@@ -1,0 +1,17 @@
+{
+  "name": "echo-agent",
+  "description": "Echoes the first text part back as an artifact and final message.",
+  "version": "0.0.1",
+  "protocolVersion": "0.3.0",
+  "capabilities": { "streaming": false },
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "echo",
+      "name": "echo",
+      "description": "Returns the input back to the sender.",
+      "tags": ["debug", "smoke-test"]
+    }
+  ]
+}
