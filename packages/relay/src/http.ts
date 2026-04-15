@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { stream } from 'hono/streaming';
 import {
   DefaultRequestHandler,
@@ -86,16 +86,30 @@ export function createHttpApp(opts: RelayHttpOptions): Hono {
     return c.json(toSdkAgentCard(conn.agentCard, conn, opts.publicUrl));
   });
 
-  app.post('/agents/:id', async (c) => {
-    const id = c.req.param('id');
-    const conn = opts.registry.getAgent(id);
-    if (!conn) return c.json({ error: 'agent not connected' }, 404);
+  // TCK / single-agent clients expect /.well-known/agent-card.json at the
+  // domain root. When exactly one adapter is connected, proxy to its card.
+  app.get('/.well-known/agent-card.json', (c) => {
+    const agents = opts.registry.listAgents();
+    if (agents.length === 1) {
+      return c.json(toSdkAgentCard(agents[0].agentCard, agents[0], opts.publicUrl));
+    }
+    return c.json(
+      {
+        error: 'root agent card unavailable',
+        reason: agents.length === 0 ? 'no adapter connected' : 'multiple adapters connected',
+        agents: agents.map((a) => ({
+          id: a.agentId,
+          cardUrl: `${opts.publicUrl ?? ''}/agents/${a.agentId}/.well-known/agent-card.json`,
+        })),
+      },
+      404,
+    );
+  });
 
-    const body = await c.req.json().catch(() => null);
-    if (!body) return c.json({ error: 'invalid JSON body' }, 400);
-
+  async function handleJsonRpc(conn: AdapterConnection, c: Context) {
+    const rawBody = await c.req.text();
     const transport = getTransport(conn);
-    const result = await transport.handle(body);
+    const result = await transport.handle(rawBody);
 
     if (Symbol.asyncIterator in (result as object)) {
       const iter = result as AsyncGenerator<unknown>;
@@ -110,6 +124,25 @@ export function createHttpApp(opts: RelayHttpOptions): Hono {
     }
 
     return c.json(result as unknown as Record<string, unknown>);
+  }
+
+  app.post('/agents/:id', async (c) => {
+    const id = c.req.param('id');
+    const conn = opts.registry.getAgent(id);
+    if (!conn) return c.json({ error: 'agent not connected' }, 404);
+    return handleJsonRpc(conn, c);
+  });
+
+  // TCK compat: single-agent alias at root (mirrors the agent-card alias).
+  app.post('/', async (c) => {
+    const agents = opts.registry.listAgents();
+    if (agents.length !== 1) {
+      return c.json(
+        { error: 'root JSON-RPC unavailable', reason: `${agents.length} adapters connected` },
+        404,
+      );
+    }
+    return handleJsonRpc(agents[0], c);
   });
 
   return app;
