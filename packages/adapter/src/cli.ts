@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { AgentCard } from '@vicoop-bridge/protocol';
 import { AdapterClient } from './client.js';
 import { echoBackend } from './backends/echo.js';
+import { createOpenclawBackend } from './backends/openclaw.js';
 import type { AdapterBackend } from './backend.js';
 
 interface Args {
@@ -45,8 +46,10 @@ function pickBackend(name: string): AdapterBackend {
   switch (name) {
     case 'echo':
       return echoBackend;
+    case 'openclaw':
+      return createOpenclawBackend();
     default:
-      throw new Error(`unknown backend: ${name} (supported: echo)`);
+      throw new Error(`unknown backend: ${name} (supported: echo, openclaw)`);
   }
 }
 
