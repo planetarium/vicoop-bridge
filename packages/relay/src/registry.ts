@@ -3,7 +3,7 @@ import type { AgentCard, DownFrame } from '@vicoop-bridge/protocol';
 import { encodeFrame } from '@vicoop-bridge/protocol';
 import type { ExecutionEventBus } from '@a2a-js/sdk/server';
 
-export interface AdapterConnection {
+export interface ConnectorConnection {
   agentId: string;
   agentCard: AgentCard;
   ws: WebSocket;
@@ -18,10 +18,10 @@ export interface TaskBinding {
 }
 
 export class Registry {
-  private agents = new Map<string, AdapterConnection>();
+  private agents = new Map<string, ConnectorConnection>();
   private bindings = new Map<string, TaskBinding>();
 
-  registerAgent(conn: AdapterConnection): { ok: true } | { ok: false; reason: string } {
+  registerAgent(conn: ConnectorConnection): { ok: true } | { ok: false; reason: string } {
     if (this.agents.has(conn.agentId)) {
       return { ok: false, reason: 'agent already connected' };
     }
@@ -47,7 +47,7 @@ export class Registry {
             kind: 'message',
             role: 'agent',
             messageId: `${binding.taskId}-disc`,
-            parts: [{ kind: 'text', text: 'adapter disconnected mid-task' }],
+            parts: [{ kind: 'text', text: 'connector disconnected mid-task' }],
             taskId: binding.taskId,
             contextId: binding.contextId,
           },
@@ -58,11 +58,11 @@ export class Registry {
     }
   }
 
-  getAgent(agentId: string): AdapterConnection | undefined {
+  getAgent(agentId: string): ConnectorConnection | undefined {
     return this.agents.get(agentId);
   }
 
-  listAgents(): AdapterConnection[] {
+  listAgents(): ConnectorConnection[] {
     return [...this.agents.values()];
   }
 

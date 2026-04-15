@@ -6,7 +6,7 @@ import { attachWsServer } from './ws.js';
 export interface RelayOptions {
   port: number;
   host?: string;
-  adapterToken: string;
+  connectorToken: string;
   publicUrl?: string;
 }
 
@@ -24,7 +24,7 @@ export async function startRelay(opts: RelayOptions) {
   });
 
   attachWsServer(server as unknown as import('node:http').Server, {
-    adapterToken: opts.adapterToken,
+    connectorToken: opts.connectorToken,
     registry,
   });
 

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import type { AdapterBackend } from '../backend.js';
+import type { ConnectorBackend } from '../backend.js';
 
-export const echoBackend: AdapterBackend = {
+export const echoBackend: ConnectorBackend = {
   name: 'echo',
   async handle(task, emit) {
     const text = task.message.parts

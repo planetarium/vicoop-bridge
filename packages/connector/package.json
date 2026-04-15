@@ -1,11 +1,11 @@
 {
-  "name": "@vicoop-bridge/adapter",
+  "name": "@vicoop-bridge/connector",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
   "bin": {
-    "vicoop-adapter": "./dist/cli.js"
+    "vicoop-connector": "./dist/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

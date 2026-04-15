@@ -15,12 +15,12 @@ External A2A Client
 │  - /.well-known/agent.json  │
 │  - /agents/{id}/agent.json  │
 │  - POST /agents/{id}/messages/send
-│  - WS /connect   (adapters) │
+│  - WS /connect   (connectors) │
 └─────────────────────────────┘
-        ▲  WebSocket (outbound from adapter)
+        ▲  WebSocket (outbound from connector)
         │
 ┌───────┴─────────────────────┐
-│  vicoop-bridge Adapter      │   사설망
+│  vicoop-bridge Connector    │   사설망
 │  - backend: openclaw | claude-cli | codex | webhook
 │  - AgentCard 제공            │
 │  - task lifecycle 번역       │
@@ -31,8 +31,8 @@ External A2A Client
 ```
 
 - **Relay**는 에이전트 종류를 모른다. 순수 A2A 프록시 + 라우터.
-- **Adapter**가 에이전트별 변환을 담당. Claude Code/Codex 같은 CLI 에이전트는 태스크당 subprocess spawn, `--resume` / `--session-id` 로 세션 유지.
-- 연결 방향은 항상 Adapter → Relay (아웃바운드).
+- **Connector**가 에이전트별 변환을 담당. Claude Code/Codex 같은 CLI 에이전트는 태스크당 subprocess spawn, `--resume` / `--session-id` 로 세션 유지.
+- 연결 방향은 항상 Connector → Relay (아웃바운드).
 
 ## 3. Repo Layout
 
@@ -41,16 +41,16 @@ vicoop-bridge/
 ├── docs/
 │   └── design.md
 ├── packages/
-│   ├── protocol/   # Relay ↔ Adapter 프레임 타입 (shared)
+│   ├── protocol/   # Relay ↔ Connector 프레임 타입 (shared)
 │   ├── relay/      # HTTP + WS 서버
-│   └── adapter/    # 스탠드얼론 adapter 데몬 (backend 플러그인)
+│   └── connector/  # 스탠드얼론 connector 데몬 (backend 플러그인)
 ├── pnpm-workspace.yaml
 └── package.json
 ```
 
-## 4. Relay ↔ Adapter Protocol (WS JSON frames)
+## 4. Relay ↔ Connector Protocol (WS JSON frames)
 
-**Adapter → Relay**
+**Connector → Relay**
 - `hello`         — `{ agentCard, version, token }`
 - `task.status`   — `{ taskId, status }`
 - `task.artifact` — `{ taskId, artifact }`
@@ -58,32 +58,32 @@ vicoop-bridge/
 - `task.fail`     — `{ taskId, error }`
 - `pong`
 
-**Relay → Adapter**
+**Relay → Connector**
 - `task.assign`   — `{ taskId, contextId, content, card }`
 - `task.cancel`   — `{ taskId }`
 - `ping`
 
-## 5. Adapter Backends
+## 5. Connector Backends
 
 ```bash
 # OpenClaw (native integration)
-vicoop-bridge adapter \
+vicoop-connector \
   --relay wss://bridge.vicoop.xyz \
   --token $TOKEN \
   --backend openclaw \
   --card ./cards/openclaw.json
 
 # Claude Code
-vicoop-bridge adapter \
+vicoop-connector \
   --backend claude-cli \
   --card ./cards/claude-code.json
   # internally: `claude -p --session-id <ctx> --resume ...`
 
 # Codex
-vicoop-bridge adapter --backend codex --card ./cards/codex.json
+vicoop-connector --backend codex --card ./cards/codex.json
 
 # Generic webhook
-vicoop-bridge adapter \
+vicoop-connector \
   --backend webhook \
   --backend-url http://localhost:8080/agent \
   --card ./cards/custom.json
@@ -91,7 +91,7 @@ vicoop-bridge adapter \
 
 각 backend는 공통 인터페이스를 구현:
 ```ts
-interface AdapterBackend {
+interface ConnectorBackend {
   handle(task: TaskAssign, emit: (frame: UpFrame) => void): Promise<void>;
   cancel(taskId: string): Promise<void>;
 }
@@ -112,8 +112,8 @@ Relay는 `@a2aproject/a2a-js` v0.3.x 스펙을 따른다.
 ## 7. Auth (미결)
 
 후보:
-- (A) Adapter: 정적 토큰, External client: API key
-- (B) Adapter: 정적 토큰, External client: SIWE (vicoop 생태계 통합)
+- (A) Connector: 정적 토큰, External client: API key
+- (B) Connector: 정적 토큰, External client: SIWE (vicoop 생태계 통합)
 - (C) mTLS
 
 **Phase 1 결정**: (A) 로 시작, Phase 4에서 SIWE 통합.
@@ -122,15 +122,15 @@ Relay는 `@a2aproject/a2a-js` v0.3.x 스펙을 따른다.
 
 | Phase | 범위 |
 |------|------|
-| 1 (MVP) | `protocol` + `relay` + `openclaw` backend, Fly.io 배포, 단일 adapter 연결 |
+| 1 (MVP) | `protocol` + `relay` + `openclaw` backend, Fly.io 배포, 단일 connector 연결 |
 | 2 | `claude-cli`, `codex` backend |
-| 3 | `webhook` backend + adapter SDK 분리 |
+| 3 | `webhook` backend + connector SDK 분리 |
 | 4 | 인증 강화 (SIWE), 동시성/process pool, 모니터링, 다중 에이전트 컨텍스트 공유 |
 
 ## 9. Open Questions
 
-- AgentCard 업데이트 흐름 (adapter 재연결 vs. 별도 프레임)
-- 여러 adapter가 같은 agent id로 붙으면? (active/standby? round-robin?)
+- AgentCard 업데이트 흐름 (connector 재연결 vs. 별도 프레임)
+- 여러 connector가 같은 agent id로 붙으면? (active/standby? round-robin?)
 - Task artifact 대용량 처리 (바이너리 / 파일) — 직접 업로드 vs. presigned URL
 - Claude Code stdout 파싱 포맷 확정 (JSON stream mode?)
 - Relay 재시작 시 in-flight task 복구 정책

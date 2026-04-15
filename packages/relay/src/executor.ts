@@ -45,7 +45,7 @@ export class RelayAgentExecutor implements AgentExecutor {
             kind: 'message',
             role: 'agent',
             messageId: `${taskId}-unreach`,
-            parts: [{ kind: 'text', text: 'adapter not connected' }],
+            parts: [{ kind: 'text', text: 'connector not connected' }],
             taskId,
             contextId,
           },

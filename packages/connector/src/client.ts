@@ -6,24 +6,24 @@ import {
   type AgentCard,
   type UpFrame,
 } from '@vicoop-bridge/protocol';
-import type { AdapterBackend } from './backend.js';
+import type { ConnectorBackend } from './backend.js';
 
-export interface AdapterClientOptions {
+export interface ConnectorClientOptions {
   relayUrl: string;
   token: string;
   agentId: string;
   agentCard: AgentCard;
-  backend: AdapterBackend;
+  backend: ConnectorBackend;
   maxConcurrency?: number;
   reconnectDelayMs?: number;
 }
 
-export class AdapterClient {
+export class ConnectorClient {
   private ws: WebSocket | null = null;
   private stopped = false;
   private inflight = new Map<string, AbortController>();
 
-  constructor(private readonly opts: AdapterClientOptions) {}
+  constructor(private readonly opts: ConnectorClientOptions) {}
 
   start(): void {
     this.connect();
@@ -40,7 +40,7 @@ export class AdapterClient {
     this.ws = ws;
 
     ws.on('open', () => {
-      console.log('[adapter] connected, sending hello');
+      console.log('[connector] connected, sending hello');
       this.send({
         type: 'hello',
         agentId: this.opts.agentId,
@@ -55,7 +55,7 @@ export class AdapterClient {
       try {
         frame = parseDownFrame(typeof raw === 'string' ? raw : raw.toString('utf8'));
       } catch (err) {
-        console.error('[adapter] invalid frame:', err);
+        console.error('[connector] invalid frame:', err);
         return;
       }
 
@@ -74,7 +74,7 @@ export class AdapterClient {
     });
 
     ws.on('close', (code, reason) => {
-      console.log(`[adapter] disconnected: ${code} ${reason.toString()}`);
+      console.log(`[connector] disconnected: ${code} ${reason.toString()}`);
       this.ws = null;
       if (!this.stopped) {
         const delay = this.opts.reconnectDelayMs ?? 3000;
@@ -83,7 +83,7 @@ export class AdapterClient {
     });
 
     ws.on('error', (err) => {
-      console.error('[adapter] ws error:', err.message);
+      console.error('[connector] ws error:', err.message);
     });
   }
 
