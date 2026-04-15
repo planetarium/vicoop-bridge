@@ -1,7 +1,7 @@
 import { createHash, generateKeyPairSync, randomUUID, sign as cryptoSign } from 'node:crypto';
 import WebSocket from 'ws';
 import type { Part } from '@vicoop-bridge/protocol';
-import type { AdapterBackend } from '../backend.js';
+import type { ConnectorBackend } from '../backend.js';
 
 const GATEWAY_PROTOCOL_VERSION = 3;
 
@@ -226,7 +226,7 @@ class GatewayClient {
         maxProtocol: GATEWAY_PROTOCOL_VERSION,
         client: {
           id: clientId,
-          displayName: 'vicoop-bridge-adapter',
+          displayName: 'vicoop-bridge-connector',
           version: '0.0.0',
           platform: process.platform,
           mode: clientMode,
@@ -283,7 +283,7 @@ export interface OpenclawBackendOptions {
 
 export function createOpenclawBackend(
   opts: OpenclawBackendOptions = {},
-): AdapterBackend {
+): ConnectorBackend {
   const url = opts.url ?? process.env.OPENCLAW_GATEWAY_URL ?? 'ws://127.0.0.1:18789';
   const token = opts.token ?? process.env.OPENCLAW_GATEWAY_TOKEN;
   const agent = opts.agent ?? process.env.OPENCLAW_AGENT ?? 'main';

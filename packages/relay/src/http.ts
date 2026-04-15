@@ -8,7 +8,7 @@ import {
 import type { AgentCard as SdkAgentCard } from '@a2a-js/sdk';
 import type { AgentCard as WireAgentCard } from '@vicoop-bridge/protocol';
 import { RelayAgentExecutor } from './executor.js';
-import type { AdapterConnection, Registry } from './registry.js';
+import type { ConnectorConnection, Registry } from './registry.js';
 
 export interface RelayHttpOptions {
   registry: Registry;
@@ -17,7 +17,7 @@ export interface RelayHttpOptions {
 
 function toSdkAgentCard(
   wire: WireAgentCard,
-  conn: AdapterConnection,
+  conn: ConnectorConnection,
   publicUrl: string | undefined,
 ): SdkAgentCard {
   const url = publicUrl
@@ -50,7 +50,7 @@ export function createHttpApp(opts: RelayHttpOptions): Hono {
   const taskStore = new InMemoryTaskStore();
   const transports = new Map<string, JsonRpcTransportHandler>();
 
-  function getTransport(conn: AdapterConnection): JsonRpcTransportHandler {
+  function getTransport(conn: ConnectorConnection): JsonRpcTransportHandler {
     const cached = transports.get(conn.agentId);
     if (cached) return cached;
     const card = toSdkAgentCard(conn.agentCard, conn, opts.publicUrl);
@@ -87,7 +87,7 @@ export function createHttpApp(opts: RelayHttpOptions): Hono {
   });
 
   // TCK / single-agent clients expect /.well-known/agent-card.json at the
-  // domain root. When exactly one adapter is connected, proxy to its card.
+  // domain root. When exactly one connector is connected, proxy to its card.
   app.get('/.well-known/agent-card.json', (c) => {
     const agents = opts.registry.listAgents();
     if (agents.length === 1) {
@@ -96,7 +96,7 @@ export function createHttpApp(opts: RelayHttpOptions): Hono {
     return c.json(
       {
         error: 'root agent card unavailable',
-        reason: agents.length === 0 ? 'no adapter connected' : 'multiple adapters connected',
+        reason: agents.length === 0 ? 'no connector connected' : 'multiple connectors connected',
         agents: agents.map((a) => ({
           id: a.agentId,
           cardUrl: `${opts.publicUrl ?? ''}/agents/${a.agentId}/.well-known/agent-card.json`,
@@ -106,7 +106,7 @@ export function createHttpApp(opts: RelayHttpOptions): Hono {
     );
   });
 
-  async function handleJsonRpc(conn: AdapterConnection, c: Context) {
+  async function handleJsonRpc(conn: ConnectorConnection, c: Context) {
     const rawBody = await c.req.text();
     const transport = getTransport(conn);
     const result = await transport.handle(rawBody);

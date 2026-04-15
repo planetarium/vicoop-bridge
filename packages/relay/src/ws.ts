@@ -4,7 +4,7 @@ import { parseUpFrame, PROTOCOL_VERSION, type Part, type TaskStatus } from '@vic
 import type { Registry } from './registry.js';
 
 export interface RelayWsOptions {
-  adapterToken: string;
+  connectorToken: string;
   registry: Registry;
 }
 
@@ -66,7 +66,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: RelayWsOpt
         ws.close(4004, 'protocol version mismatch');
         return;
       }
-      if (frame.token !== opts.adapterToken) {
+      if (frame.token !== opts.connectorToken) {
         ws.close(4005, 'bad token');
         return;
       }
@@ -83,7 +83,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: RelayWsOpt
       agentId = frame.agentId;
       authed = true;
       clearTimeout(helloTimeout);
-      console.log(`[relay] adapter connected: ${agentId} (${frame.agentCard.name})`);
+      console.log(`[relay] connector connected: ${agentId} (${frame.agentCard.name})`);
       return;
     }
 
@@ -168,7 +168,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: RelayWsOpt
   ws.on('close', () => {
     clearTimeout(helloTimeout);
     if (agentId) {
-      console.log(`[relay] adapter disconnected: ${agentId}`);
+      console.log(`[relay] connector disconnected: ${agentId}`);
       opts.registry.unregisterAgent(agentId, ws);
     }
   });

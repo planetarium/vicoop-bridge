@@ -7,7 +7,7 @@
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "dev:relay": "pnpm --filter @vicoop-bridge/relay dev",
-    "dev:adapter": "pnpm --filter @vicoop-bridge/adapter dev",
+    "dev:connector": "pnpm --filter @vicoop-bridge/connector dev",
     "deploy:relay": "fly deploy -c packages/relay/fly.toml ."
   },
   "devDependencies": {

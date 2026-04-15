@@ -8,7 +8,7 @@ COPY pnpm-workspace.yaml package.json pnpm-lock.yaml* ./
 COPY tsconfig.base.json ./
 COPY packages/protocol/package.json packages/protocol/
 COPY packages/relay/package.json packages/relay/
-COPY packages/adapter/package.json packages/adapter/
+COPY packages/connector/package.json packages/connector/
 
 RUN pnpm install --frozen-lockfile --prod=false
 
