@@ -18,7 +18,7 @@ CHECKSUM_PATH="$ARCHIVE_PATH.sha256"
 rm -rf "$WORK_DIR" "$ARCHIVE_PATH" "$CHECKSUM_PATH"
 mkdir -p "$WORK_DIR"
 
-pnpm --dir "$ROOT_DIR" --offline --filter @vicoop-bridge/connector deploy --prod "$BUNDLE_DIR"
+pnpm --dir "$ROOT_DIR" --filter @vicoop-bridge/connector deploy --prod "$BUNDLE_DIR"
 mkdir -p "$BUNDLE_DIR/bin"
 
 cat > "$BUNDLE_DIR/bin/vicoop-connector" <<'EOF'
