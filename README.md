@@ -8,7 +8,7 @@ See [`docs/design.md`](./docs/design.md) for the full design.
 
 ## Connector Releases
 
-Tagging the repository with `connector-v*` publishes a portable `vicoop-connector` bundle to GitHub Releases.
+Tagging the repository with `connector-v*` publishes a portable `vicoop-bridge-connector` bundle to GitHub Releases.
 
 Example:
 

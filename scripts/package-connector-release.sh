@@ -11,8 +11,8 @@ VERSION="${TAG#connector-v}"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="$ROOT_DIR/dist-release"
 WORK_DIR="$OUT_DIR/work"
-BUNDLE_DIR="$WORK_DIR/vicoop-connector-$VERSION"
-ARCHIVE_PATH="$OUT_DIR/vicoop-connector-$VERSION.tgz"
+BUNDLE_DIR="$WORK_DIR/vicoop-bridge-connector-$VERSION"
+ARCHIVE_PATH="$OUT_DIR/vicoop-bridge-connector-$VERSION.tgz"
 CHECKSUM_PATH="$ARCHIVE_PATH.sha256"
 
 rm -rf "$WORK_DIR" "$ARCHIVE_PATH" "$CHECKSUM_PATH"
@@ -32,7 +32,7 @@ EOF
 chmod +x "$BUNDLE_DIR/bin/vicoop-connector"
 
 cat > "$BUNDLE_DIR/README.md" <<EOF
-# vicoop-connector $VERSION
+# vicoop-bridge-connector $VERSION
 
 Portable release bundle for the standalone connector daemon.
 
@@ -49,7 +49,7 @@ Portable release bundle for the standalone connector daemon.
 - The \`bin/vicoop-connector\` wrapper runs \`node dist/cli.js\` for convenience.
 EOF
 
-tar -C "$WORK_DIR" -czf "$ARCHIVE_PATH" "vicoop-connector-$VERSION"
+tar -C "$WORK_DIR" -czf "$ARCHIVE_PATH" "vicoop-bridge-connector-$VERSION"
 shasum -a 256 "$ARCHIVE_PATH" > "$CHECKSUM_PATH"
 
 echo "created $ARCHIVE_PATH"

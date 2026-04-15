@@ -41,16 +41,16 @@ jobs:
         with:
           draft: false
           files: |
-            dist-release/vicoop-connector-*.tgz
-            dist-release/vicoop-connector-*.tgz.sha256
+            dist-release/vicoop-bridge-connector-*.tgz
+            dist-release/vicoop-bridge-connector-*.tgz.sha256
           generate_release_notes: true
           body: |
-            Portable `vicoop-connector` bundle for direct GitHub download.
+            Portable `vicoop-bridge-connector` bundle for direct GitHub download.
 
             Quick start:
 
             ```bash
-            tar -xzf vicoop-connector-<version>.tgz
-            cd vicoop-connector-<version>
+            tar -xzf vicoop-bridge-connector-<version>.tgz
+            cd vicoop-bridge-connector-<version>
             ./bin/vicoop-connector --help
             ```
