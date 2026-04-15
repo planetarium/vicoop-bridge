@@ -6,6 +6,17 @@ Agents connect *outbound* to a public Relay via WebSocket, so they can sit behin
 
 See [`docs/design.md`](./docs/design.md) for the full design.
 
+## Connector Releases
+
+Tagging the repository with `connector-v*` publishes a portable `vicoop-connector` bundle to GitHub Releases.
+
+Example:
+
+```bash
+git tag connector-v0.1.0
+git push origin connector-v0.1.0
+```
+
 ## Status
 
 Pre-implementation. Design phase only.

@@ -1,0 +1,57 @@
+name: Release Connector
+
+on:
+  push:
+    tags:
+      - 'connector-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build connector packages
+        run: pnpm --filter @vicoop-bridge/protocol --filter @vicoop-bridge/connector build
+
+      - name: Package portable connector bundle
+        run: ./scripts/package-connector-release.sh "${{ github.ref_name }}"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          files: |
+            dist-release/vicoop-connector-*.tgz
+            dist-release/vicoop-connector-*.tgz.sha256
+          generate_release_notes: true
+          body: |
+            Portable `vicoop-connector` bundle for direct GitHub download.
+
+            Quick start:
+
+            ```bash
+            tar -xzf vicoop-connector-${{ github.ref_name }}.tgz
+            cd vicoop-connector-${{ github.ref_name }}
+            node dist/cli.js --help
+            ```
+
