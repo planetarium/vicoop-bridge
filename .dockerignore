@@ -1,0 +1,13 @@
+node_modules
+**/node_modules
+dist
+**/dist
+.git
+.github
+.claude
+docs
+*.log
+.env*
+.DS_Store
+coverage
+**/*.tsbuildinfo
