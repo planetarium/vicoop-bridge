@@ -52,5 +52,5 @@ jobs:
             ```bash
             tar -xzf vicoop-connector-<version>.tgz
             cd vicoop-connector-<version>
-            node dist/cli.js --help
+            ./bin/vicoop-connector --help
             ```

@@ -17,6 +17,12 @@ git tag connector-v0.1.0
 git push origin connector-v0.1.0
 ```
 
+After extracting the release bundle, run the connector with:
+
+```bash
+./bin/vicoop-connector --help
+```
+
 ## Status
 
 Pre-implementation. Design phase only.
