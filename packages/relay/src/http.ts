@@ -133,17 +133,5 @@ export function createHttpApp(opts: RelayHttpOptions): Hono {
     return handleJsonRpc(conn, c);
   });
 
-  // TCK compat: single-agent alias at root (mirrors the agent-card alias).
-  app.post('/', async (c) => {
-    const agents = opts.registry.listAgents();
-    if (agents.length !== 1) {
-      return c.json(
-        { error: 'root JSON-RPC unavailable', reason: `${agents.length} adapters connected` },
-        404,
-      );
-    }
-    return handleJsonRpc(agents[0], c);
-  });
-
   return app;
 }
