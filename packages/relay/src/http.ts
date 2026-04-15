@@ -1,125 +1,115 @@
 import { Hono } from 'hono';
-import { randomUUID } from 'node:crypto';
-import { z } from 'zod';
-import { Message } from '@vicoop-bridge/protocol';
-import type { Registry, TaskRecord } from './registry.js';
-
-const SendBody = z.object({
-  message: Message,
-  configuration: z
-    .object({
-      blocking: z.boolean().optional(),
-    })
-    .optional(),
-});
-
-function taskToA2A(task: TaskRecord) {
-  return {
-    id: task.id,
-    contextId: task.contextId,
-    status: task.status,
-    history: task.history,
-    artifacts: task.artifacts,
-    kind: 'task' as const,
-  };
-}
+import { stream } from 'hono/streaming';
+import {
+  DefaultRequestHandler,
+  InMemoryTaskStore,
+  JsonRpcTransportHandler,
+} from '@a2a-js/sdk/server';
+import type { AgentCard as SdkAgentCard } from '@a2a-js/sdk';
+import type { AgentCard as WireAgentCard } from '@vicoop-bridge/protocol';
+import { RelayAgentExecutor } from './executor.js';
+import type { AdapterConnection, Registry } from './registry.js';
 
 export interface RelayHttpOptions {
   registry: Registry;
   publicUrl?: string;
-  taskTimeoutMs?: number;
+}
+
+function toSdkAgentCard(
+  wire: WireAgentCard,
+  conn: AdapterConnection,
+  publicUrl: string | undefined,
+): SdkAgentCard {
+  const url = publicUrl
+    ? `${publicUrl}/agents/${conn.agentId}`
+    : `/agents/${conn.agentId}`;
+  return {
+    name: wire.name,
+    description: wire.description ?? '',
+    version: wire.version,
+    protocolVersion: wire.protocolVersion ?? '0.3.0',
+    url,
+    preferredTransport: 'JSONRPC',
+    capabilities: {
+      streaming: wire.capabilities?.streaming ?? false,
+      pushNotifications: wire.capabilities?.pushNotifications ?? false,
+    },
+    defaultInputModes: wire.defaultInputModes ?? ['text/plain'],
+    defaultOutputModes: wire.defaultOutputModes ?? ['text/plain'],
+    skills: (wire.skills ?? []).map((s) => ({
+      id: s.id,
+      name: s.name,
+      description: s.description ?? '',
+      tags: s.tags ?? [],
+    })),
+  };
 }
 
 export function createHttpApp(opts: RelayHttpOptions): Hono {
   const app = new Hono();
-  const timeoutMs = opts.taskTimeoutMs ?? 5 * 60_000;
+  const taskStore = new InMemoryTaskStore();
+  const transports = new Map<string, JsonRpcTransportHandler>();
+
+  function getTransport(conn: AdapterConnection): JsonRpcTransportHandler {
+    const cached = transports.get(conn.agentId);
+    if (cached) return cached;
+    const card = toSdkAgentCard(conn.agentCard, conn, opts.publicUrl);
+    const executor = new RelayAgentExecutor(conn.agentId, opts.registry);
+    const handler = new DefaultRequestHandler(card, taskStore, executor);
+    const transport = new JsonRpcTransportHandler(handler);
+    transports.set(conn.agentId, transport);
+    return transport;
+  }
 
   app.get('/healthz', (c) => c.json({ ok: true }));
 
-  app.get('/.well-known/agent.json', (c) => {
-    return c.json({
+  app.get('/', (c) =>
+    c.json({
       name: 'vicoop-bridge',
       description: 'A2A relay for outbound-connected local agents',
       version: '0.0.0',
-      protocolVersion: '0.3.0',
       url: opts.publicUrl,
       agents: opts.registry.listAgents().map((a) => ({
         id: a.agentId,
-        url: opts.publicUrl ? `${opts.publicUrl}/agents/${a.agentId}` : undefined,
-        card: a.agentCard,
+        url: opts.publicUrl
+          ? `${opts.publicUrl}/agents/${a.agentId}`
+          : `/agents/${a.agentId}`,
+        card: toSdkAgentCard(a.agentCard, a, opts.publicUrl),
       })),
-    });
-  });
+    }),
+  );
 
-  app.get('/agents/:id/agent.json', (c) => {
+  app.get('/agents/:id/.well-known/agent-card.json', (c) => {
     const id = c.req.param('id');
     const conn = opts.registry.getAgent(id);
     if (!conn) return c.json({ error: 'agent not connected' }, 404);
-    const base = opts.publicUrl ? `${opts.publicUrl}/agents/${id}` : undefined;
-    return c.json({ ...conn.agentCard, url: base });
+    return c.json(toSdkAgentCard(conn.agentCard, conn, opts.publicUrl));
   });
 
-  app.post('/agents/:id/messages/send', async (c) => {
+  app.post('/agents/:id', async (c) => {
     const id = c.req.param('id');
     const conn = opts.registry.getAgent(id);
     if (!conn) return c.json({ error: 'agent not connected' }, 404);
 
-    const parsed = SendBody.safeParse(await c.req.json().catch(() => null));
-    if (!parsed.success) {
-      return c.json({ error: 'invalid body', detail: parsed.error.flatten() }, 400);
+    const body = await c.req.json().catch(() => null);
+    if (!body) return c.json({ error: 'invalid JSON body' }, 400);
+
+    const transport = getTransport(conn);
+    const result = await transport.handle(body);
+
+    if (Symbol.asyncIterator in (result as object)) {
+      const iter = result as AsyncGenerator<unknown>;
+      c.header('Content-Type', 'text/event-stream');
+      c.header('Cache-Control', 'no-cache');
+      c.header('Connection', 'keep-alive');
+      return stream(c, async (s) => {
+        for await (const chunk of iter) {
+          await s.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        }
+      });
     }
 
-    const taskId = randomUUID();
-    const contextId = randomUUID();
-    const task = opts.registry.createTask({
-      id: taskId,
-      contextId,
-      agentId: id,
-      initialMessage: parsed.data.message,
-    });
-
-    const sent = opts.registry.sendToAgent(id, {
-      type: 'task.assign',
-      taskId,
-      contextId,
-      message: parsed.data.message,
-    });
-    if (!sent) {
-      opts.registry.failTask(taskId, 'agent_unreachable', 'could not reach adapter');
-    }
-
-    const timeout = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('task timeout')), timeoutMs),
-    );
-
-    try {
-      const settled = await Promise.race([task.done, timeout]);
-      return c.json(taskToA2A(settled));
-    } catch (err) {
-      opts.registry.failTask(taskId, 'timeout', (err as Error).message);
-      return c.json(taskToA2A(opts.registry.getTask(taskId)!), 504);
-    }
-  });
-
-  app.post('/agents/:id/tasks/:taskId/cancel', (c) => {
-    const id = c.req.param('id');
-    const taskId = c.req.param('taskId');
-    const task = opts.registry.getTask(taskId);
-    if (!task || task.agentId !== id) {
-      return c.json({ error: 'task not found' }, 404);
-    }
-    opts.registry.sendToAgent(id, { type: 'task.cancel', taskId });
-    return c.json({ ok: true });
-  });
-
-  app.get('/agents/:id/tasks/:taskId', (c) => {
-    const id = c.req.param('id');
-    const taskId = c.req.param('taskId');
-    const task = opts.registry.getTask(taskId);
-    if (!task || task.agentId !== id) {
-      return c.json({ error: 'task not found' }, 404);
-    }
-    return c.json(taskToA2A(task));
+    return c.json(result as unknown as Record<string, unknown>);
   });
 
   return app;

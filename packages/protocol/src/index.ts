@@ -9,10 +9,12 @@ export const TextPart = z.object({
 
 export const FilePart = z.object({
   kind: z.literal('file'),
-  name: z.string().optional(),
-  mimeType: z.string().optional(),
-  bytes: z.string().optional(),
-  uri: z.string().optional(),
+  file: z.object({
+    name: z.string().optional(),
+    mimeType: z.string().optional(),
+    bytes: z.string().optional(),
+    uri: z.string().optional(),
+  }),
 });
 
 export const Part = z.discriminatedUnion('kind', [TextPart, FilePart]);

@@ -8,7 +8,6 @@ export interface RelayOptions {
   host?: string;
   adapterToken: string;
   publicUrl?: string;
-  taskTimeoutMs?: number;
 }
 
 export async function startRelay(opts: RelayOptions) {
@@ -16,7 +15,6 @@ export async function startRelay(opts: RelayOptions) {
   const app = createHttpApp({
     registry,
     publicUrl: opts.publicUrl,
-    taskTimeoutMs: opts.taskTimeoutMs,
   });
 
   const server = serve({

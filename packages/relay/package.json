@@ -14,9 +14,10 @@
     "start": "tsx src/cli.ts"
   },
   "dependencies": {
+    "@a2a-js/sdk": "^0.3.13",
+    "@hono/node-server": "^1.13.7",
     "@vicoop-bridge/protocol": "workspace:*",
     "hono": "^4.6.11",
-    "@hono/node-server": "^1.13.7",
     "tsx": "^4.19.2",
     "ws": "^8.18.0",
     "zod": "^3.23.8"

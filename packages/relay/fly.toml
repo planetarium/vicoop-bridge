@@ -2,7 +2,7 @@ app = "vicoop-bridge-relay"
 primary_region = "nrt"
 
 [build]
-  dockerfile = "packages/relay/Dockerfile"
+  dockerfile = "Dockerfile"
 
 [env]
   PORT = "8787"

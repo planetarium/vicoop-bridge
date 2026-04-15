@@ -1,6 +1,6 @@
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { IncomingMessage, Server } from 'node:http';
-import { parseUpFrame, PROTOCOL_VERSION } from '@vicoop-bridge/protocol';
+import { parseUpFrame, PROTOCOL_VERSION, type Part, type TaskStatus } from '@vicoop-bridge/protocol';
 import type { Registry } from './registry.js';
 
 export interface RelayWsOptions {
@@ -23,14 +23,29 @@ export function attachWsServer(server: Server, opts: RelayWsOptions): void {
   });
 }
 
+function toA2AMessage(
+  status: TaskStatus,
+  taskId: string,
+  contextId: string,
+): TaskStatus['message'] extends undefined ? undefined : object | undefined {
+  if (!status.message) return undefined;
+  const m = status.message;
+  return {
+    kind: 'message' as const,
+    role: m.role,
+    messageId: m.messageId,
+    parts: m.parts as Part[],
+    taskId,
+    contextId,
+  } as never;
+}
+
 function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: RelayWsOptions): void {
   let agentId: string | null = null;
   let authed = false;
 
   const helloTimeout = setTimeout(() => {
-    if (!authed) {
-      ws.close(4001, 'hello timeout');
-    }
+    if (!authed) ws.close(4001, 'hello timeout');
   }, 10_000);
 
   ws.on('message', (raw) => {
@@ -73,18 +88,75 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: RelayWsOpt
     }
 
     switch (frame.type) {
-      case 'task.status':
-        opts.registry.updateTaskStatus(frame.taskId, frame.status);
+      case 'task.status': {
+        const b = opts.registry.getBinding(frame.taskId);
+        if (!b) return;
+        b.eventBus.publish({
+          kind: 'status-update',
+          taskId: frame.taskId,
+          contextId: b.contextId,
+          final: false,
+          status: {
+            ...frame.status,
+            message: toA2AMessage(frame.status, frame.taskId, b.contextId) as never,
+          },
+        });
         break;
-      case 'task.artifact':
-        opts.registry.addArtifact(frame.taskId, frame.artifact);
+      }
+      case 'task.artifact': {
+        const b = opts.registry.getBinding(frame.taskId);
+        if (!b) return;
+        b.eventBus.publish({
+          kind: 'artifact-update',
+          taskId: frame.taskId,
+          contextId: b.contextId,
+          artifact: frame.artifact as never,
+          lastChunk: frame.lastChunk,
+        });
         break;
-      case 'task.complete':
-        opts.registry.completeTask(frame.taskId, frame.status);
+      }
+      case 'task.complete': {
+        const b = opts.registry.getBinding(frame.taskId);
+        if (!b) return;
+        b.eventBus.publish({
+          kind: 'status-update',
+          taskId: frame.taskId,
+          contextId: b.contextId,
+          final: true,
+          status: {
+            ...frame.status,
+            message: toA2AMessage(frame.status, frame.taskId, b.contextId) as never,
+          },
+        });
+        b.eventBus.finished();
+        opts.registry.unbindTask(frame.taskId);
         break;
-      case 'task.fail':
-        opts.registry.failTask(frame.taskId, frame.error.code, frame.error.message);
+      }
+      case 'task.fail': {
+        const b = opts.registry.getBinding(frame.taskId);
+        if (!b) return;
+        b.eventBus.publish({
+          kind: 'status-update',
+          taskId: frame.taskId,
+          contextId: b.contextId,
+          final: true,
+          status: {
+            state: 'failed',
+            timestamp: new Date().toISOString(),
+            message: {
+              kind: 'message',
+              role: 'agent',
+              messageId: `${frame.taskId}-err`,
+              parts: [{ kind: 'text', text: `${frame.error.code}: ${frame.error.message}` }],
+              taskId: frame.taskId,
+              contextId: b.contextId,
+            } as never,
+          },
+        });
+        b.eventBus.finished();
+        opts.registry.unbindTask(frame.taskId);
         break;
+      }
       case 'pong':
         break;
       case 'hello':
