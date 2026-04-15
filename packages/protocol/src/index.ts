@@ -17,7 +17,12 @@ export const FilePart = z.object({
   }),
 });
 
-export const Part = z.discriminatedUnion('kind', [TextPart, FilePart]);
+export const DataPart = z.object({
+  kind: z.literal('data'),
+  data: z.record(z.string(), z.unknown()),
+});
+
+export const Part = z.discriminatedUnion('kind', [TextPart, FilePart, DataPart]);
 export type Part = z.infer<typeof Part>;
 
 export const Message = z.object({
