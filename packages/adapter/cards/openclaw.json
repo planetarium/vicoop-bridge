@@ -1,0 +1,17 @@
+{
+  "name": "openclaw",
+  "description": "Multi-channel AI gateway exposed as an A2A agent via vicoop-bridge.",
+  "version": "0.0.1",
+  "protocolVersion": "0.3.0",
+  "capabilities": { "streaming": false },
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "chat",
+      "name": "chat",
+      "description": "Send a message to an OpenClaw agent and receive its reply.",
+      "tags": ["chat", "agent"]
+    }
+  ]
+}
