@@ -50,8 +50,7 @@ jobs:
             Quick start:
 
             ```bash
-            tar -xzf vicoop-connector-${{ github.ref_name }}.tgz
-            cd vicoop-connector-${{ github.ref_name }}
+            tar -xzf vicoop-connector-<version>.tgz
+            cd vicoop-connector-<version>
             node dist/cli.js --help
             ```
-
