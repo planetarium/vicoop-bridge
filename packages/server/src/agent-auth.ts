@@ -1,6 +1,10 @@
 import type { Context, Next } from 'hono';
-import type { Registry } from './registry.js';
+import type { ClientConnection, Registry } from './registry.js';
 import { verifySiweToken } from './siwe-token.js';
+
+export function getAgentConn(c: Context): ClientConnection {
+  return c.get('agentConn') as ClientConnection;
+}
 
 export function agentAuthMiddleware(registry: Registry) {
   return async (c: Context, next: Next) => {
@@ -9,6 +13,8 @@ export function agentAuthMiddleware(registry: Registry) {
     if (!conn) {
       return c.json({ error: 'agent not connected' }, 404);
     }
+
+    c.set('agentConn', conn);
 
     if (conn.allowedCallers.length === 0) {
       return next();

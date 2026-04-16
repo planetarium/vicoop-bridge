@@ -14,7 +14,7 @@ import { ServerAgentExecutor } from './executor.js';
 import type { ClientConnection, Registry } from './registry.js';
 import { createAdminTransport, buildAdminAgentCard } from './admin.js';
 import { verifySiweToken } from './siwe-token.js';
-import { agentAuthMiddleware } from './agent-auth.js';
+import { agentAuthMiddleware, getAgentConn } from './agent-auth.js';
 import type { Sql } from './db.js';
 
 export interface ServerHttpOptions {
@@ -202,8 +202,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // Client agent A2A endpoints (auth middleware checks allowedCallers)
   const authMw = agentAuthMiddleware(opts.registry);
   app.post('/agents/:id', authMw, async (c) => {
-    const id = c.req.param('id')!;
-    const conn = opts.registry.getAgent(id)!;
+    const conn = getAgentConn(c);
 
     const rawBody = await c.req.text();
     const transport = getTransport(conn);

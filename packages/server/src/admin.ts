@@ -167,16 +167,19 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
     }),
 
     list_active_agents: tool({
-      description: 'List currently connected agents with their client identity and connection time.',
+      description: 'List currently connected agents with their client identity and connection time. Non-admin users only see their own agents.',
       inputSchema: z.object({}),
       execute: async () => {
-        return registry.listAgents().map((a) => ({
-          agent_id: a.agentId,
-          client_id: a.clientId,
-          agent_name: a.agentCard.name,
-          allowed_callers: a.allowedCallers,
-          connected_at: new Date(a.connectedAt).toISOString(),
-        }));
+        const admin = isAdmin(walletAddress);
+        return registry.listAgents()
+          .filter((a) => admin || a.ownerWallet.toLowerCase() === walletAddress.toLowerCase())
+          .map((a) => ({
+            agent_id: a.agentId,
+            client_id: a.clientId,
+            agent_name: a.agentCard.name,
+            allowed_callers: a.allowedCallers,
+            connected_at: new Date(a.connectedAt).toISOString(),
+          }));
       },
     }),
 
@@ -204,8 +207,14 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
           `;
         });
         if (result.length === 0) {
-          const existing = await db`SELECT allowed_callers FROM agent_policies WHERE agent_id = ${agent_id}`;
-          if (existing.length === 0) return { error: 'Agent policy not found. Agent may not have connected yet.' };
+          const adminAddrs = process.env.ADMIN_WALLET_ADDRESSES ?? '';
+          const existing = await db.begin(async (tx) => {
+            await tx`SELECT set_config('role', 'app_authenticated', true)`;
+            await tx`SELECT set_config('jwt.claims.wallet_address', ${walletAddress.toLowerCase()}, true)`;
+            await tx`SELECT set_config('app.admin_addresses', ${adminAddrs}, true)`;
+            return tx`SELECT allowed_callers FROM agent_policies WHERE agent_id = ${agent_id}`;
+          });
+          if (existing.length === 0) return { error: 'Agent policy not found or not authorized.' };
           if ((existing[0].allowed_callers as string[]).includes(wallet)) return { agent_id, message: 'Wallet already in allowed callers', allowed_callers: existing[0].allowed_callers };
           return { error: 'Not authorized to modify this agent policy.' };
         }

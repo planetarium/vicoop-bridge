@@ -134,6 +134,10 @@ CREATE TABLE IF NOT EXISTS agent_policies (
 
 ALTER TABLE agent_policies ENABLE ROW LEVEL SECURITY;
 
+-- allowed_callers must only be modified via custom tools (add_caller/remove_caller)
+-- to keep the in-memory Registry cache in sync. Hide from GraphQL mutations.
+COMMENT ON COLUMN agent_policies.allowed_callers IS E'@omit update';
+
 -- Authenticated users see their own policies; admins see all
 DROP POLICY IF EXISTS agent_policies_select ON agent_policies;
 CREATE POLICY agent_policies_select ON agent_policies
@@ -150,7 +154,8 @@ CREATE POLICY agent_policies_insert ON agent_policies
 DROP POLICY IF EXISTS agent_policies_update ON agent_policies;
 CREATE POLICY agent_policies_update ON agent_policies
   FOR UPDATE TO app_authenticated
-  USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
+  USING (owner_wallet = lower(current_wallet_address()) OR is_admin())
+  WITH CHECK (owner_wallet = lower(current_wallet_address()) OR is_admin());
 
 -- Users can delete their own policies; admins can delete all
 DROP POLICY IF EXISTS agent_policies_delete ON agent_policies;
