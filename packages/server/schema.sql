@@ -99,9 +99,11 @@ CREATE POLICY clients_postgraphile ON clients
 COMMENT ON COLUMN clients.token_hash IS E'@omit';
 
 -- ============================================================
--- 4. A2A task store (persists admin agent conversation history)
+-- 4. Infra schema (not exposed via PostGraphile / GraphQL)
 -- ============================================================
-CREATE TABLE IF NOT EXISTS a2a_tasks (
+CREATE SCHEMA IF NOT EXISTS infra;
+
+CREATE TABLE IF NOT EXISTS infra.a2a_tasks (
   task_id    TEXT PRIMARY KEY,
   context_id TEXT NOT NULL,
   state      TEXT NOT NULL,
@@ -112,7 +114,12 @@ CREATE TABLE IF NOT EXISTS a2a_tasks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_a2a_tasks_context_id
-  ON a2a_tasks (context_id, created_at);
+  ON infra.a2a_tasks (context_id, created_at);
+
+GRANT USAGE ON SCHEMA infra TO app_postgraphile;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA infra TO app_postgraphile;
+ALTER DEFAULT PRIVILEGES IN SCHEMA infra
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_postgraphile;
 
 -- ============================================================
 -- 5. Grants
