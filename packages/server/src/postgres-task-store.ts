@@ -14,22 +14,24 @@ function extractOwnerWallet(task: Task): string | undefined {
   return undefined;
 }
 
+function stripMessageMetadata(msg: Message): Message {
+  const { _bearerToken, _walletAddress, ...rest } =
+    (msg as MessageWithMetadata).metadata ?? {};
+  const clean = Object.keys(rest).length ? rest : undefined;
+  if (clean) return { ...msg, metadata: clean } as Message;
+  const { metadata: _, ...m } = msg as MessageWithMetadata;
+  return m as Message;
+}
+
 function stripSensitiveMetadata(task: Task): Task {
-  if (!task.history?.length) return task;
-  return {
-    ...task,
-    history: task.history.map((msg) => {
-      const { _bearerToken, _walletAddress, ...rest } =
-        (msg as MessageWithMetadata).metadata ?? {};
-      const clean = Object.keys(rest).length ? rest : undefined;
-      return clean
-        ? ({ ...msg, metadata: clean } as Message)
-        : ((() => {
-            const { metadata: _, ...m } = msg as MessageWithMetadata;
-            return m as Message;
-          })());
-    }),
-  };
+  const result = { ...task };
+  if (result.history?.length) {
+    result.history = result.history.map(stripMessageMetadata);
+  }
+  if (result.status?.message) {
+    result.status = { ...result.status, message: stripMessageMetadata(result.status.message) };
+  }
+  return result;
 }
 
 export interface ContextAwareTaskStore extends TaskStore {
@@ -60,8 +62,9 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
         updated_at = now()
     `;
 
-    // Enforce retention: delete only terminal tasks beyond MAX_CONTEXT_TASKS
-    if (ownerWallet) {
+    // Enforce retention only when this task reaches a terminal state
+    const isTerminal = ['completed', 'failed', 'canceled'].includes(task.status.state);
+    if (ownerWallet && isTerminal) {
       await this.sql`
         DELETE FROM infra.a2a_tasks
         WHERE task_id IN (
