@@ -11,6 +11,9 @@ function extractOwnerWallet(task: Task): string | undefined {
     const wallet = (msg as MessageWithMetadata).metadata?._walletAddress;
     if (typeof wallet === 'string') return wallet.toLowerCase();
   }
+  const statusWallet = (task.status?.message as MessageWithMetadata | undefined)?.metadata
+    ?._walletAddress;
+  if (typeof statusWallet === 'string') return statusWallet.toLowerCase();
   return undefined;
 }
 
