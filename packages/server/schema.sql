@@ -113,8 +113,8 @@ CREATE TABLE IF NOT EXISTS infra.a2a_tasks (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_a2a_tasks_context_id
-  ON infra.a2a_tasks (context_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_a2a_tasks_context_wallet
+  ON infra.a2a_tasks (context_id, owner_wallet, created_at);
 
 GRANT USAGE ON SCHEMA infra TO app_postgraphile;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA infra TO app_postgraphile;

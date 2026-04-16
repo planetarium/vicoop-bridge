@@ -17,7 +17,7 @@ import { hashToken, generateToken } from './token.js';
 import { getSchemaTools } from './schema-tools.js';
 import { runWithBearerToken } from './graphql-client.js';
 import type { Registry } from './registry.js';
-import { PostgresTaskStore } from './postgres-task-store.js';
+import { PostgresTaskStore, type ContextAwareTaskStore } from './postgres-task-store.js';
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -175,7 +175,7 @@ class AdminAgentExecutor implements AgentExecutor {
   constructor(
     private readonly db: Sql,
     private readonly registry: Registry,
-    private readonly taskStore: PostgresTaskStore,
+    private readonly taskStore: ContextAwareTaskStore,
   ) {}
 
   async execute(ctx: RequestContext, bus: ExecutionEventBus): Promise<void> {

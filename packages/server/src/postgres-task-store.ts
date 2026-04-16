@@ -32,7 +32,11 @@ function stripSensitiveMetadata(task: Task): Task {
   };
 }
 
-export class PostgresTaskStore implements TaskStore {
+export interface ContextAwareTaskStore extends TaskStore {
+  loadByContextId(contextId: string, walletAddress: string, excludeTaskId?: string): Promise<Task[]>;
+}
+
+export class PostgresTaskStore implements ContextAwareTaskStore {
   constructor(private readonly sql: Sql) {}
 
   async save(task: Task): Promise<void> {
