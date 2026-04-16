@@ -99,7 +99,23 @@ CREATE POLICY clients_postgraphile ON clients
 COMMENT ON COLUMN clients.token_hash IS E'@omit';
 
 -- ============================================================
--- 4. Grants
+-- 4. A2A task store (persists admin agent conversation history)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS a2a_tasks (
+  task_id    TEXT PRIMARY KEY,
+  context_id TEXT NOT NULL,
+  state      TEXT NOT NULL,
+  task_json  JSONB NOT NULL,
+  owner_wallet TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_a2a_tasks_context_id
+  ON a2a_tasks (context_id, created_at);
+
+-- ============================================================
+-- 5. Grants
 -- ============================================================
 GRANT USAGE ON SCHEMA public TO app_postgraphile, app_anonymous, app_authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_postgraphile;

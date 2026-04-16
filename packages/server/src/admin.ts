@@ -6,7 +6,6 @@ import type { Message } from '@a2a-js/sdk';
 import {
   A2AError,
   DefaultRequestHandler,
-  InMemoryTaskStore,
   JsonRpcTransportHandler,
   type AgentExecutor,
   type ExecutionEventBus,
@@ -18,6 +17,7 @@ import { hashToken, generateToken } from './token.js';
 import { getSchemaTools } from './schema-tools.js';
 import { runWithBearerToken } from './graphql-client.js';
 import type { Registry } from './registry.js';
+import { PostgresTaskStore } from './postgres-task-store.js';
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -175,6 +175,7 @@ class AdminAgentExecutor implements AgentExecutor {
   constructor(
     private readonly db: Sql,
     private readonly registry: Registry,
+    private readonly taskStore: PostgresTaskStore,
   ) {}
 
   async execute(ctx: RequestContext, bus: ExecutionEventBus): Promise<void> {
@@ -220,7 +221,15 @@ class AdminAgentExecutor implements AgentExecutor {
         const { tools: schemaTools, sdl } = await getSchemaTools();
         const customTools = buildCustomTools(this.db, this.registry, walletAddress);
         const tools = { ...schemaTools, ...customTools };
-        const history: Message[] = task?.history ?? [];
+
+        // Load conversation history from previous tasks in the same context
+        const previousTasks = await this.taskStore.loadByContextId(contextId, taskId);
+        const contextHistory: Message[] = [];
+        for (const prev of previousTasks) {
+          if (prev.history) contextHistory.push(...prev.history);
+        }
+        const currentHistory = task?.history ?? [];
+        const history = [...contextHistory, ...currentHistory];
 
         return generateText({
           model: anthropic('claude-sonnet-4-6'),
@@ -310,7 +319,8 @@ export interface AdminAgentOptions {
 
 export function createAdminTransport(opts: AdminAgentOptions): JsonRpcTransportHandler {
   const card = buildAdminAgentCard(opts.publicUrl);
-  const executor = new AdminAgentExecutor(opts.db, opts.registry);
-  const handler = new DefaultRequestHandler(card, new InMemoryTaskStore(), executor);
+  const taskStore = new PostgresTaskStore(opts.db);
+  const executor = new AdminAgentExecutor(opts.db, opts.registry, taskStore);
+  const handler = new DefaultRequestHandler(card, taskStore, executor);
   return new JsonRpcTransportHandler(handler);
 }
