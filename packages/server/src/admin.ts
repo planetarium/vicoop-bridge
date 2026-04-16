@@ -137,6 +137,14 @@ Your conversation history is persisted in PostgreSQL. You remember all previous 
 
 // ── Custom Tools (token generation, active agents) ───────────────
 
+const ETH_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+function validateWalletAddress(address: string): string | null {
+  const trimmed = address.trim();
+  if (!ETH_ADDRESS_RE.test(trimmed)) return null;
+  return trimmed.toLowerCase();
+}
+
 function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
   return {
     register_client: tool({
@@ -191,7 +199,8 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
         wallet_address: z.string().describe('Ethereum wallet address to allow (e.g. 0x1234...)'),
       }),
       execute: async ({ agent_id, wallet_address }) => {
-        const wallet = wallet_address.toLowerCase();
+        const wallet = validateWalletAddress(wallet_address);
+        if (!wallet) return { error: 'Invalid wallet address. Expected 0x followed by 40 hex characters.' };
         const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
         const result = await db.begin(async (tx) => {
           await tx`SELECT set_config('role', 'app_authenticated', true)`;
@@ -232,7 +241,8 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
         wallet_address: z.string().describe('Ethereum wallet address to remove'),
       }),
       execute: async ({ agent_id, wallet_address }) => {
-        const wallet = wallet_address.toLowerCase();
+        const wallet = validateWalletAddress(wallet_address);
+        if (!wallet) return { error: 'Invalid wallet address. Expected 0x followed by 40 hex characters.' };
         const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
         const result = await db.begin(async (tx) => {
           await tx`SELECT set_config('role', 'app_authenticated', true)`;

@@ -21,7 +21,7 @@ export function agentAuthMiddleware(registry: Registry) {
     }
 
     const authHeader = c.req.header('Authorization');
-    const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
     if (!bearerToken) {
       return c.json({
         jsonrpc: '2.0',

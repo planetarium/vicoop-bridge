@@ -136,7 +136,7 @@ ALTER TABLE agent_policies ENABLE ROW LEVEL SECURITY;
 
 -- allowed_callers must only be modified via custom tools (add_caller/remove_caller)
 -- to keep the in-memory Registry cache in sync. Hide from GraphQL mutations.
-COMMENT ON COLUMN agent_policies.allowed_callers IS E'@omit update';
+COMMENT ON COLUMN agent_policies.allowed_callers IS E'@omit create,update';
 
 -- Authenticated users see their own policies; admins see all
 DROP POLICY IF EXISTS agent_policies_select ON agent_policies;
@@ -157,11 +157,11 @@ CREATE POLICY agent_policies_update ON agent_policies
   USING (owner_wallet = lower(current_wallet_address()) OR is_admin())
   WITH CHECK (owner_wallet = lower(current_wallet_address()) OR is_admin());
 
--- Users can delete their own policies; admins can delete all
+-- No DELETE policy for app_authenticated — policy rows are managed by the server
+-- and must persist as long as the agent_id exists. Use allowed_callers to toggle
+-- public/restricted. Omit delete mutations from PostGraphile.
 DROP POLICY IF EXISTS agent_policies_delete ON agent_policies;
-CREATE POLICY agent_policies_delete ON agent_policies
-  FOR DELETE TO app_authenticated
-  USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
+COMMENT ON TABLE agent_policies IS E'@omit delete';
 
 -- app_postgraphile bypasses RLS (used by server for auth checks)
 DROP POLICY IF EXISTS agent_policies_postgraphile ON agent_policies;
