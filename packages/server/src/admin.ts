@@ -95,10 +95,19 @@ Clients are services that connect to the server via WebSocket to register A2A ag
 
 ## Tool Usage
 
-- Use \`query_*\` and \`mutate_*\` tools for standard CRUD operations on clients. RLS enforces ownership.
+- Use \`query_*\` and \`mutate_*\` tools for standard CRUD operations on clients and agent policies. RLS enforces ownership.
 - Use \`register_client\` to create a new client — this generates a token and hashes it before storing.
 - Use \`list_active_agents\` to see currently connected agents.
+- Use \`add_caller\` / \`remove_caller\` / \`list_callers\` to manage per-agent access control.
 - Use \`execute_graphql\` for complex queries not covered by auto-generated tools.
+
+## Agent Access Control
+
+Each agent has an access policy (\`agent_policies\` table) with an \`allowed_callers\` list:
+- **Empty \`allowed_callers\`**: Agent is public — anyone can call it via A2A.
+- **Non-empty \`allowed_callers\`**: Agent requires SIWE Bearer authentication, and only listed wallet addresses can call.
+
+When an agent registers via WebSocket, a default policy (public) is auto-created. Use \`add_caller\` to restrict access to specific wallets. The agent card automatically includes \`securitySchemes\` when callers are configured.
 
 ## Conversation memory
 
@@ -107,6 +116,7 @@ Your conversation history is persisted in PostgreSQL. You remember all previous 
 ## Important rules
 
 - When registering a client, always warn the user that the token is shown only once.
+- When adding a caller, explain that the agent will require SIWE authentication from that point on.
 - Present data clearly in tables or lists.
 - If asked about something outside client management, politely explain your scope.
 
@@ -164,8 +174,100 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
           agent_id: a.agentId,
           client_id: a.clientId,
           agent_name: a.agentCard.name,
+          allowed_callers: a.allowedCallers,
           connected_at: new Date(a.connectedAt).toISOString(),
         }));
+      },
+    }),
+
+    add_caller: tool({
+      description:
+        'Add a wallet address to an agent\'s allowed callers. Once any caller is added, the agent requires SIWE authentication.',
+      inputSchema: z.object({
+        agent_id: z.string().describe('The agent ID to add the caller to'),
+        wallet_address: z.string().describe('Ethereum wallet address to allow (e.g. 0x1234...)'),
+      }),
+      execute: async ({ agent_id, wallet_address }) => {
+        const wallet = wallet_address.toLowerCase();
+        const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
+        const result = await db.begin(async (tx) => {
+          await tx`SELECT set_config('role', 'app_authenticated', true)`;
+          await tx`SELECT set_config('jwt.claims.wallet_address', ${walletAddress.toLowerCase()}, true)`;
+          await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
+          return tx`
+            UPDATE agent_policies
+            SET allowed_callers = array_append(allowed_callers, ${wallet}),
+                updated_at = now()
+            WHERE agent_id = ${agent_id}
+              AND NOT (${wallet} = ANY(allowed_callers))
+            RETURNING agent_id, owner_wallet, allowed_callers
+          `;
+        });
+        if (result.length === 0) {
+          const existing = await db`SELECT allowed_callers FROM agent_policies WHERE agent_id = ${agent_id}`;
+          if (existing.length === 0) return { error: 'Agent policy not found. Agent may not have connected yet.' };
+          if ((existing[0].allowed_callers as string[]).includes(wallet)) return { agent_id, message: 'Wallet already in allowed callers', allowed_callers: existing[0].allowed_callers };
+          return { error: 'Not authorized to modify this agent policy.' };
+        }
+        const callers = result[0].allowed_callers as string[];
+        registry.updateAllowedCallers(agent_id, callers);
+        return { agent_id, allowed_callers: callers };
+      },
+    }),
+
+    remove_caller: tool({
+      description:
+        'Remove a wallet address from an agent\'s allowed callers. If the list becomes empty, the agent becomes public again.',
+      inputSchema: z.object({
+        agent_id: z.string().describe('The agent ID to remove the caller from'),
+        wallet_address: z.string().describe('Ethereum wallet address to remove'),
+      }),
+      execute: async ({ agent_id, wallet_address }) => {
+        const wallet = wallet_address.toLowerCase();
+        const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
+        const result = await db.begin(async (tx) => {
+          await tx`SELECT set_config('role', 'app_authenticated', true)`;
+          await tx`SELECT set_config('jwt.claims.wallet_address', ${walletAddress.toLowerCase()}, true)`;
+          await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
+          return tx`
+            UPDATE agent_policies
+            SET allowed_callers = array_remove(allowed_callers, ${wallet}),
+                updated_at = now()
+            WHERE agent_id = ${agent_id}
+            RETURNING agent_id, owner_wallet, allowed_callers
+          `;
+        });
+        if (result.length === 0) return { error: 'Agent policy not found or not authorized.' };
+        const callers = result[0].allowed_callers as string[];
+        registry.updateAllowedCallers(agent_id, callers);
+        return { agent_id, allowed_callers: callers };
+      },
+    }),
+
+    list_callers: tool({
+      description: 'List the allowed callers for an agent. Empty list means the agent is public.',
+      inputSchema: z.object({
+        agent_id: z.string().describe('The agent ID to list callers for'),
+      }),
+      execute: async ({ agent_id }) => {
+        const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
+        const result = await db.begin(async (tx) => {
+          await tx`SELECT set_config('role', 'app_authenticated', true)`;
+          await tx`SELECT set_config('jwt.claims.wallet_address', ${walletAddress.toLowerCase()}, true)`;
+          await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
+          return tx`
+            SELECT agent_id, owner_wallet, allowed_callers, created_at, updated_at
+            FROM agent_policies WHERE agent_id = ${agent_id}
+          `;
+        });
+        if (result.length === 0) return { error: 'Agent policy not found.' };
+        const policy = result[0];
+        return {
+          agent_id: policy.agent_id,
+          owner_wallet: policy.owner_wallet,
+          allowed_callers: policy.allowed_callers,
+          is_public: (policy.allowed_callers as string[]).length === 0,
+        };
       },
     }),
   };

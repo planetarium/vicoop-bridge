@@ -63,6 +63,15 @@ export const AgentSkill = z.object({
   tags: z.array(z.string()).optional(),
 });
 
+export const SecurityScheme = z.object({
+  type: z.string(),
+  scheme: z.string().optional(),
+  bearerFormat: z.string().optional(),
+  description: z.string().optional(),
+  in: z.enum(['header', 'query', 'cookie']).optional(),
+  name: z.string().optional(),
+}).passthrough();
+
 export const AgentCard = z.object({
   name: z.string(),
   description: z.string().optional(),
@@ -78,6 +87,8 @@ export const AgentCard = z.object({
   defaultInputModes: z.array(z.string()).optional(),
   defaultOutputModes: z.array(z.string()).optional(),
   skills: z.array(AgentSkill).optional(),
+  securitySchemes: z.record(z.string(), SecurityScheme).optional(),
+  security: z.array(z.record(z.string(), z.array(z.string()))).optional(),
 });
 export type AgentCard = z.infer<typeof AgentCard>;
 

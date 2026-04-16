@@ -122,7 +122,51 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA infra
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_postgraphile;
 
 -- ============================================================
--- 5. Grants
+-- 5. Agent Policies table
+-- ============================================================
+CREATE TABLE IF NOT EXISTS agent_policies (
+  agent_id         TEXT PRIMARY KEY,
+  owner_wallet     VARCHAR(42) NOT NULL,
+  allowed_callers  TEXT[] NOT NULL DEFAULT '{}',
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE agent_policies ENABLE ROW LEVEL SECURITY;
+
+-- Authenticated users see their own policies; admins see all
+DROP POLICY IF EXISTS agent_policies_select ON agent_policies;
+CREATE POLICY agent_policies_select ON agent_policies
+  FOR SELECT TO app_authenticated
+  USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
+
+-- Users can insert policies they own
+DROP POLICY IF EXISTS agent_policies_insert ON agent_policies;
+CREATE POLICY agent_policies_insert ON agent_policies
+  FOR INSERT TO app_authenticated
+  WITH CHECK (owner_wallet = lower(current_wallet_address()));
+
+-- Users can update their own policies; admins can update all
+DROP POLICY IF EXISTS agent_policies_update ON agent_policies;
+CREATE POLICY agent_policies_update ON agent_policies
+  FOR UPDATE TO app_authenticated
+  USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
+
+-- Users can delete their own policies; admins can delete all
+DROP POLICY IF EXISTS agent_policies_delete ON agent_policies;
+CREATE POLICY agent_policies_delete ON agent_policies
+  FOR DELETE TO app_authenticated
+  USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
+
+-- app_postgraphile bypasses RLS (used by server for auth checks)
+DROP POLICY IF EXISTS agent_policies_postgraphile ON agent_policies;
+CREATE POLICY agent_policies_postgraphile ON agent_policies
+  FOR ALL TO app_postgraphile
+  USING (true)
+  WITH CHECK (true);
+
+-- ============================================================
+-- 6. Grants
 -- ============================================================
 GRANT USAGE ON SCHEMA public TO app_postgraphile, app_anonymous, app_authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_postgraphile;

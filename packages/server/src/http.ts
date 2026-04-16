@@ -14,6 +14,7 @@ import { ServerAgentExecutor } from './executor.js';
 import type { ClientConnection, Registry } from './registry.js';
 import { createAdminTransport, buildAdminAgentCard } from './admin.js';
 import { verifySiweToken } from './siwe-token.js';
+import { agentAuthMiddleware } from './agent-auth.js';
 import type { Sql } from './db.js';
 
 export interface ServerHttpOptions {
@@ -30,7 +31,7 @@ function toSdkAgentCard(
   const url = publicUrl
     ? `${publicUrl}/agents/${conn.agentId}`
     : `/agents/${conn.agentId}`;
-  return {
+  const card: SdkAgentCard = {
     name: wire.name,
     description: wire.description ?? '',
     version: wire.version,
@@ -50,6 +51,18 @@ function toSdkAgentCard(
       tags: s.tags ?? [],
     })),
   };
+  if (conn.allowedCallers.length > 0) {
+    card.securitySchemes = {
+      siwe: {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'SIWE',
+        description: 'Sign-In with Ethereum (EIP-4361) bearer token',
+      },
+    };
+    card.security = [{ siwe: [] }];
+  }
+  return card;
 }
 
 export function createHttpApp(opts: ServerHttpOptions): Hono {
@@ -186,11 +199,11 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     return c.json(toSdkAgentCard(conn.agentCard, conn, opts.publicUrl));
   });
 
-  // Client agent A2A endpoints
-  app.post('/agents/:id', async (c) => {
-    const id = c.req.param('id');
-    const conn = opts.registry.getAgent(id);
-    if (!conn) return c.json({ error: 'agent not connected' }, 404);
+  // Client agent A2A endpoints (auth middleware checks allowedCallers)
+  const authMw = agentAuthMiddleware(opts.registry);
+  app.post('/agents/:id', authMw, async (c) => {
+    const id = c.req.param('id')!;
+    const conn = opts.registry.getAgent(id)!;
 
     const rawBody = await c.req.text();
     const transport = getTransport(conn);

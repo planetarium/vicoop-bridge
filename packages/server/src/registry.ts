@@ -6,7 +6,9 @@ import type { ExecutionEventBus } from '@a2a-js/sdk/server';
 export interface ClientConnection {
   agentId: string;
   clientId: string;
+  ownerWallet: string;
   agentCard: AgentCard;
+  allowedCallers: string[];
   ws: WebSocket;
   connectedAt: number;
 }
@@ -83,6 +85,11 @@ export class Registry {
 
   unbindTask(taskId: string): void {
     this.bindings.delete(taskId);
+  }
+
+  updateAllowedCallers(agentId: string, callers: string[]): void {
+    const conn = this.agents.get(agentId);
+    if (conn) conn.allowedCallers = callers;
   }
 
   sendToAgent(agentId: string, frame: DownFrame): boolean {

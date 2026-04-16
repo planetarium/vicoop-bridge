@@ -7,14 +7,31 @@ import { hashToken } from './token.js';
 
 interface ClientRow {
   id: string;
+  owner_wallet: string;
   allowed_agent_ids: string[];
 }
 
 async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | null> {
   const rows = await sql<ClientRow[]>`
-    SELECT id, allowed_agent_ids FROM clients WHERE token_hash = ${hash} AND revoked = false
+    SELECT id, owner_wallet, allowed_agent_ids FROM clients WHERE token_hash = ${hash} AND revoked = false
   `;
   return rows[0] ?? null;
+}
+
+interface PolicyRow {
+  allowed_callers: string[];
+}
+
+async function ensureAgentPolicy(sql: Sql, agentId: string, ownerWallet: string): Promise<string[]> {
+  await sql`
+    INSERT INTO agent_policies (agent_id, owner_wallet)
+    VALUES (${agentId}, ${ownerWallet.toLowerCase()})
+    ON CONFLICT (agent_id) DO NOTHING
+  `;
+  const rows = await sql<PolicyRow[]>`
+    SELECT allowed_callers FROM agent_policies WHERE agent_id = ${agentId}
+  `;
+  return rows[0]?.allowed_callers ?? [];
 }
 
 export interface ServerWsOptions {
@@ -69,11 +86,16 @@ async function authenticateAndRegister(
     return { ok: false, code: 4008, reason: 'agent id not authorized for this client' };
   }
   const clientId = client.id;
+  const ownerWallet = client.owner_wallet;
+
+  const allowedCallers = await ensureAgentPolicy(opts.db, frame.agentId, ownerWallet);
 
   const result = opts.registry.registerAgent({
     agentId: frame.agentId,
     clientId,
+    ownerWallet,
     agentCard: frame.agentCard,
+    allowedCallers,
     ws,
     connectedAt: Date.now(),
   });
