@@ -253,10 +253,11 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
             SET allowed_callers = array_remove(allowed_callers, ${wallet}),
                 updated_at = now()
             WHERE agent_id = ${agent_id}
+              AND ${wallet} = ANY(allowed_callers)
             RETURNING agent_id, owner_wallet, allowed_callers
           `;
         });
-        if (result.length === 0) return { error: 'Agent policy not found or not authorized.' };
+        if (result.length === 0) return { error: 'Wallet not found in allowed callers, agent policy not found, or not authorized.' };
         const callers = result[0].allowed_callers as string[];
         registry.updateAllowedCallers(agent_id, callers);
         return { agent_id, allowed_callers: callers };

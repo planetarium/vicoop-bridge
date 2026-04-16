@@ -15,7 +15,11 @@ export function agentAuthMiddleware(registry: Registry, opts?: AgentAuthOptions)
     const agentId = c.req.param('id')!;
     const conn = registry.getAgent(agentId);
     if (!conn) {
-      return c.json({ error: 'agent not connected' }, 404);
+      return c.json({
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32000, message: 'Agent not connected' },
+      }, 404);
     }
 
     c.set('agentConn', conn);
