@@ -149,6 +149,31 @@ export function createHttpApp(opts: RelayHttpOptions): Hono {
     return handleTransportResult(result, c);
   });
 
+  // PostGraphile proxy — forward /graphql and /graphiql to internal PostGraphile server
+  const postgraphileUrl = `http://localhost:${process.env.POSTGRAPHILE_PORT ?? 5433}`;
+
+  app.all('/graphql', async (c) => {
+    const res = await fetch(`${postgraphileUrl}/graphql`, {
+      method: c.req.method,
+      headers: Object.fromEntries(c.req.raw.headers),
+      body: c.req.method === 'POST' ? await c.req.text() : undefined,
+    });
+    return new Response(res.body, {
+      status: res.status,
+      headers: Object.fromEntries(res.headers),
+    });
+  });
+
+  app.get('/graphiql', async (c) => {
+    const res = await fetch(`${postgraphileUrl}/graphiql`, {
+      headers: Object.fromEntries(c.req.raw.headers),
+    });
+    return new Response(res.body, {
+      status: res.status,
+      headers: Object.fromEntries(res.headers),
+    });
+  });
+
   // Connector agent cards
   app.get('/agents/:id/.well-known/agent-card.json', (c) => {
     const id = c.req.param('id');
