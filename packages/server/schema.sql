@@ -134,8 +134,9 @@ CREATE TABLE IF NOT EXISTS agent_policies (
 
 ALTER TABLE agent_policies ENABLE ROW LEVEL SECURITY;
 
--- allowed_callers must only be modified via custom tools (add_caller/remove_caller)
--- to keep the in-memory Registry cache in sync. Hide from GraphQL mutations.
+-- agent_policies rows are server-managed (auto-created on WS registration).
+-- Only expose SELECT to authenticated users; all mutations go through custom tools.
+COMMENT ON TABLE agent_policies IS E'@omit create,update,delete';
 COMMENT ON COLUMN agent_policies.allowed_callers IS E'@omit create,update';
 
 -- Authenticated users see their own policies; admins see all
@@ -144,24 +145,11 @@ CREATE POLICY agent_policies_select ON agent_policies
   FOR SELECT TO app_authenticated
   USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
 
--- Users can insert policies they own
+-- No INSERT/UPDATE/DELETE policies for app_authenticated — only the server
+-- (via app_postgraphile) and custom admin tools manage these rows.
 DROP POLICY IF EXISTS agent_policies_insert ON agent_policies;
-CREATE POLICY agent_policies_insert ON agent_policies
-  FOR INSERT TO app_authenticated
-  WITH CHECK (owner_wallet = lower(current_wallet_address()));
-
--- Users can update their own policies; admins can update all
 DROP POLICY IF EXISTS agent_policies_update ON agent_policies;
-CREATE POLICY agent_policies_update ON agent_policies
-  FOR UPDATE TO app_authenticated
-  USING (owner_wallet = lower(current_wallet_address()) OR is_admin())
-  WITH CHECK (owner_wallet = lower(current_wallet_address()) OR is_admin());
-
--- No DELETE policy for app_authenticated — policy rows are managed by the server
--- and must persist as long as the agent_id exists. Use allowed_callers to toggle
--- public/restricted. Omit delete mutations from PostGraphile.
 DROP POLICY IF EXISTS agent_policies_delete ON agent_policies;
-COMMENT ON TABLE agent_policies IS E'@omit delete';
 
 -- app_postgraphile bypasses RLS (used by server for auth checks)
 DROP POLICY IF EXISTS agent_policies_postgraphile ON agent_policies;

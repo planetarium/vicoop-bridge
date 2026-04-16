@@ -135,10 +135,20 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }),
   );
 
+  // Derive SIWE domain early so both admin and agent endpoints use it
+  let siweDomain: string | undefined;
+  if (opts.publicUrl) {
+    try {
+      siweDomain = new URL(opts.publicUrl).hostname;
+    } catch {
+      throw new Error(`PUBLIC_URL "${opts.publicUrl}" is not a valid URL — cannot configure SIWE domain verification`);
+    }
+  }
+
   // Root POST — admin agent A2A endpoint (SIWE auth)
   app.post('/', async (c) => {
     const authHeader = c.req.header('Authorization');
-    const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
     if (!bearerToken) {
       return c.json({
         jsonrpc: '2.0',
@@ -149,7 +159,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
 
     let walletAddress: string;
     try {
-      walletAddress = await verifySiweToken(bearerToken);
+      walletAddress = await verifySiweToken(bearerToken, { domain: siweDomain });
     } catch (err) {
       return c.json({
         jsonrpc: '2.0',
@@ -207,14 +217,6 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   });
 
   // Client agent A2A endpoints (auth middleware checks allowedCallers)
-  let siweDomain: string | undefined;
-  if (opts.publicUrl) {
-    try {
-      siweDomain = new URL(opts.publicUrl).hostname;
-    } catch {
-      throw new Error(`PUBLIC_URL "${opts.publicUrl}" is not a valid URL — cannot configure SIWE domain verification`);
-    }
-  }
   const authMw = agentAuthMiddleware(opts.registry, { domain: siweDomain });
   app.post('/agents/:id', authMw, async (c) => {
     const conn = getAgentConn(c);
