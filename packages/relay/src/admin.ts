@@ -277,16 +277,12 @@ class AdminAgentExecutor implements AgentExecutor {
 
 // ── Agent Card & Transport ───────────────────────────────────────
 
-export const ADMIN_AGENT_ID = '_relay-admin';
-
 export function buildAdminAgentCard(publicUrl?: string): SdkAgentCard {
-  const url = publicUrl
-    ? `${publicUrl}/agents/${ADMIN_AGENT_ID}`
-    : `/agents/${ADMIN_AGENT_ID}`;
+  const url = publicUrl ?? '';
   return {
-    name: 'Relay Admin',
+    name: 'Vicoop Bridge Relay Admin',
     description:
-      'Manage connector registrations, revocations, and access control for this relay. Authenticated via SIWE.',
+      'Manages connector registration, revocation, and access control for Vicoop Bridge Relay. Connectors are WebSocket clients that bridge local A2A agents to the relay. Each connector is scoped to an owner wallet and an explicit agent ID allowlist. Requires SIWE authentication.',
     version: '0.1.0',
     protocolVersion: '0.3.0',
     url,
