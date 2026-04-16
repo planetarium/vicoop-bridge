@@ -7,14 +7,42 @@ import { hashToken } from './token.js';
 
 interface ClientRow {
   id: string;
+  owner_wallet: string;
   allowed_agent_ids: string[];
 }
 
 async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | null> {
   const rows = await sql<ClientRow[]>`
-    SELECT id, allowed_agent_ids FROM clients WHERE token_hash = ${hash} AND revoked = false
+    SELECT id, owner_wallet, allowed_agent_ids FROM clients WHERE token_hash = ${hash} AND revoked = false
   `;
   return rows[0] ?? null;
+}
+
+interface PolicyRow {
+  owner_wallet: string;
+  allowed_callers: string[];
+}
+
+async function ensureAgentPolicy(
+  sql: Sql,
+  agentId: string,
+  ownerWallet: string,
+): Promise<{ ok: true; allowedCallers: string[] } | { ok: false; reason: string }> {
+  await sql`
+    INSERT INTO agent_policies (agent_id, owner_wallet)
+    VALUES (${agentId}, ${ownerWallet.toLowerCase()})
+    ON CONFLICT (agent_id) DO NOTHING
+  `;
+  const rows = await sql<PolicyRow[]>`
+    SELECT owner_wallet, allowed_callers FROM agent_policies WHERE agent_id = ${agentId}
+  `;
+  if (rows.length === 0) {
+    return { ok: false, reason: 'failed to create agent policy' };
+  }
+  if (rows[0].owner_wallet.toLowerCase() !== ownerWallet.toLowerCase()) {
+    return { ok: false, reason: 'agent id owned by a different wallet' };
+  }
+  return { ok: true, allowedCallers: rows[0].allowed_callers.map((a) => a.toLowerCase()) };
 }
 
 export interface ServerWsOptions {
@@ -69,11 +97,26 @@ async function authenticateAndRegister(
     return { ok: false, code: 4008, reason: 'agent id not authorized for this client' };
   }
   const clientId = client.id;
+  const ownerWallet = client.owner_wallet;
+
+  const policyResult = await ensureAgentPolicy(opts.db, frame.agentId, ownerWallet);
+  if (!policyResult.ok) {
+    console.log(JSON.stringify({
+      event: 'client_rejected',
+      reason: policyResult.reason,
+      agentId: frame.agentId,
+      clientId,
+      ts: new Date().toISOString(),
+    }));
+    return { ok: false, code: 4010, reason: policyResult.reason };
+  }
 
   const result = opts.registry.registerAgent({
     agentId: frame.agentId,
     clientId,
+    ownerWallet,
     agentCard: frame.agentCard,
+    allowedCallers: policyResult.allowedCallers,
     ws,
     connectedAt: Date.now(),
   });
@@ -153,6 +196,9 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           name: frame.agentCard.name,
           ts: new Date().toISOString(),
         }));
+      }).catch((err) => {
+        console.error('[server] auth error:', err);
+        ws.close(1011, 'internal error');
       });
       return;
     }

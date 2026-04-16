@@ -122,7 +122,44 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA infra
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_postgraphile;
 
 -- ============================================================
--- 5. Grants
+-- 5. Agent Policies table
+-- ============================================================
+CREATE TABLE IF NOT EXISTS agent_policies (
+  agent_id         TEXT PRIMARY KEY,
+  owner_wallet     VARCHAR(42) NOT NULL,
+  allowed_callers  TEXT[] NOT NULL DEFAULT '{}',
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE agent_policies ENABLE ROW LEVEL SECURITY;
+
+-- agent_policies rows are server-managed (auto-created on WS registration).
+-- Only expose SELECT to authenticated users; all mutations go through custom tools.
+COMMENT ON TABLE agent_policies IS E'@omit create,update,delete';
+COMMENT ON COLUMN agent_policies.allowed_callers IS E'@omit create,update';
+
+-- Authenticated users see their own policies; admins see all
+DROP POLICY IF EXISTS agent_policies_select ON agent_policies;
+CREATE POLICY agent_policies_select ON agent_policies
+  FOR SELECT TO app_authenticated
+  USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
+
+-- No INSERT/UPDATE/DELETE policies for app_authenticated — only the server
+-- (via app_postgraphile) and custom admin tools manage these rows.
+DROP POLICY IF EXISTS agent_policies_insert ON agent_policies;
+DROP POLICY IF EXISTS agent_policies_update ON agent_policies;
+DROP POLICY IF EXISTS agent_policies_delete ON agent_policies;
+
+-- app_postgraphile bypasses RLS (used by server for auth checks)
+DROP POLICY IF EXISTS agent_policies_postgraphile ON agent_policies;
+CREATE POLICY agent_policies_postgraphile ON agent_policies
+  FOR ALL TO app_postgraphile
+  USING (true)
+  WITH CHECK (true);
+
+-- ============================================================
+-- 6. Grants
 -- ============================================================
 GRANT USAGE ON SCHEMA public TO app_postgraphile, app_anonymous, app_authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_postgraphile;

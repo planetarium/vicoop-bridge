@@ -14,6 +14,7 @@ import { ServerAgentExecutor } from './executor.js';
 import type { ClientConnection, Registry } from './registry.js';
 import { createAdminTransport, buildAdminAgentCard } from './admin.js';
 import { verifySiweToken } from './siwe-token.js';
+import { agentAuthMiddleware, getAgentConn } from './agent-auth.js';
 import type { Sql } from './db.js';
 
 export interface ServerHttpOptions {
@@ -30,7 +31,7 @@ function toSdkAgentCard(
   const url = publicUrl
     ? `${publicUrl}/agents/${conn.agentId}`
     : `/agents/${conn.agentId}`;
-  return {
+  const card: SdkAgentCard = {
     name: wire.name,
     description: wire.description ?? '',
     version: wire.version,
@@ -50,6 +51,18 @@ function toSdkAgentCard(
       tags: s.tags ?? [],
     })),
   };
+  if (conn.allowedCallers.length > 0) {
+    card.securitySchemes = {
+      siwe: {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'SIWE',
+        description: 'Sign-In with Ethereum (EIP-4361) bearer token',
+      },
+    };
+    card.security = [{ siwe: [] }];
+  }
+  return card;
 }
 
 export function createHttpApp(opts: ServerHttpOptions): Hono {
@@ -67,6 +80,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   const adminCard = buildAdminAgentCard(opts.publicUrl);
 
   function getTransport(conn: ClientConnection): JsonRpcTransportHandler {
+    // Rebuild transport when security state changes (allowedCallers toggled)
     const cached = transports.get(conn.agentId);
     if (cached) return cached;
     const card = toSdkAgentCard(conn.agentCard, conn, opts.publicUrl);
@@ -76,6 +90,12 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     transports.set(conn.agentId, transport);
     return transport;
   }
+
+  // Invalidate cached transport when allowedCallers changes so the
+  // handler's card reflects the updated security fields.
+  opts.registry.onCallerChange((agentId) => {
+    transports.delete(agentId);
+  });
 
   async function handleTransportResult(result: unknown, c: Context) {
     if (Symbol.asyncIterator in (result as object)) {
@@ -115,10 +135,20 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }),
   );
 
+  // Derive SIWE domain early so both admin and agent endpoints use it
+  let siweDomain: string | undefined;
+  if (opts.publicUrl) {
+    try {
+      siweDomain = new URL(opts.publicUrl).hostname;
+    } catch {
+      throw new Error(`PUBLIC_URL "${opts.publicUrl}" is not a valid URL — cannot configure SIWE domain verification`);
+    }
+  }
+
   // Root POST — admin agent A2A endpoint (SIWE auth)
   app.post('/', async (c) => {
     const authHeader = c.req.header('Authorization');
-    const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
     if (!bearerToken) {
       return c.json({
         jsonrpc: '2.0',
@@ -129,7 +159,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
 
     let walletAddress: string;
     try {
-      walletAddress = await verifySiweToken(bearerToken);
+      walletAddress = await verifySiweToken(bearerToken, { domain: siweDomain });
     } catch (err) {
       return c.json({
         jsonrpc: '2.0',
@@ -186,11 +216,10 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     return c.json(toSdkAgentCard(conn.agentCard, conn, opts.publicUrl));
   });
 
-  // Client agent A2A endpoints
-  app.post('/agents/:id', async (c) => {
-    const id = c.req.param('id');
-    const conn = opts.registry.getAgent(id);
-    if (!conn) return c.json({ error: 'agent not connected' }, 404);
+  // Client agent A2A endpoints (auth middleware checks allowedCallers)
+  const authMw = agentAuthMiddleware(opts.registry, { domain: siweDomain });
+  app.post('/agents/:id', authMw, async (c) => {
+    const conn = getAgentConn(c);
 
     const rawBody = await c.req.text();
     const transport = getTransport(conn);

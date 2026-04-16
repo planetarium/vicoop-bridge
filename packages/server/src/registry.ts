@@ -6,7 +6,9 @@ import type { ExecutionEventBus } from '@a2a-js/sdk/server';
 export interface ClientConnection {
   agentId: string;
   clientId: string;
+  ownerWallet: string;
   agentCard: AgentCard;
+  allowedCallers: string[];
   ws: WebSocket;
   connectedAt: number;
 }
@@ -18,9 +20,12 @@ export interface TaskBinding {
   eventBus: ExecutionEventBus;
 }
 
+export type CallerChangeListener = (agentId: string, callers: string[]) => void;
+
 export class Registry {
   private agents = new Map<string, ClientConnection>();
   private bindings = new Map<string, TaskBinding>();
+  private callerChangeListeners: CallerChangeListener[] = [];
 
   registerAgent(conn: ClientConnection): { ok: true } | { ok: false; reason: string } {
     const existing = this.agents.get(conn.agentId);
@@ -83,6 +88,19 @@ export class Registry {
 
   unbindTask(taskId: string): void {
     this.bindings.delete(taskId);
+  }
+
+  onCallerChange(listener: CallerChangeListener): void {
+    this.callerChangeListeners.push(listener);
+  }
+
+  updateAllowedCallers(agentId: string, callers: string[]): void {
+    const normalized = callers.map((c) => c.toLowerCase());
+    const conn = this.agents.get(agentId);
+    if (conn) conn.allowedCallers = normalized;
+    for (const listener of this.callerChangeListeners) {
+      listener(agentId, normalized);
+    }
   }
 
   sendToAgent(agentId: string, frame: DownFrame): boolean {
