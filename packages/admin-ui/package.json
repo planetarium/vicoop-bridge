@@ -1,0 +1,33 @@
+{
+  "name": "@vicoop-bridge/admin-ui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@rainbow-me/rainbowkit": "^2",
+    "@tanstack/react-query": "^5",
+    "lucide-react": "^0.468",
+    "react": "^19",
+    "react-dom": "^19",
+    "react-markdown": "^9",
+    "remark-gfm": "^4.0.1",
+    "siwe": "^2",
+    "viem": "^2",
+    "wagmi": "^2"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^4",
+    "tailwindcss": "^4",
+    "typescript": "^5",
+    "vite": "^6"
+  }
+}

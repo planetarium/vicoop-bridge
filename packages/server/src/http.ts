@@ -1,4 +1,5 @@
 import { Hono, type Context } from 'hono';
+import { cors } from 'hono/cors';
 import { stream } from 'hono/streaming';
 import {
   DefaultRequestHandler,
@@ -51,6 +52,14 @@ function toSdkAgentCard(
 
 export function createHttpApp(opts: ServerHttpOptions): Hono {
   const app = new Hono();
+
+  app.use('*', cors({
+    origin: (origin) => origin,
+    allowHeaders: ['Content-Type', 'Authorization'],
+    allowMethods: ['GET', 'POST', 'OPTIONS'],
+    credentials: true,
+  }));
+
   const taskStore = new InMemoryTaskStore();
   const transports = new Map<string, JsonRpcTransportHandler>();
 
