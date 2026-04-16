@@ -212,7 +212,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     try {
       siweDomain = new URL(opts.publicUrl).hostname;
     } catch {
-      console.warn(`[server] WARNING: publicUrl "${opts.publicUrl}" is not a valid URL — SIWE domain verification disabled`);
+      throw new Error(`PUBLIC_URL "${opts.publicUrl}" is not a valid URL — cannot configure SIWE domain verification`);
     }
   }
   const authMw = agentAuthMiddleware(opts.registry, { domain: siweDomain });
