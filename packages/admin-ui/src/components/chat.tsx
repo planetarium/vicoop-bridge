@@ -28,6 +28,7 @@ export function Chat() {
   const clientRef = useRef<Client | null>(null);
   const tokenRef = useRef(token);
   tokenRef.current = token;
+  const [contextId] = useState(() => crypto.randomUUID());
 
   useEffect(() => {
     clientRef.current = null;
@@ -60,6 +61,7 @@ export function Chat() {
         message: {
           kind: 'message',
           messageId: crypto.randomUUID(),
+          contextId,
           role: 'user',
           parts: [{ kind: 'text', text }],
         },
