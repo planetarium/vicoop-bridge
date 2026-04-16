@@ -1,10 +1,10 @@
-name: Deploy Relay
+name: Deploy Server
 
 on:
   push:
     branches: [main]
     paths:
-      - 'packages/relay/**'
+      - 'packages/server/**'
       - 'packages/protocol/**'
       - 'pnpm-lock.yaml'
 
@@ -20,6 +20,6 @@ jobs:
         uses: superfly/flyctl-actions/setup-flyctl@master
 
       - name: Fly deploy
-        run: flyctl deploy --remote-only --config packages/relay/fly.toml
+        run: flyctl deploy --remote-only --config packages/server/fly.toml
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

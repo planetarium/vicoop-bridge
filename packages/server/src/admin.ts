@@ -76,7 +76,7 @@ function buildSystemPrompt(walletAddress: string, sdl?: string): string {
     ? 'You are logged in as an **admin**. You can see and manage ALL connectors across all owners.'
     : `You are logged in as wallet \`${walletAddress}\`. You can only see and manage connectors you own (RLS enforced).`;
 
-  let prompt = `You are the Relay Admin Agent for vicoop-bridge. You manage connector registrations and access control.
+  let prompt = `You are the Server Admin Agent for vicoop-bridge. You manage connector registrations and access control.
 
 ## Current User
 
@@ -84,7 +84,7 @@ ${scope}
 
 ## What you manage
 
-Connectors are services that connect to the relay via WebSocket to register A2A agents. Each connector has:
+Connectors are services that connect to the server via WebSocket to register A2A agents. Each connector has:
 - **id**: Unique identifier (UUID)
 - **owner_wallet**: Wallet address of the owner
 - **connector_name**: Human-readable name

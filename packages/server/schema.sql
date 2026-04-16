@@ -1,5 +1,5 @@
 -- ============================================================
--- schema.sql — Relay Connector Registry
+-- schema.sql — Server Client Registry
 -- ============================================================
 
 -- ============================================================
@@ -88,7 +88,7 @@ CREATE POLICY connectors_delete ON connectors
   FOR DELETE TO app_authenticated
   USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
 
--- app_postgraphile bypasses RLS (used by relay for token lookup)
+-- app_postgraphile bypasses RLS (used by server for token lookup)
 DROP POLICY IF EXISTS connectors_postgraphile ON connectors;
 CREATE POLICY connectors_postgraphile ON connectors
   FOR ALL TO app_postgraphile
