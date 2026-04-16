@@ -12,14 +12,19 @@ COPY tsconfig.base.json ./
 COPY packages/protocol/package.json packages/protocol/
 COPY packages/server/package.json packages/server/
 COPY packages/client/package.json packages/client/
+COPY packages/admin-ui/package.json packages/admin-ui/
 
 RUN pnpm install --frozen-lockfile --prod=false
 
 COPY packages/protocol/ packages/protocol/
 COPY packages/server/ packages/server/
+COPY packages/admin-ui/ packages/admin-ui/
 
 # Build protocol (server depends on its dist/)
 RUN pnpm --filter @vicoop-bridge/protocol build
+
+# Build admin UI (server serves its dist/ as static files)
+RUN pnpm --filter @vicoop-bridge/admin-ui build
 
 ENV NODE_ENV=production
 ENV PORT=8787
