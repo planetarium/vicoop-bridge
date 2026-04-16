@@ -1,26 +1,26 @@
 # vicoop-bridge
 
-A2A Relay + Connector for exposing local coding agents (OpenClaw, Claude Code, Codex, …) as Google A2A-compliant remote agents.
+A2A Server + Client for exposing local coding agents (OpenClaw, Claude Code, Codex, …) as Google A2A-compliant remote agents.
 
-Agents connect *outbound* to a public Relay via WebSocket, so they can sit behind NAT/firewalls while still being addressable by external A2A clients.
+Agents connect *outbound* to a public Server via WebSocket, so they can sit behind NAT/firewalls while still being addressable by external A2A clients.
 
 See [`docs/design.md`](./docs/design.md) for the full design.
 
-## Connector Releases
+## Client Releases
 
-Tagging the repository with `connector-v*` publishes a portable `vicoop-bridge-connector` bundle to GitHub Releases.
+Tagging the repository with `client-v*` publishes a portable `vicoop-bridge-client` bundle to GitHub Releases.
 
 Example:
 
 ```bash
-git tag connector-v0.1.0
-git push origin connector-v0.1.0
+git tag client-v0.1.0
+git push origin client-v0.1.0
 ```
 
-After extracting the release bundle, run the connector with:
+After extracting the release bundle, run the client with:
 
 ```bash
-./bin/vicoop-connector --help
+./bin/vicoop-client --help
 ```
 
 ## Status

@@ -1,7 +1,7 @@
 import type { AgentExecutor, ExecutionEventBus, RequestContext } from '@a2a-js/sdk/server';
 import type { Registry } from './registry.js';
 
-export class RelayAgentExecutor implements AgentExecutor {
+export class ServerAgentExecutor implements AgentExecutor {
   constructor(
     private readonly agentId: string,
     private readonly registry: Registry,
@@ -45,7 +45,7 @@ export class RelayAgentExecutor implements AgentExecutor {
             kind: 'message',
             role: 'agent',
             messageId: `${taskId}-unreach`,
-            parts: [{ kind: 'text', text: 'connector not connected' }],
+            parts: [{ kind: 'text', text: 'client not connected' }],
             taskId,
             contextId,
           },

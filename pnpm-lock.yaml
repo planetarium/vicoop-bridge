@@ -18,7 +18,7 @@ importers:
         specifier: ^5.6.3
         version: 5.9.3
 
-  packages/connector:
+  packages/client:
     dependencies:
       '@vicoop-bridge/protocol':
         specifier: workspace:*
@@ -40,7 +40,7 @@ importers:
         specifier: ^3.23.8
         version: 3.25.76
 
-  packages/relay:
+  packages/server:
     dependencies:
       '@a2a-js/sdk':
         specifier: ^0.3.13

@@ -1,4 +1,4 @@
-app = "vicoop-bridge-relay"
+app = "vicoop-bridge-server"
 primary_region = "nrt"
 
 [build]

@@ -1,9 +1,9 @@
-name: Release Connector
+name: Release Client
 
 on:
   push:
     tags:
-      - 'connector-v*'
+      - 'client-v*'
 
 permissions:
   contents: write
@@ -30,27 +30,27 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build connector packages
-        run: pnpm --filter @vicoop-bridge/protocol --filter @vicoop-bridge/connector build
+      - name: Build client packages
+        run: pnpm --filter @vicoop-bridge/protocol --filter @vicoop-bridge/client build
 
-      - name: Package portable connector bundle
-        run: ./scripts/package-connector-release.sh "${{ github.ref_name }}"
+      - name: Package portable client bundle
+        run: ./scripts/package-client-release.sh "${{ github.ref_name }}"
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           draft: false
           files: |
-            dist-release/vicoop-bridge-connector-*.tgz
-            dist-release/vicoop-bridge-connector-*.tgz.sha256
+            dist-release/vicoop-bridge-client-*.tgz
+            dist-release/vicoop-bridge-client-*.tgz.sha256
           generate_release_notes: true
           body: |
-            Portable `vicoop-bridge-connector` bundle for direct GitHub download.
+            Portable `vicoop-bridge-client` bundle for direct GitHub download.
 
             Quick start:
 
             ```bash
-            tar -xzf vicoop-bridge-connector-<version>.tgz
-            cd vicoop-bridge-connector-<version>
-            ./bin/vicoop-connector --help
+            tar -xzf vicoop-bridge-client-<version>.tgz
+            cd vicoop-bridge-client-<version>
+            ./bin/vicoop-client --help
             ```

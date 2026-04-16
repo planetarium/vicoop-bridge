@@ -6,9 +6,9 @@
   "scripts": {
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
-    "dev:relay": "pnpm --filter @vicoop-bridge/relay dev",
-    "dev:connector": "pnpm --filter @vicoop-bridge/connector dev",
-    "deploy:relay": "fly deploy -c packages/relay/fly.toml ."
+    "dev:server": "pnpm --filter @vicoop-bridge/server dev",
+    "dev:client": "pnpm --filter @vicoop-bridge/client dev",
+    "deploy:server": "fly deploy -c packages/server/fly.toml ."
   },
   "devDependencies": {
     "typescript": "^5.6.3",

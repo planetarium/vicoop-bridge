@@ -7,13 +7,13 @@ import {
 } from '@a2a-js/sdk/server';
 import type { AgentCard as SdkAgentCard } from '@a2a-js/sdk';
 import type { AgentCard as WireAgentCard } from '@vicoop-bridge/protocol';
-import { RelayAgentExecutor } from './executor.js';
-import type { ConnectorConnection, Registry } from './registry.js';
+import { ServerAgentExecutor } from './executor.js';
+import type { ClientConnection, Registry } from './registry.js';
 import { createAdminTransport, buildAdminAgentCard } from './admin.js';
 import { verifySiweToken } from './siwe-token.js';
 import type { Sql } from './db.js';
 
-export interface RelayHttpOptions {
+export interface ServerHttpOptions {
   registry: Registry;
   publicUrl?: string;
   db: Sql;
@@ -21,7 +21,7 @@ export interface RelayHttpOptions {
 
 function toSdkAgentCard(
   wire: WireAgentCard,
-  conn: ConnectorConnection,
+  conn: ClientConnection,
   publicUrl: string | undefined,
 ): SdkAgentCard {
   const url = publicUrl
@@ -49,7 +49,7 @@ function toSdkAgentCard(
   };
 }
 
-export function createHttpApp(opts: RelayHttpOptions): Hono {
+export function createHttpApp(opts: ServerHttpOptions): Hono {
   const app = new Hono();
   const taskStore = new InMemoryTaskStore();
   const transports = new Map<string, JsonRpcTransportHandler>();
@@ -62,11 +62,11 @@ export function createHttpApp(opts: RelayHttpOptions): Hono {
   });
   const adminCard = buildAdminAgentCard(opts.publicUrl);
 
-  function getTransport(conn: ConnectorConnection): JsonRpcTransportHandler {
+  function getTransport(conn: ClientConnection): JsonRpcTransportHandler {
     const cached = transports.get(conn.agentId);
     if (cached) return cached;
     const card = toSdkAgentCard(conn.agentCard, conn, opts.publicUrl);
-    const executor = new RelayAgentExecutor(conn.agentId, opts.registry);
+    const executor = new ServerAgentExecutor(conn.agentId, opts.registry);
     const handler = new DefaultRequestHandler(card, taskStore, executor);
     const transport = new JsonRpcTransportHandler(handler);
     transports.set(conn.agentId, transport);
@@ -90,18 +90,18 @@ export function createHttpApp(opts: RelayHttpOptions): Hono {
 
   app.get('/healthz', (c) => c.json({ ok: true }));
 
-  // Root agent card — the relay itself is an A2A agent
+  // Root agent card — the server itself is an A2A agent
   app.get('/.well-known/agent-card.json', (c) => c.json(adminCard));
 
-  // Relay info
+  // Server info
   app.get('/', (c) =>
     c.json({
       name: 'vicoop-bridge',
-      description: 'A2A relay for outbound-connected local agents',
+      description: 'A2A server for outbound-connected local agents',
       version: '0.0.0',
       url: opts.publicUrl,
       card: adminCard,
-      connectors: opts.registry.listAgents().map((a) => ({
+      clients: opts.registry.listAgents().map((a) => ({
         id: a.agentId,
         url: opts.publicUrl
           ? `${opts.publicUrl}/agents/${a.agentId}`
@@ -174,7 +174,7 @@ export function createHttpApp(opts: RelayHttpOptions): Hono {
     });
   });
 
-  // Connector agent cards
+  // Client agent cards
   app.get('/agents/:id/.well-known/agent-card.json', (c) => {
     const id = c.req.param('id');
     const conn = opts.registry.getAgent(id);
@@ -182,7 +182,7 @@ export function createHttpApp(opts: RelayHttpOptions): Hono {
     return c.json(toSdkAgentCard(conn.agentCard, conn, opts.publicUrl));
   });
 
-  // Connector agent A2A endpoints
+  // Client agent A2A endpoints
   app.post('/agents/:id', async (c) => {
     const id = c.req.param('id');
     const conn = opts.registry.getAgent(id);

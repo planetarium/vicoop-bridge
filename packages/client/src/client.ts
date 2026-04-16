@@ -6,24 +6,24 @@ import {
   type AgentCard,
   type UpFrame,
 } from '@vicoop-bridge/protocol';
-import type { ConnectorBackend } from './backend.js';
+import type { Backend } from './backend.js';
 
-export interface ConnectorClientOptions {
-  relayUrl: string;
+export interface ClientOptions {
+  serverUrl: string;
   token: string;
   agentId: string;
   agentCard: AgentCard;
-  backend: ConnectorBackend;
+  backend: Backend;
   maxConcurrency?: number;
   reconnectDelayMs?: number;
 }
 
-export class ConnectorClient {
+export class Client {
   private ws: WebSocket | null = null;
   private stopped = false;
   private inflight = new Map<string, AbortController>();
 
-  constructor(private readonly opts: ConnectorClientOptions) {}
+  constructor(private readonly opts: ClientOptions) {}
 
   start(): void {
     this.connect();
@@ -36,11 +36,11 @@ export class ConnectorClient {
 
   private connect(): void {
     if (this.stopped) return;
-    const ws = new WebSocket(`${this.opts.relayUrl.replace(/\/$/, '')}/connect`);
+    const ws = new WebSocket(`${this.opts.serverUrl.replace(/\/$/, '')}/connect`);
     this.ws = ws;
 
     ws.on('open', () => {
-      console.log('[connector] connected, sending hello');
+      console.log('[client] connected, sending hello');
       this.send({
         type: 'hello',
         agentId: this.opts.agentId,
@@ -55,7 +55,7 @@ export class ConnectorClient {
       try {
         frame = parseDownFrame(typeof raw === 'string' ? raw : raw.toString('utf8'));
       } catch (err) {
-        console.error('[connector] invalid frame:', err);
+        console.error('[client] invalid frame:', err);
         return;
       }
 
@@ -74,7 +74,7 @@ export class ConnectorClient {
     });
 
     ws.on('close', (code, reason) => {
-      console.log(`[connector] disconnected: ${code} ${reason.toString()}`);
+      console.log(`[client] disconnected: ${code} ${reason.toString()}`);
       this.ws = null;
       if (!this.stopped) {
         const delay = this.opts.reconnectDelayMs ?? 3000;
@@ -83,7 +83,7 @@ export class ConnectorClient {
     });
 
     ws.on('error', (err) => {
-      console.error('[connector] ws error:', err.message);
+      console.error('[client] ws error:', err.message);
     });
   }
 

@@ -158,7 +158,7 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
       execute: async () => {
         return registry.listAgents().map((a) => ({
           agent_id: a.agentId,
-          connector_id: a.connectorId,
+          connector_id: a.clientId,
           agent_name: a.agentCard.name,
           connected_at: new Date(a.connectedAt).toISOString(),
         }));
@@ -280,9 +280,9 @@ class AdminAgentExecutor implements AgentExecutor {
 export function buildAdminAgentCard(publicUrl?: string): SdkAgentCard {
   const url = publicUrl ?? '';
   return {
-    name: 'Vicoop Bridge Relay Admin',
+    name: 'Vicoop Bridge Server Admin',
     description:
-      'Manages connector registration, revocation, and access control for Vicoop Bridge Relay. Connectors are WebSocket clients that bridge local A2A agents to the relay. Each connector is scoped to an owner wallet and an explicit agent ID allowlist. Requires SIWE authentication.',
+      'Manages connector registration, revocation, and access control for Vicoop Bridge Server. Connectors are WebSocket clients that bridge local A2A agents to the server. Each connector is scoped to an owner wallet and an explicit agent ID allowlist. Requires SIWE authentication.',
     version: '0.1.0',
     protocolVersion: '0.3.0',
     url,
