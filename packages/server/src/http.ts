@@ -1,4 +1,7 @@
+import path from 'node:path';
+import fs from 'node:fs';
 import { Hono, type Context } from 'hono';
+import { serveStatic } from '@hono/node-server/serve-static';
 import { stream } from 'hono/streaming';
 import {
   DefaultRequestHandler,
@@ -51,6 +54,7 @@ function toSdkAgentCard(
 
 export function createHttpApp(opts: ServerHttpOptions): Hono {
   const app = new Hono();
+
   const taskStore = new InMemoryTaskStore();
   const transports = new Map<string, JsonRpcTransportHandler>();
 
@@ -193,6 +197,18 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const result = await transport.handle(rawBody);
     return handleTransportResult(result, c);
   });
+
+  // Admin UI — serve static SPA from /admin
+  const adminDistDir = path.resolve(import.meta.dirname, '../../admin-ui/dist');
+  if (fs.existsSync(adminDistDir)) {
+    app.use('/admin/*', serveStatic({ root: adminDistDir, rewriteRequestPath: (p) => p.replace(/^\/admin/, '') }));
+    // SPA fallback — serve index.html for all non-file admin routes
+    app.get('/admin/*', async (c) => {
+      const filePath = path.join(adminDistDir, 'index.html');
+      const html = await fs.promises.readFile(filePath, 'utf-8');
+      return c.html(html);
+    });
+  }
 
   return app;
 }

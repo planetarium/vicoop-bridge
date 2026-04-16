@@ -171,6 +171,7 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
 
 class AdminAgentExecutor implements AgentExecutor {
   private readonly abortControllers = new Map<string, AbortController>();
+  private readonly contextHistory = new Map<string, Message[]>();
 
   constructor(
     private readonly db: Sql,
@@ -220,7 +221,7 @@ class AdminAgentExecutor implements AgentExecutor {
         const { tools: schemaTools, sdl } = await getSchemaTools();
         const customTools = buildCustomTools(this.db, this.registry, walletAddress);
         const tools = { ...schemaTools, ...customTools };
-        const history: Message[] = task?.history ?? [];
+        const history = this.contextHistory.get(contextId) ?? [];
 
         return generateText({
           model: anthropic('claude-sonnet-4-6'),
@@ -232,13 +233,20 @@ class AdminAgentExecutor implements AgentExecutor {
         });
       });
 
+      const replyMsg = agentMessage(answer.text, taskId, contextId);
+
+      // Persist conversation history by contextId
+      const history = this.contextHistory.get(contextId) ?? [];
+      history.push(userMessage, replyMsg);
+      this.contextHistory.set(contextId, history);
+
       bus.publish({
         kind: 'status-update',
         taskId,
         contextId,
         status: {
           state: 'completed',
-          message: agentMessage(answer.text, taskId, contextId),
+          message: replyMsg,
           timestamp: nowIso(),
         },
         final: true,
