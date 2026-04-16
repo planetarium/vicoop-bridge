@@ -99,7 +99,30 @@ CREATE POLICY clients_postgraphile ON clients
 COMMENT ON COLUMN clients.token_hash IS E'@omit';
 
 -- ============================================================
--- 4. Grants
+-- 4. Infra schema (not exposed via PostGraphile / GraphQL)
+-- ============================================================
+CREATE SCHEMA IF NOT EXISTS infra;
+
+CREATE TABLE IF NOT EXISTS infra.a2a_tasks (
+  task_id    TEXT PRIMARY KEY,
+  context_id TEXT NOT NULL,
+  state      TEXT NOT NULL,
+  task_json  JSONB NOT NULL,
+  owner_wallet VARCHAR(42),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_a2a_tasks_context_wallet
+  ON infra.a2a_tasks (context_id, owner_wallet, created_at);
+
+GRANT USAGE ON SCHEMA infra TO app_postgraphile;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA infra TO app_postgraphile;
+ALTER DEFAULT PRIVILEGES IN SCHEMA infra
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_postgraphile;
+
+-- ============================================================
+-- 5. Grants
 -- ============================================================
 GRANT USAGE ON SCHEMA public TO app_postgraphile, app_anonymous, app_authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_postgraphile;

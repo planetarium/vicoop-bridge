@@ -6,7 +6,6 @@ import type { Message } from '@a2a-js/sdk';
 import {
   A2AError,
   DefaultRequestHandler,
-  InMemoryTaskStore,
   JsonRpcTransportHandler,
   type AgentExecutor,
   type ExecutionEventBus,
@@ -18,6 +17,7 @@ import { hashToken, generateToken } from './token.js';
 import { getSchemaTools } from './schema-tools.js';
 import { runWithBearerToken } from './graphql-client.js';
 import type { Registry } from './registry.js';
+import { PostgresTaskStore, type ContextAwareTaskStore } from './postgres-task-store.js';
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -100,6 +100,10 @@ Clients are services that connect to the server via WebSocket to register A2A ag
 - Use \`list_active_agents\` to see currently connected agents.
 - Use \`execute_graphql\` for complex queries not covered by auto-generated tools.
 
+## Conversation memory
+
+Your conversation history is persisted in PostgreSQL. You remember all previous messages in this context, even across server restarts. The messages above this one are real history — treat them as your own memory. Do not claim you have forgotten or cannot recall earlier parts of the conversation.
+
 ## Important rules
 
 - When registering a client, always warn the user that the token is shown only once.
@@ -171,11 +175,10 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
 
 class AdminAgentExecutor implements AgentExecutor {
   private readonly abortControllers = new Map<string, AbortController>();
-  private readonly contextHistory = new Map<string, Message[]>();
-
   constructor(
     private readonly db: Sql,
     private readonly registry: Registry,
+    private readonly taskStore: ContextAwareTaskStore,
   ) {}
 
   async execute(ctx: RequestContext, bus: ExecutionEventBus): Promise<void> {
@@ -221,7 +224,22 @@ class AdminAgentExecutor implements AgentExecutor {
         const { tools: schemaTools, sdl } = await getSchemaTools();
         const customTools = buildCustomTools(this.db, this.registry, walletAddress);
         const tools = { ...schemaTools, ...customTools };
-        const history = this.contextHistory.get(contextId) ?? [];
+
+        // Load conversation history from previous tasks in the same context.
+        // The SDK's ResultManager normally appends status.message into history
+        // before saving, but as a fallback we also include status.message if
+        // it wasn't recorded in history (e.g. edge cases around failures).
+        const previousTasks = await this.taskStore.loadByContextId(contextId, walletAddress, taskId);
+        const contextHistory: Message[] = [];
+        for (const prev of previousTasks) {
+          if (prev.history) contextHistory.push(...prev.history);
+          const statusMsg = prev.status?.message;
+          if (statusMsg && !prev.history?.some((m) => m.messageId === statusMsg.messageId)) {
+            contextHistory.push(statusMsg);
+          }
+        }
+        const currentHistory = task?.history ?? [];
+        const history = [...contextHistory, ...currentHistory];
 
         return generateText({
           model: anthropic('claude-sonnet-4-6'),
@@ -233,20 +251,13 @@ class AdminAgentExecutor implements AgentExecutor {
         });
       });
 
-      const replyMsg = agentMessage(answer.text, taskId, contextId);
-
-      // Persist conversation history by contextId
-      const history = this.contextHistory.get(contextId) ?? [];
-      history.push(userMessage, replyMsg);
-      this.contextHistory.set(contextId, history);
-
       bus.publish({
         kind: 'status-update',
         taskId,
         contextId,
         status: {
           state: 'completed',
-          message: replyMsg,
+          message: agentMessage(answer.text, taskId, contextId),
           timestamp: nowIso(),
         },
         final: true,
@@ -318,7 +329,8 @@ export interface AdminAgentOptions {
 
 export function createAdminTransport(opts: AdminAgentOptions): JsonRpcTransportHandler {
   const card = buildAdminAgentCard(opts.publicUrl);
-  const executor = new AdminAgentExecutor(opts.db, opts.registry);
-  const handler = new DefaultRequestHandler(card, new InMemoryTaskStore(), executor);
+  const taskStore = new PostgresTaskStore(opts.db);
+  const executor = new AdminAgentExecutor(opts.db, opts.registry, taskStore);
+  const handler = new DefaultRequestHandler(card, taskStore, executor);
   return new JsonRpcTransportHandler(handler);
 }
