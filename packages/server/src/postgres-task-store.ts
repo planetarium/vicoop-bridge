@@ -60,13 +60,15 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
         updated_at = now()
     `;
 
-    // Enforce retention: delete tasks beyond MAX_CONTEXT_TASKS per context+wallet
+    // Enforce retention: delete only terminal tasks beyond MAX_CONTEXT_TASKS
     if (ownerWallet) {
       await this.sql`
         DELETE FROM infra.a2a_tasks
         WHERE task_id IN (
           SELECT task_id FROM infra.a2a_tasks
-          WHERE context_id = ${task.contextId} AND owner_wallet = ${ownerWallet}
+          WHERE context_id = ${task.contextId}
+            AND owner_wallet = ${ownerWallet}
+            AND state IN ('completed', 'failed', 'canceled')
           ORDER BY created_at DESC, task_id DESC
           OFFSET ${MAX_CONTEXT_TASKS}
         )
