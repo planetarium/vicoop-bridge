@@ -50,7 +50,8 @@ function evictExpired() {
 export async function verifySiweToken(token: string, opts?: { domain?: string }): Promise<string> {
   evictExpired();
 
-  const cached = verifyCache.get(token);
+  const cacheKey = opts?.domain ? `${token}\0${opts.domain.toLowerCase()}` : token;
+  const cached = verifyCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     return cached.address;
   }
@@ -82,6 +83,6 @@ export async function verifySiweToken(token: string, opts?: { domain?: string })
     throw new Error(`SIWE domain mismatch: expected ${opts.domain}, got ${siweMessage.domain}`);
   }
 
-  verifyCache.set(token, { address: siweMessage.address, expiresAt: expires });
+  verifyCache.set(cacheKey, { address: siweMessage.address, expiresAt: expires });
   return siweMessage.address;
 }

@@ -99,7 +99,7 @@ export class Registry {
     const conn = this.agents.get(agentId);
     if (conn) conn.allowedCallers = normalized;
     for (const listener of this.callerChangeListeners) {
-      listener(agentId, callers);
+      listener(agentId, normalized);
     }
   }
 

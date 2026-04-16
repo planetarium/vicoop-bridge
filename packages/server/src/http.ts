@@ -209,7 +209,11 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // Client agent A2A endpoints (auth middleware checks allowedCallers)
   let siweDomain: string | undefined;
   if (opts.publicUrl) {
-    try { siweDomain = new URL(opts.publicUrl).hostname; } catch { /* ignore malformed publicUrl */ }
+    try {
+      siweDomain = new URL(opts.publicUrl).hostname;
+    } catch {
+      console.warn(`[server] WARNING: publicUrl "${opts.publicUrl}" is not a valid URL — SIWE domain verification disabled`);
+    }
   }
   const authMw = agentAuthMiddleware(opts.registry, { domain: siweDomain });
   app.post('/agents/:id', authMw, async (c) => {
