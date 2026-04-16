@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Send, MessageSquare } from 'lucide-react';
+import type { Client } from '@a2a-js/sdk/client';
 import { useAuthToken } from '../lib/auth-token';
-import { sendMessage, type A2AMessage } from '../lib/a2a-client';
+import { createA2AClient, type Message as A2AMessage } from '../lib/a2a-client';
 import { Message } from './message';
 
 function extractText(msg: A2AMessage): string {
@@ -24,16 +25,31 @@ export function Chat() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const clientRef = useRef<Client | null>(null);
+  const tokenRef = useRef(token);
+  tokenRef.current = token;
 
   // Persist task/context across a conversation
   const taskIdRef = useRef<string | undefined>(undefined);
   const contextIdRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
+    // Re-create client when token changes (auth handler reads tokenRef)
+    clientRef.current = null;
+  }, [token]);
+
+  useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages]);
+
+  const getClient = useCallback(async () => {
+    if (!clientRef.current) {
+      clientRef.current = await createA2AClient(() => tokenRef.current);
+    }
+    return clientRef.current;
+  }, []);
 
   const send = useCallback(async (text: string) => {
     if (!token || !text.trim()) return;
@@ -44,20 +60,36 @@ export function Chat() {
     setError(null);
 
     try {
-      const task = await sendMessage(text, token, taskIdRef.current, contextIdRef.current);
-      taskIdRef.current = task.id;
-      contextIdRef.current = task.contextId;
+      const client = await getClient();
+      const message: A2AMessage = {
+        kind: 'message',
+        messageId: crypto.randomUUID(),
+        role: 'user',
+        parts: [{ kind: 'text', text }],
+      };
+      if (taskIdRef.current) Object.assign(message, { taskId: taskIdRef.current });
+      if (contextIdRef.current) Object.assign(message, { contextId: contextIdRef.current });
 
-      const agentMsg = task.status.message;
-      if (agentMsg) {
-        setMessages((prev) => [...prev, { role: 'agent', text: extractText(agentMsg) }]);
+      const result = await client.sendMessage({ message });
+
+      // result is Task | Message
+      if ('status' in result) {
+        const task = result;
+        taskIdRef.current = task.id;
+        contextIdRef.current = task.contextId;
+        const agentMsg = task.status.message;
+        if (agentMsg) {
+          setMessages((prev) => [...prev, { role: 'agent', text: extractText(agentMsg) }]);
+        }
+      } else {
+        setMessages((prev) => [...prev, { role: 'agent', text: extractText(result) }]);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setIsLoading(false);
     }
-  }, [token]);
+  }, [token, getClient]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();

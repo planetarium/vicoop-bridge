@@ -1,75 +1,33 @@
-const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? '/';
+import {
+  ClientFactory,
+  JsonRpcTransportFactory,
+  type AuthenticationHandler,
+  type HttpHeaders,
+  createAuthenticatingFetchWithRetry,
+} from '@a2a-js/sdk/client';
+import type { Message, Task } from '@a2a-js/sdk';
 
-interface TextPart {
-  kind: 'text';
-  text: string;
-}
+export type { Message, Task };
 
-export interface A2AMessage {
-  kind: 'message';
-  messageId: string;
-  role: 'user' | 'agent';
-  parts: TextPart[];
-  taskId: string;
-  contextId: string;
-}
+const SERVER_URL = import.meta.env.VITE_SERVER_URL || window.location.origin;
 
-export interface A2ATask {
-  id: string;
-  contextId: string;
-  status: {
-    state: 'submitted' | 'working' | 'completed' | 'failed' | 'canceled';
-    message?: A2AMessage;
-    timestamp: string;
-  };
-  history: A2AMessage[];
-  artifacts: unknown[];
-}
-
-let rpcId = 0;
-
-export async function sendMessage(
-  text: string,
-  token: string,
-  taskId?: string,
-  contextId?: string,
-): Promise<A2ATask> {
-  const message: Record<string, unknown> = {
-    kind: 'message',
-    messageId: crypto.randomUUID(),
-    role: 'user',
-    parts: [{ kind: 'text', text }],
-  };
-
-  // Only include taskId/contextId for follow-up messages (continuing a task)
-  if (taskId) message.taskId = taskId;
-  if (contextId) message.contextId = contextId;
-
-  const body = {
-    jsonrpc: '2.0',
-    id: ++rpcId,
-    method: 'message/send',
-    params: { message },
-  };
-
-  const res = await fetch(SERVER_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
+function createAuthHandler(getToken: () => string | null): AuthenticationHandler {
+  return {
+    headers: async (): Promise<HttpHeaders> => {
+      const token = getToken();
+      if (token) return { Authorization: `Bearer ${token}` };
+      return {};
     },
-    body: JSON.stringify(body),
+    shouldRetryWithHeaders: async () => undefined,
+  };
+}
+
+export async function createA2AClient(getToken: () => string | null) {
+  const authFetch = createAuthenticatingFetchWithRetry(fetch, createAuthHandler(getToken));
+
+  const factory = new ClientFactory({
+    transports: [new JsonRpcTransportFactory({ fetchImpl: authFetch })],
   });
 
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: { message: res.statusText } }));
-    throw new Error(err.error?.message ?? `HTTP ${res.status}`);
-  }
-
-  const json = await res.json();
-  if (json.error) {
-    throw new Error(json.error.message ?? 'JSON-RPC error');
-  }
-
-  return json.result as A2ATask;
+  return factory.createFromUrl(SERVER_URL);
 }
