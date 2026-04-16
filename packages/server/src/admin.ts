@@ -171,7 +171,6 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
 
 class AdminAgentExecutor implements AgentExecutor {
   private readonly abortControllers = new Map<string, AbortController>();
-
   constructor(
     private readonly db: Sql,
     private readonly registry: Registry,

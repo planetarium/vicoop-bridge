@@ -4,6 +4,9 @@ primary_region = "nrt"
 [build]
   dockerfile = "Dockerfile"
 
+  [build.args]
+    VITE_WALLETCONNECT_PROJECT_ID = "e2ead043530cfc0d06ef42a09b97ebe2"
+
 [env]
   PORT = "8787"
   POSTGRAPHILE_PORT = "5433"

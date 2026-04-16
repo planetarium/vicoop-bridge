@@ -8,6 +8,7 @@
     "typecheck": "pnpm -r typecheck",
     "dev:server": "pnpm --filter @vicoop-bridge/server dev",
     "dev:client": "pnpm --filter @vicoop-bridge/client dev",
+    "dev:admin-ui": "pnpm --filter @vicoop-bridge/admin-ui dev",
     "deploy:server": "fly deploy -c packages/server/fly.toml ."
   },
   "devDependencies": {
