@@ -12,7 +12,7 @@ interface ClientRow {
 
 async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | null> {
   const rows = await sql<ClientRow[]>`
-    SELECT id, allowed_agent_ids FROM connectors WHERE token_hash = ${hash} AND revoked = false
+    SELECT id, allowed_agent_ids FROM clients WHERE token_hash = ${hash} AND revoked = false
   `;
   return rows[0] ?? null;
 }

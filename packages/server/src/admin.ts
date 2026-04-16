@@ -73,10 +73,10 @@ function isAdmin(wallet: string): boolean {
 function buildSystemPrompt(walletAddress: string, sdl?: string): string {
   const admin = isAdmin(walletAddress);
   const scope = admin
-    ? 'You are logged in as an **admin**. You can see and manage ALL connectors across all owners.'
-    : `You are logged in as wallet \`${walletAddress}\`. You can only see and manage connectors you own (RLS enforced).`;
+    ? 'You are logged in as an **admin**. You can see and manage ALL clients across all owners.'
+    : `You are logged in as wallet \`${walletAddress}\`. You can only see and manage clients you own (RLS enforced).`;
 
-  let prompt = `You are the Server Admin Agent for vicoop-bridge. You manage connector registrations and access control.
+  let prompt = `You are the Server Admin Agent for vicoop-bridge. You manage client registrations and access control.
 
 ## Current User
 
@@ -84,27 +84,27 @@ ${scope}
 
 ## What you manage
 
-Connectors are services that connect to the server via WebSocket to register A2A agents. Each connector has:
+Clients are services that connect to the server via WebSocket to register A2A agents. Each client has:
 - **id**: Unique identifier (UUID)
 - **owner_wallet**: Wallet address of the owner
-- **connector_name**: Human-readable name
-- **allowed_agent_ids**: List of agent IDs this connector is authorized to register
-- **revoked**: Whether this connector has been revoked
+- **client_name**: Human-readable name
+- **allowed_agent_ids**: List of agent IDs this client is authorized to register
+- **revoked**: Whether this client has been revoked
 - **created_at**: When it was created
-- **token_hash**: Not exposed via GraphQL — use register_connector tool to create tokens
+- **token_hash**: Not exposed via GraphQL — use register_client tool to create tokens
 
 ## Tool Usage
 
-- Use \`query_*\` and \`mutate_*\` tools for standard CRUD operations on connectors. RLS enforces ownership.
-- Use \`register_connector\` to create a new connector — this generates a token and hashes it before storing.
+- Use \`query_*\` and \`mutate_*\` tools for standard CRUD operations on clients. RLS enforces ownership.
+- Use \`register_client\` to create a new client — this generates a token and hashes it before storing.
 - Use \`list_active_agents\` to see currently connected agents.
 - Use \`execute_graphql\` for complex queries not covered by auto-generated tools.
 
 ## Important rules
 
-- When registering a connector, always warn the user that the token is shown only once.
+- When registering a client, always warn the user that the token is shown only once.
 - Present data clearly in tables or lists.
-- If asked about something outside connector management, politely explain your scope.
+- If asked about something outside client management, politely explain your scope.
 
 ## PostGraphile Conventions
 
@@ -125,16 +125,16 @@ Connectors are services that connect to the server via WebSocket to register A2A
 
 function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
   return {
-    register_connector: tool({
+    register_client: tool({
       description:
-        'Register a new connector owned by the current wallet. Generates a bearer token (shown only once) and stores its hash.',
+        'Register a new client owned by the current wallet. Generates a bearer token (shown only once) and stores its hash.',
       inputSchema: z.object({
-        connector_name: z.string().describe('Human-readable connector name'),
+        client_name: z.string().describe('Human-readable client name'),
         allowed_agent_ids: z
           .array(z.string())
-          .describe('List of agent IDs this connector is authorized to register'),
+          .describe('List of agent IDs this client is authorized to register'),
       }),
-      execute: async ({ connector_name, allowed_agent_ids }) => {
+      execute: async ({ client_name, allowed_agent_ids }) => {
         const rawToken = generateToken();
         const tokenHash = hashToken(rawToken);
         const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
@@ -143,9 +143,9 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
           await tx`SELECT set_config('jwt.claims.wallet_address', ${walletAddress.toLowerCase()}, true)`;
           await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
           return tx`
-            INSERT INTO connectors (owner_wallet, connector_name, token_hash, allowed_agent_ids)
-            VALUES (${walletAddress.toLowerCase()}, ${connector_name}, ${tokenHash}, ${allowed_agent_ids})
-            RETURNING id, owner_wallet, connector_name, allowed_agent_ids, created_at
+            INSERT INTO clients (owner_wallet, client_name, token_hash, allowed_agent_ids)
+            VALUES (${walletAddress.toLowerCase()}, ${client_name}, ${tokenHash}, ${allowed_agent_ids})
+            RETURNING id, owner_wallet, client_name, allowed_agent_ids, created_at
           `;
         });
         return { ...result[0], token: rawToken };
@@ -153,12 +153,12 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
     }),
 
     list_active_agents: tool({
-      description: 'List currently connected agents with their connector identity and connection time.',
+      description: 'List currently connected agents with their client identity and connection time.',
       inputSchema: z.object({}),
       execute: async () => {
         return registry.listAgents().map((a) => ({
           agent_id: a.agentId,
-          connector_id: a.clientId,
+          client_id: a.clientId,
           agent_name: a.agentCard.name,
           connected_at: new Date(a.connectedAt).toISOString(),
         }));
@@ -282,7 +282,7 @@ export function buildAdminAgentCard(publicUrl?: string): SdkAgentCard {
   return {
     name: 'Vicoop Bridge Server Admin',
     description:
-      'Manages connector registration, revocation, and access control for Vicoop Bridge Server. Connectors are WebSocket clients that bridge local A2A agents to the server. Each connector is scoped to an owner wallet and an explicit agent ID allowlist. Requires SIWE authentication.',
+      'Manages client registration, revocation, and access control for Vicoop Bridge Server. Clients are WebSocket services that bridge local A2A agents to the server. Each client is scoped to an owner wallet and an explicit agent ID allowlist. Requires SIWE authentication.',
     version: '0.1.0',
     protocolVersion: '0.3.0',
     url,
@@ -292,11 +292,11 @@ export function buildAdminAgentCard(publicUrl?: string): SdkAgentCard {
     defaultOutputModes: ['text/plain'],
     skills: [
       {
-        id: 'connector-management',
-        name: 'Connector Management',
+        id: 'client-management',
+        name: 'Client Management',
         description:
-          'Register, revoke, and list connectors with per-agent-id authorization. Wallet-based ownership with RLS.',
-        tags: ['admin', 'auth', 'connector', 'siwe'],
+          'Register, revoke, and list clients with per-agent-id authorization. Wallet-based ownership with RLS.',
+        tags: ['admin', 'auth', 'client', 'siwe'],
       },
     ],
   };
