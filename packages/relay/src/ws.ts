@@ -2,9 +2,23 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import type { IncomingMessage, Server } from 'node:http';
 import { parseUpFrame, PROTOCOL_VERSION, type Part, type TaskStatus } from '@vicoop-bridge/protocol';
 import type { Registry } from './registry.js';
+import type { Sql } from './db.js';
+import { hashToken } from './token.js';
+
+interface ConnectorRow {
+  id: string;
+  allowed_agent_ids: string[];
+}
+
+async function lookupByTokenHash(sql: Sql, hash: string): Promise<ConnectorRow | null> {
+  const rows = await sql<ConnectorRow[]>`
+    SELECT id, allowed_agent_ids FROM connectors WHERE token_hash = ${hash} AND revoked = false
+  `;
+  return rows[0] ?? null;
+}
 
 export interface RelayWsOptions {
-  connectorToken: string;
+  db: Sql;
   registry: Registry;
 }
 
@@ -21,6 +35,60 @@ export function attachWsServer(server: Server, opts: RelayWsOptions): void {
       handleConnection(ws, req, opts);
     });
   });
+}
+
+type AuthResult =
+  | { ok: true; connectorId: string }
+  | { ok: false; code: number; reason: string };
+
+async function authenticateAndRegister(
+  ws: WebSocket,
+  frame: import('@vicoop-bridge/protocol').HelloFrame,
+  opts: RelayWsOptions,
+): Promise<AuthResult> {
+  const hash = hashToken(frame.token);
+  const connector = await lookupByTokenHash(opts.db, hash);
+  if (!connector) {
+    console.log(JSON.stringify({
+      event: 'connector_rejected',
+      reason: 'bad token',
+      agentId: frame.agentId,
+      ts: new Date().toISOString(),
+    }));
+    return { ok: false, code: 4005, reason: 'bad token' };
+  }
+  if (!connector.allowed_agent_ids.includes(frame.agentId)) {
+    console.log(JSON.stringify({
+      event: 'connector_rejected',
+      reason: 'agent not allowed',
+      agentId: frame.agentId,
+      connectorId: connector.id,
+      allowed: connector.allowed_agent_ids,
+      ts: new Date().toISOString(),
+    }));
+    return { ok: false, code: 4008, reason: 'agent id not authorized for this connector' };
+  }
+  const connectorId = connector.id;
+
+  const result = opts.registry.registerAgent({
+    agentId: frame.agentId,
+    connectorId,
+    agentCard: frame.agentCard,
+    ws,
+    connectedAt: Date.now(),
+  });
+  if (!result.ok) {
+    console.log(JSON.stringify({
+      event: 'connector_rejected',
+      reason: result.reason,
+      agentId: frame.agentId,
+      connectorId,
+      ts: new Date().toISOString(),
+    }));
+    return { ok: false, code: 4006, reason: result.reason };
+  }
+
+  return { ok: true, connectorId };
 }
 
 function toA2AMessage(
@@ -43,6 +111,7 @@ function toA2AMessage(
 function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: RelayWsOptions): void {
   let agentId: string | null = null;
   let authed = false;
+  let helloProcessing = false;
 
   const helloTimeout = setTimeout(() => {
     if (!authed) ws.close(4001, 'hello timeout');
@@ -66,24 +135,25 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: RelayWsOpt
         ws.close(4004, 'protocol version mismatch');
         return;
       }
-      if (frame.token !== opts.connectorToken) {
-        ws.close(4005, 'bad token');
-        return;
-      }
-      const result = opts.registry.registerAgent({
-        agentId: frame.agentId,
-        agentCard: frame.agentCard,
-        ws,
-        connectedAt: Date.now(),
+      if (helloProcessing) return;
+      helloProcessing = true;
+
+      authenticateAndRegister(ws, frame, opts).then((result) => {
+        if (!result.ok) {
+          ws.close(result.code, result.reason);
+          return;
+        }
+        agentId = frame.agentId;
+        authed = true;
+        clearTimeout(helloTimeout);
+        console.log(JSON.stringify({
+          event: 'connector_connected',
+          agentId,
+          connectorId: result.connectorId,
+          name: frame.agentCard.name,
+          ts: new Date().toISOString(),
+        }));
       });
-      if (!result.ok) {
-        ws.close(4006, result.reason);
-        return;
-      }
-      agentId = frame.agentId;
-      authed = true;
-      clearTimeout(helloTimeout);
-      console.log(`[relay] connector connected: ${agentId} (${frame.agentCard.name})`);
       return;
     }
 
@@ -168,7 +238,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: RelayWsOpt
   ws.on('close', () => {
     clearTimeout(helloTimeout);
     if (agentId) {
-      console.log(`[relay] connector disconnected: ${agentId}`);
+      console.log(JSON.stringify({ event: 'connector_disconnected', agentId, ts: new Date().toISOString() }));
       opts.registry.unregisterAgent(agentId, ws);
     }
   });

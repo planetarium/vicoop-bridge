@@ -2,12 +2,13 @@ import { serve } from '@hono/node-server';
 import { Registry } from './registry.js';
 import { createHttpApp } from './http.js';
 import { attachWsServer } from './ws.js';
+import type { Sql } from './db.js';
 
 export interface RelayOptions {
   port: number;
   host?: string;
-  connectorToken: string;
   publicUrl?: string;
+  db: Sql;
 }
 
 export async function startRelay(opts: RelayOptions) {
@@ -15,6 +16,7 @@ export async function startRelay(opts: RelayOptions) {
   const app = createHttpApp({
     registry,
     publicUrl: opts.publicUrl,
+    db: opts.db,
   });
 
   const server = serve({
@@ -24,7 +26,7 @@ export async function startRelay(opts: RelayOptions) {
   });
 
   attachWsServer(server as unknown as import('node:http').Server, {
-    connectorToken: opts.connectorToken,
+    db: opts.db,
     registry,
   });
 

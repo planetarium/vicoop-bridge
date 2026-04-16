@@ -15,14 +15,23 @@
   },
   "dependencies": {
     "@a2a-js/sdk": "^0.3.13",
+    "@ai-sdk/anthropic": "^3.0.69",
     "@hono/node-server": "^1.13.7",
     "@vicoop-bridge/protocol": "workspace:*",
+    "ai": "^6.0.162",
+    "express": "^5.2.1",
     "hono": "^4.6.11",
+    "pg": "^8.20.0",
+    "postgraphile": "4",
+    "postgres": "^3.4.9",
+    "siwe": "^3.0.0",
     "tsx": "^4.19.2",
     "ws": "^8.18.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/pg": "^8.20.0",
     "@types/ws": "^8.5.13"
   }
 }
