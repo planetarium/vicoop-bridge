@@ -24,6 +24,8 @@ COPY packages/admin-ui/ packages/admin-ui/
 RUN pnpm --filter @vicoop-bridge/protocol build
 
 # Build admin UI (server serves its dist/ as static files)
+ARG VITE_WALLETCONNECT_PROJECT_ID
+ENV VITE_WALLETCONNECT_PROJECT_ID=$VITE_WALLETCONNECT_PROJECT_ID
 RUN pnpm --filter @vicoop-bridge/admin-ui build
 
 ENV NODE_ENV=production

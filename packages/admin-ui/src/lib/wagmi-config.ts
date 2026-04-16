@@ -1,14 +1,12 @@
-import { createConfig, http } from 'wagmi';
+import { getDefaultConfig } from '@rainbow-me/rainbowkit';
 import { mainnet, sepolia } from 'wagmi/chains';
-import { injected } from 'wagmi/connectors';
 
-export const config = createConfig({
+const projectId = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID ?? '';
+
+export const config = getDefaultConfig({
+  appName: 'Vicoop Bridge Admin',
+  projectId,
   chains: [mainnet, sepolia],
-  connectors: [injected()],
-  transports: {
-    [mainnet.id]: http(),
-    [sepolia.id]: http(),
-  },
 });
 
 declare module 'wagmi' {
