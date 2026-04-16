@@ -6,7 +6,11 @@ export function getAgentConn(c: Context): ClientConnection {
   return c.get('agentConn') as ClientConnection;
 }
 
-export function agentAuthMiddleware(registry: Registry) {
+export interface AgentAuthOptions {
+  domain?: string;
+}
+
+export function agentAuthMiddleware(registry: Registry, opts?: AgentAuthOptions) {
   return async (c: Context, next: Next) => {
     const agentId = c.req.param('id')!;
     const conn = registry.getAgent(agentId);
@@ -32,7 +36,7 @@ export function agentAuthMiddleware(registry: Registry) {
 
     let walletAddress: string;
     try {
-      walletAddress = await verifySiweToken(bearerToken);
+      walletAddress = await verifySiweToken(bearerToken, { domain: opts?.domain });
     } catch (err) {
       return c.json({
         jsonrpc: '2.0',

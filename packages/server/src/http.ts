@@ -93,11 +93,9 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
 
   // Invalidate cached transport when allowedCallers changes so the
   // handler's card reflects the updated security fields.
-  const origUpdate = opts.registry.updateAllowedCallers.bind(opts.registry);
-  opts.registry.updateAllowedCallers = (agentId: string, callers: string[]) => {
+  opts.registry.onCallerChange((agentId) => {
     transports.delete(agentId);
-    origUpdate(agentId, callers);
-  };
+  });
 
   async function handleTransportResult(result: unknown, c: Context) {
     if (Symbol.asyncIterator in (result as object)) {
@@ -209,7 +207,8 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   });
 
   // Client agent A2A endpoints (auth middleware checks allowedCallers)
-  const authMw = agentAuthMiddleware(opts.registry);
+  const siweDomain = opts.publicUrl ? new URL(opts.publicUrl).hostname : undefined;
+  const authMw = agentAuthMiddleware(opts.registry, { domain: siweDomain });
   app.post('/agents/:id', authMw, async (c) => {
     const conn = getAgentConn(c);
 

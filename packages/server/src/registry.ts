@@ -20,9 +20,12 @@ export interface TaskBinding {
   eventBus: ExecutionEventBus;
 }
 
+export type CallerChangeListener = (agentId: string, callers: string[]) => void;
+
 export class Registry {
   private agents = new Map<string, ClientConnection>();
   private bindings = new Map<string, TaskBinding>();
+  private callerChangeListeners: CallerChangeListener[] = [];
 
   registerAgent(conn: ClientConnection): { ok: true } | { ok: false; reason: string } {
     const existing = this.agents.get(conn.agentId);
@@ -87,9 +90,16 @@ export class Registry {
     this.bindings.delete(taskId);
   }
 
+  onCallerChange(listener: CallerChangeListener): void {
+    this.callerChangeListeners.push(listener);
+  }
+
   updateAllowedCallers(agentId: string, callers: string[]): void {
     const conn = this.agents.get(agentId);
     if (conn) conn.allowedCallers = callers;
+    for (const listener of this.callerChangeListeners) {
+      listener(agentId, callers);
+    }
   }
 
   sendToAgent(agentId: string, frame: DownFrame): boolean {
