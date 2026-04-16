@@ -95,8 +95,9 @@ export class Registry {
   }
 
   updateAllowedCallers(agentId: string, callers: string[]): void {
+    const normalized = callers.map((c) => c.toLowerCase());
     const conn = this.agents.get(agentId);
-    if (conn) conn.allowedCallers = callers;
+    if (conn) conn.allowedCallers = normalized;
     for (const listener of this.callerChangeListeners) {
       listener(agentId, callers);
     }

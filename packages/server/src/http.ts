@@ -207,7 +207,10 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   });
 
   // Client agent A2A endpoints (auth middleware checks allowedCallers)
-  const siweDomain = opts.publicUrl ? new URL(opts.publicUrl).hostname : undefined;
+  let siweDomain: string | undefined;
+  if (opts.publicUrl) {
+    try { siweDomain = new URL(opts.publicUrl).hostname; } catch { /* ignore malformed publicUrl */ }
+  }
   const authMw = agentAuthMiddleware(opts.registry, { domain: siweDomain });
   app.post('/agents/:id', authMw, async (c) => {
     const conn = getAgentConn(c);
