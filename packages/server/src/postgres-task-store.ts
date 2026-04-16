@@ -1,22 +1,73 @@
-import type { Task } from '@a2a-js/sdk';
+import type { Task, Message } from '@a2a-js/sdk';
 import type { TaskStore } from '@a2a-js/sdk/server';
 import type { Sql } from './db.js';
 
 const MAX_CONTEXT_TASKS = 10;
 
+type MessageWithMetadata = Message & { metadata?: Record<string, unknown> };
+
+function extractOwnerWallet(task: Task): string | undefined {
+  for (const msg of task.history ?? []) {
+    const wallet = (msg as MessageWithMetadata).metadata?._walletAddress;
+    if (typeof wallet === 'string') return wallet.toLowerCase();
+  }
+  return undefined;
+}
+
+function stripSensitiveMetadata(task: Task): Task {
+  if (!task.history?.length) return task;
+  return {
+    ...task,
+    history: task.history.map((msg) => {
+      const { _bearerToken, _walletAddress, ...rest } =
+        (msg as MessageWithMetadata).metadata ?? {};
+      const clean = Object.keys(rest).length ? rest : undefined;
+      return clean
+        ? ({ ...msg, metadata: clean } as Message)
+        : ((() => {
+            const { metadata: _, ...m } = msg as MessageWithMetadata;
+            return m as Message;
+          })());
+    }),
+  };
+}
+
 export class PostgresTaskStore implements TaskStore {
   constructor(private readonly sql: Sql) {}
 
   async save(task: Task): Promise<void> {
+    const ownerWallet = extractOwnerWallet(task);
+    const sanitized = stripSensitiveMetadata(task);
+
     await this.sql`
-      INSERT INTO infra.a2a_tasks (task_id, context_id, state, task_json)
-      VALUES (${task.id}, ${task.contextId}, ${task.status.state}, ${this.sql.json(task as never)})
+      INSERT INTO infra.a2a_tasks (task_id, context_id, state, task_json, owner_wallet)
+      VALUES (
+        ${task.id},
+        ${task.contextId},
+        ${task.status.state},
+        ${this.sql.json(sanitized as never)},
+        ${ownerWallet ?? null}
+      )
       ON CONFLICT (task_id) DO UPDATE SET
         context_id = EXCLUDED.context_id,
         state = EXCLUDED.state,
         task_json = EXCLUDED.task_json,
+        owner_wallet = COALESCE(infra.a2a_tasks.owner_wallet, EXCLUDED.owner_wallet),
         updated_at = now()
     `;
+
+    // Enforce retention: delete tasks beyond MAX_CONTEXT_TASKS per context+wallet
+    if (ownerWallet) {
+      await this.sql`
+        DELETE FROM infra.a2a_tasks
+        WHERE task_id IN (
+          SELECT task_id FROM infra.a2a_tasks
+          WHERE context_id = ${task.contextId} AND owner_wallet = ${ownerWallet}
+          ORDER BY created_at DESC, task_id DESC
+          OFFSET ${MAX_CONTEXT_TASKS}
+        )
+      `;
+    }
   }
 
   async load(taskId: string): Promise<Task | undefined> {
@@ -26,17 +77,24 @@ export class PostgresTaskStore implements TaskStore {
     return rows[0]?.task_json;
   }
 
-  async loadByContextId(contextId: string, excludeTaskId?: string): Promise<Task[]> {
+  async loadByContextId(
+    contextId: string,
+    walletAddress: string,
+    excludeTaskId?: string,
+  ): Promise<Task[]> {
     const rows = excludeTaskId
       ? await this.sql<{ task_json: Task }[]>`
           SELECT task_json FROM infra.a2a_tasks
-          WHERE context_id = ${contextId} AND task_id != ${excludeTaskId}
+          WHERE context_id = ${contextId}
+            AND owner_wallet = ${walletAddress.toLowerCase()}
+            AND task_id != ${excludeTaskId}
           ORDER BY created_at DESC, task_id DESC
           LIMIT ${MAX_CONTEXT_TASKS}
         `
       : await this.sql<{ task_json: Task }[]>`
           SELECT task_json FROM infra.a2a_tasks
           WHERE context_id = ${contextId}
+            AND owner_wallet = ${walletAddress.toLowerCase()}
           ORDER BY created_at DESC, task_id DESC
           LIMIT ${MAX_CONTEXT_TASKS}
         `;

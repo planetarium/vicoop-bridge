@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS infra.a2a_tasks (
   context_id TEXT NOT NULL,
   state      TEXT NOT NULL,
   task_json  JSONB NOT NULL,
-  owner_wallet TEXT,
+  owner_wallet VARCHAR(42),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

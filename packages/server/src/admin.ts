@@ -223,7 +223,7 @@ class AdminAgentExecutor implements AgentExecutor {
         const tools = { ...schemaTools, ...customTools };
 
         // Load conversation history from previous tasks in the same context
-        const previousTasks = await this.taskStore.loadByContextId(contextId, taskId);
+        const previousTasks = await this.taskStore.loadByContextId(contextId, walletAddress, taskId);
         const contextHistory: Message[] = [];
         for (const prev of previousTasks) {
           if (prev.history) contextHistory.push(...prev.history);
