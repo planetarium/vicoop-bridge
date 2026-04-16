@@ -29,12 +29,7 @@ export function Chat() {
   const tokenRef = useRef(token);
   tokenRef.current = token;
 
-  // Persist task/context across a conversation
-  const taskIdRef = useRef<string | undefined>(undefined);
-  const contextIdRef = useRef<string | undefined>(undefined);
-
   useEffect(() => {
-    // Re-create client when token changes (auth handler reads tokenRef)
     clientRef.current = null;
   }, [token]);
 
@@ -61,28 +56,18 @@ export function Chat() {
 
     try {
       const client = await getClient();
-      const message: A2AMessage = {
-        kind: 'message',
-        messageId: crypto.randomUUID(),
-        role: 'user',
-        parts: [{ kind: 'text', text }],
-      };
-      if (taskIdRef.current) Object.assign(message, { taskId: taskIdRef.current });
-      if (contextIdRef.current) Object.assign(message, { contextId: contextIdRef.current });
+      const result = await client.sendMessage({
+        message: {
+          kind: 'message',
+          messageId: crypto.randomUUID(),
+          role: 'user',
+          parts: [{ kind: 'text', text }],
+        },
+      });
 
-      const result = await client.sendMessage({ message });
-
-      // result is Task | Message
-      if ('status' in result) {
-        const task = result;
-        taskIdRef.current = task.id;
-        contextIdRef.current = task.contextId;
-        const agentMsg = task.status.message;
-        if (agentMsg) {
-          setMessages((prev) => [...prev, { role: 'agent', text: extractText(agentMsg) }]);
-        }
-      } else {
-        setMessages((prev) => [...prev, { role: 'agent', text: extractText(result) }]);
+      const agentMsg = 'status' in result ? result.status.message : result;
+      if (agentMsg) {
+        setMessages((prev) => [...prev, { role: 'agent', text: extractText(agentMsg) }]);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unknown error');
