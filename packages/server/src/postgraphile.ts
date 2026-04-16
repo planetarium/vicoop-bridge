@@ -57,6 +57,6 @@ export async function startPostGraphile(databaseUrl: string): Promise<void> {
   );
 
   app.listen(port, () => {
-    console.log(`[relay] PostGraphile listening on :${port}`);
+    console.log(`[server] PostGraphile listening on :${port}`);
   });
 }

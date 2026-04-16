@@ -1,11 +1,11 @@
 {
-  "name": "@vicoop-bridge/relay",
+  "name": "@vicoop-bridge/server",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
   "bin": {
-    "vicoop-relay": "./dist/cli.js"
+    "vicoop-server": "./dist/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

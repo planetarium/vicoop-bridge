@@ -4,7 +4,7 @@ export type TaskAssign = TaskAssignFrame;
 
 export type Emit = (frame: UpFrame) => void;
 
-export interface ConnectorBackend {
+export interface Backend {
   name: string;
   handle(task: TaskAssign, emit: Emit): Promise<void>;
   cancel(taskId: string): Promise<void>;

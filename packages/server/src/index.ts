@@ -4,14 +4,14 @@ import { createHttpApp } from './http.js';
 import { attachWsServer } from './ws.js';
 import type { Sql } from './db.js';
 
-export interface RelayOptions {
+export interface ServerOptions {
   port: number;
   host?: string;
   publicUrl?: string;
   db: Sql;
 }
 
-export async function startRelay(opts: RelayOptions) {
+export async function startServer(opts: ServerOptions) {
   const registry = new Registry();
   const app = createHttpApp({
     registry,
@@ -30,7 +30,7 @@ export async function startRelay(opts: RelayOptions) {
     registry,
   });
 
-  console.log(`[relay] listening on :${opts.port}`);
+  console.log(`[server] listening on :${opts.port}`);
   return { registry, server };
 }
 

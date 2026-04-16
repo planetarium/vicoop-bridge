@@ -3,9 +3,9 @@ import type { AgentCard, DownFrame } from '@vicoop-bridge/protocol';
 import { encodeFrame } from '@vicoop-bridge/protocol';
 import type { ExecutionEventBus } from '@a2a-js/sdk/server';
 
-export interface ConnectorConnection {
+export interface ClientConnection {
   agentId: string;
-  connectorId: string;
+  clientId: string;
   agentCard: AgentCard;
   ws: WebSocket;
   connectedAt: number;
@@ -19,18 +19,18 @@ export interface TaskBinding {
 }
 
 export class Registry {
-  private agents = new Map<string, ConnectorConnection>();
+  private agents = new Map<string, ClientConnection>();
   private bindings = new Map<string, TaskBinding>();
 
-  registerAgent(conn: ConnectorConnection): { ok: true } | { ok: false; reason: string } {
+  registerAgent(conn: ClientConnection): { ok: true } | { ok: false; reason: string } {
     const existing = this.agents.get(conn.agentId);
     if (existing) {
-      if (existing.connectorId === conn.connectorId) {
+      if (existing.clientId === conn.clientId) {
         existing.ws.close(4009, 'replaced by new connection');
         this.agents.set(conn.agentId, conn);
         return { ok: true };
       }
-      return { ok: false, reason: 'agent already registered by different connector' };
+      return { ok: false, reason: 'agent already registered by different client' };
     }
     this.agents.set(conn.agentId, conn);
     return { ok: true };
@@ -54,7 +54,7 @@ export class Registry {
             kind: 'message',
             role: 'agent',
             messageId: `${binding.taskId}-disc`,
-            parts: [{ kind: 'text', text: 'connector disconnected mid-task' }],
+            parts: [{ kind: 'text', text: 'client disconnected mid-task' }],
             taskId: binding.taskId,
             contextId: binding.contextId,
           },
@@ -65,11 +65,11 @@ export class Registry {
     }
   }
 
-  getAgent(agentId: string): ConnectorConnection | undefined {
+  getAgent(agentId: string): ClientConnection | undefined {
     return this.agents.get(agentId);
   }
 
-  listAgents(): ConnectorConnection[] {
+  listAgents(): ClientConnection[] {
     return [...this.agents.values()];
   }
 

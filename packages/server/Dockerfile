@@ -10,15 +10,15 @@ RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
 COPY pnpm-workspace.yaml package.json pnpm-lock.yaml* ./
 COPY tsconfig.base.json ./
 COPY packages/protocol/package.json packages/protocol/
-COPY packages/relay/package.json packages/relay/
-COPY packages/connector/package.json packages/connector/
+COPY packages/server/package.json packages/server/
+COPY packages/client/package.json packages/client/
 
 RUN pnpm install --frozen-lockfile --prod=false
 
 COPY packages/protocol/ packages/protocol/
-COPY packages/relay/ packages/relay/
+COPY packages/server/ packages/server/
 
-# Build protocol (relay depends on its dist/)
+# Build protocol (server depends on its dist/)
 RUN pnpm --filter @vicoop-bridge/protocol build
 
 ENV NODE_ENV=production
@@ -26,4 +26,4 @@ ENV PORT=8787
 ENV POSTGRAPHILE_PORT=5433
 EXPOSE 8787
 
-CMD ["pnpm", "--filter", "@vicoop-bridge/relay", "start"]
+CMD ["pnpm", "--filter", "@vicoop-bridge/server", "start"]

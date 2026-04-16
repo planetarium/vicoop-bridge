@@ -1,5 +1,5 @@
 -- ============================================================
--- schema.sql — Relay Connector Registry
+-- schema.sql — Server Client Registry
 -- ============================================================
 
 -- ============================================================
@@ -50,53 +50,53 @@ AS $$
 $$;
 
 -- ============================================================
--- 3. Connectors table
+-- 3. Clients table
 -- ============================================================
-CREATE TABLE IF NOT EXISTS connectors (
+CREATE TABLE IF NOT EXISTS clients (
   id                TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
   owner_wallet      VARCHAR(42) NOT NULL,
-  connector_name    TEXT NOT NULL,
+  client_name       TEXT NOT NULL,
   token_hash        TEXT NOT NULL UNIQUE,
   allowed_agent_ids TEXT[] NOT NULL DEFAULT '{}',
   revoked           BOOLEAN NOT NULL DEFAULT FALSE,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-ALTER TABLE connectors ENABLE ROW LEVEL SECURITY;
+ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
 
--- Authenticated users see their own connectors; admins see all
-DROP POLICY IF EXISTS connectors_select ON connectors;
-CREATE POLICY connectors_select ON connectors
+-- Authenticated users see their own clients; admins see all
+DROP POLICY IF EXISTS clients_select ON clients;
+CREATE POLICY clients_select ON clients
   FOR SELECT TO app_authenticated
   USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
 
--- Users can insert connectors they own
-DROP POLICY IF EXISTS connectors_insert ON connectors;
-CREATE POLICY connectors_insert ON connectors
+-- Users can insert clients they own
+DROP POLICY IF EXISTS clients_insert ON clients;
+CREATE POLICY clients_insert ON clients
   FOR INSERT TO app_authenticated
   WITH CHECK (owner_wallet = lower(current_wallet_address()));
 
--- Users can update their own connectors; admins can update all
-DROP POLICY IF EXISTS connectors_update ON connectors;
-CREATE POLICY connectors_update ON connectors
+-- Users can update their own clients; admins can update all
+DROP POLICY IF EXISTS clients_update ON clients;
+CREATE POLICY clients_update ON clients
   FOR UPDATE TO app_authenticated
   USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
 
--- Users can delete their own connectors; admins can delete all
-DROP POLICY IF EXISTS connectors_delete ON connectors;
-CREATE POLICY connectors_delete ON connectors
+-- Users can delete their own clients; admins can delete all
+DROP POLICY IF EXISTS clients_delete ON clients;
+CREATE POLICY clients_delete ON clients
   FOR DELETE TO app_authenticated
   USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
 
--- app_postgraphile bypasses RLS (used by relay for token lookup)
-DROP POLICY IF EXISTS connectors_postgraphile ON connectors;
-CREATE POLICY connectors_postgraphile ON connectors
+-- app_postgraphile bypasses RLS (used by server for token lookup)
+DROP POLICY IF EXISTS clients_postgraphile ON clients;
+CREATE POLICY clients_postgraphile ON clients
   FOR ALL TO app_postgraphile
   USING (true)
   WITH CHECK (true);
 
 -- token_hash is never exposed via GraphQL — hide from PostGraphile
-COMMENT ON COLUMN connectors.token_hash IS E'@omit';
+COMMENT ON COLUMN clients.token_hash IS E'@omit';
 
 -- ============================================================
 -- 4. Grants

@@ -1,12 +1,12 @@
 {
-  "name": "@vicoop-bridge/connector",
+  "name": "@vicoop-bridge/client",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "vicoop-connector": "./dist/cli.js"
+    "vicoop-client": "./dist/cli.js"
   },
   "files": [
     "dist",

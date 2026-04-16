@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { startRelay } from './index.js';
+import { startServer } from './index.js';
 import { createDb, ensureSchema } from './db.js';
 import { startPostGraphile } from './postgraphile.js';
 
@@ -23,13 +23,13 @@ async function main() {
   const setupDb = createDb(dbSetupUrl ?? databaseUrl!);
   await ensureSchema(setupDb);
   await setupDb.end();
-  console.log('[relay] schema ensured');
+  console.log('[server] schema ensured');
 
-  // Runtime DB connection (used for connector token lookup)
+  // Runtime DB connection (used for client token lookup)
   const db = createDb(databaseUrl!);
 
   await startPostGraphile(databaseUrl!);
-  await startRelay({ port, publicUrl, db });
+  await startServer({ port, publicUrl, db });
 }
 
 main().catch((err) => {

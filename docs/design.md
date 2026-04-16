@@ -11,16 +11,16 @@ External A2A Client
         │  (A2A HTTP/JSON-RPC)
         ▼
 ┌─────────────────────────────┐
-│  vicoop-bridge Relay        │   공개 배포 (Fly.io 등)
+│  vicoop-bridge Server       │   공개 배포 (Fly.io 등)
 │  - /.well-known/agent.json  │
 │  - /agents/{id}/agent.json  │
 │  - POST /agents/{id}/messages/send
-│  - WS /connect   (connectors) │
+│  - WS /connect   (clients)   │
 └─────────────────────────────┘
-        ▲  WebSocket (outbound from connector)
+        ▲  WebSocket (outbound from client)
         │
 ┌───────┴─────────────────────┐
-│  vicoop-bridge Connector    │   사설망
+│  vicoop-bridge Client       │   사설망
 │  - backend: openclaw | claude-cli | codex | webhook
 │  - AgentCard 제공            │
 │  - task lifecycle 번역       │
@@ -30,9 +30,9 @@ External A2A Client
   실제 에이전트 프로세스 / API
 ```
 
-- **Relay**는 에이전트 종류를 모른다. 순수 A2A 프록시 + 라우터.
-- **Connector**가 에이전트별 변환을 담당. Claude Code/Codex 같은 CLI 에이전트는 태스크당 subprocess spawn, `--resume` / `--session-id` 로 세션 유지.
-- 연결 방향은 항상 Connector → Relay (아웃바운드).
+- **Server**는 에이전트 종류를 모른다. 순수 A2A 프록시 + 라우터.
+- **Client**가 에이전트별 변환을 담당. Claude Code/Codex 같은 CLI 에이전트는 태스크당 subprocess spawn, `--resume` / `--session-id` 로 세션 유지.
+- 연결 방향은 항상 Client → Server (아웃바운드).
 
 ## 3. Repo Layout
 
@@ -41,16 +41,16 @@ vicoop-bridge/
 ├── docs/
 │   └── design.md
 ├── packages/
-│   ├── protocol/   # Relay ↔ Connector 프레임 타입 (shared)
-│   ├── relay/      # HTTP + WS 서버
-│   └── connector/  # 스탠드얼론 connector 데몬 (backend 플러그인)
+│   ├── protocol/   # Server ↔ Client 프레임 타입 (shared)
+│   ├── server/     # HTTP + WS 서버
+│   └── client/     # 스탠드얼론 client 데몬 (backend 플러그인)
 ├── pnpm-workspace.yaml
 └── package.json
 ```
 
-## 4. Relay ↔ Connector Protocol (WS JSON frames)
+## 4. Server ↔ Client Protocol (WS JSON frames)
 
-**Connector → Relay**
+**Client → Server**
 - `hello`         — `{ agentCard, version, token }`
 - `task.status`   — `{ taskId, status }`
 - `task.artifact` — `{ taskId, artifact }`
@@ -58,32 +58,32 @@ vicoop-bridge/
 - `task.fail`     — `{ taskId, error }`
 - `pong`
 
-**Relay → Connector**
+**Server → Client**
 - `task.assign`   — `{ taskId, contextId, content, card }`
 - `task.cancel`   — `{ taskId }`
 - `ping`
 
-## 5. Connector Backends
+## 5. Client Backends
 
 ```bash
 # OpenClaw (native integration)
-vicoop-connector \
-  --relay wss://bridge.vicoop.xyz \
+vicoop-client \
+  --server wss://bridge.vicoop.xyz \
   --token $TOKEN \
   --backend openclaw \
   --card ./cards/openclaw.json
 
 # Claude Code
-vicoop-connector \
+vicoop-client \
   --backend claude-cli \
   --card ./cards/claude-code.json
   # internally: `claude -p --session-id <ctx> --resume ...`
 
 # Codex
-vicoop-connector --backend codex --card ./cards/codex.json
+vicoop-client --backend codex --card ./cards/codex.json
 
 # Generic webhook
-vicoop-connector \
+vicoop-client \
   --backend webhook \
   --backend-url http://localhost:8080/agent \
   --card ./cards/custom.json
@@ -91,7 +91,7 @@ vicoop-connector \
 
 각 backend는 공통 인터페이스를 구현:
 ```ts
-interface ConnectorBackend {
+interface Backend {
   handle(task: TaskAssign, emit: (frame: UpFrame) => void): Promise<void>;
   cancel(taskId: string): Promise<void>;
 }
@@ -101,9 +101,9 @@ interface ConnectorBackend {
 
 ## 6. External A2A Surface
 
-Relay는 `@a2aproject/a2a-js` v0.3.x 스펙을 따른다.
+Server는 `@a2aproject/a2a-js` v0.3.x 스펙을 따른다.
 
-- `GET /.well-known/agent.json` — Relay 메타
+- `GET /.well-known/agent.json` — Server 메타
 - `GET /agents/{id}/agent.json` — 연결된 특정 에이전트의 AgentCard
 - `POST /agents/{id}/messages/send` — A2A task 생성
 - `POST /agents/{id}/messages/stream` — SSE 스트리밍
@@ -112,8 +112,8 @@ Relay는 `@a2aproject/a2a-js` v0.3.x 스펙을 따른다.
 ## 7. Auth (미결)
 
 후보:
-- (A) Connector: 정적 토큰, External client: API key
-- (B) Connector: 정적 토큰, External client: SIWE (vicoop 생태계 통합)
+- (A) Client: 정적 토큰, External client: API key
+- (B) Client: 정적 토큰, External client: SIWE (vicoop 생태계 통합)
 - (C) mTLS
 
 **Phase 1 결정**: (A) 로 시작, Phase 4에서 SIWE 통합.
@@ -122,18 +122,18 @@ Relay는 `@a2aproject/a2a-js` v0.3.x 스펙을 따른다.
 
 | Phase | 범위 |
 |------|------|
-| 1 (MVP) | `protocol` + `relay` + `openclaw` backend, Fly.io 배포, 단일 connector 연결 |
+| 1 (MVP) | `protocol` + `server` + `openclaw` backend, Fly.io 배포, 단일 client 연결 |
 | 2 | `claude-cli`, `codex` backend |
-| 3 | `webhook` backend + connector SDK 분리 |
+| 3 | `webhook` backend + client SDK 분리 |
 | 4 | 인증 강화 (SIWE), 동시성/process pool, 모니터링, 다중 에이전트 컨텍스트 공유 |
 
 ## 9. Open Questions
 
-- AgentCard 업데이트 흐름 (connector 재연결 vs. 별도 프레임)
-- 여러 connector가 같은 agent id로 붙으면? (active/standby? round-robin?)
+- AgentCard 업데이트 흐름 (client 재연결 vs. 별도 프레임)
+- 여러 client가 같은 agent id로 붙으면? (active/standby? round-robin?)
 - Task artifact 대용량 처리 (바이너리 / 파일) — 직접 업로드 vs. presigned URL
 - Claude Code stdout 파싱 포맷 확정 (JSON stream mode?)
-- Relay 재시작 시 in-flight task 복구 정책
+- Server 재시작 시 in-flight task 복구 정책
 
 ## 10. Out of Scope (for now)
 

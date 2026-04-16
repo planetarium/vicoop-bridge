@@ -7,21 +7,21 @@ if [[ $# -ne 1 ]]; then
 fi
 
 TAG="$1"
-VERSION="${TAG#connector-v}"
+VERSION="${TAG#client-v}"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="$ROOT_DIR/dist-release"
 WORK_DIR="$OUT_DIR/work"
-BUNDLE_DIR="$WORK_DIR/vicoop-bridge-connector-$VERSION"
-ARCHIVE_PATH="$OUT_DIR/vicoop-bridge-connector-$VERSION.tgz"
+BUNDLE_DIR="$WORK_DIR/vicoop-bridge-client-$VERSION"
+ARCHIVE_PATH="$OUT_DIR/vicoop-bridge-client-$VERSION.tgz"
 CHECKSUM_PATH="$ARCHIVE_PATH.sha256"
 
 rm -rf "$WORK_DIR" "$ARCHIVE_PATH" "$CHECKSUM_PATH"
 mkdir -p "$WORK_DIR"
 
-pnpm --dir "$ROOT_DIR" --filter @vicoop-bridge/connector deploy --prod "$BUNDLE_DIR"
+pnpm --dir "$ROOT_DIR" --filter @vicoop-bridge/client deploy --prod "$BUNDLE_DIR"
 mkdir -p "$BUNDLE_DIR/bin"
 
-cat > "$BUNDLE_DIR/bin/vicoop-connector" <<'EOF'
+cat > "$BUNDLE_DIR/bin/vicoop-client" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -29,27 +29,27 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 exec node "$SCRIPT_DIR/../dist/cli.js" "$@"
 EOF
 
-chmod +x "$BUNDLE_DIR/bin/vicoop-connector"
+chmod +x "$BUNDLE_DIR/bin/vicoop-client"
 
 cat > "$BUNDLE_DIR/README.md" <<EOF
-# vicoop-bridge-connector $VERSION
+# vicoop-bridge-client $VERSION
 
-Portable release bundle for the standalone connector daemon.
+Portable release bundle for the standalone client daemon.
 
 ## Usage
 
 \`\`\`bash
-./bin/vicoop-connector --relay <ws://...> --token <token> --agentId <id> --card ./cards/openclaw.json --backend openclaw
+./bin/vicoop-client --server <ws://...> --token <token> --agentId <id> --card ./cards/openclaw.json --backend openclaw
 \`\`\`
 
 ## Notes
 
 - This bundle is built from the Git tag \`$TAG\`.
 - Node.js 20 or newer is required.
-- The \`bin/vicoop-connector\` wrapper runs \`node dist/cli.js\` for convenience.
+- The \`bin/vicoop-client\` wrapper runs \`node dist/cli.js\` for convenience.
 EOF
 
-tar -C "$WORK_DIR" -czf "$ARCHIVE_PATH" "vicoop-bridge-connector-$VERSION"
+tar -C "$WORK_DIR" -czf "$ARCHIVE_PATH" "vicoop-bridge-client-$VERSION"
 shasum -a 256 "$ARCHIVE_PATH" > "$CHECKSUM_PATH"
 
 echo "created $ARCHIVE_PATH"
