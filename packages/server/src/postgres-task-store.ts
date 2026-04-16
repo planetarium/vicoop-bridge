@@ -54,7 +54,7 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
         ${task.id},
         ${task.contextId},
         ${task.status.state},
-        ${this.sql.json(sanitized as never)},
+        ${this.sql.json(JSON.parse(JSON.stringify(sanitized)))},
         ${ownerWallet ?? null}
       )
       ON CONFLICT (task_id) DO UPDATE SET
