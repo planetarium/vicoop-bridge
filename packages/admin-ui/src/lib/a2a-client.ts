@@ -34,23 +34,22 @@ export async function sendMessage(
   taskId?: string,
   contextId?: string,
 ): Promise<A2ATask> {
-  const msgTaskId = taskId ?? crypto.randomUUID();
-  const msgContextId = contextId ?? crypto.randomUUID();
+  const message: Record<string, unknown> = {
+    kind: 'message',
+    messageId: crypto.randomUUID(),
+    role: 'user',
+    parts: [{ kind: 'text', text }],
+  };
+
+  // Only include taskId/contextId for follow-up messages (continuing a task)
+  if (taskId) message.taskId = taskId;
+  if (contextId) message.contextId = contextId;
 
   const body = {
     jsonrpc: '2.0',
     id: ++rpcId,
     method: 'message/send',
-    params: {
-      message: {
-        kind: 'message',
-        messageId: crypto.randomUUID(),
-        role: 'user',
-        parts: [{ kind: 'text', text }],
-        taskId: msgTaskId,
-        contextId: msgContextId,
-      },
-    },
+    params: { message },
   };
 
   const res = await fetch(SERVER_URL, {
