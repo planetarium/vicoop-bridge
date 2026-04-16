@@ -80,6 +80,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   const adminCard = buildAdminAgentCard(opts.publicUrl);
 
   function getTransport(conn: ClientConnection): JsonRpcTransportHandler {
+    // Rebuild transport when security state changes (allowedCallers toggled)
     const cached = transports.get(conn.agentId);
     if (cached) return cached;
     const card = toSdkAgentCard(conn.agentCard, conn, opts.publicUrl);
@@ -89,6 +90,14 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     transports.set(conn.agentId, transport);
     return transport;
   }
+
+  // Invalidate cached transport when allowedCallers changes so the
+  // handler's card reflects the updated security fields.
+  const origUpdate = opts.registry.updateAllowedCallers.bind(opts.registry);
+  opts.registry.updateAllowedCallers = (agentId: string, callers: string[]) => {
+    transports.delete(agentId);
+    origUpdate(agentId, callers);
+  };
 
   async function handleTransportResult(result: unknown, c: Context) {
     if (Symbol.asyncIterator in (result as object)) {

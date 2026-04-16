@@ -95,11 +95,11 @@ Clients are services that connect to the server via WebSocket to register A2A ag
 
 ## Tool Usage
 
-- Use \`query_*\` and \`mutate_*\` tools for standard CRUD operations on clients and agent policies. RLS enforces ownership.
+- Use \`query_*\` and \`mutate_*\` tools for standard CRUD operations on clients. Use \`query_*\` tools to inspect agent policies. RLS enforces ownership.
 - Use \`register_client\` to create a new client — this generates a token and hashes it before storing.
 - Use \`list_active_agents\` to see currently connected agents.
-- Use \`add_caller\` / \`remove_caller\` / \`list_callers\` to manage per-agent access control.
-- Use \`execute_graphql\` for complex queries not covered by auto-generated tools.
+- Use \`add_caller\` / \`remove_caller\` / \`list_callers\` to manage per-agent access control. Do not use GraphQL mutations to manage \`allowed_callers\`.
+- Use \`execute_graphql\` for complex queries and inspection not covered by auto-generated tools.
 
 ## Agent Access Control
 
