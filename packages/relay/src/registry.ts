@@ -5,6 +5,7 @@ import type { ExecutionEventBus } from '@a2a-js/sdk/server';
 
 export interface ConnectorConnection {
   agentId: string;
+  connectorId: string;
   agentCard: AgentCard;
   ws: WebSocket;
   connectedAt: number;
@@ -22,8 +23,14 @@ export class Registry {
   private bindings = new Map<string, TaskBinding>();
 
   registerAgent(conn: ConnectorConnection): { ok: true } | { ok: false; reason: string } {
-    if (this.agents.has(conn.agentId)) {
-      return { ok: false, reason: 'agent already connected' };
+    const existing = this.agents.get(conn.agentId);
+    if (existing) {
+      if (existing.connectorId === conn.connectorId) {
+        existing.ws.close(4009, 'replaced by new connection');
+        this.agents.set(conn.agentId, conn);
+        return { ok: true };
+      }
+      return { ok: false, reason: 'agent already registered by different connector' };
     }
     this.agents.set(conn.agentId, conn);
     return { ok: true };
