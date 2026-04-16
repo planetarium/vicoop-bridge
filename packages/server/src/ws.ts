@@ -196,6 +196,9 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           name: frame.agentCard.name,
           ts: new Date().toISOString(),
         }));
+      }).catch((err) => {
+        console.error('[server] auth error:', err);
+        ws.close(1011, 'internal error');
       });
       return;
     }
