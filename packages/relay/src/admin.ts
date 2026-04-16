@@ -13,7 +13,8 @@ import {
   type RequestContext,
 } from '@a2a-js/sdk/server';
 import type { AgentCard as SdkAgentCard } from '@a2a-js/sdk';
-import { hashToken, generateToken, type Sql } from './db.js';
+import type { Sql } from './db.js';
+import { hashToken, generateToken } from './token.js';
 import { getSchemaTools } from './schema-tools.js';
 import { runWithBearerToken } from './graphql-client.js';
 import type { Registry } from './registry.js';

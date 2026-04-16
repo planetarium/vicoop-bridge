@@ -2,7 +2,20 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import type { IncomingMessage, Server } from 'node:http';
 import { parseUpFrame, PROTOCOL_VERSION, type Part, type TaskStatus } from '@vicoop-bridge/protocol';
 import type { Registry } from './registry.js';
-import { hashToken, lookupByTokenHash, type Sql } from './db.js';
+import type { Sql } from './db.js';
+import { hashToken } from './token.js';
+
+interface ConnectorRow {
+  id: string;
+  allowed_agent_ids: string[];
+}
+
+async function lookupByTokenHash(sql: Sql, hash: string): Promise<ConnectorRow | null> {
+  const rows = await sql<ConnectorRow[]>`
+    SELECT id, allowed_agent_ids FROM connectors WHERE token_hash = ${hash} AND revoked = false
+  `;
+  return rows[0] ?? null;
+}
 
 export interface RelayWsOptions {
   db: Sql;
