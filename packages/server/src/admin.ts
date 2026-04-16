@@ -222,11 +222,18 @@ class AdminAgentExecutor implements AgentExecutor {
         const customTools = buildCustomTools(this.db, this.registry, walletAddress);
         const tools = { ...schemaTools, ...customTools };
 
-        // Load conversation history from previous tasks in the same context
+        // Load conversation history from previous tasks in the same context.
+        // The SDK's ResultManager normally appends status.message into history
+        // before saving, but as a fallback we also include status.message if
+        // it wasn't recorded in history (e.g. edge cases around failures).
         const previousTasks = await this.taskStore.loadByContextId(contextId, walletAddress, taskId);
         const contextHistory: Message[] = [];
         for (const prev of previousTasks) {
           if (prev.history) contextHistory.push(...prev.history);
+          const statusMsg = prev.status?.message;
+          if (statusMsg && !prev.history?.some((m) => m.messageId === statusMsg.messageId)) {
+            contextHistory.push(statusMsg);
+          }
         }
         const currentHistory = task?.history ?? [];
         const history = [...contextHistory, ...currentHistory];
