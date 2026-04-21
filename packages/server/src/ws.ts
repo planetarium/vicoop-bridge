@@ -32,7 +32,9 @@ async function ensureAgentPolicy(
   // Refresh client_id on re-registration so cascade follows the currently
   // registering client. Case-insensitive compare mirrors the lowercase
   // normalization used elsewhere, so a legacy mixed-case row still matches;
-  // the ownership check below still rejects cross-wallet attempts.
+  // the ownership check below still rejects cross-wallet attempts. The
+  // IS DISTINCT FROM guard skips the write when nothing actually changed to
+  // avoid WAL churn on frequent reconnects.
   await sql`
     INSERT INTO agent_policies (agent_id, owner_wallet, client_id)
     VALUES (${agentId}, ${ownerWallet.toLowerCase()}, ${clientId})
@@ -41,6 +43,10 @@ async function ensureAgentPolicy(
           client_id = EXCLUDED.client_id,
           updated_at = now()
       WHERE lower(agent_policies.owner_wallet) = lower(EXCLUDED.owner_wallet)
+        AND (
+          agent_policies.client_id IS DISTINCT FROM EXCLUDED.client_id
+          OR agent_policies.owner_wallet IS DISTINCT FROM EXCLUDED.owner_wallet
+        )
   `;
   const rows = await sql<PolicyRow[]>`
     SELECT owner_wallet, allowed_callers FROM agent_policies WHERE agent_id = ${agentId}

@@ -225,10 +225,15 @@ CREATE POLICY agent_policies_select ON agent_policies
   FOR SELECT TO app_authenticated
   USING (lower(owner_wallet) = lower(current_wallet_address()) OR is_admin());
 
--- No INSERT/UPDATE policies for app_authenticated — only the server
--- (via app_postgraphile) and custom admin tools manage these rows.
+-- No INSERT policy for app_authenticated. UPDATE is allowed for the same
+-- owner/admin predicate because admin tools (add_caller / remove_caller) run
+-- UPDATE under app_authenticated; direct mutations remain hidden via @omit.
 DROP POLICY IF EXISTS agent_policies_insert ON agent_policies;
 DROP POLICY IF EXISTS agent_policies_update ON agent_policies;
+CREATE POLICY agent_policies_update ON agent_policies
+  FOR UPDATE TO app_authenticated
+  USING (lower(owner_wallet) = lower(current_wallet_address()) OR is_admin())
+  WITH CHECK (lower(owner_wallet) = lower(current_wallet_address()) OR is_admin());
 
 -- DELETE policy exists solely so ON DELETE CASCADE from clients works when a
 -- user (running as app_authenticated) deletes their own client. The direct
