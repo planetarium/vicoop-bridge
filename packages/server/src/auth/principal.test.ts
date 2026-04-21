@@ -321,11 +321,3 @@ test('matchPrincipal: unparseable entry returns false', () => {
   const caller = { principalId: 'eth:0xaabbccddeeff00112233445566778899aabbccdd' };
   assert.equal(matchPrincipal('garbage', caller), false);
 });
-
-test('matchPrincipal: legacy plain 0x entry matches eth principal (backward compat)', () => {
-  const caller = { principalId: 'eth:0xaabbccddeeff00112233445566778899aabbccdd' };
-  assert.equal(
-    matchPrincipal('0xAABBCCDDEEFF00112233445566778899AABBCCDD', caller),
-    true,
-  );
-});

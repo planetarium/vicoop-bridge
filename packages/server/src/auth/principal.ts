@@ -94,13 +94,8 @@ export function validatePrincipal(raw: string): Principal | null {
 
 // Returns true if the verified caller satisfies the given allowed_callers entry.
 // google:domain:* requires emailVerified=true.
-//
-// Backward compat: accepts legacy plain `0x<40 hex>` entries (pre-principal-prefix
-// data) by normalizing through validatePrincipal before parsing.
 export function matchPrincipal(entry: Principal, caller: VerifiedCaller): boolean {
-  const normalized = validatePrincipal(entry);
-  if (!normalized) return false;
-  const parsed = parsePrincipal(normalized);
+  const parsed = parsePrincipal(entry);
   if (!parsed) return false;
 
   switch (parsed.kind) {

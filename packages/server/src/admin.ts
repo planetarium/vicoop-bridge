@@ -251,8 +251,7 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
     remove_caller: tool({
       description:
         'Remove a principal from an agent\'s allowed callers. If the list becomes empty, the agent becomes public again. ' +
-        'Accepts the same principal formats as add_caller. To remove a legacy plain-0x entry, pass it as-is; ' +
-        'the tool matches both the canonical eth:0x... form and the legacy form.',
+        'Accepts the same principal formats as add_caller.',
       inputSchema: z.object({
         agent_id: z.string().describe('The agent ID to remove the caller from'),
         principal: z.string().describe('Principal string to remove'),
@@ -262,24 +261,11 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
         if (!normalized) {
           return { error: 'Invalid principal format. See add_caller description for supported formats.' };
         }
-        // Remove both canonical form and, when applicable, the legacy plain-0x form
-        // (pre-principal-prefix data) so stale entries can still be cleaned out.
-        const legacy = normalized.startsWith('eth:') ? normalized.slice(4) : null;
         const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
         const result = await db.begin(async (tx) => {
           await tx`SELECT set_config('role', 'app_authenticated', true)`;
           await tx`SELECT set_config('jwt.claims.wallet_address', ${walletAddress.toLowerCase()}, true)`;
           await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
-          if (legacy) {
-            return tx`
-              UPDATE agent_policies
-              SET allowed_callers = array_remove(array_remove(allowed_callers, ${normalized}), ${legacy}),
-                  updated_at = now()
-              WHERE agent_id = ${agent_id}
-                AND (${normalized} = ANY(allowed_callers) OR ${legacy} = ANY(allowed_callers))
-              RETURNING agent_id, owner_wallet, allowed_callers
-            `;
-          }
           return tx`
             UPDATE agent_policies
             SET allowed_callers = array_remove(allowed_callers, ${normalized}),
