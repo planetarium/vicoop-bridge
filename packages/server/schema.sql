@@ -54,6 +54,23 @@ AS $$
   );
 $$;
 
+-- Validate and normalize an Ethereum wallet address (0x + 40 hex chars).
+-- Raises invalid_parameter_value if the input does not match. Used by
+-- register_client to reject typo'd or malformed addresses before creating a
+-- client that the intended owner could never access under RLS.
+CREATE OR REPLACE FUNCTION normalize_wallet_address(addr TEXT)
+  RETURNS VARCHAR(42)
+  LANGUAGE plpgsql IMMUTABLE
+AS $$
+BEGIN
+  IF addr IS NULL OR addr !~ '^0x[0-9a-fA-F]{40}$' THEN
+    RAISE EXCEPTION 'invalid wallet address: %', addr
+      USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  RETURN lower(addr);
+END;
+$$;
+
 -- ============================================================
 -- 3. Clients table
 -- ============================================================
@@ -151,13 +168,17 @@ BEGIN
   v_token_hash := encode(digest(v_raw_token, 'sha256'), 'hex');
 
   IF is_admin() AND register_client.owner_wallet IS NOT NULL THEN
-    v_owner := lower(register_client.owner_wallet);
+    -- Validate the explicit owner_wallet: a typo'd address would create a row
+    -- that the intended owner could never read or update under RLS.
+    v_owner := normalize_wallet_address(register_client.owner_wallet);
   ELSE
-    v_owner := lower(current_wallet_address());
-  END IF;
-
-  IF v_owner IS NULL THEN
-    RAISE EXCEPTION 'current wallet address is not set';
+    IF current_wallet_address() IS NULL THEN
+      RAISE EXCEPTION 'current wallet address is not set';
+    END IF;
+    -- Sanity check: current_wallet_address() comes from the SIWE token claim
+    -- and should already be well-formed. Validate anyway so a compromised or
+    -- buggy auth layer cannot plant malformed rows.
+    v_owner := normalize_wallet_address(current_wallet_address());
   END IF;
 
   INSERT INTO clients AS c (owner_wallet, client_name, token_hash, allowed_agent_ids)
