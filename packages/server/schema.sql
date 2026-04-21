@@ -136,8 +136,10 @@ CREATE TABLE IF NOT EXISTS agent_policies (
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Idempotent migration for pre-#23 deployments: add the column, attach the FK,
--- backfill it from clients.allowed_agent_ids, drop orphans, then enforce NOT NULL.
+-- Idempotent migration for pre-#23 deployments. ensureSchema() runs schema.sql
+-- without an outer transaction, so each step must tolerate resuming from a
+-- half-applied state: the FK is added NOT VALID first, rows are scrubbed, and
+-- the constraint is validated only after the table is consistent.
 ALTER TABLE agent_policies ADD COLUMN IF NOT EXISTS client_id TEXT;
 
 DO $$ BEGIN
@@ -146,24 +148,38 @@ DO $$ BEGIN
   ) THEN
     ALTER TABLE agent_policies
       ADD CONSTRAINT agent_policies_client_id_fkey
-      FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE;
+      FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+      NOT VALID;
   END IF;
 END $$;
 
+-- Backfill: prefer a client whose allowed_agent_ids still lists this agent,
+-- otherwise fall back to the most recent client of the same wallet. The
+-- fallback preserves existing allowed_callers configuration when
+-- allowed_agent_ids is out of sync with historical registrations.
 UPDATE agent_policies ap
 SET client_id = sub.client_id
 FROM (
   SELECT DISTINCT ON (p.agent_id) p.agent_id, c.id AS client_id
   FROM agent_policies p
-  JOIN clients c
-    ON c.owner_wallet = p.owner_wallet
-   AND p.agent_id = ANY(c.allowed_agent_ids)
+  JOIN clients c ON c.owner_wallet = p.owner_wallet
   WHERE p.client_id IS NULL
-  ORDER BY p.agent_id, c.created_at DESC
+  ORDER BY p.agent_id,
+           (p.agent_id = ANY(c.allowed_agent_ids)) DESC,
+           c.created_at DESC
 ) sub
 WHERE ap.agent_id = sub.agent_id AND ap.client_id IS NULL;
 
+-- Partial-run safety: drop rows whose client_id references a client that no
+-- longer exists (otherwise VALIDATE CONSTRAINT would fail).
+DELETE FROM agent_policies ap
+WHERE ap.client_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM clients c WHERE c.id = ap.client_id);
+
+-- Only rows whose wallet has no clients left are truly orphaned.
 DELETE FROM agent_policies WHERE client_id IS NULL;
+
+ALTER TABLE agent_policies VALIDATE CONSTRAINT agent_policies_client_id_fkey;
 
 ALTER TABLE agent_policies ALTER COLUMN client_id SET NOT NULL;
 
