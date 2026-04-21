@@ -153,16 +153,25 @@ DO $$ BEGIN
   END IF;
 END $$;
 
+-- Partial-run safety: if a row already has a client_id but it points at a
+-- missing client (e.g. deleted while the FK was NOT VALID), reset it to NULL
+-- rather than deleting — the backfill below will try to reassign the policy
+-- to another client of the same wallet and preserve allowed_callers.
+UPDATE agent_policies ap
+SET client_id = NULL
+WHERE ap.client_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM clients c WHERE c.id = ap.client_id);
+
 -- Backfill: prefer a client whose allowed_agent_ids still lists this agent,
 -- otherwise fall back to the most recent client of the same wallet. The
--- fallback preserves existing allowed_callers configuration when
--- allowed_agent_ids is out of sync with historical registrations.
+-- fallback preserves existing allowed_callers when allowed_agent_ids is out
+-- of sync. Case-insensitive wallet compare guards against legacy casing.
 UPDATE agent_policies ap
 SET client_id = sub.client_id
 FROM (
   SELECT DISTINCT ON (p.agent_id) p.agent_id, c.id AS client_id
   FROM agent_policies p
-  JOIN clients c ON c.owner_wallet = p.owner_wallet
+  JOIN clients c ON lower(c.owner_wallet) = lower(p.owner_wallet)
   WHERE p.client_id IS NULL
   ORDER BY p.agent_id,
            (p.agent_id = ANY(c.allowed_agent_ids)) DESC,
@@ -170,14 +179,13 @@ FROM (
 ) sub
 WHERE ap.agent_id = sub.agent_id AND ap.client_id IS NULL;
 
--- Partial-run safety: drop rows whose client_id references a client that no
--- longer exists (otherwise VALIDATE CONSTRAINT would fail).
+-- Only rows whose wallet truly has no clients left are orphaned.
 DELETE FROM agent_policies ap
-WHERE ap.client_id IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM clients c WHERE c.id = ap.client_id);
-
--- Only rows whose wallet has no clients left are truly orphaned.
-DELETE FROM agent_policies WHERE client_id IS NULL;
+WHERE ap.client_id IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM clients c
+    WHERE lower(c.owner_wallet) = lower(ap.owner_wallet)
+  );
 
 ALTER TABLE agent_policies VALIDATE CONSTRAINT agent_policies_client_id_fkey;
 
