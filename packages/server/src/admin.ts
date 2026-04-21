@@ -13,7 +13,6 @@ import {
 } from '@a2a-js/sdk/server';
 import type { AgentCard as SdkAgentCard } from '@a2a-js/sdk';
 import type { Sql } from './db.js';
-import { hashToken, generateToken } from './token.js';
 import { getSchemaTools } from './schema-tools.js';
 import { runWithBearerToken } from './graphql-client.js';
 import type { Registry } from './registry.js';
@@ -95,12 +94,17 @@ Clients are services that connect to the server via WebSocket to register A2A ag
 - **allowed_agent_ids**: List of agent IDs this client is authorized to register
 - **revoked**: Whether this client has been revoked
 - **created_at**: When it was created
-- **token_hash**: Not exposed via GraphQL — use register_client tool to create tokens
+- **token_hash**: Not exposed via GraphQL — use \`mutate_registerClient\` or \`mutate_rotateClientToken\` to obtain tokens
 
 ## Tool Usage
 
-- Use \`query_*\` and \`mutate_*\` tools for standard CRUD operations on clients. Use \`query_*\` tools to inspect agent policies. RLS enforces ownership.
-- Use \`register_client\` to create a new client — this generates a token and hashes it before storing.
+- Use \`query_*\` tools to read clients and agent policies. RLS enforces ownership (admins see all).
+- Client lifecycle mutations are exposed as custom GraphQL functions:
+  - \`mutate_registerClient(clientName, allowedAgentIds, ownerWallet?)\` — creates a new client and returns the raw bearer token (shown only once). Admins may pass \`ownerWallet\` to create on behalf of another wallet; non-admins always own the resulting client.
+  - \`mutate_revokeClient(clientId)\` / \`mutate_unrevokeClient(clientId)\` — toggle the \`revoked\` flag. Existing WebSocket sessions stay connected until they reconnect.
+  - \`mutate_rotateClientToken(clientId)\` — issues a new bearer token and invalidates the previous one. Returns the raw token once.
+  - \`mutate_updateClientAllowedAgents(clientId, allowedAgentIds)\` — replaces the agent allowlist.
+- Do NOT use the auto-generated \`mutate_updateClientById\` or \`mutate_deleteClientById\` for revoke/token rotation — always prefer the semantic mutations above.
 - Use \`list_active_agents\` to see currently connected agents.
 - Use \`add_caller\` / \`remove_caller\` / \`list_callers\` to manage per-agent access control. Do not use GraphQL mutations to manage \`allowed_callers\`.
 - Use \`execute_graphql\` for complex queries and inspection not covered by auto-generated tools.
@@ -119,7 +123,8 @@ Your conversation history is persisted in PostgreSQL. You remember all previous 
 
 ## Important rules
 
-- When registering a client, always warn the user that the token is shown only once.
+- When registering a client or rotating a token, always warn the user that the raw token is shown only once.
+- When registering on behalf of another wallet (admin only), echo back the chosen \`ownerWallet\` so the user can confirm.
 - When adding a caller, explain that the agent will require SIWE authentication from that point on.
 - Present data clearly in tables or lists.
 - If asked about something outside client management, politely explain your scope.
@@ -151,33 +156,6 @@ function validateWalletAddress(address: string): string | null {
 
 function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
   return {
-    register_client: tool({
-      description:
-        'Register a new client owned by the current wallet. Generates a bearer token (shown only once) and stores its hash.',
-      inputSchema: z.object({
-        client_name: z.string().describe('Human-readable client name'),
-        allowed_agent_ids: z
-          .array(z.string())
-          .describe('List of agent IDs this client is authorized to register'),
-      }),
-      execute: async ({ client_name, allowed_agent_ids }) => {
-        const rawToken = generateToken();
-        const tokenHash = hashToken(rawToken);
-        const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
-        const result = await db.begin(async (tx) => {
-          await tx`SELECT set_config('role', 'app_authenticated', true)`;
-          await tx`SELECT set_config('jwt.claims.wallet_address', ${walletAddress.toLowerCase()}, true)`;
-          await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
-          return tx`
-            INSERT INTO clients (owner_wallet, client_name, token_hash, allowed_agent_ids)
-            VALUES (${walletAddress.toLowerCase()}, ${client_name}, ${tokenHash}, ${allowed_agent_ids})
-            RETURNING id, owner_wallet, client_name, allowed_agent_ids, created_at
-          `;
-        });
-        return { ...result[0], token: rawToken };
-      },
-    }),
-
     list_active_agents: tool({
       description: 'List currently connected agents with their client identity and connection time. Non-admin users only see their own agents.',
       inputSchema: z.object({}),
