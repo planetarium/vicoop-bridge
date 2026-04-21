@@ -27,11 +27,17 @@ async function ensureAgentPolicy(
   sql: Sql,
   agentId: string,
   ownerWallet: string,
+  clientId: string,
 ): Promise<{ ok: true; allowedCallers: string[] } | { ok: false; reason: string }> {
+  // Refresh client_id on re-registration so cascade follows the currently
+  // registering client. The WHERE guards against a different wallet silently
+  // taking over an existing policy — the ownership check below still rejects.
   await sql`
-    INSERT INTO agent_policies (agent_id, owner_wallet)
-    VALUES (${agentId}, ${ownerWallet.toLowerCase()})
-    ON CONFLICT (agent_id) DO NOTHING
+    INSERT INTO agent_policies (agent_id, owner_wallet, client_id)
+    VALUES (${agentId}, ${ownerWallet.toLowerCase()}, ${clientId})
+    ON CONFLICT (agent_id) DO UPDATE
+      SET client_id = EXCLUDED.client_id, updated_at = now()
+      WHERE agent_policies.owner_wallet = EXCLUDED.owner_wallet
   `;
   const rows = await sql<PolicyRow[]>`
     SELECT owner_wallet, allowed_callers FROM agent_policies WHERE agent_id = ${agentId}
@@ -99,7 +105,7 @@ async function authenticateAndRegister(
   const clientId = client.id;
   const ownerWallet = client.owner_wallet;
 
-  const policyResult = await ensureAgentPolicy(opts.db, frame.agentId, ownerWallet);
+  const policyResult = await ensureAgentPolicy(opts.db, frame.agentId, ownerWallet, clientId);
   if (!policyResult.ok) {
     console.log(JSON.stringify({
       event: 'client_rejected',

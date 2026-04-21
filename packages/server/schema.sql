@@ -124,13 +124,48 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA infra
 -- ============================================================
 -- 5. Agent Policies table
 -- ============================================================
+-- Each policy is owned by the client that registered the agent. When the
+-- owning client is deleted the policy cascades, so orphan rows cannot
+-- accumulate (see #23). client_id is set in INSERT/upsert on WS registration.
 CREATE TABLE IF NOT EXISTS agent_policies (
   agent_id         TEXT PRIMARY KEY,
   owner_wallet     VARCHAR(42) NOT NULL,
+  client_id        TEXT REFERENCES clients(id) ON DELETE CASCADE,
   allowed_callers  TEXT[] NOT NULL DEFAULT '{}',
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Idempotent migration for pre-#23 deployments: add the column, attach the FK,
+-- backfill it from clients.allowed_agent_ids, drop orphans, then enforce NOT NULL.
+ALTER TABLE agent_policies ADD COLUMN IF NOT EXISTS client_id TEXT;
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'agent_policies_client_id_fkey'
+  ) THEN
+    ALTER TABLE agent_policies
+      ADD CONSTRAINT agent_policies_client_id_fkey
+      FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+UPDATE agent_policies ap
+SET client_id = sub.client_id
+FROM (
+  SELECT DISTINCT ON (p.agent_id) p.agent_id, c.id AS client_id
+  FROM agent_policies p
+  JOIN clients c
+    ON c.owner_wallet = p.owner_wallet
+   AND p.agent_id = ANY(c.allowed_agent_ids)
+  WHERE p.client_id IS NULL
+  ORDER BY p.agent_id, c.created_at DESC
+) sub
+WHERE ap.agent_id = sub.agent_id AND ap.client_id IS NULL;
+
+DELETE FROM agent_policies WHERE client_id IS NULL;
+
+ALTER TABLE agent_policies ALTER COLUMN client_id SET NOT NULL;
 
 ALTER TABLE agent_policies ENABLE ROW LEVEL SECURITY;
 
