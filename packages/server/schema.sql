@@ -124,13 +124,91 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA infra
 -- ============================================================
 -- 5. Agent Policies table
 -- ============================================================
+-- Each policy is owned by the client that registered the agent. When the
+-- owning client is deleted the policy cascades, so orphan rows cannot
+-- accumulate (see #23). client_id is set in INSERT/upsert on WS registration.
 CREATE TABLE IF NOT EXISTS agent_policies (
   agent_id         TEXT PRIMARY KEY,
   owner_wallet     VARCHAR(42) NOT NULL,
+  client_id        TEXT REFERENCES clients(id) ON DELETE CASCADE,
   allowed_callers  TEXT[] NOT NULL DEFAULT '{}',
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Idempotent migration for pre-#23 deployments. ensureSchema() runs schema.sql
+-- without an outer transaction, so each step must tolerate resuming from a
+-- half-applied state: the FK is added NOT VALID first, rows are scrubbed, and
+-- the constraint is validated only after the table is consistent.
+ALTER TABLE agent_policies ADD COLUMN IF NOT EXISTS client_id TEXT;
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'agent_policies_client_id_fkey'
+      AND conrelid = 'agent_policies'::regclass
+  ) THEN
+    ALTER TABLE agent_policies
+      ADD CONSTRAINT agent_policies_client_id_fkey
+      FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+      NOT VALID;
+  END IF;
+END $$;
+
+-- Partial-run safety: if a row already has a client_id but it points at a
+-- missing client (e.g. deleted while the FK was NOT VALID), reset it to NULL
+-- rather than deleting — the backfill below will try to reassign the policy
+-- to another client of the same wallet and preserve allowed_callers.
+UPDATE agent_policies ap
+SET client_id = NULL
+WHERE ap.client_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM clients c WHERE c.id = ap.client_id);
+
+-- Backfill: prefer a client whose allowed_agent_ids still lists this agent,
+-- otherwise fall back to the most recent client of the same wallet. The
+-- fallback preserves existing allowed_callers when allowed_agent_ids is out
+-- of sync. Case-insensitive wallet compare guards against legacy casing.
+UPDATE agent_policies ap
+SET client_id = sub.client_id
+FROM (
+  SELECT DISTINCT ON (p.agent_id) p.agent_id, c.id AS client_id
+  FROM agent_policies p
+  JOIN clients c ON lower(c.owner_wallet) = lower(p.owner_wallet)
+  WHERE p.client_id IS NULL
+  ORDER BY p.agent_id,
+           (p.agent_id = ANY(c.allowed_agent_ids)) DESC,
+           c.created_at DESC
+) sub
+WHERE ap.agent_id = sub.agent_id AND ap.client_id IS NULL;
+
+-- Only rows whose wallet truly has no clients left are orphaned.
+DELETE FROM agent_policies ap
+WHERE ap.client_id IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM clients c
+    WHERE lower(c.owner_wallet) = lower(ap.owner_wallet)
+  );
+
+ALTER TABLE agent_policies VALIDATE CONSTRAINT agent_policies_client_id_fkey;
+
+-- Enforce NOT NULL via a validated CHECK constraint instead of ALTER COLUMN
+-- SET NOT NULL so the migration avoids the ACCESS EXCLUSIVE full-table scan.
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'agent_policies_client_id_not_null'
+      AND conrelid = 'agent_policies'::regclass
+  ) THEN
+    ALTER TABLE agent_policies
+      ADD CONSTRAINT agent_policies_client_id_not_null
+      CHECK (client_id IS NOT NULL) NOT VALID;
+  END IF;
+END $$;
+
+ALTER TABLE agent_policies VALIDATE CONSTRAINT agent_policies_client_id_not_null;
+
+CREATE INDEX IF NOT EXISTS idx_agent_policies_client_id
+  ON agent_policies (client_id);
 
 ALTER TABLE agent_policies ENABLE ROW LEVEL SECURITY;
 
@@ -139,17 +217,31 @@ ALTER TABLE agent_policies ENABLE ROW LEVEL SECURITY;
 COMMENT ON TABLE agent_policies IS E'@omit create,update,delete';
 COMMENT ON COLUMN agent_policies.allowed_callers IS E'@omit create,update';
 
--- Authenticated users see their own policies; admins see all
+-- Authenticated users see their own policies; admins see all.
+-- lower(owner_wallet) compare tolerates any legacy mixed-case rows, matching
+-- the normalization used in the migration backfill and WS upsert guard.
 DROP POLICY IF EXISTS agent_policies_select ON agent_policies;
 CREATE POLICY agent_policies_select ON agent_policies
   FOR SELECT TO app_authenticated
-  USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
+  USING (lower(owner_wallet) = lower(current_wallet_address()) OR is_admin());
 
--- No INSERT/UPDATE/DELETE policies for app_authenticated — only the server
--- (via app_postgraphile) and custom admin tools manage these rows.
+-- No INSERT policy for app_authenticated. UPDATE is allowed for the same
+-- owner/admin predicate because admin tools (add_caller / remove_caller) run
+-- UPDATE under app_authenticated; direct mutations remain hidden via @omit.
 DROP POLICY IF EXISTS agent_policies_insert ON agent_policies;
 DROP POLICY IF EXISTS agent_policies_update ON agent_policies;
+CREATE POLICY agent_policies_update ON agent_policies
+  FOR UPDATE TO app_authenticated
+  USING (lower(owner_wallet) = lower(current_wallet_address()) OR is_admin())
+  WITH CHECK (lower(owner_wallet) = lower(current_wallet_address()) OR is_admin());
+
+-- DELETE policy exists solely so ON DELETE CASCADE from clients works when a
+-- user (running as app_authenticated) deletes their own client. The direct
+-- delete mutation is still hidden from GraphQL via COMMENT ON TABLE @omit.
 DROP POLICY IF EXISTS agent_policies_delete ON agent_policies;
+CREATE POLICY agent_policies_delete ON agent_policies
+  FOR DELETE TO app_authenticated
+  USING (lower(owner_wallet) = lower(current_wallet_address()) OR is_admin());
 
 -- app_postgraphile bypasses RLS (used by server for auth checks)
 DROP POLICY IF EXISTS agent_policies_postgraphile ON agent_policies;
