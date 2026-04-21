@@ -6,6 +6,7 @@ on:
     paths:
       - 'packages/server/**'
       - 'packages/protocol/**'
+      - 'packages/admin-ui/**'
       - 'pnpm-lock.yaml'
 
 jobs:
