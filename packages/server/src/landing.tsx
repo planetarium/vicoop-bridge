@@ -95,7 +95,7 @@ export const Landing: FC<LandingProps> = ({ adminCard, clients, adminWallets }) 
       </p>
       <ul>
         <li>
-          <a href="/admin">Admin UI</a> — wallet sign-in via RainbowKit
+          <a href="/admin/">Admin UI</a> — wallet sign-in via RainbowKit
         </li>
         <li>
           <a href="/graphiql">GraphiQL</a> — requires{' '}
