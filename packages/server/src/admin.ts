@@ -17,6 +17,8 @@ import { getSchemaTools } from './schema-tools.js';
 import { runWithBearerToken } from './graphql-client.js';
 import type { Registry } from './registry.js';
 import { PostgresTaskStore, type ContextAwareTaskStore } from './postgres-task-store.js';
+import { validatePrincipal } from './auth/principal.js';
+import { listCallerTokens, revokeCallerToken } from './auth/caller-token.js';
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -107,15 +109,22 @@ Clients are services that connect to the server via WebSocket to register A2A ag
 - Do NOT use the auto-generated \`mutate_updateClientById\` or \`mutate_deleteClientById\` for revoke/token rotation — always prefer the semantic mutations above.
 - Use \`list_active_agents\` to see currently connected agents.
 - Use \`add_caller\` / \`remove_caller\` / \`list_callers\` to manage per-agent access control. Do not use GraphQL mutations to manage \`allowed_callers\`.
+- Use \`list_caller_tokens\` / \`revoke_caller_token\` (admin only) to manage opaque caller tokens issued via Google OAuth device flow.
 - Use \`execute_graphql\` for complex queries and inspection not covered by auto-generated tools.
 
 ## Agent Access Control
 
 Each agent has an access policy (\`agent_policies\` table) with an \`allowed_callers\` list:
 - **Empty \`allowed_callers\`**: Agent is public — anyone can call it via A2A.
-- **Non-empty \`allowed_callers\`**: Agent requires SIWE Bearer authentication, and only listed wallet addresses can call.
+- **Non-empty \`allowed_callers\`**: Agent requires an authenticated Bearer token, and only listed principals can call.
 
-When an agent registers via WebSocket, a default policy (public) is auto-created. Use \`add_caller\` to restrict access to specific wallets. The agent card automatically includes \`securitySchemes\` when callers are configured.
+Supported principal formats in \`allowed_callers\`:
+- \`eth:0x<40 hex>\` — SIWE-authenticated Ethereum address
+- \`google:sub:<sub>\` — specific Google account by stable id
+- \`google:email:<email>\` — Google account by email (pinned to sub on first match)
+- \`google:domain:<domain>\` — any verified Google Workspace account from the domain
+
+When an agent registers via WebSocket, a default policy (public) is auto-created. Use \`add_caller\` to restrict access. The agent card automatically advertises \`securitySchemes\` when callers are configured.
 
 ## Conversation memory
 
@@ -146,14 +155,6 @@ Your conversation history is persisted in PostgreSQL. You remember all previous 
 
 // ── Custom Tools (token generation, active agents) ───────────────
 
-const ETH_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
-
-function validateWalletAddress(address: string): string | null {
-  const trimmed = address.trim();
-  if (!ETH_ADDRESS_RE.test(trimmed)) return null;
-  return trimmed.toLowerCase();
-}
-
 function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
   return {
     list_active_agents: tool({
@@ -175,14 +176,22 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
 
     add_caller: tool({
       description:
-        'Add a wallet address to an agent\'s allowed callers. Once any caller is added, the agent requires SIWE authentication.',
+        'Add a principal to an agent\'s allowed callers. Once any caller is added, the agent requires authenticated Bearer token.\n' +
+        'Supported principal formats:\n' +
+        '  eth:0x<40 hex>         Ethereum address (SIWE)\n' +
+        '  0x<40 hex>             Plain wallet, auto-prefixed with eth:\n' +
+        '  google:sub:<sub>       Specific Google account (stable id)\n' +
+        '  google:email:<addr>    Google account by email (pins to sub on first match)\n' +
+        '  google:domain:<d>      Google Workspace domain (any verified account)',
       inputSchema: z.object({
         agent_id: z.string().describe('The agent ID to add the caller to'),
-        wallet_address: z.string().describe('Ethereum wallet address to allow (e.g. 0x1234...)'),
+        principal: z.string().describe('Principal string (see tool description)'),
       }),
-      execute: async ({ agent_id, wallet_address }) => {
-        const wallet = validateWalletAddress(wallet_address);
-        if (!wallet) return { error: 'Invalid wallet address. Expected 0x followed by 40 hex characters.' };
+      execute: async ({ agent_id, principal }) => {
+        const normalized = validatePrincipal(principal);
+        if (!normalized) {
+          return { error: 'Invalid principal format. See tool description for supported formats.' };
+        }
         const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
         const result = await db.begin(async (tx) => {
           await tx`SELECT set_config('role', 'app_authenticated', true)`;
@@ -190,10 +199,10 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
           await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
           return tx`
             UPDATE agent_policies
-            SET allowed_callers = array_append(allowed_callers, ${wallet}),
+            SET allowed_callers = array_append(allowed_callers, ${normalized}),
                 updated_at = now()
             WHERE agent_id = ${agent_id}
-              AND NOT (${wallet} = ANY(allowed_callers))
+              AND NOT (${normalized} = ANY(allowed_callers))
             RETURNING agent_id, owner_wallet, allowed_callers
           `;
         });
@@ -206,25 +215,30 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
             return tx`SELECT allowed_callers FROM agent_policies WHERE agent_id = ${agent_id}`;
           });
           if (existing.length === 0) return { error: 'Agent policy not found or not authorized.' };
-          if ((existing[0].allowed_callers as string[]).includes(wallet)) return { agent_id, message: 'Wallet already in allowed callers', allowed_callers: existing[0].allowed_callers };
+          if ((existing[0].allowed_callers as string[]).includes(normalized)) {
+            return { agent_id, message: 'Principal already in allowed callers', allowed_callers: existing[0].allowed_callers };
+          }
           return { error: 'Not authorized to modify this agent policy.' };
         }
         const callers = result[0].allowed_callers as string[];
         registry.updateAllowedCallers(agent_id, callers);
-        return { agent_id, allowed_callers: callers };
+        return { agent_id, principal: normalized, allowed_callers: callers };
       },
     }),
 
     remove_caller: tool({
       description:
-        'Remove a wallet address from an agent\'s allowed callers. If the list becomes empty, the agent becomes public again.',
+        'Remove a principal from an agent\'s allowed callers. If the list becomes empty, the agent becomes public again. ' +
+        'Accepts the same principal formats as add_caller.',
       inputSchema: z.object({
         agent_id: z.string().describe('The agent ID to remove the caller from'),
-        wallet_address: z.string().describe('Ethereum wallet address to remove'),
+        principal: z.string().describe('Principal string to remove'),
       }),
-      execute: async ({ agent_id, wallet_address }) => {
-        const wallet = validateWalletAddress(wallet_address);
-        if (!wallet) return { error: 'Invalid wallet address. Expected 0x followed by 40 hex characters.' };
+      execute: async ({ agent_id, principal }) => {
+        const normalized = validatePrincipal(principal);
+        if (!normalized) {
+          return { error: 'Invalid principal format. See add_caller description for supported formats.' };
+        }
         const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
         const result = await db.begin(async (tx) => {
           await tx`SELECT set_config('role', 'app_authenticated', true)`;
@@ -232,17 +246,19 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
           await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
           return tx`
             UPDATE agent_policies
-            SET allowed_callers = array_remove(allowed_callers, ${wallet}),
+            SET allowed_callers = array_remove(allowed_callers, ${normalized}),
                 updated_at = now()
             WHERE agent_id = ${agent_id}
-              AND ${wallet} = ANY(allowed_callers)
+              AND ${normalized} = ANY(allowed_callers)
             RETURNING agent_id, owner_wallet, allowed_callers
           `;
         });
-        if (result.length === 0) return { error: 'Wallet not found in allowed callers, agent policy not found, or not authorized.' };
+        if (result.length === 0) {
+          return { error: 'Principal not found in allowed callers, agent policy not found, or not authorized.' };
+        }
         const callers = result[0].allowed_callers as string[];
         registry.updateAllowedCallers(agent_id, callers);
-        return { agent_id, allowed_callers: callers };
+        return { agent_id, principal: normalized, allowed_callers: callers };
       },
     }),
 
@@ -270,6 +286,58 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
           allowed_callers: policy.allowed_callers,
           is_public: (policy.allowed_callers as string[]).length === 0,
         };
+      },
+    }),
+
+    list_caller_tokens: tool({
+      description:
+        'List caller tokens (opaque bearer tokens issued via Google OAuth device flow). Admin only. ' +
+        'Filter by principal_id (e.g. "google:1234567890") or email.',
+      inputSchema: z.object({
+        principal_id: z.string().optional().describe('Filter by exact principal_id match'),
+        email: z.string().optional().describe('Filter by exact email match'),
+        include_revoked: z.boolean().optional().describe('Include revoked tokens (default false)'),
+      }),
+      execute: async ({ principal_id, email, include_revoked }) => {
+        if (!isAdmin(walletAddress)) {
+          return { error: 'Admin-only tool. Current wallet is not in ADMIN_WALLET_ADDRESSES.' };
+        }
+        const rows = await listCallerTokens(db, {
+          principalId: principal_id,
+          email,
+          includeRevoked: include_revoked,
+        });
+        return {
+          count: rows.length,
+          tokens: rows.map((r) => ({
+            id: r.id,
+            principal_id: r.principalId,
+            provider: r.provider,
+            email: r.email,
+            label: r.label,
+            expires_at: r.expiresAt.toISOString(),
+            last_used_at: r.lastUsedAt?.toISOString() ?? null,
+            revoked: r.revoked,
+            created_at: r.createdAt.toISOString(),
+          })),
+        };
+      },
+    }),
+
+    revoke_caller_token: tool({
+      description:
+        'Revoke a caller token by id. Admin only. Idempotent — revoking an already-revoked or ' +
+        'nonexistent token is not an error. Effect propagates within ~60s due to the in-memory ' +
+        'verification cache.',
+      inputSchema: z.object({
+        caller_id: z.string().describe('The caller token id (from list_caller_tokens)'),
+      }),
+      execute: async ({ caller_id }) => {
+        if (!isAdmin(walletAddress)) {
+          return { error: 'Admin-only tool. Current wallet is not in ADMIN_WALLET_ADDRESSES.' };
+        }
+        await revokeCallerToken(db, caller_id);
+        return { caller_id, revoked: true };
       },
     }),
   };
