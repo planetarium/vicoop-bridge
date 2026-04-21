@@ -14,10 +14,11 @@ import type { AgentCard as WireAgentCard } from '@vicoop-bridge/protocol';
 import { ServerAgentExecutor } from './executor.js';
 import type { ClientConnection, Registry } from './registry.js';
 import { createAdminTransport, buildAdminAgentCard, getAdminWallets } from './admin.js';
-import { verifySiweToken } from './siwe-token.js';
 import { agentAuthMiddleware, getAgentConn } from './agent-auth.js';
+import { CALLER_TOKEN_PREFIX, verifyCallerToken } from './auth/caller-token.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
 import { mountDeviceUi } from './auth/device-ui.js';
+import { mountSiweExchange } from './auth/siwe-exchange.js';
 import type { GoogleConfig } from './auth/google-oauth.js';
 import type { Sql } from './db.js';
 import { Landing } from './landing.js';
@@ -60,15 +61,10 @@ function toSdkAgentCard(
   };
   if (conn.allowedCallers.length > 0) {
     card.securitySchemes = {
-      siwe: {
-        type: 'http',
-        scheme: 'bearer',
-        bearerFormat: 'SIWE',
-        description: 'Sign-In with Ethereum (EIP-4361) bearer token',
-      },
       bridge: {
         type: 'oauth2',
-        description: 'Bridge-issued opaque bearer token obtained via Google OAuth device flow',
+        description:
+          'Bridge-issued opaque bearer token. Acquire via /oauth/token (Google device flow) or /auth/siwe/exchange (SIWE).',
         flows: {
           deviceAuthorization: {
             deviceAuthorizationUrl: publicUrl
@@ -80,7 +76,7 @@ function toSdkAgentCard(
         },
       } as unknown as NonNullable<SdkAgentCard['securitySchemes']>[string],
     };
-    card.security = [{ siwe: [] }, { bridge: [] }];
+    card.security = [{ bridge: [] }];
   }
   return card;
 }
@@ -181,26 +177,48 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }
   }
 
-  // Root POST — admin agent A2A endpoint (SIWE auth)
+  // SIWE → opaque caller token exchange. Admin UI and any wallet-based client
+  // signs a SIWE message once, then presents the returned vbc_caller_* token
+  // on all subsequent requests.
+  mountSiweExchange(app, { sql: opts.db, domain: siweDomain });
+
+  // Root POST — admin agent A2A endpoint. Requires opaque caller token with
+  // an `eth:*` principal (admin agent is wallet-based; Google-only callers
+  // can still call /agents/:id but have no admin GraphQL access under the
+  // current owner_wallet schema).
   app.post('/', async (c) => {
     const authHeader = c.req.header('Authorization');
     const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
-    if (!bearerToken) {
+    if (!bearerToken || !bearerToken.startsWith(CALLER_TOKEN_PREFIX)) {
       return c.json({
         jsonrpc: '2.0',
         id: null,
-        error: { code: -32001, message: 'Authentication required (Bearer SIWE token)' },
+        error: {
+          code: -32001,
+          message: `Authentication required (Bearer ${CALLER_TOKEN_PREFIX}* token). Acquire via /auth/siwe/exchange.`,
+        },
       }, 401);
     }
 
     let walletAddress: string;
     try {
-      walletAddress = await verifySiweToken(bearerToken, { domain: siweDomain });
+      const caller = await verifyCallerToken(opts.db, bearerToken);
+      if (!caller.principalId.startsWith('eth:')) {
+        return c.json({
+          jsonrpc: '2.0',
+          id: null,
+          error: {
+            code: -32001,
+            message: 'Admin agent requires a wallet-based caller token (eth:*). Sign in via SIWE.',
+          },
+        }, 403);
+      }
+      walletAddress = caller.principalId.slice('eth:'.length);
     } catch (err) {
       return c.json({
         jsonrpc: '2.0',
         id: null,
-        error: { code: -32001, message: `Invalid SIWE token: ${(err as Error).message}` },
+        error: { code: -32001, message: `Invalid caller token: ${(err as Error).message}` },
       }, 401);
     }
 
@@ -267,7 +285,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   });
 
   // Client agent A2A endpoints (auth middleware checks allowedCallers)
-  const authMw = agentAuthMiddleware(opts.registry, { sql: opts.db, domain: siweDomain });
+  const authMw = agentAuthMiddleware(opts.registry, { sql: opts.db });
   app.post('/agents/:id', authMw, async (c) => {
     const conn = getAgentConn(c);
 

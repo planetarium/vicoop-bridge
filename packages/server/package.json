@@ -33,6 +33,7 @@
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/pg": "^8.20.0",
-    "@types/ws": "^8.5.13"
+    "@types/ws": "^8.5.13",
+    "ethers": "^6.16.0"
   }
 }

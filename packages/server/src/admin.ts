@@ -109,7 +109,7 @@ Clients are services that connect to the server via WebSocket to register A2A ag
 - Do NOT use the auto-generated \`mutate_updateClientById\` or \`mutate_deleteClientById\` for revoke/token rotation — always prefer the semantic mutations above.
 - Use \`list_active_agents\` to see currently connected agents.
 - Use \`add_caller\` / \`remove_caller\` / \`list_callers\` to manage per-agent access control. Do not use GraphQL mutations to manage \`allowed_callers\`.
-- Use \`list_caller_tokens\` / \`revoke_caller_token\` (admin only) to manage opaque caller tokens issued via Google OAuth device flow.
+- Use \`list_caller_tokens\` / \`revoke_caller_token\` (admin only) to manage opaque caller tokens. Issued via either Google OAuth device flow (provider=google) or SIWE exchange (provider=siwe).
 - Use \`execute_graphql\` for complex queries and inspection not covered by auto-generated tools.
 
 ## Agent Access Control
@@ -134,7 +134,7 @@ Your conversation history is persisted in PostgreSQL. You remember all previous 
 
 - When registering a client or rotating a token, always warn the user that the raw token is shown only once.
 - When registering on behalf of another wallet (admin only), echo back the chosen \`ownerWallet\` so the user can confirm.
-- When adding a caller, explain that the agent will require SIWE authentication from that point on.
+- When adding a caller, explain that the agent will require an authenticated bearer token from that point on (either SIWE-exchanged or Google-device-flow-issued, depending on the principal format).
 - Present data clearly in tables or lists.
 - If asked about something outside client management, politely explain your scope.
 
@@ -473,7 +473,7 @@ export function buildAdminAgentCard(publicUrl?: string): SdkAgentCard {
   return {
     name: 'Vicoop Bridge Server Admin',
     description:
-      'Manages client registration, revocation, and access control for Vicoop Bridge Server. Clients are WebSocket services that bridge local A2A agents to the server. Each client is scoped to an owner wallet and an explicit agent ID allowlist. Requires SIWE authentication.',
+      'Manages client registration, revocation, and access control for Vicoop Bridge Server. Clients are WebSocket services that bridge local A2A agents to the server. Each client is scoped to an owner wallet and an explicit agent ID allowlist. Requires a bridge-issued opaque caller token (vbc_caller_*) tied to a wallet principal; obtain one by signing a SIWE message at POST /auth/siwe/exchange.',
     version: '0.1.0',
     protocolVersion: '0.3.0',
     url,

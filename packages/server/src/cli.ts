@@ -43,7 +43,7 @@ async function main() {
   // Runtime DB connection (used for client token lookup)
   const db = createDb(databaseUrl!);
 
-  await startPostGraphile(databaseUrl!);
+  await startPostGraphile(databaseUrl!, db);
   await startServer({
     port,
     publicUrl,

@@ -7,9 +7,13 @@ import type { VerifiedCaller } from './principal.js';
 
 export const CALLER_TOKEN_PREFIX = 'vbc_caller_';
 
+// Provider label persisted on the `callers` row. Expands as new issuance
+// methods are added (e.g. passkey, ssh-agent). Not enforced by schema.
+export type CallerProvider = 'google' | 'siwe';
+
 export interface IssueCallerTokenInput {
-  principalId: string;        // 'google:<sub>'
-  provider: 'google';
+  principalId: string;        // 'google:<sub>' | 'eth:0x<addr>'
+  provider: CallerProvider;
   email?: string;
   label?: string;
   ttlMs?: number;             // default 90 days

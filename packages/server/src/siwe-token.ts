@@ -7,6 +7,11 @@ export interface SiweToken {
 
 const MAX_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+export function encodeSiweToken(message: string, signature: string): string {
+  const json = JSON.stringify({ message, signature });
+  return Buffer.from(json, 'utf-8').toString('base64url');
+}
+
 export function decodeSiweToken(token: string): SiweToken {
   try {
     let base64 = token.replace(/-/g, '+').replace(/_/g, '/');

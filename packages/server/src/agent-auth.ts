@@ -1,7 +1,6 @@
 import type { Context, Next } from 'hono';
 import type { ClientConnection, Registry } from './registry.js';
 import type { Sql } from './db.js';
-import { verifySiweToken } from './siwe-token.js';
 import { CALLER_TOKEN_PREFIX, verifyCallerToken } from './auth/caller-token.js';
 import { matchPrincipal, type VerifiedCaller } from './auth/principal.js';
 
@@ -15,7 +14,6 @@ export function getCaller(c: Context): VerifiedCaller | undefined {
 
 export interface AgentAuthOptions {
   sql: Sql;
-  domain?: string;
 }
 
 export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) {
@@ -42,18 +40,27 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
       return c.json({
         jsonrpc: '2.0',
         id: null,
-        error: { code: -32001, message: 'Authentication required (Bearer SIWE or caller token)' },
+        error: {
+          code: -32001,
+          message: `Authentication required (Bearer ${CALLER_TOKEN_PREFIX}* token)`,
+        },
+      }, 401);
+    }
+
+    if (!bearerToken.startsWith(CALLER_TOKEN_PREFIX)) {
+      return c.json({
+        jsonrpc: '2.0',
+        id: null,
+        error: {
+          code: -32001,
+          message: `Invalid bearer token: expected ${CALLER_TOKEN_PREFIX}* prefix. Acquire one via /auth/siwe/exchange (SIWE) or /oauth/token (device flow).`,
+        },
       }, 401);
     }
 
     let caller: VerifiedCaller;
     try {
-      if (bearerToken.startsWith(CALLER_TOKEN_PREFIX)) {
-        caller = await verifyCallerToken(opts.sql, bearerToken);
-      } else {
-        const wallet = await verifySiweToken(bearerToken, { domain: opts.domain });
-        caller = { principalId: `eth:${wallet.toLowerCase()}` };
-      }
+      caller = await verifyCallerToken(opts.sql, bearerToken);
     } catch (err) {
       return c.json({
         jsonrpc: '2.0',

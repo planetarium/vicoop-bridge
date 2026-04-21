@@ -3,7 +3,7 @@ import { useAccount, useSignMessage, useDisconnect } from 'wagmi';
 import { SiweMessage } from 'siwe';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAuthToken, setToken } from '../lib/auth-token';
-import { encodeSiweToken } from '../lib/siwe-token';
+import { exchangeSiweForCallerToken } from '../lib/siwe-exchange';
 
 export function WalletAuth() {
   const { address, isConnected, chainId } = useAccount();
@@ -35,7 +35,8 @@ export function WalletAuth() {
 
       const message = siweMessage.prepareMessage();
       const signature = await signMessageAsync({ message });
-      setToken(encodeSiweToken(message, signature));
+      const accessToken = await exchangeSiweForCallerToken(message, signature);
+      setToken(accessToken);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.toLowerCase().includes('user rejected')) {
