@@ -1,6 +1,6 @@
 {
   "name": "openclaw",
-  "description": "Multi-channel AI gateway exposed as an A2A agent via vicoop-bridge.",
+  "description": "General-purpose AI assistant. Can answer questions, browse the web, run shell commands, manage files, and operate tools its operator has granted.",
   "version": "0.0.1",
   "protocolVersion": "0.3.0",
   "capabilities": { "streaming": false },
@@ -10,8 +10,8 @@
     {
       "id": "chat",
       "name": "chat",
-      "description": "Send a message to an OpenClaw agent and receive its reply.",
-      "tags": ["chat", "agent"]
+      "description": "Ask a question or give an instruction in natural language; the agent responds with text.",
+      "tags": ["chat", "assistant"]
     }
   ]
 }
