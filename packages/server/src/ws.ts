@@ -30,14 +30,17 @@ async function ensureAgentPolicy(
   clientId: string,
 ): Promise<{ ok: true; allowedCallers: string[] } | { ok: false; reason: string }> {
   // Refresh client_id on re-registration so cascade follows the currently
-  // registering client. The WHERE guards against a different wallet silently
-  // taking over an existing policy — the ownership check below still rejects.
+  // registering client. Case-insensitive compare mirrors the lowercase
+  // normalization used elsewhere, so a legacy mixed-case row still matches;
+  // the ownership check below still rejects cross-wallet attempts.
   await sql`
     INSERT INTO agent_policies (agent_id, owner_wallet, client_id)
     VALUES (${agentId}, ${ownerWallet.toLowerCase()}, ${clientId})
     ON CONFLICT (agent_id) DO UPDATE
-      SET client_id = EXCLUDED.client_id, updated_at = now()
-      WHERE agent_policies.owner_wallet = EXCLUDED.owner_wallet
+      SET owner_wallet = EXCLUDED.owner_wallet,
+          client_id = EXCLUDED.client_id,
+          updated_at = now()
+      WHERE lower(agent_policies.owner_wallet) = lower(EXCLUDED.owner_wallet)
   `;
   const rows = await sql<PolicyRow[]>`
     SELECT owner_wallet, allowed_callers FROM agent_policies WHERE agent_id = ${agentId}
