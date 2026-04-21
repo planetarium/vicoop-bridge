@@ -58,7 +58,7 @@ export const Landing: FC<LandingProps> = ({ adminCard, clients, adminWallets }) 
       <p>Skills:</p>
       <ul>
         {adminCard.skills.map((s) => (
-          <li>
+          <li key={s.id}>
             <strong>{s.name}</strong>{' '}
             <span class="muted">— {s.description ?? ''}</span>
           </li>
@@ -77,7 +77,7 @@ export const Landing: FC<LandingProps> = ({ adminCard, clients, adminWallets }) 
           <li class="muted">No clients connected.</li>
         ) : (
           clients.map((c) => (
-            <li>
+            <li key={c.id}>
               <code>{c.id}</code> — {c.card.name}{' '}
               <span class="muted">v{c.card.version}</span>
               {' · '}
@@ -112,7 +112,7 @@ export const Landing: FC<LandingProps> = ({ adminCard, clients, adminWallets }) 
       ) : (
         <ul>
           {adminWallets.map((w) => (
-            <li>
+            <li key={w}>
               <code>{w}</code>
             </li>
           ))}
