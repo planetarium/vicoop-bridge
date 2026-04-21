@@ -20,9 +20,8 @@ DO $$ BEGIN
   GRANT app_authenticated TO app_postgraphile;
 END $$;
 
--- pgcrypto supplies gen_random_bytes / digest for register_client and
--- rotate_client_token. gen_random_uuid() is core PG13+ so the clients table
--- above does not depend on this extension.
+-- pgcrypto supplies gen_random_bytes and digest, used by register_client and
+-- rotate_client_token for token generation.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- ============================================================
@@ -467,10 +466,17 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_authe
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_postgraphile;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_authenticated;
 
--- Default PUBLIC has EXECUTE on newly created functions, but ignoreRBAC=false
--- in PostGraphile only exposes functions whose EXECUTE privilege is granted to
--- the connecting role. Grant explicitly so these mutations show up in the
--- GraphQL schema.
+-- Restrict the client lifecycle mutations to authenticated callers. Postgres
+-- grants EXECUTE to PUBLIC by default, which would let app_anonymous invoke
+-- these via GraphQL (they'd fail inside, but we want them off the anonymous
+-- surface entirely). Revoke PUBLIC and grant back only to the authenticated
+-- role and to app_postgraphile (used for introspection).
+REVOKE EXECUTE ON FUNCTION register_client(TEXT, TEXT[], VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION revoke_client(TEXT) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION unrevoke_client(TEXT) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION rotate_client_token(TEXT) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION update_client_allowed_agents(TEXT, TEXT[]) FROM PUBLIC;
+
 GRANT EXECUTE ON FUNCTION register_client(TEXT, TEXT[], VARCHAR)
   TO app_authenticated, app_postgraphile;
 GRANT EXECUTE ON FUNCTION revoke_client(TEXT)
