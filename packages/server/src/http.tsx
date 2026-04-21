@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { Hono, type Context } from 'hono';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { stream } from 'hono/streaming';
+import { html } from 'hono/html';
 import {
   DefaultRequestHandler,
   InMemoryTaskStore,
@@ -12,10 +13,11 @@ import type { AgentCard as SdkAgentCard } from '@a2a-js/sdk';
 import type { AgentCard as WireAgentCard } from '@vicoop-bridge/protocol';
 import { ServerAgentExecutor } from './executor.js';
 import type { ClientConnection, Registry } from './registry.js';
-import { createAdminTransport, buildAdminAgentCard } from './admin.js';
+import { createAdminTransport, buildAdminAgentCard, getAdminWallets } from './admin.js';
 import { verifySiweToken } from './siwe-token.js';
 import { agentAuthMiddleware, getAgentConn } from './agent-auth.js';
 import type { Sql } from './db.js';
+import { Landing } from './landing.js';
 
 export interface ServerHttpOptions {
   registry: Registry;
@@ -117,23 +119,39 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // Root agent card — the server itself is an A2A agent
   app.get('/.well-known/agent-card.json', (c) => c.json(adminCard));
 
-  // Server info
-  app.get('/', (c) =>
-    c.json({
-      name: 'vicoop-bridge',
-      description: 'A2A server for outbound-connected local agents',
-      version: '0.0.0',
-      url: opts.publicUrl,
-      card: adminCard,
-      clients: opts.registry.listAgents().map((a) => ({
-        id: a.agentId,
-        url: opts.publicUrl
-          ? `${opts.publicUrl}/agents/${a.agentId}`
-          : `/agents/${a.agentId}`,
-        card: toSdkAgentCard(a.agentCard, a, opts.publicUrl),
-      })),
-    }),
-  );
+  // Server info — HTML landing for browsers, JSON for API clients
+  app.get('/', (c) => {
+    const clients = opts.registry.listAgents().map((a) => ({
+      id: a.agentId,
+      url: opts.publicUrl
+        ? `${opts.publicUrl}/agents/${a.agentId}`
+        : `/agents/${a.agentId}`,
+      card: toSdkAgentCard(a.agentCard, a, opts.publicUrl),
+    }));
+
+    const accept = c.req.header('accept') ?? '';
+    const wantsJson =
+      accept.includes('application/json') && !accept.includes('text/html');
+    if (wantsJson) {
+      return c.json({
+        name: 'vicoop-bridge',
+        description: 'A2A server for outbound-connected local agents',
+        version: '0.0.0',
+        url: opts.publicUrl,
+        card: adminCard,
+        clients,
+      });
+    }
+    return c.html(
+      html`<!DOCTYPE html>${(
+        <Landing
+          adminCard={adminCard}
+          clients={clients}
+          adminWallets={getAdminWallets()}
+        />
+      )}`,
+    );
+  });
 
   // Derive SIWE domain early so both admin and agent endpoints use it
   let siweDomain: string | undefined;

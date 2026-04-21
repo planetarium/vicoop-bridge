@@ -68,6 +68,10 @@ function isAdmin(wallet: string): boolean {
   return adminWallets.has(wallet.toLowerCase());
 }
 
+export function getAdminWallets(): string[] {
+  return [...adminWallets];
+}
+
 // ── System Prompt ────────────────────────────────────────────────
 
 function buildSystemPrompt(walletAddress: string, sdl?: string): string {
