@@ -81,7 +81,7 @@ export const Landing: FC<LandingProps> = ({ adminCard, clients, adminWallets }) 
               <code>{c.id}</code> — {c.card.name}{' '}
               <span class="muted">v{c.card.version}</span>
               {' · '}
-              <a href={`/agents/${c.id}/.well-known/agent-card.json`}>card</a>
+              <a href={`/agents/${encodeURIComponent(c.id)}/.well-known/agent-card.json`}>card</a>
             </li>
           ))
         )}
