@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { Hono, type Context } from 'hono';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { stream } from 'hono/streaming';
+import { html } from 'hono/html';
 import {
   DefaultRequestHandler,
   InMemoryTaskStore,
@@ -16,6 +17,7 @@ import { createAdminTransport, buildAdminAgentCard } from './admin.js';
 import { verifySiweToken } from './siwe-token.js';
 import { agentAuthMiddleware, getAgentConn } from './agent-auth.js';
 import type { Sql } from './db.js';
+import { Landing } from './landing.js';
 
 export interface ServerHttpOptions {
   registry: Registry;
@@ -63,101 +65,6 @@ function toSdkAgentCard(
     card.security = [{ siwe: [] }];
   }
   return card;
-}
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-function renderLandingPage(opts: {
-  adminCard: SdkAgentCard;
-  clients: Array<{ id: string; url: string; card: SdkAgentCard }>;
-}): string {
-  const e = escapeHtml;
-  const clientItems = opts.clients.length
-    ? opts.clients
-        .map(
-          (c) => `
-          <li>
-            <code>${e(c.id)}</code> — ${e(c.card.name)}
-            <span class="muted">v${e(c.card.version)}</span>
-            · <a href="/agents/${e(c.id)}/.well-known/agent-card.json">card</a>
-          </li>`,
-        )
-        .join('')
-    : '<li class="muted">No clients connected.</li>';
-
-  const skillItems = opts.adminCard.skills
-    .map(
-      (s) =>
-        `<li><strong>${e(s.name)}</strong> <span class="muted">— ${e(s.description ?? '')}</span></li>`,
-    )
-    .join('');
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>vicoop-bridge</title>
-  <style>
-    :root { color-scheme: light dark; }
-    body {
-      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
-      max-width: 720px;
-      margin: 2rem auto;
-      padding: 0 1rem;
-      line-height: 1.5;
-    }
-    h1 { margin-bottom: 0.25rem; }
-    h2 {
-      margin-top: 2rem;
-      border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent);
-      padding-bottom: 0.25rem;
-    }
-    code {
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 0.9em;
-      padding: 0.1em 0.3em;
-      background: color-mix(in srgb, currentColor 10%, transparent);
-      border-radius: 3px;
-    }
-    .muted { opacity: 0.7; font-size: 0.9em; }
-    .lede { opacity: 0.8; margin-top: 0; }
-    ul { padding-left: 1.25rem; }
-    li { margin: 0.25rem 0; }
-    a { color: inherit; }
-  </style>
-</head>
-<body>
-  <h1>vicoop-bridge</h1>
-  <p class="lede">A2A server for outbound-connected local agents.</p>
-
-  <h2>Admin agent</h2>
-  <p>
-    <strong>${e(opts.adminCard.name)}</strong>
-    <span class="muted">v${e(opts.adminCard.version)}</span>
-  </p>
-  <p>${e(opts.adminCard.description)}</p>
-  <p>Skills:</p>
-  <ul>${skillItems}</ul>
-  <p>Card: <a href="/.well-known/agent-card.json"><code>/.well-known/agent-card.json</code></a></p>
-
-  <h2>Connected clients (${opts.clients.length})</h2>
-  <ul>${clientItems}</ul>
-
-  <h2>Tools</h2>
-  <ul>
-    <li><a href="/admin">Admin UI</a></li>
-    <li><a href="/graphiql">GraphiQL</a></li>
-  </ul>
-</body>
-</html>`;
 }
 
 export function createHttpApp(opts: ServerHttpOptions): Hono {
@@ -235,7 +142,9 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         clients,
       });
     }
-    return c.html(renderLandingPage({ adminCard, clients }));
+    return c.html(
+      html`<!DOCTYPE html>${(<Landing adminCard={adminCard} clients={clients} />)}`,
+    );
   });
 
   // Derive SIWE domain early so both admin and agent endpoints use it
