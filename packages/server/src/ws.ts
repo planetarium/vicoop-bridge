@@ -57,7 +57,7 @@ async function ensureAgentPolicy(
   if (rows[0].owner_wallet.toLowerCase() !== ownerWallet.toLowerCase()) {
     return { ok: false, reason: 'agent id owned by a different wallet' };
   }
-  return { ok: true, allowedCallers: rows[0].allowed_callers.map((a) => a.toLowerCase()) };
+  return { ok: true, allowedCallers: rows[0].allowed_callers };
 }
 
 export interface ServerWsOptions {

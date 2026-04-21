@@ -16,6 +16,9 @@ import type { ClientConnection, Registry } from './registry.js';
 import { createAdminTransport, buildAdminAgentCard, getAdminWallets } from './admin.js';
 import { verifySiweToken } from './siwe-token.js';
 import { agentAuthMiddleware, getAgentConn } from './agent-auth.js';
+import { mountDeviceFlow } from './auth/device-flow.js';
+import { mountDeviceUi } from './auth/device-ui.js';
+import type { GoogleConfig } from './auth/google-oauth.js';
 import type { Sql } from './db.js';
 import { Landing } from './landing.js';
 
@@ -23,6 +26,8 @@ export interface ServerHttpOptions {
   registry: Registry;
   publicUrl?: string;
   db: Sql;
+  google?: GoogleConfig;     // absent = device flow endpoints disabled
+  deviceFlowStateSecret?: string;
 }
 
 function toSdkAgentCard(
@@ -61,8 +66,21 @@ function toSdkAgentCard(
         bearerFormat: 'SIWE',
         description: 'Sign-In with Ethereum (EIP-4361) bearer token',
       },
+      bridge: {
+        type: 'oauth2',
+        description: 'Bridge-issued opaque bearer token obtained via Google OAuth device flow',
+        flows: {
+          deviceAuthorization: {
+            deviceAuthorizationUrl: publicUrl
+              ? `${publicUrl}/oauth/device/code`
+              : '/oauth/device/code',
+            tokenUrl: publicUrl ? `${publicUrl}/oauth/token` : '/oauth/token',
+            scopes: {},
+          },
+        },
+      } as unknown as NonNullable<SdkAgentCard['securitySchemes']>[string],
     };
-    card.security = [{ siwe: [] }];
+    card.security = [{ siwe: [] }, { bridge: [] }];
   }
   return card;
 }
@@ -201,6 +219,20 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     return handleTransportResult(result, c);
   });
 
+  // Device flow endpoints (RFC-8628) — optional: only mounted when Google config is provided
+  if (opts.google && opts.publicUrl) {
+    if (!opts.deviceFlowStateSecret) {
+      throw new Error('deviceFlowStateSecret is required when google OAuth is configured');
+    }
+    mountDeviceFlow(app, { sql: opts.db, publicUrl: opts.publicUrl });
+    mountDeviceUi(app, {
+      sql: opts.db,
+      google: opts.google,
+      stateSecret: opts.deviceFlowStateSecret,
+      publicUrl: opts.publicUrl,
+    });
+  }
+
   // PostGraphile proxy — forward /graphql and /graphiql to internal PostGraphile server
   const postgraphileUrl = `http://localhost:${process.env.POSTGRAPHILE_PORT ?? 5433}`;
 
@@ -235,7 +267,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   });
 
   // Client agent A2A endpoints (auth middleware checks allowedCallers)
-  const authMw = agentAuthMiddleware(opts.registry, { domain: siweDomain });
+  const authMw = agentAuthMiddleware(opts.registry, { sql: opts.db, domain: siweDomain });
   app.post('/agents/:id', authMw, async (c) => {
     const conn = getAgentConn(c);
 

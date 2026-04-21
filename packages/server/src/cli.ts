@@ -8,6 +8,10 @@ const databaseUrl = process.env.DATABASE_URL;
 const dbSetupUrl = process.env.DB_SETUP_URL;
 const publicUrl = process.env.PUBLIC_URL;
 
+const googleClientId = process.env.GOOGLE_CLIENT_ID;
+const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+const deviceFlowStateSecret = process.env.DEVICE_FLOW_STATE_SECRET;
+
 if (!databaseUrl) {
   console.error('DATABASE_URL env var required');
   process.exit(1);
@@ -15,6 +19,17 @@ if (!databaseUrl) {
 
 if (!process.env.ANTHROPIC_API_KEY) {
   console.error('ANTHROPIC_API_KEY env var required');
+  process.exit(1);
+}
+
+// Google OAuth device flow is optional. If any Google config is partially
+// provided we fail fast to surface misconfiguration.
+const googleConfigured = !!(googleClientId || googleClientSecret || deviceFlowStateSecret);
+if (googleConfigured && (!googleClientId || !googleClientSecret || !deviceFlowStateSecret || !publicUrl)) {
+  console.error(
+    'Google OAuth device flow requires GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, ' +
+      'DEVICE_FLOW_STATE_SECRET, and PUBLIC_URL to all be set.',
+  );
   process.exit(1);
 }
 
@@ -29,7 +44,19 @@ async function main() {
   const db = createDb(databaseUrl!);
 
   await startPostGraphile(databaseUrl!);
-  await startServer({ port, publicUrl, db });
+  await startServer({
+    port,
+    publicUrl,
+    db,
+    google: googleConfigured
+      ? {
+          clientId: googleClientId!,
+          clientSecret: googleClientSecret!,
+          redirectUri: `${publicUrl}/oauth/google/callback`,
+        }
+      : undefined,
+    deviceFlowStateSecret,
+  });
 }
 
 main().catch((err) => {

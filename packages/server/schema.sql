@@ -251,7 +251,58 @@ CREATE POLICY agent_policies_postgraphile ON agent_policies
   WITH CHECK (true);
 
 -- ============================================================
--- 6. Grants
+-- 6. Caller auth: opaque tokens issued via Google OAuth device flow
+-- ============================================================
+CREATE TABLE IF NOT EXISTS callers (
+  id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  token_hash      TEXT NOT NULL UNIQUE,
+  principal_id    TEXT NOT NULL,
+  provider        TEXT NOT NULL,
+  email           TEXT,
+  label           TEXT,
+  expires_at      TIMESTAMPTZ NOT NULL,
+  last_used_at    TIMESTAMPTZ,
+  revoked         BOOLEAN NOT NULL DEFAULT false,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS callers_principal_active_idx
+  ON callers(principal_id) WHERE revoked = false;
+
+ALTER TABLE callers ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS callers_postgraphile ON callers;
+CREATE POLICY callers_postgraphile ON callers
+  FOR ALL TO app_postgraphile USING (true) WITH CHECK (true);
+
+-- Server-managed only; never expose via GraphQL
+COMMENT ON TABLE callers IS E'@omit';
+
+-- Transient device flow sessions (RFC-8628)
+CREATE TABLE IF NOT EXISTS device_sessions (
+  device_code       TEXT PRIMARY KEY,
+  user_code         TEXT NOT NULL UNIQUE,
+  status            TEXT NOT NULL,
+  principal_id      TEXT,
+  email             TEXT,
+  expires_at        TIMESTAMPTZ NOT NULL,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  approved_at       TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS device_sessions_pending_idx
+  ON device_sessions(user_code) WHERE status = 'pending';
+
+ALTER TABLE device_sessions ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS device_sessions_postgraphile ON device_sessions;
+CREATE POLICY device_sessions_postgraphile ON device_sessions
+  FOR ALL TO app_postgraphile USING (true) WITH CHECK (true);
+
+COMMENT ON TABLE device_sessions IS E'@omit';
+
+-- ============================================================
+-- 7. Grants
 -- ============================================================
 GRANT USAGE ON SCHEMA public TO app_postgraphile, app_anonymous, app_authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_postgraphile;

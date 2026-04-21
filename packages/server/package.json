@@ -20,6 +20,7 @@
     "@vicoop-bridge/protocol": "workspace:*",
     "ai": "^6.0.162",
     "express": "^5.2.1",
+    "google-auth-library": "^10.6.2",
     "hono": "^4.6.11",
     "pg": "^8.20.0",
     "postgraphile": "4",
