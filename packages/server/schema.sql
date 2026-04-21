@@ -144,7 +144,9 @@ ALTER TABLE agent_policies ADD COLUMN IF NOT EXISTS client_id TEXT;
 
 DO $$ BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'agent_policies_client_id_fkey'
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'agent_policies_client_id_fkey'
+      AND conrelid = 'agent_policies'::regclass
   ) THEN
     ALTER TABLE agent_policies
       ADD CONSTRAINT agent_policies_client_id_fkey
@@ -189,7 +191,21 @@ WHERE ap.client_id IS NULL
 
 ALTER TABLE agent_policies VALIDATE CONSTRAINT agent_policies_client_id_fkey;
 
-ALTER TABLE agent_policies ALTER COLUMN client_id SET NOT NULL;
+-- Enforce NOT NULL via a validated CHECK constraint instead of ALTER COLUMN
+-- SET NOT NULL so the migration avoids the ACCESS EXCLUSIVE full-table scan.
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'agent_policies_client_id_not_null'
+      AND conrelid = 'agent_policies'::regclass
+  ) THEN
+    ALTER TABLE agent_policies
+      ADD CONSTRAINT agent_policies_client_id_not_null
+      CHECK (client_id IS NOT NULL) NOT VALID;
+  END IF;
+END $$;
+
+ALTER TABLE agent_policies VALIDATE CONSTRAINT agent_policies_client_id_not_null;
 
 CREATE INDEX IF NOT EXISTS idx_agent_policies_client_id
   ON agent_policies (client_id);
