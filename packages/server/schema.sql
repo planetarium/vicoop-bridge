@@ -217,11 +217,13 @@ ALTER TABLE agent_policies ENABLE ROW LEVEL SECURITY;
 COMMENT ON TABLE agent_policies IS E'@omit create,update,delete';
 COMMENT ON COLUMN agent_policies.allowed_callers IS E'@omit create,update';
 
--- Authenticated users see their own policies; admins see all
+-- Authenticated users see their own policies; admins see all.
+-- lower(owner_wallet) compare tolerates any legacy mixed-case rows, matching
+-- the normalization used in the migration backfill and WS upsert guard.
 DROP POLICY IF EXISTS agent_policies_select ON agent_policies;
 CREATE POLICY agent_policies_select ON agent_policies
   FOR SELECT TO app_authenticated
-  USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
+  USING (lower(owner_wallet) = lower(current_wallet_address()) OR is_admin());
 
 -- No INSERT/UPDATE policies for app_authenticated — only the server
 -- (via app_postgraphile) and custom admin tools manage these rows.
@@ -234,7 +236,7 @@ DROP POLICY IF EXISTS agent_policies_update ON agent_policies;
 DROP POLICY IF EXISTS agent_policies_delete ON agent_policies;
 CREATE POLICY agent_policies_delete ON agent_policies
   FOR DELETE TO app_authenticated
-  USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
+  USING (lower(owner_wallet) = lower(current_wallet_address()) OR is_admin());
 
 -- app_postgraphile bypasses RLS (used by server for auth checks)
 DROP POLICY IF EXISTS agent_policies_postgraphile ON agent_policies;
