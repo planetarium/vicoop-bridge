@@ -167,6 +167,9 @@ DELETE FROM agent_policies WHERE client_id IS NULL;
 
 ALTER TABLE agent_policies ALTER COLUMN client_id SET NOT NULL;
 
+CREATE INDEX IF NOT EXISTS idx_agent_policies_client_id
+  ON agent_policies (client_id);
+
 ALTER TABLE agent_policies ENABLE ROW LEVEL SECURITY;
 
 -- agent_policies rows are server-managed (auto-created on WS registration).
@@ -180,11 +183,18 @@ CREATE POLICY agent_policies_select ON agent_policies
   FOR SELECT TO app_authenticated
   USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
 
--- No INSERT/UPDATE/DELETE policies for app_authenticated — only the server
+-- No INSERT/UPDATE policies for app_authenticated — only the server
 -- (via app_postgraphile) and custom admin tools manage these rows.
 DROP POLICY IF EXISTS agent_policies_insert ON agent_policies;
 DROP POLICY IF EXISTS agent_policies_update ON agent_policies;
+
+-- DELETE policy exists solely so ON DELETE CASCADE from clients works when a
+-- user (running as app_authenticated) deletes their own client. The direct
+-- delete mutation is still hidden from GraphQL via COMMENT ON TABLE @omit.
 DROP POLICY IF EXISTS agent_policies_delete ON agent_policies;
+CREATE POLICY agent_policies_delete ON agent_policies
+  FOR DELETE TO app_authenticated
+  USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
 
 -- app_postgraphile bypasses RLS (used by server for auth checks)
 DROP POLICY IF EXISTS agent_policies_postgraphile ON agent_policies;
