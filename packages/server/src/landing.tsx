@@ -5,6 +5,7 @@ import type { AgentCard as SdkAgentCard } from '@a2a-js/sdk';
 interface LandingProps {
   adminCard: SdkAgentCard;
   clients: Array<{ id: string; url: string; card: SdkAgentCard }>;
+  adminWallets: string[];
 }
 
 const STYLES = `
@@ -36,7 +37,7 @@ const STYLES = `
   a { color: inherit; }
 `;
 
-export const Landing: FC<LandingProps> = ({ adminCard, clients }) => (
+export const Landing: FC<LandingProps> = ({ adminCard, clients, adminWallets }) => (
   <html lang="en">
     <head>
       <meta charset="utf-8" />
@@ -87,14 +88,36 @@ export const Landing: FC<LandingProps> = ({ adminCard, clients }) => (
       </ul>
 
       <h2>Tools</h2>
+      <p class="muted">
+        Both require SIWE (Sign-In with Ethereum) authentication. Non-admin
+        wallets only see clients they own (RLS enforced); admin wallets see
+        everything.
+      </p>
       <ul>
         <li>
-          <a href="/admin">Admin UI</a>
+          <a href="/admin">Admin UI</a> — wallet sign-in via RainbowKit
         </li>
         <li>
-          <a href="/graphiql">GraphiQL</a>
+          <a href="/graphiql">GraphiQL</a> — requires{' '}
+          <code>Authorization: Bearer &lt;SIWE-JWT&gt;</code> header
         </li>
       </ul>
+
+      <h3>Admin wallets</h3>
+      {adminWallets.length === 0 ? (
+        <p class="muted">
+          None configured. Set <code>ADMIN_WALLET_ADDRESSES</code> to grant
+          global access.
+        </p>
+      ) : (
+        <ul>
+          {adminWallets.map((w) => (
+            <li>
+              <code>{w}</code>
+            </li>
+          ))}
+        </ul>
+      )}
     </body>
   </html>
 );

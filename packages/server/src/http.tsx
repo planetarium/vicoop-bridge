@@ -13,7 +13,7 @@ import type { AgentCard as SdkAgentCard } from '@a2a-js/sdk';
 import type { AgentCard as WireAgentCard } from '@vicoop-bridge/protocol';
 import { ServerAgentExecutor } from './executor.js';
 import type { ClientConnection, Registry } from './registry.js';
-import { createAdminTransport, buildAdminAgentCard } from './admin.js';
+import { createAdminTransport, buildAdminAgentCard, getAdminWallets } from './admin.js';
 import { verifySiweToken } from './siwe-token.js';
 import { agentAuthMiddleware, getAgentConn } from './agent-auth.js';
 import type { Sql } from './db.js';
@@ -143,7 +143,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       });
     }
     return c.html(
-      html`<!DOCTYPE html>${(<Landing adminCard={adminCard} clients={clients} />)}`,
+      html`<!DOCTYPE html>${(
+        <Landing
+          adminCard={adminCard}
+          clients={clients}
+          adminWallets={getAdminWallets()}
+        />
+      )}`,
     );
   });
 
