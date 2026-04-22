@@ -172,7 +172,6 @@ test('happy path: chat.send → final event → task completes', async () => {
 
 test('concurrent first-connect: shares one WebSocket across parallel handle() calls', async () => {
   let pendingConnectId: string | null = null;
-  const pendingChats: Array<{ sock: WebSocket; id: string; runId: string }> = [];
   const fake = await createFakeGateway({
     autoHandshake: false,
     onRequest: (sock, req) => {
@@ -182,7 +181,25 @@ test('concurrent first-connect: shares one WebSocket across parallel handle() ca
       }
       if (req.method === 'chat.send') {
         const params = req.params as { idempotencyKey: string };
-        pendingChats.push({ sock, id: req.id, runId: `run-${params.idempotencyKey}` });
+        const runId = `run-${params.idempotencyKey}`;
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+        );
+        setImmediate(() => {
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId,
+                sessionKey: 'agent:main:' + params.idempotencyKey,
+                seq: 1,
+                state: 'final',
+                message: { text: 'done ' + params.idempotencyKey },
+              },
+            }),
+          );
+        });
       }
     },
   });
@@ -196,26 +213,7 @@ test('concurrent first-connect: shares one WebSocket across parallel handle() ca
     await new Promise((r) => setTimeout(r, 30));
     assert.equal(fake.connections.length, 1, 'only one WebSocket should be accepted');
     assert.ok(pendingConnectId, 'connect request should have arrived');
-    // Complete handshake. Both handle() calls then send chat.send on the same socket.
-    const sock = fake.connections[0];
-    fake.respond(sock, pendingConnectId!, {});
-    // Wait for both chat.send to arrive, then ack each and emit finals on later ticks
-    // so that handle() has time to register runToTask/taskFinalizers.
-    await new Promise((r) => setTimeout(r, 30));
-    assert.equal(pendingChats.length, 2, 'both chat.send requests should arrive');
-    for (const c of pendingChats) {
-      fake.respond(c.sock, c.id, { runId: c.runId, status: 'started' });
-    }
-    await new Promise((r) => setTimeout(r, 20));
-    for (const c of pendingChats) {
-      fake.emitChat(c.sock, {
-        runId: c.runId,
-        sessionKey: 'agent:main:x',
-        seq: 1,
-        state: 'final',
-        message: { text: c.runId },
-      });
-    }
+    fake.respond(fake.connections[0], pendingConnectId!, {});
     await Promise.all([pA, pB]);
     assert.equal(fake.connections.length, 1, 'no additional WebSocket opened after handshake');
     const finalA = framesA.find((f) => f.type === 'task.complete');
@@ -240,8 +238,7 @@ test('reconnect: after gateway close, next handle() opens a fresh WebSocket', as
             payload: { runId, status: 'started' },
           }),
         );
-        // Space the final well past the ack so handle() can register runToTask.
-        setTimeout(() => {
+        setImmediate(() => {
           sock.send(
             JSON.stringify({
               type: 'event',
@@ -255,7 +252,7 @@ test('reconnect: after gateway close, next handle() opens a fresh WebSocket', as
               },
             }),
           );
-        }, 20);
+        });
       }
     },
   });
@@ -272,6 +269,130 @@ test('reconnect: after gateway close, next handle() opens a fresh WebSocket', as
     assert.equal(fake.connections.length, 2, 'a fresh WebSocket should be opened for the second task');
     assert.ok(framesA.find((f) => f.type === 'task.complete'));
     assert.ok(framesB.find((f) => f.type === 'task.complete'));
+  } finally {
+    await fake.close();
+  }
+});
+
+test('fast terminal event: final arrives on same socket read as ack and is still delivered', async () => {
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        const runId = 'run-fast';
+        // Emit ack and terminal event in the same synchronous burst so both
+        // frames batch into a single socket read on the client. The buffer
+        // in handle() must catch the event even though runToTask has not
+        // been populated yet.
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+        );
+        sock.send(
+          JSON.stringify({
+            type: 'event',
+            event: 'chat',
+            payload: {
+              runId,
+              sessionKey: 'agent:main:ctx-t1',
+              seq: 1,
+              state: 'final',
+              message: { text: 'instant' },
+            },
+          }),
+        );
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f));
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete, 'task should complete even with racing ack+final');
+    assert.equal(complete!.status.state, 'completed');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('task timeout: no terminal event triggers task_timeout failure', async () => {
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        // Ack, then stay silent forever.
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId: 'run-stall', status: 'started' },
+          }),
+        );
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url, taskTimeoutMs: 150 });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f));
+    const fail = frames.find((f) => f.type === 'task.fail');
+    assert.ok(fail, 'task must fail on timeout');
+    assert.equal(fail!.error.code, 'task_timeout');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('cancel: issues chat.abort and lets aborted terminal event complete the task as canceled', async () => {
+  let lastChatSendId: string | null = null;
+  let activeSock: WebSocket | null = null;
+  let activeRunId: string | null = null;
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        activeSock = sock;
+        lastChatSendId = req.id;
+        activeRunId = `run-${(req.params as { idempotencyKey: string }).idempotencyKey}`;
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId: activeRunId, status: 'started' },
+          }),
+        );
+      }
+      if (req.method === 'chat.abort') {
+        sock.send(JSON.stringify({ type: 'res', id: req.id, ok: true, payload: {} }));
+        setImmediate(() => {
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId: activeRunId,
+                sessionKey: 'agent:main:ctx-t1',
+                seq: 2,
+                state: 'aborted',
+              },
+            }),
+          );
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    const task = makeTask('t1', 'hi');
+    const pending = backend.handle(task, (f) => frames.push(f));
+    // Wait for the chat.send to land so cancel() can find runToTask.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok(lastChatSendId && activeSock);
+    await backend.cancel(task.taskId);
+    await pending;
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete);
+    assert.equal(complete!.status.state, 'canceled');
   } finally {
     await fake.close();
   }

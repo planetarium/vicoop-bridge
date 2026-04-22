@@ -305,7 +305,11 @@ export interface OpenclawBackendOptions {
   thinking?: string;
   sessionKeyPrefix?: string;
   debug?: boolean;
+  /** Max time (ms) to wait for a terminal chat event after chat.send ack. Default 600000 (10min). */
+  taskTimeoutMs?: number;
 }
+
+const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
 
 export function createOpenclawBackend(
   opts: OpenclawBackendOptions = {},
@@ -316,11 +320,16 @@ export function createOpenclawBackend(
   const thinking = opts.thinking ?? process.env.OPENCLAW_THINKING;
   const sessionPrefix = opts.sessionKeyPrefix ?? 'agent';
   const debug = opts.debug ?? process.env.OPENCLAW_DEBUG === '1';
+  const envTimeout = process.env.OPENCLAW_TASK_TIMEOUT_MS
+    ? Number(process.env.OPENCLAW_TASK_TIMEOUT_MS)
+    : undefined;
+  const taskTimeoutMs = opts.taskTimeoutMs ?? (Number.isFinite(envTimeout) ? (envTimeout as number) : DEFAULT_TASK_TIMEOUT_MS);
 
   let current: GatewayClient | null = null;
   let connecting: Promise<GatewayClient> | null = null;
   const runToTask = new Map<string, { taskId: string; sessionKey: string }>();
   const taskFinalizers = new Map<string, (evt: FinalizerEvent) => void>();
+  const pendingRunEvents = new Map<string, ChatEventPayload[]>();
 
   function handleGatewayClose(c: GatewayClient, err: Error): void {
     console.error('[openclaw] connection error:', err.message);
@@ -356,7 +365,14 @@ export function createOpenclawBackend(
             console.log('[openclaw] chat event:', JSON.stringify(p).slice(0, 500));
           }
           const binding = runToTask.get(p.runId);
-          if (!binding) return;
+          if (!binding) {
+            // Event arrived before handle() finished registering the runId.
+            // Buffer until the handler catches up and drains it.
+            const buf = pendingRunEvents.get(p.runId) ?? [];
+            buf.push(p);
+            pendingRunEvents.set(p.runId, buf);
+            return;
+          }
           taskFinalizers.get(binding.taskId)?.(p);
         });
         c.onClose((err) => handleGatewayClose(c, err));
@@ -389,91 +405,134 @@ export function createOpenclawBackend(
         status: { state: 'working', timestamp: new Date().toISOString() },
       });
 
-      const idempotencyKey = task.taskId;
-      let ack: ChatSendAck;
-      try {
-        ack = await gw.request<ChatSendAck>('chat.send', {
-          sessionKey,
-          message: text,
-          idempotencyKey,
-          ...(thinking ? { thinking } : {}),
-        });
-      } catch (err) {
-        emit({
-          type: 'task.fail',
-          taskId: task.taskId,
-          error: { code: 'gateway_send_failed', message: (err as Error).message },
-        });
-        return;
-      }
-
-      const runId = ack.runId;
-      runToTask.set(runId, { taskId: task.taskId, sessionKey });
-
-      const settled = await new Promise<FinalizerEvent>((resolve) => {
-        taskFinalizers.set(task.taskId, (evt) => {
-          if (evt.state === 'final' || evt.state === 'error' || evt.state === 'aborted') {
-            resolve(evt);
-          }
-        });
+      // Register the finalizer BEFORE sending chat.send so that:
+      //   1. a gateway close between send and ack still fails this task,
+      //   2. a fast terminal event arriving before runId is known is buffered.
+      let resolveSettled!: (evt: FinalizerEvent) => void;
+      const settled = new Promise<FinalizerEvent>((r) => {
+        resolveSettled = r;
       });
+      const finalizer = (evt: FinalizerEvent) => {
+        if (evt.state === 'final' || evt.state === 'error' || evt.state === 'aborted') {
+          resolveSettled(evt);
+        }
+      };
+      taskFinalizers.set(task.taskId, finalizer);
 
-      taskFinalizers.delete(task.taskId);
-      runToTask.delete(runId);
+      let runId: string | null = null;
+      const timer = setTimeout(() => {
+        resolveSettled({
+          runId: runId ?? '',
+          sessionKey,
+          seq: -1,
+          state: 'error',
+          errorMessage: `task timed out after ${taskTimeoutMs}ms`,
+          cause: 'timeout',
+        });
+      }, taskTimeoutMs);
+      timer.unref?.();
 
-      if (settled.cause === 'gateway_closed') {
+      try {
+        let ack: ChatSendAck;
+        try {
+          ack = await gw.request<ChatSendAck>('chat.send', {
+            sessionKey,
+            message: text,
+            idempotencyKey: task.taskId,
+            ...(thinking ? { thinking } : {}),
+          });
+        } catch (err) {
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: { code: 'gateway_send_failed', message: (err as Error).message },
+          });
+          return;
+        }
+
+        runId = ack.runId;
+        runToTask.set(runId, { taskId: task.taskId, sessionKey });
+        // Drain any events that raced ahead of registration.
+        const buffered = pendingRunEvents.get(runId);
+        if (buffered) {
+          pendingRunEvents.delete(runId);
+          for (const p of buffered) finalizer(p);
+        }
+
+        const result = await settled;
+
+        if (result.cause === 'timeout') {
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: {
+              code: 'task_timeout',
+              message: result.errorMessage ?? 'task timed out',
+            },
+          });
+          return;
+        }
+        if (result.cause === 'gateway_closed') {
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: {
+              code: 'gateway_closed',
+              message: result.errorMessage ?? 'gateway closed',
+            },
+          });
+          return;
+        }
+        if (result.state === 'error') {
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: {
+              code: 'gateway_chat_error',
+              message: result.errorMessage ?? 'unknown gateway error',
+            },
+          });
+          return;
+        }
+        if (result.state === 'aborted') {
+          emit({
+            type: 'task.complete',
+            taskId: task.taskId,
+            status: { state: 'canceled', timestamp: new Date().toISOString() },
+          });
+          return;
+        }
+
+        const text2 = extractFinalText(result.message);
+        const parts: Part[] = [{ kind: 'text', text: text2 }];
+        const artifactId = randomUUID();
         emit({
-          type: 'task.fail',
+          type: 'task.artifact',
           taskId: task.taskId,
-          error: {
-            code: 'gateway_closed',
-            message: settled.errorMessage ?? 'gateway closed',
-          },
+          artifact: { artifactId, name: 'openclaw-result', parts },
+          lastChunk: true,
         });
-        return;
-      }
-      if (settled.state === 'error') {
-        emit({
-          type: 'task.fail',
-          taskId: task.taskId,
-          error: {
-            code: 'gateway_chat_error',
-            message: settled.errorMessage ?? 'unknown gateway error',
-          },
-        });
-        return;
-      }
-      if (settled.state === 'aborted') {
         emit({
           type: 'task.complete',
           taskId: task.taskId,
-          status: { state: 'canceled', timestamp: new Date().toISOString() },
-        });
-        return;
-      }
-
-      const text2 = extractFinalText(settled.message);
-      const parts: Part[] = [{ kind: 'text', text: text2 }];
-      const artifactId = randomUUID();
-      emit({
-        type: 'task.artifact',
-        taskId: task.taskId,
-        artifact: { artifactId, name: 'openclaw-result', parts },
-        lastChunk: true,
-      });
-      emit({
-        type: 'task.complete',
-        taskId: task.taskId,
-        status: {
-          state: 'completed',
-          timestamp: new Date().toISOString(),
-          message: {
-            role: 'agent',
-            messageId: randomUUID(),
-            parts,
+          status: {
+            state: 'completed',
+            timestamp: new Date().toISOString(),
+            message: {
+              role: 'agent',
+              messageId: randomUUID(),
+              parts,
+            },
           },
-        },
-      });
+        });
+      } finally {
+        clearTimeout(timer);
+        taskFinalizers.delete(task.taskId);
+        if (runId) {
+          runToTask.delete(runId);
+          pendingRunEvents.delete(runId);
+        }
+      }
     },
 
     async cancel(taskId) {
