@@ -101,8 +101,9 @@ export const Landing: FC<LandingProps> = ({ adminCard, clients, adminWallets }) 
           <a href="/admin/">Admin UI</a> — wallet sign-in via RainbowKit
         </li>
         <li>
-          <a href="/graphiql">GraphiQL</a> — requires{' '}
-          <code>Authorization: Bearer vbc_caller_*</code> header
+          <a href="/graphiql">GraphiQL</a> — loads anonymously; include{' '}
+          <code>Authorization: Bearer vbc_caller_*</code> header for
+          authenticated queries (RLS filters rows otherwise)
         </li>
       </ul>
 
