@@ -3,7 +3,7 @@ import { useAccount, useSignMessage, useDisconnect } from 'wagmi';
 import { SiweMessage } from 'siwe';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAuthToken, setToken } from '../lib/auth-token';
-import { encodeSiweToken } from '../lib/siwe-token';
+import { exchangeSiweForCallerToken } from '../lib/siwe-exchange';
 
 export function WalletAuth() {
   const { address, isConnected, chainId } = useAccount();
@@ -21,6 +21,10 @@ export function WalletAuth() {
     setError(null);
 
     try {
+      // Share a single base timestamp between issuedAt and expirationTime so
+      // their difference is exactly 7 days. Two separate Date reads can drift
+      // a few ms apart and push `expires - issued` over the server's cap.
+      const now = Date.now();
       const siweMessage = new SiweMessage({
         domain: window.location.hostname,
         address,
@@ -29,13 +33,14 @@ export function WalletAuth() {
         version: '1',
         chainId,
         nonce: crypto.randomUUID().replace(/-/g, ''),
-        issuedAt: new Date().toISOString(),
-        expirationTime: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        issuedAt: new Date(now).toISOString(),
+        expirationTime: new Date(now + 7 * 24 * 60 * 60 * 1000).toISOString(),
       });
 
       const message = siweMessage.prepareMessage();
       const signature = await signMessageAsync({ message });
-      setToken(encodeSiweToken(message, signature));
+      const accessToken = await exchangeSiweForCallerToken(message, signature);
+      setToken(accessToken);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.toLowerCase().includes('user rejected')) {

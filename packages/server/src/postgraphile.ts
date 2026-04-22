@@ -1,8 +1,9 @@
 import express from 'express';
 import { postgraphile } from 'postgraphile';
 import { Pool } from 'pg';
-import { verifySiweToken } from './siwe-token.js';
 import type { IncomingMessage } from 'node:http';
+import type { Sql } from './db.js';
+import { CALLER_TOKEN_PREFIX, verifyCallerToken } from './auth/caller-token.js';
 
 const ADMIN_WALLET_ADDRESSES = (process.env.ADMIN_WALLET_ADDRESSES ?? '')
   .split(',')
@@ -10,7 +11,7 @@ const ADMIN_WALLET_ADDRESSES = (process.env.ADMIN_WALLET_ADDRESSES ?? '')
   .filter(Boolean)
   .join(',');
 
-export async function startPostGraphile(databaseUrl: string): Promise<void> {
+export async function startPostGraphile(databaseUrl: string, sql: Sql): Promise<void> {
   const port = Number(process.env.POSTGRAPHILE_PORT ?? 5433);
 
   const pool = new Pool({
@@ -40,15 +41,24 @@ export async function startPostGraphile(databaseUrl: string): Promise<void> {
         const auth = req.headers.authorization;
         if (auth?.startsWith('Bearer ')) {
           const token = auth.slice(7);
-          try {
-            const address = await verifySiweToken(token);
-            return {
-              role: 'app_authenticated',
-              'jwt.claims.wallet_address': address,
-              'app.admin_addresses': ADMIN_WALLET_ADDRESSES,
-            };
-          } catch {
-            // fall through to anonymous
+          // Opaque caller tokens are the only accepted admin GraphQL credential
+          // as of #31. Wallet-based callers (eth:* principals) get RLS-gated
+          // access; Google-only callers have no owner_wallet so their queries
+          // fall through to anonymous.
+          if (token.startsWith(CALLER_TOKEN_PREFIX)) {
+            try {
+              const caller = await verifyCallerToken(sql, token);
+              if (caller.principalId.startsWith('eth:')) {
+                const walletAddress = caller.principalId.slice('eth:'.length);
+                return {
+                  role: 'app_authenticated',
+                  'jwt.claims.wallet_address': walletAddress,
+                  'app.admin_addresses': ADMIN_WALLET_ADDRESSES,
+                };
+              }
+            } catch {
+              // fall through to anonymous
+            }
           }
         }
         return { role: 'app_anonymous' };

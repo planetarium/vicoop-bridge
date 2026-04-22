@@ -1,7 +1,10 @@
 # Local E2E testing
 
-Walkthroughs for exercising the A2A caller auth paths (SIWE, opaque token via
-Google OAuth device flow) end-to-end against a local server + echo client.
+Walkthroughs for exercising the A2A caller auth paths end-to-end against a
+local server + echo client. After #31 all paths converge on opaque caller
+tokens (`vbc_caller_*`); they differ only in how the token is **issued**:
+direct DB insert (Path A — smoke test), Google device flow (Path B), or SIWE
+exchange (Path C).
 
 ## Prerequisites
 
@@ -199,11 +202,13 @@ Other entry formats:
 - `google:domain:<your_workspace_domain>` — any verified account from the domain
   (matches either `hd` claim or `@domain` email suffix)
 
-## SIWE regression check (programmatic)
+## Path C — SIWE exchange (programmatic)
 
-Runs SIWE without a browser by signing a SIWE message with a test EOA key using
-`viem` + `siwe`. Useful for verifying the SIWE path wasn't broken by auth
-refactors.
+Raw SIWE bearers are no longer accepted on `/agents/:id`, `POST /`, or admin
+GraphQL (see #31). SIWE is now an **issuance method**: sign a message, POST it
+to `/auth/siwe/exchange`, receive an opaque `vbc_caller_*` token, and use that
+token on every subsequent request. This section signs programmatically with a
+test EOA and walks the full exchange.
 
 ```bash
 # Script uses a well-known Anvil test key — safe because it has no real balance.
@@ -211,13 +216,18 @@ cat > /tmp/gen-siwe.mjs <<'JS'
 import { SiweMessage } from 'siwe';
 import { privateKeyToAccount } from 'viem/accounts';
 
+// Must match the server's PUBLIC_URL hostname — the exchange endpoint enforces
+// domain match against siweDomain derived from PUBLIC_URL.
 const DOMAIN = process.env.SIWE_DOMAIN ?? 'localhost';
 const URI = process.env.SIWE_URI ?? 'http://localhost:8787';
 // Anvil account #0 — public test key, DO NOT use for anything real.
 const PRIVATE_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
 
 const account = privateKeyToAccount(PRIVATE_KEY);
-console.log(`# wallet: ${account.address}`);
+console.error(`# wallet: ${account.address}`);
+// Fresh nonce per invocation: `/auth/siwe/exchange` enforces single-use per
+// (principal, nonce), so a fixed literal would cause the second run to fail.
+const nonce = crypto.randomUUID().replace(/-/g, '');
 const msg = new SiweMessage({
   domain: DOMAIN,
   address: account.address,
@@ -225,49 +235,63 @@ const msg = new SiweMessage({
   uri: URI,
   version: '1',
   chainId: 1,
-  nonce: 'testnonce0123456789abcdef',
+  nonce,
   issuedAt: new Date().toISOString(),
   expirationTime: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
 });
 const message = msg.prepareMessage();
 const signature = await account.signMessage({ message });
-const token = Buffer.from(JSON.stringify({ message, signature })).toString('base64url');
-console.log(token);
+// Emit JSON to stdout so it can be piped directly into the exchange endpoint.
+console.log(JSON.stringify({ message, signature }));
 JS
 
 # Run from packages/admin-ui — it's the only workspace with viem resolvable.
 cp /tmp/gen-siwe.mjs packages/admin-ui/
-(cd packages/admin-ui && node gen-siwe.mjs)
+(cd packages/admin-ui && node gen-siwe.mjs) > /tmp/siwe.json
 
-# Grant the wallet, restart client, call the agent.
+# Exchange SIWE → opaque caller token.
+TOKEN=$(curl -sX POST http://localhost:8787/auth/siwe/exchange \
+  -H "Content-Type: application/json" \
+  --data @/tmp/siwe.json | jq -r .access_token)
+echo "$TOKEN"   # vbc_caller_...
+
+# Confirm the callers row landed with provider='siwe'.
 psql vicoop_bridge_dev -c \
-  "UPDATE agent_policies SET allowed_callers = ARRAY['eth:<wallet_lower>'] WHERE agent_id='echo-agent';"
+  "SELECT principal_id, provider, expires_at FROM callers ORDER BY created_at DESC LIMIT 1;"
+# principal_id should be eth:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266 (Anvil #0, lowercased)
+# provider should be 'siwe'
+
+# Grant the wallet, restart client, call the agent with the opaque token.
+psql vicoop_bridge_dev -c \
+  "UPDATE agent_policies SET allowed_callers = ARRAY['eth:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266'] WHERE agent_id='echo-agent';"
 # ...restart client...
 
-SIWE_TOKEN="<token from script>"
 curl -s -X POST http://localhost:8787/agents/echo-agent \
-  -H "Authorization: Bearer $SIWE_TOKEN" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"m","role":"user","kind":"message","parts":[{"kind":"text","text":"siwe test"}]}}}'
 ```
 
 Verified scenarios:
-- canonical `eth:0x...` entry matches SIWE token
-- legacy plain `0x...` entry (no prefix, for DBs predating the principal format)
-  also matches via `validatePrincipal` auto-prefix in `matchPrincipal`
-- mixed policy (`[eth:0x..., google:sub:...]`) — both token types match
-  against their own entry type
-- malformed bearer → 401 `Failed to decode SIWE token`
+- exchange issues an opaque token tied to `eth:<addr>` with `provider='siwe'`
+- that opaque token matches canonical `eth:0x...` entries in `allowed_callers`
+- mixed policy (`[eth:0x..., google:sub:...]`) — both opaque tokens match
+  against their own principal
+- raw SIWE bearer on `/agents/:id` → 401 `Invalid bearer token: expected vbc_caller_* prefix`
+- expired SIWE message on exchange → 401 `invalid_grant`
+- domain mismatch on exchange → 401 `invalid_grant`
+- admin UI / admin GraphQL: same opaque token grants `wallet_address` claim and
+  (if wallet in `ADMIN_WALLET_ADDRESSES`) admin scope
 
 ## Unit tests with live DB
 
-9 DB-gated cases live in the auth module tests (caller-token, device-flow)
-and skip without `DATABASE_URL`. To run the full suite:
+DB-gated cases in the auth module tests (caller-token, device-flow,
+siwe-exchange) skip without `DATABASE_URL`. To run the full suite:
 
 ```bash
 DATABASE_URL="postgres://$USER@localhost:5432/vicoop_bridge_dev" \
-  ./node_modules/.bin/tsx --test packages/server/src/auth/*.test.ts
-# expect: pass 86 / skipped 0
+  pnpm --filter @vicoop-bridge/server exec tsx --test src/auth/*.test.ts
+# expect: pass 90 / skipped 0
 ```
 
 ## Gotchas

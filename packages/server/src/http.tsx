@@ -14,10 +14,11 @@ import type { AgentCard as WireAgentCard } from '@vicoop-bridge/protocol';
 import { ServerAgentExecutor } from './executor.js';
 import type { ClientConnection, Registry } from './registry.js';
 import { createAdminTransport, buildAdminAgentCard, getAdminWallets } from './admin.js';
-import { verifySiweToken } from './siwe-token.js';
 import { agentAuthMiddleware, getAgentConn } from './agent-auth.js';
+import { CALLER_TOKEN_PREFIX, verifyCallerToken } from './auth/caller-token.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
 import { mountDeviceUi } from './auth/device-ui.js';
+import { mountSiweExchange } from './auth/siwe-exchange.js';
 import type { GoogleConfig } from './auth/google-oauth.js';
 import type { Sql } from './db.js';
 import { Landing } from './landing.js';
@@ -30,11 +31,17 @@ export interface ServerHttpOptions {
   deviceFlowStateSecret?: string;
 }
 
+interface AgentCardOptions {
+  publicUrl: string | undefined;
+  deviceFlowEnabled: boolean;
+}
+
 function toSdkAgentCard(
   wire: WireAgentCard,
   conn: ClientConnection,
-  publicUrl: string | undefined,
+  opts: AgentCardOptions,
 ): SdkAgentCard {
+  const { publicUrl, deviceFlowEnabled } = opts;
   const url = publicUrl
     ? `${publicUrl}/agents/${conn.agentId}`
     : `/agents/${conn.agentId}`;
@@ -59,28 +66,38 @@ function toSdkAgentCard(
     })),
   };
   if (conn.allowedCallers.length > 0) {
-    card.securitySchemes = {
-      siwe: {
-        type: 'http',
-        scheme: 'bearer',
-        bearerFormat: 'SIWE',
-        description: 'Sign-In with Ethereum (EIP-4361) bearer token',
-      },
-      bridge: {
-        type: 'oauth2',
-        description: 'Bridge-issued opaque bearer token obtained via Google OAuth device flow',
-        flows: {
-          deviceAuthorization: {
-            deviceAuthorizationUrl: publicUrl
-              ? `${publicUrl}/oauth/device/code`
-              : '/oauth/device/code',
-            tokenUrl: publicUrl ? `${publicUrl}/oauth/token` : '/oauth/token',
-            scopes: {},
+    // The device-flow scheme only matches a real endpoint when Google OAuth is
+    // configured on this deployment (mountDeviceFlow call below). Advertising
+    // it unconditionally would point clients at a 404.
+    if (deviceFlowEnabled) {
+      card.securitySchemes = {
+        bridge: {
+          type: 'oauth2',
+          description:
+            'Bridge-issued opaque bearer token. Acquire via /oauth/token (Google device flow) or /auth/siwe/exchange (SIWE).',
+          flows: {
+            deviceAuthorization: {
+              deviceAuthorizationUrl: publicUrl
+                ? `${publicUrl}/oauth/device/code`
+                : '/oauth/device/code',
+              tokenUrl: publicUrl ? `${publicUrl}/oauth/token` : '/oauth/token',
+              scopes: {},
+            },
           },
+        } as unknown as NonNullable<SdkAgentCard['securitySchemes']>[string],
+      };
+    } else {
+      card.securitySchemes = {
+        bridge: {
+          type: 'http',
+          scheme: 'bearer',
+          bearerFormat: 'Opaque',
+          description:
+            'Bridge-issued opaque bearer token (vbc_caller_*). Acquire via POST /auth/siwe/exchange by signing a SIWE message.',
         },
-      } as unknown as NonNullable<SdkAgentCard['securitySchemes']>[string],
-    };
-    card.security = [{ siwe: [] }, { bridge: [] }];
+      };
+    }
+    card.security = [{ bridge: [] }];
   }
   return card;
 }
@@ -90,6 +107,16 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
 
   const taskStore = new InMemoryTaskStore();
   const transports = new Map<string, JsonRpcTransportHandler>();
+
+  // Device flow endpoints (/oauth/device/code, /oauth/token) are only mounted
+  // when Google OAuth is fully configured. Surface this to the agent card and
+  // the agent-auth error hint so SIWE-only deployments don't point callers at
+  // non-existent endpoints.
+  const deviceFlowEnabled = Boolean(opts.google && opts.publicUrl);
+  const agentCardOpts: AgentCardOptions = {
+    publicUrl: opts.publicUrl,
+    deviceFlowEnabled,
+  };
 
   // Built-in admin agent at root
   const adminTransport = createAdminTransport({
@@ -103,7 +130,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     // Rebuild transport when security state changes (allowedCallers toggled)
     const cached = transports.get(conn.agentId);
     if (cached) return cached;
-    const card = toSdkAgentCard(conn.agentCard, conn, opts.publicUrl);
+    const card = toSdkAgentCard(conn.agentCard, conn, agentCardOpts);
     const executor = new ServerAgentExecutor(conn.agentId, opts.registry);
     const handler = new DefaultRequestHandler(card, taskStore, executor);
     const transport = new JsonRpcTransportHandler(handler);
@@ -144,7 +171,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       url: opts.publicUrl
         ? `${opts.publicUrl}/agents/${a.agentId}`
         : `/agents/${a.agentId}`,
-      card: toSdkAgentCard(a.agentCard, a, opts.publicUrl),
+      card: toSdkAgentCard(a.agentCard, a, agentCardOpts),
     }));
 
     const accept = c.req.header('accept') ?? '';
@@ -181,26 +208,48 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }
   }
 
-  // Root POST — admin agent A2A endpoint (SIWE auth)
+  // SIWE → opaque caller token exchange. Admin UI and any wallet-based client
+  // signs a SIWE message once, then presents the returned vbc_caller_* token
+  // on all subsequent requests.
+  mountSiweExchange(app, { sql: opts.db, domain: siweDomain });
+
+  // Root POST — admin agent A2A endpoint. Requires opaque caller token with
+  // an `eth:*` principal (admin agent is wallet-based; Google-only callers
+  // can still call /agents/:id but have no admin GraphQL access under the
+  // current owner_wallet schema).
   app.post('/', async (c) => {
     const authHeader = c.req.header('Authorization');
     const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
-    if (!bearerToken) {
+    if (!bearerToken || !bearerToken.startsWith(CALLER_TOKEN_PREFIX)) {
       return c.json({
         jsonrpc: '2.0',
         id: null,
-        error: { code: -32001, message: 'Authentication required (Bearer SIWE token)' },
+        error: {
+          code: -32001,
+          message: `Authentication required (Bearer ${CALLER_TOKEN_PREFIX}* token). Acquire via /auth/siwe/exchange.`,
+        },
       }, 401);
     }
 
     let walletAddress: string;
     try {
-      walletAddress = await verifySiweToken(bearerToken, { domain: siweDomain });
+      const caller = await verifyCallerToken(opts.db, bearerToken);
+      if (!caller.principalId.startsWith('eth:')) {
+        return c.json({
+          jsonrpc: '2.0',
+          id: null,
+          error: {
+            code: -32001,
+            message: 'Admin agent requires a wallet-based caller token (eth:*). Sign in via SIWE.',
+          },
+        }, 403);
+      }
+      walletAddress = caller.principalId.slice('eth:'.length);
     } catch (err) {
       return c.json({
         jsonrpc: '2.0',
         id: null,
-        error: { code: -32001, message: `Invalid SIWE token: ${(err as Error).message}` },
+        error: { code: -32001, message: `Invalid caller token: ${(err as Error).message}` },
       }, 401);
     }
 
@@ -263,11 +312,14 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const id = c.req.param('id');
     const conn = opts.registry.getAgent(id);
     if (!conn) return c.json({ error: 'agent not connected' }, 404);
-    return c.json(toSdkAgentCard(conn.agentCard, conn, opts.publicUrl));
+    return c.json(toSdkAgentCard(conn.agentCard, conn, agentCardOpts));
   });
 
   // Client agent A2A endpoints (auth middleware checks allowedCallers)
-  const authMw = agentAuthMiddleware(opts.registry, { sql: opts.db, domain: siweDomain });
+  const authMw = agentAuthMiddleware(opts.registry, {
+    sql: opts.db,
+    deviceFlowEnabled,
+  });
   app.post('/agents/:id', authMw, async (c) => {
     const conn = getAgentConn(c);
 

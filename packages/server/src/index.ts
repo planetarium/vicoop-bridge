@@ -5,13 +5,18 @@ import { attachWsServer } from './ws.js';
 import type { Sql } from './db.js';
 import type { GoogleConfig } from './auth/google-oauth.js';
 
-const DEVICE_SESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1h
+const TRANSIENT_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1h
 
-async function cleanupExpiredDeviceSessions(db: Sql): Promise<void> {
+async function cleanupExpiredTransients(db: Sql): Promise<void> {
   try {
     await db`DELETE FROM device_sessions WHERE expires_at <= now()`;
   } catch (err) {
     console.error('[server] device_sessions cleanup failed:', err);
+  }
+  try {
+    await db`DELETE FROM used_siwe_nonces WHERE expires_at <= now()`;
+  } catch (err) {
+    console.error('[server] used_siwe_nonces cleanup failed:', err);
   }
 }
 
@@ -45,11 +50,12 @@ export async function startServer(opts: ServerOptions) {
     registry,
   });
 
-  // Cleanup expired device_sessions on startup and periodically.
-  void cleanupExpiredDeviceSessions(opts.db);
+  // Cleanup expired transient rows (device_sessions, used_siwe_nonces) on
+  // startup and periodically.
+  void cleanupExpiredTransients(opts.db);
   const cleanupTimer = setInterval(
-    () => void cleanupExpiredDeviceSessions(opts.db),
-    DEVICE_SESSION_CLEANUP_INTERVAL_MS,
+    () => void cleanupExpiredTransients(opts.db),
+    TRANSIENT_CLEANUP_INTERVAL_MS,
   );
   cleanupTimer.unref();
 

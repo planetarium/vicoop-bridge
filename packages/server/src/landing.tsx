@@ -89,17 +89,21 @@ export const Landing: FC<LandingProps> = ({ adminCard, clients, adminWallets }) 
 
       <h2>Tools</h2>
       <p class="muted">
-        Both require SIWE (Sign-In with Ethereum) authentication. Non-admin
-        wallets only see clients they own (RLS enforced); admin wallets see
-        everything.
+        Both accept a bridge-issued opaque caller token
+        (<code>vbc_caller_*</code>) on the{' '}
+        <code>Authorization: Bearer ...</code> header. Wallet-based clients
+        obtain one by signing a SIWE message and exchanging it at{' '}
+        <code>POST /auth/siwe/exchange</code>. Non-admin wallets only see
+        clients they own (RLS enforced); admin wallets see everything.
       </p>
       <ul>
         <li>
           <a href="/admin/">Admin UI</a> — wallet sign-in via RainbowKit
         </li>
         <li>
-          <a href="/graphiql">GraphiQL</a> — requires{' '}
-          <code>Authorization: Bearer &lt;SIWE-JWT&gt;</code> header
+          <a href="/graphiql">GraphiQL</a> — loads anonymously; include{' '}
+          <code>Authorization: Bearer vbc_caller_*</code> header for
+          authenticated queries (RLS filters rows otherwise)
         </li>
       </ul>
 
