@@ -312,7 +312,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const id = c.req.param('id');
     const conn = opts.registry.getAgent(id);
     if (!conn) return c.json({ error: 'agent not connected' }, 404);
-    return c.json(toSdkAgentCard(conn.agentCard, conn, opts.publicUrl));
+    return c.json(toSdkAgentCard(conn.agentCard, conn, agentCardOpts));
   });
 
   // Client agent A2A endpoints (auth middleware checks allowedCallers)
