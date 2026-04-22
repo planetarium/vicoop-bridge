@@ -109,7 +109,8 @@ CALLER_TOKEN=$(curl -sX POST "$BRIDGE_URL/auth/siwe/exchange" \
   -H 'Content-Type: application/json' \
   --data @/tmp/siwe.json | jq -r .access_token)
 echo "$CALLER_TOKEN"
-# vbc_caller_...  (valid ~60 min)
+# vbc_caller_...  (valid ~60 min, because gen-siwe.mjs sets
+# expirationTime to now + 1h; server caps at 7 days)
 ```
 
 If you change the EOA, remember to update the wallet address used in Step 5.
@@ -350,9 +351,13 @@ curl -s -X POST "$BRIDGE_URL/graphql" \
 rm /tmp/siwe.json /tmp/echo-card.json packages/admin-ui/gen-siwe.mjs
 ```
 
-The `callers` row backing your opaque token expires on its own (default ~60
-min from issuance). Self-revoke is not exposed; only `ADMIN_WALLET_ADDRESSES`
-callers can invoke `revoke_caller_token`.
+The `callers` row backing your opaque token expires on its own. For
+SIWE-issued tokens, `expires_in` is inherited from the SIWE message's
+`expirationTime` (clamped to a 7-day server maximum, see
+`MAX_TOKEN_TTL_MS` in `packages/server/src/siwe-token.ts`); the ~60 min
+you saw above comes from `gen-siwe.mjs` setting `expirationTime` to +1 h
+— change the script to extend. Self-revoke is not exposed; only
+`ADMIN_WALLET_ADDRESSES` callers can invoke `revoke_caller_token`.
 
 ## Gotchas
 
@@ -384,9 +389,12 @@ callers can invoke `revoke_caller_token`.
   a different Google account ever gets issued the same verified address and
   completes a device flow, its token will also match. Use `google:sub:*`
   for a per-account binding.
-- **(Path B) Google-issued tokens are long-lived** — `expires_in` is ~90
-  days, unlike SIWE-issued tokens (~60 min). Treat them as durable secrets
-  in tests; don't commit them.
+- **Token lifetimes differ by issuance path** — Google device-flow tokens
+  have a fixed ~90-day `expires_in`. SIWE-exchange tokens inherit
+  `expires_in` from the SIWE message's `expirationTime` (capped at 7
+  days); in this walkthrough `gen-siwe.mjs` sets +1 h, which is why the
+  returned `expires_in` is ~3595 s. Treat both as durable secrets in
+  tests; don't commit them.
 
 ## When to use this vs `local-testing.md`
 
