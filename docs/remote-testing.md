@@ -245,17 +245,20 @@ curl -s -X POST "$BRIDGE_URL/" \
   | jq -r '.result.status.message.parts[0].text'
 ```
 
-Add the caller **before** running the device flow. The issued token's
-`principal_id` is set at issuance time (`google:<sub>`), and
-`matchPrincipal` (see `packages/server/src/auth/principal.ts`) checks each
-`allowed_callers` entry independently on every request:
+Add the caller **before** running the device flow. On device-flow
+completion the server persists `principal_id` (`google:<sub>`) and the
+verified `email` into the `callers` row; `hostedDomain` is read from the
+ID token but not stored. At dispatch, `verifyCallerToken` reads this row
+and `matchPrincipal` (see `packages/server/src/auth/principal.ts`) checks
+each `allowed_callers` entry against that snapshot — Google is not queried
+again:
 
 - `google:sub:<sub>` — exact `principal_id` equality.
-- `google:email:<addr>` — the caller's verified email matches the entry
-  exactly (case-insensitive). The entry is never rewritten; changing the
-  email on the Google account invalidates the match.
-- `google:domain:<d>` — `emailVerified=true` and either the `hd` claim
-  equals the entry or the verified email ends in `@<d>`.
+- `google:email:<addr>` — case-insensitive equality against the email
+  captured at issuance time (which was verified by Google then).
+- `google:domain:<d>` — matches when the captured email ends in `@<d>`.
+  (The `hd` claim branch in `matchPrincipal` is dead for device-flow
+  tokens because `hostedDomain` isn't persisted.)
 
 ### Step 5b — Device flow
 
@@ -372,12 +375,15 @@ callers can invoke `revoke_caller_token`.
 - **(Path B) Workspace-only deployments** — if the OAuth app is configured
   `Internal`, only same-Workspace accounts can complete the flow. Personal
   Gmail accounts fail with `access_denied` even if added as test users.
-- **(Path B) `google:email:*` matches on the caller's current verified
-  email** — `matchPrincipal` compares the allowed entry against whatever
-  verified email Google returns for the token at dispatch time. The entry is
-  never rewritten, so if the same Google account later changes its primary
-  email (or a different account takes over the address), the match silently
-  breaks. Use `google:sub:*` for stable per-account binding.
+- **(Path B) `google:email:*` binds to the email captured at issuance** —
+  the email is snapshotted into the `callers` row when the device flow
+  completes; Google is not re-queried on dispatch. Consequences: (a) if the
+  Google user later changes their primary email, existing caller tokens
+  keep working against the old address until they expire or are revoked;
+  (b) the allowlist entry is an email string, not an account identity — if
+  a different Google account ever gets issued the same verified address and
+  completes a device flow, its token will also match. Use `google:sub:*`
+  for a per-account binding.
 - **(Path B) Google-issued tokens are long-lived** — `expires_in` is ~90
   days, unlike SIWE-issued tokens (~60 min). Treat them as durable secrets
   in tests; don't commit them.
