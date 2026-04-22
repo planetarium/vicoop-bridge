@@ -73,8 +73,12 @@ so the protocol must be built once.
 
 ## Step 1 — SIWE exchange
 
+We run the signing script via stdin from the admin-ui workspace directory
+so Node resolves `siwe` / `viem` from its `node_modules` without writing
+anything under `packages/`.
+
 ```bash
-cat > packages/admin-ui/gen-siwe.mjs <<'JS'
+(cd packages/admin-ui && node --input-type=module > /tmp/siwe.json) <<'JS'
 import { SiweMessage } from 'siwe';
 import { privateKeyToAccount } from 'viem/accounts';
 
@@ -95,21 +99,20 @@ const msg = new SiweMessage({
   chainId: 1,
   nonce,
   issuedAt: new Date().toISOString(),
+  // Server TTL = min(7d, expirationTime - now). Change this to extend.
   expirationTime: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
 });
 const message = msg.prepareMessage();
 const signature = await account.signMessage({ message });
 console.log(JSON.stringify({ message, signature }));
 JS
-
-(cd packages/admin-ui && node gen-siwe.mjs) > /tmp/siwe.json
 # stderr prints the wallet: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 (Anvil #0)
 
 CALLER_TOKEN=$(curl -sX POST "$BRIDGE_URL/auth/siwe/exchange" \
   -H 'Content-Type: application/json' \
   --data @/tmp/siwe.json | jq -r .access_token)
 echo "$CALLER_TOKEN"
-# vbc_caller_...  (valid ~60 min, because gen-siwe.mjs sets
+# vbc_caller_...  (valid ~60 min because the SIWE message sets
 # expirationTime to now + 1h; server caps at 7 days)
 ```
 
@@ -156,8 +159,14 @@ JSON
   --agentId "$AGENT_ID" \
   --card /tmp/echo-card.json \
   --backend echo) &
+CLIENT_PID=$!
 # logs: [client] connected, sending hello
 ```
+
+`$CLIENT_PID` is the subshell wrapping tsx; killing it signals the child
+on every supported platform. We use this in the cleanup step instead of
+`pkill -f` to avoid matching unrelated processes that happen to share the
+agent-id substring.
 
 On WS registration, `agent_policies` auto-inserts a row keyed by `agent_id`
 with `owner_wallet=<your wallet>` and empty `allowed_callers` (publicly
@@ -341,23 +350,24 @@ access granted" bug would show up here as an unexpected 200.
 ## Cleanup
 
 ```bash
-pkill -f "tsx.*cli.ts.*$AGENT_ID"
+kill "$CLIENT_PID" 2>/dev/null || true
 
 curl -s -X POST "$BRIDGE_URL/graphql" \
   -H "Authorization: Bearer $CALLER_TOKEN" -H 'Content-Type: application/json' \
   -d "{\"query\":\"mutation{deleteClientById(input:{id:\\\"${CLIENT_ID}\\\"}){deletedClientId}}\"}"
 # ON DELETE CASCADE on agent_policies.client_id drops the policy row too.
 
-rm /tmp/siwe.json /tmp/echo-card.json packages/admin-ui/gen-siwe.mjs
+rm /tmp/siwe.json /tmp/echo-card.json
 ```
 
 The `callers` row backing your opaque token expires on its own. For
 SIWE-issued tokens, `expires_in` is inherited from the SIWE message's
 `expirationTime` (clamped to a 7-day server maximum, see
 `MAX_TOKEN_TTL_MS` in `packages/server/src/siwe-token.ts`); the ~60 min
-you saw above comes from `gen-siwe.mjs` setting `expirationTime` to +1 h
-— change the script to extend. Self-revoke is not exposed; only
-`ADMIN_WALLET_ADDRESSES` callers can invoke `revoke_caller_token`.
+you saw above comes from the SIWE script setting `expirationTime` to
+`now + 1h` — extend that to get a longer token. Self-revoke is not
+exposed; only `ADMIN_WALLET_ADDRESSES` callers can invoke
+`revoke_caller_token`.
 
 ## Gotchas
 
@@ -392,7 +402,7 @@ you saw above comes from `gen-siwe.mjs` setting `expirationTime` to +1 h
 - **Token lifetimes differ by issuance path** — Google device-flow tokens
   have a fixed ~90-day `expires_in`. SIWE-exchange tokens inherit
   `expires_in` from the SIWE message's `expirationTime` (capped at 7
-  days); in this walkthrough `gen-siwe.mjs` sets +1 h, which is why the
+  days); in this walkthrough the SIWE script sets +1 h, which is why the
   returned `expires_in` is ~3595 s. Treat both as durable secrets in
   tests; don't commit them.
 
