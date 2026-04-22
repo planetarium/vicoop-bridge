@@ -93,15 +93,17 @@ interface ChatSendAck {
 
 type EventHandler = (evt: EventFrame) => void;
 
+type ClientState = 'idle' | 'connecting' | 'ready' | 'closed';
+
 class GatewayClient {
   private ws: WebSocket | null = null;
   private pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   private eventHandlers = new Set<EventHandler>();
-  private ready: Promise<void> | null = null;
+  private _state: ClientState = 'idle';
+  private readyPromise: Promise<void> | null = null;
   private readyResolve: (() => void) | null = null;
   private readyReject: ((err: Error) => void) | null = null;
   private nonce: string | null = null;
-  private stopped = false;
   private identity: DeviceIdentity;
 
   constructor(
@@ -112,69 +114,30 @@ class GatewayClient {
     this.identity = generateDeviceIdentity();
   }
 
+  get state(): ClientState {
+    return this._state;
+  }
+
   connect(): Promise<void> {
-    if (this.ready) return this.ready;
-    this.ready = new Promise<void>((resolve, reject) => {
+    if (this._state === 'ready') return Promise.resolve();
+    if (this._state === 'connecting') return this.readyPromise!;
+    if (this._state === 'closed') {
+      return Promise.reject(new Error('gateway client closed'));
+    }
+
+    this._state = 'connecting';
+    this.readyPromise = new Promise<void>((resolve, reject) => {
       this.readyResolve = resolve;
       this.readyReject = reject;
     });
 
     const ws = new WebSocket(this.url);
     this.ws = ws;
+    ws.on('message', (raw) => this.handleMessage(raw));
+    ws.on('close', () => this.onClosed(new Error('gateway websocket closed')));
+    ws.on('error', (err) => this.onClosed(err as Error));
 
-    ws.on('message', (raw) => {
-      let frame: Frame;
-      try {
-        frame = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf8')) as Frame;
-      } catch {
-        return;
-      }
-      if (frame.type === 'event' && frame.event === 'connect.challenge') {
-        const p = frame.payload as { nonce?: string } | undefined;
-        this.nonce = p?.nonce?.trim() ?? null;
-        if (!this.nonce) {
-          this.fail(new Error('gateway sent empty connect nonce'));
-          return;
-        }
-        this.sendConnect();
-        return;
-      }
-      if (frame.type === 'res') {
-        const pending = this.pending.get(frame.id);
-        if (!pending) return;
-        this.pending.delete(frame.id);
-        if (frame.ok) pending.resolve(frame.payload);
-        else pending.reject(new Error(frame.error?.message ?? 'gateway error'));
-        return;
-      }
-      if (frame.type === 'event') {
-        for (const h of this.eventHandlers) h(frame);
-      }
-    });
-
-    ws.on('close', () => {
-      const err = new Error('gateway websocket closed');
-      for (const p of this.pending.values()) p.reject(err);
-      this.pending.clear();
-      if (this.readyReject && this.ready) {
-        this.readyReject(err);
-      }
-      this.ws = null;
-      this.ready = null;
-      if (!this.stopped) this.onError?.(err);
-    });
-
-    ws.on('error', (err) => {
-      this.onError?.(err as Error);
-      if (this.readyReject) this.readyReject(err as Error);
-    });
-
-    return this.ready;
-  }
-
-  stop(): void {
-    this.stopped = true;
-    this.ws?.close();
+    return this.readyPromise;
   }
 
   onEvent(handler: EventHandler): () => void {
@@ -197,10 +160,52 @@ class GatewayClient {
     });
   }
 
-  private fail(err: Error) {
-    this.readyReject?.(err);
+  private handleMessage(raw: WebSocket.RawData | string): void {
+    let frame: Frame;
+    try {
+      frame = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf8')) as Frame;
+    } catch {
+      return;
+    }
+    if (frame.type === 'event' && frame.event === 'connect.challenge') {
+      const p = frame.payload as { nonce?: string } | undefined;
+      this.nonce = p?.nonce?.trim() ?? null;
+      if (!this.nonce) {
+        this.abortWith(new Error('gateway sent empty connect nonce'));
+        return;
+      }
+      void this.sendConnect();
+      return;
+    }
+    if (frame.type === 'res') {
+      const pending = this.pending.get(frame.id);
+      if (!pending) return;
+      this.pending.delete(frame.id);
+      if (frame.ok) pending.resolve(frame.payload);
+      else pending.reject(new Error(frame.error?.message ?? 'gateway error'));
+      return;
+    }
+    if (frame.type === 'event') {
+      for (const h of this.eventHandlers) h(frame);
+    }
+  }
+
+  private onClosed(err: Error): void {
+    if (this._state === 'closed') return;
+    const wasConnecting = this._state === 'connecting';
+    this._state = 'closed';
+    for (const p of this.pending.values()) p.reject(err);
+    this.pending.clear();
+    if (wasConnecting) this.readyReject?.(err);
+    this.readyResolve = null;
+    this.readyReject = null;
+    this.ws = null;
     this.onError?.(err);
+  }
+
+  private abortWith(err: Error): void {
     this.ws?.close();
+    this.onClosed(err);
   }
 
   private async sendConnect(): Promise<void> {
@@ -244,9 +249,12 @@ class GatewayClient {
         },
       };
       await this.request('connect', params);
-      this.readyResolve?.();
+      if (this._state === 'connecting') {
+        this._state = 'ready';
+        this.readyResolve?.();
+      }
     } catch (err) {
-      this.fail(err as Error);
+      this.abortWith(err as Error);
     }
   }
 }
@@ -291,32 +299,40 @@ export function createOpenclawBackend(
   const sessionPrefix = opts.sessionKeyPrefix ?? 'agent';
   const debug = opts.debug ?? process.env.OPENCLAW_DEBUG === '1';
 
-  let client: GatewayClient | null = null;
+  let current: GatewayClient | null = null;
+  let connecting: Promise<GatewayClient> | null = null;
   const runToTask = new Map<string, { taskId: string; sessionKey: string }>();
   const taskFinalizers = new Map<string, (evt: ChatEventPayload) => void>();
 
   async function ensureConnected(): Promise<GatewayClient> {
-    if (client) return client;
-    client = new GatewayClient(url, token, (err) => {
+    if (current && current.state === 'ready') return current;
+    if (connecting) return connecting;
+    const c = new GatewayClient(url, token, (err) => {
       console.error('[openclaw] connection error:', err.message);
-      client = null;
+      if (current === c) current = null;
     });
-    await client.connect();
-    console.log(`[openclaw] connected ${url}`);
-
-    client.onEvent((evt) => {
-      if (evt.event !== 'chat') return;
-      const p = evt.payload as ChatEventPayload | undefined;
-      if (!p?.runId) return;
-      if (debug) {
-        console.log('[openclaw] chat event:', JSON.stringify(p).slice(0, 500));
+    connecting = (async () => {
+      try {
+        await c.connect();
+        console.log(`[openclaw] connected ${url}`);
+        c.onEvent((evt) => {
+          if (evt.event !== 'chat') return;
+          const p = evt.payload as ChatEventPayload | undefined;
+          if (!p?.runId) return;
+          if (debug) {
+            console.log('[openclaw] chat event:', JSON.stringify(p).slice(0, 500));
+          }
+          const binding = runToTask.get(p.runId);
+          if (!binding) return;
+          taskFinalizers.get(binding.taskId)?.(p);
+        });
+        current = c;
+        return c;
+      } finally {
+        connecting = null;
       }
-      const binding = runToTask.get(p.runId);
-      if (!binding) return;
-      const finalizer = taskFinalizers.get(binding.taskId);
-      finalizer?.(p);
-    });
-    return client;
+    })();
+    return connecting;
   }
 
   return {
@@ -414,10 +430,10 @@ export function createOpenclawBackend(
 
     async cancel(taskId) {
       const entry = [...runToTask.entries()].find(([, v]) => v.taskId === taskId);
-      if (!entry || !client) return;
+      if (!entry || !current) return;
       const [runId, binding] = entry;
       try {
-        await client.request('chat.abort', { sessionKey: binding.sessionKey, runId });
+        await current.request('chat.abort', { sessionKey: binding.sessionKey, runId });
       } catch (err) {
         console.error('[openclaw] abort failed:', (err as Error).message);
       }

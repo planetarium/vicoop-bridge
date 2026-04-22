@@ -170,4 +170,111 @@ test('happy path: chat.send → final event → task completes', async () => {
   }
 });
 
+test('concurrent first-connect: shares one WebSocket across parallel handle() calls', async () => {
+  let pendingConnectId: string | null = null;
+  const pendingChats: Array<{ sock: WebSocket; id: string; runId: string }> = [];
+  const fake = await createFakeGateway({
+    autoHandshake: false,
+    onRequest: (sock, req) => {
+      if (req.method === 'connect') {
+        pendingConnectId = req.id;
+        return;
+      }
+      if (req.method === 'chat.send') {
+        const params = req.params as { idempotencyKey: string };
+        pendingChats.push({ sock, id: req.id, runId: `run-${params.idempotencyKey}` });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const framesA: UpFrame[] = [];
+    const framesB: UpFrame[] = [];
+    const pA = backend.handle(makeTask('tA', 'a'), (f) => framesA.push(f));
+    const pB = backend.handle(makeTask('tB', 'b'), (f) => framesB.push(f));
+    // Give both handle() calls time to subscribe and reach the connect phase.
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(fake.connections.length, 1, 'only one WebSocket should be accepted');
+    assert.ok(pendingConnectId, 'connect request should have arrived');
+    // Complete handshake. Both handle() calls then send chat.send on the same socket.
+    const sock = fake.connections[0];
+    fake.respond(sock, pendingConnectId!, {});
+    // Wait for both chat.send to arrive, then ack each and emit finals on later ticks
+    // so that handle() has time to register runToTask/taskFinalizers.
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(pendingChats.length, 2, 'both chat.send requests should arrive');
+    for (const c of pendingChats) {
+      fake.respond(c.sock, c.id, { runId: c.runId, status: 'started' });
+    }
+    await new Promise((r) => setTimeout(r, 20));
+    for (const c of pendingChats) {
+      fake.emitChat(c.sock, {
+        runId: c.runId,
+        sessionKey: 'agent:main:x',
+        seq: 1,
+        state: 'final',
+        message: { text: c.runId },
+      });
+    }
+    await Promise.all([pA, pB]);
+    assert.equal(fake.connections.length, 1, 'no additional WebSocket opened after handshake');
+    const finalA = framesA.find((f) => f.type === 'task.complete');
+    const finalB = framesB.find((f) => f.type === 'task.complete');
+    assert.ok(finalA && finalA.status.state === 'completed');
+    assert.ok(finalB && finalB.status.state === 'completed');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('reconnect: after gateway close, next handle() opens a fresh WebSocket', async () => {
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        const runId = `run-${(req.params as { idempotencyKey: string }).idempotencyKey}`;
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId, status: 'started' },
+          }),
+        );
+        // Space the final well past the ack so handle() can register runToTask.
+        setTimeout(() => {
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId,
+                sessionKey: 'agent:main:ctx',
+                seq: 1,
+                state: 'final',
+                message: { text: 'ok' },
+              },
+            }),
+          );
+        }, 20);
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const framesA: UpFrame[] = [];
+    await backend.handle(makeTask('tA', 'a'), (f) => framesA.push(f));
+    const sock0 = await fake.waitForConnection(0);
+    await fake.closeSocket(sock0);
+    // Let the client process the WebSocket close event.
+    await new Promise((r) => setTimeout(r, 20));
+    const framesB: UpFrame[] = [];
+    await backend.handle(makeTask('tB', 'b'), (f) => framesB.push(f));
+    assert.equal(fake.connections.length, 2, 'a fresh WebSocket should be opened for the second task');
+    assert.ok(framesA.find((f) => f.type === 'task.complete'));
+    assert.ok(framesB.find((f) => f.type === 'task.complete'));
+  } finally {
+    await fake.close();
+  }
+});
+
 export { createFakeGateway, makeTask };
