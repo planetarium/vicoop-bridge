@@ -330,10 +330,30 @@ export function createOpenclawBackend(
   const runToTask = new Map<string, { taskId: string; sessionKey: string }>();
   const taskFinalizers = new Map<string, (evt: FinalizerEvent) => void>();
   const pendingRunEvents = new Map<string, ChatEventPayload[]>();
+  // Bounded memory of recently-finalized runIds. Any chat event carrying one
+  // of these is dropped instead of buffered in pendingRunEvents, so late or
+  // duplicate deltas from OpenClaw cannot accumulate forever after the task
+  // has already emitted its terminal frame.
+  const recentlyFinalizedRuns = new Set<string>();
+  const MAX_FINALIZED_RUNS = 512;
+  const MAX_BUFFERED_EVENTS_PER_RUN = 64;
+
+  function markRunFinalized(runId: string): void {
+    if (recentlyFinalizedRuns.has(runId)) return;
+    recentlyFinalizedRuns.add(runId);
+    if (recentlyFinalizedRuns.size > MAX_FINALIZED_RUNS) {
+      const oldest = recentlyFinalizedRuns.values().next().value;
+      if (oldest !== undefined) recentlyFinalizedRuns.delete(oldest);
+    }
+  }
 
   function handleGatewayClose(c: GatewayClient, err: Error): void {
     console.error('[openclaw] connection error:', err.message);
     if (current === c) current = null;
+    // Drop any orphaned event buffers and finalization memory — runIds are
+    // scoped to a single gateway session, so a reconnect starts clean.
+    pendingRunEvents.clear();
+    recentlyFinalizedRuns.clear();
     // Fail every in-flight task that was running on this client so handle()
     // does not hang forever waiting for a terminal event that can never come.
     if (taskFinalizers.size === 0) return;
@@ -366,9 +386,13 @@ export function createOpenclawBackend(
           }
           const binding = runToTask.get(p.runId);
           if (!binding) {
+            // Late or duplicate event for a run whose task already finalized:
+            // drop without buffering so memory stays bounded.
+            if (recentlyFinalizedRuns.has(p.runId)) return;
             // Event arrived before handle() finished registering the runId.
             // Buffer until the handler catches up and drains it.
             const buf = pendingRunEvents.get(p.runId) ?? [];
+            if (buf.length >= MAX_BUFFERED_EVENTS_PER_RUN) buf.shift();
             buf.push(p);
             pendingRunEvents.set(p.runId, buf);
             return;
@@ -442,10 +466,18 @@ export function createOpenclawBackend(
             ...(thinking ? { thinking } : {}),
           });
         } catch (err) {
+          // A close between send and ack rejects the pending request AND
+          // resolves `settled` via the close listener. Since we bail out
+          // here without awaiting `settled`, surface the gateway-closed
+          // cause directly so the caller gets a precise error code.
+          const closed = gw.state === 'closed';
           emit({
             type: 'task.fail',
             taskId: task.taskId,
-            error: { code: 'gateway_send_failed', message: (err as Error).message },
+            error: {
+              code: closed ? 'gateway_closed' : 'gateway_send_failed',
+              message: (err as Error).message,
+            },
           });
           return;
         }
@@ -531,6 +563,7 @@ export function createOpenclawBackend(
         if (runId) {
           runToTask.delete(runId);
           pendingRunEvents.delete(runId);
+          markRunFinalized(runId);
         }
       }
     },

@@ -398,6 +398,94 @@ test('cancel: issues chat.abort and lets aborted terminal event complete the tas
   }
 });
 
+test('gateway close before ack emits gateway_closed (not gateway_send_failed)', async () => {
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        // Close the socket before acking so the pending request rejects
+        // due to the close listener.
+        setImmediate(() => sock.close(1000));
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f));
+    const fail = frames.find((f) => f.type === 'task.fail');
+    assert.ok(fail, 'task must fail');
+    assert.equal(fail!.error.code, 'gateway_closed');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('late duplicate chat event for finalized run is dropped, not buffered', async () => {
+  // After a task terminates, the gateway can still emit late deltas for
+  // the same runId (e.g. a trailing log). Those must not accumulate in
+  // pendingRunEvents — the second task should run normally with no side
+  // effects, and the backend should stay usable across many completions.
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        const runId = `run-${(req.params as { idempotencyKey: string }).idempotencyKey}`;
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId, status: 'started' },
+          }),
+        );
+        setImmediate(() => {
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId,
+                sessionKey: 'x',
+                seq: 1,
+                state: 'final',
+                message: { text: 'ok' },
+              },
+            }),
+          );
+          // Late duplicate after the terminal event.
+          setImmediate(() => {
+            sock.send(
+              JSON.stringify({
+                type: 'event',
+                event: 'chat',
+                payload: {
+                  runId,
+                  sessionKey: 'x',
+                  seq: 2,
+                  state: 'delta',
+                  message: { text: 'late' },
+                },
+              }),
+            );
+          });
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const framesA: UpFrame[] = [];
+    await backend.handle(makeTask('tA', 'hi'), (f) => framesA.push(f));
+    assert.ok(framesA.find((f) => f.type === 'task.complete'));
+    // Give the late duplicate time to arrive and be dropped.
+    await new Promise((r) => setTimeout(r, 30));
+    const framesB: UpFrame[] = [];
+    await backend.handle(makeTask('tB', 'hi'), (f) => framesB.push(f));
+    assert.ok(framesB.find((f) => f.type === 'task.complete'));
+  } finally {
+    await fake.close();
+  }
+});
+
 test('gateway close mid-run fails in-flight task deterministically', async () => {
   const fake = await createFakeGateway({
     onRequest: (sock, req) => {
