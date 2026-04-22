@@ -71,13 +71,15 @@ test(
       const caller = await verifyCallerToken(sql, body.access_token as string);
       assert.equal(caller.principalId, `eth:${address.toLowerCase()}`);
 
+      const principalId = `eth:${address.toLowerCase()}`;
       const rows = await sql<
         { provider: string; principal_id: string }[]
-      >`SELECT provider, principal_id FROM callers WHERE principal_id = ${`eth:${address.toLowerCase()}`}`;
+      >`SELECT provider, principal_id FROM callers WHERE principal_id = ${principalId}`;
       assert.equal(rows.length, 1);
       assert.equal(rows[0]!.provider, 'siwe');
 
-      await sql`DELETE FROM callers WHERE principal_id = ${`eth:${address.toLowerCase()}`}`;
+      await sql`DELETE FROM callers WHERE principal_id = ${principalId}`;
+      await sql`DELETE FROM used_siwe_nonces WHERE principal_id = ${principalId}`;
     } finally {
       await sql.end();
     }

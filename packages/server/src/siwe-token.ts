@@ -8,6 +8,14 @@ export const MAX_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // effective lifetime (relative to now) far greater than the intended 7-day max.
 const ISSUED_AT_SKEW_MS = 2 * 60 * 1000;
 
+// Clients often compute issuedAt and expirationTime from separate time reads
+// (`new Date().toISOString()` followed by `new Date(Date.now() + 7d)`), so
+// `expires - issued` can land a handful of milliseconds over a nominal 7-day
+// target. Allow a small slop here so honest clients aiming for exactly 7 days
+// aren't rejected by sub-millisecond scheduling jitter. 1 second is far below
+// the granularity of anything that would meaningfully extend the cap.
+const TTL_CAP_SLOP_MS = 1000;
+
 // Verify a SIWE (message, signature) pair and return the recovered wallet
 // address. Throws on any failure (malformed fields, TTL over cap, future
 // issuedAt, signature mismatch, domain mismatch).
@@ -32,7 +40,7 @@ export async function verifySiweMessage(
   if (expires <= issued) {
     throw new Error('SIWE message expirationTime must be after issuedAt');
   }
-  if (expires - issued > MAX_TOKEN_TTL_MS) {
+  if (expires - issued > MAX_TOKEN_TTL_MS + TTL_CAP_SLOP_MS) {
     throw new Error('SIWE message TTL exceeds maximum allowed duration');
   }
   if (issued > Date.now() + ISSUED_AT_SKEW_MS) {

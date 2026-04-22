@@ -21,6 +21,10 @@ export function WalletAuth() {
     setError(null);
 
     try {
+      // Share a single base timestamp between issuedAt and expirationTime so
+      // their difference is exactly 7 days. Two separate Date reads can drift
+      // a few ms apart and push `expires - issued` over the server's cap.
+      const now = Date.now();
       const siweMessage = new SiweMessage({
         domain: window.location.hostname,
         address,
@@ -29,8 +33,8 @@ export function WalletAuth() {
         version: '1',
         chainId,
         nonce: crypto.randomUUID().replace(/-/g, ''),
-        issuedAt: new Date().toISOString(),
-        expirationTime: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        issuedAt: new Date(now).toISOString(),
+        expirationTime: new Date(now + 7 * 24 * 60 * 60 * 1000).toISOString(),
       });
 
       const message = siweMessage.prepareMessage();

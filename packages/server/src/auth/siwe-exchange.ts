@@ -78,42 +78,55 @@ export function mountSiweExchange(app: Hono, opts: SiweExchangeOptions): void {
 
     const principalId = `eth:${walletAddress.toLowerCase()}`;
 
-    // Single-use nonce enforcement. Without this, an attacker who intercepted
-    // a valid SIWE (message, signature) could mint fresh vbc_caller_* tokens
-    // until the SIWE expirationTime, defeating per-token revocation. The
-    // primary key is (principal_id, nonce) — a bogus signature producing a
-    // different recovered address only burns its own nonce row, so a valid
-    // signer's nonce cannot be pre-burned by an attacker.
-    const nonceInsert = await opts.sql`
-      INSERT INTO used_siwe_nonces (principal_id, nonce, expires_at)
-      VALUES (${principalId}, ${nonce}, ${new Date(expiresAtMs)})
-      ON CONFLICT DO NOTHING
-      RETURNING principal_id
-    `;
-    if (nonceInsert.length === 0) {
+    // Nonce consumption and caller-token issuance must be atomic. If
+    // issueCallerToken throws (DB error, connection drop, serialization
+    // failure), an un-wrapped nonce insert would stay committed and the
+    // caller would have to re-sign a fresh SIWE even though no token was
+    // minted. Single-use nonce enforcement still holds — ON CONFLICT DO
+    // NOTHING returns an empty RETURNING on replay, which we map to 401.
+    try {
+      return await opts.sql.begin(async (tx) => {
+        const nonceInsert = await tx`
+          INSERT INTO used_siwe_nonces (principal_id, nonce, expires_at)
+          VALUES (${principalId}, ${nonce}, ${new Date(expiresAtMs)})
+          ON CONFLICT DO NOTHING
+          RETURNING principal_id
+        `;
+        if (nonceInsert.length === 0) {
+          return c.json(
+            {
+              error: 'invalid_grant',
+              error_description: 'SIWE nonce already used — sign a fresh message',
+            },
+            401,
+          );
+        }
+
+        const issued = await issueCallerToken(tx as unknown as typeof opts.sql, {
+          principalId,
+          provider: 'siwe',
+          ttlMs,
+        });
+
+        const expiresInSec = Math.max(
+          0,
+          Math.floor((issued.expiresAt.getTime() - Date.now()) / 1000),
+        );
+        return c.json({
+          access_token: issued.rawToken,
+          token_type: 'Bearer',
+          expires_in: expiresInSec,
+        });
+      });
+    } catch (err) {
+      console.error('[siwe-exchange] transaction failed:', err);
       return c.json(
         {
-          error: 'invalid_grant',
-          error_description: 'SIWE nonce already used — sign a fresh message',
+          error: 'server_error',
+          error_description: 'Failed to exchange SIWE message',
         },
-        401,
+        500,
       );
     }
-
-    const issued = await issueCallerToken(opts.sql, {
-      principalId,
-      provider: 'siwe',
-      ttlMs,
-    });
-
-    const expiresInSec = Math.max(
-      0,
-      Math.floor((issued.expiresAt.getTime() - Date.now()) / 1000),
-    );
-    return c.json({
-      access_token: issued.rawToken,
-      token_type: 'Bearer',
-      expires_in: expiresInSec,
-    });
   });
 }
