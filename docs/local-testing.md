@@ -6,6 +6,9 @@ tokens (`vbc_caller_*`); they differ only in how the token is **issued**:
 direct DB insert (Path A — smoke test), Google device flow (Path B), or SIWE
 exchange (Path C).
 
+> For validating a **deployed** bridge from a local workstation (no DB
+> access, no admin wallet required), see [`remote-testing.md`](./remote-testing.md).
+
 ## Prerequisites
 
 - PostgreSQL 15+ running locally
