@@ -214,36 +214,49 @@ test(
 );
 
 test(
-  'exchanging twice for the same SIWE yields two distinct tokens tied to same principal',
+  'replaying the same SIWE is rejected on the second exchange',
   { skip: !hasDb },
   async () => {
     const sql = postgres(process.env.DATABASE_URL!);
     try {
       const app = buildApp(sql);
       const { message, signature, address } = await buildSignedSiwe();
+      const principalId = `eth:${address.toLowerCase()}`;
 
       const resA = await app.request('/auth/siwe/exchange', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ message, signature }),
       });
+      assert.equal(resA.status, 200);
       const bodyA = (await resA.json()) as { access_token: string };
 
+      // Second attempt with the same (message, signature) must be rejected:
+      // the nonce has been consumed. Without this guard, an attacker who
+      // intercepted the SIWE could mint fresh tokens after the first one
+      // was revoked, defeating per-token revocation.
       const resB = await app.request('/auth/siwe/exchange', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ message, signature }),
       });
-      const bodyB = (await resB.json()) as { access_token: string };
+      assert.equal(resB.status, 401);
+      const bodyB = (await resB.json()) as Record<string, unknown>;
+      assert.equal(bodyB.error, 'invalid_grant');
+      assert.match(String(bodyB.error_description), /nonce/i);
 
-      assert.notEqual(bodyA.access_token, bodyB.access_token);
+      // The first token must still be valid — replay protection doesn't
+      // invalidate legitimately issued tokens.
+      const caller = await verifyCallerToken(sql, bodyA.access_token);
+      assert.equal(caller.principalId, principalId);
 
-      const callerA = await verifyCallerToken(sql, bodyA.access_token);
-      const callerB = await verifyCallerToken(sql, bodyB.access_token);
-      assert.equal(callerA.principalId, `eth:${address.toLowerCase()}`);
-      assert.equal(callerB.principalId, callerA.principalId);
+      const callerRows = await sql<
+        { n: number }[]
+      >`SELECT count(*)::int AS n FROM callers WHERE principal_id = ${principalId}`;
+      assert.equal(callerRows[0]!.n, 1);
 
-      await sql`DELETE FROM callers WHERE principal_id = ${`eth:${address.toLowerCase()}`}`;
+      await sql`DELETE FROM callers WHERE principal_id = ${principalId}`;
+      await sql`DELETE FROM used_siwe_nonces WHERE principal_id = ${principalId}`;
     } finally {
       await sql.end();
     }

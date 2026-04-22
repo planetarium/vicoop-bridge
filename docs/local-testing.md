@@ -225,6 +225,9 @@ const PRIVATE_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf
 
 const account = privateKeyToAccount(PRIVATE_KEY);
 console.error(`# wallet: ${account.address}`);
+// Fresh nonce per invocation: `/auth/siwe/exchange` enforces single-use per
+// (principal, nonce), so a fixed literal would cause the second run to fail.
+const nonce = crypto.randomUUID().replace(/-/g, '');
 const msg = new SiweMessage({
   domain: DOMAIN,
   address: account.address,
@@ -232,7 +235,7 @@ const msg = new SiweMessage({
   uri: URI,
   version: '1',
   chainId: 1,
-  nonce: 'testnonce0123456789abcdef',
+  nonce,
   issuedAt: new Date().toISOString(),
   expirationTime: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
 });

@@ -508,6 +508,31 @@ CREATE POLICY device_sessions_postgraphile ON device_sessions
 
 COMMENT ON TABLE device_sessions IS E'@omit';
 
+-- Consumed SIWE nonces, scoped per (principal_id, nonce). Prevents replay of a
+-- captured (message, signature) at POST /auth/siwe/exchange: without this, an
+-- attacker who intercepted a valid SIWE could mint fresh vbc_caller_* tokens
+-- until SIWE expirationTime, defeating per-token revocation. The per-principal
+-- scoping means a bogus signature (→ wrong recovered principal) can only burn
+-- its own nonce, not a legitimate signer's.
+CREATE TABLE IF NOT EXISTS used_siwe_nonces (
+  principal_id    TEXT NOT NULL,
+  nonce           TEXT NOT NULL,
+  expires_at      TIMESTAMPTZ NOT NULL,
+  used_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (principal_id, nonce)
+);
+
+CREATE INDEX IF NOT EXISTS used_siwe_nonces_expires_idx
+  ON used_siwe_nonces(expires_at);
+
+ALTER TABLE used_siwe_nonces ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS used_siwe_nonces_postgraphile ON used_siwe_nonces;
+CREATE POLICY used_siwe_nonces_postgraphile ON used_siwe_nonces
+  FOR ALL TO app_postgraphile USING (true) WITH CHECK (true);
+
+COMMENT ON TABLE used_siwe_nonces IS E'@omit';
+
 -- ============================================================
 -- 7. Grants
 -- ============================================================

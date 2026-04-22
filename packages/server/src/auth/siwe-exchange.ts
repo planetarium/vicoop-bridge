@@ -48,11 +48,15 @@ export function mountSiweExchange(app: Hono, opts: SiweExchangeOptions): void {
 
     let walletAddress: string;
     let expiresAtMs: number;
+    let nonce: string;
     try {
       walletAddress = await verifySiweMessage(message, signature, { domain: opts.domain });
-      // Re-parse only to read expirationTime for TTL; verifySiweMessage
-      // already validated it exists and is a valid date.
-      expiresAtMs = new Date(new SiweMessage(message).expirationTime!).getTime();
+      // Re-parse only to read expirationTime + nonce; verifySiweMessage
+      // already validated expirationTime exists and is a valid date, and
+      // siwe itself enforces a well-formed nonce on construction.
+      const parsed = new SiweMessage(message);
+      expiresAtMs = new Date(parsed.expirationTime!).getTime();
+      nonce = parsed.nonce;
     } catch (err) {
       return c.json(
         { error: 'invalid_grant', error_description: (err as Error).message },
@@ -61,9 +65,9 @@ export function mountSiweExchange(app: Hono, opts: SiweExchangeOptions): void {
     }
 
     // Clamp against the SIWE max TTL as a defense-in-depth measure alongside
-    // verifySiweToken's issuedAt check. Without clamping, a SIWE verified with
-    // a relaxed skew could still mint a caller token whose absolute lifetime
-    // (relative to now) exceeds MAX_TOKEN_TTL_MS.
+    // verifySiweMessage's issuedAt check. Without clamping, a SIWE verified
+    // with a relaxed skew could still mint a caller token whose absolute
+    // lifetime (relative to now) exceeds MAX_TOKEN_TTL_MS.
     const ttlMs = Math.min(MAX_TOKEN_TTL_MS, Math.max(0, expiresAtMs - Date.now()));
     if (ttlMs <= 0) {
       return c.json(
@@ -72,8 +76,32 @@ export function mountSiweExchange(app: Hono, opts: SiweExchangeOptions): void {
       );
     }
 
+    const principalId = `eth:${walletAddress.toLowerCase()}`;
+
+    // Single-use nonce enforcement. Without this, an attacker who intercepted
+    // a valid SIWE (message, signature) could mint fresh vbc_caller_* tokens
+    // until the SIWE expirationTime, defeating per-token revocation. The
+    // primary key is (principal_id, nonce) — a bogus signature producing a
+    // different recovered address only burns its own nonce row, so a valid
+    // signer's nonce cannot be pre-burned by an attacker.
+    const nonceInsert = await opts.sql`
+      INSERT INTO used_siwe_nonces (principal_id, nonce, expires_at)
+      VALUES (${principalId}, ${nonce}, ${new Date(expiresAtMs)})
+      ON CONFLICT DO NOTHING
+      RETURNING principal_id
+    `;
+    if (nonceInsert.length === 0) {
+      return c.json(
+        {
+          error: 'invalid_grant',
+          error_description: 'SIWE nonce already used — sign a fresh message',
+        },
+        401,
+      );
+    }
+
     const issued = await issueCallerToken(opts.sql, {
-      principalId: `eth:${walletAddress.toLowerCase()}`,
+      principalId,
       provider: 'siwe',
       ttlMs,
     });
