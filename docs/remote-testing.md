@@ -174,7 +174,8 @@ curl -s -X POST "$BRIDGE_URL/agents/$AGENT_ID" \
 ## Step 5 — Restrict with `add_caller`
 
 `POST /` is the admin agent — a Claude-backed A2A endpoint with tools like
-`add_caller`, `remove_caller`, `list_agents`, `list_caller_tokens`. It requires
+`add_caller`, `remove_caller`, `list_active_agents`, `list_callers`,
+`list_caller_tokens`, `revoke_caller_token`. It requires
 an `eth:*` caller token (not admin membership); tool execution runs under RLS
 with your wallet as the authenticated principal, so mutations on agents you
 own are authorized.
@@ -205,12 +206,12 @@ BODY='{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"mess
 curl -s -o /dev/null -w "%{http_code}\n" -X POST "$BRIDGE_URL/agents/$AGENT_ID" \
   -H 'Content-Type: application/json' -d "$BODY"
 
-# wrong bearer → 401 "Caller token not found"
+# wrong bearer → 401 "Invalid bearer token: Caller token not found"
 curl -s -X POST "$BRIDGE_URL/agents/$AGENT_ID" \
   -H 'Authorization: Bearer vbc_caller_WRONG' \
   -H 'Content-Type: application/json' -d "$BODY"
 
-# raw SIWE signature → 401 "expected vbc_caller_* prefix"
+# raw SIWE signature → 401 "Invalid bearer token: expected vbc_caller_* prefix. Acquire one via /auth/siwe/exchange (SIWE) or /oauth/token (device flow)."
 SIG=$(jq -r .signature /tmp/siwe.json)
 curl -s -X POST "$BRIDGE_URL/agents/$AGENT_ID" \
   -H "Authorization: Bearer $SIG" \
@@ -234,7 +235,7 @@ principals and cannot call `register_client` or modify their own
 
 ```bash
 # Choose one:
-GOOGLE_PRINCIPAL="google:email:you@company.com"   # exact email (pins to sub on first dispatch)
+GOOGLE_PRINCIPAL="google:email:you@company.com"   # matches on verified email equality
 # GOOGLE_PRINCIPAL="google:domain:company.com"    # any verified Workspace account at this domain
 # GOOGLE_PRINCIPAL="google:sub:123456789"         # stable Google subject id (if known)
 
@@ -245,10 +246,16 @@ curl -s -X POST "$BRIDGE_URL/" \
 ```
 
 Add the caller **before** running the device flow. The issued token's
-`principal_id` is set at issuance time (`google:sub:<sub>`), but
-`matchPrincipal` on dispatch accepts any of `google:sub:*`, `google:email:*`
-(when verified email matches), and `google:domain:*` (matches verified `hd`
-claim or `@domain` email suffix).
+`principal_id` is set at issuance time (`google:<sub>`), and
+`matchPrincipal` (see `packages/server/src/auth/principal.ts`) checks each
+`allowed_callers` entry independently on every request:
+
+- `google:sub:<sub>` — exact `principal_id` equality.
+- `google:email:<addr>` — the caller's verified email matches the entry
+  exactly (case-insensitive). The entry is never rewritten; changing the
+  email on the Google account invalidates the match.
+- `google:domain:<d>` — `emailVerified=true` and either the `hd` claim
+  equals the entry or the verified email ends in `@<d>`.
 
 ### Step 5b — Device flow
 
@@ -272,17 +279,35 @@ stops the flow cold:
 
 ### Step 5c — Poll for the token
 
+`/oauth/token` returns HTTP 400 with `{"error":"authorization_pending"}`
+while the user is still on the consent screen, then HTTP 200 with the token
+once they approve. Loop until you get an `access_token` or a non-pending
+error.
+
 ```bash
-GOOGLE_TOKEN=$(curl -sX POST "$BRIDGE_URL/oauth/token" \
-  -d 'grant_type=urn:ietf:params:oauth:grant-type:device_code' \
-  --data-urlencode "device_code=$DEVICE_CODE" \
-  | jq -r .access_token)
+GOOGLE_TOKEN=""
+while :; do
+  RESP=$(curl -sX POST "$BRIDGE_URL/oauth/token" \
+    -d 'grant_type=urn:ietf:params:oauth:grant-type:device_code' \
+    --data-urlencode "device_code=$DEVICE_CODE")
+  TOK=$(echo "$RESP" | jq -r '.access_token // empty')
+  if [ -n "$TOK" ]; then
+    GOOGLE_TOKEN="$TOK"; break
+  fi
+  ERR=$(echo "$RESP" | jq -r '.error // empty')
+  if [ "$ERR" != "authorization_pending" ] && [ "$ERR" != "slow_down" ]; then
+    echo "device flow aborted: $RESP" >&2; exit 1
+  fi
+  sleep 5
+done
 echo "$GOOGLE_TOKEN"
 # vbc_caller_...  (expires_in ≈ 90 days)
 ```
 
-While pending: `{"error":"authorization_pending"}` — loop with `sleep 5`. On
-approval: `{"access_token":"vbc_caller_...","token_type":"Bearer","expires_in":...}`.
+On approval the response is
+`{"access_token":"vbc_caller_...","token_type":"Bearer","expires_in":...}`.
+Terminal errors like `access_denied`, `expired_token`, or `invalid_grant`
+should stop the loop rather than retry.
 
 ### Step 6' — Auth matrix (Google variant)
 
@@ -347,10 +372,12 @@ callers can invoke `revoke_caller_token`.
 - **(Path B) Workspace-only deployments** — if the OAuth app is configured
   `Internal`, only same-Workspace accounts can complete the flow. Personal
   Gmail accounts fail with `access_denied` even if added as test users.
-- **(Path B) `google:email:*` pins to sub on first match** — after the first
-  successful dispatch, the entry binds to that Google account's `sub`. A
-  different Google account reusing the same email (rare but possible across
-  domain transfers) will no longer match.
+- **(Path B) `google:email:*` matches on the caller's current verified
+  email** — `matchPrincipal` compares the allowed entry against whatever
+  verified email Google returns for the token at dispatch time. The entry is
+  never rewritten, so if the same Google account later changes its primary
+  email (or a different account takes over the address), the match silently
+  breaks. Use `google:sub:*` for stable per-account binding.
 - **(Path B) Google-issued tokens are long-lived** — `expires_in` is ~90
   days, unlike SIWE-issued tokens (~60 min). Treat them as durable secrets
   in tests; don't commit them.
