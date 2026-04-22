@@ -10,9 +10,19 @@ This is the shortest path and matches the intended production flow:
 1. Sign SIWE with any EOA → exchange for an opaque caller token
 2. Register a client via the public GraphQL mutation → receive a raw client token
 3. Run a local echo backend connected over WSS
-4. Grant your wallet on the auto-created agent policy via `add_caller` (admin
+4. Grant a principal on the auto-created agent policy via `add_caller` (admin
    agent, RLS-owner-gated, not admin-only)
-5. Dispatch to `/agents/:id` with the same opaque token
+5. Dispatch to `/agents/:id` with an opaque token matching that principal
+
+Two dispatch-side variants are covered:
+
+- **Default (eth principal)** — caller uses the SIWE-issued opaque token
+  directly. Good for integrators whose callers are wallets.
+- **Google-authenticated caller** — principal is `google:email:*` /
+  `google:domain:*` / `google:sub:*`; the caller acquires a long-lived opaque
+  token via the OAuth device flow and uses that for dispatch. Setup (steps
+  1-3) still requires SIWE because `register_client` and `add_caller`
+  demand an eth-authenticated session.
 
 Contrast with [`local-testing.md`](./local-testing.md): that doc runs both
 server and client locally and uses `psql` to write `clients` /
@@ -212,6 +222,93 @@ curl -s -X POST "$BRIDGE_URL/agents/$AGENT_ID" \
   -H 'Content-Type: application/json' -d "$BODY"
 ```
 
+## Variant — Google-authenticated callers
+
+For validating that a deployed bridge accepts Google-issued opaque tokens,
+replace Steps 5-6 with the variant below. Steps 1-4 (SIWE exchange,
+registerClient, echo client) stay identical — Google callers have `google:*`
+principals and cannot call `register_client` or modify their own
+`agent_policies`, so setup must be done by an eth-authenticated wallet first.
+
+### Step 5a — `add_caller` with a Google principal
+
+```bash
+# Choose one:
+GOOGLE_PRINCIPAL="google:email:you@company.com"   # exact email (pins to sub on first dispatch)
+# GOOGLE_PRINCIPAL="google:domain:company.com"    # any verified Workspace account at this domain
+# GOOGLE_PRINCIPAL="google:sub:123456789"         # stable Google subject id (if known)
+
+curl -s -X POST "$BRIDGE_URL/" \
+  -H "Authorization: Bearer $CALLER_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"message/send\",\"params\":{\"message\":{\"messageId\":\"acg\",\"role\":\"user\",\"kind\":\"message\",\"parts\":[{\"kind\":\"text\",\"text\":\"Use the add_caller tool to add principal '${GOOGLE_PRINCIPAL}' to agent '${AGENT_ID}'.\"}]}}}" \
+  | jq -r '.result.status.message.parts[0].text'
+```
+
+Add the caller **before** running the device flow. The issued token's
+`principal_id` is set at issuance time (`google:sub:<sub>`), but
+`matchPrincipal` on dispatch accepts any of `google:sub:*`, `google:email:*`
+(when verified email matches), and `google:domain:*` (matches verified `hd`
+claim or `@domain` email suffix).
+
+### Step 5b — Device flow
+
+```bash
+DEV=$(curl -sX POST "$BRIDGE_URL/oauth/device/code")
+echo "$DEV" | jq
+DEVICE_CODE=$(echo "$DEV" | jq -r .device_code)
+VERIFY_URL=$(echo "$DEV" | jq -r .verification_uri_complete)
+echo "Open in browser: $VERIFY_URL"
+```
+
+The user opens `$VERIFY_URL`, signs in with Google, and approves. The
+consent-screen page shows `Approved as <email>` on success. Any of these
+stops the flow cold:
+
+- account not listed as a test user on the OAuth consent screen (unless the
+  app has been fully verified) → `access_denied`
+- app is configured for `Internal` user type on a Workspace account → only
+  same-workspace accounts can approve; personal Gmail accounts fail
+- user_code expired (10 min) → start over
+
+### Step 5c — Poll for the token
+
+```bash
+GOOGLE_TOKEN=$(curl -sX POST "$BRIDGE_URL/oauth/token" \
+  -d 'grant_type=urn:ietf:params:oauth:grant-type:device_code' \
+  --data-urlencode "device_code=$DEVICE_CODE" \
+  | jq -r .access_token)
+echo "$GOOGLE_TOKEN"
+# vbc_caller_...  (expires_in ≈ 90 days)
+```
+
+While pending: `{"error":"authorization_pending"}` — loop with `sleep 5`. On
+approval: `{"access_token":"vbc_caller_...","token_type":"Bearer","expires_in":...}`.
+
+### Step 6' — Auth matrix (Google variant)
+
+```bash
+BODY='{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"m","role":"user","kind":"message","parts":[{"kind":"text","text":"google test"}]}}}'
+
+# no bearer → 401
+curl -s -o /dev/null -w "%{http_code}\n" -X POST "$BRIDGE_URL/agents/$AGENT_ID" \
+  -H 'Content-Type: application/json' -d "$BODY"
+
+# SIWE/eth opaque token — 403 "Caller not authorized for this agent"
+# Token is valid, but eth:* principal is not in allowed_callers.
+curl -s -X POST "$BRIDGE_URL/agents/$AGENT_ID" \
+  -H "Authorization: Bearer $CALLER_TOKEN" \
+  -H 'Content-Type: application/json' -d "$BODY"
+
+# Google-issued token → 200 "echo: google test"
+curl -s -X POST "$BRIDGE_URL/agents/$AGENT_ID" \
+  -H "Authorization: Bearer $GOOGLE_TOKEN" \
+  -H 'Content-Type: application/json' -d "$BODY"
+```
+
+The `eth: vs google:` 403 is a useful assertion that the bridge
+discriminates provider-scoped principals correctly — a bare "token valid =
+access granted" bug would show up here as an unexpected 200.
+
 ## Cleanup
 
 ```bash
@@ -244,6 +341,19 @@ callers can invoke `revoke_caller_token`.
 - **Caller token verification cache is 60s** — admin-triggered
   `revoke_caller_token` propagates after the window. For an immediate kill
   switch, the server has to be restarted.
+- **(Path B) OAuth consent test-user gating** — a just-deployed bridge with a
+  non-verified Google OAuth app will reject any approver not listed as a test
+  user on the consent screen. Check this before blaming code.
+- **(Path B) Workspace-only deployments** — if the OAuth app is configured
+  `Internal`, only same-Workspace accounts can complete the flow. Personal
+  Gmail accounts fail with `access_denied` even if added as test users.
+- **(Path B) `google:email:*` pins to sub on first match** — after the first
+  successful dispatch, the entry binds to that Google account's `sub`. A
+  different Google account reusing the same email (rare but possible across
+  domain transfers) will no longer match.
+- **(Path B) Google-issued tokens are long-lived** — `expires_in` is ~90
+  days, unlike SIWE-issued tokens (~60 min). Treat them as durable secrets
+  in tests; don't commit them.
 
 ## When to use this vs `local-testing.md`
 
