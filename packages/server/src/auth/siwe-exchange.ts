@@ -15,7 +15,7 @@
 import type { Hono } from 'hono';
 import { SiweMessage } from 'siwe';
 import type { Sql } from '../db.js';
-import { verifySiweToken, encodeSiweToken } from '../siwe-token.js';
+import { verifySiweToken, encodeSiweToken, MAX_TOKEN_TTL_MS } from '../siwe-token.js';
 import { issueCallerToken } from './caller-token.js';
 
 export interface SiweExchangeOptions {
@@ -65,7 +65,11 @@ export function mountSiweExchange(app: Hono, opts: SiweExchangeOptions): void {
       );
     }
 
-    const ttlMs = Math.max(0, expiresAtMs - Date.now());
+    // Clamp against the SIWE max TTL as a defense-in-depth measure alongside
+    // verifySiweToken's issuedAt check. Without clamping, a SIWE verified with
+    // a relaxed skew could still mint a caller token whose absolute lifetime
+    // (relative to now) exceeds MAX_TOKEN_TTL_MS.
+    const ttlMs = Math.min(MAX_TOKEN_TTL_MS, Math.max(0, expiresAtMs - Date.now()));
     if (ttlMs <= 0) {
       return c.json(
         { error: 'invalid_grant', error_description: 'SIWE message has already expired' },

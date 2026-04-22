@@ -168,6 +168,52 @@ test(
 );
 
 test(
+  'SIWE with issuedAt far in the future is rejected with 401',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    try {
+      const app = buildApp(sql);
+      // Craft a SIWE where expirationTime - issuedAt stays under the 7-day cap
+      // (so the per-message TTL check passes) but issuedAt is far in the future,
+      // which would otherwise let the caller token's absolute lifetime exceed
+      // the 7-day max. verifySiweToken's issuedAt-vs-now check must reject it.
+      const wallet = Wallet.createRandom();
+      const issued = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+      const expires = new Date(Date.now() + (365 + 3) * 24 * 60 * 60 * 1000).toISOString();
+      const siwe = new SiweMessage({
+        domain: TEST_DOMAIN,
+        address: wallet.address,
+        statement: 'Future.',
+        uri: `https://${TEST_DOMAIN}`,
+        version: '1',
+        chainId: 1,
+        nonce: 'futurefuture0123456789abcdef',
+        issuedAt: issued,
+        expirationTime: expires,
+      });
+      const message = siwe.prepareMessage();
+      const signature = await wallet.signMessage(message);
+
+      const res = await app.request('/auth/siwe/exchange', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ message, signature }),
+      });
+      assert.equal(res.status, 401);
+      const body = (await res.json()) as Record<string, unknown>;
+      assert.equal(body.error, 'invalid_grant');
+      assert.match(String(body.error_description), /issuedAt is in the future/);
+
+      const rows = await sql`SELECT count(*)::int AS n FROM callers WHERE principal_id = ${`eth:${wallet.address.toLowerCase()}`}`;
+      assert.equal((rows[0] as { n: number }).n, 0);
+    } finally {
+      await sql.end();
+    }
+  },
+);
+
+test(
   'exchanging twice for the same SIWE yields two distinct tokens tied to same principal',
   { skip: !hasDb },
   async () => {

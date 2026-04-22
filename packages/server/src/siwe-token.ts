@@ -5,7 +5,13 @@ export interface SiweToken {
   signature: string;
 }
 
-const MAX_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const MAX_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Tolerance for clock skew between signer and server when validating `issuedAt`.
+// Without this, a SIWE message with `issuedAt` set in the future could pass the
+// `expirationTime - issuedAt <= MAX_TOKEN_TTL_MS` cap while still having an
+// effective lifetime (relative to now) far greater than the intended 7-day max.
+export const ISSUED_AT_SKEW_MS = 2 * 60 * 1000;
 
 export function encodeSiweToken(message: string, signature: string): string {
   const json = JSON.stringify({ message, signature });
@@ -75,8 +81,14 @@ export async function verifySiweToken(token: string, opts?: { domain?: string })
   if (Number.isNaN(issued) || Number.isNaN(expires)) {
     throw new Error('SIWE token has invalid date format');
   }
+  if (expires <= issued) {
+    throw new Error('SIWE token expirationTime must be after issuedAt');
+  }
   if (expires - issued > MAX_TOKEN_TTL_MS) {
     throw new Error('SIWE token TTL exceeds maximum allowed duration');
+  }
+  if (issued > Date.now() + ISSUED_AT_SKEW_MS) {
+    throw new Error('SIWE token issuedAt is in the future');
   }
 
   const result = await siweMessage.verify({ signature });
