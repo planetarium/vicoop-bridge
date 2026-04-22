@@ -147,11 +147,18 @@ class GatewayClient {
     }, this.handshakeTimeoutMs);
     this.handshakeTimer.unref?.();
 
-    const ws = new WebSocket(this.url);
-    this.ws = ws;
-    ws.on('message', (raw) => this.handleMessage(raw));
-    ws.on('close', () => this.onClosed(new Error('gateway websocket closed')));
-    ws.on('error', (err) => this.onClosed(err as Error));
+    try {
+      const ws = new WebSocket(this.url);
+      this.ws = ws;
+      ws.on('message', (raw) => this.handleMessage(raw));
+      ws.on('close', () => this.onClosed(new Error('gateway websocket closed')));
+      ws.on('error', (err) => this.onClosed(err as Error));
+    } catch (err) {
+      // `new WebSocket(url)` can throw synchronously for things like an
+      // invalid URL. Without this guard, _state would stay 'connecting'
+      // and the handshake timer would fire later against a dead promise.
+      this.onClosed(err as Error);
+    }
 
     return this.readyPromise;
   }
@@ -393,6 +400,7 @@ export function createOpenclawBackend(
   const recentlyFinalizedRuns = new Set<string>();
   const MAX_FINALIZED_RUNS = 512;
   const MAX_BUFFERED_EVENTS_PER_RUN = 64;
+  const MAX_PENDING_RUN_KEYS = 256;
 
   function markRunFinalized(runId: string): void {
     if (recentlyFinalizedRuns.has(runId)) return;
@@ -446,11 +454,20 @@ export function createOpenclawBackend(
             // drop without buffering so memory stays bounded.
             if (recentlyFinalizedRuns.has(p.runId)) return;
             // Event arrived before handle() finished registering the runId.
-            // Buffer until the handler catches up and drains it.
-            const buf = pendingRunEvents.get(p.runId) ?? [];
+            // Buffer until the handler catches up and drains it. Evict the
+            // oldest unknown runId when the map grows past the cap so a
+            // noisy/misbehaving gateway can't inflate memory indefinitely.
+            let buf = pendingRunEvents.get(p.runId);
+            if (!buf) {
+              if (pendingRunEvents.size >= MAX_PENDING_RUN_KEYS) {
+                const oldest = pendingRunEvents.keys().next().value;
+                if (oldest !== undefined) pendingRunEvents.delete(oldest);
+              }
+              buf = [];
+              pendingRunEvents.set(p.runId, buf);
+            }
             if (buf.length >= MAX_BUFFERED_EVENTS_PER_RUN) buf.shift();
             buf.push(p);
-            pendingRunEvents.set(p.runId, buf);
             return;
           }
           taskFinalizers.get(binding.taskId)?.(p);

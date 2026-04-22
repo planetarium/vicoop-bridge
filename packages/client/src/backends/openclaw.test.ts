@@ -486,6 +486,26 @@ test('late duplicate chat event for finalized run is dropped, not buffered', asy
   }
 });
 
+test('invalid URL: WebSocket constructor throwing does not wedge ensureConnected', async () => {
+  // An invalid URL makes `new WebSocket(url)` throw synchronously. Without
+  // the guard in connect(), _state would stay 'connecting' and every
+  // subsequent handle() call would block forever on the same dead promise.
+  const backend = createOpenclawBackend({
+    url: 'http://not-a-ws-url',
+    handshakeTimeoutMs: 500,
+  });
+  const framesA: UpFrame[] = [];
+  const framesB: UpFrame[] = [];
+  await backend.handle(makeTask('tA', 'a'), (f) => framesA.push(f));
+  // Second call must not hang — it should re-enter ensureConnected() cleanly
+  // and fail the same way.
+  await backend.handle(makeTask('tB', 'b'), (f) => framesB.push(f));
+  const failA = framesA.find((f) => f.type === 'task.fail');
+  const failB = framesB.find((f) => f.type === 'task.fail');
+  assert.ok(failA && failA.error.code === 'gateway_closed');
+  assert.ok(failB && failB.error.code === 'gateway_closed');
+});
+
 test('handshake timeout: gateway accepts TCP but never completes handshake', async () => {
   const fake = await createFakeGateway({
     autoHandshake: false,
