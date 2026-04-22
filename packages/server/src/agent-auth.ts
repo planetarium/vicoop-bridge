@@ -14,9 +14,14 @@ export function getCaller(c: Context): VerifiedCaller | undefined {
 
 export interface AgentAuthOptions {
   sql: Sql;
+  deviceFlowEnabled?: boolean;
 }
 
 export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) {
+  const acquisitionHint = opts.deviceFlowEnabled
+    ? '/auth/siwe/exchange (SIWE) or /oauth/token (device flow)'
+    : '/auth/siwe/exchange (SIWE)';
+
   return async (c: Context, next: Next) => {
     const agentId = c.req.param('id')!;
     const conn = registry.getAgent(agentId);
@@ -53,7 +58,7 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
         id: null,
         error: {
           code: -32001,
-          message: `Invalid bearer token: expected ${CALLER_TOKEN_PREFIX}* prefix. Acquire one via /auth/siwe/exchange (SIWE) or /oauth/token (device flow).`,
+          message: `Invalid bearer token: expected ${CALLER_TOKEN_PREFIX}* prefix. Acquire one via ${acquisitionHint}.`,
         },
       }, 401);
     }

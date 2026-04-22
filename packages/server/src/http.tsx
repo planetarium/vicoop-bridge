@@ -31,11 +31,17 @@ export interface ServerHttpOptions {
   deviceFlowStateSecret?: string;
 }
 
+interface AgentCardOptions {
+  publicUrl: string | undefined;
+  deviceFlowEnabled: boolean;
+}
+
 function toSdkAgentCard(
   wire: WireAgentCard,
   conn: ClientConnection,
-  publicUrl: string | undefined,
+  opts: AgentCardOptions,
 ): SdkAgentCard {
+  const { publicUrl, deviceFlowEnabled } = opts;
   const url = publicUrl
     ? `${publicUrl}/agents/${conn.agentId}`
     : `/agents/${conn.agentId}`;
@@ -60,22 +66,37 @@ function toSdkAgentCard(
     })),
   };
   if (conn.allowedCallers.length > 0) {
-    card.securitySchemes = {
-      bridge: {
-        type: 'oauth2',
-        description:
-          'Bridge-issued opaque bearer token. Acquire via /oauth/token (Google device flow) or /auth/siwe/exchange (SIWE).',
-        flows: {
-          deviceAuthorization: {
-            deviceAuthorizationUrl: publicUrl
-              ? `${publicUrl}/oauth/device/code`
-              : '/oauth/device/code',
-            tokenUrl: publicUrl ? `${publicUrl}/oauth/token` : '/oauth/token',
-            scopes: {},
+    // The device-flow scheme only matches a real endpoint when Google OAuth is
+    // configured on this deployment (mountDeviceFlow call below). Advertising
+    // it unconditionally would point clients at a 404.
+    if (deviceFlowEnabled) {
+      card.securitySchemes = {
+        bridge: {
+          type: 'oauth2',
+          description:
+            'Bridge-issued opaque bearer token. Acquire via /oauth/token (Google device flow) or /auth/siwe/exchange (SIWE).',
+          flows: {
+            deviceAuthorization: {
+              deviceAuthorizationUrl: publicUrl
+                ? `${publicUrl}/oauth/device/code`
+                : '/oauth/device/code',
+              tokenUrl: publicUrl ? `${publicUrl}/oauth/token` : '/oauth/token',
+              scopes: {},
+            },
           },
+        } as unknown as NonNullable<SdkAgentCard['securitySchemes']>[string],
+      };
+    } else {
+      card.securitySchemes = {
+        bridge: {
+          type: 'http',
+          scheme: 'bearer',
+          bearerFormat: 'Opaque',
+          description:
+            'Bridge-issued opaque bearer token (vbc_caller_*). Acquire via POST /auth/siwe/exchange by signing a SIWE message.',
         },
-      } as unknown as NonNullable<SdkAgentCard['securitySchemes']>[string],
-    };
+      };
+    }
     card.security = [{ bridge: [] }];
   }
   return card;
@@ -86,6 +107,16 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
 
   const taskStore = new InMemoryTaskStore();
   const transports = new Map<string, JsonRpcTransportHandler>();
+
+  // Device flow endpoints (/oauth/device/code, /oauth/token) are only mounted
+  // when Google OAuth is fully configured. Surface this to the agent card and
+  // the agent-auth error hint so SIWE-only deployments don't point callers at
+  // non-existent endpoints.
+  const deviceFlowEnabled = Boolean(opts.google && opts.publicUrl);
+  const agentCardOpts: AgentCardOptions = {
+    publicUrl: opts.publicUrl,
+    deviceFlowEnabled,
+  };
 
   // Built-in admin agent at root
   const adminTransport = createAdminTransport({
@@ -99,7 +130,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     // Rebuild transport when security state changes (allowedCallers toggled)
     const cached = transports.get(conn.agentId);
     if (cached) return cached;
-    const card = toSdkAgentCard(conn.agentCard, conn, opts.publicUrl);
+    const card = toSdkAgentCard(conn.agentCard, conn, agentCardOpts);
     const executor = new ServerAgentExecutor(conn.agentId, opts.registry);
     const handler = new DefaultRequestHandler(card, taskStore, executor);
     const transport = new JsonRpcTransportHandler(handler);
@@ -140,7 +171,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       url: opts.publicUrl
         ? `${opts.publicUrl}/agents/${a.agentId}`
         : `/agents/${a.agentId}`,
-      card: toSdkAgentCard(a.agentCard, a, opts.publicUrl),
+      card: toSdkAgentCard(a.agentCard, a, agentCardOpts),
     }));
 
     const accept = c.req.header('accept') ?? '';
@@ -285,7 +316,10 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   });
 
   // Client agent A2A endpoints (auth middleware checks allowedCallers)
-  const authMw = agentAuthMiddleware(opts.registry, { sql: opts.db });
+  const authMw = agentAuthMiddleware(opts.registry, {
+    sql: opts.db,
+    deviceFlowEnabled,
+  });
   app.post('/agents/:id', authMw, async (c) => {
     const conn = getAgentConn(c);
 
