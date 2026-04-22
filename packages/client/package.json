@@ -13,10 +13,11 @@
     "cards"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx watch src/cli.ts",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "test": "tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@vicoop-bridge/protocol": "workspace:*",

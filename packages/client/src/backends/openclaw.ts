@@ -86,6 +86,10 @@ interface ChatEventPayload {
   stopReason?: string;
 }
 
+type FinalizerCause = 'gateway_closed' | 'timeout';
+
+type FinalizerEvent = ChatEventPayload & { cause?: FinalizerCause };
+
 interface ChatSendAck {
   runId: string;
   status: 'started' | 'in_flight';
@@ -93,93 +97,80 @@ interface ChatSendAck {
 
 type EventHandler = (evt: EventFrame) => void;
 
+type ClientState = 'idle' | 'connecting' | 'ready' | 'closed';
+
 class GatewayClient {
   private ws: WebSocket | null = null;
   private pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   private eventHandlers = new Set<EventHandler>();
-  private ready: Promise<void> | null = null;
+  private closeListeners = new Set<(err: Error) => void>();
+  private _state: ClientState = 'idle';
+  private readyPromise: Promise<void> | null = null;
   private readyResolve: (() => void) | null = null;
   private readyReject: ((err: Error) => void) | null = null;
   private nonce: string | null = null;
-  private stopped = false;
   private identity: DeviceIdentity;
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly url: string,
     private readonly token?: string,
-    private readonly onError?: (err: Error) => void,
+    private readonly handshakeTimeoutMs: number = 10_000,
   ) {
     this.identity = generateDeviceIdentity();
   }
 
+  get state(): ClientState {
+    return this._state;
+  }
+
   connect(): Promise<void> {
-    if (this.ready) return this.ready;
-    this.ready = new Promise<void>((resolve, reject) => {
+    if (this._state === 'ready') return Promise.resolve();
+    if (this._state === 'connecting') return this.readyPromise!;
+    if (this._state === 'closed') {
+      return Promise.reject(new Error('gateway client closed'));
+    }
+
+    this._state = 'connecting';
+    this.readyPromise = new Promise<void>((resolve, reject) => {
       this.readyResolve = resolve;
       this.readyReject = reject;
     });
 
-    const ws = new WebSocket(this.url);
-    this.ws = ws;
-
-    ws.on('message', (raw) => {
-      let frame: Frame;
-      try {
-        frame = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf8')) as Frame;
-      } catch {
-        return;
+    // Bound the handshake so a gateway that accepts the TCP connection but
+    // never finishes the challenge/connect exchange cannot wedge every
+    // subsequent ensureConnected() caller.
+    this.handshakeTimer = setTimeout(() => {
+      if (this._state === 'connecting') {
+        this.abortWith(new Error(`gateway handshake timed out after ${this.handshakeTimeoutMs}ms`));
       }
-      if (frame.type === 'event' && frame.event === 'connect.challenge') {
-        const p = frame.payload as { nonce?: string } | undefined;
-        this.nonce = p?.nonce?.trim() ?? null;
-        if (!this.nonce) {
-          this.fail(new Error('gateway sent empty connect nonce'));
-          return;
-        }
-        this.sendConnect();
-        return;
-      }
-      if (frame.type === 'res') {
-        const pending = this.pending.get(frame.id);
-        if (!pending) return;
-        this.pending.delete(frame.id);
-        if (frame.ok) pending.resolve(frame.payload);
-        else pending.reject(new Error(frame.error?.message ?? 'gateway error'));
-        return;
-      }
-      if (frame.type === 'event') {
-        for (const h of this.eventHandlers) h(frame);
-      }
-    });
+    }, this.handshakeTimeoutMs);
+    this.handshakeTimer.unref?.();
 
-    ws.on('close', () => {
-      const err = new Error('gateway websocket closed');
-      for (const p of this.pending.values()) p.reject(err);
-      this.pending.clear();
-      if (this.readyReject && this.ready) {
-        this.readyReject(err);
-      }
-      this.ws = null;
-      this.ready = null;
-      if (!this.stopped) this.onError?.(err);
-    });
+    try {
+      const ws = new WebSocket(this.url);
+      this.ws = ws;
+      ws.on('message', (raw) => this.handleMessage(raw));
+      ws.on('close', () => this.onClosed(new Error('gateway websocket closed')));
+      ws.on('error', (err) => this.onClosed(err as Error));
+    } catch (err) {
+      // `new WebSocket(url)` can throw synchronously for things like an
+      // invalid URL. Without this guard, _state would stay 'connecting'
+      // and the handshake timer would fire later against a dead promise.
+      this.onClosed(err as Error);
+    }
 
-    ws.on('error', (err) => {
-      this.onError?.(err as Error);
-      if (this.readyReject) this.readyReject(err as Error);
-    });
-
-    return this.ready;
-  }
-
-  stop(): void {
-    this.stopped = true;
-    this.ws?.close();
+    return this.readyPromise;
   }
 
   onEvent(handler: EventHandler): () => void {
     this.eventHandlers.add(handler);
     return () => this.eventHandlers.delete(handler);
+  }
+
+  onClose(listener: (err: Error) => void): () => void {
+    this.closeListeners.add(listener);
+    return () => this.closeListeners.delete(listener);
   }
 
   async request<T = unknown>(method: string, params?: unknown): Promise<T> {
@@ -193,14 +184,77 @@ class GatewayClient {
         resolve: (v) => resolve(v as T),
         reject,
       });
-      this.ws!.send(JSON.stringify(frame));
+      try {
+        this.ws!.send(JSON.stringify(frame));
+      } catch (err) {
+        // Synchronous send failure (socket transitioned out of OPEN between
+        // the readyState check and ws.send). Clean up the pending entry so
+        // it cannot linger and be double-rejected later by onClosed().
+        this.pending.delete(id);
+        reject(err as Error);
+      }
     });
   }
 
-  private fail(err: Error) {
-    this.readyReject?.(err);
-    this.onError?.(err);
+  private handleMessage(raw: WebSocket.RawData | string): void {
+    let frame: Frame;
+    try {
+      frame = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf8')) as Frame;
+    } catch {
+      return;
+    }
+    if (frame.type === 'event' && frame.event === 'connect.challenge') {
+      const p = frame.payload as { nonce?: string } | undefined;
+      this.nonce = p?.nonce?.trim() ?? null;
+      if (!this.nonce) {
+        this.abortWith(new Error('gateway sent empty connect nonce'));
+        return;
+      }
+      void this.sendConnect();
+      return;
+    }
+    if (frame.type === 'res') {
+      const pending = this.pending.get(frame.id);
+      if (!pending) return;
+      this.pending.delete(frame.id);
+      if (frame.ok) pending.resolve(frame.payload);
+      else pending.reject(new Error(frame.error?.message ?? 'gateway error'));
+      return;
+    }
+    if (frame.type === 'event') {
+      for (const h of this.eventHandlers) h(frame);
+    }
+  }
+
+  private onClosed(err: Error): void {
+    if (this._state === 'closed') return;
+    const wasConnecting = this._state === 'connecting';
+    this._state = 'closed';
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer);
+      this.handshakeTimer = null;
+    }
+    for (const p of this.pending.values()) p.reject(err);
+    this.pending.clear();
+    if (wasConnecting) this.readyReject?.(err);
+    this.readyResolve = null;
+    this.readyReject = null;
+    this.ws = null;
+    const listeners = Array.from(this.closeListeners);
+    this.closeListeners.clear();
+    this.eventHandlers.clear();
+    for (const l of listeners) {
+      try {
+        l(err);
+      } catch (listenerErr) {
+        console.error('[openclaw] close listener threw:', (listenerErr as Error).message);
+      }
+    }
+  }
+
+  private abortWith(err: Error): void {
     this.ws?.close();
+    this.onClosed(err);
   }
 
   private async sendConnect(): Promise<void> {
@@ -244,9 +298,16 @@ class GatewayClient {
         },
       };
       await this.request('connect', params);
-      this.readyResolve?.();
+      if (this._state === 'connecting') {
+        this._state = 'ready';
+        if (this.handshakeTimer) {
+          clearTimeout(this.handshakeTimer);
+          this.handshakeTimer = null;
+        }
+        this.readyResolve?.();
+      }
     } catch (err) {
-      this.fail(err as Error);
+      this.abortWith(err as Error);
     }
   }
 }
@@ -279,6 +340,30 @@ export interface OpenclawBackendOptions {
   thinking?: string;
   sessionKeyPrefix?: string;
   debug?: boolean;
+  /** Max time (ms) to wait for a terminal chat event after chat.send ack. Default 600000 (10min). */
+  taskTimeoutMs?: number;
+  /** Max time (ms) to wait for the gateway handshake to complete. Default 10000. */
+  handshakeTimeoutMs?: number;
+}
+
+const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10 * 1000;
+
+function resolveTimeout(
+  explicit: number | undefined,
+  envName: string,
+  fallback: number,
+  label: string,
+): number {
+  const envRaw = process.env[envName];
+  const envNum = envRaw !== undefined ? Number(envRaw) : undefined;
+  const requested = explicit ?? envNum;
+  if (requested === undefined) return fallback;
+  if (!Number.isFinite(requested) || requested <= 0) {
+    console.warn(`[openclaw] invalid ${label} "${requested}", falling back to ${fallback}ms`);
+    return fallback;
+  }
+  return requested;
 }
 
 export function createOpenclawBackend(
@@ -290,40 +375,131 @@ export function createOpenclawBackend(
   const thinking = opts.thinking ?? process.env.OPENCLAW_THINKING;
   const sessionPrefix = opts.sessionKeyPrefix ?? 'agent';
   const debug = opts.debug ?? process.env.OPENCLAW_DEBUG === '1';
+  const taskTimeoutMs = resolveTimeout(
+    opts.taskTimeoutMs,
+    'OPENCLAW_TASK_TIMEOUT_MS',
+    DEFAULT_TASK_TIMEOUT_MS,
+    'taskTimeoutMs',
+  );
+  const handshakeTimeoutMs = resolveTimeout(
+    opts.handshakeTimeoutMs,
+    'OPENCLAW_HANDSHAKE_TIMEOUT_MS',
+    DEFAULT_HANDSHAKE_TIMEOUT_MS,
+    'handshakeTimeoutMs',
+  );
 
-  let client: GatewayClient | null = null;
+  let current: GatewayClient | null = null;
+  let connecting: Promise<GatewayClient> | null = null;
   const runToTask = new Map<string, { taskId: string; sessionKey: string }>();
-  const taskFinalizers = new Map<string, (evt: ChatEventPayload) => void>();
+  const taskFinalizers = new Map<string, (evt: FinalizerEvent) => void>();
+  const pendingRunEvents = new Map<string, ChatEventPayload[]>();
+  // Bounded memory of recently-finalized runIds. Any chat event carrying one
+  // of these is dropped instead of buffered in pendingRunEvents, so late or
+  // duplicate deltas from OpenClaw cannot accumulate forever after the task
+  // has already emitted its terminal frame.
+  const recentlyFinalizedRuns = new Set<string>();
+  const MAX_FINALIZED_RUNS = 512;
+  const MAX_BUFFERED_EVENTS_PER_RUN = 64;
+  const MAX_PENDING_RUN_KEYS = 256;
+
+  function markRunFinalized(runId: string): void {
+    if (recentlyFinalizedRuns.has(runId)) return;
+    recentlyFinalizedRuns.add(runId);
+    if (recentlyFinalizedRuns.size > MAX_FINALIZED_RUNS) {
+      const oldest = recentlyFinalizedRuns.values().next().value;
+      if (oldest !== undefined) recentlyFinalizedRuns.delete(oldest);
+    }
+  }
+
+  function handleGatewayClose(c: GatewayClient, err: Error): void {
+    console.error('[openclaw] connection error:', err.message);
+    if (current === c) current = null;
+    // Drop any orphaned event buffers and finalization memory — runIds are
+    // scoped to a single gateway session, so a reconnect starts clean.
+    pendingRunEvents.clear();
+    recentlyFinalizedRuns.clear();
+    // Fail every in-flight task that was running on this client so handle()
+    // does not hang forever waiting for a terminal event that can never come.
+    if (taskFinalizers.size === 0) return;
+    for (const fin of Array.from(taskFinalizers.values())) {
+      fin({
+        runId: '',
+        sessionKey: '',
+        seq: -1,
+        state: 'error',
+        errorMessage: `gateway closed: ${err.message}`,
+        cause: 'gateway_closed',
+      });
+    }
+  }
 
   async function ensureConnected(): Promise<GatewayClient> {
-    if (client) return client;
-    client = new GatewayClient(url, token, (err) => {
-      console.error('[openclaw] connection error:', err.message);
-      client = null;
-    });
-    await client.connect();
-    console.log(`[openclaw] connected ${url}`);
-
-    client.onEvent((evt) => {
-      if (evt.event !== 'chat') return;
-      const p = evt.payload as ChatEventPayload | undefined;
-      if (!p?.runId) return;
-      if (debug) {
-        console.log('[openclaw] chat event:', JSON.stringify(p).slice(0, 500));
+    if (current && current.state === 'ready') return current;
+    if (connecting) return connecting;
+    const c = new GatewayClient(url, token, handshakeTimeoutMs);
+    connecting = (async () => {
+      try {
+        await c.connect();
+        console.log(`[openclaw] connected ${url}`);
+        c.onEvent((evt) => {
+          if (evt.event !== 'chat') return;
+          const p = evt.payload as ChatEventPayload | undefined;
+          if (!p?.runId) return;
+          if (debug) {
+            console.log('[openclaw] chat event:', JSON.stringify(p).slice(0, 500));
+          }
+          const binding = runToTask.get(p.runId);
+          if (!binding) {
+            // Late or duplicate event for a run whose task already finalized:
+            // drop without buffering so memory stays bounded.
+            if (recentlyFinalizedRuns.has(p.runId)) return;
+            // Event arrived before handle() finished registering the runId.
+            // Buffer until the handler catches up and drains it. Evict the
+            // oldest unknown runId when the map grows past the cap so a
+            // noisy/misbehaving gateway can't inflate memory indefinitely.
+            let buf = pendingRunEvents.get(p.runId);
+            if (!buf) {
+              if (pendingRunEvents.size >= MAX_PENDING_RUN_KEYS) {
+                const oldest = pendingRunEvents.keys().next().value;
+                if (oldest !== undefined) pendingRunEvents.delete(oldest);
+              }
+              buf = [];
+              pendingRunEvents.set(p.runId, buf);
+            }
+            if (buf.length >= MAX_BUFFERED_EVENTS_PER_RUN) buf.shift();
+            buf.push(p);
+            return;
+          }
+          taskFinalizers.get(binding.taskId)?.(p);
+        });
+        c.onClose((err) => handleGatewayClose(c, err));
+        current = c;
+        return c;
+      } catch (err) {
+        // connect() itself failed: nothing is registered yet, just propagate.
+        throw err;
+      } finally {
+        connecting = null;
       }
-      const binding = runToTask.get(p.runId);
-      if (!binding) return;
-      const finalizer = taskFinalizers.get(binding.taskId);
-      finalizer?.(p);
-    });
-    return client;
+    })();
+    return connecting;
   }
 
   return {
     name: 'openclaw',
 
     async handle(task, emit) {
-      const gw = await ensureConnected();
+      let gw: GatewayClient;
+      try {
+        gw = await ensureConnected();
+      } catch (err) {
+        emit({
+          type: 'task.fail',
+          taskId: task.taskId,
+          error: { code: 'gateway_closed', message: (err as Error).message },
+        });
+        return;
+      }
       const sessionKey = `${sessionPrefix}:${agent}:${task.contextId}`;
       const text = task.message.parts
         .map((p) => (p.kind === 'text' ? p.text : ''))
@@ -336,88 +512,151 @@ export function createOpenclawBackend(
         status: { state: 'working', timestamp: new Date().toISOString() },
       });
 
-      const idempotencyKey = task.taskId;
-      let ack: ChatSendAck;
-      try {
-        ack = await gw.request<ChatSendAck>('chat.send', {
-          sessionKey,
-          message: text,
-          idempotencyKey,
-          ...(thinking ? { thinking } : {}),
-        });
-      } catch (err) {
-        emit({
-          type: 'task.fail',
-          taskId: task.taskId,
-          error: { code: 'gateway_send_failed', message: (err as Error).message },
-        });
-        return;
-      }
-
-      const runId = ack.runId;
-      runToTask.set(runId, { taskId: task.taskId, sessionKey });
-
-      const settled = await new Promise<ChatEventPayload>((resolve) => {
-        taskFinalizers.set(task.taskId, (evt) => {
-          if (evt.state === 'final' || evt.state === 'error' || evt.state === 'aborted') {
-            resolve(evt);
-          }
-        });
+      // Register the finalizer BEFORE sending chat.send so that:
+      //   1. a gateway close between send and ack still fails this task,
+      //   2. a fast terminal event arriving before runId is known is buffered.
+      let resolveSettled!: (evt: FinalizerEvent) => void;
+      const settled = new Promise<FinalizerEvent>((r) => {
+        resolveSettled = r;
       });
+      const finalizer = (evt: FinalizerEvent) => {
+        if (evt.state === 'final' || evt.state === 'error' || evt.state === 'aborted') {
+          resolveSettled(evt);
+        }
+      };
+      taskFinalizers.set(task.taskId, finalizer);
 
-      taskFinalizers.delete(task.taskId);
-      runToTask.delete(runId);
-
-      if (settled.state === 'error') {
-        emit({
-          type: 'task.fail',
-          taskId: task.taskId,
-          error: {
-            code: 'gateway_chat_error',
-            message: settled.errorMessage ?? 'unknown gateway error',
-          },
+      let runId: string | null = null;
+      const timer = setTimeout(() => {
+        resolveSettled({
+          runId: runId ?? '',
+          sessionKey,
+          seq: -1,
+          state: 'error',
+          errorMessage: `task timed out after ${taskTimeoutMs}ms`,
+          cause: 'timeout',
         });
-        return;
-      }
-      if (settled.state === 'aborted') {
+      }, taskTimeoutMs);
+      timer.unref?.();
+
+      try {
+        let ack: ChatSendAck;
+        try {
+          ack = await gw.request<ChatSendAck>('chat.send', {
+            sessionKey,
+            message: text,
+            idempotencyKey: task.taskId,
+            ...(thinking ? { thinking } : {}),
+          });
+        } catch (err) {
+          // A close between send and ack rejects the pending request AND
+          // resolves `settled` via the close listener. Since we bail out
+          // here without awaiting `settled`, surface the gateway-closed
+          // cause directly so the caller gets a precise error code.
+          const closed = gw.state === 'closed';
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: {
+              code: closed ? 'gateway_closed' : 'gateway_send_failed',
+              message: (err as Error).message,
+            },
+          });
+          return;
+        }
+
+        runId = ack.runId;
+        runToTask.set(runId, { taskId: task.taskId, sessionKey });
+        // Drain any events that raced ahead of registration.
+        const buffered = pendingRunEvents.get(runId);
+        if (buffered) {
+          pendingRunEvents.delete(runId);
+          for (const p of buffered) finalizer(p);
+        }
+
+        const result = await settled;
+
+        if (result.cause === 'timeout') {
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: {
+              code: 'task_timeout',
+              message: result.errorMessage ?? 'task timed out',
+            },
+          });
+          return;
+        }
+        if (result.cause === 'gateway_closed') {
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: {
+              code: 'gateway_closed',
+              message: result.errorMessage ?? 'gateway closed',
+            },
+          });
+          return;
+        }
+        if (result.state === 'error') {
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: {
+              code: 'gateway_chat_error',
+              message: result.errorMessage ?? 'unknown gateway error',
+            },
+          });
+          return;
+        }
+        if (result.state === 'aborted') {
+          emit({
+            type: 'task.complete',
+            taskId: task.taskId,
+            status: { state: 'canceled', timestamp: new Date().toISOString() },
+          });
+          return;
+        }
+
+        const text2 = extractFinalText(result.message);
+        const parts: Part[] = [{ kind: 'text', text: text2 }];
+        const artifactId = randomUUID();
+        emit({
+          type: 'task.artifact',
+          taskId: task.taskId,
+          artifact: { artifactId, name: 'openclaw-result', parts },
+          lastChunk: true,
+        });
         emit({
           type: 'task.complete',
           taskId: task.taskId,
-          status: { state: 'canceled', timestamp: new Date().toISOString() },
-        });
-        return;
-      }
-
-      const text2 = extractFinalText(settled.message);
-      const parts: Part[] = [{ kind: 'text', text: text2 }];
-      const artifactId = randomUUID();
-      emit({
-        type: 'task.artifact',
-        taskId: task.taskId,
-        artifact: { artifactId, name: 'openclaw-result', parts },
-        lastChunk: true,
-      });
-      emit({
-        type: 'task.complete',
-        taskId: task.taskId,
-        status: {
-          state: 'completed',
-          timestamp: new Date().toISOString(),
-          message: {
-            role: 'agent',
-            messageId: randomUUID(),
-            parts,
+          status: {
+            state: 'completed',
+            timestamp: new Date().toISOString(),
+            message: {
+              role: 'agent',
+              messageId: randomUUID(),
+              parts,
+            },
           },
-        },
-      });
+        });
+      } finally {
+        clearTimeout(timer);
+        taskFinalizers.delete(task.taskId);
+        if (runId) {
+          runToTask.delete(runId);
+          pendingRunEvents.delete(runId);
+          markRunFinalized(runId);
+        }
+      }
     },
 
     async cancel(taskId) {
       const entry = [...runToTask.entries()].find(([, v]) => v.taskId === taskId);
-      if (!entry || !client) return;
+      if (!entry || !current) return;
       const [runId, binding] = entry;
       try {
-        await client.request('chat.abort', { sessionKey: binding.sessionKey, runId });
+        await current.request('chat.abort', { sessionKey: binding.sessionKey, runId });
       } catch (err) {
         console.error('[openclaw] abort failed:', (err as Error).message);
       }
