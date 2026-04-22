@@ -110,10 +110,12 @@ class GatewayClient {
   private readyReject: ((err: Error) => void) | null = null;
   private nonce: string | null = null;
   private identity: DeviceIdentity;
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly url: string,
     private readonly token?: string,
+    private readonly handshakeTimeoutMs: number = 10_000,
   ) {
     this.identity = generateDeviceIdentity();
   }
@@ -134,6 +136,16 @@ class GatewayClient {
       this.readyResolve = resolve;
       this.readyReject = reject;
     });
+
+    // Bound the handshake so a gateway that accepts the TCP connection but
+    // never finishes the challenge/connect exchange cannot wedge every
+    // subsequent ensureConnected() caller.
+    this.handshakeTimer = setTimeout(() => {
+      if (this._state === 'connecting') {
+        this.abortWith(new Error(`gateway handshake timed out after ${this.handshakeTimeoutMs}ms`));
+      }
+    }, this.handshakeTimeoutMs);
+    this.handshakeTimer.unref?.();
 
     const ws = new WebSocket(this.url);
     this.ws = ws;
@@ -165,7 +177,15 @@ class GatewayClient {
         resolve: (v) => resolve(v as T),
         reject,
       });
-      this.ws!.send(JSON.stringify(frame));
+      try {
+        this.ws!.send(JSON.stringify(frame));
+      } catch (err) {
+        // Synchronous send failure (socket transitioned out of OPEN between
+        // the readyState check and ws.send). Clean up the pending entry so
+        // it cannot linger and be double-rejected later by onClosed().
+        this.pending.delete(id);
+        reject(err as Error);
+      }
     });
   }
 
@@ -203,6 +223,10 @@ class GatewayClient {
     if (this._state === 'closed') return;
     const wasConnecting = this._state === 'connecting';
     this._state = 'closed';
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer);
+      this.handshakeTimer = null;
+    }
     for (const p of this.pending.values()) p.reject(err);
     this.pending.clear();
     if (wasConnecting) this.readyReject?.(err);
@@ -269,6 +293,10 @@ class GatewayClient {
       await this.request('connect', params);
       if (this._state === 'connecting') {
         this._state = 'ready';
+        if (this.handshakeTimer) {
+          clearTimeout(this.handshakeTimer);
+          this.handshakeTimer = null;
+        }
         this.readyResolve?.();
       }
     } catch (err) {
@@ -307,9 +335,29 @@ export interface OpenclawBackendOptions {
   debug?: boolean;
   /** Max time (ms) to wait for a terminal chat event after chat.send ack. Default 600000 (10min). */
   taskTimeoutMs?: number;
+  /** Max time (ms) to wait for the gateway handshake to complete. Default 10000. */
+  handshakeTimeoutMs?: number;
 }
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10 * 1000;
+
+function resolveTimeout(
+  explicit: number | undefined,
+  envName: string,
+  fallback: number,
+  label: string,
+): number {
+  const envRaw = process.env[envName];
+  const envNum = envRaw !== undefined ? Number(envRaw) : undefined;
+  const requested = explicit ?? envNum;
+  if (requested === undefined) return fallback;
+  if (!Number.isFinite(requested) || requested <= 0) {
+    console.warn(`[openclaw] invalid ${label} "${requested}", falling back to ${fallback}ms`);
+    return fallback;
+  }
+  return requested;
+}
 
 export function createOpenclawBackend(
   opts: OpenclawBackendOptions = {},
@@ -320,10 +368,18 @@ export function createOpenclawBackend(
   const thinking = opts.thinking ?? process.env.OPENCLAW_THINKING;
   const sessionPrefix = opts.sessionKeyPrefix ?? 'agent';
   const debug = opts.debug ?? process.env.OPENCLAW_DEBUG === '1';
-  const envTimeout = process.env.OPENCLAW_TASK_TIMEOUT_MS
-    ? Number(process.env.OPENCLAW_TASK_TIMEOUT_MS)
-    : undefined;
-  const taskTimeoutMs = opts.taskTimeoutMs ?? (Number.isFinite(envTimeout) ? (envTimeout as number) : DEFAULT_TASK_TIMEOUT_MS);
+  const taskTimeoutMs = resolveTimeout(
+    opts.taskTimeoutMs,
+    'OPENCLAW_TASK_TIMEOUT_MS',
+    DEFAULT_TASK_TIMEOUT_MS,
+    'taskTimeoutMs',
+  );
+  const handshakeTimeoutMs = resolveTimeout(
+    opts.handshakeTimeoutMs,
+    'OPENCLAW_HANDSHAKE_TIMEOUT_MS',
+    DEFAULT_HANDSHAKE_TIMEOUT_MS,
+    'handshakeTimeoutMs',
+  );
 
   let current: GatewayClient | null = null;
   let connecting: Promise<GatewayClient> | null = null;
@@ -372,7 +428,7 @@ export function createOpenclawBackend(
   async function ensureConnected(): Promise<GatewayClient> {
     if (current && current.state === 'ready') return current;
     if (connecting) return connecting;
-    const c = new GatewayClient(url, token);
+    const c = new GatewayClient(url, token, handshakeTimeoutMs);
     connecting = (async () => {
       try {
         await c.connect();
@@ -416,7 +472,17 @@ export function createOpenclawBackend(
     name: 'openclaw',
 
     async handle(task, emit) {
-      const gw = await ensureConnected();
+      let gw: GatewayClient;
+      try {
+        gw = await ensureConnected();
+      } catch (err) {
+        emit({
+          type: 'task.fail',
+          taskId: task.taskId,
+          error: { code: 'gateway_closed', message: (err as Error).message },
+        });
+        return;
+      }
       const sessionKey = `${sessionPrefix}:${agent}:${task.contextId}`;
       const text = task.message.parts
         .map((p) => (p.kind === 'text' ? p.text : ''))

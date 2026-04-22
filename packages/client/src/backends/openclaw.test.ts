@@ -486,6 +486,76 @@ test('late duplicate chat event for finalized run is dropped, not buffered', asy
   }
 });
 
+test('handshake timeout: gateway accepts TCP but never completes handshake', async () => {
+  const fake = await createFakeGateway({
+    autoHandshake: false,
+    // Swallow the connect request so the handshake never resolves.
+    onRequest: () => {},
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url, handshakeTimeoutMs: 100 });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f));
+    const fail = frames.find((f) => f.type === 'task.fail');
+    assert.ok(fail, 'task must fail when handshake never completes');
+    assert.equal(fail!.error.code, 'gateway_closed');
+    assert.match(fail!.error.message, /handshake timed out/);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('invalid taskTimeoutMs falls back to default instead of firing immediately', async () => {
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId: 'run-ok', status: 'started' },
+          }),
+        );
+        setImmediate(() => {
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId: 'run-ok',
+                sessionKey: 'x',
+                seq: 1,
+                state: 'final',
+                message: { text: 'ok' },
+              },
+            }),
+          );
+        });
+      }
+    },
+  });
+  try {
+    const originalWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(' '));
+    };
+    try {
+      // Invalid timeout — must not cause the task to time out immediately.
+      const backend = createOpenclawBackend({ url: fake.url, taskTimeoutMs: 0 });
+      const frames: UpFrame[] = [];
+      await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f));
+      assert.ok(frames.find((f) => f.type === 'task.complete'));
+      assert.ok(warnings.some((w) => w.includes('invalid taskTimeoutMs')));
+    } finally {
+      console.warn = originalWarn;
+    }
+  } finally {
+    await fake.close();
+  }
+});
+
 test('gateway close mid-run fails in-flight task deterministically', async () => {
   const fake = await createFakeGateway({
     onRequest: (sock, req) => {
