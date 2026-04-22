@@ -8,7 +8,6 @@
 #   INSTALL_DIR   Target directory (default: /data/vicoop-bridge-client)
 #   VERSION       Specific tag to install, e.g. client-v0.1.0 (default: latest client-v* release)
 #   FORCE         If "1", overwrite a non-empty INSTALL_DIR
-#   GITHUB_TOKEN  Required while the repo is private; PAT with `repo` read scope
 #
 # What it does:
 #   1. Verifies prerequisites (Linux warning, Node.js >= 20, curl, tar, sha256 tool).
@@ -57,29 +56,18 @@ else
   die "missing required command: sha256sum or shasum"
 fi
 
-# curl wrapper that injects the GitHub PAT when present. curl strips the
-# Authorization header on cross-host redirects (default since 7.58), which is
-# what we want for asset downloads that redirect to objects.githubusercontent.com.
-gh_curl() {
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$@"
-  else
-    curl -fsSL "$@"
-  fi
-}
-
 # ---- 2. Resolve release tag -------------------------------------------------
 if [ -z "$VERSION" ]; then
   log "resolving latest client-v* release from GitHub"
   # Pull recent releases (default 30) and pick the first tag matching client-v*.
   # Avoid /releases/latest because it may point at a non-client release.
   VERSION="$(
-    gh_curl "https://api.github.com/repos/$REPO/releases?per_page=30" \
+    curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" \
       | grep -o '"tag_name":[[:space:]]*"client-v[^"]*"' \
       | head -n1 \
       | sed -E 's/.*"(client-v[^"]+)".*/\1/'
   )"
-  [ -n "$VERSION" ] || die "no client-v* release found in $REPO (set GITHUB_TOKEN if the repo is private)"
+  [ -n "$VERSION" ] || die "no client-v* release found in $REPO"
 fi
 
 log "installing $VERSION"
@@ -111,8 +99,8 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 log "downloading $ARCHIVE"
-gh_curl "$BASE_URL/$ARCHIVE" -o "$TMP_DIR/$ARCHIVE"
-gh_curl "$BASE_URL/$CHECKSUM" -o "$TMP_DIR/$CHECKSUM"
+curl -fsSL "$BASE_URL/$ARCHIVE" -o "$TMP_DIR/$ARCHIVE"
+curl -fsSL "$BASE_URL/$CHECKSUM" -o "$TMP_DIR/$CHECKSUM"
 
 log "verifying checksum"
 # The .sha256 file from package-client-release.sh contains an absolute path from
