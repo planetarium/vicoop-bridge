@@ -177,7 +177,7 @@ test(
       // Craft a SIWE where expirationTime - issuedAt stays under the 7-day cap
       // (so the per-message TTL check passes) but issuedAt is far in the future,
       // which would otherwise let the caller token's absolute lifetime exceed
-      // the 7-day max. verifySiweToken's issuedAt-vs-now check must reject it.
+      // the 7-day max. verifySiweMessage's issuedAt-vs-now check must reject it.
       const wallet = Wallet.createRandom();
       const issued = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
       const expires = new Date(Date.now() + (365 + 3) * 24 * 60 * 60 * 1000).toISOString();

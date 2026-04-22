@@ -15,7 +15,7 @@
 import type { Hono } from 'hono';
 import { SiweMessage } from 'siwe';
 import type { Sql } from '../db.js';
-import { verifySiweToken, encodeSiweToken, MAX_TOKEN_TTL_MS } from '../siwe-token.js';
+import { MAX_TOKEN_TTL_MS, verifySiweMessage } from '../siwe-token.js';
 import { issueCallerToken } from './caller-token.js';
 
 export interface SiweExchangeOptions {
@@ -49,15 +49,10 @@ export function mountSiweExchange(app: Hono, opts: SiweExchangeOptions): void {
     let walletAddress: string;
     let expiresAtMs: number;
     try {
-      // verifySiweToken expects the base64url-packed form used as a bearer
-      // today. Encode here so we share exactly one verification path (sig,
-      // domain, TTL cap, exp/iat sanity) with the existing agent-auth flow.
-      const packed = encodeSiweToken(message, signature);
-      walletAddress = await verifySiweToken(packed, { domain: opts.domain });
-      // Parse again only to read expirationTime for TTL — verifySiweToken
+      walletAddress = await verifySiweMessage(message, signature, { domain: opts.domain });
+      // Re-parse only to read expirationTime for TTL; verifySiweMessage
       // already validated it exists and is a valid date.
-      const parsed = new SiweMessage(message);
-      expiresAtMs = new Date(parsed.expirationTime!).getTime();
+      expiresAtMs = new Date(new SiweMessage(message).expirationTime!).getTime();
     } catch (err) {
       return c.json(
         { error: 'invalid_grant', error_description: (err as Error).message },
