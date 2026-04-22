@@ -15,6 +15,11 @@ BUNDLE_DIR="$WORK_DIR/vicoop-bridge-client-$VERSION"
 ARCHIVE_PATH="$OUT_DIR/vicoop-bridge-client-$VERSION.tgz"
 CHECKSUM_PATH="$ARCHIVE_PATH.sha256"
 
+if [[ ! -f "$ROOT_DIR/packages/client/dist/cli.js" ]]; then
+  echo "error: packages/client/dist/cli.js missing — run 'pnpm --filter @vicoop-bridge/protocol --filter @vicoop-bridge/client build' first" >&2
+  exit 1
+fi
+
 rm -rf "$WORK_DIR" "$ARCHIVE_PATH" "$CHECKSUM_PATH"
 mkdir -p "$WORK_DIR"
 
