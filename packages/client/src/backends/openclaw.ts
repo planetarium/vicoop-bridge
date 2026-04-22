@@ -86,6 +86,10 @@ interface ChatEventPayload {
   stopReason?: string;
 }
 
+type FinalizerCause = 'gateway_closed' | 'timeout';
+
+type FinalizerEvent = ChatEventPayload & { cause?: FinalizerCause };
+
 interface ChatSendAck {
   runId: string;
   status: 'started' | 'in_flight';
@@ -99,6 +103,7 @@ class GatewayClient {
   private ws: WebSocket | null = null;
   private pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   private eventHandlers = new Set<EventHandler>();
+  private closeListeners = new Set<(err: Error) => void>();
   private _state: ClientState = 'idle';
   private readyPromise: Promise<void> | null = null;
   private readyResolve: (() => void) | null = null;
@@ -109,7 +114,6 @@ class GatewayClient {
   constructor(
     private readonly url: string,
     private readonly token?: string,
-    private readonly onError?: (err: Error) => void,
   ) {
     this.identity = generateDeviceIdentity();
   }
@@ -143,6 +147,11 @@ class GatewayClient {
   onEvent(handler: EventHandler): () => void {
     this.eventHandlers.add(handler);
     return () => this.eventHandlers.delete(handler);
+  }
+
+  onClose(listener: (err: Error) => void): () => void {
+    this.closeListeners.add(listener);
+    return () => this.closeListeners.delete(listener);
   }
 
   async request<T = unknown>(method: string, params?: unknown): Promise<T> {
@@ -200,7 +209,16 @@ class GatewayClient {
     this.readyResolve = null;
     this.readyReject = null;
     this.ws = null;
-    this.onError?.(err);
+    const listeners = Array.from(this.closeListeners);
+    this.closeListeners.clear();
+    this.eventHandlers.clear();
+    for (const l of listeners) {
+      try {
+        l(err);
+      } catch (listenerErr) {
+        console.error('[openclaw] close listener threw:', (listenerErr as Error).message);
+      }
+    }
   }
 
   private abortWith(err: Error): void {
@@ -302,15 +320,30 @@ export function createOpenclawBackend(
   let current: GatewayClient | null = null;
   let connecting: Promise<GatewayClient> | null = null;
   const runToTask = new Map<string, { taskId: string; sessionKey: string }>();
-  const taskFinalizers = new Map<string, (evt: ChatEventPayload) => void>();
+  const taskFinalizers = new Map<string, (evt: FinalizerEvent) => void>();
+
+  function handleGatewayClose(c: GatewayClient, err: Error): void {
+    console.error('[openclaw] connection error:', err.message);
+    if (current === c) current = null;
+    // Fail every in-flight task that was running on this client so handle()
+    // does not hang forever waiting for a terminal event that can never come.
+    if (taskFinalizers.size === 0) return;
+    for (const fin of Array.from(taskFinalizers.values())) {
+      fin({
+        runId: '',
+        sessionKey: '',
+        seq: -1,
+        state: 'error',
+        errorMessage: `gateway closed: ${err.message}`,
+        cause: 'gateway_closed',
+      });
+    }
+  }
 
   async function ensureConnected(): Promise<GatewayClient> {
     if (current && current.state === 'ready') return current;
     if (connecting) return connecting;
-    const c = new GatewayClient(url, token, (err) => {
-      console.error('[openclaw] connection error:', err.message);
-      if (current === c) current = null;
-    });
+    const c = new GatewayClient(url, token);
     connecting = (async () => {
       try {
         await c.connect();
@@ -326,8 +359,12 @@ export function createOpenclawBackend(
           if (!binding) return;
           taskFinalizers.get(binding.taskId)?.(p);
         });
+        c.onClose((err) => handleGatewayClose(c, err));
         current = c;
         return c;
+      } catch (err) {
+        // connect() itself failed: nothing is registered yet, just propagate.
+        throw err;
       } finally {
         connecting = null;
       }
@@ -373,7 +410,7 @@ export function createOpenclawBackend(
       const runId = ack.runId;
       runToTask.set(runId, { taskId: task.taskId, sessionKey });
 
-      const settled = await new Promise<ChatEventPayload>((resolve) => {
+      const settled = await new Promise<FinalizerEvent>((resolve) => {
         taskFinalizers.set(task.taskId, (evt) => {
           if (evt.state === 'final' || evt.state === 'error' || evt.state === 'aborted') {
             resolve(evt);
@@ -384,6 +421,17 @@ export function createOpenclawBackend(
       taskFinalizers.delete(task.taskId);
       runToTask.delete(runId);
 
+      if (settled.cause === 'gateway_closed') {
+        emit({
+          type: 'task.fail',
+          taskId: task.taskId,
+          error: {
+            code: 'gateway_closed',
+            message: settled.errorMessage ?? 'gateway closed',
+          },
+        });
+        return;
+      }
       if (settled.state === 'error') {
         emit({
           type: 'task.fail',

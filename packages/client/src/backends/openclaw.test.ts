@@ -277,4 +277,37 @@ test('reconnect: after gateway close, next handle() opens a fresh WebSocket', as
   }
 });
 
+test('gateway close mid-run fails in-flight task deterministically', async () => {
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        // Ack, but never send a terminal event; the close will be the trigger.
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId: 'run-stuck', status: 'started' },
+          }),
+        );
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    const pending = backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f));
+    // Wait for the ack to arrive and handle() to register runToTask/finalizer.
+    await new Promise((r) => setTimeout(r, 50));
+    const sock = await fake.waitForConnection(0);
+    await fake.closeSocket(sock);
+    await pending;
+    const fail = frames.find((f) => f.type === 'task.fail');
+    assert.ok(fail, 'task must fail after gateway close');
+    assert.equal(fail!.error.code, 'gateway_closed');
+  } finally {
+    await fake.close();
+  }
+});
+
 export { createFakeGateway, makeTask };
