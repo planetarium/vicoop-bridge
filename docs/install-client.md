@@ -1,9 +1,13 @@
 # Install vicoop-bridge-client
 
-Onboarding guide for connecting a local A2A backend (OpenClaw, Claude Code,
-Codex, ...) to a deployed vicoop-bridge server. The end state is a
-long-running `vicoop-client` process on your host that bridges inbound A2A
+Onboarding guide for connecting a local A2A backend (OpenClaw, with `echo`
+available for testing) to a deployed vicoop-bridge server. The end state is
+a long-running `vicoop-client` process on your host that bridges inbound A2A
 traffic at `POST <bridge>/agents/<your-agent-id>` to your local backend.
+
+Additional backends (Claude Code, Codex, ...) are described in
+`docs/design.md` §5 but are not in the published client bundle yet —
+`packages/client/src/cli.ts` currently only registers `echo` and `openclaw`.
 
 This doc covers the **post-release install path** (the `install.sh`
 one-liner fetching a published `client-v*` bundle). Contrast with:
@@ -24,7 +28,8 @@ one-liner fetching a published `client-v*` bundle). Contrast with:
 ## Prerequisites
 
 - Node.js 20 or newer (`node -v`).
-- `curl`, `tar`, and one of `sha256sum` / `shasum`.
+- `curl`, `tar`, `jq`, and one of `sha256sum` / `shasum`. (`jq` is used by
+  the token-extraction snippets in Steps 2–3.)
 - A reachable bridge URL. The public deployment is
   `https://vicoop-bridge-server.fly.dev`; substitute your own below if you
   run the server yourself.
@@ -67,6 +72,13 @@ The script targets Linux (Fly.io persistent volumes are the original target
 deployment); on macOS it prints a warning and proceeds. See #17 / #21 for
 background.
 
+`install.sh` prints next-step instructions referencing
+`$INSTALL_DIR/card.json` as a placeholder path. The bundle does not ship
+that file — it ships `cards/openclaw.json` as a starting template. The rest
+of this doc points `--card` (and `AGENT_CARD`) at the shipped template
+directly; if you'd rather follow the printed path verbatim, copy the
+template to `$INSTALL_DIR/card.json` first.
+
 ## Step 2 — Obtain a caller token (SIWE)
 
 A caller token (`vbc_caller_*`) is the opaque session token you present to
@@ -90,8 +102,10 @@ TOKEN=$(a2a-wallet siwe auth \
 
 # The CLI's token is base64url(JSON({message, signature})). Decode to feed
 # the bridge's exchange endpoint, which wants a plain {message, signature}.
+# GNU base64 uses -d, BSD/macOS base64 uses -D — probe at runtime.
 PAD=$(printf '%*s' $(( (4 - ${#TOKEN} % 4) % 4 )) '' | tr ' ' '=')
-echo "${TOKEN}${PAD}" | tr '_-' '/+' | base64 -d > /tmp/siwe.json
+if printf '' | base64 -d >/dev/null 2>&1; then B64DEC='base64 -d'; else B64DEC='base64 -D'; fi
+echo "${TOKEN}${PAD}" | tr '_-' '/+' | $B64DEC > /tmp/siwe.json
 
 CALLER_TOKEN=$(curl -sX POST "$BRIDGE_URL/auth/siwe/exchange" \
   -H 'Content-Type: application/json' \
@@ -138,16 +152,21 @@ CLIENT_TOKEN=$(echo "$REG" | jq -r .data.registerClient.clientWithToken.token)
 
 `allowedAgentIds` is a whitelist — the client may only register as one of
 these agent IDs at WS connect time. Include every ID you plan to run under
-this single token; adding more later requires re-registration.
+this single token if you know them up front; you can also amend the
+allowlist later via the `updateClientAllowedAgents` GraphQL mutation
+(backed by `update_client_allowed_agents()` in `schema.sql`) without
+issuing a new token. Re-registration is only required if you intentionally
+want a new client with a fresh token.
 
 ### Choosing an agent_id
 
 The bridge has no pre-flight API to check whether an `agent_id` is already
 claimed by another wallet (see #41). A collision surfaces only at WS
-register time as `'agent id owned by a different wallet'`, and recovering
-requires issuing a new `CLIENT_TOKEN` with a different `allowedAgentIds` —
-so pick something unlikely to collide. Prefix with your wallet short hash,
-project name, or hostname:
+register time as `'agent id owned by a different wallet'`. Recovering is
+cheap — call `updateClientAllowedAgents` to swap to a different ID without
+rotating the token (issue a new `CLIENT_TOKEN` only if you intentionally
+want a new client). Still, pick something unlikely to collide up front;
+prefix with your wallet short hash, project name, or hostname:
 
 ```sh
 AGENT_ID="openclaw-$(hostname -s)"
@@ -177,8 +196,8 @@ and describe what callers can expect. At minimum you usually want to:
 - Tighten `description` to what this specific instance actually does.
 - Adjust `skills[]` if you've customized the backend.
 
-Schema reference: `packages/protocol/src/agent-card.ts` (validated by the
-client at startup — invalid cards exit with a Zod error).
+Schema reference: `packages/protocol/src/index.ts` (`AgentCard` Zod schema,
+validated by the client at startup — invalid cards exit with a Zod error).
 
 For other backends, write a fresh card:
 
@@ -302,9 +321,13 @@ Automatic restart on crash is tracked in #18.
   a fresh `agent_id` (re-register the client) or run from the original
   owner's wallet.
 
-- **`Authentication required`** on GraphQL — caller token missing or
-  expired. Re-run Step 2. SIWE nonces are single-use; you must re-sign
-  every exchange.
+- **`permission denied for function register_client`** (or similar) on
+  GraphQL — the caller token was missing, malformed, or expired, so the
+  request fell back to the `app_anonymous` Postgres role (see
+  `packages/server/src/postgraphile.ts`) which has no EXECUTE on
+  authenticated functions. Send a valid `Bearer vbc_caller_*` token; if
+  expired, re-run Step 2 to refresh via the SIWE exchange. SIWE nonces are
+  single-use, so every exchange needs a freshly signed message.
 
 - **`SIWE message has already expired`** — the `expirationTime` was in the
   past when the bridge verified it. Increase `--ttl` or check host clock
@@ -321,11 +344,14 @@ Automatic restart on crash is tracked in #18.
 
 ## What's next
 
-- **Bind more agents to the same token**: re-register with
-  `allowedAgentIds: ["openclaw-a", "openclaw-b", ...]` and run one
-  `vicoop-client` per id.
-- **Different backends**: pass `--backend claude-cli` or `--backend codex`
-  with a matching card. See `docs/design.md` §5.
+- **Bind more agents to the same token**: amend the existing client's
+  allowlist via the `updateClientAllowedAgents` GraphQL mutation (e.g. to
+  `["openclaw-a", "openclaw-b", ...]`) and run one `vicoop-client` per id.
+  No token rotation needed.
+- **Different backends**: in the published bundle today, pass
+  `--backend openclaw` or `--backend echo` with a matching card.
+  `claude-cli` / `codex` are described in `docs/design.md` §5 but are not
+  shipped yet.
 - **Audit/revoke access**: the admin agent exposes `list_caller_tokens`,
   `list_callers`, and `revoke_caller_token` tools; see the tool list in
   `packages/server/src/admin.ts`.
