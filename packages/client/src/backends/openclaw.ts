@@ -348,6 +348,11 @@ export interface OpenclawBackendOptions {
   taskTimeoutMs?: number;
   /** Max time (ms) to wait for the gateway handshake to complete. Default 10000. */
   handshakeTimeoutMs?: number;
+  /**
+   * Override the default process-based port discovery used on connect
+   * failure. Returns candidate ws:// URLs to try. Primarily for testing.
+   */
+  discoverGatewayUrls?: () => Promise<string[]>;
 }
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
@@ -356,10 +361,17 @@ const DEFAULT_DISCOVERY_PROCESS_NAME = 'openclaw';
 const DEFAULT_DISCOVERY_HANDSHAKE_TIMEOUT_MS = 3_000;
 const DISCOVERY_LSOF_TIMEOUT_MS = 2_000;
 
-// Parses `lsof -nP -iTCP -sTCP:LISTEN` output and returns listening TCP ports
-// bound to loopback or wildcard. Exported for unit testing.
-export function parseLsofListeningPorts(output: string): number[] {
-  const ports = new Set<number>();
+export interface DiscoveredListener {
+  host: string;
+  port: number;
+}
+
+// Parses `lsof -nP -iTCP -sTCP:LISTEN` output and returns listeners bound to
+// loopback or wildcard. The original bind host is preserved so callers can
+// distinguish IPv4/IPv6/wildcard binds. Exported for unit testing.
+export function parseLsofListeningPorts(output: string): DiscoveredListener[] {
+  const out: DiscoveredListener[] = [];
+  const seen = new Set<string>();
   for (const line of output.split('\n')) {
     // NAME column (last) for LISTEN rows looks like "127.0.0.1:3000 (LISTEN)"
     // or "*:18789 (LISTEN)" or "[::1]:3000 (LISTEN)".
@@ -374,9 +386,33 @@ export function parseLsofListeningPorts(output: string): number[] {
       host === '[::]';
     if (!loopback) continue;
     const port = Number(m[2]);
-    if (Number.isFinite(port) && port > 0) ports.add(port);
+    if (!Number.isFinite(port) || port <= 0) continue;
+    const key = `${host}:${port}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ host, port });
   }
-  return Array.from(ports);
+  return out;
+}
+
+// Expand a bind host into one or more ws:// URLs. Wildcard binds are expanded
+// to both IPv4 and IPv6 loopback so a dual-stack gateway is reachable either
+// way.
+export function listenersToGatewayUrls(listeners: DiscoveredListener[]): string[] {
+  const urls = new Set<string>();
+  for (const { host, port } of listeners) {
+    if (host === '127.0.0.1' || host === '0.0.0.0' || host === '*') {
+      urls.add(`ws://127.0.0.1:${port}`);
+    } else if (host === '[::1]') {
+      urls.add(`ws://[::1]:${port}`);
+    } else if (host === '[::]') {
+      // IPv6 wildcard — try both families; Node dual-stack defaults accept
+      // v4-mapped connections, but we probe v6 loopback too for safety.
+      urls.add(`ws://127.0.0.1:${port}`);
+      urls.add(`ws://[::1]:${port}`);
+    }
+  }
+  return Array.from(urls);
 }
 
 async function discoverLocalGatewayUrls(processName: string): Promise<string[]> {
@@ -387,7 +423,7 @@ async function discoverLocalGatewayUrls(processName: string): Promise<string[]> 
       ['-nP', '-iTCP', '-sTCP:LISTEN', '-c', processName],
       { timeout: DISCOVERY_LSOF_TIMEOUT_MS },
     );
-    return parseLsofListeningPorts(stdout).map((port) => `ws://127.0.0.1:${port}`);
+    return listenersToGatewayUrls(parseLsofListeningPorts(stdout));
   } catch {
     return [];
   }
@@ -400,6 +436,19 @@ function sameGatewayUrl(a: string, b: string): boolean {
     return ua.hostname === ub.hostname && ua.port === ub.port;
   } catch {
     return a === b;
+  }
+}
+
+// Discovery is only attempted when the configured URL targets the local
+// machine. A remote gateway that's temporarily unreachable must not silently
+// fall back to a local OpenClaw process — that would route tasks to the wrong
+// place.
+function isLoopbackUrl(u: string): boolean {
+  try {
+    const h = new URL(u).hostname; // WHATWG URL strips brackets for IPv6
+    return h === '127.0.0.1' || h === 'localhost' || h === '::1';
+  } catch {
+    return false;
   }
 }
 
@@ -490,6 +539,8 @@ export function createOpenclawBackend(
   let resolvedUrl = url;
   const discoveryProcessName =
     process.env.OPENCLAW_PROCESS_NAME ?? DEFAULT_DISCOVERY_PROCESS_NAME;
+  const discover =
+    opts.discoverGatewayUrls ?? (() => discoverLocalGatewayUrls(discoveryProcessName));
 
   async function connectAt(candidateUrl: string, hsTimeoutMs: number): Promise<GatewayClient> {
     const c = new GatewayClient(candidateUrl, token, hsTimeoutMs);
@@ -538,8 +589,11 @@ export function createOpenclawBackend(
       // Fall back to process-based discovery: locate any OpenClaw-named
       // process listening on loopback and try its port(s). Keeps the common
       // "gateway moved to a different port" case self-healing without any
-      // OpenClaw-side cooperation.
-      const candidates = await discoverLocalGatewayUrls(discoveryProcessName);
+      // OpenClaw-side cooperation. Skip when the configured URL is remote —
+      // a remote gateway outage must not silently reroute tasks to a local
+      // process.
+      if (!isLoopbackUrl(resolvedUrl)) throw primaryErr;
+      const candidates = await discover();
       const alternates = candidates.filter((u) => !sameGatewayUrl(u, resolvedUrl));
       if (alternates.length === 0) throw primaryErr;
       console.warn(

@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import WebSocket, { WebSocketServer } from 'ws';
-import { createOpenclawBackend, parseLsofListeningPorts } from './openclaw.js';
+import {
+  createOpenclawBackend,
+  listenersToGatewayUrls,
+  parseLsofListeningPorts,
+} from './openclaw.js';
 import type { UpFrame, TaskAssignFrame } from '@vicoop-bridge/protocol';
 
 interface ReqFrame {
@@ -609,7 +613,7 @@ test('gateway close mid-run fails in-flight task deterministically', async () =>
   }
 });
 
-test('parseLsofListeningPorts extracts loopback listen ports and ignores non-loopback', () => {
+test('parseLsofListeningPorts extracts loopback/wildcard listeners and preserves host', () => {
   const sample = [
     'COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME',
     'openclaw 1234 me    7u  IPv4 0x1111111111111111      0t0  TCP 127.0.0.1:3000 (LISTEN)',
@@ -618,8 +622,12 @@ test('parseLsofListeningPorts extracts loopback listen ports and ignores non-loo
     'openclaw 1234 me   10u  IPv4 0x4444444444444444      0t0  TCP 192.168.1.10:5000 (LISTEN)',
     'openclaw 1234 me   11u  IPv4 0x5555555555555555      0t0  TCP 127.0.0.1:6000->127.0.0.1:7000 (ESTABLISHED)',
   ].join('\n');
-  const ports = parseLsofListeningPorts(sample).sort((a, b) => a - b);
-  assert.deepEqual(ports, [3000, 4000, 18789]);
+  const listeners = parseLsofListeningPorts(sample).sort((a, b) => a.port - b.port);
+  assert.deepEqual(listeners, [
+    { host: '127.0.0.1', port: 3000 },
+    { host: '[::1]', port: 4000 },
+    { host: '*', port: 18789 },
+  ]);
 });
 
 test('parseLsofListeningPorts returns empty for empty / header-only input', () => {
@@ -627,26 +635,117 @@ test('parseLsofListeningPorts returns empty for empty / header-only input', () =
   assert.deepEqual(parseLsofListeningPorts('COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME'), []);
 });
 
+test('listenersToGatewayUrls expands wildcard binds to both IPv4 and IPv6 loopback', () => {
+  assert.deepEqual(listenersToGatewayUrls([{ host: '127.0.0.1', port: 3000 }]), ['ws://127.0.0.1:3000']);
+  assert.deepEqual(listenersToGatewayUrls([{ host: '[::1]', port: 4000 }]), ['ws://[::1]:4000']);
+  assert.deepEqual(listenersToGatewayUrls([{ host: '*', port: 5000 }]), ['ws://127.0.0.1:5000']);
+  assert.deepEqual(listenersToGatewayUrls([{ host: '0.0.0.0', port: 5000 }]), ['ws://127.0.0.1:5000']);
+  // IPv6 wildcard expands to both families so a v6-only-bound gateway still
+  // gets probed via [::1] and a dual-stack gateway is reachable via 127.0.0.1.
+  assert.deepEqual(listenersToGatewayUrls([{ host: '[::]', port: 6000 }]).sort(), [
+    'ws://127.0.0.1:6000',
+    'ws://[::1]:6000',
+  ]);
+});
+
 test('discovery fallback: when primary URL is dead and no candidates match, original error propagates', async () => {
-  // Use a deliberately bogus process name so `lsof -c <name>` matches nothing,
-  // forcing the fallback path to exit without candidates and surface the
-  // primary connect failure.
-  const prev = process.env.OPENCLAW_PROCESS_NAME;
-  process.env.OPENCLAW_PROCESS_NAME = '__vicoop_bridge_test_no_such_proc__';
+  const backend = createOpenclawBackend({
+    url: 'ws://127.0.0.1:1', // port 1 refuses TCP immediately
+    handshakeTimeoutMs: 1500,
+    discoverGatewayUrls: async () => [],
+  });
+  const frames: UpFrame[] = [];
+  await backend.handle(makeTask('t-disc', 'hi'), (f) => frames.push(f));
+  const fail = frames.find((f) => f.type === 'task.fail');
+  assert.ok(fail, 'task must fail when no gateway is reachable');
+  assert.equal(fail!.error.code, 'gateway_closed');
+});
+
+test('discovery fallback: primary URL dead, discovered candidate completes handshake, task succeeds', async () => {
+  let runCounter = 0;
+  const real = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        const runId = `run-disc-${++runCounter}`;
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId, status: 'started' },
+          }),
+        );
+        setImmediate(() => {
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId,
+                sessionKey: `agent:main:ctx-td${runCounter}`,
+                seq: 1,
+                state: 'final',
+                message: { text: `discovered-${runCounter}` },
+              },
+            }),
+          );
+        });
+      }
+    },
+  });
+  let discoverCalls = 0;
   try {
     const backend = createOpenclawBackend({
-      url: 'ws://127.0.0.1:1', // port 1 refuses TCP immediately
+      url: 'ws://127.0.0.1:1', // dead
       handshakeTimeoutMs: 1500,
+      discoverGatewayUrls: async () => {
+        discoverCalls++;
+        return [real.url];
+      },
     });
     const frames: UpFrame[] = [];
-    await backend.handle(makeTask('t-disc', 'hi'), (f) => frames.push(f));
-    const fail = frames.find((f) => f.type === 'task.fail');
-    assert.ok(fail, 'task must fail when no gateway is reachable');
-    assert.equal(fail!.error.code, 'gateway_closed');
+    await backend.handle(makeTask('td1', 'hi'), (f) => frames.push(f));
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete, 'task must complete via discovered URL');
+    assert.equal(complete!.status.state, 'completed');
+    assert.equal(discoverCalls, 1, 'discover should be invoked once on primary failure');
+
+    // Cache check: close the socket to force a reconnect, then send a second
+    // task. ensureConnected() should try the discovered URL directly without
+    // invoking discover again.
+    const sock = await real.waitForConnection(0);
+    await real.closeSocket(sock);
+    // Let the client process the WebSocket close event.
+    await new Promise((r) => setTimeout(r, 20));
+    const frames2: UpFrame[] = [];
+    await backend.handle(makeTask('td2', 'hi2'), (f) => frames2.push(f));
+    const complete2 = frames2.find((f) => f.type === 'task.complete');
+    assert.ok(complete2, 'second task must complete on reconnect');
+    assert.equal(discoverCalls, 1, 'discover must not re-run when primary (discovered) URL works');
   } finally {
-    if (prev === undefined) delete process.env.OPENCLAW_PROCESS_NAME;
-    else process.env.OPENCLAW_PROCESS_NAME = prev;
+    await real.close();
   }
+});
+
+test('discovery skipped when configured URL is remote (non-loopback)', async () => {
+  let discoverCalls = 0;
+  const backend = createOpenclawBackend({
+    // Non-loopback host that cannot connect quickly. Using .invalid TLD keeps
+    // DNS resolution local/fast-failing on most platforms, but we also bound
+    // the handshake to avoid a long hang.
+    url: 'ws://gateway.invalid:9999',
+    handshakeTimeoutMs: 1500,
+    discoverGatewayUrls: async () => {
+      discoverCalls++;
+      return ['ws://127.0.0.1:18789'];
+    },
+  });
+  const frames: UpFrame[] = [];
+  await backend.handle(makeTask('t-remote', 'hi'), (f) => frames.push(f));
+  const fail = frames.find((f) => f.type === 'task.fail');
+  assert.ok(fail, 'task must fail when remote gateway is unreachable');
+  assert.equal(fail!.error.code, 'gateway_closed');
+  assert.equal(discoverCalls, 0, 'discover must not be invoked for non-loopback URLs');
 });
 
 export { createFakeGateway, makeTask };
