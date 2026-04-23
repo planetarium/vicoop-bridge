@@ -400,8 +400,15 @@ function buildCandidateUrl(template: URL, host: '127.0.0.1' | '::1', port: numbe
   // and hash are all preserved while only host+port get swapped. Preserving
   // user-info matters when the configured URL carries credentials
   // (ws://user:pass@host:port) — dropping them would make the retry fail even
-  // on the right port. Avoids WHATWG URL hostname-setter quirks when swapping
-  // between address families.
+  // on the right port.
+  //
+  // Why not just clone the URL and set `.hostname`? Node's WHATWG URL setter
+  // silently refuses to swap an IPv4 hostname for `::1` (and vice versa),
+  // leaving the original host in place — so that approach would quietly lose
+  // the v6 candidate. Reconstructing via string interpolation is safe
+  // because `template.username` / `template.password` are exposed in their
+  // already-percent-encoded form by the URL parser, so special characters
+  // (e.g. `@`, `:`) in credentials round-trip correctly.
   const h = host === '::1' ? '[::1]' : host;
   const userInfo =
     template.username !== '' || template.password !== ''
@@ -458,10 +465,19 @@ async function discoverLocalGatewayUrls(processName: string, template: string): 
 }
 
 function sameGatewayUrl(a: string, b: string): boolean {
+  // Used to avoid re-trying the already-failed primary URL. Compare enough
+  // components that a candidate which only differs in protocol or pathname
+  // (e.g. `wss://` vs `ws://`, or a different WebSocket path) is still tried,
+  // since those changes can be the exact reason the primary failed.
   try {
     const ua = new URL(a);
     const ub = new URL(b);
-    return ua.hostname === ub.hostname && ua.port === ub.port;
+    return (
+      ua.protocol === ub.protocol &&
+      ua.hostname === ub.hostname &&
+      ua.port === ub.port &&
+      ua.pathname === ub.pathname
+    );
   } catch {
     return a === b;
   }
@@ -659,7 +675,6 @@ export function createOpenclawBackend(
         `[openclaw] connect to ${redactUrl(resolvedUrl)} failed (${(primaryErr as Error).message}); trying ${alternates.length} discovered candidate(s)`,
       );
       const probeTimeout = Math.min(handshakeTimeoutMs, DEFAULT_DISCOVERY_HANDSHAKE_TIMEOUT_MS);
-      let lastErr: Error = primaryErr as Error;
       for (const alt of alternates) {
         try {
           const c = await connectAt(alt, probeTimeout);
@@ -668,11 +683,19 @@ export function createOpenclawBackend(
           );
           resolvedUrl = alt;
           return c;
-        } catch (err) {
-          lastErr = err as Error;
+        } catch (candidateErr) {
+          if (debug) {
+            console.warn(
+              `[openclaw] discovered candidate ${redactUrl(alt)} failed: ${(candidateErr as Error).message}`,
+            );
+          }
         }
       }
-      throw lastErr;
+      // Surface the original connect failure instead of the last candidate's
+      // error — that's what the operator actually configured, and the
+      // candidate errors are downstream noise whose identity depends on scan
+      // order and false positives.
+      throw primaryErr;
     }
   }
 

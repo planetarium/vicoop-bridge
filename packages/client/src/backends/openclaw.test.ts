@@ -687,6 +687,20 @@ test('listenersToGatewayUrls preserves template userinfo when credentials are em
   );
 });
 
+test('listenersToGatewayUrls keeps percent-encoded userinfo intact for reserved chars', () => {
+  // `@` in a username and `:` in a password must remain percent-encoded in
+  // the rebuilt candidate, otherwise the authority component parses wrong.
+  const tpl = 'ws://alice%40admin:p%3Ass@127.0.0.1:18789/gateway';
+  const [candidate] = listenersToGatewayUrls([{ host: '127.0.0.1', port: 3000 }], tpl);
+  // Round-trip through URL to confirm the reserved chars decode back to the
+  // intended literals.
+  const parsed = new URL(candidate);
+  assert.equal(parsed.username, 'alice%40admin');
+  assert.equal(parsed.password, 'p%3Ass');
+  assert.equal(parsed.host, '127.0.0.1:3000');
+  assert.equal(parsed.pathname, '/gateway');
+});
+
 test('discovery fallback: when primary URL is dead and no candidates match, original error propagates', async () => {
   const backend = createOpenclawBackend({
     url: 'ws://127.0.0.1:1', // port 1 refuses TCP immediately
@@ -764,6 +778,30 @@ test('discovery fallback: primary URL dead, discovered candidate completes hands
   } finally {
     await real.close();
   }
+});
+
+test('discovery: when all candidates fail, the original primary connect error is surfaced', async () => {
+  // Candidates are all dead loopback ports. The final task.fail message must
+  // match the primary URL's connect error, not whichever candidate happened
+  // to fail last — the operator configured the primary URL, that's what
+  // diagnostics should point at.
+  const backend = createOpenclawBackend({
+    url: 'ws://127.0.0.1:1', // dead primary
+    handshakeTimeoutMs: 1500,
+    discoverGatewayUrls: async () => ['ws://127.0.0.1:2', 'ws://127.0.0.1:3'],
+  });
+  const frames: UpFrame[] = [];
+  await backend.handle(makeTask('t-allfail', 'hi'), (f) => frames.push(f));
+  const fail = frames.find((f) => f.type === 'task.fail');
+  assert.ok(fail);
+  assert.equal(fail!.error.code, 'gateway_closed');
+  // Primary URL was 127.0.0.1:1. The error message from connect ECONNREFUSED
+  // mentions the port that failed. The surfaced error must reference port 1
+  // (the configured primary), not 3 (the last candidate).
+  assert.ok(
+    /127\.0\.0\.1:1\b/.test(fail!.error.message),
+    `expected primary URL error (port 1), got: ${fail!.error.message}`,
+  );
 });
 
 test('discovery errors are swallowed so the primary connect failure still propagates', async () => {
