@@ -483,12 +483,27 @@ CREATE OR REPLACE FUNCTION agent_id_available(agent_id TEXT)
   SET search_path = pg_catalog, public
 AS $$
 BEGIN
+  -- Reject NULL/empty explicitly. Without this, `agent_id = NULL` matches no
+  -- rows and the function would return true, giving a misleading "available"
+  -- signal for an obviously invalid id (PostGraphile surfaces the arg as
+  -- nullable String).
+  IF agent_id_available.agent_id IS NULL OR agent_id_available.agent_id = '' THEN
+    RAISE EXCEPTION 'agent_id must be a non-empty string'
+      USING ERRCODE = 'invalid_parameter_value';
+  END IF;
   RETURN NOT EXISTS(
     SELECT 1 FROM public.agent_policies ap
     WHERE ap.agent_id = agent_id_available.agent_id
   );
 END;
 $$;
+
+-- Schema setup runs as a superuser, so without an explicit ALTER OWNER the
+-- definer context would be superuser — overkill for reading one table and a
+-- latent escalation surface for future edits. app_postgraphile already has
+-- the RLS-bypass policy on agent_policies, which is exactly (and only) what
+-- this function needs to cross-wallet SELECT.
+ALTER FUNCTION agent_id_available(TEXT) OWNER TO app_postgraphile;
 
 COMMENT ON FUNCTION agent_id_available(TEXT) IS
   'Check whether an agent_id is free to claim. Returns true when no agent_policies row holds the id, false when any wallet (including the caller) already owns it. Never exposes owner_wallet or other metadata — boolean only. Intended as a pre-registration probe so callers can avoid issuing a CLIENT_TOKEN bound to an agent id that the WS register step would reject.';

@@ -103,3 +103,48 @@ test(
     }
   },
 );
+
+test(
+  'app_anonymous cannot execute agent_id_available (enumeration closed)',
+  { skip: !hasDb },
+  async () => {
+    // GRANTs intentionally exclude app_anonymous so a caller without a
+    // vbc_caller_* token cannot probe the existence of arbitrary agent ids.
+    // Lock this in: if a future edit widens the grant, this test fails.
+    const sql = postgres(process.env.DATABASE_URL!);
+    try {
+      await assert.rejects(
+        () =>
+          sql.begin(async (tx) => {
+            await tx`SET LOCAL ROLE app_anonymous`;
+            await tx`SELECT agent_id_available('any-id')`;
+          }),
+        /permission denied/i,
+      );
+    } finally {
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'NULL or empty agent_id is rejected with invalid_parameter_value',
+  { skip: !hasDb },
+  async () => {
+    // Without the explicit guard, ap.agent_id = NULL matches no rows and the
+    // function would return true for a plainly invalid input. Same for ''.
+    const sql = postgres(process.env.DATABASE_URL!);
+    try {
+      await assert.rejects(
+        () => sql`SELECT agent_id_available(${null as unknown as string})`,
+        /non-empty string/,
+      );
+      await assert.rejects(
+        () => sql`SELECT agent_id_available('')`,
+        /non-empty string/,
+      );
+    } finally {
+      await sql.end();
+    }
+  },
+);
