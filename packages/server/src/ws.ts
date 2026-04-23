@@ -4,6 +4,7 @@ import { parseUpFrame, PROTOCOL_VERSION, type Part, type TaskStatus } from '@vic
 import type { Registry } from './registry.js';
 import type { Sql } from './db.js';
 import { hashToken } from './token.js';
+import { logEvent, truncate } from './log.js';
 
 interface ClientRow {
   id: string;
@@ -92,23 +93,16 @@ async function authenticateAndRegister(
   const hash = hashToken(frame.token);
   const client = await lookupByTokenHash(opts.db, hash);
   if (!client) {
-    console.log(JSON.stringify({
-      event: 'client_rejected',
-      reason: 'bad token',
-      agentId: frame.agentId,
-      ts: new Date().toISOString(),
-    }));
+    logEvent('client_rejected', { reason: 'bad token', agentId: frame.agentId });
     return { ok: false, code: 4005, reason: 'bad token' };
   }
   if (!client.allowed_agent_ids.includes(frame.agentId)) {
-    console.log(JSON.stringify({
-      event: 'client_rejected',
+    logEvent('client_rejected', {
       reason: 'agent not allowed',
       agentId: frame.agentId,
       clientId: client.id,
       allowed: client.allowed_agent_ids,
-      ts: new Date().toISOString(),
-    }));
+    });
     return { ok: false, code: 4008, reason: 'agent id not authorized for this client' };
   }
   const clientId = client.id;
@@ -116,13 +110,11 @@ async function authenticateAndRegister(
 
   const policyResult = await ensureAgentPolicy(opts.db, frame.agentId, ownerWallet, clientId);
   if (!policyResult.ok) {
-    console.log(JSON.stringify({
-      event: 'client_rejected',
+    logEvent('client_rejected', {
       reason: policyResult.reason,
       agentId: frame.agentId,
       clientId,
-      ts: new Date().toISOString(),
-    }));
+    });
     return { ok: false, code: 4010, reason: policyResult.reason };
   }
 
@@ -136,13 +128,11 @@ async function authenticateAndRegister(
     connectedAt: Date.now(),
   });
   if (!result.ok) {
-    console.log(JSON.stringify({
-      event: 'client_rejected',
+    logEvent('client_rejected', {
       reason: result.reason,
       agentId: frame.agentId,
       clientId,
-      ts: new Date().toISOString(),
-    }));
+    });
     return { ok: false, code: 4006, reason: result.reason };
   }
 
@@ -204,13 +194,11 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         agentId = frame.agentId;
         authed = true;
         clearTimeout(helloTimeout);
-        console.log(JSON.stringify({
-          event: 'client_connected',
+        logEvent('client_connected', {
           agentId,
           clientId: result.clientId,
           name: frame.agentCard.name,
-          ts: new Date().toISOString(),
-        }));
+        });
       }).catch((err) => {
         console.error('[server] auth error:', err);
         ws.close(1011, 'internal error');
@@ -261,6 +249,11 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         });
         b.eventBus.finished();
         opts.registry.unbindTask(frame.taskId);
+        logEvent('task_completed', {
+          agentId: b.agentId,
+          taskId: frame.taskId,
+          state: frame.status.state,
+        });
         break;
       }
       case 'task.fail': {
@@ -286,6 +279,12 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         });
         b.eventBus.finished();
         opts.registry.unbindTask(frame.taskId);
+        logEvent('task_failed_by_client', {
+          agentId: b.agentId,
+          taskId: frame.taskId,
+          errorCode: frame.error.code,
+          errorMessage: truncate(frame.error.message, 256),
+        });
         break;
       }
       case 'pong':
@@ -299,7 +298,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
   ws.on('close', () => {
     clearTimeout(helloTimeout);
     if (agentId) {
-      console.log(JSON.stringify({ event: 'client_disconnected', agentId, ts: new Date().toISOString() }));
+      logEvent('client_disconnected', { agentId });
       opts.registry.unregisterAgent(agentId, ws);
     }
   });

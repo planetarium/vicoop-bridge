@@ -22,6 +22,7 @@ import { mountSiweExchange } from './auth/siwe-exchange.js';
 import type { GoogleConfig } from './auth/google-oauth.js';
 import type { Sql } from './db.js';
 import { Landing } from './landing.js';
+import { logEvent } from './log.js';
 
 export interface ServerHttpOptions {
   registry: Registry;
@@ -322,6 +323,10 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   });
   app.post('/agents/:id', authMw, async (c) => {
     const conn = getAgentConn(c);
+    logEvent('agent_request', {
+      agentId: conn.agentId,
+      hasAuth: !!c.req.header('Authorization'),
+    });
 
     const rawBody = await c.req.text();
     const transport = getTransport(conn);
