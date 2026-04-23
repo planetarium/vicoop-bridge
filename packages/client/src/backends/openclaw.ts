@@ -457,6 +457,19 @@ function sameGatewayUrl(a: string, b: string): boolean {
   }
 }
 
+// Strip query, hash, and user-info from a gateway URL before logging so
+// credentials embedded in a token query param (or userinfo) don't leak into
+// stdout. Keeps protocol + host + port + pathname, which is what operators
+// actually need to diagnose a connect failure. Exported for unit testing.
+export function redactUrl(u: string): string {
+  try {
+    const p = new URL(u);
+    return `${p.protocol}//${p.host}${p.pathname}`;
+  } catch {
+    return '<unparseable-url>';
+  }
+}
+
 // Discovery is only attempted when the configured URL targets the local
 // machine. A remote gateway that's temporarily unreachable must not silently
 // fall back to a local OpenClaw process — that would route tasks to the wrong
@@ -602,7 +615,7 @@ export function createOpenclawBackend(
   async function tryConnectWithDiscovery(): Promise<GatewayClient> {
     try {
       const c = await connectAt(resolvedUrl, handshakeTimeoutMs);
-      console.log(`[openclaw] connected ${resolvedUrl}`);
+      console.log(`[openclaw] connected ${redactUrl(resolvedUrl)}`);
       return c;
     } catch (primaryErr) {
       // Fall back to process-based discovery: locate any OpenClaw-named
@@ -616,14 +629,16 @@ export function createOpenclawBackend(
       const alternates = candidates.filter((u) => !sameGatewayUrl(u, resolvedUrl));
       if (alternates.length === 0) throw primaryErr;
       console.warn(
-        `[openclaw] connect to ${resolvedUrl} failed (${(primaryErr as Error).message}); trying ${alternates.length} discovered candidate(s)`,
+        `[openclaw] connect to ${redactUrl(resolvedUrl)} failed (${(primaryErr as Error).message}); trying ${alternates.length} discovered candidate(s)`,
       );
       const probeTimeout = Math.min(handshakeTimeoutMs, DEFAULT_DISCOVERY_HANDSHAKE_TIMEOUT_MS);
       let lastErr: Error = primaryErr as Error;
       for (const alt of alternates) {
         try {
           const c = await connectAt(alt, probeTimeout);
-          console.log(`[openclaw] auto-discovered gateway at ${alt} (was ${resolvedUrl})`);
+          console.log(
+            `[openclaw] auto-discovered gateway at ${redactUrl(alt)} (was ${redactUrl(resolvedUrl)})`,
+          );
           resolvedUrl = alt;
           return c;
         } catch (err) {

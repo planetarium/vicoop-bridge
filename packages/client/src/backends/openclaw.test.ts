@@ -7,6 +7,7 @@ import {
   createOpenclawBackend,
   listenersToGatewayUrls,
   parseLsofListeningPorts,
+  redactUrl,
 } from './openclaw.js';
 import type { UpFrame, TaskAssignFrame } from '@vicoop-bridge/protocol';
 
@@ -649,6 +650,16 @@ test('listenersToGatewayUrls maps each bind family correctly', () => {
     'ws://127.0.0.1:6000/',
     'ws://[::1]:6000/',
   ]);
+});
+
+test('redactUrl strips query, hash, and userinfo but keeps protocol/host/port/path', () => {
+  assert.equal(
+    redactUrl('wss://user:pass@127.0.0.1:18789/gateway?token=secret#frag'),
+    'wss://127.0.0.1:18789/gateway',
+  );
+  assert.equal(redactUrl('ws://127.0.0.1:3000?token=abc'), 'ws://127.0.0.1:3000/');
+  assert.equal(redactUrl('ws://[::1]:4000/path'), 'ws://[::1]:4000/path');
+  assert.equal(redactUrl('not a url'), '<unparseable-url>');
 });
 
 test('listenersToGatewayUrls preserves template protocol / pathname / search', () => {
