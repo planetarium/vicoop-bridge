@@ -642,7 +642,17 @@ export function createOpenclawBackend(
       // a remote gateway outage must not silently reroute tasks to a local
       // process.
       if (!isLoopbackUrl(resolvedUrl)) throw primaryErr;
-      const candidates = await discover();
+      // Discovery is best-effort. An injected discoverGatewayUrls that throws
+      // must not mask the original connect error, so treat any rejection as
+      // "no candidates" and fall through to surface the primary failure.
+      let candidates: string[] = [];
+      try {
+        candidates = await discover();
+      } catch (discoverErr) {
+        if (debug) {
+          console.warn(`[openclaw] discover() threw, treating as empty: ${(discoverErr as Error).message}`);
+        }
+      }
       const alternates = candidates.filter((u) => !sameGatewayUrl(u, resolvedUrl));
       if (alternates.length === 0) throw primaryErr;
       console.warn(

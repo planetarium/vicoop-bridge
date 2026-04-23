@@ -766,6 +766,27 @@ test('discovery fallback: primary URL dead, discovered candidate completes hands
   }
 });
 
+test('discovery errors are swallowed so the primary connect failure still propagates', async () => {
+  const backend = createOpenclawBackend({
+    url: 'ws://127.0.0.1:1', // dead
+    handshakeTimeoutMs: 1500,
+    discoverGatewayUrls: async () => {
+      throw new Error('boom: discovery exploded');
+    },
+  });
+  const frames: UpFrame[] = [];
+  await backend.handle(makeTask('t-boom', 'hi'), (f) => frames.push(f));
+  const fail = frames.find((f) => f.type === 'task.fail');
+  assert.ok(fail, 'task must fail even when discovery itself throws');
+  assert.equal(fail!.error.code, 'gateway_closed');
+  // The message should be the original connect error, not "boom: discovery
+  // exploded" — discovery failures are best-effort and must not mask it.
+  assert.ok(
+    !/boom: discovery exploded/.test(fail!.error.message),
+    `expected primary connect error, got: ${fail!.error.message}`,
+  );
+});
+
 test('discovery runs when configured URL uses a wildcard bind address (0.0.0.0 / ::)', async () => {
   // Users sometimes copy a local bind URL (ws://0.0.0.0:<port>) into config.
   // Those should be treated as local for the purpose of allowing discovery.
