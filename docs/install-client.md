@@ -49,9 +49,13 @@ The one-liner downloads the latest `client-v*` release, verifies its
 `.sha256`, and extracts into `$INSTALL_DIR`:
 
 ```sh
-INSTALL_DIR="$HOME/vicoop-bridge-client" \
-  curl -fsSL https://raw.githubusercontent.com/planetarium/vicoop-bridge/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/planetarium/vicoop-bridge/main/install.sh \
+  | INSTALL_DIR="$HOME/vicoop-bridge-client" sh
 ```
+
+The env assignment has to sit on the `sh` side of the pipe — prefixing the
+`curl` call would scope `INSTALL_DIR` to curl's process only, and `install.sh`
+would still default to `/data/vicoop-bridge-client`.
 
 | Env | Default | Purpose |
 |---|---|---|
