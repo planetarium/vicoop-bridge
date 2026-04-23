@@ -438,7 +438,10 @@ async function discoverLocalGatewayUrls(processName: string, template: string): 
   try {
     const { stdout } = await execFileP(
       'lsof',
-      ['-nP', '-iTCP', '-sTCP:LISTEN', '-c', processName],
+      // `-a` AND-s the selectors below; without it lsof OR-s them and returns
+      // every LISTEN socket on the host plus every file handle owned by the
+      // target process, which produces false candidates and extra latency.
+      ['-nP', '-a', '-iTCP', '-sTCP:LISTEN', '-c', processName],
       { timeout: DISCOVERY_LSOF_TIMEOUT_MS },
     );
     return listenersToGatewayUrls(parseLsofListeningPorts(stdout), template);
