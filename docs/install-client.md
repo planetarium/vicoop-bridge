@@ -267,7 +267,15 @@ All flags also accept env vars, which is usually cleaner for long-running
 services:
 
 ```sh
-SERVER_URL="wss://${BRIDGE_URL#https://}" \
+# The client appends /connect to SERVER_URL, so it must be a bare origin
+# (scheme+host+port only, no path). Derive via URL parsing and map the
+# scheme to its WS counterpart.
+SERVER_URL=$(BRIDGE_URL="$BRIDGE_URL" node -p '
+  const u = new URL(process.env.BRIDGE_URL);
+  (u.protocol === "https:" ? "wss:" : "ws:") + "//" + u.host
+')
+
+SERVER_URL="$SERVER_URL" \
 SERVER_TOKEN="$CLIENT_TOKEN" \
 AGENT_ID="$AGENT_ID" \
 AGENT_CARD="$INSTALL_DIR/cards/openclaw.json" \
@@ -351,7 +359,9 @@ Put `SERVER_URL=...`, `SERVER_TOKEN=...`, etc. in
 ### Tmux (interactive hosts)
 
 ```sh
-tmux new -d -s vbc 'sh -c "set -a; . \"$HOME/.config/vicoop-client.env\"; set +a; exec \"$INSTALL_DIR/bin/vicoop-client\""'
+# Swap the hardcoded path if you installed elsewhere. The inner sh is
+# spawned fresh by tmux, so don't rely on $INSTALL_DIR being exported here.
+tmux new -d -s vbc 'sh -c "set -a; . \"$HOME/.config/vicoop-client.env\"; set +a; exec \"$HOME/vicoop-bridge-client/bin/vicoop-client\""'
 tmux attach -t vbc   # to watch logs
 ```
 
