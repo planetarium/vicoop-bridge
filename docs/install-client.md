@@ -100,17 +100,17 @@ TOKEN=$(a2a-wallet siwe auth \
   --ttl 1h \
   --json | jq -r .token)
 
-# The CLI's token is base64url(JSON({message, signature})). Decode to feed
-# the bridge's exchange endpoint, which wants a plain {message, signature}.
-# GNU base64 uses -d, BSD/macOS base64 uses -D — probe at runtime.
+# The CLI's token is base64url(JSON({message, signature})). Decode and pipe
+# the {message, signature} JSON straight into the exchange endpoint — never
+# write the signed payload to disk where another local user could read it
+# off /tmp before we delete it. GNU base64 uses -d, BSD/macOS uses -D.
 PAD=$(printf '%*s' $(( (4 - ${#TOKEN} % 4) % 4 )) '' | tr ' ' '=')
 if printf '' | base64 -d >/dev/null 2>&1; then B64DEC='base64 -d'; else B64DEC='base64 -D'; fi
-echo "${TOKEN}${PAD}" | tr '_-' '/+' | $B64DEC > /tmp/siwe.json
 
-CALLER_TOKEN=$(curl -sX POST "$BRIDGE_URL/auth/siwe/exchange" \
-  -H 'Content-Type: application/json' \
-  --data @/tmp/siwe.json | jq -r .access_token)
-rm /tmp/siwe.json
+CALLER_TOKEN=$(echo "${TOKEN}${PAD}" | tr '_-' '/+' | $B64DEC \
+  | curl -sX POST "$BRIDGE_URL/auth/siwe/exchange" \
+      -H 'Content-Type: application/json' --data-binary @- \
+  | jq -r .access_token)
 
 echo "$CALLER_TOKEN"  # vbc_caller_...
 ```
@@ -317,9 +317,12 @@ Automatic restart on crash is tracked in #18.
 ## Troubleshooting
 
 - **`agent id owned by a different wallet`** (WS register) — your wallet is
-  not the `owner_wallet` on the existing `agent_policies` row. Either pick
-  a fresh `agent_id` (re-register the client) or run from the original
-  owner's wallet.
+  not the `owner_wallet` on the existing `agent_policies` row. Pick a
+  different `agent_id`, amend the existing client's allowlist via
+  `updateClientAllowedAgents` (no token rotation), and restart
+  `vicoop-client` with the new `AGENT_ID`. Re-run Step 3 only if you
+  intentionally want a new client/token; otherwise sign in from the
+  original owner's wallet.
 
 - **`permission denied for function register_client`** (or similar) on
   GraphQL — the caller token was missing, malformed, or expired, so the
