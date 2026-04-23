@@ -4,7 +4,12 @@ A2A Server + Client for exposing local coding agents (OpenClaw, Claude Code, Cod
 
 Agents connect *outbound* to a public Server via WebSocket, so they can sit behind NAT/firewalls while still being addressable by external A2A clients.
 
-See [`docs/design.md`](./docs/design.md) for the full design.
+Docs:
+
+- [`docs/design.md`](./docs/design.md) — architectural design
+- [`docs/install-client.md`](./docs/install-client.md) — onboarding a new client against a deployed bridge
+- [`docs/remote-testing.md`](./docs/remote-testing.md) — end-to-end testing against a deployed bridge
+- [`docs/local-testing.md`](./docs/local-testing.md) — running both bridge and client from source
 
 ## Client Releases
 
@@ -17,11 +22,9 @@ git tag client-v0.1.0
 git push origin client-v0.1.0
 ```
 
-After extracting the release bundle, run the client with:
-
-```bash
-./bin/vicoop-client --help
-```
+Operators installing from a published release should follow
+[`docs/install-client.md`](./docs/install-client.md) — the one-liner
+installer plus SIWE/registerClient flow for obtaining a client token.
 
 ## Status
 
