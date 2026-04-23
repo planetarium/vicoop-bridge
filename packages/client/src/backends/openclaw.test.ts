@@ -672,6 +672,21 @@ test('listenersToGatewayUrls preserves template protocol / pathname / search', (
   ]);
 });
 
+test('listenersToGatewayUrls preserves template userinfo when credentials are embedded', () => {
+  assert.deepEqual(
+    listenersToGatewayUrls(
+      [{ host: '127.0.0.1', port: 3000 }],
+      'ws://user:pass@127.0.0.1:18789/',
+    ),
+    ['ws://user:pass@127.0.0.1:3000/'],
+  );
+  // Username-only (no password) is preserved without a trailing colon.
+  assert.deepEqual(
+    listenersToGatewayUrls([{ host: '[::1]', port: 3000 }], 'ws://user@127.0.0.1:18789/'),
+    ['ws://user@[::1]:3000/'],
+  );
+});
+
 test('discovery fallback: when primary URL is dead and no candidates match, original error propagates', async () => {
   const backend = createOpenclawBackend({
     url: 'ws://127.0.0.1:1', // port 1 refuses TCP immediately
@@ -749,6 +764,26 @@ test('discovery fallback: primary URL dead, discovered candidate completes hands
   } finally {
     await real.close();
   }
+});
+
+test('discovery runs when configured URL uses a wildcard bind address (0.0.0.0 / ::)', async () => {
+  // Users sometimes copy a local bind URL (ws://0.0.0.0:<port>) into config.
+  // Those should be treated as local for the purpose of allowing discovery.
+  let discoverCalls = 0;
+  const backend = createOpenclawBackend({
+    url: 'ws://0.0.0.0:1', // wildcard bind, port 1 refuses TCP
+    handshakeTimeoutMs: 1500,
+    discoverGatewayUrls: async () => {
+      discoverCalls++;
+      return [];
+    },
+  });
+  const frames: UpFrame[] = [];
+  await backend.handle(makeTask('t-wild', 'hi'), (f) => frames.push(f));
+  assert.equal(discoverCalls, 1, 'discover must run for wildcard bind URLs');
+  const fail = frames.find((f) => f.type === 'task.fail');
+  assert.ok(fail);
+  assert.equal(fail!.error.code, 'gateway_closed');
 });
 
 test('discovery skipped when configured URL is remote (non-loopback)', async () => {

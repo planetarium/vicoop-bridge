@@ -396,11 +396,18 @@ export function parseLsofListeningPorts(output: string): DiscoveredListener[] {
 }
 
 function buildCandidateUrl(template: URL, host: '127.0.0.1' | '::1', port: number): string {
-  // Reconstruct from parts so protocol (ws/wss), pathname, search, and hash
-  // are all preserved while only host+port get swapped. Avoids WHATWG URL
-  // hostname-setter quirks when swapping between address families.
+  // Reconstruct from parts so protocol (ws/wss), user-info, pathname, search,
+  // and hash are all preserved while only host+port get swapped. Preserving
+  // user-info matters when the configured URL carries credentials
+  // (ws://user:pass@host:port) — dropping them would make the retry fail even
+  // on the right port. Avoids WHATWG URL hostname-setter quirks when swapping
+  // between address families.
   const h = host === '::1' ? '[::1]' : host;
-  return `${template.protocol}//${h}:${port}${template.pathname}${template.search}${template.hash}`;
+  const userInfo =
+    template.username !== '' || template.password !== ''
+      ? `${template.username}${template.password !== '' ? `:${template.password}` : ''}@`
+      : '';
+  return `${template.protocol}//${userInfo}${h}:${port}${template.pathname}${template.search}${template.hash}`;
 }
 
 // Expand a bind host + port into ws:// candidate URLs derived from `template`
@@ -476,11 +483,18 @@ export function redactUrl(u: string): string {
 // Discovery is only attempted when the configured URL targets the local
 // machine. A remote gateway that's temporarily unreachable must not silently
 // fall back to a local OpenClaw process — that would route tasks to the wrong
-// place.
+// place. Wildcard binds (`0.0.0.0`, `::`) count as local too, since users may
+// copy a local bind address like `ws://0.0.0.0:<port>` into config.
 function isLoopbackUrl(u: string): boolean {
   try {
     const h = new URL(u).hostname; // WHATWG URL strips brackets for IPv6
-    return h === '127.0.0.1' || h === 'localhost' || h === '::1';
+    return (
+      h === '127.0.0.1' ||
+      h === '0.0.0.0' ||
+      h === 'localhost' ||
+      h === '::1' ||
+      h === '::'
+    );
   } catch {
     return false;
   }
