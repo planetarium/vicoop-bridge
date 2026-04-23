@@ -476,11 +476,15 @@ CREATE OR REPLACE FUNCTION agent_id_available(agent_id TEXT)
   RETURNS BOOLEAN
   LANGUAGE plpgsql STABLE
   SECURITY DEFINER
-  SET search_path = public, pg_temp
+  -- pg_catalog first, public second, and pg_temp is intentionally absent:
+  -- with pg_temp in the path any role that can CREATE TEMP could shadow an
+  -- unqualified reference and hijack a definer-privileged resolution. The
+  -- function schema-qualifies agent_policies for the same reason.
+  SET search_path = pg_catalog, public
 AS $$
 BEGIN
   RETURN NOT EXISTS(
-    SELECT 1 FROM agent_policies ap
+    SELECT 1 FROM public.agent_policies ap
     WHERE ap.agent_id = agent_id_available.agent_id
   );
 END;
