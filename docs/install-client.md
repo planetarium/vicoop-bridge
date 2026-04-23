@@ -191,11 +191,19 @@ this probe and your WS register; if another wallet claims the id in
 between, Step 5 emits `'agent id owned by a different wallet'` and you can
 fall back to the recovery path in "Troubleshooting".
 
-Even with the probe, prefer names unlikely to collide across operators:
+Even with the probe, prefer names unlikely to collide across operators.
+Pick one:
 
 ```sh
+# By hostname
 AGENT_ID="openclaw-$(hostname | cut -d. -f1)"
-AGENT_ID="openclaw-$(printf '%s' "${WALLET#0x}" | cut -c1-6)"   # first 6 hex chars of your EOA
+
+# By wallet prefix — derive WALLET from a2a-wallet status (same format used
+# later for add_caller); strip the 0x and take the first 6 hex chars
+WALLET=$(a2a-wallet status | awk '/Address/{print tolower($2)}')
+AGENT_ID="openclaw-$(printf '%s' "${WALLET#0x}" | cut -c1-6)"
+
+# Random
 AGENT_ID="$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)-openclaw"
 ```
 
