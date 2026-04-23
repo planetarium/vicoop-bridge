@@ -4,7 +4,7 @@ import { parseUpFrame, PROTOCOL_VERSION, type Part, type TaskStatus } from '@vic
 import type { Registry } from './registry.js';
 import type { Sql } from './db.js';
 import { hashToken } from './token.js';
-import { logEvent } from './log.js';
+import { logEvent, truncate } from './log.js';
 
 interface ClientRow {
   id: string;
@@ -283,7 +283,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           agentId: b.agentId,
           taskId: frame.taskId,
           errorCode: frame.error.code,
-          errorMessage: frame.error.message,
+          errorMessage: truncate(frame.error.message, 256),
         });
         break;
       }

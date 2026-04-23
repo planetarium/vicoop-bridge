@@ -3,7 +3,7 @@ import type { ClientConnection, Registry } from './registry.js';
 import type { Sql } from './db.js';
 import { CALLER_TOKEN_PREFIX, verifyCallerToken } from './auth/caller-token.js';
 import { matchPrincipal, type VerifiedCaller } from './auth/principal.js';
-import { logEvent } from './log.js';
+import { logEvent, truncate } from './log.js';
 
 export function getAgentConn(c: Context): ClientConnection {
   return c.get('agentConn') as ClientConnection;
@@ -74,7 +74,7 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
       logEvent('agent_request_rejected', {
         agentId,
         reason: 'invalid_token',
-        detail: (err as Error).message,
+        detail: truncate((err as Error).message, 256),
       });
       return c.json({
         jsonrpc: '2.0',
