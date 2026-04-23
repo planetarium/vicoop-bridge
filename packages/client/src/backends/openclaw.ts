@@ -489,6 +489,20 @@ function sameGatewayUrl(a: string, b: string): boolean {
   }
 }
 
+// Defensive error-to-string: catch clauses receive `unknown`, so a rejection
+// with `null`, a plain object, or a primitive would crash the logging path
+// that tries to read `.message`. Always return a string suitable for logs
+// without throwing.
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === 'string') return e;
+  try {
+    return String(e);
+  } catch {
+    return '<unrepresentable>';
+  }
+}
+
 // Strip query, hash, and user-info from a gateway URL before logging so
 // credentials embedded in a token query param (or userinfo) don't leak into
 // stdout. Keeps protocol + host + port + pathname, which is what operators
@@ -672,13 +686,13 @@ export function createOpenclawBackend(
         candidates = await discover();
       } catch (discoverErr) {
         if (debug) {
-          console.warn(`[openclaw] discover() threw, treating as empty: ${(discoverErr as Error).message}`);
+          console.warn(`[openclaw] discover() threw, treating as empty: ${errorMessage(discoverErr)}`);
         }
       }
       const alternates = candidates.filter((u) => !sameGatewayUrl(u, resolvedUrl));
       if (alternates.length === 0) throw primaryErr;
       console.warn(
-        `[openclaw] connect to ${redactUrl(resolvedUrl)} failed (${(primaryErr as Error).message}); trying ${alternates.length} discovered candidate(s)`,
+        `[openclaw] connect to ${redactUrl(resolvedUrl)} failed (${errorMessage(primaryErr)}); trying ${alternates.length} discovered candidate(s)`,
       );
       const probeTimeout = Math.min(handshakeTimeoutMs, DEFAULT_DISCOVERY_HANDSHAKE_TIMEOUT_MS);
       for (const alt of alternates) {
@@ -692,7 +706,7 @@ export function createOpenclawBackend(
         } catch (candidateErr) {
           if (debug) {
             console.warn(
-              `[openclaw] discovered candidate ${redactUrl(alt)} failed: ${(candidateErr as Error).message}`,
+              `[openclaw] discovered candidate ${redactUrl(alt)} failed: ${errorMessage(candidateErr)}`,
             );
           }
         }

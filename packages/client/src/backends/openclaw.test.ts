@@ -825,6 +825,27 @@ test('discovery errors are swallowed so the primary connect failure still propag
   );
 });
 
+test('discovery error logging is defensive against non-Error rejections', async () => {
+  // Reject with `null` — reading `.message` on it would throw TypeError and
+  // could mask the primary connect failure. errorMessage() must render it as
+  // a string without throwing, so the primary error still surfaces.
+  const backend = createOpenclawBackend({
+    url: 'ws://127.0.0.1:1',
+    handshakeTimeoutMs: 1500,
+    debug: true, // exercise the debug log path
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    discoverGatewayUrls: (async () => {
+      // eslint-disable-next-line @typescript-eslint/no-throw-literal
+      throw null as unknown;
+    }) as () => Promise<string[]>,
+  });
+  const frames: UpFrame[] = [];
+  await backend.handle(makeTask('t-null', 'hi'), (f) => frames.push(f));
+  const fail = frames.find((f) => f.type === 'task.fail');
+  assert.ok(fail, 'task must fail, not hang, on a null discovery rejection');
+  assert.equal(fail!.error.code, 'gateway_closed');
+});
+
 test('discovery runs when configured URL uses a wildcard bind address (0.0.0.0 / ::)', async () => {
   // Users sometimes copy a local bind URL (ws://0.0.0.0:<port>) into config.
   // Those should be treated as local for the purpose of allowing discovery.
