@@ -350,7 +350,8 @@ export interface OpenclawBackendOptions {
   handshakeTimeoutMs?: number;
   /**
    * Override the default process-based port discovery used on connect
-   * failure. Returns candidate ws:// URLs to try. Primarily for testing.
+   * failure. Returns candidate WebSocket URLs (ws:// or wss://) to try.
+   * Primarily for testing.
    */
   discoverGatewayUrls?: () => Promise<string[]>;
 }
@@ -465,10 +466,12 @@ async function discoverLocalGatewayUrls(processName: string, template: string): 
 }
 
 function sameGatewayUrl(a: string, b: string): boolean {
-  // Used to avoid re-trying the already-failed primary URL. Compare enough
-  // components that a candidate which only differs in protocol or pathname
-  // (e.g. `wss://` vs `ws://`, or a different WebSocket path) is still tried,
-  // since those changes can be the exact reason the primary failed.
+  // Used to avoid re-trying the already-failed primary URL. Err on the side
+  // of "different → try it": if any of protocol, host, port, pathname,
+  // search, or user-info differs, treat the candidate as distinct. That way
+  // an injected discover returning the same host/port with (say) a different
+  // token query or path still gets attempted — the primary may have failed
+  // precisely because of that component.
   try {
     const ua = new URL(a);
     const ub = new URL(b);
@@ -476,7 +479,10 @@ function sameGatewayUrl(a: string, b: string): boolean {
       ua.protocol === ub.protocol &&
       ua.hostname === ub.hostname &&
       ua.port === ub.port &&
-      ua.pathname === ub.pathname
+      ua.pathname === ub.pathname &&
+      ua.search === ub.search &&
+      ua.username === ub.username &&
+      ua.password === ub.password
     );
   } catch {
     return a === b;

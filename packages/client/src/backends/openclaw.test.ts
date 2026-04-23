@@ -692,8 +692,8 @@ test('listenersToGatewayUrls keeps percent-encoded userinfo intact for reserved 
   // the rebuilt candidate, otherwise the authority component parses wrong.
   const tpl = 'ws://alice%40admin:p%3Ass@127.0.0.1:18789/gateway';
   const [candidate] = listenersToGatewayUrls([{ host: '127.0.0.1', port: 3000 }], tpl);
-  // Round-trip through URL to confirm the reserved chars decode back to the
-  // intended literals.
+  // Round-trip through URL to confirm the encoded userinfo is preserved in
+  // URL.username / URL.password for these reserved characters.
   const parsed = new URL(candidate);
   assert.equal(parsed.username, 'alice%40admin');
   assert.equal(parsed.password, 'p%3Ass');
