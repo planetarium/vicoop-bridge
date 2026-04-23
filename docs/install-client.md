@@ -28,8 +28,10 @@ one-liner fetching a published `client-v*` bundle). Contrast with:
 ## Prerequisites
 
 - Node.js 20 or newer (`node -v`).
-- `curl`, `tar`, `jq`, and one of `sha256sum` / `shasum`. (`jq` is used by
-  the token-extraction snippets in Steps 2–3.)
+- `curl`, `tar`, `jq`, `base64` (usually part of `coreutils` / `busybox`),
+  and one of `sha256sum` / `shasum`. `jq` is used by the token-extraction
+  snippets in Steps 2–3; `base64` is used for the SIWE-token decode in
+  Step 2.
 - A reachable bridge URL. The public deployment is
   `https://vicoop-bridge-server.fly.dev`; substitute your own below if you
   run the server yourself.
@@ -99,10 +101,15 @@ enforcement). TTL equals the SIWE `expirationTime`, capped at 7 days.
 ```sh
 export BRIDGE_URL=https://vicoop-bridge-server.fly.dev
 
+# The server compares the SIWE `domain` field against PUBLIC_URL's hostname
+# exactly, so derive the bare hostname via URL parsing — a naïve
+# ${BRIDGE_URL#https://} breaks on http:// or trailing paths/slashes.
+BRIDGE_HOSTNAME=$(BRIDGE_URL="$BRIDGE_URL" node -p 'new URL(process.env.BRIDGE_URL).hostname')
+
 # Generate, sign, and encode a SIWE token in one step with your local wallet.
 TOKEN=$(a2a-wallet siwe auth \
   --wallet <wallet-name> \
-  --domain "${BRIDGE_URL#https://}" \
+  --domain "$BRIDGE_HOSTNAME" \
   --uri "$BRIDGE_URL" \
   --ttl 1h \
   --json | jq -r .token)
@@ -381,9 +388,15 @@ Automatic restart on crash is tracked in #18.
   log; the row is re-used on reconnect but dispatch requires an active
   session.
 
-- **Lost the `CLIENT_TOKEN`** — it's unrecoverable. Re-run Step 3 to issue
-  a new one. The old `clients` row (and any cascading `agent_policies`)
-  can be cleaned up via the admin agent's CRUD mutations (#29).
+- **Lost the `CLIENT_TOKEN`** — the raw value is unrecoverable, but you
+  don't need to create a new client identity. Rotate the token in place
+  via the `rotateClientToken` GraphQL mutation (backed by
+  `rotate_client_token()` in `schema.sql`): it mints a fresh raw token for
+  the existing `clients` row and invalidates the old hash, so your
+  `allowedAgentIds` and `agent_policies` carry over. Re-run Step 3 only if
+  you intentionally want a new client identity; in that case the old
+  `clients` row (and cascading `agent_policies`) can be cleaned up via
+  the admin agent's CRUD mutations (#29).
 
 ## What's next
 
