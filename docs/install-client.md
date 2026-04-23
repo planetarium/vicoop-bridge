@@ -168,13 +168,30 @@ want a new client with a fresh token.
 
 ### Choosing an agent_id
 
-The bridge has no pre-flight API to check whether an `agent_id` is already
-claimed by another wallet (see #41). A collision surfaces only at WS
-register time as `'agent id owned by a different wallet'`. Recovering is
-cheap — call `updateClientAllowedAgents` to swap to a different ID without
-rotating the token (issue a new `CLIENT_TOKEN` only if you intentionally
-want a new client). Still, pick something unlikely to collide up front;
-prefix with your wallet short hash, project name, or hostname:
+Before calling `registerClient`, probe the id with the
+`agentIdAvailable(agentId)` GraphQL query. It's a `SECURITY DEFINER`
+function (`packages/server/schema.sql`) that returns a plain boolean
+across every owner — no `owner_wallet` leaks — and raises
+`invalid_parameter_value` on empty input. Requires your caller token.
+
+```sh
+AGENT_ID=openclaw-local    # or one of the patterns below
+
+AVAILABLE=$(curl -sX POST "$BRIDGE_URL/graphql" \
+  -H "Authorization: Bearer $CALLER_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"query\":\"{agentIdAvailable(agentId:\\\"$AGENT_ID\\\")}\"}" \
+  | jq -r .data.agentIdAvailable)
+[ "$AVAILABLE" = "true" ] || { echo "agent_id '$AGENT_ID' is taken"; exit 1; }
+```
+
+`true` means no `agent_policies` row exists for that id yet, so your first
+WS register in Step 5 will claim ownership. `false` means another wallet
+already owns it — pick a different id. A small race window exists between
+this probe and your WS register; if another wallet claims the id in
+between, Step 5 emits `'agent id owned by a different wallet'` and you can
+fall back to the recovery path in "Troubleshooting".
+
+Even with the probe, prefer names unlikely to collide across operators:
 
 ```sh
 AGENT_ID="openclaw-$(hostname | cut -d. -f1)"
@@ -182,7 +199,10 @@ AGENT_ID="openclaw-$(printf '%s' "${WALLET#0x}" | cut -c1-6)"   # first 6 hex ch
 AGENT_ID="$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)-openclaw"
 ```
 
-You *can* check whether you already own a given ID (helpful on reinstalls):
+On reinstalls, `agentIdAvailable` reports `false` for an id you yourself
+already registered. To distinguish "mine" from "somebody else's", also
+query `agentPolicyByAgentId` — RLS returns a non-null row only when *you*
+are the owner:
 
 ```sh
 curl -sX POST "$BRIDGE_URL/graphql" \
@@ -190,9 +210,9 @@ curl -sX POST "$BRIDGE_URL/graphql" \
   -d "{\"query\":\"{agentPolicyByAgentId(agentId:\\\"$AGENT_ID\\\"){agentId ownerWallet}}\"}" | jq .
 ```
 
-A non-null response means *you* own it (re-registration will replace the
-bound client). A null response means either "unclaimed" or "owned by
-someone else" — RLS on `agent_policies` hides the difference.
+A non-null response means you own it and a reinstall will reuse the
+existing policy; null after `agentIdAvailable=false` means someone else
+owns it.
 
 ## Step 4 — Prepare the agent card
 
