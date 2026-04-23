@@ -72,12 +72,19 @@ The script targets Linux (Fly.io persistent volumes are the original target
 deployment); on macOS it prints a warning and proceeds. See #17 / #21 for
 background.
 
-`install.sh` prints next-step instructions referencing
-`$INSTALL_DIR/card.json` as a placeholder path. The bundle does not ship
-that file — it ships `cards/openclaw.json` as a starting template. The rest
-of this doc points `--card` (and `AGENT_CARD`) at the shipped template
-directly; if you'd rather follow the printed path verbatim, copy the
-template to `$INSTALL_DIR/card.json` first.
+`install.sh` prints next-step instructions, but parts of that output are
+outdated and should be ignored in favor of Steps 2-3 below:
+
+- It references `$INSTALL_DIR/card.json` as the card path — the bundle does
+  not ship that file; it ships `cards/openclaw.json` as a starting
+  template. This doc points `--card` (and `AGENT_CARD`) at the shipped
+  template directly; if you'd rather keep the printed path, copy the
+  template to `$INSTALL_DIR/card.json` first.
+- It suggests obtaining a token via a `register_client` tool on the admin
+  agent. Today the flow goes through the PostGraphile-exposed
+  `registerClient` GraphQL mutation (Step 3), gated by a SIWE caller token
+  (Step 2). The admin A2A agent itself does not carry a
+  `register_client` tool with that name.
 
 ## Step 2 — Obtain a caller token (SIWE)
 
@@ -139,7 +146,8 @@ creates a `clients` row scoped to your wallet and issues a raw
 
 ```sh
 AGENT_ID=openclaw-local     # see "Choosing an agent_id" below
-CLIENT_NAME="openclaw on $(hostname -s)"
+HOSTNAME=$(hostname)
+CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
 
 REG=$(curl -sX POST "$BRIDGE_URL/graphql" \
   -H "Authorization: Bearer $CALLER_TOKEN" \
@@ -169,8 +177,8 @@ want a new client). Still, pick something unlikely to collide up front;
 prefix with your wallet short hash, project name, or hostname:
 
 ```sh
-AGENT_ID="openclaw-$(hostname -s)"
-AGENT_ID="openclaw-${WALLET:2:6}"      # first 6 hex chars of your EOA
+AGENT_ID="openclaw-$(hostname | cut -d. -f1)"
+AGENT_ID="openclaw-$(printf '%s' "${WALLET#0x}" | cut -c1-6)"   # first 6 hex chars of your EOA
 AGENT_ID="$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)-openclaw"
 ```
 
@@ -232,7 +240,7 @@ BACKEND=openclaw \
   "$INSTALL_DIR/bin/vicoop-client"
 ```
 
-On success you'll see a `[client] connected` log. After that:
+On success you'll see a `[client] connected, sending hello` log. After that:
 
 - The bridge auto-creates an `agent_policies` row owned by your wallet with
   empty `allowed_callers` — meaning **publicly callable** until you restrict it.
@@ -308,9 +316,13 @@ Put `SERVER_URL=...`, `SERVER_TOKEN=...`, etc. in
 ### Tmux (interactive hosts)
 
 ```sh
-tmux new -d -s vbc "env $(cat ~/.config/vicoop-client.env | xargs) $INSTALL_DIR/bin/vicoop-client"
+tmux new -d -s vbc 'sh -c "set -a; . \"$HOME/.config/vicoop-client.env\"; set +a; exec \"$INSTALL_DIR/bin/vicoop-client\""'
 tmux attach -t vbc   # to watch logs
 ```
+
+Using `set -a` + `.` keeps secrets out of the process-listing line and
+tolerates quoted values / comment lines in the env file, which the
+`env $(xargs)` pattern does not.
 
 Automatic restart on crash is tracked in #18.
 
