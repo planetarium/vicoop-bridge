@@ -61,7 +61,7 @@ What you get after extraction:
 
 ```
 $INSTALL_DIR/
-├── bin/vicoop-client        # node wrapper
+├── bin/vicoop-client        # bash wrapper that execs node dist/cli.js
 ├── dist/                    # compiled JS
 ├── cards/openclaw.json      # example agent card
 ├── node_modules/            # pruned prod deps
