@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import WebSocket, { WebSocketServer } from 'ws';
-import { createOpenclawBackend } from './openclaw.js';
+import { createOpenclawBackend, parseLsofListeningPorts } from './openclaw.js';
 import type { UpFrame, TaskAssignFrame } from '@vicoop-bridge/protocol';
 
 interface ReqFrame {
@@ -606,6 +606,46 @@ test('gateway close mid-run fails in-flight task deterministically', async () =>
     assert.equal(fail!.error.code, 'gateway_closed');
   } finally {
     await fake.close();
+  }
+});
+
+test('parseLsofListeningPorts extracts loopback listen ports and ignores non-loopback', () => {
+  const sample = [
+    'COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME',
+    'openclaw 1234 me    7u  IPv4 0x1111111111111111      0t0  TCP 127.0.0.1:3000 (LISTEN)',
+    'openclaw 1234 me    8u  IPv6 0x2222222222222222      0t0  TCP [::1]:4000 (LISTEN)',
+    'openclaw 1234 me    9u  IPv4 0x3333333333333333      0t0  TCP *:18789 (LISTEN)',
+    'openclaw 1234 me   10u  IPv4 0x4444444444444444      0t0  TCP 192.168.1.10:5000 (LISTEN)',
+    'openclaw 1234 me   11u  IPv4 0x5555555555555555      0t0  TCP 127.0.0.1:6000->127.0.0.1:7000 (ESTABLISHED)',
+  ].join('\n');
+  const ports = parseLsofListeningPorts(sample).sort((a, b) => a - b);
+  assert.deepEqual(ports, [3000, 4000, 18789]);
+});
+
+test('parseLsofListeningPorts returns empty for empty / header-only input', () => {
+  assert.deepEqual(parseLsofListeningPorts(''), []);
+  assert.deepEqual(parseLsofListeningPorts('COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME'), []);
+});
+
+test('discovery fallback: when primary URL is dead and no candidates match, original error propagates', async () => {
+  // Use a deliberately bogus process name so `lsof -c <name>` matches nothing,
+  // forcing the fallback path to exit without candidates and surface the
+  // primary connect failure.
+  const prev = process.env.OPENCLAW_PROCESS_NAME;
+  process.env.OPENCLAW_PROCESS_NAME = '__vicoop_bridge_test_no_such_proc__';
+  try {
+    const backend = createOpenclawBackend({
+      url: 'ws://127.0.0.1:1', // port 1 refuses TCP immediately
+      handshakeTimeoutMs: 1500,
+    });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t-disc', 'hi'), (f) => frames.push(f));
+    const fail = frames.find((f) => f.type === 'task.fail');
+    assert.ok(fail, 'task must fail when no gateway is reachable');
+    assert.equal(fail!.error.code, 'gateway_closed');
+  } finally {
+    if (prev === undefined) delete process.env.OPENCLAW_PROCESS_NAME;
+    else process.env.OPENCLAW_PROCESS_NAME = prev;
   }
 });
 

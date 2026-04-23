@@ -1,7 +1,11 @@
 import { createHash, generateKeyPairSync, randomUUID, sign as cryptoSign } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import WebSocket from 'ws';
 import type { Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+
+const execFileP = promisify(execFile);
 
 const GATEWAY_PROTOCOL_VERSION = 3;
 
@@ -348,6 +352,56 @@ export interface OpenclawBackendOptions {
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10 * 1000;
+const DEFAULT_DISCOVERY_PROCESS_NAME = 'openclaw';
+const DEFAULT_DISCOVERY_HANDSHAKE_TIMEOUT_MS = 3_000;
+const DISCOVERY_LSOF_TIMEOUT_MS = 2_000;
+
+// Parses `lsof -nP -iTCP -sTCP:LISTEN` output and returns listening TCP ports
+// bound to loopback or wildcard. Exported for unit testing.
+export function parseLsofListeningPorts(output: string): number[] {
+  const ports = new Set<number>();
+  for (const line of output.split('\n')) {
+    // NAME column (last) for LISTEN rows looks like "127.0.0.1:3000 (LISTEN)"
+    // or "*:18789 (LISTEN)" or "[::1]:3000 (LISTEN)".
+    const m = line.match(/\s(\S+):(\d+)\s+\(LISTEN\)/);
+    if (!m) continue;
+    const host = m[1];
+    const loopback =
+      host === '127.0.0.1' ||
+      host === '[::1]' ||
+      host === '*' ||
+      host === '0.0.0.0' ||
+      host === '[::]';
+    if (!loopback) continue;
+    const port = Number(m[2]);
+    if (Number.isFinite(port) && port > 0) ports.add(port);
+  }
+  return Array.from(ports);
+}
+
+async function discoverLocalGatewayUrls(processName: string): Promise<string[]> {
+  if (process.platform === 'win32') return [];
+  try {
+    const { stdout } = await execFileP(
+      'lsof',
+      ['-nP', '-iTCP', '-sTCP:LISTEN', '-c', processName],
+      { timeout: DISCOVERY_LSOF_TIMEOUT_MS },
+    );
+    return parseLsofListeningPorts(stdout).map((port) => `ws://127.0.0.1:${port}`);
+  } catch {
+    return [];
+  }
+}
+
+function sameGatewayUrl(a: string, b: string): boolean {
+  try {
+    const ua = new URL(a);
+    const ub = new URL(b);
+    return ua.hostname === ub.hostname && ua.port === ub.port;
+  } catch {
+    return a === b;
+  }
+}
 
 function resolveTimeout(
   explicit: number | undefined,
@@ -433,51 +487,88 @@ export function createOpenclawBackend(
     }
   }
 
+  let resolvedUrl = url;
+  const discoveryProcessName =
+    process.env.OPENCLAW_PROCESS_NAME ?? DEFAULT_DISCOVERY_PROCESS_NAME;
+
+  async function connectAt(candidateUrl: string, hsTimeoutMs: number): Promise<GatewayClient> {
+    const c = new GatewayClient(candidateUrl, token, hsTimeoutMs);
+    await c.connect();
+    c.onEvent((evt) => {
+      if (evt.event !== 'chat') return;
+      const p = evt.payload as ChatEventPayload | undefined;
+      if (!p?.runId) return;
+      if (debug) {
+        console.log('[openclaw] chat event:', JSON.stringify(p).slice(0, 500));
+      }
+      const binding = runToTask.get(p.runId);
+      if (!binding) {
+        // Late or duplicate event for a run whose task already finalized:
+        // drop without buffering so memory stays bounded.
+        if (recentlyFinalizedRuns.has(p.runId)) return;
+        // Event arrived before handle() finished registering the runId.
+        // Buffer until the handler catches up and drains it. Evict the
+        // oldest unknown runId when the map grows past the cap so a
+        // noisy/misbehaving gateway can't inflate memory indefinitely.
+        let buf = pendingRunEvents.get(p.runId);
+        if (!buf) {
+          if (pendingRunEvents.size >= MAX_PENDING_RUN_KEYS) {
+            const oldest = pendingRunEvents.keys().next().value;
+            if (oldest !== undefined) pendingRunEvents.delete(oldest);
+          }
+          buf = [];
+          pendingRunEvents.set(p.runId, buf);
+        }
+        if (buf.length >= MAX_BUFFERED_EVENTS_PER_RUN) buf.shift();
+        buf.push(p);
+        return;
+      }
+      taskFinalizers.get(binding.taskId)?.(p);
+    });
+    c.onClose((err) => handleGatewayClose(c, err));
+    return c;
+  }
+
+  async function tryConnectWithDiscovery(): Promise<GatewayClient> {
+    try {
+      const c = await connectAt(resolvedUrl, handshakeTimeoutMs);
+      console.log(`[openclaw] connected ${resolvedUrl}`);
+      return c;
+    } catch (primaryErr) {
+      // Fall back to process-based discovery: locate any OpenClaw-named
+      // process listening on loopback and try its port(s). Keeps the common
+      // "gateway moved to a different port" case self-healing without any
+      // OpenClaw-side cooperation.
+      const candidates = await discoverLocalGatewayUrls(discoveryProcessName);
+      const alternates = candidates.filter((u) => !sameGatewayUrl(u, resolvedUrl));
+      if (alternates.length === 0) throw primaryErr;
+      console.warn(
+        `[openclaw] connect to ${resolvedUrl} failed (${(primaryErr as Error).message}); trying ${alternates.length} discovered candidate(s)`,
+      );
+      const probeTimeout = Math.min(handshakeTimeoutMs, DEFAULT_DISCOVERY_HANDSHAKE_TIMEOUT_MS);
+      let lastErr: Error = primaryErr as Error;
+      for (const alt of alternates) {
+        try {
+          const c = await connectAt(alt, probeTimeout);
+          console.log(`[openclaw] auto-discovered gateway at ${alt} (was ${resolvedUrl})`);
+          resolvedUrl = alt;
+          return c;
+        } catch (err) {
+          lastErr = err as Error;
+        }
+      }
+      throw lastErr;
+    }
+  }
+
   async function ensureConnected(): Promise<GatewayClient> {
     if (current && current.state === 'ready') return current;
     if (connecting) return connecting;
-    const c = new GatewayClient(url, token, handshakeTimeoutMs);
     connecting = (async () => {
       try {
-        await c.connect();
-        console.log(`[openclaw] connected ${url}`);
-        c.onEvent((evt) => {
-          if (evt.event !== 'chat') return;
-          const p = evt.payload as ChatEventPayload | undefined;
-          if (!p?.runId) return;
-          if (debug) {
-            console.log('[openclaw] chat event:', JSON.stringify(p).slice(0, 500));
-          }
-          const binding = runToTask.get(p.runId);
-          if (!binding) {
-            // Late or duplicate event for a run whose task already finalized:
-            // drop without buffering so memory stays bounded.
-            if (recentlyFinalizedRuns.has(p.runId)) return;
-            // Event arrived before handle() finished registering the runId.
-            // Buffer until the handler catches up and drains it. Evict the
-            // oldest unknown runId when the map grows past the cap so a
-            // noisy/misbehaving gateway can't inflate memory indefinitely.
-            let buf = pendingRunEvents.get(p.runId);
-            if (!buf) {
-              if (pendingRunEvents.size >= MAX_PENDING_RUN_KEYS) {
-                const oldest = pendingRunEvents.keys().next().value;
-                if (oldest !== undefined) pendingRunEvents.delete(oldest);
-              }
-              buf = [];
-              pendingRunEvents.set(p.runId, buf);
-            }
-            if (buf.length >= MAX_BUFFERED_EVENTS_PER_RUN) buf.shift();
-            buf.push(p);
-            return;
-          }
-          taskFinalizers.get(binding.taskId)?.(p);
-        });
-        c.onClose((err) => handleGatewayClose(c, err));
+        const c = await tryConnectWithDiscovery();
         current = c;
         return c;
-      } catch (err) {
-        // connect() itself failed: nothing is registered yet, just propagate.
-        throw err;
       } finally {
         connecting = null;
       }
