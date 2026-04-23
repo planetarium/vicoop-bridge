@@ -1,5 +1,6 @@
 import type { AgentExecutor, ExecutionEventBus, RequestContext } from '@a2a-js/sdk/server';
 import type { Registry } from './registry.js';
+import { logEvent } from './log.js';
 
 export class ServerAgentExecutor implements AgentExecutor {
   constructor(
@@ -33,13 +34,7 @@ export class ServerAgentExecutor implements AgentExecutor {
     });
 
     if (!sent) {
-      console.log(JSON.stringify({
-        event: 'task_unreachable',
-        agentId: this.agentId,
-        taskId,
-        contextId,
-        ts: new Date().toISOString(),
-      }));
+      logEvent('task_unreachable', { agentId: this.agentId, taskId, contextId });
       bus.publish({
         kind: 'status-update',
         taskId,
