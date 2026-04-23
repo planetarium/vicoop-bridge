@@ -60,7 +60,7 @@ test(
 );
 
 test(
-  'authenticated caller from a different wallet still sees taken=true (RLS bypass)',
+  'authenticated caller from a different wallet still sees available=false (RLS bypass)',
   { skip: !hasDb },
   async () => {
     // Guards the SECURITY DEFINER posture: agent_policies_select restricts
