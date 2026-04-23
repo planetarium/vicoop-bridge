@@ -33,6 +33,13 @@ export class ServerAgentExecutor implements AgentExecutor {
     });
 
     if (!sent) {
+      console.log(JSON.stringify({
+        event: 'task_unreachable',
+        agentId: this.agentId,
+        taskId,
+        contextId,
+        ts: new Date().toISOString(),
+      }));
       bus.publish({
         kind: 'status-update',
         taskId,
