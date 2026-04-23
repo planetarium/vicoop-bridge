@@ -635,16 +635,29 @@ test('parseLsofListeningPorts returns empty for empty / header-only input', () =
   assert.deepEqual(parseLsofListeningPorts('COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME'), []);
 });
 
-test('listenersToGatewayUrls expands wildcard binds to both IPv4 and IPv6 loopback', () => {
-  assert.deepEqual(listenersToGatewayUrls([{ host: '127.0.0.1', port: 3000 }]), ['ws://127.0.0.1:3000']);
-  assert.deepEqual(listenersToGatewayUrls([{ host: '[::1]', port: 4000 }]), ['ws://[::1]:4000']);
-  assert.deepEqual(listenersToGatewayUrls([{ host: '*', port: 5000 }]), ['ws://127.0.0.1:5000']);
-  assert.deepEqual(listenersToGatewayUrls([{ host: '0.0.0.0', port: 5000 }]), ['ws://127.0.0.1:5000']);
-  // IPv6 wildcard expands to both families so a v6-only-bound gateway still
-  // gets probed via [::1] and a dual-stack gateway is reachable via 127.0.0.1.
-  assert.deepEqual(listenersToGatewayUrls([{ host: '[::]', port: 6000 }]).sort(), [
-    'ws://127.0.0.1:6000',
-    'ws://[::1]:6000',
+test('listenersToGatewayUrls maps each bind family correctly', () => {
+  const tpl = 'ws://127.0.0.1:18789/';
+  // IPv4 loopback and IPv4 wildcards stay on IPv4 loopback.
+  assert.deepEqual(listenersToGatewayUrls([{ host: '127.0.0.1', port: 3000 }], tpl), ['ws://127.0.0.1:3000/']);
+  assert.deepEqual(listenersToGatewayUrls([{ host: '*', port: 5000 }], tpl), ['ws://127.0.0.1:5000/']);
+  assert.deepEqual(listenersToGatewayUrls([{ host: '0.0.0.0', port: 5000 }], tpl), ['ws://127.0.0.1:5000/']);
+  // IPv6 loopback stays on IPv6.
+  assert.deepEqual(listenersToGatewayUrls([{ host: '[::1]', port: 4000 }], tpl), ['ws://[::1]:4000/']);
+  // Only the IPv6 wildcard expands to both families — a dual-stack listener
+  // is reachable via either 127.0.0.1 or [::1].
+  assert.deepEqual(listenersToGatewayUrls([{ host: '[::]', port: 6000 }], tpl).sort(), [
+    'ws://127.0.0.1:6000/',
+    'ws://[::1]:6000/',
+  ]);
+});
+
+test('listenersToGatewayUrls preserves template protocol / pathname / search', () => {
+  const tpl = 'wss://127.0.0.1:18789/gateway?token=abc#frag';
+  assert.deepEqual(listenersToGatewayUrls([{ host: '127.0.0.1', port: 3000 }], tpl), [
+    'wss://127.0.0.1:3000/gateway?token=abc#frag',
+  ]);
+  assert.deepEqual(listenersToGatewayUrls([{ host: '[::1]', port: 3000 }], tpl), [
+    'wss://[::1]:3000/gateway?token=abc#frag',
   ]);
 });
 

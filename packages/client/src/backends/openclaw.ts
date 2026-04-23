@@ -395,27 +395,45 @@ export function parseLsofListeningPorts(output: string): DiscoveredListener[] {
   return out;
 }
 
-// Expand a bind host into one or more ws:// URLs. Wildcard binds are expanded
-// to both IPv4 and IPv6 loopback so a dual-stack gateway is reachable either
-// way.
-export function listenersToGatewayUrls(listeners: DiscoveredListener[]): string[] {
+function buildCandidateUrl(template: URL, host: '127.0.0.1' | '::1', port: number): string {
+  // Reconstruct from parts so protocol (ws/wss), pathname, search, and hash
+  // are all preserved while only host+port get swapped. Avoids WHATWG URL
+  // hostname-setter quirks when swapping between address families.
+  const h = host === '::1' ? '[::1]' : host;
+  return `${template.protocol}//${h}:${port}${template.pathname}${template.search}${template.hash}`;
+}
+
+// Expand a bind host + port into ws:// candidate URLs derived from `template`
+// (preserves scheme/path/search/hash — only host+port change). IPv4 binds
+// (`127.0.0.1`, `0.0.0.0`, `*`) map to IPv4 loopback; `[::1]` stays on IPv6
+// loopback. The IPv6 wildcard (`[::]`) is the only bind that expands to both
+// families, since a dual-stack listener is reachable via either 127.0.0.1 or
+// [::1] depending on how the client connects.
+export function listenersToGatewayUrls(
+  listeners: DiscoveredListener[],
+  template: string,
+): string[] {
+  let tpl: URL;
+  try {
+    tpl = new URL(template);
+  } catch {
+    return [];
+  }
   const urls = new Set<string>();
   for (const { host, port } of listeners) {
     if (host === '127.0.0.1' || host === '0.0.0.0' || host === '*') {
-      urls.add(`ws://127.0.0.1:${port}`);
+      urls.add(buildCandidateUrl(tpl, '127.0.0.1', port));
     } else if (host === '[::1]') {
-      urls.add(`ws://[::1]:${port}`);
+      urls.add(buildCandidateUrl(tpl, '::1', port));
     } else if (host === '[::]') {
-      // IPv6 wildcard — try both families; Node dual-stack defaults accept
-      // v4-mapped connections, but we probe v6 loopback too for safety.
-      urls.add(`ws://127.0.0.1:${port}`);
-      urls.add(`ws://[::1]:${port}`);
+      urls.add(buildCandidateUrl(tpl, '127.0.0.1', port));
+      urls.add(buildCandidateUrl(tpl, '::1', port));
     }
   }
   return Array.from(urls);
 }
 
-async function discoverLocalGatewayUrls(processName: string): Promise<string[]> {
+async function discoverLocalGatewayUrls(processName: string, template: string): Promise<string[]> {
   if (process.platform === 'win32') return [];
   try {
     const { stdout } = await execFileP(
@@ -423,7 +441,7 @@ async function discoverLocalGatewayUrls(processName: string): Promise<string[]> 
       ['-nP', '-iTCP', '-sTCP:LISTEN', '-c', processName],
       { timeout: DISCOVERY_LSOF_TIMEOUT_MS },
     );
-    return listenersToGatewayUrls(parseLsofListeningPorts(stdout));
+    return listenersToGatewayUrls(parseLsofListeningPorts(stdout), template);
   } catch {
     return [];
   }
@@ -540,7 +558,8 @@ export function createOpenclawBackend(
   const discoveryProcessName =
     process.env.OPENCLAW_PROCESS_NAME ?? DEFAULT_DISCOVERY_PROCESS_NAME;
   const discover =
-    opts.discoverGatewayUrls ?? (() => discoverLocalGatewayUrls(discoveryProcessName));
+    opts.discoverGatewayUrls ??
+    (() => discoverLocalGatewayUrls(discoveryProcessName, resolvedUrl));
 
   async function connectAt(candidateUrl: string, hsTimeoutMs: number): Promise<GatewayClient> {
     const c = new GatewayClient(candidateUrl, token, hsTimeoutMs);
