@@ -3,7 +3,12 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import WebSocket, { WebSocketServer } from 'ws';
-import { createOpenclawBackend } from './openclaw.js';
+import {
+  createOpenclawBackend,
+  listenersToGatewayUrls,
+  parseLsofListeningPorts,
+  redactUrl,
+} from './openclaw.js';
 import type { UpFrame, TaskAssignFrame } from '@vicoop-bridge/protocol';
 
 interface ReqFrame {
@@ -607,6 +612,279 @@ test('gateway close mid-run fails in-flight task deterministically', async () =>
   } finally {
     await fake.close();
   }
+});
+
+test('parseLsofListeningPorts extracts loopback/wildcard listeners and preserves host', () => {
+  const sample = [
+    'COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME',
+    'openclaw 1234 me    7u  IPv4 0x1111111111111111      0t0  TCP 127.0.0.1:3000 (LISTEN)',
+    'openclaw 1234 me    8u  IPv6 0x2222222222222222      0t0  TCP [::1]:4000 (LISTEN)',
+    'openclaw 1234 me    9u  IPv4 0x3333333333333333      0t0  TCP *:18789 (LISTEN)',
+    'openclaw 1234 me   10u  IPv4 0x4444444444444444      0t0  TCP 192.168.1.10:5000 (LISTEN)',
+    'openclaw 1234 me   11u  IPv4 0x5555555555555555      0t0  TCP 127.0.0.1:6000->127.0.0.1:7000 (ESTABLISHED)',
+  ].join('\n');
+  const listeners = parseLsofListeningPorts(sample).sort((a, b) => a.port - b.port);
+  assert.deepEqual(listeners, [
+    { host: '127.0.0.1', port: 3000 },
+    { host: '[::1]', port: 4000 },
+    { host: '*', port: 18789 },
+  ]);
+});
+
+test('parseLsofListeningPorts returns empty for empty / header-only input', () => {
+  assert.deepEqual(parseLsofListeningPorts(''), []);
+  assert.deepEqual(parseLsofListeningPorts('COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME'), []);
+});
+
+test('listenersToGatewayUrls maps each bind family correctly', () => {
+  const tpl = 'ws://127.0.0.1:18789/';
+  // IPv4 loopback and IPv4 wildcards stay on IPv4 loopback.
+  assert.deepEqual(listenersToGatewayUrls([{ host: '127.0.0.1', port: 3000 }], tpl), ['ws://127.0.0.1:3000/']);
+  assert.deepEqual(listenersToGatewayUrls([{ host: '*', port: 5000 }], tpl), ['ws://127.0.0.1:5000/']);
+  assert.deepEqual(listenersToGatewayUrls([{ host: '0.0.0.0', port: 5000 }], tpl), ['ws://127.0.0.1:5000/']);
+  // IPv6 loopback stays on IPv6.
+  assert.deepEqual(listenersToGatewayUrls([{ host: '[::1]', port: 4000 }], tpl), ['ws://[::1]:4000/']);
+  // Only the IPv6 wildcard expands to both families — a dual-stack listener
+  // is reachable via either 127.0.0.1 or [::1].
+  assert.deepEqual(listenersToGatewayUrls([{ host: '[::]', port: 6000 }], tpl).sort(), [
+    'ws://127.0.0.1:6000/',
+    'ws://[::1]:6000/',
+  ]);
+});
+
+test('redactUrl strips query, hash, and userinfo but keeps protocol/host/port/path', () => {
+  assert.equal(
+    redactUrl('wss://user:pass@127.0.0.1:18789/gateway?token=secret#frag'),
+    'wss://127.0.0.1:18789/gateway',
+  );
+  assert.equal(redactUrl('ws://127.0.0.1:3000?token=abc'), 'ws://127.0.0.1:3000/');
+  assert.equal(redactUrl('ws://[::1]:4000/path'), 'ws://[::1]:4000/path');
+  assert.equal(redactUrl('not a url'), '<unparseable-url>');
+});
+
+test('listenersToGatewayUrls preserves template protocol / pathname / search', () => {
+  const tpl = 'wss://127.0.0.1:18789/gateway?token=abc#frag';
+  assert.deepEqual(listenersToGatewayUrls([{ host: '127.0.0.1', port: 3000 }], tpl), [
+    'wss://127.0.0.1:3000/gateway?token=abc#frag',
+  ]);
+  assert.deepEqual(listenersToGatewayUrls([{ host: '[::1]', port: 3000 }], tpl), [
+    'wss://[::1]:3000/gateway?token=abc#frag',
+  ]);
+});
+
+test('listenersToGatewayUrls preserves template userinfo when credentials are embedded', () => {
+  assert.deepEqual(
+    listenersToGatewayUrls(
+      [{ host: '127.0.0.1', port: 3000 }],
+      'ws://user:pass@127.0.0.1:18789/',
+    ),
+    ['ws://user:pass@127.0.0.1:3000/'],
+  );
+  // Username-only (no password) is preserved without a trailing colon.
+  assert.deepEqual(
+    listenersToGatewayUrls([{ host: '[::1]', port: 3000 }], 'ws://user@127.0.0.1:18789/'),
+    ['ws://user@[::1]:3000/'],
+  );
+});
+
+test('listenersToGatewayUrls keeps percent-encoded userinfo intact for reserved chars', () => {
+  // `@` in a username and `:` in a password must remain percent-encoded in
+  // the rebuilt candidate, otherwise the authority component parses wrong.
+  const tpl = 'ws://alice%40admin:p%3Ass@127.0.0.1:18789/gateway';
+  const [candidate] = listenersToGatewayUrls([{ host: '127.0.0.1', port: 3000 }], tpl);
+  // Round-trip through URL to confirm the encoded userinfo is preserved in
+  // URL.username / URL.password for these reserved characters.
+  const parsed = new URL(candidate);
+  assert.equal(parsed.username, 'alice%40admin');
+  assert.equal(parsed.password, 'p%3Ass');
+  assert.equal(parsed.host, '127.0.0.1:3000');
+  assert.equal(parsed.pathname, '/gateway');
+});
+
+test('discovery fallback: when primary URL is dead and no candidates match, original error propagates', async () => {
+  const backend = createOpenclawBackend({
+    url: 'ws://127.0.0.1:1', // port 1 refuses TCP immediately
+    handshakeTimeoutMs: 1500,
+    discoverGatewayUrls: async () => [],
+  });
+  const frames: UpFrame[] = [];
+  await backend.handle(makeTask('t-disc', 'hi'), (f) => frames.push(f));
+  const fail = frames.find((f) => f.type === 'task.fail');
+  assert.ok(fail, 'task must fail when no gateway is reachable');
+  assert.equal(fail!.error.code, 'gateway_closed');
+});
+
+test('discovery fallback: primary URL dead, discovered candidate completes handshake, task succeeds', async () => {
+  let runCounter = 0;
+  const real = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        const runId = `run-disc-${++runCounter}`;
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId, status: 'started' },
+          }),
+        );
+        setImmediate(() => {
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId,
+                sessionKey: `agent:main:ctx-td${runCounter}`,
+                seq: 1,
+                state: 'final',
+                message: { text: `discovered-${runCounter}` },
+              },
+            }),
+          );
+        });
+      }
+    },
+  });
+  let discoverCalls = 0;
+  try {
+    const backend = createOpenclawBackend({
+      url: 'ws://127.0.0.1:1', // dead
+      handshakeTimeoutMs: 1500,
+      discoverGatewayUrls: async () => {
+        discoverCalls++;
+        return [real.url];
+      },
+    });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('td1', 'hi'), (f) => frames.push(f));
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete, 'task must complete via discovered URL');
+    assert.equal(complete!.status.state, 'completed');
+    assert.equal(discoverCalls, 1, 'discover should be invoked once on primary failure');
+
+    // Cache check: close the socket to force a reconnect, then send a second
+    // task. ensureConnected() should try the discovered URL directly without
+    // invoking discover again.
+    const sock = await real.waitForConnection(0);
+    await real.closeSocket(sock);
+    // Let the client process the WebSocket close event.
+    await new Promise((r) => setTimeout(r, 20));
+    const frames2: UpFrame[] = [];
+    await backend.handle(makeTask('td2', 'hi2'), (f) => frames2.push(f));
+    const complete2 = frames2.find((f) => f.type === 'task.complete');
+    assert.ok(complete2, 'second task must complete on reconnect');
+    assert.equal(discoverCalls, 1, 'discover must not re-run when primary (discovered) URL works');
+  } finally {
+    await real.close();
+  }
+});
+
+test('discovery: when all candidates fail, the original primary connect error is surfaced', async () => {
+  // Candidates are all dead loopback ports. The final task.fail message must
+  // match the primary URL's connect error, not whichever candidate happened
+  // to fail last — the operator configured the primary URL, that's what
+  // diagnostics should point at.
+  const backend = createOpenclawBackend({
+    url: 'ws://127.0.0.1:1', // dead primary
+    handshakeTimeoutMs: 1500,
+    discoverGatewayUrls: async () => ['ws://127.0.0.1:2', 'ws://127.0.0.1:3'],
+  });
+  const frames: UpFrame[] = [];
+  await backend.handle(makeTask('t-allfail', 'hi'), (f) => frames.push(f));
+  const fail = frames.find((f) => f.type === 'task.fail');
+  assert.ok(fail);
+  assert.equal(fail!.error.code, 'gateway_closed');
+  // Primary URL was 127.0.0.1:1. The error message from connect ECONNREFUSED
+  // mentions the port that failed. The surfaced error must reference port 1
+  // (the configured primary), not 3 (the last candidate).
+  assert.ok(
+    /127\.0\.0\.1:1\b/.test(fail!.error.message),
+    `expected primary URL error (port 1), got: ${fail!.error.message}`,
+  );
+});
+
+test('discovery errors are swallowed so the primary connect failure still propagates', async () => {
+  const backend = createOpenclawBackend({
+    url: 'ws://127.0.0.1:1', // dead
+    handshakeTimeoutMs: 1500,
+    discoverGatewayUrls: async () => {
+      throw new Error('boom: discovery exploded');
+    },
+  });
+  const frames: UpFrame[] = [];
+  await backend.handle(makeTask('t-boom', 'hi'), (f) => frames.push(f));
+  const fail = frames.find((f) => f.type === 'task.fail');
+  assert.ok(fail, 'task must fail even when discovery itself throws');
+  assert.equal(fail!.error.code, 'gateway_closed');
+  // The message should be the original connect error, not "boom: discovery
+  // exploded" — discovery failures are best-effort and must not mask it.
+  assert.ok(
+    !/boom: discovery exploded/.test(fail!.error.message),
+    `expected primary connect error, got: ${fail!.error.message}`,
+  );
+});
+
+test('discovery error logging is defensive against non-Error rejections', async () => {
+  // Reject with `null` — reading `.message` on it would throw TypeError and
+  // could mask the primary connect failure. errorMessage() must render it as
+  // a string without throwing, so the primary error still surfaces.
+  const backend = createOpenclawBackend({
+    url: 'ws://127.0.0.1:1',
+    handshakeTimeoutMs: 1500,
+    debug: true, // exercise the debug log path
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    discoverGatewayUrls: (async () => {
+      // eslint-disable-next-line @typescript-eslint/no-throw-literal
+      throw null as unknown;
+    }) as () => Promise<string[]>,
+  });
+  const frames: UpFrame[] = [];
+  await backend.handle(makeTask('t-null', 'hi'), (f) => frames.push(f));
+  const fail = frames.find((f) => f.type === 'task.fail');
+  assert.ok(fail, 'task must fail, not hang, on a null discovery rejection');
+  assert.equal(fail!.error.code, 'gateway_closed');
+});
+
+test('discovery runs when configured URL uses a wildcard bind address (0.0.0.0 / ::)', async () => {
+  // Users sometimes copy a local bind URL (ws://0.0.0.0:<port>) into config.
+  // Those should be treated as local for the purpose of allowing discovery.
+  let discoverCalls = 0;
+  const backend = createOpenclawBackend({
+    url: 'ws://0.0.0.0:1', // wildcard bind, port 1 refuses TCP
+    handshakeTimeoutMs: 1500,
+    discoverGatewayUrls: async () => {
+      discoverCalls++;
+      return [];
+    },
+  });
+  const frames: UpFrame[] = [];
+  await backend.handle(makeTask('t-wild', 'hi'), (f) => frames.push(f));
+  assert.equal(discoverCalls, 1, 'discover must run for wildcard bind URLs');
+  const fail = frames.find((f) => f.type === 'task.fail');
+  assert.ok(fail);
+  assert.equal(fail!.error.code, 'gateway_closed');
+});
+
+test('discovery skipped when configured URL is remote (non-loopback)', async () => {
+  let discoverCalls = 0;
+  const backend = createOpenclawBackend({
+    // Non-loopback host that cannot connect quickly. Using .invalid TLD keeps
+    // DNS resolution local/fast-failing on most platforms, but we also bound
+    // the handshake to avoid a long hang.
+    url: 'ws://gateway.invalid:9999',
+    handshakeTimeoutMs: 1500,
+    discoverGatewayUrls: async () => {
+      discoverCalls++;
+      return ['ws://127.0.0.1:18789'];
+    },
+  });
+  const frames: UpFrame[] = [];
+  await backend.handle(makeTask('t-remote', 'hi'), (f) => frames.push(f));
+  const fail = frames.find((f) => f.type === 'task.fail');
+  assert.ok(fail, 'task must fail when remote gateway is unreachable');
+  assert.equal(fail!.error.code, 'gateway_closed');
+  assert.equal(discoverCalls, 0, 'discover must not be invoked for non-loopback URLs');
 });
 
 export { createFakeGateway, makeTask };

@@ -1,7 +1,11 @@
 import { createHash, generateKeyPairSync, randomUUID, sign as cryptoSign } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import WebSocket from 'ws';
 import type { Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+
+const execFileP = promisify(execFile);
 
 const GATEWAY_PROTOCOL_VERSION = 3;
 
@@ -281,7 +285,7 @@ class GatewayClient {
         client: {
           id: clientId,
           displayName: 'vicoop-bridge-client',
-          version: '0.0.0',
+          version: '0.2.0',
           platform: process.platform,
           mode: clientMode,
         },
@@ -344,10 +348,193 @@ export interface OpenclawBackendOptions {
   taskTimeoutMs?: number;
   /** Max time (ms) to wait for the gateway handshake to complete. Default 10000. */
   handshakeTimeoutMs?: number;
+  /**
+   * Override the default process-based port discovery used on connect
+   * failure. Returns candidate WebSocket URLs (ws:// or wss://) to try.
+   * Primarily for testing.
+   */
+  discoverGatewayUrls?: () => Promise<string[]>;
 }
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10 * 1000;
+const DEFAULT_DISCOVERY_PROCESS_NAME = 'openclaw';
+const DEFAULT_DISCOVERY_HANDSHAKE_TIMEOUT_MS = 3_000;
+const DISCOVERY_LSOF_TIMEOUT_MS = 2_000;
+
+export interface DiscoveredListener {
+  host: string;
+  port: number;
+}
+
+// Parses `lsof -nP -iTCP -sTCP:LISTEN` output and returns listeners bound to
+// loopback or wildcard. The original bind host is preserved so callers can
+// distinguish IPv4/IPv6/wildcard binds. Exported for unit testing.
+export function parseLsofListeningPorts(output: string): DiscoveredListener[] {
+  const out: DiscoveredListener[] = [];
+  const seen = new Set<string>();
+  for (const line of output.split('\n')) {
+    // NAME column (last) for LISTEN rows looks like "127.0.0.1:3000 (LISTEN)"
+    // or "*:18789 (LISTEN)" or "[::1]:3000 (LISTEN)".
+    const m = line.match(/\s(\S+):(\d+)\s+\(LISTEN\)/);
+    if (!m) continue;
+    const host = m[1];
+    const loopback =
+      host === '127.0.0.1' ||
+      host === '[::1]' ||
+      host === '*' ||
+      host === '0.0.0.0' ||
+      host === '[::]';
+    if (!loopback) continue;
+    const port = Number(m[2]);
+    if (!Number.isFinite(port) || port <= 0) continue;
+    const key = `${host}:${port}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ host, port });
+  }
+  return out;
+}
+
+function buildCandidateUrl(template: URL, host: '127.0.0.1' | '::1', port: number): string {
+  // Reconstruct from parts so protocol (ws/wss), user-info, pathname, search,
+  // and hash are all preserved while only host+port get swapped. Preserving
+  // user-info matters when the configured URL carries credentials
+  // (ws://user:pass@host:port) — dropping them would make the retry fail even
+  // on the right port.
+  //
+  // Why not just clone the URL and set `.hostname`? Node's WHATWG URL setter
+  // silently refuses to swap an IPv4 hostname for `::1` (and vice versa),
+  // leaving the original host in place — so that approach would quietly lose
+  // the v6 candidate. Reconstructing via string interpolation is safe
+  // because `template.username` / `template.password` are exposed in their
+  // already-percent-encoded form by the URL parser, so special characters
+  // (e.g. `@`, `:`) in credentials round-trip correctly.
+  const h = host === '::1' ? '[::1]' : host;
+  const userInfo =
+    template.username !== '' || template.password !== ''
+      ? `${template.username}${template.password !== '' ? `:${template.password}` : ''}@`
+      : '';
+  return `${template.protocol}//${userInfo}${h}:${port}${template.pathname}${template.search}${template.hash}`;
+}
+
+// Expand a bind host + port into ws:// candidate URLs derived from `template`
+// (preserves scheme/path/search/hash — only host+port change). IPv4 binds
+// (`127.0.0.1`, `0.0.0.0`, `*`) map to IPv4 loopback; `[::1]` stays on IPv6
+// loopback. The IPv6 wildcard (`[::]`) is the only bind that expands to both
+// families, since a dual-stack listener is reachable via either 127.0.0.1 or
+// [::1] depending on how the client connects.
+export function listenersToGatewayUrls(
+  listeners: DiscoveredListener[],
+  template: string,
+): string[] {
+  let tpl: URL;
+  try {
+    tpl = new URL(template);
+  } catch {
+    return [];
+  }
+  const urls = new Set<string>();
+  for (const { host, port } of listeners) {
+    if (host === '127.0.0.1' || host === '0.0.0.0' || host === '*') {
+      urls.add(buildCandidateUrl(tpl, '127.0.0.1', port));
+    } else if (host === '[::1]') {
+      urls.add(buildCandidateUrl(tpl, '::1', port));
+    } else if (host === '[::]') {
+      urls.add(buildCandidateUrl(tpl, '127.0.0.1', port));
+      urls.add(buildCandidateUrl(tpl, '::1', port));
+    }
+  }
+  return Array.from(urls);
+}
+
+async function discoverLocalGatewayUrls(processName: string, template: string): Promise<string[]> {
+  if (process.platform === 'win32') return [];
+  try {
+    const { stdout } = await execFileP(
+      'lsof',
+      // `-a` AND-s the selectors below; without it lsof OR-s them and returns
+      // every LISTEN socket on the host plus every file handle owned by the
+      // target process, which produces false candidates and extra latency.
+      ['-nP', '-a', '-iTCP', '-sTCP:LISTEN', '-c', processName],
+      { timeout: DISCOVERY_LSOF_TIMEOUT_MS },
+    );
+    return listenersToGatewayUrls(parseLsofListeningPorts(stdout), template);
+  } catch {
+    return [];
+  }
+}
+
+function sameGatewayUrl(a: string, b: string): boolean {
+  // Used to avoid re-trying the already-failed primary URL. Err on the side
+  // of "different → try it": if any of protocol, host, port, pathname,
+  // search, or user-info differs, treat the candidate as distinct. That way
+  // an injected discover returning the same host/port with (say) a different
+  // token query or path still gets attempted — the primary may have failed
+  // precisely because of that component.
+  try {
+    const ua = new URL(a);
+    const ub = new URL(b);
+    return (
+      ua.protocol === ub.protocol &&
+      ua.hostname === ub.hostname &&
+      ua.port === ub.port &&
+      ua.pathname === ub.pathname &&
+      ua.search === ub.search &&
+      ua.username === ub.username &&
+      ua.password === ub.password
+    );
+  } catch {
+    return a === b;
+  }
+}
+
+// Defensive error-to-string: catch clauses receive `unknown`, so a rejection
+// with `null`, a plain object, or a primitive would crash the logging path
+// that tries to read `.message`. Always return a string suitable for logs
+// without throwing.
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === 'string') return e;
+  try {
+    return String(e);
+  } catch {
+    return '<unrepresentable>';
+  }
+}
+
+// Strip query, hash, and user-info from a gateway URL before logging so
+// credentials embedded in a token query param (or userinfo) don't leak into
+// stdout. Keeps protocol + host + port + pathname, which is what operators
+// actually need to diagnose a connect failure. Exported for unit testing.
+export function redactUrl(u: string): string {
+  try {
+    const p = new URL(u);
+    return `${p.protocol}//${p.host}${p.pathname}`;
+  } catch {
+    return '<unparseable-url>';
+  }
+}
+
+// Discovery is only attempted when the configured URL targets the local
+// machine. A remote gateway that's temporarily unreachable must not silently
+// fall back to a local OpenClaw process — that would route tasks to the wrong
+// place. Wildcard binds (`0.0.0.0`, `::`) count as local too, since users may
+// copy a local bind address like `ws://0.0.0.0:<port>` into config.
+function isLoopbackUrl(u: string): boolean {
+  try {
+    const h = new URL(u).hostname; // WHATWG URL strips brackets for IPv6
+    return (
+      h === '127.0.0.1' ||
+      h === '0.0.0.0' ||
+      h === 'localhost' ||
+      h === '::1' ||
+      h === '::'
+    );
+  } catch {
+    return false;
+  }
+}
 
 function resolveTimeout(
   explicit: number | undefined,
@@ -433,51 +620,113 @@ export function createOpenclawBackend(
     }
   }
 
+  let resolvedUrl = url;
+  const discoveryProcessName =
+    process.env.OPENCLAW_PROCESS_NAME ?? DEFAULT_DISCOVERY_PROCESS_NAME;
+  const discover =
+    opts.discoverGatewayUrls ??
+    (() => discoverLocalGatewayUrls(discoveryProcessName, resolvedUrl));
+
+  async function connectAt(candidateUrl: string, hsTimeoutMs: number): Promise<GatewayClient> {
+    const c = new GatewayClient(candidateUrl, token, hsTimeoutMs);
+    await c.connect();
+    c.onEvent((evt) => {
+      if (evt.event !== 'chat') return;
+      const p = evt.payload as ChatEventPayload | undefined;
+      if (!p?.runId) return;
+      if (debug) {
+        console.log('[openclaw] chat event:', JSON.stringify(p).slice(0, 500));
+      }
+      const binding = runToTask.get(p.runId);
+      if (!binding) {
+        // Late or duplicate event for a run whose task already finalized:
+        // drop without buffering so memory stays bounded.
+        if (recentlyFinalizedRuns.has(p.runId)) return;
+        // Event arrived before handle() finished registering the runId.
+        // Buffer until the handler catches up and drains it. Evict the
+        // oldest unknown runId when the map grows past the cap so a
+        // noisy/misbehaving gateway can't inflate memory indefinitely.
+        let buf = pendingRunEvents.get(p.runId);
+        if (!buf) {
+          if (pendingRunEvents.size >= MAX_PENDING_RUN_KEYS) {
+            const oldest = pendingRunEvents.keys().next().value;
+            if (oldest !== undefined) pendingRunEvents.delete(oldest);
+          }
+          buf = [];
+          pendingRunEvents.set(p.runId, buf);
+        }
+        if (buf.length >= MAX_BUFFERED_EVENTS_PER_RUN) buf.shift();
+        buf.push(p);
+        return;
+      }
+      taskFinalizers.get(binding.taskId)?.(p);
+    });
+    c.onClose((err) => handleGatewayClose(c, err));
+    return c;
+  }
+
+  async function tryConnectWithDiscovery(): Promise<GatewayClient> {
+    try {
+      const c = await connectAt(resolvedUrl, handshakeTimeoutMs);
+      console.log(`[openclaw] connected ${redactUrl(resolvedUrl)}`);
+      return c;
+    } catch (primaryErr) {
+      // Fall back to process-based discovery: locate any OpenClaw-named
+      // process listening on loopback and try its port(s). Keeps the common
+      // "gateway moved to a different port" case self-healing without any
+      // OpenClaw-side cooperation. Skip when the configured URL is remote —
+      // a remote gateway outage must not silently reroute tasks to a local
+      // process.
+      if (!isLoopbackUrl(resolvedUrl)) throw primaryErr;
+      // Discovery is best-effort. An injected discoverGatewayUrls that throws
+      // must not mask the original connect error, so treat any rejection as
+      // "no candidates" and fall through to surface the primary failure.
+      let candidates: string[] = [];
+      try {
+        candidates = await discover();
+      } catch (discoverErr) {
+        if (debug) {
+          console.warn(`[openclaw] discover() threw, treating as empty: ${errorMessage(discoverErr)}`);
+        }
+      }
+      const alternates = candidates.filter((u) => !sameGatewayUrl(u, resolvedUrl));
+      if (alternates.length === 0) throw primaryErr;
+      console.warn(
+        `[openclaw] connect to ${redactUrl(resolvedUrl)} failed (${errorMessage(primaryErr)}); trying ${alternates.length} discovered candidate(s)`,
+      );
+      const probeTimeout = Math.min(handshakeTimeoutMs, DEFAULT_DISCOVERY_HANDSHAKE_TIMEOUT_MS);
+      for (const alt of alternates) {
+        try {
+          const c = await connectAt(alt, probeTimeout);
+          console.log(
+            `[openclaw] auto-discovered gateway at ${redactUrl(alt)} (was ${redactUrl(resolvedUrl)})`,
+          );
+          resolvedUrl = alt;
+          return c;
+        } catch (candidateErr) {
+          if (debug) {
+            console.warn(
+              `[openclaw] discovered candidate ${redactUrl(alt)} failed: ${errorMessage(candidateErr)}`,
+            );
+          }
+        }
+      }
+      // Surface the original connect failure instead of the last candidate's
+      // error — that's what the operator actually configured, and the
+      // candidate errors are downstream noise whose identity depends on scan
+      // order and false positives.
+      throw primaryErr;
+    }
+  }
+
   async function ensureConnected(): Promise<GatewayClient> {
     if (current && current.state === 'ready') return current;
     if (connecting) return connecting;
-    const c = new GatewayClient(url, token, handshakeTimeoutMs);
     connecting = (async () => {
       try {
-        await c.connect();
-        console.log(`[openclaw] connected ${url}`);
-        c.onEvent((evt) => {
-          if (evt.event !== 'chat') return;
-          const p = evt.payload as ChatEventPayload | undefined;
-          if (!p?.runId) return;
-          if (debug) {
-            console.log('[openclaw] chat event:', JSON.stringify(p).slice(0, 500));
-          }
-          const binding = runToTask.get(p.runId);
-          if (!binding) {
-            // Late or duplicate event for a run whose task already finalized:
-            // drop without buffering so memory stays bounded.
-            if (recentlyFinalizedRuns.has(p.runId)) return;
-            // Event arrived before handle() finished registering the runId.
-            // Buffer until the handler catches up and drains it. Evict the
-            // oldest unknown runId when the map grows past the cap so a
-            // noisy/misbehaving gateway can't inflate memory indefinitely.
-            let buf = pendingRunEvents.get(p.runId);
-            if (!buf) {
-              if (pendingRunEvents.size >= MAX_PENDING_RUN_KEYS) {
-                const oldest = pendingRunEvents.keys().next().value;
-                if (oldest !== undefined) pendingRunEvents.delete(oldest);
-              }
-              buf = [];
-              pendingRunEvents.set(p.runId, buf);
-            }
-            if (buf.length >= MAX_BUFFERED_EVENTS_PER_RUN) buf.shift();
-            buf.push(p);
-            return;
-          }
-          taskFinalizers.get(binding.taskId)?.(p);
-        });
-        c.onClose((err) => handleGatewayClose(c, err));
+        const c = await tryConnectWithDiscovery();
         current = c;
         return c;
-      } catch (err) {
-        // connect() itself failed: nothing is registered yet, just propagate.
-        throw err;
       } finally {
         connecting = null;
       }
