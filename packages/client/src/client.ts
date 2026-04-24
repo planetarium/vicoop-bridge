@@ -32,6 +32,13 @@ export class Client {
   constructor(private readonly opts: ClientOptions) {}
 
   start(): void {
+    // Kick off the capability probe before opening the bridge WS so it runs
+    // in parallel with (and usually finishes before) the server's hello
+    // deadline starts ticking at the `open` event. Starting it inside
+    // `ws.on('open')` instead could push `hello` past the server's 10s
+    // hello timeout when the backend probe itself takes a while (e.g. the
+    // openclaw gateway handshake on an unreachable/slow-to-handshake host).
+    void this.resolveEffectiveCard();
     this.connect();
   }
 
@@ -54,6 +61,13 @@ export class Client {
     this.effectiveCardPromise = (async () => {
       try {
         const detected = await probe.call(this.opts.backend);
+        // Preserve the documented "no override" contract: an empty detected
+        // object must leave the card byte-for-byte unchanged, including an
+        // absent `capabilities` field. Only materialize `capabilities` when
+        // the probe actually reports a value we need to apply.
+        if (detected.streaming === undefined && detected.pushNotifications === undefined) {
+          return base;
+        }
         const merged: AgentCard['capabilities'] = {
           ...(base.capabilities ?? {}),
           ...(detected.streaming !== undefined ? { streaming: detected.streaming } : {}),

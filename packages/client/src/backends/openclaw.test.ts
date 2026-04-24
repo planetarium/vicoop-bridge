@@ -1792,4 +1792,115 @@ test('resolveCapabilities: returns empty override when gateway is unreachable', 
   }
 });
 
+test('resolveCapabilities: after unknown-method verdict, subsequent handle() skips subscribe and suppresses per-task warn', async () => {
+  // Covers the regression Copilot flagged: before this fix, a pre-v2026.3.22
+  // gateway would see `ensureSessionMessageSubscription` fire for every task,
+  // each producing a "sessions.messages.subscribe failed ... (continuing
+  // without streaming)" warn. The probe's verdict must latch so tasks run
+  // silently against the known-unsupported gateway.
+  const subscribeCalls: Array<{ params: unknown }> = [];
+  const httpServer = createServer();
+  const wss = new WebSocketServer({ server: httpServer });
+  const sockets: WebSocket[] = [];
+  wss.on('connection', (sock) => {
+    sockets.push(sock);
+    sock.send(
+      JSON.stringify({
+        type: 'event',
+        event: 'connect.challenge',
+        payload: { nonce: 'nonce-latch' },
+      }),
+    );
+    sock.on('message', (raw) => {
+      let frame: ReqFrame;
+      try {
+        frame = JSON.parse(raw.toString()) as ReqFrame;
+      } catch {
+        return;
+      }
+      if (frame.type !== 'req') return;
+      if (frame.method === 'connect') {
+        sock.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: {} }));
+        return;
+      }
+      if (frame.method === 'sessions.messages.subscribe') {
+        subscribeCalls.push({ params: frame.params });
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: frame.id,
+            ok: false,
+            error: {
+              code: 'invalid_request',
+              message: 'unknown method: sessions.messages.subscribe',
+            },
+          }),
+        );
+        return;
+      }
+      if (frame.method === 'chat.send') {
+        const params = frame.params as { sessionKey: string; idempotencyKey: string };
+        const runId = `run-${params.idempotencyKey}`;
+        sock.send(
+          JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: { runId, status: 'started' } }),
+        );
+        setImmediate(() => {
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId,
+                sessionKey: params.sessionKey,
+                seq: 1,
+                state: 'final',
+                message: { text: `done ${params.idempotencyKey}` },
+              },
+            }),
+          );
+        });
+      }
+    });
+  });
+  await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
+  const { port } = httpServer.address() as AddressInfo;
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  try {
+    const backend = createOpenclawBackend({ url: `ws://127.0.0.1:${port}` });
+    const caps = await backend.resolveCapabilities!();
+    assert.deepEqual(caps, { streaming: false });
+    assert.equal(subscribeCalls.length, 1, 'probe must call subscribe exactly once');
+
+    const frames1: UpFrame[] = [];
+    await backend.handle(makeTask('t-latch-1', 'hi'), (f) => frames1.push(f), NEVER);
+    const frames2: UpFrame[] = [];
+    await backend.handle(makeTask('t-latch-2', 'hi'), (f) => frames2.push(f), NEVER);
+
+    assert.equal(
+      subscribeCalls.length,
+      1,
+      'tasks after the unknown-method verdict must not re-attempt subscribe',
+    );
+    const perTaskWarns = warnings.filter((w) =>
+      w.includes('sessions.messages.subscribe failed for agent:'),
+    );
+    assert.equal(
+      perTaskWarns.length,
+      0,
+      `per-task subscribe warnings must be suppressed, got: ${perTaskWarns.join(' | ')}`,
+    );
+  } finally {
+    console.warn = originalWarn;
+    for (const s of sockets) {
+      if (s.readyState !== WebSocket.CLOSED) s.terminate();
+    }
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+  }
+});
+
 export { createFakeGateway, makeTask };
