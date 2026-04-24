@@ -134,7 +134,10 @@ tar -xzf "$TMP_DIR/$ARCHIVE" -C "$INSTALL_DIR" --strip-components=1
 # defense-in-depth invariant.
 if [ "$(id -u)" = "0" ]; then
   chown -R 0:0 "$INSTALL_DIR" || die "chown -R 0:0 $INSTALL_DIR failed — refusing to leave root-extracted files with non-root ownership"
-  find "$INSTALL_DIR" -type f \( -perm -4000 -o -perm -2000 \) -exec chmod u-s,g-s {} + \
+  # POSIX `-exec ... {} \;` (one-per-file) rather than `{} +` so this works
+  # on older busybox find too. Our archive ships no setuid files, so the
+  # per-file fork overhead is effectively zero in practice.
+  find "$INSTALL_DIR" -type f \( -perm -4000 -o -perm -2000 \) -exec chmod u-s,g-s {} \; \
     || die "failed to strip setuid/setgid bits under $INSTALL_DIR after root extraction"
 fi
 
