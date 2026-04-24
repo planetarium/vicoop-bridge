@@ -78,19 +78,13 @@ The script targets Linux (Fly.io persistent volumes are the original target
 deployment); on macOS it prints a warning and proceeds. See #17 / #21 for
 background.
 
-`install.sh` prints next-step instructions, but parts of that output are
-outdated and should be ignored in favor of Steps 2-3 below:
-
-- It references `$INSTALL_DIR/card.json` as the card path — the bundle does
-  not ship that file; it ships `cards/openclaw.json` as a starting
-  template. This doc points `--card` (and `AGENT_CARD`) at the shipped
-  template directly; if you'd rather keep the printed path, copy the
-  template to `$INSTALL_DIR/card.json` first.
-- It suggests obtaining a token via a `register_client` tool on the admin
-  agent. Today the flow goes through the PostGraphile-exposed
-  `registerClient` GraphQL mutation (Step 3), gated by a SIWE caller token
-  (Step 2). The admin A2A agent itself does not carry a
-  `register_client` tool with that name.
+When systemd is the host init, `install.sh` also writes a
+`vicoop-client.service` unit plus a `vicoop-client.env` template (scope
+auto-detected: `system` as root, `user` otherwise). It does not enable or
+start the service — env values are populated by Steps 2-4 below, and the
+operator runs the `systemctl enable --now` command from the installer's
+output once they're filled in. Opt out with `INSTALL_SKIP_SERVICE=1`, or
+force a scope with `INSTALL_SERVICE_SCOPE=user|system|none`.
 
 ## Step 2 — Obtain a caller token (SIWE)
 
@@ -330,6 +324,22 @@ restart needed.
 
 `vicoop-client` does not daemonize. Pick whichever supervisor fits your host.
 
+### Linux — systemd (automatic, recommended)
+
+On systemd hosts `install.sh` already dropped the unit and an env template
+(see Step 1). Populate the env file and enable:
+
+```sh
+# user-scope (default for non-root)
+"${EDITOR:-vi}" ~/.config/vicoop-client.env   # set SERVER_TOKEN, AGENT_ID, ...
+systemctl --user enable --now vicoop-client
+journalctl --user -u vicoop-client -f         # watch logs
+```
+
+For a system-scope install (installer ran as root) swap to
+`/etc/vicoop-client.env` and `sudo systemctl enable --now vicoop-client`.
+The unit restarts on failure (`Restart=on-failure`, 5s backoff).
+
 ### macOS — `launchd`
 
 Create `~/Library/LaunchAgents/com.local.vicoop-client.plist` with
@@ -337,7 +347,10 @@ Create `~/Library/LaunchAgents/com.local.vicoop-client.plist` with
 `$INSTALL_DIR/bin/vicoop-client`, and put your env into
 `EnvironmentVariables`. Load with `launchctl load -w <plist>`.
 
-### Linux — systemd user unit
+### Linux — systemd user unit (manual)
+
+If you ran `install.sh` with `INSTALL_SKIP_SERVICE=1` or the scope
+auto-detection skipped (non-systemd host), write the unit yourself:
 
 ```ini
 # ~/.config/systemd/user/vicoop-client.service
@@ -372,8 +385,6 @@ tmux attach -t vbc   # to watch logs
 Using `set -a` + `.` keeps secrets out of the process-listing line and
 tolerates quoted values / comment lines in the env file, which the
 `env $(xargs)` pattern does not.
-
-Automatic restart on crash is tracked in #18.
 
 ## Troubleshooting
 
