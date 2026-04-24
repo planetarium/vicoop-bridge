@@ -84,16 +84,25 @@ export class Client {
       // backend can actually deliver. If the probe is still running (slow
       // gateway handshake), `hello` is delayed by the difference — typically
       // a few ms on a local loopback gateway.
+      //
+      // Send on the captured `ws` (not `this.send()` / `this.ws`) so a
+      // reconnect-driven socket swap during the probe's async gap cannot
+      // misdirect the hello onto a fresh connection that has its own `open`
+      // handler coming. Also drop the frame silently if this socket moved
+      // out of OPEN before the probe settled — the next `connect()` cycle
+      // will issue its own hello.
       this.resolveEffectiveCard().then((agentCard) => {
         if (ws.readyState !== WebSocket.OPEN) return;
         console.log('[client] connected, sending hello');
-        this.send({
-          type: 'hello',
-          agentId: this.opts.agentId,
-          agentCard,
-          version: PROTOCOL_VERSION,
-          token: this.opts.token,
-        });
+        ws.send(
+          encodeFrame({
+            type: 'hello',
+            agentId: this.opts.agentId,
+            agentCard,
+            version: PROTOCOL_VERSION,
+            token: this.opts.token,
+          }),
+        );
       });
     });
 
