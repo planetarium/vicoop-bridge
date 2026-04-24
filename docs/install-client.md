@@ -50,6 +50,8 @@ one-liner fetching a published `client-v*` bundle). Contrast with:
   `capabilities.streaming: false` on its agent card so A2A callers don't
   request `message/stream` against a backend that can't deliver it;
   task execution still works via the terminal-artifact fallback.
+- For the Claude backend specifically: the local `claude` CLI installed and
+  authenticated (`claude --version` should succeed).
 
 ## Step 1 — Install the client bundle
 
@@ -79,8 +81,9 @@ What you get after extraction:
 $INSTALL_DIR/
 ├── bin/vicoop-client        # bash wrapper that execs node dist/cli.js
 ├── dist/                    # compiled JS
-├── cards/openclaw.json      # example agent card
-├── cards/claude.json        # example Claude card
+├── cards/openclaw.json      # OpenClaw example card
+├── cards/claude.json        # Claude Code example card
+├── cards/echo.json          # Echo test card
 ├── node_modules/            # pruned prod deps
 └── package.json
 ```
@@ -240,9 +243,10 @@ owns it.
 
 ## Step 4 — Prepare the agent card
 
-The bundle ships `$INSTALL_DIR/cards/openclaw.json` as a starting template.
-Agent cards are published at `GET <bridge>/agents/<agent_id>/.well-known/agent-card.json`
-and describe what callers can expect. At minimum you usually want to:
+The bundle ships backend-specific starter cards under `$INSTALL_DIR/cards/`
+(`openclaw.json`, `claude.json`, `echo.json`). Agent cards are published at
+`GET <bridge>/agents/<agent_id>/.well-known/agent-card.json` and describe
+what callers can expect. At minimum you usually want to:
 
 - Rename `name` to something meaningful (it defaults to `openclaw`).
 - Tighten `description` to what this specific instance actually does.
@@ -251,7 +255,7 @@ and describe what callers can expect. At minimum you usually want to:
 Schema reference: `packages/protocol/src/index.ts` (`AgentCard` Zod schema,
 validated by the client at startup — invalid cards exit with a Zod error).
 
-For other backends, write a fresh card:
+For custom backends, write a fresh card:
 
 ```sh
 cat > "$INSTALL_DIR/cards/my-agent.json" <<'JSON'
@@ -542,9 +546,9 @@ files before running it.
   `["openclaw-a", "openclaw-b", ...]`) and run one `vicoop-client` per id.
   No token rotation needed.
 - **Different backends**: in the published bundle today, pass
-  `--backend openclaw` or `--backend echo` with a matching card.
-  `claude-cli` / `codex` are described in `docs/design.md` §5 but are not
-  shipped yet.
+  `--backend openclaw`, `--backend claude`, or `--backend echo` with a
+  matching card. Codex and other future backends are still described in
+  `docs/design.md` §5 but are not shipped yet.
 - **Audit/revoke access**: the admin agent exposes `list_caller_tokens`,
   `list_callers`, and `revoke_caller_token` tools; see the tool list in
   `packages/server/src/admin.ts`.
