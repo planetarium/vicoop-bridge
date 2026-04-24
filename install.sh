@@ -138,7 +138,18 @@ resolve_service_scope() {
   fi
 
   case "$INSTALL_SERVICE_SCOPE" in
-    user|system) echo "$INSTALL_SERVICE_SCOPE"; return ;;
+    user) echo user; return ;;
+    system)
+      # Explicit system scope requires root — refuse early with a clear message
+      # rather than letting the later `cat > /etc/...` fail under `set -e`.
+      if [ "$(id -u)" != "0" ]; then
+        log "warning: INSTALL_SERVICE_SCOPE=system requires root; skipping service registration (rerun with sudo, or set INSTALL_SERVICE_SCOPE=user)"
+        echo none
+        return
+      fi
+      echo system
+      return
+      ;;
     auto) ;;
     *) log "warning: unknown INSTALL_SERVICE_SCOPE='$INSTALL_SERVICE_SCOPE', falling back to auto" ;;
   esac
@@ -157,7 +168,13 @@ resolve_service_scope() {
 
 install_service() {
   scope="$1"
-  bin_path="$INSTALL_DIR/bin/vicoop-client"
+
+  # Resolve node's absolute path at install time. Invoking node directly (not
+  # via bin/vicoop-client) means the unit works under nvm/asdf/Volta layouts
+  # where systemd's default PATH wouldn't find node.
+  node_bin="$(command -v node 2>/dev/null || true)"
+  [ -n "$node_bin" ] || { log "warning: node not on PATH — skipping service registration"; return; }
+  cli_entry="$INSTALL_DIR/dist/cli.js"
 
   case "$scope" in
     system)
@@ -165,7 +182,16 @@ install_service() {
       env_file="/etc/vicoop-client.env"
       env_ref="$env_file"
       want="multi-user.target"
-      SERVICE_ENABLE_CMD="sudo systemctl enable --now vicoop-client"
+      # Root running the installer (the auto-detected system path) gets an
+      # un-prefixed command; sudo is only suggested for later reinvocations by
+      # a non-root operator. Minimal images often lack sudo entirely.
+      if [ "$(id -u)" = "0" ]; then
+        SERVICE_RELOAD_CMD="systemctl daemon-reload"
+        SERVICE_ENABLE_CMD="systemctl enable --now vicoop-client"
+      else
+        SERVICE_RELOAD_CMD="sudo systemctl daemon-reload"
+        SERVICE_ENABLE_CMD="sudo systemctl enable --now vicoop-client"
+      fi
       ;;
     user)
       [ -n "${HOME:-}" ] || { log "warning: HOME unset — skipping service registration"; return; }
@@ -173,6 +199,7 @@ install_service() {
       env_file="${XDG_CONFIG_HOME:-$HOME/.config}/vicoop-client.env"
       env_ref="$env_file"
       want="default.target"
+      SERVICE_RELOAD_CMD="systemctl --user daemon-reload"
       SERVICE_ENABLE_CMD="systemctl --user enable --now vicoop-client"
       ;;
     *) return ;;
@@ -192,7 +219,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=$env_ref
-ExecStart=$bin_path
+ExecStart=$node_bin $cli_entry
 Restart=on-failure
 RestartSec=5s
 
@@ -267,11 +294,23 @@ EOF
 if [ -n "$SERVICE_INSTALLED" ]; then
   cat <<EOF
   2. Fill in $SERVICE_ENV_FILE with SERVER_URL / SERVER_TOKEN / AGENT_ID / AGENT_CARD / BACKEND.
-  3. Enable + start the service:
+  3. Reload systemd and enable + start the service:
 
+       $SERVICE_RELOAD_CMD
        $SERVICE_ENABLE_CMD
 
 EOF
+  if [ "$SERVICE_INSTALLED" = "user" ]; then
+    cat <<'EOF'
+     For 24/7 operation on a headless host, also run (once):
+
+       sudo loginctl enable-linger "$USER"
+
+     Otherwise the user's systemd manager stops when the last login session
+     closes, taking the client with it.
+
+EOF
+  fi
 else
   cat <<EOF
   2. Run the client (supply config via env or flags):

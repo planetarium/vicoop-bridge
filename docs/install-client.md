@@ -62,6 +62,8 @@ would still default to `/data/vicoop-bridge-client`.
 | `INSTALL_DIR` | `/data/vicoop-bridge-client` | Target directory. Pick a writable path on a volume that survives restarts. |
 | `VERSION` | latest `client-v*` | Pin a specific tag, e.g. `client-v0.1.1`. |
 | `FORCE` | `0` | If `1`, overwrite a non-empty `INSTALL_DIR`. |
+| `INSTALL_SKIP_SERVICE` | `0` | If `1`, skip the systemd unit + env template even on systemd hosts. |
+| `INSTALL_SERVICE_SCOPE` | `auto` | Force `user`, `system`, or `none` instead of auto-detecting by `id -u`. `system` requires root; an explicit `system` without root is refused with a warning. |
 
 What you get after extraction:
 
@@ -332,13 +334,30 @@ On systemd hosts `install.sh` already dropped the unit and an env template
 ```sh
 # user-scope (default for non-root)
 "${EDITOR:-vi}" ~/.config/vicoop-client.env   # set SERVER_TOKEN, AGENT_ID, ...
+systemctl --user daemon-reload                # pick up regenerated unit after reinstall
 systemctl --user enable --now vicoop-client
 journalctl --user -u vicoop-client -f         # watch logs
 ```
 
 For a system-scope install (installer ran as root) swap to
-`/etc/vicoop-client.env` and `sudo systemctl enable --now vicoop-client`.
-The unit restarts on failure (`Restart=on-failure`, 5s backoff).
+`/etc/vicoop-client.env`, `sudo systemctl daemon-reload`, then
+`sudo systemctl enable --now vicoop-client`. The unit restarts on failure
+(`Restart=on-failure`, 5s backoff).
+
+The `daemon-reload` is only strictly needed after a reinstall/upgrade that
+rewrote the unit file (new `INSTALL_DIR`, new absolute node path, new
+`VERSION`); first-time installs can skip it. It never hurts to run.
+
+**Headless hosts / user scope**: the user-scope manager is tied to your
+login session by default, so the client stops when you log out. For true
+24/7 operation either enable lingering:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+or rerun the installer as root with `INSTALL_SERVICE_SCOPE=system` to get
+a system-wide unit instead.
 
 ### macOS — `launchd`
 
