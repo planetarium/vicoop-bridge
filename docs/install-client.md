@@ -1,13 +1,14 @@
 # Install vicoop-bridge-client
 
-Onboarding guide for connecting a local A2A backend (OpenClaw, with `echo`
-available for testing) to a deployed vicoop-bridge server. The end state is
-a long-running `vicoop-client` process on your host that bridges inbound A2A
-traffic at `POST <bridge>/agents/<your-agent-id>` to your local backend.
+Onboarding guide for connecting a local A2A backend (OpenClaw, Claude Code,
+with `echo` available for testing) to a deployed vicoop-bridge server. The
+end state is a long-running `vicoop-client` process on your host that bridges
+inbound A2A traffic at `POST <bridge>/agents/<your-agent-id>` to your local
+backend.
 
-Additional backends (Claude Code, Codex, ...) are described in
-`docs/design.md` §5 but are not in the published client bundle yet —
-`packages/client/src/cli.ts` currently only registers `echo` and `openclaw`.
+The published client bundle currently ships `echo`, `openclaw`, and
+`claude` backends. Codex and other future backends are still described in
+`docs/design.md` §5 as design targets rather than released bundle features.
 
 This doc covers the **post-release install path** (the `install.sh`
 one-liner fetching a published `client-v*` bundle). Contrast with:
@@ -42,6 +43,8 @@ one-liner fetching a published `client-v*` bundle). Contrast with:
     scripting SIWE yourself.
 - For the OpenClaw backend specifically: an OpenClaw gateway running
   locally at `ws://127.0.0.1:18789` (override via `OPENCLAW_GATEWAY_URL`).
+- For the Claude backend specifically: the local `claude` CLI installed and
+  authenticated (`claude --version` should succeed).
 
 ## Step 1 — Install the client bundle
 
@@ -71,7 +74,9 @@ What you get after extraction:
 $INSTALL_DIR/
 ├── bin/vicoop-client        # bash wrapper that execs node dist/cli.js
 ├── dist/                    # compiled JS
-├── cards/openclaw.json      # example agent card
+├── cards/openclaw.json      # OpenClaw example card
+├── cards/claude.json        # Claude Code example card
+├── cards/echo.json          # Echo test card
 ├── node_modules/            # pruned prod deps
 └── package.json
 ```
@@ -231,9 +236,10 @@ owns it.
 
 ## Step 4 — Prepare the agent card
 
-The bundle ships `$INSTALL_DIR/cards/openclaw.json` as a starting template.
-Agent cards are published at `GET <bridge>/agents/<agent_id>/.well-known/agent-card.json`
-and describe what callers can expect. At minimum you usually want to:
+The bundle ships backend-specific starter cards under `$INSTALL_DIR/cards/`
+(`openclaw.json`, `claude.json`, `echo.json`). Agent cards are published at
+`GET <bridge>/agents/<agent_id>/.well-known/agent-card.json` and describe
+what callers can expect. At minimum you usually want to:
 
 - Rename `name` to something meaningful (it defaults to `openclaw`).
 - Tighten `description` to what this specific instance actually does.
@@ -242,7 +248,7 @@ and describe what callers can expect. At minimum you usually want to:
 Schema reference: `packages/protocol/src/index.ts` (`AgentCard` Zod schema,
 validated by the client at startup — invalid cards exit with a Zod error).
 
-For other backends, write a fresh card:
+For custom backends, write a fresh card:
 
 ```sh
 cat > "$INSTALL_DIR/cards/my-agent.json" <<'JSON'
@@ -301,6 +307,28 @@ second WS. Override if yours isn't on the default:
 | `OPENCLAW_GATEWAY_TOKEN` | *(none)* | If your gateway requires auth |
 | `OPENCLAW_AGENT` | `main` | Agent name inside OpenClaw |
 | `OPENCLAW_TASK_TIMEOUT_MS` | backend default | Per-task timeout |
+
+### Claude-specific env
+
+The Claude backend shells out to the local `claude` binary once per task and
+uses the bundled `cards/claude.json` as the default agent card:
+
+```sh
+SERVER_URL="$SERVER_URL" \
+SERVER_TOKEN="$CLIENT_TOKEN" \
+AGENT_ID="$AGENT_ID" \
+AGENT_CARD="$INSTALL_DIR/cards/claude.json" \
+BACKEND=claude \
+  "$INSTALL_DIR/bin/vicoop-client"
+```
+
+Requirements:
+
+- `claude` must be present on `PATH`
+- the local Claude CLI session must already be authenticated
+
+The current backend does not require extra env vars beyond the standard
+client settings above.
 
 ### Restrict who can call your agent
 
@@ -512,9 +540,9 @@ files before running it.
   `["openclaw-a", "openclaw-b", ...]`) and run one `vicoop-client` per id.
   No token rotation needed.
 - **Different backends**: in the published bundle today, pass
-  `--backend openclaw` or `--backend echo` with a matching card.
-  `claude-cli` / `codex` are described in `docs/design.md` §5 but are not
-  shipped yet.
+  `--backend openclaw`, `--backend claude`, or `--backend echo` with a
+  matching card. Codex and other future backends are still described in
+  `docs/design.md` §5 but are not shipped yet.
 - **Audit/revoke access**: the admin agent exposes `list_caller_tokens`,
   `list_callers`, and `revoke_caller_token` tools; see the tool list in
   `packages/server/src/admin.ts`.
