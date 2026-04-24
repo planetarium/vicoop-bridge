@@ -4,6 +4,7 @@ import {
   accessSync,
   constants as fsConstants,
   cpSync,
+  createReadStream,
   createWriteStream,
   existsSync,
   mkdirSync,
@@ -24,6 +25,11 @@ const REPO = 'planetarium/vicoop-bridge';
 // Top-level entries that the release bundle owns. Anything else under
 // $INSTALL_DIR is assumed operator-placed and preserved on upgrade.
 const SHIPPED_TOP_LEVEL = new Set(['bin', 'cards', 'dist', 'node_modules', 'package.json', 'README.md']);
+
+// Cap for the new-bundle --version probe. It's meant to be instantaneous;
+// anything close to the timeout indicates a regression we'd rather surface
+// than block on.
+const HEALTHCHECK_TIMEOUT_MS = 10_000;
 
 export interface UpgradeOptions {
   check: boolean;
@@ -65,60 +71,85 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
   rmSync(newDir, { recursive: true, force: true });
 
   const dlDir = mkdtempSync(join(tmpdir(), 'vicoop-upgrade-'));
+
+  // `swapDone` gates the .new cleanup: any exit path before the atomic swap
+  // completes (explicit `return`, thrown exception, failed rollback) must
+  // leave the original install in place and remove .new. The outer finally
+  // checks this flag so we don't have to duplicate cleanup at every failure
+  // site.
+  let swapDone = false;
+
   try {
-    const archiveName = `vicoop-bridge-client-${targetVersion}.tgz`;
-    const checksumName = `${archiveName}.sha256`;
-    const baseUrl = `https://github.com/${REPO}/releases/download/${targetTag}`;
+    try {
+      const archiveName = `vicoop-bridge-client-${targetVersion}.tgz`;
+      const checksumName = `${archiveName}.sha256`;
+      const baseUrl = `https://github.com/${REPO}/releases/download/${targetTag}`;
 
-    log(`downloading ${archiveName}`);
-    await download(`${baseUrl}/${archiveName}`, join(dlDir, archiveName));
-    await download(`${baseUrl}/${checksumName}`, join(dlDir, checksumName));
+      log(`downloading ${archiveName}`);
+      await download(`${baseUrl}/${archiveName}`, join(dlDir, archiveName));
+      await download(`${baseUrl}/${checksumName}`, join(dlDir, checksumName));
 
-    log('verifying checksum');
-    const expected = parseChecksum(readFileSync(join(dlDir, checksumName), 'utf8'));
-    const actual = sha256File(join(dlDir, archiveName));
-    if (expected !== actual) {
-      err(`checksum mismatch: expected ${expected}, got ${actual}`);
+      log('verifying checksum');
+      const expected = parseChecksum(readFileSync(join(dlDir, checksumName), 'utf8'));
+      const actual = await sha256File(join(dlDir, archiveName));
+      if (expected !== actual) {
+        err(`checksum mismatch: expected ${expected}, got ${actual}`);
+        return 1;
+      }
+
+      log(`extracting into ${newDir}`);
+      mkdirSync(newDir, { recursive: true });
+      const tarRes = spawnSync(
+        'tar',
+        ['-xzf', join(dlDir, archiveName), '-C', newDir, '--strip-components=1'],
+        { stdio: 'inherit' },
+      );
+      if (tarRes.status !== 0) {
+        err('extraction failed');
+        return 1;
+      }
+
+      preserveOperatorFiles(installDir, newDir);
+
+      const health = runHealthcheck(newDir, targetVersion);
+      if (!health.ok) {
+        err(`new bundle failed --version healthcheck; aborting${health.detail ? ` (${health.detail})` : ''}`);
+        return 1;
+      }
+
+      // Atomic swap. Both renames inside a guarded block so any failure
+      // restores the original install dir; the outer `finally` still deletes
+      // `.new` since `swapDone` stays false.
+      rmSync(prevDir, { recursive: true, force: true });
+      let movedOriginal = false;
+      try {
+        log(`swap: ${installDir} -> ${prevDir}`);
+        renameSync(installDir, prevDir);
+        movedOriginal = true;
+        log(`swap: ${newDir} -> ${installDir}`);
+        renameSync(newDir, installDir);
+        swapDone = true;
+      } catch (e) {
+        err(`swap failed, rolling back: ${(e as Error).message}`);
+        if (movedOriginal && !existsSync(installDir)) {
+          try {
+            renameSync(prevDir, installDir);
+          } catch (rollbackErr) {
+            err(`rollback rename failed: ${(rollbackErr as Error).message}`);
+          }
+        }
+        return 1;
+      }
+    } catch (e) {
+      err(`upgrade failed: ${(e as Error).message}`);
       return 1;
-    }
-
-    log(`extracting into ${newDir}`);
-    mkdirSync(newDir, { recursive: true });
-    const tarRes = spawnSync(
-      'tar',
-      ['-xzf', join(dlDir, archiveName), '-C', newDir, '--strip-components=1'],
-      { stdio: 'inherit' },
-    );
-    if (tarRes.status !== 0) {
-      err('extraction failed');
-      rmSync(newDir, { recursive: true, force: true });
-      return 1;
-    }
-
-    preserveOperatorFiles(installDir, newDir);
-
-    if (!healthcheck(newDir, targetVersion)) {
-      err('new bundle failed --version healthcheck; aborting');
-      rmSync(newDir, { recursive: true, force: true });
-      return 1;
+    } finally {
+      if (!swapDone) {
+        rmSync(newDir, { recursive: true, force: true });
+      }
     }
   } finally {
     rmSync(dlDir, { recursive: true, force: true });
-  }
-
-  // Atomic swap. The first rename is the point of no return for $INSTALL_DIR;
-  // if the second fails we put the original back before bailing.
-  rmSync(prevDir, { recursive: true, force: true });
-  log(`swap: ${installDir} -> ${prevDir}`);
-  renameSync(installDir, prevDir);
-  try {
-    log(`swap: ${newDir} -> ${installDir}`);
-    renameSync(newDir, installDir);
-  } catch (e) {
-    err(`swap failed, rolling back: ${(e as Error).message}`);
-    renameSync(prevDir, installDir);
-    rmSync(newDir, { recursive: true, force: true });
-    return 1;
   }
 
   const unit = detectSystemdUnit();
@@ -136,7 +167,7 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
   return 0;
 }
 
-function normalizeTag(v: string): string {
+export function normalizeTag(v: string): string {
   return v.startsWith('client-v') ? v : `client-v${v.replace(/^v/, '')}`;
 }
 
@@ -158,11 +189,13 @@ async function download(url: string, dest: string): Promise<void> {
   await pipeline(Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]), createWriteStream(dest));
 }
 
-function sha256File(path: string): string {
-  return createHash('sha256').update(readFileSync(path)).digest('hex');
+export async function sha256File(path: string): Promise<string> {
+  const hash = createHash('sha256');
+  await pipeline(createReadStream(path), hash);
+  return hash.digest('hex');
 }
 
-function parseChecksum(contents: string): string {
+export function parseChecksum(contents: string): string {
   // Matches install.sh: take the first whitespace-separated token from the first line.
   const first = contents.trim().split(/\s+/)[0];
   if (!first || !/^[0-9a-f]{64}$/i.test(first)) {
@@ -171,7 +204,7 @@ function parseChecksum(contents: string): string {
   return first.toLowerCase();
 }
 
-function preserveOperatorFiles(oldDir: string, newDir: string): void {
+export function preserveOperatorFiles(oldDir: string, newDir: string): void {
   for (const entry of readdirSync(oldDir)) {
     if (SHIPPED_TOP_LEVEL.has(entry)) continue;
     const src = join(oldDir, entry);
@@ -190,11 +223,32 @@ function preserveOperatorFiles(oldDir: string, newDir: string): void {
   }
 }
 
-function healthcheck(newDir: string, expected: string): boolean {
+interface HealthcheckResult {
+  ok: boolean;
+  detail?: string;
+}
+
+function runHealthcheck(newDir: string, expected: string): HealthcheckResult {
   const cli = join(newDir, 'dist', 'cli.js');
-  const r = spawnSync(process.execPath, [cli, '--version'], { encoding: 'utf8' });
-  if (r.status !== 0) return false;
-  return r.stdout.trim() === expected;
+  const r = spawnSync(process.execPath, [cli, '--version'], {
+    encoding: 'utf8',
+    timeout: HEALTHCHECK_TIMEOUT_MS,
+  });
+  // spawnSync's `timeout` option kills the child with SIGTERM on expiry; flag
+  // that path separately so the operator can distinguish a hang from a normal
+  // non-zero exit.
+  if (r.signal === 'SIGTERM' || r.error?.message?.includes('ETIMEDOUT')) {
+    return { ok: false, detail: `timeout after ${HEALTHCHECK_TIMEOUT_MS}ms` };
+  }
+  if (r.status !== 0) {
+    const stderrSnippet = (r.stderr ?? '').trim().split('\n').slice(0, 3).join(' | ').slice(0, 200);
+    return { ok: false, detail: `exit ${r.status}${stderrSnippet ? `; stderr: ${stderrSnippet}` : ''}` };
+  }
+  const got = r.stdout.trim();
+  if (got !== expected) {
+    return { ok: false, detail: `reported '${got}', expected '${expected}'` };
+  }
+  return { ok: true };
 }
 
 function detectSystemdUnit(): { scope: 'system' | 'user' } | null {
