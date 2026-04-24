@@ -13,10 +13,19 @@ export interface ClaudeChildHandle {
   on(event: 'error', listener: (err: Error) => void): void;
 }
 
-export type ClaudeSpawnFn = (command: string, args: readonly string[]) => ClaudeChildHandle;
+export interface ClaudeSpawnOptions {
+  cwd?: string;
+}
+
+export type ClaudeSpawnFn = (
+  command: string,
+  args: readonly string[],
+  options: ClaudeSpawnOptions,
+) => ClaudeChildHandle;
 
 export interface ClaudeBackendOptions {
   command?: string;
+  cwd?: string;
   extraArgs?: readonly string[];
   spawn?: ClaudeSpawnFn;
   stderrCaptureBytes?: number;
@@ -46,8 +55,15 @@ interface StreamEvent {
   result?: unknown;
 }
 
-function defaultSpawn(command: string, args: readonly string[]): ClaudeChildHandle {
-  return nodeSpawn(command, Array.from(args), { stdio: ['ignore', 'pipe', 'pipe'] }) as ChildProcess;
+function defaultSpawn(
+  command: string,
+  args: readonly string[],
+  options: ClaudeSpawnOptions,
+): ClaudeChildHandle {
+  return nodeSpawn(command, Array.from(args), {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    ...(options.cwd ? { cwd: options.cwd } : {}),
+  }) as ChildProcess;
 }
 
 function extractAssistantText(content: unknown): string {
@@ -81,6 +97,7 @@ function collectTextPrompt(parts: readonly Part[]): { ok: true; prompt: string }
 
 export function createClaudeBackend(opts: ClaudeBackendOptions = {}): Backend {
   const command = opts.command ?? 'claude';
+  const cwd = opts.cwd;
   const extraArgs = opts.extraArgs ?? [];
   const spawnFn = opts.spawn ?? defaultSpawn;
   const stderrCap = opts.stderrCaptureBytes ?? 8192;
@@ -158,7 +175,7 @@ export function createClaudeBackend(opts: ClaudeBackendOptions = {}): Backend {
 
       let child: ClaudeChildHandle;
       try {
-        child = spawnFn(command, args);
+        child = spawnFn(command, args, { cwd });
       } catch (err) {
         // Roll back the freshly-minted entry so a retry doesn't try to
         // --resume a session that was never actually created on disk.
