@@ -1,0 +1,17 @@
+{
+  "name": "claude",
+  "description": "Anthropic Claude Code CLI agent. Spawns the local `claude` binary per task and streams each assistant message back as an A2A artifact. Text input only.",
+  "version": "0.0.1",
+  "protocolVersion": "0.3.0",
+  "capabilities": { "streaming": true },
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "chat",
+      "name": "chat",
+      "description": "Ask a question or give an instruction in natural language; the Claude Code CLI responds with text.",
+      "tags": ["chat", "assistant", "claude"]
+    }
+  ]
+}

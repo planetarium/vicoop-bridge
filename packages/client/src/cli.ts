@@ -4,6 +4,7 @@ import { AgentCard } from '@vicoop-bridge/protocol';
 import { Client } from './client.js';
 import { echoBackend } from './backends/echo.js';
 import { createOpenclawBackend } from './backends/openclaw.js';
+import { createClaudeBackend } from './backends/claude.js';
 import type { Backend } from './backend.js';
 
 interface Args {
@@ -48,8 +49,10 @@ function pickBackend(name: string): Backend {
       return echoBackend;
     case 'openclaw':
       return createOpenclawBackend();
+    case 'claude':
+      return createClaudeBackend();
     default:
-      throw new Error(`unknown backend: ${name} (supported: echo, openclaw)`);
+      throw new Error(`unknown backend: ${name} (supported: echo, openclaw, claude)`);
   }
 }
 
