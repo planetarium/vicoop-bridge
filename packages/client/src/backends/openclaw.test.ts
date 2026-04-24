@@ -37,6 +37,7 @@ interface FakeGateway {
   respond(sock: WebSocket, id: string, payload: unknown): void;
   respondError(sock: WebSocket, id: string, error: { code: string; message: string }): void;
   emitChat(sock: WebSocket, payload: unknown): void;
+  emitSessionMessage(sock: WebSocket, payload: unknown): void;
   closeSocket(sock: WebSocket): Promise<void>;
   close(): Promise<void>;
 }
@@ -69,6 +70,24 @@ async function createFakeGateway(opts: FakeGatewayOptions = {}): Promise<FakeGat
       if (frame.type !== 'req') return;
       if (frame.method === 'connect' && autoHandshake) {
         sock.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: {} }));
+        return;
+      }
+      // Every backend task path now calls `sessions.messages.subscribe` once
+      // per sessionKey to enable message-boundary streaming. Auto-ack here so
+      // existing tests that don't care about streaming don't have to wire up
+      // a handler — the onRequest hook still runs if a test wants to inspect
+      // the subscription call itself.
+      if (frame.method === 'sessions.messages.subscribe') {
+        const key = (frame.params as { key?: string } | undefined)?.key ?? '';
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: frame.id,
+            ok: true,
+            payload: { subscribed: true, key },
+          }),
+        );
+        opts.onRequest?.(sock, frame);
         return;
       }
       opts.onRequest?.(sock, frame);
@@ -106,6 +125,9 @@ async function createFakeGateway(opts: FakeGatewayOptions = {}): Promise<FakeGat
     },
     emitChat(sock, payload) {
       sock.send(JSON.stringify({ type: 'event', event: 'chat', payload }));
+    },
+    emitSessionMessage(sock, payload) {
+      sock.send(JSON.stringify({ type: 'event', event: 'session.message', payload }));
     },
     async closeSocket(sock) {
       await new Promise<void>((resolve) => {
@@ -1021,6 +1043,327 @@ test('handle(): file.uri fails fast with unsupported_file_uri', async () => {
     await fake.close();
   }
 });
+
+test('streaming: assistant session.message events emit as distinct artifacts before final completion', async () => {
+  // Simulates openclaw's in-run transcript writes: two assistant messages
+  // arrive via session.message, then the chat run terminates with `final`.
+  // Each session.message should surface as its own task.artifact (distinct
+  // artifactId, lastChunk:true), and the terminal `final` must NOT tack on
+  // a redundant final-result artifact because streaming already delivered
+  // content. task.complete still carries the final text in status.message.
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method !== 'chat.send') return;
+      const params = req.params as { sessionKey: string; idempotencyKey: string };
+      const runId = `run-${params.idempotencyKey}`;
+      sock.send(
+        JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+      );
+      setImmediate(() => {
+        fake.emitSessionMessage(sock, {
+          sessionKey: params.sessionKey,
+          messageId: 'm1',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'thinking out loud' }] },
+        });
+        fake.emitSessionMessage(sock, {
+          sessionKey: params.sessionKey,
+          messageId: 'm2',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'final answer' }] },
+        });
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 1,
+          state: 'final',
+          message: { text: 'final answer' },
+        });
+      });
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t-stream', 'hi'), (f) => frames.push(f), NEVER);
+
+    const artifacts = frames.filter((f) => f.type === 'task.artifact');
+    assert.equal(artifacts.length, 2, 'each assistant message should emit its own artifact');
+    const ids = new Set(artifacts.map((a) => a.artifact.artifactId));
+    assert.equal(ids.size, 2, 'artifactIds should be distinct per message (option b: independent artifacts)');
+    for (const a of artifacts) {
+      assert.equal(a.lastChunk, true, 'each message-artifact is complete on emission');
+      assert.equal(a.artifact.name, 'openclaw-message');
+    }
+    assert.equal(
+      (artifacts[0].artifact.parts[0] as { kind: 'text'; text: string }).text,
+      'thinking out loud',
+    );
+    assert.equal(
+      (artifacts[1].artifact.parts[0] as { kind: 'text'; text: string }).text,
+      'final answer',
+    );
+
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete);
+    assert.equal(complete!.status.state, 'completed');
+    // Sanity: exactly one completion + one status(working) + two artifacts,
+    // no third artifact emitted from the final event's text.
+    assert.deepEqual(
+      frames.map((f) => f.type),
+      ['task.status', 'task.artifact', 'task.artifact', 'task.complete'],
+    );
+  } finally {
+    await fake.close();
+  }
+});
+
+test('streaming: no session.message events falls back to single final-result artifact', async () => {
+  // When the gateway never emits session.message (e.g. subscription failed or
+  // the agent wrote no intermediate messages), handle() must still behave
+  // like today: one final artifact derived from the terminal chat.final
+  // message, then task.complete.
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method !== 'chat.send') return;
+      const params = req.params as { sessionKey: string; idempotencyKey: string };
+      const runId = `run-${params.idempotencyKey}`;
+      sock.send(
+        JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+      );
+      setImmediate(() => {
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 1,
+          state: 'final',
+          message: { text: 'hello' },
+        });
+      });
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t-noop', 'hi'), (f) => frames.push(f), NEVER);
+    assert.deepEqual(
+      frames.map((f) => f.type),
+      ['task.status', 'task.artifact', 'task.complete'],
+    );
+    const artifact = frames.find((f) => f.type === 'task.artifact');
+    assert.equal(artifact!.artifact.name, 'openclaw-result');
+    assert.equal(
+      (artifact!.artifact.parts[0] as { kind: 'text'; text: string }).text,
+      'hello',
+    );
+  } finally {
+    await fake.close();
+  }
+});
+
+test('streaming: non-assistant session.message events are ignored', async () => {
+  // Transcript records user inputs and tool outputs as well as assistant
+  // replies. Only `role:"assistant"` entries should map to A2A artifacts;
+  // echoing user input back would loop the caller's own message to them.
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method !== 'chat.send') return;
+      const params = req.params as { sessionKey: string; idempotencyKey: string };
+      const runId = `run-${params.idempotencyKey}`;
+      sock.send(
+        JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+      );
+      setImmediate(() => {
+        fake.emitSessionMessage(sock, {
+          sessionKey: params.sessionKey,
+          messageId: 'u1',
+          message: { role: 'user', content: [{ type: 'text', text: 'the prompt' }] },
+        });
+        fake.emitSessionMessage(sock, {
+          sessionKey: params.sessionKey,
+          messageId: 't1',
+          message: { role: 'tool', content: [{ type: 'text', text: 'tool output' }] },
+        });
+        fake.emitSessionMessage(sock, {
+          sessionKey: params.sessionKey,
+          messageId: 'a1',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'the reply' }] },
+        });
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 1,
+          state: 'final',
+          message: { text: 'the reply' },
+        });
+      });
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t-roles', 'hi'), (f) => frames.push(f), NEVER);
+    const artifacts = frames.filter((f) => f.type === 'task.artifact');
+    assert.equal(artifacts.length, 1, 'only the assistant message should emit an artifact');
+    assert.equal(
+      (artifacts[0].artifact.parts[0] as { kind: 'text'; text: string }).text,
+      'the reply',
+    );
+  } finally {
+    await fake.close();
+  }
+});
+
+test('streaming: duplicate messageId for an assistant message is deduplicated', async () => {
+  // openclaw can republish a transcript entry (e.g. after a rewrite). The
+  // adapter must not emit two artifacts for the same messageId even though
+  // the event payload itself was valid both times.
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method !== 'chat.send') return;
+      const params = req.params as { sessionKey: string; idempotencyKey: string };
+      const runId = `run-${params.idempotencyKey}`;
+      sock.send(
+        JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+      );
+      setImmediate(() => {
+        const msg = {
+          sessionKey: params.sessionKey,
+          messageId: 'dup',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'once' }] },
+        };
+        fake.emitSessionMessage(sock, msg);
+        fake.emitSessionMessage(sock, msg);
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 1,
+          state: 'final',
+          message: { text: 'once' },
+        });
+      });
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t-dup', 'hi'), (f) => frames.push(f), NEVER);
+    const artifacts = frames.filter((f) => f.type === 'task.artifact');
+    assert.equal(artifacts.length, 1, 'duplicate messageId must not double-emit');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('streaming: sessions.messages.subscribe RPC failure degrades gracefully to single final artifact', async () => {
+  // The subscribe call must not be fatal. If the gateway rejects it (e.g.
+  // older openclaw without session message subscription, or scope denied),
+  // handle() should log, skip streaming, and behave like the no-events
+  // fallback path — one final-result artifact derived from chat.final.
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  const failingGateway = await createFakeGatewaySubscribeError();
+  try {
+    const backend = createOpenclawBackend({ url: failingGateway.url });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t-noSub', 'hi'), (f) => frames.push(f), NEVER);
+    assert.deepEqual(
+      frames.map((f) => f.type),
+      ['task.status', 'task.artifact', 'task.complete'],
+    );
+    assert.ok(
+      warnings.some((w) => w.includes('sessions.messages.subscribe failed')),
+      `expected warn about failed subscribe, got: ${warnings.join(' | ')}`,
+    );
+  } finally {
+    console.warn = originalWarn;
+    await failingGateway.close();
+  }
+});
+
+// Dedicated fake gateway that responds with an error to
+// `sessions.messages.subscribe` but still handles chat.send normally. Used
+// by the graceful-degradation test above; kept separate from the main
+// helper because the main helper auto-acks subscribes for convenience.
+async function createFakeGatewaySubscribeError(): Promise<FakeGateway> {
+  const httpServer = createServer();
+  const wss = new WebSocketServer({ server: httpServer });
+  const connections: WebSocket[] = [];
+  wss.on('connection', (sock) => {
+    connections.push(sock);
+    sock.send(
+      JSON.stringify({
+        type: 'event',
+        event: 'connect.challenge',
+        payload: { nonce: 'nonce-sub-err' },
+      }),
+    );
+    sock.on('message', (raw) => {
+      let frame: ReqFrame;
+      try {
+        frame = JSON.parse(raw.toString()) as ReqFrame;
+      } catch {
+        return;
+      }
+      if (frame.type !== 'req') return;
+      if (frame.method === 'connect') {
+        sock.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: {} }));
+        return;
+      }
+      if (frame.method === 'sessions.messages.subscribe') {
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: frame.id,
+            ok: false,
+            error: { code: 'forbidden', message: 'subscription unavailable' },
+          }),
+        );
+        return;
+      }
+      if (frame.method === 'chat.send') {
+        const params = frame.params as { sessionKey: string; idempotencyKey: string };
+        const runId = `run-${params.idempotencyKey}`;
+        sock.send(
+          JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: { runId, status: 'started' } }),
+        );
+        setImmediate(() => {
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId,
+                sessionKey: params.sessionKey,
+                seq: 1,
+                state: 'final',
+                message: { text: 'no-stream result' },
+              },
+            }),
+          );
+        });
+      }
+    });
+  });
+  await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
+  const { port } = httpServer.address() as AddressInfo;
+  return {
+    url: `ws://127.0.0.1:${port}`,
+    connections,
+    waitForConnection: () => Promise.resolve(connections[0]),
+    respond: () => undefined,
+    respondError: () => undefined,
+    emitChat: () => undefined,
+    emitSessionMessage: () => undefined,
+    closeSocket: () => Promise.resolve(),
+    close: async () => {
+      for (const s of connections) if (s.readyState !== WebSocket.CLOSED) s.terminate();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    },
+  };
+}
 
 test('parseLsofListeningPorts extracts loopback/wildcard listeners and preserves host', () => {
   const sample = [
