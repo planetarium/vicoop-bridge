@@ -3,13 +3,31 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { normalizeTag, parseChecksum, preserveOperatorFiles, sha256File } from './upgrade.js';
+import { assertLooksLikeInstall, normalizeTag, parseChecksum, preserveOperatorFiles, sha256File } from './upgrade.js';
 
 test('normalizeTag accepts full tag, bare version, and v-prefixed version', () => {
   assert.equal(normalizeTag('client-v0.3.0'), 'client-v0.3.0');
   assert.equal(normalizeTag('0.3.0'), 'client-v0.3.0');
   assert.equal(normalizeTag('v0.3.0'), 'client-v0.3.0');
   assert.equal(normalizeTag('1.0.0-alpha.1'), 'client-v1.0.0-alpha.1');
+  assert.equal(normalizeTag('1.0.0+build.sha'), 'client-v1.0.0+build.sha');
+});
+
+test('normalizeTag rejects path-traversal and shell-metacharacter payloads', () => {
+  for (const bad of [
+    '../etc/passwd',
+    'client-v../0.3.0',
+    'client-v0.3.0/../../etc',
+    'client-v..',
+    '0.3.0/../evil',
+    'client-v 0.3.0',
+    'client-v0.3.0;rm -rf /',
+    'client-v0.3.0\nfoo',
+    'client-v',
+    '',
+  ]) {
+    assert.throws(() => normalizeTag(bad), /invalid version/, `expected rejection for ${JSON.stringify(bad)}`);
+  }
 });
 
 test('parseChecksum extracts hash from `<hash>  <path>` and bare-hash forms', () => {
@@ -93,6 +111,50 @@ test('preserveOperatorFiles handles missing cards/ on either side without throwi
     assert.ok(!readdirSync(newDir).includes('cards'));
   } finally {
     rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('assertLooksLikeInstall accepts a bundle-shaped directory', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-marker-'));
+  try {
+    mkdirSync(join(dir, 'bin'), { recursive: true });
+    mkdirSync(join(dir, 'dist'), { recursive: true });
+    mkdirSync(join(dir, 'node_modules'), { recursive: true });
+    writeFileSync(join(dir, 'bin', 'vicoop-client'), '#!/usr/bin/env bash\nexec node ../dist/cli.js\n');
+    writeFileSync(join(dir, 'dist', 'cli.js'), '// stub');
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: '@vicoop-bridge/client', version: '0.3.0' }));
+    assert.doesNotThrow(() => assertLooksLikeInstall(dir));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('assertLooksLikeInstall rejects directories missing bundle markers', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-marker-'));
+  try {
+    // Dev-workspace-shaped: has dist/, package.json, node_modules, but no bin/vicoop-client.
+    mkdirSync(join(dir, 'dist'), { recursive: true });
+    mkdirSync(join(dir, 'node_modules'), { recursive: true });
+    writeFileSync(join(dir, 'dist', 'cli.js'), '// stub');
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: '@vicoop-bridge/client', version: '0.3.0' }));
+    assert.throws(() => assertLooksLikeInstall(dir), /bin\/vicoop-client/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('assertLooksLikeInstall rejects bundles with wrong package name', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-marker-'));
+  try {
+    mkdirSync(join(dir, 'bin'), { recursive: true });
+    mkdirSync(join(dir, 'dist'), { recursive: true });
+    mkdirSync(join(dir, 'node_modules'), { recursive: true });
+    writeFileSync(join(dir, 'bin', 'vicoop-client'), '# stub');
+    writeFileSync(join(dir, 'dist', 'cli.js'), '// stub');
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'some-other-package', version: '0.3.0' }));
+    assert.throws(() => assertLooksLikeInstall(dir), /unexpected name/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

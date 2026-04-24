@@ -31,6 +31,19 @@ const SHIPPED_TOP_LEVEL = new Set(['bin', 'cards', 'dist', 'node_modules', 'pack
 // than block on.
 const HEALTHCHECK_TIMEOUT_MS = 10_000;
 
+// Accepted release-tag shape. Restrictive on purpose: the tag is interpolated
+// into local filenames (archive name, temp path joins) and an external URL,
+// so we want to reject anything that could path-traverse or smuggle shell
+// metacharacters before it's used. Permissive enough for semver-ish tags
+// including pre-release/build suffixes (`client-v1.0.0-rc.1`, `...+sha.abc`).
+const TAG_RE = /^client-v[A-Za-z0-9][A-Za-z0-9.+\-]*$/;
+
+// Top-level entries a legitimate release bundle must contain. Missing any one
+// of these is taken as "not an installed bundle" and aborts upgrade before
+// anything on disk can move — guards against running the command from a dev
+// workspace where `packages/client` lacks the synthesized bin wrapper.
+const BUNDLE_MARKERS = ['bin/vicoop-client', 'dist/cli.js', 'package.json', 'node_modules'];
+
 export interface UpgradeOptions {
   check: boolean;
   force: boolean;
@@ -39,6 +52,13 @@ export interface UpgradeOptions {
 
 export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
   log(`current: ${clientVersion} (${installDir})`);
+
+  try {
+    assertLooksLikeInstall(installDir);
+  } catch (e) {
+    err((e as Error).message);
+    return 1;
+  }
 
   const targetTag = opts.version
     ? normalizeTag(opts.version)
@@ -104,8 +124,21 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
         ['-xzf', join(dlDir, archiveName), '-C', newDir, '--strip-components=1'],
         { stdio: 'inherit' },
       );
+      if (tarRes.error) {
+        // Most common failure: `tar` missing on PATH. spawnSync flags it via
+        // an ENOENT on `error.code`. Keep the message specific so an operator
+        // knows to install `tar` instead of chasing a bad-archive hypothesis.
+        const code = (tarRes.error as NodeJS.ErrnoException).code;
+        const hint = code === 'ENOENT' ? ' (tar not found on PATH — install it and retry)' : '';
+        err(`extraction failed: ${tarRes.error.message}${hint}`);
+        return 1;
+      }
+      if (tarRes.signal) {
+        err(`extraction failed: tar terminated by signal ${tarRes.signal}`);
+        return 1;
+      }
       if (tarRes.status !== 0) {
-        err('extraction failed');
+        err(`extraction failed: tar exited with status ${tarRes.status}`);
         return 1;
       }
 
@@ -168,7 +201,18 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
 }
 
 export function normalizeTag(v: string): string {
-  return v.startsWith('client-v') ? v : `client-v${v.replace(/^v/, '')}`;
+  const candidate = v.startsWith('client-v') ? v : `client-v${v.replace(/^v/, '')}`;
+  assertSafeTag(candidate, v);
+  return candidate;
+}
+
+function assertSafeTag(tag: string, raw: string = tag): void {
+  // The tag is interpolated into local paths (archive name / temp joins) and
+  // an outbound URL. Reject anything that could path-traverse or inject shell
+  // metacharacters before it reaches `join(dlDir, ...)`.
+  if (!TAG_RE.test(tag) || tag.includes('..')) {
+    throw new Error(`invalid version '${raw}': expected client-v<semver>, got '${tag}'`);
+  }
 }
 
 async function resolveLatestTag(): Promise<string> {
@@ -178,9 +222,41 @@ async function resolveLatestTag(): Promise<string> {
   if (!res.ok) throw new Error(`GitHub API request failed: ${res.status} ${res.statusText}`);
   const releases = (await res.json()) as Array<{ tag_name?: unknown }>;
   for (const r of releases) {
-    if (typeof r.tag_name === 'string' && r.tag_name.startsWith('client-v')) return r.tag_name;
+    if (typeof r.tag_name !== 'string' || !r.tag_name.startsWith('client-v')) continue;
+    // Defensively validate the API response — a future rename or a
+    // compromised upstream shouldn't get to interpolate arbitrary strings
+    // into local filenames.
+    assertSafeTag(r.tag_name);
+    return r.tag_name;
   }
   throw new Error(`no client-v* release found in ${REPO}`);
+}
+
+export function assertLooksLikeInstall(dir: string): void {
+  for (const rel of BUNDLE_MARKERS) {
+    if (!existsSync(join(dir, rel))) {
+      throw new Error(
+        `${dir} does not look like an installed vicoop-client bundle ` +
+          `(missing ${rel}). Run install.sh for first-time setup; upgrade only manages existing installs.`,
+      );
+    }
+  }
+  // The workspace package.json at packages/client has the same name, so this
+  // isn't definitive on its own — but combined with the bin/vicoop-client
+  // check above (which the dev workspace lacks) it's enough to catch a
+  // `tsx src/cli.ts upgrade` or `node packages/client/dist/cli.js upgrade`
+  // run-from-source invocation before it mutates anything.
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { name?: unknown };
+    if (pkg.name !== '@vicoop-bridge/client') {
+      throw new Error(`${dir}/package.json has unexpected name '${String(pkg.name)}' — refusing to upgrade`);
+    }
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      throw new Error(`${dir}/package.json is not valid JSON — refusing to upgrade`);
+    }
+    throw e;
+  }
 }
 
 async function download(url: string, dest: string): Promise<void> {
