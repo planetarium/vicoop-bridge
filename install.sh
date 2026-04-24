@@ -122,6 +122,25 @@ log "extracting into $INSTALL_DIR"
 # so files land directly in INSTALL_DIR.
 tar -xzf "$TMP_DIR/$ARCHIVE" -C "$INSTALL_DIR" --strip-components=1
 
+# Portable ownership normalization. We can't rely on `tar --no-same-owner`
+# everywhere (busybox tar lacks the long option), so we chown after the
+# fact. Only actually matters under `sudo`: otherwise tar extracts as the
+# current uid/gid already. When root *is* extracting, the archive's stored
+# uid (typically ~1000, whoever built the release) would otherwise end up
+# owning a root-run service's files — that's a privilege-escalation vector.
+# After chown-to-root, also strip any setuid/setgid bits tar may have
+# restored — those'd now be *root-owned* suid files, which is far worse
+# than the build-uid case. Archive has no setuid bits today; this is a
+# defense-in-depth invariant.
+if [ "$(id -u)" = "0" ]; then
+  chown -R 0:0 "$INSTALL_DIR" || die "chown -R 0:0 $INSTALL_DIR failed — refusing to leave root-extracted files with non-root ownership"
+  # POSIX `-exec ... {} \;` (one-per-file) rather than `{} +` so this works
+  # on older busybox find too. Our archive ships no setuid files, so the
+  # per-file fork overhead is effectively zero in practice.
+  find "$INSTALL_DIR" -type f \( -perm -4000 -o -perm -2000 \) -exec chmod u-s,g-s {} \; \
+    || die "failed to strip setuid/setgid bits under $INSTALL_DIR after root extraction"
+fi
+
 chmod +x "$INSTALL_DIR/bin/vicoop-client" 2>/dev/null || true
 
 # ---- 5. Optional systemd service registration -------------------------------
@@ -385,6 +404,11 @@ if [ -n "$SERVICE_INSTALLED" ]; then
        $SERVICE_RELOAD_CMD
        $SERVICE_ENABLE_CMD
 
+  Future updates: run \`"$INSTALL_DIR/bin/vicoop-client" upgrade\` — no need
+  to re-run this installer. Pass --check to see if a newer release is
+  available. The quotes keep the command correct even if \$INSTALL_DIR
+  contains whitespace.
+
 EOF
   if [ "$SERVICE_INSTALLED" = "user" ]; then
     cat <<'EOF'
@@ -411,6 +435,11 @@ else
 
      For persistent operation, see docs/install-client.md §6
      (launchd on macOS, systemd user unit, tmux).
+
+  Future updates: run \`"$INSTALL_DIR/bin/vicoop-client" upgrade\` — no need
+  to re-run this installer. Pass --check to see if a newer release is
+  available. The quotes keep the command correct even if \$INSTALL_DIR
+  contains whitespace.
 
 EOF
 fi
