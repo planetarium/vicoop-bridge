@@ -441,7 +441,11 @@ function detectSystemdUnit(): { scope: 'system' | 'user' } | null {
   if (existsSync('/etc/systemd/system/vicoop-client.service')) return { scope: 'system' };
   const home = process.env.HOME;
   if (home) {
-    const userCfg = process.env.XDG_CONFIG_HOME ?? join(home, '.config');
+    // `||` rather than `??` so an empty `XDG_CONFIG_HOME=` (common
+    // accidental mis-export, and what shells treat as unset via
+    // `${XDG_CONFIG_HOME:-...}`) falls back to $HOME/.config instead of
+    // turning the path relative.
+    const userCfg = process.env.XDG_CONFIG_HOME || join(home, '.config');
     if (existsSync(join(userCfg, 'systemd', 'user', 'vicoop-client.service'))) {
       return { scope: 'user' };
     }
