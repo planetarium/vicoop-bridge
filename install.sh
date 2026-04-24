@@ -206,25 +206,27 @@ Wants=network-online.target'
       # are cheap defense-in-depth. User-scope units inherit the caller's
       # identity and don't need (or accept) these knobs.
       #
-      # DynamicUser + ProtectHome break when the runtime paths live under
-      # /home or /root (common with nvm/asdf, or an operator who ran
-      # `sudo sh install.sh` from their home dir): the transient UID can't
-      # read files under a masked /home, and /root is 0700. Detect that
-      # case and fall back to a minimal hardening set so the unit still
-      # starts — the operator can tighten manually later.
+      # Refuse to generate a system-scope unit when node or the bundle
+      # lives under /home or /root. Falling back to a root-run unit from a
+      # user-writable directory (e.g. nvm under /home, or `sudo sh
+      # install.sh` pulling node from /root/.nvm) turns this into
+      # "root executes code from a potentially user-controlled path at
+      # boot" — a real privilege-escalation vector. Skip service
+      # registration and tell the operator how to recover; extraction
+      # already succeeded, so the install is still usable manually.
       case "$node_bin $cli_entry" in
         */home/*|*/root/*)
-          log "warning: node or install bundle lives under /home or /root; skipping DynamicUser / ProtectHome in the generated unit (service runs as root with NoNewPrivileges only)"
-          unit_hardening='NoNewPrivileges=yes'
+          log "warning: refusing to install a system-scope service because node or the bundle lives under /home or /root (node=$node_bin, cli=$cli_entry)."
+          log "  reason: a root-owned unit executing code from a user-writable or home-owned path is unsafe."
+          log "  options: reinstall with INSTALL_DIR under a root-only system path (e.g. /opt/vicoop-bridge-client) and a system-path node, or re-run with INSTALL_SERVICE_SCOPE=user."
+          return
           ;;
-        *)
-          unit_hardening='DynamicUser=yes
+      esac
+      unit_hardening='DynamicUser=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes'
-          ;;
-      esac
       # Root running the installer (the auto-detected system path) gets an
       # un-prefixed command; sudo is only suggested for later reinvocations by
       # a non-root operator. Minimal images often lack sudo entirely.
