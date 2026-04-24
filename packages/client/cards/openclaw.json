@@ -3,7 +3,7 @@
   "description": "General-purpose AI assistant. Can answer questions, browse the web, run shell commands, manage files, and operate tools its operator has granted. Accepts text and inline image attachments.",
   "version": "0.0.1",
   "protocolVersion": "0.3.0",
-  "capabilities": { "streaming": false },
+  "capabilities": { "streaming": true },
   "defaultInputModes": ["text/plain", "image/png", "image/jpeg", "image/gif", "image/webp"],
   "defaultOutputModes": ["text/plain"],
   "skills": [

@@ -120,6 +120,50 @@ docker run --rm \
 response to a `chat.abort` RPC — i.e. the backend's signal-abort path
 reached the gateway correctly.
 
+## Streaming verification
+
+A second E2E exercise lives at `packages/client/scripts/e2e-openclaw-streaming.mjs`.
+It sends a tool-use-prone prompt, collects the emitted A2A frames, and
+asserts:
+
+- at least one `task.artifact` arrives before `task.complete`,
+- all `artifactId`s are distinct,
+- the terminal frame is `task.complete` with `state: "completed"`,
+- if two or more artifacts were emitted, the first precedes the
+  terminal frame in time (otherwise the assertion is skipped — a
+  single-artifact run is the documented graceful-degradation shape and
+  still satisfies the streaming contract).
+
+Run the same way as the cancel example, with the agent's auth
+configured so a real model can respond:
+
+```bash
+# Either mount a prepared auth-profiles.json into the gateway:
+docker run --rm -d --name openclaw-e2e \
+  -v "$HOME/.openclaw-e2e/auth-profiles.json:/home/node/.openclaw/agents/main/agent/auth-profiles.json:ro" \
+  ghcr.io/openclaw/openclaw:latest
+
+# ...or interactively register a provider before running the sidecar:
+docker exec -it openclaw-e2e openclaw agents add main
+
+TOKEN=$(docker exec openclaw-e2e sh -c 'cat /home/node/.openclaw/openclaw.json' \
+  | grep -oE '"token":\s*"[a-f0-9]+"' | head -1 | sed 's/.*"\([a-f0-9]*\)"/\1/')
+
+docker run --rm \
+  --network container:openclaw-e2e \
+  -v "$PWD":/w -w /w/packages/client \
+  -e OPENCLAW_GATEWAY_TOKEN="$TOKEN" \
+  node:20 \
+  node ./scripts/e2e-openclaw-streaming.mjs
+```
+
+Without auth configured the harness still passes (the gateway emits a
+single assistant "agent failed before reply" transcript entry, which
+proves the `session.message → task.artifact` wiring end-to-end), but
+you cannot verify the multi-artifact cadence a real tool-use run
+produces. Use `DEBUG=1` in the sidecar env to see every chat /
+session.message frame as it arrives.
+
 ## Teardown
 
 ```bash

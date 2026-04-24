@@ -90,6 +90,19 @@ interface ChatEventPayload {
   stopReason?: string;
 }
 
+// OpenClaw broadcasts this on every `emitSessionTranscriptUpdate` to
+// connections that called `sessions.messages.subscribe` for the sessionKey.
+// The `message` field is the full assistant/user/tool entry that was appended
+// to the transcript — not a token delta. We use it to drive message-boundary
+// A2A artifact streaming in lieu of true per-token deltas (which only reach
+// `role:"node"` clients subscribed via `chat.subscribe` node events today).
+interface SessionMessageEventPayload {
+  sessionKey: string;
+  message?: unknown;
+  messageId?: string;
+  messageSeq?: number;
+}
+
 type FinalizerCause = 'gateway_closed' | 'timeout' | 'abort_failed';
 
 type FinalizerEvent = ChatEventPayload & { cause?: FinalizerCause };
@@ -285,7 +298,7 @@ class GatewayClient {
         client: {
           id: clientId,
           displayName: 'vicoop-bridge-client',
-          version: '0.2.0',
+          version: '0.3.0',
           platform: process.platform,
           mode: clientMode,
         },
@@ -678,6 +691,24 @@ export function createOpenclawBackend(
   const runToTask = new Map<string, { taskId: string; sessionKey: string }>();
   const taskFinalizers = new Map<string, (evt: FinalizerEvent) => void>();
   const pendingRunEvents = new Map<string, ChatEventPayload[]>();
+  // sessionKeys we have already called `sessions.messages.subscribe` on for
+  // the current gateway connection. Subscription is idempotent per
+  // connection: one call per sessionKey regardless of how many tasks reuse
+  // it. Cleared on reconnect because the connId (and therefore the server's
+  // subscriber entry) is gone after a WS close.
+  const subscribedSessionKeys = new Set<string>();
+  // Per-sessionKey owner of message-boundary streaming. OpenClaw's
+  // `session.message` payload carries no runId, so we cannot route events
+  // for two concurrent `chat.send` calls on the same sessionKey. First task
+  // wins ownership; a second concurrent task on the same sessionKey skips
+  // registration and falls back to the one-shot final artifact. Normal
+  // sequential use on the same contextId is unaffected because the owner
+  // entry is released in finally{}.
+  type SessionMessageOwner = {
+    taskId: string;
+    handler: (p: SessionMessageEventPayload) => void;
+  };
+  const sessionMessageOwners = new Map<string, SessionMessageOwner>();
   // Bounded memory of recently-finalized runIds. Any chat event carrying one
   // of these is dropped instead of buffered in pendingRunEvents, so late or
   // duplicate deltas from OpenClaw cannot accumulate forever after the task
@@ -703,6 +734,11 @@ export function createOpenclawBackend(
     // scoped to a single gateway session, so a reconnect starts clean.
     pendingRunEvents.clear();
     recentlyFinalizedRuns.clear();
+    // Subscriptions are connId-scoped on the gateway side; after a close
+    // there is no remote state to reconcile. Forget them so the next
+    // connection re-subscribes cleanly.
+    subscribedSessionKeys.clear();
+    sessionMessageOwners.clear();
     // Fail every in-flight task that was running on this client so handle()
     // does not hang forever waiting for a terminal event that can never come.
     if (taskFinalizers.size === 0) return;
@@ -729,6 +765,21 @@ export function createOpenclawBackend(
     const c = new GatewayClient(candidateUrl, token, hsTimeoutMs);
     await c.connect();
     c.onEvent((evt) => {
+      if (evt.event === 'session.message') {
+        const p = evt.payload as SessionMessageEventPayload | undefined;
+        if (!p?.sessionKey) return;
+        if (debug) {
+          console.log('[openclaw] session.message event:', JSON.stringify(p).slice(0, 500));
+        }
+        const owner = sessionMessageOwners.get(p.sessionKey);
+        if (!owner) return;
+        try {
+          owner.handler(p);
+        } catch (err) {
+          console.error('[openclaw] session.message handler threw:', (err as Error).message);
+        }
+        return;
+      }
       if (evt.event !== 'chat') return;
       const p = evt.payload as ChatEventPayload | undefined;
       if (!p?.runId) return;
@@ -832,6 +883,26 @@ export function createOpenclawBackend(
     return connecting;
   }
 
+  // Idempotent per (connection, sessionKey). Subscription is the mechanism
+  // that unlocks message-boundary streaming: OpenClaw will broadcast a
+  // `session.message` event to this connection whenever the transcript for
+  // `sessionKey` gets a new entry. Failure is non-fatal — the task falls
+  // back to today's single-artifact-on-final behavior.
+  async function ensureSessionMessageSubscription(
+    gw: GatewayClient,
+    sessionKey: string,
+  ): Promise<void> {
+    if (subscribedSessionKeys.has(sessionKey)) return;
+    try {
+      await gw.request('sessions.messages.subscribe', { key: sessionKey });
+      subscribedSessionKeys.add(sessionKey);
+    } catch (err) {
+      console.warn(
+        `[openclaw] sessions.messages.subscribe failed for ${sessionKey}: ${errorMessage(err)} (continuing without streaming)`,
+      );
+    }
+  }
+
   return {
     name: 'openclaw',
 
@@ -879,6 +950,78 @@ export function createOpenclawBackend(
         taskId: task.taskId,
         status: { state: 'working', timestamp: new Date().toISOString() },
       });
+
+      // Subscribe to per-message transcript events for this sessionKey so we
+      // can forward each assistant message as a separate A2A artifact while
+      // the run is in progress. Subscribing here (before chat.send) avoids
+      // races where fast agents write their first message before we would
+      // otherwise have registered. Failure degrades to the non-streaming
+      // final-only path — not fatal.
+      await ensureSessionMessageSubscription(gw, sessionKey);
+
+      // Per-task streaming state. `emittedAnyArtifact` decides whether the
+      // terminal `chat.final` should also emit a final-only artifact (i.e.
+      // whether the streaming path already delivered content). `seenAssistantMessageIds`
+      // drops duplicate transcript events for the same message (e.g. if
+      // OpenClaw re-emits after a rewrite). `sessionMessageSettled` closes
+      // the gate at terminal time so a late `session.message` arriving after
+      // we have already emitted `task.complete` cannot produce an artifact
+      // past the terminal frame.
+      let emittedAnyArtifact = false;
+      const seenAssistantMessageIds = new Set<string>();
+      let sessionMessageSettled = false;
+
+      const onSessionMessage = (p: SessionMessageEventPayload): void => {
+        if (sessionMessageSettled) return;
+        const msg = p.message;
+        if (!msg || typeof msg !== 'object') return;
+        const role = (msg as { role?: unknown }).role;
+        // Transcript also records user/tool entries — only assistant output
+        // maps to A2A artifacts. The user's own message was delivered by
+        // the caller and re-emitting it would loop back to them.
+        if (role !== 'assistant') return;
+        const mid = typeof p.messageId === 'string' ? p.messageId : '';
+        if (mid) {
+          if (seenAssistantMessageIds.has(mid)) return;
+          seenAssistantMessageIds.add(mid);
+        }
+        const artifactText = extractFinalText(msg);
+        if (!artifactText) return;
+        emit({
+          type: 'task.artifact',
+          taskId: task.taskId,
+          artifact: {
+            artifactId: randomUUID(),
+            name: 'openclaw-message',
+            parts: [{ kind: 'text', text: artifactText }],
+          },
+          // Each message is a self-contained artifact (option (b) in the
+          // design discussion): distinct artifactId, complete on emission.
+          // The end-of-run signal is carried by task.complete, not by any
+          // individual artifact.
+          lastChunk: true,
+        });
+        emittedAnyArtifact = true;
+      };
+
+      // First task on this sessionKey wins streaming ownership. A concurrent
+      // second task on the same contextId would see interleaved session.message
+      // events with no runId to disambiguate, so it falls back to the
+      // one-shot final artifact path. This is the common-case tradeoff —
+      // serial reuse of a contextId (the normal A2A usage pattern) streams
+      // fine because the first task releases ownership in finally{}.
+      const ownedSession =
+        subscribedSessionKeys.has(sessionKey) && !sessionMessageOwners.has(sessionKey);
+      if (ownedSession) {
+        sessionMessageOwners.set(sessionKey, {
+          taskId: task.taskId,
+          handler: onSessionMessage,
+        });
+      } else if (subscribedSessionKeys.has(sessionKey)) {
+        console.warn(
+          `[openclaw] ${sessionKey} already has a streaming owner; task ${task.taskId} will emit a single final artifact`,
+        );
+      }
 
       // Register the finalizer BEFORE sending chat.send so that:
       //   1. a gateway close between send and ack still fails this task,
@@ -997,6 +1140,12 @@ export function createOpenclawBackend(
 
         const result = await settled;
 
+        // Close the streaming gate before any terminal emit. Any
+        // `session.message` that arrives from this point on (e.g. a
+        // transcript write that races with the final event) must not
+        // produce an artifact after task.complete/fail.
+        sessionMessageSettled = true;
+
         if (result.cause === 'timeout') {
           emit({
             type: 'task.fail',
@@ -1052,13 +1201,21 @@ export function createOpenclawBackend(
 
         const text2 = extractFinalText(result.message);
         const parts: Part[] = [{ kind: 'text', text: text2 }];
-        const artifactId = randomUUID();
-        emit({
-          type: 'task.artifact',
-          taskId: task.taskId,
-          artifact: { artifactId, name: 'openclaw-result', parts },
-          lastChunk: true,
-        });
+        // Only emit the final-result artifact when streaming produced
+        // nothing — otherwise each assistant message already went out as its
+        // own artifact and re-emitting the final text here would be a
+        // redundant copy of the last one. task.complete still carries the
+        // final message in status.message, which is how A2A conventionally
+        // stamps the terminal content anyway.
+        if (!emittedAnyArtifact) {
+          const artifactId = randomUUID();
+          emit({
+            type: 'task.artifact',
+            taskId: task.taskId,
+            artifact: { artifactId, name: 'openclaw-result', parts },
+            lastChunk: true,
+          });
+        }
         emit({
           type: 'task.complete',
           taskId: task.taskId,
@@ -1080,6 +1237,13 @@ export function createOpenclawBackend(
           runToTask.delete(runId);
           pendingRunEvents.delete(runId);
           markRunFinalized(runId);
+        }
+        // Defensive: if we bailed out of handle() before reaching the
+        // explicit gate close above (synchronous throw, early return), the
+        // session.message handler could otherwise still fire for this task.
+        sessionMessageSettled = true;
+        if (ownedSession && sessionMessageOwners.get(sessionKey)?.taskId === task.taskId) {
+          sessionMessageOwners.delete(sessionKey);
         }
       }
     },
