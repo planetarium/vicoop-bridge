@@ -119,8 +119,12 @@ printf '%s  %s\n' "$EXPECTED_HASH" "$ARCHIVE" > "$TMP_DIR/$CHECKSUM"
 
 log "extracting into $INSTALL_DIR"
 # Bundle root inside the archive is vicoop-bridge-client-<version>/; strip it
-# so files land directly in INSTALL_DIR.
-tar -xzf "$TMP_DIR/$ARCHIVE" -C "$INSTALL_DIR" --strip-components=1
+# so files land directly in INSTALL_DIR. `--no-same-owner` / `--no-same-permissions`
+# guard against root-run extraction restoring the build host's uid/gid or
+# setuid bits — if the archive was built as uid 1000, we'd otherwise create
+# root-running service files writable by that uid.
+tar -xzf "$TMP_DIR/$ARCHIVE" -C "$INSTALL_DIR" --strip-components=1 \
+  --no-same-owner --no-same-permissions
 
 chmod +x "$INSTALL_DIR/bin/vicoop-client" 2>/dev/null || true
 

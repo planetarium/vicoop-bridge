@@ -91,8 +91,17 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
     return 0;
   }
 
-  if (!canWrite(installDir) || !canWrite(dirname(installDir))) {
-    err(`$INSTALL_DIR or its parent is not writable (${installDir}).`);
+  // Preflight: the operations that actually matter are parent-directory
+  // renames (moving $INSTALL_DIR aside + $INSTALL_DIR.new into place) and
+  // reading through the current bundle (version.ts + preserveOperatorFiles).
+  // So: parent must be writable + executable, installDir itself only needs
+  // read + execute. A hardened chmod 555 install that the operator intends
+  // to leave read-only passes here and upgrades cleanly.
+  try {
+    accessSync(installDir, fsConstants.R_OK | fsConstants.X_OK);
+    accessSync(dirname(installDir), fsConstants.W_OK | fsConstants.X_OK);
+  } catch {
+    err(`$INSTALL_DIR must be readable/executable and its parent must be writable (${installDir}).`);
     err('If this is a system-scope install, re-run with sudo.');
     return 1;
   }
@@ -137,7 +146,25 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
       mkdirSync(newDir, { recursive: true });
       const tarRes = spawnSync(
         'tar',
-        ['-xzf', join(dlDir, archiveName), '-C', newDir, '--strip-components=1'],
+        [
+          '-xzf',
+          join(dlDir, archiveName),
+          '-C',
+          newDir,
+          '--strip-components=1',
+          // Under `sudo vicoop-client upgrade`, root would otherwise restore
+          // the archive's stored uid/gid — typically the 1000-ish user that
+          // built the release — leaving installed files owned by an
+          // unprivileged local account. That's a privilege-escalation path
+          // for a root-run service: any local user with that uid could
+          // modify `dist/cli.js` between service restarts.
+          // `--no-same-owner` forces the extracted files to the current
+          // effective uid/gid. `--no-same-permissions` drops any stored
+          // setuid/setgid bits; the archive has none today, but we want a
+          // known-safe default.
+          '--no-same-owner',
+          '--no-same-permissions',
+        ],
         { stdio: 'inherit' },
       );
       if (tarRes.error) {
@@ -411,15 +438,6 @@ function safeRemove(path: string): void {
     rmSync(path, { recursive: true, force: true });
   } catch (e) {
     log(`warning: failed to clean up ${path}: ${(e as Error).message}`);
-  }
-}
-
-function canWrite(path: string): boolean {
-  try {
-    accessSync(path, fsConstants.W_OK);
-    return true;
-  } catch {
-    return false;
   }
 }
 
