@@ -4,7 +4,12 @@ name: Smoke Test Actions (temp)
 # Node.js 24 runners without deprecation warnings. Remove before merge.
 
 on:
-  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/smoke-test-actions.yml'
+      - '.github/workflows/release-client.yml'
+      - '.github/workflows/deploy-server.yml'
 
 jobs:
   smoke:
