@@ -6,10 +6,12 @@ import type { AddressInfo } from 'node:net';
 import WebSocket, { WebSocketServer } from 'ws';
 
 // Bind a net server to an ephemeral port, record the port, then close the
-// server. The port is now reliably free on this host for the remainder of
-// the test — a subsequent connect attempt gets ECONNREFUSED immediately
-// instead of racing against whatever may happen to be listening on a
-// hard-coded port (e.g. port 1 can be forwarded in some CI environments).
+// server. The port is unlikely to be rebound by an unrelated process
+// before the test reconnects, so ECONNREFUSED is the overwhelmingly
+// likely outcome — unlike hard-coding port 1, which can be forwarded or
+// listening in some CI environments. It's not a hard guarantee
+// (TOCTOU: another process could bind the port between close() and our
+// connect), but for an in-process test on loopback the window is small.
 async function pickUnusedLoopbackPort(): Promise<number> {
   return new Promise<number>((resolve, reject) => {
     const server = createNetServer();

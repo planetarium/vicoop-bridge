@@ -69,40 +69,56 @@ export class Client {
     const deadlineMs = this.opts.probeDeadlineMs ?? DEFAULT_PROBE_DEADLINE_MS;
     this.effectiveCardPromise = (async () => {
       const TIMEOUT = Symbol('probe-timeout');
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const timeoutPromise = new Promise<typeof TIMEOUT>((resolve) => {
-        const t = setTimeout(() => resolve(TIMEOUT), deadlineMs);
-        t.unref?.();
+        timer = setTimeout(() => resolve(TIMEOUT), deadlineMs);
+        timer.unref?.();
       });
-      const probePromise = probe.call(this.opts.backend).catch((err: unknown) => {
-        console.warn(
-          `[client] backend capability probe threw (${err instanceof Error ? err.message : String(err)}); using declared card capabilities`,
-        );
-        return null;
-      });
-      const outcome = await Promise.race([probePromise, timeoutPromise]);
-      if (outcome === TIMEOUT) {
-        console.warn(
-          `[client] backend capability probe did not complete within ${deadlineMs}ms; sending hello with declared card capabilities`,
-        );
-        return base;
+      // `Promise.resolve().then(...)` converts a synchronous throw from a
+      // non-async probe implementation into a promise rejection — otherwise
+      // the throw would escape before `.catch` is attached and surface as an
+      // unhandled rejection on `effectiveCardPromise`, which the `open`
+      // handler consumes with `.then` only.
+      const probePromise = Promise.resolve()
+        .then(() => probe.call(this.opts.backend))
+        .catch((err: unknown) => {
+          console.warn(
+            `[client] backend capability probe threw (${err instanceof Error ? err.message : String(err)}); using declared card capabilities`,
+          );
+          return null;
+        });
+      try {
+        const outcome = await Promise.race([probePromise, timeoutPromise]);
+        if (outcome === TIMEOUT) {
+          console.warn(
+            `[client] backend capability probe did not complete within ${deadlineMs}ms; sending hello with declared card capabilities`,
+          );
+          return base;
+        }
+        if (outcome === null) return base;
+        const detected = outcome;
+        // Preserve the documented "no override" contract: an empty detected
+        // object must leave the card byte-for-byte unchanged, including an
+        // absent `capabilities` field. Only materialize `capabilities` when
+        // the probe actually reports a value we need to apply.
+        if (detected.streaming === undefined && detected.pushNotifications === undefined) {
+          return base;
+        }
+        const merged: AgentCard['capabilities'] = {
+          ...(base.capabilities ?? {}),
+          ...(detected.streaming !== undefined ? { streaming: detected.streaming } : {}),
+          ...(detected.pushNotifications !== undefined
+            ? { pushNotifications: detected.pushNotifications }
+            : {}),
+        };
+        return { ...base, capabilities: merged };
+      } finally {
+        // Clear the deadline timer so a fast probe doesn't leave an extra
+        // callback and its closure alive until `deadlineMs` elapses. The
+        // unref() above is enough to keep this from blocking process exit,
+        // but clearing is cheaper than letting it fire.
+        if (timer !== undefined) clearTimeout(timer);
       }
-      if (outcome === null) return base;
-      const detected = outcome;
-      // Preserve the documented "no override" contract: an empty detected
-      // object must leave the card byte-for-byte unchanged, including an
-      // absent `capabilities` field. Only materialize `capabilities` when
-      // the probe actually reports a value we need to apply.
-      if (detected.streaming === undefined && detected.pushNotifications === undefined) {
-        return base;
-      }
-      const merged: AgentCard['capabilities'] = {
-        ...(base.capabilities ?? {}),
-        ...(detected.streaming !== undefined ? { streaming: detected.streaming } : {}),
-        ...(detected.pushNotifications !== undefined
-          ? { pushNotifications: detected.pushNotifications }
-          : {}),
-      };
-      return { ...base, capabilities: merged };
     })();
     return this.effectiveCardPromise;
   }
@@ -126,7 +142,7 @@ export class Client {
       // handler coming. Also drop the frame silently if this socket moved
       // out of OPEN before the probe settled — the next `connect()` cycle
       // will issue its own hello.
-      this.resolveEffectiveCard().then((agentCard) => {
+      const sendHello = (agentCard: AgentCard): void => {
         if (ws.readyState !== WebSocket.OPEN) return;
         console.log('[client] connected, sending hello');
         ws.send(
@@ -138,7 +154,19 @@ export class Client {
             token: this.opts.token,
           }),
         );
-      });
+      };
+      // The internal catch inside resolveEffectiveCard() already coerces
+      // every failure into "return base", so this `.catch` is defense in
+      // depth — if a future refactor ever lets a rejection escape, still
+      // send hello with the declared card instead of silently dropping it.
+      this.resolveEffectiveCard()
+        .then(sendHello)
+        .catch((err: unknown) => {
+          console.warn(
+            `[client] effectiveCard promise rejected unexpectedly (${err instanceof Error ? err.message : String(err)}); sending hello with declared card`,
+          );
+          sendHello(this.opts.agentCard);
+        });
     });
 
     ws.on('message', (raw) => {
