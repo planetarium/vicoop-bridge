@@ -31,6 +31,17 @@ const SHIPPED_TOP_LEVEL = new Set(['bin', 'cards', 'dist', 'node_modules', 'pack
 // than block on.
 const HEALTHCHECK_TIMEOUT_MS = 10_000;
 
+// Short cap for GitHub API calls (just listing tags). A stalled DNS resolution
+// or captive portal shouldn't strand the operator with a hung process.
+const API_TIMEOUT_MS = 15_000;
+
+// Generous cap for the actual release-asset download. `AbortSignal.timeout` is
+// a total-operation timeout, so this needs to cover slow-but-real networks
+// pulling a multi-MB bundle; lower it and we'd false-abort on plausible home
+// connections. If the upstream is genuinely dead the operator notices within
+// this window and can Ctrl-C sooner.
+const DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
+
 // Accepted release-tag shape. Restrictive on purpose: the tag is interpolated
 // into local filenames (archive name, temp path joins) and an external URL,
 // so we want to reject anything that could path-traverse or smuggle shell
@@ -229,10 +240,13 @@ function assertSafeTag(tag: string, raw: string = tag): void {
 }
 
 async function resolveLatestTag(): Promise<string> {
-  const res = await fetch(`https://api.github.com/repos/${REPO}/releases?per_page=30`, {
-    headers: { 'User-Agent': 'vicoop-client-upgrade', Accept: 'application/vnd.github+json' },
-  });
-  if (!res.ok) throw new Error(`GitHub API request failed: ${res.status} ${res.statusText}`);
+  const url = `https://api.github.com/repos/${REPO}/releases?per_page=30`;
+  const res = await fetchWithTimeout(
+    url,
+    { headers: { 'User-Agent': 'vicoop-client-upgrade', Accept: 'application/vnd.github+json' } },
+    API_TIMEOUT_MS,
+  );
+  if (!res.ok) throw new Error(`GitHub API request failed: ${res.status} ${res.statusText} (${url})`);
   const releases = (await res.json()) as Array<{ tag_name?: unknown }>;
   for (const r of releases) {
     if (typeof r.tag_name !== 'string' || !r.tag_name.startsWith('client-v')) continue;
@@ -243,6 +257,22 @@ async function resolveLatestTag(): Promise<string> {
     return r.tag_name;
   }
   throw new Error(`no client-v* release found in ${REPO}`);
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e) {
+    // Node surfaces AbortSignal.timeout expiry as TimeoutError; older
+    // behavior / proxied fetches sometimes report AbortError. Translate
+    // either into a human-friendly message so operators know to check the
+    // network rather than chase a spurious stack trace.
+    const name = (e as Error).name;
+    if (name === 'TimeoutError' || name === 'AbortError') {
+      throw new Error(`${url} timed out after ${timeoutMs}ms`);
+    }
+    throw e;
+  }
 }
 
 export function assertLooksLikeInstall(dir: string): void {
@@ -273,8 +303,10 @@ export function assertLooksLikeInstall(dir: string): void {
 }
 
 async function download(url: string, dest: string): Promise<void> {
-  const res = await fetch(url, { redirect: 'follow' });
-  if (!res.ok || !res.body) throw new Error(`download failed: ${res.status} ${url}`);
+  const res = await fetchWithTimeout(url, { redirect: 'follow' }, DOWNLOAD_TIMEOUT_MS);
+  if (!res.ok || !res.body) {
+    throw new Error(`download failed: ${res.status} ${res.statusText || ''} (${url})`.trim());
+  }
   await pipeline(Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]), createWriteStream(dest));
 }
 
@@ -323,15 +355,29 @@ function runHealthcheck(newDir: string, expected: string): HealthcheckResult {
     encoding: 'utf8',
     timeout: HEALTHCHECK_TIMEOUT_MS,
   });
+  const stderrSnippet = (r.stderr ?? '').trim().split('\n').slice(0, 3).join(' | ').slice(0, 200);
+  const withStderr = (msg: string) => (stderrSnippet ? `${msg}; stderr: ${stderrSnippet}` : msg);
+
   // spawnSync's `timeout` option kills the child with SIGTERM on expiry; flag
   // that path separately so the operator can distinguish a hang from a normal
-  // non-zero exit.
+  // non-zero exit. Older Node versions surface the timeout via
+  // `error.message` instead of setting `signal`.
   if (r.signal === 'SIGTERM' || r.error?.message?.includes('ETIMEDOUT')) {
     return { ok: false, detail: `timeout after ${HEALTHCHECK_TIMEOUT_MS}ms` };
   }
+  // `r.error` is set when spawn itself failed (ENOENT on the node binary, for
+  // example). Report it separately from "process ran and exited non-zero".
+  if (r.error) {
+    return { ok: false, detail: withStderr(`spawn failed: ${r.error.message}`) };
+  }
+  // Any other terminating signal (SIGKILL from the OOM killer, SIGBUS from a
+  // native-module crash, etc.) — make the signal visible instead of falling
+  // through to `exit null`.
+  if (r.signal) {
+    return { ok: false, detail: withStderr(`terminated by signal ${r.signal}`) };
+  }
   if (r.status !== 0) {
-    const stderrSnippet = (r.stderr ?? '').trim().split('\n').slice(0, 3).join(' | ').slice(0, 200);
-    return { ok: false, detail: `exit ${r.status}${stderrSnippet ? `; stderr: ${stderrSnippet}` : ''}` };
+    return { ok: false, detail: withStderr(`exit ${r.status}`) };
   }
   const got = r.stdout.trim();
   if (got !== expected) {
