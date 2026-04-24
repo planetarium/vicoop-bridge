@@ -90,7 +90,7 @@ interface ChatEventPayload {
   stopReason?: string;
 }
 
-type FinalizerCause = 'gateway_closed' | 'timeout';
+type FinalizerCause = 'gateway_closed' | 'timeout' | 'abort_failed';
 
 type FinalizerEvent = ChatEventPayload & { cause?: FinalizerCause };
 
@@ -737,7 +737,18 @@ export function createOpenclawBackend(
   return {
     name: 'openclaw',
 
-    async handle(task, emit) {
+    async handle(task, emit, signal) {
+      // Fast path: the task was canceled before we even started. Emit a
+      // terminal canceled frame and do not touch the gateway.
+      if (signal.aborted) {
+        emit({
+          type: 'task.complete',
+          taskId: task.taskId,
+          status: { state: 'canceled', timestamp: new Date().toISOString() },
+        });
+        return;
+      }
+
       let gw: GatewayClient;
       try {
         gw = await ensureConnected();
@@ -776,6 +787,53 @@ export function createOpenclawBackend(
       taskFinalizers.set(task.taskId, finalizer);
 
       let runId: string | null = null;
+      // A signal-abort that fires before the chat.send ack has to wait until
+      // we know the runId. This flag captures that intent so the ack path
+      // can fire chat.abort immediately once runId is populated.
+      let pendingAbort = false;
+
+      const fireAbort = async (activeRunId: string): Promise<void> => {
+        try {
+          await gw.request('chat.abort', { sessionKey, runId: activeRunId });
+          // Leave `settled` pending: after a successful chat.abort OpenClaw
+          // emits `state: 'aborted'` which drives the finalizer through the
+          // normal event path. taskTimeoutMs bounds the wait if that echo
+          // never arrives.
+        } catch (err) {
+          // Without this branch a failed chat.abort would leave the task
+          // hanging until taskTimeoutMs, because no terminal event is coming.
+          resolveSettled({
+            runId: activeRunId,
+            sessionKey,
+            seq: -1,
+            state: 'error',
+            errorMessage: (err as Error).message,
+            cause: 'abort_failed',
+          });
+        }
+      };
+
+      let abortHandled = false;
+      const onAbort = (): void => {
+        // Listener can race with an explicit `if (signal.aborted) onAbort()`
+        // after attach, so guard against double-invocation to avoid sending
+        // two chat.abort RPCs.
+        if (abortHandled) return;
+        abortHandled = true;
+        if (runId === null) {
+          pendingAbort = true;
+          return;
+        }
+        void fireAbort(runId);
+      };
+      signal.addEventListener('abort', onAbort);
+      // A signal that aborted between handle() entry (fast-path check) and
+      // this listener attach — typically during `await ensureConnected()` —
+      // will not auto-fire the listener we just attached (AbortSignal does
+      // not replay the event). Check explicitly so pre-ack cancels arriving
+      // during connect still propagate to the gateway.
+      if (signal.aborted) onAbort();
+
       const timer = setTimeout(() => {
         resolveSettled({
           runId: runId ?? '',
@@ -823,6 +881,9 @@ export function createOpenclawBackend(
           for (const p of buffered) finalizer(p);
         }
 
+        // Fire a deferred abort now that the runId is known.
+        if (pendingAbort) void fireAbort(runId);
+
         const result = await settled;
 
         if (result.cause === 'timeout') {
@@ -843,6 +904,17 @@ export function createOpenclawBackend(
             error: {
               code: 'gateway_closed',
               message: result.errorMessage ?? 'gateway closed',
+            },
+          });
+          return;
+        }
+        if (result.cause === 'abort_failed') {
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: {
+              code: 'gateway_abort_failed',
+              message: result.errorMessage ?? 'chat.abort request failed',
             },
           });
           return;
@@ -890,6 +962,7 @@ export function createOpenclawBackend(
           },
         });
       } finally {
+        signal.removeEventListener('abort', onAbort);
         clearTimeout(timer);
         taskFinalizers.delete(task.taskId);
         if (runId) {
@@ -897,17 +970,6 @@ export function createOpenclawBackend(
           pendingRunEvents.delete(runId);
           markRunFinalized(runId);
         }
-      }
-    },
-
-    async cancel(taskId) {
-      const entry = [...runToTask.entries()].find(([, v]) => v.taskId === taskId);
-      if (!entry || !current) return;
-      const [runId, binding] = entry;
-      try {
-        await current.request('chat.abort', { sessionKey: binding.sessionKey, runId });
-      } catch (err) {
-        console.error('[openclaw] abort failed:', (err as Error).message);
       }
     },
   };

@@ -31,6 +31,9 @@ export class Client {
 
   stop(): void {
     this.stopped = true;
+    // Abort all inflight tasks so backends can unwind cleanly instead of
+    // running to completion after the WS is gone.
+    for (const controller of this.inflight.values()) controller.abort();
     this.ws?.close();
   }
 
@@ -65,7 +68,6 @@ export class Client {
           break;
         case 'task.cancel':
           this.inflight.get(frame.taskId)?.abort();
-          void this.opts.backend.cancel(frame.taskId);
           break;
         case 'ping':
           this.send({ type: 'pong' });
@@ -97,7 +99,7 @@ export class Client {
     const controller = new AbortController();
     this.inflight.set(frame.taskId, controller);
     try {
-      await this.opts.backend.handle(frame, (f) => this.send(f));
+      await this.opts.backend.handle(frame, (f) => this.send(f), controller.signal);
     } catch (err) {
       this.send({
         type: 'task.fail',

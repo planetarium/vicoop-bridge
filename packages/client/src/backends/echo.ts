@@ -35,5 +35,4 @@ export const echoBackend: Backend = {
       },
     });
   },
-  async cancel() {},
 };
