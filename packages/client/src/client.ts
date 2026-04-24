@@ -16,7 +16,15 @@ export interface ClientOptions {
   backend: Backend;
   maxConcurrency?: number;
   reconnectDelayMs?: number;
+  // Upper bound on how long we'll wait for `backend.resolveCapabilities()`
+  // before sending the bridge-server hello with the card's declared
+  // capabilities. Defaults to 3000 ms — comfortably under the bridge
+  // server's 10s hello deadline so a slow or hung probe cannot push us
+  // into the 4001 "hello timeout" close and a reconnect loop.
+  probeDeadlineMs?: number;
 }
+
+const DEFAULT_PROBE_DEADLINE_MS = 3000;
 
 export class Client {
   private ws: WebSocket | null = null;
@@ -58,30 +66,43 @@ export class Client {
       this.effectiveCardPromise = Promise.resolve(base);
       return this.effectiveCardPromise;
     }
+    const deadlineMs = this.opts.probeDeadlineMs ?? DEFAULT_PROBE_DEADLINE_MS;
     this.effectiveCardPromise = (async () => {
-      try {
-        const detected = await probe.call(this.opts.backend);
-        // Preserve the documented "no override" contract: an empty detected
-        // object must leave the card byte-for-byte unchanged, including an
-        // absent `capabilities` field. Only materialize `capabilities` when
-        // the probe actually reports a value we need to apply.
-        if (detected.streaming === undefined && detected.pushNotifications === undefined) {
-          return base;
-        }
-        const merged: AgentCard['capabilities'] = {
-          ...(base.capabilities ?? {}),
-          ...(detected.streaming !== undefined ? { streaming: detected.streaming } : {}),
-          ...(detected.pushNotifications !== undefined
-            ? { pushNotifications: detected.pushNotifications }
-            : {}),
-        };
-        return { ...base, capabilities: merged };
-      } catch (err) {
+      const TIMEOUT = Symbol('probe-timeout');
+      const timeoutPromise = new Promise<typeof TIMEOUT>((resolve) => {
+        const t = setTimeout(() => resolve(TIMEOUT), deadlineMs);
+        t.unref?.();
+      });
+      const probePromise = probe.call(this.opts.backend).catch((err: unknown) => {
         console.warn(
           `[client] backend capability probe threw (${err instanceof Error ? err.message : String(err)}); using declared card capabilities`,
         );
+        return null;
+      });
+      const outcome = await Promise.race([probePromise, timeoutPromise]);
+      if (outcome === TIMEOUT) {
+        console.warn(
+          `[client] backend capability probe did not complete within ${deadlineMs}ms; sending hello with declared card capabilities`,
+        );
         return base;
       }
+      if (outcome === null) return base;
+      const detected = outcome;
+      // Preserve the documented "no override" contract: an empty detected
+      // object must leave the card byte-for-byte unchanged, including an
+      // absent `capabilities` field. Only materialize `capabilities` when
+      // the probe actually reports a value we need to apply.
+      if (detected.streaming === undefined && detected.pushNotifications === undefined) {
+        return base;
+      }
+      const merged: AgentCard['capabilities'] = {
+        ...(base.capabilities ?? {}),
+        ...(detected.streaming !== undefined ? { streaming: detected.streaming } : {}),
+        ...(detected.pushNotifications !== undefined
+          ? { pushNotifications: detected.pushNotifications }
+          : {}),
+      };
+      return { ...base, capabilities: merged };
     })();
     return this.effectiveCardPromise;
   }

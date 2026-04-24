@@ -1,8 +1,34 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import WebSocket, { WebSocketServer } from 'ws';
+
+// Bind a net server to an ephemeral port, record the port, then close the
+// server. The port is now reliably free on this host for the remainder of
+// the test — a subsequent connect attempt gets ECONNREFUSED immediately
+// instead of racing against whatever may happen to be listening on a
+// hard-coded port (e.g. port 1 can be forwarded in some CI environments).
+async function pickUnusedLoopbackPort(): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const server = createNetServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        server.close();
+        reject(new Error('failed to allocate an unused loopback port'));
+        return;
+      }
+      const { port } = address;
+      server.close((err) => {
+        if (err) reject(err);
+        else resolve(port);
+      });
+    });
+  });
+}
 import {
   createOpenclawBackend,
   listenersToGatewayUrls,
@@ -1770,6 +1796,7 @@ test('resolveCapabilities: treats non-method errors as "method exists" and keeps
 });
 
 test('resolveCapabilities: returns empty override when gateway is unreachable', async () => {
+  const unreachablePort = await pickUnusedLoopbackPort();
   const warnings: string[] = [];
   const originalWarn = console.warn;
   console.warn = (...args: unknown[]) => {
@@ -1777,7 +1804,7 @@ test('resolveCapabilities: returns empty override when gateway is unreachable', 
   };
   try {
     const backend = createOpenclawBackend({
-      url: 'ws://127.0.0.1:1', // port 1 is almost never listening
+      url: `ws://127.0.0.1:${unreachablePort}`,
       handshakeTimeoutMs: 500,
       discoverGatewayUrls: async () => [],
     });
