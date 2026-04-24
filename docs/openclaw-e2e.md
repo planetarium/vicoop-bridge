@@ -155,12 +155,6 @@ docker rm -f openclaw-e2e
   testing happy-path completions with real model output, mount it via
   `-e CLAUDE_AI_SESSION_KEY=…` on the gateway container.
 
-- **Pre-ack cancel is racy.** A synchronous `controller.abort()` right
-  after `backend.handle(...)` fires during `await ensureConnected()`. The
-  backend handles this correctly (see regression test `cancel (during
-  connect)` in `openclaw.test.ts`), but if you're changing that path,
-  re-run the E2E to catch timing bugs the faked gateway can mask.
-
 ## When to use this vs. the unit tests
 
 - **Unit tests (`pnpm --filter @vicoop-bridge/client test`)** — cover all
