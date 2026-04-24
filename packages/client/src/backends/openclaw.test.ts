@@ -474,6 +474,67 @@ test('cancel (pre-ack): signal abort before chat.send ack still fires chat.abort
   }
 });
 
+test('cancel (during connect): signal aborted before listener attaches still fires chat.abort', async () => {
+  // Regression: previously, handle() attached the abort listener only AFTER
+  // `await ensureConnected()`. If the signal aborted during that await, the
+  // listener attached on an already-aborted signal and never fired (AbortSignal
+  // does not replay the abort event). chat.abort was silently skipped and
+  // the task hung until taskTimeoutMs.
+  let heldConnect: { sock: WebSocket; id: string } | null = null;
+  let chatAbortSeen = false;
+  const fake = await createFakeGateway({
+    autoHandshake: false,
+    onRequest: (sock, req) => {
+      if (req.method === 'connect') {
+        heldConnect = { sock, id: req.id };
+      }
+      if (req.method === 'chat.send') {
+        const runId = `run-${(req.params as { idempotencyKey: string }).idempotencyKey}`;
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+        );
+      }
+      if (req.method === 'chat.abort') {
+        chatAbortSeen = true;
+        sock.send(JSON.stringify({ type: 'res', id: req.id, ok: true, payload: {} }));
+        setImmediate(() => {
+          const params = req.params as { runId: string; sessionKey: string };
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: { runId: params.runId, sessionKey: params.sessionKey, seq: 2, state: 'aborted' },
+            }),
+          );
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const controller = new AbortController();
+    const frames: UpFrame[] = [];
+    const pending = backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), controller.signal);
+    // Wait until connect request is received but not yet acked — abort now
+    // happens strictly inside `await ensureConnected()`.
+    for (let i = 0; i < 20 && !heldConnect; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.ok(heldConnect, 'connect request should have reached the gateway');
+    controller.abort();
+    // Release the connect ack so handle() can proceed past ensureConnected.
+    const held = heldConnect!;
+    held.sock.send(JSON.stringify({ type: 'res', id: held.id, ok: true, payload: {} }));
+    await pending;
+    assert.ok(chatAbortSeen, 'chat.abort must fire even though abort happened during connect');
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete);
+    assert.equal(complete!.status.state, 'canceled');
+  } finally {
+    await fake.close();
+  }
+});
+
 test('cancel (already aborted): signal aborted on entry emits canceled without touching the gateway', async () => {
   let chatSendSeen = false;
   const fake = await createFakeGateway({

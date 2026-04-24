@@ -813,7 +813,13 @@ export function createOpenclawBackend(
         }
       };
 
+      let abortHandled = false;
       const onAbort = (): void => {
+        // Listener can race with an explicit `if (signal.aborted) onAbort()`
+        // after attach, so guard against double-invocation to avoid sending
+        // two chat.abort RPCs.
+        if (abortHandled) return;
+        abortHandled = true;
         if (runId === null) {
           pendingAbort = true;
           return;
@@ -821,6 +827,12 @@ export function createOpenclawBackend(
         void fireAbort(runId);
       };
       signal.addEventListener('abort', onAbort);
+      // A signal that aborted between handle() entry (fast-path check) and
+      // this listener attach — typically during `await ensureConnected()` —
+      // will not auto-fire the listener we just attached (AbortSignal does
+      // not replay the event). Check explicitly so pre-ack cancels arriving
+      // during connect still propagate to the gateway.
+      if (signal.aborted) onAbort();
 
       const timer = setTimeout(() => {
         resolveSettled({
