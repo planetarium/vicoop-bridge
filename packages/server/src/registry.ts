@@ -2,6 +2,7 @@ import type { WebSocket } from 'ws';
 import type { AgentCard, DownFrame } from '@vicoop-bridge/protocol';
 import { encodeFrame } from '@vicoop-bridge/protocol';
 import type { ExecutionEventBus } from '@a2a-js/sdk/server';
+import { logEvent, truncate } from './log.js';
 
 export interface ClientConnection {
   agentId: string;
@@ -127,14 +128,18 @@ export class Registry {
         listener(agentId);
       } catch (err) {
         // A misbehaving listener must not abort further notifications or
-        // corrupt the register/unregister call site. Log the full error —
-        // stack trace included when it's an Error, verbatim value otherwise
-        // — so a listener that throws a non-Error primitive still produces
-        // an actionable log line (not `undefined`).
-        console.error(
-          `[registry] agent change listener threw for agentId=${agentId}:`,
-          err,
-        );
+        // corrupt the register/unregister call site. Log through
+        // logEvent() so user-controlled agentId (originates in the hello
+        // frame and is an unconstrained string at this layer) is JSON-
+        // escaped rather than interpolated into a format string — this
+        // prevents CRLF log injection. Truncate it too so a pathological
+        // client can't inflate each error line unbounded. Preserve the
+        // stack when available; fall back to String() for non-Error
+        // throws so the log is still actionable.
+        logEvent('registry_agent_listener_error', {
+          agentId: truncate(String(agentId), 128),
+          error: err instanceof Error ? (err.stack ?? err.message) : String(err),
+        });
       }
     }
   }

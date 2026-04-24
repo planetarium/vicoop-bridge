@@ -153,12 +153,12 @@ test('a throwing onAgentChange listener does not abort other listeners or the re
   // subsequent listeners from receiving the event.
   //
   // Use the test runner's scoped mock so parallel tests that also touch
-  // console.error don't race with this stub — node:test auto-restores the
+  // console.log don't race with this stub — node:test auto-restores the
   // original at test teardown, removing the need for a manual try/finally
   // and the "what if the test body throws before finally" window.
-  const errors: string[] = [];
-  t.mock.method(console, 'error', (...args: unknown[]) => {
-    errors.push(args.map(String).join(' '));
+  const logs: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => {
+    logs.push(args.map(String).join(' '));
   });
   const registry = new Registry();
   const seen: string[] = [];
@@ -177,5 +177,61 @@ test('a throwing onAgentChange listener does not abort other listeners or the re
   });
   assert.deepEqual(result, { ok: true });
   assert.deepEqual(seen, ['a1']);
-  assert.ok(errors.some((e) => e.includes('listener boom')));
+  // Error is emitted as a structured logEvent() JSON line — assert on both
+  // the event name and the embedded error text so we catch regressions
+  // where the event is renamed or the error is dropped.
+  const errorLine = logs.find(
+    (l) => l.includes('registry_agent_listener_error') && l.includes('listener boom'),
+  );
+  assert.ok(errorLine, `expected structured error log, got: ${logs.join(' | ')}`);
+});
+
+test('notifyAgentChange log cannot be hijacked by newline injection via agentId', (t) => {
+  // agentId originates from the client's hello frame and is an
+  // unconstrained string at this layer. A malicious client sending
+  // "a\nfake-log-line" as its agentId must not be able to synthesize
+  // a second line in operator logs. logEvent() serializes via
+  // JSON.stringify which escapes newlines; this test locks that
+  // invariant in place so a future switch back to a raw
+  // console.error(`...${agentId}...`) template-string regresses loudly.
+  const logs: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => {
+    logs.push(args.map(String).join(' '));
+  });
+  const registry = new Registry();
+  registry.onAgentChange(() => {
+    throw new Error('boom');
+  });
+  registry.registerAgent({
+    agentId: 'good\nevent: fake_login\nextra: attacker-controlled',
+    clientId: 'c1',
+    ownerWallet: '0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws: makeWs(),
+    connectedAt: 0,
+  });
+  assert.equal(logs.length, 1, 'exactly one log line must be emitted');
+  // Raw newlines in the output would split into multiple lines when a
+  // downstream log aggregator processes them. JSON.stringify escapes
+  // them as `\n`, which survives as a single physical line.
+  assert.ok(!logs[0].includes('\n'), 'structured log must not contain raw newlines');
+  assert.ok(logs[0].includes('\\n'), 'newlines must be JSON-escaped');
+  // Parse the log and verify the attacker's pseudo-fields live *inside*
+  // the agentId string value, not as top-level fields of the JSON object.
+  // A raw console.error(`...${agentId}...`) would have smuggled a second
+  // "event: fake_login" line past a line-oriented log scanner; structured
+  // logging keeps it bottled up inside the quoted agentId string.
+  const parsed = JSON.parse(logs[0]) as Record<string, unknown>;
+  assert.equal(parsed.event, 'registry_agent_listener_error');
+  assert.equal(
+    typeof parsed.agentId === 'string' && (parsed.agentId as string).includes('fake_login'),
+    true,
+    'agentId value should retain the attacker input verbatim (escaped, not stripped)',
+  );
+  assert.equal(
+    parsed.fake_login,
+    undefined,
+    'attacker payload must not surface as a top-level JSON field',
+  );
 });
