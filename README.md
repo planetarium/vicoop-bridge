@@ -27,6 +27,14 @@ Operators installing from a published release should follow
 [`docs/install-client.md`](./docs/install-client.md) — the one-liner
 installer plus SIWE/registerClient flow for obtaining a client token.
 
+Before tagging a new `client-v*` release, verify that
+[`docs/install-client.md`](./docs/install-client.md) still matches the
+published bundle:
+
+- shipped backends listed in the doc match `packages/client/src/cli.ts`
+- bundled example cards listed in the doc match `packages/client/cards/`
+- backend-specific launch examples still reflect the released client behavior
+
 ## Status
 
 Pre-implementation. Design phase only.
