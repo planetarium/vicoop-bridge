@@ -10,6 +10,7 @@ Docs:
 - [`docs/install-client.md`](./docs/install-client.md) — onboarding a new client against a deployed bridge
 - [`docs/remote-testing.md`](./docs/remote-testing.md) — end-to-end testing against a deployed bridge
 - [`docs/local-testing.md`](./docs/local-testing.md) — running both bridge and client from source
+- [`docs/openclaw-e2e.md`](./docs/openclaw-e2e.md) — exercising the `openclaw` backend directly against the gateway Docker image
 
 ## Client Releases
 
