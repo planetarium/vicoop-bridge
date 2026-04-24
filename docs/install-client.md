@@ -391,7 +391,8 @@ auto-detection skipped (non-systemd host), write the unit yourself:
 # ~/.config/systemd/user/vicoop-client.service
 [Unit]
 Description=vicoop-bridge-client
-After=network-online.target
+# network-online.target is a system-instance unit; the user manager does
+# not know about it, so intentionally omit the After=/Wants= line here.
 
 [Service]
 Type=simple
@@ -399,6 +400,7 @@ EnvironmentFile=%h/.config/vicoop-client.env
 ExecStart=%h/vicoop-bridge-client/bin/vicoop-client
 Restart=on-failure
 RestartSec=5s
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=default.target

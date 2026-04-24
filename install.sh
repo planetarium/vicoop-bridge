@@ -205,11 +205,26 @@ Wants=network-online.target'
       # root-owned 0600. NoNewPrivileges/ProtectSystem/ProtectHome/PrivateTmp
       # are cheap defense-in-depth. User-scope units inherit the caller's
       # identity and don't need (or accept) these knobs.
-      unit_hardening='DynamicUser=yes
+      #
+      # DynamicUser + ProtectHome break when the runtime paths live under
+      # /home or /root (common with nvm/asdf, or an operator who ran
+      # `sudo sh install.sh` from their home dir): the transient UID can't
+      # read files under a masked /home, and /root is 0700. Detect that
+      # case and fall back to a minimal hardening set so the unit still
+      # starts — the operator can tighten manually later.
+      case "$node_bin $cli_entry" in
+        */home/*|*/root/*)
+          log "warning: node or install bundle lives under /home or /root; skipping DynamicUser / ProtectHome in the generated unit (service runs as root with NoNewPrivileges only)"
+          unit_hardening='NoNewPrivileges=yes'
+          ;;
+        *)
+          unit_hardening='DynamicUser=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes'
+          ;;
+      esac
       # Root running the installer (the auto-detected system path) gets an
       # un-prefixed command; sudo is only suggested for later reinvocations by
       # a non-root operator. Minimal images often lack sudo entirely.
