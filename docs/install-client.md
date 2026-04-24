@@ -329,20 +329,36 @@ restart needed.
 ### Linux — systemd (automatic, recommended)
 
 On systemd hosts `install.sh` already dropped the unit and an env template
-(see Step 1). Populate the env file and enable:
+(see Step 1). The exact paths and the reload/enable commands are printed
+at the end of `install.sh` — prefer those over the examples below if they
+differ (`XDG_CONFIG_HOME`, non-default `$HOME`, etc.). You can also ask
+systemd directly with `systemctl --user cat vicoop-client`.
 
 ```sh
-# user-scope (default for non-root)
-"${EDITOR:-vi}" ~/.config/vicoop-client.env   # set SERVER_TOKEN, AGENT_ID, ...
+# user-scope (default for non-root). If XDG_CONFIG_HOME is set, swap in
+# that prefix for ~/.config/ below.
+"${EDITOR:-vi}" "${XDG_CONFIG_HOME:-$HOME/.config}/vicoop-client.env"
 systemctl --user daemon-reload                # pick up regenerated unit after reinstall
 systemctl --user enable --now vicoop-client
 journalctl --user -u vicoop-client -f         # watch logs
 ```
 
 For a system-scope install (installer ran as root) swap to
-`/etc/vicoop-client.env`, `sudo systemctl daemon-reload`, then
-`sudo systemctl enable --now vicoop-client`. The unit restarts on failure
-(`Restart=on-failure`, 5s backoff).
+`/etc/vicoop-client.env`, then reload + enable. On minimal images where
+the installer ran as root and `sudo` may not exist, drop the `sudo`
+prefix:
+
+```sh
+# already root (minimal images, Fly.io containers)
+systemctl daemon-reload
+systemctl enable --now vicoop-client
+
+# non-root operator with sudo
+sudo systemctl daemon-reload
+sudo systemctl enable --now vicoop-client
+```
+
+The unit restarts on failure (`Restart=on-failure`, 5s backoff).
 
 The `daemon-reload` is only strictly needed after a reinstall/upgrade that
 rewrote the unit file (new `INSTALL_DIR`, new absolute node path, new

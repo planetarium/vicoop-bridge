@@ -328,14 +328,15 @@ EOF
   fi
 else
   cat <<EOF
-  2. Run the client (supply config via env or flags):
+  2. Run the client (supply config via env or flags). Paths are quoted so
+     the snippet works even when \$INSTALL_DIR contains whitespace:
 
        SERVER_URL=wss://your-server-host \\
        SERVER_TOKEN=... \\
        AGENT_ID=... \\
-       AGENT_CARD=$INSTALL_DIR/cards/openclaw.json \\
+       AGENT_CARD="$INSTALL_DIR/cards/openclaw.json" \\
        BACKEND=openclaw \\
-         $INSTALL_DIR/bin/vicoop-client
+         "$INSTALL_DIR/bin/vicoop-client"
 
      For persistent operation, see docs/install-client.md §6
      (launchd on macOS, systemd user unit, tmux).
