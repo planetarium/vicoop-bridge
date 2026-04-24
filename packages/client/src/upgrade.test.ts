@@ -1,10 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assertLooksLikeInstall, normalizeTag, parseChecksum, preserveOperatorFiles, sha256File, stripSuidBits } from './upgrade.js';
-import { chmodSync, statSync } from 'node:fs';
 
 test('normalizeTag accepts full tag, bare version, and v-prefixed version', () => {
   assert.equal(normalizeTag('client-v0.3.0'), 'client-v0.3.0');

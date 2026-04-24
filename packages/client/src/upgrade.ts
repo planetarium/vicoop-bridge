@@ -201,6 +201,22 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
 
       preserveOperatorFiles(installDir, newDir);
 
+      // Re-strip setuid/setgid after preservation. `cpSync` preserves mode
+      // bits, so any operator file that had suid/sgid bits set in the old
+      // install would arrive in newDir with those bits intact — and under
+      // `sudo vicoop-client upgrade` that file's dest would be owned by
+      // root (cpSync as root) or left owner-preserved, either way yielding
+      // a privileged binary inside the next install. Second strip closes
+      // that gap; non-root path is a no-op beyond the directory walk.
+      if (process.getuid?.() === 0) {
+        try {
+          stripSuidBits(newDir);
+        } catch (e) {
+          err(`failed to strip setuid/setgid bits under ${newDir} after preserving operator files: ${(e as Error).message}`);
+          return 1;
+        }
+      }
+
       const health = runHealthcheck(newDir, targetVersion);
       if (!health.ok) {
         err(`new bundle failed --version healthcheck; aborting${health.detail ? ` (${health.detail})` : ''}`);
