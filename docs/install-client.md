@@ -302,6 +302,27 @@ second WS. Override if yours isn't on the default:
 | `OPENCLAW_AGENT` | `main` | Agent name inside OpenClaw |
 | `OPENCLAW_TASK_TIMEOUT_MS` | backend default | Per-task timeout |
 
+### Claude-specific env
+
+If you're running the Claude backend, point the client at the bundled
+Claude card and optionally set `CLAUDE_CWD` so Claude works against a
+different repository than the directory where `vicoop-client` itself was
+started:
+
+```sh
+SERVER_URL="$SERVER_URL" \
+SERVER_TOKEN="$CLIENT_TOKEN" \
+AGENT_ID="$AGENT_ID" \
+AGENT_CARD="$INSTALL_DIR/cards/claude.json" \
+BACKEND=claude \
+CLAUDE_CWD="$HOME/vicoop-bridge" \
+  "$INSTALL_DIR/bin/vicoop-client"
+```
+
+`CLAUDE_CWD` defaults to the current working directory of the client
+process. Set it when the released bundle lives outside the repository you
+want Claude to edit.
+
 ### Restrict who can call your agent
 
 By default the policy has empty `allowed_callers`, which the dispatcher
