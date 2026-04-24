@@ -147,35 +147,35 @@ test('onAgentChange does NOT fire on unregister if the ws does not match the cur
   assert.equal(current.agentCard.capabilities?.streaming, true);
 });
 
-test('a throwing onAgentChange listener does not abort other listeners or the registerAgent call', () => {
+test('a throwing onAgentChange listener does not abort other listeners or the registerAgent call', (t) => {
   // The change notification runs inside registerAgent/unregisterAgent. A bad
   // listener must not corrupt the caller's control flow or prevent
   // subsequent listeners from receiving the event.
+  //
+  // Use the test runner's scoped mock so parallel tests that also touch
+  // console.error don't race with this stub — node:test auto-restores the
+  // original at test teardown, removing the need for a manual try/finally
+  // and the "what if the test body throws before finally" window.
+  const errors: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    errors.push(args.map(String).join(' '));
+  });
   const registry = new Registry();
   const seen: string[] = [];
-  const originalError = console.error;
-  const errors: string[] = [];
-  console.error = (...args: unknown[]) => {
-    errors.push(args.map(String).join(' '));
-  };
-  try {
-    registry.onAgentChange(() => {
-      throw new Error('listener boom');
-    });
-    registry.onAgentChange((id) => seen.push(id));
-    const result = registry.registerAgent({
-      agentId: 'a1',
-      clientId: 'c1',
-      ownerWallet: '0x0',
-      agentCard: makeCard(false),
-      allowedCallers: [],
-      ws: makeWs(),
-      connectedAt: 0,
-    });
-    assert.deepEqual(result, { ok: true });
-    assert.deepEqual(seen, ['a1']);
-    assert.ok(errors.some((e) => e.includes('listener boom')));
-  } finally {
-    console.error = originalError;
-  }
+  registry.onAgentChange(() => {
+    throw new Error('listener boom');
+  });
+  registry.onAgentChange((id) => seen.push(id));
+  const result = registry.registerAgent({
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerWallet: '0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws: makeWs(),
+    connectedAt: 0,
+  });
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(seen, ['a1']);
+  assert.ok(errors.some((e) => e.includes('listener boom')));
 });

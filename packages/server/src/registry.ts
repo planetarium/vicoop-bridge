@@ -22,12 +22,15 @@ export interface TaskBinding {
 
 export type CallerChangeListener = (agentId: string, callers: string[]) => void;
 // Fires whenever the agent connection (including its embedded agentCard) is
-// replaced or removed. Downstream consumers that cache objects derived from
-// the card — e.g. the HTTP layer's per-agent JsonRpcTransportHandler, which
-// captures `capabilities.streaming` at construction time — must evict on
-// this signal, otherwise a client that reconnects with an updated card
-// (say, `streaming: false` → `true`) will continue to be served by a
-// transport built against the old card until the server restarts.
+// newly registered, replaced, or removed. Downstream consumers that cache
+// objects derived from the card — e.g. the HTTP layer's per-agent
+// JsonRpcTransportHandler, which captures `capabilities.streaming` at
+// construction time — must evict on this signal, otherwise a client that
+// reconnects with an updated card (say, `streaming: false` → `true`) will
+// continue to be served by a transport built against the old card until the
+// server restarts. Fires on first registration too so any transient cache
+// entry left behind by a previous lifecycle (e.g. a lingering entry from
+// before an unclean shutdown) is cleared unconditionally.
 export type AgentChangeListener = (agentId: string) => void;
 
 export class Registry {
@@ -124,8 +127,14 @@ export class Registry {
         listener(agentId);
       } catch (err) {
         // A misbehaving listener must not abort further notifications or
-        // corrupt the register/unregister call site. Log and continue.
-        console.error('[registry] agent change listener threw:', (err as Error).message);
+        // corrupt the register/unregister call site. Log the full error —
+        // stack trace included when it's an Error, verbatim value otherwise
+        // — so a listener that throws a non-Error primitive still produces
+        // an actionable log line (not `undefined`).
+        console.error(
+          `[registry] agent change listener threw for agentId=${agentId}:`,
+          err,
+        );
       }
     }
   }
