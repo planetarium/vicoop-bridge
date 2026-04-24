@@ -92,11 +92,11 @@ async function runUpgradeCmd(args: string[]): Promise<number> {
     else if (a === '--version') {
       version = args[++i];
       if (!version) {
-        console.error('--version requires a value (e.g. client-v0.3.0)');
+        console.error('--version requires a value (e.g. 0.3.0, v0.3.0, or client-v0.3.0)');
         return 1;
       }
     } else if (a === '-h' || a === '--help') {
-      console.log('usage: vicoop-client upgrade [--check] [--force] [--version <client-vX.Y.Z>]');
+      console.log('usage: vicoop-client upgrade [--check] [--force] [--version <X.Y.Z | vX.Y.Z | client-vX.Y.Z>]');
       return 0;
     } else {
       console.error(`unknown argument to upgrade: ${a}`);

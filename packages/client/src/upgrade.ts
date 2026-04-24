@@ -260,9 +260,14 @@ export function normalizeTag(v: string): string {
 function assertSafeTag(tag: string, raw: string = tag): void {
   // The tag is interpolated into local paths (archive name / temp joins) and
   // an outbound URL. Reject anything that could path-traverse or inject shell
-  // metacharacters before it reaches `join(dlDir, ...)`.
+  // metacharacters before it reaches `join(dlDir, ...)`. The regex is
+  // intentionally looser than strict semver — we want to accept future
+  // pre-release and build-metadata variants that GitHub might tag — so the
+  // error describes the literal character set rather than implying semver.
   if (!TAG_RE.test(tag) || tag.includes('..')) {
-    throw new Error(`invalid version '${raw}': expected client-v<semver>, got '${tag}'`);
+    throw new Error(
+      `invalid version '${raw}': expected a client-v* tag with only [A-Za-z0-9.+-] (no '..'), got '${tag}'`,
+    );
   }
 }
 
@@ -430,7 +435,21 @@ function tryRestartSystemd(scope: 'system' | 'user'): boolean {
     ? ['--user', 'try-restart', 'vicoop-client.service']
     : ['try-restart', 'vicoop-client.service'];
   const r = spawnSync('systemctl', args, { stdio: 'inherit' });
-  return r.status === 0;
+  if (r.error) {
+    const code = (r.error as NodeJS.ErrnoException).code;
+    const hint = code === 'ENOENT' ? ' (systemctl not on PATH)' : '';
+    err(`systemctl spawn failed${hint}: ${r.error.message}`);
+    return false;
+  }
+  if (r.signal) {
+    err(`systemctl terminated by signal ${r.signal}`);
+    return false;
+  }
+  if (r.status !== 0) {
+    err(`systemctl try-restart exited with status ${r.status}`);
+    return false;
+  }
+  return true;
 }
 
 function safeRemove(path: string): void {
