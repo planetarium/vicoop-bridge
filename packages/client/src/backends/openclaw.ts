@@ -298,7 +298,7 @@ class GatewayClient {
         client: {
           id: clientId,
           displayName: 'vicoop-bridge-client',
-          version: '0.3.0',
+          version: '0.4.2',
           platform: process.platform,
           mode: clientMode,
         },
@@ -905,6 +905,50 @@ export function createOpenclawBackend(
 
   return {
     name: 'openclaw',
+
+    // Probe whether the gateway implements `sessions.messages.subscribe` so
+    // the bridge-server can advertise a card capability that matches reality.
+    // OpenClaw added the RPC in v2026.3.22; older gateways reject it with
+    // `unknown method: sessions.messages.subscribe`. We treat that specific
+    // error as a negative signal and every other failure mode (scope denied,
+    // invalid key, etc.) as "method exists → streaming available", since they
+    // prove the method dispatched before being rejected. Gateway unreachable
+    // at probe time returns `{}` so the card's declared value wins — the
+    // alternative (assuming "not supported" on transient outages) would
+    // spuriously downgrade healthy deployments.
+    async resolveCapabilities() {
+      let gw: GatewayClient;
+      try {
+        gw = await ensureConnected();
+      } catch (err) {
+        console.warn(
+          `[openclaw] capability probe skipped: gateway unreachable (${errorMessage(err)}); leaving card capabilities as declared`,
+        );
+        return {};
+      }
+      const probeKey = `__vicoop-capability-probe__:${randomUUID()}`;
+      try {
+        await gw.request('sessions.messages.subscribe', { key: probeKey });
+        // Probe succeeded against a synthetic sessionKey. Best-effort cleanup
+        // so the subscriber slot isn't kept alive — subscription state is
+        // connection-scoped anyway, so a failed unsubscribe is harmless.
+        try {
+          await gw.request('sessions.messages.unsubscribe', { key: probeKey });
+        } catch {
+          /* ignore */
+        }
+        return { streaming: true };
+      } catch (err) {
+        const msg = errorMessage(err);
+        if (/unknown method/i.test(msg)) {
+          console.warn(
+            '[openclaw] gateway does not implement sessions.messages.subscribe; advertising streaming:false (streaming requires OpenClaw >= v2026.3.22)',
+          );
+          return { streaming: false };
+        }
+        return { streaming: true };
+      }
+    },
 
     async handle(task, emit, signal) {
       // Fast path: the task was canceled before we even started. Emit a

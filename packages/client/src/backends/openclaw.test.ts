@@ -1638,4 +1638,158 @@ test('discovery skipped when configured URL is remote (non-loopback)', async () 
   assert.equal(discoverCalls, 0, 'discover must not be invoked for non-loopback URLs');
 });
 
+test('resolveCapabilities: returns streaming:true when gateway accepts sessions.messages.subscribe', async () => {
+  const seenMethods: string[] = [];
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      seenMethods.push(req.method);
+      if (req.method === 'sessions.messages.unsubscribe') {
+        sock.send(JSON.stringify({ type: 'res', id: req.id, ok: true, payload: {} }));
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    assert.ok(backend.resolveCapabilities, 'openclaw backend must expose resolveCapabilities');
+    const caps = await backend.resolveCapabilities!();
+    assert.deepEqual(caps, { streaming: true });
+    assert.ok(
+      seenMethods.includes('sessions.messages.subscribe'),
+      'probe must have attempted sessions.messages.subscribe',
+    );
+    assert.ok(
+      seenMethods.includes('sessions.messages.unsubscribe'),
+      'probe must attempt unsubscribe cleanup after a successful subscribe',
+    );
+  } finally {
+    await fake.close();
+  }
+});
+
+// Reusable helper for probe tests that need a subscribe error the main fake
+// gateway helper cannot express (it auto-acks subscribe before onRequest). The
+// teardown terminates existing WebSocket connections before closing the WSS so
+// `wss.close()` doesn't hang waiting for the backend's still-open client.
+async function createFakeGatewayWithSubscribeResponse(
+  subscribeError: { code: string; message: string },
+): Promise<FakeGateway> {
+  const httpServer = createServer();
+  const wss = new WebSocketServer({ server: httpServer });
+  const connections: WebSocket[] = [];
+  wss.on('connection', (sock) => {
+    connections.push(sock);
+    sock.send(
+      JSON.stringify({
+        type: 'event',
+        event: 'connect.challenge',
+        payload: { nonce: `nonce-probe-${connections.length}` },
+      }),
+    );
+    sock.on('message', (raw) => {
+      let frame: ReqFrame;
+      try {
+        frame = JSON.parse(raw.toString()) as ReqFrame;
+      } catch {
+        return;
+      }
+      if (frame.type !== 'req') return;
+      if (frame.method === 'connect') {
+        sock.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: {} }));
+        return;
+      }
+      if (frame.method === 'sessions.messages.subscribe') {
+        sock.send(
+          JSON.stringify({ type: 'res', id: frame.id, ok: false, error: subscribeError }),
+        );
+      }
+    });
+  });
+  await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
+  const { port } = httpServer.address() as AddressInfo;
+  return {
+    url: `ws://127.0.0.1:${port}`,
+    connections,
+    waitForConnection: () => Promise.reject(new Error('not used')),
+    respond: () => undefined,
+    respondError: () => undefined,
+    emitChat: () => undefined,
+    emitSessionMessage: () => undefined,
+    closeSocket: () => Promise.resolve(),
+    async close() {
+      for (const s of connections) {
+        if (s.readyState !== WebSocket.CLOSED) s.terminate();
+      }
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    },
+  };
+}
+
+test('resolveCapabilities: returns streaming:false when gateway reports unknown method', async () => {
+  // Shape matches what OpenClaw v2026.3.13 and earlier return when the RPC
+  // doesn't exist: `errorShape(ErrorCodes.INVALID_REQUEST, "unknown method: <name>")`.
+  const fake = await createFakeGatewayWithSubscribeResponse({
+    code: 'invalid_request',
+    message: 'unknown method: sessions.messages.subscribe',
+  });
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const caps = await backend.resolveCapabilities!();
+    assert.deepEqual(caps, { streaming: false });
+    assert.ok(
+      warnings.some((w) => w.includes('streaming:false') && w.includes('v2026.3.22')),
+      `expected warning about streaming downgrade, got: ${warnings.join(' | ')}`,
+    );
+  } finally {
+    console.warn = originalWarn;
+    await fake.close();
+  }
+});
+
+test('resolveCapabilities: treats non-method errors as "method exists" and keeps streaming:true', async () => {
+  // If the gateway implements the RPC but rejects the probe for another
+  // reason (scope denied, invalid key, session not found, etc.), the method
+  // clearly dispatched — we must not downgrade. Only the literal
+  // "unknown method" shape signals absence.
+  const fake = await createFakeGatewayWithSubscribeResponse({
+    code: 'forbidden',
+    message: 'scope operator.read required',
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const caps = await backend.resolveCapabilities!();
+    assert.deepEqual(caps, { streaming: true });
+  } finally {
+    await fake.close();
+  }
+});
+
+test('resolveCapabilities: returns empty override when gateway is unreachable', async () => {
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  try {
+    const backend = createOpenclawBackend({
+      url: 'ws://127.0.0.1:1', // port 1 is almost never listening
+      handshakeTimeoutMs: 500,
+      discoverGatewayUrls: async () => [],
+    });
+    const caps = await backend.resolveCapabilities!();
+    assert.deepEqual(caps, {}, 'unreachable gateway must leave the card unmodified');
+    assert.ok(
+      warnings.some((w) => w.includes('capability probe skipped')),
+      `expected skip warning, got: ${warnings.join(' | ')}`,
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
 export { createFakeGateway, makeTask };

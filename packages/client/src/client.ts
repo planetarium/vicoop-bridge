@@ -22,6 +22,12 @@ export class Client {
   private ws: WebSocket | null = null;
   private stopped = false;
   private inflight = new Map<string, AbortController>();
+  // Resolved once per process via backend.resolveCapabilities(); the bridge
+  // hello frame is held until this settles so the advertised card matches the
+  // backend's actual upstream capability. Cached across reconnects so we
+  // don't re-probe on every bridge WS reconnect — the underlying upstream
+  // doesn't change mid-process.
+  private effectiveCardPromise: Promise<AgentCard> | null = null;
 
   constructor(private readonly opts: ClientOptions) {}
 
@@ -37,19 +43,57 @@ export class Client {
     this.ws?.close();
   }
 
+  private resolveEffectiveCard(): Promise<AgentCard> {
+    if (this.effectiveCardPromise) return this.effectiveCardPromise;
+    const base = this.opts.agentCard;
+    const probe = this.opts.backend.resolveCapabilities;
+    if (!probe) {
+      this.effectiveCardPromise = Promise.resolve(base);
+      return this.effectiveCardPromise;
+    }
+    this.effectiveCardPromise = (async () => {
+      try {
+        const detected = await probe.call(this.opts.backend);
+        const merged: AgentCard['capabilities'] = {
+          ...(base.capabilities ?? {}),
+          ...(detected.streaming !== undefined ? { streaming: detected.streaming } : {}),
+          ...(detected.pushNotifications !== undefined
+            ? { pushNotifications: detected.pushNotifications }
+            : {}),
+        };
+        return { ...base, capabilities: merged };
+      } catch (err) {
+        console.warn(
+          `[client] backend capability probe threw (${err instanceof Error ? err.message : String(err)}); using declared card capabilities`,
+        );
+        return base;
+      }
+    })();
+    return this.effectiveCardPromise;
+  }
+
   private connect(): void {
     if (this.stopped) return;
     const ws = new WebSocket(`${this.opts.serverUrl.replace(/\/$/, '')}/connect`);
     this.ws = ws;
 
     ws.on('open', () => {
-      console.log('[client] connected, sending hello');
-      this.send({
-        type: 'hello',
-        agentId: this.opts.agentId,
-        agentCard: this.opts.agentCard,
-        version: PROTOCOL_VERSION,
-        token: this.opts.token,
+      // The probe runs in parallel with the bridge TCP/WS handshake; by the
+      // time `open` fires it's usually already settled. Awaiting here means
+      // the bridge-server sees a card whose capabilities match what the
+      // backend can actually deliver. If the probe is still running (slow
+      // gateway handshake), `hello` is delayed by the difference — typically
+      // a few ms on a local loopback gateway.
+      this.resolveEffectiveCard().then((agentCard) => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        console.log('[client] connected, sending hello');
+        this.send({
+          type: 'hello',
+          agentId: this.opts.agentId,
+          agentCard,
+          version: PROTOCOL_VERSION,
+          token: this.opts.token,
+        });
       });
     });
 

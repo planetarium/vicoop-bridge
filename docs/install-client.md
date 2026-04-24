@@ -42,6 +42,13 @@ one-liner fetching a published `client-v*` bundle). Contrast with:
     scripting SIWE yourself.
 - For the OpenClaw backend specifically: an OpenClaw gateway running
   locally at `ws://127.0.0.1:18789` (override via `OPENCLAW_GATEWAY_URL`).
+  Streaming (per-message A2A artifact cadence) requires OpenClaw
+  **v2026.3.22 or newer** — the `sessions.messages.subscribe` RPC that
+  drives it was introduced in that release. On older gateways the client
+  probes at startup, logs a downgrade warning, and advertises
+  `capabilities.streaming: false` on its agent card so A2A callers don't
+  request `message/stream` against a backend that can't deliver it;
+  task execution still works via the terminal-artifact fallback.
 
 ## Step 1 — Install the client bundle
 
