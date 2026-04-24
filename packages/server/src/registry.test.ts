@@ -1,0 +1,237 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import type { WebSocket } from 'ws';
+import type { AgentCard } from '@vicoop-bridge/protocol';
+import { Registry } from './registry.js';
+
+// Minimal WebSocket stub — Registry only uses `.close()` on replacement and
+// equality (`existing.ws !== ws`) on unregister. Nothing else on the real ws
+// interface is exercised here.
+function makeWs(): WebSocket {
+  return { close: () => undefined } as unknown as WebSocket;
+}
+
+function makeCard(streaming: boolean): AgentCard {
+  return {
+    name: 'test',
+    description: 'test',
+    version: '0.0.0',
+    protocolVersion: '0.3.0',
+    capabilities: { streaming },
+    defaultInputModes: ['text/plain'],
+    defaultOutputModes: ['text/plain'],
+    skills: [{ id: 's1', name: 'skill', description: 'd', tags: [] }],
+  };
+}
+
+test('onAgentChange fires on first registration', () => {
+  const registry = new Registry();
+  const seen: string[] = [];
+  registry.onAgentChange((id) => seen.push(id));
+  const result = registry.registerAgent({
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerWallet: '0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws: makeWs(),
+    connectedAt: 0,
+  });
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(seen, ['a1']);
+});
+
+test('onAgentChange fires again when the same client reconnects with an updated card', () => {
+  // This is the fix's core guarantee: a client upgrading from streaming:false
+  // to streaming:true must trigger invalidation so consumers (e.g. the HTTP
+  // layer's cached JsonRpcTransportHandler) rebuild against the fresh card.
+  const registry = new Registry();
+  const seen: string[] = [];
+  registry.onAgentChange((id) => seen.push(id));
+  const base = {
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerWallet: '0x0',
+    allowedCallers: [],
+    connectedAt: 0,
+  };
+  registry.registerAgent({ ...base, agentCard: makeCard(false), ws: makeWs() });
+  registry.registerAgent({ ...base, agentCard: makeCard(true), ws: makeWs() });
+  assert.deepEqual(seen, ['a1', 'a1']);
+  // Current conn reflects the new card, confirming we're not just firing
+  // the notification — the registry state is actually advancing.
+  const current = registry.getAgent('a1');
+  assert.ok(current);
+  assert.equal(current.agentCard.capabilities?.streaming, true);
+});
+
+test('onAgentChange does NOT fire when registration is refused (different client owns the agentId)', () => {
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerWallet: '0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws: makeWs(),
+    connectedAt: 0,
+  });
+  const seen: string[] = [];
+  registry.onAgentChange((id) => seen.push(id));
+  const rejected = registry.registerAgent({
+    agentId: 'a1',
+    clientId: 'c2', // different client
+    ownerWallet: '0x0',
+    agentCard: makeCard(true),
+    allowedCallers: [],
+    ws: makeWs(),
+    connectedAt: 0,
+  });
+  assert.equal(rejected.ok, false);
+  // A rejected registration must not invalidate the incumbent's cached
+  // transport — it has not been replaced.
+  assert.deepEqual(seen, []);
+});
+
+test('onAgentChange fires on disconnect (unregister) so stale transports do not persist past a dead connection', () => {
+  const registry = new Registry();
+  const ws = makeWs();
+  registry.registerAgent({
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerWallet: '0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+  const seen: string[] = [];
+  registry.onAgentChange((id) => seen.push(id));
+  registry.unregisterAgent('a1', ws);
+  assert.deepEqual(seen, ['a1']);
+});
+
+test('onAgentChange does NOT fire on unregister if the ws does not match the current connection', () => {
+  // Defensive: a late-arriving close event from a superseded socket must not
+  // trigger invalidation of the new connection's cached transport.
+  const registry = new Registry();
+  const oldWs = makeWs();
+  registry.registerAgent({
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerWallet: '0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws: oldWs,
+    connectedAt: 0,
+  });
+  // New connection replaces the old one (fires once, as expected).
+  const newWs = makeWs();
+  registry.registerAgent({
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerWallet: '0x0',
+    agentCard: makeCard(true),
+    allowedCallers: [],
+    ws: newWs,
+    connectedAt: 0,
+  });
+  const seen: string[] = [];
+  registry.onAgentChange((id) => seen.push(id));
+  // Late unregister from the *old* ws — should be a no-op.
+  registry.unregisterAgent('a1', oldWs);
+  assert.deepEqual(seen, []);
+  // Registry still holds the new connection.
+  const current = registry.getAgent('a1');
+  assert.ok(current, 'agent should still be registered');
+  assert.equal(current.agentCard.capabilities?.streaming, true);
+});
+
+test('a throwing onAgentChange listener does not abort other listeners or the registerAgent call', (t) => {
+  // The change notification runs inside registerAgent/unregisterAgent. A bad
+  // listener must not corrupt the caller's control flow or prevent
+  // subsequent listeners from receiving the event.
+  //
+  // Use the test runner's scoped mock so parallel tests that also touch
+  // console.log don't race with this stub — node:test auto-restores the
+  // original at test teardown, removing the need for a manual try/finally
+  // and the "what if the test body throws before finally" window.
+  const logs: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => {
+    logs.push(args.map(String).join(' '));
+  });
+  const registry = new Registry();
+  const seen: string[] = [];
+  registry.onAgentChange(() => {
+    throw new Error('listener boom');
+  });
+  registry.onAgentChange((id) => seen.push(id));
+  const result = registry.registerAgent({
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerWallet: '0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws: makeWs(),
+    connectedAt: 0,
+  });
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(seen, ['a1']);
+  // Error is emitted as a structured logEvent() JSON line — assert on both
+  // the event name and the embedded error text so we catch regressions
+  // where the event is renamed or the error is dropped.
+  const errorLine = logs.find(
+    (l) => l.includes('registry_agent_listener_error') && l.includes('listener boom'),
+  );
+  assert.ok(errorLine, `expected structured error log, got: ${logs.join(' | ')}`);
+});
+
+test('notifyAgentChange log cannot be hijacked by newline injection via agentId', (t) => {
+  // agentId originates from the client's hello frame and is an
+  // unconstrained string at this layer. A malicious client sending
+  // "a\nfake-log-line" as its agentId must not be able to synthesize
+  // a second line in operator logs. logEvent() serializes via
+  // JSON.stringify which escapes newlines; this test locks that
+  // invariant in place so a future switch back to a raw
+  // console.error(`...${agentId}...`) template-string regresses loudly.
+  const logs: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => {
+    logs.push(args.map(String).join(' '));
+  });
+  const registry = new Registry();
+  registry.onAgentChange(() => {
+    throw new Error('boom');
+  });
+  registry.registerAgent({
+    agentId: 'good\nevent: fake_login\nextra: attacker-controlled',
+    clientId: 'c1',
+    ownerWallet: '0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws: makeWs(),
+    connectedAt: 0,
+  });
+  assert.equal(logs.length, 1, 'exactly one log line must be emitted');
+  // Raw newlines in the output would split into multiple lines when a
+  // downstream log aggregator processes them. JSON.stringify escapes
+  // them as `\n`, which survives as a single physical line.
+  assert.ok(!logs[0].includes('\n'), 'structured log must not contain raw newlines');
+  assert.ok(logs[0].includes('\\n'), 'newlines must be JSON-escaped');
+  // Parse the log and verify the attacker's pseudo-fields live *inside*
+  // the agentId string value, not as top-level fields of the JSON object.
+  // A raw console.error(`...${agentId}...`) would have smuggled a second
+  // "event: fake_login" line past a line-oriented log scanner; structured
+  // logging keeps it bottled up inside the quoted agentId string.
+  const parsed = JSON.parse(logs[0]) as Record<string, unknown>;
+  assert.equal(parsed.event, 'registry_agent_listener_error');
+  assert.equal(
+    typeof parsed.agentId === 'string' && (parsed.agentId as string).includes('fake_login'),
+    true,
+    'agentId value should retain the attacker input verbatim (escaped, not stripped)',
+  );
+  assert.equal(
+    parsed.fake_login,
+    undefined,
+    'attacker payload must not surface as a top-level JSON field',
+  );
+});
