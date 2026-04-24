@@ -11,6 +11,11 @@ import {
 } from './openclaw.js';
 import type { UpFrame, TaskAssignFrame } from '@vicoop-bridge/protocol';
 
+// Most tests don't exercise cancellation. Reusing one unaborted signal keeps
+// those call sites noise-free; cancel-specific tests build their own
+// AbortController and signal as needed.
+const NEVER: AbortSignal = new AbortController().signal;
+
 interface ReqFrame {
   type: 'req';
   id: string;
@@ -164,7 +169,7 @@ test('happy path: chat.send → final event → task completes', async () => {
   });
   try {
     const backend = createOpenclawBackend({ url: fake.url });
-    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f));
+    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), NEVER);
     const types = frames.map((f) => f.type);
     assert.deepEqual(types, ['task.status', 'task.artifact', 'task.complete']);
     const complete = frames.find((f) => f.type === 'task.complete');
@@ -212,8 +217,8 @@ test('concurrent first-connect: shares one WebSocket across parallel handle() ca
     const backend = createOpenclawBackend({ url: fake.url });
     const framesA: UpFrame[] = [];
     const framesB: UpFrame[] = [];
-    const pA = backend.handle(makeTask('tA', 'a'), (f) => framesA.push(f));
-    const pB = backend.handle(makeTask('tB', 'b'), (f) => framesB.push(f));
+    const pA = backend.handle(makeTask('tA', 'a'), (f) => framesA.push(f), NEVER);
+    const pB = backend.handle(makeTask('tB', 'b'), (f) => framesB.push(f), NEVER);
     // Give both handle() calls time to subscribe and reach the connect phase.
     await new Promise((r) => setTimeout(r, 30));
     assert.equal(fake.connections.length, 1, 'only one WebSocket should be accepted');
@@ -264,13 +269,13 @@ test('reconnect: after gateway close, next handle() opens a fresh WebSocket', as
   try {
     const backend = createOpenclawBackend({ url: fake.url });
     const framesA: UpFrame[] = [];
-    await backend.handle(makeTask('tA', 'a'), (f) => framesA.push(f));
+    await backend.handle(makeTask('tA', 'a'), (f) => framesA.push(f), NEVER);
     const sock0 = await fake.waitForConnection(0);
     await fake.closeSocket(sock0);
     // Let the client process the WebSocket close event.
     await new Promise((r) => setTimeout(r, 20));
     const framesB: UpFrame[] = [];
-    await backend.handle(makeTask('tB', 'b'), (f) => framesB.push(f));
+    await backend.handle(makeTask('tB', 'b'), (f) => framesB.push(f), NEVER);
     assert.equal(fake.connections.length, 2, 'a fresh WebSocket should be opened for the second task');
     assert.ok(framesA.find((f) => f.type === 'task.complete'));
     assert.ok(framesB.find((f) => f.type === 'task.complete'));
@@ -310,7 +315,7 @@ test('fast terminal event: final arrives on same socket read as ack and is still
   try {
     const backend = createOpenclawBackend({ url: fake.url });
     const frames: UpFrame[] = [];
-    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f));
+    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), NEVER);
     const complete = frames.find((f) => f.type === 'task.complete');
     assert.ok(complete, 'task should complete even with racing ack+final');
     assert.equal(complete!.status.state, 'completed');
@@ -338,7 +343,7 @@ test('task timeout: no terminal event triggers task_timeout failure', async () =
   try {
     const backend = createOpenclawBackend({ url: fake.url, taskTimeoutMs: 150 });
     const frames: UpFrame[] = [];
-    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f));
+    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), NEVER);
     const fail = frames.find((f) => f.type === 'task.fail');
     assert.ok(fail, 'task must fail on timeout');
     assert.equal(fail!.error.code, 'task_timeout');
@@ -347,7 +352,7 @@ test('task timeout: no terminal event triggers task_timeout failure', async () =
   }
 });
 
-test('cancel: issues chat.abort and lets aborted terminal event complete the task as canceled', async () => {
+test('cancel (post-ack): signal abort issues chat.abort and aborted event completes the task as canceled', async () => {
   let lastChatSendId: string | null = null;
   let activeSock: WebSocket | null = null;
   let activeRunId: string | null = null;
@@ -388,16 +393,150 @@ test('cancel: issues chat.abort and lets aborted terminal event complete the tas
   try {
     const backend = createOpenclawBackend({ url: fake.url });
     const frames: UpFrame[] = [];
+    const controller = new AbortController();
     const task = makeTask('t1', 'hi');
-    const pending = backend.handle(task, (f) => frames.push(f));
-    // Wait for the chat.send to land so cancel() can find runToTask.
+    const pending = backend.handle(task, (f) => frames.push(f), controller.signal);
+    // Wait for the chat.send to land so abort fires on a known runId.
     await new Promise((r) => setTimeout(r, 50));
     assert.ok(lastChatSendId && activeSock);
-    await backend.cancel(task.taskId);
+    controller.abort();
     await pending;
     const complete = frames.find((f) => f.type === 'task.complete');
     assert.ok(complete);
     assert.equal(complete!.status.state, 'canceled');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('cancel (pre-ack): signal abort before chat.send ack still fires chat.abort once runId is known', async () => {
+  // Gateway holds the chat.send ack so we can abort the signal first, then
+  // release the ack. The backend must remember the intent and issue
+  // chat.abort immediately after learning runId.
+  let heldChatSend: { sock: WebSocket; id: string; runId: string } | null = null;
+  let chatAbortSeen = false;
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        const runId = `run-${(req.params as { idempotencyKey: string }).idempotencyKey}`;
+        heldChatSend = { sock, id: req.id, runId };
+      }
+      if (req.method === 'chat.abort') {
+        chatAbortSeen = true;
+        sock.send(JSON.stringify({ type: 'res', id: req.id, ok: true, payload: {} }));
+        setImmediate(() => {
+          const runId = (req.params as { runId: string }).runId;
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId,
+                sessionKey: (req.params as { sessionKey: string }).sessionKey,
+                seq: 2,
+                state: 'aborted',
+              },
+            }),
+          );
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    const controller = new AbortController();
+    const task = makeTask('t1', 'hi');
+    const pending = backend.handle(task, (f) => frames.push(f), controller.signal);
+    // Wait for chat.send to reach the fake gateway (unacked), then abort.
+    for (let i = 0; i < 20 && !heldChatSend; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.ok(heldChatSend, 'chat.send should have reached the gateway');
+    controller.abort();
+    // Release the ack: this triggers the deferred chat.abort.
+    const held = heldChatSend!;
+    held.sock.send(
+      JSON.stringify({
+        type: 'res',
+        id: held.id,
+        ok: true,
+        payload: { runId: held.runId, status: 'started' },
+      }),
+    );
+    await pending;
+    assert.ok(chatAbortSeen, 'chat.abort must fire even though abort arrived before ack');
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete);
+    assert.equal(complete!.status.state, 'canceled');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('cancel (already aborted): signal aborted on entry emits canceled without touching the gateway', async () => {
+  let chatSendSeen = false;
+  const fake = await createFakeGateway({
+    onRequest: (_sock, req) => {
+      if (req.method === 'chat.send') chatSendSeen = true;
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const controller = new AbortController();
+    controller.abort();
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), controller.signal);
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete);
+    assert.equal(complete!.status.state, 'canceled');
+    // Give any accidental chat.send a chance to race in.
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(chatSendSeen, false, 'pre-aborted task must not hit chat.send');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('cancel: chat.abort failure surfaces as gateway_abort_failed instead of hanging', async () => {
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId: 'run-abortfail', status: 'started' },
+          }),
+        );
+      }
+      if (req.method === 'chat.abort') {
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: false,
+            error: { code: 'internal', message: 'abort machine broken' },
+          }),
+        );
+      }
+    },
+  });
+  try {
+    // Use a large task timeout so the test proves the failure fires via the
+    // abort-failed path, not via the generic task-timeout fallback.
+    const backend = createOpenclawBackend({ url: fake.url, taskTimeoutMs: 60_000 });
+    const controller = new AbortController();
+    const frames: UpFrame[] = [];
+    const pending = backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), controller.signal);
+    await new Promise((r) => setTimeout(r, 50));
+    controller.abort();
+    await pending;
+    const fail = frames.find((f) => f.type === 'task.fail');
+    assert.ok(fail, 'task must fail when chat.abort itself fails');
+    assert.equal(fail!.error.code, 'gateway_abort_failed');
+    assert.match(fail!.error.message, /abort machine broken/);
   } finally {
     await fake.close();
   }
@@ -416,7 +555,7 @@ test('gateway close before ack emits gateway_closed (not gateway_send_failed)', 
   try {
     const backend = createOpenclawBackend({ url: fake.url });
     const frames: UpFrame[] = [];
-    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f));
+    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), NEVER);
     const fail = frames.find((f) => f.type === 'task.fail');
     assert.ok(fail, 'task must fail');
     assert.equal(fail!.error.code, 'gateway_closed');
@@ -479,12 +618,12 @@ test('late duplicate chat event for finalized run is dropped, not buffered', asy
   try {
     const backend = createOpenclawBackend({ url: fake.url });
     const framesA: UpFrame[] = [];
-    await backend.handle(makeTask('tA', 'hi'), (f) => framesA.push(f));
+    await backend.handle(makeTask('tA', 'hi'), (f) => framesA.push(f), NEVER);
     assert.ok(framesA.find((f) => f.type === 'task.complete'));
     // Give the late duplicate time to arrive and be dropped.
     await new Promise((r) => setTimeout(r, 30));
     const framesB: UpFrame[] = [];
-    await backend.handle(makeTask('tB', 'hi'), (f) => framesB.push(f));
+    await backend.handle(makeTask('tB', 'hi'), (f) => framesB.push(f), NEVER);
     assert.ok(framesB.find((f) => f.type === 'task.complete'));
   } finally {
     await fake.close();
@@ -501,10 +640,10 @@ test('invalid URL: WebSocket constructor throwing does not wedge ensureConnected
   });
   const framesA: UpFrame[] = [];
   const framesB: UpFrame[] = [];
-  await backend.handle(makeTask('tA', 'a'), (f) => framesA.push(f));
+  await backend.handle(makeTask('tA', 'a'), (f) => framesA.push(f), NEVER);
   // Second call must not hang — it should re-enter ensureConnected() cleanly
   // and fail the same way.
-  await backend.handle(makeTask('tB', 'b'), (f) => framesB.push(f));
+  await backend.handle(makeTask('tB', 'b'), (f) => framesB.push(f), NEVER);
   const failA = framesA.find((f) => f.type === 'task.fail');
   const failB = framesB.find((f) => f.type === 'task.fail');
   assert.ok(failA && failA.error.code === 'gateway_closed');
@@ -520,7 +659,7 @@ test('handshake timeout: gateway accepts TCP but never completes handshake', asy
   try {
     const backend = createOpenclawBackend({ url: fake.url, handshakeTimeoutMs: 100 });
     const frames: UpFrame[] = [];
-    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f));
+    await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), NEVER);
     const fail = frames.find((f) => f.type === 'task.fail');
     assert.ok(fail, 'task must fail when handshake never completes');
     assert.equal(fail!.error.code, 'gateway_closed');
@@ -570,7 +709,7 @@ test('invalid taskTimeoutMs falls back to default instead of firing immediately'
       // Invalid timeout — must not cause the task to time out immediately.
       const backend = createOpenclawBackend({ url: fake.url, taskTimeoutMs: 0 });
       const frames: UpFrame[] = [];
-      await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f));
+      await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), NEVER);
       assert.ok(frames.find((f) => f.type === 'task.complete'));
       assert.ok(warnings.some((w) => w.includes('invalid taskTimeoutMs')));
     } finally {
@@ -600,7 +739,7 @@ test('gateway close mid-run fails in-flight task deterministically', async () =>
   try {
     const backend = createOpenclawBackend({ url: fake.url });
     const frames: UpFrame[] = [];
-    const pending = backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f));
+    const pending = backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), NEVER);
     // Wait for the ack to arrive and handle() to register runToTask/finalizer.
     await new Promise((r) => setTimeout(r, 50));
     const sock = await fake.waitForConnection(0);
@@ -708,7 +847,7 @@ test('discovery fallback: when primary URL is dead and no candidates match, orig
     discoverGatewayUrls: async () => [],
   });
   const frames: UpFrame[] = [];
-  await backend.handle(makeTask('t-disc', 'hi'), (f) => frames.push(f));
+  await backend.handle(makeTask('t-disc', 'hi'), (f) => frames.push(f), NEVER);
   const fail = frames.find((f) => f.type === 'task.fail');
   assert.ok(fail, 'task must fail when no gateway is reachable');
   assert.equal(fail!.error.code, 'gateway_closed');
@@ -757,7 +896,7 @@ test('discovery fallback: primary URL dead, discovered candidate completes hands
       },
     });
     const frames: UpFrame[] = [];
-    await backend.handle(makeTask('td1', 'hi'), (f) => frames.push(f));
+    await backend.handle(makeTask('td1', 'hi'), (f) => frames.push(f), NEVER);
     const complete = frames.find((f) => f.type === 'task.complete');
     assert.ok(complete, 'task must complete via discovered URL');
     assert.equal(complete!.status.state, 'completed');
@@ -771,7 +910,7 @@ test('discovery fallback: primary URL dead, discovered candidate completes hands
     // Let the client process the WebSocket close event.
     await new Promise((r) => setTimeout(r, 20));
     const frames2: UpFrame[] = [];
-    await backend.handle(makeTask('td2', 'hi2'), (f) => frames2.push(f));
+    await backend.handle(makeTask('td2', 'hi2'), (f) => frames2.push(f), NEVER);
     const complete2 = frames2.find((f) => f.type === 'task.complete');
     assert.ok(complete2, 'second task must complete on reconnect');
     assert.equal(discoverCalls, 1, 'discover must not re-run when primary (discovered) URL works');
@@ -791,7 +930,7 @@ test('discovery: when all candidates fail, the original primary connect error is
     discoverGatewayUrls: async () => ['ws://127.0.0.1:2', 'ws://127.0.0.1:3'],
   });
   const frames: UpFrame[] = [];
-  await backend.handle(makeTask('t-allfail', 'hi'), (f) => frames.push(f));
+  await backend.handle(makeTask('t-allfail', 'hi'), (f) => frames.push(f), NEVER);
   const fail = frames.find((f) => f.type === 'task.fail');
   assert.ok(fail);
   assert.equal(fail!.error.code, 'gateway_closed');
@@ -813,7 +952,7 @@ test('discovery errors are swallowed so the primary connect failure still propag
     },
   });
   const frames: UpFrame[] = [];
-  await backend.handle(makeTask('t-boom', 'hi'), (f) => frames.push(f));
+  await backend.handle(makeTask('t-boom', 'hi'), (f) => frames.push(f), NEVER);
   const fail = frames.find((f) => f.type === 'task.fail');
   assert.ok(fail, 'task must fail even when discovery itself throws');
   assert.equal(fail!.error.code, 'gateway_closed');
@@ -840,7 +979,7 @@ test('discovery error logging is defensive against non-Error rejections', async 
     }) as () => Promise<string[]>,
   });
   const frames: UpFrame[] = [];
-  await backend.handle(makeTask('t-null', 'hi'), (f) => frames.push(f));
+  await backend.handle(makeTask('t-null', 'hi'), (f) => frames.push(f), NEVER);
   const fail = frames.find((f) => f.type === 'task.fail');
   assert.ok(fail, 'task must fail, not hang, on a null discovery rejection');
   assert.equal(fail!.error.code, 'gateway_closed');
@@ -859,7 +998,7 @@ test('discovery runs when configured URL uses a wildcard bind address (0.0.0.0 /
     },
   });
   const frames: UpFrame[] = [];
-  await backend.handle(makeTask('t-wild', 'hi'), (f) => frames.push(f));
+  await backend.handle(makeTask('t-wild', 'hi'), (f) => frames.push(f), NEVER);
   assert.equal(discoverCalls, 1, 'discover must run for wildcard bind URLs');
   const fail = frames.find((f) => f.type === 'task.fail');
   assert.ok(fail);
@@ -880,7 +1019,7 @@ test('discovery skipped when configured URL is remote (non-loopback)', async () 
     },
   });
   const frames: UpFrame[] = [];
-  await backend.handle(makeTask('t-remote', 'hi'), (f) => frames.push(f));
+  await backend.handle(makeTask('t-remote', 'hi'), (f) => frames.push(f), NEVER);
   const fail = frames.find((f) => f.type === 'task.fail');
   assert.ok(fail, 'task must fail when remote gateway is unreachable');
   assert.equal(fail!.error.code, 'gateway_closed');
