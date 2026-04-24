@@ -88,7 +88,12 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
 
   const newDir = `${installDir}.new`;
   const prevDir = `${installDir}.prev`;
-  rmSync(newDir, { recursive: true, force: true });
+  try {
+    rmSync(newDir, { recursive: true, force: true });
+  } catch (e) {
+    err(`could not clean up stale ${newDir}: ${(e as Error).message}`);
+    return 1;
+  }
 
   const dlDir = mkdtempSync(join(tmpdir(), 'vicoop-upgrade-'));
 
@@ -153,7 +158,12 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
       // Atomic swap. Both renames inside a guarded block so any failure
       // restores the original install dir; the outer `finally` still deletes
       // `.new` since `swapDone` stays false.
-      rmSync(prevDir, { recursive: true, force: true });
+      try {
+        rmSync(prevDir, { recursive: true, force: true });
+      } catch (e) {
+        err(`could not clear existing ${prevDir}: ${(e as Error).message}`);
+        return 1;
+      }
       let movedOriginal = false;
       try {
         log(`swap: ${installDir} -> ${prevDir}`);
@@ -177,12 +187,15 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
       err(`upgrade failed: ${(e as Error).message}`);
       return 1;
     } finally {
-      if (!swapDone) {
-        rmSync(newDir, { recursive: true, force: true });
-      }
+      // Cleanup paths must not mask the operation's real exit code. `rmSync`
+      // with `force: true` silences ENOENT but still throws on EACCES /
+      // EPERM / EBUSY, so a finally-block rmSync can turn a clean failure
+      // (or a clean success) into an uncaught exception. Downgrade to a
+      // warning instead.
+      if (!swapDone) safeRemove(newDir);
     }
   } finally {
-    rmSync(dlDir, { recursive: true, force: true });
+    safeRemove(dlDir);
   }
 
   const unit = detectSystemdUnit();
@@ -345,6 +358,14 @@ function tryRestartSystemd(scope: 'system' | 'user'): boolean {
     : ['try-restart', 'vicoop-client.service'];
   const r = spawnSync('systemctl', args, { stdio: 'inherit' });
   return r.status === 0;
+}
+
+function safeRemove(path: string): void {
+  try {
+    rmSync(path, { recursive: true, force: true });
+  } catch (e) {
+    log(`warning: failed to clean up ${path}: ${(e as Error).message}`);
+  }
 }
 
 function canWrite(path: string): boolean {
