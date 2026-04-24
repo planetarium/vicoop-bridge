@@ -385,6 +385,9 @@ if [ -n "$SERVICE_INSTALLED" ]; then
        $SERVICE_RELOAD_CMD
        $SERVICE_ENABLE_CMD
 
+  Future updates: run \`$INSTALL_DIR/bin/vicoop-client upgrade\` — no need to
+  re-run this installer. Pass --check to see if a newer release is available.
+
 EOF
   if [ "$SERVICE_INSTALLED" = "user" ]; then
     cat <<'EOF'
@@ -411,6 +414,9 @@ else
 
      For persistent operation, see docs/install-client.md §6
      (launchd on macOS, systemd user unit, tmux).
+
+  Future updates: run \`$INSTALL_DIR/bin/vicoop-client upgrade\` — no need to
+  re-run this installer. Pass --check to see if a newer release is available.
 
 EOF
 fi

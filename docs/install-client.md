@@ -423,6 +423,51 @@ Using `set -a` + `.` keeps secrets out of the process-listing line and
 tolerates quoted values / comment lines in the env file, which the
 `env $(xargs)` pattern does not.
 
+## Updating the client
+
+Once installed, the client updates itself — do not re-run `install.sh`. The
+installer's `FORCE=1` path is destructive (it `rm -rf`s `$INSTALL_DIR` and
+wipes any operator-added cards / files), so it's reserved for bootstrapping.
+
+```sh
+"$INSTALL_DIR/bin/vicoop-client" upgrade --check      # report latest vs current
+"$INSTALL_DIR/bin/vicoop-client" upgrade              # upgrade to latest client-v*
+"$INSTALL_DIR/bin/vicoop-client" upgrade --version client-v0.2.0   # pin / downgrade
+"$INSTALL_DIR/bin/vicoop-client" upgrade --force      # reinstall current version
+```
+
+The upgrade command:
+
+1. Queries GitHub releases for the latest `client-v*` tag (or the `--version`
+   you pin).
+2. Downloads `.tgz` + `.sha256` to a temp directory and verifies the checksum.
+3. Extracts into `$INSTALL_DIR.new/` (sibling of the current install).
+4. Copies operator files that don't ship with the bundle — notably any
+   `cards/*.json` you added or files placed directly under `$INSTALL_DIR`.
+   Shipped cards (`openclaw.json`, `echo.json`, `claude.json`) are always
+   replaced with the new release's versions.
+5. Runs `node $INSTALL_DIR.new/dist/cli.js --version` as a healthcheck. If it
+   exits non-zero or reports the wrong version, `$INSTALL_DIR.new` is deleted
+   and the upgrade aborts with no change to the live install.
+6. Atomically swaps: `$INSTALL_DIR` → `$INSTALL_DIR.prev`,
+   `$INSTALL_DIR.new` → `$INSTALL_DIR`. A failure mid-swap restores the
+   original.
+7. Detects a matching `vicoop-client.service` unit (system or user scope) and
+   runs `systemctl [--user] try-restart vicoop-client.service`. If no unit
+   exists, prints a reminder to restart the client yourself.
+8. Keeps `$INSTALL_DIR.prev` around for manual rollback (`mv` it back into
+   place if needed). Delete it once you've confirmed the new version works.
+
+**Permissions**: for a system-scope install (root-owned `$INSTALL_DIR`),
+run the upgrade via `sudo`. The command checks write access up front and
+fails fast with a clear error otherwise.
+
+**`/etc/vicoop-client.env` and the systemd unit file are not touched.** Those
+belong to `install.sh`; if a release ever changes the unit layout, re-run
+`install.sh` once to refresh the scaffolding. Note that `FORCE=1` deletes
+everything under `$INSTALL_DIR` first — back up any operator-added cards or
+files before running it.
+
 ## Troubleshooting
 
 - **`agent id owned by a different wallet`** (WS register) — your wallet is

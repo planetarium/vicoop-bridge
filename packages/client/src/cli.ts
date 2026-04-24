@@ -6,6 +6,8 @@ import { echoBackend } from './backends/echo.js';
 import { createOpenclawBackend } from './backends/openclaw.js';
 import { createClaudeBackend } from './backends/claude.js';
 import type { Backend } from './backend.js';
+import { clientVersion } from './version.js';
+import { runUpgrade } from './upgrade.js';
 
 interface Args {
   server: string;
@@ -15,8 +17,7 @@ interface Args {
   backend: string;
 }
 
-function parseArgs(): Args {
-  const argv = process.argv.slice(2);
+function parseClientArgs(argv: string[]): Args {
   const out: Partial<Args> = {};
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i];
@@ -56,24 +57,80 @@ function pickBackend(name: string): Backend {
   }
 }
 
-const args = parseArgs();
-const cardJson = JSON.parse(readFileSync(args.card, 'utf8'));
-const agentCard = AgentCard.parse(cardJson);
+function runClient(argv: string[]): void {
+  const args = parseClientArgs(argv);
+  const cardJson = JSON.parse(readFileSync(args.card, 'utf8'));
+  const agentCard = AgentCard.parse(cardJson);
 
-const client = new Client({
-  serverUrl: args.server,
-  token: args.token,
-  agentId: args.agentId,
-  agentCard,
-  backend: pickBackend(args.backend),
+  const client = new Client({
+    serverUrl: args.server,
+    token: args.token,
+    agentId: args.agentId,
+    agentCard,
+    backend: pickBackend(args.backend),
+  });
+
+  client.start();
+
+  const shutdown = () => {
+    console.log('\n[client] shutting down');
+    client.stop();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
+async function runUpgradeCmd(args: string[]): Promise<number> {
+  let check = false;
+  let force = false;
+  let version: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--check') check = true;
+    else if (a === '--force') force = true;
+    else if (a === '--version') {
+      version = args[++i];
+      if (!version) {
+        console.error('--version requires a value (e.g. client-v0.3.0)');
+        return 1;
+      }
+    } else if (a === '-h' || a === '--help') {
+      console.log('usage: vicoop-client upgrade [--check] [--force] [--version <client-vX.Y.Z>]');
+      return 0;
+    } else {
+      console.error(`unknown argument to upgrade: ${a}`);
+      return 1;
+    }
+  }
+  try {
+    return await runUpgrade({ check, force, version });
+  } catch (e) {
+    console.error(`upgrade failed: ${(e as Error).message}`);
+    return 1;
+  }
+}
+
+async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+
+  // Top-level --version / -v: print and exit before touching anything else.
+  // Also used by the upgrade path's healthcheck on a freshly extracted bundle.
+  if (argv[0] === '--version' || argv[0] === '-v') {
+    process.stdout.write(`${clientVersion}\n`);
+    process.exit(0);
+  }
+
+  if (argv[0] === 'upgrade') {
+    process.exit(await runUpgradeCmd(argv.slice(1)));
+  }
+
+  // Default path: long-running daemon. Do not exit — client.start() keeps the
+  // event loop alive and signal handlers will call process.exit on shutdown.
+  runClient(argv);
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
 });
-
-client.start();
-
-const shutdown = () => {
-  console.log('\n[client] shutting down');
-  client.stop();
-  process.exit(0);
-};
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
