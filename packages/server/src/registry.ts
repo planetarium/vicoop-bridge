@@ -21,11 +21,20 @@ export interface TaskBinding {
 }
 
 export type CallerChangeListener = (agentId: string, callers: string[]) => void;
+// Fires whenever the agent connection (including its embedded agentCard) is
+// replaced or removed. Downstream consumers that cache objects derived from
+// the card — e.g. the HTTP layer's per-agent JsonRpcTransportHandler, which
+// captures `capabilities.streaming` at construction time — must evict on
+// this signal, otherwise a client that reconnects with an updated card
+// (say, `streaming: false` → `true`) will continue to be served by a
+// transport built against the old card until the server restarts.
+export type AgentChangeListener = (agentId: string) => void;
 
 export class Registry {
   private agents = new Map<string, ClientConnection>();
   private bindings = new Map<string, TaskBinding>();
   private callerChangeListeners: CallerChangeListener[] = [];
+  private agentChangeListeners: AgentChangeListener[] = [];
 
   registerAgent(conn: ClientConnection): { ok: true } | { ok: false; reason: string } {
     const existing = this.agents.get(conn.agentId);
@@ -33,11 +42,13 @@ export class Registry {
       if (existing.clientId === conn.clientId) {
         existing.ws.close(4009, 'replaced by new connection');
         this.agents.set(conn.agentId, conn);
+        this.notifyAgentChange(conn.agentId);
         return { ok: true };
       }
       return { ok: false, reason: 'agent already registered by different client' };
     }
     this.agents.set(conn.agentId, conn);
+    this.notifyAgentChange(conn.agentId);
     return { ok: true };
   }
 
@@ -45,6 +56,7 @@ export class Registry {
     const existing = this.agents.get(agentId);
     if (!existing || existing.ws !== ws) return;
     this.agents.delete(agentId);
+    this.notifyAgentChange(agentId);
     for (const binding of [...this.bindings.values()]) {
       if (binding.agentId !== agentId) continue;
       binding.eventBus.publish({
@@ -94,11 +106,27 @@ export class Registry {
     this.callerChangeListeners.push(listener);
   }
 
+  onAgentChange(listener: AgentChangeListener): void {
+    this.agentChangeListeners.push(listener);
+  }
+
   updateAllowedCallers(agentId: string, callers: string[]): void {
     const conn = this.agents.get(agentId);
     if (conn) conn.allowedCallers = callers;
     for (const listener of this.callerChangeListeners) {
       listener(agentId, callers);
+    }
+  }
+
+  private notifyAgentChange(agentId: string): void {
+    for (const listener of this.agentChangeListeners) {
+      try {
+        listener(agentId);
+      } catch (err) {
+        // A misbehaving listener must not abort further notifications or
+        // corrupt the register/unregister call site. Log and continue.
+        console.error('[registry] agent change listener threw:', (err as Error).message);
+      }
     }
   }
 

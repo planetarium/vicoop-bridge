@@ -144,6 +144,19 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   opts.registry.onCallerChange((agentId) => {
     transports.delete(agentId);
   });
+  // Also invalidate on (re)registration or disconnect. The SDK's
+  // DefaultRequestHandler captures the agent card at construction time —
+  // including `capabilities.streaming` — so a client that reconnects with
+  // an updated card would otherwise be served by a stale transport that
+  // still advertises the old capabilities. Concrete failure mode: after a
+  // client upgrades from streaming:false → streaming:true, `message/stream`
+  // requests are rejected with `unsupportedOperation` even though the
+  // public `/.well-known/agent-card.json` reports `streaming:true` (that
+  // endpoint reads `conn.agentCard` on every request, while the transport
+  // captures a snapshot).
+  opts.registry.onAgentChange((agentId) => {
+    transports.delete(agentId);
+  });
 
   async function handleTransportResult(result: unknown, c: Context) {
     if (Symbol.asyncIterator in (result as object)) {
