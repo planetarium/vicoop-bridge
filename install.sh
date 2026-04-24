@@ -199,6 +199,17 @@ install_service() {
       # dependency only for system scope.
       net_deps='After=network-online.target
 Wants=network-online.target'
+      # The client has no privileged operations, so drop root for system
+      # scope. DynamicUser allocates a transient UID; EnvironmentFile is
+      # read before the user switch so /etc/vicoop-client.env can stay
+      # root-owned 0600. NoNewPrivileges/ProtectSystem/ProtectHome/PrivateTmp
+      # are cheap defense-in-depth. User-scope units inherit the caller's
+      # identity and don't need (or accept) these knobs.
+      unit_hardening='DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes'
       # Root running the installer (the auto-detected system path) gets an
       # un-prefixed command; sudo is only suggested for later reinvocations by
       # a non-root operator. Minimal images often lack sudo entirely.
@@ -219,6 +230,9 @@ Wants=network-online.target'
       # User-instance systemd doesn't know about network-online.target;
       # declaring it produces "unit not found" noise and buys nothing.
       net_deps=''
+      # NoNewPrivileges is safe to apply in --user scope; the heavier
+      # ProtectSystem / DynamicUser family is system-scope only.
+      unit_hardening='NoNewPrivileges=yes'
       SERVICE_RELOAD_CMD="systemctl --user daemon-reload"
       SERVICE_ENABLE_CMD="systemctl --user enable --now vicoop-client"
       ;;
@@ -260,6 +274,7 @@ EnvironmentFile=$env_ref
 ExecStart=$node_bin $cli_entry
 Restart=on-failure
 RestartSec=5s
+$unit_hardening
 
 [Install]
 WantedBy=$want
@@ -270,6 +285,7 @@ UNIT
     # Write the env template with restrictive perms *before* content lands,
     # in case the file survives a later failure.
     ( umask 077 && : > "$env_file" )
+    env_fresh=1
     cat > "$env_file" <<ENVF
 # vicoop-client environment — populated by the agent/operator after install.
 # Restrict perms (chmod 600) if this file is ever copied elsewhere.
@@ -300,7 +316,30 @@ BACKEND=openclaw
 ENVF
     env_created="new"
   else
+    env_fresh=0
     env_created="kept"
+  fi
+
+  # Always enforce 0600 — an existing env file may have been copied in with
+  # permissive perms, and SERVER_TOKEN being world-readable is the worst
+  # failure mode we could leave behind.
+  chmod 600 "$env_file" 2>/dev/null || log "warning: could not chmod 600 $env_file"
+
+  # Warn if a kept env file's AGENT_CARD still points at a different
+  # install root than the one we just extracted into. We don't rewrite —
+  # the operator may have intentionally pointed at a different card — but
+  # an invisible stale pointer after \`INSTALL_DIR=\` reinstalls is worse
+  # than a noisy log line.
+  if [ "$env_fresh" = "0" ]; then
+    prev_card="$(sed -n 's/^[[:space:]]*AGENT_CARD=\(.*\)/\1/p' "$env_file" | tail -n1 | sed -E 's/^"//; s/"$//')"
+    new_card="$INSTALL_DIR/cards/openclaw.json"
+    if [ -n "$prev_card" ] && [ "$prev_card" != "$new_card" ]; then
+      case "$prev_card" in
+        */cards/openclaw.json)
+          log "warning: $env_file has AGENT_CARD=$prev_card but INSTALL_DIR is now $INSTALL_DIR — update the env file if that pointer is stale"
+          ;;
+      esac
+    fi
   fi
 
   SERVICE_INSTALLED="$scope"
