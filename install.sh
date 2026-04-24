@@ -17,9 +17,10 @@
 #   3. Downloads the .tgz + .sha256 and verifies integrity.
 #   4. Extracts the bundle into INSTALL_DIR.
 #   5. On systemd hosts, drops a vicoop-client.service unit + env template
-#      (does NOT enable/start — the owner must populate env first).
-#   6. Prints next-step instructions. Does NOT write a card.json
-#      (the agent that owns this client is expected to generate and place card.json).
+#      (does NOT enable/start — the owner must populate env first). The
+#      shipped bundle already contains cards/openclaw.json, so the env
+#      template points AGENT_CARD at that file by default.
+#   6. Prints next-step instructions (populate env, reload, enable).
 
 set -eu
 
@@ -205,6 +206,18 @@ install_service() {
     *) return ;;
   esac
 
+  # systemd's ExecStart tokenises on whitespace and EnvironmentFile doesn't
+  # cleanly round-trip paths with spaces either. Rather than hand-roll the
+  # quoting rules, refuse to register and let the operator pick a clean path.
+  for p in "$node_bin" "$cli_entry" "$unit_dir" "$env_file"; do
+    case "$p" in
+      *[[:space:]]*)
+        log "warning: path contains whitespace ('$p') — skipping service registration, run the client manually or reinstall under a space-free path"
+        return
+        ;;
+    esac
+  done
+
   mkdir -p "$unit_dir"
   unit_path="$unit_dir/vicoop-client.service"
 
@@ -246,8 +259,10 @@ SERVER_TOKEN=
 AGENT_ID=
 
 # Absolute path to the agent card JSON (template ships at
-# $INSTALL_DIR/cards/openclaw.json).
-AGENT_CARD=$INSTALL_DIR/cards/openclaw.json
+# \$INSTALL_DIR/cards/openclaw.json). Double-quoted so systemd's
+# EnvironmentFile parser accepts the literal value if the path is ever
+# edited to contain spaces.
+AGENT_CARD="$INSTALL_DIR/cards/openclaw.json"
 
 # One of: echo, openclaw (more backends pending, see docs/design.md §5).
 BACKEND=openclaw
