@@ -298,7 +298,7 @@ class GatewayClient {
         client: {
           id: clientId,
           displayName: 'vicoop-bridge-client',
-          version: '0.2.0',
+          version: '0.3.0',
           platform: process.platform,
           mode: clientMode,
         },
