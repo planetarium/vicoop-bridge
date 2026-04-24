@@ -433,7 +433,7 @@ wipes any operator-added cards / files), so it's reserved for bootstrapping.
 "$INSTALL_DIR/bin/vicoop-client" upgrade --check      # report latest vs current
 "$INSTALL_DIR/bin/vicoop-client" upgrade              # upgrade to latest client-v*
 "$INSTALL_DIR/bin/vicoop-client" upgrade --version client-v0.2.0   # pin / downgrade
-"$INSTALL_DIR/bin/vicoop-client" upgrade --force      # reinstall current version
+"$INSTALL_DIR/bin/vicoop-client" upgrade --force      # reinstall the resolved target even if already on it
 ```
 
 The upgrade command:

@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assertLooksLikeInstall, normalizeTag, parseChecksum, preserveOperatorFiles, sha256File } from './upgrade.js';
+import { assertLooksLikeInstall, normalizeTag, parseChecksum, preserveOperatorFiles, sha256File, stripSuidBits } from './upgrade.js';
+import { chmodSync, statSync } from 'node:fs';
 
 test('normalizeTag accepts full tag, bare version, and v-prefixed version', () => {
   assert.equal(normalizeTag('client-v0.3.0'), 'client-v0.3.0');
@@ -153,6 +154,42 @@ test('assertLooksLikeInstall rejects bundles with wrong package name', () => {
     writeFileSync(join(dir, 'dist', 'cli.js'), '// stub');
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'some-other-package', version: '0.3.0' }));
     assert.throws(() => assertLooksLikeInstall(dir), /unexpected name/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('stripSuidBits clears setuid and setgid bits while leaving other modes untouched', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-suid-'));
+  try {
+    const plain = join(dir, 'plain');
+    const suid = join(dir, 'suid');
+    const sgid = join(dir, 'sgid');
+    const both = join(dir, 'both');
+    const nestedDir = join(dir, 'nested');
+    const nested = join(nestedDir, 'binary');
+    mkdirSync(nestedDir);
+    writeFileSync(plain, '');
+    writeFileSync(suid, '');
+    writeFileSync(sgid, '');
+    writeFileSync(both, '');
+    writeFileSync(nested, '');
+
+    chmodSync(plain, 0o755);
+    chmodSync(suid, 0o4755);
+    chmodSync(sgid, 0o2755);
+    chmodSync(both, 0o6755);
+    chmodSync(nested, 0o4750);
+
+    stripSuidBits(dir);
+
+    // Mask to the low 12 bits so platform-added type bits don't interfere.
+    const mode = (p: string) => statSync(p).mode & 0o7777;
+    assert.equal(mode(plain), 0o755, 'plain file unchanged');
+    assert.equal(mode(suid), 0o755, 'setuid cleared');
+    assert.equal(mode(sgid), 0o755, 'setgid cleared');
+    assert.equal(mode(both), 0o755, 'both cleared');
+    assert.equal(mode(nested), 0o750, 'recurses into subdirectories');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import {
   accessSync,
   constants as fsConstants,
+  chmodSync,
   cpSync,
   createReadStream,
   createWriteStream,
@@ -13,6 +14,7 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -175,11 +177,24 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
       // the release) would otherwise end up owning a root-run service's
       // files. That's a privilege-escalation vector: any local user with
       // that uid could modify `dist/cli.js` between restarts.
+      //
+      // Under root we also strip setuid/setgid bits that tar may have
+      // restored from the archive. After the chown above, any such bits
+      // would become root-owned suid files under $INSTALL_DIR — much worse
+      // than the build-host-uid case. The archive has no setuid bits today;
+      // this is a defense-in-depth invariant so we don't silently start
+      // shipping a privileged binary if someone adds one.
       if (process.getuid?.() === 0) {
         const chownRes = spawnSync('chown', ['-R', '0:0', newDir], { stdio: 'inherit' });
         if (chownRes.error || chownRes.signal || chownRes.status !== 0) {
           const detail = chownRes.error?.message ?? `signal ${chownRes.signal ?? 'none'}, status ${chownRes.status}`;
           err(`chown -R 0:0 on ${newDir} failed (${detail}) — refusing to leave root-extracted files with non-root ownership`);
+          return 1;
+        }
+        try {
+          stripSuidBits(newDir);
+        } catch (e) {
+          err(`failed to strip setuid/setgid bits under ${newDir}: ${(e as Error).message}`);
           return 1;
         }
       }
@@ -454,6 +469,20 @@ function tryRestartSystemd(scope: 'system' | 'user'): boolean {
     return false;
   }
   return true;
+}
+
+// Recursively clear the setuid (04000) and setgid (02000) bits on every file
+// under `dir`. Exported for tests.
+export function stripSuidBits(dir: string): void {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      stripSuidBits(p);
+    } else if (entry.isFile()) {
+      const mode = statSync(p).mode;
+      if (mode & 0o6000) chmodSync(p, mode & ~0o6000);
+    }
+  }
 }
 
 function safeRemove(path: string): void {
