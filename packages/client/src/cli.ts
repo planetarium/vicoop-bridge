@@ -51,7 +51,9 @@ function pickBackend(name: string): Backend {
     case 'openclaw':
       return createOpenclawBackend();
     case 'claude':
-      return createClaudeBackend();
+      return createClaudeBackend({
+        cwd: process.env.CLAUDE_CWD?.trim() || undefined,
+      });
     default:
       throw new Error(`unknown backend: ${name} (supported: echo, openclaw, claude)`);
   }

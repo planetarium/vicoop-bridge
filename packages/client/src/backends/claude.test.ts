@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createClaudeBackend, type ClaudeChildHandle } from './claude.js';
+import { createClaudeBackend, type ClaudeChildHandle, type ClaudeSpawnOptions } from './claude.js';
 import type { TaskAssignFrame, UpFrame } from '@vicoop-bridge/protocol';
 
 const NEVER: AbortSignal = new AbortController().signal;
@@ -9,6 +9,7 @@ const NEVER: AbortSignal = new AbortController().signal;
 interface FakeChild extends ClaudeChildHandle {
   readonly command: string;
   readonly args: readonly string[];
+  readonly cwd?: string;
   killed: boolean;
   killSignal: NodeJS.Signals | null;
   emitStdout(text: string): void;
@@ -17,14 +18,14 @@ interface FakeChild extends ClaudeChildHandle {
 }
 
 interface FakeSpawn {
-  spawn: (cmd: string, args: readonly string[]) => ClaudeChildHandle;
+  spawn: (cmd: string, args: readonly string[], options: ClaudeSpawnOptions) => ClaudeChildHandle;
   lastChild: () => FakeChild | null;
 }
 
 function makeFakeSpawn(configure: (child: FakeChild) => void): FakeSpawn {
   let last: FakeChild | null = null;
   return {
-    spawn(command, args) {
+    spawn(command, args, options) {
       const stdoutEmitter = new EventEmitter();
       const stderrEmitter = new EventEmitter();
       const closeListeners: Array<(code: number | null, sig: NodeJS.Signals | null) => void> = [];
@@ -40,6 +41,7 @@ function makeFakeSpawn(configure: (child: FakeChild) => void): FakeSpawn {
       const child: FakeChild = {
         command,
         args,
+        cwd: options.cwd,
         stdout: mkStream(stdoutEmitter),
         stderr: mkStream(stderrEmitter),
         killed: false,
@@ -322,6 +324,23 @@ test('passes expected argv shape (prompt, session-id, stream-json, verbose, extr
   assert.equal(child.args.at(-1), 'sonnet');
 });
 
+test('passes configured cwd through to the Claude subprocess', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    cwd: '/tmp/claude-worktree',
+  });
+  await backend.handle(assign('hi'), collect().emit, NEVER);
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  assert.equal(child.cwd, '/tmp/claude-worktree');
+});
+
 test('reuses session via --resume on a second task with the same contextId', async () => {
   const fake = scriptedSpawn({
     lines: [JSON.stringify({ type: 'result', result: 'ok' })],
@@ -434,12 +453,12 @@ test('rolls back the session binding when spawn throws', async () => {
     exitCode: 0,
   });
   let throwOnce = true;
-  const wrappedSpawn = (cmd: string, args: readonly string[]) => {
+  const wrappedSpawn = (cmd: string, args: readonly string[], options: ClaudeSpawnOptions) => {
     if (throwOnce) {
       throwOnce = false;
       throw new Error('ENOENT: claude not found');
     }
-    return fake.spawn(cmd, args);
+    return fake.spawn(cmd, args, options);
   };
   const backend = createClaudeBackend({ spawn: wrappedSpawn });
   const ctx = 'ctx-rollback';
