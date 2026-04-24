@@ -1,16 +1,16 @@
 {
   "name": "openclaw",
-  "description": "General-purpose AI assistant. Can answer questions, browse the web, run shell commands, manage files, and operate tools its operator has granted.",
+  "description": "General-purpose AI assistant. Can answer questions, browse the web, run shell commands, manage files, and operate tools its operator has granted. Accepts text and inline image attachments.",
   "version": "0.0.1",
   "protocolVersion": "0.3.0",
   "capabilities": { "streaming": false },
-  "defaultInputModes": ["text/plain"],
+  "defaultInputModes": ["text/plain", "image/png", "image/jpeg", "image/gif", "image/webp"],
   "defaultOutputModes": ["text/plain"],
   "skills": [
     {
       "id": "chat",
       "name": "chat",
-      "description": "Ask a question or give an instruction in natural language; the agent responds with text.",
+      "description": "Ask a question or give an instruction in natural language; the agent responds with text. Optionally include inline image parts (file.bytes with image/* mimeType).",
       "tags": ["chat", "assistant"]
     }
   ]

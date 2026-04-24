@@ -316,6 +316,104 @@ class GatewayClient {
   }
 }
 
+// Map A2A message parts to OpenClaw's `chat.send` input shape
+// (`message` + `attachments`). The gateway accepts image attachments via
+// `{ type, mimeType, fileName, content }` where `content` is a base64
+// string; non-image MIME types are dropped with a warning inside OpenClaw,
+// and there is no native surface for structured data or remote URIs.
+//
+// Rather than silently drop non-text parts (the prior behavior), we reject
+// anything we can't represent so callers see a specific error code
+// instead of a lossy request.
+interface OpenclawChatInput {
+  message: string;
+  attachments: Array<{
+    type: 'image';
+    mimeType: string;
+    fileName?: string;
+    content: string;
+  }>;
+}
+
+interface PartMappingError {
+  code: string;
+  message: string;
+}
+
+function isImageMime(mime: string | undefined): mime is string {
+  return typeof mime === 'string' && mime.toLowerCase().startsWith('image/');
+}
+
+// Exported for unit testing; shape matches what `handle()` feeds into
+// `chat.send` (minus `sessionKey` / `idempotencyKey` / `thinking`).
+export function mapPartsToChatInput(
+  parts: Part[],
+): { ok: true; input: OpenclawChatInput } | { ok: false; error: PartMappingError } {
+  const textBits: string[] = [];
+  const attachments: OpenclawChatInput['attachments'] = [];
+  for (const [idx, p] of parts.entries()) {
+    if (p.kind === 'text') {
+      textBits.push(p.text);
+      continue;
+    }
+    if (p.kind === 'file') {
+      const f = p.file;
+      // uri requires fetching and may need caller auth — out of scope for
+      // this backend. Reject explicitly so callers know to inline bytes.
+      if (f.uri !== undefined) {
+        return {
+          ok: false,
+          error: {
+            code: 'unsupported_file_uri',
+            message: `part[${idx}]: file.uri is not supported by the openclaw backend; inline the file as base64 bytes instead`,
+          },
+        };
+      }
+      if (f.bytes === undefined) {
+        return {
+          ok: false,
+          error: {
+            code: 'invalid_file_part',
+            message: `part[${idx}]: file part must carry either bytes or uri`,
+          },
+        };
+      }
+      if (!isImageMime(f.mimeType)) {
+        return {
+          ok: false,
+          error: {
+            code: 'unsupported_file_mime',
+            message: `part[${idx}]: only image/* mimeTypes are supported by the openclaw backend (got ${f.mimeType ?? 'unset'})`,
+          },
+        };
+      }
+      attachments.push({
+        type: 'image',
+        mimeType: f.mimeType,
+        ...(f.name !== undefined ? { fileName: f.name } : {}),
+        content: f.bytes,
+      });
+      continue;
+    }
+    if (p.kind === 'data') {
+      return {
+        ok: false,
+        error: {
+          code: 'unsupported_data_part',
+          message: `part[${idx}]: data parts are not supported by the openclaw backend; serialize to a text part if the agent should see structured input`,
+        },
+      };
+    }
+  }
+  return {
+    ok: true,
+    input: {
+      message: textBits.join('\n').trim(),
+      attachments,
+    },
+  };
+}
+
 function extractFinalText(message: unknown): string {
   if (!message || typeof message !== 'object') return '';
   const m = message as Record<string, unknown>;
@@ -749,6 +847,19 @@ export function createOpenclawBackend(
         return;
       }
 
+      // Validate and normalize A2A parts BEFORE touching the gateway so
+      // malformed input fails fast without opening a WS or consuming a
+      // session slot.
+      const mapped = mapPartsToChatInput(task.message.parts);
+      if (!mapped.ok) {
+        emit({
+          type: 'task.fail',
+          taskId: task.taskId,
+          error: mapped.error,
+        });
+        return;
+      }
+
       let gw: GatewayClient;
       try {
         gw = await ensureConnected();
@@ -761,10 +872,7 @@ export function createOpenclawBackend(
         return;
       }
       const sessionKey = `${sessionPrefix}:${agent}:${task.contextId}`;
-      const text = task.message.parts
-        .map((p) => (p.kind === 'text' ? p.text : ''))
-        .join('\n')
-        .trim();
+      const { message: text, attachments } = mapped.input;
 
       emit({
         type: 'task.status',
@@ -853,6 +961,9 @@ export function createOpenclawBackend(
             sessionKey,
             message: text,
             idempotencyKey: task.taskId,
+            // Only include `attachments` when non-empty so the text-only
+            // happy path is unchanged on the wire.
+            ...(attachments.length > 0 ? { attachments } : {}),
             ...(thinking ? { thinking } : {}),
           });
         } catch (err) {

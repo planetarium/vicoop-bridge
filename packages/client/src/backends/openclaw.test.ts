@@ -6,6 +6,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 import {
   createOpenclawBackend,
   listenersToGatewayUrls,
+  mapPartsToChatInput,
   parseLsofListeningPorts,
   redactUrl,
 } from './openclaw.js';
@@ -809,6 +810,213 @@ test('gateway close mid-run fails in-flight task deterministically', async () =>
     const fail = frames.find((f) => f.type === 'task.fail');
     assert.ok(fail, 'task must fail after gateway close');
     assert.equal(fail!.error.code, 'gateway_closed');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('mapPartsToChatInput: text-only parts are joined with newline and carry no attachments', () => {
+  const result = mapPartsToChatInput([
+    { kind: 'text', text: 'first line' },
+    { kind: 'text', text: 'second line' },
+  ]);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.input.message, 'first line\nsecond line');
+  assert.deepEqual(result.input.attachments, []);
+});
+
+test('mapPartsToChatInput: file part with image bytes maps to an OpenClaw image attachment', () => {
+  const result = mapPartsToChatInput([
+    { kind: 'text', text: 'describe this' },
+    {
+      kind: 'file',
+      file: { name: 'cat.png', mimeType: 'image/png', bytes: 'AAAA' },
+    },
+  ]);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.input.message, 'describe this');
+  assert.deepEqual(result.input.attachments, [
+    { type: 'image', mimeType: 'image/png', fileName: 'cat.png', content: 'AAAA' },
+  ]);
+});
+
+test('mapPartsToChatInput: image file without a name omits fileName cleanly', () => {
+  const result = mapPartsToChatInput([
+    { kind: 'file', file: { mimeType: 'image/jpeg', bytes: 'BBBB' } },
+  ]);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.input.attachments.length, 1);
+  assert.equal(result.input.attachments[0].fileName, undefined);
+});
+
+test('mapPartsToChatInput: file.uri is rejected explicitly instead of silently dropped', () => {
+  const result = mapPartsToChatInput([
+    { kind: 'file', file: { uri: 'https://example.com/doc.pdf', mimeType: 'application/pdf' } },
+  ]);
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, 'unsupported_file_uri');
+  assert.match(result.error.message, /part\[0\]/);
+});
+
+test('mapPartsToChatInput: non-image file mime is rejected', () => {
+  const result = mapPartsToChatInput([
+    { kind: 'file', file: { mimeType: 'application/pdf', bytes: 'CCCC' } },
+  ]);
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, 'unsupported_file_mime');
+  assert.match(result.error.message, /application\/pdf/);
+});
+
+test('mapPartsToChatInput: missing both bytes and uri is rejected', () => {
+  const result = mapPartsToChatInput([
+    { kind: 'file', file: { mimeType: 'image/png' } },
+  ]);
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, 'invalid_file_part');
+});
+
+test('mapPartsToChatInput: data part is rejected since OpenClaw has no structured input surface', () => {
+  const result = mapPartsToChatInput([
+    { kind: 'text', text: 'context follows' },
+    { kind: 'data', data: { foo: 'bar', n: 42 } },
+  ]);
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, 'unsupported_data_part');
+  // Error should identify the offending part index (index 1 here).
+  assert.match(result.error.message, /part\[1\]/);
+});
+
+test('handle(): image file part is forwarded to chat.send as attachments', async () => {
+  const observedParams: unknown[] = [];
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        observedParams.push(req.params);
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId: 'run-img', status: 'started' },
+          }),
+        );
+        setImmediate(() => {
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId: 'run-img',
+                sessionKey: 'agent:main:ctx-t1',
+                seq: 1,
+                state: 'final',
+                message: { text: 'saw a cat' },
+              },
+            }),
+          );
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    const task: TaskAssignFrame = {
+      type: 'task.assign',
+      taskId: 't1',
+      contextId: 'ctx-t1',
+      message: {
+        role: 'user',
+        messageId: 'm1',
+        parts: [
+          { kind: 'text', text: 'what is in this image?' },
+          { kind: 'file', file: { name: 'cat.png', mimeType: 'image/png', bytes: 'AAAA' } },
+        ],
+      },
+    };
+    await backend.handle(task, (f) => frames.push(f), NEVER);
+    assert.equal(observedParams.length, 1, 'chat.send should have been issued exactly once');
+    const params = observedParams[0] as { message: string; attachments: unknown };
+    assert.equal(params.message, 'what is in this image?');
+    assert.deepEqual(params.attachments, [
+      { type: 'image', mimeType: 'image/png', fileName: 'cat.png', content: 'AAAA' },
+    ]);
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete);
+    assert.equal(complete!.status.state, 'completed');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('handle(): data part fails fast with unsupported_data_part without touching the gateway', async () => {
+  let chatSendSeen = false;
+  const fake = await createFakeGateway({
+    onRequest: (_sock, req) => {
+      if (req.method === 'chat.send') chatSendSeen = true;
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    const task: TaskAssignFrame = {
+      type: 'task.assign',
+      taskId: 't1',
+      contextId: 'ctx-t1',
+      message: {
+        role: 'user',
+        messageId: 'm1',
+        parts: [
+          { kind: 'text', text: 'context' },
+          { kind: 'data', data: { hello: 'world' } },
+        ],
+      },
+    };
+    await backend.handle(task, (f) => frames.push(f), NEVER);
+    const fail = frames.find((f) => f.type === 'task.fail');
+    assert.ok(fail, 'unsupported data part must fail the task');
+    assert.equal(fail!.error.code, 'unsupported_data_part');
+    // Give any racing chat.send a chance to land so the assertion is meaningful.
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(chatSendSeen, false, 'gateway must not see chat.send for malformed input');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('handle(): file.uri fails fast with unsupported_file_uri', async () => {
+  let chatSendSeen = false;
+  const fake = await createFakeGateway({
+    onRequest: (_sock, req) => {
+      if (req.method === 'chat.send') chatSendSeen = true;
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    const task: TaskAssignFrame = {
+      type: 'task.assign',
+      taskId: 't1',
+      contextId: 'ctx-t1',
+      message: {
+        role: 'user',
+        messageId: 'm1',
+        parts: [{ kind: 'file', file: { uri: 'https://example.com/x.png', mimeType: 'image/png' } }],
+      },
+    };
+    await backend.handle(task, (f) => frames.push(f), NEVER);
+    const fail = frames.find((f) => f.type === 'task.fail');
+    assert.ok(fail);
+    assert.equal(fail!.error.code, 'unsupported_file_uri');
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(chatSendSeen, false);
   } finally {
     await fake.close();
   }
