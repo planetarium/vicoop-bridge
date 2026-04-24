@@ -146,25 +146,7 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
       mkdirSync(newDir, { recursive: true });
       const tarRes = spawnSync(
         'tar',
-        [
-          '-xzf',
-          join(dlDir, archiveName),
-          '-C',
-          newDir,
-          '--strip-components=1',
-          // Under `sudo vicoop-client upgrade`, root would otherwise restore
-          // the archive's stored uid/gid — typically the 1000-ish user that
-          // built the release — leaving installed files owned by an
-          // unprivileged local account. That's a privilege-escalation path
-          // for a root-run service: any local user with that uid could
-          // modify `dist/cli.js` between service restarts.
-          // `--no-same-owner` forces the extracted files to the current
-          // effective uid/gid. `--no-same-permissions` drops any stored
-          // setuid/setgid bits; the archive has none today, but we want a
-          // known-safe default.
-          '--no-same-owner',
-          '--no-same-permissions',
-        ],
+        ['-xzf', join(dlDir, archiveName), '-C', newDir, '--strip-components=1'],
         { stdio: 'inherit' },
       );
       if (tarRes.error) {
@@ -183,6 +165,23 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
       if (tarRes.status !== 0) {
         err(`extraction failed: tar exited with status ${tarRes.status}`);
         return 1;
+      }
+
+      // Portable replacement for `tar --no-same-owner`: busybox tar lacks
+      // the long option, so we normalize ownership after the fact. Non-root
+      // tar already extracts as the current uid/gid (kernel enforces), so
+      // the chown only actually matters under `sudo vicoop-client upgrade`
+      // — where the archive's stored uid (typically ~1000, whatever built
+      // the release) would otherwise end up owning a root-run service's
+      // files. That's a privilege-escalation vector: any local user with
+      // that uid could modify `dist/cli.js` between restarts.
+      if (process.getuid?.() === 0) {
+        const chownRes = spawnSync('chown', ['-R', '0:0', newDir], { stdio: 'inherit' });
+        if (chownRes.error || chownRes.signal || chownRes.status !== 0) {
+          const detail = chownRes.error?.message ?? `signal ${chownRes.signal ?? 'none'}, status ${chownRes.status}`;
+          err(`chown -R 0:0 on ${newDir} failed (${detail}) — refusing to leave root-extracted files with non-root ownership`);
+          return 1;
+        }
       }
 
       preserveOperatorFiles(installDir, newDir);
@@ -279,16 +278,21 @@ async function resolveLatestTag(): Promise<string> {
     API_TIMEOUT_MS,
   );
   if (!res.ok) throw new Error(`GitHub API request failed: ${res.status} ${res.statusText} (${url})`);
-  const releases = (await res.json()) as Array<{ tag_name?: unknown }>;
+  const releases = (await res.json()) as Array<{ tag_name?: unknown; draft?: unknown; prerelease?: unknown }>;
   for (const r of releases) {
     if (typeof r.tag_name !== 'string' || !r.tag_name.startsWith('client-v')) continue;
+    // Skip drafts (no uploaded assets — the .tgz download would 404) and
+    // prereleases (assets exist but operators on the default channel don't
+    // want them). `--version client-vX.Y.Z-rc.1` still lets an operator
+    // pin an explicit prerelease when they want to test one.
+    if (r.draft === true || r.prerelease === true) continue;
     // Defensively validate the API response — a future rename or a
     // compromised upstream shouldn't get to interpolate arbitrary strings
     // into local filenames.
     assertSafeTag(r.tag_name);
     return r.tag_name;
   }
-  throw new Error(`no client-v* release found in ${REPO}`);
+  throw new Error(`no published (non-draft, non-prerelease) client-v* release found in ${REPO}`);
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
