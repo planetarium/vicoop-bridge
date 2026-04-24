@@ -62,6 +62,8 @@ would still default to `/data/vicoop-bridge-client`.
 | `INSTALL_DIR` | `/data/vicoop-bridge-client` | Target directory. Pick a writable path on a volume that survives restarts. |
 | `VERSION` | latest `client-v*` | Pin a specific tag, e.g. `client-v0.1.1`. |
 | `FORCE` | `0` | If `1`, overwrite a non-empty `INSTALL_DIR`. |
+| `INSTALL_SKIP_SERVICE` | `0` | If `1`, skip the systemd unit + env template even on systemd hosts. |
+| `INSTALL_SERVICE_SCOPE` | `auto` | Force `user`, `system`, or `none` instead of auto-detecting by `id -u`. `system` requires root; an explicit `system` without root is refused with a warning. |
 
 What you get after extraction:
 
@@ -78,19 +80,13 @@ The script targets Linux (Fly.io persistent volumes are the original target
 deployment); on macOS it prints a warning and proceeds. See #17 / #21 for
 background.
 
-`install.sh` prints next-step instructions, but parts of that output are
-outdated and should be ignored in favor of Steps 2-3 below:
-
-- It references `$INSTALL_DIR/card.json` as the card path — the bundle does
-  not ship that file; it ships `cards/openclaw.json` as a starting
-  template. This doc points `--card` (and `AGENT_CARD`) at the shipped
-  template directly; if you'd rather keep the printed path, copy the
-  template to `$INSTALL_DIR/card.json` first.
-- It suggests obtaining a token via a `register_client` tool on the admin
-  agent. Today the flow goes through the PostGraphile-exposed
-  `registerClient` GraphQL mutation (Step 3), gated by a SIWE caller token
-  (Step 2). The admin A2A agent itself does not carry a
-  `register_client` tool with that name.
+When systemd is the host init, `install.sh` also writes a
+`vicoop-client.service` unit plus a `vicoop-client.env` template (scope
+auto-detected: `system` as root, `user` otherwise). It does not enable or
+start the service — env values are populated by Steps 2-4 below, and the
+operator runs the `systemctl enable --now` command from the installer's
+output once they're filled in. Opt out with `INSTALL_SKIP_SERVICE=1`, or
+force a scope with `INSTALL_SERVICE_SCOPE=user|system|none`.
 
 ## Step 2 — Obtain a caller token (SIWE)
 
@@ -330,6 +326,55 @@ restart needed.
 
 `vicoop-client` does not daemonize. Pick whichever supervisor fits your host.
 
+### Linux — systemd (automatic, recommended)
+
+On systemd hosts `install.sh` already dropped the unit and an env template
+(see Step 1). The exact paths and the reload/enable commands are printed
+at the end of `install.sh` — prefer those over the examples below if they
+differ (`XDG_CONFIG_HOME`, non-default `$HOME`, etc.). You can also ask
+systemd directly with `systemctl --user cat vicoop-client`.
+
+```sh
+# user-scope (default for non-root). If XDG_CONFIG_HOME is set, swap in
+# that prefix for ~/.config/ below.
+"${EDITOR:-vi}" "${XDG_CONFIG_HOME:-$HOME/.config}/vicoop-client.env"
+systemctl --user daemon-reload                # pick up regenerated unit after reinstall
+systemctl --user enable --now vicoop-client
+journalctl --user -u vicoop-client -f         # watch logs
+```
+
+For a system-scope install (installer ran as root) swap to
+`/etc/vicoop-client.env`, then reload + enable. On minimal images where
+the installer ran as root and `sudo` may not exist, drop the `sudo`
+prefix:
+
+```sh
+# already root (minimal images, Fly.io containers)
+systemctl daemon-reload
+systemctl enable --now vicoop-client
+
+# non-root operator with sudo
+sudo systemctl daemon-reload
+sudo systemctl enable --now vicoop-client
+```
+
+The unit restarts on failure (`Restart=on-failure`, 5s backoff).
+
+The `daemon-reload` is only strictly needed after a reinstall/upgrade that
+rewrote the unit file (new `INSTALL_DIR`, new absolute node path, new
+`VERSION`); first-time installs can skip it. It never hurts to run.
+
+**Headless hosts / user scope**: the user-scope manager is tied to your
+login session by default, so the client stops when you log out. For true
+24/7 operation either enable lingering:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+or rerun the installer as root with `INSTALL_SERVICE_SCOPE=system` to get
+a system-wide unit instead.
+
 ### macOS — `launchd`
 
 Create `~/Library/LaunchAgents/com.local.vicoop-client.plist` with
@@ -337,13 +382,17 @@ Create `~/Library/LaunchAgents/com.local.vicoop-client.plist` with
 `$INSTALL_DIR/bin/vicoop-client`, and put your env into
 `EnvironmentVariables`. Load with `launchctl load -w <plist>`.
 
-### Linux — systemd user unit
+### Linux — systemd user unit (manual)
+
+If you ran `install.sh` with `INSTALL_SKIP_SERVICE=1` or the scope
+auto-detection skipped (non-systemd host), write the unit yourself:
 
 ```ini
 # ~/.config/systemd/user/vicoop-client.service
 [Unit]
 Description=vicoop-bridge-client
-After=network-online.target
+# network-online.target is a system-instance unit; the user manager does
+# not know about it, so intentionally omit the After=/Wants= line here.
 
 [Service]
 Type=simple
@@ -351,6 +400,7 @@ EnvironmentFile=%h/.config/vicoop-client.env
 ExecStart=%h/vicoop-bridge-client/bin/vicoop-client
 Restart=on-failure
 RestartSec=5s
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=default.target
@@ -372,8 +422,6 @@ tmux attach -t vbc   # to watch logs
 Using `set -a` + `.` keeps secrets out of the process-listing line and
 tolerates quoted values / comment lines in the env file, which the
 `env $(xargs)` pattern does not.
-
-Automatic restart on crash is tracked in #18.
 
 ## Troubleshooting
 
