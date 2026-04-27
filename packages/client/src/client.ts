@@ -16,16 +16,37 @@ export interface ClientOptions {
   backend: Backend;
   maxConcurrency?: number;
   reconnectDelayMs?: number;
+  // Upper bound on how long we'll wait for `backend.resolveCapabilities()`
+  // before sending the bridge-server hello with the card's declared
+  // capabilities. Defaults to 3000 ms — comfortably under the bridge
+  // server's 10s hello deadline so a slow or hung probe cannot push us
+  // into the 4001 "hello timeout" close and a reconnect loop.
+  probeDeadlineMs?: number;
 }
+
+const DEFAULT_PROBE_DEADLINE_MS = 3000;
 
 export class Client {
   private ws: WebSocket | null = null;
   private stopped = false;
   private inflight = new Map<string, AbortController>();
+  // Resolved once per process via backend.resolveCapabilities(); the bridge
+  // hello frame is held until this settles so the advertised card matches the
+  // backend's actual upstream capability. Cached across reconnects so we
+  // don't re-probe on every bridge WS reconnect — the underlying upstream
+  // doesn't change mid-process.
+  private effectiveCardPromise: Promise<AgentCard> | null = null;
 
   constructor(private readonly opts: ClientOptions) {}
 
   start(): void {
+    // Kick off the capability probe before opening the bridge WS so it runs
+    // in parallel with (and usually finishes before) the server's hello
+    // deadline starts ticking at the `open` event. Starting it inside
+    // `ws.on('open')` instead could push `hello` past the server's 10s
+    // hello timeout when the backend probe itself takes a while (e.g. the
+    // openclaw gateway handshake on an unreachable/slow-to-handshake host).
+    void this.resolveEffectiveCard();
     this.connect();
   }
 
@@ -37,20 +58,115 @@ export class Client {
     this.ws?.close();
   }
 
+  private resolveEffectiveCard(): Promise<AgentCard> {
+    if (this.effectiveCardPromise) return this.effectiveCardPromise;
+    const base = this.opts.agentCard;
+    const probe = this.opts.backend.resolveCapabilities;
+    if (!probe) {
+      this.effectiveCardPromise = Promise.resolve(base);
+      return this.effectiveCardPromise;
+    }
+    const deadlineMs = this.opts.probeDeadlineMs ?? DEFAULT_PROBE_DEADLINE_MS;
+    this.effectiveCardPromise = (async () => {
+      const TIMEOUT = Symbol('probe-timeout');
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<typeof TIMEOUT>((resolve) => {
+        timer = setTimeout(() => resolve(TIMEOUT), deadlineMs);
+        timer.unref?.();
+      });
+      // `Promise.resolve().then(...)` converts a synchronous throw from a
+      // non-async probe implementation into a promise rejection — otherwise
+      // the throw would escape before `.catch` is attached and surface as an
+      // unhandled rejection on `effectiveCardPromise`, which the `open`
+      // handler consumes with `.then` only.
+      const probePromise = Promise.resolve()
+        .then(() => probe.call(this.opts.backend))
+        .catch((err: unknown) => {
+          console.warn(
+            `[client] backend capability probe threw (${err instanceof Error ? err.message : String(err)}); using declared card capabilities`,
+          );
+          return null;
+        });
+      try {
+        const outcome = await Promise.race([probePromise, timeoutPromise]);
+        if (outcome === TIMEOUT) {
+          console.warn(
+            `[client] backend capability probe did not complete within ${deadlineMs}ms; sending hello with declared card capabilities`,
+          );
+          return base;
+        }
+        if (outcome === null) return base;
+        const detected = outcome;
+        // Preserve the documented "no override" contract: an empty detected
+        // object must leave the card byte-for-byte unchanged, including an
+        // absent `capabilities` field. Only materialize `capabilities` when
+        // the probe actually reports a value we need to apply.
+        if (detected.streaming === undefined && detected.pushNotifications === undefined) {
+          return base;
+        }
+        const merged: AgentCard['capabilities'] = {
+          ...(base.capabilities ?? {}),
+          ...(detected.streaming !== undefined ? { streaming: detected.streaming } : {}),
+          ...(detected.pushNotifications !== undefined
+            ? { pushNotifications: detected.pushNotifications }
+            : {}),
+        };
+        return { ...base, capabilities: merged };
+      } finally {
+        // Clear the deadline timer so a fast probe doesn't leave an extra
+        // callback and its closure alive until `deadlineMs` elapses. The
+        // unref() above is enough to keep this from blocking process exit,
+        // but clearing is cheaper than letting it fire.
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    })();
+    return this.effectiveCardPromise;
+  }
+
   private connect(): void {
     if (this.stopped) return;
     const ws = new WebSocket(`${this.opts.serverUrl.replace(/\/$/, '')}/connect`);
     this.ws = ws;
 
     ws.on('open', () => {
-      console.log('[client] connected, sending hello');
-      this.send({
-        type: 'hello',
-        agentId: this.opts.agentId,
-        agentCard: this.opts.agentCard,
-        version: PROTOCOL_VERSION,
-        token: this.opts.token,
-      });
+      // The probe runs in parallel with the bridge TCP/WS handshake; by the
+      // time `open` fires it's usually already settled. Awaiting here means
+      // the bridge-server sees a card whose capabilities match what the
+      // backend can actually deliver. If the probe is still running (slow
+      // gateway handshake), `hello` is delayed by the difference — typically
+      // a few ms on a local loopback gateway.
+      //
+      // Send on the captured `ws` (not `this.send()` / `this.ws`) so a
+      // reconnect-driven socket swap during the probe's async gap cannot
+      // misdirect the hello onto a fresh connection that has its own `open`
+      // handler coming. Also drop the frame silently if this socket moved
+      // out of OPEN before the probe settled — the next `connect()` cycle
+      // will issue its own hello.
+      const sendHello = (agentCard: AgentCard): void => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        console.log('[client] connected, sending hello');
+        ws.send(
+          encodeFrame({
+            type: 'hello',
+            agentId: this.opts.agentId,
+            agentCard,
+            version: PROTOCOL_VERSION,
+            token: this.opts.token,
+          }),
+        );
+      };
+      // The internal catch inside resolveEffectiveCard() already coerces
+      // every failure into "return base", so this `.catch` is defense in
+      // depth — if a future refactor ever lets a rejection escape, still
+      // send hello with the declared card instead of silently dropping it.
+      this.resolveEffectiveCard()
+        .then(sendHello)
+        .catch((err: unknown) => {
+          console.warn(
+            `[client] effectiveCard promise rejected unexpectedly (${err instanceof Error ? err.message : String(err)}); sending hello with declared card`,
+          );
+          sendHello(this.opts.agentCard);
+        });
     });
 
     ws.on('message', (raw) => {

@@ -1,8 +1,36 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import WebSocket, { WebSocketServer } from 'ws';
+
+// Bind a net server to an ephemeral port, record the port, then close the
+// server. The port is unlikely to be rebound by an unrelated process
+// before the test reconnects, so ECONNREFUSED is the overwhelmingly
+// likely outcome — unlike hard-coding port 1, which can be forwarded or
+// listening in some CI environments. It's not a hard guarantee
+// (TOCTOU: another process could bind the port between close() and our
+// connect), but for an in-process test on loopback the window is small.
+async function pickUnusedLoopbackPort(): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const server = createNetServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        server.close();
+        reject(new Error('failed to allocate an unused loopback port'));
+        return;
+      }
+      const { port } = address;
+      server.close((err) => {
+        if (err) reject(err);
+        else resolve(port);
+      });
+    });
+  });
+}
 import {
   createOpenclawBackend,
   listenersToGatewayUrls,
@@ -1636,6 +1664,272 @@ test('discovery skipped when configured URL is remote (non-loopback)', async () 
   assert.ok(fail, 'task must fail when remote gateway is unreachable');
   assert.equal(fail!.error.code, 'gateway_closed');
   assert.equal(discoverCalls, 0, 'discover must not be invoked for non-loopback URLs');
+});
+
+test('resolveCapabilities: returns streaming:true when gateway accepts sessions.messages.subscribe', async () => {
+  const seenMethods: string[] = [];
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      seenMethods.push(req.method);
+      if (req.method === 'sessions.messages.unsubscribe') {
+        sock.send(JSON.stringify({ type: 'res', id: req.id, ok: true, payload: {} }));
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    assert.ok(backend.resolveCapabilities, 'openclaw backend must expose resolveCapabilities');
+    const caps = await backend.resolveCapabilities!();
+    assert.deepEqual(caps, { streaming: true });
+    assert.ok(
+      seenMethods.includes('sessions.messages.subscribe'),
+      'probe must have attempted sessions.messages.subscribe',
+    );
+    assert.ok(
+      seenMethods.includes('sessions.messages.unsubscribe'),
+      'probe must attempt unsubscribe cleanup after a successful subscribe',
+    );
+  } finally {
+    await fake.close();
+  }
+});
+
+// Reusable helper for probe tests that need a subscribe error the main fake
+// gateway helper cannot express (it auto-acks subscribe before onRequest). The
+// teardown terminates existing WebSocket connections before closing the WSS so
+// `wss.close()` doesn't hang waiting for the backend's still-open client.
+async function createFakeGatewayWithSubscribeResponse(
+  subscribeError: { code: string; message: string },
+): Promise<FakeGateway> {
+  const httpServer = createServer();
+  const wss = new WebSocketServer({ server: httpServer });
+  const connections: WebSocket[] = [];
+  wss.on('connection', (sock) => {
+    connections.push(sock);
+    sock.send(
+      JSON.stringify({
+        type: 'event',
+        event: 'connect.challenge',
+        payload: { nonce: `nonce-probe-${connections.length}` },
+      }),
+    );
+    sock.on('message', (raw) => {
+      let frame: ReqFrame;
+      try {
+        frame = JSON.parse(raw.toString()) as ReqFrame;
+      } catch {
+        return;
+      }
+      if (frame.type !== 'req') return;
+      if (frame.method === 'connect') {
+        sock.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: {} }));
+        return;
+      }
+      if (frame.method === 'sessions.messages.subscribe') {
+        sock.send(
+          JSON.stringify({ type: 'res', id: frame.id, ok: false, error: subscribeError }),
+        );
+      }
+    });
+  });
+  await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
+  const { port } = httpServer.address() as AddressInfo;
+  return {
+    url: `ws://127.0.0.1:${port}`,
+    connections,
+    waitForConnection: () => Promise.reject(new Error('not used')),
+    respond: () => undefined,
+    respondError: () => undefined,
+    emitChat: () => undefined,
+    emitSessionMessage: () => undefined,
+    closeSocket: () => Promise.resolve(),
+    async close() {
+      for (const s of connections) {
+        if (s.readyState !== WebSocket.CLOSED) s.terminate();
+      }
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    },
+  };
+}
+
+test('resolveCapabilities: returns streaming:false when gateway reports unknown method', async () => {
+  // Shape matches what OpenClaw v2026.3.13 and earlier return when the RPC
+  // doesn't exist: `errorShape(ErrorCodes.INVALID_REQUEST, "unknown method: <name>")`.
+  const fake = await createFakeGatewayWithSubscribeResponse({
+    code: 'invalid_request',
+    message: 'unknown method: sessions.messages.subscribe',
+  });
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const caps = await backend.resolveCapabilities!();
+    assert.deepEqual(caps, { streaming: false });
+    assert.ok(
+      warnings.some((w) => w.includes('streaming:false') && w.includes('v2026.3.22')),
+      `expected warning about streaming downgrade, got: ${warnings.join(' | ')}`,
+    );
+  } finally {
+    console.warn = originalWarn;
+    await fake.close();
+  }
+});
+
+test('resolveCapabilities: treats non-method errors as "method exists" and keeps streaming:true', async () => {
+  // If the gateway implements the RPC but rejects the probe for another
+  // reason (scope denied, invalid key, session not found, etc.), the method
+  // clearly dispatched — we must not downgrade. Only the literal
+  // "unknown method" shape signals absence.
+  const fake = await createFakeGatewayWithSubscribeResponse({
+    code: 'forbidden',
+    message: 'scope operator.read required',
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const caps = await backend.resolveCapabilities!();
+    assert.deepEqual(caps, { streaming: true });
+  } finally {
+    await fake.close();
+  }
+});
+
+test('resolveCapabilities: returns empty override when gateway is unreachable', async () => {
+  const unreachablePort = await pickUnusedLoopbackPort();
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  try {
+    const backend = createOpenclawBackend({
+      url: `ws://127.0.0.1:${unreachablePort}`,
+      handshakeTimeoutMs: 500,
+      discoverGatewayUrls: async () => [],
+    });
+    const caps = await backend.resolveCapabilities!();
+    assert.deepEqual(caps, {}, 'unreachable gateway must leave the card unmodified');
+    assert.ok(
+      warnings.some((w) => w.includes('capability probe skipped')),
+      `expected skip warning, got: ${warnings.join(' | ')}`,
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test('resolveCapabilities: after unknown-method verdict, subsequent handle() skips subscribe and suppresses per-task warn', async () => {
+  // Covers the regression Copilot flagged: before this fix, a pre-v2026.3.22
+  // gateway would see `ensureSessionMessageSubscription` fire for every task,
+  // each producing a "sessions.messages.subscribe failed ... (continuing
+  // without streaming)" warn. The probe's verdict must latch so tasks run
+  // silently against the known-unsupported gateway.
+  const subscribeCalls: Array<{ params: unknown }> = [];
+  const httpServer = createServer();
+  const wss = new WebSocketServer({ server: httpServer });
+  const sockets: WebSocket[] = [];
+  wss.on('connection', (sock) => {
+    sockets.push(sock);
+    sock.send(
+      JSON.stringify({
+        type: 'event',
+        event: 'connect.challenge',
+        payload: { nonce: 'nonce-latch' },
+      }),
+    );
+    sock.on('message', (raw) => {
+      let frame: ReqFrame;
+      try {
+        frame = JSON.parse(raw.toString()) as ReqFrame;
+      } catch {
+        return;
+      }
+      if (frame.type !== 'req') return;
+      if (frame.method === 'connect') {
+        sock.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: {} }));
+        return;
+      }
+      if (frame.method === 'sessions.messages.subscribe') {
+        subscribeCalls.push({ params: frame.params });
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: frame.id,
+            ok: false,
+            error: {
+              code: 'invalid_request',
+              message: 'unknown method: sessions.messages.subscribe',
+            },
+          }),
+        );
+        return;
+      }
+      if (frame.method === 'chat.send') {
+        const params = frame.params as { sessionKey: string; idempotencyKey: string };
+        const runId = `run-${params.idempotencyKey}`;
+        sock.send(
+          JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: { runId, status: 'started' } }),
+        );
+        setImmediate(() => {
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId,
+                sessionKey: params.sessionKey,
+                seq: 1,
+                state: 'final',
+                message: { text: `done ${params.idempotencyKey}` },
+              },
+            }),
+          );
+        });
+      }
+    });
+  });
+  await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
+  const { port } = httpServer.address() as AddressInfo;
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  try {
+    const backend = createOpenclawBackend({ url: `ws://127.0.0.1:${port}` });
+    const caps = await backend.resolveCapabilities!();
+    assert.deepEqual(caps, { streaming: false });
+    assert.equal(subscribeCalls.length, 1, 'probe must call subscribe exactly once');
+
+    const frames1: UpFrame[] = [];
+    await backend.handle(makeTask('t-latch-1', 'hi'), (f) => frames1.push(f), NEVER);
+    const frames2: UpFrame[] = [];
+    await backend.handle(makeTask('t-latch-2', 'hi'), (f) => frames2.push(f), NEVER);
+
+    assert.equal(
+      subscribeCalls.length,
+      1,
+      'tasks after the unknown-method verdict must not re-attempt subscribe',
+    );
+    const perTaskWarns = warnings.filter((w) =>
+      w.includes('sessions.messages.subscribe failed for agent:'),
+    );
+    assert.equal(
+      perTaskWarns.length,
+      0,
+      `per-task subscribe warnings must be suppressed, got: ${perTaskWarns.join(' | ')}`,
+    );
+  } finally {
+    console.warn = originalWarn;
+    for (const s of sockets) {
+      if (s.readyState !== WebSocket.CLOSED) s.terminate();
+    }
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+  }
 });
 
 export { createFakeGateway, makeTask };

@@ -298,7 +298,7 @@ class GatewayClient {
         client: {
           id: clientId,
           displayName: 'vicoop-bridge-client',
-          version: '0.3.0',
+          version: '0.4.2',
           platform: process.platform,
           mode: clientMode,
         },
@@ -697,6 +697,12 @@ export function createOpenclawBackend(
   // it. Cleared on reconnect because the connId (and therefore the server's
   // subscriber entry) is gone after a WS close.
   const subscribedSessionKeys = new Set<string>();
+  // Latched true once we've observed an `unknown method` response to
+  // `sessions.messages.subscribe` (via the capability probe or a per-task
+  // attempt). When set, every subsequent task skips the subscribe RPC and
+  // its accompanying warn log. Reset on reconnect so an upgraded gateway
+  // can re-enable streaming without a client restart.
+  let gatewayLacksMessageSubscribe = false;
   // Per-sessionKey owner of message-boundary streaming. OpenClaw's
   // `session.message` payload carries no runId, so we cannot route events
   // for two concurrent `chat.send` calls on the same sessionKey. First task
@@ -739,6 +745,10 @@ export function createOpenclawBackend(
     // connection re-subscribes cleanly.
     subscribedSessionKeys.clear();
     sessionMessageOwners.clear();
+    // An upgraded gateway (e.g. OpenClaw <v2026.3.22 → ≥v2026.3.22 across a
+    // restart) may start supporting `sessions.messages.subscribe` after a
+    // reconnect. Clearing the latch lets the next probe/attempt re-evaluate.
+    gatewayLacksMessageSubscribe = false;
     // Fail every in-flight task that was running on this client so handle()
     // does not hang forever waiting for a terminal event that can never come.
     if (taskFinalizers.size === 0) return;
@@ -893,18 +903,75 @@ export function createOpenclawBackend(
     sessionKey: string,
   ): Promise<void> {
     if (subscribedSessionKeys.has(sessionKey)) return;
+    // Short-circuit once we know the gateway doesn't implement the RPC —
+    // attempting it per task would just produce a noisy warn log on every
+    // chat.send against a pre-v2026.3.22 gateway.
+    if (gatewayLacksMessageSubscribe) return;
     try {
       await gw.request('sessions.messages.subscribe', { key: sessionKey });
       subscribedSessionKeys.add(sessionKey);
     } catch (err) {
+      const msg = errorMessage(err);
+      if (/unknown method/i.test(msg)) {
+        gatewayLacksMessageSubscribe = true;
+        console.warn(
+          `[openclaw] gateway does not implement sessions.messages.subscribe; streaming disabled for this connection (requires OpenClaw >= v2026.3.22)`,
+        );
+        return;
+      }
       console.warn(
-        `[openclaw] sessions.messages.subscribe failed for ${sessionKey}: ${errorMessage(err)} (continuing without streaming)`,
+        `[openclaw] sessions.messages.subscribe failed for ${sessionKey}: ${msg} (continuing without streaming)`,
       );
     }
   }
 
   return {
     name: 'openclaw',
+
+    // Probe whether the gateway implements `sessions.messages.subscribe` so
+    // the bridge-server can advertise a card capability that matches reality.
+    // OpenClaw added the RPC in v2026.3.22; older gateways reject it with
+    // `unknown method: sessions.messages.subscribe`. We treat that specific
+    // error as a negative signal and every other failure mode (scope denied,
+    // invalid key, etc.) as "method exists → streaming available", since they
+    // prove the method dispatched before being rejected. Gateway unreachable
+    // at probe time returns `{}` so the card's declared value wins — the
+    // alternative (assuming "not supported" on transient outages) would
+    // spuriously downgrade healthy deployments.
+    async resolveCapabilities() {
+      let gw: GatewayClient;
+      try {
+        gw = await ensureConnected();
+      } catch (err) {
+        console.warn(
+          `[openclaw] capability probe skipped: gateway unreachable (${errorMessage(err)}); leaving card capabilities as declared`,
+        );
+        return {};
+      }
+      const probeKey = `__vicoop-capability-probe__:${randomUUID()}`;
+      try {
+        await gw.request('sessions.messages.subscribe', { key: probeKey });
+        // Probe succeeded against a synthetic sessionKey. Best-effort cleanup
+        // so the subscriber slot isn't kept alive — subscription state is
+        // connection-scoped anyway, so a failed unsubscribe is harmless.
+        try {
+          await gw.request('sessions.messages.unsubscribe', { key: probeKey });
+        } catch {
+          /* ignore */
+        }
+        return { streaming: true };
+      } catch (err) {
+        const msg = errorMessage(err);
+        if (/unknown method/i.test(msg)) {
+          gatewayLacksMessageSubscribe = true;
+          console.warn(
+            '[openclaw] gateway does not implement sessions.messages.subscribe; advertising streaming:false (streaming requires OpenClaw >= v2026.3.22)',
+          );
+          return { streaming: false };
+        }
+        return { streaming: true };
+      }
+    },
 
     async handle(task, emit, signal) {
       // Fast path: the task was canceled before we even started. Emit a
