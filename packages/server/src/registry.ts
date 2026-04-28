@@ -1,7 +1,7 @@
 import type { WebSocket } from 'ws';
 import type { AgentCard, DownFrame } from '@vicoop-bridge/protocol';
 import { encodeFrame } from '@vicoop-bridge/protocol';
-import type { ExecutionEventBus } from '@a2a-js/sdk/server';
+import type { TaskArtifactUpdateEvent, TaskStatusUpdateEvent } from '@a2x/sdk';
 import { logEvent, truncate } from './log.js';
 
 export interface ClientConnection {
@@ -14,18 +14,29 @@ export interface ClientConnection {
   connectedAt: number;
 }
 
+/**
+ * Sink owned by the executor for a live task. WS frames inbound from the
+ * client are translated into `TaskArtifactUpdateEvent`/`TaskStatusUpdateEvent`
+ * and pushed here; the executor's `executeStream()` yields from it.
+ */
+export interface TaskSink {
+  pushStatus(event: TaskStatusUpdateEvent): void;
+  pushArtifact(event: TaskArtifactUpdateEvent): void;
+  finish(): void;
+}
+
 export interface TaskBinding {
   agentId: string;
   taskId: string;
   contextId: string;
-  eventBus: ExecutionEventBus;
+  sink: TaskSink;
 }
 
 export type CallerChangeListener = (agentId: string, callers: string[]) => void;
 // Fires whenever the agent connection (including its embedded agentCard) is
 // newly registered, replaced, or removed. Downstream consumers that cache
 // objects derived from the card — e.g. the HTTP layer's per-agent
-// JsonRpcTransportHandler, which captures `capabilities.streaming` at
+// A2XAgent / DefaultRequestHandler, which captures the card snapshot at
 // construction time — must evict on this signal, otherwise a client that
 // reconnects with an updated card (say, `streaming: false` → `true`) will
 // continue to be served by a transport built against the old card until the
@@ -63,25 +74,28 @@ export class Registry {
     this.notifyAgentChange(agentId);
     for (const binding of [...this.bindings.values()]) {
       if (binding.agentId !== agentId) continue;
-      binding.eventBus.publish({
-        kind: 'status-update',
+      binding.sink.pushStatus({
         taskId: binding.taskId,
         contextId: binding.contextId,
         final: true,
         status: {
-          state: 'failed',
+          // `failed` is the spec's terminal failure state; mirrors the
+          // pre-migration behavior where mid-task client disconnects
+          // were surfaced as a failed status with an explanatory message.
+          // Cast keeps this file decoupled from the @a2x/sdk TaskState
+          // enum value while still emitting the wire-correct string.
+          state: 'failed' as never,
           timestamp: new Date().toISOString(),
           message: {
-            kind: 'message',
-            role: 'agent',
             messageId: `${binding.taskId}-disc`,
-            parts: [{ kind: 'text', text: 'client disconnected mid-task' }],
+            role: 'agent',
+            parts: [{ text: 'client disconnected mid-task' }],
             taskId: binding.taskId,
             contextId: binding.contextId,
           },
         },
       });
-      binding.eventBus.finished();
+      binding.sink.finish();
       this.bindings.delete(binding.taskId);
     }
   }

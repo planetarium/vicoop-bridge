@@ -1,13 +1,15 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Send, MessageSquare } from 'lucide-react';
-import type { Client } from '@a2a-js/sdk/client';
+import type { A2XClient } from '@a2x/sdk/client';
 import { useAuthToken } from '../lib/auth-token';
 import { createA2AClient, type Message as A2AMessage } from '../lib/a2a-client';
 import { Message } from './message';
 
 function extractText(msg: A2AMessage): string {
+  // a2x's internal Message uses field-presence discriminators on Parts:
+  // TextPart has `text`, FilePart has `raw`/`url`, DataPart has `data`.
   return msg.parts
-    .filter((p): p is { kind: 'text'; text: string } => p.kind === 'text')
+    .filter((p): p is { text: string } => 'text' in p && typeof (p as { text: unknown }).text === 'string')
     .map((p) => p.text)
     .join('\n');
 }
@@ -25,7 +27,7 @@ export function Chat() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const clientRef = useRef<Client | null>(null);
+  const clientRef = useRef<A2XClient | null>(null);
   const tokenRef = useRef(token);
   tokenRef.current = token;
   const [contextId] = useState(() => crypto.randomUUID());
@@ -59,15 +61,17 @@ export function Chat() {
       const client = await getClient();
       const result = await client.sendMessage({
         message: {
-          kind: 'message',
           messageId: crypto.randomUUID(),
           contextId,
           role: 'user',
-          parts: [{ kind: 'text', text }],
+          // Wire format. a2x's request validator only checks role/parts
+          // presence and forwards the message through unchanged; the
+          // server-side response mapper handles wire ↔ internal coercion.
+          parts: [{ text }],
         },
       });
 
-      const agentMsg = 'status' in result ? result.status.message : result;
+      const agentMsg = result.status.message;
       if (agentMsg) {
         setMessages((prev) => [...prev, { role: 'agent', text: extractText(agentMsg) }]);
       }

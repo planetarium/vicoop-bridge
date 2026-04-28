@@ -2,16 +2,24 @@ import crypto from 'node:crypto';
 import { anthropic } from '@ai-sdk/anthropic';
 import { generateText, tool, stepCountIs, type ModelMessage } from 'ai';
 import { z } from 'zod';
-import type { Message } from '@a2a-js/sdk';
 import {
-  A2AError,
+  A2XAgent,
+  AgentExecutor,
+  BaseAgent,
   DefaultRequestHandler,
-  JsonRpcTransportHandler,
-  type AgentExecutor,
-  type ExecutionEventBus,
-  type RequestContext,
-} from '@a2a-js/sdk/server';
-import type { AgentCard as SdkAgentCard } from '@a2a-js/sdk';
+  HttpBearerAuthorization,
+  InMemoryRunner,
+  InvalidParamsError,
+  InvalidRequestError,
+  StreamingMode,
+  TaskState,
+  type AgentCardV03,
+  type AgentEvent,
+  type Message,
+  type Task,
+  type TaskArtifactUpdateEvent,
+  type TaskStatusUpdateEvent,
+} from '@a2x/sdk';
 import type { Sql } from './db.js';
 import { getSchemaTools } from './schema-tools.js';
 import { runWithBearerToken } from './graphql-client.js';
@@ -19,6 +27,7 @@ import type { Registry } from './registry.js';
 import { PostgresTaskStore, type ContextAwareTaskStore } from './postgres-task-store.js';
 import { validatePrincipal } from './auth/principal.js';
 import { listCallerTokens, revokeCallerToken } from './auth/caller-token.js';
+import { logEvent } from './log.js';
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -28,10 +37,9 @@ function nowIso(): string {
 
 function agentMessage(text: string, taskId: string, contextId: string): Message {
   return {
-    kind: 'message',
     messageId: crypto.randomUUID(),
     role: 'agent',
-    parts: [{ kind: 'text', text: text || 'No response generated.' }],
+    parts: [{ text: text || 'No response generated.' }],
     taskId,
     contextId,
   };
@@ -39,7 +47,7 @@ function agentMessage(text: string, taskId: string, contextId: string): Message 
 
 function extractText(message: Message): string {
   return message.parts
-    .filter((p): p is { kind: 'text'; text: string } => p.kind === 'text')
+    .filter((p): p is { text: string } => 'text' in p && typeof (p as { text: unknown }).text === 'string')
     .map((p) => p.text)
     .join('\n')
     .trim();
@@ -55,6 +63,22 @@ function toModelMessages(history: Message[], userText: string): ModelMessage[] {
   messages.push({ role: 'user', content: userText });
   return messages;
 }
+
+// AgentExecutor's constructor wants a Runner. The admin executor runs
+// generateText() directly, never invoking the runner.
+class NoopBaseAgent extends BaseAgent {
+  constructor() {
+    super({ name: 'admin-noop' });
+  }
+  async *run(): AsyncGenerator<AgentEvent> {
+    // Never invoked.
+  }
+}
+
+const ADMIN_NOOP_RUNNER = new InMemoryRunner({
+  agent: new NoopBaseAgent(),
+  appName: 'vicoop-bridge-admin-noop',
+});
 
 // ── Admin Wallet Check ───────────────────────────────────────────
 
@@ -345,63 +369,76 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
 
 // ── Executor ─────────────────────────────────────────────────────
 
-class AdminAgentExecutor implements AgentExecutor {
+class AdminA2XExecutor extends AgentExecutor {
   private readonly abortControllers = new Map<string, AbortController>();
   constructor(
     private readonly db: Sql,
     private readonly registry: Registry,
-    private readonly taskStore: ContextAwareTaskStore,
-  ) {}
+    private readonly taskStoreImpl: ContextAwareTaskStore,
+  ) {
+    super({
+      runner: ADMIN_NOOP_RUNNER,
+      runConfig: { streamingMode: StreamingMode.SSE },
+    });
+  }
 
-  async execute(ctx: RequestContext, bus: ExecutionEventBus): Promise<void> {
-    const { taskId, contextId, userMessage, task } = ctx;
+  override async execute(task: Task, message: Message): Promise<Task> {
+    for await (const _event of this.executeStream(task, message)) {
+      void _event;
+    }
+    return task;
+  }
 
-    const metadata = (userMessage as { metadata?: Record<string, unknown> }).metadata;
+  override async *executeStream(
+    task: Task,
+    message: Message,
+  ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
+    const taskId = task.id;
+    const contextId = task.contextId ?? taskId;
+
+    const metadata = (message as { metadata?: Record<string, unknown> }).metadata;
     const walletAddress = metadata?._walletAddress as string | undefined;
     const bearerToken = metadata?._bearerToken as string | undefined;
     if (!walletAddress || !bearerToken) {
-      throw A2AError.invalidRequest('Authenticated wallet address is required.');
+      throw new InvalidRequestError('Authenticated wallet address is required.');
     }
 
-    const userText = extractText(userMessage);
+    const userText = extractText(message);
     if (!userText) {
-      throw A2AError.invalidParams('message.parts with text is required');
+      throw new InvalidParamsError('message.parts with text is required');
     }
 
-    if (!task) {
-      bus.publish({
-        kind: 'task',
-        id: taskId,
-        contextId,
-        status: { state: 'submitted', timestamp: nowIso() },
-        history: [userMessage],
-        artifacts: [],
-      });
-    }
-
-    bus.publish({
-      kind: 'status-update',
+    // Initial 'working' status echoes the user message so the streaming
+    // consumer can render it immediately (matches pre-migration behavior
+    // that emitted a status-update with state='working' carrying the
+    // user message).
+    yield {
       taskId,
       contextId,
-      status: { state: 'working', message: userMessage, timestamp: nowIso() },
       final: false,
-    });
+      status: {
+        state: TaskState.WORKING,
+        timestamp: nowIso(),
+        message,
+      },
+    };
 
     const controller = new AbortController();
     this.abortControllers.set(taskId, controller);
 
     try {
-      // Run with bearer token so GraphQL tools use RLS
       const answer = await runWithBearerToken(bearerToken, async () => {
         const { tools: schemaTools, sdl } = await getSchemaTools();
         const customTools = buildCustomTools(this.db, this.registry, walletAddress);
         const tools = { ...schemaTools, ...customTools };
 
-        // Load conversation history from previous tasks in the same context.
-        // The SDK's ResultManager normally appends status.message into history
-        // before saving, but as a fallback we also include status.message if
-        // it wasn't recorded in history (e.g. edge cases around failures).
-        const previousTasks = await this.taskStore.loadByContextId(contextId, walletAddress, taskId);
+        // Load conversation history from previous tasks in the same
+        // context, plus any history already on the current task.
+        const previousTasks = await this.taskStoreImpl.loadByContextId(
+          contextId,
+          walletAddress,
+          taskId,
+        );
         const contextHistory: Message[] = [];
         for (const prev of previousTasks) {
           if (prev.history) contextHistory.push(...prev.history);
@@ -410,7 +447,7 @@ class AdminAgentExecutor implements AgentExecutor {
             contextHistory.push(statusMsg);
           }
         }
-        const currentHistory = task?.history ?? [];
+        const currentHistory = task.history ?? [];
         const history = [...contextHistory, ...currentHistory];
 
         return generateText({
@@ -423,75 +460,74 @@ class AdminAgentExecutor implements AgentExecutor {
         });
       });
 
-      bus.publish({
-        kind: 'status-update',
+      const final = agentMessage(answer.text, taskId, contextId);
+      task.status = {
+        state: TaskState.COMPLETED,
+        timestamp: nowIso(),
+        message: final,
+      };
+      task.history = [...(task.history ?? []), message, final];
+
+      try {
+        await this.taskStoreImpl.updateTask(taskId, {
+          status: task.status,
+          history: task.history,
+        });
+      } catch (err) {
+        logEvent('admin_persist_error', { taskId, error: String(err) });
+      }
+
+      yield {
         taskId,
         contextId,
-        status: {
-          state: 'completed',
-          message: agentMessage(answer.text, taskId, contextId),
-          timestamp: nowIso(),
-        },
         final: true,
-      });
-      bus.finished();
+        status: task.status,
+      };
     } catch (error) {
       const aborted = controller.signal.aborted;
       const errorText = error instanceof Error ? error.message : 'Unknown error';
-      const state = aborted ? 'canceled' : 'failed';
-      const message = aborted ? 'Task canceled.' : `Error: ${errorText}`;
+      const state = aborted ? TaskState.CANCELED : TaskState.FAILED;
+      const text = aborted ? 'Task canceled.' : `Error: ${errorText}`;
+      const final = agentMessage(text, taskId, contextId);
 
-      bus.publish({
-        kind: 'status-update',
+      task.status = { state, timestamp: nowIso(), message: final };
+      task.history = [...(task.history ?? []), message, final];
+
+      try {
+        await this.taskStoreImpl.updateTask(taskId, {
+          status: task.status,
+          history: task.history,
+        });
+      } catch (err) {
+        logEvent('admin_persist_error', { taskId, error: String(err) });
+      }
+
+      yield {
         taskId,
         contextId,
-        status: {
-          state,
-          message: agentMessage(message, taskId, contextId),
-          timestamp: nowIso(),
-        },
         final: true,
-      });
-      bus.finished();
+        status: task.status,
+      };
     } finally {
       this.abortControllers.delete(taskId);
     }
   }
 
-  async cancelTask(taskId: string): Promise<void> {
+  override async cancel(task: Task): Promise<Task> {
+    const taskId = task.id;
     const controller = this.abortControllers.get(taskId);
     if (controller && !controller.signal.aborted) {
       controller.abort();
     }
+    task.status = {
+      state: TaskState.CANCELED,
+      timestamp: nowIso(),
+    };
+    return task;
   }
 }
 
 // ── Agent Card & Transport ───────────────────────────────────────
-
-export function buildAdminAgentCard(publicUrl?: string): SdkAgentCard {
-  const url = publicUrl ?? '';
-  return {
-    name: 'Vicoop Bridge Server Admin',
-    description:
-      'Manages client registration, revocation, and access control for Vicoop Bridge Server. Clients are WebSocket services that bridge local A2A agents to the server. Each client is scoped to an owner wallet and an explicit agent ID allowlist. Requires a bridge-issued opaque caller token (vbc_caller_*) tied to a wallet principal; obtain one by signing a SIWE message at POST /auth/siwe/exchange.',
-    version: '0.1.0',
-    protocolVersion: '0.3.0',
-    url,
-    preferredTransport: 'JSONRPC',
-    capabilities: { streaming: false, pushNotifications: false },
-    defaultInputModes: ['text/plain'],
-    defaultOutputModes: ['text/plain'],
-    skills: [
-      {
-        id: 'client-management',
-        name: 'Client Management',
-        description:
-          'Register, revoke, and list clients with per-agent-id authorization. Wallet-based ownership with RLS.',
-        tags: ['admin', 'auth', 'client', 'siwe'],
-      },
-    ],
-  };
-}
 
 export interface AdminAgentOptions {
   db: Sql;
@@ -499,10 +535,57 @@ export interface AdminAgentOptions {
   publicUrl?: string;
 }
 
-export function createAdminTransport(opts: AdminAgentOptions): JsonRpcTransportHandler {
-  const card = buildAdminAgentCard(opts.publicUrl);
+const ADMIN_DESCRIPTION =
+  'Manages client registration, revocation, and access control for Vicoop Bridge Server. ' +
+  'Clients are WebSocket services that bridge local A2A agents to the server. Each client ' +
+  'is scoped to an owner wallet and an explicit agent ID allowlist. Requires a bridge-issued ' +
+  'opaque caller token (vbc_caller_*) tied to a wallet principal; obtain one by signing a ' +
+  'SIWE message at POST /auth/siwe/exchange.';
+
+export function createAdminA2XAgent(opts: AdminAgentOptions): {
+  a2xAgent: A2XAgent;
+  handler: DefaultRequestHandler;
+  taskStore: PostgresTaskStore;
+} {
   const taskStore = new PostgresTaskStore(opts.db);
-  const executor = new AdminAgentExecutor(opts.db, opts.registry, taskStore);
-  const handler = new DefaultRequestHandler(card, taskStore, executor);
-  return new JsonRpcTransportHandler(handler);
+  const executor = new AdminA2XExecutor(opts.db, opts.registry, taskStore);
+
+  const a2xAgent = new A2XAgent({
+    taskStore,
+    executor,
+    protocolVersion: '0.3',
+  })
+    .setName('Vicoop Bridge Server Admin')
+    .setDescription(ADMIN_DESCRIPTION)
+    .setVersion('0.1.0')
+    .setDefaultUrl(opts.publicUrl ?? '/')
+    .setDefaultInputModes(['text/plain'])
+    .setDefaultOutputModes(['text/plain'])
+    .addSkill({
+      id: 'client-management',
+      name: 'Client Management',
+      description:
+        'Register, revoke, and list clients with per-agent-id authorization. Wallet-based ownership with RLS.',
+      tags: ['admin', 'auth', 'client', 'siwe'],
+    })
+    .addSecurityScheme(
+      'bridge',
+      new HttpBearerAuthorization({
+        scheme: 'bearer',
+        bearerFormat: 'Opaque',
+        description:
+          'Bridge-issued opaque bearer token (vbc_caller_*). Acquire via POST /auth/siwe/exchange by signing a SIWE message.',
+      }),
+    )
+    .addSecurityRequirement({ bridge: [] });
+  // The route layer enforces caller-token verification before
+  // dispatching to handler.handle(). We invoke handler.handle() without
+  // a RequestContext so a2x's per-request `_authenticate` path is
+  // skipped; the AgentCard still advertises the scheme + requirement
+  // (declarative, for spec-compliant card consumers) but the schemes'
+  // `validator` callbacks are never reached at runtime.
+
+  const handler = new DefaultRequestHandler(a2xAgent);
+  return { a2xAgent, handler, taskStore };
 }
+
