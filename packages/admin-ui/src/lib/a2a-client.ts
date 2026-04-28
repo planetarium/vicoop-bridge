@@ -1,33 +1,22 @@
-import {
-  ClientFactory,
-  JsonRpcTransportFactory,
-  type AuthenticationHandler,
-  type HttpHeaders,
-  createAuthenticatingFetchWithRetry,
-} from '@a2a-js/sdk/client';
-import type { Message, Task } from '@a2a-js/sdk';
+import { A2XClient } from '@a2x/sdk/client';
+import type { Message, Task } from '@a2x/sdk';
 
 export type { Message, Task };
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || window.location.origin;
 
-function createAuthHandler(getToken: () => string | null): AuthenticationHandler {
-  return {
-    headers: async (): Promise<HttpHeaders> => {
-      const token = getToken();
-      if (token) return { Authorization: `Bearer ${token}` };
-      return {};
-    },
-    shouldRetryWithHeaders: async () => undefined,
+/**
+ * Build an `A2XClient` whose every fetch carries the current bearer
+ * token. The token getter is called per request so token rotation
+ * (e.g. SIWE re-exchange) takes effect on the next call without
+ * rebuilding the client.
+ */
+export async function createA2AClient(getToken: () => string | null): Promise<A2XClient> {
+  const authFetch: typeof fetch = (input, init) => {
+    const token = getToken();
+    const headers = new Headers(init?.headers);
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+    return fetch(input, { ...init, headers });
   };
-}
-
-export async function createA2AClient(getToken: () => string | null) {
-  const authFetch = createAuthenticatingFetchWithRetry(fetch, createAuthHandler(getToken));
-
-  const factory = new ClientFactory({
-    transports: [new JsonRpcTransportFactory({ fetchImpl: authFetch })],
-  });
-
-  return factory.createFromUrl(SERVER_URL);
+  return new A2XClient(SERVER_URL, { fetch: authFetch });
 }

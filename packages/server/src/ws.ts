@@ -1,6 +1,14 @@
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { IncomingMessage, Server } from 'node:http';
-import { parseUpFrame, PROTOCOL_VERSION, type Part, type TaskStatus } from '@vicoop-bridge/protocol';
+import {
+  parseUpFrame,
+  PROTOCOL_VERSION,
+  type Part,
+  type TaskStatus as WireTaskStatus,
+  type Message as WireMessage,
+} from '@vicoop-bridge/protocol';
+import type { Message, TaskStatus } from '@a2x/sdk';
+import { TaskState } from '@a2x/sdk';
 import type { Registry } from './registry.js';
 import type { Sql } from './db.js';
 import { hashToken } from './token.js';
@@ -139,21 +147,35 @@ async function authenticateAndRegister(
   return { ok: true, clientId };
 }
 
-function toA2AMessage(
-  status: TaskStatus,
+function wireMessageToA2X(
+  m: WireMessage | undefined,
   taskId: string,
   contextId: string,
-): TaskStatus['message'] extends undefined ? undefined : object | undefined {
-  if (!status.message) return undefined;
-  const m = status.message;
+): Message | undefined {
+  if (!m) return undefined;
   return {
-    kind: 'message' as const,
-    role: m.role,
     messageId: m.messageId,
-    parts: m.parts as Part[],
+    role: m.role,
+    // Wire parts use `{kind, ...}` shape; a2x's internal Part type uses
+    // discriminator-by-field-presence. The v0.3 response mapper accepts
+    // either (text-part guard hits on `'text' in part`; file/data fall
+    // through to fallback that spreads). Cast keeps type-checker happy.
+    parts: m.parts as unknown as Message['parts'],
     taskId,
     contextId,
-  } as never;
+  };
+}
+
+function wireStatusToA2X(
+  status: WireTaskStatus,
+  taskId: string,
+  contextId: string,
+): TaskStatus {
+  return {
+    state: status.state as unknown as TaskStatus['state'],
+    timestamp: status.timestamp,
+    message: wireMessageToA2X(status.message, taskId, contextId),
+  };
 }
 
 function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOptions): void {
@@ -210,26 +232,26 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       case 'task.status': {
         const b = opts.registry.getBinding(frame.taskId);
         if (!b) return;
-        b.eventBus.publish({
-          kind: 'status-update',
+        b.sink.pushStatus({
           taskId: frame.taskId,
           contextId: b.contextId,
           final: false,
-          status: {
-            ...frame.status,
-            message: toA2AMessage(frame.status, frame.taskId, b.contextId) as never,
-          },
+          status: wireStatusToA2X(frame.status, frame.taskId, b.contextId),
         });
         break;
       }
       case 'task.artifact': {
         const b = opts.registry.getBinding(frame.taskId);
         if (!b) return;
-        b.eventBus.publish({
-          kind: 'artifact-update',
+        b.sink.pushArtifact({
           taskId: frame.taskId,
           contextId: b.contextId,
-          artifact: frame.artifact as never,
+          artifact: {
+            artifactId: frame.artifact.artifactId,
+            ...(frame.artifact.name !== undefined ? { name: frame.artifact.name } : {}),
+            // Wire-shape parts; see wireMessageToA2X for the shape note.
+            parts: frame.artifact.parts as unknown as Part[] as never,
+          },
           lastChunk: frame.lastChunk,
         });
         break;
@@ -237,17 +259,13 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       case 'task.complete': {
         const b = opts.registry.getBinding(frame.taskId);
         if (!b) return;
-        b.eventBus.publish({
-          kind: 'status-update',
+        b.sink.pushStatus({
           taskId: frame.taskId,
           contextId: b.contextId,
           final: true,
-          status: {
-            ...frame.status,
-            message: toA2AMessage(frame.status, frame.taskId, b.contextId) as never,
-          },
+          status: wireStatusToA2X(frame.status, frame.taskId, b.contextId),
         });
-        b.eventBus.finished();
+        b.sink.finish();
         opts.registry.unbindTask(frame.taskId);
         logEvent('task_completed', {
           agentId: b.agentId,
@@ -259,25 +277,23 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       case 'task.fail': {
         const b = opts.registry.getBinding(frame.taskId);
         if (!b) return;
-        b.eventBus.publish({
-          kind: 'status-update',
+        b.sink.pushStatus({
           taskId: frame.taskId,
           contextId: b.contextId,
           final: true,
           status: {
-            state: 'failed',
+            state: TaskState.FAILED,
             timestamp: new Date().toISOString(),
             message: {
-              kind: 'message',
-              role: 'agent',
               messageId: `${frame.taskId}-err`,
-              parts: [{ kind: 'text', text: `${frame.error.code}: ${frame.error.message}` }],
+              role: 'agent',
+              parts: [{ text: `${frame.error.code}: ${frame.error.message}` }],
               taskId: frame.taskId,
               contextId: b.contextId,
-            } as never,
+            },
           },
         });
-        b.eventBus.finished();
+        b.sink.finish();
         opts.registry.unbindTask(frame.taskId);
         logEvent('task_failed_by_client', {
           agentId: b.agentId,

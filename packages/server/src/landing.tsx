@@ -1,10 +1,10 @@
 import type { FC } from 'hono/jsx';
 import { raw } from 'hono/html';
-import type { AgentCard as SdkAgentCard } from '@a2a-js/sdk';
+import type { AgentCardV03 } from '@a2x/sdk';
 
 interface LandingProps {
-  adminCard: SdkAgentCard;
-  clients: Array<{ id: string; url: string; card: SdkAgentCard }>;
+  adminCard: AgentCardV03;
+  clients: Array<{ id: string; url: string; card: AgentCardV03 }>;
   adminWallets: string[];
 }
 

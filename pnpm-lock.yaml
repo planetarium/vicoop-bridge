@@ -20,9 +20,9 @@ importers:
 
   packages/admin-ui:
     dependencies:
-      '@a2a-js/sdk':
-        specifier: ^0.3.13
-        version: 0.3.13(express@5.2.1)
+      '@a2x/sdk':
+        specifier: ^0.11.0
+        version: 0.11.0(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6))(zod@4.3.6)
       '@rainbow-me/rainbowkit':
         specifier: ^2
         version: 2.2.10(@tanstack/react-query@5.99.0(react@19.2.5))(@types/react@19.2.14)(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(typescript@5.9.3)(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6))(wagmi@2.19.5(@tanstack/query-core@5.99.0)(@tanstack/react-query@5.99.0(react@19.2.5))(@types/react@19.2.14)(bufferutil@4.1.0)(react@19.2.5)(typescript@5.9.3)(utf-8-validate@5.0.10)(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6))(zod@4.3.6))
@@ -100,9 +100,9 @@ importers:
 
   packages/server:
     dependencies:
-      '@a2a-js/sdk':
-        specifier: ^0.3.13
-        version: 0.3.13(express@5.2.1)
+      '@a2x/sdk':
+        specifier: ^0.11.0
+        version: 0.11.0(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76)
       '@ai-sdk/anthropic':
         specifier: ^3.0.69
         version: 3.0.69(zod@3.25.76)
@@ -161,19 +161,28 @@ importers:
 
 packages:
 
-  '@a2a-js/sdk@0.3.13':
-    resolution: {integrity: sha512-BZr0f9JVNQs3GKOM9xINWCh6OKIJWZFPyqqVqTym5mxO2Eemc6I/0zL7zWnljHzGdaf5aZQyQN5xa6PSH62q+A==}
-    engines: {node: '>=18'}
+  '@a2x/sdk@0.11.0':
+    resolution: {integrity: sha512-zvgVzB+qf6okl7zLfZhaPD1/cNdH4Qkjr9nhl6jElkpOMaHFgietSfNBzSVDbbt/utEAwumZOUslZ4IxZuvo8w==}
+    engines: {node: '>=20.0.0'}
     peerDependencies:
-      '@bufbuild/protobuf': ^2.10.2
-      '@grpc/grpc-js': ^1.11.0
-      express: ^4.21.2 || ^5.1.0
+      '@anthropic-ai/sdk': '>=0.52.0'
+      '@google/genai': '>=1.0.0'
+      openai: '>=4.0.0'
+      viem: '>=2.21.0'
+      x402: '>=1.2.0'
+      zod: ^3.0.0
     peerDependenciesMeta:
-      '@bufbuild/protobuf':
+      '@anthropic-ai/sdk':
         optional: true
-      '@grpc/grpc-js':
+      '@google/genai':
         optional: true
-      express:
+      openai:
+        optional: true
+      viem:
+        optional: true
+      x402:
+        optional: true
+      zod:
         optional: true
 
   '@adraffy/ens-normalize@1.10.1':
@@ -3824,10 +3833,6 @@ packages:
   util@0.12.5:
     resolution: {integrity: sha512-kZf/K6hEIrWHI6XqOFUiiMa+79wE/D8Q+NCNAWclkyg3b4d2k7s0QGepNjiABc+aR3N1PAyHL7p6UcLY6LmrnA==}
 
-  uuid@11.1.0:
-    resolution: {integrity: sha512-0/A9rDy9P7cJ+8w1c9WD9V//9Wj15Ce2MPz8Ri6032usz+NfePxx5AcN3bN+r6ZL6jEo066/yNYB3tn4pQEx+A==}
-    hasBin: true
-
   uuid@8.3.2:
     resolution: {integrity: sha512-+NYs2QeMWy+GWFOEm9xnn6HCDp0l7QBD7ml8zLUmJ+93Q5NF0NocErnwkTkXVFNiX3/fpC6afS8Dhb/gz7R7eg==}
     hasBin: true
@@ -4108,11 +4113,15 @@ packages:
 
 snapshots:
 
-  '@a2a-js/sdk@0.3.13(express@5.2.1)':
-    dependencies:
-      uuid: 11.1.0
+  '@a2x/sdk@0.11.0(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76)':
     optionalDependencies:
-      express: 5.2.1
+      viem: 2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76)
+      zod: 3.25.76
+
+  '@a2x/sdk@0.11.0(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6))(zod@4.3.6)':
+    optionalDependencies:
+      viem: 2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6)
+      zod: 4.3.6
 
   '@adraffy/ens-normalize@1.10.1': {}
 
@@ -8938,8 +8947,6 @@ snapshots:
       is-generator-function: 1.1.2
       is-typed-array: 1.1.15
       which-typed-array: 1.1.20
-
-  uuid@11.1.0: {}
 
   uuid@8.3.2: {}
 

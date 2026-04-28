@@ -5,15 +5,12 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import { stream } from 'hono/streaming';
 import { html } from 'hono/html';
 import {
+  A2XAgent,
   DefaultRequestHandler,
-  InMemoryTaskStore,
-  JsonRpcTransportHandler,
-} from '@a2a-js/sdk/server';
-import type { AgentCard as SdkAgentCard } from '@a2a-js/sdk';
-import type { AgentCard as WireAgentCard } from '@vicoop-bridge/protocol';
-import { ServerAgentExecutor } from './executor.js';
+  type AgentCardV03,
+} from '@a2x/sdk';
 import type { ClientConnection, Registry } from './registry.js';
-import { createAdminTransport, buildAdminAgentCard, getAdminWallets } from './admin.js';
+import { createAdminA2XAgent, getAdminWallets } from './admin.js';
 import { agentAuthMiddleware, getAgentConn } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, verifyCallerToken } from './auth/caller-token.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
@@ -23,6 +20,7 @@ import type { GoogleConfig } from './auth/google-oauth.js';
 import type { Sql } from './db.js';
 import { Landing } from './landing.js';
 import { logEvent } from './log.js';
+import { buildAgentA2XAgent, type AgentA2XOptions } from './agent-card.js';
 
 export interface ServerHttpOptions {
   registry: Registry;
@@ -32,134 +30,70 @@ export interface ServerHttpOptions {
   deviceFlowStateSecret?: string;
 }
 
-interface AgentCardOptions {
-  publicUrl: string | undefined;
-  deviceFlowEnabled: boolean;
-}
-
-function toSdkAgentCard(
-  wire: WireAgentCard,
-  conn: ClientConnection,
-  opts: AgentCardOptions,
-): SdkAgentCard {
-  const { publicUrl, deviceFlowEnabled } = opts;
-  const url = publicUrl
-    ? `${publicUrl}/agents/${conn.agentId}`
-    : `/agents/${conn.agentId}`;
-  const card: SdkAgentCard = {
-    name: wire.name,
-    description: wire.description ?? '',
-    version: wire.version,
-    protocolVersion: wire.protocolVersion ?? '0.3.0',
-    url,
-    preferredTransport: 'JSONRPC',
-    capabilities: {
-      streaming: wire.capabilities?.streaming ?? false,
-      pushNotifications: wire.capabilities?.pushNotifications ?? false,
-    },
-    defaultInputModes: wire.defaultInputModes ?? ['text/plain'],
-    defaultOutputModes: wire.defaultOutputModes ?? ['text/plain'],
-    skills: (wire.skills ?? []).map((s) => ({
-      id: s.id,
-      name: s.name,
-      description: s.description ?? '',
-      tags: s.tags ?? [],
-    })),
-  };
-  if (conn.allowedCallers.length > 0) {
-    // The device-flow scheme only matches a real endpoint when Google OAuth is
-    // configured on this deployment (mountDeviceFlow call below). Advertising
-    // it unconditionally would point clients at a 404.
-    if (deviceFlowEnabled) {
-      card.securitySchemes = {
-        bridge: {
-          type: 'oauth2',
-          description:
-            'Bridge-issued opaque bearer token. Acquire via /oauth/token (Google device flow) or /auth/siwe/exchange (SIWE).',
-          flows: {
-            deviceAuthorization: {
-              deviceAuthorizationUrl: publicUrl
-                ? `${publicUrl}/oauth/device/code`
-                : '/oauth/device/code',
-              tokenUrl: publicUrl ? `${publicUrl}/oauth/token` : '/oauth/token',
-              scopes: {},
-            },
-          },
-        } as unknown as NonNullable<SdkAgentCard['securitySchemes']>[string],
-      };
-    } else {
-      card.securitySchemes = {
-        bridge: {
-          type: 'http',
-          scheme: 'bearer',
-          bearerFormat: 'Opaque',
-          description:
-            'Bridge-issued opaque bearer token (vbc_caller_*). Acquire via POST /auth/siwe/exchange by signing a SIWE message.',
-        },
-      };
-    }
-    card.security = [{ bridge: [] }];
-  }
-  return card;
-}
-
 export function createHttpApp(opts: ServerHttpOptions): Hono {
   const app = new Hono();
 
-  const taskStore = new InMemoryTaskStore();
-  const transports = new Map<string, JsonRpcTransportHandler>();
+  // Built-in admin agent at root. The admin agent owns its own taskStore
+  // (Postgres-backed) for context-aware history loading; client agents
+  // share a separate taskStore so their state isn't entangled with the
+  // admin's persistence model.
+  const { handler: adminHandler, a2xAgent: adminA2X, taskStore: adminTaskStore } =
+    createAdminA2XAgent({
+      db: opts.db,
+      registry: opts.registry,
+      publicUrl: opts.publicUrl,
+    });
+  const adminCard = adminA2X.getAgentCard() as AgentCardV03;
+
+  // Per-agent A2XAgent cache. Rebuilds on caller-/agent-change so the
+  // card reflects the latest connection state.
+  const agentCache = new Map<string, A2XAgent>();
+  const handlerCache = new Map<string, DefaultRequestHandler>();
 
   // Device flow endpoints (/oauth/device/code, /oauth/token) are only mounted
   // when Google OAuth is fully configured. Surface this to the agent card and
   // the agent-auth error hint so SIWE-only deployments don't point callers at
   // non-existent endpoints.
   const deviceFlowEnabled = Boolean(opts.google && opts.publicUrl);
-  const agentCardOpts: AgentCardOptions = {
+  const agentCardOpts: AgentA2XOptions = {
     publicUrl: opts.publicUrl,
     deviceFlowEnabled,
   };
 
-  // Built-in admin agent at root
-  const adminTransport = createAdminTransport({
-    db: opts.db,
-    registry: opts.registry,
-    publicUrl: opts.publicUrl,
-  });
-  const adminCard = buildAdminAgentCard(opts.publicUrl);
-
-  function getTransport(conn: ClientConnection): JsonRpcTransportHandler {
-    // Rebuild transport when security state changes (allowedCallers toggled)
-    const cached = transports.get(conn.agentId);
+  function getAgentForConn(conn: ClientConnection): A2XAgent {
+    const cached = agentCache.get(conn.agentId);
     if (cached) return cached;
-    const card = toSdkAgentCard(conn.agentCard, conn, agentCardOpts);
-    const executor = new ServerAgentExecutor(conn.agentId, opts.registry);
-    const handler = new DefaultRequestHandler(card, taskStore, executor);
-    const transport = new JsonRpcTransportHandler(handler);
-    transports.set(conn.agentId, transport);
-    return transport;
+    const a2x = buildAgentA2XAgent(conn, adminTaskStore, opts.registry, agentCardOpts);
+    agentCache.set(conn.agentId, a2x);
+    return a2x;
   }
 
-  // Invalidate cached transport when allowedCallers changes so the
-  // handler's card reflects the updated security fields.
+  function getHandlerForConn(conn: ClientConnection): DefaultRequestHandler {
+    const cached = handlerCache.get(conn.agentId);
+    if (cached) return cached;
+    const handler = new DefaultRequestHandler(getAgentForConn(conn));
+    handlerCache.set(conn.agentId, handler);
+    return handler;
+  }
+
+  // Invalidate cached A2XAgent + handler when allowedCallers changes so
+  // the rendered card reflects the updated security fields.
   opts.registry.onCallerChange((agentId) => {
-    transports.delete(agentId);
+    agentCache.delete(agentId);
+    handlerCache.delete(agentId);
   });
-  // Also invalidate on (re)registration or disconnect. The SDK's
-  // DefaultRequestHandler captures the agent card at construction time —
-  // including `capabilities.streaming` — so a client that reconnects with
-  // an updated card would otherwise be served by a stale transport that
-  // still advertises the old capabilities. Concrete failure mode: after a
-  // client upgrades from streaming:false → streaming:true, `message/stream`
-  // requests are rejected with `unsupportedOperation` even though the
-  // public `/.well-known/agent-card.json` reports `streaming:true` (that
-  // endpoint reads `conn.agentCard` on every request, while the transport
-  // captures a snapshot).
+  // Also invalidate on (re)registration or disconnect. The handler
+  // captures the agent card at construction time — including
+  // `capabilities.streaming` — so a client that reconnects with an
+  // updated card would otherwise be served by a stale handler that
+  // still advertises the old capabilities.
   opts.registry.onAgentChange((agentId) => {
-    transports.delete(agentId);
+    agentCache.delete(agentId);
+    handlerCache.delete(agentId);
   });
 
-  async function handleTransportResult(result: unknown, c: Context) {
-    if (Symbol.asyncIterator in (result as object)) {
+  async function handleHandlerResult(result: unknown, c: Context) {
+    if (result && typeof result === 'object' && Symbol.asyncIterator in (result as object)) {
       const iter = result as AsyncGenerator<unknown>;
       c.header('Content-Type', 'text/event-stream');
       c.header('Cache-Control', 'no-cache');
@@ -170,7 +104,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         }
       });
     }
-    return c.json(result as unknown as Record<string, unknown>);
+    return c.json(result as Record<string, unknown>);
   }
 
   app.get('/healthz', (c) => c.json({ ok: true }));
@@ -185,7 +119,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       url: opts.publicUrl
         ? `${opts.publicUrl}/agents/${a.agentId}`
         : `/agents/${a.agentId}`,
-      card: toSdkAgentCard(a.agentCard, a, agentCardOpts),
+      card: getAgentForConn(a).getAgentCard() as AgentCardV03,
     }));
 
     const accept = c.req.header('accept') ?? '';
@@ -278,8 +212,8 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       };
     }
 
-    const result = await adminTransport.handle(JSON.stringify(parsed));
-    return handleTransportResult(result, c);
+    const result = await adminHandler.handle(parsed);
+    return handleHandlerResult(result, c);
   });
 
   // Device flow endpoints (RFC-8628) — optional: only mounted when Google config is provided
@@ -326,7 +260,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const id = c.req.param('id');
     const conn = opts.registry.getAgent(id);
     if (!conn) return c.json({ error: 'agent not connected' }, 404);
-    return c.json(toSdkAgentCard(conn.agentCard, conn, agentCardOpts));
+    return c.json(getAgentForConn(conn).getAgentCard() as AgentCardV03);
   });
 
   // Client agent A2A endpoints (auth middleware checks allowedCallers)
@@ -342,9 +276,10 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     });
 
     const rawBody = await c.req.text();
-    const transport = getTransport(conn);
-    const result = await transport.handle(rawBody);
-    return handleTransportResult(result, c);
+    const parsed = JSON.parse(rawBody);
+    const handler = getHandlerForConn(conn);
+    const result = await handler.handle(parsed);
+    return handleHandlerResult(result, c);
   });
 
   // Admin UI — serve static SPA from /admin
