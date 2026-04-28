@@ -1,13 +1,14 @@
 # Install vicoop-bridge-client
 
-Onboarding guide for connecting a local A2A backend (OpenClaw, with `echo`
-available for testing) to a deployed vicoop-bridge server. The end state is
-a long-running `vicoop-client` process on your host that bridges inbound A2A
-traffic at `POST <bridge>/agents/<your-agent-id>` to your local backend.
+Onboarding guide for connecting a local A2A backend (OpenClaw, Claude Code,
+with `echo` available for testing) to a deployed vicoop-bridge server. The
+end state is a long-running `vicoop-client` process on your host that bridges
+inbound A2A traffic at `POST <bridge>/agents/<your-agent-id>` to your local
+backend.
 
-Additional backends (Claude Code, Codex, ...) are described in
-`docs/design.md` §5 but are not in the published client bundle yet —
-`packages/client/src/cli.ts` currently only registers `echo` and `openclaw`.
+Additional backends (Codex, ...) are described in `docs/design.md` §5 but are
+not in the published client bundle yet. The released client currently
+registers `echo`, `openclaw`, and `claude`.
 
 This doc covers the **post-release install path** (the `install.sh`
 one-liner fetching a published `client-v*` bundle). Contrast with:
@@ -79,6 +80,7 @@ $INSTALL_DIR/
 ├── bin/vicoop-client        # bash wrapper that execs node dist/cli.js
 ├── dist/                    # compiled JS
 ├── cards/openclaw.json      # example agent card
+├── cards/claude.json        # example Claude card
 ├── node_modules/            # pruned prod deps
 └── package.json
 ```
