@@ -1,0 +1,55 @@
+name: Server CI
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/server-ci.yml'
+      - 'packages/server/**'
+      - 'packages/protocol/**'
+      - 'packages/admin-ui/**'
+      - 'pnpm-lock.yaml'
+      - 'package.json'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/server-ci.yml'
+      - 'packages/server/**'
+      - 'packages/protocol/**'
+      - 'packages/admin-ui/**'
+      - 'pnpm-lock.yaml'
+      - 'package.json'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 9.12.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build protocol
+        run: pnpm --filter @vicoop-bridge/protocol build
+
+      - name: Typecheck server
+        run: pnpm --filter @vicoop-bridge/server typecheck
+
+      - name: Build server
+        run: pnpm --filter @vicoop-bridge/server build
+
+      - name: Smoke test A2X SDK import
+        working-directory: packages/server
+        run: node --input-type=module -e "await import('@a2x/sdk'); console.log('a2x-sdk-import-ok')"
