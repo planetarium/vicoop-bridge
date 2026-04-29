@@ -115,7 +115,7 @@ ${scope}
 
 Clients are services that connect to the server via WebSocket to register A2A agents. Each client has:
 - **id**: Unique identifier (UUID)
-- **owner_wallet**: Wallet address of the owner
+- **owner_principal**: Principal of the owner (e.g. \`eth:0x<40 hex>\` or \`google:sub:<sub>\`)
 - **client_name**: Human-readable name
 - **allowed_agent_ids**: List of agent IDs this client is authorized to register
 - **revoked**: Whether this client has been revoked
@@ -126,7 +126,7 @@ Clients are services that connect to the server via WebSocket to register A2A ag
 
 - Use \`query_*\` tools to read clients and agent policies. RLS enforces ownership (admins see all).
 - Client lifecycle mutations are exposed as custom GraphQL functions:
-  - \`mutate_registerClient(clientName, allowedAgentIds, ownerWallet?)\` — creates a new client and returns the raw bearer token (shown only once). Admins may pass \`ownerWallet\` to create on behalf of another wallet; non-admins always own the resulting client.
+  - \`mutate_registerClient(clientName, allowedAgentIds, ownerPrincipal?)\` — creates a new client and returns the raw bearer token (shown only once). Admins may pass \`ownerPrincipal\` to create on behalf of another principal; non-admins always own the resulting client.
   - \`mutate_revokeClient(clientId)\` / \`mutate_unrevokeClient(clientId)\` — toggle the \`revoked\` flag. Existing WebSocket sessions stay connected until they reconnect.
   - \`mutate_rotateClientToken(clientId)\` — issues a new bearer token and invalidates the previous one. Returns the raw token once.
   - \`mutate_updateClientAllowedAgents(clientId, allowedAgentIds)\` — replaces the agent allowlist.
@@ -142,11 +142,11 @@ Each agent has an access policy (\`agent_policies\` table) with an \`allowed_cal
 - **Empty \`allowed_callers\`**: Agent is public — anyone can call it via A2A.
 - **Non-empty \`allowed_callers\`**: Agent requires an authenticated Bearer token, and only listed principals can call.
 
-Supported principal formats in \`allowed_callers\`:
+Supported principal formats in \`allowed_callers\` (and as \`owner_principal\`):
 - \`eth:0x<40 hex>\` — SIWE-authenticated Ethereum address
 - \`google:sub:<sub>\` — specific Google account by stable id
 - \`google:email:<email>\` — Google account by email (pinned to sub on first match)
-- \`google:domain:<domain>\` — any verified Google Workspace account from the domain
+- \`google:domain:<domain>\` — any verified Google Workspace account from the domain (allowed_callers only)
 
 When an agent registers via WebSocket, a default policy (public) is auto-created. Use \`add_caller\` to restrict access. The agent card automatically advertises \`securitySchemes\` when callers are configured.
 
@@ -157,7 +157,7 @@ Your conversation history is persisted in PostgreSQL. You remember all previous 
 ## Important rules
 
 - When registering a client or rotating a token, always warn the user that the raw token is shown only once.
-- When registering on behalf of another wallet (admin only), echo back the chosen \`ownerWallet\` so the user can confirm.
+- When registering on behalf of another principal (admin only), echo back the chosen \`ownerPrincipal\` so the user can confirm.
 - When adding a caller, explain that the agent will require an authenticated bearer token from that point on (either SIWE-exchanged or Google-device-flow-issued, depending on the principal format).
 - Present data clearly in tables or lists.
 - If asked about something outside client management, politely explain your scope.
@@ -167,7 +167,7 @@ Your conversation history is persisted in PostgreSQL. You remember all previous 
 - **Connection types**: List queries return \`{ nodes { ...fields } totalCount }\`.
 - **Filtering**: Use \`condition\` argument, e.g. \`condition: { revoked: false }\`.
 - **Sorting**: Use \`orderBy\` with values like \`CREATED_AT_DESC\`.
-- **Field naming**: snake_case SQL → camelCase GraphQL (e.g. \`owner_wallet\` → \`ownerWallet\`).
+- **Field naming**: snake_case SQL → camelCase GraphQL (e.g. \`owner_principal\` → \`ownerPrincipal\`).
 `;
 
   if (sdl) {
@@ -180,6 +180,11 @@ Your conversation history is persisted in PostgreSQL. You remember all previous 
 // ── Custom Tools (token generation, active agents) ───────────────
 
 function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
+  // Admin agent authenticates via SIWE only (see http.tsx root POST /), so the
+  // current principal is always 'eth:<wallet>'. Caller-side admin tools that
+  // hit the DB pass this through as jwt.claims.principal_id so RLS predicates
+  // (owner_principal = current_principal()) match owned rows.
+  const principalId = `eth:${walletAddress.toLowerCase()}`;
   return {
     list_active_agents: tool({
       description: 'List currently connected agents with their client identity and connection time. Non-admin users only see their own agents.',
@@ -187,7 +192,7 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
       execute: async () => {
         const admin = isAdmin(walletAddress);
         return registry.listAgents()
-          .filter((a) => admin || a.ownerWallet.toLowerCase() === walletAddress.toLowerCase())
+          .filter((a) => admin || a.ownerPrincipal === principalId)
           .map((a) => ({
             agent_id: a.agentId,
             client_id: a.clientId,
@@ -219,7 +224,7 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
         const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
         const result = await db.begin(async (tx) => {
           await tx`SELECT set_config('role', 'app_authenticated', true)`;
-          await tx`SELECT set_config('jwt.claims.wallet_address', ${walletAddress.toLowerCase()}, true)`;
+          await tx`SELECT set_config('jwt.claims.principal_id', ${principalId}, true)`;
           await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
           return tx`
             UPDATE agent_policies
@@ -227,14 +232,14 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
                 updated_at = now()
             WHERE agent_id = ${agent_id}
               AND NOT (${normalized} = ANY(allowed_callers))
-            RETURNING agent_id, owner_wallet, allowed_callers
+            RETURNING agent_id, owner_principal, allowed_callers
           `;
         });
         if (result.length === 0) {
           const adminAddrs = process.env.ADMIN_WALLET_ADDRESSES ?? '';
           const existing = await db.begin(async (tx) => {
             await tx`SELECT set_config('role', 'app_authenticated', true)`;
-            await tx`SELECT set_config('jwt.claims.wallet_address', ${walletAddress.toLowerCase()}, true)`;
+            await tx`SELECT set_config('jwt.claims.principal_id', ${principalId}, true)`;
             await tx`SELECT set_config('app.admin_addresses', ${adminAddrs}, true)`;
             return tx`SELECT allowed_callers FROM agent_policies WHERE agent_id = ${agent_id}`;
           });
@@ -266,7 +271,7 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
         const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
         const result = await db.begin(async (tx) => {
           await tx`SELECT set_config('role', 'app_authenticated', true)`;
-          await tx`SELECT set_config('jwt.claims.wallet_address', ${walletAddress.toLowerCase()}, true)`;
+          await tx`SELECT set_config('jwt.claims.principal_id', ${principalId}, true)`;
           await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
           return tx`
             UPDATE agent_policies
@@ -274,7 +279,7 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
                 updated_at = now()
             WHERE agent_id = ${agent_id}
               AND ${normalized} = ANY(allowed_callers)
-            RETURNING agent_id, owner_wallet, allowed_callers
+            RETURNING agent_id, owner_principal, allowed_callers
           `;
         });
         if (result.length === 0) {
@@ -295,10 +300,10 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
         const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
         const result = await db.begin(async (tx) => {
           await tx`SELECT set_config('role', 'app_authenticated', true)`;
-          await tx`SELECT set_config('jwt.claims.wallet_address', ${walletAddress.toLowerCase()}, true)`;
+          await tx`SELECT set_config('jwt.claims.principal_id', ${principalId}, true)`;
           await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
           return tx`
-            SELECT agent_id, owner_wallet, allowed_callers, created_at, updated_at
+            SELECT agent_id, owner_principal, allowed_callers, created_at, updated_at
             FROM agent_policies WHERE agent_id = ${agent_id}
           `;
         });
@@ -306,7 +311,7 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
         const policy = result[0];
         return {
           agent_id: policy.agent_id,
-          owner_wallet: policy.owner_wallet,
+          owner_principal: policy.owner_principal,
           allowed_callers: policy.allowed_callers,
           is_public: (policy.allowed_callers as string[]).length === 0,
         };
@@ -398,8 +403,9 @@ class AdminA2XExecutor extends AgentExecutor {
 
     const metadata = (message as { metadata?: Record<string, unknown> }).metadata;
     const walletAddress = metadata?._walletAddress as string | undefined;
+    const principalId = metadata?._principalId as string | undefined;
     const bearerToken = metadata?._bearerToken as string | undefined;
-    if (!walletAddress || !bearerToken) {
+    if (!walletAddress || !principalId || !bearerToken) {
       throw new InvalidRequestError('Authenticated wallet address is required.');
     }
 
@@ -436,7 +442,7 @@ class AdminA2XExecutor extends AgentExecutor {
         // context, plus any history already on the current task.
         const previousTasks = await this.taskStoreImpl.loadByContextId(
           contextId,
-          walletAddress,
+          principalId,
           taskId,
         );
         const contextHistory: Message[] = [];

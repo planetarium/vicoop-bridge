@@ -42,10 +42,10 @@ what a real integrator would do against a production bridge.
 You do **not** need your wallet in `ADMIN_WALLET_ADDRESSES`. Every step below
 works for non-admin callers:
 
-- `register_client()` defaults `owner_wallet` to the caller's SIWE address
-  (explicit `ownerWallet` is admin-only, but the default is what we want).
+- `register_client()` defaults `owner_principal` to the caller's principal
+  (explicit `ownerPrincipal` is admin-only, but the default is what we want).
 - `agent_policies_update` RLS is `owner OR is_admin`, and the auto-created
-  policy's owner is your wallet.
+  policy's owner is your principal.
 - The admin agent at `POST /` gates only on "caller token has `eth:*`
   principal", not on admin membership.
 
@@ -133,9 +133,10 @@ echo "client_id=$CLIENT_ID"
 echo "client_token=$CLIENT_TOKEN"   # raw 64-hex token — record it, never retrievable again
 ```
 
-Owner defaults to your SIWE wallet. `ownerWallet` can be passed explicitly,
-but only admins may actually override it; non-admin attempts are silently
-replaced with the caller's own wallet (`register_client` in `schema.sql`).
+Owner defaults to your principal (SIWE → `eth:0x...`). `ownerPrincipal` can be
+passed explicitly, but only admins may actually override it; non-admin
+attempts are silently replaced with the caller's own principal
+(`register_client` in `schema.sql`).
 
 ## Step 3 — Run the echo client against WSS
 
@@ -169,7 +170,7 @@ on every supported platform. We use this in the cleanup step instead of
 agent-id substring.
 
 On WS registration, `agent_policies` auto-inserts a row keyed by `agent_id`
-with `owner_wallet=<your wallet>` and empty `allowed_callers` (publicly
+with `owner_principal=<your principal>` and empty `allowed_callers` (publicly
 callable).
 
 ## Step 4 — Public sanity check

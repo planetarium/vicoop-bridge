@@ -162,9 +162,9 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   mountSiweExchange(app, { sql: opts.db, domain: siweDomain });
 
   // Root POST — admin agent A2A endpoint. Requires opaque caller token with
-  // an `eth:*` principal (admin agent is wallet-based; Google-only callers
-  // can still call /agents/:id but have no admin GraphQL access under the
-  // current owner_wallet schema).
+  // an `eth:*` principal (admin onboarding stays wallet-only; Google callers
+  // can call /agents/:id but the admin agent itself is wallet-gated by design,
+  // see issue #79).
   app.post('/', async (c) => {
     const authHeader = c.req.header('Authorization');
     const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
@@ -208,6 +208,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       parsed.params.message.metadata = {
         ...parsed.params.message.metadata,
         _walletAddress: walletAddress,
+        _principalId: `eth:${walletAddress.toLowerCase()}`,
         _bearerToken: bearerToken,
       };
     }
