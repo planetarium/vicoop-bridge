@@ -129,11 +129,11 @@ TOKEN=$(a2a-wallet siwe auth \
 # The CLI's token is base64url(JSON({message, signature})). Decode and pipe
 # the {message, signature} JSON straight into the exchange endpoint — never
 # write the signed payload to disk where another local user could read it
-# off /tmp before we delete it. GNU base64 uses -d, BSD/macOS uses -D.
+# off /tmp before we delete it. `openssl base64 -d -A` works on macOS and
+# Linux, so we avoid shell-specific word-splitting around `base64 -d/-D`.
 PAD=$(printf '%*s' $(( (4 - ${#TOKEN} % 4) % 4 )) '' | tr ' ' '=')
-if printf '' | base64 -d >/dev/null 2>&1; then B64DEC='base64 -d'; else B64DEC='base64 -D'; fi
 
-CALLER_TOKEN=$(echo "${TOKEN}${PAD}" | tr '_-' '/+' | $B64DEC \
+CALLER_TOKEN=$(echo "${TOKEN}${PAD}" | tr '_-' '/+' | openssl base64 -d -A \
   | curl -sX POST "$BRIDGE_URL/auth/siwe/exchange" \
       -H 'Content-Type: application/json' --data-binary @- \
   | jq -r .access_token)
