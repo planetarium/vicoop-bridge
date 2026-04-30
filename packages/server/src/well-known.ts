@@ -98,6 +98,36 @@ function collectPairs(deps: WellKnownDeps): ConnectionPair[] {
   return deps.listAgents().map((conn) => ({ conn, card: deps.getAgentCard(conn) }));
 }
 
+// Mentionable v0.1 has two hard requirements that constrain when the
+// well-known surface can serve at all:
+//   • §2 requires HTTPS at the .well-known URL ("Plain HTTP is not
+//     supported"). A bridge running on http:// would publish addresses
+//     that no conformant resolver will accept.
+//   • §1 requires a multi-label domain ("Single-label hostnames (e.g.
+//     `localhost`) are rejected"). The `subject` field of the JRD must
+//     match the queried `acct:` URI and §2's domain validation makes a
+//     bare `localhost` unverifiable.
+// Bridges deployed for local development with PUBLIC_URL=http://localhost
+// fail both checks; the Mentionable surface returns 404 for them while
+// every other route continues to work, so smoke-testing Mentionable
+// requires either a real HTTPS deployment or a multi-label dev domain
+// (e.g. `https://agent.localhost` behind a reverse proxy with a
+// self-signed cert — see Mentionable §1 for the recommended forms).
+// Type predicate so call sites that pass the check can use deps.publicUrl
+// and deps.domain as `string` without re-asserting.
+function isMentionableEligible(
+  deps: WellKnownDeps,
+): deps is WellKnownDeps & { publicUrl: string; domain: string } {
+  if (!deps.publicUrl || !deps.domain) return false;
+  if (!deps.publicUrl.toLowerCase().startsWith('https://')) return false;
+  // Quick multi-label test: must contain at least one dot. IP literals
+  // (e.g. 192.168.1.1) pass — they're not globally meaningful but the
+  // spec validation ladders are not blocked by them either, so we accept
+  // them rather than introducing a fragile hostname-classifier here.
+  if (!deps.domain.includes('.')) return false;
+  return true;
+}
+
 function resolveLocal(deps: WellKnownDeps, local: string): ResolvedLocal | undefined {
   const lower = local.toLowerCase();
   if (lower === MENTIONABLE_ADMIN_LOCAL.toLowerCase()) {
@@ -156,8 +186,8 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
   app.use('/.well-known/mentionable-agents.json', noStoreOnAllResponses);
 
   app.get('/.well-known/webfinger', (c) => {
-    if (!deps.domain || !deps.publicUrl) {
-      return c.json({ error: 'webfinger not available (no PUBLIC_URL configured)' }, 404);
+    if (!isMentionableEligible(deps)) {
+      return c.json({ error: 'webfinger not available (PUBLIC_URL must be HTTPS with a multi-label hostname)' }, 404);
     }
     const resource = c.req.query('resource');
     if (!resource) {
@@ -207,8 +237,8 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
   });
 
   app.get('/.well-known/agent-card/:local', (c) => {
-    if (!deps.domain || !deps.publicUrl) {
-      return c.json({ error: 'agent-card not available (no PUBLIC_URL configured)' }, 404);
+    if (!isMentionableEligible(deps)) {
+      return c.json({ error: 'agent-card not available (PUBLIC_URL must be HTTPS with a multi-label hostname)' }, 404);
     }
     const local = c.req.param('local');
     if (!isValidMentionableLocal(local)) {
@@ -227,8 +257,8 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
   });
 
   app.get('/.well-known/mentionable-agents.json', (c) => {
-    if (!deps.domain || !deps.publicUrl) {
-      return c.json({ error: 'directory not available (no PUBLIC_URL configured)' }, 404);
+    if (!isMentionableEligible(deps)) {
+      return c.json({ error: 'directory not available (PUBLIC_URL must be HTTPS with a multi-label hostname)' }, 404);
     }
     const directory = buildAgentDirectory({
       baseUrl: deps.publicUrl,
@@ -250,8 +280,10 @@ export function buildLandingDirectory(
   deps: WellKnownDeps,
   pairs?: readonly ConnectionPair[],
 ) {
-  if (!deps.domain || !deps.publicUrl) return undefined;
+  if (!isMentionableEligible(deps)) return undefined;
   return buildAgentDirectory({
+    // isMentionableEligible's type predicate narrows publicUrl/domain
+    // from `string | undefined` to `string` here.
     baseUrl: deps.publicUrl,
     domain: deps.domain.toLowerCase(),
     organizationName: deps.organizationName,

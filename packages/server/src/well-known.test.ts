@@ -64,6 +64,10 @@ function makeApp(opts: {
   // When omitted, defaults to a typical deploy with publicUrl / domain set.
   // Pass `noPublicUrl: true` to simulate a bridge with no PUBLIC_URL config.
   noPublicUrl?: boolean;
+  // Override the publicUrl/domain pair to test ineligible deployments
+  // (http://, single-label hostnames). Both must be set together.
+  publicUrl?: string;
+  domain?: string;
   deviceFlowEnabled?: boolean;
 }) {
   const app = new Hono();
@@ -71,8 +75,12 @@ function makeApp(opts: {
     listAgents: () => opts.agents,
     getAgentCard: (conn) => fakeCardV03(conn.agentId),
     adminCard: fakeAdminCard(),
-    publicUrl: opts.noPublicUrl ? undefined : 'https://bridge.example.com',
-    domain: opts.noPublicUrl ? undefined : 'bridge.example.com',
+    publicUrl: opts.noPublicUrl
+      ? undefined
+      : (opts.publicUrl ?? 'https://bridge.example.com'),
+    domain: opts.noPublicUrl
+      ? undefined
+      : (opts.domain ?? 'bridge.example.com'),
     deviceFlowEnabled: opts.deviceFlowEnabled ?? false,
     organizationName: 'Vicoop Bridge',
   };
@@ -318,4 +326,60 @@ test('mentionable-agents.json: 404 when bridge has no PUBLIC_URL configured', as
   const app = makeApp({ agents: [fakeConn('foo')], noPublicUrl: true });
   const res = await app.request('/.well-known/mentionable-agents.json');
   assert.equal(res.status, 404);
+});
+
+test('all routes 404 when PUBLIC_URL is http:// (Mentionable §2 requires HTTPS)', async () => {
+  // A bridge deployed at http://bridge.example.com would publish self-
+  // referential http:// URLs in the JRD/agent-card/directory, which no
+  // conformant resolver will accept. Refuse to serve at all rather than
+  // ship spec-non-conformant payloads.
+  const app = makeApp({
+    agents: [fakeConn('foo')],
+    publicUrl: 'http://bridge.example.com',
+    domain: 'bridge.example.com',
+  });
+  for (const path of [
+    '/.well-known/webfinger?resource=acct:foo@bridge.example.com',
+    '/.well-known/agent-card/foo',
+    '/.well-known/mentionable-agents.json',
+  ]) {
+    const res = await app.request(path);
+    assert.equal(res.status, 404, path);
+  }
+});
+
+test('all routes 404 when domain is single-label (Mentionable §1 rejects bare localhost)', async () => {
+  // The spec validation ladder makes a bare `localhost` unverifiable in
+  // the subject step, so a deployment at https://localhost:8787 cannot
+  // serve a conformant Mentionable surface. Local dev should use a
+  // reserved-TLD subdomain (https://agent.localhost / https://agent.test)
+  // — those have a dot and pass.
+  const app = makeApp({
+    agents: [fakeConn('foo')],
+    publicUrl: 'https://localhost:8787',
+    domain: 'localhost',
+  });
+  for (const path of [
+    '/.well-known/webfinger?resource=acct:foo@localhost',
+    '/.well-known/agent-card/foo',
+    '/.well-known/mentionable-agents.json',
+  ]) {
+    const res = await app.request(path);
+    assert.equal(res.status, 404, path);
+  }
+});
+
+test('all routes serve when PUBLIC_URL is https with a multi-label hostname', async () => {
+  // Sanity check the positive path: agent.localhost (RFC 6761 reserved
+  // TLD subdomain) is the canonical local-dev form per Mentionable §1
+  // and passes the multi-label check.
+  const app = makeApp({
+    agents: [fakeConn('foo')],
+    publicUrl: 'https://agent.localhost',
+    domain: 'agent.localhost',
+  });
+  const res = await app.request(
+    '/.well-known/webfinger?resource=acct:foo@agent.localhost',
+  );
+  assert.equal(res.status, 200);
 });
