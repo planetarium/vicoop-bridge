@@ -193,6 +193,17 @@ test('agent-card: 404 when two registry entries differ only in case (ambiguous)'
   assert.equal(res.status, 404);
 });
 
+test('mentionable-agents.json: drops case-insensitive collisions to match resolveLocal', async () => {
+  // listDirectoryEntries must mirror resolveLocal's ambiguous-→-404 rule;
+  // otherwise the directory advertises addresses that immediately fail to
+  // resolve. The unambiguous `bar` survives; admin is always present.
+  const app = makeApp({ agents: [fakeConn('Foo'), fakeConn('foo'), fakeConn('bar')] });
+  const res = await app.request('/.well-known/mentionable-agents.json');
+  const body = (await res.json()) as { contactPoint: Array<{ email: string }> };
+  const emails = body.contactPoint.map((p) => p.email);
+  assert.deepEqual(emails, ['admin@bridge.example.com', 'bar@bridge.example.com']);
+});
+
 test('webfinger: 404 when local-part contains unsafe chars (path separator)', async () => {
   // Defends against an attacker crafting an agentId that smuggles `..` /
   // `@` / CRLF into the JRD subject. isValidMentionableLocal rejects them

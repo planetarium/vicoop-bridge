@@ -55,8 +55,20 @@ function listDirectoryEntries(deps: WellKnownDeps): DirectoryEntry[] {
       description: deps.adminCard.description ?? undefined,
     },
   ];
+  // Drop case-insensitive collisions consistently with resolveLocal: if
+  // two connected agents fold to the same local, resolveLocal returns 404
+  // for the lookup — listing them in the directory would advertise an
+  // address that immediately fails to resolve. Better to omit both than to
+  // ship broken links downstream.
+  const lowerCounts = new Map<string, number>();
   for (const conn of deps.listAgents()) {
     if (!isValidMentionableLocal(conn.agentId)) continue;
+    const k = conn.agentId.toLowerCase();
+    lowerCounts.set(k, (lowerCounts.get(k) ?? 0) + 1);
+  }
+  for (const conn of deps.listAgents()) {
+    if (!isValidMentionableLocal(conn.agentId)) continue;
+    if ((lowerCounts.get(conn.agentId.toLowerCase()) ?? 0) > 1) continue;
     const card = deps.getAgentCard(conn);
     entries.push({
       local: conn.agentId,
