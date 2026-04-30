@@ -22,6 +22,7 @@ import type { Sql } from './db.js';
 import { Landing } from './landing.js';
 import { logEvent } from './log.js';
 import { buildAgentA2XAgent, type AgentA2XOptions } from './agent-card.js';
+import { buildLandingDirectory, mountWellKnown, type WellKnownDeps } from './well-known.js';
 
 export interface ServerHttpOptions {
   registry: Registry;
@@ -124,10 +125,36 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     return c.json(result as Record<string, unknown>);
   }
 
+  // Derive the public hostname once. Used both for SIWE domain verification
+  // and for the Mentionable / WebFinger surface, which keys lookups on the
+  // bridge's external hostname.
+  let siweDomain: string | undefined;
+  if (opts.publicUrl) {
+    try {
+      siweDomain = new URL(opts.publicUrl).hostname;
+    } catch {
+      throw new Error(`PUBLIC_URL "${opts.publicUrl}" is not a valid URL — cannot configure SIWE domain verification`);
+    }
+  }
+
   app.get('/healthz', (c) => c.json({ ok: true }));
 
   // Root agent card — the server itself is an A2A agent
   app.get('/.well-known/agent-card.json', (c) => c.json(adminCard));
+
+  // Mentionable v0.1 surface (WebFinger + agent-card + Agent Directory)
+  // exposing every connected client as `@<agentId>@<bridge-host>`. The
+  // admin agent intentionally stays on the existing
+  // `/.well-known/agent-card.json` and is not part of this directory.
+  const wellKnownDeps: WellKnownDeps = {
+    listAgents: () => opts.registry.listAgents(),
+    getAgentCard: (conn) => getAgentForConn(conn).getAgentCard() as AgentCardV03,
+    publicUrl: opts.publicUrl,
+    domain: siweDomain,
+    deviceFlowEnabled,
+    organizationName: adminCard.name,
+  };
+  mountWellKnown(app, wellKnownDeps);
 
   // Server info — HTML landing for browsers, JSON for API clients
   app.get('/', (c) => {
@@ -152,26 +179,18 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         clients,
       });
     }
+    const directory = buildLandingDirectory(wellKnownDeps);
     return c.html(
       html`<!DOCTYPE html>${(
         <Landing
           adminCard={adminCard}
           clients={clients}
           adminWallets={getAdminWallets()}
+          directory={directory}
         />
       )}`,
     );
   });
-
-  // Derive SIWE domain early so both admin and agent endpoints use it
-  let siweDomain: string | undefined;
-  if (opts.publicUrl) {
-    try {
-      siweDomain = new URL(opts.publicUrl).hostname;
-    } catch {
-      throw new Error(`PUBLIC_URL "${opts.publicUrl}" is not a valid URL — cannot configure SIWE domain verification`);
-    }
-  }
 
   // SIWE → opaque caller token exchange. Admin UI and any wallet-based client
   // signs a SIWE message once, then presents the returned vbc_caller_* token
