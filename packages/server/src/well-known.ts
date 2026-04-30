@@ -138,10 +138,16 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
         },
       ],
     };
+    // Mentionable §3 encourages aggressive caching ("card changes are
+    // expected to be infrequent"), but our payload tracks live WS
+    // connections — a client that disconnects must stop being addressable
+    // immediately, not 5 minutes later. Until we add ETag/Last-Modified
+    // for conditional revalidation, no-store is the only honest answer
+    // for both private and shared caches.
     return new Response(JSON.stringify(jrd), {
       headers: {
         'Content-Type': 'application/jrd+json; charset=utf-8',
-        'Cache-Control': 'public, max-age=300, s-maxage=300',
+        'Cache-Control': 'no-store',
       },
     });
   });
@@ -163,7 +169,10 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
       publicUrl: deps.publicUrl,
       deviceFlowEnabled: deps.deviceFlowEnabled,
     });
-    c.header('Cache-Control', 'public, max-age=300, s-maxage=300');
+    // See WebFinger above — the underlying AgentCardV03 is rebuilt on
+    // every connect/disconnect/policy change, so shared caches must not
+    // hold it.
+    c.header('Cache-Control', 'no-store');
     return c.json(mentionable);
   });
 
@@ -177,7 +186,10 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
       organizationName: deps.organizationName,
       entries: listDirectoryEntries(deps),
     });
-    c.header('Cache-Control', 'public, max-age=60, s-maxage=60');
+    // Same reasoning as WebFinger: the entry list is the live registry
+    // snapshot, so shared caches holding it across connect/disconnect
+    // events would advertise unreachable agents.
+    c.header('Cache-Control', 'no-store');
     return c.json(directory);
   });
 }
