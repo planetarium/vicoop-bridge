@@ -121,11 +121,45 @@ function normalizeUserCode(raw: string): string {
 
 // ---- route handlers --------------------------------------------------------
 
+interface ClientRegisterParams {
+  client_name: string;
+  allowed_agent_ids: string[];
+}
+
 interface DeviceRow {
   device_code: string;
   user_code: string;
   status: string;
+  intent: string;
+  intent_params: ClientRegisterParams | null;
   expires_at: Date;
+}
+
+// Render the intent-specific intro shown on the approval landing page.
+// The whole point of the intent split (issue #79) is that the operator sees
+// what they're authorizing — a one-shot caller session vs. a long-lived
+// client registration with a stated agent-id allowlist.
+function renderIntentIntro(intent: string, params: ClientRegisterParams | null): string {
+  if (intent === 'client_register' && params) {
+    const safeName = escapeHtml(params.client_name);
+    const ids = params.allowed_agent_ids.length === 0
+      ? '<em>(none)</em>'
+      : params.allowed_agent_ids
+          .map((id) => `<code>${escapeHtml(id)}</code>`)
+          .join(', ');
+    return `
+      <p><strong>Register a bridge client</strong></p>
+      <p>This will create a long-lived bridge client named <strong>${safeName}</strong>
+         owned by your Google account, authorized to register the following
+         agent ids: ${ids}.</p>
+      <p>You'll be asked to sign in to Google to confirm.</p>
+    `;
+  }
+  // Default 'caller' intent.
+  return `
+    <p>This will authorize a CLI session to call agents on your behalf.
+       You'll be asked to sign in to Google to confirm.</p>
+  `;
 }
 
 export function mountDeviceUi(app: Hono, opts: DeviceUiOptions): void {
@@ -144,7 +178,7 @@ export function mountDeviceUi(app: Hono, opts: DeviceUiOptions): void {
 
     const normalized = normalizeUserCode(raw);
     const rows = await opts.sql<DeviceRow[]>`
-      SELECT device_code, user_code, status, expires_at
+      SELECT device_code, user_code, status, intent, intent_params, expires_at
       FROM device_sessions
       WHERE user_code = ${normalized}
         AND status = 'pending'
@@ -161,15 +195,20 @@ export function mountDeviceUi(app: Hono, opts: DeviceUiOptions): void {
       return c.html(page('Invalid code', body), 400);
     }
 
+    const session = rows[0]!;
     const safeCode = escapeHtml(normalized);
     const href = `/oauth/google/start?user_code=${encodeURIComponent(normalized)}`;
+    const intro = renderIntentIntro(session.intent, session.intent_params);
+    const headerText = session.intent === 'client_register'
+      ? 'Authorize bridge client registration'
+      : 'Authorize device';
     const body = `
-      <h1>Authorize device</h1>
+      <h1>${escapeHtml(headerText)}</h1>
       <div class="code">${safeCode}</div>
-      <p>You'll be asked to sign in to Google to authorize device <strong>${safeCode}</strong>.</p>
+      ${intro}
       <p><a class="btn" href="${escapeHtml(href)}">Continue with Google</a></p>
     `;
-    return c.html(page('Authorize device', body));
+    return c.html(page(headerText, body));
   });
 
   app.get('/oauth/google/start', async (c) => {

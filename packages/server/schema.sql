@@ -172,12 +172,21 @@ $$;
 CREATE TABLE IF NOT EXISTS clients (
   id                TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
   owner_principal   TEXT NOT NULL,
+  -- Display-only contact for non-eth principals (Google sub is opaque, so
+  -- admin tooling renders email for human readability). Populated only by
+  -- the device-flow client_register intent path; SIWE-onboarded clients
+  -- leave this NULL.
+  owner_email       TEXT,
   client_name       TEXT NOT NULL,
   token_hash        TEXT NOT NULL UNIQUE,
   allowed_agent_ids TEXT[] NOT NULL DEFAULT '{}',
   revoked           BOOLEAN NOT NULL DEFAULT FALSE,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Idempotent: existing dev DBs from PR A only have the columns above sans
+-- owner_email. Add it here so re-applying schema.sql brings them forward.
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS owner_email TEXT;
 
 ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
 
@@ -560,17 +569,33 @@ CREATE POLICY callers_postgraphile ON callers
 -- Server-managed only; never expose via GraphQL
 COMMENT ON TABLE callers IS E'@omit';
 
--- Transient device flow sessions (RFC-8628)
+-- Transient device flow sessions (RFC-8628). `intent` selects what the token
+-- endpoint materializes once the session is approved:
+--   'caller'           — issue a vbc_caller_* token in the callers table
+--                        (the original A2A-caller authorization use case).
+--   'client_register'  — call register_client() and return CLIENT_TOKEN +
+--                        client_id without ever creating a callers row;
+--                        intent_params carries client_name and
+--                        allowed_agent_ids for the call. This is the
+--                        device-flow onboarding path for vicoop-client
+--                        operators (issue #79).
 CREATE TABLE IF NOT EXISTS device_sessions (
   device_code       TEXT PRIMARY KEY,
   user_code         TEXT NOT NULL UNIQUE,
   status            TEXT NOT NULL,
   principal_id      TEXT,
   email             TEXT,
+  intent            TEXT NOT NULL DEFAULT 'caller',
+  intent_params     JSONB,
   expires_at        TIMESTAMPTZ NOT NULL,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   approved_at       TIMESTAMPTZ
 );
+
+-- Idempotent: existing dev DBs from PR A only have the original columns. Add
+-- the new ones here so re-applying schema.sql brings them forward.
+ALTER TABLE device_sessions ADD COLUMN IF NOT EXISTS intent TEXT NOT NULL DEFAULT 'caller';
+ALTER TABLE device_sessions ADD COLUMN IF NOT EXISTS intent_params JSONB;
 
 CREATE INDEX IF NOT EXISTS device_sessions_pending_idx
   ON device_sessions(user_code) WHERE status = 'pending';
