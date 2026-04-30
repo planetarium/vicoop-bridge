@@ -98,12 +98,45 @@ background.
 When systemd is the host init, `install.sh` also writes a
 `vicoop-client.service` unit plus a `vicoop-client.env` template (scope
 auto-detected: `system` as root, `user` otherwise). It does not enable or
-start the service — env values are populated by Steps 2-4 below, and the
+start the service — env values are populated by Steps 3-5 below, and the
 operator runs the `systemctl enable --now` command from the installer's
 output once they're filled in. Opt out with `INSTALL_SKIP_SERVICE=1`, or
 force a scope with `INSTALL_SERVICE_SCOPE=user|system|none`.
 
-## Step 2 — Pick an agent id
+## Step 2 — Verify the installed bundle
+
+If `$INSTALL_DIR` already existed before Step 1, `install.sh` refuses to
+overwrite it unless you pass `FORCE=1`. That's intentional: an existing
+directory may contain a working client, saved env file, or an older bundle
+you don't want clobbered by accident.
+
+If you do want to replace a non-empty install directory, rerun Step 1 with
+`FORCE=1`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/planetarium/vicoop-bridge/main/install.sh \
+  | INSTALL_DIR="$HOME/vicoop-bridge-client" FORCE=1 sh
+```
+
+If you'd rather keep the old install around, pick a different
+`INSTALL_DIR` (for example `~/vicoop-bridge-client-0.5.0`) and install the
+new bundle there instead.
+
+Before continuing, verify that the installed bundle is recent enough to
+include the `login` command used in Step 4:
+
+```sh
+"$INSTALL_DIR/bin/vicoop-client" -v
+"$INSTALL_DIR/bin/vicoop-client" login --help
+```
+
+If `login --help` prints usage, you're on a current bundle. If it instead
+fails with the daemon usage (`--server`, `--token`, `--agentId`, `--card`)
+or doesn't recognize `login`, you're still on an older pre-device-flow
+release and should reinstall into a fresh directory or rerun Step 1 with
+`FORCE=1`.
+
+## Step 3 — Pick an agent id
 
 The agent id is the routing key external A2A callers use to reach your
 client. Pick something unlikely to collide across operators:
@@ -120,14 +153,14 @@ AGENT_ID="$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)-openclaw"
 echo "$AGENT_ID"
 ```
 
-`registerClient` (called for you by `vicoop-client login` in Step 3) does
+`registerClient` (called for you by `vicoop-client login` in Step 4) does
 not pre-validate availability; collisions surface only at WS connect time.
 If you want to probe ahead, hit `agentIdAvailable(agentId)` GraphQL after
 login — it's a SECURITY DEFINER probe that returns boolean availability
 across every owner without leaking `owner_principal`. Most operators just
 pick a hostname/uuid prefix and skip the probe.
 
-## Step 3 — Login and register your client (device flow)
+## Step 4 — Login and register your client (device flow)
 
 `vicoop-client login` drives Google OAuth device flow against the bridge
 to register a fresh client and hand you a one-time `CLIENT_TOKEN`. No
@@ -200,7 +233,7 @@ This means a Google-only operator can stand up a bridge client without
 ever holding a wallet or seed phrase. Owner is recorded as
 `google:sub:<sub>` (stable id, not the email).
 
-## Step 4 — Prepare the agent card
+## Step 5 — Prepare the agent card
 
 The bundle ships backend-specific starter cards under `$INSTALL_DIR/cards/`
 (`openclaw.json`, `claude.json`, `echo.json`). Agent cards are published at
@@ -233,7 +266,7 @@ cat > "$INSTALL_DIR/cards/my-agent.json" <<'JSON'
 JSON
 ```
 
-## Step 5 — Run the client
+## Step 6 — Run the client
 
 All flags also accept env vars, which is usually cleaner for long-running
 services:
@@ -319,107 +352,6 @@ curl -sX POST "$BRIDGE_URL/" \
 The change hot-reloads via `registry.updateAllowedCallers` — no client
 restart needed.
 
-## Step 6 — Run persistently
-
-`vicoop-client` does not daemonize. Pick whichever supervisor fits your host.
-
-### Linux — systemd (automatic, recommended)
-
-On systemd hosts `install.sh` already dropped the unit and an env template
-(see Step 1). The exact paths and the reload/enable commands are printed
-at the end of `install.sh` — prefer those over the examples below if they
-differ (`XDG_CONFIG_HOME`, non-default `$HOME`, etc.). You can also ask
-systemd directly with `systemctl --user cat vicoop-client`.
-
-```sh
-# user-scope (default for non-root). If XDG_CONFIG_HOME is set, swap in
-# that prefix for ~/.config/ below.
-"${EDITOR:-vi}" "${XDG_CONFIG_HOME:-$HOME/.config}/vicoop-client.env"
-systemctl --user daemon-reload                # pick up regenerated unit after reinstall
-systemctl --user enable --now vicoop-client
-journalctl --user -u vicoop-client -f         # watch logs
-```
-
-For a system-scope install (installer ran as root) swap to
-`/etc/vicoop-client.env`, then reload + enable. On minimal images where
-the installer ran as root and `sudo` may not exist, drop the `sudo`
-prefix:
-
-```sh
-# already root (minimal images, Fly.io containers)
-systemctl daemon-reload
-systemctl enable --now vicoop-client
-
-# non-root operator with sudo
-sudo systemctl daemon-reload
-sudo systemctl enable --now vicoop-client
-```
-
-The unit restarts on failure (`Restart=on-failure`, 5s backoff).
-
-The `daemon-reload` is only strictly needed after a reinstall/upgrade that
-rewrote the unit file (new `INSTALL_DIR`, new absolute node path, new
-`VERSION`); first-time installs can skip it. It never hurts to run.
-
-**Headless hosts / user scope**: the user-scope manager is tied to your
-login session by default, so the client stops when you log out. For true
-24/7 operation either enable lingering:
-
-```sh
-sudo loginctl enable-linger "$USER"
-```
-
-or rerun the installer as root with `INSTALL_SERVICE_SCOPE=system` to get
-a system-wide unit instead.
-
-### macOS — `launchd`
-
-Create `~/Library/LaunchAgents/com.local.vicoop-client.plist` with
-`KeepAlive=true`, point `ProgramArguments` at
-`$INSTALL_DIR/bin/vicoop-client`, and put your env into
-`EnvironmentVariables`. Load with `launchctl load -w <plist>`.
-
-### Linux — systemd user unit (manual)
-
-If you ran `install.sh` with `INSTALL_SKIP_SERVICE=1` or the scope
-auto-detection skipped (non-systemd host), write the unit yourself:
-
-```ini
-# ~/.config/systemd/user/vicoop-client.service
-[Unit]
-Description=vicoop-bridge-client
-# network-online.target is a system-instance unit; the user manager does
-# not know about it, so intentionally omit the After=/Wants= line here.
-
-[Service]
-Type=simple
-EnvironmentFile=%h/.config/vicoop-client.env
-ExecStart=%h/vicoop-bridge-client/bin/vicoop-client
-Restart=on-failure
-RestartSec=5s
-NoNewPrivileges=yes
-
-[Install]
-WantedBy=default.target
-```
-
-Put `SERVER_URL=...`, `SERVER_TOKEN=...`, etc. in
-`~/.config/vicoop-client.env` (mode `0600`), then
-`systemctl --user enable --now vicoop-client`.
-
-### Tmux (interactive hosts)
-
-```sh
-# Swap the hardcoded path if you installed elsewhere. The inner sh is
-# spawned fresh by tmux, so don't rely on $INSTALL_DIR being exported here.
-tmux new -d -s vbc 'sh -c "set -a; . \"$HOME/.config/vicoop-client.env\"; set +a; exec \"$HOME/vicoop-bridge-client/bin/vicoop-client\""'
-tmux attach -t vbc   # to watch logs
-```
-
-Using `set -a` + `.` keeps secrets out of the process-listing line and
-tolerates quoted values / comment lines in the env file, which the
-`env $(xargs)` pattern does not.
-
 ## Updating the client
 
 Once installed, the client updates itself — do not re-run `install.sh`. The
@@ -471,7 +403,7 @@ files before running it.
   principal is not the `owner_principal` on the existing `agent_policies`
   row. Pick a different `agent_id`, amend the existing client's allowlist
   via `updateClientAllowedAgents` (no token rotation), and restart
-  `vicoop-client` with the new `AGENT_ID`. Re-run Step 3 only if you
+  `vicoop-client` with the new `AGENT_ID`. Re-run Step 4 only if you
   intentionally want a new client/token; otherwise sign in from the
   original owner.
 
@@ -501,7 +433,7 @@ files before running it.
   via the `rotateClientToken` GraphQL mutation (backed by
   `rotate_client_token()` in `schema.sql`): it mints a fresh raw token for
   the existing `clients` row and invalidates the old hash, so your
-  `allowedAgentIds` and `agent_policies` carry over. Re-run Step 3 only if
+  `allowedAgentIds` and `agent_policies` carry over. Re-run Step 4 only if
   you intentionally want a new client identity; in that case the old
   `clients` row (and cascading `agent_policies`) can be cleaned up via
   the admin agent's CRUD mutations (#29).
@@ -509,7 +441,7 @@ files before running it.
 ## Alternative: SIWE onboarding
 
 If you'd rather own your client identity with an Ethereum EOA than a
-Google account, replace Step 3 with the two-step SIWE path:
+Google account, replace Step 4 with the two-step SIWE path:
 
 1. Sign a SIWE message and exchange it at `POST /auth/siwe/exchange` for a
    `vbc_owner_*` session token. SIWE exchange defaults to
@@ -532,8 +464,8 @@ CLIENT_TOKEN=$(echo "$REG" | jq -r .data.registerClient.clientWithToken.token)
 
 The resulting `CLIENT_TOKEN` is identical in shape to the device-flow one;
 it just owns the row under an `eth:0x…` principal instead of
-`google:sub:…`. After that, Steps 4-6 (agent card, run, persist) are the
-same as the Google path.
+`google:sub:…`. After that, Steps 5-6 (agent card, run) are the same as
+the Google path.
 
 The same `OWNER_TOKEN` is what you'd present to the admin agent at
 `POST /` for managing `allowed_callers` (see "Restrict who can call your

@@ -120,12 +120,12 @@ console.log(JSON.stringify({ message, signature }));
 JS
 # stderr prints the wallet: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 (Anvil #0)
 
-CALLER_TOKEN=$(curl -sX POST "$BRIDGE_URL/auth/siwe/exchange" \
+OWNER_TOKEN=$(curl -sX POST "$BRIDGE_URL/auth/siwe/exchange" \
   -H 'Content-Type: application/json' \
   --data @/tmp/siwe.json | jq -r .access_token)
-echo "$CALLER_TOKEN"
-# vbc_caller_...  (valid ~60 min because the SIWE message sets
-# expirationTime to now + 1h; server caps at 7 days)
+echo "$OWNER_TOKEN"
+# vbc_owner_...  (default audience = owner_session; valid ~60 min because
+# the SIWE message sets expirationTime to now + 1h; server caps at 7 days)
 ```
 
 If you change the EOA, remember to update the wallet address used in Step 5.
@@ -137,7 +137,7 @@ AGENT_ID="echo-e2e-$(date +%s)"   # avoid collisions with other tenants
 echo "agent_id=$AGENT_ID"
 
 REG=$(curl -s -X POST "$BRIDGE_URL/graphql" \
-  -H "Authorization: Bearer $CALLER_TOKEN" -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' \
   -d "{\"query\":\"mutation{registerClient(input:{clientName:\\\"e2e-${AGENT_ID}\\\",allowedAgentIds:[\\\"${AGENT_ID}\\\"]}){clientWithToken{id token}}}\"}")
 CLIENT_ID=$(echo "$REG" | jq -r .data.registerClient.clientWithToken.id)
 CLIENT_TOKEN=$(echo "$REG" | jq -r .data.registerClient.clientWithToken.token)
