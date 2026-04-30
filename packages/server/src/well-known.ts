@@ -45,38 +45,57 @@ interface ResolvedLocal {
   card: AgentCardV03;
 }
 
-function listDirectoryEntries(deps: WellKnownDeps): DirectoryEntry[] {
+// Pair shape used by both the directory route (which collects internally)
+// and the / HTML handler (which already walks the registry to render its
+// own client list — passing the snapshot in saves a second listAgents()
+// call plus a re-fetch of every AgentCardV03).
+export interface ConnectionPair {
+  conn: ClientConnection;
+  card: AgentCardV03;
+}
+
+function entriesFromPairs(
+  pairs: readonly ConnectionPair[],
+  adminCard: AgentCardV03,
+): DirectoryEntry[] {
   // Admin always appears first so a casual reader of the directory finds
   // the bridge itself before the connected clients.
   const entries: DirectoryEntry[] = [
     {
       local: MENTIONABLE_ADMIN_LOCAL,
-      name: deps.adminCard.name,
-      description: deps.adminCard.description ?? undefined,
+      name: adminCard.name,
+      description: adminCard.description ?? undefined,
     },
   ];
   // Drop case-insensitive collisions consistently with resolveLocal: if
   // two connected agents fold to the same local, resolveLocal returns 404
-  // for the lookup — listing them in the directory would advertise an
-  // address that immediately fails to resolve. Better to omit both than to
-  // ship broken links downstream.
-  const lowerCounts = new Map<string, number>();
-  for (const conn of deps.listAgents()) {
+  // — listing them here would advertise an address that immediately fails
+  // to resolve. Single pass: candidate map keyed on the lowercased local,
+  // a second occurrence flips it to 'collision' and neither variant is
+  // emitted. Insertion order is preserved (Map iteration order = insertion
+  // order), so the directory mirrors the registry's connect order.
+  const candidates = new Map<string, DirectoryEntry | 'collision'>();
+  for (const { conn, card } of pairs) {
     if (!isValidMentionableLocal(conn.agentId)) continue;
     const k = conn.agentId.toLowerCase();
-    lowerCounts.set(k, (lowerCounts.get(k) ?? 0) + 1);
-  }
-  for (const conn of deps.listAgents()) {
-    if (!isValidMentionableLocal(conn.agentId)) continue;
-    if ((lowerCounts.get(conn.agentId.toLowerCase()) ?? 0) > 1) continue;
-    const card = deps.getAgentCard(conn);
-    entries.push({
+    if (candidates.has(k)) {
+      candidates.set(k, 'collision');
+      continue;
+    }
+    candidates.set(k, {
       local: conn.agentId,
       name: card.name,
       description: card.description ?? undefined,
     });
   }
+  for (const v of candidates.values()) {
+    if (v !== 'collision') entries.push(v);
+  }
   return entries;
+}
+
+function collectPairs(deps: WellKnownDeps): ConnectionPair[] {
+  return deps.listAgents().map((conn) => ({ conn, card: deps.getAgentCard(conn) }));
 }
 
 function resolveLocal(deps: WellKnownDeps, local: string): ResolvedLocal | undefined {
@@ -215,21 +234,27 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
       baseUrl: deps.publicUrl,
       domain: deps.domain.toLowerCase(),
       organizationName: deps.organizationName,
-      entries: listDirectoryEntries(deps),
+      entries: entriesFromPairs(collectPairs(deps), deps.adminCard),
     });
     return c.json(directory);
   });
 }
 
 // Re-exported so the HTTP layer can also embed the same payload as JSON-LD
-// in the landing page (Layer 1 source of truth per Mentionable's
-// Agent Directory spec).
-export function buildLandingDirectory(deps: WellKnownDeps) {
+// in the landing page (Layer 1 source of truth per Mentionable's Agent
+// Directory spec). Accepts a pre-collected `pairs` snapshot — the / handler
+// already walks the registry to render its own client list, so passing the
+// same snapshot in saves a redundant listAgents() + per-agent getAgentCard
+// round on every landing-page hit.
+export function buildLandingDirectory(
+  deps: WellKnownDeps,
+  pairs?: readonly ConnectionPair[],
+) {
   if (!deps.domain || !deps.publicUrl) return undefined;
   return buildAgentDirectory({
     baseUrl: deps.publicUrl,
     domain: deps.domain.toLowerCase(),
     organizationName: deps.organizationName,
-    entries: listDirectoryEntries(deps),
+    entries: entriesFromPairs(pairs ?? collectPairs(deps), deps.adminCard),
   });
 }
