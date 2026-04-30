@@ -32,16 +32,16 @@ test(
     const sql = postgres(process.env.DATABASE_URL!);
     try {
       const agentId = `availability-taken-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const owner = '0x1111111111111111111111111111111111111111';
+      const owner = 'eth:0x1111111111111111111111111111111111111111';
       const clients = await sql<{ id: string }[]>`
-        INSERT INTO clients (owner_wallet, client_name, token_hash, allowed_agent_ids)
+        INSERT INTO clients (owner_principal, client_name, token_hash, allowed_agent_ids)
         VALUES (${owner}, 'availability-test', ${`fake-hash-${agentId}`}, ARRAY[${agentId}])
         RETURNING id
       `;
       const clientId = clients[0]!.id;
       try {
         await sql`
-          INSERT INTO agent_policies (agent_id, owner_wallet, client_id)
+          INSERT INTO agent_policies (agent_id, owner_principal, client_id)
           VALUES (${agentId}, ${owner}, ${clientId})
         `;
 
@@ -60,35 +60,35 @@ test(
 );
 
 test(
-  'authenticated caller from a different wallet still sees available=false (RLS bypass)',
+  'authenticated caller from a different principal still sees available=false (RLS bypass)',
   { skip: !hasDb },
   async () => {
     // Guards the SECURITY DEFINER posture: agent_policies_select restricts
-    // SELECT to the owning wallet, so without RLS bypass a different wallet's
-    // direct query would return no rows and the function would wrongly report
-    // the id as available. Exercising app_authenticated with a mismatched
-    // wallet claim proves the bypass is effective.
+    // SELECT to the owning principal, so without RLS bypass a different
+    // principal's direct query would return no rows and the function would
+    // wrongly report the id as available. Exercising app_authenticated with a
+    // mismatched principal claim proves the bypass is effective.
     const sql = postgres(process.env.DATABASE_URL!);
     try {
       const agentId = `availability-cross-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const owner = '0x2222222222222222222222222222222222222222';
-      const other = '0x3333333333333333333333333333333333333333';
+      const owner = 'eth:0x2222222222222222222222222222222222222222';
+      const other = 'eth:0x3333333333333333333333333333333333333333';
 
       const clients = await sql<{ id: string }[]>`
-        INSERT INTO clients (owner_wallet, client_name, token_hash, allowed_agent_ids)
+        INSERT INTO clients (owner_principal, client_name, token_hash, allowed_agent_ids)
         VALUES (${owner}, 'availability-test', ${`fake-hash-${agentId}`}, ARRAY[${agentId}])
         RETURNING id
       `;
       const clientId = clients[0]!.id;
       try {
         await sql`
-          INSERT INTO agent_policies (agent_id, owner_wallet, client_id)
+          INSERT INTO agent_policies (agent_id, owner_principal, client_id)
           VALUES (${agentId}, ${owner}, ${clientId})
         `;
 
         const available = await sql.begin(async (tx) => {
           await tx`SET LOCAL ROLE app_authenticated`;
-          await tx`SELECT set_config('jwt.claims.wallet_address', ${other}, true)`;
+          await tx`SELECT set_config('jwt.claims.principal_id', ${other}, true)`;
           const rows = await tx<{ available: boolean }[]>`
             SELECT agent_id_available(${agentId}) AS available
           `;

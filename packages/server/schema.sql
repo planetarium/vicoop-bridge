@@ -25,22 +25,135 @@ END $$;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- ============================================================
+-- 1a. owner_wallet → owner_principal rename (one-time, idempotent)
+-- ============================================================
+-- We have no production users, so this block exists only so existing dev /
+-- staging databases can be re-applied without manual intervention. It
+-- detects either (a) the legacy `owner_wallet` column or (b) a half-renamed
+-- `owner_principal` column still typed VARCHAR(42), and brings either state
+-- forward to TEXT-typed `owner_principal` with an `eth:`-prefixed value.
+--
+-- ALTER COLUMN ... TYPE is rejected by Postgres while RLS policies reference
+-- the column, so we drop policies and dependent functions/types here; the
+-- rest of this file recreates them with their new shape. The DO block is
+-- implicitly transactional, so a partial run aborts cleanly and the next
+-- deploy starts from the same `owner_wallet` baseline.
+DO $$
+DECLARE
+  needs_clients_migration boolean;
+  needs_policies_migration boolean;
+  needs_tasks_migration boolean;
+BEGIN
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'clients'
+      AND (column_name = 'owner_wallet'
+           OR (column_name = 'owner_principal' AND data_type = 'character varying'))
+  ) INTO needs_clients_migration;
+
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'agent_policies'
+      AND (column_name = 'owner_wallet'
+           OR (column_name = 'owner_principal' AND data_type = 'character varying'))
+  ) INTO needs_policies_migration;
+
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'infra' AND table_name = 'a2a_tasks'
+      AND (column_name = 'owner_wallet'
+           OR (column_name = 'owner_principal' AND data_type = 'character varying'))
+  ) INTO needs_tasks_migration;
+
+  IF needs_clients_migration OR needs_policies_migration THEN
+    -- Functions and types must be dropped because their argument/field
+    -- declarations bind to the legacy VARCHAR signature.
+    DROP FUNCTION IF EXISTS register_client(TEXT, TEXT[], VARCHAR);
+    DROP FUNCTION IF EXISTS register_client(TEXT, TEXT[], TEXT);
+    DROP FUNCTION IF EXISTS rotate_client_token(TEXT);
+    DROP FUNCTION IF EXISTS revoke_client(TEXT);
+    DROP FUNCTION IF EXISTS unrevoke_client(TEXT);
+    DROP FUNCTION IF EXISTS update_client_allowed_agents(TEXT, TEXT[]);
+    DROP TYPE IF EXISTS client_with_token CASCADE;
+    -- normalize_wallet_address used to validate VARCHAR(42); not needed
+    -- after this PR (validation moved to TS).
+    DROP FUNCTION IF EXISTS normalize_wallet_address(TEXT);
+  END IF;
+
+  IF needs_clients_migration THEN
+    DROP POLICY IF EXISTS clients_select ON clients;
+    DROP POLICY IF EXISTS clients_insert ON clients;
+    DROP POLICY IF EXISTS clients_update ON clients;
+    DROP POLICY IF EXISTS clients_delete ON clients;
+
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'clients' AND column_name = 'owner_wallet'
+    ) THEN
+      ALTER TABLE clients RENAME COLUMN owner_wallet TO owner_principal;
+    END IF;
+
+    ALTER TABLE clients ALTER COLUMN owner_principal TYPE TEXT;
+    UPDATE clients SET owner_principal = 'eth:' || lower(owner_principal)
+      WHERE owner_principal !~ '^[a-z]+:';
+  END IF;
+
+  IF needs_policies_migration THEN
+    DROP POLICY IF EXISTS agent_policies_select ON agent_policies;
+    DROP POLICY IF EXISTS agent_policies_insert ON agent_policies;
+    DROP POLICY IF EXISTS agent_policies_update ON agent_policies;
+    DROP POLICY IF EXISTS agent_policies_delete ON agent_policies;
+
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'agent_policies' AND column_name = 'owner_wallet'
+    ) THEN
+      ALTER TABLE agent_policies RENAME COLUMN owner_wallet TO owner_principal;
+    END IF;
+
+    ALTER TABLE agent_policies ALTER COLUMN owner_principal TYPE TEXT;
+    UPDATE agent_policies SET owner_principal = 'eth:' || lower(owner_principal)
+      WHERE owner_principal !~ '^[a-z]+:';
+  END IF;
+
+  IF needs_tasks_migration THEN
+    -- a2a_tasks has no RLS policy referencing the column, so no policy drop
+    -- needed here.
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'infra' AND table_name = 'a2a_tasks' AND column_name = 'owner_wallet'
+    ) THEN
+      ALTER TABLE infra.a2a_tasks RENAME COLUMN owner_wallet TO owner_principal;
+    END IF;
+
+    ALTER TABLE infra.a2a_tasks ALTER COLUMN owner_principal TYPE TEXT;
+    UPDATE infra.a2a_tasks SET owner_principal = 'eth:' || lower(owner_principal)
+      WHERE owner_principal IS NOT NULL AND owner_principal !~ '^[a-z]+:';
+  END IF;
+END $$;
+
+-- ============================================================
 -- 2. Helper functions
 -- ============================================================
-CREATE OR REPLACE FUNCTION current_wallet_address()
+CREATE OR REPLACE FUNCTION current_principal()
   RETURNS TEXT
   LANGUAGE SQL STABLE
 AS $$
-  SELECT nullif(current_setting('jwt.claims.wallet_address', true), '');
+  SELECT nullif(current_setting('jwt.claims.principal_id', true), '');
 $$;
 
+-- ADMIN_WALLET_ADDRESSES env stays a CSV of bare 0x... addresses (admin
+-- onboarding is wallet-only by design; see issue #79). is_admin() therefore
+-- only matches when the current principal is `eth:<addr>` whose stripped
+-- address is in the list. Non-`eth:` principals never match.
 CREATE OR REPLACE FUNCTION is_admin()
   RETURNS BOOLEAN
   LANGUAGE SQL STABLE
 AS $$
   SELECT COALESCE(
-    current_wallet_address() IS NOT NULL
-    AND lower(current_wallet_address()) = ANY(
+    current_principal() IS NOT NULL
+    AND current_principal() LIKE 'eth:%'
+    AND lower(substring(current_principal() FROM 5)) = ANY(
       string_to_array(
         lower(replace(
           coalesce(current_setting('app.admin_addresses', true), ''),
@@ -53,29 +166,12 @@ AS $$
   );
 $$;
 
--- Validate and normalize an Ethereum wallet address (0x + 40 hex chars).
--- Raises invalid_parameter_value if the input does not match. Used by
--- register_client to reject typo'd or malformed addresses before creating a
--- client that the intended owner could never access under RLS.
-CREATE OR REPLACE FUNCTION normalize_wallet_address(addr TEXT)
-  RETURNS VARCHAR(42)
-  LANGUAGE plpgsql IMMUTABLE
-AS $$
-BEGIN
-  IF addr IS NULL OR addr !~ '^0x[0-9a-fA-F]{40}$' THEN
-    RAISE EXCEPTION 'invalid wallet address: %', addr
-      USING ERRCODE = 'invalid_parameter_value';
-  END IF;
-  RETURN lower(addr);
-END;
-$$;
-
 -- ============================================================
 -- 3. Clients table
 -- ============================================================
 CREATE TABLE IF NOT EXISTS clients (
   id                TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-  owner_wallet      VARCHAR(42) NOT NULL,
+  owner_principal   TEXT NOT NULL,
   client_name       TEXT NOT NULL,
   token_hash        TEXT NOT NULL UNIQUE,
   allowed_agent_ids TEXT[] NOT NULL DEFAULT '{}',
@@ -89,27 +185,27 @@ ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS clients_select ON clients;
 CREATE POLICY clients_select ON clients
   FOR SELECT TO app_authenticated
-  USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
+  USING (owner_principal = current_principal() OR is_admin());
 
--- Users can insert clients they own; admins can insert on behalf of any wallet.
+-- Users can insert clients they own; admins can insert on behalf of any principal.
 -- The admin branch is needed by register_client() when called with an explicit
--- owner_wallet argument.
+-- owner_principal argument.
 DROP POLICY IF EXISTS clients_insert ON clients;
 CREATE POLICY clients_insert ON clients
   FOR INSERT TO app_authenticated
-  WITH CHECK (owner_wallet = lower(current_wallet_address()) OR is_admin());
+  WITH CHECK (owner_principal = current_principal() OR is_admin());
 
 -- Users can update their own clients; admins can update all
 DROP POLICY IF EXISTS clients_update ON clients;
 CREATE POLICY clients_update ON clients
   FOR UPDATE TO app_authenticated
-  USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
+  USING (owner_principal = current_principal() OR is_admin());
 
 -- Users can delete their own clients; admins can delete all
 DROP POLICY IF EXISTS clients_delete ON clients;
 CREATE POLICY clients_delete ON clients
   FOR DELETE TO app_authenticated
-  USING (owner_wallet = lower(current_wallet_address()) OR is_admin());
+  USING (owner_principal = current_principal() OR is_admin());
 
 -- app_postgraphile bypasses RLS (used by server for token lookup)
 DROP POLICY IF EXISTS clients_postgraphile ON clients;
@@ -134,7 +230,7 @@ COMMENT ON TABLE clients IS E'@omit create';
 DO $$ BEGIN
   CREATE TYPE client_with_token AS (
     id                TEXT,
-    owner_wallet      VARCHAR(42),
+    owner_principal   TEXT,
     client_name       TEXT,
     allowed_agent_ids TEXT[],
     revoked           BOOLEAN,
@@ -144,15 +240,17 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- Register a new client. Admins may pass an explicit owner_wallet to create on
--- behalf of another wallet; non-admins own the client themselves regardless of
--- what they pass. Returns the raw bearer token — shown only once.
--- Arg names match clients column names, so the body qualifies them with
--- `register_client.*` to disambiguate from columns in enclosing SQL scopes.
+-- Register a new client. Admins may pass an explicit owner_principal to create
+-- on behalf of another principal; non-admins own the client themselves
+-- regardless of what they pass. Returns the raw bearer token — shown only once.
+-- Principal validation/normalization is performed in the TypeScript layer
+-- (packages/server/src/auth/principal.ts validatePrincipal) before the value
+-- ever reaches this function or the jwt.claims.principal_id session var, so
+-- this body trusts its inputs.
 CREATE OR REPLACE FUNCTION register_client(
   client_name       TEXT,
   allowed_agent_ids TEXT[],
-  owner_wallet      VARCHAR(42) DEFAULT NULL
+  owner_principal   TEXT DEFAULT NULL
 ) RETURNS client_with_token
   LANGUAGE plpgsql
   SECURITY INVOKER
@@ -160,42 +258,37 @@ AS $$
 DECLARE
   v_raw_token  TEXT;
   v_token_hash TEXT;
-  v_owner      VARCHAR(42);
+  v_owner      TEXT;
   v_row        client_with_token;
 BEGIN
   v_raw_token  := encode(gen_random_bytes(32), 'hex');
   v_token_hash := encode(digest(v_raw_token, 'sha256'), 'hex');
 
-  IF is_admin() AND register_client.owner_wallet IS NOT NULL THEN
-    -- Validate the explicit owner_wallet: a typo'd address would create a row
-    -- that the intended owner could never read or update under RLS.
-    v_owner := normalize_wallet_address(register_client.owner_wallet);
+  IF is_admin() AND register_client.owner_principal IS NOT NULL THEN
+    v_owner := register_client.owner_principal;
   ELSE
-    IF current_wallet_address() IS NULL THEN
-      RAISE EXCEPTION 'current wallet address is not set';
+    IF current_principal() IS NULL THEN
+      RAISE EXCEPTION 'current principal is not set';
     END IF;
-    -- Sanity check: current_wallet_address() comes from the SIWE token claim
-    -- and should already be well-formed. Validate anyway so a compromised or
-    -- buggy auth layer cannot plant malformed rows.
-    v_owner := normalize_wallet_address(current_wallet_address());
+    v_owner := current_principal();
   END IF;
 
-  INSERT INTO clients AS c (owner_wallet, client_name, token_hash, allowed_agent_ids)
+  INSERT INTO clients AS c (owner_principal, client_name, token_hash, allowed_agent_ids)
   VALUES (
     v_owner,
     register_client.client_name,
     v_token_hash,
     COALESCE(register_client.allowed_agent_ids, '{}')
   )
-  RETURNING c.id, c.owner_wallet, c.client_name, c.allowed_agent_ids, c.revoked, c.created_at, v_raw_token
+  RETURNING c.id, c.owner_principal, c.client_name, c.allowed_agent_ids, c.revoked, c.created_at, v_raw_token
   INTO v_row;
 
   RETURN v_row;
 END;
 $$;
 
-COMMENT ON FUNCTION register_client(TEXT, TEXT[], VARCHAR) IS
-  'Register a new client. Admins may pass ownerWallet to create on behalf of another wallet; non-admins always own the resulting client. Returns the raw bearer token — shown only once.';
+COMMENT ON FUNCTION register_client(TEXT, TEXT[], TEXT) IS
+  'Register a new client. Admins may pass ownerPrincipal to create on behalf of another principal; non-admins always own the resulting client. Returns the raw bearer token — shown only once.';
 
 -- Mark a client as revoked. Does not delete the row so history is preserved.
 -- RLS authorizes the update (owner or admin).
@@ -264,7 +357,7 @@ BEGIN
   UPDATE clients AS c
   SET token_hash = v_token_hash
   WHERE c.id = rotate_client_token.client_id
-  RETURNING c.id, c.owner_wallet, c.client_name, c.allowed_agent_ids, c.revoked, c.created_at, v_raw_token
+  RETURNING c.id, c.owner_principal, c.client_name, c.allowed_agent_ids, c.revoked, c.created_at, v_raw_token
   INTO v_row;
 
   IF NOT FOUND THEN
@@ -311,17 +404,21 @@ COMMENT ON FUNCTION update_client_allowed_agents(TEXT, TEXT[]) IS
 CREATE SCHEMA IF NOT EXISTS infra;
 
 CREATE TABLE IF NOT EXISTS infra.a2a_tasks (
-  task_id    TEXT PRIMARY KEY,
-  context_id TEXT NOT NULL,
-  state      TEXT NOT NULL,
-  task_json  JSONB NOT NULL,
-  owner_wallet VARCHAR(42),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  task_id         TEXT PRIMARY KEY,
+  context_id      TEXT NOT NULL,
+  state           TEXT NOT NULL,
+  task_json       JSONB NOT NULL,
+  owner_principal TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_a2a_tasks_context_wallet
-  ON infra.a2a_tasks (context_id, owner_wallet, created_at);
+CREATE INDEX IF NOT EXISTS idx_a2a_tasks_context_principal
+  ON infra.a2a_tasks (context_id, owner_principal, created_at);
+
+-- Drop the legacy index name from before the rename so re-running schema.sql
+-- on a renamed dev DB doesn't leave a stale index pointing at the old column.
+DROP INDEX IF EXISTS infra.idx_a2a_tasks_context_wallet;
 
 GRANT USAGE ON SCHEMA infra TO app_postgraphile;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA infra TO app_postgraphile;
@@ -336,83 +433,12 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA infra
 -- accumulate (see #23). client_id is set in INSERT/upsert on WS registration.
 CREATE TABLE IF NOT EXISTS agent_policies (
   agent_id         TEXT PRIMARY KEY,
-  owner_wallet     VARCHAR(42) NOT NULL,
-  client_id        TEXT REFERENCES clients(id) ON DELETE CASCADE,
+  owner_principal  TEXT NOT NULL,
+  client_id        TEXT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
   allowed_callers  TEXT[] NOT NULL DEFAULT '{}',
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
--- Idempotent migration for pre-#23 deployments. ensureSchema() runs schema.sql
--- without an outer transaction, so each step must tolerate resuming from a
--- half-applied state: the FK is added NOT VALID first, rows are scrubbed, and
--- the constraint is validated only after the table is consistent.
-ALTER TABLE agent_policies ADD COLUMN IF NOT EXISTS client_id TEXT;
-
-DO $$ BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint
-    WHERE conname = 'agent_policies_client_id_fkey'
-      AND conrelid = 'agent_policies'::regclass
-  ) THEN
-    ALTER TABLE agent_policies
-      ADD CONSTRAINT agent_policies_client_id_fkey
-      FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
-      NOT VALID;
-  END IF;
-END $$;
-
--- Partial-run safety: if a row already has a client_id but it points at a
--- missing client (e.g. deleted while the FK was NOT VALID), reset it to NULL
--- rather than deleting — the backfill below will try to reassign the policy
--- to another client of the same wallet and preserve allowed_callers.
-UPDATE agent_policies ap
-SET client_id = NULL
-WHERE ap.client_id IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM clients c WHERE c.id = ap.client_id);
-
--- Backfill: prefer a client whose allowed_agent_ids still lists this agent,
--- otherwise fall back to the most recent client of the same wallet. The
--- fallback preserves existing allowed_callers when allowed_agent_ids is out
--- of sync. Case-insensitive wallet compare guards against legacy casing.
-UPDATE agent_policies ap
-SET client_id = sub.client_id
-FROM (
-  SELECT DISTINCT ON (p.agent_id) p.agent_id, c.id AS client_id
-  FROM agent_policies p
-  JOIN clients c ON lower(c.owner_wallet) = lower(p.owner_wallet)
-  WHERE p.client_id IS NULL
-  ORDER BY p.agent_id,
-           (p.agent_id = ANY(c.allowed_agent_ids)) DESC,
-           c.created_at DESC
-) sub
-WHERE ap.agent_id = sub.agent_id AND ap.client_id IS NULL;
-
--- Only rows whose wallet truly has no clients left are orphaned.
-DELETE FROM agent_policies ap
-WHERE ap.client_id IS NULL
-  AND NOT EXISTS (
-    SELECT 1 FROM clients c
-    WHERE lower(c.owner_wallet) = lower(ap.owner_wallet)
-  );
-
-ALTER TABLE agent_policies VALIDATE CONSTRAINT agent_policies_client_id_fkey;
-
--- Enforce NOT NULL via a validated CHECK constraint instead of ALTER COLUMN
--- SET NOT NULL so the migration avoids the ACCESS EXCLUSIVE full-table scan.
-DO $$ BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint
-    WHERE conname = 'agent_policies_client_id_not_null'
-      AND conrelid = 'agent_policies'::regclass
-  ) THEN
-    ALTER TABLE agent_policies
-      ADD CONSTRAINT agent_policies_client_id_not_null
-      CHECK (client_id IS NOT NULL) NOT VALID;
-  END IF;
-END $$;
-
-ALTER TABLE agent_policies VALIDATE CONSTRAINT agent_policies_client_id_not_null;
 
 CREATE INDEX IF NOT EXISTS idx_agent_policies_client_id
   ON agent_policies (client_id);
@@ -425,12 +451,10 @@ COMMENT ON TABLE agent_policies IS E'@omit create,update,delete';
 COMMENT ON COLUMN agent_policies.allowed_callers IS E'@omit create,update';
 
 -- Authenticated users see their own policies; admins see all.
--- lower(owner_wallet) compare tolerates any legacy mixed-case rows, matching
--- the normalization used in the migration backfill and WS upsert guard.
 DROP POLICY IF EXISTS agent_policies_select ON agent_policies;
 CREATE POLICY agent_policies_select ON agent_policies
   FOR SELECT TO app_authenticated
-  USING (lower(owner_wallet) = lower(current_wallet_address()) OR is_admin());
+  USING (owner_principal = current_principal() OR is_admin());
 
 -- No INSERT policy for app_authenticated. UPDATE is allowed for the same
 -- owner/admin predicate because admin tools (add_caller / remove_caller) run
@@ -439,8 +463,8 @@ DROP POLICY IF EXISTS agent_policies_insert ON agent_policies;
 DROP POLICY IF EXISTS agent_policies_update ON agent_policies;
 CREATE POLICY agent_policies_update ON agent_policies
   FOR UPDATE TO app_authenticated
-  USING (lower(owner_wallet) = lower(current_wallet_address()) OR is_admin())
-  WITH CHECK (lower(owner_wallet) = lower(current_wallet_address()) OR is_admin());
+  USING (owner_principal = current_principal() OR is_admin())
+  WITH CHECK (owner_principal = current_principal() OR is_admin());
 
 -- DELETE policy exists solely so ON DELETE CASCADE from clients works when a
 -- user (running as app_authenticated) deletes their own client. The direct
@@ -448,7 +472,7 @@ CREATE POLICY agent_policies_update ON agent_policies
 DROP POLICY IF EXISTS agent_policies_delete ON agent_policies;
 CREATE POLICY agent_policies_delete ON agent_policies
   FOR DELETE TO app_authenticated
-  USING (lower(owner_wallet) = lower(current_wallet_address()) OR is_admin());
+  USING (owner_principal = current_principal() OR is_admin());
 
 -- app_postgraphile bypasses RLS (used by server for auth checks)
 DROP POLICY IF EXISTS agent_policies_postgraphile ON agent_policies;
@@ -463,14 +487,14 @@ CREATE POLICY agent_policies_postgraphile ON agent_policies
 -- registerClient() accepts an allowed_agent_ids list but does not verify that
 -- the ids are free — collisions surface only at first WS register
 -- (packages/server/src/ws.ts ensureAgentPolicy → 'agent id owned by a
--- different wallet'), by which point the CLIENT_TOKEN has already been issued
--- and rotation is needed. agent_policies_select RLS also hides rows owned by
--- other wallets, so a non-admin cannot distinguish 'free' from 'taken by
--- someone else' with a direct query.
+-- different principal'), by which point the CLIENT_TOKEN has already been
+-- issued and rotation is needed. agent_policies_select RLS also hides rows
+-- owned by other principals, so a non-admin cannot distinguish 'free' from
+-- 'taken by someone else' with a direct query.
 --
 -- This function returns boolean availability only, bypassing RLS via
 -- SECURITY DEFINER so the check is authoritative across all owners. It does
--- NOT expose owner_wallet or any metadata — callers learn only whether the
+-- NOT expose owner_principal or any metadata — callers learn only whether the
 -- id is claimable.
 CREATE OR REPLACE FUNCTION agent_id_available(agent_id TEXT)
   RETURNS BOOLEAN
@@ -502,11 +526,11 @@ $$;
 -- definer context would be superuser — overkill for reading one table and a
 -- latent escalation surface for future edits. app_postgraphile already has
 -- the RLS-bypass policy on agent_policies, which is exactly (and only) what
--- this function needs to cross-wallet SELECT.
+-- this function needs to cross-principal SELECT.
 ALTER FUNCTION agent_id_available(TEXT) OWNER TO app_postgraphile;
 
 COMMENT ON FUNCTION agent_id_available(TEXT) IS
-  'Check whether an agent_id is free to claim. Returns true when no agent_policies row holds the id, false when any wallet (including the caller) already owns it. Never exposes owner_wallet or other metadata — boolean only. Intended as a pre-registration probe so callers can avoid issuing a CLIENT_TOKEN bound to an agent id that the WS register step would reject.';
+  'Check whether an agent_id is free to claim. Returns true when no agent_policies row holds the id, false when any principal (including the caller) already owns it. Never exposes owner_principal or other metadata — boolean only. Intended as a pre-registration probe so callers can avoid issuing a CLIENT_TOKEN bound to an agent id that the WS register step would reject.';
 
 -- ============================================================
 -- 6. Caller auth: opaque tokens issued via Google OAuth device flow
@@ -598,14 +622,14 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE O
 -- these via GraphQL (they'd fail inside, but we want them off the anonymous
 -- surface entirely). Revoke PUBLIC and grant back only to the authenticated
 -- role and to app_postgraphile (used for introspection).
-REVOKE EXECUTE ON FUNCTION register_client(TEXT, TEXT[], VARCHAR) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION register_client(TEXT, TEXT[], TEXT) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION revoke_client(TEXT) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION unrevoke_client(TEXT) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION rotate_client_token(TEXT) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION update_client_allowed_agents(TEXT, TEXT[]) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION agent_id_available(TEXT) FROM PUBLIC;
 
-GRANT EXECUTE ON FUNCTION register_client(TEXT, TEXT[], VARCHAR)
+GRANT EXECUTE ON FUNCTION register_client(TEXT, TEXT[], TEXT)
   TO app_authenticated, app_postgraphile;
 GRANT EXECUTE ON FUNCTION revoke_client(TEXT)
   TO app_authenticated, app_postgraphile;

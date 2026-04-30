@@ -13,22 +13,22 @@ const MAX_CONTEXT_TASKS = 10;
 
 type MessageWithMetadata = Message & { metadata?: Record<string, unknown> };
 
-function extractOwnerWallet(task: Task): string | undefined {
+function extractOwnerPrincipal(task: Task): string | undefined {
   for (const msg of task.history ?? []) {
-    const wallet = (msg as MessageWithMetadata).metadata?._walletAddress;
-    if (typeof wallet === 'string') return wallet.toLowerCase();
+    const principal = (msg as MessageWithMetadata).metadata?._principalId;
+    if (typeof principal === 'string') return principal;
   }
-  const statusWallet = (task.status?.message as MessageWithMetadata | undefined)?.metadata
-    ?._walletAddress;
-  if (typeof statusWallet === 'string') return statusWallet.toLowerCase();
+  const statusPrincipal = (task.status?.message as MessageWithMetadata | undefined)?.metadata
+    ?._principalId;
+  if (typeof statusPrincipal === 'string') return statusPrincipal;
   return undefined;
 }
 
 function stripMessageMetadata(msg: Message): Message {
-  const { _bearerToken, _walletAddress, ...rest } =
+  const { _bearerToken, _principalId, ...rest } =
     (msg as MessageWithMetadata).metadata ?? {};
   void _bearerToken;
-  void _walletAddress;
+  void _principalId;
   const clean = Object.keys(rest).length ? rest : undefined;
   if (clean) return { ...msg, metadata: clean };
   const { metadata: _meta, ...m } = msg as MessageWithMetadata;
@@ -48,7 +48,7 @@ function stripSensitiveMetadata(task: Task): Task {
 }
 
 export interface ContextAwareTaskStore extends TaskStore {
-  loadByContextId(contextId: string, walletAddress: string, excludeTaskId?: string): Promise<Task[]>;
+  loadByContextId(contextId: string, principalId: string, excludeTaskId?: string): Promise<Task[]>;
 }
 
 export class PostgresTaskStore implements ContextAwareTaskStore {
@@ -92,14 +92,14 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
 
   async loadByContextId(
     contextId: string,
-    walletAddress: string,
+    principalId: string,
     excludeTaskId?: string,
   ): Promise<Task[]> {
     const rows = excludeTaskId
       ? await this.sql<{ task_json: Task }[]>`
           SELECT task_json FROM infra.a2a_tasks
           WHERE context_id = ${contextId}
-            AND owner_wallet = ${walletAddress.toLowerCase()}
+            AND owner_principal = ${principalId}
             AND task_id != ${excludeTaskId}
           ORDER BY created_at DESC, task_id DESC
           LIMIT ${MAX_CONTEXT_TASKS}
@@ -107,7 +107,7 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
       : await this.sql<{ task_json: Task }[]>`
           SELECT task_json FROM infra.a2a_tasks
           WHERE context_id = ${contextId}
-            AND owner_wallet = ${walletAddress.toLowerCase()}
+            AND owner_principal = ${principalId}
           ORDER BY created_at DESC, task_id DESC
           LIMIT ${MAX_CONTEXT_TASKS}
         `;
@@ -115,36 +115,36 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   }
 
   private async upsert(task: Task): Promise<void> {
-    const ownerWallet = extractOwnerWallet(task);
+    const ownerPrincipal = extractOwnerPrincipal(task);
     const sanitized = stripSensitiveMetadata(task);
     const contextId = task.contextId ?? task.id;
 
     await this.sql`
-      INSERT INTO infra.a2a_tasks (task_id, context_id, state, task_json, owner_wallet)
+      INSERT INTO infra.a2a_tasks (task_id, context_id, state, task_json, owner_principal)
       VALUES (
         ${task.id},
         ${contextId},
         ${task.status.state},
         ${this.sql.json(JSON.parse(JSON.stringify(sanitized)))},
-        ${ownerWallet ?? null}
+        ${ownerPrincipal ?? null}
       )
       ON CONFLICT (task_id) DO UPDATE SET
         context_id = EXCLUDED.context_id,
         state = EXCLUDED.state,
         task_json = EXCLUDED.task_json,
-        owner_wallet = COALESCE(infra.a2a_tasks.owner_wallet, EXCLUDED.owner_wallet),
+        owner_principal = COALESCE(infra.a2a_tasks.owner_principal, EXCLUDED.owner_principal),
         updated_at = now()
     `;
 
     // Enforce retention only when this task reaches a terminal state
     const isTerminal = TERMINAL_STATES.has(task.status.state);
-    if (ownerWallet && isTerminal) {
+    if (ownerPrincipal && isTerminal) {
       await this.sql`
         DELETE FROM infra.a2a_tasks
         WHERE task_id IN (
           SELECT task_id FROM infra.a2a_tasks
           WHERE context_id = ${contextId}
-            AND owner_wallet = ${ownerWallet}
+            AND owner_principal = ${ownerPrincipal}
             AND state IN ('completed', 'failed', 'canceled', 'rejected')
           ORDER BY created_at DESC, task_id DESC
           OFFSET ${MAX_CONTEXT_TASKS}

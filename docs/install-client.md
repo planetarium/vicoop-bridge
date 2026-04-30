@@ -171,7 +171,7 @@ CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
 REG=$(curl -sX POST "$BRIDGE_URL/graphql" \
   -H "Authorization: Bearer $CALLER_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d "{\"query\":\"mutation{registerClient(input:{clientName:\\\"$CLIENT_NAME\\\",allowedAgentIds:[\\\"$AGENT_ID\\\"]}){clientWithToken{id token ownerWallet allowedAgentIds}}}\"}")
+  -d "{\"query\":\"mutation{registerClient(input:{clientName:\\\"$CLIENT_NAME\\\",allowedAgentIds:[\\\"$AGENT_ID\\\"]}){clientWithToken{id token ownerPrincipal allowedAgentIds}}}\"}")
 
 echo "$REG" | jq .
 CLIENT_TOKEN=$(echo "$REG" | jq -r .data.registerClient.clientWithToken.token)
@@ -190,7 +190,7 @@ want a new client with a fresh token.
 Before calling `registerClient`, probe the id with the
 `agentIdAvailable(agentId)` GraphQL query. It's a `SECURITY DEFINER`
 function (`packages/server/schema.sql`) that returns a plain boolean
-across every owner — no `owner_wallet` leaks — and raises
+across every owner — no `owner_principal` leaks — and raises
 `invalid_parameter_value` on empty input. Requires your caller token.
 
 ```sh
@@ -204,10 +204,10 @@ AVAILABLE=$(curl -sX POST "$BRIDGE_URL/graphql" \
 ```
 
 `true` means no `agent_policies` row exists for that id yet, so your first
-WS register in Step 5 will claim ownership. `false` means another wallet
+WS register in Step 5 will claim ownership. `false` means another principal
 already owns it — pick a different id. A small race window exists between
-this probe and your WS register; if another wallet claims the id in
-between, Step 5 emits `'agent id owned by a different wallet'` and you can
+this probe and your WS register; if another principal claims the id in
+between, Step 5 emits `'agent id owned by a different principal'` and you can
 fall back to the recovery path in "Troubleshooting".
 
 Even with the probe, prefer names unlikely to collide across operators.
@@ -234,7 +234,7 @@ are the owner:
 ```sh
 curl -sX POST "$BRIDGE_URL/graphql" \
   -H "Authorization: Bearer $CALLER_TOKEN" -H 'Content-Type: application/json' \
-  -d "{\"query\":\"{agentPolicyByAgentId(agentId:\\\"$AGENT_ID\\\"){agentId ownerWallet}}\"}" | jq .
+  -d "{\"query\":\"{agentPolicyByAgentId(agentId:\\\"$AGENT_ID\\\"){agentId ownerPrincipal}}\"}" | jq .
 ```
 
 A non-null response means you own it and a reinstall will reuse the
@@ -504,13 +504,13 @@ files before running it.
 
 ## Troubleshooting
 
-- **`agent id owned by a different wallet`** (WS register) — your wallet is
-  not the `owner_wallet` on the existing `agent_policies` row. Pick a
-  different `agent_id`, amend the existing client's allowlist via
-  `updateClientAllowedAgents` (no token rotation), and restart
+- **`agent id owned by a different principal`** (WS register) — your
+  principal is not the `owner_principal` on the existing `agent_policies`
+  row. Pick a different `agent_id`, amend the existing client's allowlist
+  via `updateClientAllowedAgents` (no token rotation), and restart
   `vicoop-client` with the new `AGENT_ID`. Re-run Step 3 only if you
   intentionally want a new client/token; otherwise sign in from the
-  original owner's wallet.
+  original owner.
 
 - **`permission denied for function register_client`** (or similar) on
   GraphQL — the caller token was missing, malformed, or expired, so the

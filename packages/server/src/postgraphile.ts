@@ -42,20 +42,16 @@ export async function startPostGraphile(databaseUrl: string, sql: Sql): Promise<
         if (auth?.startsWith('Bearer ')) {
           const token = auth.slice(7);
           // Opaque caller tokens are the only accepted admin GraphQL credential
-          // as of #31. Wallet-based callers (eth:* principals) get RLS-gated
-          // access; Google-only callers have no owner_wallet so their queries
-          // fall through to anonymous.
+          // as of #31. Any verified principal (eth:* or google:*) gets RLS-gated
+          // access scoped to rows whose owner_principal matches.
           if (token.startsWith(CALLER_TOKEN_PREFIX)) {
             try {
               const caller = await verifyCallerToken(sql, token);
-              if (caller.principalId.startsWith('eth:')) {
-                const walletAddress = caller.principalId.slice('eth:'.length);
-                return {
-                  role: 'app_authenticated',
-                  'jwt.claims.wallet_address': walletAddress,
-                  'app.admin_addresses': ADMIN_WALLET_ADDRESSES,
-                };
-              }
+              return {
+                role: 'app_authenticated',
+                'jwt.claims.principal_id': caller.principalId,
+                'app.admin_addresses': ADMIN_WALLET_ADDRESSES,
+              };
             } catch {
               // fall through to anonymous
             }

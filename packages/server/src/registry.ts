@@ -7,7 +7,7 @@ import { logEvent, truncate } from './log.js';
 export interface ClientConnection {
   agentId: string;
   clientId: string;
-  ownerWallet: string;
+  ownerPrincipal: string;
   agentCard: AgentCard;
   allowedCallers: string[];
   ws: WebSocket;

@@ -72,9 +72,9 @@ route requests to.
 # 1. Pick a raw token and insert the hashed form into clients.
 TOKEN=dev-client-token-raw-12345
 psql vicoop_bridge_dev <<SQL
-INSERT INTO clients (owner_wallet, client_name, token_hash, allowed_agent_ids)
+INSERT INTO clients (owner_principal, client_name, token_hash, allowed_agent_ids)
 VALUES (
-  '0x0000000000000000000000000000000000000001',
+  'eth:0x0000000000000000000000000000000000000001',
   'dev-echo-client',
   encode(digest('$TOKEN', 'sha256'), 'hex'),
   ARRAY['echo-agent']
@@ -283,8 +283,8 @@ Verified scenarios:
 - raw SIWE bearer on `/agents/:id` → 401 `Invalid bearer token: expected vbc_caller_* prefix`
 - expired SIWE message on exchange → 401 `invalid_grant`
 - domain mismatch on exchange → 401 `invalid_grant`
-- admin UI / admin GraphQL: same opaque token grants `wallet_address` claim and
-  (if wallet in `ADMIN_WALLET_ADDRESSES`) admin scope
+- admin UI / admin GraphQL: same opaque token grants `principal_id` claim and
+  (if the eth: address is in `ADMIN_WALLET_ADDRESSES`) admin scope
 
 ## Unit tests with live DB
 

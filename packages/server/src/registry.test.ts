@@ -31,7 +31,7 @@ test('onAgentChange fires on first registration', () => {
   const result = registry.registerAgent({
     agentId: 'a1',
     clientId: 'c1',
-    ownerWallet: '0x0',
+    ownerPrincipal: 'eth:0x0',
     agentCard: makeCard(false),
     allowedCallers: [],
     ws: makeWs(),
@@ -51,7 +51,7 @@ test('onAgentChange fires again when the same client reconnects with an updated 
   const base = {
     agentId: 'a1',
     clientId: 'c1',
-    ownerWallet: '0x0',
+    ownerPrincipal: 'eth:0x0',
     allowedCallers: [],
     connectedAt: 0,
   };
@@ -70,7 +70,7 @@ test('onAgentChange does NOT fire when registration is refused (different client
   registry.registerAgent({
     agentId: 'a1',
     clientId: 'c1',
-    ownerWallet: '0x0',
+    ownerPrincipal: 'eth:0x0',
     agentCard: makeCard(false),
     allowedCallers: [],
     ws: makeWs(),
@@ -81,7 +81,7 @@ test('onAgentChange does NOT fire when registration is refused (different client
   const rejected = registry.registerAgent({
     agentId: 'a1',
     clientId: 'c2', // different client
-    ownerWallet: '0x0',
+    ownerPrincipal: 'eth:0x0',
     agentCard: makeCard(true),
     allowedCallers: [],
     ws: makeWs(),
@@ -99,7 +99,7 @@ test('onAgentChange fires on disconnect (unregister) so stale transports do not 
   registry.registerAgent({
     agentId: 'a1',
     clientId: 'c1',
-    ownerWallet: '0x0',
+    ownerPrincipal: 'eth:0x0',
     agentCard: makeCard(false),
     allowedCallers: [],
     ws,
@@ -119,7 +119,7 @@ test('onAgentChange does NOT fire on unregister if the ws does not match the cur
   registry.registerAgent({
     agentId: 'a1',
     clientId: 'c1',
-    ownerWallet: '0x0',
+    ownerPrincipal: 'eth:0x0',
     agentCard: makeCard(false),
     allowedCallers: [],
     ws: oldWs,
@@ -130,7 +130,7 @@ test('onAgentChange does NOT fire on unregister if the ws does not match the cur
   registry.registerAgent({
     agentId: 'a1',
     clientId: 'c1',
-    ownerWallet: '0x0',
+    ownerPrincipal: 'eth:0x0',
     agentCard: makeCard(true),
     allowedCallers: [],
     ws: newWs,
@@ -169,7 +169,7 @@ test('a throwing onAgentChange listener does not abort other listeners or the re
   const result = registry.registerAgent({
     agentId: 'a1',
     clientId: 'c1',
-    ownerWallet: '0x0',
+    ownerPrincipal: 'eth:0x0',
     agentCard: makeCard(false),
     allowedCallers: [],
     ws: makeWs(),
@@ -205,7 +205,7 @@ test('notifyAgentChange log cannot be hijacked by newline injection via agentId'
   registry.registerAgent({
     agentId: 'good\nevent: fake_login\nextra: attacker-controlled',
     clientId: 'c1',
-    ownerWallet: '0x0',
+    ownerPrincipal: 'eth:0x0',
     agentCard: makeCard(false),
     allowedCallers: [],
     ws: makeWs(),
