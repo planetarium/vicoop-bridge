@@ -10,6 +10,7 @@ import {
   exchangeCode,
   type GoogleConfig,
 } from './google-oauth.js';
+import { issueSessionToken } from './caller-token.js';
 import type { Sql } from '../db.js';
 
 export interface DeviceUiOptions {
@@ -77,15 +78,24 @@ function hmacOf(secret: string, deviceCode: string): Buffer {
   return createHmac('sha256', secret).update(deviceCode).digest();
 }
 
-// state = base64url(HMAC) + '.' + base64url(device_code)
-function buildState(secret: string, deviceCode: string): string {
-  const mac = hmacOf(secret, deviceCode);
-  return `${b64urlEncode(mac)}.${b64urlEncode(Buffer.from(deviceCode, 'utf8'))}`;
+// state = base64url(HMAC) + '.' + base64url(payload)
+// payload is `device_code` for CLI flow, or `device_code|onsite_origin` for
+// the onsite popup flow. The `|` separator is safe: device codes are URL-safe
+// base64 (no `|`) and onsite origins are URLs (no `|`).
+function buildState(secret: string, deviceCode: string, onsiteOrigin?: string): string {
+  const payload = onsiteOrigin ? `${deviceCode}|${onsiteOrigin}` : deviceCode;
+  const mac = hmacOf(secret, payload);
+  return `${b64urlEncode(mac)}.${b64urlEncode(Buffer.from(payload, 'utf8'))}`;
 }
 
-// Returns the decoded device_code on success, or null on any failure.
+interface VerifiedState {
+  deviceCode: string;
+  onsiteOrigin?: string;
+}
+
+// Returns the decoded payload on success, or null on any failure.
 // Uses timingSafeEqual with equal-length buffers.
-function verifyState(secret: string, state: string): string | null {
+function verifyState(secret: string, state: string): VerifiedState | null {
   if (typeof state !== 'string' || state.length === 0) return null;
   const dot = state.indexOf('.');
   if (dot < 0) return null;
@@ -94,20 +104,43 @@ function verifyState(secret: string, state: string): string | null {
   if (!macPart || !dcPart) return null;
 
   let presented: Buffer;
-  let deviceCodeBuf: Buffer;
+  let payloadBuf: Buffer;
   try {
     presented = b64urlDecode(macPart);
-    deviceCodeBuf = b64urlDecode(dcPart);
+    payloadBuf = b64urlDecode(dcPart);
   } catch {
     return null;
   }
-  const deviceCode = deviceCodeBuf.toString('utf8');
-  if (deviceCode.length === 0) return null;
+  const payload = payloadBuf.toString('utf8');
+  if (payload.length === 0) return null;
 
-  const expected = hmacOf(secret, deviceCode);
+  const expected = hmacOf(secret, payload);
   if (presented.length !== expected.length) return null;
   if (!timingSafeEqual(presented, expected)) return null;
-  return deviceCode;
+
+  const sep = payload.indexOf('|');
+  if (sep < 0) return { deviceCode: payload };
+  return {
+    deviceCode: payload.slice(0, sep),
+    onsiteOrigin: payload.slice(sep + 1),
+  };
+}
+
+// Validate an onsite_origin query value. We're going to use it as a
+// postMessage targetOrigin and embed it in HTML, so it must be a syntactically
+// valid http(s) origin with no path/query/fragment and no embedded quotes.
+function normalizeOnsiteOrigin(raw: string | undefined): string | null {
+  if (!raw) return null;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  if (url.pathname !== '/' && url.pathname !== '') return null;
+  if (url.search || url.hash) return null;
+  return url.origin;
 }
 
 // Normalize "wdjb mjht" / "wdjb-mjht" / "WDJBMJHT" → "WDJB-MJHT"
@@ -255,7 +288,13 @@ export function mountDeviceUi(app: Hono, opts: DeviceUiOptions): void {
       );
     }
 
-    const state = buildState(opts.stateSecret, row.device_code);
+    // Onsite popup flow signals its opener origin so the callback can
+    // postMessage the issued token directly back instead of relying on
+    // the CLI-style /oauth/token poll loop. A bad/missing value silently
+    // falls back to the CLI flow (status='approved', polling continues).
+    const onsiteOrigin = normalizeOnsiteOrigin(c.req.query('onsite_origin'));
+
+    const state = buildState(opts.stateSecret, row.device_code, onsiteOrigin ?? undefined);
     const url = buildAuthorizeUrl(opts.google, state);
     return c.redirect(url, 302);
   });
@@ -272,8 +311,8 @@ export function mountDeviceUi(app: Hono, opts: DeviceUiOptions): void {
     }
 
     const state = c.req.query('state') ?? '';
-    const deviceCode = verifyState(opts.stateSecret, state);
-    if (!deviceCode) {
+    const verified = verifyState(opts.stateSecret, state);
+    if (!verified) {
       return c.html(
         page(
           'Invalid state',
@@ -282,6 +321,7 @@ export function mountDeviceUi(app: Hono, opts: DeviceUiOptions): void {
         400,
       );
     }
+    const { deviceCode, onsiteOrigin } = verified;
 
     const code = c.req.query('code');
     if (!code) {
@@ -294,8 +334,13 @@ export function mountDeviceUi(app: Hono, opts: DeviceUiOptions): void {
       );
     }
 
-    const rows = await opts.sql<{ status: string; expires_at: Date }[]>`
-      SELECT status, expires_at
+    const rows = await opts.sql<{
+      status: string;
+      expires_at: Date;
+      intent: string;
+      intent_params: ClientRegisterParams | null;
+    }[]>`
+      SELECT status, expires_at, intent, intent_params
       FROM device_sessions
       WHERE device_code = ${deviceCode}
       LIMIT 1
@@ -333,6 +378,84 @@ export function mountDeviceUi(app: Hono, opts: DeviceUiOptions): void {
     }
 
     const principalId = `google:${user.sub}`;
+
+    // Onsite popup flow: issue the session token inline and postMessage it
+    // back to the opener. Only supported for caller / owner_session intents
+    // — `client_register` uses CLI-style polling because it needs SQL
+    // function invocation that's already wired in /oauth/token.
+    const onsiteEligible =
+      onsiteOrigin !== undefined && (row.intent === 'caller' || row.intent === 'owner_session');
+
+    if (onsiteEligible) {
+      const audience = row.intent === 'owner_session' ? 'owner_session' : 'caller';
+      let issued;
+      try {
+        issued = await opts.sql.begin(async (tx) => {
+          const i = await issueSessionToken(tx as unknown as Sql, {
+            principalId,
+            provider: 'google',
+            audience,
+            email: user.email ?? undefined,
+          });
+          // Drop the device_session: the token has been delivered via
+          // postMessage, polling won't find it and shouldn't.
+          await tx`DELETE FROM device_sessions WHERE device_code = ${deviceCode}`;
+          return i;
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'unknown error';
+        return c.html(
+          page(
+            'Session issuance failed',
+            `<h1 class="error">Failed to issue session</h1><p>${escapeHtml(msg)}</p>`,
+          ),
+          500,
+        );
+      }
+
+      const expiresInSec = Math.max(
+        0,
+        Math.floor((issued.expiresAt.getTime() - Date.now()) / 1000),
+      );
+
+      // Embed token + target origin via JSON.stringify in a JSON island
+      // (`<script type="application/json">`) and read it from the script
+      // body. This avoids the XSS pitfalls of interpolating user-derived
+      // strings into JS source — even though the values here are
+      // server-generated, the convention keeps the surface small.
+      const payload = JSON.stringify({
+        type: 'vbc_session_token',
+        access_token: issued.rawToken,
+        token_type: 'Bearer',
+        expires_in: expiresInSec,
+        audience,
+      }).replace(/</g, '\\u003c');
+      const targetOrigin = JSON.stringify(onsiteOrigin).replace(/</g, '\\u003c');
+
+      const body = `
+        <h1>Approved</h1>
+        <p>Approved as <strong>${escapeHtml(user.email)}</strong>. Returning to admin UI…</p>
+        <script id="vbc-payload" type="application/json">${payload}</script>
+        <script>
+          (function () {
+            var raw = document.getElementById('vbc-payload').textContent;
+            var msg = JSON.parse(raw);
+            try {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage(msg, ${targetOrigin});
+              }
+            } finally {
+              window.close();
+            }
+          })();
+        </script>
+      `;
+      return c.html(page('Approved', body));
+    }
+
+    // CLI / device-flow path (no onsite_origin in state, or
+    // intent=client_register) — keep the existing behavior so callers
+    // poll /oauth/token for the token.
     const updated = await opts.sql`
       UPDATE device_sessions
       SET status = 'approved',

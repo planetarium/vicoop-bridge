@@ -58,7 +58,13 @@ describe('state build/parse round-trip', () => {
     const state = buildState(secret, deviceCode);
     assert.match(state, /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
     const decoded = verifyState(secret, state);
-    assert.equal(decoded, deviceCode);
+    assert.deepEqual(decoded, { deviceCode });
+  });
+
+  it('round-trips an onsite_origin payload', () => {
+    const state = buildState(secret, deviceCode, 'http://localhost:5174');
+    const decoded = verifyState(secret, state);
+    assert.deepEqual(decoded, { deviceCode, onsiteOrigin: 'http://localhost:5174' });
   });
 
   it('binds to the secret — wrong secret rejects', () => {

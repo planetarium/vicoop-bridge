@@ -4,6 +4,7 @@ import { Hono, type Context } from 'hono';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { stream } from 'hono/streaming';
 import { html } from 'hono/html';
+import { cors } from 'hono/cors';
 import {
   A2XAgent,
   DefaultRequestHandler,
@@ -32,6 +33,22 @@ export interface ServerHttpOptions {
 
 export function createHttpApp(opts: ServerHttpOptions): Hono {
   const app = new Hono();
+
+  // The deployed admin UI lives at the same origin as the bridge (mounted
+  // under /admin), but during local dev it runs on Vite. Reflect the
+  // request Origin so cross-origin XHR from the dev UI works without
+  // baking a wildcard into the response. `credentials: true` is needed
+  // because A2XClient sends `Authorization: Bearer ...` headers.
+  app.use(
+    '*',
+    cors({
+      origin: (origin) => origin ?? '',
+      allowHeaders: ['Authorization', 'Content-Type'],
+      allowMethods: ['GET', 'POST', 'OPTIONS'],
+      credentials: true,
+      maxAge: 600,
+    }),
+  );
 
   // Built-in admin agent at root. The admin agent owns its own taskStore
   // (Postgres-backed) for context-aware history loading; client agents

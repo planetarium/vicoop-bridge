@@ -1,4 +1,4 @@
-import { ConnectButton } from '@rainbow-me/rainbowkit';
+import { useConnectModal } from '@rainbow-me/rainbowkit';
 import { useAccount, useSignMessage, useDisconnect } from 'wagmi';
 import { SiweMessage } from 'siwe';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -9,6 +9,7 @@ export function WalletAuth() {
   const { address, isConnected, chainId } = useAccount();
   const { signMessageAsync } = useSignMessage();
   const { disconnect } = useDisconnect();
+  const { openConnectModal } = useConnectModal();
   const token = useAuthToken();
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -61,14 +62,22 @@ export function WalletAuth() {
   useEffect(() => {
     if (!isConnected) {
       autoSignInAttempted.current = false;
-      if (token) setToken(null);
+      // Only clear tokens this component owns (SIWE issues `vbc_caller_*`).
+      // Google sign-in produces `vbc_owner_*` tokens managed by GoogleAuth;
+      // those must survive a wallet disconnect (or never-connected state).
+      if (token && token.startsWith('vbc_caller_')) setToken(null);
     }
   }, [isConnected, token]);
 
   if (!isConnected) {
     return (
       <div className="flex items-center gap-3">
-        <ConnectButton />
+        <button
+          onClick={openConnectModal}
+          className="text-sm bg-zinc-800 hover:bg-zinc-700 text-zinc-100 px-3 py-1.5 rounded transition-colors"
+        >
+          Connect Wallet
+        </button>
         {error && <p className="text-sm text-red-400">{error}</p>}
       </div>
     );
