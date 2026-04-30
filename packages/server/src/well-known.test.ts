@@ -43,6 +43,22 @@ function fakeCardV03(agentId: string, overrides: Partial<AgentCardV03> = {}): Ag
   } as AgentCardV03;
 }
 
+function fakeAdminCard(): AgentCardV03 {
+  return {
+    name: 'Vicoop Bridge Server Admin',
+    description: 'Bridge admin agent',
+    version: '0.1.0',
+    protocolVersion: '0.3',
+    url: 'https://bridge.example.com/',
+    capabilities: { streaming: false, pushNotifications: false },
+    defaultInputModes: ['text/plain'],
+    defaultOutputModes: ['text/plain'],
+    skills: [
+      { id: 'client-management', name: 'Client Management', description: 'admin tools' },
+    ],
+  } as AgentCardV03;
+}
+
 function makeApp(opts: {
   agents: ClientConnection[];
   // When omitted, defaults to a typical deploy with publicUrl / domain set.
@@ -54,6 +70,7 @@ function makeApp(opts: {
   const deps: WellKnownDeps = {
     listAgents: () => opts.agents,
     getAgentCard: (conn) => fakeCardV03(conn.agentId),
+    adminCard: fakeAdminCard(),
     publicUrl: opts.noPublicUrl ? undefined : 'https://bridge.example.com',
     domain: opts.noPublicUrl ? undefined : 'bridge.example.com',
     deviceFlowEnabled: opts.deviceFlowEnabled ?? false,
@@ -174,9 +191,10 @@ test('agent-card: 404 for an unknown local', async () => {
   assert.equal(res.status, 404);
 });
 
-test('mentionable-agents.json: lists every connected client with a safe local-part', async () => {
+test('mentionable-agents.json: lists admin first, then every safe-local-part client', async () => {
   // The third agent has `bad@id` which fails isValidMentionableLocal and
   // must be silently dropped so we never render an `acct:bad@id@host` URI.
+  // Admin is always advertised — it's the bridge itself.
   const app = makeApp({
     agents: [fakeConn('foo'), fakeConn('bar'), fakeConn('bad@id')],
   });
@@ -187,16 +205,57 @@ test('mentionable-agents.json: lists every connected client with a safe local-pa
     contactPoint: Array<{ email: string }>;
   };
   assert.equal(body['@type'], 'Organization');
-  const emails = body.contactPoint.map((p) => p.email).sort();
-  assert.deepEqual(emails, ['bar@bridge.example.com', 'foo@bridge.example.com']);
+  const emails = body.contactPoint.map((p) => p.email);
+  // Admin first by convention; client order follows registry insertion.
+  assert.deepEqual(emails, [
+    'admin@bridge.example.com',
+    'foo@bridge.example.com',
+    'bar@bridge.example.com',
+  ]);
 });
 
-test('mentionable-agents.json: empty contactPoint when no clients connected', async () => {
+test('mentionable-agents.json: contains only admin when no clients connected', async () => {
+  // The bridge itself is always addressable — directory is never empty
+  // on a configured deployment.
   const app = makeApp({ agents: [] });
   const res = await app.request('/.well-known/mentionable-agents.json');
   assert.equal(res.status, 200);
-  const body = (await res.json()) as { contactPoint: unknown[] };
-  assert.equal(body.contactPoint.length, 0);
+  const body = (await res.json()) as { contactPoint: Array<{ email: string }> };
+  assert.equal(body.contactPoint.length, 1);
+  assert.equal(body.contactPoint[0]!.email, 'admin@bridge.example.com');
+});
+
+test('webfinger: resolves admin even when no clients are connected', async () => {
+  const app = makeApp({ agents: [] });
+  const res = await app.request(
+    '/.well-known/webfinger?resource=acct:admin@bridge.example.com',
+  );
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { subject: string; aliases: string[] };
+  assert.equal(body.subject, 'acct:admin@bridge.example.com');
+  // Admin lives at the bridge root, NOT under /agents/admin.
+  assert.deepEqual(body.aliases, ['https://bridge.example.com/']);
+});
+
+test('agent-card: returns admin Mentionable card with admin endpoint at root', async () => {
+  const app = makeApp({ agents: [] });
+  const res = await app.request('/.well-known/agent-card/admin');
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as {
+    address: string;
+    a2a: { endpoint: string };
+  };
+  assert.equal(body.address, '@admin@bridge.example.com');
+  assert.equal(body.a2a.endpoint, 'https://bridge.example.com/');
+});
+
+test('agent-card: matches admin local-part case-insensitively', async () => {
+  const app = makeApp({ agents: [] });
+  const res = await app.request('/.well-known/agent-card/ADMIN');
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { address: string };
+  // Canonical local-part is rendered in lowercase regardless of input case.
+  assert.equal(body.address, '@admin@bridge.example.com');
 });
 
 test('mentionable-agents.json: 404 when bridge has no PUBLIC_URL configured', async () => {

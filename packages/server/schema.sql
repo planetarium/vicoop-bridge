@@ -234,6 +234,33 @@ COMMENT ON TABLE clients IS E'@omit create';
 -- ------------------------------------------------------------
 -- 3a. Client CRUD mutations (exposed by PostGraphile)
 -- ------------------------------------------------------------
+
+-- Agent ids the bridge reserves for itself. Mirrored in
+-- packages/server/src/reserved-agent-ids.ts — keep both lists in sync.
+-- The case-insensitive comparison matches the TS layer's behavior so a
+-- caller can't bypass by sending 'Admin' / 'ADMIN'.
+CREATE OR REPLACE FUNCTION assert_no_reserved_agent_ids(allowed_agent_ids TEXT[])
+RETURNS VOID
+  LANGUAGE plpgsql
+  IMMUTABLE
+AS $$
+DECLARE
+  v_reserved TEXT[] := ARRAY['admin'];
+  v_id TEXT;
+BEGIN
+  IF allowed_agent_ids IS NULL THEN RETURN; END IF;
+  FOREACH v_id IN ARRAY allowed_agent_ids LOOP
+    IF lower(v_id) = ANY(v_reserved) THEN
+      RAISE EXCEPTION 'agent id "%" is reserved by the bridge', v_id
+        USING ERRCODE = 'check_violation';
+    END IF;
+  END LOOP;
+END;
+$$;
+
+COMMENT ON FUNCTION assert_no_reserved_agent_ids(TEXT[]) IS
+  'Raise if any element of allowed_agent_ids is reserved (e.g. "admin"). Mirrors RESERVED_AGENT_IDS in packages/server/src/reserved-agent-ids.ts.';
+
 -- Token-carrying return type for register / rotate.
 -- Wrapped in DO so the migration is idempotent.
 DO $$ BEGIN
@@ -270,6 +297,8 @@ DECLARE
   v_owner      TEXT;
   v_row        client_with_token;
 BEGIN
+  PERFORM assert_no_reserved_agent_ids(register_client.allowed_agent_ids);
+
   v_raw_token  := encode(gen_random_bytes(32), 'hex');
   v_token_hash := encode(digest(v_raw_token, 'sha256'), 'hex');
 
@@ -391,6 +420,8 @@ AS $$
 DECLARE
   v_row clients;
 BEGIN
+  PERFORM assert_no_reserved_agent_ids(update_client_allowed_agents.allowed_agent_ids);
+
   UPDATE clients AS c
   SET allowed_agent_ids = COALESCE(update_client_allowed_agents.allowed_agent_ids, '{}')
   WHERE c.id = update_client_allowed_agents.client_id

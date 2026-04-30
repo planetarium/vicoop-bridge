@@ -143,12 +143,14 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   app.get('/.well-known/agent-card.json', (c) => c.json(adminCard));
 
   // Mentionable v0.1 surface (WebFinger + agent-card + Agent Directory)
-  // exposing every connected client as `@<agentId>@<bridge-host>`. The
-  // admin agent intentionally stays on the existing
-  // `/.well-known/agent-card.json` and is not part of this directory.
+  // exposing every connected client as `@<agentId>@<bridge-host>`, plus
+  // the bridge's own admin agent at `@admin@<bridge-host>`. The agentId
+  // "admin" is reserved (see reserved-agent-ids.ts) so a connected client
+  // cannot shadow the admin entry.
   const wellKnownDeps: WellKnownDeps = {
     listAgents: () => opts.registry.listAgents(),
     getAgentCard: (conn) => getAgentForConn(conn).getAgentCard() as AgentCardV03,
+    adminCard,
     publicUrl: opts.publicUrl,
     domain: siweDomain,
     deviceFlowEnabled,

@@ -3,6 +3,11 @@ import type { AgentCardV03 } from '@a2x/sdk';
 export const MENTIONABLE_PROTOCOL_VERSION = '0.1' as const;
 export const MENTIONABLE_AGENT_CARD_REL = 'https://mentionable.dev/agent-card';
 
+// Local-part for the bridge's built-in admin agent. Reserved at every
+// agentId intake point (see reserved-agent-ids.ts) so a connected client
+// cannot shadow it.
+export const MENTIONABLE_ADMIN_LOCAL = 'admin';
+
 // RFC 5321 §4.1.2 allows a wider local-part charset, but agentIds at this
 // layer are unconstrained client-supplied strings (see registry.ts). Restrict
 // the Mentionable surface to a safe subset — letter, digit, dot, hyphen,

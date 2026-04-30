@@ -2,6 +2,7 @@ import type { Hono } from 'hono';
 import type { AgentCardV03 } from '@a2x/sdk';
 import type { ClientConnection } from './registry.js';
 import {
+  MENTIONABLE_ADMIN_LOCAL,
   MENTIONABLE_AGENT_CARD_REL,
   buildAgentDirectory,
   buildMentionableCard,
@@ -19,6 +20,10 @@ export interface WellKnownDeps {
   // streaming/extensions/security all reflected). The HTTP layer hands us
   // a closure over its per-agent cache so we don't rebuild cards here.
   getAgentCard: (conn: ClientConnection) => AgentCardV03;
+  // Bridge's own admin agent card. Listed under @admin@<host> in every
+  // well-known surface — does not depend on a WS connection (it's the
+  // bridge itself).
+  adminCard: AgentCardV03;
   // Bridge's external HTTPS base, e.g. `https://bridge.example.com`. When
   // unset, every Mentionable route degrades to 404 — RFC 7033 requires HTTPS
   // and we can't render a self-referential URL without knowing our origin.
@@ -35,8 +40,21 @@ export interface WellKnownDeps {
   organizationName: string;
 }
 
+interface ResolvedLocal {
+  local: string; // canonical local-part as it appears in addresses
+  card: AgentCardV03;
+}
+
 function listDirectoryEntries(deps: WellKnownDeps): DirectoryEntry[] {
-  const entries: DirectoryEntry[] = [];
+  // Admin always appears first so a casual reader of the directory finds
+  // the bridge itself before the connected clients.
+  const entries: DirectoryEntry[] = [
+    {
+      local: MENTIONABLE_ADMIN_LOCAL,
+      name: deps.adminCard.name,
+      description: deps.adminCard.description ?? undefined,
+    },
+  ];
   for (const conn of deps.listAgents()) {
     if (!isValidMentionableLocal(conn.agentId)) continue;
     const card = deps.getAgentCard(conn);
@@ -49,14 +67,17 @@ function listDirectoryEntries(deps: WellKnownDeps): DirectoryEntry[] {
   return entries;
 }
 
-function findConnByLocal(deps: WellKnownDeps, local: string): ClientConnection | undefined {
+function resolveLocal(deps: WellKnownDeps, local: string): ResolvedLocal | undefined {
   const lower = local.toLowerCase();
+  if (lower === MENTIONABLE_ADMIN_LOCAL.toLowerCase()) {
+    return { local: MENTIONABLE_ADMIN_LOCAL, card: deps.adminCard };
+  }
   for (const conn of deps.listAgents()) {
     if (
       isValidMentionableLocal(conn.agentId) &&
       conn.agentId.toLowerCase() === lower
     ) {
-      return conn;
+      return { local: conn.agentId, card: deps.getAgentCard(conn) };
     }
   }
   return undefined;
@@ -92,18 +113,23 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
     ) {
       return c.json({ error: 'not found' }, 404);
     }
-    const conn = findConnByLocal(deps, parsed.local);
-    if (!conn) return c.json({ error: 'not found' }, 404);
+    const resolved = resolveLocal(deps, parsed.local);
+    if (!resolved) return c.json({ error: 'not found' }, 404);
 
-    const subject = `acct:${conn.agentId}@${deps.domain.toLowerCase()}`;
+    // Admin lives at the bridge root; clients live under /agents/<id>.
+    const isAdmin = resolved.local === MENTIONABLE_ADMIN_LOCAL;
+    const aliasUrl = isAdmin
+      ? `${deps.publicUrl}/`
+      : `${deps.publicUrl}/agents/${resolved.local}`;
+    const subject = `acct:${resolved.local}@${deps.domain.toLowerCase()}`;
     const jrd = {
       subject,
-      aliases: [`${deps.publicUrl}/agents/${conn.agentId}`],
+      aliases: [aliasUrl],
       links: [
         {
           rel: MENTIONABLE_AGENT_CARD_REL,
           type: 'application/json',
-          href: `${deps.publicUrl}/.well-known/agent-card/${conn.agentId}`,
+          href: `${deps.publicUrl}/.well-known/agent-card/${resolved.local}`,
         },
         {
           rel: 'http://webfinger.net/rel/profile-page',
@@ -128,11 +154,10 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
     if (!isValidMentionableLocal(local)) {
       return c.json({ error: 'not found' }, 404);
     }
-    const conn = findConnByLocal(deps, local);
-    if (!conn) return c.json({ error: 'not found' }, 404);
-    const card = deps.getAgentCard(conn);
-    const mentionable = buildMentionableCard(card, {
-      local: conn.agentId,
+    const resolved = resolveLocal(deps, local);
+    if (!resolved) return c.json({ error: 'not found' }, 404);
+    const mentionable = buildMentionableCard(resolved.card, {
+      local: resolved.local,
       domain: deps.domain.toLowerCase(),
       baseUrl: deps.publicUrl,
       publicUrl: deps.publicUrl,

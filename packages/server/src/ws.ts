@@ -13,6 +13,7 @@ import type { Registry } from './registry.js';
 import type { Sql } from './db.js';
 import { hashToken } from './token.js';
 import { logEvent, truncate } from './log.js';
+import { isReservedAgentId } from './reserved-agent-ids.js';
 
 interface ClientRow {
   id: string;
@@ -97,6 +98,15 @@ async function authenticateAndRegister(
   frame: import('@vicoop-bridge/protocol').HelloFrame,
   opts: ServerWsOptions,
 ): Promise<AuthResult> {
+  // Reserved agent ids (e.g. "admin") are owned by the bridge itself —
+  // exposed at @admin@<host> via Mentionable. The schema assert makes it
+  // impossible for a client row to legally carry "admin" in its allowlist,
+  // but a manually-inserted row or a future schema regression must still
+  // be refused at the wire. Belt and suspenders.
+  if (isReservedAgentId(frame.agentId)) {
+    logEvent('client_rejected', { reason: 'agent id reserved', agentId: frame.agentId });
+    return { ok: false, code: 4011, reason: 'agent id reserved by the bridge' };
+  }
   const hash = hashToken(frame.token);
   const client = await lookupByTokenHash(opts.db, hash);
   if (!client) {
