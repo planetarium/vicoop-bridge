@@ -159,8 +159,10 @@ AGENT_ID=<your agent id>
 > ⚠ The `CLIENT_TOKEN` is unrecoverable after this single output. The env
 > file is the only place it persists; back it up if you need to rotate
 > hosts. To rotate the token later, use the `rotateClientToken` GraphQL
-> mutation (requires a fresh caller token via either `vicoop-client login`
-> or SIWE — the rotation surfaces a new CLIENT_TOKEN, also one-time).
+> mutation (requires a fresh `vbc_owner_*` session token from
+> `/auth/siwe/exchange?intent=owner_session` or device flow with
+> `intent=owner_session` — the rotation surfaces a new CLIENT_TOKEN, also
+> one-time).
 
 Drop `--env-file` and pass `--json` instead if you want to compose with
 shell tooling:
@@ -297,18 +299,19 @@ want Claude to edit.
 
 By default the policy has empty `allowed_callers`, which the dispatcher
 treats as "public". To lock it down, use the admin agent's `add_caller`
-tool. The admin agent at `POST /` is **wallet-gated** (requires a SIWE
-caller token with an `eth:*` principal — Google operators need to sign in
-separately via SIWE to talk to it; see "Alternative: SIWE onboarding"
-below for the SIWE token exchange).
+tool. The admin agent at `POST /` accepts any **owner-session token**
+(`vbc_owner_*`) — wallet (SIWE) or Google (device flow with
+`intent=owner_session`). Admin scope (`is_admin()`) is wallet-only and
+gates only the cross-owner tools.
 
 ```sh
-# Assumes you've already obtained $CALLER_TOKEN from SIWE — see
-# "Alternative: SIWE onboarding".
+# $OWNER_TOKEN: vbc_owner_* token from /auth/siwe/exchange or
+# /oauth/device/code with intent=owner_session. See "Alternative: SIWE
+# onboarding" below for the SIWE path.
 WALLET_PRINCIPAL="eth:$(a2a-wallet status | awk '/Address/{print tolower($2)}')"
 
 curl -sX POST "$BRIDGE_URL/" \
-  -H "Authorization: Bearer $CALLER_TOKEN" -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"message/send\",\"params\":{\"message\":{\"messageId\":\"ac\",\"role\":\"user\",\"kind\":\"message\",\"parts\":[{\"kind\":\"text\",\"text\":\"Use add_caller to add '${WALLET_PRINCIPAL}' to agent '${AGENT_ID}'.\"}]}}}" \
   | jq -r '.result.status.message.parts[0].text'
 ```
@@ -506,22 +509,21 @@ files before running it.
 ## Alternative: SIWE onboarding
 
 If you'd rather own your client identity with an Ethereum EOA than a
-Google account — or if you need to talk to the wallet-gated admin agent
-at `POST /` — replace Step 3 with the two-step SIWE path:
+Google account, replace Step 3 with the two-step SIWE path:
 
-1. Sign a SIWE message and exchange it for a caller token at
-   `POST /auth/siwe/exchange`. See
-   [`remote-testing.md` §1](./remote-testing.md) for the full snippet
-   (also linked from the `add_caller` example earlier in this doc), or
+1. Sign a SIWE message and exchange it at `POST /auth/siwe/exchange` for a
+   `vbc_owner_*` session token. SIWE exchange defaults to
+   `intent=owner_session`, which is what you want here. See
+   [`remote-testing.md` §1](./remote-testing.md) for the full snippet, or
    use `a2a-wallet siwe auth` if the CLI is installed.
-2. Call the `registerClient` GraphQL mutation with that caller token to
-   mint a `CLIENT_TOKEN`:
+2. Call the `registerClient` GraphQL mutation with that owner-session
+   token to mint a `CLIENT_TOKEN`:
 
 ```sh
-CALLER_TOKEN=...   # from POST /auth/siwe/exchange
+OWNER_TOKEN=...   # vbc_owner_* from POST /auth/siwe/exchange
 
 REG=$(curl -sX POST "$BRIDGE_URL/graphql" \
-  -H "Authorization: Bearer $CALLER_TOKEN" \
+  -H "Authorization: Bearer $OWNER_TOKEN" \
   -H 'Content-Type: application/json' \
   -d "{\"query\":\"mutation{registerClient(input:{clientName:\\\"$CLIENT_NAME\\\",allowedAgentIds:[\\\"$AGENT_ID\\\"]}){clientWithToken{id token ownerPrincipal allowedAgentIds}}}\"}")
 
@@ -533,9 +535,11 @@ it just owns the row under an `eth:0x…` principal instead of
 `google:sub:…`. After that, Steps 4-6 (agent card, run, persist) are the
 same as the Google path.
 
-This SIWE caller token is also what you need to invoke the admin agent for
-managing `allowed_callers` (see "Restrict who can call your agent"
-above) — the admin agent rejects non-`eth:` principals by design.
+The same `OWNER_TOKEN` is what you'd present to the admin agent at
+`POST /` for managing `allowed_callers` (see "Restrict who can call your
+agent" above). Google operators get an equivalent `vbc_owner_*` from the
+device flow and can use the admin agent the same way; admin **scope**
+(visibility into all owners' rows) remains wallet-only.
 
 ## What's next
 

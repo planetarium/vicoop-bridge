@@ -7,22 +7,33 @@ access** and **no admin wallet** required.
 
 This is the shortest path and matches the intended production flow:
 
-1. Sign SIWE with any EOA → exchange for an opaque caller token
+1. Sign SIWE with any EOA → exchange for a `vbc_owner_*` session token
+   (default `intent=owner_session`)
 2. Register a client via the public GraphQL mutation → receive a raw client token
 3. Run a local echo backend connected over WSS
 4. Grant a principal on the auto-created agent policy via `add_caller` (admin
    agent, RLS-owner-gated, not admin-only)
-5. Dispatch to `/agents/:id` with an opaque token matching that principal
+5. Dispatch to `/agents/:id` with an opaque `vbc_caller_*` token matching that principal
 
-Two dispatch-side variants are covered:
+Note the **two distinct token audiences** used below (issue #79 PR D):
 
-- **Default (eth principal)** — caller uses the SIWE-issued opaque token
-  directly. Good for integrators whose callers are wallets.
+- `vbc_owner_*` (owner-session): issued by SIWE exchange or device flow
+  with `intent=owner_session`. Presented to `/graphql` and `POST /` for
+  self-service operations. Used in steps 1, 2, 4 below.
+- `vbc_caller_*` (caller): issued by SIWE exchange with `intent=caller`
+  or device flow with `intent=caller`. Presented to `/agents/:id` to
+  invoke somebody's agent. Used in step 5.
+
+Two dispatch-side (step 5) variants are covered:
+
+- **Default (eth principal)** — caller uses a SIWE-issued
+  `vbc_caller_*` (re-exchange with `intent=caller`). Good for integrators
+  whose callers are wallets.
 - **Google-authenticated caller** — principal is `google:email:*` /
-  `google:domain:*` / `google:sub:*`; the caller acquires a long-lived opaque
-  token via the OAuth device flow and uses that for dispatch. Setup (steps
-  1-3) still requires SIWE because `register_client` and `add_caller`
-  demand an eth-authenticated session.
+  `google:domain:*` / `google:sub:*`; the caller acquires a long-lived
+  `vbc_caller_*` via the OAuth device flow with `intent=caller`. Setup
+  (steps 1-3) still uses SIWE because `register_client` and `add_caller`
+  expect an eth-authenticated owner session.
 
 Contrast with [`local-testing.md`](./local-testing.md): that doc runs both
 server and client locally and uses `psql` to write `clients` /

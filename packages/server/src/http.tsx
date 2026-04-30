@@ -12,7 +12,7 @@ import {
 import type { ClientConnection, Registry } from './registry.js';
 import { createAdminA2XAgent, getAdminWallets } from './admin.js';
 import { agentAuthMiddleware, getAgentConn } from './agent-auth.js';
-import { CALLER_TOKEN_PREFIX, verifyCallerToken } from './auth/caller-token.js';
+import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
 import { mountDeviceUi } from './auth/device-ui.js';
 import { mountSiweExchange } from './auth/siwe-exchange.js';
@@ -161,24 +161,27 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // on all subsequent requests.
   mountSiweExchange(app, { sql: opts.db, domain: siweDomain });
 
-  // Root POST — admin agent A2A endpoint. Accepts any verified caller token;
-  // RLS scopes what the operator can see (their own clients/policies). The
-  // admin scope itself stays wallet-only — `is_admin()` matches only
-  // `eth:` principals against ADMIN_WALLET_ADDRESSES — but non-admin
-  // wallet and non-admin Google callers both reach the chat now and see
-  // their RLS-scoped view. (Originally eth-only by design; lifted to
-  // open self-service to Google-onboarded operators per issue #79
-  // option B.)
+  // Root POST — admin agent A2A endpoint. Owner-session-audience only
+  // (`vbc_owner_*`); caller-audience tokens (`vbc_caller_*`) are rejected
+  // because admin chat is for the resource owner managing their own
+  // clients/policies, not for third-party agent invocation. RLS scopes
+  // what the operator can see; admin scope (`is_admin()`) stays
+  // wallet-only by design (issue #79).
   app.post('/', async (c) => {
     const authHeader = c.req.header('Authorization');
     const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
-    if (!bearerToken || !bearerToken.startsWith(CALLER_TOKEN_PREFIX)) {
+    if (!bearerToken || !bearerToken.startsWith(OWNER_SESSION_PREFIX)) {
       return c.json({
         jsonrpc: '2.0',
         id: null,
         error: {
           code: -32001,
-          message: `Authentication required (Bearer ${CALLER_TOKEN_PREFIX}* token). Acquire via /auth/siwe/exchange or Google OAuth device flow.`,
+          message:
+            `Authentication required (Bearer ${OWNER_SESSION_PREFIX}* token). ` +
+            `Acquire via /auth/siwe/exchange (intent=owner_session) or ` +
+            `/oauth/device/code (intent=owner_session). ` +
+            `${CALLER_TOKEN_PREFIX}* tokens are not accepted here — those ` +
+            `are for /agents/:id calls.`,
         },
       }, 401);
     }
@@ -186,14 +189,16 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     let principalId: string;
     let callerEmail: string | undefined;
     try {
-      const caller = await verifyCallerToken(opts.db, bearerToken);
+      const caller = await verifySessionToken(opts.db, bearerToken, {
+        expectedAudience: 'owner_session',
+      });
       principalId = caller.principalId;
       callerEmail = caller.email;
     } catch (err) {
       return c.json({
         jsonrpc: '2.0',
         id: null,
-        error: { code: -32001, message: `Invalid caller token: ${(err as Error).message}` },
+        error: { code: -32001, message: `Invalid session token: ${(err as Error).message}` },
       }, 401);
     }
 

@@ -3,30 +3,27 @@
 // (that sets status='approved' and fills principal_id/email) is implemented
 // separately in device-ui.ts.
 //
-// Two intents flow through the same approval pipeline (see issue #79):
-//   * 'caller'           — issue a vbc_caller_* opaque token to the polling
-//                          CLI for use as a Bearer credential against
-//                          /agents/:id and the admin GraphQL surface.
-//   * 'client_register'  — call register_client() on behalf of the approved
-//                          principal and return the resulting CLIENT_TOKEN +
-//                          client_id, no callers row created. This is the
-//                          device-flow vicoop-client onboarding path.
+// Three intents flow through the same approval pipeline (see issue #79):
+//   * 'caller'          — issue a `vbc_caller_*` Bearer for an external A2A
+//                         caller invoking somebody else's agent at
+//                         /agents/:id (audience='caller').
+//   * 'owner_session'   — issue a `vbc_owner_*` Bearer for the resource
+//                         owner's self-service surface (admin chat,
+//                         /graphql) (audience='owner_session'). PR D.
+//   * 'client_register' — call register_client() on behalf of the approved
+//                         principal and return the resulting CLIENT_TOKEN +
+//                         client_id, no callers row created. This is the
+//                         device-flow vicoop-client onboarding path.
 //
 // Token endpoint dispatches on `device_sessions.intent`. Approval UI surfaces
 // the difference to the operator (device-ui.ts).
-//
-// Bootstrap-mode tokenTtlMs: device-flow caller tokens default to 90 days,
-// matching SIWE-issued tokens for ergonomic admin-GraphQL reuse. Operators
-// who only want a one-shot bootstrap can set bootstrapTokenTtlMs to scope
-// the issued token tighter; that doesn't apply to the client_register branch
-// (its CLIENT_TOKEN has no TTL — it's revoked, not expired).
 
 import { randomBytes, randomInt } from 'node:crypto';
 import type { Hono, Context } from 'hono';
 import type { Sql } from '../db.js';
-import { issueCallerToken } from './caller-token.js';
+import { issueSessionToken } from './caller-token.js';
 
-export type DeviceFlowIntent = 'caller' | 'client_register';
+export type DeviceFlowIntent = 'caller' | 'owner_session' | 'client_register';
 
 export interface DeviceFlowOptions {
   sql: Sql;
@@ -191,6 +188,8 @@ export function mountDeviceFlow(app: Hono, opts: DeviceFlowOptions): void {
 
     if (intentRaw === 'caller' || intentRaw === '') {
       intent = 'caller';
+    } else if (intentRaw === 'owner_session') {
+      intent = 'owner_session';
     } else if (intentRaw === 'client_register') {
       intent = 'client_register';
       const parsed = parseClientRegisterParams(body);
@@ -370,11 +369,17 @@ export function mountDeviceFlow(app: Hono, opts: DeviceFlowOptions): void {
         });
       }
 
-      // intent === 'caller' (default) — original behavior
+      // intent === 'caller' or 'owner_session' — issue a session token of
+      // the matching audience. The two paths are otherwise identical
+      // (single principal, persisted to callers, returned via OAuth-style
+      // access_token response). Audience selects the prefix
+      // (`vbc_caller_*` vs `vbc_owner_*`) and constrains downstream usage.
+      const audience = row.intent === 'owner_session' ? 'owner_session' : 'caller';
       const issued = await sql.begin(async (tx) => {
-        const i = await issueCallerToken(tx as unknown as Sql, {
+        const i = await issueSessionToken(tx as unknown as Sql, {
           principalId: row.principal_id!,
           provider: 'google',
+          audience,
           email: row.email ?? undefined,
           ttlMs: tokenTtlMs,
         });

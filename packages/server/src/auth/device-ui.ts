@@ -155,6 +155,16 @@ function renderIntentIntro(intent: string, params: ClientRegisterParams | null):
       <p>You'll be asked to sign in to Google to confirm.</p>
     `;
   }
+  if (intent === 'owner_session') {
+    return `
+      <p><strong>Sign in to manage your bridge clients</strong></p>
+      <p>This will issue a session token bound to your Google account so you
+         can view and manage clients and agent policies you own (admin chat,
+         GraphQL self-service). It does not authorize calls to other people's
+         agents.</p>
+      <p>You'll be asked to sign in to Google to confirm.</p>
+    `;
+  }
   // Default 'caller' intent.
   return `
     <p>This will authorize a CLI session to call agents on your behalf.
@@ -199,9 +209,12 @@ export function mountDeviceUi(app: Hono, opts: DeviceUiOptions): void {
     const safeCode = escapeHtml(normalized);
     const href = `/oauth/google/start?user_code=${encodeURIComponent(normalized)}`;
     const intro = renderIntentIntro(session.intent, session.intent_params);
-    const headerText = session.intent === 'client_register'
-      ? 'Authorize bridge client registration'
-      : 'Authorize device';
+    const headerText =
+      session.intent === 'client_register'
+        ? 'Authorize bridge client registration'
+        : session.intent === 'owner_session'
+          ? 'Sign in to manage your bridge clients'
+          : 'Authorize device';
     const body = `
       <h1>${escapeHtml(headerText)}</h1>
       <div class="code">${safeCode}</div>

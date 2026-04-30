@@ -19,9 +19,12 @@ export interface AgentAuthOptions {
 }
 
 export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) {
+  // /agents/:id only accepts caller-audience tokens. Owner-session tokens
+  // (vbc_owner_*) are for self-service surfaces and explicitly rejected
+  // here even if they belong to a principal in allowed_callers.
   const acquisitionHint = opts.deviceFlowEnabled
-    ? '/auth/siwe/exchange (SIWE) or /oauth/token (device flow)'
-    : '/auth/siwe/exchange (SIWE)';
+    ? '/auth/siwe/exchange (SIWE, intent=caller) or /oauth/token (device flow, intent=caller)'
+    : '/auth/siwe/exchange (SIWE, intent=caller)';
 
   return async (c: Context, next: Next) => {
     const agentId = c.req.param('id')!;
