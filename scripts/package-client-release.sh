@@ -41,11 +41,21 @@ cat > "$BUNDLE_DIR/README.md" <<EOF
 
 Portable release bundle for the standalone client daemon.
 
-## Usage
+## Quick start
 
 \`\`\`bash
-./bin/vicoop-client --server <ws://...> --token <token> --agentId <id> --card ./cards/openclaw.json --backend openclaw
+export BRIDGE_URL=https://vicoop-bridge-server.fly.dev
+export AGENT_ID=my-agent
+
+./bin/vicoop-client login \\
+  --bridge "\$BRIDGE_URL" \\
+  --client-name "my client" \\
+  --agent-ids "\$AGENT_ID" \\
+  --env-file ./vicoop-client.env
 \`\`\`
+
+Then start the client with env vars from \`./vicoop-client.env\` and a backend card
+such as \`./cards/openclaw.json\` or \`./cards/claude.json\`.
 
 ## Notes
 

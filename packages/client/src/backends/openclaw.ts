@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import WebSocket from 'ws';
 import type { Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { clientVersion } from '../version.js';
 
 const execFileP = promisify(execFile);
 
@@ -298,7 +299,7 @@ class GatewayClient {
         client: {
           id: clientId,
           displayName: 'vicoop-bridge-client',
-          version: '0.4.2',
+          version: clientVersion,
           platform: process.platform,
           mode: clientMode,
         },
