@@ -161,10 +161,14 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // on all subsequent requests.
   mountSiweExchange(app, { sql: opts.db, domain: siweDomain });
 
-  // Root POST — admin agent A2A endpoint. Requires opaque caller token with
-  // an `eth:*` principal (admin onboarding stays wallet-only; Google callers
-  // can call /agents/:id but the admin agent itself is wallet-gated by design,
-  // see issue #79).
+  // Root POST — admin agent A2A endpoint. Accepts any verified caller token;
+  // RLS scopes what the operator can see (their own clients/policies). The
+  // admin scope itself stays wallet-only — `is_admin()` matches only
+  // `eth:` principals against ADMIN_WALLET_ADDRESSES — but non-admin
+  // wallet and non-admin Google callers both reach the chat now and see
+  // their RLS-scoped view. (Originally eth-only by design; lifted to
+  // open self-service to Google-onboarded operators per issue #79
+  // option B.)
   app.post('/', async (c) => {
     const authHeader = c.req.header('Authorization');
     const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
@@ -174,25 +178,17 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         id: null,
         error: {
           code: -32001,
-          message: `Authentication required (Bearer ${CALLER_TOKEN_PREFIX}* token). Acquire via /auth/siwe/exchange.`,
+          message: `Authentication required (Bearer ${CALLER_TOKEN_PREFIX}* token). Acquire via /auth/siwe/exchange or Google OAuth device flow.`,
         },
       }, 401);
     }
 
-    let walletAddress: string;
+    let principalId: string;
+    let callerEmail: string | undefined;
     try {
       const caller = await verifyCallerToken(opts.db, bearerToken);
-      if (!caller.principalId.startsWith('eth:')) {
-        return c.json({
-          jsonrpc: '2.0',
-          id: null,
-          error: {
-            code: -32001,
-            message: 'Admin agent requires a wallet-based caller token (eth:*). Sign in via SIWE.',
-          },
-        }, 403);
-      }
-      walletAddress = caller.principalId.slice('eth:'.length);
+      principalId = caller.principalId;
+      callerEmail = caller.email;
     } catch (err) {
       return c.json({
         jsonrpc: '2.0',
@@ -207,9 +203,9 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     if (parsed.params?.message) {
       parsed.params.message.metadata = {
         ...parsed.params.message.metadata,
-        _walletAddress: walletAddress,
-        _principalId: `eth:${walletAddress.toLowerCase()}`,
+        _principalId: principalId,
         _bearerToken: bearerToken,
+        ...(callerEmail !== undefined ? { _email: callerEmail } : {}),
       };
     }
 

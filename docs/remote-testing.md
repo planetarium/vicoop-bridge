@@ -46,8 +46,9 @@ works for non-admin callers:
   (explicit `ownerPrincipal` is admin-only, but the default is what we want).
 - `agent_policies_update` RLS is `owner OR is_admin`, and the auto-created
   policy's owner is your principal.
-- The admin agent at `POST /` gates only on "caller token has `eth:*`
-  principal", not on admin membership.
+- The admin agent at `POST /` accepts any verified caller token (`eth:*` or
+  `google:sub:*`); admin membership only widens RLS scope to all rows.
+  Non-admin callers see/manage their own clients only.
 
 ## Env
 
@@ -186,10 +187,12 @@ curl -s -X POST "$BRIDGE_URL/agents/$AGENT_ID" \
 
 `POST /` is the admin agent — a Claude-backed A2A endpoint with tools like
 `add_caller`, `remove_caller`, `list_active_agents`, `list_callers`,
-`list_caller_tokens`, `revoke_caller_token`. It requires
-an `eth:*` caller token (not admin membership); tool execution runs under RLS
-with your wallet as the authenticated principal, so mutations on agents you
-own are authorized.
+`list_caller_tokens`, `revoke_caller_token`. It accepts any verified
+caller token (`eth:*` or `google:*`); tool execution runs under RLS with
+your principal as the authenticated subject, so mutations on agents you
+own are authorized. The admin scope (`is_admin()`) is wallet-only and
+gates only the cross-owner tools (`list_caller_tokens`,
+`revoke_caller_token`).
 
 ```bash
 WALLET_PRINCIPAL=eth:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266   # lowercase
