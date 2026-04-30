@@ -60,14 +60,15 @@ export function WalletAuth() {
   }, [isConnected, address, token, isAuthenticating, signIn]);
 
   useEffect(() => {
+    // Reset the auto-sign-in latch on disconnect so a future reconnect
+    // can attempt SIWE again. The token itself is left alone — both
+    // SIWE and Google now issue `vbc_owner_*`, so prefix can't tell us
+    // who owns the token, and forcing a sign-out on every wagmi
+    // disconnect would nuke a still-valid Google session.
     if (!isConnected) {
       autoSignInAttempted.current = false;
-      // Only clear tokens this component owns (SIWE issues `vbc_caller_*`).
-      // Google sign-in produces `vbc_owner_*` tokens managed by GoogleAuth;
-      // those must survive a wallet disconnect (or never-connected state).
-      if (token && token.startsWith('vbc_caller_')) setToken(null);
     }
-  }, [isConnected, token]);
+  }, [isConnected]);
 
   if (!isConnected) {
     return (
