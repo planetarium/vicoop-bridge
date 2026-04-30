@@ -542,13 +542,26 @@ COMMENT ON FUNCTION agent_id_available(TEXT) IS
   'Check whether an agent_id is free to claim. Returns true when no agent_policies row holds the id, false when any principal (including the caller) already owns it. Never exposes owner_principal or other metadata — boolean only. Intended as a pre-registration probe so callers can avoid issuing a CLIENT_TOKEN bound to an agent id that the WS register step would reject.';
 
 -- ============================================================
--- 6. Caller auth: opaque tokens issued via Google OAuth device flow
+-- 6. Session tokens: opaque tokens issued via SIWE / device flow
 -- ============================================================
+-- `audience` partitions the table into two distinct token kinds with
+-- different prefixes, sites of use, and security envelopes (see #79):
+--   'caller'         — `vbc_caller_*`, used as Bearer at /agents/:id by
+--                       a third-party A2A caller invoking somebody else's
+--                       agent. Matched against allowed_callers.
+--   'owner_session'  — `vbc_owner_*`, used as Bearer at /graphql and
+--                       POST / by the resource owner for self-service
+--                       (admin agent chat, client/policy CRUD). Matched
+--                       against owner_principal under RLS.
+-- The two kinds intentionally cannot be cross-used; the corresponding
+-- HTTP guards reject mismatched prefixes (see agent-auth.ts /
+-- http.tsx / postgraphile.ts).
 CREATE TABLE IF NOT EXISTS callers (
   id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
   token_hash      TEXT NOT NULL UNIQUE,
   principal_id    TEXT NOT NULL,
   provider        TEXT NOT NULL,
+  audience        TEXT NOT NULL DEFAULT 'caller',
   email           TEXT,
   label           TEXT,
   expires_at      TIMESTAMPTZ NOT NULL,
@@ -557,8 +570,15 @@ CREATE TABLE IF NOT EXISTS callers (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Idempotent: re-applying schema.sql on dev DBs from earlier PRs adds the
+-- audience column. Existing rows default to 'caller', preserving prior
+-- behavior for anyone who already has a vbc_caller_* token in flight.
+ALTER TABLE callers ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT 'caller';
+
 CREATE INDEX IF NOT EXISTS callers_principal_active_idx
   ON callers(principal_id) WHERE revoked = false;
+CREATE INDEX IF NOT EXISTS callers_audience_active_idx
+  ON callers(audience) WHERE revoked = false;
 
 ALTER TABLE callers ENABLE ROW LEVEL SECURITY;
 

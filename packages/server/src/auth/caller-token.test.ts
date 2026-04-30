@@ -58,7 +58,7 @@ test('verifyCallerToken rejects bad prefix without hitting DB', async () => {
   }) as unknown as Parameters<typeof verifyCallerToken>[0];
   await assert.rejects(
     () => verifyCallerToken(sqlStub, 'not-a-caller-token'),
-    /Invalid caller token format/,
+    /Invalid session token format/,
   );
 });
 
@@ -114,7 +114,7 @@ test(
       // Use a fresh token string variant to sidestep any prior cache.
       await assert.rejects(
         () => verifyCallerToken(sql, issued.rawToken),
-        /Caller token revoked/,
+        /Session token revoked/,
       );
 
       await sql`DELETE FROM callers WHERE id = ${issued.callerId}`;
@@ -140,7 +140,7 @@ test(
       await new Promise((r) => setTimeout(r, 10));
       await assert.rejects(
         () => verifyCallerToken(sql, issued.rawToken),
-        /Caller token expired/,
+        /Session token expired/,
       );
       await sql`DELETE FROM callers WHERE id = ${issued.callerId}`;
     } finally {

@@ -1,22 +1,31 @@
-// POST /auth/siwe/exchange — issues an opaque caller token in exchange for a
-// verified SIWE (message, signature) pair.
+// POST /auth/siwe/exchange — issues an opaque session token in exchange for
+// a verified SIWE (message, signature) pair.
 //
-// This unifies SIWE with the bridge's opaque token model: after exchange, the
-// SIWE signature is never presented to the server again. The caller presents
-// the opaque `vbc_caller_*` token on subsequent requests (admin GraphQL, A2A
-// /agents/:id, root POST /). Revocation, audit (`last_used_at`, `label`), and
-// admin tooling (`list_caller_tokens` / `revoke_caller_token`) all apply.
+// `intent` selects the audience of the issued token (issue #79 PR D):
+//   'owner_session' (default) — `vbc_owner_*`. Used by admin UI / install
+//                                bootstrap to manage one's own clients and
+//                                policies. This is the dominant case for
+//                                SIWE — wallets self-identify as owners.
+//   'caller'                  — `vbc_caller_*`. For an external A2A caller
+//                                whose wallet wants to invoke somebody
+//                                else's agent at /agents/:id.
+//
+// After exchange, the SIWE signature is never presented to the server again;
+// the opaque token is the only credential. Revocation, audit
+// (`last_used_at`, `label`), and admin tooling (`list_caller_tokens` /
+// `revoke_caller_token`) all apply to both audiences.
 //
 // TTL is inherited from the SIWE message's `expirationTime` rather than the
-// 90-day caller-token default; SIWE messages cap at 7 days by convention.
+// 90-day default; SIWE messages cap at 7 days by convention.
 //
-// See issue #31 for the design rationale.
+// See issue #31 for the original design rationale and #79 for the
+// audience split.
 
 import type { Hono } from 'hono';
 import { SiweMessage } from 'siwe';
 import type { Sql } from '../db.js';
 import { MAX_TOKEN_TTL_MS, verifySiweMessage } from '../siwe-token.js';
-import { issueCallerToken } from './caller-token.js';
+import { issueSessionToken, type Audience } from './caller-token.js';
 
 export interface SiweExchangeOptions {
   sql: Sql;
@@ -26,6 +35,7 @@ export interface SiweExchangeOptions {
 interface ExchangeBody {
   message?: unknown;
   signature?: unknown;
+  intent?: unknown;
 }
 
 export function mountSiweExchange(app: Hono, opts: SiweExchangeOptions): void {
@@ -42,6 +52,19 @@ export function mountSiweExchange(app: Hono, opts: SiweExchangeOptions): void {
     if (!message || !signature) {
       return c.json(
         { error: 'invalid_request', error_description: 'message and signature are required' },
+        400,
+      );
+    }
+
+    let audience: Audience;
+    const intentRaw = typeof body.intent === 'string' ? body.intent : 'owner_session';
+    if (intentRaw === 'owner_session' || intentRaw === '') {
+      audience = 'owner_session';
+    } else if (intentRaw === 'caller') {
+      audience = 'caller';
+    } else {
+      return c.json(
+        { error: 'invalid_request', error_description: `unknown intent: ${intentRaw}` },
         400,
       );
     }
@@ -102,9 +125,10 @@ export function mountSiweExchange(app: Hono, opts: SiweExchangeOptions): void {
           );
         }
 
-        const issued = await issueCallerToken(tx as unknown as typeof opts.sql, {
+        const issued = await issueSessionToken(tx as unknown as typeof opts.sql, {
           principalId,
           provider: 'siwe',
+          audience,
           ttlMs,
         });
 

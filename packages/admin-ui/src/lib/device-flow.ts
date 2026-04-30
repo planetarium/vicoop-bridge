@@ -1,9 +1,11 @@
 // Browser-side driver for the bridge's RFC-8628 device flow with
-// intent=caller. Issues a vbc_caller_* opaque token after the user signs
-// in to Google in a popup window. See packages/server/src/auth/device-flow.ts
-// for the wire surface.
+// intent=owner_session. Issues a vbc_owner_* opaque token after the user
+// signs in to Google in a popup window — that token is what the admin UI
+// presents to /graphql and POST / for self-service. See
+// packages/server/src/auth/device-flow.ts for the wire surface and
+// issue #79 PR D for the audience split.
 
-const CALLER_TOKEN_PREFIX = 'vbc_caller_';
+const OWNER_SESSION_PREFIX = 'vbc_owner_';
 
 interface DeviceCodeResponse {
   device_code: string;
@@ -19,7 +21,7 @@ export interface DeviceFlowSession {
   verificationUriComplete: string;
   userCode: string;
   /**
-   * Resolves with a `vbc_caller_*` token once the popup approval completes.
+   * Resolves with a `vbc_owner_*` token once the popup approval completes.
    * Rejects on expiry, server error, or `cancel()` invocation.
    */
   result: Promise<string>;
@@ -35,7 +37,7 @@ class CanceledError extends Error {
 }
 
 async function postDeviceCode(): Promise<DeviceCodeResponse> {
-  const body = new URLSearchParams({ intent: 'caller' });
+  const body = new URLSearchParams({ intent: 'owner_session' });
   const res = await fetch('/oauth/device/code', {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -75,8 +77,8 @@ async function pollOnce(deviceCode: string): Promise<PollOk | PollPending | Poll
   });
   if (res.ok) {
     const payload = (await res.json()) as { access_token?: unknown; token_type?: unknown };
-    if (typeof payload.access_token !== 'string' || !payload.access_token.startsWith(CALLER_TOKEN_PREFIX)) {
-      return { kind: 'fatal', message: 'malformed access_token' };
+    if (typeof payload.access_token !== 'string' || !payload.access_token.startsWith(OWNER_SESSION_PREFIX)) {
+      return { kind: 'fatal', message: 'malformed access_token (expected vbc_owner_* prefix)' };
     }
     return { kind: 'ok', token: payload.access_token };
   }
