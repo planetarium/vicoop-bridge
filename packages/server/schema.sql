@@ -27,16 +27,47 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- ============================================================
 -- 1a. owner_wallet → owner_principal rename (one-time, idempotent)
 -- ============================================================
--- We have no production users, so this block exists only so existing dev
--- databases can be re-applied without dropping. It detects the legacy
--- VARCHAR(42)-typed wallet column and rewrites it to TEXT owner_principal,
--- prefixing 'eth:' on existing rows. Functions/types depending on the old
--- column are dropped first; the rest of this file recreates them.
-DO $$ BEGIN
-  IF EXISTS (
+-- We have no production users, so this block exists only so existing dev /
+-- staging databases can be re-applied without manual intervention. It
+-- detects either (a) the legacy `owner_wallet` column or (b) a half-renamed
+-- `owner_principal` column still typed VARCHAR(42), and brings either state
+-- forward to TEXT-typed `owner_principal` with an `eth:`-prefixed value.
+--
+-- ALTER COLUMN ... TYPE is rejected by Postgres while RLS policies reference
+-- the column, so we drop policies and dependent functions/types here; the
+-- rest of this file recreates them with their new shape. The DO block is
+-- implicitly transactional, so a partial run aborts cleanly and the next
+-- deploy starts from the same `owner_wallet` baseline.
+DO $$
+DECLARE
+  needs_clients_migration boolean;
+  needs_policies_migration boolean;
+  needs_tasks_migration boolean;
+BEGIN
+  SELECT EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'clients' AND column_name = 'owner_wallet'
-  ) THEN
+    WHERE table_schema = 'public' AND table_name = 'clients'
+      AND (column_name = 'owner_wallet'
+           OR (column_name = 'owner_principal' AND data_type = 'character varying'))
+  ) INTO needs_clients_migration;
+
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'agent_policies'
+      AND (column_name = 'owner_wallet'
+           OR (column_name = 'owner_principal' AND data_type = 'character varying'))
+  ) INTO needs_policies_migration;
+
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'infra' AND table_name = 'a2a_tasks'
+      AND (column_name = 'owner_wallet'
+           OR (column_name = 'owner_principal' AND data_type = 'character varying'))
+  ) INTO needs_tasks_migration;
+
+  IF needs_clients_migration OR needs_policies_migration THEN
+    -- Functions and types must be dropped because their argument/field
+    -- declarations bind to the legacy VARCHAR signature.
     DROP FUNCTION IF EXISTS register_client(TEXT, TEXT[], VARCHAR);
     DROP FUNCTION IF EXISTS register_client(TEXT, TEXT[], TEXT);
     DROP FUNCTION IF EXISTS rotate_client_token(TEXT);
@@ -44,28 +75,57 @@ DO $$ BEGIN
     DROP FUNCTION IF EXISTS unrevoke_client(TEXT);
     DROP FUNCTION IF EXISTS update_client_allowed_agents(TEXT, TEXT[]);
     DROP TYPE IF EXISTS client_with_token CASCADE;
+    -- normalize_wallet_address used to validate VARCHAR(42); not needed
+    -- after this PR (validation moved to TS).
+    DROP FUNCTION IF EXISTS normalize_wallet_address(TEXT);
+  END IF;
 
-    ALTER TABLE clients RENAME COLUMN owner_wallet TO owner_principal;
+  IF needs_clients_migration THEN
+    DROP POLICY IF EXISTS clients_select ON clients;
+    DROP POLICY IF EXISTS clients_insert ON clients;
+    DROP POLICY IF EXISTS clients_update ON clients;
+    DROP POLICY IF EXISTS clients_delete ON clients;
+
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'clients' AND column_name = 'owner_wallet'
+    ) THEN
+      ALTER TABLE clients RENAME COLUMN owner_wallet TO owner_principal;
+    END IF;
+
     ALTER TABLE clients ALTER COLUMN owner_principal TYPE TEXT;
     UPDATE clients SET owner_principal = 'eth:' || lower(owner_principal)
       WHERE owner_principal !~ '^[a-z]+:';
   END IF;
 
-  IF EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'agent_policies' AND column_name = 'owner_wallet'
-  ) THEN
-    ALTER TABLE agent_policies RENAME COLUMN owner_wallet TO owner_principal;
+  IF needs_policies_migration THEN
+    DROP POLICY IF EXISTS agent_policies_select ON agent_policies;
+    DROP POLICY IF EXISTS agent_policies_insert ON agent_policies;
+    DROP POLICY IF EXISTS agent_policies_update ON agent_policies;
+    DROP POLICY IF EXISTS agent_policies_delete ON agent_policies;
+
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'agent_policies' AND column_name = 'owner_wallet'
+    ) THEN
+      ALTER TABLE agent_policies RENAME COLUMN owner_wallet TO owner_principal;
+    END IF;
+
     ALTER TABLE agent_policies ALTER COLUMN owner_principal TYPE TEXT;
     UPDATE agent_policies SET owner_principal = 'eth:' || lower(owner_principal)
       WHERE owner_principal !~ '^[a-z]+:';
   END IF;
 
-  IF EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'infra' AND table_name = 'a2a_tasks' AND column_name = 'owner_wallet'
-  ) THEN
-    ALTER TABLE infra.a2a_tasks RENAME COLUMN owner_wallet TO owner_principal;
+  IF needs_tasks_migration THEN
+    -- a2a_tasks has no RLS policy referencing the column, so no policy drop
+    -- needed here.
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'infra' AND table_name = 'a2a_tasks' AND column_name = 'owner_wallet'
+    ) THEN
+      ALTER TABLE infra.a2a_tasks RENAME COLUMN owner_wallet TO owner_principal;
+    END IF;
+
     ALTER TABLE infra.a2a_tasks ALTER COLUMN owner_principal TYPE TEXT;
     UPDATE infra.a2a_tasks SET owner_principal = 'eth:' || lower(owner_principal)
       WHERE owner_principal IS NOT NULL AND owner_principal !~ '^[a-z]+:';
