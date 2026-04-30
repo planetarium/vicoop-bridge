@@ -89,21 +89,40 @@ const adminWallets = new Set(
     .filter(Boolean),
 );
 
-function isAdmin(wallet: string): boolean {
-  return adminWallets.has(wallet.toLowerCase());
+// Admin scope is wallet-only by design: only `eth:<addr>` principals whose
+// stripped 0x address appears in ADMIN_WALLET_ADDRESSES match. Non-eth
+// principals (e.g. google:sub:…) authenticate fine but never gain admin
+// scope — they get the RLS-scoped self-service view of their own rows.
+function isAdmin(principalId: string): boolean {
+  if (!principalId.startsWith('eth:')) return false;
+  return adminWallets.has(principalId.slice('eth:'.length).toLowerCase());
 }
 
 export function getAdminWallets(): string[] {
   return [...adminWallets];
 }
 
+// Render principal-kind-specific copy for the "logged in as" line. Email is
+// optional; we surface it for google: principals so the human reading the
+// chat sees their address rather than the opaque numeric `sub`.
+function describePrincipal(principalId: string, email?: string): string {
+  if (principalId.startsWith('eth:')) {
+    const addr = principalId.slice('eth:'.length);
+    return `wallet \`${addr}\``;
+  }
+  if (principalId.startsWith('google:')) {
+    return email ? `Google account \`${email}\`` : `Google account \`${principalId}\``;
+  }
+  return `principal \`${principalId}\``;
+}
+
 // ── System Prompt ────────────────────────────────────────────────
 
-function buildSystemPrompt(walletAddress: string, sdl?: string): string {
-  const admin = isAdmin(walletAddress);
+function buildSystemPrompt(principalId: string, email: string | undefined, sdl?: string): string {
+  const admin = isAdmin(principalId);
   const scope = admin
     ? 'You are logged in as an **admin**. You can see and manage ALL clients across all owners.'
-    : `You are logged in as wallet \`${walletAddress}\`. You can only see and manage clients you own (RLS enforced).`;
+    : `You are logged in as ${describePrincipal(principalId, email)}. You can only see and manage clients you own (RLS enforced).`;
 
   let prompt = `You are the Server Admin Agent for vicoop-bridge. You manage client registrations and access control.
 
@@ -179,18 +198,18 @@ Your conversation history is persisted in PostgreSQL. You remember all previous 
 
 // ── Custom Tools (token generation, active agents) ───────────────
 
-function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
-  // Admin agent authenticates via SIWE only (see http.tsx root POST /), so the
-  // current principal is always 'eth:<wallet>'. Caller-side admin tools that
-  // hit the DB pass this through as jwt.claims.principal_id so RLS predicates
-  // (owner_principal = current_principal()) match owned rows.
-  const principalId = `eth:${walletAddress.toLowerCase()}`;
+function buildCustomTools(db: Sql, registry: Registry, principalId: string) {
+  // Caller-side admin tools that hit the DB pass jwt.claims.principal_id
+  // through so RLS predicates (owner_principal = current_principal()) match
+  // the operator's own rows. The principalId arrives already canonicalized
+  // (eth:0x… or google:sub:…) from the http layer, so no normalization
+  // here.
   return {
     list_active_agents: tool({
       description: 'List currently connected agents with their client identity and connection time. Non-admin users only see their own agents.',
       inputSchema: z.object({}),
       execute: async () => {
-        const admin = isAdmin(walletAddress);
+        const admin = isAdmin(principalId);
         return registry.listAgents()
           .filter((a) => admin || a.ownerPrincipal === principalId)
           .map((a) => ({
@@ -328,8 +347,8 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
         include_revoked: z.boolean().optional().describe('Include revoked tokens (default false)'),
       }),
       execute: async ({ principal_id, email, include_revoked }) => {
-        if (!isAdmin(walletAddress)) {
-          return { error: 'Admin-only tool. Current wallet is not in ADMIN_WALLET_ADDRESSES.' };
+        if (!isAdmin(principalId)) {
+          return { error: 'Admin-only tool. Current principal is not in ADMIN_WALLET_ADDRESSES (admin scope is wallet-only).' };
         }
         const rows = await listCallerTokens(db, {
           principalId: principal_id,
@@ -362,8 +381,8 @@ function buildCustomTools(db: Sql, registry: Registry, walletAddress: string) {
         caller_id: z.string().describe('The caller token id (from list_caller_tokens)'),
       }),
       execute: async ({ caller_id }) => {
-        if (!isAdmin(walletAddress)) {
-          return { error: 'Admin-only tool. Current wallet is not in ADMIN_WALLET_ADDRESSES.' };
+        if (!isAdmin(principalId)) {
+          return { error: 'Admin-only tool. Current principal is not in ADMIN_WALLET_ADDRESSES (admin scope is wallet-only).' };
         }
         await revokeCallerToken(db, caller_id);
         return { caller_id, revoked: true };
@@ -402,11 +421,11 @@ class AdminA2XExecutor extends AgentExecutor {
     const contextId = task.contextId ?? taskId;
 
     const metadata = (message as { metadata?: Record<string, unknown> }).metadata;
-    const walletAddress = metadata?._walletAddress as string | undefined;
     const principalId = metadata?._principalId as string | undefined;
     const bearerToken = metadata?._bearerToken as string | undefined;
-    if (!walletAddress || !principalId || !bearerToken) {
-      throw new InvalidRequestError('Authenticated wallet address is required.');
+    const callerEmail = metadata?._email as string | undefined;
+    if (!principalId || !bearerToken) {
+      throw new InvalidRequestError('Authenticated principal is required.');
     }
 
     const userText = extractText(message);
@@ -435,7 +454,7 @@ class AdminA2XExecutor extends AgentExecutor {
     try {
       const answer = await runWithBearerToken(bearerToken, async () => {
         const { tools: schemaTools, sdl } = await getSchemaTools();
-        const customTools = buildCustomTools(this.db, this.registry, walletAddress);
+        const customTools = buildCustomTools(this.db, this.registry, principalId);
         const tools = { ...schemaTools, ...customTools };
 
         // Load conversation history from previous tasks in the same
@@ -458,7 +477,7 @@ class AdminA2XExecutor extends AgentExecutor {
 
         return generateText({
           model: anthropic('claude-sonnet-4-6'),
-          system: buildSystemPrompt(walletAddress, sdl),
+          system: buildSystemPrompt(principalId, callerEmail, sdl),
           messages: toModelMessages(history, userText),
           tools,
           stopWhen: stepCountIs(10),
