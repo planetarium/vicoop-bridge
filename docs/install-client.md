@@ -23,24 +23,27 @@ one-liner fetching a published `client-v*` bundle). Contrast with:
 
 - A human operator (or an agent acting on their behalf) standing up a
   brand-new client that will connect to a bridge they do not operate.
-- The operator has an Ethereum EOA they control; that wallet becomes the
-  owner of the resulting agent policy and must sign SIWE to obtain tokens.
+- The operator has either a Google account (used throughout) or an Ethereum
+  EOA they control. Either becomes the owner of the resulting client and
+  agent policy.
 
 ## Prerequisites
 
 - Node.js 20 or newer (`node -v`).
-- `curl`, `tar`, `jq`, `base64` (usually part of `coreutils` / `busybox`),
-  and one of `sha256sum` / `shasum`. `jq` is used by the token-extraction
-  snippets in Steps 2–3; `base64` is used for the SIWE-token decode in
-  Step 2.
+- `curl`, `tar`, and one of `sha256sum` / `shasum`. `jq` is recommended for
+  the optional SIWE alternative path; the default Google flow doesn't need
+  it.
 - A reachable bridge URL. The public deployment is
   `https://vicoop-bridge-server.fly.dev`; substitute your own below if you
   run the server yourself.
-- An operator EOA. Either:
-  - [`a2a-wallet`](https://github.com/planetarium/a2a-x402-wallet) CLI with a
-    local wallet imported — this is the shortest path, used throughout.
-  - Or the raw-curl path from `remote-testing.md` §1-2 if you prefer
-    scripting SIWE yourself.
+- A browser on **any** device you can open URLs in. The CLI doesn't need
+  to run on the same machine as the browser — device flow is designed for
+  exactly that case (e.g. headless server + laptop browser).
+- A Google account. No wallet, `a2a-wallet`, or seed phrase required.
+- (Optional, alternative path) For wallet-based onboarding instead of
+  Google, [`a2a-wallet`](https://github.com/planetarium/a2a-x402-wallet)
+  CLI with an imported wallet — see "Alternative: SIWE onboarding" near
+  the end of this doc.
 - For the OpenClaw backend specifically: an OpenClaw gateway running
   locally at `ws://127.0.0.1:18789` (override via `OPENCLAW_GATEWAY_URL`).
   Streaming (per-message A2A artifact cadence) requires OpenClaw
@@ -100,146 +103,100 @@ operator runs the `systemctl enable --now` command from the installer's
 output once they're filled in. Opt out with `INSTALL_SKIP_SERVICE=1`, or
 force a scope with `INSTALL_SERVICE_SCOPE=user|system|none`.
 
-## Step 2 — Obtain a caller token (SIWE)
+## Step 2 — Pick an agent id
 
-A caller token (`vbc_caller_*`) is the opaque session token you present to
-the bridge's admin endpoints. It is minted by signing a SIWE message at
-`POST /auth/siwe/exchange` (see `packages/server/src/auth/siwe-exchange.ts`
-for the exchange, `schema.sql` `used_siwe_nonces` for single-use-nonce
-enforcement). TTL equals the SIWE `expirationTime`, capped at 7 days.
-
-### Using `a2a-wallet`
+The agent id is the routing key external A2A callers use to reach your
+client. Pick something unlikely to collide across operators:
 
 ```sh
 export BRIDGE_URL=https://vicoop-bridge-server.fly.dev
 
-# The server compares the SIWE `domain` field against PUBLIC_URL's hostname
-# exactly, so derive the bare hostname via URL parsing — a naïve
-# ${BRIDGE_URL#https://} breaks on http:// or trailing paths/slashes.
-BRIDGE_HOSTNAME=$(BRIDGE_URL="$BRIDGE_URL" node -p 'new URL(process.env.BRIDGE_URL).hostname')
-
-# Generate, sign, and encode a SIWE token in one step with your local wallet.
-TOKEN=$(a2a-wallet siwe auth \
-  --wallet <wallet-name> \
-  --domain "$BRIDGE_HOSTNAME" \
-  --uri "$BRIDGE_URL" \
-  --ttl 1h \
-  --json | jq -r .token)
-
-# The CLI's token is base64url(JSON({message, signature})). Decode and pipe
-# the {message, signature} JSON straight into the exchange endpoint — never
-# write the signed payload to disk where another local user could read it
-# off /tmp before we delete it. `openssl base64 -d -A` works on macOS and
-# Linux, so we avoid shell-specific word-splitting around `base64 -d/-D`.
-PAD=$(printf '%*s' $(( (4 - ${#TOKEN} % 4) % 4 )) '' | tr ' ' '=')
-
-CALLER_TOKEN=$(echo "${TOKEN}${PAD}" | tr '_-' '/+' | openssl base64 -d -A \
-  | curl -sX POST "$BRIDGE_URL/auth/siwe/exchange" \
-      -H 'Content-Type: application/json' --data-binary @- \
-  | jq -r .access_token)
-
-echo "$CALLER_TOKEN"  # vbc_caller_...
-```
-
-Replace `<wallet-name>` with the label from `a2a-wallet wallet list`. The
-default wallet is used if you omit `--wallet`.
-
-The `a2a-wallet siwe` subcommand is marked deprecated (its tokens are
-CLI-wallet-scoped and not shareable with a Web UI) but is the correct tool
-here — the bridge's exchange endpoint explicitly wants a wallet-signed
-SIWE message.
-
-### Alternative: raw curl
-
-If you'd rather not depend on `a2a-wallet`, follow
-[`remote-testing.md` §1 (SIWE exchange)](./remote-testing.md) — it builds
-the SIWE message in Node with `viem` + `siwe` and POSTs to the same
-endpoint. The resulting `CALLER_TOKEN` is interchangeable with the one
-produced above.
-
-## Step 3 — Register the client
-
-Call the `registerClient` GraphQL mutation with your caller token. This
-creates a `clients` row scoped to your wallet and issues a raw
-`CLIENT_TOKEN` (64-hex). **Save it immediately — it is unrecoverable.**
-
-```sh
-AGENT_ID=openclaw-local     # see "Choosing an agent_id" below
-HOSTNAME=$(hostname)
-CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
-
-REG=$(curl -sX POST "$BRIDGE_URL/graphql" \
-  -H "Authorization: Bearer $CALLER_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d "{\"query\":\"mutation{registerClient(input:{clientName:\\\"$CLIENT_NAME\\\",allowedAgentIds:[\\\"$AGENT_ID\\\"]}){clientWithToken{id token ownerPrincipal allowedAgentIds}}}\"}")
-
-echo "$REG" | jq .
-CLIENT_TOKEN=$(echo "$REG" | jq -r .data.registerClient.clientWithToken.token)
-```
-
-`allowedAgentIds` is a whitelist — the client may only register as one of
-these agent IDs at WS connect time. Include every ID you plan to run under
-this single token if you know them up front; you can also amend the
-allowlist later via the `updateClientAllowedAgents` GraphQL mutation
-(backed by `update_client_allowed_agents()` in `schema.sql`) without
-issuing a new token. Re-registration is only required if you intentionally
-want a new client with a fresh token.
-
-### Choosing an agent_id
-
-Before calling `registerClient`, probe the id with the
-`agentIdAvailable(agentId)` GraphQL query. It's a `SECURITY DEFINER`
-function (`packages/server/schema.sql`) that returns a plain boolean
-across every owner — no `owner_principal` leaks — and raises
-`invalid_parameter_value` on empty input. Requires your caller token.
-
-```sh
-AGENT_ID=openclaw-local    # or one of the patterns below
-
-AVAILABLE=$(curl -sX POST "$BRIDGE_URL/graphql" \
-  -H "Authorization: Bearer $CALLER_TOKEN" -H 'Content-Type: application/json' \
-  -d "{\"query\":\"{agentIdAvailable(agentId:\\\"$AGENT_ID\\\")}\"}" \
-  | jq -r .data.agentIdAvailable)
-[ "$AVAILABLE" = "true" ] || { echo "agent_id '$AGENT_ID' is taken"; exit 1; }
-```
-
-`true` means no `agent_policies` row exists for that id yet, so your first
-WS register in Step 5 will claim ownership. `false` means another principal
-already owns it — pick a different id. A small race window exists between
-this probe and your WS register; if another principal claims the id in
-between, Step 5 emits `'agent id owned by a different principal'` and you can
-fall back to the recovery path in "Troubleshooting".
-
-Even with the probe, prefer names unlikely to collide across operators.
-Pick one:
-
-```sh
 # By hostname
 AGENT_ID="openclaw-$(hostname | cut -d. -f1)"
 
-# By wallet prefix — derive WALLET from a2a-wallet status (same format used
-# later for add_caller); strip the 0x and take the first 6 hex chars
-WALLET=$(a2a-wallet status | awk '/Address/{print tolower($2)}')
-AGENT_ID="openclaw-$(printf '%s' "${WALLET#0x}" | cut -c1-6)"
-
-# Random
+# Or random
 AGENT_ID="$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)-openclaw"
+
+echo "$AGENT_ID"
 ```
 
-On reinstalls, `agentIdAvailable` reports `false` for an id you yourself
-already registered. To distinguish "mine" from "somebody else's", also
-query `agentPolicyByAgentId` — RLS returns a non-null row only when *you*
-are the owner:
+`registerClient` (called for you by `vicoop-client login` in Step 3) does
+not pre-validate availability; collisions surface only at WS connect time.
+If you want to probe ahead, hit `agentIdAvailable(agentId)` GraphQL after
+login — it's a SECURITY DEFINER probe that returns boolean availability
+across every owner without leaking `owner_principal`. Most operators just
+pick a hostname/uuid prefix and skip the probe.
+
+## Step 3 — Login and register your client (device flow)
+
+`vicoop-client login` drives Google OAuth device flow against the bridge
+to register a fresh client and hand you a one-time `CLIENT_TOKEN`. No
+wallet, no SIWE, no GraphQL calls.
 
 ```sh
-curl -sX POST "$BRIDGE_URL/graphql" \
-  -H "Authorization: Bearer $CALLER_TOKEN" -H 'Content-Type: application/json' \
-  -d "{\"query\":\"{agentPolicyByAgentId(agentId:\\\"$AGENT_ID\\\"){agentId ownerPrincipal}}\"}" | jq .
+HOSTNAME=$(hostname)
+CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
+
+"$INSTALL_DIR/bin/vicoop-client" login \
+  --bridge "$BRIDGE_URL" \
+  --client-name "$CLIENT_NAME" \
+  --agent-ids "$AGENT_ID" \
+  --env-file "$INSTALL_DIR/vicoop-client.env"
 ```
 
-A non-null response means you own it and a reinstall will reuse the
-existing policy; null after `agentIdAvailable=false` means someone else
-owns it.
+The CLI prints a verification URL to stderr — open it in **any** browser
+(the same machine, or your laptop while running the CLI on a headless
+host) and authorize with your Google account. The CLI polls the bridge in
+the background and writes the resulting env block to
+`vicoop-client.env` (mode 600) on success:
+
+```text
+SERVER_URL=wss://vicoop-bridge-server.fly.dev
+SERVER_TOKEN=<64-hex CLIENT_TOKEN — shown ONLY here>
+AGENT_ID=<your agent id>
+```
+
+> ⚠ The `CLIENT_TOKEN` is unrecoverable after this single output. The env
+> file is the only place it persists; back it up if you need to rotate
+> hosts. To rotate the token later, use the `rotateClientToken` GraphQL
+> mutation (requires a fresh caller token via either `vicoop-client login`
+> or SIWE — the rotation surfaces a new CLIENT_TOKEN, also one-time).
+
+Drop `--env-file` and pass `--json` instead if you want to compose with
+shell tooling:
+
+```sh
+"$INSTALL_DIR/bin/vicoop-client" login \
+  --bridge "$BRIDGE_URL" --client-name "$CLIENT_NAME" \
+  --agent-ids "$AGENT_ID" --json \
+  | tee /tmp/vicoop-login.json
+CLIENT_TOKEN=$(jq -r .client_token /tmp/vicoop-login.json)
+```
+
+`--agent-ids` is a comma-separated allowlist. Include every id you plan to
+run under this single token if you know them up front; amend later via
+the `updateClientAllowedAgents` GraphQL mutation (backed by
+`update_client_allowed_agents()` in `schema.sql`) without issuing a new
+token.
+
+### What login does on the server
+
+1. `POST /oauth/device/code` with `intent=client_register` + `client_name`
+   + `allowed_agent_ids` — the bridge stores these on a `device_sessions`
+   row and returns a one-time `device_code` + 8-char user code.
+2. Operator opens the verification URL, signs in with Google, and the
+   approval page shows exactly what's being authorized
+   ("Register a bridge client `<name>` … with allowed agent ids …").
+3. CLI polls `POST /oauth/token`. Once status flips to `approved`, the
+   bridge calls `register_client()` on behalf of the Google principal,
+   stamps `clients.owner_email` for admin readability, and returns
+   `{client_id, client_token, owner_principal, allowed_agent_ids}`.
+4. The CLI never sees a `vbc_caller_*` token — `client_register` issues
+   the long-lived `CLIENT_TOKEN` directly. No `callers` row is created.
+
+This means a Google-only operator can stand up a bridge client without
+ever holding a wallet or seed phrase. Owner is recorded as
+`google:sub:<sub>` (stable id, not the email).
 
 ## Step 4 — Prepare the agent card
 
@@ -340,11 +297,14 @@ want Claude to edit.
 
 By default the policy has empty `allowed_callers`, which the dispatcher
 treats as "public". To lock it down, use the admin agent's `add_caller`
-tool — this is the same flow as
-[`remote-testing.md` §5](./remote-testing.md). Example for gating to your
-own wallet only:
+tool. The admin agent at `POST /` is **wallet-gated** (requires a SIWE
+caller token with an `eth:*` principal — Google operators need to sign in
+separately via SIWE to talk to it; see "Alternative: SIWE onboarding"
+below for the SIWE token exchange).
 
 ```sh
+# Assumes you've already obtained $CALLER_TOKEN from SIWE — see
+# "Alternative: SIWE onboarding".
 WALLET_PRINCIPAL="eth:$(a2a-wallet status | awk '/Address/{print tolower($2)}')"
 
 curl -sX POST "$BRIDGE_URL/" \
@@ -516,13 +476,17 @@ files before running it.
   GraphQL — the caller token was missing, malformed, or expired, so the
   request fell back to the `app_anonymous` Postgres role (see
   `packages/server/src/postgraphile.ts`) which has no EXECUTE on
-  authenticated functions. Send a valid `Bearer vbc_caller_*` token; if
-  expired, re-run Step 2 to refresh via the SIWE exchange. SIWE nonces are
-  single-use, so every exchange needs a freshly signed message.
+  authenticated functions. Re-run `vicoop-client login` (or the SIWE
+  exchange in the alternative section below) to refresh.
 
 - **`SIWE message has already expired`** — the `expirationTime` was in the
   past when the bridge verified it. Increase `--ttl` or check host clock
   skew.
+
+- **Device flow timed out** — the `vicoop-client login` deadline matches
+  the bridge's `device_sessions.expires_at` (10 min by default). If the
+  browser approval is delayed past that, re-run `login`; the previous
+  device code is invalidated automatically.
 
 - **Client reconnects but `/agents/:id` returns 404** — the
   `agent_policies` row exists but no WS session is live. Check the client
@@ -538,6 +502,40 @@ files before running it.
   you intentionally want a new client identity; in that case the old
   `clients` row (and cascading `agent_policies`) can be cleaned up via
   the admin agent's CRUD mutations (#29).
+
+## Alternative: SIWE onboarding
+
+If you'd rather own your client identity with an Ethereum EOA than a
+Google account — or if you need to talk to the wallet-gated admin agent
+at `POST /` — replace Step 3 with the two-step SIWE path:
+
+1. Sign a SIWE message and exchange it for a caller token at
+   `POST /auth/siwe/exchange`. See
+   [`remote-testing.md` §1](./remote-testing.md) for the full snippet
+   (also linked from the `add_caller` example earlier in this doc), or
+   use `a2a-wallet siwe auth` if the CLI is installed.
+2. Call the `registerClient` GraphQL mutation with that caller token to
+   mint a `CLIENT_TOKEN`:
+
+```sh
+CALLER_TOKEN=...   # from POST /auth/siwe/exchange
+
+REG=$(curl -sX POST "$BRIDGE_URL/graphql" \
+  -H "Authorization: Bearer $CALLER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"query\":\"mutation{registerClient(input:{clientName:\\\"$CLIENT_NAME\\\",allowedAgentIds:[\\\"$AGENT_ID\\\"]}){clientWithToken{id token ownerPrincipal allowedAgentIds}}}\"}")
+
+CLIENT_TOKEN=$(echo "$REG" | jq -r .data.registerClient.clientWithToken.token)
+```
+
+The resulting `CLIENT_TOKEN` is identical in shape to the device-flow one;
+it just owns the row under an `eth:0x…` principal instead of
+`google:sub:…`. After that, Steps 4-6 (agent card, run, persist) are the
+same as the Google path.
+
+This SIWE caller token is also what you need to invoke the admin agent for
+managing `allowed_callers` (see "Restrict who can call your agent"
+above) — the admin agent rejects non-`eth:` principals by design.
 
 ## What's next
 

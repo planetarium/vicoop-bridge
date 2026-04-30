@@ -2,11 +2,31 @@
 // Exposes POST /oauth/device/code and POST /oauth/token. The UI approval path
 // (that sets status='approved' and fills principal_id/email) is implemented
 // separately in device-ui.ts.
+//
+// Two intents flow through the same approval pipeline (see issue #79):
+//   * 'caller'           — issue a vbc_caller_* opaque token to the polling
+//                          CLI for use as a Bearer credential against
+//                          /agents/:id and the admin GraphQL surface.
+//   * 'client_register'  — call register_client() on behalf of the approved
+//                          principal and return the resulting CLIENT_TOKEN +
+//                          client_id, no callers row created. This is the
+//                          device-flow vicoop-client onboarding path.
+//
+// Token endpoint dispatches on `device_sessions.intent`. Approval UI surfaces
+// the difference to the operator (device-ui.ts).
+//
+// Bootstrap-mode tokenTtlMs: device-flow caller tokens default to 90 days,
+// matching SIWE-issued tokens for ergonomic admin-GraphQL reuse. Operators
+// who only want a one-shot bootstrap can set bootstrapTokenTtlMs to scope
+// the issued token tighter; that doesn't apply to the client_register branch
+// (its CLIENT_TOKEN has no TTL — it's revoked, not expired).
 
 import { randomBytes, randomInt } from 'node:crypto';
 import type { Hono, Context } from 'hono';
 import type { Sql } from '../db.js';
 import { issueCallerToken } from './caller-token.js';
+
+export type DeviceFlowIntent = 'caller' | 'client_register';
 
 export interface DeviceFlowOptions {
   sql: Sql;
@@ -29,12 +49,25 @@ const USER_CODE_LENGTH = 8;
 const USER_CODE_HYPHEN_AT = 4;
 const MAX_USER_CODE_RETRIES = 5;
 
+// Bound the size of intent_params so an attacker can't drive a DB into
+// large-row territory on what is otherwise a transient session table.
+const MAX_CLIENT_NAME_LEN = 256;
+const MAX_AGENT_ID_LEN = 256;
+const MAX_AGENT_IDS_COUNT = 32;
+
+interface ClientRegisterParams {
+  client_name: string;
+  allowed_agent_ids: string[];
+}
+
 interface DeviceSessionRow {
   device_code: string;
   user_code: string;
   status: string;
   principal_id: string | null;
   email: string | null;
+  intent: string;
+  intent_params: ClientRegisterParams | null;
   expires_at: Date;
 }
 
@@ -78,6 +111,60 @@ async function readBody(c: Context): Promise<Record<string, unknown>> {
   }
 }
 
+// Coerce a body field into string[] tolerating both JSON arrays (JS SDKs)
+// and CSV strings (curl/form). Strips empties.
+function toStringArray(raw: unknown): string[] | null {
+  if (Array.isArray(raw)) {
+    return raw.filter((v): v is string => typeof v === 'string' && v.length > 0);
+  }
+  if (typeof raw === 'string') {
+    return raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+  }
+  return null;
+}
+
+// Validate a client_register intent's params. Returns either the canonicalized
+// params object or an error string suitable for invalid_request error_description.
+function parseClientRegisterParams(
+  body: Record<string, unknown>,
+): { ok: true; params: ClientRegisterParams } | { ok: false; reason: string } {
+  const clientName = typeof body.client_name === 'string' ? body.client_name.trim() : '';
+  if (!clientName) {
+    return { ok: false, reason: 'client_name is required for intent=client_register' };
+  }
+  if (clientName.length > MAX_CLIENT_NAME_LEN) {
+    return { ok: false, reason: `client_name exceeds ${MAX_CLIENT_NAME_LEN} chars` };
+  }
+
+  const ids = toStringArray(body.allowed_agent_ids);
+  if (!ids || ids.length === 0) {
+    return {
+      ok: false,
+      reason: 'allowed_agent_ids is required for intent=client_register (CSV or JSON array)',
+    };
+  }
+  if (ids.length > MAX_AGENT_IDS_COUNT) {
+    return { ok: false, reason: `allowed_agent_ids exceeds ${MAX_AGENT_IDS_COUNT} entries` };
+  }
+  for (const id of ids) {
+    if (id.length > MAX_AGENT_ID_LEN) {
+      return { ok: false, reason: `agent id exceeds ${MAX_AGENT_ID_LEN} chars` };
+    }
+  }
+
+  return { ok: true, params: { client_name: clientName, allowed_agent_ids: ids } };
+}
+
+interface RegisterClientResult {
+  id: string;
+  owner_principal: string;
+  client_name: string;
+  allowed_agent_ids: string[];
+  revoked: boolean;
+  created_at: Date;
+  token: string;
+}
+
 export function mountDeviceFlow(app: Hono, opts: DeviceFlowOptions): void {
   const sql = opts.sql;
   const sessionTtlMs = opts.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
@@ -97,7 +184,27 @@ export function mountDeviceFlow(app: Hono, opts: DeviceFlowOptions): void {
   }
 
   app.post('/oauth/device/code', async (c) => {
-    // Body is deliberately ignored — we don't do external client registration yet.
+    const body = await readBody(c);
+    const intentRaw = typeof body.intent === 'string' ? body.intent : 'caller';
+    let intent: DeviceFlowIntent;
+    let intentParams: ClientRegisterParams | null = null;
+
+    if (intentRaw === 'caller' || intentRaw === '') {
+      intent = 'caller';
+    } else if (intentRaw === 'client_register') {
+      intent = 'client_register';
+      const parsed = parseClientRegisterParams(body);
+      if (!parsed.ok) {
+        return c.json({ error: 'invalid_request', error_description: parsed.reason }, 400);
+      }
+      intentParams = parsed.params;
+    } else {
+      return c.json(
+        { error: 'invalid_request', error_description: `unknown intent: ${intentRaw}` },
+        400,
+      );
+    }
+
     const deviceCode = generateDeviceCode();
     const expiresAt = new Date(Date.now() + sessionTtlMs);
 
@@ -107,8 +214,15 @@ export function mountDeviceFlow(app: Hono, opts: DeviceFlowOptions): void {
       const candidate = generateUserCode();
       try {
         await sql`
-          INSERT INTO device_sessions (device_code, user_code, status, expires_at)
-          VALUES (${deviceCode}, ${candidate}, 'pending', ${expiresAt})
+          INSERT INTO device_sessions (device_code, user_code, status, expires_at, intent, intent_params)
+          VALUES (
+            ${deviceCode},
+            ${candidate},
+            'pending',
+            ${expiresAt},
+            ${intent},
+            ${intentParams ? sql.json(JSON.parse(JSON.stringify(intentParams))) : null}
+          )
         `;
         userCode = candidate;
         break;
@@ -161,7 +275,7 @@ export function mountDeviceFlow(app: Hono, opts: DeviceFlowOptions): void {
     lastPoll.set(deviceCode, now);
 
     const rows = await sql<DeviceSessionRow[]>`
-      SELECT device_code, user_code, status, principal_id, email, expires_at
+      SELECT device_code, user_code, status, principal_id, email, intent, intent_params, expires_at
       FROM device_sessions
       WHERE device_code = ${deviceCode}
       LIMIT 1
@@ -198,9 +312,65 @@ export function mountDeviceFlow(app: Hono, opts: DeviceFlowOptions): void {
         return c.json({ error: 'expired_token' }, 400);
       }
 
-      // Issue the caller token and delete the session atomically. The transaction
-      // object from postgres.js is type-compatible with Sql, so issueCallerToken
-      // participates in the same tx.
+      if (row.intent === 'client_register') {
+        const params = row.intent_params;
+        if (!params) {
+          // Approved client_register session must have intent_params; if it
+          // doesn't, the session is unusable. Treat as expired so the CLI
+          // restarts with a fresh request.
+          lastPoll.delete(deviceCode);
+          return c.json({ error: 'expired_token' }, 400);
+        }
+
+        const principalId = row.principal_id;
+        const email = row.email;
+
+        const issued = await sql.begin(async (tx) => {
+          // SECURITY INVOKER on register_client(); set the session principal
+          // so RLS WITH CHECK passes and the new row's owner_principal is
+          // correct without us needing to pass it as the explicit override
+          // (which would require admin scope).
+          await tx`SELECT set_config('role', 'app_authenticated', true)`;
+          await tx`SELECT set_config('jwt.claims.principal_id', ${principalId}, true)`;
+          // app.admin_addresses left empty — non-admin path is what we want
+          // here; the function falls through to current_principal().
+          await tx`SELECT set_config('app.admin_addresses', '', true)`;
+
+          const result = await tx<RegisterClientResult[]>`
+            SELECT * FROM register_client(
+              ${params.client_name},
+              ${params.allowed_agent_ids}::text[],
+              NULL
+            )
+          `;
+          const r = result[0];
+          if (!r) throw new Error('register_client returned no row');
+
+          // Stamp owner_email so admin tooling can render a human-readable
+          // identity for Google-onboarded clients (sub is opaque).
+          if (email) {
+            await tx`UPDATE clients SET owner_email = ${email} WHERE id = ${r.id}`;
+          }
+
+          await tx`DELETE FROM device_sessions WHERE device_code = ${deviceCode}`;
+          return r;
+        });
+
+        lastPoll.delete(deviceCode);
+        prunePollMap();
+
+        return c.json({
+          intent: 'client_register' as const,
+          client_id: issued.id,
+          client_token: issued.token,
+          owner_principal: issued.owner_principal,
+          owner_email: email ?? null,
+          client_name: issued.client_name,
+          allowed_agent_ids: issued.allowed_agent_ids,
+        });
+      }
+
+      // intent === 'caller' (default) — original behavior
       const issued = await sql.begin(async (tx) => {
         const i = await issueCallerToken(tx as unknown as Sql, {
           principalId: row.principal_id!,
