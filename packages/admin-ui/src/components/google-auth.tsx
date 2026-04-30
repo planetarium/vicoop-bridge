@@ -7,7 +7,7 @@
 // non-eth principals as of the issue #79 option-B server change).
 
 import { useCallback, useRef, useState } from 'react';
-import { setToken } from '../lib/auth-token';
+import { setSession } from '../lib/auth-token';
 import { startDeviceFlow, type DeviceFlowSession } from '../lib/device-flow';
 
 interface State {
@@ -58,7 +58,7 @@ export function GoogleAuth() {
 
     try {
       const token = await session.result;
-      setToken(token);
+      setSession({ token, provider: 'google' });
       // Token is set; parent App will swap to Chat. Close the popup if the
       // user didn't already.
       if (popup && !popup.closed) popup.close();

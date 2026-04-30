@@ -1,30 +1,26 @@
-import { useAccount } from 'wagmi';
 import { WalletAuth } from './components/wallet-auth';
 import { GoogleAuth } from './components/google-auth';
 import { Chat } from './components/chat';
-import { useAuthToken, setToken } from './lib/auth-token';
+import { useAuthSession, setSession } from './lib/auth-token';
 
 export default function App() {
-  const token = useAuthToken();
-  const { isConnected } = useAccount();
+  const session = useAuthSession();
 
   return (
     <div className="flex h-screen flex-col">
       {/* Header */}
       <header className="flex shrink-0 items-center justify-between border-b border-zinc-800 px-6 py-3">
         <h1 className="text-lg font-semibold text-zinc-100">Vicoop Bridge Admin</h1>
-        {token ? (
-          // Both SIWE and Google sign-in produce `vbc_owner_*` tokens
-          // (audience='owner_session'), so prefix doesn't tell us the
-          // provider. Use the live wagmi connection instead: if a wallet
-          // is connected, defer to WalletAuth's signed-in display (it
-          // owns the wagmi disconnect on sign-out); otherwise show a
-          // plain Sign out that just clears the auth token.
-          isConnected ? (
+        {session ? (
+          // Provider is recorded at sign-in time (auth-token.ts). For
+          // wallet sessions, defer to WalletAuth so its Sign out also
+          // disconnects wagmi; for Google sessions, just clear the
+          // session.
+          session.provider === 'wallet' ? (
             <WalletAuth />
           ) : (
             <button
-              onClick={() => setToken(null)}
+              onClick={() => setSession(null)}
               className="text-sm bg-zinc-800 hover:bg-zinc-700 text-zinc-100 px-3 py-1.5 rounded transition-colors"
             >
               Sign out
@@ -40,7 +36,7 @@ export default function App() {
       </header>
 
       {/* Chat area */}
-      {token ? (
+      {session ? (
         <Chat />
       ) : (
         <div className="flex flex-1 items-center justify-center">
