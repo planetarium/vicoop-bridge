@@ -99,10 +99,12 @@ async function authenticateAndRegister(
   opts: ServerWsOptions,
 ): Promise<AuthResult> {
   // Reserved agent ids (e.g. "admin") are owned by the bridge itself —
-  // exposed at @admin@<host> via Mentionable. The schema assert makes it
-  // impossible for a client row to legally carry "admin" in its allowlist,
-  // but a manually-inserted row or a future schema regression must still
-  // be refused at the wire. Belt and suspenders.
+  // exposed at @admin@<host> via Mentionable. The SQL trigger
+  // clients_assert_no_reserved_agent_ids covers every mutation path on the
+  // `clients` table (wrapper functions, PostGraphile auto-mutations, direct
+  // SQL), but a manually-inserted row from psql before the trigger landed,
+  // or any future schema regression, must still be refused at the wire.
+  // Belt and suspenders — and cheaper to deny here than after the DB lookup.
   if (isReservedAgentId(frame.agentId)) {
     logEvent('client_rejected', { reason: 'agent id reserved', agentId: frame.agentId });
     return { ok: false, code: 4011, reason: 'agent id reserved by the bridge' };

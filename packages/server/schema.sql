@@ -261,6 +261,29 @@ $$;
 COMMENT ON FUNCTION assert_no_reserved_agent_ids(TEXT[]) IS
   'Raise if any element of allowed_agent_ids is reserved (e.g. "admin"). Mirrors RESERVED_AGENT_IDS in packages/server/src/reserved-agent-ids.ts.';
 
+-- Trigger that runs the assertion on every INSERT and UPDATE of clients.
+-- Catches paths the explicit PERFORM in register_client() /
+-- update_client_allowed_agents() can't reach: PostGraphile's auto-generated
+-- updateClientById / patchClient mutations (the `clients` table only carries
+-- `@omit create`, not `@omit update`), direct SQL from psql, and any future
+-- code that bypasses the wrapper functions. This is the load-bearing gate;
+-- the explicit PERFORM calls in the wrapper functions are kept for clearer
+-- error context but are no longer the only line of defense.
+CREATE OR REPLACE FUNCTION trg_clients_assert_no_reserved_agent_ids()
+RETURNS TRIGGER
+  LANGUAGE plpgsql
+AS $$
+BEGIN
+  PERFORM assert_no_reserved_agent_ids(NEW.allowed_agent_ids);
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS clients_assert_no_reserved_agent_ids ON clients;
+CREATE TRIGGER clients_assert_no_reserved_agent_ids
+  BEFORE INSERT OR UPDATE OF allowed_agent_ids ON clients
+  FOR EACH ROW EXECUTE FUNCTION trg_clients_assert_no_reserved_agent_ids();
+
 -- Token-carrying return type for register / rotate.
 -- Wrapped in DO so the migration is idempotent.
 DO $$ BEGIN

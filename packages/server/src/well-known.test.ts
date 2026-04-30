@@ -175,6 +175,24 @@ test('webfinger: 404 on malformed resource (no acct: scheme)', async () => {
   assert.equal(res.status, 404);
 });
 
+test('webfinger: 404 when two registry entries differ only in case (ambiguous)', async () => {
+  // Mentionable lookups are case-insensitive but the registry is
+  // case-sensitive, so `Foo` and `foo` could both register concurrently.
+  // The lookup MUST refuse to pick — silently routing a mention to
+  // whichever connected first would be misdelivery.
+  const app = makeApp({ agents: [fakeConn('Foo'), fakeConn('foo')] });
+  const res = await app.request(
+    '/.well-known/webfinger?resource=acct:foo@bridge.example.com',
+  );
+  assert.equal(res.status, 404);
+});
+
+test('agent-card: 404 when two registry entries differ only in case (ambiguous)', async () => {
+  const app = makeApp({ agents: [fakeConn('Foo'), fakeConn('foo')] });
+  const res = await app.request('/.well-known/agent-card/foo');
+  assert.equal(res.status, 404);
+});
+
 test('webfinger: 404 when local-part contains unsafe chars (path separator)', async () => {
   // Defends against an attacker crafting an agentId that smuggles `..` /
   // `@` / CRLF into the JRD subject. isValidMentionableLocal rejects them

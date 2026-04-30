@@ -72,15 +72,25 @@ function resolveLocal(deps: WellKnownDeps, local: string): ResolvedLocal | undef
   if (lower === MENTIONABLE_ADMIN_LOCAL.toLowerCase()) {
     return { local: MENTIONABLE_ADMIN_LOCAL, card: deps.adminCard };
   }
+  // Mentionable lookups are case-insensitive (RFC 1035 / RFC 5321), but the
+  // registry treats `agentId` as case-sensitive at the moment, so two
+  // distinct connections like `Foo` and `foo` could both fold to the same
+  // local. Picking one would silently route mentions to whichever connected
+  // first; refuse the lookup instead so the ambiguity surfaces as a 404
+  // rather than misdelivery. The right long-term fix is to enforce
+  // case-insensitive uniqueness at registration time.
+  let match: ResolvedLocal | undefined;
   for (const conn of deps.listAgents()) {
     if (
-      isValidMentionableLocal(conn.agentId) &&
-      conn.agentId.toLowerCase() === lower
+      !isValidMentionableLocal(conn.agentId) ||
+      conn.agentId.toLowerCase() !== lower
     ) {
-      return { local: conn.agentId, card: deps.getAgentCard(conn) };
+      continue;
     }
+    if (match) return undefined;
+    match = { local: conn.agentId, card: deps.getAgentCard(conn) };
   }
-  return undefined;
+  return match;
 }
 
 /**
