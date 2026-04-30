@@ -86,6 +86,33 @@ test('webfinger: 400 when resource is missing', async () => {
   assert.equal(res.status, 400);
 });
 
+test('every well-known response (200, 400, 404) carries Cache-Control: no-store', async () => {
+  // The data tracks live WS connections, so a 404 for an offline agent
+  // must NOT be cached — when the agent reconnects, an intermediate
+  // shared cache holding the old 404 would keep advertising it as
+  // unreachable. Same logic for the success paths.
+  const app = makeApp({ agents: [fakeConn('foo')] });
+  const cases = [
+    // success
+    '/.well-known/webfinger?resource=acct:foo@bridge.example.com',
+    '/.well-known/agent-card/foo',
+    '/.well-known/mentionable-agents.json',
+    // 400
+    '/.well-known/webfinger',
+    // 404 — unknown local-part
+    '/.well-known/webfinger?resource=acct:nope@bridge.example.com',
+    '/.well-known/agent-card/nope',
+  ];
+  for (const path of cases) {
+    const res = await app.request(path);
+    assert.equal(
+      res.headers.get('cache-control'),
+      'no-store',
+      `${path} → status=${res.status} cache-control="${res.headers.get('cache-control')}"`,
+    );
+  }
+});
+
 test('webfinger: returns JRD with the agent-card rel for a connected agent', async () => {
   const app = makeApp({ agents: [fakeConn('foo')] });
   const res = await app.request(

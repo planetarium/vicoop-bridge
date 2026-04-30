@@ -1,4 +1,4 @@
-import type { Hono } from 'hono';
+import type { Hono, MiddlewareHandler } from 'hono';
 import type { AgentCardV03 } from '@a2x/sdk';
 import type { ClientConnection } from './registry.js';
 import {
@@ -96,7 +96,24 @@ function resolveLocal(deps: WellKnownDeps, local: string): ResolvedLocal | undef
  *   `Organization` payload listing every connected client whose agentId is
  *   a Mentionable-safe local-part.
  */
+// Mentionable §3 encourages aggressive caching ("card changes are expected
+// to be infrequent"), but our payloads track live WS connections — a client
+// that disconnects (or that hasn't connected yet, producing a 404) must not
+// be cached, otherwise shared caches keep returning unreachable / stale
+// addressability for the TTL window. 404s are cacheable by HTTP defaults
+// too, so the header has to apply uniformly across every status. Until we
+// add ETag/Last-Modified for conditional revalidation, no-store is the
+// only honest answer.
+const noStoreOnAllResponses: MiddlewareHandler = async (c, next) => {
+  await next();
+  c.header('Cache-Control', 'no-store');
+};
+
 export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
+  app.use('/.well-known/webfinger', noStoreOnAllResponses);
+  app.use('/.well-known/agent-card/:local', noStoreOnAllResponses);
+  app.use('/.well-known/mentionable-agents.json', noStoreOnAllResponses);
+
   app.get('/.well-known/webfinger', (c) => {
     if (!deps.domain || !deps.publicUrl) {
       return c.json({ error: 'webfinger not available (no PUBLIC_URL configured)' }, 404);
@@ -138,16 +155,12 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
         },
       ],
     };
-    // Mentionable §3 encourages aggressive caching ("card changes are
-    // expected to be infrequent"), but our payload tracks live WS
-    // connections — a client that disconnects must stop being addressable
-    // immediately, not 5 minutes later. Until we add ETag/Last-Modified
-    // for conditional revalidation, no-store is the only honest answer
-    // for both private and shared caches.
+    // Cache-Control: no-store is applied uniformly by the route-scoped
+    // middleware above, so every status (including the 400/404 errors)
+    // carries it.
     return new Response(JSON.stringify(jrd), {
       headers: {
         'Content-Type': 'application/jrd+json; charset=utf-8',
-        'Cache-Control': 'no-store',
       },
     });
   });
@@ -169,10 +182,6 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
       publicUrl: deps.publicUrl,
       deviceFlowEnabled: deps.deviceFlowEnabled,
     });
-    // See WebFinger above — the underlying AgentCardV03 is rebuilt on
-    // every connect/disconnect/policy change, so shared caches must not
-    // hold it.
-    c.header('Cache-Control', 'no-store');
     return c.json(mentionable);
   });
 
@@ -186,10 +195,6 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
       organizationName: deps.organizationName,
       entries: listDirectoryEntries(deps),
     });
-    // Same reasoning as WebFinger: the entry list is the live registry
-    // snapshot, so shared caches holding it across connect/disconnect
-    // events would advertise unreachable agents.
-    c.header('Cache-Control', 'no-store');
     return c.json(directory);
   });
 }
