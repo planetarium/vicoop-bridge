@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Send, MessageSquare } from 'lucide-react';
 import type { A2XClient } from '@a2x/sdk/client';
-import { useAuthToken } from '../lib/auth-token';
+import { useAuthSession } from '../lib/auth-token';
 import { createA2AClient, type Message as A2AMessage } from '../lib/a2a-client';
 import { Message } from './message';
 
@@ -21,7 +21,8 @@ const EXAMPLE_PROMPTS = [
 ];
 
 export function Chat() {
-  const token = useAuthToken();
+  const session = useAuthSession();
+  const token = session?.token ?? null;
   const [messages, setMessages] = useState<{ role: 'user' | 'agent'; text: string }[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
