@@ -164,6 +164,67 @@ you cannot verify the multi-artifact cadence a real tool-use run
 produces. Use `DEBUG=1` in the sidecar env to see every chat /
 session.message frame as it arrives.
 
+## File-passthrough verification (caller → agent)
+
+A third exercise at `packages/client/scripts/e2e-openclaw-file-passthrough.mjs`
+verifies that bridge-client's non-image attachment mapping matches the
+shape OpenClaw `>= v2026.4.27` expects on `chat.send`. The script sends
+a tiny synthetic PDF as a `kind: 'file'` part with `mimeType:
+'application/pdf'` and asserts:
+
+- the gateway accepts the attachment shape (no `chat.send` error like
+  "only image/* supported" or "non-image attachments are not supported
+  on this entrypoint"),
+- any failure that follows is downstream of attachment parsing
+  (typically agent auth / model invocation, which is acceptable when
+  no provider auth is configured).
+
+Because the protocol-level test does not need a real model response,
+you can run it against an unauthenticated gateway. The cleanest setup
+is `gateway.auth.mode = "none"` + `--bind loopback` (avoids container
+token extraction entirely):
+
+```bash
+docker run -d --name openclaw-e2e \
+  --entrypoint /bin/sh \
+  ghcr.io/openclaw/openclaw:latest \
+  -c 'mkdir -p /home/node/.openclaw && \
+      printf %s "{\"gateway\":{\"auth\":{\"mode\":\"none\"}}}" \
+        > /home/node/.openclaw/openclaw.json && \
+      exec docker-entrypoint.sh node openclaw.mjs gateway \
+        --allow-unconfigured --bind loopback'
+
+# wait for "[gateway] ready" in `docker logs openclaw-e2e`
+
+docker run --rm \
+  --network container:openclaw-e2e \
+  -v "$PWD":/w -w /w/packages/client \
+  -e DEBUG=1 \
+  node:20 \
+  node ./scripts/e2e-openclaw-file-passthrough.mjs
+```
+
+Expected tail:
+
+```
+[frame +Xms] task.artifact artifact id=… name=openclaw-result …
+[frame +Xms] task.complete complete state=completed
+[e2e] PASS: gateway accepted non-image attachment shape (no protocol-shape rejection)
+[e2e] PASS: task.complete carries state=completed (got completed)
+```
+
+If you see a fail like `code=gateway_send_failed msg="…only image/* supported…"`,
+the gateway image is older than v2026.4.27 and predates the non-image
+attachment acceptance path (CHANGELOG: "Gateway/chat: accept non-image
+attachments through chat.send by staging them as agent-readable media
+paths"). Pull a newer tag.
+
+> **Note**: `--bind loopback` is required when `auth.mode = "none"` —
+> the container default of `bind=auto` (0.0.0.0) refuses to start
+> unauthenticated. Loopback is fine because the sidecar shares the
+> gateway container's network namespace via `--network container:…`
+> and connects through `127.0.0.1` from inside.
+
 ## Teardown
 
 ```bash
