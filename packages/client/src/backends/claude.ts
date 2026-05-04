@@ -57,6 +57,11 @@ export interface ClaudeBackendOptions {
 interface SessionEntry {
   sessionId: string;
   lastUsedAt: number;
+  // Monotonic per-write token. A rollback only deletes the entry when
+  // this matches the writeId the rolling-back task itself stamped — so a
+  // second concurrent task on the same contextId that has since refreshed
+  // the binding (and bumped writeId) is not robbed of its session id.
+  writeId: number;
 }
 
 // claude --output-format stream-json writes one JSON object per line. We
@@ -288,6 +293,10 @@ export function createClaudeBackend(
   // memory. The map is in-memory only — restarts lose the binding (next task
   // on a stale contextId starts a new session).
   const sessions = new Map<string, SessionEntry>();
+  // Monotonic counter shared across all writes into `sessions`. Used to
+  // disambiguate concurrent tasks on the same contextId so a rollback only
+  // touches the entry the rolling-back task itself last wrote.
+  let writeCounter = 0;
 
   function evictExpired(cutoff: number): void {
     for (const [key, entry] of sessions) {
@@ -328,11 +337,13 @@ export function createClaudeBackend(
       const existing = sessionTtlMs > 0 ? sessions.get(task.contextId) : undefined;
       const sessionId = existing?.sessionId ?? randomUUID();
       const isResume = existing !== undefined;
+      let writeId = 0;
       if (sessionTtlMs > 0) {
         // Refresh lastUsedAt eagerly: a concurrent second task on the same
         // contextId arriving before this one finishes also resumes the same
         // session id (rather than racing to mint a new one).
-        sessions.set(task.contextId, { sessionId, lastUsedAt: tNow });
+        writeId = ++writeCounter;
+        sessions.set(task.contextId, { sessionId, lastUsedAt: tNow, writeId });
       }
 
       // Bring up the MCP server first (if enabled) so we know its URL before
@@ -383,10 +394,17 @@ export function createClaudeBackend(
       // contextId mints a brand-new id instead of `--resume`-ing a session
       // claude never persisted on disk. No-op if this run was already
       // resuming an existing session, or if session reuse is disabled.
+      //
+      // Concurrency: only delete when the entry is still the one THIS task
+      // wrote. A second concurrent task on the same contextId would have
+      // bumped `writeId` when refreshing the binding; if we see a different
+      // writeId, that other task now "owns" the entry and should keep it.
       const rollbackFreshSession = (): void => {
         if (isResume || sessionTtlMs <= 0) return;
         const cur = sessions.get(task.contextId);
-        if (cur?.sessionId === sessionId) sessions.delete(task.contextId);
+        if (cur?.sessionId === sessionId && cur.writeId === writeId) {
+          sessions.delete(task.contextId);
+        }
       };
 
       let child: ClaudeChildHandle;

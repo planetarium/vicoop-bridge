@@ -720,6 +720,77 @@ test('rolls back the session binding when claude exits non-zero on a fresh sessi
   assert.ok(child.args.indexOf('--session-id') !== -1, 'must mint a fresh session id');
 });
 
+test('rollback does not delete a binding a concurrent task has refreshed', async () => {
+  // Task A (first) holds open without finishing. Task B (second) starts
+  // on the same contextId, sees the binding A wrote, refreshes lastUsedAt
+  // and bumps writeId. Then A fails. The rollback must NOT delete the
+  // entry — task C should still resume B's id.
+  const ctx = 'ctx-concurrent-rollback';
+  let releaseA: () => void = () => {};
+  const aReady = new Promise<void>((resolve) => {
+    releaseA = resolve;
+  });
+
+  const fakeA = makeFakeSpawn((child) => {
+    setImmediate(async () => {
+      await aReady;
+      child.emitStderr('boom\n');
+      setImmediate(() => child.finish(1));
+    });
+  });
+  const fakeB = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok-b' })],
+    exitCode: 0,
+  });
+  const fakeC = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok-c' })],
+    exitCode: 0,
+  });
+  let call = 0;
+  const wrappedSpawn = (cmd: string, args: readonly string[], opts: ClaudeSpawnOptions) => {
+    call++;
+    if (call === 1) return fakeA.spawn(cmd, args, opts);
+    if (call === 2) return fakeB.spawn(cmd, args, opts);
+    return fakeC.spawn(cmd, args, opts);
+  };
+  const backend = createClaudeBackend({ spawn: wrappedSpawn });
+
+  const tA = assign('a');
+  tA.contextId = ctx;
+  const cA = collect();
+  const pA = backend.handle(tA, cA.emit, NEVER);
+  // Yield so the spawn for A lands and the binding is recorded.
+  await new Promise((r) => setImmediate(r));
+
+  const tB = assign('b');
+  tB.contextId = ctx;
+  const cB = collect();
+  await backend.handle(tB, cB.emit, NEVER);
+  const childB = fakeB.lastChild()!;
+  const resumeIdxB = childB.args.indexOf('--resume');
+  assert.ok(resumeIdxB !== -1, 'task B must resume task A\'s session');
+  const sidB = String(childB.args[resumeIdxB + 1]);
+
+  // Now let task A fail; its rollback must skip the delete because B
+  // refreshed the binding (bumped writeId).
+  releaseA();
+  await pA;
+  assert.equal(
+    cA.frames.find((f) => f.type === 'task.fail')?.error.code,
+    'claude_exit_nonzero',
+  );
+
+  // Task C must still resume B's session id, proving the binding survived
+  // A's rollback.
+  const tC = assign('c');
+  tC.contextId = ctx;
+  await backend.handle(tC, collect().emit, NEVER);
+  const childC = fakeC.lastChild()!;
+  const resumeIdxC = childC.args.indexOf('--resume');
+  assert.ok(resumeIdxC !== -1, 'task C must resume — binding must not have been wiped');
+  assert.equal(String(childC.args[resumeIdxC + 1]), sidB);
+});
+
 test('coalesces split stdout chunks (partial line across data events)', async () => {
   const fake = makeFakeSpawn((child) => {
     setImmediate(() => {
