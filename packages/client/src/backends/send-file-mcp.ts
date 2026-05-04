@@ -33,6 +33,18 @@ export interface SendFileMcpOptions {
   /** Bind host; default 127.0.0.1. */
   host?: string;
   /**
+   * Allow binding to a non-loopback host (any wildcard like `0.0.0.0`/`::`,
+   * or a concrete external interface). The send_file tool exposes file
+   * reads from `allowedRoots` to anything that can reach the listener and
+   * has no transport-level auth, so binding off loopback exposes the tool
+   * to other machines on the network. Default: refuse and throw.
+   *
+   * Operators that need a non-loopback bind (sidecar in another container's
+   * network namespace, etc.) opt in with this flag and accept that
+   * `allowedRoots` is the only access control.
+   */
+  dangerouslyAllowNonLoopback?: boolean;
+  /**
    * Skip binding the HTTP listener. The MCP server, tool registry, and
    * routing are still built so tests can drive the tool path through
    * `invokeSendFileForTest` directly without opening a socket. Production
@@ -68,6 +80,8 @@ export interface SendFileMcpServer {
 
 const DEFAULT_MAX_BYTES = 20 * 1024 * 1024;
 const DEFAULT_HOST = '127.0.0.1';
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
+const WILDCARD_HOSTS = new Set(['0.0.0.0', '::', '*']);
 
 export async function startSendFileMcpServer(
   opts: SendFileMcpOptions,
@@ -75,6 +89,11 @@ export async function startSendFileMcpServer(
   const allowedRoots = opts.allowedRoots;
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
   const host = opts.host ?? DEFAULT_HOST;
+  if (!LOOPBACK_HOSTS.has(host) && !opts.dangerouslyAllowNonLoopback) {
+    throw new Error(
+      `send_file MCP refuses to bind to non-loopback host "${host}" — the tool reads files from allowedRoots without transport-level auth. Set dangerouslyAllowNonLoopback:true to override.`,
+    );
+  }
   // Cached reader: canonicalize roots once per server instance instead of
   // on every tool call. This server is long-lived (one per backend), so
   // every send_file tool invocation reuses the same canonical roots.
@@ -216,11 +235,18 @@ export async function startSendFileMcpServer(
   let actualPort = 0;
   // Wildcard bind addresses are not routable for clients — they tell the OS
   // "listen on all interfaces" but a client connecting to `http://0.0.0.0/`
-  // gets a connection refused on most platforms. Advertise loopback when the
-  // operator chose a wildcard (mirrors what openclaw.ts does for gateway
-  // listener URLs).
-  const advertiseHost = host === '0.0.0.0' || host === '::' || host === '*' ? '127.0.0.1' : host;
-  let url = `http://${advertiseHost}:0/mcp`;
+  // gets a connection refused on most platforms. Advertise the matching
+  // loopback (IPv4 → 127.0.0.1, IPv6 → ::1) so a `::`-bound listener on a
+  // host with IPV6_V6ONLY set still resolves to a reachable URL.
+  const advertiseHost =
+    host === '::'
+      ? '::1'
+      : host === '0.0.0.0' || host === '*'
+        ? '127.0.0.1'
+        : host;
+  // IPv6 literals must be bracketed in URLs (RFC 3986).
+  const urlHost = advertiseHost.includes(':') ? `[${advertiseHost}]` : advertiseHost;
+  let url = `http://${urlHost}:0/mcp`;
 
   if (!opts.skipHttp) {
     httpServer = createHttpServer((req, res) => {
@@ -250,7 +276,7 @@ export async function startSendFileMcpServer(
         resolve();
       });
     });
-    url = `http://${advertiseHost}:${actualPort}/mcp`;
+    url = `http://${urlHost}:${actualPort}/mcp`;
   }
 
   return {

@@ -191,3 +191,45 @@ test('start with port:0 and host:127.0.0.1 binds an HTTP listener exposing /mcp'
     await server.close();
   }
 });
+
+test('refuses to bind a non-loopback host without dangerouslyAllowNonLoopback', async () => {
+  const root = await tmpDir();
+  await assert.rejects(
+    () =>
+      startSendFileMcpServer({
+        allowedRoots: [root],
+        host: '0.0.0.0',
+        skipHttp: true,
+      }),
+    /non-loopback/,
+  );
+});
+
+test('binds non-loopback when dangerouslyAllowNonLoopback is true', async () => {
+  const root = await tmpDir();
+  const server = await startSendFileMcpServer({
+    allowedRoots: [root],
+    host: '0.0.0.0',
+    skipHttp: true,
+    dangerouslyAllowNonLoopback: true,
+  });
+  try {
+    assert.equal(server.host, '0.0.0.0');
+  } finally {
+    await server.close();
+  }
+});
+
+test('::-bound listener advertises [::1] (IPv6 loopback) in url, not 127.0.0.1', async () => {
+  const root = await tmpDir();
+  const server = await startSendFileMcpServer({
+    allowedRoots: [root],
+    host: '::',
+    dangerouslyAllowNonLoopback: true,
+  });
+  try {
+    assert.match(server.url, /^http:\/\/\[::1\]:\d+\/mcp$/);
+  } finally {
+    await server.close();
+  }
+});

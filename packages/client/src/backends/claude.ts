@@ -1,5 +1,5 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
 import {
@@ -82,6 +82,25 @@ type InputContentBlock =
 
 const INPUT_IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 
+// Hard cap on a single inbound FilePart's decoded size. base64 in the
+// stream-json envelope expands ~4/3, and the model context plus per-call
+// API limits make multi-megabyte attachments expensive even when accepted.
+// Reject above this with a stable code rather than silently embedding a
+// huge payload.
+const INPUT_FILE_MAX_BYTES = 5 * 1024 * 1024;
+
+function decodedBase64Size(b64: string): number {
+  if (b64.length === 0) return 0;
+  let pad = 0;
+  if (b64.endsWith('==')) pad = 2;
+  else if (b64.endsWith('=')) pad = 1;
+  return Math.floor((b64.length * 3) / 4) - pad;
+}
+
+function sha256OfBase64(b64: string): string {
+  return createHash('sha256').update(Buffer.from(b64, 'base64')).digest('hex');
+}
+
 function defaultSpawn(
   command: string,
   args: readonly string[],
@@ -136,9 +155,13 @@ function extractToolResultMediaParts(content: unknown): Part[] {
 function mapPartsToContentBlocks(
   parts: readonly Part[],
 ):
-  | { ok: true; blocks: InputContentBlock[] }
+  | { ok: true; blocks: InputContentBlock[]; inboundHashes: Set<string> }
   | { ok: false; code: string; message: string } {
   const blocks: InputContentBlock[] = [];
+  // SHA-256 (hex) of every accepted FilePart's decoded bytes. Used by the
+  // tool_result passthrough to skip echoes — if the model Reads a caller-
+  // provided file the same bytes would otherwise re-emit as a new artifact.
+  const inboundHashes = new Set<string>();
   for (const p of parts) {
     if (p.kind === 'text') {
       if (p.text) {
@@ -154,6 +177,14 @@ function mapPartsToContentBlocks(
           ok: false,
           code: 'unsupported_file_uri',
           message: 'claude backend requires inline FilePart bytes; uri-only is not supported',
+        };
+      }
+      const decodedSize = decodedBase64Size(p.file.bytes);
+      if (decodedSize > INPUT_FILE_MAX_BYTES) {
+        return {
+          ok: false,
+          code: 'file_too_large',
+          message: `FilePart exceeds INPUT_FILE_MAX_BYTES (${decodedSize} > ${INPUT_FILE_MAX_BYTES})`,
         };
       }
       const mime = p.file.mimeType ?? '';
@@ -174,6 +205,7 @@ function mapPartsToContentBlocks(
           message: `claude backend accepts image/{png,jpeg,webp,gif} or application/pdf (got ${mime || 'unknown'})`,
         };
       }
+      inboundHashes.add(sha256OfBase64(p.file.bytes));
       continue;
     }
     return {
@@ -188,7 +220,7 @@ function mapPartsToContentBlocks(
   if (blocks.length === 0) {
     return { ok: false, code: 'empty_prompt', message: 'no content in message' };
   }
-  return { ok: true, blocks };
+  return { ok: true, blocks, inboundHashes };
 }
 
 export function createClaudeBackend(
@@ -345,12 +377,31 @@ export function createClaudeBackend(
       // and proceeds. Errors here are recorded; the close listener still
       // drives the terminal frame so we don't double-emit.
       let stdinError: Error | null = null;
+      if (!child.stdin) {
+        // A custom spawn that doesn't pipe stdin would otherwise leave
+        // claude blocked waiting for input. Hard-fail loud rather than
+        // hang the run.
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          /* best effort */
+        }
+        emit({
+          type: 'task.fail',
+          taskId: task.taskId,
+          error: {
+            code: 'spawn_no_stdin',
+            message: 'spawned claude has no stdin pipe; cannot deliver user message',
+          },
+        });
+        return;
+      }
       try {
         const envelope = JSON.stringify({
           type: 'user',
           message: { role: 'user', content: mapped.blocks },
         });
-        child.stdin?.end(envelope + '\n');
+        child.stdin.end(envelope + '\n');
       } catch (err) {
         stdinError = err as Error;
       }
@@ -426,7 +477,14 @@ export function createClaudeBackend(
           // tool_result events come in as a synthetic user message in the
           // stream-json transcript; pull out any image/document blocks and
           // emit them as A2A FileParts. Text-only tool results are skipped.
-          const parts = extractToolResultMediaParts(evt.message?.content);
+          // Echo dedup: a tool_result whose decoded bytes match an inbound
+          // FilePart (e.g. the model Read the caller's image) would re-emit
+          // the same payload back to the caller. Drop those before they
+          // reach the wire.
+          const parts = extractToolResultMediaParts(evt.message?.content).filter((p) => {
+            if (p.kind !== 'file' || !p.file.bytes) return true;
+            return !mapped.inboundHashes.has(sha256OfBase64(p.file.bytes));
+          });
           emitToolResultMedia(parts);
           return;
         }

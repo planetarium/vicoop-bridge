@@ -330,6 +330,35 @@ test('rejects FilePart with unsupported MIME (e.g. application/zip)', async () =
   assert.equal(fail.error.code, 'unsupported_file_mime');
 });
 
+test('rejects FilePart whose decoded bytes exceed INPUT_FILE_MAX_BYTES (5 MiB)', async () => {
+  let spawned = 0;
+  const backend = createClaudeBackend({
+    spawn: () => {
+      spawned++;
+      throw new Error('should not spawn');
+    },
+  });
+  // 6 MiB of zeros encoded as base64 → ~8 MiB string, decoded size 6 MiB > cap.
+  const oversize = Buffer.alloc(6 * 1024 * 1024).toString('base64');
+  const { emit, frames } = collect();
+  const task: TaskAssignFrame = {
+    type: 'task.assign',
+    taskId: 't',
+    contextId: 'c',
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [{ kind: 'file', file: { mimeType: 'image/png', bytes: oversize } }],
+    },
+  };
+  await backend.handle(task, emit, NEVER);
+
+  assert.equal(spawned, 0);
+  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
+  assert.ok(fail);
+  assert.equal(fail.error.code, 'file_too_large');
+});
+
 test('rejects FilePart with uri-only (no inline bytes)', async () => {
   const backend = createClaudeBackend({
     spawn: () => {
@@ -679,6 +708,61 @@ test('coalesces split stdout chunks (partial line across data events)', async ()
   const artifacts = frames.filter((f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact');
   assert.equal(artifacts.length, 1);
   assert.equal(textOf(artifacts[0]), 'split');
+});
+
+test('skips tool_result media whose decoded bytes match an inbound FilePart (input echo dedup)', async () => {
+  const sharedBytes = 'iVBORw0KAA==';
+  const fake = scriptedSpawn({
+    lines: [
+      // Same base64 the caller sent on stdin — the model "Read" the input.
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              tool_use_id: 'tu_echo',
+              type: 'tool_result',
+              content: [
+                {
+                  type: 'image',
+                  source: { type: 'base64', media_type: 'image/png', data: sharedBytes },
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      JSON.stringify({ type: 'result', result: 'done' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  const task: TaskAssignFrame = {
+    type: 'task.assign',
+    taskId: 't',
+    contextId: 'c',
+    message: {
+      role: 'user',
+      messageId: 'm',
+      parts: [
+        { kind: 'text', text: 'describe' },
+        { kind: 'file', file: { mimeType: 'image/png', bytes: sharedBytes } },
+      ],
+    },
+  };
+  await backend.handle(task, emit, NEVER);
+
+  const fileArtifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
+      f.type === 'task.artifact' && f.artifact.parts[0]?.kind === 'file',
+  );
+  assert.equal(
+    fileArtifacts.length,
+    0,
+    'tool_result whose bytes echo the inbound FilePart must not re-emit',
+  );
 });
 
 test('emits FilePart artifact when tool_result contains an image block', async () => {
