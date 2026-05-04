@@ -33,9 +33,10 @@ export interface SendFileMcpOptions {
   /** Bind host; default 127.0.0.1. */
   host?: string;
   /**
-   * Optional pre-built server for unit tests — the public factory builds
-   * its own. Tests can pass `{ skipHttp: true }` and drive the registry
-   * directly without spinning up sockets.
+   * Skip binding the HTTP listener. The MCP server, tool registry, and
+   * routing are still built so tests can drive the tool path through
+   * `invokeSendFileForTest` directly without opening a socket. Production
+   * callers leave this unset.
    */
   skipHttp?: boolean;
 }

@@ -139,12 +139,10 @@ function mapPartsToContentBlocks(
   | { ok: true; blocks: InputContentBlock[] }
   | { ok: false; code: string; message: string } {
   const blocks: InputContentBlock[] = [];
-  let textTotal = 0;
   for (const p of parts) {
     if (p.kind === 'text') {
       if (p.text) {
         blocks.push({ type: 'text', text: p.text });
-        textTotal += p.text.length;
       }
       continue;
     }
@@ -184,13 +182,11 @@ function mapPartsToContentBlocks(
       message: `claude backend does not accept ${p.kind} parts`,
     };
   }
-  if (blocks.length === 0 || (textTotal === 0 && blocks.every((b) => b.type !== 'text'))) {
-    // Anthropic accepts media-only messages, but a fully empty parts array
-    // (no text, no files) carries no signal — fail loud rather than spawn
-    // claude on nothing.
-    if (blocks.length === 0) {
-      return { ok: false, code: 'empty_prompt', message: 'no content in message' };
-    }
+  // Media-only messages (image/document with no text) are accepted —
+  // Anthropic's vision/document path can answer about them without an
+  // accompanying prompt. Only a fully empty content array fails loud.
+  if (blocks.length === 0) {
+    return { ok: false, code: 'empty_prompt', message: 'no content in message' };
   }
   return { ok: true, blocks };
 }
