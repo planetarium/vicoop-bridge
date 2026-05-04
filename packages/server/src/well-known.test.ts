@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import { Hono } from 'hono';
 import type { AgentCardV03 } from '@a2x/sdk';
 import type { ClientConnection } from './registry.js';
-import { mountWellKnown, type WellKnownDeps } from './well-known.js';
+import {
+  buildLandingDirectory,
+  mountWellKnown,
+  type WellKnownDeps,
+} from './well-known.js';
 
 function fakeConn(agentId: string, card: Partial<AgentCardV03> = {}): ClientConnection {
   return {
@@ -210,6 +214,35 @@ test('mentionable-agents.json: drops case-insensitive collisions to match resolv
   const body = (await res.json()) as { contactPoint: Array<{ email: string }> };
   const emails = body.contactPoint.map((p) => p.email);
   assert.deepEqual(emails, ['admin@bridge.example.com', 'bar@bridge.example.com']);
+});
+
+test('mentionable-agents.json: avoids card synthesis for invalid and colliding locals', () => {
+  const calls: string[] = [];
+  const deps: WellKnownDeps = {
+    listAgents: () => [
+      fakeConn('Foo'),
+      fakeConn('foo'),
+      fakeConn('bad@id'),
+      fakeConn('bar'),
+    ],
+    getAgentCard: (conn) => {
+      calls.push(conn.agentId);
+      return fakeCardV03(conn.agentId);
+    },
+    adminCard: fakeAdminCard(),
+    publicUrl: 'https://bridge.example.com',
+    domain: 'bridge.example.com',
+    deviceFlowEnabled: false,
+    organizationName: 'Vicoop Bridge',
+  };
+
+  const directory = buildLandingDirectory(deps);
+  assert.ok(directory);
+  assert.deepEqual(calls, ['bar']);
+  assert.deepEqual(
+    directory.contactPoint.map((p) => p.email),
+    ['admin@bridge.example.com', 'bar@bridge.example.com'],
+  );
 });
 
 test('webfinger: 404 when local-part contains unsafe chars (path separator)', async () => {

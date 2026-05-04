@@ -96,7 +96,22 @@ function entriesFromPairs(
 }
 
 function collectPairs(deps: WellKnownDeps): ConnectionPair[] {
-  return deps.listAgents().map((conn) => ({ conn, card: deps.getAgentCard(conn) }));
+  const candidates = new Map<string, ClientConnection | 'collision'>();
+  for (const conn of deps.listAgents()) {
+    if (!isValidMentionableLocal(conn.agentId)) continue;
+    const key = conn.agentId.toLowerCase();
+    if (candidates.has(key)) {
+      candidates.set(key, 'collision');
+      continue;
+    }
+    candidates.set(key, conn);
+  }
+
+  const pairs: ConnectionPair[] = [];
+  for (const conn of candidates.values()) {
+    if (conn !== 'collision') pairs.push({ conn, card: deps.getAgentCard(conn) });
+  }
+  return pairs;
 }
 
 function isIpLiteral(hostname: string): boolean {

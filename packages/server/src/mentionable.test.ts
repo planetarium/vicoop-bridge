@@ -39,7 +39,16 @@ test('isValidMentionableLocal accepts safe LDH+dot+underscore', () => {
 });
 
 test('isValidMentionableLocal rejects unsafe chars and empty / overlong', () => {
-  for (const bad of ['', 'foo@bar', 'foo bar', 'foo/bar', 'foo\nbar', 'a'.repeat(65)]) {
+  for (const bad of [
+    '',
+    '.',
+    '..',
+    'foo@bar',
+    'foo bar',
+    'foo/bar',
+    'foo\nbar',
+    'a'.repeat(65),
+  ]) {
     assert.equal(isValidMentionableLocal(bad), false, JSON.stringify(bad));
   }
 });
