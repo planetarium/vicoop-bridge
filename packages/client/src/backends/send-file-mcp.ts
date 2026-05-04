@@ -6,8 +6,8 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod';
 import type { Part } from '@vicoop-bridge/protocol';
 import {
+  createBoundedFileReader,
   inferMimeFromPath,
-  readBoundedFileWithinRoots,
   SafeReadError,
 } from './file-attach.js';
 import { clientVersion } from '../version.js';
@@ -74,6 +74,10 @@ export async function startSendFileMcpServer(
   const allowedRoots = opts.allowedRoots;
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
   const host = opts.host ?? DEFAULT_HOST;
+  // Cached reader: canonicalize roots once per server instance instead of
+  // on every tool call. This server is long-lived (one per backend), so
+  // every send_file tool invocation reuses the same canonical roots.
+  const readBounded = createBoundedFileReader({ allowedRoots, maxBytes });
 
   // Routing strategy R1: a single in-flight task at a time. Bridge's
   // typical caller-per-context pattern keeps this true; the alternative
@@ -114,11 +118,7 @@ export async function startSendFileMcpServer(
     }
     const [task] = activeTasks;
     try {
-      const read = await readBoundedFileWithinRoots({
-        filePath: input.path,
-        allowedRoots,
-        maxBytes,
-      });
+      const read = await readBounded(input.path);
       const fileName = input.name ?? path.basename(read.realPath);
       const artifactId = randomUUID();
       const parts: Part[] = [

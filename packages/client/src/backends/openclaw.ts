@@ -1,13 +1,14 @@
 import { createHash, generateKeyPairSync, randomUUID, sign as cryptoSign } from 'node:crypto';
 import { execFile } from 'node:child_process';
+import path from 'node:path';
 import { promisify } from 'node:util';
 import WebSocket from 'ws';
 import type { Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
 import {
+  createBoundedFileReader,
   inferMimeFromPath,
   parseBridgeAttachMarkers,
-  readBoundedFileWithinRoots,
   SafeReadError,
   stripMarkersForPath,
 } from './file-attach.js';
@@ -765,10 +766,20 @@ export function createOpenclawBackend(
   );
   const attachOutputs =
     opts.attachOutputs && opts.attachOutputs.allowedRoots.length > 0
-      ? {
-          allowedRoots: opts.attachOutputs.allowedRoots,
-          maxBytes: opts.attachOutputs.maxBytes ?? DEFAULT_ATTACH_OUTPUTS_MAX_BYTES,
-        }
+      ? (() => {
+          const cfg = {
+            allowedRoots: opts.attachOutputs!.allowedRoots,
+            maxBytes: opts.attachOutputs!.maxBytes ?? DEFAULT_ATTACH_OUTPUTS_MAX_BYTES,
+          };
+          return {
+            ...cfg,
+            // Cached reader: canonicalizes allowedRoots once and reuses the
+            // result for every marker, so an assistant message with N
+            // bridge-attach markers does N file reads instead of N + N*roots
+            // realpath calls.
+            read: createBoundedFileReader(cfg),
+          };
+        })()
       : null;
   const sendFileMcpOpts =
     opts.sendFileMcp && opts.sendFileMcp.allowedRoots.length > 0
@@ -908,16 +919,12 @@ export function createOpenclawBackend(
     const fileParts: Part[] = [];
     for (const p of parsed.paths) {
       try {
-        const read = await readBoundedFileWithinRoots({
-          filePath: p,
-          allowedRoots: attachOutputs.allowedRoots,
-          maxBytes: attachOutputs.maxBytes,
-        });
+        const read = await attachOutputs.read(p);
         const mimeType = inferMimeFromPath(read.realPath);
         fileParts.push({
           kind: 'file',
           file: {
-            name: read.realPath.split('/').pop() ?? p,
+            name: path.basename(read.realPath),
             mimeType,
             bytes: read.buffer.toString('base64'),
           },
@@ -926,7 +933,7 @@ export function createOpenclawBackend(
       } catch (err) {
         const code = err instanceof SafeReadError ? err.code : 'read-failed';
         console.warn(
-          `[openclaw] bridge-attach skipped (${code}) for ${p}: ${(err as Error).message}`,
+          `[openclaw] bridge-attach skipped (${code}) for ${p}: ${errorMessage(err)}`,
         );
         // Marker stays in cleanedText so the operator can debug what the
         // agent tried to send.
