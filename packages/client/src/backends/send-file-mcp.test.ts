@@ -192,6 +192,27 @@ test('start with port:0 and host:127.0.0.1 binds an HTTP listener exposing /mcp'
   }
 });
 
+test('listen() failure rejects and does not leak the McpServer/transport', async () => {
+  // Hold a port so the second start fails to bind, exercising the
+  // try/catch around `httpServer.listen`. Without cleanup the McpServer
+  // would stay connected and accumulate across retries.
+  const root = await tmpDir();
+  const occupier = await startSendFileMcpServer({ allowedRoots: [root] });
+  try {
+    await assert.rejects(
+      () =>
+        startSendFileMcpServer({
+          allowedRoots: [root],
+          host: '127.0.0.1',
+          port: occupier.port,
+        }),
+      /EADDRINUSE/i,
+    );
+  } finally {
+    await occupier.close();
+  }
+});
+
 test('refuses to bind a non-loopback host without dangerouslyAllowNonLoopback', async () => {
   const root = await tmpDir();
   await assert.rejects(

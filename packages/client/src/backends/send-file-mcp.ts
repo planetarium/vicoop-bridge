@@ -283,16 +283,34 @@ export async function startSendFileMcpServer(
       });
     });
 
-    await new Promise<void>((resolve, reject) => {
-      httpServer!.once('error', reject);
-      httpServer!.listen(opts.port ?? 0, host, () => {
-        const addr = httpServer!.address();
-        if (addr && typeof addr === 'object') {
-          actualPort = addr.port;
-        }
-        resolve();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        httpServer!.once('error', reject);
+        httpServer!.listen(opts.port ?? 0, host, () => {
+          const addr = httpServer!.address();
+          if (addr && typeof addr === 'object') {
+            actualPort = addr.port;
+          }
+          resolve();
+        });
       });
-    });
+    } catch (err) {
+      // Bind failed (port in use, permission denied, host unresolvable).
+      // The McpServer + transport were already wired up before the bind
+      // attempt; close them so a retry doesn't leak handles. httpServer
+      // itself never finished listening so closing is best-effort.
+      try {
+        await mcp.close();
+      } catch {
+        /* ignore secondary failure */
+      }
+      try {
+        httpServer.close();
+      } catch {
+        /* ignore */
+      }
+      throw err;
+    }
     url = `http://${urlHost}:${actualPort}/mcp`;
   }
 

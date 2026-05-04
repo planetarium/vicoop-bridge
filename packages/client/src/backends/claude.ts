@@ -415,6 +415,9 @@ export function createClaudeBackend(
         } catch {
           /* best effort */
         }
+        // The freshly-minted sessionId never reached claude, so a follow-up
+        // task on the same contextId must mint a new id rather than --resume.
+        rollbackFreshSession();
         emit({
           type: 'task.fail',
           taskId: task.taskId,
