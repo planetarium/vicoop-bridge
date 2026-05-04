@@ -291,8 +291,30 @@ async function readWithRoots(params: {
         `file exceeds maxBytes (${stat.size} > ${params.maxBytes}): ${realPath}`,
       );
     }
-    const buffer = await handle.readFile();
-    return { buffer, realPath, size: stat.size };
+    // Bounded read: cap allocation at maxBytes + 1 so a file that grew
+    // between fstat and readFile (TOCTOU) is detected and rejected
+    // instead of silently inflating the in-memory buffer beyond
+    // maxBytes. We read until EOF or the cap+1-th byte appears.
+    const cap = params.maxBytes;
+    const buf = Buffer.alloc(cap + 1);
+    let totalRead = 0;
+    while (totalRead < cap + 1) {
+      const { bytesRead } = await handle.read(
+        buf,
+        totalRead,
+        cap + 1 - totalRead,
+        totalRead,
+      );
+      if (bytesRead === 0) break; // EOF
+      totalRead += bytesRead;
+    }
+    if (totalRead > cap) {
+      throw new SafeReadError(
+        'too-large',
+        `file exceeds maxBytes during read (>${cap} bytes, file grew between stat and read): ${realPath}`,
+      );
+    }
+    return { buffer: buf.subarray(0, totalRead), realPath, size: totalRead };
   } finally {
     await handle.close().catch(() => {});
   }

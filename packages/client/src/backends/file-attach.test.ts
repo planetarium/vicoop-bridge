@@ -200,6 +200,23 @@ test('readBoundedFileWithinRoots: oversized file rejected with too-large', async
   );
 });
 
+test('readBoundedFileWithinRoots: bounded read returns the actual byte count even if file shrinks between stat and read', async () => {
+  // The size returned should reflect what was actually read, not the
+  // (possibly stale) stat.size. This also confirms we are using a
+  // bounded read instead of fs.readFile() which would read whatever the
+  // descriptor still had.
+  const root = await tmpDir();
+  const file = path.join(root, 'small.txt');
+  await fs.writeFile(file, 'small content');
+  const r = await readBoundedFileWithinRoots({
+    filePath: file,
+    allowedRoots: [root],
+    maxBytes: 1024,
+  });
+  assert.equal(r.size, 'small content'.length);
+  assert.equal(r.buffer.toString('utf8'), 'small content');
+});
+
 test('readBoundedFileWithinRoots: missing file rejected with not-found', async () => {
   const root = await tmpDir();
   const missing = path.join(root, 'nope.txt');

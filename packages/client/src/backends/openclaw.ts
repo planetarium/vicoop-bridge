@@ -1181,7 +1181,7 @@ export function createOpenclawBackend(
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: { code: 'gateway_closed', message: (err as Error).message },
+          error: { code: 'gateway_closed', message: errorMessage(err) },
         });
         return;
       }
@@ -1249,7 +1249,7 @@ export function createOpenclawBackend(
           }
         } catch (err) {
           console.warn(
-            `[openclaw] send_file MCP server failed to start; tool path disabled for this task: ${(err as Error).message}`,
+            `[openclaw] send_file MCP server failed to start; tool path disabled for this task: ${errorMessage(err)}`,
           );
         }
       }
@@ -1297,7 +1297,7 @@ export function createOpenclawBackend(
           .catch((err: unknown) => {
             console.error(
               '[openclaw] session.message processing failed:',
-              (err as Error).message,
+              errorMessage(err),
             );
           });
       };
@@ -1356,7 +1356,7 @@ export function createOpenclawBackend(
             sessionKey,
             seq: -1,
             state: 'error',
-            errorMessage: (err as Error).message,
+            errorMessage: errorMessage(err),
             cause: 'abort_failed',
           });
         }
@@ -1418,7 +1418,7 @@ export function createOpenclawBackend(
             taskId: task.taskId,
             error: {
               code: closed ? 'gateway_closed' : 'gateway_send_failed',
-              message: (err as Error).message,
+              message: errorMessage(err),
             },
           });
           return;
