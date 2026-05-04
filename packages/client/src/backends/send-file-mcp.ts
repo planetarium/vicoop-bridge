@@ -54,7 +54,12 @@ export interface SendFileMcpOptions {
 }
 
 export interface SendFileMcpServer {
-  /** URL operators register in OpenClaw's `mcp.servers` config. */
+  /**
+   * URL the agent's MCP runtime should connect to. Backends register it
+   * however their host CLI / config expects: OpenClaw via
+   * `openclaw mcp set send-file`, claude via `--mcp-config` inline JSON,
+   * other backends via their own equivalents.
+   */
   url: string;
   /** Bind host (after resolution). */
   host: string;
