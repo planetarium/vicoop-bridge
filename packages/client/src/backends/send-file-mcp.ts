@@ -160,7 +160,7 @@ export async function startSendFileMcpServer(
           .string()
           .min(1)
           .describe(
-            'Absolute path to the file on the local filesystem. Must be inside one of the operator-configured allowed roots; relative paths and paths that resolve outside the roots are rejected.',
+            'Path to the file on the local filesystem. Absolute paths are preferred; a relative path resolves against the first operator-configured allowed root. After resolution the file must canonicalize (realpath) into one of the allowed roots, otherwise the call is rejected.',
           ),
         name: z
           .string()
@@ -213,7 +213,13 @@ export async function startSendFileMcpServer(
 
   let httpServer: HttpServer | null = null;
   let actualPort = 0;
-  let url = `http://${host}:0/mcp`;
+  // Wildcard bind addresses are not routable for clients — they tell the OS
+  // "listen on all interfaces" but a client connecting to `http://0.0.0.0/`
+  // gets a connection refused on most platforms. Advertise loopback when the
+  // operator chose a wildcard (mirrors what openclaw.ts does for gateway
+  // listener URLs).
+  const advertiseHost = host === '0.0.0.0' || host === '::' || host === '*' ? '127.0.0.1' : host;
+  let url = `http://${advertiseHost}:0/mcp`;
 
   if (!opts.skipHttp) {
     httpServer = createHttpServer((req, res) => {
@@ -243,7 +249,7 @@ export async function startSendFileMcpServer(
         resolve();
       });
     });
-    url = `http://${host}:${actualPort}/mcp`;
+    url = `http://${advertiseHost}:${actualPort}/mcp`;
   }
 
   return {

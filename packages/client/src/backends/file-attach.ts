@@ -204,10 +204,16 @@ export function createBoundedFileReader(opts: {
  *   2. lstat() must report a regular file (no dirs/sockets/devices).
  *   3. open() with O_NOFOLLOW so the terminal component cannot be a symlink
  *      pointing outside roots between realpath and open.
- *   4. fstat().nlink === 1 — hardlinks could anchor a file inside roots
+ *   4. fstat() dev/ino must equal the prior lstat dev/ino — defense against
+ *      a TOCTOU swap (realpath → lstat → open) and the only line of defense
+ *      on platforms where O_NOFOLLOW is unavailable (win32).
+ *   5. fstat().nlink === 1 — hardlinks could anchor a file inside roots
  *      that is also reachable via an outside-root path the operator doesn't
  *      see. Reject so the model cannot use hardlinks to smuggle paths.
- *   5. size <= maxBytes — bound the per-attachment payload before reading.
+ *   6. fstat().size <= maxBytes — initial bound on the per-attachment payload.
+ *   7. Bounded read up to maxBytes + 1 — detect a file that grows between
+ *      stat and read so a TOCTOU inflation cannot push the in-memory buffer
+ *      past the cap.
  *
  * For repeated reads under the same roots, prefer `createBoundedFileReader`
  * which caches the canonicalization.
