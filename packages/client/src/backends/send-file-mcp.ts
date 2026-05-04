@@ -81,7 +81,11 @@ export interface SendFileMcpServer {
 const DEFAULT_MAX_BYTES = 20 * 1024 * 1024;
 const DEFAULT_HOST = '127.0.0.1';
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
-const WILDCARD_HOSTS = new Set(['0.0.0.0', '::', '*']);
+// Real wildcard bind addresses Node accepts in `httpServer.listen(port, host)`.
+// `"*"` is intentionally excluded: Node treats it as a literal hostname and
+// `.listen()` resolves it via DNS, typically failing ENOTFOUND. Operators
+// who want all-interfaces use `0.0.0.0` (IPv4) or `::` (IPv6 / dual stack).
+const WILDCARD_HOSTS = new Set(['0.0.0.0', '::']);
 
 // Defensive stringification — `(e as Error).message` is unsafe when the
 // thrown value is null/undefined or a non-Error primitive (common when

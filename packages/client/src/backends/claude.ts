@@ -378,16 +378,22 @@ export function createClaudeBackend(
         status: { state: 'working', timestamp: new Date().toISOString() },
       });
 
+      // Drop the freshly-minted (contextId → sessionId) binding when the
+      // run never reached a successful state, so the next task on this
+      // contextId mints a brand-new id instead of `--resume`-ing a session
+      // claude never persisted on disk. No-op if this run was already
+      // resuming an existing session, or if session reuse is disabled.
+      const rollbackFreshSession = (): void => {
+        if (isResume || sessionTtlMs <= 0) return;
+        const cur = sessions.get(task.contextId);
+        if (cur?.sessionId === sessionId) sessions.delete(task.contextId);
+      };
+
       let child: ClaudeChildHandle;
       try {
         child = spawnFn(command, args, { cwd });
       } catch (err) {
-        // Roll back the freshly-minted entry so a retry doesn't try to
-        // --resume a session that was never actually created on disk.
-        if (!isResume && sessionTtlMs > 0) {
-          const cur = sessions.get(task.contextId);
-          if (cur?.sessionId === sessionId) sessions.delete(task.contextId);
-        }
+        rollbackFreshSession();
         emit({
           type: 'task.fail',
           taskId: task.taskId,
@@ -599,6 +605,7 @@ export function createClaudeBackend(
       }
 
       if (exit.error) {
+        rollbackFreshSession();
         emit({
           type: 'task.fail',
           taskId: task.taskId,
@@ -608,6 +615,7 @@ export function createClaudeBackend(
       }
 
       if (exit.code !== 0) {
+        rollbackFreshSession();
         const detail = stderrTail.trim();
         const sigPart = exit.signal ? ` (signal ${exit.signal})` : '';
         const detailPart = detail ? `: ${detail.slice(-500)}` : '';

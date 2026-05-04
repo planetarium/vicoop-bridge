@@ -686,6 +686,40 @@ test('rolls back the session binding when spawn throws', async () => {
   assert.ok(child.args.indexOf('--session-id') !== -1);
 });
 
+test('rolls back the session binding when claude exits non-zero on a fresh session', async () => {
+  // First task: claude exits with a stderr message but no result. The
+  // freshly-minted sessionId was never persisted on disk, so a follow-up
+  // task on the same contextId must mint a NEW id rather than --resume.
+  const fakeFail = scriptedSpawn({ lines: [], stderr: 'auth required\n', exitCode: 2 });
+  const fakeOk = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+  let firstCall = true;
+  const wrappedSpawn = (cmd: string, args: readonly string[], opts: ClaudeSpawnOptions) => {
+    if (firstCall) {
+      firstCall = false;
+      return fakeFail.spawn(cmd, args, opts);
+    }
+    return fakeOk.spawn(cmd, args, opts);
+  };
+  const backend = createClaudeBackend({ spawn: wrappedSpawn });
+  const ctx = 'ctx-exit-rollback';
+
+  const t1 = assign('first');
+  t1.contextId = ctx;
+  const c1 = collect();
+  await backend.handle(t1, c1.emit, NEVER);
+  assert.equal(c1.frames.find((f) => f.type === 'task.fail')?.error.code, 'claude_exit_nonzero');
+
+  const t2 = assign('second');
+  t2.contextId = ctx;
+  await backend.handle(t2, collect().emit, NEVER);
+  const child = fakeOk.lastChild()!;
+  assert.equal(child.args.indexOf('--resume'), -1, 'must not resume an aborted session');
+  assert.ok(child.args.indexOf('--session-id') !== -1, 'must mint a fresh session id');
+});
+
 test('coalesces split stdout chunks (partial line across data events)', async () => {
   const fake = makeFakeSpawn((child) => {
     setImmediate(() => {
