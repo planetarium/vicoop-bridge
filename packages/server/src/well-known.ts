@@ -164,7 +164,7 @@ function resolveLocal(deps: WellKnownDeps, local: string): ResolvedLocal | undef
   // first; refuse the lookup instead so the ambiguity surfaces as a 404
   // rather than misdelivery. The right long-term fix is to enforce
   // case-insensitive uniqueness at registration time.
-  let match: ResolvedLocal | undefined;
+  let match: ClientConnection | undefined;
   for (const conn of deps.listAgents()) {
     if (
       !isValidMentionableLocal(conn.agentId) ||
@@ -173,9 +173,11 @@ function resolveLocal(deps: WellKnownDeps, local: string): ResolvedLocal | undef
       continue;
     }
     if (match) return undefined;
-    match = { local: conn.agentId, card: deps.getAgentCard(conn) };
+    match = conn;
   }
-  return match;
+  return match
+    ? { local: match.agentId, card: deps.getAgentCard(match) }
+    : undefined;
 }
 
 /**

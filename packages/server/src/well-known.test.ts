@@ -205,6 +205,29 @@ test('agent-card: 404 when two registry entries differ only in case (ambiguous)'
   assert.equal(res.status, 404);
 });
 
+test('webfinger: avoids card synthesis when local lookup is ambiguous', async () => {
+  const calls: string[] = [];
+  const app = new Hono();
+  mountWellKnown(app, {
+    listAgents: () => [fakeConn('Foo'), fakeConn('foo')],
+    getAgentCard: (conn) => {
+      calls.push(conn.agentId);
+      return fakeCardV03(conn.agentId);
+    },
+    adminCard: fakeAdminCard(),
+    publicUrl: 'https://bridge.example.com',
+    domain: 'bridge.example.com',
+    deviceFlowEnabled: false,
+    organizationName: 'Vicoop Bridge',
+  });
+
+  const res = await app.request(
+    '/.well-known/webfinger?resource=acct:foo@bridge.example.com',
+  );
+  assert.equal(res.status, 404);
+  assert.deepEqual(calls, []);
+});
+
 test('mentionable-agents.json: drops case-insensitive collisions to match resolveLocal', async () => {
   // listDirectoryEntries must mirror resolveLocal's ambiguous-→-404 rule;
   // otherwise the directory advertises addresses that immediately fail to
