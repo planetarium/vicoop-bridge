@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createClaudeBackend, type ClaudeChildHandle, type ClaudeSpawnOptions } from './claude.js';
 import type { TaskAssignFrame, UpFrame } from '@vicoop-bridge/protocol';
@@ -12,6 +15,8 @@ interface FakeChild extends ClaudeChildHandle {
   readonly cwd?: string;
   killed: boolean;
   killSignal: NodeJS.Signals | null;
+  stdinPayload: string;
+  stdinClosed: boolean;
   emitStdout(text: string): void;
   emitStderr(text: string): void;
   finish(code: number | null, sig?: NodeJS.Signals | null): void;
@@ -31,21 +36,47 @@ function makeFakeSpawn(configure: (child: FakeChild) => void): FakeSpawn {
       const closeListeners: Array<(code: number | null, sig: NodeJS.Signals | null) => void> = [];
       let closed = false;
 
-      const mkStream = (em: EventEmitter) =>
+      const mkReadable = (em: EventEmitter) =>
         ({
           on(event: string, cb: (...a: unknown[]) => void) {
             em.on(event, cb);
           },
         }) as unknown as NodeJS.ReadableStream;
 
+      // Fake writable stream that just captures whatever the backend writes.
+      // `end(payload)` is the only write call the backend makes, so we don't
+      // bother differentiating write vs end here.
+      const stdinChunks: string[] = [];
+      const stdin: NodeJS.WritableStream = {
+        write(chunk: unknown): boolean {
+          stdinChunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Buffer).toString('utf8'));
+          return true;
+        },
+        end(chunk?: unknown) {
+          if (chunk !== undefined) {
+            stdinChunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Buffer).toString('utf8'));
+          }
+          (child as { stdinClosed: boolean }).stdinClosed = true;
+          return stdin;
+        },
+        on() { return stdin; },
+        once() { return stdin; },
+        emit() { return false; },
+      } as unknown as NodeJS.WritableStream;
+
       const child: FakeChild = {
         command,
         args,
         cwd: options.cwd,
-        stdout: mkStream(stdoutEmitter),
-        stderr: mkStream(stderrEmitter),
+        stdin,
+        stdout: mkReadable(stdoutEmitter),
+        stderr: mkReadable(stderrEmitter),
         killed: false,
         killSignal: null,
+        get stdinPayload() {
+          return stdinChunks.join('');
+        },
+        stdinClosed: false,
         kill(sig?: NodeJS.Signals) {
           this.killed = true;
           this.killSignal = sig ?? 'SIGTERM';
@@ -245,7 +276,7 @@ test('abort propagates SIGTERM and completes as canceled', async () => {
   assert.equal(artifacts.length, 1);
 });
 
-test('fails fast on non-text part without spawning', async () => {
+test('rejects data parts as unsupported_part_kind without spawning', async () => {
   let spawned = 0;
   const backend = createClaudeBackend({
     spawn: () => {
@@ -261,7 +292,7 @@ test('fails fast on non-text part without spawning', async () => {
     message: {
       role: 'user',
       messageId: 'm1',
-      parts: [{ kind: 'file', file: { name: 'x.png', mimeType: 'image/png', bytes: 'AA==' } }],
+      parts: [{ kind: 'data', data: { foo: 'bar' } }],
     },
   };
   await backend.handle(task, emit, NEVER);
@@ -270,6 +301,57 @@ test('fails fast on non-text part without spawning', async () => {
   const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
   assert.ok(fail);
   assert.equal(fail.error.code, 'unsupported_part_kind');
+});
+
+test('rejects FilePart with unsupported MIME (e.g. application/zip)', async () => {
+  let spawned = 0;
+  const backend = createClaudeBackend({
+    spawn: () => {
+      spawned++;
+      throw new Error('should not spawn');
+    },
+  });
+  const { emit, frames } = collect();
+  const task: TaskAssignFrame = {
+    type: 'task.assign',
+    taskId: 't',
+    contextId: 'c',
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [{ kind: 'file', file: { mimeType: 'application/zip', bytes: 'AA==' } }],
+    },
+  };
+  await backend.handle(task, emit, NEVER);
+
+  assert.equal(spawned, 0);
+  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
+  assert.ok(fail);
+  assert.equal(fail.error.code, 'unsupported_file_mime');
+});
+
+test('rejects FilePart with uri-only (no inline bytes)', async () => {
+  const backend = createClaudeBackend({
+    spawn: () => {
+      throw new Error('should not spawn');
+    },
+  });
+  const { emit, frames } = collect();
+  const task: TaskAssignFrame = {
+    type: 'task.assign',
+    taskId: 't',
+    contextId: 'c',
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [{ kind: 'file', file: { mimeType: 'image/png', uri: 'https://example.com/x.png' } }],
+    },
+  };
+  await backend.handle(task, emit, NEVER);
+
+  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
+  assert.ok(fail);
+  assert.equal(fail.error.code, 'unsupported_file_uri');
 });
 
 test('already-aborted signal short-circuits before spawn', async () => {
@@ -291,7 +373,97 @@ test('already-aborted signal short-circuits before spawn', async () => {
   assert.equal((frames[0] as Extract<UpFrame, { type: 'task.complete' }>).status.state, 'canceled');
 });
 
-test('passes expected argv shape (prompt, session-id, stream-json, verbose, extraArgs)', async () => {
+test('stdin envelope: text-only message becomes a single text content block', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  await backend.handle(assign('hello world'), collect().emit, NEVER);
+  const child = fake.lastChild()!;
+  assert.equal(child.stdinClosed, true);
+  const env = JSON.parse(child.stdinPayload.trim()) as {
+    type: string;
+    message: { role: string; content: Array<{ type: string; text?: string }> };
+  };
+  assert.equal(env.type, 'user');
+  assert.equal(env.message.role, 'user');
+  assert.equal(env.message.content.length, 1);
+  assert.equal(env.message.content[0].type, 'text');
+  assert.equal(env.message.content[0].text, 'hello world');
+});
+
+test('stdin envelope: image FilePart maps to image content block', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const task: TaskAssignFrame = {
+    type: 'task.assign',
+    taskId: 't',
+    contextId: 'c',
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [
+        { kind: 'text', text: 'what color?' },
+        { kind: 'file', file: { mimeType: 'image/png', bytes: 'iVBORw0KAA==' } },
+      ],
+    },
+  };
+  await backend.handle(task, collect().emit, NEVER);
+  const child = fake.lastChild()!;
+  const env = JSON.parse(child.stdinPayload.trim()) as {
+    message: {
+      content: Array<{
+        type: string;
+        text?: string;
+        source?: { type: string; media_type: string; data: string };
+      }>;
+    };
+  };
+  assert.equal(env.message.content.length, 2);
+  assert.equal(env.message.content[0].type, 'text');
+  assert.equal(env.message.content[1].type, 'image');
+  assert.equal(env.message.content[1].source!.type, 'base64');
+  assert.equal(env.message.content[1].source!.media_type, 'image/png');
+  assert.equal(env.message.content[1].source!.data, 'iVBORw0KAA==');
+});
+
+test('stdin envelope: PDF FilePart maps to document content block', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const task: TaskAssignFrame = {
+    type: 'task.assign',
+    taskId: 't',
+    contextId: 'c',
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [{ kind: 'file', file: { mimeType: 'application/pdf', bytes: 'JVBERi0K' } }],
+    },
+  };
+  await backend.handle(task, collect().emit, NEVER);
+  const child = fake.lastChild()!;
+  const env = JSON.parse(child.stdinPayload.trim()) as {
+    message: {
+      content: Array<{
+        type: string;
+        source?: { media_type: string; data: string };
+      }>;
+    };
+  };
+  assert.equal(env.message.content.length, 1);
+  assert.equal(env.message.content[0].type, 'document');
+  assert.equal(env.message.content[0].source!.media_type, 'application/pdf');
+  assert.equal(env.message.content[0].source!.data, 'JVBERi0K');
+});
+
+test('passes expected argv shape (stream-json, session-id, verbose, extraArgs)', async () => {
   const fake = makeFakeSpawn((child) => {
     setImmediate(() => {
       child.emitStdout(JSON.stringify({ type: 'result', result: 'ok' }) + '\n');
@@ -309,16 +481,24 @@ test('passes expected argv shape (prompt, session-id, stream-json, verbose, extr
   const child = fake.lastChild();
   assert.ok(child);
   assert.equal(child.command, 'claude');
-  assert.deepEqual(child.args.slice(0, 2), ['-p', 'hi']);
+  // First positional flag is `-p` with no inline prompt — input now arrives
+  // via stdin instead of argv.
+  assert.equal(child.args[0], '-p');
+  // The prompt text must NOT appear as the second arg (it's on stdin only).
+  assert.notEqual(child.args[1], 'hi');
+
+  const inFmtIdx = child.args.indexOf('--input-format');
+  assert.ok(inFmtIdx !== -1, 'expected --input-format flag');
+  assert.equal(child.args[inFmtIdx + 1], 'stream-json');
+
+  const outFmtIdx = child.args.indexOf('--output-format');
+  assert.ok(outFmtIdx !== -1);
+  assert.equal(child.args[outFmtIdx + 1], 'stream-json');
+  assert.ok(child.args.includes('--verbose'));
 
   const sidIdx = child.args.indexOf('--session-id');
   assert.ok(sidIdx !== -1);
   assert.match(String(child.args[sidIdx + 1]), /^[0-9a-f-]{36}$/i);
-
-  const fmtIdx = child.args.indexOf('--output-format');
-  assert.ok(fmtIdx !== -1);
-  assert.equal(child.args[fmtIdx + 1], 'stream-json');
-  assert.ok(child.args.includes('--verbose'));
 
   assert.equal(child.args.at(-2), '--model');
   assert.equal(child.args.at(-1), 'sonnet');
@@ -391,8 +571,6 @@ test('keeps independent sessions for distinct contextIds', async () => {
   const sidB = String(fake.lastChild()!.args[fake.lastChild()!.args.indexOf('--session-id') + 1]);
 
   assert.notEqual(sidA, sidB);
-  // Neither should have used --resume since each contextId is fresh.
-  // (We checked the most recent child; checking both individually is overkill.)
 });
 
 test('expires the session binding past sessionTtlMs and starts fresh', async () => {
@@ -501,4 +679,159 @@ test('coalesces split stdout chunks (partial line across data events)', async ()
   const artifacts = frames.filter((f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact');
   assert.equal(artifacts.length, 1);
   assert.equal(textOf(artifacts[0]), 'split');
+});
+
+test('emits FilePart artifact when tool_result contains an image block', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              tool_use_id: 'tu_1',
+              type: 'tool_result',
+              content: [
+                {
+                  type: 'image',
+                  source: { type: 'base64', media_type: 'image/png', data: 'AAAAB' },
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      JSON.stringify({ type: 'result', result: 'done' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('x'), emit, NEVER);
+
+  const fileArtifact = frames.find(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
+      f.type === 'task.artifact' && f.artifact.parts[0]?.kind === 'file',
+  );
+  assert.ok(fileArtifact, 'expected a FilePart artifact for tool_result image');
+  const part = fileArtifact.artifact.parts[0];
+  assert.equal(part.kind, 'file');
+  if (part.kind === 'file') {
+    assert.equal(part.file.mimeType, 'image/png');
+    assert.equal(part.file.bytes, 'AAAAB');
+  }
+});
+
+test('send_file MCP: server is registered on first task and a registered handle receives invoked artifacts', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-sendfile-test-'));
+  const realRoot = await fs.realpath(root);
+  await fs.writeFile(path.join(realRoot, 'note.txt'), 'note body');
+
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    sendFileMcp: { allowedRoots: [realRoot], skipHttp: true },
+  });
+
+  // Drive a task. After it ends, the MCP server must be running and have
+  // released the task slot. We then exercise the tool path directly.
+  await backend.handle(assign('x'), collect().emit, NEVER);
+  const server = backend.getSendFileMcpServer();
+  assert.ok(server, 'send_file MCP server should be running after the first task');
+  assert.equal(server.activeTaskCount(), 0, 'task slot must release at terminal time');
+
+  // argv must include --mcp-config with the running server's URL.
+  const child = fake.lastChild();
+  assert.ok(child);
+  const cfgIdx = child.args.indexOf('--mcp-config');
+  assert.ok(cfgIdx !== -1, 'expected --mcp-config when sendFileMcp is enabled');
+  const cfg = JSON.parse(String(child.args[cfgIdx + 1])) as {
+    mcpServers: Record<string, { type: string; url: string }>;
+  };
+  assert.equal(cfg.mcpServers['vicoop-bridge'].type, 'http');
+  assert.equal(cfg.mcpServers['vicoop-bridge'].url, server.url);
+
+  // Re-register a synthetic handle to check the routing reaches the handle's
+  // emit (the lifecycle inside handle() already ran and released).
+  const captured: Array<{ artifactId: string; name: string }> = [];
+  const release = server.registerActiveTask({
+    taskId: 'manual',
+    contextId: 'ctx-manual',
+    emit: (artifact) => {
+      captured.push({ artifactId: artifact.artifactId, name: artifact.name });
+    },
+  });
+  try {
+    const result = await server.invokeSendFileForTest({
+      path: path.join(realRoot, 'note.txt'),
+    });
+    assert.equal(result.ok, true);
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0].name, 'send-file');
+  } finally {
+    release.release();
+    await server.close();
+    await fs.rm(realRoot, { recursive: true, force: true });
+  }
+});
+
+test('send_file MCP: tool call landing during an in-flight task emits a task.artifact frame', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-sendfile-inflight-'));
+  const realRoot = await fs.realpath(root);
+  await fs.writeFile(path.join(realRoot, 'doc.txt'), 'inflight');
+
+  // Hold the task open until we have invoked send_file on the registered slot.
+  let releaseProcess: () => void = () => {};
+  const ready = new Promise<void>((resolve) => {
+    releaseProcess = resolve;
+  });
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(async () => {
+      // Wait until the test signals us to finish.
+      await ready;
+      child.emitStdout(JSON.stringify({ type: 'result', result: 'ok' }) + '\n');
+      setImmediate(() => child.finish(0));
+    });
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    sendFileMcp: { allowedRoots: [realRoot], skipHttp: true },
+  });
+  const { emit, frames } = collect();
+
+  const runP = backend.handle(assign('x'), emit, NEVER);
+
+  // Wait for ensureSendFileMcp + registerActiveTask to land before invoking.
+  for (let i = 0; i < 20; i++) {
+    if (backend.getSendFileMcpServer()?.activeTaskCount() === 1) break;
+    await new Promise((r) => setImmediate(r));
+  }
+  const server = backend.getSendFileMcpServer();
+  assert.ok(server);
+  assert.equal(server.activeTaskCount(), 1, 'task slot must register during handle()');
+
+  const result = await server.invokeSendFileForTest({
+    path: path.join(realRoot, 'doc.txt'),
+  });
+  assert.equal(result.ok, true);
+
+  // Now let the child exit so handle() resolves.
+  releaseProcess();
+  await runP;
+
+  const fileArtifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
+      f.type === 'task.artifact' && f.artifact.parts[0]?.kind === 'file',
+  );
+  assert.equal(fileArtifacts.length, 1);
+  const part = fileArtifacts[0].artifact.parts[0];
+  if (part.kind !== 'file') throw new Error('expected file part');
+  assert.equal(Buffer.from(part.file.bytes!, 'base64').toString('utf8'), 'inflight');
+
+  await server.close();
+  await fs.rm(realRoot, { recursive: true, force: true });
 });
