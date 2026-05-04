@@ -4,6 +4,13 @@ import { promisify } from 'node:util';
 import WebSocket from 'ws';
 import type { Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import {
+  inferMimeFromPath,
+  parseBridgeAttachMarkers,
+  readBoundedFileWithinRoots,
+  SafeReadError,
+  stripMarkersForPath,
+} from './file-attach.js';
 import { clientVersion } from '../version.js';
 
 const execFileP = promisify(execFile);
@@ -331,18 +338,21 @@ class GatewayClient {
 }
 
 // Map A2A message parts to OpenClaw's `chat.send` input shape
-// (`message` + `attachments`). The gateway accepts image attachments via
-// `{ type, mimeType, fileName, content }` where `content` is a base64
-// string; non-image MIME types are dropped with a warning inside OpenClaw,
-// and there is no native surface for structured data or remote URIs.
+// (`message` + `attachments`). The gateway accepts attachments as
+// `{ type, mimeType, fileName, content }` where `content` is base64 and
+// `type` is a label-only field (the real routing decision is mime-based).
 //
-// Rather than silently drop non-text parts (the prior behavior), we reject
-// anything we can't represent so callers see a specific error code
-// instead of a lossy request.
+// OpenClaw >= v2026.4.27 accepts non-image attachments and offloads them to
+// `media://inbound/<id>` for the agent to read via Read/Bash. Older gateways
+// reject non-image mimes server-side; we do not pre-filter here because the
+// rejection should be surfaced as a gateway error, not silently swallowed.
+//
+// Out of scope: `file.uri` (requires fetching with caller auth) and
+// `kind: 'data'` (no structured-input surface on OpenClaw).
 interface OpenclawChatInput {
   message: string;
   attachments: Array<{
-    type: 'image';
+    type: 'image' | 'file';
     mimeType: string;
     fileName?: string;
     content: string;
@@ -354,7 +364,7 @@ interface PartMappingError {
   message: string;
 }
 
-function isImageMime(mime: string | undefined): mime is string {
+function isImageMime(mime: string | undefined): boolean {
   return typeof mime === 'string' && mime.toLowerCase().startsWith('image/');
 }
 
@@ -392,17 +402,20 @@ export function mapPartsToChatInput(
           },
         };
       }
-      if (!isImageMime(f.mimeType)) {
+      // mimeType is required so the gateway can sniff/route correctly.
+      // Without it, OpenClaw's mime-resolution falls back to label-derived
+      // guessing which is unreliable for arbitrary callers.
+      if (typeof f.mimeType !== 'string' || f.mimeType.length === 0) {
         return {
           ok: false,
           error: {
-            code: 'unsupported_file_mime',
-            message: `part[${idx}]: only image/* mimeTypes are supported by the openclaw backend (got ${f.mimeType ?? 'unset'})`,
+            code: 'invalid_file_part',
+            message: `part[${idx}]: file.mimeType is required`,
           },
         };
       }
       attachments.push({
-        type: 'image',
+        type: isImageMime(f.mimeType) ? 'image' : 'file',
         mimeType: f.mimeType,
         ...(f.name !== undefined ? { fileName: f.name } : {}),
         content: f.bytes,
@@ -449,6 +462,25 @@ function extractFinalText(message: unknown): string {
   return '';
 }
 
+export interface OpenclawAttachOutputsOptions {
+  /**
+   * Operator-controlled roots within which the agent may reference files
+   * for caller delivery via `[bridge-attach: <path>]` markers in assistant
+   * messages. Each path is canonicalized via realpath() and the resolved
+   * file must be a subpath of one of the canonicalized roots.
+   *
+   * If omitted or empty, the feature is disabled and markers in agent
+   * output are passed through as plain text.
+   */
+  allowedRoots: string[];
+  /**
+   * Per-attachment size cap. Default 20 MiB to mirror OpenClaw's default
+   * inbound media cap. Files larger than this are skipped and the marker
+   * is left in the artifact text so the operator can debug.
+   */
+  maxBytes?: number;
+}
+
 export interface OpenclawBackendOptions {
   url?: string;
   token?: string;
@@ -466,7 +498,20 @@ export interface OpenclawBackendOptions {
    * Primarily for testing.
    */
   discoverGatewayUrls?: () => Promise<string[]>;
+  /**
+   * Enable agent->caller file delivery. When set, assistant messages are
+   * scanned for `[bridge-attach: <path>]` markers and matching files
+   * (under `allowedRoots`, bounded by `maxBytes`) are emitted as A2A
+   * `FilePart`s alongside the message text.
+   *
+   * Off by default. The bridge-client and OpenClaw are assumed to be
+   * co-located on the same host; this disk-share pattern does not work
+   * across hosts.
+   */
+  attachOutputs?: OpenclawAttachOutputsOptions;
 }
+
+const DEFAULT_ATTACH_OUTPUTS_MAX_BYTES = 20 * 1024 * 1024;
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10 * 1000;
@@ -686,6 +731,13 @@ export function createOpenclawBackend(
     DEFAULT_HANDSHAKE_TIMEOUT_MS,
     'handshakeTimeoutMs',
   );
+  const attachOutputs =
+    opts.attachOutputs && opts.attachOutputs.allowedRoots.length > 0
+      ? {
+          allowedRoots: opts.attachOutputs.allowedRoots,
+          maxBytes: opts.attachOutputs.maxBytes ?? DEFAULT_ATTACH_OUTPUTS_MAX_BYTES,
+        }
+      : null;
 
   let current: GatewayClient | null = null;
   let connecting: Promise<GatewayClient> | null = null;
@@ -771,6 +823,64 @@ export function createOpenclawBackend(
   const discover =
     opts.discoverGatewayUrls ??
     (() => discoverLocalGatewayUrls(discoveryProcessName, resolvedUrl));
+
+  // Convert an assistant-message text into A2A Parts, optionally pulling in
+  // files referenced by `[bridge-attach: <path>]` markers under
+  // `attachOutputs.allowedRoots`. Returns:
+  //   - parts: what to put inside an emitted task.artifact (or task.complete
+  //     status.message). Includes the (possibly cleaned) text part plus a
+  //     FilePart per successfully-read marker.
+  //   - cleanedText: the text with successful markers stripped — used as the
+  //     canonical text in task.complete.status.message so the user-visible
+  //     "final assistant message" doesn't echo on-disk paths.
+  //
+  // Failed reads (path outside roots, too large, missing, etc.) are
+  // non-fatal: the marker is left visible in the text and a warning is
+  // logged. The agent's intent is preserved for debugging without crashing
+  // the run.
+  async function processAssistantText(
+    text: string,
+  ): Promise<{ parts: Part[]; cleanedText: string }> {
+    if (!attachOutputs || text.length === 0) {
+      return { parts: [{ kind: 'text', text }], cleanedText: text };
+    }
+    const parsed = parseBridgeAttachMarkers(text);
+    if (parsed.paths.length === 0) {
+      return { parts: [{ kind: 'text', text }], cleanedText: text };
+    }
+    let cleanedText = text;
+    const fileParts: Part[] = [];
+    for (const p of parsed.paths) {
+      try {
+        const read = await readBoundedFileWithinRoots({
+          filePath: p,
+          allowedRoots: attachOutputs.allowedRoots,
+          maxBytes: attachOutputs.maxBytes,
+        });
+        const mimeType = inferMimeFromPath(read.realPath);
+        fileParts.push({
+          kind: 'file',
+          file: {
+            name: read.realPath.split('/').pop() ?? p,
+            mimeType,
+            bytes: read.buffer.toString('base64'),
+          },
+        });
+        cleanedText = stripMarkersForPath(cleanedText, parsed, p);
+      } catch (err) {
+        const code = err instanceof SafeReadError ? err.code : 'read-failed';
+        console.warn(
+          `[openclaw] bridge-attach skipped (${code}) for ${p}: ${(err as Error).message}`,
+        );
+        // Marker stays in cleanedText so the operator can debug what the
+        // agent tried to send.
+      }
+    }
+    const parts: Part[] = [];
+    if (cleanedText.length > 0) parts.push({ kind: 'text', text: cleanedText });
+    parts.push(...fileParts);
+    return { parts, cleanedText };
+  }
 
   async function connectAt(candidateUrl: string, hsTimeoutMs: number): Promise<GatewayClient> {
     const c = new GatewayClient(candidateUrl, token, hsTimeoutMs);
@@ -1038,6 +1148,11 @@ export function createOpenclawBackend(
       let emittedAnyArtifact = false;
       const seenAssistantMessageIds = new Set<string>();
       let sessionMessageSettled = false;
+      // Per-task FIFO promise chain. processAssistantText may do file I/O
+      // (when attachOutputs is enabled) which means handler invocations
+      // race in the microtask queue — chaining serializes them so artifacts
+      // emit in the order their session.message events arrived.
+      let processingTail: Promise<void> = Promise.resolve();
 
       const onSessionMessage = (p: SessionMessageEventPayload): void => {
         if (sessionMessageSettled) return;
@@ -1055,21 +1170,36 @@ export function createOpenclawBackend(
         }
         const artifactText = extractFinalText(msg);
         if (!artifactText) return;
-        emit({
-          type: 'task.artifact',
-          taskId: task.taskId,
-          artifact: {
-            artifactId: randomUUID(),
-            name: 'openclaw-message',
-            parts: [{ kind: 'text', text: artifactText }],
-          },
-          // Each message is a self-contained artifact (option (b) in the
-          // design discussion): distinct artifactId, complete on emission.
-          // The end-of-run signal is carried by task.complete, not by any
-          // individual artifact.
-          lastChunk: true,
-        });
-        emittedAnyArtifact = true;
+        processingTail = processingTail
+          .then(async () => {
+            // Re-check under the chain in case settle landed between the
+            // sync check above and our turn on the queue (e.g. terminal
+            // chat event drained ahead of us).
+            if (sessionMessageSettled) return;
+            const { parts } = await processAssistantText(artifactText);
+            if (parts.length === 0) return;
+            emit({
+              type: 'task.artifact',
+              taskId: task.taskId,
+              artifact: {
+                artifactId: randomUUID(),
+                name: 'openclaw-message',
+                parts,
+              },
+              // Each message is a self-contained artifact (option (b) in the
+              // design discussion): distinct artifactId, complete on emission.
+              // The end-of-run signal is carried by task.complete, not by any
+              // individual artifact.
+              lastChunk: true,
+            });
+            emittedAnyArtifact = true;
+          })
+          .catch((err: unknown) => {
+            console.error(
+              '[openclaw] session.message processing failed:',
+              (err as Error).message,
+            );
+          });
       };
 
       // First task on this sessionKey wins streaming ownership. A concurrent
@@ -1208,6 +1338,13 @@ export function createOpenclawBackend(
 
         const result = await settled;
 
+        // Drain any in-flight session.message processing (file reads from
+        // attachOutputs may still be running) before declaring the stream
+        // settled. This preserves the original ordering guarantee that
+        // every queued message-artifact emits BEFORE task.complete, even
+        // when async file I/O extends the per-message turnaround.
+        await processingTail;
+
         // Close the streaming gate before any terminal emit. Any
         // `session.message` that arrives from this point on (e.g. a
         // transcript write that races with the final event) must not
@@ -1268,19 +1405,23 @@ export function createOpenclawBackend(
         }
 
         const text2 = extractFinalText(result.message);
-        const parts: Part[] = [{ kind: 'text', text: text2 }];
+        const { parts: finalArtifactParts, cleanedText } = await processAssistantText(text2);
         // Only emit the final-result artifact when streaming produced
         // nothing — otherwise each assistant message already went out as its
-        // own artifact and re-emitting the final text here would be a
-        // redundant copy of the last one. task.complete still carries the
-        // final message in status.message, which is how A2A conventionally
-        // stamps the terminal content anyway.
-        if (!emittedAnyArtifact) {
+        // own artifact (with its own bridge-attach files) and re-emitting
+        // the final text here would be a redundant copy of the last one.
+        // task.complete still carries the final text in status.message,
+        // which is how A2A conventionally stamps the terminal content
+        // anyway. File parts are intentionally NOT duplicated into
+        // status.message: streaming or non-streaming, files are delivered
+        // via task.artifact frames, not by re-encoding the same bytes into
+        // the terminal message.
+        if (!emittedAnyArtifact && finalArtifactParts.length > 0) {
           const artifactId = randomUUID();
           emit({
             type: 'task.artifact',
             taskId: task.taskId,
-            artifact: { artifactId, name: 'openclaw-result', parts },
+            artifact: { artifactId, name: 'openclaw-result', parts: finalArtifactParts },
             lastChunk: true,
           });
         }
@@ -1293,7 +1434,7 @@ export function createOpenclawBackend(
             message: {
               role: 'agent',
               messageId: randomUUID(),
-              parts,
+              parts: [{ kind: 'text', text: cleanedText }],
             },
           },
         });
