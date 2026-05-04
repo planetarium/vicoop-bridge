@@ -187,6 +187,13 @@ test('start with port:0 and host:127.0.0.1 binds an HTTP listener exposing /mcp'
     // is exercised by the e2e harness; here we only confirm the bind.
     const res = await fetch(`http://127.0.0.1:${server.port}/not-mcp`);
     assert.equal(res.status, 404);
+    // Tightened path guard: `/mcp2` must NOT match `/mcp` (the old
+    // startsWith check did).
+    const sibling = await fetch(`http://127.0.0.1:${server.port}/mcp2`);
+    assert.equal(sibling.status, 404);
+    // A subpath like `/mcp/extra` is also not the single MCP endpoint.
+    const sub = await fetch(`http://127.0.0.1:${server.port}/mcp/extra`);
+    assert.equal(sub.status, 404);
   } finally {
     await server.close();
   }

@@ -277,8 +277,11 @@ export async function startSendFileMcpServer(
   if (!opts.skipHttp) {
     httpServer = createHttpServer((req, res) => {
       // Single MCP endpoint. Reject anything else fast so we don't expose
-      // unintended surfaces (e.g. /).
-      if (!req.url || !req.url.startsWith('/mcp')) {
+      // unintended surfaces. Strict pathname match (`/mcp` exactly, with
+      // an optional querystring) — the previous `startsWith('/mcp')` also
+      // matched `/mcp2`, `/mcp-anything`, etc.
+      const pathname = req.url ? req.url.split('?', 1)[0] : '';
+      if (pathname !== '/mcp') {
         res.statusCode = 404;
         res.end('not found');
         return;
