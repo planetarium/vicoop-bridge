@@ -279,6 +279,19 @@ async function readWithRoots(params: {
     if (!stat.isFile()) {
       throw new SafeReadError('not-file', `opened path is not a regular file: ${realPath}`);
     }
+    // Cross-platform symlink TOCTOU defense: compare device + inode of the
+    // opened descriptor against the lstat we did before open. On POSIX
+    // O_NOFOLLOW already blocks a terminal-component symlink swap; on
+    // win32 (where O_NOFOLLOW is unavailable) this identity check is the
+    // only thing standing between us and a swapped-in symlink. Defense
+    // in depth on POSIX too. Mismatched dev/ino means the path resolved
+    // to a different file at open time than at lstat time.
+    if (stat.dev !== lstat.dev || stat.ino !== lstat.ino) {
+      throw new SafeReadError(
+        'symlink',
+        `path identity changed between stat and open (possible symlink swap): ${realPath}`,
+      );
+    }
     if (stat.nlink > 1) {
       throw new SafeReadError(
         'hardlink',

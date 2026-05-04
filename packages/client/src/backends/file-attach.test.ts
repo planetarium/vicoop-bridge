@@ -200,6 +200,23 @@ test('readBoundedFileWithinRoots: oversized file rejected with too-large', async
   );
 });
 
+test('readBoundedFileWithinRoots: regular file with stable dev/ino passes identity check (path-swap detector does not false-positive)', async () => {
+  // Smoke test for the cross-platform symlink TOCTOU defense: a normal
+  // file should pass through (dev+ino at fstat == dev+ino at lstat).
+  // Real swap simulation requires racing fs operations and is left to
+  // platform-specific fuzz coverage; this catches a regression where
+  // the identity comparison itself becomes spurious.
+  const root = await tmpDir();
+  const file = path.join(root, 'stable.txt');
+  await fs.writeFile(file, 'stable');
+  const r = await readBoundedFileWithinRoots({
+    filePath: file,
+    allowedRoots: [root],
+    maxBytes: 1024,
+  });
+  assert.equal(r.buffer.toString('utf8'), 'stable');
+});
+
 test('readBoundedFileWithinRoots: bounded read returns the actual byte count even if file shrinks between stat and read', async () => {
   // The size returned should reflect what was actually read, not the
   // (possibly stale) stat.size. This also confirms we are using a
