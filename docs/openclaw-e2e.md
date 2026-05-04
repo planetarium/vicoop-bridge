@@ -225,6 +225,77 @@ paths"). Pull a newer tag.
 > gateway container's network namespace via `--network container:…`
 > and connects through `127.0.0.1` from inside.
 
+## Outbound attachment verification (agent → caller)
+
+A fourth exercise at
+`packages/client/scripts/e2e-openclaw-attach-outputs.mjs` verifies the
+opposite direction: bridge-client parses `[bridge-attach: <path>]`
+markers in real assistant messages, reads the referenced file from
+disk, and emits it as an A2A FilePart artifact alongside the cleaned
+text.
+
+The script:
+
+- writes a fixture at `/tmp/attach-test/hello.txt` (sidecar-private —
+  the gateway never sees it; markers are pure text in the chat
+  transcript),
+- configures bridge-client with `attachOutputs.allowedRoots: ['/tmp/attach-test']`,
+- prompts the model to reply with EXACTLY `[bridge-attach: <fixture-path>]`,
+- asserts that the resulting artifact carries a FilePart whose decoded
+  bytes equal the fixture content, the filename matches, and the
+  marker is stripped from the text part.
+
+Unlike the file-passthrough exercise, this one needs a working agent
+provider so the model actually replies. Cheapest setup is an
+Anthropic API key + `anthropic/claude-sonnet-4-6`:
+
+```bash
+mkdir -p /tmp/oc-build-anthropic
+cat > /tmp/oc-build-anthropic/Dockerfile << 'EOF'
+FROM ghcr.io/openclaw/openclaw:latest
+USER root
+RUN mkdir -p /home/node/.openclaw && \
+    printf '%s' '{"gateway":{"auth":{"mode":"none"}},"agents":{"defaults":{"model":{"primary":"anthropic/claude-sonnet-4-6"}}}}' \
+      > /home/node/.openclaw/openclaw.json && \
+    chown -R node:node /home/node/.openclaw
+USER node
+EOF
+docker build -t oc-e2e-anthropic /tmp/oc-build-anthropic
+
+docker run -d --name openclaw-e2e \
+  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  oc-e2e-anthropic \
+  node openclaw.mjs gateway --allow-unconfigured --bind loopback
+
+# wait for "[gateway] ready"
+
+docker run --rm \
+  --network container:openclaw-e2e \
+  -v "$PWD":/w -w /w/packages/client \
+  -e DEBUG=1 \
+  node:20 \
+  node ./scripts/e2e-openclaw-attach-outputs.mjs
+```
+
+Expected tail (sonnet-4-6 will echo the marker exactly given the
+"reply with EXACTLY" framing):
+
+```
+[frame +Xms] task.artifact artifact id=… name=openclaw-result parts=[file]
+[frame +Xms] task.complete complete state=completed
+[e2e] PASS: terminal frame is task.complete with state=completed
+[e2e] PASS: at least one FilePart artifact emitted
+[e2e] PASS: FilePart bytes match fixture
+[e2e] PASS: FilePart name is fixture basename
+[e2e] PASS: marker stripped from artifact text on success
+```
+
+Costs roughly one short Claude call per run (a few cents). Mounting a
+real `auth-profiles.json` from the host instead of using
+`ANTHROPIC_API_KEY` works too, but mind that OAuth-based providers
+(e.g. `openai-codex`) may fail to refresh from inside a container with
+restricted network paths — the API-key route is the most reliable.
+
 ## Teardown
 
 ```bash
