@@ -317,26 +317,28 @@ The script:
 - asserts the resulting artifact carries `name="send-file"` (the MCP
   tool path tag) and the FilePart bytes equal the fixture content.
 
-The OpenClaw image must be built with `mcp.servers.send-file`
-configured to match the bridge-client's MCP URL:
+Setup uses the stock OpenClaw image and the canonical
+`openclaw mcp set` CLI to register the bridge-client MCP server —
+matching how operators add MCP servers in production. The startup
+shell writes a minimal config (auth + model), runs `openclaw mcp set`
+to add the `send-file` server, then execs the gateway:
 
 ```bash
-mkdir -p /tmp/oc-build-sendfile
-cat > /tmp/oc-build-sendfile/Dockerfile << 'EOF'
-FROM ghcr.io/openclaw/openclaw:latest
-USER root
-RUN mkdir -p /home/node/.openclaw && \
-    printf '%s' '{"gateway":{"auth":{"mode":"none"}},"agents":{"defaults":{"model":{"primary":"anthropic/claude-sonnet-4-6"}}},"mcp":{"servers":{"send-file":{"url":"http://127.0.0.1:19090/mcp","transport":"streamable-http"}}}}' \
-      > /home/node/.openclaw/openclaw.json && \
-    chown -R node:node /home/node/.openclaw
-USER node
-EOF
-docker build -t oc-e2e-sendfile-img /tmp/oc-build-sendfile
-
 docker run -d --name openclaw-e2e \
   -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-  oc-e2e-sendfile-img \
-  node openclaw.mjs gateway --allow-unconfigured --bind loopback
+  --entrypoint /bin/sh \
+  ghcr.io/openclaw/openclaw:latest \
+  -c '
+    set -e
+    mkdir -p /home/node/.openclaw
+    printf "%s" "{\"gateway\":{\"auth\":{\"mode\":\"none\"}},\"agents\":{\"defaults\":{\"model\":{\"primary\":\"anthropic/claude-sonnet-4-6\"}}}}" \
+      > /home/node/.openclaw/openclaw.json
+    cd /app
+    node openclaw.mjs mcp set send-file \
+      "{\"url\":\"http://127.0.0.1:19090/mcp\",\"transport\":\"streamable-http\"}"
+    exec docker-entrypoint.sh node openclaw.mjs gateway \
+      --allow-unconfigured --bind loopback
+  '
 
 # wait for "[gateway] ready"
 
@@ -347,6 +349,16 @@ docker run --rm \
   node:20 \
   node ./scripts/e2e-openclaw-send-file.mjs
 ```
+
+In production the same registration is a one-shot operator step:
+
+```bash
+openclaw mcp set send-file \
+  '{"url":"http://127.0.0.1:19090/mcp","transport":"streamable-http"}'
+```
+
+The CLI persists the entry into `~/.openclaw/openclaw.json`'s
+`mcp.servers.send-file`, picked up at the next gateway boot.
 
 Expected tail:
 
