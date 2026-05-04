@@ -212,9 +212,10 @@ export function createBoundedFileReader(opts: {
  *      that is also reachable via an outside-root path the operator doesn't
  *      see. Reject so the model cannot use hardlinks to smuggle paths.
  *   6. fstat().size <= maxBytes — initial bound on the per-attachment payload.
- *   7. Bounded read up to maxBytes + 1 — detect a file that grows between
- *      stat and read so a TOCTOU inflation cannot push the in-memory buffer
- *      past the cap.
+ *   7. Bounded read up to fstat().size + 1 — allocate exactly the claimed
+ *      file size + one extra byte. Reading into that +1 slot signals the
+ *      file grew between stat and read, so we reject before the in-memory
+ *      buffer can exceed the size we already validated against maxBytes.
  *
  * For repeated reads under the same roots, prefer `createBoundedFileReader`
  * which caches the canonicalization.
@@ -233,10 +234,14 @@ export async function readBoundedFileWithinRoots(params: {
 }
 
 // Programmer-error guard: maxBytes is operator config, not user input.
-// Buffer.alloc(maxBytes + 1) deep inside readWithRoots would throw a
-// RangeError for negative or non-finite values, bypassing the SafeReadError
-// codes the caller is shaped to handle. Validate at the public boundaries
-// so misconfiguration fails loudly at startup, not on the first read.
+// A negative or non-finite value would otherwise produce nonsensical
+// comparisons inside readWithRoots — `stat.size > NaN` is always false, so
+// a misconfigured cap would silently let oversize files through; a
+// negative cap would reject every file with too-large; and feeding either
+// to `Buffer.alloc` would throw a RangeError that bypasses the
+// SafeReadError codes callers are shaped to handle. Validate at the public
+// boundaries so misconfiguration fails loudly at startup, not on the
+// first read.
 function assertMaxBytes(maxBytes: number): void {
   if (typeof maxBytes !== 'number' || !Number.isFinite(maxBytes) || maxBytes < 0) {
     throw new RangeError(

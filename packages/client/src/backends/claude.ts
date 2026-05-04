@@ -542,6 +542,7 @@ export function createClaudeBackend(
           //   2. echo dedup — a tool_result whose decoded bytes match an
           //      inbound FilePart (e.g. the model Read the caller's image)
           //      would re-emit the same payload back. Drop those.
+          const dedupActive = mapped.inboundHashes.size > 0;
           const parts = extractToolResultMediaParts(evt.message?.content).filter((p) => {
             if (p.kind !== 'file' || !p.file.bytes) return true;
             const decodedSize = decodedBase64Size(p.file.bytes);
@@ -551,6 +552,10 @@ export function createClaudeBackend(
               );
               return false;
             }
+            // Skip the hash when there are no inbound files to dedup against.
+            // The hash decodes the full base64 (up to 5 MiB) and would burn
+            // CPU/memory on every tool_result image for no possible match.
+            if (!dedupActive) return true;
             return !mapped.inboundHashes.has(sha256OfBase64(p.file.bytes));
           });
           emitToolResultMedia(parts);
