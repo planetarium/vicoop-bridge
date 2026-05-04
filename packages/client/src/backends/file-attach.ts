@@ -325,27 +325,30 @@ async function readWithRoots(params: {
         `file exceeds maxBytes (${stat.size} > ${params.maxBytes}): ${realPath}`,
       );
     }
-    // Bounded read: cap allocation at maxBytes + 1 so a file that grew
-    // between fstat and readFile (TOCTOU) is detected and rejected
-    // instead of silently inflating the in-memory buffer beyond
-    // maxBytes. We read until EOF or the cap+1-th byte appears.
-    const cap = params.maxBytes;
-    const buf = Buffer.alloc(cap + 1);
+    // Bounded read sized to the file's claimed length, not maxBytes. Earlier
+    // we already proved `stat.size <= maxBytes`, so allocating `stat.size +
+    // 1` bytes:
+    //   - keeps small files small (a 4 KiB note doesn't burn a 20 MiB Buffer)
+    //   - still detects growth between stat and read: if the file grew, we
+    //     try to read into the +1 slot and reject. `cap + 1` allocation was
+    //     forcing the worst case on every call regardless of actual size.
+    const claimedSize = stat.size;
+    const buf = Buffer.alloc(claimedSize + 1);
     let totalRead = 0;
-    while (totalRead < cap + 1) {
+    while (totalRead < claimedSize + 1) {
       const { bytesRead } = await handle.read(
         buf,
         totalRead,
-        cap + 1 - totalRead,
+        claimedSize + 1 - totalRead,
         totalRead,
       );
       if (bytesRead === 0) break; // EOF
       totalRead += bytesRead;
     }
-    if (totalRead > cap) {
+    if (totalRead > claimedSize) {
       throw new SafeReadError(
         'too-large',
-        `file exceeds maxBytes during read (>${cap} bytes, file grew between stat and read): ${realPath}`,
+        `file grew between stat and read (claimed ${claimedSize}, read at least ${totalRead}): ${realPath}`,
       );
     }
     return { buffer: buf.subarray(0, totalRead), realPath, size: totalRead };
