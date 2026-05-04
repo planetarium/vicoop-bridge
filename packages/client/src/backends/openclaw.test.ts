@@ -1,8 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 import WebSocket, { WebSocketServer } from 'ws';
 
 // Bind a net server to an ephemeral port, record the port, then close the
@@ -912,14 +915,17 @@ test('mapPartsToChatInput: file.uri is rejected explicitly instead of silently d
   assert.match(result.error.message, /part\[0\]/);
 });
 
-test('mapPartsToChatInput: non-image file mime is rejected', () => {
+test('mapPartsToChatInput: non-image file maps to a generic file attachment (OpenClaw >= v2026.4.27 offloads to media://inbound/<id>)', () => {
   const result = mapPartsToChatInput([
-    { kind: 'file', file: { mimeType: 'application/pdf', bytes: 'CCCC' } },
+    { kind: 'text', text: 'summarize' },
+    { kind: 'file', file: { name: 'report.pdf', mimeType: 'application/pdf', bytes: 'CCCC' } },
   ]);
-  assert.equal(result.ok, false);
-  if (result.ok) return;
-  assert.equal(result.error.code, 'unsupported_file_mime');
-  assert.match(result.error.message, /application\/pdf/);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.input.message, 'summarize');
+  assert.deepEqual(result.input.attachments, [
+    { type: 'file', mimeType: 'application/pdf', fileName: 'report.pdf', content: 'CCCC' },
+  ]);
 });
 
 test('mapPartsToChatInput: missing both bytes and uri is rejected', () => {
@@ -929,6 +935,16 @@ test('mapPartsToChatInput: missing both bytes and uri is rejected', () => {
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.equal(result.error.code, 'invalid_file_part');
+});
+
+test('mapPartsToChatInput: missing mimeType is rejected (gateway needs it for sniff/route)', () => {
+  const result = mapPartsToChatInput([
+    { kind: 'file', file: { name: 'blob.bin', bytes: 'DDDD' } },
+  ]);
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, 'invalid_file_part');
+  assert.match(result.error.message, /mimeType/);
 });
 
 test('mapPartsToChatInput: data part is rejected since OpenClaw has no structured input surface', () => {
@@ -997,6 +1013,69 @@ test('handle(): image file part is forwarded to chat.send as attachments', async
     assert.equal(params.message, 'what is in this image?');
     assert.deepEqual(params.attachments, [
       { type: 'image', mimeType: 'image/png', fileName: 'cat.png', content: 'AAAA' },
+    ]);
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete);
+    assert.equal(complete!.status.state, 'completed');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('handle(): non-image file part is forwarded as a non-image attachment (OpenClaw >= v2026.4.27 will offload it)', async () => {
+  const observedParams: unknown[] = [];
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        observedParams.push(req.params);
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId: 'run-pdf', status: 'started' },
+          }),
+        );
+        setImmediate(() => {
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId: 'run-pdf',
+                sessionKey: 'agent:main:ctx-t1',
+                seq: 1,
+                state: 'final',
+                message: { text: 'pdf summarized' },
+              },
+            }),
+          );
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    const task: TaskAssignFrame = {
+      type: 'task.assign',
+      taskId: 't1',
+      contextId: 'ctx-t1',
+      message: {
+        role: 'user',
+        messageId: 'm1',
+        parts: [
+          { kind: 'text', text: 'summarize this report' },
+          { kind: 'file', file: { name: 'report.pdf', mimeType: 'application/pdf', bytes: 'CCCC' } },
+        ],
+      },
+    };
+    await backend.handle(task, (f) => frames.push(f), NEVER);
+    assert.equal(observedParams.length, 1, 'chat.send should have been issued exactly once');
+    const params = observedParams[0] as { message: string; attachments: unknown };
+    assert.equal(params.message, 'summarize this report');
+    assert.deepEqual(params.attachments, [
+      { type: 'file', mimeType: 'application/pdf', fileName: 'report.pdf', content: 'CCCC' },
     ]);
     const complete = frames.find((f) => f.type === 'task.complete');
     assert.ok(complete);
@@ -1929,6 +2008,345 @@ test('resolveCapabilities: after unknown-method verdict, subsequent handle() ski
     }
     await new Promise<void>((resolve) => wss.close(() => resolve()));
     await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// agent -> caller file delivery via [bridge-attach: <path>] markers
+// ---------------------------------------------------------------------------
+
+async function attachOutputsRoot(): Promise<string> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'openclaw-attach-test-'));
+  return await fs.realpath(dir);
+}
+
+test('attachOutputs (streaming): assistant message with bridge-attach marker emits a FilePart in the artifact', async () => {
+  const root = await attachOutputsRoot();
+  const filePath = path.join(root, 'report.pdf');
+  const content = Buffer.from('PDF-FAKE-BYTES-FOR-TEST');
+  await fs.writeFile(filePath, content);
+
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method !== 'chat.send') return;
+      const params = req.params as { sessionKey: string; idempotencyKey: string };
+      const runId = `run-${params.idempotencyKey}`;
+      sock.send(
+        JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+      );
+      setImmediate(() => {
+        fake.emitSessionMessage(sock, {
+          sessionKey: params.sessionKey,
+          messageId: 'm1',
+          message: {
+            role: 'assistant',
+            content: [
+              {
+                type: 'text',
+                text: `here is the report [bridge-attach: ${filePath}] enjoy`,
+              },
+            ],
+          },
+        });
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 1,
+          state: 'final',
+          message: { text: 'done' },
+        });
+      });
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({
+      url: fake.url,
+      attachOutputs: { allowedRoots: [root] },
+    });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t-attach-stream', 'do it'), (f) => frames.push(f), NEVER);
+
+    const artifacts = frames.filter((f) => f.type === 'task.artifact');
+    assert.equal(artifacts.length, 1, 'one streaming artifact (final not duplicated)');
+    const parts = artifacts[0].artifact.parts;
+    const textPart = parts.find((p) => p.kind === 'text');
+    const filePart = parts.find((p) => p.kind === 'file');
+    assert.ok(textPart, 'artifact must include cleaned text');
+    assert.ok(filePart, 'artifact must include the resolved file');
+    assert.equal(
+      (textPart as { kind: 'text'; text: string }).text.includes('[bridge-attach:'),
+      false,
+      'successful marker must be stripped from artifact text',
+    );
+    const f = (filePart as { kind: 'file'; file: { name?: string; mimeType?: string; bytes?: string } }).file;
+    assert.equal(f.mimeType, 'application/pdf');
+    assert.equal(f.name, 'report.pdf');
+    assert.ok(f.bytes, 'file must carry inline base64 bytes');
+    assert.equal(Buffer.from(f.bytes!, 'base64').toString('utf8'), content.toString('utf8'));
+
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete);
+    assert.equal(complete!.status.state, 'completed');
+  } finally {
+    await fake.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('attachOutputs (non-streaming): final-result artifact carries text + FilePart when streaming produced nothing', async () => {
+  const root = await attachOutputsRoot();
+  const filePath = path.join(root, 'graph.png');
+  const content = Buffer.from('PNGDATA');
+  await fs.writeFile(filePath, content);
+
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'sessions.messages.subscribe') {
+        // Simulate gateway without streaming so we exit via the final
+        // (non-streaming) artifact path.
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: false,
+            error: { code: 'unknown_method', message: 'unknown method: sessions.messages.subscribe' },
+          }),
+        );
+        return;
+      }
+      if (req.method !== 'chat.send') return;
+      const params = req.params as { sessionKey: string; idempotencyKey: string };
+      const runId = `run-${params.idempotencyKey}`;
+      sock.send(
+        JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+      );
+      setImmediate(() => {
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 1,
+          state: 'final',
+          message: { text: `done. see [bridge-attach: ${filePath}] for the chart` },
+        });
+      });
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({
+      url: fake.url,
+      attachOutputs: { allowedRoots: [root] },
+    });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t-attach-final', 'plot it'), (f) => frames.push(f), NEVER);
+
+    const artifacts = frames.filter((f) => f.type === 'task.artifact');
+    assert.equal(artifacts.length, 1);
+    const parts = artifacts[0].artifact.parts;
+    const filePart = parts.find((p) => p.kind === 'file') as
+      | { kind: 'file'; file: { mimeType?: string; bytes?: string } }
+      | undefined;
+    assert.ok(filePart, 'final artifact must include the resolved file');
+    assert.equal(filePart!.file.mimeType, 'image/png');
+    assert.equal(Buffer.from(filePart!.file.bytes!, 'base64').toString('utf8'), 'PNGDATA');
+
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete);
+    const completeText = (complete!.status.message!.parts[0] as { kind: 'text'; text: string }).text;
+    assert.equal(
+      completeText.includes('[bridge-attach:'),
+      false,
+      'task.complete status.message must also have successful marker stripped',
+    );
+  } finally {
+    await fake.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('attachOutputs: marker pointing outside allowedRoots is preserved as text and warns (no FilePart)', async () => {
+  const root = await attachOutputsRoot();
+  const outside = await attachOutputsRoot();
+  const outsideFile = path.join(outside, 'secret.txt');
+  await fs.writeFile(outsideFile, 'secret');
+
+  const warnLog: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnLog.push(args.map(String).join(' '));
+  };
+
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'sessions.messages.subscribe') {
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: false,
+            error: { code: 'unknown_method', message: 'unknown method' },
+          }),
+        );
+        return;
+      }
+      if (req.method !== 'chat.send') return;
+      const params = req.params as { sessionKey: string; idempotencyKey: string };
+      const runId = `run-${params.idempotencyKey}`;
+      sock.send(
+        JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+      );
+      setImmediate(() => {
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 1,
+          state: 'final',
+          message: { text: `try [bridge-attach: ${outsideFile}] now` },
+        });
+      });
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({
+      url: fake.url,
+      attachOutputs: { allowedRoots: [root] },
+    });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t-attach-escape', 'leak'), (f) => frames.push(f), NEVER);
+
+    const artifacts = frames.filter((f) => f.type === 'task.artifact');
+    assert.equal(artifacts.length, 1);
+    const parts = artifacts[0].artifact.parts;
+    const fileParts = parts.filter((p) => p.kind === 'file');
+    assert.equal(fileParts.length, 0, 'no FilePart for outside-root marker');
+    const textPart = parts.find((p) => p.kind === 'text') as { kind: 'text'; text: string };
+    assert.ok(
+      textPart.text.includes('[bridge-attach:'),
+      'marker must remain visible so operator can debug',
+    );
+    assert.ok(
+      warnLog.some((m) => m.includes('bridge-attach skipped') && m.includes('outside-roots')),
+      `expected outside-roots warn, got: ${warnLog.join(' | ')}`,
+    );
+  } finally {
+    console.warn = originalWarn;
+    await fake.close();
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(outside, { recursive: true, force: true });
+  }
+});
+
+test('attachOutputs disabled (default): bridge-attach markers are passed through as plain text, no disk read', async () => {
+  const root = await attachOutputsRoot();
+  const filePath = path.join(root, 'should-not-be-read.txt');
+  await fs.writeFile(filePath, 'never read');
+
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'sessions.messages.subscribe') {
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: false,
+            error: { code: 'unknown_method', message: 'unknown method' },
+          }),
+        );
+        return;
+      }
+      if (req.method !== 'chat.send') return;
+      const params = req.params as { sessionKey: string; idempotencyKey: string };
+      const runId = `run-${params.idempotencyKey}`;
+      sock.send(
+        JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+      );
+      setImmediate(() => {
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 1,
+          state: 'final',
+          message: { text: `[bridge-attach: ${filePath}] inline` },
+        });
+      });
+    },
+  });
+  try {
+    // No attachOutputs option -> feature off.
+    const backend = createOpenclawBackend({ url: fake.url });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t-attach-off', 'go'), (f) => frames.push(f), NEVER);
+
+    const artifacts = frames.filter((f) => f.type === 'task.artifact');
+    const parts = artifacts[0].artifact.parts;
+    assert.equal(parts.filter((p) => p.kind === 'file').length, 0, 'no FilePart when feature is off');
+    const textPart = parts.find((p) => p.kind === 'text') as { kind: 'text'; text: string };
+    assert.ok(textPart.text.includes('[bridge-attach:'), 'marker must remain in text');
+  } finally {
+    await fake.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('attachOutputs: oversized file is skipped with a too-large warning, marker preserved', async () => {
+  const root = await attachOutputsRoot();
+  const filePath = path.join(root, 'big.bin');
+  await fs.writeFile(filePath, Buffer.alloc(2048));
+
+  const warnLog: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnLog.push(args.map(String).join(' '));
+  };
+
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'sessions.messages.subscribe') {
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: false,
+            error: { code: 'unknown_method', message: 'unknown method' },
+          }),
+        );
+        return;
+      }
+      if (req.method !== 'chat.send') return;
+      const params = req.params as { sessionKey: string; idempotencyKey: string };
+      const runId = `run-${params.idempotencyKey}`;
+      sock.send(
+        JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+      );
+      setImmediate(() => {
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 1,
+          state: 'final',
+          message: { text: `[bridge-attach: ${filePath}]` },
+        });
+      });
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({
+      url: fake.url,
+      attachOutputs: { allowedRoots: [root], maxBytes: 1024 },
+    });
+    const frames: UpFrame[] = [];
+    await backend.handle(makeTask('t-attach-toobig', 'go'), (f) => frames.push(f), NEVER);
+
+    const artifacts = frames.filter((f) => f.type === 'task.artifact');
+    const parts = artifacts[0].artifact.parts;
+    assert.equal(parts.filter((p) => p.kind === 'file').length, 0, 'oversized file must be skipped');
+    assert.ok(
+      warnLog.some((m) => m.includes('too-large')),
+      `expected too-large warn, got: ${warnLog.join(' | ')}`,
+    );
+  } finally {
+    console.warn = originalWarn;
+    await fake.close();
+    await fs.rm(root, { recursive: true, force: true });
   }
 });
 
