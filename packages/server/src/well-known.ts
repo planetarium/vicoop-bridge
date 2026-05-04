@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import type { Hono, MiddlewareHandler } from 'hono';
 import type { AgentCardV03 } from '@a2x/sdk';
 import type { ClientConnection } from './registry.js';
@@ -98,6 +99,14 @@ function collectPairs(deps: WellKnownDeps): ConnectionPair[] {
   return deps.listAgents().map((conn) => ({ conn, card: deps.getAgentCard(conn) }));
 }
 
+function isIpLiteral(hostname: string): boolean {
+  const unbracketed =
+    hostname.startsWith('[') && hostname.endsWith(']')
+      ? hostname.slice(1, -1)
+      : hostname;
+  return isIP(unbracketed) !== 0;
+}
+
 // Mentionable v0.1 has two hard requirements that constrain when the
 // well-known surface can serve at all:
 //   • §2 requires HTTPS at the .well-known URL ("Plain HTTP is not
@@ -120,11 +129,11 @@ function isMentionableEligible(
 ): deps is WellKnownDeps & { publicUrl: string; domain: string } {
   if (!deps.publicUrl || !deps.domain) return false;
   if (!deps.publicUrl.toLowerCase().startsWith('https://')) return false;
-  // Quick multi-label test: must contain at least one dot. IP literals
-  // (e.g. 192.168.1.1) pass — they're not globally meaningful but the
-  // spec validation ladders are not blocked by them either, so we accept
-  // them rather than introducing a fragile hostname-classifier here.
-  if (!deps.domain.includes('.')) return false;
+  // Quick multi-label test: must contain at least one dot, unless the host
+  // is an IP literal. IPs are not globally meaningful but the spec validation
+  // ladders are not blocked by them either, so we allow IPv4 and bracketed
+  // IPv6 literals for private deployments and smoke tests.
+  if (!deps.domain.includes('.') && !isIpLiteral(deps.domain)) return false;
   return true;
 }
 

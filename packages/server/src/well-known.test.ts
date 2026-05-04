@@ -383,3 +383,15 @@ test('all routes serve when PUBLIC_URL is https with a multi-label hostname', as
   );
   assert.equal(res.status, 200);
 });
+
+test('all routes serve when PUBLIC_URL is https with an IPv6 literal hostname', async () => {
+  const app = makeApp({
+    agents: [fakeConn('foo')],
+    publicUrl: 'https://[::1]',
+    domain: '[::1]',
+  });
+  const res = await app.request(
+    '/.well-known/webfinger?resource=acct:foo@[::1]',
+  );
+  assert.equal(res.status, 200);
+});

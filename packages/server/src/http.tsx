@@ -138,7 +138,9 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     try {
       siweDomain = new URL(opts.publicUrl).hostname;
     } catch {
-      throw new Error(`PUBLIC_URL "${opts.publicUrl}" is not a valid URL — cannot configure SIWE domain verification`);
+      throw new Error(
+        `PUBLIC_URL "${opts.publicUrl}" is not a valid URL — cannot configure SIWE domain verification or well-known Mentionable routes`,
+      );
     }
   }
 

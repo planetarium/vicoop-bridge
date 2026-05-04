@@ -31,6 +31,6 @@ test('findReservedAgentId returns the first reserved entry, in input case', () =
 });
 
 test('RESERVED_AGENT_IDS is non-empty (the SQL mirror would silently no-op otherwise)', () => {
-  assert.ok(RESERVED_AGENT_IDS.size > 0);
-  assert.ok(RESERVED_AGENT_IDS.has('admin'));
+  assert.ok(RESERVED_AGENT_IDS.length > 0);
+  assert.ok(RESERVED_AGENT_IDS.includes('admin'));
 });

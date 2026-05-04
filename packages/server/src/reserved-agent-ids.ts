@@ -10,10 +10,12 @@
 // in sync — a divergence between the SQL gate and the TS gate creates a
 // bypass: the SQL function signature is stable, so when adding a new
 // reserved id, edit both files in the same commit.
-export const RESERVED_AGENT_IDS: ReadonlySet<string> = new Set(['admin']);
+export const RESERVED_AGENT_IDS = ['admin'] as const;
+
+const RESERVED_AGENT_ID_SET = new Set<string>(RESERVED_AGENT_IDS);
 
 export function isReservedAgentId(id: string): boolean {
-  return RESERVED_AGENT_IDS.has(id.toLowerCase());
+  return RESERVED_AGENT_ID_SET.has(id.toLowerCase());
 }
 
 export function findReservedAgentId(ids: readonly string[]): string | undefined {
