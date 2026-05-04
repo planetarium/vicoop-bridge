@@ -24,9 +24,13 @@ const FIXTURE_CONTENT = 'sent via send_file tool';
 fs.mkdirSync(FIXTURE_DIR, { recursive: true });
 fs.writeFileSync(FIXTURE_PATH, FIXTURE_CONTENT);
 
+// OpenClaw prefixes external MCP tool names with the server name (see the
+// note in docs/openclaw-e2e.md), so the model sees `send-file__send_file`
+// in its tool catalog. Naming the exact tool reduces flakiness vs. relying
+// on the model to disambiguate `send_file`.
 const PROMPT =
   process.env.E2E_PROMPT ??
-  `Please call the send_file tool to deliver the file at "${FIXTURE_PATH}" to the caller. After the tool returns, briefly confirm you sent the file (one short sentence). Do not include the path in your reply.`;
+  `Please call the send-file__send_file tool to deliver the file at "${FIXTURE_PATH}" to the caller. After the tool returns, briefly confirm you sent the file (one short sentence). Do not include the path in your reply.`;
 
 const backend = createOpenclawBackend({
   url: 'ws://127.0.0.1:18789',

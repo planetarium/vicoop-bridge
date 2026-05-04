@@ -89,6 +89,12 @@ const INPUT_IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'imag
 // huge payload.
 const INPUT_FILE_MAX_BYTES = 5 * 1024 * 1024;
 
+// Hard cap on a single tool_result media block's decoded size before
+// it becomes an outbound A2A FilePart. Prevents a misbehaving tool
+// (e.g. an MCP screenshot at unbounded resolution) from forcing a huge
+// in-memory base64 decode and a giant artifact payload on the wire.
+const TOOL_RESULT_MEDIA_MAX_BYTES = 5 * 1024 * 1024;
+
 function decodedBase64Size(b64: string): number {
   if (b64.length === 0) return 0;
   let pad = 0;
@@ -477,12 +483,22 @@ export function createClaudeBackend(
           // tool_result events come in as a synthetic user message in the
           // stream-json transcript; pull out any image/document blocks and
           // emit them as A2A FileParts. Text-only tool results are skipped.
-          // Echo dedup: a tool_result whose decoded bytes match an inbound
-          // FilePart (e.g. the model Read the caller's image) would re-emit
-          // the same payload back to the caller. Drop those before they
-          // reach the wire.
+          // Two filters apply, in order:
+          //   1. size cap — drop oversize blocks before we even base64-decode
+          //      them for hashing (cheap length math first; full decode is
+          //      O(payload size)).
+          //   2. echo dedup — a tool_result whose decoded bytes match an
+          //      inbound FilePart (e.g. the model Read the caller's image)
+          //      would re-emit the same payload back. Drop those.
           const parts = extractToolResultMediaParts(evt.message?.content).filter((p) => {
             if (p.kind !== 'file' || !p.file.bytes) return true;
+            const decodedSize = decodedBase64Size(p.file.bytes);
+            if (decodedSize > TOOL_RESULT_MEDIA_MAX_BYTES) {
+              console.warn(
+                `[claude] tool_result media dropped: decoded size ${decodedSize} > ${TOOL_RESULT_MEDIA_MAX_BYTES}`,
+              );
+              return false;
+            }
             return !mapped.inboundHashes.has(sha256OfBase64(p.file.bytes));
           });
           emitToolResultMedia(parts);

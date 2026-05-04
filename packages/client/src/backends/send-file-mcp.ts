@@ -238,12 +238,11 @@ export async function startSendFileMcpServer(
   // gets a connection refused on most platforms. Advertise the matching
   // loopback (IPv4 → 127.0.0.1, IPv6 → ::1) so a `::`-bound listener on a
   // host with IPV6_V6ONLY set still resolves to a reachable URL.
-  const advertiseHost =
-    host === '::'
-      ? '::1'
-      : host === '0.0.0.0' || host === '*'
-        ? '127.0.0.1'
-        : host;
+  const advertiseHost = host === '::'
+    ? '::1'
+    : WILDCARD_HOSTS.has(host)
+      ? '127.0.0.1'
+      : host;
   // IPv6 literals must be bracketed in URLs (RFC 3986).
   const urlHost = advertiseHost.includes(':') ? `[${advertiseHost}]` : advertiseHost;
   let url = `http://${urlHost}:0/mcp`;
