@@ -13,6 +13,7 @@ import type { Registry } from './registry.js';
 import type { Sql } from './db.js';
 import { hashToken } from './token.js';
 import { logEvent, truncate } from './log.js';
+import { isReservedAgentId } from './reserved-agent-ids.js';
 
 interface ClientRow {
   id: string;
@@ -97,6 +98,17 @@ async function authenticateAndRegister(
   frame: import('@vicoop-bridge/protocol').HelloFrame,
   opts: ServerWsOptions,
 ): Promise<AuthResult> {
+  // Reserved agent ids (e.g. "admin") are owned by the bridge itself —
+  // exposed at @admin@<host> via Mentionable. The SQL trigger
+  // clients_assert_no_reserved_agent_ids covers every mutation path on the
+  // `clients` table (wrapper functions, PostGraphile auto-mutations, direct
+  // SQL), but a manually-inserted row from psql before the trigger landed,
+  // or any future schema regression, must still be refused at the wire.
+  // Belt and suspenders — and cheaper to deny here than after the DB lookup.
+  if (isReservedAgentId(frame.agentId)) {
+    logEvent('client_rejected', { reason: 'agent id reserved', agentId: frame.agentId });
+    return { ok: false, code: 4011, reason: 'agent id reserved by the bridge' };
+  }
   const hash = hashToken(frame.token);
   const client = await lookupByTokenHash(opts.db, hash);
   if (!client) {

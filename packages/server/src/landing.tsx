@@ -1,11 +1,25 @@
 import type { FC } from 'hono/jsx';
 import { raw } from 'hono/html';
 import type { AgentCardV03 } from '@a2x/sdk';
+import type { AgentDirectoryOrganization } from './mentionable.js';
 
 interface LandingProps {
   adminCard: AgentCardV03;
   clients: Array<{ id: string; url: string; card: AgentCardV03 }>;
   adminWallets: string[];
+  // Layer-1 source of truth for the Mentionable Agent Directory: the same
+  // Schema.org Organization payload served by /.well-known/mentionable-agents.json
+  // is embedded here as JSON-LD so generic crawlers (search engines, AI
+  // browsers, scrapers) discover the connected agents without speaking
+  // any Mentionable-specific protocol.
+  directory?: AgentDirectoryOrganization;
+}
+
+// Per JSON-LD §1.4 the only character that can break a `<script>` block is
+// `</`. Escape the forward slash to neutralize an inline `</script>`
+// terminator without otherwise altering the bytes of the JSON.
+function escapeJsonLd(payload: unknown): string {
+  return JSON.stringify(payload).replace(/<\/(script)/gi, '<\\/$1');
 }
 
 const STYLES = `
@@ -37,13 +51,16 @@ const STYLES = `
   a { color: inherit; }
 `;
 
-export const Landing: FC<LandingProps> = ({ adminCard, clients, adminWallets }) => (
+export const Landing: FC<LandingProps> = ({ adminCard, clients, adminWallets, directory }) => (
   <html lang="en">
     <head>
       <meta charset="utf-8" />
       <meta name="viewport" content="width=device-width, initial-scale=1" />
       <title>vicoop-bridge</title>
       <style>{raw(STYLES)}</style>
+      {directory ? (
+        <script type="application/ld+json">{raw(escapeJsonLd(directory))}</script>
+      ) : null}
     </head>
     <body>
       <h1>vicoop-bridge</h1>

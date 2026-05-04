@@ -22,6 +22,7 @@ import { randomBytes, randomInt } from 'node:crypto';
 import type { Hono, Context } from 'hono';
 import type { Sql } from '../db.js';
 import { issueSessionToken } from './caller-token.js';
+import { findReservedAgentId } from '../reserved-agent-ids.js';
 
 export type DeviceFlowIntent = 'caller' | 'owner_session' | 'client_register';
 
@@ -147,6 +148,10 @@ function parseClientRegisterParams(
     if (id.length > MAX_AGENT_ID_LEN) {
       return { ok: false, reason: `agent id exceeds ${MAX_AGENT_ID_LEN} chars` };
     }
+  }
+  const reserved = findReservedAgentId(ids);
+  if (reserved) {
+    return { ok: false, reason: `agent id "${reserved}" is reserved by the bridge` };
   }
 
   return { ok: true, params: { client_name: clientName, allowed_agent_ids: ids } };

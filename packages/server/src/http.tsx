@@ -22,6 +22,12 @@ import type { Sql } from './db.js';
 import { Landing } from './landing.js';
 import { logEvent } from './log.js';
 import { buildAgentA2XAgent, type AgentA2XOptions } from './agent-card.js';
+import {
+  buildLandingDirectory,
+  mountWellKnown,
+  type ConnectionPair,
+  type WellKnownDeps,
+} from './well-known.js';
 
 export interface ServerHttpOptions {
   registry: Registry;
@@ -124,19 +130,59 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     return c.json(result as Record<string, unknown>);
   }
 
+  // Derive the public hostname once. Used both for SIWE domain verification
+  // and for the Mentionable / WebFinger surface, which keys lookups on the
+  // bridge's external hostname.
+  let siweDomain: string | undefined;
+  if (opts.publicUrl) {
+    try {
+      siweDomain = new URL(opts.publicUrl).hostname;
+    } catch {
+      throw new Error(
+        `PUBLIC_URL "${opts.publicUrl}" is not a valid URL — cannot configure SIWE domain verification or well-known Mentionable routes`,
+      );
+    }
+  }
+
   app.get('/healthz', (c) => c.json({ ok: true }));
 
   // Root agent card — the server itself is an A2A agent
   app.get('/.well-known/agent-card.json', (c) => c.json(adminCard));
 
+  // Mentionable v0.1 surface (WebFinger + agent-card + Agent Directory)
+  // exposing every connected client as `@<agentId>@<bridge-host>`, plus
+  // the bridge's own admin agent at `@admin@<bridge-host>`. The agentId
+  // "admin" is reserved (see reserved-agent-ids.ts) so a connected client
+  // cannot shadow the admin entry.
+  const wellKnownDeps: WellKnownDeps = {
+    listAgents: () => opts.registry.listAgents(),
+    getAgentCard: (conn) => getAgentForConn(conn).getAgentCard() as AgentCardV03,
+    adminCard,
+    publicUrl: opts.publicUrl,
+    domain: siweDomain,
+    deviceFlowEnabled,
+    organizationName: adminCard.name,
+  };
+  mountWellKnown(app, wellKnownDeps);
+
   // Server info — HTML landing for browsers, JSON for API clients
   app.get('/', (c) => {
-    const clients = opts.registry.listAgents().map((a) => ({
-      id: a.agentId,
+    // Single registry walk per request: the HTML landing's `clients` array
+    // and the JSON-LD directory it embeds both derive from the same
+    // (connection, AgentCardV03) snapshot. Reusing one snapshot means the
+    // two views can never disagree mid-request — and getAgentCard, which
+    // reads from a per-agent cache that's invalidated on caller-policy /
+    // hello-frame changes, is called once per agent instead of twice.
+    const pairs: ConnectionPair[] = opts.registry.listAgents().map((conn) => ({
+      conn,
+      card: getAgentForConn(conn).getAgentCard() as AgentCardV03,
+    }));
+    const clients = pairs.map(({ conn, card }) => ({
+      id: conn.agentId,
       url: opts.publicUrl
-        ? `${opts.publicUrl}/agents/${a.agentId}`
-        : `/agents/${a.agentId}`,
-      card: getAgentForConn(a).getAgentCard() as AgentCardV03,
+        ? `${opts.publicUrl}/agents/${conn.agentId}`
+        : `/agents/${conn.agentId}`,
+      card,
     }));
 
     const accept = c.req.header('accept') ?? '';
@@ -152,26 +198,18 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         clients,
       });
     }
+    const directory = buildLandingDirectory(wellKnownDeps, pairs);
     return c.html(
       html`<!DOCTYPE html>${(
         <Landing
           adminCard={adminCard}
           clients={clients}
           adminWallets={getAdminWallets()}
+          directory={directory}
         />
       )}`,
     );
   });
-
-  // Derive SIWE domain early so both admin and agent endpoints use it
-  let siweDomain: string | undefined;
-  if (opts.publicUrl) {
-    try {
-      siweDomain = new URL(opts.publicUrl).hostname;
-    } catch {
-      throw new Error(`PUBLIC_URL "${opts.publicUrl}" is not a valid URL — cannot configure SIWE domain verification`);
-    }
-  }
 
   // SIWE → opaque caller token exchange. Admin UI and any wallet-based client
   // signs a SIWE message once, then presents the returned vbc_caller_* token
