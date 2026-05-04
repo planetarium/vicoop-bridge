@@ -83,6 +83,20 @@ const DEFAULT_HOST = '127.0.0.1';
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 const WILDCARD_HOSTS = new Set(['0.0.0.0', '::', '*']);
 
+// Defensive stringification — `(e as Error).message` is unsafe when the
+// thrown value is null/undefined or a non-Error primitive (common when
+// rejection paths in foreign code throw raw strings or numbers). Always
+// returns a string suitable for logs/structured-content without throwing.
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === 'string') return e;
+  try {
+    return String(e);
+  } catch {
+    return '<unrepresentable>';
+  }
+}
+
 export async function startSendFileMcpServer(
   opts: SendFileMcpOptions,
 ): Promise<SendFileMcpServer> {
@@ -160,7 +174,7 @@ export async function startSendFileMcpServer(
       return {
         ok: false,
         code: 'unexpected-error',
-        message: (err as Error).message,
+        message: errorMessage(err),
       };
     }
   }
@@ -257,7 +271,7 @@ export async function startSendFileMcpServer(
         return;
       }
       transport.handleRequest(req, res).catch((err) => {
-        console.error('[send-file-mcp] handleRequest threw:', (err as Error).message);
+        console.error('[send-file-mcp] handleRequest threw:', errorMessage(err));
         if (!res.headersSent) {
           res.statusCode = 500;
           res.end('internal error');

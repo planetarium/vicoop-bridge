@@ -95,6 +95,19 @@ const INPUT_FILE_MAX_BYTES = 5 * 1024 * 1024;
 // in-memory base64 decode and a giant artifact payload on the wire.
 const TOOL_RESULT_MEDIA_MAX_BYTES = 5 * 1024 * 1024;
 
+// Defensive stringification — `(e as Error).message` is unsafe when the
+// thrown value is null/undefined or a non-Error primitive (common in JS).
+// Always returns a string suitable for logs/frames without throwing.
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === 'string') return e;
+  try {
+    return String(e);
+  } catch {
+    return '<unrepresentable>';
+  }
+}
+
 function decodedBase64Size(b64: string): number {
   if (b64.length === 0) return 0;
   let pad = 0;
@@ -327,7 +340,7 @@ export function createClaudeBackend(
           mcpServerForTask = await ensureSendFileMcp();
         } catch (err) {
           console.warn(
-            `[claude] send_file MCP server failed to start; tool path disabled for this task: ${(err as Error).message}`,
+            `[claude] send_file MCP server failed to start; tool path disabled for this task: ${errorMessage(err)}`,
           );
         }
       }
@@ -374,7 +387,7 @@ export function createClaudeBackend(
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: { code: 'spawn_failed', message: (err as Error).message },
+          error: { code: 'spawn_failed', message: errorMessage(err) },
         });
         return;
       }
@@ -382,7 +395,7 @@ export function createClaudeBackend(
       // Write the user message envelope and close stdin so claude sees EOF
       // and proceeds. Errors here are recorded; the close listener still
       // drives the terminal frame so we don't double-emit.
-      let stdinError: Error | null = null;
+      let stdinError: unknown = null;
       if (!child.stdin) {
         // A custom spawn that doesn't pipe stdin would otherwise leave
         // claude blocked waiting for input. Hard-fail loud rather than
@@ -409,7 +422,7 @@ export function createClaudeBackend(
         });
         child.stdin.end(envelope + '\n');
       } catch (err) {
-        stdinError = err as Error;
+        stdinError = err;
       }
 
       let emittedAnyArtifact = false;
@@ -588,7 +601,7 @@ export function createClaudeBackend(
         const detailPart = detail ? `: ${detail.slice(-500)}` : '';
         // If stdin write blew up and the process exited non-zero, surface
         // both: the stdin error is usually the proximate cause.
-        const stdinPart = stdinError ? ` [stdin: ${stdinError.message}]` : '';
+        const stdinPart = stdinError ? ` [stdin: ${errorMessage(stdinError)}]` : '';
         emit({
           type: 'task.fail',
           taskId: task.taskId,

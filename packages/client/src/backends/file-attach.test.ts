@@ -275,3 +275,29 @@ test('inferMimeFromPath: known extensions map to specific mimes; unknown falls b
   assert.equal(inferMimeFromPath('/x/blob.unknownext'), 'application/octet-stream');
   assert.equal(inferMimeFromPath('/x/no-extension'), 'application/octet-stream');
 });
+
+test('createBoundedFileReader: throws RangeError on negative maxBytes', () => {
+  assert.throws(
+    () => createBoundedFileReader({ allowedRoots: ['/tmp'], maxBytes: -1 }),
+    /maxBytes must be a finite non-negative number/,
+  );
+});
+
+test('createBoundedFileReader: throws RangeError on non-finite maxBytes', () => {
+  assert.throws(
+    () => createBoundedFileReader({ allowedRoots: ['/tmp'], maxBytes: Number.POSITIVE_INFINITY }),
+    /maxBytes must be a finite non-negative number/,
+  );
+});
+
+test('readBoundedFileWithinRoots: throws RangeError on NaN maxBytes', async () => {
+  await assert.rejects(
+    () =>
+      readBoundedFileWithinRoots({
+        filePath: '/tmp/x',
+        allowedRoots: ['/tmp'],
+        maxBytes: Number.NaN,
+      }),
+    /maxBytes must be a finite non-negative number/,
+  );
+});

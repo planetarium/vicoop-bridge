@@ -173,6 +173,7 @@ export function createBoundedFileReader(opts: {
   allowedRoots: string[];
   maxBytes: number;
 }): (filePath: string) => Promise<SafeReadResult> {
+  assertMaxBytes(opts.maxBytes);
   let canonicalRootsPromise: Promise<string[]> | null = null;
   return async (filePath) =>
     readWithRoots({
@@ -223,11 +224,25 @@ export async function readBoundedFileWithinRoots(params: {
   allowedRoots: string[];
   maxBytes: number;
 }): Promise<SafeReadResult> {
+  assertMaxBytes(params.maxBytes);
   return readWithRoots({
     filePath: params.filePath,
     maxBytes: params.maxBytes,
     getCanonicalRoots: () => resolveCanonicalRoots(params.allowedRoots),
   });
+}
+
+// Programmer-error guard: maxBytes is operator config, not user input.
+// Buffer.alloc(maxBytes + 1) deep inside readWithRoots would throw a
+// RangeError for negative or non-finite values, bypassing the SafeReadError
+// codes the caller is shaped to handle. Validate at the public boundaries
+// so misconfiguration fails loudly at startup, not on the first read.
+function assertMaxBytes(maxBytes: number): void {
+  if (typeof maxBytes !== 'number' || !Number.isFinite(maxBytes) || maxBytes < 0) {
+    throw new RangeError(
+      `maxBytes must be a finite non-negative number (got ${maxBytes})`,
+    );
+  }
 }
 
 async function readWithRoots(params: {
