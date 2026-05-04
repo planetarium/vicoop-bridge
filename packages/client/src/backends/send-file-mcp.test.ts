@@ -213,6 +213,45 @@ test('listen() failure rejects and does not leak the McpServer/transport', async
   }
 });
 
+test('treats empty/whitespace `name` as missing and falls back to basename', async () => {
+  const root = await tmpDir();
+  await fs.writeFile(path.join(root, 'real.txt'), 'data');
+  const server = await startSendFileMcpServer({ allowedRoots: [root], skipHttp: true });
+  try {
+    const cap = { artifacts: [] as unknown[] };
+    const release = server.registerActiveTask(makeTaskHandle('t1', cap));
+    try {
+      const result = await server.invokeSendFileForTest({
+        path: path.join(root, 'real.txt'),
+        name: '   ',
+      });
+      assert.equal(result.ok, true);
+      const art = cap.artifacts[0] as {
+        parts: Array<{ file?: { name?: string } }>;
+      };
+      assert.equal(art.parts[0].file!.name, 'real.txt');
+    } finally {
+      release.release();
+    }
+  } finally {
+    await server.close();
+  }
+});
+
+test('treats `Localhost`/`LOCALHOST` as loopback (case-insensitive)', async () => {
+  const root = await tmpDir();
+  // Should NOT throw — case-insensitive normalization makes these
+  // equivalent to lowercase `localhost`, which is in the loopback set.
+  for (const host of ['Localhost', 'LOCALHOST', 'LocalHost']) {
+    const server = await startSendFileMcpServer({
+      allowedRoots: [root],
+      host,
+      skipHttp: true,
+    });
+    await server.close();
+  }
+});
+
 test('refuses to bind a non-loopback host without dangerouslyAllowNonLoopback', async () => {
   const root = await tmpDir();
   await assert.rejects(

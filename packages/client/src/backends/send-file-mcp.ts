@@ -106,7 +106,11 @@ export async function startSendFileMcpServer(
 ): Promise<SendFileMcpServer> {
   const allowedRoots = opts.allowedRoots;
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
-  const host = opts.host ?? DEFAULT_HOST;
+  // Hostnames are case-insensitive per RFC 1035 §2.3.3; IPv6 hex digits
+  // likewise have no case. Lowercase once so allowlist comparisons and
+  // wildcard checks aren't tripped by `Localhost` / `LOCALHOST` / mixed
+  // IPv6 hex like `::1` vs `::1`.
+  const host = (opts.host ?? DEFAULT_HOST).toLowerCase();
   if (!LOOPBACK_HOSTS.has(host) && !opts.dangerouslyAllowNonLoopback) {
     throw new Error(
       `send_file MCP refuses to bind to non-loopback host "${host}" — the tool reads files from allowedRoots without transport-level auth. Set dangerouslyAllowNonLoopback:true to override.`,
@@ -157,7 +161,12 @@ export async function startSendFileMcpServer(
     const [task] = activeTasks;
     try {
       const read = await readBounded(input.path);
-      const fileName = input.name ?? path.basename(read.realPath);
+      // Treat empty / whitespace-only `name` as missing — falling back to
+      // the basename gives the caller a useful filename instead of the
+      // empty string the model accidentally passed in.
+      const trimmedName = input.name?.trim();
+      const fileName =
+        trimmedName && trimmedName.length > 0 ? trimmedName : path.basename(read.realPath);
       const artifactId = randomUUID();
       const parts: Part[] = [
         {
