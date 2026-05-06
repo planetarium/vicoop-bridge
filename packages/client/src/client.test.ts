@@ -219,12 +219,19 @@ test('processTask: backend throws without emit -> emits backend_error fail and l
   assert.match(failLog, /code=backend_error/);
 });
 
-test('processTask: backend emits complete then throws -> does not double-emit, warns', async () => {
+test('processTask: backend emits complete then throws -> does not double-emit, warns with errorClass only', async () => {
   const c = makeSink();
   const s = captureSend();
+  // Use a custom Error subclass so we can assert the class name in the warn.
+  class LateBoom extends Error {
+    constructor(msg: string) {
+      super(msg);
+      this.name = 'LateBoom';
+    }
+  }
   const backend = backendOf('stub', async (_t, emit) => {
     emit({ type: 'task.complete', taskId: 'T1', status: { state: 'completed' } });
-    throw new Error('late boom');
+    throw new LateBoom('user-prompt-secret-leak');
   });
   await processTask(makeAssign('T1'), new AbortController().signal, {
     backend,
@@ -234,15 +241,23 @@ test('processTask: backend emits complete then throws -> does not double-emit, w
   // Wire saw only the original task.complete; no fallback fail was sent.
   assert.equal(s.sent.length, 1);
   assert.equal(s.sent[0].type, 'task.complete');
+  // warn: includes terminal kind + errorClass, but NOT the raw message.
+  const warnLine = c.warn.find((l) => /backend threw after terminal taskId=T1/.test(l));
+  assert.ok(warnLine, `expected late-throw warn, got: ${c.warn.join(' | ')}`);
+  assert.match(warnLine, /terminal=complete/);
+  assert.match(warnLine, /errorClass=LateBoom/);
+  assert.equal(
+    warnLine.includes('user-prompt-secret-leak'),
+    false,
+    'warn line must not include the raw error message',
+  );
+  // debug: full message available for opt-in operators.
   assert.ok(
-    c.warn.some((l) =>
-      /backend threw after terminal taskId=T1 .*terminal=complete .*message=late boom/.test(l),
-    ),
-    `expected late-throw warn, got: ${c.warn.join(' | ')}`,
+    c.log.some((l) => /backend threw after terminal taskId=T1.*message=user-prompt-secret-leak/.test(l)),
   );
 });
 
-test('processTask: backend emits fail then throws -> does not double-emit, warns', async () => {
+test('processTask: backend emits fail then throws -> does not double-emit, warns with errorClass only', async () => {
   const c = makeSink();
   const s = captureSend();
   const backend = backendOf('stub', async (_t, emit) => {
@@ -262,12 +277,11 @@ test('processTask: backend emits fail then throws -> does not double-emit, warns
   const sent = s.sent[0];
   assert.equal(sent.type, 'task.fail');
   if (sent.type === 'task.fail') assert.equal(sent.error.code, 'upstream');
-  assert.ok(
-    c.warn.some((l) =>
-      /backend threw after terminal taskId=T1 .*terminal=fail .*message=post-fail boom/.test(l),
-    ),
-    `expected late-throw warn, got: ${c.warn.join(' | ')}`,
-  );
+  const warnLine = c.warn.find((l) => /backend threw after terminal taskId=T1/.test(l));
+  assert.ok(warnLine, `expected late-throw warn, got: ${c.warn.join(' | ')}`);
+  assert.match(warnLine, /terminal=fail/);
+  assert.match(warnLine, /errorClass=Error/);
+  assert.equal(warnLine.includes('post-fail boom'), false, 'warn must not include raw message');
 });
 
 test('processTask: backend.start log uses the backend name', async () => {
@@ -315,10 +329,12 @@ test('processTask: backend throws after abort -> emits canceled task.complete, l
   );
 });
 
-test('processTask: backend emits canceled task.complete on abort -> uses backend frame, no fallback', async () => {
+test('processTask: backend emits canceled task.complete on abort -> uses backend frame, logs task.canceled', async () => {
   // Well-behaved backend (like claude.ts): observes signal and emits its
   // own canceled-state task.complete instead of throwing. processTask
-  // must use that frame as-is and not synthesize a fallback.
+  // must use that frame as-is, not synthesize a fallback, and log it as
+  // `task.canceled` (not `task.complete`) so the lifecycle log clearly
+  // distinguishes a successful completion from a cancel.
   const c = makeSink();
   const s = captureSend();
   const controller = new AbortController();
@@ -344,6 +360,14 @@ test('processTask: backend emits canceled task.complete on abort -> uses backend
     assert.equal(sent.status.state, 'canceled');
     assert.equal(sent.status.timestamp, '2026-01-01T00:00:00Z');
   }
+  assert.ok(
+    c.log.some((l) => /task\.canceled taskId=T1 elapsedMs=\d+ artifacts=\d+/.test(l)),
+    `expected task.canceled log, got: ${c.log.join(' | ')}`,
+  );
+  assert.ok(
+    !c.log.some((l) => /task\.complete taskId=T1/.test(l)),
+    'should not log task.complete for a canceled-state completion',
+  );
 });
 
 test('processTask: forwards non-terminal frames (e.g. task.artifact, task.status) to send', async () => {

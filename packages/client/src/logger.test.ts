@@ -110,7 +110,7 @@ test('resolveLogLevel: invalid env value falls back to info and warns once', () 
     assert.equal(resolveLogLevel(undefined, c.sink), 'info');
   });
   assert.equal(c.warn.length, 1);
-  assert.match(c.warn[0], /ignoring invalid VICOOP_CLIENT_LOG_LEVEL=verbose/);
+  assert.match(c.warn[0], /ignoring invalid VICOOP_CLIENT_LOG_LEVEL="verbose"/);
 });
 
 test('resolveLogLevel: invalid explicit value warns then falls through to env', () => {
@@ -120,7 +120,7 @@ test('resolveLogLevel: invalid explicit value warns then falls through to env', 
     assert.equal(resolveLogLevel('TRACE' as 'debug', c.sink), 'debug');
   });
   assert.equal(c.warn.length, 1);
-  assert.match(c.warn[0], /ignoring invalid logLevel=TRACE/);
+  assert.match(c.warn[0], /ignoring invalid logLevel="TRACE"/);
 });
 
 test('resolveLogLevel: invalid explicit value with no env falls back to info', () => {
@@ -130,7 +130,32 @@ test('resolveLogLevel: invalid explicit value with no env falls back to info', (
     assert.equal(resolveLogLevel('verbose' as 'debug', c.sink), 'info');
   });
   assert.equal(c.warn.length, 1);
-  assert.match(c.warn[0], /ignoring invalid logLevel=verbose/);
+  assert.match(c.warn[0], /ignoring invalid logLevel="verbose"/);
+});
+
+test('resolveLogLevel: sanitizes newlines/control chars in invalid value (no log injection)', () => {
+  _resetLogLevelWarningsForTests();
+  const c = makeSink();
+  withEnv(LOG_LEVEL_ENV, 'evil\n[client] FAKE INJECTED LINE', () => {
+    assert.equal(resolveLogLevel(undefined, c.sink), 'info');
+  });
+  assert.equal(c.warn.length, 1);
+  // Single line — newline must be escaped, not literal.
+  assert.equal(c.warn[0].includes('\n'), false, 'warn message must not contain raw newlines');
+  assert.match(c.warn[0], /\\n\[client\] FAKE INJECTED LINE/);
+});
+
+test('resolveLogLevel: truncates very long invalid values', () => {
+  _resetLogLevelWarningsForTests();
+  const c = makeSink();
+  const long = 'x'.repeat(500);
+  withEnv(LOG_LEVEL_ENV, long, () => {
+    assert.equal(resolveLogLevel(undefined, c.sink), 'info');
+  });
+  assert.equal(c.warn.length, 1);
+  // Bounded length: prefix line + escaped+truncated value should be short.
+  assert.ok(c.warn[0].length < 250, `warn line should be bounded, got ${c.warn[0].length} chars`);
+  assert.match(c.warn[0], /…/);
 });
 
 test('resolveLogLevel: warns at most once per distinct invalid value across calls', () => {
@@ -167,7 +192,7 @@ test('resolveLogLevel: warn passes PREFIX as a separate sink argument', () => {
   // the logger's own .warn() uses, so structured-logging sinks can treat
   // them consistently.
   assert.equal(calls[0][0], '[client]');
-  assert.match(String(calls[0][1]), /ignoring invalid VICOOP_CLIENT_LOG_LEVEL=bogus/);
+  assert.match(String(calls[0][1]), /ignoring invalid VICOOP_CLIENT_LOG_LEVEL="bogus"/);
 });
 
 test('createLogger at info: error/warn/info pass, debug filtered', () => {

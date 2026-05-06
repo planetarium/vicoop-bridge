@@ -52,6 +52,18 @@ function warnOnce(sink: ConsoleSink, key: string, message: string): void {
   sink.warn(PREFIX, message);
 }
 
+// Render an arbitrary string as a safe, single-line log token. Uses
+// JSON.stringify so newlines and control chars are escaped (preventing
+// log-injection / multi-line entries) and truncates to keep one bad env
+// value from flooding the log.
+function safeForLog(value: string, maxLen = 120): string {
+  const escaped = JSON.stringify(value);
+  if (escaped.length <= maxLen) return escaped;
+  // Trim to maxLen and tack on an ellipsis. The result intentionally
+  // doesn't preserve the closing quote — readers see the truncation.
+  return `${escaped.slice(0, maxLen - 1)}…`;
+}
+
 // Normalize a level string from any source (explicit option, env var) by
 // trimming and lowercasing, then validating against the known set. An
 // invalid non-empty value is reported via `warnOnce` (per distinct
@@ -86,7 +98,7 @@ function tryParseLevel(
   warnOnce(
     sink,
     `${source}:value:${trimmed}`,
-    `ignoring invalid ${source}=${raw} (expected silent|error|warn|info|debug)`,
+    `ignoring invalid ${source}=${safeForLog(raw)} (expected silent|error|warn|info|debug)`,
   );
   return undefined;
 }

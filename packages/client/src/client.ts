@@ -273,16 +273,27 @@ export async function processTask(
   // so a per-frame counter would over-report.
   const state: {
     artifactIds: Set<string>;
-    terminal: { kind: 'complete' } | { kind: 'fail'; code: string } | null;
+    terminal:
+      | { kind: 'complete' }
+      | { kind: 'canceled' }
+      | { kind: 'fail'; code: string }
+      | null;
   } = { artifactIds: new Set(), terminal: null };
 
   // Wrap emit so we can observe terminal frames the backend sends and
   // report taskId/elapsedMs/artifacts/code from the same code path,
   // without changing the wire-level frames or inspecting their payloads.
+  // A `task.complete` with `status.state === 'canceled'` is the codebase's
+  // existing cancellation convention (see backends/claude.ts); record it
+  // distinctly so the lifecycle log doesn't mislabel cancels as completions.
   const emit: Emit = (f) => {
     if (f.type === 'task.artifact') state.artifactIds.add(f.artifact.artifactId);
-    else if (f.type === 'task.complete') state.terminal = { kind: 'complete' };
-    else if (f.type === 'task.fail') state.terminal = { kind: 'fail', code: f.error.code };
+    else if (f.type === 'task.complete') {
+      state.terminal =
+        f.status.state === 'canceled' ? { kind: 'canceled' } : { kind: 'complete' };
+    } else if (f.type === 'task.fail') {
+      state.terminal = { kind: 'fail', code: f.error.code };
+    }
     deps.send(f);
   };
 
@@ -302,6 +313,10 @@ export async function processTask(
       deps.logger.info(
         `task.complete taskId=${frame.taskId} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
       );
+    } else if (terminal.kind === 'canceled') {
+      deps.logger.info(
+        `task.canceled taskId=${frame.taskId} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
+      );
     } else {
       deps.logger.info(
         `task.fail taskId=${frame.taskId} code=${terminal.code} elapsedMs=${elapsedMs}`,
@@ -310,15 +325,22 @@ export async function processTask(
   } catch (err) {
     const elapsedMs = Date.now() - startedAt;
     const message = err instanceof Error ? err.message : String(err);
+    const errorClass = err instanceof Error ? err.constructor.name : typeof err;
     if (state.terminal !== null) {
       // The backend already emitted a terminal frame and then threw. Do
       // *not* send a second terminal — the bridge server treats a second
       // task.complete/task.fail for the same taskId as a protocol
       // violation. Surface the late throw at warn so operators notice
       // the backend's broken contract instead of seeing it silently
-      // swallowed.
+      // swallowed. The raw error message can include user content
+      // (prompts, file paths, upstream payloads) and stays out of the
+      // default-visible warn line; debug carries the full text for
+      // operators who opt in.
       deps.logger.warn(
-        `backend threw after terminal taskId=${frame.taskId} elapsedMs=${elapsedMs} terminal=${state.terminal.kind} message=${message}`,
+        `backend threw after terminal taskId=${frame.taskId} elapsedMs=${elapsedMs} terminal=${state.terminal.kind} errorClass=${errorClass}`,
+      );
+      deps.logger.debug(
+        `backend threw after terminal taskId=${frame.taskId} message=${message}`,
       );
     } else if (signal.aborted) {
       // The throw is plausibly the backend reacting to the AbortSignal it
