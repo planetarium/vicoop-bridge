@@ -132,7 +132,7 @@ include the `login` command used in Step 4:
 ```
 
 If `login --help` prints usage, you're on a current bundle. If it instead
-fails with the daemon usage (`--server`, `--token`, `--agentId`, `--card`)
+fails with the daemon usage (`--server`, `--token`, `--agentId`, `--backend`)
 or doesn't recognize `login`, you're still on an older pre-device-flow
 release and should reinstall into a fresh directory or rerun Step 1 with
 `FORCE=1`.
@@ -239,19 +239,34 @@ This means a Google-only operator can stand up a bridge client without
 ever holding a wallet or seed phrase. Owner is recorded as
 `google:sub:<sub>` (stable id, not the email).
 
-## Step 5 — Prepare the agent card
+## Step 5 — Choose a backend and optional agent card
 
-The bundle ships backend-specific starter cards under `$INSTALL_DIR/cards/`
-(`openclaw.json`, `claude.json`, `echo.json`). Agent cards are published at
-`GET <bridge>/agents/<agent_id>/.well-known/agent-card.json` and describe
-what callers can expect. At minimum you usually want to:
+Pick the local backend this client should drive:
+
+- `openclaw` — OpenClaw gateway at `OPENCLAW_GATEWAY_URL`
+- `claude` — local Claude Code CLI
+- `echo` — smoke-test backend
+
+For these built-in backends, you normally do **not** pass an agent card file.
+The client sends `BACKEND` as `backendKind`, and the bridge server publishes
+the canonical card for that backend at
+`GET <bridge>/agents/<agent_id>/.well-known/agent-card.json`. That keeps
+metadata/capability fixes on the faster server deploy path instead of
+requiring every operator to upgrade their client bundle.
+
+The bundle still ships backend-specific starter cards under
+`$INSTALL_DIR/cards/` (`openclaw.json`, `claude.json`, `echo.json`) for
+operator overrides and compatibility with older bridge servers. Set
+`AGENT_CARD` only when you intentionally want to override the server card,
+for example to:
 
 - Rename `name` to something meaningful (it defaults to `openclaw`).
 - Tighten `description` to what this specific instance actually does.
 - Adjust `skills[]` if you've customized the backend.
 
 Schema reference: `packages/protocol/src/index.ts` (`AgentCard` Zod schema,
-validated by the client at startup — invalid cards exit with a Zod error).
+validated by the client at startup when `AGENT_CARD` is set — invalid cards
+exit with a Zod error).
 
 For custom backends, write a fresh card:
 
@@ -280,7 +295,6 @@ file written by Step 4 can be loaded directly:
 ```sh
 . "$INSTALL_DIR/vicoop-client.env"
 
-AGENT_CARD="$INSTALL_DIR/cards/openclaw.json" \
 BACKEND=openclaw \
   "$INSTALL_DIR/bin/vicoop-client"
 ```
@@ -306,16 +320,14 @@ second WS. Override if yours isn't on the default:
 
 ### Claude-specific env
 
-If you're running the Claude backend, point the client at the bundled
-Claude card and optionally set `CLAUDE_CWD` so Claude works against a
-different repository than the directory where `vicoop-client` itself was
-started:
+If you're running the Claude backend, set `BACKEND=claude` and optionally set
+`CLAUDE_CWD` so Claude works against a different repository than the directory
+where `vicoop-client` itself was started:
 
 ```sh
 SERVER_URL="$SERVER_URL" \
 SERVER_TOKEN="$CLIENT_TOKEN" \
 AGENT_ID="$AGENT_ID" \
-AGENT_CARD="$INSTALL_DIR/cards/claude.json" \
 BACKEND=claude \
 CLAUDE_CWD="$HOME/vicoop-bridge" \
   "$INSTALL_DIR/bin/vicoop-client"
@@ -327,7 +339,6 @@ already-populated `SERVER_URL`, `SERVER_TOKEN`, and `AGENT_ID` assignments:
 ```sh
 . "$INSTALL_DIR/vicoop-client.env"
 
-AGENT_CARD="$INSTALL_DIR/cards/claude.json" \
 BACKEND=claude \
 CLAUDE_CWD="$HOME/vicoop-bridge" \
   "$INSTALL_DIR/bin/vicoop-client"
@@ -347,7 +358,6 @@ On systemd hosts where `install.sh` wrote a unit, update the generated env
 file with the same values used for the foreground run:
 
 ```sh
-AGENT_CARD="$INSTALL_DIR/cards/openclaw.json"
 BACKEND=openclaw
 ```
 
@@ -408,7 +418,8 @@ The upgrade command:
 3. Extracts into `$INSTALL_DIR.new/` (sibling of the current install).
 4. Copies operator files that don't ship with the bundle — notably any
    `cards/*.json` you added or files placed directly under `$INSTALL_DIR`.
-   Shipped cards (`openclaw.json`, `echo.json`, `claude.json`) are always
+   Shipped cards (`openclaw.json`, `echo.json`, `claude.json`) are kept for
+   optional overrides and older server compatibility; they are always
    replaced with the new release's versions.
 5. Runs `node $INSTALL_DIR.new/dist/cli.js --version` as a healthcheck. If it
    exits non-zero or reports the wrong version, `$INSTALL_DIR.new` is deleted
@@ -515,8 +526,9 @@ device flow and can use the admin agent the same way; admin **scope**
   `["openclaw-a", "openclaw-b", ...]`) and run one `vicoop-client` per id.
   No token rotation needed.
 - **Different backends**: in the published bundle today, pass
-  `--backend openclaw`, `--backend claude`, or `--backend echo` with a
-  matching card. Codex and other future backends are still described in
+  `--backend openclaw`, `--backend claude`, or `--backend echo`. Set
+  `--card`/`AGENT_CARD` only when you need to override the server's
+  canonical card. Codex and other future backends are still described in
   `docs/design.md` §5 but are not shipped yet.
 - **Audit/revoke access**: the admin agent exposes `list_caller_tokens`,
   `list_callers`, and `revoke_caller_token` tools; see the tool list in

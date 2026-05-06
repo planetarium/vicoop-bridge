@@ -153,24 +153,10 @@ attempts are silently replaced with the caller's own principal
 ## Step 3 — Run the echo client against WSS
 
 ```bash
-cat > /tmp/echo-card.json <<'JSON'
-{
-  "name": "echo",
-  "description": "Echo backend for e2e testing",
-  "version": "0.0.1",
-  "protocolVersion": "0.3.0",
-  "capabilities": { "streaming": false },
-  "defaultInputModes": ["text/plain"],
-  "defaultOutputModes": ["text/plain"],
-  "skills": [{ "id": "echo", "name": "echo", "description": "Echo back", "tags": ["echo"] }]
-}
-JSON
-
 (cd packages/client && ../../node_modules/.bin/tsx src/cli.ts \
   --server "$BRIDGE_WS_URL" \
   --token "$CLIENT_TOKEN" \
   --agentId "$AGENT_ID" \
-  --card /tmp/echo-card.json \
   --backend echo) &
 CLIENT_PID=$!
 # logs: [client] connected, sending hello

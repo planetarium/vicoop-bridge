@@ -92,10 +92,14 @@ export const AgentCard = z.object({
 });
 export type AgentCard = z.infer<typeof AgentCard>;
 
+export const BackendKind = z.string().min(1);
+export type BackendKind = z.infer<typeof BackendKind>;
+
 export const HelloFrame = z.object({
   type: z.literal('hello'),
   agentId: z.string(),
-  agentCard: AgentCard,
+  agentCard: AgentCard.optional(),
+  backendKind: BackendKind.optional(),
   version: z.literal(PROTOCOL_VERSION),
   token: z.string(),
 });

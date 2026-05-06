@@ -81,28 +81,13 @@ VALUES (
 ) ON CONFLICT (token_hash) DO NOTHING;
 SQL
 
-# 2. Write an agent card.
-cat > /tmp/echo-card.json <<'JSON'
-{
-  "name": "echo",
-  "description": "Echo backend for dispatch testing",
-  "version": "0.0.1",
-  "protocolVersion": "0.3.0",
-  "capabilities": { "streaming": false },
-  "defaultInputModes": ["text/plain"],
-  "defaultOutputModes": ["text/plain"],
-  "skills": [{ "id": "echo", "name": "echo", "description": "Echo back", "tags": ["echo"] }]
-}
-JSON
-
-# 3. Run the client. NOTE: --server is the base URL WITHOUT /connect — the
+# 2. Run the client. NOTE: --server is the base URL WITHOUT /connect — the
 # client appends /connect itself (client.ts:39). Pass ws:// not http://.
 cd packages/client
 ../../node_modules/.bin/tsx src/cli.ts \
   --server ws://localhost:8787 \
   --token dev-client-token-raw-12345 \
   --agentId echo-agent \
-  --card /tmp/echo-card.json \
   --backend echo
 # logs: [client] connected, sending hello
 ```

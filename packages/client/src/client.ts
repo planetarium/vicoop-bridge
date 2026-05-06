@@ -15,7 +15,8 @@ export interface ClientOptions {
   serverUrl: string;
   token: string;
   agentId: string;
-  agentCard: AgentCard;
+  agentCard?: AgentCard;
+  backendKind: string;
   backend: Backend;
   maxConcurrency?: number;
   reconnectDelayMs?: number;
@@ -45,7 +46,7 @@ export class Client {
   // backend's actual upstream capability. Cached across reconnects so we
   // don't re-probe on every bridge WS reconnect — the underlying upstream
   // doesn't change mid-process.
-  private effectiveCardPromise: Promise<AgentCard> | null = null;
+  private effectiveCardPromise: Promise<AgentCard | undefined> | null = null;
   private readonly logger: Logger;
 
   constructor(private readonly opts: ClientOptions) {
@@ -71,9 +72,13 @@ export class Client {
     this.ws?.close();
   }
 
-  private resolveEffectiveCard(): Promise<AgentCard> {
+  private resolveEffectiveCard(): Promise<AgentCard | undefined> {
     if (this.effectiveCardPromise) return this.effectiveCardPromise;
     const base = this.opts.agentCard;
+    if (!base) {
+      this.effectiveCardPromise = Promise.resolve(undefined);
+      return this.effectiveCardPromise;
+    }
     const probe = this.opts.backend.resolveCapabilities;
     if (!probe) {
       this.effectiveCardPromise = Promise.resolve(base);
@@ -160,14 +165,15 @@ export class Client {
       // handler coming. Also drop the frame silently if this socket moved
       // out of OPEN before the probe settled — the next `connect()` cycle
       // will issue its own hello.
-      const sendHello = (agentCard: AgentCard): void => {
+      const sendHello = (agentCard: AgentCard | undefined): void => {
         if (ws.readyState !== WebSocket.OPEN) return;
         this.logger.info('connected, sending hello');
         ws.send(
           encodeFrame({
             type: 'hello',
             agentId: this.opts.agentId,
-            agentCard,
+            ...(agentCard ? { agentCard } : {}),
+            backendKind: this.opts.backendKind,
             version: PROTOCOL_VERSION,
             token: this.opts.token,
           }),

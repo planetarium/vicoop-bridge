@@ -17,9 +17,7 @@
 #   3. Downloads the .tgz + .sha256 and verifies integrity.
 #   4. Extracts the bundle into INSTALL_DIR.
 #   5. On systemd hosts, drops an optional vicoop-client.service unit + env
-#      template (does NOT enable/start — verify a foreground run first). The
-#      shipped bundle already contains cards/openclaw.json, so the env
-#      template points AGENT_CARD at that file by default.
+#      template (does NOT enable/start — verify a foreground run first).
 #   6. Prints next-step instructions for login and a foreground first run.
 
 set -eu
@@ -335,14 +333,13 @@ SERVER_TOKEN=
 # One of the agent IDs allowed for this client token.
 AGENT_ID=
 
-# Absolute path to the agent card JSON (template ships at
-# \$INSTALL_DIR/cards/openclaw.json). Double-quoted so systemd's
-# EnvironmentFile parser accepts the literal value if the path is ever
-# edited to contain spaces.
-AGENT_CARD="$INSTALL_DIR/cards/openclaw.json"
-
-# One of: echo, openclaw (more backends pending, see docs/design.md §5).
+# One of: echo, openclaw, claude.
 BACKEND=openclaw
+
+# Optional operator override for the published AgentCard metadata. Leave unset
+# for the bridge server's canonical card for BACKEND. Double-quote paths with
+# spaces if you enable this in systemd EnvironmentFile syntax.
+#AGENT_CARD="$INSTALL_DIR/cards/openclaw.json"
 
 # --- OpenClaw-only (uncomment if overriding defaults) ---
 #OPENCLAW_GATEWAY_URL=ws://127.0.0.1:18789
@@ -361,7 +358,7 @@ ENVF
   # failure mode we could leave behind.
   chmod 600 "$env_file" 2>/dev/null || log "warning: could not chmod 600 $env_file"
 
-  # Warn if a kept env file's AGENT_CARD still points at a different
+  # Warn if a kept env file's optional AGENT_CARD still points at a different
   # install root than the one we just extracted into. We don't rewrite —
   # the operator may have intentionally pointed at a different card — but
   # an invisible stale pointer after \`INSTALL_DIR=\` reinstalls is worse
@@ -397,14 +394,14 @@ Next steps (the agent that owns this client should perform these):
        "$INSTALL_DIR/bin/vicoop-client" -v
        "$INSTALL_DIR/bin/vicoop-client" login --help
 
-     Then follow docs/install-client.md steps 3-5 to pick AGENT_ID, run
-     login, and choose an agent card.
+     Then follow docs/install-client.md steps 3-6 to pick AGENT_ID, run
+     login, choose a backend, and start the client.
 EOF
 
 if [ -n "$SERVICE_INSTALLED" ]; then
   cat <<EOF
   2. First run the client in the foreground with SERVER_URL / SERVER_TOKEN /
-     AGENT_ID / AGENT_CARD / BACKEND. See docs/install-client.md step 6.
+     AGENT_ID / BACKEND. See docs/install-client.md step 6.
 
   3. Optional: after the foreground run works, fill in $SERVICE_ENV_FILE,
      then reload systemd and enable + start the service:
@@ -438,7 +435,6 @@ else
        SERVER_URL=wss://your-server-host \\
        SERVER_TOKEN=... \\
        AGENT_ID=... \\
-       AGENT_CARD="$INSTALL_DIR/cards/openclaw.json" \\
        BACKEND=openclaw \\
          "$INSTALL_DIR/bin/vicoop-client"
 

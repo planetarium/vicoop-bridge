@@ -14,7 +14,7 @@ interface Args {
   server: string;
   token: string;
   agentId: string;
-  card: string;
+  card?: string;
   backend: string;
 }
 
@@ -33,13 +33,19 @@ function parseClientArgs(argv: string[]): Args {
     server: env('SERVER_URL', out.server)!,
     token: env('SERVER_TOKEN', out.token)!,
     agentId: env('AGENT_ID', out.agentId)!,
-    card: env('AGENT_CARD', out.card)!,
+    card: env('AGENT_CARD', out.card),
     backend: env('BACKEND', out.backend) ?? 'echo',
   };
-  const missing = Object.entries(resolved).filter(([, v]) => !v).map(([k]) => k);
+  const required = {
+    server: resolved.server,
+    token: resolved.token,
+    agentId: resolved.agentId,
+    backend: resolved.backend,
+  };
+  const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length) {
     console.error(`missing required args: ${missing.join(', ')}`);
-    console.error('usage: vicoop-client --server <ws://...> --token <t> --agentId <id> --card <path> [--backend echo]');
+    console.error('usage: vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude> [--card <path>]');
     process.exit(1);
   }
   return resolved;
@@ -62,14 +68,16 @@ function pickBackend(name: string): Backend {
 
 function runClient(argv: string[]): void {
   const args = parseClientArgs(argv);
-  const cardJson = JSON.parse(readFileSync(args.card, 'utf8'));
-  const agentCard = AgentCard.parse(cardJson);
+  const agentCard = args.card
+    ? AgentCard.parse(JSON.parse(readFileSync(args.card, 'utf8')))
+    : undefined;
 
   const client = new Client({
     serverUrl: args.server,
     token: args.token,
     agentId: args.agentId,
     agentCard,
+    backendKind: args.backend,
     backend: pickBackend(args.backend),
   });
 
