@@ -231,6 +231,31 @@ test('processTask: backend throws without emit -> emits backend_error fail and l
   assert.match(failLog, /code=backend_error/);
 });
 
+test('processTask: late-throw debug log preserves long error messages (not truncated at 200)', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const longMessage = 'x'.repeat(1500);
+  const backend = backendOf('stub', async (_t, emit) => {
+    emit({ type: 'task.complete', taskId: 'T1', status: { state: 'completed' } });
+    throw new Error(longMessage);
+  });
+  await processTask(makeAssign('T1'), new AbortController().signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  const debugLine = c.log.find((l) =>
+    /backend threw after terminal taskId=T1.*message=/.test(l),
+  );
+  assert.ok(debugLine, `expected debug late-throw line, got: ${c.log.join(' | ')}`);
+  // The full 1500-char message must be present (default lifecycle-token
+  // limit of 200 would truncate it; this debug log uses a generous cap).
+  assert.ok(
+    debugLine.includes(longMessage),
+    `expected full error message, got debug line of length ${debugLine.length}`,
+  );
+});
+
 test('processTask: backend emits complete then throws -> does not double-emit, warns with errorClass only', async () => {
   const c = makeSink();
   const s = captureSend();
@@ -315,7 +340,14 @@ test('processTask: backend throws after abort -> emits canceled task.complete, l
   const s = captureSend();
   const controller = new AbortController();
   controller.abort();
-  const backend = backendOf('stub', async (_t, _emit, signal) => {
+  const backend = backendOf('stub', async (_t, emit, signal) => {
+    // Backend may have streamed an artifact before observing the abort —
+    // the canceled log should still surface the artifact count.
+    emit({
+      type: 'task.artifact',
+      taskId: 'T1',
+      artifact: { artifactId: 'A', parts: [{ kind: 'text', text: 'partial' }] },
+    });
     if (signal.aborted) throw new Error('aborted');
   });
   await processTask(makeAssign('T1'), controller.signal, {
@@ -323,17 +355,18 @@ test('processTask: backend throws after abort -> emits canceled task.complete, l
     send: s.send,
     logger: createLogger('debug', c.sink),
   });
-  // Wire saw a canceled-state task.complete — not a backend_error fail.
-  assert.equal(s.sent.length, 1);
-  const sent = s.sent[0];
+  // Wire saw the artifact + a canceled-state task.complete — not a backend_error fail.
+  assert.equal(s.sent.length, 2);
+  assert.equal(s.sent[0].type, 'task.artifact');
+  const sent = s.sent[1];
   assert.equal(sent.type, 'task.complete');
   if (sent.type === 'task.complete') {
     assert.equal(sent.status.state, 'canceled');
     assert.ok(typeof sent.status.timestamp === 'string' && sent.status.timestamp.length > 0);
   }
   assert.ok(
-    c.log.some((l) => /task\.canceled taskId=T1 elapsedMs=\d+/.test(l)),
-    `expected task.canceled log, got: ${c.log.join(' | ')}`,
+    c.log.some((l) => /task\.canceled taskId=T1 elapsedMs=\d+ artifacts=1/.test(l)),
+    `expected task.canceled log with artifacts=1, got: ${c.log.join(' | ')}`,
   );
   assert.ok(
     !c.log.some((l) => /task\.fail/.test(l)),

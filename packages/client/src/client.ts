@@ -347,8 +347,12 @@ export async function processTask(
       deps.logger.warn(
         `backend threw after terminal taskId=${taskTok} elapsedMs=${elapsedMs} terminal=${state.terminal.kind} errorClass=${safeToken(errorClass)}`,
       );
+      // Use a generous limit so the full backend message is preserved at
+      // debug — the default 200-char ceiling on lifecycle tokens is too
+      // tight for an exception's text. Still escape line breaks so the
+      // log line stays single-line.
       deps.logger.debug(
-        `backend threw after terminal taskId=${taskTok} message=${safeToken(message)}`,
+        `backend threw after terminal taskId=${taskTok} message=${safeToken(message, 4000)}`,
       );
     } else if (signal.aborted) {
       // The throw is plausibly the backend reacting to the AbortSignal it
@@ -362,7 +366,9 @@ export async function processTask(
         taskId: frame.taskId,
         status: { state: 'canceled', timestamp: new Date().toISOString() },
       });
-      deps.logger.info(`task.canceled taskId=${taskTok} elapsedMs=${elapsedMs}`);
+      deps.logger.info(
+        `task.canceled taskId=${taskTok} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
+      );
     } else {
       const code = 'backend_error';
       deps.send({

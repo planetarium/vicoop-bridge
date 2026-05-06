@@ -52,12 +52,21 @@ function warnOnce(sink: ConsoleSink, key: string, message: string): void {
   sink.warn(PREFIX, message);
 }
 
+// JSON.stringify covers \n / \r / control chars and the standard JSON
+// escapes, but the spec leaves U+2028 (Line Separator) and U+2029
+// (Paragraph Separator) raw — and several log collectors / terminals
+// render them as line breaks. Replace them with their `\uXXXX` escape
+// sequences so the single-line invariant survives those sinks too.
+function escapeLineSeparators(s: string): string {
+  return s.replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+}
+
 // Quote+escape+truncate. Use for "what value was rejected"-style messages
 // where the surrounding quotes help operators see the exact string the
 // client received. Newlines and control chars are escaped; long inputs
 // are truncated with an ellipsis.
 function safeForLog(value: string, maxLen = 120): string {
-  const escaped = JSON.stringify(value);
+  const escaped = escapeLineSeparators(JSON.stringify(value));
   if (escaped.length <= maxLen) return escaped;
   // Trim to maxLen and tack on an ellipsis. The result intentionally
   // doesn't preserve the closing quote — readers see the truncation.
@@ -74,7 +83,9 @@ export function safeToken(value: string, maxLen = 200): string {
   // JSON.stringify produces a fully escaped, double-quoted string; strip
   // the surrounding quotes to keep tokens lightweight while inheriting
   // every escape rule (\n, \r, \t, \", \\, \uXXXX for control chars).
-  const escaped = JSON.stringify(value).slice(1, -1);
+  // The line-separator post-process closes the U+2028/U+2029 gap left by
+  // JSON.stringify.
+  const escaped = escapeLineSeparators(JSON.stringify(value).slice(1, -1));
   return escaped.length <= maxLen ? escaped : `${escaped.slice(0, maxLen - 1)}…`;
 }
 

@@ -270,6 +270,28 @@ test('safeToken: truncates very long tokens', () => {
   assert.match(out, /…$/);
 });
 
+test('safeToken: escapes Unicode line/paragraph separators (U+2028/U+2029)', () => {
+  // JSON.stringify leaves these raw, but several log collectors render
+  // them as line breaks — they must be escaped to keep tokens single-line.
+  const ls = ' ';
+  const ps = ' ';
+  const out = safeToken(`pre${ls}mid${ps}post`);
+  assert.equal(out.includes(ls), false, 'raw U+2028 must not survive');
+  assert.equal(out.includes(ps), false, 'raw U+2029 must not survive');
+  assert.match(out, /pre\\u2028mid\\u2029post/);
+});
+
+test('safeForLog: escapes Unicode line/paragraph separators (U+2028/U+2029)', () => {
+  _resetLogLevelWarningsForTests();
+  const c = makeSink();
+  withEnv(LOG_LEVEL_ENV, 'evil [client] FAKE INJECTED LINE', () => {
+    assert.equal(resolveLogLevel(undefined, c.sink), 'info');
+  });
+  assert.equal(c.warn.length, 1);
+  assert.equal(c.warn[0].includes(' '), false, 'raw U+2028 must not survive');
+  assert.match(c.warn[0], /evil\\u2028\[client\] FAKE INJECTED LINE/);
+});
+
 test('createLogger: trims an explicit level string', () => {
   const c = makeSink();
   const logger = createLogger(' DEBUG ', c.sink);
