@@ -1,16 +1,30 @@
 {
   "name": "claude",
-  "description": "Anthropic Claude Code CLI agent. Spawns the local `claude` binary per task and streams each assistant message back as an A2A artifact. Text input only.",
+  "description": "Anthropic Claude Code CLI agent. Spawns the local `claude` binary per task and streams each assistant message back as an A2A artifact. Accepts text, image, and PDF inputs; can return text plus image/PDF outputs from tool results.",
   "version": "0.0.1",
   "protocolVersion": "0.3.0",
   "capabilities": { "streaming": true },
-  "defaultInputModes": ["text/plain"],
-  "defaultOutputModes": ["text/plain"],
+  "defaultInputModes": [
+    "text/plain",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "application/pdf"
+  ],
+  "defaultOutputModes": [
+    "text/plain",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "application/pdf"
+  ],
   "skills": [
     {
       "id": "chat",
       "name": "chat",
-      "description": "Ask a question or give an instruction in natural language; the Claude Code CLI responds with text.",
+      "description": "Ask a question or give an instruction in natural language; the Claude Code CLI responds with text. Optionally include inline image (image/{png,jpeg,gif,webp}) or PDF (application/pdf) parts as `file.bytes`.",
       "tags": ["chat", "assistant", "claude"]
     }
   ]

@@ -1,16 +1,45 @@
 {
   "name": "openclaw",
-  "description": "General-purpose AI assistant. Can answer questions, browse the web, run shell commands, manage files, and operate tools its operator has granted. Accepts text and inline image attachments.",
+  "description": "General-purpose AI assistant. Can answer questions, browse the web, run shell commands, manage files, and operate tools its operator has granted. Accepts text, image, and PDF inputs; when the operator enables outbound file delivery, can also return file artifacts spanning images, PDFs, structured data (JSON/XML/CSV/HTML/Markdown), archives, audio, video, and other binary types.",
   "version": "0.0.1",
   "protocolVersion": "0.3.0",
   "capabilities": { "streaming": true },
-  "defaultInputModes": ["text/plain", "image/png", "image/jpeg", "image/gif", "image/webp"],
-  "defaultOutputModes": ["text/plain"],
+  "defaultInputModes": [
+    "text/plain",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "application/pdf"
+  ],
+  "defaultOutputModes": [
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "text/html",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/svg+xml",
+    "image/bmp",
+    "application/pdf",
+    "application/json",
+    "application/xml",
+    "application/zip",
+    "application/octet-stream",
+    "audio/mpeg",
+    "audio/wav",
+    "audio/ogg",
+    "video/mp4",
+    "video/quicktime",
+    "video/webm"
+  ],
   "skills": [
     {
       "id": "chat",
       "name": "chat",
-      "description": "Ask a question or give an instruction in natural language; the agent responds with text. Optionally include inline image parts (file.bytes with image/* mimeType).",
+      "description": "Ask a question or give an instruction in natural language; the agent responds with text. Optionally include inline image (image/{png,jpeg,gif,webp}) or PDF (application/pdf) parts as `file.bytes`. When the operator enables outbound file delivery, replies may also include file artifacts (images, PDFs, structured data, archives, audio, video, or other binary types).",
       "tags": ["chat", "assistant"]
     }
   ]
