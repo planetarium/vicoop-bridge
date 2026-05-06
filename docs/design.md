@@ -21,8 +21,8 @@ External A2A Client
         │
 ┌───────┴─────────────────────┐
 │  vicoop-bridge Client       │   사설망
-│  - backend: openclaw | claude-cli | codex | webhook
-│  - AgentCard 제공            │
+│  - backend: echo | openclaw | claude
+│  - backendKind + optional AgentCard override
 │  - task lifecycle 번역       │
 └─────────────────────────────┘
         │
@@ -30,7 +30,9 @@ External A2A Client
   실제 에이전트 프로세스 / API
 ```
 
-- **Server**는 에이전트 종류를 모른다. 순수 A2A 프록시 + 라우터.
+- **Server**는 dispatch 로직을 에이전트 종류에 결합하지 않는다. 다만
+  built-in backend의 AgentCard metadata는 `backendKind`로 canonical card를
+  선택해 서버 배포만으로 갱신할 수 있다.
 - **Client**가 에이전트별 변환을 담당. Claude Code/Codex 같은 CLI 에이전트는 태스크당 subprocess spawn, `--resume` / `--session-id` 로 세션 유지.
 - 연결 방향은 항상 Client → Server (아웃바운드).
 
@@ -51,7 +53,7 @@ vicoop-bridge/
 ## 4. Server ↔ Client Protocol (WS JSON frames)
 
 **Client → Server**
-- `hello`         — `{ agentCard, version, token }`
+- `hello`         — `{ backendKind?, agentCard?, version, token }`
 - `task.status`   — `{ taskId, status }`
 - `task.artifact` — `{ taskId, artifact }`
 - `task.complete` — `{ taskId, result }`
@@ -77,8 +79,8 @@ vicoop-client \
   --backend claude
   # internally: `claude -p --session-id <ctx> --resume ...`
 
-# Codex
-vicoop-client --backend codex
+# Future/custom Codex adapter (not shipped in the current client bundle)
+vicoop-client --backend codex --card ./cards/codex.json
 
 # Generic webhook
 vicoop-client \
@@ -87,9 +89,9 @@ vicoop-client \
   --card ./cards/custom.json
 ```
 
-Built-in backends send a `backendKind` and can use the bridge server's
-canonical AgentCard. `--card` is only needed for operator overrides or custom
-backends.
+Shipped built-in backends (`echo`, `openclaw`, `claude`) send a `backendKind`
+and can use the bridge server's canonical AgentCard. `--card` is only needed
+for operator overrides, older server compatibility, or custom/future backends.
 
 각 backend는 공통 인터페이스를 구현:
 ```ts
