@@ -55,6 +55,7 @@ test('rejects unknown backendKind when no inline card is provided', () => {
   assert.deepEqual(result, {
     ok: false,
     code: 4013,
-    reason: 'unknown backend kind: custom',
+    reason: 'unknown backend kind',
+    backendKind: 'custom',
   });
 });

@@ -3,9 +3,9 @@ import {
   type AgentCard as AgentCardType,
   type HelloFrame,
 } from '@vicoop-bridge/protocol';
-import claudeCard from './cards/claude.json';
-import echoCard from './cards/echo.json';
-import openclawCard from './cards/openclaw.json';
+import claudeCard from './cards/claude.json' with { type: 'json' };
+import echoCard from './cards/echo.json' with { type: 'json' };
+import openclawCard from './cards/openclaw.json' with { type: 'json' };
 
 const canonicalCards = new Map<string, AgentCardType>(
   Object.entries({
@@ -17,7 +17,7 @@ const canonicalCards = new Map<string, AgentCardType>(
 
 export type ResolvedAgentCard =
   | { ok: true; agentCard: AgentCardType; source: 'inline' | 'canonical' }
-  | { ok: false; code: number; reason: string };
+  | { ok: false; code: number; reason: string; backendKind?: string };
 
 export function resolveHelloAgentCard(
   frame: Pick<HelloFrame, 'agentCard' | 'backendKind'>,
@@ -32,12 +32,17 @@ export function resolveHelloAgentCard(
 
   const canonical = canonicalCards.get(frame.backendKind);
   if (!canonical) {
-    return { ok: false, code: 4013, reason: `unknown backend kind: ${frame.backendKind}` };
+    return {
+      ok: false,
+      code: 4013,
+      reason: 'unknown backend kind',
+      backendKind: frame.backendKind,
+    };
   }
 
   return {
     ok: true,
-    agentCard: AgentCard.parse(canonical),
+    agentCard: canonical,
     source: 'canonical',
   };
 }

@@ -128,6 +128,19 @@ async function authenticateAndRegister(
   const clientId = client.id;
   const ownerPrincipal = client.owner_principal;
 
+  const resolvedCard = resolveHelloAgentCard(frame);
+  if (!resolvedCard.ok) {
+    logEvent('client_rejected', {
+      reason: resolvedCard.reason,
+      agentId: frame.agentId,
+      clientId,
+      ...(resolvedCard.backendKind
+        ? { backendKind: truncate(resolvedCard.backendKind, 128) }
+        : {}),
+    });
+    return { ok: false, code: resolvedCard.code, reason: resolvedCard.reason };
+  }
+
   const policyResult = await ensureAgentPolicy(opts.db, frame.agentId, ownerPrincipal, clientId);
   if (!policyResult.ok) {
     logEvent('client_rejected', {
@@ -136,17 +149,6 @@ async function authenticateAndRegister(
       clientId,
     });
     return { ok: false, code: 4010, reason: policyResult.reason };
-  }
-
-  const resolvedCard = resolveHelloAgentCard(frame);
-  if (!resolvedCard.ok) {
-    logEvent('client_rejected', {
-      reason: resolvedCard.reason,
-      agentId: frame.agentId,
-      clientId,
-      backendKind: frame.backendKind,
-    });
-    return { ok: false, code: resolvedCard.code, reason: resolvedCard.reason };
   }
 
   const result = opts.registry.registerAgent({
