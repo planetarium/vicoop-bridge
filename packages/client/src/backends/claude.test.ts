@@ -1163,12 +1163,18 @@ test('heartbeat: suppressed after signal.abort so canceled tasks do not look lik
   assert.equal(last.status.state, 'canceled');
 });
 
-test('summarizeToolInput stays bounded for a huge top-level array (no full JSON.stringify)', async () => {
-  // 100k tiny objects in a top-level field. A naive JSON.stringify of
-  // the whole input would produce ~MiBs of output before clipTo trims
-  // it. The bounded serializer must stop walking once the summary is
-  // long enough to be clipped anyway.
-  const huge = { items: Array.from({ length: 100_000 }, (_, i) => ({ i })) };
+test('summarizeToolInput stays bounded for a top-level structure with 100k entries (early-bail walk)', async () => {
+  // The summarizer doesn't recurse — nested structures are summarized
+  // as a `<object>` / `<array(N)>` tag — so we have to put the bulk
+  // *at the top level* to actually exercise the bounded-walk path.
+  // Two shapes drive the two branches:
+  //   - a top-level object with 100k keys → `for..in` early-bail
+  //   - a top-level array  with 100k items → `for(i...)` early-bail
+  // For the test we pick the object branch because it also guards
+  // against regressing the `Object.keys`-allocates-full-list case.
+  const hugeObj: Record<string, number> = {};
+  for (let i = 0; i < 100_000; i++) hugeObj[`k${i}`] = i;
+
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({
@@ -1180,7 +1186,7 @@ test('summarizeToolInput stays bounded for a huge top-level array (no full JSON.
               type: 'tool_use',
               id: 'tu_huge',
               name: 'BulkOp',
-              input: huge,
+              input: hugeObj,
             },
           ],
         },
@@ -1206,11 +1212,15 @@ test('summarizeToolInput stays bounded for a huge top-level array (no full JSON.
     textPart.text.length <= 200,
     `summary length ${textPart.text.length} exceeds cap`,
   );
-  // Bounded serializer should finish well under a second on a 100k-entry
-  // input — a naive full JSON.stringify on this would still be quick on
-  // modern hardware, so this is a smoke check, not a hard SLA. If this
-  // ever fails, something walked the whole structure recursively.
-  assert.ok(elapsedMs < 2000, `summarize took ${elapsedMs}ms — likely walked the full input`);
+  // Smoke check: the early-bail walk should finish in well under a
+  // second. A regression that materializes the full key list (e.g.
+  // reverting to `Object.keys(input)`) is still fast on modern
+  // hardware, so this isn't a hard SLA — but anything walking 100k
+  // values would blow well past a couple of seconds.
+  assert.ok(
+    elapsedMs < 2000,
+    `summarize took ${elapsedMs}ms — likely walked the full input`,
+  );
 });
 
 test('heartbeat: heartbeatMs:0 disables the interval entirely', async () => {

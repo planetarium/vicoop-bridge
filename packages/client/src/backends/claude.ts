@@ -262,7 +262,13 @@ function summarizeToolInput(input: unknown, clipPerString: number): string {
     }
     let out = '{';
     let first = true;
-    for (const k of Object.keys(input)) {
+    // Stream keys via `for..in` rather than `Object.keys`: the latter
+    // allocates the full key array up front, which would itself be
+    // unbounded on a tool input with 100k top-level keys. With `for..in`
+    // we can stop walking as soon as we hit `budget` without paying for
+    // keys we'll never look at.
+    for (const k in input) {
+      if (!Object.prototype.hasOwnProperty.call(input, k)) continue;
       if (out.length >= budget) break;
       if (!first) out += ',';
       first = false;
