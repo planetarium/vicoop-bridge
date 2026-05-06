@@ -4,7 +4,12 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { createClaudeBackend, type ClaudeChildHandle, type ClaudeSpawnOptions } from './claude.js';
+import {
+  createClaudeBackend,
+  summarizeToolInput,
+  type ClaudeChildHandle,
+  type ClaudeSpawnOptions,
+} from './claude.js';
 import type { TaskAssignFrame, UpFrame } from '@vicoop-bridge/protocol';
 
 const NEVER: AbortSignal = new AbortController().signal;
@@ -1163,64 +1168,76 @@ test('heartbeat: suppressed after signal.abort so canceled tasks do not look lik
   assert.equal(last.status.state, 'canceled');
 });
 
-test('summarizeToolInput stays bounded for a top-level structure with 100k entries (early-bail walk)', async () => {
-  // The summarizer doesn't recurse — nested structures are summarized
-  // as a `<object>` / `<array(N)>` tag — so we have to put the bulk
-  // *at the top level* to actually exercise the bounded-walk path.
-  // Two shapes drive the two branches:
-  //   - a top-level object with 100k keys → `for..in` early-bail
-  //   - a top-level array  with 100k items → `for(i...)` early-bail
-  // For the test we pick the object branch because it also guards
-  // against regressing the `Object.keys`-allocates-full-list case.
-  const hugeObj: Record<string, number> = {};
-  for (let i = 0; i < 100_000; i++) hugeObj[`k${i}`] = i;
+test('summarizeToolInput bails early on a top-level object with many keys (deterministic visit count)', async () => {
+  // Deterministic regression guard for the bounded-walk behavior.
+  // Each key is an instrumented enumerable getter that records when
+  // its value is read. With ~80-char string values, 3 keys' worth of
+  // serialization already pushes the accumulator past `budget`
+  // (200 + 16 = 216 chars), so the walker MUST bail before reading
+  // the 4th value. A regression that materializes the full key list
+  // (e.g. reverting to `Object.keys`) or that fails to early-break
+  // would walk into the tripwire keys and blow the assertion.
+  //
+  // Going through the backend handle() path would force the test
+  // itself to JSON.stringify the input as part of the stream-json
+  // line, triggering every getter and ruining the count — so we
+  // call summarizeToolInput directly. The production wiring is
+  // already exercised by other tests in this file.
+  const probed: string[] = [];
+  const inp: Record<string, unknown> = {};
+  const layout: Array<[string, string]> = [
+    ['a', 'x'.repeat(80)],
+    ['b', 'y'.repeat(80)],
+    ['c', 'z'.repeat(80)],
+    // Tripwires: walker must NOT reach these. Their getters push
+    // onto `probed` just like the real keys, so a regression makes
+    // them visible.
+    ['tripwire_1', 'should-not-be-read'],
+    ['tripwire_2', 'should-not-be-read'],
+    ['tripwire_3', 'should-not-be-read'],
+  ];
+  for (const [k, v] of layout) {
+    Object.defineProperty(inp, k, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        probed.push(k);
+        return v;
+      },
+    });
+  }
 
-  const fake = scriptedSpawn({
-    lines: [
-      JSON.stringify({
-        type: 'assistant',
-        message: {
-          role: 'assistant',
-          content: [
-            {
-              type: 'tool_use',
-              id: 'tu_huge',
-              name: 'BulkOp',
-              input: hugeObj,
-            },
-          ],
-        },
-      }),
-      JSON.stringify({ type: 'result', result: 'ok' }),
-    ],
-    exitCode: 0,
-  });
-  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
-  const { emit, frames } = collect();
-  const t0 = Date.now();
-  await backend.handle(assign('x'), emit, NEVER);
-  const elapsedMs = Date.now() - t0;
+  const summary = summarizeToolInput(inp, 200);
 
-  const callArtifact = frames.find(
-    (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
-      f.type === 'task.artifact' && f.artifact.name === 'claude-tool-call',
+  // Deterministic guarantee: only the first 3 keys' values were ever
+  // read. The walker hits the budget check at the top of iteration 4
+  // and bails before touching the tripwire getters. The summary's
+  // own length is bounded by O(visited × clipPerString) — not
+  // O(total keys × clipPerString) — so it's strictly smaller than a
+  // full JSON.stringify would produce, but we don't assert an exact
+  // ceiling because one iteration can overshoot the soft budget by
+  // up to one clipped key + clipped value.
+  assert.deepEqual(
+    probed,
+    ['a', 'b', 'c'],
+    `walker should bail after 3 keys; visited ${probed.join(',')}`,
   );
-  assert.ok(callArtifact);
-  const textPart = callArtifact.artifact.parts[0];
-  if (textPart.kind !== 'text') throw new Error('expected text part');
-  assert.ok(
-    textPart.text.length <= 200,
-    `summary length ${textPart.text.length} exceeds cap`,
-  );
-  // Smoke check: the early-bail walk should finish in well under a
-  // second. A regression that materializes the full key list (e.g.
-  // reverting to `Object.keys(input)`) is still fast on modern
-  // hardware, so this isn't a hard SLA — but anything walking 100k
-  // values would blow well past a couple of seconds.
-  assert.ok(
-    elapsedMs < 2000,
-    `summarize took ${elapsedMs}ms — likely walked the full input`,
-  );
+  assert.ok(!summary.includes('tripwire'), 'tripwire keys must not appear in summary');
+});
+
+test('summarizeToolInput clips both keys and values so a giant key cannot blow the budget', async () => {
+  // A 50k-char top-level key alone would, before key-clipping, drive
+  // a 50k-char JSON.stringify allocation just to land that one
+  // property — defeating the bounded-cost guarantee on the *first*
+  // iteration. With key clipping in place the produced summary is
+  // bounded by the same per-string cap that values use.
+  const giantKey = 'K'.repeat(50_000);
+  const inp = { [giantKey]: 'tiny' };
+  const summary = summarizeToolInput(inp, 200);
+  assert.ok(summary.length <= 216, `summary length ${summary.length} exceeds budget`);
+  // The clipped key prefix is present, but not the full 50k-char form.
+  assert.ok(summary.includes('KKKK'));
+  assert.ok(!summary.includes('K'.repeat(1000)), 'giant key must not appear verbatim');
 });
 
 test('heartbeat: heartbeatMs:0 disables the interval entirely', async () => {

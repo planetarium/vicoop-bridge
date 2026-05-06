@@ -237,7 +237,9 @@ function stringifyValueClipped(v: unknown, clipPerString: number): string {
   }
 }
 
-function summarizeToolInput(input: unknown, clipPerString: number): string {
+// Exported for direct tests of the bounded-walk behavior; the production
+// caller (handleEvent → emitToolCallArtifact) goes through it indirectly.
+export function summarizeToolInput(input: unknown, clipPerString: number): string {
   if (input === undefined || input === null) return '';
   if (typeof input === 'string') return input.slice(0, clipPerString + 1);
   if (typeof input !== 'object') {
@@ -272,7 +274,12 @@ function summarizeToolInput(input: unknown, clipPerString: number): string {
       if (out.length >= budget) break;
       if (!first) out += ',';
       first = false;
-      out += JSON.stringify(k) + ':';
+      // Clip the key too: a 100-KB property name would otherwise drive
+      // a 100-KB+ JSON.stringify allocation just to hit the budget on
+      // the next line. Same `clipPerString` cap applies to keys and
+      // values so the bounded-cost guarantee holds for both.
+      const clippedKey = k.length > clipPerString ? k.slice(0, clipPerString) : k;
+      out += JSON.stringify(clippedKey) + ':';
       out += stringifyValueClipped((input as Record<string, unknown>)[k], clipPerString);
     }
     return out + '}';
