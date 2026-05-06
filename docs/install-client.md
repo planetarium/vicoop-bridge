@@ -2,9 +2,10 @@
 
 Onboarding guide for connecting a local A2A backend (OpenClaw, Claude Code,
 with `echo` available for testing) to a deployed vicoop-bridge server. The
-end state is a long-running `vicoop-client` process on your host that bridges
-inbound A2A traffic at `POST <bridge>/agents/<your-agent-id>` to your local
-backend.
+first target is a verified foreground `vicoop-client` process on your host
+that bridges inbound A2A traffic at `POST <bridge>/agents/<your-agent-id>` to
+your local backend. Persistent service setup is optional once the foreground
+run works.
 
 Additional backends (Codex, ...) are described in `docs/design.md` §5 but are
 not in the published client bundle yet. The released client currently
@@ -75,7 +76,7 @@ would still default to `/data/vicoop-bridge-client`.
 | `INSTALL_DIR` | `/data/vicoop-bridge-client` | Target directory. Pick a writable path on a volume that survives restarts. |
 | `VERSION` | latest `client-v*` | Pin a specific tag, e.g. `client-v0.1.1`. |
 | `FORCE` | `0` | If `1`, overwrite a non-empty `INSTALL_DIR`. |
-| `INSTALL_SKIP_SERVICE` | `0` | If `1`, skip the systemd unit + env template even on systemd hosts. |
+| `INSTALL_SKIP_SERVICE` | `0` | If `1`, skip the optional systemd unit + env template even on systemd hosts. |
 | `INSTALL_SERVICE_SCOPE` | `auto` | Force `user`, `system`, or `none` instead of auto-detecting by `id -u`. `system` requires root; an explicit `system` without root is refused with a warning. |
 
 What you get after extraction:
@@ -95,13 +96,13 @@ The script targets Linux (Fly.io persistent volumes are the original target
 deployment); on macOS it prints a warning and proceeds. See #17 / #21 for
 background.
 
-When systemd is the host init, `install.sh` also writes a
+When systemd is the host init, `install.sh` may also write an optional
 `vicoop-client.service` unit plus a `vicoop-client.env` template (scope
 auto-detected: `system` as root, `user` otherwise). It does not enable or
-start the service — env values are populated by Steps 3-5 below, and the
-operator runs the `systemctl enable --now` command from the installer's
-output once they're filled in. Opt out with `INSTALL_SKIP_SERVICE=1`, or
-force a scope with `INSTALL_SERVICE_SCOPE=user|system|none`.
+start the service. Use the foreground run in Step 6 first; enable the service
+later only if this host should keep the client online unattended. Opt out with
+`INSTALL_SKIP_SERVICE=1`, or force a scope with
+`INSTALL_SERVICE_SCOPE=user|system|none`.
 
 ## Step 2 — Verify the installed bundle
 
@@ -174,7 +175,7 @@ CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
   --bridge "$BRIDGE_URL" \
   --client-name "$CLIENT_NAME" \
   --agent-ids "$AGENT_ID" \
-  --env-file "$INSTALL_DIR/vicoop-client.env"
+  --write-env-file "$INSTALL_DIR/vicoop-client.env"
 ```
 
 The CLI prints a verification URL to stderr — open it in **any** browser
@@ -197,8 +198,8 @@ AGENT_ID=<your agent id>
 > `intent=owner_session` — the rotation surfaces a new CLIENT_TOKEN, also
 > one-time).
 
-Drop `--env-file` and pass `--json` instead if you want to compose with
-shell tooling:
+Drop `--write-env-file` and pass `--json` instead if you want to compose
+with shell tooling:
 
 ```sh
 "$INSTALL_DIR/bin/vicoop-client" login \
@@ -207,6 +208,11 @@ shell tooling:
   | tee /tmp/vicoop-login.json
 CLIENT_TOKEN=$(jq -r .client_token /tmp/vicoop-login.json)
 ```
+
+`--write-env-file` replaces the older `--env-file` spelling. The old alias is
+still accepted by current bundles, but avoid it on Node 24 or newer unless the
+bundle wrapper has been updated to invoke `node -- dist/cli.js`; otherwise
+Node may consume `--env-file` before the CLI sees it.
 
 `--agent-ids` is a comma-separated allowlist. Include every id you plan to
 run under this single token if you know them up front; amend later via
@@ -268,21 +274,12 @@ JSON
 
 ## Step 6 — Run the client
 
-All flags also accept env vars, which is usually cleaner for long-running
-services:
+Run the client in the foreground first. All flags also accept env vars, so the
+file written by Step 4 can be loaded directly:
 
 ```sh
-# The client appends /connect to SERVER_URL, so it must be a bare origin
-# (scheme+host+port only, no path). Derive via URL parsing and map the
-# scheme to its WS counterpart.
-SERVER_URL=$(BRIDGE_URL="$BRIDGE_URL" node -p '
-  const u = new URL(process.env.BRIDGE_URL);
-  (u.protocol === "https:" ? "wss:" : "ws:") + "//" + u.host
-')
+. "$INSTALL_DIR/vicoop-client.env"
 
-SERVER_URL="$SERVER_URL" \
-SERVER_TOKEN="$CLIENT_TOKEN" \
-AGENT_ID="$AGENT_ID" \
 AGENT_CARD="$INSTALL_DIR/cards/openclaw.json" \
 BACKEND=openclaw \
   "$INSTALL_DIR/bin/vicoop-client"
@@ -324,9 +321,47 @@ CLAUDE_CWD="$HOME/vicoop-bridge" \
   "$INSTALL_DIR/bin/vicoop-client"
 ```
 
+If you used `--write-env-file` in Step 4, load it first and omit the
+already-populated `SERVER_URL`, `SERVER_TOKEN`, and `AGENT_ID` assignments:
+
+```sh
+. "$INSTALL_DIR/vicoop-client.env"
+
+AGENT_CARD="$INSTALL_DIR/cards/claude.json" \
+BACKEND=claude \
+CLAUDE_CWD="$HOME/vicoop-bridge" \
+  "$INSTALL_DIR/bin/vicoop-client"
+```
+
 `CLAUDE_CWD` defaults to the current working directory of the client
 process. Set it when the released bundle lives outside the repository you
 want Claude to edit.
+
+## Optional: persistence
+
+Only set up persistence after the foreground run connects and the agent
+endpoint responds. For local Claude/OpenClaw onboarding, a foreground process
+is often enough for first success.
+
+On systemd hosts where `install.sh` wrote a unit, update the generated env
+file with the same values used for the foreground run:
+
+```sh
+AGENT_CARD="$INSTALL_DIR/cards/openclaw.json"
+BACKEND=openclaw
+```
+
+Then reload and start the service using the exact commands printed by the
+installer, for example:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now vicoop-client
+```
+
+For macOS or ad hoc local testing, use the foreground command above or your
+normal process supervisor. The bridge does not require systemd; it only needs
+one live `vicoop-client` process connected for the agent id.
 
 ### Restrict who can call your agent
 
