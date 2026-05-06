@@ -70,17 +70,15 @@ vicoop-bridge/
 vicoop-client \
   --server wss://bridge.vicoop.xyz \
   --token $TOKEN \
-  --backend openclaw \
-  --card ./cards/openclaw.json
+  --backend openclaw
 
 # Claude Code
 vicoop-client \
-  --backend claude-cli \
-  --card ./cards/claude-code.json
+  --backend claude
   # internally: `claude -p --session-id <ctx> --resume ...`
 
 # Codex
-vicoop-client --backend codex --card ./cards/codex.json
+vicoop-client --backend codex
 
 # Generic webhook
 vicoop-client \
@@ -88,6 +86,10 @@ vicoop-client \
   --backend-url http://localhost:8080/agent \
   --card ./cards/custom.json
 ```
+
+Built-in backends send a `backendKind` and can use the bridge server's
+canonical AgentCard. `--card` is only needed for operator overrides or custom
+backends.
 
 각 backend는 공통 인터페이스를 구현:
 ```ts

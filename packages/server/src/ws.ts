@@ -14,6 +14,7 @@ import type { Sql } from './db.js';
 import { hashToken } from './token.js';
 import { logEvent, truncate } from './log.js';
 import { isReservedAgentId } from './reserved-agent-ids.js';
+import { resolveHelloAgentCard } from './card-resolver.js';
 
 interface ClientRow {
   id: string;
@@ -90,7 +91,7 @@ export function attachWsServer(server: Server, opts: ServerWsOptions): void {
 }
 
 type AuthResult =
-  | { ok: true; clientId: string }
+  | { ok: true; clientId: string; cardName: string; cardSource: 'inline' | 'canonical' }
   | { ok: false; code: number; reason: string };
 
 async function authenticateAndRegister(
@@ -137,11 +138,22 @@ async function authenticateAndRegister(
     return { ok: false, code: 4010, reason: policyResult.reason };
   }
 
+  const resolvedCard = resolveHelloAgentCard(frame);
+  if (!resolvedCard.ok) {
+    logEvent('client_rejected', {
+      reason: resolvedCard.reason,
+      agentId: frame.agentId,
+      clientId,
+      backendKind: frame.backendKind,
+    });
+    return { ok: false, code: resolvedCard.code, reason: resolvedCard.reason };
+  }
+
   const result = opts.registry.registerAgent({
     agentId: frame.agentId,
     clientId,
     ownerPrincipal,
-    agentCard: frame.agentCard,
+    agentCard: resolvedCard.agentCard,
     allowedCallers: policyResult.allowedCallers,
     ws,
     connectedAt: Date.now(),
@@ -155,7 +167,12 @@ async function authenticateAndRegister(
     return { ok: false, code: 4006, reason: result.reason };
   }
 
-  return { ok: true, clientId };
+  return {
+    ok: true,
+    clientId,
+    cardName: resolvedCard.agentCard.name,
+    cardSource: resolvedCard.source,
+  };
 }
 
 function wireMessageToA2X(
@@ -230,7 +247,8 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         logEvent('client_connected', {
           agentId,
           clientId: result.clientId,
-          name: frame.agentCard.name,
+          name: result.cardName,
+          cardSource: result.cardSource,
         });
       }).catch((err) => {
         console.error('[server] auth error:', err);
