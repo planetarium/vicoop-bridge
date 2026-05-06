@@ -416,10 +416,14 @@ export function createClaudeBackend(
     getSendFileMcpServer: () => sendFileMcp,
 
     async handle(task, rawEmit, signal) {
-      // Idle-silence heartbeat needs to observe every outbound frame so it
-      // doesn't fire while real traffic is flowing. Wrap rawEmit so every
-      // emission refreshes `lastEmitAt`. The heartbeat itself goes through
-      // rawEmit directly to avoid a no-op self-trigger loop.
+      // Idle-silence heartbeat needs to observe every outbound frame so
+      // it doesn't fire while real traffic is flowing. Wrap rawEmit so
+      // every emission refreshes `lastEmitAt`. The heartbeat tick also
+      // goes through this wrapped `emit` (NOT `rawEmit`) — that is what
+      // resets `lastEmitAt` on a heartbeat frame so a follow-up tick at
+      // the same instant sees a fresh window and skips. See the tick
+      // site below for the rationale; the two comments must stay
+      // consistent.
       let lastEmitAt = now();
       const emit: typeof rawEmit = (frame) => {
         lastEmitAt = now();
