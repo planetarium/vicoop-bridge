@@ -84,10 +84,13 @@ interface SessionEntry {
 //   result                     → task.complete (state: completed)
 //   <heartbeatMs of silence>   → task.status (state: working, no body)
 //
-// Tool inputs are head-truncated to ~200 chars before they hit the wire
-// (`TOOL_CALL_SUMMARY_MAX_CHARS`). The structured tool name + tool_use_id
-// ride along as a `data` part so consumers can filter/count tool calls
-// even when the summary text was clipped.
+// The `claude-tool-call` summary line is bounded as a whole: the
+// `<tool>: <input>` text part is hard-capped at TOOL_CALL_SUMMARY_MAX_CHARS
+// (tool-name prefix + JSON overhead included), and the JSON serializer
+// also pre-clips individual string values during walking so a single
+// huge field can't drive a multi-MiB intermediate buffer. The structured
+// tool name + tool_use_id ride along on a `data` part so consumers can
+// filter/count tool calls reliably even after the text was clipped.
 interface StreamEvent {
   type?: unknown;
   message?: {
@@ -200,25 +203,73 @@ interface ToolUseBlock {
 }
 
 // Bounded stringification for a `tool_use.input`. The naive
-// `JSON.stringify(input)` would materialize the entire input as a
-// string before the caller clips to TOOL_CALL_SUMMARY_MAX_CHARS, so a
-// `Write` call with a multi-MiB `content` value would allocate the
-// full multi-MiB output buffer for nothing. We pass a replacer that
-// clips any individual string value to at most `clipPerString` chars
-// before serialization, and we also slice the input itself when it
-// arrives as a bare string. End result: peak intermediate string size
-// is bounded by O(structure-size × clipPerString) instead of the
-// original input size.
+// `JSON.stringify(input)` materializes the whole input as a string
+// before the caller clips to TOOL_CALL_SUMMARY_MAX_CHARS, so a tool
+// with a multi-MiB string field — or a top-level array of 100k tiny
+// values — would allocate a giant intermediate buffer just to chop
+// the first 200 chars. We avoid both:
+//
+//   1. Per-string clip:  any individual string value longer than
+//      `clipPerString` is sliced before serialization.
+//   2. Hard total budget: we walk top-level keys/elements only and
+//      bail out once the accumulator exceeds `budget` chars. The
+//      caller's `clipTo` does the final trim.
+//   3. No recursion:     nested objects / arrays are summarized as a
+//      type tag (`"<object>"` / `"<array(N)>"`) rather than walked,
+//      so depth is irrelevant to cost.
+//
+// Worst-case work is O(top-level-keys × clipPerString) and the
+// returned string itself is bounded by `budget`, regardless of the
+// input's actual size or shape.
+function stringifyValueClipped(v: unknown, clipPerString: number): string {
+  if (typeof v === 'string') {
+    return JSON.stringify(v.length > clipPerString ? v.slice(0, clipPerString) : v);
+  }
+  if (v === null || typeof v === 'number' || typeof v === 'boolean') {
+    return JSON.stringify(v);
+  }
+  if (Array.isArray(v)) return `"<array(${v.length})>"`;
+  if (typeof v === 'object') return '"<object>"';
+  try {
+    return JSON.stringify(String(v));
+  } catch {
+    return '"?"';
+  }
+}
+
 function summarizeToolInput(input: unknown, clipPerString: number): string {
   if (input === undefined || input === null) return '';
   if (typeof input === 'string') return input.slice(0, clipPerString + 1);
+  if (typeof input !== 'object') {
+    try {
+      return String(input).slice(0, clipPerString + 1);
+    } catch {
+      return '<unserializable>';
+    }
+  }
+  // Small overshoot lets the caller's clipTo see we exceeded and apply
+  // its truncation marker; we don't need exact-budget output here.
+  const budget = clipPerString + 16;
   try {
-    return JSON.stringify(input, (_key, value) => {
-      if (typeof value === 'string' && value.length > clipPerString) {
-        return value.slice(0, clipPerString);
+    if (Array.isArray(input)) {
+      let out = '[';
+      for (let i = 0; i < input.length; i++) {
+        if (out.length >= budget) break;
+        if (i > 0) out += ',';
+        out += stringifyValueClipped(input[i], clipPerString);
       }
-      return value;
-    });
+      return out + ']';
+    }
+    let out = '{';
+    let first = true;
+    for (const k of Object.keys(input)) {
+      if (out.length >= budget) break;
+      if (!first) out += ',';
+      first = false;
+      out += JSON.stringify(k) + ':';
+      out += stringifyValueClipped((input as Record<string, unknown>)[k], clipPerString);
+    }
+    return out + '}';
   } catch {
     return '<unserializable>';
   }
@@ -756,6 +807,11 @@ export function createClaudeBackend(
       if (heartbeatMs > 0) {
         heartbeatHandle = setIntervalImpl(() => {
           if (settled) return;
+          // After abort the run is going to settle as `canceled` once
+          // the child finishes tearing down; emitting more
+          // `state: working` heartbeats in that window would actively
+          // misrepresent the task status to the caller. Suppress them.
+          if (aborted) return;
           if (now() - lastEmitAt < heartbeatMs) return;
           // Route through the wrapped `emit` (NOT `rawEmit`): the
           // wrapper refreshes `lastEmitAt` before forwarding the frame,

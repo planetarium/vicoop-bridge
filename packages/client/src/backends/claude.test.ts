@@ -1108,6 +1108,111 @@ test('heartbeat: emits task.status after heartbeatMs of silence and stops at ter
   );
 });
 
+test('heartbeat: suppressed after signal.abort so canceled tasks do not look like they are still working', async () => {
+  let scheduledFn: () => void = () => {};
+  let nowMs = 1_000_000;
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      // Hold the child open. Termination is driven by abort → kill().
+      void child;
+    });
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    heartbeatMs: 100,
+    now: () => nowMs,
+    setIntervalFn: (fn) => {
+      scheduledFn = fn;
+      return { tag: 'fake-interval' };
+    },
+    clearIntervalFn: () => {},
+  });
+  const controller = new AbortController();
+  const { emit, frames } = collect();
+  const runP = backend.handle(assign('x'), emit, controller.signal);
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+
+  // Sanity: the heartbeat fires while the task is still working.
+  nowMs += 250;
+  scheduledFn();
+  const before = frames.filter((f) => f.type === 'task.status').length;
+  assert.ok(before >= 2, 'heartbeat must emit at least one extra task.status while working');
+
+  // Abort. Subsequent heartbeat ticks must NOT add more `state: working`
+  // status frames — the run is on its way to a `canceled` terminal frame.
+  controller.abort();
+  nowMs += 250;
+  scheduledFn();
+  nowMs += 250;
+  scheduledFn();
+
+  await runP;
+
+  const workingStatusCount = frames.filter(
+    (f) =>
+      f.type === 'task.status' &&
+      (f as Extract<UpFrame, { type: 'task.status' }>).status.state === 'working',
+  ).length;
+  assert.equal(
+    workingStatusCount,
+    before,
+    'no extra working-state heartbeats may land between abort and terminal frame',
+  );
+  const last = frames.at(-1) as Extract<UpFrame, { type: 'task.complete' }>;
+  assert.equal(last.type, 'task.complete');
+  assert.equal(last.status.state, 'canceled');
+});
+
+test('summarizeToolInput stays bounded for a huge top-level array (no full JSON.stringify)', async () => {
+  // 100k tiny objects in a top-level field. A naive JSON.stringify of
+  // the whole input would produce ~MiBs of output before clipTo trims
+  // it. The bounded serializer must stop walking once the summary is
+  // long enough to be clipped anyway.
+  const huge = { items: Array.from({ length: 100_000 }, (_, i) => ({ i })) };
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'tu_huge',
+              name: 'BulkOp',
+              input: huge,
+            },
+          ],
+        },
+      }),
+      JSON.stringify({ type: 'result', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
+  const { emit, frames } = collect();
+  const t0 = Date.now();
+  await backend.handle(assign('x'), emit, NEVER);
+  const elapsedMs = Date.now() - t0;
+
+  const callArtifact = frames.find(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
+      f.type === 'task.artifact' && f.artifact.name === 'claude-tool-call',
+  );
+  assert.ok(callArtifact);
+  const textPart = callArtifact.artifact.parts[0];
+  if (textPart.kind !== 'text') throw new Error('expected text part');
+  assert.ok(
+    textPart.text.length <= 200,
+    `summary length ${textPart.text.length} exceeds cap`,
+  );
+  // Bounded serializer should finish well under a second on a 100k-entry
+  // input — a naive full JSON.stringify on this would still be quick on
+  // modern hardware, so this is a smoke check, not a hard SLA. If this
+  // ever fails, something walked the whole structure recursively.
+  assert.ok(elapsedMs < 2000, `summarize took ${elapsedMs}ms — likely walked the full input`);
+});
+
 test('heartbeat: heartbeatMs:0 disables the interval entirely', async () => {
   let registered = false;
   const fake = scriptedSpawn({
