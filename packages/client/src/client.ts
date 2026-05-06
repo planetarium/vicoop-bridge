@@ -4,9 +4,11 @@ import {
   encodeFrame,
   parseDownFrame,
   type AgentCard,
+  type Part,
   type UpFrame,
 } from '@vicoop-bridge/protocol';
-import type { Backend } from './backend.js';
+import type { Backend, Emit } from './backend.js';
+import { createLogger, type LogLevel, type Logger } from './logger.js';
 
 export interface ClientOptions {
   serverUrl: string;
@@ -22,6 +24,11 @@ export interface ClientOptions {
   // server's 10s hello deadline so a slow or hung probe cannot push us
   // into the 4001 "hello timeout" close and a reconnect loop.
   probeDeadlineMs?: number;
+  // Verbosity for client-emitted logs. Falls back to the
+  // `VICOOP_CLIENT_LOG_LEVEL` env var, then to `info`. Lifecycle events
+  // (task.assign / backend.start / task.complete / task.fail / task.cancel)
+  // surface at `info`; `debug` adds messageId and per-part detail.
+  logLevel?: LogLevel;
 }
 
 const DEFAULT_PROBE_DEADLINE_MS = 3000;
@@ -36,8 +43,11 @@ export class Client {
   // don't re-probe on every bridge WS reconnect — the underlying upstream
   // doesn't change mid-process.
   private effectiveCardPromise: Promise<AgentCard> | null = null;
+  private readonly logger: Logger;
 
-  constructor(private readonly opts: ClientOptions) {}
+  constructor(private readonly opts: ClientOptions) {
+    this.logger = createLogger(opts.logLevel);
+  }
 
   start(): void {
     // Kick off the capability probe before opening the bridge WS so it runs
@@ -82,16 +92,16 @@ export class Client {
       const probePromise = Promise.resolve()
         .then(() => probe.call(this.opts.backend))
         .catch((err: unknown) => {
-          console.warn(
-            `[client] backend capability probe threw (${err instanceof Error ? err.message : String(err)}); using declared card capabilities`,
+          this.logger.warn(
+            `backend capability probe threw (${err instanceof Error ? err.message : String(err)}); using declared card capabilities`,
           );
           return null;
         });
       try {
         const outcome = await Promise.race([probePromise, timeoutPromise]);
         if (outcome === TIMEOUT) {
-          console.warn(
-            `[client] backend capability probe did not complete within ${deadlineMs}ms; sending hello with declared card capabilities`,
+          this.logger.warn(
+            `backend capability probe did not complete within ${deadlineMs}ms; sending hello with declared card capabilities`,
           );
           return base;
         }
@@ -144,7 +154,7 @@ export class Client {
       // will issue its own hello.
       const sendHello = (agentCard: AgentCard): void => {
         if (ws.readyState !== WebSocket.OPEN) return;
-        console.log('[client] connected, sending hello');
+        this.logger.info('connected, sending hello');
         ws.send(
           encodeFrame({
             type: 'hello',
@@ -162,8 +172,8 @@ export class Client {
       this.resolveEffectiveCard()
         .then(sendHello)
         .catch((err: unknown) => {
-          console.warn(
-            `[client] effectiveCard promise rejected unexpectedly (${err instanceof Error ? err.message : String(err)}); sending hello with declared card`,
+          this.logger.warn(
+            `effectiveCard promise rejected unexpectedly (${err instanceof Error ? err.message : String(err)}); sending hello with declared card`,
           );
           sendHello(this.opts.agentCard);
         });
@@ -174,15 +184,22 @@ export class Client {
       try {
         frame = parseDownFrame(typeof raw === 'string' ? raw : raw.toString('utf8'));
       } catch (err) {
-        console.error('[client] invalid frame:', err);
+        this.logger.error('invalid frame:', err);
         return;
       }
 
       switch (frame.type) {
         case 'task.assign':
+          this.logger.info(
+            `task.assign taskId=${frame.taskId} contextId=${frame.contextId} parts=${summarizeParts(frame.message.parts)}`,
+          );
+          this.logger.debug(
+            `task.assign detail taskId=${frame.taskId} messageId=${frame.message.messageId} role=${frame.message.role} partsCount=${frame.message.parts.length}`,
+          );
           this.runTask(frame);
           break;
         case 'task.cancel':
+          this.logger.info(`task.cancel taskId=${frame.taskId}`);
           this.inflight.get(frame.taskId)?.abort();
           break;
         case 'ping':
@@ -192,7 +209,7 @@ export class Client {
     });
 
     ws.on('close', (code, reason) => {
-      console.log(`[client] disconnected: ${code} ${reason.toString()}`);
+      this.logger.info(`disconnected: ${code} ${reason.toString()}`);
       this.ws = null;
       if (!this.stopped) {
         const delay = this.opts.reconnectDelayMs ?? 3000;
@@ -201,7 +218,7 @@ export class Client {
     });
 
     ws.on('error', (err) => {
-      console.error('[client] ws error:', err.message);
+      this.logger.error('ws error:', err.message);
     });
   }
 
@@ -214,19 +231,85 @@ export class Client {
     if (frame.type !== 'task.assign') return;
     const controller = new AbortController();
     this.inflight.set(frame.taskId, controller);
+    const startedAt = Date.now();
+    // Track lifecycle state through an object so reads after `await` aren't
+    // narrowed back to the initial `null` by control-flow analysis — TS
+    // doesn't follow assignments made inside the `emit` closure below.
+    const state: {
+      artifactCount: number;
+      terminal: { kind: 'complete' } | { kind: 'fail'; code: string } | null;
+    } = { artifactCount: 0, terminal: null };
+
+    // Wrap emit so the client can observe terminal frames the backend sends
+    // and report taskId/elapsedMs/artifacts/code from the same code path,
+    // without changing the wire-level frames or inspecting their payloads.
+    const emit: Emit = (f) => {
+      if (f.type === 'task.artifact') state.artifactCount++;
+      else if (f.type === 'task.complete') state.terminal = { kind: 'complete' };
+      else if (f.type === 'task.fail') state.terminal = { kind: 'fail', code: f.error.code };
+      this.send(f);
+    };
+
+    this.logger.info(`backend.start taskId=${frame.taskId} backend=${this.opts.backend.name}`);
     try {
-      await this.opts.backend.handle(frame, (f) => this.send(f), controller.signal);
+      await this.opts.backend.handle(frame, emit, controller.signal);
+      const elapsedMs = Date.now() - startedAt;
+      const terminal = state.terminal;
+      if (terminal === null) {
+        // Backend resolved without emitting task.complete or task.fail. The
+        // bridge server will likely time the task out; surface it at warn so
+        // operators see the broken contract instead of a silent gap.
+        this.logger.warn(
+          `backend.end taskId=${frame.taskId} elapsedMs=${elapsedMs} (no terminal frame)`,
+        );
+      } else if (terminal.kind === 'complete') {
+        this.logger.info(
+          `task.complete taskId=${frame.taskId} elapsedMs=${elapsedMs} artifacts=${state.artifactCount}`,
+        );
+      } else {
+        this.logger.info(
+          `task.fail taskId=${frame.taskId} code=${terminal.code} elapsedMs=${elapsedMs}`,
+        );
+      }
     } catch (err) {
+      const elapsedMs = Date.now() - startedAt;
+      const code = 'backend_error';
       this.send({
         type: 'task.fail',
         taskId: frame.taskId,
         error: {
-          code: 'backend_error',
+          code,
           message: err instanceof Error ? err.message : String(err),
         },
       });
+      this.logger.info(
+        `task.fail taskId=${frame.taskId} code=${code} elapsedMs=${elapsedMs}`,
+      );
     } finally {
       this.inflight.delete(frame.taskId);
     }
   }
+}
+
+// Summarize an A2A message's parts as a comma-separated list of unique MIME
+// types for logging. Avoids leaking content (text bodies, file bytes) by
+// reporting only the structural shape of the message.
+export function summarizeParts(parts: readonly Part[]): string {
+  if (parts.length === 0) return '(none)';
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const part of parts) {
+    const mime = mimeForPart(part);
+    if (!seen.has(mime)) {
+      seen.add(mime);
+      ordered.push(mime);
+    }
+  }
+  return ordered.join(',');
+}
+
+function mimeForPart(part: Part): string {
+  if (part.kind === 'text') return 'text/plain';
+  if (part.kind === 'file') return part.file.mimeType ?? 'application/octet-stream';
+  return 'application/json';
 }
