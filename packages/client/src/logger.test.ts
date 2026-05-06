@@ -7,6 +7,7 @@ import {
   isLogLevel,
   LOG_LEVEL_ENV,
   resolveLogLevel,
+  safeToken,
 } from './logger.js';
 
 interface Captured {
@@ -239,6 +240,34 @@ test('createLogger at silent: every level filtered', () => {
   assert.deepEqual(c.error, []);
   assert.deepEqual(c.warn, []);
   assert.deepEqual(c.log, []);
+});
+
+test('safeToken: leaves plain ASCII tokens unchanged', () => {
+  assert.equal(safeToken('abc-123_def'), 'abc-123_def');
+  assert.equal(safeToken('text/plain'), 'text/plain');
+  assert.equal(safeToken(''), '');
+});
+
+test('safeToken: escapes newlines / control chars so a token cannot inject log lines', () => {
+  const escaped = safeToken('evil\n[client] FAKE');
+  assert.equal(escaped.includes('\n'), false);
+  assert.match(escaped, /^evil\\n\[client\] FAKE$/);
+  // No surrounding quotes (those are reserved for safeForLog-style messages).
+  assert.equal(escaped.startsWith('"'), false);
+  assert.equal(escaped.endsWith('"'), false);
+});
+
+test('safeToken: escapes embedded quotes and backslashes', () => {
+  assert.equal(safeToken('a"b'), 'a\\"b');
+  assert.equal(safeToken('a\\b'), 'a\\\\b');
+  assert.equal(safeToken('\t\r'), '\\t\\r');
+});
+
+test('safeToken: truncates very long tokens', () => {
+  const long = 'a'.repeat(500);
+  const out = safeToken(long, 50);
+  assert.ok(out.length <= 50, `expected <=50, got ${out.length}`);
+  assert.match(out, /…$/);
 });
 
 test('createLogger: trims an explicit level string', () => {

@@ -9,7 +9,7 @@ import {
   type UpFrame,
 } from '@vicoop-bridge/protocol';
 import type { Backend, Emit } from './backend.js';
-import { createLogger, type LogLevel, type Logger } from './logger.js';
+import { createLogger, type LogLevel, type Logger, safeToken } from './logger.js';
 
 export interface ClientOptions {
   serverUrl: string;
@@ -192,15 +192,15 @@ export class Client {
       switch (frame.type) {
         case 'task.assign':
           this.logger.info(
-            `task.assign taskId=${frame.taskId} contextId=${frame.contextId} parts=${summarizeParts(frame.message.parts)}`,
+            `task.assign taskId=${safeToken(frame.taskId)} contextId=${safeToken(frame.contextId)} parts=${safeToken(summarizeParts(frame.message.parts))}`,
           );
           this.logger.debug(
-            `task.assign detail taskId=${frame.taskId} messageId=${frame.message.messageId} role=${frame.message.role} partsCount=${frame.message.parts.length}`,
+            `task.assign detail taskId=${safeToken(frame.taskId)} messageId=${safeToken(frame.message.messageId)} role=${frame.message.role} partsCount=${frame.message.parts.length}`,
           );
           this.runTask(frame);
           break;
         case 'task.cancel':
-          this.logger.info(`task.cancel taskId=${frame.taskId}`);
+          this.logger.info(`task.cancel taskId=${safeToken(frame.taskId)}`);
           this.inflight.get(frame.taskId)?.abort();
           break;
         case 'ping':
@@ -210,7 +210,10 @@ export class Client {
     });
 
     ws.on('close', (code, reason) => {
-      this.logger.info(`disconnected: ${code} ${reason.toString()}`);
+      // `reason` is a remote-controlled byte buffer from the WebSocket
+      // close frame; sanitize before logging so a server can't inject a
+      // fake `[client] …` line via newlines.
+      this.logger.info(`disconnected: ${code} ${safeToken(reason.toString())}`);
       this.ws = null;
       if (!this.stopped) {
         const delay = this.opts.reconnectDelayMs ?? 3000;
@@ -297,7 +300,12 @@ export async function processTask(
     deps.send(f);
   };
 
-  deps.logger.info(`backend.start taskId=${frame.taskId} backend=${deps.backend.name}`);
+  // Sanitize wire-derived tokens so a hostile server (or a bug in a
+  // backend that derives strings from user content) can't break out of a
+  // single log line via embedded \n / control chars.
+  const taskTok = safeToken(frame.taskId);
+  const backendTok = safeToken(deps.backend.name);
+  deps.logger.info(`backend.start taskId=${taskTok} backend=${backendTok}`);
   try {
     await deps.backend.handle(frame, emit, signal);
     const elapsedMs = Date.now() - startedAt;
@@ -307,19 +315,19 @@ export async function processTask(
       // bridge server will likely time the task out; surface it at warn so
       // operators see the broken contract instead of a silent gap.
       deps.logger.warn(
-        `backend.end taskId=${frame.taskId} elapsedMs=${elapsedMs} (no terminal frame)`,
+        `backend.end taskId=${taskTok} elapsedMs=${elapsedMs} (no terminal frame)`,
       );
     } else if (terminal.kind === 'complete') {
       deps.logger.info(
-        `task.complete taskId=${frame.taskId} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
+        `task.complete taskId=${taskTok} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
       );
     } else if (terminal.kind === 'canceled') {
       deps.logger.info(
-        `task.canceled taskId=${frame.taskId} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
+        `task.canceled taskId=${taskTok} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
       );
     } else {
       deps.logger.info(
-        `task.fail taskId=${frame.taskId} code=${terminal.code} elapsedMs=${elapsedMs}`,
+        `task.fail taskId=${taskTok} code=${safeToken(terminal.code)} elapsedMs=${elapsedMs}`,
       );
     }
   } catch (err) {
@@ -337,10 +345,10 @@ export async function processTask(
       // default-visible warn line; debug carries the full text for
       // operators who opt in.
       deps.logger.warn(
-        `backend threw after terminal taskId=${frame.taskId} elapsedMs=${elapsedMs} terminal=${state.terminal.kind} errorClass=${errorClass}`,
+        `backend threw after terminal taskId=${taskTok} elapsedMs=${elapsedMs} terminal=${state.terminal.kind} errorClass=${safeToken(errorClass)}`,
       );
       deps.logger.debug(
-        `backend threw after terminal taskId=${frame.taskId} message=${message}`,
+        `backend threw after terminal taskId=${taskTok} message=${safeToken(message)}`,
       );
     } else if (signal.aborted) {
       // The throw is plausibly the backend reacting to the AbortSignal it
@@ -354,9 +362,7 @@ export async function processTask(
         taskId: frame.taskId,
         status: { state: 'canceled', timestamp: new Date().toISOString() },
       });
-      deps.logger.info(
-        `task.canceled taskId=${frame.taskId} elapsedMs=${elapsedMs}`,
-      );
+      deps.logger.info(`task.canceled taskId=${taskTok} elapsedMs=${elapsedMs}`);
     } else {
       const code = 'backend_error';
       deps.send({
@@ -365,7 +371,7 @@ export async function processTask(
         error: { code, message },
       });
       deps.logger.info(
-        `task.fail taskId=${frame.taskId} code=${code} elapsedMs=${elapsedMs}`,
+        `task.fail taskId=${taskTok} code=${code} elapsedMs=${elapsedMs}`,
       );
     }
   }
@@ -373,13 +379,16 @@ export async function processTask(
 
 // Summarize an A2A message's parts as a comma-separated list of unique MIME
 // types for logging. Avoids leaking content (text bodies, file bytes) by
-// reporting only the structural shape of the message.
+// reporting only the structural shape of the message. The MIME from a
+// `file` part is user/peer-supplied, so each entry is run through
+// `safeToken` to neutralize embedded newlines / control chars before the
+// summary is interpolated into a log line.
 export function summarizeParts(parts: readonly Part[]): string {
   if (parts.length === 0) return '(none)';
   const seen = new Set<string>();
   const ordered: string[] = [];
   for (const part of parts) {
-    const mime = mimeForPart(part);
+    const mime = safeToken(mimeForPart(part));
     if (!seen.has(mime)) {
       seen.add(mime);
       ordered.push(mime);

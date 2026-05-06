@@ -52,16 +52,30 @@ function warnOnce(sink: ConsoleSink, key: string, message: string): void {
   sink.warn(PREFIX, message);
 }
 
-// Render an arbitrary string as a safe, single-line log token. Uses
-// JSON.stringify so newlines and control chars are escaped (preventing
-// log-injection / multi-line entries) and truncates to keep one bad env
-// value from flooding the log.
+// Quote+escape+truncate. Use for "what value was rejected"-style messages
+// where the surrounding quotes help operators see the exact string the
+// client received. Newlines and control chars are escaped; long inputs
+// are truncated with an ellipsis.
 function safeForLog(value: string, maxLen = 120): string {
   const escaped = JSON.stringify(value);
   if (escaped.length <= maxLen) return escaped;
   // Trim to maxLen and tack on an ellipsis. The result intentionally
   // doesn't preserve the closing quote — readers see the truncation.
   return `${escaped.slice(0, maxLen - 1)}…`;
+}
+
+// Escape+truncate without surrounding quotes. Use for lifecycle log
+// tokens (taskId=, contextId=, parts=, errorClass=, …) where wire-derived
+// values must not be able to break out of the log line. A plain ASCII
+// taskId like `abc-123` is left unchanged; a hostile value like
+// `evil\n[client] FAKE` is escaped to `evil\\n[client] FAKE`, preserving
+// the single-line invariant.
+export function safeToken(value: string, maxLen = 200): string {
+  // JSON.stringify produces a fully escaped, double-quoted string; strip
+  // the surrounding quotes to keep tokens lightweight while inheriting
+  // every escape rule (\n, \r, \t, \", \\, \uXXXX for control chars).
+  const escaped = JSON.stringify(value).slice(1, -1);
+  return escaped.length <= maxLen ? escaped : `${escaped.slice(0, maxLen - 1)}…`;
 }
 
 // Normalize a level string from any source (explicit option, env var) by

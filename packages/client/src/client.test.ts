@@ -95,6 +95,18 @@ test('summarizeParts: dedupes mime types and preserves first-seen order', () => 
   assert.equal(summarizeParts(parts), 'text/plain,image/png,application/json');
 });
 
+test('summarizeParts: sanitizes hostile mimeType so it cannot inject newlines', () => {
+  const parts: Part[] = [
+    {
+      kind: 'file',
+      file: { name: 'a.png', mimeType: 'image/png\n[client] FAKE INJECTED LINE' },
+    },
+  ];
+  const summary = summarizeParts(parts);
+  assert.equal(summary.includes('\n'), false, 'summary must not contain raw newlines');
+  assert.match(summary, /image\/png\\n\[client\] FAKE INJECTED LINE/);
+});
+
 test('summarizeParts: does not include user-supplied content', () => {
   const secret = 'super-secret-token';
   const parts: Part[] = [
@@ -367,6 +379,39 @@ test('processTask: backend emits canceled task.complete on abort -> uses backend
   assert.ok(
     !c.log.some((l) => /task\.complete taskId=T1/.test(l)),
     'should not log task.complete for a canceled-state completion',
+  );
+});
+
+test('processTask: sanitizes hostile taskId so wire data cannot inject log lines', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const hostileTaskId = 'T1\n[client] FAKE INJECTED LINE';
+  const backend = backendOf('stub', async (_t, emit) => {
+    emit({ type: 'task.complete', taskId: hostileTaskId, status: { state: 'completed' } });
+  });
+  await processTask(
+    { ...makeAssign(hostileTaskId), taskId: hostileTaskId },
+    new AbortController().signal,
+    {
+      backend,
+      send: s.send,
+      logger: createLogger('debug', c.sink),
+    },
+  );
+  // Every log line must remain single-line — no line should contain a raw
+  // newline carried over from the taskId interpolation.
+  for (const line of [...c.log, ...c.warn, ...c.error]) {
+    assert.equal(
+      line.includes('\n'),
+      false,
+      `log line contained a raw newline (log injection): ${JSON.stringify(line)}`,
+    );
+  }
+  // The hostile suffix must appear escaped — operators can still see what
+  // arrived, but it cannot break out of the line.
+  assert.ok(
+    c.log.some((l) => /backend\.start taskId=T1\\n\[client\] FAKE INJECTED LINE/.test(l)),
+    `expected escaped taskId in backend.start, got: ${c.log.join(' | ')}`,
   );
 });
 
