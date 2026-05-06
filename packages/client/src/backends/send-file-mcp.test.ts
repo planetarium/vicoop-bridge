@@ -245,18 +245,28 @@ test('treats empty/whitespace `name` as missing and falls back to basename', asy
   }
 });
 
-test('treats `Localhost`/`LOCALHOST` as loopback (case-insensitive)', async () => {
+test('rejects the literal "localhost" (any case) as host — only loopback IP literals allowed', async () => {
   const root = await tmpDir();
-  // Should NOT throw — case-insensitive normalization makes these
-  // equivalent to lowercase `localhost`, which is in the loopback set.
-  for (const host of ['Localhost', 'LOCALHOST', 'LocalHost']) {
-    const server = await startSendFileMcpServer({
-      allowedRoots: [root],
-      host,
-      skipHttp: true,
-    });
-    await server.close();
+  // `"localhost"` resolves via libc/DNS at listen time and a non-standard
+  // /etc/hosts could send it to a routable interface, so it's not in the
+  // safe allowlist. Operators must use 127.0.0.1 or ::1 to opt into the
+  // safe-by-default loopback bind.
+  for (const host of ['localhost', 'Localhost', 'LOCALHOST']) {
+    await assert.rejects(
+      () => startSendFileMcpServer({ allowedRoots: [root], host, skipHttp: true }),
+      /non-loopback/,
+    );
   }
+});
+
+test('accepts `::1` as IPv6 loopback', async () => {
+  const root = await tmpDir();
+  const server = await startSendFileMcpServer({
+    allowedRoots: [root],
+    host: '::1',
+    skipHttp: true,
+  });
+  await server.close();
 });
 
 test('refuses to bind a non-loopback host without dangerouslyAllowNonLoopback', async () => {
