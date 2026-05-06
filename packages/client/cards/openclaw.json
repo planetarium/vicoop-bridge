@@ -16,14 +16,24 @@
     "text/plain",
     "text/markdown",
     "text/csv",
+    "text/html",
     "image/png",
     "image/jpeg",
     "image/gif",
     "image/webp",
+    "image/svg+xml",
+    "image/bmp",
     "application/pdf",
     "application/json",
+    "application/xml",
     "application/zip",
-    "application/octet-stream"
+    "application/octet-stream",
+    "audio/mpeg",
+    "audio/wav",
+    "audio/ogg",
+    "video/mp4",
+    "video/quicktime",
+    "video/webm"
   ],
   "skills": [
     {
