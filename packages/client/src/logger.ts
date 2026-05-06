@@ -42,12 +42,23 @@ export function isLogLevel(value: string): value is LogLevel {
 // for typed callers, a plain-JS consumer can still pass anything, and an
 // unrecognized string would otherwise produce `LEVEL_RANK[v] === undefined`
 // and silently disable every level.
+//
+// `raw` is typed `unknown` rather than `string | undefined` so a JS caller
+// passing a number/object/null doesn't crash the client at startup with a
+// "raw.trim is not a function" TypeError; we warn and fall through to the
+// next priority instead.
 function tryParseLevel(
-  raw: string | undefined,
+  raw: unknown,
   source: string,
   sink: ConsoleSink,
 ): LogLevel | undefined {
-  if (raw === undefined) return undefined;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string') {
+    sink.warn(
+      `${PREFIX} ignoring non-string ${source} of type ${typeof raw} (expected silent|error|warn|info|debug)`,
+    );
+    return undefined;
+  }
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
   const v = trimmed.toLowerCase();

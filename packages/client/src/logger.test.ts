@@ -181,3 +181,24 @@ test('createLogger: trims an explicit level string', () => {
   assert.equal(logger.level, 'debug');
   assert.deepEqual(c.warn, []);
 });
+
+test('resolveLogLevel: non-string explicit value warns and falls through (does not crash)', () => {
+  const c = makeSink();
+  withEnv(LOG_LEVEL_ENV, undefined, () => {
+    // JS caller bypasses the TS type and passes a number/object/etc.
+    assert.equal(resolveLogLevel(123 as unknown as 'debug', c.sink), 'info');
+    assert.equal(resolveLogLevel({} as unknown as 'debug', c.sink), 'info');
+  });
+  assert.equal(c.warn.length, 2);
+  for (const line of c.warn) {
+    assert.match(line, /ignoring non-string logLevel of type/);
+  }
+});
+
+test('resolveLogLevel: null explicit value is treated as not provided', () => {
+  const c = makeSink();
+  withEnv(LOG_LEVEL_ENV, 'debug', () => {
+    assert.equal(resolveLogLevel(null as unknown as 'debug', c.sink), 'debug');
+  });
+  assert.deepEqual(c.warn, []);
+});

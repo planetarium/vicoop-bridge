@@ -22,6 +22,13 @@ test('summarizeParts: file part without mimeType falls back to octet-stream', ()
   assert.equal(summarizeParts(parts), 'application/octet-stream');
 });
 
+test('summarizeParts: file part with empty/whitespace mimeType falls back to octet-stream', () => {
+  const empty: Part[] = [{ kind: 'file', file: { name: 'a.bin', mimeType: '' } }];
+  assert.equal(summarizeParts(empty), 'application/octet-stream');
+  const whitespace: Part[] = [{ kind: 'file', file: { name: 'a.bin', mimeType: '   \t' } }];
+  assert.equal(summarizeParts(whitespace), 'application/octet-stream');
+});
+
 test('summarizeParts: data part reports application/json', () => {
   const parts: Part[] = [{ kind: 'data', data: { foo: 'bar' } }];
   assert.equal(summarizeParts(parts), 'application/json');

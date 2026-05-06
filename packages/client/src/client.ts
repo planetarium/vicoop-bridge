@@ -325,6 +325,12 @@ export function summarizeParts(parts: readonly Part[]): string {
 
 function mimeForPart(part: Part): string {
   if (part.kind === 'text') return 'text/plain';
-  if (part.kind === 'file') return part.file.mimeType ?? 'application/octet-stream';
+  if (part.kind === 'file') {
+    // The protocol allows `mimeType` to be any string (or absent).
+    // Normalize empty / whitespace-only values to the octet-stream
+    // fallback so log lines don't end up with empty `parts=,` segments.
+    const mime = part.file.mimeType?.trim();
+    return mime || 'application/octet-stream';
+  }
   return 'application/json';
 }
