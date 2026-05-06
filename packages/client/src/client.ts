@@ -278,18 +278,28 @@ export class Client {
       }
     } catch (err) {
       const elapsedMs = Date.now() - startedAt;
-      const code = 'backend_error';
-      this.send({
-        type: 'task.fail',
-        taskId: frame.taskId,
-        error: {
-          code,
-          message: err instanceof Error ? err.message : String(err),
-        },
-      });
-      this.logger.info(
-        `task.fail taskId=${frame.taskId} code=${code} elapsedMs=${elapsedMs}`,
-      );
+      const message = err instanceof Error ? err.message : String(err);
+      if (state.terminal !== null) {
+        // The backend already emitted a terminal frame and then threw. Do
+        // *not* send a second terminal — the bridge server treats a second
+        // task.complete/task.fail for the same taskId as a protocol
+        // violation. Surface the late throw at warn so operators notice
+        // the backend's broken contract instead of seeing it silently
+        // swallowed.
+        this.logger.warn(
+          `backend threw after terminal taskId=${frame.taskId} elapsedMs=${elapsedMs} terminal=${state.terminal.kind} message=${message}`,
+        );
+      } else {
+        const code = 'backend_error';
+        this.send({
+          type: 'task.fail',
+          taskId: frame.taskId,
+          error: { code, message },
+        });
+        this.logger.info(
+          `task.fail taskId=${frame.taskId} code=${code} elapsedMs=${elapsedMs}`,
+        );
+      }
     } finally {
       this.inflight.delete(frame.taskId);
     }
