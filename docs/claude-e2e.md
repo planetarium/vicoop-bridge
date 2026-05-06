@@ -190,8 +190,12 @@ in `claude.test.ts`:
 
 - `tool_use` blocks inside an `assistant` event become
   `claude-tool-call` artifacts. Each artifact carries a head-truncated
-  `<tool>: <input>` text part (≤ 200 chars; secrets-and-size guard) and
-  a `data` part with `{ toolName, toolUseId }` for filtering.
+  `<tool>: <input>` text part (≤ 200 chars — **size guard only**, not a
+  secrets guard; tokens or keys appearing in the head will still be
+  emitted) plus a `data` part with `{ toolName, toolUseId }` for
+  filtering. Operators that need secret-safe artifacts must add
+  per-tool redaction or gate input summaries off entirely (#100 part B
+  follow-up).
 - A configurable idle-silence heartbeat (`heartbeatMs`, default 30 s)
   emits a bare `task.status: working` whenever no other frame has gone
   out for that many ms. Disabled with `heartbeatMs: 0`. Backstop for

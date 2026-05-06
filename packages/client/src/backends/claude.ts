@@ -120,12 +120,19 @@ const INPUT_FILE_MAX_BYTES = 5 * 1024 * 1024;
 // in-memory base64 decode and a giant artifact payload on the wire.
 const TOOL_RESULT_MEDIA_MAX_BYTES = 5 * 1024 * 1024;
 
-// Tool-call summary line length. The model's tool_use input can be huge
-// (full file bodies, long Bash commands) and may contain secrets that
-// shouldn't be re-broadcast verbatim on the artifact wire. Truncate to
-// this many characters of `<tool>: <input>` before emitting; the tool
-// name lives in the artifact's data part so consumers can still filter
-// reliably even after the head was clipped.
+// Tool-call summary line length. Bounds the on-wire size of a single
+// `claude-tool-call` artifact's text part — the model's `tool_use.input`
+// can be megabytes (e.g. Write with full file `content`), and we don't
+// want a single tool turn to fill the artifact stream or burn CPU
+// stringifying the whole thing. The structured `toolName` rides on a
+// separate `data` part so consumers still get a stable handle for
+// filtering after the head was clipped.
+//
+// Threat model: SIZE only. Head-truncation is NOT a secrets guard —
+// tokens, keys, or other sensitive values that appear in the first
+// ~200 chars of the input WILL be emitted. Operators that need
+// secret-safe artifacts must add per-tool redaction (or gate input
+// summaries off entirely; #100 part B follow-up).
 const TOOL_CALL_SUMMARY_MAX_CHARS = 200;
 
 // Default idle-silence heartbeat. `dist/backends/claude.js` events that
@@ -192,11 +199,26 @@ interface ToolUseBlock {
   summary: string;
 }
 
-function summarizeToolInput(input: unknown): string {
+// Bounded stringification for a `tool_use.input`. The naive
+// `JSON.stringify(input)` would materialize the entire input as a
+// string before the caller clips to TOOL_CALL_SUMMARY_MAX_CHARS, so a
+// `Write` call with a multi-MiB `content` value would allocate the
+// full multi-MiB output buffer for nothing. We pass a replacer that
+// clips any individual string value to at most `clipPerString` chars
+// before serialization, and we also slice the input itself when it
+// arrives as a bare string. End result: peak intermediate string size
+// is bounded by O(structure-size × clipPerString) instead of the
+// original input size.
+function summarizeToolInput(input: unknown, clipPerString: number): string {
   if (input === undefined || input === null) return '';
-  if (typeof input === 'string') return input;
+  if (typeof input === 'string') return input.slice(0, clipPerString + 1);
   try {
-    return JSON.stringify(input);
+    return JSON.stringify(input, (_key, value) => {
+      if (typeof value === 'string' && value.length > clipPerString) {
+        return value.slice(0, clipPerString);
+      }
+      return value;
+    });
   } catch {
     return '<unserializable>';
   }
@@ -224,7 +246,7 @@ function extractAssistantToolUses(content: unknown): ToolUseBlock[] {
     const toolName = typeof b.name === 'string' ? b.name : '<unknown>';
     const toolUseId = typeof b.id === 'string' ? b.id : '';
     const summary = clipTo(
-      `${toolName}: ${summarizeToolInput(b.input)}`,
+      `${toolName}: ${summarizeToolInput(b.input, TOOL_CALL_SUMMARY_MAX_CHARS)}`,
       TOOL_CALL_SUMMARY_MAX_CHARS,
     );
     out.push({ toolName, toolUseId, summary });
@@ -731,10 +753,12 @@ export function createClaudeBackend(
         heartbeatHandle = setIntervalImpl(() => {
           if (settled) return;
           if (now() - lastEmitAt < heartbeatMs) return;
-          // Bypass `emit` (the wrapper) when assembling the frame, but
-          // route through it so `lastEmitAt` resets — otherwise back-to-
-          // back ticks would queue up if `now()` jumped past the threshold
-          // multiple times in one cycle.
+          // Route through the wrapped `emit` (NOT `rawEmit`): the
+          // wrapper refreshes `lastEmitAt` before forwarding the frame,
+          // so a follow-up tick arriving at the same instant sees a
+          // fresh window and skips. Calling `rawEmit` here would leave
+          // `lastEmitAt` stale and let several ticks emit back-to-back
+          // if the timer fired multiple times after a long pause.
           emit({
             type: 'task.status',
             taskId: task.taskId,
