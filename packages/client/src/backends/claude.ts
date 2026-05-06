@@ -52,6 +52,15 @@ export interface ClaudeBackendOptions {
    * calls across overlapping tasks are rejected with `ambiguous-task`.
    */
   sendFileMcp?: SendFileMcpOptions;
+  // Idle-silence heartbeat. While a task is running, if no other frame has
+  // gone out for at least `heartbeatMs`, emit a bare `task.status` (state:
+  // working, no message body) so callers and intermediaries (Fly edge,
+  // SSE consumers) see bytes on the wire and don't tear down the
+  // connection as a dead read. Default 30000 ms; pass 0 to disable.
+  heartbeatMs?: number;
+  // Test seam: timer impls. Defaults to global setInterval/clearInterval.
+  setIntervalFn?: (fn: () => void, ms: number) => unknown;
+  clearIntervalFn?: (handle: unknown) => void;
 }
 
 interface SessionEntry {
@@ -64,10 +73,24 @@ interface SessionEntry {
   writeId: number;
 }
 
-// claude --output-format stream-json writes one JSON object per line. We
-// surface assistant `text` blocks (one A2A artifact per assistant message)
-// and pass through `tool_result` content of type image/document so MCP
-// screenshot-style tools land as A2A `FilePart`s alongside the text.
+// claude --output-format stream-json writes one JSON object per line.
+// Mapping from stream event → upstream A2A frame:
+//
+//   spawn (initial)            → task.status (state: working)
+//   assistant: text block(s)   → task.artifact (name: claude-message)
+//   assistant: tool_use block  → task.artifact (name: claude-tool-call)
+//   user: tool_result image/PDF→ task.artifact (name: claude-tool-result, file)
+//   user: tool_result text     → dropped (size/secrets policy; see #100)
+//   result                     → task.complete (state: completed)
+//   <heartbeatMs of silence>   → task.status (state: working, no body)
+//
+// The `claude-tool-call` summary line is bounded as a whole: the
+// `<tool>: <input>` text part is hard-capped at TOOL_CALL_SUMMARY_MAX_CHARS
+// (tool-name prefix + JSON overhead included), and the JSON serializer
+// also pre-clips individual string values during walking so a single
+// huge field can't drive a multi-MiB intermediate buffer. The structured
+// tool name + tool_use_id ride along on a `data` part so consumers can
+// filter/count tool calls reliably even after the text was clipped.
 interface StreamEvent {
   type?: unknown;
   message?: {
@@ -99,6 +122,28 @@ const INPUT_FILE_MAX_BYTES = 5 * 1024 * 1024;
 // (e.g. an MCP screenshot at unbounded resolution) from forcing a huge
 // in-memory base64 decode and a giant artifact payload on the wire.
 const TOOL_RESULT_MEDIA_MAX_BYTES = 5 * 1024 * 1024;
+
+// Tool-call summary line length. Bounds the on-wire size of a single
+// `claude-tool-call` artifact's text part — the model's `tool_use.input`
+// can be megabytes (e.g. Write with full file `content`), and we don't
+// want a single tool turn to fill the artifact stream or burn CPU
+// stringifying the whole thing. The structured `toolName` rides on a
+// separate `data` part so consumers still get a stable handle for
+// filtering after the head was clipped.
+//
+// Threat model: SIZE only. Head-truncation is NOT a secrets guard —
+// tokens, keys, or other sensitive values that appear in the first
+// ~200 chars of the input WILL be emitted. Operators that need
+// secret-safe artifacts must add per-tool redaction (or gate input
+// summaries off entirely; #100 part B follow-up).
+const TOOL_CALL_SUMMARY_MAX_CHARS = 200;
+
+// Default idle-silence heartbeat. `dist/backends/claude.js` events that
+// do tool work (Bash/Read/Grep/Edit/MCP) can run minute-plus without
+// producing any assistant text — long enough to trip Fly edge and SSE
+// caller idle timeouts. Below this many ms of silence, emit a bare
+// `task.status: working` so bytes keep flowing.
+const DEFAULT_HEARTBEAT_MS = 30_000;
 
 // Defensive stringification — `(e as Error).message` is unsafe when the
 // thrown value is null/undefined or a non-Error primitive (common in JS).
@@ -147,6 +192,128 @@ function extractAssistantText(content: unknown): string {
     if (!block || typeof block !== 'object') continue;
     const b = block as { type?: unknown; text?: unknown };
     if (b.type === 'text' && typeof b.text === 'string') out += b.text;
+  }
+  return out;
+}
+
+interface ToolUseBlock {
+  toolName: string;
+  toolUseId: string;
+  summary: string;
+}
+
+// Bounded stringification for a `tool_use.input`. The naive
+// `JSON.stringify(input)` materializes the whole input as a string
+// before the caller clips to TOOL_CALL_SUMMARY_MAX_CHARS, so a tool
+// with a multi-MiB string field — or a top-level array of 100k tiny
+// values — would allocate a giant intermediate buffer just to chop
+// the first 200 chars. We avoid both:
+//
+//   1. Per-string clip:  any individual string value longer than
+//      `clipPerString` is sliced before serialization.
+//   2. Hard total budget: we walk top-level keys/elements only and
+//      bail out once the accumulator exceeds `budget` chars. The
+//      caller's `clipTo` does the final trim.
+//   3. No recursion:     nested objects / arrays are summarized as a
+//      type tag (`"<object>"` / `"<array(N)>"`) rather than walked,
+//      so depth is irrelevant to cost.
+//
+// Worst-case work is O(top-level-keys × clipPerString) and the
+// returned string itself is bounded by `budget`, regardless of the
+// input's actual size or shape.
+function stringifyValueClipped(v: unknown, clipPerString: number): string {
+  if (typeof v === 'string') {
+    return JSON.stringify(v.length > clipPerString ? v.slice(0, clipPerString) : v);
+  }
+  if (v === null || typeof v === 'number' || typeof v === 'boolean') {
+    return JSON.stringify(v);
+  }
+  if (Array.isArray(v)) return `"<array(${v.length})>"`;
+  if (typeof v === 'object') return '"<object>"';
+  try {
+    return JSON.stringify(String(v));
+  } catch {
+    return '"?"';
+  }
+}
+
+// Exported for direct tests of the bounded-walk behavior; the production
+// caller (handleEvent → emitToolCallArtifact) goes through it indirectly.
+export function summarizeToolInput(input: unknown, clipPerString: number): string {
+  if (input === undefined || input === null) return '';
+  if (typeof input === 'string') return input.slice(0, clipPerString + 1);
+  if (typeof input !== 'object') {
+    try {
+      return String(input).slice(0, clipPerString + 1);
+    } catch {
+      return '<unserializable>';
+    }
+  }
+  // Small overshoot lets the caller's clipTo see we exceeded and apply
+  // its truncation marker; we don't need exact-budget output here.
+  const budget = clipPerString + 16;
+  try {
+    if (Array.isArray(input)) {
+      let out = '[';
+      for (let i = 0; i < input.length; i++) {
+        if (out.length >= budget) break;
+        if (i > 0) out += ',';
+        out += stringifyValueClipped(input[i], clipPerString);
+      }
+      return out + ']';
+    }
+    let out = '{';
+    let first = true;
+    // Stream keys via `for..in` rather than `Object.keys`: the latter
+    // allocates the full key array up front, which would itself be
+    // unbounded on a tool input with 100k top-level keys. With `for..in`
+    // we can stop walking as soon as we hit `budget` without paying for
+    // keys we'll never look at.
+    for (const k in input) {
+      if (!Object.prototype.hasOwnProperty.call(input, k)) continue;
+      if (out.length >= budget) break;
+      if (!first) out += ',';
+      first = false;
+      // Clip the key too: a 100-KB property name would otherwise drive
+      // a 100-KB+ JSON.stringify allocation just to hit the budget on
+      // the next line. Same `clipPerString` cap applies to keys and
+      // values so the bounded-cost guarantee holds for both.
+      const clippedKey = k.length > clipPerString ? k.slice(0, clipPerString) : k;
+      out += JSON.stringify(clippedKey) + ':';
+      out += stringifyValueClipped((input as Record<string, unknown>)[k], clipPerString);
+    }
+    return out + '}';
+  } catch {
+    return '<unserializable>';
+  }
+}
+
+function clipTo(line: string, max: number): string {
+  if (line.length <= max) return line;
+  // 1-char ellipsis keeps the head as long as possible while still
+  // signalling truncation. Callers know the cap; they can recover the
+  // tool name (and full input from a server-side log) if needed.
+  return `${line.slice(0, Math.max(0, max - 1))}…`;
+}
+
+// Pull `tool_use` blocks out of an `assistant`-role message's content
+// array. Each one becomes one `claude-tool-call` artifact upstream, with
+// a head-truncated `<tool>: <input>` summary plus a `data` part carrying
+// the structured tool name + tool_use_id for consumer-side filtering.
+function extractAssistantToolUses(content: unknown): ToolUseBlock[] {
+  if (!Array.isArray(content)) return [];
+  const out: ToolUseBlock[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    const b = block as { type?: unknown; name?: unknown; id?: unknown; input?: unknown };
+    if (b.type !== 'tool_use') continue;
+    const toolName = typeof b.name === 'string' ? b.name : '<unknown>';
+    const toolUseId = typeof b.id === 'string' ? b.id : '';
+    const summary = clipTo(
+      `${toolName}: ${summarizeToolInput(b.input, TOOL_CALL_SUMMARY_MAX_CHARS)}`,
+      TOOL_CALL_SUMMARY_MAX_CHARS,
+    );
+    out.push({ toolName, toolUseId, summary });
   }
   return out;
 }
@@ -261,6 +428,9 @@ export function createClaudeBackend(
   const stderrCap = opts.stderrCaptureBytes ?? 8192;
   const sessionTtlMs = opts.sessionTtlMs ?? 60 * 60 * 1000;
   const now = opts.now ?? Date.now;
+  const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const setIntervalImpl = opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
+  const clearIntervalImpl = opts.clearIntervalFn ?? ((h) => clearInterval(h as ReturnType<typeof setInterval>));
   const sendFileMcpOpts =
     opts.sendFileMcp && opts.sendFileMcp.allowedRoots.length > 0
       ? opts.sendFileMcp
@@ -309,7 +479,21 @@ export function createClaudeBackend(
 
     getSendFileMcpServer: () => sendFileMcp,
 
-    async handle(task, emit, signal) {
+    async handle(task, rawEmit, signal) {
+      // Idle-silence heartbeat needs to observe every outbound frame so
+      // it doesn't fire while real traffic is flowing. Wrap rawEmit so
+      // every emission refreshes `lastEmitAt`. The heartbeat tick also
+      // goes through this wrapped `emit` (NOT `rawEmit`) — that is what
+      // resets `lastEmitAt` on a heartbeat frame so a follow-up tick at
+      // the same instant sees a fresh window and skips. See the tick
+      // site below for the rationale; the two comments must stay
+      // consistent.
+      let lastEmitAt = now();
+      const emit: typeof rawEmit = (frame) => {
+        lastEmitAt = now();
+        rawEmit(frame);
+      };
+
       if (signal.aborted) {
         emit({
           type: 'task.complete',
@@ -524,11 +708,38 @@ export function createClaudeBackend(
         emittedAnyArtifact = true;
       };
 
+      const emitToolCallArtifact = (block: ToolUseBlock): void => {
+        emit({
+          type: 'task.artifact',
+          taskId: task.taskId,
+          artifact: {
+            artifactId: randomUUID(),
+            name: 'claude-tool-call',
+            parts: [
+              { kind: 'text', text: block.summary },
+              {
+                kind: 'data',
+                data: { toolName: block.toolName, toolUseId: block.toolUseId },
+              },
+            ],
+          },
+          lastChunk: true,
+        });
+        emittedAnyArtifact = true;
+      };
+
       const handleEvent = (evt: StreamEvent): void => {
         if (settled) return;
         if (evt.type === 'assistant') {
           if (evt.message?.role !== 'assistant') return;
+          // A single assistant turn can interleave plain text and tool_use
+          // blocks. Emit the text (if any) first so observers see "what the
+          // model said" before "what tools it then called", matching the
+          // visible CLI ordering inside that turn.
           emitAssistantArtifact(extractAssistantText(evt.message.content));
+          for (const tu of extractAssistantToolUses(evt.message.content)) {
+            emitToolCallArtifact(tu);
+          }
           return;
         }
         if (evt.type === 'user') {
@@ -601,6 +812,34 @@ export function createClaudeBackend(
         if (stderrTail.length > stderrCap) stderrTail = stderrTail.slice(-stderrCap);
       });
 
+      // Idle-silence heartbeat: while the child is alive, every
+      // `heartbeatMs` of no outbound traffic produces a bare
+      // `task.status: working` so callers and intermediaries see bytes
+      // on the wire. Disabled when heartbeatMs <= 0.
+      let heartbeatHandle: unknown = null;
+      if (heartbeatMs > 0) {
+        heartbeatHandle = setIntervalImpl(() => {
+          if (settled) return;
+          // After abort the run is going to settle as `canceled` once
+          // the child finishes tearing down; emitting more
+          // `state: working` heartbeats in that window would actively
+          // misrepresent the task status to the caller. Suppress them.
+          if (aborted) return;
+          if (now() - lastEmitAt < heartbeatMs) return;
+          // Route through the wrapped `emit` (NOT `rawEmit`): the
+          // wrapper refreshes `lastEmitAt` before forwarding the frame,
+          // so a follow-up tick arriving at the same instant sees a
+          // fresh window and skips. Calling `rawEmit` here would leave
+          // `lastEmitAt` stale and let several ticks emit back-to-back
+          // if the timer fired multiple times after a long pause.
+          emit({
+            type: 'task.status',
+            taskId: task.taskId,
+            status: { state: 'working', timestamp: new Date().toISOString() },
+          });
+        }, heartbeatMs);
+      }
+
       const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: unknown }>((resolve) => {
         // The `error` event is *typed* with `Error`, but EventEmitter at
         // runtime can emit any value. Carry it as unknown so the frame
@@ -612,6 +851,7 @@ export function createClaudeBackend(
       signal.removeEventListener('abort', onAbort);
       settled = true;
       sendFileRelease?.();
+      if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
 
       // Flush any trailing line without a newline. claude normally terminates
       // each event with \n but a crash mid-write could leave one orphan.

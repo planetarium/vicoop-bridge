@@ -4,7 +4,12 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { createClaudeBackend, type ClaudeChildHandle, type ClaudeSpawnOptions } from './claude.js';
+import {
+  createClaudeBackend,
+  summarizeToolInput,
+  type ClaudeChildHandle,
+  type ClaudeSpawnOptions,
+} from './claude.js';
 import type { TaskAssignFrame, UpFrame } from '@vicoop-bridge/protocol';
 
 const NEVER: AbortSignal = new AbortController().signal;
@@ -910,6 +915,348 @@ test('emits FilePart artifact when tool_result contains an image block', async (
     assert.equal(part.file.mimeType, 'image/png');
     assert.equal(part.file.bytes, 'AAAAB');
   }
+});
+
+test('emits a claude-tool-call artifact per tool_use block in an assistant event', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'Let me check the directory.' },
+            {
+              type: 'tool_use',
+              id: 'tu_1',
+              name: 'Bash',
+              input: { command: 'ls -la /tmp' },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              tool_use_id: 'tu_1',
+              type: 'tool_result',
+              content: [{ type: 'text', text: 'total 0' }],
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'No files.' }],
+        },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'No files.' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
+  const { emit, frames } = collect();
+  await backend.handle(assign('list /tmp'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  const names = artifacts.map((a) => a.artifact.name);
+  assert.deepEqual(
+    names,
+    ['claude-message', 'claude-tool-call', 'claude-message'],
+    'order: assistant text, then tool_use, then trailing assistant text',
+  );
+
+  const callArtifact = artifacts[1];
+  assert.equal(callArtifact.lastChunk, true);
+  assert.equal(callArtifact.artifact.parts.length, 2);
+  const textPart = callArtifact.artifact.parts[0];
+  assert.equal(textPart.kind, 'text');
+  if (textPart.kind === 'text') {
+    assert.match(textPart.text, /^Bash: /);
+    assert.ok(textPart.text.includes('ls -la /tmp'));
+  }
+  const dataPart = callArtifact.artifact.parts[1];
+  assert.equal(dataPart.kind, 'data');
+  if (dataPart.kind === 'data') {
+    assert.equal(dataPart.data.toolName, 'Bash');
+    assert.equal(dataPart.data.toolUseId, 'tu_1');
+  }
+
+  // Existing assistant text artifacts and the terminal frame remain
+  // untouched — new frames are additive, not replacements.
+  const complete = frames.at(-1) as Extract<UpFrame, { type: 'task.complete' }>;
+  assert.equal(complete.type, 'task.complete');
+  assert.equal(complete.status.state, 'completed');
+});
+
+test('truncates a long tool_use input summary to a bounded length', async () => {
+  const longArg = 'x'.repeat(800);
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'tu_long',
+              name: 'Bash',
+              input: { command: longArg },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({ type: 'result', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
+  const { emit, frames } = collect();
+  await backend.handle(assign('x'), emit, NEVER);
+
+  const callArtifact = frames.find(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
+      f.type === 'task.artifact' && f.artifact.name === 'claude-tool-call',
+  );
+  assert.ok(callArtifact, 'expected claude-tool-call artifact');
+  const textPart = callArtifact.artifact.parts[0];
+  if (textPart.kind !== 'text') throw new Error('expected text part');
+  assert.ok(textPart.text.length <= 200, `summary length ${textPart.text.length} > 200`);
+  assert.ok(textPart.text.startsWith('Bash: '));
+  assert.ok(textPart.text.endsWith('…'), 'truncation marker expected at tail');
+});
+
+test('heartbeat: emits task.status after heartbeatMs of silence and stops at terminal time', async () => {
+  // Initialize as a no-op so the type stays `() => void` instead of
+  // `(() => void) | null`. The closure-mutation path through setIntervalFn
+  // confuses TS narrowing — easier to start callable.
+  let scheduledFn: () => void = () => {};
+  let scheduled = false;
+  let cleared = false;
+  let nowMs = 1_000_000;
+
+  // Hold the child open so we can drive heartbeat ticks before the run
+  // terminates and clears the interval.
+  let releaseFinish: () => void = () => {};
+  const finishReady = new Promise<void>((r) => {
+    releaseFinish = r;
+  });
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(async () => {
+      await finishReady;
+      child.emitStdout(JSON.stringify({ type: 'result', result: 'ok' }) + '\n');
+      setImmediate(() => child.finish(0));
+    });
+  });
+
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    heartbeatMs: 100,
+    now: () => nowMs,
+    setIntervalFn: (fn) => {
+      scheduledFn = fn;
+      scheduled = true;
+      return { tag: 'fake-interval' };
+    },
+    clearIntervalFn: () => {
+      cleared = true;
+    },
+  });
+  const { emit, frames } = collect();
+
+  const runP = backend.handle(assign('x'), emit, NEVER);
+  // Yield enough microtasks for spawn → register-listeners → schedule
+  // heartbeat to run before we drive ticks.
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(scheduled, 'heartbeat must register a setInterval handler');
+
+  const countStatus = () => frames.filter((f) => f.type === 'task.status').length;
+  assert.equal(countStatus(), 1, 'only the initial task.status: working has been emitted');
+
+  // Tick with no elapsed time → silence < heartbeat → skip.
+  scheduledFn();
+  assert.equal(countStatus(), 1);
+
+  // Advance past the heartbeat threshold → tick must emit one status.
+  nowMs += 250;
+  scheduledFn();
+  assert.equal(countStatus(), 2);
+
+  // Subsequent tick at the same instant must NOT double-fire — the prior
+  // emit refreshed lastEmitAt through the wrapped emitter.
+  scheduledFn();
+  assert.equal(countStatus(), 2);
+
+  // Real traffic also resets the silence window. Let the child finish.
+  releaseFinish();
+  await runP;
+
+  assert.ok(cleared, 'heartbeat handle must be cleared at terminal time');
+  // After terminal frame, no more status frames may be added even if a
+  // stale tick fires (the `settled` guard inside the closure protects
+  // against this — exercise it explicitly).
+  scheduledFn();
+  const lastStatusAfterTerminal = countStatus();
+  assert.equal(
+    lastStatusAfterTerminal,
+    2,
+    'no heartbeat allowed after terminal frame',
+  );
+});
+
+test('heartbeat: suppressed after signal.abort so canceled tasks do not look like they are still working', async () => {
+  let scheduledFn: () => void = () => {};
+  let nowMs = 1_000_000;
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      // Hold the child open. Termination is driven by abort → kill().
+      void child;
+    });
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    heartbeatMs: 100,
+    now: () => nowMs,
+    setIntervalFn: (fn) => {
+      scheduledFn = fn;
+      return { tag: 'fake-interval' };
+    },
+    clearIntervalFn: () => {},
+  });
+  const controller = new AbortController();
+  const { emit, frames } = collect();
+  const runP = backend.handle(assign('x'), emit, controller.signal);
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+
+  // Sanity: the heartbeat fires while the task is still working.
+  nowMs += 250;
+  scheduledFn();
+  const before = frames.filter((f) => f.type === 'task.status').length;
+  assert.ok(before >= 2, 'heartbeat must emit at least one extra task.status while working');
+
+  // Abort. Subsequent heartbeat ticks must NOT add more `state: working`
+  // status frames — the run is on its way to a `canceled` terminal frame.
+  controller.abort();
+  nowMs += 250;
+  scheduledFn();
+  nowMs += 250;
+  scheduledFn();
+
+  await runP;
+
+  const workingStatusCount = frames.filter(
+    (f) =>
+      f.type === 'task.status' &&
+      (f as Extract<UpFrame, { type: 'task.status' }>).status.state === 'working',
+  ).length;
+  assert.equal(
+    workingStatusCount,
+    before,
+    'no extra working-state heartbeats may land between abort and terminal frame',
+  );
+  const last = frames.at(-1) as Extract<UpFrame, { type: 'task.complete' }>;
+  assert.equal(last.type, 'task.complete');
+  assert.equal(last.status.state, 'canceled');
+});
+
+test('summarizeToolInput bails early on a top-level object with many keys (deterministic visit count)', async () => {
+  // Deterministic regression guard for the bounded-walk behavior.
+  // Each key is an instrumented enumerable getter that records when
+  // its value is read. With ~80-char string values, 3 keys' worth of
+  // serialization already pushes the accumulator past `budget`
+  // (200 + 16 = 216 chars), so the walker MUST bail before reading
+  // the 4th value. A regression that materializes the full key list
+  // (e.g. reverting to `Object.keys`) or that fails to early-break
+  // would walk into the tripwire keys and blow the assertion.
+  //
+  // Going through the backend handle() path would force the test
+  // itself to JSON.stringify the input as part of the stream-json
+  // line, triggering every getter and ruining the count — so we
+  // call summarizeToolInput directly. The production wiring is
+  // already exercised by other tests in this file.
+  const probed: string[] = [];
+  const inp: Record<string, unknown> = {};
+  const layout: Array<[string, string]> = [
+    ['a', 'x'.repeat(80)],
+    ['b', 'y'.repeat(80)],
+    ['c', 'z'.repeat(80)],
+    // Tripwires: walker must NOT reach these. Their getters push
+    // onto `probed` just like the real keys, so a regression makes
+    // them visible.
+    ['tripwire_1', 'should-not-be-read'],
+    ['tripwire_2', 'should-not-be-read'],
+    ['tripwire_3', 'should-not-be-read'],
+  ];
+  for (const [k, v] of layout) {
+    Object.defineProperty(inp, k, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        probed.push(k);
+        return v;
+      },
+    });
+  }
+
+  const summary = summarizeToolInput(inp, 200);
+
+  // Deterministic guarantee: only the first 3 keys' values were ever
+  // read. The walker hits the budget check at the top of iteration 4
+  // and bails before touching the tripwire getters. The summary's
+  // own length is bounded by O(visited × clipPerString) — not
+  // O(total keys × clipPerString) — so it's strictly smaller than a
+  // full JSON.stringify would produce, but we don't assert an exact
+  // ceiling because one iteration can overshoot the soft budget by
+  // up to one clipped key + clipped value.
+  assert.deepEqual(
+    probed,
+    ['a', 'b', 'c'],
+    `walker should bail after 3 keys; visited ${probed.join(',')}`,
+  );
+  assert.ok(!summary.includes('tripwire'), 'tripwire keys must not appear in summary');
+});
+
+test('summarizeToolInput clips both keys and values so a giant key cannot blow the budget', async () => {
+  // A 50k-char top-level key alone would, before key-clipping, drive
+  // a 50k-char JSON.stringify allocation just to land that one
+  // property — defeating the bounded-cost guarantee on the *first*
+  // iteration. With key clipping in place the produced summary is
+  // bounded by the same per-string cap that values use.
+  const giantKey = 'K'.repeat(50_000);
+  const inp = { [giantKey]: 'tiny' };
+  const summary = summarizeToolInput(inp, 200);
+  assert.ok(summary.length <= 216, `summary length ${summary.length} exceeds budget`);
+  // The clipped key prefix is present, but not the full 50k-char form.
+  assert.ok(summary.includes('KKKK'));
+  assert.ok(!summary.includes('K'.repeat(1000)), 'giant key must not appear verbatim');
+});
+
+test('heartbeat: heartbeatMs:0 disables the interval entirely', async () => {
+  let registered = false;
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    heartbeatMs: 0,
+    setIntervalFn: () => {
+      registered = true;
+      return null;
+    },
+    clearIntervalFn: () => {},
+  });
+  await backend.handle(assign('x'), collect().emit, NEVER);
+  assert.equal(registered, false, 'heartbeatMs:0 must skip setInterval registration');
 });
 
 test('send_file MCP: server is registered on first task and a registered handle receives invoked artifacts', async () => {
