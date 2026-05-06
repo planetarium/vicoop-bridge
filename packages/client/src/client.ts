@@ -320,6 +320,21 @@ export async function processTask(
       deps.logger.warn(
         `backend threw after terminal taskId=${frame.taskId} elapsedMs=${elapsedMs} terminal=${state.terminal.kind} message=${message}`,
       );
+    } else if (signal.aborted) {
+      // The throw is plausibly the backend reacting to the AbortSignal it
+      // was handed (an incoming `task.cancel` aborted the controller).
+      // Emit a canceled-state task.complete — the codebase's existing
+      // convention for cancellation (see backends/claude.ts) — instead of
+      // misclassifying the cancel as a `backend_error` fail and racing
+      // the bridge server's own cancel path.
+      deps.send({
+        type: 'task.complete',
+        taskId: frame.taskId,
+        status: { state: 'canceled', timestamp: new Date().toISOString() },
+      });
+      deps.logger.info(
+        `task.canceled taskId=${frame.taskId} elapsedMs=${elapsedMs}`,
+      );
     } else {
       const code = 'backend_error';
       deps.send({

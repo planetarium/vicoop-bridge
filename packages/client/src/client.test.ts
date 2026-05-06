@@ -284,6 +284,68 @@ test('processTask: backend.start log uses the backend name', async () => {
   assert.match(c.log[0], /backend\.start taskId=T1 backend=my-special-backend/);
 });
 
+test('processTask: backend throws after abort -> emits canceled task.complete, logs task.canceled (not task.fail)', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const controller = new AbortController();
+  controller.abort();
+  const backend = backendOf('stub', async (_t, _emit, signal) => {
+    if (signal.aborted) throw new Error('aborted');
+  });
+  await processTask(makeAssign('T1'), controller.signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  // Wire saw a canceled-state task.complete — not a backend_error fail.
+  assert.equal(s.sent.length, 1);
+  const sent = s.sent[0];
+  assert.equal(sent.type, 'task.complete');
+  if (sent.type === 'task.complete') {
+    assert.equal(sent.status.state, 'canceled');
+    assert.ok(typeof sent.status.timestamp === 'string' && sent.status.timestamp.length > 0);
+  }
+  assert.ok(
+    c.log.some((l) => /task\.canceled taskId=T1 elapsedMs=\d+/.test(l)),
+    `expected task.canceled log, got: ${c.log.join(' | ')}`,
+  );
+  assert.ok(
+    !c.log.some((l) => /task\.fail/.test(l)),
+    'should not log task.fail when the throw is from cancellation',
+  );
+});
+
+test('processTask: backend emits canceled task.complete on abort -> uses backend frame, no fallback', async () => {
+  // Well-behaved backend (like claude.ts): observes signal and emits its
+  // own canceled-state task.complete instead of throwing. processTask
+  // must use that frame as-is and not synthesize a fallback.
+  const c = makeSink();
+  const s = captureSend();
+  const controller = new AbortController();
+  controller.abort();
+  const backend = backendOf('stub', async (_t, emit, signal) => {
+    if (signal.aborted) {
+      emit({
+        type: 'task.complete',
+        taskId: 'T1',
+        status: { state: 'canceled', timestamp: '2026-01-01T00:00:00Z' },
+      });
+    }
+  });
+  await processTask(makeAssign('T1'), controller.signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  assert.equal(s.sent.length, 1);
+  const sent = s.sent[0];
+  assert.equal(sent.type, 'task.complete');
+  if (sent.type === 'task.complete') {
+    assert.equal(sent.status.state, 'canceled');
+    assert.equal(sent.status.timestamp, '2026-01-01T00:00:00Z');
+  }
+});
+
 test('processTask: forwards non-terminal frames (e.g. task.artifact, task.status) to send', async () => {
   const c = makeSink();
   const s = captureSend();
