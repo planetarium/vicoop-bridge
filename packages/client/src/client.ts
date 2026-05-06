@@ -4,9 +4,12 @@ import {
   encodeFrame,
   parseDownFrame,
   type AgentCard,
+  type Part,
+  type TaskAssignFrame,
   type UpFrame,
 } from '@vicoop-bridge/protocol';
-import type { Backend } from './backend.js';
+import type { Backend, Emit } from './backend.js';
+import { createLogger, type LogLevel, type Logger, safeToken } from './logger.js';
 
 export interface ClientOptions {
   serverUrl: string;
@@ -22,6 +25,13 @@ export interface ClientOptions {
   // server's 10s hello deadline so a slow or hung probe cannot push us
   // into the 4001 "hello timeout" close and a reconnect loop.
   probeDeadlineMs?: number;
+  // Verbosity for client-emitted logs. Falls back to the
+  // `VICOOP_CLIENT_LOG_LEVEL` env var, then to `info`. Lifecycle events
+  // (task.assign / backend.start / task.complete / task.canceled /
+  // task.fail / task.cancel) surface at `info`; `debug` adds the
+  // task.assign detail line (`messageId`, `role`, `partsCount`) and the
+  // full backend exception message on the late-throw path.
+  logLevel?: LogLevel;
 }
 
 const DEFAULT_PROBE_DEADLINE_MS = 3000;
@@ -36,8 +46,11 @@ export class Client {
   // don't re-probe on every bridge WS reconnect — the underlying upstream
   // doesn't change mid-process.
   private effectiveCardPromise: Promise<AgentCard> | null = null;
+  private readonly logger: Logger;
 
-  constructor(private readonly opts: ClientOptions) {}
+  constructor(private readonly opts: ClientOptions) {
+    this.logger = createLogger(opts.logLevel);
+  }
 
   start(): void {
     // Kick off the capability probe before opening the bridge WS so it runs
@@ -82,16 +95,21 @@ export class Client {
       const probePromise = Promise.resolve()
         .then(() => probe.call(this.opts.backend))
         .catch((err: unknown) => {
-          console.warn(
-            `[client] backend capability probe threw (${err instanceof Error ? err.message : String(err)}); using declared card capabilities`,
+          // Sanitize the message — even a probe error path can carry text
+          // derived from upstream, and a stray newline in an error message
+          // would let a non-fatal probe failure split the warn into two
+          // log lines (or appear to inject a fake `[client] …` entry).
+          const message = err instanceof Error ? err.message : String(err);
+          this.logger.warn(
+            `backend capability probe threw (${safeToken(message)}); using declared card capabilities`,
           );
           return null;
         });
       try {
         const outcome = await Promise.race([probePromise, timeoutPromise]);
         if (outcome === TIMEOUT) {
-          console.warn(
-            `[client] backend capability probe did not complete within ${deadlineMs}ms; sending hello with declared card capabilities`,
+          this.logger.warn(
+            `backend capability probe did not complete within ${deadlineMs}ms; sending hello with declared card capabilities`,
           );
           return base;
         }
@@ -144,7 +162,7 @@ export class Client {
       // will issue its own hello.
       const sendHello = (agentCard: AgentCard): void => {
         if (ws.readyState !== WebSocket.OPEN) return;
-        console.log('[client] connected, sending hello');
+        this.logger.info('connected, sending hello');
         ws.send(
           encodeFrame({
             type: 'hello',
@@ -162,8 +180,9 @@ export class Client {
       this.resolveEffectiveCard()
         .then(sendHello)
         .catch((err: unknown) => {
-          console.warn(
-            `[client] effectiveCard promise rejected unexpectedly (${err instanceof Error ? err.message : String(err)}); sending hello with declared card`,
+          const message = err instanceof Error ? err.message : String(err);
+          this.logger.warn(
+            `effectiveCard promise rejected unexpectedly (${safeToken(message)}); sending hello with declared card`,
           );
           sendHello(this.opts.agentCard);
         });
@@ -174,15 +193,31 @@ export class Client {
       try {
         frame = parseDownFrame(typeof raw === 'string' ? raw : raw.toString('utf8'));
       } catch (err) {
-        console.error('[client] invalid frame:', err);
+        // Stringify+sanitize before passing to the logger so a frame parse
+        // error (Zod or otherwise) carrying newlines / control chars in
+        // its message can't split the log into multiple lines.
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger.error(`invalid frame: ${safeToken(message)}`);
         return;
       }
 
       switch (frame.type) {
         case 'task.assign':
+          // `summarizeParts` already sanitizes each MIME via safeToken, so
+          // the `parts=` token here intentionally does NOT wrap the whole
+          // summary again — that would double-escape backslashes (a `\n`
+          // sanitized to `\\n` would become `\\\\n`) and make the field
+          // harder to read for operators.
+          this.logger.info(
+            `task.assign taskId=${safeToken(frame.taskId)} contextId=${safeToken(frame.contextId)} parts=${summarizeParts(frame.message.parts)}`,
+          );
+          this.logger.debug(
+            `task.assign detail taskId=${safeToken(frame.taskId)} messageId=${safeToken(frame.message.messageId)} role=${frame.message.role} partsCount=${frame.message.parts.length}`,
+          );
           this.runTask(frame);
           break;
         case 'task.cancel':
+          this.logger.info(`task.cancel taskId=${safeToken(frame.taskId)}`);
           this.inflight.get(frame.taskId)?.abort();
           break;
         case 'ping':
@@ -192,7 +227,10 @@ export class Client {
     });
 
     ws.on('close', (code, reason) => {
-      console.log(`[client] disconnected: ${code} ${reason.toString()}`);
+      // `reason` is a remote-controlled byte buffer from the WebSocket
+      // close frame; sanitize before logging so a server can't inject a
+      // fake `[client] …` line via newlines.
+      this.logger.info(`disconnected: ${code} ${safeToken(reason.toString())}`);
       this.ws = null;
       if (!this.stopped) {
         const delay = this.opts.reconnectDelayMs ?? 3000;
@@ -201,7 +239,10 @@ export class Client {
     });
 
     ws.on('error', (err) => {
-      console.error('[client] ws error:', err.message);
+      // Sanitize: ws error messages can include URLs, hostnames, or
+      // upstream text and we want the same single-line invariant we
+      // applied to the close `reason` and lifecycle logs.
+      this.logger.error(`ws error: ${safeToken(err.message)}`);
     });
   }
 
@@ -215,18 +256,181 @@ export class Client {
     const controller = new AbortController();
     this.inflight.set(frame.taskId, controller);
     try {
-      await this.opts.backend.handle(frame, (f) => this.send(f), controller.signal);
-    } catch (err) {
-      this.send({
-        type: 'task.fail',
-        taskId: frame.taskId,
-        error: {
-          code: 'backend_error',
-          message: err instanceof Error ? err.message : String(err),
-        },
+      await processTask(frame, controller.signal, {
+        backend: this.opts.backend,
+        send: (f) => this.send(f),
+        logger: this.logger,
       });
     } finally {
       this.inflight.delete(frame.taskId);
     }
   }
+}
+
+export interface ProcessTaskDeps {
+  backend: Backend;
+  // Wire send. Receives every frame the backend emits, plus a fallback
+  // task.fail emitted by `processTask` itself when the backend throws
+  // without having emitted a terminal.
+  send: (frame: UpFrame) => void;
+  logger: Logger;
+}
+
+// Run a single A2A task through the backend and emit the lifecycle logs
+// described in vicoop-bridge issue #98. Extracted from `Client.runTask` so
+// the lifecycle logic is unit-testable without a real WebSocket — tests
+// pass stub backends and a capturing send/logger.
+export async function processTask(
+  frame: TaskAssignFrame,
+  signal: AbortSignal,
+  deps: ProcessTaskDeps,
+): Promise<void> {
+  const startedAt = Date.now();
+  // Track lifecycle state through an object so reads after `await` aren't
+  // narrowed back to the initial `null` by control-flow analysis — TS
+  // doesn't follow assignments made inside the `emit` closure below.
+  //
+  // `artifactIds` counts *distinct* artifacts via their `artifactId`
+  // rather than counting raw `task.artifact` frames: the protocol allows
+  // a single artifact to be streamed across multiple chunks (`lastChunk`),
+  // so a per-frame counter would over-report.
+  const state: {
+    artifactIds: Set<string>;
+    terminal:
+      | { kind: 'complete' }
+      | { kind: 'canceled' }
+      | { kind: 'fail'; code: string }
+      | null;
+  } = { artifactIds: new Set(), terminal: null };
+
+  // Wrap emit so we can observe terminal frames the backend sends and
+  // report taskId/elapsedMs/artifacts/code from the same code path,
+  // without changing the wire-level frames or inspecting their payloads.
+  // A `task.complete` with `status.state === 'canceled'` is the codebase's
+  // existing cancellation convention (see backends/claude.ts); record it
+  // distinctly so the lifecycle log doesn't mislabel cancels as completions.
+  const emit: Emit = (f) => {
+    if (f.type === 'task.artifact') state.artifactIds.add(f.artifact.artifactId);
+    else if (f.type === 'task.complete') {
+      state.terminal =
+        f.status.state === 'canceled' ? { kind: 'canceled' } : { kind: 'complete' };
+    } else if (f.type === 'task.fail') {
+      state.terminal = { kind: 'fail', code: f.error.code };
+    }
+    deps.send(f);
+  };
+
+  // Sanitize wire-derived tokens so a hostile server (or a bug in a
+  // backend that derives strings from user content) can't break out of a
+  // single log line via embedded \n / control chars.
+  const taskTok = safeToken(frame.taskId);
+  const backendTok = safeToken(deps.backend.name);
+  deps.logger.info(`backend.start taskId=${taskTok} backend=${backendTok}`);
+  try {
+    await deps.backend.handle(frame, emit, signal);
+    const elapsedMs = Date.now() - startedAt;
+    const terminal = state.terminal;
+    if (terminal === null) {
+      // Backend resolved without emitting task.complete or task.fail. The
+      // bridge server will likely time the task out; surface it at warn so
+      // operators see the broken contract instead of a silent gap.
+      deps.logger.warn(
+        `backend.end taskId=${taskTok} elapsedMs=${elapsedMs} (no terminal frame)`,
+      );
+    } else if (terminal.kind === 'complete') {
+      deps.logger.info(
+        `task.complete taskId=${taskTok} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
+      );
+    } else if (terminal.kind === 'canceled') {
+      deps.logger.info(
+        `task.canceled taskId=${taskTok} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
+      );
+    } else {
+      deps.logger.info(
+        `task.fail taskId=${taskTok} code=${safeToken(terminal.code)} elapsedMs=${elapsedMs}`,
+      );
+    }
+  } catch (err) {
+    const elapsedMs = Date.now() - startedAt;
+    const message = err instanceof Error ? err.message : String(err);
+    const errorClass = err instanceof Error ? err.constructor.name : typeof err;
+    if (state.terminal !== null) {
+      // The backend already emitted a terminal frame and then threw. Do
+      // *not* send a second terminal — the bridge server treats a second
+      // task.complete/task.fail for the same taskId as a protocol
+      // violation. Surface the late throw at warn so operators notice
+      // the backend's broken contract instead of seeing it silently
+      // swallowed. The raw error message can include user content
+      // (prompts, file paths, upstream payloads) and stays out of the
+      // default-visible warn line; debug carries the full text for
+      // operators who opt in.
+      deps.logger.warn(
+        `backend threw after terminal taskId=${taskTok} elapsedMs=${elapsedMs} terminal=${state.terminal.kind} errorClass=${safeToken(errorClass)}`,
+      );
+      // Use a generous limit so the full backend message is preserved at
+      // debug — the default 200-char ceiling on lifecycle tokens is too
+      // tight for an exception's text. Still escape line breaks so the
+      // log line stays single-line.
+      deps.logger.debug(
+        `backend threw after terminal taskId=${taskTok} message=${safeToken(message, 4000)}`,
+      );
+    } else if (signal.aborted) {
+      // The throw is plausibly the backend reacting to the AbortSignal it
+      // was handed (an incoming `task.cancel` aborted the controller).
+      // Emit a canceled-state task.complete — the codebase's existing
+      // convention for cancellation (see backends/claude.ts) — instead of
+      // misclassifying the cancel as a `backend_error` fail and racing
+      // the bridge server's own cancel path.
+      deps.send({
+        type: 'task.complete',
+        taskId: frame.taskId,
+        status: { state: 'canceled', timestamp: new Date().toISOString() },
+      });
+      deps.logger.info(
+        `task.canceled taskId=${taskTok} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
+      );
+    } else {
+      const code = 'backend_error';
+      deps.send({
+        type: 'task.fail',
+        taskId: frame.taskId,
+        error: { code, message },
+      });
+      deps.logger.info(
+        `task.fail taskId=${taskTok} code=${code} elapsedMs=${elapsedMs}`,
+      );
+    }
+  }
+}
+
+// Summarize an A2A message's parts as a comma-separated list of unique MIME
+// types for logging. Avoids leaking content (text bodies, file bytes) by
+// reporting only the structural shape of the message. The MIME from a
+// `file` part is user/peer-supplied, so each entry is run through
+// `safeToken` to neutralize embedded newlines / control chars before the
+// summary is interpolated into a log line.
+export function summarizeParts(parts: readonly Part[]): string {
+  if (parts.length === 0) return '(none)';
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const part of parts) {
+    const mime = safeToken(mimeForPart(part));
+    if (!seen.has(mime)) {
+      seen.add(mime);
+      ordered.push(mime);
+    }
+  }
+  return ordered.join(',');
+}
+
+function mimeForPart(part: Part): string {
+  if (part.kind === 'text') return 'text/plain';
+  if (part.kind === 'file') {
+    // The protocol allows `mimeType` to be any string (or absent).
+    // Normalize empty / whitespace-only values to the octet-stream
+    // fallback so log lines don't end up with empty `parts=,` segments.
+    const mime = part.file.mimeType?.trim();
+    return mime || 'application/octet-stream';
+  }
+  return 'application/json';
 }
