@@ -1,17 +1,20 @@
+import { readFileSync } from 'node:fs';
 import {
   AgentCard,
   type AgentCard as AgentCardType,
   type HelloFrame,
 } from '@vicoop-bridge/protocol';
-import claudeCard from './cards/claude.json' with { type: 'json' };
-import echoCard from './cards/echo.json' with { type: 'json' };
-import openclawCard from './cards/openclaw.json' with { type: 'json' };
+
+function readCanonicalCard(kind: string): AgentCardType {
+  const url = new URL(`./cards/${kind}.json`, import.meta.url);
+  return AgentCard.parse(JSON.parse(readFileSync(url, 'utf8')));
+}
 
 const canonicalCards = new Map<string, AgentCardType>(
   Object.entries({
-    claude: AgentCard.parse(claudeCard),
-    echo: AgentCard.parse(echoCard),
-    openclaw: AgentCard.parse(openclawCard),
+    claude: readCanonicalCard('claude'),
+    echo: readCanonicalCard('echo'),
+    openclaw: readCanonicalCard('openclaw'),
   }),
 );
 
