@@ -235,16 +235,21 @@ export class Client {
     // Track lifecycle state through an object so reads after `await` aren't
     // narrowed back to the initial `null` by control-flow analysis — TS
     // doesn't follow assignments made inside the `emit` closure below.
+    //
+    // `artifactIds` counts *distinct* artifacts via their `artifactId`
+    // rather than counting raw `task.artifact` frames: the protocol allows
+    // a single artifact to be streamed across multiple chunks (`lastChunk`),
+    // so a per-frame counter would over-report.
     const state: {
-      artifactCount: number;
+      artifactIds: Set<string>;
       terminal: { kind: 'complete' } | { kind: 'fail'; code: string } | null;
-    } = { artifactCount: 0, terminal: null };
+    } = { artifactIds: new Set(), terminal: null };
 
     // Wrap emit so the client can observe terminal frames the backend sends
     // and report taskId/elapsedMs/artifacts/code from the same code path,
     // without changing the wire-level frames or inspecting their payloads.
     const emit: Emit = (f) => {
-      if (f.type === 'task.artifact') state.artifactCount++;
+      if (f.type === 'task.artifact') state.artifactIds.add(f.artifact.artifactId);
       else if (f.type === 'task.complete') state.terminal = { kind: 'complete' };
       else if (f.type === 'task.fail') state.terminal = { kind: 'fail', code: f.error.code };
       this.send(f);
@@ -264,7 +269,7 @@ export class Client {
         );
       } else if (terminal.kind === 'complete') {
         this.logger.info(
-          `task.complete taskId=${frame.taskId} elapsedMs=${elapsedMs} artifacts=${state.artifactCount}`,
+          `task.complete taskId=${frame.taskId} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
         );
       } else {
         this.logger.info(

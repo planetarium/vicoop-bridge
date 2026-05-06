@@ -19,42 +19,76 @@ export interface Logger {
   debug(...args: unknown[]): void;
 }
 
+// Subset of `Console` the logger writes to. Letting callers (and tests)
+// inject this sink avoids monkey-patching the global console — important
+// because Node's test runner can execute test files concurrently in
+// separate processes, but a future refactor that drops process isolation
+// would re-introduce cross-file flakiness on a global-patch approach.
+export interface ConsoleSink {
+  error(...args: unknown[]): void;
+  warn(...args: unknown[]): void;
+  log(...args: unknown[]): void;
+}
+
 export function isLogLevel(value: string): value is LogLevel {
   return Object.prototype.hasOwnProperty.call(LEVEL_RANK, value);
 }
 
-export function resolveLogLevel(explicit?: LogLevel): LogLevel {
-  if (explicit) return explicit;
-  const raw = process.env[LOG_LEVEL_ENV];
-  if (!raw) return 'info';
-  const v = raw.toLowerCase();
+// Normalize a level string from any source (explicit option, env var) by
+// trimming and lowercasing, then validating against the known set. An
+// invalid non-empty value is reported via `sink.warn` once and returns
+// `undefined` so the caller can fall through to the next priority. We
+// validate explicit values too — even though TS `LogLevel` constrains them
+// for typed callers, a plain-JS consumer can still pass anything, and an
+// unrecognized string would otherwise produce `LEVEL_RANK[v] === undefined`
+// and silently disable every level.
+function tryParseLevel(
+  raw: string | undefined,
+  source: string,
+  sink: ConsoleSink,
+): LogLevel | undefined {
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const v = trimmed.toLowerCase();
   if (isLogLevel(v)) return v;
-  // The env var came from the operator; surface the misconfiguration once at
-  // logger creation rather than silently falling back, so an unexpected level
-  // string ("verbose", "trace") doesn't quietly degrade observability.
-  console.warn(
-    `${PREFIX} ignoring invalid ${LOG_LEVEL_ENV}=${raw} (expected silent|error|warn|info|debug)`,
+  sink.warn(
+    `${PREFIX} ignoring invalid ${source}=${raw} (expected silent|error|warn|info|debug)`,
   );
-  return 'info';
+  return undefined;
 }
 
-export function createLogger(level?: LogLevel): Logger {
-  const resolved = resolveLogLevel(level);
+export function resolveLogLevel(
+  explicit?: LogLevel | string,
+  sink: ConsoleSink = console,
+): LogLevel {
+  return (
+    tryParseLevel(explicit, 'logLevel', sink) ??
+    tryParseLevel(process.env[LOG_LEVEL_ENV], LOG_LEVEL_ENV, sink) ??
+    'info'
+  );
+}
+
+export function createLogger(
+  level?: LogLevel | string,
+  sink: ConsoleSink = console,
+): Logger {
+  const resolved = resolveLogLevel(level, sink);
   const threshold = LEVEL_RANK[resolved];
   const enabled = (l: LogLevel): boolean => threshold >= LEVEL_RANK[l];
   return {
     level: resolved,
     error: (...args) => {
-      if (enabled('error')) console.error(PREFIX, ...args);
+      if (enabled('error')) sink.error(PREFIX, ...args);
     },
     warn: (...args) => {
-      if (enabled('warn')) console.warn(PREFIX, ...args);
+      if (enabled('warn')) sink.warn(PREFIX, ...args);
     },
     info: (...args) => {
-      if (enabled('info')) console.log(PREFIX, ...args);
+      if (enabled('info')) sink.log(PREFIX, ...args);
     },
     debug: (...args) => {
-      if (enabled('debug')) console.log(PREFIX, ...args);
+      if (enabled('debug')) sink.log(PREFIX, ...args);
     },
   };
 }

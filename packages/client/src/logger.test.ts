@@ -1,41 +1,45 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createLogger, isLogLevel, LOG_LEVEL_ENV, resolveLogLevel } from './logger.js';
+import {
+  type ConsoleSink,
+  createLogger,
+  isLogLevel,
+  LOG_LEVEL_ENV,
+  resolveLogLevel,
+} from './logger.js';
 
-interface CapturedConsole {
+interface Captured {
   log: string[];
   warn: string[];
   error: string[];
-  restore: () => void;
+  sink: ConsoleSink;
 }
 
-function captureConsole(): CapturedConsole {
-  const captured: CapturedConsole = {
-    log: [],
-    warn: [],
-    error: [],
-    restore: () => {
-      console.log = originalLog;
-      console.warn = originalWarn;
-      console.error = originalError;
+// Capturing sink. Tests inject this instead of monkey-patching the global
+// console so a parallel test file in the same process (or a future change
+// to test-runner isolation) cannot interleave global mutations.
+function makeSink(): Captured {
+  const log: string[] = [];
+  const warn: string[] = [];
+  const error: string[] = [];
+  const join = (args: unknown[]): string =>
+    args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ');
+  return {
+    log,
+    warn,
+    error,
+    sink: {
+      log: (...a: unknown[]) => log.push(join(a)),
+      warn: (...a: unknown[]) => warn.push(join(a)),
+      error: (...a: unknown[]) => error.push(join(a)),
     },
   };
-  const originalLog = console.log;
-  const originalWarn = console.warn;
-  const originalError = console.error;
-  const join = (args: unknown[]): string => args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ');
-  console.log = (...args: unknown[]) => {
-    captured.log.push(join(args));
-  };
-  console.warn = (...args: unknown[]) => {
-    captured.warn.push(join(args));
-  };
-  console.error = (...args: unknown[]) => {
-    captured.error.push(join(args));
-  };
-  return captured;
 }
 
+// `process.env` is process-global; this helper restores the previous value
+// in a `finally` so each test leaves the environment as it found it. The
+// node:test runner isolates test files in separate processes by default,
+// so a single test's env mutation cannot leak to another file.
 function withEnv<T>(key: string, value: string | undefined, fn: () => T): T {
   const prev = process.env[key];
   if (value === undefined) delete process.env[key];
@@ -59,96 +63,121 @@ test('isLogLevel accepts the documented levels and rejects anything else', () =>
 
 test('resolveLogLevel: explicit value wins over env and default', () => {
   withEnv(LOG_LEVEL_ENV, 'debug', () => {
-    assert.equal(resolveLogLevel('warn'), 'warn');
+    const c = makeSink();
+    assert.equal(resolveLogLevel('warn', c.sink), 'warn');
+    assert.deepEqual(c.warn, []);
   });
 });
 
 test('resolveLogLevel: env var is honored when no explicit value', () => {
+  const c = makeSink();
   withEnv(LOG_LEVEL_ENV, 'debug', () => {
-    assert.equal(resolveLogLevel(), 'debug');
+    assert.equal(resolveLogLevel(undefined, c.sink), 'debug');
   });
   withEnv(LOG_LEVEL_ENV, 'SILENT', () => {
-    assert.equal(resolveLogLevel(), 'silent');
+    assert.equal(resolveLogLevel(undefined, c.sink), 'silent');
   });
+  assert.deepEqual(c.warn, []);
 });
 
-test('resolveLogLevel: defaults to info when env is unset', () => {
+test('resolveLogLevel: defaults to info when env is unset or empty', () => {
+  const c = makeSink();
   withEnv(LOG_LEVEL_ENV, undefined, () => {
-    assert.equal(resolveLogLevel(), 'info');
+    assert.equal(resolveLogLevel(undefined, c.sink), 'info');
   });
+  withEnv(LOG_LEVEL_ENV, '   ', () => {
+    assert.equal(resolveLogLevel(undefined, c.sink), 'info');
+  });
+  assert.deepEqual(c.warn, []);
+});
+
+test('resolveLogLevel: trims whitespace from env values', () => {
+  const c = makeSink();
+  withEnv(LOG_LEVEL_ENV, ' debug ', () => {
+    assert.equal(resolveLogLevel(undefined, c.sink), 'debug');
+  });
+  withEnv(LOG_LEVEL_ENV, '\tWarn\n', () => {
+    assert.equal(resolveLogLevel(undefined, c.sink), 'warn');
+  });
+  assert.deepEqual(c.warn, []);
 });
 
 test('resolveLogLevel: invalid env value falls back to info and warns once', () => {
-  const captured = captureConsole();
-  try {
-    withEnv(LOG_LEVEL_ENV, 'verbose', () => {
-      assert.equal(resolveLogLevel(), 'info');
-    });
-    assert.equal(captured.warn.length, 1);
-    assert.match(captured.warn[0], /ignoring invalid VICOOP_CLIENT_LOG_LEVEL=verbose/);
-  } finally {
-    captured.restore();
-  }
+  const c = makeSink();
+  withEnv(LOG_LEVEL_ENV, 'verbose', () => {
+    assert.equal(resolveLogLevel(undefined, c.sink), 'info');
+  });
+  assert.equal(c.warn.length, 1);
+  assert.match(c.warn[0], /ignoring invalid VICOOP_CLIENT_LOG_LEVEL=verbose/);
+});
+
+test('resolveLogLevel: invalid explicit value warns then falls through to env', () => {
+  const c = makeSink();
+  withEnv(LOG_LEVEL_ENV, 'debug', () => {
+    assert.equal(resolveLogLevel('TRACE' as 'debug', c.sink), 'debug');
+  });
+  assert.equal(c.warn.length, 1);
+  assert.match(c.warn[0], /ignoring invalid logLevel=TRACE/);
+});
+
+test('resolveLogLevel: invalid explicit value with no env falls back to info', () => {
+  const c = makeSink();
+  withEnv(LOG_LEVEL_ENV, undefined, () => {
+    assert.equal(resolveLogLevel('verbose' as 'debug', c.sink), 'info');
+  });
+  assert.equal(c.warn.length, 1);
+  assert.match(c.warn[0], /ignoring invalid logLevel=verbose/);
 });
 
 test('createLogger at info: error/warn/info pass, debug filtered', () => {
-  const captured = captureConsole();
-  try {
-    const logger = createLogger('info');
-    logger.error('boom');
-    logger.warn('careful');
-    logger.info('hello');
-    logger.debug('quiet');
-    assert.deepEqual(captured.error, ['[client] boom']);
-    assert.deepEqual(captured.warn, ['[client] careful']);
-    assert.deepEqual(captured.log, ['[client] hello']);
-  } finally {
-    captured.restore();
-  }
+  const c = makeSink();
+  const logger = createLogger('info', c.sink);
+  logger.error('boom');
+  logger.warn('careful');
+  logger.info('hello');
+  logger.debug('quiet');
+  assert.deepEqual(c.error, ['[client] boom']);
+  assert.deepEqual(c.warn, ['[client] careful']);
+  assert.deepEqual(c.log, ['[client] hello']);
 });
 
 test('createLogger at debug: every level passes through', () => {
-  const captured = captureConsole();
-  try {
-    const logger = createLogger('debug');
-    logger.error('e');
-    logger.warn('w');
-    logger.info('i');
-    logger.debug('d');
-    assert.deepEqual(captured.error, ['[client] e']);
-    assert.deepEqual(captured.warn, ['[client] w']);
-    assert.deepEqual(captured.log, ['[client] i', '[client] d']);
-  } finally {
-    captured.restore();
-  }
+  const c = makeSink();
+  const logger = createLogger('debug', c.sink);
+  logger.error('e');
+  logger.warn('w');
+  logger.info('i');
+  logger.debug('d');
+  assert.deepEqual(c.error, ['[client] e']);
+  assert.deepEqual(c.warn, ['[client] w']);
+  assert.deepEqual(c.log, ['[client] i', '[client] d']);
 });
 
 test('createLogger at warn: info and debug filtered', () => {
-  const captured = captureConsole();
-  try {
-    const logger = createLogger('warn');
-    logger.info('i');
-    logger.debug('d');
-    logger.warn('w');
-    assert.deepEqual(captured.log, []);
-    assert.deepEqual(captured.warn, ['[client] w']);
-  } finally {
-    captured.restore();
-  }
+  const c = makeSink();
+  const logger = createLogger('warn', c.sink);
+  logger.info('i');
+  logger.debug('d');
+  logger.warn('w');
+  assert.deepEqual(c.log, []);
+  assert.deepEqual(c.warn, ['[client] w']);
 });
 
 test('createLogger at silent: every level filtered', () => {
-  const captured = captureConsole();
-  try {
-    const logger = createLogger('silent');
-    logger.error('e');
-    logger.warn('w');
-    logger.info('i');
-    logger.debug('d');
-    assert.deepEqual(captured.error, []);
-    assert.deepEqual(captured.warn, []);
-    assert.deepEqual(captured.log, []);
-  } finally {
-    captured.restore();
-  }
+  const c = makeSink();
+  const logger = createLogger('silent', c.sink);
+  logger.error('e');
+  logger.warn('w');
+  logger.info('i');
+  logger.debug('d');
+  assert.deepEqual(c.error, []);
+  assert.deepEqual(c.warn, []);
+  assert.deepEqual(c.log, []);
+});
+
+test('createLogger: trims an explicit level string', () => {
+  const c = makeSink();
+  const logger = createLogger(' DEBUG ', c.sink);
+  assert.equal(logger.level, 'debug');
+  assert.deepEqual(c.warn, []);
 });
