@@ -31,7 +31,7 @@ cat > "$BUNDLE_DIR/bin/vicoop-client" <<'EOF'
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec node "$SCRIPT_DIR/../dist/cli.js" "$@"
+exec node -- "$SCRIPT_DIR/../dist/cli.js" "$@"
 EOF
 
 chmod +x "$BUNDLE_DIR/bin/vicoop-client"
@@ -51,7 +51,7 @@ export AGENT_ID=my-agent
   --bridge "\$BRIDGE_URL" \\
   --client-name "my client" \\
   --agent-ids "\$AGENT_ID" \\
-  --env-file ./vicoop-client.env
+  --write-env-file ./vicoop-client.env
 \`\`\`
 
 Then start the client with env vars from \`./vicoop-client.env\` and a backend card

@@ -16,11 +16,11 @@
 #   2. Resolves the latest (or pinned) client-v* GitHub release.
 #   3. Downloads the .tgz + .sha256 and verifies integrity.
 #   4. Extracts the bundle into INSTALL_DIR.
-#   5. On systemd hosts, drops a vicoop-client.service unit + env template
-#      (does NOT enable/start — the owner must populate env first). The
+#   5. On systemd hosts, drops an optional vicoop-client.service unit + env
+#      template (does NOT enable/start — verify a foreground run first). The
 #      shipped bundle already contains cards/openclaw.json, so the env
 #      template points AGENT_CARD at that file by default.
-#   6. Prints next-step instructions (populate env, reload, enable).
+#   6. Prints next-step instructions for login and a foreground first run.
 
 set -eu
 
@@ -187,7 +187,7 @@ register_service() {
   # systemd must be the init (PID 1) — otherwise systemctl may exist but the
   # unit will never actually run (common in Docker, WSL1, macOS with homebrew).
   if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
-    log "systemd not detected — skipping service registration (set up a supervisor manually; see docs/install-client.md §6)"
+    log "systemd not detected — skipping optional service registration"
     return
   fi
 
@@ -392,14 +392,22 @@ cat <<EOF
 
 Next steps (the agent that owns this client should perform these):
 
-  1. Obtain SERVER_TOKEN, AGENT_ID, and an agent card — see
-     docs/install-client.md steps 2-4 for the SIWE + registerClient flow.
+  1. Verify the installed bundle and register with device flow:
+
+       "$INSTALL_DIR/bin/vicoop-client" -v
+       "$INSTALL_DIR/bin/vicoop-client" login --help
+
+     Then follow docs/install-client.md steps 3-5 to pick AGENT_ID, run
+     login, and choose an agent card.
 EOF
 
 if [ -n "$SERVICE_INSTALLED" ]; then
   cat <<EOF
-  2. Fill in $SERVICE_ENV_FILE with SERVER_URL / SERVER_TOKEN / AGENT_ID / AGENT_CARD / BACKEND.
-  3. Reload systemd and enable + start the service:
+  2. First run the client in the foreground with SERVER_URL / SERVER_TOKEN /
+     AGENT_ID / AGENT_CARD / BACKEND. See docs/install-client.md step 6.
+
+  3. Optional: after the foreground run works, fill in $SERVICE_ENV_FILE,
+     then reload systemd and enable + start the service:
 
        $SERVICE_RELOAD_CMD
        $SERVICE_ENABLE_CMD
@@ -423,7 +431,8 @@ EOF
   fi
 else
   cat <<EOF
-  2. Run the client (supply config via env or flags). Paths are quoted so
+  2. Run the client in the foreground (supply config via env or flags).
+     Paths are quoted so
      the snippet works even when \$INSTALL_DIR contains whitespace:
 
        SERVER_URL=wss://your-server-host \\
@@ -433,8 +442,8 @@ else
        BACKEND=openclaw \\
          "$INSTALL_DIR/bin/vicoop-client"
 
-     For persistent operation, see docs/install-client.md §6
-     (launchd on macOS, systemd user unit, tmux).
+     Persistent operation is optional after the foreground run works; see
+     docs/install-client.md "Optional: persistence".
 
   Future updates: run \`"$INSTALL_DIR/bin/vicoop-client" upgrade\` — no need
   to re-run this installer. Pass --check to see if a newer release is

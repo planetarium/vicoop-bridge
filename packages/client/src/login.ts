@@ -49,7 +49,7 @@ function usage(): void {
   process.stderr.write(
     [
       'usage: vicoop-client login --bridge <https://...> --client-name <name>',
-      '                          --agent-ids <id1,id2> [--env-file <path>] [--json]',
+      '                          --agent-ids <id1,id2> [--write-env-file <path>] [--json]',
       '',
       'Drives Google OAuth device flow against the bridge to register a new client.',
       'Prints the resulting CLIENT_TOKEN once — save it immediately, it is unrecoverable.',
@@ -58,8 +58,11 @@ function usage(): void {
       '  --bridge          Bridge HTTP URL (e.g. https://vicoop-bridge-server.fly.dev)',
       '  --client-name     Human-readable client name shown in admin tooling',
       '  --agent-ids       CSV of agent ids this client is allowed to register as',
-      '  --env-file PATH   Write SERVER_URL / SERVER_TOKEN / AGENT_ID env block to PATH',
+      '  --write-env-file PATH',
+      '                    Write SERVER_URL / SERVER_TOKEN / AGENT_ID env block to PATH',
       '                    (chmod 600). When omitted, the env block is printed to stdout.',
+      '  --env-file PATH   Deprecated alias for --write-env-file. Avoid on Node 24+',
+      '                    unless your wrapper invokes node with "--" before the script.',
       '  --json            Print the token endpoint response as JSON to stdout instead.',
       '',
     ].join('\n'),
@@ -103,6 +106,7 @@ function parseArgs(args: string[]): LoginArgs | null {
       case '--agent-ids':
         out.allowedAgentIds = v.split(',').map((s) => s.trim()).filter(Boolean);
         break;
+      case '--write-env-file':
       case '--env-file':
         out.envFile = v;
         break;
