@@ -191,8 +191,13 @@ export class Client {
 
       switch (frame.type) {
         case 'task.assign':
+          // `summarizeParts` already sanitizes each MIME via safeToken, so
+          // the `parts=` token here intentionally does NOT wrap the whole
+          // summary again — that would double-escape backslashes (a `\n`
+          // sanitized to `\\n` would become `\\\\n`) and make the field
+          // harder to read for operators.
           this.logger.info(
-            `task.assign taskId=${safeToken(frame.taskId)} contextId=${safeToken(frame.contextId)} parts=${safeToken(summarizeParts(frame.message.parts))}`,
+            `task.assign taskId=${safeToken(frame.taskId)} contextId=${safeToken(frame.contextId)} parts=${summarizeParts(frame.message.parts)}`,
           );
           this.logger.debug(
             `task.assign detail taskId=${safeToken(frame.taskId)} messageId=${safeToken(frame.message.messageId)} role=${frame.message.role} partsCount=${frame.message.parts.length}`,
