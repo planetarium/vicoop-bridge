@@ -180,3 +180,23 @@ the unit test `emits FilePart artifact when tool_result contains an
 image block`. An e2e harness for that path would require a separate MCP
 server that actually returns image blocks; deferred until a real use
 case lands.
+
+## Progress visibility (issue #100)
+
+Long-running tool work used to look identical to a hung process: a
+single `task.status: working` followed by a multi-minute silence until
+the final assistant text. Two additions cover the gap, both unit-tested
+in `claude.test.ts`:
+
+- `tool_use` blocks inside an `assistant` event become
+  `claude-tool-call` artifacts. Each artifact carries a head-truncated
+  `<tool>: <input>` text part (≤ 200 chars; secrets-and-size guard) and
+  a `data` part with `{ toolName, toolUseId }` for filtering.
+- A configurable idle-silence heartbeat (`heartbeatMs`, default 30 s)
+  emits a bare `task.status: working` whenever no other frame has gone
+  out for that many ms. Disabled with `heartbeatMs: 0`. Backstop for
+  any future case where work happens without an interleaved model turn.
+
+Text-only `tool_result` blocks are still dropped — gating that stream
+needs a truncation policy that hasn't been settled (see #100 "B"). The
+existing image/document passthrough is unchanged.

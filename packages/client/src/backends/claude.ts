@@ -52,6 +52,15 @@ export interface ClaudeBackendOptions {
    * calls across overlapping tasks are rejected with `ambiguous-task`.
    */
   sendFileMcp?: SendFileMcpOptions;
+  // Idle-silence heartbeat. While a task is running, if no other frame has
+  // gone out for at least `heartbeatMs`, emit a bare `task.status` (state:
+  // working, no message body) so callers and intermediaries (Fly edge,
+  // SSE consumers) see bytes on the wire and don't tear down the
+  // connection as a dead read. Default 30000 ms; pass 0 to disable.
+  heartbeatMs?: number;
+  // Test seam: timer impls. Defaults to global setInterval/clearInterval.
+  setIntervalFn?: (fn: () => void, ms: number) => unknown;
+  clearIntervalFn?: (handle: unknown) => void;
 }
 
 interface SessionEntry {
@@ -64,10 +73,21 @@ interface SessionEntry {
   writeId: number;
 }
 
-// claude --output-format stream-json writes one JSON object per line. We
-// surface assistant `text` blocks (one A2A artifact per assistant message)
-// and pass through `tool_result` content of type image/document so MCP
-// screenshot-style tools land as A2A `FilePart`s alongside the text.
+// claude --output-format stream-json writes one JSON object per line.
+// Mapping from stream event → upstream A2A frame:
+//
+//   spawn (initial)            → task.status (state: working)
+//   assistant: text block(s)   → task.artifact (name: claude-message)
+//   assistant: tool_use block  → task.artifact (name: claude-tool-call)
+//   user: tool_result image/PDF→ task.artifact (name: claude-tool-result, file)
+//   user: tool_result text     → dropped (size/secrets policy; see #100)
+//   result                     → task.complete (state: completed)
+//   <heartbeatMs of silence>   → task.status (state: working, no body)
+//
+// Tool inputs are head-truncated to ~200 chars before they hit the wire
+// (`TOOL_CALL_SUMMARY_MAX_CHARS`). The structured tool name + tool_use_id
+// ride along as a `data` part so consumers can filter/count tool calls
+// even when the summary text was clipped.
 interface StreamEvent {
   type?: unknown;
   message?: {
@@ -99,6 +119,21 @@ const INPUT_FILE_MAX_BYTES = 5 * 1024 * 1024;
 // (e.g. an MCP screenshot at unbounded resolution) from forcing a huge
 // in-memory base64 decode and a giant artifact payload on the wire.
 const TOOL_RESULT_MEDIA_MAX_BYTES = 5 * 1024 * 1024;
+
+// Tool-call summary line length. The model's tool_use input can be huge
+// (full file bodies, long Bash commands) and may contain secrets that
+// shouldn't be re-broadcast verbatim on the artifact wire. Truncate to
+// this many characters of `<tool>: <input>` before emitting; the tool
+// name lives in the artifact's data part so consumers can still filter
+// reliably even after the head was clipped.
+const TOOL_CALL_SUMMARY_MAX_CHARS = 200;
+
+// Default idle-silence heartbeat. `dist/backends/claude.js` events that
+// do tool work (Bash/Read/Grep/Edit/MCP) can run minute-plus without
+// producing any assistant text — long enough to trip Fly edge and SSE
+// caller idle timeouts. Below this many ms of silence, emit a bare
+// `task.status: working` so bytes keep flowing.
+const DEFAULT_HEARTBEAT_MS = 30_000;
 
 // Defensive stringification — `(e as Error).message` is unsafe when the
 // thrown value is null/undefined or a non-Error primitive (common in JS).
@@ -147,6 +182,52 @@ function extractAssistantText(content: unknown): string {
     if (!block || typeof block !== 'object') continue;
     const b = block as { type?: unknown; text?: unknown };
     if (b.type === 'text' && typeof b.text === 'string') out += b.text;
+  }
+  return out;
+}
+
+interface ToolUseBlock {
+  toolName: string;
+  toolUseId: string;
+  summary: string;
+}
+
+function summarizeToolInput(input: unknown): string {
+  if (input === undefined || input === null) return '';
+  if (typeof input === 'string') return input;
+  try {
+    return JSON.stringify(input);
+  } catch {
+    return '<unserializable>';
+  }
+}
+
+function clipTo(line: string, max: number): string {
+  if (line.length <= max) return line;
+  // 1-char ellipsis keeps the head as long as possible while still
+  // signalling truncation. Callers know the cap; they can recover the
+  // tool name (and full input from a server-side log) if needed.
+  return `${line.slice(0, Math.max(0, max - 1))}…`;
+}
+
+// Pull `tool_use` blocks out of an `assistant`-role message's content
+// array. Each one becomes one `claude-tool-call` artifact upstream, with
+// a head-truncated `<tool>: <input>` summary plus a `data` part carrying
+// the structured tool name + tool_use_id for consumer-side filtering.
+function extractAssistantToolUses(content: unknown): ToolUseBlock[] {
+  if (!Array.isArray(content)) return [];
+  const out: ToolUseBlock[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    const b = block as { type?: unknown; name?: unknown; id?: unknown; input?: unknown };
+    if (b.type !== 'tool_use') continue;
+    const toolName = typeof b.name === 'string' ? b.name : '<unknown>';
+    const toolUseId = typeof b.id === 'string' ? b.id : '';
+    const summary = clipTo(
+      `${toolName}: ${summarizeToolInput(b.input)}`,
+      TOOL_CALL_SUMMARY_MAX_CHARS,
+    );
+    out.push({ toolName, toolUseId, summary });
   }
   return out;
 }
@@ -261,6 +342,9 @@ export function createClaudeBackend(
   const stderrCap = opts.stderrCaptureBytes ?? 8192;
   const sessionTtlMs = opts.sessionTtlMs ?? 60 * 60 * 1000;
   const now = opts.now ?? Date.now;
+  const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const setIntervalImpl = opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
+  const clearIntervalImpl = opts.clearIntervalFn ?? ((h) => clearInterval(h as ReturnType<typeof setInterval>));
   const sendFileMcpOpts =
     opts.sendFileMcp && opts.sendFileMcp.allowedRoots.length > 0
       ? opts.sendFileMcp
@@ -309,7 +393,17 @@ export function createClaudeBackend(
 
     getSendFileMcpServer: () => sendFileMcp,
 
-    async handle(task, emit, signal) {
+    async handle(task, rawEmit, signal) {
+      // Idle-silence heartbeat needs to observe every outbound frame so it
+      // doesn't fire while real traffic is flowing. Wrap rawEmit so every
+      // emission refreshes `lastEmitAt`. The heartbeat itself goes through
+      // rawEmit directly to avoid a no-op self-trigger loop.
+      let lastEmitAt = now();
+      const emit: typeof rawEmit = (frame) => {
+        lastEmitAt = now();
+        rawEmit(frame);
+      };
+
       if (signal.aborted) {
         emit({
           type: 'task.complete',
@@ -524,11 +618,38 @@ export function createClaudeBackend(
         emittedAnyArtifact = true;
       };
 
+      const emitToolCallArtifact = (block: ToolUseBlock): void => {
+        emit({
+          type: 'task.artifact',
+          taskId: task.taskId,
+          artifact: {
+            artifactId: randomUUID(),
+            name: 'claude-tool-call',
+            parts: [
+              { kind: 'text', text: block.summary },
+              {
+                kind: 'data',
+                data: { toolName: block.toolName, toolUseId: block.toolUseId },
+              },
+            ],
+          },
+          lastChunk: true,
+        });
+        emittedAnyArtifact = true;
+      };
+
       const handleEvent = (evt: StreamEvent): void => {
         if (settled) return;
         if (evt.type === 'assistant') {
           if (evt.message?.role !== 'assistant') return;
+          // A single assistant turn can interleave plain text and tool_use
+          // blocks. Emit the text (if any) first so observers see "what the
+          // model said" before "what tools it then called", matching the
+          // visible CLI ordering inside that turn.
           emitAssistantArtifact(extractAssistantText(evt.message.content));
+          for (const tu of extractAssistantToolUses(evt.message.content)) {
+            emitToolCallArtifact(tu);
+          }
           return;
         }
         if (evt.type === 'user') {
@@ -601,6 +722,27 @@ export function createClaudeBackend(
         if (stderrTail.length > stderrCap) stderrTail = stderrTail.slice(-stderrCap);
       });
 
+      // Idle-silence heartbeat: while the child is alive, every
+      // `heartbeatMs` of no outbound traffic produces a bare
+      // `task.status: working` so callers and intermediaries see bytes
+      // on the wire. Disabled when heartbeatMs <= 0.
+      let heartbeatHandle: unknown = null;
+      if (heartbeatMs > 0) {
+        heartbeatHandle = setIntervalImpl(() => {
+          if (settled) return;
+          if (now() - lastEmitAt < heartbeatMs) return;
+          // Bypass `emit` (the wrapper) when assembling the frame, but
+          // route through it so `lastEmitAt` resets — otherwise back-to-
+          // back ticks would queue up if `now()` jumped past the threshold
+          // multiple times in one cycle.
+          emit({
+            type: 'task.status',
+            taskId: task.taskId,
+            status: { state: 'working', timestamp: new Date().toISOString() },
+          });
+        }, heartbeatMs);
+      }
+
       const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: unknown }>((resolve) => {
         // The `error` event is *typed* with `Error`, but EventEmitter at
         // runtime can emit any value. Carry it as unknown so the frame
@@ -612,6 +754,7 @@ export function createClaudeBackend(
       signal.removeEventListener('abort', onAbort);
       settled = true;
       sendFileRelease?.();
+      if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
 
       // Flush any trailing line without a newline. claude normally terminates
       // each event with \n but a crash mid-write could leave one orphan.

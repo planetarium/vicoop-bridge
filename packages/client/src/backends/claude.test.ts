@@ -912,6 +912,221 @@ test('emits FilePart artifact when tool_result contains an image block', async (
   }
 });
 
+test('emits a claude-tool-call artifact per tool_use block in an assistant event', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'Let me check the directory.' },
+            {
+              type: 'tool_use',
+              id: 'tu_1',
+              name: 'Bash',
+              input: { command: 'ls -la /tmp' },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              tool_use_id: 'tu_1',
+              type: 'tool_result',
+              content: [{ type: 'text', text: 'total 0' }],
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'No files.' }],
+        },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'No files.' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
+  const { emit, frames } = collect();
+  await backend.handle(assign('list /tmp'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  const names = artifacts.map((a) => a.artifact.name);
+  assert.deepEqual(
+    names,
+    ['claude-message', 'claude-tool-call', 'claude-message'],
+    'order: assistant text, then tool_use, then trailing assistant text',
+  );
+
+  const callArtifact = artifacts[1];
+  assert.equal(callArtifact.lastChunk, true);
+  assert.equal(callArtifact.artifact.parts.length, 2);
+  const textPart = callArtifact.artifact.parts[0];
+  assert.equal(textPart.kind, 'text');
+  if (textPart.kind === 'text') {
+    assert.match(textPart.text, /^Bash: /);
+    assert.ok(textPart.text.includes('ls -la /tmp'));
+  }
+  const dataPart = callArtifact.artifact.parts[1];
+  assert.equal(dataPart.kind, 'data');
+  if (dataPart.kind === 'data') {
+    assert.equal(dataPart.data.toolName, 'Bash');
+    assert.equal(dataPart.data.toolUseId, 'tu_1');
+  }
+
+  // Existing assistant text artifacts and the terminal frame remain
+  // untouched — new frames are additive, not replacements.
+  const complete = frames.at(-1) as Extract<UpFrame, { type: 'task.complete' }>;
+  assert.equal(complete.type, 'task.complete');
+  assert.equal(complete.status.state, 'completed');
+});
+
+test('truncates a long tool_use input summary to a bounded length', async () => {
+  const longArg = 'x'.repeat(800);
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'tu_long',
+              name: 'Bash',
+              input: { command: longArg },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({ type: 'result', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
+  const { emit, frames } = collect();
+  await backend.handle(assign('x'), emit, NEVER);
+
+  const callArtifact = frames.find(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
+      f.type === 'task.artifact' && f.artifact.name === 'claude-tool-call',
+  );
+  assert.ok(callArtifact, 'expected claude-tool-call artifact');
+  const textPart = callArtifact.artifact.parts[0];
+  if (textPart.kind !== 'text') throw new Error('expected text part');
+  assert.ok(textPart.text.length <= 200, `summary length ${textPart.text.length} > 200`);
+  assert.ok(textPart.text.startsWith('Bash: '));
+  assert.ok(textPart.text.endsWith('…'), 'truncation marker expected at tail');
+});
+
+test('heartbeat: emits task.status after heartbeatMs of silence and stops at terminal time', async () => {
+  // Initialize as a no-op so the type stays `() => void` instead of
+  // `(() => void) | null`. The closure-mutation path through setIntervalFn
+  // confuses TS narrowing — easier to start callable.
+  let scheduledFn: () => void = () => {};
+  let scheduled = false;
+  let cleared = false;
+  let nowMs = 1_000_000;
+
+  // Hold the child open so we can drive heartbeat ticks before the run
+  // terminates and clears the interval.
+  let releaseFinish: () => void = () => {};
+  const finishReady = new Promise<void>((r) => {
+    releaseFinish = r;
+  });
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(async () => {
+      await finishReady;
+      child.emitStdout(JSON.stringify({ type: 'result', result: 'ok' }) + '\n');
+      setImmediate(() => child.finish(0));
+    });
+  });
+
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    heartbeatMs: 100,
+    now: () => nowMs,
+    setIntervalFn: (fn) => {
+      scheduledFn = fn;
+      scheduled = true;
+      return { tag: 'fake-interval' };
+    },
+    clearIntervalFn: () => {
+      cleared = true;
+    },
+  });
+  const { emit, frames } = collect();
+
+  const runP = backend.handle(assign('x'), emit, NEVER);
+  // Yield enough microtasks for spawn → register-listeners → schedule
+  // heartbeat to run before we drive ticks.
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(scheduled, 'heartbeat must register a setInterval handler');
+
+  const countStatus = () => frames.filter((f) => f.type === 'task.status').length;
+  assert.equal(countStatus(), 1, 'only the initial task.status: working has been emitted');
+
+  // Tick with no elapsed time → silence < heartbeat → skip.
+  scheduledFn();
+  assert.equal(countStatus(), 1);
+
+  // Advance past the heartbeat threshold → tick must emit one status.
+  nowMs += 250;
+  scheduledFn();
+  assert.equal(countStatus(), 2);
+
+  // Subsequent tick at the same instant must NOT double-fire — the prior
+  // emit refreshed lastEmitAt through the wrapped emitter.
+  scheduledFn();
+  assert.equal(countStatus(), 2);
+
+  // Real traffic also resets the silence window. Let the child finish.
+  releaseFinish();
+  await runP;
+
+  assert.ok(cleared, 'heartbeat handle must be cleared at terminal time');
+  // After terminal frame, no more status frames may be added even if a
+  // stale tick fires (the `settled` guard inside the closure protects
+  // against this — exercise it explicitly).
+  scheduledFn();
+  const lastStatusAfterTerminal = countStatus();
+  assert.equal(
+    lastStatusAfterTerminal,
+    2,
+    'no heartbeat allowed after terminal frame',
+  );
+});
+
+test('heartbeat: heartbeatMs:0 disables the interval entirely', async () => {
+  let registered = false;
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    heartbeatMs: 0,
+    setIntervalFn: () => {
+      registered = true;
+      return null;
+    },
+    clearIntervalFn: () => {},
+  });
+  await backend.handle(assign('x'), collect().emit, NEVER);
+  assert.equal(registered, false, 'heartbeatMs:0 must skip setInterval registration');
+});
+
 test('send_file MCP: server is registered on first task and a registered handle receives invoked artifacts', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-sendfile-test-'));
   const realRoot = await fs.realpath(root);
