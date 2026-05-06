@@ -601,7 +601,10 @@ export function createClaudeBackend(
         if (stderrTail.length > stderrCap) stderrTail = stderrTail.slice(-stderrCap);
       });
 
-      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: Error }>((resolve) => {
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: unknown }>((resolve) => {
+        // The `error` event is *typed* with `Error`, but EventEmitter at
+        // runtime can emit any value. Carry it as unknown so the frame
+        // builder routes through `errorMessage` safely.
         child.on('error', (err) => resolve({ code: null, signal: null, error: err }));
         child.on('close', (code, sig) => resolve({ code, signal: sig }));
       });
@@ -635,7 +638,10 @@ export function createClaudeBackend(
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: { code: 'spawn_failed', message: exit.error.message },
+          // exit.error is typed Error from the child `error` event but a
+          // custom spawn / fake child could emit a non-Error here. Route
+          // through errorMessage so .message access can't crash the frame.
+          error: { code: 'spawn_failed', message: errorMessage(exit.error) },
         });
         return;
       }
