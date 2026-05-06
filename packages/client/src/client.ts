@@ -93,8 +93,13 @@ export class Client {
       const probePromise = Promise.resolve()
         .then(() => probe.call(this.opts.backend))
         .catch((err: unknown) => {
+          // Sanitize the message — even a probe error path can carry text
+          // derived from upstream, and a stray newline in an error message
+          // would let a non-fatal probe failure split the warn into two
+          // log lines (or appear to inject a fake `[client] …` entry).
+          const message = err instanceof Error ? err.message : String(err);
           this.logger.warn(
-            `backend capability probe threw (${err instanceof Error ? err.message : String(err)}); using declared card capabilities`,
+            `backend capability probe threw (${safeToken(message)}); using declared card capabilities`,
           );
           return null;
         });
@@ -173,8 +178,9 @@ export class Client {
       this.resolveEffectiveCard()
         .then(sendHello)
         .catch((err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
           this.logger.warn(
-            `effectiveCard promise rejected unexpectedly (${err instanceof Error ? err.message : String(err)}); sending hello with declared card`,
+            `effectiveCard promise rejected unexpectedly (${safeToken(message)}); sending hello with declared card`,
           );
           sendHello(this.opts.agentCard);
         });
@@ -185,7 +191,11 @@ export class Client {
       try {
         frame = parseDownFrame(typeof raw === 'string' ? raw : raw.toString('utf8'));
       } catch (err) {
-        this.logger.error('invalid frame:', err);
+        // Stringify+sanitize before passing to the logger so a frame parse
+        // error (Zod or otherwise) carrying newlines / control chars in
+        // its message can't split the log into multiple lines.
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger.error(`invalid frame: ${safeToken(message)}`);
         return;
       }
 
@@ -227,7 +237,10 @@ export class Client {
     });
 
     ws.on('error', (err) => {
-      this.logger.error('ws error:', err.message);
+      // Sanitize: ws error messages can include URLs, hostnames, or
+      // upstream text and we want the same single-line invariant we
+      // applied to the close `reason` and lifecycle logs.
+      this.logger.error(`ws error: ${safeToken(err.message)}`);
     });
   }
 
