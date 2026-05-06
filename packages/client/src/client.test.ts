@@ -1,7 +1,57 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { Part } from '@vicoop-bridge/protocol';
-import { summarizeParts } from './client.js';
+import type { Part, TaskAssignFrame, UpFrame } from '@vicoop-bridge/protocol';
+import type { Backend, Emit } from './backend.js';
+import { processTask, summarizeParts } from './client.js';
+import { type ConsoleSink, createLogger } from './logger.js';
+
+interface CapturedSink {
+  log: string[];
+  warn: string[];
+  error: string[];
+  sink: ConsoleSink;
+}
+
+function makeSink(): CapturedSink {
+  const log: string[] = [];
+  const warn: string[] = [];
+  const error: string[] = [];
+  const join = (a: unknown[]): string =>
+    a.map((x) => (typeof x === 'string' ? x : String(x))).join(' ');
+  return {
+    log,
+    warn,
+    error,
+    sink: {
+      log: (...a: unknown[]) => log.push(join(a)),
+      warn: (...a: unknown[]) => warn.push(join(a)),
+      error: (...a: unknown[]) => error.push(join(a)),
+    },
+  };
+}
+
+function captureSend(): { sent: UpFrame[]; send: (f: UpFrame) => void } {
+  const sent: UpFrame[] = [];
+  return {
+    sent,
+    send: (f) => {
+      sent.push(f);
+    },
+  };
+}
+
+function makeAssign(taskId: string): TaskAssignFrame {
+  return {
+    type: 'task.assign',
+    taskId,
+    contextId: 'ctx',
+    message: { role: 'user', parts: [{ kind: 'text', text: 'hi' }], messageId: 'm1' },
+  };
+}
+
+function backendOf(name: string, handle: Backend['handle']): Backend {
+  return { name, handle };
+}
 
 test('summarizeParts: empty', () => {
   assert.equal(summarizeParts([]), '(none)');
@@ -54,4 +104,205 @@ test('summarizeParts: does not include user-supplied content', () => {
   ];
   const summary = summarizeParts(parts);
   assert.equal(summary.includes(secret), false);
+});
+
+// processTask lifecycle tests — exercise the runTask body directly with
+// stub backends and a capturing send/logger so we don't need a real ws.
+
+test('processTask: backend emits task.complete -> logs backend.start and task.complete', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const backend = backendOf('stub', async (_t, emit: Emit) => {
+    emit({ type: 'task.complete', taskId: 'T1', status: { state: 'completed' } });
+  });
+  await processTask(makeAssign('T1'), new AbortController().signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  assert.equal(s.sent.length, 1);
+  assert.equal(s.sent[0].type, 'task.complete');
+  assert.equal(c.log.length, 2);
+  assert.match(c.log[0], /backend\.start taskId=T1 backend=stub/);
+  assert.match(c.log[1], /task\.complete taskId=T1 elapsedMs=\d+ artifacts=0/);
+});
+
+test('processTask: artifacts are deduped by artifactId across chunks', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const backend = backendOf('stub', async (_t, emit) => {
+    emit({
+      type: 'task.artifact',
+      taskId: 'T1',
+      artifact: { artifactId: 'A', parts: [{ kind: 'text', text: 'p1' }] },
+    });
+    emit({
+      type: 'task.artifact',
+      taskId: 'T1',
+      artifact: { artifactId: 'A', parts: [{ kind: 'text', text: 'p2' }] },
+      lastChunk: true,
+    });
+    emit({
+      type: 'task.artifact',
+      taskId: 'T1',
+      artifact: { artifactId: 'B', parts: [{ kind: 'text', text: 'b' }] },
+      lastChunk: true,
+    });
+    emit({ type: 'task.complete', taskId: 'T1', status: { state: 'completed' } });
+  });
+  await processTask(makeAssign('T1'), new AbortController().signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  const completeLog = c.log.find((l) => l.includes('task.complete'));
+  assert.ok(completeLog, 'task.complete log should be emitted');
+  assert.match(completeLog, /artifacts=2/);
+});
+
+test('processTask: backend emits task.fail -> logs task.fail with code', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const backend = backendOf('stub', async (_t, emit) => {
+    emit({
+      type: 'task.fail',
+      taskId: 'T1',
+      error: { code: 'rate_limited', message: 'slow down' },
+    });
+  });
+  await processTask(makeAssign('T1'), new AbortController().signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  const failLog = c.log.find((l) => l.includes('task.fail'));
+  assert.ok(failLog);
+  assert.match(failLog, /code=rate_limited/);
+});
+
+test('processTask: backend resolves silently -> warns about missing terminal', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const backend = backendOf('stub', async () => {
+    /* no emits */
+  });
+  await processTask(makeAssign('T1'), new AbortController().signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  assert.equal(s.sent.length, 0);
+  assert.equal(c.warn.length, 1);
+  assert.match(c.warn[0], /backend\.end taskId=T1 .* \(no terminal frame\)/);
+});
+
+test('processTask: backend throws without emit -> emits backend_error fail and logs task.fail', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const backend = backendOf('stub', async () => {
+    throw new Error('boom');
+  });
+  await processTask(makeAssign('T1'), new AbortController().signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  assert.equal(s.sent.length, 1);
+  const sent = s.sent[0];
+  assert.equal(sent.type, 'task.fail');
+  if (sent.type === 'task.fail') {
+    assert.equal(sent.error.code, 'backend_error');
+    assert.equal(sent.error.message, 'boom');
+  }
+  const failLog = c.log.find((l) => l.includes('task.fail'));
+  assert.ok(failLog);
+  assert.match(failLog, /code=backend_error/);
+});
+
+test('processTask: backend emits complete then throws -> does not double-emit, warns', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const backend = backendOf('stub', async (_t, emit) => {
+    emit({ type: 'task.complete', taskId: 'T1', status: { state: 'completed' } });
+    throw new Error('late boom');
+  });
+  await processTask(makeAssign('T1'), new AbortController().signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  // Wire saw only the original task.complete; no fallback fail was sent.
+  assert.equal(s.sent.length, 1);
+  assert.equal(s.sent[0].type, 'task.complete');
+  assert.ok(
+    c.warn.some((l) =>
+      /backend threw after terminal taskId=T1 .*terminal=complete .*message=late boom/.test(l),
+    ),
+    `expected late-throw warn, got: ${c.warn.join(' | ')}`,
+  );
+});
+
+test('processTask: backend emits fail then throws -> does not double-emit, warns', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const backend = backendOf('stub', async (_t, emit) => {
+    emit({
+      type: 'task.fail',
+      taskId: 'T1',
+      error: { code: 'upstream', message: 'gateway 500' },
+    });
+    throw new Error('post-fail boom');
+  });
+  await processTask(makeAssign('T1'), new AbortController().signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  assert.equal(s.sent.length, 1);
+  const sent = s.sent[0];
+  assert.equal(sent.type, 'task.fail');
+  if (sent.type === 'task.fail') assert.equal(sent.error.code, 'upstream');
+  assert.ok(
+    c.warn.some((l) =>
+      /backend threw after terminal taskId=T1 .*terminal=fail .*message=post-fail boom/.test(l),
+    ),
+    `expected late-throw warn, got: ${c.warn.join(' | ')}`,
+  );
+});
+
+test('processTask: backend.start log uses the backend name', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const backend = backendOf('my-special-backend', async (_t, emit) => {
+    emit({ type: 'task.complete', taskId: 'T1', status: { state: 'completed' } });
+  });
+  await processTask(makeAssign('T1'), new AbortController().signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  assert.match(c.log[0], /backend\.start taskId=T1 backend=my-special-backend/);
+});
+
+test('processTask: forwards non-terminal frames (e.g. task.artifact, task.status) to send', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const backend = backendOf('stub', async (_t, emit) => {
+    emit({ type: 'task.status', taskId: 'T1', status: { state: 'working' } });
+    emit({
+      type: 'task.artifact',
+      taskId: 'T1',
+      artifact: { artifactId: 'A', parts: [{ kind: 'text', text: 'a' }] },
+    });
+    emit({ type: 'task.complete', taskId: 'T1', status: { state: 'completed' } });
+  });
+  await processTask(makeAssign('T1'), new AbortController().signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  assert.deepEqual(
+    s.sent.map((f) => f.type),
+    ['task.status', 'task.artifact', 'task.complete'],
+  );
 });

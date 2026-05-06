@@ -34,14 +34,32 @@ export function isLogLevel(value: string): value is LogLevel {
   return Object.prototype.hasOwnProperty.call(LEVEL_RANK, value);
 }
 
+// Process-wide dedup of "ignoring invalid" warnings. Without this,
+// `createLogger` (called per Client instance) would re-emit the same
+// warning every time it ran, contradicting the PR's "warn once" promise
+// in long-running processes that build multiple loggers.
+const warnedKeys = new Set<string>();
+
+// Test-only: clear the dedup state so warn-asserting tests don't suffer
+// from prior tests' suppression. Underscored to signal non-public.
+export function _resetLogLevelWarningsForTests(): void {
+  warnedKeys.clear();
+}
+
+function warnOnce(sink: ConsoleSink, key: string, message: string): void {
+  if (warnedKeys.has(key)) return;
+  warnedKeys.add(key);
+  sink.warn(PREFIX, message);
+}
+
 // Normalize a level string from any source (explicit option, env var) by
 // trimming and lowercasing, then validating against the known set. An
-// invalid non-empty value is reported via `sink.warn` once and returns
-// `undefined` so the caller can fall through to the next priority. We
-// validate explicit values too — even though TS `LogLevel` constrains them
-// for typed callers, a plain-JS consumer can still pass anything, and an
-// unrecognized string would otherwise produce `LEVEL_RANK[v] === undefined`
-// and silently disable every level.
+// invalid non-empty value is reported via `warnOnce` (per distinct
+// source+value) and returns `undefined` so the caller can fall through to
+// the next priority. We validate explicit values too — even though TS
+// `LogLevel` constrains them for typed callers, a plain-JS consumer can
+// still pass anything, and an unrecognized string would otherwise produce
+// `LEVEL_RANK[v] === undefined` and silently disable every level.
 //
 // `raw` is typed `unknown` rather than `string | undefined` so a JS caller
 // passing a number/object/null doesn't crash the client at startup with a
@@ -54,8 +72,10 @@ function tryParseLevel(
 ): LogLevel | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== 'string') {
-    sink.warn(
-      `${PREFIX} ignoring non-string ${source} of type ${typeof raw} (expected silent|error|warn|info|debug)`,
+    warnOnce(
+      sink,
+      `${source}:type:${typeof raw}`,
+      `ignoring non-string ${source} of type ${typeof raw} (expected silent|error|warn|info|debug)`,
     );
     return undefined;
   }
@@ -63,8 +83,10 @@ function tryParseLevel(
   if (!trimmed) return undefined;
   const v = trimmed.toLowerCase();
   if (isLogLevel(v)) return v;
-  sink.warn(
-    `${PREFIX} ignoring invalid ${source}=${raw} (expected silent|error|warn|info|debug)`,
+  warnOnce(
+    sink,
+    `${source}:value:${trimmed}`,
+    `ignoring invalid ${source}=${raw} (expected silent|error|warn|info|debug)`,
   );
   return undefined;
 }

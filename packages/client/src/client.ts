@@ -5,6 +5,7 @@ import {
   parseDownFrame,
   type AgentCard,
   type Part,
+  type TaskAssignFrame,
   type UpFrame,
 } from '@vicoop-bridge/protocol';
 import type { Backend, Emit } from './backend.js';
@@ -231,77 +232,104 @@ export class Client {
     if (frame.type !== 'task.assign') return;
     const controller = new AbortController();
     this.inflight.set(frame.taskId, controller);
-    const startedAt = Date.now();
-    // Track lifecycle state through an object so reads after `await` aren't
-    // narrowed back to the initial `null` by control-flow analysis — TS
-    // doesn't follow assignments made inside the `emit` closure below.
-    //
-    // `artifactIds` counts *distinct* artifacts via their `artifactId`
-    // rather than counting raw `task.artifact` frames: the protocol allows
-    // a single artifact to be streamed across multiple chunks (`lastChunk`),
-    // so a per-frame counter would over-report.
-    const state: {
-      artifactIds: Set<string>;
-      terminal: { kind: 'complete' } | { kind: 'fail'; code: string } | null;
-    } = { artifactIds: new Set(), terminal: null };
-
-    // Wrap emit so the client can observe terminal frames the backend sends
-    // and report taskId/elapsedMs/artifacts/code from the same code path,
-    // without changing the wire-level frames or inspecting their payloads.
-    const emit: Emit = (f) => {
-      if (f.type === 'task.artifact') state.artifactIds.add(f.artifact.artifactId);
-      else if (f.type === 'task.complete') state.terminal = { kind: 'complete' };
-      else if (f.type === 'task.fail') state.terminal = { kind: 'fail', code: f.error.code };
-      this.send(f);
-    };
-
-    this.logger.info(`backend.start taskId=${frame.taskId} backend=${this.opts.backend.name}`);
     try {
-      await this.opts.backend.handle(frame, emit, controller.signal);
-      const elapsedMs = Date.now() - startedAt;
-      const terminal = state.terminal;
-      if (terminal === null) {
-        // Backend resolved without emitting task.complete or task.fail. The
-        // bridge server will likely time the task out; surface it at warn so
-        // operators see the broken contract instead of a silent gap.
-        this.logger.warn(
-          `backend.end taskId=${frame.taskId} elapsedMs=${elapsedMs} (no terminal frame)`,
-        );
-      } else if (terminal.kind === 'complete') {
-        this.logger.info(
-          `task.complete taskId=${frame.taskId} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
-        );
-      } else {
-        this.logger.info(
-          `task.fail taskId=${frame.taskId} code=${terminal.code} elapsedMs=${elapsedMs}`,
-        );
-      }
-    } catch (err) {
-      const elapsedMs = Date.now() - startedAt;
-      const message = err instanceof Error ? err.message : String(err);
-      if (state.terminal !== null) {
-        // The backend already emitted a terminal frame and then threw. Do
-        // *not* send a second terminal — the bridge server treats a second
-        // task.complete/task.fail for the same taskId as a protocol
-        // violation. Surface the late throw at warn so operators notice
-        // the backend's broken contract instead of seeing it silently
-        // swallowed.
-        this.logger.warn(
-          `backend threw after terminal taskId=${frame.taskId} elapsedMs=${elapsedMs} terminal=${state.terminal.kind} message=${message}`,
-        );
-      } else {
-        const code = 'backend_error';
-        this.send({
-          type: 'task.fail',
-          taskId: frame.taskId,
-          error: { code, message },
-        });
-        this.logger.info(
-          `task.fail taskId=${frame.taskId} code=${code} elapsedMs=${elapsedMs}`,
-        );
-      }
+      await processTask(frame, controller.signal, {
+        backend: this.opts.backend,
+        send: (f) => this.send(f),
+        logger: this.logger,
+      });
     } finally {
       this.inflight.delete(frame.taskId);
+    }
+  }
+}
+
+export interface ProcessTaskDeps {
+  backend: Backend;
+  // Wire send. Receives every frame the backend emits, plus a fallback
+  // task.fail emitted by `processTask` itself when the backend throws
+  // without having emitted a terminal.
+  send: (frame: UpFrame) => void;
+  logger: Logger;
+}
+
+// Run a single A2A task through the backend and emit the lifecycle logs
+// described in vicoop-bridge issue #98. Extracted from `Client.runTask` so
+// the lifecycle logic is unit-testable without a real WebSocket — tests
+// pass stub backends and a capturing send/logger.
+export async function processTask(
+  frame: TaskAssignFrame,
+  signal: AbortSignal,
+  deps: ProcessTaskDeps,
+): Promise<void> {
+  const startedAt = Date.now();
+  // Track lifecycle state through an object so reads after `await` aren't
+  // narrowed back to the initial `null` by control-flow analysis — TS
+  // doesn't follow assignments made inside the `emit` closure below.
+  //
+  // `artifactIds` counts *distinct* artifacts via their `artifactId`
+  // rather than counting raw `task.artifact` frames: the protocol allows
+  // a single artifact to be streamed across multiple chunks (`lastChunk`),
+  // so a per-frame counter would over-report.
+  const state: {
+    artifactIds: Set<string>;
+    terminal: { kind: 'complete' } | { kind: 'fail'; code: string } | null;
+  } = { artifactIds: new Set(), terminal: null };
+
+  // Wrap emit so we can observe terminal frames the backend sends and
+  // report taskId/elapsedMs/artifacts/code from the same code path,
+  // without changing the wire-level frames or inspecting their payloads.
+  const emit: Emit = (f) => {
+    if (f.type === 'task.artifact') state.artifactIds.add(f.artifact.artifactId);
+    else if (f.type === 'task.complete') state.terminal = { kind: 'complete' };
+    else if (f.type === 'task.fail') state.terminal = { kind: 'fail', code: f.error.code };
+    deps.send(f);
+  };
+
+  deps.logger.info(`backend.start taskId=${frame.taskId} backend=${deps.backend.name}`);
+  try {
+    await deps.backend.handle(frame, emit, signal);
+    const elapsedMs = Date.now() - startedAt;
+    const terminal = state.terminal;
+    if (terminal === null) {
+      // Backend resolved without emitting task.complete or task.fail. The
+      // bridge server will likely time the task out; surface it at warn so
+      // operators see the broken contract instead of a silent gap.
+      deps.logger.warn(
+        `backend.end taskId=${frame.taskId} elapsedMs=${elapsedMs} (no terminal frame)`,
+      );
+    } else if (terminal.kind === 'complete') {
+      deps.logger.info(
+        `task.complete taskId=${frame.taskId} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
+      );
+    } else {
+      deps.logger.info(
+        `task.fail taskId=${frame.taskId} code=${terminal.code} elapsedMs=${elapsedMs}`,
+      );
+    }
+  } catch (err) {
+    const elapsedMs = Date.now() - startedAt;
+    const message = err instanceof Error ? err.message : String(err);
+    if (state.terminal !== null) {
+      // The backend already emitted a terminal frame and then threw. Do
+      // *not* send a second terminal — the bridge server treats a second
+      // task.complete/task.fail for the same taskId as a protocol
+      // violation. Surface the late throw at warn so operators notice
+      // the backend's broken contract instead of seeing it silently
+      // swallowed.
+      deps.logger.warn(
+        `backend threw after terminal taskId=${frame.taskId} elapsedMs=${elapsedMs} terminal=${state.terminal.kind} message=${message}`,
+      );
+    } else {
+      const code = 'backend_error';
+      deps.send({
+        type: 'task.fail',
+        taskId: frame.taskId,
+        error: { code, message },
+      });
+      deps.logger.info(
+        `task.fail taskId=${frame.taskId} code=${code} elapsedMs=${elapsedMs}`,
+      );
     }
   }
 }

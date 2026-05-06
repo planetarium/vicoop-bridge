@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  _resetLogLevelWarningsForTests,
   type ConsoleSink,
   createLogger,
   isLogLevel,
@@ -103,6 +104,7 @@ test('resolveLogLevel: trims whitespace from env values', () => {
 });
 
 test('resolveLogLevel: invalid env value falls back to info and warns once', () => {
+  _resetLogLevelWarningsForTests();
   const c = makeSink();
   withEnv(LOG_LEVEL_ENV, 'verbose', () => {
     assert.equal(resolveLogLevel(undefined, c.sink), 'info');
@@ -112,6 +114,7 @@ test('resolveLogLevel: invalid env value falls back to info and warns once', () 
 });
 
 test('resolveLogLevel: invalid explicit value warns then falls through to env', () => {
+  _resetLogLevelWarningsForTests();
   const c = makeSink();
   withEnv(LOG_LEVEL_ENV, 'debug', () => {
     assert.equal(resolveLogLevel('TRACE' as 'debug', c.sink), 'debug');
@@ -121,12 +124,50 @@ test('resolveLogLevel: invalid explicit value warns then falls through to env', 
 });
 
 test('resolveLogLevel: invalid explicit value with no env falls back to info', () => {
+  _resetLogLevelWarningsForTests();
   const c = makeSink();
   withEnv(LOG_LEVEL_ENV, undefined, () => {
     assert.equal(resolveLogLevel('verbose' as 'debug', c.sink), 'info');
   });
   assert.equal(c.warn.length, 1);
   assert.match(c.warn[0], /ignoring invalid logLevel=verbose/);
+});
+
+test('resolveLogLevel: warns at most once per distinct invalid value across calls', () => {
+  _resetLogLevelWarningsForTests();
+  const c = makeSink();
+  withEnv(LOG_LEVEL_ENV, 'fatal', () => {
+    resolveLogLevel(undefined, c.sink);
+    resolveLogLevel(undefined, c.sink);
+    resolveLogLevel(undefined, c.sink);
+  });
+  assert.equal(c.warn.length, 1, 'same invalid value warns only once');
+  // A different invalid value still warns (distinct dedup key).
+  withEnv(LOG_LEVEL_ENV, 'panic', () => {
+    resolveLogLevel(undefined, c.sink);
+  });
+  assert.equal(c.warn.length, 2, 'a distinct invalid value warns separately');
+});
+
+test('resolveLogLevel: warn passes PREFIX as a separate sink argument', () => {
+  _resetLogLevelWarningsForTests();
+  const calls: unknown[][] = [];
+  const sink: ConsoleSink = {
+    log: () => {},
+    warn: (...args) => {
+      calls.push(args);
+    },
+    error: () => {},
+  };
+  withEnv(LOG_LEVEL_ENV, 'bogus', () => {
+    resolveLogLevel(undefined, sink);
+  });
+  assert.equal(calls.length, 1);
+  // First arg is the prefix, second is the structured message — same shape
+  // the logger's own .warn() uses, so structured-logging sinks can treat
+  // them consistently.
+  assert.equal(calls[0][0], '[client]');
+  assert.match(String(calls[0][1]), /ignoring invalid VICOOP_CLIENT_LOG_LEVEL=bogus/);
 });
 
 test('createLogger at info: error/warn/info pass, debug filtered', () => {
@@ -183,6 +224,7 @@ test('createLogger: trims an explicit level string', () => {
 });
 
 test('resolveLogLevel: non-string explicit value warns and falls through (does not crash)', () => {
+  _resetLogLevelWarningsForTests();
   const c = makeSink();
   withEnv(LOG_LEVEL_ENV, undefined, () => {
     // JS caller bypasses the TS type and passes a number/object/etc.
