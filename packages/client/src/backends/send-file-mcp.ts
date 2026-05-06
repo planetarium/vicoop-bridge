@@ -307,8 +307,20 @@ export async function startSendFileMcpServer(
 
     try {
       await new Promise<void>((resolve, reject) => {
-        httpServer!.once('error', reject);
+        // Named so we can detach it on success. A `once('error', reject)`
+        // that never fires stays attached forever and would swallow
+        // post-start error events by resolving an already-settled
+        // Promise (and counting as "handled" to Node's process-crash
+        // logic) instead of surfacing them.
+        const onStartupError = (err: unknown): void => reject(err);
+        httpServer!.once('error', onStartupError);
         httpServer!.listen(opts.port ?? 0, host, () => {
+          httpServer!.removeListener('error', onStartupError);
+          // Long-lived listener so post-start failures (e.g. fd exhaustion)
+          // surface in logs instead of silently disappearing.
+          httpServer!.on('error', (err: unknown) => {
+            console.error('[send-file-mcp] httpServer error:', errorMessage(err));
+          });
           const addr = httpServer!.address();
           if (addr && typeof addr === 'object') {
             actualPort = addr.port;
