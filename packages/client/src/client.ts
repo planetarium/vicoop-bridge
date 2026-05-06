@@ -27,8 +27,10 @@ export interface ClientOptions {
   probeDeadlineMs?: number;
   // Verbosity for client-emitted logs. Falls back to the
   // `VICOOP_CLIENT_LOG_LEVEL` env var, then to `info`. Lifecycle events
-  // (task.assign / backend.start / task.complete / task.fail / task.cancel)
-  // surface at `info`; `debug` adds messageId and per-part detail.
+  // (task.assign / backend.start / task.complete / task.canceled /
+  // task.fail / task.cancel) surface at `info`; `debug` adds the
+  // task.assign detail line (`messageId`, `role`, `partsCount`) and the
+  // full backend exception message on the late-throw path.
   logLevel?: LogLevel;
 }
 
