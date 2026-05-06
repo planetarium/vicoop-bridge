@@ -2350,4 +2350,169 @@ test('attachOutputs: oversized file is skipped with a too-large warning, marker 
   }
 });
 
+// ---------------------------------------------------------------------------
+// sendFileMcp wiring (MCP tool path) — integration with handle()
+// ---------------------------------------------------------------------------
+
+test('sendFileMcp: handle() registers active task; tool call during run emits FilePart artifact through the same emit; releases on completion', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'openclaw-mcp-int-'));
+  const realRoot = await fs.realpath(root);
+  const filePath = path.join(realRoot, 'tool-out.txt');
+  await fs.writeFile(filePath, 'tool-emitted bytes');
+
+  // Hold the chat run open until the test triggers a tool call so we can
+  // observe the FilePart artifact emit BEFORE task.complete lands.
+  let releaseRun: (() => void) | null = null;
+  const runHeld = new Promise<void>((resolve) => {
+    releaseRun = resolve;
+  });
+
+  const fake = await createFakeGateway({
+    onRequest: async (sock, req) => {
+      if (req.method === 'sessions.messages.subscribe') {
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: false,
+            error: { code: 'unknown_method', message: 'unknown method' },
+          }),
+        );
+        return;
+      }
+      if (req.method !== 'chat.send') return;
+      const params = req.params as { sessionKey: string; idempotencyKey: string };
+      const runId = `run-${params.idempotencyKey}`;
+      sock.send(
+        JSON.stringify({
+          type: 'res',
+          id: req.id,
+          ok: true,
+          payload: { runId, status: 'started' },
+        }),
+      );
+      // Wait until the test invokes the tool, then send terminal final.
+      await runHeld;
+      sock.send(
+        JSON.stringify({
+          type: 'event',
+          event: 'chat',
+          payload: {
+            runId,
+            sessionKey: params.sessionKey,
+            seq: 1,
+            state: 'final',
+            message: { text: 'done' },
+          },
+        }),
+      );
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({
+      url: fake.url,
+      sendFileMcp: { allowedRoots: [realRoot] },
+    });
+    const frames: UpFrame[] = [];
+    const handlePromise = backend.handle(
+      makeTask('t-mcp-int', 'go'),
+      (f) => frames.push(f),
+      NEVER,
+    );
+
+    // Wait until the MCP server is up and the task has been registered.
+    // The lazy start happens inside handle(); poll briefly.
+    let server = backend.getSendFileMcpServer();
+    for (let i = 0; i < 50 && (!server || server.activeTaskCount() === 0); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+      server = backend.getSendFileMcpServer();
+    }
+    assert.ok(server, 'MCP server should have started lazily during handle()');
+    assert.equal(server!.activeTaskCount(), 1, 'task should be registered while in flight');
+
+    // Invoke send_file directly via the test hook (bypasses HTTP transport).
+    const result = await server!.invokeSendFileForTest({ path: filePath });
+    assert.equal(result.ok, true);
+
+    // Release the gateway run so handle() can settle.
+    releaseRun!();
+    await handlePromise;
+
+    // After completion, the registry slot should be released.
+    assert.equal(server!.activeTaskCount(), 0, 'task should be released after handle() returns');
+
+    // The FilePart artifact emitted via the MCP tool should appear in the frames.
+    const artifacts = frames.filter((f) => f.type === 'task.artifact');
+    const fileArtifact = artifacts.find((a) =>
+      a.artifact.parts.some((p) => p.kind === 'file'),
+    );
+    assert.ok(fileArtifact, 'a FilePart artifact must have been emitted via the tool path');
+    const filePart = fileArtifact!.artifact.parts.find((p) => p.kind === 'file') as
+      | { kind: 'file'; file: { name?: string; mimeType?: string; bytes?: string } }
+      | undefined;
+    assert.equal(filePart!.file.name, 'tool-out.txt');
+    assert.equal(filePart!.file.mimeType, 'text/plain');
+    assert.equal(
+      Buffer.from(filePart!.file.bytes!, 'base64').toString('utf8'),
+      'tool-emitted bytes',
+    );
+
+    // Because the MCP tool already emitted an artifact, the final-result
+    // path should NOT have produced a duplicate text artifact.
+    const finalArtifacts = artifacts.filter(
+      (a) => a.artifact.name === 'openclaw-result',
+    );
+    assert.equal(
+      finalArtifacts.length,
+      0,
+      'final-result artifact must not be emitted when the tool already produced one',
+    );
+
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete);
+    assert.equal(complete!.status.state, 'completed');
+
+    const finalServer = backend.getSendFileMcpServer();
+    if (finalServer) await finalServer.close();
+  } finally {
+    await fake.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('sendFileMcp: not configured -> getSendFileMcpServer() stays null even after handle() runs', async () => {
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'sessions.messages.subscribe') {
+        sock.send(JSON.stringify({ type: 'res', id: req.id, ok: false, error: { code: 'unknown_method', message: 'unknown method' } }));
+        return;
+      }
+      if (req.method !== 'chat.send') return;
+      const params = req.params as { sessionKey: string; idempotencyKey: string };
+      const runId = `run-${params.idempotencyKey}`;
+      sock.send(JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }));
+      setImmediate(() => {
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 1,
+          state: 'final',
+          message: { text: 'no tool today' },
+        });
+      });
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    await backend.handle(makeTask('t-no-mcp', 'go'), () => {}, NEVER);
+    assert.equal(
+      backend.getSendFileMcpServer(),
+      null,
+      'no MCP server should be lazily started when sendFileMcp is unset',
+    );
+  } finally {
+    await fake.close();
+  }
+});
+
 export { createFakeGateway, makeTask };

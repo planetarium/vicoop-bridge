@@ -164,6 +164,228 @@ you cannot verify the multi-artifact cadence a real tool-use run
 produces. Use `DEBUG=1` in the sidecar env to see every chat /
 session.message frame as it arrives.
 
+## File-passthrough verification (caller → agent)
+
+A third exercise at `packages/client/scripts/e2e-openclaw-file-passthrough.mjs`
+verifies that bridge-client's non-image attachment mapping matches the
+shape OpenClaw `>= v2026.4.27` expects on `chat.send`. The script sends
+a tiny synthetic PDF as a `kind: 'file'` part with `mimeType:
+'application/pdf'` and asserts:
+
+- the gateway accepts the attachment shape (no `chat.send` error like
+  "only image/* supported" or "non-image attachments are not supported
+  on this entrypoint"),
+- any failure that follows is downstream of attachment parsing
+  (typically agent auth / model invocation, which is acceptable when
+  no provider auth is configured).
+
+Because the protocol-level test does not need a real model response,
+you can run it against an unauthenticated gateway. The cleanest setup
+is `gateway.auth.mode = "none"` + `--bind loopback` (avoids container
+token extraction entirely):
+
+```bash
+docker run -d --name openclaw-e2e \
+  --entrypoint /bin/sh \
+  ghcr.io/openclaw/openclaw:latest \
+  -c 'mkdir -p /home/node/.openclaw && \
+      printf %s "{\"gateway\":{\"auth\":{\"mode\":\"none\"}}}" \
+        > /home/node/.openclaw/openclaw.json && \
+      exec docker-entrypoint.sh node openclaw.mjs gateway \
+        --allow-unconfigured --bind loopback'
+
+# wait for "[gateway] ready" in `docker logs openclaw-e2e`
+
+docker run --rm \
+  --network container:openclaw-e2e \
+  -v "$PWD":/w -w /w/packages/client \
+  -e DEBUG=1 \
+  node:20 \
+  node ./scripts/e2e-openclaw-file-passthrough.mjs
+```
+
+Expected tail:
+
+```
+[frame +Xms] task.artifact artifact id=… name=openclaw-result …
+[frame +Xms] task.complete complete state=completed
+[e2e] PASS: gateway accepted non-image attachment shape (no protocol-shape rejection)
+[e2e] PASS: task.complete carries state=completed (got completed)
+```
+
+If you see a fail like `code=gateway_send_failed msg="…only image/* supported…"`,
+the gateway image is older than v2026.4.27 and predates the non-image
+attachment acceptance path (CHANGELOG: "Gateway/chat: accept non-image
+attachments through chat.send by staging them as agent-readable media
+paths"). Pull a newer tag.
+
+> **Note**: `--bind loopback` is required when `auth.mode = "none"` —
+> the container default of `bind=auto` (0.0.0.0) refuses to start
+> unauthenticated. Loopback is fine because the sidecar shares the
+> gateway container's network namespace via `--network container:…`
+> and connects through `127.0.0.1` from inside.
+
+## Outbound attachment verification (agent → caller)
+
+A fourth exercise at
+`packages/client/scripts/e2e-openclaw-attach-outputs.mjs` verifies the
+opposite direction: bridge-client parses `[bridge-attach: <path>]`
+markers in real assistant messages, reads the referenced file from
+disk, and emits it as an A2A FilePart artifact alongside the cleaned
+text.
+
+The script:
+
+- writes a fixture at `/tmp/attach-test/hello.txt` (sidecar-private —
+  the gateway never sees it; markers are pure text in the chat
+  transcript),
+- configures bridge-client with `attachOutputs.allowedRoots: ['/tmp/attach-test']`,
+- prompts the model to reply with EXACTLY `[bridge-attach: <fixture-path>]`,
+- asserts that the resulting artifact carries a FilePart whose decoded
+  bytes equal the fixture content, the filename matches, and the
+  marker is stripped from the text part.
+
+Unlike the file-passthrough exercise, this one needs a working agent
+provider so the model actually replies. Cheapest setup is an
+Anthropic API key + `anthropic/claude-sonnet-4-6`:
+
+```bash
+mkdir -p /tmp/oc-build-anthropic
+cat > /tmp/oc-build-anthropic/Dockerfile << 'EOF'
+FROM ghcr.io/openclaw/openclaw:latest
+USER root
+RUN mkdir -p /home/node/.openclaw && \
+    printf '%s' '{"gateway":{"auth":{"mode":"none"}},"agents":{"defaults":{"model":{"primary":"anthropic/claude-sonnet-4-6"}}}}' \
+      > /home/node/.openclaw/openclaw.json && \
+    chown -R node:node /home/node/.openclaw
+USER node
+EOF
+docker build -t oc-e2e-anthropic /tmp/oc-build-anthropic
+
+docker run -d --name openclaw-e2e \
+  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  oc-e2e-anthropic \
+  node openclaw.mjs gateway --allow-unconfigured --bind loopback
+
+# wait for "[gateway] ready"
+
+docker run --rm \
+  --network container:openclaw-e2e \
+  -v "$PWD":/w -w /w/packages/client \
+  -e DEBUG=1 \
+  node:20 \
+  node ./scripts/e2e-openclaw-attach-outputs.mjs
+```
+
+Expected tail (sonnet-4-6 will echo the marker exactly given the
+"reply with EXACTLY" framing):
+
+```
+[frame +Xms] task.artifact artifact id=… name=openclaw-result parts=[file]
+[frame +Xms] task.complete complete state=completed
+[e2e] PASS: terminal frame is task.complete with state=completed
+[e2e] PASS: at least one FilePart artifact emitted
+[e2e] PASS: FilePart bytes match fixture
+[e2e] PASS: FilePart name is fixture basename
+[e2e] PASS: marker stripped from artifact text on success
+```
+
+Costs roughly one short Claude call per run (a few cents). Mounting a
+real `auth-profiles.json` from the host instead of using
+`ANTHROPIC_API_KEY` works too, but mind that OAuth-based providers
+(e.g. `openai-codex`) may fail to refresh from inside a container with
+restricted network paths — the API-key route is the most reliable.
+
+## MCP send_file tool verification (agent → caller, structured path)
+
+A fifth exercise at
+`packages/client/scripts/e2e-openclaw-send-file.mjs` verifies the
+tool-call alternative to text markers: bridge-client exposes a local
+Streamable HTTP MCP server with a `send_file(path, name?)` tool, the
+operator registers it in OpenClaw's `mcp.servers` config, and the
+agent invokes the tool to deliver files instead of emitting a text
+marker.
+
+The script:
+
+- writes a fixture at `/tmp/send-file-test/tool-output.txt` (sidecar-
+  private),
+- enables `sendFileMcp` on the backend with the fixture dir as an
+  allowed root and a fixed port (default `19090`, override with
+  `SEND_FILE_MCP_PORT`),
+- prompts the model to call `send_file` with the fixture path,
+- asserts the resulting artifact carries `name="send-file"` (the MCP
+  tool path tag) and the FilePart bytes equal the fixture content.
+
+Setup uses the stock OpenClaw image and the canonical
+`openclaw mcp set` CLI to register the bridge-client MCP server —
+matching how operators add MCP servers in production. The startup
+shell writes a minimal config (auth + model), runs `openclaw mcp set`
+to add the `send-file` server, then execs the gateway:
+
+```bash
+docker run -d --name openclaw-e2e \
+  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  --entrypoint /bin/sh \
+  ghcr.io/openclaw/openclaw:latest \
+  -c '
+    set -e
+    mkdir -p /home/node/.openclaw
+    printf "%s" "{\"gateway\":{\"auth\":{\"mode\":\"none\"}},\"agents\":{\"defaults\":{\"model\":{\"primary\":\"anthropic/claude-sonnet-4-6\"}}}}" \
+      > /home/node/.openclaw/openclaw.json
+    cd /app
+    node openclaw.mjs mcp set send-file \
+      "{\"url\":\"http://127.0.0.1:19090/mcp\",\"transport\":\"streamable-http\"}"
+    exec docker-entrypoint.sh node openclaw.mjs gateway \
+      --allow-unconfigured --bind loopback
+  '
+
+# wait for "[gateway] ready"
+
+docker run --rm \
+  --network container:openclaw-e2e \
+  -v "$PWD":/w -w /w/packages/client \
+  -e DEBUG=1 \
+  node:20 \
+  node ./scripts/e2e-openclaw-send-file.mjs
+```
+
+In production the same registration is a one-shot operator step:
+
+```bash
+openclaw mcp set send-file \
+  '{"url":"http://127.0.0.1:19090/mcp","transport":"streamable-http"}'
+```
+
+The CLI persists the entry into `~/.openclaw/openclaw.json`'s
+`mcp.servers.send-file`, picked up at the next gateway boot.
+
+Expected tail:
+
+```
+[frame +Xms] task.artifact artifact id=… name=send-file parts=[file]
+[frame +Xms] task.complete complete state=completed
+[e2e] PASS: terminal frame is task.complete with state=completed
+[e2e] PASS: at least one FilePart artifact emitted via send_file tool
+[e2e] PASS: at least one artifact with name="send-file" (the MCP tool path tag)
+[e2e] PASS: FilePart bytes match fixture
+```
+
+Notes:
+
+- OpenClaw prefixes external MCP tool names with the server name, so
+  the agent sees `send-file__send_file` in its tool catalog.
+- The bridge-client lazy-starts the MCP HTTP listener inside `handle()`,
+  so the gateway's `bundle-mcp` runtime must reach it AFTER bridge-client
+  has registered an active task. With `--network container:` shared
+  loopback this works because OpenClaw computes the per-session catalog
+  on first `chat.send` (after bridge-client is up), not at boot.
+- Routing: `sendFileMcp` follows R1 — single in-flight task per backend.
+  Concurrent calls during overlapping tasks return `ambiguous-task`.
+- The text-marker `attachOutputs` path remains supported and may be
+  enabled simultaneously as a fallback for callers that don't register
+  the MCP server.
+
 ## Teardown
 
 ```bash

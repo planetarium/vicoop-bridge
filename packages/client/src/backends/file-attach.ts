@@ -54,17 +54,38 @@ export function parseBridgeAttachMarkers(text: string): ParsedAttachMarkers {
  * Strip a specific path's markers from the text. Used after a successful
  * read so the user-visible artifact text doesn't contain the raw on-disk
  * location (privacy + UX). Failed reads keep their markers visible.
+ *
+ * Cleanup is scoped to lines that contain (only) the marker:
+ * - A marker-only line (with optional surrounding whitespace) is removed entirely.
+ * - An inline marker is removed in place; the rest of the line is preserved.
+ *
+ * Whitespace and newlines unrelated to the stripped marker are left
+ * untouched so the agent's intended formatting (leading/trailing
+ * whitespace, blank lines elsewhere, etc.) survives.
  */
-export function stripMarkersForPath(text: string, parsed: ParsedAttachMarkers, attachPath: string): string {
+export function stripMarkersForPath(
+  text: string,
+  parsed: ParsedAttachMarkers,
+  attachPath: string,
+): string {
   const markers = parsed.markersByPath.get(attachPath);
   if (!markers || markers.length === 0) return text;
-  let out = text;
-  for (const m of markers) {
-    // Replace literally — markers came from the same text so they're guaranteed present.
-    out = out.split(m).join('');
+  const markerSet = new Set(markers);
+  const lines = text.split('\n');
+  const out: string[] = [];
+  for (const line of lines) {
+    // A line that is exactly the marker (modulo surrounding whitespace)
+    // disappears entirely so we don't leave a blank line gap behind.
+    if (markerSet.has(line.trim())) continue;
+    // Otherwise, strip any inline marker substrings but preserve the rest
+    // of the line as-is — including original whitespace.
+    let lineOut = line;
+    for (const m of markers) {
+      lineOut = lineOut.split(m).join('');
+    }
+    out.push(lineOut);
   }
-  // Collapse runs of blank lines created by stripping a marker that occupied its own line.
-  return out.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return out.join('\n');
 }
 
 export type SafeReadErrorCode =
@@ -118,6 +139,61 @@ async function realpathOrUndefined(p: string): Promise<string | undefined> {
 }
 
 /**
+ * Canonicalize allowed roots — operators may have provided paths that
+ * contain symlinks (e.g. /var/folders on macOS). Drops any root whose
+ * realpath cannot be resolved; an unresolvable root cannot match anything.
+ * Throws SafeReadError('outside-roots') if none resolved.
+ */
+async function resolveCanonicalRoots(allowedRoots: string[]): Promise<string[]> {
+  if (allowedRoots.length === 0) {
+    throw new SafeReadError('outside-roots', 'no allowed roots configured');
+  }
+  const canonicalRoots: string[] = [];
+  for (const r of allowedRoots) {
+    const real = await realpathOrUndefined(path.resolve(r));
+    if (real) canonicalRoots.push(ensureTrailingSep(real));
+  }
+  if (canonicalRoots.length === 0) {
+    throw new SafeReadError('outside-roots', 'no allowed roots resolvable on disk');
+  }
+  return canonicalRoots;
+}
+
+/**
+ * Build a reader that canonicalizes its allowed roots once (lazily, on
+ * first read) and reuses the result across subsequent reads. Use this when
+ * the same caller will read multiple files under the same configured
+ * roots — e.g. one assistant message containing several `[bridge-attach]`
+ * markers, or a per-backend instance handling many tool calls.
+ *
+ * For one-shot reads (or when roots may have rotated since the last
+ * call), `readBoundedFileWithinRoots` does the resolution per-call.
+ */
+export function createBoundedFileReader(opts: {
+  allowedRoots: string[];
+  maxBytes: number;
+}): (filePath: string) => Promise<SafeReadResult> {
+  assertMaxBytes(opts.maxBytes);
+  let canonicalRootsPromise: Promise<string[]> | null = null;
+  return async (filePath) =>
+    readWithRoots({
+      filePath,
+      maxBytes: opts.maxBytes,
+      getCanonicalRoots: async () => {
+        if (!canonicalRootsPromise) {
+          canonicalRootsPromise = resolveCanonicalRoots(opts.allowedRoots).catch((err) => {
+            // On failure, clear the cache so a subsequent call retries
+            // (e.g. operator fixed the missing dir between attempts).
+            canonicalRootsPromise = null;
+            throw err;
+          });
+        }
+        return canonicalRootsPromise;
+      },
+    });
+}
+
+/**
  * Read a file from disk under operator-controlled roots. Designed for the
  * narrow case where the bridge-client forwards on-disk artifacts produced by
  * a co-located agent (OpenClaw) to a remote A2A caller — i.e. the agent
@@ -129,19 +205,56 @@ async function realpathOrUndefined(p: string): Promise<string | undefined> {
  *   2. lstat() must report a regular file (no dirs/sockets/devices).
  *   3. open() with O_NOFOLLOW so the terminal component cannot be a symlink
  *      pointing outside roots between realpath and open.
- *   4. fstat().nlink === 1 — hardlinks could anchor a file inside roots
+ *   4. fstat() dev/ino must equal the prior lstat dev/ino — defense against
+ *      a TOCTOU swap (realpath → lstat → open) and the only line of defense
+ *      on platforms where O_NOFOLLOW is unavailable (win32).
+ *   5. fstat().nlink === 1 — hardlinks could anchor a file inside roots
  *      that is also reachable via an outside-root path the operator doesn't
  *      see. Reject so the model cannot use hardlinks to smuggle paths.
- *   5. size <= maxBytes — bound the per-attachment payload before reading.
+ *   6. fstat().size <= maxBytes — initial bound on the per-attachment payload.
+ *   7. Bounded read up to fstat().size + 1 — allocate exactly the claimed
+ *      file size + one extra byte. Reading into that +1 slot signals the
+ *      file grew between stat and read, so we reject before the in-memory
+ *      buffer can exceed the size we already validated against maxBytes.
+ *
+ * For repeated reads under the same roots, prefer `createBoundedFileReader`
+ * which caches the canonicalization.
  */
 export async function readBoundedFileWithinRoots(params: {
   filePath: string;
   allowedRoots: string[];
   maxBytes: number;
 }): Promise<SafeReadResult> {
-  if (params.allowedRoots.length === 0) {
-    throw new SafeReadError('outside-roots', 'no allowed roots configured');
+  assertMaxBytes(params.maxBytes);
+  return readWithRoots({
+    filePath: params.filePath,
+    maxBytes: params.maxBytes,
+    getCanonicalRoots: () => resolveCanonicalRoots(params.allowedRoots),
+  });
+}
+
+// Programmer-error guard: maxBytes is operator config, not user input.
+// A negative or non-finite value would otherwise produce nonsensical
+// comparisons inside readWithRoots — `stat.size > NaN` is always false, so
+// a misconfigured cap would silently let oversize files through; a
+// negative cap would reject every file with too-large; and feeding either
+// to `Buffer.alloc` would throw a RangeError that bypasses the
+// SafeReadError codes callers are shaped to handle. Validate at the public
+// boundaries so misconfiguration fails loudly at startup, not on the
+// first read.
+function assertMaxBytes(maxBytes: number): void {
+  if (typeof maxBytes !== 'number' || !Number.isFinite(maxBytes) || maxBytes < 0) {
+    throw new RangeError(
+      `maxBytes must be a finite non-negative number (got ${maxBytes})`,
+    );
   }
+}
+
+async function readWithRoots(params: {
+  filePath: string;
+  maxBytes: number;
+  getCanonicalRoots: () => Promise<string[]>;
+}): Promise<SafeReadResult> {
   if (typeof params.filePath !== 'string' || params.filePath.length === 0) {
     throw new SafeReadError('invalid-path', 'empty path');
   }
@@ -149,17 +262,7 @@ export async function readBoundedFileWithinRoots(params: {
     throw new SafeReadError('invalid-path', 'path contains NUL');
   }
 
-  // Canonicalize allowed roots once — operators may have provided paths that
-  // contain symlinks (e.g. /var/folders on macOS). Drop any root whose
-  // realpath cannot be resolved; an unresolvable root cannot match anything.
-  const canonicalRoots: string[] = [];
-  for (const r of params.allowedRoots) {
-    const real = await realpathOrUndefined(path.resolve(r));
-    if (real) canonicalRoots.push(ensureTrailingSep(real));
-  }
-  if (canonicalRoots.length === 0) {
-    throw new SafeReadError('outside-roots', 'no allowed roots resolvable on disk');
-  }
+  const canonicalRoots = await params.getCanonicalRoots();
 
   // Resolve the candidate. Relative paths resolve against the first root for
   // ergonomics — agents typically emit absolute paths, but a bare filename
@@ -202,6 +305,19 @@ export async function readBoundedFileWithinRoots(params: {
     if (!stat.isFile()) {
       throw new SafeReadError('not-file', `opened path is not a regular file: ${realPath}`);
     }
+    // Cross-platform symlink TOCTOU defense: compare device + inode of the
+    // opened descriptor against the lstat we did before open. On POSIX
+    // O_NOFOLLOW already blocks a terminal-component symlink swap; on
+    // win32 (where O_NOFOLLOW is unavailable) this identity check is the
+    // only thing standing between us and a swapped-in symlink. Defense
+    // in depth on POSIX too. Mismatched dev/ino means the path resolved
+    // to a different file at open time than at lstat time.
+    if (stat.dev !== lstat.dev || stat.ino !== lstat.ino) {
+      throw new SafeReadError(
+        'symlink',
+        `path identity changed between stat and open (possible symlink swap): ${realPath}`,
+      );
+    }
     if (stat.nlink > 1) {
       throw new SafeReadError(
         'hardlink',
@@ -214,8 +330,33 @@ export async function readBoundedFileWithinRoots(params: {
         `file exceeds maxBytes (${stat.size} > ${params.maxBytes}): ${realPath}`,
       );
     }
-    const buffer = await handle.readFile();
-    return { buffer, realPath, size: stat.size };
+    // Bounded read sized to the file's claimed length, not maxBytes. Earlier
+    // we already proved `stat.size <= maxBytes`, so allocating `stat.size +
+    // 1` bytes:
+    //   - keeps small files small (a 4 KiB note doesn't burn a 20 MiB Buffer)
+    //   - still detects growth between stat and read: if the file grew, we
+    //     try to read into the +1 slot and reject. `cap + 1` allocation was
+    //     forcing the worst case on every call regardless of actual size.
+    const claimedSize = stat.size;
+    const buf = Buffer.alloc(claimedSize + 1);
+    let totalRead = 0;
+    while (totalRead < claimedSize + 1) {
+      const { bytesRead } = await handle.read(
+        buf,
+        totalRead,
+        claimedSize + 1 - totalRead,
+        totalRead,
+      );
+      if (bytesRead === 0) break; // EOF
+      totalRead += bytesRead;
+    }
+    if (totalRead > claimedSize) {
+      throw new SafeReadError(
+        'too-large',
+        `file grew between stat and read (claimed ${claimedSize}, read at least ${totalRead}): ${realPath}`,
+      );
+    }
+    return { buffer: buf.subarray(0, totalRead), realPath, size: totalRead };
   } finally {
     await handle.close().catch(() => {});
   }

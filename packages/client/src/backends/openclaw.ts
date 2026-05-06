@@ -1,16 +1,22 @@
 import { createHash, generateKeyPairSync, randomUUID, sign as cryptoSign } from 'node:crypto';
 import { execFile } from 'node:child_process';
+import path from 'node:path';
 import { promisify } from 'node:util';
 import WebSocket from 'ws';
 import type { Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
 import {
+  createBoundedFileReader,
   inferMimeFromPath,
   parseBridgeAttachMarkers,
-  readBoundedFileWithinRoots,
   SafeReadError,
   stripMarkersForPath,
 } from './file-attach.js';
+import {
+  startSendFileMcpServer,
+  type SendFileMcpServer,
+  type SendFileMcpOptions,
+} from './send-file-mcp.js';
 import { clientVersion } from '../version.js';
 
 const execFileP = promisify(execFile);
@@ -507,8 +513,27 @@ export interface OpenclawBackendOptions {
    * Off by default. The bridge-client and OpenClaw are assumed to be
    * co-located on the same host; this disk-share pattern does not work
    * across hosts.
+   *
+   * `attachOutputs` and `sendFileMcp` may be enabled together: the MCP
+   * tool path is the recommended primary surface (deterministic), and
+   * the marker path remains as a text-only fallback for callers that
+   * prompt the agent without registering the MCP server.
    */
   attachOutputs?: OpenclawAttachOutputsOptions;
+  /**
+   * Expose a local Streamable HTTP MCP server with a `send_file(path, name?)`
+   * tool. The operator registers the resulting URL into OpenClaw's
+   * `mcp.servers` config so the agent gets `send_file` in its tool list.
+   *
+   * When the model invokes `send_file`, bridge-client reads the file
+   * (gated by `allowedRoots` + `maxBytes`, same primitives as `attachOutputs`)
+   * and emits an A2A `task.artifact` frame to the caller.
+   *
+   * Routing: bridge-client maintains a single in-flight task pointer per
+   * backend instance; concurrent tool calls during overlapping tasks are
+   * rejected with `ambiguous-task`.
+   */
+  sendFileMcp?: SendFileMcpOptions;
 }
 
 const DEFAULT_ATTACH_OUTPUTS_MAX_BYTES = 20 * 1024 * 1024;
@@ -712,7 +737,15 @@ function resolveTimeout(
 
 export function createOpenclawBackend(
   opts: OpenclawBackendOptions = {},
-): Backend {
+): Backend & {
+  /**
+   * Returns the lazily-started send_file MCP server, or null if it has
+   * not been spun up yet (no task with sendFileMcp has run, or the
+   * option wasn't enabled). Exposed for tests and operator diagnostics
+   * (e.g. logging the MCP URL on startup).
+   */
+  getSendFileMcpServer(): SendFileMcpServer | null;
+} {
   const url = opts.url ?? process.env.OPENCLAW_GATEWAY_URL ?? 'ws://127.0.0.1:18789';
   const token = opts.token ?? process.env.OPENCLAW_GATEWAY_TOKEN;
   const agent = opts.agent ?? process.env.OPENCLAW_AGENT ?? 'main';
@@ -733,11 +766,45 @@ export function createOpenclawBackend(
   );
   const attachOutputs =
     opts.attachOutputs && opts.attachOutputs.allowedRoots.length > 0
-      ? {
-          allowedRoots: opts.attachOutputs.allowedRoots,
-          maxBytes: opts.attachOutputs.maxBytes ?? DEFAULT_ATTACH_OUTPUTS_MAX_BYTES,
-        }
+      ? (() => {
+          const cfg = {
+            allowedRoots: opts.attachOutputs!.allowedRoots,
+            maxBytes: opts.attachOutputs!.maxBytes ?? DEFAULT_ATTACH_OUTPUTS_MAX_BYTES,
+          };
+          return {
+            ...cfg,
+            // Cached reader: canonicalizes allowedRoots once and reuses the
+            // result for every marker, so an assistant message with N
+            // bridge-attach markers does N file reads instead of N + N*roots
+            // realpath calls.
+            read: createBoundedFileReader(cfg),
+          };
+        })()
       : null;
+  const sendFileMcpOpts =
+    opts.sendFileMcp && opts.sendFileMcp.allowedRoots.length > 0
+      ? opts.sendFileMcp
+      : null;
+  // Lazy: only spin the HTTP server up on the first task that needs it,
+  // so backends that never see a tool call don't open a port.
+  let sendFileMcp: SendFileMcpServer | null = null;
+  let sendFileMcpStarting: Promise<SendFileMcpServer> | null = null;
+  async function ensureSendFileMcp(): Promise<SendFileMcpServer | null> {
+    if (!sendFileMcpOpts) return null;
+    if (sendFileMcp) return sendFileMcp;
+    if (sendFileMcpStarting) return sendFileMcpStarting;
+    sendFileMcpStarting = (async () => {
+      const server = await startSendFileMcpServer(sendFileMcpOpts);
+      sendFileMcp = server;
+      console.log(`[openclaw] send_file MCP server listening at ${server.url}`);
+      return server;
+    })();
+    try {
+      return await sendFileMcpStarting;
+    } finally {
+      sendFileMcpStarting = null;
+    }
+  }
 
   let current: GatewayClient | null = null;
   let connecting: Promise<GatewayClient> | null = null;
@@ -852,16 +919,12 @@ export function createOpenclawBackend(
     const fileParts: Part[] = [];
     for (const p of parsed.paths) {
       try {
-        const read = await readBoundedFileWithinRoots({
-          filePath: p,
-          allowedRoots: attachOutputs.allowedRoots,
-          maxBytes: attachOutputs.maxBytes,
-        });
+        const read = await attachOutputs.read(p);
         const mimeType = inferMimeFromPath(read.realPath);
         fileParts.push({
           kind: 'file',
           file: {
-            name: read.realPath.split('/').pop() ?? p,
+            name: path.basename(read.realPath),
             mimeType,
             bytes: read.buffer.toString('base64'),
           },
@@ -870,7 +933,7 @@ export function createOpenclawBackend(
       } catch (err) {
         const code = err instanceof SafeReadError ? err.code : 'read-failed';
         console.warn(
-          `[openclaw] bridge-attach skipped (${code}) for ${p}: ${(err as Error).message}`,
+          `[openclaw] bridge-attach skipped (${code}) for ${p}: ${errorMessage(err)}`,
         );
         // Marker stays in cleanedText so the operator can debug what the
         // agent tried to send.
@@ -1039,6 +1102,8 @@ export function createOpenclawBackend(
   return {
     name: 'openclaw',
 
+    getSendFileMcpServer: () => sendFileMcp,
+
     // Probe whether the gateway implements `sessions.messages.subscribe` so
     // the bridge-server can advertise a card capability that matches reality.
     // OpenClaw added the RPC in v2026.3.22; older gateways reject it with
@@ -1116,7 +1181,7 @@ export function createOpenclawBackend(
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: { code: 'gateway_closed', message: (err as Error).message },
+          error: { code: 'gateway_closed', message: errorMessage(err) },
         });
         return;
       }
@@ -1137,6 +1202,14 @@ export function createOpenclawBackend(
       // final-only path — not fatal.
       await ensureSessionMessageSubscription(gw, sessionKey);
 
+      // Register this task with the send_file MCP server (if enabled) so
+      // tool calls landing during this run resolve to this task's emit().
+      // Released in finally{} so a crashed/timed-out task doesn't keep the
+      // slot occupied indefinitely. The shared `emittedAnyArtifact` flag
+      // is set on every successful tool call so the final-result path
+      // doesn't double up: a tool call that delivers a file plus a text
+      // reply already covers what the final artifact would carry.
+
       // Per-task streaming state. `emittedAnyArtifact` decides whether the
       // terminal `chat.final` should also emit a final-only artifact (i.e.
       // whether the streaming path already delivered content). `seenAssistantMessageIds`
@@ -1153,6 +1226,33 @@ export function createOpenclawBackend(
       // race in the microtask queue — chaining serializes them so artifacts
       // emit in the order their session.message events arrived.
       let processingTail: Promise<void> = Promise.resolve();
+
+      let sendFileRelease: (() => void) | null = null;
+      if (sendFileMcpOpts) {
+        try {
+          const server = await ensureSendFileMcp();
+          if (server) {
+            const handle = server.registerActiveTask({
+              taskId: task.taskId,
+              contextId: task.contextId,
+              emit: (artifact) => {
+                emit({
+                  type: 'task.artifact',
+                  taskId: task.taskId,
+                  artifact,
+                  lastChunk: true,
+                });
+                emittedAnyArtifact = true;
+              },
+            });
+            sendFileRelease = handle.release;
+          }
+        } catch (err) {
+          console.warn(
+            `[openclaw] send_file MCP server failed to start; tool path disabled for this task: ${errorMessage(err)}`,
+          );
+        }
+      }
 
       const onSessionMessage = (p: SessionMessageEventPayload): void => {
         if (sessionMessageSettled) return;
@@ -1197,7 +1297,7 @@ export function createOpenclawBackend(
           .catch((err: unknown) => {
             console.error(
               '[openclaw] session.message processing failed:',
-              (err as Error).message,
+              errorMessage(err),
             );
           });
       };
@@ -1256,7 +1356,7 @@ export function createOpenclawBackend(
             sessionKey,
             seq: -1,
             state: 'error',
-            errorMessage: (err as Error).message,
+            errorMessage: errorMessage(err),
             cause: 'abort_failed',
           });
         }
@@ -1318,7 +1418,7 @@ export function createOpenclawBackend(
             taskId: task.taskId,
             error: {
               code: closed ? 'gateway_closed' : 'gateway_send_failed',
-              message: (err as Error).message,
+              message: errorMessage(err),
             },
           });
           return;
@@ -1454,6 +1554,7 @@ export function createOpenclawBackend(
         if (ownedSession && sessionMessageOwners.get(sessionKey)?.taskId === task.taskId) {
           sessionMessageOwners.delete(sessionKey);
         }
+        sendFileRelease?.();
       }
     },
   };

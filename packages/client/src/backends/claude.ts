@@ -1,11 +1,17 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import {
+  startSendFileMcpServer,
+  type SendFileMcpOptions,
+  type SendFileMcpServer,
+} from './send-file-mcp.js';
 
 // Slim subset of ChildProcess that the backend actually uses. Tests inject a
 // fake that satisfies this without wiring up a real OS process.
 export interface ClaudeChildHandle {
+  readonly stdin: NodeJS.WritableStream | null;
   readonly stdout: NodeJS.ReadableStream | null;
   readonly stderr: NodeJS.ReadableStream | null;
   kill(signal?: NodeJS.Signals): boolean;
@@ -36,16 +42,32 @@ export interface ClaudeBackendOptions {
   sessionTtlMs?: number;
   // Test seam: deterministic clock for TTL eviction.
   now?: () => number;
+  /**
+   * Expose a local Streamable HTTP MCP server with a `send_file(path, name?)`
+   * tool that delivers files from disk to the A2A caller as `FilePart`
+   * artifacts. When set, the server is registered into the spawned claude
+   * via `--mcp-config` so the agent sees `send_file` in its tool list.
+   *
+   * Routing: a single in-flight task per backend instance. Concurrent tool
+   * calls across overlapping tasks are rejected with `ambiguous-task`.
+   */
+  sendFileMcp?: SendFileMcpOptions;
 }
 
 interface SessionEntry {
   sessionId: string;
   lastUsedAt: number;
+  // Monotonic per-write token. A rollback only deletes the entry when
+  // this matches the writeId the rolling-back task itself stamped — so a
+  // second concurrent task on the same contextId that has since refreshed
+  // the binding (and bumped writeId) is not robbed of its session id.
+  writeId: number;
 }
 
-// claude --output-format stream-json writes one JSON object per line. Message
-// events have `type:"assistant"` with a content block array we surface as
-// artifacts; the run ends with `type:"result"` carrying the final text string.
+// claude --output-format stream-json writes one JSON object per line. We
+// surface assistant `text` blocks (one A2A artifact per assistant message)
+// and pass through `tool_result` content of type image/document so MCP
+// screenshot-style tools land as A2A `FilePart`s alongside the text.
 interface StreamEvent {
   type?: unknown;
   message?: {
@@ -55,13 +77,65 @@ interface StreamEvent {
   result?: unknown;
 }
 
+// Anthropic-shaped content block we send on stdin.
+type InputContentBlock =
+  | { type: 'text'; text: string }
+  | {
+      type: 'image' | 'document';
+      source: { type: 'base64'; media_type: string; data: string };
+    };
+
+const INPUT_IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+
+// Hard cap on a single inbound FilePart's decoded size. base64 in the
+// stream-json envelope expands ~4/3, and the model context plus per-call
+// API limits make multi-megabyte attachments expensive even when accepted.
+// Reject above this with a stable code rather than silently embedding a
+// huge payload.
+const INPUT_FILE_MAX_BYTES = 5 * 1024 * 1024;
+
+// Hard cap on a single tool_result media block's decoded size before
+// it becomes an outbound A2A FilePart. Prevents a misbehaving tool
+// (e.g. an MCP screenshot at unbounded resolution) from forcing a huge
+// in-memory base64 decode and a giant artifact payload on the wire.
+const TOOL_RESULT_MEDIA_MAX_BYTES = 5 * 1024 * 1024;
+
+// Defensive stringification — `(e as Error).message` is unsafe when the
+// thrown value is null/undefined or a non-Error primitive (common in JS).
+// Always returns a string suitable for logs/frames without throwing.
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === 'string') return e;
+  try {
+    return String(e);
+  } catch {
+    return '<unrepresentable>';
+  }
+}
+
+function decodedBase64Size(b64: string): number {
+  if (b64.length === 0) return 0;
+  let pad = 0;
+  if (b64.endsWith('==')) pad = 2;
+  else if (b64.endsWith('=')) pad = 1;
+  // Clamp to >= 0 so a malformed input like a bare "=" or "==" (which
+  // would otherwise compute to -1) reports zero, not a negative size.
+  // The size-cap callers only need a non-negative upper bound; any deeper
+  // base64 validation belongs to whoever decodes the bytes.
+  return Math.max(0, Math.floor((b64.length * 3) / 4) - pad);
+}
+
+function sha256OfBase64(b64: string): string {
+  return createHash('sha256').update(Buffer.from(b64, 'base64')).digest('hex');
+}
+
 function defaultSpawn(
   command: string,
   args: readonly string[],
   options: ClaudeSpawnOptions,
 ): ClaudeChildHandle {
   return nodeSpawn(command, Array.from(args), {
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
     ...(options.cwd ? { cwd: options.cwd } : {}),
   }) as ChildProcess;
 }
@@ -77,25 +151,109 @@ function extractAssistantText(content: unknown): string {
   return out;
 }
 
-function collectTextPrompt(parts: readonly Part[]): { ok: true; prompt: string } | { ok: false; code: string; message: string } {
-  let prompt = '';
-  for (const p of parts) {
-    if (p.kind !== 'text') {
-      return {
-        ok: false,
-        code: 'unsupported_part_kind',
-        message: `claude backend only accepts text parts (got ${p.kind})`,
+// Pull image/document blocks out of a `user`-role event's `tool_result`
+// content array. MCP screenshot tools, image-generation tools, and built-in
+// Read on a media file all surface here. Returned in encounter order.
+function extractToolResultMediaParts(content: unknown): Part[] {
+  if (!Array.isArray(content)) return [];
+  const out: Part[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    const b = block as { type?: unknown; content?: unknown };
+    if (b.type !== 'tool_result' || !Array.isArray(b.content)) continue;
+    for (const inner of b.content) {
+      if (!inner || typeof inner !== 'object') continue;
+      const i = inner as {
+        type?: unknown;
+        source?: { type?: unknown; media_type?: unknown; data?: unknown };
       };
+      if (i.type !== 'image' && i.type !== 'document') continue;
+      const src = i.source;
+      if (!src || src.type !== 'base64') continue;
+      if (typeof src.media_type !== 'string' || typeof src.data !== 'string') continue;
+      out.push({
+        kind: 'file',
+        file: { mimeType: src.media_type, bytes: src.data },
+      });
     }
-    prompt += p.text;
   }
-  if (!prompt) {
-    return { ok: false, code: 'empty_prompt', message: 'no text content in message' };
-  }
-  return { ok: true, prompt };
+  return out;
 }
 
-export function createClaudeBackend(opts: ClaudeBackendOptions = {}): Backend {
+function mapPartsToContentBlocks(
+  parts: readonly Part[],
+):
+  | { ok: true; blocks: InputContentBlock[]; inboundHashes: Set<string> }
+  | { ok: false; code: string; message: string } {
+  const blocks: InputContentBlock[] = [];
+  // SHA-256 (hex) of every accepted FilePart's decoded bytes. Used by the
+  // tool_result passthrough to skip echoes — if the model Reads a caller-
+  // provided file the same bytes would otherwise re-emit as a new artifact.
+  const inboundHashes = new Set<string>();
+  for (const p of parts) {
+    if (p.kind === 'text') {
+      if (p.text) {
+        blocks.push({ type: 'text', text: p.text });
+      }
+      continue;
+    }
+    if (p.kind === 'file') {
+      // uri-only FilePart is not supported — fetching is the responsibility
+      // of a different backend or the caller. Reject with a stable code.
+      if (!p.file.bytes) {
+        return {
+          ok: false,
+          code: 'unsupported_file_uri',
+          message: 'claude backend requires inline FilePart bytes; uri-only is not supported',
+        };
+      }
+      const decodedSize = decodedBase64Size(p.file.bytes);
+      if (decodedSize > INPUT_FILE_MAX_BYTES) {
+        return {
+          ok: false,
+          code: 'file_too_large',
+          message: `FilePart exceeds INPUT_FILE_MAX_BYTES (${decodedSize} > ${INPUT_FILE_MAX_BYTES})`,
+        };
+      }
+      const mime = p.file.mimeType ?? '';
+      if (INPUT_IMAGE_MIME.has(mime)) {
+        blocks.push({
+          type: 'image',
+          source: { type: 'base64', media_type: mime, data: p.file.bytes },
+        });
+      } else if (mime === 'application/pdf') {
+        blocks.push({
+          type: 'document',
+          source: { type: 'base64', media_type: mime, data: p.file.bytes },
+        });
+      } else {
+        return {
+          ok: false,
+          code: 'unsupported_file_mime',
+          message: `claude backend accepts image/{png,jpeg,webp,gif} or application/pdf (got ${mime || 'unknown'})`,
+        };
+      }
+      inboundHashes.add(sha256OfBase64(p.file.bytes));
+      continue;
+    }
+    return {
+      ok: false,
+      code: 'unsupported_part_kind',
+      message: `claude backend does not accept ${p.kind} parts`,
+    };
+  }
+  // Media-only messages (image/document with no text) are accepted —
+  // Anthropic's vision/document path can answer about them without an
+  // accompanying prompt. Only a fully empty content array fails loud.
+  if (blocks.length === 0) {
+    return { ok: false, code: 'empty_prompt', message: 'no content in message' };
+  }
+  return { ok: true, blocks, inboundHashes };
+}
+
+export function createClaudeBackend(
+  opts: ClaudeBackendOptions = {},
+): Backend & { getSendFileMcpServer(): SendFileMcpServer | null } {
   const command = opts.command ?? 'claude';
   const cwd = opts.cwd;
   const extraArgs = opts.extraArgs ?? [];
@@ -103,6 +261,31 @@ export function createClaudeBackend(opts: ClaudeBackendOptions = {}): Backend {
   const stderrCap = opts.stderrCaptureBytes ?? 8192;
   const sessionTtlMs = opts.sessionTtlMs ?? 60 * 60 * 1000;
   const now = opts.now ?? Date.now;
+  const sendFileMcpOpts =
+    opts.sendFileMcp && opts.sendFileMcp.allowedRoots.length > 0
+      ? opts.sendFileMcp
+      : null;
+
+  // Lazy: first task that needs the MCP server starts it; backends that
+  // never see send_file enabled don't open a port.
+  let sendFileMcp: SendFileMcpServer | null = null;
+  let sendFileMcpStarting: Promise<SendFileMcpServer> | null = null;
+  async function ensureSendFileMcp(): Promise<SendFileMcpServer | null> {
+    if (!sendFileMcpOpts) return null;
+    if (sendFileMcp) return sendFileMcp;
+    if (sendFileMcpStarting) return sendFileMcpStarting;
+    sendFileMcpStarting = (async () => {
+      const server = await startSendFileMcpServer(sendFileMcpOpts);
+      sendFileMcp = server;
+      console.log(`[claude] send_file MCP server listening at ${server.url}`);
+      return server;
+    })();
+    try {
+      return await sendFileMcpStarting;
+    } finally {
+      sendFileMcpStarting = null;
+    }
+  }
 
   // contextId → claude session_id. A follow-up task on the same A2A
   // contextId resumes the same claude conversation via --resume so the model
@@ -110,6 +293,10 @@ export function createClaudeBackend(opts: ClaudeBackendOptions = {}): Backend {
   // memory. The map is in-memory only — restarts lose the binding (next task
   // on a stale contextId starts a new session).
   const sessions = new Map<string, SessionEntry>();
+  // Monotonic counter shared across all writes into `sessions`. Used to
+  // disambiguate concurrent tasks on the same contextId so a rollback only
+  // touches the entry the rolling-back task itself last wrote.
+  let writeCounter = 0;
 
   function evictExpired(cutoff: number): void {
     for (const [key, entry] of sessions) {
@@ -119,6 +306,8 @@ export function createClaudeBackend(opts: ClaudeBackendOptions = {}): Backend {
 
   return {
     name: 'claude',
+
+    getSendFileMcpServer: () => sendFileMcp,
 
     async handle(task, emit, signal) {
       if (signal.aborted) {
@@ -130,7 +319,7 @@ export function createClaudeBackend(opts: ClaudeBackendOptions = {}): Backend {
         return;
       }
 
-      const mapped = collectTextPrompt(task.message.parts);
+      const mapped = mapPartsToContentBlocks(task.message.parts);
       if (!mapped.ok) {
         emit({
           type: 'task.fail',
@@ -148,22 +337,49 @@ export function createClaudeBackend(opts: ClaudeBackendOptions = {}): Backend {
       const existing = sessionTtlMs > 0 ? sessions.get(task.contextId) : undefined;
       const sessionId = existing?.sessionId ?? randomUUID();
       const isResume = existing !== undefined;
+      let writeId = 0;
       if (sessionTtlMs > 0) {
         // Refresh lastUsedAt eagerly: a concurrent second task on the same
         // contextId arriving before this one finishes also resumes the same
         // session id (rather than racing to mint a new one).
-        sessions.set(task.contextId, { sessionId, lastUsedAt: tNow });
+        writeId = ++writeCounter;
+        sessions.set(task.contextId, { sessionId, lastUsedAt: tNow, writeId });
+      }
+
+      // Bring up the MCP server first (if enabled) so we know its URL before
+      // building argv. A startup failure disables the tool path for this task
+      // but the run continues — the caller still gets text/markers.
+      let mcpServerForTask: SendFileMcpServer | null = null;
+      if (sendFileMcpOpts) {
+        try {
+          mcpServerForTask = await ensureSendFileMcp();
+        } catch (err) {
+          console.warn(
+            `[claude] send_file MCP server failed to start; tool path disabled for this task: ${errorMessage(err)}`,
+          );
+        }
       }
 
       const args: string[] = [
         '-p',
-        mapped.prompt,
-        ...(isResume ? ['--resume', sessionId] : ['--session-id', sessionId]),
+        '--input-format',
+        'stream-json',
         '--output-format',
         'stream-json',
         // Required alongside --output-format stream-json; without it claude
         // prints a banner and exits instead of streaming.
         '--verbose',
+        ...(isResume ? ['--resume', sessionId] : ['--session-id', sessionId]),
+        ...(mcpServerForTask
+          ? [
+              '--mcp-config',
+              JSON.stringify({
+                mcpServers: {
+                  'vicoop-bridge': { type: 'http', url: mcpServerForTask.url },
+                },
+              }),
+            ]
+          : []),
         ...extraArgs,
       ];
 
@@ -173,22 +389,79 @@ export function createClaudeBackend(opts: ClaudeBackendOptions = {}): Backend {
         status: { state: 'working', timestamp: new Date().toISOString() },
       });
 
+      // Drop the freshly-minted (contextId → sessionId) binding when the
+      // run never reached a successful state, so the next task on this
+      // contextId mints a brand-new id instead of `--resume`-ing a session
+      // claude never persisted on disk. No-op if this run was already
+      // resuming an existing session, or if session reuse is disabled.
+      //
+      // Concurrency: only delete when the entry is still the one THIS task
+      // wrote. A second concurrent task on the same contextId would have
+      // bumped `writeId` when refreshing the binding; if we see a different
+      // writeId, that other task now "owns" the entry and should keep it.
+      const rollbackFreshSession = (): void => {
+        if (isResume || sessionTtlMs <= 0) return;
+        const cur = sessions.get(task.contextId);
+        if (cur?.sessionId === sessionId && cur.writeId === writeId) {
+          sessions.delete(task.contextId);
+        }
+      };
+
       let child: ClaudeChildHandle;
       try {
         child = spawnFn(command, args, { cwd });
       } catch (err) {
-        // Roll back the freshly-minted entry so a retry doesn't try to
-        // --resume a session that was never actually created on disk.
-        if (!isResume && sessionTtlMs > 0) {
-          const cur = sessions.get(task.contextId);
-          if (cur?.sessionId === sessionId) sessions.delete(task.contextId);
-        }
+        rollbackFreshSession();
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: { code: 'spawn_failed', message: (err as Error).message },
+          error: { code: 'spawn_failed', message: errorMessage(err) },
         });
         return;
+      }
+
+      // Write the user message envelope and close stdin so claude sees EOF
+      // and proceeds. Errors here are recorded; the close listener still
+      // drives the terminal frame so we don't double-emit.
+      let stdinError: unknown = null;
+      if (!child.stdin) {
+        // A custom spawn that doesn't pipe stdin would otherwise leave
+        // claude blocked waiting for input. Hard-fail loud rather than
+        // hang the run.
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          /* best effort */
+        }
+        // The freshly-minted sessionId never reached claude, so a follow-up
+        // task on the same contextId must mint a new id rather than --resume.
+        rollbackFreshSession();
+        emit({
+          type: 'task.fail',
+          taskId: task.taskId,
+          error: {
+            code: 'spawn_no_stdin',
+            message: 'spawned claude has no stdin pipe; cannot deliver user message',
+          },
+        });
+        return;
+      }
+      // Attach an error listener BEFORE writing. EPIPE and similar stream
+      // failures surface asynchronously via `error` rather than as a
+      // synchronous throw from `.end()`; without this, the unhandled error
+      // would crash the process. The exit-nonzero handler already
+      // formats `stdinError` into the surfaced message.
+      child.stdin.on('error', (err: unknown) => {
+        if (!stdinError) stdinError = err;
+      });
+      try {
+        const envelope = JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: mapped.blocks },
+        });
+        child.stdin.end(envelope + '\n');
+      } catch (err) {
+        stdinError = err;
       }
 
       let emittedAnyArtifact = false;
@@ -196,6 +469,28 @@ export function createClaudeBackend(opts: ClaudeBackendOptions = {}): Backend {
       let stderrTail = '';
       let aborted = false;
       let settled = false;
+
+      // Register this task with the send_file MCP server (if running) so
+      // tool calls landing during this run resolve to this task's emit().
+      // Released in the terminal block so a crashed/timed-out task doesn't
+      // keep the slot occupied indefinitely.
+      let sendFileRelease: (() => void) | null = null;
+      if (mcpServerForTask) {
+        const handle = mcpServerForTask.registerActiveTask({
+          taskId: task.taskId,
+          contextId: task.contextId,
+          emit: (artifact) => {
+            emit({
+              type: 'task.artifact',
+              taskId: task.taskId,
+              artifact,
+              lastChunk: true,
+            });
+            emittedAnyArtifact = true;
+          },
+        });
+        sendFileRelease = handle.release;
+      }
 
       const emitAssistantArtifact = (text: string): void => {
         if (!text) return;
@@ -214,12 +509,59 @@ export function createClaudeBackend(opts: ClaudeBackendOptions = {}): Backend {
         emittedAnyArtifact = true;
       };
 
+      const emitToolResultMedia = (parts: Part[]): void => {
+        if (parts.length === 0) return;
+        emit({
+          type: 'task.artifact',
+          taskId: task.taskId,
+          artifact: {
+            artifactId: randomUUID(),
+            name: 'claude-tool-result',
+            parts,
+          },
+          lastChunk: true,
+        });
+        emittedAnyArtifact = true;
+      };
+
       const handleEvent = (evt: StreamEvent): void => {
         if (settled) return;
         if (evt.type === 'assistant') {
           if (evt.message?.role !== 'assistant') return;
           emitAssistantArtifact(extractAssistantText(evt.message.content));
-        } else if (evt.type === 'result') {
+          return;
+        }
+        if (evt.type === 'user') {
+          // tool_result events come in as a synthetic user message in the
+          // stream-json transcript; pull out any image/document blocks and
+          // emit them as A2A FileParts. Text-only tool results are skipped.
+          // Two filters apply, in order:
+          //   1. size cap — drop oversize blocks before we even base64-decode
+          //      them for hashing (cheap length math first; full decode is
+          //      O(payload size)).
+          //   2. echo dedup — a tool_result whose decoded bytes match an
+          //      inbound FilePart (e.g. the model Read the caller's image)
+          //      would re-emit the same payload back. Drop those.
+          const dedupActive = mapped.inboundHashes.size > 0;
+          const parts = extractToolResultMediaParts(evt.message?.content).filter((p) => {
+            if (p.kind !== 'file' || !p.file.bytes) return true;
+            const decodedSize = decodedBase64Size(p.file.bytes);
+            if (decodedSize > TOOL_RESULT_MEDIA_MAX_BYTES) {
+              console.warn(
+                `[claude] tool_result media dropped: decoded size ${decodedSize} > ${TOOL_RESULT_MEDIA_MAX_BYTES}`,
+              );
+              return false;
+            }
+            // Skip the hash when there are no inbound files to dedup against.
+            // The hash decodes the full base64 (up to 5 MiB) and would burn
+            // CPU/memory on every tool_result image for no possible match.
+            if (!dedupActive) return true;
+            return !mapped.inboundHashes.has(sha256OfBase64(p.file.bytes));
+          });
+          emitToolResultMedia(parts);
+          return;
+        }
+        if (evt.type === 'result') {
           if (typeof evt.result === 'string') finalText = evt.result;
         }
       };
@@ -259,13 +601,17 @@ export function createClaudeBackend(opts: ClaudeBackendOptions = {}): Backend {
         if (stderrTail.length > stderrCap) stderrTail = stderrTail.slice(-stderrCap);
       });
 
-      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: Error }>((resolve) => {
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: unknown }>((resolve) => {
+        // The `error` event is *typed* with `Error`, but EventEmitter at
+        // runtime can emit any value. Carry it as unknown so the frame
+        // builder routes through `errorMessage` safely.
         child.on('error', (err) => resolve({ code: null, signal: null, error: err }));
         child.on('close', (code, sig) => resolve({ code, signal: sig }));
       });
 
       signal.removeEventListener('abort', onAbort);
       settled = true;
+      sendFileRelease?.();
 
       // Flush any trailing line without a newline. claude normally terminates
       // each event with \n but a crash mid-write could leave one orphan.
@@ -288,24 +634,32 @@ export function createClaudeBackend(opts: ClaudeBackendOptions = {}): Backend {
       }
 
       if (exit.error) {
+        rollbackFreshSession();
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: { code: 'spawn_failed', message: exit.error.message },
+          // exit.error is typed Error from the child `error` event but a
+          // custom spawn / fake child could emit a non-Error here. Route
+          // through errorMessage so .message access can't crash the frame.
+          error: { code: 'spawn_failed', message: errorMessage(exit.error) },
         });
         return;
       }
 
       if (exit.code !== 0) {
+        rollbackFreshSession();
         const detail = stderrTail.trim();
         const sigPart = exit.signal ? ` (signal ${exit.signal})` : '';
         const detailPart = detail ? `: ${detail.slice(-500)}` : '';
+        // If stdin write blew up and the process exited non-zero, surface
+        // both: the stdin error is usually the proximate cause.
+        const stdinPart = stdinError ? ` [stdin: ${errorMessage(stdinError)}]` : '';
         emit({
           type: 'task.fail',
           taskId: task.taskId,
           error: {
             code: 'claude_exit_nonzero',
-            message: `claude exited with code ${exit.code}${sigPart}${detailPart}`,
+            message: `claude exited with code ${exit.code}${sigPart}${detailPart}${stdinPart}`,
           },
         });
         return;

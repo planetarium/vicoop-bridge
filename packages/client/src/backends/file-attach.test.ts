@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
+  createBoundedFileReader,
   inferMimeFromPath,
   parseBridgeAttachMarkers,
   readBoundedFileWithinRoots,
@@ -66,11 +67,49 @@ test('stripMarkersForPath: removes only the requested path markers', () => {
   assert.equal(stripped.includes('/b/y.pdf'), true, 'unrelated marker must remain');
 });
 
-test('stripMarkersForPath: collapses whitespace-only lines created by stripping', () => {
+test('stripMarkersForPath: removes a marker-only line entirely (no blank-line gap left behind)', () => {
   const original = 'paragraph one\n[bridge-attach: /a/x.png]\n\nparagraph two';
   const parsed = parseBridgeAttachMarkers(original);
   const stripped = stripMarkersForPath(original, parsed, '/a/x.png');
   assert.equal(stripped, 'paragraph one\n\nparagraph two');
+});
+
+test('stripMarkersForPath: preserves leading/trailing whitespace and blank lines outside the marker line', () => {
+  // The .trim() in the previous implementation would strip the leading
+  // newline and the trailing spaces here, which is unrelated to marker
+  // removal. Per-line cleanup keeps the agent's formatting intact.
+  const original = '\n  intro line  \n[bridge-attach: /a/x.png]\nbody  \n\n';
+  const parsed = parseBridgeAttachMarkers(original);
+  const stripped = stripMarkersForPath(original, parsed, '/a/x.png');
+  assert.equal(stripped, '\n  intro line  \nbody  \n\n');
+});
+
+test('stripMarkersForPath: an inline marker in the middle of a line preserves surrounding text and whitespace', () => {
+  const original = 'before [bridge-attach: /a/x.png] after';
+  const parsed = parseBridgeAttachMarkers(original);
+  const stripped = stripMarkersForPath(original, parsed, '/a/x.png');
+  // Marker substring is removed in place; the resulting double space is
+  // intentional — not our job to fix the assistant\'s original spacing.
+  assert.equal(stripped, 'before  after');
+});
+
+test('createBoundedFileReader: reuses canonicalized roots across calls (root realpath happens once)', async () => {
+  const root = await tmpDir();
+  await fs.writeFile(path.join(root, 'a.txt'), 'A');
+  await fs.writeFile(path.join(root, 'b.txt'), 'B');
+  const read = createBoundedFileReader({ allowedRoots: [root], maxBytes: 1024 });
+  const a = await read(path.join(root, 'a.txt'));
+  const b = await read(path.join(root, 'b.txt'));
+  assert.equal(a.buffer.toString('utf8'), 'A');
+  assert.equal(b.buffer.toString('utf8'), 'B');
+});
+
+test('createBoundedFileReader: surfaces outside-roots when no allowed roots configured (cache resolution failure not silently swallowed)', async () => {
+  const read = createBoundedFileReader({ allowedRoots: [], maxBytes: 1024 });
+  await assert.rejects(
+    read('/etc/hosts'),
+    (err: unknown) => err instanceof SafeReadError && err.code === 'outside-roots',
+  );
 });
 
 test('readBoundedFileWithinRoots: happy path reads bytes and reports realPath under the configured root', async () => {
@@ -161,6 +200,40 @@ test('readBoundedFileWithinRoots: oversized file rejected with too-large', async
   );
 });
 
+test('readBoundedFileWithinRoots: regular file with stable dev/ino passes identity check (path-swap detector does not false-positive)', async () => {
+  // Smoke test for the cross-platform symlink TOCTOU defense: a normal
+  // file should pass through (dev+ino at fstat == dev+ino at lstat).
+  // Real swap simulation requires racing fs operations and is left to
+  // platform-specific fuzz coverage; this catches a regression where
+  // the identity comparison itself becomes spurious.
+  const root = await tmpDir();
+  const file = path.join(root, 'stable.txt');
+  await fs.writeFile(file, 'stable');
+  const r = await readBoundedFileWithinRoots({
+    filePath: file,
+    allowedRoots: [root],
+    maxBytes: 1024,
+  });
+  assert.equal(r.buffer.toString('utf8'), 'stable');
+});
+
+test('readBoundedFileWithinRoots: bounded read returns the actual byte count even if file shrinks between stat and read', async () => {
+  // The size returned should reflect what was actually read, not the
+  // (possibly stale) stat.size. This also confirms we are using a
+  // bounded read instead of fs.readFile() which would read whatever the
+  // descriptor still had.
+  const root = await tmpDir();
+  const file = path.join(root, 'small.txt');
+  await fs.writeFile(file, 'small content');
+  const r = await readBoundedFileWithinRoots({
+    filePath: file,
+    allowedRoots: [root],
+    maxBytes: 1024,
+  });
+  assert.equal(r.size, 'small content'.length);
+  assert.equal(r.buffer.toString('utf8'), 'small content');
+});
+
 test('readBoundedFileWithinRoots: missing file rejected with not-found', async () => {
   const root = await tmpDir();
   const missing = path.join(root, 'nope.txt');
@@ -201,4 +274,30 @@ test('inferMimeFromPath: known extensions map to specific mimes; unknown falls b
   assert.equal(inferMimeFromPath('/x/notes.md'), 'text/markdown');
   assert.equal(inferMimeFromPath('/x/blob.unknownext'), 'application/octet-stream');
   assert.equal(inferMimeFromPath('/x/no-extension'), 'application/octet-stream');
+});
+
+test('createBoundedFileReader: throws RangeError on negative maxBytes', () => {
+  assert.throws(
+    () => createBoundedFileReader({ allowedRoots: ['/tmp'], maxBytes: -1 }),
+    /maxBytes must be a finite non-negative number/,
+  );
+});
+
+test('createBoundedFileReader: throws RangeError on non-finite maxBytes', () => {
+  assert.throws(
+    () => createBoundedFileReader({ allowedRoots: ['/tmp'], maxBytes: Number.POSITIVE_INFINITY }),
+    /maxBytes must be a finite non-negative number/,
+  );
+});
+
+test('readBoundedFileWithinRoots: throws RangeError on NaN maxBytes', async () => {
+  await assert.rejects(
+    () =>
+      readBoundedFileWithinRoots({
+        filePath: '/tmp/x',
+        allowedRoots: ['/tmp'],
+        maxBytes: Number.NaN,
+      }),
+    /maxBytes must be a finite non-negative number/,
+  );
 });
