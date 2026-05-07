@@ -95,3 +95,17 @@ test('verifySiweBearerToken caches verified results', async () => {
   const b = await verifySiweBearerToken(token, { domain: 'bridge.example' });
   assert.equal(a.address, b.address);
 });
+
+test('verifySiweBearerToken re-checks domain on cache hit', async () => {
+  _resetSiweBearerCacheForTests();
+  const token = await mintBearer({ domain: 'bridge.example', uri: 'https://bridge.example' });
+  // First call seeds the cache with the verified domain.
+  await verifySiweBearerToken(token, { domain: 'bridge.example' });
+  // Second call with a stricter domain must reject even though the token is
+  // already verified — otherwise a cached entry could bypass a tightened
+  // domain check from a different caller.
+  await assert.rejects(
+    () => verifySiweBearerToken(token, { domain: 'attacker.example' }),
+    /domain mismatch/i,
+  );
+});

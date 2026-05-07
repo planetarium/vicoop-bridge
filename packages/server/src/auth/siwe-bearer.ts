@@ -45,6 +45,7 @@ export function decodeSiweBearerToken(token: string): DecodedSiweBearer {
 
 interface CacheEntry {
   address: string;
+  domain: string;
   expiresAt: number;
 }
 
@@ -52,6 +53,13 @@ interface CacheEntry {
 // not a true LRU — it bounds memory and TTL-evicts expired entries, which
 // matches dba's siwe-token.ts and is sufficient for our usage pattern (a
 // caller signs once and reuses the same token for the SIWE TTL).
+//
+// We cache the verified domain alongside the address so a cache hit can
+// re-check it if the caller passes a different `opts.domain`. Without this
+// re-check a token whose first verification accepted any domain (or domain
+// undefined) would cache-bypass a stricter domain check on subsequent
+// calls. In practice opts.domain is fixed (siweDomain from http.tsx), but
+// the function is exported and could be reused.
 const CACHE_MAX_ENTRIES = 10_000;
 const CACHE_SWEEP_INTERVAL_MS = 60_000;
 const verifyCache = new Map<string, CacheEntry>();
@@ -88,16 +96,27 @@ export async function verifySiweBearerToken(
   maybeSweep();
   const cached = verifyCache.get(token);
   if (cached && cached.expiresAt > Date.now()) {
+    if (opts.domain && cached.domain !== opts.domain.toLowerCase()) {
+      throw new Error(
+        `SIWE domain mismatch: expected ${opts.domain}, got ${cached.domain}`,
+      );
+    }
     return { address: cached.address };
   }
   const { message, signature } = decodeSiweBearerToken(token);
   const address = await verifySiweMessage(message, signature, { domain: opts.domain });
   // verifySiweMessage already enforces presence and validity of expirationTime,
-  // so re-parsing here is just to read the value back out for the cache TTL.
+  // so re-parsing here is just to read the value back out for the cache TTL +
+  // the verified domain (so a later call with a different opts.domain doesn't
+  // pass on the cached result).
   const parsed = new SiweMessage(message);
   const expiresAt = new Date(parsed.expirationTime!).getTime();
   const lower = address.toLowerCase();
-  verifyCache.set(token, { address: lower, expiresAt });
+  verifyCache.set(token, {
+    address: lower,
+    domain: parsed.domain.toLowerCase(),
+    expiresAt,
+  });
   return { address: lower };
 }
 
