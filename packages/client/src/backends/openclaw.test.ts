@@ -868,8 +868,8 @@ test('gateway close mid-run fails in-flight task deterministically', async () =>
   }
 });
 
-test('mapPartsToChatInput: text-only parts are joined with newline and carry no attachments', () => {
-  const result = mapPartsToChatInput([
+test('mapPartsToChatInput: text-only parts are joined with newline and carry no attachments', async () => {
+  const result = await mapPartsToChatInput([
     { kind: 'text', text: 'first line' },
     { kind: 'text', text: 'second line' },
   ]);
@@ -879,8 +879,8 @@ test('mapPartsToChatInput: text-only parts are joined with newline and carry no 
   assert.deepEqual(result.input.attachments, []);
 });
 
-test('mapPartsToChatInput: file part with image bytes maps to an OpenClaw image attachment', () => {
-  const result = mapPartsToChatInput([
+test('mapPartsToChatInput: file part with image bytes maps to an OpenClaw image attachment', async () => {
+  const result = await mapPartsToChatInput([
     { kind: 'text', text: 'describe this' },
     {
       kind: 'file',
@@ -895,8 +895,8 @@ test('mapPartsToChatInput: file part with image bytes maps to an OpenClaw image 
   ]);
 });
 
-test('mapPartsToChatInput: image file without a name omits fileName cleanly', () => {
-  const result = mapPartsToChatInput([
+test('mapPartsToChatInput: image file without a name omits fileName cleanly', async () => {
+  const result = await mapPartsToChatInput([
     { kind: 'file', file: { mimeType: 'image/jpeg', bytes: 'BBBB' } },
   ]);
   assert.equal(result.ok, true);
@@ -905,18 +905,45 @@ test('mapPartsToChatInput: image file without a name omits fileName cleanly', ()
   assert.equal(result.input.attachments[0].fileName, undefined);
 });
 
-test('mapPartsToChatInput: file.uri is rejected explicitly instead of silently dropped', () => {
-  const result = mapPartsToChatInput([
+test('mapPartsToChatInput: file.uri is rejected when URI fetching is disabled', async () => {
+  const result = await mapPartsToChatInput([
     { kind: 'file', file: { uri: 'https://example.com/doc.pdf', mimeType: 'application/pdf' } },
-  ]);
+  ], { enabled: false });
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.equal(result.error.code, 'unsupported_file_uri');
   assert.match(result.error.message, /part\[0\]/);
 });
 
-test('mapPartsToChatInput: non-image file maps to a generic file attachment (OpenClaw >= v2026.4.27 offloads to media://inbound/<id>)', () => {
-  const result = mapPartsToChatInput([
+test('mapPartsToChatInput: file.uri is fetched and mapped to an attachment', async () => {
+  const body = Buffer.from('pdf-bytes');
+  const result = await mapPartsToChatInput(
+    [{ kind: 'file', file: { name: 'doc.pdf', mimeType: 'application/pdf', uri: 'https://example.com/doc.pdf' } }],
+    {
+      fetchImplForTest: async () =>
+        new Response(body, {
+          headers: {
+            'content-type': 'application/pdf',
+            'content-length': String(body.length),
+          },
+        }),
+      resolveHost: async () => ['93.184.216.34'],
+    },
+  );
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(result.input.attachments, [
+    {
+      type: 'file',
+      mimeType: 'application/pdf',
+      fileName: 'doc.pdf',
+      content: body.toString('base64'),
+    },
+  ]);
+});
+
+test('mapPartsToChatInput: non-image file maps to a generic file attachment (OpenClaw >= v2026.4.27 offloads to media://inbound/<id>)', async () => {
+  const result = await mapPartsToChatInput([
     { kind: 'text', text: 'summarize' },
     { kind: 'file', file: { name: 'report.pdf', mimeType: 'application/pdf', bytes: 'CCCC' } },
   ]);
@@ -928,8 +955,8 @@ test('mapPartsToChatInput: non-image file maps to a generic file attachment (Ope
   ]);
 });
 
-test('mapPartsToChatInput: missing both bytes and uri is rejected', () => {
-  const result = mapPartsToChatInput([
+test('mapPartsToChatInput: missing both bytes and uri is rejected', async () => {
+  const result = await mapPartsToChatInput([
     { kind: 'file', file: { mimeType: 'image/png' } },
   ]);
   assert.equal(result.ok, false);
@@ -937,8 +964,8 @@ test('mapPartsToChatInput: missing both bytes and uri is rejected', () => {
   assert.equal(result.error.code, 'invalid_file_part');
 });
 
-test('mapPartsToChatInput: missing mimeType is rejected (gateway needs it for sniff/route)', () => {
-  const result = mapPartsToChatInput([
+test('mapPartsToChatInput: missing mimeType is rejected (gateway needs it for sniff/route)', async () => {
+  const result = await mapPartsToChatInput([
     { kind: 'file', file: { name: 'blob.bin', bytes: 'DDDD' } },
   ]);
   assert.equal(result.ok, false);
@@ -947,8 +974,8 @@ test('mapPartsToChatInput: missing mimeType is rejected (gateway needs it for sn
   assert.match(result.error.message, /mimeType/);
 });
 
-test('mapPartsToChatInput: data part is rejected since OpenClaw has no structured input surface', () => {
-  const result = mapPartsToChatInput([
+test('mapPartsToChatInput: data part is rejected since OpenClaw has no structured input surface', async () => {
+  const result = await mapPartsToChatInput([
     { kind: 'text', text: 'context follows' },
     { kind: 'data', data: { foo: 'bar', n: 42 } },
   ]);
@@ -1128,7 +1155,7 @@ test('handle(): file.uri fails fast with unsupported_file_uri', async () => {
     },
   });
   try {
-    const backend = createOpenclawBackend({ url: fake.url });
+    const backend = createOpenclawBackend({ url: fake.url, fetchUriPolicy: { enabled: false } });
     const frames: UpFrame[] = [];
     const task: TaskAssignFrame = {
       type: 'task.assign',
@@ -1144,6 +1171,7 @@ test('handle(): file.uri fails fast with unsupported_file_uri', async () => {
     const fail = frames.find((f) => f.type === 'task.fail');
     assert.ok(fail);
     assert.equal(fail!.error.code, 'unsupported_file_uri');
+    assert.match(fail!.error.message, /URI fetching is disabled/);
     await new Promise((r) => setTimeout(r, 30));
     assert.equal(chatSendSeen, false);
   } finally {

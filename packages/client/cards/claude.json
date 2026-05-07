@@ -33,7 +33,7 @@
     {
       "id": "chat",
       "name": "chat",
-      "description": "Ask a question or give an instruction in natural language; the Claude Code CLI responds with text. Optionally include inline image (image/{png,jpeg,gif,webp}) or PDF (application/pdf) parts as `file.bytes`.",
+      "description": "Ask a question or give an instruction in natural language; the Claude Code CLI responds with text. Include image (image/{png,jpeg,gif,webp}) or PDF (application/pdf) parts as either `file.bytes` or `file.uri` (https only; bridge fetches under a 5 MiB / default 10 s policy).",
       "tags": ["chat", "assistant", "claude"]
     }
   ]

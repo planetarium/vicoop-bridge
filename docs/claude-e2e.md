@@ -16,7 +16,7 @@ discovery, model behavior on tool use). This guide fills that gap.
 - `claude` on `PATH` and authenticated. Verify with `claude --version`.
 - Repo built: `pnpm install && pnpm --filter @vicoop-bridge/client build`.
 - Network egress to the Anthropic API. Each harness consumes real
-  inference credits; total cost across the four scripts is small (single
+  inference credits; total cost across the five scripts is small (single
   digits of cents at current rates) but non-zero.
 
 The harnesses live under `packages/client/scripts/` and each one is a
@@ -59,7 +59,22 @@ node packages/client/scripts/e2e-claude-input-image.mjs
 
 Expected (≈ 11 s): final assistant text `red`.
 
-### 3. PDF input — `e2e-claude-input-pdf.mjs`
+### 3. URI image input — `e2e-claude-input-image-uri.mjs`
+
+A public 1×1 solid-red PNG URL is sent as a uri-only `FilePart` with no
+inline `bytes`, and the harness asserts the model's reply mentions
+`red`. Confirms bridge clients fetch inbound file URIs before building
+the Claude vision content block.
+
+```bash
+node packages/client/scripts/e2e-claude-input-image-uri.mjs
+# Override the fixture URI:
+E2E_IMAGE_URI=https://example.com/red.png node packages/client/scripts/e2e-claude-input-image-uri.mjs
+```
+
+Expected (≈ 6 s): final assistant text `red`.
+
+### 4. PDF input — `e2e-claude-input-pdf.mjs`
 
 Generates a 1-page PDF on the fly with a known word (default `KUMQUAT`)
 drawn in Helvetica, sends it as a `FilePart` with `mimeType:
@@ -74,7 +89,7 @@ E2E_PDF_WORD=PINEAPPLE node packages/client/scripts/e2e-claude-input-pdf.mjs
 
 Expected (≈ 7 s): final assistant text equals the secret word.
 
-### 4. send_file MCP — `e2e-claude-send-file.mjs`
+### 5. send_file MCP — `e2e-claude-send-file.mjs`
 
 Most complex path. The harness:
 
@@ -172,6 +187,7 @@ present in argv) or is blocked on the first model call. Re-run with
 |---|---|---|
 | Text → text | text-smoke | stream-json stdin envelope, `--session-id`, `result` event parsing |
 | Image FilePart → model | input-image | image content block reaches vision |
+| URI image FilePart → model | input-image-uri | client-side file URI fetch, image content block reaches vision |
 | PDF FilePart → model | input-pdf | document content block reaches doc parser |
 | Model → file artifact | send-file | `--mcp-config` injection, R1 routing, MCP `send_file` tool, bounded read, `task.artifact` round-trip |
 
