@@ -21,15 +21,28 @@ import { saveOwnerSession, defaultStorePath } from './owner-session.js';
 
 type Intent = 'client_register' | 'owner_session';
 
-interface LoginArgs {
-  intent: Intent;
+// Modelled as a discriminated union on `intent` so TypeScript blocks
+// accidental access to `clientName` / `allowedAgentIds` on the
+// owner-session path (where they don't apply) and parseArgs is forced to
+// validate them before constructing a ClientRegisterArgs.
+interface BaseLoginArgs {
   bridge: string;
-  clientName: string;          // unused for owner_session
-  allowedAgentIds: string[];   // unused for owner_session
   envFile: string | null;
   json: boolean;
   pollOnce: boolean; // for tests / CI smoke
 }
+
+interface ClientRegisterArgs extends BaseLoginArgs {
+  intent: 'client_register';
+  clientName: string;
+  allowedAgentIds: string[];
+}
+
+interface OwnerSessionArgs extends BaseLoginArgs {
+  intent: 'owner_session';
+}
+
+type LoginArgs = ClientRegisterArgs | OwnerSessionArgs;
 
 interface DeviceCodeResponse {
   device_code: string;
@@ -101,26 +114,27 @@ function usage(): void {
 }
 
 function parseArgs(args: string[]): LoginArgs | null {
-  const out: Partial<LoginArgs> & { allowedAgentIds: string[] } = {
-    intent: 'client_register',
-    allowedAgentIds: [],
-    envFile: null,
-    json: false,
-    pollOnce: false,
-  };
+  let intent: Intent = 'client_register';
+  let bridge: string | undefined;
+  let clientName: string | undefined;
+  let allowedAgentIds: string[] = [];
+  let envFile: string | null = null;
+  let json = false;
+  let pollOnce = false;
+
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--json') {
-      out.json = true;
+      json = true;
       continue;
     }
     if (a === '--owner-session') {
-      out.intent = 'owner_session';
+      intent = 'owner_session';
       continue;
     }
     if (a === '--poll-once') {
       // Internal: bail after a single poll, regardless of state. Used by tests.
-      out.pollOnce = true;
+      pollOnce = true;
       continue;
     }
     const v = args[i + 1];
@@ -130,17 +144,17 @@ function parseArgs(args: string[]): LoginArgs | null {
     }
     switch (a) {
       case '--bridge':
-        out.bridge = v;
+        bridge = v;
         break;
       case '--client-name':
-        out.clientName = v;
+        clientName = v;
         break;
       case '--agent-ids':
-        out.allowedAgentIds = v.split(',').map((s) => s.trim()).filter(Boolean);
+        allowedAgentIds = v.split(',').map((s) => s.trim()).filter(Boolean);
         break;
       case '--write-env-file':
       case '--env-file':
-        out.envFile = v;
+        envFile = v;
         break;
       default:
         process.stderr.write(`unknown flag: ${a}\n`);
@@ -148,17 +162,19 @@ function parseArgs(args: string[]): LoginArgs | null {
     }
     i++;
   }
-  if (!out.bridge) {
+  if (!bridge) {
     usage();
     return null;
   }
-  if (out.intent === 'client_register') {
-    if (!out.clientName || out.allowedAgentIds.length === 0) {
+  const base = { bridge, envFile, json, pollOnce };
+  if (intent === 'client_register') {
+    if (!clientName || allowedAgentIds.length === 0) {
       usage();
       return null;
     }
+    return { intent, ...base, clientName, allowedAgentIds };
   }
-  return out as LoginArgs;
+  return { intent, ...base };
 }
 
 async function fetchDeviceCode(args: LoginArgs): Promise<DeviceCodeResponse> {
