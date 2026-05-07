@@ -11,7 +11,16 @@
 // and we want feature-parity. Tokens are short-ish (default 90 days) and the
 // CLI re-prompts via login when expired.
 
-import { readFileSync, writeFileSync, chmodSync, mkdirSync, existsSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -33,15 +42,27 @@ export function defaultStorePath(): string {
 
 export function saveOwnerSession(session: OwnerSession, path: string = defaultStorePath()): void {
   const dir = dirname(path);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(path, JSON.stringify(session, null, 2));
-  // chmod 600 so peer processes on a shared host can't read the bearer.
-  // Best-effort — silently ignore on filesystems without POSIX modes.
+  // mkdirSync's `mode` only applies to directories actually created here;
+  // pre-existing dirs keep their permissions. The bearer's defence-in-depth
+  // is the file mode we set below.
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+  // Write to a temp sibling at mode 0o600, then rename. Rationale:
+  //   * openSync's mode arg is only honoured on creation, so if `path` already
+  //     exists with looser perms (e.g. a legacy save), opening it with 'w'
+  //     would leave the old mode in place.
+  //   * write-then-chmod creates a window where the file is world-readable
+  //     under a permissive umask — exactly what the review flagged.
+  // Writing fresh + atomic rename avoids both: the resulting file is always
+  // mode 0o600 with no partial-write state visible on the canonical path.
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  const fd = openSync(tmp, 'wx', 0o600);
   try {
-    chmodSync(path, 0o600);
-  } catch {
-    // ignore
+    writeFileSync(fd, JSON.stringify(session, null, 2));
+  } finally {
+    closeSync(fd);
   }
+  renameSync(tmp, path);
 }
 
 export function loadOwnerSession(path: string = defaultStorePath()): OwnerSession | null {

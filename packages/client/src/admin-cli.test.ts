@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   runAddCaller,
   runListAgents,
@@ -58,11 +61,15 @@ function installFetch(t: { after: (fn: () => void) => void }, response: {
   return { calls };
 }
 
-function withEnv(t: { after: (fn: () => void) => void }, env: Record<string, string>): void {
+function withEnv(
+  t: { after: (fn: () => void) => void },
+  env: Record<string, string | undefined>,
+): void {
   const prev: Record<string, string | undefined> = {};
   for (const [k, v] of Object.entries(env)) {
     prev[k] = process.env[k];
-    process.env[k] = v;
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
   }
   t.after(() => {
     for (const [k, v] of Object.entries(prev)) {
@@ -194,34 +201,32 @@ test('list-callers GETs the agent endpoint', async (t) => {
 });
 
 test('subcommand exits 1 with hint when no token is available', async (t) => {
-  // Wipe both env and the default file lookup. We can't easily redirect the
-  // file path without exposing a hook, so just unset the env and rely on the
-  // user not having a stale ~/.vicoop/owner-session.json — gate on the message
-  // structure rather than the exact failure mode.
-  withEnv(t, {});
-  delete process.env.VICOOP_OWNER_TOKEN;
-  delete process.env.VICOOP_BRIDGE;
+  // Hermetic missing-auth: redirect HOME (and USERPROFILE on Windows) to an
+  // empty temp dir so os.homedir() resolves into a location without an
+  // owner-session.json — independent of whether the developer running these
+  // tests has one in their real home. With env unset and the file lookup
+  // pointing at an empty dir, resolveOwnerSession returns null deterministically.
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-no-token-'));
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+  withEnv(t, {
+    HOME: tmpHome,
+    USERPROFILE: tmpHome,
+    VICOOP_OWNER_TOKEN: undefined,
+    VICOOP_BRIDGE: undefined,
+  });
   const stderr = captureStderr(t);
 
-  // Fetch should not be called when auth is missing; install a guard.
+  // Fetch must not be called when auth is missing; throw if it is so the
+  // assertion fails loudly rather than silently masking a regression.
   const original = globalThis.fetch;
-  let fetchCalled = false;
   globalThis.fetch = (async () => {
-    fetchCalled = true;
-    return new Response('', { status: 200 });
+    throw new Error('fetch should not be called when no owner-session is available');
   }) as typeof fetch;
   t.after(() => {
     globalThis.fetch = original;
   });
 
   const code = await runListAgents([]);
-  // If the developer running tests has a real owner-session file, the call
-  // would actually go out — skip the assertion in that case rather than
-  // failing on environment leakage.
-  if (fetchCalled) {
-    t.skip('developer has a stored owner-session.json — env-only assertion would be unsafe');
-    return;
-  }
   assert.equal(code, 1);
   assert.match(stderr.read(), /vicoop-client login --owner-session/);
 });
