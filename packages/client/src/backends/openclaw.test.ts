@@ -2515,4 +2515,230 @@ test('sendFileMcp: not configured -> getSendFileMcpServer() stays null even afte
   }
 });
 
+test('heartbeat: emits task.status after heartbeatMs of silence and stops at terminal time', async () => {
+  // Initialize as a no-op so the type stays `() => void` instead of
+  // `(() => void) | null`. The closure-mutation path through setIntervalFn
+  // confuses TS narrowing — easier to start callable.
+  let scheduledFn: () => void = () => {};
+  let scheduled = false;
+  let cleared = false;
+  let nowMs = 1_000_000;
+
+  // Hold the chat.send ack so the task stays mid-flight while we drive
+  // heartbeat ticks before the run terminates and clears the interval.
+  let releaseFinish: () => void = () => {};
+  const finishReady = new Promise<void>((r) => {
+    releaseFinish = r;
+  });
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method !== 'chat.send') return;
+      void (async () => {
+        await finishReady;
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId: 'run-hb', status: 'started' },
+          }),
+        );
+        setImmediate(() => {
+          fake.emitChat(sock, {
+            runId: 'run-hb',
+            sessionKey: 'agent:main:ctx-t1',
+            seq: 1,
+            state: 'final',
+            message: { text: 'done' },
+          });
+        });
+      })();
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({
+      url: fake.url,
+      heartbeatMs: 100,
+      now: () => nowMs,
+      setIntervalFn: (fn) => {
+        scheduledFn = fn;
+        scheduled = true;
+        return { tag: 'fake-interval' };
+      },
+      clearIntervalFn: () => {
+        cleared = true;
+      },
+    });
+    const frames: UpFrame[] = [];
+    const runP = backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), NEVER);
+
+    // Wait for ensureConnected + sessions.messages.subscribe + chat.send
+    // to land before driving ticks. 50ms is enough on loopback.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok(scheduled, 'heartbeat must register a setInterval handler');
+
+    const countStatus = () => frames.filter((f) => f.type === 'task.status').length;
+    assert.equal(countStatus(), 1, 'only the initial task.status: working has been emitted');
+
+    // Tick with no elapsed time → silence < heartbeat → skip.
+    scheduledFn();
+    assert.equal(countStatus(), 1);
+
+    // Advance past the heartbeat threshold → tick must emit one status.
+    nowMs += 250;
+    scheduledFn();
+    assert.equal(countStatus(), 2);
+
+    // Subsequent tick at the same instant must NOT double-fire — the prior
+    // emit refreshed lastEmitAt through the wrapped emitter.
+    scheduledFn();
+    assert.equal(countStatus(), 2);
+
+    // Real traffic also resets the silence window. Let the gateway send
+    // its ack + final event.
+    releaseFinish();
+    await runP;
+
+    assert.ok(cleared, 'heartbeat handle must be cleared at terminal time');
+    // After the terminal frame, no more status frames may be added even if
+    // a stale tick fires (the `terminalSettled` guard inside the closure
+    // protects against this — exercise it explicitly).
+    scheduledFn();
+    const lastStatusAfterTerminal = countStatus();
+    assert.equal(
+      lastStatusAfterTerminal,
+      2,
+      'no heartbeat allowed after terminal frame',
+    );
+  } finally {
+    await fake.close();
+  }
+});
+
+test('heartbeat: heartbeatMs:0 disables the interval entirely', async () => {
+  let registered = false;
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method !== 'chat.send') return;
+      sock.send(
+        JSON.stringify({
+          type: 'res',
+          id: req.id,
+          ok: true,
+          payload: { runId: 'run-hb0', status: 'started' },
+        }),
+      );
+      setImmediate(() => {
+        fake.emitChat(sock, {
+          runId: 'run-hb0',
+          sessionKey: 'agent:main:ctx-t1',
+          seq: 1,
+          state: 'final',
+          message: { text: 'ok' },
+        });
+      });
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({
+      url: fake.url,
+      heartbeatMs: 0,
+      setIntervalFn: () => {
+        registered = true;
+        return null;
+      },
+      clearIntervalFn: () => {},
+    });
+    await backend.handle(makeTask('t1', 'hi'), () => {}, NEVER);
+    assert.equal(registered, false, 'heartbeatMs:0 must skip setInterval registration');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('heartbeat: suppressed after signal.abort so canceled tasks do not look like they are still working', async () => {
+  let scheduledFn: () => void = () => {};
+  let nowMs = 1_000_000;
+  let activeRunId: string | null = null;
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        activeRunId = `run-${(req.params as { idempotencyKey: string }).idempotencyKey}`;
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId: activeRunId, status: 'started' },
+          }),
+        );
+        // Stay silent — the test drives the run to abort.
+      }
+      if (req.method === 'chat.abort') {
+        sock.send(JSON.stringify({ type: 'res', id: req.id, ok: true, payload: {} }));
+        setImmediate(() => {
+          fake.emitChat(sock, {
+            runId: activeRunId,
+            sessionKey: 'agent:main:ctx-t1',
+            seq: 2,
+            state: 'aborted',
+          });
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({
+      url: fake.url,
+      heartbeatMs: 100,
+      now: () => nowMs,
+      setIntervalFn: (fn) => {
+        scheduledFn = fn;
+        return { tag: 'fake-interval' };
+      },
+      clearIntervalFn: () => {},
+    });
+    const controller = new AbortController();
+    const frames: UpFrame[] = [];
+    const runP = backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), controller.signal);
+    // Let the chat.send round-trip land.
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Sanity: the heartbeat fires while the task is still working.
+    nowMs += 250;
+    scheduledFn();
+    const before = frames.filter((f) => f.type === 'task.status').length;
+    assert.ok(
+      before >= 2,
+      'heartbeat must emit at least one extra task.status while working',
+    );
+
+    // Abort. Subsequent heartbeat ticks must NOT add more `state: working`
+    // status frames — the run is on its way to a `canceled` terminal frame.
+    controller.abort();
+    nowMs += 250;
+    scheduledFn();
+    nowMs += 250;
+    scheduledFn();
+
+    await runP;
+
+    const workingStatusCount = frames.filter(
+      (f) =>
+        f.type === 'task.status' &&
+        (f as Extract<UpFrame, { type: 'task.status' }>).status.state === 'working',
+    ).length;
+    assert.equal(
+      workingStatusCount,
+      before,
+      'no extra working-state heartbeats may land between abort and terminal frame',
+    );
+    const last = frames.at(-1) as Extract<UpFrame, { type: 'task.complete' }>;
+    assert.equal(last.type, 'task.complete');
+    assert.equal(last.status.state, 'canceled');
+  } finally {
+    await fake.close();
+  }
+});
+
 export { createFakeGateway, makeTask };
