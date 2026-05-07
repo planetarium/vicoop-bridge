@@ -1,8 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { Part, TaskAssignFrame, UpFrame } from '@vicoop-bridge/protocol';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { WebSocketServer, type WebSocket } from 'ws';
+import {
+  parseUpFrame,
+  type Part,
+  type TaskAssignFrame,
+  type UpFrame,
+} from '@vicoop-bridge/protocol';
 import type { Backend, Emit } from './backend.js';
-import { processTask, summarizeParts } from './client.js';
+import { Client, processTask, summarizeParts } from './client.js';
 import { type ConsoleSink, createLogger } from './logger.js';
 
 interface CapturedSink {
@@ -51,6 +59,38 @@ function makeAssign(taskId: string): TaskAssignFrame {
 
 function backendOf(name: string, handle: Backend['handle']): Backend {
   return { name, handle };
+}
+
+async function listen(server: Server): Promise<string> {
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address() as AddressInfo;
+  return `ws://127.0.0.1:${addr.port}`;
+}
+
+async function closeServer(server: Server, wss: WebSocketServer): Promise<void> {
+  for (const client of wss.clients) client.terminate();
+  await new Promise<void>((resolve, reject) => {
+    wss.close((wssErr) => {
+      server.close((serverErr) => {
+        const err = wssErr ?? serverErr;
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  });
+}
+
+async function waitFor(
+  predicate: () => boolean,
+  message: string,
+  timeoutMs = 1000,
+): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.fail(message);
 }
 
 test('summarizeParts: empty', () => {
@@ -116,6 +156,52 @@ test('summarizeParts: does not include user-supplied content', () => {
   ];
   const summary = summarizeParts(parts);
   assert.equal(summary.includes(secret), false);
+});
+
+test('Client reconnects after WebSocket close and sends hello again', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  const connections: WebSocket[] = [];
+  const hellos: UpFrame[] = [];
+  wss.on('connection', (ws) => {
+    connections.push(ws);
+    ws.on('message', (raw) => {
+      hellos.push(parseUpFrame(typeof raw === 'string' ? raw : raw.toString('utf8')));
+    });
+  });
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => {
+      /* no tasks in this test */
+    }),
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    reconnectStableMs: 0,
+    heartbeatIntervalMs: 0,
+  });
+
+  try {
+    client.start();
+    await waitFor(() => hellos.length === 1, 'expected initial hello');
+    connections[0]!.close(1012, 'service restart');
+    await waitFor(() => hellos.length === 2, 'expected hello after reconnect');
+    for (const frame of hellos) {
+      assert.equal(frame.type, 'hello');
+      if (frame.type === 'hello') {
+        assert.equal(frame.agentId, 'agent-1');
+        assert.equal(frame.token, 'client-token');
+      }
+    }
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
 });
 
 // processTask lifecycle tests — exercise the runTask body directly with
