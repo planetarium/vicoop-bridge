@@ -78,10 +78,6 @@ function parseArgs(args: string[]): LoginArgs | null {
   };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '-h' || a === '--help') {
-      usage();
-      return null;
-    }
     if (a === '--json') {
       out.json = true;
       continue;
@@ -211,6 +207,11 @@ function writeEnvFile(path: string, success: TokenSuccessResponse, bridgeUrl: st
 }
 
 export async function runLogin(args: string[]): Promise<number> {
+  if (args.includes('-h') || args.includes('--help')) {
+    usage();
+    return 0;
+  }
+
   const parsed = parseArgs(args);
   if (!parsed) return 1;
 
