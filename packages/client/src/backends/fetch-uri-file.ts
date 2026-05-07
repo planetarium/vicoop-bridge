@@ -257,7 +257,11 @@ function fetchPinnedToAddress(url: URL, address: string, signal: AbortSignal): P
       path: `${url.pathname}${url.search}`,
       method: 'GET',
       servername: stripIpv6Brackets(url.hostname),
-      lookup: (_hostname, _options, cb) => {
+      lookup: (_hostname, options, cb) => {
+        if (typeof options === 'object' && options?.all) {
+          cb(null, [{ address, family }]);
+          return;
+        }
         cb(null, address, family);
       },
     });
