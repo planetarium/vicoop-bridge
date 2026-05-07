@@ -17,6 +17,11 @@ import {
   type SendFileMcpServer,
   type SendFileMcpOptions,
 } from './send-file-mcp.js';
+import {
+  FetchUriError,
+  fetchUriToBytes,
+  type FetchUriPolicy,
+} from './fetch-uri-file.js';
 import { clientVersion } from '../version.js';
 
 const execFileP = promisify(execFile);
@@ -353,8 +358,10 @@ class GatewayClient {
 // reject non-image mimes server-side; we do not pre-filter here because the
 // rejection should be surfaced as a gateway error, not silently swallowed.
 //
-// Out of scope: `file.uri` (requires fetching with caller auth) and
-// `kind: 'data'` (no structured-input surface on OpenClaw).
+// `file.uri` inputs are fetched by the bridge under the shared inbound file
+// safety policy, then forwarded as the same base64 attachment shape as
+// caller-inline `file.bytes`. `kind: 'data'` remains out of scope because
+// OpenClaw has no structured-input surface for it.
 interface OpenclawChatInput {
   message: string;
   attachments: Array<{
@@ -376,9 +383,11 @@ function isImageMime(mime: string | undefined): boolean {
 
 // Exported for unit testing; shape matches what `handle()` feeds into
 // `chat.send` (minus `sessionKey` / `idempotencyKey` / `thinking`).
-export function mapPartsToChatInput(
+export async function mapPartsToChatInput(
   parts: Part[],
-): { ok: true; input: OpenclawChatInput } | { ok: false; error: PartMappingError } {
+  fetchUriPolicy?: FetchUriPolicy,
+  signal: AbortSignal = new AbortController().signal,
+): Promise<{ ok: true; input: OpenclawChatInput } | { ok: false; error: PartMappingError }> {
   const textBits: string[] = [];
   const attachments: OpenclawChatInput['attachments'] = [];
   for (const [idx, p] of parts.entries()) {
@@ -388,22 +397,31 @@ export function mapPartsToChatInput(
     }
     if (p.kind === 'file') {
       const f = p.file;
-      // uri requires fetching and may need caller auth — out of scope for
-      // this backend. Reject explicitly so callers know to inline bytes.
-      if (f.uri !== undefined) {
-        return {
-          ok: false,
-          error: {
-            code: 'unsupported_file_uri',
-            message: `part[${idx}]: file.uri is not supported by the openclaw backend; inline the file as base64 bytes instead`,
-          },
-        };
+      let bytes = f.bytes;
+      let mimeType = f.mimeType;
+      if (bytes === undefined && f.uri !== undefined && fetchUriPolicy?.enabled !== false) {
+        try {
+          const fetched = await fetchUriToBytes(f.uri, f.mimeType, fetchUriPolicy, signal);
+          bytes = fetched.bytes;
+          mimeType = fetched.mimeType;
+        } catch (err) {
+          if (err instanceof FetchUriError) {
+            return {
+              ok: false,
+              error: { code: err.code, message: `part[${idx}]: ${err.message}` },
+            };
+          }
+          return {
+            ok: false,
+            error: { code: 'fetch_failed', message: `part[${idx}]: ${errorMessage(err)}` },
+          };
+        }
       }
-      if (f.bytes === undefined) {
+      if (bytes === undefined) {
         return {
           ok: false,
           error: {
-            code: 'invalid_file_part',
+            code: f.uri !== undefined ? 'unsupported_file_uri' : 'invalid_file_part',
             message: `part[${idx}]: file part must carry either bytes or uri`,
           },
         };
@@ -411,7 +429,7 @@ export function mapPartsToChatInput(
       // mimeType is required so the gateway can sniff/route correctly.
       // Without it, OpenClaw's mime-resolution falls back to label-derived
       // guessing which is unreliable for arbitrary callers.
-      if (typeof f.mimeType !== 'string' || f.mimeType.length === 0) {
+      if (typeof mimeType !== 'string' || mimeType.length === 0) {
         return {
           ok: false,
           error: {
@@ -421,10 +439,10 @@ export function mapPartsToChatInput(
         };
       }
       attachments.push({
-        type: isImageMime(f.mimeType) ? 'image' : 'file',
-        mimeType: f.mimeType,
+        type: isImageMime(mimeType) ? 'image' : 'file',
+        mimeType,
         ...(f.name !== undefined ? { fileName: f.name } : {}),
-        content: f.bytes,
+        content: bytes,
       });
       continue;
     }
@@ -547,6 +565,11 @@ export interface OpenclawBackendOptions {
   /** Test seam: timer impls. Defaults to global setInterval/clearInterval. */
   setIntervalFn?: (fn: () => void, ms: number) => unknown;
   clearIntervalFn?: (handle: unknown) => void;
+  /**
+   * Fetch uri-only inbound FileParts under the shared HTTPS/SSRF/size/MIME
+   * policy. Enabled by default; set enabled:false to require inline bytes.
+   */
+  fetchUriPolicy?: FetchUriPolicy;
 }
 
 const DEFAULT_ATTACH_OUTPUTS_MAX_BYTES = 20 * 1024 * 1024;
@@ -1203,7 +1226,7 @@ export function createOpenclawBackend(
       // Validate and normalize A2A parts BEFORE touching the gateway so
       // malformed input fails fast without opening a WS or consuming a
       // session slot.
-      const mapped = mapPartsToChatInput(task.message.parts);
+      const mapped = await mapPartsToChatInput(task.message.parts, opts.fetchUriPolicy, signal);
       if (!mapped.ok) {
         emit({
           type: 'task.fail',

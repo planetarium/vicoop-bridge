@@ -7,6 +7,13 @@ import {
   type SendFileMcpOptions,
   type SendFileMcpServer,
 } from './send-file-mcp.js';
+import {
+  FetchUriError,
+  fetchUriToBytes,
+  INPUT_FILE_MAX_BYTES,
+  INPUT_IMAGE_MIME,
+  type FetchUriPolicy,
+} from './fetch-uri-file.js';
 
 // Slim subset of ChildProcess that the backend actually uses. Tests inject a
 // fake that satisfies this without wiring up a real OS process.
@@ -61,6 +68,9 @@ export interface ClaudeBackendOptions {
   // Test seam: timer impls. Defaults to global setInterval/clearInterval.
   setIntervalFn?: (fn: () => void, ms: number) => unknown;
   clearIntervalFn?: (handle: unknown) => void;
+  // Fetch uri-only inbound FileParts under the shared HTTPS/SSRF/size/MIME
+  // policy. Enabled by default; set enabled:false to require inline bytes.
+  fetchUriPolicy?: FetchUriPolicy;
 }
 
 interface SessionEntry {
@@ -112,15 +122,6 @@ type InputContentBlock =
       type: 'image' | 'document';
       source: { type: 'base64'; media_type: string; data: string };
     };
-
-const INPUT_IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
-
-// Hard cap on a single inbound FilePart's decoded size. base64 in the
-// stream-json envelope expands ~4/3, and the model context plus per-call
-// API limits make multi-megabyte attachments expensive even when accepted.
-// Reject above this with a stable code rather than silently embedding a
-// huge payload.
-const INPUT_FILE_MAX_BYTES = 5 * 1024 * 1024;
 
 // Hard cap on a single tool_result media block's decoded size before
 // it becomes an outbound A2A FilePart. Prevents a misbehaving tool
@@ -362,11 +363,15 @@ function extractToolResultMediaParts(content: unknown): Part[] {
   return out;
 }
 
-function mapPartsToContentBlocks(
+async function mapPartsToContentBlocks(
   parts: readonly Part[],
+  fetchUriPolicy: FetchUriPolicy | undefined,
+  signal: AbortSignal,
 ):
-  | { ok: true; blocks: InputContentBlock[]; inboundHashes: Set<string> }
-  | { ok: false; code: string; message: string } {
+  Promise<
+    | { ok: true; blocks: InputContentBlock[]; inboundHashes: Set<string> }
+    | { ok: false; code: string; message: string }
+  > {
   const blocks: InputContentBlock[] = [];
   // SHA-256 (hex) of every accepted FilePart's decoded bytes. Used by the
   // tool_result passthrough to skip echoes — if the model Reads a caller-
@@ -380,16 +385,32 @@ function mapPartsToContentBlocks(
       continue;
     }
     if (p.kind === 'file') {
-      // uri-only FilePart is not supported — fetching is the responsibility
-      // of a different backend or the caller. Reject with a stable code.
-      if (!p.file.bytes) {
+      let bytes = p.file.bytes;
+      let mime = p.file.mimeType ?? '';
+      if (!bytes && p.file.uri && fetchUriPolicy?.enabled !== false) {
+        try {
+          const fetched = await fetchUriToBytes(p.file.uri, p.file.mimeType, fetchUriPolicy, signal);
+          bytes = fetched.bytes;
+          mime = fetched.mimeType;
+        } catch (err) {
+          if (err instanceof FetchUriError) {
+            return { ok: false, code: err.code, message: err.message };
+          }
+          return {
+            ok: false,
+            code: 'fetch_failed',
+            message: errorMessage(err),
+          };
+        }
+      }
+      if (!bytes) {
         return {
           ok: false,
           code: 'unsupported_file_uri',
-          message: 'claude backend requires inline FilePart bytes; uri-only is not supported',
+          message: 'claude backend requires inline FilePart bytes or fetchable file.uri',
         };
       }
-      const decodedSize = decodedBase64Size(p.file.bytes);
+      const decodedSize = decodedBase64Size(bytes);
       if (decodedSize > INPUT_FILE_MAX_BYTES) {
         return {
           ok: false,
@@ -397,16 +418,15 @@ function mapPartsToContentBlocks(
           message: `FilePart exceeds INPUT_FILE_MAX_BYTES (${decodedSize} > ${INPUT_FILE_MAX_BYTES})`,
         };
       }
-      const mime = p.file.mimeType ?? '';
       if (INPUT_IMAGE_MIME.has(mime)) {
         blocks.push({
           type: 'image',
-          source: { type: 'base64', media_type: mime, data: p.file.bytes },
+          source: { type: 'base64', media_type: mime, data: bytes },
         });
       } else if (mime === 'application/pdf') {
         blocks.push({
           type: 'document',
-          source: { type: 'base64', media_type: mime, data: p.file.bytes },
+          source: { type: 'base64', media_type: mime, data: bytes },
         });
       } else {
         return {
@@ -415,7 +435,7 @@ function mapPartsToContentBlocks(
           message: `claude backend accepts image/{png,jpeg,webp,gif} or application/pdf (got ${mime || 'unknown'})`,
         };
       }
-      inboundHashes.add(sha256OfBase64(p.file.bytes));
+      inboundHashes.add(sha256OfBase64(bytes));
       continue;
     }
     return {
@@ -518,7 +538,7 @@ export function createClaudeBackend(
         return;
       }
 
-      const mapped = mapPartsToContentBlocks(task.message.parts);
+      const mapped = await mapPartsToContentBlocks(task.message.parts, opts.fetchUriPolicy, signal);
       if (!mapped.ok) {
         emit({
           type: 'task.fail',

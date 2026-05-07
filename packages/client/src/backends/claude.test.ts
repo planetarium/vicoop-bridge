@@ -375,8 +375,9 @@ test('rejects FilePart whose decoded bytes exceed INPUT_FILE_MAX_BYTES (5 MiB)',
   assert.equal(fail.error.code, 'file_too_large');
 });
 
-test('rejects FilePart with uri-only (no inline bytes)', async () => {
+test('rejects FilePart with uri-only when URI fetching is disabled', async () => {
   const backend = createClaudeBackend({
+    fetchUriPolicy: { enabled: false },
     spawn: () => {
       throw new Error('should not spawn');
     },
@@ -397,6 +398,78 @@ test('rejects FilePart with uri-only (no inline bytes)', async () => {
   const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
   assert.ok(fail);
   assert.equal(fail.error.code, 'unsupported_file_uri');
+});
+
+test('stdin envelope: URI FilePart is fetched and mapped like inline image bytes', async () => {
+  const png = Buffer.from('png-bytes');
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    fetchUriPolicy: {
+      fetchImpl: async () =>
+        new Response(png, {
+          headers: {
+            'content-type': 'image/png',
+            'content-length': String(png.length),
+          },
+        }),
+      resolveHost: async () => ['93.184.216.34'],
+    },
+  });
+  const task: TaskAssignFrame = {
+    type: 'task.assign',
+    taskId: 't',
+    contextId: 'c',
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [{ kind: 'file', file: { mimeType: 'image/png', uri: 'https://example.com/x.png' } }],
+    },
+  };
+  await backend.handle(task, collect().emit, NEVER);
+
+  const child = fake.lastChild()!;
+  const env = JSON.parse(child.stdinPayload.trim()) as {
+    message: { content: Array<{ type: string; source?: { media_type: string; data: string } }> };
+  };
+  assert.equal(env.message.content.length, 1);
+  assert.equal(env.message.content[0].type, 'image');
+  assert.equal(env.message.content[0].source!.media_type, 'image/png');
+  assert.equal(env.message.content[0].source!.data, png.toString('base64'));
+});
+
+test('rejects URI FilePart when host resolves to a private address', async () => {
+  let spawned = 0;
+  const backend = createClaudeBackend({
+    spawn: () => {
+      spawned++;
+      throw new Error('should not spawn');
+    },
+    fetchUriPolicy: {
+      fetchImpl: async () => new Response(Buffer.from('unused'), { headers: { 'content-type': 'image/png' } }),
+      resolveHost: async () => ['10.0.0.1'],
+    },
+  });
+  const { emit, frames } = collect();
+  const task: TaskAssignFrame = {
+    type: 'task.assign',
+    taskId: 't',
+    contextId: 'c',
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [{ kind: 'file', file: { mimeType: 'image/png', uri: 'https://example.com/x.png' } }],
+    },
+  };
+  await backend.handle(task, emit, NEVER);
+
+  assert.equal(spawned, 0);
+  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
+  assert.ok(fail);
+  assert.equal(fail.error.code, 'fetch_blocked_host');
 });
 
 test('already-aborted signal short-circuits before spawn', async () => {
