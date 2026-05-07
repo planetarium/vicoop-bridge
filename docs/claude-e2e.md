@@ -193,8 +193,7 @@ progress from execution trace details:
   out for that many ms. Disabled with `heartbeatMs: 0`. Backstop for
   any future case where work happens without an interleaved model turn.
 - When the caller opts into the Traceability Extension with
-  `X-A2A-Extensions:
-  https://github.com/a2aproject/a2a-samples/extensions/traceability/v1`,
+  `X-A2A-Extensions: https://github.com/a2aproject/a2a-samples/extensions/traceability/v1`,
   `tool_use` blocks inside an `assistant` event become
   `claude-tool-call` artifacts. Each artifact carries a head-truncated
   `<tool>: <input>` text part (<= 200 chars — **size guard only**, not a

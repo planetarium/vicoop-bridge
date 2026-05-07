@@ -759,12 +759,14 @@ export function createClaudeBackend(
           // model said" before "what tools it then called", matching the
           // visible CLI ordering inside that turn.
           emitAssistantArtifact(extractAssistantText(evt.message.content));
+          if (!emitTraceArtifacts) return;
           for (const tu of extractAssistantToolUses(evt.message.content)) {
             emitToolCallArtifact(tu);
           }
           return;
         }
         if (evt.type === 'user') {
+          if (!emitTraceArtifacts) return;
           // tool_result events come in as a synthetic user message in the
           // stream-json transcript; pull out any image/document blocks and
           // emit them as A2A FileParts. Text-only tool results are skipped.

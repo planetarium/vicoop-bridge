@@ -54,7 +54,12 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     '*',
     cors({
       origin: (origin) => origin ?? '',
-      allowHeaders: ['Authorization', 'Content-Type'],
+      allowHeaders: [
+        'Authorization',
+        'Content-Type',
+        A2A_EXTENSIONS_HEADER,
+        A2A_EXTENSIONS_LEGACY_HEADER,
+      ],
       allowMethods: ['GET', 'POST', 'OPTIONS'],
       credentials: true,
       maxAge: 600,
