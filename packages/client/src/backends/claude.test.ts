@@ -437,7 +437,7 @@ test('stdin envelope: URI FilePart is fetched and mapped like inline image bytes
   const backend = createClaudeBackend({
     spawn: fake.spawn,
     fetchUriPolicy: {
-      fetchImpl: async () =>
+      fetchImplForTest: async () =>
         new Response(png, {
           headers: {
             'content-type': 'image/png',
@@ -477,7 +477,7 @@ test('rejects URI FilePart when host resolves to a private address', async () =>
       throw new Error('should not spawn');
     },
     fetchUriPolicy: {
-      fetchImpl: async () => new Response(Buffer.from('unused'), { headers: { 'content-type': 'image/png' } }),
+      fetchImplForTest: async () => new Response(Buffer.from('unused'), { headers: { 'content-type': 'image/png' } }),
       resolveHost: async () => ['10.0.0.1'],
     },
   });

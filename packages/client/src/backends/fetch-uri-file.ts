@@ -26,7 +26,9 @@ export interface FetchUriPolicy {
   enabled?: boolean;
   timeoutMs?: number;
   maxRedirects?: number;
-  fetchImpl?: typeof fetch;
+  // Test seam only. Production uses the pinned-IP HTTPS path so DNS cannot
+  // be resolved again after the SSRF policy check.
+  fetchImplForTest?: typeof fetch;
   resolveHost?: (hostname: string) => Promise<string[]>;
 }
 
@@ -238,11 +240,7 @@ function headersFromIncoming(headers: Record<string, string | string[] | undefin
   return out;
 }
 
-function fetchPinned(url: URL, addresses: readonly string[], signal: AbortSignal): Promise<Response> {
-  const address = addresses[0];
-  if (!address) {
-    return Promise.reject(new FetchUriError('fetch_failed', `failed to resolve ${url.hostname}`));
-  }
+function fetchPinnedToAddress(url: URL, address: string, signal: AbortSignal): Promise<Response> {
   const family = net.isIP(address);
   return new Promise<Response>((resolve, reject) => {
     let activeResponse: Readable | null = null;
@@ -284,6 +282,19 @@ function fetchPinned(url: URL, addresses: readonly string[], signal: AbortSignal
   });
 }
 
+async function fetchPinned(url: URL, addresses: readonly string[], signal: AbortSignal): Promise<Response> {
+  let lastErr: unknown = null;
+  for (const address of addresses) {
+    throwIfAborted(signal);
+    try {
+      return await fetchPinnedToAddress(url, address, signal);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr ?? new FetchUriError('fetch_failed', `failed to resolve ${url.hostname}`);
+}
+
 async function responseStreamToBase64(res: Response, maxBytes: number): Promise<string> {
   const body = res.body;
   if (!body) {
@@ -317,7 +328,7 @@ export async function fetchUriToBytes(
 ): Promise<FetchedUriFile> {
   const timeoutMs = policy?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxRedirects = policy?.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
-  const fetchImpl = policy?.fetchImpl;
+  const fetchImplForTest = policy?.fetchImplForTest;
   const resolveHost = policy?.resolveHost ?? defaultResolveHost;
   let current: URL;
   try {
@@ -332,8 +343,8 @@ export async function fetchUriToBytes(
       const addresses = await validateUrlForFetch(current, resolveHost, timeout.signal);
       let res: Response;
       try {
-        res = fetchImpl
-          ? await fetchImpl(current, { redirect: 'manual', signal: timeout.signal })
+        res = fetchImplForTest
+          ? await fetchImplForTest(current, { redirect: 'manual', signal: timeout.signal })
           : await fetchPinned(current, addresses, timeout.signal);
       } catch (err) {
         throw new FetchUriError('fetch_failed', `failed to fetch file.uri (${current.hostname})`, { cause: err });

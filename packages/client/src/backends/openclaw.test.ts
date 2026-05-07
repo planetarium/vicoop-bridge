@@ -920,7 +920,7 @@ test('mapPartsToChatInput: file.uri is fetched and mapped to an attachment', asy
   const result = await mapPartsToChatInput(
     [{ kind: 'file', file: { name: 'doc.pdf', mimeType: 'application/pdf', uri: 'https://example.com/doc.pdf' } }],
     {
-      fetchImpl: async () =>
+      fetchImplForTest: async () =>
         new Response(body, {
           headers: {
             'content-type': 'application/pdf',

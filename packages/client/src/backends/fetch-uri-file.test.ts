@@ -11,7 +11,7 @@ test('fetchUriToBytes: fetches supported https content as base64', async () => {
     'https://example.com/x.png',
     'image/png',
     {
-      fetchImpl: async () =>
+      fetchImplForTest: async () =>
         new Response(body, {
           headers: { 'content-type': 'image/png', 'content-length': String(body.length) },
         }),
@@ -30,7 +30,7 @@ test('fetchUriToBytes: blocks non-https schemes before fetch', async () => {
       'file:///etc/passwd',
       'image/png',
       {
-        fetchImpl: async () => {
+        fetchImplForTest: async () => {
           fetched = true;
           return new Response(Buffer.from('unused'), { headers: { 'content-type': 'image/png' } });
         },
@@ -49,7 +49,7 @@ test('fetchUriToBytes: blocks hosts resolving to private addresses', async () =>
       'https://example.com/x.png',
       'image/png',
       {
-        fetchImpl: async () => new Response(Buffer.from('unused'), { headers: { 'content-type': 'image/png' } }),
+        fetchImplForTest: async () => new Response(Buffer.from('unused'), { headers: { 'content-type': 'image/png' } }),
         resolveHost: async () => ['169.254.169.254'],
       },
       NEVER,
@@ -64,7 +64,7 @@ test('fetchUriToBytes: blocks direct IPv6 loopback hosts', async () => {
       'https://[::1]/x.png',
       'image/png',
       {
-        fetchImpl: async () => new Response(Buffer.from('unused'), { headers: { 'content-type': 'image/png' } }),
+        fetchImplForTest: async () => new Response(Buffer.from('unused'), { headers: { 'content-type': 'image/png' } }),
       },
       NEVER,
     ),
@@ -79,7 +79,7 @@ test('fetchUriToBytes: timeout bounds hostname resolution', async () => {
       'image/png',
       {
         timeoutMs: 5,
-        fetchImpl: async () => new Response(Buffer.from('unused'), { headers: { 'content-type': 'image/png' } }),
+        fetchImplForTest: async () => new Response(Buffer.from('unused'), { headers: { 'content-type': 'image/png' } }),
         resolveHost: async () => new Promise<string[]>(() => undefined),
       },
       NEVER,
@@ -94,7 +94,7 @@ test('fetchUriToBytes: revalidates redirect targets', async () => {
       'https://example.com/start',
       'image/png',
       {
-        fetchImpl: async () =>
+        fetchImplForTest: async () =>
           new Response(null, {
             status: 302,
             headers: { location: 'https://private.example/x.png' },
@@ -113,7 +113,7 @@ test('fetchUriToBytes: rejects Content-Length over the inbound cap', async () =>
       'https://example.com/x.png',
       'image/png',
       {
-        fetchImpl: async () =>
+        fetchImplForTest: async () =>
           new Response(Buffer.from('unused'), {
             headers: { 'content-type': 'image/png', 'content-length': String(6 * 1024 * 1024) },
           }),
@@ -131,7 +131,7 @@ test('fetchUriToBytes: rejects responses that exceed the inbound cap while strea
       'https://example.com/x.png',
       'image/png',
       {
-        fetchImpl: async () =>
+        fetchImplForTest: async () =>
           new Response(Buffer.alloc(INPUT_FILE_MAX_BYTES + 1), {
             headers: { 'content-type': 'image/png' },
           }),
@@ -149,7 +149,7 @@ test('fetchUriToBytes: rejects empty response bodies', async () => {
       'https://example.com/x.png',
       'image/png',
       {
-        fetchImpl: async () =>
+        fetchImplForTest: async () =>
           new Response(null, {
             headers: { 'content-type': 'image/png' },
           }),
@@ -167,7 +167,7 @@ test('fetchUriToBytes: rejects unsupported observed MIME', async () => {
       'https://example.com/archive.zip',
       'application/zip',
       {
-        fetchImpl: async () =>
+        fetchImplForTest: async () =>
           new Response(Buffer.from('zip'), {
             headers: { 'content-type': 'application/zip', 'content-length': '3' },
           }),

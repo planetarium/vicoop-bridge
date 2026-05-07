@@ -353,10 +353,13 @@ class GatewayClient {
 // `{ type, mimeType, fileName, content }` where `content` is base64 and
 // `type` is a label-only field (the real routing decision is mime-based).
 //
-// OpenClaw >= v2026.4.27 accepts non-image attachments and offloads them to
-// `media://inbound/<id>` for the agent to read via Read/Bash. Older gateways
-// reject non-image mimes server-side; we do not pre-filter here because the
-// rejection should be surfaced as a gateway error, not silently swallowed.
+// OpenClaw >= v2026.4.27 accepts non-image inline attachments and offloads
+// them to `media://inbound/<id>` for the agent to read via Read/Bash. Older
+// gateways reject non-image inline mimes server-side; we do not pre-filter
+// caller-provided `file.bytes` because the rejection should be surfaced as a
+// gateway error, not silently swallowed. URI-fetched inputs are different:
+// they pass through the shared inbound fetch policy and are MIME-gated before
+// reaching the gateway.
 //
 // `file.uri` inputs are fetched by the bridge under the shared inbound file
 // safety policy, then forwarded as the same base64 attachment shape as
