@@ -77,7 +77,10 @@ export function buildAgentA2XAgent(
   const restricted = conn.allowedCallers.length > 0;
   const wireDeclaresSiwe = wireExtensions.some((e) => e.uri === SIWE_BEARER_AUTH_EXTENSION_URI);
   if (restricted && opts.publicUrl && !wireDeclaresSiwe) {
-    const siweDomain = new URL(opts.publicUrl).host;
+    // Match http.tsx's siwe domain derivation (.hostname strips the port) so
+    // the advertised domain matches what /auth/siwe/exchange and the bearer
+    // fast-path actually validate against.
+    const siweDomain = new URL(opts.publicUrl).hostname;
     a2xAgent.addExtension({
       uri: SIWE_BEARER_AUTH_EXTENSION_URI,
       description:

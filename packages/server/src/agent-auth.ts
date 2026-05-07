@@ -26,13 +26,23 @@ export interface AgentAuthOptions {
 export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) {
   // /agents/:id accepts two bearer shapes (issue #31 + siwe-bearer-auth/v0.1):
   //   1. Opaque vbc_caller_* (issued by /auth/siwe/exchange or /oauth/token)
-  //   2. base64url-encoded SIWE bearer (self-verifying per siwe-bearer-auth/v0.1).
+  //   2. base64url-encoded SIWE bearer (self-verifying per siwe-bearer-auth/v0.1) —
+  //      only when opts.siweDomain is set; otherwise the fast-path is disabled.
   // Owner-session tokens (vbc_owner_*) are for self-service surfaces and
   // explicitly rejected here even if they belong to a principal in
   // allowed_callers.
-  const acquisitionHint = opts.deviceFlowEnabled
-    ? '/auth/siwe/exchange (SIWE, intent=caller), /oauth/token (device flow, intent=caller), or a base64url SIWE bearer per siwe-bearer-auth/v0.1'
-    : '/auth/siwe/exchange (SIWE, intent=caller) or a base64url SIWE bearer per siwe-bearer-auth/v0.1';
+  const siweEnabled = Boolean(opts.siweDomain);
+  const exchangeHint = '/auth/siwe/exchange (SIWE, intent=caller)';
+  const deviceHint = opts.deviceFlowEnabled
+    ? '/oauth/token (device flow, intent=caller)'
+    : null;
+  const siweBearerHint = siweEnabled ? 'a base64url SIWE bearer per siwe-bearer-auth/v0.1' : null;
+  const acquisitionHint = [exchangeHint, deviceHint, siweBearerHint]
+    .filter((h): h is string => h !== null)
+    .join(', ');
+  const missingBearerMessage = siweEnabled
+    ? `Authentication required (Bearer ${CALLER_TOKEN_PREFIX}* or SIWE bearer)`
+    : `Authentication required (Bearer ${CALLER_TOKEN_PREFIX}*)`;
 
   return async (c: Context, next: Next) => {
     const agentId = c.req.param('id')!;
@@ -61,7 +71,7 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
         id: null,
         error: {
           code: -32001,
-          message: `Authentication required (Bearer ${CALLER_TOKEN_PREFIX}* or SIWE bearer)`,
+          message: missingBearerMessage,
         },
       }, 401);
     }

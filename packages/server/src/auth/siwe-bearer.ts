@@ -48,6 +48,10 @@ interface CacheEntry {
   expiresAt: number;
 }
 
+// FIFO cache (Map insertion order). We don't promote on access, so this is
+// not a true LRU — it bounds memory and TTL-evicts expired entries, which
+// matches dba's siwe-token.ts and is sufficient for our usage pattern (a
+// caller signs once and reuses the same token for the SIWE TTL).
 const CACHE_MAX_ENTRIES = 10_000;
 const CACHE_SWEEP_INTERVAL_MS = 60_000;
 const verifyCache = new Map<string, CacheEntry>();
@@ -88,12 +92,13 @@ export async function verifySiweBearerToken(
   }
   const { message, signature } = decodeSiweBearerToken(token);
   const address = await verifySiweMessage(message, signature, { domain: opts.domain });
+  // verifySiweMessage already enforces presence and validity of expirationTime,
+  // so re-parsing here is just to read the value back out for the cache TTL.
   const parsed = new SiweMessage(message);
-  const expiresAt = parsed.expirationTime
-    ? new Date(parsed.expirationTime).getTime()
-    : Date.now() + 60_000;
-  verifyCache.set(token, { address: address.toLowerCase(), expiresAt });
-  return { address: address.toLowerCase() };
+  const expiresAt = new Date(parsed.expirationTime!).getTime();
+  const lower = address.toLowerCase();
+  verifyCache.set(token, { address: lower, expiresAt });
+  return { address: lower };
 }
 
 // Test-only: clear the in-memory cache so unit tests can exercise the
