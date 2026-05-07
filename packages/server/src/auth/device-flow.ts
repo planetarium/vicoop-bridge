@@ -403,6 +403,11 @@ export function mountDeviceFlow(app: Hono, opts: DeviceFlowOptions): void {
         access_token: issued.rawToken,
         token_type: 'Bearer',
         expires_in: expiresInSec,
+        // The token's principal/email aren't carried in the opaque token
+        // itself, so we surface them here. The CLI uses these to confirm
+        // (and persist) which identity the operator is logged in as.
+        principal_id: row.principal_id,
+        email: row.email ?? null,
       });
     }
 

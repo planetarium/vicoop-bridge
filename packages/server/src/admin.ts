@@ -25,9 +25,18 @@ import { getSchemaTools } from './schema-tools.js';
 import { runWithBearerToken } from './graphql-client.js';
 import type { Registry } from './registry.js';
 import { PostgresTaskStore, type ContextAwareTaskStore } from './postgres-task-store.js';
-import { validatePrincipal } from './auth/principal.js';
 import { listCallerTokens, revokeCallerToken } from './auth/caller-token.js';
 import { logEvent } from './log.js';
+import { isAdmin } from './admin-scope.js';
+import {
+  AdminApiError,
+  addCaller,
+  listActiveAgents,
+  listCallers,
+  removeCaller,
+} from './admin-api.js';
+
+export { getAdminWallets } from './admin-scope.js';
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -79,28 +88,6 @@ const ADMIN_NOOP_RUNNER = new InMemoryRunner({
   agent: new NoopBaseAgent(),
   appName: 'vicoop-bridge-admin-noop',
 });
-
-// ── Admin Wallet Check ───────────────────────────────────────────
-
-const adminWallets = new Set(
-  (process.env.ADMIN_WALLET_ADDRESSES ?? '')
-    .split(',')
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean),
-);
-
-// Admin scope is wallet-only by design: only `eth:<addr>` principals whose
-// stripped 0x address appears in ADMIN_WALLET_ADDRESSES match. Non-eth
-// principals (e.g. google:sub:…) authenticate fine but never gain admin
-// scope — they get the RLS-scoped self-service view of their own rows.
-function isAdmin(principalId: string): boolean {
-  if (!principalId.startsWith('eth:')) return false;
-  return adminWallets.has(principalId.slice('eth:'.length).toLowerCase());
-}
-
-export function getAdminWallets(): string[] {
-  return [...adminWallets];
-}
 
 // Render principal-kind-specific copy for the "logged in as" line. Email is
 // optional; we surface it for google: principals so the human reading the
@@ -203,23 +190,22 @@ function buildCustomTools(db: Sql, registry: Registry, principalId: string) {
   // through so RLS predicates (owner_principal = current_principal()) match
   // the operator's own rows. The principalId arrives already canonicalized
   // (eth:0x… or google:sub:…) from the http layer, so no normalization
-  // here.
+  // here. The actual implementations live in admin-api.ts and are shared
+  // with the deterministic /admin-api/* HTTP routes; these wrappers translate
+  // AdminApiError into the `{error}` shape the LLM was trained to read.
+  const wrap = async <T>(fn: () => Promise<T>): Promise<T | { error: string }> => {
+    try {
+      return await fn();
+    } catch (err) {
+      if (err instanceof AdminApiError) return { error: err.message };
+      throw err;
+    }
+  };
   return {
     list_active_agents: tool({
       description: 'List currently connected agents with their client identity and connection time. Non-admin users only see their own agents.',
       inputSchema: z.object({}),
-      execute: async () => {
-        const admin = isAdmin(principalId);
-        return registry.listAgents()
-          .filter((a) => admin || a.ownerPrincipal === principalId)
-          .map((a) => ({
-            agent_id: a.agentId,
-            client_id: a.clientId,
-            agent_name: a.agentCard.name,
-            allowed_callers: a.allowedCallers,
-            connected_at: new Date(a.connectedAt).toISOString(),
-          }));
-      },
+      execute: async () => listActiveAgents(registry, principalId),
     }),
 
     add_caller: tool({
@@ -235,43 +221,8 @@ function buildCustomTools(db: Sql, registry: Registry, principalId: string) {
         agent_id: z.string().describe('The agent ID to add the caller to'),
         principal: z.string().describe('Principal string (see tool description)'),
       }),
-      execute: async ({ agent_id, principal }) => {
-        const normalized = validatePrincipal(principal);
-        if (!normalized) {
-          return { error: 'Invalid principal format. See tool description for supported formats.' };
-        }
-        const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
-        const result = await db.begin(async (tx) => {
-          await tx`SELECT set_config('role', 'app_authenticated', true)`;
-          await tx`SELECT set_config('jwt.claims.principal_id', ${principalId}, true)`;
-          await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
-          return tx`
-            UPDATE agent_policies
-            SET allowed_callers = array_append(allowed_callers, ${normalized}),
-                updated_at = now()
-            WHERE agent_id = ${agent_id}
-              AND NOT (${normalized} = ANY(allowed_callers))
-            RETURNING agent_id, owner_principal, allowed_callers
-          `;
-        });
-        if (result.length === 0) {
-          const adminAddrs = process.env.ADMIN_WALLET_ADDRESSES ?? '';
-          const existing = await db.begin(async (tx) => {
-            await tx`SELECT set_config('role', 'app_authenticated', true)`;
-            await tx`SELECT set_config('jwt.claims.principal_id', ${principalId}, true)`;
-            await tx`SELECT set_config('app.admin_addresses', ${adminAddrs}, true)`;
-            return tx`SELECT allowed_callers FROM agent_policies WHERE agent_id = ${agent_id}`;
-          });
-          if (existing.length === 0) return { error: 'Agent policy not found or not authorized.' };
-          if ((existing[0].allowed_callers as string[]).includes(normalized)) {
-            return { agent_id, message: 'Principal already in allowed callers', allowed_callers: existing[0].allowed_callers };
-          }
-          return { error: 'Not authorized to modify this agent policy.' };
-        }
-        const callers = result[0].allowed_callers as string[];
-        registry.updateAllowedCallers(agent_id, callers);
-        return { agent_id, principal: normalized, allowed_callers: callers };
-      },
+      execute: async ({ agent_id, principal }) =>
+        wrap(() => addCaller(db, registry, principalId, agent_id, principal)),
     }),
 
     remove_caller: tool({
@@ -282,32 +233,8 @@ function buildCustomTools(db: Sql, registry: Registry, principalId: string) {
         agent_id: z.string().describe('The agent ID to remove the caller from'),
         principal: z.string().describe('Principal string to remove'),
       }),
-      execute: async ({ agent_id, principal }) => {
-        const normalized = validatePrincipal(principal);
-        if (!normalized) {
-          return { error: 'Invalid principal format. See add_caller description for supported formats.' };
-        }
-        const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
-        const result = await db.begin(async (tx) => {
-          await tx`SELECT set_config('role', 'app_authenticated', true)`;
-          await tx`SELECT set_config('jwt.claims.principal_id', ${principalId}, true)`;
-          await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
-          return tx`
-            UPDATE agent_policies
-            SET allowed_callers = array_remove(allowed_callers, ${normalized}),
-                updated_at = now()
-            WHERE agent_id = ${agent_id}
-              AND ${normalized} = ANY(allowed_callers)
-            RETURNING agent_id, owner_principal, allowed_callers
-          `;
-        });
-        if (result.length === 0) {
-          return { error: 'Principal not found in allowed callers, agent policy not found, or not authorized.' };
-        }
-        const callers = result[0].allowed_callers as string[];
-        registry.updateAllowedCallers(agent_id, callers);
-        return { agent_id, principal: normalized, allowed_callers: callers };
-      },
+      execute: async ({ agent_id, principal }) =>
+        wrap(() => removeCaller(db, registry, principalId, agent_id, principal)),
     }),
 
     list_callers: tool({
@@ -315,26 +242,7 @@ function buildCustomTools(db: Sql, registry: Registry, principalId: string) {
       inputSchema: z.object({
         agent_id: z.string().describe('The agent ID to list callers for'),
       }),
-      execute: async ({ agent_id }) => {
-        const adminAddresses = process.env.ADMIN_WALLET_ADDRESSES ?? '';
-        const result = await db.begin(async (tx) => {
-          await tx`SELECT set_config('role', 'app_authenticated', true)`;
-          await tx`SELECT set_config('jwt.claims.principal_id', ${principalId}, true)`;
-          await tx`SELECT set_config('app.admin_addresses', ${adminAddresses}, true)`;
-          return tx`
-            SELECT agent_id, owner_principal, allowed_callers, created_at, updated_at
-            FROM agent_policies WHERE agent_id = ${agent_id}
-          `;
-        });
-        if (result.length === 0) return { error: 'Agent policy not found.' };
-        const policy = result[0];
-        return {
-          agent_id: policy.agent_id,
-          owner_principal: policy.owner_principal,
-          allowed_callers: policy.allowed_callers,
-          is_public: (policy.allowed_callers as string[]).length === 0,
-        };
-      },
+      execute: async ({ agent_id }) => wrap(() => listCallers(db, principalId, agent_id)),
     }),
 
     list_caller_tokens: tool({

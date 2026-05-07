@@ -140,6 +140,7 @@ export function mountSiweExchange(app: Hono, opts: SiweExchangeOptions): void {
           access_token: issued.rawToken,
           token_type: 'Bearer',
           expires_in: expiresInSec,
+          principal_id: principalId,
         });
       });
     } catch (err) {

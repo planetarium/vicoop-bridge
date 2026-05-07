@@ -376,11 +376,34 @@ one live `vicoop-client` process connected for the agent id.
 ### Restrict who can call your agent
 
 By default the policy has empty `allowed_callers`, which the dispatcher
-treats as "public". To lock it down, use the admin agent's `add_caller`
-tool. The admin agent at `POST /` accepts any **owner-session token**
+treats as "public". To lock it down, either use the `vicoop-client`
+subcommands (deterministic, scriptable) or send a natural-language
+request to the admin agent. Both require an **owner-session token**
 (`vbc_owner_*`) — wallet (SIWE) or Google (device flow with
 `intent=owner_session`). Admin scope (`is_admin()`) is wallet-only and
 gates only the cross-owner tools.
+
+#### Option A: `vicoop-client` subcommands (recommended for scripts)
+
+```sh
+# One-time login — saves the bearer to ~/.vicoop/owner-session.json (chmod 600).
+vicoop-client login --owner-session --bridge "$BRIDGE_URL"
+
+# Now any of these work without re-authenticating:
+vicoop-client list-agents
+vicoop-client list-callers "$AGENT_ID"
+vicoop-client add-caller "$AGENT_ID" "eth:0x<40-hex>"
+vicoop-client remove-caller "$AGENT_ID" "google:email:caller@example.com"
+
+# Pass --json for machine-readable output, or --bridge / --token to override
+# the saved session for one call. VICOOP_BRIDGE / VICOOP_OWNER_TOKEN env vars
+# work too (handy for CI).
+```
+
+These talk to the bridge's `/admin-api/*` routes — same logic the admin
+agent's tools run, but without an LLM round-trip per call.
+
+#### Option B: natural-language admin agent
 
 ```sh
 # $OWNER_TOKEN: vbc_owner_* token from /auth/siwe/exchange or
@@ -394,7 +417,7 @@ curl -sX POST "$BRIDGE_URL/" \
   | jq -r '.result.status.message.parts[0].text'
 ```
 
-The change hot-reloads via `registry.updateAllowedCallers` — no client
+Either path hot-reloads via `registry.updateAllowedCallers` — no client
 restart needed.
 
 ## Updating the client
