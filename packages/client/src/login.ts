@@ -10,10 +10,18 @@
 //     persisted to ~/.vicoop/owner-session.json (chmod 600) by default.
 //     Only --bridge is required.
 //
-// Output goes to stderr for human guidance; the final result is written to
-// stdout as either an env-style block or a JSON document. That keeps shell
-// composition (`$(vicoop-client login --json | jq -r .client_token)`)
-// straightforward.
+// Output: stderr is always used for human guidance. The destination of the
+// "final result" depends on intent + flags:
+//   * client_register, default          → stdout, env-style block
+//   * client_register, --json            → stdout, JSON document
+//   * client_register, --write-env-file  → file at the given path, env-style
+//   * owner_session, default             → ~/.vicoop/owner-session.json (chmod 600)
+//   * owner_session, --json              → stdout, JSON document
+//   * owner_session, --write-env-file    → file at the given path, env-style
+// Stdout-as-default for client_register keeps shell composition working
+// (`$(vicoop-client login --json | jq -r .client_token)`); owner-session's
+// default-to-file matches the way `gh auth login` plants ~/.config/gh/hosts.yml,
+// so subsequent admin subcommands pick up the bearer with no env wiring.
 
 import { closeSync, openSync, renameSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -87,7 +95,8 @@ function usage(): void {
     [
       'usage: vicoop-client login --bridge <https://...> --client-name <name>',
       '                          --agent-ids <id1,id2> [--write-env-file <path>] [--json]',
-      '       vicoop-client login --owner-session --bridge <https://...> [--json]',
+      '       vicoop-client login --owner-session --bridge <https://...>',
+      '                          [--write-env-file <path>] [--json]',
       '',
       'Default: drives Google OAuth device flow to register a new client and prints',
       '         the resulting CLIENT_TOKEN once. Required: --bridge, --client-name, --agent-ids.',
