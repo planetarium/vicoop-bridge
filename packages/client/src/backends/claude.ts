@@ -387,7 +387,7 @@ async function mapPartsToContentBlocks(
     if (p.kind === 'file') {
       let bytes = p.file.bytes;
       let mime = p.file.mimeType ?? '';
-      if (!bytes && p.file.uri && fetchUriPolicy?.enabled !== false) {
+      if (!bytes && p.file.uri !== undefined && fetchUriPolicy?.enabled !== false) {
         try {
           const fetched = await fetchUriToBytes(p.file.uri, p.file.mimeType, fetchUriPolicy, signal);
           bytes = fetched.bytes;
@@ -403,11 +403,18 @@ async function mapPartsToContentBlocks(
           };
         }
       }
-      if (!bytes && p.file.uri && fetchUriPolicy?.enabled === false) {
+      if (!bytes && p.file.uri !== undefined && fetchUriPolicy?.enabled === false) {
         return {
           ok: false,
           code: 'unsupported_file_uri',
           message: 'claude backend URI fetching is disabled; provide inline FilePart bytes',
+        };
+      }
+      if (!bytes && p.file.uri === undefined) {
+        return {
+          ok: false,
+          code: 'invalid_file_part',
+          message: 'claude backend FilePart must carry either bytes or uri',
         };
       }
       if (!bytes) {

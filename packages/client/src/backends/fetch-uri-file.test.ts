@@ -72,6 +72,22 @@ test('fetchUriToBytes: blocks direct IPv6 loopback hosts', async () => {
   );
 });
 
+test('fetchUriToBytes: timeout bounds hostname resolution', async () => {
+  await assert.rejects(
+    fetchUriToBytes(
+      'https://example.com/x.png',
+      'image/png',
+      {
+        timeoutMs: 5,
+        fetchImpl: async () => new Response(Buffer.from('unused'), { headers: { 'content-type': 'image/png' } }),
+        resolveHost: async () => new Promise<string[]>(() => undefined),
+      },
+      NEVER,
+    ),
+    { name: 'FetchUriError', code: 'fetch_failed' },
+  );
+});
+
 test('fetchUriToBytes: revalidates redirect targets', async () => {
   await assert.rejects(
     fetchUriToBytes(

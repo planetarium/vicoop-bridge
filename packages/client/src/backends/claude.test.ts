@@ -401,6 +401,33 @@ test('rejects FilePart with uri-only when URI fetching is disabled', async () =>
   assert.match(fail.error.message, /URI fetching is disabled/);
 });
 
+test('rejects FilePart missing both bytes and uri as invalid', async () => {
+  let spawned = 0;
+  const backend = createClaudeBackend({
+    spawn: () => {
+      spawned++;
+      throw new Error('should not spawn');
+    },
+  });
+  const { emit, frames } = collect();
+  const task: TaskAssignFrame = {
+    type: 'task.assign',
+    taskId: 't',
+    contextId: 'c',
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [{ kind: 'file', file: { mimeType: 'image/png' } }],
+    },
+  };
+  await backend.handle(task, emit, NEVER);
+
+  assert.equal(spawned, 0);
+  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
+  assert.ok(fail);
+  assert.equal(fail.error.code, 'invalid_file_part');
+});
+
 test('stdin envelope: URI FilePart is fetched and mapped like inline image bytes', async () => {
   const png = Buffer.from('png-bytes');
   const fake = scriptedSpawn({

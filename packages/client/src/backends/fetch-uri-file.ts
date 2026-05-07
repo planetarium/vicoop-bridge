@@ -132,7 +132,44 @@ async function defaultResolveHost(hostname: string): Promise<string[]> {
   return records.map((r) => r.address);
 }
 
-async function validateUrlForFetch(url: URL, resolveHost: (hostname: string) => Promise<string[]>): Promise<void> {
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw new FetchUriError('fetch_failed', 'file.uri fetch timed out or was aborted');
+  }
+}
+
+async function waitForResolution(
+  hostname: string,
+  resolveHost: (hostname: string) => Promise<string[]>,
+  signal: AbortSignal,
+): Promise<string[]> {
+  throwIfAborted(signal);
+  return new Promise<string[]>((resolve, reject) => {
+    const abort = () => reject(new FetchUriError('fetch_failed', 'file.uri fetch timed out or was aborted'));
+    signal.addEventListener('abort', abort, { once: true });
+    resolveHost(hostname).then(
+      (addresses) => {
+        signal.removeEventListener('abort', abort);
+        if (signal.aborted) {
+          reject(new FetchUriError('fetch_failed', 'file.uri fetch timed out or was aborted'));
+          return;
+        }
+        resolve(addresses);
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', abort);
+        reject(err);
+      },
+    );
+  });
+}
+
+async function validateUrlForFetch(
+  url: URL,
+  resolveHost: (hostname: string) => Promise<string[]>,
+  signal: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal);
   if (url.protocol !== 'https:') {
     throw new FetchUriError('fetch_blocked_host', `file.uri must use https (got ${url.protocol || 'unknown'})`);
   }
@@ -141,8 +178,9 @@ async function validateUrlForFetch(url: URL, resolveHost: (hostname: string) => 
   }
   let addresses: string[];
   try {
-    addresses = await resolveHost(url.hostname);
+    addresses = await waitForResolution(url.hostname, resolveHost, signal);
   } catch (err) {
+    if (err instanceof FetchUriError) throw err;
     throw new FetchUriError('fetch_failed', `failed to resolve ${url.hostname}`, { cause: err });
   }
   if (addresses.length === 0) {
@@ -153,6 +191,7 @@ async function validateUrlForFetch(url: URL, resolveHost: (hostname: string) => 
       throw new FetchUriError('fetch_blocked_host', `file.uri host resolves to a blocked address (${address})`);
     }
   }
+  throwIfAborted(signal);
 }
 
 function makeTimeoutSignal(parent: AbortSignal, timeoutMs: number): { signal: AbortSignal; cleanup: () => void } {
@@ -224,7 +263,7 @@ export async function fetchUriToBytes(
   const timeout = makeTimeoutSignal(signal, timeoutMs);
   try {
     for (let redirects = 0; redirects <= maxRedirects; redirects++) {
-      await validateUrlForFetch(current, resolveHost);
+      await validateUrlForFetch(current, resolveHost, timeout.signal);
       let res: Response;
       try {
         res = await fetchImpl(current, { redirect: 'manual', signal: timeout.signal });
