@@ -17,6 +17,11 @@ import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from '.
 import { mountDeviceFlow } from './auth/device-flow.js';
 import { mountDeviceUi } from './auth/device-ui.js';
 import { mountSiweExchange } from './auth/siwe-exchange.js';
+import {
+  A2A_EXTENSIONS_HEADER,
+  A2A_EXTENSIONS_LEGACY_HEADER,
+  parseA2AExtensionsHeader,
+} from './a2a-extensions.js';
 import type { GoogleConfig } from './auth/google-oauth.js';
 import type { Sql } from './db.js';
 import { Landing } from './landing.js';
@@ -37,6 +42,10 @@ export interface ServerHttpOptions {
   deviceFlowStateSecret?: string;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 export function createHttpApp(opts: ServerHttpOptions): Hono {
   const app = new Hono();
 
@@ -49,7 +58,12 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     '*',
     cors({
       origin: (origin) => origin ?? '',
-      allowHeaders: ['Authorization', 'Content-Type'],
+      allowHeaders: [
+        'Authorization',
+        'Content-Type',
+        A2A_EXTENSIONS_HEADER,
+        A2A_EXTENSIONS_LEGACY_HEADER,
+      ],
       allowMethods: ['GET', 'POST', 'OPTIONS'],
       credentials: true,
       maxAge: 600,
@@ -260,9 +274,10 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const rawBody = await c.req.text();
     const parsed = JSON.parse(rawBody);
 
-    if (parsed.params?.message) {
-      parsed.params.message.metadata = {
-        ...parsed.params.message.metadata,
+    const message = parsed.params?.message;
+    if (isRecord(message)) {
+      message.metadata = {
+        ...(isRecord(message.metadata) ? message.metadata : {}),
         _principalId: principalId,
         _bearerToken: bearerToken,
         ...(callerEmail !== undefined ? { _email: callerEmail } : {}),
@@ -334,6 +349,17 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
 
     const rawBody = await c.req.text();
     const parsed = JSON.parse(rawBody);
+    const requestedExtensions = [
+      ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_HEADER)),
+      ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_LEGACY_HEADER)),
+    ];
+    const message = parsed.params?.message;
+    if (requestedExtensions.length > 0 && isRecord(message)) {
+      const existing = Array.isArray(message.extensions)
+        ? message.extensions.filter((v: unknown): v is string => typeof v === 'string')
+        : [];
+      message.extensions = [...new Set([...existing, ...requestedExtensions])];
+    }
     const handler = getHandlerForConn(conn);
     const result = await handler.handle(parsed);
     return handleHandlerResult(result, c);

@@ -1,6 +1,8 @@
 import { z } from 'zod';
 
 export const PROTOCOL_VERSION = '0.1';
+export const TRACEABILITY_EXTENSION_URI =
+  'https://github.com/a2aproject/a2a-samples/extensions/traceability/v1';
 
 export const TextPart = z.object({
   kind: z.literal('text'),
@@ -29,6 +31,8 @@ export const Message = z.object({
   role: z.enum(['user', 'agent']),
   parts: z.array(Part),
   messageId: z.string(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  extensions: z.array(z.string()).optional(),
 });
 export type Message = z.infer<typeof Message>;
 
@@ -53,6 +57,8 @@ export const Artifact = z.object({
   artifactId: z.string(),
   name: z.string().optional(),
   parts: z.array(Part),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  extensions: z.array(z.string()).optional(),
 });
 export type Artifact = z.infer<typeof Artifact>;
 
@@ -62,6 +68,14 @@ export const AgentSkill = z.object({
   description: z.string().optional(),
   tags: z.array(z.string()).optional(),
 });
+
+export const AgentExtension = z.object({
+  uri: z.string(),
+  description: z.string().optional(),
+  required: z.boolean().optional(),
+  params: z.record(z.string(), z.unknown()).optional(),
+});
+export type AgentExtension = z.infer<typeof AgentExtension>;
 
 export const SecurityScheme = z.object({
   type: z.string(),
@@ -82,6 +96,7 @@ export const AgentCard = z.object({
     .object({
       streaming: z.boolean().optional(),
       pushNotifications: z.boolean().optional(),
+      extensions: z.array(AgentExtension).optional(),
     })
     .optional(),
   defaultInputModes: z.array(z.string()).optional(),
@@ -155,6 +170,7 @@ export const TaskAssignFrame = z.object({
   taskId: z.string(),
   contextId: z.string(),
   message: Message,
+  requestedExtensions: z.array(z.string()).optional(),
 });
 
 export const TaskCancelFrame = z.object({

@@ -3,7 +3,16 @@
   "description": "Anthropic Claude Code CLI agent. Spawns the local `claude` binary per task and streams each assistant message back as an A2A artifact. Accepts text, image, and PDF inputs; can return text plus image/PDF outputs from tool results.",
   "version": "0.0.1",
   "protocolVersion": "0.3.0",
-  "capabilities": { "streaming": true },
+  "capabilities": {
+    "streaming": true,
+    "extensions": [
+      {
+        "uri": "https://github.com/a2aproject/a2a-samples/extensions/traceability/v1",
+        "description": "Opt-in execution trace stream for Claude Code tool calls and tool-result media.",
+        "required": false
+      }
+    ]
+  },
   "defaultInputModes": [
     "text/plain",
     "image/png",
