@@ -245,6 +245,13 @@ function fetchPinned(url: URL, addresses: readonly string[], signal: AbortSignal
   }
   const family = net.isIP(address);
   return new Promise<Response>((resolve, reject) => {
+    let activeResponse: Readable | null = null;
+    const cleanupAbort = () => signal.removeEventListener('abort', abort);
+    const abort = () => {
+      const err = new FetchUriError('fetch_failed', 'file.uri fetch timed out or was aborted');
+      activeResponse?.destroy(err);
+      req.destroy(err);
+    };
     const req = https.request({
       protocol: 'https:',
       hostname: stripIpv6Brackets(url.hostname),
@@ -256,12 +263,12 @@ function fetchPinned(url: URL, addresses: readonly string[], signal: AbortSignal
         cb(null, address, family);
       },
     });
-    const abort = () => {
-      req.destroy(new FetchUriError('fetch_failed', 'file.uri fetch timed out or was aborted'));
-    };
     signal.addEventListener('abort', abort, { once: true });
     req.on('response', (res) => {
-      signal.removeEventListener('abort', abort);
+      activeResponse = res;
+      res.once('close', cleanupAbort);
+      res.once('end', cleanupAbort);
+      res.once('error', cleanupAbort);
       const body = Readable.toWeb(res) as ReadableStream<Uint8Array>;
       resolve(new Response(body, {
         status: res.statusCode ?? 0,
@@ -270,7 +277,7 @@ function fetchPinned(url: URL, addresses: readonly string[], signal: AbortSignal
       }));
     });
     req.on('error', (err) => {
-      signal.removeEventListener('abort', abort);
+      cleanupAbort();
       reject(err);
     });
     req.end();
