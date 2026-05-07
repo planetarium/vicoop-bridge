@@ -534,12 +534,32 @@ export interface OpenclawBackendOptions {
    * rejected with `ambiguous-task`.
    */
   sendFileMcp?: SendFileMcpOptions;
+  /**
+   * Idle-silence heartbeat. While a task is running, if no other frame has
+   * gone out for at least `heartbeatMs`, emit a bare `task.status` (state:
+   * working, no message body) so callers and intermediaries (Fly edge,
+   * SSE consumers) see bytes on the wire and don't tear down the
+   * connection as a dead read. Default 30000 ms; pass 0 to disable.
+   */
+  heartbeatMs?: number;
+  /** Test seam: deterministic clock for heartbeat. Defaults to Date.now. */
+  now?: () => number;
+  /** Test seam: timer impls. Defaults to global setInterval/clearInterval. */
+  setIntervalFn?: (fn: () => void, ms: number) => unknown;
+  clearIntervalFn?: (handle: unknown) => void;
 }
 
 const DEFAULT_ATTACH_OUTPUTS_MAX_BYTES = 20 * 1024 * 1024;
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10 * 1000;
+// Default idle-silence heartbeat. OpenClaw `chat` runs can spend minutes
+// in heavy tool use without producing any `session.message` event — long
+// enough to trip Fly edge / SSE / A2A caller idle timeouts. Below this
+// many ms of silence, emit a bare `task.status: working` so bytes keep
+// flowing. Mirrors the claude backend's heartbeat (issue #100 part C,
+// ported in #102).
+const DEFAULT_HEARTBEAT_MS = 30_000;
 const DEFAULT_DISCOVERY_PROCESS_NAME = 'openclaw';
 const DEFAULT_DISCOVERY_HANDSHAKE_TIMEOUT_MS = 3_000;
 const DISCOVERY_LSOF_TIMEOUT_MS = 2_000;
@@ -764,6 +784,12 @@ export function createOpenclawBackend(
     DEFAULT_HANDSHAKE_TIMEOUT_MS,
     'handshakeTimeoutMs',
   );
+  const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const now = opts.now ?? Date.now;
+  const setIntervalImpl =
+    opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
+  const clearIntervalImpl =
+    opts.clearIntervalFn ?? ((h) => clearInterval(h as ReturnType<typeof setInterval>));
   const attachOutputs =
     opts.attachOutputs && opts.attachOutputs.allowedRoots.length > 0
       ? (() => {
@@ -1149,7 +1175,20 @@ export function createOpenclawBackend(
       }
     },
 
-    async handle(task, emit, signal) {
+    async handle(task, rawEmit, signal) {
+      // Idle-silence heartbeat needs to observe every outbound frame so it
+      // doesn't fire while real traffic is flowing. Wrap rawEmit so every
+      // emission refreshes `lastEmitAt`. The heartbeat tick also goes
+      // through this wrapped `emit` (NOT `rawEmit`) so a heartbeat frame
+      // resets the silence window — a follow-up tick at the same instant
+      // sees a fresh window and skips. See the tick site below.
+      let lastEmitAt = now();
+      let terminalSettled = false;
+      const emit: typeof rawEmit = (frame) => {
+        lastEmitAt = now();
+        rawEmit(frame);
+      };
+
       // Fast path: the task was canceled before we even started. Emit a
       // terminal canceled frame and do not touch the gateway.
       if (signal.aborted) {
@@ -1193,6 +1232,31 @@ export function createOpenclawBackend(
         taskId: task.taskId,
         status: { state: 'working', timestamp: new Date().toISOString() },
       });
+
+      // Idle-silence heartbeat: while the task is in flight, every
+      // `heartbeatMs` of no outbound traffic produces a bare
+      // `task.status: working` so callers and intermediaries see bytes on
+      // the wire. Disabled when heartbeatMs <= 0. Cleared in finally{}.
+      let heartbeatHandle: unknown = null;
+      if (heartbeatMs > 0) {
+        heartbeatHandle = setIntervalImpl(() => {
+          if (terminalSettled) return;
+          // After abort the run is heading toward a `canceled` terminal
+          // frame; emitting more `state: working` heartbeats in that
+          // window would actively misrepresent the task status. Suppress.
+          if (signal.aborted) return;
+          if (now() - lastEmitAt < heartbeatMs) return;
+          // Route through the wrapped `emit` (NOT `rawEmit`): the wrapper
+          // refreshes `lastEmitAt` before forwarding the frame, so a
+          // follow-up tick arriving at the same instant sees a fresh
+          // window and skips.
+          emit({
+            type: 'task.status',
+            taskId: task.taskId,
+            status: { state: 'working', timestamp: new Date().toISOString() },
+          });
+        }, heartbeatMs);
+      }
 
       // Subscribe to per-message transcript events for this sessionKey so we
       // can forward each assistant message as a separate A2A artifact while
@@ -1551,6 +1615,12 @@ export function createOpenclawBackend(
         // explicit gate close above (synchronous throw, early return), the
         // session.message handler could otherwise still fire for this task.
         sessionMessageSettled = true;
+        // Close the heartbeat gate before clearing the interval so a tick
+        // already pending in the event queue sees `terminalSettled` and
+        // bails instead of squeezing a `state: working` frame in past the
+        // terminal emit.
+        terminalSettled = true;
+        if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
         if (ownedSession && sessionMessageOwners.get(sessionKey)?.taskId === task.taskId) {
           sessionMessageOwners.delete(sessionKey);
         }
