@@ -5,8 +5,9 @@
 // `message` is an EIP-4361 SIWE message string. Unlike the opaque
 // `vbc_caller_*` tokens issued by /auth/siwe/exchange (issue #31), these are
 // stateless: every request re-runs signature recovery + TTL + domain checks.
-// We cache by raw token string to avoid re-verifying the same bearer on
-// every request from the same caller.
+// To avoid re-verifying the same bearer on every request from the same
+// caller, we keep an in-process cache keyed by the bearer's SHA-256 digest
+// (see `tokenCacheKey` below).
 
 import { createHash } from 'node:crypto';
 import { SiweMessage } from 'siwe';
