@@ -69,8 +69,68 @@ test('buildAgentA2XAgent advertises SIWE bearer-auth extension when restricted',
     (e) => e.uri === SIWE_BEARER_AUTH_EXTENSION_URI,
   );
   assert.ok(siwe, 'expected SIWE bearer-auth extension to be advertised');
+  // Mirror vicoop-db-agent-builder — fail-closed for clients that don't
+  // understand the URI.
+  assert.equal(siwe.required, true);
   assert.equal((siwe.params as { domain: string }).domain, 'bridge.example');
   assert.equal((siwe.params as { uri: string }).uri, 'https://bridge.example');
+});
+
+test('buildAgentA2XAgent exposes bearerAuth + deviceFlow security schemes when restricted (mirrors dba)', () => {
+  const agent = buildAgentA2XAgent(
+    fakeConn(
+      {
+        name: 'claude',
+        description: 'Claude Code',
+        version: '0.0.1',
+        protocolVersion: '0.3.0',
+        capabilities: { streaming: true },
+        skills: [],
+      },
+      { allowedCallers: ['eth:0x0000000000000000000000000000000000000002'] },
+    ),
+    new InMemoryTaskStore(),
+    new Registry(),
+    { publicUrl: 'https://bridge.example', deviceFlowEnabled: true },
+  );
+
+  const card = agent.getAgentCard() as AgentCardV03;
+  const schemes = card.securitySchemes ?? {};
+  assert.ok(schemes.bearerAuth, 'expected bearerAuth scheme');
+  assert.equal((schemes.bearerAuth as { type: string }).type, 'http');
+  assert.equal((schemes.bearerAuth as { scheme: string }).scheme, 'bearer');
+  assert.equal((schemes.bearerAuth as { bearerFormat: string }).bearerFormat, 'SIWE');
+  assert.ok(schemes.deviceFlow, 'expected deviceFlow scheme');
+  assert.equal((schemes.deviceFlow as { type: string }).type, 'oauth2');
+  // Both should appear as alternatives in security[].
+  assert.deepEqual(card.security, [{ bearerAuth: [] }, { deviceFlow: [] }]);
+  // Old `bridge` key from before the dba-parity refactor must not survive.
+  assert.equal((schemes as Record<string, unknown>).bridge, undefined);
+});
+
+test('buildAgentA2XAgent omits deviceFlow when device flow is not enabled', () => {
+  const agent = buildAgentA2XAgent(
+    fakeConn(
+      {
+        name: 'claude',
+        description: 'Claude Code',
+        version: '0.0.1',
+        protocolVersion: '0.3.0',
+        capabilities: { streaming: true },
+        skills: [],
+      },
+      { allowedCallers: ['eth:0x0000000000000000000000000000000000000002'] },
+    ),
+    new InMemoryTaskStore(),
+    new Registry(),
+    { publicUrl: 'https://bridge.example', deviceFlowEnabled: false },
+  );
+
+  const card = agent.getAgentCard() as AgentCardV03;
+  const schemes = card.securitySchemes ?? {};
+  assert.ok(schemes.bearerAuth, 'expected bearerAuth scheme');
+  assert.equal((schemes as Record<string, unknown>).deviceFlow, undefined);
+  assert.deepEqual(card.security, [{ bearerAuth: [] }]);
 });
 
 test('buildAgentA2XAgent omits SIWE extension for public agents', () => {
