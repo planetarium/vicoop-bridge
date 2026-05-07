@@ -4,6 +4,7 @@ import {
   OAuth2DeviceCodeAuthorization,
   type TaskStore,
 } from '@a2x/sdk';
+import { SIWE_BEARER_AUTH_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import type { ClientConnection, Registry } from './registry.js';
 import { WSForwardingExecutor } from './executor.js';
 
@@ -57,8 +58,36 @@ export function buildAgentA2XAgent(
       pushNotifications: wire.capabilities?.pushNotifications ?? false,
     });
 
-  for (const extension of wire.capabilities?.extensions ?? []) {
+  const wireExtensions = wire.capabilities?.extensions ?? [];
+  for (const extension of wireExtensions) {
     a2xAgent.addExtension(extension);
+  }
+
+  // Advertise SIWE bearer-auth (siwe-bearer-auth/v0.1) when this agent is
+  // restricted to a non-empty allowed_callers set. Mentionable / A2A clients
+  // discover this URI to know they can mint a base64url SIWE bearer locally
+  // (no exchange step) and present it directly. Skip when the wire card
+  // already declares it — the client's own opt-in wins.
+  const restricted = conn.allowedCallers.length > 0;
+  const wireDeclaresSiwe = wireExtensions.some((e) => e.uri === SIWE_BEARER_AUTH_EXTENSION_URI);
+  if (restricted && opts.publicUrl && !wireDeclaresSiwe) {
+    const siweDomain = new URL(opts.publicUrl).host;
+    a2xAgent.addExtension({
+      uri: SIWE_BEARER_AUTH_EXTENSION_URI,
+      description:
+        'Sign-In with Ethereum (EIP-4361) bearer auth. Clients sign a SIWE message locally and present it as a base64url-encoded Bearer token; no exchange step needed.',
+      required: false,
+      params: {
+        domain: siweDomain,
+        uri: opts.publicUrl,
+        maxTokenTtl: '7d',
+        domainBinding: true,
+        usageHint: {
+          mintToken: `a2a-wallet siwe auth --domain ${siweDomain} --uri ${opts.publicUrl} --ttl 1h --json | jq -r '.token'`,
+          sendMessage: `a2a-wallet a2a send --bearer "$TOKEN" ${opts.publicUrl}/agents/${conn.agentId}/.well-known/agent-card.json "Hello"`,
+        },
+      },
+    });
   }
 
   for (const skill of wire.skills ?? []) {
