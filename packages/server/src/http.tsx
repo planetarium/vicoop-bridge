@@ -339,6 +339,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   const authMw = agentAuthMiddleware(opts.registry, {
     sql: opts.db,
     deviceFlowEnabled,
+    siweDomain,
   });
   app.post('/agents/:id', authMw, async (c) => {
     const conn = getAgentConn(c);
