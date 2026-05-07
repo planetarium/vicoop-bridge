@@ -8,6 +8,7 @@
 // We cache by raw token string to avoid re-verifying the same bearer on
 // every request from the same caller.
 
+import { createHash } from 'node:crypto';
 import { SiweMessage } from 'siwe';
 import { verifySiweMessage } from '../siwe-token.js';
 
@@ -54,6 +55,13 @@ interface CacheEntry {
 // matches dba's siwe-token.ts and is sufficient for our usage pattern (a
 // caller signs once and reuses the same token for the SIWE TTL).
 //
+// Cache keys are SHA-256 hex digests of the bearer token, not the raw
+// token itself. SIWE bearers are base64url-encoded JSON with embedded
+// signatures and can run several hundred bytes each; an attacker hammering
+// the route with distinct tokens could otherwise pin up to MAX_ENTRIES *
+// header_size bytes in memory until TTL eviction. The 64-char digest
+// keeps each key fixed-size regardless of input.
+//
 // We cache the verified domain alongside the address so a cache hit can
 // re-check it if the caller passes a different `opts.domain`. Without this
 // re-check a token whose first verification accepted any domain (or domain
@@ -64,6 +72,10 @@ const CACHE_MAX_ENTRIES = 10_000;
 const CACHE_SWEEP_INTERVAL_MS = 60_000;
 const verifyCache = new Map<string, CacheEntry>();
 let lastSweep = 0;
+
+function tokenCacheKey(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
 
 function maybeSweep() {
   const now = Date.now();
@@ -94,7 +106,8 @@ export async function verifySiweBearerToken(
   opts: VerifySiweBearerOptions = {},
 ): Promise<VerifiedSiweBearer> {
   maybeSweep();
-  const cached = verifyCache.get(token);
+  const cacheKey = tokenCacheKey(token);
+  const cached = verifyCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     if (opts.domain && cached.domain !== opts.domain.toLowerCase()) {
       throw new Error(
@@ -112,7 +125,7 @@ export async function verifySiweBearerToken(
   const parsed = new SiweMessage(message);
   const expiresAt = new Date(parsed.expirationTime!).getTime();
   const lower = address.toLowerCase();
-  verifyCache.set(token, {
+  verifyCache.set(cacheKey, {
     address: lower,
     domain: parsed.domain.toLowerCase(),
     expiresAt,

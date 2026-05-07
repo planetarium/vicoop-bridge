@@ -58,29 +58,38 @@ export function buildAgentA2XAgent(
       pushNotifications: wire.capabilities?.pushNotifications ?? false,
     });
 
-  const wireExtensions = wire.capabilities?.extensions ?? [];
-  for (const extension of wireExtensions) {
-    a2xAgent.addExtension(extension);
-  }
-
   // Advertise SIWE bearer-auth (siwe-bearer-auth/v0.1) when this agent is
   // restricted to a non-empty allowed_callers set. Mentionable / A2A clients
   // discover this URI to know they can mint a base64url SIWE bearer locally
-  // (no exchange step) and present it directly. Skip when the wire card
-  // already declares it — the client's own opt-in wins.
+  // (no exchange step) and present it directly.
+  //
+  // The bridge is authoritative for the bridge-side facts in `params`
+  // (domain / exchange URL / usage hints) and for the `required` flag — a
+  // client's wire card cannot weaken either by self-declaring a downgraded
+  // version of the same URI. So when the wire card declares the URI we
+  // suppress its entry and emit our own; non-SIWE wire extensions pass
+  // through unchanged.
   //
   // `required: true` matches vicoop-db-agent-builder's advertisement so
   // Mentionable clients that fail-closed on unknown required extensions
   // behave identically across both hosts. Clients that don't understand
   // the URI can still authenticate via the opaque vbc_caller_* path on
   // the bridge.
+  const wireExtensions = wire.capabilities?.extensions ?? [];
   const restricted = conn.allowedCallers.length > 0;
-  const wireDeclaresSiwe = wireExtensions.some((e) => e.uri === SIWE_BEARER_AUTH_EXTENSION_URI);
-  if (restricted && opts.publicUrl && !wireDeclaresSiwe) {
+  const bridgeWillEmitSiwe = restricted && Boolean(opts.publicUrl);
+  for (const extension of wireExtensions) {
+    if (bridgeWillEmitSiwe && extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI) {
+      // Drop the wire-declared SIWE entry — the bridge owns this advertisement.
+      continue;
+    }
+    a2xAgent.addExtension(extension);
+  }
+  if (bridgeWillEmitSiwe) {
     // Match http.tsx's siwe domain derivation (.hostname strips the port) so
     // the advertised domain matches what /auth/siwe/exchange and the bearer
     // fast-path actually validate against.
-    const siweDomain = new URL(opts.publicUrl).hostname;
+    const siweDomain = new URL(opts.publicUrl!).hostname;
     a2xAgent.addExtension({
       uri: SIWE_BEARER_AUTH_EXTENSION_URI,
       description:

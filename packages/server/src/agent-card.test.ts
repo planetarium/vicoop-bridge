@@ -155,7 +155,9 @@ test('buildAgentA2XAgent omits SIWE extension for public agents', () => {
   assert.equal(siwe, undefined);
 });
 
-test('buildAgentA2XAgent does not double-add SIWE extension when wire already declares it', () => {
+test('buildAgentA2XAgent overrides a wire-declared SIWE extension with the bridge version', () => {
+  // The bridge is authoritative for params (domain / endpoint / hints) and
+  // for `required: true`; a client cannot weaken either via the wire card.
   const agent = buildAgentA2XAgent(
     fakeConn(
       {
@@ -166,13 +168,54 @@ test('buildAgentA2XAgent does not double-add SIWE extension when wire already de
         capabilities: {
           streaming: true,
           extensions: [
-            { uri: SIWE_BEARER_AUTH_EXTENSION_URI, description: 'wire-declared', required: true },
+            {
+              uri: SIWE_BEARER_AUTH_EXTENSION_URI,
+              description: 'wire-declared (downgraded)',
+              required: false,
+            },
           ],
         },
         skills: [],
       },
       { allowedCallers: ['eth:0x0000000000000000000000000000000000000002'] },
     ),
+    new InMemoryTaskStore(),
+    new Registry(),
+    { publicUrl: 'https://bridge.example', deviceFlowEnabled: false },
+  );
+
+  const card = agent.getAgentCard() as AgentCardV03;
+  const siweEntries = (card.capabilities.extensions ?? []).filter(
+    (e) => e.uri === SIWE_BEARER_AUTH_EXTENSION_URI,
+  );
+  assert.equal(siweEntries.length, 1, 'expected exactly one SIWE extension entry');
+  // Bridge-emitted, not wire-declared.
+  assert.equal(siweEntries[0]!.required, true);
+  assert.notEqual(siweEntries[0]!.description, 'wire-declared (downgraded)');
+  assert.equal(
+    (siweEntries[0]!.params as { domain: string }).domain,
+    'bridge.example',
+    'bridge must own the advertised SIWE domain',
+  );
+});
+
+test('buildAgentA2XAgent leaves a wire-declared SIWE extension alone when not restricted', () => {
+  // Public agent: the bridge does not enforce SIWE auth, so a wire card that
+  // happens to declare the URI passes through unchanged.
+  const agent = buildAgentA2XAgent(
+    fakeConn({
+      name: 'claude',
+      description: 'Claude Code',
+      version: '0.0.1',
+      protocolVersion: '0.3.0',
+      capabilities: {
+        streaming: true,
+        extensions: [
+          { uri: SIWE_BEARER_AUTH_EXTENSION_URI, description: 'wire-declared', required: true },
+        ],
+      },
+      skills: [],
+    }),
     new InMemoryTaskStore(),
     new Registry(),
     { publicUrl: 'https://bridge.example', deviceFlowEnabled: false },
