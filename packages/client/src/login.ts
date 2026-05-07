@@ -15,7 +15,8 @@
 // composition (`$(vicoop-client login --json | jq -r .client_token)`)
 // straightforward.
 
-import { writeFileSync, chmodSync } from 'node:fs';
+import { closeSync, openSync, renameSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { saveOwnerSession, defaultStorePath } from './owner-session.js';
 
 type Intent = 'client_register' | 'owner_session';
@@ -243,14 +244,19 @@ function writeEnvFile(path: string, success: TokenSuccessResponse, bridgeUrl: st
         `VICOOP_OWNER_TOKEN=${success.access_token}`,
         '',
       ].join('\n');
-  writeFileSync(path, lines);
-  // chmod 600 so a peer process on the same host can't read the token. Best
-  // effort — fails silently on filesystems that don't support POSIX modes.
+  // Same atomic write+rename pattern saveOwnerSession uses: openSync's mode
+  // arg is only honoured on creation, so write-then-chmod against an existing
+  // path would leave looser perms in place, and even on first creation under
+  // a permissive umask the file is briefly world-readable. Writing fresh to
+  // a 0o600 temp sibling and renaming sidesteps both.
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  const fd = openSync(tmp, 'wx', 0o600);
   try {
-    chmodSync(path, 0o600);
-  } catch {
-    // ignore
+    writeFileSync(fd, lines);
+  } finally {
+    closeSync(fd);
   }
+  renameSync(tmp, path);
 }
 
 export async function runLogin(args: string[]): Promise<number> {
