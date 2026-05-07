@@ -97,6 +97,11 @@ export async function addCaller(
     }
     const callers = existing[0].allowed_callers as string[];
     if (callers.includes(normalized)) {
+      // Idempotent path also pushes the canonical DB state into the registry
+      // so a stale in-memory copy (e.g. a missed caller-change notification)
+      // converges on every call. Cheap; the registry update is a single map
+      // assignment plus listener fan-out.
+      registry.updateAllowedCallers(agentId, callers);
       return {
         agent_id: agentId,
         principal: normalized,
@@ -148,6 +153,9 @@ export async function removeCaller(
       throw new AdminApiError('Agent policy not found or not authorized.', 404);
     }
     const callers = existing[0].allowed_callers as string[];
+    // Same convergence as addCaller's no-op path: hot-reload the registry
+    // even when nothing changed so a stale in-memory copy lines up with DB.
+    registry.updateAllowedCallers(agentId, callers);
     return {
       agent_id: agentId,
       principal: normalized,

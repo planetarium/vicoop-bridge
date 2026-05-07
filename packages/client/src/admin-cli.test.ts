@@ -231,6 +231,23 @@ test('subcommand exits 1 with hint when no token is available', async (t) => {
   assert.match(stderr.read(), /vicoop-client login --owner-session/);
 });
 
+test('subcommand surfaces network errors as a clean exit-1 instead of crashing', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stderr = captureStderr(t);
+
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new TypeError('fetch failed');
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+
+  const code = await runListAgents([]);
+  assert.equal(code, 1);
+  assert.match(stderr.read(), /network error.*fetch failed/);
+});
+
 test('subcommand surfaces server error on non-2xx response', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   const stderr = captureStderr(t);

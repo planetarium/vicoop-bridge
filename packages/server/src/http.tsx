@@ -308,14 +308,18 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const authHeader = c.req.header('Authorization');
     const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
     if (!bearerToken || !bearerToken.startsWith(OWNER_SESSION_PREFIX)) {
+      // Device flow is optional (only mounted when Google OAuth is configured),
+      // so don't point operators at /oauth/device/code on SIWE-only deployments.
+      const acquireHints = deviceFlowEnabled
+        ? '/auth/siwe/exchange (intent=owner_session) or /oauth/device/code (intent=owner_session)'
+        : '/auth/siwe/exchange (intent=owner_session)';
       return {
         ok: false,
         response: c.json(
           {
             error:
               `Authentication required (Bearer ${OWNER_SESSION_PREFIX}* token). ` +
-              `Acquire via /auth/siwe/exchange (intent=owner_session) or ` +
-              `/oauth/device/code (intent=owner_session).`,
+              `Acquire via ${acquireHints}.`,
           },
           401,
         ),

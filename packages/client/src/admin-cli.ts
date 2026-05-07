@@ -102,11 +102,23 @@ async function callApi({ session, method, path, body }: RequestArgs): Promise<Ap
     Authorization: `Bearer ${session.token}`,
   };
   if (body !== undefined) headers['content-type'] = 'application/json';
-  const res = await fetch(`${session.bridge}${path}`, {
-    method,
-    headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${session.bridge}${path}`, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch (err) {
+    // Surface DNS / ECONNREFUSED / TLS / aborted-connection failures through
+    // the same emitError path the rest of the subcommands use, so the user
+    // gets a clean "error (0): …" line + exit code 1 instead of an unhandled
+    // rejection stack trace. Status 0 is a sentinel for "no HTTP response".
+    return {
+      status: 0,
+      body: { error: `network error: ${(err as Error).message}` },
+    };
+  }
   const text = await res.text();
   let parsed: unknown = text;
   if (text) {
@@ -128,7 +140,9 @@ function emitError(result: ApiResult): void {
 }
 
 function emit(result: ApiResult, json: boolean, humanRender: (body: unknown) => string): number {
-  if (result.status >= 400) {
+  // status 0 is the network-error sentinel from callApi; treat it as failure
+  // alongside the regular HTTP error range.
+  if (result.status === 0 || result.status >= 400) {
     emitError(result);
     return 1;
   }
