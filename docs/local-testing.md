@@ -93,9 +93,15 @@ cd packages/client
 ```
 
 The WS registration auto-creates an `agent_policies` row with
-`allowed_callers = '{}'` (public). To make the agent require auth, populate
-`allowed_callers` then restart the client (registry reads the list only at
-registration time).
+`allowed_callers = '{}'` (public). Two ways to populate it:
+
+- **`vicoop-client add-caller`** (Paths B/C below) — hot-reloads via
+  `registry.updateAllowedCallers`, no restart needed. Requires an
+  owner-session bearer (issued via SIWE exchange or Google device flow).
+- **Raw SQL `UPDATE agent_policies SET allowed_callers = …`** (Path A
+  below) — bypasses the registry, so the connected client must be killed
+  and rerun to pick up the new list. Useful when you want to skip the
+  auth flow entirely for the smoke test.
 
 ## Path A — opaque token via direct DB insert
 
@@ -167,15 +173,23 @@ curl -sX POST http://localhost:8787/oauth/token \
 # while pending: {"error":"authorization_pending"}
 # after approval: {"access_token":"vbc_caller_...","token_type":"Bearer","expires_in":...}
 
-# 4. Find the principal that was bound to your token
+# 4. Find the Google sub that was bound to your token
 psql vicoop_bridge_dev -c \
   "SELECT principal_id, email, expires_at FROM callers ORDER BY created_at DESC LIMIT 1;"
+# principal_id will be 'google:<sub>' — keep the sub for step 5b.
 
-# 5. Grant that principal access to the agent + restart echo client
-psql vicoop_bridge_dev -c \
-  "UPDATE agent_policies SET allowed_callers = ARRAY['google:sub:<YOUR_SUB>'] WHERE agent_id='echo-agent';"
-pkill -f 'tsx.*cli.ts.*echo-agent'
-# ...rerun client...
+# 5a. Get an owner-session bearer (separate device-flow run with
+#     intent=owner_session). Saves the token to ~/.vicoop/owner-session.json
+#     so 5b picks it up automatically. Re-using the same Google account is
+#     fine; the audiences are independent.
+#     (`CLI` is just shorthand for the local-source invocation — see the
+#     callout below if you're working from a published bundle.)
+CLI="pnpm --filter @vicoop-bridge/client exec tsx src/cli.ts"
+$CLI login --owner-session --bridge http://localhost:8787
+
+# 5b. Add the caller principal — hot-reloads via registry.updateAllowedCallers,
+#     no client restart needed.
+$CLI add-caller echo-agent "google:sub:<YOUR_SUB>"
 
 # 6. Call the agent with the issued Bearer
 TOKEN="vbc_caller_..."   # from step 3
@@ -184,6 +198,11 @@ curl -s -X POST http://localhost:8787/agents/echo-agent \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"m","role":"user","kind":"message","parts":[{"kind":"text","text":"hi"}]}}}'
 ```
+
+> Working from a published client bundle instead of source? Swap `$CLI`
+> for `"$INSTALL_DIR/bin/vicoop-client"` (the path
+> [`docs/install-client.md`](./install-client.md) sets up). The
+> subcommands are identical.
 
 Other entry formats:
 - `google:email:<your_email>` — matches on verified email
@@ -237,10 +256,13 @@ JS
 cp /tmp/gen-siwe.mjs packages/admin-ui/
 (cd packages/admin-ui && node gen-siwe.mjs) > /tmp/siwe.json
 
-# Exchange SIWE → opaque caller token.
+# Exchange SIWE → opaque caller token. The exchange endpoint defaults to
+# audience='owner_session' (vbc_owner_*) when intent is omitted, so for the
+# /agents/:id call below we ask explicitly for intent=caller.
 TOKEN=$(curl -sX POST http://localhost:8787/auth/siwe/exchange \
   -H "Content-Type: application/json" \
-  --data @/tmp/siwe.json | jq -r .access_token)
+  --data "$(jq -c '. + {intent: "caller"}' /tmp/siwe.json)" \
+  | jq -r .access_token)
 echo "$TOKEN"   # vbc_caller_...
 
 # Confirm the callers row landed with provider='siwe'.
@@ -249,11 +271,25 @@ psql vicoop_bridge_dev -c \
 # principal_id should be eth:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266 (Anvil #0, lowercased)
 # provider should be 'siwe'
 
-# Grant the wallet, restart client, call the agent with the opaque token.
-psql vicoop_bridge_dev -c \
-  "UPDATE agent_policies SET allowed_callers = ARRAY['eth:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266'] WHERE agent_id='echo-agent';"
-# ...restart client...
+# Grant the wallet via the CLI (no client restart needed). Two-step:
+#   (a) sign a fresh SIWE for an owner-session bearer
+#   (b) add the eth:* principal to the agent's allowed_callers
+# The step-3 exchange asked for intent=caller; here we use the exchange
+# endpoint's owner_session default (intent omitted) for the policy bearer.
+# Re-run /tmp/gen-siwe.mjs to mint a fresh nonce — single-use per exchange.
+(cd packages/admin-ui && node gen-siwe.mjs) > /tmp/siwe-owner.json
+OWNER_TOKEN=$(curl -sX POST 'http://localhost:8787/auth/siwe/exchange' \
+  -H 'Content-Type: application/json' \
+  --data @/tmp/siwe-owner.json \
+  | jq -r .access_token)
+echo "$OWNER_TOKEN"   # vbc_owner_...
 
+CLI="pnpm --filter @vicoop-bridge/client exec tsx src/cli.ts"
+VICOOP_BRIDGE=http://localhost:8787 VICOOP_OWNER_TOKEN="$OWNER_TOKEN" \
+  $CLI add-caller echo-agent \
+  'eth:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266'
+
+# Call the agent with the caller-audience opaque token from step 3.
 curl -s -X POST http://localhost:8787/agents/echo-agent \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
@@ -284,9 +320,12 @@ DATABASE_URL="postgres://$USER@localhost:5432/vicoop_bridge_dev" \
 
 ## Gotchas
 
-- **`allowed_callers` edits via SQL don't hot-reload** — `registry.ts` caches
-  the list in memory at WS registration. After updating the DB, kill and
-  re-run the echo client so it re-registers and the registry re-reads the row.
+- **`allowed_callers` edits via raw SQL don't hot-reload** — `registry.ts`
+  caches the list in memory at WS registration. After a `psql` `UPDATE`
+  (Path A), kill and re-run the echo client so it re-registers and the
+  registry re-reads the row. The `vicoop-client add-caller` /
+  `remove-caller` subcommands and the admin agent's `add_caller` tool
+  call `registry.updateAllowedCallers` and don't need a restart.
 - **Client `--server` URL must not include `/connect`** — client.ts appends it.
   `--server ws://localhost:8787/connect` results in `/connect/connect` and
   immediate disconnects.
