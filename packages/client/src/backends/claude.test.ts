@@ -833,6 +833,7 @@ test('coalesces split stdout chunks (partial line across data events)', async ()
 
 test('skips tool_result media whose decoded bytes match an inbound FilePart (input echo dedup)', async () => {
   const sharedBytes = 'iVBORw0KAA==';
+  const distinctBytes = 'ZGlzdGluY3Q=';
   const fake = scriptedSpawn({
     lines: [
       // Same base64 the caller sent on stdin — the model "Read" the input.
@@ -849,6 +850,10 @@ test('skips tool_result media whose decoded bytes match an inbound FilePart (inp
                   type: 'image',
                   source: { type: 'base64', media_type: 'image/png', data: sharedBytes },
                 },
+                {
+                  type: 'image',
+                  source: { type: 'base64', media_type: 'image/png', data: distinctBytes },
+                },
               ],
             },
           ],
@@ -864,6 +869,7 @@ test('skips tool_result media whose decoded bytes match an inbound FilePart (inp
     type: 'task.assign',
     taskId: 't',
     contextId: 'c',
+    requestedExtensions: [TRACEABILITY_EXTENSION_URI],
     message: {
       role: 'user',
       messageId: 'm',
@@ -881,9 +887,16 @@ test('skips tool_result media whose decoded bytes match an inbound FilePart (inp
   );
   assert.equal(
     fileArtifacts.length,
-    0,
-    'tool_result whose bytes echo the inbound FilePart must not re-emit',
+    1,
+    'Traceability-enabled tool_result media should emit only non-echo files',
   );
+  const part = fileArtifacts[0].artifact.parts[0];
+  assert.equal(part.kind, 'file');
+  if (part.kind === 'file') {
+    assert.equal(part.file.bytes, distinctBytes);
+  }
+  assert.deepEqual(fileArtifacts[0].artifact.extensions, [TRACEABILITY_EXTENSION_URI]);
+  assert.equal(fileArtifacts[0].artifact.metadata?.traceType, 'tool-result');
 });
 
 test('emits FilePart artifact when tool_result contains an image block', async () => {
