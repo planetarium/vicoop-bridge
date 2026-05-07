@@ -19,7 +19,17 @@ export interface ClientOptions {
   backendKind: string;
   backend: Backend;
   maxConcurrency?: number;
+  // Initial reconnect delay after an unintentional disconnect. Retries use
+  // exponential backoff from this value up to `reconnectMaxDelayMs`.
   reconnectDelayMs?: number;
+  reconnectMaxDelayMs?: number;
+  reconnectJitterRatio?: number;
+  reconnectStableMs?: number;
+  // WebSocket protocol ping interval. The client terminates the socket when
+  // a previous ping has not received a pong by the next tick, which turns
+  // half-open network failures into a normal reconnect path. Set to 0 to
+  // disable.
+  heartbeatIntervalMs?: number;
   // Upper bound on how long we'll wait for `backend.resolveCapabilities()`
   // before sending the bridge-server hello with the card's declared
   // capabilities. Defaults to 3000 ms — comfortably under the bridge
@@ -36,10 +46,20 @@ export interface ClientOptions {
 }
 
 const DEFAULT_PROBE_DEADLINE_MS = 3000;
+const DEFAULT_RECONNECT_DELAY_MS = 3000;
+const DEFAULT_RECONNECT_MAX_DELAY_MS = 30_000;
+const DEFAULT_RECONNECT_JITTER_RATIO = 0.2;
+const DEFAULT_RECONNECT_STABLE_MS = 60_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
 
 export class Client {
   private ws: WebSocket | null = null;
   private stopped = false;
+  private reconnectAttempt = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectResetTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatAwaitingPong = false;
   private inflight = new Map<string, AbortController>();
   // Resolved once per process via backend.resolveCapabilities(); the bridge
   // hello frame is held until this settles so the advertised card matches the
@@ -66,6 +86,9 @@ export class Client {
 
   stop(): void {
     this.stopped = true;
+    this.clearReconnectTimer();
+    this.clearReconnectResetTimer();
+    this.clearHeartbeat();
     // Abort all inflight tasks so backends can unwind cleanly instead of
     // running to completion after the WS is gone.
     for (const controller of this.inflight.values()) controller.abort();
@@ -152,6 +175,8 @@ export class Client {
     this.ws = ws;
 
     ws.on('open', () => {
+      this.scheduleReconnectAttemptReset(ws);
+      this.startHeartbeat(ws);
       // The probe runs in parallel with the bridge TCP/WS handshake; by the
       // time `open` fires it's usually already settled. Awaiting here means
       // the bridge-server sees a card whose capabilities match what the
@@ -232,15 +257,21 @@ export class Client {
       }
     });
 
+    ws.on('pong', () => {
+      if (this.ws === ws) this.heartbeatAwaitingPong = false;
+    });
+
     ws.on('close', (code, reason) => {
+      const current = this.ws === ws;
+      if (current) this.clearReconnectResetTimer();
+      if (current) this.clearHeartbeat();
       // `reason` is a remote-controlled byte buffer from the WebSocket
       // close frame; sanitize before logging so a server can't inject a
       // fake `[client] …` line via newlines.
       this.logger.info(`disconnected: ${code} ${safeToken(reason.toString())}`);
-      this.ws = null;
-      if (!this.stopped) {
-        const delay = this.opts.reconnectDelayMs ?? 3000;
-        setTimeout(() => this.connect(), delay);
+      if (current) {
+        this.ws = null;
+        this.scheduleReconnect();
       }
     });
 
@@ -250,6 +281,94 @@ export class Client {
       // applied to the close `reason` and lifecycle logs.
       this.logger.error(`ws error: ${safeToken(err.message)}`);
     });
+  }
+
+  private startHeartbeat(ws: WebSocket): void {
+    this.clearHeartbeat();
+    const intervalMs = this.opts.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+    if (intervalMs <= 0) return;
+    this.heartbeatAwaitingPong = false;
+    this.heartbeatTimer = setInterval(() => {
+      if (this.stopped || this.ws !== ws) return;
+      if (ws.readyState !== WebSocket.OPEN) return;
+      if (this.heartbeatAwaitingPong) {
+        this.logger.warn('connection heartbeat timed out; reconnecting');
+        ws.terminate();
+        return;
+      }
+      this.heartbeatAwaitingPong = true;
+      try {
+        ws.ping();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger.warn(`connection heartbeat failed (${safeToken(message)}); reconnecting`);
+        ws.terminate();
+      }
+    }, intervalMs);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private clearHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    this.heartbeatAwaitingPong = false;
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  private clearReconnectResetTimer(): void {
+    if (this.reconnectResetTimer) {
+      clearTimeout(this.reconnectResetTimer);
+      this.reconnectResetTimer = null;
+    }
+  }
+
+  private scheduleReconnectAttemptReset(ws: WebSocket): void {
+    this.clearReconnectResetTimer();
+    const stableMs = this.opts.reconnectStableMs ?? DEFAULT_RECONNECT_STABLE_MS;
+    if (stableMs <= 0) {
+      this.reconnectAttempt = 0;
+      return;
+    }
+    this.reconnectResetTimer = setTimeout(() => {
+      this.reconnectResetTimer = null;
+      if (!this.stopped && this.ws === ws && ws.readyState === WebSocket.OPEN) {
+        this.reconnectAttempt = 0;
+      }
+    }, stableMs);
+    this.reconnectResetTimer.unref?.();
+  }
+
+  private scheduleReconnect(): void {
+    if (this.stopped || this.reconnectTimer) return;
+    const attempt = this.reconnectAttempt++;
+    const delay = this.nextReconnectDelay(attempt);
+    this.logger.info(`reconnecting in ${delay}ms attempt=${attempt + 1}`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.logger.info(`reconnect attempt=${attempt + 1}`);
+      this.connect();
+    }, delay);
+    this.reconnectTimer.unref?.();
+  }
+
+  private nextReconnectDelay(attempt: number): number {
+    const base = Math.max(0, this.opts.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS);
+    const max = Math.max(base, this.opts.reconnectMaxDelayMs ?? DEFAULT_RECONNECT_MAX_DELAY_MS);
+    const capped = Math.min(max, base * 2 ** attempt);
+    const ratio = Math.max(0, this.opts.reconnectJitterRatio ?? DEFAULT_RECONNECT_JITTER_RATIO);
+    if (capped === 0 || ratio === 0) return Math.round(capped);
+    const jitter = capped * ratio;
+    const min = Math.max(0, capped - jitter);
+    const maxWithJitter = Math.min(max, capped + jitter);
+    return Math.round(min + Math.random() * (maxWithJitter - min));
   }
 
   private send(frame: UpFrame): void {
