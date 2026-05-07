@@ -199,6 +199,40 @@ test('buildAgentA2XAgent overrides a wire-declared SIWE extension with the bridg
   );
 });
 
+test('buildAgentA2XAgent drops a wire-declared SIWE extension on restricted agents without publicUrl', () => {
+  // Without publicUrl the middleware can't accept SIWE bearers (no
+  // siweDomain). Letting a wire-declared SIWE extension pass through here
+  // would advertise auth the server won't actually honor, so it must be
+  // stripped — even though the bridge isn't emitting its own replacement.
+  const agent = buildAgentA2XAgent(
+    fakeConn(
+      {
+        name: 'claude',
+        description: 'Claude Code',
+        version: '0.0.1',
+        protocolVersion: '0.3.0',
+        capabilities: {
+          streaming: true,
+          extensions: [
+            { uri: SIWE_BEARER_AUTH_EXTENSION_URI, description: 'wire-declared', required: true },
+          ],
+        },
+        skills: [],
+      },
+      { allowedCallers: ['eth:0x0000000000000000000000000000000000000002'] },
+    ),
+    new InMemoryTaskStore(),
+    new Registry(),
+    { publicUrl: undefined, deviceFlowEnabled: false },
+  );
+
+  const card = agent.getAgentCard() as AgentCardV03;
+  const siweEntries = (card.capabilities.extensions ?? []).filter(
+    (e) => e.uri === SIWE_BEARER_AUTH_EXTENSION_URI,
+  );
+  assert.equal(siweEntries.length, 0);
+});
+
 test('buildAgentA2XAgent leaves a wire-declared SIWE extension alone when not restricted', () => {
   // Public agent: the bridge does not enforce SIWE auth, so a wire card that
   // happens to declare the URI passes through unchanged.

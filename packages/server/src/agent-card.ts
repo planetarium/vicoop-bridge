@@ -63,12 +63,21 @@ export function buildAgentA2XAgent(
   // discover this URI to know they can mint a base64url SIWE bearer locally
   // (no exchange step) and present it directly.
   //
-  // The bridge is authoritative for the bridge-side facts in `params`
-  // (domain / exchange URL / usage hints) and for the `required` flag — a
-  // client's wire card cannot weaken either by self-declaring a downgraded
-  // version of the same URI. So when the wire card declares the URI we
-  // suppress its entry and emit our own; non-SIWE wire extensions pass
-  // through unchanged.
+  // For restricted agents the bridge owns the SIWE bearer-auth
+  // advertisement: it is authoritative for the bridge-side facts in `params`
+  // (domain / exchange URL / usage hints) and for the `required` flag, and
+  // — critically — is the only side that knows whether the SIWE-bearer
+  // fast-path is actually wired. The middleware accepts SIWE bearers iff a
+  // siweDomain is configured, which on this layer maps to opts.publicUrl
+  // being set (http.tsx derives one from the other). So for restricted
+  // agents we always strip a wire-declared SIWE entry and re-emit our own
+  // only when publicUrl is set; without publicUrl we drop it entirely so a
+  // wire client can't advertise auth that the server won't accept.
+  //
+  // Public agents pass wire SIWE entries through unchanged: auth isn't
+  // enforced there, so the advertisement is informational and the wire
+  // client's intent (e.g. "I'd like SIWE if you ever restrict me") is
+  // preserved.
   //
   // `required: true` matches vicoop-db-agent-builder's advertisement so
   // Mentionable clients that fail-closed on unknown required extensions
@@ -79,8 +88,10 @@ export function buildAgentA2XAgent(
   const restricted = conn.allowedCallers.length > 0;
   const bridgeWillEmitSiwe = restricted && Boolean(opts.publicUrl);
   for (const extension of wireExtensions) {
-    if (bridgeWillEmitSiwe && extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI) {
-      // Drop the wire-declared SIWE entry — the bridge owns this advertisement.
+    if (restricted && extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI) {
+      // Bridge owns this advertisement on restricted agents — drop wire
+      // entry whether or not we re-emit our own (the latter is gated by
+      // publicUrl).
       continue;
     }
     a2xAgent.addExtension(extension);
