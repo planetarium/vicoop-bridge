@@ -1171,6 +1171,7 @@ test('handle(): file.uri fails fast with unsupported_file_uri', async () => {
     const fail = frames.find((f) => f.type === 'task.fail');
     assert.ok(fail);
     assert.equal(fail!.error.code, 'unsupported_file_uri');
+    assert.match(fail!.error.message, /URI fetching is disabled/);
     await new Promise((r) => setTimeout(r, 30));
     assert.equal(chatSendSeen, false);
   } finally {

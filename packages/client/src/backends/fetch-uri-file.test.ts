@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fetchUriToBytes } from './fetch-uri-file.js';
+import { INPUT_FILE_MAX_BYTES, fetchUriToBytes } from './fetch-uri-file.js';
 
 const NEVER: AbortSignal = new AbortController().signal;
 const PUBLIC_IP = ['93.184.216.34'];
@@ -106,6 +106,42 @@ test('fetchUriToBytes: rejects Content-Length over the inbound cap', async () =>
       NEVER,
     ),
     { name: 'FetchUriError', code: 'fetch_too_large' },
+  );
+});
+
+test('fetchUriToBytes: rejects responses that exceed the inbound cap while streaming', async () => {
+  await assert.rejects(
+    fetchUriToBytes(
+      'https://example.com/x.png',
+      'image/png',
+      {
+        fetchImpl: async () =>
+          new Response(Buffer.alloc(INPUT_FILE_MAX_BYTES + 1), {
+            headers: { 'content-type': 'image/png' },
+          }),
+        resolveHost: async () => PUBLIC_IP,
+      },
+      NEVER,
+    ),
+    { name: 'FetchUriError', code: 'fetch_too_large' },
+  );
+});
+
+test('fetchUriToBytes: rejects empty response bodies', async () => {
+  await assert.rejects(
+    fetchUriToBytes(
+      'https://example.com/x.png',
+      'image/png',
+      {
+        fetchImpl: async () =>
+          new Response(null, {
+            headers: { 'content-type': 'image/png' },
+          }),
+        resolveHost: async () => PUBLIC_IP,
+      },
+      NEVER,
+    ),
+    { name: 'FetchUriError', code: 'fetch_failed' },
   );
 });
 

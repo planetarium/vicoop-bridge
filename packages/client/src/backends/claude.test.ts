@@ -398,6 +398,7 @@ test('rejects FilePart with uri-only when URI fetching is disabled', async () =>
   const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
   assert.ok(fail);
   assert.equal(fail.error.code, 'unsupported_file_uri');
+  assert.match(fail.error.message, /URI fetching is disabled/);
 });
 
 test('stdin envelope: URI FilePart is fetched and mapped like inline image bytes', async () => {

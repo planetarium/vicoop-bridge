@@ -175,14 +175,15 @@ function makeTimeoutSignal(parent: AbortSignal, timeoutMs: number): { signal: Ab
   };
 }
 
-async function responseBytesToBase64(res: Response): Promise<string> {
-  const buf = Buffer.from(await res.arrayBuffer());
-  return buf.toString('base64');
+async function cancelResponseBody(res: Response): Promise<void> {
+  await res.body?.cancel().catch(() => undefined);
 }
 
 async function responseStreamToBase64(res: Response, maxBytes: number): Promise<string> {
   const body = res.body;
-  if (!body) return '';
+  if (!body) {
+    throw new FetchUriError('fetch_failed', 'file.uri response had no body');
+  }
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -196,6 +197,9 @@ async function responseStreamToBase64(res: Response, maxBytes: number): Promise<
       throw new FetchUriError('fetch_too_large', `file.uri response exceeded INPUT_FILE_MAX_BYTES (${total} > ${maxBytes})`);
     }
     chunks.push(value);
+  }
+  if (total === 0) {
+    throw new FetchUriError('fetch_failed', 'file.uri response body was empty');
   }
   return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('base64');
 }
@@ -231,16 +235,20 @@ export async function fetchUriToBytes(
       if (res.status >= 300 && res.status < 400) {
         const location = res.headers.get('location');
         if (!location) {
+          await cancelResponseBody(res);
           throw new FetchUriError('fetch_failed', `file.uri redirect missing Location header (${res.status})`);
         }
         if (redirects === maxRedirects) {
+          await cancelResponseBody(res);
           throw new FetchUriError('fetch_failed', `file.uri exceeded max redirects (${maxRedirects})`);
         }
+        await cancelResponseBody(res);
         current = new URL(location, current);
         continue;
       }
 
       if (!res.ok) {
+        await cancelResponseBody(res);
         throw new FetchUriError('fetch_failed', `file.uri fetch returned HTTP ${res.status}`);
       }
 
@@ -248,6 +256,7 @@ export async function fetchUriToBytes(
       if (contentLength !== null) {
         const n = Number(contentLength);
         if (Number.isFinite(n) && n > INPUT_FILE_MAX_BYTES) {
+          await cancelResponseBody(res);
           throw new FetchUriError('fetch_too_large', `file.uri Content-Length exceeds INPUT_FILE_MAX_BYTES (${n} > ${INPUT_FILE_MAX_BYTES})`);
         }
       }
@@ -255,15 +264,15 @@ export async function fetchUriToBytes(
       const observedMime = normalizeMime(res.headers.get('content-type'));
       const declared = normalizeMime(declaredMimeType ?? null);
       if (!observedMime || !isSupportedInputFileMime(observedMime)) {
+        await cancelResponseBody(res);
         throw new FetchUriError('fetch_mime_mismatch', `file.uri Content-Type is not supported (${observedMime || 'unknown'})`);
       }
       if (declared && declared !== observedMime) {
+        await cancelResponseBody(res);
         throw new FetchUriError('fetch_mime_mismatch', `file.uri declared mimeType ${declared} does not match Content-Type ${observedMime}`);
       }
 
-      const bytes = res.body
-        ? await responseStreamToBase64(res, INPUT_FILE_MAX_BYTES)
-        : await responseBytesToBase64(res);
+      const bytes = await responseStreamToBase64(res, INPUT_FILE_MAX_BYTES);
       return { bytes, mimeType: observedMime };
     }
   } finally {

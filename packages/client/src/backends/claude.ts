@@ -403,6 +403,13 @@ async function mapPartsToContentBlocks(
           };
         }
       }
+      if (!bytes && p.file.uri && fetchUriPolicy?.enabled === false) {
+        return {
+          ok: false,
+          code: 'unsupported_file_uri',
+          message: 'claude backend URI fetching is disabled; provide inline FilePart bytes',
+        };
+      }
       if (!bytes) {
         return {
           ok: false,

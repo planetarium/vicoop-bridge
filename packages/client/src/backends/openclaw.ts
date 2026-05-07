@@ -417,6 +417,15 @@ export async function mapPartsToChatInput(
           };
         }
       }
+      if (bytes === undefined && f.uri !== undefined && fetchUriPolicy?.enabled === false) {
+        return {
+          ok: false,
+          error: {
+            code: 'unsupported_file_uri',
+            message: `part[${idx}]: URI fetching is disabled; provide inline file.bytes`,
+          },
+        };
+      }
       if (bytes === undefined) {
         return {
           ok: false,
