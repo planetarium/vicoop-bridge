@@ -1,7 +1,11 @@
 import type { Context, Next } from 'hono';
 import type { ClientConnection, Registry } from './registry.js';
 import type { Sql } from './db.js';
-import { CALLER_TOKEN_PREFIX, verifyCallerToken } from './auth/caller-token.js';
+import {
+  CALLER_TOKEN_PREFIX,
+  OWNER_SESSION_PREFIX,
+  verifyCallerToken,
+} from './auth/caller-token.js';
 import { matchPrincipal, type VerifiedCaller } from './auth/principal.js';
 import { verifySiweBearerToken } from './auth/siwe-bearer.js';
 import { logEvent, truncate } from './log.js';
@@ -92,6 +96,22 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
           error: { code: -32001, message: `Invalid bearer token: ${(err as Error).message}` },
         }, 401);
       }
+    } else if (bearerToken.startsWith(OWNER_SESSION_PREFIX)) {
+      // Owner-session tokens are for self-service surfaces (admin agent /
+      // /graphql) and explicitly not accepted here, even when the principal
+      // is in allowed_callers. Reject up front with a clear message — without
+      // this, the SIWE-bearer branch below would try to decode the opaque
+      // owner-session token as base64url JSON and fail with the misleading
+      // "SIWE bearer token is not valid JSON".
+      logEvent('agent_request_rejected', { agentId, reason: 'owner_session_on_caller_route' });
+      return c.json({
+        jsonrpc: '2.0',
+        id: null,
+        error: {
+          code: -32001,
+          message: `Invalid bearer token: ${OWNER_SESSION_PREFIX}* (owner-session) tokens are not accepted on /agents/:id. Acquire one via ${acquisitionHint}.`,
+        },
+      }, 401);
     } else if (opts.siweDomain) {
       // Stateless SIWE bearer per siwe-bearer-auth/v0.1. No callers row is
       // created — revocation is at the principal level (remove from
