@@ -191,6 +191,8 @@ function wireMessageToA2X(
     // either (text-part guard hits on `'text' in part`; file/data fall
     // through to fallback that spreads). Cast keeps type-checker happy.
     parts: m.parts as unknown as Message['parts'],
+    ...(m.metadata !== undefined ? { metadata: m.metadata } : {}),
+    ...(m.extensions !== undefined ? { extensions: m.extensions } : {}),
     taskId,
     contextId,
   };
@@ -280,6 +282,8 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           artifact: {
             artifactId: frame.artifact.artifactId,
             ...(frame.artifact.name !== undefined ? { name: frame.artifact.name } : {}),
+            ...(frame.artifact.metadata !== undefined ? { metadata: frame.artifact.metadata } : {}),
+            ...(frame.artifact.extensions !== undefined ? { extensions: frame.artifact.extensions } : {}),
             // Wire-shape parts; see wireMessageToA2X for the shape note.
             parts: frame.artifact.parts as unknown as Part[] as never,
           },

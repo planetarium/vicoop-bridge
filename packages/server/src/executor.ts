@@ -101,7 +101,10 @@ export class WSForwardingExecutor extends AgentExecutor {
         // the parts through as-is.
         parts: message.parts as never,
         messageId: message.messageId,
+        ...(message.metadata !== undefined ? { metadata: message.metadata } : {}),
+        ...(message.extensions !== undefined ? { extensions: message.extensions } : {}),
       },
+      ...(message.extensions !== undefined ? { requestedExtensions: message.extensions } : {}),
     });
 
     if (!sent) {

@@ -181,26 +181,32 @@ image block`. An e2e harness for that path would require a separate MCP
 server that actually returns image blocks; deferred until a real use
 case lands.
 
-## Progress visibility (issue #100)
+## Progress visibility and traces (issues #100, #111)
 
 Long-running tool work used to look identical to a hung process: a
 single `task.status: working` followed by a multi-minute silence until
-the final assistant text. Two additions cover the gap, both unit-tested
-in `claude.test.ts`:
+the final assistant text. The bridge now separates caller-visible
+progress from execution trace details:
 
-- `tool_use` blocks inside an `assistant` event become
-  `claude-tool-call` artifacts. Each artifact carries a head-truncated
-  `<tool>: <input>` text part (≤ 200 chars — **size guard only**, not a
-  secrets guard; tokens or keys appearing in the head will still be
-  emitted) plus a `data` part with `{ toolName, toolUseId }` for
-  filtering. Operators that need secret-safe artifacts must add
-  per-tool redaction or gate input summaries off entirely (#100 part B
-  follow-up).
 - A configurable idle-silence heartbeat (`heartbeatMs`, default 30 s)
   emits a bare `task.status: working` whenever no other frame has gone
   out for that many ms. Disabled with `heartbeatMs: 0`. Backstop for
   any future case where work happens without an interleaved model turn.
+- When the caller opts into the Traceability Extension with
+  `X-A2A-Extensions:
+  https://github.com/a2aproject/a2a-samples/extensions/traceability/v1`,
+  `tool_use` blocks inside an `assistant` event become
+  `claude-tool-call` artifacts. Each artifact carries a head-truncated
+  `<tool>: <input>` text part (<= 200 chars — **size guard only**, not a
+  secrets guard; tokens or keys appearing in the head will still be
+  emitted) plus a `data` part with `{ toolName, toolUseId }` for
+  filtering. The artifact also carries the Traceability Extension URI in
+  `artifact.extensions`.
+- Tool-result image/PDF media from Claude's synthetic `user` events is
+  also treated as trace output and is only emitted when the same
+  extension is requested.
 
 Text-only `tool_result` blocks are still dropped — gating that stream
 needs a truncation policy that hasn't been settled (see #100 "B"). The
-existing image/document passthrough is unchanged.
+explicit `send_file` MCP artifact path is unchanged and remains visible
+without Traceability Extension opt-in.

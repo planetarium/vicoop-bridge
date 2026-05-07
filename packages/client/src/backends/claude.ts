@@ -1,6 +1,6 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import type { Part } from '@vicoop-bridge/protocol';
+import { TRACEABILITY_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
 import {
   startSendFileMcpServer,
@@ -78,11 +78,16 @@ interface SessionEntry {
 //
 //   spawn (initial)            → task.status (state: working)
 //   assistant: text block(s)   → task.artifact (name: claude-message)
-//   assistant: tool_use block  → task.artifact (name: claude-tool-call)
-//   user: tool_result image/PDF→ task.artifact (name: claude-tool-result, file)
+//   assistant: tool_use block  → trace task.artifact when requested
+//   user: tool_result image/PDF→ trace task.artifact when requested
 //   user: tool_result text     → dropped (size/secrets policy; see #100)
 //   result                     → task.complete (state: completed)
 //   <heartbeatMs of silence>   → task.status (state: working, no body)
+//
+// Traceability Extension opt-in is per A2A request. Without it,
+// `claude-tool-call` and `claude-tool-result` are suppressed so regular
+// clients see only assistant-facing messages and explicit `send_file`
+// artifacts.
 //
 // The `claude-tool-call` summary line is bounded as a whole: the
 // `<tool>: <input>` text part is hard-capped at TOOL_CALL_SUMMARY_MAX_CHARS
@@ -294,6 +299,16 @@ function clipTo(line: string, max: number): string {
   // signalling truncation. Callers know the cap; they can recover the
   // tool name (and full input from a server-side log) if needed.
   return `${line.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function traceabilityRequested(task: {
+  requestedExtensions?: readonly string[];
+  message?: { extensions?: readonly string[] };
+}): boolean {
+  return (
+    task.requestedExtensions?.includes(TRACEABILITY_EXTENSION_URI) === true ||
+    task.message?.extensions?.includes(TRACEABILITY_EXTENSION_URI) === true
+  );
 }
 
 // Pull `tool_use` blocks out of an `assistant`-role message's content
@@ -653,6 +668,7 @@ export function createClaudeBackend(
       let stderrTail = '';
       let aborted = false;
       let settled = false;
+      const emitTraceArtifacts = traceabilityRequested(task);
 
       // Register this task with the send_file MCP server (if running) so
       // tool calls landing during this run resolve to this task's emit().
@@ -694,6 +710,7 @@ export function createClaudeBackend(
       };
 
       const emitToolResultMedia = (parts: Part[]): void => {
+        if (!emitTraceArtifacts) return;
         if (parts.length === 0) return;
         emit({
           type: 'task.artifact',
@@ -702,6 +719,8 @@ export function createClaudeBackend(
             artifactId: randomUUID(),
             name: 'claude-tool-result',
             parts,
+            extensions: [TRACEABILITY_EXTENSION_URI],
+            metadata: { traceType: 'tool-result' },
           },
           lastChunk: true,
         });
@@ -709,6 +728,7 @@ export function createClaudeBackend(
       };
 
       const emitToolCallArtifact = (block: ToolUseBlock): void => {
+        if (!emitTraceArtifacts) return;
         emit({
           type: 'task.artifact',
           taskId: task.taskId,
@@ -722,6 +742,8 @@ export function createClaudeBackend(
                 data: { toolName: block.toolName, toolUseId: block.toolUseId },
               },
             ],
+            extensions: [TRACEABILITY_EXTENSION_URI],
+            metadata: { traceType: 'tool-call' },
           },
           lastChunk: true,
         });

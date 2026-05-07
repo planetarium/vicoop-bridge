@@ -17,6 +17,11 @@ import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from '.
 import { mountDeviceFlow } from './auth/device-flow.js';
 import { mountDeviceUi } from './auth/device-ui.js';
 import { mountSiweExchange } from './auth/siwe-exchange.js';
+import {
+  A2A_EXTENSIONS_HEADER,
+  A2A_EXTENSIONS_LEGACY_HEADER,
+  parseA2AExtensionsHeader,
+} from './a2a-extensions.js';
 import type { GoogleConfig } from './auth/google-oauth.js';
 import type { Sql } from './db.js';
 import { Landing } from './landing.js';
@@ -334,6 +339,16 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
 
     const rawBody = await c.req.text();
     const parsed = JSON.parse(rawBody);
+    const requestedExtensions = [
+      ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_HEADER)),
+      ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_LEGACY_HEADER)),
+    ];
+    if (requestedExtensions.length > 0 && parsed.params?.message) {
+      const existing = Array.isArray(parsed.params.message.extensions)
+        ? parsed.params.message.extensions.filter((v: unknown): v is string => typeof v === 'string')
+        : [];
+      parsed.params.message.extensions = [...new Set([...existing, ...requestedExtensions])];
+    }
     const handler = getHandlerForConn(conn);
     const result = await handler.handle(parsed);
     return handleHandlerResult(result, c);

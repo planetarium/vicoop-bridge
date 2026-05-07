@@ -10,7 +10,11 @@ import {
   type ClaudeChildHandle,
   type ClaudeSpawnOptions,
 } from './claude.js';
-import type { TaskAssignFrame, UpFrame } from '@vicoop-bridge/protocol';
+import {
+  TRACEABILITY_EXTENSION_URI,
+  type TaskAssignFrame,
+  type UpFrame,
+} from '@vicoop-bridge/protocol';
 
 const NEVER: AbortSignal = new AbortController().signal;
 
@@ -149,6 +153,13 @@ function assign(text: string): TaskAssignFrame {
       messageId: 'm1',
       parts: [{ kind: 'text', text }],
     },
+  };
+}
+
+function assignWithTraceability(text: string): TaskAssignFrame {
+  return {
+    ...assign(text),
+    requestedExtensions: [TRACEABILITY_EXTENSION_URI],
   };
 }
 
@@ -902,13 +913,15 @@ test('emits FilePart artifact when tool_result contains an image block', async (
   });
   const backend = createClaudeBackend({ spawn: fake.spawn });
   const { emit, frames } = collect();
-  await backend.handle(assign('x'), emit, NEVER);
+  await backend.handle(assignWithTraceability('x'), emit, NEVER);
 
   const fileArtifact = frames.find(
     (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
       f.type === 'task.artifact' && f.artifact.parts[0]?.kind === 'file',
   );
   assert.ok(fileArtifact, 'expected a FilePart artifact for tool_result image');
+  assert.deepEqual(fileArtifact.artifact.extensions, [TRACEABILITY_EXTENSION_URI]);
+  assert.equal(fileArtifact.artifact.metadata?.traceType, 'tool-result');
   const part = fileArtifact.artifact.parts[0];
   assert.equal(part.kind, 'file');
   if (part.kind === 'file') {
@@ -917,7 +930,7 @@ test('emits FilePart artifact when tool_result contains an image block', async (
   }
 });
 
-test('emits a claude-tool-call artifact per tool_use block in an assistant event', async () => {
+test('suppresses Claude tool trace artifacts unless Traceability Extension is requested', async () => {
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({
@@ -967,6 +980,62 @@ test('emits a claude-tool-call artifact per tool_use block in an assistant event
   const artifacts = frames.filter(
     (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
   );
+  assert.deepEqual(
+    artifacts.map((a) => a.artifact.name),
+    ['claude-message', 'claude-message'],
+  );
+});
+
+test('emits a trace claude-tool-call artifact per tool_use block when requested', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'Let me check the directory.' },
+            {
+              type: 'tool_use',
+              id: 'tu_1',
+              name: 'Bash',
+              input: { command: 'ls -la /tmp' },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              tool_use_id: 'tu_1',
+              type: 'tool_result',
+              content: [{ type: 'text', text: 'total 0' }],
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'No files.' }],
+        },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'No files.' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
+  const { emit, frames } = collect();
+  await backend.handle(assignWithTraceability('list /tmp'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
   const names = artifacts.map((a) => a.artifact.name);
   assert.deepEqual(
     names,
@@ -976,6 +1045,8 @@ test('emits a claude-tool-call artifact per tool_use block in an assistant event
 
   const callArtifact = artifacts[1];
   assert.equal(callArtifact.lastChunk, true);
+  assert.deepEqual(callArtifact.artifact.extensions, [TRACEABILITY_EXTENSION_URI]);
+  assert.equal(callArtifact.artifact.metadata?.traceType, 'tool-call');
   assert.equal(callArtifact.artifact.parts.length, 2);
   const textPart = callArtifact.artifact.parts[0];
   assert.equal(textPart.kind, 'text');
@@ -1021,7 +1092,7 @@ test('truncates a long tool_use input summary to a bounded length', async () => 
   });
   const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
   const { emit, frames } = collect();
-  await backend.handle(assign('x'), emit, NEVER);
+  await backend.handle(assignWithTraceability('x'), emit, NEVER);
 
   const callArtifact = frames.find(
     (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>

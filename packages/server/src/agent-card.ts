@@ -57,6 +57,10 @@ export function buildAgentA2XAgent(
       pushNotifications: wire.capabilities?.pushNotifications ?? false,
     });
 
+  for (const extension of wire.capabilities?.extensions ?? []) {
+    a2xAgent.addExtension(extension);
+  }
+
   for (const skill of wire.skills ?? []) {
     a2xAgent.addSkill({
       id: skill.id,
@@ -99,4 +103,3 @@ export function buildAgentA2XAgent(
 
   return a2xAgent;
 }
-
