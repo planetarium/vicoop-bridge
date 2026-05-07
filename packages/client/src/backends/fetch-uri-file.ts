@@ -1,5 +1,7 @@
 import dns from 'node:dns/promises';
+import https from 'node:https';
 import net from 'node:net';
+import { Readable } from 'node:stream';
 
 export const INPUT_IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 
@@ -164,11 +166,15 @@ async function waitForResolution(
   });
 }
 
+function stripIpv6Brackets(hostname: string): string {
+  return hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
+}
+
 async function validateUrlForFetch(
   url: URL,
   resolveHost: (hostname: string) => Promise<string[]>,
   signal: AbortSignal,
-): Promise<void> {
+): Promise<string[]> {
   throwIfAborted(signal);
   if (url.protocol !== 'https:') {
     throw new FetchUriError('fetch_blocked_host', `file.uri must use https (got ${url.protocol || 'unknown'})`);
@@ -192,6 +198,7 @@ async function validateUrlForFetch(
     }
   }
   throwIfAborted(signal);
+  return addresses;
 }
 
 function makeTimeoutSignal(parent: AbortSignal, timeoutMs: number): { signal: AbortSignal; cleanup: () => void } {
@@ -216,6 +223,58 @@ function makeTimeoutSignal(parent: AbortSignal, timeoutMs: number): { signal: Ab
 
 async function cancelResponseBody(res: Response): Promise<void> {
   await res.body?.cancel().catch(() => undefined);
+}
+
+function headersFromIncoming(headers: Record<string, string | string[] | undefined>): Headers {
+  const out = new Headers();
+  for (const [key, value] of Object.entries(headers)) {
+    if (value === undefined) continue;
+    if (Array.isArray(value)) {
+      for (const v of value) out.append(key, v);
+    } else {
+      out.set(key, value);
+    }
+  }
+  return out;
+}
+
+function fetchPinned(url: URL, addresses: readonly string[], signal: AbortSignal): Promise<Response> {
+  const address = addresses[0];
+  if (!address) {
+    return Promise.reject(new FetchUriError('fetch_failed', `failed to resolve ${url.hostname}`));
+  }
+  const family = net.isIP(address);
+  return new Promise<Response>((resolve, reject) => {
+    const req = https.request({
+      protocol: 'https:',
+      hostname: stripIpv6Brackets(url.hostname),
+      port: url.port ? Number(url.port) : 443,
+      path: `${url.pathname}${url.search}`,
+      method: 'GET',
+      servername: stripIpv6Brackets(url.hostname),
+      lookup: (_hostname, _options, cb) => {
+        cb(null, address, family);
+      },
+    });
+    const abort = () => {
+      req.destroy(new FetchUriError('fetch_failed', 'file.uri fetch timed out or was aborted'));
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    req.on('response', (res) => {
+      signal.removeEventListener('abort', abort);
+      const body = Readable.toWeb(res) as ReadableStream<Uint8Array>;
+      resolve(new Response(body, {
+        status: res.statusCode ?? 0,
+        statusText: res.statusMessage,
+        headers: headersFromIncoming(res.headers),
+      }));
+    });
+    req.on('error', (err) => {
+      signal.removeEventListener('abort', abort);
+      reject(err);
+    });
+    req.end();
+  });
 }
 
 async function responseStreamToBase64(res: Response, maxBytes: number): Promise<string> {
@@ -251,7 +310,7 @@ export async function fetchUriToBytes(
 ): Promise<FetchedUriFile> {
   const timeoutMs = policy?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxRedirects = policy?.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
-  const fetchImpl = policy?.fetchImpl ?? fetch;
+  const fetchImpl = policy?.fetchImpl;
   const resolveHost = policy?.resolveHost ?? defaultResolveHost;
   let current: URL;
   try {
@@ -263,10 +322,12 @@ export async function fetchUriToBytes(
   const timeout = makeTimeoutSignal(signal, timeoutMs);
   try {
     for (let redirects = 0; redirects <= maxRedirects; redirects++) {
-      await validateUrlForFetch(current, resolveHost, timeout.signal);
+      const addresses = await validateUrlForFetch(current, resolveHost, timeout.signal);
       let res: Response;
       try {
-        res = await fetchImpl(current, { redirect: 'manual', signal: timeout.signal });
+        res = fetchImpl
+          ? await fetchImpl(current, { redirect: 'manual', signal: timeout.signal })
+          : await fetchPinned(current, addresses, timeout.signal);
       } catch (err) {
         throw new FetchUriError('fetch_failed', `failed to fetch file.uri (${current.hostname})`, { cause: err });
       }
