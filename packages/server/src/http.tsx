@@ -42,6 +42,10 @@ export interface ServerHttpOptions {
   deviceFlowStateSecret?: string;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
 export function createHttpApp(opts: ServerHttpOptions): Hono {
   const app = new Hono();
 
@@ -270,9 +274,10 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const rawBody = await c.req.text();
     const parsed = JSON.parse(rawBody);
 
-    if (parsed.params?.message) {
-      parsed.params.message.metadata = {
-        ...parsed.params.message.metadata,
+    const message = parsed.params?.message;
+    if (isRecord(message)) {
+      message.metadata = {
+        ...(isRecord(message.metadata) ? message.metadata : {}),
         _principalId: principalId,
         _bearerToken: bearerToken,
         ...(callerEmail !== undefined ? { _email: callerEmail } : {}),
@@ -348,11 +353,12 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_HEADER)),
       ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_LEGACY_HEADER)),
     ];
-    if (requestedExtensions.length > 0 && parsed.params?.message) {
-      const existing = Array.isArray(parsed.params.message.extensions)
-        ? parsed.params.message.extensions.filter((v: unknown): v is string => typeof v === 'string')
+    const message = parsed.params?.message;
+    if (requestedExtensions.length > 0 && isRecord(message)) {
+      const existing = Array.isArray(message.extensions)
+        ? message.extensions.filter((v: unknown): v is string => typeof v === 'string')
         : [];
-      parsed.params.message.extensions = [...new Set([...existing, ...requestedExtensions])];
+      message.extensions = [...new Set([...existing, ...requestedExtensions])];
     }
     const handler = getHandlerForConn(conn);
     const result = await handler.handle(parsed);
