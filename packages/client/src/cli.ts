@@ -143,7 +143,13 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  if (argv[0] === '--help' || argv[0] === '-h' || argv[0] === 'help') {
+  // Bare `help` is an explicit top-level help request. We defer `-h`/`--help`
+  // until after subcommand routing so e.g. `vicoop-client login --help` lets
+  // runLogin handle its own usage, and so a daemon invocation that includes
+  // `--help` anywhere in argv (`--server ... --help`) still hits this path
+  // instead of confusing parseClientArgs (which treats every `--key` as
+  // taking a value).
+  if (argv[0] === 'help') {
     process.stdout.write(`${SUBCOMMAND_LIST}\n`);
     process.stdout.write(`daemon mode: ${DAEMON_USAGE}\n`);
     process.exit(0);
@@ -187,6 +193,15 @@ async function main(): Promise<void> {
     console.error(SUBCOMMAND_LIST);
     console.error(`daemon mode: ${DAEMON_USAGE}`);
     process.exit(1);
+  }
+
+  // Daemon-mode help: `--help`/`-h` anywhere in argv prints usage. parseClientArgs
+  // would otherwise consume the next token (e.g. `--token`) as `--help`'s value
+  // and surface a confusing "missing required args" error.
+  if (argv.includes('--help') || argv.includes('-h')) {
+    process.stdout.write(`${SUBCOMMAND_LIST}\n`);
+    process.stdout.write(`daemon mode: ${DAEMON_USAGE}\n`);
+    process.exit(0);
   }
 
   // Default path: long-running daemon. Do not exit — client.start() keeps the
