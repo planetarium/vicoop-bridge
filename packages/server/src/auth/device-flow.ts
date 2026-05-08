@@ -399,16 +399,23 @@ export function mountDeviceFlow(app: Hono, opts: DeviceFlowOptions): void {
         0,
         Math.floor((issued.expiresAt.getTime() - Date.now()) / 1000),
       );
-      return c.json({
+      // Owner-session responses surface principal_id + email so the CLI
+      // (`vicoop-client login --owner-session`) can confirm and persist the
+      // logged-in identity. Caller-audience responses stay close to the
+      // minimal OAuth shape — third-party caller clients don't need the
+      // bridge to echo user PII back, and the agent owner doesn't gain
+      // anything from learning the caller's email this way (the principal
+      // is matched against allowed_callers server-side).
+      const body: Record<string, unknown> = {
         access_token: issued.rawToken,
         token_type: 'Bearer',
         expires_in: expiresInSec,
-        // The token's principal/email aren't carried in the opaque token
-        // itself, so we surface them here. The CLI uses these to confirm
-        // (and persist) which identity the operator is logged in as.
-        principal_id: row.principal_id,
-        email: row.email ?? null,
-      });
+      };
+      if (audience === 'owner_session') {
+        body.principal_id = row.principal_id;
+        body.email = row.email ?? null;
+      }
+      return c.json(body);
     }
 
     // Unknown status — conservative fallback.

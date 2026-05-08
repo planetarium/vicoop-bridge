@@ -136,12 +136,19 @@ export function mountSiweExchange(app: Hono, opts: SiweExchangeOptions): void {
           0,
           Math.floor((issued.expiresAt.getTime() - Date.now()) / 1000),
         );
-        return c.json({
+        // principal_id is echoed only for owner-session bearers, where the
+        // CLI uses it for confirm/persist. Caller-audience exchanges keep
+        // the minimal OAuth shape (the wallet that signed the SIWE already
+        // knows its address — no need to round-trip it).
+        const body: Record<string, unknown> = {
           access_token: issued.rawToken,
           token_type: 'Bearer',
           expires_in: expiresInSec,
-          principal_id: principalId,
-        });
+        };
+        if (audience === 'owner_session') {
+          body.principal_id = principalId;
+        }
+        return c.json(body);
       });
     } catch (err) {
       console.error('[siwe-exchange] transaction failed:', err);
