@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Invoked by `changesets/action` once a "Version Packages" PR has been merged
-# (i.e. no pending .changeset/*.md remains). Builds the portable client
-# bundle and publishes the corresponding `client-v<version>` GitHub release.
+# Invoked by `changesets/action` whenever it runs without pending changesets.
+# That happens both right after a "Version Packages" PR merges (real release
+# work) and on every other main push that has no changesets to consume
+# (where there's nothing to do). The script reads the current
+# `packages/client/package.json` version and converges the corresponding
+# `client-v<version>` GitHub release into one of three states:
 #
-# Convergent: a re-run (workflow_dispatch retry, or after a previous run
-# failed mid-upload) always rebuilds the bundle and pushes the assets with
-# `--clobber`, so partial state on the release recovers without manual
-# intervention. The release/tag itself is created on the first run only.
+#   - complete: release exists with both expected assets attached → exit 0
+#   - partial:  release exists but assets are missing or out of date →
+#               rebuild, then `gh release upload --clobber` to repair
+#   - missing:  no release yet → guard against a stray pre-existing tag,
+#               rebuild, then `gh release create` with --target pinned
 
 set -euo pipefail
 
@@ -20,21 +24,43 @@ VERSION="$(node -p "require('./packages/client/package.json').version")"
 TAG="client-v${VERSION}"
 ARCHIVE="dist-release/vicoop-bridge-client-${VERSION}.tgz"
 CHECKSUM="${ARCHIVE}.sha256"
+ARCHIVE_NAME="$(basename "${ARCHIVE}")"
+CHECKSUM_NAME="$(basename "${CHECKSUM}")"
 
-pnpm --filter @vicoop-bridge/protocol --filter @vicoop-bridge/client build
-./scripts/package-client-release.sh "${TAG}"
+# Probe the existing release (if any) and decide what state we're in
+# *before* spending build time. Skipping the rebuild on already-complete
+# releases is what keeps idle main pushes (e.g. server-only merges) cheap.
+release_state="missing"
+if existing_assets="$(gh release view "${TAG}" --json assets --jq '.assets[].name' 2>/dev/null)"; then
+  if grep -qx "${ARCHIVE_NAME}" <<<"${existing_assets}" \
+      && grep -qx "${CHECKSUM_NAME}" <<<"${existing_assets}"; then
+    release_state="complete"
+  else
+    release_state="partial"
+  fi
+fi
+
+if [[ "${release_state}" == "complete" ]]; then
+  echo "release ${TAG} already complete with ${ARCHIVE_NAME} + ${CHECKSUM_NAME} — nothing to do"
+  exit 0
+fi
 
 TARGET_SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
 
-if gh release view "${TAG}" >/dev/null 2>&1; then
-  echo "release ${TAG} already exists — re-uploading assets to converge"
+# Build only when we actually need to (partial repair or first publish).
+pnpm --filter @vicoop-bridge/protocol --filter @vicoop-bridge/client build
+./scripts/package-client-release.sh "${TAG}"
+
+if [[ "${release_state}" == "partial" ]]; then
+  echo "release ${TAG} missing one or both expected assets — re-uploading to converge"
   gh release upload "${TAG}" --clobber "${ARCHIVE}" "${CHECKSUM}"
 else
-  # The release object doesn't exist, but a stray tag with the same name
-  # might (e.g. someone manually pushed it, or a prior release was deleted
-  # without removing the tag). `gh release create` would silently attach to
-  # that tag and ignore --target, decoupling the assets from the commit
-  # they were built from. Bail with a clear remediation step instead.
+  # release_state == "missing": the release object doesn't exist, but a
+  # stray tag with the same name might (e.g. someone manually pushed it, or
+  # a prior release was deleted without removing the tag). `gh release
+  # create` would silently attach to that tag and ignore --target,
+  # decoupling the assets from the commit they were built from. Bail with a
+  # clear remediation step instead.
   remote_commit_sha="$(git ls-remote origin "refs/tags/${TAG}^{}" | awk 'NR==1{print $1}')"
   if [[ -z "${remote_commit_sha}" ]]; then
     remote_commit_sha="$(git ls-remote origin "refs/tags/${TAG}" | awk 'NR==1{print $1}')"
