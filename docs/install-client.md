@@ -475,8 +475,8 @@ version takes effect — `upgrade` cannot signal a process it didn't start.
 To check for stragglers, run `pgrep -fl 'vicoop-client|dist/cli\.js'` and kill
 any old process before starting the new one. Multiple client processes
 connecting with the **same `SERVER_TOKEN`** for one `AGENT_ID` collide and
-the older WS is closed with code 4009 (harmless but noisy); see
-`docs/local-testing.md` Troubleshooting for the same note.
+the older WS is closed with code 4009 (harmless but noisy); see the Gotchas
+section of `docs/local-testing.md` for the same note.
 
 ## Troubleshooting
 
