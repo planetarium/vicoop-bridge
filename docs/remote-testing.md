@@ -182,20 +182,33 @@ curl -s -X POST "$BRIDGE_URL/agents/$AGENT_ID" \
 
 ## Step 5 — Restrict with `add_caller`
 
-`POST /` is the admin agent — a Claude-backed A2A endpoint with tools like
-`add_caller`, `remove_caller`, `list_active_agents`, `list_callers`,
-`list_caller_tokens`, `revoke_caller_token`. It accepts any verified
-caller token (`eth:*` or `google:*`); tool execution runs under RLS with
-your principal as the authenticated subject, so mutations on agents you
-own are authorized. The admin scope (`is_admin()`) is wallet-only and
-gates only the cross-owner tools (`list_caller_tokens`,
-`revoke_caller_token`).
+There are two ways to mutate `allowed_callers`:
+
+* **Deterministic HTTP** at `/admin-api/*` — recommended for tests and
+  scripts. The `vicoop-client` CLI wraps it (see below).
+* **Natural-language admin agent** at `POST /` — same logic, exposed as
+  Claude-backed tools (`add_caller`, `remove_caller`, `list_callers`,
+  `list_active_agents`, `list_caller_tokens`, `revoke_caller_token`).
+  Useful for interactive operator chat.
+
+Both paths require an **owner-session bearer** (`vbc_owner_*`). Tool
+execution runs under RLS with your principal as the authenticated
+subject, so mutations on agents you own are authorized. Admin scope
+(`is_admin()`) is wallet-only and gates only the cross-owner tools
+(`list_caller_tokens`, `revoke_caller_token`).
 
 ```bash
 WALLET_PRINCIPAL=eth:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266   # lowercase
 
+# Deterministic CLI path:
+vicoop-client login --owner-session --bridge "$BRIDGE_URL"   # one-time
+vicoop-client add-caller "$AGENT_ID" "$WALLET_PRINCIPAL"
+
+# Or the natural-language admin agent (uses $OWNER_TOKEN, a vbc_owner_*
+# bearer obtained via /auth/siwe/exchange or device flow with
+# intent=owner_session):
 curl -s -X POST "$BRIDGE_URL/" \
-  -H "Authorization: Bearer $CALLER_TOKEN" -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"message/send\",\"params\":{\"message\":{\"messageId\":\"ac\",\"role\":\"user\",\"kind\":\"message\",\"parts\":[{\"kind\":\"text\",\"text\":\"Use the add_caller tool to add principal '${WALLET_PRINCIPAL}' to agent '${AGENT_ID}'.\"}]}}}" \
   | jq -r '.result.status.message.parts[0].text'
 ```

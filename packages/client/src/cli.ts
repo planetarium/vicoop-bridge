@@ -9,6 +9,12 @@ import type { Backend } from './backend.js';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
 import { runLogin } from './login.js';
+import {
+  runAddCaller,
+  runListAgents,
+  runListCallers,
+  runRemoveCaller,
+} from './admin-cli.js';
 
 interface Args {
   server: string;
@@ -138,6 +144,22 @@ async function main(): Promise<void> {
 
   if (argv[0] === 'login') {
     process.exit(await runLogin(argv.slice(1)));
+  }
+
+  if (argv[0] === 'add-caller') {
+    process.exit(await runAddCaller(argv.slice(1)));
+  }
+
+  if (argv[0] === 'remove-caller') {
+    process.exit(await runRemoveCaller(argv.slice(1)));
+  }
+
+  if (argv[0] === 'list-callers') {
+    process.exit(await runListCallers(argv.slice(1)));
+  }
+
+  if (argv[0] === 'list-agents') {
+    process.exit(await runListAgents(argv.slice(1)));
   }
 
   // Default path: long-running daemon. Do not exit — client.start() keeps the

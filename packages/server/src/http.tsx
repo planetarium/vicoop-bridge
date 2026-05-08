@@ -11,7 +11,15 @@ import {
   type AgentCardV03,
 } from '@a2x/sdk';
 import type { ClientConnection, Registry } from './registry.js';
-import { createAdminA2XAgent, getAdminWallets } from './admin.js';
+import { createAdminA2XAgent } from './admin.js';
+import { getAdminWallets } from './admin-scope.js';
+import {
+  AdminApiError,
+  addCaller,
+  listActiveAgents,
+  listCallers,
+  removeCaller,
+} from './admin-api.js';
 import { agentAuthMiddleware, getAgentConn } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
@@ -64,7 +72,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         A2A_EXTENSIONS_HEADER,
         A2A_EXTENSIONS_LEGACY_HEADER,
       ],
-      allowMethods: ['GET', 'POST', 'OPTIONS'],
+      allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
       credentials: true,
       maxAge: 600,
     }),
@@ -230,6 +238,57 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // on all subsequent requests.
   mountSiweExchange(app, { sql: opts.db, domain: siweDomain });
 
+  // Single owner-session bearer check shared by POST '/' (admin agent A2A
+  // endpoint) and the /admin-api/* routes. Returns structured success or
+  // failure; each call site formats its own envelope (JSON-RPC for the A2A
+  // route, plain `{error}` for /admin-api). Centralising this prevents the
+  // two from drifting again — e.g. when the device-flow hint became
+  // conditional on deviceFlowEnabled, only one path was updated last time.
+  type OwnerSessionAuthResult =
+    | {
+        ok: true;
+        principalId: string;
+        email: string | undefined;
+        bearerToken: string;
+      }
+    | { ok: false; kind: 'missing' | 'invalid'; message: string };
+
+  async function authOwnerSession(c: Context): Promise<OwnerSessionAuthResult> {
+    const authHeader = c.req.header('Authorization');
+    const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
+    if (!bearerToken || !bearerToken.startsWith(OWNER_SESSION_PREFIX)) {
+      // Device flow is optional (only mounted when Google OAuth is configured),
+      // so don't point operators at /oauth/device/code on SIWE-only deployments.
+      const acquireHints = deviceFlowEnabled
+        ? '/auth/siwe/exchange (intent=owner_session) or /oauth/device/code (intent=owner_session)'
+        : '/auth/siwe/exchange (intent=owner_session)';
+      return {
+        ok: false,
+        kind: 'missing',
+        message:
+          `Authentication required (Bearer ${OWNER_SESSION_PREFIX}* token). ` +
+          `Acquire via ${acquireHints}.`,
+      };
+    }
+    try {
+      const caller = await verifySessionToken(opts.db, bearerToken, {
+        expectedAudience: 'owner_session',
+      });
+      return {
+        ok: true,
+        principalId: caller.principalId,
+        email: caller.email,
+        bearerToken,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        kind: 'invalid',
+        message: `Invalid session token: ${(err as Error).message}`,
+      };
+    }
+  }
+
   // Root POST — admin agent A2A endpoint. Owner-session-audience only
   // (`vbc_owner_*`); caller-audience tokens (`vbc_caller_*`) are rejected
   // because admin chat is for the resource owner managing their own
@@ -237,38 +296,23 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // what the operator can see; admin scope (`is_admin()`) stays
   // wallet-only by design (issue #79).
   app.post('/', async (c) => {
-    const authHeader = c.req.header('Authorization');
-    const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
-    if (!bearerToken || !bearerToken.startsWith(OWNER_SESSION_PREFIX)) {
-      return c.json({
-        jsonrpc: '2.0',
-        id: null,
-        error: {
-          code: -32001,
-          message:
-            `Authentication required (Bearer ${OWNER_SESSION_PREFIX}* token). ` +
-            `Acquire via /auth/siwe/exchange (intent=owner_session) or ` +
-            `/oauth/device/code (intent=owner_session). ` +
-            `${CALLER_TOKEN_PREFIX}* tokens are not accepted here — those ` +
-            `are for /agents/:id calls.`,
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) {
+      // The A2A endpoint adds an extra hint about caller-audience tokens
+      // because operators commonly try the wrong bearer here when they
+      // already have a /agents/:id one.
+      const message =
+        auth.kind === 'missing'
+          ? `${auth.message} ${CALLER_TOKEN_PREFIX}* tokens are not accepted here — those are for /agents/:id calls.`
+          : auth.message;
+      return c.json(
+        {
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32001, message },
         },
-      }, 401);
-    }
-
-    let principalId: string;
-    let callerEmail: string | undefined;
-    try {
-      const caller = await verifySessionToken(opts.db, bearerToken, {
-        expectedAudience: 'owner_session',
-      });
-      principalId = caller.principalId;
-      callerEmail = caller.email;
-    } catch (err) {
-      return c.json({
-        jsonrpc: '2.0',
-        id: null,
-        error: { code: -32001, message: `Invalid session token: ${(err as Error).message}` },
-      }, 401);
+        401,
+      );
     }
 
     const rawBody = await c.req.text();
@@ -278,14 +322,102 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     if (isRecord(message)) {
       message.metadata = {
         ...(isRecord(message.metadata) ? message.metadata : {}),
-        _principalId: principalId,
-        _bearerToken: bearerToken,
-        ...(callerEmail !== undefined ? { _email: callerEmail } : {}),
+        _principalId: auth.principalId,
+        _bearerToken: auth.bearerToken,
+        ...(auth.email !== undefined ? { _email: auth.email } : {}),
       };
     }
 
     const result = await adminHandler.handle(parsed);
     return handleHandlerResult(result, c);
+  });
+
+  // Deterministic admin RPC at /admin-api/*. Same owner_session bearer
+  // requirement as the admin agent at POST '/', but the request never
+  // crosses the LLM — these are direct calls to the same shared functions
+  // (admin-api.ts) the admin agent's tools use. Lets CLI / scripts manage
+  // callers and inspect connected agents without per-call LLM cost.
+  function adminApiUnauthorized(c: Context, auth: Extract<OwnerSessionAuthResult, { ok: false }>): Response {
+    return c.json({ error: auth.message }, 401);
+  }
+
+  function adminApiErrorResponse(c: Context, err: unknown): Response {
+    if (err instanceof AdminApiError) {
+      // Cast to a Hono-acceptable status union; AdminApiError uses standard
+      // HTTP codes (400/403/404) that Hono accepts for c.json's second arg.
+      return c.json({ error: err.message }, err.status as 400 | 401 | 403 | 404);
+    }
+    logEvent('admin_api_error', { error: String(err) });
+    return c.json({ error: 'Internal error' }, 500);
+  }
+
+  app.get('/admin-api/agents', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    return c.json({ agents: listActiveAgents(opts.registry, auth.principalId) });
+  });
+
+  app.get('/admin-api/agents/:id/callers', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    try {
+      const result = await listCallers(opts.db, auth.principalId, c.req.param('id'));
+      return c.json(result);
+    } catch (err) {
+      return adminApiErrorResponse(c, err);
+    }
+  });
+
+  app.post('/admin-api/agents/:id/callers', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Body must be JSON: { "principal": "<...>" }' }, 400);
+    }
+    const principal =
+      isRecord(body) && typeof body.principal === 'string' ? body.principal : null;
+    if (!principal) {
+      return c.json({ error: 'Body must be JSON: { "principal": "<...>" }' }, 400);
+    }
+    try {
+      const result = await addCaller(
+        opts.db,
+        opts.registry,
+        auth.principalId,
+        c.req.param('id'),
+        principal,
+      );
+      return c.json(result);
+    } catch (err) {
+      return adminApiErrorResponse(c, err);
+    }
+  });
+
+  // Principal removal uses ?principal=<urlencoded> rather than a path
+  // segment so colon-delimited principals (eth:0x…, google:email:…@…) and
+  // any future principal kinds with unusual characters survive routing.
+  app.delete('/admin-api/agents/:id/callers', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    const principal = c.req.query('principal');
+    if (!principal) {
+      return c.json({ error: 'Query parameter "principal" is required' }, 400);
+    }
+    try {
+      const result = await removeCaller(
+        opts.db,
+        opts.registry,
+        auth.principalId,
+        c.req.param('id'),
+        principal,
+      );
+      return c.json(result);
+    } catch (err) {
+      return adminApiErrorResponse(c, err);
+    }
   });
 
   // Device flow endpoints (RFC-8628) — optional: only mounted when Google config is provided
