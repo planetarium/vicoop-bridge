@@ -23,9 +23,11 @@
 // default-to-file matches the way `gh auth login` plants ~/.config/gh/hosts.yml,
 // so subsequent admin subcommands pick up the bearer with no env wiring.
 
-import { closeSync, openSync, renameSync, writeFileSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
-import { saveOwnerSession, defaultStorePath } from './owner-session.js';
+import {
+  atomicWriteFile,
+  defaultStorePath,
+  saveOwnerSession,
+} from './owner-session.js';
 
 type Intent = 'client_register' | 'owner_session';
 
@@ -269,19 +271,11 @@ function writeEnvFile(path: string, success: TokenSuccessResponse, bridgeUrl: st
         `VICOOP_OWNER_TOKEN=${success.access_token}`,
         '',
       ].join('\n');
-  // Same atomic write+rename pattern saveOwnerSession uses: openSync's mode
-  // arg is only honoured on creation, so write-then-chmod against an existing
-  // path would leave looser perms in place, and even on first creation under
-  // a permissive umask the file is briefly world-readable. Writing fresh to
-  // a 0o600 temp sibling and renaming sidesteps both.
-  const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
-  const fd = openSync(tmp, 'wx', 0o600);
-  try {
-    writeFileSync(fd, lines);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(tmp, path);
+  // Shared atomic write helper: creates a 0o600 temp sibling and renames it
+  // into place, handling Windows' non-overwriting rename so re-running
+  // `login --write-env-file` updates an existing file reliably. Same
+  // semantics saveOwnerSession uses.
+  atomicWriteFile(path, lines, 0o600);
 }
 
 export async function runLogin(args: string[]): Promise<number> {

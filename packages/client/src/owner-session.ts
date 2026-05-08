@@ -18,11 +18,40 @@ import {
   openSync,
   readFileSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+
+// Atomic write that's safe on Windows. POSIX rename is overwrite-by-default,
+// but Node's renameSync on win32 throws EEXIST/EPERM when the destination
+// already exists, which would leave a re-saved token stranded in the temp
+// file. We unlink the destination first on win32 (ignoring ENOENT for the
+// first-save case). Exported so other client modules — currently login.ts's
+// writeEnvFile — can share the same write semantics.
+export function atomicWriteFile(path: string, contents: string, mode = 0o600): void {
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  const fd = openSync(tmp, 'wx', mode);
+  try {
+    writeFileSync(fd, contents);
+  } finally {
+    closeSync(fd);
+  }
+  if (process.platform === 'win32') {
+    try {
+      unlinkSync(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        // Cleanup so we don't leave a stray temp file on the way out.
+        try { unlinkSync(tmp); } catch { /* ignore */ }
+        throw err;
+      }
+    }
+  }
+  renameSync(tmp, path);
+}
 
 export interface OwnerSession {
   bridge: string;
@@ -44,34 +73,42 @@ export function saveOwnerSession(session: OwnerSession, path: string = defaultSt
   const dir = dirname(path);
   // mkdirSync's `mode` only applies to directories actually created here;
   // pre-existing dirs keep their permissions. The bearer's defence-in-depth
-  // is the file mode we set below.
+  // is the file mode atomicWriteFile sets below.
   mkdirSync(dir, { recursive: true, mode: 0o700 });
 
-  // Write to a temp sibling at mode 0o600, then rename. Rationale:
-  //   * openSync's mode arg is only honoured on creation, so if `path` already
-  //     exists with looser perms (e.g. a legacy save), opening it with 'w'
-  //     would leave the old mode in place.
-  //   * write-then-chmod creates a window where the file is world-readable
-  //     under a permissive umask — exactly what the review flagged.
+  // Write to a temp sibling at mode 0o600, then rename atomically. Rationale:
+  //   * openSync's mode arg is only honoured on creation, so opening an
+  //     existing path with 'w' would keep the old (possibly looser) mode.
+  //   * write-then-chmod leaves a window where the file is world-readable
+  //     under a permissive umask.
   // Writing fresh + atomic rename avoids both: the resulting file is always
   // mode 0o600 with no partial-write state visible on the canonical path.
-  const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
-  const fd = openSync(tmp, 'wx', 0o600);
-  try {
-    writeFileSync(fd, JSON.stringify(session, null, 2));
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(tmp, path);
+  // atomicWriteFile also handles Windows' non-overwriting rename so a
+  // second `login --owner-session` invocation replaces the file cleanly.
+  atomicWriteFile(path, JSON.stringify(session, null, 2), 0o600);
+}
+
+// Strict shape check: a tampered or hand-edited file with non-string fields
+// would otherwise crash later in resolveOwnerSession's `.replace()` call.
+// Optional fields (principal_id, email) are checked only when present;
+// `email` may be null per the persisted shape.
+function isOwnerSession(value: unknown): value is OwnerSession {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  if (typeof v.bridge !== 'string' || !v.bridge) return false;
+  if (typeof v.token !== 'string' || !v.token) return false;
+  if (typeof v.expires_at !== 'string' || !v.expires_at) return false;
+  if ('saved_at' in v && typeof v.saved_at !== 'string') return false;
+  if ('principal_id' in v && v.principal_id !== undefined && typeof v.principal_id !== 'string') return false;
+  if ('email' in v && v.email !== null && v.email !== undefined && typeof v.email !== 'string') return false;
+  return true;
 }
 
 export function loadOwnerSession(path: string = defaultStorePath()): OwnerSession | null {
   if (!existsSync(path)) return null;
   try {
-    const raw = readFileSync(path, 'utf-8');
-    const parsed = JSON.parse(raw) as OwnerSession;
-    if (!parsed.bridge || !parsed.token || !parsed.expires_at) return null;
-    return parsed;
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+    return isOwnerSession(parsed) ? parsed : null;
   } catch {
     return null;
   }

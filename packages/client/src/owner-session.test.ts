@@ -56,6 +56,40 @@ test('loadOwnerSession returns null on malformed JSON', () => {
   }
 });
 
+test('loadOwnerSession returns null when fields have wrong types', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-owner-types-'));
+  try {
+    const path = join(dir, 'owner-session.json');
+    // Tampered: `bridge` is a number, not a string. The truthiness check
+    // would have let this through and resolveOwnerSession would have
+    // crashed in `.replace()`.
+    writeFileSync(path, JSON.stringify({
+      bridge: 123,
+      token: 'vbc_owner_xxx',
+      expires_at: new Date(Date.now() + 1000).toISOString(),
+      saved_at: new Date().toISOString(),
+    }));
+    assert.equal(loadOwnerSession(path), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('saveOwnerSession can overwrite an existing file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-owner-overwrite-'));
+  try {
+    const path = join(dir, 'owner-session.json');
+    saveOwnerSession(makeSession({ token: 'vbc_owner_first' }), path);
+    // Re-saving must succeed cross-platform — Windows' non-overwriting
+    // rename was leaving the new token stranded in the temp file.
+    saveOwnerSession(makeSession({ token: 'vbc_owner_second' }), path);
+    const loaded = loadOwnerSession(path);
+    assert.equal(loaded?.token, 'vbc_owner_second');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('resolveOwnerSession prefers env over file when both present', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'vicoop-owner-env-'));
   try {
