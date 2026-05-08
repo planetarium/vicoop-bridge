@@ -24,12 +24,29 @@ CHECKSUM="${ARCHIVE}.sha256"
 pnpm --filter @vicoop-bridge/protocol --filter @vicoop-bridge/client build
 ./scripts/package-client-release.sh "${TAG}"
 
+TARGET_SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
+
 if gh release view "${TAG}" >/dev/null 2>&1; then
   echo "release ${TAG} already exists — re-uploading assets to converge"
   gh release upload "${TAG}" --clobber "${ARCHIVE}" "${CHECKSUM}"
 else
+  # The release object doesn't exist, but a stray tag with the same name
+  # might (e.g. someone manually pushed it, or a prior release was deleted
+  # without removing the tag). `gh release create` would silently attach to
+  # that tag and ignore --target, decoupling the assets from the commit
+  # they were built from. Bail with a clear remediation step instead.
+  remote_commit_sha="$(git ls-remote origin "refs/tags/${TAG}^{}" | awk 'NR==1{print $1}')"
+  if [[ -z "${remote_commit_sha}" ]]; then
+    remote_commit_sha="$(git ls-remote origin "refs/tags/${TAG}" | awk 'NR==1{print $1}')"
+  fi
+  if [[ -n "${remote_commit_sha}" && "${remote_commit_sha}" != "${TARGET_SHA}" ]]; then
+    echo "error: tag ${TAG} already exists at ${remote_commit_sha} but expected ${TARGET_SHA}" >&2
+    echo "delete the tag (e.g. 'gh api -X DELETE repos/<owner>/<repo>/git/refs/tags/${TAG}') and rerun." >&2
+    exit 1
+  fi
+
   # `gh release create` creates the underlying tag remotely when it doesn't
-  # yet exist. Pin `--target` to the commit we actually built from so a
+  # yet exist. `--target` pins the commit we actually built from so a
   # commit landing on main mid-job can't make the tag point somewhere else;
   # CI sets GITHUB_SHA, falling back to HEAD for local invocations.
   # `--generate-notes` pulls in the commit/PR summary since the previous
@@ -38,7 +55,6 @@ else
   # wants the structured form.
   # Pass exact filenames — globbing dist-release/ would also pick up
   # artifacts left by previous local runs and upload them as extra assets.
-  TARGET_SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
   gh release create "${TAG}" \
     --target "${TARGET_SHA}" \
     --title "${TAG}" \
