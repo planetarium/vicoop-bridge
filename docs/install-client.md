@@ -370,10 +370,10 @@ systemctl --user enable --now vicoop-client
 ```
 
 For macOS or ad hoc local testing, run the foreground command above directly,
-or wrap it in a detached session (`screen -dmS vicoop-client …` / `tmux new
--d …`) or a `launchd` plist if you want it to survive the terminal closing.
-The bridge does not require systemd; it only needs one live `vicoop-client`
-process connected for the agent id.
+or wrap it in a detached session (`screen -dmS vicoop-client …` /
+`tmux new -d …`) or a `launchd` plist if you want it to survive the terminal
+closing. The bridge does not require systemd; it only needs one live
+`vicoop-client` process connected for the agent id.
 
 ### Restrict who can call your agent
 
@@ -472,10 +472,11 @@ files before running it.
 client process attached to the previous bundle. Stop it and start it again
 with your usual command (foreground / screen / tmux / launchd) so the new
 version takes effect — `upgrade` cannot signal a process it didn't start.
-To check for stragglers during a manual restart, run
-`pgrep -fl 'vicoop-client|dist/cli.js'`; if two clients end up live for the
-same `AGENT_ID`, the bridge keeps the newest WS and closes the older one
-with close code 4009, which is harmless but noisy.
+To check for stragglers, run `pgrep -fl 'vicoop-client|dist/cli.js'` and kill
+any old process before starting the new one. Multiple client processes
+connecting with the **same `SERVER_TOKEN`** for one `AGENT_ID` collide and
+the older WS is closed with code 4009 (harmless but noisy); see
+`docs/local-testing.md` Troubleshooting for the same note.
 
 ## Troubleshooting
 
