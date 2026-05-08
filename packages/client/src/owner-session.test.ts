@@ -56,6 +56,23 @@ test('loadOwnerSession returns null on malformed JSON', () => {
   }
 });
 
+test('loadOwnerSession returns null when required field saved_at is missing', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-owner-missing-'));
+  try {
+    const path = join(dir, 'owner-session.json');
+    // OwnerSession requires saved_at; an older or hand-edited file without
+    // it shouldn't slip through and violate the declared return type.
+    writeFileSync(path, JSON.stringify({
+      bridge: 'https://bridge.test',
+      token: 'vbc_owner_xxx',
+      expires_at: new Date(Date.now() + 1000).toISOString(),
+    }));
+    assert.equal(loadOwnerSession(path), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('loadOwnerSession returns null when fields have wrong types', () => {
   const dir = mkdtempSync(join(tmpdir(), 'vicoop-owner-types-'));
   try {

@@ -90,15 +90,18 @@ export function saveOwnerSession(session: OwnerSession, path: string = defaultSt
 
 // Strict shape check: a tampered or hand-edited file with non-string fields
 // would otherwise crash later in resolveOwnerSession's `.replace()` call.
-// Optional fields (principal_id, email) are checked only when present;
-// `email` may be null per the persisted shape.
+// Required fields (bridge / token / expires_at / saved_at per OwnerSession)
+// are enforced as non-empty strings so the guard matches the interface and
+// loadOwnerSession's return type is honest. Truly optional fields
+// (principal_id, email) are checked only when present; `email` may be null
+// per the persisted shape.
 function isOwnerSession(value: unknown): value is OwnerSession {
   if (!value || typeof value !== 'object') return false;
   const v = value as Record<string, unknown>;
   if (typeof v.bridge !== 'string' || !v.bridge) return false;
   if (typeof v.token !== 'string' || !v.token) return false;
   if (typeof v.expires_at !== 'string' || !v.expires_at) return false;
-  if ('saved_at' in v && typeof v.saved_at !== 'string') return false;
+  if (typeof v.saved_at !== 'string' || !v.saved_at) return false;
   if ('principal_id' in v && v.principal_id !== undefined && typeof v.principal_id !== 'string') return false;
   if ('email' in v && v.email !== null && v.email !== undefined && typeof v.email !== 'string') return false;
   return true;
