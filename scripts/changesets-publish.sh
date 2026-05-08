@@ -27,14 +27,19 @@ fi
 pnpm --filter @vicoop-bridge/protocol --filter @vicoop-bridge/client build
 ./scripts/package-client-release.sh "${TAG}"
 
-# `gh release create` creates the underlying tag remotely (pointing at the
-# default branch HEAD) when it doesn't yet exist. `--generate-notes` pulls in
-# the commit/PR summary since the previous client-v* tag; the per-version
-# CHANGELOG.md entry written by changesets/action lives in
-# packages/client/CHANGELOG.md for anyone who wants the structured form.
+# `gh release create` creates the underlying tag remotely when it doesn't
+# yet exist. Pin `--target` to the commit we actually built from so a commit
+# landing on main mid-job can't make the tag point somewhere else; CI sets
+# GITHUB_SHA, falling back to HEAD for local invocations.
+# `--generate-notes` pulls in the commit/PR summary since the previous
+# client-v* tag; the per-version CHANGELOG.md entry written by
+# changesets/action lives in packages/client/CHANGELOG.md for anyone who
+# wants the structured form.
 # Pass exact filenames — globbing dist-release/ would also pick up artifacts
 # left by previous local runs and upload them as extra release assets.
+TARGET_SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
 gh release create "${TAG}" \
+  --target "${TARGET_SHA}" \
   --title "${TAG}" \
   --generate-notes \
   "${ARCHIVE}" \
