@@ -162,6 +162,19 @@ async function main(): Promise<void> {
     process.exit(await runListAgents(argv.slice(1)));
   }
 
+  // A bare word (not a flag) here is an unrecognised subcommand. Catch it so
+  // operators on an older bundle calling a newer subcommand get a clear
+  // upgrade hint instead of a confusing "missing required args" from the
+  // default client path.
+  if (argv[0] && !argv[0].startsWith('-')) {
+    console.error(`unknown command: ${argv[0]}`);
+    console.error(
+      `this client (${clientVersion}) does not recognise that subcommand. ` +
+        'It may be available in a newer release — run `vicoop-client upgrade --check`.',
+    );
+    process.exit(1);
+  }
+
   // Default path: long-running daemon. Do not exit — client.start() keeps the
   // event loop alive and signal handlers will call process.exit on shutdown.
   runClient(argv);

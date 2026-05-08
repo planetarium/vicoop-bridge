@@ -273,7 +273,10 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
       err('systemctl try-restart failed; restart the service manually');
     }
   } else {
-    log('no systemd unit detected — restart your client manually to pick up the new version');
+    log(
+      'no systemd unit detected — your running client (if any) keeps the previous bundle ' +
+        'until you stop it and start it again with your usual command',
+    );
   }
 
   log(`upgraded ${clientVersion} -> ${targetVersion}`);
