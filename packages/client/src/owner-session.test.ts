@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
+  atomicWriteFile,
   loadOwnerSession,
   resolveOwnerSession,
   saveOwnerSession,
@@ -87,6 +88,22 @@ test('loadOwnerSession returns null when fields have wrong types', () => {
       saved_at: new Date().toISOString(),
     }));
     assert.equal(loadOwnerSession(path), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('atomicWriteFile cleans up its temp file on rename failure', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-atomic-fail-'));
+  try {
+    // Force renameSync to fail by making the destination an existing
+    // directory — POSIX rename(2) returns EISDIR / ENOTEMPTY in that case.
+    const dest = join(dir, 'collide');
+    mkdirSync(dest);
+    assert.throws(() => atomicWriteFile(dest, 'irrelevant'));
+    // No *.tmp file should remain in the parent dir.
+    const stragglers = readdirSync(dir).filter((n) => n.endsWith('.tmp'));
+    assert.deepEqual(stragglers, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

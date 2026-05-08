@@ -39,18 +39,29 @@ export function atomicWriteFile(path: string, contents: string, mode = 0o600): v
   } finally {
     closeSync(fd);
   }
+
+  // From here on, every error path must clean up `tmp` so repeated
+  // login / write-env-file attempts don't accumulate stray *.tmp files
+  // on permission errors, locked files, etc.
+  const cleanupAndThrow = (err: unknown): never => {
+    try { unlinkSync(tmp); } catch { /* ignore */ }
+    throw err;
+  };
+
   if (process.platform === 'win32') {
     try {
       unlinkSync(path);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-        // Cleanup so we don't leave a stray temp file on the way out.
-        try { unlinkSync(tmp); } catch { /* ignore */ }
-        throw err;
+        cleanupAndThrow(err);
       }
     }
   }
-  renameSync(tmp, path);
+  try {
+    renameSync(tmp, path);
+  } catch (err) {
+    cleanupAndThrow(err);
+  }
 }
 
 export interface OwnerSession {
