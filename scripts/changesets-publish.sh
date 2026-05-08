@@ -46,4 +46,7 @@ gh release create "${TAG}" \
   "${CHECKSUM}"
 
 # Marker line that changesets/action greps for to set its `published` output.
-echo "🦋 New tag: client@${VERSION}"
+# Use the actual workspace package name so anything reading the action's
+# `publishedPackages` output sees a real identifier; the GitHub release tag
+# itself remains `client-v<version>`.
+echo "🦋 New tag: @vicoop-bridge/client@${VERSION}"
