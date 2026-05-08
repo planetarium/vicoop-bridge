@@ -8,8 +8,16 @@
 
 set -euo pipefail
 
+# Resolve the repo root from the script's own location so this works no
+# matter where it's invoked from (CI sets cwd, but local reruns or future
+# wrappers may not).
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
 VERSION="$(node -p "require('./packages/client/package.json').version")"
 TAG="client-v${VERSION}"
+ARCHIVE="dist-release/vicoop-bridge-client-${VERSION}.tgz"
+CHECKSUM="${ARCHIVE}.sha256"
 
 if gh release view "${TAG}" >/dev/null 2>&1; then
   echo "release ${TAG} already exists — nothing to do"
@@ -24,11 +32,13 @@ pnpm --filter @vicoop-bridge/protocol --filter @vicoop-bridge/client build
 # the commit/PR summary since the previous client-v* tag; the per-version
 # CHANGELOG.md entry written by changesets/action lives in
 # packages/client/CHANGELOG.md for anyone who wants the structured form.
+# Pass exact filenames — globbing dist-release/ would also pick up artifacts
+# left by previous local runs and upload them as extra release assets.
 gh release create "${TAG}" \
   --title "${TAG}" \
   --generate-notes \
-  dist-release/vicoop-bridge-client-*.tgz \
-  dist-release/vicoop-bridge-client-*.tgz.sha256
+  "${ARCHIVE}" \
+  "${CHECKSUM}"
 
 # Marker line that changesets/action greps for to set its `published` output.
 echo "🦋 New tag: client@${VERSION}"
