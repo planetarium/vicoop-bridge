@@ -14,22 +14,32 @@ Docs:
 
 ## Client Releases
 
-Tagging the repository with `client-v*` publishes a portable `vicoop-bridge-client` bundle to GitHub Releases.
+`@vicoop-bridge/client` releases are driven by
+[Changesets](https://github.com/changesets/changesets). PRs that should bump
+the client include a changeset describing the change; merging them keeps a
+single "Version Packages" PR up to date with the resulting version + changelog
+entry. Merging that Version PR triggers
+[`.github/workflows/release.yml`](./.github/workflows/release.yml), which
+builds the portable bundle and publishes the `client-v<version>` GitHub
+release.
 
-Example:
+Day-to-day flow for contributors:
 
 ```bash
-git tag client-v0.1.0
-git push origin client-v0.1.0
+pnpm changeset           # pick patch / minor / major + write a one-line summary
+git add .changeset/      # commit the new file alongside your change
 ```
+
+See [`.changeset/README.md`](./.changeset/README.md) for the full flow,
+including which packages are versioned (only `@vicoop-bridge/client`).
 
 Operators installing from a published release should follow
 [`docs/install-client.md`](./docs/install-client.md) — the one-liner
 installer plus SIWE/registerClient flow for obtaining a client token.
 
-Before tagging a new `client-v*` release, verify that
+Before merging a Version Packages PR, verify that
 [`docs/install-client.md`](./docs/install-client.md) still matches the
-published bundle:
+bundle being released:
 
 - shipped backends listed in the doc match `packages/client/src/cli.ts`
 - bundled example cards listed in the doc match `packages/client/cards/`
