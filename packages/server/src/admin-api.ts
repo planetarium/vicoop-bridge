@@ -18,6 +18,15 @@ export class AdminApiError extends Error {
   }
 }
 
+// Single source of truth for the invalid-principal 400 message. Must stay
+// aligned with the formats validatePrincipal() accepts in auth/principal.ts —
+// in particular a plain `0x<40 hex>` (no eth: prefix) is normalized to
+// eth:0x<…>, so operators hitting this error need to know that's a valid
+// input form.
+const INVALID_PRINCIPAL_MESSAGE =
+  'Invalid principal format. Expected eth:0x<40 hex>, 0x<40 hex>, ' +
+  'google:sub:<sub>, google:email:<addr>, or google:domain:<d>.';
+
 export interface CallerListResult {
   agent_id: string;
   owner_principal: string;
@@ -67,10 +76,7 @@ export async function addCaller(
 ): Promise<CallerMutationResult> {
   const normalized = validatePrincipal(principal);
   if (!normalized) {
-    throw new AdminApiError(
-      'Invalid principal format. Expected eth:0x<40 hex>, google:sub:<sub>, google:email:<addr>, or google:domain:<d>.',
-      400,
-    );
+    throw new AdminApiError(INVALID_PRINCIPAL_MESSAGE, 400);
   }
 
   const result = await db.begin(async (tx) => {
@@ -126,10 +132,7 @@ export async function removeCaller(
 ): Promise<CallerMutationResult> {
   const normalized = validatePrincipal(principal);
   if (!normalized) {
-    throw new AdminApiError(
-      'Invalid principal format. Expected eth:0x<40 hex>, google:sub:<sub>, google:email:<addr>, or google:domain:<d>.',
-      400,
-    );
+    throw new AdminApiError(INVALID_PRINCIPAL_MESSAGE, 400);
   }
 
   const result = await db.begin(async (tx) => {
