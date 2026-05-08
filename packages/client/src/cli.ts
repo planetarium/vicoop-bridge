@@ -24,6 +24,11 @@ interface Args {
   backend: string;
 }
 
+const DAEMON_USAGE =
+  'vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude> [--card <path>]';
+const SUBCOMMAND_LIST =
+  'subcommands: login, upgrade, list-agents, list-callers, add-caller, remove-caller (run any with --help)';
+
 function parseClientArgs(argv: string[]): Args {
   const out: Partial<Args> = {};
   for (let i = 0; i < argv.length; i++) {
@@ -51,7 +56,7 @@ function parseClientArgs(argv: string[]): Args {
   const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length) {
     console.error(`missing required args: ${missing.join(', ')}`);
-    console.error('usage: vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude> [--card <path>]');
+    console.error(`usage: ${DAEMON_USAGE}`);
     process.exit(1);
   }
   return resolved;
@@ -138,6 +143,18 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  // Bare `help` is an explicit top-level help request. We defer `-h`/`--help`
+  // until after subcommand routing so e.g. `vicoop-client login --help` lets
+  // runLogin handle its own usage, and so a daemon invocation that includes
+  // `--help` anywhere in argv (`--server ... --help`) still hits this path
+  // instead of confusing parseClientArgs (which treats every `--key` as
+  // taking a value).
+  if (argv[0] === 'help') {
+    process.stdout.write(`${SUBCOMMAND_LIST}\n`);
+    process.stdout.write(`daemon mode: ${DAEMON_USAGE}\n`);
+    process.exit(0);
+  }
+
   if (argv[0] === 'upgrade') {
     process.exit(await runUpgradeCmd(argv.slice(1)));
   }
@@ -160,6 +177,31 @@ async function main(): Promise<void> {
 
   if (argv[0] === 'list-agents') {
     process.exit(await runListAgents(argv.slice(1)));
+  }
+
+  // A bare word (not a flag) here is an unrecognised subcommand. Catch it so
+  // operators on an older bundle calling a newer subcommand get a clear
+  // upgrade hint instead of a confusing "missing required args" from the
+  // default client path. Also include the subcommand list and daemon usage
+  // so plain typos still see actionable syntax guidance.
+  if (argv[0] && !argv[0].startsWith('-')) {
+    console.error(`unknown command: ${argv[0]}`);
+    console.error(
+      `this client (${clientVersion}) does not recognise that subcommand. ` +
+        'It may be available in a newer release — run `vicoop-client upgrade --check`.',
+    );
+    console.error(SUBCOMMAND_LIST);
+    console.error(`daemon mode: ${DAEMON_USAGE}`);
+    process.exit(1);
+  }
+
+  // Daemon-mode help: `--help`/`-h` anywhere in argv prints usage. parseClientArgs
+  // would otherwise consume the next token (e.g. `--token`) as `--help`'s value
+  // and surface a confusing "missing required args" error.
+  if (argv.includes('--help') || argv.includes('-h')) {
+    process.stdout.write(`${SUBCOMMAND_LIST}\n`);
+    process.stdout.write(`daemon mode: ${DAEMON_USAGE}\n`);
+    process.exit(0);
   }
 
   // Default path: long-running daemon. Do not exit — client.start() keeps the
