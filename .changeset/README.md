@@ -7,9 +7,10 @@ intent files. They drive `@vicoop-bridge/client` versioning, the per-release
 ## When to add a changeset
 
 Any PR that should bump `@vicoop-bridge/client` (a behaviour change, fix, or
-docs change relevant to operators) needs a changeset. Server-only or
-admin-ui-only changes can skip it — those packages are listed under `ignore`
-in `config.json` and are not versioned.
+docs change relevant to operators) needs a changeset. Changes that only
+touch `@vicoop-bridge/server`, `@vicoop-bridge/protocol`, or
+`@vicoop-bridge/admin-ui` can skip it — those packages are listed under
+`ignore` in `config.json` and are not versioned.
 
 ## How
 
