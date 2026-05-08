@@ -370,10 +370,29 @@ systemctl --user enable --now vicoop-client
 ```
 
 For macOS or ad hoc local testing, run the foreground command above directly,
-or wrap it in a detached session (`screen -dmS vicoop-client …` /
-`tmux new -d …`) or a `launchd` plist if you want it to survive the terminal
+or wrap it in a detached session if you want it to survive the terminal
 closing. The bridge does not require systemd; it only needs one live
 `vicoop-client` process connected for the agent id.
+
+`nohup … &` tends to lose stdout/stderr on macOS; prefer `screen` or `tmux`
+with explicit log redirection so failures are recoverable:
+
+```sh
+mkdir -p "$INSTALL_DIR/logs"
+screen -dmS vicoop-client bash -lc ". \"$INSTALL_DIR/vicoop-client.env\" && \
+  BACKEND=claude \"$INSTALL_DIR/bin/vicoop-client\" \
+  >> \"$INSTALL_DIR/logs/client.log\" 2>&1"
+
+# tail the log
+tail -f "$INSTALL_DIR/logs/client.log"
+
+# stop
+screen -S vicoop-client -X quit
+```
+
+`launchd` is the persistent option if you want the client to start at login;
+write a plist under `~/Library/LaunchAgents/` and load it with
+`launchctl load -w`.
 
 ### Restrict who can call your agent
 
@@ -387,20 +406,35 @@ gates only the cross-owner tools.
 
 #### Option A: `vicoop-client` subcommands (recommended for scripts)
 
+These subcommands require **bundle `client-v0.8.0` or newer**. Older
+installs only know the daemon flags; check before using and upgrade if
+needed:
+
+```sh
+"$INSTALL_DIR/bin/vicoop-client" -v
+"$INSTALL_DIR/bin/vicoop-client" upgrade --check   # report latest vs current
+"$INSTALL_DIR/bin/vicoop-client" upgrade           # upgrade in place if behind
+```
+
 ```sh
 # One-time login — saves the bearer to ~/.vicoop/owner-session.json (chmod 600).
-vicoop-client login --owner-session --bridge "$BRIDGE_URL"
+"$INSTALL_DIR/bin/vicoop-client" login --owner-session --bridge "$BRIDGE_URL"
 
 # Now any of these work without re-authenticating:
-vicoop-client list-agents
-vicoop-client list-callers "$AGENT_ID"
-vicoop-client add-caller "$AGENT_ID" "eth:0x<40-hex>"
-vicoop-client remove-caller "$AGENT_ID" "google:email:caller@example.com"
+"$INSTALL_DIR/bin/vicoop-client" list-agents
+"$INSTALL_DIR/bin/vicoop-client" list-callers "$AGENT_ID" --json
+"$INSTALL_DIR/bin/vicoop-client" add-caller "$AGENT_ID" "eth:0x<40-hex>"
+"$INSTALL_DIR/bin/vicoop-client" remove-caller "$AGENT_ID" "google:email:caller@example.com"
 
 # Pass --json for machine-readable output, or --bridge / --token to override
 # the saved session for one call. VICOOP_BRIDGE / VICOOP_OWNER_TOKEN env vars
 # work too (handy for CI).
 ```
+
+The env file written by Step 4 (`SERVER_URL` / `SERVER_TOKEN` / `AGENT_ID`)
+is a **client** credential and is **not** accepted by these admin commands —
+they only accept an owner-session bearer, which is why
+`login --owner-session` is a separate step.
 
 These talk to the bridge's `/admin-api/*` routes — same logic the admin
 agent's tools run, but without an LLM round-trip per call.
