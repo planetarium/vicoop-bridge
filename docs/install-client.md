@@ -358,6 +358,43 @@ CLAUDE_CWD="$HOME/vicoop-bridge" \
 process. Set it when the released bundle lives outside the repository you
 want Claude to edit.
 
+The Claude backend also injects a small `--append-system-prompt` on every
+spawned `claude` telling it its own A2A mention (`@<agentId>@<host>`) so
+the model recognises self-references in user messages and doesn't try to
+a2a-call its own address (see #128). No configuration required — it's
+derived from `AGENT_ID` and the host part of `SERVER_URL`.
+
+### Check your agent's mention / acct (any backend)
+
+`vicoop-client whoami` prints the agent's canonical A2A identity — the
+WebFinger acct, the `@<agentId>@<host>` mention, and the WebFinger lookup
+URL. Useful for registering this agent on another agent's `allowed_callers`
+list, or for pasting into the **OpenClaw gateway persona** (OpenClaw's
+`chat.send` has no per-message system field, so its persona is configured
+on the gateway via `openclaw config set ...` — paste the mention there if
+you want self-reference recognition on the OpenClaw backend too).
+
+```sh
+. "$INSTALL_DIR/vicoop-client.env"
+"$INSTALL_DIR/bin/vicoop-client" whoami
+# agentId:    my-agent
+# host:       bridge.example.com
+# mention:    @my-agent@bridge.example.com
+# acct:       acct:my-agent@bridge.example.com
+# a2a:        https://bridge.example.com/agents/my-agent
+# a2a card:   https://bridge.example.com/agents/my-agent/.well-known/agent-card.json
+# webfinger:  https://bridge.example.com/.well-known/webfinger?resource=acct%3A...
+```
+
+`a2a` is the JSON-RPC endpoint another caller would POST to (e.g.
+`a2a-wallet a2a stream <a2a> "...")`. `a2a card` is the agent-card URL —
+useful for confirming the card the bridge advertises for this agent.
+
+`whoami --verify` additionally fetches the WebFinger URL and reports
+whether the bridge actually resolves this agent's acct (useful when
+PUBLIC_URL on the bridge differs from the `SERVER_URL` host you're
+connecting on). `--json` emits a machine-readable record for scripts.
+
 ## Optional: persistence
 
 Only set up persistence after the foreground run connects and the agent

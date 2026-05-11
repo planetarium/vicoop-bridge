@@ -650,6 +650,71 @@ test('passes expected argv shape (stream-json, session-id, verbose, extraArgs)',
   assert.equal(child.args.at(-1), 'sonnet');
 });
 
+test('injects --append-system-prompt with self-identity mention when identity is provided', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    identity: { agentId: '6eec0b6e-claude', host: 'vicoop-bridge-server.fly.dev' },
+  });
+  await backend.handle(assign('hi'), collect().emit, NEVER);
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  const idx = child.args.indexOf('--append-system-prompt');
+  assert.ok(idx !== -1, 'expected --append-system-prompt in argv');
+  const prompt = String(child.args[idx + 1]);
+  assert.match(prompt, /@6eec0b6e-claude@vicoop-bridge-server\.fly\.dev/);
+  assert.match(prompt, /acct:6eec0b6e-claude@vicoop-bridge-server\.fly\.dev/);
+});
+
+test('omits --append-system-prompt when no identity is configured', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  await backend.handle(assign('hi'), collect().emit, NEVER);
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  assert.equal(
+    child.args.indexOf('--append-system-prompt'),
+    -1,
+    'no identity → no system prompt args',
+  );
+});
+
+test('identity args precede extraArgs so operator extraArgs override', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    identity: { agentId: 'me', host: 'example.com' },
+    extraArgs: ['--append-system-prompt', 'OPERATOR'],
+  });
+  await backend.handle(assign('hi'), collect().emit, NEVER);
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  // claude applies multiple --append-system-prompt occurrences in order, so
+  // the operator-supplied one must appear LATER than the identity one.
+  const occurrences: number[] = [];
+  child.args.forEach((a, i) => {
+    if (a === '--append-system-prompt') occurrences.push(i);
+  });
+  assert.equal(occurrences.length, 2);
+  assert.ok(occurrences[1] > occurrences[0]);
+  assert.equal(child.args[occurrences[1] + 1], 'OPERATOR');
+});
+
 test('passes configured cwd through to the Claude subprocess', async () => {
   const fake = scriptedSpawn({
     lines: [JSON.stringify({ type: 'result', result: 'ok' })],
