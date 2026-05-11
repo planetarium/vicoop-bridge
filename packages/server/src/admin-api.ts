@@ -99,7 +99,33 @@ export async function addCaller(
       return tx`SELECT allowed_callers FROM agent_policies WHERE agent_id = ${agentId}`;
     });
     if (existing.length === 0) {
-      throw new AdminApiError('Agent policy not found or not authorized.', 404);
+      const created = await db.begin(async (tx) => {
+        await setRlsContext(tx, principalId);
+        return tx`
+          WITH owning_client AS (
+            SELECT id, owner_principal
+            FROM clients
+            WHERE ${agentId} = ANY(allowed_agent_ids)
+              AND revoked = false
+            ORDER BY created_at DESC
+            LIMIT 1
+          )
+          INSERT INTO agent_policies (agent_id, owner_principal, client_id, allowed_callers)
+          SELECT ${agentId}, owner_principal, id, ARRAY[${normalized}]::text[]
+          FROM owning_client
+          ON CONFLICT (agent_id) DO NOTHING
+          RETURNING agent_id, owner_principal, allowed_callers
+        `;
+      });
+      if (created.length === 0) {
+        throw new AdminApiError(
+          'Agent policy not found, and no registered client allows this agent id.',
+          404,
+        );
+      }
+      const callers = created[0].allowed_callers as string[];
+      registry.updateAllowedCallers(agentId, callers);
+      return { agent_id: agentId, principal: normalized, allowed_callers: callers };
     }
     const callers = existing[0].allowed_callers as string[];
     if (callers.includes(normalized)) {

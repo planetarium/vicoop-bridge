@@ -178,13 +178,16 @@ CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
 "$INSTALL_DIR/bin/vicoop-client" setup \
   --client-name "$CLIENT_NAME" \
   --agent-ids "$AGENT_ID" \
+  --caller "eth:0x<40-hex>" \
   --write-env-file "$INSTALL_DIR/vicoop-client.env"
 ```
 
 `login` prints a verification URL to stderr — open it in **any** browser
 (the same machine, or your laptop while running the CLI on a headless host)
-and authorize with your Google account. `setup` writes the resulting daemon env
-block to `vicoop-client.env` (mode 600):
+and authorize with your Google account. `setup` registers the client, configures
+any `--caller` allowlist entries, and writes the resulting daemon env block to
+`vicoop-client.env` (mode 600). If you omit `--caller`, `setup` succeeds but
+prints a warning that the agent will be public until you restrict callers:
 
 ```text
 SERVER_URL=wss://vicoop-bridge-server.fly.dev
@@ -205,7 +208,8 @@ with shell tooling:
 ```sh
 "$INSTALL_DIR/bin/vicoop-client" setup \
   --client-name "$CLIENT_NAME" \
-  --agent-ids "$AGENT_ID" --json \
+  --agent-ids "$AGENT_ID" \
+  --caller "eth:0x<40-hex>" --json \
   | tee /tmp/vicoop-setup.json
 CLIENT_TOKEN=$(jq -r .client_token /tmp/vicoop-setup.json)
 ```
@@ -302,10 +306,9 @@ BACKEND=openclaw \
 
 On success you'll see a `[client] connected, sending hello` log. After that:
 
-- The bridge auto-creates an `agent_policies` row owned by your wallet with
-  empty `allowed_callers` — meaning **publicly callable** until you restrict it.
-  For security, restrict callers before sharing the agent id or leaving the
-  client online unattended.
+- The bridge loads the `agent_policies` row for your agent. If Step 4 setup
+  included `--caller`, that allowlist is already in place; otherwise
+  `allowed_callers` is empty, meaning **publicly callable** until you restrict it.
 - `POST $BRIDGE_URL/agents/$AGENT_ID` with a JSON-RPC `message/send` payload
   reaches your backend and the reply is returned inline.
 
@@ -399,13 +402,13 @@ write a plist under `~/Library/LaunchAgents/` and load it with
 
 ### Recommended: restrict who can call your agent
 
-By default the policy has empty `allowed_callers`, which the dispatcher
-treats as "public". For normal use, add an allowlist entry for each trusted
-caller and keep the agent private by default. Either use the `vicoop-client`
-subcommands (deterministic, scriptable) or send a natural-language request to
-the admin agent. Both require an **owner-session token** (`vbc_owner_*`).
-Step 4 login saves one locally; you only need to rerun `login` if that file is
-missing or expired. Admin scope
+If Step 4 setup did not include `--caller`, the policy has empty
+`allowed_callers`, which the dispatcher treats as "public". For normal use, pass
+`--caller` during initial setup, or add an allowlist entry afterward with the
+`vicoop-client` subcommands (deterministic, scriptable) or a natural-language
+request to the admin agent. These paths require an **owner-session token**
+(`vbc_owner_*`). Step 4 login saves one locally; you only need to rerun `login`
+if that file is missing or expired. Admin scope
 (`is_admin()`) is wallet-only and gates only the cross-owner tools.
 
 #### Option A: `vicoop-client` subcommands (recommended for scripts)
@@ -422,6 +425,11 @@ needed:
 
 ```sh
 # Step 4 login saves the owner-session bearer, so these work without re-authenticating:
+"$INSTALL_DIR/bin/vicoop-client" setup \
+  --client-name "$CLIENT_NAME" \
+  --agent-ids "$AGENT_ID" \
+  --caller "eth:0x<40-hex>" \
+  --write-env-file "$INSTALL_DIR/vicoop-client.env"
 "$INSTALL_DIR/bin/vicoop-client" list-agents
 "$INSTALL_DIR/bin/vicoop-client" list-callers "$AGENT_ID" --json
 "$INSTALL_DIR/bin/vicoop-client" add-caller "$AGENT_ID" "eth:0x<40-hex>"

@@ -4,7 +4,7 @@
 //
 // Auth: each subcommand resolves an owner-session bearer via env
 // (VICOOP_OWNER_TOKEN + VICOOP_BRIDGE) or the file written by
-// `vicoop-client login --owner-session`. If neither is present (or the
+// `vicoop-client login --bridge <URL>`. If neither is present (or the
 // stored token is expired) the user gets a clear "run login" hint and the
 // process exits with code 1.
 

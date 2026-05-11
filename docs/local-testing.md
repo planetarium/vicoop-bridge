@@ -178,14 +178,13 @@ psql vicoop_bridge_dev -c \
   "SELECT principal_id, email, expires_at FROM callers ORDER BY created_at DESC LIMIT 1;"
 # principal_id will be 'google:<sub>' — keep the sub for step 5b.
 
-# 5a. Get an owner-session bearer (separate device-flow run with
-#     intent=owner_session). Saves the token to ~/.vicoop/owner-session.json
+# 5a. Get an owner-session bearer. Saves the token to ~/.vicoop/owner-session.json
 #     so 5b picks it up automatically. Re-using the same Google account is
 #     fine; the audiences are independent.
 #     (`CLI` is just shorthand for the local-source invocation — see the
 #     callout below if you're working from a published bundle.)
 CLI="pnpm --filter @vicoop-bridge/client exec tsx src/cli.ts"
-$CLI login --owner-session --bridge http://localhost:8787
+$CLI login --bridge http://localhost:8787
 
 # 5b. Add the caller principal — hot-reloads via registry.updateAllowedCallers,
 #     no client restart needed.

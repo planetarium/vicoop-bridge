@@ -245,6 +245,47 @@ test(
 );
 
 test(
+  'POST /admin-api/agents/:id/callers pre-creates policy for a registered client agent id',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'e'.repeat(40)}`;
+    let setup: SetupResult | null = null;
+    try {
+      setup = await setupOwner(sql, owner);
+      await sql`DELETE FROM agent_policies WHERE agent_id = ${setup.agentId}`;
+
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+      const target = `eth:0x${'f'.repeat(40)}`;
+      const res = await app.request(`/admin-api/agents/${setup.agentId}/callers`, {
+        method: 'POST',
+        headers: { ...authHeaders(setup.ownerToken), 'content-type': 'application/json' },
+        body: JSON.stringify({ principal: target }),
+      });
+
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as { allowed_callers: string[]; principal: string };
+      assert.deepEqual(body.allowed_callers, [target]);
+      assert.equal(body.principal, target);
+
+      const rows = await sql<{ owner_principal: string; client_id: string; allowed_callers: string[] }[]>`
+        SELECT owner_principal, client_id, allowed_callers
+        FROM agent_policies
+        WHERE agent_id = ${setup.agentId}
+      `;
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0]!.owner_principal, owner);
+      assert.equal(rows[0]!.client_id, setup.clientId);
+      assert.deepEqual(rows[0]!.allowed_callers, [target]);
+    } finally {
+      if (setup) await teardown(sql, owner, setup.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
   'POST /admin-api/agents/:id/callers rejects invalid principals with 400',
   { skip: !hasDb },
   async () => {

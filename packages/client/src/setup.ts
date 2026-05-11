@@ -6,6 +6,7 @@ import { atomicWriteFile, resolveOwnerSession } from './owner-session.js';
 interface SetupArgs {
   clientName: string;
   allowedAgentIds: string[];
+  callers: string[];
   envFile: string | null;
   bridge?: string;
   token?: string;
@@ -38,13 +39,15 @@ interface ClientRegisterSuccess {
 function usage(): string {
   return [
     'usage: vicoop-client setup --client-name <name> --agent-ids <id1,id2>',
-    '                           [--write-env-file <path>] [--bridge URL] [--token TOKEN] [--json]',
+    '                           [--caller PRINCIPAL]... [--write-env-file <path>]',
+    '                           [--bridge URL] [--token TOKEN] [--json]',
   ].join('\n');
 }
 
 function parseArgs(args: string[]): SetupArgs | { error: string; help?: boolean } {
   let clientName: string | undefined;
   let allowedAgentIds: string[] = [];
+  const callers: string[] = [];
   let envFile: string | null = null;
   let bridge: string | undefined;
   let token: string | undefined;
@@ -68,6 +71,9 @@ function parseArgs(args: string[]): SetupArgs | { error: string; help?: boolean 
       case '--agent-ids':
         allowedAgentIds = v.split(',').map((s) => s.trim()).filter(Boolean);
         break;
+      case '--caller':
+        callers.push(...v.split(',').map((s) => s.trim()).filter(Boolean));
+        break;
       case '--write-env-file':
       case '--env-file':
         envFile = v;
@@ -86,7 +92,7 @@ function parseArgs(args: string[]): SetupArgs | { error: string; help?: boolean 
 
   if (!clientName) return { error: '--client-name is required' };
   if (allowedAgentIds.length === 0) return { error: '--agent-ids is required' };
-  return { clientName, allowedAgentIds, envFile, bridge, token, json };
+  return { clientName, allowedAgentIds, callers, envFile, bridge, token, json };
 }
 
 function gqlString(value: string): string {
@@ -152,6 +158,64 @@ async function registerClient(
   };
 }
 
+interface CallerSetupResult {
+  agent_id?: string;
+  principal?: string;
+  allowed_callers?: string[];
+}
+
+async function addCaller(
+  session: { bridge: string; token: string },
+  agentId: string,
+  principal: string,
+): Promise<CallerSetupResult> {
+  const res = await fetch(
+    `${session.bridge.replace(/\/$/, '')}/admin-api/agents/${encodeURIComponent(agentId)}/callers`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${session.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ principal }),
+    },
+  );
+  const text = await res.text();
+  let parsed: unknown = text;
+  if (text) {
+    try {
+      parsed = JSON.parse(text) as unknown;
+    } catch {
+      // leave raw text
+    }
+  }
+  if (!res.ok) {
+    const detail =
+      parsed && typeof parsed === 'object' && 'error' in parsed
+        ? String((parsed as { error: unknown }).error)
+        : String(parsed);
+    throw new Error(`add-caller failed for ${agentId} (${res.status}): ${detail}`);
+  }
+  return parsed as CallerSetupResult;
+}
+
+async function configureCallers(
+  session: { bridge: string; token: string },
+  agentIds: string[],
+  callers: string[],
+): Promise<void> {
+  for (const agentId of agentIds) {
+    for (const caller of callers) {
+      const result = await addCaller(session, agentId, caller);
+      const configured = (result.allowed_callers ?? []).join(', ') || '(none)';
+      process.stderr.write(
+        `Configured caller for ${agentId}: ${result.principal ?? caller}\n` +
+          `  allowed_callers   ${configured}\n`,
+      );
+    }
+  }
+}
+
 export async function runSetup(args: string[]): Promise<number> {
   const parsed = parseArgs(args);
   if ('error' in parsed) {
@@ -190,6 +254,21 @@ export async function runSetup(args: string[]): Promise<number> {
       'The CLIENT_TOKEN below is shown only once and cannot be retrieved later.\n' +
       '  Save it now (export to env, write to a vault, etc.).\n\n',
   );
+
+  if (parsed.callers.length > 0) {
+    try {
+      await configureCallers({ bridge, token }, success.allowed_agent_ids, parsed.callers);
+    } catch (e) {
+      process.stderr.write(`${(e as Error).message}\n`);
+      return 1;
+    }
+    process.stderr.write('\n');
+  } else {
+    process.stderr.write(
+      'WARNING: no callers configured. The agent is public until you run ' +
+        '`vicoop-client add-caller <agent_id> <principal>`.\n\n',
+    );
+  }
 
   if (parsed.envFile) {
     writeClientEnvFile(parsed.envFile, success, bridge);

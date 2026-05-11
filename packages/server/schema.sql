@@ -519,11 +519,14 @@ CREATE POLICY agent_policies_select ON agent_policies
   FOR SELECT TO app_authenticated
   USING (owner_principal = current_principal() OR is_admin());
 
--- No INSERT policy for app_authenticated. UPDATE is allowed for the same
--- owner/admin predicate because admin tools (add_caller / remove_caller) run
--- UPDATE under app_authenticated; direct mutations remain hidden via @omit.
+-- INSERT/UPDATE are allowed for the same owner/admin predicate because admin
+-- tools can pre-create policies during setup, then mutate allowed_callers.
+-- Direct mutations remain hidden from GraphQL via @omit.
 DROP POLICY IF EXISTS agent_policies_insert ON agent_policies;
 DROP POLICY IF EXISTS agent_policies_update ON agent_policies;
+CREATE POLICY agent_policies_insert ON agent_policies
+  FOR INSERT TO app_authenticated
+  WITH CHECK (owner_principal = current_principal() OR is_admin());
 CREATE POLICY agent_policies_update ON agent_policies
   FOR UPDATE TO app_authenticated
   USING (owner_principal = current_principal() OR is_admin())
