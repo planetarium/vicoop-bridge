@@ -64,12 +64,14 @@ export function a2aCardUrl(id: AgentIdentity): string {
 // for the URL-building counterpart.
 //
 // IPv6 literals are returned bracketed (`[::1]`) so the `acct:` form follows
-// RFC 7565 / RFC 3986 host-with-brackets convention and matches the bridge's
-// own Mentionable surface, which expects bracketed IPv6 hosts (see
-// `packages/server/src/well-known.ts` `isIpLiteral`). The WHATWG URL spec
-// keeps the brackets on `hostname` for IPv6 — Node 24+ does — but some older
-// Node/embedder implementations stripped them, so we re-wrap defensively when
-// the hostname looks like a bare IPv6 literal.
+// the RFC 7565 / RFC 3986 host-with-brackets convention and matches the
+// bridge's own Mentionable surface (see `packages/server/src/well-known.ts`
+// `isIpLiteral`).
+//
+// Different URL parsers disagree on whether `URL.hostname` includes the
+// brackets — some surface a bare `::1`, others keep `[::1]`. We normalise to
+// the bracketed form regardless: if the hostname contains `:` (which a legal
+// DNS hostname cannot) and is not already bracketed, wrap it.
 export function hostFromServerUrl(serverUrl: string): string | null {
   let url: URL;
   try {
@@ -79,8 +81,6 @@ export function hostFromServerUrl(serverUrl: string): string | null {
   }
   const hostname = url.hostname;
   if (!hostname) return null;
-  // Any `:` in a hostname is unambiguously an IPv6 literal (legal hostnames
-  // can't contain `:`). If it's already bracketed, leave it; otherwise wrap.
   if (hostname.includes(':') && !hostname.startsWith('[')) {
     return `[${hostname}]`;
   }
