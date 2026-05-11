@@ -67,18 +67,44 @@ TAG_PREFIX="@vicoop-bridge/client@"
 
 if [ -z "$VERSION" ]; then
   log "resolving latest $TAG_PREFIX* release from GitHub"
-  # Pull recent releases (default 30) and pick the first tag matching the
-  # changesets monorepo prefix. Avoid /releases/latest because it may point
-  # at a non-client release. Use `#` as the sed delimiter so the `/` inside
-  # the tag prefix doesn't need escaping.
+  # Pull recent releases (default 30) and pick the newest non-draft,
+  # non-prerelease release whose tag matches the changesets monorepo
+  # prefix. Avoid /releases/latest because it may point at a non-client
+  # release. Parse with node (already a hard prereq above) rather than
+  # grepping tag_name, so the draft/prerelease flags are honored the same
+  # way `vicoop-client upgrade` honors them.
   VERSION="$(
     curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" \
-      | grep -o '"tag_name":[[:space:]]*"@vicoop-bridge/client@[^"]*"' \
-      | head -n1 \
-      | sed -E 's#.*"(@vicoop-bridge/client@[^"]+)".*#\1#'
+      | node -e '
+let data = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (c) => { data += c; });
+process.stdin.on("end", () => {
+  let releases;
+  try { releases = JSON.parse(data); } catch { return; }
+  if (!Array.isArray(releases)) return;
+  const prefix = "@vicoop-bridge/client@";
+  for (const r of releases) {
+    if (!r || typeof r.tag_name !== "string") continue;
+    if (!r.tag_name.startsWith(prefix)) continue;
+    if (r.draft || r.prerelease) continue;
+    process.stdout.write(r.tag_name);
+    return;
+  }
+});
+'
   )"
-  [ -n "$VERSION" ] || die "no $TAG_PREFIX* release found in $REPO"
+  [ -n "$VERSION" ] || die "no published (non-draft, non-prerelease) $TAG_PREFIX* release found in $REPO"
 fi
+
+# Defense in depth: even when the operator pins VERSION via env, refuse to
+# proceed if it doesn't carry the expected prefix. Otherwise the
+# `${VERSION#$TAG_PREFIX}` expansion below leaves arbitrary characters in
+# VERSION_NUM, which then lands in the archive filename and URL.
+case "$VERSION" in
+  "$TAG_PREFIX"*) ;;
+  *) die "VERSION must start with $TAG_PREFIX (got: $VERSION)" ;;
+esac
 
 log "installing $VERSION"
 
