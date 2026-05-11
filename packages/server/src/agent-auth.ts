@@ -20,12 +20,18 @@ export function getCaller(c: Context): VerifiedCaller | undefined {
 
 const WWW_AUTH_REALM = 'vicoop-bridge';
 
+// Cap the error_description so a long upstream err.message can't push the
+// WWW-Authenticate header past common proxy/server limits (often ~8KB total).
+const ERROR_DESCRIPTION_MAX_LEN = 200;
+
 // RFC 6749 §4.1.2.1 restricts error_description to %x20-21 / %x23-5B / %x5D-7E,
 // i.e. printable ASCII excluding `"` and `\`. Anything outside that range is
 // dropped so the header stays a valid quoted-string without escape handling.
+// Output is also length-capped to keep total header size bounded.
 function sanitizeErrorDescription(value: string): string {
   let out = '';
   for (const ch of value) {
+    if (out.length >= ERROR_DESCRIPTION_MAX_LEN) break;
     const code = ch.charCodeAt(0);
     if (
       code === 0x20 ||

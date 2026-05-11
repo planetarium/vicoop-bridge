@@ -9,7 +9,8 @@ import type { Sql } from './db.js';
 
 // The reject paths exercised here never touch postgres — the middleware short-
 // circuits on missing/malformed bearer headers before reaching verifyCallerToken
-// or verifySessionToken. A stub Sql is sufficient.
+// (vbc_caller_* branch) or verifySiweBearerToken (SIWE branch). A stub Sql is
+// sufficient.
 const stubSql = {} as Sql;
 
 function fakeAgentCard(name: string): AgentCard {
@@ -122,4 +123,27 @@ test('unknown agent returns 404 without auth challenge', async () => {
   assert.equal(res.status, 404);
   // 404 is not an auth failure, so RFC 6750 challenge shouldn't be added.
   assert.equal(res.headers.get('WWW-Authenticate'), null);
+});
+
+test('error_description is length-capped so a long upstream message cannot blow up the header', async () => {
+  // SIWE verify failures bubble up err.message into error_description; we
+  // can't easily inject an arbitrary long message here, so just assert the
+  // header stays within a sane bound on the realistic failure case.
+  const { app, registry } = buildApp({ siweDomain: 'bridge.example' });
+  registerAgent(registry, 'restricted', ['eth:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']);
+
+  const res = await app.request('/agents/restricted', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${'a'.repeat(4096)}` },
+  });
+  assert.equal(res.status, 401);
+  const challenge = res.headers.get('WWW-Authenticate');
+  assert.ok(challenge);
+  // Header total stays well under common 8KB limits; the cap inside
+  // sanitizeErrorDescription keeps error_description bounded at 200 chars.
+  assert.ok(challenge.length < 512, `expected challenge < 512 chars, got ${challenge.length}`);
+  const match = challenge.match(/error_description="([^"]*)"/);
+  if (match) {
+    assert.ok(match[1].length <= 200, `expected description <= 200 chars, got ${match[1].length}`);
+  }
 });
