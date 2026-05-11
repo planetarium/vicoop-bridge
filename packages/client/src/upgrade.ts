@@ -300,6 +300,14 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
 }
 
 export function normalizeTag(v: string): string {
+  // A leading `@` signals the operator meant to pass a full scoped tag. If
+  // the prefix doesn't match (e.g. `@evil/client@0.3.0`), surface that
+  // directly — otherwise the prefix is prepended unconditionally and
+  // assertSafeTag's "got" value reads like the double-prefixed
+  // `@vicoop-bridge/client@@evil/client@0.3.0`, which is hard to parse.
+  if (v.startsWith('@') && !v.startsWith(TAG_PREFIX)) {
+    throw new Error(`invalid version '${v}': expected tag to start with ${TAG_PREFIX}`);
+  }
   // Peel the prefix if present so the leading-`v` strip applies whether the
   // operator typed the bare version, the v-prefixed bare version, or the
   // full tag (`@vicoop-bridge/client@v0.3.0` should resolve the same as

@@ -17,6 +17,16 @@ test('normalizeTag accepts full tag, bare version, and v-prefixed version', () =
   assert.equal(normalizeTag('1.0.0+build.sha'), '@vicoop-bridge/client@1.0.0+build.sha');
 });
 
+test('normalizeTag wrong-scope error names the expected prefix, not a doubled string', () => {
+  // The error should call out the bad prefix on the raw input, not show a
+  // confusing post-normalization string like
+  // "@vicoop-bridge/client@@evil/client@0.3.0".
+  assert.throws(
+    () => normalizeTag('@evil/client@0.3.0'),
+    /expected tag to start with @vicoop-bridge\/client@/,
+  );
+});
+
 test('normalizeTag rejects path-traversal and shell-metacharacter payloads', () => {
   for (const bad of [
     '../etc/passwd',
@@ -33,6 +43,7 @@ test('normalizeTag rejects path-traversal and shell-metacharacter payloads', () 
     // Wrong scope shouldn't squeak through — `startsWith` check + the
     // anchored regex must agree.
     '@evil/client@0.3.0',
+    '@vicoop-bridge/server@0.3.0',
     '',
   ]) {
     assert.throws(() => normalizeTag(bad), /invalid version/, `expected rejection for ${JSON.stringify(bad)}`);
