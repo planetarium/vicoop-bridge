@@ -50,8 +50,8 @@ else
   exit "$rc"
 fi
 
-if grep -qx "${ARCHIVE_NAME}" <<<"${existing_assets}" \
-    && grep -qx "${CHECKSUM_NAME}" <<<"${existing_assets}"; then
+if grep -Fqx "${ARCHIVE_NAME}" <<<"${existing_assets}" \
+    && grep -Fqx "${CHECKSUM_NAME}" <<<"${existing_assets}"; then
   echo "release ${TAG} already has ${ARCHIVE_NAME} + ${CHECKSUM_NAME} — nothing to do"
   exit 0
 fi
