@@ -336,7 +336,7 @@ function assertSafeTag(tag: string, raw: string = tag): void {
   // encodeURIComponent before being used.
   if (!TAG_RE.test(tag) || tag.includes('..')) {
     throw new Error(
-      `invalid version '${raw}': expected ${TAG_PREFIX}<X.Y.Z> with only [A-Za-z0-9.+-] in the version (no '..'), got '${tag}'`,
+      `invalid version '${raw}': expected ${TAG_PREFIX}<version> with only [A-Za-z0-9.+-] in the version (no '..'), got '${tag}'`,
     );
   }
 }
