@@ -140,10 +140,11 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
           reason: 'invalid_token',
           detail: truncate((err as Error).message, 256),
         });
-        // Don't surface raw err.message in WWW-Authenticate — the
-        // verifyCallerToken path can throw SQL/connection errors, and the
-        // header is commonly captured by proxy access logs. Detailed cause is
-        // already in the structured logEvent above.
+        // Don't surface raw err.message in either WWW-Authenticate (commonly
+        // captured by proxy access logs) or the JSON-RPC body (returned to
+        // unauthenticated callers) — the verifyCallerToken path can throw
+        // SQL/connection errors. Detailed cause stays in the structured
+        // logEvent above for diagnostics.
         setWWWAuthenticate(c, {
           error: 'invalid_token',
           description: 'invalid bearer token',
@@ -151,7 +152,7 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
         return c.json({
           jsonrpc: '2.0',
           id: null,
-          error: { code: -32001, message: `Invalid bearer token: ${(err as Error).message}` },
+          error: { code: -32001, message: `Invalid bearer token. Acquire one via ${acquisitionHint}.` },
         }, 401);
       }
     } else if (bearerToken.startsWith(OWNER_SESSION_PREFIX)) {
@@ -187,9 +188,11 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
           reason: 'invalid_siwe_bearer',
           detail: truncate((err as Error).message, 256),
         });
-        // Stable, public description — siwe-bearer verification can surface
-        // low-level library/parse errors that we don't want to echo into a
-        // header that proxies routinely log.
+        // Stable public strings in both the header and the JSON body —
+        // siwe-bearer verification can surface low-level library/parse
+        // errors that we don't want to echo into a header that proxies
+        // routinely log, nor into a body returned to unauthenticated callers.
+        // Detailed cause stays in the structured logEvent above.
         setWWWAuthenticate(c, {
           error: 'invalid_token',
           description: 'invalid SIWE bearer',
@@ -199,7 +202,7 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
           id: null,
           error: {
             code: -32001,
-            message: `Invalid bearer token: ${(err as Error).message}. Acquire one via ${acquisitionHint}.`,
+            message: `Invalid bearer token. Acquire one via ${acquisitionHint}.`,
           },
         }, 401);
       }

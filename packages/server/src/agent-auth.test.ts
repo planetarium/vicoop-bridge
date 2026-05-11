@@ -141,6 +141,13 @@ test('invalid SIWE bearer (siweDomain on) responds with WWW-Authenticate error="
   // so detail (e.g. "SIWE bearer token is not valid JSON") can't leak via
   // proxy access logs.
   assert.match(challenge, /error_description="invalid SIWE bearer"/);
+
+  // The JSON body must also not leak the underlying verifier err.message —
+  // unauthenticated callers receive this directly. Detail stays in logEvent.
+  const body = (await res.json()) as { error: { message: string } };
+  assert.doesNotMatch(body.error.message, /not valid JSON/i);
+  assert.doesNotMatch(body.error.message, /SIWE bearer token/i);
+  assert.match(body.error.message, /^Invalid bearer token\./);
 });
 
 test('public agent (no allowedCallers) passes through without WWW-Authenticate', async () => {
