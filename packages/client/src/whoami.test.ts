@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer, type Server } from 'node:http';
 import { runWhoami } from './whoami.js';
 
 // Capture stdout/stderr for the duration of a single runWhoami() call. The
@@ -28,6 +29,43 @@ function captureIO<T>(fn: () => Promise<T>): Promise<{
       process.stdout.write = origOut;
       process.stderr.write = origErr;
     });
+}
+
+// Spin up a real HTTP server so --verify hits a deterministic local
+// endpoint instead of touching the network.
+function withWebfingerServer<T>(
+  handler: (req: { resource: string }, res: { json: (body: unknown, status?: number) => void }) => void,
+  fn: (origin: string) => Promise<T>,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const server: Server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://localhost');
+      const resource = url.searchParams.get('resource') ?? '';
+      const wrapped = {
+        json: (body: unknown, status = 200) => {
+          res.statusCode = status;
+          res.setHeader('Content-Type', 'application/jrd+json');
+          res.end(JSON.stringify(body));
+        },
+      };
+      handler({ resource }, wrapped);
+    });
+    server.listen(0, '127.0.0.1', async () => {
+      const addr = server.address();
+      if (!addr || typeof addr === 'string') {
+        server.close();
+        reject(new Error('no address'));
+        return;
+      }
+      const origin = `http://127.0.0.1:${addr.port}`;
+      try {
+        const out = await fn(origin);
+        server.close(() => resolve(out));
+      } catch (e) {
+        server.close(() => reject(e));
+      }
+    });
+  });
 }
 
 test('whoami prints mention / acct / webfinger URL on happy path', async () => {
@@ -72,12 +110,33 @@ test('whoami --json emits a parseable record', async () => {
   const parsed = JSON.parse(stdout);
   assert.equal(parsed.agentId, 'me');
   assert.equal(parsed.host, 'h.example');
+  assert.equal(parsed.httpOrigin, 'https://h.example');
   assert.equal(parsed.mention, '@me@h.example');
   assert.equal(parsed.acct, 'acct:me@h.example');
   assert.equal(parsed.a2aEndpoint, 'https://h.example/agents/me');
   assert.equal(
     parsed.a2aCardUrl,
     'https://h.example/agents/me/.well-known/agent-card.json',
+  );
+});
+
+test('whoami preserves scheme+port for local dev (ws → http, port retained)', async () => {
+  const { result, stdout } = await captureIO(() =>
+    runWhoami([
+      '--agentId',
+      'me',
+      '--server',
+      'ws://localhost:8787/ws',
+      '--json',
+    ]),
+  );
+  assert.equal(result, 0);
+  const parsed = JSON.parse(stdout);
+  assert.equal(parsed.httpOrigin, 'http://localhost:8787');
+  assert.equal(parsed.a2aEndpoint, 'http://localhost:8787/agents/me');
+  assert.equal(
+    parsed.webfingerUrl,
+    'http://localhost:8787/.well-known/webfinger?resource=acct%3Ame%40localhost',
   );
 });
 
@@ -96,7 +155,7 @@ test('whoami exits 1 with usage when agentId / server are missing', async () => 
 });
 
 test('whoami warns and exits 2 when agentId is not a Mentionable local', async () => {
-  const { result, stderr } = await captureIO(() =>
+  const { result, stderr, stdout } = await captureIO(() =>
     runWhoami([
       '--agentId',
       'bad/agent',
@@ -106,4 +165,76 @@ test('whoami warns and exits 2 when agentId is not a Mentionable local', async (
   );
   assert.equal(result, 2);
   assert.match(stderr, /not a valid Mentionable local-part/);
+  // Even with an invalid id, the printed URL must be valid (encoded).
+  assert.match(stdout, /a2a:\s*https:\/\/h\.example\/agents\/bad%2Fagent/);
+});
+
+test('whoami --verify treats a matching JRD subject as success', async () => {
+  await withWebfingerServer(
+    ({ resource }, res) => {
+      assert.equal(resource, 'acct:me@127.0.0.1');
+      res.json({
+        subject: 'acct:me@127.0.0.1',
+        aliases: ['https://127.0.0.1/agents/me'],
+      });
+    },
+    async (origin) => {
+      const url = new URL(origin);
+      const { result, stdout } = await captureIO(() =>
+        runWhoami([
+          '--agentId',
+          'me',
+          '--server',
+          `ws://${url.host}/ws`,
+          '--verify',
+        ]),
+      );
+      assert.equal(result, 0);
+      assert.match(stdout, /webfinger ok/);
+    },
+  );
+});
+
+test('whoami --verify exits 3 when the JRD subject does not match the requested acct', async () => {
+  await withWebfingerServer(
+    (_req, res) => {
+      // Wrong subject — pretend the server pointed us at a different agent.
+      res.json({ subject: 'acct:somebody-else@127.0.0.1', aliases: [] });
+    },
+    async (origin) => {
+      const url = new URL(origin);
+      const { result, stdout } = await captureIO(() =>
+        runWhoami([
+          '--agentId',
+          'me',
+          '--server',
+          `ws://${url.host}/ws`,
+          '--verify',
+        ]),
+      );
+      assert.equal(result, 3);
+      assert.match(stdout, /webfinger FAILED/);
+      assert.match(stdout, /subject mismatch/);
+    },
+  );
+});
+
+test('whoami --verify exits 3 with HTTP <status> when WebFinger returns 404', async () => {
+  await withWebfingerServer(
+    (_req, res) => res.json({ error: 'not found' }, 404),
+    async (origin) => {
+      const url = new URL(origin);
+      const { result, stdout } = await captureIO(() =>
+        runWhoami([
+          '--agentId',
+          'me',
+          '--server',
+          `ws://${url.host}/ws`,
+          '--verify',
+        ]),
+      );
+      assert.equal(result, 3);
+      assert.match(stdout, /webfinger FAILED:\s*HTTP 404/);
+    },
+  );
 });

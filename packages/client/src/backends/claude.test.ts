@@ -658,7 +658,11 @@ test('injects --append-system-prompt with self-identity mention when identity is
 
   const backend = createClaudeBackend({
     spawn: fake.spawn,
-    identity: { agentId: '6eec0b6e-claude', host: 'vicoop-bridge-server.fly.dev' },
+    identity: {
+      agentId: '6eec0b6e-claude',
+      host: 'vicoop-bridge-server.fly.dev',
+      httpOrigin: 'https://vicoop-bridge-server.fly.dev',
+    },
   });
   await backend.handle(assign('hi'), collect().emit, NEVER);
 
@@ -697,7 +701,7 @@ test('identity args precede extraArgs so operator extraArgs override', async () 
 
   const backend = createClaudeBackend({
     spawn: fake.spawn,
-    identity: { agentId: 'me', host: 'example.com' },
+    identity: { agentId: 'me', host: 'example.com', httpOrigin: 'https://example.com' },
     extraArgs: ['--append-system-prompt', 'OPERATOR'],
   });
   await backend.handle(assign('hi'), collect().emit, NEVER);

@@ -11,7 +11,14 @@ export function isValidMentionableLocal(local: string): boolean {
 
 export interface AgentIdentity {
   agentId: string;
+  // Hostname only (no scheme, no port). Used in the mention/acct subject
+  // (`@<agentId>@<host>` / `acct:<agentId>@<host>`).
   host: string;
+  // HTTP(S) origin of the bridge (`scheme://host[:port]`). Used to build
+  // WebFinger / A2A / agent-card URLs. Carried separately from `host` so a
+  // dev deployment on `ws://localhost:8787` resolves to `http://localhost:8787`
+  // for URLs while the mention stays `<agentId>@localhost`.
+  httpOrigin: string;
 }
 
 // `<agentId>@<host>` — the canonical mention form a user types in the bridge
@@ -31,14 +38,16 @@ export function formatAcct(id: AgentIdentity): string {
 // resolves this agent's acct from outside.
 export function webfingerUrl(id: AgentIdentity): string {
   const acct = encodeURIComponent(formatAcct(id));
-  return `https://${id.host}/.well-known/webfinger?resource=${acct}`;
+  return `${id.httpOrigin}/.well-known/webfinger?resource=${acct}`;
 }
 
 // A2A JSON-RPC endpoint for this agent — what a caller POSTs to via
 // `a2a-wallet a2a stream` etc. The corresponding agent card lives one path
-// segment deeper (see `a2aCardUrl`).
+// segment deeper (see `a2aCardUrl`). `agentId` is %-encoded defensively even
+// though valid Mentionable locals never require it, so the URL stays valid
+// when whoami is asked to print an out-of-charset id.
 export function a2aEndpoint(id: AgentIdentity): string {
-  return `https://${id.host}/agents/${id.agentId}`;
+  return `${id.httpOrigin}/agents/${encodeURIComponent(id.agentId)}`;
 }
 
 // Agent card JSON URL served by the bridge for this agent (see
@@ -50,11 +59,9 @@ export function a2aCardUrl(id: AgentIdentity): string {
   return `${a2aEndpoint(id)}/.well-known/agent-card.json`;
 }
 
-// Best-effort host derivation from the bridge WebSocket URL. The bridge's
-// WebFinger surface is rooted at the same hostname as the WS endpoint in the
-// usual deployment (`wss://<host>/ws` ↔ `https://<host>/.well-known/...`); if
-// PUBLIC_URL is configured to a different host on the server side the derived
-// mention will not resolve via WebFinger and `whoami` will say so.
+// Best-effort host derivation from the bridge WebSocket URL. Hostname only
+// (no port) — used for the mention/acct subject. See `httpOriginFromServerUrl`
+// for the URL-building counterpart.
 export function hostFromServerUrl(serverUrl: string): string | null {
   try {
     return new URL(serverUrl).hostname || null;
@@ -63,12 +70,30 @@ export function hostFromServerUrl(serverUrl: string): string | null {
   }
 }
 
+// HTTP(S) origin counterpart to `hostFromServerUrl`. ws↔http / wss↔https
+// (`URL.protocol` is `ws:`/`wss:`/`http:`/`https:`), preserving the port so
+// dev deployments like `ws://localhost:8787` get the correct
+// `http://localhost:8787` for WebFinger / A2A URLs.
+export function httpOriginFromServerUrl(serverUrl: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(serverUrl);
+  } catch {
+    return null;
+  }
+  if (!url.hostname) return null;
+  const scheme =
+    url.protocol === 'wss:' || url.protocol === 'https:' ? 'https' : 'http';
+  return `${scheme}://${url.host}`;
+}
+
 export function deriveIdentity(
   agentId: string,
   serverUrl: string,
 ): AgentIdentity | null {
   const host = hostFromServerUrl(serverUrl);
-  if (!host) return null;
+  const httpOrigin = httpOriginFromServerUrl(serverUrl);
+  if (!host || !httpOrigin) return null;
   if (!isValidMentionableLocal(agentId)) return null;
-  return { agentId, host };
+  return { agentId, host, httpOrigin };
 }

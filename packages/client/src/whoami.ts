@@ -11,6 +11,7 @@ import {
   formatAcct,
   formatMention,
   hostFromServerUrl,
+  httpOriginFromServerUrl,
   isValidMentionableLocal,
   webfingerUrl,
   type AgentIdentity,
@@ -23,6 +24,11 @@ interface ParsedArgs {
   verify: boolean;
   help: boolean;
 }
+
+// Default timeout for `--verify`. Long enough to ride out a slow handshake
+// against a sleeping fly machine but short enough to give a clear failure
+// instead of hanging an operator's terminal indefinitely.
+const VERIFY_TIMEOUT_MS = 10_000;
 
 const USAGE =
   'usage: vicoop-client whoami [--agentId <id>] [--server <ws://...>] [--json] [--verify]\n' +
@@ -60,6 +66,7 @@ function parseArgs(args: string[]): ParsedArgs | { error: string } {
 interface WhoamiResult {
   agentId: string;
   host: string;
+  httpOrigin: string;
   mention: string;
   acct: string;
   a2aEndpoint: string;
@@ -76,14 +83,25 @@ interface VerifyResult {
   aliases?: string[];
 }
 
-// Calls WebFinger and reports whether the bridge resolves this acct. A miss
-// here usually means the bridge isn't connected to a client agent with this
-// agentId, or the bridge's PUBLIC_URL host differs from the WS host the
-// client is connecting on.
+// Calls WebFinger and reports whether the bridge actually resolves this
+// agent. A miss usually means the bridge isn't connected to a client agent
+// with this agentId, or its PUBLIC_URL host differs from the WS host being
+// used here. We treat the lookup as failed unless the JRD's `subject` matches
+// the requested acct — a generic 200 with an unrelated subject would
+// otherwise look like a successful resolution.
 async function verifyWebfinger(id: AgentIdentity): Promise<VerifyResult> {
   const url = webfingerUrl(id);
+  const expectedSubject = formatAcct(id);
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new Error(`timeout after ${VERIFY_TIMEOUT_MS}ms`)),
+    VERIFY_TIMEOUT_MS,
+  );
   try {
-    const res = await fetch(url, { headers: { Accept: 'application/jrd+json' } });
+    const res = await fetch(url, {
+      headers: { Accept: 'application/jrd+json' },
+      signal: controller.signal,
+    });
     if (!res.ok) {
       return { ok: false, status: res.status, error: `HTTP ${res.status}` };
     }
@@ -92,9 +110,26 @@ async function verifyWebfinger(id: AgentIdentity): Promise<VerifyResult> {
     const aliases = Array.isArray(body.aliases)
       ? body.aliases.filter((x): x is string => typeof x === 'string')
       : undefined;
+    if (!subject) {
+      return { ok: false, status: res.status, error: 'response missing subject', aliases };
+    }
+    // RFC 7033 §4.4 requires `subject` to identify the resource the response
+    // describes. WebFinger's acct case-folding is host-only, so compare the
+    // local part case-sensitively and the host case-insensitively.
+    if (subject.toLowerCase() !== expectedSubject.toLowerCase()) {
+      return {
+        ok: false,
+        status: res.status,
+        error: `subject mismatch: expected "${expectedSubject}", got "${subject}"`,
+        subject,
+        aliases,
+      };
+    }
     return { ok: true, status: res.status, subject, aliases };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -125,6 +160,19 @@ function printText(r: WhoamiResult): void {
   }
 }
 
+function buildResult(id: AgentIdentity): WhoamiResult {
+  return {
+    agentId: id.agentId,
+    host: id.host,
+    httpOrigin: id.httpOrigin,
+    mention: formatMention(id),
+    acct: formatAcct(id),
+    a2aEndpoint: a2aEndpoint(id),
+    a2aCardUrl: a2aCardUrl(id),
+    webfingerUrl: webfingerUrl(id),
+  };
+}
+
 export async function runWhoami(argv: string[]): Promise<number> {
   const parsed = parseArgs(argv);
   if ('error' in parsed) {
@@ -146,7 +194,8 @@ export async function runWhoami(argv: string[]): Promise<number> {
   }
 
   const host = hostFromServerUrl(server);
-  if (!host) {
+  const httpOrigin = httpOriginFromServerUrl(server);
+  if (!host || !httpOrigin) {
     process.stderr.write(`could not derive host from --server: ${server}\n`);
     return 1;
   }
@@ -156,17 +205,10 @@ export async function runWhoami(argv: string[]): Promise<number> {
         'WebFinger lookup will not resolve.\n',
     );
     // Continue printing so operators see what they have configured — but flag
-    // it via a non-zero exit so scripts can branch on validity.
-    const id: AgentIdentity = { agentId, host };
-    const result: WhoamiResult = {
-      agentId,
-      host,
-      mention: formatMention(id),
-      acct: formatAcct(id),
-      a2aEndpoint: a2aEndpoint(id),
-      a2aCardUrl: a2aCardUrl(id),
-      webfingerUrl: webfingerUrl(id),
-    };
+    // it via a non-zero exit so scripts can branch on validity. URL helpers
+    // %-encode `agentId` defensively, so an out-of-charset id still yields
+    // a parseable (if non-resolving) URL.
+    const result = buildResult({ agentId, host, httpOrigin });
     if (parsed.json) {
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     } else {
@@ -181,15 +223,7 @@ export async function runWhoami(argv: string[]): Promise<number> {
     process.stderr.write('could not derive agent identity\n');
     return 1;
   }
-  const result: WhoamiResult = {
-    agentId: id.agentId,
-    host: id.host,
-    mention: formatMention(id),
-    acct: formatAcct(id),
-    a2aEndpoint: a2aEndpoint(id),
-    a2aCardUrl: a2aCardUrl(id),
-    webfingerUrl: webfingerUrl(id),
-  };
+  const result = buildResult(id);
   if (parsed.verify) {
     result.verify = await verifyWebfinger(id);
   }

@@ -387,7 +387,7 @@ you want self-reference recognition on the OpenClaw backend too).
 ```
 
 `a2a` is the JSON-RPC endpoint another caller would POST to (e.g.
-`a2a-wallet a2a stream <a2a> "...")`. `a2a card` is the agent-card URL —
+`a2a-wallet a2a stream <a2a> "..."`). `a2a card` is the agent-card URL —
 useful for confirming the card the bridge advertises for this agent.
 
 `whoami --verify` additionally fetches the WebFinger URL and reports
