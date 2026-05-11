@@ -113,6 +113,23 @@ function writeClientEnvFile(path: string, success: ClientRegisterSuccess, bridge
   ].join('\n'), 0o600);
 }
 
+function writeClientSetupOutput(args: SetupArgs, success: ClientRegisterSuccess, bridgeUrl: string): void {
+  if (args.envFile) {
+    writeClientEnvFile(args.envFile, success, bridgeUrl);
+    process.stderr.write(`Wrote env block to ${args.envFile} (mode 600).\n`);
+  } else if (args.json) {
+    process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
+  } else {
+    const wsUrl = bridgeUrl.replace(/^http(s?):\/\//, (_m, s) => (s === 's' ? 'wss://' : 'ws://'));
+    process.stdout.write([
+      `SERVER_URL=${wsUrl}`,
+      `SERVER_TOKEN=${success.client_token}`,
+      `AGENT_ID=${success.allowed_agent_ids[0] ?? ''}`,
+      '',
+    ].join('\n'));
+  }
+}
+
 async function registerClient(
   session: { bridge: string; token: string },
   args: SetupArgs,
@@ -228,8 +245,18 @@ export async function runSetup(args: string[]): Promise<number> {
   }
 
   const stored = resolveOwnerSession();
-  const bridge = parsed.bridge ?? stored?.bridge;
-  const token = parsed.token ?? stored?.token;
+  if ((parsed.bridge && !parsed.token) || (!parsed.bridge && parsed.token)) {
+    process.stderr.write(
+      'Pass --bridge and --token together. Owner-session credentials are tied to their bridge URL.\n',
+    );
+    return 1;
+  }
+
+  const session = parsed.bridge && parsed.token
+    ? { bridge: parsed.bridge, token: parsed.token }
+    : stored;
+  const bridge = session?.bridge;
+  const token = session?.token;
   if (!bridge || !token) {
     process.stderr.write(
       'No owner-session bearer found. Run `vicoop-client login --bridge <URL>` first, ' +
@@ -255,6 +282,8 @@ export async function runSetup(args: string[]): Promise<number> {
       '  Save the setup output or env file now.\n\n',
   );
 
+  writeClientSetupOutput(parsed, success, bridge);
+
   if (parsed.callers.length > 0) {
     try {
       await configureCallers({ bridge, token }, success.allowed_agent_ids, parsed.callers);
@@ -268,21 +297,6 @@ export async function runSetup(args: string[]): Promise<number> {
       'WARNING: no callers configured. The agent is public until you run ' +
         '`vicoop-client add-caller <agent_id> <principal>`.\n\n',
     );
-  }
-
-  if (parsed.envFile) {
-    writeClientEnvFile(parsed.envFile, success, bridge);
-    process.stderr.write(`Wrote env block to ${parsed.envFile} (mode 600).\n`);
-  } else if (parsed.json) {
-    process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
-  } else {
-    const wsUrl = bridge.replace(/^http(s?):\/\//, (_m, s) => (s === 's' ? 'wss://' : 'ws://'));
-    process.stdout.write([
-      `SERVER_URL=${wsUrl}`,
-      `SERVER_TOKEN=${success.client_token}`,
-      `AGENT_ID=${success.allowed_agent_ids[0] ?? ''}`,
-      '',
-    ].join('\n'));
   }
 
   return 0;
