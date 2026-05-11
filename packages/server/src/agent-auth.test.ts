@@ -5,7 +5,7 @@ import { SiweMessage } from 'siwe';
 import { Wallet } from 'ethers';
 import type { WebSocket } from 'ws';
 import type { AgentCard } from '@vicoop-bridge/protocol';
-import { agentAuthMiddleware, sanitizeErrorDescription } from './agent-auth.js';
+import { agentAuthMiddleware, newRejectionId, sanitizeErrorDescription } from './agent-auth.js';
 import { _resetSiweBearerCacheForTests } from './auth/siwe-bearer.js';
 import { Registry, type ClientConnection } from './registry.js';
 import type { Sql } from './db.js';
@@ -213,4 +213,89 @@ test('sanitizeErrorDescription caps output at 200 chars regardless of input leng
   const out = sanitizeErrorDescription(long);
   assert.equal(out.length, 200);
   assert.equal(out, 'a'.repeat(200));
+});
+
+// Rejection-id observability — issue #128 (B). Each reject branch stamps a
+// short opaque id into both the structured log (asserted indirectly here via
+// the body) and the JSON-RPC error body's `data.rejectionId`, so a caller
+// transcript line can be grepped 1:1 against the bridge log.
+
+const REJECTION_ID_RE = /^rej_[0-9a-f]{8}$/;
+
+test('newRejectionId returns a short opaque rej_-prefixed id', () => {
+  const id = newRejectionId();
+  assert.match(id, REJECTION_ID_RE);
+  // Two consecutive calls must not collide — 32 bits is enough that a flake
+  // is vanishingly unlikely, and this catches obvious mistakes (constant id,
+  // empty suffix) immediately.
+  assert.notEqual(id, newRejectionId());
+});
+
+test('agent_not_connected (404) body carries rejectionId in error.data', async () => {
+  const { app } = buildApp();
+
+  const res = await app.request('/agents/missing', { method: 'POST' });
+  assert.equal(res.status, 404);
+  const body = (await res.json()) as {
+    error: { code: number; data?: { rejectionId?: string } };
+  };
+  assert.equal(body.error.code, -32000);
+  assert.match(body.error.data?.rejectionId ?? '', REJECTION_ID_RE);
+});
+
+test('missing_bearer (401) body carries rejectionId in error.data', async () => {
+  const { app, registry } = buildApp();
+  registerAgent(registry, 'restricted', ['eth:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']);
+
+  const res = await app.request('/agents/restricted', { method: 'POST' });
+  assert.equal(res.status, 401);
+  const body = (await res.json()) as { error: { data?: { rejectionId?: string } } };
+  assert.match(body.error.data?.rejectionId ?? '', REJECTION_ID_RE);
+});
+
+test('bad_token_prefix (401) body carries rejectionId in error.data', async () => {
+  const { app, registry } = buildApp();
+  registerAgent(registry, 'restricted', ['eth:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']);
+
+  const res = await app.request('/agents/restricted', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer not-a-known-prefix-xyz' },
+  });
+  assert.equal(res.status, 401);
+  const body = (await res.json()) as { error: { data?: { rejectionId?: string } } };
+  assert.match(body.error.data?.rejectionId ?? '', REJECTION_ID_RE);
+});
+
+test('caller_not_authorized (403) body carries rejectionId in error.data', async () => {
+  _resetSiweBearerCacheForTests();
+  const { app, registry } = buildApp({ siweDomain: 'bridge.example' });
+  registerAgent(registry, 'restricted', [
+    'eth:0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+  ]);
+  const bearer = await mintBearer({
+    domain: 'bridge.example',
+    uri: 'https://bridge.example',
+  });
+
+  const res = await app.request('/agents/restricted', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bearer}` },
+  });
+  assert.equal(res.status, 403);
+  const body = (await res.json()) as { error: { data?: { rejectionId?: string } } };
+  assert.match(body.error.data?.rejectionId ?? '', REJECTION_ID_RE);
+});
+
+test('each rejection gets its own id (no shared / cached id across requests)', async () => {
+  // Two independent rejections in the same process must produce different
+  // ids — guards against accidentally hoisting the id to module scope or
+  // reusing a per-middleware-instance constant.
+  const { app, registry } = buildApp();
+  registerAgent(registry, 'restricted', ['eth:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']);
+
+  const res1 = await app.request('/agents/restricted', { method: 'POST' });
+  const res2 = await app.request('/agents/restricted', { method: 'POST' });
+  const body1 = (await res1.json()) as { error: { data: { rejectionId: string } } };
+  const body2 = (await res2.json()) as { error: { data: { rejectionId: string } } };
+  assert.notEqual(body1.error.data.rejectionId, body2.error.data.rejectionId);
 });

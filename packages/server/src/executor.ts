@@ -37,6 +37,28 @@ const NOOP_RUNNER = new InMemoryRunner({
 });
 
 /**
+ * Drop server-internal `_`-prefixed metadata keys (e.g. `_principalId`)
+ * before forwarding a message to the connected client. The convention is
+ * shared with the admin route — `_`-prefix means "bridge-internal context,
+ * not for downstream". Returns undefined when nothing meaningful survives so
+ * the WS frame omits the metadata field entirely (preserving the
+ * pre-existing wire shape for messages that had no metadata).
+ *
+ * Exported for unit tests.
+ */
+export function stripInternalMetadata(
+  metadata: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (metadata === undefined) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (key.startsWith('_')) continue;
+    out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
  * AgentExecutor that forwards A2A requests to a WebSocket-connected
  * client and pipes the client's task.* frames back as A2A streaming
  * events.
@@ -88,7 +110,23 @@ export class WSForwardingExecutor extends AgentExecutor {
       finish: () => queue.end(),
     };
 
-    this.registry.bindTask({ agentId: this.agentId, taskId, contextId, sink });
+    // The /agents/:id route stashes server-internal context on
+    // `message.metadata` under `_`-prefixed keys (matching the admin route's
+    // `_principalId` / `_bearerToken` convention). `_principalId` flows into
+    // the binding so accept-path logs in ws.ts can correlate caller →
+    // completed task without exposing it to the client agent over the wire.
+    const rawMetadata = (message as { metadata?: Record<string, unknown> }).metadata;
+    const principalId =
+      typeof rawMetadata?._principalId === 'string' ? rawMetadata._principalId : undefined;
+    const forwardMetadata = stripInternalMetadata(rawMetadata);
+
+    this.registry.bindTask({
+      agentId: this.agentId,
+      taskId,
+      contextId,
+      sink,
+      ...(principalId !== undefined ? { principalId } : {}),
+    });
 
     const sent = this.registry.sendToAgent(this.agentId, {
       type: 'task.assign',
@@ -101,14 +139,19 @@ export class WSForwardingExecutor extends AgentExecutor {
         // the parts through as-is.
         parts: message.parts as never,
         messageId: message.messageId,
-        ...(message.metadata !== undefined ? { metadata: message.metadata } : {}),
+        ...(forwardMetadata !== undefined ? { metadata: forwardMetadata } : {}),
         ...(message.extensions !== undefined ? { extensions: message.extensions } : {}),
       },
       ...(message.extensions !== undefined ? { requestedExtensions: message.extensions } : {}),
     });
 
     if (!sent) {
-      logEvent('task_unreachable', { agentId: this.agentId, taskId, contextId });
+      logEvent('task_unreachable', {
+        agentId: this.agentId,
+        taskId,
+        contextId,
+        ...(principalId !== undefined ? { principalId } : {}),
+      });
       const failEvent: TaskStatusUpdateEvent = {
         taskId,
         contextId,

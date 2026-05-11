@@ -20,7 +20,7 @@ import {
   listCallers,
   removeCaller,
 } from './admin-api.js';
-import { agentAuthMiddleware, getAgentConn } from './agent-auth.js';
+import { agentAuthMiddleware, getAgentConn, getCaller } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
 import { mountDeviceUi } from './auth/device-ui.js';
@@ -475,9 +475,15 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   });
   app.post('/agents/:id', authMw, async (c) => {
     const conn = getAgentConn(c);
+    // caller is undefined for public agents (allowedCallers.length === 0) —
+    // the middleware short-circuits before parsing the bearer in that case.
+    // For restricted agents it's always populated; otherwise the middleware
+    // would have returned 401/403 before reaching this handler.
+    const caller = getCaller(c);
     logEvent('agent_request', {
       agentId: conn.agentId,
       hasAuth: !!c.req.header('Authorization'),
+      ...(caller !== undefined ? { principalId: caller.principalId } : {}),
     });
 
     const rawBody = await c.req.text();
@@ -487,11 +493,23 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_LEGACY_HEADER)),
     ];
     const message = parsed.params?.message;
-    if (requestedExtensions.length > 0 && isRecord(message)) {
-      const existing = Array.isArray(message.extensions)
-        ? message.extensions.filter((v: unknown): v is string => typeof v === 'string')
-        : [];
-      message.extensions = [...new Set([...existing, ...requestedExtensions])];
+    if (isRecord(message)) {
+      if (requestedExtensions.length > 0) {
+        const existing = Array.isArray(message.extensions)
+          ? message.extensions.filter((v: unknown): v is string => typeof v === 'string')
+          : [];
+        message.extensions = [...new Set([...existing, ...requestedExtensions])];
+      }
+      // Stash caller identity under the `_principalId` convention so the
+      // WSForwardingExecutor can thread it into the task binding for
+      // accept-path log correlation (issue #128). Stripped before the WS
+      // frame leaves the bridge — the connected client never sees `_*` keys.
+      if (caller !== undefined) {
+        message.metadata = {
+          ...(isRecord(message.metadata) ? message.metadata : {}),
+          _principalId: caller.principalId,
+        };
+      }
     }
     const handler = getHandlerForConn(conn);
     const result = await handler.handle(parsed);

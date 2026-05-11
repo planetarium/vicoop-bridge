@@ -30,6 +30,11 @@ export interface TaskBinding {
   taskId: string;
   contextId: string;
   sink: TaskSink;
+  // principalId of the caller that originated this task (post-auth). Optional
+  // because the admin-route path (POST '/') binds tasks too and keeps caller
+  // identity in its own metadata; only the /agents/:id route currently
+  // threads it through the binding for accept-path log correlation.
+  principalId?: string;
 }
 
 export type CallerChangeListener = (agentId: string, callers: string[]) => void;
