@@ -25,6 +25,23 @@ interface ParsedArgs {
   help: boolean;
 }
 
+// Output sinks are injectable so tests don't have to mutate global
+// process.stdout/stderr — overriding `process.stdout.write` collides with
+// node:test's TAP emitter and silently drops most test events.
+export interface WhoamiIO {
+  stdout: (s: string) => void;
+  stderr: (s: string) => void;
+}
+
+const defaultIO: WhoamiIO = {
+  stdout: (s) => {
+    process.stdout.write(s);
+  },
+  stderr: (s) => {
+    process.stderr.write(s);
+  },
+};
+
 // Default timeout for `--verify`. Long enough to ride out a slow handshake
 // against a sleeping fly machine but short enough to give a clear failure
 // instead of hanging an operator's terminal indefinitely.
@@ -114,8 +131,11 @@ async function verifyWebfinger(id: AgentIdentity): Promise<VerifyResult> {
       return { ok: false, status: res.status, error: 'response missing subject', aliases };
     }
     // RFC 7033 §4.4 requires `subject` to identify the resource the response
-    // describes. WebFinger's acct case-folding is host-only, so compare the
-    // local part case-sensitively and the host case-insensitively.
+    // describes. The bridge's WebFinger lookup is case-insensitive on
+    // scheme + local + domain (see `packages/server/src/well-known.test.ts`
+    // "matches case-insensitively on scheme + domain + local"), so we
+    // compare case-insensitively here to align — a subject that round-trips
+    // through the server may come back with different casing than we sent.
     if (subject.toLowerCase() !== expectedSubject.toLowerCase()) {
       return {
         ok: false,
@@ -133,27 +153,25 @@ async function verifyWebfinger(id: AgentIdentity): Promise<VerifyResult> {
   }
 }
 
-function printText(r: WhoamiResult): void {
+function printText(r: WhoamiResult, io: WhoamiIO): void {
   const pad = (k: string) => k.padEnd(12);
-  process.stdout.write(`${pad('agentId:')}${r.agentId}\n`);
-  process.stdout.write(`${pad('host:')}${r.host}\n`);
-  process.stdout.write(`${pad('mention:')}${r.mention}\n`);
-  process.stdout.write(`${pad('acct:')}${r.acct}\n`);
-  process.stdout.write(`${pad('a2a:')}${r.a2aEndpoint}\n`);
-  process.stdout.write(`${pad('a2a card:')}${r.a2aCardUrl}\n`);
-  process.stdout.write(`${pad('webfinger:')}${r.webfingerUrl}\n`);
+  io.stdout(`${pad('agentId:')}${r.agentId}\n`);
+  io.stdout(`${pad('host:')}${r.host}\n`);
+  io.stdout(`${pad('mention:')}${r.mention}\n`);
+  io.stdout(`${pad('acct:')}${r.acct}\n`);
+  io.stdout(`${pad('a2a:')}${r.a2aEndpoint}\n`);
+  io.stdout(`${pad('a2a card:')}${r.a2aCardUrl}\n`);
+  io.stdout(`${pad('webfinger:')}${r.webfingerUrl}\n`);
   if (r.verify) {
-    process.stdout.write('\n');
+    io.stdout('\n');
     if (r.verify.ok) {
-      process.stdout.write(`webfinger ok (subject=${r.verify.subject ?? '?'})\n`);
+      io.stdout(`webfinger ok (subject=${r.verify.subject ?? '?'})\n`);
       for (const a of r.verify.aliases ?? []) {
-        process.stdout.write(`  alias: ${a}\n`);
+        io.stdout(`  alias: ${a}\n`);
       }
     } else {
-      process.stdout.write(
-        `webfinger FAILED: ${r.verify.error ?? 'unknown error'}\n`,
-      );
-      process.stdout.write(
+      io.stdout(`webfinger FAILED: ${r.verify.error ?? 'unknown error'}\n`);
+      io.stdout(
         '  (the bridge may not have this agentId connected, or its PUBLIC_URL host differs from --server host)\n',
       );
     }
@@ -173,21 +191,21 @@ function buildResult(id: AgentIdentity): WhoamiResult {
   };
 }
 
-export async function runWhoami(argv: string[]): Promise<number> {
+export async function runWhoami(argv: string[], io: WhoamiIO = defaultIO): Promise<number> {
   const parsed = parseArgs(argv);
   if ('error' in parsed) {
-    process.stderr.write(`${parsed.error}\n${USAGE}\n`);
+    io.stderr(`${parsed.error}\n${USAGE}\n`);
     return 1;
   }
   if (parsed.help) {
-    process.stdout.write(`${USAGE}\n`);
+    io.stdout(`${USAGE}\n`);
     return 0;
   }
 
   const agentId = parsed.agentId ?? process.env.AGENT_ID;
   const server = parsed.server ?? process.env.SERVER_URL;
   if (!agentId || !server) {
-    process.stderr.write(
+    io.stderr(
       `missing required: ${[!agentId && 'agentId', !server && 'server'].filter(Boolean).join(', ')}\n${USAGE}\n`,
     );
     return 1;
@@ -196,11 +214,11 @@ export async function runWhoami(argv: string[]): Promise<number> {
   const host = hostFromServerUrl(server);
   const httpOrigin = httpOriginFromServerUrl(server);
   if (!host || !httpOrigin) {
-    process.stderr.write(`could not derive host from --server: ${server}\n`);
+    io.stderr(`could not derive host from --server: ${server}\n`);
     return 1;
   }
   if (!isValidMentionableLocal(agentId)) {
-    process.stderr.write(
+    io.stderr(
       `agentId "${agentId}" is not a valid Mentionable local-part (must match [A-Za-z0-9._-]{1,64} and not be . or ..). ` +
         'WebFinger lookup will not resolve.\n',
     );
@@ -210,9 +228,9 @@ export async function runWhoami(argv: string[]): Promise<number> {
     // a parseable (if non-resolving) URL.
     const result = buildResult({ agentId, host, httpOrigin });
     if (parsed.json) {
-      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      io.stdout(`${JSON.stringify(result, null, 2)}\n`);
     } else {
-      printText(result);
+      printText(result, io);
     }
     return 2;
   }
@@ -220,7 +238,7 @@ export async function runWhoami(argv: string[]): Promise<number> {
   const id = deriveIdentity(agentId, server);
   if (!id) {
     // Should not be reachable given the explicit checks above; defensive.
-    process.stderr.write('could not derive agent identity\n');
+    io.stderr('could not derive agent identity\n');
     return 1;
   }
   const result = buildResult(id);
@@ -228,9 +246,9 @@ export async function runWhoami(argv: string[]): Promise<number> {
     result.verify = await verifyWebfinger(id);
   }
   if (parsed.json) {
-    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    io.stdout(`${JSON.stringify(result, null, 2)}\n`);
   } else {
-    printText(result);
+    printText(result, io);
   }
   return result.verify && !result.verify.ok ? 3 : 0;
 }
