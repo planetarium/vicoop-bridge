@@ -44,12 +44,25 @@ const API_TIMEOUT_MS = 15_000;
 // this window and can Ctrl-C sooner.
 const DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
 
-// Accepted release-tag shape. Restrictive on purpose: the tag is interpolated
-// into local filenames (archive name, temp path joins) and an external URL,
-// so we want to reject anything that could path-traverse or smuggle shell
-// metacharacters before it's used. Permissive enough for semver-ish tags
-// including pre-release/build suffixes (`client-v1.0.0-rc.1`, `...+sha.abc`).
-const TAG_RE = /^client-v[A-Za-z0-9][A-Za-z0-9.+\-]*$/;
+// Fixed prefix used by changesets/action for monorepo package releases. The
+// version portion (after the prefix) is what gets interpolated into local
+// filenames; the prefix itself only appears in the GitHub download URL and is
+// url-encoded there (the `/` would otherwise split the URL path).
+const TAG_PREFIX = '@vicoop-bridge/client@';
+
+// Accepted release-tag shape. Restrictive on purpose: the version portion is
+// interpolated into local filenames (archive name, temp path joins), so we
+// reject anything that could path-traverse or smuggle shell metacharacters
+// before it's used. The literal `/` in the prefix is the only `/` allowed;
+// the version character class still excludes it. Permissive enough for
+// semver-ish tags including pre-release/build suffixes
+// (`@vicoop-bridge/client@1.0.0-rc.1`, `...+sha.abc`).
+//
+// Derived from TAG_PREFIX so the prefix lives in one place. `@` and `/`
+// aren't regex metacharacters in JavaScript, so interpolating the prefix
+// verbatim is safe; if the prefix ever picks up a real metacharacter (`.`
+// `*` `?` etc.) this needs explicit escaping.
+const TAG_RE = new RegExp(`^${TAG_PREFIX}[A-Za-z0-9][A-Za-z0-9.+\\-]*$`);
 
 // Top-level entries a legitimate release bundle must contain. Missing any one
 // of these is taken as "not an installed bundle" and aborts upgrade before
@@ -76,7 +89,7 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
   const targetTag = opts.version
     ? normalizeTag(opts.version)
     : await resolveLatestTag();
-  const targetVersion = targetTag.replace(/^client-v/, '');
+  const targetVersion = versionFromTag(targetTag);
   log(`target:  ${targetVersion} (${targetTag})`);
 
   if (opts.check) {
@@ -130,7 +143,9 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
     try {
       const archiveName = `vicoop-bridge-client-${targetVersion}.tgz`;
       const checksumName = `${archiveName}.sha256`;
-      const baseUrl = `https://github.com/${REPO}/releases/download/${targetTag}`;
+      // The tag contains `/` and `@`; both must be percent-encoded as a single
+      // path segment so the URL points at one release, not into a subpath.
+      const baseUrl = `https://github.com/${REPO}/releases/download/${encodeURIComponent(targetTag)}`;
 
       log(`downloading ${archiveName}`);
       await download(`${baseUrl}/${archiveName}`, join(dlDir, archiveName));
@@ -285,21 +300,43 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
 }
 
 export function normalizeTag(v: string): string {
-  const candidate = v.startsWith('client-v') ? v : `client-v${v.replace(/^v/, '')}`;
+  // A leading `@` signals the operator meant to pass a full scoped tag. If
+  // the prefix doesn't match (e.g. `@evil/client@0.3.0`), surface that
+  // directly — otherwise the prefix is prepended unconditionally and
+  // assertSafeTag's "got" value reads like the double-prefixed
+  // `@vicoop-bridge/client@@evil/client@0.3.0`, which is hard to parse.
+  if (v.startsWith('@') && !v.startsWith(TAG_PREFIX)) {
+    throw new Error(`invalid version '${v}': expected tag to start with ${TAG_PREFIX}`);
+  }
+  // Peel the prefix if present so the leading-`v` strip applies whether the
+  // operator typed the bare version, the v-prefixed bare version, or the
+  // full tag (`@vicoop-bridge/client@v0.3.0` should resolve the same as
+  // `@vicoop-bridge/client@0.3.0`). Without this peel, the full-tag form
+  // would slip a `v` into the archive filename and miss the real asset.
+  const versionPart = (v.startsWith(TAG_PREFIX) ? v.slice(TAG_PREFIX.length) : v).replace(/^v/, '');
+  const candidate = `${TAG_PREFIX}${versionPart}`;
   assertSafeTag(candidate, v);
   return candidate;
 }
 
+function versionFromTag(tag: string): string {
+  // assertSafeTag is the gate that proves the prefix is present; callers
+  // should only pass tags that have already passed that check.
+  return tag.slice(TAG_PREFIX.length);
+}
+
 function assertSafeTag(tag: string, raw: string = tag): void {
-  // The tag is interpolated into local paths (archive name / temp joins) and
-  // an outbound URL. Reject anything that could path-traverse or inject shell
-  // metacharacters before it reaches `join(dlDir, ...)`. The regex is
-  // intentionally looser than strict semver — we want to accept future
-  // pre-release and build-metadata variants that GitHub might tag — so the
-  // error describes the literal character set rather than implying semver.
+  // The bare version portion of the tag is interpolated into local paths
+  // (archive name / temp joins); reject anything that could path-traverse or
+  // inject shell metacharacters before it reaches `join(dlDir, ...)`. The
+  // version regex is intentionally looser than strict semver — we want to
+  // accept future pre-release and build-metadata variants — so the error
+  // describes the literal character set rather than implying semver. The
+  // single `/` in the prefix is fine because the download URL goes through
+  // encodeURIComponent before being used.
   if (!TAG_RE.test(tag) || tag.includes('..')) {
     throw new Error(
-      `invalid version '${raw}': expected a client-v* tag with only [A-Za-z0-9.+-] (no '..'), got '${tag}'`,
+      `invalid version '${raw}': expected ${TAG_PREFIX}<version> with only [A-Za-z0-9.+-] in the version (no '..'), got '${tag}'`,
     );
   }
 }
@@ -312,13 +349,24 @@ async function resolveLatestTag(): Promise<string> {
     API_TIMEOUT_MS,
   );
   if (!res.ok) throw new Error(`GitHub API request failed: ${res.status} ${res.statusText} (${url})`);
-  const releases = (await res.json()) as Array<{ tag_name?: unknown; draft?: unknown; prerelease?: unknown }>;
+  const body = (await res.json()) as unknown;
+  // GitHub returns an object (`{ message, documentation_url, ... }`) for
+  // rate-limit / abuse / auth errors with a 2xx-shaped body on some legacy
+  // paths, so don't trust the HTTP status alone — confirm we got an array
+  // before iterating, otherwise `for...of` would throw "X is not
+  // iterable" which is harder to act on than the upstream error message.
+  if (!Array.isArray(body)) {
+    const msg = (body as { message?: unknown })?.message;
+    const detail = typeof msg === 'string' ? msg : JSON.stringify(body).slice(0, 200);
+    throw new Error(`GitHub API returned a non-array payload at ${url}: ${detail}`);
+  }
+  const releases = body as Array<{ tag_name?: unknown; draft?: unknown; prerelease?: unknown }>;
   for (const r of releases) {
-    if (typeof r.tag_name !== 'string' || !r.tag_name.startsWith('client-v')) continue;
+    if (typeof r.tag_name !== 'string' || !r.tag_name.startsWith(TAG_PREFIX)) continue;
     // Skip drafts (no uploaded assets — the .tgz download would 404) and
     // prereleases (assets exist but operators on the default channel don't
-    // want them). `--version client-vX.Y.Z-rc.1` still lets an operator
-    // pin an explicit prerelease when they want to test one.
+    // want them). `--version <tag>` with an explicit prerelease tag still
+    // lets an operator pin one when they want to test it.
     if (r.draft === true || r.prerelease === true) continue;
     // Defensively validate the API response — a future rename or a
     // compromised upstream shouldn't get to interpolate arbitrary strings
@@ -326,7 +374,7 @@ async function resolveLatestTag(): Promise<string> {
     assertSafeTag(r.tag_name);
     return r.tag_name;
   }
-  throw new Error(`no published (non-draft, non-prerelease) client-v* release found in ${REPO}`);
+  throw new Error(`no published (non-draft, non-prerelease) ${TAG_PREFIX}* release found in ${REPO}`);
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {

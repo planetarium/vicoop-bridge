@@ -6,24 +6,44 @@ import { join } from 'node:path';
 import { assertLooksLikeInstall, normalizeTag, parseChecksum, preserveOperatorFiles, sha256File, stripSuidBits } from './upgrade.js';
 
 test('normalizeTag accepts full tag, bare version, and v-prefixed version', () => {
-  assert.equal(normalizeTag('client-v0.3.0'), 'client-v0.3.0');
-  assert.equal(normalizeTag('0.3.0'), 'client-v0.3.0');
-  assert.equal(normalizeTag('v0.3.0'), 'client-v0.3.0');
-  assert.equal(normalizeTag('1.0.0-alpha.1'), 'client-v1.0.0-alpha.1');
-  assert.equal(normalizeTag('1.0.0+build.sha'), 'client-v1.0.0+build.sha');
+  assert.equal(normalizeTag('@vicoop-bridge/client@0.3.0'), '@vicoop-bridge/client@0.3.0');
+  assert.equal(normalizeTag('0.3.0'), '@vicoop-bridge/client@0.3.0');
+  assert.equal(normalizeTag('v0.3.0'), '@vicoop-bridge/client@0.3.0');
+  // Full tag with a stray `v` after the prefix should normalize the same as
+  // the bare-v form — otherwise the archive filename would carry the `v`
+  // and miss the real release asset.
+  assert.equal(normalizeTag('@vicoop-bridge/client@v0.3.0'), '@vicoop-bridge/client@0.3.0');
+  assert.equal(normalizeTag('1.0.0-alpha.1'), '@vicoop-bridge/client@1.0.0-alpha.1');
+  assert.equal(normalizeTag('1.0.0+build.sha'), '@vicoop-bridge/client@1.0.0+build.sha');
+});
+
+test('normalizeTag wrong-scope error names the expected prefix, not a doubled string', () => {
+  // The error should call out the bad prefix on the raw input, not show a
+  // confusing post-normalization string like
+  // "@vicoop-bridge/client@@evil/client@0.3.0".
+  assert.throws(
+    () => normalizeTag('@evil/client@0.3.0'),
+    /expected tag to start with @vicoop-bridge\/client@/,
+  );
 });
 
 test('normalizeTag rejects path-traversal and shell-metacharacter payloads', () => {
   for (const bad of [
     '../etc/passwd',
-    'client-v../0.3.0',
-    'client-v0.3.0/../../etc',
-    'client-v..',
+    '@vicoop-bridge/client@../0.3.0',
+    '@vicoop-bridge/client@0.3.0/../../etc',
+    '@vicoop-bridge/client@..',
     '0.3.0/../evil',
-    'client-v 0.3.0',
-    'client-v0.3.0;rm -rf /',
-    'client-v0.3.0\nfoo',
-    'client-v',
+    '@vicoop-bridge/client@ 0.3.0',
+    '@vicoop-bridge/client@0.3.0;rm -rf /',
+    '@vicoop-bridge/client@0.3.0\nfoo',
+    '@vicoop-bridge/client@',
+    // Slash anywhere inside the version segment would split the URL path.
+    '@vicoop-bridge/client@0.3.0/extra',
+    // Wrong scope shouldn't squeak through — `startsWith` check + the
+    // anchored regex must agree.
+    '@evil/client@0.3.0',
+    '@vicoop-bridge/server@0.3.0',
     '',
   ]) {
     assert.throws(() => normalizeTag(bad), /invalid version/, `expected rejection for ${JSON.stringify(bad)}`);

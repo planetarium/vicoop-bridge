@@ -12,7 +12,7 @@ not in the published client bundle yet. The released client currently
 registers `echo`, `openclaw`, and `claude`.
 
 This doc covers the **post-release install path** (the `install.sh`
-one-liner fetching a published `client-v*` bundle). Contrast with:
+one-liner fetching a published `@vicoop-bridge/client@*` bundle). Contrast with:
 
 - [`local-testing.md`](./local-testing.md) — running both bridge and client
   from source against a local Postgres, using `psql` for setup.
@@ -59,8 +59,8 @@ one-liner fetching a published `client-v*` bundle). Contrast with:
 
 ## Step 1 — Install the client bundle
 
-The one-liner downloads the latest `client-v*` release, verifies its
-`.sha256`, and extracts into `$INSTALL_DIR`:
+The one-liner downloads the latest `@vicoop-bridge/client@*` release, verifies
+its `.sha256`, and extracts into `$INSTALL_DIR`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/planetarium/vicoop-bridge/main/install.sh \
@@ -74,7 +74,7 @@ would still default to `/data/vicoop-bridge-client`.
 | Env | Default | Purpose |
 |---|---|---|
 | `INSTALL_DIR` | `/data/vicoop-bridge-client` | Target directory. Pick a writable path on a volume that survives restarts. |
-| `VERSION` | latest `client-v*` | Pin a specific tag, e.g. `client-v0.1.1`. |
+| `VERSION` | latest `@vicoop-bridge/client@*` | Pin a specific tag, e.g. `@vicoop-bridge/client@0.1.1`. |
 | `FORCE` | `0` | If `1`, overwrite a non-empty `INSTALL_DIR`. |
 | `INSTALL_SKIP_SERVICE` | `0` | If `1`, skip the optional systemd unit + env template even on systemd hosts. |
 | `INSTALL_SERVICE_SCOPE` | `auto` | Force `user`, `system`, or `none` instead of auto-detecting by `id -u`. `system` requires root; an explicit `system` without root is refused with a warning. |
@@ -417,7 +417,7 @@ if that file is missing or expired. Admin scope
 
 #### Option A: `vicoop-client` subcommands (recommended for scripts)
 
-These subcommands require **bundle `client-v0.8.0` or newer**. Older
+These subcommands require **bundle version 0.8.0 or newer**. Older
 installs only know the daemon flags; check before using and upgrade if
 needed:
 
@@ -481,15 +481,15 @@ wipes any operator-added cards / files), so it's reserved for bootstrapping.
 
 ```sh
 "$INSTALL_DIR/bin/vicoop-client" upgrade --check      # report latest vs current
-"$INSTALL_DIR/bin/vicoop-client" upgrade              # upgrade to latest client-v*
-"$INSTALL_DIR/bin/vicoop-client" upgrade --version client-v0.2.0   # pin / downgrade
+"$INSTALL_DIR/bin/vicoop-client" upgrade              # upgrade to latest @vicoop-bridge/client@*
+"$INSTALL_DIR/bin/vicoop-client" upgrade --version 0.2.0   # pin / downgrade (bare version, v0.2.0, or @vicoop-bridge/client@0.2.0 all accepted)
 "$INSTALL_DIR/bin/vicoop-client" upgrade --force      # reinstall the resolved target even if already on it
 ```
 
 The upgrade command:
 
-1. Queries GitHub releases for the latest `client-v*` tag (or the `--version`
-   you pin).
+1. Queries GitHub releases for the latest `@vicoop-bridge/client@*` tag (or
+   the `--version` you pin).
 2. Downloads `.tgz` + `.sha256` to a temp directory and verifies the checksum.
 3. Extracts into `$INSTALL_DIR.new/` (sibling of the current install).
 4. Copies operator files that don't ship with the bundle — notably any

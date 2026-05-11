@@ -20,8 +20,8 @@ the client include a changeset describing the change; merging them keeps a
 single "Version Packages" PR up to date with the resulting version + changelog
 entry. Merging that Version PR triggers
 [`.github/workflows/release.yml`](./.github/workflows/release.yml), which
-builds the portable bundle and publishes the `client-v<version>` GitHub
-release.
+builds the portable bundle and publishes the `@vicoop-bridge/client@<version>`
+GitHub release.
 
 Day-to-day flow for contributors:
 

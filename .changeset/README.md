@@ -2,7 +2,7 @@
 
 This directory holds [Changesets](https://github.com/changesets/changesets)
 intent files. They drive `@vicoop-bridge/client` versioning, the per-release
-`CHANGELOG.md`, and the `client-v*` GitHub release pipeline.
+`CHANGELOG.md`, and the `@vicoop-bridge/client@*` GitHub release pipeline.
 
 ## When to add a changeset
 
@@ -31,4 +31,4 @@ operator-facing summary. The command writes a markdown file under
    entry in `packages/client/CHANGELOG.md`.
 2. When the Version Packages PR is merged, `scripts/changesets-publish.sh`
    builds the portable client bundle and creates the
-   `client-v<version>` GitHub release.
+   `@vicoop-bridge/client@<version>` GitHub release.

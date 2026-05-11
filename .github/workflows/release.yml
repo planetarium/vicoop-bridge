@@ -38,7 +38,8 @@ jobs:
       # When pending changesets exist, this opens / refreshes the
       # "Version Packages" PR. When that PR is merged (no pending
       # changesets remain), `publish` runs scripts/changesets-publish.sh,
-      # which builds the bundle and creates the client-v* release.
+      # which builds the bundle and creates the
+      # @vicoop-bridge/client@* release.
       - name: Version PR or publish client release
         uses: changesets/action@v1
         with:

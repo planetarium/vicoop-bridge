@@ -6,14 +6,15 @@
 #
 # Environment overrides:
 #   INSTALL_DIR           Target directory (default: /data/vicoop-bridge-client)
-#   VERSION               Specific tag to install, e.g. client-v0.1.0 (default: latest client-v* release)
+#   VERSION               Specific tag to install, e.g. @vicoop-bridge/client@0.1.0
+#                         (default: latest @vicoop-bridge/client@* release)
 #   FORCE                 If "1", overwrite a non-empty INSTALL_DIR
 #   INSTALL_SKIP_SERVICE  If "1", skip systemd unit registration
 #   INSTALL_SERVICE_SCOPE Override detection: "auto" | "user" | "system" | "none" (default: auto)
 #
 # What it does:
 #   1. Verifies prerequisites (Linux warning, Node.js >= 20, curl, tar, sha256 tool).
-#   2. Resolves the latest (or pinned) client-v* GitHub release.
+#   2. Resolves the latest (or pinned) @vicoop-bridge/client@* GitHub release.
 #   3. Downloads the .tgz + .sha256 and verifies integrity.
 #   4. Extracts the bundle into INSTALL_DIR.
 #   5. On systemd hosts, drops an optional vicoop-client.service unit + env
@@ -62,25 +63,95 @@ else
 fi
 
 # ---- 2. Resolve release tag -------------------------------------------------
+TAG_PREFIX="@vicoop-bridge/client@"
+
 if [ -z "$VERSION" ]; then
-  log "resolving latest client-v* release from GitHub"
-  # Pull recent releases (default 30) and pick the first tag matching client-v*.
-  # Avoid /releases/latest because it may point at a non-client release.
+  log "resolving latest $TAG_PREFIX* release from GitHub"
+  # Pull recent releases (default 30) and pick the newest non-draft,
+  # non-prerelease release whose tag matches the changesets monorepo
+  # prefix. Avoid /releases/latest because it may point at a non-client
+  # release. Parse with node (already a hard prereq above) rather than
+  # grepping tag_name, so the draft/prerelease flags are honored the same
+  # way `vicoop-client upgrade` honors them.
+  #
+  # `set -e` doesn't catch failures on the upstream end of a POSIX-sh
+  # pipeline, so curl is run on its own first — otherwise a network /
+  # rate-limit error would let node read empty input, exit 0, and surface
+  # as a misleading "no published release found" later.
+  api_json="$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30")" \
+    || die "GitHub release API request failed"
+  # node exits non-zero on a malformed or non-array payload (rate-limit
+  # error object, abuse-detection response, etc.) so those failures don't
+  # masquerade as "no release found"; an empty stdout with exit 0 is the
+  # genuine no-match case.
   VERSION="$(
-    curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" \
-      | grep -o '"tag_name":[[:space:]]*"client-v[^"]*"' \
-      | head -n1 \
-      | sed -E 's/.*"(client-v[^"]+)".*/\1/'
-  )"
-  [ -n "$VERSION" ] || die "no client-v* release found in $REPO"
+    printf '%s' "$api_json" \
+      | TAG_PREFIX="$TAG_PREFIX" node -e '
+let data = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (c) => { data += c; });
+process.stdin.on("end", () => {
+  let releases;
+  try {
+    releases = JSON.parse(data);
+  } catch (e) {
+    process.stderr.write(`error: GitHub API response was not valid JSON: ${e.message}\n`);
+    process.exit(1);
+  }
+  if (!Array.isArray(releases)) {
+    const msg = releases && typeof releases.message === "string"
+      ? releases.message
+      : JSON.stringify(releases).slice(0, 200);
+    process.stderr.write(`error: GitHub API returned a non-array payload: ${msg}\n`);
+    process.exit(1);
+  }
+  const prefix = process.env.TAG_PREFIX;
+  if (!prefix) {
+    process.stderr.write("error: TAG_PREFIX env var missing\n");
+    process.exit(1);
+  }
+  for (const r of releases) {
+    if (!r || typeof r.tag_name !== "string") continue;
+    if (!r.tag_name.startsWith(prefix)) continue;
+    if (r.draft || r.prerelease) continue;
+    process.stdout.write(r.tag_name);
+    return;
+  }
+});
+'
+  )" || die "failed to parse GitHub release list (see error above)"
+  [ -n "$VERSION" ] || die "no published (non-draft, non-prerelease) $TAG_PREFIX* release found in $REPO"
 fi
+
+# Defense in depth: even when the operator pins VERSION via env, refuse to
+# proceed if it doesn't carry the expected prefix. Otherwise the
+# `${VERSION#$TAG_PREFIX}` expansion below leaves arbitrary characters in
+# VERSION_NUM, which then lands in the archive filename and URL.
+case "$VERSION" in
+  "$TAG_PREFIX"*) ;;
+  *) die "VERSION must start with $TAG_PREFIX (got: $VERSION)" ;;
+esac
 
 log "installing $VERSION"
 
-VERSION_NUM="${VERSION#client-v}"
+VERSION_NUM="${VERSION#$TAG_PREFIX}"
+# After stripping the prefix, the bare version still has to be safe to
+# interpolate into a local filename and a URL — the prefix check alone
+# wouldn't catch e.g. `@vicoop-bridge/client@0.3.0/../../etc`. Mirrors
+# packages/client/src/upgrade.ts's TAG_RE: first char must be alphanumeric
+# (rejects ".0.3.0", "-1", and other option-like names), remaining chars
+# limited to [A-Za-z0-9.+-], and no consecutive dots.
+case "$VERSION_NUM" in
+  ''|[!A-Za-z0-9]*|*[!A-Za-z0-9.+-]*|*..*)
+    die "version contains unsafe characters: $VERSION_NUM"
+    ;;
+esac
 ARCHIVE="vicoop-bridge-client-$VERSION_NUM.tgz"
 CHECKSUM="$ARCHIVE.sha256"
-BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
+# GitHub's release-download endpoint takes the tag as one path segment. The
+# tag contains `/` and `@`; percent-encode both so the URL doesn't split.
+ENCODED_TAG="$(printf '%s' "$VERSION" | sed -e 's#@#%40#g' -e 's#/#%2F#g')"
+BASE_URL="https://github.com/$REPO/releases/download/$ENCODED_TAG"
 
 # ---- 3. Prepare install dir -------------------------------------------------
 PARENT_DIR="$(dirname "$INSTALL_DIR")"
