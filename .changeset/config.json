@@ -11,5 +11,9 @@
     "@vicoop-bridge/server",
     "@vicoop-bridge/protocol",
     "@vicoop-bridge/admin-ui"
-  ]
+  ],
+  "privatePackages": {
+    "version": true,
+    "tag": true
+  }
 }
