@@ -80,6 +80,10 @@ if [ -z "$VERSION" ]; then
   # as a misleading "no published release found" later.
   api_json="$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30")" \
     || die "GitHub release API request failed"
+  # node exits non-zero on a malformed or non-array payload (rate-limit
+  # error object, abuse-detection response, etc.) so those failures don't
+  # masquerade as "no release found"; an empty stdout with exit 0 is the
+  # genuine no-match case.
   VERSION="$(
     printf '%s' "$api_json" \
       | TAG_PREFIX="$TAG_PREFIX" node -e '
@@ -88,10 +92,24 @@ process.stdin.setEncoding("utf8");
 process.stdin.on("data", (c) => { data += c; });
 process.stdin.on("end", () => {
   let releases;
-  try { releases = JSON.parse(data); } catch { return; }
-  if (!Array.isArray(releases)) return;
+  try {
+    releases = JSON.parse(data);
+  } catch (e) {
+    process.stderr.write(`error: GitHub API response was not valid JSON: ${e.message}\n`);
+    process.exit(1);
+  }
+  if (!Array.isArray(releases)) {
+    const msg = releases && typeof releases.message === "string"
+      ? releases.message
+      : JSON.stringify(releases).slice(0, 200);
+    process.stderr.write(`error: GitHub API returned a non-array payload: ${msg}\n`);
+    process.exit(1);
+  }
   const prefix = process.env.TAG_PREFIX;
-  if (!prefix) return;
+  if (!prefix) {
+    process.stderr.write("error: TAG_PREFIX env var missing\n");
+    process.exit(1);
+  }
   for (const r of releases) {
     if (!r || typeof r.tag_name !== "string") continue;
     if (!r.tag_name.startsWith(prefix)) continue;
@@ -101,7 +119,7 @@ process.stdin.on("end", () => {
   }
 });
 '
-  )"
+  )" || die "failed to parse GitHub release list (see error above)"
   [ -n "$VERSION" ] || die "no published (non-draft, non-prerelease) $TAG_PREFIX* release found in $REPO"
 fi
 

@@ -349,7 +349,18 @@ async function resolveLatestTag(): Promise<string> {
     API_TIMEOUT_MS,
   );
   if (!res.ok) throw new Error(`GitHub API request failed: ${res.status} ${res.statusText} (${url})`);
-  const releases = (await res.json()) as Array<{ tag_name?: unknown; draft?: unknown; prerelease?: unknown }>;
+  const body = (await res.json()) as unknown;
+  // GitHub returns an object (`{ message, documentation_url, ... }`) for
+  // rate-limit / abuse / auth errors with a 2xx-shaped body on some legacy
+  // paths, so don't trust the HTTP status alone — confirm we got an array
+  // before iterating, otherwise `for...of` would throw "X is not
+  // iterable" which is harder to act on than the upstream error message.
+  if (!Array.isArray(body)) {
+    const msg = (body as { message?: unknown })?.message;
+    const detail = typeof msg === 'string' ? msg : JSON.stringify(body).slice(0, 200);
+    throw new Error(`GitHub API returned a non-array payload at ${url}: ${detail}`);
+  }
+  const releases = body as Array<{ tag_name?: unknown; draft?: unknown; prerelease?: unknown }>;
   for (const r of releases) {
     if (typeof r.tag_name !== 'string' || !r.tag_name.startsWith(TAG_PREFIX)) continue;
     // Skip drafts (no uploaded assets — the .tgz download would 404) and
