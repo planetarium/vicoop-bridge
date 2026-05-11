@@ -2,6 +2,7 @@ import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { TRACEABILITY_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { formatAcct, formatMention, type AgentIdentity } from '../identity.js';
 import {
   startSendFileMcpServer,
   type SendFileMcpOptions,
@@ -71,6 +72,25 @@ export interface ClaudeBackendOptions {
   // Fetch uri-only inbound FileParts under the shared HTTPS/SSRF/size/MIME
   // policy. Enabled by default; set enabled:false to require inline bytes.
   fetchUriPolicy?: FetchUriPolicy;
+  // Agent's own A2A identity. When present, an `--append-system-prompt` is
+  // injected on every spawned `claude` so the model can recognise its own
+  // mention (`@<agentId>@<host>`) / acct in user messages and respond
+  // directly instead of attempting an outbound A2A call to its own address.
+  // See issue #128 for the failure mode this prevents.
+  identity?: AgentIdentity;
+}
+
+// Kept short and behaviour-focused. The risk we're guarding against is
+// concrete: a Claude-as-caller skill (a2a-wallet) interpreting the agent's
+// own mention as an external destination. Anything beyond self-reference
+// detection belongs in the operator-controlled prompt, not here.
+export function buildSelfIdentitySystemPrompt(id: AgentIdentity): string {
+  const mention = formatMention(id);
+  const acct = formatAcct(id);
+  return [
+    `You are an A2A agent reachable as the mention \`${mention}\` (${acct}).`,
+    `If a user message references this mention or acct, treat it as a self-reference and respond directly — do not invoke any outbound A2A tool or skill (e.g. a2a-wallet) to contact this address as if it were a separate agent.`,
+  ].join(' ');
 }
 
 interface SessionEntry {
@@ -484,6 +504,12 @@ export function createClaudeBackend(
     opts.sendFileMcp && opts.sendFileMcp.allowedRoots.length > 0
       ? opts.sendFileMcp
       : null;
+  // Static per-backend args (placed before extraArgs so an operator-supplied
+  // `--append-system-prompt` in extraArgs concatenates AFTER ours rather than
+  // being ignored — claude appends each occurrence in order).
+  const identityArgs: readonly string[] = opts.identity
+    ? ['--append-system-prompt', buildSelfIdentitySystemPrompt(opts.identity)]
+    : [];
 
   // Lazy: first task that needs the MCP server starts it; backends that
   // never see send_file enabled don't open a port.
@@ -613,6 +639,7 @@ export function createClaudeBackend(
               }),
             ]
           : []),
+        ...identityArgs,
         ...extraArgs,
       ];
 

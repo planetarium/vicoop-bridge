@@ -16,6 +16,8 @@ import {
   runListCallers,
   runRemoveCaller,
 } from './admin-cli.js';
+import { runWhoami } from './whoami.js';
+import { deriveIdentity } from './identity.js';
 
 interface Args {
   server: string;
@@ -28,7 +30,7 @@ interface Args {
 const DAEMON_USAGE =
   'vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude> [--card <path>]';
 const SUBCOMMAND_LIST =
-  'subcommands: login, setup, upgrade, list-agents, list-callers, add-caller, remove-caller (run any with --help)';
+  'subcommands: login, setup, upgrade, list-agents, list-callers, add-caller, remove-caller, whoami (run any with --help)';
 
 function parseClientArgs(argv: string[]): Args {
   const out: Partial<Args> = {};
@@ -63,15 +65,21 @@ function parseClientArgs(argv: string[]): Args {
   return resolved;
 }
 
-function pickBackend(name: string): Backend {
+function pickBackend(name: string, args: Args): Backend {
   switch (name) {
     case 'echo':
       return echoBackend;
     case 'openclaw':
+      // openclaw's persona / system prompt lives in the gateway-side config
+      // (`/data/openclaw.json`), not in a per-message field on `chat.send`.
+      // Self-identity is surfaced via `vicoop-client whoami` so operators can
+      // paste it into their gateway persona; the bridge has no wire-protocol
+      // hook to inject it from here.
       return createOpenclawBackend();
     case 'claude':
       return createClaudeBackend({
         cwd: process.env.CLAUDE_CWD?.trim() || undefined,
+        identity: deriveIdentity(args.agentId, args.server) ?? undefined,
       });
     default:
       throw new Error(`unknown backend: ${name} (supported: echo, openclaw, claude)`);
@@ -90,7 +98,7 @@ function runClient(argv: string[]): void {
     agentId: args.agentId,
     agentCard,
     backendKind: args.backend,
-    backend: pickBackend(args.backend),
+    backend: pickBackend(args.backend, args),
   });
 
   client.start();
@@ -182,6 +190,10 @@ async function main(): Promise<void> {
 
   if (argv[0] === 'list-agents') {
     process.exit(await runListAgents(argv.slice(1)));
+  }
+
+  if (argv[0] === 'whoami') {
+    process.exit(await runWhoami(argv.slice(1)));
   }
 
   // A bare word (not a flag) here is an unrecognised subcommand. Catch it so
