@@ -5,7 +5,7 @@ import { SiweMessage } from 'siwe';
 import { Wallet } from 'ethers';
 import type { WebSocket } from 'ws';
 import type { AgentCard } from '@vicoop-bridge/protocol';
-import { agentAuthMiddleware } from './agent-auth.js';
+import { agentAuthMiddleware, sanitizeErrorDescription } from './agent-auth.js';
 import { _resetSiweBearerCacheForTests } from './auth/siwe-bearer.js';
 import { Registry, type ClientConnection } from './registry.js';
 import type { Sql } from './db.js';
@@ -122,7 +122,7 @@ test('owner-session token on caller route responds with WWW-Authenticate error="
   assert.match(challenge, /error_description="vbc_owner_\* tokens are not accepted on \/agents\/:id"/);
 });
 
-test('invalid SIWE bearer (siweDomain on) responds with WWW-Authenticate error="invalid_token"', async () => {
+test('invalid SIWE bearer (siweDomain on) responds with WWW-Authenticate error="invalid_token" and stable description', async () => {
   const { app, registry } = buildApp({ siweDomain: 'bridge.example' });
   registerAgent(registry, 'restricted', ['eth:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']);
 
@@ -137,6 +137,10 @@ test('invalid SIWE bearer (siweDomain on) responds with WWW-Authenticate error="
   assert.ok(challenge);
   assert.match(challenge, /^Bearer realm="vicoop-bridge"/);
   assert.match(challenge, /error="invalid_token"/);
+  // Description is a stable public string, not the raw upstream err.message,
+  // so detail (e.g. "SIWE bearer token is not valid JSON") can't leak via
+  // proxy access logs.
+  assert.match(challenge, /error_description="invalid SIWE bearer"/);
 });
 
 test('public agent (no allowedCallers) passes through without WWW-Authenticate', async () => {
@@ -185,25 +189,21 @@ test('caller not in allowedCallers responds 403 with WWW-Authenticate error="ins
   assert.match(challenge, /error_description="caller not in allowed list"/);
 });
 
-test('error_description is length-capped so a long upstream message cannot blow up the header', async () => {
-  // SIWE verify failures bubble up err.message into error_description; we
-  // can't easily inject an arbitrary long message here, so just assert the
-  // header stays within a sane bound on the realistic failure case.
-  const { app, registry } = buildApp({ siweDomain: 'bridge.example' });
-  registerAgent(registry, 'restricted', ['eth:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']);
+// Direct unit tests for sanitizeErrorDescription. All call sites in the
+// middleware now feed stable hand-authored strings, but the sanitize + cap
+// remains as defense-in-depth — these tests pin that contract.
+test('sanitizeErrorDescription drops chars outside the RFC 6749 §4.1.2.1 set', () => {
+  // Strip `"` (0x22), `\` (0x5C), control chars, and anything > 0x7E.
+  assert.equal(sanitizeErrorDescription('hello'), 'hello');
+  assert.equal(sanitizeErrorDescription('with "quotes"'), 'with quotes');
+  assert.equal(sanitizeErrorDescription('with\\backslash'), 'withbackslash');
+  assert.equal(sanitizeErrorDescription('line\nbreak\ttab'), 'linebreaktab');
+  assert.equal(sanitizeErrorDescription('non-ascii: ✓ 한글'), 'non-ascii:  ');
+});
 
-  const res = await app.request('/agents/restricted', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${'a'.repeat(4096)}` },
-  });
-  assert.equal(res.status, 401);
-  const challenge = res.headers.get('WWW-Authenticate');
-  assert.ok(challenge);
-  // Header total stays well under common 8KB limits; the cap inside
-  // sanitizeErrorDescription keeps error_description bounded at 200 chars.
-  assert.ok(challenge.length < 512, `expected challenge < 512 chars, got ${challenge.length}`);
-  const match = challenge.match(/error_description="([^"]*)"/);
-  if (match) {
-    assert.ok(match[1].length <= 200, `expected description <= 200 chars, got ${match[1].length}`);
-  }
+test('sanitizeErrorDescription caps output at 200 chars regardless of input length', () => {
+  const long = 'a'.repeat(5000);
+  const out = sanitizeErrorDescription(long);
+  assert.equal(out.length, 200);
+  assert.equal(out, 'a'.repeat(200));
 });

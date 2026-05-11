@@ -28,7 +28,12 @@ const ERROR_DESCRIPTION_MAX_LEN = 200;
 // i.e. printable ASCII excluding `"` and `\`. Anything outside that range is
 // dropped so the header stays a valid quoted-string without escape handling.
 // Output is also length-capped to keep total header size bounded.
-function sanitizeErrorDescription(value: string): string {
+//
+// Exported for direct unit testing — all call sites inside this module feed
+// it stable, hand-authored strings (never raw upstream err.message) to avoid
+// leaking internal SQL/verifier details via WWW-Authenticate (often captured
+// by access logs). The sanitize + cap remains as defense-in-depth.
+export function sanitizeErrorDescription(value: string): string {
   let out = '';
   for (const ch of value) {
     if (out.length >= ERROR_DESCRIPTION_MAX_LEN) break;
@@ -135,9 +140,13 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
           reason: 'invalid_token',
           detail: truncate((err as Error).message, 256),
         });
+        // Don't surface raw err.message in WWW-Authenticate — the
+        // verifyCallerToken path can throw SQL/connection errors, and the
+        // header is commonly captured by proxy access logs. Detailed cause is
+        // already in the structured logEvent above.
         setWWWAuthenticate(c, {
           error: 'invalid_token',
-          description: (err as Error).message,
+          description: 'invalid bearer token',
         });
         return c.json({
           jsonrpc: '2.0',
@@ -178,9 +187,12 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
           reason: 'invalid_siwe_bearer',
           detail: truncate((err as Error).message, 256),
         });
+        // Stable, public description — siwe-bearer verification can surface
+        // low-level library/parse errors that we don't want to echo into a
+        // header that proxies routinely log.
         setWWWAuthenticate(c, {
           error: 'invalid_token',
-          description: (err as Error).message,
+          description: 'invalid SIWE bearer',
         });
         return c.json({
           jsonrpc: '2.0',
