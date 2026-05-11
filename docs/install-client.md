@@ -189,6 +189,10 @@ any `--caller` allowlist entries, and writes the resulting daemon env block to
 `vicoop-client.env` (mode 600). If you omit `--caller`, `setup` succeeds but
 prints a warning that the agent will be public until you restrict callers:
 
+> `setup --caller` requires a bridge server version that can pre-create
+> `agent_policies` for registered client agent ids. If you are testing against
+> your own deployment, deploy the matching server/schema before this step.
+
 ```text
 SERVER_URL=wss://vicoop-bridge-server.fly.dev
 SERVER_TOKEN=<64-hex CLIENT_TOKEN — shown ONLY here>
