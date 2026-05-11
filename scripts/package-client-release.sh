@@ -7,7 +7,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 TAG="$1"
-VERSION="${TAG#client-v}"
+VERSION="${TAG#@vicoop-bridge/client@}"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="$ROOT_DIR/dist-release"
 WORK_DIR="$OUT_DIR/work"

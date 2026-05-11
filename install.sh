@@ -6,14 +6,15 @@
 #
 # Environment overrides:
 #   INSTALL_DIR           Target directory (default: /data/vicoop-bridge-client)
-#   VERSION               Specific tag to install, e.g. client-v0.1.0 (default: latest client-v* release)
+#   VERSION               Specific tag to install, e.g. @vicoop-bridge/client@0.1.0
+#                         (default: latest @vicoop-bridge/client@* release)
 #   FORCE                 If "1", overwrite a non-empty INSTALL_DIR
 #   INSTALL_SKIP_SERVICE  If "1", skip systemd unit registration
 #   INSTALL_SERVICE_SCOPE Override detection: "auto" | "user" | "system" | "none" (default: auto)
 #
 # What it does:
 #   1. Verifies prerequisites (Linux warning, Node.js >= 20, curl, tar, sha256 tool).
-#   2. Resolves the latest (or pinned) client-v* GitHub release.
+#   2. Resolves the latest (or pinned) @vicoop-bridge/client@* GitHub release.
 #   3. Downloads the .tgz + .sha256 and verifies integrity.
 #   4. Extracts the bundle into INSTALL_DIR.
 #   5. On systemd hosts, drops an optional vicoop-client.service unit + env
@@ -62,25 +63,32 @@ else
 fi
 
 # ---- 2. Resolve release tag -------------------------------------------------
+TAG_PREFIX="@vicoop-bridge/client@"
+
 if [ -z "$VERSION" ]; then
-  log "resolving latest client-v* release from GitHub"
-  # Pull recent releases (default 30) and pick the first tag matching client-v*.
-  # Avoid /releases/latest because it may point at a non-client release.
+  log "resolving latest $TAG_PREFIX* release from GitHub"
+  # Pull recent releases (default 30) and pick the first tag matching the
+  # changesets monorepo prefix. Avoid /releases/latest because it may point
+  # at a non-client release. Use `#` as the sed delimiter so the `/` inside
+  # the tag prefix doesn't need escaping.
   VERSION="$(
     curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" \
-      | grep -o '"tag_name":[[:space:]]*"client-v[^"]*"' \
+      | grep -o '"tag_name":[[:space:]]*"@vicoop-bridge/client@[^"]*"' \
       | head -n1 \
-      | sed -E 's/.*"(client-v[^"]+)".*/\1/'
+      | sed -E 's#.*"(@vicoop-bridge/client@[^"]+)".*#\1#'
   )"
-  [ -n "$VERSION" ] || die "no client-v* release found in $REPO"
+  [ -n "$VERSION" ] || die "no $TAG_PREFIX* release found in $REPO"
 fi
 
 log "installing $VERSION"
 
-VERSION_NUM="${VERSION#client-v}"
+VERSION_NUM="${VERSION#$TAG_PREFIX}"
 ARCHIVE="vicoop-bridge-client-$VERSION_NUM.tgz"
 CHECKSUM="$ARCHIVE.sha256"
-BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
+# GitHub's release-download endpoint takes the tag as one path segment. The
+# tag contains `/` and `@`; percent-encode both so the URL doesn't split.
+ENCODED_TAG="$(printf '%s' "$VERSION" | sed -e 's#@#%40#g' -e 's#/#%2F#g')"
+BASE_URL="https://github.com/$REPO/releases/download/$ENCODED_TAG"
 
 # ---- 3. Prepare install dir -------------------------------------------------
 PARENT_DIR="$(dirname "$INSTALL_DIR")"

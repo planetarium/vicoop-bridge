@@ -4,7 +4,7 @@
 # work) and on every other main push that has no changesets to consume
 # (where there's nothing to do). The script reads the current
 # `packages/client/package.json` version and converges the corresponding
-# `client-v<version>` GitHub release into one of three states:
+# `@vicoop-bridge/client@<version>` GitHub release into one of three states:
 #
 #   - complete: release exists with both expected assets attached → exit 0
 #   - partial:  release exists but assets are missing or out of date →
@@ -21,7 +21,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
 VERSION="$(node -p "require('./packages/client/package.json').version")"
-TAG="client-v${VERSION}"
+TAG="@vicoop-bridge/client@${VERSION}"
 ARCHIVE="dist-release/vicoop-bridge-client-${VERSION}.tgz"
 CHECKSUM="${ARCHIVE}.sha256"
 ARCHIVE_NAME="$(basename "${ARCHIVE}")"
@@ -76,9 +76,9 @@ else
   # commit landing on main mid-job can't make the tag point somewhere else;
   # CI sets GITHUB_SHA, falling back to HEAD for local invocations.
   # `--generate-notes` pulls in the commit/PR summary since the previous
-  # client-v* tag; the per-version CHANGELOG.md entry written by
-  # changesets/action lives in packages/client/CHANGELOG.md for anyone who
-  # wants the structured form.
+  # @vicoop-bridge/client@* tag; the per-version CHANGELOG.md entry written
+  # by changesets/action lives in packages/client/CHANGELOG.md for anyone
+  # who wants the structured form.
   # Pass exact filenames — globbing dist-release/ would also pick up
   # artifacts left by previous local runs and upload them as extra assets.
   gh release create "${TAG}" \
@@ -90,7 +90,7 @@ else
 fi
 
 # Marker line that changesets/action greps for to set its `published` output.
-# Use the actual workspace package name so anything reading the action's
-# `publishedPackages` output sees a real identifier; the GitHub release tag
-# itself remains `client-v<version>`.
-echo "🦋 New tag: @vicoop-bridge/client@${VERSION}"
+# This now matches the actual release tag, so the action's tag-push step
+# won't chase a non-existent local tag the way it did under the legacy
+# client-v* scheme.
+echo "🦋 New tag: ${TAG}"
