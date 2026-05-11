@@ -73,6 +73,23 @@ test('hostFromServerUrl returns null for malformed input', () => {
   assert.equal(hostFromServerUrl(''), null);
 });
 
+test('hostFromServerUrl re-wraps IPv6 literals in brackets', () => {
+  // URL.hostname strips `[ ]`. The mention/acct form needs them back so
+  // `acct:foo@[::1]` follows RFC 7565 / RFC 3986 and matches the bridge's
+  // own Mentionable expectation.
+  assert.equal(hostFromServerUrl('wss://[::1]/ws'), '[::1]');
+  assert.equal(hostFromServerUrl('ws://[fe80::1]:8787/ws'), '[fe80::1]');
+});
+
+test('deriveIdentity renders the IPv6 mention correctly end-to-end', () => {
+  const id = deriveIdentity('agent', 'ws://[::1]:8787/ws');
+  assert.ok(id);
+  assert.equal(formatMention(id), '@agent@[::1]');
+  assert.equal(formatAcct(id), 'acct:agent@[::1]');
+  // The HTTP origin keeps brackets via URL.host.
+  assert.equal(id.httpOrigin, 'http://[::1]:8787');
+});
+
 test('httpOriginFromServerUrl maps ws→http and wss→https, preserving port', () => {
   assert.equal(httpOriginFromServerUrl('ws://localhost:8787/ws'), 'http://localhost:8787');
   assert.equal(httpOriginFromServerUrl('wss://bridge.example.com/ws'), 'https://bridge.example.com');

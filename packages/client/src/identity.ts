@@ -62,12 +62,29 @@ export function a2aCardUrl(id: AgentIdentity): string {
 // Best-effort host derivation from the bridge WebSocket URL. Hostname only
 // (no port) — used for the mention/acct subject. See `httpOriginFromServerUrl`
 // for the URL-building counterpart.
+//
+// IPv6 literals are returned bracketed (`[::1]`) so the `acct:` form follows
+// RFC 7565 / RFC 3986 host-with-brackets convention and matches the bridge's
+// own Mentionable surface, which expects bracketed IPv6 hosts (see
+// `packages/server/src/well-known.ts` `isIpLiteral`). The WHATWG URL spec
+// keeps the brackets on `hostname` for IPv6 — Node 24+ does — but some older
+// Node/embedder implementations stripped them, so we re-wrap defensively when
+// the hostname looks like a bare IPv6 literal.
 export function hostFromServerUrl(serverUrl: string): string | null {
+  let url: URL;
   try {
-    return new URL(serverUrl).hostname || null;
+    url = new URL(serverUrl);
   } catch {
     return null;
   }
+  const hostname = url.hostname;
+  if (!hostname) return null;
+  // Any `:` in a hostname is unambiguously an IPv6 literal (legal hostnames
+  // can't contain `:`). If it's already bracketed, leave it; otherwise wrap.
+  if (hostname.includes(':') && !hostname.startsWith('[')) {
+    return `[${hostname}]`;
+  }
+  return hostname;
 }
 
 // HTTP(S) origin counterpart to `hostFromServerUrl`. ws↔http / wss↔https

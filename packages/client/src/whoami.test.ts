@@ -216,9 +216,18 @@ test('whoami --verify exits 3 when the JRD subject does not match the requested 
   );
 });
 
-test('whoami --verify exits 3 with HTTP <status> when WebFinger returns 404', async () => {
+test('whoami --verify surfaces the server-provided error reason on non-2xx', async () => {
   await withWebfingerServer(
-    (_req, res) => res.json({ error: 'not found' }, 404),
+    (_req, res) =>
+      // Real shape returned by `mountWellKnown` when Mentionable is
+      // ineligible — operators should see this verbatim instead of just
+      // "HTTP 404".
+      res.json(
+        {
+          error: 'webfinger not available (PUBLIC_URL must be HTTPS with a multi-label hostname)',
+        },
+        404,
+      ),
     async (origin) => {
       const url = new URL(origin);
       const io = makeIO();
@@ -227,7 +236,45 @@ test('whoami --verify exits 3 with HTTP <status> when WebFinger returns 404', as
         io,
       );
       assert.equal(result, 3);
-      assert.match(io.readStdout(), /webfinger FAILED:\s*HTTP 404/);
+      const stdout = io.readStdout();
+      assert.match(stdout, /webfinger FAILED:\s*HTTP 404/);
+      assert.match(stdout, /PUBLIC_URL must be HTTPS/);
     },
   );
+});
+
+test('whoami --verify still surfaces a bare status when the body is not JSON', async () => {
+  await new Promise<void>((resolve, reject) => {
+    const server = createServer((_req, res) => {
+      res.statusCode = 502;
+      res.setHeader('Content-Type', 'text/plain');
+      res.end('bad gateway');
+    });
+    server.listen(0, '127.0.0.1', async () => {
+      const addr = server.address();
+      if (!addr || typeof addr === 'string') {
+        server.close();
+        reject(new Error('no address'));
+        return;
+      }
+      try {
+        const io = makeIO();
+        const result = await runWhoami(
+          [
+            '--agentId',
+            'me',
+            '--server',
+            `ws://127.0.0.1:${addr.port}/ws`,
+            '--verify',
+          ],
+          io,
+        );
+        assert.equal(result, 3);
+        assert.match(io.readStdout(), /webfinger FAILED:\s*HTTP 502/);
+        server.close(() => resolve());
+      } catch (e) {
+        server.close(() => reject(e));
+      }
+    });
+  });
 });

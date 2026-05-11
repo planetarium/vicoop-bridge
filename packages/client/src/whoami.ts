@@ -120,7 +120,22 @@ async function verifyWebfinger(id: AgentIdentity): Promise<VerifyResult> {
       signal: controller.signal,
     });
     if (!res.ok) {
-      return { ok: false, status: res.status, error: `HTTP ${res.status}` };
+      // The bridge's well-known routes return `{ error: <reason> }` on 4xx
+      // (see `packages/server/src/well-known.ts` — e.g. "webfinger not
+      // available (PUBLIC_URL must be HTTPS with a multi-label hostname)").
+      // Surface that reason so operators know whether the agent isn't
+      // connected, PUBLIC_URL differs, or Mentionable is disabled entirely.
+      let detail = `HTTP ${res.status}`;
+      try {
+        const body = (await res.json()) as { error?: unknown };
+        if (typeof body.error === 'string' && body.error.length > 0) {
+          detail = `HTTP ${res.status}: ${body.error}`;
+        }
+      } catch {
+        // Non-JSON body — keep the bare status. Don't fail verify just
+        // because the error response wasn't shaped as we expected.
+      }
+      return { ok: false, status: res.status, error: detail };
     }
     const body = (await res.json()) as { subject?: unknown; aliases?: unknown };
     const subject = typeof body.subject === 'string' ? body.subject : undefined;

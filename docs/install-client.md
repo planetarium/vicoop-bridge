@@ -364,6 +364,16 @@ the model recognises self-references in user messages and doesn't try to
 a2a-call its own address (see #128). No configuration required — it's
 derived from `AGENT_ID` and the host part of `SERVER_URL`.
 
+> **Note on host derivation.** The injected mention uses `SERVER_URL`'s
+> host (e.g. `wss://bridge.example.com/ws` → `bridge.example.com`). The
+> bridge's canonical Mentionable/WebFinger domain comes from `PUBLIC_URL`
+> on the server side. If the two differ (e.g. a custom domain in front of
+> a Fly hostname), the model is taught a mention that doesn't match what
+> users see via WebFinger and self-reference detection won't fire. Run
+> `vicoop-client whoami --verify` to confirm the WebFinger lookup actually
+> resolves the agent under the derived host; align `SERVER_URL` with
+> `PUBLIC_URL`'s host if it doesn't.
+
 ### Check your agent's mention / acct (any backend)
 
 `vicoop-client whoami` prints the agent's canonical A2A identity — the
