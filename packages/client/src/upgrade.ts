@@ -57,7 +57,12 @@ const TAG_PREFIX = '@vicoop-bridge/client@';
 // the version character class still excludes it. Permissive enough for
 // semver-ish tags including pre-release/build suffixes
 // (`@vicoop-bridge/client@1.0.0-rc.1`, `...+sha.abc`).
-const TAG_RE = /^@vicoop-bridge\/client@[A-Za-z0-9][A-Za-z0-9.+\-]*$/;
+//
+// Derived from TAG_PREFIX so the prefix lives in one place. `@` and `/`
+// aren't regex metacharacters in JavaScript, so interpolating the prefix
+// verbatim is safe; if the prefix ever picks up a real metacharacter (`.`
+// `*` `?` etc.) this needs explicit escaping.
+const TAG_RE = new RegExp(`^${TAG_PREFIX}[A-Za-z0-9][A-Za-z0-9.+\\-]*$`);
 
 // Top-level entries a legitimate release bundle must contain. Missing any one
 // of these is taken as "not an installed bundle" and aborts upgrade before
@@ -295,7 +300,13 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
 }
 
 export function normalizeTag(v: string): string {
-  const candidate = v.startsWith(TAG_PREFIX) ? v : `${TAG_PREFIX}${v.replace(/^v/, '')}`;
+  // Peel the prefix if present so the leading-`v` strip applies whether the
+  // operator typed the bare version, the v-prefixed bare version, or the
+  // full tag (`@vicoop-bridge/client@v0.3.0` should resolve the same as
+  // `@vicoop-bridge/client@0.3.0`). Without this peel, the full-tag form
+  // would slip a `v` into the archive filename and miss the real asset.
+  const versionPart = (v.startsWith(TAG_PREFIX) ? v.slice(TAG_PREFIX.length) : v).replace(/^v/, '');
+  const candidate = `${TAG_PREFIX}${versionPart}`;
   assertSafeTag(candidate, v);
   return candidate;
 }

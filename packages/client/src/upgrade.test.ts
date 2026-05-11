@@ -9,6 +9,10 @@ test('normalizeTag accepts full tag, bare version, and v-prefixed version', () =
   assert.equal(normalizeTag('@vicoop-bridge/client@0.3.0'), '@vicoop-bridge/client@0.3.0');
   assert.equal(normalizeTag('0.3.0'), '@vicoop-bridge/client@0.3.0');
   assert.equal(normalizeTag('v0.3.0'), '@vicoop-bridge/client@0.3.0');
+  // Full tag with a stray `v` after the prefix should normalize the same as
+  // the bare-v form — otherwise the archive filename would carry the `v`
+  // and miss the real release asset.
+  assert.equal(normalizeTag('@vicoop-bridge/client@v0.3.0'), '@vicoop-bridge/client@0.3.0');
   assert.equal(normalizeTag('1.0.0-alpha.1'), '@vicoop-bridge/client@1.0.0-alpha.1');
   assert.equal(normalizeTag('1.0.0+build.sha'), '@vicoop-bridge/client@1.0.0+build.sha');
 });

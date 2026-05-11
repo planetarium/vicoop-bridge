@@ -73,8 +73,15 @@ if [ -z "$VERSION" ]; then
   # release. Parse with node (already a hard prereq above) rather than
   # grepping tag_name, so the draft/prerelease flags are honored the same
   # way `vicoop-client upgrade` honors them.
+  #
+  # `set -e` doesn't catch failures on the upstream end of a POSIX-sh
+  # pipeline, so curl is run on its own first — otherwise a network /
+  # rate-limit error would let node read empty input, exit 0, and surface
+  # as a misleading "no published release found" later.
+  api_json="$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30")" \
+    || die "GitHub release API request failed"
   VERSION="$(
-    curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" \
+    printf '%s' "$api_json" \
       | TAG_PREFIX="$TAG_PREFIX" node -e '
 let data = "";
 process.stdin.setEncoding("utf8");
