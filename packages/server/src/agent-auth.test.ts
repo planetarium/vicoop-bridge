@@ -1,11 +1,43 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Hono } from 'hono';
+import { SiweMessage } from 'siwe';
+import { Wallet } from 'ethers';
 import type { WebSocket } from 'ws';
 import type { AgentCard } from '@vicoop-bridge/protocol';
 import { agentAuthMiddleware } from './agent-auth.js';
+import { _resetSiweBearerCacheForTests } from './auth/siwe-bearer.js';
 import { Registry, type ClientConnection } from './registry.js';
 import type { Sql } from './db.js';
+
+// Anvil account #0 — well-known test key, mirrors siwe-bearer.test.ts.
+const TEST_PRIVATE_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+const TEST_ADDRESS_LOWER = '0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266';
+
+async function mintBearer(opts: { domain: string; uri: string }): Promise<string> {
+  const wallet = new Wallet(TEST_PRIVATE_KEY);
+  const issuedAt = new Date();
+  const expirationTime = new Date(Date.now() + 60 * 60 * 1000);
+  const msg = new SiweMessage({
+    domain: opts.domain,
+    address: wallet.address,
+    statement: 'agent-auth test',
+    uri: opts.uri,
+    version: '1',
+    chainId: 1,
+    nonce: crypto.randomUUID().replace(/-/g, ''),
+    issuedAt: issuedAt.toISOString(),
+    expirationTime: expirationTime.toISOString(),
+  });
+  const message = msg.prepareMessage();
+  const signature = await wallet.signMessage(message);
+  const json = JSON.stringify({ message, signature });
+  return Buffer.from(json, 'utf-8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
 
 // The reject paths exercised here never touch postgres — the middleware short-
 // circuits on missing/malformed bearer headers before reaching verifyCallerToken
@@ -123,6 +155,34 @@ test('unknown agent returns 404 without auth challenge', async () => {
   assert.equal(res.status, 404);
   // 404 is not an auth failure, so RFC 6750 challenge shouldn't be added.
   assert.equal(res.headers.get('WWW-Authenticate'), null);
+});
+
+test('caller not in allowedCallers responds 403 with WWW-Authenticate error="insufficient_scope"', async () => {
+  _resetSiweBearerCacheForTests();
+  // The agent only allows a different principal — the bearer's address is
+  // valid SIWE but not on the allow list, so the middleware must reach the
+  // caller_not_authorized branch (403).
+  const { app, registry } = buildApp({ siweDomain: 'bridge.example' });
+  registerAgent(registry, 'restricted', [
+    'eth:0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+  ]);
+  // Sanity: the minted bearer's address differs from the allowed principal.
+  assert.notEqual(TEST_ADDRESS_LOWER, '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+
+  const bearer = await mintBearer({
+    domain: 'bridge.example',
+    uri: 'https://bridge.example',
+  });
+  const res = await app.request('/agents/restricted', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bearer}` },
+  });
+  assert.equal(res.status, 403);
+  const challenge = res.headers.get('WWW-Authenticate');
+  assert.ok(challenge);
+  assert.match(challenge, /^Bearer realm="vicoop-bridge"/);
+  assert.match(challenge, /error="insufficient_scope"/);
+  assert.match(challenge, /error_description="caller not in allowed list"/);
 });
 
 test('error_description is length-capped so a long upstream message cannot blow up the header', async () => {
