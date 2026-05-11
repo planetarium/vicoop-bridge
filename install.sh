@@ -75,7 +75,7 @@ if [ -z "$VERSION" ]; then
   # way `vicoop-client upgrade` honors them.
   VERSION="$(
     curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" \
-      | node -e '
+      | TAG_PREFIX="$TAG_PREFIX" node -e '
 let data = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (c) => { data += c; });
@@ -83,7 +83,8 @@ process.stdin.on("end", () => {
   let releases;
   try { releases = JSON.parse(data); } catch { return; }
   if (!Array.isArray(releases)) return;
-  const prefix = "@vicoop-bridge/client@";
+  const prefix = process.env.TAG_PREFIX;
+  if (!prefix) return;
   for (const r of releases) {
     if (!r || typeof r.tag_name !== "string") continue;
     if (!r.tag_name.startsWith(prefix)) continue;
@@ -109,6 +110,15 @@ esac
 log "installing $VERSION"
 
 VERSION_NUM="${VERSION#$TAG_PREFIX}"
+# After stripping the prefix, the bare version still has to be safe to
+# interpolate into a local filename and a URL — the prefix check alone
+# wouldn't catch e.g. `@vicoop-bridge/client@0.3.0/../../etc`. Allowed
+# charset mirrors packages/client/src/upgrade.ts's TAG_RE.
+case "$VERSION_NUM" in
+  ''|*[!A-Za-z0-9.+-]*|*..*)
+    die "version contains unsafe characters: $VERSION_NUM"
+    ;;
+esac
 ARCHIVE="vicoop-bridge-client-$VERSION_NUM.tgz"
 CHECKSUM="$ARCHIVE.sha256"
 # GitHub's release-download endpoint takes the tag as one path segment. The

@@ -7,7 +7,24 @@ if [[ $# -ne 1 ]]; then
 fi
 
 TAG="$1"
-VERSION="${TAG#@vicoop-bridge/client@}"
+TAG_PREFIX="@vicoop-bridge/client@"
+
+# Caller passes the full tag (changesets-publish.sh does this) so the
+# README and archive name agree on the version. Fail fast if it doesn't
+# carry the expected prefix or if the stripped version has anything that
+# could path-traverse / inject shell metacharacters into BUNDLE_DIR or
+# ARCHIVE_PATH below.
+case "$TAG" in
+  "$TAG_PREFIX"*) ;;
+  *) echo "error: TAG must start with $TAG_PREFIX (got: $TAG)" >&2; exit 1 ;;
+esac
+VERSION="${TAG#$TAG_PREFIX}"
+case "$VERSION" in
+  ''|*[!A-Za-z0-9.+-]*|*..*)
+    echo "error: version portion contains unsafe characters: $VERSION" >&2
+    exit 1
+    ;;
+esac
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="$ROOT_DIR/dist-release"
 WORK_DIR="$OUT_DIR/work"
