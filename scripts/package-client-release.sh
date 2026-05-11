@@ -19,8 +19,11 @@ case "$TAG" in
   *) echo "error: TAG must start with $TAG_PREFIX (got: $TAG)" >&2; exit 1 ;;
 esac
 VERSION="${TAG#$TAG_PREFIX}"
+# Mirrors packages/client/src/upgrade.ts's TAG_RE: first char must be
+# alphanumeric (no ".x" or "-x"), remaining chars limited to
+# [A-Za-z0-9.+-], and no consecutive dots.
 case "$VERSION" in
-  ''|*[!A-Za-z0-9.+-]*|*..*)
+  ''|[!A-Za-z0-9]*|*[!A-Za-z0-9.+-]*|*..*)
     echo "error: version portion contains unsafe characters: $VERSION" >&2
     exit 1
     ;;

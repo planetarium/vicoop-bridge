@@ -112,10 +112,12 @@ log "installing $VERSION"
 VERSION_NUM="${VERSION#$TAG_PREFIX}"
 # After stripping the prefix, the bare version still has to be safe to
 # interpolate into a local filename and a URL — the prefix check alone
-# wouldn't catch e.g. `@vicoop-bridge/client@0.3.0/../../etc`. Allowed
-# charset mirrors packages/client/src/upgrade.ts's TAG_RE.
+# wouldn't catch e.g. `@vicoop-bridge/client@0.3.0/../../etc`. Mirrors
+# packages/client/src/upgrade.ts's TAG_RE: first char must be alphanumeric
+# (rejects ".0.3.0", "-1", and other option-like names), remaining chars
+# limited to [A-Za-z0-9.+-], and no consecutive dots.
 case "$VERSION_NUM" in
-  ''|*[!A-Za-z0-9.+-]*|*..*)
+  ''|[!A-Za-z0-9]*|*[!A-Za-z0-9.+-]*|*..*)
     die "version contains unsafe characters: $VERSION_NUM"
     ;;
 esac

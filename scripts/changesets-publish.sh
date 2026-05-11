@@ -67,7 +67,10 @@ else
   fi
   if [[ -n "${remote_commit_sha}" && "${remote_commit_sha}" != "${TARGET_SHA}" ]]; then
     echo "error: tag ${TAG} already exists at ${remote_commit_sha} but expected ${TARGET_SHA}" >&2
-    echo "delete the tag (e.g. 'gh api -X DELETE repos/<owner>/<repo>/git/refs/tags/${TAG}') and rerun." >&2
+    # The tag contains `/` and `@`, so a `gh api refs/tags/${TAG}` URL would
+    # be malformed without percent-encoding. `git push --delete` operates on
+    # the tag name directly and handles either character fine.
+    echo "delete the tag (e.g. 'git push --delete origin ${TAG}') and rerun." >&2
     exit 1
   fi
 
