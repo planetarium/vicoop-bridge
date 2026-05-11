@@ -78,7 +78,7 @@ function resolveSession(parsed: ParsedArgs): Session | { error: string } {
   if (!bridge || !token) {
     return {
       error:
-        'No owner-session bearer found. Run `vicoop-client login --owner-session --bridge <URL>` first, ' +
+        'No owner-session bearer found. Run `vicoop-client login --bridge <URL>` first, ' +
         'or pass --bridge and --token explicitly (or set VICOOP_BRIDGE / VICOOP_OWNER_TOKEN).',
     };
   }

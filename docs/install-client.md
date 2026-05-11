@@ -154,35 +154,37 @@ AGENT_ID="$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)-openclaw"
 echo "$AGENT_ID"
 ```
 
-`registerClient` (called for you by `vicoop-client login` in Step 4) does
+`registerClient` (called for you by `vicoop-client setup` in Step 4) does
 not pre-validate availability; collisions surface only at WS connect time.
 If you want to probe ahead, hit `agentIdAvailable(agentId)` GraphQL after
 login — it's a SECURITY DEFINER probe that returns boolean availability
 across every owner without leaking `owner_principal`. Most operators just
 pick a hostname/uuid prefix and skip the probe.
 
-## Step 4 — Login and register your client (device flow)
+## Step 4 — Login and set up your client
 
-`vicoop-client login` drives Google OAuth device flow against the bridge
-to register a fresh client and hand you a one-time `CLIENT_TOKEN`. No
-wallet, no SIWE, no GraphQL calls.
+`vicoop-client login` only signs you in as the client owner and saves an
+owner-session bearer to `~/.vicoop/owner-session.json`. It does **not** create
+a bridge client. `vicoop-client setup` then uses that saved owner-session to
+call `registerClient` and mint a one-time `CLIENT_TOKEN`. No wallet or SIWE
+required.
 
 ```sh
 HOSTNAME=$(hostname)
 CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
 
-"$INSTALL_DIR/bin/vicoop-client" login \
-  --bridge "$BRIDGE_URL" \
+"$INSTALL_DIR/bin/vicoop-client" login --bridge "$BRIDGE_URL"
+
+"$INSTALL_DIR/bin/vicoop-client" setup \
   --client-name "$CLIENT_NAME" \
   --agent-ids "$AGENT_ID" \
   --write-env-file "$INSTALL_DIR/vicoop-client.env"
 ```
 
-The CLI prints a verification URL to stderr — open it in **any** browser
-(the same machine, or your laptop while running the CLI on a headless
-host) and authorize with your Google account. The CLI polls the bridge in
-the background and writes the resulting env block to
-`vicoop-client.env` (mode 600) on success:
+`login` prints a verification URL to stderr — open it in **any** browser
+(the same machine, or your laptop while running the CLI on a headless host)
+and authorize with your Google account. `setup` writes the resulting daemon env
+block to `vicoop-client.env` (mode 600):
 
 ```text
 SERVER_URL=wss://vicoop-bridge-server.fly.dev
@@ -193,20 +195,19 @@ AGENT_ID=<your agent id>
 > ⚠ The `CLIENT_TOKEN` is unrecoverable after this single output. The env
 > file is the only place it persists; back it up if you need to rotate
 > hosts. To rotate the token later, use the `rotateClientToken` GraphQL
-> mutation (requires a fresh `vbc_owner_*` session token from
-> `/auth/siwe/exchange?intent=owner_session` or device flow with
-> `intent=owner_session` — the rotation surfaces a new CLIENT_TOKEN, also
-> one-time).
+> mutation (requires a `vbc_owner_*` session token; the default login flow
+> saves one locally for you). Rotation surfaces a new CLIENT_TOKEN, also
+> one-time.
 
-Drop `--write-env-file` and pass `--json` instead if you want to compose
+For setup scripting, drop `--write-env-file` and pass `--json` instead if you want to compose
 with shell tooling:
 
 ```sh
-"$INSTALL_DIR/bin/vicoop-client" login \
-  --bridge "$BRIDGE_URL" --client-name "$CLIENT_NAME" \
+"$INSTALL_DIR/bin/vicoop-client" setup \
+  --client-name "$CLIENT_NAME" \
   --agent-ids "$AGENT_ID" --json \
-  | tee /tmp/vicoop-login.json
-CLIENT_TOKEN=$(jq -r .client_token /tmp/vicoop-login.json)
+  | tee /tmp/vicoop-setup.json
+CLIENT_TOKEN=$(jq -r .client_token /tmp/vicoop-setup.json)
 ```
 
 `--write-env-file` replaces the older `--env-file` spelling. The old alias is
@@ -220,20 +221,20 @@ the `updateClientAllowedAgents` GraphQL mutation (backed by
 `update_client_allowed_agents()` in `schema.sql`) without issuing a new
 token.
 
-### What login does on the server
+### What login and setup do
 
-1. `POST /oauth/device/code` with `intent=client_register` + `client_name`
-   + `allowed_agent_ids` — the bridge stores these on a `device_sessions`
-   row and returns a one-time `device_code` + 8-char user code.
+1. `login` calls `POST /oauth/device/code` with `intent=owner_session`; the bridge stores
+   a `device_sessions` row and returns a one-time `device_code` + 8-char user
+   code.
 2. Operator opens the verification URL, signs in with Google, and the
-   approval page shows exactly what's being authorized
-   ("Register a bridge client `<name>` … with allowed agent ids …").
+   approval page authorizes an owner-session login for bridge management.
 3. CLI polls `POST /oauth/token`. Once status flips to `approved`, the
-   bridge calls `register_client()` on behalf of the Google principal,
-   stamps `clients.owner_email` for admin readability, and returns
-   `{client_id, client_token, owner_principal, allowed_agent_ids}`.
-4. The CLI never sees a `vbc_caller_*` token — `client_register` issues
-   the long-lived `CLIENT_TOKEN` directly. No `callers` row is created.
+   bridge returns a `vbc_owner_*` bearer, and `login` saves it to
+   `~/.vicoop/owner-session.json` (mode 600).
+4. `setup` calls the authenticated GraphQL `registerClient` mutation with
+   that bearer, receives `{client_id, client_token, owner_principal,
+   allowed_agent_ids}`, and writes the client env file. It never sees a
+   `vbc_caller_*` token.
 
 This means a Google-only operator can stand up a bridge client without
 ever holding a wallet or seed phrase. Owner is recorded as
@@ -303,6 +304,8 @@ On success you'll see a `[client] connected, sending hello` log. After that:
 
 - The bridge auto-creates an `agent_policies` row owned by your wallet with
   empty `allowed_callers` — meaning **publicly callable** until you restrict it.
+  For security, restrict callers before sharing the agent id or leaving the
+  client online unattended.
 - `POST $BRIDGE_URL/agents/$AGENT_ID` with a JSON-RPC `message/send` payload
   reaches your backend and the reply is returned inline.
 
@@ -394,15 +397,16 @@ screen -S vicoop-client -X quit
 write a plist under `~/Library/LaunchAgents/` and load it with
 `launchctl load -w`.
 
-### Restrict who can call your agent
+### Recommended: restrict who can call your agent
 
 By default the policy has empty `allowed_callers`, which the dispatcher
-treats as "public". To lock it down, either use the `vicoop-client`
-subcommands (deterministic, scriptable) or send a natural-language
-request to the admin agent. Both require an **owner-session token**
-(`vbc_owner_*`) — wallet (SIWE) or Google (device flow with
-`intent=owner_session`). Admin scope (`is_admin()`) is wallet-only and
-gates only the cross-owner tools.
+treats as "public". For normal use, add an allowlist entry for each trusted
+caller and keep the agent private by default. Either use the `vicoop-client`
+subcommands (deterministic, scriptable) or send a natural-language request to
+the admin agent. Both require an **owner-session token** (`vbc_owner_*`).
+Step 4 login saves one locally; you only need to rerun `login` if that file is
+missing or expired. Admin scope
+(`is_admin()`) is wallet-only and gates only the cross-owner tools.
 
 #### Option A: `vicoop-client` subcommands (recommended for scripts)
 
@@ -417,10 +421,7 @@ needed:
 ```
 
 ```sh
-# One-time login — saves the bearer to ~/.vicoop/owner-session.json (chmod 600).
-"$INSTALL_DIR/bin/vicoop-client" login --owner-session --bridge "$BRIDGE_URL"
-
-# Now any of these work without re-authenticating:
+# Step 4 login saves the owner-session bearer, so these work without re-authenticating:
 "$INSTALL_DIR/bin/vicoop-client" list-agents
 "$INSTALL_DIR/bin/vicoop-client" list-callers "$AGENT_ID" --json
 "$INSTALL_DIR/bin/vicoop-client" add-caller "$AGENT_ID" "eth:0x<40-hex>"
@@ -431,10 +432,14 @@ needed:
 # work too (handy for CI).
 ```
 
-The env file written by Step 4 (`SERVER_URL` / `SERVER_TOKEN` / `AGENT_ID`)
+The env file written by Step 4 setup (`SERVER_URL` / `SERVER_TOKEN` / `AGENT_ID`)
 is a **client** credential and is **not** accepted by these admin commands —
-they only accept an owner-session bearer, which is why
-`login --owner-session` is a separate step.
+they only accept an owner-session bearer. If the saved bearer is missing or
+expired, refresh it without registering a new client:
+
+```sh
+"$INSTALL_DIR/bin/vicoop-client" login --bridge "$BRIDGE_URL"
+```
 
 These talk to the bridge's `/admin-api/*` routes — same logic the admin
 agent's tools run, but without an LLM round-trip per call.

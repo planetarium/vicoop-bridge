@@ -9,6 +9,7 @@ import type { Backend } from './backend.js';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
 import { runLogin } from './login.js';
+import { runSetup } from './setup.js';
 import {
   runAddCaller,
   runListAgents,
@@ -27,7 +28,7 @@ interface Args {
 const DAEMON_USAGE =
   'vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude> [--card <path>]';
 const SUBCOMMAND_LIST =
-  'subcommands: login, upgrade, list-agents, list-callers, add-caller, remove-caller (run any with --help)';
+  'subcommands: login, setup, upgrade, list-agents, list-callers, add-caller, remove-caller (run any with --help)';
 
 function parseClientArgs(argv: string[]): Args {
   const out: Partial<Args> = {};
@@ -161,6 +162,10 @@ async function main(): Promise<void> {
 
   if (argv[0] === 'login') {
     process.exit(await runLogin(argv.slice(1)));
+  }
+
+  if (argv[0] === 'setup') {
+    process.exit(await runSetup(argv.slice(1)));
   }
 
   if (argv[0] === 'add-caller') {
