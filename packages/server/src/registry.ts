@@ -31,9 +31,10 @@ export interface TaskBinding {
   contextId: string;
   sink: TaskSink;
   // principalId of the caller that originated this task (post-auth). Optional
-  // because the admin-route path (POST '/') binds tasks too and keeps caller
-  // identity in its own metadata; only the /agents/:id route currently
-  // threads it through the binding for accept-path log correlation.
+  // because public agents (allowedCallers.length === 0) skip the auth
+  // middleware entirely, so there is no verified caller to record. The admin
+  // route does not create TaskBindings — it has its own executor
+  // (AdminA2XExecutor) that never calls registry.bindTask().
   principalId?: string;
 }
 
