@@ -251,8 +251,8 @@ export async function runSetup(args: string[]): Promise<number> {
       `  owner_principal  ${success.owner_principal}\n` +
       `  client_name      ${success.client_name}\n` +
       `  allowed_agents   ${success.allowed_agent_ids.join(', ')}\n\n` +
-      'The CLIENT_TOKEN below is shown only once and cannot be retrieved later.\n' +
-      '  Save it now (export to env, write to a vault, etc.).\n\n',
+      'The CLIENT_TOKEN is shown only once and cannot be retrieved later.\n' +
+      '  Save the setup output or env file now.\n\n',
   );
 
   if (parsed.callers.length > 0) {

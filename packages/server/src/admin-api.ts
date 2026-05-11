@@ -79,54 +79,30 @@ export async function addCaller(
     throw new AdminApiError(INVALID_PRINCIPAL_MESSAGE, 400);
   }
 
-  const result = await db.begin(async (tx) => {
-    await setRlsContext(tx, principalId);
-    return tx`
-      UPDATE agent_policies
-      SET allowed_callers = array_append(allowed_callers, ${normalized}),
-          updated_at = now()
-      WHERE agent_id = ${agentId}
-        AND NOT (${normalized} = ANY(allowed_callers))
-      RETURNING agent_id, owner_principal, allowed_callers
-    `;
-  });
+  const updateExisting = async (): Promise<CallerMutationResult | null> => {
+    const result = await db.begin(async (tx) => {
+      await setRlsContext(tx, principalId);
+      return tx`
+        UPDATE agent_policies
+        SET allowed_callers = array_append(allowed_callers, ${normalized}),
+            updated_at = now()
+        WHERE agent_id = ${agentId}
+          AND NOT (${normalized} = ANY(allowed_callers))
+        RETURNING agent_id, owner_principal, allowed_callers
+      `;
+    });
+    if (result.length > 0) {
+      const callers = result[0].allowed_callers as string[];
+      registry.updateAllowedCallers(agentId, callers);
+      return { agent_id: agentId, principal: normalized, allowed_callers: callers };
+    }
 
-  if (result.length === 0) {
-    // Either: policy missing, principal already present, or RLS blocked the
-    // update. Disambiguate with a follow-up SELECT (still under RLS).
     const existing = await db.begin(async (tx) => {
       await setRlsContext(tx, principalId);
       return tx`SELECT allowed_callers FROM agent_policies WHERE agent_id = ${agentId}`;
     });
-    if (existing.length === 0) {
-      const created = await db.begin(async (tx) => {
-        await setRlsContext(tx, principalId);
-        return tx`
-          WITH owning_client AS (
-            SELECT id, owner_principal
-            FROM clients
-            WHERE ${agentId} = ANY(allowed_agent_ids)
-              AND revoked = false
-            ORDER BY created_at DESC
-            LIMIT 1
-          )
-          INSERT INTO agent_policies (agent_id, owner_principal, client_id, allowed_callers)
-          SELECT ${agentId}, owner_principal, id, ARRAY[${normalized}]::text[]
-          FROM owning_client
-          ON CONFLICT (agent_id) DO NOTHING
-          RETURNING agent_id, owner_principal, allowed_callers
-        `;
-      });
-      if (created.length === 0) {
-        throw new AdminApiError(
-          'Agent policy not found, and no registered client allows this agent id.',
-          404,
-        );
-      }
-      const callers = created[0].allowed_callers as string[];
-      registry.updateAllowedCallers(agentId, callers);
-      return { agent_id: agentId, principal: normalized, allowed_callers: callers };
-    }
+    if (existing.length === 0) return null;
+
     const callers = existing[0].allowed_callers as string[];
     if (callers.includes(normalized)) {
       // Idempotent path also pushes the canonical DB state into the registry
@@ -142,11 +118,44 @@ export async function addCaller(
       };
     }
     throw new AdminApiError('Not authorized to modify this agent policy.', 403);
+  };
+
+  const updated = await updateExisting();
+  if (updated) return updated;
+
+  const created = await db.begin(async (tx) => {
+    await setRlsContext(tx, principalId);
+    return tx`
+      WITH owning_client AS (
+        SELECT id, owner_principal
+        FROM clients
+        WHERE ${agentId} = ANY(allowed_agent_ids)
+          AND revoked = false
+        ORDER BY created_at DESC
+        LIMIT 1
+      )
+      INSERT INTO agent_policies (agent_id, owner_principal, client_id, allowed_callers)
+      SELECT ${agentId}, owner_principal, id, ARRAY[${normalized}]::text[]
+      FROM owning_client
+      ON CONFLICT (agent_id) DO UPDATE
+        SET allowed_callers = array_append(agent_policies.allowed_callers, ${normalized}),
+            updated_at = now()
+        WHERE NOT (${normalized} = ANY(agent_policies.allowed_callers))
+      RETURNING agent_id, owner_principal, allowed_callers
+    `;
+  });
+  if (created.length > 0) {
+    const callers = created[0].allowed_callers as string[];
+    registry.updateAllowedCallers(agentId, callers);
+    return { agent_id: agentId, principal: normalized, allowed_callers: callers };
   }
 
-  const callers = result[0].allowed_callers as string[];
-  registry.updateAllowedCallers(agentId, callers);
-  return { agent_id: agentId, principal: normalized, allowed_callers: callers };
+  // Another process may have created the policy with this caller already in
+  // place, or RLS may have blocked the conflict update. Retry the normal
+  // update/idempotency path once so races converge before reporting 404.
+  const retried = await updateExisting();
+  if (retried) return retried;
+  throw new AdminApiError('Agent policy not found or not authorized.', 404);
 }
 
 export async function removeCaller(

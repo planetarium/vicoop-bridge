@@ -76,6 +76,8 @@ test('setup registers client with saved owner-session and writes daemon env', as
   assert.match(readFileSync(envFile, 'utf8'), /SERVER_TOKEN=client-token/);
   assert.match(readFileSync(envFile, 'utf8'), /AGENT_ID=agent-1/);
   assert.match(stderr, /client_id\s+client-1/);
+  assert.match(stderr, /The CLIENT_TOKEN is shown only once/);
+  assert.match(stderr, /Save the setup output or env file now/);
   assert.match(stderr, /WARNING: no callers configured/);
 });
 
