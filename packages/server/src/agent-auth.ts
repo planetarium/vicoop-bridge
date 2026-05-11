@@ -18,6 +18,53 @@ export function getCaller(c: Context): VerifiedCaller | undefined {
   return c.get('caller') as VerifiedCaller | undefined;
 }
 
+const WWW_AUTH_REALM = 'vicoop-bridge';
+
+// Cap the error_description so a long upstream err.message can't push the
+// WWW-Authenticate header past common proxy/server limits (often ~8KB total).
+const ERROR_DESCRIPTION_MAX_LEN = 200;
+
+// RFC 6749 §4.1.2.1 restricts error_description to %x20-21 / %x23-5B / %x5D-7E,
+// i.e. printable ASCII excluding `"` and `\`. Anything outside that range is
+// dropped so the header stays a valid quoted-string without escape handling.
+// Output is also length-capped to keep total header size bounded.
+//
+// Exported for direct unit testing — all call sites inside this module feed
+// it stable, hand-authored strings (never raw upstream err.message) to avoid
+// leaking internal SQL/verifier details via WWW-Authenticate (often captured
+// by access logs). The sanitize + cap remains as defense-in-depth.
+export function sanitizeErrorDescription(value: string): string {
+  let out = '';
+  for (const ch of value) {
+    if (out.length >= ERROR_DESCRIPTION_MAX_LEN) break;
+    const code = ch.charCodeAt(0);
+    if (
+      code === 0x20 ||
+      code === 0x21 ||
+      (code >= 0x23 && code <= 0x5b) ||
+      (code >= 0x5d && code <= 0x7e)
+    ) {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+function setWWWAuthenticate(
+  c: Context,
+  opts: {
+    error?: 'invalid_token' | 'insufficient_scope';
+    description?: string;
+  } = {},
+): void {
+  const parts = [`realm="${WWW_AUTH_REALM}"`];
+  if (opts.error) parts.push(`error="${opts.error}"`);
+  if (opts.description) {
+    parts.push(`error_description="${sanitizeErrorDescription(opts.description)}"`);
+  }
+  c.header('WWW-Authenticate', `Bearer ${parts.join(', ')}`);
+}
+
 export interface AgentAuthOptions {
   sql: Sql;
   deviceFlowEnabled?: boolean;
@@ -70,6 +117,9 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
     const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
     if (!bearerToken) {
       logEvent('agent_request_rejected', { agentId, reason: 'missing_bearer' });
+      // Per RFC 6750 §3.1, no error code when the request lacks any
+      // authentication information — only the challenge realm.
+      setWWWAuthenticate(c);
       return c.json({
         jsonrpc: '2.0',
         id: null,
@@ -90,10 +140,19 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
           reason: 'invalid_token',
           detail: truncate((err as Error).message, 256),
         });
+        // Don't surface raw err.message in either WWW-Authenticate (commonly
+        // captured by proxy access logs) or the JSON-RPC body (returned to
+        // unauthenticated callers) — the verifyCallerToken path can throw
+        // SQL/connection errors. Detailed cause stays in the structured
+        // logEvent above for diagnostics.
+        setWWWAuthenticate(c, {
+          error: 'invalid_token',
+          description: 'invalid bearer token',
+        });
         return c.json({
           jsonrpc: '2.0',
           id: null,
-          error: { code: -32001, message: `Invalid bearer token: ${(err as Error).message}` },
+          error: { code: -32001, message: `Invalid bearer token. Acquire one via ${acquisitionHint}.` },
         }, 401);
       }
     } else if (bearerToken.startsWith(OWNER_SESSION_PREFIX)) {
@@ -104,6 +163,10 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
       // owner-session token as base64url JSON and fail with the misleading
       // "SIWE bearer token is not valid JSON".
       logEvent('agent_request_rejected', { agentId, reason: 'owner_session_on_caller_route' });
+      setWWWAuthenticate(c, {
+        error: 'invalid_token',
+        description: `${OWNER_SESSION_PREFIX}* tokens are not accepted on /agents/:id`,
+      });
       return c.json({
         jsonrpc: '2.0',
         id: null,
@@ -125,17 +188,30 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
           reason: 'invalid_siwe_bearer',
           detail: truncate((err as Error).message, 256),
         });
+        // Stable public strings in both the header and the JSON body —
+        // siwe-bearer verification can surface low-level library/parse
+        // errors that we don't want to echo into a header that proxies
+        // routinely log, nor into a body returned to unauthenticated callers.
+        // Detailed cause stays in the structured logEvent above.
+        setWWWAuthenticate(c, {
+          error: 'invalid_token',
+          description: 'invalid SIWE bearer',
+        });
         return c.json({
           jsonrpc: '2.0',
           id: null,
           error: {
             code: -32001,
-            message: `Invalid bearer token: ${(err as Error).message}. Acquire one via ${acquisitionHint}.`,
+            message: `Invalid bearer token. Acquire one via ${acquisitionHint}.`,
           },
         }, 401);
       }
     } else {
       logEvent('agent_request_rejected', { agentId, reason: 'bad_token_prefix' });
+      setWWWAuthenticate(c, {
+        error: 'invalid_token',
+        description: `expected ${CALLER_TOKEN_PREFIX}* prefix`,
+      });
       return c.json({
         jsonrpc: '2.0',
         id: null,
@@ -152,6 +228,10 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
         agentId,
         reason: 'caller_not_authorized',
         principalId: caller.principalId,
+      });
+      setWWWAuthenticate(c, {
+        error: 'insufficient_scope',
+        description: 'caller not in allowed list',
       });
       return c.json({
         jsonrpc: '2.0',
