@@ -4,7 +4,7 @@
 //
 // Auth: each subcommand resolves an owner-session bearer via env
 // (VICOOP_OWNER_TOKEN + VICOOP_BRIDGE) or the file written by
-// `vicoop-client login --owner-session`. If neither is present (or the
+// `vicoop-client login --bridge <URL>`. If neither is present (or the
 // stored token is expired) the user gets a clear "run login" hint and the
 // process exits with code 1.
 
@@ -78,7 +78,7 @@ function resolveSession(parsed: ParsedArgs): Session | { error: string } {
   if (!bridge || !token) {
     return {
       error:
-        'No owner-session bearer found. Run `vicoop-client login --owner-session --bridge <URL>` first, ' +
+        'No owner-session bearer found. Run `vicoop-client login --bridge <URL>` first, ' +
         'or pass --bridge and --token explicitly (or set VICOOP_BRIDGE / VICOOP_OWNER_TOKEN).',
     };
   }

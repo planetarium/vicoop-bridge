@@ -1,27 +1,7 @@
-// `vicoop-client login` — device-flow login (issue #79). Two intents:
-//
-//   * default: `intent=client_register` — registers a new client and returns
-//     a CLIENT_TOKEN bound to the resulting client. Required flags:
-//     --bridge, --client-name, --agent-ids.
-//
-//   * `--owner-session`: `intent=owner_session` — issues an owner-session
-//     bearer (`vbc_owner_*`) used by the admin-management subcommands
-//     (add-caller etc) to authenticate against /admin-api/*. The bearer is
-//     persisted to ~/.vicoop/owner-session.json (chmod 600) by default.
-//     Only --bridge is required.
-//
-// Output: stderr is always used for human guidance. The destination of the
-// "final result" depends on intent + flags:
-//   * client_register, default          → stdout, env-style block
-//   * client_register, --json            → stdout, JSON document
-//   * client_register, --write-env-file  → file at the given path, env-style
-//   * owner_session, default             → ~/.vicoop/owner-session.json (chmod 600)
-//   * owner_session, --json              → stdout, JSON document
-//   * owner_session, --write-env-file    → file at the given path, env-style
-// Stdout-as-default for client_register keeps shell composition working
-// (`$(vicoop-client login --json | jq -r .client_token)`); owner-session's
-// default-to-file matches the way `gh auth login` plants ~/.config/gh/hosts.yml,
-// so subsequent admin subcommands pick up the bearer with no env wiring.
+// `vicoop-client login` — authenticate the operator and persist an
+// owner-session bearer. Client creation is deliberately handled by
+// `vicoop-client setup` so login has no server-side client-registration
+// side effects.
 
 import {
   atomicWriteFile,
@@ -29,30 +9,12 @@ import {
   saveOwnerSession,
 } from './owner-session.js';
 
-type Intent = 'client_register' | 'owner_session';
-
-// Modelled as a discriminated union on `intent` so TypeScript blocks
-// accidental access to `clientName` / `allowedAgentIds` on the
-// owner-session path (where they don't apply) and parseArgs is forced to
-// validate them before constructing a ClientRegisterArgs.
-interface BaseLoginArgs {
+interface LoginArgs {
   bridge: string;
   envFile: string | null;
   json: boolean;
   pollOnce: boolean; // for tests / CI smoke
 }
-
-interface ClientRegisterArgs extends BaseLoginArgs {
-  intent: 'client_register';
-  clientName: string;
-  allowedAgentIds: string[];
-}
-
-interface OwnerSessionArgs extends BaseLoginArgs {
-  intent: 'owner_session';
-}
-
-type LoginArgs = ClientRegisterArgs | OwnerSessionArgs;
 
 interface DeviceCodeResponse {
   device_code: string;
@@ -63,28 +25,12 @@ interface DeviceCodeResponse {
   interval: number;
 }
 
-interface ClientRegisterSuccess {
-  intent: 'client_register';
-  client_id: string;
-  client_token: string;
-  owner_principal: string;
-  owner_email: string | null;
-  client_name: string;
-  allowed_agent_ids: string[];
-}
-
 interface OwnerSessionSuccess {
   access_token: string;
   token_type: 'Bearer';
   expires_in: number;
   principal_id: string;
   email: string | null;
-}
-
-type TokenSuccessResponse = ClientRegisterSuccess | OwnerSessionSuccess;
-
-function isClientRegister(body: TokenSuccessResponse): body is ClientRegisterSuccess {
-  return (body as ClientRegisterSuccess).intent === 'client_register';
 }
 
 interface OAuthError {
@@ -95,27 +41,17 @@ interface OAuthError {
 function usage(): void {
   process.stderr.write(
     [
-      'usage: vicoop-client login --bridge <https://...> --client-name <name>',
-      '                          --agent-ids <id1,id2> [--write-env-file <path>] [--json]',
-      '       vicoop-client login --owner-session --bridge <https://...>',
-      '                          [--write-env-file <path>] [--json]',
+      'usage: vicoop-client login --bridge <https://...> [--write-env-file <path>] [--json]',
       '',
-      'Default: drives Google OAuth device flow to register a new client and prints',
-      '         the resulting CLIENT_TOKEN once. Required: --bridge, --client-name, --agent-ids.',
-      '',
-      '--owner-session: drives the same flow but issues an owner-session bearer used',
-      '         by add-caller / list-callers / list-agents / remove-caller. The token',
-      '         is saved to ~/.vicoop/owner-session.json (chmod 600) by default.',
+      'Drives Google OAuth device flow and issues an owner-session bearer used',
+      'by setup / add-caller / list-callers / list-agents / remove-caller.',
+      'By default the token is saved to ~/.vicoop/owner-session.json (chmod 600).',
       '',
       'Flags:',
       '  --bridge          Bridge HTTP URL (e.g. https://vicoop-bridge-server.fly.dev)',
-      '  --owner-session   Issue an owner-session bearer instead of registering a client.',
-      '  --client-name     Human-readable client name (client_register only).',
-      '  --agent-ids       CSV of agent ids this client is allowed to register as.',
+      '  --owner-session   Accepted for compatibility; login always issues owner-session.',
       '  --write-env-file PATH',
-      '                    Write env block to PATH (chmod 600).',
-      '                      client_register: SERVER_URL / SERVER_TOKEN / AGENT_ID',
-      '                      owner-session:   VICOOP_BRIDGE / VICOOP_OWNER_TOKEN',
+      '                    Write VICOOP_BRIDGE / VICOOP_OWNER_TOKEN env block to PATH.',
       '  --env-file PATH   Deprecated alias for --write-env-file. Avoid on Node 24+',
       '                    unless your wrapper invokes node with "--" before the script.',
       '  --json            Print the token endpoint response as JSON to stdout.',
@@ -125,10 +61,7 @@ function usage(): void {
 }
 
 function parseArgs(args: string[]): LoginArgs | null {
-  let intent: Intent = 'client_register';
   let bridge: string | undefined;
-  let clientName: string | undefined;
-  let allowedAgentIds: string[] = [];
   let envFile: string | null = null;
   let json = false;
   let pollOnce = false;
@@ -140,11 +73,9 @@ function parseArgs(args: string[]): LoginArgs | null {
       continue;
     }
     if (a === '--owner-session') {
-      intent = 'owner_session';
       continue;
     }
     if (a === '--poll-once') {
-      // Internal: bail after a single poll, regardless of state. Used by tests.
       pollOnce = true;
       continue;
     }
@@ -156,12 +87,6 @@ function parseArgs(args: string[]): LoginArgs | null {
     switch (a) {
       case '--bridge':
         bridge = v;
-        break;
-      case '--client-name':
-        clientName = v;
-        break;
-      case '--agent-ids':
-        allowedAgentIds = v.split(',').map((s) => s.trim()).filter(Boolean);
         break;
       case '--write-env-file':
       case '--env-file':
@@ -177,23 +102,11 @@ function parseArgs(args: string[]): LoginArgs | null {
     usage();
     return null;
   }
-  const base = { bridge, envFile, json, pollOnce };
-  if (intent === 'client_register') {
-    if (!clientName || allowedAgentIds.length === 0) {
-      usage();
-      return null;
-    }
-    return { intent, ...base, clientName, allowedAgentIds };
-  }
-  return { intent, ...base };
+  return { bridge, envFile, json, pollOnce };
 }
 
 async function fetchDeviceCode(args: LoginArgs): Promise<DeviceCodeResponse> {
-  const body = new URLSearchParams({ intent: args.intent });
-  if (args.intent === 'client_register') {
-    body.set('client_name', args.clientName);
-    body.set('allowed_agent_ids', args.allowedAgentIds.join(','));
-  }
+  const body = new URLSearchParams({ intent: 'owner_session' });
   const res = await fetch(`${args.bridge.replace(/\/$/, '')}/oauth/device/code`, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -221,7 +134,7 @@ async function pollOnce(
   | { kind: 'slow_down' }
   | { kind: 'expired' }
   | { kind: 'error'; message: string }
-  | { kind: 'success'; body: TokenSuccessResponse }
+  | { kind: 'success'; body: OwnerSessionSuccess }
 > {
   const body = new URLSearchParams({
     grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
@@ -234,48 +147,46 @@ async function pollOnce(
   });
   const text = await res.text();
   if (res.ok) {
-    return { kind: 'success', body: JSON.parse(text) as TokenSuccessResponse };
+    return { kind: 'success', body: JSON.parse(text) as OwnerSessionSuccess };
   }
   let parsed: OAuthError | null = null;
   try {
     parsed = JSON.parse(text) as OAuthError;
   } catch {
-    // not JSON — wrap raw text below
+    // not JSON
   }
   const code = parsed?.error;
   if (code === 'authorization_pending') return { kind: 'pending' };
   if (code === 'slow_down') return { kind: 'slow_down' };
   if (code === 'expired_token') return { kind: 'expired' };
-  return {
-    kind: 'error',
-    message: parsed?.error_description ?? parsed?.error ?? text,
-  };
+  return { kind: 'error', message: parsed?.error_description ?? parsed?.error ?? text };
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function writeEnvFile(path: string, success: TokenSuccessResponse, bridgeUrl: string): void {
-  const lines = isClientRegister(success)
-    ? [
-        `# vicoop-client env (generated by 'vicoop-client login')`,
-        `SERVER_URL=${bridgeUrl.replace(/^http(s?):\/\//, (_m, s) => (s === 's' ? 'wss://' : 'ws://'))}`,
-        `SERVER_TOKEN=${success.client_token}`,
-        `AGENT_ID=${success.allowed_agent_ids[0] ?? ''}`,
-        '',
-      ].join('\n')
-    : [
-        `# vicoop-client env (generated by 'vicoop-client login --owner-session')`,
-        `VICOOP_BRIDGE=${bridgeUrl.replace(/\/$/, '')}`,
-        `VICOOP_OWNER_TOKEN=${success.access_token}`,
-        '',
-      ].join('\n');
-  // Shared atomic write helper: creates a 0o600 temp sibling and renames it
-  // into place, handling Windows' non-overwriting rename so re-running
-  // `login --write-env-file` updates an existing file reliably. Same
-  // semantics saveOwnerSession uses.
-  atomicWriteFile(path, lines, 0o600);
+function writeEnvFile(path: string, success: OwnerSessionSuccess, bridgeUrl: string): void {
+  atomicWriteFile(path, [
+    `# vicoop-client env (generated by 'vicoop-client login')`,
+    `VICOOP_BRIDGE=${bridgeUrl.replace(/\/$/, '')}`,
+    `VICOOP_OWNER_TOKEN=${success.access_token}`,
+    '',
+  ].join('\n'), 0o600);
+}
+
+function saveOwnerSessionBearer(bridgeUrl: string, success: OwnerSessionSuccess): string {
+  const expiresAt = new Date(Date.now() + success.expires_in * 1000).toISOString();
+  const path = defaultStorePath();
+  saveOwnerSession({
+    bridge: bridgeUrl.replace(/\/$/, ''),
+    token: success.access_token,
+    principal_id: success.principal_id,
+    email: success.email,
+    expires_at: expiresAt,
+    saved_at: new Date().toISOString(),
+  }, path);
+  return path;
 }
 
 export async function runLogin(args: string[]): Promise<number> {
@@ -298,19 +209,17 @@ export async function runLogin(args: string[]): Promise<number> {
   process.stderr.write(
     [
       '',
-      'Open the following URL in your browser to authorize this client:',
+      'Open the following URL in your browser to sign in:',
       `  ${device.verification_uri_complete}`,
       '',
       `If the URL is unwieldy, browse to ${device.verification_uri} and enter:`,
       `  ${device.user_code}`,
       '',
-      `Waiting for approval (expires in ${Math.floor(device.expires_in / 60)} min)…`,
+      `Waiting for approval (expires in ${Math.floor(device.expires_in / 60)} min)...`,
       '',
     ].join('\n'),
   );
 
-  // Hard cap polling at the session's expires_in so we don't poll forever
-  // on an abandoned approval.
   const deadline = Date.now() + device.expires_in * 1000;
   let intervalMs = Math.max(device.interval, 1) * 1000;
 
@@ -319,71 +228,23 @@ export async function runLogin(args: string[]): Promise<number> {
     if (result.kind === 'success') {
       const success = result.body;
       process.stderr.write('\nApproved.\n\n');
+      process.stderr.write(
+        `  principal_id     ${success.principal_id}\n` +
+          `  email            ${success.email ?? '(none)'}\n` +
+          `  expires_in       ${success.expires_in}s\n\n`,
+      );
 
-      if (isClientRegister(success)) {
-        process.stderr.write(
-          `  client_id        ${success.client_id}\n` +
-            `  owner_principal  ${success.owner_principal}\n` +
-            `  owner_email      ${success.owner_email ?? '(none)'}\n` +
-            `  client_name      ${success.client_name}\n` +
-            `  allowed_agents   ${success.allowed_agent_ids.join(', ')}\n\n`,
-        );
-        process.stderr.write(
-          'The CLIENT_TOKEN below is shown only once and cannot be retrieved later.\n' +
-            '  Save it now (export to env, write to a vault, etc.).\n\n',
-        );
-
-        if (parsed.envFile) {
-          writeEnvFile(parsed.envFile, success, parsed.bridge);
-          process.stderr.write(`Wrote env block to ${parsed.envFile} (mode 600).\n`);
-        } else if (parsed.json) {
-          process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
-        } else {
-          const wsUrl = parsed.bridge.replace(/^http(s?):\/\//, (_m, s) =>
-            s === 's' ? 'wss://' : 'ws://',
-          );
-          process.stdout.write(
-            [
-              `SERVER_URL=${wsUrl}`,
-              `SERVER_TOKEN=${success.client_token}`,
-              `AGENT_ID=${success.allowed_agent_ids[0] ?? ''}`,
-              '',
-            ].join('\n'),
-          );
-        }
+      if (parsed.envFile) {
+        writeEnvFile(parsed.envFile, success, parsed.bridge);
+        process.stderr.write(`Wrote env block to ${parsed.envFile} (mode 600).\n`);
+      } else if (parsed.json) {
+        process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
       } else {
+        const path = saveOwnerSessionBearer(parsed.bridge, success);
         process.stderr.write(
-          `  principal_id     ${success.principal_id}\n` +
-            `  email            ${success.email ?? '(none)'}\n` +
-            `  expires_in       ${success.expires_in}s\n\n`,
+          `Saved owner-session bearer to ${path} (mode 600).\n` +
+            'Run `vicoop-client setup` to create a bridge client token.\n',
         );
-
-        const expiresAt = new Date(Date.now() + success.expires_in * 1000).toISOString();
-
-        if (parsed.envFile) {
-          writeEnvFile(parsed.envFile, success, parsed.bridge);
-          process.stderr.write(`Wrote env block to ${parsed.envFile} (mode 600).\n`);
-        } else if (parsed.json) {
-          process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
-        } else {
-          // Default for owner-session: persist to ~/.vicoop/owner-session.json so
-          // subsequent admin-management subcommands pick it up automatically. This
-          // mirrors how `gh auth login` plants ~/.config/gh/hosts.yml — no env
-          // wiring required for the common single-host case.
-          const path = defaultStorePath();
-          saveOwnerSession({
-            bridge: parsed.bridge.replace(/\/$/, ''),
-            token: success.access_token,
-            principal_id: success.principal_id,
-            email: success.email,
-            expires_at: expiresAt,
-            saved_at: new Date().toISOString(),
-          }, path);
-          process.stderr.write(
-            `Saved owner-session bearer to ${path} (mode 600).\n` +
-              `Use VICOOP_OWNER_TOKEN / VICOOP_BRIDGE to override per-invocation.\n`,
-          );
-        }
       }
       return 0;
     }
@@ -396,7 +257,6 @@ export async function runLogin(args: string[]): Promise<number> {
       return 1;
     }
     if (result.kind === 'slow_down') {
-      // RFC-8628 §3.5: bump interval by 5 seconds on slow_down.
       intervalMs += 5000;
     }
     if (parsed.pollOnce) return 0;

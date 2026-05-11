@@ -228,7 +228,7 @@ test('subcommand exits 1 with hint when no token is available', async (t) => {
 
   const code = await runListAgents([]);
   assert.equal(code, 1);
-  assert.match(stderr.read(), /vicoop-client login --owner-session/);
+  assert.match(stderr.read(), /vicoop-client login --bridge/);
 });
 
 test('subcommand surfaces network errors as a clean exit-1 instead of crashing', async (t) => {

@@ -4,7 +4,7 @@
 //
 // Resolution order when the CLI needs a token:
 //   1. VICOOP_OWNER_TOKEN env (paired with VICOOP_BRIDGE for the URL)
-//   2. ~/.vicoop/owner-session.json written by `vicoop-client login --owner-session`
+//   2. ~/.vicoop/owner-session.json written by `vicoop-client login`
 //
 // Storage is a single JSON file (chmod 600) rather than a credential keychain
 // because the rest of the client already keeps its bearer in plain env files
@@ -95,7 +95,7 @@ export function saveOwnerSession(session: OwnerSession, path: string = defaultSt
   // Writing fresh + atomic rename avoids both: the resulting file is always
   // mode 0o600 with no partial-write state visible on the canonical path.
   // atomicWriteFile also handles Windows' non-overwriting rename so a
-  // second `login --owner-session` invocation replaces the file cleanly.
+  // second `login` invocation replaces the file cleanly.
   atomicWriteFile(path, JSON.stringify(session, null, 2), 0o600);
 }
 

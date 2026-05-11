@@ -400,7 +400,7 @@ export function mountDeviceFlow(app: Hono, opts: DeviceFlowOptions): void {
         Math.floor((issued.expiresAt.getTime() - Date.now()) / 1000),
       );
       // Owner-session responses surface principal_id + email so the CLI
-      // (`vicoop-client login --owner-session`) can confirm and persist the
+      // (`vicoop-client login --bridge <URL>`) can confirm and persist the
       // logged-in identity. Caller-audience responses stay close to the
       // minimal OAuth shape — third-party caller clients don't need the
       // bridge to echo user PII back, and the agent owner doesn't gain
