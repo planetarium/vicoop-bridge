@@ -59,8 +59,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # The script is idempotent: it reads the current client version
+      # from package.json, looks up the matching release, and exits
+      # cheaply when assets are already complete or the release doesn't
+      # exist yet. Running unconditionally lets a workflow_dispatch
+      # rerun recover from a failure between release creation and asset
+      # upload, where `changeset tag` on rerun would otherwise produce
+      # no `published` signal.
       - name: Upload client release assets
-        if: steps.changesets.outputs.published == 'true'
-        env:
-          PUBLISHED_PACKAGES: ${{ steps.changesets.outputs.publishedPackages }}
         run: ./scripts/upload-client-release-assets.sh

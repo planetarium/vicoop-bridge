@@ -1,34 +1,45 @@
 #!/usr/bin/env bash
-# Runs after changesets/action has pushed the tag and created the
-# GitHub release object. Builds the portable client bundle and attaches
-# `vicoop-bridge-client-<version>.tgz` plus its `.sha256` to that
-# release. The action sets PUBLISHED_PACKAGES to its JSON output; we
-# pick the client entry out of it, so a release that only bumps other
-# packages becomes a no-op here.
+# Idempotent asset converger for the @vicoop-bridge/client release.
+# Runs after changesets/action; reads the current client version from
+# package.json, looks up the matching `@vicoop-bridge/client@<version>`
+# release, and converges to one of three states:
+#
+#   - complete: release has both expected assets → exit 0
+#   - partial:  release exists but assets are missing or stale →
+#               rebuild and `gh release upload --clobber`
+#   - missing:  release doesn't exist yet (no publish this run, or a
+#               different package was published) → exit 0
+#
+# The release object is created by changesets/action (createGithubReleases),
+# so this script only ever attaches assets — it never creates the
+# release. The convergence shape exists so a workflow rerun (e.g.
+# manual workflow_dispatch after an upload-step failure) can finish the
+# job even though `changeset tag` will have nothing to print on rerun.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-PACKAGE_NAME="@vicoop-bridge/client"
+VERSION="$(node -p "require('./packages/client/package.json').version")"
+TAG="@vicoop-bridge/client@${VERSION}"
+ARCHIVE="dist-release/vicoop-bridge-client-${VERSION}.tgz"
+CHECKSUM="${ARCHIVE}.sha256"
+ARCHIVE_NAME="$(basename "${ARCHIVE}")"
+CHECKSUM_NAME="$(basename "${CHECKSUM}")"
 
-VERSION="$(jq -r --arg name "$PACKAGE_NAME" \
-  'map(select(.name == $name)) | .[0].version // empty' \
-  <<<"${PUBLISHED_PACKAGES:-[]}")"
-
-if [[ -z "${VERSION}" ]]; then
-  echo "${PACKAGE_NAME} not in this publish batch — nothing to upload"
+if ! existing_assets="$(gh release view "${TAG}" --json assets --jq '.assets[].name' 2>/dev/null)"; then
+  echo "release ${TAG} does not exist — nothing to upload (yet)"
   exit 0
 fi
 
-TAG="${PACKAGE_NAME}@${VERSION}"
-ARCHIVE="dist-release/vicoop-bridge-client-${VERSION}.tgz"
-CHECKSUM="${ARCHIVE}.sha256"
+if grep -qx "${ARCHIVE_NAME}" <<<"${existing_assets}" \
+    && grep -qx "${CHECKSUM_NAME}" <<<"${existing_assets}"; then
+  echo "release ${TAG} already has ${ARCHIVE_NAME} + ${CHECKSUM_NAME} — nothing to do"
+  exit 0
+fi
 
-pnpm --filter @vicoop-bridge/protocol --filter "${PACKAGE_NAME}" build
+echo "release ${TAG} missing one or both expected assets — building and uploading"
+pnpm --filter @vicoop-bridge/protocol --filter @vicoop-bridge/client build
 ./scripts/package-client-release.sh "${TAG}"
-
-# --clobber so reruns of this step (manual workflow_dispatch, retried
-# job) converge instead of erroring on already-uploaded asset names.
 gh release upload "${TAG}" --clobber "${ARCHIVE}" "${CHECKSUM}"
