@@ -306,6 +306,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           agentId: b.agentId,
           taskId: frame.taskId,
           state: frame.status.state,
+          ...(b.principalId !== undefined ? { principalId: b.principalId } : {}),
         });
         break;
       }
@@ -335,6 +336,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           taskId: frame.taskId,
           errorCode: frame.error.code,
           errorMessage: truncate(frame.error.message, 256),
+          ...(b.principalId !== undefined ? { principalId: b.principalId } : {}),
         });
         break;
       }

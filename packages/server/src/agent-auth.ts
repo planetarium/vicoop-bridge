@@ -20,6 +20,42 @@ export function getCaller(c: Context): VerifiedCaller | undefined {
 
 const WWW_AUTH_REALM = 'vicoop-bridge';
 
+// Short opaque correlation id stamped into both the structured rejection log
+// and the JSON-RPC error body's `data` field so a caller transcript line
+// like "Caller not authorized for this agent (rejectionId=rej_a1b2c3d4)" can
+// be grepped 1:1 against the bridge's `agent_request_rejected` log. 32 bits
+// of randomness is short enough to be useful in transcripts and large enough
+// that nearby-in-time collisions are vanishingly unlikely.
+//
+// Exported for unit tests.
+export function newRejectionId(): string {
+  return `rej_${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`;
+}
+
+interface RejectionBody {
+  rejectionId: string;
+}
+
+function rejectionErrorBody(
+  code: number,
+  message: string,
+  rejectionId: string,
+): {
+  jsonrpc: '2.0';
+  id: null;
+  error: { code: number; message: string; data: RejectionBody };
+} {
+  return {
+    jsonrpc: '2.0',
+    id: null,
+    error: {
+      code,
+      message,
+      data: { rejectionId },
+    },
+  };
+}
+
 // Cap the error_description so a long upstream err.message can't push the
 // WWW-Authenticate header past common proxy/server limits (often ~8KB total).
 const ERROR_DESCRIPTION_MAX_LEN = 200;
@@ -99,12 +135,13 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
     const agentId = c.req.param('id')!;
     const conn = registry.getAgent(agentId);
     if (!conn) {
-      logEvent('agent_request_rejected', { agentId, reason: 'agent_not_connected' });
-      return c.json({
-        jsonrpc: '2.0',
-        id: null,
-        error: { code: -32000, message: 'Agent not connected' },
-      }, 404);
+      const rejectionId = newRejectionId();
+      logEvent('agent_request_rejected', {
+        agentId,
+        reason: 'agent_not_connected',
+        rejectionId,
+      });
+      return c.json(rejectionErrorBody(-32000, 'Agent not connected', rejectionId), 404);
     }
 
     c.set('agentConn', conn);
@@ -116,18 +153,16 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
     const authHeader = c.req.header('Authorization');
     const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
     if (!bearerToken) {
-      logEvent('agent_request_rejected', { agentId, reason: 'missing_bearer' });
+      const rejectionId = newRejectionId();
+      logEvent('agent_request_rejected', {
+        agentId,
+        reason: 'missing_bearer',
+        rejectionId,
+      });
       // Per RFC 6750 §3.1, no error code when the request lacks any
       // authentication information — only the challenge realm.
       setWWWAuthenticate(c);
-      return c.json({
-        jsonrpc: '2.0',
-        id: null,
-        error: {
-          code: -32001,
-          message: missingBearerMessage,
-        },
-      }, 401);
+      return c.json(rejectionErrorBody(-32001, missingBearerMessage, rejectionId), 401);
     }
 
     let caller: VerifiedCaller;
@@ -135,9 +170,11 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
       try {
         caller = await verifyCallerToken(opts.sql, bearerToken);
       } catch (err) {
+        const rejectionId = newRejectionId();
         logEvent('agent_request_rejected', {
           agentId,
           reason: 'invalid_token',
+          rejectionId,
           detail: truncate((err as Error).message, 256),
         });
         // Don't surface raw err.message in either WWW-Authenticate (commonly
@@ -149,11 +186,14 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
           error: 'invalid_token',
           description: 'invalid bearer token',
         });
-        return c.json({
-          jsonrpc: '2.0',
-          id: null,
-          error: { code: -32001, message: `Invalid bearer token. Acquire one via ${acquisitionHint}.` },
-        }, 401);
+        return c.json(
+          rejectionErrorBody(
+            -32001,
+            `Invalid bearer token. Acquire one via ${acquisitionHint}.`,
+            rejectionId,
+          ),
+          401,
+        );
       }
     } else if (bearerToken.startsWith(OWNER_SESSION_PREFIX)) {
       // Owner-session tokens are for self-service surfaces (admin agent /
@@ -162,19 +202,24 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
       // this, the SIWE-bearer branch below would try to decode the opaque
       // owner-session token as base64url JSON and fail with the misleading
       // "SIWE bearer token is not valid JSON".
-      logEvent('agent_request_rejected', { agentId, reason: 'owner_session_on_caller_route' });
+      const rejectionId = newRejectionId();
+      logEvent('agent_request_rejected', {
+        agentId,
+        reason: 'owner_session_on_caller_route',
+        rejectionId,
+      });
       setWWWAuthenticate(c, {
         error: 'invalid_token',
         description: `${OWNER_SESSION_PREFIX}* tokens are not accepted on /agents/:id`,
       });
-      return c.json({
-        jsonrpc: '2.0',
-        id: null,
-        error: {
-          code: -32001,
-          message: `Invalid bearer token: ${OWNER_SESSION_PREFIX}* (owner-session) tokens are not accepted on /agents/:id. Acquire one via ${acquisitionHint}.`,
-        },
-      }, 401);
+      return c.json(
+        rejectionErrorBody(
+          -32001,
+          `Invalid bearer token: ${OWNER_SESSION_PREFIX}* (owner-session) tokens are not accepted on /agents/:id. Acquire one via ${acquisitionHint}.`,
+          rejectionId,
+        ),
+        401,
+      );
     } else if (opts.siweDomain) {
       // Stateless SIWE bearer per siwe-bearer-auth/v0.1. No callers row is
       // created — revocation is at the principal level (remove from
@@ -183,9 +228,11 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
         const verified = await verifySiweBearerToken(bearerToken, { domain: opts.siweDomain });
         caller = { principalId: `eth:${verified.address}` };
       } catch (err) {
+        const rejectionId = newRejectionId();
         logEvent('agent_request_rejected', {
           agentId,
           reason: 'invalid_siwe_bearer',
+          rejectionId,
           detail: truncate((err as Error).message, 256),
         });
         // Stable public strings in both the header and the JSON body —
@@ -197,47 +244,53 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
           error: 'invalid_token',
           description: 'invalid SIWE bearer',
         });
-        return c.json({
-          jsonrpc: '2.0',
-          id: null,
-          error: {
-            code: -32001,
-            message: `Invalid bearer token. Acquire one via ${acquisitionHint}.`,
-          },
-        }, 401);
+        return c.json(
+          rejectionErrorBody(
+            -32001,
+            `Invalid bearer token. Acquire one via ${acquisitionHint}.`,
+            rejectionId,
+          ),
+          401,
+        );
       }
     } else {
-      logEvent('agent_request_rejected', { agentId, reason: 'bad_token_prefix' });
+      const rejectionId = newRejectionId();
+      logEvent('agent_request_rejected', {
+        agentId,
+        reason: 'bad_token_prefix',
+        rejectionId,
+      });
       setWWWAuthenticate(c, {
         error: 'invalid_token',
         description: `expected ${CALLER_TOKEN_PREFIX}* prefix`,
       });
-      return c.json({
-        jsonrpc: '2.0',
-        id: null,
-        error: {
-          code: -32001,
-          message: `Invalid bearer token: expected ${CALLER_TOKEN_PREFIX}* prefix. Acquire one via ${acquisitionHint}.`,
-        },
-      }, 401);
+      return c.json(
+        rejectionErrorBody(
+          -32001,
+          `Invalid bearer token: expected ${CALLER_TOKEN_PREFIX}* prefix. Acquire one via ${acquisitionHint}.`,
+          rejectionId,
+        ),
+        401,
+      );
     }
 
     const allowed = conn.allowedCallers.some((entry) => matchPrincipal(entry, caller));
     if (!allowed) {
+      const rejectionId = newRejectionId();
       logEvent('agent_request_rejected', {
         agentId,
         reason: 'caller_not_authorized',
+        rejectionId,
         principalId: caller.principalId,
       });
       setWWWAuthenticate(c, {
         error: 'insufficient_scope',
         description: 'caller not in allowed list',
       });
-      return c.json({
-        jsonrpc: '2.0',
-        id: null,
-        error: { code: -32001, message: 'Caller not authorized for this agent' },
-      }, 403);
+      return c.json(
+        rejectionErrorBody(-32001, 'Caller not authorized for this agent', rejectionId),
+        403,
+      );
     }
 
     c.set('caller', caller);

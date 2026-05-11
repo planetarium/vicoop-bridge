@@ -20,7 +20,7 @@ import {
   listCallers,
   removeCaller,
 } from './admin-api.js';
-import { agentAuthMiddleware, getAgentConn } from './agent-auth.js';
+import { agentAuthMiddleware, getAgentConn, getCaller } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
 import { mountDeviceUi } from './auth/device-ui.js';
@@ -52,6 +52,35 @@ export interface ServerHttpOptions {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Drop caller-supplied `_`-prefixed keys from `message.metadata` in place at
+ * the HTTP boundary. The `_*` convention marks bridge-internal context
+ * (`_principalId`, `_bearerToken`, `_email`) that downstream code — the
+ * executor's binding stamp, the admin executor's auth resolve — treats as
+ * trusted. Without this strip, a caller could put `_principalId:
+ * eth:victim` in their request body and it would (on public agents, where
+ * the auth middleware doesn't inject one) flow through to the task binding
+ * and downstream `task_*` logs as if it had been verified.
+ *
+ * Mutates `message.metadata` so the existing downstream code (which reads
+ * `message.metadata` directly) sees the scrubbed object. Removes the
+ * metadata field entirely when only `_*` keys were present, so the WS frame
+ * keeps its pre-existing wire shape for messages that arrived bare.
+ *
+ * Exported for unit tests.
+ */
+export function stripCallerSuppliedInternalKeys(message: Record<string, unknown>): void {
+  if (!isRecord(message.metadata)) return;
+  for (const key of Object.keys(message.metadata)) {
+    if (key.startsWith('_')) {
+      delete (message.metadata as Record<string, unknown>)[key];
+    }
+  }
+  if (Object.keys(message.metadata).length === 0) {
+    delete message.metadata;
+  }
 }
 
 export function createHttpApp(opts: ServerHttpOptions): Hono {
@@ -475,9 +504,15 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   });
   app.post('/agents/:id', authMw, async (c) => {
     const conn = getAgentConn(c);
+    // caller is undefined for public agents (allowedCallers.length === 0) —
+    // the middleware short-circuits before parsing the bearer in that case.
+    // For restricted agents it's always populated; otherwise the middleware
+    // would have returned 401/403 before reaching this handler.
+    const caller = getCaller(c);
     logEvent('agent_request', {
       agentId: conn.agentId,
       hasAuth: !!c.req.header('Authorization'),
+      ...(caller !== undefined ? { principalId: caller.principalId } : {}),
     });
 
     const rawBody = await c.req.text();
@@ -487,11 +522,32 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_LEGACY_HEADER)),
     ];
     const message = parsed.params?.message;
-    if (requestedExtensions.length > 0 && isRecord(message)) {
-      const existing = Array.isArray(message.extensions)
-        ? message.extensions.filter((v: unknown): v is string => typeof v === 'string')
-        : [];
-      message.extensions = [...new Set([...existing, ...requestedExtensions])];
+    if (isRecord(message)) {
+      if (requestedExtensions.length > 0) {
+        const existing = Array.isArray(message.extensions)
+          ? message.extensions.filter((v: unknown): v is string => typeof v === 'string')
+          : [];
+        message.extensions = [...new Set([...existing, ...requestedExtensions])];
+      }
+      // Drop any caller-supplied `_*` metadata BEFORE injecting the verified
+      // `_principalId`. Without this scrub, a public-agent caller (where
+      // `caller` is undefined and the injection block below is a no-op)
+      // could put `_principalId: eth:victim` in their request body and have
+      // it stamped into the binding + downstream `task_*` logs as if it had
+      // been verified. The strip runs unconditionally so it also covers the
+      // restricted-agent case for any future `_*` consumer beyond
+      // `_principalId`.
+      stripCallerSuppliedInternalKeys(message);
+      // Stash caller identity under the `_principalId` convention so the
+      // WSForwardingExecutor can thread it into the task binding for
+      // accept-path log correlation (issue #128). Stripped before the WS
+      // frame leaves the bridge — the connected client never sees `_*` keys.
+      if (caller !== undefined) {
+        message.metadata = {
+          ...(isRecord(message.metadata) ? message.metadata : {}),
+          _principalId: caller.principalId,
+        };
+      }
     }
     const handler = getHandlerForConn(conn);
     const result = await handler.handle(parsed);

@@ -30,6 +30,12 @@ export interface TaskBinding {
   taskId: string;
   contextId: string;
   sink: TaskSink;
+  // principalId of the caller that originated this task (post-auth). Optional
+  // because public agents (allowedCallers.length === 0) skip the auth
+  // middleware entirely, so there is no verified caller to record. The admin
+  // route does not create TaskBindings — it has its own executor
+  // (AdminA2XExecutor) that never calls registry.bindTask().
+  principalId?: string;
 }
 
 export type CallerChangeListener = (agentId: string, callers: string[]) => void;
