@@ -194,10 +194,16 @@ prints a warning that the agent will be public until you restrict callers:
 > your own deployment, deploy the matching server/schema before this step.
 
 ```text
-SERVER_URL=wss://vicoop-bridge-server.fly.dev
-SERVER_TOKEN=<64-hex CLIENT_TOKEN — shown ONLY here>
-AGENT_ID=<your agent id>
+export SERVER_URL=wss://vicoop-bridge-server.fly.dev
+export SERVER_TOKEN=<64-hex CLIENT_TOKEN — shown ONLY here>
+export AGENT_ID=<your agent id>
 ```
+
+The `export` prefix lets `. "$INSTALL_DIR/vicoop-client.env"` propagate the
+assignments to the `vicoop-client` child process. Bundles older than this
+release wrote bare `KEY=VALUE` lines; if a pre-existing env file fails with
+`missing required: agentId, server`, add `export ` to each line or
+regenerate the file with the current `setup`.
 
 > ⚠ The `CLIENT_TOKEN` is unrecoverable after this single output. The env
 > file is the only place it persists; back it up if you need to rotate

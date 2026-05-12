@@ -73,8 +73,14 @@ test('setup registers client with saved owner-session and writes daemon env', as
   assert.equal(calls[0].url, 'https://bridge.test/graphql');
   assert.equal(calls[0].authorization, 'Bearer vbc_owner_test');
   assert.match(calls[0].body, /registerClient/);
-  assert.match(readFileSync(envFile, 'utf8'), /SERVER_TOKEN=client-token/);
-  assert.match(readFileSync(envFile, 'utf8'), /AGENT_ID=agent-1/);
+  const envBody = readFileSync(envFile, 'utf8');
+  assert.match(envBody, /SERVER_TOKEN=client-token/);
+  assert.match(envBody, /AGENT_ID=agent-1/);
+  // Lines must start with `export ` so `. vicoop-client.env` propagates the
+  // assignments to the daemon child process (see #134).
+  assert.match(envBody, /^export SERVER_URL=/m);
+  assert.match(envBody, /^export SERVER_TOKEN=/m);
+  assert.match(envBody, /^export AGENT_ID=/m);
   assert.match(stderr, /client_id\s+client-1/);
   assert.match(stderr, /The CLIENT_TOKEN is shown only once/);
   assert.match(stderr, /Save the setup output or env file now/);
