@@ -67,8 +67,13 @@ Portable release bundle for the standalone client daemon.
 export BRIDGE_URL=https://vicoop-bridge-server.fly.dev
 export AGENT_ID=my-agent
 
-./bin/vicoop-client login \\
-  --bridge "\$BRIDGE_URL" \\
+# 1. Sign in as the client owner (saves an owner-session bearer to
+#    ~/.vicoop/owner-session.json; admin subcommands pick it up).
+./bin/vicoop-client login --bridge "\$BRIDGE_URL"
+
+# 2. Register a bridge client and write its one-time CLIENT_TOKEN into a
+#    daemon env file (mode 600, export'd + single-quoted, safe to source).
+./bin/vicoop-client setup \\
   --client-name "my client" \\
   --agent-ids "\$AGENT_ID" \\
   --write-env-file ./vicoop-client.env
