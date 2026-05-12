@@ -204,8 +204,13 @@ assignments to the `vicoop-client` child process; values are single-quoted
 so any shell metacharacter that ends up in an agent id (or future field)
 stays a literal when the file is sourced. Bundles older than this release
 wrote bare unquoted `KEY=VALUE` lines; if a pre-existing env file fails
-with `missing required: agentId, server`, add `export ` to each line or
-regenerate the file with the current `setup`.
+with `missing required: agentId, server`, **regenerate it with the
+current `setup --write-env-file`** so both the `export` and the
+single-quoting come back in one step. Hand-editing the old file by
+prepending `export ` works only when every value is a tame identifier
+(alphanumerics, `-`, `_`, `.`, `:`, `/`); a value containing `$`, `` ` ``,
+`'`, or whitespace will execute or break when sourced unless you also
+wrap it as `export KEY='value'` with any embedded `'` escaped as `'\''`.
 
 > ⚠ The `CLIENT_TOKEN` is unrecoverable after this single output. The env
 > file is the only place it persists; back it up if you need to rotate
