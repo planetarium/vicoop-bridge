@@ -1,15 +1,14 @@
 # Install vicoop-bridge-client
 
-Onboarding guide for connecting a local A2A backend (OpenClaw, Claude Code,
-with `echo` available for testing) to a deployed vicoop-bridge server. The
+Onboarding guide for connecting a local A2A backend (OpenClaw, Claude Code, or
+Codex CLI; `echo` is available for testing) to a deployed vicoop-bridge server. The
 first target is a verified foreground `vicoop-client` process on your host
 that bridges inbound A2A traffic at `POST <bridge>/agents/<your-agent-id>` to
 your local backend. Persistent service setup is optional once the foreground
 run works.
 
-Additional backends (Codex, ...) are described in `docs/design.md` §5 but are
-not in the published client bundle yet. The released client currently
-registers `echo`, `openclaw`, and `claude`.
+Custom backends are described in `docs/design.md` §5. The released client
+currently registers `echo`, `openclaw`, `claude`, and `codex`.
 
 This doc covers the **post-release install path** (the `install.sh`
 one-liner fetching a published `@vicoop-bridge/client@*` bundle). Contrast with:
@@ -56,6 +55,8 @@ one-liner fetching a published `@vicoop-bridge/client@*` bundle). Contrast with:
   task execution still works via the terminal-artifact fallback.
 - For the Claude backend specifically: the local `claude` CLI installed and
   authenticated (`claude --version` should succeed).
+- For the Codex backend specifically: the local `codex` CLI installed and
+  authenticated (`codex --version` should succeed).
 
 ## Step 1 — Install the client bundle
 
@@ -87,6 +88,7 @@ $INSTALL_DIR/
 ├── dist/                    # compiled JS
 ├── cards/openclaw.json      # OpenClaw example card
 ├── cards/claude.json        # Claude Code example card
+├── cards/codex.json         # Codex CLI example card
 ├── cards/echo.json          # Echo test card
 ├── node_modules/            # pruned prod deps
 └── package.json
@@ -267,6 +269,7 @@ Pick the local backend this client should drive:
 
 - `openclaw` — OpenClaw gateway at `OPENCLAW_GATEWAY_URL`
 - `claude` — local Claude Code CLI
+- `codex` — local Codex CLI
 - `echo` — smoke-test backend
 
 For these built-in backends, you normally do **not** pass an agent card file.
@@ -277,7 +280,7 @@ metadata/capability fixes on the faster server deploy path instead of
 requiring every operator to upgrade their client bundle.
 
 The bundle still ships backend-specific starter cards under
-`$INSTALL_DIR/cards/` (`openclaw.json`, `claude.json`, `echo.json`) for
+`$INSTALL_DIR/cards/` (`openclaw.json`, `claude.json`, `codex.json`, `echo.json`) for
 operator overrides and compatibility with older bridge servers. Set
 `AGENT_CARD` only when you intentionally want to override the server card,
 for example to:
@@ -438,6 +441,28 @@ Typical follow-ups from this output:
 
 `--json` emits a machine-readable record of all the same fields for scripts.
 
+### Codex-specific env
+
+If you're running the Codex backend, set `BACKEND=codex` and optionally set
+`CODEX_CWD` so Codex works against a different repository than the directory
+where `vicoop-client` itself was started:
+
+```sh
+. "$INSTALL_DIR/vicoop-client.env"
+
+BACKEND=codex \
+CODEX_CWD="$HOME/vicoop-bridge" \
+CODEX_SANDBOX_MODE=workspace-write \
+  "$INSTALL_DIR/bin/vicoop-client"
+```
+
+`CODEX_CWD` defaults to the current working directory of the client process.
+The v1 backend accepts text plus inline image `file.bytes` inputs and returns
+text output. `CODEX_SANDBOX_MODE` is optional and accepts `read-only`,
+`workspace-write`, or `danger-full-access`; the client passes it to Codex as
+`-c sandbox_mode="<mode>"` so the same setting applies to fresh and resumed
+Codex sessions.
+
 ## Optional: persistence
 
 Only set up persistence after the foreground run connects and the agent
@@ -574,7 +599,7 @@ The upgrade command:
 3. Extracts into `$INSTALL_DIR.new/` (sibling of the current install).
 4. Copies operator files that don't ship with the bundle — notably any
    `cards/*.json` you added or files placed directly under `$INSTALL_DIR`.
-   Shipped cards (`openclaw.json`, `echo.json`, `claude.json`) are kept for
+   Shipped cards (`openclaw.json`, `echo.json`, `claude.json`, `codex.json`) are kept for
    optional overrides and older server compatibility; they are always
    replaced with the new release's versions.
 5. Runs `node $INSTALL_DIR.new/dist/cli.js --version` as a healthcheck. If it
@@ -692,9 +717,9 @@ device flow and can use the admin agent the same way; admin **scope**
   `["openclaw-a", "openclaw-b", ...]`) and run one `vicoop-client` per id.
   No token rotation needed.
 - **Different backends**: in the published bundle today, pass
-  `--backend openclaw`, `--backend claude`, or `--backend echo`. Set
+  `--backend openclaw`, `--backend claude`, `--backend codex`, or `--backend echo`. Set
   `--card`/`AGENT_CARD` only when you need to override the server's
-  canonical card. Codex and other future backends are still described in
+  canonical card. Custom/future backends are still described in
   `docs/design.md` §5 but are not shipped yet.
 - **Audit/revoke access**: the admin agent exposes `list_caller_tokens`,
   `list_callers`, and `revoke_caller_token` tools; see the tool list in

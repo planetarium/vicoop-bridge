@@ -19,6 +19,19 @@ test('resolves canonical server card from backendKind when inline card is absent
   );
 });
 
+test('resolves canonical codex server card from backendKind', () => {
+  const result = resolveHelloAgentCard(frame({ backendKind: 'codex' }));
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.source, 'canonical');
+  assert.equal(result.ok && result.agentCard.name, 'codex');
+  assert.deepEqual(
+    result.ok && result.agentCard.defaultInputModes,
+    ['text/plain', 'image/png', 'image/jpeg', 'image/gif', 'image/webp'],
+  );
+  assert.deepEqual(result.ok && result.agentCard.defaultOutputModes, ['text/plain']);
+});
+
 test('inline card overrides backendKind', () => {
   const inline = {
     name: 'operator-custom',

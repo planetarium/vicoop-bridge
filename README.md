@@ -47,4 +47,5 @@ bundle being released:
 
 ## Status
 
-Pre-implementation. Design phase only.
+Active development. The client currently ships `echo`, `openclaw`, `claude`,
+and `codex` backends.

@@ -1,0 +1,34 @@
+{
+  "name": "codex",
+  "description": "OpenAI Codex CLI agent. Spawns the local `codex` binary per task and streams agent messages back as A2A text artifacts. Accepts text and inline image inputs.",
+  "version": "0.0.1",
+  "protocolVersion": "0.3.0",
+  "capabilities": {
+    "streaming": true,
+    "extensions": [
+      {
+        "uri": "https://github.com/a2aproject/a2a-samples/extensions/traceability/v1",
+        "description": "Opt-in execution trace stream for Codex command executions.",
+        "required": false
+      }
+    ]
+  },
+  "defaultInputModes": [
+    "text/plain",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp"
+  ],
+  "defaultOutputModes": [
+    "text/plain"
+  ],
+  "skills": [
+    {
+      "id": "chat",
+      "name": "chat",
+      "description": "Ask a question or give an instruction in natural language; the Codex CLI responds with text. Include image (image/{png,jpeg,gif,webp}) parts as inline `file.bytes`.",
+      "tags": ["chat", "assistant", "codex"]
+    }
+  ]
+}
