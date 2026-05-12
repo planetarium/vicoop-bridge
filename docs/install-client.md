@@ -1,7 +1,7 @@
 # Install vicoop-bridge-client
 
-Onboarding guide for connecting a local A2A backend (OpenClaw, Claude Code,
-Codex CLI, with `echo` available for testing) to a deployed vicoop-bridge server. The
+Onboarding guide for connecting a local A2A backend (OpenClaw, Claude Code, or
+Codex CLI; `echo` is available for testing) to a deployed vicoop-bridge server. The
 first target is a verified foreground `vicoop-client` process on your host
 that bridges inbound A2A traffic at `POST <bridge>/agents/<your-agent-id>` to
 your local backend. Persistent service setup is optional once the foreground

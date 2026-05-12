@@ -102,9 +102,10 @@ function parseCodexSandboxMode(raw: string | undefined): CodexSandboxMode | unde
   if (CODEX_SANDBOX_MODES.has(trimmed as CodexSandboxMode)) {
     return trimmed as CodexSandboxMode;
   }
-  throw new Error(
-    `CODEX_SANDBOX_MODE must be one of: ${Array.from(CODEX_SANDBOX_MODES).join(', ')}`,
+  console.error(
+    `CODEX_SANDBOX_MODE must be one of: ${Array.from(CODEX_SANDBOX_MODES).join(', ')} (got ${JSON.stringify(trimmed)})`,
   );
+  process.exit(1);
 }
 
 function pickBackend(name: string, args: Args): Backend {
