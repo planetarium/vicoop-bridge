@@ -38,8 +38,8 @@ two layers in the same `--settings` JSON:
    Claude's own internal file tools.
 
 A vetted starter profile that keeps common dev tooling (`gh`, `git`,
-`npm`) working while blocking SSH keys, cloud credentials, `.env`
-files, and DNS-shaped exfil tools (CVE-2025-55284 pattern):
+`npm`/`pnpm`) working while blocking SSH keys, cloud credentials,
+`.env` files, and DNS-shaped exfil tools (CVE-2025-55284 pattern):
 
 ```json
 {
@@ -49,9 +49,16 @@ files, and DNS-shaped exfil tools (CVE-2025-55284 pattern):
     "allowUnsandboxedCommands": false,
     "filesystem": {
       "denyRead": ["~/.ssh", "~/.aws", "~/.gnupg", "~/.netrc"],
-      "allowWrite": ["/tmp/vicoop"]
+      "allowWrite": ["/tmp/vicoop", "~/.npm", "~/.cache/pnpm"]
     },
-    "network": { "allowManagedDomainsOnly": true }
+    "network": {
+      "allowManagedDomainsOnly": true,
+      "allowedDomains": [
+        "github.com", "api.github.com", "codeload.github.com",
+        "objects.githubusercontent.com", "uploads.github.com",
+        "registry.npmjs.org"
+      ]
+    }
   },
   "permissions": {
     "deny": [
@@ -71,6 +78,22 @@ proxy does not terminate TLS), and `allowUnsandboxedCommands:false`
 is required to neutralise the documented `dangerouslyDisableSandbox`
 escape hatch (the Ona writeup showed Claude self-disabling the
 sandbox when caught).
+
+### Non-obvious gotchas (verified empirically on Seatbelt + claude 2.1.139)
+
+- **`allowedDomains` must be nested under `sandbox.network`.** Placing
+  it at `sandbox.allowedDomains` is silently ignored — every outbound
+  request still gets a proxy 403. Easy to miss because no error fires.
+- **`npm`/`pnpm` need their cache dirs in `allowWrite`.** With only
+  `/tmp/vicoop` allowed, even `npm view <pkg>` fails with EPERM at the
+  cache-write step _after_ the registry fetch succeeds. Add `~/.npm`
+  and/or `~/.cache/pnpm`.
+- **`gh` cannot read its macOS Keychain token under Seatbelt.**
+  `gh auth status` fails regardless of network policy. If the agent
+  needs `gh`, inject the token via `GH_TOKEN` env on the systemd unit
+  (a fine-grained PAT scoped to the repos the agent actually touches)
+  — matches Anthropic's recommended "credential-injecting proxy"
+  pattern.
 
 ### Observability via OpenTelemetry
 
