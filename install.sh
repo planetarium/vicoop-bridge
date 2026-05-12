@@ -417,6 +417,34 @@ BACKEND=openclaw
 #OPENCLAW_GATEWAY_TOKEN=
 #OPENCLAW_AGENT=main
 #OPENCLAW_TASK_TIMEOUT_MS=
+
+# --- Claude-backend-only (uncomment if BACKEND=claude) ---
+# Working directory for the spawned claude subprocess. Defaults to the
+# daemon's pwd. Set this to a dedicated work tree so sandbox.filesystem
+# default write rules (cwd-only) and Read tool defaults are scoped to a
+# directory that does NOT contain operator credentials.
+#CLAUDE_CWD=/srv/agent-work
+
+# Inline --settings JSON forwarded to every \`claude -p\` (issue #138).
+# Enables the OS-level sandbox (Seatbelt on macOS, bubblewrap on Linux)
+# AND permission-rule deny lists for Claude's internal Read/Edit (which
+# the OS sandbox does not cover). The example below is a starter profile
+# vetted against gh/git/npm — broaden filesystem.allowRead and
+# network.allowedDomains as your agent's toolchain requires. Single line
+# only (systemd EnvironmentFile is one assignment per line); compact your
+# JSON before pasting.
+#CLAUDE_SETTINGS_JSON={"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false,"filesystem":{"denyRead":["~/.ssh","~/.aws","~/.gnupg","~/.netrc"],"allowWrite":["/tmp/vicoop"]},"network":{"allowManagedDomainsOnly":true}},"permissions":{"deny":["Read(~/.ssh/**)","Read(~/.aws/**)","Read(~/.netrc)","Read(**/.env*)","Bash(ping:*)","Bash(nslookup:*)","Bash(dig:*)","Bash(host:*)","Bash(curl:*)","Bash(wget:*)","Bash(nc:*)","Bash(socat:*)"]}}
+
+# --- Observability (optional, OpenTelemetry) ---
+# claude-code is OTEL-native. The bridge daemon just inherits these
+# variables and claude exports tool-call / prompt traces directly. Point
+# OTEL_EXPORTER_OTLP_ENDPOINT at your collector and the SIEM gets a
+# queryable, tamper-evident audit trail (the agent cannot suppress
+# exported spans). All four vars are needed for full fidelity.
+#OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.local:4317
+#OTEL_LOG_TOOL_DETAILS=1
+#OTEL_LOG_TOOL_CONTENT=1
+#OTEL_LOG_USER_PROMPTS=1
 ENVF
     env_created="new"
   else
