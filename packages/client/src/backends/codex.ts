@@ -546,15 +546,18 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
           rollbackFreshThread();
           rollbackResumeRefresh();
           const detail = stderrTail.trim();
-          const sigPart = exit.signal ? ` (signal ${exit.signal})` : '';
           const detailPart = detail ? `: ${detail.slice(-500)}` : '';
           const stdinPart = stdinError ? ` [stdin: ${errorMessage(stdinError)}]` : '';
+          const exitMessage =
+            exit.code === null && exit.signal
+              ? `codex terminated by signal ${exit.signal}${detailPart}${stdinPart}`
+              : `codex exited with code ${exit.code}${exit.signal ? ` (signal ${exit.signal})` : ''}${detailPart}${stdinPart}`;
           emit({
             type: 'task.fail',
             taskId: task.taskId,
             error: {
               code: 'codex_exit_nonzero',
-              message: `codex exited with code ${exit.code}${sigPart}${detailPart}${stdinPart}`,
+              message: exitMessage,
             },
           });
           return;

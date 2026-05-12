@@ -429,6 +429,26 @@ test('nonzero exit emits task.fail with stderr tail', async () => {
   assert.match(fail.error.message, /auth required/);
 });
 
+test('signal exit emits task.fail without code null wording', async () => {
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      child.emitStderr('codex: interrupted\n');
+      setImmediate(() => child.finish(null, 'SIGTERM'));
+    });
+  });
+
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('x'), emit, NEVER);
+
+  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
+  assert.ok(fail);
+  assert.equal(fail.error.code, 'codex_exit_nonzero');
+  assert.match(fail.error.message, /terminated by signal SIGTERM/);
+  assert.doesNotMatch(fail.error.message, /code null/);
+  assert.match(fail.error.message, /interrupted/);
+});
+
 test('abort kills the child and emits canceled completion', async () => {
   const fake = makeFakeSpawn((child) => {
     setImmediate(() => {
