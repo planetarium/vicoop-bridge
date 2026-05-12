@@ -78,6 +78,17 @@ export interface ClaudeBackendOptions {
   // directly instead of attempting an outbound A2A call to its own address.
   // See issue #128 for the failure mode this prevents.
   identity?: AgentIdentity;
+  // Inline Claude Code settings JSON forwarded to each spawned `claude` via
+  // `--settings <json>`. Primary use case is enabling the OS-level sandbox
+  // (Seatbelt on macOS, bubblewrap on Linux) in `-p` mode, where the
+  // `/sandbox` slash command is unavailable. See issue #138.
+  //
+  // The object is serialized verbatim — the backend does not validate shape
+  // or merge defaults. Operators that want sandbox-on-by-default with the
+  // local `send_file` MCP server reachable must include the loopback host in
+  // `sandbox.network` themselves; the URL is dynamic per task so the backend
+  // cannot pre-populate it without rewriting the operator's JSON.
+  settings?: Record<string, unknown>;
 }
 
 // Kept short and behaviour-focused. The risk we're guarding against is
@@ -510,6 +521,12 @@ export function createClaudeBackend(
   const identityArgs: readonly string[] = opts.identity
     ? ['--append-system-prompt', buildSelfIdentitySystemPrompt(opts.identity)]
     : [];
+  // Serialize once at backend construction so per-task spawn stays cheap and
+  // a malformed settings object (e.g. a circular reference) fails loud at
+  // setup time rather than producing a corrupted argv on the first task.
+  const settingsArgs: readonly string[] = opts.settings
+    ? ['--settings', JSON.stringify(opts.settings)]
+    : [];
 
   // Lazy: first task that needs the MCP server starts it; backends that
   // never see send_file enabled don't open a port.
@@ -640,6 +657,7 @@ export function createClaudeBackend(
             ]
           : []),
         ...identityArgs,
+        ...settingsArgs,
         ...extraArgs,
       ];
 
