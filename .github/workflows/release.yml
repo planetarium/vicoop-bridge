@@ -20,6 +20,11 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          # Needed so `changeset tag` sees already-released tags as
+          # existing — otherwise it would re-tag HEAD with a name that
+          # already points at a different commit on the remote, and the
+          # subsequent `git push` would fail.
+          fetch-tags: true
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v5
@@ -36,16 +41,30 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # When pending changesets exist, this opens / refreshes the
-      # "Version Packages" PR. When that PR is merged (no pending
-      # changesets remain), `publish` runs scripts/changesets-publish.sh,
-      # which builds the bundle and creates the
-      # @vicoop-bridge/client@* release.
-      - name: Version PR or publish client release
+      # "Version Packages" PR. When that PR merges (no pending changesets
+      # remain), the publish step runs `pnpm changeset tag` which creates
+      # the local `@vicoop-bridge/client@<version>` tag; the action then
+      # pushes that tag and creates the GitHub release object using the
+      # CHANGELOG entry as the body. Asset files are attached in the
+      # following step.
+      - name: Version PR or tag client release
+        id: changesets
         uses: changesets/action@v1
         with:
           version: pnpm changeset version
-          publish: ./scripts/changesets-publish.sh
+          publish: pnpm changeset tag
           commit: 'chore: version packages'
           title: 'chore: version packages'
+          createGithubReleases: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The script is idempotent: it reads the current client version
+      # from package.json, looks up the matching release, and exits
+      # cheaply when assets are already complete or the release doesn't
+      # exist yet. Running unconditionally lets a workflow_dispatch
+      # rerun recover from a failure between release creation and asset
+      # upload, where `changeset tag` on rerun would otherwise produce
+      # no `published` signal.
+      - name: Upload client release assets
+        run: ./scripts/upload-client-release-assets.sh

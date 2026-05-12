@@ -29,6 +29,9 @@ operator-facing summary. The command writes a markdown file under
 1. If pending changesets exist on `main`, the action keeps a "Version
    Packages" PR up-to-date with the resulting `package.json` bump and a new
    entry in `packages/client/CHANGELOG.md`.
-2. When the Version Packages PR is merged, `scripts/changesets-publish.sh`
-   builds the portable client bundle and creates the
-   `@vicoop-bridge/client@<version>` GitHub release.
+2. When the Version Packages PR is merged, the action runs
+   `pnpm changeset tag` to create the `@vicoop-bridge/client@<version>`
+   git tag, pushes it, and creates the GitHub release object with the
+   new `CHANGELOG.md` entry as the body. A follow-up step then runs
+   `scripts/upload-client-release-assets.sh`, which builds the portable
+   client bundle and attaches `.tgz` + `.sha256` to that release.

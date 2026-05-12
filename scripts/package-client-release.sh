@@ -9,8 +9,8 @@ fi
 TAG="$1"
 TAG_PREFIX="@vicoop-bridge/client@"
 
-# Caller passes the full tag (changesets-publish.sh does this) so the
-# README and archive name agree on the version. Fail fast if it doesn't
+# Caller passes the full tag (upload-client-release-assets.sh does this)
+# so the README and archive name agree on the version. Fail fast if it doesn't
 # carry the expected prefix or if the stripped version has anything that
 # could path-traverse / inject shell metacharacters into BUNDLE_DIR or
 # ARCHIVE_PATH below.
