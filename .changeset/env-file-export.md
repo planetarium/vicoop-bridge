@@ -18,9 +18,16 @@ user-scope equivalent) is unchanged and still uses bare `KEY=VALUE`,
 matching what systemd actually parses.
 
 `vicoop-client login --write-env-file` (and its deprecated `--env-file`
-alias) is **removed**. Admin subcommands already fall back to
-`~/.vicoop/owner-session.json` (auto-saved by `login` regardless of
-flags) via `resolveOwnerSession`, so the env-file output was structurally
-redundant. Scripts that need the raw access token can still use
+alias) is **removed**. In its default mode `login` saves the owner
+bearer to `~/.vicoop/owner-session.json`, and admin subcommands fall
+back to that file via `resolveOwnerSession` whenever the
+`VICOOP_OWNER_TOKEN` / `VICOOP_BRIDGE` env pair is unset — so the
+env-file output was structurally redundant. Scripts that need the raw
+access token without touching the session file can still use
 `vicoop-client login --json`, which prints the token-endpoint response
-to stdout without persisting it. Closes #136.
+to stdout and (intentionally) does not persist. Closes #136.
+
+The setup-written env file now single-quotes its values
+(`export KEY='value'`) so shell metacharacters in operator input —
+notably AGENT_ID, which the bridge echoes back verbatim — can't
+trigger expansion or command substitution when the file is sourced.

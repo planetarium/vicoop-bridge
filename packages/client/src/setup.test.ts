@@ -74,13 +74,12 @@ test('setup registers client with saved owner-session and writes daemon env', as
   assert.equal(calls[0].authorization, 'Bearer vbc_owner_test');
   assert.match(calls[0].body, /registerClient/);
   const envBody = readFileSync(envFile, 'utf8');
-  assert.match(envBody, /SERVER_TOKEN=client-token/);
-  assert.match(envBody, /AGENT_ID=agent-1/);
-  // Lines must start with `export ` so `. vicoop-client.env` propagates the
-  // assignments to the daemon child process (see #134).
-  assert.match(envBody, /^export SERVER_URL=/m);
-  assert.match(envBody, /^export SERVER_TOKEN=/m);
-  assert.match(envBody, /^export AGENT_ID=/m);
+  // `. vicoop-client.env` must propagate to the daemon (see #134) — `export`
+  // — AND values are single-quoted so shell metacharacters in operator input
+  // can't trigger expansion when sourced.
+  assert.match(envBody, /^export SERVER_URL='wss:\/\/bridge\.test'$/m);
+  assert.match(envBody, /^export SERVER_TOKEN='client-token'$/m);
+  assert.match(envBody, /^export AGENT_ID='agent-1'$/m);
   assert.match(stderr, /client_id\s+client-1/);
   assert.match(stderr, /The CLIENT_TOKEN is shown only once/);
   assert.match(stderr, /Save the setup output or env file now/);
@@ -238,7 +237,7 @@ test('setup writes client token before caller configuration can fail', async (t)
 
   assert.equal(code, 1);
   assert.equal(calls.length, 2);
-  assert.match(readFileSync(envFile, 'utf8'), /SERVER_TOKEN=client-token/);
+  assert.match(readFileSync(envFile, 'utf8'), /^export SERVER_TOKEN='client-token'$/m);
   assert.match(stderr, /Wrote env block/);
   assert.match(stderr, /add-caller failed for agent-1 \(403\): not allowed/);
 });
@@ -328,4 +327,72 @@ test('setup prompts for login when no owner-session is available', async (t) => 
 
   assert.equal(code, 1);
   assert.match(stderr, /vicoop-client login --bridge/);
+});
+
+test('setup quotes env values so shell metacharacters cannot trigger expansion', async (t) => {
+  // The bridge echoes the requested agent id back in `allowed_agent_ids`. If an
+  // operator (or some compromised path between them and `setup`) feeds an id
+  // containing shell metacharacters, sourcing the generated env file must not
+  // run them. Use a deliberately ugly id with `$()`, backticks, and a literal
+  // single quote to exercise the close-escape-reopen path.
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-quote-'));
+  const envFile = join(tmpHome, 'vicoop-client.env');
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  const previousHome = process.env.HOME;
+  process.env.HOME = tmpHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+  });
+
+  saveOwnerSession({
+    bridge: 'https://bridge.test',
+    token: 'vbc_owner_test',
+    principal_id: 'google:123',
+    email: null,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    saved_at: new Date().toISOString(),
+  });
+
+  const evilId = "a'b$(touch /tmp/pwned)`c";
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({
+      data: {
+        registerClient: {
+          clientWithToken: {
+            id: 'client-1',
+            token: 'tok',
+            ownerPrincipal: 'google:123',
+            allowedAgentIds: [evilId],
+          },
+        },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  t.mock.method(process.stderr, 'write', () => true);
+
+  const code = await runSetup([
+    '--client-name',
+    't',
+    '--agent-ids',
+    evilId,
+    '--write-env-file',
+    envFile,
+  ]);
+  assert.equal(code, 0);
+
+  const body = readFileSync(envFile, 'utf8');
+  // Single-quoted literal with embedded `'` escaped as `'\''`. The expansion
+  // forms `$()` and backticks survive verbatim inside the single quotes;
+  // they only run if a future change drops the quoting.
+  assert.match(body, /^export AGENT_ID='a'\\''b\$\(touch \/tmp\/pwned\)`c'$/m);
+  // The AGENT_ID line must open with a single quote immediately after `=`.
+  // Anything else (a bare letter, `$`, backtick) means the value escaped the
+  // quoted literal and would be evaluated on `. vicoop-client.env`.
+  assert.doesNotMatch(body, /^export AGENT_ID=[^']/m);
 });
