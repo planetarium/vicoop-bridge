@@ -23,4 +23,4 @@ alias) is **removed**. Admin subcommands already fall back to
 flags) via `resolveOwnerSession`, so the env-file output was structurally
 redundant. Scripts that need the raw access token can still use
 `vicoop-client login --json`, which prints the token-endpoint response
-to stdout without persisting it. Closes #137.
+to stdout without persisting it. Closes #136.
