@@ -273,6 +273,11 @@ for example to:
 - Tighten `description` to what this specific instance actually does.
 - Adjust `skills[]` if you've customized the backend.
 
+To see what the bridge currently advertises for this agent (before deciding
+whether to override), connect the client once and `curl` the `a2a card` URL
+that `vicoop-client whoami` prints — see ["Check your agent's mention /
+acct"](#check-your-agents-mention--acct-any-backend) in Step 6.
+
 Schema reference: `packages/protocol/src/index.ts` (`AgentCard` Zod schema,
 validated by the client at startup when `AGENT_CARD` is set — invalid cards
 exit with a Zod error).
@@ -376,13 +381,9 @@ derived from `AGENT_ID` and the host part of `SERVER_URL`.
 
 ### Check your agent's mention / acct (any backend)
 
-`vicoop-client whoami` prints the agent's canonical A2A identity — the
-WebFinger acct, the `@<agentId>@<host>` mention, and the WebFinger lookup
-URL. Useful for registering this agent on another agent's `allowed_callers`
-list, or for pasting into the **OpenClaw gateway persona** (OpenClaw's
-`chat.send` has no per-message system field, so its persona is configured
-on the gateway via `openclaw config set ...` — paste the mention there if
-you want self-reference recognition on the OpenClaw backend too).
+After the first `connected` log, run `vicoop-client whoami` to surface every
+identifier external callers will see for this agent — the WebFinger acct, the
+`@<agentId>@<host>` mention, the JSON-RPC endpoint, and the agent-card URL.
 
 ```sh
 . "$INSTALL_DIR/vicoop-client.env"
@@ -396,14 +397,33 @@ you want self-reference recognition on the OpenClaw backend too).
 # webfinger:  https://bridge.example.com/.well-known/webfinger?resource=acct%3A...
 ```
 
-`a2a` is the JSON-RPC endpoint another caller would POST to (e.g.
-`a2a-wallet a2a stream <a2a> "..."`). `a2a card` is the agent-card URL —
-useful for confirming the card the bridge advertises for this agent.
+Typical follow-ups from this output:
 
-`whoami --verify` additionally fetches the WebFinger URL and reports
-whether the bridge actually resolves this agent's acct (useful when
-PUBLIC_URL on the bridge differs from the `SERVER_URL` host you're
-connecting on). `--json` emits a machine-readable record for scripts.
+1. **Hand the mention to another agent.** Copy the `mention:` line and paste
+   it into the other agent's `allowed_callers` (via `add-caller` or the admin
+   agent) so it can call you. Same value goes into the **OpenClaw gateway
+   persona** if you want self-reference recognition on the OpenClaw backend
+   (configured via `openclaw config set ...` since `chat.send` has no
+   per-message system field). `a2a` is the JSON-RPC endpoint another caller
+   would POST to (e.g. `a2a-wallet a2a stream <a2a> "..."`).
+2. **Confirm which card the bridge advertises.** `curl` the `a2a card` URL —
+   that's the canonical card external callers receive, which is the
+   server-published default for `BACKEND` unless you set `AGENT_CARD` to
+   override it (see Step 5). If the response doesn't match what you expect,
+   that's the cue to override.
+
+   ```sh
+   CARD_URL=$("$INSTALL_DIR/bin/vicoop-client" whoami --json | jq -r .a2aCardUrl)
+   curl -sf "$CARD_URL" | jq .
+   ```
+3. **Verify WebFinger actually resolves the acct.** `whoami --verify`
+   additionally fetches the WebFinger URL and reports whether the bridge
+   resolves this agent's acct under the derived host. This catches the
+   `SERVER_URL` host vs bridge `PUBLIC_URL` mismatch flagged in the
+   Claude-specific note above; if `--verify` fails, align the two before
+   trusting self-reference detection or external mentions.
+
+`--json` emits a machine-readable record of all the same fields for scripts.
 
 ## Optional: persistence
 
