@@ -417,6 +417,52 @@ BACKEND=openclaw
 #OPENCLAW_GATEWAY_TOKEN=
 #OPENCLAW_AGENT=main
 #OPENCLAW_TASK_TIMEOUT_MS=
+
+# --- Claude-backend-only (uncomment if BACKEND=claude) ---
+# Working directory for the spawned claude subprocess. Defaults to the
+# daemon's pwd. Set this to a dedicated work tree so sandbox.filesystem
+# default write rules (cwd-only) and Read tool defaults are scoped to a
+# directory that does NOT contain operator credentials.
+#CLAUDE_CWD=/srv/agent-work
+
+# Inline --settings JSON forwarded to every \`claude -p\` (issue #138).
+# Enables the OS-level sandbox (Seatbelt on macOS, bubblewrap on Linux)
+# AND permission-rule deny lists for Claude's internal Read/Edit (which
+# the OS sandbox does not cover). Single line only (systemd EnvironmentFile
+# is one assignment per line); compact your JSON before pasting.
+#
+# Starter profile vetted on macOS Seatbelt with claude 2.1.139. Three
+# non-obvious gotchas were verified empirically and folded in below:
+#
+#   1. allowedDomains MUST be nested under sandbox.network. Placing it at
+#      sandbox.allowedDomains is silently ignored.
+#   2. npm/pnpm need ~/.npm and ~/.cache/pnpm in allowWrite or every
+#      registry fetch fails at the cache-write step (EPERM), even with
+#      the registry domain allowed.
+#   3. \`gh\` cannot read its macOS Keychain token under Seatbelt
+#      (\`gh auth status\` fails regardless of network). If the agent needs
+#      gh, inject the token via env: GH_TOKEN=<pat> on this systemd unit.
+#
+# Broaden filesystem.allowWrite, network.allowedDomains, and the
+# permission deny list as your agent's toolchain requires.
+#CLAUDE_SETTINGS_JSON={"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false,"filesystem":{"denyRead":["~/.ssh","~/.aws","~/.gnupg","~/.netrc"],"allowWrite":["/tmp/vicoop","~/.npm","~/.cache/pnpm"]},"network":{"allowManagedDomainsOnly":true,"allowedDomains":["github.com","api.github.com","codeload.github.com","objects.githubusercontent.com","uploads.github.com","registry.npmjs.org"]}},"permissions":{"deny":["Read(~/.ssh/**)","Read(~/.aws/**)","Read(~/.netrc)","Read(**/.env*)","Bash(ping:*)","Bash(nslookup:*)","Bash(dig:*)","Bash(host:*)","Bash(curl:*)","Bash(wget:*)","Bash(nc:*)","Bash(socat:*)"]}}
+
+# Personal access token injected when the agent uses \`gh\` — Seatbelt
+# blocks Keychain access so the stored gh credential is unreachable
+# inside the sandbox. Use a fine-grained PAT scoped to the repos the
+# agent actually needs.
+#GH_TOKEN=
+
+# --- Observability (optional, OpenTelemetry) ---
+# claude-code is OTEL-native. The bridge daemon just inherits these
+# variables and claude exports tool-call / prompt traces directly. Point
+# OTEL_EXPORTER_OTLP_ENDPOINT at your collector and the SIEM gets a
+# queryable, tamper-evident audit trail (the agent cannot suppress
+# exported spans). All four vars are needed for full fidelity.
+#OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.local:4317
+#OTEL_LOG_TOOL_DETAILS=1
+#OTEL_LOG_TOOL_CONTENT=1
+#OTEL_LOG_USER_PROMPTS=1
 ENVF
     env_created="new"
   else

@@ -650,6 +650,99 @@ test('passes expected argv shape (stream-json, session-id, verbose, extraArgs)',
   assert.equal(child.args.at(-1), 'sonnet');
 });
 
+test('injects --settings <json> when settings option is provided', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+
+  const settings = {
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: true,
+      allowUnsandboxedCommands: false,
+    },
+  };
+  const backend = createClaudeBackend({ spawn: fake.spawn, settings });
+  await backend.handle(assign('hi'), collect().emit, NEVER);
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  const idx = child.args.indexOf('--settings');
+  assert.ok(idx !== -1, 'expected --settings flag');
+  // The serialized JSON must round-trip exactly (no shell escaping — spawn
+  // takes an argv array, claude reads it as a single argument).
+  assert.deepEqual(JSON.parse(String(child.args[idx + 1])), settings);
+});
+
+test('omits --settings when settings option is not provided', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  await backend.handle(assign('hi'), collect().emit, NEVER);
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  assert.equal(child.args.indexOf('--settings'), -1);
+});
+
+test('createClaudeBackend throws a named error if settings is not JSON-serializable', () => {
+  // Circular reference — JSON.stringify throws TypeError. The wrapped Error
+  // must name the option so an operator can find the misconfiguration
+  // quickly instead of debugging a raw stack trace from inside the backend.
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+  assert.throws(
+    () => createClaudeBackend({ settings: circular }),
+    /createClaudeBackend: failed to serialize `settings` option/,
+  );
+
+  // BigInt — different throw inside JSON.stringify, same wrapper outside.
+  // `settings` is `Record<string, unknown>`, so `1n` slots in as-is.
+  assert.throws(
+    () => createClaudeBackend({ settings: { token: 1n } }),
+    /createClaudeBackend: failed to serialize `settings` option/,
+  );
+
+  // `toJSON()` that returns undefined — JSON.stringify returns undefined
+  // (no throw), which would otherwise stringify-coerce to "undefined" in
+  // argv. The post-stringify type check must catch this.
+  const toJsonReturnsUndefined: Record<string, unknown> = {
+    toJSON() {
+      return undefined;
+    },
+  };
+  assert.throws(
+    () => createClaudeBackend({ settings: toJsonReturnsUndefined }),
+    /serialized to `undefined`/,
+  );
+});
+
+test('--settings precedes extraArgs so operator extraArgs can override', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    settings: { sandbox: { enabled: true } },
+    extraArgs: ['--model', 'sonnet'],
+  });
+  await backend.handle(assign('hi'), collect().emit, NEVER);
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  const settingsIdx = child.args.indexOf('--settings');
+  const modelIdx = child.args.indexOf('--model');
+  assert.ok(settingsIdx !== -1);
+  assert.ok(modelIdx !== -1);
+  assert.ok(settingsIdx < modelIdx, '--settings must appear before extraArgs');
+});
+
 test('injects --append-system-prompt with self-identity mention when identity is provided', async () => {
   const fake = scriptedSpawn({
     lines: [JSON.stringify({ type: 'result', result: 'ok' })],

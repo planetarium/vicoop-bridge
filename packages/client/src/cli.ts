@@ -65,6 +65,31 @@ function parseClientArgs(argv: string[]): Args {
   return resolved;
 }
 
+// Parse the operator's inline `--settings` JSON for the claude backend. The
+// primary use case is enabling the OS-level sandbox in `-p` mode (issue #138),
+// where the `/sandbox` slash command is unavailable and `settings.json` on
+// disk is awkward on systemd-`DynamicUser` hosts. We fail loud on malformed
+// JSON rather than silently dropping it — a syntax error in a sandbox config
+// is exactly the kind of bug an operator wants surfaced at startup, not
+// after the first task already ran with no sandbox at all.
+function parseClaudeSettingsEnv(raw: string | undefined): Record<string, unknown> | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`CLAUDE_SETTINGS_JSON is not valid JSON: ${msg}`);
+    process.exit(1);
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    console.error('CLAUDE_SETTINGS_JSON must be a JSON object');
+    process.exit(1);
+  }
+  return parsed as Record<string, unknown>;
+}
+
 function pickBackend(name: string, args: Args): Backend {
   switch (name) {
     case 'echo':
@@ -80,6 +105,7 @@ function pickBackend(name: string, args: Args): Backend {
       return createClaudeBackend({
         cwd: process.env.CLAUDE_CWD?.trim() || undefined,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
+        settings: parseClaudeSettingsEnv(process.env.CLAUDE_SETTINGS_JSON),
       });
     default:
       throw new Error(`unknown backend: ${name} (supported: echo, openclaw, claude)`);
