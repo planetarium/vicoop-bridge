@@ -701,8 +701,9 @@ test('createClaudeBackend throws a named error if settings is not JSON-serializa
   );
 
   // BigInt — different throw inside JSON.stringify, same wrapper outside.
+  // `settings` is `Record<string, unknown>`, so `1n` slots in as-is.
   assert.throws(
-    () => createClaudeBackend({ settings: { token: 1n as unknown as number } }),
+    () => createClaudeBackend({ settings: { token: 1n } }),
     /createClaudeBackend: failed to serialize `settings` option/,
   );
 });

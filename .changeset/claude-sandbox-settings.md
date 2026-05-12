@@ -5,9 +5,11 @@
 Claude backend now forwards an operator-supplied Claude Code settings
 JSON to every spawned `claude -p` via `--settings <json>`. The new
 `CLAUDE_SETTINGS_JSON` env var (read by the daemon's `pickBackend`)
-accepts a top-level JSON object that is serialized verbatim on the
-argv — primary use case is enabling the OS-level sandbox (Seatbelt on
-macOS, bubblewrap on Linux) in non-interactive mode, where the
+accepts a top-level JSON object; it is parsed at startup, re-serialized
+with `JSON.stringify`, and forwarded as `--settings <json>` on every
+spawn (whitespace and key order may change but the semantic value is
+preserved). Primary use case is enabling the OS-level sandbox (Seatbelt
+on macOS, bubblewrap on Linux) in non-interactive mode, where the
 `/sandbox` slash command is unavailable and on-disk `settings.json`
 is awkward on systemd `DynamicUser=yes` hosts.
 
