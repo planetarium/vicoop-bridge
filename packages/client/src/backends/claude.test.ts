@@ -706,6 +706,19 @@ test('createClaudeBackend throws a named error if settings is not JSON-serializa
     () => createClaudeBackend({ settings: { token: 1n } }),
     /createClaudeBackend: failed to serialize `settings` option/,
   );
+
+  // `toJSON()` that returns undefined — JSON.stringify returns undefined
+  // (no throw), which would otherwise stringify-coerce to "undefined" in
+  // argv. The post-stringify type check must catch this.
+  const toJsonReturnsUndefined: Record<string, unknown> = {
+    toJSON() {
+      return undefined;
+    },
+  };
+  assert.throws(
+    () => createClaudeBackend({ settings: toJsonReturnsUndefined }),
+    /serialized to `undefined`/,
+  );
 });
 
 test('--settings precedes extraArgs so operator extraArgs can override', async () => {

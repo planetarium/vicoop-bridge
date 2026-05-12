@@ -534,12 +534,25 @@ export function createClaudeBackend(
   // without the operator having to read a raw stack trace.
   const settingsArgs: readonly string[] = ((): readonly string[] => {
     if (!opts.settings) return [];
-    let serialized: string;
+    let serialized: string | undefined;
     try {
       serialized = JSON.stringify(opts.settings);
     } catch (err) {
       throw new Error(
         `createClaudeBackend: failed to serialize \`settings\` option as JSON for --settings argv: ${errorMessage(err)}`,
+      );
+    }
+    // JSON.stringify can return `undefined` even without throwing — e.g. a
+    // top-level `toJSON()` that returns undefined, or the value being a bare
+    // function/symbol. Without this guard the argv would carry `undefined`
+    // which the child spawn coerces to the string "undefined", silently
+    // running claude with a bogus --settings payload. Surface the same
+    // named error so callers can't miss it.
+    if (typeof serialized !== 'string') {
+      throw new Error(
+        'createClaudeBackend: `settings` option serialized to `undefined` ' +
+          '(toJSON returned undefined, or value was a function/symbol); ' +
+          'pass a JSON-safe object for --settings argv',
       );
     }
     return ['--settings', serialized];
