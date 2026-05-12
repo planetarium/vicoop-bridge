@@ -689,6 +689,24 @@ test('omits --settings when settings option is not provided', async () => {
   assert.equal(child.args.indexOf('--settings'), -1);
 });
 
+test('createClaudeBackend throws a named error if settings is not JSON-serializable', () => {
+  // Circular reference — JSON.stringify throws TypeError. The wrapped Error
+  // must name the option so an operator can find the misconfiguration
+  // quickly instead of debugging a raw stack trace from inside the backend.
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+  assert.throws(
+    () => createClaudeBackend({ settings: circular }),
+    /createClaudeBackend: failed to serialize `settings` option/,
+  );
+
+  // BigInt — different throw inside JSON.stringify, same wrapper outside.
+  assert.throws(
+    () => createClaudeBackend({ settings: { token: 1n as unknown as number } }),
+    /createClaudeBackend: failed to serialize `settings` option/,
+  );
+});
+
 test('--settings precedes extraArgs so operator extraArgs can override', async () => {
   const fake = scriptedSpawn({
     lines: [JSON.stringify({ type: 'result', result: 'ok' })],

@@ -83,11 +83,16 @@ export interface ClaudeBackendOptions {
   // (Seatbelt on macOS, bubblewrap on Linux) in `-p` mode, where the
   // `/sandbox` slash command is unavailable. See issue #138.
   //
-  // The object is serialized verbatim — the backend does not validate shape
-  // or merge defaults. Operators that want sandbox-on-by-default with the
-  // local `send_file` MCP server reachable must include the loopback host in
-  // `sandbox.network` themselves; the URL is dynamic per task so the backend
-  // cannot pre-populate it without rewriting the operator's JSON.
+  // The object is serialized with `JSON.stringify` at backend construction
+  // and must therefore be JSON-safe: `BigInt` values throw, `undefined` /
+  // functions / symbols drop, and `NaN` / `Infinity` become `null`. The
+  // backend does not validate shape or merge defaults — operators that want
+  // sandbox-on-by-default with the local `send_file` MCP server reachable
+  // must include the loopback host in `sandbox.network` themselves; the URL
+  // is dynamic per task so the backend cannot pre-populate it without
+  // rewriting the operator's JSON. Serialization failures surface as a
+  // thrown Error from `createClaudeBackend(...)` so misconfiguration is
+  // visible at startup rather than as a corrupted argv on the first task.
   settings?: Record<string, unknown>;
 }
 
@@ -522,11 +527,23 @@ export function createClaudeBackend(
     ? ['--append-system-prompt', buildSelfIdentitySystemPrompt(opts.identity)]
     : [];
   // Serialize once at backend construction so per-task spawn stays cheap and
-  // a malformed settings object (e.g. a circular reference) fails loud at
-  // setup time rather than producing a corrupted argv on the first task.
-  const settingsArgs: readonly string[] = opts.settings
-    ? ['--settings', JSON.stringify(opts.settings)]
-    : [];
+  // a malformed settings object (circular reference, BigInt value, etc.)
+  // fails loud at setup time rather than producing a corrupted argv on the
+  // first task. The wrapper Error name-checks the option and surfaces the
+  // underlying `JSON.stringify` message so a misconfiguration is actionable
+  // without the operator having to read a raw stack trace.
+  const settingsArgs: readonly string[] = ((): readonly string[] => {
+    if (!opts.settings) return [];
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(opts.settings);
+    } catch (err) {
+      throw new Error(
+        `createClaudeBackend: failed to serialize \`settings\` option as JSON for --settings argv: ${errorMessage(err)}`,
+      );
+    }
+    return ['--settings', serialized];
+  })();
 
   // Lazy: first task that needs the MCP server starts it; backends that
   // never see send_file enabled don't open a port.
