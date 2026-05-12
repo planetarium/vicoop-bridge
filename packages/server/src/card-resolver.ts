@@ -13,6 +13,7 @@ function readCanonicalCard(kind: string): AgentCardType {
 const canonicalCards = new Map<string, AgentCardType>(
   Object.entries({
     claude: readCanonicalCard('claude'),
+    codex: readCanonicalCard('codex'),
     echo: readCanonicalCard('echo'),
     openclaw: readCanonicalCard('openclaw'),
   }),

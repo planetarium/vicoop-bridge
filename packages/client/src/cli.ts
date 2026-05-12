@@ -5,6 +5,7 @@ import { Client } from './client.js';
 import { echoBackend } from './backends/echo.js';
 import { createOpenclawBackend } from './backends/openclaw.js';
 import { createClaudeBackend } from './backends/claude.js';
+import { createCodexBackend, type CodexSandboxMode } from './backends/codex.js';
 import type { Backend } from './backend.js';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
@@ -28,9 +29,14 @@ interface Args {
 }
 
 const DAEMON_USAGE =
-  'vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude> [--card <path>]';
+  'vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude|codex> [--card <path>]';
 const SUBCOMMAND_LIST =
   'subcommands: login, setup, upgrade, list-agents, list-callers, add-caller, remove-caller, whoami (run any with --help)';
+const CODEX_SANDBOX_MODES = new Set<CodexSandboxMode>([
+  'read-only',
+  'workspace-write',
+  'danger-full-access',
+]);
 
 function parseClientArgs(argv: string[]): Args {
   const out: Partial<Args> = {};
@@ -90,6 +96,17 @@ function parseClaudeSettingsEnv(raw: string | undefined): Record<string, unknown
   return parsed as Record<string, unknown>;
 }
 
+function parseCodexSandboxMode(raw: string | undefined): CodexSandboxMode | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) return undefined;
+  if (CODEX_SANDBOX_MODES.has(trimmed as CodexSandboxMode)) {
+    return trimmed as CodexSandboxMode;
+  }
+  throw new Error(
+    `CODEX_SANDBOX_MODE must be one of: ${Array.from(CODEX_SANDBOX_MODES).join(', ')}`,
+  );
+}
+
 function pickBackend(name: string, args: Args): Backend {
   switch (name) {
     case 'echo':
@@ -107,8 +124,13 @@ function pickBackend(name: string, args: Args): Backend {
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
         settings: parseClaudeSettingsEnv(process.env.CLAUDE_SETTINGS_JSON),
       });
+    case 'codex':
+      return createCodexBackend({
+        cwd: process.env.CODEX_CWD?.trim() || undefined,
+        sandboxMode: parseCodexSandboxMode(process.env.CODEX_SANDBOX_MODE),
+      });
     default:
-      throw new Error(`unknown backend: ${name} (supported: echo, openclaw, claude)`);
+      throw new Error(`unknown backend: ${name} (supported: echo, openclaw, claude, codex)`);
   }
 }
 
