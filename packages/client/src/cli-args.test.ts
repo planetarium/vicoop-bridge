@@ -108,6 +108,27 @@ test('parseFlags fails when a known flag is missing its value', () => {
   assert.match(consumed.error, /--config requires a value/);
 });
 
+test('mergeClientArgs trims and treats whitespace-only as unset', () => {
+  // Space-padded values from env or CLI should normalize to clean strings,
+  // and a whitespace-only value should fall through to the next layer —
+  // matching the same trim+drop semantics normalizeConfig applies to the
+  // config layer.
+  const r = mergeClientArgs(
+    { server: '  wss://flag-padded  ', card: '   ' },
+    { SERVER_TOKEN: '\ttoken-env\n', AGENT_ID: '   ' },
+    { agent_id: 'agent-from-config', backend: 'claude' },
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.server, 'wss://flag-padded');
+  assert.equal(r.args.token, 'token-env');
+  // env AGENT_ID is whitespace-only → falls through to config
+  assert.equal(r.args.agentId, 'agent-from-config');
+  // card was whitespace-only on both flag and env, and config has none →
+  // resolves to undefined (not empty string).
+  assert.equal(r.args.card, undefined);
+});
+
 test('empty env values fall through to config', () => {
   // install.sh ships the env template with empty `SERVER_TOKEN=` for the
   // operator to fill in. That empty string must not shadow a populated

@@ -192,8 +192,10 @@ like:
   client_name      openclaw on my-host
   allowed_agents   openclaw-my-host
 
-The CLIENT_TOKEN is shown only once and cannot be retrieved later.
-  Save the setup output or env file now.
+The CLIENT_TOKEN is one-time — the bridge cannot reissue it.
+  setup persists it to the canonical config below; --json prints it to
+  stdout instead. Back up that file (or rerun with --write-env-file
+  to drop a systemd EnvironmentFile alongside) before rotating hosts.
 
 Wrote /home/you/.vicoop/config.json (mode 600).
 ```

@@ -56,22 +56,36 @@ export function parseFlags(argv: string[]): ParseFlagsResult {
   return { ok: true, flags: out };
 }
 
-// `||` (not `??`) so an empty `SERVER_TOKEN=` line from a freshly-generated
-// EnvironmentFile= template doesn't shadow a populated config.json. The
-// install.sh template ships these keys with empty values for operators to
-// fill in; treating "" as "not set" lets the config value carry through
-// until the operator either populates env or removes the empty line.
+// Trim and treat whitespace-only as unset. Two reasons:
+//   1. `||` (not `??`) so an empty `SERVER_TOKEN=` line from a
+//      freshly-generated EnvironmentFile= template doesn't shadow a
+//      populated config.json. The install.sh template ships these keys
+//      with empty values for operators to fill in; treating "" as "not
+//      set" lets the config value carry through until the operator
+//      either populates env or removes the empty line.
+//   2. Trim so a stray space-padded value (`SERVER_URL=" wss://x "` or
+//      `--token " ... "`) doesn't surface as a "looks set but doesn't
+//      connect" mystery. `normalizeConfig` already trims for the config
+//      layer; doing the same here keeps env / CLI on the same footing.
+function pick(v: string | undefined): string {
+  return v?.trim() ?? '';
+}
+
 export function mergeClientArgs(
   flags: ParsedFlags,
   env: NodeJS.ProcessEnv,
   config: ClientConfig,
 ): { ok: true; args: DaemonArgs } | { ok: false; missing: string[] } {
+  const card =
+    pick(flags.card) || pick(env.AGENT_CARD) || config.card;
   const resolved: DaemonArgs = {
-    server: flags.server || env.SERVER_URL || config.server_url || '',
-    token: flags.token || env.SERVER_TOKEN || config.server_token || '',
-    agentId: flags.agentId || env.AGENT_ID || config.agent_id || '',
-    card: flags.card || env.AGENT_CARD || config.card,
-    backend: flags.backend || env.BACKEND || config.backend || 'echo',
+    server: pick(flags.server) || pick(env.SERVER_URL) || config.server_url || '',
+    token: pick(flags.token) || pick(env.SERVER_TOKEN) || config.server_token || '',
+    agentId: pick(flags.agentId) || pick(env.AGENT_ID) || config.agent_id || '',
+    // `card` is optional; normalize "" back to undefined so callers don't
+    // get a present-but-empty string they then have to filter.
+    card: card === '' ? undefined : card,
+    backend: pick(flags.backend) || pick(env.BACKEND) || config.backend || 'echo',
     backends: config.backends,
   };
   const missing: string[] = [];
