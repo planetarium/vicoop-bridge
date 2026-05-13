@@ -388,8 +388,12 @@ export async function runSetup(args: string[]): Promise<number> {
       `  allowed_agents   ${success.allowed_agent_ids.join(', ')}\n\n` +
       'The CLIENT_TOKEN is one-time — the bridge cannot reissue it.\n' +
       '  setup persists it to the canonical config below; --json prints it to\n' +
-      '  stdout instead. Back up that file (or rerun with --write-env-file\n' +
-      '  to drop a systemd EnvironmentFile alongside) before rotating hosts.\n\n',
+      '  stdout instead. Back up that file before rotating hosts.\n' +
+      '  To also stash it in a systemd EnvironmentFile, pass --write-env-file\n' +
+      '  on this same setup invocation — rerunning setup later would call\n' +
+      '  registerClient again and mint a NEW CLIENT_TOKEN, invalidating this\n' +
+      '  one. To populate an env file from an already-issued token, copy\n' +
+      '  SERVER_URL / SERVER_TOKEN / AGENT_ID out of config.json by hand.\n\n',
   );
 
   // Canonical persistence: if this fails the operator is left with a

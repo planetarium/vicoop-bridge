@@ -531,9 +531,13 @@ if [ -n "$SERVICE_INSTALLED" ]; then
      picks them up automatically. See docs/install-client.md step 6.
 
   3. Optional: after the foreground run works, populate $SERVICE_ENV_FILE
-     for the systemd unit (or rerun setup with --write-env-file
-     $SERVICE_ENV_FILE to sync it from the canonical config.json), then
-     reload systemd and enable + start the service:
+     for the systemd unit. Either run \`vicoop-client setup\` once with
+     \`--write-env-file $SERVICE_ENV_FILE\` (mints token + writes both
+     outputs in one shot) or copy SERVER_URL / SERVER_TOKEN / AGENT_ID
+     from the canonical config.json by hand. Re-running setup just to
+     refresh the env file would mint a NEW CLIENT_TOKEN and invalidate
+     the previously persisted one. Then reload systemd and enable +
+     start the service:
 
        $SERVICE_RELOAD_CMD
        $SERVICE_ENABLE_CMD

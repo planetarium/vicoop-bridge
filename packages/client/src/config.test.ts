@@ -64,6 +64,41 @@ test('resolveConfigDir prefers existing ~/.vicoop over XDG_CONFIG_HOME', (t) => 
   assert.equal(resolveConfigDir(), legacy);
 });
 
+test('resolveConfigDir warns + falls through when $VICOOP_HOME points at a regular file', (t) => {
+  // VICOOP_HOME being a regular file would make the daemon later crash
+  // mkdirSync / atomicWriteFile with ENOTDIR. Warn loudly and pick the
+  // next candidate (legacy ~/.vicoop fallback in this test) so the
+  // daemon still has a usable place to write.
+  const home = mkdtempSync(join(tmpdir(), 'vicoop-cfg-vicoophome-file-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const strayFile = join(home, 'not-a-dir');
+  writeFileSync(strayFile, 'stray');
+
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  t.after(() => {
+    console.warn = origWarn;
+  });
+
+  withEnv(t, {
+    HOME: home,
+    USERPROFILE: home,
+    VICOOP_HOME: strayFile,
+    XDG_CONFIG_HOME: undefined,
+  });
+  // Falls through to default ~/.vicoop under HOME (which doesn't exist
+  // as a dir yet, so resolver returns the path; mkdirSync would create
+  // it on first write).
+  assert.equal(resolveConfigDir(), join(home, '.vicoop'));
+  assert.ok(
+    warnings.some((w) => w.includes('$VICOOP_HOME') && w.includes('not a directory')),
+    `expected warning about VICOOP_HOME, got: ${JSON.stringify(warnings)}`,
+  );
+});
+
 test('resolveConfigDir skips the legacy ~/.vicoop branch when the path is a regular file', (t) => {
   // existsSync would otherwise say "yes" for a stray file at ~/.vicoop
   // (e.g. someone curl'd a download there) and later mkdirSync would crash

@@ -194,8 +194,12 @@ like:
 
 The CLIENT_TOKEN is one-time — the bridge cannot reissue it.
   setup persists it to the canonical config below; --json prints it to
-  stdout instead. Back up that file (or rerun with --write-env-file
-  to drop a systemd EnvironmentFile alongside) before rotating hosts.
+  stdout instead. Back up that file before rotating hosts.
+  To also stash it in a systemd EnvironmentFile, pass --write-env-file
+  on this same setup invocation — rerunning setup later would call
+  registerClient again and mint a NEW CLIENT_TOKEN, invalidating this
+  one. To populate an env file from an already-issued token, copy
+  SERVER_URL / SERVER_TOKEN / AGENT_ID out of config.json by hand.
 
 Wrote /home/you/.vicoop/config.json (mode 600).
 ```

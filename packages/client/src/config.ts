@@ -23,29 +23,64 @@ const CONFIG_FILENAME = 'config.json';
 const OWNER_SESSION_FILENAME = 'owner-session.json';
 const LEGACY_HOME_DIRNAME = '.vicoop';
 
-// Order:
+// Order (each candidate is skipped if its filesystem entry exists and is
+// not a directory — see `isUsableConfigDirPath`):
 //   1. $VICOOP_HOME — explicit operator override, useful for tests and
 //      multi-tenant hosts.
-//   2. ~/.vicoop if it already exists — keep existing installs (which
-//      already store owner-session.json there) on the same path even when
-//      the operator later sets $XDG_CONFIG_HOME for unrelated reasons.
+//   2. ~/.vicoop if it already exists as a directory — keep existing
+//      installs (which already store owner-session.json there) on the
+//      same path even when the operator later sets $XDG_CONFIG_HOME for
+//      unrelated reasons.
 //   3. $XDG_CONFIG_HOME/vicoop — fresh installs that opted in to XDG.
 //   4. ~/.vicoop fallback for everything else, matching the old default.
 export function resolveConfigDir(): string {
+  // Each candidate is accepted only when its filesystem entry is either
+  // missing (we'll create it via `mkdirSync(..., { recursive: true })`) or
+  // already a directory. A regular file at any of these paths would later
+  // crash `mkdirSync` / `atomicWriteFile` with confusing ENOTDIR. Warn
+  // loudly and fall through so the daemon can still start under a sane
+  // fallback instead of failing with a low-level errno trace.
   const explicit = process.env.VICOOP_HOME?.trim();
-  if (explicit) return explicit;
+  if (explicit) {
+    if (isUsableConfigDirPath(explicit)) return explicit;
+    console.warn(
+      `[client] $VICOOP_HOME (${explicit}) exists but is not a directory; ignoring.`,
+    );
+  }
 
-  // A regular file at `~/.vicoop` (e.g. someone curl'd a download there)
-  // would make `existsSync` answer true and later `mkdirSync` / `join`
-  // crash with ENOTDIR. Require it to actually be a directory before
-  // adopting the legacy path; otherwise fall through.
   const legacy = join(homedir(), LEGACY_HOME_DIRNAME);
   if (isExistingDirectory(legacy)) return legacy;
 
   const xdg = process.env.XDG_CONFIG_HOME?.trim();
-  if (xdg) return join(xdg, 'vicoop');
+  if (xdg) {
+    // For XDG, the canonical config dir is `$XDG_CONFIG_HOME/vicoop`. Both
+    // the XDG parent and the joined subpath get the same usability rule:
+    // either non-existent (we'll mkdir -p) or an existing directory.
+    if (isUsableConfigDirPath(xdg)) {
+      const xdgVicoop = join(xdg, 'vicoop');
+      if (isUsableConfigDirPath(xdgVicoop)) return xdgVicoop;
+      console.warn(
+        `[client] $XDG_CONFIG_HOME/vicoop (${xdgVicoop}) exists but is not a directory; ignoring.`,
+      );
+    } else {
+      console.warn(
+        `[client] $XDG_CONFIG_HOME (${xdg}) exists but is not a directory; ignoring.`,
+      );
+    }
+  }
 
   return legacy;
+}
+
+// "Usable" means either it doesn't exist yet (mkdir -p will create it) or
+// it exists and is a directory. An existing regular file / symlink-to-file
+// / other non-directory entry is rejected.
+function isUsableConfigDirPath(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT';
+  }
 }
 
 function isExistingDirectory(path: string): boolean {
