@@ -239,6 +239,17 @@ Daemon precedence is **CLI flag > env var > `--config <path>` > canonical
 or CI overrides). `setup` only ever touches `server_url`, `server_token`, and
 `agent_id` — hand-edits to the other fields survive `setup` re-runs.
 
+> **Top-level vs `backends.*` parity.** The five top-level fields above
+> (`server_url`, `server_token`, `agent_id`, `backend`, `card`) all have
+> matching CLI flags (`--server`, `--token`, `--agentId`, `--backend`,
+> `--card`) and env vars. The `backends.*` map is config + env only —
+> there's no per-backend CLI flag. The backend-specific env vars
+> (`CLAUDE_CWD`, `CLAUDE_SETTINGS_JSON`, `CODEX_CWD`,
+> `CODEX_SANDBOX_MODE`, `OPENCLAW_GATEWAY_URL` /
+> `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_AGENT` /
+> `OPENCLAW_TASK_TIMEOUT_MS`) still override the corresponding config
+> values.
+
 If you omit `--caller`, `setup` succeeds but prints a warning that the
 agent will be public until you restrict callers:
 
