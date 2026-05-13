@@ -130,6 +130,25 @@ function parseClaudeSettingsEnv(raw: string | undefined): Record<string, unknown
 // rejection branch here, but parameterizing keeps the function safe to
 // reuse on any source without leaking a misleading "CODEX_SANDBOX_MODE
 // must be one of..." when the bogus value actually came from config.json.
+// Three-state classifier for `OPENCLAW_TASK_TIMEOUT_MS`. The `'valid'` arm
+// is the only one where we want the factory's own resolveTimeout to read
+// the env var; in every other case we fall through to the config value so
+// a mistyped env doesn't silently shadow `backends.openclaw.task_timeout_ms`.
+// The factory still validates internally, so this is purely about choosing
+// which surface contributes the value, not duplicating its parse logic.
+function parseOpenclawTimeoutEnv(
+  raw: string | undefined,
+): 'valid' | 'invalid' | 'unset' {
+  const trimmed = raw?.trim();
+  if (!trimmed) return 'unset';
+  const n = Number(trimmed);
+  if (Number.isFinite(n) && n > 0) return 'valid';
+  console.warn(
+    `[client] OPENCLAW_TASK_TIMEOUT_MS=${JSON.stringify(trimmed)} is not a positive number; ignoring (using backends.openclaw.task_timeout_ms / default).`,
+  );
+  return 'invalid';
+}
+
 function parseCodexSandboxMode(
   raw: string | undefined,
   source = 'CODEX_SANDBOX_MODE',
@@ -166,17 +185,23 @@ function pickBackend(name: string, args: Args): Backend {
       // `?.trim() ||` mirrors the daemon-level precedence (env wins when set,
       // falls through to config when blank/unset).
       const oc = backends.openclaw;
-      const envTimeout = process.env.OPENCLAW_TASK_TIMEOUT_MS?.trim();
+      // Parse `OPENCLAW_TASK_TIMEOUT_MS` here too (the factory already does
+      // it inside `resolveTimeout`, but we need the parse result *outside*
+      // the factory to decide whether to fall through to config). Three
+      // cases:
+      //   - env unset / blank → opts = config (factory uses config or default)
+      //   - env is a positive finite number → opts = undefined (factory
+      //     re-reads env so the value flows through resolveTimeout normally)
+      //   - env is non-empty but invalid (e.g. "abc", "0", "-5") → warn
+      //     once here, then fall through to config like the blank case so
+      //     the operator's `backends.openclaw.task_timeout_ms` is honored
+      //     instead of being silently replaced by the compiled default.
+      const envTimeoutMs = parseOpenclawTimeoutEnv(process.env.OPENCLAW_TASK_TIMEOUT_MS);
       return createOpenclawBackend({
         url: process.env.OPENCLAW_GATEWAY_URL?.trim() || oc?.gateway_url,
         token: process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || oc?.gateway_token,
         agent: process.env.OPENCLAW_AGENT?.trim() || oc?.agent,
-        // OPENCLAW_TASK_TIMEOUT_MS env parsing already lives in the factory
-        // (`resolveTimeout`). Pass the config value only when env is unset or
-        // blank so a freshly-templated `OPENCLAW_TASK_TIMEOUT_MS=` doesn't
-        // make the factory parse `""` as 0 and fall back to the compiled
-        // default, ignoring config.
-        taskTimeoutMs: envTimeout ? undefined : oc?.task_timeout_ms,
+        taskTimeoutMs: envTimeoutMs === 'valid' ? undefined : oc?.task_timeout_ms,
       });
     }
     case 'claude':
