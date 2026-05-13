@@ -194,20 +194,27 @@ function writeConfigForSetup(success: ClientRegisterSuccess, bridgeUrl: string):
   return path;
 }
 
-function writeClientSetupOutput(args: SetupArgs, success: ClientRegisterSuccess, bridgeUrl: string): void {
-  // --json keeps its scripting contract: no disk side effects, raw response on
-  // stdout. Anything else persists to the canonical config so the daemon
-  // launches without further wiring.
+// Persist the canonical credentials. Returns the path written (or `null` on
+// the --json path, which writes to stdout instead and has no disk side
+// effect). Throws on persistence failure — the caller must surface the
+// just-minted token as a recovery hatch because the bridge cannot reissue
+// it. The optional `--write-env-file` write is intentionally NOT performed
+// here; see `writeOptionalEnvFile` for that path's separate failure
+// handling.
+function persistCanonical(
+  args: SetupArgs,
+  success: ClientRegisterSuccess,
+  bridgeUrl: string,
+): string | null {
+  // --json keeps its scripting contract: no disk side effects, raw response
+  // on stdout.
   if (args.json) {
     process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
-    return;
+    return null;
   }
   const configPath = writeConfigForSetup(success, bridgeUrl);
   process.stderr.write(`Wrote ${configPath} (mode 600).\n`);
-  if (args.envFile) {
-    writeClientEnvFile(args.envFile, success, bridgeUrl);
-    process.stderr.write(`Wrote env block to ${args.envFile} (mode 600).\n`);
-  }
+  return configPath;
 }
 
 async function registerClient(
@@ -385,20 +392,23 @@ export async function runSetup(args: string[]): Promise<number> {
       '  to drop a systemd EnvironmentFile alongside) before rotating hosts.\n\n',
   );
 
+  // Canonical persistence: if this fails the operator is left with a
+  // just-minted token that exists nowhere, so dump it to stderr as a
+  // recovery hatch.
+  let canonicalPath: string | null;
   try {
-    writeClientSetupOutput(parsed, success, bridge);
+    canonicalPath = persistCanonical(parsed, success, bridge);
   } catch (e) {
     process.stderr.write(`${(e as Error).message}\n`);
-    // Defense in depth — the preflight above catches the common "existing
-    // config is malformed" case before minting, but a disk-full / EPERM
-    // failure during the write itself can still strand the just-minted
-    // token. Surface it on stderr as a recovery hatch so the operator can
-    // save it manually instead of being left with an unrecoverable bridge
-    // registration. The token still goes to stderr (not stdout) so
-    // `--json`-style pipelines aren't affected — they would have taken
-    // the --json branch above.
+    // The preflight above catches the common "existing config is malformed"
+    // case before minting, but a disk-full / EPERM failure during the
+    // write itself can still strand the token. Surface it on stderr so
+    // the operator can save it manually instead of being left with an
+    // unrecoverable bridge registration. The token still goes to stderr
+    // (not stdout) so `--json`-style pipelines aren't affected — they
+    // would have taken the --json branch inside persistCanonical.
     process.stderr.write(
-      '\n[recovery] persistence failed AFTER registerClient succeeded. The bridge has issued this CLIENT_TOKEN exactly once:\n' +
+      '\n[recovery] canonical persistence failed AFTER registerClient succeeded. The bridge has issued this CLIENT_TOKEN exactly once:\n' +
         `\n  CLIENT_ID:      ${success.client_id}\n` +
         `  CLIENT_TOKEN:   ${success.client_token}\n` +
         `  SERVER_URL:     ${wsUrlFromBridge(bridge)}\n` +
@@ -407,6 +417,28 @@ export async function runSetup(args: string[]): Promise<number> {
         '`rotateClientToken` GraphQL mutation if you suspect leakage.\n',
     );
     return 1;
+  }
+
+  // Optional env-file emission for systemd `EnvironmentFile=`. Errors here
+  // are NOT recovery situations: the token is already safe in canonical
+  // config.json. Surface a targeted warning that tells the operator how
+  // to populate the env file by hand without rotating the token (rerunning
+  // `setup --write-env-file` would mint a new CLIENT_TOKEN). Exit
+  // non-zero so CI / scripts catch the partial failure, but with a
+  // distinct message — not the "token was not persisted" recovery block.
+  if (parsed.envFile && !parsed.json) {
+    try {
+      writeClientEnvFile(parsed.envFile, success, bridge);
+      process.stderr.write(`Wrote env block to ${parsed.envFile} (mode 600).\n`);
+    } catch (e) {
+      process.stderr.write(
+        `\nWARNING: --write-env-file ${parsed.envFile} failed: ${(e as Error).message}\n` +
+          `  The CLIENT_TOKEN was persisted to ${canonicalPath ?? '(canonical config)'} — the daemon can start without the env file.\n` +
+          '  To populate the env file without rotating the token, copy SERVER_URL / SERVER_TOKEN / AGENT_ID out of config.json by hand.\n' +
+          '  Re-running `setup --write-env-file ...` would mint a NEW CLIENT_TOKEN and invalidate the one just written.\n',
+      );
+      return 1;
+    }
   }
 
   if (parsed.callers.length > 0) {

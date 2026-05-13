@@ -651,6 +651,88 @@ test('setup preserves operator-added / future-version keys via raw round-trip', 
   );
 });
 
+test('setup: env-file write failure does NOT trip the canonical-recovery block', async (t) => {
+  // Two distinct failure surfaces deserve distinct UX:
+  //   - canonical persistence failed → token was lost, dump it to stderr
+  //   - env-file emission failed but canonical succeeded → token is safe in
+  //     config.json, warn with manual-copy instructions instead of the
+  //     "token not persisted" recovery block.
+  // This test exercises the latter by pointing --write-env-file at an
+  // existing directory, which makes openSync('wx') fail with EISDIR.
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-envfail-'));
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  process.env.HOME = tmpHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+  });
+
+  saveOwnerSession({
+    bridge: 'https://bridge.test',
+    token: 'vbc_owner_test',
+    principal_id: 'google:123',
+    email: null,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    saved_at: new Date().toISOString(),
+  });
+
+  // Make the requested env-file path collide with a directory so the
+  // atomic write trips EISDIR.
+  const { mkdirSync } = await import('node:fs');
+  const envFile = join(tmpHome, 'a-directory.env');
+  mkdirSync(envFile);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({
+      data: {
+        registerClient: {
+          clientWithToken: {
+            id: 'client-1',
+            token: 'fresh-token',
+            ownerPrincipal: 'google:123',
+            allowedAgentIds: ['agent-1'],
+          },
+        },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let stderr = '';
+  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  });
+
+  const code = await runSetup([
+    '--client-name', 'test client',
+    '--agent-ids', 'agent-1',
+    '--write-env-file', envFile,
+  ]);
+  assert.equal(code, 1);
+
+  // Canonical persisted — assert the token is on disk under VICOOP_HOME.
+  const after = readConfig(join(process.env.VICOOP_HOME, 'config.json'));
+  assert.equal(after?.server_token, 'fresh-token');
+  assert.equal(after?.agent_id, 'agent-1');
+
+  // Warning explains config is safe + how to recover without rotating the
+  // token. Crucially, the "[recovery] canonical persistence failed"
+  // wording is NOT printed — that's the misleading message we removed.
+  assert.match(stderr, /--write-env-file .* failed/);
+  assert.match(stderr, /CLIENT_TOKEN was persisted/);
+  assert.match(stderr, /would mint a NEW CLIENT_TOKEN/);
+  assert.doesNotMatch(stderr, /\[recovery\] canonical persistence failed/);
+});
+
 test('setup refuses to overwrite an existing-but-malformed config.json', async (t) => {
   // The merge path leans on readConfig returning the prior file's parsed
   // shape. If the file exists but is malformed (operator hand-edited it into
