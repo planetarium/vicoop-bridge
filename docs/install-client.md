@@ -552,6 +552,14 @@ Codex sessions.
 > applies, but stamped into argv so the posture is visible in `ps` / audit
 > logs and survives any future change to Codex's own default.
 
+> **`cwd` must be a git repository.** `codex exec` refuses to run from a
+> directory that is neither a git repo nor an operator-trusted path,
+> exiting non-zero in ~200 ms. The client pre-checks this and fails fast
+> with `codex_cwd_not_git_repo` when it would. Run `git init` inside the
+> directory, point `cwd` at an existing repo, or — if you intentionally
+> want to run outside a repo — add `--skip-git-repo-check` to
+> `backends.codex.extra_args`.
+
 ## Manage caller allowlists
 
 If Step 4 setup did not include `--caller`, the policy has empty

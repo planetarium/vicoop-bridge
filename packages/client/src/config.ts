@@ -107,6 +107,11 @@ export interface ClaudeBackendConfig {
 export interface CodexBackendConfig {
   cwd?: string;
   sandbox_mode?: string;
+  // Extra positional/optional arguments to splice into `codex exec`
+  // after our own option args (sandbox_mode, --image, …). Useful for
+  // opt-outs like `--skip-git-repo-check` and for forwarding flags Codex
+  // adds in versions newer than this client's defaults.
+  extra_args?: string[];
 }
 
 export interface OpenclawBackendConfig {
@@ -203,10 +208,19 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const sandbox = asString(codexRaw.sandbox_mode);
       const validSandbox =
         sandbox && KNOWN_CODEX_SANDBOX_MODES.has(sandbox) ? sandbox : undefined;
-      if (cwd || validSandbox) {
+      // Only accept a homogeneous string array — anything else (a bare
+      // string, a number, nested objects) is dropped to keep malformed
+      // edits from injecting non-string args into the spawned argv.
+      const extraArgsRaw = codexRaw.extra_args;
+      const extraArgs =
+        Array.isArray(extraArgsRaw) && extraArgsRaw.every((v) => typeof v === 'string')
+          ? (extraArgsRaw as string[])
+          : undefined;
+      if (cwd || validSandbox || (extraArgs && extraArgs.length > 0)) {
         out.codex = {};
         if (cwd) out.codex.cwd = cwd;
         if (validSandbox) out.codex.sandbox_mode = validSandbox;
+        if (extraArgs && extraArgs.length > 0) out.codex.extra_args = extraArgs;
       }
     }
     const ocRaw = asRecord(backends.openclaw);

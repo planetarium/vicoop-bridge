@@ -168,7 +168,11 @@ test('text-only task spawns codex exec --json - and writes prompt to stdin', asy
     ],
   ]);
 
-  const backend = createCodexBackend({ spawn: fake.spawn, cwd: '/repo' });
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    cwd: '/repo',
+    hasGitDir: async () => true,
+  });
   const { emit, frames } = collect();
   await backend.handle(assign('say hi'), emit, NEVER);
 
@@ -461,6 +465,92 @@ test('nonzero exit emits task.fail with stderr tail', async () => {
   assert.equal(fail.error.code, 'codex_exit_nonzero');
   assert.match(fail.error.message, /code 2/);
   assert.match(fail.error.message, /auth required/);
+  assert.match(fail.error.message, /argv=/);
+});
+
+test('nonzero exit message includes argv and cwd for repro (#147)', async () => {
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      child.emitStderr('boom\n');
+      setImmediate(() => child.finish(1));
+    });
+  });
+
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    cwd: '/srv/agent-work',
+    hasGitDir: async () => true,
+  });
+  const { emit, frames } = collect();
+  await backend.handle(assign('x'), emit, NEVER);
+
+  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
+  assert.ok(fail);
+  assert.equal(fail.error.code, 'codex_exit_nonzero');
+  assert.match(fail.error.message, /argv=\[/);
+  assert.match(fail.error.message, /"codex"/);
+  assert.match(fail.error.message, /"exec"/);
+  assert.match(fail.error.message, /cwd="\/srv\/agent-work"/);
+});
+
+test('cwd that is not a git repository fails fast with codex_cwd_not_git_repo (#147)', async () => {
+  let spawned = 0;
+  const backend = createCodexBackend({
+    spawn: () => {
+      spawned++;
+      throw new Error('should not spawn');
+    },
+    cwd: '/tmp/not-a-repo',
+    hasGitDir: async () => false,
+  });
+  const { emit, frames } = collect();
+  await backend.handle(assign('x'), emit, NEVER);
+
+  assert.equal(spawned, 0);
+  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
+  assert.ok(fail);
+  assert.equal(fail.error.code, 'codex_cwd_not_git_repo');
+  assert.match(fail.error.message, /not a git repository/);
+  assert.match(fail.error.message, /--skip-git-repo-check/);
+});
+
+test('--skip-git-repo-check in extraArgs bypasses the git pre-check (#147)', async () => {
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    cwd: '/tmp/not-a-repo',
+    extraArgs: ['--skip-git-repo-check'],
+    // Would return false if asked, but the bypass must mean we never ask.
+    hasGitDir: async () => {
+      throw new Error('hasGitDir should not be called when --skip-git-repo-check is set');
+    },
+  });
+  const { emit, frames } = collect();
+  await backend.handle(assign('x'), emit, NEVER);
+
+  const child = fake.lastChild()!;
+  assert.ok(child.args.includes('--skip-git-repo-check'));
+  assert.ok(frames.some((f) => f.type === 'task.complete'));
+});
+
+test('hasGitDir is not invoked when cwd is unset', async () => {
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  let invoked = false;
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    hasGitDir: async () => {
+      invoked = true;
+      return true;
+    },
+  });
+  const { emit } = collect();
+  await backend.handle(assign('x'), emit, NEVER);
+  assert.equal(invoked, false);
 });
 
 test('signal exit emits task.fail without code null wording', async () => {
