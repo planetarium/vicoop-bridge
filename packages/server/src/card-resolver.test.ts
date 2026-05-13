@@ -15,7 +15,7 @@ test('resolves canonical server card from backendKind when inline card is absent
   assert.equal(result.ok && result.agentCard.name, 'claude');
   assert.deepEqual(
     result.ok && result.agentCard.defaultInputModes,
-    ['text/plain', 'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf'],
+    ['text/plain', 'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf', 'application/json'],
   );
 });
 
@@ -27,7 +27,7 @@ test('resolves canonical codex server card from backendKind', () => {
   assert.equal(result.ok && result.agentCard.name, 'codex');
   assert.deepEqual(
     result.ok && result.agentCard.defaultInputModes,
-    ['text/plain', 'image/png', 'image/jpeg', 'image/gif', 'image/webp'],
+    ['text/plain', 'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/json'],
   );
   assert.deepEqual(result.ok && result.agentCard.defaultOutputModes, ['text/plain']);
 });

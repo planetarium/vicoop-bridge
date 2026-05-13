@@ -19,7 +19,8 @@
     "image/jpeg",
     "image/gif",
     "image/webp",
-    "application/pdf"
+    "application/pdf",
+    "application/json"
   ],
   "defaultOutputModes": [
     "text/plain",
@@ -33,7 +34,7 @@
     {
       "id": "chat",
       "name": "chat",
-      "description": "Ask a question or give an instruction in natural language; the Claude Code CLI responds with text. Optionally include inline image (image/{png,jpeg,gif,webp}) or PDF (application/pdf) parts as `file.bytes`.",
+      "description": "Ask a question or give an instruction in natural language; the Claude Code CLI responds with text. Optionally include inline image (image/{png,jpeg,gif,webp}) or PDF (application/pdf) parts as `file.bytes`. Auxiliary structured context can be attached as A2A `data` parts; they are serialized into the prompt as tagged JSON blocks.",
       "tags": ["chat", "assistant", "claude"]
     }
   ]

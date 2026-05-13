@@ -297,14 +297,12 @@ test('abort propagates SIGTERM and completes as canceled', async () => {
   assert.equal(artifacts.length, 1);
 });
 
-test('rejects data parts as unsupported_part_kind without spawning', async () => {
-  let spawned = 0;
-  const backend = createClaudeBackend({
-    spawn: () => {
-      spawned++;
-      throw new Error('should not spawn');
-    },
+test('data parts are serialized into a tagged JSON text content block', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
   });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
   const { emit, frames } = collect();
   const task: TaskAssignFrame = {
     type: 'task.assign',
@@ -313,15 +311,30 @@ test('rejects data parts as unsupported_part_kind without spawning', async () =>
     message: {
       role: 'user',
       messageId: 'm1',
-      parts: [{ kind: 'data', data: { foo: 'bar' } }],
+      parts: [
+        { kind: 'text', text: 'please review' },
+        { kind: 'data', data: { ticket: 42, priority: 'high' } },
+      ],
     },
   };
   await backend.handle(task, emit, NEVER);
 
-  assert.equal(spawned, 0);
-  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
-  assert.ok(fail);
-  assert.equal(fail.error.code, 'unsupported_part_kind');
+  const fail = frames.find((f) => f.type === 'task.fail');
+  assert.equal(fail, undefined);
+
+  const child = fake.lastChild()!;
+  const env = JSON.parse(child.stdinPayload.trim()) as {
+    message: { content: Array<{ type: string; text?: string }> };
+  };
+  assert.equal(env.message.content.length, 2);
+  assert.equal(env.message.content[0].type, 'text');
+  assert.equal(env.message.content[0].text, 'please review');
+  assert.equal(env.message.content[1].type, 'text');
+  const second = env.message.content[1].text ?? '';
+  assert.match(second, /^<context kind="application\/json">\n/);
+  assert.ok(second.includes('"ticket": 42'));
+  assert.ok(second.includes('"priority": "high"'));
+  assert.ok(second.endsWith('</context>'));
 });
 
 test('rejects FilePart with unsupported MIME (e.g. application/zip)', async () => {

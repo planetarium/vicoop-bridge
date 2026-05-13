@@ -690,7 +690,7 @@ test('image FilePart.bytes creates temp files and passes --image args', async ()
   assert.deepEqual(removed, ['/tmp/vicoop-codex-test']);
 });
 
-test('unsupported file and data parts fail fast before spawn', async () => {
+test('unsupported file parts fail fast before spawn', async () => {
   let spawned = 0;
   const backend = createCodexBackend({
     spawn: () => {
@@ -699,12 +699,6 @@ test('unsupported file and data parts fail fast before spawn', async () => {
     },
   });
 
-  const dataTask: TaskAssignFrame = {
-    type: 'task.assign',
-    taskId: 't1',
-    contextId: 'c',
-    message: { role: 'user', messageId: 'm1', parts: [{ kind: 'data', data: { foo: 'bar' } }] },
-  };
   const pdfTask: TaskAssignFrame = {
     type: 'task.assign',
     taskId: 't2',
@@ -716,14 +710,69 @@ test('unsupported file and data parts fail fast before spawn', async () => {
     },
   };
 
-  const framesA = collect();
-  const framesB = collect();
-  await backend.handle(dataTask, framesA.emit, NEVER);
-  await backend.handle(pdfTask, framesB.emit, NEVER);
+  const frames = collect();
+  await backend.handle(pdfTask, frames.emit, NEVER);
 
   assert.equal(spawned, 0);
-  assert.equal((framesA.frames[0] as Extract<UpFrame, { type: 'task.fail' }>).error.code, 'unsupported_part_kind');
-  assert.equal((framesB.frames[0] as Extract<UpFrame, { type: 'task.fail' }>).error.code, 'unsupported_file_mime');
+  assert.equal((frames.frames[0] as Extract<UpFrame, { type: 'task.fail' }>).error.code, 'unsupported_file_mime');
+});
+
+test('data parts are serialized into the codex prompt as tagged JSON', async () => {
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  const backend = createCodexBackend({ spawn: fake.spawn });
+
+  const task: TaskAssignFrame = {
+    type: 'task.assign',
+    taskId: 't-data',
+    contextId: 'c',
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [
+        { kind: 'text', text: 'summarize' },
+        { kind: 'data', data: { ticket: 42, priority: 'high' } },
+      ],
+    },
+  };
+
+  const { emit, frames } = collect();
+  await backend.handle(task, emit, NEVER);
+
+  const child = fake.lastChild()!;
+  assert.match(child.stdinPayload, /^summarize\n\n<context kind="application\/json">\n/);
+  assert.ok(child.stdinPayload.includes('"ticket": 42'));
+  assert.ok(child.stdinPayload.includes('"priority": "high"'));
+  assert.ok(child.stdinPayload.endsWith('</context>'));
+
+  const failFrame = frames.find((f) => f.type === 'task.fail');
+  assert.equal(failFrame, undefined);
+});
+
+test('data-only message produces a prompt with just the JSON context block', async () => {
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  const backend = createCodexBackend({ spawn: fake.spawn });
+
+  const task: TaskAssignFrame = {
+    type: 'task.assign',
+    taskId: 't-data-only',
+    contextId: 'c',
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [{ kind: 'data', data: { hello: 'world' } }],
+    },
+  };
+
+  const { emit } = collect();
+  await backend.handle(task, emit, NEVER);
+
+  const child = fake.lastChild()!;
+  assert.match(child.stdinPayload, /^<context kind="application\/json">\n/);
+  assert.ok(child.stdinPayload.includes('"hello": "world"'));
 });
 
 test('image materialization failure emits task.fail and cleans temp dir before spawn', async () => {
