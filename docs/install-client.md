@@ -188,10 +188,25 @@ CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
 and authorize with your Google account. `setup` registers the client, configures
 any `--caller` allowlist entries, and persists the daemon credentials to
 `~/.vicoop/config.json` (mode 600 — see #137 for the consolidated config
-layout). On success it prints something like:
+layout). The success output looks like:
 
 ```text
+  client_id        <uuid>
+  owner_principal  google:sub:<sub>
+  client_name      openclaw on my-host
+  allowed_agents   openclaw-my-host
+
+The CLIENT_TOKEN is shown only once and cannot be retrieved later.
+  Save the setup output or env file now.
+
 Wrote /home/you/.vicoop/config.json (mode 600).
+```
+
+Verify it landed where you expect (matters when `$VICOOP_HOME` or
+`$XDG_CONFIG_HOME` is set):
+
+```sh
+ls -l ~/.vicoop/config.json   # or "$VICOOP_HOME/config.json" / "$XDG_CONFIG_HOME/vicoop/config.json"
 ```
 
 `config.json` is the canonical place the daemon looks for `server_url`,
@@ -264,26 +279,9 @@ agent will be public until you restrict callers:
 > login flow saves one locally for you). Rotation surfaces a new
 > CLIENT_TOKEN, also one-time.
 
-### Optional: also write a systemd `EnvironmentFile=`
-
-If you plan to launch the daemon under a systemd unit that uses
-`EnvironmentFile=` (the layout `install.sh` generates), pass
-`--write-env-file <path>` to also drop an `export KEY='value'` file
-alongside `config.json`. The two are kept in sync by `setup`; either one
-on its own is enough to run the daemon. The env file's `export` prefix
-plus single-quoted values mean `. "$INSTALL_DIR/vicoop-client.env"`
-propagates safely even when an agent id contains shell metacharacters.
-
-```sh
-"$INSTALL_DIR/bin/vicoop-client" setup \
-  --client-name "$CLIENT_NAME" \
-  --agent-ids "$AGENT_ID" \
-  --caller "eth:0x<40-hex>" \
-  --write-env-file "$INSTALL_DIR/vicoop-client.env"
-```
-
-For setup scripting, drop `--write-env-file` and pass `--json` instead if you want to compose
-with shell tooling:
+For setup scripting, pass `--json` instead of writing `config.json` if you
+want to compose with shell tooling (no disk side effects, raw response on
+stdout):
 
 ```sh
 "$INSTALL_DIR/bin/vicoop-client" setup \
@@ -294,10 +292,10 @@ with shell tooling:
 CLIENT_TOKEN=$(jq -r .client_token /tmp/vicoop-setup.json)
 ```
 
-`--write-env-file` replaces the older `--env-file` spelling. The old alias is
-still accepted by current bundles, but avoid it on Node 24 or newer unless the
-bundle wrapper has been updated to invoke `node -- dist/cli.js`; otherwise
-Node may consume `--env-file` before the CLI sees it.
+For systemd installs that use `EnvironmentFile=`, see ["Optional: also
+write a systemd `EnvironmentFile=`"](#optional-also-write-a-systemd-environmentfile)
+under persistence — `setup --write-env-file <path>` writes the env file in
+addition to `config.json`.
 
 `--agent-ids` is a comma-separated allowlist. Include every id you plan to
 run under this single token if you know them up front; amend later via
@@ -317,8 +315,10 @@ token.
    `~/.vicoop/owner-session.json` (mode 600).
 4. `setup` calls the authenticated GraphQL `registerClient` mutation with
    that bearer, receives `{client_id, client_token, owner_principal,
-   allowed_agent_ids}`, and writes the client env file. It never sees a
-   `vbc_caller_*` token.
+   allowed_agent_ids}`, and writes the daemon credentials into
+   `~/.vicoop/config.json` (mode 600). With `--write-env-file <path>` it
+   additionally emits a systemd-shaped env file at that path. It never
+   sees a `vbc_caller_*` token.
 
 This means a Google-only operator can stand up a bridge client without
 ever holding a wallet or seed phrase. Owner is recorded as
@@ -388,8 +388,14 @@ BACKEND=openclaw \
   "$INSTALL_DIR/bin/vicoop-client"
 ```
 
-If you also wrote a systemd `EnvironmentFile=` via `--write-env-file` in
-Step 4, source it instead of relying on `config.json`:
+Precedence at startup is **CLI flag > env var > `--config <path>` > canonical
+`config.json`**, so the layers compose freely — e.g. a systemd unit can keep
+`SERVER_TOKEN` in `EnvironmentFile=` while letting backend defaults
+(`CLAUDE_SETTINGS_JSON`, openclaw gateway URL, etc.) live in `config.json`.
+
+If you generated an env file via `--write-env-file` in Step 4 and want to
+test it locally, sourcing it works because the env values override
+`config.json` (same precedence):
 
 ```sh
 . "$INSTALL_DIR/vicoop-client.env"
@@ -397,11 +403,6 @@ Step 4, source it instead of relying on `config.json`:
 BACKEND=openclaw \
   "$INSTALL_DIR/bin/vicoop-client"
 ```
-
-Precedence at startup is CLI flag > env var > `--config <path>` > canonical
-`config.json`, so the two layers compose freely — e.g. a systemd unit can
-keep `SERVER_TOKEN` in `EnvironmentFile=` while letting backend defaults
-(`CLAUDE_SETTINGS_JSON`, openclaw gateway URL, etc.) live in `config.json`.
 
 On success you'll see a `[client] connected, sending hello` log. After that:
 
@@ -531,70 +532,18 @@ text output. `CODEX_SANDBOX_MODE` is optional and accepts `read-only`,
 `-c sandbox_mode="<mode>"` so the same setting applies to fresh and resumed
 Codex sessions.
 
-## Optional: persistence
-
-Only set up persistence after the foreground run connects and the agent
-endpoint responds. For local Claude/OpenClaw onboarding, a foreground process
-is often enough for first success.
-
-On systemd hosts where `install.sh` wrote a unit, populate the generated
-`EnvironmentFile=` with the credentials the daemon needs. The unit reads
-this file directly (DynamicUser can't reach `~/.vicoop/config.json` in the
-caller's home), so copy the values out of `~/.vicoop/config.json` — or
-rerun `setup --write-env-file <path>` pointing at the systemd path to sync
-both in one step — and fill in `BACKEND` to match the foreground run:
-
-```sh
-SERVER_URL=wss://vicoop-bridge-server.fly.dev
-SERVER_TOKEN=<copy from ~/.vicoop/config.json>
-AGENT_ID=<your agent id>
-BACKEND=openclaw
-```
-
-Then reload and start the service using the exact commands printed by the
-installer, for example:
-
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now vicoop-client
-```
-
-For macOS or ad hoc local testing, run the foreground command above directly,
-or wrap it in a detached session if you want it to survive the terminal
-closing. The bridge does not require systemd; it only needs one live
-`vicoop-client` process connected for the agent id.
-
-`nohup … &` tends to lose stdout/stderr on macOS; prefer `screen` or `tmux`
-with explicit log redirection so failures are recoverable:
-
-```sh
-mkdir -p "$INSTALL_DIR/logs"
-screen -dmS vicoop-client bash -lc "BACKEND=claude \"$INSTALL_DIR/bin/vicoop-client\" \
-  >> \"$INSTALL_DIR/logs/client.log\" 2>&1"
-
-# tail the log
-tail -f "$INSTALL_DIR/logs/client.log"
-
-# stop
-screen -S vicoop-client -X quit
-```
-
-`launchd` is the persistent option if you want the client to start at login;
-write a plist under `~/Library/LaunchAgents/` and load it with
-`launchctl load -w`.
-
-### Recommended: restrict who can call your agent
+## Manage caller allowlists
 
 If Step 4 setup did not include `--caller`, the policy has empty
-`allowed_callers`, which the dispatcher treats as "public". For normal use, pass
-`--caller` during initial setup, or add an allowlist entry afterward with the
-`vicoop-client` subcommands (deterministic, scriptable) or a natural-language
-request to the admin agent. These paths require an **owner-session token**
-(`vbc_owner_*`). Step 4 login saves one locally; you only need to rerun `login`
-if that file is missing or expired. Admin scope
-(`is_admin()`) is wallet-only and gates only the cross-owner tools.
+`allowed_callers`, which the dispatcher treats as "public". For normal use,
+pass `--caller` during initial setup, or add an allowlist entry afterward
+with the `vicoop-client` subcommands (deterministic, scriptable) or a
+natural-language request to the admin agent. These paths require an
+**owner-session token** (`vbc_owner_*`). Step 4 login saves one locally;
+you only need to rerun `login` if that file is missing or expired. Admin
+scope (`is_admin()`) is wallet-only and gates only the cross-owner tools.
 
-#### Option A: `vicoop-client` subcommands (recommended for scripts)
+### Option A: `vicoop-client` subcommands (recommended for scripts)
 
 These subcommands require **bundle version 0.8.0 or newer**. Older
 installs only know the daemon flags; check before using and upgrade if
@@ -635,7 +584,7 @@ it without registering a new client:
 These talk to the bridge's `/admin-api/*` routes — same logic the admin
 agent's tools run, but without an LLM round-trip per call.
 
-#### Option B: natural-language admin agent
+### Option B: natural-language admin agent
 
 ```sh
 # $OWNER_TOKEN: vbc_owner_* token from /auth/siwe/exchange or
@@ -651,6 +600,82 @@ curl -sX POST "$BRIDGE_URL/" \
 
 Either path hot-reloads via `registry.updateAllowedCallers` — no client
 restart needed.
+
+## Optional: persistence
+
+Only set up persistence after the foreground run connects and the agent
+endpoint responds. For local Claude/OpenClaw onboarding, a foreground process
+is often enough for first success.
+
+### Optional: also write a systemd `EnvironmentFile=`
+
+On systemd hosts where `install.sh` wrote a unit, the unit reads credentials
+from the `EnvironmentFile=` (path printed by the installer). The simplest
+way to populate it is to rerun `setup` with `--write-env-file <path>` so
+both `~/.vicoop/config.json` and the env file are written from the same
+`registerClient` call:
+
+```sh
+"$INSTALL_DIR/bin/vicoop-client" setup \
+  --client-name "$CLIENT_NAME" \
+  --agent-ids "$AGENT_ID" \
+  --caller "eth:0x<40-hex>" \
+  --write-env-file /etc/vicoop-client.env   # or the user-scope path the installer printed
+```
+
+`--write-env-file` mints a fresh CLIENT_TOKEN, so prefer it at first
+install. To populate the env file from an already-issued token without
+rotating it, copy the relevant fields out of `~/.vicoop/config.json` by
+hand and append `BACKEND=` to match your foreground run:
+
+```sh
+SERVER_URL=wss://vicoop-bridge-server.fly.dev
+SERVER_TOKEN=<copy from ~/.vicoop/config.json>
+AGENT_ID=<your agent id>
+BACKEND=openclaw
+```
+
+> **Why the env file matters for system-scope systemd.** With
+> `DynamicUser=yes` (the default for `system` scope), the daemon runs as a
+> transient UID that has no access to the operator's `~/.vicoop/config.json`.
+> The `EnvironmentFile=` is read by systemd itself before the user switch,
+> which is why it's the credential delivery path for that scope.
+> **User-scope** units run as the caller and can read `~/.vicoop/config.json`
+> directly — the env file is optional there.
+
+Then reload and start the service using the exact commands printed by the
+installer, for example:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now vicoop-client
+```
+
+### macOS / ad-hoc detached run
+
+For macOS or ad hoc local testing, run the foreground command from Step 6
+directly, or wrap it in a detached session if you want it to survive the
+terminal closing. The bridge does not require systemd; it only needs one
+live `vicoop-client` process connected for the agent id.
+
+`nohup … &` tends to lose stdout/stderr on macOS; prefer `screen` or `tmux`
+with explicit log redirection so failures are recoverable:
+
+```sh
+mkdir -p "$INSTALL_DIR/logs"
+screen -dmS vicoop-client bash -lc "BACKEND=claude \"$INSTALL_DIR/bin/vicoop-client\" \
+  >> \"$INSTALL_DIR/logs/client.log\" 2>&1"
+
+# tail the log
+tail -f "$INSTALL_DIR/logs/client.log"
+
+# stop
+screen -S vicoop-client -X quit
+```
+
+`launchd` is the persistent option if you want the client to start at login;
+write a plist under `~/Library/LaunchAgents/` and load it with
+`launchctl load -w`.
 
 ## Updating the client
 
@@ -782,8 +807,8 @@ it just owns the row under an `eth:0x…` principal instead of
 the Google path.
 
 The same `OWNER_TOKEN` is what you'd present to the admin agent at
-`POST /` for managing `allowed_callers` (see "Restrict who can call your
-agent" above). Google operators get an equivalent `vbc_owner_*` from the
+`POST /` for managing `allowed_callers` (see "Manage caller allowlists"
+above). Google operators get an equivalent `vbc_owner_*` from the
 device flow and can use the admin agent the same way; admin **scope**
 (visibility into all owners' rows) remains wallet-only.
 
