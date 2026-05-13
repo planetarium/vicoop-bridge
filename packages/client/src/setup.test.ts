@@ -82,8 +82,10 @@ test('setup registers client with saved owner-session and writes daemon env', as
   assert.match(envBody, /^export SERVER_TOKEN='client-token'$/m);
   assert.match(envBody, /^export AGENT_ID='agent-1'$/m);
   assert.match(stderr, /client_id\s+client-1/);
-  assert.match(stderr, /The CLIENT_TOKEN is shown only once/);
-  assert.match(stderr, /Save the setup output or env file now/);
+  // Updated banner reflects "token is persisted, not displayed" — setup
+  // writes it to config.json by default and only --json prints it.
+  assert.match(stderr, /The CLIENT_TOKEN is one-time/);
+  assert.match(stderr, /setup persists it to the canonical config/);
   assert.match(stderr, /WARNING: no callers configured/);
 });
 
@@ -713,7 +715,10 @@ test('setup refuses to overwrite an existing-but-malformed config.json', async (
     '--agent-ids', 'agent-1',
   ]);
   assert.equal(code, 1);
-  assert.match(stderr, /refusing to overwrite/);
+  // Preflight refuses to mint a token before registerClient runs, so the
+  // operator doesn't end up with an unrecoverable bridge registration whose
+  // token they never got to see.
+  assert.match(stderr, /refusing to mint a token we cannot save/);
   // Broken file left untouched so the operator can inspect it.
   assert.equal(readFileSync(configPath, 'utf8'), '{not json');
 });

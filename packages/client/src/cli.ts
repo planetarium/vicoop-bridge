@@ -19,6 +19,7 @@ import {
 } from './admin-cli.js';
 import { runWhoami } from './whoami.js';
 import { deriveIdentity } from './identity.js';
+import { existsSync } from 'node:fs';
 import {
   type ClientConfig,
   defaultConfigPath,
@@ -58,7 +59,26 @@ function parseClientArgs(argv: string[]): Args {
   // overlaid on top per field so missing keys (notably `backends.*`) fall
   // through from the canonical file instead of disappearing whenever the
   // operator points --config at a partial file.
-  const canonical = readConfig(defaultConfigPath()) ?? {};
+  //
+  // If the canonical file is on disk but readConfig returns null (malformed
+  // JSON / not an object), warn loudly. The canonical config is optional
+  // (systemd installs configure everything via EnvironmentFile=) so we
+  // proceed with an empty config; if env / CLI fills the gap the daemon
+  // still starts, but the operator sees the root cause if it doesn't,
+  // instead of being misled by a generic "missing required args" later.
+  const canonicalPath = defaultConfigPath();
+  let canonical: ClientConfig = {};
+  if (existsSync(canonicalPath)) {
+    const loaded = readConfig(canonicalPath);
+    if (loaded === null) {
+      console.warn(
+        `[client] ${canonicalPath} exists but is unreadable / not a JSON object; ` +
+          'proceeding with env vars + CLI flags only — fix or move it aside to use the file.',
+      );
+    } else {
+      canonical = loaded;
+    }
+  }
   let config: ClientConfig = canonical;
   if (flags.config) {
     const explicit = readConfig(flags.config);

@@ -101,8 +101,14 @@ export interface ClientConfig {
   backends?: BackendConfigs;
 }
 
+// Trim hand-edited values and drop the result when it's whitespace-only.
+// Matches the env / CLI layers (both already call `.trim()` on their inputs)
+// so a config like `"server_url": " wss://bridge "` doesn't surface as a
+// "looks set but doesn't connect" mystery.
 function asString(v: unknown): string | undefined {
-  return typeof v === 'string' && v.length > 0 ? v : undefined;
+  if (typeof v !== 'string') return undefined;
+  const trimmed = v.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function asNumber(v: unknown): number | undefined {

@@ -212,6 +212,32 @@ test('overlayConfig: when both sides set the same backend slot, top wins entirel
   });
 });
 
+test('normalizeConfig trims string fields and drops whitespace-only', (t) => {
+  // Hand-edited config files often have stray whitespace around values; if
+  // that bled through verbatim into env vars / URLs / argv it would surface
+  // as a confusing connection failure. Normalize trims so config.json
+  // behaves like the env / CLI layers, both of which already call .trim().
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-trim-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  writeFileSync(
+    path,
+    JSON.stringify({
+      server_url: '  wss://bridge.test  ',
+      server_token: '\t fresh-token \n',
+      backend: 'claude\n',
+      agent_id: '   ', // whitespace-only — dropped
+      backends: { openclaw: { agent: ' main ' } },
+    }),
+  );
+  assert.deepEqual(readConfig(path), {
+    server_url: 'wss://bridge.test',
+    server_token: 'fresh-token',
+    backend: 'claude',
+    backends: { openclaw: { agent: 'main' } },
+  });
+});
+
 test('normalizeConfig drops unknown backend and unknown codex.sandbox_mode', (t) => {
   // Permissive normalize must also catch enum typos — otherwise a hand-edited
   // `"backend": "claud"` or `"sandbox_mode": "workspace_write"` would survive

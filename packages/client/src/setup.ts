@@ -345,6 +345,25 @@ export async function runSetup(args: string[]): Promise<number> {
     return 1;
   }
 
+  // Preflight: if the canonical config.json already exists but readConfigRaw
+  // returns null (malformed JSON / not an object), abort BEFORE minting a
+  // client token. Otherwise `registerClient` succeeds, the token comes back
+  // exactly once from the bridge, and `writeConfigForSetup` then throws the
+  // same "refusing to overwrite" error — leaving the operator with no token
+  // and no record of it. The --json path is exempt (it doesn't touch the
+  // canonical config) and --bridge/--token explicit overrides are too:
+  // those flows don't read the canonical config either.
+  if (!parsed.json) {
+    const configPath = defaultConfigPath();
+    if (existsSync(configPath) && readConfigRaw(configPath) === null) {
+      process.stderr.write(
+        `${configPath} exists but is unreadable / not a JSON object — ` +
+          'fix or move it aside before rerunning setup (refusing to mint a token we cannot save).\n',
+      );
+      return 1;
+    }
+  }
+
   let success: ClientRegisterSuccess;
   try {
     success = await registerClient({ bridge, token }, parsed);
@@ -358,14 +377,33 @@ export async function runSetup(args: string[]): Promise<number> {
       `  owner_principal  ${success.owner_principal}\n` +
       `  client_name      ${success.client_name}\n` +
       `  allowed_agents   ${success.allowed_agent_ids.join(', ')}\n\n` +
-      'The CLIENT_TOKEN is shown only once and cannot be retrieved later.\n' +
-      '  Save the setup output or env file now.\n\n',
+      'The CLIENT_TOKEN is one-time — the bridge cannot reissue it.\n' +
+      '  setup persists it to the canonical config below; --json prints it to\n' +
+      '  stdout instead. Back up that file (or rerun with --write-env-file\n' +
+      '  to drop a systemd EnvironmentFile alongside) before rotating hosts.\n\n',
   );
 
   try {
     writeClientSetupOutput(parsed, success, bridge);
   } catch (e) {
     process.stderr.write(`${(e as Error).message}\n`);
+    // Defense in depth — the preflight above catches the common "existing
+    // config is malformed" case before minting, but a disk-full / EPERM
+    // failure during the write itself can still strand the just-minted
+    // token. Surface it on stderr as a recovery hatch so the operator can
+    // save it manually instead of being left with an unrecoverable bridge
+    // registration. The token still goes to stderr (not stdout) so
+    // `--json`-style pipelines aren't affected — they would have taken
+    // the --json branch above.
+    process.stderr.write(
+      '\n[recovery] persistence failed AFTER registerClient succeeded. The bridge has issued this CLIENT_TOKEN exactly once:\n' +
+        `\n  CLIENT_ID:      ${success.client_id}\n` +
+        `  CLIENT_TOKEN:   ${success.client_token}\n` +
+        `  SERVER_URL:     ${wsUrlFromBridge(bridge)}\n` +
+        `  AGENT_ID:       ${success.allowed_agent_ids[0] ?? ''}\n\n` +
+        '  Save these values now; they cannot be retrieved later. Rotate via ' +
+        '`rotateClientToken` GraphQL mutation if you suspect leakage.\n',
+    );
     return 1;
   }
 
