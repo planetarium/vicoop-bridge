@@ -44,11 +44,14 @@ export interface CodexBackendOptions {
   mkdtemp?: (prefix: string) => Promise<string>;
   writeFile?: (file: string, data: Buffer) => Promise<void>;
   rm?: (file: string, options: { recursive: boolean; force: boolean }) => Promise<void>;
-  // Local-only sink for spawn-failure diagnostics that must NOT travel
-  // over the wire (argv, cwd, --image temp paths). Defaults to a fresh
-  // logger driven by the same env var as the rest of the client, so
-  // operators see the line in the foreground log without explicit
-  // wiring. Tests inject a capturing stub.
+  // Local-only sink for exec-failure diagnostics (nonzero exit / signal)
+  // that must NOT travel over the wire — argv, cwd, --image temp paths
+  // are host-local. Defaults to a fresh logger driven by the same env
+  // var as the rest of the client, so operators see the line in the
+  // foreground log without explicit wiring. Tests inject a capturing
+  // stub. Note: real spawn(2) failures use error code `spawn_failed`
+  // and are a separate branch above this one — "exec-failure" here
+  // means codex started but exited non-zero.
   logger?: Logger;
 }
 
@@ -586,7 +589,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
           const argvSummary = clipTo(JSON.stringify([command, ...args]), 400);
           const cwdSummary = cwd ? ` cwd=${JSON.stringify(cwd)}` : '';
           logger.warn(
-            `codex spawn-failure repro taskId=${task.taskId} argv=${argvSummary}${cwdSummary}`,
+            `codex exec-failure repro taskId=${task.taskId} argv=${argvSummary}${cwdSummary}`,
           );
           emit({
             type: 'task.fail',

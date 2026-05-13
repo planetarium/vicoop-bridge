@@ -483,7 +483,7 @@ test('nonzero exit emits task.fail with stderr tail (no host-local argv/cwd on t
   assert.doesNotMatch(fail.error.message, /cwd=/);
 });
 
-test('spawn-failure repro line goes to the local logger, not the wire (#147 Copilot)', async () => {
+test('exec-failure repro line goes to the local logger, not the wire (#147 Copilot)', async () => {
   const fake = makeFakeSpawn((child) => {
     setImmediate(() => {
       child.emitStderr('boom\n');
@@ -515,7 +515,7 @@ test('spawn-failure repro line goes to the local logger, not the wire (#147 Copi
   assert.doesNotMatch(fail.error.message, /\/srv\/agent-work/);
 
   // Local logger receives the full argv + cwd for operator debugging.
-  const repro = warnLines.find((l) => l.includes('codex spawn-failure repro'));
+  const repro = warnLines.find((l) => l.includes('codex exec-failure repro'));
   assert.ok(repro, `expected a repro warn line, got: ${JSON.stringify(warnLines)}`);
   assert.match(repro, /argv=\[/);
   assert.match(repro, /"codex"/);
