@@ -514,7 +514,8 @@ test('exec-failure repro line goes to the local logger, not the wire (#147)', as
   assert.equal(fail.error.code, 'codex_exit_nonzero');
   assert.doesNotMatch(fail.error.message, /\/srv\/agent-work/);
 
-  // Local logger receives the full argv + cwd for operator debugging.
+  // Local logger receives an argv summary (clipped to 400 chars in
+  // codex.ts) + cwd for operator debugging.
   const repro = warnLines.find((l) => l.includes('codex exec-failure repro'));
   assert.ok(repro, `expected a repro warn line, got: ${JSON.stringify(warnLines)}`);
   assert.match(repro, /argv=\[/);
