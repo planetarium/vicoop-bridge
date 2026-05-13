@@ -71,25 +71,41 @@ test('missing required args reported as a list', () => {
 });
 
 test('parseFlags picks up known flags and ignores unrecognised ones', () => {
-  assert.deepEqual(
-    parseFlags([
-      '--server', 'wss://x',
-      '--token', 't',
-      '--agentId', 'a',
-      '--backend', 'claude',
-      '--card', '/c.json',
-      '--config', '/etc/vicoop/config.json',
-      '--unknown', 'value',
-    ]),
-    {
-      server: 'wss://x',
-      token: 't',
-      agentId: 'a',
-      backend: 'claude',
-      card: '/c.json',
-      config: '/etc/vicoop/config.json',
-    },
-  );
+  const r = parseFlags([
+    '--server', 'wss://x',
+    '--token', 't',
+    '--agentId', 'a',
+    '--backend', 'claude',
+    '--card', '/c.json',
+    '--config', '/etc/vicoop/config.json',
+    '--unknown', 'value',
+  ]);
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.deepEqual(r.flags, {
+    server: 'wss://x',
+    token: 't',
+    agentId: 'a',
+    backend: 'claude',
+    card: '/c.json',
+    config: '/etc/vicoop/config.json',
+  });
+});
+
+test('parseFlags fails when a known flag is missing its value', () => {
+  // Trailing --config with no token after it should not silently set
+  // config = undefined; report the missing value so the operator notices.
+  const trailing = parseFlags(['--server', 'wss://x', '--config']);
+  assert.equal(trailing.ok, false);
+  if (trailing.ok) return;
+  assert.match(trailing.error, /--config requires a value/);
+
+  // --config followed by another --flag means the operator forgot the path
+  // and the next flag would otherwise be consumed as the value. Reject.
+  const consumed = parseFlags(['--config', '--server', 'wss://x']);
+  assert.equal(consumed.ok, false);
+  if (consumed.ok) return;
+  assert.match(consumed.error, /--config requires a value/);
 });
 
 test('empty env values fall through to config', () => {

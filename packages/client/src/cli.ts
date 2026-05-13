@@ -22,6 +22,7 @@ import { deriveIdentity } from './identity.js';
 import {
   type ClientConfig,
   defaultConfigPath,
+  overlayConfig,
   readConfig,
 } from './config.js';
 import { mergeClientArgs, parseFlags, type DaemonArgs as Args } from './cli-args.js';
@@ -39,17 +40,37 @@ const CODEX_SANDBOX_MODES = new Set<CodexSandboxMode>([
 // Precedence (highest wins):
 //   1. CLI flag values
 //   2. env vars (kept for systemd EnvironmentFile= compatibility)
-//   3. `--config <path>` file
+//   3. `--config <path>` file (overlaid on canonical, per field)
 //   4. canonical config.json at the resolved vicoop dir
 //
 // Each layer is optional and contributes only the fields it sets, so
 // operators can split state across them — e.g. systemd unit ships server_*
 // via EnvironmentFile while backends.* lives in config.json.
 function parseClientArgs(argv: string[]): Args {
-  const flags = parseFlags(argv);
-  const explicitConfig = flags.config ? readConfig(flags.config) : null;
-  const canonicalConfig = explicitConfig ? null : readConfig(defaultConfigPath());
-  const config: ClientConfig = explicitConfig ?? canonicalConfig ?? {};
+  const parsed = parseFlags(argv);
+  if (!parsed.ok) {
+    console.error(parsed.error);
+    console.error(`usage: ${DAEMON_USAGE}`);
+    process.exit(1);
+  }
+  const flags = parsed.flags;
+  // Canonical config is always considered. An explicit `--config <path>` is
+  // overlaid on top per field so missing keys (notably `backends.*`) fall
+  // through from the canonical file instead of disappearing whenever the
+  // operator points --config at a partial file.
+  const canonical = readConfig(defaultConfigPath()) ?? {};
+  let config: ClientConfig = canonical;
+  if (flags.config) {
+    const explicit = readConfig(flags.config);
+    if (!explicit) {
+      // The operator named a specific file; silently falling back to the
+      // canonical config when it can't be read would let them think
+      // they're using one config while actually using another.
+      console.error(`--config ${flags.config}: file is missing, unreadable, or not a JSON object`);
+      process.exit(1);
+    }
+    config = overlayConfig(canonical, explicit);
+  }
   const result = mergeClientArgs(flags, process.env, config);
   if (!result.ok) {
     console.error(`missing required args: ${result.missing.join(', ')}`);

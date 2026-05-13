@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   defaultConfigPath,
   defaultOwnerSessionPath,
+  overlayConfig,
   readConfig,
   resolveConfigDir,
   writeConfig,
@@ -193,6 +194,49 @@ test('readConfig returns null when JSON root is not an object', (t) => {
   const path = join(dir, 'config.json');
   writeFileSync(path, JSON.stringify(['not', 'an', 'object']));
   assert.equal(readConfig(path), null);
+});
+
+test('overlayConfig: top fields win per key, missing keys fall through from base', () => {
+  // Used by cli.ts to layer `--config <path>` on top of the canonical
+  // config so an explicit config file with only `server_token` doesn't
+  // wipe `backends.claude.settings` from the canonical file.
+  const base = {
+    server_url: 'wss://canonical',
+    server_token: 'canonical-tok',
+    agent_id: 'canonical-agent',
+    backend: 'claude',
+    card: '/canonical/card.json',
+    backends: { claude: { settings: { sandbox: { enabled: true } } } },
+  };
+  const top = {
+    server_token: 'explicit-tok',
+    agent_id: 'explicit-agent',
+  };
+  assert.deepEqual(overlayConfig(base, top), {
+    server_url: 'wss://canonical',
+    server_token: 'explicit-tok',
+    agent_id: 'explicit-agent',
+    backend: 'claude',
+    card: '/canonical/card.json',
+    backends: { claude: { settings: { sandbox: { enabled: true } } } },
+  });
+});
+
+test('overlayConfig: empty top leaves base values intact; empty base passes top through', () => {
+  // The result object always carries the six known keys; missing inputs land
+  // as `undefined` rather than absent properties. mergeClientArgs's `||`
+  // chain treats both shapes identically, so this is just shape — assert the
+  // values rather than the key set.
+  const base = { server_url: 'wss://b', backends: { codex: { sandbox_mode: 'read-only' } } };
+  const allFromBase = overlayConfig(base, {});
+  assert.equal(allFromBase.server_url, 'wss://b');
+  assert.deepEqual(allFromBase.backends, base.backends);
+  assert.equal(allFromBase.server_token, undefined);
+
+  const top = { server_token: 'tok' };
+  const allFromTop = overlayConfig({}, top);
+  assert.equal(allFromTop.server_token, 'tok');
+  assert.equal(allFromTop.server_url, undefined);
 });
 
 // Confirm the default-args call (no explicit path) wires through VICOOP_HOME.

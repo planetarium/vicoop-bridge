@@ -25,19 +25,35 @@ export interface DaemonArgs {
 const FLAG_NAMES = ['server', 'token', 'agentId', 'card', 'backend', 'config'] as const;
 type FlagName = (typeof FLAG_NAMES)[number];
 
-export function parseFlags(argv: string[]): ParsedFlags {
+// Result discriminator: success carries the parsed flags; failure carries a
+// short message naming the offending flag so cli.ts can surface a targeted
+// error like "--config requires a path" instead of silently treating the
+// next flag as a value (or `undefined` when --config was the last token).
+export type ParseFlagsResult =
+  | { ok: true; flags: ParsedFlags }
+  | { ok: false; error: string };
+
+export function parseFlags(argv: string[]): ParseFlagsResult {
   const out: ParsedFlags = {};
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i];
-    const val = argv[i + 1];
     if (!key.startsWith('--')) continue;
     const k = key.slice(2);
-    if ((FLAG_NAMES as readonly string[]).includes(k)) {
-      out[k as FlagName] = val;
+    if (!(FLAG_NAMES as readonly string[]).includes(k)) continue;
+    const val = argv[i + 1];
+    // Reject both "flag at end of argv" (val === undefined) and "flag
+    // followed by another --flag" (val starts with --). Either case silently
+    // consumed the next token as a value before this guard and produced
+    // surprising behavior — particularly bad for --config where the daemon
+    // would either run with the canonical config (val undefined) or load a
+    // file path that's actually a flag name.
+    if (val === undefined || val.startsWith('--')) {
+      return { ok: false, error: `--${k} requires a value` };
     }
+    out[k as FlagName] = val;
     i++;
   }
-  return out;
+  return { ok: true, flags: out };
 }
 
 // `||` (not `??`) so an empty `SERVER_TOKEN=` line from a freshly-generated

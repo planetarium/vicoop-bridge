@@ -182,3 +182,20 @@ export function writeConfig(path: string, config: ClientConfig): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   atomicWriteFile(path, `${JSON.stringify(config, null, 2)}\n`, 0o600);
 }
+
+// Per-field overlay (top-level only — `backends.*` falls through wholesale
+// when the top layer doesn't set it). Used to layer an explicit
+// `--config <path>` file on top of the canonical config so operators can
+// keep, say, `backends.claude.settings` in the canonical file while
+// overriding just `server_url` + `server_token` via `--config`. Missing
+// keys in `top` fall through from `base`; everything `top` does set wins.
+export function overlayConfig(base: ClientConfig, top: ClientConfig): ClientConfig {
+  return {
+    server_url: top.server_url ?? base.server_url,
+    server_token: top.server_token ?? base.server_token,
+    agent_id: top.agent_id ?? base.agent_id,
+    backend: top.backend ?? base.backend,
+    card: top.card ?? base.card,
+    backends: top.backends ?? base.backends,
+  };
+}

@@ -143,12 +143,25 @@ function wsUrlFromBridge(bridgeUrl: string): string {
 // Merge into any existing config.json so operator-edited fields (backend
 // defaults, card path, etc.) survive a setup re-run that's only rotating
 // the server token. Returns the path written for the success message.
+//
+// Throws when `allowed_agent_ids` is empty — the bridge contract guarantees
+// at least one entry (the operator passed `--agent-ids ...` and the mutation
+// echoes them back), so an empty array is a server bug or a tampered
+// response. Failing here is safer than silently overwriting a populated
+// `agent_id` in config.json with `""`, which would break the daemon on
+// next start with no obvious cause.
 function writeConfigForSetup(success: ClientRegisterSuccess, bridgeUrl: string): string {
+  const firstAgentId = success.allowed_agent_ids[0];
+  if (!firstAgentId) {
+    throw new Error(
+      'registerClient returned no allowed_agent_ids — refusing to overwrite config.json with an empty agent_id',
+    );
+  }
   const path = defaultConfigPath();
   const existing: ClientConfig = readConfig(path) ?? {};
   existing.server_url = wsUrlFromBridge(bridgeUrl);
   existing.server_token = success.client_token;
-  existing.agent_id = success.allowed_agent_ids[0] ?? '';
+  existing.agent_id = firstAgentId;
   writeConfig(path, existing);
   return path;
 }
@@ -321,7 +334,12 @@ export async function runSetup(args: string[]): Promise<number> {
       '  Save the setup output or env file now.\n\n',
   );
 
-  writeClientSetupOutput(parsed, success, bridge);
+  try {
+    writeClientSetupOutput(parsed, success, bridge);
+  } catch (e) {
+    process.stderr.write(`${(e as Error).message}\n`);
+    return 1;
+  }
 
   if (parsed.callers.length > 0) {
     try {

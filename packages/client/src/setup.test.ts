@@ -478,6 +478,91 @@ test('setup --json suppresses config.json write for scripting', async (t) => {
   assert.equal(parsed.client_token, 'json-token');
 });
 
+test('setup refuses to overwrite agent_id with empty when bridge returns no allowed_agent_ids', async (t) => {
+  // Defense-in-depth: the server contract guarantees a non-empty allowed_agent_ids
+  // (the operator passed --agent-ids and the mutation echoes them back), but if
+  // a buggy/tampered response ever returns [], we'd otherwise wipe a populated
+  // agent_id in config.json with "" and break the daemon on next start.
+  // Fail loud + leave the prior config intact.
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-empty-agent-'));
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  process.env.HOME = tmpHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+  });
+
+  saveOwnerSession({
+    bridge: 'https://bridge.test',
+    token: 'vbc_owner_test',
+    principal_id: 'google:123',
+    email: null,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    saved_at: new Date().toISOString(),
+  });
+
+  // Pre-existing config that must NOT be overwritten with an empty agent_id.
+  const { writeConfig } = await import('./config.js');
+  const configPath = join(process.env.VICOOP_HOME, 'config.json');
+  writeConfig(configPath, {
+    server_url: 'wss://old',
+    server_token: 'old-token',
+    agent_id: 'still-valid-agent',
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({
+      data: {
+        registerClient: {
+          clientWithToken: {
+            id: 'client-1',
+            token: 'fresh-token',
+            ownerPrincipal: 'google:123',
+            // Empty allowed_agent_ids — the misbehaviour we're guarding against.
+            allowedAgentIds: [],
+          },
+        },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let stderr = '';
+  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  });
+
+  // The empty allowed_agent_ids array passes the upstream `!response.allowedAgentIds`
+  // truthy check, so it reaches `writeConfigForSetup`'s guard. That's the
+  // defense-in-depth point — fail loud instead of writing an empty agent_id.
+  const code = await runSetup([
+    '--client-name', 'test client',
+    '--agent-ids', 'still-valid-agent',
+  ]);
+  assert.equal(code, 1);
+  assert.match(
+    stderr,
+    /registerClient returned no allowed_agent_ids/,
+    'expected writeConfigForSetup guard message',
+  );
+
+  const after = await import('./config.js').then((m) => m.readConfig(configPath));
+  assert.deepEqual(after, {
+    server_url: 'wss://old',
+    server_token: 'old-token',
+    agent_id: 'still-valid-agent',
+  });
+});
+
 test('setup quotes env values so shell metacharacters cannot trigger expansion', async (t) => {
   // The bridge echoes the requested agent id back in `allowed_agent_ids`. If an
   // operator (or some compromised path between them and `setup`) feeds an id

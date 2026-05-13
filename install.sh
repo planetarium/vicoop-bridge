@@ -397,8 +397,10 @@ UNIT
 #
 # This file is the systemd EnvironmentFile= layout (one assignment per line,
 # no shell). For interactive / non-systemd installs, prefer the canonical
-# ~/.vicoop/config.json that `vicoop-client setup` writes by default — the
-# daemon merges both with env taking precedence (see #137).
+# vicoop config.json that `vicoop-client setup` writes by default — its
+# directory is resolved as $VICOOP_HOME > (existing) ~/.vicoop >
+# $XDG_CONFIG_HOME/vicoop > ~/.vicoop. The daemon merges both with env
+# taking precedence (see #137).
 
 # Bare WS(S) origin of the bridge server (the client appends /connect).
 SERVER_URL=wss://vicoop-bridge-server.fly.dev
