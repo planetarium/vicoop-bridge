@@ -149,6 +149,78 @@ test('readConfig returns null when file does not exist', () => {
   assert.equal(readConfig(path), null);
 });
 
+test('overlayConfig merges backends per slot so a partial top does not wipe other backends', () => {
+  // The common --config use case: operator points --config at a file that
+  // only sets `backends.codex` (or a server token override). The canonical
+  // file's `backends.claude` and `backends.openclaw` must still apply.
+  const base = {
+    backends: {
+      claude: { cwd: '/srv/work' },
+      openclaw: { gateway_url: 'ws://127.0.0.1:18789' },
+    },
+  };
+  const top = {
+    backends: {
+      codex: { sandbox_mode: 'workspace-write' as const },
+    },
+  };
+  const merged = overlayConfig(base, top);
+  assert.deepEqual(merged.backends, {
+    claude: { cwd: '/srv/work' },
+    openclaw: { gateway_url: 'ws://127.0.0.1:18789' },
+    codex: { sandbox_mode: 'workspace-write' },
+  });
+});
+
+test('overlayConfig: when both sides set the same backend slot, top wins entirely', () => {
+  // Within a single backend slot the override remains all-or-nothing — supplying
+  // any value replaces the default — matching how createClaudeBackend etc.
+  // already treat their `settings` / `cwd` opts. So a top.backends.claude with
+  // only `cwd` discards canonical `settings` from base.backends.claude.
+  const base = {
+    backends: {
+      claude: { cwd: '/canon/work', settings: { sandbox: { enabled: true } } },
+    },
+  };
+  const top = {
+    backends: {
+      claude: { cwd: '/override/work' },
+    },
+  };
+  const merged = overlayConfig(base, top);
+  assert.deepEqual(merged.backends, {
+    claude: { cwd: '/override/work' },
+  });
+});
+
+test('normalizeConfig drops unknown backend and unknown codex.sandbox_mode', (t) => {
+  // Permissive normalize must also catch enum typos — otherwise a hand-edited
+  // `"backend": "claud"` or `"sandbox_mode": "workspace_write"` would survive
+  // the read and then exit the daemon at startup via the downstream parser.
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-enum-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  writeFileSync(
+    path,
+    JSON.stringify({
+      server_url: 'wss://bridge.test',
+      backend: 'claud', // typo — dropped
+      backends: {
+        codex: {
+          cwd: '/work',
+          sandbox_mode: 'workspace_write', // underscore vs hyphen — dropped
+        },
+      },
+    }),
+  );
+  assert.deepEqual(readConfig(path), {
+    server_url: 'wss://bridge.test',
+    backends: {
+      codex: { cwd: '/work' },
+    },
+  });
+});
+
 test('readConfig drops malformed fields and keeps the rest', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-bad-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

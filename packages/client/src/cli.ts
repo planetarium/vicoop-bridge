@@ -105,14 +105,23 @@ function parseClaudeSettingsEnv(raw: string | undefined): Record<string, unknown
   return parsed as Record<string, unknown>;
 }
 
-function parseCodexSandboxMode(raw: string | undefined): CodexSandboxMode | undefined {
+// `source` names the surface the value came from (env var name, config
+// JSON path, etc.) so the error message points at the right knob. Config-
+// derived values are pre-validated by `normalizeConfig` and never reach the
+// rejection branch here, but parameterizing keeps the function safe to
+// reuse on any source without leaking a misleading "CODEX_SANDBOX_MODE
+// must be one of..." when the bogus value actually came from config.json.
+function parseCodexSandboxMode(
+  raw: string | undefined,
+  source = 'CODEX_SANDBOX_MODE',
+): CodexSandboxMode | undefined {
   const trimmed = raw?.trim();
   if (!trimmed) return undefined;
   if (CODEX_SANDBOX_MODES.has(trimmed as CodexSandboxMode)) {
     return trimmed as CodexSandboxMode;
   }
   console.error(
-    `CODEX_SANDBOX_MODE must be one of: ${Array.from(CODEX_SANDBOX_MODES).join(', ')} (got ${JSON.stringify(trimmed)})`,
+    `${source} must be one of: ${Array.from(CODEX_SANDBOX_MODES).join(', ')} (got ${JSON.stringify(trimmed)})`,
   );
   process.exit(1);
 }
@@ -170,7 +179,10 @@ function pickBackend(name: string, args: Args): Backend {
           undefined,
         sandboxMode:
           parseCodexSandboxMode(process.env.CODEX_SANDBOX_MODE) ??
-          parseCodexSandboxMode(backends.codex?.sandbox_mode),
+          parseCodexSandboxMode(
+            backends.codex?.sandbox_mode,
+            'backends.codex.sandbox_mode (config.json)',
+          ),
       });
     default:
       throw new Error(`unknown backend: ${name} (supported: echo, openclaw, claude, codex)`);

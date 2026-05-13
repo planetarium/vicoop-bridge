@@ -102,10 +102,23 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v as Record<string, unknown>;
 }
 
+// Enum surfaces validated at normalize time so a hand-edited typo doesn't
+// reach a downstream parser that does `process.exit(1)`. Anything outside
+// these sets is treated like any other malformed field — dropped, the rest
+// of the file kept usable.
+const KNOWN_BACKENDS = new Set(['echo', 'openclaw', 'claude', 'codex']);
+const KNOWN_CODEX_SANDBOX_MODES = new Set([
+  'read-only',
+  'workspace-write',
+  'danger-full-access',
+]);
+
 // Hand-edited config files reliably ship malformed entries (typos, wrong
 // types, accidental nesting). Be permissive: drop bad fields silently and
 // keep the rest of the file usable, rather than refusing to load and
-// stranding the daemon with no config at all.
+// stranding the daemon with no config at all. Enum-like fields are
+// validated against their known sets here so the daemon doesn't exit on
+// an unknown `backend` / `sandbox_mode` later.
 function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
   const c: ClientConfig = {};
   const serverUrl = asString(raw.server_url);
@@ -115,7 +128,7 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
   const agentId = asString(raw.agent_id);
   if (agentId) c.agent_id = agentId;
   const backend = asString(raw.backend);
-  if (backend) c.backend = backend;
+  if (backend && KNOWN_BACKENDS.has(backend)) c.backend = backend;
   const card = asString(raw.card);
   if (card) c.card = card;
   const backends = asRecord(raw.backends);
@@ -135,10 +148,12 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
     if (codexRaw) {
       const cwd = asString(codexRaw.cwd);
       const sandbox = asString(codexRaw.sandbox_mode);
-      if (cwd || sandbox) {
+      const validSandbox =
+        sandbox && KNOWN_CODEX_SANDBOX_MODES.has(sandbox) ? sandbox : undefined;
+      if (cwd || validSandbox) {
         out.codex = {};
         if (cwd) out.codex.cwd = cwd;
-        if (sandbox) out.codex.sandbox_mode = sandbox;
+        if (validSandbox) out.codex.sandbox_mode = validSandbox;
       }
     }
     const ocRaw = asRecord(backends.openclaw);
@@ -183,19 +198,30 @@ export function writeConfig(path: string, config: ClientConfig): void {
   atomicWriteFile(path, `${JSON.stringify(config, null, 2)}\n`, 0o600);
 }
 
-// Per-field overlay (top-level only — `backends.*` falls through wholesale
-// when the top layer doesn't set it). Used to layer an explicit
-// `--config <path>` file on top of the canonical config so operators can
-// keep, say, `backends.claude.settings` in the canonical file while
-// overriding just `server_url` + `server_token` via `--config`. Missing
-// keys in `top` fall through from `base`; everything `top` does set wins.
+// Per-field overlay used to layer an explicit `--config <path>` file on top
+// of the canonical config so operators can keep, say,
+// `backends.claude.settings` in the canonical file while overriding just
+// `server_url` + `server_token` via `--config`. Missing top-level keys in
+// `top` fall through from `base`; everything `top` does set wins.
+//
+// `backends` gets a per-slot merge (claude / codex / openclaw) so that a
+// `--config` containing only `backends.codex` doesn't wipe canonical
+// `backends.claude` and `backends.openclaw`. Within each backend slot the
+// override is still all-or-nothing — supplying `backends.claude.cwd`
+// without `backends.claude.settings` keeps `cwd` from top and discards
+// canonical `settings`, matching the documented "supplying any value
+// replaces the default" semantics for backend config.
 export function overlayConfig(base: ClientConfig, top: ClientConfig): ClientConfig {
+  const mergedBackends: BackendConfigs | undefined =
+    base.backends || top.backends
+      ? { ...(base.backends ?? {}), ...(top.backends ?? {}) }
+      : undefined;
   return {
     server_url: top.server_url ?? base.server_url,
     server_token: top.server_token ?? base.server_token,
     agent_id: top.agent_id ?? base.agent_id,
     backend: top.backend ?? base.backend,
     card: top.card ?? base.card,
-    backends: top.backends ?? base.backends,
+    backends: mergedBackends,
   };
 }
