@@ -160,11 +160,20 @@ async function mapPartsToCodexInput(
   },
 ): Promise<MappedInput> {
   const textParts: string[] = [];
+  const dataParts: string[] = [];
   const pendingImages: Array<{ mime: string; bytes: string }> = [];
 
   for (const p of parts) {
     if (p.kind === 'text') {
       if (p.text) textParts.push(p.text);
+      continue;
+    }
+    if (p.kind === 'data') {
+      // Auxiliary structured metadata sent alongside the user text. The codex
+      // CLI has no first-class data-part channel, so fold it into the prompt
+      // as a tagged JSON block — deterministic, visible, and grep-friendly.
+      const serialized = serializeDataPart(p.data);
+      if (serialized) dataParts.push(serialized);
       continue;
     }
     if (p.kind === 'file') {
@@ -196,14 +205,9 @@ async function mapPartsToCodexInput(
       pendingImages.push({ mime, bytes: p.file.bytes });
       continue;
     }
-    return {
-      ok: false,
-      code: 'unsupported_part_kind',
-      message: `codex backend does not accept ${p.kind} parts`,
-    };
   }
 
-  if (textParts.length === 0 && pendingImages.length === 0) {
+  if (textParts.length === 0 && dataParts.length === 0 && pendingImages.length === 0) {
     return { ok: false, code: 'empty_prompt', message: 'no content in message' };
   }
 
@@ -234,7 +238,18 @@ async function mapPartsToCodexInput(
     }
   }
 
-  return { ok: true, prompt: textParts.join('\n\n'), imageFiles, tempDir };
+  const prompt = [...textParts, ...dataParts].join('\n\n');
+  return { ok: true, prompt, imageFiles, tempDir };
+}
+
+function serializeDataPart(data: Record<string, unknown>): string {
+  let body: string;
+  try {
+    body = JSON.stringify(data, null, 2);
+  } catch {
+    return '';
+  }
+  return `<context kind="application/json">\n${body}\n</context>`;
 }
 
 export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {

@@ -363,8 +363,9 @@ class GatewayClient {
 //
 // `file.uri` inputs are fetched by the bridge under the shared inbound file
 // safety policy, then forwarded as the same base64 attachment shape as
-// caller-inline `file.bytes`. `kind: 'data'` remains out of scope because
-// OpenClaw has no structured-input surface for it.
+// caller-inline `file.bytes`. `kind: 'data'` is folded into the chat
+// message text as a tagged JSON block because OpenClaw has no structured-
+// input surface for it.
 interface OpenclawChatInput {
   message: string;
   attachments: Array<{
@@ -382,6 +383,16 @@ interface PartMappingError {
 
 function isImageMime(mime: string | undefined): boolean {
   return typeof mime === 'string' && mime.toLowerCase().startsWith('image/');
+}
+
+function serializeDataPart(data: Record<string, unknown>): string {
+  let body: string;
+  try {
+    body = JSON.stringify(data, null, 2);
+  } catch {
+    return '';
+  }
+  return `<context kind="application/json">\n${body}\n</context>`;
 }
 
 // Exported for unit testing; shape matches what `handle()` feeds into
@@ -459,13 +470,12 @@ export async function mapPartsToChatInput(
       continue;
     }
     if (p.kind === 'data') {
-      return {
-        ok: false,
-        error: {
-          code: 'unsupported_data_part',
-          message: `part[${idx}]: data parts are not supported by the openclaw backend; serialize to a text part if the agent should see structured input`,
-        },
-      };
+      // Auxiliary structured metadata; serialize into the chat message as a
+      // tagged JSON block so the agent sees the context even though OpenClaw
+      // has no first-class data-part channel.
+      const serialized = serializeDataPart(p.data);
+      if (serialized) textBits.push(serialized);
+      continue;
     }
   }
   return {

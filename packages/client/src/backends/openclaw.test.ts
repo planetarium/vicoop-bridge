@@ -974,16 +974,29 @@ test('mapPartsToChatInput: missing mimeType is rejected (gateway needs it for sn
   assert.match(result.error.message, /mimeType/);
 });
 
-test('mapPartsToChatInput: data part is rejected since OpenClaw has no structured input surface', async () => {
+test('mapPartsToChatInput: data part is serialized into the chat message as a tagged JSON block', async () => {
   const result = await mapPartsToChatInput([
     { kind: 'text', text: 'context follows' },
     { kind: 'data', data: { foo: 'bar', n: 42 } },
   ]);
-  assert.equal(result.ok, false);
-  if (result.ok) return;
-  assert.equal(result.error.code, 'unsupported_data_part');
-  // Error should identify the offending part index (index 1 here).
-  assert.match(result.error.message, /part\[1\]/);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(result.input.attachments, []);
+  const msg = result.input.message;
+  assert.match(msg, /^context follows\n<context kind="application\/json">\n/);
+  assert.ok(msg.includes('"foo": "bar"'));
+  assert.ok(msg.includes('"n": 42'));
+  assert.ok(msg.endsWith('</context>'));
+});
+
+test('mapPartsToChatInput: data-only message produces a chat message with just the JSON context block', async () => {
+  const result = await mapPartsToChatInput([
+    { kind: 'data', data: { hello: 'world' } },
+  ]);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.match(result.input.message, /^<context kind="application\/json">\n/);
+  assert.ok(result.input.message.includes('"hello": "world"'));
 });
 
 test('handle(): image file part is forwarded to chat.send as attachments', async () => {

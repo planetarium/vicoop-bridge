@@ -216,6 +216,16 @@ function sha256OfBase64(b64: string): string {
   return createHash('sha256').update(Buffer.from(b64, 'base64')).digest('hex');
 }
 
+function serializeDataPart(data: Record<string, unknown>): string {
+  let body: string;
+  try {
+    body = JSON.stringify(data, null, 2);
+  } catch {
+    return '';
+  }
+  return `<context kind="application/json">\n${body}\n</context>`;
+}
+
 function defaultSpawn(
   command: string,
   args: readonly string[],
@@ -420,6 +430,14 @@ async function mapPartsToContentBlocks(
       }
       continue;
     }
+    if (p.kind === 'data') {
+      // Auxiliary structured metadata. Render as a tagged JSON text block
+      // appended after primary text — Anthropic's API takes one content array
+      // and there's no dedicated data channel for caller-supplied context.
+      const serialized = serializeDataPart(p.data);
+      if (serialized) blocks.push({ type: 'text', text: serialized });
+      continue;
+    }
     if (p.kind === 'file') {
       let bytes = p.file.bytes;
       let mime = p.file.mimeType ?? '';
@@ -488,11 +506,6 @@ async function mapPartsToContentBlocks(
       inboundHashes.add(sha256OfBase64(bytes));
       continue;
     }
-    return {
-      ok: false,
-      code: 'unsupported_part_kind',
-      message: `claude backend does not accept ${p.kind} parts`,
-    };
   }
   // Media-only messages (image/document with no text) are accepted —
   // Anthropic's vision/document path can answer about them without an
