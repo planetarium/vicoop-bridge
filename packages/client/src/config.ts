@@ -75,6 +75,11 @@ export interface BackendConfigs {
   openclaw?: OpenclawBackendConfig;
 }
 
+// Mirrors the daemon's CLI flag surface (--server / --token / --agentId /
+// --card / --backend) plus a `backends` map for per-backend defaults. Keeping
+// full parity with the flags means anything an operator can pass at launch
+// also has a place to live in config.json — no "this knob is only configurable
+// via env" surprises.
 export interface ClientConfig {
   server_url?: string;
   server_token?: string;

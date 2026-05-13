@@ -200,7 +200,7 @@ resolved as `$VICOOP_HOME > $XDG_CONFIG_HOME/vicoop > ~/.vicoop` (existing
 `~/.vicoop` installs are honored even when `$XDG_CONFIG_HOME` is set).
 
 `setup` only writes the three credentials above; backend defaults are
-hand-edited into the same file. The full shape (every field optional —
+hand-edited into the same file. The common shape (every field optional —
 omit what you don't need) is:
 
 ```json
@@ -209,7 +209,6 @@ omit what you don't need) is:
   "server_token": "<written by setup>",
   "agent_id": "<written by setup>",
   "backend": "claude",
-  "card": "/srv/vicoop/cards/my-agent.json",
   "backends": {
     "claude": {
       "cwd": "/srv/agent-work",
@@ -230,6 +229,10 @@ omit what you don't need) is:
   }
 }
 ```
+
+The schema also accepts a top-level `card` mirroring the `--card` flag /
+`AGENT_CARD` env var (rarely needed: the bridge already publishes a
+canonical card per backend — see Step 5).
 
 Daemon precedence is **CLI flag > env var > `--config <path>` > canonical
 `config.json`**, so env values still win (handy for systemd `EnvironmentFile=`
