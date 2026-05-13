@@ -23,16 +23,14 @@ one-liner fetching a published `@vicoop-bridge/client@*` bundle). Contrast with:
 
 - A human operator (or an agent acting on their behalf) standing up a
   brand-new client that will connect to a bridge they do not operate.
-- The operator has either a Google account (used throughout) or an Ethereum
-  EOA they control. Either becomes the owner of the resulting client and
-  agent policy.
+- The operator has a Google account; that account becomes the owner of the
+  resulting client and agent policy. For wallet-based (SIWE) onboarding,
+  see [`remote-testing.md`](./remote-testing.md) — out of scope here.
 
 ## Prerequisites
 
 - Node.js 20 or newer (`node -v`).
-- `curl`, `tar`, and one of `sha256sum` / `shasum`. `jq` is recommended for
-  the optional SIWE alternative path; the default Google flow doesn't need
-  it.
+- `curl`, `tar`, and one of `sha256sum` / `shasum`.
 - A reachable bridge URL. The public deployment is
   `https://vicoop-bridge-server.fly.dev`; substitute your own below if you
   run the server yourself.
@@ -40,10 +38,6 @@ one-liner fetching a published `@vicoop-bridge/client@*` bundle). Contrast with:
   to run on the same machine as the browser — device flow is designed for
   exactly that case (e.g. headless server + laptop browser).
 - A Google account. No wallet, `a2a-wallet`, or seed phrase required.
-- (Optional, alternative path) For wallet-based onboarding instead of
-  Google, [`a2a-wallet`](https://github.com/planetarium/a2a-x402-wallet)
-  CLI with an imported wallet — see "Alternative: SIWE onboarding" near
-  the end of this doc.
 - For the OpenClaw backend specifically: an OpenClaw gateway running
   locally at `ws://127.0.0.1:18789` (override via `OPENCLAW_GATEWAY_URL`).
   Streaming (per-message A2A artifact cadence) requires OpenClaw
@@ -292,11 +286,6 @@ stdout):
 CLIENT_TOKEN=$(jq -r .client_token /tmp/vicoop-setup.json)
 ```
 
-For systemd installs that use `EnvironmentFile=`, see ["Optional: also
-write a systemd `EnvironmentFile=`"](#optional-also-write-a-systemd-environmentfile)
-under persistence — `setup --write-env-file <path>` writes the env file in
-addition to `config.json`.
-
 `--agent-ids` is a comma-separated allowlist. Include every id you plan to
 run under this single token if you know them up front; amend later via
 the `updateClientAllowedAgents` GraphQL mutation (backed by
@@ -389,20 +378,8 @@ BACKEND=openclaw \
 ```
 
 Precedence at startup is **CLI flag > env var > `--config <path>` > canonical
-`config.json`**, so the layers compose freely — e.g. a systemd unit can keep
-`SERVER_TOKEN` in `EnvironmentFile=` while letting backend defaults
-(`CLAUDE_SETTINGS_JSON`, openclaw gateway URL, etc.) live in `config.json`.
-
-If you generated an env file via `--write-env-file` in Step 4 and want to
-test it locally, sourcing it works because the env values override
-`config.json` (same precedence):
-
-```sh
-. "$INSTALL_DIR/vicoop-client.env"
-
-BACKEND=openclaw \
-  "$INSTALL_DIR/bin/vicoop-client"
-```
+`config.json`**, so the layers compose freely — env values still override
+`config.json` when both set the same key.
 
 On success you'll see a `[client] connected, sending hello` log. After that:
 
@@ -587,9 +564,9 @@ agent's tools run, but without an LLM round-trip per call.
 ### Option B: natural-language admin agent
 
 ```sh
-# $OWNER_TOKEN: vbc_owner_* token from /auth/siwe/exchange or
-# /oauth/device/code with intent=owner_session. See "Alternative: SIWE
-# onboarding" below for the SIWE path.
+# $OWNER_TOKEN: vbc_owner_* token from /oauth/device/code with
+# intent=owner_session (the bearer Step 4 login saved into
+# ~/.vicoop/owner-session.json works directly).
 WALLET_PRINCIPAL="eth:$(a2a-wallet status | awk '/Address/{print tolower($2)}')"
 
 curl -sX POST "$BRIDGE_URL/" \
@@ -600,82 +577,6 @@ curl -sX POST "$BRIDGE_URL/" \
 
 Either path hot-reloads via `registry.updateAllowedCallers` — no client
 restart needed.
-
-## Optional: persistence
-
-Only set up persistence after the foreground run connects and the agent
-endpoint responds. For local Claude/OpenClaw onboarding, a foreground process
-is often enough for first success.
-
-### Optional: also write a systemd `EnvironmentFile=`
-
-On systemd hosts where `install.sh` wrote a unit, the unit reads credentials
-from the `EnvironmentFile=` (path printed by the installer). The simplest
-way to populate it is to rerun `setup` with `--write-env-file <path>` so
-both `~/.vicoop/config.json` and the env file are written from the same
-`registerClient` call:
-
-```sh
-"$INSTALL_DIR/bin/vicoop-client" setup \
-  --client-name "$CLIENT_NAME" \
-  --agent-ids "$AGENT_ID" \
-  --caller "eth:0x<40-hex>" \
-  --write-env-file /etc/vicoop-client.env   # or the user-scope path the installer printed
-```
-
-`--write-env-file` mints a fresh CLIENT_TOKEN, so prefer it at first
-install. To populate the env file from an already-issued token without
-rotating it, copy the relevant fields out of `~/.vicoop/config.json` by
-hand and append `BACKEND=` to match your foreground run:
-
-```sh
-SERVER_URL=wss://vicoop-bridge-server.fly.dev
-SERVER_TOKEN=<copy from ~/.vicoop/config.json>
-AGENT_ID=<your agent id>
-BACKEND=openclaw
-```
-
-> **Why the env file matters for system-scope systemd.** With
-> `DynamicUser=yes` (the default for `system` scope), the daemon runs as a
-> transient UID that has no access to the operator's `~/.vicoop/config.json`.
-> The `EnvironmentFile=` is read by systemd itself before the user switch,
-> which is why it's the credential delivery path for that scope.
-> **User-scope** units run as the caller and can read `~/.vicoop/config.json`
-> directly — the env file is optional there.
-
-Then reload and start the service using the exact commands printed by the
-installer, for example:
-
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now vicoop-client
-```
-
-### macOS / ad-hoc detached run
-
-For macOS or ad hoc local testing, run the foreground command from Step 6
-directly, or wrap it in a detached session if you want it to survive the
-terminal closing. The bridge does not require systemd; it only needs one
-live `vicoop-client` process connected for the agent id.
-
-`nohup … &` tends to lose stdout/stderr on macOS; prefer `screen` or `tmux`
-with explicit log redirection so failures are recoverable:
-
-```sh
-mkdir -p "$INSTALL_DIR/logs"
-screen -dmS vicoop-client bash -lc "BACKEND=claude \"$INSTALL_DIR/bin/vicoop-client\" \
-  >> \"$INSTALL_DIR/logs/client.log\" 2>&1"
-
-# tail the log
-tail -f "$INSTALL_DIR/logs/client.log"
-
-# stop
-screen -S vicoop-client -X quit
-```
-
-`launchd` is the persistent option if you want the client to start at login;
-write a plist under `~/Library/LaunchAgents/` and load it with
-`launchctl load -w`.
 
 ## Updating the client
 
@@ -750,12 +651,7 @@ section of `docs/local-testing.md` for the same note.
   GraphQL — the caller token was missing, malformed, or expired, so the
   request fell back to the `app_anonymous` Postgres role (see
   `packages/server/src/postgraphile.ts`) which has no EXECUTE on
-  authenticated functions. Re-run `vicoop-client login` (or the SIWE
-  exchange in the alternative section below) to refresh.
-
-- **`SIWE message has already expired`** — the `expirationTime` was in the
-  past when the bridge verified it. Increase `--ttl` or check host clock
-  skew.
+  authenticated functions. Re-run `vicoop-client login` to refresh.
 
 - **Device flow timed out** — the `vicoop-client login` deadline matches
   the bridge's `device_sessions.expires_at` (10 min by default). If the
@@ -776,41 +672,6 @@ section of `docs/local-testing.md` for the same note.
   you intentionally want a new client identity; in that case the old
   `clients` row (and cascading `agent_policies`) can be cleaned up via
   the admin agent's CRUD mutations (#29).
-
-## Alternative: SIWE onboarding
-
-If you'd rather own your client identity with an Ethereum EOA than a
-Google account, replace Step 4 with the two-step SIWE path:
-
-1. Sign a SIWE message and exchange it at `POST /auth/siwe/exchange` for a
-   `vbc_owner_*` session token. SIWE exchange defaults to
-   `intent=owner_session`, which is what you want here. See
-   [`remote-testing.md` §1](./remote-testing.md) for the full snippet, or
-   use `a2a-wallet siwe auth` if the CLI is installed.
-2. Call the `registerClient` GraphQL mutation with that owner-session
-   token to mint a `CLIENT_TOKEN`:
-
-```sh
-OWNER_TOKEN=...   # vbc_owner_* from POST /auth/siwe/exchange
-
-REG=$(curl -sX POST "$BRIDGE_URL/graphql" \
-  -H "Authorization: Bearer $OWNER_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d "{\"query\":\"mutation{registerClient(input:{clientName:\\\"$CLIENT_NAME\\\",allowedAgentIds:[\\\"$AGENT_ID\\\"]}){clientWithToken{id token ownerPrincipal allowedAgentIds}}}\"}")
-
-CLIENT_TOKEN=$(echo "$REG" | jq -r .data.registerClient.clientWithToken.token)
-```
-
-The resulting `CLIENT_TOKEN` is identical in shape to the device-flow one;
-it just owns the row under an `eth:0x…` principal instead of
-`google:sub:…`. After that, Steps 5-6 (agent card, run) are the same as
-the Google path.
-
-The same `OWNER_TOKEN` is what you'd present to the admin agent at
-`POST /` for managing `allowed_callers` (see "Manage caller allowlists"
-above). Google operators get an equivalent `vbc_owner_*` from the
-device flow and can use the admin agent the same way; admin **scope**
-(visibility into all owners' rows) remains wallet-only.
 
 ## What's next
 
