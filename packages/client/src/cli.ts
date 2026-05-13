@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { AgentCard } from '@vicoop-bridge/protocol';
 import { Client } from './client.js';
 import { echoBackend } from './backends/echo.js';
@@ -19,7 +19,6 @@ import {
 } from './admin-cli.js';
 import { runWhoami } from './whoami.js';
 import { deriveIdentity } from './identity.js';
-import { existsSync } from 'node:fs';
 import {
   type ClientConfig,
   defaultConfigPath,
