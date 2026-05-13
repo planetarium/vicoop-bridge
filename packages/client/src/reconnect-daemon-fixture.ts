@@ -5,10 +5,14 @@
 // WebSocketServer / http.Server keeping the loop alive regardless of how the
 // reconnect timer is refed. See issue #156.
 //
-// Spawned as: `node --import tsx reconnect-daemon-fixture.ts <serverUrl>`.
-// Lifecycle: starts the Client, reports liveness on stdout so the parent test
-// can observe it's still running across the disconnect, and exits on SIGTERM
-// from the parent at end-of-test.
+// Invoked by the test as:
+//   `<node> <tsx/cli> reconnect-daemon-fixture.ts <serverUrl>`
+// where `<tsx/cli>` is the script path resolved from the `tsx/cli` package
+// export. The test deliberately avoids `node --import tsx ...` so the
+// subprocess runs on every Node 20+ minor (the `--import` flag was only
+// added in Node 20.6.0). Lifecycle: starts the Client, prints `daemon-ready`
+// on stdout so the parent knows startup completed, then waits silently
+// until SIGTERM from the parent at end-of-test.
 import { Client } from './client.js';
 
 const serverUrl = process.argv[2];

@@ -283,7 +283,7 @@ test('Client reconnect timer is refed so a disconnected daemon stays alive (#156
   // reconnect timer. With the WS dropped and the heartbeat / reset timers
   // already cleared, that left the daemon process with no refed handles
   // and Node exited before the first reconnect attempt fired. The existing
-  // "reconnects after WebSocket close" test below passes regardless of the
+  // "reconnects after WebSocket close" test above passes regardless of the
   // unref because the test process has the mock WebSocketServer and http
   // server keeping the loop alive on their own. We assert directly on the
   // refed-ness of the scheduled timer instead, so the regression is caught
