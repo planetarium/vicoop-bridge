@@ -381,7 +381,21 @@ Precedence at startup is **CLI flag > env var > `--config <path>` > canonical
 `config.json`**, so the layers compose freely — env values still override
 `config.json` when both set the same key.
 
-On success you'll see a `[client] connected, sending hello` log. After that:
+On success you'll see a `[client] connected, sending hello` log followed
+by an identity block — same data `vicoop-client whoami` would print, so
+you can copy the mention / acct / agent-card URL from here directly:
+
+```text
+[client] connected, sending hello
+[client] agentId:    openclaw-mac
+[client] mention:    @openclaw-mac@vicoop-bridge-server.fly.dev
+[client] acct:       acct:openclaw-mac@vicoop-bridge-server.fly.dev
+[client] a2a:        https://vicoop-bridge-server.fly.dev/agents/openclaw-mac
+[client] a2a card:   https://vicoop-bridge-server.fly.dev/agents/openclaw-mac/.well-known/agent-card.json
+[client] webfinger:  https://vicoop-bridge-server.fly.dev/.well-known/webfinger?resource=acct%3A...
+```
+
+After that:
 
 - The bridge loads the `agent_policies` row for your agent. If Step 4 setup
   included `--caller`, that allowlist is already in place; otherwise

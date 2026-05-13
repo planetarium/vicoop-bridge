@@ -9,7 +9,21 @@ import {
   type UpFrame,
 } from '@vicoop-bridge/protocol';
 import type { Backend, Emit } from './backend.js';
-import { createLogger, type LogLevel, type Logger, safeToken } from './logger.js';
+import {
+  createLogger,
+  type ConsoleSink,
+  type LogLevel,
+  type Logger,
+  safeToken,
+} from './logger.js';
+import {
+  a2aCardUrl,
+  a2aEndpoint,
+  deriveIdentity,
+  formatAcct,
+  formatMention,
+  webfingerUrl,
+} from './identity.js';
 
 export interface ClientOptions {
   serverUrl: string;
@@ -43,6 +57,9 @@ export interface ClientOptions {
   // task.assign detail line (`messageId`, `role`, `partsCount`) and the
   // full backend exception message on the late-throw path.
   logLevel?: LogLevel;
+  // Test seam: override the default console sink. Production callers leave
+  // this unset and logs land on `console.log` / `.warn` / `.error`.
+  logSink?: ConsoleSink;
 }
 
 const DEFAULT_PROBE_DEADLINE_MS = 3000;
@@ -60,6 +77,10 @@ export class Client {
   private reconnectResetTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private heartbeatAwaitingPong = false;
+  // Identity block (mention / acct / a2a / agent-card / webfinger URLs)
+  // is logged exactly once on first successful connect — same data on every
+  // reconnect would just be noise, and we don't want to wait for whoami.
+  private identityLogged = false;
   private inflight = new Map<string, AbortController>();
   // Resolved once per process via backend.resolveCapabilities(); the bridge
   // hello frame is held until this settles so the advertised card matches the
@@ -70,7 +91,7 @@ export class Client {
   private readonly logger: Logger;
 
   constructor(private readonly opts: ClientOptions) {
-    this.logger = createLogger(opts.logLevel);
+    this.logger = createLogger(opts.logLevel, opts.logSink);
   }
 
   start(): void {
@@ -169,6 +190,27 @@ export class Client {
     return this.effectiveCardPromise;
   }
 
+  // Print the mention / acct / A2A endpoint / card URL / WebFinger URL block
+  // that `vicoop-client whoami` would surface, so an operator who just
+  // started the daemon doesn't have to open a second shell to find the
+  // identifiers external callers will see. Logged once per process — same
+  // data on every reconnect would just be noise. Skipped silently when the
+  // agentId fails the Mentionable local rule (rare; uuid-prefixed ids match
+  // the regex), since mention/acct/webfinger aren't meaningful in that case
+  // and the operator can still get a coherent answer from `whoami`.
+  private logIdentityOnce(): void {
+    if (this.identityLogged) return;
+    this.identityLogged = true;
+    const id = deriveIdentity(this.opts.agentId, this.opts.serverUrl);
+    if (!id) return;
+    this.logger.info(`agentId:    ${safeToken(id.agentId)}`);
+    this.logger.info(`mention:    ${safeToken(formatMention(id))}`);
+    this.logger.info(`acct:       ${safeToken(formatAcct(id))}`);
+    this.logger.info(`a2a:        ${safeToken(a2aEndpoint(id))}`);
+    this.logger.info(`a2a card:   ${safeToken(a2aCardUrl(id))}`);
+    this.logger.info(`webfinger:  ${safeToken(webfingerUrl(id))}`);
+  }
+
   private connect(): void {
     if (this.stopped) return;
     const ws = new WebSocket(`${this.opts.serverUrl.replace(/\/$/, '')}/connect`);
@@ -193,6 +235,7 @@ export class Client {
       const sendHello = (agentCard: AgentCard | undefined): void => {
         if (ws.readyState !== WebSocket.OPEN) return;
         this.logger.info('connected, sending hello');
+        this.logIdentityOnce();
         ws.send(
           encodeFrame({
             type: 'hello',

@@ -158,6 +158,77 @@ test('summarizeParts: does not include user-supplied content', () => {
   assert.equal(summary.includes(secret), false);
 });
 
+test('Client logs identity block (mention/acct/a2a/card/webfinger) once on connect', async () => {
+  // Operators shouldn't need to run `vicoop-client whoami` in a second
+  // shell to learn the agent's externally-visible identifiers. The daemon
+  // surfaces the same block as part of the connect log, exactly once per
+  // process — reconnects don't repeat it because the data hasn't changed.
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  const connections: WebSocket[] = [];
+  let helloCount = 0;
+  wss.on('connection', (ws) => {
+    connections.push(ws);
+    ws.on('message', () => {
+      helloCount++;
+    });
+  });
+
+  const c = makeSink();
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => {
+      /* no tasks */
+    }),
+    logSink: c.sink,
+    logLevel: 'info',
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    reconnectStableMs: 0,
+    heartbeatIntervalMs: 0,
+  });
+
+  try {
+    client.start();
+    await waitFor(() => helloCount === 1, 'expected initial hello');
+    // Initial connect produced the identity block.
+    const identityLines = c.log.filter(
+      (l) =>
+        l.includes('mention:') ||
+        l.includes('acct:') ||
+        l.startsWith('[client] a2a:') ||
+        l.includes('a2a card:') ||
+        l.includes('webfinger:') ||
+        l.startsWith('[client] agentId:'),
+    );
+    assert.equal(identityLines.length, 6, `expected 6 identity lines, got ${identityLines.length}: ${JSON.stringify(identityLines)}`);
+    // Spot-check that the URLs were derived from the test server URL.
+    assert.ok(c.log.some((l) => l.includes('@agent-1@127.0.0.1')), 'mention line not found');
+    assert.ok(c.log.some((l) => l.includes('acct:agent-1@127.0.0.1')), 'acct line not found');
+    assert.ok(c.log.some((l) => l.includes('/agents/agent-1')), 'a2a URL not found');
+
+    // Force a reconnect and confirm the block is NOT printed again.
+    const linesBeforeReconnect = c.log.length;
+    connections[0]!.close(1012, 'service restart');
+    await waitFor(() => helloCount === 2, 'expected hello after reconnect');
+    const newLines = c.log.slice(linesBeforeReconnect);
+    assert.ok(
+      !newLines.some(
+        (l) => l.includes('mention:') || l.includes('webfinger:'),
+      ),
+      `identity block should not repeat on reconnect, got: ${JSON.stringify(newLines)}`,
+    );
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
 test('Client reconnects after WebSocket close and sends hello again', async () => {
   const server = createServer();
   const wss = new WebSocketServer({ server, path: '/connect' });
