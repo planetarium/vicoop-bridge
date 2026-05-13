@@ -125,28 +125,32 @@ function pickBackend(name: string, args: Args): Backend {
   switch (name) {
     case 'echo':
       return echoBackend;
-    case 'openclaw':
+    case 'openclaw': {
       // openclaw's persona / system prompt lives in the gateway-side config
       // (`/data/openclaw.json`), not in a per-message field on `chat.send`.
       // Self-identity is surfaced via `vicoop-client whoami` so operators can
       // paste it into their gateway persona; the bridge has no wire-protocol
       // hook to inject it from here.
+      //
+      // Trim + treat-empty-as-unset across the board: install.sh's env
+      // template ships these keys with empty values for operators to fill in,
+      // and `??` would let those empty strings shadow a populated config.json.
+      // `?.trim() ||` mirrors the daemon-level precedence (env wins when set,
+      // falls through to config when blank/unset).
+      const oc = backends.openclaw;
+      const envTimeout = process.env.OPENCLAW_TASK_TIMEOUT_MS?.trim();
       return createOpenclawBackend({
-        url:
-          process.env.OPENCLAW_GATEWAY_URL ??
-          backends.openclaw?.gateway_url,
-        token:
-          process.env.OPENCLAW_GATEWAY_TOKEN ??
-          backends.openclaw?.gateway_token,
-        agent: process.env.OPENCLAW_AGENT ?? backends.openclaw?.agent,
+        url: process.env.OPENCLAW_GATEWAY_URL?.trim() || oc?.gateway_url,
+        token: process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || oc?.gateway_token,
+        agent: process.env.OPENCLAW_AGENT?.trim() || oc?.agent,
         // OPENCLAW_TASK_TIMEOUT_MS env parsing already lives in the factory
-        // (`resolveTimeout`). Pass the config value only when env is unset so
-        // env wins, matching the daemon-level precedence above.
-        taskTimeoutMs:
-          process.env.OPENCLAW_TASK_TIMEOUT_MS === undefined
-            ? backends.openclaw?.task_timeout_ms
-            : undefined,
+        // (`resolveTimeout`). Pass the config value only when env is unset or
+        // blank so a freshly-templated `OPENCLAW_TASK_TIMEOUT_MS=` doesn't
+        // make the factory parse `""` as 0 and fall back to the compiled
+        // default, ignoring config.
+        taskTimeoutMs: envTimeout ? undefined : oc?.task_timeout_ms,
       });
+    }
     case 'claude':
       return createClaudeBackend({
         cwd:
