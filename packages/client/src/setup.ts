@@ -350,9 +350,11 @@ export async function runSetup(args: string[]): Promise<number> {
   // client token. Otherwise `registerClient` succeeds, the token comes back
   // exactly once from the bridge, and `writeConfigForSetup` then throws the
   // same "refusing to overwrite" error — leaving the operator with no token
-  // and no record of it. The --json path is exempt (it doesn't touch the
-  // canonical config) and --bridge/--token explicit overrides are too:
-  // those flows don't read the canonical config either.
+  // and no record of it. Only `--json` is exempt (it skips
+  // `writeClientSetupOutput` entirely and prints the token to stdout);
+  // `--bridge/--token` overrides change *where* the owner session comes
+  // from, not *where* the client credentials get persisted, so they still
+  // write canonical config.json and need the same preflight.
   if (!parsed.json) {
     const configPath = defaultConfigPath();
     if (existsSync(configPath) && readConfigRaw(configPath) === null) {
