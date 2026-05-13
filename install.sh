@@ -394,6 +394,11 @@ UNIT
     cat > "$env_file" <<ENVF
 # vicoop-client environment — populated by the agent/operator after install.
 # Restrict perms (chmod 600) if this file is ever copied elsewhere.
+#
+# This file is the systemd EnvironmentFile= layout (one assignment per line,
+# no shell). For interactive / non-systemd installs, prefer the canonical
+# ~/.vicoop/config.json that `vicoop-client setup` writes by default — the
+# daemon merges both with env taking precedence (see #137).
 
 # Bare WS(S) origin of the bridge server (the client appends /connect).
 SERVER_URL=wss://vicoop-bridge-server.fly.dev
@@ -517,11 +522,15 @@ EOF
 
 if [ -n "$SERVICE_INSTALLED" ]; then
   cat <<EOF
-  2. First run the client in the foreground with SERVER_URL / SERVER_TOKEN /
-     AGENT_ID / BACKEND. See docs/install-client.md step 6.
+  2. First run the client in the foreground. \`vicoop-client setup\`
+     persists credentials to ~/.vicoop/config.json (mode 600) by default;
+     the daemon picks them up automatically. See docs/install-client.md
+     step 6.
 
-  3. Optional: after the foreground run works, fill in $SERVICE_ENV_FILE,
-     then reload systemd and enable + start the service:
+  3. Optional: after the foreground run works, populate $SERVICE_ENV_FILE
+     for the systemd unit (or rerun setup with --write-env-file
+     $SERVICE_ENV_FILE to sync it from the canonical config.json), then
+     reload systemd and enable + start the service:
 
        $SERVICE_RELOAD_CMD
        $SERVICE_ENABLE_CMD

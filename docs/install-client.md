@@ -180,46 +180,56 @@ CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
 "$INSTALL_DIR/bin/vicoop-client" setup \
   --client-name "$CLIENT_NAME" \
   --agent-ids "$AGENT_ID" \
-  --caller "eth:0x<40-hex>" \
-  --write-env-file "$INSTALL_DIR/vicoop-client.env"
+  --caller "eth:0x<40-hex>"
 ```
 
 `login` prints a verification URL to stderr — open it in **any** browser
 (the same machine, or your laptop while running the CLI on a headless host)
 and authorize with your Google account. `setup` registers the client, configures
-any `--caller` allowlist entries, and writes the resulting daemon env block to
-`vicoop-client.env` (mode 600). If you omit `--caller`, `setup` succeeds but
-prints a warning that the agent will be public until you restrict callers:
+any `--caller` allowlist entries, and persists the daemon credentials to
+`~/.vicoop/config.json` (mode 600 — see #137 for the consolidated config
+layout). On success it prints something like:
+
+```text
+Wrote /home/you/.vicoop/config.json (mode 600).
+```
+
+`config.json` is the canonical place the daemon looks for `server_url`,
+`server_token`, `agent_id`, and any backend defaults. The location is
+resolved as `$VICOOP_HOME > $XDG_CONFIG_HOME/vicoop > ~/.vicoop` (existing
+`~/.vicoop` installs are honored even when `$XDG_CONFIG_HOME` is set).
+
+If you omit `--caller`, `setup` succeeds but prints a warning that the
+agent will be public until you restrict callers:
 
 > `setup --caller` requires a bridge server version that can pre-create
 > `agent_policies` for registered client agent ids. If you are testing against
 > your own deployment, deploy the matching server/schema before this step.
 
-```text
-export SERVER_URL='wss://vicoop-bridge-server.fly.dev'
-export SERVER_TOKEN='<64-hex CLIENT_TOKEN — shown ONLY here>'
-export AGENT_ID='<your agent id>'
+> ⚠ The `CLIENT_TOKEN` is unrecoverable after this single output.
+> `config.json` is the only place it persists; back it up if you need to
+> rotate hosts. To rotate the token later, use the `rotateClientToken`
+> GraphQL mutation (requires a `vbc_owner_*` session token; the default
+> login flow saves one locally for you). Rotation surfaces a new
+> CLIENT_TOKEN, also one-time.
+
+### Optional: also write a systemd `EnvironmentFile=`
+
+If you plan to launch the daemon under a systemd unit that uses
+`EnvironmentFile=` (the layout `install.sh` generates), pass
+`--write-env-file <path>` to also drop an `export KEY='value'` file
+alongside `config.json`. The two are kept in sync by `setup`; either one
+on its own is enough to run the daemon. The env file's `export` prefix
+plus single-quoted values mean `. "$INSTALL_DIR/vicoop-client.env"`
+propagates safely even when an agent id contains shell metacharacters.
+
+```sh
+"$INSTALL_DIR/bin/vicoop-client" setup \
+  --client-name "$CLIENT_NAME" \
+  --agent-ids "$AGENT_ID" \
+  --caller "eth:0x<40-hex>" \
+  --write-env-file "$INSTALL_DIR/vicoop-client.env"
 ```
-
-The `export` prefix lets `. "$INSTALL_DIR/vicoop-client.env"` propagate the
-assignments to the `vicoop-client` child process; values are single-quoted
-so any shell metacharacter that ends up in an agent id (or future field)
-stays a literal when the file is sourced. Bundles older than this release
-wrote bare unquoted `KEY=VALUE` lines; if a pre-existing env file fails
-with `missing required: agentId, server`, **regenerate it with the
-current `setup --write-env-file`** so both the `export` and the
-single-quoting come back in one step. Hand-editing the old file by
-prepending `export ` works only when every value is a tame identifier
-(alphanumerics, `-`, `_`, `.`, `:`, `/`); a value containing `$`, `` ` ``,
-`'`, or whitespace will execute or break when sourced unless you also
-wrap it as `export KEY='value'` with any embedded `'` escaped as `'\''`.
-
-> ⚠ The `CLIENT_TOKEN` is unrecoverable after this single output. The env
-> file is the only place it persists; back it up if you need to rotate
-> hosts. To rotate the token later, use the `rotateClientToken` GraphQL
-> mutation (requires a `vbc_owner_*` session token; the default login flow
-> saves one locally for you). Rotation surfaces a new CLIENT_TOKEN, also
-> one-time.
 
 For setup scripting, drop `--write-env-file` and pass `--json` instead if you want to compose
 with shell tooling:
@@ -319,8 +329,16 @@ JSON
 
 ## Step 6 — Run the client
 
-Run the client in the foreground first. All flags also accept env vars, so the
-file written by Step 4 can be loaded directly:
+Run the client in the foreground first. With `config.json` written by Step 4,
+the daemon picks up `server_url`, `server_token`, and `agent_id` on its own:
+
+```sh
+BACKEND=openclaw \
+  "$INSTALL_DIR/bin/vicoop-client"
+```
+
+If you also wrote a systemd `EnvironmentFile=` via `--write-env-file` in
+Step 4, source it instead of relying on `config.json`:
 
 ```sh
 . "$INSTALL_DIR/vicoop-client.env"
@@ -328,6 +346,11 @@ file written by Step 4 can be loaded directly:
 BACKEND=openclaw \
   "$INSTALL_DIR/bin/vicoop-client"
 ```
+
+Precedence at startup is CLI flag > env var > `--config <path>` > canonical
+`config.json`, so the two layers compose freely — e.g. a systemd unit can
+keep `SERVER_TOKEN` in `EnvironmentFile=` while letting backend defaults
+(`CLAUDE_SETTINGS_JSON`, openclaw gateway URL, etc.) live in `config.json`.
 
 On success you'll see a `[client] connected, sending hello` log. After that:
 

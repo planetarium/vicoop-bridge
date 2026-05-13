@@ -1,7 +1,11 @@
 // `vicoop-client setup` — create a bridge client token using an existing
-// owner-session bearer, then write the daemon env file.
+// owner-session bearer, then persist the daemon credentials to the canonical
+// `config.json`. `--write-env-file` remains as an opt-in for operators who
+// want a systemd `EnvironmentFile=` (or shell-sourceable file) alongside the
+// canonical config — see #137.
 
 import { atomicWriteFile, resolveOwnerSession } from './owner-session.js';
+import { defaultConfigPath, readConfig, writeConfig, type ClientConfig } from './config.js';
 
 interface SetupArgs {
   clientName: string;
@@ -132,14 +136,36 @@ function writeClientEnvFile(path: string, success: ClientRegisterSuccess, bridge
   ].join('\n'), 0o600);
 }
 
+function wsUrlFromBridge(bridgeUrl: string): string {
+  return bridgeUrl.replace(/^http(s?):\/\//, (_m, s) => (s === 's' ? 'wss://' : 'ws://'));
+}
+
+// Merge into any existing config.json so operator-edited fields (backend
+// defaults, card path, etc.) survive a setup re-run that's only rotating
+// the server token. Returns the path written for the success message.
+function writeConfigForSetup(success: ClientRegisterSuccess, bridgeUrl: string): string {
+  const path = defaultConfigPath();
+  const existing: ClientConfig = readConfig(path) ?? {};
+  existing.server_url = wsUrlFromBridge(bridgeUrl);
+  existing.server_token = success.client_token;
+  existing.agent_id = success.allowed_agent_ids[0] ?? '';
+  writeConfig(path, existing);
+  return path;
+}
+
 function writeClientSetupOutput(args: SetupArgs, success: ClientRegisterSuccess, bridgeUrl: string): void {
+  // --json keeps its scripting contract: no disk side effects, raw response on
+  // stdout. Anything else persists to the canonical config so the daemon
+  // launches without further wiring.
+  if (args.json) {
+    process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
+    return;
+  }
+  const configPath = writeConfigForSetup(success, bridgeUrl);
+  process.stderr.write(`Wrote ${configPath} (mode 600).\n`);
   if (args.envFile) {
     writeClientEnvFile(args.envFile, success, bridgeUrl);
     process.stderr.write(`Wrote env block to ${args.envFile} (mode 600).\n`);
-  } else if (args.json) {
-    process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
-  } else {
-    process.stdout.write(`${envLines(success, bridgeUrl).join('\n')}\n`);
   }
 }
 

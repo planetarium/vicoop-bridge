@@ -19,17 +19,15 @@ import {
 } from './admin-cli.js';
 import { runWhoami } from './whoami.js';
 import { deriveIdentity } from './identity.js';
-
-interface Args {
-  server: string;
-  token: string;
-  agentId: string;
-  card?: string;
-  backend: string;
-}
+import {
+  type ClientConfig,
+  defaultConfigPath,
+  readConfig,
+} from './config.js';
+import { mergeClientArgs, parseFlags, type DaemonArgs as Args } from './cli-args.js';
 
 const DAEMON_USAGE =
-  'vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude|codex> [--card <path>]';
+  'vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude|codex> [--card <path>] [--config <path>]';
 const SUBCOMMAND_LIST =
   'subcommands: login, setup, upgrade, list-agents, list-callers, add-caller, remove-caller, whoami (run any with --help)';
 const CODEX_SANDBOX_MODES = new Set<CodexSandboxMode>([
@@ -38,37 +36,27 @@ const CODEX_SANDBOX_MODES = new Set<CodexSandboxMode>([
   'danger-full-access',
 ]);
 
+// Precedence (highest wins):
+//   1. CLI flag values
+//   2. env vars (kept for systemd EnvironmentFile= compatibility)
+//   3. `--config <path>` file
+//   4. canonical config.json at the resolved vicoop dir
+//
+// Each layer is optional and contributes only the fields it sets, so
+// operators can split state across them — e.g. systemd unit ships server_*
+// via EnvironmentFile while backends.* lives in config.json.
 function parseClientArgs(argv: string[]): Args {
-  const out: Partial<Args> = {};
-  for (let i = 0; i < argv.length; i++) {
-    const key = argv[i];
-    const val = argv[i + 1];
-    if (!key.startsWith('--')) continue;
-    const k = key.slice(2) as keyof Args;
-    out[k] = val;
-    i++;
-  }
-  const env = (k: string, v?: string) => v ?? process.env[k];
-  const resolved: Args = {
-    server: env('SERVER_URL', out.server)!,
-    token: env('SERVER_TOKEN', out.token)!,
-    agentId: env('AGENT_ID', out.agentId)!,
-    card: env('AGENT_CARD', out.card),
-    backend: env('BACKEND', out.backend) ?? 'echo',
-  };
-  const required = {
-    server: resolved.server,
-    token: resolved.token,
-    agentId: resolved.agentId,
-    backend: resolved.backend,
-  };
-  const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
-  if (missing.length) {
-    console.error(`missing required args: ${missing.join(', ')}`);
+  const flags = parseFlags(argv);
+  const explicitConfig = flags.config ? readConfig(flags.config) : null;
+  const canonicalConfig = explicitConfig ? null : readConfig(defaultConfigPath());
+  const config: ClientConfig = explicitConfig ?? canonicalConfig ?? {};
+  const result = mergeClientArgs(flags, process.env, config);
+  if (!result.ok) {
+    console.error(`missing required args: ${result.missing.join(', ')}`);
     console.error(`usage: ${DAEMON_USAGE}`);
     process.exit(1);
   }
-  return resolved;
+  return result.args;
 }
 
 // Parse the operator's inline `--settings` JSON for the claude backend. The
@@ -109,6 +97,10 @@ function parseCodexSandboxMode(raw: string | undefined): CodexSandboxMode | unde
 }
 
 function pickBackend(name: string, args: Args): Backend {
+  // Env wins over config.json for backend defaults, mirroring the daemon-level
+  // precedence above. The backend factories already do `opts ?? default`
+  // internally, so passing the merged value here is enough.
+  const backends = args.backends ?? {};
   switch (name) {
     case 'echo':
       return echoBackend;
@@ -118,17 +110,42 @@ function pickBackend(name: string, args: Args): Backend {
       // Self-identity is surfaced via `vicoop-client whoami` so operators can
       // paste it into their gateway persona; the bridge has no wire-protocol
       // hook to inject it from here.
-      return createOpenclawBackend();
+      return createOpenclawBackend({
+        url:
+          process.env.OPENCLAW_GATEWAY_URL ??
+          backends.openclaw?.gateway_url,
+        token:
+          process.env.OPENCLAW_GATEWAY_TOKEN ??
+          backends.openclaw?.gateway_token,
+        agent: process.env.OPENCLAW_AGENT ?? backends.openclaw?.agent,
+        // OPENCLAW_TASK_TIMEOUT_MS env parsing already lives in the factory
+        // (`resolveTimeout`). Pass the config value only when env is unset so
+        // env wins, matching the daemon-level precedence above.
+        taskTimeoutMs:
+          process.env.OPENCLAW_TASK_TIMEOUT_MS === undefined
+            ? backends.openclaw?.task_timeout_ms
+            : undefined,
+      });
     case 'claude':
       return createClaudeBackend({
-        cwd: process.env.CLAUDE_CWD?.trim() || undefined,
+        cwd:
+          process.env.CLAUDE_CWD?.trim() ||
+          backends.claude?.cwd ||
+          undefined,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
-        settings: parseClaudeSettingsEnv(process.env.CLAUDE_SETTINGS_JSON),
+        settings:
+          parseClaudeSettingsEnv(process.env.CLAUDE_SETTINGS_JSON) ??
+          backends.claude?.settings,
       });
     case 'codex':
       return createCodexBackend({
-        cwd: process.env.CODEX_CWD?.trim() || undefined,
-        sandboxMode: parseCodexSandboxMode(process.env.CODEX_SANDBOX_MODE),
+        cwd:
+          process.env.CODEX_CWD?.trim() ||
+          backends.codex?.cwd ||
+          undefined,
+        sandboxMode:
+          parseCodexSandboxMode(process.env.CODEX_SANDBOX_MODE) ??
+          parseCodexSandboxMode(backends.codex?.sandbox_mode),
       });
     default:
       throw new Error(`unknown backend: ${name} (supported: echo, openclaw, claude, codex)`);
