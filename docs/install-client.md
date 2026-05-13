@@ -376,27 +376,19 @@ second WS. Override if yours isn't on the default:
 
 If you're running the Claude backend, set `BACKEND=claude` and optionally set
 `CLAUDE_CWD` so Claude works against a different repository than the directory
-where `vicoop-client` itself was started:
+where `vicoop-client` itself was started. With Step 4's `config.json` already
+holding the daemon credentials, the foreground command is just:
 
 ```sh
-SERVER_URL="$SERVER_URL" \
-SERVER_TOKEN="$CLIENT_TOKEN" \
-AGENT_ID="$AGENT_ID" \
 BACKEND=claude \
 CLAUDE_CWD="$HOME/vicoop-bridge" \
   "$INSTALL_DIR/bin/vicoop-client"
 ```
 
-If you used `--write-env-file` in Step 4, load it first and omit the
-already-populated `SERVER_URL`, `SERVER_TOKEN`, and `AGENT_ID` assignments:
-
-```sh
-. "$INSTALL_DIR/vicoop-client.env"
-
-BACKEND=claude \
-CLAUDE_CWD="$HOME/vicoop-bridge" \
-  "$INSTALL_DIR/bin/vicoop-client"
-```
+Both knobs can also live in `~/.vicoop/config.json` under `backends.claude`
+(`cwd`, `settings`) so the foreground command shrinks to just
+`"$INSTALL_DIR/bin/vicoop-client"`; the env vars still win when set, mirroring
+the daemon-level precedence (Step 6 intro).
 
 `CLAUDE_CWD` defaults to the current working directory of the client
 process. Set it when the released bundle lives outside the repository you
@@ -425,7 +417,6 @@ identifier external callers will see for this agent — the WebFinger acct, the
 `@<agentId>@<host>` mention, the JSON-RPC endpoint, and the agent-card URL.
 
 ```sh
-. "$INSTALL_DIR/vicoop-client.env"
 "$INSTALL_DIR/bin/vicoop-client" whoami
 # agentId:    my-agent
 # host:       bridge.example.com
@@ -468,16 +459,19 @@ Typical follow-ups from this output:
 
 If you're running the Codex backend, set `BACKEND=codex` and optionally set
 `CODEX_CWD` so Codex works against a different repository than the directory
-where `vicoop-client` itself was started:
+where `vicoop-client` itself was started. With Step 4's `config.json` in place
+the foreground command is just:
 
 ```sh
-. "$INSTALL_DIR/vicoop-client.env"
-
 BACKEND=codex \
 CODEX_CWD="$HOME/vicoop-bridge" \
 CODEX_SANDBOX_MODE=workspace-write \
   "$INSTALL_DIR/bin/vicoop-client"
 ```
+
+Both `cwd` and `sandbox_mode` can also live in `~/.vicoop/config.json` under
+`backends.codex` so the foreground command can shrink to just
+`"$INSTALL_DIR/bin/vicoop-client"`. Env vars still win when set.
 
 `CODEX_CWD` defaults to the current working directory of the client process.
 The v1 backend accepts text plus inline image `file.bytes` inputs and returns
@@ -492,10 +486,17 @@ Only set up persistence after the foreground run connects and the agent
 endpoint responds. For local Claude/OpenClaw onboarding, a foreground process
 is often enough for first success.
 
-On systemd hosts where `install.sh` wrote a unit, update the generated env
-file with the same values used for the foreground run:
+On systemd hosts where `install.sh` wrote a unit, populate the generated
+`EnvironmentFile=` with the credentials the daemon needs. The unit reads
+this file directly (DynamicUser can't reach `~/.vicoop/config.json` in the
+caller's home), so copy the values out of `~/.vicoop/config.json` — or
+rerun `setup --write-env-file <path>` pointing at the systemd path to sync
+both in one step — and fill in `BACKEND` to match the foreground run:
 
 ```sh
+SERVER_URL=wss://vicoop-bridge-server.fly.dev
+SERVER_TOKEN=<copy from ~/.vicoop/config.json>
+AGENT_ID=<your agent id>
 BACKEND=openclaw
 ```
 
@@ -517,8 +518,7 @@ with explicit log redirection so failures are recoverable:
 
 ```sh
 mkdir -p "$INSTALL_DIR/logs"
-screen -dmS vicoop-client bash -lc ". \"$INSTALL_DIR/vicoop-client.env\" && \
-  BACKEND=claude \"$INSTALL_DIR/bin/vicoop-client\" \
+screen -dmS vicoop-client bash -lc "BACKEND=claude \"$INSTALL_DIR/bin/vicoop-client\" \
   >> \"$INSTALL_DIR/logs/client.log\" 2>&1"
 
 # tail the log
@@ -560,8 +560,7 @@ needed:
 "$INSTALL_DIR/bin/vicoop-client" setup \
   --client-name "$CLIENT_NAME" \
   --agent-ids "$AGENT_ID" \
-  --caller "eth:0x<40-hex>" \
-  --write-env-file "$INSTALL_DIR/vicoop-client.env"
+  --caller "eth:0x<40-hex>"
 "$INSTALL_DIR/bin/vicoop-client" list-agents
 "$INSTALL_DIR/bin/vicoop-client" list-callers "$AGENT_ID" --json
 "$INSTALL_DIR/bin/vicoop-client" add-caller "$AGENT_ID" "eth:0x<40-hex>"
@@ -572,10 +571,11 @@ needed:
 # work too (handy for CI).
 ```
 
-The env file written by Step 4 setup (`SERVER_URL` / `SERVER_TOKEN` / `AGENT_ID`)
-is a **client** credential and is **not** accepted by these admin commands —
-they only accept an owner-session bearer. If the saved bearer is missing or
-expired, refresh it without registering a new client:
+The `server_token` Step 4 setup writes into `~/.vicoop/config.json` is a
+**client** credential and is **not** accepted by these admin commands —
+they only accept an owner-session bearer (the separate `~/.vicoop/owner-session.json`
+that `login` writes). If the saved bearer is missing or expired, refresh
+it without registering a new client:
 
 ```sh
 "$INSTALL_DIR/bin/vicoop-client" login --bridge "$BRIDGE_URL"
@@ -641,8 +641,11 @@ The upgrade command:
 run the upgrade via `sudo`. The command checks write access up front and
 fails fast with a clear error otherwise.
 
-**`/etc/vicoop-client.env` and the systemd unit file are not touched.** Those
-belong to `install.sh`; if a release ever changes the unit layout, re-run
+**Operator-owned state is not touched by `upgrade`.** That covers
+`~/.vicoop/config.json` (the canonical daemon config — Step 4),
+`~/.vicoop/owner-session.json` (the owner bearer — `login`), and
+`/etc/vicoop-client.env` plus the systemd unit file (written by
+`install.sh` only). If a release ever changes the unit layout, re-run
 `install.sh` once to refresh the scaffolding. Note that `FORCE=1` deletes
 everything under `$INSTALL_DIR` first — back up any operator-added cards or
 files before running it.
