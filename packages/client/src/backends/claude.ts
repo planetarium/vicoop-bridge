@@ -1,6 +1,10 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { TRACEABILITY_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol';
+import {
+  OPENAI_COMPAT_EXTENSION_URI,
+  TRACEABILITY_EXTENSION_URI,
+  type Part,
+} from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
 import { formatAcct, formatMention, type AgentIdentity } from '../identity.js';
 import {
@@ -348,6 +352,129 @@ function traceabilityRequested(task: {
   );
 }
 
+// Payload of the openai-compat A2A extension as carried under
+// `Message.metadata[OPENAI_COMPAT_EXTENSION_URI]`. Each field is optional and
+// is forwarded verbatim from the OpenAI-shaped originating request.
+export interface OpenAICompatMetadata {
+  system?: string;
+  tools?: unknown[];
+  tool_choice?: unknown;
+}
+
+// Extract and shape-check the openai-compat metadata key. Returns null when
+// the metadata key is absent, malformed, or actionably empty (all three
+// fields missing or trivial) so the caller can fall back to its non-extension
+// path without conditional null-checks on every read.
+export function parseOpenAICompatMetadata(
+  metadata: Record<string, unknown> | undefined,
+): OpenAICompatMetadata | null {
+  if (!metadata) return null;
+  const raw = metadata[OPENAI_COMPAT_EXTENSION_URI];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const out: OpenAICompatMetadata = {};
+  if (typeof r.system === 'string' && r.system.length > 0) out.system = r.system;
+  if (Array.isArray(r.tools) && r.tools.length > 0) out.tools = r.tools;
+  if (r.tool_choice !== undefined && r.tool_choice !== null) out.tool_choice = r.tool_choice;
+  if (out.system === undefined && out.tools === undefined && out.tool_choice === undefined) {
+    return null;
+  }
+  return out;
+}
+
+function describeToolChoice(toolChoice: unknown): string | null {
+  if (toolChoice === undefined || toolChoice === null) return null;
+  if (toolChoice === 'auto') {
+    return 'tool_choice="auto": call a function only if appropriate; otherwise answer in natural language.';
+  }
+  if (toolChoice === 'required') {
+    return 'tool_choice="required": you MUST emit a tool_calls envelope — answering in natural language is not allowed for this turn.';
+  }
+  if (typeof toolChoice === 'object' && !Array.isArray(toolChoice)) {
+    const c = toolChoice as { type?: unknown; function?: unknown };
+    if (c.type === 'function' && c.function && typeof c.function === 'object') {
+      const fn = c.function as { name?: unknown };
+      if (typeof fn.name === 'string' && fn.name.length > 0) {
+        return `tool_choice: you MUST emit a tool_calls envelope that calls the function named "${fn.name}".`;
+      }
+    }
+  }
+  return null;
+}
+
+// Build the system-prompt text injected via `--append-system-prompt` when the
+// openai-compat extension is active. Composition rules:
+//
+//   - User-supplied `system` (if any) is included verbatim, first.
+//   - The tool-envelope contract block is included only when `tools` were
+//     provided and `tool_choice` is not "none" — without tools the envelope
+//     would be a contract the model can't satisfy. With tool_choice="none"
+//     we instead emit a short "do not use the envelope" directive so the
+//     gateway's intent is preserved.
+//   - A tool_choice descriptor line is appended when the value is one of
+//     the recognised shapes (`"auto"` / `"required"` / `{type:"function",
+//     function:{name}}`); unrecognised values are silently dropped because
+//     the model can't act on a shape it doesn't understand.
+export function buildOpenAICompatSystemPrompt(meta: OpenAICompatMetadata): string {
+  const sections: string[] = [];
+  if (meta.system) sections.push(meta.system);
+
+  const toolChoiceIsNone = meta.tool_choice === 'none';
+  const hasTools = meta.tools !== undefined && !toolChoiceIsNone;
+
+  if (hasTools) {
+    sections.push(
+      [
+        'You are routed through an OpenAI-compatible gateway and have access to the following callable functions.',
+        '',
+        'When you decide a function should be called, respond with ONLY a single JSON object (no prose, no code fences, no markdown) of the exact shape:',
+        '',
+        '{"tool_calls":[{"id":"call_<unique>","function":{"name":"<fn name>","arguments":{<args as JSON object>}}}]}',
+        '',
+        '- "id" must be a unique string starting with "call_".',
+        '- "arguments" must be a JSON object matching the function\'s parameters schema.',
+        '- Emit nothing outside the JSON object.',
+        '- Do not execute the function yourself; just emit the call.',
+        '- If no function should be called, answer normally in natural language.',
+        '',
+        'Available functions:',
+        JSON.stringify(meta.tools, null, 2),
+      ].join('\n'),
+    );
+    const tcDesc = describeToolChoice(meta.tool_choice);
+    if (tcDesc) sections.push(tcDesc);
+  } else if (toolChoiceIsNone) {
+    sections.push(
+      'A list of OpenAI-style tools was supplied with tool_choice="none". Do not emit a tool_calls envelope; always answer in natural language.',
+    );
+  }
+
+  return sections.join('\n\n');
+}
+
+// Attempt to interpret an assistant message as the OpenAI tool-call envelope
+// the SYSTEM_INSTRUCTION above teaches the model to emit. Returns the parsed
+// envelope verbatim (preserving unknown keys) when the trimmed text parses as
+// a JSON object carrying a `tool_calls` array; otherwise null so the caller
+// falls back to a text artifact. Strict: a leading non-`{` character (prose
+// preamble, code fence, etc.) short-circuits without paying the JSON.parse.
+export function tryParseToolCallsEnvelope(
+  text: string,
+): (Record<string, unknown> & { tool_calls: unknown[] }) | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{')) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const obj = parsed as Record<string, unknown>;
+  if (!Array.isArray(obj.tool_calls)) return null;
+  return obj as Record<string, unknown> & { tool_calls: unknown[] };
+}
+
 // Pull `tool_use` blocks out of an `assistant`-role message's content
 // array. Each one becomes one `claude-tool-call` artifact upstream, with
 // a head-truncated `<tool>: <input>` summary plus a `data` part carrying
@@ -641,6 +768,13 @@ export function createClaudeBackend(
         return;
       }
 
+      // Detect the openai-compat extension payload once per task so the
+      // result feeds both the spawn argv (--append-system-prompt) and the
+      // assistant artifact path (tool_calls JSON → data part). Absent or
+      // malformed metadata leaves the run on the original non-extension code
+      // path with no envelope-detection cost.
+      const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+
       const mapped = await mapPartsToContentBlocks(task.message.parts, opts.fetchUriPolicy, signal);
       if (!mapped.ok) {
         emit({
@@ -682,6 +816,16 @@ export function createClaudeBackend(
         }
       }
 
+      // Per-task `--append-system-prompt` carrying the openai-compat
+      // extension's system / tools / tool_choice. Placed AFTER identityArgs
+      // (so the self-identity directive is the model's first read) but
+      // BEFORE extraArgs (so an operator-supplied append still wins by
+      // appending last — claude concatenates each --append-system-prompt
+      // occurrence in argv order).
+      const openaiCompatArgs: readonly string[] = openaiCompat
+        ? ['--append-system-prompt', buildOpenAICompatSystemPrompt(openaiCompat)]
+        : [];
+
       const args: string[] = [
         '-p',
         '--input-format',
@@ -703,6 +847,7 @@ export function createClaudeBackend(
             ]
           : []),
         ...identityArgs,
+        ...openaiCompatArgs,
         ...settingsArgs,
         ...extraArgs,
       ];
@@ -819,6 +964,32 @@ export function createClaudeBackend(
 
       const emitAssistantArtifact = (text: string): void => {
         if (!text) return;
+        // When the openai-compat extension is active for this task, the
+        // model was instructed to emit `{"tool_calls":[...]}` JSON for tool
+        // turns. Detect that shape and surface it as an A2A `data` part so
+        // the upstream gateway can forward it as `tool_calls` on the
+        // OpenAI response without re-parsing model prose. Non-envelope text
+        // (natural-language answers, or any turn from a task that didn't
+        // request the extension) falls through to the text artifact path
+        // unchanged.
+        if (openaiCompat) {
+          const envelope = tryParseToolCallsEnvelope(text);
+          if (envelope) {
+            emit({
+              type: 'task.artifact',
+              taskId: task.taskId,
+              artifact: {
+                artifactId: randomUUID(),
+                name: 'claude-message',
+                parts: [{ kind: 'data', data: envelope }],
+                extensions: [OPENAI_COMPAT_EXTENSION_URI],
+              },
+              lastChunk: true,
+            });
+            emittedAnyArtifact = true;
+            return;
+          }
+        }
         emit({
           type: 'task.artifact',
           taskId: task.taskId,

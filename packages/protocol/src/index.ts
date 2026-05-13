@@ -5,6 +5,8 @@ export const TRACEABILITY_EXTENSION_URI =
   'https://github.com/a2aproject/a2a-samples/extensions/traceability/v1';
 export const SIWE_BEARER_AUTH_EXTENSION_URI =
   'https://github.com/planetarium/a2a-x402-wallet/tree/main/docs/siwe-bearer-auth/v0.1';
+export const OPENAI_COMPAT_EXTENSION_URI =
+  'https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1';
 
 export const TextPart = z.object({
   kind: z.literal('text'),
