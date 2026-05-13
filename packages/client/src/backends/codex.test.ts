@@ -483,7 +483,7 @@ test('nonzero exit emits task.fail with stderr tail (no host-local argv/cwd on t
   assert.doesNotMatch(fail.error.message, /cwd=/);
 });
 
-test('exec-failure repro line goes to the local logger, not the wire (#147 Copilot)', async () => {
+test('exec-failure repro line goes to the local logger, not the wire (#147)', async () => {
   const fake = makeFakeSpawn((child) => {
     setImmediate(() => {
       child.emitStderr('boom\n');
@@ -522,7 +522,7 @@ test('exec-failure repro line goes to the local logger, not the wire (#147 Copil
   assert.match(repro, /cwd="\/srv\/agent-work"/);
 });
 
-test('exec-failure repro line sanitizes taskId and escapes line separators (#147 Copilot)', async () => {
+test('exec-failure repro line sanitizes taskId and escapes line separators (#147)', async () => {
   // Wire-derived taskId can contain newlines / control chars; argv / cwd
   // values can contain U+2028 / U+2029 which JSON.stringify leaves raw
   // but some log sinks treat as line breaks. The repro line must stay

@@ -108,9 +108,12 @@ export interface CodexBackendConfig {
   cwd?: string;
   sandbox_mode?: string;
   // Extra positional/optional arguments to splice into `codex exec`
-  // after our own option args (sandbox_mode, --image, …). Useful for
-  // opt-outs like `--skip-git-repo-check` and for forwarding flags Codex
-  // adds in versions newer than this client's defaults.
+  // after our own option args (sandbox_mode, --skip-git-repo-check,
+  // --image, …). Useful for forwarding flags Codex adds in versions
+  // newer than this client's defaults, or for per-deployment knobs the
+  // operator wants in argv. (No need to put `--skip-git-repo-check`
+  // here — the Codex backend already passes it; if you do, the
+  // backend deduplicates it.)
   extra_args?: string[];
 }
 
