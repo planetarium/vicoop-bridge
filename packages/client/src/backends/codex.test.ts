@@ -6,6 +6,7 @@ import {
   type CodexChildHandle,
   type CodexSpawnOptions,
 } from './codex.js';
+import type { Logger } from '../logger.js';
 import {
   TRACEABILITY_EXTENSION_URI,
   type TaskAssignFrame,
@@ -174,7 +175,14 @@ test('text-only task spawns codex exec --json - and writes prompt to stdin', asy
 
   const child = fake.lastChild()!;
   assert.equal(child.command, 'codex');
-  assert.deepEqual(child.args, ['exec', '--json', '-c', 'sandbox_mode="read-only"', '-']);
+  assert.deepEqual(child.args, [
+    'exec',
+    '--json',
+    '-c',
+    'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
+    '-',
+  ]);
   assert.equal(child.cwd, '/repo');
   assert.equal(child.stdinPayload, 'say hi');
   assert.equal(child.stdinClosed, true);
@@ -225,6 +233,7 @@ test('thread.started id is reused via codex exec resume on the same contextId', 
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     '-',
   ]);
   assert.deepEqual(fake.children[1].args, [
@@ -233,6 +242,7 @@ test('thread.started id is reused via codex exec resume on the same contextId', 
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     'thread-a',
     '-',
   ]);
@@ -256,6 +266,7 @@ test('sandboxMode is passed as a Codex config override on initial and resume run
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     '-',
   ]);
   assert.deepEqual(fake.children[1].args, [
@@ -264,6 +275,7 @@ test('sandboxMode is passed as a Codex config override on initial and resume run
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     'thread-a',
     '-',
   ]);
@@ -284,6 +296,7 @@ test('extraArgs follow sandboxMode config so tests/operators can override it', a
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     '-c',
     'sandbox_mode="workspace-write"',
     '-',
@@ -308,6 +321,7 @@ test('distinct contextIds get distinct sessions', async () => {
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     'thread-a',
     '-',
   ]);
@@ -334,6 +348,7 @@ test('session TTL expiry starts a new codex exec run', async () => {
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     '-',
   ]);
 });
@@ -407,6 +422,7 @@ test('resume spawn failure rolls back TTL refresh for the existing session', asy
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     '-',
   ]);
 });
@@ -444,7 +460,7 @@ test('command_execution emits trace artifact only when traceability is requested
   assert.match(textOf(artifact), /npm test/);
 });
 
-test('nonzero exit emits task.fail with stderr tail', async () => {
+test('nonzero exit emits task.fail with stderr tail (no host-local argv/cwd on the wire)', async () => {
   const fake = makeFakeSpawn((child) => {
     setImmediate(() => {
       child.emitStderr('codex: auth required\n');
@@ -461,6 +477,128 @@ test('nonzero exit emits task.fail with stderr tail', async () => {
   assert.equal(fail.error.code, 'codex_exit_nonzero');
   assert.match(fail.error.message, /code 2/);
   assert.match(fail.error.message, /auth required/);
+  // argv and cwd are host-local — they go to the local logger, not the
+  // wire-level error.message which the bridge forwards to the caller.
+  assert.doesNotMatch(fail.error.message, /argv=/);
+  assert.doesNotMatch(fail.error.message, /cwd=/);
+});
+
+test('exec-failure repro line goes to the local logger, not the wire (#147)', async () => {
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      child.emitStderr('boom\n');
+      setImmediate(() => child.finish(1));
+    });
+  });
+
+  const warnLines: string[] = [];
+  const stubLogger: Logger = {
+    level: 'info',
+    error: () => {},
+    warn: (...a: unknown[]) => warnLines.push(a.map(String).join(' ')),
+    info: () => {},
+    debug: () => {},
+  };
+
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    cwd: '/srv/agent-work',
+    logger: stubLogger,
+  });
+  const { emit, frames } = collect();
+  await backend.handle(assign('x'), emit, NEVER);
+
+  // Wire-level message stays free of host-local detail.
+  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
+  assert.ok(fail);
+  assert.equal(fail.error.code, 'codex_exit_nonzero');
+  assert.doesNotMatch(fail.error.message, /\/srv\/agent-work/);
+
+  // Local logger receives an argv summary (clipped to 400 chars in
+  // codex.ts) + cwd for operator debugging.
+  const repro = warnLines.find((l) => l.includes('codex exec-failure repro'));
+  assert.ok(repro, `expected a repro warn line, got: ${JSON.stringify(warnLines)}`);
+  assert.match(repro, /argv=\[/);
+  assert.match(repro, /"codex"/);
+  assert.match(repro, /cwd="\/srv\/agent-work"/);
+});
+
+test('exec-failure repro line sanitizes taskId and escapes line separators (#147)', async () => {
+  // Wire-derived taskId can contain newlines / control chars; argv / cwd
+  // values can contain U+2028 / U+2029 which JSON.stringify leaves raw
+  // but some log sinks treat as line breaks. The repro line must stay
+  // single-line and must not let an attacker inject fake [client] lines.
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      child.emitStderr('boom\n');
+      setImmediate(() => child.finish(1));
+    });
+  });
+
+  const warnLines: string[] = [];
+  const stubLogger: Logger = {
+    level: 'info',
+    error: () => {},
+    warn: (...a: unknown[]) => warnLines.push(a.map(String).join(' ')),
+    info: () => {},
+    debug: () => {},
+  };
+
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    cwd: '/srv/a\u2028b', // U+2028 in cwd
+    logger: stubLogger,
+  });
+  const hostileTask: TaskAssignFrame = {
+    type: 'task.assign',
+    taskId: 'evil\n[client] FAKE',
+    contextId: 'ctx',
+    message: { role: 'user', messageId: 'm1', parts: [{ kind: 'text', text: 'x' }] },
+  };
+
+  await backend.handle(hostileTask, collect().emit, NEVER);
+
+  const repro = warnLines.find((l) => l.includes('codex exec-failure repro'));
+  assert.ok(repro);
+  // taskId's embedded newline must be escaped, not preserved as a real LF.
+  assert.doesNotMatch(repro, /\n\[client\] FAKE/);
+  assert.match(repro, /taskId=evil\\n\[client\] FAKE/);
+  // U+2028 in cwd must be escaped to its \uXXXX form. (RegExp ctor used
+  // so the source file doesn't carry a raw U+2028 of its own — esbuild
+  // parses raw U+2028 in a regex literal as a line terminator.)
+  assert.doesNotMatch(repro, /\u2028/);
+  assert.match(repro, /\\u2028/);
+});
+
+test('--skip-git-repo-check is auto-added so non-git cwds work out of the box (#147)', async () => {
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  const backend = createCodexBackend({ spawn: fake.spawn, cwd: '/tmp/not-a-repo' });
+  const { emit, frames } = collect();
+  await backend.handle(assign('x'), emit, NEVER);
+
+  const child = fake.lastChild()!;
+  assert.ok(
+    child.args.includes('--skip-git-repo-check'),
+    `expected --skip-git-repo-check in argv, got ${JSON.stringify(child.args)}`,
+  );
+  assert.ok(frames.some((f) => f.type === 'task.complete'));
+});
+
+test('--skip-git-repo-check is not duplicated when extraArgs already lists it (#147)', async () => {
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    extraArgs: ['--skip-git-repo-check'],
+  });
+  await backend.handle(assign('x'), collect().emit, NEVER);
+
+  const args = fake.lastChild()!.args;
+  const occurrences = args.filter((a) => a === '--skip-git-repo-check').length;
+  assert.equal(occurrences, 1, `expected exactly one --skip-git-repo-check, got ${occurrences} in ${JSON.stringify(args)}`);
 });
 
 test('signal exit emits task.fail without code null wording', async () => {
@@ -544,6 +682,7 @@ test('image FilePart.bytes creates temp files and passes --image args', async ()
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     '--image',
     '/tmp/vicoop-codex-test/image-1.png',
     '-',

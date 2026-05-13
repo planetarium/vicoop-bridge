@@ -329,7 +329,7 @@ test('processTask: artifacts are deduped by artifactId across chunks', async () 
   assert.match(completeLog, /artifacts=2/);
 });
 
-test('processTask: backend emits task.fail -> logs task.fail with code', async () => {
+test('processTask: backend emits task.fail -> logs task.fail with code and message (#147)', async () => {
   const c = makeSink();
   const s = captureSend();
   const backend = backendOf('stub', async (_t, emit) => {
@@ -347,6 +347,36 @@ test('processTask: backend emits task.fail -> logs task.fail with code', async (
   const failLog = c.log.find((l) => l.includes('task.fail'));
   assert.ok(failLog);
   assert.match(failLog, /code=rate_limited/);
+  // The message must be surfaced so operators can debug from the
+  // foreground log without enabling bridge-side wire tracing. Backends
+  // pack stderr tails / argv / exit detail into error.message; the
+  // previous log line dropped all of it.
+  assert.match(failLog, /message=slow down/);
+});
+
+test('processTask: task.fail with multi-line message stays on a single log line', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const backend = backendOf('stub', async (_t, emit) => {
+    emit({
+      type: 'task.fail',
+      taskId: 'T1',
+      error: {
+        code: 'codex_exit_nonzero',
+        message: 'codex exited with code 1: Not inside a trusted directory\nextra line',
+      },
+    });
+  });
+  await processTask(makeAssign('T1'), new AbortController().signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  const failLog = c.log.find((l) => l.includes('task.fail'));
+  assert.ok(failLog);
+  // Embedded newline must be escaped so the log line stays single-line.
+  assert.doesNotMatch(failLog, /\n.*extra line/);
+  assert.match(failLog, /trusted directory/);
 });
 
 test('processTask: backend resolves silently -> warns about missing terminal', async () => {

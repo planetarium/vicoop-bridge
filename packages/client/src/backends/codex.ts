@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { TRACEABILITY_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { createLogger, escapeLineSeparators, safeToken, type Logger } from '../logger.js';
 import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME } from './fetch-uri-file.js';
 
 export interface CodexChildHandle {
@@ -43,7 +44,18 @@ export interface CodexBackendOptions {
   mkdtemp?: (prefix: string) => Promise<string>;
   writeFile?: (file: string, data: Buffer) => Promise<void>;
   rm?: (file: string, options: { recursive: boolean; force: boolean }) => Promise<void>;
+  // Local-only sink for exec-failure diagnostics (nonzero exit / signal)
+  // that must NOT travel over the wire — argv, cwd, --image temp paths
+  // are host-local. Defaults to a fresh logger driven by the same env
+  // var as the rest of the client, so operators see the line in the
+  // foreground log without explicit wiring. Tests inject a capturing
+  // stub. Note: real spawn(2) failures use error code `spawn_failed`
+  // and are a separate branch above this one — "exec-failure" here
+  // means codex started but exited non-zero.
+  logger?: Logger;
 }
+
+const SKIP_GIT_REPO_CHECK_FLAG = '--skip-git-repo-check';
 
 interface SessionEntry {
   threadId: string;
@@ -245,6 +257,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
   const mkdtemp = opts.mkdtemp ?? fs.mkdtemp;
   const writeFile = opts.writeFile ?? fs.writeFile;
   const rm = opts.rm ?? fs.rm;
+  const logger = opts.logger ?? createLogger();
 
   const sessions = new Map<string, SessionEntry>();
   let writeCounter = 0;
@@ -308,10 +321,19 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
           });
         }
 
+        // Always pass `--skip-git-repo-check`. vicoop-bridge agents work in
+        // an operator-chosen `cwd` (often not a git repo); without this
+        // flag, codex exec exits 1 with "Not inside a trusted directory"
+        // in ~200 ms (#147). Skip the auto-add if the operator already
+        // listed the flag in extra_args so the argv stays clean.
+        const skipGitRepoCheck = extraArgs.includes(SKIP_GIT_REPO_CHECK_FLAG)
+          ? []
+          : [SKIP_GIT_REPO_CHECK_FLAG];
         const optionArgs = [
           '--json',
           '-c',
           `sandbox_mode=${JSON.stringify(sandboxMode)}`,
+          ...skipGitRepoCheck,
           ...mapped.imageFiles.flatMap((filePath) => ['--image', filePath]),
           ...extraArgs,
         ];
@@ -558,6 +580,27 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
             exit.code === null && exit.signal
               ? `codex terminated by signal ${exit.signal}${detailPart}${stdinPart}`
               : `codex exited with code ${exit.code}${exit.signal ? ` (signal ${exit.signal})` : ''}${detailPart}${stdinPart}`;
+          // The repro details (argv with --image temp paths, cwd) are
+          // host-local: they should help the local operator but must not
+          // travel over the wire to the bridge server in `error.message`,
+          // which is plaintext-forwarded to the caller. Emit them as a
+          // separate local log line keyed by taskId so operators can
+          // line it up with the `task.fail` lifecycle log.
+          //
+          // taskId is wire-derived and could carry control chars; we run
+          // it through safeToken to match the lifecycle log's single-line
+          // invariant. JSON.stringify leaves U+2028 / U+2029 raw, which
+          // some log sinks render as line breaks — escape them on the
+          // argv / cwd JSON payloads so the warn line stays one line.
+          const argvSummary = escapeLineSeparators(
+            clipTo(JSON.stringify([command, ...args]), 400),
+          );
+          const cwdSummary = cwd
+            ? ` cwd=${escapeLineSeparators(JSON.stringify(cwd))}`
+            : '';
+          logger.warn(
+            `codex exec-failure repro taskId=${safeToken(task.taskId)} argv=${argvSummary}${cwdSummary}`,
+          );
           emit({
             type: 'task.fail',
             taskId: task.taskId,

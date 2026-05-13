@@ -273,6 +273,79 @@ test('normalizeConfig trims string fields and drops whitespace-only', (t) => {
   });
 });
 
+test('normalizeConfig keeps backends.codex.extra_args when it is a string[] (#147)', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-codex-extra-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  writeFileSync(
+    path,
+    JSON.stringify({
+      backends: { codex: { extra_args: ['--skip-git-repo-check'] } },
+    }),
+  );
+  assert.deepEqual(readConfig(path), {
+    backends: { codex: { extra_args: ['--skip-git-repo-check'] } },
+  });
+});
+
+test('normalizeConfig drops backends.codex.extra_args when it is not a string[]', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-codex-extra-bad-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  writeFileSync(
+    path,
+    JSON.stringify({
+      backends: {
+        codex: {
+          cwd: '/work',
+          extra_args: '--skip-git-repo-check', // wrong type — dropped, the rest kept
+        },
+      },
+    }),
+  );
+  assert.deepEqual(readConfig(path), {
+    backends: { codex: { cwd: '/work' } },
+  });
+});
+
+test('normalizeConfig drops backends.codex.extra_args containing non-strings', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-codex-extra-mixed-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  writeFileSync(
+    path,
+    JSON.stringify({
+      backends: { codex: { extra_args: ['--ok', 123] } },
+    }),
+  );
+  assert.deepEqual(readConfig(path), {});
+});
+
+test('normalizeConfig trims each codex.extra_args entry and drops whitespace-only ones', (t) => {
+  // Matches the same trimming/whitespace-only rule used for other string
+  // config fields (server_url, server_token, …). A hand-edited
+  // `" --flag"` would otherwise reach codex argv with a leading space
+  // and produce a confusing parse error.
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-codex-extra-trim-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  writeFileSync(
+    path,
+    JSON.stringify({
+      backends: {
+        codex: {
+          extra_args: ['  --skip-git-repo-check  ', '   ', '--debug'],
+        },
+      },
+    }),
+  );
+  assert.deepEqual(readConfig(path), {
+    backends: {
+      codex: { extra_args: ['--skip-git-repo-check', '--debug'] },
+    },
+  });
+});
+
 test('normalizeConfig drops unknown backend and unknown codex.sandbox_mode', (t) => {
   // Permissive normalize must also catch enum typos — otherwise a hand-edited
   // `"backend": "claud"` or `"sandbox_mode": "workspace_write"` would survive

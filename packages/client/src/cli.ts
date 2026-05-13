@@ -227,6 +227,7 @@ function pickBackend(name: string, args: Args): Backend {
             backends.codex?.sandbox_mode,
             'backends.codex.sandbox_mode (config.json)',
           ),
+        extraArgs: backends.codex?.extra_args,
       });
     default:
       throw new Error(`unknown backend: ${name} (supported: echo, openclaw, claude, codex)`);

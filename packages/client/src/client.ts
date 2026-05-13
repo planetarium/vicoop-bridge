@@ -467,7 +467,7 @@ export async function processTask(
     terminal:
       | { kind: 'complete' }
       | { kind: 'canceled' }
-      | { kind: 'fail'; code: string }
+      | { kind: 'fail'; code: string; message: string }
       | null;
   } = { artifactIds: new Set(), terminal: null };
 
@@ -483,7 +483,11 @@ export async function processTask(
       state.terminal =
         f.status.state === 'canceled' ? { kind: 'canceled' } : { kind: 'complete' };
     } else if (f.type === 'task.fail') {
-      state.terminal = { kind: 'fail', code: f.error.code };
+      state.terminal = {
+        kind: 'fail',
+        code: f.error.code,
+        message: f.error.message ?? '',
+      };
     }
     deps.send(f);
   };
@@ -514,8 +518,19 @@ export async function processTask(
         `task.canceled taskId=${taskTok} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
       );
     } else {
+      // Surface error.message alongside the code so operators can debug
+      // failures from the foreground log alone (#147). Backends embed
+      // stderr tails, exit-status detail, and other diagnostic context
+      // there; previously the code-only line forced operators to enable
+      // wire-frame tracing on the bridge just to see why a task failed.
+      // Use a generous cap because backend messages legitimately include
+      // multi-line stderr excerpts — safeToken still escapes newlines so
+      // the log stays single-line.
+      const msgPart = terminal.message
+        ? ` message=${safeToken(terminal.message, 4000)}`
+        : '';
       deps.logger.info(
-        `task.fail taskId=${taskTok} code=${safeToken(terminal.code)} elapsedMs=${elapsedMs}`,
+        `task.fail taskId=${taskTok} code=${safeToken(terminal.code)} elapsedMs=${elapsedMs}${msgPart}`,
       );
     }
   } catch (err) {
@@ -564,8 +579,9 @@ export async function processTask(
         taskId: frame.taskId,
         error: { code, message },
       });
+      const msgPart = message ? ` message=${safeToken(message, 4000)}` : '';
       deps.logger.info(
-        `task.fail taskId=${taskTok} code=${code} elapsedMs=${elapsedMs}`,
+        `task.fail taskId=${taskTok} code=${code} elapsedMs=${elapsedMs}${msgPart}`,
       );
     }
   }
