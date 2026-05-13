@@ -525,9 +525,10 @@ EOF
 if [ -n "$SERVICE_INSTALLED" ]; then
   cat <<EOF
   2. First run the client in the foreground. \`vicoop-client setup\`
-     persists credentials to ~/.vicoop/config.json (mode 600) by default;
-     the daemon picks them up automatically. See docs/install-client.md
-     step 6.
+     persists credentials (mode 600) to the resolved vicoop config dir's
+     config.json — \$VICOOP_HOME > (existing) ~/.vicoop >
+     \$XDG_CONFIG_HOME/vicoop > ~/.vicoop, default ~/.vicoop. The daemon
+     picks them up automatically. See docs/install-client.md step 6.
 
   3. Optional: after the foreground run works, populate $SERVICE_ENV_FILE
      for the systemd unit (or rerun setup with --write-env-file
@@ -566,8 +567,8 @@ else
        BACKEND=openclaw \\
          "$INSTALL_DIR/bin/vicoop-client"
 
-     Persistent operation is optional after the foreground run works; see
-     docs/install-client.md "Optional: persistence".
+     Persistent operation is optional after the foreground run works
+     (systemd EnvironmentFile=, screen, tmux, launchd, etc.).
 
   Future updates: run \`"$INSTALL_DIR/bin/vicoop-client" upgrade\` — no need
   to re-run this installer. Pass --check to see if a newer release is

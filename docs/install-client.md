@@ -435,7 +435,8 @@ CLAUDE_CWD="$HOME/vicoop-bridge" \
   "$INSTALL_DIR/bin/vicoop-client"
 ```
 
-Both knobs can also live in `~/.vicoop/config.json` under `backends.claude`
+Both knobs can also live in the canonical `config.json` (resolved per Step
+4 — `~/.vicoop/config.json` by default) under `backends.claude`
 (`cwd`, `settings`) so the foreground command shrinks to just
 `"$INSTALL_DIR/bin/vicoop-client"`; the env vars still win when set, mirroring
 the daemon-level precedence (Step 6 intro).
@@ -529,7 +530,8 @@ CODEX_SANDBOX_MODE=workspace-write \
   "$INSTALL_DIR/bin/vicoop-client"
 ```
 
-Both `cwd` and `sandbox_mode` can also live in `~/.vicoop/config.json` under
+Both `cwd` and `sandbox_mode` can also live in the canonical `config.json`
+(resolved per Step 4 — `~/.vicoop/config.json` by default) under
 `backends.codex` so the foreground command can shrink to just
 `"$INSTALL_DIR/bin/vicoop-client"`. Env vars still win when set.
 
@@ -585,11 +587,11 @@ needed:
 # work too (handy for CI).
 ```
 
-The `server_token` Step 4 setup writes into `~/.vicoop/config.json` is a
-**client** credential and is **not** accepted by these admin commands —
-they only accept an owner-session bearer (the separate `~/.vicoop/owner-session.json`
-that `login` writes). If the saved bearer is missing or expired, refresh
-it without registering a new client:
+The `server_token` Step 4 setup writes into the canonical `config.json`
+is a **client** credential and is **not** accepted by these admin commands —
+they only accept an owner-session bearer (the separate `owner-session.json`
+that `login` writes alongside it). If the saved bearer is missing or expired,
+refresh it without registering a new client:
 
 ```sh
 "$INSTALL_DIR/bin/vicoop-client" login --bridge "$BRIDGE_URL"
