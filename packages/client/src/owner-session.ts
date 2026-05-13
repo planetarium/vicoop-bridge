@@ -4,65 +4,22 @@
 //
 // Resolution order when the CLI needs a token:
 //   1. VICOOP_OWNER_TOKEN env (paired with VICOOP_BRIDGE for the URL)
-//   2. ~/.vicoop/owner-session.json written by `vicoop-client login`
+//   2. owner-session.json under the canonical vicoop dir (see config.ts)
+//      written by `vicoop-client login`
 //
 // Storage is a single JSON file (chmod 600) rather than a credential keychain
 // because the rest of the client already keeps its bearer in plain env files
 // and we want feature-parity. Tokens are short-ish (default 90 days) and the
 // CLI re-prompts via login when expired.
 
-import {
-  closeSync,
-  existsSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs';
-import { randomBytes } from 'node:crypto';
-import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { atomicWriteFile } from './fs-util.js';
+import { defaultOwnerSessionPath } from './config.js';
 
-// Atomic write that's safe on Windows. POSIX rename is overwrite-by-default,
-// but Node's renameSync on win32 throws EEXIST/EPERM when the destination
-// already exists, which would leave a re-saved token stranded in the temp
-// file. We unlink the destination first on win32 (ignoring ENOENT for the
-// first-save case). Exported so other client modules — currently login.ts's
-// writeEnvFile — can share the same write semantics.
-export function atomicWriteFile(path: string, contents: string, mode = 0o600): void {
-  const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
-  const fd = openSync(tmp, 'wx', mode);
-  try {
-    writeFileSync(fd, contents);
-  } finally {
-    closeSync(fd);
-  }
-
-  // From here on, every error path must clean up `tmp` so repeated
-  // login / write-env-file attempts don't accumulate stray *.tmp files
-  // on permission errors, locked files, etc.
-  const cleanupAndThrow = (err: unknown): never => {
-    try { unlinkSync(tmp); } catch { /* ignore */ }
-    throw err;
-  };
-
-  if (process.platform === 'win32') {
-    try {
-      unlinkSync(path);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-        cleanupAndThrow(err);
-      }
-    }
-  }
-  try {
-    renameSync(tmp, path);
-  } catch (err) {
-    cleanupAndThrow(err);
-  }
-}
+// Re-export so existing call sites (setup.writeClientEnvFile) don't need a
+// second import line.
+export { atomicWriteFile };
 
 export interface OwnerSession {
   bridge: string;
@@ -73,11 +30,11 @@ export interface OwnerSession {
   saved_at: string;          // ISO 8601
 }
 
+// Owner-session is colocated with `config.json` under the canonical vicoop
+// dir; both are honored by the same VICOOP_HOME / XDG_CONFIG_HOME / ~/.vicoop
+// resolution chain.
 export function defaultStorePath(): string {
-  // ~/.vicoop/ keeps the file colocated with future client state; an XDG
-  // state-dir layout would be more correct on Linux but cross-platform
-  // parity (macOS/Linux/WSL) is more useful here than strict XDG.
-  return join(homedir(), '.vicoop', 'owner-session.json');
+  return defaultOwnerSessionPath();
 }
 
 export function saveOwnerSession(session: OwnerSession, path: string = defaultStorePath()): void {

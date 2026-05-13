@@ -228,7 +228,12 @@ async function mapPartsToCodexInput(
 export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
   const command = opts.command ?? 'codex';
   const cwd = opts.cwd;
-  const sandboxMode = opts.sandboxMode;
+  // Sandbox-on by default. `read-only` is also Codex CLI's own default for
+  // `codex exec` today, but pass it explicitly so the security posture is
+  // visible in `ps`/audit logs and survives any future change to that
+  // upstream default. Operators that want a wider scope pass `workspace-write`
+  // or `danger-full-access` via `CODEX_SANDBOX_MODE` / `backends.codex.sandbox_mode`.
+  const sandboxMode: CodexSandboxMode = opts.sandboxMode ?? 'read-only';
   const extraArgs = opts.extraArgs ?? [];
   const spawnFn = opts.spawn ?? defaultSpawn;
   const stderrCap = opts.stderrCaptureBytes ?? 8192;
@@ -305,7 +310,8 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
 
         const optionArgs = [
           '--json',
-          ...(sandboxMode ? ['-c', `sandbox_mode=${JSON.stringify(sandboxMode)}`] : []),
+          '-c',
+          `sandbox_mode=${JSON.stringify(sandboxMode)}`,
           ...mapped.imageFiles.flatMap((filePath) => ['--image', filePath]),
           ...extraArgs,
         ];

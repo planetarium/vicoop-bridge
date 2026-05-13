@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { saveOwnerSession } from './owner-session.js';
 import { runSetup } from './setup.js';
+import { readConfig } from './config.js';
 
 test('setup registers client with saved owner-session and writes daemon env', async (t) => {
   const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-home-'));
@@ -81,8 +82,10 @@ test('setup registers client with saved owner-session and writes daemon env', as
   assert.match(envBody, /^export SERVER_TOKEN='client-token'$/m);
   assert.match(envBody, /^export AGENT_ID='agent-1'$/m);
   assert.match(stderr, /client_id\s+client-1/);
-  assert.match(stderr, /The CLIENT_TOKEN is shown only once/);
-  assert.match(stderr, /Save the setup output or env file now/);
+  // Updated banner reflects "token is persisted, not displayed" — setup
+  // writes it to config.json by default and only --json prints it.
+  assert.match(stderr, /The CLIENT_TOKEN is one-time/);
+  assert.match(stderr, /setup persists it to the canonical config/);
   assert.match(stderr, /WARNING: no callers configured/);
 });
 
@@ -327,6 +330,479 @@ test('setup prompts for login when no owner-session is available', async (t) => 
 
   assert.equal(code, 1);
   assert.match(stderr, /vicoop-client login --bridge/);
+});
+
+test('setup writes config.json by default and preserves operator-edited fields', async (t) => {
+  // Verify the #137 consolidation: a vanilla `setup` (no --write-env-file)
+  // persists server_url / server_token / agent_id into the canonical
+  // config.json, AND merges into any pre-existing config the operator may
+  // have edited (e.g. backends.claude.settings) instead of clobbering it.
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-config-'));
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  process.env.HOME = tmpHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+  });
+
+  saveOwnerSession({
+    bridge: 'https://bridge.test',
+    token: 'vbc_owner_test',
+    principal_id: 'google:123',
+    email: null,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    saved_at: new Date().toISOString(),
+  });
+
+  // Pre-existing config with operator-edited backend settings — must survive
+  // the setup re-run. writeConfig is used directly to seed state (we're
+  // checking setup merges, not setup creates).
+  const { writeConfig } = await import('./config.js');
+  const configPath = join(process.env.VICOOP_HOME, 'config.json');
+  writeConfig(configPath, {
+    backend: 'claude',
+    backends: {
+      claude: { settings: { sandbox: { enabled: true } } },
+    },
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({
+      data: {
+        registerClient: {
+          clientWithToken: {
+            id: 'client-1',
+            token: 'fresh-token',
+            ownerPrincipal: 'google:123',
+            allowedAgentIds: ['agent-1'],
+          },
+        },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let stderr = '';
+  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  });
+
+  const code = await runSetup([
+    '--client-name', 'test client',
+    '--agent-ids', 'agent-1',
+  ]);
+
+  assert.equal(code, 0);
+  const after = readConfig(configPath);
+  assert.deepEqual(after, {
+    server_url: 'wss://bridge.test',
+    server_token: 'fresh-token',
+    agent_id: 'agent-1',
+    backend: 'claude',
+    backends: {
+      claude: { settings: { sandbox: { enabled: true } } },
+    },
+  });
+  assert.match(stderr, new RegExp(`Wrote ${configPath.replace(/[/\\]/g, '[/\\\\]')}`));
+});
+
+test('setup --json suppresses config.json write for scripting', async (t) => {
+  // The --json contract is "no disk side effects, raw response on stdout" so
+  // scripts (CI, pipelines) can compose without leaking state.
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-json-'));
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  process.env.HOME = tmpHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+  });
+
+  saveOwnerSession({
+    bridge: 'https://bridge.test',
+    token: 'vbc_owner_test',
+    principal_id: 'google:123',
+    email: null,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    saved_at: new Date().toISOString(),
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({
+      data: {
+        registerClient: {
+          clientWithToken: {
+            id: 'client-1',
+            token: 'json-token',
+            ownerPrincipal: 'google:123',
+            allowedAgentIds: ['agent-1'],
+          },
+        },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let stdout = '';
+  t.mock.method(process.stdout, 'write', (chunk: string | Uint8Array) => {
+    stdout += String(chunk);
+    return true;
+  });
+  t.mock.method(process.stderr, 'write', () => true);
+
+  const code = await runSetup([
+    '--client-name', 'test client',
+    '--agent-ids', 'agent-1',
+    '--json',
+  ]);
+
+  assert.equal(code, 0);
+  // No config.json on disk.
+  assert.equal(readConfig(join(process.env.VICOOP_HOME, 'config.json')), null);
+  // Token surfaced through stdout JSON.
+  const parsed = JSON.parse(stdout) as { client_token?: string };
+  assert.equal(parsed.client_token, 'json-token');
+});
+
+test('setup refuses to overwrite agent_id with empty when bridge returns no allowed_agent_ids', async (t) => {
+  // Defense-in-depth: the server contract guarantees a non-empty allowed_agent_ids
+  // (the operator passed --agent-ids and the mutation echoes them back), but if
+  // a buggy/tampered response ever returns [], we'd otherwise wipe a populated
+  // agent_id in config.json with "" and break the daemon on next start.
+  // Fail loud + leave the prior config intact.
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-empty-agent-'));
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  process.env.HOME = tmpHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+  });
+
+  saveOwnerSession({
+    bridge: 'https://bridge.test',
+    token: 'vbc_owner_test',
+    principal_id: 'google:123',
+    email: null,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    saved_at: new Date().toISOString(),
+  });
+
+  // Pre-existing config that must NOT be overwritten with an empty agent_id.
+  const { writeConfig } = await import('./config.js');
+  const configPath = join(process.env.VICOOP_HOME, 'config.json');
+  writeConfig(configPath, {
+    server_url: 'wss://old',
+    server_token: 'old-token',
+    agent_id: 'still-valid-agent',
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({
+      data: {
+        registerClient: {
+          clientWithToken: {
+            id: 'client-1',
+            token: 'fresh-token',
+            ownerPrincipal: 'google:123',
+            // Empty allowed_agent_ids — the misbehaviour we're guarding against.
+            allowedAgentIds: [],
+          },
+        },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let stderr = '';
+  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  });
+
+  // The empty allowed_agent_ids array passes the upstream `!response.allowedAgentIds`
+  // truthy check, so it reaches `writeConfigForSetup`'s guard. That's the
+  // defense-in-depth point — fail loud instead of writing an empty agent_id.
+  const code = await runSetup([
+    '--client-name', 'test client',
+    '--agent-ids', 'still-valid-agent',
+  ]);
+  assert.equal(code, 1);
+  assert.match(
+    stderr,
+    /registerClient returned no allowed_agent_ids/,
+    'expected writeConfigForSetup guard message',
+  );
+
+  const after = await import('./config.js').then((m) => m.readConfig(configPath));
+  assert.deepEqual(after, {
+    server_url: 'wss://old',
+    server_token: 'old-token',
+    agent_id: 'still-valid-agent',
+  });
+});
+
+test('setup preserves operator-added / future-version keys via raw round-trip', async (t) => {
+  // normalizeConfig drops top-level keys it doesn't know about. If setup
+  // round-tripped through that, an operator who added (say) a future
+  // `telemetry` block in config.json would lose it on every setup re-run.
+  // The merge path therefore uses `readConfigRaw` and writes the raw
+  // object back; assert the unknown keys survive both top-level and
+  // nested-under-backends.
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-preserve-'));
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  process.env.HOME = tmpHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+  });
+
+  saveOwnerSession({
+    bridge: 'https://bridge.test',
+    token: 'vbc_owner_test',
+    principal_id: 'google:123',
+    email: null,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    saved_at: new Date().toISOString(),
+  });
+
+  const { mkdirSync, writeFileSync, readFileSync } = await import('node:fs');
+  const configPath = join(process.env.VICOOP_HOME, 'config.json');
+  mkdirSync(process.env.VICOOP_HOME, { recursive: true, mode: 0o700 });
+  // Hand-edited config with two kinds of unknown keys: a future top-level
+  // section (`telemetry`) and an unknown subkey of a known backend
+  // (`backends.claude.future_flag`). Both should survive the round trip.
+  writeFileSync(configPath, JSON.stringify({
+    server_url: 'wss://old',
+    backend: 'claude',
+    backends: {
+      claude: {
+        settings: { sandbox: { enabled: true } },
+        future_flag: 'keep me',
+      },
+    },
+    telemetry: { otel_endpoint: 'http://otel:4317' },
+  }));
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({
+      data: {
+        registerClient: {
+          clientWithToken: {
+            id: 'client-1',
+            token: 'fresh-token',
+            ownerPrincipal: 'google:123',
+            allowedAgentIds: ['agent-1'],
+          },
+        },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  t.mock.method(process.stderr, 'write', () => true);
+
+  const code = await runSetup([
+    '--client-name', 'test client',
+    '--agent-ids', 'agent-1',
+  ]);
+  assert.equal(code, 0);
+
+  const after = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+  assert.equal(after.server_url, 'wss://bridge.test');
+  assert.equal(after.server_token, 'fresh-token');
+  assert.equal(after.agent_id, 'agent-1');
+  assert.equal(after.backend, 'claude');
+  assert.deepEqual(after.telemetry, { otel_endpoint: 'http://otel:4317' });
+  assert.deepEqual(
+    (after.backends as Record<string, unknown>).claude,
+    { settings: { sandbox: { enabled: true } }, future_flag: 'keep me' },
+  );
+});
+
+test('setup: env-file write failure does NOT trip the canonical-recovery block', async (t) => {
+  // Two distinct failure surfaces deserve distinct UX:
+  //   - canonical persistence failed → token was lost, dump it to stderr
+  //   - env-file emission failed but canonical succeeded → token is safe in
+  //     config.json, warn with manual-copy instructions instead of the
+  //     "token not persisted" recovery block.
+  // This test exercises the latter by pointing --write-env-file at an
+  // existing directory, which makes openSync('wx') fail with EISDIR.
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-envfail-'));
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  process.env.HOME = tmpHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+  });
+
+  saveOwnerSession({
+    bridge: 'https://bridge.test',
+    token: 'vbc_owner_test',
+    principal_id: 'google:123',
+    email: null,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    saved_at: new Date().toISOString(),
+  });
+
+  // Make the requested env-file path collide with a directory so the
+  // atomic write trips EISDIR.
+  const { mkdirSync } = await import('node:fs');
+  const envFile = join(tmpHome, 'a-directory.env');
+  mkdirSync(envFile);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({
+      data: {
+        registerClient: {
+          clientWithToken: {
+            id: 'client-1',
+            token: 'fresh-token',
+            ownerPrincipal: 'google:123',
+            allowedAgentIds: ['agent-1'],
+          },
+        },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let stderr = '';
+  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  });
+
+  const code = await runSetup([
+    '--client-name', 'test client',
+    '--agent-ids', 'agent-1',
+    '--write-env-file', envFile,
+  ]);
+  assert.equal(code, 1);
+
+  // Canonical persisted — assert the token is on disk under VICOOP_HOME.
+  const after = readConfig(join(process.env.VICOOP_HOME, 'config.json'));
+  assert.equal(after?.server_token, 'fresh-token');
+  assert.equal(after?.agent_id, 'agent-1');
+
+  // Warning explains config is safe + how to recover without rotating the
+  // token. Crucially, the "[recovery] canonical persistence failed"
+  // wording is NOT printed — that's the misleading message we removed.
+  assert.match(stderr, /--write-env-file .* failed/);
+  assert.match(stderr, /CLIENT_TOKEN was persisted/);
+  assert.match(stderr, /would mint a NEW CLIENT_TOKEN/);
+  assert.doesNotMatch(stderr, /\[recovery\] canonical persistence failed/);
+});
+
+test('setup refuses to overwrite an existing-but-malformed config.json', async (t) => {
+  // The merge path leans on readConfig returning the prior file's parsed
+  // shape. If the file exists but is malformed (operator hand-edited it into
+  // broken JSON), readConfig returns null and the prior `?? {}` fallback
+  // would silently start from empty — wiping any backend defaults the
+  // operator had added before the typo. Refuse + tell them what to fix.
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-malformed-'));
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  process.env.HOME = tmpHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+  });
+
+  saveOwnerSession({
+    bridge: 'https://bridge.test',
+    token: 'vbc_owner_test',
+    principal_id: 'google:123',
+    email: null,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    saved_at: new Date().toISOString(),
+  });
+
+  // Pre-write a broken config.json (truncated JSON).
+  const { mkdirSync, writeFileSync, readFileSync } = await import('node:fs');
+  const configPath = join(process.env.VICOOP_HOME, 'config.json');
+  mkdirSync(process.env.VICOOP_HOME, { recursive: true, mode: 0o700 });
+  writeFileSync(configPath, '{not json');
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({
+      data: {
+        registerClient: {
+          clientWithToken: {
+            id: 'client-1',
+            token: 'fresh-token',
+            ownerPrincipal: 'google:123',
+            allowedAgentIds: ['agent-1'],
+          },
+        },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let stderr = '';
+  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  });
+
+  const code = await runSetup([
+    '--client-name', 'test client',
+    '--agent-ids', 'agent-1',
+  ]);
+  assert.equal(code, 1);
+  // Preflight refuses to mint a token before registerClient runs, so the
+  // operator doesn't end up with an unrecoverable bridge registration whose
+  // token they never got to see.
+  assert.match(stderr, /refusing to mint a token we cannot save/);
+  // Broken file left untouched so the operator can inspect it.
+  assert.equal(readFileSync(configPath, 'utf8'), '{not json');
 });
 
 test('setup quotes env values so shell metacharacters cannot trigger expansion', async (t) => {

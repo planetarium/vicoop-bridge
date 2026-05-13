@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { AgentCard } from '@vicoop-bridge/protocol';
 import { Client } from './client.js';
 import { echoBackend } from './backends/echo.js';
@@ -19,17 +19,16 @@ import {
 } from './admin-cli.js';
 import { runWhoami } from './whoami.js';
 import { deriveIdentity } from './identity.js';
-
-interface Args {
-  server: string;
-  token: string;
-  agentId: string;
-  card?: string;
-  backend: string;
-}
+import {
+  type ClientConfig,
+  defaultConfigPath,
+  overlayConfig,
+  readConfig,
+} from './config.js';
+import { mergeClientArgs, parseFlags, type DaemonArgs as Args } from './cli-args.js';
 
 const DAEMON_USAGE =
-  'vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude|codex> [--card <path>]';
+  'vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude|codex> [--card <path>] [--config <path>]';
 const SUBCOMMAND_LIST =
   'subcommands: login, setup, upgrade, list-agents, list-callers, add-caller, remove-caller, whoami (run any with --help)';
 const CODEX_SANDBOX_MODES = new Set<CodexSandboxMode>([
@@ -38,37 +37,66 @@ const CODEX_SANDBOX_MODES = new Set<CodexSandboxMode>([
   'danger-full-access',
 ]);
 
+// Precedence (highest wins):
+//   1. CLI flag values
+//   2. env vars (kept for systemd EnvironmentFile= compatibility)
+//   3. `--config <path>` file (overlaid on canonical, per field)
+//   4. canonical config.json at the resolved vicoop dir
+//
+// Each layer is optional and contributes only the fields it sets, so
+// operators can split state across them — e.g. systemd unit ships server_*
+// via EnvironmentFile while backends.* lives in config.json.
 function parseClientArgs(argv: string[]): Args {
-  const out: Partial<Args> = {};
-  for (let i = 0; i < argv.length; i++) {
-    const key = argv[i];
-    const val = argv[i + 1];
-    if (!key.startsWith('--')) continue;
-    const k = key.slice(2) as keyof Args;
-    out[k] = val;
-    i++;
-  }
-  const env = (k: string, v?: string) => v ?? process.env[k];
-  const resolved: Args = {
-    server: env('SERVER_URL', out.server)!,
-    token: env('SERVER_TOKEN', out.token)!,
-    agentId: env('AGENT_ID', out.agentId)!,
-    card: env('AGENT_CARD', out.card),
-    backend: env('BACKEND', out.backend) ?? 'echo',
-  };
-  const required = {
-    server: resolved.server,
-    token: resolved.token,
-    agentId: resolved.agentId,
-    backend: resolved.backend,
-  };
-  const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
-  if (missing.length) {
-    console.error(`missing required args: ${missing.join(', ')}`);
+  const parsed = parseFlags(argv);
+  if (!parsed.ok) {
+    console.error(parsed.error);
     console.error(`usage: ${DAEMON_USAGE}`);
     process.exit(1);
   }
-  return resolved;
+  const flags = parsed.flags;
+  // Canonical config is always considered. An explicit `--config <path>` is
+  // overlaid on top per field so missing keys (notably `backends.*`) fall
+  // through from the canonical file instead of disappearing whenever the
+  // operator points --config at a partial file.
+  //
+  // If the canonical file is on disk but readConfig returns null (malformed
+  // JSON / not an object), warn loudly. The canonical config is optional
+  // (systemd installs configure everything via EnvironmentFile=) so we
+  // proceed with an empty config; if env / CLI fills the gap the daemon
+  // still starts, but the operator sees the root cause if it doesn't,
+  // instead of being misled by a generic "missing required args" later.
+  const canonicalPath = defaultConfigPath();
+  let canonical: ClientConfig = {};
+  if (existsSync(canonicalPath)) {
+    const loaded = readConfig(canonicalPath);
+    if (loaded === null) {
+      console.warn(
+        `[client] ${canonicalPath} exists but is unreadable / not a JSON object; ` +
+          'proceeding with env vars + CLI flags only — fix or move it aside to use the file.',
+      );
+    } else {
+      canonical = loaded;
+    }
+  }
+  let config: ClientConfig = canonical;
+  if (flags.config) {
+    const explicit = readConfig(flags.config);
+    if (!explicit) {
+      // The operator named a specific file; silently falling back to the
+      // canonical config when it can't be read would let them think
+      // they're using one config while actually using another.
+      console.error(`--config ${flags.config}: file is missing, unreadable, or not a JSON object`);
+      process.exit(1);
+    }
+    config = overlayConfig(canonical, explicit);
+  }
+  const result = mergeClientArgs(flags, process.env, config);
+  if (!result.ok) {
+    console.error(`missing required args: ${result.missing.join(', ')}`);
+    console.error(`usage: ${DAEMON_USAGE}`);
+    process.exit(1);
+  }
+  return result.args;
 }
 
 // Parse the operator's inline `--settings` JSON for the claude backend. The
@@ -96,39 +124,109 @@ function parseClaudeSettingsEnv(raw: string | undefined): Record<string, unknown
   return parsed as Record<string, unknown>;
 }
 
-function parseCodexSandboxMode(raw: string | undefined): CodexSandboxMode | undefined {
+// `source` names the surface the value came from (env var name, config
+// JSON path, etc.) so the error message points at the right knob. Config-
+// derived values are pre-validated by `normalizeConfig` and never reach the
+// rejection branch here, but parameterizing keeps the function safe to
+// reuse on any source without leaking a misleading "CODEX_SANDBOX_MODE
+// must be one of..." when the bogus value actually came from config.json.
+// Three-state classifier for `OPENCLAW_TASK_TIMEOUT_MS`. The `'valid'` arm
+// is the only one where we want the factory's own resolveTimeout to read
+// the env var; in every other case we fall through to the config value so
+// a mistyped env doesn't silently shadow `backends.openclaw.task_timeout_ms`.
+// The factory still validates internally, so this is purely about choosing
+// which surface contributes the value, not duplicating its parse logic.
+function parseOpenclawTimeoutEnv(
+  raw: string | undefined,
+): 'valid' | 'invalid' | 'unset' {
+  const trimmed = raw?.trim();
+  if (!trimmed) return 'unset';
+  const n = Number(trimmed);
+  if (Number.isFinite(n) && n > 0) return 'valid';
+  console.warn(
+    `[client] OPENCLAW_TASK_TIMEOUT_MS=${JSON.stringify(trimmed)} is not a positive number; ignoring (using backends.openclaw.task_timeout_ms / default).`,
+  );
+  return 'invalid';
+}
+
+function parseCodexSandboxMode(
+  raw: string | undefined,
+  source = 'CODEX_SANDBOX_MODE',
+): CodexSandboxMode | undefined {
   const trimmed = raw?.trim();
   if (!trimmed) return undefined;
   if (CODEX_SANDBOX_MODES.has(trimmed as CodexSandboxMode)) {
     return trimmed as CodexSandboxMode;
   }
   console.error(
-    `CODEX_SANDBOX_MODE must be one of: ${Array.from(CODEX_SANDBOX_MODES).join(', ')} (got ${JSON.stringify(trimmed)})`,
+    `${source} must be one of: ${Array.from(CODEX_SANDBOX_MODES).join(', ')} (got ${JSON.stringify(trimmed)})`,
   );
   process.exit(1);
 }
 
 function pickBackend(name: string, args: Args): Backend {
+  // Env wins over config.json for backend defaults, mirroring the daemon-level
+  // precedence above. The backend factories already do `opts ?? default`
+  // internally, so passing the merged value here is enough.
+  const backends = args.backends ?? {};
   switch (name) {
     case 'echo':
       return echoBackend;
-    case 'openclaw':
+    case 'openclaw': {
       // openclaw's persona / system prompt lives in the gateway-side config
       // (`/data/openclaw.json`), not in a per-message field on `chat.send`.
       // Self-identity is surfaced via `vicoop-client whoami` so operators can
       // paste it into their gateway persona; the bridge has no wire-protocol
       // hook to inject it from here.
-      return createOpenclawBackend();
+      //
+      // Trim + treat-empty-as-unset across the board: install.sh's env
+      // template ships these keys with empty values for operators to fill in,
+      // and `??` would let those empty strings shadow a populated config.json.
+      // `?.trim() ||` mirrors the daemon-level precedence (env wins when set,
+      // falls through to config when blank/unset).
+      const oc = backends.openclaw;
+      // Parse `OPENCLAW_TASK_TIMEOUT_MS` here too (the factory already does
+      // it inside `resolveTimeout`, but we need the parse result *outside*
+      // the factory to decide whether to fall through to config). Three
+      // cases:
+      //   - env unset / blank → opts = config (factory uses config or default)
+      //   - env is a positive finite number → opts = undefined (factory
+      //     re-reads env so the value flows through resolveTimeout normally)
+      //   - env is non-empty but invalid (e.g. "abc", "0", "-5") → warn
+      //     once here, then fall through to config like the blank case so
+      //     the operator's `backends.openclaw.task_timeout_ms` is honored
+      //     instead of being silently replaced by the compiled default.
+      const envTimeoutMs = parseOpenclawTimeoutEnv(process.env.OPENCLAW_TASK_TIMEOUT_MS);
+      return createOpenclawBackend({
+        url: process.env.OPENCLAW_GATEWAY_URL?.trim() || oc?.gateway_url,
+        token: process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || oc?.gateway_token,
+        agent: process.env.OPENCLAW_AGENT?.trim() || oc?.agent,
+        taskTimeoutMs: envTimeoutMs === 'valid' ? undefined : oc?.task_timeout_ms,
+      });
+    }
     case 'claude':
       return createClaudeBackend({
-        cwd: process.env.CLAUDE_CWD?.trim() || undefined,
+        cwd:
+          process.env.CLAUDE_CWD?.trim() ||
+          backends.claude?.cwd ||
+          undefined,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
-        settings: parseClaudeSettingsEnv(process.env.CLAUDE_SETTINGS_JSON),
+        settings:
+          parseClaudeSettingsEnv(process.env.CLAUDE_SETTINGS_JSON) ??
+          backends.claude?.settings,
       });
     case 'codex':
       return createCodexBackend({
-        cwd: process.env.CODEX_CWD?.trim() || undefined,
-        sandboxMode: parseCodexSandboxMode(process.env.CODEX_SANDBOX_MODE),
+        cwd:
+          process.env.CODEX_CWD?.trim() ||
+          backends.codex?.cwd ||
+          undefined,
+        sandboxMode:
+          parseCodexSandboxMode(process.env.CODEX_SANDBOX_MODE) ??
+          parseCodexSandboxMode(
+            backends.codex?.sandbox_mode,
+            'backends.codex.sandbox_mode (config.json)',
+          ),
       });
     default:
       throw new Error(`unknown backend: ${name} (supported: echo, openclaw, claude, codex)`);

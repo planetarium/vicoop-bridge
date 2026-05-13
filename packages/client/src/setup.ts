@@ -1,7 +1,16 @@
 // `vicoop-client setup` — create a bridge client token using an existing
-// owner-session bearer, then write the daemon env file.
+// owner-session bearer, then persist the daemon credentials to the canonical
+// `config.json`. `--write-env-file` remains as an opt-in for operators who
+// want a systemd `EnvironmentFile=` (or shell-sourceable file) alongside the
+// canonical config — see #137.
 
+import { existsSync } from 'node:fs';
 import { atomicWriteFile, resolveOwnerSession } from './owner-session.js';
+import {
+  defaultConfigPath,
+  readConfigRaw,
+  writeConfig,
+} from './config.js';
 
 interface SetupArgs {
   clientName: string;
@@ -112,10 +121,16 @@ function shSingleQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
+// Convert the bridge's HTTP(S) URL to the WebSocket scheme the daemon
+// connects with. Shared by both the canonical config writer and the
+// systemd env-file emitter so the rewrite rule has one source of truth.
+function wsUrlFromBridge(bridgeUrl: string): string {
+  return bridgeUrl.replace(/^http(s?):\/\//, (_m, s) => (s === 's' ? 'wss://' : 'ws://'));
+}
+
 function envLines(success: ClientRegisterSuccess, bridgeUrl: string): string[] {
-  const wsUrl = bridgeUrl.replace(/^http(s?):\/\//, (_m, s) => (s === 's' ? 'wss://' : 'ws://'));
   return [
-    `export SERVER_URL=${shSingleQuote(wsUrl)}`,
+    `export SERVER_URL=${shSingleQuote(wsUrlFromBridge(bridgeUrl))}`,
     `export SERVER_TOKEN=${shSingleQuote(success.client_token)}`,
     `export AGENT_ID=${shSingleQuote(success.allowed_agent_ids[0] ?? '')}`,
   ];
@@ -132,15 +147,74 @@ function writeClientEnvFile(path: string, success: ClientRegisterSuccess, bridge
   ].join('\n'), 0o600);
 }
 
-function writeClientSetupOutput(args: SetupArgs, success: ClientRegisterSuccess, bridgeUrl: string): void {
-  if (args.envFile) {
-    writeClientEnvFile(args.envFile, success, bridgeUrl);
-    process.stderr.write(`Wrote env block to ${args.envFile} (mode 600).\n`);
-  } else if (args.json) {
-    process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
-  } else {
-    process.stdout.write(`${envLines(success, bridgeUrl).join('\n')}\n`);
+// Merge into any existing config.json so operator-edited fields (backend
+// defaults, card path, etc.) survive a setup re-run that's only rotating
+// the server token. Returns the path written for the success message.
+//
+// Throws when `allowed_agent_ids` is empty — the bridge contract guarantees
+// at least one entry (the operator passed `--agent-ids ...` and the mutation
+// echoes them back), so an empty array is a server bug or a tampered
+// response. Failing here is safer than silently overwriting a populated
+// `agent_id` in config.json with `""`, which would break the daemon on
+// next start with no obvious cause.
+function writeConfigForSetup(success: ClientRegisterSuccess, bridgeUrl: string): string {
+  const firstAgentId = success.allowed_agent_ids[0];
+  if (!firstAgentId) {
+    throw new Error(
+      'registerClient returned no allowed_agent_ids — refusing to overwrite config.json with an empty agent_id',
+    );
   }
+  const path = defaultConfigPath();
+  // Distinguish "file does not exist" (fresh install — start from empty) from
+  // "file exists but raw parse returned null" (malformed JSON / unreadable —
+  // operator hand-edited it into a broken state). Silently overwriting the
+  // latter would clobber whatever backend defaults the operator added before
+  // the typo. Refuse and let them inspect/fix or move it aside; setup never
+  // owns enough context to know whether the corrupted bytes should be lost.
+  //
+  // We use `readConfigRaw` rather than `readConfig` so the round trip
+  // preserves operator-added or future-version keys that `normalizeConfig`
+  // would drop. Setup only owns the three credential fields below;
+  // everything else in the file is the operator's domain and must survive.
+  let existing: Record<string, unknown> = {};
+  if (existsSync(path)) {
+    const loaded = readConfigRaw(path);
+    if (!loaded) {
+      throw new Error(
+        `${path} exists but is unreadable or not a valid JSON object — refusing to overwrite. ` +
+          'Inspect / fix the file (or move it aside) and rerun setup.',
+      );
+    }
+    existing = loaded;
+  }
+  existing.server_url = wsUrlFromBridge(bridgeUrl);
+  existing.server_token = success.client_token;
+  existing.agent_id = firstAgentId;
+  writeConfig(path, existing);
+  return path;
+}
+
+// Persist the canonical credentials. Returns the path written (or `null` on
+// the --json path, which writes to stdout instead and has no disk side
+// effect). Throws on persistence failure — the caller must surface the
+// just-minted token as a recovery hatch because the bridge cannot reissue
+// it. The optional `--write-env-file` write is intentionally NOT performed
+// here; see `writeOptionalEnvFile` for that path's separate failure
+// handling.
+function persistCanonical(
+  args: SetupArgs,
+  success: ClientRegisterSuccess,
+  bridgeUrl: string,
+): string | null {
+  // --json keeps its scripting contract: no disk side effects, raw response
+  // on stdout.
+  if (args.json) {
+    process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
+    return null;
+  }
+  const configPath = writeConfigForSetup(success, bridgeUrl);
+  process.stderr.write(`Wrote ${configPath} (mode 600).\n`);
+  return configPath;
 }
 
 async function registerClient(
@@ -278,6 +352,27 @@ export async function runSetup(args: string[]): Promise<number> {
     return 1;
   }
 
+  // Preflight: if the canonical config.json already exists but readConfigRaw
+  // returns null (malformed JSON / not an object), abort BEFORE minting a
+  // client token. Otherwise `registerClient` succeeds, the token comes back
+  // exactly once from the bridge, and `writeConfigForSetup` then throws the
+  // same "refusing to overwrite" error — leaving the operator with no token
+  // and no record of it. Only `--json` is exempt (it skips
+  // `writeClientSetupOutput` entirely and prints the token to stdout);
+  // `--bridge/--token` overrides change *where* the owner session comes
+  // from, not *where* the client credentials get persisted, so they still
+  // write canonical config.json and need the same preflight.
+  if (!parsed.json) {
+    const configPath = defaultConfigPath();
+    if (existsSync(configPath) && readConfigRaw(configPath) === null) {
+      process.stderr.write(
+        `${configPath} exists but is unreadable / not a JSON object — ` +
+          'fix or move it aside before rerunning setup (refusing to mint a token we cannot save).\n',
+      );
+      return 1;
+    }
+  }
+
   let success: ClientRegisterSuccess;
   try {
     success = await registerClient({ bridge, token }, parsed);
@@ -291,11 +386,64 @@ export async function runSetup(args: string[]): Promise<number> {
       `  owner_principal  ${success.owner_principal}\n` +
       `  client_name      ${success.client_name}\n` +
       `  allowed_agents   ${success.allowed_agent_ids.join(', ')}\n\n` +
-      'The CLIENT_TOKEN is shown only once and cannot be retrieved later.\n' +
-      '  Save the setup output or env file now.\n\n',
+      'The CLIENT_TOKEN is one-time — the bridge cannot reissue it.\n' +
+      '  setup persists it to the canonical config below; --json prints it to\n' +
+      '  stdout instead. Back up that file before rotating hosts.\n' +
+      '  To also stash it in a systemd EnvironmentFile, pass --write-env-file\n' +
+      '  on this same setup invocation — rerunning setup later would call\n' +
+      '  registerClient again and mint a NEW CLIENT_TOKEN, invalidating this\n' +
+      '  one. To populate an env file from an already-issued token, copy\n' +
+      '  SERVER_URL / SERVER_TOKEN / AGENT_ID out of config.json by hand.\n\n',
   );
 
-  writeClientSetupOutput(parsed, success, bridge);
+  // Canonical persistence: if this fails the operator is left with a
+  // just-minted token that exists nowhere, so dump it to stderr as a
+  // recovery hatch.
+  let canonicalPath: string | null;
+  try {
+    canonicalPath = persistCanonical(parsed, success, bridge);
+  } catch (e) {
+    process.stderr.write(`${(e as Error).message}\n`);
+    // The preflight above catches the common "existing config is malformed"
+    // case before minting, but a disk-full / EPERM failure during the
+    // write itself can still strand the token. Surface it on stderr so
+    // the operator can save it manually instead of being left with an
+    // unrecoverable bridge registration. The token still goes to stderr
+    // (not stdout) so `--json`-style pipelines aren't affected — they
+    // would have taken the --json branch inside persistCanonical.
+    process.stderr.write(
+      '\n[recovery] canonical persistence failed AFTER registerClient succeeded. The bridge has issued this CLIENT_TOKEN exactly once:\n' +
+        `\n  CLIENT_ID:      ${success.client_id}\n` +
+        `  CLIENT_TOKEN:   ${success.client_token}\n` +
+        `  SERVER_URL:     ${wsUrlFromBridge(bridge)}\n` +
+        `  AGENT_ID:       ${success.allowed_agent_ids[0] ?? ''}\n\n` +
+        '  Save these values now; they cannot be retrieved later. Rotate via ' +
+        '`rotateClientToken` GraphQL mutation if you suspect leakage.\n',
+    );
+    return 1;
+  }
+
+  // Optional env-file emission for systemd `EnvironmentFile=`. Errors here
+  // are NOT recovery situations: the token is already safe in canonical
+  // config.json. Surface a targeted warning that tells the operator how
+  // to populate the env file by hand without rotating the token (rerunning
+  // `setup --write-env-file` would mint a new CLIENT_TOKEN). Exit
+  // non-zero so CI / scripts catch the partial failure, but with a
+  // distinct message — not the "token was not persisted" recovery block.
+  if (parsed.envFile && !parsed.json) {
+    try {
+      writeClientEnvFile(parsed.envFile, success, bridge);
+      process.stderr.write(`Wrote env block to ${parsed.envFile} (mode 600).\n`);
+    } catch (e) {
+      process.stderr.write(
+        `\nWARNING: --write-env-file ${parsed.envFile} failed: ${(e as Error).message}\n` +
+          `  The CLIENT_TOKEN was persisted to ${canonicalPath ?? '(canonical config)'} — the daemon can start without the env file.\n` +
+          '  To populate the env file without rotating the token, copy SERVER_URL / SERVER_TOKEN / AGENT_ID out of config.json by hand.\n' +
+          '  Re-running `setup --write-env-file ...` would mint a NEW CLIENT_TOKEN and invalidate the one just written.\n',
+      );
+      return 1;
+    }
+  }
 
   if (parsed.callers.length > 0) {
     try {
