@@ -199,6 +199,43 @@ Wrote /home/you/.vicoop/config.json (mode 600).
 resolved as `$VICOOP_HOME > $XDG_CONFIG_HOME/vicoop > ~/.vicoop` (existing
 `~/.vicoop` installs are honored even when `$XDG_CONFIG_HOME` is set).
 
+`setup` only writes the three credentials above; backend defaults are
+hand-edited into the same file. The full shape (every field optional —
+omit what you don't need) is:
+
+```json
+{
+  "server_url": "wss://vicoop-bridge-server.fly.dev",
+  "server_token": "<written by setup>",
+  "agent_id": "<written by setup>",
+  "backend": "claude",
+  "card": "/srv/vicoop/cards/my-agent.json",
+  "backends": {
+    "claude": {
+      "cwd": "/srv/agent-work",
+      "settings": {
+        "sandbox": { "enabled": true, "failIfUnavailable": true }
+      }
+    },
+    "codex": {
+      "cwd": "/srv/agent-work",
+      "sandbox_mode": "workspace-write"
+    },
+    "openclaw": {
+      "gateway_url": "ws://127.0.0.1:18789",
+      "gateway_token": "<gateway-token-if-required>",
+      "agent": "main",
+      "task_timeout_ms": 600000
+    }
+  }
+}
+```
+
+Daemon precedence is **CLI flag > env var > `--config <path>` > canonical
+`config.json`**, so env values still win (handy for systemd `EnvironmentFile=`
+or CI overrides). `setup` only ever touches `server_url`, `server_token`, and
+`agent_id` — hand-edits to the other fields survive `setup` re-runs.
+
 If you omit `--caller`, `setup` succeeds but prints a warning that the
 agent will be public until you restrict callers:
 
