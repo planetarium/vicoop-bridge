@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
   parseUpFrame,
@@ -271,6 +273,166 @@ test('Client reconnects after WebSocket close and sends hello again', async () =
     }
   } finally {
     client.stop();
+    await closeServer(server, wss);
+  }
+});
+
+test('Client reconnect timer is refed so a disconnected daemon stays alive (#156)', async () => {
+  // Regression: scheduleReconnect() previously called `.unref()` on the
+  // reconnect timer. With the WS dropped and the heartbeat / reset timers
+  // already cleared, that left the daemon process with no refed handles
+  // and Node exited before the first reconnect attempt fired. The existing
+  // "reconnects after WebSocket close" test below passes regardless of the
+  // unref because the test process has the mock WebSocketServer and http
+  // server keeping the loop alive on their own. We assert directly on the
+  // refed-ness of the scheduled timer instead, so the regression is caught
+  // even in-process.
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  const connections: WebSocket[] = [];
+  let helloCount = 0;
+  wss.on('connection', (ws) => {
+    connections.push(ws);
+    ws.on('message', () => helloCount++);
+  });
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => {
+      /* no tasks */
+    }),
+    // Keep the reconnect delay long enough that the timer is still pending
+    // when we inspect it below. Without this we'd race the reconnect itself.
+    reconnectDelayMs: 5000,
+    reconnectMaxDelayMs: 5000,
+    reconnectJitterRatio: 0,
+    reconnectStableMs: 0,
+    heartbeatIntervalMs: 0,
+  });
+
+  // Private-field access for the regression check. The reconnect timer is
+  // an implementation detail, but the invariant ("must keep the event loop
+  // alive while disconnected") is part of the daemon contract — and the
+  // only way to assert that in-process without a subprocess is to look at
+  // the timer's `hasRef()`. Kept narrow so a refactor renaming the field
+  // will fail loudly here.
+  interface Internals {
+    reconnectTimer: { hasRef(): boolean } | null;
+  }
+  const internals = client as unknown as Internals;
+
+  try {
+    client.start();
+    await waitFor(() => helloCount === 1, 'expected initial hello');
+    // Forcibly drop the connection on the server side. `terminate()` skips
+    // the close-frame handshake so the client observes a 1006 abnormal
+    // closure — matching the production repro in the issue and avoiding
+    // the "1006 is not a transmissible code" error that `close(1006, ...)`
+    // would throw on the server-side socket.
+    connections[0]!.terminate();
+    await waitFor(
+      () => internals.reconnectTimer !== null,
+      'expected reconnect timer to be scheduled after disconnect',
+    );
+    assert.equal(
+      internals.reconnectTimer!.hasRef(),
+      true,
+      'reconnect timer must keep the event loop alive — without this the daemon exits on first disconnect (#156)',
+    );
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
+test('Client daemon (subprocess) survives WS disconnect and reconnects (#156)', async () => {
+  // End-to-end regression: spawn a real Node child that runs only the
+  // Client (no other refed handles), force-close its WS, and assert that
+  // the child stays alive long enough to reconnect. This is the scenario
+  // the in-process tests can't reproduce — there the WebSocketServer and
+  // http.Server keep the loop alive regardless of how the reconnect timer
+  // is refed.
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  let helloCount = 0;
+  wss.on('connection', (ws) => {
+    ws.on('message', () => {
+      helloCount++;
+      // Drop the connection on the first hello so the child has to recover
+      // via its reconnect path. 1006 is delivered as an abnormal closure on
+      // the client side, matching the production reproduction in the issue.
+      if (helloCount === 1) ws.terminate();
+    });
+  });
+
+  const fixturePath = fileURLToPath(
+    new URL('./reconnect-daemon-fixture.ts', import.meta.url),
+  );
+  // We're already running under tsx (per the package's test script), so
+  // the same `--import tsx` flag is available to the child. Pinning to
+  // `process.execPath` keeps us off PATH and out of sync with whatever
+  // node is in `node_modules/.bin`.
+  const child = spawn(
+    process.execPath,
+    ['--import', 'tsx', fixturePath, serverUrl],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  let exited = false;
+  let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+  child.on('exit', (code, signal) => {
+    exited = true;
+    exitInfo = { code, signal };
+  });
+  const stderr: string[] = [];
+  child.stderr.on('data', (b: Buffer) => stderr.push(b.toString('utf8')));
+  // Wait for the child to print `daemon-ready` so we know the Client has
+  // been constructed and `start()` has been called. Without this we could
+  // race the child's startup and observe `helloCount === 0` purely because
+  // the fixture hasn't connected yet.
+  await new Promise<void>((resolve, reject) => {
+    let buf = '';
+    const onData = (b: Buffer): void => {
+      buf += b.toString('utf8');
+      if (buf.includes('daemon-ready')) {
+        child.stdout.off('data', onData);
+        resolve();
+      }
+    };
+    child.stdout.on('data', onData);
+    const timeout = setTimeout(() => {
+      child.stdout.off('data', onData);
+      reject(
+        new Error(
+          `daemon fixture did not become ready within 5s. stderr: ${stderr.join('')}`,
+        ),
+      );
+    }, 5000);
+    child.on('exit', () => clearTimeout(timeout));
+  });
+
+  try {
+    await waitFor(() => helloCount === 1, 'expected initial hello from child', 3000);
+    // The server terminated the socket after the first hello. If the
+    // daemon is healthy it reconnects after reconnectDelayMs (100ms in
+    // the fixture) and sends a second hello. If the unref regression is
+    // back, the child exits before the reconnect fires.
+    await waitFor(
+      () => helloCount === 2,
+      `expected reconnect hello from daemon — child exited=${exited} info=${JSON.stringify(exitInfo)} stderr=${stderr.join('')}`,
+      3000,
+    );
+    assert.equal(
+      exited,
+      false,
+      `daemon must survive the disconnect; exited with ${JSON.stringify(exitInfo)} stderr=${stderr.join('')}`,
+    );
+  } finally {
+    if (!exited) child.kill('SIGTERM');
     await closeServer(server, wss);
   }
 });
