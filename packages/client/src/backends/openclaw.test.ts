@@ -1125,11 +1125,36 @@ test('handle(): non-image file part is forwarded as a non-image attachment (Open
   }
 });
 
-test('handle(): data part fails fast with unsupported_data_part without touching the gateway', async () => {
-  let chatSendSeen = false;
+test('handle(): data part is folded into the chat.send message as a tagged JSON block', async () => {
+  let observedMessage: string | undefined;
   const fake = await createFakeGateway({
-    onRequest: (_sock, req) => {
-      if (req.method === 'chat.send') chatSendSeen = true;
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        observedMessage = (req.params as { message?: string } | undefined)?.message;
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { runId: 'run-data', status: 'started' },
+          }),
+        );
+        setImmediate(() => {
+          sock.send(
+            JSON.stringify({
+              type: 'event',
+              event: 'chat',
+              payload: {
+                runId: 'run-data',
+                sessionKey: 'agent:main:ctx-t1',
+                seq: 1,
+                state: 'final',
+                message: { text: 'ok' },
+              },
+            }),
+          );
+        });
+      }
     },
   });
   try {
@@ -1150,11 +1175,11 @@ test('handle(): data part fails fast with unsupported_data_part without touching
     };
     await backend.handle(task, (f) => frames.push(f), NEVER);
     const fail = frames.find((f) => f.type === 'task.fail');
-    assert.ok(fail, 'unsupported data part must fail the task');
-    assert.equal(fail!.error.code, 'unsupported_data_part');
-    // Give any racing chat.send a chance to land so the assertion is meaningful.
-    await new Promise((r) => setTimeout(r, 30));
-    assert.equal(chatSendSeen, false, 'gateway must not see chat.send for malformed input');
+    assert.equal(fail, undefined, 'data parts must no longer fail the task');
+    assert.ok(observedMessage, 'chat.send must have been called with a message');
+    assert.match(observedMessage!, /^context\n<context kind="application\/json">\n/);
+    assert.ok(observedMessage!.includes('"hello": "world"'));
+    assert.ok(observedMessage!.endsWith('</context>'));
   } finally {
     await fake.close();
   }
