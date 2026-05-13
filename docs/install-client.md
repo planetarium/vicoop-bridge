@@ -433,6 +433,16 @@ Both knobs can also live in `~/.vicoop/config.json` under `backends.claude`
 `"$INSTALL_DIR/bin/vicoop-client"`; the env vars still win when set, mirroring
 the daemon-level precedence (Step 6 intro).
 
+> **Sandbox-on by default.** When neither `CLAUDE_SETTINGS_JSON` nor
+> `backends.claude.settings` is set, the backend forwards
+> `--settings '{"sandbox":{"enabled":true,"failIfUnavailable":true}}'` to every
+> spawned `claude`. The OS-level sandbox (Seatbelt on macOS, bubblewrap on
+> Linux) is on; `failIfUnavailable: true` means a host that can't enable it
+> exits at startup instead of silently running with full host access. To
+> widen the policy (extra `allowedDomains`, `allowWrite`, etc.) supply a
+> complete `settings` object — it replaces the default entirely. To run
+> without a sandbox, pass `{ "sandbox": { "enabled": false } }`.
+
 `CLAUDE_CWD` defaults to the current working directory of the client
 process. Set it when the released bundle lives outside the repository you
 want Claude to edit.
@@ -522,6 +532,12 @@ text output. `CODEX_SANDBOX_MODE` is optional and accepts `read-only`,
 `workspace-write`, or `danger-full-access`; the client passes it to Codex as
 `-c sandbox_mode="<mode>"` so the same setting applies to fresh and resumed
 Codex sessions.
+
+> **Sandbox-on by default.** With neither `CODEX_SANDBOX_MODE` nor
+> `backends.codex.sandbox_mode` set, the backend passes
+> `-c sandbox_mode="read-only"` explicitly — the same default Codex CLI
+> applies, but stamped into argv so the posture is visible in `ps` / audit
+> logs and survives any future change to Codex's own default.
 
 ## Manage caller allowlists
 

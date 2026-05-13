@@ -174,7 +174,7 @@ test('text-only task spawns codex exec --json - and writes prompt to stdin', asy
 
   const child = fake.lastChild()!;
   assert.equal(child.command, 'codex');
-  assert.deepEqual(child.args, ['exec', '--json', '-']);
+  assert.deepEqual(child.args, ['exec', '--json', '-c', 'sandbox_mode="read-only"', '-']);
   assert.equal(child.cwd, '/repo');
   assert.equal(child.stdinPayload, 'say hi');
   assert.equal(child.stdinClosed, true);
@@ -220,8 +220,22 @@ test('thread.started id is reused via codex exec resume on the same contextId', 
   await backend.handle(assign('one', 'ctx'), collect().emit, NEVER);
   await backend.handle(assign('two', 'ctx'), collect().emit, NEVER);
 
-  assert.deepEqual(fake.children[0].args, ['exec', '--json', '-']);
-  assert.deepEqual(fake.children[1].args, ['exec', 'resume', '--json', 'thread-a', '-']);
+  assert.deepEqual(fake.children[0].args, [
+    'exec',
+    '--json',
+    '-c',
+    'sandbox_mode="read-only"',
+    '-',
+  ]);
+  assert.deepEqual(fake.children[1].args, [
+    'exec',
+    'resume',
+    '--json',
+    '-c',
+    'sandbox_mode="read-only"',
+    'thread-a',
+    '-',
+  ]);
 });
 
 test('sandboxMode is passed as a Codex config override on initial and resume runs', async () => {
@@ -288,7 +302,15 @@ test('distinct contextIds get distinct sessions', async () => {
   await backend.handle(assign('two', 'ctx-b'), collect().emit, NEVER);
   await backend.handle(assign('again', 'ctx-a'), collect().emit, NEVER);
 
-  assert.deepEqual(fake.children[2].args, ['exec', 'resume', '--json', 'thread-a', '-']);
+  assert.deepEqual(fake.children[2].args, [
+    'exec',
+    'resume',
+    '--json',
+    '-c',
+    'sandbox_mode="read-only"',
+    'thread-a',
+    '-',
+  ]);
 });
 
 test('session TTL expiry starts a new codex exec run', async () => {
@@ -307,7 +329,13 @@ test('session TTL expiry starts a new codex exec run', async () => {
   now = 6_000;
   await backend.handle(assign('two', 'ctx'), collect().emit, NEVER);
 
-  assert.deepEqual(fake.children[1].args, ['exec', '--json', '-']);
+  assert.deepEqual(fake.children[1].args, [
+    'exec',
+    '--json',
+    '-c',
+    'sandbox_mode="read-only"',
+    '-',
+  ]);
 });
 
 test('abort after image materialization completes before spawn and cleans temp dir', async () => {
@@ -374,7 +402,13 @@ test('resume spawn failure rolls back TTL refresh for the existing session', asy
 
   const fail = failed.frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
   assert.equal(fail?.error.code, 'spawn_failed');
-  assert.deepEqual(fake.children[1].args, ['exec', '--json', '-']);
+  assert.deepEqual(fake.children[1].args, [
+    'exec',
+    '--json',
+    '-c',
+    'sandbox_mode="read-only"',
+    '-',
+  ]);
 });
 
 test('command_execution emits trace artifact only when traceability is requested', async () => {
@@ -508,6 +542,8 @@ test('image FilePart.bytes creates temp files and passes --image args', async ()
   assert.deepEqual(fake.lastChild()!.args, [
     'exec',
     '--json',
+    '-c',
+    'sandbox_mode="read-only"',
     '--image',
     '/tmp/vicoop-codex-test/image-1.png',
     '-',

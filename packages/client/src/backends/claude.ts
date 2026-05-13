@@ -526,6 +526,18 @@ export function createClaudeBackend(
   const identityArgs: readonly string[] = opts.identity
     ? ['--append-system-prompt', buildSelfIdentitySystemPrompt(opts.identity)]
     : [];
+  // Sandbox-on by default. Operators get the OS-level sandbox (Seatbelt on
+  // macOS, bubblewrap on Linux) without having to opt in via
+  // `CLAUDE_SETTINGS_JSON`, and `failIfUnavailable: true` makes the daemon
+  // exit at startup on a host where the sandbox can't be enabled — failing
+  // open here would silently run unsandboxed, which the agent's filesystem
+  // and shell access make actively unsafe. An operator who explicitly passes
+  // `settings` (via env or config.json) overrides this default entirely; to
+  // turn the sandbox off they pass `{ "sandbox": { "enabled": false } }`.
+  const DEFAULT_SETTINGS: Record<string, unknown> = {
+    sandbox: { enabled: true, failIfUnavailable: true },
+  };
+  const resolvedSettings = opts.settings ?? DEFAULT_SETTINGS;
   // Serialize once at backend construction so per-task spawn stays cheap and
   // a malformed settings object (circular reference, BigInt value, etc.)
   // fails loud at setup time rather than producing a corrupted argv on the
@@ -533,10 +545,10 @@ export function createClaudeBackend(
   // underlying `JSON.stringify` message so a misconfiguration is actionable
   // without the operator having to read a raw stack trace.
   const settingsArgs: readonly string[] = ((): readonly string[] => {
-    if (!opts.settings) return [];
+    if (!resolvedSettings) return [];
     let serialized: string | undefined;
     try {
-      serialized = JSON.stringify(opts.settings);
+      serialized = JSON.stringify(resolvedSettings);
     } catch (err) {
       throw new Error(
         `createClaudeBackend: failed to serialize \`settings\` option as JSON for --settings argv: ${errorMessage(err)}`,

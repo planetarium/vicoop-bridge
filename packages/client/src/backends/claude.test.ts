@@ -675,7 +675,11 @@ test('injects --settings <json> when settings option is provided', async () => {
   assert.deepEqual(JSON.parse(String(child.args[idx + 1])), settings);
 });
 
-test('omits --settings when settings option is not provided', async () => {
+test('injects default sandbox-on --settings when settings option is not provided', async () => {
+  // Sandbox-on-by-default is the safe baseline: operators get the OS-level
+  // sandbox (Seatbelt / bubblewrap) without having to remember to opt in,
+  // and failIfUnavailable: true means a host that can't enable it fails
+  // loud at startup instead of silently running unsandboxed.
   const fake = scriptedSpawn({
     lines: [JSON.stringify({ type: 'result', result: 'ok' })],
     exitCode: 0,
@@ -686,7 +690,11 @@ test('omits --settings when settings option is not provided', async () => {
 
   const child = fake.lastChild();
   assert.ok(child);
-  assert.equal(child.args.indexOf('--settings'), -1);
+  const idx = child.args.indexOf('--settings');
+  assert.ok(idx !== -1, 'expected default --settings flag');
+  assert.deepEqual(JSON.parse(String(child.args[idx + 1])), {
+    sandbox: { enabled: true, failIfUnavailable: true },
+  });
 });
 
 test('createClaudeBackend throws a named error if settings is not JSON-serializable', () => {
