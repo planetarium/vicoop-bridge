@@ -211,10 +211,14 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       // Only accept a homogeneous string array — anything else (a bare
       // string, a number, nested objects) is dropped to keep malformed
       // edits from injecting non-string args into the spawned argv.
+      // Each entry is then trimmed and whitespace-only entries are
+      // dropped, matching the rest of this file's string-field handling
+      // — `extra_args: [" --flag", "   "]` becomes `["--flag"]` rather
+      // than a leading-space-bearing argv that codex parses as junk.
       const extraArgsRaw = codexRaw.extra_args;
       const extraArgs =
         Array.isArray(extraArgsRaw) && extraArgsRaw.every((v) => typeof v === 'string')
-          ? (extraArgsRaw as string[])
+          ? (extraArgsRaw as string[]).map((v) => v.trim()).filter((v) => v.length > 0)
           : undefined;
       if (cwd || validSandbox || (extraArgs && extraArgs.length > 0)) {
         out.codex = {};

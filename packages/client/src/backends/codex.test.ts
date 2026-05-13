@@ -6,6 +6,7 @@ import {
   type CodexChildHandle,
   type CodexSpawnOptions,
 } from './codex.js';
+import type { Logger } from '../logger.js';
 import {
   TRACEABILITY_EXTENSION_URI,
   type TaskAssignFrame,
@@ -459,7 +460,7 @@ test('command_execution emits trace artifact only when traceability is requested
   assert.match(textOf(artifact), /npm test/);
 });
 
-test('nonzero exit emits task.fail with stderr tail', async () => {
+test('nonzero exit emits task.fail with stderr tail (no host-local argv/cwd on the wire)', async () => {
   const fake = makeFakeSpawn((child) => {
     setImmediate(() => {
       child.emitStderr('codex: auth required\n');
@@ -476,10 +477,13 @@ test('nonzero exit emits task.fail with stderr tail', async () => {
   assert.equal(fail.error.code, 'codex_exit_nonzero');
   assert.match(fail.error.message, /code 2/);
   assert.match(fail.error.message, /auth required/);
-  assert.match(fail.error.message, /argv=/);
+  // argv and cwd are host-local — they go to the local logger, not the
+  // wire-level error.message which the bridge forwards to the caller.
+  assert.doesNotMatch(fail.error.message, /argv=/);
+  assert.doesNotMatch(fail.error.message, /cwd=/);
 });
 
-test('nonzero exit message includes argv and cwd for repro (#147)', async () => {
+test('spawn-failure repro line goes to the local logger, not the wire (#147 Copilot)', async () => {
   const fake = makeFakeSpawn((child) => {
     setImmediate(() => {
       child.emitStderr('boom\n');
@@ -487,20 +491,35 @@ test('nonzero exit message includes argv and cwd for repro (#147)', async () => 
     });
   });
 
+  const warnLines: string[] = [];
+  const stubLogger: Logger = {
+    level: 'info',
+    error: () => {},
+    warn: (...a: unknown[]) => warnLines.push(a.map(String).join(' ')),
+    info: () => {},
+    debug: () => {},
+  };
+
   const backend = createCodexBackend({
     spawn: fake.spawn,
     cwd: '/srv/agent-work',
+    logger: stubLogger,
   });
   const { emit, frames } = collect();
   await backend.handle(assign('x'), emit, NEVER);
 
+  // Wire-level message stays free of host-local detail.
   const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
   assert.ok(fail);
   assert.equal(fail.error.code, 'codex_exit_nonzero');
-  assert.match(fail.error.message, /argv=\[/);
-  assert.match(fail.error.message, /"codex"/);
-  assert.match(fail.error.message, /"exec"/);
-  assert.match(fail.error.message, /cwd="\/srv\/agent-work"/);
+  assert.doesNotMatch(fail.error.message, /\/srv\/agent-work/);
+
+  // Local logger receives the full argv + cwd for operator debugging.
+  const repro = warnLines.find((l) => l.includes('codex spawn-failure repro'));
+  assert.ok(repro, `expected a repro warn line, got: ${JSON.stringify(warnLines)}`);
+  assert.match(repro, /argv=\[/);
+  assert.match(repro, /"codex"/);
+  assert.match(repro, /cwd="\/srv\/agent-work"/);
 });
 
 test('--skip-git-repo-check is auto-added so non-git cwds work out of the box (#147)', async () => {

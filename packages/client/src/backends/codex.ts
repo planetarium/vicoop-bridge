@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { TRACEABILITY_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { createLogger, type Logger } from '../logger.js';
 import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME } from './fetch-uri-file.js';
 
 export interface CodexChildHandle {
@@ -43,6 +44,12 @@ export interface CodexBackendOptions {
   mkdtemp?: (prefix: string) => Promise<string>;
   writeFile?: (file: string, data: Buffer) => Promise<void>;
   rm?: (file: string, options: { recursive: boolean; force: boolean }) => Promise<void>;
+  // Local-only sink for spawn-failure diagnostics that must NOT travel
+  // over the wire (argv, cwd, --image temp paths). Defaults to a fresh
+  // logger driven by the same env var as the rest of the client, so
+  // operators see the line in the foreground log without explicit
+  // wiring. Tests inject a capturing stub.
+  logger?: Logger;
 }
 
 const SKIP_GIT_REPO_CHECK_FLAG = '--skip-git-repo-check';
@@ -247,6 +254,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
   const mkdtemp = opts.mkdtemp ?? fs.mkdtemp;
   const writeFile = opts.writeFile ?? fs.writeFile;
   const rm = opts.rm ?? fs.rm;
+  const logger = opts.logger ?? createLogger();
 
   const sessions = new Map<string, SessionEntry>();
   let writeCounter = 0;
@@ -565,16 +573,21 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
           const detail = stderrTail.trim();
           const detailPart = detail ? `: ${detail.slice(-500)}` : '';
           const stdinPart = stdinError ? ` [stdin: ${errorMessage(stdinError)}]` : '';
-          // Include the spawned argv and cwd so operators can reproduce
-          // the failing invocation from the foreground log alone (#147).
-          // The prompt itself travels over stdin, not argv, so this is
-          // safe to surface.
-          const argvPart = ` argv=${clipTo(JSON.stringify([command, ...args]), 400)}`;
-          const cwdPart = cwd ? ` cwd=${JSON.stringify(cwd)}` : '';
           const exitMessage =
             exit.code === null && exit.signal
-              ? `codex terminated by signal ${exit.signal}${detailPart}${stdinPart}${argvPart}${cwdPart}`
-              : `codex exited with code ${exit.code}${exit.signal ? ` (signal ${exit.signal})` : ''}${detailPart}${stdinPart}${argvPart}${cwdPart}`;
+              ? `codex terminated by signal ${exit.signal}${detailPart}${stdinPart}`
+              : `codex exited with code ${exit.code}${exit.signal ? ` (signal ${exit.signal})` : ''}${detailPart}${stdinPart}`;
+          // The repro details (argv with --image temp paths, cwd) are
+          // host-local: they should help the local operator but must not
+          // travel over the wire to the bridge server in `error.message`,
+          // which is plaintext-forwarded to the caller. Emit them as a
+          // separate local log line keyed by taskId so operators can
+          // line it up with the `task.fail` lifecycle log.
+          const argvSummary = clipTo(JSON.stringify([command, ...args]), 400);
+          const cwdSummary = cwd ? ` cwd=${JSON.stringify(cwd)}` : '';
+          logger.warn(
+            `codex spawn-failure repro taskId=${task.taskId} argv=${argvSummary}${cwdSummary}`,
+          );
           emit({
             type: 'task.fail',
             taskId: task.taskId,
