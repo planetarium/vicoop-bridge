@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
+import { createRequire } from 'node:module';
 import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -373,13 +374,20 @@ test('Client daemon (subprocess) survives WS disconnect and reconnects (#156)', 
   const fixturePath = fileURLToPath(
     new URL('./reconnect-daemon-fixture.ts', import.meta.url),
   );
-  // We're already running under tsx (per the package's test script), so
-  // the same `--import tsx` flag is available to the child. Pinning to
-  // `process.execPath` keeps us off PATH and out of sync with whatever
-  // node is in `node_modules/.bin`.
+  // Invoke tsx's CLI script directly instead of `node --import tsx ...`.
+  // `--import` was added in Node 20.6.0, but the repo's `engines.node` only
+  // requires `>=20`, so 20.0–20.5 must also work; tsx 4.x's own CLI
+  // registers its loader internally and is portable across every Node 20+
+  // minor. Pinning to `process.execPath` keeps us off PATH so the child
+  // runs under the same node binary as the parent test process.
+  // `tsx/cli` is tsx 4.x's exported entry point that maps to its CLI
+  // script (see the package's `exports` field). `tsx/dist/cli.mjs`
+  // isn't a publicly exported path and throws ERR_PACKAGE_PATH_NOT_EXPORTED
+  // under Node's exports-field enforcement.
+  const tsxCli = createRequire(import.meta.url).resolve('tsx/cli');
   const child = spawn(
     process.execPath,
-    ['--import', 'tsx', fixturePath, serverUrl],
+    [tsxCli, fixturePath, serverUrl],
     { stdio: ['ignore', 'pipe', 'pipe'] },
   );
   let exited = false;
@@ -390,49 +398,56 @@ test('Client daemon (subprocess) survives WS disconnect and reconnects (#156)', 
   });
   const stderr: string[] = [];
   child.stderr.on('data', (b: Buffer) => stderr.push(b.toString('utf8')));
-  // Wait for the child to print `daemon-ready` so we know the Client has
-  // been constructed and `start()` has been called. Without this we could
-  // race the child's startup and observe `helloCount === 0` purely because
-  // the fixture hasn't connected yet. The three terminal paths are unified
-  // through a single `cleanup` so an early `exit` rejects the promise (it
-  // used to merely clear the timeout, which left the promise pending
-  // forever on startup failures), the readiness signal can resolve once,
-  // and the 5s timeout still fires if the child neither readies nor exits.
-  await new Promise<void>((resolve, reject) => {
-    let buf = '';
-    const cleanup = (): void => {
-      child.stdout.off('data', onData);
-      child.off('exit', onExit);
-      clearTimeout(timeout);
-    };
-    const onData = (b: Buffer): void => {
-      buf += b.toString('utf8');
-      if (buf.includes('daemon-ready')) {
-        cleanup();
-        resolve();
-      }
-    };
-    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
-      cleanup();
-      reject(
-        new Error(
-          `daemon fixture exited before becoming ready (code=${code} signal=${signal}). stderr: ${stderr.join('')}`,
-        ),
-      );
-    };
-    const timeout = setTimeout(() => {
-      cleanup();
-      reject(
-        new Error(
-          `daemon fixture did not become ready within 5s. stderr: ${stderr.join('')}`,
-        ),
-      );
-    }, 5000);
-    child.stdout.on('data', onData);
-    child.on('exit', onExit);
-  });
-
+  // The single try/finally below wraps the readiness wait *and* the
+  // assertions so the child + mock server are cleaned up even when the
+  // readiness path itself rejects (timeout or early exit). An earlier
+  // shape put the readiness wait outside the try and would leak the child
+  // and leave the WebSocketServer / http.Server open on those failure
+  // modes, flaking the rest of the suite.
   try {
+    // Wait for the child to print `daemon-ready` so we know the Client has
+    // been constructed and `start()` has been called. Without this we could
+    // race the child's startup and observe `helloCount === 0` purely
+    // because the fixture hasn't connected yet. The three terminal paths
+    // are unified through a single `cleanup` so an early `exit` rejects
+    // the promise (it used to merely clear the timeout, which left the
+    // promise pending forever on startup failures), the readiness signal
+    // can resolve once, and the 5s timeout still fires if the child
+    // neither readies nor exits.
+    await new Promise<void>((resolve, reject) => {
+      let buf = '';
+      const cleanup = (): void => {
+        child.stdout.off('data', onData);
+        child.off('exit', onExit);
+        clearTimeout(timeout);
+      };
+      const onData = (b: Buffer): void => {
+        buf += b.toString('utf8');
+        if (buf.includes('daemon-ready')) {
+          cleanup();
+          resolve();
+        }
+      };
+      const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+        cleanup();
+        reject(
+          new Error(
+            `daemon fixture exited before becoming ready (code=${code} signal=${signal}). stderr: ${stderr.join('')}`,
+          ),
+        );
+      };
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(
+          new Error(
+            `daemon fixture did not become ready within 5s. stderr: ${stderr.join('')}`,
+          ),
+        );
+      }, 5000);
+      child.stdout.on('data', onData);
+      child.on('exit', onExit);
+    });
+
     await waitFor(() => helloCount === 1, 'expected initial hello from child', 3000);
     // The server terminated the socket after the first hello. If the
     // daemon is healthy it reconnects after reconnectDelayMs (100ms in
