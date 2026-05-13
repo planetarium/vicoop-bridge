@@ -352,6 +352,26 @@ function traceabilityRequested(task: {
   );
 }
 
+// One entry of `tool_call_history` — either an `assistant` turn echoing the
+// model's prior tool_calls envelope, or a `tool` turn carrying the function
+// return that the gateway executed externally. Mirrors OpenAI Chat
+// Completions message shape for these two roles.
+export interface OpenAICompatHistoryAssistant {
+  role: 'assistant';
+  tool_calls: unknown[];
+}
+export interface OpenAICompatHistoryTool {
+  role: 'tool';
+  tool_call_id: string;
+  name?: string;
+  // OpenAI permits string-or-content-parts; on the wire we require string so
+  // gateways own the normalisation. Bridges treat it as opaque text.
+  content: string;
+}
+export type OpenAICompatHistoryEntry =
+  | OpenAICompatHistoryAssistant
+  | OpenAICompatHistoryTool;
+
 // Payload of the openai-compat A2A extension as carried under
 // `Message.metadata[OPENAI_COMPAT_EXTENSION_URI]`. Each field is optional and
 // is forwarded verbatim from the OpenAI-shaped originating request.
@@ -359,10 +379,50 @@ export interface OpenAICompatMetadata {
   system?: string;
   tools?: unknown[];
   tool_choice?: unknown;
+  tool_call_history?: OpenAICompatHistoryEntry[];
+}
+
+// Whole-array validator for `tool_call_history`. Returns null (caller drops
+// the field) on ANY malformed entry rather than skipping it — order and
+// id-pairings between `assistant.tool_calls` and `role:"tool"` results
+// matter, so dropping a middle entry would silently break the model's view
+// of the prior round. Strict-or-nothing is safer than forgiving-with-holes.
+function parseToolCallHistory(raw: unknown[]): OpenAICompatHistoryEntry[] | null {
+  if (raw.length === 0) return null;
+  const out: OpenAICompatHistoryEntry[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const e = entry as Record<string, unknown>;
+    if (
+      e.role === 'assistant' &&
+      Array.isArray(e.tool_calls) &&
+      e.tool_calls.length > 0
+    ) {
+      out.push({ role: 'assistant', tool_calls: e.tool_calls });
+      continue;
+    }
+    if (
+      e.role === 'tool' &&
+      typeof e.tool_call_id === 'string' &&
+      e.tool_call_id.length > 0 &&
+      typeof e.content === 'string'
+    ) {
+      const toolEntry: OpenAICompatHistoryTool = {
+        role: 'tool',
+        tool_call_id: e.tool_call_id,
+        content: e.content,
+      };
+      if (typeof e.name === 'string' && e.name.length > 0) toolEntry.name = e.name;
+      out.push(toolEntry);
+      continue;
+    }
+    return null;
+  }
+  return out;
 }
 
 // Extract and shape-check the openai-compat metadata key. Returns null when
-// the metadata key is absent, malformed, or actionably empty (all three
+// the metadata key is absent, malformed, or actionably empty (all four
 // fields missing or trivial) so the caller can fall back to its non-extension
 // path without conditional null-checks on every read.
 export function parseOpenAICompatMetadata(
@@ -376,7 +436,16 @@ export function parseOpenAICompatMetadata(
   if (typeof r.system === 'string' && r.system.length > 0) out.system = r.system;
   if (Array.isArray(r.tools) && r.tools.length > 0) out.tools = r.tools;
   if (r.tool_choice !== undefined && r.tool_choice !== null) out.tool_choice = r.tool_choice;
-  if (out.system === undefined && out.tools === undefined && out.tool_choice === undefined) {
+  if (Array.isArray(r.tool_call_history)) {
+    const history = parseToolCallHistory(r.tool_call_history);
+    if (history) out.tool_call_history = history;
+  }
+  if (
+    out.system === undefined &&
+    out.tools === undefined &&
+    out.tool_choice === undefined &&
+    out.tool_call_history === undefined
+  ) {
     return null;
   }
   return out;
@@ -437,6 +506,14 @@ export function buildOpenAICompatSystemPrompt(meta: OpenAICompatMetadata): strin
         '- Do not execute the function yourself; just emit the call.',
         '- If no function should be called, answer normally in natural language.',
         '',
+        // History-block contract: aligned with `formatToolCallHistory`'s
+        // rendering. The model needs to know how to read the block AND that
+        // already-resolved calls must not be repeated, otherwise it'll loop.
+        'On follow-up turns the user message may begin with a <tool_call_history>...</tool_call_history> block containing a JSON array of prior round-trips. Each entry is one of:',
+        '  - {"role":"assistant","tool_calls":[...]} — calls you previously emitted on an earlier turn.',
+        '  - {"role":"tool","tool_call_id":"call_…","name":"…","content":"…"} — the authoritative return value for one of those calls.',
+        'Treat the history as the source of truth for what has happened so far. Do NOT repeat a call whose tool_call_id already appears in the history. Either emit a NEW tool_calls envelope (to chain another call) or compose a natural-language answer using the prior results.',
+        '',
         'Available functions:',
         JSON.stringify(meta.tools, null, 2),
       ].join('\n'),
@@ -450,6 +527,21 @@ export function buildOpenAICompatSystemPrompt(meta: OpenAICompatMetadata): strin
   }
 
   return sections.join('\n\n');
+}
+
+// Render a `tool_call_history` payload as a `<tool_call_history>`-wrapped
+// JSON block. Goes at the front of the user content on follow-up turns so
+// the model reads the prior round before the new instruction; the wrapper
+// tag makes the boundary unambiguous against the user's own text. The
+// inner array is the parsed history verbatim — same shape as on the wire,
+// so the model only has to learn one structure (also taught in the
+// SYSTEM_INSTRUCTION above).
+export function formatToolCallHistory(history: OpenAICompatHistoryEntry[]): string {
+  return [
+    '<tool_call_history>',
+    JSON.stringify(history, null, 2),
+    '</tool_call_history>',
+  ].join('\n');
 }
 
 // Attempt to interpret an assistant message as the OpenAI tool-call envelope
@@ -776,6 +868,19 @@ export function createClaudeBackend(
       const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
 
       const mapped = await mapPartsToContentBlocks(task.message.parts, opts.fetchUriPolicy, signal);
+      if (mapped.ok && openaiCompat?.tool_call_history) {
+        // Spec contract: bridges MUST replay the entire `tool_call_history`
+        // in order. We render it as a text block and prepend it to the user
+        // content so the model reads the prior round BEFORE the current
+        // user turn. Any internal optimisation (e.g. claude `--resume`
+        // already holds the prior `assistant.tool_calls` in session
+        // memory) is invisible to the wire and does not change replay
+        // semantics — the redundancy is the price of cross-bridge interop.
+        mapped.blocks.unshift({
+          type: 'text',
+          text: formatToolCallHistory(openaiCompat.tool_call_history),
+        });
+      }
       if (!mapped.ok) {
         emit({
           type: 'task.fail',

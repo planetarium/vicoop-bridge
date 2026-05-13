@@ -7,6 +7,7 @@ import { EventEmitter } from 'node:events';
 import {
   buildOpenAICompatSystemPrompt,
   createClaudeBackend,
+  formatToolCallHistory,
   parseOpenAICompatMetadata,
   summarizeToolInput,
   tryParseToolCallsEnvelope,
@@ -2052,4 +2053,210 @@ test('extension off: a coincidental {"tool_calls":[...]} text stays a text artif
   );
   assert.equal(artifacts.length, 1);
   assert.equal(artifacts[0].artifact.parts[0].kind, 'text');
+});
+
+// ---------------------------------------------------------------------------
+// openai-compat extension: multi-turn (tool_call_history)
+// ---------------------------------------------------------------------------
+
+const SAMPLE_HISTORY: ReadonlyArray<Record<string, unknown>> = [
+  {
+    role: 'assistant',
+    tool_calls: [
+      { id: 'call_abc', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
+    ],
+  },
+  {
+    role: 'tool',
+    tool_call_id: 'call_abc',
+    name: 'get_weather',
+    content: '{"temp":15,"cond":"sunny"}',
+  },
+];
+
+test('parseOpenAICompatMetadata: accepts well-formed tool_call_history', () => {
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: SAMPLE_TOOLS,
+      tool_call_history: SAMPLE_HISTORY,
+    },
+  });
+  assert.ok(m);
+  assert.equal(m.tool_call_history?.length, 2);
+  // assistant entry preserves tool_calls verbatim.
+  const a = m.tool_call_history![0];
+  assert.equal(a.role, 'assistant');
+  if (a.role !== 'assistant') throw new Error('expected assistant entry');
+  assert.equal(a.tool_calls.length, 1);
+  // tool entry preserves content as string + optional name.
+  const t = m.tool_call_history![1];
+  assert.equal(t.role, 'tool');
+  if (t.role !== 'tool') throw new Error('expected tool entry');
+  assert.equal(t.tool_call_id, 'call_abc');
+  assert.equal(t.name, 'get_weather');
+  assert.equal(t.content, '{"temp":15,"cond":"sunny"}');
+});
+
+test('parseOpenAICompatMetadata: tool entry without optional name is accepted', () => {
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tool_call_history: [
+        { role: 'tool', tool_call_id: 'call_x', content: 'ok' },
+      ],
+    },
+  });
+  assert.ok(m);
+  const t = m.tool_call_history![0];
+  if (t.role !== 'tool') throw new Error('expected tool entry');
+  assert.equal(t.name, undefined);
+});
+
+test('parseOpenAICompatMetadata: malformed history entry drops the whole array', () => {
+  // assistant.tool_calls must be a non-empty array — strict-or-nothing means
+  // an empty array poisons the whole history, since the parse is whole-array
+  // and order matters for pairings.
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: SAMPLE_TOOLS,
+      tool_call_history: [
+        { role: 'assistant', tool_calls: [] },
+        { role: 'tool', tool_call_id: 'call_a', content: 'ok' },
+      ],
+    },
+  });
+  // tools survived; history dropped → still a valid metadata (not null).
+  assert.ok(m);
+  assert.equal(m.tool_call_history, undefined);
+  assert.equal(m.tools?.length, 1);
+});
+
+test('parseOpenAICompatMetadata: tool entry missing content drops the whole array', () => {
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: SAMPLE_TOOLS,
+      tool_call_history: [
+        { role: 'assistant', tool_calls: [{ id: 'call_a', function: { name: 'f' } }] },
+        // Missing `content` — invalid.
+        { role: 'tool', tool_call_id: 'call_a' },
+      ],
+    },
+  });
+  assert.ok(m);
+  assert.equal(m.tool_call_history, undefined);
+});
+
+test('parseOpenAICompatMetadata: empty history is treated as absent', () => {
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: SAMPLE_TOOLS,
+      tool_call_history: [],
+    },
+  });
+  assert.ok(m);
+  assert.equal(m.tool_call_history, undefined);
+});
+
+test('parseOpenAICompatMetadata: history-only payload (no tools/system) still returns metadata', () => {
+  // Tolerant degradation: gateway sent only history, no tools schema. Bridge
+  // can still replay; model will answer naturally without tool affordances.
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: { tool_call_history: SAMPLE_HISTORY },
+  });
+  assert.ok(m);
+  assert.equal(m.tool_call_history?.length, 2);
+  assert.equal(m.tools, undefined);
+});
+
+test('buildOpenAICompatSystemPrompt: includes the tool_call_history paragraph when tools are present', () => {
+  const prompt = buildOpenAICompatSystemPrompt({ tools: SAMPLE_TOOLS });
+  assert.match(prompt, /<tool_call_history>\.\.\.<\/tool_call_history>/);
+  // Anti-loop directive must survive any future wording revisions to this
+  // paragraph — the model needs to be told not to repeat calls already in
+  // the history, otherwise tool turns chain forever.
+  assert.match(prompt, /Do NOT repeat a call whose tool_call_id already appears in the history/);
+});
+
+test('buildOpenAICompatSystemPrompt: omits the history paragraph when tools are absent', () => {
+  // No tools → no envelope contract → no history paragraph either; the
+  // paragraph references a tool_calls envelope that wouldn't be valid.
+  const prompt = buildOpenAICompatSystemPrompt({ system: 'Be terse.' });
+  assert.doesNotMatch(prompt, /<tool_call_history>/);
+});
+
+test('formatToolCallHistory: wraps the JSON array verbatim', () => {
+  const rendered = formatToolCallHistory([
+    { role: 'assistant', tool_calls: [{ id: 'call_x', function: { name: 'f' } }] },
+    { role: 'tool', tool_call_id: 'call_x', content: 'ok' },
+  ]);
+  assert.match(rendered, /^<tool_call_history>\n/);
+  assert.match(rendered, /\n<\/tool_call_history>$/);
+  // Pretty-printed JSON makes the structure scannable for the model and for
+  // operators reading bridge logs; the test pins indentation to lock in the
+  // contract.
+  assert.match(rendered, /"role": "assistant"/);
+  assert.match(rendered, /"tool_call_id": "call_x"/);
+});
+
+test('multi-turn: history block is prepended to the user content sent to claude', async () => {
+  // We need to inspect the stdin payload claude received, which carries the
+  // user message envelope as JSON — see the existing `assign(...)` flow.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('continue, please', {
+      tools: SAMPLE_TOOLS,
+      tool_call_history: SAMPLE_HISTORY,
+    }),
+    emit,
+    NEVER,
+  );
+
+  const child = fake.lastChild();
+  assert.ok(child, 'expected a spawned child');
+  // The envelope is a single JSON line on stdin; parse it back to inspect
+  // the content block order.
+  const envelope = JSON.parse(child.stdinPayload.trim()) as {
+    message: { content: Array<{ type: string; text?: string }> };
+  };
+  assert.equal(envelope.message.content[0].type, 'text');
+  // First block is the history; the user's actual prompt is second.
+  assert.match(envelope.message.content[0].text ?? '', /^<tool_call_history>/);
+  assert.match(envelope.message.content[0].text ?? '', /"role": "assistant"/);
+  assert.equal(envelope.message.content[1].type, 'text');
+  assert.equal(envelope.message.content[1].text, 'continue, please');
+});
+
+test('multi-turn: absent tool_call_history leaves the user content untouched', async () => {
+  // First-turn / no-history path: only the user text reaches claude, no
+  // injected XML wrapper. Guards against the history block leaking onto
+  // tasks that didn't ask for it.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('what is the weather in Seoul?', { tools: SAMPLE_TOOLS }),
+    emit,
+    NEVER,
+  );
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  const envelope = JSON.parse(child.stdinPayload.trim()) as {
+    message: { content: Array<{ type: string; text?: string }> };
+  };
+  assert.equal(envelope.message.content.length, 1);
+  assert.equal(envelope.message.content[0].text, 'what is the weather in Seoul?');
 });
