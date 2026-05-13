@@ -16,20 +16,25 @@ import { randomBytes } from 'node:crypto';
 
 export function atomicWriteFile(path: string, contents: string, mode = 0o600): void {
   const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
-  const fd = openSync(tmp, 'wx', mode);
-  try {
-    writeFileSync(fd, contents);
-  } finally {
-    closeSync(fd);
-  }
-
-  // From here on, every error path must clean up `tmp` so repeated
-  // login / write-env-file attempts don't accumulate stray *.tmp files
-  // on permission errors, locked files, etc.
+  // Every error path past `openSync(tmp, 'wx')` must clean up `tmp` so
+  // repeated login / write-env-file attempts don't accumulate stray *.tmp
+  // files on permission errors, locked files, mid-write disk-full, etc.
+  // Helper is defined first so it's reachable from the write try/catch
+  // below — a previous version only set it up after `writeFileSync` and
+  // would leak the tmp file when the write itself threw.
   const cleanupAndThrow = (err: unknown): never => {
     try { unlinkSync(tmp); } catch { /* ignore */ }
     throw err;
   };
+
+  const fd = openSync(tmp, 'wx', mode);
+  try {
+    writeFileSync(fd, contents);
+  } catch (err) {
+    try { closeSync(fd); } catch { /* ignore */ }
+    cleanupAndThrow(err);
+  }
+  closeSync(fd);
 
   if (process.platform === 'win32') {
     try {

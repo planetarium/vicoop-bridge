@@ -4,6 +4,7 @@
 // want a systemd `EnvironmentFile=` (or shell-sourceable file) alongside the
 // canonical config — see #137.
 
+import { existsSync } from 'node:fs';
 import { atomicWriteFile, resolveOwnerSession } from './owner-session.js';
 import { defaultConfigPath, readConfig, writeConfig, type ClientConfig } from './config.js';
 
@@ -158,7 +159,23 @@ function writeConfigForSetup(success: ClientRegisterSuccess, bridgeUrl: string):
     );
   }
   const path = defaultConfigPath();
-  const existing: ClientConfig = readConfig(path) ?? {};
+  // Distinguish "file does not exist" (fresh install — start from empty) from
+  // "file exists but readConfig returned null" (malformed JSON / unreadable —
+  // operator hand-edited it into a broken state). Silently overwriting the
+  // latter would clobber whatever backend defaults the operator added before
+  // the typo. Refuse and let them inspect/fix or move it aside; setup never
+  // owns enough context to know whether the corrupted bytes should be lost.
+  let existing: ClientConfig = {};
+  if (existsSync(path)) {
+    const loaded = readConfig(path);
+    if (!loaded) {
+      throw new Error(
+        `${path} exists but is unreadable or not a valid JSON object — refusing to overwrite. ` +
+          'Inspect / fix the file (or move it aside) and rerun setup.',
+      );
+    }
+    existing = loaded;
+  }
   existing.server_url = wsUrlFromBridge(bridgeUrl);
   existing.server_token = success.client_token;
   existing.agent_id = firstAgentId;

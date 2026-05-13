@@ -563,6 +563,75 @@ test('setup refuses to overwrite agent_id with empty when bridge returns no allo
   });
 });
 
+test('setup refuses to overwrite an existing-but-malformed config.json', async (t) => {
+  // The merge path leans on readConfig returning the prior file's parsed
+  // shape. If the file exists but is malformed (operator hand-edited it into
+  // broken JSON), readConfig returns null and the prior `?? {}` fallback
+  // would silently start from empty — wiping any backend defaults the
+  // operator had added before the typo. Refuse + tell them what to fix.
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-malformed-'));
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  process.env.HOME = tmpHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+  });
+
+  saveOwnerSession({
+    bridge: 'https://bridge.test',
+    token: 'vbc_owner_test',
+    principal_id: 'google:123',
+    email: null,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    saved_at: new Date().toISOString(),
+  });
+
+  // Pre-write a broken config.json (truncated JSON).
+  const { mkdirSync, writeFileSync, readFileSync } = await import('node:fs');
+  const configPath = join(process.env.VICOOP_HOME, 'config.json');
+  mkdirSync(process.env.VICOOP_HOME, { recursive: true, mode: 0o700 });
+  writeFileSync(configPath, '{not json');
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({
+      data: {
+        registerClient: {
+          clientWithToken: {
+            id: 'client-1',
+            token: 'fresh-token',
+            ownerPrincipal: 'google:123',
+            allowedAgentIds: ['agent-1'],
+          },
+        },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let stderr = '';
+  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  });
+
+  const code = await runSetup([
+    '--client-name', 'test client',
+    '--agent-ids', 'agent-1',
+  ]);
+  assert.equal(code, 1);
+  assert.match(stderr, /refusing to overwrite/);
+  // Broken file left untouched so the operator can inspect it.
+  assert.equal(readFileSync(configPath, 'utf8'), '{not json');
+});
+
 test('setup quotes env values so shell metacharacters cannot trigger expansion', async (t) => {
   // The bridge echoes the requested agent id back in `allowed_agent_ids`. If an
   // operator (or some compromised path between them and `setup`) feeds an id
