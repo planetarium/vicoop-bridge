@@ -394,12 +394,19 @@ export class Client {
     const attempt = this.reconnectAttempt++;
     const delay = this.nextReconnectDelay(attempt);
     this.logger.info(`reconnecting in ${delay}ms attempt=${attempt + 1}`);
+    // Intentionally NOT unref'd. By the time we get here the WS is gone and
+    // the heartbeat / reconnect-reset timers have been cleared, so this timer
+    // is the only handle keeping a disconnected daemon up until reconnect
+    // fires — signal listeners alone don't ref the event loop. Unref'ing it
+    // (a previous revision did) caused the process to exit on the first
+    // disconnect, killing the entire reconnect/backoff path. `stop()` clears
+    // this timer explicitly via `clearReconnectTimer()`, so intentional
+    // shutdown still exits cleanly. See issue #156.
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.logger.info(`reconnect attempt=${attempt + 1}`);
       this.connect();
     }, delay);
-    this.reconnectTimer.unref?.();
   }
 
   private nextReconnectDelay(attempt: number): number {
