@@ -5,12 +5,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import {
+  buildOpenAICompatSystemPrompt,
   createClaudeBackend,
+  formatToolCallHistory,
+  parseOpenAICompatMetadata,
   summarizeToolInput,
+  tryParseToolCallsEnvelope,
   type ClaudeChildHandle,
   type ClaudeSpawnOptions,
 } from './claude.js';
 import {
+  OPENAI_COMPAT_EXTENSION_URI,
   TRACEABILITY_EXTENSION_URI,
   type TaskAssignFrame,
   type UpFrame,
@@ -1725,4 +1730,533 @@ test('send_file MCP: tool call landing during an in-flight task emits a task.art
 
   await server.close();
   await fs.rm(realRoot, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// openai-compat extension
+// ---------------------------------------------------------------------------
+
+const SAMPLE_TOOLS = [
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_weather',
+      description: 'Get the current weather for a city.',
+      parameters: {
+        type: 'object',
+        properties: { city: { type: 'string' } },
+        required: ['city'],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
+function assignWithOpenAICompat(
+  text: string,
+  payload: Record<string, unknown>,
+): TaskAssignFrame {
+  return {
+    ...assign(text),
+    message: {
+      ...assign(text).message,
+      metadata: { [OPENAI_COMPAT_EXTENSION_URI]: payload },
+    },
+  };
+}
+
+test('parseOpenAICompatMetadata: absent / wrong-shape / empty payload returns null', () => {
+  assert.equal(parseOpenAICompatMetadata(undefined), null);
+  assert.equal(parseOpenAICompatMetadata({}), null);
+  // Wrong shape (array / scalar / null) is treated as absent so callers do
+  // not have to defend against trash from a non-cooperating sender.
+  assert.equal(
+    parseOpenAICompatMetadata({ [OPENAI_COMPAT_EXTENSION_URI]: [] as unknown as Record<string, unknown> }),
+    null,
+  );
+  assert.equal(
+    parseOpenAICompatMetadata({ [OPENAI_COMPAT_EXTENSION_URI]: 'nope' as unknown as Record<string, unknown> }),
+    null,
+  );
+  // Object present but no actionable fields → still null.
+  assert.equal(parseOpenAICompatMetadata({ [OPENAI_COMPAT_EXTENSION_URI]: {} }), null);
+  // Empty tools array is treated as absent — there's nothing for the model
+  // to call, and emitting the envelope contract on no functions is noise.
+  assert.equal(
+    parseOpenAICompatMetadata({ [OPENAI_COMPAT_EXTENSION_URI]: { tools: [] } }),
+    null,
+  );
+});
+
+test('parseOpenAICompatMetadata: picks up system / tools / tool_choice and drops blank system', () => {
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      system: 'You are concise.',
+      tools: SAMPLE_TOOLS,
+      tool_choice: 'auto',
+    },
+  });
+  assert.ok(m);
+  assert.equal(m.system, 'You are concise.');
+  assert.equal(m.tool_choice, 'auto');
+  assert.equal(m.tools?.length, 1);
+
+  // Empty-string system is treated as absent so the assembler doesn't emit
+  // a blank section before the tool envelope.
+  const m2 = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: { system: '', tools: SAMPLE_TOOLS },
+  });
+  assert.ok(m2);
+  assert.equal(m2.system, undefined);
+  assert.equal(m2.tools?.length, 1);
+});
+
+test('buildOpenAICompatSystemPrompt: includes tools JSON and tool_choice line when tools present', () => {
+  const prompt = buildOpenAICompatSystemPrompt({
+    system: 'You are concise.',
+    tools: SAMPLE_TOOLS,
+    tool_choice: 'auto',
+  });
+  // User system precedes the envelope contract.
+  assert.match(prompt, /^You are concise\./);
+  // Envelope contract is present verbatim — the exact phrasing is the
+  // contract the LLM is being trained against at runtime; changing it
+  // without intent breaks parsing on the model side.
+  assert.match(prompt, /"tool_calls":\[\{"id":"call_<unique>"/);
+  // tools JSON inlined.
+  assert.match(prompt, /"name": "get_weather"/);
+  // tool_choice descriptor appended.
+  assert.match(prompt, /tool_choice="auto"/);
+});
+
+test('buildOpenAICompatSystemPrompt: forced-function tool_choice surfaces the name', () => {
+  const prompt = buildOpenAICompatSystemPrompt({
+    tools: SAMPLE_TOOLS,
+    tool_choice: { type: 'function', function: { name: 'get_weather' } },
+  });
+  assert.match(prompt, /calls the function named "get_weather"/);
+});
+
+test('buildOpenAICompatSystemPrompt: tool_choice="none" suppresses the envelope contract', () => {
+  const prompt = buildOpenAICompatSystemPrompt({
+    system: 'Stay polite.',
+    tools: SAMPLE_TOOLS,
+    tool_choice: 'none',
+  });
+  assert.match(prompt, /^Stay polite\./);
+  // No envelope contract emitted — instead the explicit "do not emit"
+  // directive runs so the gateway's intent is preserved.
+  assert.doesNotMatch(prompt, /"tool_calls":\[\{"id":"call_<unique>"/);
+  assert.match(prompt, /tool_choice="none"/);
+});
+
+test('buildOpenAICompatSystemPrompt: system only (no tools) returns just the user system', () => {
+  const prompt = buildOpenAICompatSystemPrompt({ system: 'Be terse.' });
+  assert.equal(prompt, 'Be terse.');
+});
+
+test('tryParseToolCallsEnvelope: recognises a well-formed envelope and preserves unknown keys', () => {
+  const out = tryParseToolCallsEnvelope(
+    JSON.stringify({
+      tool_calls: [
+        { id: 'call_abc', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
+      ],
+      // Unknown keys (e.g. model name, usage) ride along verbatim — the
+      // gateway is responsible for stripping anything it doesn't expect.
+      _model: 'claude',
+    }),
+  );
+  assert.ok(out);
+  assert.equal(out.tool_calls.length, 1);
+  assert.equal((out as { _model?: string })._model, 'claude');
+});
+
+test('tryParseToolCallsEnvelope: rejects prose, non-objects, and missing tool_calls', () => {
+  assert.equal(tryParseToolCallsEnvelope(''), null);
+  assert.equal(tryParseToolCallsEnvelope('I will not call any tool.'), null);
+  // Prose before the brace short-circuits the parse — keeps the cost off
+  // the JSON.parse on conversational turns.
+  assert.equal(
+    tryParseToolCallsEnvelope('Sure! {"tool_calls":[{"id":"call_x"}]}'),
+    null,
+  );
+  // Trimmed whitespace is fine; the model occasionally pads with newlines.
+  assert.ok(tryParseToolCallsEnvelope('  \n{"tool_calls":[]}\n  '));
+  // Top-level array is not the envelope shape.
+  assert.equal(tryParseToolCallsEnvelope('[]'), null);
+  // Object without tool_calls or with non-array tool_calls is not envelope.
+  assert.equal(tryParseToolCallsEnvelope('{"foo":1}'), null);
+  assert.equal(tryParseToolCallsEnvelope('{"tool_calls":"nope"}'), null);
+  // Malformed JSON falls through to null rather than throwing.
+  assert.equal(tryParseToolCallsEnvelope('{"tool_calls":'), null);
+});
+
+test('spawn argv carries --append-system-prompt with the tool envelope when metadata is present', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('what is the weather?', {
+      system: 'You are concise.',
+      tools: SAMPLE_TOOLS,
+      tool_choice: 'auto',
+    }),
+    emit,
+    NEVER,
+  );
+
+  const args = fake.lastChild()?.args ?? [];
+  // The flag occurs at least once (operator can pass additional ones via
+  // extraArgs; identity-injecting variant may also fire). The openai-compat
+  // value is identified by the tool-envelope contract phrase.
+  const idx = args.findIndex(
+    (a, i) =>
+      args[i - 1] === '--append-system-prompt' &&
+      typeof a === 'string' &&
+      a.includes('"tool_calls":[{"id":"call_<unique>"'),
+  );
+  assert.ok(idx >= 0, 'expected --append-system-prompt carrying the tool envelope');
+  // User system precedes the envelope contract in that same value.
+  assert.match(args[idx] as string, /You are concise\./);
+  assert.match(args[idx] as string, /"name": "get_weather"/);
+});
+
+test('absent metadata → no openai-compat --append-system-prompt is injected', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(assign('hello'), emit, NEVER);
+
+  const args = fake.lastChild()?.args ?? [];
+  // No tool-envelope contract anywhere in argv when the caller didn't ask
+  // for the extension.
+  const hasEnvelope = args.some(
+    (a) => typeof a === 'string' && a.includes('"tool_calls":[{"id":"call_<unique>"'),
+  );
+  assert.equal(hasEnvelope, false);
+});
+
+test('assistant {"tool_calls":[...]} reply becomes a data-part artifact when extension is active', async () => {
+  const envelope = {
+    tool_calls: [
+      { id: 'call_abc', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
+    ],
+  };
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: JSON.stringify(envelope) }],
+        },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: JSON.stringify(envelope) }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('what is the weather in Seoul?', { tools: SAMPLE_TOOLS }),
+    emit,
+    NEVER,
+  );
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  assert.equal(artifacts.length, 1);
+  const part = artifacts[0].artifact.parts[0];
+  assert.equal(part.kind, 'data');
+  if (part.kind !== 'data') throw new Error('expected data part');
+  assert.deepEqual(part.data, envelope);
+  // Artifact carries the extension URI so downstream filters can route on it.
+  assert.deepEqual(artifacts[0].artifact.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+});
+
+test('non-envelope assistant text still streams as a text artifact under the extension', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'No tool needed; the answer is 42.' }],
+        },
+      }),
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: 'No tool needed; the answer is 42.',
+      }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('hi', { tools: SAMPLE_TOOLS, tool_choice: 'auto' }),
+    emit,
+    NEVER,
+  );
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  assert.equal(artifacts.length, 1);
+  assert.equal(textOf(artifacts[0]), 'No tool needed; the answer is 42.');
+  // Plain-text path leaves the artifact untagged — no extension URI claim
+  // that doesn't apply to this turn.
+  assert.equal(artifacts[0].artifact.extensions, undefined);
+});
+
+test('extension off: a coincidental {"tool_calls":[...]} text stays a text artifact', async () => {
+  // Without the extension we don't claim any envelope contract is in
+  // force, so this defends against false-positive routing if the model
+  // happens to emit a JSON-shaped reply for unrelated reasons.
+  const envelope = JSON.stringify({ tool_calls: [] });
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: envelope }] },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: envelope }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('hi'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  assert.equal(artifacts.length, 1);
+  assert.equal(artifacts[0].artifact.parts[0].kind, 'text');
+});
+
+// ---------------------------------------------------------------------------
+// openai-compat extension: multi-turn (tool_call_history)
+// ---------------------------------------------------------------------------
+
+const SAMPLE_HISTORY: ReadonlyArray<Record<string, unknown>> = [
+  {
+    role: 'assistant',
+    tool_calls: [
+      { id: 'call_abc', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
+    ],
+  },
+  {
+    role: 'tool',
+    tool_call_id: 'call_abc',
+    name: 'get_weather',
+    content: '{"temp":15,"cond":"sunny"}',
+  },
+];
+
+test('parseOpenAICompatMetadata: accepts well-formed tool_call_history', () => {
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: SAMPLE_TOOLS,
+      tool_call_history: SAMPLE_HISTORY,
+    },
+  });
+  assert.ok(m);
+  assert.equal(m.tool_call_history?.length, 2);
+  // assistant entry preserves tool_calls verbatim.
+  const a = m.tool_call_history![0];
+  assert.equal(a.role, 'assistant');
+  if (a.role !== 'assistant') throw new Error('expected assistant entry');
+  assert.equal(a.tool_calls.length, 1);
+  // tool entry preserves content as string + optional name.
+  const t = m.tool_call_history![1];
+  assert.equal(t.role, 'tool');
+  if (t.role !== 'tool') throw new Error('expected tool entry');
+  assert.equal(t.tool_call_id, 'call_abc');
+  assert.equal(t.name, 'get_weather');
+  assert.equal(t.content, '{"temp":15,"cond":"sunny"}');
+});
+
+test('parseOpenAICompatMetadata: tool entry without optional name is accepted', () => {
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tool_call_history: [
+        { role: 'tool', tool_call_id: 'call_x', content: 'ok' },
+      ],
+    },
+  });
+  assert.ok(m);
+  const t = m.tool_call_history![0];
+  if (t.role !== 'tool') throw new Error('expected tool entry');
+  assert.equal(t.name, undefined);
+});
+
+test('parseOpenAICompatMetadata: malformed history entry drops the whole array', () => {
+  // assistant.tool_calls must be a non-empty array — strict-or-nothing means
+  // an empty array poisons the whole history, since the parse is whole-array
+  // and order matters for pairings.
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: SAMPLE_TOOLS,
+      tool_call_history: [
+        { role: 'assistant', tool_calls: [] },
+        { role: 'tool', tool_call_id: 'call_a', content: 'ok' },
+      ],
+    },
+  });
+  // tools survived; history dropped → still a valid metadata (not null).
+  assert.ok(m);
+  assert.equal(m.tool_call_history, undefined);
+  assert.equal(m.tools?.length, 1);
+});
+
+test('parseOpenAICompatMetadata: tool entry missing content drops the whole array', () => {
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: SAMPLE_TOOLS,
+      tool_call_history: [
+        { role: 'assistant', tool_calls: [{ id: 'call_a', function: { name: 'f' } }] },
+        // Missing `content` — invalid.
+        { role: 'tool', tool_call_id: 'call_a' },
+      ],
+    },
+  });
+  assert.ok(m);
+  assert.equal(m.tool_call_history, undefined);
+});
+
+test('parseOpenAICompatMetadata: empty history is treated as absent', () => {
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: SAMPLE_TOOLS,
+      tool_call_history: [],
+    },
+  });
+  assert.ok(m);
+  assert.equal(m.tool_call_history, undefined);
+});
+
+test('parseOpenAICompatMetadata: history-only payload (no tools/system) still returns metadata', () => {
+  // Tolerant degradation: gateway sent only history, no tools schema. Bridge
+  // can still replay; model will answer naturally without tool affordances.
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: { tool_call_history: SAMPLE_HISTORY },
+  });
+  assert.ok(m);
+  assert.equal(m.tool_call_history?.length, 2);
+  assert.equal(m.tools, undefined);
+});
+
+test('buildOpenAICompatSystemPrompt: includes the tool_call_history paragraph when tools are present', () => {
+  const prompt = buildOpenAICompatSystemPrompt({ tools: SAMPLE_TOOLS });
+  assert.match(prompt, /<tool_call_history>\.\.\.<\/tool_call_history>/);
+  // Anti-loop directive must survive any future wording revisions to this
+  // paragraph — the model needs to be told not to repeat calls already in
+  // the history, otherwise tool turns chain forever.
+  assert.match(prompt, /Do NOT repeat a call whose tool_call_id already appears in the history/);
+});
+
+test('buildOpenAICompatSystemPrompt: omits the history paragraph when tools are absent', () => {
+  // No tools → no envelope contract → no history paragraph either; the
+  // paragraph references a tool_calls envelope that wouldn't be valid.
+  const prompt = buildOpenAICompatSystemPrompt({ system: 'Be terse.' });
+  assert.doesNotMatch(prompt, /<tool_call_history>/);
+});
+
+test('formatToolCallHistory: wraps the JSON array verbatim', () => {
+  const rendered = formatToolCallHistory([
+    { role: 'assistant', tool_calls: [{ id: 'call_x', function: { name: 'f' } }] },
+    { role: 'tool', tool_call_id: 'call_x', content: 'ok' },
+  ]);
+  assert.match(rendered, /^<tool_call_history>\n/);
+  assert.match(rendered, /\n<\/tool_call_history>$/);
+  // Pretty-printed JSON makes the structure scannable for the model and for
+  // operators reading bridge logs; the test pins indentation to lock in the
+  // contract.
+  assert.match(rendered, /"role": "assistant"/);
+  assert.match(rendered, /"tool_call_id": "call_x"/);
+});
+
+test('multi-turn: history block is prepended to the user content sent to claude', async () => {
+  // We need to inspect the stdin payload claude received, which carries the
+  // user message envelope as JSON — see the existing `assign(...)` flow.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('continue, please', {
+      tools: SAMPLE_TOOLS,
+      tool_call_history: SAMPLE_HISTORY,
+    }),
+    emit,
+    NEVER,
+  );
+
+  const child = fake.lastChild();
+  assert.ok(child, 'expected a spawned child');
+  // The envelope is a single JSON line on stdin; parse it back to inspect
+  // the content block order.
+  const envelope = JSON.parse(child.stdinPayload.trim()) as {
+    message: { content: Array<{ type: string; text?: string }> };
+  };
+  assert.equal(envelope.message.content[0].type, 'text');
+  // First block is the history; the user's actual prompt is second.
+  assert.match(envelope.message.content[0].text ?? '', /^<tool_call_history>/);
+  assert.match(envelope.message.content[0].text ?? '', /"role": "assistant"/);
+  assert.equal(envelope.message.content[1].type, 'text');
+  assert.equal(envelope.message.content[1].text, 'continue, please');
+});
+
+test('multi-turn: absent tool_call_history leaves the user content untouched', async () => {
+  // First-turn / no-history path: only the user text reaches claude, no
+  // injected XML wrapper. Guards against the history block leaking onto
+  // tasks that didn't ask for it.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('what is the weather in Seoul?', { tools: SAMPLE_TOOLS }),
+    emit,
+    NEVER,
+  );
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  const envelope = JSON.parse(child.stdinPayload.trim()) as {
+    message: { content: Array<{ type: string; text?: string }> };
+  };
+  assert.equal(envelope.message.content.length, 1);
+  assert.equal(envelope.message.content[0].text, 'what is the weather in Seoul?');
 });
