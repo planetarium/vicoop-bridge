@@ -168,17 +168,20 @@ test('text-only task spawns codex exec --json - and writes prompt to stdin', asy
     ],
   ]);
 
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    cwd: '/repo',
-    hasGitDir: async () => true,
-  });
+  const backend = createCodexBackend({ spawn: fake.spawn, cwd: '/repo' });
   const { emit, frames } = collect();
   await backend.handle(assign('say hi'), emit, NEVER);
 
   const child = fake.lastChild()!;
   assert.equal(child.command, 'codex');
-  assert.deepEqual(child.args, ['exec', '--json', '-c', 'sandbox_mode="read-only"', '-']);
+  assert.deepEqual(child.args, [
+    'exec',
+    '--json',
+    '-c',
+    'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
+    '-',
+  ]);
   assert.equal(child.cwd, '/repo');
   assert.equal(child.stdinPayload, 'say hi');
   assert.equal(child.stdinClosed, true);
@@ -229,6 +232,7 @@ test('thread.started id is reused via codex exec resume on the same contextId', 
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     '-',
   ]);
   assert.deepEqual(fake.children[1].args, [
@@ -237,6 +241,7 @@ test('thread.started id is reused via codex exec resume on the same contextId', 
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     'thread-a',
     '-',
   ]);
@@ -260,6 +265,7 @@ test('sandboxMode is passed as a Codex config override on initial and resume run
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     '-',
   ]);
   assert.deepEqual(fake.children[1].args, [
@@ -268,6 +274,7 @@ test('sandboxMode is passed as a Codex config override on initial and resume run
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     'thread-a',
     '-',
   ]);
@@ -288,6 +295,7 @@ test('extraArgs follow sandboxMode config so tests/operators can override it', a
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     '-c',
     'sandbox_mode="workspace-write"',
     '-',
@@ -312,6 +320,7 @@ test('distinct contextIds get distinct sessions', async () => {
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     'thread-a',
     '-',
   ]);
@@ -338,6 +347,7 @@ test('session TTL expiry starts a new codex exec run', async () => {
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     '-',
   ]);
 });
@@ -411,6 +421,7 @@ test('resume spawn failure rolls back TTL refresh for the existing session', asy
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     '-',
   ]);
 });
@@ -479,7 +490,6 @@ test('nonzero exit message includes argv and cwd for repro (#147)', async () => 
   const backend = createCodexBackend({
     spawn: fake.spawn,
     cwd: '/srv/agent-work',
-    hasGitDir: async () => true,
   });
   const { emit, frames } = collect();
   await backend.handle(assign('x'), emit, NEVER);
@@ -493,64 +503,35 @@ test('nonzero exit message includes argv and cwd for repro (#147)', async () => 
   assert.match(fail.error.message, /cwd="\/srv\/agent-work"/);
 });
 
-test('cwd that is not a git repository fails fast with codex_cwd_not_git_repo (#147)', async () => {
-  let spawned = 0;
-  const backend = createCodexBackend({
-    spawn: () => {
-      spawned++;
-      throw new Error('should not spawn');
-    },
-    cwd: '/tmp/not-a-repo',
-    hasGitDir: async () => false,
-  });
-  const { emit, frames } = collect();
-  await backend.handle(assign('x'), emit, NEVER);
-
-  assert.equal(spawned, 0);
-  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
-  assert.ok(fail);
-  assert.equal(fail.error.code, 'codex_cwd_not_git_repo');
-  assert.match(fail.error.message, /not a git repository/);
-  assert.match(fail.error.message, /--skip-git-repo-check/);
-});
-
-test('--skip-git-repo-check in extraArgs bypasses the git pre-check (#147)', async () => {
+test('--skip-git-repo-check is auto-added so non-git cwds work out of the box (#147)', async () => {
   const fake = scriptedSpawn([
     [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
   ]);
-
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    cwd: '/tmp/not-a-repo',
-    extraArgs: ['--skip-git-repo-check'],
-    // Would return false if asked, but the bypass must mean we never ask.
-    hasGitDir: async () => {
-      throw new Error('hasGitDir should not be called when --skip-git-repo-check is set');
-    },
-  });
+  const backend = createCodexBackend({ spawn: fake.spawn, cwd: '/tmp/not-a-repo' });
   const { emit, frames } = collect();
   await backend.handle(assign('x'), emit, NEVER);
 
   const child = fake.lastChild()!;
-  assert.ok(child.args.includes('--skip-git-repo-check'));
+  assert.ok(
+    child.args.includes('--skip-git-repo-check'),
+    `expected --skip-git-repo-check in argv, got ${JSON.stringify(child.args)}`,
+  );
   assert.ok(frames.some((f) => f.type === 'task.complete'));
 });
 
-test('hasGitDir is not invoked when cwd is unset', async () => {
+test('--skip-git-repo-check is not duplicated when extraArgs already lists it (#147)', async () => {
   const fake = scriptedSpawn([
     [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
   ]);
-  let invoked = false;
   const backend = createCodexBackend({
     spawn: fake.spawn,
-    hasGitDir: async () => {
-      invoked = true;
-      return true;
-    },
+    extraArgs: ['--skip-git-repo-check'],
   });
-  const { emit } = collect();
-  await backend.handle(assign('x'), emit, NEVER);
-  assert.equal(invoked, false);
+  await backend.handle(assign('x'), collect().emit, NEVER);
+
+  const args = fake.lastChild()!.args;
+  const occurrences = args.filter((a) => a === '--skip-git-repo-check').length;
+  assert.equal(occurrences, 1, `expected exactly one --skip-git-repo-check, got ${occurrences} in ${JSON.stringify(args)}`);
 });
 
 test('signal exit emits task.fail without code null wording', async () => {
@@ -634,6 +615,7 @@ test('image FilePart.bytes creates temp files and passes --image args', async ()
     '--json',
     '-c',
     'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
     '--image',
     '/tmp/vicoop-codex-test/image-1.png',
     '-',

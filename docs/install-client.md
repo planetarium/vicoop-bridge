@@ -552,13 +552,13 @@ Codex sessions.
 > applies, but stamped into argv so the posture is visible in `ps` / audit
 > logs and survives any future change to Codex's own default.
 
-> **`cwd` must be a git repository.** `codex exec` refuses to run from a
-> directory that is neither a git repo nor an operator-trusted path,
-> exiting non-zero in ~200 ms. The client pre-checks this and fails fast
-> with `codex_cwd_not_git_repo` when it would. Run `git init` inside the
-> directory, point `cwd` at an existing repo, or — if you intentionally
-> want to run outside a repo — add `--skip-git-repo-check` to
-> `backends.codex.extra_args`.
+> **`cwd` need not be a git repository.** `codex exec` refuses by default
+> to run outside a trusted directory, exiting non-zero in ~200 ms (#147).
+> The Codex backend always passes `--skip-git-repo-check` to keep the
+> CLI usable from an operator-chosen `cwd` (an agent's working tree is
+> often not a git repo). Sandboxing is unchanged — the cwd-trust check
+> is a CLI ergonomics gate, not part of `sandbox_mode`. The flag is
+> deduplicated when also listed in `backends.codex.extra_args`.
 
 ## Manage caller allowlists
 

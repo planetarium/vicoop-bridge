@@ -43,12 +43,6 @@ export interface CodexBackendOptions {
   mkdtemp?: (prefix: string) => Promise<string>;
   writeFile?: (file: string, data: Buffer) => Promise<void>;
   rm?: (file: string, options: { recursive: boolean; force: boolean }) => Promise<void>;
-  // Pre-spawn check that `cwd` is a git repository. Codex CLI refuses to
-  // run `codex exec` outside a trusted directory and prints the failure to
-  // stderr, exiting non-zero in ~200 ms (see issue #147). The injected
-  // function lets unit tests stub the filesystem; production uses
-  // `fs.access(<cwd>/.git)`.
-  hasGitDir?: (cwd: string) => Promise<boolean>;
 }
 
 const SKIP_GIT_REPO_CHECK_FLAG = '--skip-git-repo-check';
@@ -253,16 +247,6 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
   const mkdtemp = opts.mkdtemp ?? fs.mkdtemp;
   const writeFile = opts.writeFile ?? fs.writeFile;
   const rm = opts.rm ?? fs.rm;
-  const hasGitDir =
-    opts.hasGitDir ??
-    (async (dir: string) => {
-      try {
-        await fs.access(path.join(dir, '.git'));
-        return true;
-      } catch {
-        return false;
-      }
-    });
 
   const sessions = new Map<string, SessionEntry>();
   let writeCounter = 0;
@@ -302,42 +286,6 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
         return;
       }
 
-      // Codex CLI refuses to run `codex exec` from a directory that is
-      // neither a git repository nor an operator-trusted path, printing
-      // "Not inside a trusted directory and --skip-git-repo-check was
-      // not specified." to stderr and exiting 1 in ~200 ms (#147).
-      // Catch the common case up front so operators get a clear,
-      // actionable error code instead of a generic codex_exit_nonzero
-      // whose detail line was previously dropped by the foreground log.
-      // Run this before any session-TTL bookkeeping so there is no state
-      // to roll back when the pre-check fails.
-      if (cwd && !extraArgs.includes(SKIP_GIT_REPO_CHECK_FLAG)) {
-        const isRepo = await hasGitDir(cwd);
-        if (!isRepo) {
-          if (mapped.tempDir) {
-            try {
-              await rm(mapped.tempDir, { recursive: true, force: true });
-            } catch {
-              /* best-effort cleanup */
-            }
-          }
-          emit({
-            type: 'task.fail',
-            taskId: task.taskId,
-            error: {
-              code: 'codex_cwd_not_git_repo',
-              message:
-                `codex backend cwd ${JSON.stringify(cwd)} is not a git repository; ` +
-                `codex exec refuses to run there. Run \`git init\` inside that ` +
-                `directory, point cwd at a real repo, or add ` +
-                `${SKIP_GIT_REPO_CHECK_FLAG} to backends.codex.extra_args ` +
-                `to opt out of the check.`,
-            },
-          });
-          return;
-        }
-      }
-
       try {
         if (signal.aborted) {
           emit({
@@ -362,10 +310,19 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
           });
         }
 
+        // Always pass `--skip-git-repo-check`. vicoop-bridge agents work in
+        // an operator-chosen `cwd` (often not a git repo); without this
+        // flag, codex exec exits 1 with "Not inside a trusted directory"
+        // in ~200 ms (#147). Skip the auto-add if the operator already
+        // listed the flag in extra_args so the argv stays clean.
+        const skipGitRepoCheck = extraArgs.includes(SKIP_GIT_REPO_CHECK_FLAG)
+          ? []
+          : [SKIP_GIT_REPO_CHECK_FLAG];
         const optionArgs = [
           '--json',
           '-c',
           `sandbox_mode=${JSON.stringify(sandboxMode)}`,
+          ...skipGitRepoCheck,
           ...mapped.imageFiles.flatMap((filePath) => ['--image', filePath]),
           ...extraArgs,
         ];
