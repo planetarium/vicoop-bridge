@@ -191,11 +191,24 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
 // that isn't an object. The daemon treats null as "no config", which means
 // env vars / CLI flags carry the whole load (today's behavior).
 export function readConfig(path: string = defaultConfigPath()): ClientConfig | null {
+  const raw = readConfigRaw(path);
+  return raw ? normalizeConfig(raw) : null;
+}
+
+// Same parse + shape check as `readConfig` but without normalization, so
+// callers that need to round-trip the file (e.g. `setup` merging credentials
+// into a pre-existing config.json) preserve operator-added or future-version
+// keys that `normalizeConfig` would otherwise drop. Returns `null` for the
+// same "missing / unreadable / not a JSON object" cases as `readConfig`,
+// so callers don't have to do file existence + JSON checks themselves.
+export function readConfigRaw(
+  path: string = defaultConfigPath(),
+): Record<string, unknown> | null {
   if (!existsSync(path)) return null;
   try {
     const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'));
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-    return normalizeConfig(parsed as Record<string, unknown>);
+    return parsed as Record<string, unknown>;
   } catch {
     return null;
   }
@@ -203,8 +216,15 @@ export function readConfig(path: string = defaultConfigPath()): ClientConfig | n
 
 // Atomic write at mode 0o600 — config.json carries SERVER_TOKEN, treat it
 // like owner-session.json. Directory created at 0o700 only when fresh; an
-// existing dir keeps its permissions.
-export function writeConfig(path: string, config: ClientConfig): void {
+// existing dir keeps its permissions. Accepts either the typed
+// `ClientConfig` shape or a raw `Record<string, unknown>` so callers
+// merging into a pre-read raw object (preserving unknown / future-version
+// keys) can write the result back without losing them through the typed
+// surface.
+export function writeConfig(
+  path: string,
+  config: ClientConfig | Record<string, unknown>,
+): void {
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   atomicWriteFile(path, `${JSON.stringify(config, null, 2)}\n`, 0o600);

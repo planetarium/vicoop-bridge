@@ -544,8 +544,12 @@ export function createClaudeBackend(
   // first task. The wrapper Error name-checks the option and surfaces the
   // underlying `JSON.stringify` message so a misconfiguration is actionable
   // without the operator having to read a raw stack trace.
+  //
+  // `resolvedSettings` is unconditionally an object now (DEFAULT_SETTINGS
+  // fallback above), so there's no `if (!resolvedSettings) return []` path —
+  // operators that want to omit --settings entirely must pass an explicit
+  // override that disables the sandbox (e.g. `{ sandbox: { enabled: false } }`).
   const settingsArgs: readonly string[] = ((): readonly string[] => {
-    if (!resolvedSettings) return [];
     let serialized: string | undefined;
     try {
       serialized = JSON.stringify(resolvedSettings);

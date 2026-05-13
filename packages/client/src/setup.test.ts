@@ -563,6 +563,92 @@ test('setup refuses to overwrite agent_id with empty when bridge returns no allo
   });
 });
 
+test('setup preserves operator-added / future-version keys via raw round-trip', async (t) => {
+  // normalizeConfig drops top-level keys it doesn't know about. If setup
+  // round-tripped through that, an operator who added (say) a future
+  // `telemetry` block in config.json would lose it on every setup re-run.
+  // The merge path therefore uses `readConfigRaw` and writes the raw
+  // object back; assert the unknown keys survive both top-level and
+  // nested-under-backends.
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-preserve-'));
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  process.env.HOME = tmpHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+  });
+
+  saveOwnerSession({
+    bridge: 'https://bridge.test',
+    token: 'vbc_owner_test',
+    principal_id: 'google:123',
+    email: null,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    saved_at: new Date().toISOString(),
+  });
+
+  const { mkdirSync, writeFileSync, readFileSync } = await import('node:fs');
+  const configPath = join(process.env.VICOOP_HOME, 'config.json');
+  mkdirSync(process.env.VICOOP_HOME, { recursive: true, mode: 0o700 });
+  // Hand-edited config with two kinds of unknown keys: a future top-level
+  // section (`telemetry`) and an unknown subkey of a known backend
+  // (`backends.claude.future_flag`). Both should survive the round trip.
+  writeFileSync(configPath, JSON.stringify({
+    server_url: 'wss://old',
+    backend: 'claude',
+    backends: {
+      claude: {
+        settings: { sandbox: { enabled: true } },
+        future_flag: 'keep me',
+      },
+    },
+    telemetry: { otel_endpoint: 'http://otel:4317' },
+  }));
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({
+      data: {
+        registerClient: {
+          clientWithToken: {
+            id: 'client-1',
+            token: 'fresh-token',
+            ownerPrincipal: 'google:123',
+            allowedAgentIds: ['agent-1'],
+          },
+        },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  t.mock.method(process.stderr, 'write', () => true);
+
+  const code = await runSetup([
+    '--client-name', 'test client',
+    '--agent-ids', 'agent-1',
+  ]);
+  assert.equal(code, 0);
+
+  const after = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+  assert.equal(after.server_url, 'wss://bridge.test');
+  assert.equal(after.server_token, 'fresh-token');
+  assert.equal(after.agent_id, 'agent-1');
+  assert.equal(after.backend, 'claude');
+  assert.deepEqual(after.telemetry, { otel_endpoint: 'http://otel:4317' });
+  assert.deepEqual(
+    (after.backends as Record<string, unknown>).claude,
+    { settings: { sandbox: { enabled: true } }, future_flag: 'keep me' },
+  );
+});
+
 test('setup refuses to overwrite an existing-but-malformed config.json', async (t) => {
   // The merge path leans on readConfig returning the prior file's parsed
   // shape. If the file exists but is malformed (operator hand-edited it into

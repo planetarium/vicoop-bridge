@@ -6,7 +6,11 @@
 
 import { existsSync } from 'node:fs';
 import { atomicWriteFile, resolveOwnerSession } from './owner-session.js';
-import { defaultConfigPath, readConfig, writeConfig, type ClientConfig } from './config.js';
+import {
+  defaultConfigPath,
+  readConfigRaw,
+  writeConfig,
+} from './config.js';
 
 interface SetupArgs {
   clientName: string;
@@ -117,10 +121,16 @@ function shSingleQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
+// Convert the bridge's HTTP(S) URL to the WebSocket scheme the daemon
+// connects with. Shared by both the canonical config writer and the
+// systemd env-file emitter so the rewrite rule has one source of truth.
+function wsUrlFromBridge(bridgeUrl: string): string {
+  return bridgeUrl.replace(/^http(s?):\/\//, (_m, s) => (s === 's' ? 'wss://' : 'ws://'));
+}
+
 function envLines(success: ClientRegisterSuccess, bridgeUrl: string): string[] {
-  const wsUrl = bridgeUrl.replace(/^http(s?):\/\//, (_m, s) => (s === 's' ? 'wss://' : 'ws://'));
   return [
-    `export SERVER_URL=${shSingleQuote(wsUrl)}`,
+    `export SERVER_URL=${shSingleQuote(wsUrlFromBridge(bridgeUrl))}`,
     `export SERVER_TOKEN=${shSingleQuote(success.client_token)}`,
     `export AGENT_ID=${shSingleQuote(success.allowed_agent_ids[0] ?? '')}`,
   ];
@@ -135,10 +145,6 @@ function writeClientEnvFile(path: string, success: ClientRegisterSuccess, bridge
     ...envLines(success, bridgeUrl),
     '',
   ].join('\n'), 0o600);
-}
-
-function wsUrlFromBridge(bridgeUrl: string): string {
-  return bridgeUrl.replace(/^http(s?):\/\//, (_m, s) => (s === 's' ? 'wss://' : 'ws://'));
 }
 
 // Merge into any existing config.json so operator-edited fields (backend
@@ -160,14 +166,19 @@ function writeConfigForSetup(success: ClientRegisterSuccess, bridgeUrl: string):
   }
   const path = defaultConfigPath();
   // Distinguish "file does not exist" (fresh install — start from empty) from
-  // "file exists but readConfig returned null" (malformed JSON / unreadable —
+  // "file exists but raw parse returned null" (malformed JSON / unreadable —
   // operator hand-edited it into a broken state). Silently overwriting the
   // latter would clobber whatever backend defaults the operator added before
   // the typo. Refuse and let them inspect/fix or move it aside; setup never
   // owns enough context to know whether the corrupted bytes should be lost.
-  let existing: ClientConfig = {};
+  //
+  // We use `readConfigRaw` rather than `readConfig` so the round trip
+  // preserves operator-added or future-version keys that `normalizeConfig`
+  // would drop. Setup only owns the three credential fields below;
+  // everything else in the file is the operator's domain and must survive.
+  let existing: Record<string, unknown> = {};
   if (existsSync(path)) {
-    const loaded = readConfig(path);
+    const loaded = readConfigRaw(path);
     if (!loaded) {
       throw new Error(
         `${path} exists but is unreadable or not a valid JSON object — refusing to overwrite. ` +
