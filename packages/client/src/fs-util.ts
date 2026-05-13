@@ -34,7 +34,14 @@ export function atomicWriteFile(path: string, contents: string, mode = 0o600): v
     try { closeSync(fd); } catch { /* ignore */ }
     cleanupAndThrow(err);
   }
-  closeSync(fd);
+  // closeSync can throw on an I/O error reported only at close (delayed
+  // flush failure on some filesystems). Route that through cleanupAndThrow
+  // so the *.tmp doesn't survive the failure.
+  try {
+    closeSync(fd);
+  } catch (err) {
+    cleanupAndThrow(err);
+  }
 
   if (process.platform === 'win32') {
     try {

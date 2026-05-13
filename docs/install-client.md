@@ -181,8 +181,10 @@ CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
 (the same machine, or your laptop while running the CLI on a headless host)
 and authorize with your Google account. `setup` registers the client, configures
 any `--caller` allowlist entries, and persists the daemon credentials to
-`~/.vicoop/config.json` (mode 600 — see #137 for the consolidated config
-layout). The success output looks like:
+the resolved vicoop config dir (`~/.vicoop/config.json` by default; see the
+resolution order below for `$VICOOP_HOME` / `$XDG_CONFIG_HOME` cases), mode
+600 — see #137 for the consolidated config layout. The success output looks
+like:
 
 ```text
   client_id        <uuid>
@@ -204,9 +206,12 @@ ls -l ~/.vicoop/config.json   # or "$VICOOP_HOME/config.json" / "$XDG_CONFIG_HOM
 ```
 
 `config.json` is the canonical place the daemon looks for `server_url`,
-`server_token`, `agent_id`, and any backend defaults. The location is
-resolved as `$VICOOP_HOME > $XDG_CONFIG_HOME/vicoop > ~/.vicoop` (existing
-`~/.vicoop` installs are honored even when `$XDG_CONFIG_HOME` is set).
+`server_token`, `agent_id`, and any backend defaults. The directory is
+resolved as `$VICOOP_HOME > (existing) ~/.vicoop > $XDG_CONFIG_HOME/vicoop
+> ~/.vicoop`. The "(existing) `~/.vicoop`" branch wins over XDG so prior
+installs that already store `owner-session.json` there aren't orphaned
+when `$XDG_CONFIG_HOME` gets set later; fresh installs with `$XDG_CONFIG_HOME`
+set land under `$XDG_CONFIG_HOME/vicoop`.
 
 `setup` only writes the three credentials above; backend defaults are
 hand-edited into the same file. The common shape (every field optional —

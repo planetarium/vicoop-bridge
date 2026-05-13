@@ -64,6 +64,25 @@ test('resolveConfigDir prefers existing ~/.vicoop over XDG_CONFIG_HOME', (t) => 
   assert.equal(resolveConfigDir(), legacy);
 });
 
+test('resolveConfigDir skips the legacy ~/.vicoop branch when the path is a regular file', (t) => {
+  // existsSync would otherwise say "yes" for a stray file at ~/.vicoop
+  // (e.g. someone curl'd a download there) and later mkdirSync would crash
+  // with ENOTDIR. Require it to actually be a directory before adopting it.
+  const home = mkdtempSync(join(tmpdir(), 'vicoop-cfg-stray-file-'));
+  const xdg = mkdtempSync(join(tmpdir(), 'vicoop-cfg-stray-xdg-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(xdg, { recursive: true, force: true }));
+  writeFileSync(join(home, '.vicoop'), 'stray file at ~/.vicoop');
+  withEnv(t, {
+    HOME: home,
+    USERPROFILE: home,
+    VICOOP_HOME: undefined,
+    XDG_CONFIG_HOME: xdg,
+  });
+  // Legacy path is a file, so the resolver must fall through to XDG.
+  assert.equal(resolveConfigDir(), join(xdg, 'vicoop'));
+});
+
 test('resolveConfigDir uses $XDG_CONFIG_HOME/vicoop for fresh installs', (t) => {
   const home = mkdtempSync(join(tmpdir(), 'vicoop-cfg-fresh-'));
   const xdg = mkdtempSync(join(tmpdir(), 'vicoop-cfg-xdg-'));

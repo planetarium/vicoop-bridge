@@ -14,7 +14,7 @@
 //   3. `--config <path>` (operator-specified)
 //   4. config.json at the canonical path
 
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { atomicWriteFile } from './fs-util.js';
@@ -35,13 +35,25 @@ export function resolveConfigDir(): string {
   const explicit = process.env.VICOOP_HOME?.trim();
   if (explicit) return explicit;
 
+  // A regular file at `~/.vicoop` (e.g. someone curl'd a download there)
+  // would make `existsSync` answer true and later `mkdirSync` / `join`
+  // crash with ENOTDIR. Require it to actually be a directory before
+  // adopting the legacy path; otherwise fall through.
   const legacy = join(homedir(), LEGACY_HOME_DIRNAME);
-  if (existsSync(legacy)) return legacy;
+  if (isExistingDirectory(legacy)) return legacy;
 
   const xdg = process.env.XDG_CONFIG_HOME?.trim();
   if (xdg) return join(xdg, 'vicoop');
 
   return legacy;
+}
+
+function isExistingDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 export function defaultConfigPath(): string {
