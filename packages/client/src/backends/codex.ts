@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { TRACEABILITY_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
-import { createLogger, type Logger } from '../logger.js';
+import { createLogger, escapeLineSeparators, safeToken, type Logger } from '../logger.js';
 import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME } from './fetch-uri-file.js';
 
 export interface CodexChildHandle {
@@ -586,10 +586,20 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
           // which is plaintext-forwarded to the caller. Emit them as a
           // separate local log line keyed by taskId so operators can
           // line it up with the `task.fail` lifecycle log.
-          const argvSummary = clipTo(JSON.stringify([command, ...args]), 400);
-          const cwdSummary = cwd ? ` cwd=${JSON.stringify(cwd)}` : '';
+          //
+          // taskId is wire-derived and could carry control chars; we run
+          // it through safeToken to match the lifecycle log's single-line
+          // invariant. JSON.stringify leaves U+2028 / U+2029 raw, which
+          // some log sinks render as line breaks — escape them on the
+          // argv / cwd JSON payloads so the warn line stays one line.
+          const argvSummary = escapeLineSeparators(
+            clipTo(JSON.stringify([command, ...args]), 400),
+          );
+          const cwdSummary = cwd
+            ? ` cwd=${escapeLineSeparators(JSON.stringify(cwd))}`
+            : '';
           logger.warn(
-            `codex exec-failure repro taskId=${task.taskId} argv=${argvSummary}${cwdSummary}`,
+            `codex exec-failure repro taskId=${safeToken(task.taskId)} argv=${argvSummary}${cwdSummary}`,
           );
           emit({
             type: 'task.fail',

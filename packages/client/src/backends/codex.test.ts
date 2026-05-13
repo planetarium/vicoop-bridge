@@ -522,6 +522,53 @@ test('exec-failure repro line goes to the local logger, not the wire (#147 Copil
   assert.match(repro, /cwd="\/srv\/agent-work"/);
 });
 
+test('exec-failure repro line sanitizes taskId and escapes line separators (#147 Copilot)', async () => {
+  // Wire-derived taskId can contain newlines / control chars; argv / cwd
+  // values can contain U+2028 / U+2029 which JSON.stringify leaves raw
+  // but some log sinks treat as line breaks. The repro line must stay
+  // single-line and must not let an attacker inject fake [client] lines.
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      child.emitStderr('boom\n');
+      setImmediate(() => child.finish(1));
+    });
+  });
+
+  const warnLines: string[] = [];
+  const stubLogger: Logger = {
+    level: 'info',
+    error: () => {},
+    warn: (...a: unknown[]) => warnLines.push(a.map(String).join(' ')),
+    info: () => {},
+    debug: () => {},
+  };
+
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    cwd: '/srv/a\u2028b', // U+2028 in cwd
+    logger: stubLogger,
+  });
+  const hostileTask: TaskAssignFrame = {
+    type: 'task.assign',
+    taskId: 'evil\n[client] FAKE',
+    contextId: 'ctx',
+    message: { role: 'user', messageId: 'm1', parts: [{ kind: 'text', text: 'x' }] },
+  };
+
+  await backend.handle(hostileTask, collect().emit, NEVER);
+
+  const repro = warnLines.find((l) => l.includes('codex exec-failure repro'));
+  assert.ok(repro);
+  // taskId's embedded newline must be escaped, not preserved as a real LF.
+  assert.doesNotMatch(repro, /\n\[client\] FAKE/);
+  assert.match(repro, /taskId=evil\\n\[client\] FAKE/);
+  // U+2028 in cwd must be escaped to its \uXXXX form. (RegExp ctor used
+  // so the source file doesn't carry a raw U+2028 of its own — esbuild
+  // parses raw U+2028 in a regex literal as a line terminator.)
+  assert.doesNotMatch(repro, /\u2028/);
+  assert.match(repro, /\\u2028/);
+});
+
 test('--skip-git-repo-check is auto-added so non-git cwds work out of the box (#147)', async () => {
   const fake = scriptedSpawn([
     [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],

@@ -57,7 +57,13 @@ function warnOnce(sink: ConsoleSink, key: string, message: string): void {
 // (Paragraph Separator) raw — and several log collectors / terminals
 // render them as line breaks. Replace them with their `\uXXXX` escape
 // sequences so the single-line invariant survives those sinks too.
-function escapeLineSeparators(s: string): string {
+// Exported for callers that already produced a JSON.stringify'd string
+// (so the standard escapes are already applied) but still need the
+// U+2028 / U+2029 hardening before the value lands in a log line.
+// Internal `safeToken` / `safeForLog` callers should keep using those
+// wrappers \u2014 this is a lower-level helper for places that build their
+// own JSON payload.
+export function escapeLineSeparators(s: string): string {
   return s.replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 }
 
