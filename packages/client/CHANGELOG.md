@@ -1,5 +1,16 @@
 # @vicoop-bridge/client
 
+## 0.12.1
+
+### Patch Changes
+
+- b9074af: Make Codex backend usable from any `cwd` and surface backend failure detail (#147). Two changes work together:
+
+  - **Foreground log now includes `error.message` on `task.fail`.** Backends pack stderr tails and exit-status detail into `error.message`, but the lifecycle log emitted only `code=` and dropped the message — forcing operators to enable bridge-side wire-frame tracing just to learn why a task failed. The message is appended via `safeToken` (4 KB cap, line breaks escaped) so the log stays single-line and wire-derived bytes can't break out of it. Host-local detail (argv, absolute cwd) is **not** put into `error.message`; that travels over the wire to the bridge / caller and so stays redacted (see the local repro log below).
+  - **Codex backend always passes `--skip-git-repo-check`.** `codex exec` refuses by default to run from a directory that is neither a git repo nor an operator-trusted path, exiting `1` with `Not inside a trusted directory…` in ~200 ms. vicoop agents work in an operator-chosen `cwd` that is often not a git repo, so the new default is to skip codex's cwd-trust ergonomics gate. Sandboxing is unchanged — this is a separate concern from `sandbox_mode`. The flag is deduplicated when also listed in `backends.codex.extra_args`.
+  - When `codex exec` exits non-zero (auth errors, usage errors, signal termination, …) the backend writes a local-only `codex exec-failure repro taskId=… argv=… cwd=…` line (logger.warn) so operators can reproduce the failing invocation. The wire-level `task.fail` `error.message` keeps only stderr-tail + exit/signal detail; argv (which carries `--image` temp paths) and `cwd` are host-local and not forwarded to the bridge or the caller. Real spawn(2) failures still use the existing `spawn_failed` error code and emit `task.fail` directly — this repro line is specifically for the codex-started-but-exited-non-zero case.
+  - Config accepts `backends.codex.extra_args: string[]`. Entries are validated as a homogeneous string array, then trimmed; whitespace-only entries are dropped (so `" --flag"` and `"   "` don't reach codex argv with stray spaces). Malformed arrays are dropped entirely.
+
 ## 0.12.0
 
 ### Minor Changes
