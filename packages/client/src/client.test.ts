@@ -393,26 +393,43 @@ test('Client daemon (subprocess) survives WS disconnect and reconnects (#156)', 
   // Wait for the child to print `daemon-ready` so we know the Client has
   // been constructed and `start()` has been called. Without this we could
   // race the child's startup and observe `helloCount === 0` purely because
-  // the fixture hasn't connected yet.
+  // the fixture hasn't connected yet. The three terminal paths are unified
+  // through a single `cleanup` so an early `exit` rejects the promise (it
+  // used to merely clear the timeout, which left the promise pending
+  // forever on startup failures), the readiness signal can resolve once,
+  // and the 5s timeout still fires if the child neither readies nor exits.
   await new Promise<void>((resolve, reject) => {
     let buf = '';
+    const cleanup = (): void => {
+      child.stdout.off('data', onData);
+      child.off('exit', onExit);
+      clearTimeout(timeout);
+    };
     const onData = (b: Buffer): void => {
       buf += b.toString('utf8');
       if (buf.includes('daemon-ready')) {
-        child.stdout.off('data', onData);
+        cleanup();
         resolve();
       }
     };
-    child.stdout.on('data', onData);
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      cleanup();
+      reject(
+        new Error(
+          `daemon fixture exited before becoming ready (code=${code} signal=${signal}). stderr: ${stderr.join('')}`,
+        ),
+      );
+    };
     const timeout = setTimeout(() => {
-      child.stdout.off('data', onData);
+      cleanup();
       reject(
         new Error(
           `daemon fixture did not become ready within 5s. stderr: ${stderr.join('')}`,
         ),
       );
     }, 5000);
-    child.on('exit', () => clearTimeout(timeout));
+    child.stdout.on('data', onData);
+    child.on('exit', onExit);
   });
 
   try {
