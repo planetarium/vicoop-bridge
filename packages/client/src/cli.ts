@@ -251,6 +251,13 @@ function runClient(argv: string[]): void {
     agentCard,
     backendKind: args.backend,
     backend: pickBackend(args.backend, args),
+    // Daemon entrypoint: a fatal terminal close (currently 4014 "client
+    // revoked") should drop the process with a non-zero exit so
+    // systemd / a parent supervisor sees the revocation as a hard
+    // failure instead of masking it as a transient disconnect. The
+    // Client class deliberately does not call process.exit itself —
+    // tests and future in-process embedders pass a non-exiting callback.
+    onFatal: () => process.exit(1),
   });
 
   client.start();

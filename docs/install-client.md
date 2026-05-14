@@ -785,7 +785,7 @@ vicoop-client revoke-client <client-id-or-name>
 - A unique name resolves automatically; an ambiguous name exits non-zero
   with a list of matching `client_id`s so you can retry with the id.
 - If the daemon is alive at the moment of revocation, its WebSocket is
-  closed with code **4012 "client revoked"** and the daemon exits
+  closed with code **4014 "client revoked"** and the daemon exits
   non-zero without reconnecting. The bridge's WS auth path also rejects
   the token on the next register attempt, so a daemon launched again with
   the same token will fail with **close code 4005 "bad token"** rather

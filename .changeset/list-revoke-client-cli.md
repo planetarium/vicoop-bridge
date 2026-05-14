@@ -14,11 +14,11 @@ Add `vicoop-client list-clients` and `vicoop-client revoke-client` subcommands s
 **Server surface**
 
 - `GET /admin-api/clients` and `DELETE /admin-api/clients/:target` under the same owner-session bearer guard as the existing `/admin-api/agents/*` routes. RLS filters list/delete to the operator's own rows; reads of another principal's rows return 404 (no existence leak), name-resolution ambiguity returns 409.
-- `Registry.disconnectClient(clientId)` closes every live WebSocket bound to a revoked client with new close code **4012 "client revoked"**. (4010 was already taken by the agent-id-owned-by-different-principal path in `ws.ts`.)
+- `Registry.disconnectClient(clientId)` closes every live WebSocket bound to a revoked client with new close code **4014 "client revoked"**. (4010 was already taken by the agent-id-owned-by-different-principal path in `ws.ts`.)
 
 **Daemon behavior**
 
-- The client daemon's reconnect loop now branches on close code 4012: log `client revoked by owner; exiting`, abort inflight tasks, and exit non-zero without reconnecting. Without this branch the daemon would loop forever against a permanently-failing auth.
+- The client daemon's reconnect loop now branches on close code 4014: log `client revoked by owner; exiting`, abort inflight tasks, and exit non-zero without reconnecting. Without this branch the daemon would loop forever against a permanently-failing auth.
 
 **Revocation propagation**
 

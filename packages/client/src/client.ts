@@ -60,6 +60,18 @@ export interface ClientOptions {
   // Test seam: override the default console sink. Production callers leave
   // this unset and logs land on `console.log` / `.warn` / `.error`.
   logSink?: ConsoleSink;
+  // Invoked when the daemon hits a non-recoverable terminal close code
+  // (currently only 4014 "client revoked"). The Client itself only
+  // tears down its own state — `stopped = true`, reconnect timer
+  // cleared, inflight tasks aborted — and delegates the
+  // process-lifecycle decision (e.g. process.exit(1)) to the caller via
+  // this callback. Two reasons we don't call process.exit here: tests
+  // that construct a Client can't recover from a forced exit, and
+  // future embedders (a long-running parent process hosting multiple
+  // clients) need to keep running after one client is revoked. The
+  // production entrypoint (`cli.ts runClient`) wires this to
+  // `process.exit(1)`; tests pass a capturing callback.
+  onFatal?: (info: { code: number; reason: string }) => void;
 }
 
 const DEFAULT_PROBE_DEADLINE_MS = 3000;
@@ -314,19 +326,22 @@ export class Client {
       this.logger.info(`disconnected: ${code} ${safeToken(reason.toString())}`);
       if (!current) return;
       this.ws = null;
-      // 4012 is the server's "client revoked" signal (issue #166). The DB
-      // row was just soft-deleted by an owner-side `vicoop-client
-      // revoke-client`, and ws.ts will reject every future hello with the
-      // same token. Looping forever would just spam reconnects against a
-      // permanently-failing auth; stop the daemon with a non-zero exit so
-      // systemd / a parent supervisor surfaces the revocation instead of
-      // masking it as a transient network hiccup.
-      if (code === 4012) {
-        this.logger.error('client revoked by owner; exiting');
+      // 4014 is the server's "client revoked" signal (issue #166). The
+      // DB row was just soft-deleted by an owner-side `vicoop-client
+      // revoke-client`, and ws.ts will reject every future hello with
+      // the same token. Looping forever would just spam reconnects
+      // against a permanently-failing auth; tear down our own reconnect
+      // state and delegate the process-lifecycle decision to `onFatal`
+      // (the production entrypoint exits non-zero so systemd / a parent
+      // supervisor surfaces the revocation instead of masking it as a
+      // transient network hiccup).
+      if (code === 4014) {
+        this.logger.error('client revoked by owner; stopping');
         this.stopped = true;
         this.clearReconnectTimer();
         for (const controller of this.inflight.values()) controller.abort();
-        process.exit(1);
+        this.opts.onFatal?.({ code, reason: reason.toString() });
+        return;
       }
       this.scheduleReconnect();
     });

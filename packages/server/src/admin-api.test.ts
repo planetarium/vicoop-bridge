@@ -413,7 +413,7 @@ test(
 );
 
 test(
-  'DELETE /admin-api/clients/:target sets revoked=true and closes the live WS with 4012',
+  'DELETE /admin-api/clients/:target sets revoked=true and closes the live WS with 4014',
   { skip: !hasDb },
   async () => {
     const sql = postgres(process.env.DATABASE_URL!);
@@ -454,7 +454,7 @@ test(
       assert.equal(body.client_id, setup.clientId);
       assert.equal(body.revoked, true);
       assert.equal(body.closed_connections, 1);
-      assert.deepEqual(closeArgs, [{ code: 4012, reason: 'client revoked' }]);
+      assert.deepEqual(closeArgs, [{ code: 4014, reason: 'client revoked' }]);
 
       // DB row reflects the revocation.
       const rows = await sql<{ revoked: boolean }[]>`

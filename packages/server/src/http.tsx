@@ -374,11 +374,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
 
   function adminApiErrorResponse(c: Context, err: unknown): Response {
     if (err instanceof AdminApiError) {
-      // Cast to a Hono-acceptable status union; AdminApiError uses standard
-      // HTTP codes (400/403/404/409) that Hono accepts for c.json's second
-      // arg. 409 is the ambiguous-client-name signal from
-      // revokeClientForOwner — the operator passed a name that matches
-      // multiple rows and needs to retry with the id.
+      // Cast to a Hono-acceptable status union. AdminApiError uses standard
+      // HTTP codes that Hono accepts for c.json's second arg: 400 invalid
+      // input, 401 auth (currently emitted only by adminApiUnauthorized,
+      // not through this path, but kept in the union so a future
+      // AdminApiError with status 401 still typechecks), 403 forbidden,
+      // 404 not-found / RLS-hidden, 409 ambiguous-client-name from
+      // revokeClientForOwner.
       return c.json({ error: err.message }, err.status as 400 | 401 | 403 | 404 | 409);
     }
     logEvent('admin_api_error', { error: String(err) });
@@ -450,7 +452,8 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // and may be a UUID `client_id` or a `client_name`; the server resolves
   // the ambiguity (404 if neither matches, 409 with the candidate ids if a
   // name matches multiple rows). On success, sets `revoked = true` and
-  // closes every live WS bound to the client with code 4012.
+  // closes every live WS bound to the client with code 4014 — see the
+  // close-code rationale in Registry.disconnectClient.
   app.delete('/admin-api/clients/:target', async (c) => {
     const auth = await authOwnerSession(c);
     if (!auth.ok) return adminApiUnauthorized(c, auth);

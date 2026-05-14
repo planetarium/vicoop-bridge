@@ -251,10 +251,10 @@ test('notifyAgentChange log cannot be hijacked by newline injection via agentId'
   );
 });
 
-test('disconnectClient closes every ws bound to the client_id with code 4012', () => {
+test('disconnectClient closes every ws bound to the client_id with code 4014', () => {
   // Two agents owned by the revoked client + one agent owned by an unrelated
   // client. After disconnectClient('c1'), only the first two sockets see a
-  // close, and they see code 4012 with the "client revoked" reason. The
+  // close, and they see code 4014 with the "client revoked" reason. The
   // unrelated socket is untouched.
   const registry = new Registry();
   const ws1 = makeRecordingWs();
@@ -272,8 +272,8 @@ test('disconnectClient closes every ws bound to the client_id with code 4012', (
 
   const closed = registry.disconnectClient('c1');
   assert.equal(closed, 2);
-  assert.deepEqual(ws1.closeArgs, [{ code: 4012, reason: 'client revoked' }]);
-  assert.deepEqual(ws2.closeArgs, [{ code: 4012, reason: 'client revoked' }]);
+  assert.deepEqual(ws1.closeArgs, [{ code: 4014, reason: 'client revoked' }]);
+  assert.deepEqual(ws2.closeArgs, [{ code: 4014, reason: 'client revoked' }]);
   assert.deepEqual(ws3.closeArgs, []);
 });
 

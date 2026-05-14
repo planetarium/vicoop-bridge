@@ -369,7 +369,7 @@ export async function revokeClientForOwner(
   });
 
   // Close every live WebSocket session bound to this client. The daemon
-  // sees close code 4012 and exits without reconnecting (see client.ts).
+  // sees close code 4014 and exits without reconnecting (see client.ts).
   const closedConnections = registry.disconnectClient(resolved.id);
 
   return {
