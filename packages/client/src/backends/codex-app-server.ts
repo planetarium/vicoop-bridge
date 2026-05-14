@@ -11,7 +11,6 @@ import { mapPartsToCodexInput } from './codex.js';
 import {
   buildOpenAICompatSystemPrompt,
   callerToolDispatchActive,
-  formatToolCallHistory,
   parseOpenAICompatMetadata,
   tryParseToolCallsEnvelope,
 } from './claude.js';
@@ -22,10 +21,12 @@ import {
   TRANSPORT_CLOSED,
   type AppServerSpawnFn,
   type InitializeResult,
+  type ResponsesApiItem,
   type SandboxMode,
   type ThreadItem,
   type UserInputItem,
 } from './codex-app-server-rpc.js';
+import type { OpenAICompatHistoryEntry } from './claude.js';
 
 // Public re-export so operators can refer to the same sandbox-mode type
 // surface as the existing `codex` backend without crossing files.
@@ -117,25 +118,68 @@ interface PreparedInput {
 }
 
 // Convert mapped prompt + image files to the app-server `UserInput[]` shape.
-// Order: any tool_call_history prefix → user text → images appended.
+// Order: user text → images appended. Tool-call history is no longer
+// folded into the user text — see `historyToInjectItems`, which puts it
+// into the thread's native model-visible context via `thread/inject_items`.
 function buildUserInput(
   prompt: string,
   imageFiles: string[],
-  toolCallHistoryPrefix: string | null,
 ): UserInputItem[] {
   const items: UserInputItem[] = [];
-  const textBody = toolCallHistoryPrefix
-    ? prompt
-      ? `${toolCallHistoryPrefix}\n\n${prompt}`
-      : toolCallHistoryPrefix
-    : prompt;
-  if (textBody) {
-    items.push({ type: 'text', text: textBody, text_elements: [] });
+  if (prompt) {
+    items.push({ type: 'text', text: prompt, text_elements: [] });
   }
   for (const p of imageFiles) {
     items.push({ type: 'localImage', path: p });
   }
   return items;
+}
+
+// Map an openai-compat `tool_call_history` to OpenAI Responses API items
+// suitable for `thread/inject_items`. Each `assistant.tool_calls[]` entry
+// fans out into one `function_call` item; each `role:"tool"` entry maps to
+// a matching `function_call_output`. Order is preserved so call_id pairing
+// stays consistent with the originating conversation.
+//
+// Malformed entries (missing id / function name) are skipped silently —
+// the gateway already validated the OpenAI request shape, so this is a
+// defensive last filter rather than an error surface.
+export function historyToInjectItems(
+  history: OpenAICompatHistoryEntry[],
+): ResponsesApiItem[] {
+  const out: ResponsesApiItem[] = [];
+  for (const entry of history) {
+    if (entry.role === 'assistant') {
+      for (const tc of entry.tool_calls) {
+        if (!tc || typeof tc !== 'object') continue;
+        const call = tc as { id?: unknown; function?: unknown };
+        if (typeof call.id !== 'string' || !call.id) continue;
+        if (!call.function || typeof call.function !== 'object') continue;
+        const fn = call.function as { name?: unknown; arguments?: unknown };
+        if (typeof fn.name !== 'string' || !fn.name) continue;
+        // OpenAI spec: `function.arguments` is a JSON-encoded string. Some
+        // producers send the parsed object instead — re-stringify so the
+        // Responses API item is spec-compliant either way.
+        const args =
+          typeof fn.arguments === 'string'
+            ? fn.arguments
+            : JSON.stringify(fn.arguments ?? {});
+        out.push({
+          type: 'function_call',
+          call_id: call.id,
+          name: fn.name,
+          arguments: args,
+        });
+      }
+    } else {
+      out.push({
+        type: 'function_call_output',
+        call_id: entry.tool_call_id,
+        output: entry.content,
+      });
+    }
+  }
+  return out;
 }
 
 // Per-task in-progress notification subscription — listens for
@@ -334,14 +378,18 @@ export function createCodexAppServerBackend(
         }
 
         // Detect the openai-compat extension once. The system-prompt text
-        // feeds `developerInstructions` on the next thread/start; the
-        // tool_call_history is replayed as a user-prompt prefix (same
-        // contract the `codex` backend enforces).
+        // feeds `developerInstructions` on the next thread/start; any
+        // `tool_call_history` is materialised as native Responses API
+        // items and pushed through `thread/inject_items` after thread/start
+        // (see `historyToInjectItems` below) — this gives the model a real
+        // function-call history rather than a JSON blob it has to be
+        // instructed to interpret, eliminating the multi-turn re-call loop
+        // observed under prompts like `"Use a tool to list …"` (#176).
         const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
         const systemPrompt =
           openaiCompat ? buildOpenAICompatSystemPrompt(openaiCompat) : '';
-        const toolCallHistoryPrefix = openaiCompat?.tool_call_history
-          ? formatToolCallHistory(openaiCompat.tool_call_history)
+        const historyInjectItems = openaiCompat?.tool_call_history
+          ? historyToInjectItems(openaiCompat.tool_call_history)
           : null;
 
         const mapped = await mapPartsToCodexInput(task.message.parts, {
@@ -360,11 +408,7 @@ export function createCodexAppServerBackend(
         }
 
         try {
-          const userInput = buildUserInput(
-            mapped.prompt,
-            mapped.imageFiles,
-            toolCallHistoryPrefix,
-          );
+          const userInput = buildUserInput(mapped.prompt, mapped.imageFiles);
 
           let client: AppServerRpcClient;
           try {
@@ -478,6 +522,19 @@ export function createCodexAppServerBackend(
                   writeId,
                 });
               }
+            }
+            // Append prior round-trips (if any) as native Responses API
+            // items so codex's session builder includes them in the model
+            // prompt as proper function-call history. Without this, the
+            // model only sees a JSON `tool_call_history` blob in user text
+            // and may re-emit the same envelope when the user prompt
+            // contains a "use a tool" imperative (#176). Skip when there
+            // are no items to inject.
+            if (historyInjectItems && historyInjectItems.length > 0) {
+              await client.request('thread/inject_items', {
+                threadId,
+                items: historyInjectItems,
+              });
             }
             recorder.mark('threadReady');
           } catch (err) {

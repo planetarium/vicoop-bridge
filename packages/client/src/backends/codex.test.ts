@@ -1104,12 +1104,10 @@ test('history-only payload writes no instructions file (build prompt is empty) b
     false,
   );
 
-  // History still prepended to user content. The history block is followed
-  // by an inline anti-loop note (see formatToolCallHistory) before the
-  // verbatim user text.
+  // History still prepended to user content.
   const stdin = fake.lastChild()!.stdinPayload;
   assert.match(stdin, /^<tool_call_history>\n/);
-  assert.match(stdin, /\n<\/tool_call_history_note>\n\ncontinue$/);
+  assert.match(stdin, /\n<\/tool_call_history>\n\ncontinue$/);
 });
 
 test('instructions file is co-located with the image temp dir when both are present (single cleanup)', async () => {
@@ -1227,12 +1225,12 @@ test('multi-turn: history block is prepended to the user prompt on stdin', async
   );
 
   const stdin = fake.lastChild()!.stdinPayload;
-  // History block (JSON + anti-loop note) precedes the user prompt,
-  // separated by a blank line so the model sees the boundary clearly.
+  // History block precedes the user prompt, separated by a blank line so
+  // the model sees the boundary clearly.
   assert.match(stdin, /^<tool_call_history>\n/);
   assert.match(stdin, /"role": "assistant"/);
   assert.match(stdin, /"tool_call_id": "call_abc"/);
-  assert.match(stdin, /\n<\/tool_call_history_note>\n\ncontinue, please$/);
+  assert.match(stdin, /\n<\/tool_call_history>\n\ncontinue, please$/);
 });
 
 test('multi-turn: absent tool_call_history leaves the stdin prompt untouched', async () => {

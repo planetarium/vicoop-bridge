@@ -2218,23 +2218,18 @@ test('buildOpenAICompatSystemPrompt: omits the history paragraph when tools are 
   assert.doesNotMatch(prompt, /<tool_call_history>/);
 });
 
-test('formatToolCallHistory: wraps the JSON array and appends the inline anti-loop note', () => {
+test('formatToolCallHistory: wraps the JSON array verbatim', () => {
   const rendered = formatToolCallHistory([
     { role: 'assistant', tool_calls: [{ id: 'call_x', function: { name: 'f' } }] },
     { role: 'tool', tool_call_id: 'call_x', content: 'ok' },
   ]);
   assert.match(rendered, /^<tool_call_history>\n/);
+  assert.match(rendered, /\n<\/tool_call_history>$/);
   // Pretty-printed JSON makes the structure scannable for the model and for
   // operators reading bridge logs; the test pins indentation to lock in the
   // contract.
   assert.match(rendered, /"role": "assistant"/);
   assert.match(rendered, /"tool_call_id": "call_x"/);
-  // The inline note follows the JSON block. Without it the model has been
-  // observed to re-emit the same call when the user prompt contains an
-  // imperative like "use a tool" (#176 follow-up).
-  assert.match(rendered, /<\/tool_call_history>\n<tool_call_history_note>\n/);
-  assert.match(rendered, /\n<\/tool_call_history_note>$/);
-  assert.match(rendered, /DO NOT interpret imperatives/);
 });
 
 test('multi-turn: history block is prepended to the user content sent to claude', async () => {
