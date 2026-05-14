@@ -1983,6 +1983,84 @@ test('absent metadata → no openai-compat --append-system-prompt is injected', 
   assert.equal(hasEnvelope, false);
 });
 
+test('caller tools active → spawn argv carries `--tools ""` to disable claude built-ins', async () => {
+  // Without this, claude silently uses its own Read / Glob / Bash to satisfy
+  // requests that should round-trip through the caller's tool dispatch — see
+  // #178. Mirrors the codex backend's `--disable shell_tool` /
+  // `--disable unified_exec` gating on the same `callerToolDispatchActive`.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('hi', { tools: SAMPLE_TOOLS, tool_choice: 'auto' }),
+    emit,
+    NEVER,
+  );
+
+  const args = fake.lastChild()?.args ?? [];
+  const idx = args.indexOf('--tools');
+  assert.ok(idx >= 0, 'expected --tools in argv when caller tools are active');
+  // The empty-string value is the documented switch for blanket-disabling
+  // built-ins; any other value would re-enable the offending tools.
+  assert.equal(args[idx + 1], '');
+});
+
+test('history-only payload (no tools) leaves claude built-in tools enabled', async () => {
+  // Counterpart to the active-tools case: when the caller's payload carries
+  // only `tool_call_history` (replay context for a follow-up turn) and no
+  // `tools` array, there is no caller-side dispatch contract to protect this
+  // turn — `--tools ""` MUST NOT appear or claude would lose its built-ins
+  // for a turn the caller never intended to constrain.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('continue', { tool_call_history: SAMPLE_HISTORY }),
+    emit,
+    NEVER,
+  );
+
+  const args = fake.lastChild()?.args ?? [];
+  assert.equal(args.includes('--tools'), false);
+});
+
+test('tool_choice="none" suppresses `--tools ""` even when `tools` are present', async () => {
+  // `tool_choice="none"` is the caller explicitly opting out of tool
+  // dispatch for this turn even though it sent a catalogue (e.g. for future
+  // turns of the same conversation). The envelope contract block in the
+  // system prompt is suppressed under the same gate, so handicapping
+  // claude's built-ins here would be incoherent.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('hi', { tools: SAMPLE_TOOLS, tool_choice: 'none' }),
+    emit,
+    NEVER,
+  );
+
+  const args = fake.lastChild()?.args ?? [];
+  assert.equal(args.includes('--tools'), false);
+});
+
 test('assistant {"tool_calls":[...]} reply becomes a data-part artifact when extension is active', async () => {
   const envelope = {
     tool_calls: [
