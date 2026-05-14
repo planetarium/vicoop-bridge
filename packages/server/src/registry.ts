@@ -81,13 +81,16 @@ export class Registry {
   // live daemon was revoked.
   //
   // 4014 is the next unused slot in the bridge's WS close-code range:
-  // 4001-4011 are claimed by ws.ts (hello timeout / frame parse /
-  // protocol-version / token / agent allowlist / registry collision /
-  // duplicate hello / reserved agent id / cross-principal policy), and
-  // 4012-4013 by card-resolver.ts (missing card-or-backend / unknown
-  // backend). Reusing any of those would make the daemon misclassify
-  // unrelated handshake failures as revocation and exit instead of
-  // backing off.
+  //   - 4001-4008 ws.ts (hello timeout, invalid frame, expected hello,
+  //     protocol-version mismatch, bad token, registry registration
+  //     failed, duplicate hello, agent id not in client allowlist)
+  //   - 4009 registry.ts (this file: `replaced by new connection`)
+  //   - 4010-4011 ws.ts (agent id owned by a different principal,
+  //     reserved agent id)
+  //   - 4012-4013 card-resolver.ts (missing card-or-backend, unknown
+  //     backend kind)
+  // Reusing any of those would make the daemon misclassify unrelated
+  // handshake failures as revocation and exit instead of backing off.
   //
   // The close itself fires this WS's own `close` handler asynchronously,
   // which in turn calls unregisterAgent and removes the entry from the
