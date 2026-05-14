@@ -201,6 +201,8 @@ function pickBackend(name: string, args: Args): Backend {
         url: process.env.OPENCLAW_GATEWAY_URL?.trim() || oc?.gateway_url,
         token: process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || oc?.gateway_token,
         agent: process.env.OPENCLAW_AGENT?.trim() || oc?.agent,
+        openaiCompatAgent:
+          process.env.OPENCLAW_OAI_COMPAT_AGENT?.trim() || oc?.openai_compat_agent,
         taskTimeoutMs: envTimeoutMs === 'valid' ? undefined : oc?.task_timeout_ms,
       });
     }

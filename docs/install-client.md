@@ -244,6 +244,7 @@ omit what you don't need) is:
       "gateway_url": "ws://127.0.0.1:18789",
       "gateway_token": "<gateway-token-if-required>",
       "agent": "main",
+      "openai_compat_agent": "oai",
       "task_timeout_ms": 600000
     }
   }
@@ -267,8 +268,8 @@ or CI overrides). `setup` only ever touches `server_url`, `server_token`, and
 > (`CLAUDE_CWD`, `CLAUDE_SETTINGS_JSON`, `CODEX_CWD`,
 > `CODEX_SANDBOX_MODE`, `OPENCLAW_GATEWAY_URL` /
 > `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_AGENT` /
-> `OPENCLAW_TASK_TIMEOUT_MS`) still override the corresponding config
-> values.
+> `OPENCLAW_OAI_COMPAT_AGENT` / `OPENCLAW_TASK_TIMEOUT_MS`) still
+> override the corresponding config values.
 
 If you omit `--caller`, `setup` succeeds but prints a warning that the
 agent will be public until you restrict callers:
@@ -424,7 +425,38 @@ second WS. Override if yours isn't on the default:
 | `OPENCLAW_GATEWAY_URL` | `ws://127.0.0.1:18789` | Local gateway endpoint |
 | `OPENCLAW_GATEWAY_TOKEN` | *(none)* | If your gateway requires auth |
 | `OPENCLAW_AGENT` | `main` | Agent name inside OpenClaw |
+| `OPENCLAW_OAI_COMPAT_AGENT` | *(unset, single-agent mode)* | Optional secondary OpenClaw agent name dedicated to tasks carrying the A2A openai-compat extension metadata. When set, the bridge routes those tasks via `agent:<this>:<contextId>` sessionKeys; non-extension tasks keep using `OPENCLAW_AGENT`. Pairs with a `tools.deny=["*"]` `agents.list` entry on the OpenClaw side — see the box below. |
 | `OPENCLAW_TASK_TIMEOUT_MS` | backend default | Per-task timeout |
+
+> **Recommended dual-agent setup for the openai-compat extension.**
+> If you advertise the `…/openai-compat/v1` extension on the OpenClaw
+> card (it ships advertised by default) and expect OpenAI-shaped
+> callers to actually hit it, configure two OpenClaw agents instead
+> of one. The default `main` agent keeps its full toolset for normal
+> natural-language traffic; a secondary `oai` agent runs with native
+> tools disabled so the host model can't satisfy a tool-call prompt
+> with its own Bash / browser / weather skill and ignore the
+> envelope contract the bridge text-injects into the user message.
+>
+> Add this to the OpenClaw gateway config (`~/.openclaw/openclaw.json`
+> on the host running OpenClaw):
+> ```json
+> {
+>   "agents": {
+>     "list": [
+>       { "id": "main" },
+>       { "id": "oai", "tools": { "profile": "minimal", "deny": ["*"] } }
+>     ]
+>   }
+> }
+> ```
+> Then set `OPENCLAW_OAI_COMPAT_AGENT=oai` (or
+> `backends.openclaw.openai_compat_agent: "oai"` in `config.json`)
+> on the vicoop-client side. Pilot measurement on
+> `anthropic/claude-sonnet-4-6` saw envelope-contract compliance
+> rise from 5/10 (single-agent baseline, full tools) to 10/10 with
+> this split. Leave `OPENCLAW_OAI_COMPAT_AGENT` unset and you get
+> today's single-agent behavior on every task.
 
 ### Claude-specific env
 

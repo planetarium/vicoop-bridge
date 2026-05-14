@@ -1,0 +1,7 @@
+---
+"@vicoop-bridge/client": minor
+---
+
+Implement the A2A [openai-compat/v1 extension](https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1) on the `openclaw` backend, mirroring the contract added for `claude` in #152 and `codex` in #159. Because OpenClaw's `chat.send` RPC has no `system` field — the entire writable channel into the model is the user `message` text — the contract is folded into the user content as tagged XML blocks: `<system_instructions>` carrying the envelope contract + tools + tool_choice, then `<user_message>` carrying the caller's actual prompt. Envelope detection runs on every assistant transcript entry (and on the terminal `chat` event for the non-streaming fallback path) and surfaces matches as A2A `data` part artifacts tagged with `OPENAI_COMPAT_EXTENSION_URI`.
+
+The `openclaw` agent card now advertises the extension URI under `capabilities.extensions[]` so cooperating gateways can discover it from a card fetch. The card description explicitly flags the contract as **best-effort**: because OpenClaw's wire has no system-prompt seam, reliability depends on the gateway's host model honoring the text-injected instructions. Verified on Anthropic `claude-sonnet-4-6` in repeated probes (5/5 envelope-on-tool-turn, 5/5 anti-loop-on-history-turn); OSS-hosted gateways may require per-model measurement, and tasks against a non-cooperating host model fall through cleanly to the existing text-artifact path with no extension URI tag.

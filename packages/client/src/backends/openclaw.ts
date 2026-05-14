@@ -3,8 +3,15 @@ import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import WebSocket from 'ws';
-import type { Part } from '@vicoop-bridge/protocol';
+import { OPENAI_COMPAT_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import {
+  buildOpenAICompatSystemPrompt,
+  formatToolCallHistory,
+  parseOpenAICompatMetadata,
+  tryParseToolCallsEnvelope,
+  type OpenAICompatMetadata,
+} from './claude.js';
 import {
   createBoundedFileReader,
   inferMimeFromPath,
@@ -487,6 +494,43 @@ export async function mapPartsToChatInput(
   };
 }
 
+// Compose the user-content payload for `chat.send.message` when the
+// openai-compat extension is active. OpenClaw has no system-prompt wire
+// seam — the only writable channel into the model is the user message
+// itself — so the contract is folded in as tagged XML blocks:
+//
+//   <system_instructions>…envelope contract + tools + tool_choice…</system_instructions>
+//   <tool_call_history>…JSON array of prior round-trips…</tool_call_history>  // optional
+//   <user_message>…the caller's actual text…</user_message>
+//
+// The wrapper tags exist so a host model that respects user-injected
+// pseudo-system framing has a clear boundary; non-cooperating models will
+// see the block as opaque user content and may answer in natural
+// language, in which case the bridge falls through to the existing text
+// artifact path (no envelope tag) without claiming the extension was
+// honored.
+//
+// `system_instructions` is omitted when `buildOpenAICompatSystemPrompt`
+// returns empty (e.g. a history-only payload with no tools / system /
+// tool_choice). `tool_call_history` is omitted when absent. The user-message
+// wrapper is always present so the model's mental model of where its
+// instructions end and the user's prompt begins is stable across turns.
+export function composeOpenAICompatUserMessage(
+  meta: OpenAICompatMetadata,
+  userText: string,
+): string {
+  const blocks: string[] = [];
+  const sys = buildOpenAICompatSystemPrompt(meta);
+  if (sys) {
+    blocks.push(`<system_instructions>\n${sys}\n</system_instructions>`);
+  }
+  if (meta.tool_call_history) {
+    blocks.push(formatToolCallHistory(meta.tool_call_history));
+  }
+  blocks.push(`<user_message>\n${userText}\n</user_message>`);
+  return blocks.join('\n\n');
+}
+
 function extractFinalText(message: unknown): string {
   if (!message || typeof message !== 'object') return '';
   const m = message as Record<string, unknown>;
@@ -531,6 +575,39 @@ export interface OpenclawBackendOptions {
   url?: string;
   token?: string;
   agent?: string;
+  /**
+   * Optional secondary agent name to route tasks carrying the openai-compat
+   * extension metadata to, instead of the default `agent`. Intended for
+   * operators who want to dedicate a tools-disabled agent profile to
+   * envelope-contract requests so the host model isn't tempted to satisfy
+   * the question with its own native skills (Bash, browser, weather, etc.)
+   * — which is the main source of stochastic envelope-contract refusals.
+   *
+   * The operator pairs this with a matching `agents.list` entry in the
+   * OpenClaw gateway config:
+   *
+   *   {
+   *     "agents": {
+   *       "list": [
+   *         { "id": "main" },
+   *         { "id": "oai", "tools": { "profile": "minimal", "deny": ["*"] } }
+   *       ]
+   *     }
+   *   }
+   *
+   * Then sets `openaiCompatAgent: "oai"` here so tasks whose
+   * `Message.metadata` carries the openai-compat URI are routed through
+   * `agent:oai:<contextId>` sessionKeys instead of the default
+   * `agent:main:<contextId>`. Non-extension tasks still use the default
+   * agent's full toolset.
+   *
+   * Pilot measurement on `anthropic/claude-sonnet-4-6`: envelope-contract
+   * compliance rose from 5/10 (default `main` agent with full tools) to
+   * 10/10 (`oai` agent with tools disabled) on a tool-call-prone prompt.
+   *
+   * Leave undefined to disable the split — every task uses `agent`.
+   */
+  openaiCompatAgent?: string;
   thinking?: string;
   sessionKeyPrefix?: string;
   debug?: boolean;
@@ -814,6 +891,19 @@ export function createOpenclawBackend(
   const url = opts.url ?? process.env.OPENCLAW_GATEWAY_URL ?? 'ws://127.0.0.1:18789';
   const token = opts.token ?? process.env.OPENCLAW_GATEWAY_TOKEN;
   const agent = opts.agent ?? process.env.OPENCLAW_AGENT ?? 'main';
+  // Optional secondary agent name dedicated to openai-compat tasks. See the
+  // doc comment on `OpenclawBackendOptions.openaiCompatAgent` for the
+  // operator-side OpenClaw config (agents.list + tools.deny=["*"]) this
+  // pairs with. Trim + treat-empty-as-unset across env / opts so an
+  // install.sh-style env template with the key present-but-blank doesn't
+  // shadow a populated config.json. When unresolved, all tasks route to
+  // `agent`.
+  const openaiCompatAgentRaw =
+    opts.openaiCompatAgent ?? process.env.OPENCLAW_OAI_COMPAT_AGENT;
+  const openaiCompatAgent =
+    typeof openaiCompatAgentRaw === 'string' && openaiCompatAgentRaw.trim().length > 0
+      ? openaiCompatAgentRaw.trim()
+      : undefined;
   const thinking = opts.thinking ?? process.env.OPENCLAW_THINKING;
   const sessionPrefix = opts.sessionKeyPrefix ?? 'agent';
   const debug = opts.debug ?? process.env.OPENCLAW_DEBUG === '1';
@@ -1258,6 +1348,21 @@ export function createOpenclawBackend(
         return;
       }
 
+      // Detect the openai-compat extension payload once per task so the
+      // result feeds both the chat.send.message composition (system /
+      // tools / tool_choice / tool_call_history → tagged XML blocks
+      // prepended to the user content, since OpenClaw has no system-prompt
+      // wire seam) and the assistant artifact path (envelope JSON → data
+      // part). Absent / malformed metadata leaves the run on the original
+      // non-extension code path with no envelope-detection cost.
+      const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+      if (openaiCompat) {
+        mapped.input.message = composeOpenAICompatUserMessage(
+          openaiCompat,
+          mapped.input.message,
+        );
+      }
+
       let gw: GatewayClient;
       try {
         gw = await ensureConnected();
@@ -1269,7 +1374,17 @@ export function createOpenclawBackend(
         });
         return;
       }
-      const sessionKey = `${sessionPrefix}:${agent}:${task.contextId}`;
+      // When the openai-compat extension is active on this task AND the
+      // operator has configured a secondary agent name for it, route via
+      // that agent's session-key namespace. That secondary agent is expected
+      // to have `tools.deny=["*"]` so the host model has no native tools,
+      // eliminating the system-vs-user-instruction conflict that
+      // significantly reduces envelope-contract compliance (see the doc
+      // comment on `OpenclawBackendOptions.openaiCompatAgent`). Tasks
+      // without the extension metadata always use the default `agent`,
+      // so this split is invisible to non-compat callers.
+      const effectiveAgent = openaiCompat && openaiCompatAgent ? openaiCompatAgent : agent;
+      const sessionKey = `${sessionPrefix}:${effectiveAgent}:${task.contextId}`;
       const { message: text, attachments } = mapped.input;
 
       emit({
@@ -1385,6 +1500,34 @@ export function createOpenclawBackend(
             // sync check above and our turn on the queue (e.g. terminal
             // chat event drained ahead of us).
             if (sessionMessageSettled) return;
+            // When the openai-compat extension is active for this task,
+            // the model was instructed to emit `{"tool_calls":[...]}` JSON
+            // for tool turns. Detect that shape and surface it as an A2A
+            // `data` part tagged with the extension URI so the upstream
+            // gateway can forward it verbatim as `tool_calls`. The
+            // envelope is the complete payload — no attachOutputs
+            // processing, no text part. Non-envelope text (natural-
+            // language answers, internal tool transcript, or any turn
+            // from a task that didn't request the extension) falls
+            // through to the existing text artifact path unchanged.
+            if (openaiCompat) {
+              const envelope = tryParseToolCallsEnvelope(artifactText);
+              if (envelope) {
+                emit({
+                  type: 'task.artifact',
+                  taskId: task.taskId,
+                  artifact: {
+                    artifactId: randomUUID(),
+                    name: 'openclaw-message',
+                    parts: [{ kind: 'data', data: envelope }],
+                    extensions: [OPENAI_COMPAT_EXTENSION_URI],
+                  },
+                  lastChunk: true,
+                });
+                emittedAnyArtifact = true;
+                return;
+              }
+            }
             const { parts } = await processAssistantText(artifactText);
             if (parts.length === 0) return;
             emit({
@@ -1614,6 +1757,52 @@ export function createOpenclawBackend(
         }
 
         const text2 = extractFinalText(result.message);
+
+        // Non-streaming fallback path for the envelope: when no streaming
+        // subscription delivered a session.message artifact (e.g. the
+        // concurrent-task case forfeited streaming ownership, or the
+        // gateway is older than v2026.3.22 and never broadcasts
+        // session.message at all), the only way to surface the envelope
+        // is here. Mirrors the streaming-path detection in
+        // onSessionMessage: match → single data-part artifact tagged with
+        // the extension URI; non-match → fall through to the existing
+        // text-artifact path with full processAssistantText handling.
+        if (openaiCompat) {
+          const envelope = tryParseToolCallsEnvelope(text2);
+          if (envelope) {
+            if (!emittedAnyArtifact) {
+              emit({
+                type: 'task.artifact',
+                taskId: task.taskId,
+                artifact: {
+                  artifactId: randomUUID(),
+                  name: 'openclaw-result',
+                  parts: [{ kind: 'data', data: envelope }],
+                  extensions: [OPENAI_COMPAT_EXTENSION_URI],
+                },
+                lastChunk: true,
+              });
+            }
+            emit({
+              type: 'task.complete',
+              taskId: task.taskId,
+              status: {
+                state: 'completed',
+                timestamp: new Date().toISOString(),
+                message: {
+                  role: 'agent',
+                  messageId: randomUUID(),
+                  // text2 is the raw envelope JSON string; stamp it on
+                  // status.message for callers that pull terminal content
+                  // from the conventional A2A slot. Mirrors claude/codex.
+                  parts: [{ kind: 'text', text: text2 }],
+                },
+              },
+            });
+            return;
+          }
+        }
+
         const { parts: finalArtifactParts, cleanedText } = await processAssistantText(text2);
         // Only emit the final-result artifact when streaming produced
         // nothing — otherwise each assistant message already went out as its

@@ -121,6 +121,14 @@ export interface OpenclawBackendConfig {
   gateway_url?: string;
   gateway_token?: string;
   agent?: string;
+  /**
+   * Optional secondary agent name dedicated to tasks carrying the
+   * openai-compat extension metadata. See
+   * `OpenclawBackendOptions.openaiCompatAgent` for the operator-side
+   * pairing (OpenClaw `agents.list` entry with `tools.deny=["*"]`).
+   * Leave unset to route every task through `agent`.
+   */
+  openai_compat_agent?: string;
   task_timeout_ms?: number;
 }
 
@@ -235,12 +243,14 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const url = asString(ocRaw.gateway_url);
       const tok = asString(ocRaw.gateway_token);
       const ag = asString(ocRaw.agent);
+      const oai = asString(ocRaw.openai_compat_agent);
       const tto = asNumber(ocRaw.task_timeout_ms);
-      if (url || tok || ag || tto !== undefined) {
+      if (url || tok || ag || oai || tto !== undefined) {
         out.openclaw = {};
         if (url) out.openclaw.gateway_url = url;
         if (tok) out.openclaw.gateway_token = tok;
         if (ag) out.openclaw.agent = ag;
+        if (oai) out.openclaw.openai_compat_agent = oai;
         if (tto !== undefined) out.openclaw.task_timeout_ms = tto;
       }
     }
