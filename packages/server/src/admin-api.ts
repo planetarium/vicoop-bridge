@@ -249,3 +249,133 @@ export function listActiveAgents(
       connected_at: new Date(a.connectedAt).toISOString(),
     }));
 }
+
+export interface ClientListItem {
+  client_id: string;
+  client_name: string;
+  owner_principal: string;
+  allowed_agent_ids: string[];
+  revoked: boolean;
+  created_at: string;
+  /**
+   * True iff at least one agent owned by this client is currently registered
+   * in the in-memory WebSocket registry. Distinguishes orphaned `clients`
+   * rows (daemon never started, or has since exited) from rows whose daemon
+   * is alive — the original motivation for the issue.
+   */
+  connected: boolean;
+}
+
+export async function listClientsForOwner(
+  db: Sql,
+  registry: Registry,
+  principalId: string,
+): Promise<ClientListItem[]> {
+  const rows = await db.begin(async (tx) => {
+    await setRlsContext(tx, principalId);
+    return tx`
+      SELECT id, owner_principal, client_name, allowed_agent_ids, revoked, created_at
+      FROM clients
+      ORDER BY created_at DESC
+    `;
+  });
+
+  // Build the set of client_ids whose agents are currently connected.
+  // listAgents() returns the registry's in-memory view; deduplicating by
+  // clientId keeps the set small even if a client has many agents bound.
+  const connectedClientIds = new Set<string>();
+  for (const conn of registry.listAgents()) {
+    connectedClientIds.add(conn.clientId);
+  }
+
+  return rows.map((r) => ({
+    client_id: r.id as string,
+    client_name: r.client_name as string,
+    owner_principal: r.owner_principal as string,
+    allowed_agent_ids: (r.allowed_agent_ids as string[]) ?? [],
+    revoked: r.revoked as boolean,
+    created_at:
+      r.created_at instanceof Date
+        ? r.created_at.toISOString()
+        : (r.created_at as string),
+    connected: connectedClientIds.has(r.id as string),
+  }));
+}
+
+export interface RevokeClientResult {
+  client_id: string;
+  client_name: string;
+  revoked: boolean;
+  /** Number of live WebSocket connections closed as part of this revoke. */
+  closed_connections: number;
+}
+
+// Resolve a CLI argument (either a UUID `client_id` or a `client_name`) to a
+// unique client row owned by `principalId`. Returns 404 when nothing matches
+// and a distinct 409 when a name is ambiguous, so the CLI can tell the user
+// to retry with the id.
+async function resolveClient(
+  db: Sql,
+  principalId: string,
+  target: string,
+): Promise<{ id: string; client_name: string }> {
+  // Try id-match first — if `target` is a valid id and resolves to a row,
+  // we're done. If it doesn't, fall through to name lookup. We deliberately
+  // do NOT pre-filter on UUID shape: ids are TEXT in this schema (the table
+  // happens to default-generate UUIDs, but the column is `TEXT PRIMARY KEY`),
+  // so any string can in principle be an id.
+  const byId = await db.begin(async (tx) => {
+    await setRlsContext(tx, principalId);
+    return tx`SELECT id, client_name FROM clients WHERE id = ${target}`;
+  });
+  if (byId.length === 1) {
+    return { id: byId[0].id as string, client_name: byId[0].client_name as string };
+  }
+
+  const byName = await db.begin(async (tx) => {
+    await setRlsContext(tx, principalId);
+    return tx`SELECT id, client_name FROM clients WHERE client_name = ${target}`;
+  });
+  if (byName.length === 0) {
+    throw new AdminApiError(`No client found matching "${target}".`, 404);
+  }
+  if (byName.length > 1) {
+    const ids = byName.map((r) => r.id as string).join(', ');
+    throw new AdminApiError(
+      `Ambiguous client name "${target}" matches multiple clients (${ids}). ` +
+        'Specify client_id instead.',
+      409,
+    );
+  }
+  return { id: byName[0].id as string, client_name: byName[0].client_name as string };
+}
+
+export async function revokeClientForOwner(
+  db: Sql,
+  registry: Registry,
+  principalId: string,
+  target: string,
+): Promise<RevokeClientResult> {
+  const resolved = await resolveClient(db, principalId, target);
+
+  await db.begin(async (tx) => {
+    await setRlsContext(tx, principalId);
+    // revoke_client() is SECURITY INVOKER and re-checks RLS; resolveClient()
+    // already verified the row is visible to this principal so the UPDATE
+    // inside will succeed (or NOT FOUND if a concurrent delete happened, in
+    // which case the function raises — we let that propagate as 500 because
+    // it's a genuinely unexpected race, not a user-facing error condition).
+    await tx`SELECT revoke_client(${resolved.id})`;
+  });
+
+  // Close every live WebSocket session bound to this client. The daemon
+  // sees close code 4014 and exits without reconnecting (see client.ts).
+  const closedConnections = registry.disconnectClient(resolved.id);
+
+  return {
+    client_id: resolved.id,
+    client_name: resolved.client_name,
+    revoked: true,
+    closed_connections: closedConnections,
+  };
+}

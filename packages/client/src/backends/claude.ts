@@ -24,6 +24,8 @@ import {
   INPUT_IMAGE_MIME,
   type FetchUriPolicy,
 } from './fetch-uri-file.js';
+import { createLogger } from '../logger.js';
+import { createTimingRecorder } from './timing.js';
 
 // Slim subset of ChildProcess that the backend actually uses. Tests inject a
 // fake that satisfies this without wiring up a real OS process.
@@ -806,6 +808,7 @@ export function createClaudeBackend(
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const setIntervalImpl = opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
   const clearIntervalImpl = opts.clearIntervalFn ?? ((h) => clearInterval(h as ReturnType<typeof setInterval>));
+  const timingLogger = createLogger();
   const sendFileMcpOpts =
     opts.sendFileMcp && opts.sendFileMcp.allowedRoots.length > 0
       ? opts.sendFileMcp
@@ -917,9 +920,29 @@ export function createClaudeBackend(
       // site below for the rationale; the two comments must stay
       // consistent.
       let lastEmitAt = now();
+      const recorder = createTimingRecorder({
+        logger: timingLogger,
+        backend: 'claude',
+        taskId: task.taskId,
+        contextId: task.contextId,
+        now,
+      });
+      // Terminal frame types trigger the single per-task timing log line.
+      // The mark fires BEFORE rawEmit so the emit-side cost is captured,
+      // and finish fires AFTER so the line follows the lifecycle log.
       const emit: typeof rawEmit = (frame) => {
         lastEmitAt = now();
+        const terminal = frame.type === 'task.complete' || frame.type === 'task.fail';
+        if (terminal) recorder.mark('emit');
         rawEmit(frame);
+        if (terminal) {
+          const state =
+            frame.type === 'task.fail'
+              ? 'failed'
+              : frame.status?.state ?? 'completed';
+          const code = frame.type === 'task.fail' ? frame.error?.code : undefined;
+          recorder.finish({ state, code });
+        }
       };
 
       if (signal.aborted) {
@@ -939,6 +962,7 @@ export function createClaudeBackend(
       const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
 
       const mapped = await mapPartsToContentBlocks(task.message.parts, opts.fetchUriPolicy, signal);
+      recorder.mark('map');
       if (mapped.ok && openaiCompat?.tool_call_history) {
         // Spec contract: bridges MUST replay the entire `tool_call_history`
         // in order. We render it as a text block and prepend it to the user
@@ -990,6 +1014,7 @@ export function createClaudeBackend(
             `[claude] send_file MCP server failed to start; tool path disabled for this task: ${errorMessage(err)}`,
           );
         }
+        recorder.mark('mcp');
       }
 
       // Per-task `--append-system-prompt` carrying the openai-compat
@@ -1055,6 +1080,7 @@ export function createClaudeBackend(
       let child: ClaudeChildHandle;
       try {
         child = spawnFn(command, args, { cwd });
+        recorder.mark('spawn');
       } catch (err) {
         rollbackFreshSession();
         emit({
@@ -1105,6 +1131,7 @@ export function createClaudeBackend(
           message: { role: 'user', content: mapped.blocks },
         });
         child.stdin.end(envelope + '\n');
+        recorder.mark('stdin');
       } catch (err) {
         stdinError = err;
       }
@@ -1227,6 +1254,7 @@ export function createClaudeBackend(
         if (settled) return;
         if (evt.type === 'assistant') {
           if (evt.message?.role !== 'assistant') return;
+          recorder.mark('firstAssistant');
           // A single assistant turn can interleave plain text and tool_use
           // blocks. Emit the text (if any) first so observers see "what the
           // model said" before "what tools it then called", matching the
@@ -1294,6 +1322,7 @@ export function createClaudeBackend(
 
       let stdoutBuf = '';
       child.stdout?.on('data', (chunk: Buffer | string) => {
+        recorder.mark('firstOut');
         stdoutBuf += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
         let nl: number;
         while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
@@ -1350,6 +1379,7 @@ export function createClaudeBackend(
         child.on('error', (err) => resolve({ code: null, signal: null, error: err }));
         child.on('close', (code, sig) => resolve({ code, signal: sig }));
       });
+      recorder.mark('closed');
 
       signal.removeEventListener('abort', onAbort);
       settled = true;

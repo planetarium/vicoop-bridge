@@ -27,11 +27,25 @@ test('login saves owner-session bearer without registering a client', async (t) 
   const calls: Array<{ url: string; body: string }> = [];
   t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
 
+  // Pin `resolveConfigDir()` to `${tmpHome}/.vicoop` regardless of host env
+  // by setting `VICOOP_HOME` directly (its precedence is "explicit override
+  // wins"). Without this, a CI runner with `XDG_CONFIG_HOME` already exported
+  // would route the owner-session write to `$XDG_CONFIG_HOME/vicoop/...`
+  // instead of `${tmpHome}/.vicoop/...`, and the later `readFileSync`
+  // assertion would `ENOENT`. Restore every touched env on teardown.
   const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  const previousXdg = process.env.XDG_CONFIG_HOME;
   process.env.HOME = tmpHome;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  delete process.env.XDG_CONFIG_HOME;
   t.after(() => {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+    if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousXdg;
   });
 
   const originalFetch = globalThis.fetch;

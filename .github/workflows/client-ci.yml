@@ -1,21 +1,19 @@
-name: Server CI
+name: Client CI
 
 on:
   pull_request:
     paths:
-      - '.github/workflows/server-ci.yml'
-      - 'packages/server/**'
+      - '.github/workflows/client-ci.yml'
+      - 'packages/client/**'
       - 'packages/protocol/**'
-      - 'packages/admin-ui/**'
       - 'pnpm-lock.yaml'
       - 'package.json'
   push:
     branches: [main]
     paths:
-      - '.github/workflows/server-ci.yml'
-      - 'packages/server/**'
+      - '.github/workflows/client-ci.yml'
+      - 'packages/client/**'
       - 'packages/protocol/**'
-      - 'packages/admin-ui/**'
       - 'pnpm-lock.yaml'
       - 'package.json'
 
@@ -44,15 +42,11 @@ jobs:
       - name: Build protocol
         run: pnpm --filter @vicoop-bridge/protocol build
 
-      - name: Typecheck server
-        run: pnpm --filter @vicoop-bridge/server typecheck
+      - name: Typecheck client
+        run: pnpm --filter @vicoop-bridge/client typecheck
 
-      - name: Test server
-        run: pnpm --filter @vicoop-bridge/server test
+      - name: Test client
+        run: pnpm --filter @vicoop-bridge/client test
 
-      - name: Build server
-        run: pnpm --filter @vicoop-bridge/server build
-
-      - name: Smoke test A2X SDK import
-        working-directory: packages/server
-        run: node --input-type=module -e "await import('@a2x/sdk'); console.log('a2x-sdk-import-ok')"
+      - name: Build client
+        run: pnpm --filter @vicoop-bridge/client build

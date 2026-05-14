@@ -6,6 +6,11 @@ import { echoBackend } from './backends/echo.js';
 import { createOpenclawBackend } from './backends/openclaw.js';
 import { createClaudeBackend } from './backends/claude.js';
 import { createCodexBackend, type CodexSandboxMode } from './backends/codex.js';
+import {
+  createCodexAppServerBackend,
+  type ApprovalDecision,
+  type CodexAppServerSandboxMode,
+} from './backends/codex-app-server.js';
 import type { Backend } from './backend.js';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
@@ -15,7 +20,9 @@ import {
   runAddCaller,
   runListAgents,
   runListCallers,
+  runListClients,
   runRemoveCaller,
+  runRevokeClient,
 } from './admin-cli.js';
 import { runWhoami } from './whoami.js';
 import { deriveIdentity } from './identity.js';
@@ -30,7 +37,7 @@ import { mergeClientArgs, parseFlags, type DaemonArgs as Args } from './cli-args
 const DAEMON_USAGE =
   'vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude|codex> [--card <path>] [--config <path>]';
 const SUBCOMMAND_LIST =
-  'subcommands: login, setup, upgrade, list-agents, list-callers, add-caller, remove-caller, whoami (run any with --help)';
+  'subcommands: login, setup, upgrade, list-agents, list-callers, add-caller, remove-caller, list-clients, revoke-client, whoami (run any with --help)';
 const CODEX_SANDBOX_MODES = new Set<CodexSandboxMode>([
   'read-only',
   'workspace-write',
@@ -231,8 +238,31 @@ function pickBackend(name: string, args: Args): Backend {
           ),
         extraArgs: backends.codex?.extra_args,
       });
+    case 'codex-app-server': {
+      const cas = backends['codex-app-server'];
+      // Reuses the `codex` sandbox-mode parser since the enum is identical
+      // (the SandboxMode type re-exported from codex-app-server.ts is the
+      // same string union). Env-var precedence mirrors the `codex` case
+      // so operators can share a single `CODEX_SANDBOX_MODE` / `CODEX_CWD`
+      // across both backends and swap by changing only `--backend`.
+      return createCodexAppServerBackend({
+        cwd:
+          process.env.CODEX_CWD?.trim() ||
+          cas?.cwd ||
+          undefined,
+        sandboxMode:
+          (parseCodexSandboxMode(process.env.CODEX_SANDBOX_MODE) as CodexAppServerSandboxMode | undefined) ??
+          (parseCodexSandboxMode(
+            cas?.sandbox_mode,
+            'backends.codex-app-server.sandbox_mode (config.json)',
+          ) as CodexAppServerSandboxMode | undefined),
+        approvalDecision: cas?.approval_decision as ApprovalDecision | undefined,
+      });
+    }
     default:
-      throw new Error(`unknown backend: ${name} (supported: echo, openclaw, claude, codex)`);
+      throw new Error(
+        `unknown backend: ${name} (supported: echo, openclaw, claude, codex, codex-app-server)`,
+      );
   }
 }
 
@@ -249,6 +279,13 @@ function runClient(argv: string[]): void {
     agentCard,
     backendKind: args.backend,
     backend: pickBackend(args.backend, args),
+    // Daemon entrypoint: a fatal terminal close (currently 4014 "client
+    // revoked") should drop the process with a non-zero exit so
+    // systemd / a parent supervisor sees the revocation as a hard
+    // failure instead of masking it as a transient disconnect. The
+    // Client class deliberately does not call process.exit itself —
+    // tests and future in-process embedders pass a non-exiting callback.
+    onFatal: () => process.exit(1),
   });
 
   client.start();
@@ -340,6 +377,14 @@ async function main(): Promise<void> {
 
   if (argv[0] === 'list-agents') {
     process.exit(await runListAgents(argv.slice(1)));
+  }
+
+  if (argv[0] === 'list-clients') {
+    process.exit(await runListClients(argv.slice(1)));
+  }
+
+  if (argv[0] === 'revoke-client') {
+    process.exit(await runRevokeClient(argv.slice(1)));
   }
 
   if (argv[0] === 'whoami') {

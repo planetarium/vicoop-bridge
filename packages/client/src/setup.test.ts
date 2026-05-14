@@ -305,15 +305,30 @@ test('setup prompts for login when no owner-session is available', async (t) => 
   const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-no-auth-'));
   t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
 
+  // Pin `resolveConfigDir()` to a known empty tmpdir via VICOOP_HOME so the
+  // "no owner-session on disk" path is exercised even on CI hosts that have
+  // an exported `XDG_CONFIG_HOME` (Linux runners). Without this, the resolver
+  // would route loadOwnerSession() at a populated XDG dir and skip the
+  // login-prompt branch we're asserting on; the test would then fall through
+  // to a real device-flow `fetch`, fail the network call, and surface
+  // "fetch failed" on stderr instead of the prompt.
   const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  const previousXdg = process.env.XDG_CONFIG_HOME;
   const previousToken = process.env.VICOOP_OWNER_TOKEN;
   const previousBridge = process.env.VICOOP_BRIDGE;
   process.env.HOME = tmpHome;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  delete process.env.XDG_CONFIG_HOME;
   delete process.env.VICOOP_OWNER_TOKEN;
   delete process.env.VICOOP_BRIDGE;
   t.after(() => {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+    if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousXdg;
     if (previousToken === undefined) delete process.env.VICOOP_OWNER_TOKEN;
     else process.env.VICOOP_OWNER_TOKEN = previousToken;
     if (previousBridge === undefined) delete process.env.VICOOP_BRIDGE;
