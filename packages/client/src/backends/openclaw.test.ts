@@ -42,6 +42,7 @@ import {
   parseLsofListeningPorts,
   redactUrl,
 } from './openclaw.js';
+import type { OpenAICompatHistoryEntry } from './claude.js';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
   type TaskAssignFrame,
@@ -2840,6 +2841,21 @@ const OAI_SAMPLE_TOOLS = [
   },
 ];
 
+const OAI_SAMPLE_HISTORY: OpenAICompatHistoryEntry[] = [
+  {
+    role: 'assistant',
+    tool_calls: [
+      { id: 'call_abc', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
+    ],
+  },
+  {
+    role: 'tool',
+    tool_call_id: 'call_abc',
+    name: 'get_weather',
+    content: '{"temp":15,"cond":"sunny"}',
+  },
+];
+
 function makeOpenAICompatTask(
   taskId: string,
   text: string,
@@ -2877,6 +2893,24 @@ test('composeOpenAICompatUserMessage: wraps system_instructions + user_message w
   assert.match(out, /<\/system_instructions>\n\n<user_message>/);
   // User content sits inside user_message verbatim, no extra wrapping.
   assert.match(out, /<user_message>\nwhat is the weather\?\n<\/user_message>$/);
+});
+
+test('composeOpenAICompatUserMessage: history-only payload omits system_instructions but still wraps user content + history', () => {
+  // No tools / no system / no tool_choice → buildOpenAICompatSystemPrompt
+  // returns "". We MUST NOT emit an empty <system_instructions></system_instructions>
+  // shell (the block-presence-vs-absence signal is part of the contract).
+  const out = composeOpenAICompatUserMessage(
+    { tool_call_history: OAI_SAMPLE_HISTORY },
+    'continue, please',
+  );
+  assert.doesNotMatch(out, /<system_instructions>/);
+  // History block is still injected — spec contract requires per-turn replay.
+  assert.match(out, /^<tool_call_history>\n/);
+  assert.match(out, /"role": "assistant"/);
+  assert.match(out, /"tool_call_id": "call_abc"/);
+  assert.match(out, /\n<\/tool_call_history>\n\n<user_message>/);
+  // User content follows.
+  assert.match(out, /<user_message>\ncontinue, please\n<\/user_message>$/);
 });
 
 test('composeOpenAICompatUserMessage: tool_choice="none" suppresses envelope contract but keeps no-envelope directive', () => {
@@ -3175,5 +3209,50 @@ test('extension on but model answered in prose → text artifact, no extension t
   }
 });
 
+test('multi-turn: tool_call_history block is prepended to chat.send.message on follow-up turn', async () => {
+  let sentMessage: string | null = null;
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        sentMessage = (req.params as { message: string }).message;
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId: 'r-mt', status: 'started' } }),
+        );
+        setImmediate(() => {
+          fake.emitChat(sock, {
+            runId: 'r-mt',
+            sessionKey: 'agent:main:ctx-t-mt',
+            seq: 1,
+            state: 'final',
+            message: { text: '7°C and clear in Seoul.' },
+          });
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    await backend.handle(
+      makeOpenAICompatTask('t-mt', 'natural language please', {
+        tools: OAI_SAMPLE_TOOLS,
+        tool_call_history: OAI_SAMPLE_HISTORY,
+      }),
+      () => {},
+      NEVER,
+    );
+    assert.ok(sentMessage);
+    // System instructions block precedes the history block.
+    assert.match(sentMessage!, /^<system_instructions>/);
+    // History block is present, in order, between system_instructions and user_message.
+    assert.match(sentMessage!, /<\/system_instructions>\n\n<tool_call_history>\n/);
+    assert.match(sentMessage!, /"role": "assistant"/);
+    assert.match(sentMessage!, /"tool_call_id": "call_abc"/);
+    assert.match(sentMessage!, /\n<\/tool_call_history>\n\n<user_message>/);
+    // User content closes the message.
+    assert.match(sentMessage!, /<user_message>\nnatural language please\n<\/user_message>$/);
+  } finally {
+    await fake.close();
+  }
+});
 
 export { createFakeGateway, makeTask };

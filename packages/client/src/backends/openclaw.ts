@@ -7,6 +7,7 @@ import { OPENAI_COMPAT_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol'
 import type { Backend } from '../backend.js';
 import {
   buildOpenAICompatSystemPrompt,
+  formatToolCallHistory,
   parseOpenAICompatMetadata,
   tryParseToolCallsEnvelope,
   type OpenAICompatMetadata,
@@ -522,6 +523,9 @@ export function composeOpenAICompatUserMessage(
   const sys = buildOpenAICompatSystemPrompt(meta);
   if (sys) {
     blocks.push(`<system_instructions>\n${sys}\n</system_instructions>`);
+  }
+  if (meta.tool_call_history) {
+    blocks.push(formatToolCallHistory(meta.tool_call_history));
   }
   blocks.push(`<user_message>\n${userText}\n</user_message>`);
   return blocks.join('\n\n');
