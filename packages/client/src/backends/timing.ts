@@ -20,6 +20,10 @@ export interface TimingRecorder {
 // (grep / awk / cut). `mark()` is idempotent per name — only the first
 // arrival is recorded, which is the meaningful one for one-shot
 // milestones like first-stdout-byte.
+//
+// Emitted at `debug` so the default `info` level does not gain a
+// per-task log line in production; operators opt in via
+// `VICOOP_CLIENT_LOG_LEVEL=debug` when investigating overhead.
 export function createTimingRecorder(opts: TimingRecorderOptions): TimingRecorder {
   const now = opts.now ?? Date.now;
   const t0 = now();
@@ -51,7 +55,7 @@ export function createTimingRecorder(opts: TimingRecorderOptions): TimingRecorde
         const raw = typeof v === 'string' ? safeToken(v) : String(v);
         fields.push(`${k}=${raw}`);
       }
-      opts.logger.info(`timing ${fields.join(' ')}`);
+      opts.logger.debug(`timing ${fields.join(' ')}`);
     },
   };
 }
