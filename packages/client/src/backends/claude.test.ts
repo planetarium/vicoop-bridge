@@ -2273,3 +2273,161 @@ test('multi-turn: absent tool_call_history leaves the user content untouched', a
   assert.equal(envelope.message.content.length, 1);
   assert.equal(envelope.message.content[0].text, 'what is the weather in Seoul?');
 });
+
+// ---------------------------------------------------------------------------
+// openai-compat/v1 response-side `usage` forwarding
+//
+// Claude Code's terminal `result` event carries a `modelUsage` object keyed
+// by model id; we sum across entries to capture internal sub-model
+// invocations (e.g. haiku for summarisation) that the top-level `result.usage`
+// omits. The summed counts are forwarded under
+// `Task.status.message.metadata[<openai-compat URI>].usage` so the gateway
+// can hand authoritative numbers to OpenAI clients.
+// ---------------------------------------------------------------------------
+
+function completionMessageMetadata(frames: readonly UpFrame[]): Record<string, unknown> | undefined {
+  const complete = frames.find((f) => f.type === 'task.complete');
+  if (complete?.type !== 'task.complete') return undefined;
+  return complete.status.message?.metadata;
+}
+
+test('result.modelUsage is summed across models and forwarded as openai-compat usage', async () => {
+  // Real shape observed on claude-code 2.1.141 (per the spike): a single
+  // turn routes through the primary opus model AND an internal haiku call.
+  // Native fields per the openai-compat/v1 mapping table:
+  //   input_tokens          → component of prompt_tokens
+  //   cache_creation_input  → component of prompt_tokens
+  //   cache_read_input      → component of prompt_tokens AND mirrored to cached_tokens
+  //   output_tokens         → completion_tokens
+  const modelUsage = {
+    'claude-haiku-4-5-20251001': {
+      inputTokens: 348,
+      outputTokens: 13,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+    },
+    'claude-opus-4-7[1m]': {
+      inputTokens: 6,
+      outputTokens: 8,
+      cacheReadInputTokens: 18029,
+      cacheCreationInputTokens: 6904,
+    },
+  };
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: 'HELLO',
+        modelUsage,
+      }),
+    ],
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('hi'), emit, NEVER);
+
+  const metadata = completionMessageMetadata(frames);
+  assert.ok(metadata, 'task.complete message should carry metadata');
+  const payload = metadata[OPENAI_COMPAT_EXTENSION_URI] as { usage?: Record<string, unknown> };
+  assert.ok(payload?.usage, 'metadata should contain openai-compat usage');
+  // Σ_M (input + cacheCreate + cacheRead): (348+0+0) + (6+6904+18029) = 25287.
+  assert.equal(payload.usage.prompt_tokens, 25287);
+  // Σ_M output: 13 + 8 = 21.
+  assert.equal(payload.usage.completion_tokens, 21);
+  // MUST invariant.
+  assert.equal(payload.usage.total_tokens, 25287 + 21);
+  // cached_tokens mirrors Σ_M cacheRead (lossless): 0 + 18029.
+  assert.deepEqual(payload.usage.prompt_tokens_details, { cached_tokens: 18029 });
+  // `model` reports the entry with the largest output share — opus had 8 vs
+  // haiku's 13, so haiku wins by raw output_tokens count. The contract is
+  // "largest output", documenting that the field is telemetry only.
+  assert.equal(payload.usage.model, 'claude-haiku-4-5-20251001');
+});
+
+test('single-model modelUsage maps cleanly and advertises the extension', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: 'ok',
+        modelUsage: {
+          'claude-opus-4-7[1m]': {
+            inputTokens: 6,
+            outputTokens: 8,
+            cacheReadInputTokens: 24933,
+            cacheCreationInputTokens: 23,
+          },
+        },
+      }),
+    ],
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('hi'), emit, NEVER);
+
+  const complete = frames.find((f) => f.type === 'task.complete');
+  assert.ok(complete && complete.type === 'task.complete');
+  assert.deepEqual(complete.status.message?.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+  const payload = complete.status.message?.metadata?.[OPENAI_COMPAT_EXTENSION_URI] as {
+    usage?: Record<string, unknown>;
+  };
+  assert.equal(payload?.usage?.prompt_tokens, 6 + 24933 + 23);
+  assert.equal(payload?.usage?.completion_tokens, 8);
+  assert.equal(payload?.usage?.total_tokens, 6 + 24933 + 23 + 8);
+  assert.deepEqual(payload?.usage?.prompt_tokens_details, { cached_tokens: 24933 });
+  assert.equal(payload?.usage?.model, 'claude-opus-4-7[1m]');
+});
+
+test('absent modelUsage → no openai-compat metadata is attached', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('hi'), emit, NEVER);
+
+  const complete = frames.find((f) => f.type === 'task.complete');
+  assert.ok(complete && complete.type === 'task.complete');
+  assert.equal(complete.status.message?.metadata, undefined);
+  assert.equal(complete.status.message?.extensions, undefined);
+});
+
+test('zero cacheRead does not surface a cached_tokens breakdown', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: 'ok',
+        modelUsage: {
+          'claude-opus-4-7[1m]': {
+            inputTokens: 100,
+            outputTokens: 20,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          },
+        },
+      }),
+    ],
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('hi'), emit, NEVER);
+
+  const complete = frames.find((f) => f.type === 'task.complete');
+  assert.ok(complete && complete.type === 'task.complete');
+  const payload = complete.status.message?.metadata?.[OPENAI_COMPAT_EXTENSION_URI] as {
+    usage?: Record<string, unknown>;
+  };
+  // Omit prompt_tokens_details entirely when there's nothing meaningful to
+  // mirror — keeps the wire shape minimal.
+  assert.equal(payload?.usage?.prompt_tokens_details, undefined);
+});

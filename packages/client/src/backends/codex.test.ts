@@ -1276,3 +1276,112 @@ test('tool_choice="none" writes a no-envelope directive to the instructions file
   assert.doesNotMatch(body, /"tool_calls":\[\{"id":"call_<unique>"/);
   assert.match(body, /tool_choice="none"/);
 });
+
+// ---------------------------------------------------------------------------
+// openai-compat/v1 response-side `usage` forwarding
+//
+// Codex 0.130+ emits a flat `usage` object on the terminal `turn.completed`
+// event. We forward it verbatim as the openai-compat/v1 `usage` payload on
+// the final A2A message metadata so the gateway can hand authoritative token
+// counts to OpenAI clients instead of falling back to a local estimate.
+// ---------------------------------------------------------------------------
+
+function completionMessageMetadata(frames: readonly UpFrame[]): Record<string, unknown> | undefined {
+  const complete = frames.find((f) => f.type === 'task.complete');
+  if (complete?.type !== 'task.complete') return undefined;
+  return complete.status.message?.metadata;
+}
+
+test('turn.completed.usage is forwarded under openai-compat metadata on task.complete', async () => {
+  const fake = scriptedSpawn([
+    [
+      JSON.stringify({ type: 'thread.started', thread_id: 't' }),
+      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'HELLO' } }),
+      JSON.stringify({
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 13411,
+          cached_input_tokens: 7552,
+          output_tokens: 15,
+          reasoning_output_tokens: 7,
+        },
+      }),
+    ],
+  ]);
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('say hi'), emit, NEVER);
+
+  const metadata = completionMessageMetadata(frames);
+  assert.ok(metadata, 'task.complete message should carry metadata');
+  const payload = metadata[OPENAI_COMPAT_EXTENSION_URI] as { usage?: Record<string, unknown> };
+  assert.ok(payload?.usage, 'metadata should contain openai-compat usage');
+  // Required fields with MUST invariant on total.
+  assert.equal(payload.usage.prompt_tokens, 13411);
+  assert.equal(payload.usage.completion_tokens, 15);
+  assert.equal(payload.usage.total_tokens, 13411 + 15);
+  // Cached and reasoning ride along as the OpenAI-shaped breakdowns.
+  assert.deepEqual(payload.usage.prompt_tokens_details, { cached_tokens: 7552 });
+  assert.deepEqual(payload.usage.completion_tokens_details, { reasoning_tokens: 7 });
+});
+
+test('task.complete message advertises openai-compat extension when usage is attached', async () => {
+  const fake = scriptedSpawn([
+    [
+      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } }),
+      JSON.stringify({
+        type: 'turn.completed',
+        usage: { input_tokens: 100, output_tokens: 20 },
+      }),
+    ],
+  ]);
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('go'), emit, NEVER);
+
+  const complete = frames.find((f) => f.type === 'task.complete');
+  assert.ok(complete && complete.type === 'task.complete');
+  assert.deepEqual(complete.status.message?.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+});
+
+test('absent turn.completed.usage → no openai-compat metadata is attached', async () => {
+  const fake = scriptedSpawn([
+    [
+      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } }),
+      // No turn.completed (or one without usage) — gateway falls back to its
+      // own estimate per spec.
+    ],
+  ]);
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('go'), emit, NEVER);
+
+  const complete = frames.find((f) => f.type === 'task.complete');
+  assert.ok(complete && complete.type === 'task.complete');
+  // Message is still emitted (it carries the visible reply text) but bears
+  // no metadata key for the openai-compat extension.
+  assert.equal(complete.status.message?.metadata, undefined);
+  assert.equal(complete.status.message?.extensions, undefined);
+});
+
+test('malformed turn.completed.usage is dropped silently (best-effort)', async () => {
+  const fake = scriptedSpawn([
+    [
+      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } }),
+      JSON.stringify({
+        type: 'turn.completed',
+        // Negative output_tokens is not a valid count — best-effort policy
+        // is to omit rather than forward a shape that breaks consumer
+        // accounting.
+        usage: { input_tokens: 10, output_tokens: -1 },
+      }),
+    ],
+  ]);
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('go'), emit, NEVER);
+
+  const complete = frames.find((f) => f.type === 'task.complete');
+  assert.ok(complete && complete.type === 'task.complete');
+  assert.equal(complete.status.message?.metadata, undefined);
+});

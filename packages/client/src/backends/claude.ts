@@ -8,6 +8,11 @@ import {
 import type { Backend } from '../backend.js';
 import { formatAcct, formatMention, type AgentIdentity } from '../identity.js';
 import {
+  buildOpenAICompatUsage,
+  makeOpenAICompatUsageMetadata,
+  type OpenAICompatUsage,
+} from './openai-compat-usage.js';
+import {
   startSendFileMcpServer,
   type SendFileMcpOptions,
   type SendFileMcpServer,
@@ -153,6 +158,59 @@ interface StreamEvent {
     content?: unknown;
   };
   result?: unknown;
+  // Present on the terminal `result` event. `modelUsage` is the per-model
+  // breakdown — preferred over the top-level `usage` because Claude Code
+  // can route through internal sub-models (e.g. haiku for summarisation)
+  // whose tokens never appear in `usage` but do appear here. Summing across
+  // all entries honours the openai-compat/v1 spec's "every model invocation
+  // that contributed to producing this response" requirement.
+  modelUsage?: unknown;
+}
+
+// Parse Claude Code's `result.modelUsage` (a map keyed by model id with
+// per-model { inputTokens, outputTokens, cacheCreationInputTokens,
+// cacheReadInputTokens, ... }) into a spec-compliant OpenAICompatUsage.
+//
+// Mapping rule per the native-fields appendix
+// (extensions/openai-compat/v1#native-field-mappings):
+//   prompt_tokens = Σ_M (inputTokens + cacheCreationInputTokens + cacheReadInputTokens)
+//   prompt_tokens_details.cached_tokens = Σ_M cacheReadInputTokens  (lossless mirror)
+//   completion_tokens = Σ_M outputTokens
+// `model` is reported as the entry with the largest output share — usually
+// the user-facing primary model; ties go to whichever Object.entries returns
+// first, which is fine for telemetry.
+export function parseClaudeModelUsageForOpenAICompat(raw: unknown): OpenAICompatUsage | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  let promptSum = 0;
+  let completionSum = 0;
+  let cacheReadSum = 0;
+  let primaryModel: string | null = null;
+  let primaryOutput = -1;
+  let saw = false;
+  for (const [modelKey, perModel] of Object.entries(raw as Record<string, unknown>)) {
+    if (!perModel || typeof perModel !== 'object' || Array.isArray(perModel)) continue;
+    const m = perModel as Record<string, unknown>;
+    const input = typeof m.inputTokens === 'number' ? m.inputTokens : 0;
+    const output = typeof m.outputTokens === 'number' ? m.outputTokens : 0;
+    const cacheCreate =
+      typeof m.cacheCreationInputTokens === 'number' ? m.cacheCreationInputTokens : 0;
+    const cacheRead = typeof m.cacheReadInputTokens === 'number' ? m.cacheReadInputTokens : 0;
+    promptSum += input + cacheCreate + cacheRead;
+    completionSum += output;
+    cacheReadSum += cacheRead;
+    if (output > primaryOutput) {
+      primaryOutput = output;
+      primaryModel = modelKey;
+    }
+    saw = true;
+  }
+  if (!saw) return null;
+  return buildOpenAICompatUsage({
+    prompt_tokens: promptSum,
+    completion_tokens: completionSum,
+    cached_tokens: cacheReadSum > 0 ? cacheReadSum : undefined,
+    model: primaryModel ?? undefined,
+  });
 }
 
 // Anthropic-shaped content block we send on stdin.
@@ -1053,6 +1111,7 @@ export function createClaudeBackend(
 
       let emittedAnyArtifact = false;
       let finalText: string | null = null;
+      let finalUsage: OpenAICompatUsage | null = null;
       let stderrTail = '';
       let aborted = false;
       let settled = false;
@@ -1212,6 +1271,12 @@ export function createClaudeBackend(
         }
         if (evt.type === 'result') {
           if (typeof evt.result === 'string') finalText = evt.result;
+          // openai-compat/v1 response-side usage: prefer modelUsage over the
+          // top-level `usage` (latter omits internal sub-model invocations).
+          // Best-effort: a malformed shape just leaves finalUsage null and
+          // the gateway falls back to its own estimate.
+          const parsed = parseClaudeModelUsageForOpenAICompat(evt.modelUsage);
+          if (parsed) finalUsage = parsed;
         }
       };
 
@@ -1362,18 +1427,33 @@ export function createClaudeBackend(
         });
       }
 
+      // Attach the openai-compat/v1 `usage` payload to the final A2A
+      // message of this turn when the underlying claude run reported it.
+      // Per spec the carrier is `Task.status.message.metadata[<URI>].usage`,
+      // so when usage is present but there is no completion text we still
+      // emit a message frame (with empty parts) to carry the metadata.
+      const hasMessage = completeText.length > 0 || finalUsage !== null;
+      const messageMetadata = finalUsage
+        ? makeOpenAICompatUsageMetadata(finalUsage)
+        : undefined;
       emit({
         type: 'task.complete',
         taskId: task.taskId,
         status: {
           state: 'completed',
           timestamp: new Date().toISOString(),
-          ...(completeText
+          ...(hasMessage
             ? {
                 message: {
                   role: 'agent' as const,
                   messageId: randomUUID(),
                   parts,
+                  ...(messageMetadata
+                    ? {
+                        metadata: messageMetadata,
+                        extensions: [OPENAI_COMPAT_EXTENSION_URI],
+                      }
+                    : {}),
                 },
               }
             : {}),

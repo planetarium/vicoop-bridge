@@ -15,6 +15,11 @@ import {
   parseOpenAICompatMetadata,
   tryParseToolCallsEnvelope,
 } from './claude.js';
+import {
+  buildOpenAICompatUsage,
+  makeOpenAICompatUsageMetadata,
+  type OpenAICompatUsage,
+} from './openai-compat-usage.js';
 import { createLogger, escapeLineSeparators, safeToken, type Logger } from '../logger.js';
 import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME } from './fetch-uri-file.js';
 
@@ -84,6 +89,42 @@ interface CodexEvent {
     exit_code?: unknown;
     status?: unknown;
   };
+  // Present on the terminal `turn.completed` event. Codex 0.130+ emits a
+  // flat usage object that maps 1:1 to the openai-compat/v1 response shape.
+  usage?: unknown;
+}
+
+// Parse Codex `turn.completed.usage` into a spec-compliant OpenAICompatUsage.
+//
+// Native shape (codex-cli 0.130+):
+//   { input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens }
+//
+// Mapping per the openai-compat/v1 native-fields appendix:
+//   prompt_tokens                              = input_tokens
+//                                                (cached_input_tokens is ALREADY
+//                                                 included in input_tokens; do not
+//                                                 add again)
+//   prompt_tokens_details.cached_tokens        = cached_input_tokens
+//   completion_tokens                          = output_tokens
+//                                                (reasoning_output_tokens is a
+//                                                 breakdown of output_tokens, not
+//                                                 additive)
+//   completion_tokens_details.reasoning_tokens = reasoning_output_tokens
+export function parseCodexTurnUsageForOpenAICompat(raw: unknown): OpenAICompatUsage | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const u = raw as Record<string, unknown>;
+  const input = typeof u.input_tokens === 'number' ? u.input_tokens : null;
+  const output = typeof u.output_tokens === 'number' ? u.output_tokens : null;
+  if (input === null || output === null) return null;
+  const cached = typeof u.cached_input_tokens === 'number' ? u.cached_input_tokens : undefined;
+  const reasoning =
+    typeof u.reasoning_output_tokens === 'number' ? u.reasoning_output_tokens : undefined;
+  return buildOpenAICompatUsage({
+    prompt_tokens: input,
+    completion_tokens: output,
+    cached_tokens: cached,
+    reasoning_tokens: reasoning,
+  });
 }
 
 type MappedInput =
@@ -518,6 +559,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
 
         let emittedAnyArtifact = false;
         let finalText: string | null = null;
+        let finalUsage: OpenAICompatUsage | null = null;
         let stderrTail = '';
         let aborted = false;
         let settled = false;
@@ -595,6 +637,14 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
           if (settled) return;
           if (evt.type === 'thread.started' && typeof evt.thread_id === 'string') {
             maybeStoreThread(evt.thread_id);
+            return;
+          }
+          if (evt.type === 'turn.completed') {
+            // openai-compat/v1 response-side usage. Best-effort: a malformed
+            // shape leaves finalUsage null and the gateway falls back to its
+            // own estimate.
+            const parsed = parseCodexTurnUsageForOpenAICompat(evt.usage);
+            if (parsed) finalUsage = parsed;
             return;
           }
           if (evt.type !== 'item.completed' || !evt.item) return;
@@ -750,18 +800,32 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
           });
         }
 
+        // Attach the openai-compat/v1 `usage` payload to the final A2A
+        // message of this turn when codex reported it on `turn.completed`.
+        // When usage is present but there are no parts we still emit the
+        // message frame (with empty parts) to carry the metadata.
+        const hasMessage = parts.length > 0 || finalUsage !== null;
+        const messageMetadata = finalUsage
+          ? makeOpenAICompatUsageMetadata(finalUsage)
+          : undefined;
         emit({
           type: 'task.complete',
           taskId: task.taskId,
           status: {
             state: 'completed',
             timestamp: new Date().toISOString(),
-            ...(parts.length
+            ...(hasMessage
               ? {
                   message: {
                     role: 'agent',
                     messageId: randomUUID(),
                     parts,
+                    ...(messageMetadata
+                      ? {
+                          metadata: messageMetadata,
+                          extensions: [OPENAI_COMPAT_EXTENSION_URI],
+                        }
+                      : {}),
                   },
                 }
               : {}),
