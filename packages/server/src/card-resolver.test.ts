@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { HelloFrame } from '@vicoop-bridge/protocol';
+import {
+  OPENAI_COMPAT_EXTENSION_URI,
+  type HelloFrame,
+} from '@vicoop-bridge/protocol';
 import { resolveHelloAgentCard } from './card-resolver.js';
 
 function frame(overrides: Partial<HelloFrame>): Pick<HelloFrame, 'agentCard' | 'backendKind'> {
@@ -72,3 +75,30 @@ test('rejects unknown backendKind when no inline card is provided', () => {
     backendKind: 'custom',
   });
 });
+
+// Pin the openai-compat advertisement on canonical cards: this is the
+// surface external A2A callers fetch via `/agents/<id>/.well-known/agent-card.json`
+// when an operator hasn't supplied an inline card override. The card-side
+// advertisement and the client-side metadata-honoring code were shipped in
+// PRs #152 / #159 / #161, but the original PRs touched only the
+// client-bundled `packages/client/cards/*.json` files; without these
+// canonical-card entries the URI silently disappears for every operator on
+// the default `setup` path (which doesn't pass `--card`).
+//
+// If a future card edit drops the URI, callers that rely on the card to
+// decide whether to send the openai-compat metadata payload will assume
+// the bridge can't honor it and silently fall back to text injection or
+// refuse the call. So pin it here.
+for (const kind of ['claude', 'codex', 'openclaw'] as const) {
+  test(`canonical ${kind} card advertises the openai-compat extension URI`, () => {
+    const result = resolveHelloAgentCard(frame({ backendKind: kind }));
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    const uris =
+      result.agentCard.capabilities?.extensions?.map((e) => e.uri) ?? [];
+    assert.ok(
+      uris.includes(OPENAI_COMPAT_EXTENSION_URI),
+      `expected canonical ${kind} card to advertise ${OPENAI_COMPAT_EXTENSION_URI}, got: ${JSON.stringify(uris)}`,
+    );
+  });
+}
