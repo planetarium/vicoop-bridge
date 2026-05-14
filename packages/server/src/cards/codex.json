@@ -10,6 +10,11 @@
         "uri": "https://github.com/a2aproject/a2a-samples/extensions/traceability/v1",
         "description": "Opt-in execution trace stream for Codex command executions.",
         "required": false
+      },
+      {
+        "uri": "https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1",
+        "description": "Honors OpenAI-style system/tools/tool_choice via message metadata; emulates tool calls by instructing the model to emit a {\"tool_calls\":[...]} JSON envelope, returned as an A2A data part.",
+        "required": false
       }
     ]
   },
