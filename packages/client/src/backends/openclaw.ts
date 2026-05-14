@@ -575,6 +575,39 @@ export interface OpenclawBackendOptions {
   url?: string;
   token?: string;
   agent?: string;
+  /**
+   * Optional secondary agent name to route tasks carrying the openai-compat
+   * extension metadata to, instead of the default `agent`. Intended for
+   * operators who want to dedicate a tools-disabled agent profile to
+   * envelope-contract requests so the host model isn't tempted to satisfy
+   * the question with its own native skills (Bash, browser, weather, etc.)
+   * — which is the main source of stochastic envelope-contract refusals.
+   *
+   * The operator pairs this with a matching `agents.list` entry in the
+   * OpenClaw gateway config:
+   *
+   *   {
+   *     "agents": {
+   *       "list": [
+   *         { "id": "main" },
+   *         { "id": "oai", "tools": { "profile": "minimal", "deny": ["*"] } }
+   *       ]
+   *     }
+   *   }
+   *
+   * Then sets `openaiCompatAgent: "oai"` here so tasks whose
+   * `Message.metadata` carries the openai-compat URI are routed through
+   * `agent:oai:<contextId>` sessionKeys instead of the default
+   * `agent:main:<contextId>`. Non-extension tasks still use the default
+   * agent's full toolset.
+   *
+   * Pilot measurement on `anthropic/claude-sonnet-4-6`: envelope-contract
+   * compliance rose from 5/10 (default `main` agent with full tools) to
+   * 10/10 (`oai` agent with tools disabled) on a tool-call-prone prompt.
+   *
+   * Leave undefined to disable the split — every task uses `agent`.
+   */
+  openaiCompatAgent?: string;
   thinking?: string;
   sessionKeyPrefix?: string;
   debug?: boolean;
@@ -858,6 +891,19 @@ export function createOpenclawBackend(
   const url = opts.url ?? process.env.OPENCLAW_GATEWAY_URL ?? 'ws://127.0.0.1:18789';
   const token = opts.token ?? process.env.OPENCLAW_GATEWAY_TOKEN;
   const agent = opts.agent ?? process.env.OPENCLAW_AGENT ?? 'main';
+  // Optional secondary agent name dedicated to openai-compat tasks. See the
+  // doc comment on `OpenclawBackendOptions.openaiCompatAgent` for the
+  // operator-side OpenClaw config (agents.list + tools.deny=["*"]) this
+  // pairs with. Trim + treat-empty-as-unset across env / opts so an
+  // install.sh-style env template with the key present-but-blank doesn't
+  // shadow a populated config.json. When unresolved, all tasks route to
+  // `agent`.
+  const openaiCompatAgentRaw =
+    opts.openaiCompatAgent ?? process.env.OPENCLAW_OAI_COMPAT_AGENT;
+  const openaiCompatAgent =
+    typeof openaiCompatAgentRaw === 'string' && openaiCompatAgentRaw.trim().length > 0
+      ? openaiCompatAgentRaw.trim()
+      : undefined;
   const thinking = opts.thinking ?? process.env.OPENCLAW_THINKING;
   const sessionPrefix = opts.sessionKeyPrefix ?? 'agent';
   const debug = opts.debug ?? process.env.OPENCLAW_DEBUG === '1';
@@ -1328,7 +1374,17 @@ export function createOpenclawBackend(
         });
         return;
       }
-      const sessionKey = `${sessionPrefix}:${agent}:${task.contextId}`;
+      // When the openai-compat extension is active on this task AND the
+      // operator has configured a secondary agent name for it, route via
+      // that agent's session-key namespace. That secondary agent is expected
+      // to have `tools.deny=["*"]` so the host model has no native tools,
+      // eliminating the system-vs-user-instruction conflict that
+      // significantly reduces envelope-contract compliance (see the doc
+      // comment on `OpenclawBackendOptions.openaiCompatAgent`). Tasks
+      // without the extension metadata always use the default `agent`,
+      // so this split is invisible to non-compat callers.
+      const effectiveAgent = openaiCompat && openaiCompatAgent ? openaiCompatAgent : agent;
+      const sessionKey = `${sessionPrefix}:${effectiveAgent}:${task.contextId}`;
       const { message: text, attachments } = mapped.input;
 
       emit({

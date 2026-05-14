@@ -8,7 +8,7 @@
     "extensions": [
       {
         "uri": "https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1",
-        "description": "Honors OpenAI-style system/tools/tool_choice via message metadata; emulates tool calls by instructing the model to emit a {\"tool_calls\":[...]} JSON envelope, returned as an A2A data part. Best-effort: contract is text-injected into user content because the OpenClaw `chat.send` wire has no system-prompt seam, so reliability depends on the gateway's host model honoring the embedded instructions (verified on anthropic claude-sonnet-4-6 in repeated probes; OSS-hosted gateways may require per-model measurement).",
+        "description": "Honors OpenAI-style system/tools/tool_choice via message metadata; emulates tool calls by instructing the model to emit a {\"tool_calls\":[...]} JSON envelope, returned as an A2A data part. Best-effort: contract is text-injected into user content because the OpenClaw `chat.send` wire has no system-prompt seam, so reliability depends on the gateway's host model honoring the embedded instructions. Pilot measurement on anthropic claude-sonnet-4-6 (N=10 per arm): with the host agent's native tools enabled, envelope compliance is ~50%; with a dedicated tools-disabled agent (gateway `agents.list[].tools.deny=[\"*\"]`) routed via `backends.openclaw.openai_compat_agent` / `OPENCLAW_OAI_COMPAT_AGENT`, compliance rose to 100%. The split is opt-in; operators who don't configure the secondary agent get the single-agent baseline behavior.",
         "required": false
       }
     ]

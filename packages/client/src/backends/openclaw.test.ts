@@ -3255,4 +3255,132 @@ test('multi-turn: tool_call_history block is prepended to chat.send.message on f
   }
 });
 
+test('openaiCompatAgent: chat.send.sessionKey routes openai-compat tasks to the configured secondary agent', async () => {
+  // Tasks WITH the extension metadata use `agent:oai:...`; tasks WITHOUT it
+  // keep using the default `agent:main:...`. The operator pairs this with
+  // an OpenClaw config that puts `tools.deny=["*"]` on the `oai` agent so
+  // the host model can't fall back to its own skills (Bash, browser,
+  // weather, etc.) and the envelope contract becomes deterministic.
+  const sentKeys: string[] = [];
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        const params = req.params as { sessionKey: string };
+        sentKeys.push(params.sessionKey);
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId: `run-${sentKeys.length}`, status: 'started' } }),
+        );
+        setImmediate(() => {
+          fake.emitChat(sock, {
+            runId: `run-${sentKeys.length}`,
+            sessionKey: params.sessionKey,
+            seq: 1,
+            state: 'final',
+            message: { text: 'ok' },
+          });
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url, openaiCompatAgent: 'oai' });
+    // Extension-bearing task → routed to `oai`.
+    await backend.handle(
+      makeOpenAICompatTask('t-route-oai', 'what is the weather?', { tools: OAI_SAMPLE_TOOLS }, 'ctx-route-oai'),
+      () => {},
+      NEVER,
+    );
+    // Plain task → keeps the default `main`.
+    await backend.handle(makeTask('t-route-main', 'hello'), () => {}, NEVER);
+
+    assert.equal(sentKeys.length, 2);
+    assert.equal(sentKeys[0], 'agent:oai:ctx-route-oai');
+    assert.equal(sentKeys[1], 'agent:main:ctx-t-route-main');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('openaiCompatAgent: when unset, openai-compat tasks still use the default agent name', async () => {
+  // Default behavior pre-#161 / when the operator hasn't opted into the
+  // split: every task — extension or not — goes to the single configured
+  // `agent`. Guards against the routing override leaking onto every
+  // operator who hasn't set the new option.
+  const sentKeys: string[] = [];
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        const params = req.params as { sessionKey: string };
+        sentKeys.push(params.sessionKey);
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId: `run-${sentKeys.length}`, status: 'started' } }),
+        );
+        setImmediate(() => {
+          fake.emitChat(sock, {
+            runId: `run-${sentKeys.length}`,
+            sessionKey: params.sessionKey,
+            seq: 1,
+            state: 'final',
+            message: { text: 'ok' },
+          });
+        });
+      }
+    },
+  });
+  try {
+    // No openaiCompatAgent here — both tasks should reach `agent:main:...`.
+    const backend = createOpenclawBackend({ url: fake.url });
+    await backend.handle(
+      makeOpenAICompatTask('t-noroute-oai', 'hi', { tools: OAI_SAMPLE_TOOLS }, 'ctx-noroute-oai'),
+      () => {},
+      NEVER,
+    );
+    await backend.handle(makeTask('t-noroute-plain', 'hi'), () => {}, NEVER);
+
+    assert.equal(sentKeys.length, 2);
+    assert.equal(sentKeys[0], 'agent:main:ctx-noroute-oai');
+    assert.equal(sentKeys[1], 'agent:main:ctx-t-noroute-plain');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('openaiCompatAgent: blank string (e.g. empty env template) does not override the default agent', async () => {
+  // Mirrors the daemon-level "trim + treat-empty-as-unset" pattern other
+  // openclaw options follow so an install.sh env template with the key
+  // present-but-blank doesn't accidentally activate the split.
+  const sentKeys: string[] = [];
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        const params = req.params as { sessionKey: string };
+        sentKeys.push(params.sessionKey);
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId: 'run-blank', status: 'started' } }),
+        );
+        setImmediate(() => {
+          fake.emitChat(sock, {
+            runId: 'run-blank',
+            sessionKey: params.sessionKey,
+            seq: 1,
+            state: 'final',
+            message: { text: 'ok' },
+          });
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url, openaiCompatAgent: '   ' });
+    await backend.handle(
+      makeOpenAICompatTask('t-blank', 'hi', { tools: OAI_SAMPLE_TOOLS }, 'ctx-blank'),
+      () => {},
+      NEVER,
+    );
+    assert.equal(sentKeys[0], 'agent:main:ctx-blank');
+  } finally {
+    await fake.close();
+  }
+});
+
 export { createFakeGateway, makeTask };
