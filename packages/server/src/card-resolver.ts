@@ -14,7 +14,6 @@ const canonicalCards = new Map<string, AgentCardType>(
   Object.entries({
     claude: readCanonicalCard('claude'),
     codex: readCanonicalCard('codex'),
-    'codex-app-server': readCanonicalCard('codex-app-server'),
     echo: readCanonicalCard('echo'),
     openclaw: readCanonicalCard('openclaw'),
   }),

@@ -210,7 +210,7 @@ export class AppServerRpcError extends Error {
 
 // Drives one `codex app-server` subprocess. The class is intentionally
 // agnostic to backend semantics (threads, turns, approvals) — those live
-// in `codex-app-server.ts` and consume `request` / `notify` /
+// in `codex.ts` and consume `request` / `notify` /
 // `onNotification` / `onServerRequest` here.
 export class AppServerRpcClient {
   private readonly command: string;
@@ -380,7 +380,7 @@ export class AppServerRpcClient {
       try {
         msg = JSON.parse(line) as IncomingMessage;
       } catch {
-        this.logger?.warn(`[codex-app-server] bad json line: ${line.slice(0, 200)}`);
+        this.logger?.warn(`[codex-rpc] bad json line: ${line.slice(0, 200)}`);
         continue;
       }
       this.dispatch(msg);
@@ -423,7 +423,7 @@ export class AppServerRpcClient {
         // Decline by default so a misconfigured backend fails closed
         // rather than hanging.
         this.logger?.warn(
-          `[codex-app-server] no handler for server request ${req.method}; declining`,
+          `[codex-rpc] no handler for server request ${req.method}; declining`,
         );
         this.respond(req.id, { decision: 'decline' });
         return;
@@ -434,7 +434,7 @@ export class AppServerRpcClient {
           (result) => this.respond(req.id, result),
           (err) => {
             this.logger?.warn(
-              `[codex-app-server] server request handler failed for ${req.method}: ${err instanceof Error ? err.message : String(err)}`,
+              `[codex-rpc] server request handler failed for ${req.method}: ${err instanceof Error ? err.message : String(err)}`,
             );
             this.respondError(req.id, err instanceof Error ? err.message : String(err));
           },
@@ -449,7 +449,7 @@ export class AppServerRpcClient {
           h(note.method, note.params);
         } catch (err) {
           this.logger?.warn(
-            `[codex-app-server] notification handler threw on ${note.method}: ${err instanceof Error ? err.message : String(err)}`,
+            `[codex-rpc] notification handler threw on ${note.method}: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
       }

@@ -624,13 +624,12 @@ export function buildOpenAICompatSystemPrompt(meta: OpenAICompatMetadata): strin
 // so the model only has to learn one structure (also taught in the
 // SYSTEM_INSTRUCTION above).
 //
-// Note: the `codex-app-server` backend bypasses this text-prepend and
-// instead injects native Responses API `function_call` /
-// `function_call_output` items via `thread/inject_items` (see
-// historyToInjectItems in codex-app-server.ts) — that gives the model
-// proper native tool-call history rather than a JSON blob it has to be
-// instructed to interpret. claude / openclaw still use this textual form
-// because their native conversation channels are different.
+// Note: the `codex` backend bypasses this text-prepend and instead injects
+// native Responses API `function_call` / `function_call_output` items via
+// `thread/inject_items` (see historyToInjectItems in codex.ts) — that gives
+// the model proper native tool-call history rather than a JSON blob it has
+// to be instructed to interpret. claude / openclaw still use this textual
+// form because their native conversation channels are different.
 export function formatToolCallHistory(history: OpenAICompatHistoryEntry[]): string {
   return [
     '<tool_call_history>',

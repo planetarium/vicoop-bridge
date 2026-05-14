@@ -35,24 +35,6 @@ test('resolves canonical codex server card from backendKind', () => {
   assert.deepEqual(result.ok && result.agentCard.defaultOutputModes, ['text/plain']);
 });
 
-test('resolves canonical codex-app-server card from backendKind', () => {
-  // The new backend shares the codex capability surface (one Codex agent
-  // either way; only the transport differs), so the canonical card mirrors
-  // the codex one for input/output modes — callers fetching the
-  // well-known agent-card.json shouldn't see a different contract just
-  // because the operator opted into the persistent-process backend.
-  const result = resolveHelloAgentCard(frame({ backendKind: 'codex-app-server' }));
-
-  assert.equal(result.ok, true);
-  assert.equal(result.ok && result.source, 'canonical');
-  assert.equal(result.ok && result.agentCard.name, 'codex-app-server');
-  assert.deepEqual(
-    result.ok && result.agentCard.defaultInputModes,
-    ['text/plain', 'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/json'],
-  );
-  assert.deepEqual(result.ok && result.agentCard.defaultOutputModes, ['text/plain']);
-});
-
 test('inline card overrides backendKind', () => {
   const inline = {
     name: 'operator-custom',
@@ -107,7 +89,7 @@ test('rejects unknown backendKind when no inline card is provided', () => {
 // decide whether to send the openai-compat metadata payload will assume
 // the bridge can't honor it and silently fall back to text injection or
 // refuse the call. So pin it here.
-for (const kind of ['claude', 'codex', 'codex-app-server', 'openclaw'] as const) {
+for (const kind of ['claude', 'codex', 'openclaw'] as const) {
   test(`canonical ${kind} card advertises the openai-compat extension URI`, () => {
     const result = resolveHelloAgentCard(frame({ backendKind: kind }));
     assert.equal(result.ok, true);

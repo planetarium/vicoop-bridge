@@ -107,24 +107,6 @@ export interface ClaudeBackendConfig {
 export interface CodexBackendConfig {
   cwd?: string;
   sandbox_mode?: string;
-  // Extra positional/optional arguments to splice into `codex exec`
-  // after our own option args (sandbox_mode, --skip-git-repo-check,
-  // --image, …). Useful for forwarding flags Codex adds in versions
-  // newer than this client's defaults, or for per-deployment knobs the
-  // operator wants in argv. (No need to put `--skip-git-repo-check`
-  // here — the Codex backend already passes it; if you do, the
-  // backend deduplicates it.)
-  extra_args?: string[];
-}
-
-// Operator-side defaults for the `codex-app-server` backend. The wire
-// surface intentionally avoids `extra_args` — the JSON-RPC client does not
-// take CLI flags the way `codex exec` does, and any future override goes
-// through the protocol's `developerInstructions` / per-turn config knobs
-// instead.
-export interface CodexAppServerBackendConfig {
-  cwd?: string;
-  sandbox_mode?: string;
   /** What to answer when codex requests user approval. Default `decline`. */
   approval_decision?: 'accept' | 'acceptForSession' | 'decline';
 }
@@ -147,7 +129,6 @@ export interface OpenclawBackendConfig {
 export interface BackendConfigs {
   claude?: ClaudeBackendConfig;
   codex?: CodexBackendConfig;
-  'codex-app-server'?: CodexAppServerBackendConfig;
   openclaw?: OpenclawBackendConfig;
 }
 
@@ -193,7 +174,6 @@ const KNOWN_BACKENDS = new Set([
   'openclaw',
   'claude',
   'codex',
-  'codex-app-server',
 ]);
 const KNOWN_APPROVAL_DECISIONS = new Set([
   'accept',
@@ -243,41 +223,16 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const sandbox = asString(codexRaw.sandbox_mode);
       const validSandbox =
         sandbox && KNOWN_CODEX_SANDBOX_MODES.has(sandbox) ? sandbox : undefined;
-      // Only accept a homogeneous string array — anything else (a bare
-      // string, a number, nested objects) is dropped to keep malformed
-      // edits from injecting non-string args into the spawned argv.
-      // Each entry is then trimmed and whitespace-only entries are
-      // dropped, matching the rest of this file's string-field handling
-      // — `extra_args: [" --flag", "   "]` becomes `["--flag"]` rather
-      // than a leading-space-bearing argv that codex parses as junk.
-      const extraArgsRaw = codexRaw.extra_args;
-      const extraArgs =
-        Array.isArray(extraArgsRaw) && extraArgsRaw.every((v) => typeof v === 'string')
-          ? (extraArgsRaw as string[]).map((v) => v.trim()).filter((v) => v.length > 0)
-          : undefined;
-      if (cwd || validSandbox || (extraArgs && extraArgs.length > 0)) {
-        out.codex = {};
-        if (cwd) out.codex.cwd = cwd;
-        if (validSandbox) out.codex.sandbox_mode = validSandbox;
-        if (extraArgs && extraArgs.length > 0) out.codex.extra_args = extraArgs;
-      }
-    }
-    const casRaw = asRecord(backends['codex-app-server']);
-    if (casRaw) {
-      const cwd = asString(casRaw.cwd);
-      const sandbox = asString(casRaw.sandbox_mode);
-      const validSandbox =
-        sandbox && KNOWN_CODEX_SANDBOX_MODES.has(sandbox) ? sandbox : undefined;
-      const approvalRaw = asString(casRaw.approval_decision);
+      const approvalRaw = asString(codexRaw.approval_decision);
       const validApproval =
         approvalRaw && KNOWN_APPROVAL_DECISIONS.has(approvalRaw)
           ? (approvalRaw as 'accept' | 'acceptForSession' | 'decline')
           : undefined;
       if (cwd || validSandbox || validApproval) {
-        out['codex-app-server'] = {};
-        if (cwd) out['codex-app-server']!.cwd = cwd;
-        if (validSandbox) out['codex-app-server']!.sandbox_mode = validSandbox;
-        if (validApproval) out['codex-app-server']!.approval_decision = validApproval;
+        out.codex = {};
+        if (cwd) out.codex.cwd = cwd;
+        if (validSandbox) out.codex.sandbox_mode = validSandbox;
+        if (validApproval) out.codex.approval_decision = validApproval;
       }
     }
     const ocRaw = asRecord(backends.openclaw);

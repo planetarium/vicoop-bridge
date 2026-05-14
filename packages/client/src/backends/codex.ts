@@ -1,4 +1,3 @@
-import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -9,10 +8,10 @@ import {
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { createLogger, type Logger } from '../logger.js';
 import {
   buildOpenAICompatSystemPrompt,
   callerToolDispatchActive,
-  formatToolCallHistory,
   parseOpenAICompatMetadata,
   tryParseToolCallsEnvelope,
 } from './claude.js';
@@ -21,58 +20,59 @@ import {
   makeOpenAICompatUsageMetadata,
   type OpenAICompatUsage,
 } from './openai-compat-usage.js';
-import { createLogger, escapeLineSeparators, safeToken, type Logger } from '../logger.js';
 import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME } from './fetch-uri-file.js';
 import { createTimingRecorder } from './timing.js';
+import {
+  AppServerRpcClient,
+  defaultAppServerSpawn,
+  TRANSPORT_CLOSED,
+  type AppServerSpawnFn,
+  type InitializeResult,
+  type ResponsesApiItem,
+  type SandboxMode,
+  type ThreadItem,
+  type UserInputItem,
+} from './codex-rpc.js';
+import type { OpenAICompatHistoryEntry } from './claude.js';
 
-export interface CodexChildHandle {
-  readonly stdin: NodeJS.WritableStream | null;
-  readonly stdout: NodeJS.ReadableStream | null;
-  readonly stderr: NodeJS.ReadableStream | null;
-  kill(signal?: NodeJS.Signals): boolean;
-  on(event: 'close', listener: (code: number | null, signal: NodeJS.Signals | null) => void): void;
-  on(event: 'error', listener: (err: Error) => void): void;
-}
-
-export interface CodexSpawnOptions {
-  cwd?: string;
-}
-
-export type CodexSpawnFn = (
-  command: string,
-  args: readonly string[],
-  options: CodexSpawnOptions,
-) => CodexChildHandle;
-
-export type CodexSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
+export type CodexSandboxMode = SandboxMode;
+export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline';
 
 export interface CodexBackendOptions {
   command?: string;
+  appServerArgs?: readonly string[];
   cwd?: string;
-  sandboxMode?: CodexSandboxMode;
-  extraArgs?: readonly string[];
-  spawn?: CodexSpawnFn;
+  sandboxMode?: SandboxMode;
+  // What to answer when codex sends a server-initiated approval request
+  // (execCommandApproval / applyPatchApproval). Default `decline` — safe
+  // even under workspace-write; operators that explicitly want auto-accept
+  // opt in via config.
+  approvalDecision?: ApprovalDecision;
+  spawn?: AppServerSpawnFn;
   stderrCaptureBytes?: number;
+  // How long an idle `(contextId → threadId)` mapping survives without use.
+  // Default 1 hour. `0` disables session reuse — every task does
+  // `thread/start` from scratch.
   sessionTtlMs?: number;
+  // Test seam: deterministic clock for TTL eviction and timing.
   now?: () => number;
+  // Idle-silence heartbeat — same semantics as `codex` / `claude`.
   heartbeatMs?: number;
   setIntervalFn?: (fn: () => void, ms: number) => unknown;
   clearIntervalFn?: (handle: unknown) => void;
   mkdtemp?: (prefix: string) => Promise<string>;
   writeFile?: (file: string, data: Buffer) => Promise<void>;
   rm?: (file: string, options: { recursive: boolean; force: boolean }) => Promise<void>;
-  // Local-only sink for exec-failure diagnostics (nonzero exit / signal)
-  // that must NOT travel over the wire — argv, cwd, --image temp paths
-  // are host-local. Defaults to a fresh logger driven by the same env
-  // var as the rest of the client, so operators see the line in the
-  // foreground log without explicit wiring. Tests inject a capturing
-  // stub. Note: real spawn(2) failures use error code `spawn_failed`
-  // and are a separate branch above this one — "exec-failure" here
-  // means codex started but exited non-zero.
   logger?: Logger;
+  // Wait this long for `initialize` to complete on the first task before
+  // surfacing `app_server_unavailable`. Subsequent tasks reuse the client
+  // and skip this wait. Default 10s.
+  initializeTimeoutMs?: number;
+  // Wait this long for `turn/completed` after `turn/start`. Default 0
+  // (no client-side timeout — the server is authoritative). Set to a
+  // positive value to fail-fast against a hung agent.
+  turnTimeoutMs?: number;
 }
-
-const SKIP_GIT_REPO_CHECK_FLAG = '--skip-git-repo-check';
 
 interface SessionEntry {
   threadId: string;
@@ -80,74 +80,27 @@ interface SessionEntry {
   writeId: number;
 }
 
-interface CodexEvent {
-  type?: unknown;
-  thread_id?: unknown;
-  item?: {
-    type?: unknown;
-    text?: unknown;
-    command?: unknown;
-    aggregated_output?: unknown;
-    exit_code?: unknown;
-    status?: unknown;
-  };
-  // Present on the terminal `turn.completed` event. Codex 0.130+ emits a
-  // flat usage object that maps 1:1 to the openai-compat/v1 response shape.
-  usage?: unknown;
-}
-
-// Parse Codex `turn.completed.usage` into a spec-compliant OpenAICompatUsage.
-//
-// Native shape (codex-cli 0.130+):
-//   { input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens }
-//
-// Mapping per the openai-compat/v1 native-fields appendix:
-//   prompt_tokens                              = input_tokens
-//                                                (cached_input_tokens is ALREADY
-//                                                 included in input_tokens; do not
-//                                                 add again)
-//   prompt_tokens_details.cached_tokens        = cached_input_tokens
-//   completion_tokens                          = output_tokens
-//                                                (reasoning_output_tokens is a
-//                                                 breakdown of output_tokens, not
-//                                                 additive)
-//   completion_tokens_details.reasoning_tokens = reasoning_output_tokens
-export function parseCodexTurnUsageForOpenAICompat(raw: unknown): OpenAICompatUsage | null {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const u = raw as Record<string, unknown>;
-  const input = typeof u.input_tokens === 'number' ? u.input_tokens : null;
-  const output = typeof u.output_tokens === 'number' ? u.output_tokens : null;
-  if (input === null || output === null) return null;
-  const cached = typeof u.cached_input_tokens === 'number' ? u.cached_input_tokens : undefined;
-  const reasoning =
-    typeof u.reasoning_output_tokens === 'number' ? u.reasoning_output_tokens : undefined;
-  return buildOpenAICompatUsage({
-    prompt_tokens: input,
-    completion_tokens: output,
-    cached_tokens: cached,
-    reasoning_tokens: reasoning,
-  });
-}
-
-// Shared with the `codex-app-server` backend: the input-mapping result
-// shape is identical (prompt text + materialised image temp paths +
-// tempDir for finally-cleanup); only the downstream wire framing differs
-// (argv `--image` vs. `UserInput {type:"localImage", path}`).
-export type MappedInput =
-  | { ok: true; prompt: string; imageFiles: string[]; tempDir: string | null }
-  | { ok: false; code: string; message: string };
-
 const DEFAULT_HEARTBEAT_MS = 30_000;
 const COMMAND_TRACE_MAX_CHARS = 2_000;
 
 function errorMessage(e: unknown): string {
   if (e instanceof Error) return e.message;
-  if (typeof e === 'string') return e;
-  try {
-    return String(e);
-  } catch {
-    return '<unrepresentable>';
-  }
+  return String(e);
+}
+
+function traceabilityRequested(task: {
+  message?: { extensions?: readonly string[] };
+  requestedExtensions?: readonly string[];
+}): boolean {
+  return (
+    task.requestedExtensions?.includes(TRACEABILITY_EXTENSION_URI) === true ||
+    task.message?.extensions?.includes(TRACEABILITY_EXTENSION_URI) === true
+  );
+}
+
+function clipTo(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 1))}…`;
 }
 
 function decodedBase64Size(b64: string): number {
@@ -156,27 +109,6 @@ function decodedBase64Size(b64: string): number {
   if (b64.endsWith('==')) pad = 2;
   else if (b64.endsWith('=')) pad = 1;
   return Math.max(0, Math.floor((b64.length * 3) / 4) - pad);
-}
-
-function traceabilityRequested(task: {
-  requestedExtensions?: readonly string[];
-  message?: { extensions?: readonly string[] };
-}): boolean {
-  return (
-    task.requestedExtensions?.includes(TRACEABILITY_EXTENSION_URI) === true ||
-    task.message?.extensions?.includes(TRACEABILITY_EXTENSION_URI) === true
-  );
-}
-
-function defaultSpawn(
-  command: string,
-  args: readonly string[],
-  options: CodexSpawnOptions,
-): CodexChildHandle {
-  return nodeSpawn(command, Array.from(args), {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    ...(options.cwd ? { cwd: options.cwd } : {}),
-  }) as ChildProcess;
 }
 
 function imageExtForMime(mime: string): string {
@@ -194,19 +126,22 @@ function imageExtForMime(mime: string): string {
   }
 }
 
-function clipTo(text: string, max: number): string {
-  if (text.length <= max) return text;
-  return `${text.slice(0, Math.max(0, max - 1))}…`;
+function serializeDataPart(data: Record<string, unknown>): string {
+  let body: string;
+  try {
+    body = JSON.stringify(data, null, 2);
+  } catch {
+    return '';
+  }
+  return `<context kind="application/json">\n${body}\n</context>`;
 }
 
-function commandSummary(item: NonNullable<CodexEvent['item']>): string {
-  const command = typeof item.command === 'string' ? item.command : '<unknown command>';
-  const status = typeof item.status === 'string' ? item.status : 'unknown';
-  const exit = typeof item.exit_code === 'number' ? item.exit_code : null;
-  const output = typeof item.aggregated_output === 'string' ? item.aggregated_output.trim() : '';
-  const head = exit === null ? `${command} (${status})` : `${command} (${status}, exit ${exit})`;
-  return clipTo(output ? `${head}\n${output}` : head, COMMAND_TRACE_MAX_CHARS);
-}
+// Result of mapping the user's A2A `Message.parts` to the codex input shape:
+// a single prompt string (text + serialized data parts), zero or more
+// materialised image temp paths, and the temp dir to clean up afterward.
+export type MappedInput =
+  | { ok: true; prompt: string; imageFiles: string[]; tempDir: string | null }
+  | { ok: false; code: string; message: string };
 
 export async function mapPartsToCodexInput(
   parts: readonly Part[],
@@ -226,9 +161,6 @@ export async function mapPartsToCodexInput(
       continue;
     }
     if (p.kind === 'data') {
-      // Auxiliary structured metadata sent alongside the user text. The codex
-      // CLI has no first-class data-part channel, so fold it into the prompt
-      // as a tagged JSON block — deterministic, visible, and grep-friendly.
       const serialized = serializeDataPart(p.data);
       if (serialized) dataParts.push(serialized);
       continue;
@@ -299,38 +231,160 @@ export async function mapPartsToCodexInput(
   return { ok: true, prompt, imageFiles, tempDir };
 }
 
-function serializeDataPart(data: Record<string, unknown>): string {
-  let body: string;
-  try {
-    body = JSON.stringify(data, null, 2);
-  } catch {
-    return '';
-  }
-  return `<context kind="application/json">\n${body}\n</context>`;
+// Parse codex `turn.completed.usage` (or any equivalent shape codex
+// app-server emits on the terminal turn notification) into a spec-compliant
+// OpenAICompatUsage payload.
+//
+// Native shape (codex 0.130+):
+//   { input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens }
+//
+// Mapping per the openai-compat/v1 native-fields appendix:
+//   prompt_tokens                              = input_tokens
+//                                                (cached_input_tokens is ALREADY
+//                                                 included in input_tokens; do not
+//                                                 add again)
+//   prompt_tokens_details.cached_tokens        = cached_input_tokens
+//   completion_tokens                          = output_tokens
+//                                                (reasoning_output_tokens is a
+//                                                 breakdown of output_tokens, not
+//                                                 additive)
+//   completion_tokens_details.reasoning_tokens = reasoning_output_tokens
+export function parseCodexTurnUsageForOpenAICompat(raw: unknown): OpenAICompatUsage | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const u = raw as Record<string, unknown>;
+  const input = typeof u.input_tokens === 'number' ? u.input_tokens : null;
+  const output = typeof u.output_tokens === 'number' ? u.output_tokens : null;
+  if (input === null || output === null) return null;
+  const cached = typeof u.cached_input_tokens === 'number' ? u.cached_input_tokens : undefined;
+  const reasoning =
+    typeof u.reasoning_output_tokens === 'number' ? u.reasoning_output_tokens : undefined;
+  return buildOpenAICompatUsage({
+    prompt_tokens: input,
+    completion_tokens: output,
+    cached_tokens: cached,
+    reasoning_tokens: reasoning,
+  });
 }
 
-export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
+// app-server `commandExecution` item summary.
+function commandExecutionSummary(item: Extract<ThreadItem, { type: 'commandExecution' }>): string {
+  const command = typeof item.command === 'string' ? item.command : '<unknown command>';
+  const status = typeof item.status === 'string' ? item.status : 'unknown';
+  const exit = typeof item.exitCode === 'number' ? item.exitCode : null;
+  const rawOutput = (item as { aggregatedOutput?: unknown }).aggregatedOutput;
+  const output = typeof rawOutput === 'string' ? rawOutput.trim() : '';
+  const head = exit === null ? `${command} (${status})` : `${command} (${status}, exit ${exit})`;
+  return clipTo(output ? `${head}\n${output}` : head, COMMAND_TRACE_MAX_CHARS);
+}
+
+interface PreparedInput {
+  input: UserInputItem[];
+  tempDir: string | null;
+  instructions: string | null;
+}
+
+// Convert mapped prompt + image files to the app-server `UserInput[]` shape.
+// Order: user text → images appended. Tool-call history is no longer
+// folded into the user text — see `historyToInjectItems`, which puts it
+// into the thread's native model-visible context via `thread/inject_items`.
+function buildUserInput(
+  prompt: string,
+  imageFiles: string[],
+): UserInputItem[] {
+  const items: UserInputItem[] = [];
+  if (prompt) {
+    items.push({ type: 'text', text: prompt, text_elements: [] });
+  }
+  for (const p of imageFiles) {
+    items.push({ type: 'localImage', path: p });
+  }
+  return items;
+}
+
+// Map an openai-compat `tool_call_history` to OpenAI Responses API items
+// suitable for `thread/inject_items`. Each `assistant.tool_calls[]` entry
+// fans out into one `function_call` item; each `role:"tool"` entry maps to
+// a matching `function_call_output`. Order is preserved so call_id pairing
+// stays consistent with the originating conversation.
+//
+// Malformed entries (missing id / function name) are skipped silently —
+// the gateway already validated the OpenAI request shape, so this is a
+// defensive last filter rather than an error surface.
+export function historyToInjectItems(
+  history: OpenAICompatHistoryEntry[],
+): ResponsesApiItem[] {
+  const out: ResponsesApiItem[] = [];
+  for (const entry of history) {
+    if (entry.role === 'assistant') {
+      for (const tc of entry.tool_calls) {
+        if (!tc || typeof tc !== 'object') continue;
+        const call = tc as { id?: unknown; function?: unknown };
+        if (typeof call.id !== 'string' || !call.id) continue;
+        if (!call.function || typeof call.function !== 'object') continue;
+        const fn = call.function as { name?: unknown; arguments?: unknown };
+        if (typeof fn.name !== 'string' || !fn.name) continue;
+        // OpenAI spec: `function.arguments` is a JSON-encoded string. Some
+        // producers send the parsed object instead — re-stringify so the
+        // Responses API item is spec-compliant either way.
+        const args =
+          typeof fn.arguments === 'string'
+            ? fn.arguments
+            : JSON.stringify(fn.arguments ?? {});
+        out.push({
+          type: 'function_call',
+          call_id: call.id,
+          name: fn.name,
+          arguments: args,
+        });
+      }
+    } else {
+      out.push({
+        type: 'function_call_output',
+        call_id: entry.tool_call_id,
+        output: entry.content,
+      });
+    }
+  }
+  return out;
+}
+
+// Per-task in-progress notification subscription — listens for
+// `item/agentMessage/delta`, `item/completed`, and `turn/completed`
+// scoped to the active turn, then resolves with the final state.
+interface TurnRunOutcome {
+  status: 'completed' | 'failed' | 'interrupted' | 'aborted';
+  error?: { message: string };
+  finalText: string | null;
+}
+
+export function createCodexBackend(
+  opts: CodexBackendOptions = {},
+): Backend {
   const command = opts.command ?? 'codex';
+  const appServerArgs = opts.appServerArgs ?? ['app-server'];
   const cwd = opts.cwd;
-  // Sandbox-on by default. `read-only` is also Codex CLI's own default for
-  // `codex exec` today, but pass it explicitly so the security posture is
-  // visible in `ps`/audit logs and survives any future change to that
-  // upstream default. Operators that want a wider scope pass `workspace-write`
-  // or `danger-full-access` via `CODEX_SANDBOX_MODE` / `backends.codex.sandbox_mode`.
-  const sandboxMode: CodexSandboxMode = opts.sandboxMode ?? 'read-only';
-  const extraArgs = opts.extraArgs ?? [];
-  const spawnFn = opts.spawn ?? defaultSpawn;
+  const sandboxMode: SandboxMode = opts.sandboxMode ?? 'read-only';
+  const approvalDecision: ApprovalDecision = opts.approvalDecision ?? 'decline';
+  const spawnFn = opts.spawn ?? defaultAppServerSpawn;
   const stderrCap = opts.stderrCaptureBytes ?? 8192;
   const sessionTtlMs = opts.sessionTtlMs ?? 60 * 60 * 1000;
   const now = opts.now ?? Date.now;
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
-  const setIntervalImpl = opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
-  const clearIntervalImpl = opts.clearIntervalFn ?? ((h) => clearInterval(h as ReturnType<typeof setInterval>));
+  const setIntervalImpl =
+    opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
+  const clearIntervalImpl =
+    opts.clearIntervalFn ??
+    ((h) => clearInterval(h as ReturnType<typeof setInterval>));
   const mkdtemp = opts.mkdtemp ?? fs.mkdtemp;
   const writeFile = opts.writeFile ?? fs.writeFile;
   const rm = opts.rm ?? fs.rm;
   const logger = opts.logger ?? createLogger();
+  const initializeTimeoutMs = opts.initializeTimeoutMs ?? 10_000;
+  const turnTimeoutMs = opts.turnTimeoutMs ?? 0;
 
+  // contextId → (threadId, lastUsedAt). writeId-protected rollback so a
+  // concurrent task on the same contextId doesn't get its session entry
+  // rolled back from under it.
   const sessions = new Map<string, SessionEntry>();
   let writeCounter = 0;
 
@@ -338,6 +392,101 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
     for (const [key, entry] of sessions) {
       if (entry.lastUsedAt < cutoff) sessions.delete(key);
     }
+  }
+
+  // contextId mutex — codex app-server requires turns within a thread to
+  // be serialised (a second `turn/start` while another is active is
+  // rejected). Funnel concurrent same-contextId tasks through a per-context
+  // chain so the second turn waits for the first.
+  const contextLocks = new Map<string, Promise<void>>();
+
+  async function acquireContextLock(contextId: string): Promise<() => void> {
+    const prev = contextLocks.get(contextId) ?? Promise.resolve();
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // Chain off the prior holder; the next holder waits on `prev` and
+    // installs `next` as the new tail. When `release()` fires the chain
+    // moves forward. The tail is only cleared if no one else queued behind
+    // us, to keep the map free of stale entries on idle contexts.
+    contextLocks.set(
+      contextId,
+      prev.then(() => next),
+    );
+    await prev;
+    return () => {
+      release();
+      // If we are still the tail, drop the entry so the map doesn't grow
+      // unbounded with idle contexts.
+      if (contextLocks.get(contextId) === next) {
+        contextLocks.delete(contextId);
+      }
+    };
+  }
+
+  let rpcClient: AppServerRpcClient | null = null;
+  let initInFlight: Promise<AppServerRpcClient> | null = null;
+  let serverInfo: InitializeResult | null = null;
+
+  // Spawn the app-server, do the handshake, register handlers. Subsequent
+  // tasks reuse the same client until it dies; a dead client is replaced
+  // on the next `ensureClient()` call.
+  async function ensureClient(): Promise<AppServerRpcClient> {
+    if (rpcClient && !rpcClient.isClosed()) return rpcClient;
+    if (initInFlight) return initInFlight;
+    initInFlight = (async () => {
+      const c = new AppServerRpcClient({
+        command,
+        args: appServerArgs,
+        cwd,
+        spawn: spawnFn,
+        logger,
+        stderrCaptureBytes: stderrCap,
+      });
+      c.setServerRequestHandler((_id, _method) => ({ decision: approvalDecision }));
+      try {
+        c.start();
+      } catch (err) {
+        initInFlight = null;
+        throw err;
+      }
+      // Clear singleton on crash so the next task respawns.
+      void c.waitForClose().then(() => {
+        if (rpcClient === c) {
+          rpcClient = null;
+          serverInfo = null;
+        }
+      });
+      try {
+        const initParams = {
+          clientInfo: {
+            name: 'vicoop-bridge',
+            title: 'vicoop-bridge client',
+            version: '1',
+          },
+        };
+        const result = await withTimeout(
+          c.request<InitializeResult>('initialize', initParams),
+          initializeTimeoutMs,
+          'initialize timed out',
+        );
+        c.notify('initialized');
+        serverInfo = result;
+        rpcClient = c;
+        return c;
+      } catch (err) {
+        try {
+          c.kill();
+        } catch {
+          // best effort
+        }
+        throw err;
+      } finally {
+        initInFlight = null;
+      }
+    })();
+    return initInFlight;
   }
 
   return {
@@ -352,9 +501,6 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
         contextId: task.contextId,
         now,
       });
-      // Terminal frame types trigger the single per-task timing log line.
-      // The mark fires BEFORE rawEmit so the emit-side cost is captured,
-      // and finish fires AFTER so the line follows the lifecycle log.
       const emit: typeof rawEmit = (frame) => {
         lastEmitAt = now();
         const terminal = frame.type === 'task.complete' || frame.type === 'task.fail';
@@ -379,32 +525,11 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
         return;
       }
 
-      const mapped = await mapPartsToCodexInput(task.message.parts, { mkdtemp, writeFile, rm });
-      recorder.mark('map');
-      if (!mapped.ok) {
-        emit({
-          type: 'task.fail',
-          taskId: task.taskId,
-          error: { code: mapped.code, message: mapped.message },
-        });
-        return;
-      }
-
-      // Detect the openai-compat extension payload once per task so the
-      // result feeds three places: (a) the instructions file we materialise
-      // for `-c model_instructions_file=...`, (b) the assistant artifact
-      // path (envelope JSON → data part), and (c) the user prompt prefix
-      // for multi-turn `tool_call_history`. Absent or malformed metadata
-      // leaves the run on the original non-extension code path with no
-      // envelope-detection cost.
-      const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
-
-      // A separately-rooted temp dir created only when openai-compat is
-      // active AND no image temp dir already exists. Tracked here (outside
-      // the try/finally) so the finally block can clean it independently
-      // of `mapped.tempDir`.
-      let instructionsTempDir: string | null = null;
-
+      // Funnel concurrent same-contextId tasks. The existing `codex`
+      // backend dodged this race by spawning per-task; app-server serialises
+      // turns per thread, so we enforce that here rather than letting the
+      // server reject the second `turn/start`.
+      const releaseLock = await acquireContextLock(task.contextId);
       try {
         if (signal.aborted) {
           emit({
@@ -415,482 +540,583 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
           return;
         }
 
-        // Materialise the openai-compat system prompt to a file we point
-        // codex at via `-c model_instructions_file="..."`. codex 0.130+
-        // exposes this as the seam for caller-supplied instructions;
-        // `experimental_instructions_file` is deprecated and silently
-        // ignored. Skip when the built prompt is empty (e.g. metadata only
-        // carried `tool_call_history`, which is replayed in user content
-        // instead — no system-level contract needed).
-        let instructionsFile: string | null = null;
-        if (openaiCompat) {
-          const systemPromptText = buildOpenAICompatSystemPrompt(openaiCompat);
-          if (systemPromptText) {
-            try {
-              let dir: string;
-              if (mapped.tempDir) {
-                dir = mapped.tempDir;
-              } else {
-                instructionsTempDir = await mkdtemp(path.join(os.tmpdir(), 'vicoop-codex-'));
-                dir = instructionsTempDir;
+        // Detect the openai-compat extension once. The system-prompt text
+        // feeds `developerInstructions` on the next thread/start; any
+        // `tool_call_history` is materialised as native Responses API
+        // items and pushed through `thread/inject_items` after thread/start
+        // (see `historyToInjectItems` below) — this gives the model a real
+        // function-call history rather than a JSON blob it has to be
+        // instructed to interpret, eliminating the multi-turn re-call loop
+        // observed under prompts like `"Use a tool to list …"` (#176).
+        const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+        const systemPrompt =
+          openaiCompat ? buildOpenAICompatSystemPrompt(openaiCompat) : '';
+        const historyInjectItems = openaiCompat?.tool_call_history
+          ? historyToInjectItems(openaiCompat.tool_call_history)
+          : null;
+
+        const mapped = await mapPartsToCodexInput(task.message.parts, {
+          mkdtemp,
+          writeFile,
+          rm,
+        });
+        recorder.mark('map');
+        if (!mapped.ok) {
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: { code: mapped.code, message: mapped.message },
+          });
+          return;
+        }
+
+        try {
+          const userInput = buildUserInput(mapped.prompt, mapped.imageFiles);
+
+          let client: AppServerRpcClient;
+          try {
+            client = await ensureClient();
+            recorder.mark('initialized');
+          } catch (err) {
+            emit({
+              type: 'task.fail',
+              taskId: task.taskId,
+              error: {
+                code: 'app_server_unavailable',
+                message: `codex app-server failed to start: ${errorMessage(err)}`,
+              },
+            });
+            return;
+          }
+
+          // Session-reuse map: same writeId-protected pattern as codex.ts
+          // so a concurrent task on the same contextId doesn't get its
+          // session entry rolled back from under it.
+          const tNow = now();
+          if (sessionTtlMs > 0) evictExpired(tNow - sessionTtlMs);
+          const existing = sessionTtlMs > 0 ? sessions.get(task.contextId) : undefined;
+          let writeId = 0;
+          if (sessionTtlMs > 0) {
+            writeId = ++writeCounter;
+            if (existing) {
+              sessions.set(task.contextId, {
+                threadId: existing.threadId,
+                lastUsedAt: tNow,
+                writeId,
+              });
+            }
+          }
+          const isResume = existing !== undefined;
+          let observedThreadId: string | null = null;
+
+          const rollbackResumeRefresh = (): void => {
+            if (!isResume || sessionTtlMs <= 0) return;
+            const cur = sessions.get(task.contextId);
+            if (cur?.threadId === existing.threadId && cur.writeId === writeId) {
+              sessions.set(task.contextId, {
+                threadId: existing.threadId,
+                lastUsedAt: existing.lastUsedAt,
+                writeId: ++writeCounter,
+              });
+            }
+          };
+          const rollbackFreshThread = (): void => {
+            if (isResume || sessionTtlMs <= 0 || !observedThreadId) return;
+            const cur = sessions.get(task.contextId);
+            if (cur?.threadId === observedThreadId && cur.writeId === writeId) {
+              sessions.delete(task.contextId);
+            }
+          };
+
+          emit({
+            type: 'task.status',
+            taskId: task.taskId,
+            status: { state: 'working', timestamp: new Date().toISOString() },
+          });
+
+          // For resumes we re-attach to the existing thread; sandbox and
+          // any developerInstructions set on initial `thread/start` carry
+          // over via the server-side session record. Feature-flag overrides
+          // (see `featuresOverride` below) are the exception — they do NOT
+          // persist across resume and must be re-sent every turn that wants
+          // them.
+          //
+          // When caller-side tool dispatch is active (openai-compat with
+          // tools), every codex surface that lets the model do something
+          // directly is disabled. The caller's `tools` array is the ONLY
+          // legitimate dispatch surface — anything codex can call itself
+          // (shell, exec, browser, computer use, patch tools, image
+          // generation, plugins / multi-agent / MCP, workspace
+          // introspection) would bypass the envelope contract. This is
+          // broader than the original #175 fix (`shell_tool` +
+          // `unified_exec`); see PR #180 review for the full rationale.
+          // The model is reduced to "emit text" or "emit a tool_calls
+          // envelope" only.
+          const featuresOverride = callerToolDispatchActive(openaiCompat)
+            ? {
+                features: {
+                  // Direct execution surfaces — anything that lets codex
+                  // do work itself instead of asking the caller.
+                  shell_tool: false,
+                  unified_exec: false,
+                  browser_use: false,
+                  browser_use_external: false,
+                  computer_use: false,
+                  in_app_browser: false,
+                  apply_patch_freeform: false,
+                  apply_patch_streaming_events: false,
+                  // Text-only output: caller asked for textual responses,
+                  // not generated images or other modalities.
+                  image_generation: false,
+                  // Codex-side tool catalog / discovery — under openai-
+                  // compat the caller's `tools` array is the only legit
+                  // tool surface, so codex shouldn't be searching, suggesting,
+                  // or eliciting MCP tools of its own.
+                  tool_search: false,
+                  tool_suggest: false,
+                  tool_call_mcp_elicitation: false,
+                  builtin_mcp: false,
+                  // Plugin / app integrations expose third-party tools
+                  // codex could call directly.
+                  plugins: false,
+                  apps: false,
+                  enable_mcp_apps: false,
+                  // Subagent spawning bypasses the single-agent contract.
+                  multi_agent: false,
+                  // Workspace introspection — fs reads that could leak
+                  // host paths back into model context.
+                  workspace_dependencies: false,
+                },
               }
-              const file = path.join(dir, 'instructions.md');
-              await writeFile(file, Buffer.from(systemPromptText, 'utf8'));
-              instructionsFile = file;
-            } catch (err) {
+            : null;
+
+          let threadId: string;
+          try {
+            if (isResume) {
+              const resumeResult = await client.request<{ thread: { id: string } }>(
+                'thread/resume',
+                {
+                  threadId: existing.threadId,
+                  cwd,
+                  sandbox: sandboxMode,
+                  ...(featuresOverride ? { config: featuresOverride } : {}),
+                },
+              );
+              threadId = resumeResult.thread.id;
+            } else {
+              const startResult = await client.request<{ thread: { id: string } }>(
+                'thread/start',
+                {
+                  cwd,
+                  sandbox: sandboxMode,
+                  ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),
+                  ...(featuresOverride ? { config: featuresOverride } : {}),
+                },
+              );
+              threadId = startResult.thread.id;
+              observedThreadId = threadId;
+              if (sessionTtlMs > 0) {
+                sessions.set(task.contextId, {
+                  threadId,
+                  lastUsedAt: now(),
+                  writeId,
+                });
+              }
+            }
+            // Append prior round-trips (if any) as native Responses API
+            // items so codex's session builder includes them in the model
+            // prompt as proper function-call history. Without this, the
+            // model only sees a JSON `tool_call_history` blob in user text
+            // and may re-emit the same envelope when the user prompt
+            // contains a "use a tool" imperative (#176). Skip when there
+            // are no items to inject.
+            if (historyInjectItems && historyInjectItems.length > 0) {
+              await client.request('thread/inject_items', {
+                threadId,
+                items: historyInjectItems,
+              });
+            }
+            recorder.mark('threadReady');
+          } catch (err) {
+            rollbackResumeRefresh();
+            // Transport closed mid-handshake: report as crash so operator
+            // sees the same code as a startup-time failure; the next task
+            // will re-spawn the client.
+            if (err instanceof Error && err.message.startsWith(TRANSPORT_CLOSED)) {
               emit({
                 type: 'task.fail',
                 taskId: task.taskId,
                 error: {
-                  code: 'input_file_write_failed',
-                  message: `failed to materialize codex instructions: ${errorMessage(err)}`,
+                  code: 'app_server_crashed',
+                  message: `codex app-server transport closed during ${isResume ? 'thread/resume' : 'thread/start'}: ${err.message}`,
                 },
               });
               return;
             }
-          }
-        }
-
-        const tNow = now();
-        if (sessionTtlMs > 0) evictExpired(tNow - sessionTtlMs);
-        const existing = sessionTtlMs > 0 ? sessions.get(task.contextId) : undefined;
-        const isResume = existing !== undefined;
-        let writeId = 0;
-        if (existing && sessionTtlMs > 0) {
-          writeId = ++writeCounter;
-          sessions.set(task.contextId, {
-            threadId: existing.threadId,
-            lastUsedAt: tNow,
-            writeId,
-          });
-        }
-
-        // Always pass `--skip-git-repo-check`. vicoop-bridge agents work in
-        // an operator-chosen `cwd` (often not a git repo); without this
-        // flag, codex exec exits 1 with "Not inside a trusted directory"
-        // in ~200 ms (#147). Skip the auto-add if the operator already
-        // listed the flag in extra_args so the argv stays clean.
-        const skipGitRepoCheck = extraArgs.includes(SKIP_GIT_REPO_CHECK_FLAG)
-          ? []
-          : [SKIP_GIT_REPO_CHECK_FLAG];
-        // `-c key=val` expects val to parse as TOML; for a string value
-        // that means wrapped in TOML's basic-string double quotes. Lean on
-        // JSON.stringify since TOML's basic-string escape set matches
-        // JSON's (\", \\, \n, \t, etc.) so the value survives spaces /
-        // unicode / quotes in the path verbatim.
-        const instructionsArgs = instructionsFile
-          ? ['-c', `model_instructions_file=${JSON.stringify(instructionsFile)}`]
-          : [];
-        // Disable codex's built-in shell/exec tools when the caller has
-        // supplied its own tool definitions via the openai-compat extension.
-        // Without this, codex executes commands in its sandbox and emits
-        // plain-text results, silently bypassing the caller's tool dispatch
-        // contract (#175). Re-passed on resume because feature flags are
-        // not persisted across `codex exec resume`.
-        const disableBuiltinToolArgs = callerToolDispatchActive(openaiCompat)
-          ? ['--disable', 'shell_tool', '--disable', 'unified_exec']
-          : [];
-        const optionArgs = [
-          '--json',
-          '-c',
-          `sandbox_mode=${JSON.stringify(sandboxMode)}`,
-          ...skipGitRepoCheck,
-          ...disableBuiltinToolArgs,
-          ...instructionsArgs,
-          ...mapped.imageFiles.flatMap((filePath) => ['--image', filePath]),
-          ...extraArgs,
-        ];
-        const args: string[] = [
-          'exec',
-          ...(isResume ? ['resume', ...optionArgs, existing.threadId] : optionArgs),
-          '-',
-        ];
-
-        let observedThreadId: string | null = null;
-
-        const maybeStoreThread = (threadId: string): void => {
-          if (isResume || sessionTtlMs <= 0) return;
-          observedThreadId = threadId;
-          writeId = ++writeCounter;
-          sessions.set(task.contextId, { threadId, lastUsedAt: now(), writeId });
-        };
-
-        const rollbackResumeRefresh = (): void => {
-          if (!isResume || sessionTtlMs <= 0) return;
-          const cur = sessions.get(task.contextId);
-          if (cur?.threadId === existing.threadId && cur.writeId === writeId) {
-            sessions.set(task.contextId, {
-              threadId: existing.threadId,
-              lastUsedAt: existing.lastUsedAt,
-              writeId: ++writeCounter,
-            });
-          }
-        };
-
-        const rollbackFreshThread = (): void => {
-          if (isResume || sessionTtlMs <= 0 || !observedThreadId) return;
-          const cur = sessions.get(task.contextId);
-          if (cur?.threadId === observedThreadId && cur.writeId === writeId) {
-            sessions.delete(task.contextId);
-          }
-        };
-
-        emit({
-          type: 'task.status',
-          taskId: task.taskId,
-          status: { state: 'working', timestamp: new Date().toISOString() },
-        });
-
-        let child: CodexChildHandle;
-        try {
-          child = spawnFn(command, args, { cwd });
-          recorder.mark('spawn');
-        } catch (err) {
-          rollbackResumeRefresh();
-          emit({
-            type: 'task.fail',
-            taskId: task.taskId,
-            error: { code: 'spawn_failed', message: errorMessage(err) },
-          });
-          return;
-        }
-
-        let stdinError: unknown = null;
-        if (!child.stdin) {
-          try {
-            child.kill('SIGTERM');
-          } catch {
-            /* best effort */
-          }
-          rollbackResumeRefresh();
-          emit({
-            type: 'task.fail',
-            taskId: task.taskId,
-            error: {
-              code: 'spawn_no_stdin',
-              message: 'spawned codex has no stdin pipe; cannot deliver user prompt',
-            },
-          });
-          return;
-        }
-
-        child.stdin.on('error', (err: unknown) => {
-          if (!stdinError) stdinError = err;
-        });
-        // Spec contract: bridges MUST replay the entire `tool_call_history`
-        // in order on every follow-up turn. Render it as a `<tool_call_history>`
-        // JSON block and prepend it to the user prompt so the model reads
-        // the prior round BEFORE the current user turn. Any internal session
-        // reuse (codex `exec resume`) is invisible to the wire and does not
-        // change replay semantics — the redundancy is the price of
-        // cross-bridge interop.
-        const promptToWrite = openaiCompat?.tool_call_history
-          ? (mapped.prompt
-              ? `${formatToolCallHistory(openaiCompat.tool_call_history)}\n\n${mapped.prompt}`
-              : formatToolCallHistory(openaiCompat.tool_call_history))
-          : mapped.prompt;
-        try {
-          child.stdin.end(promptToWrite);
-          recorder.mark('stdin');
-        } catch (err) {
-          stdinError = err;
-        }
-
-        let emittedAnyArtifact = false;
-        let finalText: string | null = null;
-        let finalUsage: OpenAICompatUsage | null = null;
-        let stderrTail = '';
-        let aborted = false;
-        let settled = false;
-        const emitTraceArtifacts = traceabilityRequested(task);
-
-        const emitAgentArtifact = (text: string): void => {
-          if (!text) return;
-          // When the openai-compat extension is active for this task, the
-          // model was instructed to emit `{"tool_calls":[...]}` JSON for
-          // tool turns. Detect that shape and surface it as an A2A `data`
-          // part so the upstream gateway can forward it as `tool_calls` on
-          // the OpenAI response without re-parsing model prose. Non-envelope
-          // text (natural-language answers, or any turn from a task that
-          // didn't request the extension) falls through to the text artifact
-          // path unchanged.
-          if (openaiCompat) {
-            const envelope = tryParseToolCallsEnvelope(text);
-            if (envelope) {
-              emit({
-                type: 'task.artifact',
-                taskId: task.taskId,
-                artifact: {
-                  artifactId: randomUUID(),
-                  name: 'codex-message',
-                  parts: [{ kind: 'data', data: envelope }],
-                  extensions: [OPENAI_COMPAT_EXTENSION_URI],
-                },
-                lastChunk: true,
-              });
-              emittedAnyArtifact = true;
-              return;
-            }
-          }
-          emit({
-            type: 'task.artifact',
-            taskId: task.taskId,
-            artifact: {
-              artifactId: randomUUID(),
-              name: 'codex-message',
-              parts: [{ kind: 'text', text }],
-            },
-            lastChunk: true,
-          });
-          emittedAnyArtifact = true;
-        };
-
-        const emitCommandTrace = (item: NonNullable<CodexEvent['item']>): void => {
-          if (!emitTraceArtifacts) return;
-          emit({
-            type: 'task.artifact',
-            taskId: task.taskId,
-            artifact: {
-              artifactId: randomUUID(),
-              name: 'codex-command-execution',
-              parts: [
-                { kind: 'text', text: commandSummary(item) },
-                {
-                  kind: 'data',
-                  data: {
-                    command: typeof item.command === 'string' ? item.command : undefined,
-                    status: typeof item.status === 'string' ? item.status : undefined,
-                    exitCode: typeof item.exit_code === 'number' ? item.exit_code : undefined,
-                  },
-                },
-              ],
-              extensions: [TRACEABILITY_EXTENSION_URI],
-              metadata: { traceType: 'command-execution' },
-            },
-            lastChunk: true,
-          });
-          emittedAnyArtifact = true;
-        };
-
-        const handleEvent = (evt: CodexEvent): void => {
-          if (settled) return;
-          if (evt.type === 'thread.started' && typeof evt.thread_id === 'string') {
-            maybeStoreThread(evt.thread_id);
-            return;
-          }
-          if (evt.type === 'turn.completed') {
-            // openai-compat/v1 response-side usage. Best-effort: a malformed
-            // shape leaves finalUsage null and the gateway falls back to its
-            // own estimate.
-            const parsed = parseCodexTurnUsageForOpenAICompat(evt.usage);
-            if (parsed) finalUsage = parsed;
-            return;
-          }
-          if (evt.type !== 'item.completed' || !evt.item) return;
-          if (evt.item.type === 'agent_message' && typeof evt.item.text === 'string') {
-            recorder.mark('firstFinal');
-            finalText = evt.item.text;
-            emitAgentArtifact(evt.item.text);
-            return;
-          }
-          if (evt.item.type === 'command_execution') {
-            emitCommandTrace(evt.item);
-          }
-        };
-
-        const onAbort = (): void => {
-          if (aborted) return;
-          aborted = true;
-          try {
-            child.kill('SIGTERM');
-          } catch {
-            /* best effort */
-          }
-        };
-        signal.addEventListener('abort', onAbort);
-
-        let stdoutBuf = '';
-        child.stdout?.on('data', (chunk: Buffer | string) => {
-          recorder.mark('firstOut');
-          stdoutBuf += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-          let nl: number;
-          while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
-            const line = stdoutBuf.slice(0, nl).trim();
-            stdoutBuf = stdoutBuf.slice(nl + 1);
-            if (!line) continue;
-            try {
-              handleEvent(JSON.parse(line) as CodexEvent);
-            } catch {
-              // Ignore non-JSON chatter defensively.
-            }
-          }
-        });
-
-        child.stderr?.on('data', (chunk: Buffer | string) => {
-          stderrTail += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-          if (stderrTail.length > stderrCap) stderrTail = stderrTail.slice(-stderrCap);
-        });
-
-        let heartbeatHandle: unknown = null;
-        if (heartbeatMs > 0) {
-          heartbeatHandle = setIntervalImpl(() => {
-            if (settled || aborted) return;
-            if (now() - lastEmitAt < heartbeatMs) return;
             emit({
-              type: 'task.status',
+              type: 'task.fail',
               taskId: task.taskId,
-              status: { state: 'working', timestamp: new Date().toISOString() },
+              error: {
+                code: isResume ? 'thread_resume_failed' : 'thread_start_failed',
+                message: errorMessage(err),
+              },
             });
-          }, heartbeatMs);
-        }
-
-        const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: unknown }>((resolve) => {
-          child.on('error', (err) => resolve({ code: null, signal: null, error: err }));
-          child.on('close', (code, sig) => resolve({ code, signal: sig }));
-        });
-        recorder.mark('closed');
-
-        signal.removeEventListener('abort', onAbort);
-        if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
-
-        const trailing = stdoutBuf.trim();
-        if (trailing) {
-          try {
-            handleEvent(JSON.parse(trailing) as CodexEvent);
-          } catch {
-            // ignore
+            return;
           }
-        }
-        settled = true;
 
-        if (aborted) {
-          rollbackFreshThread();
-          rollbackResumeRefresh();
+          // Subscribe to notifications scoped to our turn. The turnId is
+          // not known until `turn/start` returns; we capture it then
+          // filter incoming notifications by it. Prior to capture we
+          // ignore turn-level events (no turn of ours is yet on the wire).
+          let activeTurnId: string | null = null;
+          let finalText: string | null = null;
+          let finalUsage: OpenAICompatUsage | null = null;
+          let emittedAnyArtifact = false;
+          const emitTraceArtifacts = traceabilityRequested(task);
+
+          const emitAgentArtifact = (text: string): void => {
+            if (!text) return;
+            // openai-compat envelope detection — same contract the codex
+            // backend uses, so callers see identical `data` parts.
+            if (openaiCompat) {
+              const envelope = tryParseToolCallsEnvelope(text);
+              if (envelope) {
+                emit({
+                  type: 'task.artifact',
+                  taskId: task.taskId,
+                  artifact: {
+                    artifactId: randomUUID(),
+                    name: 'codex-message',
+                    parts: [{ kind: 'data', data: envelope }],
+                    extensions: [OPENAI_COMPAT_EXTENSION_URI],
+                  },
+                  lastChunk: true,
+                });
+                emittedAnyArtifact = true;
+                return;
+              }
+            }
+            emit({
+              type: 'task.artifact',
+              taskId: task.taskId,
+              artifact: {
+                artifactId: randomUUID(),
+                name: 'codex-message',
+                parts: [{ kind: 'text', text }],
+              },
+              lastChunk: true,
+            });
+            emittedAnyArtifact = true;
+          };
+
+          const emitCommandTrace = (
+            item: Extract<ThreadItem, { type: 'commandExecution' }>,
+          ): void => {
+            if (!emitTraceArtifacts) return;
+            emit({
+              type: 'task.artifact',
+              taskId: task.taskId,
+              artifact: {
+                artifactId: randomUUID(),
+                name: 'codex-command-execution',
+                parts: [
+                  { kind: 'text', text: commandExecutionSummary(item) },
+                  {
+                    kind: 'data',
+                    data: {
+                      command: typeof item.command === 'string' ? item.command : undefined,
+                      status: typeof item.status === 'string' ? item.status : undefined,
+                      exitCode: typeof item.exitCode === 'number' ? item.exitCode : undefined,
+                    },
+                  },
+                ],
+                extensions: [TRACEABILITY_EXTENSION_URI],
+                metadata: { traceType: 'command-execution' },
+              },
+              lastChunk: true,
+            });
+            emittedAnyArtifact = true;
+          };
+
+          // Drive the turn to completion. The notification subscription
+          // captures the agent's final message text and command-execution
+          // traces; the loop resolves on `turn/completed` or `turn/failed`.
+          const outcome: TurnRunOutcome = await new Promise((resolve) => {
+            let settled = false;
+            const finish = (o: TurnRunOutcome): void => {
+              if (settled) return;
+              settled = true;
+              cleanupNotifications();
+              if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
+              signal.removeEventListener('abort', onAbort);
+              resolve(o);
+            };
+
+            const cleanupNotifications = client.onNotification((method, params) => {
+              if (method === 'item/completed') {
+                const p = params as { item?: ThreadItem; turnId?: string } | undefined;
+                if (activeTurnId && p?.turnId !== activeTurnId) return;
+                const item = p?.item;
+                if (!item) return;
+                if (item.type === 'agentMessage' && typeof item.text === 'string') {
+                  recorder.mark('firstFinal');
+                  finalText = item.text;
+                  emitAgentArtifact(item.text);
+                  return;
+                }
+                if (item.type === 'commandExecution') {
+                  emitCommandTrace(item as Extract<ThreadItem, { type: 'commandExecution' }>);
+                }
+                return;
+              }
+              if (method === 'item/agentMessage/delta') {
+                const p = params as { turnId?: string } | undefined;
+                if (activeTurnId && p?.turnId !== activeTurnId) return;
+                recorder.mark('firstDelta');
+                return;
+              }
+              if (method === 'turn/completed') {
+                const p = params as
+                  | {
+                      turn?: {
+                        id?: string;
+                        status?: string;
+                        error?: { message?: string } | null;
+                        usage?: unknown;
+                      };
+                      usage?: unknown;
+                    }
+                  | undefined;
+                const t = p?.turn;
+                if (activeTurnId && t?.id !== activeTurnId) return;
+                // openai-compat/v1 response-side usage. Best-effort: codex
+                // 0.130+ flat usage object on `turn.usage` (or `params.usage`,
+                // depending on app-server schema version). A malformed shape
+                // leaves finalUsage null and the gateway falls back to its
+                // own estimate.
+                const parsed =
+                  parseCodexTurnUsageForOpenAICompat(t?.usage) ??
+                  parseCodexTurnUsageForOpenAICompat(p?.usage);
+                if (parsed) finalUsage = parsed;
+                if (t?.status === 'completed') {
+                  finish({ status: 'completed', finalText });
+                } else if (t?.status === 'interrupted') {
+                  finish({ status: 'interrupted', finalText });
+                } else {
+                  finish({
+                    status: 'failed',
+                    error: { message: t?.error?.message ?? `turn ended with status ${t?.status ?? 'unknown'}` },
+                    finalText,
+                  });
+                }
+              }
+            });
+
+            const onAbort = (): void => {
+              // Best-effort `turn/interrupt`; the resolution will land on
+              // turn/completed status:'interrupted'. If the rpc client is
+              // dead we still resolve as aborted.
+              if (activeTurnId) {
+                client.request('turn/interrupt', { threadId, turnId: activeTurnId }).catch(() => {});
+              }
+              // Don't `finish` immediately — wait for the server's terminal
+              // event to land so we don't race with a `turn/completed`
+              // arriving during the round-trip.
+              setTimeoutCheckAbort();
+            };
+            // If turn/completed never arrives after abort (e.g. server
+            // ignored interrupt because turn was already settling),
+            // we still resolve to canceled after a short grace period.
+            let abortGracePending = false;
+            const setTimeoutCheckAbort = (): void => {
+              if (abortGracePending) return;
+              abortGracePending = true;
+              setTimeout(() => {
+                if (!settled) {
+                  finish({ status: 'aborted', finalText });
+                }
+              }, 2_000);
+            };
+            signal.addEventListener('abort', onAbort);
+
+            // Idle-silence heartbeat — same shape as codex.ts.
+            let heartbeatHandle: unknown = null;
+            if (heartbeatMs > 0) {
+              heartbeatHandle = setIntervalImpl(() => {
+                if (settled) return;
+                if (now() - lastEmitAt < heartbeatMs) return;
+                emit({
+                  type: 'task.status',
+                  taskId: task.taskId,
+                  status: { state: 'working', timestamp: new Date().toISOString() },
+                });
+              }, heartbeatMs);
+            }
+
+            // Wire client-side timeout if configured. The default 0 means
+            // wait for the server.
+            if (turnTimeoutMs > 0) {
+              setTimeout(() => {
+                if (!settled) {
+                  finish({
+                    status: 'failed',
+                    error: { message: `turn timed out after ${turnTimeoutMs}ms` },
+                    finalText,
+                  });
+                }
+              }, turnTimeoutMs);
+            }
+
+            // Detect a transport closure mid-turn — the rpc client rejects
+            // pending requests on close, but our turn-result loop is
+            // notification-driven. Race the close future against the rest.
+            void client.waitForClose().then(() => {
+              if (!settled) {
+                finish({
+                  status: 'failed',
+                  error: { message: 'codex app-server transport closed during turn' },
+                  finalText,
+                });
+              }
+            });
+
+            // Fire turn/start. The response carries our turnId so we can
+            // filter notifications.
+            client
+              .request<{ turn: { id: string } }>('turn/start', {
+                threadId,
+                input: userInput,
+              })
+              .then(
+                (res) => {
+                  activeTurnId = res.turn.id;
+                  recorder.mark('turnStarted');
+                },
+                (err) => {
+                  finish({
+                    status: 'failed',
+                    error: { message: `turn/start failed: ${errorMessage(err)}` },
+                    finalText,
+                  });
+                },
+              );
+          });
+
+          // Map turn outcome to A2A lifecycle.
+          if (outcome.status === 'interrupted' || outcome.status === 'aborted') {
+            rollbackFreshThread();
+            rollbackResumeRefresh();
+            emit({
+              type: 'task.complete',
+              taskId: task.taskId,
+              status: { state: 'canceled', timestamp: new Date().toISOString() },
+            });
+            return;
+          }
+
+          if (outcome.status === 'failed') {
+            rollbackFreshThread();
+            rollbackResumeRefresh();
+            emit({
+              type: 'task.fail',
+              taskId: task.taskId,
+              error: {
+                code: 'turn_failed',
+                message: outcome.error?.message ?? 'turn failed',
+              },
+            });
+            return;
+          }
+
+          // Refresh the resumed binding on success so TTL extends.
+          if (isResume && sessionTtlMs > 0) {
+            const cur = sessions.get(task.contextId);
+            if (cur?.threadId === existing.threadId && cur.writeId === writeId) {
+              sessions.set(task.contextId, {
+                threadId: existing.threadId,
+                lastUsedAt: now(),
+                writeId,
+              });
+            }
+          }
+
+          const completeText = outcome.finalText ?? '';
+          const parts: Part[] = completeText
+            ? [{ kind: 'text', text: completeText }]
+            : [];
+          if (!emittedAnyArtifact && completeText) {
+            emit({
+              type: 'task.artifact',
+              taskId: task.taskId,
+              artifact: {
+                artifactId: randomUUID(),
+                name: 'codex-result',
+                parts,
+              },
+              lastChunk: true,
+            });
+          }
+
+          // Attach the openai-compat/v1 `usage` payload to the final A2A
+          // message of this turn when codex reported it on turn/completed.
+          // When usage is present but there are no parts we still emit the
+          // message frame (with empty parts) to carry the metadata.
+          const hasMessage = parts.length > 0 || finalUsage !== null;
+          const messageMetadata = finalUsage
+            ? makeOpenAICompatUsageMetadata(finalUsage)
+            : undefined;
           emit({
             type: 'task.complete',
             taskId: task.taskId,
-            status: { state: 'canceled', timestamp: new Date().toISOString() },
-          });
-          return;
-        }
-
-        if (exit.error) {
-          rollbackFreshThread();
-          rollbackResumeRefresh();
-          emit({
-            type: 'task.fail',
-            taskId: task.taskId,
-            error: { code: 'spawn_failed', message: errorMessage(exit.error) },
-          });
-          return;
-        }
-
-        if (exit.code !== 0) {
-          rollbackFreshThread();
-          rollbackResumeRefresh();
-          const detail = stderrTail.trim();
-          const detailPart = detail ? `: ${detail.slice(-500)}` : '';
-          const stdinPart = stdinError ? ` [stdin: ${errorMessage(stdinError)}]` : '';
-          const exitMessage =
-            exit.code === null && exit.signal
-              ? `codex terminated by signal ${exit.signal}${detailPart}${stdinPart}`
-              : `codex exited with code ${exit.code}${exit.signal ? ` (signal ${exit.signal})` : ''}${detailPart}${stdinPart}`;
-          // The repro details (argv with --image temp paths, cwd) are
-          // host-local: they should help the local operator but must not
-          // travel over the wire to the bridge server in `error.message`,
-          // which is plaintext-forwarded to the caller. Emit them as a
-          // separate local log line keyed by taskId so operators can
-          // line it up with the `task.fail` lifecycle log.
-          //
-          // taskId is wire-derived and could carry control chars; we run
-          // it through safeToken to match the lifecycle log's single-line
-          // invariant. JSON.stringify leaves U+2028 / U+2029 raw, which
-          // some log sinks render as line breaks — escape them on the
-          // argv / cwd JSON payloads so the warn line stays one line.
-          const argvSummary = escapeLineSeparators(
-            clipTo(JSON.stringify([command, ...args]), 400),
-          );
-          const cwdSummary = cwd
-            ? ` cwd=${escapeLineSeparators(JSON.stringify(cwd))}`
-            : '';
-          logger.warn(
-            `codex exec-failure repro taskId=${safeToken(task.taskId)} argv=${argvSummary}${cwdSummary}`,
-          );
-          emit({
-            type: 'task.fail',
-            taskId: task.taskId,
-            error: {
-              code: 'codex_exit_nonzero',
-              message: exitMessage,
+            status: {
+              state: 'completed',
+              timestamp: new Date().toISOString(),
+              ...(hasMessage
+                ? {
+                    message: {
+                      role: 'agent',
+                      messageId: randomUUID(),
+                      parts,
+                      ...(messageMetadata
+                        ? {
+                            metadata: messageMetadata,
+                            extensions: [OPENAI_COMPAT_EXTENSION_URI],
+                          }
+                        : {}),
+                    },
+                  }
+                : {}),
             },
           });
-          return;
+        } finally {
+          if (mapped.tempDir) {
+            try {
+              await rm(mapped.tempDir, { recursive: true, force: true });
+            } catch {
+              // best-effort cleanup
+            }
+          }
         }
-
-        const completeText = finalText ?? '';
-        const parts: Part[] = completeText ? [{ kind: 'text', text: completeText }] : [];
-        if (!emittedAnyArtifact && completeText) {
-          emit({
-            type: 'task.artifact',
-            taskId: task.taskId,
-            artifact: {
-              artifactId: randomUUID(),
-              name: 'codex-result',
-              parts,
-            },
-            lastChunk: true,
-          });
-        }
-
-        // Attach the openai-compat/v1 `usage` payload to the final A2A
-        // message of this turn when codex reported it on `turn.completed`.
-        // When usage is present but there are no parts we still emit the
-        // message frame (with empty parts) to carry the metadata.
-        const hasMessage = parts.length > 0 || finalUsage !== null;
-        const messageMetadata = finalUsage
-          ? makeOpenAICompatUsageMetadata(finalUsage)
-          : undefined;
-        emit({
-          type: 'task.complete',
-          taskId: task.taskId,
-          status: {
-            state: 'completed',
-            timestamp: new Date().toISOString(),
-            ...(hasMessage
-              ? {
-                  message: {
-                    role: 'agent',
-                    messageId: randomUUID(),
-                    parts,
-                    ...(messageMetadata
-                      ? {
-                          metadata: messageMetadata,
-                          extensions: [OPENAI_COMPAT_EXTENSION_URI],
-                        }
-                      : {}),
-                  },
-                }
-              : {}),
-          },
-        });
       } finally {
-        if (mapped.tempDir) {
-          try {
-            await rm(mapped.tempDir, { recursive: true, force: true });
-          } catch {
-            // Best-effort cleanup; task result should not fail after the child settled.
-          }
-        }
-        // Separately clean the openai-compat instructions dir when it was
-        // not co-located with `mapped.tempDir` (i.e. there were no images).
-        if (instructionsTempDir && instructionsTempDir !== mapped.tempDir) {
-          try {
-            await rm(instructionsTempDir, { recursive: true, force: true });
-          } catch {
-            // Best-effort cleanup; see above.
-          }
-        }
+        releaseLock();
       }
     },
   };
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  if (ms <= 0) return p;
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(label)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(t);
+        reject(err);
+      },
+    );
+  });
 }

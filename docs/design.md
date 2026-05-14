@@ -82,7 +82,7 @@ vicoop-client \
 # Codex CLI
 vicoop-client \
   --backend codex
-  # internally: `codex exec --json -` / `codex exec resume --json <thread_id> -`
+  # internally: `codex app-server` (one persistent JSON-RPC over stdio process)
 
 # Generic webhook
 vicoop-client \

@@ -584,13 +584,18 @@ Codex sessions.
 > applies, but stamped into argv so the posture is visible in `ps` / audit
 > logs and survives any future change to Codex's own default.
 
-> **`cwd` need not be a git repository.** `codex exec` refuses by default
-> to run outside a trusted directory, exiting non-zero in ~200 ms (#147).
-> The Codex backend always passes `--skip-git-repo-check` to keep the
-> CLI usable from an operator-chosen `cwd` (an agent's working tree is
-> often not a git repo). Sandboxing is unchanged — the cwd-trust check
-> is a CLI ergonomics gate, not part of `sandbox_mode`. The flag is
-> deduplicated when also listed in `backends.codex.extra_args`.
+> **`cwd` need not be a git repository.** The Codex backend speaks
+> `codex app-server` over stdio JSON-RPC and does not require a
+> git-trusted directory the way `codex exec` did (#147). Sandboxing is
+> unchanged — the cwd-trust check was a CLI ergonomics gate, not part
+> of `sandbox_mode`.
+
+> **Approval prompts.** When codex sends a server-initiated approval
+> request (`execCommandApproval` / `applyPatchApproval`) the backend
+> answers with `decline` by default — safe even under
+> `workspace-write`. Operators that want auto-accept set
+> `backends.codex.approval_decision` to `accept` or `acceptForSession`
+> in `config.json`.
 
 ## Manage caller allowlists
 

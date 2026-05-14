@@ -1,6 +1,6 @@
 {
   "name": "codex",
-  "description": "OpenAI Codex CLI agent. Spawns the local `codex` binary per task and streams agent messages back as A2A text artifacts. Accepts text, inline image, and JSON data part inputs.",
+  "description": "OpenAI Codex agent driven via `codex app-server` (persistent stdio JSON-RPC). One long-lived codex process serves all turns and streams agent messages back as A2A text artifacts. Accepts text, inline image, and JSON data part inputs.",
   "version": "0.0.1",
   "protocolVersion": "0.3.0",
   "capabilities": {

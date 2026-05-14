@@ -1,6 +1,6 @@
 {
   "name": "codex",
-  "description": "OpenAI Codex CLI agent. Spawns the local `codex` binary per task and streams agent messages back as A2A text artifacts. Accepts text and inline image inputs.",
+  "description": "OpenAI Codex agent driven via `codex app-server` (persistent stdio JSON-RPC). One long-lived codex process serves all turns and streams agent messages back as A2A text artifacts. Accepts text, inline image, and JSON data part inputs.",
   "version": "0.0.1",
   "protocolVersion": "0.3.0",
   "capabilities": {
@@ -23,7 +23,8 @@
     "image/png",
     "image/jpeg",
     "image/gif",
-    "image/webp"
+    "image/webp",
+    "application/json"
   ],
   "defaultOutputModes": [
     "text/plain"
@@ -32,7 +33,7 @@
     {
       "id": "chat",
       "name": "chat",
-      "description": "Ask a question or give an instruction in natural language; the Codex CLI responds with text. Include image (image/{png,jpeg,gif,webp}) parts as inline `file.bytes`.",
+      "description": "Ask a question or give an instruction in natural language; the Codex agent responds with text. Include image (image/{png,jpeg,gif,webp}) parts as inline `file.bytes`. Auxiliary structured context can be attached as A2A `data` parts; they are serialized into the prompt as tagged JSON blocks.",
       "tags": ["chat", "assistant", "codex"]
     }
   ]
