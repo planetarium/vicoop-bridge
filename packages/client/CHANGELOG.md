@@ -1,5 +1,76 @@
 # @vicoop-bridge/client
 
+## 0.15.0
+
+### Minor Changes
+
+- d609ec5: Add per-task timing milestones to codex and claude backends. Each task now
+  emits a single structured `[client] timing backend=… taskId=… contextId=…
+mapMs=… spawnMs=… firstOutMs=… firstFinalMs=… closedMs=… emitMs=…
+totalMs=… state=… code=…` line at the terminal emit, so operators can grep
+  per-phase distribution without running a profiler. Emitted at `debug` so
+  default `info` level is unchanged; set `VICOOP_CLIENT_LOG_LEVEL=debug` to
+  see it.
+- 514fc52: Rewrite the `codex` backend to drive one persistent `codex app-server` subprocess over stdio JSON-RPC for the lifetime of the client, instead of spawning `codex exec` per task. The wire-facing A2A surface is unchanged — same `--backend codex`, same `BACKEND=codex`, same `backends.codex` config block, same openai-compat extension, same `tool_call_history`, image FileParts, traceability artifacts, and sandbox modes.
+
+  Operator config impact:
+
+  - `backends.codex.cwd`, `backends.codex.sandbox_mode`, `CODEX_CWD`, `CODEX_SANDBOX_MODE` keep their meaning.
+  - `backends.codex.extra_args` is removed — the JSON-RPC transport doesn't take CLI flags the way `codex exec` did. The single in-tree user (`--skip-git-repo-check`) is no longer needed because app-server doesn't require a git-trusted directory.
+  - New: `backends.codex.approval_decision` (`accept` / `acceptForSession` / `decline`, default `decline`) — what to answer when codex sends a server-initiated approval request (`execCommandApproval` / `applyPatchApproval`). Safe even under `workspace-write`; operators that explicitly want auto-accept opt in.
+
+  Behavior changes:
+
+  - Multi-turn `tool_call_history` is now injected as native Responses API `function_call` / `function_call_output` items via `thread/inject_items`, not as a `<tool_call_history>` JSON blob prepended to the user prompt. This eliminates the multi-turn re-call loop observed under prompts like `"Use a tool to list ..."` (#176) — the model sees real prior tool dispatch rather than a JSON envelope it has to be instructed to interpret.
+  - Built-in `shell_tool` / `unified_exec` are disabled per-thread via `config.features` (was: `--disable shell_tool --disable unified_exec` argv).
+  - Concurrent same-`contextId` tasks are serialised through a per-context lock (app-server rejects a second `turn/start` while another is active on the same thread). Previously each task got its own subprocess so the race didn't exist.
+  - Per-task fork-exec isolation is no longer in play. Operators that depended on it should comment on #177.
+
+  Performance (prompt: `Reply OK`, same contextId, 2 turns):
+
+  - Old (per-task spawn): turn 1 ~10s, turn 2 ~10s
+  - New (persistent app-server): turn 1 ~6–9s, turn 2 ~1.3–1.6s
+
+  The win is on follow-up turns — the prior backend paid `codex exec resume` startup on every turn; the new one keeps the agent warm in a single process. See #169 for the design and measurement notes; #177 for why the two backends were consolidated under the `codex` name instead of shipping a separate `codex-app-server` backend alongside.
+
+- f1406de: Add `vicoop-client list-clients` and `vicoop-client revoke-client` subcommands so an owner can inspect and clean up their own `clients` rows from the CLI without dropping into admin GraphQL or psql (issue #166).
+
+  **Client surface**
+
+  - `vicoop-client list-clients [--bridge URL] [--json]` lists every `clients` row owned by the operator. Output columns are `client_id`, `client_name`, `allowed_agent_ids`, `revoked`, `connected`, `created_at`. `connected` reflects in-memory registry state so orphans left behind by an aborted setup or an exited daemon show up with `connected: false`.
+  - `vicoop-client revoke-client <client-id-or-name> [--bridge URL]` resolves either a UUID `client_id` or a unique `client_name` and sets `revoked = true` on the row. An ambiguous name exits non-zero with a list of candidate ids so the operator can retry with the id.
+  - Both subcommands authenticate with the existing `vicoop-client login` owner-session bearer — same flow as `add-caller` / `remove-caller`.
+
+  **Server surface**
+
+  - `GET /admin-api/clients` and `DELETE /admin-api/clients/:target` under the same owner-session bearer guard as the existing `/admin-api/agents/*` routes. RLS filters list/delete to the operator's own rows; reads of another principal's rows return 404 (no existence leak), name-resolution ambiguity returns 409.
+  - `Registry.disconnectClient(clientId)` closes every live WebSocket bound to a revoked client with new close code **4014 "client revoked"**. (4010 was already taken by the agent-id-owned-by-different-principal path in `ws.ts`.)
+
+  **Daemon behavior**
+
+  - The client daemon's reconnect loop now treats two close codes as terminal: 4014 "client revoked" (the live-disconnect path) and 4005 "bad token" (the relaunch path — a daemon restarted with the same revoked token, or launched with a wrong token in the first place). Both fire `onFatal` and exit non-zero instead of reconnect-looping against a permanently-failing auth. All other close codes still go through the normal exponential-backoff reconnect path.
+
+  **Revocation propagation**
+
+  - Client-token verification in `ws.ts` queries `clients` directly on every WS register (no LRU cache, unlike the 60s `callers` cache documented in `local-testing.md`), so revocation is effectively synchronous from the next auth attempt — and combined with the 4005-terminal client behavior above, a daemon relaunched with the same token after revoke exits at first hello instead of looping. No cache-invalidation work needed on the server side.
+
+  **Schema**
+
+  - No schema migration. The existing `clients.revoked BOOLEAN` column and `revoke_client(TEXT)` PL/pgSQL function are reused as-is. Promoting the column to a `revoked_at TIMESTAMPTZ` for audit-trail purposes is filed as a follow-up — it's orthogonal to the CLI surface this change ships and would have a much larger blast radius (the `client_with_token` TYPE, the admin agent's LLM prompt, and all `SELECT … WHERE revoked = false` predicates would need touching).
+
+  Documentation: a new "Inspecting and revoking your clients" section in `docs/install-client.md` replaces the previous "use the admin agent's CRUD mutations" hand-wave for the cleanup case.
+
+- bc2fbf5: Forward authoritative token counts from the `codex` and `claude` backends as the A2A [openai-compat/v1 response-side `usage`](https://github.com/planetarium/oai2a2a/pull/35) payload, so OpenAI-compatible gateways can surface real numbers in `chat.completion.usage` instead of falling back to a local cl100k_base estimate.
+
+  Wiring:
+
+  - **codex**: parse `turn.completed.usage` (`input_tokens` / `cached_input_tokens` / `output_tokens` / `reasoning_output_tokens`) and map 1:1 to the spec — `cached_input_tokens` is already included in `input_tokens` (mirrored to `prompt_tokens_details.cached_tokens`); `reasoning_output_tokens` is a breakdown of `output_tokens`, not additive.
+  - **claude**: parse the terminal `result.modelUsage` map and sum across entries. Using top-level `result.usage` would silently underreport because Claude Code can route a single turn through internal sub-models (e.g. haiku for summarisation) whose tokens never appear on `result.usage` but do appear under `modelUsage`. `cacheReadInputTokens` is mirrored losslessly: included in `prompt_tokens` AND surfaced as `prompt_tokens_details.cached_tokens`.
+
+  When the underlying CLI omits usage (older codex versions, claude runs that never produced a `result` event), the agent emits no `usage` key and the gateway falls back to its local estimate — emission is best-effort per the spec.
+
+  The wire shape lives on `Task.status.message.metadata[<openai-compat/v1 URI>].usage` of the final A2A message of the turn, with `total_tokens = prompt_tokens + completion_tokens` computed locally so the MUST invariant holds regardless of what the runtime reports.
+
 ## 0.14.0
 
 ### Minor Changes
