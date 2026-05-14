@@ -87,7 +87,11 @@ interface CodexEvent {
   };
 }
 
-type MappedInput =
+// Shared with the `codex-app-server` backend: the input-mapping result
+// shape is identical (prompt text + materialised image temp paths +
+// tempDir for finally-cleanup); only the downstream wire framing differs
+// (argv `--image` vs. `UserInput {type:"localImage", path}`).
+export type MappedInput =
   | { ok: true; prompt: string; imageFiles: string[]; tempDir: string | null }
   | { ok: false; code: string; message: string };
 
@@ -162,7 +166,7 @@ function commandSummary(item: NonNullable<CodexEvent['item']>): string {
   return clipTo(output ? `${head}\n${output}` : head, COMMAND_TRACE_MAX_CHARS);
 }
 
-async function mapPartsToCodexInput(
+export async function mapPartsToCodexInput(
   parts: readonly Part[],
   io: {
     mkdtemp: (prefix: string) => Promise<string>;

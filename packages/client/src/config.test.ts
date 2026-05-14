@@ -374,6 +374,60 @@ test('normalizeConfig drops unknown backend and unknown codex.sandbox_mode', (t)
   });
 });
 
+test('normalizeConfig accepts backends.codex-app-server with sandbox_mode and approval_decision', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-cas-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  writeFileSync(
+    path,
+    JSON.stringify({
+      server_url: 'wss://b',
+      backend: 'codex-app-server',
+      backends: {
+        'codex-app-server': {
+          cwd: '/srv',
+          sandbox_mode: 'workspace-write',
+          approval_decision: 'acceptForSession',
+        },
+      },
+    }),
+  );
+  assert.deepEqual(readConfig(path), {
+    server_url: 'wss://b',
+    backend: 'codex-app-server',
+    backends: {
+      'codex-app-server': {
+        cwd: '/srv',
+        sandbox_mode: 'workspace-write',
+        approval_decision: 'acceptForSession',
+      },
+    },
+  });
+});
+
+test('normalizeConfig drops invalid codex-app-server approval_decision and sandbox_mode', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-cas-bad-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  writeFileSync(
+    path,
+    JSON.stringify({
+      backends: {
+        'codex-app-server': {
+          cwd: '/work',
+          sandbox_mode: 'workspace_write', // typo — dropped
+          approval_decision: 'yes', // not in enum — dropped
+        },
+      },
+    }),
+  );
+  assert.deepEqual(readConfig(path), {
+    backends: {
+      'codex-app-server': { cwd: '/work' },
+    },
+  });
+});
+
 test('readConfig drops malformed fields and keeps the rest', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-bad-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
