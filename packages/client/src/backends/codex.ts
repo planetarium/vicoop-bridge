@@ -17,6 +17,7 @@ import {
 } from './claude.js';
 import { createLogger, escapeLineSeparators, safeToken, type Logger } from '../logger.js';
 import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME } from './fetch-uri-file.js';
+import { createTimingRecorder } from './timing.js';
 
 export interface CodexChildHandle {
   readonly stdin: NodeJS.WritableStream | null;
@@ -298,9 +299,29 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
 
     async handle(task, rawEmit, signal) {
       let lastEmitAt = now();
+      const recorder = createTimingRecorder({
+        logger,
+        backend: 'codex',
+        taskId: task.taskId,
+        contextId: task.contextId,
+        now,
+      });
+      // Terminal frame types trigger the single per-task timing log line.
+      // The mark fires BEFORE rawEmit so the emit-side cost is captured,
+      // and finish fires AFTER so the line follows the lifecycle log.
       const emit: typeof rawEmit = (frame) => {
         lastEmitAt = now();
+        const terminal = frame.type === 'task.complete' || frame.type === 'task.fail';
+        if (terminal) recorder.mark('emit');
         rawEmit(frame);
+        if (terminal) {
+          const state =
+            frame.type === 'task.fail'
+              ? 'failed'
+              : frame.status?.state ?? 'completed';
+          const code = frame.type === 'task.fail' ? frame.error?.code : undefined;
+          recorder.finish({ state, code });
+        }
       };
 
       if (signal.aborted) {
@@ -313,6 +334,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
       }
 
       const mapped = await mapPartsToCodexInput(task.message.parts, { mkdtemp, writeFile, rm });
+      recorder.mark('map');
       if (!mapped.ok) {
         emit({
           type: 'task.fail',
@@ -466,6 +488,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
         let child: CodexChildHandle;
         try {
           child = spawnFn(command, args, { cwd });
+          recorder.mark('spawn');
         } catch (err) {
           rollbackResumeRefresh();
           emit({
@@ -512,6 +535,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
           : mapped.prompt;
         try {
           child.stdin.end(promptToWrite);
+          recorder.mark('stdin');
         } catch (err) {
           stdinError = err;
         }
@@ -599,6 +623,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
           }
           if (evt.type !== 'item.completed' || !evt.item) return;
           if (evt.item.type === 'agent_message' && typeof evt.item.text === 'string') {
+            recorder.mark('firstFinal');
             finalText = evt.item.text;
             emitAgentArtifact(evt.item.text);
             return;
@@ -621,6 +646,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
 
         let stdoutBuf = '';
         child.stdout?.on('data', (chunk: Buffer | string) => {
+          recorder.mark('firstOut');
           stdoutBuf += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
           let nl: number;
           while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
@@ -657,6 +683,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
           child.on('error', (err) => resolve({ code: null, signal: null, error: err }));
           child.on('close', (code, sig) => resolve({ code, signal: sig }));
         });
+        recorder.mark('closed');
 
         signal.removeEventListener('abort', onAbort);
         if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
