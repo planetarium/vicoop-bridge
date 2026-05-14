@@ -53,17 +53,31 @@ export interface InitializeResult {
   platformOs?: string;
 }
 
+// Open `config` passthrough on thread/start and thread/resume. The full
+// codex schema treats this as a wide object (`additionalProperties: true`);
+// we model only the nested keys we actually set so the codex schema can
+// grow without forcing edits here. `features.<name>=false` is the seam we
+// use to disable built-in shell/exec tools when caller-side tool dispatch
+// is active (#175). Re-passed on every resume because feature flags do not
+// persist across thread/resume in app-server.
+export interface ThreadConfigOverride {
+  features?: Record<string, boolean>;
+  [key: string]: unknown;
+}
+
 export interface ThreadStartParams {
   cwd?: string | null;
   sandbox?: SandboxMode | null;
   developerInstructions?: string | null;
   baseInstructions?: string | null;
+  config?: ThreadConfigOverride | null;
 }
 
 export interface ThreadResumeParams {
   threadId: string;
   cwd?: string | null;
   sandbox?: SandboxMode | null;
+  config?: ThreadConfigOverride | null;
 }
 
 export interface ThreadStartOrResumeResult {
@@ -86,6 +100,37 @@ export interface TurnStartResult {
 export interface TurnInterruptParams {
   threadId: string;
   turnId: string;
+}
+
+// Native function-call history items appended to a thread's model-visible
+// context via `thread/inject_items`. These are OpenAI Responses API items;
+// codex's session builder includes them in the model prompt as proper
+// prior tool dispatch rather than as JSON text the model has to be
+// instructed to interpret. We model the two variants we use here
+// (function_call + function_call_output) and pass anything else through
+// as opaque so the schema can grow without forcing edits.
+export interface FunctionCallItem {
+  type: 'function_call';
+  call_id: string;
+  name: string;
+  /** OpenAI spec: arguments is a JSON-encoded string. */
+  arguments: string;
+}
+
+export interface FunctionCallOutputItem {
+  type: 'function_call_output';
+  call_id: string;
+  output: string;
+}
+
+export type ResponsesApiItem =
+  | FunctionCallItem
+  | FunctionCallOutputItem
+  | { type: string; [key: string]: unknown };
+
+export interface ThreadInjectItemsParams {
+  threadId: string;
+  items: ResponsesApiItem[];
 }
 
 export interface ApprovalResponse {

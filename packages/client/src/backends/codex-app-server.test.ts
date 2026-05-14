@@ -257,6 +257,12 @@ function happyPath(opts: HappyPathOptions = {}): ChildScenario {
         child.emitStdout({ id, result: { thread: { id: activeThreadId } } });
         return;
       }
+      if (method === 'thread/inject_items' && id !== undefined) {
+        // Empty-object result mirrors the real server's response shape;
+        // the backend treats it as fire-and-confirm.
+        child.emitStdout({ id, result: {} });
+        return;
+      }
       if (method === 'turn/start' && id !== undefined) {
         turnCounter += 1;
         const localTurnId = `${turnId}-${turnCounter}`;
@@ -703,7 +709,12 @@ test('image FilePart is materialised under a temp dir and passed as localImage U
   assert.equal(frames.at(-1)?.type, 'task.complete');
 });
 
-test('openai-compat tool_call_history is replayed as a prefix on the user text', async () => {
+test('openai-compat tool_call_history is injected as native Responses API items, NOT folded into user text', async () => {
+  // Codex absorbs `function_call` / `function_call_output` items as proper
+  // prior tool dispatch — the model sees them as its own past actions and
+  // does not re-emit the same envelope (#176). The text input must NOT
+  // carry a `<tool_call_history>` blob anymore: the native channel is the
+  // single source of truth.
   const fake = makeFakeSpawn(() => happyPath());
   const backend = createCodexAppServerBackend({ spawn: fake.spawn });
   const { emit, frames } = collect();
@@ -732,18 +743,80 @@ test('openai-compat tool_call_history is replayed as a prefix on the user text',
     NEVER,
   );
 
+  // thread/inject_items must be sent between thread/start and turn/start,
+  // with one function_call + one function_call_output item paired by call_id.
+  const inject = findRequest(fake.lastChild().stdinFrames(), 'thread/inject_items');
+  assert.ok(inject, 'thread/inject_items observed');
+  const injectParams = (inject as {
+    params?: { items?: Array<Record<string, unknown>> };
+  }).params;
+  assert.deepEqual(injectParams?.items, [
+    { type: 'function_call', call_id: 'tc1', name: 'lookup', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'tc1', output: 'OK' },
+  ]);
+
+  // The user text part of turn/start carries ONLY the user's text — no
+  // history blob is folded in.
   const turnStart = findRequest(fake.lastChild().stdinFrames(), 'turn/start');
   const params = (turnStart as {
     params?: { input?: Array<{ type: string; text?: string }> };
   }).params;
   const textItem = params?.input?.find((it) => it.type === 'text');
-  assert.ok(textItem?.text?.includes('next'));
-  assert.ok(
-    textItem?.text?.includes('tool_call_history') ||
-      textItem?.text?.includes('lookup'),
-    'tool call history is replayed in the prompt',
-  );
+  assert.equal(textItem?.text, 'next');
   assert.equal(frames.at(-1)?.type, 'task.complete');
+});
+
+test('absent tool_call_history skips thread/inject_items entirely', async () => {
+  // First-turn tasks (no prior round-trips) must NOT send a dangling
+  // empty-items inject.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexAppServerBackend({ spawn: fake.spawn });
+  await backend.handle(assign('hi', 'ctx-no-hist'), collect().emit, NEVER);
+  const inject = findRequest(fake.lastChild().stdinFrames(), 'thread/inject_items');
+  assert.equal(inject, null);
+});
+
+test('parallel tool_calls in one assistant entry fan out into one function_call item each', async () => {
+  // OpenAI permits multiple tool_calls per assistant message (parallel
+  // tool use). Each becomes its own native function_call item so codex's
+  // session sees each call as a discrete event.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexAppServerBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('next', 'ctx-parallel', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'next' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tool_call_history: [
+              {
+                role: 'assistant',
+                tool_calls: [
+                  { id: 'tc1', function: { name: 'a', arguments: '{"x":1}' } },
+                  { id: 'tc2', function: { name: 'b', arguments: '{"y":2}' } },
+                ],
+              },
+              { role: 'tool', tool_call_id: 'tc1', content: 'A' },
+              { role: 'tool', tool_call_id: 'tc2', content: 'B' },
+            ],
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  const inject = findRequest(fake.lastChild().stdinFrames(), 'thread/inject_items');
+  const items = (inject as { params?: { items?: Array<Record<string, unknown>> } })
+    .params?.items;
+  assert.deepEqual(items, [
+    { type: 'function_call', call_id: 'tc1', name: 'a', arguments: '{"x":1}' },
+    { type: 'function_call', call_id: 'tc2', name: 'b', arguments: '{"y":2}' },
+    { type: 'function_call_output', call_id: 'tc1', output: 'A' },
+    { type: 'function_call_output', call_id: 'tc2', output: 'B' },
+  ]);
 });
 
 test('expired session falls back to thread/start instead of thread/resume', async () => {
@@ -940,4 +1013,129 @@ test('openai-compat envelope agent message is emitted as a data part', async () 
       params.developerInstructions.length > 0,
     'developerInstructions sent on thread/start',
   );
+});
+
+test('thread/start carries `config.features.{shell_tool,unified_exec}: false` when caller tools are active (#175)', async () => {
+  // Without this, codex would execute the caller's "bash" call itself in
+  // its sandbox and emit a plain-text result instead of the openai-compat
+  // envelope the caller is waiting for.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexAppServerBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('list files', 'ctx-features', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'list files' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as {
+    params?: { config?: { features?: Record<string, boolean> } };
+  }).params;
+  assert.deepEqual(params?.config?.features, {
+    shell_tool: false,
+    unified_exec: false,
+  });
+});
+
+test('thread/start omits `config` when no caller tools are supplied', async () => {
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexAppServerBackend({ spawn: fake.spawn });
+  // Plain text task with no openai-compat metadata.
+  await backend.handle(assign('hi', 'ctx-no-features'), collect().emit, NEVER);
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { config?: unknown } }).params;
+  assert.equal(params?.config, undefined);
+});
+
+test('history-only openai-compat payload (no `tools`) does not disable codex built-ins', async () => {
+  // Mirror of the codex (exec) backend test. With tools absent there is no
+  // caller-side dispatch contract to protect; do not handicap codex's
+  // built-ins for this turn.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexAppServerBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('continue', 'ctx-hist-no-feat', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'continue' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tool_call_history: [
+              { role: 'assistant', tool_calls: [{ id: 'tc1', function: { name: 'x', arguments: '{}' } }] },
+              { role: 'tool', tool_call_id: 'tc1', content: 'OK' },
+            ],
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { config?: unknown } }).params;
+  assert.equal(params?.config, undefined);
+});
+
+test('thread/resume re-passes `config.features` because feature flags do not persist across resume (#175)', async () => {
+  // Two turns on the same contextId: first thread/start, second
+  // thread/resume. Both must carry the disable flags — feature settings
+  // are scoped to a single resume span server-side, so a missing config on
+  // resume would silently re-enable shell_tool.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexAppServerBackend({ spawn: fake.spawn });
+  const meta = {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+    },
+  };
+  await backend.handle(
+    assign('one', 'ctx-feat-resume', {
+      message: {
+        role: 'user',
+        messageId: 'm1',
+        parts: [{ kind: 'text', text: 'one' }],
+        metadata: meta,
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  await backend.handle(
+    assign('two', 'ctx-feat-resume', {
+      message: {
+        role: 'user',
+        messageId: 'm2',
+        parts: [{ kind: 'text', text: 'two' }],
+        metadata: meta,
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const frames = fake.lastChild().stdinFrames();
+  const start = findRequest(frames, 'thread/start');
+  const resume = findRequest(frames, 'thread/resume');
+  assert.ok(start, 'thread/start observed');
+  assert.ok(resume, 'thread/resume observed');
+  const startFeatures = (start as { params?: { config?: { features?: Record<string, boolean> } } })
+    .params?.config?.features;
+  const resumeFeatures = (resume as { params?: { config?: { features?: Record<string, boolean> } } })
+    .params?.config?.features;
+  assert.deepEqual(startFeatures, { shell_tool: false, unified_exec: false });
+  assert.deepEqual(resumeFeatures, { shell_tool: false, unified_exec: false });
 });

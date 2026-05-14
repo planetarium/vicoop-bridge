@@ -11,6 +11,7 @@ import {
 import type { Backend } from '../backend.js';
 import {
   buildOpenAICompatSystemPrompt,
+  callerToolDispatchActive,
   formatToolCallHistory,
   parseOpenAICompatMetadata,
   tryParseToolCallsEnvelope,
@@ -480,11 +481,21 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
         const instructionsArgs = instructionsFile
           ? ['-c', `model_instructions_file=${JSON.stringify(instructionsFile)}`]
           : [];
+        // Disable codex's built-in shell/exec tools when the caller has
+        // supplied its own tool definitions via the openai-compat extension.
+        // Without this, codex executes commands in its sandbox and emits
+        // plain-text results, silently bypassing the caller's tool dispatch
+        // contract (#175). Re-passed on resume because feature flags are
+        // not persisted across `codex exec resume`.
+        const disableBuiltinToolArgs = callerToolDispatchActive(openaiCompat)
+          ? ['--disable', 'shell_tool', '--disable', 'unified_exec']
+          : [];
         const optionArgs = [
           '--json',
           '-c',
           `sandbox_mode=${JSON.stringify(sandboxMode)}`,
           ...skipGitRepoCheck,
+          ...disableBuiltinToolArgs,
           ...instructionsArgs,
           ...mapped.imageFiles.flatMap((filePath) => ['--image', filePath]),
           ...extraArgs,

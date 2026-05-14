@@ -918,6 +918,13 @@ test('argv carries `-c model_instructions_file=...` and the file contains the en
     '-c',
     'sandbox_mode="read-only"',
     '--skip-git-repo-check',
+    // `tools` are present → suppress codex's built-in shell/exec tools so
+    // they don't bypass the caller's envelope contract (#175). Sits
+    // between --skip-git-repo-check and the instructions-file pair.
+    '--disable',
+    'shell_tool',
+    '--disable',
+    'unified_exec',
     '-c',
     'model_instructions_file="/tmp/vicoop-codex-instr/instructions.md"',
     '-',
@@ -955,6 +962,110 @@ test('absent metadata → no instructions file is written and no `model_instruct
     args.some((a) => typeof a === 'string' && a.startsWith('model_instructions_file=')),
     false,
   );
+});
+
+test('history-only payload (no tools) leaves the built-in shell/exec tools enabled', async () => {
+  // Counterpart to the `tools`-present test: when the openai-compat payload
+  // has no `tools` array, there is no caller-side dispatch contract to
+  // protect, so codex's built-in shell/exec tools should stay available —
+  // `--disable shell_tool` / `--disable unified_exec` MUST NOT appear.
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    mkdtemp: async () => '/tmp/vicoop-codex-instr',
+    writeFile: async () => {},
+    rm: async () => {},
+  });
+
+  await backend.handle(
+    assignWithOpenAICompat('continue', { tool_call_history: SAMPLE_HISTORY }),
+    collect().emit,
+    NEVER,
+  );
+
+  const args = fake.lastChild()!.args;
+  assert.equal(args.includes('shell_tool'), false);
+  assert.equal(args.includes('unified_exec'), false);
+});
+
+test('tool_choice="none" suppresses the disable flags even when `tools` are present', async () => {
+  // `tool_choice="none"` means the caller is explicitly opting out of tool
+  // dispatch for this turn even though it sent a tool catalogue (e.g. for
+  // future turns of the same conversation). Suppressing codex's built-ins
+  // here would needlessly cripple this turn — keep them on. Mirrors the
+  // `hasTools` gate in `buildOpenAICompatSystemPrompt`.
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    mkdtemp: async () => '/tmp/vicoop-codex-instr',
+    writeFile: async () => {},
+    rm: async () => {},
+  });
+
+  await backend.handle(
+    assignWithOpenAICompat('answer in prose', {
+      tools: SAMPLE_TOOLS,
+      tool_choice: 'none',
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const args = fake.lastChild()!.args;
+  assert.equal(args.includes('shell_tool'), false);
+  assert.equal(args.includes('unified_exec'), false);
+});
+
+test('the disable flags are re-passed on resume (feature flags do not persist across `codex exec resume`)', async () => {
+  // Two turns on the same contextId. The first turn establishes the thread;
+  // the second resumes it. Both turns carry the same openai-compat metadata
+  // with caller tools, so both must carry `--disable shell_tool` /
+  // `--disable unified_exec` in argv — codex does not persist feature flags
+  // across `exec resume`, so a missing flag on the second turn would let
+  // the built-in shell tool resurface.
+  const fake = scriptedSpawn([
+    [
+      JSON.stringify({ type: 'thread.started', thread_id: 'thread-a' }),
+      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'first' } }),
+    ],
+    [
+      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'second' } }),
+    ],
+  ]);
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    mkdtemp: async () => '/tmp/vicoop-codex-instr',
+    writeFile: async () => {},
+    rm: async () => {},
+  });
+
+  await backend.handle(
+    assignWithOpenAICompat('one', { tools: SAMPLE_TOOLS, tool_choice: 'auto' }, 'ctx-resume'),
+    collect().emit,
+    NEVER,
+  );
+  await backend.handle(
+    assignWithOpenAICompat('two', { tools: SAMPLE_TOOLS, tool_choice: 'auto' }, 'ctx-resume'),
+    collect().emit,
+    NEVER,
+  );
+
+  const firstArgs = fake.children[0].args;
+  const secondArgs = fake.children[1].args;
+  for (const args of [firstArgs, secondArgs]) {
+    const idx = args.indexOf('shell_tool');
+    assert.ok(idx > 0, 'shell_tool not present');
+    assert.equal(args[idx - 1], '--disable');
+    const idx2 = args.indexOf('unified_exec');
+    assert.ok(idx2 > 0, 'unified_exec not present');
+    assert.equal(args[idx2 - 1], '--disable');
+  }
+  // Resume path actually used.
+  assert.equal(secondArgs[1], 'resume');
 });
 
 test('history-only payload writes no instructions file (build prompt is empty) but still prepends the history block', async () => {

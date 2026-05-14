@@ -491,6 +491,21 @@ function parseToolCallHistory(raw: unknown[]): OpenAICompatHistoryEntry[] | null
   return out;
 }
 
+// True when the caller has supplied tool definitions AND has not explicitly
+// disabled tool use (`tool_choice === "none"`). Backends consult this to
+// decide whether to suppress agent-side built-in tools that would otherwise
+// bypass the envelope-emit contract — see issue #175 for the codex case
+// where the built-in shell/exec tools executed `ls` directly instead of
+// emitting a `tool_calls` envelope for the caller's `bash` definition.
+// The condition mirrors `hasTools` in `buildOpenAICompatSystemPrompt` so
+// the gate that enables the envelope contract in the prompt is the same
+// gate that disables the conflicting built-ins.
+export function callerToolDispatchActive(meta: OpenAICompatMetadata | null): boolean {
+  if (!meta) return false;
+  if (meta.tools === undefined) return false;
+  return meta.tool_choice !== 'none';
+}
+
 // Extract and shape-check the openai-compat metadata key. Returns null when
 // the metadata key is absent, malformed, or actionably empty (all four
 // fields missing or trivial) so the caller can fall back to its non-extension
@@ -606,6 +621,14 @@ export function buildOpenAICompatSystemPrompt(meta: OpenAICompatMetadata): strin
 // inner array is the parsed history verbatim — same shape as on the wire,
 // so the model only has to learn one structure (also taught in the
 // SYSTEM_INSTRUCTION above).
+//
+// Note: the `codex-app-server` backend bypasses this text-prepend and
+// instead injects native Responses API `function_call` /
+// `function_call_output` items via `thread/inject_items` (see
+// historyToInjectItems in codex-app-server.ts) — that gives the model
+// proper native tool-call history rather than a JSON blob it has to be
+// instructed to interpret. claude / openclaw still use this textual form
+// because their native conversation channels are different.
 export function formatToolCallHistory(history: OpenAICompatHistoryEntry[]): string {
   return [
     '<tool_call_history>',
