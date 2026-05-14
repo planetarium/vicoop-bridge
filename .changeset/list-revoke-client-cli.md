@@ -1,6 +1,5 @@
 ---
 "@vicoop-bridge/client": minor
-"@vicoop-bridge/server": minor
 ---
 
 Add `vicoop-client list-clients` and `vicoop-client revoke-client` subcommands so an owner can inspect and clean up their own `clients` rows from the CLI without dropping into admin GraphQL or psql (issue #166).
