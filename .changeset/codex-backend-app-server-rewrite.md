@@ -1,6 +1,5 @@
 ---
 '@vicoop-bridge/client': minor
-'@vicoop-bridge/server': minor
 ---
 
 Rewrite the `codex` backend to drive one persistent `codex app-server` subprocess over stdio JSON-RPC for the lifetime of the client, instead of spawning `codex exec` per task. The wire-facing A2A surface is unchanged — same `--backend codex`, same `BACKEND=codex`, same `backends.codex` config block, same openai-compat extension, same `tool_call_history`, image FileParts, traceability artifacts, and sandbox modes.
