@@ -1015,10 +1015,41 @@ test('openai-compat envelope agent message is emitted as a data part', async () 
   );
 });
 
-test('thread/start carries `config.features.{shell_tool,unified_exec}: false` when caller tools are active (#175)', async () => {
+// The full set of codex features the backend disables when caller-side
+// tool dispatch is active. Pinning the list here so a regression that
+// drops one of them (re-enabling, say, browser_use under openai-compat)
+// fails loudly rather than silently widening the agent's surface back
+// out to direct execution. If you update this list, also update the
+// matching block in `codex.ts` and call out the addition in the PR.
+const EXPECTED_OPENAI_COMPAT_DISABLES: Record<string, boolean> = {
+  shell_tool: false,
+  unified_exec: false,
+  browser_use: false,
+  browser_use_external: false,
+  computer_use: false,
+  in_app_browser: false,
+  apply_patch_freeform: false,
+  apply_patch_streaming_events: false,
+  image_generation: false,
+  tool_search: false,
+  tool_suggest: false,
+  tool_call_mcp_elicitation: false,
+  builtin_mcp: false,
+  plugins: false,
+  apps: false,
+  enable_mcp_apps: false,
+  multi_agent: false,
+  workspace_dependencies: false,
+};
+
+test('thread/start disables every codex direct-execution feature when caller tools are active (#175, PR #180)', async () => {
   // Without this, codex would execute the caller's "bash" call itself in
   // its sandbox and emit a plain-text result instead of the openai-compat
-  // envelope the caller is waiting for.
+  // envelope the caller is waiting for. Beyond shell_tool / unified_exec
+  // (#175), every other codex surface that lets the model do something
+  // directly — browser, computer use, patch tools, image generation,
+  // plugins / apps / MCP, multi-agent, workspace introspection — is also
+  // disabled so the only legitimate dispatch is the caller's tools.
   const fake = makeFakeSpawn(() => happyPath());
   const backend = createCodexBackend({ spawn: fake.spawn });
   await backend.handle(
@@ -1042,10 +1073,86 @@ test('thread/start carries `config.features.{shell_tool,unified_exec}: false` wh
   const params = (tsFrame as {
     params?: { config?: { features?: Record<string, boolean> } };
   }).params;
-  assert.deepEqual(params?.config?.features, {
-    shell_tool: false,
-    unified_exec: false,
-  });
+  assert.deepEqual(params?.config?.features, EXPECTED_OPENAI_COMPAT_DISABLES);
+});
+
+test('thread/start drops `cwd` when caller tools are active (PR #180)', async () => {
+  // Caller-supplied tools execute on the caller's host, not the agent's,
+  // so the agent's cwd is irrelevant — and worse, codex was leaking the
+  // configured agent cwd into tool_call args (e.g. List(/tmp/agent-
+  // workdir)) when prompts referenced "current working directory". With
+  // openai-compat tools active we drop cwd from thread/start so the model
+  // has no host path to echo.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn, cwd: '/srv/agent-work' });
+  await backend.handle(
+    assign('go', 'ctx-no-cwd', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'go' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tools: [{ type: 'function', function: { name: 'noop', parameters: {} } }],
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { cwd?: string } }).params;
+  assert.equal(params?.cwd, undefined);
+});
+
+test('thread/start preserves `cwd` when no caller tools are supplied', async () => {
+  // The cwd-drop is gated on caller-side tool dispatch. Plain text /
+  // history-only / no-openai-compat tasks are operator-controlled local
+  // codex flows where the configured cwd is the whole point.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn, cwd: '/srv/agent-work' });
+  await backend.handle(assign('hi', 'ctx-keep-cwd'), collect().emit, NEVER);
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { cwd?: string } }).params;
+  assert.equal(params?.cwd, '/srv/agent-work');
+});
+
+test('thread/resume drops `cwd` when caller tools are active (PR #180)', async () => {
+  // Same cwd-leak guard as thread/start, applied to the resume path.
+  // Otherwise the second turn of a multi-turn openai-compat conversation
+  // would re-introduce the host path.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn, cwd: '/srv/agent-work' });
+  const meta = {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: [{ type: 'function', function: { name: 'noop', parameters: {} } }],
+    },
+  };
+  await backend.handle(
+    assign('one', 'ctx-no-cwd-resume', {
+      message: { role: 'user', messageId: 'm1', parts: [{ kind: 'text', text: 'one' }], metadata: meta },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  await backend.handle(
+    assign('two', 'ctx-no-cwd-resume', {
+      message: { role: 'user', messageId: 'm2', parts: [{ kind: 'text', text: 'two' }], metadata: meta },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const frames = fake.lastChild().stdinFrames();
+  const start = findRequest(frames, 'thread/start');
+  const resume = findRequest(frames, 'thread/resume');
+  assert.ok(start, 'thread/start observed');
+  assert.ok(resume, 'thread/resume observed');
+  assert.equal((start as { params?: { cwd?: string } }).params?.cwd, undefined);
+  assert.equal((resume as { params?: { cwd?: string } }).params?.cwd, undefined);
 });
 
 test('thread/start omits `config` when no caller tools are supplied', async () => {
@@ -1136,6 +1243,6 @@ test('thread/resume re-passes `config.features` because feature flags do not per
     .params?.config?.features;
   const resumeFeatures = (resume as { params?: { config?: { features?: Record<string, boolean> } } })
     .params?.config?.features;
-  assert.deepEqual(startFeatures, { shell_tool: false, unified_exec: false });
-  assert.deepEqual(resumeFeatures, { shell_tool: false, unified_exec: false });
+  assert.deepEqual(startFeatures, EXPECTED_OPENAI_COMPAT_DISABLES);
+  assert.deepEqual(resumeFeatures, EXPECTED_OPENAI_COMPAT_DISABLES);
 });

@@ -640,18 +640,73 @@ export function createCodexBackend(
           // (see `featuresOverride` below) are the exception — they do NOT
           // persist across resume and must be re-sent every turn that wants
           // them.
-          const featuresOverride = callerToolDispatchActive(openaiCompat)
-            ? // Disable codex's built-in shell/exec tools when caller-side
-              // tool dispatch is active. Without this, codex bypasses the
-              // openai-compat envelope contract by running commands in its
-              // own sandbox and emitting plain text (#175).
-              {
+          //
+          // When caller-side tool dispatch is active (openai-compat with
+          // tools), codex MUST be reduced to "emit text or emit a tool_calls
+          // envelope" only. Two wire-level guards:
+          //
+          //   1. Disable every codex feature that lets the model do
+          //      something directly (shell, exec, browser, computer use,
+          //      patch tools, image generation, plugins / multi-agent /
+          //      MCP). This is broader than the original #175 fix
+          //      (`shell_tool` + `unified_exec`) — anything codex can call
+          //      itself bypasses the envelope contract; the caller's tools
+          //      are the only legitimate dispatch surface.
+          //
+          //   2. Drop `cwd` from thread/start and thread/resume. The
+          //      caller's tools execute on the caller's host, not the
+          //      agent's; an agent-side cwd has nothing useful to
+          //      contribute, and worse, codex was leaking the agent's
+          //      host path into tool_call args (e.g. `List(/tmp/agent-
+          //      workdir)`) when prompts referenced "current working
+          //      directory" — see PR #180 review thread.
+          //
+          // Outside of caller-side tool dispatch (no openai-compat tools)
+          // we keep cwd + leave codex's built-ins enabled — that's the
+          // operator-controlled local-codex path and not subject to the
+          // same envelope contract.
+          const callerToolsActive = callerToolDispatchActive(openaiCompat);
+          const featuresOverride = callerToolsActive
+            ? {
                 features: {
+                  // Direct execution surfaces — anything that lets codex
+                  // do work itself instead of asking the caller.
                   shell_tool: false,
                   unified_exec: false,
+                  browser_use: false,
+                  browser_use_external: false,
+                  computer_use: false,
+                  in_app_browser: false,
+                  apply_patch_freeform: false,
+                  apply_patch_streaming_events: false,
+                  // Text-only output: caller asked for textual responses,
+                  // not generated images or other modalities.
+                  image_generation: false,
+                  // Codex-side tool catalog / discovery — under openai-
+                  // compat the caller's `tools` array is the only legit
+                  // tool surface, so codex shouldn't be searching, suggesting,
+                  // or eliciting MCP tools of its own.
+                  tool_search: false,
+                  tool_suggest: false,
+                  tool_call_mcp_elicitation: false,
+                  builtin_mcp: false,
+                  // Plugin / app integrations expose third-party tools
+                  // codex could call directly.
+                  plugins: false,
+                  apps: false,
+                  enable_mcp_apps: false,
+                  // Subagent spawning bypasses the single-agent contract.
+                  multi_agent: false,
+                  // Workspace introspection — fs reads that could leak
+                  // host paths back into model context.
+                  workspace_dependencies: false,
                 },
               }
             : null;
+          // cwd is meaningful only when codex's local tools are in play.
+          // With openai-compat tools active we drop it so the model has no
+          // host path to echo back.
+          const threadCwd = callerToolsActive ? undefined : cwd;
 
           let threadId: string;
           try {
@@ -660,7 +715,7 @@ export function createCodexBackend(
                 'thread/resume',
                 {
                   threadId: existing.threadId,
-                  cwd,
+                  ...(threadCwd !== undefined ? { cwd: threadCwd } : {}),
                   sandbox: sandboxMode,
                   ...(featuresOverride ? { config: featuresOverride } : {}),
                 },
@@ -670,7 +725,7 @@ export function createCodexBackend(
               const startResult = await client.request<{ thread: { id: string } }>(
                 'thread/start',
                 {
-                  cwd,
+                  ...(threadCwd !== undefined ? { cwd: threadCwd } : {}),
                   sandbox: sandboxMode,
                   ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),
                   ...(featuresOverride ? { config: featuresOverride } : {}),
