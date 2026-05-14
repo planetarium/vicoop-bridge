@@ -386,6 +386,137 @@ Notes:
   enabled simultaneously as a fallback for callers that don't register
   the MCP server.
 
+## openai-compat envelope verification
+
+A sixth exercise at
+`packages/client/scripts/probe-openclaw-openai-compat.mjs` measures
+whether the OpenClaw host model honors the text-injected
+`{"tool_calls":[…]}` envelope contract for the
+[A2A openai-compat/v1 extension](https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1).
+Unlike the previous exercises, this one's reliability depends on
+the gateway's host model — OpenClaw's `chat.send` RPC has no
+system-prompt seam, so the bridge folds the contract into the user
+message as tagged XML blocks. A paranoid host model can refuse to
+follow user-injected pseudo-system instructions; a tool-rich host
+can satisfy the prompt with its own skill (Bash + wttr.in, etc.)
+and ignore the envelope directive. The probe quantifies both
+behaviors against your actual deployment.
+
+The script runs two turns:
+
+1. **Turn 1** — sends a `<system_instructions>` block carrying the
+   envelope contract + a `get_weather` tool definition, then a
+   `<user_message>` asking for the weather. Reports whether the
+   assistant emitted the `{"tool_calls":[...]}` envelope verbatim
+   or answered in natural language.
+2. **Turn 2** — same `sessionKey` follow-up with a
+   `<tool_call_history>` block carrying a synthesized prior
+   `assistant.tool_calls` + a `role:"tool"` result. Reports
+   whether the model re-emitted the envelope (anti-loop directive
+   violated) or composed a natural-language answer using the prior
+   result (anti-loop honored).
+
+### Single-agent run (baseline)
+
+Reuses the `oc-e2e-anthropic` image from the attach-outputs section
+(`auth.mode=none` + Anthropic API key + claude-sonnet-4-6):
+
+```bash
+docker run -d --name openclaw-e2e \
+  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  oc-e2e-anthropic \
+  node openclaw.mjs gateway --allow-unconfigured --bind loopback
+
+# wait for "[gateway] ready"
+
+docker run --rm \
+  --network container:openclaw-e2e \
+  -v "$PWD":/w -w /w/packages/client \
+  node:20 \
+  node ./scripts/probe-openclaw-openai-compat.mjs
+```
+
+Expected verdict tail (one possible outcome — the result is
+stochastic on this configuration):
+
+```
+=== VERDICT ===
+turn1 envelope detected: true {"tool_calls":[{"id":"call_seoul_weather",…}]}
+turn2 envelope detected: false (text: "Right now in Seoul, it's…")
+```
+
+On pilot probes against `claude-sonnet-4-6` the single-agent
+configuration delivered turn-1 envelope compliance ~5/10 — the
+host model frequently satisfied the prompt with its own native
+weather skill and skipped the envelope. To measure your own
+deployment's rate, wrap the probe in a small loop and count
+`turn1 envelope detected: true` lines across N runs.
+
+### Dual-agent run (recommended for openai-compat traffic)
+
+Define a secondary OpenClaw agent with native tools disabled, then
+point the bridge at it for openai-compat tasks via
+`OPENCLAW_OAI_COMPAT_AGENT`. Non-extension tasks continue to flow
+through the default `main` agent with its full toolset, so this
+split is invisible to natural-language callers.
+
+```bash
+mkdir -p /tmp/oc-build-multiagent
+cat > /tmp/oc-build-multiagent/Dockerfile << 'EOF'
+FROM ghcr.io/openclaw/openclaw:latest
+USER root
+RUN mkdir -p /home/node/.openclaw && \
+    printf '%s' '{"gateway":{"auth":{"mode":"none"}},"agents":{"defaults":{"model":{"primary":"anthropic/claude-sonnet-4-6"}},"list":[{"id":"main"},{"id":"oai","tools":{"profile":"minimal","deny":["*"]}}]}}' \
+      > /home/node/.openclaw/openclaw.json && \
+    chown -R node:node /home/node/.openclaw
+USER node
+EOF
+docker build -t oc-e2e-multiagent /tmp/oc-build-multiagent
+
+docker run -d --name openclaw-e2e \
+  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  oc-e2e-multiagent \
+  node openclaw.mjs gateway --allow-unconfigured --bind loopback
+
+# wait for "[gateway] ready"
+
+docker run --rm \
+  --network container:openclaw-e2e \
+  -v "$PWD":/w -w /w/packages/client \
+  -e OPENCLAW_OAI_COMPAT_AGENT=oai \
+  node:20 \
+  node ./scripts/probe-openclaw-openai-compat.mjs
+```
+
+Expected verdict tail:
+
+```
+=== VERDICT ===
+turn1 envelope detected: true {"tool_calls":[{"id":"call_seoul_weather",…}]}
+turn2 envelope detected: false (text: "It's currently clear in Seoul and about 7°C.")
+```
+
+Both turns now produce the expected shape deterministically:
+turn 1 emits the envelope (the `oai` agent has no native tool to
+fall back on), turn 2 reads the synthesized `tool_call_history`
+and answers in natural language with the prior tool result
+(anti-loop directive honored). Pilot N=10 measurement on the same
+prompt: 10/10 envelope on turn 1, 10/10 anti-loop on turn 2.
+
+### Verifying the routing split
+
+To confirm the bridge is actually routing extension and
+non-extension tasks to different agents, watch the OpenClaw
+gateway log while the probe runs:
+
+```bash
+docker exec openclaw-e2e sh -c 'cat /tmp/openclaw/openclaw-*.log' | grep sessionKey
+```
+
+The extension-bearing task should reach
+`agent:oai:<contextId>`, the plain follow-up (if you run a separate
+natural-language `chat.send`) should reach `agent:main:<contextId>`.
+
 ## Teardown
 
 ```bash
