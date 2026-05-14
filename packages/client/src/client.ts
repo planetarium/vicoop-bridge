@@ -330,7 +330,9 @@ export class Client {
       // Terminal auth failures the daemon cannot recover from by waiting:
       //
       //   - **4014 "client revoked"** (issue #166). The DB row was just
-      //     soft-deleted by an owner-side `vicoop-client revoke-client`.
+      //     flagged `revoked = true` by an owner-side `vicoop-client
+      //     revoke-client` (the row stays — soft revocation, not
+      //     deletion — but ws.ts's `revoked = false` filter excludes it).
       //     Future hellos will be rejected with 4005 anyway, so we exit
       //     immediately rather than wait one more reconnect cycle.
       //
