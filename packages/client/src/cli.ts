@@ -5,12 +5,11 @@ import { Client } from './client.js';
 import { echoBackend } from './backends/echo.js';
 import { createOpenclawBackend } from './backends/openclaw.js';
 import { createClaudeBackend } from './backends/claude.js';
-import { createCodexBackend, type CodexSandboxMode } from './backends/codex.js';
 import {
-  createCodexAppServerBackend,
+  createCodexBackend,
   type ApprovalDecision,
-  type CodexAppServerSandboxMode,
-} from './backends/codex-app-server.js';
+  type CodexSandboxMode,
+} from './backends/codex.js';
 import type { Backend } from './backend.js';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
@@ -236,32 +235,11 @@ function pickBackend(name: string, args: Args): Backend {
             backends.codex?.sandbox_mode,
             'backends.codex.sandbox_mode (config.json)',
           ),
-        extraArgs: backends.codex?.extra_args,
+        approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
       });
-    case 'codex-app-server': {
-      const cas = backends['codex-app-server'];
-      // Reuses the `codex` sandbox-mode parser since the enum is identical
-      // (the SandboxMode type re-exported from codex-app-server.ts is the
-      // same string union). Env-var precedence mirrors the `codex` case
-      // so operators can share a single `CODEX_SANDBOX_MODE` / `CODEX_CWD`
-      // across both backends and swap by changing only `--backend`.
-      return createCodexAppServerBackend({
-        cwd:
-          process.env.CODEX_CWD?.trim() ||
-          cas?.cwd ||
-          undefined,
-        sandboxMode:
-          (parseCodexSandboxMode(process.env.CODEX_SANDBOX_MODE) as CodexAppServerSandboxMode | undefined) ??
-          (parseCodexSandboxMode(
-            cas?.sandbox_mode,
-            'backends.codex-app-server.sandbox_mode (config.json)',
-          ) as CodexAppServerSandboxMode | undefined),
-        approvalDecision: cas?.approval_decision as ApprovalDecision | undefined,
-      });
-    }
     default:
       throw new Error(
-        `unknown backend: ${name} (supported: echo, openclaw, claude, codex, codex-app-server)`,
+        `unknown backend: ${name} (supported: echo, openclaw, claude, codex)`,
       );
   }
 }

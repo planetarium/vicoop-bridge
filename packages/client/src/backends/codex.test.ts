@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import {
-  createCodexBackend,
-  type CodexChildHandle,
-  type CodexSpawnOptions,
-} from './codex.js';
-import type { Logger } from '../logger.js';
+import { createCodexBackend } from './codex.js';
+import type {
+  AppServerChildHandle,
+  AppServerSpawnFn,
+  AppServerSpawnOptions,
+} from './codex-rpc.js';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
   TRACEABILITY_EXTENSION_URI,
@@ -14,134 +14,323 @@ import {
   type UpFrame,
 } from '@vicoop-bridge/protocol';
 
-const NEVER: AbortSignal = new AbortController().signal;
+// ─────────────────────────────────────────────────────────────────────────────
+// Fake stdio child — same shape as codex.test.ts so the test surface stays
+// familiar. Tests script behaviour by registering an `onStdinLine` callback
+// per child; whenever the backend writes a newline-terminated JSON-RPC frame
+// to stdin the helper parses it, hands the parsed object to the scenario,
+// and lets the scenario emit responses/notifications back on stdout.
+// ─────────────────────────────────────────────────────────────────────────────
 
-interface FakeChild extends CodexChildHandle {
+interface FakeChild extends AppServerChildHandle {
   readonly command: string;
   readonly args: readonly string[];
   readonly cwd?: string;
   killed: boolean;
   killSignal: NodeJS.Signals | null;
-  stdinPayload: string;
-  stdinClosed: boolean;
-  emitStdout(text: string): void;
+  /** All stdin chunks concatenated (newline-delimited JSON-RPC frames). */
+  readonly stdinPayload: () => string;
+  /** Parse every complete line written so far. */
+  readonly stdinFrames: () => unknown[];
+  /** Push one JSON-RPC line to the backend's stdout. */
+  emitStdout(obj: unknown): void;
+  /** Push raw text (non-JSON line, partial buffer, etc.). */
+  emitStdoutRaw(text: string): void;
+  /** Push stderr bytes — mostly for transport-failure tests. */
   emitStderr(text: string): void;
+  /** Synthesise a process exit. */
   finish(code: number | null, sig?: NodeJS.Signals | null): void;
 }
 
 interface FakeSpawn {
-  spawn: (cmd: string, args: readonly string[], options: CodexSpawnOptions) => CodexChildHandle;
+  spawn: AppServerSpawnFn;
   children: FakeChild[];
-  lastChild: () => FakeChild | null;
+  lastChild: () => FakeChild;
 }
 
-function makeFakeSpawn(configure: (child: FakeChild, index: number) => void): FakeSpawn {
+interface ChildScenario {
+  /** Called per inbound JSON-RPC line from the backend. */
+  onLine?: (line: Record<string, unknown>, child: FakeChild, index: number) => void;
+}
+
+function makeFakeSpawn(
+  configure: (child: FakeChild, index: number) => ChildScenario | void,
+): FakeSpawn {
   const children: FakeChild[] = [];
-  return {
-    children,
-    spawn(command, args, options) {
-      const stdoutEmitter = new EventEmitter();
-      const stderrEmitter = new EventEmitter();
-      const closeListeners: Array<(code: number | null, sig: NodeJS.Signals | null) => void> = [];
-      let closed = false;
+  const spawn: AppServerSpawnFn = (
+    command,
+    args,
+    options: AppServerSpawnOptions,
+  ) => {
+    const stdoutEmitter = new EventEmitter();
+    const stderrEmitter = new EventEmitter();
+    const closeListeners: Array<
+      (code: number | null, sig: NodeJS.Signals | null) => void
+    > = [];
+    let closed = false;
 
-      const mkReadable = (em: EventEmitter) =>
-        ({
-          on(event: string, cb: (...a: unknown[]) => void) {
-            em.on(event, cb);
-          },
-        }) as unknown as NodeJS.ReadableStream;
-
-      const stdinChunks: string[] = [];
-      const stdin: NodeJS.WritableStream = {
-        write(chunk: unknown): boolean {
-          stdinChunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Buffer).toString('utf8'));
-          return true;
+    const mkReadable = (em: EventEmitter): NodeJS.ReadableStream =>
+      ({
+        on(event: string, cb: (...a: unknown[]) => void) {
+          em.on(event, cb);
         },
-        end(chunk?: unknown) {
-          if (chunk !== undefined) {
-            stdinChunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Buffer).toString('utf8'));
+      }) as unknown as NodeJS.ReadableStream;
+
+    const stdinChunks: string[] = [];
+    let stdinBuf = '';
+    let onLine: ChildScenario['onLine'] | undefined;
+
+    const handleLine = (line: string): void => {
+      if (!onLine) return;
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      onLine(parsed, child, children.length - 1);
+    };
+
+    const writeBytes = (chunk: unknown): void => {
+      const s =
+        typeof chunk === 'string'
+          ? chunk
+          : Buffer.from(chunk as Buffer).toString('utf8');
+      stdinChunks.push(s);
+      stdinBuf += s;
+      let nl: number;
+      while ((nl = stdinBuf.indexOf('\n')) !== -1) {
+        const line = stdinBuf.slice(0, nl).trim();
+        stdinBuf = stdinBuf.slice(nl + 1);
+        if (line) handleLine(line);
+      }
+    };
+    const stdin: NodeJS.WritableStream = {
+      write(chunk: unknown): boolean {
+        writeBytes(chunk);
+        return true;
+      },
+      end(chunk?: unknown) {
+        if (chunk !== undefined) writeBytes(chunk);
+        return stdin;
+      },
+      on() {
+        return stdin;
+      },
+      once() {
+        return stdin;
+      },
+      emit() {
+        return false;
+      },
+    } as unknown as NodeJS.WritableStream;
+
+    const child: FakeChild = {
+      command,
+      args,
+      cwd: options.cwd,
+      stdin,
+      stdout: mkReadable(stdoutEmitter),
+      stderr: mkReadable(stderrEmitter),
+      killed: false,
+      killSignal: null,
+      stdinPayload: () => stdinChunks.join(''),
+      stdinFrames: () => {
+        const out: unknown[] = [];
+        for (const line of stdinChunks.join('').split('\n')) {
+          const t = line.trim();
+          if (!t) continue;
+          try {
+            out.push(JSON.parse(t));
+          } catch {
+            // ignore — tests assert on framed content
           }
-          (child as { stdinClosed: boolean }).stdinClosed = true;
-          return stdin;
-        },
-        on() { return stdin; },
-        once() { return stdin; },
-        emit() { return false; },
-      } as unknown as NodeJS.WritableStream;
-
-      const child: FakeChild = {
-        command,
-        args,
-        cwd: options.cwd,
-        stdin,
-        stdout: mkReadable(stdoutEmitter),
-        stderr: mkReadable(stderrEmitter),
-        killed: false,
-        killSignal: null,
-        get stdinPayload() {
-          return stdinChunks.join('');
-        },
-        stdinClosed: false,
-        kill(sig?: NodeJS.Signals) {
-          this.killed = true;
-          this.killSignal = sig ?? 'SIGTERM';
-          queueMicrotask(() => {
-            if (closed) return;
-            closed = true;
-            for (const l of closeListeners) l(null, this.killSignal);
-          });
-          return true;
-        },
-        on(
-          event: 'close' | 'error',
-          listener:
-            | ((code: number | null, signal: NodeJS.Signals | null) => void)
-            | ((err: Error) => void),
-        ) {
-          if (event === 'close') {
-            closeListeners.push(listener as (c: number | null, s: NodeJS.Signals | null) => void);
-          }
-        },
-        emitStdout(text) {
-          stdoutEmitter.emit('data', Buffer.from(text, 'utf8'));
-        },
-        emitStderr(text) {
-          stderrEmitter.emit('data', Buffer.from(text, 'utf8'));
-        },
-        finish(code, sig = null) {
+        }
+        return out;
+      },
+      emitStdout(obj) {
+        stdoutEmitter.emit('data', Buffer.from(JSON.stringify(obj) + '\n', 'utf8'));
+      },
+      emitStdoutRaw(text) {
+        stdoutEmitter.emit('data', Buffer.from(text, 'utf8'));
+      },
+      emitStderr(text) {
+        stderrEmitter.emit('data', Buffer.from(text, 'utf8'));
+      },
+      kill(sig?: NodeJS.Signals) {
+        this.killed = true;
+        this.killSignal = sig ?? 'SIGTERM';
+        queueMicrotask(() => {
           if (closed) return;
           closed = true;
-          for (const l of closeListeners) l(code, sig);
-        },
-      };
-      children.push(child);
-      configure(child, children.length - 1);
-      return child;
+          for (const l of closeListeners) l(null, this.killSignal);
+        });
+        return true;
+      },
+      on(
+        event: 'close' | 'error',
+        listener:
+          | ((code: number | null, signal: NodeJS.Signals | null) => void)
+          | ((err: Error) => void),
+      ) {
+        if (event === 'close') {
+          closeListeners.push(
+            listener as (c: number | null, s: NodeJS.Signals | null) => void,
+          );
+        }
+      },
+      finish(code, sig = null) {
+        if (closed) return;
+        closed = true;
+        for (const l of closeListeners) l(code, sig);
+      },
+    };
+
+    children.push(child);
+    const scenario = configure(child, children.length - 1);
+    if (scenario?.onLine) onLine = scenario.onLine;
+    return child;
+  };
+  return {
+    spawn,
+    children,
+    lastChild: () => {
+      const c = children.at(-1);
+      if (!c) throw new Error('no spawned child yet');
+      return c;
     },
-    lastChild: () => children.at(-1) ?? null,
   };
 }
 
-function scriptedSpawn(linesByRun: readonly (readonly string[])[], exitCode = 0): FakeSpawn {
-  return makeFakeSpawn((child, index) => {
-    setImmediate(() => {
-      for (const l of linesByRun[index] ?? []) child.emitStdout(l.endsWith('\n') ? l : `${l}\n`);
-      setImmediate(() => child.finish(exitCode));
-    });
-  });
+// ─────────────────────────────────────────────────────────────────────────────
+// Scenario helpers — encode the canonical app-server happy-path response
+// pattern (initialize → thread/start|resume → turn/start → notifications →
+// turn/completed) once so the per-test code stays focused on the bit under
+// test.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface HappyPathOptions {
+  agentMessageText?: string;
+  threadId?: string;
+  turnId?: string;
+  /**
+   * After how many `turn/start` requests we should pretend the agent
+   * emitted a `commandExecution` item before completing. Default 0.
+   */
+  emitCommandExecutionTurns?: number[];
+  /** Optional override of the initialize result payload. */
+  initializeResult?: Record<string, unknown>;
 }
 
-function assign(text: string, contextId = 'ctx-1'): TaskAssignFrame {
+function happyPath(opts: HappyPathOptions = {}): ChildScenario {
+  const agentMessageText = opts.agentMessageText ?? 'OK';
+  const threadId = opts.threadId ?? 'thr-1';
+  const turnId = opts.turnId ?? 'turn-1';
+  const commandTurns = new Set(opts.emitCommandExecutionTurns ?? []);
+  let turnCounter = 0;
+  let activeThreadId = threadId;
+  return {
+    onLine(frame, child) {
+      const id = (frame as { id?: number | string }).id;
+      const method = (frame as { method?: string }).method;
+      if (method === 'initialize' && id !== undefined) {
+        child.emitStdout({
+          id,
+          result:
+            opts.initializeResult ?? {
+              userAgent: 'fake-codex/0.130.0',
+              codexHome: '/tmp',
+              platformFamily: 'unix',
+              platformOs: 'macos',
+            },
+        });
+        return;
+      }
+      if (method === 'thread/start' && id !== undefined) {
+        activeThreadId = threadId;
+        child.emitStdout({ id, result: { thread: { id: activeThreadId } } });
+        return;
+      }
+      if (method === 'thread/resume' && id !== undefined) {
+        const p = (frame as { params?: { threadId?: string } }).params;
+        activeThreadId = p?.threadId ?? threadId;
+        child.emitStdout({ id, result: { thread: { id: activeThreadId } } });
+        return;
+      }
+      if (method === 'thread/inject_items' && id !== undefined) {
+        // Empty-object result mirrors the real server's response shape;
+        // the backend treats it as fire-and-confirm.
+        child.emitStdout({ id, result: {} });
+        return;
+      }
+      if (method === 'turn/start' && id !== undefined) {
+        turnCounter += 1;
+        const localTurnId = `${turnId}-${turnCounter}`;
+        child.emitStdout({
+          id,
+          result: { turn: { id: localTurnId, status: 'inProgress' } },
+        });
+        // Schedule the notifications on a microtask so the backend's
+        // turn/start promise resolves and `activeTurnId` is recorded
+        // before the first notification arrives.
+        queueMicrotask(() => {
+          child.emitStdout({
+            method: 'item/agentMessage/delta',
+            params: { itemId: 'item-1', delta: agentMessageText, turnId: localTurnId },
+          });
+          if (commandTurns.has(turnCounter)) {
+            child.emitStdout({
+              method: 'item/completed',
+              params: {
+                turnId: localTurnId,
+                threadId: activeThreadId,
+                item: {
+                  type: 'commandExecution',
+                  id: 'cmd-1',
+                  command: 'ls -la',
+                  status: 'success',
+                  exitCode: 0,
+                  aggregatedOutput: 'foo\nbar\n',
+                },
+              },
+            });
+          }
+          child.emitStdout({
+            method: 'item/completed',
+            params: {
+              turnId: localTurnId,
+              threadId: activeThreadId,
+              item: { type: 'agentMessage', id: 'item-1', text: agentMessageText },
+            },
+          });
+          child.emitStdout({
+            method: 'turn/completed',
+            params: {
+              turn: { id: localTurnId, status: 'completed', items: [], error: null },
+            },
+          });
+        });
+        return;
+      }
+    },
+  };
+}
+
+function assign(
+  text: string,
+  contextId = 'ctx-1',
+  overrides: Partial<TaskAssignFrame> = {},
+): TaskAssignFrame {
   return {
     type: 'task.assign',
-    taskId: `task-${Math.random().toString(36).slice(2, 8)}`,
+    taskId: `task-${Math.random().toString(36).slice(2, 10)}`,
     contextId,
     message: {
       role: 'user',
       messageId: 'm1',
       parts: [{ kind: 'text', text }],
     },
+    ...overrides,
   };
 }
 
@@ -150,1349 +339,803 @@ function collect(): { emit: (f: UpFrame) => void; frames: UpFrame[] } {
   return { emit: (f) => frames.push(f), frames };
 }
 
-function textOf(frame: UpFrame): string {
-  if (frame.type === 'task.artifact') {
-    const p = frame.artifact.parts[0];
-    return p?.kind === 'text' ? p.text : '';
+function findRequest(frames: unknown[], method: string): Record<string, unknown> | null {
+  for (const f of frames) {
+    if (f === null || typeof f !== 'object') continue;
+    const o = f as { method?: unknown; id?: unknown };
+    if (o.method === method && 'id' in o && o.id !== undefined) {
+      return f as Record<string, unknown>;
+    }
   }
-  if (frame.type === 'task.complete') {
-    const p = frame.status.message?.parts[0];
-    return p?.kind === 'text' ? p.text : '';
-  }
-  return '';
+  return null;
 }
 
-test('text-only task spawns codex exec --json - and writes prompt to stdin', async () => {
-  const fake = scriptedSpawn([
-    [
-      JSON.stringify({ type: 'thread.started', thread_id: 'thread-1' }),
-      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'hello' } }),
-    ],
-  ]);
+const NEVER: AbortSignal = new AbortController().signal;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('first task runs initialize + thread/start + turn/start and emits agent artifact', async () => {
+  const fake = makeFakeSpawn(() => happyPath({ agentMessageText: 'OK' }));
   const backend = createCodexBackend({ spawn: fake.spawn, cwd: '/repo' });
-  const { emit, frames } = collect();
-  await backend.handle(assign('say hi'), emit, NEVER);
 
-  const child = fake.lastChild()!;
+  const { emit, frames } = collect();
+  await backend.handle(assign('hello'), emit, NEVER);
+
+  // Only ONE child should have been spawned (singleton app-server).
+  assert.equal(fake.children.length, 1);
+  const child = fake.lastChild();
   assert.equal(child.command, 'codex');
-  assert.deepEqual(child.args, [
-    'exec',
-    '--json',
-    '-c',
-    'sandbox_mode="read-only"',
-    '--skip-git-repo-check',
-    '-',
-  ]);
+  assert.deepEqual(child.args, ['app-server']);
   assert.equal(child.cwd, '/repo');
-  assert.equal(child.stdinPayload, 'say hi');
-  assert.equal(child.stdinClosed, true);
 
-  assert.deepEqual(
-    frames.map((f) => f.type),
-    ['task.status', 'task.artifact', 'task.complete'],
-  );
-  assert.equal(textOf(frames[1]), 'hello');
-  assert.equal(textOf(frames[2]), 'hello');
-});
+  // Sent frames must include initialize → initialized (notif) → thread/start → turn/start.
+  const sent = child.stdinFrames();
+  assert.ok(findRequest(sent, 'initialize'), 'initialize sent');
+  const init = sent.find((f) => (f as { method?: string }).method === 'initialized') as
+    | Record<string, unknown>
+    | undefined;
+  assert.ok(init && !('id' in init), 'initialized is a notification (no id)');
+  const threadStart = findRequest(sent, 'thread/start');
+  assert.ok(threadStart, 'thread/start sent');
+  const turnStart = findRequest(sent, 'turn/start');
+  assert.ok(turnStart, 'turn/start sent');
 
-test('parses trailing JSONL event without final newline', async () => {
-  const fake = makeFakeSpawn((child) => {
-    setImmediate(() => {
-      child.emitStdout(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'tail' } }));
-      setImmediate(() => child.finish(0));
-    });
-  });
+  // thread/start carries sandbox=read-only and cwd.
+  const tsParams = (threadStart as { params?: { sandbox?: string; cwd?: string } }).params;
+  assert.equal(tsParams?.sandbox, 'read-only');
+  assert.equal(tsParams?.cwd, '/repo');
 
-  const backend = createCodexBackend({ spawn: fake.spawn });
-  const { emit, frames } = collect();
-  await backend.handle(assign('x'), emit, NEVER);
-
-  const artifact = frames.find((f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact');
-  assert.ok(artifact);
-  assert.equal(textOf(artifact), 'tail');
-});
-
-
-test('thread.started id is reused via codex exec resume on the same contextId', async () => {
-  const fake = scriptedSpawn([
-    [
-      JSON.stringify({ type: 'thread.started', thread_id: 'thread-a' }),
-      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'first' } }),
-    ],
-    [
-      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'second' } }),
-    ],
+  // turn/start carries the text input plus an empty `text_elements`.
+  const tParams = (turnStart as {
+    params?: { threadId?: string; input?: Array<{ type: string; text?: string; text_elements?: unknown[] }> };
+  }).params;
+  assert.equal(tParams?.threadId, 'thr-1');
+  assert.deepEqual(tParams?.input, [
+    { type: 'text', text: 'hello', text_elements: [] },
   ]);
 
-  const backend = createCodexBackend({ spawn: fake.spawn });
-  await backend.handle(assign('one', 'ctx'), collect().emit, NEVER);
-  await backend.handle(assign('two', 'ctx'), collect().emit, NEVER);
-
-  assert.deepEqual(fake.children[0].args, [
-    'exec',
-    '--json',
-    '-c',
-    'sandbox_mode="read-only"',
-    '--skip-git-repo-check',
-    '-',
-  ]);
-  assert.deepEqual(fake.children[1].args, [
-    'exec',
-    'resume',
-    '--json',
-    '-c',
-    'sandbox_mode="read-only"',
-    '--skip-git-repo-check',
-    'thread-a',
-    '-',
-  ]);
+  // The backend emits working → artifact → complete with completed state.
+  assert.equal(frames[0]?.type, 'task.status');
+  assert.equal(frames[1]?.type, 'task.artifact');
+  const last = frames.at(-1);
+  assert.equal(last?.type, 'task.complete');
+  assert.equal(last?.type === 'task.complete' && last.status.state, 'completed');
 });
 
-test('sandboxMode is passed as a Codex config override on initial and resume runs', async () => {
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'thread.started', thread_id: 'thread-a' })],
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'again' } })],
-  ]);
-
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    sandboxMode: 'read-only',
-  });
-  await backend.handle(assign('one', 'ctx'), collect().emit, NEVER);
-  await backend.handle(assign('two', 'ctx'), collect().emit, NEVER);
-
-  assert.deepEqual(fake.children[0].args, [
-    'exec',
-    '--json',
-    '-c',
-    'sandbox_mode="read-only"',
-    '--skip-git-repo-check',
-    '-',
-  ]);
-  assert.deepEqual(fake.children[1].args, [
-    'exec',
-    'resume',
-    '--json',
-    '-c',
-    'sandbox_mode="read-only"',
-    '--skip-git-repo-check',
-    'thread-a',
-    '-',
-  ]);
-});
-
-test('extraArgs follow sandboxMode config so tests/operators can override it', async () => {
-  const fake = scriptedSpawn([[JSON.stringify({ type: 'thread.started', thread_id: 'thread-a' })]]);
-
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    sandboxMode: 'read-only',
-    extraArgs: ['-c', 'sandbox_mode="workspace-write"'],
-  });
-  await backend.handle(assign('one'), collect().emit, NEVER);
-
-  assert.deepEqual(fake.lastChild()!.args, [
-    'exec',
-    '--json',
-    '-c',
-    'sandbox_mode="read-only"',
-    '--skip-git-repo-check',
-    '-c',
-    'sandbox_mode="workspace-write"',
-    '-',
-  ]);
-});
-
-test('distinct contextIds get distinct sessions', async () => {
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'thread.started', thread_id: 'thread-a' })],
-    [JSON.stringify({ type: 'thread.started', thread_id: 'thread-b' })],
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'again' } })],
-  ]);
-
-  const backend = createCodexBackend({ spawn: fake.spawn });
-  await backend.handle(assign('one', 'ctx-a'), collect().emit, NEVER);
-  await backend.handle(assign('two', 'ctx-b'), collect().emit, NEVER);
-  await backend.handle(assign('again', 'ctx-a'), collect().emit, NEVER);
-
-  assert.deepEqual(fake.children[2].args, [
-    'exec',
-    'resume',
-    '--json',
-    '-c',
-    'sandbox_mode="read-only"',
-    '--skip-git-repo-check',
-    'thread-a',
-    '-',
-  ]);
-});
-
-test('session TTL expiry starts a new codex exec run', async () => {
-  let now = 0;
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'thread.started', thread_id: 'thread-a' })],
-    [JSON.stringify({ type: 'thread.started', thread_id: 'thread-b' })],
-  ]);
-
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    sessionTtlMs: 5_000,
-    now: () => now,
-  });
-  await backend.handle(assign('one', 'ctx'), collect().emit, NEVER);
-  now = 6_000;
-  await backend.handle(assign('two', 'ctx'), collect().emit, NEVER);
-
-  assert.deepEqual(fake.children[1].args, [
-    'exec',
-    '--json',
-    '-c',
-    'sandbox_mode="read-only"',
-    '--skip-git-repo-check',
-    '-',
-  ]);
-});
-
-test('abort after image materialization completes before spawn and cleans temp dir', async () => {
-  let spawned = 0;
-  const removed: string[] = [];
-  const controller = new AbortController();
-  const backend = createCodexBackend({
-    spawn: () => {
-      spawned++;
-      throw new Error('should not spawn');
-    },
-    mkdtemp: async () => '/tmp/vicoop-codex-test',
-    writeFile: async () => {
-      controller.abort();
-    },
-    rm: async (filePath) => {
-      removed.push(String(filePath));
-    },
-  });
-  const task: TaskAssignFrame = {
-    type: 'task.assign',
-    taskId: 't',
-    contextId: 'c',
-    message: {
-      role: 'user',
-      messageId: 'm1',
-      parts: [{ kind: 'file', file: { mimeType: 'image/png', bytes: Buffer.from('png').toString('base64') } }],
-    },
-  };
-
-  const { emit, frames } = collect();
-  await backend.handle(task, emit, controller.signal);
-
-  assert.equal(spawned, 0);
-  assert.deepEqual(removed, ['/tmp/vicoop-codex-test']);
-  assert.equal(frames.length, 1);
-  assert.equal(frames[0].type, 'task.complete');
-  assert.equal((frames[0] as Extract<UpFrame, { type: 'task.complete' }>).status.state, 'canceled');
-});
-
-test('resume spawn failure rolls back TTL refresh for the existing session', async () => {
-  let now = 0;
-  let calls = 0;
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'thread.started', thread_id: 'thread-a' })],
-    [JSON.stringify({ type: 'thread.started', thread_id: 'thread-b' })],
-  ]);
-  const backend = createCodexBackend({
-    sessionTtlMs: 5_000,
-    now: () => now,
-    spawn: (command, args, options) => {
-      calls++;
-      if (calls === 2) throw new Error('spawn failed');
-      return fake.spawn(command, args, options);
-    },
-  });
-
-  await backend.handle(assign('one', 'ctx'), collect().emit, NEVER);
-  now = 4_000;
-  const failed = collect();
-  await backend.handle(assign('two', 'ctx'), failed.emit, NEVER);
-  now = 6_000;
-  await backend.handle(assign('three', 'ctx'), collect().emit, NEVER);
-
-  const fail = failed.frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
-  assert.equal(fail?.error.code, 'spawn_failed');
-  assert.deepEqual(fake.children[1].args, [
-    'exec',
-    '--json',
-    '-c',
-    'sandbox_mode="read-only"',
-    '--skip-git-repo-check',
-    '-',
-  ]);
-});
-
-test('command_execution emits trace artifact only when traceability is requested', async () => {
-  const line = JSON.stringify({
-    type: 'item.completed',
-    item: {
-      type: 'command_execution',
-      command: 'npm test',
-      aggregated_output: 'ok',
-      exit_code: 0,
-      status: 'completed',
-    },
-  });
-
-  const withoutTrace = scriptedSpawn([[line]]);
-  const backendA = createCodexBackend({ spawn: withoutTrace.spawn });
-  const framesA = collect();
-  await backendA.handle(assign('x'), framesA.emit, NEVER);
-  assert.equal(framesA.frames.filter((f) => f.type === 'task.artifact').length, 0);
-
-  const withTrace = scriptedSpawn([[line]]);
-  const backendB = createCodexBackend({ spawn: withTrace.spawn });
-  const framesB = collect();
-  await backendB.handle(
-    { ...assign('x'), requestedExtensions: [TRACEABILITY_EXTENSION_URI] },
-    framesB.emit,
-    NEVER,
-  );
-  const artifact = framesB.frames.find((f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact');
-  assert.ok(artifact);
-  assert.equal(artifact.artifact.name, 'codex-command-execution');
-  assert.equal(artifact.artifact.metadata?.traceType, 'command-execution');
-  assert.match(textOf(artifact), /npm test/);
-});
-
-test('nonzero exit emits task.fail with stderr tail (no host-local argv/cwd on the wire)', async () => {
-  const fake = makeFakeSpawn((child) => {
-    setImmediate(() => {
-      child.emitStderr('codex: auth required\n');
-      setImmediate(() => child.finish(2));
-    });
-  });
-
-  const backend = createCodexBackend({ spawn: fake.spawn });
-  const { emit, frames } = collect();
-  await backend.handle(assign('x'), emit, NEVER);
-
-  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
-  assert.ok(fail);
-  assert.equal(fail.error.code, 'codex_exit_nonzero');
-  assert.match(fail.error.message, /code 2/);
-  assert.match(fail.error.message, /auth required/);
-  // argv and cwd are host-local — they go to the local logger, not the
-  // wire-level error.message which the bridge forwards to the caller.
-  assert.doesNotMatch(fail.error.message, /argv=/);
-  assert.doesNotMatch(fail.error.message, /cwd=/);
-});
-
-test('exec-failure repro line goes to the local logger, not the wire (#147)', async () => {
-  const fake = makeFakeSpawn((child) => {
-    setImmediate(() => {
-      child.emitStderr('boom\n');
-      setImmediate(() => child.finish(1));
-    });
-  });
-
-  const warnLines: string[] = [];
-  const stubLogger: Logger = {
-    level: 'info',
-    error: () => {},
-    warn: (...a: unknown[]) => warnLines.push(a.map(String).join(' ')),
-    info: () => {},
-    debug: () => {},
-  };
-
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    cwd: '/srv/agent-work',
-    logger: stubLogger,
-  });
-  const { emit, frames } = collect();
-  await backend.handle(assign('x'), emit, NEVER);
-
-  // Wire-level message stays free of host-local detail.
-  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
-  assert.ok(fail);
-  assert.equal(fail.error.code, 'codex_exit_nonzero');
-  assert.doesNotMatch(fail.error.message, /\/srv\/agent-work/);
-
-  // Local logger receives an argv summary (clipped to 400 chars in
-  // codex.ts) + cwd for operator debugging.
-  const repro = warnLines.find((l) => l.includes('codex exec-failure repro'));
-  assert.ok(repro, `expected a repro warn line, got: ${JSON.stringify(warnLines)}`);
-  assert.match(repro, /argv=\[/);
-  assert.match(repro, /"codex"/);
-  assert.match(repro, /cwd="\/srv\/agent-work"/);
-});
-
-test('exec-failure repro line sanitizes taskId and escapes line separators (#147)', async () => {
-  // Wire-derived taskId can contain newlines / control chars; argv / cwd
-  // values can contain U+2028 / U+2029 which JSON.stringify leaves raw
-  // but some log sinks treat as line breaks. The repro line must stay
-  // single-line and must not let an attacker inject fake [client] lines.
-  const fake = makeFakeSpawn((child) => {
-    setImmediate(() => {
-      child.emitStderr('boom\n');
-      setImmediate(() => child.finish(1));
-    });
-  });
-
-  const warnLines: string[] = [];
-  const stubLogger: Logger = {
-    level: 'info',
-    error: () => {},
-    warn: (...a: unknown[]) => warnLines.push(a.map(String).join(' ')),
-    info: () => {},
-    debug: () => {},
-  };
-
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    cwd: '/srv/a\u2028b', // U+2028 in cwd
-    logger: stubLogger,
-  });
-  const hostileTask: TaskAssignFrame = {
-    type: 'task.assign',
-    taskId: 'evil\n[client] FAKE',
-    contextId: 'ctx',
-    message: { role: 'user', messageId: 'm1', parts: [{ kind: 'text', text: 'x' }] },
-  };
-
-  await backend.handle(hostileTask, collect().emit, NEVER);
-
-  const repro = warnLines.find((l) => l.includes('codex exec-failure repro'));
-  assert.ok(repro);
-  // taskId's embedded newline must be escaped, not preserved as a real LF.
-  assert.doesNotMatch(repro, /\n\[client\] FAKE/);
-  assert.match(repro, /taskId=evil\\n\[client\] FAKE/);
-  // U+2028 in cwd must be escaped to its \uXXXX form. (RegExp ctor used
-  // so the source file doesn't carry a raw U+2028 of its own — esbuild
-  // parses raw U+2028 in a regex literal as a line terminator.)
-  assert.doesNotMatch(repro, /\u2028/);
-  assert.match(repro, /\\u2028/);
-});
-
-test('--skip-git-repo-check is auto-added so non-git cwds work out of the box (#147)', async () => {
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
-  ]);
-  const backend = createCodexBackend({ spawn: fake.spawn, cwd: '/tmp/not-a-repo' });
-  const { emit, frames } = collect();
-  await backend.handle(assign('x'), emit, NEVER);
-
-  const child = fake.lastChild()!;
-  assert.ok(
-    child.args.includes('--skip-git-repo-check'),
-    `expected --skip-git-repo-check in argv, got ${JSON.stringify(child.args)}`,
-  );
-  assert.ok(frames.some((f) => f.type === 'task.complete'));
-});
-
-test('--skip-git-repo-check is not duplicated when extraArgs already lists it (#147)', async () => {
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
-  ]);
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    extraArgs: ['--skip-git-repo-check'],
-  });
-  await backend.handle(assign('x'), collect().emit, NEVER);
-
-  const args = fake.lastChild()!.args;
-  const occurrences = args.filter((a) => a === '--skip-git-repo-check').length;
-  assert.equal(occurrences, 1, `expected exactly one --skip-git-repo-check, got ${occurrences} in ${JSON.stringify(args)}`);
-});
-
-test('signal exit emits task.fail without code null wording', async () => {
-  const fake = makeFakeSpawn((child) => {
-    setImmediate(() => {
-      child.emitStderr('codex: interrupted\n');
-      setImmediate(() => child.finish(null, 'SIGTERM'));
-    });
-  });
-
-  const backend = createCodexBackend({ spawn: fake.spawn });
-  const { emit, frames } = collect();
-  await backend.handle(assign('x'), emit, NEVER);
-
-  const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
-  assert.ok(fail);
-  assert.equal(fail.error.code, 'codex_exit_nonzero');
-  assert.match(fail.error.message, /terminated by signal SIGTERM/);
-  assert.doesNotMatch(fail.error.message, /code null/);
-  assert.match(fail.error.message, /interrupted/);
-});
-
-test('abort kills the child and emits canceled completion', async () => {
-  const fake = makeFakeSpawn((child) => {
-    setImmediate(() => {
-      child.emitStdout(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'partial' } }) + '\n');
-    });
-  });
-
-  const backend = createCodexBackend({ spawn: fake.spawn });
-  const controller = new AbortController();
-  const { emit, frames } = collect();
-  const runP = backend.handle(assign('x'), emit, controller.signal);
-  await new Promise((r) => setImmediate(r));
-  await new Promise((r) => setImmediate(r));
-  controller.abort();
-  await runP;
-
-  assert.ok(fake.lastChild()?.killed);
-  assert.equal(fake.lastChild()?.killSignal, 'SIGTERM');
-  const last = frames.at(-1) as Extract<UpFrame, { type: 'task.complete' }>;
-  assert.equal(last.type, 'task.complete');
-  assert.equal(last.status.state, 'canceled');
-});
-
-test('image FilePart.bytes creates temp files and passes --image args', async () => {
-  const fake = scriptedSpawn([[JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })]]);
-  const written: Array<{ path: string; data: Buffer }> = [];
-  const removed: string[] = [];
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    mkdtemp: async () => '/tmp/vicoop-codex-test',
-    writeFile: async (filePath, data) => {
-      written.push({ path: String(filePath), data: Buffer.from(data as Buffer) });
-    },
-    rm: async (filePath) => {
-      removed.push(String(filePath));
-    },
-  });
-  const task: TaskAssignFrame = {
-    type: 'task.assign',
-    taskId: 't',
-    contextId: 'c',
-    message: {
-      role: 'user',
-      messageId: 'm1',
-      parts: [
-        { kind: 'text', text: 'what is this?' },
-        { kind: 'file', file: { mimeType: 'image/png', bytes: Buffer.from('png').toString('base64') } },
-      ],
-    },
-  };
-
-  await backend.handle(task, collect().emit, NEVER);
-
-  assert.equal(written.length, 1);
-  assert.equal(written[0].path, '/tmp/vicoop-codex-test/image-1.png');
-  assert.equal(written[0].data.toString('utf8'), 'png');
-  assert.deepEqual(fake.lastChild()!.args, [
-    'exec',
-    '--json',
-    '-c',
-    'sandbox_mode="read-only"',
-    '--skip-git-repo-check',
-    '--image',
-    '/tmp/vicoop-codex-test/image-1.png',
-    '-',
-  ]);
-  assert.deepEqual(removed, ['/tmp/vicoop-codex-test']);
-});
-
-test('unsupported file parts fail fast before spawn', async () => {
-  let spawned = 0;
-  const backend = createCodexBackend({
-    spawn: () => {
-      spawned++;
-      throw new Error('should not spawn');
-    },
-  });
-
-  const pdfTask: TaskAssignFrame = {
-    type: 'task.assign',
-    taskId: 't2',
-    contextId: 'c',
-    message: {
-      role: 'user',
-      messageId: 'm2',
-      parts: [{ kind: 'file', file: { mimeType: 'application/pdf', bytes: 'JVBERi0K' } }],
-    },
-  };
-
-  const frames = collect();
-  await backend.handle(pdfTask, frames.emit, NEVER);
-
-  assert.equal(spawned, 0);
-  assert.equal((frames.frames[0] as Extract<UpFrame, { type: 'task.fail' }>).error.code, 'unsupported_file_mime');
-});
-
-test('data parts are serialized into the codex prompt as tagged JSON', async () => {
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
-  ]);
+test('follow-up task with same contextId uses thread/resume not thread/start', async () => {
+  const fake = makeFakeSpawn(() => happyPath({ threadId: 'thr-1' }));
   const backend = createCodexBackend({ spawn: fake.spawn });
 
-  const task: TaskAssignFrame = {
-    type: 'task.assign',
-    taskId: 't-data',
-    contextId: 'c',
-    message: {
-      role: 'user',
-      messageId: 'm1',
-      parts: [
-        { kind: 'text', text: 'summarize' },
-        { kind: 'data', data: { ticket: 42, priority: 'high' } },
-      ],
-    },
-  };
+  const a = collect();
+  await backend.handle(assign('first', 'ctx-A'), a.emit, NEVER);
+  const b = collect();
+  await backend.handle(assign('second', 'ctx-A'), b.emit, NEVER);
 
-  const { emit, frames } = collect();
-  await backend.handle(task, emit, NEVER);
+  // Still one child.
+  assert.equal(fake.children.length, 1);
+  const frames = fake.lastChild().stdinFrames();
+  const startCount = frames.filter((f) => (f as { method?: string }).method === 'thread/start').length;
+  const resumeCount = frames.filter((f) => (f as { method?: string }).method === 'thread/resume').length;
+  const turnStarts = frames.filter((f) => (f as { method?: string }).method === 'turn/start').length;
 
-  const child = fake.lastChild()!;
-  assert.match(child.stdinPayload, /^summarize\n\n<context kind="application\/json">\n/);
-  assert.ok(child.stdinPayload.includes('"ticket": 42'));
-  assert.ok(child.stdinPayload.includes('"priority": "high"'));
-  assert.ok(child.stdinPayload.endsWith('</context>'));
+  assert.equal(startCount, 1, 'only one thread/start over two tasks');
+  assert.equal(resumeCount, 1, 'second task resumes the thread');
+  assert.equal(turnStarts, 2, 'one turn per task');
 
-  const failFrame = frames.find((f) => f.type === 'task.fail');
-  assert.equal(failFrame, undefined);
+  assert.equal(a.frames.at(-1)?.type, 'task.complete');
+  assert.equal(b.frames.at(-1)?.type, 'task.complete');
 });
 
-test('data-only message produces a prompt with just the JSON context block', async () => {
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
-  ]);
-  const backend = createCodexBackend({ spawn: fake.spawn });
-
-  const task: TaskAssignFrame = {
-    type: 'task.assign',
-    taskId: 't-data-only',
-    contextId: 'c',
-    message: {
-      role: 'user',
-      messageId: 'm1',
-      parts: [{ kind: 'data', data: { hello: 'world' } }],
-    },
-  };
-
-  const { emit } = collect();
-  await backend.handle(task, emit, NEVER);
-
-  const child = fake.lastChild()!;
-  assert.match(child.stdinPayload, /^<context kind="application\/json">\n/);
-  assert.ok(child.stdinPayload.includes('"hello": "world"'));
-});
-
-test('image materialization failure emits task.fail and cleans temp dir before spawn', async () => {
-  let spawned = 0;
-  const removed: string[] = [];
-  const backend = createCodexBackend({
-    spawn: () => {
-      spawned++;
-      throw new Error('should not spawn');
-    },
-    mkdtemp: async () => '/tmp/vicoop-codex-test',
-    writeFile: async () => {
-      throw new Error('disk full');
-    },
-    rm: async (filePath) => {
-      removed.push(String(filePath));
-    },
-  });
-  const task: TaskAssignFrame = {
-    type: 'task.assign',
-    taskId: 't',
-    contextId: 'c',
-    message: {
-      role: 'user',
-      messageId: 'm1',
-      parts: [{ kind: 'file', file: { mimeType: 'image/png', bytes: Buffer.from('png').toString('base64') } }],
-    },
-  };
-
-  const { emit, frames } = collect();
-  await backend.handle(task, emit, NEVER);
-
-  assert.equal(spawned, 0);
-  assert.deepEqual(removed, ['/tmp/vicoop-codex-test']);
-  const fail = frames[0] as Extract<UpFrame, { type: 'task.fail' }>;
-  assert.equal(fail.type, 'task.fail');
-  assert.equal(fail.error.code, 'input_file_write_failed');
-  assert.match(fail.error.message, /disk full/);
-});
-
-// ---------------------------------------------------------------------------
-// openai-compat extension
-//
-// The pure helpers (parseOpenAICompatMetadata, buildOpenAICompatSystemPrompt,
-// formatToolCallHistory, tryParseToolCallsEnvelope) live in claude.ts and are
-// covered by claude.test.ts — codex.ts imports them verbatim, so we only test
-// the codex-specific wiring here: argv injection of the `-c
-// model_instructions_file=...` seam, file write/cleanup lifecycle, history
-// prepend on the stdin prompt, and envelope→data-part artifact conversion.
-// ---------------------------------------------------------------------------
-
-const SAMPLE_TOOLS = [
-  {
-    type: 'function' as const,
-    function: {
-      name: 'get_weather',
-      description: 'Get the current weather for a city.',
-      parameters: {
-        type: 'object',
-        properties: { city: { type: 'string' } },
-        required: ['city'],
-        additionalProperties: false,
+test('distinct contextIds get distinct threads on a single app-server', async () => {
+  const fake = makeFakeSpawn((_child, _idx) => {
+    // Both contexts share the same fake server, so use a counter for threadId.
+    let threadCounter = 0;
+    let turnCounter = 0;
+    return {
+      onLine(frame, child) {
+        const id = (frame as { id?: number | string }).id;
+        const method = (frame as { method?: string }).method;
+        if (method === 'initialize' && id !== undefined) {
+          child.emitStdout({ id, result: { userAgent: 'fake' } });
+          return;
+        }
+        if (method === 'thread/start' && id !== undefined) {
+          threadCounter += 1;
+          const tid = `thr-${threadCounter}`;
+          child.emitStdout({ id, result: { thread: { id: tid } } });
+          return;
+        }
+        if (method === 'thread/resume' && id !== undefined) {
+          const p = (frame as { params?: { threadId?: string } }).params;
+          child.emitStdout({ id, result: { thread: { id: p?.threadId ?? 'thr-?' } } });
+          return;
+        }
+        if (method === 'turn/start' && id !== undefined) {
+          turnCounter += 1;
+          const localTurnId = `turn-${turnCounter}`;
+          const params = (frame as { params?: { threadId?: string } }).params;
+          const threadId = params?.threadId ?? 'thr-?';
+          child.emitStdout({
+            id,
+            result: { turn: { id: localTurnId, status: 'inProgress' } },
+          });
+          queueMicrotask(() => {
+            child.emitStdout({
+              method: 'item/completed',
+              params: {
+                turnId: localTurnId,
+                threadId,
+                item: { type: 'agentMessage', id: 'i', text: `reply-${turnCounter}` },
+              },
+            });
+            child.emitStdout({
+              method: 'turn/completed',
+              params: { turn: { id: localTurnId, status: 'completed' } },
+            });
+          });
+        }
       },
-    },
-  },
-];
-
-const SAMPLE_HISTORY: ReadonlyArray<Record<string, unknown>> = [
-  {
-    role: 'assistant',
-    tool_calls: [
-      { id: 'call_abc', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
-    ],
-  },
-  {
-    role: 'tool',
-    tool_call_id: 'call_abc',
-    name: 'get_weather',
-    content: '{"temp":15,"cond":"sunny"}',
-  },
-];
-
-function assignWithOpenAICompat(
-  text: string,
-  payload: Record<string, unknown>,
-  contextId = 'ctx-1',
-): TaskAssignFrame {
-  const base = assign(text, contextId);
-  return {
-    ...base,
-    message: {
-      ...base.message,
-      metadata: { [OPENAI_COMPAT_EXTENSION_URI]: payload },
-    },
-  };
-}
-
-test('argv carries `-c model_instructions_file=...` and the file contains the envelope contract', async () => {
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
-  ]);
-  const written: Array<{ path: string; data: Buffer }> = [];
-  const removed: string[] = [];
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    mkdtemp: async () => '/tmp/vicoop-codex-instr',
-    writeFile: async (filePath, data) => {
-      written.push({ path: String(filePath), data: Buffer.from(data as Buffer) });
-    },
-    rm: async (filePath) => {
-      removed.push(String(filePath));
-    },
+    };
   });
-
-  await backend.handle(
-    assignWithOpenAICompat('what is the weather?', {
-      system: 'You are concise.',
-      tools: SAMPLE_TOOLS,
-      tool_choice: 'auto',
-    }),
-    collect().emit,
-    NEVER,
-  );
-
-  // Exactly one instructions file written under the freshly-minted temp dir.
-  assert.equal(written.length, 1);
-  assert.equal(written[0].path, '/tmp/vicoop-codex-instr/instructions.md');
-  const body = written[0].data.toString('utf8');
-  // The user system precedes the envelope contract in the rendered file.
-  assert.match(body, /^You are concise\./);
-  assert.match(body, /"tool_calls":\[\{"id":"call_<unique>"/);
-  assert.match(body, /"name": "get_weather"/);
-  assert.match(body, /tool_choice="auto"/);
-
-  // The argv carries the `-c model_instructions_file="..."` pair; the value
-  // is TOML-quoted (so paths with spaces / unicode survive). Position is
-  // after the sandbox `-c` block and `--skip-git-repo-check`, before any
-  // operator extras — pin it precisely.
-  assert.deepEqual(fake.lastChild()!.args, [
-    'exec',
-    '--json',
-    '-c',
-    'sandbox_mode="read-only"',
-    '--skip-git-repo-check',
-    // `tools` are present → suppress codex's built-in shell/exec tools so
-    // they don't bypass the caller's envelope contract (#175). Sits
-    // between --skip-git-repo-check and the instructions-file pair.
-    '--disable',
-    'shell_tool',
-    '--disable',
-    'unified_exec',
-    '-c',
-    'model_instructions_file="/tmp/vicoop-codex-instr/instructions.md"',
-    '-',
-  ]);
-
-  // Cleanup ran on the instructions temp dir.
-  assert.deepEqual(removed, ['/tmp/vicoop-codex-instr']);
-});
-
-test('absent metadata → no instructions file is written and no `model_instructions_file` arg appears', async () => {
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
-  ]);
-  let mkdtempCalls = 0;
-  const written: string[] = [];
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    mkdtemp: async () => {
-      mkdtempCalls++;
-      return '/tmp/vicoop-codex-instr';
-    },
-    writeFile: async (filePath) => {
-      written.push(String(filePath));
-    },
-    rm: async () => {},
-  });
-
-  await backend.handle(assign('hello'), collect().emit, NEVER);
-
-  // No openai-compat metadata → no temp dir, no instructions file.
-  assert.equal(mkdtempCalls, 0);
-  assert.deepEqual(written, []);
-  const args = fake.lastChild()!.args;
-  assert.equal(
-    args.some((a) => typeof a === 'string' && a.startsWith('model_instructions_file=')),
-    false,
-  );
-});
-
-test('history-only payload (no tools) leaves the built-in shell/exec tools enabled', async () => {
-  // Counterpart to the `tools`-present test: when the openai-compat payload
-  // has no `tools` array, there is no caller-side dispatch contract to
-  // protect, so codex's built-in shell/exec tools should stay available —
-  // `--disable shell_tool` / `--disable unified_exec` MUST NOT appear.
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
-  ]);
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    mkdtemp: async () => '/tmp/vicoop-codex-instr',
-    writeFile: async () => {},
-    rm: async () => {},
-  });
-
-  await backend.handle(
-    assignWithOpenAICompat('continue', { tool_call_history: SAMPLE_HISTORY }),
-    collect().emit,
-    NEVER,
-  );
-
-  const args = fake.lastChild()!.args;
-  assert.equal(args.includes('shell_tool'), false);
-  assert.equal(args.includes('unified_exec'), false);
-});
-
-test('tool_choice="none" suppresses the disable flags even when `tools` are present', async () => {
-  // `tool_choice="none"` means the caller is explicitly opting out of tool
-  // dispatch for this turn even though it sent a tool catalogue (e.g. for
-  // future turns of the same conversation). Suppressing codex's built-ins
-  // here would needlessly cripple this turn — keep them on. Mirrors the
-  // `hasTools` gate in `buildOpenAICompatSystemPrompt`.
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
-  ]);
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    mkdtemp: async () => '/tmp/vicoop-codex-instr',
-    writeFile: async () => {},
-    rm: async () => {},
-  });
-
-  await backend.handle(
-    assignWithOpenAICompat('answer in prose', {
-      tools: SAMPLE_TOOLS,
-      tool_choice: 'none',
-    }),
-    collect().emit,
-    NEVER,
-  );
-
-  const args = fake.lastChild()!.args;
-  assert.equal(args.includes('shell_tool'), false);
-  assert.equal(args.includes('unified_exec'), false);
-});
-
-test('the disable flags are re-passed on resume (feature flags do not persist across `codex exec resume`)', async () => {
-  // Two turns on the same contextId. The first turn establishes the thread;
-  // the second resumes it. Both turns carry the same openai-compat metadata
-  // with caller tools, so both must carry `--disable shell_tool` /
-  // `--disable unified_exec` in argv — codex does not persist feature flags
-  // across `exec resume`, so a missing flag on the second turn would let
-  // the built-in shell tool resurface.
-  const fake = scriptedSpawn([
-    [
-      JSON.stringify({ type: 'thread.started', thread_id: 'thread-a' }),
-      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'first' } }),
-    ],
-    [
-      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'second' } }),
-    ],
-  ]);
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    mkdtemp: async () => '/tmp/vicoop-codex-instr',
-    writeFile: async () => {},
-    rm: async () => {},
-  });
-
-  await backend.handle(
-    assignWithOpenAICompat('one', { tools: SAMPLE_TOOLS, tool_choice: 'auto' }, 'ctx-resume'),
-    collect().emit,
-    NEVER,
-  );
-  await backend.handle(
-    assignWithOpenAICompat('two', { tools: SAMPLE_TOOLS, tool_choice: 'auto' }, 'ctx-resume'),
-    collect().emit,
-    NEVER,
-  );
-
-  const firstArgs = fake.children[0].args;
-  const secondArgs = fake.children[1].args;
-  for (const args of [firstArgs, secondArgs]) {
-    const idx = args.indexOf('shell_tool');
-    assert.ok(idx > 0, 'shell_tool not present');
-    assert.equal(args[idx - 1], '--disable');
-    const idx2 = args.indexOf('unified_exec');
-    assert.ok(idx2 > 0, 'unified_exec not present');
-    assert.equal(args[idx2 - 1], '--disable');
-  }
-  // Resume path actually used.
-  assert.equal(secondArgs[1], 'resume');
-});
-
-test('history-only payload writes no instructions file (build prompt is empty) but still prepends the history block', async () => {
-  // Cooperating gateway sent only the multi-turn history — no tools, no
-  // system, no tool_choice. `buildOpenAICompatSystemPrompt` returns "" in
-  // that case, so we MUST NOT mkdtemp / write an empty instructions file.
-  // The history is still required by spec to be replayed in user content.
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
-  ]);
-  let mkdtempCalls = 0;
-  const written: string[] = [];
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    mkdtemp: async () => {
-      mkdtempCalls++;
-      return '/tmp/vicoop-codex-instr';
-    },
-    writeFile: async (filePath) => {
-      written.push(String(filePath));
-    },
-    rm: async () => {},
-  });
-
-  await backend.handle(
-    assignWithOpenAICompat('continue', { tool_call_history: SAMPLE_HISTORY }),
-    collect().emit,
-    NEVER,
-  );
-
-  assert.equal(mkdtempCalls, 0);
-  assert.deepEqual(written, []);
-  const args = fake.lastChild()!.args;
-  assert.equal(
-    args.some((a) => typeof a === 'string' && a.startsWith('model_instructions_file=')),
-    false,
-  );
-
-  // History still prepended to user content.
-  const stdin = fake.lastChild()!.stdinPayload;
-  assert.match(stdin, /^<tool_call_history>\n/);
-  assert.match(stdin, /\n<\/tool_call_history>\n\ncontinue$/);
-});
-
-test('instructions file is co-located with the image temp dir when both are present (single cleanup)', async () => {
-  // When the task also carries images, mapPartsToCodexInput already minted
-  // a temp dir for them. The instructions file MUST land in that same dir
-  // so a single `rm -r` cleans both, and no second mkdtemp is issued.
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
-  ]);
-  let mkdtempCalls = 0;
-  const written: Array<{ path: string; data: Buffer }> = [];
-  const removed: string[] = [];
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    mkdtemp: async () => {
-      mkdtempCalls++;
-      return '/tmp/vicoop-codex-mix';
-    },
-    writeFile: async (filePath, data) => {
-      written.push({ path: String(filePath), data: Buffer.from(data as Buffer) });
-    },
-    rm: async (filePath) => {
-      removed.push(String(filePath));
-    },
-  });
-
-  const taskWithImage: TaskAssignFrame = {
-    ...assignWithOpenAICompat('what is this?', {
-      tools: SAMPLE_TOOLS,
-      tool_choice: 'auto',
-    }),
-    message: {
-      role: 'user',
-      messageId: 'm1',
-      parts: [
-        { kind: 'text', text: 'what is this?' },
-        { kind: 'file', file: { mimeType: 'image/png', bytes: Buffer.from('png').toString('base64') } },
-      ],
-      metadata: {
-        [OPENAI_COMPAT_EXTENSION_URI]: {
-          tools: SAMPLE_TOOLS,
-          tool_choice: 'auto',
-        },
-      },
-    },
-  };
-
-  await backend.handle(taskWithImage, collect().emit, NEVER);
-
-  // mkdtemp ran exactly once (the image path); the instructions file
-  // landed in the same dir so cleanup is a single rm.
-  assert.equal(mkdtempCalls, 1);
-  const paths = written.map((w) => w.path);
-  assert.ok(paths.includes('/tmp/vicoop-codex-mix/image-1.png'));
-  assert.ok(paths.includes('/tmp/vicoop-codex-mix/instructions.md'));
-  // Only one rm — for the shared dir.
-  assert.deepEqual(removed, ['/tmp/vicoop-codex-mix']);
-});
-
-test('instructions write failure emits task.fail and cleans the freshly-minted temp dir', async () => {
-  // Mirror the image write-failure path: the file the operator could see
-  // referenced in the failure message is the system prompt one. The
-  // instructions temp dir was minted just for this run, so it must be
-  // cleaned even though the child never spawned.
-  let spawned = 0;
-  const removed: string[] = [];
-  const backend = createCodexBackend({
-    spawn: () => {
-      spawned++;
-      throw new Error('should not spawn');
-    },
-    mkdtemp: async () => '/tmp/vicoop-codex-instr-fail',
-    writeFile: async () => {
-      throw new Error('disk full');
-    },
-    rm: async (filePath) => {
-      removed.push(String(filePath));
-    },
-  });
-
-  const { emit, frames } = collect();
-  await backend.handle(
-    assignWithOpenAICompat('go', { tools: SAMPLE_TOOLS, tool_choice: 'auto' }),
-    emit,
-    NEVER,
-  );
-
-  assert.equal(spawned, 0);
-  assert.deepEqual(removed, ['/tmp/vicoop-codex-instr-fail']);
-  const fail = frames[0] as Extract<UpFrame, { type: 'task.fail' }>;
-  assert.equal(fail.type, 'task.fail');
-  assert.equal(fail.error.code, 'input_file_write_failed');
-  assert.match(fail.error.message, /failed to materialize codex instructions/);
-  assert.match(fail.error.message, /disk full/);
-});
-
-test('multi-turn: history block is prepended to the user prompt on stdin', async () => {
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
-  ]);
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    mkdtemp: async () => '/tmp/vicoop-codex-mt',
-    writeFile: async () => {},
-    rm: async () => {},
-  });
-
-  await backend.handle(
-    assignWithOpenAICompat('continue, please', {
-      tools: SAMPLE_TOOLS,
-      tool_call_history: SAMPLE_HISTORY,
-    }),
-    collect().emit,
-    NEVER,
-  );
-
-  const stdin = fake.lastChild()!.stdinPayload;
-  // History block precedes the user prompt, separated by a blank line so
-  // the model sees the boundary clearly.
-  assert.match(stdin, /^<tool_call_history>\n/);
-  assert.match(stdin, /"role": "assistant"/);
-  assert.match(stdin, /"tool_call_id": "call_abc"/);
-  assert.match(stdin, /\n<\/tool_call_history>\n\ncontinue, please$/);
-});
-
-test('multi-turn: absent tool_call_history leaves the stdin prompt untouched', async () => {
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
-  ]);
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    mkdtemp: async () => '/tmp/vicoop-codex-mt-none',
-    writeFile: async () => {},
-    rm: async () => {},
-  });
-
-  await backend.handle(
-    assignWithOpenAICompat('hi', { tools: SAMPLE_TOOLS }),
-    collect().emit,
-    NEVER,
-  );
-
-  // No <tool_call_history> wrapper leaks onto a first-turn task.
-  const stdin = fake.lastChild()!.stdinPayload;
-  assert.equal(stdin, 'hi');
-});
-
-test('agent_message envelope JSON becomes a data-part artifact tagged with the extension URI', async () => {
-  const envelope = {
-    tool_calls: [
-      { id: 'call_abc', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
-    ],
-  };
-  const fake = scriptedSpawn([
-    [
-      JSON.stringify({ type: 'thread.started', thread_id: 't1' }),
-      JSON.stringify({
-        type: 'item.completed',
-        item: { type: 'agent_message', text: JSON.stringify(envelope) },
-      }),
-    ],
-  ]);
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    mkdtemp: async () => '/tmp/vicoop-codex-env',
-    writeFile: async () => {},
-    rm: async () => {},
-  });
-
-  const { emit, frames } = collect();
-  await backend.handle(
-    assignWithOpenAICompat('what is the weather in Seoul?', { tools: SAMPLE_TOOLS }),
-    emit,
-    NEVER,
-  );
-
-  const artifacts = frames.filter(
-    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
-  );
-  assert.equal(artifacts.length, 1);
-  const part = artifacts[0].artifact.parts[0];
-  assert.equal(part.kind, 'data');
-  if (part.kind !== 'data') throw new Error('expected data part');
-  assert.deepEqual(part.data, envelope);
-  // Tagged so downstream gateways can route on the extension.
-  assert.deepEqual(artifacts[0].artifact.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
-});
-
-test('extension off: a coincidental {"tool_calls":[...]} agent_message stays a text artifact', async () => {
-  // No metadata → no envelope contract is in force, so a model emitting
-  // JSON-shaped text by coincidence MUST NOT be routed as a tool call.
-  // Guards against false positives polluting natural-language tasks.
-  const coincidental = JSON.stringify({ tool_calls: [] });
-  const fake = scriptedSpawn([
-    [
-      JSON.stringify({
-        type: 'item.completed',
-        item: { type: 'agent_message', text: coincidental },
-      }),
-    ],
-  ]);
   const backend = createCodexBackend({ spawn: fake.spawn });
+
+  const a = collect();
+  await backend.handle(assign('hi A', 'ctx-A'), a.emit, NEVER);
+  const b = collect();
+  await backend.handle(assign('hi B', 'ctx-B'), b.emit, NEVER);
+
+  assert.equal(fake.children.length, 1);
+  const frames = fake.lastChild().stdinFrames();
+  const starts = frames.filter((f) => (f as { method?: string }).method === 'thread/start');
+  assert.equal(starts.length, 2, 'one thread/start per context');
+});
+
+test('abort sends turn/interrupt and emits canceled', async () => {
+  // Scenario: respond to initialize, thread/start, turn/start, but never
+  // emit a turn/completed unless an interrupt arrives.
+  const fake = makeFakeSpawn(() => ({
+    onLine(frame, child) {
+      const id = (frame as { id?: unknown }).id;
+      const method = (frame as { method?: string }).method;
+      if (method === 'initialize' && id !== undefined) {
+        child.emitStdout({ id, result: { userAgent: 'fake' } });
+        return;
+      }
+      if (method === 'thread/start' && id !== undefined) {
+        child.emitStdout({ id, result: { thread: { id: 'thr' } } });
+        return;
+      }
+      if (method === 'turn/start' && id !== undefined) {
+        child.emitStdout({ id, result: { turn: { id: 'turn-x', status: 'inProgress' } } });
+        return;
+      }
+      if (method === 'turn/interrupt' && id !== undefined) {
+        child.emitStdout({ id, result: {} });
+        // After ack, emit a turn/completed status=interrupted.
+        queueMicrotask(() => {
+          child.emitStdout({
+            method: 'turn/completed',
+            params: { turn: { id: 'turn-x', status: 'interrupted' } },
+          });
+        });
+      }
+    },
+  }));
+  const backend = createCodexBackend({ spawn: fake.spawn });
+
+  const ctrl = new AbortController();
+  const { emit, frames } = collect();
+  const handlePromise = backend.handle(assign('hang'), emit, ctrl.signal);
+  // Give the backend time to send turn/start before aborting.
+  await new Promise((r) => setTimeout(r, 20));
+  ctrl.abort();
+  await handlePromise;
+
+  const sent = fake.lastChild().stdinFrames();
+  const interrupt = findRequest(sent, 'turn/interrupt');
+  assert.ok(interrupt, 'turn/interrupt sent on abort');
+  const last = frames.at(-1);
+  assert.equal(last?.type, 'task.complete');
+  assert.equal(last?.type === 'task.complete' && last.status.state, 'canceled');
+});
+
+test('approval server-request gets auto-decline by default', async () => {
+  let lastApprovalResponse: unknown = null;
+  const fake = makeFakeSpawn(() => ({
+    onLine(frame, child) {
+      const id = (frame as { id?: unknown }).id;
+      const method = (frame as { method?: string }).method;
+      if (method === 'initialize' && id !== undefined) {
+        child.emitStdout({ id, result: { userAgent: 'fake' } });
+        return;
+      }
+      if (method === 'thread/start' && id !== undefined) {
+        child.emitStdout({ id, result: { thread: { id: 'thr' } } });
+        return;
+      }
+      if (method === 'turn/start' && id !== undefined) {
+        child.emitStdout({ id, result: { turn: { id: 't', status: 'inProgress' } } });
+        // Send a server-initiated approval request to the client.
+        queueMicrotask(() => {
+          child.emitStdout({
+            id: 9999,
+            method: 'execCommandApproval',
+            params: { command: 'rm -rf /' },
+          });
+        });
+        return;
+      }
+      // The auto-decline response comes back from the client with `id: 9999`.
+      if (id === 9999) {
+        lastApprovalResponse = frame;
+        // After approval is declined, conclude the turn.
+        queueMicrotask(() => {
+          child.emitStdout({
+            method: 'item/completed',
+            params: {
+              turnId: 't',
+              item: { type: 'agentMessage', id: 'a', text: 'declined' },
+            },
+          });
+          child.emitStdout({
+            method: 'turn/completed',
+            params: { turn: { id: 't', status: 'completed' } },
+          });
+        });
+      }
+    },
+  }));
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('do dangerous thing'), emit, NEVER);
+
+  const approvalFrame = lastApprovalResponse as { id?: number; result?: { decision?: string } } | null;
+  assert.equal(approvalFrame?.id, 9999);
+  assert.equal(approvalFrame?.result?.decision, 'decline');
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+});
+
+test('app-server spawn failure surfaces app_server_unavailable', async () => {
+  const failingSpawn: AppServerSpawnFn = () => {
+    throw new Error('ENOENT');
+  };
+  const backend = createCodexBackend({ spawn: failingSpawn });
   const { emit, frames } = collect();
   await backend.handle(assign('hi'), emit, NEVER);
 
-  const artifacts = frames.filter(
-    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  const last = frames.at(-1);
+  assert.equal(last?.type, 'task.fail');
+  assert.equal(
+    last?.type === 'task.fail' && last.error.code,
+    'app_server_unavailable',
   );
-  assert.equal(artifacts.length, 1);
-  assert.equal(artifacts[0].artifact.parts[0].kind, 'text');
-  assert.equal(textOf(artifacts[0]), coincidental);
-  assert.equal(artifacts[0].artifact.extensions, undefined);
 });
 
-test('extension on but the model answered in prose → text artifact, no extension tag', async () => {
-  // The extension being active does not mean every turn is a tool turn:
-  // tool_choice="auto" lets the model answer naturally. Non-envelope text
-  // must still flow through as a text artifact and must NOT carry the
-  // extension URI tag, which would mis-claim a data-part contract.
-  const fake = scriptedSpawn([
-    [
-      JSON.stringify({
-        type: 'item.completed',
-        item: { type: 'agent_message', text: 'No tool needed; the answer is 42.' },
-      }),
-    ],
-  ]);
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
-    mkdtemp: async () => '/tmp/vicoop-codex-prose',
-    writeFile: async () => {},
-    rm: async () => {},
-  });
+test('transport closing mid-turn emits task.fail', async () => {
+  const fake = makeFakeSpawn(() => ({
+    onLine(frame, child) {
+      const id = (frame as { id?: unknown }).id;
+      const method = (frame as { method?: string }).method;
+      if (method === 'initialize' && id !== undefined) {
+        child.emitStdout({ id, result: { userAgent: 'fake' } });
+        return;
+      }
+      if (method === 'thread/start' && id !== undefined) {
+        child.emitStdout({ id, result: { thread: { id: 'thr' } } });
+        return;
+      }
+      if (method === 'turn/start' && id !== undefined) {
+        child.emitStdout({ id, result: { turn: { id: 't', status: 'inProgress' } } });
+        // Kill the child mid-turn.
+        queueMicrotask(() => child.finish(1));
+      }
+    },
+  }));
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('crash me'), emit, NEVER);
+
+  const last = frames.at(-1);
+  assert.equal(last?.type, 'task.fail');
+  assert.equal(last?.type === 'task.fail' && last.error.code, 'turn_failed');
+});
+
+test('traceability extension surfaces commandExecution item as a trace artifact', async () => {
+  const fake = makeFakeSpawn(() =>
+    happyPath({ agentMessageText: 'done', emitCommandExecutionTurns: [1] }),
+  );
+  const backend = createCodexBackend({ spawn: fake.spawn });
   const { emit, frames } = collect();
   await backend.handle(
-    assignWithOpenAICompat('hi', { tools: SAMPLE_TOOLS, tool_choice: 'auto' }),
+    assign('run ls', 'ctx-trace', {
+      requestedExtensions: [TRACEABILITY_EXTENSION_URI],
+    }),
     emit,
     NEVER,
   );
 
-  const artifacts = frames.filter(
-    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  const traceArtifact = frames.find(
+    (f) =>
+      f.type === 'task.artifact' && f.artifact.extensions?.includes(TRACEABILITY_EXTENSION_URI),
   );
-  assert.equal(artifacts.length, 1);
-  assert.equal(textOf(artifacts[0]), 'No tool needed; the answer is 42.');
-  assert.equal(artifacts[0].artifact.extensions, undefined);
+  assert.ok(traceArtifact, 'trace artifact emitted');
+  assert.equal(frames.at(-1)?.type, 'task.complete');
 });
 
-test('tool_choice="none" writes a no-envelope directive to the instructions file', async () => {
-  const fake = scriptedSpawn([
-    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
-  ]);
-  const written: Array<{ path: string; data: Buffer }> = [];
+test('image FilePart is materialised under a temp dir and passed as localImage UserInput', async () => {
+  const fake = makeFakeSpawn(() => happyPath());
+  const written: Array<{ file: string; size: number }> = [];
   const backend = createCodexBackend({
     spawn: fake.spawn,
-    mkdtemp: async () => '/tmp/vicoop-codex-none',
-    writeFile: async (filePath, data) => {
-      written.push({ path: String(filePath), data: Buffer.from(data as Buffer) });
+    mkdtemp: async () => '/tmp/test-codex-as',
+    writeFile: async (file, data) => {
+      written.push({ file, size: data.length });
     },
-    rm: async () => {},
+    rm: async () => undefined,
   });
 
+  const tiny = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64');
+  const { emit, frames } = collect();
   await backend.handle(
-    assignWithOpenAICompat('hi', {
-      tools: SAMPLE_TOOLS,
-      tool_choice: 'none',
+    {
+      type: 'task.assign',
+      taskId: 'task-img',
+      contextId: 'ctx-img',
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [
+          { kind: 'text', text: 'what is this' },
+          { kind: 'file', file: { mimeType: 'image/png', bytes: tiny } },
+        ],
+      },
+    },
+    emit,
+    NEVER,
+  );
+
+  assert.equal(written.length, 1);
+  assert.match(written[0].file, /^\/tmp\/test-codex-as\/image-1\.png$/);
+
+  const turnStart = findRequest(fake.lastChild().stdinFrames(), 'turn/start');
+  const params = (turnStart as {
+    params?: { input?: Array<{ type: string; path?: string }> };
+  }).params;
+  const imageItem = params?.input?.find((it) => it.type === 'localImage');
+  assert.ok(imageItem, 'localImage UserInput present');
+  assert.equal(imageItem?.path, '/tmp/test-codex-as/image-1.png');
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+});
+
+test('openai-compat tool_call_history is injected as native Responses API items, NOT folded into user text', async () => {
+  // Codex absorbs `function_call` / `function_call_output` items as proper
+  // prior tool dispatch — the model sees them as its own past actions and
+  // does not re-emit the same envelope (#176). The text input must NOT
+  // carry a `<tool_call_history>` blob anymore: the native channel is the
+  // single source of truth.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(
+    assign('next', 'ctx-hist', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'next' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tool_call_history: [
+              {
+                role: 'assistant',
+                tool_calls: [
+                  { id: 'tc1', function: { name: 'lookup', arguments: '{}' } },
+                ],
+              },
+              { role: 'tool', tool_call_id: 'tc1', content: 'OK' },
+            ],
+          },
+        },
+      },
+    }),
+    emit,
+    NEVER,
+  );
+
+  // thread/inject_items must be sent between thread/start and turn/start,
+  // with one function_call + one function_call_output item paired by call_id.
+  const inject = findRequest(fake.lastChild().stdinFrames(), 'thread/inject_items');
+  assert.ok(inject, 'thread/inject_items observed');
+  const injectParams = (inject as {
+    params?: { items?: Array<Record<string, unknown>> };
+  }).params;
+  assert.deepEqual(injectParams?.items, [
+    { type: 'function_call', call_id: 'tc1', name: 'lookup', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'tc1', output: 'OK' },
+  ]);
+
+  // The user text part of turn/start carries ONLY the user's text — no
+  // history blob is folded in.
+  const turnStart = findRequest(fake.lastChild().stdinFrames(), 'turn/start');
+  const params = (turnStart as {
+    params?: { input?: Array<{ type: string; text?: string }> };
+  }).params;
+  const textItem = params?.input?.find((it) => it.type === 'text');
+  assert.equal(textItem?.text, 'next');
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+});
+
+test('absent tool_call_history skips thread/inject_items entirely', async () => {
+  // First-turn tasks (no prior round-trips) must NOT send a dangling
+  // empty-items inject.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(assign('hi', 'ctx-no-hist'), collect().emit, NEVER);
+  const inject = findRequest(fake.lastChild().stdinFrames(), 'thread/inject_items');
+  assert.equal(inject, null);
+});
+
+test('parallel tool_calls in one assistant entry fan out into one function_call item each', async () => {
+  // OpenAI permits multiple tool_calls per assistant message (parallel
+  // tool use). Each becomes its own native function_call item so codex's
+  // session sees each call as a discrete event.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('next', 'ctx-parallel', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'next' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tool_call_history: [
+              {
+                role: 'assistant',
+                tool_calls: [
+                  { id: 'tc1', function: { name: 'a', arguments: '{"x":1}' } },
+                  { id: 'tc2', function: { name: 'b', arguments: '{"y":2}' } },
+                ],
+              },
+              { role: 'tool', tool_call_id: 'tc1', content: 'A' },
+              { role: 'tool', tool_call_id: 'tc2', content: 'B' },
+            ],
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  const inject = findRequest(fake.lastChild().stdinFrames(), 'thread/inject_items');
+  const items = (inject as { params?: { items?: Array<Record<string, unknown>> } })
+    .params?.items;
+  assert.deepEqual(items, [
+    { type: 'function_call', call_id: 'tc1', name: 'a', arguments: '{"x":1}' },
+    { type: 'function_call', call_id: 'tc2', name: 'b', arguments: '{"y":2}' },
+    { type: 'function_call_output', call_id: 'tc1', output: 'A' },
+    { type: 'function_call_output', call_id: 'tc2', output: 'B' },
+  ]);
+});
+
+test('expired session falls back to thread/start instead of thread/resume', async () => {
+  const fake = makeFakeSpawn(() => happyPath());
+  let clock = 1_000_000;
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    sessionTtlMs: 1_000,
+    now: () => clock,
+  });
+
+  await backend.handle(assign('first', 'ctx-ttl'), collect().emit, NEVER);
+  clock += 60_000; // jump well past the TTL
+  await backend.handle(assign('second', 'ctx-ttl'), collect().emit, NEVER);
+
+  const frames = fake.lastChild().stdinFrames();
+  const starts = frames.filter((f) => (f as { method?: string }).method === 'thread/start').length;
+  const resumes = frames.filter((f) => (f as { method?: string }).method === 'thread/resume').length;
+  assert.equal(starts, 2, 'expired session re-runs thread/start');
+  assert.equal(resumes, 0, 'no thread/resume across the TTL boundary');
+});
+
+test('two concurrent tasks on the same contextId run sequentially through the mutex', async () => {
+  // Make the fake server delay turn/completed so we can observe the ordering.
+  const fake = makeFakeSpawn(() => {
+    let turnCounter = 0;
+    const pendingTurns: Array<{ id: number | string; localId: string }> = [];
+    return {
+      onLine(frame, child) {
+        const id = (frame as { id?: number | string }).id;
+        const method = (frame as { method?: string }).method;
+        if (method === 'initialize' && id !== undefined) {
+          child.emitStdout({ id, result: { userAgent: 'fake' } });
+          return;
+        }
+        if ((method === 'thread/start' || method === 'thread/resume') && id !== undefined) {
+          child.emitStdout({ id, result: { thread: { id: 'thr' } } });
+          return;
+        }
+        if (method === 'turn/start' && id !== undefined) {
+          turnCounter += 1;
+          const localTurnId = `turn-${turnCounter}`;
+          child.emitStdout({ id, result: { turn: { id: localTurnId, status: 'inProgress' } } });
+          pendingTurns.push({ id, localId: localTurnId });
+          // Drive turns to completion on the next macrotask; the second
+          // turn must not race the first.
+          setTimeout(() => {
+            const t = pendingTurns.shift();
+            if (!t) return;
+            child.emitStdout({
+              method: 'item/completed',
+              params: {
+                turnId: t.localId,
+                item: { type: 'agentMessage', id: 'a', text: `r-${t.localId}` },
+              },
+            });
+            child.emitStdout({
+              method: 'turn/completed',
+              params: { turn: { id: t.localId, status: 'completed' } },
+            });
+          }, 10);
+        }
+      },
+    };
+  });
+  const backend = createCodexBackend({ spawn: fake.spawn });
+
+  const a = collect();
+  const b = collect();
+  const t0 = Date.now();
+  const promiseA = backend.handle(assign('first', 'ctx-conc'), a.emit, NEVER);
+  const promiseB = backend.handle(assign('second', 'ctx-conc'), b.emit, NEVER);
+  await Promise.all([promiseA, promiseB]);
+  const elapsed = Date.now() - t0;
+
+  // Both tasks completed.
+  assert.equal(a.frames.at(-1)?.type, 'task.complete');
+  assert.equal(b.frames.at(-1)?.type, 'task.complete');
+  // Each fake turn carries a 10ms delay; serial execution should land
+  // around 20ms+ rather than ~10ms parallel.
+  assert.ok(elapsed >= 18, `concurrent same-context should serialise (elapsed=${elapsed}ms)`);
+
+  // Sanity: only ONE turn was on the wire at any moment — the second
+  // turn/start would have been queued, so they arrived in order.
+  const frames = fake.lastChild().stdinFrames();
+  const turnStarts = frames.filter((f) => (f as { method?: string }).method === 'turn/start');
+  assert.equal(turnStarts.length, 2);
+});
+
+test('backend tolerates a malformed (non-JSON) stdout line without breaking the turn', async () => {
+  const fake = makeFakeSpawn(() => ({
+    onLine(frame, child) {
+      const id = (frame as { id?: unknown }).id;
+      const method = (frame as { method?: string }).method;
+      if (method === 'initialize' && id !== undefined) {
+        // Garbage line first — must NOT crash the dispatcher.
+        child.emitStdoutRaw('this is not json\n');
+        child.emitStdout({ id, result: { userAgent: 'fake' } });
+        return;
+      }
+      if (method === 'thread/start' && id !== undefined) {
+        child.emitStdout({ id, result: { thread: { id: 'thr' } } });
+        return;
+      }
+      if (method === 'turn/start' && id !== undefined) {
+        child.emitStdout({ id, result: { turn: { id: 't', status: 'inProgress' } } });
+        queueMicrotask(() => {
+          child.emitStdout({
+            method: 'item/completed',
+            params: { turnId: 't', item: { type: 'agentMessage', id: 'a', text: 'ok' } },
+          });
+          child.emitStdout({
+            method: 'turn/completed',
+            params: { turn: { id: 't', status: 'completed' } },
+          });
+        });
+      }
+    },
+  }));
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('x'), emit, NEVER);
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+});
+
+test('turn/start RPC error surfaces task.fail with turn_failed', async () => {
+  const fake = makeFakeSpawn(() => ({
+    onLine(frame, child) {
+      const id = (frame as { id?: unknown }).id;
+      const method = (frame as { method?: string }).method;
+      if (method === 'initialize' && id !== undefined) {
+        child.emitStdout({ id, result: { userAgent: 'fake' } });
+        return;
+      }
+      if (method === 'thread/start' && id !== undefined) {
+        child.emitStdout({ id, result: { thread: { id: 'thr' } } });
+        return;
+      }
+      if (method === 'turn/start' && id !== undefined) {
+        child.emitStdout({
+          id,
+          error: { code: -32001, message: 'overloaded' },
+        });
+      }
+    },
+  }));
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('x'), emit, NEVER);
+  const last = frames.at(-1);
+  assert.equal(last?.type, 'task.fail');
+  assert.equal(last?.type === 'task.fail' && last.error.code, 'turn_failed');
+});
+
+test('openai-compat envelope agent message is emitted as a data part', async () => {
+  const envelope = JSON.stringify({
+    tool_calls: [{ id: '1', function: { name: 'fetch', arguments: '{}' } }],
+  });
+  const fake = makeFakeSpawn(() => happyPath({ agentMessageText: envelope }));
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(
+    assign('what tools?', 'ctx-oai', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'what tools?' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            system: 'be terse',
+            tools: [{ type: 'function', function: { name: 'fetch', parameters: {} } }],
+          },
+        },
+      },
+    }),
+    emit,
+    NEVER,
+  );
+
+  // The envelope-shaped agent message must be a `data` part.
+  const artifact = frames.find((f) => f.type === 'task.artifact');
+  assert.ok(artifact);
+  if (artifact?.type === 'task.artifact') {
+    const p = artifact.artifact.parts[0];
+    assert.equal(p.kind, 'data');
+    assert.ok(artifact.artifact.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI));
+  }
+
+  // developerInstructions must have been included in thread/start.
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { developerInstructions?: string } }).params;
+  assert.ok(
+    typeof params?.developerInstructions === 'string' &&
+      params.developerInstructions.length > 0,
+    'developerInstructions sent on thread/start',
+  );
+});
+
+test('thread/start carries `config.features.{shell_tool,unified_exec}: false` when caller tools are active (#175)', async () => {
+  // Without this, codex would execute the caller's "bash" call itself in
+  // its sandbox and emit a plain-text result instead of the openai-compat
+  // envelope the caller is waiting for.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('list files', 'ctx-features', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'list files' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+          },
+        },
+      },
     }),
     collect().emit,
     NEVER,
   );
 
-  assert.equal(written.length, 1);
-  const body = written[0].data.toString('utf8');
-  // The envelope contract block is suppressed under tool_choice="none";
-  // an explicit "do not emit" directive replaces it so the gateway's
-  // intent (no tool calls this turn) is preserved.
-  assert.doesNotMatch(body, /"tool_calls":\[\{"id":"call_<unique>"/);
-  assert.match(body, /tool_choice="none"/);
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as {
+    params?: { config?: { features?: Record<string, boolean> } };
+  }).params;
+  assert.deepEqual(params?.config?.features, {
+    shell_tool: false,
+    unified_exec: false,
+  });
 });
 
-// ---------------------------------------------------------------------------
-// openai-compat/v1 response-side `usage` forwarding
-//
-// Codex 0.130+ emits a flat `usage` object on the terminal `turn.completed`
-// event. We forward it verbatim as the openai-compat/v1 `usage` payload on
-// the final A2A message metadata so the gateway can hand authoritative token
-// counts to OpenAI clients instead of falling back to a local estimate.
-// ---------------------------------------------------------------------------
+test('thread/start omits `config` when no caller tools are supplied', async () => {
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  // Plain text task with no openai-compat metadata.
+  await backend.handle(assign('hi', 'ctx-no-features'), collect().emit, NEVER);
 
-function completionMessageMetadata(frames: readonly UpFrame[]): Record<string, unknown> | undefined {
-  const complete = frames.find((f) => f.type === 'task.complete');
-  if (complete?.type !== 'task.complete') return undefined;
-  return complete.status.message?.metadata;
-}
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { config?: unknown } }).params;
+  assert.equal(params?.config, undefined);
+});
 
-test('turn.completed.usage is forwarded under openai-compat metadata on task.complete', async () => {
-  const fake = scriptedSpawn([
-    [
-      JSON.stringify({ type: 'thread.started', thread_id: 't' }),
-      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'HELLO' } }),
-      JSON.stringify({
-        type: 'turn.completed',
-        usage: {
-          input_tokens: 13411,
-          cached_input_tokens: 7552,
-          output_tokens: 15,
-          reasoning_output_tokens: 7,
+test('history-only openai-compat payload (no `tools`) does not disable codex built-ins', async () => {
+  // Mirror of the codex (exec) backend test. With tools absent there is no
+  // caller-side dispatch contract to protect; do not handicap codex's
+  // built-ins for this turn.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('continue', 'ctx-hist-no-feat', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'continue' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tool_call_history: [
+              { role: 'assistant', tool_calls: [{ id: 'tc1', function: { name: 'x', arguments: '{}' } }] },
+              { role: 'tool', tool_call_id: 'tc1', content: 'OK' },
+            ],
+          },
         },
-      }),
-    ],
-  ]);
-  const backend = createCodexBackend({ spawn: fake.spawn });
-  const { emit, frames } = collect();
-  await backend.handle(assign('say hi'), emit, NEVER);
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
 
-  const metadata = completionMessageMetadata(frames);
-  assert.ok(metadata, 'task.complete message should carry metadata');
-  const payload = metadata[OPENAI_COMPAT_EXTENSION_URI] as { usage?: Record<string, unknown> };
-  assert.ok(payload?.usage, 'metadata should contain openai-compat usage');
-  // Required fields with MUST invariant on total.
-  assert.equal(payload.usage.prompt_tokens, 13411);
-  assert.equal(payload.usage.completion_tokens, 15);
-  assert.equal(payload.usage.total_tokens, 13411 + 15);
-  // Cached and reasoning ride along as the OpenAI-shaped breakdowns.
-  assert.deepEqual(payload.usage.prompt_tokens_details, { cached_tokens: 7552 });
-  assert.deepEqual(payload.usage.completion_tokens_details, { reasoning_tokens: 7 });
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { config?: unknown } }).params;
+  assert.equal(params?.config, undefined);
 });
 
-test('task.complete message advertises openai-compat extension when usage is attached', async () => {
-  const fake = scriptedSpawn([
-    [
-      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } }),
-      JSON.stringify({
-        type: 'turn.completed',
-        usage: { input_tokens: 100, output_tokens: 20 },
-      }),
-    ],
-  ]);
+test('thread/resume re-passes `config.features` because feature flags do not persist across resume (#175)', async () => {
+  // Two turns on the same contextId: first thread/start, second
+  // thread/resume. Both must carry the disable flags — feature settings
+  // are scoped to a single resume span server-side, so a missing config on
+  // resume would silently re-enable shell_tool.
+  const fake = makeFakeSpawn(() => happyPath());
   const backend = createCodexBackend({ spawn: fake.spawn });
-  const { emit, frames } = collect();
-  await backend.handle(assign('go'), emit, NEVER);
+  const meta = {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+    },
+  };
+  await backend.handle(
+    assign('one', 'ctx-feat-resume', {
+      message: {
+        role: 'user',
+        messageId: 'm1',
+        parts: [{ kind: 'text', text: 'one' }],
+        metadata: meta,
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  await backend.handle(
+    assign('two', 'ctx-feat-resume', {
+      message: {
+        role: 'user',
+        messageId: 'm2',
+        parts: [{ kind: 'text', text: 'two' }],
+        metadata: meta,
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
 
-  const complete = frames.find((f) => f.type === 'task.complete');
-  assert.ok(complete && complete.type === 'task.complete');
-  assert.deepEqual(complete.status.message?.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
-});
-
-test('absent turn.completed.usage → no openai-compat metadata is attached', async () => {
-  const fake = scriptedSpawn([
-    [
-      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } }),
-      // No turn.completed (or one without usage) — gateway falls back to its
-      // own estimate per spec.
-    ],
-  ]);
-  const backend = createCodexBackend({ spawn: fake.spawn });
-  const { emit, frames } = collect();
-  await backend.handle(assign('go'), emit, NEVER);
-
-  const complete = frames.find((f) => f.type === 'task.complete');
-  assert.ok(complete && complete.type === 'task.complete');
-  // Message is still emitted (it carries the visible reply text) but bears
-  // no metadata key for the openai-compat extension.
-  assert.equal(complete.status.message?.metadata, undefined);
-  assert.equal(complete.status.message?.extensions, undefined);
-});
-
-test('malformed turn.completed.usage is dropped silently (best-effort)', async () => {
-  const fake = scriptedSpawn([
-    [
-      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } }),
-      JSON.stringify({
-        type: 'turn.completed',
-        // Negative output_tokens is not a valid count — best-effort policy
-        // is to omit rather than forward a shape that breaks consumer
-        // accounting.
-        usage: { input_tokens: 10, output_tokens: -1 },
-      }),
-    ],
-  ]);
-  const backend = createCodexBackend({ spawn: fake.spawn });
-  const { emit, frames } = collect();
-  await backend.handle(assign('go'), emit, NEVER);
-
-  const complete = frames.find((f) => f.type === 'task.complete');
-  assert.ok(complete && complete.type === 'task.complete');
-  assert.equal(complete.status.message?.metadata, undefined);
+  const frames = fake.lastChild().stdinFrames();
+  const start = findRequest(frames, 'thread/start');
+  const resume = findRequest(frames, 'thread/resume');
+  assert.ok(start, 'thread/start observed');
+  assert.ok(resume, 'thread/resume observed');
+  const startFeatures = (start as { params?: { config?: { features?: Record<string, boolean> } } })
+    .params?.config?.features;
+  const resumeFeatures = (resume as { params?: { config?: { features?: Record<string, boolean> } } })
+    .params?.config?.features;
+  assert.deepEqual(startFeatures, { shell_tool: false, unified_exec: false });
+  assert.deepEqual(resumeFeatures, { shell_tool: false, unified_exec: false });
 });
