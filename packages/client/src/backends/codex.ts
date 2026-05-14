@@ -642,31 +642,17 @@ export function createCodexBackend(
           // them.
           //
           // When caller-side tool dispatch is active (openai-compat with
-          // tools), codex MUST be reduced to "emit text or emit a tool_calls
-          // envelope" only. Two wire-level guards:
-          //
-          //   1. Disable every codex feature that lets the model do
-          //      something directly (shell, exec, browser, computer use,
-          //      patch tools, image generation, plugins / multi-agent /
-          //      MCP). This is broader than the original #175 fix
-          //      (`shell_tool` + `unified_exec`) — anything codex can call
-          //      itself bypasses the envelope contract; the caller's tools
-          //      are the only legitimate dispatch surface.
-          //
-          //   2. Drop `cwd` from thread/start and thread/resume. The
-          //      caller's tools execute on the caller's host, not the
-          //      agent's; an agent-side cwd has nothing useful to
-          //      contribute, and worse, codex was leaking the agent's
-          //      host path into tool_call args (e.g. `List(/tmp/agent-
-          //      workdir)`) when prompts referenced "current working
-          //      directory" — see PR #180 review thread.
-          //
-          // Outside of caller-side tool dispatch (no openai-compat tools)
-          // we keep cwd + leave codex's built-ins enabled — that's the
-          // operator-controlled local-codex path and not subject to the
-          // same envelope contract.
-          const callerToolsActive = callerToolDispatchActive(openaiCompat);
-          const featuresOverride = callerToolsActive
+          // tools), every codex surface that lets the model do something
+          // directly is disabled. The caller's `tools` array is the ONLY
+          // legitimate dispatch surface — anything codex can call itself
+          // (shell, exec, browser, computer use, patch tools, image
+          // generation, plugins / multi-agent / MCP, workspace
+          // introspection) would bypass the envelope contract. This is
+          // broader than the original #175 fix (`shell_tool` +
+          // `unified_exec`); see PR #180 review for the full rationale.
+          // The model is reduced to "emit text" or "emit a tool_calls
+          // envelope" only.
+          const featuresOverride = callerToolDispatchActive(openaiCompat)
             ? {
                 features: {
                   // Direct execution surfaces — anything that lets codex
@@ -703,10 +689,6 @@ export function createCodexBackend(
                 },
               }
             : null;
-          // cwd is meaningful only when codex's local tools are in play.
-          // With openai-compat tools active we drop it so the model has no
-          // host path to echo back.
-          const threadCwd = callerToolsActive ? undefined : cwd;
 
           let threadId: string;
           try {
@@ -715,7 +697,7 @@ export function createCodexBackend(
                 'thread/resume',
                 {
                   threadId: existing.threadId,
-                  ...(threadCwd !== undefined ? { cwd: threadCwd } : {}),
+                  cwd,
                   sandbox: sandboxMode,
                   ...(featuresOverride ? { config: featuresOverride } : {}),
                 },
@@ -725,7 +707,7 @@ export function createCodexBackend(
               const startResult = await client.request<{ thread: { id: string } }>(
                 'thread/start',
                 {
-                  ...(threadCwd !== undefined ? { cwd: threadCwd } : {}),
+                  cwd,
                   sandbox: sandboxMode,
                   ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),
                   ...(featuresOverride ? { config: featuresOverride } : {}),
