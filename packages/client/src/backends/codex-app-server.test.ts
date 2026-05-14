@@ -941,3 +941,128 @@ test('openai-compat envelope agent message is emitted as a data part', async () 
     'developerInstructions sent on thread/start',
   );
 });
+
+test('thread/start carries `config.features.{shell_tool,unified_exec}: false` when caller tools are active (#175)', async () => {
+  // Without this, codex would execute the caller's "bash" call itself in
+  // its sandbox and emit a plain-text result instead of the openai-compat
+  // envelope the caller is waiting for.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexAppServerBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('list files', 'ctx-features', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'list files' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as {
+    params?: { config?: { features?: Record<string, boolean> } };
+  }).params;
+  assert.deepEqual(params?.config?.features, {
+    shell_tool: false,
+    unified_exec: false,
+  });
+});
+
+test('thread/start omits `config` when no caller tools are supplied', async () => {
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexAppServerBackend({ spawn: fake.spawn });
+  // Plain text task with no openai-compat metadata.
+  await backend.handle(assign('hi', 'ctx-no-features'), collect().emit, NEVER);
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { config?: unknown } }).params;
+  assert.equal(params?.config, undefined);
+});
+
+test('history-only openai-compat payload (no `tools`) does not disable codex built-ins', async () => {
+  // Mirror of the codex (exec) backend test. With tools absent there is no
+  // caller-side dispatch contract to protect; do not handicap codex's
+  // built-ins for this turn.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexAppServerBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('continue', 'ctx-hist-no-feat', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'continue' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tool_call_history: [
+              { role: 'assistant', tool_calls: [{ id: 'tc1', function: { name: 'x', arguments: '{}' } }] },
+              { role: 'tool', tool_call_id: 'tc1', content: 'OK' },
+            ],
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { config?: unknown } }).params;
+  assert.equal(params?.config, undefined);
+});
+
+test('thread/resume re-passes `config.features` because feature flags do not persist across resume (#175)', async () => {
+  // Two turns on the same contextId: first thread/start, second
+  // thread/resume. Both must carry the disable flags — feature settings
+  // are scoped to a single resume span server-side, so a missing config on
+  // resume would silently re-enable shell_tool.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexAppServerBackend({ spawn: fake.spawn });
+  const meta = {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+    },
+  };
+  await backend.handle(
+    assign('one', 'ctx-feat-resume', {
+      message: {
+        role: 'user',
+        messageId: 'm1',
+        parts: [{ kind: 'text', text: 'one' }],
+        metadata: meta,
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  await backend.handle(
+    assign('two', 'ctx-feat-resume', {
+      message: {
+        role: 'user',
+        messageId: 'm2',
+        parts: [{ kind: 'text', text: 'two' }],
+        metadata: meta,
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const frames = fake.lastChild().stdinFrames();
+  const start = findRequest(frames, 'thread/start');
+  const resume = findRequest(frames, 'thread/resume');
+  assert.ok(start, 'thread/start observed');
+  assert.ok(resume, 'thread/resume observed');
+  const startFeatures = (start as { params?: { config?: { features?: Record<string, boolean> } } })
+    .params?.config?.features;
+  const resumeFeatures = (resume as { params?: { config?: { features?: Record<string, boolean> } } })
+    .params?.config?.features;
+  assert.deepEqual(startFeatures, { shell_tool: false, unified_exec: false });
+  assert.deepEqual(resumeFeatures, { shell_tool: false, unified_exec: false });
+});

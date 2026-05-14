@@ -491,6 +491,21 @@ function parseToolCallHistory(raw: unknown[]): OpenAICompatHistoryEntry[] | null
   return out;
 }
 
+// True when the caller has supplied tool definitions AND has not explicitly
+// disabled tool use (`tool_choice === "none"`). Backends consult this to
+// decide whether to suppress agent-side built-in tools that would otherwise
+// bypass the envelope-emit contract — see issue #175 for the codex case
+// where the built-in shell/exec tools executed `ls` directly instead of
+// emitting a `tool_calls` envelope for the caller's `bash` definition.
+// The condition mirrors `hasTools` in `buildOpenAICompatSystemPrompt` so
+// the gate that enables the envelope contract in the prompt is the same
+// gate that disables the conflicting built-ins.
+export function callerToolDispatchActive(meta: OpenAICompatMetadata | null): boolean {
+  if (!meta) return false;
+  if (meta.tools === undefined) return false;
+  return meta.tool_choice !== 'none';
+}
+
 // Extract and shape-check the openai-compat metadata key. Returns null when
 // the metadata key is absent, malformed, or actionably empty (all four
 // fields missing or trivial) so the caller can fall back to its non-extension

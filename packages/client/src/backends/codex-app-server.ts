@@ -10,6 +10,7 @@ import { createLogger, type Logger } from '../logger.js';
 import { mapPartsToCodexInput } from './codex.js';
 import {
   buildOpenAICompatSystemPrompt,
+  callerToolDispatchActive,
   formatToolCallHistory,
   parseOpenAICompatMetadata,
   tryParseToolCallsEnvelope,
@@ -426,9 +427,25 @@ export function createCodexAppServerBackend(
             status: { state: 'working', timestamp: new Date().toISOString() },
           });
 
-          // For resumes we only re-attach to the existing thread without
-          // overriding config — initial `thread/start` already set sandbox
-          // and developerInstructions. Fresh threads pass both.
+          // For resumes we re-attach to the existing thread; sandbox and
+          // any developerInstructions set on initial `thread/start` carry
+          // over via the server-side session record. Feature-flag overrides
+          // (see `featuresOverride` below) are the exception — they do NOT
+          // persist across resume and must be re-sent every turn that wants
+          // them.
+          const featuresOverride = callerToolDispatchActive(openaiCompat)
+            ? // Disable codex's built-in shell/exec tools when caller-side
+              // tool dispatch is active. Without this, codex bypasses the
+              // openai-compat envelope contract by running commands in its
+              // own sandbox and emitting plain text (#175).
+              {
+                features: {
+                  shell_tool: false,
+                  unified_exec: false,
+                },
+              }
+            : null;
+
           let threadId: string;
           try {
             if (isResume) {
@@ -438,6 +455,7 @@ export function createCodexAppServerBackend(
                   threadId: existing.threadId,
                   cwd,
                   sandbox: sandboxMode,
+                  ...(featuresOverride ? { config: featuresOverride } : {}),
                 },
               );
               threadId = resumeResult.thread.id;
@@ -448,6 +466,7 @@ export function createCodexAppServerBackend(
                   cwd,
                   sandbox: sandboxMode,
                   ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),
+                  ...(featuresOverride ? { config: featuresOverride } : {}),
                 },
               );
               threadId = startResult.thread.id;

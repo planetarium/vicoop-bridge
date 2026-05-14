@@ -6,6 +6,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import {
   buildOpenAICompatSystemPrompt,
+  callerToolDispatchActive,
   createClaudeBackend,
   formatToolCallHistory,
   parseOpenAICompatMetadata,
@@ -1866,6 +1867,27 @@ test('buildOpenAICompatSystemPrompt: tool_choice="none" suppresses the envelope 
 test('buildOpenAICompatSystemPrompt: system only (no tools) returns just the user system', () => {
   const prompt = buildOpenAICompatSystemPrompt({ system: 'Be terse.' });
   assert.equal(prompt, 'Be terse.');
+});
+
+test('callerToolDispatchActive: gates on `tools` present and `tool_choice !== "none"`', () => {
+  // The same gate `buildOpenAICompatSystemPrompt` uses for the envelope
+  // contract block. Backends consult this to decide whether to suppress
+  // agent-side built-in tools (#175).
+  assert.equal(callerToolDispatchActive(null), false);
+  assert.equal(callerToolDispatchActive({}), false);
+  assert.equal(callerToolDispatchActive({ system: 'hi' }), false);
+  assert.equal(callerToolDispatchActive({ tools: [] }), true);
+  assert.equal(callerToolDispatchActive({ tools: [{ type: 'function' }] }), true);
+  // Caller catalogued tools but explicitly opted out for this turn — don't
+  // handicap the agent's built-ins; the contract isn't being enforced now.
+  assert.equal(
+    callerToolDispatchActive({ tools: [{ type: 'function' }], tool_choice: 'none' }),
+    false,
+  );
+  assert.equal(
+    callerToolDispatchActive({ tools: [{ type: 'function' }], tool_choice: 'auto' }),
+    true,
+  );
 });
 
 test('tryParseToolCallsEnvelope: recognises a well-formed envelope and preserves unknown keys', () => {
