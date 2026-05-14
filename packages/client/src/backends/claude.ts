@@ -615,17 +615,32 @@ export function buildOpenAICompatSystemPrompt(meta: OpenAICompatMetadata): strin
 }
 
 // Render a `tool_call_history` payload as a `<tool_call_history>`-wrapped
-// JSON block. Goes at the front of the user content on follow-up turns so
-// the model reads the prior round before the new instruction; the wrapper
-// tag makes the boundary unambiguous against the user's own text. The
-// inner array is the parsed history verbatim — same shape as on the wire,
-// so the model only has to learn one structure (also taught in the
-// SYSTEM_INSTRUCTION above).
+// JSON block followed by an inline directive. Goes at the front of the user
+// content on follow-up turns so the model reads the prior round before the
+// new instruction; the wrapper tag makes the boundary unambiguous against
+// the user's own text. The inner array is the parsed history verbatim —
+// same shape as on the wire, so the model only has to learn one structure
+// (also taught in the SYSTEM_INSTRUCTION above).
+//
+// The trailing `<tool_call_history_note>` block is the loop-defense. The
+// system-prompt directive ("do not repeat") alone is too easy to override
+// when the user's prompt contains an imperative like "Use a tool to …"
+// because each follow-up turn on app-server is a fresh thread (no codex
+// session memory of the prior envelope), so the model re-reads the user
+// directive verbatim and re-calls. By appending the note adjacent to the
+// user text and BEFORE it, we put the "the call already happened, use the
+// result" framing right where the model is parsing the imperative. The
+// note repeats the directive in plain language because relying on the
+// distant system prompt alone has empirically been observed to lose the
+// race (~25% loop rate with prompts like `"Use a tool to list …"`).
 export function formatToolCallHistory(history: OpenAICompatHistoryEntry[]): string {
   return [
     '<tool_call_history>',
     JSON.stringify(history, null, 2),
     '</tool_call_history>',
+    '<tool_call_history_note>',
+    'The block above contains REAL results from tool calls you ALREADY made on previous turns of this same conversation. The user message below may be a verbatim replay of the original request (the gateway resends it each turn) — DO NOT interpret imperatives like "use a tool", "list X", or "call X" as instructions to call tools you have already called. If a `{"role":"tool"}` entry above already answers what the user is asking for, write the final natural-language answer using that result. Only emit a new tool_calls envelope if the user genuinely needs information not yet present in the history above.',
+    '</tool_call_history_note>',
   ].join('\n');
 }
 

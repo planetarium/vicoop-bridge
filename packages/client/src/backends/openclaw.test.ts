@@ -2908,7 +2908,7 @@ test('composeOpenAICompatUserMessage: history-only payload omits system_instruct
   assert.match(out, /^<tool_call_history>\n/);
   assert.match(out, /"role": "assistant"/);
   assert.match(out, /"tool_call_id": "call_abc"/);
-  assert.match(out, /\n<\/tool_call_history>\n\n<user_message>/);
+  assert.match(out, /\n<\/tool_call_history_note>\n\n<user_message>/);
   // User content follows.
   assert.match(out, /<user_message>\ncontinue, please\n<\/user_message>$/);
 });
@@ -3247,7 +3247,7 @@ test('multi-turn: tool_call_history block is prepended to chat.send.message on f
     assert.match(sentMessage!, /<\/system_instructions>\n\n<tool_call_history>\n/);
     assert.match(sentMessage!, /"role": "assistant"/);
     assert.match(sentMessage!, /"tool_call_id": "call_abc"/);
-    assert.match(sentMessage!, /\n<\/tool_call_history>\n\n<user_message>/);
+    assert.match(sentMessage!, /\n<\/tool_call_history_note>\n\n<user_message>/);
     // User content closes the message.
     assert.match(sentMessage!, /<user_message>\nnatural language please\n<\/user_message>$/);
   } finally {
