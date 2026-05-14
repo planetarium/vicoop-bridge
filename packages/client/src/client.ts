@@ -312,10 +312,23 @@ export class Client {
       // close frame; sanitize before logging so a server can't inject a
       // fake `[client] …` line via newlines.
       this.logger.info(`disconnected: ${code} ${safeToken(reason.toString())}`);
-      if (current) {
-        this.ws = null;
-        this.scheduleReconnect();
+      if (!current) return;
+      this.ws = null;
+      // 4012 is the server's "client revoked" signal (issue #166). The DB
+      // row was just soft-deleted by an owner-side `vicoop-client
+      // revoke-client`, and ws.ts will reject every future hello with the
+      // same token. Looping forever would just spam reconnects against a
+      // permanently-failing auth; stop the daemon with a non-zero exit so
+      // systemd / a parent supervisor surfaces the revocation instead of
+      // masking it as a transient network hiccup.
+      if (code === 4012) {
+        this.logger.error('client revoked by owner; exiting');
+        this.stopped = true;
+        this.clearReconnectTimer();
+        for (const controller of this.inflight.values()) controller.abort();
+        process.exit(1);
       }
+      this.scheduleReconnect();
     });
 
     ws.on('error', (err) => {

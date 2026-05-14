@@ -18,7 +18,9 @@ import {
   addCaller,
   listActiveAgents,
   listCallers,
+  listClientsForOwner,
   removeCaller,
+  revokeClientForOwner,
 } from './admin-api.js';
 import { agentAuthMiddleware, getAgentConn, getCaller } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
@@ -373,8 +375,11 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   function adminApiErrorResponse(c: Context, err: unknown): Response {
     if (err instanceof AdminApiError) {
       // Cast to a Hono-acceptable status union; AdminApiError uses standard
-      // HTTP codes (400/403/404) that Hono accepts for c.json's second arg.
-      return c.json({ error: err.message }, err.status as 400 | 401 | 403 | 404);
+      // HTTP codes (400/403/404/409) that Hono accepts for c.json's second
+      // arg. 409 is the ambiguous-client-name signal from
+      // revokeClientForOwner — the operator passed a name that matches
+      // multiple rows and needs to retry with the id.
+      return c.json({ error: err.message }, err.status as 400 | 401 | 403 | 404 | 409);
     }
     logEvent('admin_api_error', { error: String(err) });
     return c.json({ error: 'Internal error' }, 500);
@@ -418,6 +423,43 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         auth.principalId,
         c.req.param('id'),
         principal,
+      );
+      return c.json(result);
+    } catch (err) {
+      return adminApiErrorResponse(c, err);
+    }
+  });
+
+  // List the owner's `clients` rows so operators can see persisted state
+  // (including orphans from aborted setup / exited daemons) without
+  // dropping to admin GraphQL or psql. RLS filters to the principal's own
+  // rows. `connected` is the in-memory registry view so callers can spot
+  // orphans at a glance — see issue #166.
+  app.get('/admin-api/clients', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    try {
+      const clients = await listClientsForOwner(opts.db, opts.registry, auth.principalId);
+      return c.json({ clients });
+    } catch (err) {
+      return adminApiErrorResponse(c, err);
+    }
+  });
+
+  // Revoke a client by id or unique name. The target travels in the URL path
+  // and may be a UUID `client_id` or a `client_name`; the server resolves
+  // the ambiguity (404 if neither matches, 409 with the candidate ids if a
+  // name matches multiple rows). On success, sets `revoked = true` and
+  // closes every live WS bound to the client with code 4012.
+  app.delete('/admin-api/clients/:target', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    try {
+      const result = await revokeClientForOwner(
+        opts.db,
+        opts.registry,
+        auth.principalId,
+        c.req.param('target'),
       );
       return c.json(result);
     } catch (err) {

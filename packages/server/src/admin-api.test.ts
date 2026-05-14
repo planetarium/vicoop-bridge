@@ -335,3 +335,282 @@ test(
     }
   },
 );
+
+// ── /admin-api/clients (issue #166) ──────────────────────────────
+
+test(
+  'GET /admin-api/clients returns only the operator’s own clients with connected flag',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const ownerA = `eth:0x${'3'.repeat(40)}`;
+    const ownerB = `eth:0x${'4'.repeat(40)}`;
+    let setupA: SetupResult | null = null;
+    let setupB: SetupResult | null = null;
+    try {
+      setupA = await setupOwner(sql, ownerA);
+      setupB = await setupOwner(sql, ownerB);
+
+      const registry = new Registry();
+      // Only setupA is "connected" — setupB has a clients row but no live WS.
+      registry.registerAgent(fakeConnection({
+        agentId: setupA.agentId,
+        clientId: setupA.clientId,
+        ownerPrincipal: ownerA,
+      }));
+
+      const app = createHttpApp({ db: sql, registry });
+      const res = await app.request('/admin-api/clients', {
+        headers: authHeaders(setupA.ownerToken),
+      });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as {
+        clients: Array<{ client_id: string; connected: boolean; revoked: boolean }>;
+      };
+      const setupAClientId = setupA.clientId;
+      const ids = body.clients.map((c) => c.client_id);
+      assert.ok(ids.includes(setupAClientId), 'should see own client');
+      assert.ok(!ids.includes(setupB.clientId), 'should not see other owner’s client');
+      const a = body.clients.find((c) => c.client_id === setupAClientId)!;
+      assert.equal(a.connected, true);
+      assert.equal(a.revoked, false);
+    } finally {
+      if (setupA) await teardown(sql, ownerA, setupA.clientId);
+      if (setupB) await teardown(sql, ownerB, setupB.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'GET /admin-api/clients shows persisted orphans (clients with no live WS) as connected:false',
+  { skip: !hasDb },
+  async () => {
+    // Repros the issue's concrete trigger: two test clients were registered,
+    // their daemons exited, and `list-agents` showed them as gone — but the
+    // `clients` rows persisted. /admin-api/clients must surface those rows
+    // with connected=false so the operator can spot them.
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'5'.repeat(40)}`;
+    let setup: SetupResult | null = null;
+    try {
+      setup = await setupOwner(sql, owner);
+      const registry = new Registry(); // no agents registered → all clients orphaned
+      const app = createHttpApp({ db: sql, registry });
+      const res = await app.request('/admin-api/clients', {
+        headers: authHeaders(setup.ownerToken),
+      });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as { clients: Array<{ client_id: string; connected: boolean }> };
+      const row = body.clients.find((c) => c.client_id === setup!.clientId);
+      assert.ok(row, 'orphan client should be listed');
+      assert.equal(row.connected, false);
+    } finally {
+      if (setup) await teardown(sql, owner, setup.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'DELETE /admin-api/clients/:target sets revoked=true and closes the live WS with 4012',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'6'.repeat(40)}`;
+    let setup: SetupResult | null = null;
+    try {
+      setup = await setupOwner(sql, owner);
+
+      // Recording WS so we can assert the close code propagated.
+      const closeArgs: Array<{ code: number; reason: string }> = [];
+      const ws = {
+        close(code: number, reason: string) {
+          closeArgs.push({ code, reason });
+        },
+      } as unknown as WebSocket;
+
+      const registry = new Registry();
+      registry.registerAgent({
+        ...fakeConnection({
+          agentId: setup.agentId,
+          clientId: setup.clientId,
+          ownerPrincipal: owner,
+        }),
+        ws,
+      });
+
+      const app = createHttpApp({ db: sql, registry });
+      const res = await app.request(
+        `/admin-api/clients/${encodeURIComponent(setup.clientId)}`,
+        { method: 'DELETE', headers: authHeaders(setup.ownerToken) },
+      );
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as {
+        client_id: string;
+        revoked: boolean;
+        closed_connections: number;
+      };
+      assert.equal(body.client_id, setup.clientId);
+      assert.equal(body.revoked, true);
+      assert.equal(body.closed_connections, 1);
+      assert.deepEqual(closeArgs, [{ code: 4012, reason: 'client revoked' }]);
+
+      // DB row reflects the revocation.
+      const rows = await sql<{ revoked: boolean }[]>`
+        SELECT revoked FROM clients WHERE id = ${setup.clientId}
+      `;
+      assert.equal(rows[0]?.revoked, true);
+    } finally {
+      if (setup) await teardown(sql, owner, setup.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'DELETE /admin-api/clients/:name resolves a unique client_name',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'7'.repeat(40)}`;
+    const uniqueName = `revoke-test-name-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let setup: SetupResult | null = null;
+    try {
+      setup = await setupOwner(sql, owner);
+      // Rename the just-created row so we can target it by name.
+      await sql`UPDATE clients SET client_name = ${uniqueName} WHERE id = ${setup.clientId}`;
+
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+      const res = await app.request(
+        `/admin-api/clients/${encodeURIComponent(uniqueName)}`,
+        { method: 'DELETE', headers: authHeaders(setup.ownerToken) },
+      );
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as { client_id: string; client_name: string };
+      assert.equal(body.client_id, setup.clientId);
+      assert.equal(body.client_name, uniqueName);
+    } finally {
+      if (setup) await teardown(sql, owner, setup.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'DELETE /admin-api/clients/:name returns 409 when the name is ambiguous',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'8'.repeat(40)}`;
+    const dupName = `ambiguous-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    let setupA: SetupResult | null = null;
+    let setupB: SetupResult | null = null;
+    try {
+      setupA = await setupOwner(sql, owner);
+      setupB = await setupOwner(sql, owner);
+      // Both rows are owned by the same principal and share the same name.
+      await sql`UPDATE clients SET client_name = ${dupName} WHERE id IN (${setupA.clientId}, ${setupB.clientId})`;
+
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+      const res = await app.request(
+        `/admin-api/clients/${encodeURIComponent(dupName)}`,
+        { method: 'DELETE', headers: authHeaders(setupA.ownerToken) },
+      );
+      assert.equal(res.status, 409);
+      const body = (await res.json()) as { error: string };
+      assert.match(body.error, /Ambiguous client name/);
+      assert.match(body.error, /Specify client_id/);
+
+      // Neither client should be revoked — the ambiguous lookup must abort
+      // before any state change.
+      const rows = await sql<{ id: string; revoked: boolean }[]>`
+        SELECT id, revoked FROM clients WHERE id IN (${setupA.clientId}, ${setupB.clientId})
+      `;
+      for (const r of rows) assert.equal(r.revoked, false);
+    } finally {
+      if (setupA) await teardown(sql, owner, setupA.clientId);
+      if (setupB) await teardown(sql, owner, setupB.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'DELETE /admin-api/clients/:target returns 404 when nothing matches',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'9'.repeat(40)}`;
+    let setup: SetupResult | null = null;
+    try {
+      setup = await setupOwner(sql, owner);
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+      const res = await app.request(
+        '/admin-api/clients/no-such-id-or-name',
+        { method: 'DELETE', headers: authHeaders(setup.ownerToken) },
+      );
+      assert.equal(res.status, 404);
+    } finally {
+      if (setup) await teardown(sql, owner, setup.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'DELETE /admin-api/clients/:id returns 404 for another owner’s client (RLS)',
+  { skip: !hasDb },
+  async () => {
+    // RLS hides B's row from A's principal, so resolveClient yields no match
+    // and we surface 404 — same shape as "no such client" so we don't leak
+    // existence of rows owned by a different principal.
+    const sql = postgres(process.env.DATABASE_URL!);
+    const ownerA = `eth:0x${'a'.repeat(40)}`;
+    const ownerB = `eth:0x${'b'.repeat(40)}`;
+    let setupA: SetupResult | null = null;
+    let setupB: SetupResult | null = null;
+    try {
+      setupA = await setupOwner(sql, ownerA);
+      setupB = await setupOwner(sql, ownerB);
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+      const res = await app.request(
+        `/admin-api/clients/${encodeURIComponent(setupB.clientId)}`,
+        { method: 'DELETE', headers: authHeaders(setupA.ownerToken) },
+      );
+      assert.equal(res.status, 404);
+
+      // ownerB's row remains intact.
+      const rows = await sql<{ revoked: boolean }[]>`
+        SELECT revoked FROM clients WHERE id = ${setupB.clientId}
+      `;
+      assert.equal(rows[0]?.revoked, false);
+    } finally {
+      if (setupA) await teardown(sql, ownerA, setupA.clientId);
+      if (setupB) await teardown(sql, ownerB, setupB.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
+  '/admin-api/clients endpoints reject missing owner-session bearer',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    try {
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+      const list = await app.request('/admin-api/clients');
+      assert.equal(list.status, 401);
+      const revoke = await app.request('/admin-api/clients/anything', { method: 'DELETE' });
+      assert.equal(revoke.status, 401);
+    } finally {
+      await sql.end();
+    }
+  },
+);

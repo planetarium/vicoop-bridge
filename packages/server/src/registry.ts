@@ -73,6 +73,28 @@ export class Registry {
     return { ok: true };
   }
 
+  // Close every live WebSocket whose ClientConnection.clientId matches.
+  // Used by the admin-api revoke-client path so a daemon whose client row
+  // was just revoked sees a distinct close code (4012) and exits without
+  // reconnecting. Returns the number of connections closed; callers
+  // surface that to the operator as confirmation that an orphan vs a
+  // live daemon was revoked.
+  //
+  // The close itself fires this WS's own `close` handler asynchronously,
+  // which in turn calls unregisterAgent and removes the entry from the
+  // `agents` map and flushes any bound tasks via the usual disconnect
+  // path. We don't pre-delete from `agents` here — letting the close
+  // handler do it keeps the in-memory state machine single-sourced.
+  disconnectClient(clientId: string): number {
+    let closed = 0;
+    for (const conn of this.agents.values()) {
+      if (conn.clientId !== clientId) continue;
+      conn.ws.close(4012, 'client revoked');
+      closed++;
+    }
+    return closed;
+  }
+
   unregisterAgent(agentId: string, ws: WebSocket): void {
     const existing = this.agents.get(agentId);
     if (!existing || existing.ws !== ws) return;

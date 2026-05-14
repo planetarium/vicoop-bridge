@@ -11,6 +11,21 @@ function makeWs(): WebSocket {
   return { close: () => undefined } as unknown as WebSocket;
 }
 
+interface RecordingWs extends WebSocket {
+  closeArgs: Array<{ code: number; reason: string }>;
+}
+
+function makeRecordingWs(): RecordingWs {
+  const closeArgs: Array<{ code: number; reason: string }> = [];
+  const ws = {
+    closeArgs,
+    close(code: number, reason: string) {
+      closeArgs.push({ code, reason });
+    },
+  } as unknown as RecordingWs;
+  return ws;
+}
+
 function makeCard(streaming: boolean): AgentCard {
   return {
     name: 'test',
@@ -234,4 +249,44 @@ test('notifyAgentChange log cannot be hijacked by newline injection via agentId'
     undefined,
     'attacker payload must not surface as a top-level JSON field',
   );
+});
+
+test('disconnectClient closes every ws bound to the client_id with code 4012', () => {
+  // Two agents owned by the revoked client + one agent owned by an unrelated
+  // client. After disconnectClient('c1'), only the first two sockets see a
+  // close, and they see code 4012 with the "client revoked" reason. The
+  // unrelated socket is untouched.
+  const registry = new Registry();
+  const ws1 = makeRecordingWs();
+  const ws2 = makeRecordingWs();
+  const ws3 = makeRecordingWs();
+  const base = {
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    connectedAt: 0,
+  };
+  registry.registerAgent({ ...base, agentId: 'a1', clientId: 'c1', ws: ws1 });
+  registry.registerAgent({ ...base, agentId: 'a2', clientId: 'c1', ws: ws2 });
+  registry.registerAgent({ ...base, agentId: 'a3', clientId: 'c2', ws: ws3 });
+
+  const closed = registry.disconnectClient('c1');
+  assert.equal(closed, 2);
+  assert.deepEqual(ws1.closeArgs, [{ code: 4012, reason: 'client revoked' }]);
+  assert.deepEqual(ws2.closeArgs, [{ code: 4012, reason: 'client revoked' }]);
+  assert.deepEqual(ws3.closeArgs, []);
+});
+
+test('disconnectClient returns 0 when no agents are bound to the client', () => {
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws: makeWs(),
+    connectedAt: 0,
+  });
+  assert.equal(registry.disconnectClient('orphan-client'), 0);
 });

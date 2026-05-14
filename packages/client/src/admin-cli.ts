@@ -10,7 +10,13 @@
 
 import { resolveOwnerSession } from './owner-session.js';
 
-type Subcommand = 'add-caller' | 'remove-caller' | 'list-callers' | 'list-agents';
+type Subcommand =
+  | 'add-caller'
+  | 'remove-caller'
+  | 'list-callers'
+  | 'list-agents'
+  | 'list-clients'
+  | 'revoke-client';
 
 interface ParsedArgs {
   positional: string[];
@@ -58,6 +64,10 @@ function usage(sub: Subcommand): string {
       return 'usage: vicoop-client list-callers <agent_id> [--bridge URL] [--token TOKEN] [--json]';
     case 'list-agents':
       return 'usage: vicoop-client list-agents [--bridge URL] [--token TOKEN] [--json]';
+    case 'list-clients':
+      return 'usage: vicoop-client list-clients [--bridge URL] [--token TOKEN] [--json]';
+    case 'revoke-client':
+      return 'usage: vicoop-client revoke-client <client-id-or-name> [--bridge URL] [--token TOKEN] [--json]';
   }
 }
 
@@ -180,6 +190,41 @@ function renderCallerList(body: unknown): string {
   ].join('\n');
 }
 
+function renderClientList(body: unknown): string {
+  if (!body || typeof body !== 'object' || !('clients' in body)) return String(body);
+  const clients = (body as { clients: Array<Record<string, unknown>> }).clients;
+  if (clients.length === 0) return '(no clients registered)';
+  return clients
+    .map((c) => {
+      const agents = (c.allowed_agent_ids as string[] | undefined)?.join(', ') ?? '';
+      return [
+        `client_id:         ${c.client_id}`,
+        `client_name:       ${c.client_name}`,
+        `allowed_agent_ids: ${agents}`,
+        `revoked:           ${c.revoked}`,
+        `connected:         ${c.connected}`,
+        `created_at:        ${c.created_at}`,
+      ].join('\n');
+    })
+    .join('\n---\n');
+}
+
+function renderRevokeResult(body: unknown): string {
+  if (!body || typeof body !== 'object') return String(body);
+  const b = body as {
+    client_id?: string;
+    client_name?: string;
+    revoked?: boolean;
+    closed_connections?: number;
+  };
+  return [
+    `client_id:          ${b.client_id}`,
+    `client_name:        ${b.client_name}`,
+    `revoked:            ${b.revoked}`,
+    `closed_connections: ${b.closed_connections}`,
+  ].join('\n');
+}
+
 function renderAgentList(body: unknown): string {
   if (!body || typeof body !== 'object' || !('agents' in body)) return String(body);
   const agents = (body as { agents: Array<Record<string, unknown>> }).agents;
@@ -282,6 +327,61 @@ export async function runListCallers(args: string[]): Promise<number> {
     path: `/admin-api/agents/${encodeURIComponent(agentId)}/callers`,
   });
   return emit(result, parsed.json, renderCallerList);
+}
+
+export async function runListClients(args: string[]): Promise<number> {
+  const parsed = parseArgs(args);
+  if ('error' in parsed) {
+    process.stderr.write(`${parsed.error}\n${usage('list-clients')}\n`);
+    return 1;
+  }
+  if (parsed.help) {
+    process.stdout.write(`${usage('list-clients')}\n`);
+    return 0;
+  }
+  if (parsed.positional.length !== 0) {
+    process.stderr.write(`${usage('list-clients')}\n`);
+    return 1;
+  }
+  const session = resolveSession(parsed);
+  if ('error' in session) {
+    process.stderr.write(`${session.error}\n`);
+    return 1;
+  }
+  const result = await callApi({
+    session,
+    method: 'GET',
+    path: '/admin-api/clients',
+  });
+  return emit(result, parsed.json, renderClientList);
+}
+
+export async function runRevokeClient(args: string[]): Promise<number> {
+  const parsed = parseArgs(args);
+  if ('error' in parsed) {
+    process.stderr.write(`${parsed.error}\n${usage('revoke-client')}\n`);
+    return 1;
+  }
+  if (parsed.help) {
+    process.stdout.write(`${usage('revoke-client')}\n`);
+    return 0;
+  }
+  if (parsed.positional.length !== 1) {
+    process.stderr.write(`${usage('revoke-client')}\n`);
+    return 1;
+  }
+  const [target] = parsed.positional;
+  const session = resolveSession(parsed);
+  if ('error' in session) {
+    process.stderr.write(`${session.error}\n`);
+    return 1;
+  }
+  const result = await callApi({
+    session,
+    method: 'DELETE',
+    path: `/admin-api/clients/${encodeURIComponent(target)}`,
+  });
+  return emit(result, parsed.json, renderRevokeResult);
 }
 
 export async function runListAgents(args: string[]): Promise<number> {
