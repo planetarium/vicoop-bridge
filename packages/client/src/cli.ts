@@ -15,7 +15,9 @@ import {
   runAddCaller,
   runListAgents,
   runListCallers,
+  runListClients,
   runRemoveCaller,
+  runRevokeClient,
 } from './admin-cli.js';
 import { runWhoami } from './whoami.js';
 import { deriveIdentity } from './identity.js';
@@ -30,7 +32,7 @@ import { mergeClientArgs, parseFlags, type DaemonArgs as Args } from './cli-args
 const DAEMON_USAGE =
   'vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude|codex> [--card <path>] [--config <path>]';
 const SUBCOMMAND_LIST =
-  'subcommands: login, setup, upgrade, list-agents, list-callers, add-caller, remove-caller, whoami (run any with --help)';
+  'subcommands: login, setup, upgrade, list-agents, list-callers, add-caller, remove-caller, list-clients, revoke-client, whoami (run any with --help)';
 const CODEX_SANDBOX_MODES = new Set<CodexSandboxMode>([
   'read-only',
   'workspace-write',
@@ -249,6 +251,13 @@ function runClient(argv: string[]): void {
     agentCard,
     backendKind: args.backend,
     backend: pickBackend(args.backend, args),
+    // Daemon entrypoint: a fatal terminal close (currently 4014 "client
+    // revoked") should drop the process with a non-zero exit so
+    // systemd / a parent supervisor sees the revocation as a hard
+    // failure instead of masking it as a transient disconnect. The
+    // Client class deliberately does not call process.exit itself —
+    // tests and future in-process embedders pass a non-exiting callback.
+    onFatal: () => process.exit(1),
   });
 
   client.start();
@@ -340,6 +349,14 @@ async function main(): Promise<void> {
 
   if (argv[0] === 'list-agents') {
     process.exit(await runListAgents(argv.slice(1)));
+  }
+
+  if (argv[0] === 'list-clients') {
+    process.exit(await runListClients(argv.slice(1)));
+  }
+
+  if (argv[0] === 'revoke-client') {
+    process.exit(await runRevokeClient(argv.slice(1)));
   }
 
   if (argv[0] === 'whoami') {

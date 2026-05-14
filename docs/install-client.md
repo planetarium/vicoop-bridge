@@ -753,8 +753,53 @@ section of `docs/local-testing.md` for the same note.
   the existing `clients` row and invalidates the old hash, so your
   `allowedAgentIds` and `agent_policies` carry over. Re-run Step 4 only if
   you intentionally want a new client identity; in that case the old
-  `clients` row (and cascading `agent_policies`) can be cleaned up via
-  the admin agent's CRUD mutations (#29).
+  `clients` row can be revoked from the CLI — see
+  [Inspecting and revoking your clients](#inspecting-and-revoking-your-clients).
+
+## Inspecting and revoking your clients
+
+`vicoop-client list-agents` only shows *currently connected* agents. To see
+every `clients` row registered under your owner principal — including
+orphans left behind by an aborted `setup`, an exited daemon, or a leaked
+`CLIENT_TOKEN` — use:
+
+```bash
+vicoop-client list-clients
+```
+
+Columns are `client_id`, `client_name`, `allowed_agent_ids`, `revoked`,
+`connected`, `created_at`. The `connected` flag reflects in-memory
+registry state, so a row with `connected: false` is exactly the kind of
+orphan you want to clean up.
+
+To revoke a client — and disconnect its live WebSocket if one is bound —
+use either the UUID `client_id` or a unique `client_name`:
+
+```bash
+vicoop-client revoke-client <client-id-or-name>
+```
+
+- A revoked client's row is kept (`revoked = true`) so audit history
+  survives; existing `agent_policies` cascade-deleted only when the
+  underlying row is later hard-deleted.
+- A unique name resolves automatically; an ambiguous name exits non-zero
+  with a list of matching `client_id`s so you can retry with the id.
+- If the daemon is alive at the moment of revocation, its WebSocket is
+  closed with code **4014 "client revoked"** and the daemon exits
+  non-zero without reconnecting.
+- If the daemon is **relaunched** with the same token after revocation
+  (rather than already being live), the bridge's WS auth path rejects
+  the hello with **close code 4005 "bad token"** — the daemon treats
+  4005 as terminal too (same `onFatal` path as 4014), so it exits
+  non-zero on the first reconnect attempt rather than reconnect-loop
+  indefinitely against a permanently-rejected token. The same 4005
+  branch catches plain mis-typed / wrong tokens at first launch.
+- Propagation is **synchronous from the next auth attempt**: client-token
+  verification queries `clients` directly on every WS register with no
+  cache, so there is no equivalent of the 60s `callers` LRU window.
+
+Both subcommands use the same owner-session bearer as `add-caller` /
+`remove-caller`; no SIWE re-sign required.
 
 ## What's next
 

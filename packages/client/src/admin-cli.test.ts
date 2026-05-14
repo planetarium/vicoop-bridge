@@ -7,7 +7,9 @@ import {
   runAddCaller,
   runListAgents,
   runListCallers,
+  runListClients,
   runRemoveCaller,
+  runRevokeClient,
 } from './admin-cli.js';
 
 interface Captured {
@@ -246,6 +248,105 @@ test('subcommand surfaces network errors as a clean exit-1 instead of crashing',
   const code = await runListAgents([]);
   assert.equal(code, 1);
   assert.match(stderr.read(), /network error.*fetch failed/);
+});
+
+test('list-clients calls GET /admin-api/clients and renders rows with connected flag', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  const { calls } = installFetch(t, {
+    body: {
+      clients: [
+        {
+          client_id: 'cid-1',
+          client_name: 'usage-test-1',
+          owner_principal: 'eth:0xabc',
+          allowed_agent_ids: ['agent-a'],
+          revoked: false,
+          connected: false,
+          created_at: '2026-05-07T00:00:00.000Z',
+        },
+      ],
+    },
+  });
+
+  const code = await runListClients([]);
+  assert.equal(code, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, 'GET');
+  assert.equal(calls[0].url, `${BRIDGE}/admin-api/clients`);
+  assert.equal(calls[0].headers.authorization, `Bearer ${TOKEN}`);
+  const out = stdout.read();
+  assert.match(out, /client_id:\s+cid-1/);
+  assert.match(out, /connected:\s+false/);
+});
+
+test('list-clients --json prints raw JSON', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  installFetch(t, { body: { clients: [] } });
+
+  const code = await runListClients(['--json']);
+  assert.equal(code, 0);
+  const parsed = JSON.parse(stdout.read()) as { clients: unknown[] };
+  assert.deepEqual(parsed, { clients: [] });
+});
+
+test('revoke-client DELETEs /admin-api/clients/<target>', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, {
+    body: {
+      client_id: 'cid-1',
+      client_name: 'usage-test-1',
+      revoked: true,
+      closed_connections: 0,
+    },
+  });
+
+  const code = await runRevokeClient(['usage-test-1']);
+  assert.equal(code, 0);
+  assert.equal(calls[0].method, 'DELETE');
+  assert.equal(calls[0].url, `${BRIDGE}/admin-api/clients/usage-test-1`);
+});
+
+test('revoke-client URL-encodes the target (so names with /, : survive)', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const target = 'weird/name:with-colon';
+  const { calls } = installFetch(t, {
+    body: { client_id: 'cid', client_name: target, revoked: true, closed_connections: 0 },
+  });
+  const code = await runRevokeClient([target]);
+  assert.equal(code, 0);
+  assert.equal(calls[0].url, `${BRIDGE}/admin-api/clients/${encodeURIComponent(target)}`);
+});
+
+test('revoke-client surfaces 409 ambiguous-name error as exit 1', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stderr = captureStderr(t);
+  installFetch(t, {
+    status: 409,
+    body: { error: 'Ambiguous client name "dup" matches multiple clients (a, b). Specify client_id instead.' },
+  });
+
+  const code = await runRevokeClient(['dup']);
+  assert.equal(code, 1);
+  assert.match(stderr.read(), /409.*Ambiguous client name/);
+});
+
+test('revoke-client requires exactly one positional', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stderr = captureStderr(t);
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new Error('fetch should not be called when args are invalid');
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  const code = await runRevokeClient([]);
+  assert.equal(code, 1);
+  assert.match(stderr.read(), /usage: vicoop-client revoke-client/);
 });
 
 test('subcommand surfaces server error on non-2xx response', async (t) => {
