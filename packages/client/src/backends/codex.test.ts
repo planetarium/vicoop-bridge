@@ -841,6 +841,21 @@ const SAMPLE_TOOLS = [
   },
 ];
 
+const SAMPLE_HISTORY: ReadonlyArray<Record<string, unknown>> = [
+  {
+    role: 'assistant',
+    tool_calls: [
+      { id: 'call_abc', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
+    ],
+  },
+  {
+    role: 'tool',
+    tool_call_id: 'call_abc',
+    name: 'get_weather',
+    content: '{"temp":15,"cond":"sunny"}',
+  },
+];
+
 function assignWithOpenAICompat(
   text: string,
   payload: Record<string, unknown>,
@@ -942,6 +957,48 @@ test('absent metadata → no instructions file is written and no `model_instruct
   );
 });
 
+test('history-only payload writes no instructions file (build prompt is empty) but still prepends the history block', async () => {
+  // Cooperating gateway sent only the multi-turn history — no tools, no
+  // system, no tool_choice. `buildOpenAICompatSystemPrompt` returns "" in
+  // that case, so we MUST NOT mkdtemp / write an empty instructions file.
+  // The history is still required by spec to be replayed in user content.
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  let mkdtempCalls = 0;
+  const written: string[] = [];
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    mkdtemp: async () => {
+      mkdtempCalls++;
+      return '/tmp/vicoop-codex-instr';
+    },
+    writeFile: async (filePath) => {
+      written.push(String(filePath));
+    },
+    rm: async () => {},
+  });
+
+  await backend.handle(
+    assignWithOpenAICompat('continue', { tool_call_history: SAMPLE_HISTORY }),
+    collect().emit,
+    NEVER,
+  );
+
+  assert.equal(mkdtempCalls, 0);
+  assert.deepEqual(written, []);
+  const args = fake.lastChild()!.args;
+  assert.equal(
+    args.some((a) => typeof a === 'string' && a.startsWith('model_instructions_file=')),
+    false,
+  );
+
+  // History still prepended to user content.
+  const stdin = fake.lastChild()!.stdinPayload;
+  assert.match(stdin, /^<tool_call_history>\n/);
+  assert.match(stdin, /\n<\/tool_call_history>\n\ncontinue$/);
+});
+
 test('instructions file is co-located with the image temp dir when both are present (single cleanup)', async () => {
   // When the task also carries images, mapPartsToCodexInput already minted
   // a temp dir for them. The instructions file MUST land in that same dir
@@ -1034,6 +1091,57 @@ test('instructions write failure emits task.fail and cleans the freshly-minted t
   assert.equal(fail.error.code, 'input_file_write_failed');
   assert.match(fail.error.message, /failed to materialize codex instructions/);
   assert.match(fail.error.message, /disk full/);
+});
+
+test('multi-turn: history block is prepended to the user prompt on stdin', async () => {
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    mkdtemp: async () => '/tmp/vicoop-codex-mt',
+    writeFile: async () => {},
+    rm: async () => {},
+  });
+
+  await backend.handle(
+    assignWithOpenAICompat('continue, please', {
+      tools: SAMPLE_TOOLS,
+      tool_call_history: SAMPLE_HISTORY,
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const stdin = fake.lastChild()!.stdinPayload;
+  // History block precedes the user prompt, separated by a blank line so
+  // the model sees the boundary clearly.
+  assert.match(stdin, /^<tool_call_history>\n/);
+  assert.match(stdin, /"role": "assistant"/);
+  assert.match(stdin, /"tool_call_id": "call_abc"/);
+  assert.match(stdin, /\n<\/tool_call_history>\n\ncontinue, please$/);
+});
+
+test('multi-turn: absent tool_call_history leaves the stdin prompt untouched', async () => {
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    mkdtemp: async () => '/tmp/vicoop-codex-mt-none',
+    writeFile: async () => {},
+    rm: async () => {},
+  });
+
+  await backend.handle(
+    assignWithOpenAICompat('hi', { tools: SAMPLE_TOOLS }),
+    collect().emit,
+    NEVER,
+  );
+
+  // No <tool_call_history> wrapper leaks onto a first-turn task.
+  const stdin = fake.lastChild()!.stdinPayload;
+  assert.equal(stdin, 'hi');
 });
 
 test('agent_message envelope JSON becomes a data-part artifact tagged with the extension URI', async () => {

@@ -11,6 +11,7 @@ import {
 import type { Backend } from '../backend.js';
 import {
   buildOpenAICompatSystemPrompt,
+  formatToolCallHistory,
   parseOpenAICompatMetadata,
   tryParseToolCallsEnvelope,
 } from './claude.js';
@@ -497,8 +498,20 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
         child.stdin.on('error', (err: unknown) => {
           if (!stdinError) stdinError = err;
         });
+        // Spec contract: bridges MUST replay the entire `tool_call_history`
+        // in order on every follow-up turn. Render it as a `<tool_call_history>`
+        // JSON block and prepend it to the user prompt so the model reads
+        // the prior round BEFORE the current user turn. Any internal session
+        // reuse (codex `exec resume`) is invisible to the wire and does not
+        // change replay semantics — the redundancy is the price of
+        // cross-bridge interop.
+        const promptToWrite = openaiCompat?.tool_call_history
+          ? (mapped.prompt
+              ? `${formatToolCallHistory(openaiCompat.tool_call_history)}\n\n${mapped.prompt}`
+              : formatToolCallHistory(openaiCompat.tool_call_history))
+          : mapped.prompt;
         try {
-          child.stdin.end(mapped.prompt);
+          child.stdin.end(promptToWrite);
         } catch (err) {
           stdinError = err;
         }
