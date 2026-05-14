@@ -117,6 +117,18 @@ export interface CodexBackendConfig {
   extra_args?: string[];
 }
 
+// Operator-side defaults for the `codex-app-server` backend. The wire
+// surface intentionally avoids `extra_args` — the JSON-RPC client does not
+// take CLI flags the way `codex exec` does, and any future override goes
+// through the protocol's `developerInstructions` / per-turn config knobs
+// instead.
+export interface CodexAppServerBackendConfig {
+  cwd?: string;
+  sandbox_mode?: string;
+  /** What to answer when codex requests user approval. Default `decline`. */
+  approval_decision?: 'accept' | 'acceptForSession' | 'decline';
+}
+
 export interface OpenclawBackendConfig {
   gateway_url?: string;
   gateway_token?: string;
@@ -135,6 +147,7 @@ export interface OpenclawBackendConfig {
 export interface BackendConfigs {
   claude?: ClaudeBackendConfig;
   codex?: CodexBackendConfig;
+  'codex-app-server'?: CodexAppServerBackendConfig;
   openclaw?: OpenclawBackendConfig;
 }
 
@@ -175,7 +188,18 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
 // reach a downstream parser that does `process.exit(1)`. Anything outside
 // these sets is treated like any other malformed field — dropped, the rest
 // of the file kept usable.
-const KNOWN_BACKENDS = new Set(['echo', 'openclaw', 'claude', 'codex']);
+const KNOWN_BACKENDS = new Set([
+  'echo',
+  'openclaw',
+  'claude',
+  'codex',
+  'codex-app-server',
+]);
+const KNOWN_APPROVAL_DECISIONS = new Set([
+  'accept',
+  'acceptForSession',
+  'decline',
+]);
 const KNOWN_CODEX_SANDBOX_MODES = new Set([
   'read-only',
   'workspace-write',
@@ -236,6 +260,24 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
         if (cwd) out.codex.cwd = cwd;
         if (validSandbox) out.codex.sandbox_mode = validSandbox;
         if (extraArgs && extraArgs.length > 0) out.codex.extra_args = extraArgs;
+      }
+    }
+    const casRaw = asRecord(backends['codex-app-server']);
+    if (casRaw) {
+      const cwd = asString(casRaw.cwd);
+      const sandbox = asString(casRaw.sandbox_mode);
+      const validSandbox =
+        sandbox && KNOWN_CODEX_SANDBOX_MODES.has(sandbox) ? sandbox : undefined;
+      const approvalRaw = asString(casRaw.approval_decision);
+      const validApproval =
+        approvalRaw && KNOWN_APPROVAL_DECISIONS.has(approvalRaw)
+          ? (approvalRaw as 'accept' | 'acceptForSession' | 'decline')
+          : undefined;
+      if (cwd || validSandbox || validApproval) {
+        out['codex-app-server'] = {};
+        if (cwd) out['codex-app-server']!.cwd = cwd;
+        if (validSandbox) out['codex-app-server']!.sandbox_mode = validSandbox;
+        if (validApproval) out['codex-app-server']!.approval_decision = validApproval;
       }
     }
     const ocRaw = asRecord(backends.openclaw);

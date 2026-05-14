@@ -1,0 +1,816 @@
+import { randomUUID } from 'node:crypto';
+import fs from 'node:fs/promises';
+import {
+  OPENAI_COMPAT_EXTENSION_URI,
+  TRACEABILITY_EXTENSION_URI,
+  type Part,
+} from '@vicoop-bridge/protocol';
+import type { Backend, Emit, TaskAssign } from '../backend.js';
+import { createLogger, type Logger } from '../logger.js';
+import { mapPartsToCodexInput } from './codex.js';
+import {
+  buildOpenAICompatSystemPrompt,
+  formatToolCallHistory,
+  parseOpenAICompatMetadata,
+  tryParseToolCallsEnvelope,
+} from './claude.js';
+import { createTimingRecorder } from './timing.js';
+import {
+  AppServerRpcClient,
+  defaultAppServerSpawn,
+  TRANSPORT_CLOSED,
+  type AppServerSpawnFn,
+  type InitializeResult,
+  type SandboxMode,
+  type ThreadItem,
+  type UserInputItem,
+} from './codex-app-server-rpc.js';
+
+// Public re-export so operators can refer to the same sandbox-mode type
+// surface as the existing `codex` backend without crossing files.
+export type CodexAppServerSandboxMode = SandboxMode;
+export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline';
+
+export interface CodexAppServerBackendOptions {
+  command?: string;
+  appServerArgs?: readonly string[];
+  cwd?: string;
+  sandboxMode?: SandboxMode;
+  // What to answer when codex sends a server-initiated approval request
+  // (execCommandApproval / applyPatchApproval). Default `decline` — safe
+  // even under workspace-write; operators that explicitly want auto-accept
+  // opt in via config.
+  approvalDecision?: ApprovalDecision;
+  spawn?: AppServerSpawnFn;
+  stderrCaptureBytes?: number;
+  // How long an idle `(contextId → threadId)` mapping survives without use.
+  // Default 1 hour. `0` disables session reuse — every task does
+  // `thread/start` from scratch.
+  sessionTtlMs?: number;
+  // Test seam: deterministic clock for TTL eviction and timing.
+  now?: () => number;
+  // Idle-silence heartbeat — same semantics as `codex` / `claude`.
+  heartbeatMs?: number;
+  setIntervalFn?: (fn: () => void, ms: number) => unknown;
+  clearIntervalFn?: (handle: unknown) => void;
+  mkdtemp?: (prefix: string) => Promise<string>;
+  writeFile?: (file: string, data: Buffer) => Promise<void>;
+  rm?: (file: string, options: { recursive: boolean; force: boolean }) => Promise<void>;
+  logger?: Logger;
+  // Wait this long for `initialize` to complete on the first task before
+  // surfacing `app_server_unavailable`. Subsequent tasks reuse the client
+  // and skip this wait. Default 10s.
+  initializeTimeoutMs?: number;
+  // Wait this long for `turn/completed` after `turn/start`. Default 0
+  // (no client-side timeout — the server is authoritative). Set to a
+  // positive value to fail-fast against a hung agent.
+  turnTimeoutMs?: number;
+}
+
+interface SessionEntry {
+  threadId: string;
+  lastUsedAt: number;
+  writeId: number;
+}
+
+const DEFAULT_HEARTBEAT_MS = 30_000;
+const COMMAND_TRACE_MAX_CHARS = 2_000;
+
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  return String(e);
+}
+
+function traceabilityRequested(task: {
+  message?: { extensions?: readonly string[] };
+  requestedExtensions?: readonly string[];
+}): boolean {
+  return (
+    task.requestedExtensions?.includes(TRACEABILITY_EXTENSION_URI) === true ||
+    task.message?.extensions?.includes(TRACEABILITY_EXTENSION_URI) === true
+  );
+}
+
+function clipTo(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
+// app-server `commandExecution` item summary — same shape as the codex.ts
+// helper but reading camelCase fields from the new schema rather than
+// the snake_case JSON-event shape.
+function commandExecutionSummary(item: Extract<ThreadItem, { type: 'commandExecution' }>): string {
+  const command = typeof item.command === 'string' ? item.command : '<unknown command>';
+  const status = typeof item.status === 'string' ? item.status : 'unknown';
+  const exit = typeof item.exitCode === 'number' ? item.exitCode : null;
+  const rawOutput = (item as { aggregatedOutput?: unknown }).aggregatedOutput;
+  const output = typeof rawOutput === 'string' ? rawOutput.trim() : '';
+  const head = exit === null ? `${command} (${status})` : `${command} (${status}, exit ${exit})`;
+  return clipTo(output ? `${head}\n${output}` : head, COMMAND_TRACE_MAX_CHARS);
+}
+
+interface PreparedInput {
+  input: UserInputItem[];
+  tempDir: string | null;
+  instructions: string | null;
+}
+
+// Convert mapped prompt + image files to the app-server `UserInput[]` shape.
+// Order: any tool_call_history prefix → user text → images appended.
+function buildUserInput(
+  prompt: string,
+  imageFiles: string[],
+  toolCallHistoryPrefix: string | null,
+): UserInputItem[] {
+  const items: UserInputItem[] = [];
+  const textBody = toolCallHistoryPrefix
+    ? prompt
+      ? `${toolCallHistoryPrefix}\n\n${prompt}`
+      : toolCallHistoryPrefix
+    : prompt;
+  if (textBody) {
+    items.push({ type: 'text', text: textBody, text_elements: [] });
+  }
+  for (const p of imageFiles) {
+    items.push({ type: 'localImage', path: p });
+  }
+  return items;
+}
+
+// Per-task in-progress notification subscription — listens for
+// `item/agentMessage/delta`, `item/completed`, and `turn/completed`
+// scoped to the active turn, then resolves with the final state.
+interface TurnRunOutcome {
+  status: 'completed' | 'failed' | 'interrupted' | 'aborted';
+  error?: { message: string };
+  finalText: string | null;
+}
+
+export function createCodexAppServerBackend(
+  opts: CodexAppServerBackendOptions = {},
+): Backend {
+  const command = opts.command ?? 'codex';
+  const appServerArgs = opts.appServerArgs ?? ['app-server'];
+  const cwd = opts.cwd;
+  const sandboxMode: SandboxMode = opts.sandboxMode ?? 'read-only';
+  const approvalDecision: ApprovalDecision = opts.approvalDecision ?? 'decline';
+  const spawnFn = opts.spawn ?? defaultAppServerSpawn;
+  const stderrCap = opts.stderrCaptureBytes ?? 8192;
+  const sessionTtlMs = opts.sessionTtlMs ?? 60 * 60 * 1000;
+  const now = opts.now ?? Date.now;
+  const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const setIntervalImpl =
+    opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
+  const clearIntervalImpl =
+    opts.clearIntervalFn ??
+    ((h) => clearInterval(h as ReturnType<typeof setInterval>));
+  const mkdtemp = opts.mkdtemp ?? fs.mkdtemp;
+  const writeFile = opts.writeFile ?? fs.writeFile;
+  const rm = opts.rm ?? fs.rm;
+  const logger = opts.logger ?? createLogger();
+  const initializeTimeoutMs = opts.initializeTimeoutMs ?? 10_000;
+  const turnTimeoutMs = opts.turnTimeoutMs ?? 0;
+
+  // contextId → (threadId, lastUsedAt) — same shape as codex.ts so the
+  // resume / TTL / writeId-protected rollback logic carries straight
+  // across. The only difference is the "session" identifier (threadId
+  // here vs codex CLI thread_id) and the absence of a per-task subprocess
+  // (one app-server serves all threads).
+  const sessions = new Map<string, SessionEntry>();
+  let writeCounter = 0;
+
+  function evictExpired(cutoff: number): void {
+    for (const [key, entry] of sessions) {
+      if (entry.lastUsedAt < cutoff) sessions.delete(key);
+    }
+  }
+
+  // contextId mutex — codex app-server requires turns within a thread to
+  // be serialised (a second `turn/start` while another is active is
+  // rejected). The old `codex` backend never hit this race because each
+  // task spawned a new process. We funnel concurrent same-contextId
+  // tasks through a per-context chain.
+  const contextLocks = new Map<string, Promise<void>>();
+
+  async function acquireContextLock(contextId: string): Promise<() => void> {
+    const prev = contextLocks.get(contextId) ?? Promise.resolve();
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // Chain off the prior holder; the next holder waits on `prev` and
+    // installs `next` as the new tail. When `release()` fires the chain
+    // moves forward. The tail is only cleared if no one else queued behind
+    // us, to keep the map free of stale entries on idle contexts.
+    contextLocks.set(
+      contextId,
+      prev.then(() => next),
+    );
+    await prev;
+    return () => {
+      release();
+      // If we are still the tail, drop the entry so the map doesn't grow
+      // unbounded with idle contexts.
+      if (contextLocks.get(contextId) === next) {
+        contextLocks.delete(contextId);
+      }
+    };
+  }
+
+  let rpcClient: AppServerRpcClient | null = null;
+  let initInFlight: Promise<AppServerRpcClient> | null = null;
+  let serverInfo: InitializeResult | null = null;
+
+  // Spawn the app-server, do the handshake, register handlers. Subsequent
+  // tasks reuse the same client until it dies; a dead client is replaced
+  // on the next `ensureClient()` call.
+  async function ensureClient(): Promise<AppServerRpcClient> {
+    if (rpcClient && !rpcClient.isClosed()) return rpcClient;
+    if (initInFlight) return initInFlight;
+    initInFlight = (async () => {
+      const c = new AppServerRpcClient({
+        command,
+        args: appServerArgs,
+        cwd,
+        spawn: spawnFn,
+        logger,
+        stderrCaptureBytes: stderrCap,
+      });
+      c.setServerRequestHandler((_id, _method) => ({ decision: approvalDecision }));
+      try {
+        c.start();
+      } catch (err) {
+        initInFlight = null;
+        throw err;
+      }
+      // Clear singleton on crash so the next task respawns.
+      void c.waitForClose().then(() => {
+        if (rpcClient === c) {
+          rpcClient = null;
+          serverInfo = null;
+        }
+      });
+      try {
+        const initParams = {
+          clientInfo: {
+            name: 'vicoop-bridge',
+            title: 'vicoop-bridge client',
+            version: '1',
+          },
+        };
+        const result = await withTimeout(
+          c.request<InitializeResult>('initialize', initParams),
+          initializeTimeoutMs,
+          'initialize timed out',
+        );
+        c.notify('initialized');
+        serverInfo = result;
+        rpcClient = c;
+        return c;
+      } catch (err) {
+        try {
+          c.kill();
+        } catch {
+          // best effort
+        }
+        throw err;
+      } finally {
+        initInFlight = null;
+      }
+    })();
+    return initInFlight;
+  }
+
+  return {
+    name: 'codex-app-server',
+
+    async handle(task, rawEmit, signal) {
+      let lastEmitAt = now();
+      const recorder = createTimingRecorder({
+        logger,
+        backend: 'codex-app-server',
+        taskId: task.taskId,
+        contextId: task.contextId,
+        now,
+      });
+      const emit: typeof rawEmit = (frame) => {
+        lastEmitAt = now();
+        const terminal = frame.type === 'task.complete' || frame.type === 'task.fail';
+        if (terminal) recorder.mark('emit');
+        rawEmit(frame);
+        if (terminal) {
+          const state =
+            frame.type === 'task.fail'
+              ? 'failed'
+              : frame.status?.state ?? 'completed';
+          const code = frame.type === 'task.fail' ? frame.error?.code : undefined;
+          recorder.finish({ state, code });
+        }
+      };
+
+      if (signal.aborted) {
+        emit({
+          type: 'task.complete',
+          taskId: task.taskId,
+          status: { state: 'canceled', timestamp: new Date().toISOString() },
+        });
+        return;
+      }
+
+      // Funnel concurrent same-contextId tasks. The existing `codex`
+      // backend dodged this race by spawning per-task; app-server serialises
+      // turns per thread, so we enforce that here rather than letting the
+      // server reject the second `turn/start`.
+      const releaseLock = await acquireContextLock(task.contextId);
+      try {
+        if (signal.aborted) {
+          emit({
+            type: 'task.complete',
+            taskId: task.taskId,
+            status: { state: 'canceled', timestamp: new Date().toISOString() },
+          });
+          return;
+        }
+
+        // Detect the openai-compat extension once. The system-prompt text
+        // feeds `developerInstructions` on the next thread/start; the
+        // tool_call_history is replayed as a user-prompt prefix (same
+        // contract the `codex` backend enforces).
+        const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+        const systemPrompt =
+          openaiCompat ? buildOpenAICompatSystemPrompt(openaiCompat) : '';
+        const toolCallHistoryPrefix = openaiCompat?.tool_call_history
+          ? formatToolCallHistory(openaiCompat.tool_call_history)
+          : null;
+
+        const mapped = await mapPartsToCodexInput(task.message.parts, {
+          mkdtemp,
+          writeFile,
+          rm,
+        });
+        recorder.mark('map');
+        if (!mapped.ok) {
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: { code: mapped.code, message: mapped.message },
+          });
+          return;
+        }
+
+        try {
+          const userInput = buildUserInput(
+            mapped.prompt,
+            mapped.imageFiles,
+            toolCallHistoryPrefix,
+          );
+
+          let client: AppServerRpcClient;
+          try {
+            client = await ensureClient();
+            recorder.mark('initialized');
+          } catch (err) {
+            emit({
+              type: 'task.fail',
+              taskId: task.taskId,
+              error: {
+                code: 'app_server_unavailable',
+                message: `codex app-server failed to start: ${errorMessage(err)}`,
+              },
+            });
+            return;
+          }
+
+          // Session-reuse map: same writeId-protected pattern as codex.ts
+          // so a concurrent task on the same contextId doesn't get its
+          // session entry rolled back from under it.
+          const tNow = now();
+          if (sessionTtlMs > 0) evictExpired(tNow - sessionTtlMs);
+          const existing = sessionTtlMs > 0 ? sessions.get(task.contextId) : undefined;
+          let writeId = 0;
+          if (sessionTtlMs > 0) {
+            writeId = ++writeCounter;
+            if (existing) {
+              sessions.set(task.contextId, {
+                threadId: existing.threadId,
+                lastUsedAt: tNow,
+                writeId,
+              });
+            }
+          }
+          const isResume = existing !== undefined;
+          let observedThreadId: string | null = null;
+
+          const rollbackResumeRefresh = (): void => {
+            if (!isResume || sessionTtlMs <= 0) return;
+            const cur = sessions.get(task.contextId);
+            if (cur?.threadId === existing.threadId && cur.writeId === writeId) {
+              sessions.set(task.contextId, {
+                threadId: existing.threadId,
+                lastUsedAt: existing.lastUsedAt,
+                writeId: ++writeCounter,
+              });
+            }
+          };
+          const rollbackFreshThread = (): void => {
+            if (isResume || sessionTtlMs <= 0 || !observedThreadId) return;
+            const cur = sessions.get(task.contextId);
+            if (cur?.threadId === observedThreadId && cur.writeId === writeId) {
+              sessions.delete(task.contextId);
+            }
+          };
+
+          emit({
+            type: 'task.status',
+            taskId: task.taskId,
+            status: { state: 'working', timestamp: new Date().toISOString() },
+          });
+
+          // For resumes we only re-attach to the existing thread without
+          // overriding config — initial `thread/start` already set sandbox
+          // and developerInstructions. Fresh threads pass both.
+          let threadId: string;
+          try {
+            if (isResume) {
+              const resumeResult = await client.request<{ thread: { id: string } }>(
+                'thread/resume',
+                {
+                  threadId: existing.threadId,
+                  cwd,
+                  sandbox: sandboxMode,
+                },
+              );
+              threadId = resumeResult.thread.id;
+            } else {
+              const startResult = await client.request<{ thread: { id: string } }>(
+                'thread/start',
+                {
+                  cwd,
+                  sandbox: sandboxMode,
+                  ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),
+                },
+              );
+              threadId = startResult.thread.id;
+              observedThreadId = threadId;
+              if (sessionTtlMs > 0) {
+                sessions.set(task.contextId, {
+                  threadId,
+                  lastUsedAt: now(),
+                  writeId,
+                });
+              }
+            }
+            recorder.mark('threadReady');
+          } catch (err) {
+            rollbackResumeRefresh();
+            // Transport closed mid-handshake: report as crash so operator
+            // sees the same code as a startup-time failure; the next task
+            // will re-spawn the client.
+            if (err instanceof Error && err.message.startsWith(TRANSPORT_CLOSED)) {
+              emit({
+                type: 'task.fail',
+                taskId: task.taskId,
+                error: {
+                  code: 'app_server_crashed',
+                  message: `codex app-server transport closed during ${isResume ? 'thread/resume' : 'thread/start'}: ${err.message}`,
+                },
+              });
+              return;
+            }
+            emit({
+              type: 'task.fail',
+              taskId: task.taskId,
+              error: {
+                code: isResume ? 'thread_resume_failed' : 'thread_start_failed',
+                message: errorMessage(err),
+              },
+            });
+            return;
+          }
+
+          // Subscribe to notifications scoped to our turn. The turnId is
+          // not known until `turn/start` returns; we capture it then
+          // filter incoming notifications by it. Prior to capture we
+          // ignore turn-level events (no turn of ours is yet on the wire).
+          let activeTurnId: string | null = null;
+          let finalText: string | null = null;
+          let emittedAnyArtifact = false;
+          const emitTraceArtifacts = traceabilityRequested(task);
+
+          const emitAgentArtifact = (text: string): void => {
+            if (!text) return;
+            // openai-compat envelope detection — same contract the codex
+            // backend uses, so callers see identical `data` parts.
+            if (openaiCompat) {
+              const envelope = tryParseToolCallsEnvelope(text);
+              if (envelope) {
+                emit({
+                  type: 'task.artifact',
+                  taskId: task.taskId,
+                  artifact: {
+                    artifactId: randomUUID(),
+                    name: 'codex-message',
+                    parts: [{ kind: 'data', data: envelope }],
+                    extensions: [OPENAI_COMPAT_EXTENSION_URI],
+                  },
+                  lastChunk: true,
+                });
+                emittedAnyArtifact = true;
+                return;
+              }
+            }
+            emit({
+              type: 'task.artifact',
+              taskId: task.taskId,
+              artifact: {
+                artifactId: randomUUID(),
+                name: 'codex-message',
+                parts: [{ kind: 'text', text }],
+              },
+              lastChunk: true,
+            });
+            emittedAnyArtifact = true;
+          };
+
+          const emitCommandTrace = (
+            item: Extract<ThreadItem, { type: 'commandExecution' }>,
+          ): void => {
+            if (!emitTraceArtifacts) return;
+            emit({
+              type: 'task.artifact',
+              taskId: task.taskId,
+              artifact: {
+                artifactId: randomUUID(),
+                name: 'codex-command-execution',
+                parts: [
+                  { kind: 'text', text: commandExecutionSummary(item) },
+                  {
+                    kind: 'data',
+                    data: {
+                      command: typeof item.command === 'string' ? item.command : undefined,
+                      status: typeof item.status === 'string' ? item.status : undefined,
+                      exitCode: typeof item.exitCode === 'number' ? item.exitCode : undefined,
+                    },
+                  },
+                ],
+                extensions: [TRACEABILITY_EXTENSION_URI],
+                metadata: { traceType: 'command-execution' },
+              },
+              lastChunk: true,
+            });
+            emittedAnyArtifact = true;
+          };
+
+          // Drive the turn to completion. The notification subscription
+          // captures the agent's final message text and command-execution
+          // traces; the loop resolves on `turn/completed` or `turn/failed`.
+          const outcome: TurnRunOutcome = await new Promise((resolve) => {
+            let settled = false;
+            const finish = (o: TurnRunOutcome): void => {
+              if (settled) return;
+              settled = true;
+              cleanupNotifications();
+              if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
+              signal.removeEventListener('abort', onAbort);
+              resolve(o);
+            };
+
+            const cleanupNotifications = client.onNotification((method, params) => {
+              if (method === 'item/completed') {
+                const p = params as { item?: ThreadItem; turnId?: string } | undefined;
+                if (activeTurnId && p?.turnId !== activeTurnId) return;
+                const item = p?.item;
+                if (!item) return;
+                if (item.type === 'agentMessage' && typeof item.text === 'string') {
+                  recorder.mark('firstFinal');
+                  finalText = item.text;
+                  emitAgentArtifact(item.text);
+                  return;
+                }
+                if (item.type === 'commandExecution') {
+                  emitCommandTrace(item as Extract<ThreadItem, { type: 'commandExecution' }>);
+                }
+                return;
+              }
+              if (method === 'item/agentMessage/delta') {
+                const p = params as { turnId?: string } | undefined;
+                if (activeTurnId && p?.turnId !== activeTurnId) return;
+                recorder.mark('firstDelta');
+                return;
+              }
+              if (method === 'turn/completed') {
+                const p = params as
+                  | {
+                      turn?: { id?: string; status?: string; error?: { message?: string } | null };
+                    }
+                  | undefined;
+                const t = p?.turn;
+                if (activeTurnId && t?.id !== activeTurnId) return;
+                if (t?.status === 'completed') {
+                  finish({ status: 'completed', finalText });
+                } else if (t?.status === 'interrupted') {
+                  finish({ status: 'interrupted', finalText });
+                } else {
+                  finish({
+                    status: 'failed',
+                    error: { message: t?.error?.message ?? `turn ended with status ${t?.status ?? 'unknown'}` },
+                    finalText,
+                  });
+                }
+              }
+            });
+
+            const onAbort = (): void => {
+              // Best-effort `turn/interrupt`; the resolution will land on
+              // turn/completed status:'interrupted'. If the rpc client is
+              // dead we still resolve as aborted.
+              if (activeTurnId) {
+                client.request('turn/interrupt', { threadId, turnId: activeTurnId }).catch(() => {});
+              }
+              // Don't `finish` immediately — wait for the server's terminal
+              // event to land so we don't race with a `turn/completed`
+              // arriving during the round-trip.
+              setTimeoutCheckAbort();
+            };
+            // If turn/completed never arrives after abort (e.g. server
+            // ignored interrupt because turn was already settling),
+            // we still resolve to canceled after a short grace period.
+            let abortGracePending = false;
+            const setTimeoutCheckAbort = (): void => {
+              if (abortGracePending) return;
+              abortGracePending = true;
+              setTimeout(() => {
+                if (!settled) {
+                  finish({ status: 'aborted', finalText });
+                }
+              }, 2_000);
+            };
+            signal.addEventListener('abort', onAbort);
+
+            // Idle-silence heartbeat — same shape as codex.ts.
+            let heartbeatHandle: unknown = null;
+            if (heartbeatMs > 0) {
+              heartbeatHandle = setIntervalImpl(() => {
+                if (settled) return;
+                if (now() - lastEmitAt < heartbeatMs) return;
+                emit({
+                  type: 'task.status',
+                  taskId: task.taskId,
+                  status: { state: 'working', timestamp: new Date().toISOString() },
+                });
+              }, heartbeatMs);
+            }
+
+            // Wire client-side timeout if configured. The default 0 means
+            // wait for the server.
+            if (turnTimeoutMs > 0) {
+              setTimeout(() => {
+                if (!settled) {
+                  finish({
+                    status: 'failed',
+                    error: { message: `turn timed out after ${turnTimeoutMs}ms` },
+                    finalText,
+                  });
+                }
+              }, turnTimeoutMs);
+            }
+
+            // Detect a transport closure mid-turn — the rpc client rejects
+            // pending requests on close, but our turn-result loop is
+            // notification-driven. Race the close future against the rest.
+            void client.waitForClose().then(() => {
+              if (!settled) {
+                finish({
+                  status: 'failed',
+                  error: { message: 'codex app-server transport closed during turn' },
+                  finalText,
+                });
+              }
+            });
+
+            // Fire turn/start. The response carries our turnId so we can
+            // filter notifications.
+            client
+              .request<{ turn: { id: string } }>('turn/start', {
+                threadId,
+                input: userInput,
+              })
+              .then(
+                (res) => {
+                  activeTurnId = res.turn.id;
+                  recorder.mark('turnStarted');
+                },
+                (err) => {
+                  finish({
+                    status: 'failed',
+                    error: { message: `turn/start failed: ${errorMessage(err)}` },
+                    finalText,
+                  });
+                },
+              );
+          });
+
+          // Map turn outcome to A2A lifecycle.
+          if (outcome.status === 'interrupted' || outcome.status === 'aborted') {
+            rollbackFreshThread();
+            rollbackResumeRefresh();
+            emit({
+              type: 'task.complete',
+              taskId: task.taskId,
+              status: { state: 'canceled', timestamp: new Date().toISOString() },
+            });
+            return;
+          }
+
+          if (outcome.status === 'failed') {
+            rollbackFreshThread();
+            rollbackResumeRefresh();
+            emit({
+              type: 'task.fail',
+              taskId: task.taskId,
+              error: {
+                code: 'turn_failed',
+                message: outcome.error?.message ?? 'turn failed',
+              },
+            });
+            return;
+          }
+
+          // Refresh the resumed binding on success so TTL extends.
+          if (isResume && sessionTtlMs > 0) {
+            const cur = sessions.get(task.contextId);
+            if (cur?.threadId === existing.threadId && cur.writeId === writeId) {
+              sessions.set(task.contextId, {
+                threadId: existing.threadId,
+                lastUsedAt: now(),
+                writeId,
+              });
+            }
+          }
+
+          const completeText = outcome.finalText ?? '';
+          const parts: Part[] = completeText
+            ? [{ kind: 'text', text: completeText }]
+            : [];
+          if (!emittedAnyArtifact && completeText) {
+            emit({
+              type: 'task.artifact',
+              taskId: task.taskId,
+              artifact: {
+                artifactId: randomUUID(),
+                name: 'codex-result',
+                parts,
+              },
+              lastChunk: true,
+            });
+          }
+
+          emit({
+            type: 'task.complete',
+            taskId: task.taskId,
+            status: {
+              state: 'completed',
+              timestamp: new Date().toISOString(),
+              ...(parts.length
+                ? {
+                    message: {
+                      role: 'agent',
+                      messageId: randomUUID(),
+                      parts,
+                    },
+                  }
+                : {}),
+            },
+          });
+        } finally {
+          if (mapped.tempDir) {
+            try {
+              await rm(mapped.tempDir, { recursive: true, force: true });
+            } catch {
+              // best-effort cleanup
+            }
+          }
+        }
+      } finally {
+        releaseLock();
+      }
+    },
+  };
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  if (ms <= 0) return p;
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(label)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(t);
+        reject(err);
+      },
+    );
+  });
+}
