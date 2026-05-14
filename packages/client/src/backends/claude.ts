@@ -494,12 +494,14 @@ function parseToolCallHistory(raw: unknown[]): OpenAICompatHistoryEntry[] | null
 // True when the caller has supplied tool definitions AND has not explicitly
 // disabled tool use (`tool_choice === "none"`). Backends consult this to
 // decide whether to suppress agent-side built-in tools that would otherwise
-// bypass the envelope-emit contract — see issue #175 for the codex case
-// where the built-in shell/exec tools executed `ls` directly instead of
-// emitting a `tool_calls` envelope for the caller's `bash` definition.
-// The condition mirrors `hasTools` in `buildOpenAICompatSystemPrompt` so
-// the gate that enables the envelope contract in the prompt is the same
-// gate that disables the conflicting built-ins.
+// bypass the envelope-emit contract — see #175 for the codex case (built-in
+// shell/exec executed `ls` directly instead of emitting a `tool_calls`
+// envelope for the caller's `bash` definition) and #178 for the same
+// pattern in claude (built-in Read/Glob/Bash served a `ls` request without
+// surfacing the caller's `List`). The condition mirrors `hasTools` in
+// `buildOpenAICompatSystemPrompt` so the gate that enables the envelope
+// contract in the prompt is the same gate that disables the conflicting
+// built-ins.
 export function callerToolDispatchActive(meta: OpenAICompatMetadata | null): boolean {
   if (!meta) return false;
   if (meta.tools === undefined) return false;
@@ -1049,6 +1051,18 @@ export function createClaudeBackend(
       const openaiCompatArgs: readonly string[] = openaiCompat
         ? ['--append-system-prompt', buildOpenAICompatSystemPrompt(openaiCompat)]
         : [];
+      // Disable claude's built-in tools (Read / Glob / Bash / Edit / Write /
+      // ...) when the caller has supplied its own tool definitions via the
+      // openai-compat extension. Without this, claude silently uses its own
+      // tools to satisfy a request like "list the cwd" and emits the result
+      // as plain text, bypassing the caller's `tool_calls` envelope contract
+      // — see #178 for the observed case (envelope absent, response served
+      // from agent-side filesystem). `--tools ""` is the documented switch
+      // for blanket-disabling built-ins; MCP-registered tools (e.g.
+      // `send_file`) continue to load via `--mcp-config`.
+      const disableBuiltinToolArgs: readonly string[] = callerToolDispatchActive(openaiCompat)
+        ? ['--tools', '']
+        : [];
 
       const args: string[] = [
         '-p',
@@ -1072,6 +1086,7 @@ export function createClaudeBackend(
           : []),
         ...identityArgs,
         ...openaiCompatArgs,
+        ...disableBuiltinToolArgs,
         ...settingsArgs,
         ...extraArgs,
       ];
