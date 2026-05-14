@@ -18,11 +18,11 @@ Add `vicoop-client list-clients` and `vicoop-client revoke-client` subcommands s
 
 **Daemon behavior**
 
-- The client daemon's reconnect loop now branches on close code 4014: log `client revoked by owner; exiting`, abort inflight tasks, and exit non-zero without reconnecting. Without this branch the daemon would loop forever against a permanently-failing auth.
+- The client daemon's reconnect loop now treats two close codes as terminal: 4014 "client revoked" (the live-disconnect path) and 4005 "bad token" (the relaunch path — a daemon restarted with the same revoked token, or launched with a wrong token in the first place). Both fire `onFatal` and exit non-zero instead of reconnect-looping against a permanently-failing auth. All other close codes still go through the normal exponential-backoff reconnect path.
 
 **Revocation propagation**
 
-- Client-token verification in `ws.ts` queries `clients` directly on every WS register (no LRU cache, unlike the 60s `callers` cache documented in `local-testing.md`), so revocation is effectively synchronous from the next auth attempt — a daemon relaunched with the same token after revoke fails with close code 4005 "bad token". No cache-invalidation work needed on the server side.
+- Client-token verification in `ws.ts` queries `clients` directly on every WS register (no LRU cache, unlike the 60s `callers` cache documented in `local-testing.md`), so revocation is effectively synchronous from the next auth attempt — and combined with the 4005-terminal client behavior above, a daemon relaunched with the same token after revoke exits at first hello instead of looping. No cache-invalidation work needed on the server side.
 
 **Schema**
 

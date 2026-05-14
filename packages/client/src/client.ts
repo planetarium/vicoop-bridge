@@ -61,16 +61,17 @@ export interface ClientOptions {
   // this unset and logs land on `console.log` / `.warn` / `.error`.
   logSink?: ConsoleSink;
   // Invoked when the daemon hits a non-recoverable terminal close code
-  // (currently only 4014 "client revoked"). The Client itself only
-  // tears down its own state — `stopped = true`, reconnect timer
-  // cleared, inflight tasks aborted — and delegates the
-  // process-lifecycle decision (e.g. process.exit(1)) to the caller via
-  // this callback. Two reasons we don't call process.exit here: tests
-  // that construct a Client can't recover from a forced exit, and
-  // future embedders (a long-running parent process hosting multiple
-  // clients) need to keep running after one client is revoked. The
-  // production entrypoint (`cli.ts runClient`) wires this to
-  // `process.exit(1)`; tests pass a capturing callback.
+  // (currently 4014 "client revoked" and 4005 "bad token" — see the
+  // close-handler in `connect()` for the rationale on each). The Client
+  // itself only tears down its own state — `stopped = true`, reconnect
+  // timer cleared, inflight tasks aborted — and delegates the
+  // process-lifecycle decision (e.g. process.exit(1)) to the caller
+  // via this callback. Two reasons we don't call process.exit here:
+  // tests that construct a Client can't recover from a forced exit,
+  // and future embedders (a long-running parent process hosting
+  // multiple clients) need to keep running after one client is
+  // revoked. The production entrypoint (`cli.ts runClient`) wires this
+  // to `process.exit(1)`; tests pass a capturing callback.
   onFatal?: (info: { code: number; reason: string }) => void;
 }
 
@@ -326,17 +327,33 @@ export class Client {
       this.logger.info(`disconnected: ${code} ${safeToken(reason.toString())}`);
       if (!current) return;
       this.ws = null;
-      // 4014 is the server's "client revoked" signal (issue #166). The
-      // DB row was just soft-deleted by an owner-side `vicoop-client
-      // revoke-client`, and ws.ts will reject every future hello with
-      // the same token. Looping forever would just spam reconnects
-      // against a permanently-failing auth; tear down our own reconnect
-      // state and delegate the process-lifecycle decision to `onFatal`
-      // (the production entrypoint exits non-zero so systemd / a parent
-      // supervisor surfaces the revocation instead of masking it as a
-      // transient network hiccup).
-      if (code === 4014) {
-        this.logger.error('client revoked by owner; stopping');
+      // Terminal auth failures the daemon cannot recover from by waiting:
+      //
+      //   - **4014 "client revoked"** (issue #166). The DB row was just
+      //     soft-deleted by an owner-side `vicoop-client revoke-client`.
+      //     Future hellos will be rejected with 4005 anyway, so we exit
+      //     immediately rather than wait one more reconnect cycle.
+      //
+      //   - **4005 "bad token"**. ws.ts only emits 4005 after a
+      //     `SELECT … WHERE token_hash = $1 AND revoked = false` returns
+      //     no row — either the token is wrong (operator copy/paste, or
+      //     daemon was relaunched after revocation without rotating) or
+      //     the row is revoked but the daemon missed the live 4014 close.
+      //     In both cases the failure is permanent: no amount of backoff
+      //     produces a row that matches. Looping just spams the bridge.
+      //
+      // Other close codes (4001-4004 / 4006-4013) might be transient or
+      // bug-shaped but are out of scope for this PR — they continue to
+      // hit scheduleReconnect.
+      //
+      // We tear down our own reconnect state and delegate the
+      // process-lifecycle decision to `onFatal`. The production
+      // entrypoint exits non-zero so systemd / a parent supervisor
+      // surfaces the failure instead of masking it as a transient
+      // network hiccup.
+      if (code === 4014 || code === 4005) {
+        const label = code === 4014 ? 'client revoked by owner' : 'bridge rejected token';
+        this.logger.error(`${label}; stopping (code=${code})`);
         this.stopped = true;
         this.clearReconnectTimer();
         for (const controller of this.inflight.values()) controller.abort();

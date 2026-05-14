@@ -340,11 +340,58 @@ test('Client stops on 4014 "client revoked", invokes onFatal, and does NOT recon
   }
 });
 
-test('Client treats non-4014 closes as reconnectable and does NOT call onFatal', async () => {
-  // Companion to the 4014 test: any other close code (here 1012 service
-  // restart, the same code the reconnect-happy-path test uses) must
-  // fall through to the normal reconnect path and never trigger the
-  // fatal callback.
+test('Client stops on 4005 "bad token" too (revoke-then-relaunch case, #166)', async () => {
+  // 4005 is what ws.ts emits when the token lookup returns no row —
+  // either the operator pasted the wrong secret, or the daemon was
+  // relaunched after revocation without rotating. Both are permanent
+  // auth failures, so the daemon must surface onFatal instead of
+  // looping reconnects against an unreachable row.
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  const connections: WebSocket[] = [];
+  let helloCount = 0;
+  wss.on('connection', (ws) => {
+    connections.push(ws);
+    ws.on('message', () => helloCount++);
+  });
+
+  const fatalCalls: Array<{ code: number; reason: string }> = [];
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => {
+      /* no tasks */
+    }),
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    reconnectStableMs: 0,
+    heartbeatIntervalMs: 0,
+    onFatal: (info) => fatalCalls.push(info),
+  });
+
+  try {
+    client.start();
+    await waitFor(() => helloCount === 1, 'expected initial hello');
+    connections[0]!.close(4005, 'bad token');
+    await waitFor(() => fatalCalls.length === 1, 'expected onFatal to fire on 4005');
+    assert.equal(fatalCalls[0]!.code, 4005);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(helloCount, 1, 'must not reconnect after 4005');
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
+test('Client treats reconnectable closes (1012) as non-terminal and does NOT call onFatal', async () => {
+  // Companion to the 4014/4005 tests: a transient close code (here 1012
+  // service restart, the same code the reconnect-happy-path test uses)
+  // must fall through to the normal reconnect path and never trigger
+  // the fatal callback.
   const server = createServer();
   const wss = new WebSocketServer({ server, path: '/connect' });
   const serverUrl = await listen(server);

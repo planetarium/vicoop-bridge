@@ -786,10 +786,14 @@ vicoop-client revoke-client <client-id-or-name>
   with a list of matching `client_id`s so you can retry with the id.
 - If the daemon is alive at the moment of revocation, its WebSocket is
   closed with code **4014 "client revoked"** and the daemon exits
-  non-zero without reconnecting. The bridge's WS auth path also rejects
-  the token on the next register attempt, so a daemon launched again with
-  the same token will fail with **close code 4005 "bad token"** rather
-  than reconnect-loop indefinitely.
+  non-zero without reconnecting.
+- If the daemon is **relaunched** with the same token after revocation
+  (rather than already being live), the bridge's WS auth path rejects
+  the hello with **close code 4005 "bad token"** — the daemon treats
+  4005 as terminal too (same `onFatal` path as 4014), so it exits
+  non-zero on the first reconnect attempt rather than reconnect-loop
+  indefinitely against a permanently-rejected token. The same 4005
+  branch catches plain mis-typed / wrong tokens at first launch.
 - Propagation is **synchronous from the next auth attempt**: client-token
   verification queries `clients` directly on every WS register with no
   cache, so there is no equivalent of the 60s `callers` LRU window.
