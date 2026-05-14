@@ -35,13 +35,18 @@ async function pickUnusedLoopbackPort(): Promise<number> {
   });
 }
 import {
+  composeOpenAICompatUserMessage,
   createOpenclawBackend,
   listenersToGatewayUrls,
   mapPartsToChatInput,
   parseLsofListeningPorts,
   redactUrl,
 } from './openclaw.js';
-import type { UpFrame, TaskAssignFrame } from '@vicoop-bridge/protocol';
+import {
+  OPENAI_COMPAT_EXTENSION_URI,
+  type TaskAssignFrame,
+  type UpFrame,
+} from '@vicoop-bridge/protocol';
 
 // Most tests don't exercise cancellation. Reusing one unaborted signal keeps
 // those call sites noise-free; cancel-specific tests build their own
@@ -2806,5 +2811,369 @@ test('heartbeat: suppressed after signal.abort so canceled tasks do not look lik
     await fake.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// openai-compat extension
+//
+// The pure helpers (parseOpenAICompatMetadata, buildOpenAICompatSystemPrompt,
+// formatToolCallHistory, tryParseToolCallsEnvelope) live in claude.ts and are
+// covered by claude.test.ts — openclaw.ts imports them verbatim, so we only
+// test the openclaw-specific wiring here: chat.send.message composition with
+// the XML-wrapped contract blocks, envelope→data-part on session.message,
+// non-streaming envelope on the terminal chat event, and the false-positive
+// defence when the extension is off.
+// ---------------------------------------------------------------------------
+
+const OAI_SAMPLE_TOOLS = [
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_weather',
+      description: 'Get the current weather for a city.',
+      parameters: {
+        type: 'object',
+        properties: { city: { type: 'string' } },
+        required: ['city'],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
+function makeOpenAICompatTask(
+  taskId: string,
+  text: string,
+  payload: Record<string, unknown>,
+  contextId = `ctx-${taskId}`,
+): TaskAssignFrame {
+  return {
+    type: 'task.assign',
+    taskId,
+    contextId,
+    message: {
+      role: 'user',
+      messageId: `msg-${taskId}`,
+      parts: [{ kind: 'text', text }],
+      metadata: { [OPENAI_COMPAT_EXTENSION_URI]: payload },
+    },
+  };
+}
+
+test('composeOpenAICompatUserMessage: wraps system_instructions + user_message with tools+tool_choice present', () => {
+  const out = composeOpenAICompatUserMessage(
+    { tools: OAI_SAMPLE_TOOLS, tool_choice: 'auto', system: 'Be terse.' },
+    'what is the weather?',
+  );
+  // User system precedes the envelope contract inside the system_instructions block.
+  assert.match(out, /^<system_instructions>\nBe terse\./);
+  // Envelope contract wording (the precise text the LLM is being trained
+  // against at runtime — pinned to detect accidental rewordings).
+  assert.match(out, /"tool_calls":\[\{"id":"call_<unique>"/);
+  // tools JSON inlined inside the block.
+  assert.match(out, /"name": "get_weather"/);
+  // tool_choice descriptor present in the same block.
+  assert.match(out, /tool_choice="auto"/);
+  // system_instructions block closes before user_message opens.
+  assert.match(out, /<\/system_instructions>\n\n<user_message>/);
+  // User content sits inside user_message verbatim, no extra wrapping.
+  assert.match(out, /<user_message>\nwhat is the weather\?\n<\/user_message>$/);
+});
+
+test('composeOpenAICompatUserMessage: tool_choice="none" suppresses envelope contract but keeps no-envelope directive', () => {
+  const out = composeOpenAICompatUserMessage(
+    { tools: OAI_SAMPLE_TOOLS, tool_choice: 'none' },
+    'hi',
+  );
+  // The envelope contract block is gone under tool_choice="none".
+  assert.doesNotMatch(out, /"tool_calls":\[\{"id":"call_<unique>"/);
+  // The explicit "do not use the envelope" directive replaces it.
+  assert.match(out, /tool_choice="none"/);
+});
+
+test('chat.send.message carries the XML-wrapped envelope contract when metadata is present', async () => {
+  let sentMessage: string | null = null;
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        sentMessage = (req.params as { message: string }).message;
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId: 'r-oai', status: 'started' } }),
+        );
+        setImmediate(() => {
+          fake.emitChat(sock, {
+            runId: 'r-oai',
+            sessionKey: 'agent:main:ctx-t-oai-argv',
+            seq: 1,
+            state: 'final',
+            // Reply with the envelope so we don't trip the natural-language path.
+            message: { text: '{"tool_calls":[{"id":"call_1","function":{"name":"get_weather","arguments":{"city":"Seoul"}}}]}' },
+          });
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    await backend.handle(
+      makeOpenAICompatTask('t-oai-argv', 'what is the weather?', {
+        tools: OAI_SAMPLE_TOOLS,
+        tool_choice: 'auto',
+      }),
+      () => {},
+      NEVER,
+    );
+    assert.ok(sentMessage, 'expected chat.send to fire');
+    // The user content was wrapped by the helper before reaching chat.send.
+    assert.match(sentMessage!, /^<system_instructions>/);
+    assert.match(sentMessage!, /"tool_calls":\[\{"id":"call_<unique>"/);
+    assert.match(sentMessage!, /<user_message>\nwhat is the weather\?\n<\/user_message>$/);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('absent metadata → chat.send.message is the raw user text (no XML wrapper leaks)', async () => {
+  // Guards against the XML wrapping accidentally activating on non-extension
+  // tasks (e.g. if metadata parsing started returning a non-null sentinel
+  // for shapes that should really be treated as absent).
+  let sentMessage: string | null = null;
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        sentMessage = (req.params as { message: string }).message;
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId: 'r-plain', status: 'started' } }),
+        );
+        setImmediate(() => {
+          fake.emitChat(sock, {
+            runId: 'r-plain',
+            sessionKey: 'agent:main:ctx-t-plain',
+            seq: 1,
+            state: 'final',
+            message: { text: 'ok' },
+          });
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    await backend.handle(makeTask('t-plain', 'just a plain hello'), () => {}, NEVER);
+    assert.equal(sentMessage, 'just a plain hello');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('envelope JSON on session.message becomes a data-part artifact tagged with the extension URI', async () => {
+  const frames: UpFrame[] = [];
+  const envelope = {
+    tool_calls: [
+      { id: 'call_abc', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
+    ],
+  };
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId: 'r-env', status: 'started' } }),
+        );
+        setImmediate(() => {
+          fake.emitSessionMessage(sock, {
+            sessionKey: 'agent:main:ctx-t-env',
+            messageId: 'mid-1',
+            message: { role: 'assistant', text: JSON.stringify(envelope) },
+          });
+          setImmediate(() => {
+            fake.emitChat(sock, {
+              runId: 'r-env',
+              sessionKey: 'agent:main:ctx-t-env',
+              seq: 1,
+              state: 'final',
+              message: { text: JSON.stringify(envelope) },
+            });
+          });
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    await backend.handle(
+      makeOpenAICompatTask('t-env', 'what is the weather in Seoul?', { tools: OAI_SAMPLE_TOOLS }),
+      (f) => frames.push(f),
+      NEVER,
+    );
+    const artifacts = frames.filter(
+      (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+    );
+    assert.equal(artifacts.length, 1);
+    const part = artifacts[0].artifact.parts[0];
+    assert.equal(part.kind, 'data');
+    if (part.kind !== 'data') throw new Error('expected data part');
+    assert.deepEqual(part.data, envelope);
+    assert.deepEqual(artifacts[0].artifact.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('envelope JSON arriving only on the terminal chat event (no session.message) still becomes a data-part artifact', async () => {
+  // Non-streaming fallback: the gateway never broadcasts session.message
+  // (older image, or this task lost streaming ownership to a concurrent
+  // peer). The bridge MUST still surface the envelope via the terminal
+  // chat 'final' event so the cooperating gateway sees `tool_calls`.
+  const frames: UpFrame[] = [];
+  const envelope = {
+    tool_calls: [
+      { id: 'call_xyz', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
+    ],
+  };
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId: 'r-env-nostream', status: 'started' } }),
+        );
+        setImmediate(() => {
+          // NO session.message emit — go straight to terminal.
+          fake.emitChat(sock, {
+            runId: 'r-env-nostream',
+            sessionKey: 'agent:main:ctx-t-env-nostream',
+            seq: 1,
+            state: 'final',
+            message: { text: JSON.stringify(envelope) },
+          });
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    await backend.handle(
+      makeOpenAICompatTask('t-env-nostream', 'what is the weather?', { tools: OAI_SAMPLE_TOOLS }),
+      (f) => frames.push(f),
+      NEVER,
+    );
+    const artifacts = frames.filter(
+      (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+    );
+    assert.equal(artifacts.length, 1);
+    const part = artifacts[0].artifact.parts[0];
+    assert.equal(part.kind, 'data');
+    if (part.kind !== 'data') throw new Error('expected data part');
+    assert.deepEqual(part.data, envelope);
+    assert.deepEqual(artifacts[0].artifact.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+    // task.complete still carries the envelope JSON as text in status.message
+    // (mirrors claude/codex: data-part is the primary surface, text in the
+    // terminal slot is the conventional A2A mirror).
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete && complete.type === 'task.complete');
+    const stamped = complete.status.message?.parts[0];
+    assert.equal(stamped?.kind, 'text');
+    if (stamped?.kind === 'text') assert.equal(stamped.text, JSON.stringify(envelope));
+  } finally {
+    await fake.close();
+  }
+});
+
+test('extension off: a coincidental {"tool_calls":[...]} reply stays a text artifact', async () => {
+  // Without the extension we don't claim any envelope contract is in force,
+  // so a JSON-shaped reply from a non-cooperating task MUST NOT be routed
+  // as a tool call. Guards against false-positive routing.
+  const frames: UpFrame[] = [];
+  const coincidental = JSON.stringify({ tool_calls: [] });
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId: 'r-coincidental', status: 'started' } }),
+        );
+        setImmediate(() => {
+          fake.emitSessionMessage(sock, {
+            sessionKey: 'agent:main:ctx-t-coincidental',
+            messageId: 'mid-c',
+            message: { role: 'assistant', text: coincidental },
+          });
+          setImmediate(() => {
+            fake.emitChat(sock, {
+              runId: 'r-coincidental',
+              sessionKey: 'agent:main:ctx-t-coincidental',
+              seq: 1,
+              state: 'final',
+              message: { text: coincidental },
+            });
+          });
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    await backend.handle(makeTask('t-coincidental', 'hi'), (f) => frames.push(f), NEVER);
+    const artifacts = frames.filter(
+      (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+    );
+    assert.equal(artifacts.length, 1);
+    assert.equal(artifacts[0].artifact.parts[0].kind, 'text');
+    assert.equal(artifacts[0].artifact.extensions, undefined);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('extension on but model answered in prose → text artifact, no extension tag', async () => {
+  // The extension being active does not mean every turn is a tool turn:
+  // a tool_choice="auto" model is free to answer in natural language, and
+  // a non-cooperating host model may refuse the envelope contract entirely.
+  // Either way, non-envelope text must flow through as a text artifact
+  // without the extension URI tag — mis-claiming the contract was honored
+  // would mislead the upstream gateway.
+  const frames: UpFrame[] = [];
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method === 'chat.send') {
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId: 'r-prose', status: 'started' } }),
+        );
+        setImmediate(() => {
+          fake.emitSessionMessage(sock, {
+            sessionKey: 'agent:main:ctx-t-prose',
+            messageId: 'mid-p',
+            message: { role: 'assistant', text: 'No tool needed; the answer is 42.' },
+          });
+          setImmediate(() => {
+            fake.emitChat(sock, {
+              runId: 'r-prose',
+              sessionKey: 'agent:main:ctx-t-prose',
+              seq: 1,
+              state: 'final',
+              message: { text: 'No tool needed; the answer is 42.' },
+            });
+          });
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    await backend.handle(
+      makeOpenAICompatTask('t-prose', 'hi', { tools: OAI_SAMPLE_TOOLS, tool_choice: 'auto' }),
+      (f) => frames.push(f),
+      NEVER,
+    );
+    const artifacts = frames.filter(
+      (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+    );
+    assert.equal(artifacts.length, 1);
+    const part = artifacts[0].artifact.parts[0];
+    assert.equal(part.kind, 'text');
+    if (part.kind === 'text') assert.equal(part.text, 'No tool needed; the answer is 42.');
+    assert.equal(artifacts[0].artifact.extensions, undefined);
+  } finally {
+    await fake.close();
+  }
+});
+
 
 export { createFakeGateway, makeTask };
