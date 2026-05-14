@@ -3,8 +3,17 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { TRACEABILITY_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol';
+import {
+  OPENAI_COMPAT_EXTENSION_URI,
+  TRACEABILITY_EXTENSION_URI,
+  type Part,
+} from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import {
+  buildOpenAICompatSystemPrompt,
+  parseOpenAICompatMetadata,
+  tryParseToolCallsEnvelope,
+} from './claude.js';
 import { createLogger, escapeLineSeparators, safeToken, type Logger } from '../logger.js';
 import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME } from './fetch-uri-file.js';
 
@@ -312,6 +321,21 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
         return;
       }
 
+      // Detect the openai-compat extension payload once per task so the
+      // result feeds three places: (a) the instructions file we materialise
+      // for `-c model_instructions_file=...`, (b) the assistant artifact
+      // path (envelope JSON → data part), and (c) the user prompt prefix
+      // for multi-turn `tool_call_history`. Absent or malformed metadata
+      // leaves the run on the original non-extension code path with no
+      // envelope-detection cost.
+      const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+
+      // A separately-rooted temp dir created only when openai-compat is
+      // active AND no image temp dir already exists. Tracked here (outside
+      // the try/finally) so the finally block can clean it independently
+      // of `mapped.tempDir`.
+      let instructionsTempDir: string | null = null;
+
       try {
         if (signal.aborted) {
           emit({
@@ -320,6 +344,42 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
             status: { state: 'canceled', timestamp: new Date().toISOString() },
           });
           return;
+        }
+
+        // Materialise the openai-compat system prompt to a file we point
+        // codex at via `-c model_instructions_file="..."`. codex 0.130+
+        // exposes this as the seam for caller-supplied instructions;
+        // `experimental_instructions_file` is deprecated and silently
+        // ignored. Skip when the built prompt is empty (e.g. metadata only
+        // carried `tool_call_history`, which is replayed in user content
+        // instead — no system-level contract needed).
+        let instructionsFile: string | null = null;
+        if (openaiCompat) {
+          const systemPromptText = buildOpenAICompatSystemPrompt(openaiCompat);
+          if (systemPromptText) {
+            try {
+              let dir: string;
+              if (mapped.tempDir) {
+                dir = mapped.tempDir;
+              } else {
+                instructionsTempDir = await mkdtemp(path.join(os.tmpdir(), 'vicoop-codex-'));
+                dir = instructionsTempDir;
+              }
+              const file = path.join(dir, 'instructions.md');
+              await writeFile(file, Buffer.from(systemPromptText, 'utf8'));
+              instructionsFile = file;
+            } catch (err) {
+              emit({
+                type: 'task.fail',
+                taskId: task.taskId,
+                error: {
+                  code: 'input_file_write_failed',
+                  message: `failed to materialize codex instructions: ${errorMessage(err)}`,
+                },
+              });
+              return;
+            }
+          }
         }
 
         const tNow = now();
@@ -344,11 +404,20 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
         const skipGitRepoCheck = extraArgs.includes(SKIP_GIT_REPO_CHECK_FLAG)
           ? []
           : [SKIP_GIT_REPO_CHECK_FLAG];
+        // `-c key=val` expects val to parse as TOML; for a string value
+        // that means wrapped in TOML's basic-string double quotes. Lean on
+        // JSON.stringify since TOML's basic-string escape set matches
+        // JSON's (\", \\, \n, \t, etc.) so the value survives spaces /
+        // unicode / quotes in the path verbatim.
+        const instructionsArgs = instructionsFile
+          ? ['-c', `model_instructions_file=${JSON.stringify(instructionsFile)}`]
+          : [];
         const optionArgs = [
           '--json',
           '-c',
           `sandbox_mode=${JSON.stringify(sandboxMode)}`,
           ...skipGitRepoCheck,
+          ...instructionsArgs,
           ...mapped.imageFiles.flatMap((filePath) => ['--image', filePath]),
           ...extraArgs,
         ];
@@ -443,6 +512,32 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
 
         const emitAgentArtifact = (text: string): void => {
           if (!text) return;
+          // When the openai-compat extension is active for this task, the
+          // model was instructed to emit `{"tool_calls":[...]}` JSON for
+          // tool turns. Detect that shape and surface it as an A2A `data`
+          // part so the upstream gateway can forward it as `tool_calls` on
+          // the OpenAI response without re-parsing model prose. Non-envelope
+          // text (natural-language answers, or any turn from a task that
+          // didn't request the extension) falls through to the text artifact
+          // path unchanged.
+          if (openaiCompat) {
+            const envelope = tryParseToolCallsEnvelope(text);
+            if (envelope) {
+              emit({
+                type: 'task.artifact',
+                taskId: task.taskId,
+                artifact: {
+                  artifactId: randomUUID(),
+                  name: 'codex-message',
+                  parts: [{ kind: 'data', data: envelope }],
+                  extensions: [OPENAI_COMPAT_EXTENSION_URI],
+                },
+                lastChunk: true,
+              });
+              emittedAnyArtifact = true;
+              return;
+            }
+          }
           emit({
             type: 'task.artifact',
             taskId: task.taskId,
@@ -665,6 +760,15 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): Backend {
             await rm(mapped.tempDir, { recursive: true, force: true });
           } catch {
             // Best-effort cleanup; task result should not fail after the child settled.
+          }
+        }
+        // Separately clean the openai-compat instructions dir when it was
+        // not co-located with `mapped.tempDir` (i.e. there were no images).
+        if (instructionsTempDir && instructionsTempDir !== mapped.tempDir) {
+          try {
+            await rm(instructionsTempDir, { recursive: true, force: true });
+          } catch {
+            // Best-effort cleanup; see above.
           }
         }
       }

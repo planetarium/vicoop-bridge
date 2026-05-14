@@ -8,6 +8,7 @@ import {
 } from './codex.js';
 import type { Logger } from '../logger.js';
 import {
+  OPENAI_COMPAT_EXTENSION_URI,
   TRACEABILITY_EXTENSION_URI,
   type TaskAssignFrame,
   type UpFrame,
@@ -811,4 +812,359 @@ test('image materialization failure emits task.fail and cleans temp dir before s
   assert.equal(fail.type, 'task.fail');
   assert.equal(fail.error.code, 'input_file_write_failed');
   assert.match(fail.error.message, /disk full/);
+});
+
+// ---------------------------------------------------------------------------
+// openai-compat extension
+//
+// The pure helpers (parseOpenAICompatMetadata, buildOpenAICompatSystemPrompt,
+// formatToolCallHistory, tryParseToolCallsEnvelope) live in claude.ts and are
+// covered by claude.test.ts — codex.ts imports them verbatim, so we only test
+// the codex-specific wiring here: argv injection of the `-c
+// model_instructions_file=...` seam, file write/cleanup lifecycle, history
+// prepend on the stdin prompt, and envelope→data-part artifact conversion.
+// ---------------------------------------------------------------------------
+
+const SAMPLE_TOOLS = [
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_weather',
+      description: 'Get the current weather for a city.',
+      parameters: {
+        type: 'object',
+        properties: { city: { type: 'string' } },
+        required: ['city'],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
+function assignWithOpenAICompat(
+  text: string,
+  payload: Record<string, unknown>,
+  contextId = 'ctx-1',
+): TaskAssignFrame {
+  const base = assign(text, contextId);
+  return {
+    ...base,
+    message: {
+      ...base.message,
+      metadata: { [OPENAI_COMPAT_EXTENSION_URI]: payload },
+    },
+  };
+}
+
+test('argv carries `-c model_instructions_file=...` and the file contains the envelope contract', async () => {
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  const written: Array<{ path: string; data: Buffer }> = [];
+  const removed: string[] = [];
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    mkdtemp: async () => '/tmp/vicoop-codex-instr',
+    writeFile: async (filePath, data) => {
+      written.push({ path: String(filePath), data: Buffer.from(data as Buffer) });
+    },
+    rm: async (filePath) => {
+      removed.push(String(filePath));
+    },
+  });
+
+  await backend.handle(
+    assignWithOpenAICompat('what is the weather?', {
+      system: 'You are concise.',
+      tools: SAMPLE_TOOLS,
+      tool_choice: 'auto',
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  // Exactly one instructions file written under the freshly-minted temp dir.
+  assert.equal(written.length, 1);
+  assert.equal(written[0].path, '/tmp/vicoop-codex-instr/instructions.md');
+  const body = written[0].data.toString('utf8');
+  // The user system precedes the envelope contract in the rendered file.
+  assert.match(body, /^You are concise\./);
+  assert.match(body, /"tool_calls":\[\{"id":"call_<unique>"/);
+  assert.match(body, /"name": "get_weather"/);
+  assert.match(body, /tool_choice="auto"/);
+
+  // The argv carries the `-c model_instructions_file="..."` pair; the value
+  // is TOML-quoted (so paths with spaces / unicode survive). Position is
+  // after the sandbox `-c` block and `--skip-git-repo-check`, before any
+  // operator extras — pin it precisely.
+  assert.deepEqual(fake.lastChild()!.args, [
+    'exec',
+    '--json',
+    '-c',
+    'sandbox_mode="read-only"',
+    '--skip-git-repo-check',
+    '-c',
+    'model_instructions_file="/tmp/vicoop-codex-instr/instructions.md"',
+    '-',
+  ]);
+
+  // Cleanup ran on the instructions temp dir.
+  assert.deepEqual(removed, ['/tmp/vicoop-codex-instr']);
+});
+
+test('absent metadata → no instructions file is written and no `model_instructions_file` arg appears', async () => {
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  let mkdtempCalls = 0;
+  const written: string[] = [];
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    mkdtemp: async () => {
+      mkdtempCalls++;
+      return '/tmp/vicoop-codex-instr';
+    },
+    writeFile: async (filePath) => {
+      written.push(String(filePath));
+    },
+    rm: async () => {},
+  });
+
+  await backend.handle(assign('hello'), collect().emit, NEVER);
+
+  // No openai-compat metadata → no temp dir, no instructions file.
+  assert.equal(mkdtempCalls, 0);
+  assert.deepEqual(written, []);
+  const args = fake.lastChild()!.args;
+  assert.equal(
+    args.some((a) => typeof a === 'string' && a.startsWith('model_instructions_file=')),
+    false,
+  );
+});
+
+test('instructions file is co-located with the image temp dir when both are present (single cleanup)', async () => {
+  // When the task also carries images, mapPartsToCodexInput already minted
+  // a temp dir for them. The instructions file MUST land in that same dir
+  // so a single `rm -r` cleans both, and no second mkdtemp is issued.
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  let mkdtempCalls = 0;
+  const written: Array<{ path: string; data: Buffer }> = [];
+  const removed: string[] = [];
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    mkdtemp: async () => {
+      mkdtempCalls++;
+      return '/tmp/vicoop-codex-mix';
+    },
+    writeFile: async (filePath, data) => {
+      written.push({ path: String(filePath), data: Buffer.from(data as Buffer) });
+    },
+    rm: async (filePath) => {
+      removed.push(String(filePath));
+    },
+  });
+
+  const taskWithImage: TaskAssignFrame = {
+    ...assignWithOpenAICompat('what is this?', {
+      tools: SAMPLE_TOOLS,
+      tool_choice: 'auto',
+    }),
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [
+        { kind: 'text', text: 'what is this?' },
+        { kind: 'file', file: { mimeType: 'image/png', bytes: Buffer.from('png').toString('base64') } },
+      ],
+      metadata: {
+        [OPENAI_COMPAT_EXTENSION_URI]: {
+          tools: SAMPLE_TOOLS,
+          tool_choice: 'auto',
+        },
+      },
+    },
+  };
+
+  await backend.handle(taskWithImage, collect().emit, NEVER);
+
+  // mkdtemp ran exactly once (the image path); the instructions file
+  // landed in the same dir so cleanup is a single rm.
+  assert.equal(mkdtempCalls, 1);
+  const paths = written.map((w) => w.path);
+  assert.ok(paths.includes('/tmp/vicoop-codex-mix/image-1.png'));
+  assert.ok(paths.includes('/tmp/vicoop-codex-mix/instructions.md'));
+  // Only one rm — for the shared dir.
+  assert.deepEqual(removed, ['/tmp/vicoop-codex-mix']);
+});
+
+test('instructions write failure emits task.fail and cleans the freshly-minted temp dir', async () => {
+  // Mirror the image write-failure path: the file the operator could see
+  // referenced in the failure message is the system prompt one. The
+  // instructions temp dir was minted just for this run, so it must be
+  // cleaned even though the child never spawned.
+  let spawned = 0;
+  const removed: string[] = [];
+  const backend = createCodexBackend({
+    spawn: () => {
+      spawned++;
+      throw new Error('should not spawn');
+    },
+    mkdtemp: async () => '/tmp/vicoop-codex-instr-fail',
+    writeFile: async () => {
+      throw new Error('disk full');
+    },
+    rm: async (filePath) => {
+      removed.push(String(filePath));
+    },
+  });
+
+  const { emit, frames } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('go', { tools: SAMPLE_TOOLS, tool_choice: 'auto' }),
+    emit,
+    NEVER,
+  );
+
+  assert.equal(spawned, 0);
+  assert.deepEqual(removed, ['/tmp/vicoop-codex-instr-fail']);
+  const fail = frames[0] as Extract<UpFrame, { type: 'task.fail' }>;
+  assert.equal(fail.type, 'task.fail');
+  assert.equal(fail.error.code, 'input_file_write_failed');
+  assert.match(fail.error.message, /failed to materialize codex instructions/);
+  assert.match(fail.error.message, /disk full/);
+});
+
+test('agent_message envelope JSON becomes a data-part artifact tagged with the extension URI', async () => {
+  const envelope = {
+    tool_calls: [
+      { id: 'call_abc', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
+    ],
+  };
+  const fake = scriptedSpawn([
+    [
+      JSON.stringify({ type: 'thread.started', thread_id: 't1' }),
+      JSON.stringify({
+        type: 'item.completed',
+        item: { type: 'agent_message', text: JSON.stringify(envelope) },
+      }),
+    ],
+  ]);
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    mkdtemp: async () => '/tmp/vicoop-codex-env',
+    writeFile: async () => {},
+    rm: async () => {},
+  });
+
+  const { emit, frames } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('what is the weather in Seoul?', { tools: SAMPLE_TOOLS }),
+    emit,
+    NEVER,
+  );
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  assert.equal(artifacts.length, 1);
+  const part = artifacts[0].artifact.parts[0];
+  assert.equal(part.kind, 'data');
+  if (part.kind !== 'data') throw new Error('expected data part');
+  assert.deepEqual(part.data, envelope);
+  // Tagged so downstream gateways can route on the extension.
+  assert.deepEqual(artifacts[0].artifact.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+});
+
+test('extension off: a coincidental {"tool_calls":[...]} agent_message stays a text artifact', async () => {
+  // No metadata → no envelope contract is in force, so a model emitting
+  // JSON-shaped text by coincidence MUST NOT be routed as a tool call.
+  // Guards against false positives polluting natural-language tasks.
+  const coincidental = JSON.stringify({ tool_calls: [] });
+  const fake = scriptedSpawn([
+    [
+      JSON.stringify({
+        type: 'item.completed',
+        item: { type: 'agent_message', text: coincidental },
+      }),
+    ],
+  ]);
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('hi'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  assert.equal(artifacts.length, 1);
+  assert.equal(artifacts[0].artifact.parts[0].kind, 'text');
+  assert.equal(textOf(artifacts[0]), coincidental);
+  assert.equal(artifacts[0].artifact.extensions, undefined);
+});
+
+test('extension on but the model answered in prose → text artifact, no extension tag', async () => {
+  // The extension being active does not mean every turn is a tool turn:
+  // tool_choice="auto" lets the model answer naturally. Non-envelope text
+  // must still flow through as a text artifact and must NOT carry the
+  // extension URI tag, which would mis-claim a data-part contract.
+  const fake = scriptedSpawn([
+    [
+      JSON.stringify({
+        type: 'item.completed',
+        item: { type: 'agent_message', text: 'No tool needed; the answer is 42.' },
+      }),
+    ],
+  ]);
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    mkdtemp: async () => '/tmp/vicoop-codex-prose',
+    writeFile: async () => {},
+    rm: async () => {},
+  });
+  const { emit, frames } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('hi', { tools: SAMPLE_TOOLS, tool_choice: 'auto' }),
+    emit,
+    NEVER,
+  );
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  assert.equal(artifacts.length, 1);
+  assert.equal(textOf(artifacts[0]), 'No tool needed; the answer is 42.');
+  assert.equal(artifacts[0].artifact.extensions, undefined);
+});
+
+test('tool_choice="none" writes a no-envelope directive to the instructions file', async () => {
+  const fake = scriptedSpawn([
+    [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } })],
+  ]);
+  const written: Array<{ path: string; data: Buffer }> = [];
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    mkdtemp: async () => '/tmp/vicoop-codex-none',
+    writeFile: async (filePath, data) => {
+      written.push({ path: String(filePath), data: Buffer.from(data as Buffer) });
+    },
+    rm: async () => {},
+  });
+
+  await backend.handle(
+    assignWithOpenAICompat('hi', {
+      tools: SAMPLE_TOOLS,
+      tool_choice: 'none',
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  assert.equal(written.length, 1);
+  const body = written[0].data.toString('utf8');
+  // The envelope contract block is suppressed under tool_choice="none";
+  // an explicit "do not emit" directive replaces it so the gateway's
+  // intent (no tool calls this turn) is preserved.
+  assert.doesNotMatch(body, /"tool_calls":\[\{"id":"call_<unique>"/);
+  assert.match(body, /tool_choice="none"/);
 });
