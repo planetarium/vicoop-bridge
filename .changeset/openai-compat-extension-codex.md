@@ -1,0 +1,7 @@
+---
+"@vicoop-bridge/client": minor
+---
+
+Implement the A2A [openai-compat/v1 extension](https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1) on the `codex` backend, mirroring the contract added for `claude` in #152. When an inbound `Message.metadata` carries the extension key, the client lifts `system` / `tools` / `tool_choice` out of the payload and materialises them to a per-task instructions file pointed at by `-c model_instructions_file="<path>"` (codex 0.130+; `experimental_instructions_file` is deprecated). The file teaches the spawned `codex` to emit a `{"tool_calls":[{"id":"call_…","function":{"name":"…","arguments":{…}}}]}` envelope when it decides to call a function. Envelope replies are detected on every `agent_message` and surfaced as an A2A `data` part artifact (`extensions: ["…/openai-compat/v1"]`) so the upstream OpenAI-compatible gateway can forward them verbatim as `tool_calls`; non-envelope turns continue to stream as text artifacts.
+
+The instructions file co-locates with the existing per-task image temp dir when one is present, or a freshly-minted one otherwise — a single cleanup path drains both. Write failures emit `task.fail` with code `input_file_write_failed`. The `codex` agent card now advertises the extension URI under `capabilities.extensions[]`, so cooperating gateways can discover the capability from a card fetch. Tasks that do not carry the extension metadata key are unchanged — no instructions file, no envelope detection, no argv injection.
