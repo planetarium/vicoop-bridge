@@ -199,7 +199,7 @@ curl -s -X POST http://localhost:8787/agents/echo-agent \
 ```
 
 > Working from a published client bundle instead of source? Swap `$CLI`
-> for `"$INSTALL_DIR/bin/vicoop-client"` (the path
+> for `"$INSTALL_DIR/vicoop-client"` (the path
 > [`docs/install-client.md`](./install-client.md) sets up). The
 > subcommands are identical.
 

@@ -6,6 +6,8 @@ on:
       - '.github/workflows/client-ci.yml'
       - 'packages/client/**'
       - 'packages/protocol/**'
+      - 'scripts/**'
+      - 'install.sh'
       - 'pnpm-lock.yaml'
       - 'package.json'
   push:
@@ -14,8 +16,11 @@ on:
       - '.github/workflows/client-ci.yml'
       - 'packages/client/**'
       - 'packages/protocol/**'
+      - 'scripts/**'
+      - 'install.sh'
       - 'pnpm-lock.yaml'
       - 'package.json'
+  workflow_dispatch: {}
 
 jobs:
   validate:
@@ -36,6 +41,14 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      # Mirrors the version pinned in release.yml so the cross-compile
+      # dry-run below exercises the exact same toolchain that publishes
+      # release assets.
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.20
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -50,3 +63,28 @@ jobs:
 
       - name: Build client
         run: pnpm --filter @vicoop-bridge/client build
+
+      # Cross-compile dry-run: produces every per-platform release binary
+      # (macOS arm64/x64, Linux arm64/x64, Windows x64) plus its .sha256
+      # sidecar into dist-release/, without uploading anything. Catches
+      # regressions in scripts/package-client-release.sh, the bun
+      # cross-compile matrix, and any code path that breaks under
+      # `bun build --compile` (e.g. unembeddable native modules) before
+      # the release workflow has to discover it on `main`. Whichever tag
+      # we feed only affects the asset filename — the build artefacts
+      # themselves are version-agnostic for this check.
+      - name: Cross-compile release binaries (dry-run)
+        run: |
+          CLIENT_VERSION="$(node -p "require('./packages/client/package.json').version")"
+          ./scripts/package-client-release.sh "@vicoop-bridge/client@${CLIENT_VERSION}"
+
+      - name: Sanity-check Linux x64 binary
+        run: |
+          CLIENT_VERSION="$(node -p "require('./packages/client/package.json').version")"
+          BIN="dist-release/vicoop-client-${CLIENT_VERSION}-linux-x64"
+          GOT="$("$BIN" --version)"
+          if [[ "$GOT" != "$CLIENT_VERSION" ]]; then
+            echo "::error::compiled binary reported '$GOT', expected '$CLIENT_VERSION'"
+            exit 1
+          fi
+          echo "linux-x64 binary --version: $GOT"

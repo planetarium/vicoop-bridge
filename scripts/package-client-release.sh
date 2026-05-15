@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Cross-compile per-platform vicoop-client binaries + sha256 sidecars into
+# dist-release/. Idempotent: re-running rebuilds everything.
+#
+# Usage: scripts/package-client-release.sh <tag>
+#
+# The asset filename convention must stay in lock-step with
+# packages/client/src/upgrade.ts (resolvePlatformAsset + assetName) and
+# install.sh — both rely on `vicoop-client-<version>-<slug>[.exe]` and a
+# sibling `.sha256` whose first whitespace-separated token is the hash.
+
 if [[ $# -ne 1 ]]; then
   echo "usage: $0 <tag>" >&2
   exit 1
@@ -9,90 +19,79 @@ fi
 TAG="$1"
 TAG_PREFIX="@vicoop-bridge/client@"
 
-# Caller passes the full tag (upload-client-release-assets.sh does this)
-# so the README and archive name agree on the version. Fail fast if it doesn't
-# carry the expected prefix or if the stripped version has anything that
-# could path-traverse / inject shell metacharacters into BUNDLE_DIR or
-# ARCHIVE_PATH below.
 case "$TAG" in
   "$TAG_PREFIX"*) ;;
   *) echo "error: TAG must start with $TAG_PREFIX (got: $TAG)" >&2; exit 1 ;;
 esac
 VERSION="${TAG#$TAG_PREFIX}"
-# Mirrors packages/client/src/upgrade.ts's TAG_RE: first char must be
-# alphanumeric (no ".x" or "-x"), remaining chars limited to
-# [A-Za-z0-9.+-], and no consecutive dots.
+# Mirrors packages/client/src/upgrade.ts's TAG_RE: first char alphanumeric,
+# remaining chars [A-Za-z0-9.+-], no `..`. The version portion gets
+# interpolated into the output filename, so reject anything that could
+# path-traverse before it reaches the filesystem.
 case "$VERSION" in
   ''|[!A-Za-z0-9]*|*[!A-Za-z0-9.+-]*|*..*)
     echo "error: version portion contains unsafe characters: $VERSION" >&2
     exit 1
     ;;
 esac
+
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="$ROOT_DIR/dist-release"
-WORK_DIR="$OUT_DIR/work"
-BUNDLE_DIR="$WORK_DIR/vicoop-bridge-client-$VERSION"
-ARCHIVE_PATH="$OUT_DIR/vicoop-bridge-client-$VERSION.tgz"
-CHECKSUM_PATH="$ARCHIVE_PATH.sha256"
 
-if [[ ! -f "$ROOT_DIR/packages/client/dist/cli.js" ]]; then
-  echo "error: packages/client/dist/cli.js missing — run 'pnpm --filter @vicoop-bridge/protocol --filter @vicoop-bridge/client build' first" >&2
+# Bun resolves `@vicoop-bridge/protocol` via the workspace package's
+# `exports.import` (dist/index.js), so the protocol package must be built
+# before we compile the client. Tsc-building the client itself is no
+# longer required — `bun build --compile` reads src/cli.ts directly.
+pnpm --dir "$ROOT_DIR" --filter @vicoop-bridge/protocol build
+
+rm -rf "$OUT_DIR"
+mkdir -p "$OUT_DIR"
+
+CLIENT_DIR="$ROOT_DIR/packages/client"
+
+# (bun-target, asset-slug, file-extension) — keep this table identical to
+# resolvePlatformAsset() in upgrade.ts. Anything added here also needs a
+# matching branch there, otherwise `vicoop-client upgrade` will fail to
+# look up the asset on that platform.
+TARGETS=(
+  "bun-darwin-arm64 macos-arm64 "
+  "bun-darwin-x64   macos-x64   "
+  "bun-linux-arm64  linux-arm64 "
+  "bun-linux-x64    linux-x64   "
+  "bun-windows-x64  windows-x64 .exe"
+)
+
+# sha256 tool selection mirrors install.sh's logic so a build host without
+# GNU coreutils (e.g. a Mac dev box) still produces the same checksum file
+# shape (<hash>  <filename>).
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA_CMD="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+  SHA_CMD="shasum -a 256"
+else
+  echo "error: need sha256sum or shasum on PATH" >&2
   exit 1
 fi
 
-rm -rf "$WORK_DIR" "$ARCHIVE_PATH" "$CHECKSUM_PATH"
-mkdir -p "$WORK_DIR"
+for entry in "${TARGETS[@]}"; do
+  # shellcheck disable=SC2206  # split on whitespace intentionally
+  parts=( $entry )
+  target="${parts[0]}"
+  slug="${parts[1]}"
+  ext="${parts[2]:-}"
+  asset="vicoop-client-${VERSION}-${slug}${ext}"
 
-pnpm --dir "$ROOT_DIR" --filter @vicoop-bridge/client deploy --prod "$BUNDLE_DIR"
-mkdir -p "$BUNDLE_DIR/bin"
+  echo "==> building $target -> $asset"
+  ( cd "$CLIENT_DIR" && bun build --compile --target="$target" src/cli.ts --outfile "$OUT_DIR/$asset" )
+  chmod +x "$OUT_DIR/$asset"
 
-cat > "$BUNDLE_DIR/bin/vicoop-client" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
+  # Write the checksum file with a *bare filename*, not the absolute build
+  # path, so `sha256sum -c` works in install.sh's $TMP_DIR without
+  # rewriting. The cd-before-shasum keeps the path bare.
+  ( cd "$OUT_DIR" && $SHA_CMD "$asset" > "$asset.sha256" )
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec node -- "$SCRIPT_DIR/../dist/cli.js" "$@"
-EOF
+  echo "    $(ls -lh "$OUT_DIR/$asset" | awk '{print $5}')  $(cat "$OUT_DIR/$asset.sha256")"
+done
 
-chmod +x "$BUNDLE_DIR/bin/vicoop-client"
-
-cat > "$BUNDLE_DIR/README.md" <<EOF
-# vicoop-bridge-client $VERSION
-
-Portable release bundle for the standalone client daemon.
-
-## Quick start
-
-\`\`\`bash
-AGENT_ID=my-agent
-
-# 1. Sign in as the client owner (saves an owner-session bearer to
-#    ~/.vicoop/owner-session.json; admin subcommands pick it up).
-#    --bridge defaults to https://vicoop-bridge-server.fly.dev; pass
-#    --bridge https://your-bridge if you self-host.
-./bin/vicoop-client login
-
-# 2. Register a bridge client. setup writes the one-time CLIENT_TOKEN
-#    plus server_url / agent_id into the canonical ~/.vicoop/config.json
-#    (mode 600). The daemon picks those up on its next launch.
-./bin/vicoop-client setup \\
-  --client-name "my client" \\
-  --agent-ids "\$AGENT_ID"
-
-# 3. Start the daemon. With config.json populated, the only thing left
-#    to choose is the backend (echo / openclaw / claude / codex).
-./bin/vicoop-client --backend openclaw
-\`\`\`
-
-## Notes
-
-- This bundle is built from the Git tag \`$TAG\`.
-- Node.js 20 or newer is required.
-- The \`bin/vicoop-client\` wrapper runs \`node dist/cli.js\` for convenience.
-EOF
-
-tar -C "$WORK_DIR" -czf "$ARCHIVE_PATH" "vicoop-bridge-client-$VERSION"
-shasum -a 256 "$ARCHIVE_PATH" > "$CHECKSUM_PATH"
-
-echo "created $ARCHIVE_PATH"
-echo "created $CHECKSUM_PATH"
+echo
+echo "built $(ls "$OUT_DIR" | wc -l | tr -d ' ') files in $OUT_DIR"

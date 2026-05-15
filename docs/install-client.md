@@ -29,8 +29,14 @@ one-liner fetching a published `@vicoop-bridge/client@*` bundle). Contrast with:
 
 ## Prerequisites
 
-- Node.js 20 or newer (`node -v`).
-- `curl`, `tar`, and one of `sha256sum` / `shasum`.
+- `curl` and one of `sha256sum` / `shasum`. `jq` is also required when
+  `install.sh` resolves the latest release for you (skip-able by pinning
+  `VERSION` to the exact tag).
+- The released client is a self-contained native binary — **no Node.js
+  runtime on the host**. Supported platforms: macOS arm64/x64, Linux
+  arm64/x64. Windows operators: a PowerShell installer is tracked in
+  issue #188; in the meantime download `vicoop-client-<version>-windows-x64.exe`
+  from the release page by hand and skip Step 1.
 - A reachable bridge URL. The public deployment is
   `https://vicoop-bridge-server.fly.dev`; substitute your own below if you
   run the server yourself.
@@ -53,10 +59,11 @@ one-liner fetching a published `@vicoop-bridge/client@*` bundle). Contrast with:
 - For the Codex backend specifically: the local `codex` CLI installed and
   authenticated (`codex --version` should succeed).
 
-## Step 1 — Install the client bundle
+## Step 1 — Install the client binary
 
-The one-liner downloads the latest `@vicoop-bridge/client@*` release, verifies
-its `.sha256`, and extracts into `$INSTALL_DIR`:
+The one-liner detects your OS/arch, downloads the matching
+`vicoop-client-<version>-<os>-<arch>[.exe]` asset, verifies its `.sha256`,
+and installs it as `$INSTALL_DIR/vicoop-client`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/planetarium/vicoop-bridge/main/install.sh \
@@ -70,26 +77,26 @@ would still default to `/data/vicoop-bridge-client`.
 | Env | Default | Purpose |
 |---|---|---|
 | `INSTALL_DIR` | `/data/vicoop-bridge-client` | Target directory. Pick a writable path on a volume that survives restarts. |
-| `VERSION` | latest `@vicoop-bridge/client@*` | Pin a specific tag, e.g. `@vicoop-bridge/client@0.1.1`. |
+| `VERSION` | latest `@vicoop-bridge/client@*` | Pin a specific tag, e.g. `@vicoop-bridge/client@0.1.1`. With `VERSION` set, `jq` is no longer required. |
 | `FORCE` | `0` | If `1`, overwrite a non-empty `INSTALL_DIR`. |
 
-What you get after extraction:
+What you get after install:
 
 ```
 $INSTALL_DIR/
-├── bin/vicoop-client        # bash wrapper that execs node dist/cli.js
-├── dist/                    # compiled JS
-├── cards/openclaw.json      # OpenClaw example card
-├── cards/claude.json        # Claude Code example card
-├── cards/codex.json         # Codex CLI example card
-├── cards/echo.json          # Echo test card
-├── node_modules/            # pruned prod deps
-└── package.json
+└── vicoop-client        # self-contained native binary (Bun --compile)
 ```
 
-The script targets Linux (Fly.io persistent volumes are the original target
-deployment); on macOS it prints a warning and proceeds. See #17 / #21 for
-background.
+The released binary embeds everything the daemon needs — there are no
+sidecar files. Operator-managed state (`~/.vicoop/config.json`,
+`~/.vicoop/owner-session.json`, any operator-authored agent cards) lives
+outside `$INSTALL_DIR` so the upgrade flow can replace the binary without
+touching it.
+
+On macOS, `install.sh` strips the `com.apple.quarantine` xattr right after
+the download so first launch isn't Gatekeeper-blocked. Developer ID
+signing + notarization are planned (issue #188 follow-up); until then this
+keeps `curl | sh` a true one-liner.
 
 > The installer no longer generates an always-on service unit. The design
 > for unattended operation (systemd, launchd, etc.) is still in flux —
@@ -100,7 +107,7 @@ background.
 
 If `$INSTALL_DIR` already existed before Step 1, `install.sh` refuses to
 overwrite it unless you pass `FORCE=1`. That's intentional: an existing
-directory may contain a working client, saved env file, or an older bundle
+directory may contain a working client binary or operator-authored files
 you don't want clobbered by accident.
 
 If you do want to replace a non-empty install directory, rerun Step 1 with
@@ -119,15 +126,11 @@ Before continuing, verify that the installed bundle is recent enough to
 include the `login` command used in Step 4:
 
 ```sh
-"$INSTALL_DIR/bin/vicoop-client" -v
-"$INSTALL_DIR/bin/vicoop-client" login --help
+"$INSTALL_DIR/vicoop-client" -v
+"$INSTALL_DIR/vicoop-client" login --help
 ```
 
-If `login --help` prints usage, you're on a current bundle. If it instead
-fails with the daemon usage (`--server`, `--token`, `--agentId`, `--backend`)
-or doesn't recognize `login`, you're still on an older pre-device-flow
-release and should reinstall into a fresh directory or rerun Step 1 with
-`FORCE=1`.
+If `login --help` prints usage, you're on a current binary and can move on.
 
 ## Step 3 — Pick an agent id
 
@@ -171,9 +174,9 @@ required.
 HOSTNAME=$(hostname)
 CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
 
-"$INSTALL_DIR/bin/vicoop-client" login
+"$INSTALL_DIR/vicoop-client" login
 
-"$INSTALL_DIR/bin/vicoop-client" setup \
+"$INSTALL_DIR/vicoop-client" setup \
   --client-name "$CLIENT_NAME" \
   --agent-ids "$AGENT_ID" \
   --caller "eth:0x<40-hex>"
@@ -311,7 +314,7 @@ want to compose with shell tooling (no disk side effects, raw response on
 stdout):
 
 ```sh
-"$INSTALL_DIR/bin/vicoop-client" setup \
+"$INSTALL_DIR/vicoop-client" setup \
   --client-name "$CLIENT_NAME" \
   --agent-ids "$AGENT_ID" \
   --caller "eth:0x<40-hex>" --json \
@@ -366,11 +369,15 @@ server publishes the canonical card for that backend at
 metadata/capability fixes on the faster server deploy path instead of
 requiring every operator to upgrade their client bundle.
 
-The bundle still ships backend-specific starter cards under
-`$INSTALL_DIR/cards/` (`openclaw.json`, `claude.json`, `codex.json`, `echo.json`) for
-operator overrides and compatibility with older bridge servers. Pass
-`--card <path>` (or set `AGENT_CARD` / `"card"` in `config.json`) only
-when you intentionally want to override the server card, for example to:
+Starter cards for the built-in backends (`openclaw.json`, `claude.json`,
+`codex.json`, `echo.json`) live in the source tree under
+[`packages/client/cards/`](https://github.com/planetarium/vicoop-bridge/tree/main/packages/client/cards) —
+download whichever one you want to base an override on. The native binary
+itself doesn't ship them on disk (the bridge already publishes the
+canonical card per backend, and the daemon only reads cards from disk when
+you explicitly pass `--card`). Pass `--card <path>` (or set `"card"` in
+`config.json`) only when you intentionally want to override the server
+card, for example to:
 
 - Rename `name` to something meaningful (it defaults to `openclaw`).
 - Tighten `description` to what this specific instance actually does.
@@ -382,13 +389,17 @@ that `vicoop-client whoami` prints — see ["Check your agent's mention /
 acct"](#check-your-agents-mention--acct-any-backend) in Step 6.
 
 Schema reference: `packages/protocol/src/index.ts` (`AgentCard` Zod schema,
-validated by the client at startup when `--card` / `AGENT_CARD` is set —
-invalid cards exit with a Zod error).
+validated by the client at startup when `--card` is set — invalid cards
+exit with a Zod error).
 
-For custom backends, write a fresh card:
+For custom backends, write a fresh card anywhere on disk and point
+`--card` (or `"card"` in `config.json`) at it. The single-file binary
+keeps `$INSTALL_DIR` clean for upgrades, so the conventional spot is
+under your vicoop config dir, e.g. `~/.vicoop/cards/my-agent.json`:
 
 ```sh
-cat > "$INSTALL_DIR/cards/my-agent.json" <<'JSON'
+mkdir -p ~/.vicoop/cards
+cat > ~/.vicoop/cards/my-agent.json <<'JSON'
 {
   "name": "my-agent",
   "description": "...",
@@ -411,14 +422,14 @@ the daemon picks up `server_url`, `server_token`, and `agent_id` on its own;
 pick the backend with `--backend`:
 
 ```sh
-"$INSTALL_DIR/bin/vicoop-client" --backend openclaw
+"$INSTALL_DIR/vicoop-client" --backend openclaw
 ```
 
 Precedence at startup is **CLI flag > `--config <path>` > canonical
 `config.json` > built-in default**. Env vars are not consulted for
 runtime config (#189 §5). With `"backend": "openclaw"` persisted in
 `config.json`, the daemon needs no flags at all:
-`"$INSTALL_DIR/bin/vicoop-client"`.
+`"$INSTALL_DIR/vicoop-client"`.
 
 On success you'll see a `[client] connected, sending hello` log followed
 by an identity block — same data `vicoop-client whoami` would print, so
@@ -500,7 +511,7 @@ For the Claude backend, pass `--backend claude` (or persist
 different repository than the one `vicoop-client` itself runs in:
 
 ```sh
-"$INSTALL_DIR/bin/vicoop-client" \
+"$INSTALL_DIR/vicoop-client" \
   --backend claude \
   --claude-cwd "$HOME/vicoop-bridge"
 ```
@@ -508,7 +519,7 @@ different repository than the one `vicoop-client` itself runs in:
 Both knobs can also live in the canonical `config.json` (resolved per Step
 4 — `~/.vicoop/config.json` by default) under `backends.claude`
 (`cwd`, `settings`) so the foreground command shrinks to just
-`"$INSTALL_DIR/bin/vicoop-client"`; the flag wins over config, mirroring
+`"$INSTALL_DIR/vicoop-client"`; the flag wins over config, mirroring
 the daemon-level precedence (Step 6 intro).
 
 | Flag | `backends.claude.*` |
@@ -553,7 +564,7 @@ identifier external callers will see for this agent — the WebFinger acct, the
 `@<agentId>@<host>` mention, the JSON-RPC endpoint, and the agent-card URL.
 
 ```sh
-"$INSTALL_DIR/bin/vicoop-client" whoami
+"$INSTALL_DIR/vicoop-client" whoami
 # agentId:    my-agent
 # host:       bridge.example.com
 # mention:    @my-agent@bridge.example.com
@@ -575,11 +586,11 @@ Typical follow-ups from this output:
 2. **Confirm which card the bridge advertises.** `curl` the `a2a card` URL —
    that's the canonical card external callers receive, which is the
    server-published default for the selected backend unless you pass
-   `--card <path>` (or set `AGENT_CARD`) to override it (see Step 5). If the
+   `--card <path>` (or `"card"` in `config.json`) to override it (see Step 5). If the
    response doesn't match what you expect, that's the cue to override.
 
    ```sh
-   CARD_URL=$("$INSTALL_DIR/bin/vicoop-client" whoami --json | jq -r .a2aCardUrl)
+   CARD_URL=$("$INSTALL_DIR/vicoop-client" whoami --json | jq -r .a2aCardUrl)
    curl -sf "$CARD_URL" | jq .
    ```
 3. **Verify WebFinger actually resolves the acct.** `whoami --verify`
@@ -598,7 +609,7 @@ For the Codex backend, pass `--backend codex` (or persist
 different repository / loosen the sandbox:
 
 ```sh
-"$INSTALL_DIR/bin/vicoop-client" \
+"$INSTALL_DIR/vicoop-client" \
   --backend codex \
   --codex-cwd "$HOME/vicoop-bridge" \
   --codex-sandbox workspace-write
@@ -606,7 +617,7 @@ different repository / loosen the sandbox:
 
 Both knobs can also live in the canonical `config.json` (resolved per Step
 4 — `~/.vicoop/config.json` by default) under `backends.codex` so the
-foreground command can shrink to just `"$INSTALL_DIR/bin/vicoop-client"`.
+foreground command can shrink to just `"$INSTALL_DIR/vicoop-client"`.
 The flag wins over config.
 
 | Flag | `backends.codex.*` |
@@ -653,26 +664,26 @@ scope (`is_admin()`) is wallet-only and gates only the cross-owner tools.
 
 ### Option A: `vicoop-client` subcommands (recommended for scripts)
 
-These subcommands require **bundle version 0.8.0 or newer**. Older
-installs only know the daemon flags; check before using and upgrade if
-needed:
+Check that you're on a current release before using the admin subcommands
+below — `upgrade --check` reports the live version against the latest
+published release:
 
 ```sh
-"$INSTALL_DIR/bin/vicoop-client" -v
-"$INSTALL_DIR/bin/vicoop-client" upgrade --check   # report latest vs current
-"$INSTALL_DIR/bin/vicoop-client" upgrade           # upgrade in place if behind
+"$INSTALL_DIR/vicoop-client" -v
+"$INSTALL_DIR/vicoop-client" upgrade --check   # report latest vs current
+"$INSTALL_DIR/vicoop-client" upgrade           # upgrade in place if behind
 ```
 
 ```sh
 # Step 4 login saves the owner-session bearer, so these work without re-authenticating:
-"$INSTALL_DIR/bin/vicoop-client" setup \
+"$INSTALL_DIR/vicoop-client" setup \
   --client-name "$CLIENT_NAME" \
   --agent-ids "$AGENT_ID" \
   --caller "eth:0x<40-hex>"
-"$INSTALL_DIR/bin/vicoop-client" list-agents
-"$INSTALL_DIR/bin/vicoop-client" list-callers "$AGENT_ID" --json
-"$INSTALL_DIR/bin/vicoop-client" add-caller "$AGENT_ID" "eth:0x<40-hex>"
-"$INSTALL_DIR/bin/vicoop-client" remove-caller "$AGENT_ID" "google:email:caller@example.com"
+"$INSTALL_DIR/vicoop-client" list-agents
+"$INSTALL_DIR/vicoop-client" list-callers "$AGENT_ID" --json
+"$INSTALL_DIR/vicoop-client" add-caller "$AGENT_ID" "eth:0x<40-hex>"
+"$INSTALL_DIR/vicoop-client" remove-caller "$AGENT_ID" "google:email:caller@example.com"
 
 # Pass --json for machine-readable output, or --bridge / --token to override
 # the saved session for one call. VICOOP_BRIDGE / VICOOP_OWNER_TOKEN env vars
@@ -686,7 +697,7 @@ that `login` writes alongside it). If the saved bearer is missing or expired,
 refresh it without registering a new client:
 
 ```sh
-"$INSTALL_DIR/bin/vicoop-client" login
+"$INSTALL_DIR/vicoop-client" login
 ```
 
 (Self-hosting? Pass `--bridge https://<your-bridge>`.)
@@ -716,51 +727,53 @@ restart needed.
 ## Updating the client
 
 Once installed, the client updates itself — do not re-run `install.sh`. The
-installer's `FORCE=1` path is destructive (it `rm -rf`s `$INSTALL_DIR` and
-wipes any operator-added cards / files), so it's reserved for bootstrapping.
+installer's `FORCE=1` path is destructive (it `rm -rf`s `$INSTALL_DIR`) and
+is reserved for bootstrapping.
 
 ```sh
-"$INSTALL_DIR/bin/vicoop-client" upgrade --check      # report latest vs current
-"$INSTALL_DIR/bin/vicoop-client" upgrade              # upgrade to latest @vicoop-bridge/client@*
-"$INSTALL_DIR/bin/vicoop-client" upgrade --version 0.2.0   # pin / downgrade (bare version, v0.2.0, or @vicoop-bridge/client@0.2.0 all accepted)
-"$INSTALL_DIR/bin/vicoop-client" upgrade --force      # reinstall the resolved target even if already on it
+"$INSTALL_DIR/vicoop-client" upgrade --check      # report latest vs current
+"$INSTALL_DIR/vicoop-client" upgrade              # upgrade to latest @vicoop-bridge/client@*
+"$INSTALL_DIR/vicoop-client" upgrade --version 0.2.0   # pin / downgrade (bare version, v0.2.0, or @vicoop-bridge/client@0.2.0 all accepted)
+"$INSTALL_DIR/vicoop-client" upgrade --force      # reinstall the resolved target even if already on it
 ```
 
 The upgrade command:
 
 1. Queries GitHub releases for the latest `@vicoop-bridge/client@*` tag (or
-   the `--version` you pin).
-2. Downloads `.tgz` + `.sha256` to a temp directory and verifies the checksum.
-3. Extracts into `$INSTALL_DIR.new/` (sibling of the current install).
-4. Copies operator files that don't ship with the bundle — notably any
-   `cards/*.json` you added or files placed directly under `$INSTALL_DIR`.
-   Shipped cards (`openclaw.json`, `echo.json`, `claude.json`, `codex.json`) are kept for
-   optional overrides and older server compatibility; they are always
-   replaced with the new release's versions.
-5. Runs `node $INSTALL_DIR.new/dist/cli.js --version` as a healthcheck. If it
-   exits non-zero or reports the wrong version, `$INSTALL_DIR.new` is deleted
-   and the upgrade aborts with no change to the live install.
-6. Atomically swaps: `$INSTALL_DIR` → `$INSTALL_DIR.prev`,
-   `$INSTALL_DIR.new` → `$INSTALL_DIR`. A failure mid-swap restores the
-   original.
-7. Keeps `$INSTALL_DIR.prev` around for manual rollback (`mv` it back into
-   place if needed). Delete it once you've confirmed the new version works.
+   the `--version` you pin) and resolves the per-platform asset name from
+   `process.platform` / `process.arch` (must match this host).
+2. Downloads `vicoop-client-<version>-<os>-<arch>[.exe]` + its `.sha256`
+   into `$INSTALL_DIR` as `vicoop-client.new`, verifies the checksum, and
+   chmods +x.
+3. Runs `$INSTALL_DIR/vicoop-client.new --version` as a healthcheck. If it
+   exits non-zero or reports the wrong version, `.new` is deleted and the
+   upgrade aborts with no change to the live binary.
+4. Atomically swaps: `$INSTALL_DIR/vicoop-client` → `vicoop-client.prev`,
+   `vicoop-client.new` → `vicoop-client`. A failure mid-swap restores the
+   original. On unix the running daemon keeps executing from the unlinked
+   inode — the file swap is safe under load (see "Manual restart" below).
+5. Keeps `vicoop-client.prev` around for manual rollback (`mv` it back over
+   `vicoop-client` if needed). Delete it once the new version is proven.
 
 **Permissions**: for a system-scope install (root-owned `$INSTALL_DIR`),
 run the upgrade via `sudo`. The command checks write access up front and
 fails fast with a clear error otherwise.
 
-**Operator-owned state is not touched by `upgrade`.** That covers
-`~/.vicoop/config.json` (the canonical daemon config — Step 4) and
-`~/.vicoop/owner-session.json` (the owner bearer — `login`). `FORCE=1`
-deletes everything under `$INSTALL_DIR` first — back up any operator-added
-cards or files before running it.
+**Operator-owned state is not touched by `upgrade`.** The binary swap
+only ever moves three filenames inside `$INSTALL_DIR` (`vicoop-client`,
+`vicoop-client.new`, `vicoop-client.prev`). Anything else you've left
+under `$INSTALL_DIR` (operator-authored cards, notes, scratch files) is
+preserved automatically. Outside `$INSTALL_DIR`, your canonical
+`~/.vicoop/config.json` (Step 4) and `~/.vicoop/owner-session.json`
+(`login`) are out of scope for upgrades entirely. `FORCE=1` on
+`install.sh` deletes everything under `$INSTALL_DIR` first — back up any
+operator-added files before running it.
 
 **Manual restart after upgrade.** The atomic swap leaves your running
 client process attached to the previous bundle. Stop it and start it again
 with your usual command (foreground / screen / tmux) so the new version
 takes effect — `upgrade` cannot signal a process it didn't start. To check
-for stragglers, run `pgrep -fl 'vicoop-client|dist/cli\.js'` and kill any
+for stragglers, run `pgrep -fl vicoop-client` and kill any
 old process before starting the new one. Multiple client processes
 connecting with the **same `SERVER_TOKEN`** for one `AGENT_ID` collide and
 the older WS is closed with code 4009 (harmless but noisy); see the Gotchas
@@ -855,7 +868,7 @@ Both subcommands use the same owner-session bearer as `add-caller` /
   No token rotation needed.
 - **Different backends**: in the published bundle today, pass
   `--backend openclaw`, `--backend claude`, `--backend codex`, or `--backend echo`. Set
-  `--card`/`AGENT_CARD` only when you need to override the server's
+  `--card` (or `"card"` in `config.json`) only when you need to override the server's
   canonical card. Custom/future backends are still described in
   `docs/design.md` §5 but are not shipped yet.
 - **Audit/revoke access**: the admin agent exposes `list_caller_tokens`,

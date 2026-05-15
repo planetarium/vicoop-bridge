@@ -37,6 +37,15 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      # Bun cross-compiles the per-platform vicoop-client binaries from a
+      # single Linux runner via `bun build --compile --target=…`. The
+      # asset-upload step (scripts/package-client-release.sh) invokes it;
+      # changesets/action above only needs Node.
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.20
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 

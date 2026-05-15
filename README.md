@@ -20,7 +20,8 @@ the client include a changeset describing the change; merging them keeps a
 single "Version Packages" PR up to date with the resulting version + changelog
 entry. Merging that Version PR triggers
 [`.github/workflows/release.yml`](./.github/workflows/release.yml), which
-builds the portable bundle and publishes the `@vicoop-bridge/client@<version>`
+cross-compiles per-platform native binaries (macOS/Linux/Windows) with Bun
+and publishes them as assets on the `@vicoop-bridge/client@<version>`
 GitHub release.
 
 Day-to-day flow for contributors:
@@ -42,8 +43,10 @@ Before merging a Version Packages PR, verify that
 bundle being released:
 
 - shipped backends listed in the doc match `packages/client/src/cli.ts`
-- bundled example cards listed in the doc match `packages/client/cards/`
 - backend-specific launch examples still reflect the released client behavior
+- the asset filename matrix in `scripts/package-client-release.sh` and
+  `install.sh`'s platform-detect block still agree with
+  `resolvePlatformAsset()` in `packages/client/src/upgrade.ts`
 
 ## Status
 
