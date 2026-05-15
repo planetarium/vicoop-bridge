@@ -41,8 +41,12 @@ flag forms are the leading examples — Step 6 backend recipes are now
 ship flag-keyed knob tables, and the public-bridge examples no longer
 export `BRIDGE_URL`. Self-hosting overrides are collected in one place.
 
+`vicoop-client --help` (and `help`) now prints **grouped daemon-mode
+help** (#189 §3): Identity / Connection / Backend selection /
+Backend-specific (Claude / Codex / OpenClaw), with a precedence-chain
+footer. Error-path output keeps the short single-line `usage:` form so
+test assertions on `/usage: vicoop-client/` continue to match.
+
 Out of scope for this PoC and tracked separately: removing env vars from
-the runtime config precedence chain (#189 §5), the `install.sh` systemd
-unit rewrite (#189 §5 / AC#6). Help text is preserved verbatim so
-existing operator habits and test assertions keep working — moving to
-optique's auto-generated, grouped `--help` output is a follow-up.
+the runtime config precedence chain (#189 §5) and the `install.sh`
+systemd unit rewrite (#189 §5 / AC#6).
