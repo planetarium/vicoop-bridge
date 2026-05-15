@@ -58,7 +58,6 @@ function usage(): void {
       'Flags:',
       `  --bridge          Bridge HTTP URL (default ${DEFAULT_BRIDGE_HTTPS_URL};`,
       '                    override only when running your own bridge).',
-      '  --owner-session   Accepted for compatibility; login always issues owner-session.',
       '  --json            Print the token endpoint response as JSON to stdout',
       '                    without persisting ~/.vicoop/owner-session.json.',
       '',
@@ -69,9 +68,6 @@ function usage(): void {
 const loginParser = object({
   bridge: optional(option('--bridge', string({ metavar: 'URL' }))),
   json: withDefault(flag('--json'), false),
-  // `--owner-session` is accepted for backward compatibility — login always
-  // issues an owner-session bearer. The flag is parsed and ignored.
-  _ownerSession: withDefault(flag('--owner-session'), false),
   // `--poll-once` is a test/CI smoke flag, undocumented in usage.
   pollOnce: withDefault(flag('--poll-once'), false),
 });

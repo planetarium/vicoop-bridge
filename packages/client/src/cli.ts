@@ -263,6 +263,13 @@ function runClient(argv: string[]): void {
     ? AgentCard.parse(JSON.parse(readFileSync(args.card, 'utf8')))
     : undefined;
 
+  // Emit the resolved backend at startup so operators can verify which
+  // backend the precedence chain picked (flag vs. config vs. default
+  // 'echo'). Without this the only signal is downstream behavior —
+  // operators reading boot logs to diagnose "wrong backend ran" can't
+  // tell whether parsing landed where they expected.
+  console.log(`[client] backend: ${args.backend}`);
+
   const client = new Client({
     serverUrl: args.server,
     token: args.token,
