@@ -308,8 +308,17 @@ async function main(): Promise<void> {
     programName: 'vicoop-client',
     brief: message`A2A bridge client daemon. Connects a local backend (echo, openclaw, claude, codex) to a deployed vicoop-bridge server.`,
     footer: message`Precedence: CLI flag > --config <path> > canonical config.json > built-in default. Env vars are not consulted for runtime config (config-location vars like VICOOP_HOME / XDG_CONFIG_HOME / HOME are honored separately). See docs/install-client.md for the full operator guide.`,
-    help: 'both',
-    version: clientVersion,
+    // Both `--help`/`-h` and the `help` subcommand. The explicit `names`
+    // list enables the `-h` short alias optique doesn't register by
+    // default. Same for `--version`/`-v`.
+    help: {
+      command: true,
+      option: { names: ['--help', '-h'] },
+    },
+    version: {
+      value: clientVersion,
+      option: { names: ['--version', '-v'] },
+    },
     aboveError: 'usage',
   });
 
