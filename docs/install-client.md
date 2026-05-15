@@ -71,8 +71,6 @@ would still default to `/data/vicoop-bridge-client`.
 | `INSTALL_DIR` | `/data/vicoop-bridge-client` | Target directory. Pick a writable path on a volume that survives restarts. |
 | `VERSION` | latest `@vicoop-bridge/client@*` | Pin a specific tag, e.g. `@vicoop-bridge/client@0.1.1`. |
 | `FORCE` | `0` | If `1`, overwrite a non-empty `INSTALL_DIR`. |
-| `INSTALL_SKIP_SERVICE` | `0` | If `1`, skip the optional systemd unit + env template even on systemd hosts. |
-| `INSTALL_SERVICE_SCOPE` | `auto` | Force `user`, `system`, or `none` instead of auto-detecting by `id -u`. `system` requires root; an explicit `system` without root is refused with a warning. |
 
 What you get after extraction:
 
@@ -92,13 +90,10 @@ The script targets Linux (Fly.io persistent volumes are the original target
 deployment); on macOS it prints a warning and proceeds. See #17 / #21 for
 background.
 
-When systemd is the host init, `install.sh` may also write an optional
-`vicoop-client.service` unit plus a `vicoop-client.env` template (scope
-auto-detected: `system` as root, `user` otherwise). It does not enable or
-start the service. Use the foreground run in Step 6 first; enable the service
-later only if this host should keep the client online unattended. Opt out with
-`INSTALL_SKIP_SERVICE=1`, or force a scope with
-`INSTALL_SERVICE_SCOPE=user|system|none`.
+> The installer no longer generates an always-on service unit. The design
+> for unattended operation (systemd, launchd, etc.) is still in flux —
+> issue #186 tracks the rework. For now the supported entrypoint is the
+> foreground run in Step 6.
 
 ## Step 2 — Verify the installed bundle
 
@@ -195,7 +190,7 @@ like:
 The CLIENT_TOKEN is one-time — the bridge cannot reissue it.
   setup persists it to the canonical config below; --json prints it to
   stdout instead. Back up that file before rotating hosts.
-  To also stash it in a systemd EnvironmentFile, pass --write-env-file
+  To also stash it in a shell-sourceable env file, pass --write-env-file
   on this same setup invocation — rerunning setup later would call
   registerClient again and mint a NEW CLIENT_TOKEN, invalidating this
   one. To populate an env file from an already-issued token, copy
@@ -256,7 +251,7 @@ The schema also accepts a top-level `card` mirroring the `--card` flag /
 canonical card per backend — see Step 5).
 
 Daemon precedence is **CLI flag > env var > `--config <path>` > canonical
-`config.json`**, so env values still win (handy for systemd `EnvironmentFile=`
+`config.json`**, so env values still win (handy for shell-sourced env files
 or CI overrides). `setup` only ever touches `server_url`, `server_token`, and
 `agent_id` — hand-edits to the other fields survive `setup` re-runs.
 
@@ -318,7 +313,7 @@ token.
    that bearer, receives `{client_id, client_token, owner_principal,
    allowed_agent_ids}`, and writes the daemon credentials into
    `~/.vicoop/config.json` (mode 600). With `--write-env-file <path>` it
-   additionally emits a systemd-shaped env file at that path. It never
+   additionally emits a shell-sourceable env file at that path. It never
    sees a `vbc_caller_*` token.
 
 This means a Google-only operator can stand up a bridge client without
@@ -696,10 +691,7 @@ The upgrade command:
 6. Atomically swaps: `$INSTALL_DIR` → `$INSTALL_DIR.prev`,
    `$INSTALL_DIR.new` → `$INSTALL_DIR`. A failure mid-swap restores the
    original.
-7. Detects a matching `vicoop-client.service` unit (system or user scope) and
-   runs `systemctl [--user] try-restart vicoop-client.service`. If no unit
-   exists, prints a reminder to restart the client yourself.
-8. Keeps `$INSTALL_DIR.prev` around for manual rollback (`mv` it back into
+7. Keeps `$INSTALL_DIR.prev` around for manual rollback (`mv` it back into
    place if needed). Delete it once you've confirmed the new version works.
 
 **Permissions**: for a system-scope install (root-owned `$INSTALL_DIR`),
@@ -707,20 +699,17 @@ run the upgrade via `sudo`. The command checks write access up front and
 fails fast with a clear error otherwise.
 
 **Operator-owned state is not touched by `upgrade`.** That covers
-`~/.vicoop/config.json` (the canonical daemon config — Step 4),
-`~/.vicoop/owner-session.json` (the owner bearer — `login`), and
-`/etc/vicoop-client.env` plus the systemd unit file (written by
-`install.sh` only). If a release ever changes the unit layout, re-run
-`install.sh` once to refresh the scaffolding. Note that `FORCE=1` deletes
-everything under `$INSTALL_DIR` first — back up any operator-added cards or
-files before running it.
+`~/.vicoop/config.json` (the canonical daemon config — Step 4) and
+`~/.vicoop/owner-session.json` (the owner bearer — `login`). `FORCE=1`
+deletes everything under `$INSTALL_DIR` first — back up any operator-added
+cards or files before running it.
 
-**Manual restart on non-systemd hosts.** The atomic swap leaves your running
+**Manual restart after upgrade.** The atomic swap leaves your running
 client process attached to the previous bundle. Stop it and start it again
-with your usual command (foreground / screen / tmux / launchd) so the new
-version takes effect — `upgrade` cannot signal a process it didn't start.
-To check for stragglers, run `pgrep -fl 'vicoop-client|dist/cli\.js'` and kill
-any old process before starting the new one. Multiple client processes
+with your usual command (foreground / screen / tmux) so the new version
+takes effect — `upgrade` cannot signal a process it didn't start. To check
+for stragglers, run `pgrep -fl 'vicoop-client|dist/cli\.js'` and kill any
+old process before starting the new one. Multiple client processes
 connecting with the **same `SERVER_TOKEN`** for one `AGENT_ID` collide and
 the older WS is closed with code 4009 (harmless but noisy); see the Gotchas
 section of `docs/local-testing.md` for the same note.

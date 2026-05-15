@@ -281,18 +281,10 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
     safeRemove(dlDir);
   }
 
-  const unit = detectSystemdUnit();
-  if (unit) {
-    log(`restarting systemd unit (${unit.scope} scope)`);
-    if (!tryRestartSystemd(unit.scope)) {
-      err('systemctl try-restart failed; restart the service manually');
-    }
-  } else {
-    log(
-      'no systemd unit detected — your running client (if any) keeps the previous bundle ' +
-        'until you stop it and start it again with your usual command',
-    );
-  }
+  log(
+    'a running client (if any) keeps the previous bundle in memory until ' +
+      'you stop it and start it again with your usual command',
+  );
 
   log(`upgraded ${clientVersion} -> ${targetVersion}`);
   log(`previous install kept at ${prevDir} (delete when satisfied)`);
@@ -502,44 +494,6 @@ function runHealthcheck(newDir: string, expected: string): HealthcheckResult {
     return { ok: false, detail: `reported '${got}', expected '${expected}'` };
   }
   return { ok: true };
-}
-
-function detectSystemdUnit(): { scope: 'system' | 'user' } | null {
-  if (existsSync('/etc/systemd/system/vicoop-client.service')) return { scope: 'system' };
-  const home = process.env.HOME;
-  if (home) {
-    // `||` rather than `??` so an empty `XDG_CONFIG_HOME=` (common
-    // accidental mis-export, and what shells treat as unset via
-    // `${XDG_CONFIG_HOME:-...}`) falls back to $HOME/.config instead of
-    // turning the path relative.
-    const userCfg = process.env.XDG_CONFIG_HOME || join(home, '.config');
-    if (existsSync(join(userCfg, 'systemd', 'user', 'vicoop-client.service'))) {
-      return { scope: 'user' };
-    }
-  }
-  return null;
-}
-
-function tryRestartSystemd(scope: 'system' | 'user'): boolean {
-  const args = scope === 'user'
-    ? ['--user', 'try-restart', 'vicoop-client.service']
-    : ['try-restart', 'vicoop-client.service'];
-  const r = spawnSync('systemctl', args, { stdio: 'inherit' });
-  if (r.error) {
-    const code = (r.error as NodeJS.ErrnoException).code;
-    const hint = code === 'ENOENT' ? ' (systemctl not on PATH)' : '';
-    err(`systemctl spawn failed${hint}: ${r.error.message}`);
-    return false;
-  }
-  if (r.signal) {
-    err(`systemctl terminated by signal ${r.signal}`);
-    return false;
-  }
-  if (r.status !== 0) {
-    err(`systemctl try-restart exited with status ${r.status}`);
-    return false;
-  }
-  return true;
 }
 
 // Recursively clear the setuid (04000) and setgid (02000) bits on every file
