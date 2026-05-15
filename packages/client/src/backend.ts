@@ -23,4 +23,13 @@ export interface Backend {
   // version support). Returning `{}` — or throwing — leaves the card's
   // declared capabilities unchanged.
   resolveCapabilities?(): Promise<DetectedCapabilities>;
+  // Optional process-wide cleanup invoked from `Client.stop()` before the
+  // daemon exits. Per-task cancellation already flows through `signal` in
+  // `handle()`, but long-lived upstream resources held across tasks (e.g.
+  // codex's `app-server` subprocess) would otherwise leak as orphaned
+  // children when the daemon receives SIGINT/SIGTERM. Must be synchronous
+  // and best-effort — callers do not await it before `process.exit`, so
+  // implementations should send a kill signal / close a socket and return
+  // immediately rather than wait for graceful shutdown.
+  stop?(): void;
 }

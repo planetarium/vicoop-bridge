@@ -410,6 +410,36 @@ test('first task runs initialize + thread/start + turn/start and emits agent art
   assert.equal(last?.type === 'task.complete' && last.status.state, 'completed');
 });
 
+test('backend.stop() sends SIGTERM to the long-lived app-server child (#186)', async () => {
+  // Daemon shutdown path: Client.stop() forwards to Backend.stop(), which
+  // the codex backend uses to tear down the singleton `codex app-server`
+  // process. Without this signal the child is re-parented to init after
+  // the daemon exits and leaks (see issue #186, macOS report). Verify a
+  // SIGTERM is dispatched to the active child, and that calling stop()
+  // before any task has spawned a child is a safe no-op (the codex
+  // backend lazily spawns on the first task).
+  const fake = makeFakeSpawn(() => happyPath({ agentMessageText: 'OK' }));
+  const backend = createCodexBackend({ spawn: fake.spawn });
+
+  // No child yet — stop must not throw.
+  assert.doesNotThrow(() => backend.stop?.());
+  assert.equal(fake.children.length, 0);
+
+  // Run one task to materialize the singleton child, then stop.
+  const { emit } = collect();
+  await backend.handle(assign('hello'), emit, NEVER);
+  assert.equal(fake.children.length, 1);
+  const child = fake.lastChild();
+  assert.equal(child.killed, false, 'child must be alive before stop');
+
+  backend.stop?.();
+  assert.equal(child.killed, true, 'stop must kill the app-server child');
+  assert.equal(child.killSignal, 'SIGTERM');
+
+  // Idempotent: a second stop after the child has closed must not throw.
+  assert.doesNotThrow(() => backend.stop?.());
+});
+
 test('follow-up task with same contextId uses thread/resume not thread/start', async () => {
   const fake = makeFakeSpawn(() => happyPath({ threadId: 'thr-1' }));
   const backend = createCodexBackend({ spawn: fake.spawn });

@@ -501,6 +501,18 @@ export function createCodexBackend(
   return {
     name: 'codex',
 
+    // Daemon shutdown hook. Per-task abort flows through `signal` in
+    // `handle()`, but the `codex app-server` subprocess is a singleton kept
+    // alive across tasks via `ensureClient()` — without an explicit kill on
+    // SIGINT/SIGTERM it would be re-parented to init and linger after the
+    // daemon exits (issue #186). Best-effort SIGTERM; the OS delivers it
+    // before `process.exit` runs even though we don't await the close.
+    stop(): void {
+      if (rpcClient && !rpcClient.isClosed()) {
+        rpcClient.kill('SIGTERM');
+      }
+    },
+
     async handle(task, rawEmit, signal) {
       let lastEmitAt = now();
       const recorder = createTimingRecorder({

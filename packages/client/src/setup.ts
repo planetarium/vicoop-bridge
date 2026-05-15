@@ -1,8 +1,7 @@
 // `vicoop-client setup` — create a bridge client token using an existing
 // owner-session bearer, then persist the daemon credentials to the canonical
 // `config.json`. `--write-env-file` remains as an opt-in for operators who
-// want a systemd `EnvironmentFile=` (or shell-sourceable file) alongside the
-// canonical config — see #137.
+// want a shell-sourceable env file alongside the canonical config — see #137.
 
 import { existsSync } from 'node:fs';
 import { atomicWriteFile, resolveOwnerSession } from './owner-session.js';
@@ -123,7 +122,7 @@ function shSingleQuote(value: string): string {
 
 // Convert the bridge's HTTP(S) URL to the WebSocket scheme the daemon
 // connects with. Shared by both the canonical config writer and the
-// systemd env-file emitter so the rewrite rule has one source of truth.
+// env-file emitter so the rewrite rule has one source of truth.
 function wsUrlFromBridge(bridgeUrl: string): string {
   return bridgeUrl.replace(/^http(s?):\/\//, (_m, s) => (s === 's' ? 'wss://' : 'ws://'));
 }
@@ -389,7 +388,7 @@ export async function runSetup(args: string[]): Promise<number> {
       'The CLIENT_TOKEN is one-time — the bridge cannot reissue it.\n' +
       '  setup persists it to the canonical config below; --json prints it to\n' +
       '  stdout instead. Back up that file before rotating hosts.\n' +
-      '  To also stash it in a systemd EnvironmentFile, pass --write-env-file\n' +
+      '  To also stash it in a shell-sourceable env file, pass --write-env-file\n' +
       '  on this same setup invocation — rerunning setup later would call\n' +
       '  registerClient again and mint a NEW CLIENT_TOKEN, invalidating this\n' +
       '  one. To populate an env file from an already-issued token, copy\n' +
@@ -423,7 +422,7 @@ export async function runSetup(args: string[]): Promise<number> {
     return 1;
   }
 
-  // Optional env-file emission for systemd `EnvironmentFile=`. Errors here
+  // Optional env-file emission (shell-sourceable). Errors here
   // are NOT recovery situations: the token is already safe in canonical
   // config.json. Surface a targeted warning that tells the operator how
   // to populate the env file by hand without rotating the token (rerunning

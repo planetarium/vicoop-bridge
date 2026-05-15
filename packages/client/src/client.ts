@@ -127,6 +127,16 @@ export class Client {
     // running to completion after the WS is gone.
     for (const controller of this.inflight.values()) controller.abort();
     this.ws?.close();
+    // Tear down long-lived backend resources (e.g. codex app-server child).
+    // Per-task abort above covers per-handle subprocesses; this hook is for
+    // upstreams the backend keeps across tasks. Best-effort and synchronous
+    // so callers can `process.exit` on the next line — errors from a buggy
+    // backend cleanup must not block daemon shutdown.
+    try {
+      this.opts.backend.stop?.();
+    } catch (err) {
+      this.logger.warn(`backend stop threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private resolveEffectiveCard(): Promise<AgentCard | undefined> {
