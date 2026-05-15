@@ -372,7 +372,13 @@ test('first task runs initialize + thread/start + turn/start and emits agent art
 
   // Sent frames must include initialize → initialized (notif) → thread/start → turn/start.
   const sent = child.stdinFrames();
-  assert.ok(findRequest(sent, 'initialize'), 'initialize sent');
+  const initReq = findRequest(sent, 'initialize') as
+    | { params?: { capabilities?: { experimentalApi?: boolean } } }
+    | undefined;
+  assert.ok(initReq, 'initialize sent');
+  // experimentalApi opt-in is required for `thread/start.environments` (#183).
+  // Send it unconditionally so the codex app-server accepts our env clamp.
+  assert.equal(initReq.params?.capabilities?.experimentalApi, true);
   const init = sent.find((f) => (f as { method?: string }).method === 'initialized') as
     | Record<string, unknown>
     | undefined;

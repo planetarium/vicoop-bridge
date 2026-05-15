@@ -465,6 +465,15 @@ export function createCodexBackend(
             title: 'vicoop-bridge client',
             version: '1',
           },
+          // `experimentalApi: true` is required to send
+          // `thread/start.environments` — the wholesale lever we use to
+          // remove codex's built-in execution surfaces under openai-compat
+          // dispatch (#183). Codex's app-server rejects the request with
+          // `thread/start.environments requires experimentalApi capability`
+          // otherwise. Opt-in is documented as the public stable handshake
+          // for accessing gated fields; individual fields graduate
+          // independently so this opt-in remains safe across upgrades.
+          capabilities: { experimentalApi: true },
         };
         const result = await withTimeout(
           c.request<InitializeResult>('initialize', initParams),
