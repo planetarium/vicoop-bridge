@@ -622,6 +622,13 @@ export interface OpenclawBackendOptions {
    */
   discoverGatewayUrls?: () => Promise<string[]>;
   /**
+   * Process name to look for during port discovery. Optional override on
+   * the default `openclaw` substring — used by operators running the
+   * gateway under a renamed binary, or by tests pinning to a fixture.
+   * Was previously the `OPENCLAW_PROCESS_NAME` env var.
+   */
+  discoveryProcessName?: string;
+  /**
    * Enable agent->caller file delivery. When set, assistant messages are
    * scanned for `[bridge-attach: <path>]` markers and matching files
    * (under `allowedRoots`, bounded by `maxBytes`) are emitted as A2A
@@ -862,19 +869,15 @@ function isLoopbackUrl(u: string): boolean {
 
 function resolveTimeout(
   explicit: number | undefined,
-  envName: string,
   fallback: number,
   label: string,
 ): number {
-  const envRaw = process.env[envName];
-  const envNum = envRaw !== undefined ? Number(envRaw) : undefined;
-  const requested = explicit ?? envNum;
-  if (requested === undefined) return fallback;
-  if (!Number.isFinite(requested) || requested <= 0) {
-    console.warn(`[openclaw] invalid ${label} "${requested}", falling back to ${fallback}ms`);
+  if (explicit === undefined) return fallback;
+  if (!Number.isFinite(explicit) || explicit <= 0) {
+    console.warn(`[openclaw] invalid ${label} "${explicit}", falling back to ${fallback}ms`);
     return fallback;
   }
-  return requested;
+  return explicit;
 }
 
 export function createOpenclawBackend(
@@ -888,34 +891,32 @@ export function createOpenclawBackend(
    */
   getSendFileMcpServer(): SendFileMcpServer | null;
 } {
-  const url = opts.url ?? process.env.OPENCLAW_GATEWAY_URL ?? 'ws://127.0.0.1:18789';
-  const token = opts.token ?? process.env.OPENCLAW_GATEWAY_TOKEN;
-  const agent = opts.agent ?? process.env.OPENCLAW_AGENT ?? 'main';
-  // Optional secondary agent name dedicated to openai-compat tasks. See the
-  // doc comment on `OpenclawBackendOptions.openaiCompatAgent` for the
+  // All knobs come exclusively from `opts` (the daemon pre-merges flag +
+  // config.json in cli-args.ts/mergeClientArgs). Issue #189 §5: no env in
+  // the runtime config chain.
+  const url = opts.url ?? 'ws://127.0.0.1:18789';
+  const token = opts.token;
+  const agent = opts.agent ?? 'main';
+  // Optional secondary agent name dedicated to openai-compat tasks. See
+  // the doc comment on `OpenclawBackendOptions.openaiCompatAgent` for the
   // operator-side OpenClaw config (agents.list + tools.deny=["*"]) this
-  // pairs with. Trim + treat-empty-as-unset across env / opts so an
-  // install.sh-style env template with the key present-but-blank doesn't
-  // shadow a populated config.json. When unresolved, all tasks route to
-  // `agent`.
-  const openaiCompatAgentRaw =
-    opts.openaiCompatAgent ?? process.env.OPENCLAW_OAI_COMPAT_AGENT;
+  // pairs with. Trim + treat-empty-as-unset so a blank value from config
+  // doesn't shadow the single-agent default; when unresolved, all tasks
+  // route to `agent`.
   const openaiCompatAgent =
-    typeof openaiCompatAgentRaw === 'string' && openaiCompatAgentRaw.trim().length > 0
-      ? openaiCompatAgentRaw.trim()
+    typeof opts.openaiCompatAgent === 'string' && opts.openaiCompatAgent.trim().length > 0
+      ? opts.openaiCompatAgent.trim()
       : undefined;
-  const thinking = opts.thinking ?? process.env.OPENCLAW_THINKING;
+  const thinking = opts.thinking;
   const sessionPrefix = opts.sessionKeyPrefix ?? 'agent';
-  const debug = opts.debug ?? process.env.OPENCLAW_DEBUG === '1';
+  const debug = opts.debug ?? false;
   const taskTimeoutMs = resolveTimeout(
     opts.taskTimeoutMs,
-    'OPENCLAW_TASK_TIMEOUT_MS',
     DEFAULT_TASK_TIMEOUT_MS,
     'taskTimeoutMs',
   );
   const handshakeTimeoutMs = resolveTimeout(
     opts.handshakeTimeoutMs,
-    'OPENCLAW_HANDSHAKE_TIMEOUT_MS',
     DEFAULT_HANDSHAKE_TIMEOUT_MS,
     'handshakeTimeoutMs',
   );
@@ -1047,7 +1048,7 @@ export function createOpenclawBackend(
 
   let resolvedUrl = url;
   const discoveryProcessName =
-    process.env.OPENCLAW_PROCESS_NAME ?? DEFAULT_DISCOVERY_PROCESS_NAME;
+    opts.discoveryProcessName ?? DEFAULT_DISCOVERY_PROCESS_NAME;
   const discover =
     opts.discoverGatewayUrls ??
     (() => discoverLocalGatewayUrls(discoveryProcessName, resolvedUrl));

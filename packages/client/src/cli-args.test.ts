@@ -3,10 +3,10 @@ import test from 'node:test';
 import { DEFAULT_BRIDGE_URL, mergeClientArgs, parseFlags } from './cli-args.js';
 import type { ClientConfig } from './config.js';
 
-// mergeClientArgs is the pure precedence layer: CLI flags > env > config.
-// Tests here cover only the merge — the IO-heavy loader (parseClientArgs)
-// resolves the config file path on disk and is covered indirectly by
-// setup.test.ts + config.test.ts.
+// mergeClientArgs is the pure precedence layer: CLI flags > config (env
+// is no longer part of the chain — issue #189 §5). The IO-heavy loader
+// (parseClientArgs) resolves the config file path on disk and is covered
+// indirectly by setup.test.ts + config.test.ts.
 
 const CONFIG: ClientConfig = {
   server_url: 'wss://from-config',
@@ -17,14 +17,13 @@ const CONFIG: ClientConfig = {
   backends: { codex: { sandbox_mode: 'read-only' } },
 };
 
-test('CLI flags beat env beat config', () => {
+test('CLI flags beat config', () => {
   const r = mergeClientArgs(
-    { server: 'wss://from-flag', token: 'tok-flag' },
     {
-      SERVER_URL: 'wss://from-env',
-      SERVER_TOKEN: 'tok-env',
-      AGENT_ID: 'agent-env',
-      BACKEND: 'claude',
+      server: 'wss://from-flag',
+      token: 'tok-flag',
+      agentId: 'agent-flag',
+      backend: 'claude',
     },
     CONFIG,
   );
@@ -32,16 +31,14 @@ test('CLI flags beat env beat config', () => {
   if (!r.ok) return;
   assert.equal(r.args.server, 'wss://from-flag');
   assert.equal(r.args.token, 'tok-flag');
-  // No flag for agentId → env wins over config
-  assert.equal(r.args.agentId, 'agent-env');
-  // No flag for backend → env wins over config
+  assert.equal(r.args.agentId, 'agent-flag');
   assert.equal(r.args.backend, 'claude');
-  // backends.* always comes from config (env has no override surface)
+  // backends.* always comes from config (no flag has a place to put it).
   assert.deepEqual(r.args.backends, CONFIG.backends);
 });
 
-test('config fills in fields absent from CLI flags and env', () => {
-  const r = mergeClientArgs({}, {}, CONFIG);
+test('config fills in fields absent from CLI flags', () => {
+  const r = mergeClientArgs({}, CONFIG);
   assert.equal(r.ok, true);
   if (!r.ok) return;
   assert.equal(r.args.server, CONFIG.server_url);
@@ -51,10 +48,9 @@ test('config fills in fields absent from CLI flags and env', () => {
   assert.equal(r.args.card, CONFIG.card);
 });
 
-test('default backend is echo when neither flag, env, nor config sets it', () => {
+test('default backend is echo when neither flag nor config sets it', () => {
   const r = mergeClientArgs(
     { server: 'wss://x', token: 't', agentId: 'a' },
-    {},
     {},
   );
   assert.equal(r.ok, true);
@@ -62,17 +58,17 @@ test('default backend is echo when neither flag, env, nor config sets it', () =>
   assert.equal(r.args.backend, 'echo');
 });
 
-test('server falls back to DEFAULT_BRIDGE_URL when no flag/env/config sets it', () => {
+test('server falls back to DEFAULT_BRIDGE_URL when no flag/config sets it', () => {
   // Issue #189 §6: the public bridge URL is baked in so a fresh install
   // needs zero flags. `server` is therefore never in the missing list.
-  const r = mergeClientArgs({}, { SERVER_TOKEN: 't', AGENT_ID: 'a' }, {});
+  const r = mergeClientArgs({ token: 't', agentId: 'a' }, {});
   assert.equal(r.ok, true);
   if (!r.ok) return;
   assert.equal(r.args.server, DEFAULT_BRIDGE_URL);
 });
 
 test('missing required args reported as a list', () => {
-  const r = mergeClientArgs({}, {}, {});
+  const r = mergeClientArgs({}, {});
   assert.equal(r.ok, false);
   if (r.ok) return;
   // backend defaults to 'echo' and server defaults to DEFAULT_BRIDGE_URL,
@@ -163,54 +159,29 @@ test('parseFlags rejects invalid enum values (--codex-sandbox)', () => {
   assert.match(r.error, /codex-sandbox/);
 });
 
-test('mergeClientArgs trims and treats whitespace-only as unset', () => {
-  // Space-padded values from env or CLI should normalize to clean strings,
-  // and a whitespace-only value should fall through to the next layer —
-  // matching the same trim+drop semantics normalizeConfig applies to the
-  // config layer.
+test('mergeClientArgs trims and treats whitespace-only flag values as unset', () => {
+  // Space-padded values from CLI should normalize to clean strings, and a
+  // whitespace-only value should fall through to the next layer — matching
+  // the same trim+drop semantics normalizeConfig applies to the config
+  // layer.
   const r = mergeClientArgs(
     { server: '  wss://flag-padded  ', card: '   ' },
-    { SERVER_TOKEN: '\ttoken-env\n', AGENT_ID: '   ' },
-    { agent_id: 'agent-from-config', backend: 'claude' },
+    { agent_id: 'agent-from-config', server_token: 't', backend: 'claude' },
   );
   assert.equal(r.ok, true);
   if (!r.ok) return;
   assert.equal(r.args.server, 'wss://flag-padded');
-  assert.equal(r.args.token, 'token-env');
-  // env AGENT_ID is whitespace-only → falls through to config
+  assert.equal(r.args.token, 't');
   assert.equal(r.args.agentId, 'agent-from-config');
-  // card was whitespace-only on both flag and env, and config has none →
-  // resolves to undefined (not empty string).
+  // card was whitespace-only on flag, and config has none → resolves to
+  // undefined (not empty string).
   assert.equal(r.args.card, undefined);
 });
 
-test('empty env values fall through to config', () => {
-  // install.sh ships the env template with empty `SERVER_TOKEN=` for the
-  // operator to fill in. That empty string must not shadow a populated
-  // config.json, otherwise an operator who finished setup via config.json
-  // would suddenly find the daemon missing a token on next start.
-  const r = mergeClientArgs(
-    {},
-    { SERVER_URL: '', SERVER_TOKEN: '', AGENT_ID: '' },
-    {
-      server_url: 'wss://from-config',
-      server_token: 'tok-config',
-      agent_id: 'agent-config',
-    },
-  );
-  assert.equal(r.ok, true);
-  if (!r.ok) return;
-  assert.equal(r.args.server, 'wss://from-config');
-  assert.equal(r.args.token, 'tok-config');
-  assert.equal(r.args.agentId, 'agent-config');
-});
-
-test('CLI backend flag wins over env CLAUDE_CWD via backends merge', () => {
-  // Issue #189 §1: --claude-cwd is now a first-class flag and beats the
-  // env-var fallback CLAUDE_CWD. Config layer wins last.
+test('CLI backend flag wins over config backends.claude.cwd', () => {
+  // Issue #189 §1: --claude-cwd is a first-class flag. Config layer wins last.
   const r = mergeClientArgs(
     { token: 't', agentId: 'a', claudeCwd: '/from-flag' },
-    { CLAUDE_CWD: '/from-env' },
     { backends: { claude: { cwd: '/from-config' } } },
   );
   assert.equal(r.ok, true);
@@ -218,13 +189,55 @@ test('CLI backend flag wins over env CLAUDE_CWD via backends merge', () => {
   assert.equal(r.args.claudeCwd, '/from-flag');
 });
 
-test('env CLAUDE_CWD beats config when no flag is set', () => {
-  const r = mergeClientArgs(
-    { token: 't', agentId: 'a' },
-    { CLAUDE_CWD: '/from-env' },
-    { backends: { claude: { cwd: '/from-config' } } },
-  );
-  assert.equal(r.ok, true);
-  if (!r.ok) return;
-  assert.equal(r.args.claudeCwd, '/from-env');
+test('config backends.claude.cwd is the only fallback (no env)', () => {
+  // Issue #189 §5: env is out of the chain entirely. Setting CLAUDE_CWD
+  // in process.env has no effect here.
+  const previous = process.env.CLAUDE_CWD;
+  process.env.CLAUDE_CWD = '/from-env';
+  try {
+    const r = mergeClientArgs(
+      { token: 't', agentId: 'a' },
+      { backends: { claude: { cwd: '/from-config' } } },
+    );
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    assert.equal(r.args.claudeCwd, '/from-config');
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CWD;
+    else process.env.CLAUDE_CWD = previous;
+  }
+});
+
+test('env vars in the daemon-config chain are ignored entirely (issue #189 §5)', () => {
+  // The old chain consulted SERVER_URL / SERVER_TOKEN / AGENT_ID / BACKEND
+  // / AGENT_CARD between flag and config. With env removed, these vars
+  // must have no effect on the resolved daemon args.
+  const env = {
+    SERVER_URL: 'wss://from-env',
+    SERVER_TOKEN: 'tok-env',
+    AGENT_ID: 'agent-env',
+    BACKEND: 'claude',
+    AGENT_CARD: '/env/card.json',
+  };
+  const previous: Record<string, string | undefined> = {};
+  for (const [k, v] of Object.entries(env)) {
+    previous[k] = process.env[k];
+    process.env[k] = v;
+  }
+  try {
+    const r = mergeClientArgs({}, CONFIG);
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    // Every field should reflect CONFIG, never the env value.
+    assert.equal(r.args.server, CONFIG.server_url);
+    assert.equal(r.args.token, CONFIG.server_token);
+    assert.equal(r.args.agentId, CONFIG.agent_id);
+    assert.equal(r.args.backend, CONFIG.backend);
+    assert.equal(r.args.card, CONFIG.card);
+  } finally {
+    for (const [k, v] of Object.entries(previous)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
 });

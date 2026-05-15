@@ -126,19 +126,31 @@ test('whoami preserves scheme+port for local dev (ws → http, port retained)', 
   );
 });
 
-test('whoami exits 1 with usage when agentId / server are missing', async () => {
-  const prev = { agent: process.env.AGENT_ID, server: process.env.SERVER_URL };
-  delete process.env.AGENT_ID;
-  delete process.env.SERVER_URL;
-  try {
-    const io = makeIO();
-    const result = await runWhoami([], io);
-    assert.equal(result, 1);
-    assert.match(io.readStderr(), /missing required/);
-  } finally {
-    if (prev.agent !== undefined) process.env.AGENT_ID = prev.agent;
-    if (prev.server !== undefined) process.env.SERVER_URL = prev.server;
-  }
+test('whoami exits 1 with usage when agentId / server are missing', async (t) => {
+  // No flags, no config.json — should fail loudly. Pin VICOOP_HOME at an
+  // empty tmpdir so the host's real ~/.vicoop/config.json (which may or
+  // may not exist on the developer machine / CI runner) cannot supply
+  // values and accidentally satisfy the missing-required check.
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-whoami-'));
+  const previousVicoop = process.env.VICOOP_HOME;
+  const previousXdg = process.env.XDG_CONFIG_HOME;
+  process.env.VICOOP_HOME = tmpHome;
+  delete process.env.XDG_CONFIG_HOME;
+  t.after(() => {
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+    if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousXdg;
+    rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  const io = makeIO();
+  const result = await runWhoami([], io);
+  assert.equal(result, 1);
+  assert.match(io.readStderr(), /missing required/);
 });
 
 test('whoami warns and exits 2 when agentId is not a Mentionable local', async () => {

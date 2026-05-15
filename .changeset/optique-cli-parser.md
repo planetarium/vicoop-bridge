@@ -33,6 +33,27 @@ The user-visible behavior changes that land with this:
   now reports the bad value at the parser layer with a list of accepted
   values, rather than exiting later from `parseCodexSandboxMode` in
   `cli.ts`.
+- **Env vars are removed from the runtime config chain entirely**
+  (#189 §5). The daemon no longer reads `SERVER_URL`, `SERVER_TOKEN`,
+  `AGENT_ID`, `BACKEND`, `AGENT_CARD`, `CLAUDE_CWD`,
+  `CLAUDE_SETTINGS_JSON`, `CODEX_CWD`, `CODEX_SANDBOX_MODE`,
+  `OPENCLAW_GATEWAY_URL`, `OPENCLAW_GATEWAY_TOKEN`, `OPENCLAW_AGENT`,
+  `OPENCLAW_OAI_COMPAT_AGENT`, `OPENCLAW_TASK_TIMEOUT_MS`,
+  `OPENCLAW_THINKING`, `OPENCLAW_DEBUG`, or `OPENCLAW_PROCESS_NAME`.
+  `vicoop-client whoami` no longer falls back to `AGENT_ID` /
+  `SERVER_URL` env either — it reads the canonical `config.json`. The
+  resulting precedence is **CLI flag > `--config <path>` > canonical
+  config.json > built-in default**. Operators with env-only setups need
+  to either run `setup` (persists credentials into `config.json`) or
+  pass the equivalent CLI flags. Env vars the client still reads
+  (different category — config *location*, not config *content*):
+  `VICOOP_HOME`, `XDG_CONFIG_HOME`, `HOME` (config-dir resolution),
+  `VICOOP_BRIDGE` / `VICOOP_OWNER_TOKEN` (admin-command owner-session
+  bootstrap), `VICOOP_CLIENT_LOG_LEVEL` (logging diagnostic).
+  `vicoop-client setup --write-env-file` still emits a shell-sourceable
+  file at the path you pass (useful as a credentials audit / scripting
+  hook), but the daemon will no longer consume those env vars on its
+  own — point operators at `--config` or `config.json` instead.
 
 `docs/install-client.md` is updated alongside the parser so the new
 flag forms are the leading examples — Step 6 backend recipes are now
@@ -47,6 +68,8 @@ Backend-specific (Claude / Codex / OpenClaw), with a precedence-chain
 footer. Error-path output keeps the short single-line `usage:` form so
 test assertions on `/usage: vicoop-client/` continue to match.
 
-Out of scope for this PoC and tracked separately: removing env vars from
-the runtime config precedence chain (#189 §5) and the `install.sh`
-systemd unit rewrite (#189 §5 / AC#6).
+The `install.sh` systemd unit rewrite (#189 AC#6) stays deferred to
+**#190** — it depends on the supervisor strategy that #190 will decide
+(Linux systemd vs macOS launchd, auto-install vs operator-installed,
+etc.). #187 already removed the half-built systemd auto-registration;
+reintroducing a Linux-only path here would conflict with that.

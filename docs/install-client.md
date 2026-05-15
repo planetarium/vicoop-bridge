@@ -40,7 +40,7 @@ one-liner fetching a published `@vicoop-bridge/client@*` bundle). Contrast with:
 - A Google account. No wallet, `a2a-wallet`, or seed phrase required.
 - For the OpenClaw backend specifically: an OpenClaw gateway running
   locally at `ws://127.0.0.1:18789` (override via `--openclaw-gateway`
-  / `OPENCLAW_GATEWAY_URL` / `backends.openclaw.gateway_url`).
+  or `backends.openclaw.gateway_url`).
   Streaming (per-message A2A artifact cadence) requires OpenClaw
   **v2026.3.22 or newer** — the `sessions.messages.subscribe` RPC that
   drives it was introduced in that release. On older gateways the client
@@ -255,27 +255,42 @@ omit what you don't need) is:
 }
 ```
 
-The schema also accepts a top-level `card` mirroring the `--card` flag /
-`AGENT_CARD` env var (rarely needed: the bridge already publishes a
-canonical card per backend — see Step 5).
+The schema also accepts a top-level `card` mirroring the `--card` flag
+(rarely needed: the bridge already publishes a canonical card per backend
+— see Step 5).
 
-Daemon precedence is **CLI flag > env var > `--config <path>` > canonical
-`config.json`**, so env values still win (handy for shell-sourced env files
-or CI overrides). `setup` only ever touches `server_url`, `server_token`, and
-`agent_id` — hand-edits to the other fields survive `setup` re-runs.
+Daemon precedence is **CLI flag > `--config <path>` > canonical
+`config.json` > built-in default**. Env vars are not consulted for
+runtime config (#189 §5) — secrets and overrides live in `config.json`
+(mode 600) or in flags. `setup` only ever touches `server_url`,
+`server_token`, and `agent_id` — hand-edits to the other fields survive
+`setup` re-runs.
 
 > **Top-level vs `backends.*` parity.** Every operator-tunable knob is
-> reachable as a CLI flag, an env var, and a `config.json` field — pick
-> whichever surface fits the deployment. Top-level fields (`server_url`,
+> reachable as a CLI flag and as a `config.json` field — pick whichever
+> surface fits the deployment. Top-level fields (`server_url`,
 > `server_token`, `agent_id`, `backend`, `card`) map to `--server`,
-> `--token`, `--agentId`, `--backend`, `--card` (and `SERVER_URL`,
-> `SERVER_TOKEN`, `AGENT_ID`, `BACKEND`, `AGENT_CARD`). Backend-specific
-> fields under `backends.*` map to `--claude-cwd`,
-> `--claude-settings-file`, `--codex-cwd`, `--codex-sandbox`,
-> `--openclaw-gateway`, `--openclaw-gateway-token`, `--openclaw-agent`,
-> `--openclaw-openai-compat-agent`, `--openclaw-task-timeout-ms` (and
-> their `CLAUDE_*` / `CODEX_*` / `OPENCLAW_*` env equivalents — see #189
-> for the rationale behind the flag promotion).
+> `--token`, `--agentId`, `--backend`, `--card`. Backend-specific fields
+> under `backends.*` map to `--claude-cwd`, `--claude-settings-file`,
+> `--codex-cwd`, `--codex-sandbox`, `--openclaw-gateway`,
+> `--openclaw-gateway-token`, `--openclaw-agent`,
+> `--openclaw-openai-compat-agent`, `--openclaw-task-timeout-ms`.
+
+> **Env vars are out of the runtime-config chain.** Past releases also
+> consulted `SERVER_URL` / `SERVER_TOKEN` / `AGENT_ID` / `BACKEND` /
+> `CLAUDE_*` / `CODEX_*` / `OPENCLAW_*` between the flag and config
+> layers. Those reads were removed in this release per #189 §5: env at
+> that position adds no expressive power that `--config <path>` doesn't
+> already provide, but it adds invisible state (shell rc files, CI env
+> bleed, stale exports). Existing operators with env-only setups need to
+> either run `setup` (which persists `server_url` / `server_token` /
+> `agent_id` into `config.json`) or pass the equivalent CLI flags.
+>
+> Env vars the client still reads (different category — they pick *where*
+> config lives, not *what's in* it): `VICOOP_HOME`, `XDG_CONFIG_HOME`,
+> `HOME` (config-dir resolution), `VICOOP_BRIDGE` / `VICOOP_OWNER_TOKEN`
+> (admin-command owner-session bootstrap, same role as `KUBECONFIG`),
+> `VICOOP_CLIENT_LOG_LEVEL` (logging diagnostic).
 
 If you omit `--caller`, `setup` succeeds but prints a warning that the
 agent will be public until you restrict callers:
@@ -334,8 +349,7 @@ ever holding a wallet or seed phrase. Owner is recorded as
 ## Step 5 — Choose a backend and optional agent card
 
 Pick the local backend this client should drive (selected by
-`--backend <name>`, `BACKEND=<name>`, or `"backend": "<name>"` in
-`config.json`):
+`--backend <name>` or `"backend": "<name>"` in `config.json`):
 
 - `openclaw` — OpenClaw gateway (default `ws://127.0.0.1:18789`)
 - `claude` — local Claude Code CLI
@@ -397,10 +411,10 @@ pick the backend with `--backend`:
 "$INSTALL_DIR/bin/vicoop-client" --backend openclaw
 ```
 
-Precedence at startup is **CLI flag > env var > `--config <path>` > canonical
-`config.json` > built-in default**, so the layers compose freely — env values
-still override `config.json` when both set the same key. With `"backend":
-"openclaw"` persisted in `config.json`, the daemon needs no flags at all:
+Precedence at startup is **CLI flag > `--config <path>` > canonical
+`config.json` > built-in default**. Env vars are not consulted for
+runtime config (#189 §5). With `"backend": "openclaw"` persisted in
+`config.json`, the daemon needs no flags at all:
 `"$INSTALL_DIR/bin/vicoop-client"`.
 
 On success you'll see a `[client] connected, sending hello` log followed
@@ -429,17 +443,17 @@ After that:
 
 The OpenClaw backend connects outbound to a local OpenClaw gateway over a
 second WS. Override if yours isn't on the default — each knob takes the
-usual flag > env > `backends.openclaw.*` precedence:
+usual flag > `backends.openclaw.*` precedence:
 
-| Flag | Env | `backends.openclaw.*` | Default |
-|---|---|---|---|
-| `--openclaw-gateway` | `OPENCLAW_GATEWAY_URL` | `gateway_url` | `ws://127.0.0.1:18789` |
-| `--openclaw-gateway-token` | `OPENCLAW_GATEWAY_TOKEN` | `gateway_token` | *(none)* |
-| `--openclaw-agent` | `OPENCLAW_AGENT` | `agent` | `main` |
-| `--openclaw-openai-compat-agent` | `OPENCLAW_OAI_COMPAT_AGENT` | `openai_compat_agent` | *(unset, single-agent mode)* |
-| `--openclaw-task-timeout-ms` | `OPENCLAW_TASK_TIMEOUT_MS` | `task_timeout_ms` | backend default |
+| Flag | `backends.openclaw.*` | Default |
+|---|---|---|
+| `--openclaw-gateway` | `gateway_url` | `ws://127.0.0.1:18789` |
+| `--openclaw-gateway-token` | `gateway_token` | *(none)* |
+| `--openclaw-agent` | `agent` | `main` |
+| `--openclaw-openai-compat-agent` | `openai_compat_agent` | *(unset, single-agent mode)* |
+| `--openclaw-task-timeout-ms` | `task_timeout_ms` | backend default |
 
-`--openclaw-openai-compat-agent` (and its env / config equivalents) names a
+`--openclaw-openai-compat-agent` (and its config equivalent) names a
 secondary OpenClaw agent dedicated to tasks carrying the A2A openai-compat
 extension metadata. When set, the bridge routes those tasks via
 `agent:<this>:<contextId>` sessionKeys; non-extension tasks keep using the
@@ -468,8 +482,7 @@ entry on the OpenClaw side — see the box below.
 >   }
 > }
 > ```
-> Then set `--openclaw-openai-compat-agent oai`
-> (or `OPENCLAW_OAI_COMPAT_AGENT=oai`, or
+> Then set `--openclaw-openai-compat-agent oai` (or
 > `backends.openclaw.openai_compat_agent: "oai"` in `config.json`)
 > on the vicoop-client side. Pilot measurement on
 > `anthropic/claude-sonnet-4-6` saw envelope-contract compliance
@@ -492,15 +505,15 @@ different repository than the one `vicoop-client` itself runs in:
 Both knobs can also live in the canonical `config.json` (resolved per Step
 4 — `~/.vicoop/config.json` by default) under `backends.claude`
 (`cwd`, `settings`) so the foreground command shrinks to just
-`"$INSTALL_DIR/bin/vicoop-client"`; the flag wins over env wins over config,
-mirroring the daemon-level precedence (Step 6 intro).
+`"$INSTALL_DIR/bin/vicoop-client"`; the flag wins over config, mirroring
+the daemon-level precedence (Step 6 intro).
 
-| Flag | Env | `backends.claude.*` |
-|---|---|---|
-| `--claude-cwd` | `CLAUDE_CWD` | `cwd` |
-| `--claude-settings-file` | `CLAUDE_SETTINGS_JSON` (inline JSON) | `settings` (JSON object) |
+| Flag | `backends.claude.*` |
+|---|---|
+| `--claude-cwd` | `cwd` |
+| `--claude-settings-file` | `settings` (JSON object) |
 
-> **Sandbox-on by default.** When neither `CLAUDE_SETTINGS_JSON` nor
+> **Sandbox-on by default.** When neither `--claude-settings-file` nor
 > `backends.claude.settings` is set, the backend forwards
 > `--settings '{"sandbox":{"enabled":true,"failIfUnavailable":true}}'` to every
 > spawned `claude`. The OS-level sandbox (Seatbelt on macOS, bubblewrap on
@@ -510,16 +523,15 @@ mirroring the daemon-level precedence (Step 6 intro).
 > complete `settings` object — it replaces the default entirely. To run
 > without a sandbox, pass `{ "sandbox": { "enabled": false } }`.
 
-`--claude-cwd` (and `CLAUDE_CWD`) defaults to the current working directory
-of the client process. Set it when the released bundle lives outside the
-repository you want Claude to edit.
+`--claude-cwd` defaults to the current working directory of the client
+process. Set it when the released bundle lives outside the repository you
+want Claude to edit.
 
 The Claude backend also injects a small `--append-system-prompt` on every
 spawned `claude` telling it its own A2A mention (`@<agentId>@<host>`) so
 the model recognises self-references in user messages and doesn't try to
 a2a-call its own address (see #128). No configuration required — it's
-derived from `--agentId` / `AGENT_ID` and the host part of `--server` /
-`SERVER_URL`.
+derived from `--agentId` and the host part of `--server`.
 
 > **Note on host derivation.** The injected mention uses the server URL's
 > host (e.g. `wss://bridge.example.com/ws` → `bridge.example.com`). The
@@ -528,8 +540,8 @@ derived from `--agentId` / `AGENT_ID` and the host part of `--server` /
 > a Fly hostname), the model is taught a mention that doesn't match what
 > users see via WebFinger and self-reference detection won't fire. Run
 > `vicoop-client whoami --verify` to confirm the WebFinger lookup actually
-> resolves the agent under the derived host; align `--server` /
-> `SERVER_URL` with `PUBLIC_URL`'s host if it doesn't.
+> resolves the agent under the derived host; align `--server` with
+> `PUBLIC_URL`'s host if it doesn't.
 
 ### Check your agent's mention / acct (any backend)
 
@@ -592,25 +604,24 @@ different repository / loosen the sandbox:
 Both knobs can also live in the canonical `config.json` (resolved per Step
 4 — `~/.vicoop/config.json` by default) under `backends.codex` so the
 foreground command can shrink to just `"$INSTALL_DIR/bin/vicoop-client"`.
-The flag wins over env wins over config.
+The flag wins over config.
 
-| Flag | Env | `backends.codex.*` |
-|---|---|---|
-| `--codex-cwd` | `CODEX_CWD` | `cwd` |
-| `--codex-sandbox` | `CODEX_SANDBOX_MODE` | `sandbox_mode` |
+| Flag | `backends.codex.*` |
+|---|---|
+| `--codex-cwd` | `cwd` |
+| `--codex-sandbox` | `sandbox_mode` |
 
-`--codex-cwd` (and `CODEX_CWD`) defaults to the current working directory
-of the client process. The v1 backend accepts text plus inline image
-`file.bytes` inputs and returns text output. `--codex-sandbox`
-(and `CODEX_SANDBOX_MODE`) is optional and accepts `read-only`,
-`workspace-write`, or `danger-full-access`; the client passes it to Codex
-as `-c sandbox_mode="<mode>"` so the same setting applies to fresh and
-resumed Codex sessions.
+`--codex-cwd` defaults to the current working directory of the client
+process. The v1 backend accepts text plus inline image `file.bytes`
+inputs and returns text output. `--codex-sandbox` is optional and
+accepts `read-only`, `workspace-write`, or `danger-full-access`; the
+client passes it to Codex as `-c sandbox_mode="<mode>"` so the same
+setting applies to fresh and resumed Codex sessions.
 
 > **Sandbox-on by default.** With neither `--codex-sandbox` nor
-> `CODEX_SANDBOX_MODE` nor `backends.codex.sandbox_mode` set, the backend
-> passes `-c sandbox_mode="read-only"` explicitly — the same default Codex
-> CLI applies, but stamped into argv so the posture is visible in `ps` /
+> `backends.codex.sandbox_mode` set, the backend passes
+> `-c sandbox_mode="read-only"` explicitly — the same default Codex CLI
+> applies, but stamped into argv so the posture is visible in `ps` /
 > audit logs and survives any future change to Codex's own default.
 
 > **`cwd` need not be a git repository.** The Codex backend speaks

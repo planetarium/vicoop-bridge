@@ -221,19 +221,26 @@ Next steps (the agent that owns this client should perform these):
      Then follow docs/install-client.md steps 3-6 to pick AGENT_ID, run
      login, choose a backend, and start the client.
 
-  2. Run the client in the foreground (supply config via env or flags).
-     Paths are quoted so the snippet works even when \$INSTALL_DIR contains
-     whitespace:
+  2. Run the client in the foreground. After \`login\` + \`setup\` from
+     docs/install-client.md, the canonical \`~/.vicoop/config.json\`
+     (mode 600) already holds server_url / server_token / agent_id —
+     the daemon needs no further args:
 
-       SERVER_URL=wss://your-server-host \\
-       SERVER_TOKEN=... \\
-       AGENT_ID=... \\
-       BACKEND=openclaw \\
-         "$INSTALL_DIR/bin/vicoop-client"
+       "$INSTALL_DIR/bin/vicoop-client" --backend openclaw
+
+     Or persist \`"backend": "openclaw"\` in config.json and run with no
+     flags at all:
+
+       "$INSTALL_DIR/bin/vicoop-client"
+
+     Backend-specific knobs (CLAUDE_CWD, CODEX_SANDBOX_MODE, OPENCLAW_*)
+     are passed as CLI flags (\`--claude-cwd\`, \`--codex-sandbox\`,
+     \`--openclaw-gateway\`, …) or persisted in \`backends.*\` inside
+     config.json — env vars are no longer consulted for runtime config.
 
      An always-on supervisor story (systemd unit, launchd plist, etc.) is
      not currently provided by this installer; the foreground run above is
-     the supported entrypoint while the design is in flux (issue #186).
+     the supported entrypoint while the design is in flux (issue #190).
 
   Future updates: run \`"$INSTALL_DIR/bin/vicoop-client" upgrade\` — no need
   to re-run this installer. Pass --check to see if a newer release is

@@ -57,7 +57,7 @@ const DAEMON_USAGE =
 const DAEMON_HELP = [
   `usage: ${DAEMON_USAGE}`,
   '',
-  'Identity (required after env / config layers fill in):',
+  'Identity (required after config layer fills in):',
   '  --token <t>             Bridge client token from `vicoop-client setup` / config.json.',
   '  --agentId <id>          Agent id (routing key external callers use).',
   '',
@@ -85,8 +85,8 @@ const DAEMON_HELP = [
   '  --openclaw-openai-compat-agent <n>   Secondary agent for openai-compat-extension tasks.',
   '  --openclaw-task-timeout-ms <ms>      Per-task timeout (positive integer).',
   '',
-  'Precedence: CLI flag > env var > --config <path> > canonical config.json > built-in default.',
-  'Every backend-specific flag has matching env / `backends.<name>.*` config keys (see docs/install-client.md).',
+  'Precedence: CLI flag > --config <path> > canonical config.json > built-in default.',
+  'Every backend-specific flag has a matching `backends.<name>.*` config key (see docs/install-client.md).',
 ].join('\n');
 const SUBCOMMAND_LIST =
   'subcommands: login, setup, upgrade, list-agents, list-callers, add-caller, remove-caller, list-clients, revoke-client, whoami (run any with --help)';
@@ -101,16 +101,17 @@ type CodexSandboxMode =
   | 'workspace-write'
   | 'danger-full-access';
 
-// Precedence (highest wins):
+// Precedence (highest wins) — issue #189 §5 landed: no env layer.
 //   1. CLI flag values
-//   2. env vars (kept for systemd EnvironmentFile= compatibility)
-//   3. `--config <path>` file (overlaid on canonical, per field)
-//   4. canonical config.json at the resolved vicoop dir
-//   5. built-in defaults (DEFAULT_BRIDGE_URL for --server, 'echo' for --backend)
+//   2. `--config <path>` file (overlaid on canonical, per field)
+//   3. canonical config.json at the resolved vicoop dir
+//   4. built-in defaults (DEFAULT_BRIDGE_URL for --server, 'echo' for --backend)
 //
-// Each layer is optional and contributes only the fields it sets, so
-// operators can split state across them — e.g. systemd unit ships server_*
-// via EnvironmentFile while backends.* lives in config.json.
+// Env vars are not consulted for runtime config. The only env still
+// honoured by the client touches config *location* (VICOOP_HOME /
+// XDG_CONFIG_HOME / HOME), admin-bootstrap (VICOOP_BRIDGE /
+// VICOOP_OWNER_TOKEN, owner-session only), and diagnostics
+// (VICOOP_CLIENT_LOG_LEVEL).
 function parseClientArgs(argv: string[]): Args {
   const parsed = parseFlags(argv);
   if (!parsed.ok) {
@@ -126,10 +127,10 @@ function parseClientArgs(argv: string[]): Args {
   //
   // If the canonical file is on disk but readConfig returns null (malformed
   // JSON / not an object), warn loudly. The canonical config is optional
-  // (systemd installs configure everything via EnvironmentFile=) so we
-  // proceed with an empty config; if env / CLI fills the gap the daemon
-  // still starts, but the operator sees the root cause if it doesn't,
-  // instead of being misled by a generic "missing required args" later.
+  // (one-off invocations can supply everything via flags) so we proceed
+  // with an empty config; if CLI flags fill the gap the daemon still
+  // starts, but the operator sees the root cause if it doesn't, instead
+  // of being misled by a generic "missing required args" later.
   const canonicalPath = defaultConfigPath();
   let canonical: ClientConfig = {};
   if (existsSync(canonicalPath)) {
@@ -137,7 +138,7 @@ function parseClientArgs(argv: string[]): Args {
     if (loaded === null) {
       console.warn(
         `[client] ${canonicalPath} exists but is unreadable / not a JSON object; ` +
-          'proceeding with env vars + CLI flags only — fix or move it aside to use the file.',
+          'proceeding with CLI flags only — fix or move it aside to use the file.',
       );
     } else {
       canonical = loaded;
@@ -155,37 +156,13 @@ function parseClientArgs(argv: string[]): Args {
     }
     config = overlayConfig(canonical, explicit);
   }
-  const result = mergeClientArgs(flags, process.env, config);
+  const result = mergeClientArgs(flags, config);
   if (!result.ok) {
     console.error(`missing required args: ${result.missing.join(', ')}`);
     console.error(`usage: ${DAEMON_USAGE}`);
     process.exit(1);
   }
   return result.args;
-}
-
-// Parse `CLAUDE_SETTINGS_JSON` (inline JSON env var) into a settings object.
-// We fail loud on malformed JSON rather than silently dropping it — a syntax
-// error in a sandbox config is exactly the kind of bug an operator wants
-// surfaced at startup, not after the first task already ran with no sandbox
-// at all. The flag equivalent is `--claude-settings-file <path>`, handled
-// separately (reads from disk and JSON-parses there).
-function parseClaudeSettingsEnv(raw: string | undefined): Record<string, unknown> | undefined {
-  const trimmed = raw?.trim();
-  if (!trimmed) return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    console.error(`CLAUDE_SETTINGS_JSON is not valid JSON: ${msg}`);
-    process.exit(1);
-  }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    console.error('CLAUDE_SETTINGS_JSON must be a JSON object');
-    process.exit(1);
-  }
-  return parsed as Record<string, unknown>;
 }
 
 // Read & JSON-parse a `--claude-settings-file <path>` flag value. Parse errors
@@ -257,17 +234,10 @@ function pickBackend(name: string, args: Args): Backend {
     }
     case 'claude': {
       // settings precedence: --claude-settings-file (flag, path on disk) >
-      // CLAUDE_SETTINGS_JSON (env, inline JSON) > backends.claude.settings
-      // (config). The flag wins because operators reach for it explicitly;
-      // the env form is the legacy install-script path.
-      let settings: Record<string, unknown> | undefined;
-      if (args.claudeSettingsFile) {
-        settings = readClaudeSettingsFile(args.claudeSettingsFile);
-      } else {
-        settings =
-          parseClaudeSettingsEnv(process.env.CLAUDE_SETTINGS_JSON) ??
-          backends.claude?.settings;
-      }
+      // backends.claude.settings (config). No env layer (#189 §5).
+      const settings = args.claudeSettingsFile
+        ? readClaudeSettingsFile(args.claudeSettingsFile)
+        : backends.claude?.settings;
       return createClaudeBackend({
         cwd: args.claudeCwd,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,

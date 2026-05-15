@@ -116,100 +116,54 @@ function pickSandbox(v: string | undefined): CodexSandboxMode | undefined {
     : undefined;
 }
 
-// Three-state classifier for OPENCLAW_TASK_TIMEOUT_MS. Returns the parsed
-// positive number when valid, `null` when the env was set but invalid
-// (so callers can warn once and fall through), and `undefined` when unset.
-export function parseTimeoutMsEnv(raw: string | undefined): number | null | undefined {
-  const trimmed = raw?.trim();
-  if (!trimmed) return undefined;
-  const n = Number(trimmed);
-  return Number.isFinite(n) && n > 0 ? n : null;
-}
-
-// Final precedence (highest wins):
+// Final precedence (highest wins) — issue #189 §5 landed:
 //   1. CLI flag values  (parsed by optique above)
-//   2. env vars
-//   3. `--config <path>` overlay  (caller pre-merged into `config`)
-//   4. canonical config.json      (caller pre-merged into `config`)
-//   5. built-in defaults (DEFAULT_BRIDGE_URL for server; 'echo' for backend)
+//   2. `--config <path>` overlay  (caller pre-merged into `config`)
+//   3. canonical config.json      (caller pre-merged into `config`)
+//   4. built-in defaults (DEFAULT_BRIDGE_URL for server; 'echo' for backend)
 //
-// Env vars stay in the chain for systemd EnvironmentFile= compatibility —
-// removing them is issue #189 §5 and is deliberately out of scope for the
-// optique PoC.
+// Env vars are NOT in this chain. Config-location env (VICOOP_HOME /
+// XDG_CONFIG_HOME / HOME) is a separate category and resolved by
+// `defaultConfigPath()` before this function runs. Admin-bootstrap env
+// (VICOOP_BRIDGE / VICOOP_OWNER_TOKEN) is unrelated to the daemon runtime
+// config and lives in owner-session.ts.
+//
 // `flags` is `Partial<DaemonFlags>` so tests can pass `{}` or `{ server }`
 // shorthand. At runtime, `parseFlags()` returns the full shape — every key
 // present with `undefined` for unset flags — but the merge logic reads each
 // field independently and tolerates missing keys.
 export function mergeClientArgs(
   flags: Partial<DaemonFlags>,
-  env: NodeJS.ProcessEnv,
   config: ClientConfig,
 ): { ok: true; args: DaemonArgs } | { ok: false; missing: string[] } {
-  const card =
-    pick(flags.card) || pick(env.AGENT_CARD) || config.card;
+  const card = pick(flags.card) || config.card;
   const backends = config.backends ?? {};
 
-  // OPENCLAW_TASK_TIMEOUT_MS three-state: valid → take it; invalid → null
-  // (caller warns and we leave it undefined so config fallback applies);
-  // unset → undefined.
-  let openclawTaskTimeoutMs: number | undefined;
-  if (flags.openclawTaskTimeoutMs !== undefined) {
-    openclawTaskTimeoutMs = flags.openclawTaskTimeoutMs;
-  } else {
-    const envTimeout = parseTimeoutMsEnv(env.OPENCLAW_TASK_TIMEOUT_MS);
-    if (envTimeout === null) {
-      console.warn(
-        `[client] OPENCLAW_TASK_TIMEOUT_MS=${JSON.stringify(env.OPENCLAW_TASK_TIMEOUT_MS)} is not a positive number; ignoring (using backends.openclaw.task_timeout_ms / default).`,
-      );
-      openclawTaskTimeoutMs = backends.openclaw?.task_timeout_ms;
-    } else if (envTimeout !== undefined) {
-      openclawTaskTimeoutMs = envTimeout;
-    } else {
-      openclawTaskTimeoutMs = backends.openclaw?.task_timeout_ms;
-    }
-  }
-
   const resolved: DaemonArgs = {
-    server:
-      pick(flags.server) ||
-      pick(env.SERVER_URL) ||
-      config.server_url ||
-      DEFAULT_BRIDGE_URL,
-    token: pick(flags.token) || pick(env.SERVER_TOKEN) || config.server_token || '',
-    agentId: pick(flags.agentId) || pick(env.AGENT_ID) || config.agent_id || '',
+    server: pick(flags.server) || config.server_url || DEFAULT_BRIDGE_URL,
+    token: pick(flags.token) || config.server_token || '',
+    agentId: pick(flags.agentId) || config.agent_id || '',
     card: card === '' ? undefined : card,
-    backend: pick(flags.backend) || pick(env.BACKEND) || config.backend || 'echo',
+    backend: pick(flags.backend) || config.backend || 'echo',
     backends: config.backends,
-    claudeCwd:
-      pick(flags.claudeCwd) || pick(env.CLAUDE_CWD) || backends.claude?.cwd || undefined,
+    claudeCwd: pick(flags.claudeCwd) || backends.claude?.cwd || undefined,
     claudeSettingsFile: pick(flags.claudeSettingsFile) || undefined,
-    codexCwd:
-      pick(flags.codexCwd) || pick(env.CODEX_CWD) || backends.codex?.cwd || undefined,
+    codexCwd: pick(flags.codexCwd) || backends.codex?.cwd || undefined,
     codexSandbox:
-      flags.codexSandbox ??
-      pickSandbox(env.CODEX_SANDBOX_MODE) ??
-      pickSandbox(backends.codex?.sandbox_mode),
+      flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),
     openclawGateway:
-      pick(flags.openclawGateway) ||
-      pick(env.OPENCLAW_GATEWAY_URL) ||
-      backends.openclaw?.gateway_url ||
-      undefined,
+      pick(flags.openclawGateway) || backends.openclaw?.gateway_url || undefined,
     openclawGatewayToken:
       pick(flags.openclawGatewayToken) ||
-      pick(env.OPENCLAW_GATEWAY_TOKEN) ||
       backends.openclaw?.gateway_token ||
       undefined,
-    openclawAgent:
-      pick(flags.openclawAgent) ||
-      pick(env.OPENCLAW_AGENT) ||
-      backends.openclaw?.agent ||
-      undefined,
+    openclawAgent: pick(flags.openclawAgent) || backends.openclaw?.agent || undefined,
     openclawOpenaiCompatAgent:
       pick(flags.openclawOpenaiCompatAgent) ||
-      pick(env.OPENCLAW_OAI_COMPAT_AGENT) ||
       backends.openclaw?.openai_compat_agent ||
       undefined,
-    openclawTaskTimeoutMs,
+    openclawTaskTimeoutMs:
+      flags.openclawTaskTimeoutMs ?? backends.openclaw?.task_timeout_ms,
   };
 
   // Empty-string normalisation for the optional path-ish fields so callers

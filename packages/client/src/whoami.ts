@@ -4,12 +4,14 @@
 // persona/system prompt, and optionally verify the bridge actually
 // resolves it via WebFinger.
 
+import { existsSync } from 'node:fs';
 import { object } from '@optique/core/constructs';
 import { optional, withDefault } from '@optique/core/modifiers';
 import { flag, option } from '@optique/core/primitives';
 import { parse } from '@optique/core/parser';
 import { formatMessage } from '@optique/core/message';
 import { string } from '@optique/core/valueparser';
+import { defaultConfigPath, readConfig } from './config.js';
 import {
   a2aCardUrl,
   a2aEndpoint,
@@ -54,7 +56,7 @@ const VERIFY_TIMEOUT_MS = 10_000;
 
 const USAGE =
   'usage: vicoop-client whoami [--agentId <id>] [--server <ws://...>] [--json] [--verify]\n' +
-  '  agentId / server fall back to AGENT_ID / SERVER_URL env vars.';
+  '  agentId / server fall back to the canonical config.json (agent_id / server_url).';
 
 const whoamiParser = object({
   agentId: optional(option('--agentId', string({ metavar: 'ID' }))),
@@ -218,8 +220,22 @@ export async function runWhoami(argv: string[], io: WhoamiIO = defaultIO): Promi
     return 1;
   }
 
-  const agentId = parsed.agentId ?? process.env.AGENT_ID;
-  const server = parsed.server ?? process.env.SERVER_URL;
+  // Fallback to canonical config.json (#189 §5 — env removed from daemon
+  // config chain, and whoami reuses the same source so the two surfaces
+  // can't drift). The file is optional: a fresh install with no `setup`
+  // run yet just gets `missing required` if no flags are passed either.
+  let configAgentId: string | undefined;
+  let configServer: string | undefined;
+  const canonicalPath = defaultConfigPath();
+  if (existsSync(canonicalPath)) {
+    const cfg = readConfig(canonicalPath);
+    if (cfg) {
+      configAgentId = cfg.agent_id;
+      configServer = cfg.server_url;
+    }
+  }
+  const agentId = parsed.agentId ?? configAgentId;
+  const server = parsed.server ?? configServer;
   if (!agentId || !server) {
     io.stderr(
       `missing required: ${[!agentId && 'agentId', !server && 'server'].filter(Boolean).join(', ')}\n${USAGE}\n`,
