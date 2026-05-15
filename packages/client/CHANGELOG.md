@@ -1,5 +1,135 @@
 # @vicoop-bridge/client
 
+## 0.16.0
+
+### Minor Changes
+
+- 4075b13: Fix the codex backend leaving an orphaned `codex app-server` subprocess
+  after the daemon exits (#186). The `Backend` interface gains an optional
+  `stop()` hook; `Client.stop()` invokes it before returning, and the codex
+  backend uses it to SIGTERM the long-lived `app-server` child that
+  otherwise outlived SIGINT/SIGTERM on the daemon.
+
+  Always-on service registration has been removed pending a redesign:
+  `install.sh` no longer writes a `vicoop-client.service` unit or env
+  template (the `INSTALL_SKIP_SERVICE` / `INSTALL_SERVICE_SCOPE` env vars
+  are gone), and `vicoop-client upgrade` no longer tries to
+  `systemctl try-restart` after swapping the bundle. Restart the daemon
+  manually with whatever supervisor you use until the new design lands.
+  `setup --write-env-file` is unchanged; it now describes itself as a
+  generic shell-sourceable env file rather than a systemd
+  `EnvironmentFile=`.
+
+- 7218b61: Ship `@vicoop-bridge/client` as a self-contained native binary per platform
+  (macOS arm64/x64, Linux arm64/x64, Windows x64) instead of a Node.js
+  portable bundle (#188). The release no longer requires Node.js on the
+  host: `install.sh` now downloads
+  `vicoop-client-<version>-<os>-<arch>[.exe]` + its `.sha256`, verifies
+  integrity, and drops the macOS quarantine xattr so first launch isn't
+  Gatekeeper-blocked. The binary is produced by `bun build --compile` from
+  a single Linux runner via cross-compile (`oven-sh/setup-bun@v2` in
+  `release.yml`).
+
+  The asset layout, install path, and upgrade flow change in lock-step:
+
+  - **Install path**: `$INSTALL_DIR/vicoop-client` (single file), not
+    `$INSTALL_DIR/bin/vicoop-client` + `dist/` + `node_modules/`. Anything
+    else the operator leaves under `$INSTALL_DIR` is preserved by upgrades
+    by construction (the swap only moves three filenames).
+  - **`vicoop-client upgrade`**: rewritten for the binary model. Downloads
+    the matching per-platform asset, sha256-verifies, runs `--version` as
+    a healthcheck, atomically renames `vicoop-client` →
+    `vicoop-client.prev` and `vicoop-client.new` → `vicoop-client`. Dev
+    workspace invocations (`tsx src/cli.ts upgrade`, `node dist/cli.js
+upgrade`) are now rejected up front because `process.execPath` ends in
+    `node` / `tsx` / `bun` rather than `vicoop-client[.exe]`.
+  - **Released-bundle `cards/` directory is gone** (closes the A side of
+    #164). The bridge already publishes the canonical card per backend;
+    `--card <path>` (or `"card"` in `config.json`) is the operator
+    override path, and source-tree
+    [`packages/client/cards/`](https://github.com/planetarium/vicoop-bridge/tree/main/packages/client/cards)
+    remains the documented reference for authoring overrides.
+  - **Prerequisites**: Node.js 20+ and `tar` are no longer required by the
+    install path. `curl` + `sha256sum`/`shasum` is enough; `jq` is added
+    only when `install.sh` auto-resolves the latest tag (skip-able with
+    `VERSION=@vicoop-bridge/client@<x.y.z>`).
+
+  This is breaking for anyone who currently scripts against
+  `$INSTALL_DIR/bin/vicoop-client` or extracts the released `.tgz`
+  directly — both go away.
+
+- 6ce7428: Migrate the `vicoop-client` argv parsers to [optique](https://github.com/dahlia/optique),
+  a type-safe parser-combinator library, as a PoC for #189. The hand-rolled
+  `for (let i = 0; i < args.length; i++)` loops that lived in `cli-args.ts`,
+  `login.ts`, `setup.ts`, `whoami.ts`, `admin-cli.ts`, and `cli.ts` (upgrade)
+  are gone — one optique grammar per subcommand replaces them.
+
+  The user-visible behavior changes that land with this:
+
+  - **`--flag=value` is accepted everywhere** (#189 §2). The old parser
+    silently dropped `--backend=claude` and fell through to the `'echo'`
+    default with no error; it now parses identically to `--backend claude`.
+  - **Every env-only backend knob now has a CLI flag** (#189 §1):
+    `--claude-cwd`, `--claude-settings-file`, `--codex-cwd`,
+    `--codex-sandbox`, `--openclaw-gateway`, `--openclaw-gateway-token`,
+    `--openclaw-agent`, `--openclaw-openai-compat-agent`,
+    `--openclaw-task-timeout-ms`. Flag wins over env wins over `backends.*`
+    in `config.json`. The corresponding `CLAUDE_CWD` / `CODEX_SANDBOX_MODE` /
+    `OPENCLAW_*` env vars are still honoured for systemd compatibility.
+  - **`--server` falls back to a built-in `DEFAULT_BRIDGE_URL`** (#189 §6,
+    `wss://vicoop-bridge-server.fly.dev`); `--bridge` on `login` falls back
+    to `DEFAULT_BRIDGE_HTTPS_URL` (`https://vicoop-bridge-server.fly.dev`).
+    A fresh install on the public bridge no longer needs `--server` /
+    `SERVER_URL` for the daemon or `--bridge` for `login`.
+  - **Typo'd flags are rejected** instead of silently ignored. The old
+    parser passed unknown `--whatever` through, which masked real mistakes
+    (a misspelled flag would fall all the way through every fallback to
+    the wrong default with no signal).
+  - **Enum validation happens at parse time.** `--codex-sandbox banana`
+    now reports the bad value at the parser layer with a list of accepted
+    values, rather than exiting later from `parseCodexSandboxMode` in
+    `cli.ts`.
+  - **Env vars are removed from the runtime config chain entirely**
+    (#189 §5). The daemon no longer reads `SERVER_URL`, `SERVER_TOKEN`,
+    `AGENT_ID`, `BACKEND`, `AGENT_CARD`, `CLAUDE_CWD`,
+    `CLAUDE_SETTINGS_JSON`, `CODEX_CWD`, `CODEX_SANDBOX_MODE`,
+    `OPENCLAW_GATEWAY_URL`, `OPENCLAW_GATEWAY_TOKEN`, `OPENCLAW_AGENT`,
+    `OPENCLAW_OAI_COMPAT_AGENT`, `OPENCLAW_TASK_TIMEOUT_MS`,
+    `OPENCLAW_THINKING`, `OPENCLAW_DEBUG`, or `OPENCLAW_PROCESS_NAME`.
+    `vicoop-client whoami` no longer falls back to `AGENT_ID` /
+    `SERVER_URL` env either — it reads the canonical `config.json`. The
+    resulting precedence is **CLI flag > `--config <path>` > canonical
+    config.json > built-in default**. Operators with env-only setups need
+    to either run `setup` (persists credentials into `config.json`) or
+    pass the equivalent CLI flags. Env vars the client still reads
+    (different category — config _location_, not config _content_):
+    `VICOOP_HOME`, `XDG_CONFIG_HOME`, `HOME` (config-dir resolution),
+    `VICOOP_BRIDGE` / `VICOOP_OWNER_TOKEN` (admin-command owner-session
+    bootstrap), `VICOOP_CLIENT_LOG_LEVEL` (logging diagnostic).
+    `vicoop-client setup --write-env-file` still emits a shell-sourceable
+    file at the path you pass (useful as a credentials audit / scripting
+    hook), but the daemon will no longer consume those env vars on its
+    own — point operators at `--config` or `config.json` instead.
+
+  `docs/install-client.md` is updated alongside the parser so the new
+  flag forms are the leading examples — Step 6 backend recipes are now
+  `vicoop-client --backend claude --claude-cwd …` instead of
+  `BACKEND=claude CLAUDE_CWD=…`, the OpenClaw / Claude / Codex sections
+  ship flag-keyed knob tables, and the public-bridge examples no longer
+  export `BRIDGE_URL`. Self-hosting overrides are collected in one place.
+
+  `vicoop-client --help` (and `help`) now prints **grouped daemon-mode
+  help** (#189 §3): Identity / Connection / Backend selection /
+  Backend-specific (Claude / Codex / OpenClaw), with a precedence-chain
+  footer. Error-path output keeps the short single-line `usage:` form so
+  test assertions on `/usage: vicoop-client/` continue to match.
+
+  The `install.sh` systemd unit rewrite (#189 AC#6) stays deferred to
+  **#190** — it depends on the supervisor strategy that #190 will decide
+  (Linux systemd vs macOS launchd, auto-install vs operator-installed,
+  etc.). #187 already removed the half-built systemd auto-registration;
+  reintroducing a Linux-only path here would conflict with that.
+
 ## 0.15.1
 
 ### Patch Changes
