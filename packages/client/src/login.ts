@@ -3,16 +3,48 @@
 // `vicoop-client setup` so login has no server-side client-registration
 // side effects.
 
+import { object } from '@optique/core/constructs';
+import { optional, withDefault } from '@optique/core/modifiers';
+import { command, constant, flag, option } from '@optique/core/primitives';
+import { message } from '@optique/core/message';
+import type { InferValue } from '@optique/core/parser';
+import { string } from '@optique/core/valueparser';
+import { DEFAULT_BRIDGE_HTTPS_URL } from './cli-args.js';
 import {
   defaultStorePath,
   saveOwnerSession,
 } from './owner-session.js';
 
-interface LoginArgs {
-  bridge: string;
-  json: boolean;
-  pollOnce: boolean; // for tests / CI smoke
-}
+// `login` is one branch of the top-level `or(...)` parser in cli.ts.
+// `action: constant("login")` is the discriminator the dispatch switch
+// reads after `run()` returns.
+export const loginCmd = command(
+  'login',
+  object({
+    action: constant('login' as const),
+    bridge: optional(
+      option('--bridge', string({ metavar: 'URL' }), {
+        description: message`Bridge HTTPS URL (defaults to ${DEFAULT_BRIDGE_HTTPS_URL}; override only when running your own bridge).`,
+      }),
+    ),
+    json: withDefault(
+      flag('--json', {
+        description: message`Print the token-endpoint response as JSON to stdout without persisting ~/.vicoop/owner-session.json.`,
+      }),
+      false,
+    ),
+    // Undocumented test/CI smoke flag — exits after the first poll cycle
+    // so login.test.ts can drive a deterministic fixture without sleeping
+    // through the real device-flow polling interval.
+    pollOnce: withDefault(flag('--poll-once'), false),
+  }),
+  {
+    brief: message`Sign in as the client owner and save an owner-session bearer.`,
+    description: message`Drives Google OAuth device flow and issues an owner-session bearer used by setup / add-caller / list-callers / list-agents / remove-caller. By default the token is saved to ~/.vicoop/owner-session.json (chmod 600) so admin subcommands pick it up automatically; pass --json to print the raw token-endpoint response to stdout instead (that mode does NOT persist the session).`,
+  },
+);
+
+export type LoginArgs = InferValue<typeof loginCmd>;
 
 interface DeviceCodeResponse {
   device_code: string;
@@ -36,71 +68,9 @@ interface OAuthError {
   error_description?: string;
 }
 
-function usage(): void {
-  process.stderr.write(
-    [
-      'usage: vicoop-client login --bridge <https://...> [--json]',
-      '',
-      'Drives Google OAuth device flow and issues an owner-session bearer used',
-      'by setup / add-caller / list-callers / list-agents / remove-caller.',
-      'By default the token is saved to ~/.vicoop/owner-session.json (chmod',
-      '600) so admin subcommands pick it up automatically; pass --json to',
-      'print the raw token-endpoint response to stdout instead (that mode',
-      'does NOT persist the session).',
-      '',
-      'Flags:',
-      '  --bridge          Bridge HTTP URL (e.g. https://vicoop-bridge-server.fly.dev)',
-      '  --owner-session   Accepted for compatibility; login always issues owner-session.',
-      '  --json            Print the token endpoint response as JSON to stdout',
-      '                    without persisting ~/.vicoop/owner-session.json.',
-      '',
-    ].join('\n'),
-  );
-}
-
-function parseArgs(args: string[]): LoginArgs | null {
-  let bridge: string | undefined;
-  let json = false;
-  let pollOnce = false;
-
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--json') {
-      json = true;
-      continue;
-    }
-    if (a === '--owner-session') {
-      continue;
-    }
-    if (a === '--poll-once') {
-      pollOnce = true;
-      continue;
-    }
-    const v = args[i + 1];
-    if (v === undefined) {
-      process.stderr.write(`flag ${a} requires a value\n`);
-      return null;
-    }
-    switch (a) {
-      case '--bridge':
-        bridge = v;
-        break;
-      default:
-        process.stderr.write(`unknown flag: ${a}\n`);
-        return null;
-    }
-    i++;
-  }
-  if (!bridge) {
-    usage();
-    return null;
-  }
-  return { bridge, json, pollOnce };
-}
-
-async function fetchDeviceCode(args: LoginArgs): Promise<DeviceCodeResponse> {
+async function fetchDeviceCode(bridgeUrl: string): Promise<DeviceCodeResponse> {
   const body = new URLSearchParams({ intent: 'owner_session' });
-  const res = await fetch(`${args.bridge.replace(/\/$/, '')}/oauth/device/code`, {
+  const res = await fetch(`${bridgeUrl.replace(/\/$/, '')}/oauth/device/code`, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
@@ -173,18 +143,14 @@ function saveOwnerSessionBearer(bridgeUrl: string, success: OwnerSessionSuccess)
   return path;
 }
 
-export async function runLogin(args: string[]): Promise<number> {
-  if (args.includes('-h') || args.includes('--help')) {
-    usage();
-    return 0;
-  }
-
-  const parsed = parseArgs(args);
-  if (!parsed) return 1;
+export async function runLogin(args: LoginArgs): Promise<number> {
+  // No --bridge → public default (#189 §6). Self-hosters pass
+  // `--bridge https://bridge.example.com`.
+  const bridge = args.bridge ?? DEFAULT_BRIDGE_HTTPS_URL;
 
   let device: DeviceCodeResponse;
   try {
-    device = await fetchDeviceCode(parsed);
+    device = await fetchDeviceCode(bridge);
   } catch (e) {
     process.stderr.write(`${(e as Error).message}\n`);
     return 1;
@@ -208,7 +174,7 @@ export async function runLogin(args: string[]): Promise<number> {
   let intervalMs = Math.max(device.interval, 1) * 1000;
 
   while (Date.now() < deadline) {
-    const result = await pollOnce(parsed.bridge, device.device_code);
+    const result = await pollOnce(bridge, device.device_code);
     if (result.kind === 'success') {
       const success = result.body;
       process.stderr.write('\nApproved.\n\n');
@@ -218,10 +184,10 @@ export async function runLogin(args: string[]): Promise<number> {
           `  expires_in       ${success.expires_in}s\n\n`,
       );
 
-      if (parsed.json) {
+      if (args.json) {
         process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
       } else {
-        const path = saveOwnerSessionBearer(parsed.bridge, success);
+        const path = saveOwnerSessionBearer(bridge, success);
         process.stderr.write(
           `Saved owner-session bearer to ${path} (mode 600).\n` +
             'Run `vicoop-client setup` to create a bridge client token.\n',
@@ -240,7 +206,7 @@ export async function runLogin(args: string[]): Promise<number> {
     if (result.kind === 'slow_down') {
       intervalMs += 5000;
     }
-    if (parsed.pollOnce) return 0;
+    if (args.pollOnce) return 0;
     await sleep(intervalMs);
   }
 

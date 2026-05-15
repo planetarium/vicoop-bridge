@@ -4,6 +4,14 @@
 // persona/system prompt, and optionally verify the bridge actually
 // resolves it via WebFinger.
 
+import { existsSync } from 'node:fs';
+import { object } from '@optique/core/constructs';
+import { optional, withDefault } from '@optique/core/modifiers';
+import { command, constant, flag, option } from '@optique/core/primitives';
+import { message } from '@optique/core/message';
+import type { InferValue } from '@optique/core/parser';
+import { string } from '@optique/core/valueparser';
+import { defaultConfigPath, readConfig } from './config.js';
 import {
   a2aCardUrl,
   a2aEndpoint,
@@ -17,13 +25,38 @@ import {
   type AgentIdentity,
 } from './identity.js';
 
-interface ParsedArgs {
-  agentId?: string;
-  server?: string;
-  json: boolean;
-  verify: boolean;
-  help: boolean;
-}
+export const whoamiCmd = command(
+  'whoami',
+  object({
+    action: constant('whoami' as const),
+    agentId: optional(
+      option('--agentId', string({ metavar: 'ID' }), {
+        description: message`Agent id. Falls back to the canonical config.json (\`agent_id\`).`,
+      }),
+    ),
+    server: optional(
+      option('--server', string({ metavar: 'WS_URL' }), {
+        description: message`Bridge WS URL. Falls back to the canonical config.json (\`server_url\`).`,
+      }),
+    ),
+    json: withDefault(
+      flag('--json', { description: message`Emit a machine-readable JSON record.` }),
+      false,
+    ),
+    verify: withDefault(
+      flag('--verify', {
+        description: message`Probe WebFinger to confirm the bridge resolves this agent's acct.`,
+      }),
+      false,
+    ),
+  }),
+  {
+    brief: message`Print the agent's A2A identity (mention / acct / WebFinger URL).`,
+    description: message`Surfaces the identifiers external callers will see for this agent. Use the output to populate other agents' \`allowed_callers\` or the OpenClaw gateway persona for self-reference recognition. With \`--verify\`, additionally fetches WebFinger to confirm the bridge resolves the agent's acct under the derived host.`,
+  },
+);
+
+export type WhoamiArgs = InferValue<typeof whoamiCmd>;
 
 // Output sinks are injectable so tests don't have to mutate global
 // process.stdout/stderr — overriding `process.stdout.write` collides with
@@ -46,39 +79,6 @@ const defaultIO: WhoamiIO = {
 // against a sleeping fly machine but short enough to give a clear failure
 // instead of hanging an operator's terminal indefinitely.
 const VERIFY_TIMEOUT_MS = 10_000;
-
-const USAGE =
-  'usage: vicoop-client whoami [--agentId <id>] [--server <ws://...>] [--json] [--verify]\n' +
-  '  agentId / server fall back to AGENT_ID / SERVER_URL env vars.';
-
-function parseArgs(args: string[]): ParsedArgs | { error: string } {
-  const out: ParsedArgs = { json: false, verify: false, help: false };
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--json') {
-      out.json = true;
-      continue;
-    }
-    if (a === '--verify') {
-      out.verify = true;
-      continue;
-    }
-    if (a === '-h' || a === '--help') {
-      out.help = true;
-      continue;
-    }
-    if (a === '--agentId' || a === '--server') {
-      const v = args[i + 1];
-      if (v === undefined) return { error: `${a} requires a value` };
-      if (a === '--agentId') out.agentId = v;
-      else out.server = v;
-      i++;
-      continue;
-    }
-    return { error: `unknown argument: ${a}` };
-  }
-  return out;
-}
 
 interface WhoamiResult {
   agentId: string;
@@ -206,22 +206,26 @@ function buildResult(id: AgentIdentity): WhoamiResult {
   };
 }
 
-export async function runWhoami(argv: string[], io: WhoamiIO = defaultIO): Promise<number> {
-  const parsed = parseArgs(argv);
-  if ('error' in parsed) {
-    io.stderr(`${parsed.error}\n${USAGE}\n`);
-    return 1;
+export async function runWhoami(args: WhoamiArgs, io: WhoamiIO = defaultIO): Promise<number> {
+  // Fallback to canonical config.json (#189 §5 — env removed from daemon
+  // config chain, and whoami reuses the same source so the two surfaces
+  // can't drift). The file is optional: a fresh install with no `setup`
+  // run yet just gets `missing required` if no flags are passed either.
+  let configAgentId: string | undefined;
+  let configServer: string | undefined;
+  const canonicalPath = defaultConfigPath();
+  if (existsSync(canonicalPath)) {
+    const cfg = readConfig(canonicalPath);
+    if (cfg) {
+      configAgentId = cfg.agent_id;
+      configServer = cfg.server_url;
+    }
   }
-  if (parsed.help) {
-    io.stdout(`${USAGE}\n`);
-    return 0;
-  }
-
-  const agentId = parsed.agentId ?? process.env.AGENT_ID;
-  const server = parsed.server ?? process.env.SERVER_URL;
+  const agentId = args.agentId ?? configAgentId;
+  const server = args.server ?? configServer;
   if (!agentId || !server) {
     io.stderr(
-      `missing required: ${[!agentId && 'agentId', !server && 'server'].filter(Boolean).join(', ')}\n${USAGE}\n`,
+      `missing required: ${[!agentId && 'agentId', !server && 'server'].filter(Boolean).join(', ')}\n`,
     );
     return 1;
   }
@@ -242,7 +246,7 @@ export async function runWhoami(argv: string[], io: WhoamiIO = defaultIO): Promi
     // %-encode `agentId` defensively, so an out-of-charset id still yields
     // a parseable (if non-resolving) URL.
     const result = buildResult({ agentId, host, httpOrigin });
-    if (parsed.json) {
+    if (args.json) {
       io.stdout(`${JSON.stringify(result, null, 2)}\n`);
     } else {
       printText(result, io);
@@ -257,10 +261,10 @@ export async function runWhoami(argv: string[], io: WhoamiIO = defaultIO): Promi
     return 1;
   }
   const result = buildResult(id);
-  if (parsed.verify) {
+  if (args.verify) {
     result.verify = await verifyWebfinger(id);
   }
-  if (parsed.json) {
+  if (args.json) {
     io.stdout(`${JSON.stringify(result, null, 2)}\n`);
   } else {
     printText(result, io);

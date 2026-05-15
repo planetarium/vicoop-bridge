@@ -1,7 +1,20 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
-import { runWhoami, type WhoamiIO } from './whoami.js';
+import { runWhoami, type WhoamiArgs, type WhoamiIO } from './whoami.js';
+
+// `runWhoami` now takes the parser's discriminated-union output. Tests
+// construct that shape directly.
+function whoamiArgs(p: Partial<Omit<WhoamiArgs, 'action'>> = {}): WhoamiArgs {
+  return {
+    action: 'whoami',
+    agentId: undefined,
+    server: undefined,
+    json: false,
+    verify: false,
+    ...p,
+  };
+}
 
 // Inject a buffered IO so the test runner's TAP output on the real
 // process.stdout stays untouched. Globally overriding `process.stdout.write`
@@ -62,12 +75,10 @@ function withWebfingerServer<T>(
 test('whoami prints mention / acct / webfinger URL on happy path', async () => {
   const io = makeIO();
   const result = await runWhoami(
-    [
-      '--agentId',
-      '6eec0b6e-claude',
-      '--server',
-      'wss://vicoop-bridge-server.fly.dev/ws',
-    ],
+    whoamiArgs({
+      agentId: '6eec0b6e-claude',
+      server: 'wss://vicoop-bridge-server.fly.dev/ws',
+    }),
     io,
   );
   assert.equal(result, 0);
@@ -93,7 +104,7 @@ test('whoami prints mention / acct / webfinger URL on happy path', async () => {
 test('whoami --json emits a parseable record', async () => {
   const io = makeIO();
   const result = await runWhoami(
-    ['--agentId', 'me', '--server', 'wss://h.example/ws', '--json'],
+    whoamiArgs({ agentId: 'me', server: 'wss://h.example/ws', json: true }),
     io,
   );
   assert.equal(result, 0);
@@ -113,7 +124,7 @@ test('whoami --json emits a parseable record', async () => {
 test('whoami preserves scheme+port for local dev (ws → http, port retained)', async () => {
   const io = makeIO();
   const result = await runWhoami(
-    ['--agentId', 'me', '--server', 'ws://localhost:8787/ws', '--json'],
+    whoamiArgs({ agentId: 'me', server: 'ws://localhost:8787/ws', json: true }),
     io,
   );
   assert.equal(result, 0);
@@ -126,25 +137,37 @@ test('whoami preserves scheme+port for local dev (ws → http, port retained)', 
   );
 });
 
-test('whoami exits 1 with usage when agentId / server are missing', async () => {
-  const prev = { agent: process.env.AGENT_ID, server: process.env.SERVER_URL };
-  delete process.env.AGENT_ID;
-  delete process.env.SERVER_URL;
-  try {
-    const io = makeIO();
-    const result = await runWhoami([], io);
-    assert.equal(result, 1);
-    assert.match(io.readStderr(), /missing required/);
-  } finally {
-    if (prev.agent !== undefined) process.env.AGENT_ID = prev.agent;
-    if (prev.server !== undefined) process.env.SERVER_URL = prev.server;
-  }
+test('whoami exits 1 with usage when agentId / server are missing', async (t) => {
+  // No flags, no config.json — should fail loudly. Pin VICOOP_HOME at an
+  // empty tmpdir so the host's real ~/.vicoop/config.json (which may or
+  // may not exist on the developer machine / CI runner) cannot supply
+  // values and accidentally satisfy the missing-required check.
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-whoami-'));
+  const previousVicoop = process.env.VICOOP_HOME;
+  const previousXdg = process.env.XDG_CONFIG_HOME;
+  process.env.VICOOP_HOME = tmpHome;
+  delete process.env.XDG_CONFIG_HOME;
+  t.after(() => {
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+    if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousXdg;
+    rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  const io = makeIO();
+  const result = await runWhoami(whoamiArgs(), io);
+  assert.equal(result, 1);
+  assert.match(io.readStderr(), /missing required/);
 });
 
 test('whoami warns and exits 2 when agentId is not a Mentionable local', async () => {
   const io = makeIO();
   const result = await runWhoami(
-    ['--agentId', 'bad/agent', '--server', 'wss://h.example/ws'],
+    whoamiArgs({ agentId: 'bad/agent', server: 'wss://h.example/ws' }),
     io,
   );
   assert.equal(result, 2);
@@ -166,7 +189,7 @@ test('whoami --verify treats a matching JRD subject as success', async () => {
       const url = new URL(origin);
       const io = makeIO();
       const result = await runWhoami(
-        ['--agentId', 'me', '--server', `ws://${url.host}/ws`, '--verify'],
+        whoamiArgs({ agentId: 'me', server: `ws://${url.host}/ws`, verify: true }),
         io,
       );
       assert.equal(result, 0);
@@ -186,7 +209,7 @@ test('whoami --verify treats subject as case-insensitive (matches server)', asyn
       const url = new URL(origin);
       const io = makeIO();
       const result = await runWhoami(
-        ['--agentId', 'me', '--server', `ws://${url.host}/ws`, '--verify'],
+        whoamiArgs({ agentId: 'me', server: `ws://${url.host}/ws`, verify: true }),
         io,
       );
       assert.equal(result, 0);
@@ -205,7 +228,7 @@ test('whoami --verify exits 3 when the JRD subject does not match the requested 
       const url = new URL(origin);
       const io = makeIO();
       const result = await runWhoami(
-        ['--agentId', 'me', '--server', `ws://${url.host}/ws`, '--verify'],
+        whoamiArgs({ agentId: 'me', server: `ws://${url.host}/ws`, verify: true }),
         io,
       );
       assert.equal(result, 3);
@@ -232,7 +255,7 @@ test('whoami --verify surfaces the server-provided error reason on non-2xx', asy
       const url = new URL(origin);
       const io = makeIO();
       const result = await runWhoami(
-        ['--agentId', 'me', '--server', `ws://${url.host}/ws`, '--verify'],
+        whoamiArgs({ agentId: 'me', server: `ws://${url.host}/ws`, verify: true }),
         io,
       );
       assert.equal(result, 3);
@@ -260,13 +283,11 @@ test('whoami --verify still surfaces a bare status when the body is not JSON', a
       try {
         const io = makeIO();
         const result = await runWhoami(
-          [
-            '--agentId',
-            'me',
-            '--server',
-            `ws://127.0.0.1:${addr.port}/ws`,
-            '--verify',
-          ],
+          whoamiArgs({
+            agentId: 'me',
+            server: `ws://127.0.0.1:${addr.port}/ws`,
+            verify: true,
+          }),
           io,
         );
         assert.equal(result, 3);

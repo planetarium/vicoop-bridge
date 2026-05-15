@@ -1,17 +1,116 @@
-// Pure argv/env/config merging for the daemon entrypoint. Lives in its own
+// Pure argv/config merging for the daemon entrypoint. Lives in its own
 // module so tests can import it without triggering the side-effectful
 // `main()` at the bottom of cli.ts.
 
+import { object } from '@optique/core/constructs';
+import { optional } from '@optique/core/modifiers';
+import { option } from '@optique/core/primitives';
+import { message } from '@optique/core/message';
+import { choice, integer, string } from '@optique/core/valueparser';
+import { parse } from '@optique/core/parser';
+import { formatMessage } from '@optique/core/message';
+import type { InferValue } from '@optique/core/parser';
 import type { ClientConfig, BackendConfigs } from './config.js';
 
-export interface ParsedFlags {
-  server?: string;
-  token?: string;
-  agentId?: string;
-  card?: string;
-  backend?: string;
-  config?: string;
-}
+// Public bridge URL baked in so a fresh install on the public deployment
+// needs zero flags. Self-hosters override via --server / config.json. The
+// asymmetry (the bridge URL was the *only* required input that never varies
+// across most installs) is item 6 of issue #189.
+export const DEFAULT_BRIDGE_URL = 'wss://vicoop-bridge-server.fly.dev';
+
+// HTTPS form of the same bridge, used by `login` (device-flow over HTTPS)
+// and the `setup` / admin commands that talk to the bridge's REST + GraphQL
+// surfaces. Kept in lock-step with `DEFAULT_BRIDGE_URL`; the scheme split
+// is unavoidable because the daemon connects over WS while OAuth /
+// /admin-api use HTTPS.
+export const DEFAULT_BRIDGE_HTTPS_URL = 'https://vicoop-bridge-server.fly.dev';
+
+const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const;
+export type CodexSandboxMode = (typeof SANDBOX_MODES)[number];
+
+const BACKEND_KINDS = ['echo', 'openclaw', 'claude', 'codex'] as const;
+export type BackendKind = (typeof BACKEND_KINDS)[number];
+
+// Optique daemon-mode grammar. Every operator-tunable knob is a flag here,
+// including the ones that used to be env-only (CLAUDE_CWD, CODEX_SANDBOX_MODE,
+// OPENCLAW_*) — see issue #189 §1. `optional()` everywhere because the
+// config.json layer fills the gaps; the merge step below decides whether
+// a field is actually missing.
+//
+// Fields are exposed as a plain object literal so cli.ts can spread them
+// into the top-level `or(command(…), daemonCmd)` parser without losing
+// per-field types. `daemonFlagsParser` keeps the wrapped form for tests
+// that call `parseFlags` directly.
+//
+// `group()` wrappers below give optique's help renderer section headers
+// (Identity / Connection / Backend / Backend-specific Claude / Codex /
+// OpenClaw) — issue #189 §3.
+export const daemonFlagsFields = {
+  // Identity
+  token: optional(option('--token', string({ metavar: 'TOKEN' }), {
+    description: message`Bridge client token (issued by \`vicoop-client setup\`; usually persisted in config.json).`,
+  })),
+  agentId: optional(option('--agentId', string({ metavar: 'ID' }), {
+    description: message`Agent id (routing key external A2A callers use).`,
+  })),
+
+  // Connection
+  server: optional(option('--server', string({ metavar: 'WS_URL' }), {
+    description: message`Bridge WS URL. Defaults to ${DEFAULT_BRIDGE_URL}; set only when self-hosting.`,
+  })),
+  card: optional(option('--card', string({ metavar: 'PATH' }), {
+    description: message`Agent card JSON override (defaults to the server-published card for the chosen backend).`,
+  })),
+  config: optional(option('--config', string({ metavar: 'PATH' }), {
+    description: message`Explicit config.json overlaid on the canonical file.`,
+  })),
+
+  // Backend selection
+  backend: optional(option('--backend', choice([...BACKEND_KINDS]), {
+    description: message`Backend implementation. Default: \`echo\`.`,
+  })),
+
+  // Backend-specific (Claude)
+  claudeCwd: optional(option('--claude-cwd', string({ metavar: 'PATH' }), {
+    description: message`Working directory for the spawned \`claude\`.`,
+  })),
+  claudeSettingsFile: optional(option('--claude-settings-file', string({ metavar: 'PATH' }), {
+    description: message`Path to a JSON file used as Claude \`--settings\`.`,
+  })),
+
+  // Backend-specific (Codex)
+  codexCwd: optional(option('--codex-cwd', string({ metavar: 'PATH' }), {
+    description: message`Working directory for the spawned \`codex\`.`,
+  })),
+  codexSandbox: optional(option('--codex-sandbox', choice([...SANDBOX_MODES]), {
+    description: message`Codex sandbox mode.`,
+  })),
+
+  // Backend-specific (OpenClaw)
+  openclawGateway: optional(option('--openclaw-gateway', string({ metavar: 'WS_URL' }), {
+    description: message`Gateway WS URL (default ws://127.0.0.1:18789).`,
+  })),
+  openclawGatewayToken: optional(option('--openclaw-gateway-token', string({ metavar: 'TOKEN' }), {
+    description: message`Auth token if your gateway requires one.`,
+  })),
+  openclawAgent: optional(option('--openclaw-agent', string({ metavar: 'NAME' }), {
+    description: message`Primary OpenClaw agent name. Default: \`main\`.`,
+  })),
+  openclawOpenaiCompatAgent: optional(
+    option('--openclaw-openai-compat-agent', string({ metavar: 'NAME' }), {
+      description: message`Secondary OpenClaw agent dedicated to openai-compat-extension tasks (gateway must define this agent with tools.deny=["*"]).`,
+    }),
+  ),
+  openclawTaskTimeoutMs: optional(
+    option('--openclaw-task-timeout-ms', integer({ metavar: 'MS', min: 1 }), {
+      description: message`Per-task timeout in milliseconds.`,
+    }),
+  ),
+};
+
+export const daemonFlagsParser = object(daemonFlagsFields);
+
+export type DaemonFlags = InferValue<typeof daemonFlagsParser>;
 
 export interface DaemonArgs {
   server: string;
@@ -20,79 +119,122 @@ export interface DaemonArgs {
   card?: string;
   backend: string;
   backends?: BackendConfigs;
+  // Flag-derived overrides for env-only knobs. These take precedence over
+  // env when set; merge logic in cli.ts threads them into backend factories.
+  claudeCwd?: string;
+  claudeSettingsFile?: string;
+  codexCwd?: string;
+  codexSandbox?: CodexSandboxMode;
+  openclawGateway?: string;
+  openclawGatewayToken?: string;
+  openclawAgent?: string;
+  openclawOpenaiCompatAgent?: string;
+  openclawTaskTimeoutMs?: number;
 }
 
-const FLAG_NAMES = ['server', 'token', 'agentId', 'card', 'backend', 'config'] as const;
-type FlagName = (typeof FLAG_NAMES)[number];
-
-// Result discriminator: success carries the parsed flags; failure carries a
-// short message naming the offending flag so cli.ts can surface a targeted
-// error like "--config requires a path" instead of silently treating the
-// next flag as a value (or `undefined` when --config was the last token).
 export type ParseFlagsResult =
-  | { ok: true; flags: ParsedFlags }
+  | { ok: true; flags: DaemonFlags }
   | { ok: false; error: string };
 
+// Thin wrapper around `parse()` from @optique/core. Surfaces structured
+// errors (`{ ok: false, error }`) so the caller in cli.ts can print usage
+// alongside the targeted message instead of leaning on optique's own
+// process.exit path.
 export function parseFlags(argv: string[]): ParseFlagsResult {
-  const out: ParsedFlags = {};
-  for (let i = 0; i < argv.length; i++) {
-    const key = argv[i];
-    if (!key.startsWith('--')) continue;
-    const k = key.slice(2);
-    if (!(FLAG_NAMES as readonly string[]).includes(k)) continue;
-    const val = argv[i + 1];
-    // Reject both "flag at end of argv" (val === undefined) and "flag
-    // followed by another --flag" (val starts with --). Either case silently
-    // consumed the next token as a value before this guard and produced
-    // surprising behavior — particularly bad for --config where the daemon
-    // would either run with the canonical config (val undefined) or load a
-    // file path that's actually a flag name.
-    if (val === undefined || val.startsWith('--')) {
-      return { ok: false, error: `--${k} requires a value` };
-    }
-    out[k as FlagName] = val;
-    i++;
+  const r = parse(daemonFlagsParser, argv);
+  if (!r.success) {
+    return { ok: false, error: formatMessage(r.error, { colors: false }) };
   }
-  return { ok: true, flags: out };
+  return { ok: true, flags: r.value };
 }
 
-// Trim and treat whitespace-only as unset. Two reasons:
+// Trim and treat whitespace-only as unset.
 //   1. `||` (not `??`) so an empty `SERVER_TOKEN=` line from a
 //      freshly-generated EnvironmentFile= template doesn't shadow a
 //      populated config.json. The install.sh template ships these keys
-//      with empty values for operators to fill in; treating "" as "not
-//      set" lets the config value carry through until the operator
-//      either populates env or removes the empty line.
+//      with empty values for operators to fill in.
 //   2. Trim so a stray space-padded value (`SERVER_URL=" wss://x "` or
 //      `--token " ... "`) doesn't surface as a "looks set but doesn't
-//      connect" mystery. `normalizeConfig` already trims for the config
-//      layer; doing the same here keeps env / CLI on the same footing.
+//      connect" mystery.
 function pick(v: string | undefined): string {
   return v?.trim() ?? '';
 }
 
+function pickSandbox(v: string | undefined): CodexSandboxMode | undefined {
+  const t = v?.trim();
+  if (!t) return undefined;
+  return (SANDBOX_MODES as readonly string[]).includes(t)
+    ? (t as CodexSandboxMode)
+    : undefined;
+}
+
+// Final precedence (highest wins) — issue #189 §5 landed:
+//   1. CLI flag values  (parsed by optique above)
+//   2. `--config <path>` overlay  (caller pre-merged into `config`)
+//   3. canonical config.json      (caller pre-merged into `config`)
+//   4. built-in defaults (DEFAULT_BRIDGE_URL for server; 'echo' for backend)
+//
+// Env vars are NOT in this chain. Config-location env (VICOOP_HOME /
+// XDG_CONFIG_HOME / HOME) is a separate category and resolved by
+// `defaultConfigPath()` before this function runs. Admin-bootstrap env
+// (VICOOP_BRIDGE / VICOOP_OWNER_TOKEN) is unrelated to the daemon runtime
+// config and lives in owner-session.ts.
+//
+// `flags` is `Partial<DaemonFlags>` so tests can pass `{}` or `{ server }`
+// shorthand. At runtime, `parseFlags()` returns the full shape — every key
+// present with `undefined` for unset flags — but the merge logic reads each
+// field independently and tolerates missing keys.
 export function mergeClientArgs(
-  flags: ParsedFlags,
-  env: NodeJS.ProcessEnv,
+  flags: Partial<DaemonFlags>,
   config: ClientConfig,
 ): { ok: true; args: DaemonArgs } | { ok: false; missing: string[] } {
-  const card =
-    pick(flags.card) || pick(env.AGENT_CARD) || config.card;
+  const card = pick(flags.card) || config.card;
+  const backends = config.backends ?? {};
+
   const resolved: DaemonArgs = {
-    server: pick(flags.server) || pick(env.SERVER_URL) || config.server_url || '',
-    token: pick(flags.token) || pick(env.SERVER_TOKEN) || config.server_token || '',
-    agentId: pick(flags.agentId) || pick(env.AGENT_ID) || config.agent_id || '',
-    // `card` is optional; normalize "" back to undefined so callers don't
-    // get a present-but-empty string they then have to filter.
+    server: pick(flags.server) || config.server_url || DEFAULT_BRIDGE_URL,
+    token: pick(flags.token) || config.server_token || '',
+    agentId: pick(flags.agentId) || config.agent_id || '',
     card: card === '' ? undefined : card,
-    backend: pick(flags.backend) || pick(env.BACKEND) || config.backend || 'echo',
+    backend: pick(flags.backend) || config.backend || 'echo',
     backends: config.backends,
+    claudeCwd: pick(flags.claudeCwd) || backends.claude?.cwd || undefined,
+    claudeSettingsFile: pick(flags.claudeSettingsFile) || undefined,
+    codexCwd: pick(flags.codexCwd) || backends.codex?.cwd || undefined,
+    codexSandbox:
+      flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),
+    openclawGateway:
+      pick(flags.openclawGateway) || backends.openclaw?.gateway_url || undefined,
+    openclawGatewayToken:
+      pick(flags.openclawGatewayToken) ||
+      backends.openclaw?.gateway_token ||
+      undefined,
+    openclawAgent: pick(flags.openclawAgent) || backends.openclaw?.agent || undefined,
+    openclawOpenaiCompatAgent:
+      pick(flags.openclawOpenaiCompatAgent) ||
+      backends.openclaw?.openai_compat_agent ||
+      undefined,
+    openclawTaskTimeoutMs:
+      flags.openclawTaskTimeoutMs ?? backends.openclaw?.task_timeout_ms,
   };
+
+  // Empty-string normalisation for the optional path-ish fields so callers
+  // can `if (resolved.claudeCwd)` cleanly instead of having to filter "".
+  if (resolved.claudeCwd === '') resolved.claudeCwd = undefined;
+  if (resolved.claudeSettingsFile === '') resolved.claudeSettingsFile = undefined;
+  if (resolved.codexCwd === '') resolved.codexCwd = undefined;
+  if (resolved.openclawGateway === '') resolved.openclawGateway = undefined;
+  if (resolved.openclawGatewayToken === '') resolved.openclawGatewayToken = undefined;
+  if (resolved.openclawAgent === '') resolved.openclawAgent = undefined;
+  if (resolved.openclawOpenaiCompatAgent === '') {
+    resolved.openclawOpenaiCompatAgent = undefined;
+  }
+
   const missing: string[] = [];
-  if (!resolved.server) missing.push('server');
   if (!resolved.token) missing.push('token');
   if (!resolved.agentId) missing.push('agentId');
-  if (!resolved.backend) missing.push('backend');
+  // `server` always has DEFAULT_BRIDGE_URL fallback so it's never missing.
+  // `backend` always has 'echo' fallback.
   if (missing.length) return { ok: false, missing };
   return { ok: true, args: resolved };
 }

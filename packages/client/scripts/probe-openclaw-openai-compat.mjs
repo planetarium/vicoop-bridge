@@ -88,11 +88,19 @@ function buildTurn2Message(userText, history) {
 }
 
 async function runOne(label, message, contextId) {
+  // Env reads stay local to this probe script — the production daemon
+  // does not consult env for runtime config (#189 §5). The backend
+  // factory itself only accepts opts now, so the script does the env →
+  // opts translation here for the e2e harness in docs/openclaw-e2e.md
+  // (which sets these via `docker run -e ...`).
+  const openaiCompatAgent =
+    process.env.OPENCLAW_OAI_COMPAT_AGENT?.trim() || undefined;
   const backend = createOpenclawBackend({
     url: 'ws://127.0.0.1:18789',
     token: '',                  // auth.mode=none in the test gateway
     debug: process.env.DEBUG === '1',
     taskTimeoutMs: 120_000,
+    openaiCompatAgent,
   });
 
   const frames = [];

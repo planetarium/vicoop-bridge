@@ -39,7 +39,8 @@ one-liner fetching a published `@vicoop-bridge/client@*` bundle). Contrast with:
   exactly that case (e.g. headless server + laptop browser).
 - A Google account. No wallet, `a2a-wallet`, or seed phrase required.
 - For the OpenClaw backend specifically: an OpenClaw gateway running
-  locally at `ws://127.0.0.1:18789` (override via `OPENCLAW_GATEWAY_URL`).
+  locally at `ws://127.0.0.1:18789` (override via `--openclaw-gateway`
+  or `backends.openclaw.gateway_url`).
   Streaming (per-message A2A artifact cadence) requires OpenClaw
   **v2026.3.22 or newer** — the `sessions.messages.subscribe` RPC that
   drives it was introduced in that release. On older gateways the client
@@ -134,8 +135,6 @@ The agent id is the routing key external A2A callers use to reach your
 client. Pick something unlikely to collide across operators:
 
 ```sh
-export BRIDGE_URL=https://vicoop-bridge-server.fly.dev
-
 # By hostname
 AGENT_ID="openclaw-$(hostname | cut -d. -f1)"
 
@@ -144,6 +143,14 @@ AGENT_ID="$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)-openclaw"
 
 echo "$AGENT_ID"
 ```
+
+> **Self-hosting the bridge.** `login` / `setup` / the daemon all default
+> to the public bridge at `https://vicoop-bridge-server.fly.dev` (HTTPS for
+> `login` / `setup` / admin commands; `wss://…` for the daemon). If you
+> run your own bridge, pass `--bridge <https://your-bridge>` to `login` and
+> `--server <wss://your-bridge>` to the daemon (or persist `server_url`
+> in `config.json`). Every example below uses the public defaults; the
+> self-host overrides are the only place the URL has to change.
 
 `registerClient` (called for you by `vicoop-client setup` in Step 4) does
 not pre-validate availability; collisions surface only at WS connect time.
@@ -164,13 +171,15 @@ required.
 HOSTNAME=$(hostname)
 CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
 
-"$INSTALL_DIR/bin/vicoop-client" login --bridge "$BRIDGE_URL"
+"$INSTALL_DIR/bin/vicoop-client" login
 
 "$INSTALL_DIR/bin/vicoop-client" setup \
   --client-name "$CLIENT_NAME" \
   --agent-ids "$AGENT_ID" \
   --caller "eth:0x<40-hex>"
 ```
+
+(Self-hosting? Pass `--bridge https://<your-bridge>` to `login`.)
 
 `login` prints a verification URL to stderr — open it in **any** browser
 (the same machine, or your laptop while running the CLI on a headless host)
@@ -246,25 +255,42 @@ omit what you don't need) is:
 }
 ```
 
-The schema also accepts a top-level `card` mirroring the `--card` flag /
-`AGENT_CARD` env var (rarely needed: the bridge already publishes a
-canonical card per backend — see Step 5).
+The schema also accepts a top-level `card` mirroring the `--card` flag
+(rarely needed: the bridge already publishes a canonical card per backend
+— see Step 5).
 
-Daemon precedence is **CLI flag > env var > `--config <path>` > canonical
-`config.json`**, so env values still win (handy for shell-sourced env files
-or CI overrides). `setup` only ever touches `server_url`, `server_token`, and
-`agent_id` — hand-edits to the other fields survive `setup` re-runs.
+Daemon precedence is **CLI flag > `--config <path>` > canonical
+`config.json` > built-in default**. Env vars are not consulted for
+runtime config (#189 §5) — secrets and overrides live in `config.json`
+(mode 600) or in flags. `setup` only ever touches `server_url`,
+`server_token`, and `agent_id` — hand-edits to the other fields survive
+`setup` re-runs.
 
-> **Top-level vs `backends.*` parity.** The five top-level fields above
-> (`server_url`, `server_token`, `agent_id`, `backend`, `card`) all have
-> matching CLI flags (`--server`, `--token`, `--agentId`, `--backend`,
-> `--card`) and env vars. The `backends.*` map is config + env only —
-> there's no per-backend CLI flag. The backend-specific env vars
-> (`CLAUDE_CWD`, `CLAUDE_SETTINGS_JSON`, `CODEX_CWD`,
-> `CODEX_SANDBOX_MODE`, `OPENCLAW_GATEWAY_URL` /
-> `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_AGENT` /
-> `OPENCLAW_OAI_COMPAT_AGENT` / `OPENCLAW_TASK_TIMEOUT_MS`) still
-> override the corresponding config values.
+> **Top-level vs `backends.*` parity.** Every operator-tunable knob is
+> reachable as a CLI flag and as a `config.json` field — pick whichever
+> surface fits the deployment. Top-level fields (`server_url`,
+> `server_token`, `agent_id`, `backend`, `card`) map to `--server`,
+> `--token`, `--agentId`, `--backend`, `--card`. Backend-specific fields
+> under `backends.*` map to `--claude-cwd`, `--claude-settings-file`,
+> `--codex-cwd`, `--codex-sandbox`, `--openclaw-gateway`,
+> `--openclaw-gateway-token`, `--openclaw-agent`,
+> `--openclaw-openai-compat-agent`, `--openclaw-task-timeout-ms`.
+
+> **Env vars are out of the runtime-config chain.** Past releases also
+> consulted `SERVER_URL` / `SERVER_TOKEN` / `AGENT_ID` / `BACKEND` /
+> `CLAUDE_*` / `CODEX_*` / `OPENCLAW_*` between the flag and config
+> layers. Those reads were removed in this release per #189 §5: env at
+> that position adds no expressive power that `--config <path>` doesn't
+> already provide, but it adds invisible state (shell rc files, CI env
+> bleed, stale exports). Existing operators with env-only setups need to
+> either run `setup` (which persists `server_url` / `server_token` /
+> `agent_id` into `config.json`) or pass the equivalent CLI flags.
+>
+> Env vars the client still reads (different category — they pick *where*
+> config lives, not *what's in* it): `VICOOP_HOME`, `XDG_CONFIG_HOME`,
+> `HOME` (config-dir resolution), `VICOOP_BRIDGE` / `VICOOP_OWNER_TOKEN`
+> (admin-command owner-session bootstrap, same role as `KUBECONFIG`),
+> `VICOOP_CLIENT_LOG_LEVEL` (logging diagnostic).
 
 If you omit `--caller`, `setup` succeeds but prints a warning that the
 agent will be public until you restrict callers:
@@ -313,8 +339,11 @@ token.
    that bearer, receives `{client_id, client_token, owner_principal,
    allowed_agent_ids}`, and writes the daemon credentials into
    `~/.vicoop/config.json` (mode 600). With `--write-env-file <path>` it
-   additionally emits a shell-sourceable env file at that path. It never
-   sees a `vbc_caller_*` token.
+   additionally emits a shell-sourceable env file at that path — useful as
+   a credentials audit/backup record, though the daemon no longer reads
+   those env vars (#189 §5); it always sources runtime config from
+   `config.json` or `--config <path>`. It never sees a `vbc_caller_*`
+   token.
 
 This means a Google-only operator can stand up a bridge client without
 ever holding a wallet or seed phrase. Owner is recorded as
@@ -322,25 +351,26 @@ ever holding a wallet or seed phrase. Owner is recorded as
 
 ## Step 5 — Choose a backend and optional agent card
 
-Pick the local backend this client should drive:
+Pick the local backend this client should drive (selected by
+`--backend <name>` or `"backend": "<name>"` in `config.json`):
 
-- `openclaw` — OpenClaw gateway at `OPENCLAW_GATEWAY_URL`
+- `openclaw` — OpenClaw gateway (default `ws://127.0.0.1:18789`)
 - `claude` — local Claude Code CLI
 - `codex` — local Codex CLI
 - `echo` — smoke-test backend
 
 For these built-in backends, you normally do **not** pass an agent card file.
-The client sends `BACKEND` as `backendKind`, and the bridge server publishes
-the canonical card for that backend at
+The client sends the selected backend name as `backendKind`, and the bridge
+server publishes the canonical card for that backend at
 `GET <bridge>/agents/<agent_id>/.well-known/agent-card.json`. That keeps
 metadata/capability fixes on the faster server deploy path instead of
 requiring every operator to upgrade their client bundle.
 
 The bundle still ships backend-specific starter cards under
 `$INSTALL_DIR/cards/` (`openclaw.json`, `claude.json`, `codex.json`, `echo.json`) for
-operator overrides and compatibility with older bridge servers. Set
-`AGENT_CARD` only when you intentionally want to override the server card,
-for example to:
+operator overrides and compatibility with older bridge servers. Pass
+`--card <path>` (or set `AGENT_CARD` / `"card"` in `config.json`) only
+when you intentionally want to override the server card, for example to:
 
 - Rename `name` to something meaningful (it defaults to `openclaw`).
 - Tighten `description` to what this specific instance actually does.
@@ -352,8 +382,8 @@ that `vicoop-client whoami` prints — see ["Check your agent's mention /
 acct"](#check-your-agents-mention--acct-any-backend) in Step 6.
 
 Schema reference: `packages/protocol/src/index.ts` (`AgentCard` Zod schema,
-validated by the client at startup when `AGENT_CARD` is set — invalid cards
-exit with a Zod error).
+validated by the client at startup when `--card` / `AGENT_CARD` is set —
+invalid cards exit with a Zod error).
 
 For custom backends, write a fresh card:
 
@@ -377,16 +407,18 @@ JSON
 ## Step 6 — Run the client
 
 Run the client in the foreground first. With `config.json` written by Step 4,
-the daemon picks up `server_url`, `server_token`, and `agent_id` on its own:
+the daemon picks up `server_url`, `server_token`, and `agent_id` on its own;
+pick the backend with `--backend`:
 
 ```sh
-BACKEND=openclaw \
-  "$INSTALL_DIR/bin/vicoop-client"
+"$INSTALL_DIR/bin/vicoop-client" --backend openclaw
 ```
 
-Precedence at startup is **CLI flag > env var > `--config <path>` > canonical
-`config.json`**, so the layers compose freely — env values still override
-`config.json` when both set the same key.
+Precedence at startup is **CLI flag > `--config <path>` > canonical
+`config.json` > built-in default**. Env vars are not consulted for
+runtime config (#189 §5). With `"backend": "openclaw"` persisted in
+`config.json`, the daemon needs no flags at all:
+`"$INSTALL_DIR/bin/vicoop-client"`.
 
 On success you'll see a `[client] connected, sending hello` log followed
 by an identity block — same data `vicoop-client whoami` would print, so
@@ -410,18 +442,26 @@ After that:
 - `POST $BRIDGE_URL/agents/$AGENT_ID` with a JSON-RPC `message/send` payload
   reaches your backend and the reply is returned inline.
 
-### OpenClaw-specific env
+### OpenClaw-specific knobs
 
 The OpenClaw backend connects outbound to a local OpenClaw gateway over a
-second WS. Override if yours isn't on the default:
+second WS. Override if yours isn't on the default — each knob takes the
+usual flag > `backends.openclaw.*` precedence:
 
-| Env | Default | |
+| Flag | `backends.openclaw.*` | Default |
 |---|---|---|
-| `OPENCLAW_GATEWAY_URL` | `ws://127.0.0.1:18789` | Local gateway endpoint |
-| `OPENCLAW_GATEWAY_TOKEN` | *(none)* | If your gateway requires auth |
-| `OPENCLAW_AGENT` | `main` | Agent name inside OpenClaw |
-| `OPENCLAW_OAI_COMPAT_AGENT` | *(unset, single-agent mode)* | Optional secondary OpenClaw agent name dedicated to tasks carrying the A2A openai-compat extension metadata. When set, the bridge routes those tasks via `agent:<this>:<contextId>` sessionKeys; non-extension tasks keep using `OPENCLAW_AGENT`. Pairs with a `tools.deny=["*"]` `agents.list` entry on the OpenClaw side — see the box below. |
-| `OPENCLAW_TASK_TIMEOUT_MS` | backend default | Per-task timeout |
+| `--openclaw-gateway` | `gateway_url` | `ws://127.0.0.1:18789` |
+| `--openclaw-gateway-token` | `gateway_token` | *(none)* |
+| `--openclaw-agent` | `agent` | `main` |
+| `--openclaw-openai-compat-agent` | `openai_compat_agent` | *(unset, single-agent mode)* |
+| `--openclaw-task-timeout-ms` | `task_timeout_ms` | backend default |
+
+`--openclaw-openai-compat-agent` (and its config equivalent) names a
+secondary OpenClaw agent dedicated to tasks carrying the A2A openai-compat
+extension metadata. When set, the bridge routes those tasks via
+`agent:<this>:<contextId>` sessionKeys; non-extension tasks keep using the
+primary `--openclaw-agent`. Pairs with a `tools.deny=["*"]` `agents.list`
+entry on the OpenClaw side — see the box below.
 
 > **Recommended dual-agent setup for the openai-compat extension.**
 > If you advertise the `…/openai-compat/v1` extension on the OpenClaw
@@ -445,34 +485,38 @@ second WS. Override if yours isn't on the default:
 >   }
 > }
 > ```
-> Then set `OPENCLAW_OAI_COMPAT_AGENT=oai` (or
+> Then set `--openclaw-openai-compat-agent oai` (or
 > `backends.openclaw.openai_compat_agent: "oai"` in `config.json`)
 > on the vicoop-client side. Pilot measurement on
 > `anthropic/claude-sonnet-4-6` saw envelope-contract compliance
 > rise from 5/10 (single-agent baseline, full tools) to 10/10 with
-> this split. Leave `OPENCLAW_OAI_COMPAT_AGENT` unset and you get
-> today's single-agent behavior on every task.
+> this split. Leave the flag unset and you get today's single-agent
+> behavior on every task.
 
-### Claude-specific env
+### Claude-specific knobs
 
-If you're running the Claude backend, set `BACKEND=claude` and optionally set
-`CLAUDE_CWD` so Claude works against a different repository than the directory
-where `vicoop-client` itself was started. With Step 4's `config.json` already
-holding the daemon credentials, the foreground command is just:
+For the Claude backend, pass `--backend claude` (or persist
+`"backend": "claude"` in `config.json`) and optionally point Claude at a
+different repository than the one `vicoop-client` itself runs in:
 
 ```sh
-BACKEND=claude \
-CLAUDE_CWD="$HOME/vicoop-bridge" \
-  "$INSTALL_DIR/bin/vicoop-client"
+"$INSTALL_DIR/bin/vicoop-client" \
+  --backend claude \
+  --claude-cwd "$HOME/vicoop-bridge"
 ```
 
 Both knobs can also live in the canonical `config.json` (resolved per Step
 4 — `~/.vicoop/config.json` by default) under `backends.claude`
 (`cwd`, `settings`) so the foreground command shrinks to just
-`"$INSTALL_DIR/bin/vicoop-client"`; the env vars still win when set, mirroring
+`"$INSTALL_DIR/bin/vicoop-client"`; the flag wins over config, mirroring
 the daemon-level precedence (Step 6 intro).
 
-> **Sandbox-on by default.** When neither `CLAUDE_SETTINGS_JSON` nor
+| Flag | `backends.claude.*` |
+|---|---|
+| `--claude-cwd` | `cwd` |
+| `--claude-settings-file` | `settings` (JSON object) |
+
+> **Sandbox-on by default.** When neither `--claude-settings-file` nor
 > `backends.claude.settings` is set, the backend forwards
 > `--settings '{"sandbox":{"enabled":true,"failIfUnavailable":true}}'` to every
 > spawned `claude`. The OS-level sandbox (Seatbelt on macOS, bubblewrap on
@@ -482,7 +526,7 @@ the daemon-level precedence (Step 6 intro).
 > complete `settings` object — it replaces the default entirely. To run
 > without a sandbox, pass `{ "sandbox": { "enabled": false } }`.
 
-`CLAUDE_CWD` defaults to the current working directory of the client
+`--claude-cwd` defaults to the current working directory of the client
 process. Set it when the released bundle lives outside the repository you
 want Claude to edit.
 
@@ -490,16 +534,16 @@ The Claude backend also injects a small `--append-system-prompt` on every
 spawned `claude` telling it its own A2A mention (`@<agentId>@<host>`) so
 the model recognises self-references in user messages and doesn't try to
 a2a-call its own address (see #128). No configuration required — it's
-derived from `AGENT_ID` and the host part of `SERVER_URL`.
+derived from `--agentId` and the host part of `--server`.
 
-> **Note on host derivation.** The injected mention uses `SERVER_URL`'s
+> **Note on host derivation.** The injected mention uses the server URL's
 > host (e.g. `wss://bridge.example.com/ws` → `bridge.example.com`). The
 > bridge's canonical Mentionable/WebFinger domain comes from `PUBLIC_URL`
 > on the server side. If the two differ (e.g. a custom domain in front of
 > a Fly hostname), the model is taught a mention that doesn't match what
 > users see via WebFinger and self-reference detection won't fire. Run
 > `vicoop-client whoami --verify` to confirm the WebFinger lookup actually
-> resolves the agent under the derived host; align `SERVER_URL` with
+> resolves the agent under the derived host; align `--server` with
 > `PUBLIC_URL`'s host if it doesn't.
 
 ### Check your agent's mention / acct (any backend)
@@ -530,9 +574,9 @@ Typical follow-ups from this output:
    would POST to (e.g. `a2a-wallet a2a stream <a2a> "..."`).
 2. **Confirm which card the bridge advertises.** `curl` the `a2a card` URL —
    that's the canonical card external callers receive, which is the
-   server-published default for `BACKEND` unless you set `AGENT_CARD` to
-   override it (see Step 5). If the response doesn't match what you expect,
-   that's the cue to override.
+   server-published default for the selected backend unless you pass
+   `--card <path>` (or set `AGENT_CARD`) to override it (see Step 5). If the
+   response doesn't match what you expect, that's the cue to override.
 
    ```sh
    CARD_URL=$("$INSTALL_DIR/bin/vicoop-client" whoami --json | jq -r .a2aCardUrl)
@@ -541,43 +585,47 @@ Typical follow-ups from this output:
 3. **Verify WebFinger actually resolves the acct.** `whoami --verify`
    additionally fetches the WebFinger URL and reports whether the bridge
    resolves this agent's acct under the derived host. This catches the
-   `SERVER_URL` host vs bridge `PUBLIC_URL` mismatch flagged in the
+   client server URL host vs bridge `PUBLIC_URL` mismatch flagged in the
    Claude-specific note above; if `--verify` fails, align the two before
    trusting self-reference detection or external mentions.
 
 `--json` emits a machine-readable record of all the same fields for scripts.
 
-### Codex-specific env
+### Codex-specific knobs
 
-If you're running the Codex backend, set `BACKEND=codex` and optionally set
-`CODEX_CWD` so Codex works against a different repository than the directory
-where `vicoop-client` itself was started. With Step 4's `config.json` in place
-the foreground command is just:
+For the Codex backend, pass `--backend codex` (or persist
+`"backend": "codex"` in `config.json`) and optionally point Codex at a
+different repository / loosen the sandbox:
 
 ```sh
-BACKEND=codex \
-CODEX_CWD="$HOME/vicoop-bridge" \
-CODEX_SANDBOX_MODE=workspace-write \
-  "$INSTALL_DIR/bin/vicoop-client"
+"$INSTALL_DIR/bin/vicoop-client" \
+  --backend codex \
+  --codex-cwd "$HOME/vicoop-bridge" \
+  --codex-sandbox workspace-write
 ```
 
-Both `cwd` and `sandbox_mode` can also live in the canonical `config.json`
-(resolved per Step 4 — `~/.vicoop/config.json` by default) under
-`backends.codex` so the foreground command can shrink to just
-`"$INSTALL_DIR/bin/vicoop-client"`. Env vars still win when set.
+Both knobs can also live in the canonical `config.json` (resolved per Step
+4 — `~/.vicoop/config.json` by default) under `backends.codex` so the
+foreground command can shrink to just `"$INSTALL_DIR/bin/vicoop-client"`.
+The flag wins over config.
 
-`CODEX_CWD` defaults to the current working directory of the client process.
-The v1 backend accepts text plus inline image `file.bytes` inputs and returns
-text output. `CODEX_SANDBOX_MODE` is optional and accepts `read-only`,
-`workspace-write`, or `danger-full-access`; the client passes it to Codex as
-`-c sandbox_mode="<mode>"` so the same setting applies to fresh and resumed
-Codex sessions.
+| Flag | `backends.codex.*` |
+|---|---|
+| `--codex-cwd` | `cwd` |
+| `--codex-sandbox` | `sandbox_mode` |
 
-> **Sandbox-on by default.** With neither `CODEX_SANDBOX_MODE` nor
+`--codex-cwd` defaults to the current working directory of the client
+process. The v1 backend accepts text plus inline image `file.bytes`
+inputs and returns text output. `--codex-sandbox` is optional and
+accepts `read-only`, `workspace-write`, or `danger-full-access`; the
+client passes it to Codex as `-c sandbox_mode="<mode>"` so the same
+setting applies to fresh and resumed Codex sessions.
+
+> **Sandbox-on by default.** With neither `--codex-sandbox` nor
 > `backends.codex.sandbox_mode` set, the backend passes
 > `-c sandbox_mode="read-only"` explicitly — the same default Codex CLI
-> applies, but stamped into argv so the posture is visible in `ps` / audit
-> logs and survives any future change to Codex's own default.
+> applies, but stamped into argv so the posture is visible in `ps` /
+> audit logs and survives any future change to Codex's own default.
 
 > **`cwd` need not be a git repository.** The Codex backend speaks
 > `codex app-server` over stdio JSON-RPC and does not require a
@@ -638,8 +686,10 @@ that `login` writes alongside it). If the saved bearer is missing or expired,
 refresh it without registering a new client:
 
 ```sh
-"$INSTALL_DIR/bin/vicoop-client" login --bridge "$BRIDGE_URL"
+"$INSTALL_DIR/bin/vicoop-client" login
 ```
+
+(Self-hosting? Pass `--bridge https://<your-bridge>`.)
 
 These talk to the bridge's `/admin-api/*` routes — same logic the admin
 agent's tools run, but without an LLM round-trip per call.
@@ -650,6 +700,8 @@ agent's tools run, but without an LLM round-trip per call.
 # $OWNER_TOKEN: vbc_owner_* token from /oauth/device/code with
 # intent=owner_session (the bearer Step 4 login saved into
 # ~/.vicoop/owner-session.json works directly).
+# Self-hosting? Swap the URL for your own bridge.
+BRIDGE_URL=https://vicoop-bridge-server.fly.dev
 WALLET_PRINCIPAL="eth:$(a2a-wallet status | awk '/Address/{print tolower($2)}')"
 
 curl -sX POST "$BRIDGE_URL/" \
