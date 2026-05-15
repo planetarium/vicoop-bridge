@@ -17,6 +17,13 @@ import type { ClientConfig, BackendConfigs } from './config.js';
 // across most installs) is item 6 of issue #189.
 export const DEFAULT_BRIDGE_URL = 'wss://vicoop-bridge-server.fly.dev';
 
+// HTTPS form of the same bridge, used by `login` (device-flow over HTTPS)
+// and the `setup` / admin commands that talk to the bridge's REST + GraphQL
+// surfaces. Kept in lock-step with `DEFAULT_BRIDGE_URL`; the scheme split
+// is unavoidable because the daemon connects over WS while OAuth /
+// /admin-api use HTTPS.
+export const DEFAULT_BRIDGE_HTTPS_URL = 'https://vicoop-bridge-server.fly.dev';
+
 const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const;
 export type CodexSandboxMode = (typeof SANDBOX_MODES)[number];
 

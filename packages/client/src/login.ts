@@ -9,6 +9,7 @@ import { flag, option } from '@optique/core/primitives';
 import { parse } from '@optique/core/parser';
 import { formatMessage } from '@optique/core/message';
 import { string } from '@optique/core/valueparser';
+import { DEFAULT_BRIDGE_HTTPS_URL } from './cli-args.js';
 import {
   defaultStorePath,
   saveOwnerSession,
@@ -45,7 +46,7 @@ interface OAuthError {
 function usage(): void {
   process.stderr.write(
     [
-      'usage: vicoop-client login --bridge <https://...> [--json]',
+      'usage: vicoop-client login [--bridge <https://...>] [--json]',
       '',
       'Drives Google OAuth device flow and issues an owner-session bearer used',
       'by setup / add-caller / list-callers / list-agents / remove-caller.',
@@ -55,7 +56,8 @@ function usage(): void {
       'does NOT persist the session).',
       '',
       'Flags:',
-      '  --bridge          Bridge HTTP URL (e.g. https://vicoop-bridge-server.fly.dev)',
+      `  --bridge          Bridge HTTP URL (default ${DEFAULT_BRIDGE_HTTPS_URL};`,
+      '                    override only when running your own bridge).',
       '  --owner-session   Accepted for compatibility; login always issues owner-session.',
       '  --json            Print the token endpoint response as JSON to stdout',
       '                    without persisting ~/.vicoop/owner-session.json.',
@@ -80,11 +82,10 @@ function parseArgs(args: string[]): LoginArgs | null {
     process.stderr.write(`${formatMessage(r.error, { colors: false })}\n`);
     return null;
   }
-  if (!r.value.bridge) {
-    usage();
-    return null;
-  }
-  return { bridge: r.value.bridge, json: r.value.json, pollOnce: r.value.pollOnce };
+  // No --bridge → fall back to the public bridge URL (#189 §6). Self-hosters
+  // who run their own bridge pass `--bridge https://bridge.example.com`.
+  const bridge = r.value.bridge ?? DEFAULT_BRIDGE_HTTPS_URL;
+  return { bridge, json: r.value.json, pollOnce: r.value.pollOnce };
 }
 
 async function fetchDeviceCode(args: LoginArgs): Promise<DeviceCodeResponse> {

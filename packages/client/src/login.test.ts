@@ -98,3 +98,72 @@ test('login saves owner-session bearer without registering a client', async (t) 
   assert.equal(saved.principal_id, 'google:123');
   assert.match(stderr, /Run `vicoop-client setup`/);
 });
+
+test('login falls back to DEFAULT_BRIDGE_HTTPS_URL when --bridge is omitted', async (t) => {
+  // Issue #189 §6 / AC#9: fresh installs against the public bridge should
+  // need zero flags. `login` no longer requires `--bridge`; absence routes
+  // every fetch at the baked-in default URL.
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-login-default-'));
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  const previousXdg = process.env.XDG_CONFIG_HOME;
+  process.env.HOME = tmpHome;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  delete process.env.XDG_CONFIG_HOME;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+    if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousXdg;
+  });
+
+  const seen: string[] = [];
+  const originalFetch = globalThis.fetch;
+  let call = 0;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    seen.push(typeof input === 'string' ? input : input.toString());
+    call++;
+    if (call === 1) {
+      return new Response(
+        JSON.stringify({
+          device_code: 'device-test',
+          user_code: 'ABCD-EFGH',
+          verification_uri: 'https://x/oauth/device',
+          verification_uri_complete: 'https://x/oauth/device?u=A',
+          expires_in: 600,
+          interval: 1,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        access_token: 'vbc_owner_default',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        principal_id: 'google:default',
+        email: null,
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  // Quiet the stderr usage / approval prompts that runLogin writes during
+  // the polling phase — they're not under test here.
+  t.mock.method(process.stderr, 'write', () => true);
+
+  const code = await runLogin([]);
+  assert.equal(code, 0);
+  // Both round-trips (device-code, token) hit the public bridge HTTPS URL.
+  assert.ok(
+    seen.every((u) => u.startsWith('https://vicoop-bridge-server.fly.dev/')),
+    `expected every fetch to hit the default bridge URL; got ${JSON.stringify(seen)}`,
+  );
+});
