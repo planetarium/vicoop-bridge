@@ -64,23 +64,25 @@ Portable release bundle for the standalone client daemon.
 ## Quick start
 
 \`\`\`bash
-export BRIDGE_URL=https://vicoop-bridge-server.fly.dev
-export AGENT_ID=my-agent
+AGENT_ID=my-agent
 
 # 1. Sign in as the client owner (saves an owner-session bearer to
 #    ~/.vicoop/owner-session.json; admin subcommands pick it up).
-./bin/vicoop-client login --bridge "\$BRIDGE_URL"
+#    --bridge defaults to https://vicoop-bridge-server.fly.dev; pass
+#    --bridge https://your-bridge if you self-host.
+./bin/vicoop-client login
 
-# 2. Register a bridge client and write its one-time CLIENT_TOKEN into a
-#    daemon env file (mode 600, export'd + single-quoted, safe to source).
+# 2. Register a bridge client. setup writes the one-time CLIENT_TOKEN
+#    plus server_url / agent_id into the canonical ~/.vicoop/config.json
+#    (mode 600). The daemon picks those up on its next launch.
 ./bin/vicoop-client setup \\
   --client-name "my client" \\
-  --agent-ids "\$AGENT_ID" \\
-  --write-env-file ./vicoop-client.env
-\`\`\`
+  --agent-ids "\$AGENT_ID"
 
-Then start the client with env vars from \`./vicoop-client.env\` and a backend card
-such as \`./cards/openclaw.json\` or \`./cards/claude.json\`.
+# 3. Start the daemon. With config.json populated, the only thing left
+#    to choose is the backend (echo / openclaw / claude / codex).
+./bin/vicoop-client --backend openclaw
+\`\`\`
 
 ## Notes
 

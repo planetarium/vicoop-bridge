@@ -339,8 +339,11 @@ token.
    that bearer, receives `{client_id, client_token, owner_principal,
    allowed_agent_ids}`, and writes the daemon credentials into
    `~/.vicoop/config.json` (mode 600). With `--write-env-file <path>` it
-   additionally emits a shell-sourceable env file at that path. It never
-   sees a `vbc_caller_*` token.
+   additionally emits a shell-sourceable env file at that path — useful as
+   a credentials audit/backup record, though the daemon no longer reads
+   those env vars (#189 §5); it always sources runtime config from
+   `config.json` or `--config <path>`. It never sees a `vbc_caller_*`
+   token.
 
 This means a Google-only operator can stand up a bridge client without
 ever holding a wallet or seed phrase. Owner is recorded as
