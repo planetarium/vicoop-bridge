@@ -1,10 +1,11 @@
-// Pure argv/env/config merging for the daemon entrypoint. Lives in its own
+// Pure argv/config merging for the daemon entrypoint. Lives in its own
 // module so tests can import it without triggering the side-effectful
 // `main()` at the bottom of cli.ts.
 
 import { object } from '@optique/core/constructs';
 import { optional } from '@optique/core/modifiers';
 import { option } from '@optique/core/primitives';
+import { message } from '@optique/core/message';
 import { choice, integer, string } from '@optique/core/valueparser';
 import { parse } from '@optique/core/parser';
 import { formatMessage } from '@optique/core/message';
@@ -32,31 +33,82 @@ export type BackendKind = (typeof BACKEND_KINDS)[number];
 
 // Optique daemon-mode grammar. Every operator-tunable knob is a flag here,
 // including the ones that used to be env-only (CLAUDE_CWD, CODEX_SANDBOX_MODE,
-// OPENCLAW_*) — see issue #189 §1. `optional()` everywhere because env vars
-// and config.json layers fill the gaps; the merge step below decides whether
+// OPENCLAW_*) — see issue #189 §1. `optional()` everywhere because the
+// config.json layer fills the gaps; the merge step below decides whether
 // a field is actually missing.
-export const daemonFlagsParser = object({
-  server: optional(option('--server', string({ metavar: 'WS_URL' }))),
-  token: optional(option('--token', string({ metavar: 'TOKEN' }))),
-  agentId: optional(option('--agentId', string({ metavar: 'ID' }))),
-  card: optional(option('--card', string({ metavar: 'PATH' }))),
-  backend: optional(option('--backend', choice([...BACKEND_KINDS]))),
-  config: optional(option('--config', string({ metavar: 'PATH' }))),
-  // Promoted from env-only to first-class flags (issue #189 §1).
-  claudeCwd: optional(option('--claude-cwd', string({ metavar: 'PATH' }))),
-  claudeSettingsFile: optional(option('--claude-settings-file', string({ metavar: 'PATH' }))),
-  codexCwd: optional(option('--codex-cwd', string({ metavar: 'PATH' }))),
-  codexSandbox: optional(option('--codex-sandbox', choice([...SANDBOX_MODES]))),
-  openclawGateway: optional(option('--openclaw-gateway', string({ metavar: 'WS_URL' }))),
-  openclawGatewayToken: optional(option('--openclaw-gateway-token', string({ metavar: 'TOKEN' }))),
-  openclawAgent: optional(option('--openclaw-agent', string({ metavar: 'NAME' }))),
+//
+// Fields are exposed as a plain object literal so cli.ts can spread them
+// into the top-level `or(command(…), daemonCmd)` parser without losing
+// per-field types. `daemonFlagsParser` keeps the wrapped form for tests
+// that call `parseFlags` directly.
+//
+// `group()` wrappers below give optique's help renderer section headers
+// (Identity / Connection / Backend / Backend-specific Claude / Codex /
+// OpenClaw) — issue #189 §3.
+export const daemonFlagsFields = {
+  // Identity
+  token: optional(option('--token', string({ metavar: 'TOKEN' }), {
+    description: message`Bridge client token (issued by \`vicoop-client setup\`; usually persisted in config.json).`,
+  })),
+  agentId: optional(option('--agentId', string({ metavar: 'ID' }), {
+    description: message`Agent id (routing key external A2A callers use).`,
+  })),
+
+  // Connection
+  server: optional(option('--server', string({ metavar: 'WS_URL' }), {
+    description: message`Bridge WS URL. Defaults to ${DEFAULT_BRIDGE_URL}; set only when self-hosting.`,
+  })),
+  card: optional(option('--card', string({ metavar: 'PATH' }), {
+    description: message`Agent card JSON override (defaults to the server-published card for the chosen backend).`,
+  })),
+  config: optional(option('--config', string({ metavar: 'PATH' }), {
+    description: message`Explicit config.json overlaid on the canonical file.`,
+  })),
+
+  // Backend selection
+  backend: optional(option('--backend', choice([...BACKEND_KINDS]), {
+    description: message`Backend implementation. Default: \`echo\`.`,
+  })),
+
+  // Backend-specific (Claude)
+  claudeCwd: optional(option('--claude-cwd', string({ metavar: 'PATH' }), {
+    description: message`Working directory for the spawned \`claude\`.`,
+  })),
+  claudeSettingsFile: optional(option('--claude-settings-file', string({ metavar: 'PATH' }), {
+    description: message`Path to a JSON file used as Claude \`--settings\`.`,
+  })),
+
+  // Backend-specific (Codex)
+  codexCwd: optional(option('--codex-cwd', string({ metavar: 'PATH' }), {
+    description: message`Working directory for the spawned \`codex\`.`,
+  })),
+  codexSandbox: optional(option('--codex-sandbox', choice([...SANDBOX_MODES]), {
+    description: message`Codex sandbox mode.`,
+  })),
+
+  // Backend-specific (OpenClaw)
+  openclawGateway: optional(option('--openclaw-gateway', string({ metavar: 'WS_URL' }), {
+    description: message`Gateway WS URL (default ws://127.0.0.1:18789).`,
+  })),
+  openclawGatewayToken: optional(option('--openclaw-gateway-token', string({ metavar: 'TOKEN' }), {
+    description: message`Auth token if your gateway requires one.`,
+  })),
+  openclawAgent: optional(option('--openclaw-agent', string({ metavar: 'NAME' }), {
+    description: message`Primary OpenClaw agent name. Default: \`main\`.`,
+  })),
   openclawOpenaiCompatAgent: optional(
-    option('--openclaw-openai-compat-agent', string({ metavar: 'NAME' })),
+    option('--openclaw-openai-compat-agent', string({ metavar: 'NAME' }), {
+      description: message`Secondary OpenClaw agent dedicated to openai-compat-extension tasks (gateway must define this agent with tools.deny=["*"]).`,
+    }),
   ),
   openclawTaskTimeoutMs: optional(
-    option('--openclaw-task-timeout-ms', integer({ metavar: 'MS', min: 1 })),
+    option('--openclaw-task-timeout-ms', integer({ metavar: 'MS', min: 1 }), {
+      description: message`Per-task timeout in milliseconds.`,
+    }),
   ),
-});
+};
+
+export const daemonFlagsParser = object(daemonFlagsFields);
 
 export type DaemonFlags = InferValue<typeof daemonFlagsParser>;
 

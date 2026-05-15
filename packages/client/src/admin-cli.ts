@@ -9,89 +9,130 @@
 // process exits with code 1.
 
 import { object } from '@optique/core/constructs';
-import { multiple, optional, withDefault } from '@optique/core/modifiers';
-import { argument, flag, option } from '@optique/core/primitives';
-import { parse } from '@optique/core/parser';
-import { formatMessage } from '@optique/core/message';
+import { optional, withDefault } from '@optique/core/modifiers';
+import { argument, command, constant, flag, option } from '@optique/core/primitives';
+import { message } from '@optique/core/message';
+import type { InferValue } from '@optique/core/parser';
 import { string } from '@optique/core/valueparser';
 import { resolveOwnerSession } from './owner-session.js';
 
-type Subcommand =
-  | 'add-caller'
-  | 'remove-caller'
-  | 'list-callers'
-  | 'list-agents'
-  | 'list-clients'
-  | 'revoke-client';
+// All six admin subcommands share the same auth/output flags. Define them
+// once and splice into each command's parser to keep the surface uniform.
+const sharedFlags = {
+  bridge: optional(option('--bridge', string({ metavar: 'URL' }), {
+    description: message`Override the bridge URL from the saved owner-session. Pair with --token.`,
+  })),
+  token: optional(option('--token', string({ metavar: 'TOKEN' }), {
+    description: message`Override the owner-session token from disk. Pair with --bridge.`,
+  })),
+  json: withDefault(flag('--json', {
+    description: message`Emit a machine-readable JSON response.`,
+  }), false),
+};
 
-interface ParsedArgs {
-  positional: string[];
-  bridge?: string;
-  token?: string;
-  json: boolean;
-  help: boolean;
-}
+export const addCallerCmd = command(
+  'add-caller',
+  object({
+    action: constant('add-caller' as const),
+    ...sharedFlags,
+    agentId: argument(string({ metavar: 'AGENT_ID' })),
+    principal: argument(string({ metavar: 'PRINCIPAL' })),
+  }),
+  {
+    brief: message`Add a principal to the agent's allowed-callers list.`,
+    description: message`Calls POST /admin-api/agents/<AGENT_ID>/callers to add PRINCIPAL to the allowlist. Hot-reloaded — no daemon restart needed.`,
+  },
+);
 
-// Shared parser across the six admin subcommands. Each subcommand handler
-// validates its own positional arity afterwards — keeping the parser
-// generic lets one definition serve all six call sites.
-const adminParser = object({
-  bridge: optional(option('--bridge', string({ metavar: 'URL' }))),
-  token: optional(option('--token', string({ metavar: 'TOKEN' }))),
-  json: withDefault(flag('--json'), false),
-  positional: multiple(argument(string({ metavar: 'ARG' }))),
-});
+export const removeCallerCmd = command(
+  'remove-caller',
+  object({
+    action: constant('remove-caller' as const),
+    ...sharedFlags,
+    agentId: argument(string({ metavar: 'AGENT_ID' })),
+    principal: argument(string({ metavar: 'PRINCIPAL' })),
+  }),
+  {
+    brief: message`Remove a principal from the agent's allowed-callers list.`,
+    description: message`Calls DELETE /admin-api/agents/<AGENT_ID>/callers?principal=<PRINCIPAL>. Hot-reloaded.`,
+  },
+);
 
-function parseArgs(args: string[]): ParsedArgs | { error: string } {
-  const r = parse(adminParser, args);
-  if (!r.success) {
-    return { error: formatMessage(r.error, { colors: false }) };
-  }
-  return {
-    positional: [...r.value.positional],
-    bridge: r.value.bridge,
-    token: r.value.token,
-    json: r.value.json,
-    // -h/--help is detected pre-parse by each handler (they all return 0
-    // and print their own usage). The flag is never threaded into the
-    // optique grammar — adding it would shadow optique's own help builder
-    // and the existing per-subcommand `usage()` strings would lose their
-    // exact wording, which tests assert against.
-    help: false,
-  };
-}
+export const listCallersCmd = command(
+  'list-callers',
+  object({
+    action: constant('list-callers' as const),
+    ...sharedFlags,
+    agentId: argument(string({ metavar: 'AGENT_ID' })),
+  }),
+  {
+    brief: message`Show the agent's allowed-callers list.`,
+  },
+);
 
-function usage(sub: Subcommand): string {
-  switch (sub) {
-    case 'add-caller':
-      return 'usage: vicoop-client add-caller <agent_id> <principal> [--bridge URL] [--token TOKEN] [--json]';
-    case 'remove-caller':
-      return 'usage: vicoop-client remove-caller <agent_id> <principal> [--bridge URL] [--token TOKEN] [--json]';
-    case 'list-callers':
-      return 'usage: vicoop-client list-callers <agent_id> [--bridge URL] [--token TOKEN] [--json]';
-    case 'list-agents':
-      return 'usage: vicoop-client list-agents [--bridge URL] [--token TOKEN] [--json]';
-    case 'list-clients':
-      return 'usage: vicoop-client list-clients [--bridge URL] [--token TOKEN] [--json]';
-    case 'revoke-client':
-      return 'usage: vicoop-client revoke-client <client-id-or-name> [--bridge URL] [--token TOKEN] [--json]';
-  }
-}
+export const listAgentsCmd = command(
+  'list-agents',
+  object({
+    action: constant('list-agents' as const),
+    ...sharedFlags,
+  }),
+  {
+    brief: message`List currently connected agents under this owner.`,
+  },
+);
+
+export const listClientsCmd = command(
+  'list-clients',
+  object({
+    action: constant('list-clients' as const),
+    ...sharedFlags,
+  }),
+  {
+    brief: message`List every client registration under this owner (including disconnected).`,
+    description: message`Surfaces orphan clients left behind by an aborted setup, exited daemon, or leaked CLIENT_TOKEN. Use \`revoke-client\` to clean them up.`,
+  },
+);
+
+export const revokeClientCmd = command(
+  'revoke-client',
+  object({
+    action: constant('revoke-client' as const),
+    ...sharedFlags,
+    target: argument(string({ metavar: 'CLIENT_ID_OR_NAME' })),
+  }),
+  {
+    brief: message`Revoke a client by id or unique name.`,
+    description: message`Marks the clients row revoked=true and, if a daemon is live, closes its WebSocket with code 4014. Revoked clients cannot re-authenticate; the row is preserved for audit history.`,
+  },
+);
+
+export type AddCallerArgs = InferValue<typeof addCallerCmd>;
+export type RemoveCallerArgs = InferValue<typeof removeCallerCmd>;
+export type ListCallersArgs = InferValue<typeof listCallersCmd>;
+export type ListAgentsArgs = InferValue<typeof listAgentsCmd>;
+export type ListClientsArgs = InferValue<typeof listClientsCmd>;
+export type RevokeClientArgs = InferValue<typeof revokeClientCmd>;
 
 interface Session {
   bridge: string;
   token: string;
 }
 
-function resolveSession(parsed: ParsedArgs): Session | { error: string } {
-  // Explicit --bridge / --token wins over env wins over file.
-  if (parsed.bridge && parsed.token) {
-    return { bridge: parsed.bridge.replace(/\/$/, ''), token: parsed.token };
+// Auth resolution shared by every admin handler. Explicit --bridge/--token
+// wins; otherwise we fall back to the file `vicoop-client login` wrote (or
+// VICOOP_BRIDGE / VICOOP_OWNER_TOKEN if the operator prefers env, which is
+// owner-session-bootstrap, *not* daemon runtime config — see #189 §5
+// rationale).
+function resolveSession(args: {
+  bridge?: string;
+  token?: string;
+}): Session | { error: string } {
+  if (args.bridge && args.token) {
+    return { bridge: args.bridge.replace(/\/$/, ''), token: args.token };
   }
   const stored = resolveOwnerSession();
-  // Allow --bridge or --token to override one half.
-  const bridge = parsed.bridge ?? stored?.bridge;
-  const token = parsed.token ?? stored?.token;
+  const bridge = args.bridge ?? stored?.bridge;
+  const token = args.token ?? stored?.token;
   if (!bridge || !token) {
     return {
       error:
@@ -251,22 +292,8 @@ function renderAgentList(body: unknown): string {
     .join('\n---\n');
 }
 
-export async function runAddCaller(args: string[]): Promise<number> {
-  if (args.includes('-h') || args.includes('--help')) {
-    process.stdout.write(`${usage('add-caller')}\n`);
-    return 0;
-  }
-  const parsed = parseArgs(args);
-  if ('error' in parsed) {
-    process.stderr.write(`${parsed.error}\n${usage('add-caller')}\n`);
-    return 1;
-  }
-  if (parsed.positional.length !== 2) {
-    process.stderr.write(`${usage('add-caller')}\n`);
-    return 1;
-  }
-  const [agentId, principal] = parsed.positional;
-  const session = resolveSession(parsed);
+export async function runAddCaller(args: AddCallerArgs): Promise<number> {
+  const session = resolveSession(args);
   if ('error' in session) {
     process.stderr.write(`${session.error}\n`);
     return 1;
@@ -274,28 +301,14 @@ export async function runAddCaller(args: string[]): Promise<number> {
   const result = await callApi({
     session,
     method: 'POST',
-    path: `/admin-api/agents/${encodeURIComponent(agentId)}/callers`,
-    body: { principal },
+    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/callers`,
+    body: { principal: args.principal },
   });
-  return emit(result, parsed.json, renderCallerMutation);
+  return emit(result, args.json, renderCallerMutation);
 }
 
-export async function runRemoveCaller(args: string[]): Promise<number> {
-  if (args.includes('-h') || args.includes('--help')) {
-    process.stdout.write(`${usage('remove-caller')}\n`);
-    return 0;
-  }
-  const parsed = parseArgs(args);
-  if ('error' in parsed) {
-    process.stderr.write(`${parsed.error}\n${usage('remove-caller')}\n`);
-    return 1;
-  }
-  if (parsed.positional.length !== 2) {
-    process.stderr.write(`${usage('remove-caller')}\n`);
-    return 1;
-  }
-  const [agentId, principal] = parsed.positional;
-  const session = resolveSession(parsed);
+export async function runRemoveCaller(args: RemoveCallerArgs): Promise<number> {
+  const session = resolveSession(args);
   if ('error' in session) {
     process.stderr.write(`${session.error}\n`);
     return 1;
@@ -303,27 +316,13 @@ export async function runRemoveCaller(args: string[]): Promise<number> {
   const result = await callApi({
     session,
     method: 'DELETE',
-    path: `/admin-api/agents/${encodeURIComponent(agentId)}/callers?principal=${encodeURIComponent(principal)}`,
+    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/callers?principal=${encodeURIComponent(args.principal)}`,
   });
-  return emit(result, parsed.json, renderCallerMutation);
+  return emit(result, args.json, renderCallerMutation);
 }
 
-export async function runListCallers(args: string[]): Promise<number> {
-  if (args.includes('-h') || args.includes('--help')) {
-    process.stdout.write(`${usage('list-callers')}\n`);
-    return 0;
-  }
-  const parsed = parseArgs(args);
-  if ('error' in parsed) {
-    process.stderr.write(`${parsed.error}\n${usage('list-callers')}\n`);
-    return 1;
-  }
-  if (parsed.positional.length !== 1) {
-    process.stderr.write(`${usage('list-callers')}\n`);
-    return 1;
-  }
-  const [agentId] = parsed.positional;
-  const session = resolveSession(parsed);
+export async function runListCallers(args: ListCallersArgs): Promise<number> {
+  const session = resolveSession(args);
   if ('error' in session) {
     process.stderr.write(`${session.error}\n`);
     return 1;
@@ -331,26 +330,13 @@ export async function runListCallers(args: string[]): Promise<number> {
   const result = await callApi({
     session,
     method: 'GET',
-    path: `/admin-api/agents/${encodeURIComponent(agentId)}/callers`,
+    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/callers`,
   });
-  return emit(result, parsed.json, renderCallerList);
+  return emit(result, args.json, renderCallerList);
 }
 
-export async function runListClients(args: string[]): Promise<number> {
-  if (args.includes('-h') || args.includes('--help')) {
-    process.stdout.write(`${usage('list-clients')}\n`);
-    return 0;
-  }
-  const parsed = parseArgs(args);
-  if ('error' in parsed) {
-    process.stderr.write(`${parsed.error}\n${usage('list-clients')}\n`);
-    return 1;
-  }
-  if (parsed.positional.length !== 0) {
-    process.stderr.write(`${usage('list-clients')}\n`);
-    return 1;
-  }
-  const session = resolveSession(parsed);
+export async function runListClients(args: ListClientsArgs): Promise<number> {
+  const session = resolveSession(args);
   if ('error' in session) {
     process.stderr.write(`${session.error}\n`);
     return 1;
@@ -360,25 +346,11 @@ export async function runListClients(args: string[]): Promise<number> {
     method: 'GET',
     path: '/admin-api/clients',
   });
-  return emit(result, parsed.json, renderClientList);
+  return emit(result, args.json, renderClientList);
 }
 
-export async function runRevokeClient(args: string[]): Promise<number> {
-  if (args.includes('-h') || args.includes('--help')) {
-    process.stdout.write(`${usage('revoke-client')}\n`);
-    return 0;
-  }
-  const parsed = parseArgs(args);
-  if ('error' in parsed) {
-    process.stderr.write(`${parsed.error}\n${usage('revoke-client')}\n`);
-    return 1;
-  }
-  if (parsed.positional.length !== 1) {
-    process.stderr.write(`${usage('revoke-client')}\n`);
-    return 1;
-  }
-  const [target] = parsed.positional;
-  const session = resolveSession(parsed);
+export async function runRevokeClient(args: RevokeClientArgs): Promise<number> {
+  const session = resolveSession(args);
   if ('error' in session) {
     process.stderr.write(`${session.error}\n`);
     return 1;
@@ -386,26 +358,13 @@ export async function runRevokeClient(args: string[]): Promise<number> {
   const result = await callApi({
     session,
     method: 'DELETE',
-    path: `/admin-api/clients/${encodeURIComponent(target)}`,
+    path: `/admin-api/clients/${encodeURIComponent(args.target)}`,
   });
-  return emit(result, parsed.json, renderRevokeResult);
+  return emit(result, args.json, renderRevokeResult);
 }
 
-export async function runListAgents(args: string[]): Promise<number> {
-  if (args.includes('-h') || args.includes('--help')) {
-    process.stdout.write(`${usage('list-agents')}\n`);
-    return 0;
-  }
-  const parsed = parseArgs(args);
-  if ('error' in parsed) {
-    process.stderr.write(`${parsed.error}\n${usage('list-agents')}\n`);
-    return 1;
-  }
-  if (parsed.positional.length !== 0) {
-    process.stderr.write(`${usage('list-agents')}\n`);
-    return 1;
-  }
-  const session = resolveSession(parsed);
+export async function runListAgents(args: ListAgentsArgs): Promise<number> {
+  const session = resolveSession(args);
   if ('error' in session) {
     process.stderr.write(`${session.error}\n`);
     return 1;
@@ -415,5 +374,6 @@ export async function runListAgents(args: string[]): Promise<number> {
     method: 'GET',
     path: '/admin-api/agents',
   });
-  return emit(result, parsed.json, renderAgentList);
+  return emit(result, args.json, renderAgentList);
 }
+

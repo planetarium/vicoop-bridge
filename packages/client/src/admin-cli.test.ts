@@ -10,7 +10,41 @@ import {
   runListClients,
   runRemoveCaller,
   runRevokeClient,
+  type AddCallerArgs,
+  type ListAgentsArgs,
+  type ListCallersArgs,
+  type ListClientsArgs,
+  type RemoveCallerArgs,
+  type RevokeClientArgs,
 } from './admin-cli.js';
+
+// `runXxx` handlers now take the parser's discriminated-union output.
+// Tests construct that shape directly. Shared auth/output fields default
+// to undefined/false so each test only specifies what it cares about.
+const SHARED = { bridge: undefined, token: undefined, json: false } as const;
+const listAgentsArgs = (p: Partial<ListAgentsArgs> = {}): ListAgentsArgs =>
+  ({ action: 'list-agents', ...SHARED, ...p });
+const listClientsArgs = (p: Partial<ListClientsArgs> = {}): ListClientsArgs =>
+  ({ action: 'list-clients', ...SHARED, ...p });
+const listCallersArgs = (
+  agentId: string,
+  p: Partial<ListCallersArgs> = {},
+): ListCallersArgs => ({ action: 'list-callers', agentId, ...SHARED, ...p });
+const addCallerArgs = (
+  agentId: string,
+  principal: string,
+  p: Partial<AddCallerArgs> = {},
+): AddCallerArgs => ({ action: 'add-caller', agentId, principal, ...SHARED, ...p });
+const removeCallerArgs = (
+  agentId: string,
+  principal: string,
+  p: Partial<RemoveCallerArgs> = {},
+): RemoveCallerArgs =>
+  ({ action: 'remove-caller', agentId, principal, ...SHARED, ...p });
+const revokeClientArgs = (
+  target: string,
+  p: Partial<RevokeClientArgs> = {},
+): RevokeClientArgs => ({ action: 'revoke-client', target, ...SHARED, ...p });
 
 interface Captured {
   url: string;
@@ -127,7 +161,7 @@ test('list-agents calls GET /admin-api/agents and renders human output', async (
     },
   });
 
-  const code = await runListAgents([]);
+  const code = await runListAgents(listAgentsArgs());
   assert.equal(code, 0);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, 'GET');
@@ -141,7 +175,7 @@ test('list-agents --json prints raw JSON', async (t) => {
   const stdout = captureStdout(t);
   installFetch(t, { body: { agents: [] } });
 
-  const code = await runListAgents(['--json']);
+  const code = await runListAgents(listAgentsArgs({ json: true }));
   assert.equal(code, 0);
   const parsed = JSON.parse(stdout.read()) as { agents: unknown[] };
   assert.deepEqual(parsed, { agents: [] });
@@ -159,7 +193,7 @@ test('add-caller posts the principal in the body', async (t) => {
     },
   });
 
-  const code = await runAddCaller(['foo', principal]);
+  const code = await runAddCaller(addCallerArgs('foo', principal));
   assert.equal(code, 0);
   assert.equal(calls[0].method, 'POST');
   assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/callers`);
@@ -175,7 +209,7 @@ test('remove-caller URL-encodes the principal in the query string', async (t) =>
     body: { agent_id: 'foo', principal, allowed_callers: [] },
   });
 
-  const code = await runRemoveCaller(['foo', principal]);
+  const code = await runRemoveCaller(removeCallerArgs('foo', principal));
   assert.equal(code, 0);
   assert.equal(calls[0].method, 'DELETE');
   assert.equal(
@@ -196,7 +230,7 @@ test('list-callers GETs the agent endpoint', async (t) => {
     },
   });
 
-  const code = await runListCallers(['foo']);
+  const code = await runListCallers(listCallersArgs('foo'));
   assert.equal(code, 0);
   assert.equal(calls[0].method, 'GET');
   assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/callers`);
@@ -228,7 +262,7 @@ test('subcommand exits 1 with hint when no token is available', async (t) => {
     globalThis.fetch = original;
   });
 
-  const code = await runListAgents([]);
+  const code = await runListAgents(listAgentsArgs());
   assert.equal(code, 1);
   assert.match(stderr.read(), /vicoop-client login --bridge/);
 });
@@ -245,7 +279,7 @@ test('subcommand surfaces network errors as a clean exit-1 instead of crashing',
     globalThis.fetch = original;
   });
 
-  const code = await runListAgents([]);
+  const code = await runListAgents(listAgentsArgs());
   assert.equal(code, 1);
   assert.match(stderr.read(), /network error.*fetch failed/);
 });
@@ -269,7 +303,7 @@ test('list-clients calls GET /admin-api/clients and renders rows with connected 
     },
   });
 
-  const code = await runListClients([]);
+  const code = await runListClients(listClientsArgs());
   assert.equal(code, 0);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, 'GET');
@@ -285,7 +319,7 @@ test('list-clients --json prints raw JSON', async (t) => {
   const stdout = captureStdout(t);
   installFetch(t, { body: { clients: [] } });
 
-  const code = await runListClients(['--json']);
+  const code = await runListClients(listClientsArgs({ json: true }));
   assert.equal(code, 0);
   const parsed = JSON.parse(stdout.read()) as { clients: unknown[] };
   assert.deepEqual(parsed, { clients: [] });
@@ -303,7 +337,7 @@ test('revoke-client DELETEs /admin-api/clients/<target>', async (t) => {
     },
   });
 
-  const code = await runRevokeClient(['usage-test-1']);
+  const code = await runRevokeClient(revokeClientArgs('usage-test-1'));
   assert.equal(code, 0);
   assert.equal(calls[0].method, 'DELETE');
   assert.equal(calls[0].url, `${BRIDGE}/admin-api/clients/usage-test-1`);
@@ -316,7 +350,7 @@ test('revoke-client URL-encodes the target (so names with /, : survive)', async 
   const { calls } = installFetch(t, {
     body: { client_id: 'cid', client_name: target, revoked: true, closed_connections: 0 },
   });
-  const code = await runRevokeClient([target]);
+  const code = await runRevokeClient(revokeClientArgs(target));
   assert.equal(code, 0);
   assert.equal(calls[0].url, `${BRIDGE}/admin-api/clients/${encodeURIComponent(target)}`);
 });
@@ -329,32 +363,24 @@ test('revoke-client surfaces 409 ambiguous-name error as exit 1', async (t) => {
     body: { error: 'Ambiguous client name "dup" matches multiple clients (a, b). Specify client_id instead.' },
   });
 
-  const code = await runRevokeClient(['dup']);
+  const code = await runRevokeClient(revokeClientArgs('dup'));
   assert.equal(code, 1);
   assert.match(stderr.read(), /409.*Ambiguous client name/);
 });
 
-test('revoke-client requires exactly one positional', async (t) => {
-  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
-  const stderr = captureStderr(t);
-  const original = globalThis.fetch;
-  globalThis.fetch = (async () => {
-    throw new Error('fetch should not be called when args are invalid');
-  }) as typeof fetch;
-  t.after(() => {
-    globalThis.fetch = original;
-  });
-  const code = await runRevokeClient([]);
-  assert.equal(code, 1);
-  assert.match(stderr.read(), /usage: vicoop-client revoke-client/);
-});
+// Positional-arity checks moved out of these handler tests — `command()`
+// declares `target` as a required argument, so optique itself enforces it
+// at the top-level parser layer. The handler signature now guarantees a
+// non-undefined `target` arrived. Exercising the optique-side rejection
+// lives in the top-level CLI integration tests against the cli `or(…)`
+// parser (not in this per-subcommand handler suite).
 
 test('subcommand surfaces server error on non-2xx response', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   const stderr = captureStderr(t);
   installFetch(t, { status: 403, body: { error: 'Not authorized to modify this agent policy.' } });
 
-  const code = await runAddCaller(['foo', 'eth:0xabc']);
+  const code = await runAddCaller(addCallerArgs('foo', 'eth:0xabc'));
   assert.equal(code, 1);
   assert.match(stderr.read(), /403.*Not authorized/);
 });

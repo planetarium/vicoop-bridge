@@ -5,10 +5,10 @@
 
 import { existsSync } from 'node:fs';
 import { object } from '@optique/core/constructs';
-import { multiple, optional, withDefault } from '@optique/core/modifiers';
-import { flag, option } from '@optique/core/primitives';
-import { parse } from '@optique/core/parser';
-import { formatMessage } from '@optique/core/message';
+import { map, multiple, optional, withDefault } from '@optique/core/modifiers';
+import { command, constant, flag, option } from '@optique/core/primitives';
+import { message } from '@optique/core/message';
+import type { InferValue } from '@optique/core/parser';
 import { string } from '@optique/core/valueparser';
 import { atomicWriteFile, resolveOwnerSession } from './owner-session.js';
 import {
@@ -17,15 +17,48 @@ import {
   writeConfig,
 } from './config.js';
 
-interface SetupArgs {
-  clientName: string;
-  allowedAgentIds: string[];
-  callers: string[];
-  envFile: string | null;
-  bridge?: string;
-  token?: string;
-  json: boolean;
-}
+export const setupCmd = command(
+  'setup',
+  object({
+    action: constant('setup' as const),
+    clientName: option('--client-name', string({ metavar: 'NAME' }), {
+      description: message`Human-readable label saved with this client registration.`,
+    }),
+    // We accept comma-separated IDs in a single occurrence and explode
+    // them post-parse. `map()` does the split so the handler always sees
+    // a clean array — no callers need to remember the historical
+    // semicolon-or-comma trivia.
+    allowedAgentIds: map(option('--agent-ids', string({ metavar: 'ID1,ID2' }), {
+      description: message`Comma-separated agent ids this client is allowed to run as.`,
+    }), (raw) => raw.split(',').map((s) => s.trim()).filter(Boolean)),
+    // `--caller` is repeatable; we also accept comma-separated values in a
+    // single occurrence for symmetry with `--agent-ids`. `multiple` collects
+    // them all; the handler flattens the per-occurrence comma split.
+    callers: multiple(option('--caller', string({ metavar: 'PRINCIPAL' }), {
+      description: message`Principal allowed to call this agent. Repeatable; comma-separated lists also accepted within a single occurrence.`,
+    })),
+    envFile: optional(option('--write-env-file', string({ metavar: 'PATH' }), {
+      description: message`Also emit a shell-sourceable env file. Daemon does NOT consume these env vars (#189 §5); the file is purely an operator-side credentials backup / scripting hook.`,
+    })),
+    // `--env-file` is an alias for `--write-env-file` (older docs used it).
+    envFileAlias: optional(option('--env-file', string({ metavar: 'PATH' }))),
+    bridge: optional(option('--bridge', string({ metavar: 'URL' }), {
+      description: message`Override the bridge URL from the saved owner-session. Pair with --token.`,
+    })),
+    token: optional(option('--token', string({ metavar: 'TOKEN' }), {
+      description: message`Override the owner-session token from disk. Pair with --bridge.`,
+    })),
+    json: withDefault(flag('--json', {
+      description: message`Print the registerClient response as JSON to stdout instead of persisting to config.json.`,
+    }), false),
+  }),
+  {
+    brief: message`Register a bridge client and persist daemon credentials.`,
+    description: message`Calls the bridge's \`registerClient\` GraphQL mutation using the owner-session bearer (saved by \`vicoop-client login\`, or supplied via --bridge/--token), receives a one-time CLIENT_TOKEN, and writes the daemon credentials into the canonical \`~/.vicoop/config.json\` (mode 600). The token is unrecoverable after this single output; back up config.json before rotating hosts. \`--json\` skips disk persistence and prints the raw response instead.`,
+  },
+);
+
+export type SetupArgs = InferValue<typeof setupCmd>;
 
 interface RegisterClientGraphQLResponse {
   data?: {
@@ -48,58 +81,6 @@ interface ClientRegisterSuccess {
   owner_principal: string;
   client_name: string;
   allowed_agent_ids: string[];
-}
-
-function usage(): string {
-  return [
-    'usage: vicoop-client setup --client-name <name> --agent-ids <id1,id2>',
-    '                           [--caller PRINCIPAL]... [--write-env-file <path>]',
-    '                           [--bridge URL] [--token TOKEN] [--json]',
-  ].join('\n');
-}
-
-const setupParser = object({
-  clientName: optional(option('--client-name', string({ metavar: 'NAME' }))),
-  agentIds: optional(option('--agent-ids', string({ metavar: 'ID1,ID2' }))),
-  // `--caller` is repeatable; we also accept comma-separated values in a
-  // single occurrence to preserve the historical CLI surface.
-  callers: multiple(option('--caller', string({ metavar: 'PRINCIPAL' }))),
-  envFile: optional(option('--write-env-file', string({ metavar: 'PATH' }))),
-  // `--env-file` is an alias for `--write-env-file` (older docs used it).
-  envFileAlias: optional(option('--env-file', string({ metavar: 'PATH' }))),
-  bridge: optional(option('--bridge', string({ metavar: 'URL' }))),
-  token: optional(option('--token', string({ metavar: 'TOKEN' }))),
-  json: withDefault(flag('--json'), false),
-});
-
-function parseArgs(args: string[]): SetupArgs | { error: string; help?: boolean } {
-  if (args.includes('-h') || args.includes('--help')) {
-    return { error: '', help: true };
-  }
-  const r = parse(setupParser, args);
-  if (!r.success) {
-    return { error: formatMessage(r.error, { colors: false }) };
-  }
-  const v = r.value;
-  if (!v.clientName) return { error: '--client-name is required' };
-  const allowedAgentIds = v.agentIds
-    ? v.agentIds.split(',').map((s) => s.trim()).filter(Boolean)
-    : [];
-  if (allowedAgentIds.length === 0) return { error: '--agent-ids is required' };
-  // `--caller` is repeatable AND accepts comma-separated values within each
-  // occurrence — explode both into a flat list.
-  const callers = v.callers.flatMap((c) =>
-    c.split(',').map((s) => s.trim()).filter(Boolean),
-  );
-  return {
-    clientName: v.clientName,
-    allowedAgentIds,
-    callers,
-    envFile: v.envFile ?? v.envFileAlias ?? null,
-    bridge: v.bridge,
-    token: v.token,
-    json: v.json,
-  };
 }
 
 function gqlString(value: string): string {
@@ -200,7 +181,7 @@ function writeConfigForSetup(success: ClientRegisterSuccess, bridgeUrl: string):
 // here; see `writeOptionalEnvFile` for that path's separate failure
 // handling.
 function persistCanonical(
-  args: SetupArgs,
+  args: { json: boolean },
   success: ClientRegisterSuccess,
   bridgeUrl: string,
 ): string | null {
@@ -217,13 +198,13 @@ function persistCanonical(
 
 async function registerClient(
   session: { bridge: string; token: string },
-  args: SetupArgs,
+  args: { clientName: string; allowedAgentIds: readonly string[] },
 ): Promise<ClientRegisterSuccess> {
   const query =
     'mutation{' +
     'registerClient(input:{' +
     `clientName:${gqlString(args.clientName)},` +
-    `allowedAgentIds:${gqlStringArray(args.allowedAgentIds)}` +
+    `allowedAgentIds:${gqlStringArray([...args.allowedAgentIds])}` +
     '}){clientWithToken{id token ownerPrincipal allowedAgentIds}}' +
     '}';
 
@@ -318,27 +299,28 @@ async function configureCallers(
   }
 }
 
-export async function runSetup(args: string[]): Promise<number> {
-  const parsed = parseArgs(args);
-  if ('error' in parsed) {
-    if (parsed.help) {
-      process.stdout.write(`${usage()}\n`);
-      return 0;
-    }
-    process.stderr.write(`${parsed.error}\n${usage()}\n`);
+export async function runSetup(args: SetupArgs): Promise<number> {
+  if (args.allowedAgentIds.length === 0) {
+    process.stderr.write('--agent-ids is required\n');
     return 1;
   }
+  // `--caller` is repeatable AND accepts comma-separated values within each
+  // occurrence — explode both into a flat list.
+  const callers = args.callers.flatMap((c) =>
+    c.split(',').map((s) => s.trim()).filter(Boolean),
+  );
+  const envFile = args.envFile ?? args.envFileAlias ?? null;
 
   const stored = resolveOwnerSession();
-  if ((parsed.bridge && !parsed.token) || (!parsed.bridge && parsed.token)) {
+  if ((args.bridge && !args.token) || (!args.bridge && args.token)) {
     process.stderr.write(
       'Pass --bridge and --token together. Owner-session credentials are tied to their bridge URL.\n',
     );
     return 1;
   }
 
-  const session = parsed.bridge && parsed.token
-    ? { bridge: parsed.bridge, token: parsed.token }
+  const session = args.bridge && args.token
+    ? { bridge: args.bridge, token: args.token }
     : stored;
   const bridge = session?.bridge;
   const token = session?.token;
@@ -360,7 +342,7 @@ export async function runSetup(args: string[]): Promise<number> {
   // `--bridge/--token` overrides change *where* the owner session comes
   // from, not *where* the client credentials get persisted, so they still
   // write canonical config.json and need the same preflight.
-  if (!parsed.json) {
+  if (!args.json) {
     const configPath = defaultConfigPath();
     if (existsSync(configPath) && readConfigRaw(configPath) === null) {
       process.stderr.write(
@@ -373,7 +355,10 @@ export async function runSetup(args: string[]): Promise<number> {
 
   let success: ClientRegisterSuccess;
   try {
-    success = await registerClient({ bridge, token }, parsed);
+    success = await registerClient(
+      { bridge, token },
+      { clientName: args.clientName, allowedAgentIds: args.allowedAgentIds },
+    );
   } catch (e) {
     process.stderr.write(`${(e as Error).message}\n`);
     return 1;
@@ -399,7 +384,7 @@ export async function runSetup(args: string[]): Promise<number> {
   // recovery hatch.
   let canonicalPath: string | null;
   try {
-    canonicalPath = persistCanonical(parsed, success, bridge);
+    canonicalPath = persistCanonical({ json: args.json }, success, bridge);
   } catch (e) {
     process.stderr.write(`${(e as Error).message}\n`);
     // The preflight above catches the common "existing config is malformed"
@@ -428,13 +413,13 @@ export async function runSetup(args: string[]): Promise<number> {
   // `setup --write-env-file` would mint a new CLIENT_TOKEN). Exit
   // non-zero so CI / scripts catch the partial failure, but with a
   // distinct message — not the "token was not persisted" recovery block.
-  if (parsed.envFile && !parsed.json) {
+  if (envFile && !args.json) {
     try {
-      writeClientEnvFile(parsed.envFile, success, bridge);
-      process.stderr.write(`Wrote env block to ${parsed.envFile} (mode 600).\n`);
+      writeClientEnvFile(envFile, success, bridge);
+      process.stderr.write(`Wrote env block to ${envFile} (mode 600).\n`);
     } catch (e) {
       process.stderr.write(
-        `\nWARNING: --write-env-file ${parsed.envFile} failed: ${(e as Error).message}\n` +
+        `\nWARNING: --write-env-file ${envFile} failed: ${(e as Error).message}\n` +
           `  The CLIENT_TOKEN was persisted to ${canonicalPath ?? '(canonical config)'} — the daemon can start without the env file.\n` +
           '  To populate the env file without rotating the token, copy SERVER_URL / SERVER_TOKEN / AGENT_ID out of config.json by hand.\n' +
           '  Re-running `setup --write-env-file ...` would mint a NEW CLIENT_TOKEN and invalidate the one just written.\n',
@@ -443,9 +428,9 @@ export async function runSetup(args: string[]): Promise<number> {
     }
   }
 
-  if (parsed.callers.length > 0) {
+  if (callers.length > 0) {
     try {
-      await configureCallers({ bridge, token }, success.allowed_agent_ids, parsed.callers);
+      await configureCallers({ bridge, token }, [...success.allowed_agent_ids], callers);
     } catch (e) {
       process.stderr.write(`${(e as Error).message}\n`);
       return 1;

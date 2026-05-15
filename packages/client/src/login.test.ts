@@ -3,24 +3,15 @@ import test from 'node:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { LoginArgs } from './login.js';
 import { runLogin } from './login.js';
 
-test('login help flags print usage and exit successfully', async (t) => {
-  let stderr = '';
-  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
-    stderr += String(chunk);
-    return true;
-  });
-
-  const longCode = await runLogin(['--help']);
-  assert.equal(longCode, 0);
-  assert.match(stderr, /usage: vicoop-client login/);
-
-  stderr = '';
-  const shortCode = await runLogin(['-h']);
-  assert.equal(shortCode, 0);
-  assert.match(stderr, /usage: vicoop-client login/);
-});
+// `runLogin` now takes the parser's discriminated-union output. Tests
+// construct that shape directly — argv-level parsing is owned by optique
+// and exercised at the integration level in cli.test (top-level `run()`).
+function loginArgs(p: Partial<Omit<LoginArgs, 'action'>> = {}): LoginArgs {
+  return { action: 'login', bridge: undefined, json: false, pollOnce: false, ...p };
+}
 
 test('login saves owner-session bearer without registering a client', async (t) => {
   const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-login-home-'));
@@ -84,7 +75,7 @@ test('login saves owner-session bearer without registering a client', async (t) 
     return true;
   });
 
-  const code = await runLogin(['--bridge', 'https://bridge.test']);
+  const code = await runLogin(loginArgs({ bridge: 'https://bridge.test' }));
 
   assert.equal(code, 0);
   assert.equal(calls.length, 2);
@@ -159,7 +150,7 @@ test('login falls back to DEFAULT_BRIDGE_HTTPS_URL when --bridge is omitted', as
   // the polling phase — they're not under test here.
   t.mock.method(process.stderr, 'write', () => true);
 
-  const code = await runLogin([]);
+  const code = await runLogin(loginArgs());
   assert.equal(code, 0);
   // Both round-trips (device-code, token) hit the public bridge HTTPS URL.
   assert.ok(

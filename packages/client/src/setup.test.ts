@@ -4,8 +4,32 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { saveOwnerSession } from './owner-session.js';
-import { runSetup } from './setup.js';
+import { runSetup, type SetupArgs } from './setup.js';
 import { readConfig } from './config.js';
+
+// `runSetup` now takes the parser's discriminated-union output. Tests
+// construct that shape directly via this helper, which fills in the
+// usual defaults and allows partial overrides per case.
+function setupArgs(
+  p: { clientName: string; allowedAgentIds: readonly string[] }
+    & Partial<Omit<SetupArgs, 'action' | 'clientName' | 'allowedAgentIds'>>,
+): SetupArgs {
+  const {
+    clientName, allowedAgentIds,
+    callers = [], envFile, envFileAlias, bridge, token, json = false,
+  } = p;
+  return {
+    action: 'setup',
+    clientName,
+    allowedAgentIds: [...allowedAgentIds],
+    callers,
+    envFile,
+    envFileAlias,
+    bridge,
+    token,
+    json,
+  };
+}
 
 test('setup registers client with saved owner-session and writes daemon env', async (t) => {
   const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-setup-home-'));
@@ -60,14 +84,11 @@ test('setup registers client with saved owner-session and writes daemon env', as
     return true;
   });
 
-  const code = await runSetup([
-    '--client-name',
-    'test client',
-    '--agent-ids',
-    'agent-1',
-    '--write-env-file',
+  const code = await runSetup(setupArgs({
+    clientName: 'test client',
+    allowedAgentIds: ['agent-1'],
     envFile,
-  ]);
+  }));
 
   assert.equal(code, 0);
   assert.equal(calls.length, 1);
@@ -150,14 +171,11 @@ test('setup configures callers when requested', async (t) => {
     return true;
   });
 
-  const code = await runSetup([
-    '--client-name',
-    'test client',
-    '--agent-ids',
-    'agent-1',
-    '--caller',
-    'eth:0x1111111111111111111111111111111111111111',
-  ]);
+  const code = await runSetup(setupArgs({
+    clientName: 'test client',
+    allowedAgentIds: ['agent-1'],
+    callers: ['eth:0x1111111111111111111111111111111111111111'],
+  }));
 
   assert.equal(code, 0);
   assert.equal(calls.length, 2);
@@ -227,16 +245,12 @@ test('setup writes client token before caller configuration can fail', async (t)
     return true;
   });
 
-  const code = await runSetup([
-    '--client-name',
-    'test client',
-    '--agent-ids',
-    'agent-1',
-    '--caller',
-    'eth:0x1111111111111111111111111111111111111111',
-    '--write-env-file',
+  const code = await runSetup(setupArgs({
+    clientName: 'test client',
+    allowedAgentIds: ['agent-1'],
+    callers: ['eth:0x1111111111111111111111111111111111111111'],
     envFile,
-  ]);
+  }));
 
   assert.equal(code, 1);
   assert.equal(calls.length, 2);
@@ -279,25 +293,19 @@ test('setup requires explicit bridge and token to be passed together', async (t)
     return true;
   });
 
-  assert.equal(await runSetup([
-    '--client-name',
-    'test client',
-    '--agent-ids',
-    'agent-1',
-    '--bridge',
-    'https://other-bridge.test',
-  ]), 1);
+  assert.equal(await runSetup(setupArgs({
+    clientName: 'test client',
+    allowedAgentIds: ['agent-1'],
+    bridge: 'https://other-bridge.test',
+  })), 1);
   assert.match(stderr, /Pass --bridge and --token together/);
 
   stderr = '';
-  assert.equal(await runSetup([
-    '--client-name',
-    'test client',
-    '--agent-ids',
-    'agent-1',
-    '--token',
-    'vbc_owner_other',
-  ]), 1);
+  assert.equal(await runSetup(setupArgs({
+    clientName: 'test client',
+    allowedAgentIds: ['agent-1'],
+    token: 'vbc_owner_other',
+  })), 1);
   assert.match(stderr, /Pass --bridge and --token together/);
 });
 
@@ -341,7 +349,7 @@ test('setup prompts for login when no owner-session is available', async (t) => 
     return true;
   });
 
-  const code = await runSetup(['--client-name', 'test client', '--agent-ids', 'agent-1']);
+  const code = await runSetup(setupArgs({ clientName: 'test client', allowedAgentIds: ['agent-1'] }));
 
   assert.equal(code, 1);
   assert.match(stderr, /vicoop-client login --bridge/);
@@ -411,10 +419,10 @@ test('setup writes config.json by default and preserves operator-edited fields',
     return true;
   });
 
-  const code = await runSetup([
-    '--client-name', 'test client',
-    '--agent-ids', 'agent-1',
-  ]);
+  const code = await runSetup(setupArgs({
+    clientName: 'test client',
+    allowedAgentIds: ['agent-1'],
+  }));
 
   assert.equal(code, 0);
   const after = readConfig(configPath);
@@ -481,11 +489,11 @@ test('setup --json suppresses config.json write for scripting', async (t) => {
   });
   t.mock.method(process.stderr, 'write', () => true);
 
-  const code = await runSetup([
-    '--client-name', 'test client',
-    '--agent-ids', 'agent-1',
-    '--json',
-  ]);
+  const code = await runSetup(setupArgs({
+    clientName: 'test client',
+    allowedAgentIds: ['agent-1'],
+    json: true,
+  }));
 
   assert.equal(code, 0);
   // No config.json on disk.
@@ -561,10 +569,10 @@ test('setup refuses to overwrite agent_id with empty when bridge returns no allo
   // The empty allowed_agent_ids array passes the upstream `!response.allowedAgentIds`
   // truthy check, so it reaches `writeConfigForSetup`'s guard. That's the
   // defense-in-depth point — fail loud instead of writing an empty agent_id.
-  const code = await runSetup([
-    '--client-name', 'test client',
-    '--agent-ids', 'still-valid-agent',
-  ]);
+  const code = await runSetup(setupArgs({
+    clientName: 'test client',
+    allowedAgentIds: ['still-valid-agent'],
+  }));
   assert.equal(code, 1);
   assert.match(
     stderr,
@@ -648,10 +656,10 @@ test('setup preserves operator-added / future-version keys via raw round-trip', 
 
   t.mock.method(process.stderr, 'write', () => true);
 
-  const code = await runSetup([
-    '--client-name', 'test client',
-    '--agent-ids', 'agent-1',
-  ]);
+  const code = await runSetup(setupArgs({
+    clientName: 'test client',
+    allowedAgentIds: ['agent-1'],
+  }));
   assert.equal(code, 0);
 
   const after = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
@@ -727,11 +735,11 @@ test('setup: env-file write failure does NOT trip the canonical-recovery block',
     return true;
   });
 
-  const code = await runSetup([
-    '--client-name', 'test client',
-    '--agent-ids', 'agent-1',
-    '--write-env-file', envFile,
-  ]);
+  const code = await runSetup(setupArgs({
+    clientName: 'test client',
+    allowedAgentIds: ['agent-1'],
+    envFile,
+  }));
   assert.equal(code, 1);
 
   // Canonical persisted — assert the token is on disk under VICOOP_HOME.
@@ -807,10 +815,10 @@ test('setup refuses to overwrite an existing-but-malformed config.json', async (
     return true;
   });
 
-  const code = await runSetup([
-    '--client-name', 'test client',
-    '--agent-ids', 'agent-1',
-  ]);
+  const code = await runSetup(setupArgs({
+    clientName: 'test client',
+    allowedAgentIds: ['agent-1'],
+  }));
   assert.equal(code, 1);
   // Preflight refuses to mint a token before registerClient runs, so the
   // operator doesn't end up with an unrecoverable bridge registration whose
@@ -867,14 +875,11 @@ test('setup quotes env values so shell metacharacters cannot trigger expansion',
 
   t.mock.method(process.stderr, 'write', () => true);
 
-  const code = await runSetup([
-    '--client-name',
-    't',
-    '--agent-ids',
-    evilId,
-    '--write-env-file',
+  const code = await runSetup(setupArgs({
+    clientName: 't',
+    allowedAgentIds: [evilId],
     envFile,
-  ]);
+  }));
   assert.equal(code, 0);
 
   const body = readFileSync(envFile, 'utf8');

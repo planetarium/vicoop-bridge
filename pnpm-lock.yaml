@@ -87,6 +87,9 @@ importers:
       '@optique/core':
         specifier: 1.0.2
         version: 1.0.2
+      '@optique/run':
+        specifier: 1.0.2
+        version: 1.0.2
       '@vicoop-bridge/protocol':
         specifier: workspace:*
         version: link:../protocol
@@ -930,6 +933,10 @@ packages:
 
   '@optique/core@1.0.2':
     resolution: {integrity: sha512-znsqMmjAdeOgSJzdJlpZpgAscojwQmeQYXzYnuEKllz5VCj6WyEkdzU4QuvJQtWQY3ve2taXwudEBRur0VHBOQ==}
+    engines: {bun: '>=1.2.0', deno: '>=2.3.0', node: '>=20.0.0'}
+
+  '@optique/run@1.0.2':
+    resolution: {integrity: sha512-0Wc+zC8SLGV8zXQX+pk+o0c6wE/ddx/36CHZ0toTh5lApsjruUuGhqbxvljerAAG5un1xQbOLxzksBVC6UPgSg==}
     engines: {bun: '>=1.2.0', deno: '>=2.3.0', node: '>=20.0.0'}
 
   '@paulmillr/qr@0.2.1':
@@ -5419,6 +5426,10 @@ snapshots:
   '@opentelemetry/api@1.9.0': {}
 
   '@optique/core@1.0.2': {}
+
+  '@optique/run@1.0.2':
+    dependencies:
+      '@optique/core': 1.0.2
 
   '@paulmillr/qr@0.2.1': {}
 
