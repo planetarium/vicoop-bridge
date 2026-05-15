@@ -1,20 +1,19 @@
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import pkg from '../package.json' with { type: 'json' };
 
-// In the shipped bundle, this file compiles to $INSTALL_DIR/dist/version.js and
-// package.json sits at $INSTALL_DIR/package.json. Resolving from import.meta.url
-// gives us both the running version and the install root in one step, without
-// any build-time codegen.
-const here = dirname(fileURLToPath(import.meta.url));
+// `clientVersion` is captured at build time. Under tsc the import resolves to
+// $INSTALL_DIR/package.json at runtime; under `bun build --compile` the JSON
+// is inlined into the single-file binary, so the version survives even
+// though there's no package.json on disk.
+export const clientVersion: string = pkg.version;
 
-export const installDir: string = dirname(here);
-
-export const clientVersion: string = (() => {
-  try {
-    const pkg = JSON.parse(readFileSync(join(installDir, 'package.json'), 'utf8')) as { version?: unknown };
-    return typeof pkg.version === 'string' ? pkg.version : 'unknown';
-  } catch {
-    return 'unknown';
-  }
-})();
+// In a tgz install this file lands at $INSTALL_DIR/dist/version.js, so the
+// install root is two dirnames up from import.meta.url. In a Bun single-file
+// build import.meta.url points at the embedded virtual fs (file:///$bunfs/…),
+// which isn't a real path — fall back to the binary's own location, which is
+// where install.sh places it.
+const metaPath = fileURLToPath(import.meta.url);
+export const installDir: string = metaPath.startsWith('/$bunfs/')
+  ? dirname(process.execPath)
+  : dirname(dirname(metaPath));

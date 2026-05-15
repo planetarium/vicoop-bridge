@@ -5,16 +5,16 @@
 #   curl -fsSL https://raw.githubusercontent.com/planetarium/vicoop-bridge/main/install.sh | sh
 #
 # Environment overrides:
-#   INSTALL_DIR           Target directory (default: /data/vicoop-bridge-client)
-#   VERSION               Specific tag to install, e.g. @vicoop-bridge/client@0.1.0
-#                         (default: latest @vicoop-bridge/client@* release)
-#   FORCE                 If "1", overwrite a non-empty INSTALL_DIR
+#   INSTALL_DIR  Target directory (default: /data/vicoop-bridge-client)
+#   VERSION      Specific tag, e.g. @vicoop-bridge/client@0.16.0
+#                (default: latest @vicoop-bridge/client@* release)
+#   FORCE        If "1", overwrite a non-empty INSTALL_DIR
 #
 # What it does:
-#   1. Verifies prerequisites (Linux warning, Node.js >= 20, curl, tar, sha256 tool).
-#   2. Resolves the latest (or pinned) @vicoop-bridge/client@* GitHub release.
-#   3. Downloads the .tgz + .sha256 and verifies integrity.
-#   4. Extracts the bundle into INSTALL_DIR.
+#   1. Verifies prerequisites (curl, sha256 tool, jq when auto-resolving).
+#   2. Detects OS/arch and resolves the matching release asset.
+#   3. Downloads the binary + .sha256, verifies integrity, chmod +x.
+#   4. Drops macOS quarantine xattr so first launch isn't Gatekeeper-blocked.
 #   5. Prints next-step instructions for login and a foreground first run.
 
 set -eu
@@ -32,21 +32,8 @@ need() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
-# ---- 1. Prerequisites -------------------------------------------------------
-OS="$(uname -s)"
-case "$OS" in
-  Linux) ;;
-  *) log "warning: this installer targets Linux (Fly.io containers); detected $OS — proceeding anyway" ;;
-esac
-
+# ---- 1. Prereqs + platform detect ------------------------------------------
 need curl
-need tar
-need node
-
-NODE_MAJOR="$(node -e 'process.stdout.write(String(process.versions.node.split(".")[0]))')"
-if [ "$NODE_MAJOR" -lt 20 ]; then
-  die "Node.js >= 20 required (found $(node -v))"
-fi
 
 if command -v sha256sum >/dev/null 2>&1; then
   SHA_CMD="sha256sum"
@@ -56,94 +43,81 @@ else
   die "missing required command: sha256sum or shasum"
 fi
 
+# Asset slug + extension mapping. Must stay aligned with
+# resolvePlatformAsset() in packages/client/src/upgrade.ts and the build
+# matrix in scripts/package-client-release.sh.
+OS_NAME="$(uname -s)"
+ARCH_NAME="$(uname -m)"
+case "$OS_NAME/$ARCH_NAME" in
+  Darwin/arm64)         ASSET_SLUG="macos-arm64"; ASSET_EXT="" ;;
+  Darwin/x86_64)        ASSET_SLUG="macos-x64";   ASSET_EXT="" ;;
+  Linux/aarch64|Linux/arm64)
+                        ASSET_SLUG="linux-arm64"; ASSET_EXT="" ;;
+  Linux/x86_64|Linux/amd64)
+                        ASSET_SLUG="linux-x64";   ASSET_EXT="" ;;
+  *)
+    die "unsupported platform/arch combination: $OS_NAME/$ARCH_NAME (Windows users: see docs/install-client.md for the install.ps1 path)"
+    ;;
+esac
+
 # ---- 2. Resolve release tag -------------------------------------------------
 TAG_PREFIX="@vicoop-bridge/client@"
 
 if [ -z "$VERSION" ]; then
+  # Auto-resolution needs JSON parsing to filter out draft/prerelease
+  # entries. When VERSION is pinned explicitly, jq isn't required.
+  need jq
   log "resolving latest $TAG_PREFIX* release from GitHub"
-  # Pull recent releases (default 30) and pick the newest non-draft,
-  # non-prerelease release whose tag matches the changesets monorepo
-  # prefix. Avoid /releases/latest because it may point at a non-client
-  # release. Parse with node (already a hard prereq above) rather than
-  # grepping tag_name, so the draft/prerelease flags are honored the same
-  # way `vicoop-client upgrade` honors them.
-  #
-  # `set -e` doesn't catch failures on the upstream end of a POSIX-sh
-  # pipeline, so curl is run on its own first — otherwise a network /
-  # rate-limit error would let node read empty input, exit 0, and surface
-  # as a misleading "no published release found" later.
+  # `set -e` doesn't catch failures inside a POSIX-sh pipeline, so the
+  # curl step runs first — otherwise a network / rate-limit error would
+  # let jq read empty input, exit 0, and surface as a misleading
+  # "no published release found" later.
   api_json="$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30")" \
     || die "GitHub release API request failed"
-  # node exits non-zero on a malformed or non-array payload (rate-limit
-  # error object, abuse-detection response, etc.) so those failures don't
-  # masquerade as "no release found"; an empty stdout with exit 0 is the
-  # genuine no-match case.
+  # `--exit-status` makes jq exit non-zero when the filter yields null /
+  # nothing, so missing-release cases surface explicitly instead of as an
+  # empty VERSION string.
   VERSION="$(
     printf '%s' "$api_json" \
-      | TAG_PREFIX="$TAG_PREFIX" node -e '
-let data = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (c) => { data += c; });
-process.stdin.on("end", () => {
-  let releases;
-  try {
-    releases = JSON.parse(data);
-  } catch (e) {
-    process.stderr.write(`error: GitHub API response was not valid JSON: ${e.message}\n`);
-    process.exit(1);
-  }
-  if (!Array.isArray(releases)) {
-    const msg = releases && typeof releases.message === "string"
-      ? releases.message
-      : JSON.stringify(releases).slice(0, 200);
-    process.stderr.write(`error: GitHub API returned a non-array payload: ${msg}\n`);
-    process.exit(1);
-  }
-  const prefix = process.env.TAG_PREFIX;
-  if (!prefix) {
-    process.stderr.write("error: TAG_PREFIX env var missing\n");
-    process.exit(1);
-  }
-  for (const r of releases) {
-    if (!r || typeof r.tag_name !== "string") continue;
-    if (!r.tag_name.startsWith(prefix)) continue;
-    if (r.draft || r.prerelease) continue;
-    process.stdout.write(r.tag_name);
-    return;
-  }
-});
-'
-  )" || die "failed to parse GitHub release list (see error above)"
-  [ -n "$VERSION" ] || die "no published (non-draft, non-prerelease) $TAG_PREFIX* release found in $REPO"
+      | jq -r --arg prefix "$TAG_PREFIX" --exit-status '
+          if type != "array" then
+            error("GitHub API returned a non-array payload: " + (.message // tostring))
+          else
+            (map(select(
+              .tag_name != null
+              and (.tag_name | startswith($prefix))
+              and (.draft != true)
+              and (.prerelease != true)
+            )) | first | .tag_name)
+          end
+        ' 2>&1
+  )" || die "no published (non-draft, non-prerelease) $TAG_PREFIX* release found in $REPO (jq said: $VERSION)"
 fi
 
 # Defense in depth: even when the operator pins VERSION via env, refuse to
-# proceed if it doesn't carry the expected prefix. Otherwise the
-# `${VERSION#$TAG_PREFIX}` expansion below leaves arbitrary characters in
-# VERSION_NUM, which then lands in the archive filename and URL.
+# proceed if it doesn't carry the expected prefix.
 case "$VERSION" in
   "$TAG_PREFIX"*) ;;
   *) die "VERSION must start with $TAG_PREFIX (got: $VERSION)" ;;
 esac
 
-log "installing $VERSION"
+log "installing $VERSION ($ASSET_SLUG)"
 
-VERSION_NUM="${VERSION#$TAG_PREFIX}"
+VERSION_NUM="${VERSION#"$TAG_PREFIX"}"
 # After stripping the prefix, the bare version still has to be safe to
-# interpolate into a local filename and a URL — the prefix check alone
-# wouldn't catch e.g. `@vicoop-bridge/client@0.3.0/../../etc`. Mirrors
-# packages/client/src/upgrade.ts's TAG_RE: first char must be alphanumeric
-# (rejects ".0.3.0", "-1", and other option-like names), remaining chars
-# limited to [A-Za-z0-9.+-], and no consecutive dots.
+# interpolate into a filename and URL. Mirrors
+# packages/client/src/upgrade.ts's TAG_RE.
 case "$VERSION_NUM" in
   ''|[!A-Za-z0-9]*|*[!A-Za-z0-9.+-]*|*..*)
     die "version contains unsafe characters: $VERSION_NUM"
     ;;
 esac
-ARCHIVE="vicoop-bridge-client-$VERSION_NUM.tgz"
-CHECKSUM="$ARCHIVE.sha256"
-# GitHub's release-download endpoint takes the tag as one path segment. The
-# tag contains `/` and `@`; percent-encode both so the URL doesn't split.
+
+ASSET_NAME="vicoop-client-${VERSION_NUM}-${ASSET_SLUG}${ASSET_EXT}"
+CHECKSUM_NAME="${ASSET_NAME}.sha256"
+BINARY_NAME="vicoop-client${ASSET_EXT}"
+# GitHub's release-download endpoint takes the tag as one path segment;
+# the tag contains `/` and `@`, percent-encode both so the URL doesn't split.
 ENCODED_TAG="$(printf '%s' "$VERSION" | sed -e 's#@#%40#g' -e 's#/#%2F#g')"
 BASE_URL="https://github.com/$REPO/releases/download/$ENCODED_TAG"
 
@@ -164,87 +138,85 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 
-# ---- 4. Download + verify + extract ----------------------------------------
+# ---- 4. Download + verify + install ----------------------------------------
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-log "downloading $ARCHIVE"
-curl -fsSL "$BASE_URL/$ARCHIVE" -o "$TMP_DIR/$ARCHIVE"
-curl -fsSL "$BASE_URL/$CHECKSUM" -o "$TMP_DIR/$CHECKSUM"
+log "downloading $ASSET_NAME"
+curl -fsSL "$BASE_URL/$ASSET_NAME"     -o "$TMP_DIR/$ASSET_NAME"
+curl -fsSL "$BASE_URL/$CHECKSUM_NAME"  -o "$TMP_DIR/$CHECKSUM_NAME"
 
 log "verifying checksum"
-# The .sha256 file from package-client-release.sh contains an absolute path from
-# the build host. Rewrite it to reference the local archive name before checking.
-EXPECTED_HASH="$(awk '{print $1}' "$TMP_DIR/$CHECKSUM")"
-[ -n "$EXPECTED_HASH" ] || die "could not parse expected hash from $CHECKSUM"
-printf '%s  %s\n' "$EXPECTED_HASH" "$ARCHIVE" > "$TMP_DIR/$CHECKSUM"
-( cd "$TMP_DIR" && $SHA_CMD -c "$CHECKSUM" >/dev/null ) || die "checksum verification failed"
+# The .sha256 sidecar produced by package-client-release.sh already has
+# `<hash>  <bare-filename>` shape (cd-into-OUT_DIR before shasum), so no
+# rewrite is needed here.
+( cd "$TMP_DIR" && $SHA_CMD -c "$CHECKSUM_NAME" >/dev/null ) || die "checksum verification failed"
 
-log "extracting into $INSTALL_DIR"
-# Bundle root inside the archive is vicoop-bridge-client-<version>/; strip it
-# so files land directly in INSTALL_DIR.
-tar -xzf "$TMP_DIR/$ARCHIVE" -C "$INSTALL_DIR" --strip-components=1
+log "installing into $INSTALL_DIR/$BINARY_NAME"
+mv "$TMP_DIR/$ASSET_NAME" "$INSTALL_DIR/$BINARY_NAME"
+chmod +x "$INSTALL_DIR/$BINARY_NAME"
 
-# Portable ownership normalization. We can't rely on `tar --no-same-owner`
-# everywhere (busybox tar lacks the long option), so we chown after the
-# fact. Only actually matters under `sudo`: otherwise tar extracts as the
-# current uid/gid already. When root *is* extracting, the archive's stored
-# uid (typically ~1000, whoever built the release) would otherwise end up
-# owning a root-run service's files — that's a privilege-escalation vector.
-# After chown-to-root, also strip any setuid/setgid bits tar may have
-# restored — those'd now be *root-owned* suid files, which is far worse
-# than the build-uid case. Archive has no setuid bits today; this is a
-# defense-in-depth invariant.
+# Under sudo: normalize ownership so the binary doesn't end up owned by
+# whoever happened to build the release / whoever ran install.sh.
 if [ "$(id -u)" = "0" ]; then
-  chown -R 0:0 "$INSTALL_DIR" || die "chown -R 0:0 $INSTALL_DIR failed — refusing to leave root-extracted files with non-root ownership"
-  # POSIX `-exec ... {} \;` (one-per-file) rather than `{} +` so this works
-  # on older busybox find too. Our archive ships no setuid files, so the
-  # per-file fork overhead is effectively zero in practice.
-  find "$INSTALL_DIR" -type f \( -perm -4000 -o -perm -2000 \) -exec chmod u-s,g-s {} \; \
-    || die "failed to strip setuid/setgid bits under $INSTALL_DIR after root extraction"
+  chown 0:0 "$INSTALL_DIR/$BINARY_NAME" \
+    || die "chown 0:0 $INSTALL_DIR/$BINARY_NAME failed — refusing to leave root-installed file with non-root ownership"
+  # Defense-in-depth: strip suid/sgid in case a future build accidentally
+  # ships them. After chown, any such bit would yield a root-owned suid
+  # binary inside $INSTALL_DIR.
+  current_mode="$(stat -c '%a' "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null \
+                  || stat -f '%Lp' "$INSTALL_DIR/$BINARY_NAME")"
+  case "$current_mode" in
+    [4-7]???) chmod u-s,g-s "$INSTALL_DIR/$BINARY_NAME" ;;
+  esac
 fi
 
-chmod +x "$INSTALL_DIR/bin/vicoop-client" 2>/dev/null || true
+# macOS quarantine attribute attaches to anything `curl` downloaded; first
+# launch would otherwise be Gatekeeper-blocked with "Apple cannot verify
+# this software". Stripping it here keeps `install.sh | sh` a true one-liner
+# until proper Developer ID signing + notarization land (issue #188
+# follow-up). xattr is part of the macOS base system; the check guards
+# against the rare Linux case where it isn't.
+if [ "$OS_NAME" = "Darwin" ] && command -v xattr >/dev/null 2>&1; then
+  xattr -d com.apple.quarantine "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null || true
+fi
 
 # ---- 5. Next steps ----------------------------------------------------------
 cat <<EOF
 
-==> installed $VERSION to $INSTALL_DIR
+==> installed $VERSION to $INSTALL_DIR/$BINARY_NAME
 
 Next steps (the agent that owns this client should perform these):
 
-  1. Verify the installed bundle and register with device flow:
+  1. Verify and sign in (device flow). The owner-session bearer is saved
+     to ~/.vicoop/owner-session.json; admin subcommands pick it up:
 
-       "$INSTALL_DIR/bin/vicoop-client" -v
-       "$INSTALL_DIR/bin/vicoop-client" login --help
+       "$INSTALL_DIR/$BINARY_NAME" --version
+       "$INSTALL_DIR/$BINARY_NAME" login
 
-     Then follow docs/install-client.md steps 3-6 to pick AGENT_ID, run
-     login, choose a backend, and start the client.
+  2. Register this client. \`setup\` writes the one-time CLIENT_TOKEN plus
+     server_url / agent_id into the canonical ~/.vicoop/config.json
+     (mode 600); the daemon picks those up on its next launch:
 
-  2. Run the client in the foreground. After \`login\` + \`setup\` from
-     docs/install-client.md, the canonical \`~/.vicoop/config.json\`
-     (mode 600) already holds server_url / server_token / agent_id —
-     the daemon needs no further args:
+       "$INSTALL_DIR/$BINARY_NAME" setup \\
+         --client-name "my client" --agent-ids "\$AGENT_ID"
 
-       "$INSTALL_DIR/bin/vicoop-client" --backend openclaw
+  3. Run the daemon in the foreground. With config.json populated, only
+     the backend choice (echo / openclaw / claude / codex) is left:
+
+       "$INSTALL_DIR/$BINARY_NAME" --backend openclaw
 
      Or persist \`"backend": "openclaw"\` in config.json and run with no
      flags at all:
 
-       "$INSTALL_DIR/bin/vicoop-client"
+       "$INSTALL_DIR/$BINARY_NAME"
 
-     Backend-specific knobs (CLAUDE_CWD, CODEX_SANDBOX_MODE, OPENCLAW_*)
-     are passed as CLI flags (\`--claude-cwd\`, \`--codex-sandbox\`,
-     \`--openclaw-gateway\`, …) or persisted in \`backends.*\` inside
-     config.json — env vars are no longer consulted for runtime config.
+     An always-on supervisor (systemd unit, launchd plist, …) is not
+     provided by this installer; the foreground run above is the
+     supported entrypoint while the design is in flux (issue #190).
 
-     An always-on supervisor story (systemd unit, launchd plist, etc.) is
-     not currently provided by this installer; the foreground run above is
-     the supported entrypoint while the design is in flux (issue #190).
-
-  Future updates: run \`"$INSTALL_DIR/bin/vicoop-client" upgrade\` — no need
+  Future updates: run \`"$INSTALL_DIR/$BINARY_NAME" upgrade\` — no need
   to re-run this installer. Pass --check to see if a newer release is
-  available. The quotes keep the command correct even if \$INSTALL_DIR
-  contains whitespace.
+  available.
 
 EOF
