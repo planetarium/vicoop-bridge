@@ -196,6 +196,110 @@ function makeTask(taskId: string, text: string): TaskAssignFrame {
   };
 }
 
+test('connect advertises OpenClaw gateway protocol range 3..4', async () => {
+  let connectMinProtocol: number | undefined;
+  let connectMaxProtocol: number | undefined;
+  const fake = await createFakeGateway({
+    autoHandshake: false,
+    onRequest: (sock, req) => {
+      if (req.method === 'connect') {
+        const params = req.params as { minProtocol?: number; maxProtocol?: number };
+        connectMinProtocol = params.minProtocol;
+        connectMaxProtocol = params.maxProtocol;
+        sock.send(
+          JSON.stringify({
+            type: 'res',
+            id: req.id,
+            ok: true,
+            payload: { type: 'hello-ok', protocol: 4 },
+          }),
+        );
+        return;
+      }
+      if (req.method === 'chat.send') {
+        const params = req.params as { idempotencyKey: string; sessionKey: string };
+        const runId = `run-${params.idempotencyKey}`;
+        sock.send(
+          JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+        );
+        setImmediate(() => {
+          fake.emitChat(sock, {
+            runId,
+            sessionKey: params.sessionKey,
+            seq: 1,
+            state: 'final',
+            message: { text: 'done' },
+          });
+        });
+      }
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    await backend.handle(makeTask('t-proto', 'hi'), () => {}, NEVER);
+    assert.equal(connectMinProtocol, 3);
+    assert.equal(connectMaxProtocol, 4);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('v4 chat deltaText is used when final message is absent', async () => {
+  const frames: UpFrame[] = [];
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method !== 'chat.send') return;
+      const params = req.params as { idempotencyKey: string; sessionKey: string };
+      const runId = `run-${params.idempotencyKey}`;
+      sock.send(
+        JSON.stringify({ type: 'res', id: req.id, ok: true, payload: { runId, status: 'started' } }),
+      );
+      setImmediate(() => {
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 1,
+          state: 'delta',
+          deltaText: 'ignored',
+        });
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 2,
+          state: 'delta',
+          deltaText: 'PO',
+          replace: true,
+        });
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 3,
+          state: 'delta',
+          deltaText: 'NG',
+        });
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 4,
+          state: 'final',
+        });
+      });
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    await backend.handle(makeTask('t-v4-delta', 'hi'), (f) => frames.push(f), NEVER);
+    const artifact = frames.find((f) => f.type === 'task.artifact');
+    assert.ok(artifact);
+    assert.deepEqual(artifact!.artifact.parts, [{ kind: 'text', text: 'PONG' }]);
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete);
+    assert.deepEqual(complete!.status.message?.parts, [{ kind: 'text', text: 'PONG' }]);
+  } finally {
+    await fake.close();
+  }
+});
+
 test('happy path: chat.send → final event → task completes', async () => {
   const frames: UpFrame[] = [];
   const fake = await createFakeGateway({

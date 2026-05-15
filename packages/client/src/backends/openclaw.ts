@@ -33,7 +33,40 @@ import { clientVersion } from '../version.js';
 
 const execFileP = promisify(execFile);
 
-const GATEWAY_PROTOCOL_VERSION = 3;
+const MIN_GATEWAY_PROTOCOL_VERSION = 3;
+const MAX_GATEWAY_PROTOCOL_VERSION = 4;
+
+interface OpenclawGatewayProtocolRange {
+  minProtocol: number;
+  maxProtocol: number;
+}
+
+interface OpenclawChatDeltaAccumulator {
+  text: string;
+}
+
+function openclawGatewayProtocolRange(): OpenclawGatewayProtocolRange {
+  return {
+    minProtocol: MIN_GATEWAY_PROTOCOL_VERSION,
+    maxProtocol: MAX_GATEWAY_PROTOCOL_VERSION,
+  };
+}
+
+function applyOpenclawChatDelta(
+  state: OpenclawChatDeltaAccumulator,
+  evt: ChatEventPayload,
+): boolean {
+  if (evt.state !== 'delta' || typeof evt.deltaText !== 'string') return false;
+  state.text = evt.replace ? evt.deltaText : state.text + evt.deltaText;
+  return true;
+}
+
+function finalTextForOpenclawChatEvent(
+  evt: ChatEventPayload,
+  delta: OpenclawChatDeltaAccumulator,
+): string {
+  return extractFinalText(evt.message) || delta.text;
+}
 
 interface DeviceIdentity {
   deviceId: string;
@@ -112,6 +145,8 @@ interface ChatEventPayload {
   seq: number;
   state: 'delta' | 'final' | 'aborted' | 'error';
   message?: unknown;
+  deltaText?: string;
+  replace?: boolean;
   errorMessage?: string;
   stopReason?: string;
 }
@@ -138,6 +173,11 @@ interface ChatSendAck {
   status: 'started' | 'in_flight';
 }
 
+interface HelloOkPayload {
+  type?: 'hello-ok';
+  protocol?: number;
+}
+
 type EventHandler = (evt: EventFrame) => void;
 
 type ClientState = 'idle' | 'connecting' | 'ready' | 'closed';
@@ -154,6 +194,7 @@ class GatewayClient {
   private nonce: string | null = null;
   private identity: DeviceIdentity;
   private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
+  private _protocol: number | null = null;
 
   constructor(
     private readonly url: string,
@@ -165,6 +206,10 @@ class GatewayClient {
 
   get state(): ClientState {
     return this._state;
+  }
+
+  get protocol(): number | null {
+    return this._protocol;
   }
 
   connect(): Promise<void> {
@@ -319,8 +364,7 @@ class GatewayClient {
       });
       const signature = signPayload(this.identity.privateKeyPem, payload);
       const params = {
-        minProtocol: GATEWAY_PROTOCOL_VERSION,
-        maxProtocol: GATEWAY_PROTOCOL_VERSION,
+        ...openclawGatewayProtocolRange(),
         client: {
           id: clientId,
           displayName: 'vicoop-bridge-client',
@@ -340,7 +384,8 @@ class GatewayClient {
           nonce: this.nonce!,
         },
       };
-      await this.request('connect', params);
+      const hello = await this.request<HelloOkPayload>('connect', params);
+      if (typeof hello?.protocol === 'number') this._protocol = hello.protocol;
       if (this._state === 'connecting') {
         this._state = 'ready';
         if (this.handshakeTimer) {
@@ -1581,7 +1626,9 @@ export function createOpenclawBackend(
       const settled = new Promise<FinalizerEvent>((r) => {
         resolveSettled = r;
       });
+      const chatDelta: OpenclawChatDeltaAccumulator = { text: '' };
       const finalizer = (evt: FinalizerEvent) => {
+        if (applyOpenclawChatDelta(chatDelta, evt)) return;
         if (evt.state === 'final' || evt.state === 'error' || evt.state === 'aborted') {
           resolveSettled(evt);
         }
@@ -1757,7 +1804,7 @@ export function createOpenclawBackend(
           return;
         }
 
-        const text2 = extractFinalText(result.message);
+        const text2 = finalTextForOpenclawChatEvent(result, chatDelta);
 
         // Non-streaming fallback path for the envelope: when no streaming
         // subscription delivered a session.message artifact (e.g. the
