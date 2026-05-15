@@ -42,8 +42,22 @@ export const defaultAppServerSpawn: AppServerSpawnFn = (command, args, options) 
 
 export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 
+// Client-side capability opt-ins announced at initialize time. codex
+// app-server gates a number of fields behind `experimentalApi` — the gate
+// we care about is `thread/start.environments`, which we use to disable
+// codex's built-in execution surfaces under openai-compat dispatch (#183).
+// Other gated features (`thread/turns/list`, `process/spawn`, etc.) become
+// reachable too, but we don't call them, so opting in is no-op for them.
+// Safe to opt in unconditionally — codex marks individual fields stable
+// independently of the capability, and any future graduation just makes
+// the gate disappear.
+export interface InitializeCapabilities {
+  experimentalApi?: boolean;
+}
+
 export interface InitializeParams {
   clientInfo: { name: string; title: string; version: string };
+  capabilities?: InitializeCapabilities;
 }
 
 export interface InitializeResult {
@@ -71,6 +85,11 @@ export interface ThreadStartParams {
   developerInstructions?: string | null;
   baseInstructions?: string | null;
   config?: ThreadConfigOverride | null;
+  // Per-thread environment specs. Empty array = no execution environment,
+  // which structurally removes shell / unified_exec / apply_patch / view_image
+  // handlers from the tool registry for this thread (sticky across resumes).
+  // We model as opaque `unknown[]` because the only value we ever send is `[]`.
+  environments?: unknown[] | null;
 }
 
 export interface ThreadResumeParams {

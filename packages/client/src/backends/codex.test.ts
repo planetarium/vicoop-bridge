@@ -372,7 +372,13 @@ test('first task runs initialize + thread/start + turn/start and emits agent art
 
   // Sent frames must include initialize → initialized (notif) → thread/start → turn/start.
   const sent = child.stdinFrames();
-  assert.ok(findRequest(sent, 'initialize'), 'initialize sent');
+  const initReq = findRequest(sent, 'initialize') as
+    | { params?: { capabilities?: { experimentalApi?: boolean } } }
+    | undefined;
+  assert.ok(initReq, 'initialize sent');
+  // experimentalApi opt-in is required for `thread/start.environments` (#183).
+  // Send it unconditionally so the codex app-server accepts our env clamp.
+  assert.equal(initReq.params?.capabilities?.experimentalApi, true);
   const init = sent.find((f) => (f as { method?: string }).method === 'initialized') as
     | Record<string, unknown>
     | undefined;
@@ -1021,16 +1027,20 @@ test('openai-compat envelope agent message is emitted as a data part', async () 
 // fails loudly rather than silently widening the agent's surface back
 // out to direct execution. If you update this list, also update the
 // matching block in `codex.ts` and call out the addition in the PR.
+// Features the openai-compat dispatch path zeroes out via `config.features`.
+// This list is INTENTIONALLY narrower than the full set of codex built-ins
+// because `environments: []` (asserted separately below) structurally removes
+// every handler gated on `environment_mode.has_environment()` — shell /
+// unified_exec / exec_command / write_stdin / shell_command / local_shell /
+// container.exec / apply_patch / view_image — without needing a feature flag.
+// What remains here is the set of surfaces NOT gated by environment: hosted
+// modalities, plugin/MCP discovery, multi-agent orchestration, etc.
+// If you update this list, also update the matching block in `codex.ts` and
+// call out the addition in the PR.
 const EXPECTED_OPENAI_COMPAT_DISABLES: Record<string, boolean> = {
-  shell_tool: false,
-  unified_exec: false,
-  browser_use: false,
-  browser_use_external: false,
-  computer_use: false,
-  in_app_browser: false,
-  apply_patch_freeform: false,
-  apply_patch_streaming_events: false,
   image_generation: false,
+  web_search_request: false,
+  web_search_cached: false,
   tool_search: false,
   tool_suggest: false,
   tool_call_mcp_elicitation: false,
@@ -1039,17 +1049,26 @@ const EXPECTED_OPENAI_COMPAT_DISABLES: Record<string, boolean> = {
   apps: false,
   enable_mcp_apps: false,
   multi_agent: false,
+  multi_agent_v2: false,
+  enable_fanout: false,
+  request_permissions_tool: false,
+  code_mode: false,
+  goals: false,
+  memories: false,
   workspace_dependencies: false,
 };
 
-test('thread/start disables every codex direct-execution feature when caller tools are active (#175, PR #180)', async () => {
+test('thread/start disables every codex direct-execution feature when caller tools are active (#175, PR #180, #183)', async () => {
   // Without this, codex would execute the caller's "bash" call itself in
   // its sandbox and emit a plain-text result instead of the openai-compat
-  // envelope the caller is waiting for. Beyond shell_tool / unified_exec
-  // (#175), every other codex surface that lets the model do something
-  // directly — browser, computer use, patch tools, image generation,
-  // plugins / apps / MCP, multi-agent, workspace introspection — is also
-  // disabled so the only legitimate dispatch is the caller's tools.
+  // envelope the caller is waiting for. Defense is on two seams:
+  // `environments: []` (asserted in a separate test) drops every handler
+  // gated on `environment_mode.has_environment()` — shell / unified_exec /
+  // exec_command / write_stdin / shell_command / local_shell / container.exec
+  // / apply_patch / view_image. This test covers the surfaces NOT covered by
+  // that: hosted modalities (image gen, web search), plugin/MCP discovery,
+  // multi-agent / fan-out, request_permissions, experimental code surfaces,
+  // and workspace introspection.
   const fake = makeFakeSpawn(() => happyPath());
   const backend = createCodexBackend({ spawn: fake.spawn });
   await backend.handle(
@@ -1074,6 +1093,97 @@ test('thread/start disables every codex direct-execution feature when caller too
     params?: { config?: { features?: Record<string, boolean> } };
   }).params;
   assert.deepEqual(params?.config?.features, EXPECTED_OPENAI_COMPAT_DISABLES);
+});
+
+test('thread/start sends `environments: []` when caller tools are active (#183)', async () => {
+  // `environments: []` is the wholesale lever that drops every codex
+  // handler whose registration is gated on `environment_mode.has_environment()`
+  // — most importantly the entire exec/shell surface (`shell`,
+  // `unified_exec`, `exec_command`, `write_stdin`, `shell_command`,
+  // `local_shell`, `container.exec`) and `apply_patch` / `view_image`.
+  // Without this, `features.shell_tool: false` alone leaves `exec_command`
+  // callable (see #183: codex cli 0.130 actually executed `git clone` via
+  // `exec_command` despite our feature disables).
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('list files', 'ctx-env-empty', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'list files' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { environments?: unknown[] } }).params;
+  assert.deepEqual(params?.environments, []);
+});
+
+test('thread/start omits `environments` when no caller tools are supplied', async () => {
+  // Non-openai-compat callers (or openai-compat without tools) still expect
+  // codex to behave as a normal coding agent with its full environment, so
+  // we must NOT clamp environments to []. Gate matches `callerToolDispatchActive`.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(assign('hi', 'ctx-no-env-clamp'), collect().emit, NEVER);
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { environments?: unknown } }).params;
+  assert.equal(params?.environments, undefined);
+});
+
+test('thread/resume does NOT send `environments` (sticky on start; ResumeParams does not accept it) (#183)', async () => {
+  // `environments` is set once on `thread/start` and carries across resumes
+  // via the server-side session record. `ThreadResumeParams` in codex
+  // app-server-protocol has no `environments` field, so sending it on
+  // resume would either be ignored or rejected. Verify we only send it on
+  // start.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const meta = {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+    },
+  };
+  await backend.handle(
+    assign('one', 'ctx-env-resume', {
+      message: {
+        role: 'user',
+        messageId: 'm1',
+        parts: [{ kind: 'text', text: 'one' }],
+        metadata: meta,
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  await backend.handle(
+    assign('two', 'ctx-env-resume', {
+      message: {
+        role: 'user',
+        messageId: 'm2',
+        parts: [{ kind: 'text', text: 'two' }],
+        metadata: meta,
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const frames = fake.lastChild().stdinFrames();
+  const resume = findRequest(frames, 'thread/resume');
+  assert.ok(resume, 'thread/resume observed');
+  const resumeParams = (resume as { params?: { environments?: unknown } }).params;
+  assert.equal(resumeParams?.environments, undefined);
 });
 
 test('thread/start omits `config` when no caller tools are supplied', async () => {
