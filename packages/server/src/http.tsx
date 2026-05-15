@@ -26,6 +26,7 @@ import { agentAuthMiddleware, getAgentConn, getCaller } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
 import { mountDeviceUi } from './auth/device-ui.js';
+import { mountTokenRevocation } from './auth/revoke.js';
 import { mountSiweExchange } from './auth/siwe-exchange.js';
 import {
   A2A_EXTENSIONS_HEADER,
@@ -268,6 +269,11 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // signs a SIWE message once, then presents the returned vbc_caller_* token
   // on all subsequent requests.
   mountSiweExchange(app, { sql: opts.db, domain: siweDomain });
+
+  // RFC 7009 token revocation. Mounted unconditionally — revocation is
+  // independent of how the token was issued (SIWE exchange or device flow),
+  // so SIWE-only deployments without Google OAuth still get /oauth/revoke.
+  mountTokenRevocation(app, { sql: opts.db });
 
   // Single owner-session bearer check shared by POST '/' (admin agent A2A
   // endpoint) and the /admin-api/* routes. Returns structured success or
