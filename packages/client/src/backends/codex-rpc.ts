@@ -71,6 +71,11 @@ export interface ThreadStartParams {
   developerInstructions?: string | null;
   baseInstructions?: string | null;
   config?: ThreadConfigOverride | null;
+  // Per-thread environment specs. Empty array = no execution environment,
+  // which structurally removes shell / unified_exec / apply_patch / view_image
+  // handlers from the tool registry for this thread (sticky across resumes).
+  // We model as opaque `unknown[]` because the only value we ever send is `[]`.
+  environments?: unknown[] | null;
 }
 
 export interface ThreadResumeParams {

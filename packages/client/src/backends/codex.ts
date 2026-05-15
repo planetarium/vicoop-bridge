@@ -639,56 +639,80 @@ export function createCodexBackend(
           // over via the server-side session record. Feature-flag overrides
           // (see `featuresOverride` below) are the exception — they do NOT
           // persist across resume and must be re-sent every turn that wants
-          // them.
+          // them. `environments`, by contrast, IS sticky on `thread/start`
+          // and `ThreadResumeParams` does not even accept it, so we only
+          // send it on start.
           //
           // When caller-side tool dispatch is active (openai-compat with
-          // tools), every codex surface that lets the model do something
-          // directly is disabled. The caller's `tools` array is the ONLY
-          // legitimate dispatch surface — anything codex can call itself
-          // (shell, exec, browser, computer use, patch tools, image
-          // generation, plugins / multi-agent / MCP, workspace
-          // introspection) would bypass the envelope contract. This is
-          // broader than the original #175 fix (`shell_tool` +
-          // `unified_exec`); see PR #180 review for the full rationale.
-          // The model is reduced to "emit text" or "emit a tool_calls
-          // envelope" only.
+          // tools), the caller's `tools` array is the ONLY legitimate
+          // dispatch surface — anything codex can call itself would bypass
+          // the envelope contract. We defend on two seams:
+          //
+          // 1. `environments: []` — structurally drops every handler that
+          //    `spec_plan.rs` gates on `environment_mode.has_environment()`:
+          //    `shell` / `local_shell` / `shell_command` / `exec_command` /
+          //    `write_stdin` / `container.exec` / `apply_patch` / `view_image`.
+          //    This is wholesale and not whack-a-mole: the model can't dispatch
+          //    these handlers by name because they are not in the registry,
+          //    regardless of which feature flags are set or which tool the
+          //    model decides to invent. See #183 — `features.shell_tool=false`
+          //    alone left `exec_command` callable in cli 0.130 because exec
+          //    handlers have fallback registrations that survive the
+          //    `ConfigShellToolType::Disabled` branch; `environments: []`
+          //    closes that gap by removing the environment those handlers
+          //    require.
+          //
+          // 2. `features.*: false` — for surfaces NOT covered by
+          //    `environments: []`: hosted web search, image generation,
+          //    multi-agent / fan-out, plugin / MCP discovery, etc. These
+          //    handlers do not depend on `environment_mode` and must each be
+          //    explicitly disabled by their feature key.
+          //
+          // Surfaces we can't disable from here: `update_plan` and
+          // `request_user_input` are unconditional in codex's tool registry;
+          // they have no feature key. They are benign in practice (plan
+          // mutation is session-local; request_user_input blocks on an MCP
+          // elicitation reply that never arrives under openai-compat).
+          // `list_mcp_resources` and siblings are gated by codex's per-server
+          // `mcp_tools` config — out of scope for this flag plumbing.
           const featuresOverride = callerToolDispatchActive(openaiCompat)
             ? {
                 features: {
-                  // Direct execution surfaces — anything that lets codex
-                  // do work itself instead of asking the caller.
-                  shell_tool: false,
-                  unified_exec: false,
-                  browser_use: false,
-                  browser_use_external: false,
-                  computer_use: false,
-                  in_app_browser: false,
-                  apply_patch_freeform: false,
-                  apply_patch_streaming_events: false,
-                  // Text-only output: caller asked for textual responses,
-                  // not generated images or other modalities.
+                  // Hosted modalities that bypass the caller's text envelope.
                   image_generation: false,
-                  // Codex-side tool catalog / discovery — under openai-
-                  // compat the caller's `tools` array is the only legit
-                  // tool surface, so codex shouldn't be searching, suggesting,
-                  // or eliciting MCP tools of its own.
+                  web_search_request: false,
+                  web_search_cached: false,
+                  // Codex-side tool catalog / discovery and plugin surfaces.
                   tool_search: false,
                   tool_suggest: false,
                   tool_call_mcp_elicitation: false,
                   builtin_mcp: false,
-                  // Plugin / app integrations expose third-party tools
-                  // codex could call directly.
                   plugins: false,
                   apps: false,
                   enable_mcp_apps: false,
-                  // Subagent spawning bypasses the single-agent contract.
+                  // Sub-agent / fan-out orchestration bypasses the single-
+                  // agent envelope contract.
                   multi_agent: false,
-                  // Workspace introspection — fs reads that could leak
-                  // host paths back into model context.
+                  multi_agent_v2: false,
+                  enable_fanout: false,
+                  // Permission-escalation prompts would block under openai-
+                  // compat (no human in loop).
+                  request_permissions_tool: false,
+                  // Experimental code surfaces.
+                  code_mode: false,
+                  goals: false,
+                  memories: false,
+                  // Workspace introspection — fs reads that could leak host
+                  // paths back into model context.
                   workspace_dependencies: false,
                 },
               }
             : null;
+          // `environments: []` is sticky on `thread/start` and unsupported on
+          // `thread/resume`, so we only send it on start. Gated by the same
+          // condition as the feature override so non-openai-compat callers
+          // keep their normal codex environment.
+          const sendEmptyEnvironments = callerToolDispatchActive(openaiCompat);
 
           let threadId: string;
           try {
@@ -711,6 +735,7 @@ export function createCodexBackend(
                   sandbox: sandboxMode,
                   ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),
                   ...(featuresOverride ? { config: featuresOverride } : {}),
+                  ...(sendEmptyEnvironments ? { environments: [] } : {}),
                 },
               );
               threadId = startResult.thread.id;
