@@ -232,6 +232,79 @@ test('Client logs identity block (mention/acct/a2a/card/webfinger) once on conne
   }
 });
 
+test('Client.stop invokes backend.stop so long-lived children are torn down (#186)', async () => {
+  // The codex backend keeps a `codex app-server` subprocess alive across
+  // tasks via its `AppServerRpcClient` singleton — per-task AbortSignal
+  // doesn't reach it. Without an explicit `backend.stop()` on daemon
+  // shutdown, the child gets re-parented to init and lingers, which is
+  // what the macOS report in #186 observed. Assert here that Client.stop
+  // calls the optional hook, and tolerates a throwing implementation
+  // without crashing the shutdown path (the daemon entrypoint follows
+  // stop() with process.exit, so an unhandled throw would suppress the
+  // exit semantics callers depend on).
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+
+  let stopCalls = 0;
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: {
+      name: 'stub',
+      handle: async () => {
+        /* no tasks */
+      },
+      stop: () => {
+        stopCalls++;
+      },
+    },
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    reconnectStableMs: 0,
+    heartbeatIntervalMs: 0,
+  });
+
+  try {
+    client.start();
+    await waitFor(() => wss.clients.size === 1, 'expected one ws client');
+    client.stop();
+    assert.equal(stopCalls, 1, 'Client.stop must invoke backend.stop exactly once');
+
+    // A throwing stop must not propagate out of Client.stop — the daemon
+    // entrypoint calls process.exit on the next line and shouldn't be
+    // hijacked by a buggy backend.
+    const throwingClient = new Client({
+      serverUrl,
+      token: 'client-token',
+      agentId: 'agent-2',
+      backendKind: 'echo',
+      backend: {
+        name: 'stub',
+        handle: async () => {
+          /* no tasks */
+        },
+        stop: () => {
+          throw new Error('boom');
+        },
+      },
+      reconnectDelayMs: 10,
+      reconnectMaxDelayMs: 10,
+      reconnectJitterRatio: 0,
+      reconnectStableMs: 0,
+      heartbeatIntervalMs: 0,
+    });
+    throwingClient.start();
+    await waitFor(() => wss.clients.size === 1, 'expected one ws client after second start');
+    assert.doesNotThrow(() => throwingClient.stop());
+  } finally {
+    await closeServer(server, wss);
+  }
+});
+
 test('Client reconnects after WebSocket close and sends hello again', async () => {
   const server = createServer();
   const wss = new WebSocketServer({ server, path: '/connect' });
