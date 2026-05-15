@@ -8,7 +8,6 @@ import { createClaudeBackend } from './backends/claude.js';
 import {
   createCodexBackend,
   type ApprovalDecision,
-  type CodexSandboxMode,
 } from './backends/codex.js';
 import type { Backend } from './backend.js';
 import { clientVersion } from './version.js';
@@ -31,23 +30,47 @@ import {
   overlayConfig,
   readConfig,
 } from './config.js';
-import { mergeClientArgs, parseFlags, type DaemonArgs as Args } from './cli-args.js';
+import {
+  DEFAULT_BRIDGE_URL,
+  mergeClientArgs,
+  parseFlags,
+  type DaemonArgs as Args,
+} from './cli-args.js';
+import { object } from '@optique/core/constructs';
+import { optional, withDefault } from '@optique/core/modifiers';
+import { flag, option } from '@optique/core/primitives';
+import { parse as parseOptique } from '@optique/core/parser';
+import { formatMessage } from '@optique/core/message';
+import { string } from '@optique/core/valueparser';
 
 const DAEMON_USAGE =
-  'vicoop-client --server <ws://...> --token <t> --agentId <id> --backend <echo|openclaw|claude|codex> [--card <path>] [--config <path>]';
+  'vicoop-client [--server <ws://...>] --token <t> --agentId <id>\n' +
+  '              [--backend <echo|openclaw|claude|codex>] [--card <path>] [--config <path>]\n' +
+  '              [--claude-cwd <path>] [--claude-settings-file <path>]\n' +
+  '              [--codex-cwd <path>] [--codex-sandbox <read-only|workspace-write|danger-full-access>]\n' +
+  '              [--openclaw-gateway <url>] [--openclaw-gateway-token <t>]\n' +
+  '              [--openclaw-agent <name>] [--openclaw-openai-compat-agent <name>]\n' +
+  '              [--openclaw-task-timeout-ms <ms>]\n' +
+  `  --server defaults to ${DEFAULT_BRIDGE_URL} (public bridge); override for self-hosted bridges.`;
 const SUBCOMMAND_LIST =
   'subcommands: login, setup, upgrade, list-agents, list-callers, add-caller, remove-caller, list-clients, revoke-client, whoami (run any with --help)';
-const CODEX_SANDBOX_MODES = new Set<CodexSandboxMode>([
+const KNOWN_CODEX_SANDBOX_MODES = new Set([
   'read-only',
   'workspace-write',
   'danger-full-access',
-]);
+] as const);
+
+type CodexSandboxMode =
+  | 'read-only'
+  | 'workspace-write'
+  | 'danger-full-access';
 
 // Precedence (highest wins):
 //   1. CLI flag values
 //   2. env vars (kept for systemd EnvironmentFile= compatibility)
 //   3. `--config <path>` file (overlaid on canonical, per field)
 //   4. canonical config.json at the resolved vicoop dir
+//   5. built-in defaults (DEFAULT_BRIDGE_URL for --server, 'echo' for --backend)
 //
 // Each layer is optional and contributes only the fields it sets, so
 // operators can split state across them — e.g. systemd unit ships server_*
@@ -105,13 +128,12 @@ function parseClientArgs(argv: string[]): Args {
   return result.args;
 }
 
-// Parse the operator's inline `--settings` JSON for the claude backend. The
-// primary use case is enabling the OS-level sandbox in `-p` mode (issue #138),
-// where the `/sandbox` slash command is unavailable and `settings.json` on
-// disk is awkward on systemd-`DynamicUser` hosts. We fail loud on malformed
-// JSON rather than silently dropping it — a syntax error in a sandbox config
-// is exactly the kind of bug an operator wants surfaced at startup, not
-// after the first task already ran with no sandbox at all.
+// Parse `CLAUDE_SETTINGS_JSON` (inline JSON env var) into a settings object.
+// We fail loud on malformed JSON rather than silently dropping it — a syntax
+// error in a sandbox config is exactly the kind of bug an operator wants
+// surfaced at startup, not after the first task already ran with no sandbox
+// at all. The flag equivalent is `--claude-settings-file <path>`, handled
+// separately (reads from disk and JSON-parses there).
 function parseClaudeSettingsEnv(raw: string | undefined): Record<string, unknown> | undefined {
   const trimmed = raw?.trim();
   if (!trimmed) return undefined;
@@ -130,50 +152,54 @@ function parseClaudeSettingsEnv(raw: string | undefined): Record<string, unknown
   return parsed as Record<string, unknown>;
 }
 
-// `source` names the surface the value came from (env var name, config
-// JSON path, etc.) so the error message points at the right knob. Config-
-// derived values are pre-validated by `normalizeConfig` and never reach the
-// rejection branch here, but parameterizing keeps the function safe to
-// reuse on any source without leaking a misleading "CODEX_SANDBOX_MODE
-// must be one of..." when the bogus value actually came from config.json.
-// Three-state classifier for `OPENCLAW_TASK_TIMEOUT_MS`. The `'valid'` arm
-// is the only one where we want the factory's own resolveTimeout to read
-// the env var; in every other case we fall through to the config value so
-// a mistyped env doesn't silently shadow `backends.openclaw.task_timeout_ms`.
-// The factory still validates internally, so this is purely about choosing
-// which surface contributes the value, not duplicating its parse logic.
-function parseOpenclawTimeoutEnv(
-  raw: string | undefined,
-): 'valid' | 'invalid' | 'unset' {
-  const trimmed = raw?.trim();
-  if (!trimmed) return 'unset';
-  const n = Number(trimmed);
-  if (Number.isFinite(n) && n > 0) return 'valid';
-  console.warn(
-    `[client] OPENCLAW_TASK_TIMEOUT_MS=${JSON.stringify(trimmed)} is not a positive number; ignoring (using backends.openclaw.task_timeout_ms / default).`,
-  );
-  return 'invalid';
+// Read & JSON-parse a `--claude-settings-file <path>` flag value. Parse errors
+// exit non-zero so an operator's typo doesn't silently fall through to the
+// next layer with no sandbox.
+function readClaudeSettingsFile(path: string): Record<string, unknown> {
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (e) {
+    console.error(`--claude-settings-file ${path}: ${(e as Error).message}`);
+    process.exit(1);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    console.error(`--claude-settings-file ${path}: not valid JSON: ${(e as Error).message}`);
+    process.exit(1);
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    console.error(`--claude-settings-file ${path}: must be a JSON object`);
+    process.exit(1);
+  }
+  return parsed as Record<string, unknown>;
 }
 
-function parseCodexSandboxMode(
-  raw: string | undefined,
-  source = 'CODEX_SANDBOX_MODE',
+function isCodexSandboxMode(v: string | undefined): v is CodexSandboxMode {
+  return v !== undefined && (KNOWN_CODEX_SANDBOX_MODES as Set<string>).has(v);
+}
+
+// Coerce a backends.codex.sandbox_mode coming from config.json. The runtime
+// `--codex-sandbox` enum is already validated by optique at parse time, so
+// this only filters the config-derived fallback. Bad enum values from
+// config.json are dropped here rather than exiting the process — config is
+// hand-edited and we prefer permissive recovery over a daemon that won't
+// start because of a typo in an unrelated field.
+function coerceCodexSandbox(
+  args: Args,
+  configSandbox: string | undefined,
 ): CodexSandboxMode | undefined {
-  const trimmed = raw?.trim();
-  if (!trimmed) return undefined;
-  if (CODEX_SANDBOX_MODES.has(trimmed as CodexSandboxMode)) {
-    return trimmed as CodexSandboxMode;
-  }
-  console.error(
-    `${source} must be one of: ${Array.from(CODEX_SANDBOX_MODES).join(', ')} (got ${JSON.stringify(trimmed)})`,
-  );
-  process.exit(1);
+  if (args.codexSandbox) return args.codexSandbox;
+  if (isCodexSandboxMode(configSandbox)) return configSandbox;
+  return undefined;
 }
 
 function pickBackend(name: string, args: Args): Backend {
-  // Env wins over config.json for backend defaults, mirroring the daemon-level
-  // precedence above. The backend factories already do `opts ?? default`
-  // internally, so passing the merged value here is enough.
+  // All backend-specific knobs are now threaded through `args` (merged from
+  // flag > env > config in mergeClientArgs). `pickBackend` just constructs
+  // the right factory with those values; no env reads here.
   const backends = args.backends ?? {};
   switch (name) {
     case 'echo':
@@ -181,60 +207,41 @@ function pickBackend(name: string, args: Args): Backend {
     case 'openclaw': {
       // openclaw's persona / system prompt lives in the gateway-side config
       // (`/data/openclaw.json`), not in a per-message field on `chat.send`.
-      // Self-identity is surfaced via `vicoop-client whoami` so operators can
-      // paste it into their gateway persona; the bridge has no wire-protocol
-      // hook to inject it from here.
-      //
-      // Trim + treat-empty-as-unset across the board: install.sh's env
-      // template ships these keys with empty values for operators to fill in,
-      // and `??` would let those empty strings shadow a populated config.json.
-      // `?.trim() ||` mirrors the daemon-level precedence (env wins when set,
-      // falls through to config when blank/unset).
-      const oc = backends.openclaw;
-      // Parse `OPENCLAW_TASK_TIMEOUT_MS` here too (the factory already does
-      // it inside `resolveTimeout`, but we need the parse result *outside*
-      // the factory to decide whether to fall through to config). Three
-      // cases:
-      //   - env unset / blank → opts = config (factory uses config or default)
-      //   - env is a positive finite number → opts = undefined (factory
-      //     re-reads env so the value flows through resolveTimeout normally)
-      //   - env is non-empty but invalid (e.g. "abc", "0", "-5") → warn
-      //     once here, then fall through to config like the blank case so
-      //     the operator's `backends.openclaw.task_timeout_ms` is honored
-      //     instead of being silently replaced by the compiled default.
-      const envTimeoutMs = parseOpenclawTimeoutEnv(process.env.OPENCLAW_TASK_TIMEOUT_MS);
+      // Self-identity is surfaced via `vicoop-client whoami` so operators
+      // can paste it into their gateway persona; the bridge has no
+      // wire-protocol hook to inject it from here.
       return createOpenclawBackend({
-        url: process.env.OPENCLAW_GATEWAY_URL?.trim() || oc?.gateway_url,
-        token: process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || oc?.gateway_token,
-        agent: process.env.OPENCLAW_AGENT?.trim() || oc?.agent,
+        url: args.openclawGateway ?? backends.openclaw?.gateway_url,
+        token: args.openclawGatewayToken ?? backends.openclaw?.gateway_token,
+        agent: args.openclawAgent ?? backends.openclaw?.agent,
         openaiCompatAgent:
-          process.env.OPENCLAW_OAI_COMPAT_AGENT?.trim() || oc?.openai_compat_agent,
-        taskTimeoutMs: envTimeoutMs === 'valid' ? undefined : oc?.task_timeout_ms,
+          args.openclawOpenaiCompatAgent ?? backends.openclaw?.openai_compat_agent,
+        taskTimeoutMs: args.openclawTaskTimeoutMs,
       });
     }
-    case 'claude':
-      return createClaudeBackend({
-        cwd:
-          process.env.CLAUDE_CWD?.trim() ||
-          backends.claude?.cwd ||
-          undefined,
-        identity: deriveIdentity(args.agentId, args.server) ?? undefined,
-        settings:
+    case 'claude': {
+      // settings precedence: --claude-settings-file (flag, path on disk) >
+      // CLAUDE_SETTINGS_JSON (env, inline JSON) > backends.claude.settings
+      // (config). The flag wins because operators reach for it explicitly;
+      // the env form is the legacy install-script path.
+      let settings: Record<string, unknown> | undefined;
+      if (args.claudeSettingsFile) {
+        settings = readClaudeSettingsFile(args.claudeSettingsFile);
+      } else {
+        settings =
           parseClaudeSettingsEnv(process.env.CLAUDE_SETTINGS_JSON) ??
-          backends.claude?.settings,
+          backends.claude?.settings;
+      }
+      return createClaudeBackend({
+        cwd: args.claudeCwd,
+        identity: deriveIdentity(args.agentId, args.server) ?? undefined,
+        settings,
       });
+    }
     case 'codex':
       return createCodexBackend({
-        cwd:
-          process.env.CODEX_CWD?.trim() ||
-          backends.codex?.cwd ||
-          undefined,
-        sandboxMode:
-          parseCodexSandboxMode(process.env.CODEX_SANDBOX_MODE) ??
-          parseCodexSandboxMode(
-            backends.codex?.sandbox_mode,
-            'backends.codex.sandbox_mode (config.json)',
-          ),
+        cwd: args.codexCwd,
+        sandboxMode: coerceCodexSandbox(args, backends.codex?.sandbox_mode),
         approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
       });
     default:
@@ -277,30 +284,30 @@ function runClient(argv: string[]): void {
   process.on('SIGTERM', shutdown);
 }
 
+const upgradeParser = object({
+  check: withDefault(flag('--check'), false),
+  force: withDefault(flag('--force'), false),
+  version: optional(option('--version', string({ metavar: 'X.Y.Z' }))),
+});
+
 async function runUpgradeCmd(args: string[]): Promise<number> {
-  let check = false;
-  let force = false;
-  let version: string | undefined;
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--check') check = true;
-    else if (a === '--force') force = true;
-    else if (a === '--version') {
-      version = args[++i];
-      if (!version) {
-        console.error('--version requires a value (e.g. 0.3.0, v0.3.0, or @vicoop-bridge/client@0.3.0)');
-        return 1;
-      }
-    } else if (a === '-h' || a === '--help') {
-      console.log('usage: vicoop-client upgrade [--check] [--force] [--version <X.Y.Z | vX.Y.Z | @vicoop-bridge/client@X.Y.Z>]');
-      return 0;
-    } else {
-      console.error(`unknown argument to upgrade: ${a}`);
-      return 1;
-    }
+  if (args.includes('-h') || args.includes('--help')) {
+    console.log(
+      'usage: vicoop-client upgrade [--check] [--force] [--version <X.Y.Z | vX.Y.Z | @vicoop-bridge/client@X.Y.Z>]',
+    );
+    return 0;
+  }
+  const r = parseOptique(upgradeParser, args);
+  if (!r.success) {
+    console.error(formatMessage(r.error, { colors: false }));
+    return 1;
   }
   try {
-    return await runUpgrade({ check, force, version });
+    return await runUpgrade({
+      check: r.value.check,
+      force: r.value.force,
+      version: r.value.version,
+    });
   } catch (e) {
     console.error(`upgrade failed: ${(e as Error).message}`);
     return 1;

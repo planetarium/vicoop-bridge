@@ -8,6 +8,12 @@
 // stored token is expired) the user gets a clear "run login" hint and the
 // process exits with code 1.
 
+import { object } from '@optique/core/constructs';
+import { multiple, optional, withDefault } from '@optique/core/modifiers';
+import { argument, flag, option } from '@optique/core/primitives';
+import { parse } from '@optique/core/parser';
+import { formatMessage } from '@optique/core/message';
+import { string } from '@optique/core/valueparser';
 import { resolveOwnerSession } from './owner-session.js';
 
 type Subcommand =
@@ -26,32 +32,33 @@ interface ParsedArgs {
   help: boolean;
 }
 
+// Shared parser across the six admin subcommands. Each subcommand handler
+// validates its own positional arity afterwards — keeping the parser
+// generic lets one definition serve all six call sites.
+const adminParser = object({
+  bridge: optional(option('--bridge', string({ metavar: 'URL' }))),
+  token: optional(option('--token', string({ metavar: 'TOKEN' }))),
+  json: withDefault(flag('--json'), false),
+  positional: multiple(argument(string({ metavar: 'ARG' }))),
+});
+
 function parseArgs(args: string[]): ParsedArgs | { error: string } {
-  const out: ParsedArgs = { positional: [], json: false, help: false };
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--json') {
-      out.json = true;
-      continue;
-    }
-    if (a === '-h' || a === '--help') {
-      out.help = true;
-      continue;
-    }
-    if (a === '--bridge' || a === '--token') {
-      const v = args[i + 1];
-      if (v === undefined) return { error: `${a} requires a value` };
-      if (a === '--bridge') out.bridge = v;
-      else out.token = v;
-      i++;
-      continue;
-    }
-    if (a.startsWith('--')) {
-      return { error: `unknown flag: ${a}` };
-    }
-    out.positional.push(a);
+  const r = parse(adminParser, args);
+  if (!r.success) {
+    return { error: formatMessage(r.error, { colors: false }) };
   }
-  return out;
+  return {
+    positional: [...r.value.positional],
+    bridge: r.value.bridge,
+    token: r.value.token,
+    json: r.value.json,
+    // -h/--help is detected pre-parse by each handler (they all return 0
+    // and print their own usage). The flag is never threaded into the
+    // optique grammar — adding it would shadow optique's own help builder
+    // and the existing per-subcommand `usage()` strings would lose their
+    // exact wording, which tests assert against.
+    help: false,
+  };
 }
 
 function usage(sub: Subcommand): string {
@@ -245,14 +252,14 @@ function renderAgentList(body: unknown): string {
 }
 
 export async function runAddCaller(args: string[]): Promise<number> {
+  if (args.includes('-h') || args.includes('--help')) {
+    process.stdout.write(`${usage('add-caller')}\n`);
+    return 0;
+  }
   const parsed = parseArgs(args);
   if ('error' in parsed) {
     process.stderr.write(`${parsed.error}\n${usage('add-caller')}\n`);
     return 1;
-  }
-  if (parsed.help) {
-    process.stdout.write(`${usage('add-caller')}\n`);
-    return 0;
   }
   if (parsed.positional.length !== 2) {
     process.stderr.write(`${usage('add-caller')}\n`);
@@ -274,14 +281,14 @@ export async function runAddCaller(args: string[]): Promise<number> {
 }
 
 export async function runRemoveCaller(args: string[]): Promise<number> {
+  if (args.includes('-h') || args.includes('--help')) {
+    process.stdout.write(`${usage('remove-caller')}\n`);
+    return 0;
+  }
   const parsed = parseArgs(args);
   if ('error' in parsed) {
     process.stderr.write(`${parsed.error}\n${usage('remove-caller')}\n`);
     return 1;
-  }
-  if (parsed.help) {
-    process.stdout.write(`${usage('remove-caller')}\n`);
-    return 0;
   }
   if (parsed.positional.length !== 2) {
     process.stderr.write(`${usage('remove-caller')}\n`);
@@ -302,14 +309,14 @@ export async function runRemoveCaller(args: string[]): Promise<number> {
 }
 
 export async function runListCallers(args: string[]): Promise<number> {
+  if (args.includes('-h') || args.includes('--help')) {
+    process.stdout.write(`${usage('list-callers')}\n`);
+    return 0;
+  }
   const parsed = parseArgs(args);
   if ('error' in parsed) {
     process.stderr.write(`${parsed.error}\n${usage('list-callers')}\n`);
     return 1;
-  }
-  if (parsed.help) {
-    process.stdout.write(`${usage('list-callers')}\n`);
-    return 0;
   }
   if (parsed.positional.length !== 1) {
     process.stderr.write(`${usage('list-callers')}\n`);
@@ -330,14 +337,14 @@ export async function runListCallers(args: string[]): Promise<number> {
 }
 
 export async function runListClients(args: string[]): Promise<number> {
+  if (args.includes('-h') || args.includes('--help')) {
+    process.stdout.write(`${usage('list-clients')}\n`);
+    return 0;
+  }
   const parsed = parseArgs(args);
   if ('error' in parsed) {
     process.stderr.write(`${parsed.error}\n${usage('list-clients')}\n`);
     return 1;
-  }
-  if (parsed.help) {
-    process.stdout.write(`${usage('list-clients')}\n`);
-    return 0;
   }
   if (parsed.positional.length !== 0) {
     process.stderr.write(`${usage('list-clients')}\n`);
@@ -357,14 +364,14 @@ export async function runListClients(args: string[]): Promise<number> {
 }
 
 export async function runRevokeClient(args: string[]): Promise<number> {
+  if (args.includes('-h') || args.includes('--help')) {
+    process.stdout.write(`${usage('revoke-client')}\n`);
+    return 0;
+  }
   const parsed = parseArgs(args);
   if ('error' in parsed) {
     process.stderr.write(`${parsed.error}\n${usage('revoke-client')}\n`);
     return 1;
-  }
-  if (parsed.help) {
-    process.stdout.write(`${usage('revoke-client')}\n`);
-    return 0;
   }
   if (parsed.positional.length !== 1) {
     process.stderr.write(`${usage('revoke-client')}\n`);
@@ -385,14 +392,14 @@ export async function runRevokeClient(args: string[]): Promise<number> {
 }
 
 export async function runListAgents(args: string[]): Promise<number> {
+  if (args.includes('-h') || args.includes('--help')) {
+    process.stdout.write(`${usage('list-agents')}\n`);
+    return 0;
+  }
   const parsed = parseArgs(args);
   if ('error' in parsed) {
     process.stderr.write(`${parsed.error}\n${usage('list-agents')}\n`);
     return 1;
-  }
-  if (parsed.help) {
-    process.stdout.write(`${usage('list-agents')}\n`);
-    return 0;
   }
   if (parsed.positional.length !== 0) {
     process.stderr.write(`${usage('list-agents')}\n`);

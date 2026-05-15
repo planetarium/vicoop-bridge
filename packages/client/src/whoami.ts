@@ -4,6 +4,12 @@
 // persona/system prompt, and optionally verify the bridge actually
 // resolves it via WebFinger.
 
+import { object } from '@optique/core/constructs';
+import { optional, withDefault } from '@optique/core/modifiers';
+import { flag, option } from '@optique/core/primitives';
+import { parse } from '@optique/core/parser';
+import { formatMessage } from '@optique/core/message';
+import { string } from '@optique/core/valueparser';
 import {
   a2aCardUrl,
   a2aEndpoint,
@@ -22,7 +28,6 @@ interface ParsedArgs {
   server?: string;
   json: boolean;
   verify: boolean;
-  help: boolean;
 }
 
 // Output sinks are injectable so tests don't have to mutate global
@@ -51,33 +56,27 @@ const USAGE =
   'usage: vicoop-client whoami [--agentId <id>] [--server <ws://...>] [--json] [--verify]\n' +
   '  agentId / server fall back to AGENT_ID / SERVER_URL env vars.';
 
+const whoamiParser = object({
+  agentId: optional(option('--agentId', string({ metavar: 'ID' }))),
+  server: optional(option('--server', string({ metavar: 'WS_URL' }))),
+  // `flag()` alone is *required* in optique — even though the result is a
+  // boolean, the flag itself must appear in argv. Wrap with `withDefault`
+  // so absence reads as `false`.
+  json: withDefault(flag('--json'), false),
+  verify: withDefault(flag('--verify'), false),
+});
+
 function parseArgs(args: string[]): ParsedArgs | { error: string } {
-  const out: ParsedArgs = { json: false, verify: false, help: false };
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--json') {
-      out.json = true;
-      continue;
-    }
-    if (a === '--verify') {
-      out.verify = true;
-      continue;
-    }
-    if (a === '-h' || a === '--help') {
-      out.help = true;
-      continue;
-    }
-    if (a === '--agentId' || a === '--server') {
-      const v = args[i + 1];
-      if (v === undefined) return { error: `${a} requires a value` };
-      if (a === '--agentId') out.agentId = v;
-      else out.server = v;
-      i++;
-      continue;
-    }
-    return { error: `unknown argument: ${a}` };
+  const r = parse(whoamiParser, args);
+  if (!r.success) {
+    return { error: formatMessage(r.error, { colors: false }) };
   }
-  return out;
+  return {
+    agentId: r.value.agentId,
+    server: r.value.server,
+    json: r.value.json,
+    verify: r.value.verify,
+  };
 }
 
 interface WhoamiResult {
@@ -207,14 +206,16 @@ function buildResult(id: AgentIdentity): WhoamiResult {
 }
 
 export async function runWhoami(argv: string[], io: WhoamiIO = defaultIO): Promise<number> {
+  // Handle -h/--help before optique sees them so the existing usage text is
+  // surfaced unchanged. (`flag('--help')` would shadow it.)
+  if (argv.includes('-h') || argv.includes('--help')) {
+    io.stdout(`${USAGE}\n`);
+    return 0;
+  }
   const parsed = parseArgs(argv);
   if ('error' in parsed) {
     io.stderr(`${parsed.error}\n${USAGE}\n`);
     return 1;
-  }
-  if (parsed.help) {
-    io.stdout(`${USAGE}\n`);
-    return 0;
   }
 
   const agentId = parsed.agentId ?? process.env.AGENT_ID;

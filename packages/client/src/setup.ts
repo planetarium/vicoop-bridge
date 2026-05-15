@@ -4,6 +4,12 @@
 // want a shell-sourceable env file alongside the canonical config — see #137.
 
 import { existsSync } from 'node:fs';
+import { object } from '@optique/core/constructs';
+import { multiple, optional, withDefault } from '@optique/core/modifiers';
+import { flag, option } from '@optique/core/primitives';
+import { parse } from '@optique/core/parser';
+import { formatMessage } from '@optique/core/message';
+import { string } from '@optique/core/valueparser';
 import { atomicWriteFile, resolveOwnerSession } from './owner-session.js';
 import {
   defaultConfigPath,
@@ -52,55 +58,48 @@ function usage(): string {
   ].join('\n');
 }
 
+const setupParser = object({
+  clientName: optional(option('--client-name', string({ metavar: 'NAME' }))),
+  agentIds: optional(option('--agent-ids', string({ metavar: 'ID1,ID2' }))),
+  // `--caller` is repeatable; we also accept comma-separated values in a
+  // single occurrence to preserve the historical CLI surface.
+  callers: multiple(option('--caller', string({ metavar: 'PRINCIPAL' }))),
+  envFile: optional(option('--write-env-file', string({ metavar: 'PATH' }))),
+  // `--env-file` is an alias for `--write-env-file` (older docs used it).
+  envFileAlias: optional(option('--env-file', string({ metavar: 'PATH' }))),
+  bridge: optional(option('--bridge', string({ metavar: 'URL' }))),
+  token: optional(option('--token', string({ metavar: 'TOKEN' }))),
+  json: withDefault(flag('--json'), false),
+});
+
 function parseArgs(args: string[]): SetupArgs | { error: string; help?: boolean } {
-  let clientName: string | undefined;
-  let allowedAgentIds: string[] = [];
-  const callers: string[] = [];
-  let envFile: string | null = null;
-  let bridge: string | undefined;
-  let token: string | undefined;
-  let json = false;
-
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--json') {
-      json = true;
-      continue;
-    }
-    if (a === '-h' || a === '--help') {
-      return { error: '', help: true };
-    }
-    const v = args[i + 1];
-    if (v === undefined) return { error: `${a} requires a value` };
-    switch (a) {
-      case '--client-name':
-        clientName = v;
-        break;
-      case '--agent-ids':
-        allowedAgentIds = v.split(',').map((s) => s.trim()).filter(Boolean);
-        break;
-      case '--caller':
-        callers.push(...v.split(',').map((s) => s.trim()).filter(Boolean));
-        break;
-      case '--write-env-file':
-      case '--env-file':
-        envFile = v;
-        break;
-      case '--bridge':
-        bridge = v;
-        break;
-      case '--token':
-        token = v;
-        break;
-      default:
-        return { error: `unknown flag: ${a}` };
-    }
-    i++;
+  if (args.includes('-h') || args.includes('--help')) {
+    return { error: '', help: true };
   }
-
-  if (!clientName) return { error: '--client-name is required' };
+  const r = parse(setupParser, args);
+  if (!r.success) {
+    return { error: formatMessage(r.error, { colors: false }) };
+  }
+  const v = r.value;
+  if (!v.clientName) return { error: '--client-name is required' };
+  const allowedAgentIds = v.agentIds
+    ? v.agentIds.split(',').map((s) => s.trim()).filter(Boolean)
+    : [];
   if (allowedAgentIds.length === 0) return { error: '--agent-ids is required' };
-  return { clientName, allowedAgentIds, callers, envFile, bridge, token, json };
+  // `--caller` is repeatable AND accepts comma-separated values within each
+  // occurrence — explode both into a flat list.
+  const callers = v.callers.flatMap((c) =>
+    c.split(',').map((s) => s.trim()).filter(Boolean),
+  );
+  return {
+    clientName: v.clientName,
+    allowedAgentIds,
+    callers,
+    envFile: v.envFile ?? v.envFileAlias ?? null,
+    bridge: v.bridge,
+    token: v.token,
+    json: v.json,
+  };
 }
 
 function gqlString(value: string): string {

@@ -3,6 +3,12 @@
 // `vicoop-client setup` so login has no server-side client-registration
 // side effects.
 
+import { object } from '@optique/core/constructs';
+import { optional, withDefault } from '@optique/core/modifiers';
+import { flag, option } from '@optique/core/primitives';
+import { parse } from '@optique/core/parser';
+import { formatMessage } from '@optique/core/message';
+import { string } from '@optique/core/valueparser';
 import {
   defaultStorePath,
   saveOwnerSession,
@@ -58,44 +64,27 @@ function usage(): void {
   );
 }
 
-function parseArgs(args: string[]): LoginArgs | null {
-  let bridge: string | undefined;
-  let json = false;
-  let pollOnce = false;
+const loginParser = object({
+  bridge: optional(option('--bridge', string({ metavar: 'URL' }))),
+  json: withDefault(flag('--json'), false),
+  // `--owner-session` is accepted for backward compatibility — login always
+  // issues an owner-session bearer. The flag is parsed and ignored.
+  _ownerSession: withDefault(flag('--owner-session'), false),
+  // `--poll-once` is a test/CI smoke flag, undocumented in usage.
+  pollOnce: withDefault(flag('--poll-once'), false),
+});
 
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--json') {
-      json = true;
-      continue;
-    }
-    if (a === '--owner-session') {
-      continue;
-    }
-    if (a === '--poll-once') {
-      pollOnce = true;
-      continue;
-    }
-    const v = args[i + 1];
-    if (v === undefined) {
-      process.stderr.write(`flag ${a} requires a value\n`);
-      return null;
-    }
-    switch (a) {
-      case '--bridge':
-        bridge = v;
-        break;
-      default:
-        process.stderr.write(`unknown flag: ${a}\n`);
-        return null;
-    }
-    i++;
+function parseArgs(args: string[]): LoginArgs | null {
+  const r = parse(loginParser, args);
+  if (!r.success) {
+    process.stderr.write(`${formatMessage(r.error, { colors: false })}\n`);
+    return null;
   }
-  if (!bridge) {
+  if (!r.value.bridge) {
     usage();
     return null;
   }
-  return { bridge, json, pollOnce };
+  return { bridge: r.value.bridge, json: r.value.json, pollOnce: r.value.pollOnce };
 }
 
 async function fetchDeviceCode(args: LoginArgs): Promise<DeviceCodeResponse> {
