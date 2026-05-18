@@ -1831,20 +1831,19 @@ export function createOpenclawBackend(
                 lastChunk: true,
               });
             }
+            // The envelope is the complete task output and was already
+            // routed via the `data` artifact above. Per A2A "Messages
+            // SHOULD NOT be used to deliver task outputs"; re-stamping
+            // the raw envelope JSON on status.message.parts caused
+            // downstream gateways (oai2a2a) to re-extract and re-emit
+            // the same tool_calls, corrupting OpenAI streaming clients
+            // that concatenate arguments by index. See issue #200.
             emit({
               type: 'task.complete',
               taskId: task.taskId,
               status: {
                 state: 'completed',
                 timestamp: new Date().toISOString(),
-                message: {
-                  role: 'agent',
-                  messageId: randomUUID(),
-                  // text2 is the raw envelope JSON string; stamp it on
-                  // status.message for callers that pull terminal content
-                  // from the conventional A2A slot. Mirrors claude/codex.
-                  parts: [{ kind: 'text', text: text2 }],
-                },
               },
             });
             return;

@@ -2100,6 +2100,23 @@ test('assistant {"tool_calls":[...]} reply becomes a data-part artifact when ext
   assert.deepEqual(part.data, envelope);
   // Artifact carries the extension URI so downstream filters can route on it.
   assert.deepEqual(artifacts[0].artifact.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+
+  // The envelope is the complete task output and must NOT be re-stamped on
+  // status.message.parts: per A2A "Messages SHOULD NOT be used to deliver
+  // task outputs", and downstream gateways (oai2a2a) used to re-parse the
+  // text part as tool_calls, double-emitting them and corrupting OpenAI
+  // streaming clients. See issue #200.
+  const complete = frames.find((f) => f.type === 'task.complete');
+  assert.ok(complete && complete.type === 'task.complete');
+  const messageParts = complete.status.message?.parts ?? [];
+  for (const p of messageParts) {
+    if (p.kind !== 'text') continue;
+    assert.equal(
+      p.text.includes('"tool_calls"'),
+      false,
+      'status.message.parts must not echo the openai-compat envelope JSON',
+    );
+  }
 });
 
 test('non-envelope assistant text still streams as a text artifact under the extension', async () => {

@@ -1476,7 +1476,19 @@ export function createClaudeBackend(
       }
 
       const completeText = finalText ?? '';
-      const parts: Part[] = completeText ? [{ kind: 'text', text: completeText }] : [];
+      // If the finalText is the openai-compat `{"tool_calls":[…]}`
+      // envelope, it was already routed to a `data` artifact via
+      // emitAssistantArtifact. Re-stamping the raw JSON onto
+      // status.message.parts violates A2A's "Messages SHOULD NOT be used
+      // to deliver task outputs" and causes downstream gateways
+      // (oai2a2a) to re-extract and re-emit the same tool_calls,
+      // corrupting OpenAI streaming clients that concatenate arguments
+      // by index. See issue #200.
+      const envelopeAlreadyRouted =
+        openaiCompat !== null && tryParseToolCallsEnvelope(completeText) !== null;
+      const parts: Part[] = !envelopeAlreadyRouted && completeText
+        ? [{ kind: 'text', text: completeText }]
+        : [];
 
       // Streaming produced nothing (e.g. claude only wrote a `result` event).
       // Emit the final text once so clients that ignore task.complete still
@@ -1499,7 +1511,7 @@ export function createClaudeBackend(
       // Per spec the carrier is `Task.status.message.metadata[<URI>].usage`,
       // so when usage is present but there is no completion text we still
       // emit a message frame (with empty parts) to carry the metadata.
-      const hasMessage = completeText.length > 0 || finalUsage !== null;
+      const hasMessage = parts.length > 0 || finalUsage !== null;
       const messageMetadata = finalUsage
         ? makeOpenAICompatUsageMetadata(finalUsage)
         : undefined;
