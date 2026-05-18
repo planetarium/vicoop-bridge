@@ -723,47 +723,61 @@ export function createCodexBackend(
           // entries in codex-rs `spec_plan.rs` with no feature key. We
           // counter them with `CODEX_LEFTOVER_TOOL_DIRECTIVE` in the
           // developer instructions instead (see systemPrompt above).
-          const configOverride = callerToolDispatchActive(openaiCompat)
+          //
+          // The override is split across two gates with different scopes:
+          //
+          // - `mcp_servers: {}` is sent for ANY openai-compat call. The
+          //   caller is treating us as an LLM endpoint, not an agentic
+          //   codex; MCP discovery tools (`list_mcp_resources` /
+          //   `list_mcp_resource_templates` / `read_mcp_resource`, gated
+          //   in `spec_plan.rs` by `if params.mcp_tools.is_some()`) never
+          //   fit that mental model — empty server map → no aggregated
+          //   mcp_tools → those handlers are not pushed into the registry.
+          //   Verified via the #207 session 019e3a10-… where the model
+          //   burned multiple turns on `list_mcp_resources({server:"local"})`
+          //   before bailing with text-only output.
+          //
+          // - `features.*: false` is restricted to caller-side dispatch
+          //   (tools provided AND tool_choice ≠ "none") because those
+          //   surfaces (image_generation, web_search, multi-agent, etc.)
+          //   may be desirable for non-dispatch openai-compat callers
+          //   (history-only resumes, system-only prompts, tool_choice="none").
+          const configOverride = openaiCompat !== null
             ? {
-                features: {
-                  // Hosted modalities that bypass the caller's text envelope.
-                  image_generation: false,
-                  web_search_request: false,
-                  web_search_cached: false,
-                  // Codex-side tool catalog / discovery and plugin surfaces.
-                  tool_search: false,
-                  tool_suggest: false,
-                  tool_call_mcp_elicitation: false,
-                  builtin_mcp: false,
-                  plugins: false,
-                  apps: false,
-                  enable_mcp_apps: false,
-                  // Sub-agent / fan-out orchestration bypasses the single-
-                  // agent envelope contract.
-                  multi_agent: false,
-                  multi_agent_v2: false,
-                  enable_fanout: false,
-                  // Permission-escalation prompts would block under openai-
-                  // compat (no human in loop).
-                  request_permissions_tool: false,
-                  // Experimental code surfaces.
-                  code_mode: false,
-                  goals: false,
-                  memories: false,
-                  // Workspace introspection — fs reads that could leak host
-                  // paths back into model context.
-                  workspace_dependencies: false,
-                },
-                // Drop every configured MCP server for this thread. This is
-                // the gate for `list_mcp_resources` / `list_mcp_resource_templates`
-                // / `read_mcp_resource` registration in codex-rs
-                // `spec_plan.rs` (`if params.mcp_tools.is_some()` —
-                // empty server map → no aggregated mcp_tools → those
-                // handlers not pushed into the registry). Verified via
-                // the #207 session 019e3a10-… where the model burned
-                // multiple turns on `list_mcp_resources({server:"local"})`
-                // before bailing with text-only output.
                 mcp_servers: {},
+                ...(callerToolDispatchActive(openaiCompat)
+                  ? {
+                      features: {
+                        // Hosted modalities that bypass the caller's text envelope.
+                        image_generation: false,
+                        web_search_request: false,
+                        web_search_cached: false,
+                        // Codex-side tool catalog / discovery and plugin surfaces.
+                        tool_search: false,
+                        tool_suggest: false,
+                        tool_call_mcp_elicitation: false,
+                        builtin_mcp: false,
+                        plugins: false,
+                        apps: false,
+                        enable_mcp_apps: false,
+                        // Sub-agent / fan-out orchestration bypasses the single-
+                        // agent envelope contract.
+                        multi_agent: false,
+                        multi_agent_v2: false,
+                        enable_fanout: false,
+                        // Permission-escalation prompts would block under openai-
+                        // compat (no human in loop).
+                        request_permissions_tool: false,
+                        // Experimental code surfaces.
+                        code_mode: false,
+                        goals: false,
+                        memories: false,
+                        // Workspace introspection — fs reads that could leak host
+                        // paths back into model context.
+                        workspace_dependencies: false,
+                      },
+                    }
+                  : {}),
               }
             : null;
           // `environments: []` is sticky on `thread/start` and unsupported on

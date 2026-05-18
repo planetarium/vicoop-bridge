@@ -8,14 +8,17 @@ chaining host-side scaffolding (issue #207).
 
 Two seams:
 
-- **`config.mcp_servers: {}` on `thread/start` / `thread/resume`** — empties
-  the MCP server map at thread scope, which trips the
-  `if params.mcp_tools.is_some()` gate in codex-rs `spec_plan.rs` and
-  prevents `list_mcp_resources`, `list_mcp_resource_templates`, and
+- **`config.mcp_servers: {}` on `thread/start` / `thread/resume` for any
+  openai-compat call** — empties the MCP server map at thread scope, which
+  trips the `if params.mcp_tools.is_some()` gate in codex-rs `spec_plan.rs`
+  and prevents `list_mcp_resources`, `list_mcp_resource_templates`, and
   `read_mcp_resource` from being pushed into the tool registry. In the
   observed #207 session the model burned three turns on
   `list_mcp_resources({server:"local"})` before bailing with text-only
-  output.
+  output. Gated to all openai-compat calls (not just caller-side dispatch)
+  because MCP discovery never fits the LLM-endpoint mental model of an
+  openai-compat caller, regardless of whether `tools` are supplied or
+  `tool_choice` is `"none"`.
 
 - **`CODEX_LEFTOVER_TOOL_DIRECTIVE` appended to `developerInstructions`** —
   `update_plan` and `request_user_input` are unconditional
