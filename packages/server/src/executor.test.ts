@@ -4,7 +4,11 @@ import type { WebSocket } from 'ws';
 import { TaskState, type Message, type Task, type TaskStore } from '@a2x/sdk';
 import { parseDownFrame, type AgentCard } from '@vicoop-bridge/protocol';
 import { Registry, type ClientConnection } from './registry.js';
-import { WSForwardingExecutor, stripInternalMetadata } from './executor.js';
+import {
+  WSForwardingExecutor,
+  appendHistoryMessage,
+  stripInternalMetadata,
+} from './executor.js';
 
 // Issue #128 (B): the /agents/:id route stashes the verified caller's
 // principalId on `message.metadata._principalId`. The executor must (1)
@@ -77,6 +81,30 @@ test('stripInternalMetadata preserves a regular metadata object as-is', () => {
     keepMe: 1,
     nested: { x: 2 },
   });
+});
+
+test('appendHistoryMessage appends messages once by messageId', () => {
+  const first = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-1',
+  } as unknown as Message;
+  const duplicate = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi again' }],
+    messageId: 'm-1',
+  } as unknown as Message;
+  const second = {
+    role: 'agent',
+    parts: [{ text: 'done' }],
+    messageId: 'm-2',
+  } as unknown as Message;
+
+  const withFirst = appendHistoryMessage([], first);
+  const withDuplicate = appendHistoryMessage(withFirst, duplicate);
+  const withSecond = appendHistoryMessage(withDuplicate, second);
+
+  assert.deepEqual(withSecond.map((m) => m.messageId), ['m-1', 'm-2']);
 });
 
 test('executor records principalId in binding and strips _principalId from outgoing WS frame', async () => {

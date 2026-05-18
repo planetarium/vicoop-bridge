@@ -58,7 +58,7 @@ export function stripInternalMetadata(
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-function appendHistoryMessage(history: Message[], message: Message | undefined): Message[] {
+export function appendHistoryMessage(history: Message[], message: Message | undefined): Message[] {
   if (message === undefined) return history;
   if (history.some((existing) => existing.messageId === message.messageId)) return history;
   return [...history, message];
