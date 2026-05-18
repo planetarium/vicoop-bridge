@@ -1041,6 +1041,23 @@ test('openai-compat envelope agent message is emitted as a data part', async () 
     assert.ok(artifact.artifact.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI));
   }
 
+  // The envelope is the complete task output and must NOT be re-stamped on
+  // status.message.parts: per A2A "Messages SHOULD NOT be used to deliver
+  // task outputs", and downstream gateways (oai2a2a) used to re-parse the
+  // text part as tool_calls, double-emitting them and corrupting OpenAI
+  // streaming clients. See issue #200.
+  const complete = frames.find((f) => f.type === 'task.complete');
+  assert.ok(complete && complete.type === 'task.complete');
+  const messageParts = complete.status.message?.parts ?? [];
+  for (const p of messageParts) {
+    if (p.kind !== 'text') continue;
+    assert.equal(
+      p.text.includes('"tool_calls"'),
+      false,
+      'status.message.parts must not echo the openai-compat envelope JSON',
+    );
+  }
+
   // developerInstructions must have been included in thread/start.
   const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
   const params = (tsFrame as { params?: { developerInstructions?: string } }).params;

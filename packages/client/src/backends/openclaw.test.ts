@@ -3151,6 +3151,13 @@ test('envelope JSON on session.message becomes a data-part artifact tagged with 
     if (part.kind !== 'data') throw new Error('expected data part');
     assert.deepEqual(part.data, envelope);
     assert.deepEqual(artifacts[0].artifact.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+
+    // The envelope is the complete task output and must NOT be stamped on
+    // status.message.parts as well: per A2A "Messages SHOULD NOT be used
+    // to deliver task outputs". See issue #200.
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete && complete.type === 'task.complete');
+    assert.equal(complete.status.message, undefined);
   } finally {
     await fake.close();
   }
@@ -3202,14 +3209,14 @@ test('envelope JSON arriving only on the terminal chat event (no session.message
     if (part.kind !== 'data') throw new Error('expected data part');
     assert.deepEqual(part.data, envelope);
     assert.deepEqual(artifacts[0].artifact.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
-    // task.complete still carries the envelope JSON as text in status.message
-    // (mirrors claude/codex: data-part is the primary surface, text in the
-    // terminal slot is the conventional A2A mirror).
+    // The envelope is the complete task output and must NOT be stamped on
+    // status.message.parts as well: per A2A "Messages SHOULD NOT be used
+    // to deliver task outputs", and downstream gateways (oai2a2a) used to
+    // re-parse the text part as tool_calls, double-emitting them and
+    // corrupting OpenAI streaming clients. See issue #200.
     const complete = frames.find((f) => f.type === 'task.complete');
     assert.ok(complete && complete.type === 'task.complete');
-    const stamped = complete.status.message?.parts[0];
-    assert.equal(stamped?.kind, 'text');
-    if (stamped?.kind === 'text') assert.equal(stamped.text, JSON.stringify(envelope));
+    assert.equal(complete.status.message, undefined);
   } finally {
     await fake.close();
   }
