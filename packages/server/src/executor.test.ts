@@ -4,7 +4,11 @@ import type { WebSocket } from 'ws';
 import { TaskState, type Message, type Task, type TaskStore } from '@a2x/sdk';
 import { parseDownFrame, type AgentCard } from '@vicoop-bridge/protocol';
 import { Registry, type ClientConnection } from './registry.js';
-import { WSForwardingExecutor, stripInternalMetadata } from './executor.js';
+import {
+  WSForwardingExecutor,
+  appendHistoryMessage,
+  stripInternalMetadata,
+} from './executor.js';
 
 // Issue #128 (B): the /agents/:id route stashes the verified caller's
 // principalId on `message.metadata._principalId`. The executor must (1)
@@ -31,6 +35,18 @@ function noopTaskStore(): TaskStore {
     load: async () => undefined,
     updateTask: async () => {},
   } as unknown as TaskStore;
+}
+
+function captureTaskStore(): TaskStore & { updates: unknown[] } {
+  const updates: unknown[] = [];
+  return {
+    updates,
+    save: async () => {},
+    load: async () => undefined,
+    updateTask: async (_taskId: string, update: unknown) => {
+      updates.push(update);
+    },
+  } as unknown as TaskStore & { updates: unknown[] };
 }
 
 function makeWsCapture(): { ws: WebSocket; sent: string[] } {
@@ -65,6 +81,30 @@ test('stripInternalMetadata preserves a regular metadata object as-is', () => {
     keepMe: 1,
     nested: { x: 2 },
   });
+});
+
+test('appendHistoryMessage appends messages once by messageId', () => {
+  const first = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-1',
+  } as unknown as Message;
+  const duplicate = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi again' }],
+    messageId: 'm-1',
+  } as unknown as Message;
+  const second = {
+    role: 'agent',
+    parts: [{ text: 'done' }],
+    messageId: 'm-2',
+  } as unknown as Message;
+
+  const withFirst = appendHistoryMessage([], first);
+  const withDuplicate = appendHistoryMessage(withFirst, duplicate);
+  const withSecond = appendHistoryMessage(withDuplicate, second);
+
+  assert.deepEqual(withSecond.map((m) => m.messageId), ['m-1', 'm-2']);
 });
 
 test('executor records principalId in binding and strips _principalId from outgoing WS frame', async () => {
@@ -233,4 +273,105 @@ test('executor binding has no principalId when message metadata is absent', asyn
   binding.sink.finish();
   await firstEvent;
   for await (const _event of gen) void _event;
+});
+
+test('executor persists inbound and agent status messages in task history', async () => {
+  const { ws } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'a4',
+    clientId: 'c4',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+  const taskStore = captureTaskStore();
+  const executor = new WSForwardingExecutor('a4', registry, taskStore);
+  const task = {
+    id: 't-4',
+    contextId: 'ctx-4',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-4',
+  } as unknown as Message;
+
+  const gen = executor.executeStream(task, message);
+  const firstEvent = gen.next();
+  const binding = registry.getBinding('t-4')!;
+
+  binding.sink.pushStatus({
+    taskId: 't-4',
+    contextId: 'ctx-4',
+    final: false,
+    status: {
+      state: TaskState.WORKING,
+      timestamp: new Date().toISOString(),
+      message: {
+        role: 'agent',
+        parts: [{ text: 'working' }],
+        messageId: 'agent-working',
+        taskId: 't-4',
+        contextId: 'ctx-4',
+      },
+    },
+  });
+  binding.sink.pushStatus({
+    taskId: 't-4',
+    contextId: 'ctx-4',
+    final: true,
+    status: {
+      state: TaskState.COMPLETED,
+      timestamp: new Date().toISOString(),
+      message: {
+        role: 'agent',
+        parts: [{ text: 'done' }],
+        messageId: 'agent-done',
+        taskId: 't-4',
+        contextId: 'ctx-4',
+      },
+    },
+  });
+  binding.sink.finish();
+
+  await firstEvent;
+  for await (const _event of gen) void _event;
+
+  const update = taskStore.updates.at(-1) as { history?: Message[] };
+  assert.deepEqual(
+    update.history?.map((m) => m.messageId),
+    ['m-4', 'agent-working', 'agent-done'],
+  );
+  assert.deepEqual(
+    task.history?.map((m) => m.messageId),
+    ['m-4', 'agent-working', 'agent-done'],
+  );
+});
+
+test('executor persists history when agent is unreachable', async () => {
+  const registry = new Registry();
+  const taskStore = captureTaskStore();
+  const executor = new WSForwardingExecutor('missing', registry, taskStore);
+  const task = {
+    id: 't-5',
+    contextId: 'ctx-5',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-5',
+  } as unknown as Message;
+
+  for await (const _event of executor.executeStream(task, message)) void _event;
+
+  const update = taskStore.updates.at(-1) as { history?: Message[] };
+  assert.deepEqual(
+    update.history?.map((m) => m.messageId),
+    ['m-5', 't-5-unreach'],
+  );
 });

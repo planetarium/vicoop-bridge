@@ -58,6 +58,12 @@ export function stripInternalMetadata(
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+export function appendHistoryMessage(history: Message[], message: Message | undefined): Message[] {
+  if (message === undefined) return history;
+  if (history.some((existing) => existing.messageId === message.messageId)) return history;
+  return [...history, message];
+}
+
 /**
  * AgentExecutor that forwards A2A requests to a WebSocket-connected
  * client and pipes the client's task.* frames back as A2A streaming
@@ -128,6 +134,9 @@ export class WSForwardingExecutor extends AgentExecutor {
       ...(principalId !== undefined ? { principalId } : {}),
     });
 
+    let history = appendHistoryMessage(task.history ?? [], message);
+    task.history = history;
+
     const sent = this.registry.sendToAgent(this.agentId, {
       type: 'task.assign',
       taskId,
@@ -169,11 +178,16 @@ export class WSForwardingExecutor extends AgentExecutor {
         },
       };
       task.status = failEvent.status;
+      history = appendHistoryMessage(history, failEvent.status.message);
+      task.history = history;
       this.registry.unbindTask(taskId);
       this.abortControllers.delete(taskId);
       yield failEvent;
       try {
-        await this.taskStore.updateTask(taskId, { status: task.status });
+        await this.taskStore.updateTask(taskId, {
+          status: task.status,
+          history: task.history,
+        });
       } catch (err) {
         logEvent('task_persist_error', { taskId, error: String(err) });
       }
@@ -194,6 +208,8 @@ export class WSForwardingExecutor extends AgentExecutor {
           continue;
         }
         // status event
+        history = appendHistoryMessage(history, event.status.message);
+        task.history = history;
         if (TERMINAL_STATES.has(event.status.state)) {
           // Terminal — mutate task in place so the request-handler's
           // post-stream read reflects the final state.
@@ -222,6 +238,7 @@ export class WSForwardingExecutor extends AgentExecutor {
       try {
         await this.taskStore.updateTask(taskId, {
           status: task.status,
+          history: task.history,
           ...(accumulatedArtifacts.length > 0 ? { artifacts: accumulatedArtifacts } : {}),
         });
       } catch (err) {

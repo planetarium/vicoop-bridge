@@ -35,6 +35,7 @@ import {
   listCallers,
   removeCaller,
 } from './admin-api.js';
+import { appendHistoryMessage } from './executor.js';
 
 export { getAdminWallets } from './admin-scope.js';
 
@@ -345,7 +346,7 @@ class AdminA2XExecutor extends AgentExecutor {
     // consumer can render it immediately (matches pre-migration behavior
     // that emitted a status-update with state='working' carrying the
     // user message).
-    yield {
+    const initialStatus: TaskStatusUpdateEvent = {
       taskId,
       contextId,
       final: false,
@@ -355,6 +356,8 @@ class AdminA2XExecutor extends AgentExecutor {
         message,
       },
     };
+    task.history = appendHistoryMessage(task.history ?? [], initialStatus.status.message);
+    yield initialStatus;
 
     const controller = new AbortController();
     this.abortControllers.set(taskId, controller);
@@ -399,7 +402,7 @@ class AdminA2XExecutor extends AgentExecutor {
         timestamp: nowIso(),
         message: final,
       };
-      task.history = [...(task.history ?? []), message, final];
+      task.history = appendHistoryMessage(task.history ?? [], task.status.message);
 
       try {
         await this.taskStoreImpl.updateTask(taskId, {
@@ -424,7 +427,7 @@ class AdminA2XExecutor extends AgentExecutor {
       const final = agentMessage(text, taskId, contextId);
 
       task.status = { state, timestamp: nowIso(), message: final };
-      task.history = [...(task.history ?? []), message, final];
+      task.history = appendHistoryMessage(task.history ?? [], task.status.message);
 
       try {
         await this.taskStoreImpl.updateTask(taskId, {
@@ -521,4 +524,3 @@ export function createAdminA2XAgent(opts: AdminAgentOptions): {
   const handler = new DefaultRequestHandler(a2xAgent);
   return { a2xAgent, handler, taskStore };
 }
-
