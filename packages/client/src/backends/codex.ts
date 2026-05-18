@@ -348,6 +348,25 @@ export function historyToInjectItems(
   return out;
 }
 
+// Codex registers two internal tools that survive every config/feature
+// knob we have. Verified against `codex-rs/core/src/tools/spec_plan.rs`:
+//   - `update_plan`         — `executors.push(Arc::new(PlanHandler))` is
+//                             unconditional; no feature flag, no mode gate.
+//   - `request_user_input`  — registered unconditionally; calls in our
+//                             default mode fail with "request_user_input
+//                             is unavailable in Default mode", but the
+//                             tool still appears in the model's registry.
+// Under caller-side dispatch the model has been observed (#207 session
+// `019e3a10-…`) to chain calls to these two instead of emitting the
+// envelope, producing silent text-only completions because the host
+// (codex) consumes the calls and the caller (oai2a2a → opencode) never
+// sees them. Tell the model explicitly to treat them as host scaffolding
+// outside the task's tool surface so it falls back to the envelope.
+const CODEX_LEFTOVER_TOOL_DIRECTIVE = [
+  'IMPORTANT: The host runtime (codex) exposes two internal tools that are NOT part of this task\'s tool surface and are invisible to the caller: `update_plan` (host-side planning notepad) and `request_user_input` (host-side prompt UI).',
+  'Do NOT call either of them under any circumstance. They are host scaffolding; calling them wastes the turn and produces no observable effect for the caller. Your only legitimate actions are (a) emitting a `tool_calls` envelope as described above, or (b) answering in natural language.',
+].join('\n\n');
+
 // Per-task in-progress notification subscription — listens for
 // `item/agentMessage/delta`, `item/completed`, and `turn/completed`
 // scoped to the active turn, then resolves with the final state.
@@ -570,8 +589,17 @@ export function createCodexBackend(
         // instructed to interpret, eliminating the multi-turn re-call loop
         // observed under prompts like `"Use a tool to list …"` (#176).
         const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
-        const systemPrompt =
+        const baseSystemPrompt =
           openaiCompat ? buildOpenAICompatSystemPrompt(openaiCompat) : '';
+        // Append the leftover-tool directive only when caller-side dispatch
+        // is active. Outside that mode update_plan / request_user_input are
+        // legitimate codex affordances and we should not steer the model
+        // away from them.
+        const systemPrompt = callerToolDispatchActive(openaiCompat)
+          ? [baseSystemPrompt, CODEX_LEFTOVER_TOOL_DIRECTIVE]
+              .filter((s) => s.length > 0)
+              .join('\n\n')
+          : baseSystemPrompt;
         const historyInjectItems = openaiCompat?.tool_call_history
           ? historyToInjectItems(openaiCompat.tool_call_history)
           : null;
@@ -657,10 +685,11 @@ export function createCodexBackend(
 
           // For resumes we re-attach to the existing thread; sandbox and
           // any developerInstructions set on initial `thread/start` carry
-          // over via the server-side session record. Feature-flag overrides
-          // (see `featuresOverride` below) are the exception — they do NOT
-          // persist across resume and must be re-sent every turn that wants
-          // them. `environments`, by contrast, IS sticky on `thread/start`
+          // over via the server-side session record. Config overrides
+          // (see `configOverride` below — features + mcp_servers) are
+          // the exception: they do NOT persist across resume and must
+          // be re-sent every turn that wants them. `environments`, by
+          // contrast, IS sticky on `thread/start`
           // and `ThreadResumeParams` does not even accept it, so we only
           // send it on start.
           //
@@ -689,14 +718,12 @@ export function createCodexBackend(
           //    handlers do not depend on `environment_mode` and must each be
           //    explicitly disabled by their feature key.
           //
-          // Surfaces we can't disable from here: `update_plan` and
-          // `request_user_input` are unconditional in codex's tool registry;
-          // they have no feature key. They are benign in practice (plan
-          // mutation is session-local; request_user_input blocks on an MCP
-          // elicitation reply that never arrives under openai-compat).
-          // `list_mcp_resources` and siblings are gated by codex's per-server
-          // `mcp_tools` config — out of scope for this flag plumbing.
-          const featuresOverride = callerToolDispatchActive(openaiCompat)
+          // Surfaces we still can't disable from here: `update_plan` and
+          // `request_user_input` are unconditional `executors.push(...)`
+          // entries in codex-rs `spec_plan.rs` with no feature key. We
+          // counter them with `CODEX_LEFTOVER_TOOL_DIRECTIVE` in the
+          // developer instructions instead (see systemPrompt above).
+          const configOverride = callerToolDispatchActive(openaiCompat)
             ? {
                 features: {
                   // Hosted modalities that bypass the caller's text envelope.
@@ -727,6 +754,16 @@ export function createCodexBackend(
                   // paths back into model context.
                   workspace_dependencies: false,
                 },
+                // Drop every configured MCP server for this thread. This is
+                // the gate for `list_mcp_resources` / `list_mcp_resource_templates`
+                // / `read_mcp_resource` registration in codex-rs
+                // `spec_plan.rs` (`if params.mcp_tools.is_some()` —
+                // empty server map → no aggregated mcp_tools → those
+                // handlers not pushed into the registry). Verified via
+                // the #207 session 019e3a10-… where the model burned
+                // multiple turns on `list_mcp_resources({server:"local"})`
+                // before bailing with text-only output.
+                mcp_servers: {},
               }
             : null;
           // `environments: []` is sticky on `thread/start` and unsupported on
@@ -744,7 +781,7 @@ export function createCodexBackend(
                   threadId: existing.threadId,
                   cwd,
                   sandbox: sandboxMode,
-                  ...(featuresOverride ? { config: featuresOverride } : {}),
+                  ...(configOverride ? { config: configOverride } : {}),
                 },
               );
               threadId = resumeResult.thread.id;
@@ -755,7 +792,7 @@ export function createCodexBackend(
                   cwd,
                   sandbox: sandboxMode,
                   ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),
-                  ...(featuresOverride ? { config: featuresOverride } : {}),
+                  ...(configOverride ? { config: configOverride } : {}),
                   ...(sendEmptyEnvironments ? { environments: [] } : {}),
                 },
               );

@@ -1324,3 +1324,163 @@ test('thread/resume re-passes `config.features` because feature flags do not per
   assert.deepEqual(startFeatures, EXPECTED_OPENAI_COMPAT_DISABLES);
   assert.deepEqual(resumeFeatures, EXPECTED_OPENAI_COMPAT_DISABLES);
 });
+
+test('thread/start sends `config.mcp_servers: {}` when caller tools are active (#207)', async () => {
+  // The model in the #207 session (`019e3a10-…`) burned multiple turns
+  // calling `list_mcp_resources({server:"local"})` /
+  // `list_mcp_resource_templates(...)` before giving up with text-only
+  // output. Those handlers are gated in codex-rs `spec_plan.rs` by
+  // `if params.mcp_tools.is_some()`; an empty mcp_servers map at
+  // thread scope leaves `mcp_tools` empty/None so the three handlers
+  // (`list_mcp_resources`, `list_mcp_resource_templates`,
+  // `read_mcp_resource`) are not pushed into the registry.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('do it', 'ctx-mcp-empty', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'do it' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as {
+    params?: { config?: { mcp_servers?: Record<string, unknown> } };
+  }).params;
+  assert.deepEqual(params?.config?.mcp_servers, {});
+});
+
+test('thread/resume re-passes `config.mcp_servers: {}` (#207)', async () => {
+  // Same rationale as the `config.features` resume test: the thread-
+  // scoped config override does not persist across resume, so a missing
+  // mcp_servers on resume would silently re-expose `list_mcp_resources`
+  // and siblings for that turn.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const meta = {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+    },
+  };
+  await backend.handle(
+    assign('one', 'ctx-mcp-resume', {
+      message: {
+        role: 'user',
+        messageId: 'm1',
+        parts: [{ kind: 'text', text: 'one' }],
+        metadata: meta,
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  await backend.handle(
+    assign('two', 'ctx-mcp-resume', {
+      message: {
+        role: 'user',
+        messageId: 'm2',
+        parts: [{ kind: 'text', text: 'two' }],
+        metadata: meta,
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const frames = fake.lastChild().stdinFrames();
+  const start = findRequest(frames, 'thread/start');
+  const resume = findRequest(frames, 'thread/resume');
+  const startMcp = (start as { params?: { config?: { mcp_servers?: unknown } } })
+    .params?.config?.mcp_servers;
+  const resumeMcp = (resume as { params?: { config?: { mcp_servers?: unknown } } })
+    .params?.config?.mcp_servers;
+  assert.deepEqual(startMcp, {});
+  assert.deepEqual(resumeMcp, {});
+});
+
+test('developerInstructions includes the leftover-tool directive under caller-side dispatch (#207)', async () => {
+  // `update_plan` and `request_user_input` are unconditionally registered
+  // by codex (`spec_plan.rs`) with no feature gate. The directive in
+  // `CODEX_LEFTOVER_TOOL_DIRECTIVE` is the only seam we have to steer
+  // the model away from them under caller-side dispatch — the #207
+  // session chained these instead of emitting the envelope.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('do it', 'ctx-leftover-directive', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'do it' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const dev = (tsFrame as { params?: { developerInstructions?: string } })
+    .params?.developerInstructions;
+  assert.ok(typeof dev === 'string', 'developerInstructions present');
+  assert.ok(
+    dev!.includes('`update_plan`') && dev!.includes('`request_user_input`'),
+    'leftover-tool directive names both unsuppressable codex tools',
+  );
+  assert.ok(
+    dev!.includes('Do NOT call'),
+    'leftover-tool directive instructs the model not to call them',
+  );
+});
+
+test('developerInstructions omits the leftover-tool directive when no caller tools are supplied', async () => {
+  // openai-compat with only a `system` field (or only history) — there
+  // is no envelope contract to enforce and `update_plan` / `request_user_input`
+  // are legitimate codex affordances. Do not inject the directive.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('hi', 'ctx-no-leftover-directive', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'hi' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            system: 'be terse',
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const dev = (tsFrame as { params?: { developerInstructions?: string } })
+    .params?.developerInstructions ?? '';
+  assert.equal(
+    dev.includes('update_plan'),
+    false,
+    'directive must not appear without caller tools',
+  );
+  assert.equal(
+    dev.includes('request_user_input'),
+    false,
+    'directive must not appear without caller tools',
+  );
+});
