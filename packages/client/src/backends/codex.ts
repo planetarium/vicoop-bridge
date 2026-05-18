@@ -685,11 +685,10 @@ export function createCodexBackend(
 
           // For resumes we re-attach to the existing thread; sandbox and
           // any developerInstructions set on initial `thread/start` carry
-          // over via the server-side session record. Config overrides
-          // (see `configOverride` below — features + mcp_servers) are
-          // the exception: they do NOT persist across resume and must
-          // be re-sent every turn that wants them. `environments`, by
-          // contrast, IS sticky on `thread/start`
+          // over via the server-side session record. Feature-flag overrides
+          // (see `configOverride` below) are the exception — they do NOT
+          // persist across resume and must be re-sent every turn that wants
+          // them. `environments`, by contrast, IS sticky on `thread/start`
           // and `ThreadResumeParams` does not even accept it, so we only
           // send it on start.
           //
@@ -724,60 +723,47 @@ export function createCodexBackend(
           // counter them with `CODEX_LEFTOVER_TOOL_DIRECTIVE` in the
           // developer instructions instead (see systemPrompt above).
           //
-          // The override is split across two gates with different scopes:
-          //
-          // - `mcp_servers: {}` is sent for ANY openai-compat call. The
-          //   caller is treating us as an LLM endpoint, not an agentic
-          //   codex; MCP discovery tools (`list_mcp_resources` /
-          //   `list_mcp_resource_templates` / `read_mcp_resource`, gated
-          //   in `spec_plan.rs` by `if params.mcp_tools.is_some()`) never
-          //   fit that mental model — empty server map → no aggregated
-          //   mcp_tools → those handlers are not pushed into the registry.
-          //   Verified via the #207 session 019e3a10-… where the model
-          //   burned multiple turns on `list_mcp_resources({server:"local"})`
-          //   before bailing with text-only output.
-          //
-          // - `features.*: false` is restricted to caller-side dispatch
-          //   (tools provided AND tool_choice ≠ "none") because those
-          //   surfaces (image_generation, web_search, multi-agent, etc.)
-          //   may be desirable for non-dispatch openai-compat callers
-          //   (history-only resumes, system-only prompts, tool_choice="none").
-          const configOverride = openaiCompat !== null
+          // `list_mcp_resources` / `list_mcp_resource_templates` /
+          // `read_mcp_resource` are gated in `spec_plan.rs` by
+          // `if params.mcp_tools.is_some()`, which traces back to
+          // `mcp_connection_manager.has_servers()`. The manager is built
+          // at app-server process startup, so thread-level overrides
+          // (sending `config.mcp_servers: {}` on `thread/start`) do not
+          // affect it. Process-level suppression via app-server `-c`
+          // flags would work for user-configured servers but cannot
+          // disable codex's builtin MCP entries on cli 0.130 — see
+          // analysis in PR #208 review. Tracking as follow-up.
+          const configOverride = callerToolDispatchActive(openaiCompat)
             ? {
-                mcp_servers: {},
-                ...(callerToolDispatchActive(openaiCompat)
-                  ? {
-                      features: {
-                        // Hosted modalities that bypass the caller's text envelope.
-                        image_generation: false,
-                        web_search_request: false,
-                        web_search_cached: false,
-                        // Codex-side tool catalog / discovery and plugin surfaces.
-                        tool_search: false,
-                        tool_suggest: false,
-                        tool_call_mcp_elicitation: false,
-                        builtin_mcp: false,
-                        plugins: false,
-                        apps: false,
-                        enable_mcp_apps: false,
-                        // Sub-agent / fan-out orchestration bypasses the single-
-                        // agent envelope contract.
-                        multi_agent: false,
-                        multi_agent_v2: false,
-                        enable_fanout: false,
-                        // Permission-escalation prompts would block under openai-
-                        // compat (no human in loop).
-                        request_permissions_tool: false,
-                        // Experimental code surfaces.
-                        code_mode: false,
-                        goals: false,
-                        memories: false,
-                        // Workspace introspection — fs reads that could leak host
-                        // paths back into model context.
-                        workspace_dependencies: false,
-                      },
-                    }
-                  : {}),
+                features: {
+                  // Hosted modalities that bypass the caller's text envelope.
+                  image_generation: false,
+                  web_search_request: false,
+                  web_search_cached: false,
+                  // Codex-side tool catalog / discovery and plugin surfaces.
+                  tool_search: false,
+                  tool_suggest: false,
+                  tool_call_mcp_elicitation: false,
+                  builtin_mcp: false,
+                  plugins: false,
+                  apps: false,
+                  enable_mcp_apps: false,
+                  // Sub-agent / fan-out orchestration bypasses the single-
+                  // agent envelope contract.
+                  multi_agent: false,
+                  multi_agent_v2: false,
+                  enable_fanout: false,
+                  // Permission-escalation prompts would block under openai-
+                  // compat (no human in loop).
+                  request_permissions_tool: false,
+                  // Experimental code surfaces.
+                  code_mode: false,
+                  goals: false,
+                  memories: false,
+                  // Workspace introspection — fs reads that could leak host
+                  // paths back into model context.
+                  workspace_dependencies: false,
+                },
               }
             : null;
           // `environments: []` is sticky on `thread/start` and unsupported on

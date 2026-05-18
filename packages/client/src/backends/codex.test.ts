@@ -1233,10 +1233,7 @@ test('thread/resume does NOT send `environments` (sticky on start; ResumeParams 
   assert.equal(resumeParams?.environments, undefined);
 });
 
-test('thread/start omits `config` entirely for plain (non-openai-compat) tasks', async () => {
-  // Non-openai-compat callers get full codex behaviour: native MCP
-  // discovery, every feature flag at its operator default, etc. The
-  // override only kicks in when openai-compat metadata is present.
+test('thread/start omits `config` when no caller tools are supplied', async () => {
   const fake = makeFakeSpawn(() => happyPath());
   const backend = createCodexBackend({ spawn: fake.spawn });
   // Plain text task with no openai-compat metadata.
@@ -1247,14 +1244,10 @@ test('thread/start omits `config` entirely for plain (non-openai-compat) tasks',
   assert.equal(params?.config, undefined);
 });
 
-test('history-only openai-compat payload (no `tools`) clears MCP servers but does not disable codex built-in features', async () => {
-  // With `tools` absent there is no caller-side dispatch contract for
-  // codex's hosted modalities / multi-agent / etc. surfaces to compete
-  // with — keep `config.features` off so non-dispatch openai-compat
-  // callers don't lose them. But MCP discovery (`list_mcp_resources` &
-  // siblings) still doesn't fit the openai-compat mental model at all
-  // — the caller is an LLM endpoint, not a codex agent — so `mcp_servers`
-  // is cleared on every openai-compat call regardless of `tools`.
+test('history-only openai-compat payload (no `tools`) does not disable codex built-ins', async () => {
+  // Mirror of the codex (exec) backend test. With tools absent there is no
+  // caller-side dispatch contract to protect; do not handicap codex's
+  // built-ins for this turn.
   const fake = makeFakeSpawn(() => happyPath());
   const backend = createCodexBackend({ spawn: fake.spawn });
   await backend.handle(
@@ -1278,46 +1271,8 @@ test('history-only openai-compat payload (no `tools`) clears MCP servers but doe
   );
 
   const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
-  const params = (tsFrame as {
-    params?: { config?: { mcp_servers?: unknown; features?: unknown } };
-  }).params;
-  assert.deepEqual(params?.config?.mcp_servers, {}, 'mcp_servers cleared for any openai-compat');
-  assert.equal(params?.config?.features, undefined, 'features untouched without caller-side dispatch');
-});
-
-test('openai-compat with tool_choice="none" clears MCP servers but does not disable codex built-in features', async () => {
-  // `tool_choice: "none"` means the caller explicitly does NOT want the
-  // model to emit a `tool_calls` envelope; caller-side dispatch is off
-  // by definition (`callerToolDispatchActive` returns false). Same
-  // contract as the history-only case: `mcp_servers` is still cleared
-  // (no MCP discovery for an LLM-shaped caller) but `features` stays
-  // untouched.
-  const fake = makeFakeSpawn(() => happyPath());
-  const backend = createCodexBackend({ spawn: fake.spawn });
-  await backend.handle(
-    assign('answer', 'ctx-tc-none', {
-      message: {
-        role: 'user',
-        messageId: 'm',
-        parts: [{ kind: 'text', text: 'answer' }],
-        metadata: {
-          [OPENAI_COMPAT_EXTENSION_URI]: {
-            tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
-            tool_choice: 'none',
-          },
-        },
-      },
-    }),
-    collect().emit,
-    NEVER,
-  );
-
-  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
-  const params = (tsFrame as {
-    params?: { config?: { mcp_servers?: unknown; features?: unknown } };
-  }).params;
-  assert.deepEqual(params?.config?.mcp_servers, {});
-  assert.equal(params?.config?.features, undefined);
+  const params = (tsFrame as { params?: { config?: unknown } }).params;
+  assert.equal(params?.config, undefined);
 });
 
 test('thread/resume re-passes `config.features` because feature flags do not persist across resume (#175)', async () => {
@@ -1368,89 +1323,6 @@ test('thread/resume re-passes `config.features` because feature flags do not per
     .params?.config?.features;
   assert.deepEqual(startFeatures, EXPECTED_OPENAI_COMPAT_DISABLES);
   assert.deepEqual(resumeFeatures, EXPECTED_OPENAI_COMPAT_DISABLES);
-});
-
-test('thread/start sends `config.mcp_servers: {}` when caller tools are active (#207)', async () => {
-  // The model in the #207 session (`019e3a10-…`) burned multiple turns
-  // calling `list_mcp_resources({server:"local"})` /
-  // `list_mcp_resource_templates(...)` before giving up with text-only
-  // output. Those handlers are gated in codex-rs `spec_plan.rs` by
-  // `if params.mcp_tools.is_some()`; an empty mcp_servers map at
-  // thread scope leaves `mcp_tools` empty/None so the three handlers
-  // (`list_mcp_resources`, `list_mcp_resource_templates`,
-  // `read_mcp_resource`) are not pushed into the registry.
-  const fake = makeFakeSpawn(() => happyPath());
-  const backend = createCodexBackend({ spawn: fake.spawn });
-  await backend.handle(
-    assign('do it', 'ctx-mcp-empty', {
-      message: {
-        role: 'user',
-        messageId: 'm',
-        parts: [{ kind: 'text', text: 'do it' }],
-        metadata: {
-          [OPENAI_COMPAT_EXTENSION_URI]: {
-            tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
-          },
-        },
-      },
-    }),
-    collect().emit,
-    NEVER,
-  );
-
-  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
-  const params = (tsFrame as {
-    params?: { config?: { mcp_servers?: Record<string, unknown> } };
-  }).params;
-  assert.deepEqual(params?.config?.mcp_servers, {});
-});
-
-test('thread/resume re-passes `config.mcp_servers: {}` (#207)', async () => {
-  // Same rationale as the `config.features` resume test: the thread-
-  // scoped config override does not persist across resume, so a missing
-  // mcp_servers on resume would silently re-expose `list_mcp_resources`
-  // and siblings for that turn.
-  const fake = makeFakeSpawn(() => happyPath());
-  const backend = createCodexBackend({ spawn: fake.spawn });
-  const meta = {
-    [OPENAI_COMPAT_EXTENSION_URI]: {
-      tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
-    },
-  };
-  await backend.handle(
-    assign('one', 'ctx-mcp-resume', {
-      message: {
-        role: 'user',
-        messageId: 'm1',
-        parts: [{ kind: 'text', text: 'one' }],
-        metadata: meta,
-      },
-    }),
-    collect().emit,
-    NEVER,
-  );
-  await backend.handle(
-    assign('two', 'ctx-mcp-resume', {
-      message: {
-        role: 'user',
-        messageId: 'm2',
-        parts: [{ kind: 'text', text: 'two' }],
-        metadata: meta,
-      },
-    }),
-    collect().emit,
-    NEVER,
-  );
-
-  const frames = fake.lastChild().stdinFrames();
-  const start = findRequest(frames, 'thread/start');
-  const resume = findRequest(frames, 'thread/resume');
-  const startMcp = (start as { params?: { config?: { mcp_servers?: unknown } } })
-    .params?.config?.mcp_servers;
-  const resumeMcp = (resume as { params?: { config?: { mcp_servers?: unknown } } })
-    .params?.config?.mcp_servers;
-  assert.deepEqual(startMcp, {});
-  assert.deepEqual(resumeMcp, {});
 });
 
 test('developerInstructions includes the leftover-tool directive under caller-side dispatch (#207)', async () => {
