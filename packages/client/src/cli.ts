@@ -20,6 +20,7 @@ import type { Backend } from './backend.js';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
 import { loginCmd, runLogin } from './login.js';
+import { logoutCmd, runLogout } from './logout.js';
 import { setupCmd, runSetup } from './setup.js';
 import {
   addCallerCmd, listAgentsCmd, listCallersCmd, listClientsCmd,
@@ -96,6 +97,7 @@ const daemonCmd = object({
 // wins otherwise.
 const cli = longestMatch(
   loginCmd,
+  logoutCmd,
   setupCmd,
   upgradeCmd,
   addCallerCmd,
@@ -325,6 +327,9 @@ async function main(): Promise<void> {
   switch (parsed.action) {
     case 'login':
       process.exit(await runLogin(parsed));
+      break;
+    case 'logout':
+      process.exit(await runLogout(parsed));
       break;
     case 'setup':
       process.exit(await runSetup(parsed));

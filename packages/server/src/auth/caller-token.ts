@@ -267,6 +267,28 @@ export async function revokeCallerToken(sql: Sql, callerId: string): Promise<voi
   await sql`UPDATE callers SET revoked = true WHERE id = ${callerId}`;
 }
 
+// Revoke by raw token. Looks up the row by token_hash and flips revoked=true.
+// Idempotent — silently no-ops for unknown / already-revoked tokens (RFC 7009
+// §2.2: "an invalid token type hint value is ignored ... [the AS] responds
+// with HTTP status code 200 if the token has been revoked successfully or if
+// the client submitted an invalid token"). Returns true only when we actually
+// flipped a row, so callers (admin tooling) can log a useful audit signal;
+// the /oauth/revoke endpoint discards the boolean to honor RFC 7009's
+// no-information-leak guarantee.
+export async function revokeSessionTokenByRaw(
+  sql: Sql,
+  rawToken: string,
+): Promise<boolean> {
+  if (audienceFromRaw(rawToken) === null) return false;
+  const tokenHash = hashCallerToken(rawToken);
+  const rows = await sql<{ id: string }[]>`
+    UPDATE callers SET revoked = true
+    WHERE token_hash = ${tokenHash} AND revoked = false
+    RETURNING id
+  `;
+  return rows.length > 0;
+}
+
 export interface CallerTokenRow {
   id: string;
   principalId: string;
