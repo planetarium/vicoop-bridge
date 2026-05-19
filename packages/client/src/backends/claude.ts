@@ -669,35 +669,37 @@ export function openaiToolsToCallerToolDefs(
 }
 
 // Build the system-prompt text injected via `--append-system-prompt` for the
-// **native** openai-compat path on the claude backend (#213). This is the
-// claude analog of codex's `composeNativeDevInstructions` (#212): the
-// envelope-teaching block is dropped because the caller's tools are exposed
-// to the model through the native MCP tool surface (`caller-tools-mcp.ts`),
-// so describing a JSON-emit contract would only fight the native dispatch
-// path the model already understands.
+// openai-compat path on the claude backend (#213). The caller's tools are
+// exposed to the model through the native MCP tool surface
+// (`caller-tools-mcp.ts`), so the prompt no longer teaches a JSON-emit
+// contract or duplicates the tool list — the model discovers tools via
+// `tools/list` and invokes them through its normal `tool_use` surface.
 //
-// What's kept and why:
-//   - Caller's `system` text — verbatim, first.
-//   - A "stop after one caller tool" directive. claude has no equivalent of
-//     codex's `turn/interrupt`, so we rely on the model to self-terminate
-//     after invoking a caller-provided tool. The MCP ack the bridge returns
-//     is intentionally short and uninformative; the actual result lands on
-//     the next turn via `tool_call_history`. Without this directive the
-//     model would often follow the ack with a synthesised "OK I called the
-//     tool" wrap-up or, worse, attempt to chain another call before the
-//     caller has seen the first one.
-//   - `<tool_call_history>` reading rules. Follow-up turns still text-prepend
-//     the history block (claude has no native equivalent of codex's
-//     `thread/inject_items`), so the model needs to know how to read it and
-//     not to repeat a call whose id is already resolved.
-//   - tool_choice descriptor for `"required"` and `{type:"function",function:
-//     {name}}` — same as the envelope path.
+// What we still teach the model:
+//   - Caller's `system` text — verbatim, first. No other transport carries
+//     it: MCP `tools/list` only describes tools, not the conversation's
+//     system message.
+//   - How to read the `<tool_call_history>` block. Follow-up turns
+//     text-prepend the history (`formatToolCallHistory`) because claude has
+//     no native equivalent of codex's `thread/inject_items`. The model has
+//     to know the block is authoritative and not to re-emit a call whose
+//     result is already recorded.
+//   - tool_choice descriptor for `"required"` and `{type:"function",
+//     function:{name}}` — claude has no native `tool_choice` flag, so the
+//     prompt is the only place we can express it.
 //
-// What's dropped vs `buildOpenAICompatSystemPrompt`:
+// What we DON'T teach anymore:
 //   - The "respond with ONLY a single JSON object …" envelope contract.
-//   - The full `JSON.stringify(meta.tools)` dump — the tools are visible to
-//     the model via MCP `tools/list`, so re-listing them in the prompt is
-//     redundant context.
+//   - The full `JSON.stringify(meta.tools)` dump.
+//   - A "stop after invoking, don't chain" directive — `--max-turns 1` on
+//     the spawned claude enforces it mechanically. The model can still
+//     emit parallel `tool_use` blocks within one assistant message (which
+//     is fine per OpenAI semantics), but it cannot proceed to a second
+//     model turn within the same task.
+//   - A "session memory vs history block" disambiguation — openai-compat
+//     tasks always spawn with a fresh `--session-id` (see the session
+//     reuse gate in `handle()`), so there's no prior session memory to
+//     conflict with the history block.
 export function buildOpenAICompatNativeSystemPrompt(meta: OpenAICompatMetadata): string {
   const sections: string[] = [];
   if (meta.system) sections.push(meta.system);
@@ -708,18 +710,9 @@ export function buildOpenAICompatNativeSystemPrompt(meta: OpenAICompatMetadata):
   if (hasTools) {
     sections.push(
       [
-        // The MCP tool names claude sees are namespaced `mcp__<server>__<name>`
-        // — we don't have to teach that here because the model already
-        // discovers them via `tools/list`. The directive below targets the
-        // BEHAVIOUR (one call per turn, then stop), not the naming.
-        'You are routed through an OpenAI-compatible gateway. The caller has supplied function tools that appear in your native tool list. Invoke them through your normal tool-use surface; do NOT emit them as JSON text.',
+        'You are routed through an OpenAI-compatible gateway. The caller has supplied function tools that appear in your native tool list — invoke them through your normal tool-use surface.',
         '',
-        'After invoking one of these caller-provided tools, STOP. Do not generate any further text, and do not invoke another tool in the same turn. The result of your call will be delivered to you on the next turn — any wrap-up sentence you emit now will be discarded by the bridge.',
-        '',
-        'On follow-up turns the user message may begin with a <tool_call_history>...</tool_call_history> block containing a JSON array of prior round-trips. Each entry is one of:',
-        '  - {"role":"assistant","tool_calls":[...]} — calls you previously emitted on an earlier turn.',
-        '  - {"role":"tool","tool_call_id":"call_…","name":"…","content":"…"} — the authoritative return value for one of those calls.',
-        'Treat the history as the source of truth for what has happened so far. Do NOT repeat a call whose tool_call_id already appears in the history. Either invoke a NEW caller-provided tool (to chain another call, observing the same one-call-per-turn rule) or compose a natural-language answer using the prior results.',
+        'The user message may begin with a <tool_call_history>...</tool_call_history> block holding a JSON array of prior round-trips: {"role":"assistant","tool_calls":[...]} for calls you previously emitted, and {"role":"tool","tool_call_id":"call_…","name":"…","content":"…"} for the authoritative result of each call. Treat the block as the source of truth for what has happened so far — do not re-emit a call whose `tool_call_id` already has a recorded result.',
       ].join('\n'),
     );
     const tcDesc = describeToolChoice(meta.tool_choice);
@@ -1141,16 +1134,25 @@ export function createClaudeBackend(
         return;
       }
 
-      // Reuse a prior session bound to this contextId when the binding is
-      // still fresh; otherwise mint a new uuid and pre-assign it via
-      // --session-id so we can record it before the run produces any output.
+      // Session reuse is for A2A callers that want conversation continuity
+      // across tasks sharing a contextId. The openai-compat extension is
+      // stateless by design — every OpenAI Chat Completions request carries
+      // its own full message history, so resuming a prior claude session
+      // would risk feeding the model two sources of truth (claude's own
+      // session memory containing the sentinel "captured by bridge" result
+      // we returned from the MCP `onInvoke` handler, AND the user message's
+      // prepended `tool_call_history` JSON carrying the caller's real tool
+      // results). Skip the session map entirely for openai-compat tasks so
+      // every spawn starts on a clean `--session-id`; the history block in
+      // the user message is then the unambiguous source of truth.
+      const sessionReuseEligible = openaiCompat === null && sessionTtlMs > 0;
       const tNow = now();
-      if (sessionTtlMs > 0) evictExpired(tNow - sessionTtlMs);
-      const existing = sessionTtlMs > 0 ? sessions.get(task.contextId) : undefined;
+      if (sessionReuseEligible) evictExpired(tNow - sessionTtlMs);
+      const existing = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
       const sessionId = existing?.sessionId ?? randomUUID();
       const isResume = existing !== undefined;
       let writeId = 0;
-      if (sessionTtlMs > 0) {
+      if (sessionReuseEligible) {
         // Refresh lastUsedAt eagerly: a concurrent second task on the same
         // contextId arriving before this one finishes also resumes the same
         // session id (rather than racing to mint a new one).
@@ -1172,7 +1174,7 @@ export function createClaudeBackend(
       // failure with a fatal escalation, caller-tools MCP failure) can
       // reach it before the spawn block redeclares it.
       const rollbackFreshSession = (): void => {
-        if (isResume || sessionTtlMs <= 0) return;
+        if (isResume || !sessionReuseEligible) return;
         const cur = sessions.get(task.contextId);
         if (cur?.sessionId === sessionId && cur.writeId === writeId) {
           sessions.delete(task.contextId);

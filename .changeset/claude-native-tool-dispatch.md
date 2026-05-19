@@ -47,6 +47,18 @@ takes the native MCP path. Plain claude tasks (no openai-compat
 metadata, or metadata without `tools`) are unaffected — they keep
 their full agentic toolset and don't pay any native-dispatch overhead.
 
+**Stateless session model.** openai-compat is stateless by design (every
+OpenAI Chat Completions request carries its own full message history),
+so openai-compat tasks now skip the session-reuse map entirely and
+always spawn claude with a fresh `--session-id` instead of `--resume`.
+This removes the source-of-truth conflict between claude's session
+memory (containing the sentinel "captured by bridge" result from the
+MCP `onInvoke` of the prior turn) and the user message's prepended
+`tool_call_history` block, and lets the system prompt drop both the
+"stop after invoking" directive (`--max-turns 1` enforces it) and the
+verbose history-disambiguation paragraph. Plain (non-openai-compat)
+A2A tasks keep their existing contextId → session reuse behaviour.
+
 The two MCP servers (`vicoop-bridge` for `send_file`, `caller-tools`
 for caller-supplied tools) coexist on the same spawn under a single
 `--mcp-config` argv.

@@ -1966,13 +1966,21 @@ test('spawn argv carries --append-system-prompt with the native directive when m
       a.includes('You are concise.'),
   );
   assert.ok(idx >= 0, 'expected --append-system-prompt carrying the openai-compat system text');
-  // Native directive present (stop-after-invoke + history-reading rules).
-  assert.match(args[idx] as string, /After invoking one of these caller-provided tools/);
+  // The slim native prompt teaches the model to use the native tool surface
+  // and how to read the history block — nothing more.
+  assert.match(args[idx] as string, /native tool list/);
   assert.match(args[idx] as string, /<tool_call_history>/);
   // Envelope contract phrase MUST NOT appear under #213.
   assert.equal(
     (args[idx] as string).includes('"tool_calls":[{"id":"call_<unique>"'),
     false,
+  );
+  // The "stop after invoking" directive was dropped because `--max-turns 1`
+  // enforces single-turn semantics mechanically.
+  assert.equal(
+    (args[idx] as string).toLowerCase().includes('after invoking'),
+    false,
+    'stop-after-invoke directive should be absent (--max-turns 1 enforces)',
   );
 });
 
@@ -2562,13 +2570,13 @@ test('openaiToolsToCallerToolDefs maps OpenAI tools and drops malformed entries 
   });
 });
 
-// Native system-prompt: must NOT carry the envelope-teaching block (the
-// model uses MCP natively now; teaching it the JSON contract would invite
-// it to drop into the brittle envelope path and re-create the exact
-// failures #208 catalogued). Must still carry the user's `system` text and
-// the `<tool_call_history>` reading rules (resume turns still text-prepend
-// the history block because claude has no native history-injection path).
-test('buildOpenAICompatNativeSystemPrompt drops envelope contract, keeps system + history rules (#213)', () => {
+// Native system-prompt: slim. Must NOT carry the envelope contract (#213
+// removed it wholesale), MUST carry the user's `system` text + the
+// `<tool_call_history>` reading hint, and MUST NOT carry the
+// stop-after-invoke directive — `--max-turns 1` on the spawned claude
+// enforces single-turn semantics mechanically, so prompting the model to
+// "stop" duplicates work and pollutes its context.
+test('buildOpenAICompatNativeSystemPrompt: slim shape (#213)', () => {
   const out = buildOpenAICompatNativeSystemPrompt({
     system: 'be terse',
     tools: [{ type: 'function', function: { name: 'fetch' } }],
@@ -2581,11 +2589,18 @@ test('buildOpenAICompatNativeSystemPrompt drops envelope contract, keeps system 
   // in its contract block; we assert it's missing here.
   assert.equal(out.includes('{"tool_calls"'), false);
   assert.equal(out.includes('respond with ONLY a single JSON object'), false);
-  // History-reading rules stay — resume turns need them.
+  // History-reading hint stays — the model still has to know how to read
+  // the prepended `<tool_call_history>` JSON.
   assert.ok(out.includes('<tool_call_history>'));
-  // Stop-after-invoke directive — without this, claude has no equivalent
-  // of codex's `turn/interrupt` and may chain or wrap up after a call.
-  assert.ok(out.toLowerCase().includes('stop'));
+  // Tools are exposed via MCP `tools/list`; the prompt only mentions the
+  // native tool surface and does not re-dump the schema.
+  assert.ok(out.includes('native tool list'));
+  // Stop-after-invoke directive: dropped. `--max-turns 1` enforces it.
+  assert.equal(
+    out.toLowerCase().includes('after invoking'),
+    false,
+    'stop-after-invoke directive should be absent (--max-turns 1 enforces)',
+  );
 
   // tool_choice="required" gets a steering line (same descriptor the
   // envelope path uses; `describeToolChoice` is shared).
@@ -2596,14 +2611,12 @@ test('buildOpenAICompatNativeSystemPrompt drops envelope contract, keeps system 
   assert.ok(required.includes('tool_choice="required"'));
 
   // tool_choice="none" → no envelope, just a "don't invoke caller tools"
-  // directive. Must NOT include the stop-after-invoke text (would
-  // contradict "never invoke").
+  // directive.
   const none = buildOpenAICompatNativeSystemPrompt({
     tools: [],
     tool_choice: 'none',
   });
   assert.ok(none.includes('tool_choice="none"'));
-  assert.equal(none.toLowerCase().includes('after invoking'), false);
 
   // Bare `system` with no tools — emits just the system text.
   assert.equal(
@@ -3061,4 +3074,63 @@ test('no openai-compat tools → no native dispatch argv (#213)', async () => {
   // Non-extension task should reach task.complete normally.
   const terminal = frames.at(-1);
   assert.ok(terminal && terminal.type === 'task.complete');
+});
+
+// openai-compat is stateless by design (every OpenAI Chat Completions
+// request carries its own full message history), so the bridge MUST NOT
+// `--resume` a prior claude session for these tasks even when the same
+// contextId comes through again. Resuming would feed the model the
+// sentinel "captured by bridge" result from the MCP `onInvoke` of the
+// prior turn alongside the user message's real history block — two
+// conflicting sources of truth on the same `tool_call_id`. Force fresh
+// `--session-id` instead. Plain claude tasks (no openai-compat metadata)
+// keep their existing session-reuse behaviour.
+test('openai-compat: same contextId still spawns a fresh --session-id (no --resume) (#213)', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    onCallerToolsMcpReady: () => {},
+  });
+  const { emit } = collect();
+  const meta = {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: [
+        { type: 'function', function: { name: 'fetch', parameters: { type: 'object' } } },
+      ],
+    },
+  };
+
+  // Two turns sharing the same contextId — without the openai-compat gate
+  // the second one would carry `--resume <sessionId-from-turn-1>`.
+  await backend.handle(
+    {
+      type: 'task.assign',
+      taskId: 'oai-t1',
+      contextId: 'ctx-shared',
+      message: { role: 'user', messageId: 'm1', parts: [{ kind: 'text', text: 'a' }], metadata: meta },
+    },
+    emit,
+    NEVER,
+  );
+  await backend.handle(
+    {
+      type: 'task.assign',
+      taskId: 'oai-t2',
+      contextId: 'ctx-shared',
+      message: { role: 'user', messageId: 'm2', parts: [{ kind: 'text', text: 'b' }], metadata: meta },
+    },
+    emit,
+    NEVER,
+  );
+
+  const child = fake.lastChild()!;
+  // Every openai-compat spawn must use `--session-id`, never `--resume`.
+  assert.notEqual(child.args.indexOf('--session-id'), -1, 'second turn uses --session-id');
+  assert.equal(child.args.indexOf('--resume'), -1, 'second turn must NOT --resume');
 });
