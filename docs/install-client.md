@@ -176,9 +176,9 @@ CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
 
 "$INSTALL_DIR/vicoop-client" login
 
-"$INSTALL_DIR/vicoop-client" setup \
-  --client-name "$CLIENT_NAME" \
-  --agent-ids "$AGENT_ID" \
+"$INSTALL_DIR/vicoop-client" agent register \
+  --name "$CLIENT_NAME" \
+  --agent-id "$AGENT_ID" \
   --caller "eth:0x<40-hex>"
 ```
 
@@ -186,30 +186,35 @@ CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
 
 `login` prints a verification URL to stderr — open it in **any** browser
 (the same machine, or your laptop while running the CLI on a headless host)
-and authorize with your Google account. `setup` registers the client, configures
-any `--caller` allowlist entries, and persists the daemon credentials to
-the resolved vicoop config dir (`~/.vicoop/config.json` by default; see the
-resolution order below for `$VICOOP_HOME` / `$XDG_CONFIG_HOME` cases), mode
-600 — see #137 for the consolidated config layout. The success output looks
-like:
+and authorize with your Google account. `agent register` calls the bridge's
+`registerClient` mutation, configures any `--caller` allowlist entries, and
+persists the daemon credentials to the resolved vicoop config dir
+(`~/.vicoop/config.json` by default; see the resolution order below for
+`$VICOOP_HOME` / `$XDG_CONFIG_HOME` cases), mode 600 — see #137 for the
+consolidated config layout. The success output looks like:
 
 ```text
-  client_id        <uuid>
+  agent_id         openclaw-my-host
   owner_principal  google:sub:<sub>
-  client_name      openclaw on my-host
-  allowed_agents   openclaw-my-host
+  name             openclaw on my-host
 
-The CLIENT_TOKEN is one-time — the bridge cannot reissue it.
-  setup persists it to the canonical config below; --json prints it to
+The AGENT_TOKEN is one-time — the bridge cannot reissue it.
+  agent register persists it to the canonical config below; --json prints it to
   stdout instead. Back up that file before rotating hosts.
   To also stash it in a shell-sourceable env file, pass --write-env-file
-  on this same setup invocation — rerunning setup later would call
-  registerClient again and mint a NEW CLIENT_TOKEN, invalidating this
+  on this same agent register invocation — rerunning agent register later would call
+  registerClient again and mint a NEW AGENT_TOKEN, invalidating this
   one. To populate an env file from an already-issued token, copy
   SERVER_URL / SERVER_TOKEN / AGENT_ID out of config.json by hand.
 
 Wrote /home/you/.vicoop/config.json (mode 600).
 ```
+
+> **Legacy `vicoop-client setup` alias.** The flat `setup` command still
+> works (with the old `--client-name` / `--agent-ids` flags and the
+> `CLIENT_TOKEN` / `client_id` / `client_name` vocabulary) but now prints
+> a one-line deprecation warning to stderr pointing at `agent register`.
+> It will be removed in a future release.
 
 Verify it landed where you expect (matters when `$VICOOP_HOME` or
 `$XDG_CONFIG_HOME` is set):
@@ -309,26 +314,30 @@ agent will be public until you restrict callers:
 > login flow saves one locally for you). Rotation surfaces a new
 > CLIENT_TOKEN, also one-time.
 
-For setup scripting, pass `--json` instead of writing `config.json` if you
-want to compose with shell tooling (no disk side effects, raw response on
-stdout):
+For scripting, pass `--json` instead of writing `config.json` if you want to
+compose with shell tooling (no disk side effects, raw response on stdout):
 
 ```sh
-"$INSTALL_DIR/vicoop-client" setup \
-  --client-name "$CLIENT_NAME" \
-  --agent-ids "$AGENT_ID" \
+"$INSTALL_DIR/vicoop-client" agent register \
+  --name "$CLIENT_NAME" \
+  --agent-id "$AGENT_ID" \
   --caller "eth:0x<40-hex>" --json \
-  | tee /tmp/vicoop-setup.json
-CLIENT_TOKEN=$(jq -r .client_token /tmp/vicoop-setup.json)
+  | tee /tmp/vicoop-agent.json
+AGENT_TOKEN=$(jq -r .client_token /tmp/vicoop-agent.json)
 ```
 
-`--agent-ids` is a legacy plural flag, but the current server model is
-1:1: one setup call creates one agent registration and the flag must contain
-exactly one id. To change that id later, use the `updateClientAllowedAgents`
-GraphQL compatibility mutation (backed by `update_client_allowed_agents()`
-in `schema.sql`) without issuing a new token.
+`--json` keeps the `registerClient` response shape (`client_id`,
+`client_token`, `client_name`, `allowed_agent_ids`) for back-compat with
+existing scripts. New scripts can read `allowed_agent_ids[0]` as the
+agent id and `client_token` as the agent token.
 
-### What login and setup do
+The bridge's server model is 1:1 (#219): one `agent register` call creates
+one agent registration with one id. To change that id later, use the
+`updateClientAllowedAgents` GraphQL compatibility mutation (backed by
+`update_client_allowed_agents()` in `schema.sql`) without issuing a new
+token.
+
+### What login and agent register do
 
 1. `login` calls `POST /oauth/device/code` with `intent=owner_session`; the bridge stores
    a `device_sessions` row and returns a one-time `device_code` + 8-char user
@@ -338,8 +347,8 @@ in `schema.sql`) without issuing a new token.
 3. CLI polls `POST /oauth/token`. Once status flips to `approved`, the
    bridge returns a `vbc_owner_*` bearer, and `login` saves it to
    `~/.vicoop/owner-session.json` (mode 600).
-4. `setup` calls the authenticated GraphQL `registerClient` mutation with
-   that bearer, receives `{client_id, client_token, owner_principal,
+4. `agent register` calls the authenticated GraphQL `registerClient` mutation
+   with that bearer, receives `{client_id, client_token, owner_principal,
    allowed_agent_ids}`, and writes the daemon credentials into
    `~/.vicoop/config.json` (mode 600). With `--write-env-file <path>` it
    additionally emits a shell-sourceable env file at that path — useful as
@@ -676,9 +685,9 @@ published release:
 
 ```sh
 # Step 4 login saves the owner-session bearer, so these work without re-authenticating:
-"$INSTALL_DIR/vicoop-client" setup \
-  --client-name "$CLIENT_NAME" \
-  --agent-ids "$AGENT_ID" \
+"$INSTALL_DIR/vicoop-client" agent register \
+  --name "$CLIENT_NAME" \
+  --agent-id "$AGENT_ID" \
   --caller "eth:0x<40-hex>"
 "$INSTALL_DIR/vicoop-client" agent list --connected
 "$INSTALL_DIR/vicoop-client" agent callers list "$AGENT_ID" --json

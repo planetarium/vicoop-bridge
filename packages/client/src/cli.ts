@@ -22,7 +22,7 @@ import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
 import { loginCmd, runLogin } from './login.js';
 import { logoutCmd, runLogout } from './logout.js';
-import { setupCmd, runSetup } from './setup.js';
+import { setupCmd, runAgentRegister, runSetup } from './setup.js';
 import {
   addCallerCmd, agentCmd, listAgentsCmd, listCallersCmd, listClientsCmd,
   removeCallerCmd, revokeClientCmd,
@@ -341,6 +341,9 @@ async function main(): Promise<void> {
       break;
     case 'upgrade':
       process.exit(await runUpgradeCmd(parsed));
+      break;
+    case 'agent-register':
+      process.exit(await runAgentRegister(parsed));
       break;
     case 'agent-list':
       process.exit(await runAgentList(parsed));

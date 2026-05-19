@@ -1,7 +1,7 @@
-// `vicoop-client setup` — create a bridge client token using an existing
-// owner-session bearer, then persist the daemon credentials to the canonical
-// `config.json`. `--write-env-file` remains as an opt-in for operators who
-// want a shell-sourceable env file alongside the canonical config — see #137.
+// Agent registration command surface: the new `vicoop-client agent register`
+// (agent-first; see #224) and the legacy `vicoop-client setup` alias, both
+// backed by `executeRegistration`. `setup` keeps working but prints a
+// deprecation hint to stderr.
 
 import { existsSync } from 'node:fs';
 import { object } from '@optique/core/constructs';
@@ -27,7 +27,8 @@ export const setupCmd = command(
     // We accept comma-separated IDs in a single occurrence and explode
     // them post-parse. `map()` does the split so the handler always sees
     // a clean array — no callers need to remember the historical
-    // semicolon-or-comma trivia.
+    // semicolon-or-comma trivia. After #219 the server enforces a single
+    // id; we keep the comma-list shape here only for backward-compat.
     allowedAgentIds: map(option('--agent-ids', string({ metavar: 'ID1,ID2' }), {
       description: message`Comma-separated agent ids this client is allowed to run as.`,
     }), (raw) => raw.split(',').map((s) => s.trim()).filter(Boolean)),
@@ -53,12 +54,47 @@ export const setupCmd = command(
     }), false),
   }),
   {
-    brief: message`Register a bridge client and persist daemon credentials.`,
-    description: message`Calls the bridge's \`registerClient\` GraphQL mutation using the owner-session bearer (saved by \`vicoop-client login\`, or supplied via --bridge/--token), receives a one-time CLIENT_TOKEN, and writes the daemon credentials into the canonical \`~/.vicoop/config.json\` (mode 600). The token is unrecoverable after this single output; back up config.json before rotating hosts. \`--json\` skips disk persistence and prints the raw response instead.`,
+    brief: message`[deprecated] Use \`agent register\`.`,
+    description: message`Deprecated alias for \`vicoop-client agent register\` (#224). Calls the bridge's \`registerClient\` GraphQL mutation, persists daemon credentials to \`~/.vicoop/config.json\`, and supports \`--write-env-file\` for an optional shell-sourceable env file. Will be removed in a future release.`,
   },
 );
 
 export type SetupArgs = InferValue<typeof setupCmd>;
+
+export const agentRegisterCmd = command(
+  'register',
+  object({
+    action: constant('agent-register' as const),
+    name: option('--name', string({ metavar: 'NAME' }), {
+      description: message`Human-readable label saved with this agent registration.`,
+    }),
+    agentId: option('--agent-id', string({ metavar: 'ID' }), {
+      description: message`Agent id (routing key external A2A callers will use). After #219 the server enforces a single agent per registration.`,
+    }),
+    callers: multiple(option('--caller', string({ metavar: 'PRINCIPAL' }), {
+      description: message`Principal allowed to call this agent. Repeatable; comma-separated lists also accepted within a single occurrence.`,
+    })),
+    envFile: optional(option('--write-env-file', string({ metavar: 'PATH' }), {
+      description: message`Also emit a shell-sourceable env file. Daemon does NOT consume these env vars (#189 §5); the file is purely an operator-side credentials backup / scripting hook.`,
+    })),
+    envFileAlias: optional(option('--env-file', string({ metavar: 'PATH' }))),
+    bridge: optional(option('--bridge', string({ metavar: 'URL' }), {
+      description: message`Override the bridge URL from the saved owner-session. Pair with --token.`,
+    })),
+    token: optional(option('--token', string({ metavar: 'TOKEN' }), {
+      description: message`Override the owner-session token from disk. Pair with --bridge.`,
+    })),
+    json: withDefault(flag('--json', {
+      description: message`Print the registration response as JSON to stdout instead of persisting to config.json.`,
+    }), false),
+  }),
+  {
+    brief: message`Register an agent and persist daemon credentials.`,
+    description: message`Calls the bridge's \`registerClient\` GraphQL mutation (compat name; the unified server model from #219 is agent-first) using the owner-session bearer saved by \`vicoop-client login\`, receives a one-time AGENT_TOKEN, and writes the daemon credentials into the canonical \`~/.vicoop/config.json\` (mode 600). The token is unrecoverable after this single output; back up config.json before rotating hosts. \`--json\` skips disk persistence and prints the raw response instead.`,
+  },
+);
+
+export type AgentRegisterArgs = InferValue<typeof agentRegisterCmd>;
 
 interface RegisterClientGraphQLResponse {
   data?: {
@@ -299,28 +335,53 @@ async function configureCallers(
   }
 }
 
-export async function runSetup(args: SetupArgs): Promise<number> {
-  if (args.allowedAgentIds.length === 0) {
-    process.stderr.write('--agent-ids is required\n');
+// Label set for human-output text. The new `agent register` and the
+// deprecated `setup` share the same wire path (and identical --json shape so
+// scripts on either entry point keep working) but diverge in their stderr
+// vocabulary. `renderSuccessBlock` picks the right identifier (agent_id is
+// the operator-supplied routing key; client_id is the legacy registration
+// UUID returned by registerClient) per surface.
+interface RegistrationLabels {
+  cmdName: string;        // 'agent register' or 'setup'
+  agentsFlag: string;     // '--agent-id' or '--agent-ids'
+  tokenLabel: string;     // 'AGENT_TOKEN' or 'CLIENT_TOKEN'
+  addCallerHint: string;  // 'vicoop-client agent callers add' or 'vicoop-client add-caller'
+  renderSuccessBlock: (s: ClientRegisterSuccess) => string;
+  renderRecoveryBlock: (s: ClientRegisterSuccess, serverUrl: string) => string;
+}
+
+interface ExecuteRegistrationOpts {
+  name: string;
+  allowedAgentIds: string[];
+  callers: string[];
+  envFile: string | null;
+  bridge: string | null;
+  token: string | null;
+  json: boolean;
+  labels: RegistrationLabels;
+}
+
+// Shared registration flow used by both `agent register` and the legacy
+// `setup` alias. Label strings are injected so callers can use the
+// vocabulary appropriate to their command surface; everything else
+// (preflight, GraphQL call, persistence, env-file write, caller
+// configuration, recovery hatches) is identical.
+async function executeRegistration(opts: ExecuteRegistrationOpts): Promise<number> {
+  if (opts.allowedAgentIds.length === 0) {
+    process.stderr.write(`${opts.labels.agentsFlag} is required\n`);
     return 1;
   }
-  // `--caller` is repeatable AND accepts comma-separated values within each
-  // occurrence — explode both into a flat list.
-  const callers = args.callers.flatMap((c) =>
-    c.split(',').map((s) => s.trim()).filter(Boolean),
-  );
-  const envFile = args.envFile ?? args.envFileAlias ?? null;
 
   const stored = resolveOwnerSession();
-  if ((args.bridge && !args.token) || (!args.bridge && args.token)) {
+  if ((opts.bridge && !opts.token) || (!opts.bridge && opts.token)) {
     process.stderr.write(
       'Pass --bridge and --token together. Owner-session credentials are tied to their bridge URL.\n',
     );
     return 1;
   }
 
-  const session = args.bridge && args.token
-    ? { bridge: args.bridge, token: args.token }
+  const session = opts.bridge && opts.token
+    ? { bridge: opts.bridge, token: opts.token }
     : stored;
   const bridge = session?.bridge;
   const token = session?.token;
@@ -337,17 +398,16 @@ export async function runSetup(args: SetupArgs): Promise<number> {
   // client token. Otherwise `registerClient` succeeds, the token comes back
   // exactly once from the bridge, and `writeConfigForSetup` then throws the
   // same "refusing to overwrite" error — leaving the operator with no token
-  // and no record of it. Only `--json` is exempt (it skips
-  // `writeClientSetupOutput` entirely and prints the token to stdout);
-  // `--bridge/--token` overrides change *where* the owner session comes
-  // from, not *where* the client credentials get persisted, so they still
-  // write canonical config.json and need the same preflight.
-  if (!args.json) {
+  // and no record of it. Only `--json` is exempt (it skips persistence and
+  // prints the token to stdout); `--bridge/--token` overrides change *where*
+  // the owner session comes from, not *where* the credentials get persisted,
+  // so they still write canonical config.json and need the same preflight.
+  if (!opts.json) {
     const configPath = defaultConfigPath();
     if (existsSync(configPath) && readConfigRaw(configPath) === null) {
       process.stderr.write(
         `${configPath} exists but is unreadable / not a JSON object — ` +
-          'fix or move it aside before rerunning setup (refusing to mint a token we cannot save).\n',
+          `fix or move it aside before rerunning ${opts.labels.cmdName} (refusing to mint a token we cannot save).\n`,
       );
       return 1;
     }
@@ -357,7 +417,7 @@ export async function runSetup(args: SetupArgs): Promise<number> {
   try {
     success = await registerClient(
       { bridge, token },
-      { clientName: args.clientName, allowedAgentIds: args.allowedAgentIds },
+      { clientName: opts.name, allowedAgentIds: opts.allowedAgentIds },
     );
   } catch (e) {
     process.stderr.write(`${(e as Error).message}\n`);
@@ -365,16 +425,13 @@ export async function runSetup(args: SetupArgs): Promise<number> {
   }
 
   process.stderr.write(
-    `  client_id        ${success.client_id}\n` +
-      `  owner_principal  ${success.owner_principal}\n` +
-      `  client_name      ${success.client_name}\n` +
-      `  allowed_agents   ${success.allowed_agent_ids.join(', ')}\n\n` +
-      'The CLIENT_TOKEN is one-time — the bridge cannot reissue it.\n' +
-      '  setup persists it to the canonical config below; --json prints it to\n' +
+    `${opts.labels.renderSuccessBlock(success)}\n\n` +
+      `The ${opts.labels.tokenLabel} is one-time — the bridge cannot reissue it.\n` +
+      `  ${opts.labels.cmdName} persists it to the canonical config below; --json prints it to\n` +
       '  stdout instead. Back up that file before rotating hosts.\n' +
       '  To also stash it in a shell-sourceable env file, pass --write-env-file\n' +
-      '  on this same setup invocation — rerunning setup later would call\n' +
-      '  registerClient again and mint a NEW CLIENT_TOKEN, invalidating this\n' +
+      `  on this same ${opts.labels.cmdName} invocation — rerunning ${opts.labels.cmdName} later would call\n` +
+      `  registerClient again and mint a NEW ${opts.labels.tokenLabel}, invalidating this\n` +
       '  one. To populate an env file from an already-issued token, copy\n' +
       '  SERVER_URL / SERVER_TOKEN / AGENT_ID out of config.json by hand.\n\n',
   );
@@ -384,53 +441,41 @@ export async function runSetup(args: SetupArgs): Promise<number> {
   // recovery hatch.
   let canonicalPath: string | null;
   try {
-    canonicalPath = persistCanonical({ json: args.json }, success, bridge);
+    canonicalPath = persistCanonical({ json: opts.json }, success, bridge);
   } catch (e) {
     process.stderr.write(`${(e as Error).message}\n`);
-    // The preflight above catches the common "existing config is malformed"
-    // case before minting, but a disk-full / EPERM failure during the
-    // write itself can still strand the token. Surface it on stderr so
-    // the operator can save it manually instead of being left with an
-    // unrecoverable bridge registration. The token still goes to stderr
-    // (not stdout) so `--json`-style pipelines aren't affected — they
-    // would have taken the --json branch inside persistCanonical.
     process.stderr.write(
-      '\n[recovery] canonical persistence failed AFTER registerClient succeeded. The bridge has issued this CLIENT_TOKEN exactly once:\n' +
-        `\n  CLIENT_ID:      ${success.client_id}\n` +
-        `  CLIENT_TOKEN:   ${success.client_token}\n` +
-        `  SERVER_URL:     ${wsUrlFromBridge(bridge)}\n` +
-        `  AGENT_ID:       ${success.allowed_agent_ids[0] ?? ''}\n\n` +
+      `\n[recovery] canonical persistence failed AFTER registerClient succeeded. ` +
+        `The bridge has issued this ${opts.labels.tokenLabel} exactly once:\n\n` +
+        `${opts.labels.renderRecoveryBlock(success, wsUrlFromBridge(bridge))}\n\n` +
         '  Save these values now; they cannot be retrieved later. Rotate via ' +
         '`rotateClientToken` GraphQL mutation if you suspect leakage.\n',
     );
     return 1;
   }
 
-  // Optional env-file emission (shell-sourceable). Errors here
-  // are NOT recovery situations: the token is already safe in canonical
-  // config.json. Surface a targeted warning that tells the operator how
-  // to populate the env file by hand without rotating the token (rerunning
-  // `setup --write-env-file` would mint a new CLIENT_TOKEN). Exit
-  // non-zero so CI / scripts catch the partial failure, but with a
-  // distinct message — not the "token was not persisted" recovery block.
-  if (envFile && !args.json) {
+  // Optional env-file emission (shell-sourceable). Errors here are NOT
+  // recovery situations: the token is already safe in canonical config.json.
+  // Surface a targeted warning instead of the "token was not persisted"
+  // recovery block; exit non-zero so CI / scripts catch the partial failure.
+  if (opts.envFile && !opts.json) {
     try {
-      writeClientEnvFile(envFile, success, bridge);
-      process.stderr.write(`Wrote env block to ${envFile} (mode 600).\n`);
+      writeClientEnvFile(opts.envFile, success, bridge);
+      process.stderr.write(`Wrote env block to ${opts.envFile} (mode 600).\n`);
     } catch (e) {
       process.stderr.write(
-        `\nWARNING: --write-env-file ${envFile} failed: ${(e as Error).message}\n` +
-          `  The CLIENT_TOKEN was persisted to ${canonicalPath ?? '(canonical config)'} — the daemon can start without the env file.\n` +
+        `\nWARNING: --write-env-file ${opts.envFile} failed: ${(e as Error).message}\n` +
+          `  The ${opts.labels.tokenLabel} was persisted to ${canonicalPath ?? '(canonical config)'} — the daemon can start without the env file.\n` +
           '  To populate the env file without rotating the token, copy SERVER_URL / SERVER_TOKEN / AGENT_ID out of config.json by hand.\n' +
-          '  Re-running `setup --write-env-file ...` would mint a NEW CLIENT_TOKEN and invalidate the one just written.\n',
+          `  Re-running \`${opts.labels.cmdName} --write-env-file ...\` would mint a NEW ${opts.labels.tokenLabel} and invalidate the one just written.\n`,
       );
       return 1;
     }
   }
 
-  if (callers.length > 0) {
+  if (opts.callers.length > 0) {
     try {
-      await configureCallers({ bridge, token }, [...success.allowed_agent_ids], callers);
+      await configureCallers({ bridge, token }, [...success.allowed_agent_ids], opts.callers);
     } catch (e) {
       process.stderr.write(`${(e as Error).message}\n`);
       return 1;
@@ -438,10 +483,106 @@ export async function runSetup(args: SetupArgs): Promise<number> {
     process.stderr.write('\n');
   } else {
     process.stderr.write(
-      'WARNING: no callers configured. The agent is public until you run ' +
-        '`vicoop-client add-caller <agent_id> <principal>`.\n\n',
+      `WARNING: no callers configured. The agent is public until you run ` +
+        `\`${opts.labels.addCallerHint} <agent_id> <principal>\`.\n\n`,
     );
   }
 
   return 0;
+}
+
+// Renderers for `setup`'s client-first stderr vocabulary. Kept here so the
+// legacy alias surfaces unchanged for operators (and scripts) still parsing
+// stderr; `success.client_id` is the legacy registration UUID returned by
+// registerClient, not the operator-supplied agent id.
+function renderSetupSuccessBlock(success: ClientRegisterSuccess): string {
+  return [
+    `  client_id        ${success.client_id}`,
+    `  owner_principal  ${success.owner_principal}`,
+    `  client_name      ${success.client_name}`,
+    `  allowed_agents   ${success.allowed_agent_ids.join(', ')}`,
+  ].join('\n');
+}
+
+function renderSetupRecoveryBlock(success: ClientRegisterSuccess, serverUrl: string): string {
+  return [
+    `  CLIENT_ID:      ${success.client_id}`,
+    `  CLIENT_TOKEN:   ${success.client_token}`,
+    `  SERVER_URL:     ${serverUrl}`,
+    `  AGENT_ID:       ${success.allowed_agent_ids[0] ?? ''}`,
+  ].join('\n');
+}
+
+// Renderers for `agent register`. Surfaces the operator-supplied agent_id
+// (= `allowed_agent_ids[0]`) as the primary identifier. The legacy
+// registration UUID is exposed only on the recovery path, where the operator
+// may need it for an out-of-band revoke / audit.
+function renderAgentRegisterSuccessBlock(success: ClientRegisterSuccess): string {
+  return [
+    `  agent_id         ${success.allowed_agent_ids[0] ?? ''}`,
+    `  owner_principal  ${success.owner_principal}`,
+    `  name             ${success.client_name}`,
+  ].join('\n');
+}
+
+function renderAgentRegisterRecoveryBlock(success: ClientRegisterSuccess, serverUrl: string): string {
+  return [
+    `  AGENT_ID:        ${success.allowed_agent_ids[0] ?? ''}`,
+    `  AGENT_TOKEN:     ${success.client_token}`,
+    `  SERVER_URL:      ${serverUrl}`,
+    `  registration_id: ${success.client_id}`,
+  ].join('\n');
+}
+
+export async function runSetup(args: SetupArgs): Promise<number> {
+  process.stderr.write(
+    '[warning] `vicoop-client setup` is deprecated; ' +
+      'use `vicoop-client agent register --name NAME --agent-id ID` instead. ' +
+      'The deprecated form will be removed in a future release.\n',
+  );
+  // `--caller` is repeatable AND accepts comma-separated values within each
+  // occurrence — explode both into a flat list.
+  const callers = args.callers.flatMap((c) =>
+    c.split(',').map((s) => s.trim()).filter(Boolean),
+  );
+  return executeRegistration({
+    name: args.clientName,
+    allowedAgentIds: args.allowedAgentIds,
+    callers,
+    envFile: args.envFile ?? args.envFileAlias ?? null,
+    bridge: args.bridge ?? null,
+    token: args.token ?? null,
+    json: args.json,
+    labels: {
+      cmdName: 'setup',
+      agentsFlag: '--agent-ids',
+      tokenLabel: 'CLIENT_TOKEN',
+      addCallerHint: 'vicoop-client add-caller',
+      renderSuccessBlock: renderSetupSuccessBlock,
+      renderRecoveryBlock: renderSetupRecoveryBlock,
+    },
+  });
+}
+
+export async function runAgentRegister(args: AgentRegisterArgs): Promise<number> {
+  const callers = args.callers.flatMap((c) =>
+    c.split(',').map((s) => s.trim()).filter(Boolean),
+  );
+  return executeRegistration({
+    name: args.name,
+    allowedAgentIds: [args.agentId],
+    callers,
+    envFile: args.envFile ?? args.envFileAlias ?? null,
+    bridge: args.bridge ?? null,
+    token: args.token ?? null,
+    json: args.json,
+    labels: {
+      cmdName: 'agent register',
+      agentsFlag: '--agent-id',
+      tokenLabel: 'AGENT_TOKEN',
+      addCallerHint: 'vicoop-client agent callers add',
+      renderSuccessBlock: renderAgentRegisterSuccessBlock,
+      renderRecoveryBlock: renderAgentRegisterRecoveryBlock,
+    },
+  });
 }

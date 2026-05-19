@@ -15,6 +15,7 @@ import { message } from '@optique/core/message';
 import type { InferValue } from '@optique/core/parser';
 import { string } from '@optique/core/valueparser';
 import { resolveOwnerSession } from './owner-session.js';
+import { agentRegisterCmd } from './setup.js';
 
 // All six admin subcommands share the same auth/output flags. Define them
 // once and splice into each command's parser to keep the surface uniform.
@@ -113,10 +114,10 @@ const agentCallersSubCmd = command(
 
 export const agentCmd = command(
   'agent',
-  longestMatch(agentListSubCmd, agentRevokeSubCmd, agentCallersSubCmd),
+  longestMatch(agentRegisterCmd, agentListSubCmd, agentRevokeSubCmd, agentCallersSubCmd),
   {
     brief: message`Manage agent registrations and their allowed callers.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`list\`, \`revoke\`, \`callers {list,add,remove}\`. Replaces the older flat \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`revoke\`, \`callers {list,add,remove}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
   },
 );
 
