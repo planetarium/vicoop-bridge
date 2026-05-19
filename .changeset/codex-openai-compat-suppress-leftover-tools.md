@@ -38,6 +38,23 @@ surrounding JSON object (respecting strings + escapes), and parse the
 slice. False positives are bounded by the marker specificity + valid-JSON
 + `tool_calls`-array gate.
 
+Also overrides `sandbox` to `workspace-write` on `thread/start` /
+`thread/resume` whenever caller-side dispatch is active. A second 5-run
+re-test caught two runs (030, 031) where the model read codex's
+built-in permissions text ("`sandbox_mode` is `read-only`") and
+explicitly refused the caller's writable tools:
+
+> "this session is currently in a read-only filesystem sandbox, so I
+>  can't create `index.html`, `styles.css`, or `script.js` from here."
+
+The model never executes locally under caller-side dispatch
+(`environments: []` removes every shell / write / apply_patch handler),
+so the operator-configured sandbox value only matters for the
+permissions-text rendering. Forcing it to `workspace-write` aligns the
+text the model reads with its actual contract (emit envelopes the caller
+will execute against the caller's workspace). Non-openai-compat callers
+still get the operator-configured sandbox unchanged.
+
 Not addressed by this PR (tracked separately):
 
 - `list_mcp_resources` / `list_mcp_resource_templates` /

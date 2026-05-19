@@ -772,6 +772,24 @@ export function createCodexBackend(
           // keep their normal codex environment.
           const sendEmptyEnvironments = callerToolDispatchActive(openaiCompat);
 
+          // Under caller-side dispatch the model never executes locally —
+          // `environments: []` removes every shell / write / apply_patch
+          // handler from the registry. The operator-configured `sandbox`
+          // still flows into codex's built-in permissions text (developer
+          // message content[0]), which renders as "sandbox_mode is
+          // `<value>`. The sandbox permits …". With the default
+          // `read-only`, the model has been observed (#207 round-3 runs
+          // 030, 031) to read that text and refuse the caller's writable
+          // tools, declaring "this session is in a read-only filesystem
+          // sandbox" and ending the turn with no envelope. Override to
+          // `workspace-write` for caller-side dispatch so the permissions
+          // text matches the model's actual contract — emitting envelopes
+          // that the caller will execute against its writable workspace.
+          // Safe because the codex-side write handlers are already gone.
+          const effectiveSandbox: SandboxMode = callerToolDispatchActive(openaiCompat)
+            ? 'workspace-write'
+            : sandboxMode;
+
           let threadId: string;
           try {
             if (isResume) {
@@ -780,7 +798,7 @@ export function createCodexBackend(
                 {
                   threadId: existing.threadId,
                   cwd,
-                  sandbox: sandboxMode,
+                  sandbox: effectiveSandbox,
                   ...(configOverride ? { config: configOverride } : {}),
                 },
               );
@@ -790,7 +808,7 @@ export function createCodexBackend(
                 'thread/start',
                 {
                   cwd,
-                  sandbox: sandboxMode,
+                  sandbox: effectiveSandbox,
                   ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),
                   ...(configOverride ? { config: configOverride } : {}),
                   ...(sendEmptyEnvironments ? { environments: [] } : {}),

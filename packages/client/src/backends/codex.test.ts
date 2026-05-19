@@ -1325,6 +1325,87 @@ test('thread/resume re-passes `config.features` because feature flags do not per
   assert.deepEqual(resumeFeatures, EXPECTED_OPENAI_COMPAT_DISABLES);
 });
 
+test('thread/start overrides sandbox to workspace-write under caller-side dispatch (#207)', async () => {
+  // Live test rounds for #207 showed two runs (030, 031) failing because
+  // the model read codex's built-in permissions text ("sandbox_mode is
+  // `read-only`") and refused the caller's writable tools, declaring
+  // "this session is in a read-only filesystem sandbox" and ending the
+  // turn with no envelope. Under caller-side dispatch the model never
+  // executes locally (environments: [] removes the write/exec handlers),
+  // so a read-only permissions block only confuses it. Override to
+  // workspace-write so the permissions text matches the model's actual
+  // contract.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn, sandboxMode: 'read-only' });
+  await backend.handle(
+    assign('do it', 'ctx-sandbox-override', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'do it' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tools: [{ type: 'function', function: { name: 'write', parameters: {} } }],
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { sandbox?: string } }).params;
+  assert.equal(params?.sandbox, 'workspace-write');
+});
+
+test('thread/start passes the operator sandbox through when no caller tools are supplied', async () => {
+  // Non-openai-compat callers still get the operator-configured sandbox
+  // — the override is gated on `callerToolDispatchActive`. Regression
+  // check for plain codex usage.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn, sandboxMode: 'read-only' });
+  await backend.handle(assign('hi', 'ctx-sandbox-passthrough'), collect().emit, NEVER);
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { sandbox?: string } }).params;
+  assert.equal(params?.sandbox, 'read-only');
+});
+
+test('thread/resume also overrides sandbox to workspace-write under caller-side dispatch (#207)', async () => {
+  // Sandbox setting is re-sent on resume in codex.ts; verify the
+  // caller-side-dispatch override applies symmetrically so the model
+  // doesn't suddenly read "read-only" on follow-up turns and refuse
+  // the caller's tools.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn, sandboxMode: 'read-only' });
+  const meta = {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: [{ type: 'function', function: { name: 'write', parameters: {} } }],
+    },
+  };
+  await backend.handle(
+    assign('one', 'ctx-sandbox-resume', {
+      message: { role: 'user', messageId: 'm1', parts: [{ kind: 'text', text: 'one' }], metadata: meta },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  await backend.handle(
+    assign('two', 'ctx-sandbox-resume', {
+      message: { role: 'user', messageId: 'm2', parts: [{ kind: 'text', text: 'two' }], metadata: meta },
+    }),
+    collect().emit,
+    NEVER,
+  );
+
+  const frames = fake.lastChild().stdinFrames();
+  const resume = findRequest(frames, 'thread/resume');
+  assert.ok(resume, 'thread/resume observed');
+  const params = (resume as { params?: { sandbox?: string } }).params;
+  assert.equal(params?.sandbox, 'workspace-write');
+});
+
 test('developerInstructions includes the leftover-tool directive under caller-side dispatch (#207)', async () => {
   // `update_plan` and `request_user_input` are unconditionally registered
   // by codex (`spec_plan.rs`) with no feature gate. The directive in
