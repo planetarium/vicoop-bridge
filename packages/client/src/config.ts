@@ -174,6 +174,7 @@ const KNOWN_BACKENDS = new Set([
   'openclaw',
   'claude',
   'codex',
+  'vicoop-codex',
 ]);
 const KNOWN_APPROVAL_DECISIONS = new Set([
   'accept',

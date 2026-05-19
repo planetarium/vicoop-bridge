@@ -16,6 +16,7 @@ const canonicalCards = new Map<string, AgentCardType>(
     codex: readCanonicalCard('codex'),
     echo: readCanonicalCard('echo'),
     openclaw: readCanonicalCard('openclaw'),
+    'vicoop-codex': readCanonicalCard('vicoop-codex'),
   }),
 );
 

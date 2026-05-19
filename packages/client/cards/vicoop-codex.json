@@ -1,0 +1,31 @@
+{
+  "name": "vicoop-codex",
+  "description": "OpenAI Codex agent driven via the `vicoop-codex call` CLI. Each A2A task spawns a single non-streaming `vicoop-codex call` invocation with an OpenAI Chat Completions body assembled from the openai-compat A2A extension, and returns the response payload as A2A artifacts plus an openai-compat usage / chat_completion echo on the final message metadata.",
+  "version": "0.0.1",
+  "protocolVersion": "0.3.0",
+  "capabilities": {
+    "streaming": false,
+    "extensions": [
+      {
+        "uri": "https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1",
+        "description": "Reads the standard 4-field openai-compat metadata (system / tools / tool_choice / tool_call_history) to assemble the call body; emits OpenAI Chat Completions tool_calls back as an A2A data part and the full response envelope on the final message metadata.",
+        "required": false
+      }
+    ]
+  },
+  "defaultInputModes": [
+    "text/plain",
+    "application/json"
+  ],
+  "defaultOutputModes": [
+    "text/plain"
+  ],
+  "skills": [
+    {
+      "id": "chat",
+      "name": "chat",
+      "description": "Ask a question or give an instruction in natural language; the vicoop-codex CLI responds with text. Auxiliary structured context can be attached as A2A `data` parts; they are serialized into the prompt as tagged JSON blocks. File parts are not supported.",
+      "tags": ["chat", "assistant", "codex", "openai-compat"]
+    }
+  ]
+}
