@@ -642,16 +642,50 @@ export function formatToolCallHistory(history: OpenAICompatHistoryEntry[]): stri
 // the SYSTEM_INSTRUCTION above teaches the model to emit. Returns the parsed
 // envelope verbatim (preserving unknown keys) when the trimmed text parses as
 // a JSON object carrying a `tool_calls` array; otherwise null so the caller
-// falls back to a text artifact. Strict: a leading non-`{` character (prose
-// preamble, code fence, etc.) short-circuits without paying the JSON.parse.
+// falls back to a text artifact.
+//
+// Two-stage recognition:
+//
+// - Fast path: text starts with `{` after trim — assume the model honored
+//   the contract ("emit nothing outside the JSON object") and parse the
+//   whole string. Cheap for the common envelope-only turn AND for pure
+//   conversational turns (the leading `{` check rejects them before any
+//   JSON.parse).
+//
+// - Slow path: locate a `{"tool_calls": …` marker anywhere in the trimmed
+//   string and balance-match the surrounding JSON object, then parse the
+//   slice. Recovers envelopes the model prefixed with narration (or
+//   wrapped in a code fence). Observed in PR #208 review against
+//   `codex-Mac-pr208`: out of 5 reproduction runs one failed solely
+//   because the model emitted
+//
+//       "Creating the three static app files now …{"tool_calls":[ … ]}"
+//
+//   and the strict prefix check discarded a fully-formed envelope. False
+//   positives are bounded by the marker specificity + valid-JSON +
+//   tool_calls-array checks; a prose mention of the literal string is
+//   highly unlikely to also satisfy the balance-match + JSON.parse path.
 export function tryParseToolCallsEnvelope(
   text: string,
 ): (Record<string, unknown> & { tool_calls: unknown[] }) | null {
   const trimmed = text.trim();
-  if (!trimmed.startsWith('{')) return null;
+  if (trimmed.startsWith('{')) {
+    const fast = parseAsToolCallsEnvelope(trimmed);
+    if (fast) return fast;
+  }
+  const marker = trimmed.search(/\{\s*"tool_calls"\s*:/);
+  if (marker < 0) return null;
+  const sliced = extractBalancedJsonObject(trimmed, marker);
+  if (sliced === null) return null;
+  return parseAsToolCallsEnvelope(sliced);
+}
+
+function parseAsToolCallsEnvelope(
+  s: string,
+): (Record<string, unknown> & { tool_calls: unknown[] }) | null {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(trimmed);
+    parsed = JSON.parse(s);
   } catch {
     return null;
   }
@@ -659,6 +693,41 @@ export function tryParseToolCallsEnvelope(
   const obj = parsed as Record<string, unknown>;
   if (!Array.isArray(obj.tool_calls)) return null;
   return obj as Record<string, unknown> & { tool_calls: unknown[] };
+}
+
+// Walk a string from `start` (which must point at `{`) and find the
+// matching `}`, respecting string literals and their escape sequences.
+// Returns the inclusive substring, or null if the depth never returns
+// to zero or `start` is not `{`. Used to extract the envelope object out
+// of mixed `<prose> { … } <prose>` outputs without false-cutting on
+// braces that appear inside JSON string values.
+function extractBalancedJsonObject(s: string, start: number): string | null {
+  if (s[start] !== '{') return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (inString) {
+      if (c === '\\') escape = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      continue;
+    }
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return s.substring(start, i + 1);
+    }
+  }
+  return null;
 }
 
 // Pull `tool_use` blocks out of an `assistant`-role message's content

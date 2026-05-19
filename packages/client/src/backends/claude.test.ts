@@ -1909,12 +1909,6 @@ test('tryParseToolCallsEnvelope: recognises a well-formed envelope and preserves
 test('tryParseToolCallsEnvelope: rejects prose, non-objects, and missing tool_calls', () => {
   assert.equal(tryParseToolCallsEnvelope(''), null);
   assert.equal(tryParseToolCallsEnvelope('I will not call any tool.'), null);
-  // Prose before the brace short-circuits the parse — keeps the cost off
-  // the JSON.parse on conversational turns.
-  assert.equal(
-    tryParseToolCallsEnvelope('Sure! {"tool_calls":[{"id":"call_x"}]}'),
-    null,
-  );
   // Trimmed whitespace is fine; the model occasionally pads with newlines.
   assert.ok(tryParseToolCallsEnvelope('  \n{"tool_calls":[]}\n  '));
   // Top-level array is not the envelope shape.
@@ -1924,6 +1918,61 @@ test('tryParseToolCallsEnvelope: rejects prose, non-objects, and missing tool_ca
   assert.equal(tryParseToolCallsEnvelope('{"tool_calls":"nope"}'), null);
   // Malformed JSON falls through to null rather than throwing.
   assert.equal(tryParseToolCallsEnvelope('{"tool_calls":'), null);
+  // Conversational prose without the envelope marker → null even after
+  // relaxation; the marker check (`{"tool_calls":`) is the gate.
+  assert.equal(
+    tryParseToolCallsEnvelope('No tool needed, here is the answer.'),
+    null,
+  );
+});
+
+test('tryParseToolCallsEnvelope: recovers envelopes the model prefixed with narration (PR #208 review)', () => {
+  // Live #207 reproduction (codex-Mac-pr208, run 028) caught the model
+  // emitting "<short narration>{tool_calls:[…]}" — a fully-formed
+  // envelope at the suffix, prose preamble in front. The strict
+  // pre-relaxation path discarded it; the relaxed path recovers it by
+  // locating the marker and balance-matching the surrounding object.
+  const recovered = tryParseToolCallsEnvelope(
+    'Creating the three static app files now.{"tool_calls":[{"id":"call_x","function":{"name":"write","arguments":{"filePath":"/tmp/a"}}}]}',
+  );
+  assert.ok(recovered);
+  assert.equal(recovered.tool_calls.length, 1);
+});
+
+test('tryParseToolCallsEnvelope: recovers envelope wrapped in a markdown code fence', () => {
+  const recovered = tryParseToolCallsEnvelope(
+    'Sure, here is the call:\n```json\n{"tool_calls":[{"id":"c1","function":{"name":"x"}}]}\n```',
+  );
+  assert.ok(recovered);
+  assert.equal(recovered.tool_calls.length, 1);
+});
+
+test('tryParseToolCallsEnvelope: balance-match respects strings containing braces', () => {
+  // A function argument string containing `}` chars must not prematurely
+  // close the surrounding JSON object — the balance walker tracks string
+  // state.
+  const recovered = tryParseToolCallsEnvelope(
+    'prose {"tool_calls":[{"id":"c","function":{"name":"x","arguments":{"q":"a } b { c"}}}]}',
+  );
+  assert.ok(recovered);
+  assert.equal((recovered.tool_calls[0] as { id: string }).id, 'c');
+});
+
+test('tryParseToolCallsEnvelope: prose-prefixed but unbalanced JSON yields null, no throw', () => {
+  // Marker is present, but the object never closes — extractBalancedJsonObject
+  // returns null and the parser falls through cleanly.
+  assert.equal(
+    tryParseToolCallsEnvelope('prose {"tool_calls":[{"id":"x"'),
+    null,
+  );
+});
+
+test('tryParseToolCallsEnvelope: trailing prose after envelope is tolerated', () => {
+  const recovered = tryParseToolCallsEnvelope(
+    'before {"tool_calls":[{"id":"c"}]} and then some after-text',
+  );
+  assert.ok(recovered);
+  assert.equal((recovered.tool_calls[0] as { id: string }).id, 'c');
 });
 
 test('spawn argv carries --append-system-prompt with the tool envelope when metadata is present', async () => {

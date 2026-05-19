@@ -26,6 +26,18 @@ re-test against a deployed `codex-Mac-pr208` agent showed
 model now emits the envelope and tasks complete (vs the silent
 text-only completion observed in #207).
 
+Also relaxes `tryParseToolCallsEnvelope` to recover envelopes the model
+prefixed with prose (or wrapped in a code fence). A 5-run re-test caught
+one case where the model emitted
+`"<short narration>{"tool_calls":[…]}"` — a fully-formed envelope at
+the suffix that the strict pre-relaxation path discarded, producing a
+silent run failure even though the call payload was complete. The
+relaxed path keeps the fast (clean-envelope) check unchanged and adds a
+slow fallback: locate the `{"tool_calls":` marker, balance-match the
+surrounding JSON object (respecting strings + escapes), and parse the
+slice. False positives are bounded by the marker specificity + valid-JSON
++ `tool_calls`-array gate.
+
 Not addressed by this PR (tracked separately):
 
 - `list_mcp_resources` / `list_mcp_resource_templates` /
