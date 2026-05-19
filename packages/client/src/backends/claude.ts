@@ -316,6 +316,7 @@ interface ToolUseBlock {
   toolName: string;
   toolUseId: string;
   summary: string;
+  input: unknown;
 }
 
 // Bounded stringification for a `tool_use.input`. The naive
@@ -678,7 +679,7 @@ function extractAssistantToolUses(content: unknown): ToolUseBlock[] {
       `${toolName}: ${summarizeToolInput(b.input, TOOL_CALL_SUMMARY_MAX_CHARS)}`,
       TOOL_CALL_SUMMARY_MAX_CHARS,
     );
-    out.push({ toolName, toolUseId, summary });
+    out.push({ toolName, toolUseId, summary, input: b.input });
   }
   return out;
 }
@@ -1167,13 +1168,14 @@ export function createClaudeBackend(
           type: 'user',
           message: { role: 'user', content: mapped.blocks },
         });
-        child.stdin.end(envelope + '\n');
+        child.stdin.write(envelope + '\n');
         recorder.mark('stdin');
       } catch (err) {
         stdinError = err;
       }
 
       let emittedAnyArtifact = false;
+      let emittedAskUserQuestion = false;
       let finalText: string | null = null;
       let finalUsage: OpenAICompatUsage | null = null;
       let stderrTail = '';
@@ -1296,10 +1298,50 @@ export function createClaudeBackend(
           // blocks. Emit the text (if any) first so observers see "what the
           // model said" before "what tools it then called", matching the
           // visible CLI ordering inside that turn.
-          emitAssistantArtifact(extractAssistantText(evt.message.content));
-          if (!emitTraceArtifacts) return;
+          if (!emittedAskUserQuestion) {
+            emitAssistantArtifact(extractAssistantText(evt.message.content));
+          }
+          if (emittedAskUserQuestion) return;
           for (const tu of extractAssistantToolUses(evt.message.content)) {
-            emitToolCallArtifact(tu);
+            if (tu.toolName === 'AskUserQuestion' && tu.toolUseId && child.stdin) {
+              // Emit questions as an A2A artifact so upstream (e.g. slack-connector)
+              // can render interactive UI. Immediately return a placeholder tool_result
+              // so CC continues; the real answer arrives as a follow-up turn.
+              emit({
+                type: 'task.artifact',
+                taskId: task.taskId,
+                artifact: {
+                  artifactId: randomUUID(),
+                  name: 'ask-user-question',
+                  parts: [
+                    {
+                      kind: 'data',
+                      data: { kind: 'tool_call', toolName: 'AskUserQuestion', toolUseId: tu.toolUseId, input: tu.input },
+                    },
+                  ],
+                },
+                lastChunk: true,
+              });
+              emittedAnyArtifact = true;
+              emittedAskUserQuestion = true;
+              const toolResult = JSON.stringify({
+                type: 'user',
+                message: {
+                  role: 'user',
+                  content: [
+                    {
+                      type: 'tool_result',
+                      tool_use_id: tu.toolUseId,
+                      content: 'Question displayed to user. Do NOT attempt to answer on their behalf. Wait for their response in the next message. Stop here and end your response now.',
+                    },
+                  ],
+                },
+              });
+              child.stdin.write(toolResult + '\n');
+              try { child.stdin.end(); } catch { /* best effort */ }
+            } else if (emitTraceArtifacts) {
+              emitToolCallArtifact(tu);
+            }
           }
           return;
         }
@@ -1335,13 +1377,15 @@ export function createClaudeBackend(
           return;
         }
         if (evt.type === 'result') {
-          if (typeof evt.result === 'string') finalText = evt.result;
+          if (typeof evt.result === 'string' && !emittedAskUserQuestion) finalText = evt.result;
           // openai-compat/v1 response-side usage: prefer modelUsage over the
           // top-level `usage` (latter omits internal sub-model invocations).
           // Best-effort: a malformed shape just leaves finalUsage null and
           // the gateway falls back to its own estimate.
           const parsed = parseClaudeModelUsageForOpenAICompat(evt.modelUsage);
           if (parsed) finalUsage = parsed;
+          // CC finished — close stdin now that no more tool_results need writing.
+          try { child.stdin?.end(); } catch { /* best effort */ }
         }
       };
 
