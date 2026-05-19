@@ -51,20 +51,21 @@ async function setupOwner(
   ownerPrincipal: string,
 ): Promise<SetupResult> {
   const agentId = `admin-api-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const clients = await sql<{ id: string }[]>`
-    INSERT INTO clients (owner_principal, client_name, token_hash, allowed_agent_ids)
+  const agents = await sql<{ client_id: string }[]>`
+    INSERT INTO agents (id, owner_principal, name, token_hash)
     VALUES (
+      ${agentId},
       ${ownerPrincipal},
       'admin-api-test',
-      ${`fake-hash-${agentId}`},
-      ARRAY[${agentId}]
+      ${`fake-hash-${agentId}`}
     )
-    RETURNING id
+    RETURNING client_id
   `;
-  const clientId = clients[0]!.id;
+  const clientId = agents[0]!.client_id;
   await sql`
-    INSERT INTO agent_policies (agent_id, owner_principal, client_id)
-    VALUES (${agentId}, ${ownerPrincipal}, ${clientId})
+    INSERT INTO clients (id, owner_principal, client_name, token_hash, allowed_agent_ids)
+    VALUES (${clientId}, ${ownerPrincipal}, 'admin-api-test', ${`fake-client-hash-${agentId}`}, ARRAY[${agentId}])
+    ON CONFLICT (id) DO NOTHING
   `;
   const issued = await issueSessionToken(sql, {
     principalId: ownerPrincipal,
@@ -75,7 +76,7 @@ async function setupOwner(
 }
 
 async function teardown(sql: postgres.Sql, principalId: string, clientId: string): Promise<void> {
-  // agent_policies cascades on clients.id, callers wiped by principal_id.
+  await sql`DELETE FROM agents WHERE client_id = ${clientId}`;
   await sql`DELETE FROM clients WHERE id = ${clientId}`;
   await sql`DELETE FROM callers WHERE principal_id = ${principalId}`;
 }
@@ -245,7 +246,7 @@ test(
 );
 
 test(
-  'POST /admin-api/agents/:id/callers pre-creates policy for a registered client agent id',
+  'POST /admin-api/agents/:id/callers updates a registered agent without a live connection',
   { skip: !hasDb },
   async () => {
     const sql = postgres(process.env.DATABASE_URL!);
@@ -253,7 +254,6 @@ test(
     let setup: SetupResult | null = null;
     try {
       setup = await setupOwner(sql, owner);
-      await sql`DELETE FROM agent_policies WHERE agent_id = ${setup.agentId}`;
 
       const registry = new Registry();
       const app = createHttpApp({ db: sql, registry });
@@ -271,8 +271,8 @@ test(
 
       const rows = await sql<{ owner_principal: string; client_id: string; allowed_callers: string[] }[]>`
         SELECT owner_principal, client_id, allowed_callers
-        FROM agent_policies
-        WHERE agent_id = ${setup.agentId}
+        FROM agents
+        WHERE id = ${setup.agentId}
       `;
       assert.equal(rows.length, 1);
       assert.equal(rows[0]!.owner_principal, owner);
@@ -479,7 +479,7 @@ test(
     try {
       setup = await setupOwner(sql, owner);
       // Rename the just-created row so we can target it by name.
-      await sql`UPDATE clients SET client_name = ${uniqueName} WHERE id = ${setup.clientId}`;
+      await sql`UPDATE agents SET name = ${uniqueName} WHERE client_id = ${setup.clientId}`;
 
       const registry = new Registry();
       const app = createHttpApp({ db: sql, registry });
@@ -511,7 +511,7 @@ test(
       setupA = await setupOwner(sql, owner);
       setupB = await setupOwner(sql, owner);
       // Both rows are owned by the same principal and share the same name.
-      await sql`UPDATE clients SET client_name = ${dupName} WHERE id IN (${setupA.clientId}, ${setupB.clientId})`;
+      await sql`UPDATE agents SET name = ${dupName} WHERE client_id IN (${setupA.clientId}, ${setupB.clientId})`;
 
       const registry = new Registry();
       const app = createHttpApp({ db: sql, registry });

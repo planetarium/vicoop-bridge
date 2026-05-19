@@ -83,12 +83,12 @@ export async function addCaller(
     const result = await db.begin(async (tx) => {
       await setRlsContext(tx, principalId);
       return tx`
-        UPDATE agent_policies
+        UPDATE agents
         SET allowed_callers = array_append(allowed_callers, ${normalized}),
             updated_at = now()
-        WHERE agent_id = ${agentId}
+        WHERE id = ${agentId}
           AND NOT (${normalized} = ANY(allowed_callers))
-        RETURNING agent_id, owner_principal, allowed_callers
+        RETURNING id AS agent_id, owner_principal, allowed_callers
       `;
     });
     if (result.length > 0) {
@@ -99,7 +99,7 @@ export async function addCaller(
 
     const existing = await db.begin(async (tx) => {
       await setRlsContext(tx, principalId);
-      return tx`SELECT allowed_callers FROM agent_policies WHERE agent_id = ${agentId}`;
+      return tx`SELECT allowed_callers FROM agents WHERE id = ${agentId}`;
     });
     if (existing.length === 0) return null;
 
@@ -117,45 +117,13 @@ export async function addCaller(
         message: 'Principal already in allowed callers',
       };
     }
-    throw new AdminApiError('Not authorized to modify this agent policy.', 403);
+    throw new AdminApiError('Not authorized to modify this agent.', 403);
   };
 
   const updated = await updateExisting();
   if (updated) return updated;
 
-  const created = await db.begin(async (tx) => {
-    await setRlsContext(tx, principalId);
-    return tx`
-      WITH owning_client AS (
-        SELECT id, owner_principal
-        FROM clients
-        WHERE ${agentId} = ANY(allowed_agent_ids)
-          AND revoked = false
-        ORDER BY created_at DESC
-        LIMIT 1
-      )
-      INSERT INTO agent_policies (agent_id, owner_principal, client_id, allowed_callers)
-      SELECT ${agentId}, owner_principal, id, ARRAY[${normalized}]::text[]
-      FROM owning_client
-      ON CONFLICT (agent_id) DO UPDATE
-        SET allowed_callers = array_append(agent_policies.allowed_callers, ${normalized}),
-            updated_at = now()
-        WHERE NOT (${normalized} = ANY(agent_policies.allowed_callers))
-      RETURNING agent_id, owner_principal, allowed_callers
-    `;
-  });
-  if (created.length > 0) {
-    const callers = created[0].allowed_callers as string[];
-    registry.updateAllowedCallers(agentId, callers);
-    return { agent_id: agentId, principal: normalized, allowed_callers: callers };
-  }
-
-  // Another process may have created the policy with this caller already in
-  // place, or RLS may have blocked the conflict update. Retry the normal
-  // update/idempotency path once so races converge before reporting 404.
-  const retried = await updateExisting();
-  if (retried) return retried;
-  throw new AdminApiError('Agent policy not found or not authorized.', 404);
+  throw new AdminApiError('Agent not found or not authorized.', 404);
 }
 
 export async function removeCaller(
@@ -173,22 +141,22 @@ export async function removeCaller(
   const result = await db.begin(async (tx) => {
     await setRlsContext(tx, principalId);
     return tx`
-      UPDATE agent_policies
+      UPDATE agents
       SET allowed_callers = array_remove(allowed_callers, ${normalized}),
           updated_at = now()
-      WHERE agent_id = ${agentId}
+      WHERE id = ${agentId}
         AND ${normalized} = ANY(allowed_callers)
-      RETURNING agent_id, owner_principal, allowed_callers
+      RETURNING id AS agent_id, owner_principal, allowed_callers
     `;
   });
 
   if (result.length === 0) {
     const existing = await db.begin(async (tx) => {
       await setRlsContext(tx, principalId);
-      return tx`SELECT allowed_callers FROM agent_policies WHERE agent_id = ${agentId}`;
+      return tx`SELECT allowed_callers FROM agents WHERE id = ${agentId}`;
     });
     if (existing.length === 0) {
-      throw new AdminApiError('Agent policy not found or not authorized.', 404);
+      throw new AdminApiError('Agent not found or not authorized.', 404);
     }
     const callers = existing[0].allowed_callers as string[];
     // Same convergence as addCaller's no-op path: hot-reload the registry
@@ -215,12 +183,12 @@ export async function listCallers(
   const result = await db.begin(async (tx) => {
     await setRlsContext(tx, principalId);
     return tx`
-      SELECT agent_id, owner_principal, allowed_callers, created_at, updated_at
-      FROM agent_policies WHERE agent_id = ${agentId}
+      SELECT id AS agent_id, owner_principal, allowed_callers, created_at, updated_at
+      FROM agents WHERE id = ${agentId}
     `;
   });
   if (result.length === 0) {
-    throw new AdminApiError('Agent policy not found.', 404);
+    throw new AdminApiError('Agent not found.', 404);
   }
   const policy = result[0];
   const callers = policy.allowed_callers as string[];
@@ -252,6 +220,7 @@ export function listActiveAgents(
 
 export interface ClientListItem {
   client_id: string;
+  agent_id: string;
   client_name: string;
   owner_principal: string;
   allowed_agent_ids: string[];
@@ -274,8 +243,8 @@ export async function listClientsForOwner(
   const rows = await db.begin(async (tx) => {
     await setRlsContext(tx, principalId);
     return tx`
-      SELECT id, owner_principal, client_name, allowed_agent_ids, revoked, created_at
-      FROM clients
+      SELECT client_id, id, owner_principal, name, revoked, created_at
+      FROM agents
       ORDER BY created_at DESC
     `;
   });
@@ -289,16 +258,17 @@ export async function listClientsForOwner(
   }
 
   return rows.map((r) => ({
-    client_id: r.id as string,
-    client_name: r.client_name as string,
+    client_id: r.client_id as string,
+    agent_id: r.id as string,
+    client_name: r.name as string,
     owner_principal: r.owner_principal as string,
-    allowed_agent_ids: (r.allowed_agent_ids as string[]) ?? [],
+    allowed_agent_ids: [r.id as string],
     revoked: r.revoked as boolean,
     created_at:
       r.created_at instanceof Date
         ? r.created_at.toISOString()
         : (r.created_at as string),
-    connected: connectedClientIds.has(r.id as string),
+    connected: connectedClientIds.has(r.client_id as string),
   }));
 }
 
@@ -326,7 +296,7 @@ async function resolveClient(
   // so any string can in principle be an id.
   const byId = await db.begin(async (tx) => {
     await setRlsContext(tx, principalId);
-    return tx`SELECT id, client_name FROM clients WHERE id = ${target}`;
+    return tx`SELECT client_id AS id, name AS client_name FROM agents WHERE client_id = ${target} OR id = ${target}`;
   });
   if (byId.length === 1) {
     return { id: byId[0].id as string, client_name: byId[0].client_name as string };
@@ -334,7 +304,7 @@ async function resolveClient(
 
   const byName = await db.begin(async (tx) => {
     await setRlsContext(tx, principalId);
-    return tx`SELECT id, client_name FROM clients WHERE client_name = ${target}`;
+    return tx`SELECT client_id AS id, name AS client_name FROM agents WHERE name = ${target}`;
   });
   if (byName.length === 0) {
     throw new AdminApiError(`No client found matching "${target}".`, 404);
@@ -365,7 +335,16 @@ export async function revokeClientForOwner(
     // inside will succeed (or NOT FOUND if a concurrent delete happened, in
     // which case the function raises — we let that propagate as 500 because
     // it's a genuinely unexpected race, not a user-facing error condition).
-    await tx`SELECT revoke_client(${resolved.id})`;
+    await tx`
+      UPDATE agents
+      SET revoked = TRUE, updated_at = now()
+      WHERE client_id = ${resolved.id}
+    `;
+    await tx`
+      UPDATE clients
+      SET revoked = TRUE
+      WHERE id = ${resolved.id}
+    `;
   });
 
   // Close every live WebSocket session bound to this client. The daemon

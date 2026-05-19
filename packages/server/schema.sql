@@ -231,6 +231,65 @@ COMMENT ON COLUMN clients.token_hash IS E'@omit';
 -- Clients must be created through register_client() which generates the token.
 COMMENT ON TABLE clients IS E'@omit create';
 
+-- ============================================================
+-- 3b. Agents table (unified server-side persistence model)
+-- ============================================================
+-- Source of truth for one operator-facing agent registration. The legacy
+-- `clients` and `agent_policies` tables are kept for compatibility during the
+-- migration, but server runtime paths should prefer this table.
+CREATE TABLE IF NOT EXISTS agents (
+  id                TEXT PRIMARY KEY,
+  client_id         TEXT NOT NULL UNIQUE DEFAULT gen_random_uuid()::text,
+  owner_principal   TEXT NOT NULL,
+  owner_email       TEXT,
+  name              TEXT NOT NULL,
+  token_hash        TEXT NOT NULL UNIQUE,
+  allowed_callers   TEXT[] NOT NULL DEFAULT '{}',
+  revoked           BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS owner_email TEXT;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS client_id TEXT UNIQUE DEFAULT gen_random_uuid()::text;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS allowed_callers TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+UPDATE agents SET client_id = gen_random_uuid()::text WHERE client_id IS NULL;
+ALTER TABLE agents ALTER COLUMN client_id SET NOT NULL;
+
+ALTER TABLE agents ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS agents_select ON agents;
+CREATE POLICY agents_select ON agents
+  FOR SELECT TO app_authenticated
+  USING (owner_principal = current_principal() OR is_admin());
+
+DROP POLICY IF EXISTS agents_insert ON agents;
+CREATE POLICY agents_insert ON agents
+  FOR INSERT TO app_authenticated
+  WITH CHECK (owner_principal = current_principal() OR is_admin());
+
+DROP POLICY IF EXISTS agents_update ON agents;
+CREATE POLICY agents_update ON agents
+  FOR UPDATE TO app_authenticated
+  USING (owner_principal = current_principal() OR is_admin())
+  WITH CHECK (owner_principal = current_principal() OR is_admin());
+
+DROP POLICY IF EXISTS agents_delete ON agents;
+CREATE POLICY agents_delete ON agents
+  FOR DELETE TO app_authenticated
+  USING (owner_principal = current_principal() OR is_admin());
+
+DROP POLICY IF EXISTS agents_postgraphile ON agents;
+CREATE POLICY agents_postgraphile ON agents
+  FOR ALL TO app_postgraphile
+  USING (true)
+  WITH CHECK (true);
+
+COMMENT ON COLUMN agents.token_hash IS E'@omit';
+COMMENT ON TABLE agents IS E'@omit create';
+
 -- ------------------------------------------------------------
 -- 3a. Client CRUD mutations (exposed by PostGraphile)
 -- ------------------------------------------------------------
@@ -284,6 +343,21 @@ CREATE TRIGGER clients_assert_no_reserved_agent_ids
   BEFORE INSERT OR UPDATE OF allowed_agent_ids ON clients
   FOR EACH ROW EXECUTE FUNCTION trg_clients_assert_no_reserved_agent_ids();
 
+CREATE OR REPLACE FUNCTION trg_agents_assert_no_reserved_agent_id()
+RETURNS TRIGGER
+  LANGUAGE plpgsql
+AS $$
+BEGIN
+  PERFORM assert_no_reserved_agent_ids(ARRAY[NEW.id]);
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS agents_assert_no_reserved_agent_id ON agents;
+CREATE TRIGGER agents_assert_no_reserved_agent_id
+  BEFORE INSERT OR UPDATE OF id ON agents
+  FOR EACH ROW EXECUTE FUNCTION trg_agents_assert_no_reserved_agent_id();
+
 -- Token-carrying return type for register / rotate.
 -- Wrapped in DO so the migration is idempotent.
 DO $$ BEGIN
@@ -318,9 +392,15 @@ DECLARE
   v_raw_token  TEXT;
   v_token_hash TEXT;
   v_owner      TEXT;
+  v_agent_id   TEXT;
+  v_client_id  TEXT;
   v_row        client_with_token;
 BEGIN
   PERFORM assert_no_reserved_agent_ids(register_client.allowed_agent_ids);
+  IF COALESCE(array_length(register_client.allowed_agent_ids, 1), 0) <> 1 THEN
+    RAISE EXCEPTION 'exactly one allowed_agent_id is required';
+  END IF;
+  v_agent_id := register_client.allowed_agent_ids[1];
 
   v_raw_token  := encode(gen_random_bytes(32), 'hex');
   v_token_hash := encode(digest(v_raw_token, 'sha256'), 'hex');
@@ -334,14 +414,29 @@ BEGIN
     v_owner := current_principal();
   END IF;
 
-  INSERT INTO clients AS c (owner_principal, client_name, token_hash, allowed_agent_ids)
+  INSERT INTO agents AS a (id, owner_principal, name, token_hash)
   VALUES (
+    v_agent_id,
+    v_owner,
+    register_client.client_name,
+    v_token_hash
+  )
+  RETURNING a.client_id INTO v_client_id;
+
+  -- Compatibility shadow for existing GraphQL clients and direct SQL tooling.
+  INSERT INTO clients AS c (id, owner_principal, client_name, token_hash, allowed_agent_ids)
+  VALUES (
+    v_client_id,
     v_owner,
     register_client.client_name,
     v_token_hash,
-    COALESCE(register_client.allowed_agent_ids, '{}')
+    ARRAY[v_agent_id]
   )
-  RETURNING c.id, c.owner_principal, c.client_name, c.allowed_agent_ids, c.revoked, c.created_at, v_raw_token
+  ON CONFLICT (id) DO NOTHING;
+
+  SELECT v_client_id, a.owner_principal, a.name, ARRAY[a.id], a.revoked, a.created_at, v_raw_token
+  FROM agents a
+  WHERE a.id = v_agent_id
   INTO v_row;
 
   RETURN v_row;
@@ -361,8 +456,12 @@ AS $$
 DECLARE
   v_row clients;
 BEGIN
+  UPDATE agents AS a SET revoked = TRUE, updated_at = now()
+  WHERE a.client_id = revoke_client.client_id OR a.id = revoke_client.client_id;
+
   UPDATE clients AS c SET revoked = TRUE
   WHERE c.id = revoke_client.client_id
+     OR c.id = (SELECT client_id FROM agents WHERE id = revoke_client.client_id)
   RETURNING c.* INTO v_row;
 
   IF NOT FOUND THEN
@@ -385,8 +484,12 @@ AS $$
 DECLARE
   v_row clients;
 BEGIN
+  UPDATE agents AS a SET revoked = FALSE, updated_at = now()
+  WHERE a.client_id = unrevoke_client.client_id OR a.id = unrevoke_client.client_id;
+
   UPDATE clients AS c SET revoked = FALSE
   WHERE c.id = unrevoke_client.client_id
+     OR c.id = (SELECT client_id FROM agents WHERE id = unrevoke_client.client_id)
   RETURNING c.* INTO v_row;
 
   IF NOT FOUND THEN
@@ -415,9 +518,14 @@ BEGIN
   v_raw_token  := encode(gen_random_bytes(32), 'hex');
   v_token_hash := encode(digest(v_raw_token, 'sha256'), 'hex');
 
+  UPDATE agents AS a
+  SET token_hash = v_token_hash, updated_at = now()
+  WHERE a.client_id = rotate_client_token.client_id OR a.id = rotate_client_token.client_id;
+
   UPDATE clients AS c
   SET token_hash = v_token_hash
   WHERE c.id = rotate_client_token.client_id
+     OR c.id = (SELECT client_id FROM agents WHERE id = rotate_client_token.client_id)
   RETURNING c.id, c.owner_principal, c.client_name, c.allowed_agent_ids, c.revoked, c.created_at, v_raw_token
   INTO v_row;
 
@@ -432,7 +540,8 @@ $$;
 COMMENT ON FUNCTION rotate_client_token(TEXT) IS
   'Issue a new bearer token for a client. Returns the raw token — shown only once. Previous tokens are immediately invalidated for new connections.';
 
--- Replace the allowed_agent_ids list on a client.
+-- Compatibility wrapper for replacing the single agent id bound to a legacy
+-- client registration.
 CREATE OR REPLACE FUNCTION update_client_allowed_agents(
   client_id         TEXT,
   allowed_agent_ids TEXT[]
@@ -442,12 +551,29 @@ CREATE OR REPLACE FUNCTION update_client_allowed_agents(
 AS $$
 DECLARE
   v_row clients;
+  v_target_client_id TEXT;
 BEGIN
   PERFORM assert_no_reserved_agent_ids(update_client_allowed_agents.allowed_agent_ids);
+  IF COALESCE(array_length(update_client_allowed_agents.allowed_agent_ids, 1), 0) <> 1 THEN
+    RAISE EXCEPTION 'exactly one allowed_agent_id is required';
+  END IF;
+
+  SELECT a.client_id INTO v_target_client_id
+  FROM agents a
+  WHERE a.client_id = update_client_allowed_agents.client_id
+     OR a.id = update_client_allowed_agents.client_id;
+
+  IF v_target_client_id IS NULL THEN
+    RAISE EXCEPTION 'client not found or not authorized: %', update_client_allowed_agents.client_id;
+  END IF;
+
+  UPDATE agents AS a
+  SET id = update_client_allowed_agents.allowed_agent_ids[1], updated_at = now()
+  WHERE a.client_id = v_target_client_id;
 
   UPDATE clients AS c
-  SET allowed_agent_ids = COALESCE(update_client_allowed_agents.allowed_agent_ids, '{}')
-  WHERE c.id = update_client_allowed_agents.client_id
+  SET allowed_agent_ids = update_client_allowed_agents.allowed_agent_ids
+  WHERE c.id = v_target_client_id
   RETURNING c.* INTO v_row;
 
   IF NOT FOUND THEN
@@ -459,7 +585,7 @@ END;
 $$;
 
 COMMENT ON FUNCTION update_client_allowed_agents(TEXT, TEXT[]) IS
-  'Replace the allowed_agent_ids list on a client.';
+  'Compatibility wrapper for replacing the single agent id bound to a client registration.';
 
 -- ============================================================
 -- 4. Infra schema (not exposed via PostGraphile / GraphQL)
@@ -508,8 +634,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_policies_client_id
 
 ALTER TABLE agent_policies ENABLE ROW LEVEL SECURITY;
 
--- agent_policies rows are server-managed (auto-created on WS registration).
--- Only expose SELECT to authenticated users; all mutations go through custom tools.
+-- Legacy compatibility table. New server runtime paths use agents.allowed_callers.
+-- Keep this hidden from generated mutations while old databases migrate.
 COMMENT ON TABLE agent_policies IS E'@omit create,update,delete';
 COMMENT ON COLUMN agent_policies.allowed_callers IS E'@omit create,update';
 
@@ -547,14 +673,42 @@ CREATE POLICY agent_policies_postgraphile ON agent_policies
   USING (true)
   WITH CHECK (true);
 
+-- One-time compatibility backfill. Legacy rows allowed multiple agent ids per
+-- client token; the new model is 1:1 and the daemon config only stores one
+-- agent_id, so we migrate the first allowed id as the persisted agent id.
+INSERT INTO agents (
+  id,
+  client_id,
+  owner_principal,
+  owner_email,
+  name,
+  token_hash,
+  allowed_callers,
+  revoked,
+  created_at,
+  updated_at
+)
+SELECT
+  c.allowed_agent_ids[1],
+  c.id,
+  c.owner_principal,
+  c.owner_email,
+  c.client_name,
+  c.token_hash,
+  COALESCE(ap.allowed_callers, '{}'),
+  c.revoked,
+  c.created_at,
+  COALESCE(ap.updated_at, c.created_at)
+FROM clients c
+LEFT JOIN agent_policies ap ON ap.agent_id = c.allowed_agent_ids[1]
+WHERE array_length(c.allowed_agent_ids, 1) >= 1
+ON CONFLICT (id) DO NOTHING;
+
 -- ------------------------------------------------------------
 -- 5a. Agent id availability probe
 -- ------------------------------------------------------------
--- registerClient() accepts an allowed_agent_ids list but does not verify that
--- the ids are free — collisions surface only at first WS register
--- (packages/server/src/ws.ts ensureAgentPolicy → 'agent id owned by a
--- different principal'), by which point the CLIENT_TOKEN has already been
--- issued and rotation is needed. agent_policies_select RLS also hides rows
+-- registerClient() accepts the legacy allowed_agent_ids list but now requires
+-- exactly one id and writes it to agents.id. agents_select RLS hides rows
 -- owned by other principals, so a non-admin cannot distinguish 'free' from
 -- 'taken by someone else' with a direct query.
 --
@@ -569,7 +723,7 @@ CREATE OR REPLACE FUNCTION agent_id_available(agent_id TEXT)
   -- pg_catalog first, public second, and pg_temp is intentionally absent:
   -- with pg_temp in the path any role that can CREATE TEMP could shadow an
   -- unqualified reference and hijack a definer-privileged resolution. The
-  -- function schema-qualifies agent_policies for the same reason.
+  -- function schema-qualifies agents for the same reason.
   SET search_path = pg_catalog, public
 AS $$
 BEGIN
@@ -582,8 +736,8 @@ BEGIN
       USING ERRCODE = 'invalid_parameter_value';
   END IF;
   RETURN NOT EXISTS(
-    SELECT 1 FROM public.agent_policies ap
-    WHERE ap.agent_id = agent_id_available.agent_id
+    SELECT 1 FROM public.agents a
+    WHERE a.id = agent_id_available.agent_id
   );
 END;
 $$;
@@ -591,12 +745,12 @@ $$;
 -- Schema setup runs as a superuser, so without an explicit ALTER OWNER the
 -- definer context would be superuser — overkill for reading one table and a
 -- latent escalation surface for future edits. app_postgraphile already has
--- the RLS-bypass policy on agent_policies, which is exactly (and only) what
--- this function needs to cross-principal SELECT.
+-- the RLS-bypass policy on agents, which is exactly (and only) what this
+-- function needs to cross-principal SELECT.
 ALTER FUNCTION agent_id_available(TEXT) OWNER TO app_postgraphile;
 
 COMMENT ON FUNCTION agent_id_available(TEXT) IS
-  'Check whether an agent_id is free to claim. Returns true when no agent_policies row holds the id, false when any principal (including the caller) already owns it. Never exposes owner_principal or other metadata — boolean only. Intended as a pre-registration probe so callers can avoid issuing a CLIENT_TOKEN bound to an agent id that the WS register step would reject.';
+  'Check whether an agent_id is free to claim. Returns true when no agents row holds the id, false when any principal (including the caller) already owns it. Never exposes owner_principal or other metadata — boolean only.';
 
 -- ============================================================
 -- 6. Session tokens: opaque tokens issued via SIWE / device flow

@@ -1,4 +1,4 @@
-// Principal string parsing and matching for agent_policies.allowed_callers.
+// Principal string parsing and matching for agents.allowed_callers.
 //
 // Format:
 //   eth:0x<40 hex>              SIWE-authenticated Ethereum address

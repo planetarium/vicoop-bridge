@@ -298,9 +298,9 @@ runtime config (#189 §5) — secrets and overrides live in `config.json`
 If you omit `--caller`, `setup` succeeds but prints a warning that the
 agent will be public until you restrict callers:
 
-> `setup --caller` requires a bridge server version that can pre-create
-> `agent_policies` for registered client agent ids. If you are testing against
-> your own deployment, deploy the matching server/schema before this step.
+> `setup --caller` requires a bridge server version that stores caller
+> allowlists on registered agents. If you are testing against your own
+> deployment, deploy the matching server/schema before this step.
 
 > ⚠ The `CLIENT_TOKEN` is unrecoverable after this single output.
 > `config.json` is the only place it persists; back it up if you need to
@@ -322,11 +322,11 @@ stdout):
 CLIENT_TOKEN=$(jq -r .client_token /tmp/vicoop-setup.json)
 ```
 
-`--agent-ids` is a comma-separated allowlist. Include every id you plan to
-run under this single token if you know them up front; amend later via
-the `updateClientAllowedAgents` GraphQL mutation (backed by
-`update_client_allowed_agents()` in `schema.sql`) without issuing a new
-token.
+`--agent-ids` is a legacy plural flag, but the current server model is
+1:1: one setup call creates one agent registration and the flag must contain
+exactly one id. To change that id later, use the `updateClientAllowedAgents`
+GraphQL compatibility mutation (backed by `update_client_allowed_agents()`
+in `schema.sql`) without issuing a new token.
 
 ### What login and setup do
 
@@ -447,7 +447,7 @@ you can copy the mention / acct / agent-card URL from here directly:
 
 After that:
 
-- The bridge loads the `agent_policies` row for your agent. If Step 4 setup
+- The bridge loads the `allowed_callers` list for your agent. If Step 4 setup
   included `--caller`, that allowlist is already in place; otherwise
   `allowed_callers` is empty, meaning **publicly callable** until you restrict it.
 - `POST $BRIDGE_URL/agents/$AGENT_ID` with a JSON-RPC `message/send` payload
@@ -782,12 +782,10 @@ section of `docs/local-testing.md` for the same note.
 ## Troubleshooting
 
 - **`agent id owned by a different principal`** (WS register) — your
-  principal is not the `owner_principal` on the existing `agent_policies`
-  row. Pick a different `agent_id`, amend the existing client's allowlist
-  via `updateClientAllowedAgents` (no token rotation), and restart
-  `vicoop-client` with the new `AGENT_ID`. Re-run Step 4 only if you
-  intentionally want a new client/token; otherwise sign in from the
-  original owner.
+  principal is not the `owner_principal` on the existing agent registration.
+  Pick a different `agent_id`, or sign in from the original owner before
+  changing that registration. Re-run Step 4 only if you intentionally want a
+  new client/token.
 
 - **`permission denied for function register_client`** (or similar) on
   GraphQL — the caller token was missing, malformed, or expired, so the
@@ -800,17 +798,16 @@ section of `docs/local-testing.md` for the same note.
   browser approval is delayed past that, re-run `login`; the previous
   device code is invalidated automatically.
 
-- **Client reconnects but `/agents/:id` returns 404** — the
-  `agent_policies` row exists but no WS session is live. Check the client
-  log; the row is re-used on reconnect but dispatch requires an active
-  session.
+- **Client reconnects but `/agents/:id` returns 404** — the agent
+  registration exists but no WS session is live. Check the client log;
+  dispatch requires an active session.
 
 - **Lost the `CLIENT_TOKEN`** — the raw value is unrecoverable, but you
   don't need to create a new client identity. Rotate the token in place
   via the `rotateClientToken` GraphQL mutation (backed by
   `rotate_client_token()` in `schema.sql`): it mints a fresh raw token for
-  the existing `clients` row and invalidates the old hash, so your
-  `allowedAgentIds` and `agent_policies` carry over. Re-run Step 4 only if
+  the existing agent registration and invalidates the old hash, so your
+  agent id and caller allowlist carry over. Re-run Step 4 only if
   you intentionally want a new client identity; in that case the old
   `clients` row can be revoked from the CLI — see
   [Inspecting and revoking your clients](#inspecting-and-revoking-your-clients).
@@ -827,9 +824,10 @@ vicoop-client list-clients
 ```
 
 Columns are `client_id`, `client_name`, `allowed_agent_ids`, `revoked`,
-`connected`, `created_at`. The `connected` flag reflects in-memory
-registry state, so a row with `connected: false` is exactly the kind of
-orphan you want to clean up.
+`connected`, `created_at` (newer servers may also include `agent_id` in
+JSON output). The `connected` flag reflects in-memory registry state, so a
+row with `connected: false` is exactly the kind of orphan you want to clean
+up.
 
 To revoke a client — and disconnect its live WebSocket if one is bound —
 use either the UUID `client_id` or a unique `client_name`:
@@ -838,9 +836,8 @@ use either the UUID `client_id` or a unique `client_name`:
 vicoop-client revoke-client <client-id-or-name>
 ```
 
-- A revoked client's row is kept (`revoked = true`) so audit history
-  survives; existing `agent_policies` cascade-deleted only when the
-  underlying row is later hard-deleted.
+- A revoked client's compatibility row is kept (`revoked = true`) so audit
+  history survives.
 - A unique name resolves automatically; an ambiguous name exits non-zero
   with a list of matching `client_id`s so you can retry with the id.
 - If the daemon is alive at the moment of revocation, its WebSocket is
