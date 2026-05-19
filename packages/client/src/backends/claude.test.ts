@@ -1929,7 +1929,7 @@ test('tryParseToolCallsEnvelope: rejects prose, non-objects, and missing tool_ca
   assert.equal(tryParseToolCallsEnvelope('{"tool_calls":'), null);
 });
 
-test('spawn argv carries --append-system-prompt with the tool envelope when metadata is present', async () => {
+test('spawn argv carries --append-system-prompt with the native directive when metadata is present', async () => {
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
@@ -1937,7 +1937,12 @@ test('spawn argv carries --append-system-prompt with the tool envelope when meta
     ],
     exitCode: 0,
   });
-  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    // Skip the real HTTP listener — the assertion targets argv composition,
+    // not the running MCP server.
+    onCallerToolsMcpReady: () => {},
+  });
   const { emit } = collect();
   await backend.handle(
     assignWithOpenAICompat('what is the weather?', {
@@ -1952,17 +1957,23 @@ test('spawn argv carries --append-system-prompt with the tool envelope when meta
   const args = fake.lastChild()?.args ?? [];
   // The flag occurs at least once (operator can pass additional ones via
   // extraArgs; identity-injecting variant may also fire). The openai-compat
-  // value is identified by the tool-envelope contract phrase.
+  // value carries the user's `system` text plus the native-dispatch directive
+  // — NOT the old envelope JSON contract, which #213 removed.
   const idx = args.findIndex(
     (a, i) =>
       args[i - 1] === '--append-system-prompt' &&
       typeof a === 'string' &&
-      a.includes('"tool_calls":[{"id":"call_<unique>"'),
+      a.includes('You are concise.'),
   );
-  assert.ok(idx >= 0, 'expected --append-system-prompt carrying the tool envelope');
-  // User system precedes the envelope contract in that same value.
-  assert.match(args[idx] as string, /You are concise\./);
-  assert.match(args[idx] as string, /"name": "get_weather"/);
+  assert.ok(idx >= 0, 'expected --append-system-prompt carrying the openai-compat system text');
+  // Native directive present (stop-after-invoke + history-reading rules).
+  assert.match(args[idx] as string, /After invoking one of these caller-provided tools/);
+  assert.match(args[idx] as string, /<tool_call_history>/);
+  // Envelope contract phrase MUST NOT appear under #213.
+  assert.equal(
+    (args[idx] as string).includes('"tool_calls":[{"id":"call_<unique>"'),
+    false,
+  );
 });
 
 test('absent metadata → no openai-compat --append-system-prompt is injected', async () => {
@@ -2062,64 +2073,6 @@ test('tool_choice="none" suppresses `--tools ""` even when `tools` are present',
 
   const args = fake.lastChild()?.args ?? [];
   assert.equal(args.includes('--tools'), false);
-});
-
-test('assistant {"tool_calls":[...]} reply becomes a data-part artifact when extension is active', async () => {
-  const envelope = {
-    tool_calls: [
-      { id: 'call_abc', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
-    ],
-  };
-  const fake = scriptedSpawn({
-    lines: [
-      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
-      JSON.stringify({
-        type: 'assistant',
-        message: {
-          role: 'assistant',
-          content: [{ type: 'text', text: JSON.stringify(envelope) }],
-        },
-      }),
-      JSON.stringify({ type: 'result', subtype: 'success', result: JSON.stringify(envelope) }),
-    ],
-    exitCode: 0,
-  });
-
-  const backend = createClaudeBackend({ spawn: fake.spawn });
-  const { emit, frames } = collect();
-  await backend.handle(
-    assignWithOpenAICompat('what is the weather in Seoul?', { tools: SAMPLE_TOOLS }),
-    emit,
-    NEVER,
-  );
-
-  const artifacts = frames.filter(
-    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
-  );
-  assert.equal(artifacts.length, 1);
-  const part = artifacts[0].artifact.parts[0];
-  assert.equal(part.kind, 'data');
-  if (part.kind !== 'data') throw new Error('expected data part');
-  assert.deepEqual(part.data, envelope);
-  // Artifact carries the extension URI so downstream filters can route on it.
-  assert.deepEqual(artifacts[0].artifact.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
-
-  // The envelope is the complete task output and must NOT be re-stamped on
-  // status.message.parts: per A2A "Messages SHOULD NOT be used to deliver
-  // task outputs", and downstream gateways (oai2a2a) used to re-parse the
-  // text part as tool_calls, double-emitting them and corrupting OpenAI
-  // streaming clients. See issue #200.
-  const complete = frames.find((f) => f.type === 'task.complete');
-  assert.ok(complete && complete.type === 'task.complete');
-  const messageParts = complete.status.message?.parts ?? [];
-  for (const p of messageParts) {
-    if (p.kind !== 'text') continue;
-    assert.equal(
-      p.text.includes('"tool_calls"'),
-      false,
-      'status.message.parts must not echo the openai-compat envelope JSON',
-    );
-  }
 });
 
 test('non-envelope assistant text still streams as a text artifact under the extension', async () => {
@@ -2554,9 +2507,11 @@ test('zero cacheRead does not surface a cached_tokens breakdown', async () => {
 
 // ---------------------------------------------------------------------------
 // Native MCP dispatch (#213) — claude analog of codex's #212/dynamicTools.
-// The envelope path stays the default; these tests cover the new path that
-// activates when `nativeToolDispatch: true` is passed to the backend AND the
-// caller has supplied openai-compat tools.
+// The native path is the only dispatch for openai-compat caller tools on the
+// claude backend; the JSON-text envelope path (#208) was removed wholesale
+// because it never actually worked reliably under load (#207). The helpers
+// `buildOpenAICompatSystemPrompt` and `tryParseToolCallsEnvelope` are still
+// exported from claude.ts for openclaw, which has no MCP-tools equivalent.
 // ---------------------------------------------------------------------------
 
 // Unit cover for the OpenAI → CallerToolDefinition mapping. The MCP server
@@ -2723,11 +2678,11 @@ test('caller-tools MCP: onInvoke throw is wrapped as isError ack (#213)', async 
   }
 });
 
-// Argv composition: with `nativeToolDispatch: true` and caller tools the
+// Argv composition: when openai-compat caller tools are present the
 // argv must (a) include a `--mcp-config` with a `caller-tools` server,
 // (b) carry the native system prompt (no envelope contract substring),
 // (c) still pass `--tools ""` to suppress claude's built-ins.
-test('argv: nativeToolDispatch wires caller-tools MCP + native prompt + --tools "" (#213)', async () => {
+test('argv: openai-compat caller tools wire caller-tools MCP + native prompt + --tools "" (#213)', async () => {
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' }),
@@ -2735,20 +2690,12 @@ test('argv: nativeToolDispatch wires caller-tools MCP + native prompt + --tools 
     ],
     exitCode: 0,
   });
-  const backend = createClaudeBackend({
-    spawn: fake.spawn,
-    nativeToolDispatch: true,
-    // Test seam: bind no HTTP listener (would leak ports across tests),
-    // but capture the running server handle for follow-up assertions.
-    onCallerToolsMcpReady: () => {
-      /* presence assertion below */
-    },
-  });
 
   let capturedServer: unknown = null;
   const backend2 = createClaudeBackend({
     spawn: fake.spawn,
-    nativeToolDispatch: true,
+    // Test seam: bind no HTTP listener (would leak ports across tests),
+    // but capture the running server handle for follow-up assertions.
     onCallerToolsMcpReady: (s) => {
       capturedServer = s;
     },
@@ -2807,14 +2754,12 @@ test('argv: nativeToolDispatch wires caller-tools MCP + native prompt + --tools 
   assert.equal(prompt.includes('{"tool_calls"'), false);
   assert.ok(prompt.startsWith('be terse'));
 
-  // (c) --tools "" still passed (same gate as envelope path — caller
-  // tools should be the ONLY tool surface available to the model).
+  // (c) --tools "" still passed (caller tools should be the ONLY tool
+  // surface available to the model — native MCP-mapped tools, no
+  // claude built-ins; #178's original concern).
   const toolsIdx = args.indexOf('--tools');
   assert.notEqual(toolsIdx, -1);
   assert.equal(args[toolsIdx + 1], '');
-
-  // Use the unused first backend so the variable isn't dead.
-  void backend;
 });
 
 // End-to-end (with test seam): the model "invokes" the caller tool via
@@ -2842,7 +2787,6 @@ test('native dispatch: tool invocation emits tool_calls artifact + suppresses fi
   const { emit, frames } = collect();
   const backend = createClaudeBackend({
     spawn: fake.spawn,
-    nativeToolDispatch: true,
     onCallerToolsMcpReady: async (server) => {
       // Drive the synthetic tool call. The bridge's onInvoke captures
       // this and emits the tool_calls artifact.
@@ -2968,7 +2912,6 @@ test('native dispatch: --max-turns 1 exits with code 1; bridge maps to completed
   const { emit, frames } = collect();
   const backend = createClaudeBackend({
     spawn: fake.spawn,
-    nativeToolDispatch: true,
     onCallerToolsMcpReady: async (server) => {
       // Drive the synthetic tool call.
       await server.invokeForTest({
@@ -3050,7 +2993,6 @@ test('native dispatch: exit-code-1 with NO tool capture still fails (#213)', asy
   const { emit, frames } = collect();
   const backend = createClaudeBackend({
     spawn: fake.spawn,
-    nativeToolDispatch: true,
   });
 
   await backend.handle(
@@ -3084,60 +3026,26 @@ test('native dispatch: exit-code-1 with NO tool capture still fails (#213)', asy
   }
 });
 
-// nativeToolDispatch:false (the default) preserves the envelope path
-// bit-for-bit — same argv, same prompt, same artifact emission. Belt-and-
-// suspenders against accidentally flipping the new path on for every
-// caller.
-test('native dispatch off: envelope path unchanged (#213)', async () => {
-  const envelope = JSON.stringify({
-    tool_calls: [{ id: 'c', function: { name: 'fetch', arguments: '{}' } }],
-  });
+// Without an openai-compat `tools` field, no caller-tools MCP is stood
+// up and none of the native-dispatch argv (`--mcp-config caller-tools`,
+// `--max-turns 1`, native system prompt) attaches. Guards against the
+// new path leaking into plain claude tasks.
+test('no openai-compat tools → no native dispatch argv (#213)', async () => {
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' }),
       JSON.stringify({
         type: 'assistant',
-        message: { role: 'assistant', content: [{ type: 'text', text: envelope }] },
+        message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] },
       }),
-      JSON.stringify({ type: 'result', subtype: 'success', result: envelope }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'hi' }),
     ],
     exitCode: 0,
   });
-  // No nativeToolDispatch:true here — envelope path stays in force.
   const backend = createClaudeBackend({ spawn: fake.spawn });
   const { emit, frames } = collect();
-  await backend.handle(
-    {
-      ...assign('hi'),
-      message: {
-        role: 'user',
-        messageId: 'm',
-        parts: [{ kind: 'text', text: 'hi' }],
-        metadata: {
-          [OPENAI_COMPAT_EXTENSION_URI]: {
-            tools: [
-              { type: 'function', function: { name: 'fetch' } },
-            ],
-          },
-        },
-      },
-    },
-    emit,
-    NEVER,
-  );
+  await backend.handle(assign('hi'), emit, NEVER);
 
-  // The envelope-shaped agent message must still surface as a data part
-  // (existing behaviour — tested elsewhere too; this assertion guards
-  // the off-by-default invariant specifically).
-  const dataArt = frames.find(
-    (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
-      f.type === 'task.artifact' &&
-      f.artifact.parts[0]?.kind === 'data',
-  );
-  assert.ok(dataArt, 'envelope path emits data part as before');
-
-  // Argv has NO `caller-tools` server. The legacy envelope path
-  // doesn't bring up the MCP impersonation server at all.
   const child = fake.lastChild()!;
   const cfgIdx = child.args.indexOf('--mcp-config');
   if (cfgIdx !== -1) {
@@ -3146,4 +3054,11 @@ test('native dispatch off: envelope path unchanged (#213)', async () => {
     };
     assert.equal(cfg.mcpServers?.['caller-tools'], undefined);
   }
+  assert.equal(child.args.indexOf('--max-turns'), -1);
+  // Built-in tools stay enabled (no `--tools ""`) so claude can operate
+  // normally on a plain text prompt.
+  assert.equal(child.args.indexOf('--tools'), -1);
+  // Non-extension task should reach task.complete normally.
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.complete');
 });

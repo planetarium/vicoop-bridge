@@ -3,8 +3,8 @@
 // `main()` at the bottom of cli.ts.
 
 import { object } from '@optique/core/constructs';
-import { optional, withDefault } from '@optique/core/modifiers';
-import { flag, option } from '@optique/core/primitives';
+import { optional } from '@optique/core/modifiers';
+import { option } from '@optique/core/primitives';
 import { message } from '@optique/core/message';
 import { choice, integer, string } from '@optique/core/valueparser';
 import { parse } from '@optique/core/parser';
@@ -77,9 +77,6 @@ export const daemonFlagsFields = {
   claudeSettingsFile: optional(option('--claude-settings-file', string({ metavar: 'PATH' }), {
     description: message`Path to a JSON file used as Claude \`--settings\`.`,
   })),
-  claudeNativeToolDispatch: withDefault(flag('--claude-native-tool-dispatch', {
-    description: message`Expose openai-compat caller tools as native MCP tools instead of the JSON envelope (#213). Off by default; flip on to test the new path against your traffic.`,
-  }), false),
 
   // Backend-specific (Codex)
   codexCwd: optional(option('--codex-cwd', string({ metavar: 'PATH' }), {
@@ -126,7 +123,6 @@ export interface DaemonArgs {
   // env when set; merge logic in cli.ts threads them into backend factories.
   claudeCwd?: string;
   claudeSettingsFile?: string;
-  claudeNativeToolDispatch?: boolean;
   codexCwd?: string;
   codexSandbox?: CodexSandboxMode;
   openclawGateway?: string;
@@ -204,11 +200,6 @@ export function mergeClientArgs(
     backends: config.backends,
     claudeCwd: pick(flags.claudeCwd) || backends.claude?.cwd || undefined,
     claudeSettingsFile: pick(flags.claudeSettingsFile) || undefined,
-    // Flag wins over config, default false. Boolean flag → either truthy
-    // (operator set it on argv) or fall through to config / default.
-    claudeNativeToolDispatch:
-      flags.claudeNativeToolDispatch ||
-      backends.claude?.native_tool_dispatch === true,
     codexCwd: pick(flags.codexCwd) || backends.codex?.cwd || undefined,
     codexSandbox:
       flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),

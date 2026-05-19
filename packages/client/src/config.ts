@@ -102,14 +102,6 @@ export function defaultOwnerSessionPath(): string {
 export interface ClaudeBackendConfig {
   cwd?: string;
   settings?: Record<string, unknown>;
-  /**
-   * Opt-in native MCP dispatch for openai-compat caller tools (#213). When
-   * true, the claude backend exposes caller-supplied `tools` as native MCP
-   * tools (via an in-process `caller-tools` MCP server) instead of teaching
-   * the model the JSON-text envelope contract. Default false — flip on
-   * after validating against the operator's traffic shape.
-   */
-  native_tool_dispatch?: boolean;
 }
 
 export interface CodexBackendConfig {
