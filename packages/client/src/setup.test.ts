@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { saveOwnerSession } from './owner-session.js';
-import { runSetup, type SetupArgs } from './setup.js';
+import { runAgentRegister, runSetup, type AgentRegisterArgs, type SetupArgs } from './setup.js';
 import { readConfig } from './config.js';
 
 // `runSetup` now takes the parser's discriminated-union output. Tests
@@ -16,7 +16,7 @@ function setupArgs(
 ): SetupArgs {
   const {
     clientName, allowedAgentIds,
-    callers = [], envFile, envFileAlias, bridge, token, json = false,
+    callers = [], envFile, envFileAlias, server, token, json = false,
   } = p;
   return {
     action: 'setup',
@@ -25,7 +25,7 @@ function setupArgs(
     callers,
     envFile,
     envFileAlias,
-    bridge,
+    server,
     token,
     json,
   };
@@ -296,9 +296,9 @@ test('setup requires explicit bridge and token to be passed together', async (t)
   assert.equal(await runSetup(setupArgs({
     clientName: 'test client',
     allowedAgentIds: ['agent-1'],
-    bridge: 'https://other-bridge.test',
+    server: 'https://other-bridge.test',
   })), 1);
-  assert.match(stderr, /Pass --bridge and --token together/);
+  assert.match(stderr, /Pass --server and --token together/);
 
   stderr = '';
   assert.equal(await runSetup(setupArgs({
@@ -306,7 +306,7 @@ test('setup requires explicit bridge and token to be passed together', async (t)
     allowedAgentIds: ['agent-1'],
     token: 'vbc_owner_other',
   })), 1);
-  assert.match(stderr, /Pass --bridge and --token together/);
+  assert.match(stderr, /Pass --server and --token together/);
 });
 
 test('setup prompts for login when no owner-session is available', async (t) => {
@@ -352,7 +352,7 @@ test('setup prompts for login when no owner-session is available', async (t) => 
   const code = await runSetup(setupArgs({ clientName: 'test client', allowedAgentIds: ['agent-1'] }));
 
   assert.equal(code, 1);
-  assert.match(stderr, /vicoop-client login --bridge/);
+  assert.match(stderr, /vicoop-client auth login --server/);
 });
 
 test('setup writes config.json by default and preserves operator-edited fields', async (t) => {
@@ -891,4 +891,216 @@ test('setup quotes env values so shell metacharacters cannot trigger expansion',
   // Anything else (a bare letter, `$`, backtick) means the value escaped the
   // quoted literal and would be evaluated on `. vicoop-client.env`.
   assert.doesNotMatch(body, /^export AGENT_ID=[^']/m);
+});
+
+// ---- New `agent register` surface (#224) -----------------------------------
+
+function agentRegisterArgs(
+  p: { name: string; agentId: string }
+    & Partial<Omit<AgentRegisterArgs, 'action' | 'name' | 'agentId'>>,
+): AgentRegisterArgs {
+  const {
+    name, agentId,
+    callers = [], envFile, envFileAlias, server, token, json = false,
+  } = p;
+  return {
+    action: 'agent-register',
+    name,
+    agentId,
+    callers,
+    envFile,
+    envFileAlias,
+    server,
+    token,
+    json,
+  };
+}
+
+// The test-context fixture type is intentionally permissive — node:test's
+// real TestContext.mock.method signature is heavily overloaded and not
+// portable across versions, so the fixture just relies on the runtime
+// shape it actually uses.
+function installAgentRegisterFixture(t: TestContext): {
+  tmpHome: string;
+  envFile: string;
+  calls: Array<{ url: string; method?: string; body: string }>;
+  stderr: () => string;
+} {
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-agent-register-'));
+  const envFile = join(tmpHome, 'vicoop-client.env');
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  // Pin both `VICOOP_HOME` and `HOME` so `resolveConfigDir()` lands inside the
+  // tmp dir on every host. Clearing `XDG_CONFIG_HOME` matters on CI runners
+  // (Linux) where it is exported by default — otherwise the config write goes
+  // to `$XDG_CONFIG_HOME/vicoop/config.json` while the assertion reads
+  // `${tmpHome}/.vicoop/config.json` and sees `null`.
+  const prevHome = process.env.HOME;
+  const prevVicoop = process.env.VICOOP_HOME;
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  process.env.HOME = tmpHome;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  delete process.env.XDG_CONFIG_HOME;
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = prevVicoop;
+    if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prevXdg;
+  });
+
+  saveOwnerSession({
+    bridge: 'https://bridge.test',
+    token: 'vbc_owner_test',
+    principal_id: 'google:123',
+    email: 'owner@example.com',
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    saved_at: new Date().toISOString(),
+  });
+
+  const calls: Array<{ url: string; method?: string; body: string }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    calls.push({
+      url,
+      method: init?.method,
+      body: typeof init?.body === 'string' ? init.body : '',
+    });
+    if (url.endsWith('/graphql')) {
+      return new Response(JSON.stringify({
+        data: {
+          registerClient: {
+            clientWithToken: {
+              id: 'reg-uuid-1',
+              token: 'agent-token-1',
+              ownerPrincipal: 'google:123',
+              allowedAgentIds: ['codex-Mac'],
+            },
+          },
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    // caller add success
+    return new Response(JSON.stringify({
+      agent_id: 'codex-Mac', principal: 'eth:0xabc', allowed_callers: ['eth:0xabc'],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let stderr = '';
+  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  });
+  return { tmpHome, envFile, calls, stderr: () => stderr };
+}
+
+test('agent register calls registerClient with a 1-element allowedAgentIds and writes config', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    name: 'codex on Mac', agentId: 'codex-Mac', envFile: fix.envFile,
+  }));
+
+  assert.equal(code, 0);
+  assert.equal(fix.calls.length, 1);
+  assert.equal(fix.calls[0].url, 'https://bridge.test/graphql');
+  // Server-side 1:1 enforcement (#219) means the array must contain exactly
+  // one id; the new flag is singular so this is the natural shape.
+  // GraphQL mutation body is JSON-encoded, so inner double quotes appear
+  // escaped as \" — accept either form.
+  assert.match(fix.calls[0].body, /allowedAgentIds:\[\\"codex-Mac\\"\]/);
+  assert.match(fix.calls[0].body, /clientName:\\"codex on Mac\\"/);
+
+  const config = readConfig(join(fix.tmpHome, '.vicoop', 'config.json'));
+  assert.deepEqual(config, {
+    server_url: 'wss://bridge.test',
+    server_token: 'agent-token-1',
+    agent_id: 'codex-Mac',
+  });
+});
+
+test('agent register stderr surfaces agent-first labels (agent_id, name, AGENT_TOKEN)', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    name: 'codex on Mac', agentId: 'codex-Mac',
+  }));
+
+  assert.equal(code, 0);
+  const out = fix.stderr();
+  // Operator-supplied agent_id (not the server's registration UUID) is the
+  // primary identifier in the success block.
+  assert.match(out, /agent_id\s+codex-Mac/);
+  assert.match(out, /name\s+codex on Mac/);
+  assert.match(out, /The AGENT_TOKEN is one-time/);
+  assert.match(out, /agent register persists it to the canonical config/);
+  // Recovery hint and "add caller" pointer also use the new vocabulary.
+  assert.match(out, /vicoop-client agent callers add/);
+  // The legacy CLIENT_TOKEN label should not appear on this surface.
+  assert.doesNotMatch(out, /CLIENT_TOKEN/);
+  assert.doesNotMatch(out, /client_id\b/);
+});
+
+test('agent register --json prints the registerClient response shape unchanged for back-compat', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+  let stdout = '';
+  t.mock.method(process.stdout, 'write', (chunk: string | Uint8Array) => {
+    stdout += String(chunk);
+    return true;
+  });
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    name: 'codex on Mac', agentId: 'codex-Mac', json: true,
+  }));
+
+  assert.equal(code, 0);
+  const parsed = JSON.parse(stdout) as Record<string, unknown>;
+  // Existing scripts depend on these field names; #224 explicitly keeps the
+  // JSON shape stable across the rename.
+  assert.equal(parsed.intent, 'client_register');
+  assert.equal(parsed.client_token, 'agent-token-1');
+  assert.equal(parsed.client_id, 'reg-uuid-1');
+  assert.deepEqual(parsed.allowed_agent_ids, ['codex-Mac']);
+});
+
+test('agent register configures callers when --caller is passed', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    name: 'codex on Mac', agentId: 'codex-Mac',
+    callers: ['eth:0xabc'],
+  }));
+
+  assert.equal(code, 0);
+  assert.equal(fix.calls.length, 2);
+  assert.equal(fix.calls[1].method, 'POST');
+  assert.equal(
+    fix.calls[1].url,
+    'https://bridge.test/admin-api/agents/codex-Mac/callers',
+  );
+});
+
+// ---- Legacy `setup` alias: deprecation warning -----------------------------
+
+test('legacy setup prints a stderr deprecation warning pointing at agent register', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+
+  const code = await runSetup(setupArgs({
+    clientName: 'codex on Mac', allowedAgentIds: ['codex-Mac'],
+  }));
+
+  assert.equal(code, 0);
+  assert.match(
+    fix.stderr(),
+    /vicoop-client setup.*deprecated.*vicoop-client agent register --name NAME --agent-id ID/s,
+  );
+  // Old vocabulary stays present on the legacy surface (back-compat for scripts
+  // that parse stderr) — only the new path uses agent-first labels.
+  assert.match(fix.stderr(), /client_id\s+reg-uuid-1/);
+  assert.match(fix.stderr(), /The CLIENT_TOKEN is one-time/);
 });

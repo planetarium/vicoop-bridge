@@ -147,69 +147,79 @@ AGENT_ID="$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)-openclaw"
 echo "$AGENT_ID"
 ```
 
-> **Self-hosting the bridge.** `login` / `setup` / the daemon all default
-> to the public bridge at `https://vicoop-bridge-server.fly.dev` (HTTPS for
-> `login` / `setup` / admin commands; `wss://…` for the daemon). If you
-> run your own bridge, pass `--bridge <https://your-bridge>` to `login` and
+> **Self-hosting the bridge.** `login` / `agent register` / the daemon all
+> default to the public bridge at `https://vicoop-bridge-server.fly.dev`
+> (HTTPS for `login` / `agent register` / admin commands; `wss://…` for the
+> daemon). If you
+> run your own bridge, pass `--server <https://your-bridge>` to `auth login` and
 > `--server <wss://your-bridge>` to the daemon (or persist `server_url`
 > in `config.json`). Every example below uses the public defaults; the
 > self-host overrides are the only place the URL has to change.
 
-`registerClient` (called for you by `vicoop-client setup` in Step 4) does
-not pre-validate availability; collisions surface only at WS connect time.
+`registerClient` (called for you by `vicoop-client agent register` in
+Step 4) does not pre-validate availability; collisions surface only at WS
+connect time.
 If you want to probe ahead, hit `agentIdAvailable(agentId)` GraphQL after
 login — it's a SECURITY DEFINER probe that returns boolean availability
 across every owner without leaking `owner_principal`. Most operators just
 pick a hostname/uuid prefix and skip the probe.
 
-## Step 4 — Login and set up your client
+## Step 4 — Login and register your agent
 
-`vicoop-client login` only signs you in as the client owner and saves an
-owner-session bearer to `~/.vicoop/owner-session.json`. It does **not** create
-a bridge client. `vicoop-client setup` then uses that saved owner-session to
-call `registerClient` and mint a one-time `CLIENT_TOKEN`. No wallet or SIWE
-required.
+`vicoop-client auth login` only signs you in as the agent owner and saves
+an owner-session bearer to `~/.vicoop/owner-session.json`. It does **not**
+create an agent registration. `vicoop-client agent register` then uses that
+saved owner-session to call `registerClient` and mint a one-time
+`AGENT_TOKEN`. No wallet or SIWE required.
 
 ```sh
 HOSTNAME=$(hostname)
 CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
 
-"$INSTALL_DIR/vicoop-client" login
+"$INSTALL_DIR/vicoop-client" auth login
 
-"$INSTALL_DIR/vicoop-client" setup \
-  --client-name "$CLIENT_NAME" \
-  --agent-ids "$AGENT_ID" \
+"$INSTALL_DIR/vicoop-client" agent register \
+  --name "$CLIENT_NAME" \
+  --agent-id "$AGENT_ID" \
   --caller "eth:0x<40-hex>"
 ```
 
-(Self-hosting? Pass `--bridge https://<your-bridge>` to `login`.)
+(Self-hosting? Pass `--server https://<your-bridge>` to `auth login`.)
 
 `login` prints a verification URL to stderr — open it in **any** browser
 (the same machine, or your laptop while running the CLI on a headless host)
-and authorize with your Google account. `setup` registers the client, configures
-any `--caller` allowlist entries, and persists the daemon credentials to
-the resolved vicoop config dir (`~/.vicoop/config.json` by default; see the
-resolution order below for `$VICOOP_HOME` / `$XDG_CONFIG_HOME` cases), mode
-600 — see #137 for the consolidated config layout. The success output looks
-like:
+and authorize with your Google account. `agent register` calls the bridge's
+`registerClient` mutation, configures any `--caller` allowlist entries, and
+persists the daemon credentials to the resolved vicoop config dir
+(`~/.vicoop/config.json` by default; see the resolution order below for
+`$VICOOP_HOME` / `$XDG_CONFIG_HOME` cases), mode 600 — see #137 for the
+consolidated config layout. The success output looks like:
 
 ```text
-  client_id        <uuid>
+  agent_id         openclaw-my-host
   owner_principal  google:sub:<sub>
-  client_name      openclaw on my-host
-  allowed_agents   openclaw-my-host
+  name             openclaw on my-host
 
-The CLIENT_TOKEN is one-time — the bridge cannot reissue it.
-  setup persists it to the canonical config below; --json prints it to
+The AGENT_TOKEN is one-time — the bridge cannot reissue it.
+  agent register persists it to the canonical config below; --json prints it to
   stdout instead. Back up that file before rotating hosts.
   To also stash it in a shell-sourceable env file, pass --write-env-file
-  on this same setup invocation — rerunning setup later would call
-  registerClient again and mint a NEW CLIENT_TOKEN, invalidating this
+  on this same agent register invocation — rerunning agent register later would call
+  registerClient again and mint a NEW AGENT_TOKEN, invalidating this
   one. To populate an env file from an already-issued token, copy
   SERVER_URL / SERVER_TOKEN / AGENT_ID out of config.json by hand.
 
 Wrote /home/you/.vicoop/config.json (mode 600).
 ```
+
+> **Legacy flat aliases.** The flat `setup` / `login` / `logout` / `whoami`
+> commands still work (with the same flags as their umbrella replacements)
+> but now print a one-line deprecation warning to stderr pointing at their
+> `agent register` / `auth login` / `auth logout` / `auth whoami` form.
+> `setup` additionally keeps its old `--client-name` / `--agent-ids` flags
+> and the `CLIENT_TOKEN` / `client_id` / `client_name` vocabulary on
+> stderr for script back-compat. All four will be removed in a future
+> release.
 
 Verify it landed where you expect (matters when `$VICOOP_HOME` or
 `$XDG_CONFIG_HOME` is set):
@@ -226,15 +236,15 @@ installs that already store `owner-session.json` there aren't orphaned
 when `$XDG_CONFIG_HOME` gets set later; fresh installs with `$XDG_CONFIG_HOME`
 set land under `$XDG_CONFIG_HOME/vicoop`.
 
-`setup` only writes the three credentials above; backend defaults are
-hand-edited into the same file. The common shape (every field optional —
+`agent register` only writes the three credentials above; backend defaults
+are hand-edited into the same file. The common shape (every field optional —
 omit what you don't need) is:
 
 ```json
 {
   "server_url": "wss://vicoop-bridge-server.fly.dev",
-  "server_token": "<written by setup>",
-  "agent_id": "<written by setup>",
+  "server_token": "<written by agent register>",
+  "agent_id": "<written by agent register>",
   "backend": "claude",
   "backends": {
     "claude": {
@@ -265,9 +275,9 @@ The schema also accepts a top-level `card` mirroring the `--card` flag
 Daemon precedence is **CLI flag > `--config <path>` > canonical
 `config.json` > built-in default**. Env vars are not consulted for
 runtime config (#189 §5) — secrets and overrides live in `config.json`
-(mode 600) or in flags. `setup` only ever touches `server_url`,
+(mode 600) or in flags. `agent register` only ever touches `server_url`,
 `server_token`, and `agent_id` — hand-edits to the other fields survive
-`setup` re-runs.
+re-runs.
 
 > **Top-level vs `backends.*` parity.** Every operator-tunable knob is
 > reachable as a CLI flag and as a `config.json` field — pick whichever
@@ -286,7 +296,7 @@ runtime config (#189 §5) — secrets and overrides live in `config.json`
 > that position adds no expressive power that `--config <path>` doesn't
 > already provide, but it adds invisible state (shell rc files, CI env
 > bleed, stale exports). Existing operators with env-only setups need to
-> either run `setup` (which persists `server_url` / `server_token` /
+> either run `agent register` (which persists `server_url` / `server_token` /
 > `agent_id` into `config.json`) or pass the equivalent CLI flags.
 >
 > Env vars the client still reads (different category — they pick *where*
@@ -295,40 +305,44 @@ runtime config (#189 §5) — secrets and overrides live in `config.json`
 > (admin-command owner-session bootstrap, same role as `KUBECONFIG`),
 > `VICOOP_CLIENT_LOG_LEVEL` (logging diagnostic).
 
-If you omit `--caller`, `setup` succeeds but prints a warning that the
-agent will be public until you restrict callers:
+If you omit `--caller`, `agent register` succeeds but prints a warning that
+the agent will be public until you restrict callers:
 
-> `setup --caller` requires a bridge server version that stores caller
-> allowlists on registered agents. If you are testing against your own
-> deployment, deploy the matching server/schema before this step.
+> `--caller` requires a bridge server version that stores caller allowlists
+> on registered agents. If you are testing against your own deployment,
+> deploy the matching server/schema before this step.
 
-> ⚠ The `CLIENT_TOKEN` is unrecoverable after this single output.
+> ⚠ The `AGENT_TOKEN` is unrecoverable after this single output.
 > `config.json` is the only place it persists; back it up if you need to
 > rotate hosts. To rotate the token later, use the `rotateClientToken`
 > GraphQL mutation (requires a `vbc_owner_*` session token; the default
 > login flow saves one locally for you). Rotation surfaces a new
-> CLIENT_TOKEN, also one-time.
+> AGENT_TOKEN, also one-time.
 
-For setup scripting, pass `--json` instead of writing `config.json` if you
-want to compose with shell tooling (no disk side effects, raw response on
-stdout):
+For scripting, pass `--json` instead of writing `config.json` if you want to
+compose with shell tooling (no disk side effects, raw response on stdout):
 
 ```sh
-"$INSTALL_DIR/vicoop-client" setup \
-  --client-name "$CLIENT_NAME" \
-  --agent-ids "$AGENT_ID" \
+"$INSTALL_DIR/vicoop-client" agent register \
+  --name "$CLIENT_NAME" \
+  --agent-id "$AGENT_ID" \
   --caller "eth:0x<40-hex>" --json \
-  | tee /tmp/vicoop-setup.json
-CLIENT_TOKEN=$(jq -r .client_token /tmp/vicoop-setup.json)
+  | tee /tmp/vicoop-agent.json
+AGENT_TOKEN=$(jq -r .client_token /tmp/vicoop-agent.json)
 ```
 
-`--agent-ids` is a legacy plural flag, but the current server model is
-1:1: one setup call creates one agent registration and the flag must contain
-exactly one id. To change that id later, use the `updateClientAllowedAgents`
-GraphQL compatibility mutation (backed by `update_client_allowed_agents()`
-in `schema.sql`) without issuing a new token.
+`--json` keeps the `registerClient` response shape (`client_id`,
+`client_token`, `client_name`, `allowed_agent_ids`) for back-compat with
+existing scripts. New scripts can read `allowed_agent_ids[0]` as the
+agent id and `client_token` as the agent token.
 
-### What login and setup do
+The bridge's server model is 1:1 (#219): one `agent register` call creates
+one agent registration with one id. To change that id later, use the
+`updateClientAllowedAgents` GraphQL compatibility mutation (backed by
+`update_client_allowed_agents()` in `schema.sql`) without issuing a new
+token.
+
+### What login and agent register do
 
 1. `login` calls `POST /oauth/device/code` with `intent=owner_session`; the bridge stores
    a `device_sessions` row and returns a one-time `device_code` + 8-char user
@@ -338,8 +352,8 @@ in `schema.sql`) without issuing a new token.
 3. CLI polls `POST /oauth/token`. Once status flips to `approved`, the
    bridge returns a `vbc_owner_*` bearer, and `login` saves it to
    `~/.vicoop/owner-session.json` (mode 600).
-4. `setup` calls the authenticated GraphQL `registerClient` mutation with
-   that bearer, receives `{client_id, client_token, owner_principal,
+4. `agent register` calls the authenticated GraphQL `registerClient` mutation
+   with that bearer, receives `{client_id, client_token, owner_principal,
    allowed_agent_ids}`, and writes the daemon credentials into
    `~/.vicoop/config.json` (mode 600). With `--write-env-file <path>` it
    additionally emits a shell-sourceable env file at that path — useful as
@@ -385,7 +399,7 @@ card, for example to:
 
 To see what the bridge currently advertises for this agent (before deciding
 whether to override), connect the client once and `curl` the `a2a card` URL
-that `vicoop-client whoami` prints — see ["Check your agent's mention /
+that `vicoop-client auth whoami` prints — see ["Check your agent's mention /
 acct"](#check-your-agents-mention--acct-any-backend) in Step 6.
 
 Schema reference: `packages/protocol/src/index.ts` (`AgentCard` Zod schema,
@@ -432,7 +446,7 @@ runtime config (#189 §5). With `"backend": "openclaw"` persisted in
 `"$INSTALL_DIR/vicoop-client"`.
 
 On success you'll see a `[client] connected, sending hello` log followed
-by an identity block — same data `vicoop-client whoami` would print, so
+by an identity block — same data `vicoop-client auth whoami` would print, so
 you can copy the mention / acct / agent-card URL from here directly:
 
 ```text
@@ -447,8 +461,9 @@ you can copy the mention / acct / agent-card URL from here directly:
 
 After that:
 
-- The bridge loads the `allowed_callers` list for your agent. If Step 4 setup
-  included `--caller`, that allowlist is already in place; otherwise
+- The bridge loads the `allowed_callers` list for your agent. If Step 4 (the
+  `agent register` call) included `--caller`, that allowlist is already in
+  place; otherwise
   `allowed_callers` is empty, meaning **publicly callable** until you restrict it.
 - `POST $BRIDGE_URL/agents/$AGENT_ID` with a JSON-RPC `message/send` payload
   reaches your backend and the reply is returned inline.
@@ -553,13 +568,13 @@ derived from `--agentId` and the host part of `--server`.
 > on the server side. If the two differ (e.g. a custom domain in front of
 > a Fly hostname), the model is taught a mention that doesn't match what
 > users see via WebFinger and self-reference detection won't fire. Run
-> `vicoop-client whoami --verify` to confirm the WebFinger lookup actually
+> `vicoop-client auth whoami --verify` to confirm the WebFinger lookup actually
 > resolves the agent under the derived host; align `--server` with
 > `PUBLIC_URL`'s host if it doesn't.
 
 ### Check your agent's mention / acct (any backend)
 
-After the first `connected` log, run `vicoop-client whoami` to surface every
+After the first `connected` log, run `vicoop-client auth whoami` to surface every
 identifier external callers will see for this agent — the WebFinger acct, the
 `@<agentId>@<host>` mention, the JSON-RPC endpoint, and the agent-card URL.
 
@@ -577,8 +592,8 @@ identifier external callers will see for this agent — the WebFinger acct, the
 Typical follow-ups from this output:
 
 1. **Hand the mention to another agent.** Copy the `mention:` line and paste
-   it into the other agent's `allowed_callers` (via `add-caller` or the admin
-   agent) so it can call you. Same value goes into the **OpenClaw gateway
+   it into the other agent's `allowed_callers` (via `agent callers add` or
+   the admin agent) so it can call you. Same value goes into the **OpenClaw gateway
    persona** if you want self-reference recognition on the OpenClaw backend
    (configured via `openclaw config set ...` since `chat.send` has no
    per-message system field). `a2a` is the JSON-RPC endpoint another caller
@@ -653,9 +668,9 @@ setting applies to fresh and resumed Codex sessions.
 
 ## Manage caller allowlists
 
-If Step 4 setup did not include `--caller`, the policy has empty
+If Step 4 `agent register` did not include `--caller`, the policy has empty
 `allowed_callers`, which the dispatcher treats as "public". For normal use,
-pass `--caller` during initial setup, or add an allowlist entry afterward
+pass `--caller` during initial registration, or add an allowlist entry afterward
 with the `vicoop-client` subcommands (deterministic, scriptable) or a
 natural-language request to the admin agent. These paths require an
 **owner-session token** (`vbc_owner_*`). Step 4 login saves one locally;
@@ -676,31 +691,31 @@ published release:
 
 ```sh
 # Step 4 login saves the owner-session bearer, so these work without re-authenticating:
-"$INSTALL_DIR/vicoop-client" setup \
-  --client-name "$CLIENT_NAME" \
-  --agent-ids "$AGENT_ID" \
+"$INSTALL_DIR/vicoop-client" agent register \
+  --name "$CLIENT_NAME" \
+  --agent-id "$AGENT_ID" \
   --caller "eth:0x<40-hex>"
-"$INSTALL_DIR/vicoop-client" list-agents
-"$INSTALL_DIR/vicoop-client" list-callers "$AGENT_ID" --json
-"$INSTALL_DIR/vicoop-client" add-caller "$AGENT_ID" "eth:0x<40-hex>"
-"$INSTALL_DIR/vicoop-client" remove-caller "$AGENT_ID" "google:email:caller@example.com"
+"$INSTALL_DIR/vicoop-client" agent list --connected
+"$INSTALL_DIR/vicoop-client" agent callers list "$AGENT_ID" --json
+"$INSTALL_DIR/vicoop-client" agent callers add "$AGENT_ID" "eth:0x<40-hex>"
+"$INSTALL_DIR/vicoop-client" agent callers remove "$AGENT_ID" "google:email:caller@example.com"
 
-# Pass --json for machine-readable output, or --bridge / --token to override
+# Pass --json for machine-readable output, or --server / --token to override
 # the saved session for one call. VICOOP_BRIDGE / VICOOP_OWNER_TOKEN env vars
 # work too (handy for CI).
 ```
 
-The `server_token` Step 4 setup writes into the canonical `config.json`
-is a **client** credential and is **not** accepted by these admin commands —
-they only accept an owner-session bearer (the separate `owner-session.json`
-that `login` writes alongside it). If the saved bearer is missing or expired,
-refresh it without registering a new client:
+The `server_token` Step 4 `agent register` writes into the canonical
+`config.json` is the per-**agent** credential and is **not** accepted by
+these admin commands — they only accept an owner-session bearer (the
+separate `owner-session.json` that `login` writes alongside it). If the
+saved bearer is missing or expired, refresh it without re-registering:
 
 ```sh
-"$INSTALL_DIR/vicoop-client" login
+"$INSTALL_DIR/vicoop-client" auth login
 ```
 
-(Self-hosting? Pass `--bridge https://<your-bridge>`.)
+(Self-hosting? Pass `--server https://<your-bridge>`.)
 
 These talk to the bridge's `/admin-api/*` routes — same logic the admin
 agent's tools run, but without an LLM round-trip per call.
@@ -791,9 +806,9 @@ section of `docs/local-testing.md` for the same note.
   GraphQL — the caller token was missing, malformed, or expired, so the
   request fell back to the `app_anonymous` Postgres role (see
   `packages/server/src/postgraphile.ts`) which has no EXECUTE on
-  authenticated functions. Re-run `vicoop-client login` to refresh.
+  authenticated functions. Re-run `vicoop-client auth login` to refresh.
 
-- **Device flow timed out** — the `vicoop-client login` deadline matches
+- **Device flow timed out** — the `vicoop-client auth login` deadline matches
   the bridge's `device_sessions.expires_at` (10 min by default). If the
   browser approval is delayed past that, re-run `login`; the previous
   device code is invalidated automatically.
@@ -802,44 +817,45 @@ section of `docs/local-testing.md` for the same note.
   registration exists but no WS session is live. Check the client log;
   dispatch requires an active session.
 
-- **Lost the `CLIENT_TOKEN`** — the raw value is unrecoverable, but you
-  don't need to create a new client identity. Rotate the token in place
-  via the `rotateClientToken` GraphQL mutation (backed by
-  `rotate_client_token()` in `schema.sql`): it mints a fresh raw token for
-  the existing agent registration and invalidates the old hash, so your
-  agent id and caller allowlist carry over. Re-run Step 4 only if
-  you intentionally want a new client identity; in that case the old
-  `clients` row can be revoked from the CLI — see
-  [Inspecting and revoking your clients](#inspecting-and-revoking-your-clients).
+- **Lost the `AGENT_TOKEN`** (formerly surfaced as `CLIENT_TOKEN`) — the
+  raw value is unrecoverable, but you don't need to create a new agent
+  identity. Rotate the token in place via the `rotateClientToken` GraphQL
+  mutation (backed by `rotate_client_token()` in `schema.sql`): it mints a
+  fresh raw token for the existing agent registration and invalidates the
+  old hash, so your agent id and caller allowlist carry over. Re-run Step
+  4 only if you intentionally want a new agent identity; in that case the
+  old registration can be revoked from the CLI — see
+  [Inspecting and revoking your agents](#inspecting-and-revoking-your-agents).
 
-## Inspecting and revoking your clients
+## Inspecting and revoking your agents
 
-`vicoop-client list-agents` only shows *currently connected* agents. To see
-every `clients` row registered under your owner principal — including
-orphans left behind by an aborted `setup`, an exited daemon, or a leaked
-`CLIENT_TOKEN` — use:
+`vicoop-client agent list --connected` only shows *currently connected*
+agents. To see every agent registered under your owner principal — including
+orphans left behind by an aborted `agent register`, an exited daemon, or a
+leaked `AGENT_TOKEN` — drop the flag:
 
 ```bash
-vicoop-client list-clients
+vicoop-client agent list
 ```
 
-Columns are `client_id`, `client_name`, `allowed_agent_ids`, `revoked`,
-`connected`, `created_at` (newer servers may also include `agent_id` in
-JSON output). The `connected` flag reflects in-memory registry state, so a
+The table columns are `AGENT_ID`, `NAME`, `CONNECTED`, `REVOKED`, and
+`REGISTERED_AT`. The `connected` flag reflects in-memory registry state, so a
 row with `connected: false` is exactly the kind of orphan you want to clean
-up.
+up. (`--json` additionally returns the legacy `client_id` UUID for scripts
+that still reference it.)
 
-To revoke a client — and disconnect its live WebSocket if one is bound —
-use either the UUID `client_id` or a unique `client_name`:
+To revoke an agent — and disconnect its live WebSocket if one is bound —
+pass the agent id, the legacy registration id, or a unique registration
+name:
 
 ```bash
-vicoop-client revoke-client <client-id-or-name>
+vicoop-client agent revoke <agent-id-or-name>
 ```
 
-- A revoked client's compatibility row is kept (`revoked = true`) so audit
+- A revoked agent's compatibility row is kept (`revoked = true`) so audit
   history survives.
 - A unique name resolves automatically; an ambiguous name exits non-zero
-  with a list of matching `client_id`s so you can retry with the id.
+  with a list of matching ids so you can retry with the id.
 - If the daemon is alive at the moment of revocation, its WebSocket is
   closed with code **4014 "client revoked"** and the daemon exits
   non-zero without reconnecting.
@@ -851,11 +867,18 @@ vicoop-client revoke-client <client-id-or-name>
   indefinitely against a permanently-rejected token. The same 4005
   branch catches plain mis-typed / wrong tokens at first launch.
 - Propagation is **synchronous from the next auth attempt**: client-token
-  verification queries `clients` directly on every WS register with no
-  cache, so there is no equivalent of the 60s `callers` LRU window.
+  verification queries the unified `agents` table directly on every WS
+  register with no cache, so there is no equivalent of the 60s `callers`
+  LRU window.
 
-Both subcommands use the same owner-session bearer as `add-caller` /
-`remove-caller`; no SIWE re-sign required.
+Both subcommands use the same owner-session bearer as `agent callers add`
+/ `remove`; no SIWE re-sign required.
+
+> **Deprecated flat aliases.** The older `list-agents`, `list-clients`,
+> `revoke-client`, `add-caller`, `remove-caller`, and `list-callers`
+> commands still work but print a one-line deprecation warning to stderr
+> pointing at their `agent <sub>` replacement. They will be removed in a
+> future release.
 
 ## What's next
 

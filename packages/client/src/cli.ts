@@ -20,16 +20,17 @@ import { createVicoopCodexBackend } from './backends/vicoop-codex.js';
 import type { Backend } from './backend.js';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
-import { loginCmd, runLogin } from './login.js';
-import { logoutCmd, runLogout } from './logout.js';
-import { setupCmd, runSetup } from './setup.js';
+import { authLoginCmd, loginCmd, runAuthLogin, runLogin } from './login.js';
+import { authLogoutCmd, logoutCmd, runAuthLogout, runLogout } from './logout.js';
+import { setupCmd, runAgentRegister, runSetup } from './setup.js';
 import {
-  addCallerCmd, listAgentsCmd, listCallersCmd, listClientsCmd,
+  addCallerCmd, agentCmd, listAgentsCmd, listCallersCmd, listClientsCmd,
   removeCallerCmd, revokeClientCmd,
-  runAddCaller, runListAgents, runListCallers, runListClients,
+  runAddCaller, runAgentCallersAdd, runAgentCallersList, runAgentCallersRemove,
+  runAgentList, runAgentRevoke, runListAgents, runListCallers, runListClients,
   runRemoveCaller, runRevokeClient,
 } from './admin-cli.js';
-import { whoamiCmd, runWhoami } from './whoami.js';
+import { authWhoamiCmd, whoamiCmd, runAuthWhoami, runWhoami } from './whoami.js';
 import { deriveIdentity } from './identity.js';
 import {
   type ClientConfig,
@@ -96,11 +97,25 @@ const daemonCmd = object({
 // daemonCmd structurally matches. With longestMatch, subcommand branches
 // win whenever their keyword is present (longer match), and daemonCmd
 // wins otherwise.
+// Owner-session umbrella. Mirrors the `agent` umbrella from #218: both new
+// subcommands sit under their topic, the flat versions stay as deprecated
+// aliases.
+const authCmd = command(
+  'auth',
+  longestMatch(authLoginCmd, authLogoutCmd, authWhoamiCmd),
+  {
+    brief: message`Manage owner-session and identity (sign in / out / whoami).`,
+    description: message`Operator-facing umbrella for owner-session and agent-identity. Subcommands: \`login\`, \`logout\`, \`whoami\`. Replaces the older flat \`login\` / \`logout\` / \`whoami\` commands, which remain as deprecated aliases.`,
+  },
+);
+
 const cli = longestMatch(
+  authCmd,
   loginCmd,
   logoutCmd,
   setupCmd,
   upgradeCmd,
+  agentCmd,
   addCallerCmd,
   removeCallerCmd,
   listCallersCmd,
@@ -328,6 +343,15 @@ async function main(): Promise<void> {
   });
 
   switch (parsed.action) {
+    case 'auth-login':
+      process.exit(await runAuthLogin(parsed));
+      break;
+    case 'auth-logout':
+      process.exit(await runAuthLogout(parsed));
+      break;
+    case 'auth-whoami':
+      process.exit(await runAuthWhoami(parsed));
+      break;
     case 'login':
       process.exit(await runLogin(parsed));
       break;
@@ -339,6 +363,24 @@ async function main(): Promise<void> {
       break;
     case 'upgrade':
       process.exit(await runUpgradeCmd(parsed));
+      break;
+    case 'agent-register':
+      process.exit(await runAgentRegister(parsed));
+      break;
+    case 'agent-list':
+      process.exit(await runAgentList(parsed));
+      break;
+    case 'agent-revoke':
+      process.exit(await runAgentRevoke(parsed));
+      break;
+    case 'agent-callers-list':
+      process.exit(await runAgentCallersList(parsed));
+      break;
+    case 'agent-callers-add':
+      process.exit(await runAgentCallersAdd(parsed));
+      break;
+    case 'agent-callers-remove':
+      process.exit(await runAgentCallersRemove(parsed));
       break;
     case 'add-caller':
       process.exit(await runAddCaller(parsed));
