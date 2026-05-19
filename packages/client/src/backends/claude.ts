@@ -1176,6 +1176,12 @@ export function createClaudeBackend(
 
       let emittedAnyArtifact = false;
       let emittedAskUserQuestion = false;
+      let pendingInputRequest: {
+        kind: 'tool_call'
+        toolName: 'AskUserQuestion'
+        toolUseId: string
+        input: unknown
+      } | null = null;
       let finalText: string | null = null;
       let finalUsage: OpenAICompatUsage | null = null;
       let stderrTail = '';
@@ -1304,25 +1310,15 @@ export function createClaudeBackend(
           if (emittedAskUserQuestion) return;
           for (const tu of extractAssistantToolUses(evt.message.content)) {
             if (tu.toolName === 'AskUserQuestion' && tu.toolUseId && child.stdin) {
-              // Emit questions as an A2A artifact so upstream (e.g. slack-connector)
-              // can render interactive UI. Immediately return a placeholder tool_result
-              // so CC continues; the real answer arrives as a follow-up turn.
-              emit({
-                type: 'task.artifact',
-                taskId: task.taskId,
-                artifact: {
-                  artifactId: randomUUID(),
-                  name: 'ask-user-question',
-                  parts: [
-                    {
-                      kind: 'data',
-                      data: { kind: 'tool_call', toolName: 'AskUserQuestion', toolUseId: tu.toolUseId, input: tu.input },
-                    },
-                  ],
-                },
-                lastChunk: true,
-              });
-              emittedAnyArtifact = true;
+              // Stash for input-required terminal frame (A2A spec §9.4).
+              // Placeholder tool_result + stdin.end() flushes CC's session state
+              // so the next turn can --resume cleanly.
+              pendingInputRequest = {
+                kind: 'tool_call',
+                toolName: 'AskUserQuestion',
+                toolUseId: tu.toolUseId,
+                input: tu.input,
+              };
               emittedAskUserQuestion = true;
               const toolResult = JSON.stringify({
                 type: 'user',
@@ -1514,6 +1510,23 @@ export function createClaudeBackend(
           error: {
             code: 'claude_exit_nonzero',
             message: `claude exited with code ${exit.code}${sigPart}${detailPart}${stdinPart}`,
+          },
+        });
+        return;
+      }
+
+      if (pendingInputRequest !== null) {
+        emit({
+          type: 'task.complete',
+          taskId: task.taskId,
+          status: {
+            state: 'input-required',
+            timestamp: new Date().toISOString(),
+            message: {
+              role: 'agent' as const,
+              messageId: randomUUID(),
+              parts: [{ kind: 'data', data: pendingInputRequest }],
+            },
           },
         });
         return;
