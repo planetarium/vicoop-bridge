@@ -5,12 +5,22 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   runAddCaller,
+  runAgentCallersAdd,
+  runAgentCallersList,
+  runAgentCallersRemove,
+  runAgentList,
+  runAgentRevoke,
   runListAgents,
   runListCallers,
   runListClients,
   runRemoveCaller,
   runRevokeClient,
   type AddCallerArgs,
+  type AgentCallersAddArgs,
+  type AgentCallersListArgs,
+  type AgentCallersRemoveArgs,
+  type AgentListArgs,
+  type AgentRevokeArgs,
   type ListAgentsArgs,
   type ListCallersArgs,
   type ListClientsArgs,
@@ -45,6 +55,28 @@ const revokeClientArgs = (
   target: string,
   p: Partial<RevokeClientArgs> = {},
 ): RevokeClientArgs => ({ action: 'revoke-client', target, ...SHARED, ...p });
+const agentListArgsFn = (p: Partial<AgentListArgs> = {}): AgentListArgs =>
+  ({ action: 'agent-list', ...SHARED, connected: false, ...p });
+const agentRevokeArgsFn = (
+  target: string,
+  p: Partial<AgentRevokeArgs> = {},
+): AgentRevokeArgs => ({ action: 'agent-revoke', target, ...SHARED, ...p });
+const agentCallersListArgsFn = (
+  agentId: string,
+  p: Partial<AgentCallersListArgs> = {},
+): AgentCallersListArgs => ({ action: 'agent-callers-list', agentId, ...SHARED, ...p });
+const agentCallersAddArgsFn = (
+  agentId: string,
+  principal: string,
+  p: Partial<AgentCallersAddArgs> = {},
+): AgentCallersAddArgs =>
+  ({ action: 'agent-callers-add', agentId, principal, ...SHARED, ...p });
+const agentCallersRemoveArgsFn = (
+  agentId: string,
+  principal: string,
+  p: Partial<AgentCallersRemoveArgs> = {},
+): AgentCallersRemoveArgs =>
+  ({ action: 'agent-callers-remove', agentId, principal, ...SHARED, ...p });
 
 interface Captured {
   url: string;
@@ -167,7 +199,10 @@ test('list-agents calls GET /admin-api/agents and renders human output', async (
   assert.equal(calls[0].method, 'GET');
   assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents`);
   assert.equal(calls[0].headers.authorization, `Bearer ${TOKEN}`);
-  assert.match(stdout.read(), /agent_id:\s+foo/);
+  const out = stdout.read();
+  // Table-form: header row + data row, padded with whitespace.
+  assert.match(out, /AGENT_ID\s+AGENT_NAME/);
+  assert.match(out, /^foo\s+Foo\s+cid\b/m);
 });
 
 test('list-agents --json prints raw JSON', async (t) => {
@@ -310,8 +345,9 @@ test('list-clients calls GET /admin-api/clients and renders rows with connected 
   assert.equal(calls[0].url, `${BRIDGE}/admin-api/clients`);
   assert.equal(calls[0].headers.authorization, `Bearer ${TOKEN}`);
   const out = stdout.read();
-  assert.match(out, /client_id:\s+cid-1/);
-  assert.match(out, /connected:\s+false/);
+  // Table-form: header row + data row.
+  assert.match(out, /CLIENT_ID\s+CLIENT_NAME\s+ALLOWED_AGENT_IDS/);
+  assert.match(out, /^cid-1\s+usage-test-1\s+agent-a\s+false\s+false\b/m);
 });
 
 test('list-clients --json prints raw JSON', async (t) => {
@@ -383,4 +419,185 @@ test('subcommand surfaces server error on non-2xx response', async (t) => {
   const code = await runAddCaller(addCallerArgs('foo', 'eth:0xabc'));
   assert.equal(code, 1);
   assert.match(stderr.read(), /403.*Not authorized/);
+});
+
+// ---- New `agent <sub>` command group (#218) --------------------------------
+
+// `agent list` calls the same /admin-api/clients endpoint as the legacy
+// list-clients (the server-side unified persistence in #219 makes them
+// equivalent), but renders rows agent-id-first to match the operator-facing
+// model and includes registration_id/revoked/connected fields.
+test('agent list calls GET /admin-api/clients and renders agent-centric rows', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  const { calls } = installFetch(t, {
+    body: {
+      clients: [
+        {
+          client_id: 'cid-1',
+          agent_id: 'agent-a',
+          client_name: 'codex on Mac',
+          owner_principal: 'eth:0xabc',
+          allowed_agent_ids: ['agent-a'],
+          revoked: false,
+          connected: true,
+          created_at: '2026-05-07T00:00:00.000Z',
+        },
+      ],
+    },
+  });
+
+  const code = await runAgentList(agentListArgsFn());
+  assert.equal(code, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, `${BRIDGE}/admin-api/clients`);
+  const out = stdout.read();
+  // Header row puts AGENT_ID first. The legacy client_id is intentionally
+  // omitted from the human table — it remains available via --json.
+  assert.match(out, /AGENT_ID\s+NAME\s+CONNECTED\s+REVOKED\s+REGISTERED_AT\s*$/m);
+  assert.match(out, /^agent-a\s+codex on Mac\s+true\s+false\s+\S+\s*$/m);
+  assert.doesNotMatch(out, /cid-1/);
+});
+
+// --connected filters client-side so the human view only shows live daemons
+// even though the API itself returns every registration.
+test('agent list --connected filters to connected rows in human + JSON output', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  installFetch(t, {
+    body: {
+      clients: [
+        {
+          client_id: 'cid-1', agent_id: 'agent-a', client_name: 'live',
+          owner_principal: 'eth:0xabc', allowed_agent_ids: ['agent-a'],
+          revoked: false, connected: true,
+          created_at: '2026-05-07T00:00:00.000Z',
+        },
+        {
+          client_id: 'cid-2', agent_id: 'agent-b', client_name: 'stale',
+          owner_principal: 'eth:0xabc', allowed_agent_ids: ['agent-b'],
+          revoked: false, connected: false,
+          created_at: '2026-05-07T00:00:00.000Z',
+        },
+      ],
+    },
+  });
+
+  const code = await runAgentList(agentListArgsFn({ json: true, connected: true }));
+  assert.equal(code, 0);
+  const parsed = JSON.parse(stdout.read()) as { clients: Array<{ agent_id: string }> };
+  assert.deepEqual(parsed.clients.map((c) => c.agent_id), ['agent-a']);
+});
+
+test('agent list --connected with no live agents prints the empty-state line', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  installFetch(t, { body: { clients: [] } });
+
+  const code = await runAgentList(agentListArgsFn({ connected: true }));
+  assert.equal(code, 0);
+  assert.match(stdout.read(), /no connected agents/);
+});
+
+// `agent revoke` keeps the legacy DELETE /admin-api/clients/<target> endpoint
+// because the server-side resolver (admin-api.ts resolveClient) accepts an
+// agent_id, the legacy client_id, or the registration name. No new endpoint
+// is required.
+test('agent revoke DELETEs /admin-api/clients/<AGENT_ID>', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, {
+    body: { client_id: 'cid', client_name: 'agent-a', revoked: true, closed_connections: 1 },
+  });
+
+  const code = await runAgentRevoke(agentRevokeArgsFn('agent-a'));
+  assert.equal(code, 0);
+  assert.equal(calls[0].method, 'DELETE');
+  assert.equal(calls[0].url, `${BRIDGE}/admin-api/clients/agent-a`);
+});
+
+test('agent callers list/add/remove hit the existing /admin-api/agents/:id/callers routes', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const principal = 'eth:0xabcdefabcdefabcdefabcdefabcdefabcdefabcd';
+  const { calls } = installFetch(t, {
+    body: { agent_id: 'foo', owner_principal: 'eth:0xabc', allowed_callers: [], is_public: true },
+  });
+
+  assert.equal(await runAgentCallersList(agentCallersListArgsFn('foo')), 0);
+  assert.equal(await runAgentCallersAdd(agentCallersAddArgsFn('foo', principal)), 0);
+  assert.equal(await runAgentCallersRemove(agentCallersRemoveArgsFn('foo', principal)), 0);
+
+  assert.equal(calls[0].method, 'GET');
+  assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/callers`);
+  assert.equal(calls[1].method, 'POST');
+  assert.equal(calls[1].url, `${BRIDGE}/admin-api/agents/foo/callers`);
+  assert.deepEqual(JSON.parse(calls[1].body!), { principal });
+  assert.equal(calls[2].method, 'DELETE');
+  assert.equal(
+    calls[2].url,
+    `${BRIDGE}/admin-api/agents/foo/callers?principal=${encodeURIComponent(principal)}`,
+  );
+});
+
+// The new `agent` commands must not print a deprecation warning — that's
+// reserved for the legacy flat aliases.
+test('agent subcommands do NOT emit deprecation warnings', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const stderr = captureStderr(t);
+  installFetch(t, { body: { clients: [] } });
+
+  assert.equal(await runAgentList(agentListArgsFn()), 0);
+  assert.doesNotMatch(stderr.read(), /deprecated/i);
+});
+
+// ---- Deprecation warnings on legacy aliases --------------------------------
+
+test('legacy list-agents prints a deprecation warning pointing at agent list --connected', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const stderr = captureStderr(t);
+  installFetch(t, { body: { agents: [] } });
+
+  assert.equal(await runListAgents(listAgentsArgs()), 0);
+  assert.match(stderr.read(), /list-agents.*deprecated.*agent list --connected/s);
+});
+
+test('legacy list-clients warns and points at agent list', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const stderr = captureStderr(t);
+  installFetch(t, { body: { clients: [] } });
+
+  assert.equal(await runListClients(listClientsArgs()), 0);
+  assert.match(stderr.read(), /list-clients.*deprecated.*agent list/s);
+});
+
+test('legacy revoke-client warns and points at agent revoke', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const stderr = captureStderr(t);
+  installFetch(t, { body: { client_id: 'c', client_name: 'n', revoked: true, closed_connections: 0 } });
+
+  assert.equal(await runRevokeClient(revokeClientArgs('n')), 0);
+  assert.match(stderr.read(), /revoke-client.*deprecated.*agent revoke/s);
+});
+
+test('legacy {add,remove,list}-caller all emit the agent-callers deprecation hint', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const stderr = captureStderr(t);
+  installFetch(t, {
+    body: { agent_id: 'foo', owner_principal: 'eth:0xabc', allowed_callers: [], is_public: true },
+  });
+
+  const principal = 'eth:0xabcdefabcdefabcdefabcdefabcdefabcdefabcd';
+  assert.equal(await runListCallers(listCallersArgs('foo')), 0);
+  assert.equal(await runAddCaller(addCallerArgs('foo', principal)), 0);
+  assert.equal(await runRemoveCaller(removeCallerArgs('foo', principal)), 0);
+  const out = stderr.read();
+  assert.match(out, /list-callers.*agent callers list/s);
+  assert.match(out, /add-caller.*agent callers add/s);
+  assert.match(out, /remove-caller.*agent callers remove/s);
 });

@@ -24,9 +24,10 @@ import { loginCmd, runLogin } from './login.js';
 import { logoutCmd, runLogout } from './logout.js';
 import { setupCmd, runSetup } from './setup.js';
 import {
-  addCallerCmd, listAgentsCmd, listCallersCmd, listClientsCmd,
+  addCallerCmd, agentCmd, listAgentsCmd, listCallersCmd, listClientsCmd,
   removeCallerCmd, revokeClientCmd,
-  runAddCaller, runListAgents, runListCallers, runListClients,
+  runAddCaller, runAgentCallersAdd, runAgentCallersList, runAgentCallersRemove,
+  runAgentList, runAgentRevoke, runListAgents, runListCallers, runListClients,
   runRemoveCaller, runRevokeClient,
 } from './admin-cli.js';
 import { whoamiCmd, runWhoami } from './whoami.js';
@@ -101,6 +102,7 @@ const cli = longestMatch(
   logoutCmd,
   setupCmd,
   upgradeCmd,
+  agentCmd,
   addCallerCmd,
   removeCallerCmd,
   listCallersCmd,
@@ -339,6 +341,21 @@ async function main(): Promise<void> {
       break;
     case 'upgrade':
       process.exit(await runUpgradeCmd(parsed));
+      break;
+    case 'agent-list':
+      process.exit(await runAgentList(parsed));
+      break;
+    case 'agent-revoke':
+      process.exit(await runAgentRevoke(parsed));
+      break;
+    case 'agent-callers-list':
+      process.exit(await runAgentCallersList(parsed));
+      break;
+    case 'agent-callers-add':
+      process.exit(await runAgentCallersAdd(parsed));
+      break;
+    case 'agent-callers-remove':
+      process.exit(await runAgentCallersRemove(parsed));
       break;
     case 'add-caller':
       process.exit(await runAddCaller(parsed));

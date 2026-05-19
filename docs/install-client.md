@@ -577,8 +577,8 @@ identifier external callers will see for this agent — the WebFinger acct, the
 Typical follow-ups from this output:
 
 1. **Hand the mention to another agent.** Copy the `mention:` line and paste
-   it into the other agent's `allowed_callers` (via `add-caller` or the admin
-   agent) so it can call you. Same value goes into the **OpenClaw gateway
+   it into the other agent's `allowed_callers` (via `agent callers add` or
+   the admin agent) so it can call you. Same value goes into the **OpenClaw gateway
    persona** if you want self-reference recognition on the OpenClaw backend
    (configured via `openclaw config set ...` since `chat.send` has no
    per-message system field). `a2a` is the JSON-RPC endpoint another caller
@@ -680,10 +680,10 @@ published release:
   --client-name "$CLIENT_NAME" \
   --agent-ids "$AGENT_ID" \
   --caller "eth:0x<40-hex>"
-"$INSTALL_DIR/vicoop-client" list-agents
-"$INSTALL_DIR/vicoop-client" list-callers "$AGENT_ID" --json
-"$INSTALL_DIR/vicoop-client" add-caller "$AGENT_ID" "eth:0x<40-hex>"
-"$INSTALL_DIR/vicoop-client" remove-caller "$AGENT_ID" "google:email:caller@example.com"
+"$INSTALL_DIR/vicoop-client" agent list --connected
+"$INSTALL_DIR/vicoop-client" agent callers list "$AGENT_ID" --json
+"$INSTALL_DIR/vicoop-client" agent callers add "$AGENT_ID" "eth:0x<40-hex>"
+"$INSTALL_DIR/vicoop-client" agent callers remove "$AGENT_ID" "google:email:caller@example.com"
 
 # Pass --json for machine-readable output, or --bridge / --token to override
 # the saved session for one call. VICOOP_BRIDGE / VICOOP_OWNER_TOKEN env vars
@@ -810,36 +810,37 @@ section of `docs/local-testing.md` for the same note.
   agent id and caller allowlist carry over. Re-run Step 4 only if
   you intentionally want a new client identity; in that case the old
   `clients` row can be revoked from the CLI — see
-  [Inspecting and revoking your clients](#inspecting-and-revoking-your-clients).
+  [Inspecting and revoking your agents](#inspecting-and-revoking-your-agents).
 
-## Inspecting and revoking your clients
+## Inspecting and revoking your agents
 
-`vicoop-client list-agents` only shows *currently connected* agents. To see
-every `clients` row registered under your owner principal — including
+`vicoop-client agent list --connected` only shows *currently connected*
+agents. To see every agent registered under your owner principal — including
 orphans left behind by an aborted `setup`, an exited daemon, or a leaked
-`CLIENT_TOKEN` — use:
+`CLIENT_TOKEN` — drop the flag:
 
 ```bash
-vicoop-client list-clients
+vicoop-client agent list
 ```
 
-Columns are `client_id`, `client_name`, `allowed_agent_ids`, `revoked`,
-`connected`, `created_at` (newer servers may also include `agent_id` in
-JSON output). The `connected` flag reflects in-memory registry state, so a
+The table columns are `AGENT_ID`, `NAME`, `CONNECTED`, `REVOKED`, and
+`REGISTERED_AT`. The `connected` flag reflects in-memory registry state, so a
 row with `connected: false` is exactly the kind of orphan you want to clean
-up.
+up. (`--json` additionally returns the legacy `client_id` UUID for scripts
+that still reference it.)
 
-To revoke a client — and disconnect its live WebSocket if one is bound —
-use either the UUID `client_id` or a unique `client_name`:
+To revoke an agent — and disconnect its live WebSocket if one is bound —
+pass the agent id, the legacy registration id, or a unique registration
+name:
 
 ```bash
-vicoop-client revoke-client <client-id-or-name>
+vicoop-client agent revoke <agent-id-or-name>
 ```
 
-- A revoked client's compatibility row is kept (`revoked = true`) so audit
+- A revoked agent's compatibility row is kept (`revoked = true`) so audit
   history survives.
 - A unique name resolves automatically; an ambiguous name exits non-zero
-  with a list of matching `client_id`s so you can retry with the id.
+  with a list of matching ids so you can retry with the id.
 - If the daemon is alive at the moment of revocation, its WebSocket is
   closed with code **4014 "client revoked"** and the daemon exits
   non-zero without reconnecting.
@@ -851,11 +852,18 @@ vicoop-client revoke-client <client-id-or-name>
   indefinitely against a permanently-rejected token. The same 4005
   branch catches plain mis-typed / wrong tokens at first launch.
 - Propagation is **synchronous from the next auth attempt**: client-token
-  verification queries `clients` directly on every WS register with no
-  cache, so there is no equivalent of the 60s `callers` LRU window.
+  verification queries the unified `agents` table directly on every WS
+  register with no cache, so there is no equivalent of the 60s `callers`
+  LRU window.
 
-Both subcommands use the same owner-session bearer as `add-caller` /
-`remove-caller`; no SIWE re-sign required.
+Both subcommands use the same owner-session bearer as `agent callers add`
+/ `remove`; no SIWE re-sign required.
+
+> **Deprecated flat aliases.** The older `list-agents`, `list-clients`,
+> `revoke-client`, `add-caller`, `remove-caller`, and `list-callers`
+> commands still work but print a one-line deprecation warning to stderr
+> pointing at their `agent <sub>` replacement. They will be removed in a
+> future release.
 
 ## What's next
 
