@@ -165,29 +165,9 @@ Migration risk is low because the **caller wire shape is unchanged in both direc
 
 ## 7. PoC
 
-`docs/spikes/native-function-call-surface-poc.mjs` — single-shot Node script. Spawns the real `codex app-server` (codex-cli 0.130.0), runs the full handshake, injects one `DynamicToolSpec`, captures the model's `item/tool/call`, returns a synthetic result, and prints the turn's terminal assistant text. About 200 lines, no dependencies outside Node built-ins, and exits non-zero on any contract violation (no item/tool/call observed, schema mismatch, turn/failed, etc.).
+The spike originally shipped a standalone `*-poc.mjs` that spoke JSON-RPC to `codex app-server` directly, with no bridge code in the loop. That script proved the contract — `thread/start.dynamicTools` accepted, `item/tool/call` received, synthetic response unblocks the turn — and was removed once the production backend landed the same path. The end-to-end check now lives at `packages/client/scripts/e2e-codex-native-tools.mjs`, which drives the same scenario through the real backend (`createCodexBackend` + the openai-compat A2A surface) so a green run validates both the codex contract AND the bridge wiring at once.
 
-Run it:
-
-```
-node docs/spikes/native-function-call-surface-poc.mjs
-```
-
-Expected stdout:
-
-```
-[poc] spawning codex app-server …
-[poc] initialize OK
-[poc] thread/start OK threadId=…
-[poc] turn/start OK turnId=…
-[poc] >>> received item/tool/call name=get_weather args={"city":"Seoul"}
-[poc] <<< responded with synthetic result
-[poc] turn/completed status=completed
-[poc] assistant text: It's 17 °C and sunny in Seoul today.
-[poc] PASS
-```
-
-The PoC requires a working `codex` on PATH with valid auth (`~/.codex/auth.json`), the same prerequisite the existing `e2e-claude-text-*` scripts have.
+Same prereqs as the existing `e2e-claude-text-*` scripts: `codex` on PATH with valid `~/.codex/auth.json`.
 
 ## 8. Non-goals
 
