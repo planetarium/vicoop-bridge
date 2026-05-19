@@ -18,6 +18,12 @@ import {
   type SendFileMcpServer,
 } from './send-file-mcp.js';
 import {
+  startCallerToolsMcpServer,
+  type CallerToolDefinition,
+  type CallerToolInvocation,
+  type CallerToolsMcpServer,
+} from './caller-tools-mcp.js';
+import {
   FetchUriError,
   fetchUriToBytes,
   INPUT_FILE_MAX_BYTES,
@@ -105,6 +111,38 @@ export interface ClaudeBackendOptions {
   // thrown Error from `createClaudeBackend(...)` so misconfiguration is
   // visible at startup rather than as a corrupted argv on the first task.
   settings?: Record<string, unknown>;
+  /**
+   * Opt-in to the native-MCP dispatch path for openai-compat caller tools
+   * (#213) — the claude analog of codex's `dynamicTools` (#212). When true:
+   *
+   *   - The bridge stands up a per-task in-process MCP server
+   *     (`caller-tools-mcp.ts`) exposing the caller's `tools` as native MCP
+   *     tools, and adds it to claude's `--mcp-config` alongside any existing
+   *     `send_file` server.
+   *   - `--append-system-prompt` carries `buildOpenAICompatNativeSystemPrompt`
+   *     output (no JSON-envelope contract; just a "stop after invoking a
+   *     tool" directive plus the standard `<tool_call_history>` reading
+   *     rules).
+   *   - When the model invokes a caller tool, the bridge emits the same
+   *     `tool_calls` data artifact the envelope path emits today — wire
+   *     shape to the caller is unchanged.
+   *
+   * Default false: the envelope-text path (#208) remains the supported
+   * route until the native path has soaked. Flip to true once the new path
+   * has been validated against the operator's traffic shape.
+   *
+   * Independent of `sendFileMcp` — both MCP servers can coexist on the
+   * same spawn.
+   */
+  nativeToolDispatch?: boolean;
+  /**
+   * Test seam: invoked once per task with the caller-tools MCP server
+   * handle immediately after the bridge stands one up (native dispatch
+   * path only). Used by unit tests to drive `invokeForTest` against the
+   * exact server the spawn will see, without going through a real MCP
+   * transport. Not part of the public API — leave unset in production.
+   */
+  onCallerToolsMcpReady?: (server: CallerToolsMcpServer) => void;
 }
 
 // Kept short and behaviour-focused. The risk we're guarding against is
@@ -616,6 +654,108 @@ export function buildOpenAICompatSystemPrompt(meta: OpenAICompatMetadata): strin
   return sections.join('\n\n');
 }
 
+// Map the caller-provided OpenAI `tools` array (the wire shape used in
+// OpenAI Chat Completions: `{ type: 'function', function: { name, description,
+// parameters } }`) to `CallerToolDefinition[]` for `caller-tools-mcp`. Mirrors
+// `openaiToolsToDynamicToolSpecs` on the codex backend (#212) byte-for-byte
+// in its mapping rules — same dropped entries (no name, missing function
+// envelope, unknown type) and same empty-object schema default for tools
+// declared without `parameters`. Returns `null` when no usable entries
+// remain so callers can branch off "no tools to register" without checking
+// `length`.
+export function openaiToolsToCallerToolDefs(
+  tools: readonly unknown[],
+): CallerToolDefinition[] | null {
+  const out: CallerToolDefinition[] = [];
+  for (const t of tools) {
+    if (!t || typeof t !== 'object') continue;
+    const wrap = t as { type?: unknown; function?: unknown };
+    if (wrap.type !== 'function') continue;
+    if (!wrap.function || typeof wrap.function !== 'object') continue;
+    const fn = wrap.function as {
+      name?: unknown;
+      description?: unknown;
+      parameters?: unknown;
+    };
+    if (typeof fn.name !== 'string' || !fn.name) continue;
+    out.push({
+      name: fn.name,
+      description: typeof fn.description === 'string' ? fn.description : '',
+      // Forward the JSON Schema verbatim. The MCP server in turn forwards
+      // it to claude unchanged, so the model sees exactly what the caller
+      // declared. Missing `parameters` ⇒ the canonical empty-object
+      // schema, matching OpenAI's convention for parameterless functions.
+      inputSchema: fn.parameters ?? { type: 'object', properties: {} },
+    });
+  }
+  return out.length > 0 ? out : null;
+}
+
+// Build the system-prompt text injected via `--append-system-prompt` for the
+// **native** openai-compat path on the claude backend (#213). This is the
+// claude analog of codex's `composeNativeDevInstructions` (#212): the
+// envelope-teaching block is dropped because the caller's tools are exposed
+// to the model through the native MCP tool surface (`caller-tools-mcp.ts`),
+// so describing a JSON-emit contract would only fight the native dispatch
+// path the model already understands.
+//
+// What's kept and why:
+//   - Caller's `system` text — verbatim, first.
+//   - A "stop after one caller tool" directive. claude has no equivalent of
+//     codex's `turn/interrupt`, so we rely on the model to self-terminate
+//     after invoking a caller-provided tool. The MCP ack the bridge returns
+//     is intentionally short and uninformative; the actual result lands on
+//     the next turn via `tool_call_history`. Without this directive the
+//     model would often follow the ack with a synthesised "OK I called the
+//     tool" wrap-up or, worse, attempt to chain another call before the
+//     caller has seen the first one.
+//   - `<tool_call_history>` reading rules. Follow-up turns still text-prepend
+//     the history block (claude has no native equivalent of codex's
+//     `thread/inject_items`), so the model needs to know how to read it and
+//     not to repeat a call whose id is already resolved.
+//   - tool_choice descriptor for `"required"` and `{type:"function",function:
+//     {name}}` — same as the envelope path.
+//
+// What's dropped vs `buildOpenAICompatSystemPrompt`:
+//   - The "respond with ONLY a single JSON object …" envelope contract.
+//   - The full `JSON.stringify(meta.tools)` dump — the tools are visible to
+//     the model via MCP `tools/list`, so re-listing them in the prompt is
+//     redundant context.
+export function buildOpenAICompatNativeSystemPrompt(meta: OpenAICompatMetadata): string {
+  const sections: string[] = [];
+  if (meta.system) sections.push(meta.system);
+
+  const toolChoiceIsNone = meta.tool_choice === 'none';
+  const hasTools = meta.tools !== undefined && !toolChoiceIsNone;
+
+  if (hasTools) {
+    sections.push(
+      [
+        // The MCP tool names claude sees are namespaced `mcp__<server>__<name>`
+        // — we don't have to teach that here because the model already
+        // discovers them via `tools/list`. The directive below targets the
+        // BEHAVIOUR (one call per turn, then stop), not the naming.
+        'You are routed through an OpenAI-compatible gateway. The caller has supplied function tools that appear in your native tool list. Invoke them through your normal tool-use surface; do NOT emit them as JSON text.',
+        '',
+        'After invoking one of these caller-provided tools, STOP. Do not generate any further text, and do not invoke another tool in the same turn. The result of your call will be delivered to you on the next turn — any wrap-up sentence you emit now will be discarded by the bridge.',
+        '',
+        'On follow-up turns the user message may begin with a <tool_call_history>...</tool_call_history> block containing a JSON array of prior round-trips. Each entry is one of:',
+        '  - {"role":"assistant","tool_calls":[...]} — calls you previously emitted on an earlier turn.',
+        '  - {"role":"tool","tool_call_id":"call_…","name":"…","content":"…"} — the authoritative return value for one of those calls.',
+        'Treat the history as the source of truth for what has happened so far. Do NOT repeat a call whose tool_call_id already appears in the history. Either invoke a NEW caller-provided tool (to chain another call, observing the same one-call-per-turn rule) or compose a natural-language answer using the prior results.',
+      ].join('\n'),
+    );
+    const tcDesc = describeToolChoice(meta.tool_choice);
+    if (tcDesc) sections.push(tcDesc);
+  } else if (toolChoiceIsNone) {
+    sections.push(
+      'A list of OpenAI-style tools was supplied with tool_choice="none". Do not invoke any caller-provided tool; always answer in natural language.',
+    );
+  }
+
+  return sections.join('\n\n');
+}
+
 // Render a `tool_call_history` payload as a `<tool_call_history>`-wrapped
 // JSON block. Goes at the front of the user content on follow-up turns so
 // the model reads the prior round before the new instruction; the wrapper
@@ -837,6 +977,7 @@ export function createClaudeBackend(
     opts.sendFileMcp && opts.sendFileMcp.allowedRoots.length > 0
       ? opts.sendFileMcp
       : null;
+  const nativeToolDispatch = opts.nativeToolDispatch === true;
   // Static per-backend args (placed before extraArgs so an operator-supplied
   // `--append-system-prompt` in extraArgs concatenates AFTER ours rather than
   // being ignored — claude appends each occurrence in order).
@@ -985,6 +1126,19 @@ export function createClaudeBackend(
       // path with no envelope-detection cost.
       const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
 
+      // Native MCP dispatch (#213): when the backend was constructed with
+      // `nativeToolDispatch: true` and the caller actually supplied tools,
+      // we expose them through a per-task MCP server (`caller-tools-mcp`)
+      // instead of the JSON-text envelope contract. `callerToolDefs` is
+      // non-null only on that path; everything downstream branches off
+      // that single check so the envelope path stays bit-for-bit unchanged
+      // when the option is off.
+      const callerToolDefs =
+        nativeToolDispatch && callerToolDispatchActive(openaiCompat) && openaiCompat?.tools
+          ? openaiToolsToCallerToolDefs(openaiCompat.tools)
+          : null;
+      const nativeDispatchActive = callerToolDefs !== null;
+
       const mapped = await mapPartsToContentBlocks(task.message.parts, opts.fetchUriPolicy, signal);
       recorder.mark('map');
       if (mapped.ok && openaiCompat?.tool_call_history) {
@@ -1041,6 +1195,102 @@ export function createClaudeBackend(
         recorder.mark('mcp');
       }
 
+      // Flag flipped by the `caller-tools-mcp` invocation handler when the
+      // model invokes a caller-supplied tool. Read in the terminal block
+      // below to suppress re-stamping the model's wrap-up text on
+      // `status.message.parts` — the `tool_calls` data artifact is the
+      // complete output for this turn, matching OpenAI Chat Completions'
+      // `finish_reason: "tool_calls"` semantics (the same invariant codex
+      // backend enforces on its native path, see #212).
+      let capturedToolCall = false;
+
+      // Caller-side function tools, exposed as native MCP tools. Per-task
+      // lifecycle: stood up here BEFORE the spawn (so we know the URL to
+      // wire into `--mcp-config`), torn down in `closeCallerToolsMcp`
+      // which is called once per terminal path. A startup failure falls
+      // back to the non-native path on this task (envelope contract via
+      // `buildOpenAICompatSystemPrompt`) so a transient bind failure
+      // doesn't kill the whole turn.
+      let callerToolsMcp: CallerToolsMcpServer | null = null;
+      const closeCallerToolsMcp = async (): Promise<void> => {
+        // Idempotent: each return path may call this and we only want one
+        // real close. Nulling out before the await also avoids a race if a
+        // throw inside `close()` re-entered this function.
+        if (!callerToolsMcp) return;
+        const s = callerToolsMcp;
+        callerToolsMcp = null;
+        try {
+          await s.close();
+        } catch (err) {
+          console.warn(
+            `[claude] caller-tools MCP close failed: ${errorMessage(err)}`,
+          );
+        }
+      };
+      if (callerToolDefs) {
+        try {
+          callerToolsMcp = await startCallerToolsMcpServer({
+            // Tests drive this listener-free via `invokeForTest`; production
+            // leaves `skipHttp` unset so claude can connect over HTTP.
+            skipHttp: opts.onCallerToolsMcpReady !== undefined,
+            tools: callerToolDefs,
+            onInvoke: (invocation: CallerToolInvocation) => {
+              // Same OpenAI wire shape the envelope path emits — downstream
+              // gateways (oai2a2a) see no difference between native and
+              // envelope output, so this dispatch swap is invisible above
+              // the bridge layer.
+              const envelope = {
+                tool_calls: [
+                  {
+                    id: invocation.callId,
+                    function: {
+                      name: invocation.toolName,
+                      arguments: invocation.arguments,
+                    },
+                  },
+                ],
+              };
+              emit({
+                type: 'task.artifact',
+                taskId: task.taskId,
+                artifact: {
+                  artifactId: randomUUID(),
+                  name: 'claude-message',
+                  parts: [{ kind: 'data', data: envelope }],
+                  extensions: [OPENAI_COMPAT_EXTENSION_URI],
+                },
+                lastChunk: true,
+              });
+              capturedToolCall = true;
+              // The actual tool result is the caller's job — it arrives on
+              // the next A2A turn via `tool_call_history`. Returning a
+              // short structured-error ack here so claude sees "tool gave
+              // up; don't try again" rather than "tool succeeded with some
+              // text result" (which it might then try to summarise). The
+              // system-prompt directive in
+              // `buildOpenAICompatNativeSystemPrompt` reinforces the same
+              // stop-after-invoke rule from the prompt side.
+              return {
+                text: 'caller-tool call captured by bridge; the actual result will be delivered on the next turn',
+                isError: true,
+              };
+            },
+          });
+        } catch (err) {
+          console.warn(
+            `[claude] caller-tools MCP server failed to start; falling back to envelope path for this task: ${errorMessage(err)}`,
+          );
+        }
+        recorder.mark('caller-tools-mcp');
+        if (callerToolsMcp && opts.onCallerToolsMcpReady) {
+          opts.onCallerToolsMcpReady(callerToolsMcp);
+        }
+      }
+      // If startup failed, downgrade to envelope semantics for this turn
+      // so the run still completes (the operator's `nativeToolDispatch`
+      // opt-in is a backend default, not a hard requirement).
+      const nativeReady = nativeDispatchActive && callerToolsMcp !== null;
+
       // Per-task `--append-system-prompt` carrying the openai-compat
       // extension's system / tools / tool_choice. Placed AFTER identityArgs
       // (so the self-identity directive is the model's first read) but
@@ -1048,7 +1298,12 @@ export function createClaudeBackend(
       // appending last — claude concatenates each --append-system-prompt
       // occurrence in argv order).
       const openaiCompatArgs: readonly string[] = openaiCompat
-        ? ['--append-system-prompt', buildOpenAICompatSystemPrompt(openaiCompat)]
+        ? [
+            '--append-system-prompt',
+            nativeReady
+              ? buildOpenAICompatNativeSystemPrompt(openaiCompat)
+              : buildOpenAICompatSystemPrompt(openaiCompat),
+          ]
         : [];
       // Disable claude's built-in tools (Read / Glob / Bash / Edit / Write /
       // ...) when the caller has supplied its own tool definitions via the
@@ -1062,6 +1317,22 @@ export function createClaudeBackend(
       const disableBuiltinToolArgs: readonly string[] = callerToolDispatchActive(openaiCompat)
         ? ['--tools', '']
         : [];
+      // Cap claude to a single model turn when caller-tools are dispatched
+      // natively (#213). Without this, the model would treat our MCP
+      // sentinel ack (`isError:true` "captured by bridge…") as a tool
+      // failure and CHAIN further tool calls within the same A2A turn —
+      // each chain step is a full Anthropic API round-trip paying the
+      // system-prompt + tools-definition cost, AND every chained call is
+      // decided on stale / wrong feedback (the model never sees the
+      // caller's real tool result until the next OpenAI request comes in).
+      // Capping the turn forces a clean unwind after one tool call,
+      // mirroring codex's `turn/interrupt` behaviour under PR #212. The
+      // single text artifact path (no tool invoked) is unaffected because
+      // it still fits in one model turn. Off when nativeReady is false so
+      // the envelope path's existing semantics are preserved.
+      const nativeTurnCapArgs: readonly string[] = nativeReady
+        ? ['--max-turns', '1']
+        : [];
 
       const args: string[] = [
         '-p',
@@ -1073,19 +1344,33 @@ export function createClaudeBackend(
         // prints a banner and exits instead of streaming.
         '--verbose',
         ...(isResume ? ['--resume', sessionId] : ['--session-id', sessionId]),
-        ...(mcpServerForTask
-          ? [
-              '--mcp-config',
-              JSON.stringify({
-                mcpServers: {
-                  'vicoop-bridge': { type: 'http', url: mcpServerForTask.url },
-                },
-              }),
-            ]
-          : []),
+        // Both MCP servers ride on a single `--mcp-config` argv with one
+        // JSON blob. Keys are the MCP server names claude exposes the
+        // tools under (`mcp__<name>__<tool>` is the resulting tool-id
+        // pattern in the model's view). Either or both can be absent
+        // depending on opts; an entirely empty `mcpServers` map is
+        // skipped entirely so we don't pass an unused argv to claude.
+        ...((): readonly string[] => {
+          const mcpServers: Record<string, unknown> = {};
+          if (mcpServerForTask) {
+            mcpServers['vicoop-bridge'] = {
+              type: 'http',
+              url: mcpServerForTask.url,
+            };
+          }
+          if (callerToolsMcp) {
+            mcpServers['caller-tools'] = {
+              type: 'http',
+              url: callerToolsMcp.url,
+            };
+          }
+          if (Object.keys(mcpServers).length === 0) return [];
+          return ['--mcp-config', JSON.stringify({ mcpServers })];
+        })(),
         ...identityArgs,
         ...openaiCompatArgs,
         ...disableBuiltinToolArgs,
+        ...nativeTurnCapArgs,
         ...settingsArgs,
         ...extraArgs,
       ];
@@ -1120,6 +1405,7 @@ export function createClaudeBackend(
         recorder.mark('spawn');
       } catch (err) {
         rollbackFreshSession();
+        await closeCallerToolsMcp();
         emit({
           type: 'task.fail',
           taskId: task.taskId,
@@ -1144,6 +1430,7 @@ export function createClaudeBackend(
         // The freshly-minted sessionId never reached claude, so a follow-up
         // task on the same contextId must mint a new id rather than --resume.
         rollbackFreshSession();
+        await closeCallerToolsMcp();
         emit({
           type: 'task.fail',
           taskId: task.taskId,
@@ -1421,6 +1708,14 @@ export function createClaudeBackend(
       signal.removeEventListener('abort', onAbort);
       settled = true;
       sendFileRelease?.();
+      // Caller-tools MCP is per-task; release it as soon as claude has
+      // exited so a misbehaving model that keeps the MCP request open
+      // can't pin the listener after the run is conceptually done.
+      // Awaited so a slow close (the SDK's transport teardown is async)
+      // can't race a follow-up task starting a new server on the same
+      // port. Safe to await even on the success path because by here
+      // we're guaranteed claude has already disconnected.
+      await closeCallerToolsMcp();
       if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
 
       // Flush any trailing line without a newline. claude normally terminates
@@ -1445,6 +1740,7 @@ export function createClaudeBackend(
 
       if (exit.error) {
         rollbackFreshSession();
+        await closeCallerToolsMcp();
         emit({
           type: 'task.fail',
           taskId: task.taskId,
@@ -1456,7 +1752,21 @@ export function createClaudeBackend(
         return;
       }
 
-      if (exit.code !== 0) {
+      // Native dispatch (#213): under `--max-turns 1`, claude code exits
+      // with code 1 immediately after the model emits its tool_use(s) —
+      // it interprets the cap as "exceeded" the moment a follow-up turn
+      // would be needed to feed the tool_result back. The `tool_calls`
+      // data artifact(s) are already on the wire by this point, so the
+      // task IS effectively complete from the caller's perspective; the
+      // nonzero exit is bookkeeping noise, not a real failure. Same
+      // invariant codex backend enforces on its native path (PR #212
+      // maps `turn/interrupt` → `completed` when capturedToolCall is true).
+      // Caller-initiated abort still wins — surfacing a captured tool call
+      // when the caller explicitly canceled would override their request.
+      const treatExitAsSuccess =
+        capturedToolCall && exit.code !== 0 && !aborted;
+
+      if (exit.code !== 0 && !treatExitAsSuccess) {
         rollbackFreshSession();
         const detail = stderrTail.trim();
         const sigPart = exit.signal ? ` (signal ${exit.signal})` : '';
@@ -1486,7 +1796,15 @@ export function createClaudeBackend(
       // by index. See issue #200.
       const envelopeAlreadyRouted =
         openaiCompat !== null && tryParseToolCallsEnvelope(completeText) !== null;
-      const parts: Part[] = !envelopeAlreadyRouted && completeText
+      // Native MCP dispatch (#213): when the model invoked a caller tool,
+      // the `tool_calls` data artifact is the complete task output. Any
+      // wrap-up text the model produced before exiting the turn (the
+      // system-prompt directive tells it to stop, but models occasionally
+      // emit a brief acknowledgement anyway) is reasoning preamble and
+      // must NOT be re-stamped on `status.message.parts` — same invariant
+      // codex backend enforces under PR #212, same root-cause concern as
+      // #200 on the envelope path.
+      const parts: Part[] = !envelopeAlreadyRouted && !capturedToolCall && completeText
         ? [{ kind: 'text', text: completeText }]
         : [];
 

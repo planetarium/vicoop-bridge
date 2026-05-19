@@ -5,16 +5,19 @@ import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import {
+  buildOpenAICompatNativeSystemPrompt,
   buildOpenAICompatSystemPrompt,
   callerToolDispatchActive,
   createClaudeBackend,
   formatToolCallHistory,
+  openaiToolsToCallerToolDefs,
   parseOpenAICompatMetadata,
   summarizeToolInput,
   tryParseToolCallsEnvelope,
   type ClaudeChildHandle,
   type ClaudeSpawnOptions,
 } from './claude.js';
+import { startCallerToolsMcpServer } from './caller-tools-mcp.js';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
   TRACEABILITY_EXTENSION_URI,
@@ -2547,4 +2550,600 @@ test('zero cacheRead does not surface a cached_tokens breakdown', async () => {
   // Omit prompt_tokens_details entirely when there's nothing meaningful to
   // mirror — keeps the wire shape minimal.
   assert.equal(payload?.usage?.prompt_tokens_details, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Native MCP dispatch (#213) — claude analog of codex's #212/dynamicTools.
+// The envelope path stays the default; these tests cover the new path that
+// activates when `nativeToolDispatch: true` is passed to the backend AND the
+// caller has supplied openai-compat tools.
+// ---------------------------------------------------------------------------
+
+// Unit cover for the OpenAI → CallerToolDefinition mapping. The MCP server
+// forwards `inputSchema` verbatim to claude, so getting this mapping right
+// is the only place we filter malformed shapes before they reach the model.
+test('openaiToolsToCallerToolDefs maps OpenAI tools and drops malformed entries (#213)', () => {
+  const out = openaiToolsToCallerToolDefs([
+    {
+      type: 'function',
+      function: {
+        name: 'fetch',
+        description: 'Fetch a URL',
+        parameters: { type: 'object', properties: { url: { type: 'string' } } },
+      },
+    },
+    // Below must be dropped — the gateway already validated the OpenAI
+    // shape upstream, but the bridge is the last filter before claude
+    // sees a tools/list response and silently misbehaves on a bad spec.
+    { type: 'function' }, // no function body
+    { type: 'function', function: { description: 'no name' } },
+    { type: 'function', function: { name: '' } }, // empty name
+    null,
+    'oops',
+    { function: { name: 'no-type-wrapper' } }, // missing type:"function"
+  ] as unknown[]);
+  assert.ok(Array.isArray(out));
+  assert.equal(out?.length, 1);
+  assert.deepEqual(out?.[0], {
+    name: 'fetch',
+    description: 'Fetch a URL',
+    inputSchema: { type: 'object', properties: { url: { type: 'string' } } },
+  });
+
+  // Empty / all-invalid inputs return null (callers branch off "no tools
+  // to register" without poking `.length`).
+  assert.equal(openaiToolsToCallerToolDefs([]), null);
+  assert.equal(openaiToolsToCallerToolDefs([null, undefined]), null);
+
+  // A tool with no `parameters` becomes the canonical empty-object schema
+  // (matches OpenAI's convention for parameterless functions and gives
+  // claude's MCP runtime a syntactically valid JSON Schema to load).
+  const noParams = openaiToolsToCallerToolDefs([
+    { type: 'function', function: { name: 'ping' } },
+  ]);
+  assert.deepEqual(noParams?.[0]?.inputSchema, {
+    type: 'object',
+    properties: {},
+  });
+});
+
+// Native system-prompt: must NOT carry the envelope-teaching block (the
+// model uses MCP natively now; teaching it the JSON contract would invite
+// it to drop into the brittle envelope path and re-create the exact
+// failures #208 catalogued). Must still carry the user's `system` text and
+// the `<tool_call_history>` reading rules (resume turns still text-prepend
+// the history block because claude has no native history-injection path).
+test('buildOpenAICompatNativeSystemPrompt drops envelope contract, keeps system + history rules (#213)', () => {
+  const out = buildOpenAICompatNativeSystemPrompt({
+    system: 'be terse',
+    tools: [{ type: 'function', function: { name: 'fetch' } }],
+    tool_choice: 'auto',
+  });
+  // The user's system text leads.
+  assert.ok(out.startsWith('be terse'));
+  // The envelope contract — the very thing this path replaces — must be
+  // absent. The legacy helper emits a literal '{"tool_calls":' substring
+  // in its contract block; we assert it's missing here.
+  assert.equal(out.includes('{"tool_calls"'), false);
+  assert.equal(out.includes('respond with ONLY a single JSON object'), false);
+  // History-reading rules stay — resume turns need them.
+  assert.ok(out.includes('<tool_call_history>'));
+  // Stop-after-invoke directive — without this, claude has no equivalent
+  // of codex's `turn/interrupt` and may chain or wrap up after a call.
+  assert.ok(out.toLowerCase().includes('stop'));
+
+  // tool_choice="required" gets a steering line (same descriptor the
+  // envelope path uses; `describeToolChoice` is shared).
+  const required = buildOpenAICompatNativeSystemPrompt({
+    tools: [],
+    tool_choice: 'required',
+  });
+  assert.ok(required.includes('tool_choice="required"'));
+
+  // tool_choice="none" → no envelope, just a "don't invoke caller tools"
+  // directive. Must NOT include the stop-after-invoke text (would
+  // contradict "never invoke").
+  const none = buildOpenAICompatNativeSystemPrompt({
+    tools: [],
+    tool_choice: 'none',
+  });
+  assert.ok(none.includes('tool_choice="none"'));
+  assert.equal(none.toLowerCase().includes('after invoking'), false);
+
+  // Bare `system` with no tools — emits just the system text.
+  assert.equal(
+    buildOpenAICompatNativeSystemPrompt({ system: 'just be terse' }),
+    'just be terse',
+  );
+});
+
+// caller-tools MCP module: the onInvoke wiring. We drive the tool through
+// `invokeForTest` (skipHttp:true so no listener bind), then verify the ack
+// shape and that arguments are passed through verbatim. End-to-end via a
+// real HTTP MCP client is deliberately out of scope here — we cover the
+// claude.ts wiring through the test seam below.
+test('caller-tools MCP: invokeForTest routes args + ack verbatim (#213)', async () => {
+  const seen: Array<{ name: string; args: unknown; callId: string }> = [];
+  const server = await startCallerToolsMcpServer({
+    tools: [
+      {
+        name: 'fetch',
+        description: 'Fetch a URL',
+        inputSchema: {
+          type: 'object',
+          properties: { url: { type: 'string' } },
+        },
+      },
+    ],
+    onInvoke: (inv) => {
+      seen.push({ name: inv.toolName, args: inv.arguments, callId: inv.callId });
+      return { text: 'captured', isError: true };
+    },
+    skipHttp: true,
+  });
+  try {
+    const ack = await server.invokeForTest({
+      callId: 'call_42',
+      toolName: 'fetch',
+      arguments: { url: 'https://example.com' },
+    });
+    assert.deepEqual(ack, { text: 'captured', isError: true });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].name, 'fetch');
+    assert.deepEqual(seen[0].args, { url: 'https://example.com' });
+    assert.equal(seen[0].callId, 'call_42');
+  } finally {
+    await server.close();
+  }
+});
+
+// onInvoke throwing must NOT crash the request — the server has to ack so
+// claude doesn't block on the MCP call forever. The bridge wraps the
+// thrown error into an isError ack.
+test('caller-tools MCP: onInvoke throw is wrapped as isError ack (#213)', async () => {
+  const server = await startCallerToolsMcpServer({
+    tools: [
+      { name: 't', description: '', inputSchema: { type: 'object' } },
+    ],
+    onInvoke: () => {
+      throw new Error('boom');
+    },
+    skipHttp: true,
+  });
+  try {
+    const ack = await server.invokeForTest({
+      callId: 'c',
+      toolName: 't',
+      arguments: {},
+    });
+    assert.equal(ack.isError, true);
+    assert.ok(ack.text.includes('boom'));
+  } finally {
+    await server.close();
+  }
+});
+
+// Argv composition: with `nativeToolDispatch: true` and caller tools the
+// argv must (a) include a `--mcp-config` with a `caller-tools` server,
+// (b) carry the native system prompt (no envelope contract substring),
+// (c) still pass `--tools ""` to suppress claude's built-ins.
+test('argv: nativeToolDispatch wires caller-tools MCP + native prompt + --tools "" (#213)', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    nativeToolDispatch: true,
+    // Test seam: bind no HTTP listener (would leak ports across tests),
+    // but capture the running server handle for follow-up assertions.
+    onCallerToolsMcpReady: () => {
+      /* presence assertion below */
+    },
+  });
+
+  let capturedServer: unknown = null;
+  const backend2 = createClaudeBackend({
+    spawn: fake.spawn,
+    nativeToolDispatch: true,
+    onCallerToolsMcpReady: (s) => {
+      capturedServer = s;
+    },
+  });
+
+  const { emit } = collect();
+  await backend2.handle(
+    {
+      ...assign('do a fetch'),
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'do a fetch' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            system: 'be terse',
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'fetch',
+                  description: 'Fetch a URL',
+                  parameters: { type: 'object', properties: {} },
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+    emit,
+    NEVER,
+  );
+
+  assert.ok(capturedServer, 'caller-tools MCP server handle exposed to test seam');
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  const args = child!.args;
+
+  // (a) --mcp-config carries a `caller-tools` server entry.
+  const cfgIdx = args.indexOf('--mcp-config');
+  assert.notEqual(cfgIdx, -1, 'expected --mcp-config in argv');
+  const cfg = JSON.parse(args[cfgIdx + 1] as string) as {
+    mcpServers?: Record<string, { type?: string; url?: string }>;
+  };
+  assert.ok(cfg.mcpServers?.['caller-tools'], 'caller-tools MCP server registered');
+  assert.equal(cfg.mcpServers?.['caller-tools']?.type, 'http');
+
+  // (b) --append-system-prompt carries the native variant — the envelope
+  // contract block (the literal `{"tool_calls"` substring the legacy
+  // prompt teaches) must be absent.
+  const apsIdx = args.indexOf('--append-system-prompt');
+  assert.notEqual(apsIdx, -1, '--append-system-prompt present');
+  const prompt = args[apsIdx + 1] as string;
+  assert.equal(prompt.includes('{"tool_calls"'), false);
+  assert.ok(prompt.startsWith('be terse'));
+
+  // (c) --tools "" still passed (same gate as envelope path — caller
+  // tools should be the ONLY tool surface available to the model).
+  const toolsIdx = args.indexOf('--tools');
+  assert.notEqual(toolsIdx, -1);
+  assert.equal(args[toolsIdx + 1], '');
+
+  // Use the unused first backend so the variable isn't dead.
+  void backend;
+});
+
+// End-to-end (with test seam): the model "invokes" the caller tool via
+// the MCP server's `invokeForTest` while claude is mid-run; the bridge
+// emits a `tool_calls` data artifact with the OpenAI wire shape and
+// suppresses any subsequent agent text from `status.message.parts` on
+// completion. Same invariant codex backend enforces under #212.
+test('native dispatch: tool invocation emits tool_calls artifact + suppresses final text (#213)', async () => {
+  // Drive claude's stream-json from outside so we can interleave the
+  // MCP invocation. The fake child stays alive until `finish()` so the
+  // bridge can route the artifact emit through the live `emit` capture.
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      child.emitStdout(
+        JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' }) + '\n',
+      );
+      // The model "decides" to call a tool — in real life this fires an
+      // MCP `tools/call` against our server. In test we drive
+      // `invokeForTest` directly from the seam below. Then the model
+      // ends the turn with a result event.
+      // (Order: seam fires invokeForTest BEFORE we emit the result line.)
+    });
+  });
+
+  const { emit, frames } = collect();
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    nativeToolDispatch: true,
+    onCallerToolsMcpReady: async (server) => {
+      // Drive the synthetic tool call. The bridge's onInvoke captures
+      // this and emits the tool_calls artifact.
+      const ack = await server.invokeForTest({
+        callId: 'call_xyz',
+        toolName: 'fetch',
+        arguments: { url: 'https://example.com' },
+      });
+      assert.equal(ack.isError, true);
+      // After the bridge has captured, simulate claude wrapping up the
+      // turn with a brief text emission AND a final result. The text
+      // must NOT land on status.message.parts (capturedToolCall flag).
+      const child = fake.lastChild();
+      if (!child) return;
+      child.emitStdout(
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'OK, calling that for you.' }],
+          },
+        }) + '\n',
+      );
+      child.emitStdout(
+        JSON.stringify({
+          type: 'result',
+          subtype: 'success',
+          result: 'OK, calling that for you.',
+        }) + '\n',
+      );
+      setImmediate(() => child.finish(0));
+    },
+  });
+
+  await backend.handle(
+    {
+      ...assign('fetch example.com'),
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'fetch example.com' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            system: 'be terse',
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'fetch',
+                  description: 'Fetch a URL',
+                  parameters: {
+                    type: 'object',
+                    properties: { url: { type: 'string' } },
+                    required: ['url'],
+                  },
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+    emit,
+    NEVER,
+  );
+
+  // Locate the tool_calls artifact (data part with the OPENAI_COMPAT
+  // extension). Bridge emits it as soon as onInvoke fires.
+  const toolCallsArtifact = frames.find(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
+      f.type === 'task.artifact' &&
+      f.artifact.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI) === true &&
+      f.artifact.parts[0]?.kind === 'data',
+  );
+  assert.ok(toolCallsArtifact, 'tool_calls data artifact emitted under openai-compat extension');
+  if (toolCallsArtifact) {
+    const data = (toolCallsArtifact.artifact.parts[0] as { data: unknown }).data as {
+      tool_calls?: Array<{
+        id?: string;
+        function?: { name?: string; arguments?: unknown };
+      }>;
+    };
+    assert.equal(data.tool_calls?.length, 1);
+    assert.equal(data.tool_calls?.[0]?.id, 'call_xyz');
+    assert.equal(data.tool_calls?.[0]?.function?.name, 'fetch');
+    assert.deepEqual(data.tool_calls?.[0]?.function?.arguments, {
+      url: 'https://example.com',
+    });
+  }
+
+  // Terminal frame: state=completed, NO text in status.message.parts.
+  // The tool_calls artifact is the complete output; any wrap-up text the
+  // model emitted ("OK, calling that for you.") is reasoning preamble
+  // and is dropped on completion to avoid the #200-style double-emit
+  // downstream gateways would otherwise produce.
+  const complete = frames.find(
+    (f): f is Extract<UpFrame, { type: 'task.complete' }> => f.type === 'task.complete',
+  );
+  assert.ok(complete);
+  assert.equal(complete?.status.state, 'completed');
+  const parts = complete?.status.message?.parts ?? [];
+  const hasText = parts.some((p) => p.kind === 'text');
+  assert.equal(hasText, false, 'no text in status.message.parts when tool was captured');
+});
+
+// `--max-turns 1` + exit-code-1 mapping (#213): with native dispatch active,
+// claude code hits the turn cap immediately after the model emits its
+// tool_use(s) and exits with code 1. The bridge MUST map that exit to a
+// successful task.complete when a tool call was captured (the `tool_calls`
+// artifact is the complete output for this turn — same invariant codex
+// backend enforces under PR #212). Without this mapping every native
+// tool-using task would surface as task.fail to the caller, breaking the
+// OpenAI Chat Completions `finish_reason: "tool_calls"` round-trip.
+test('native dispatch: --max-turns 1 exits with code 1; bridge maps to completed when tool captured (#213)', async () => {
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      child.emitStdout(
+        JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' }) + '\n',
+      );
+    });
+  });
+
+  const { emit, frames } = collect();
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    nativeToolDispatch: true,
+    onCallerToolsMcpReady: async (server) => {
+      // Drive the synthetic tool call.
+      await server.invokeForTest({
+        callId: 'call_xyz',
+        toolName: 'fetch',
+        arguments: { url: 'https://example.com' },
+      });
+      // claude code's `--max-turns 1` reaction: exits with code 1 the
+      // moment a follow-up turn would be needed. The artifact is already
+      // on the wire; the bridge must still surface a success terminal.
+      const child = fake.lastChild();
+      if (child) setImmediate(() => child.finish(1));
+    },
+  });
+
+  await backend.handle(
+    {
+      ...assign('fetch example.com'),
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'fetch example.com' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tools: [
+              {
+                type: 'function',
+                function: { name: 'fetch', parameters: { type: 'object' } },
+              },
+            ],
+          },
+        },
+      },
+    },
+    emit,
+    NEVER,
+  );
+
+  // argv carries `--max-turns 1` when native dispatch fires.
+  const child = fake.lastChild()!;
+  const mtIdx = child.args.indexOf('--max-turns');
+  assert.notEqual(mtIdx, -1, '--max-turns present');
+  assert.equal(child.args[mtIdx + 1], '1');
+
+  // Terminal must be task.complete with state=completed, NOT task.fail.
+  // The exit-code-1 from claude is bookkeeping noise once a tool was
+  // captured.
+  const terminal = frames.at(-1);
+  assert.ok(terminal);
+  assert.equal(terminal?.type, 'task.complete');
+  if (terminal?.type === 'task.complete') {
+    assert.equal(terminal.status.state, 'completed');
+  }
+
+  // No task.fail anywhere in the stream.
+  const failFrame = frames.find((f) => f.type === 'task.fail');
+  assert.equal(failFrame, undefined, 'task.fail must not be emitted');
+
+  // The tool_calls artifact is still on the wire.
+  const dataArt = frames.find(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
+      f.type === 'task.artifact' && f.artifact.parts[0]?.kind === 'data',
+  );
+  assert.ok(dataArt, 'tool_calls artifact emitted before exit');
+});
+
+// Inverse: claude exits non-zero WITHOUT any tool capture (e.g., a real
+// startup failure). The bridge must still surface task.fail — we never
+// want the exit-success mapping to silently swallow real errors. The gate
+// is `capturedToolCall`, not just "native dispatch active."
+test('native dispatch: exit-code-1 with NO tool capture still fails (#213)', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' }),
+    ],
+    stderr: 'fatal: model API unreachable',
+    exitCode: 1,
+  });
+  const { emit, frames } = collect();
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    nativeToolDispatch: true,
+  });
+
+  await backend.handle(
+    {
+      ...assign('do a fetch'),
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'do a fetch' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tools: [
+              {
+                type: 'function',
+                function: { name: 'fetch', parameters: { type: 'object' } },
+              },
+            ],
+          },
+        },
+      },
+    },
+    emit,
+    NEVER,
+  );
+
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.fail');
+  if (terminal.type === 'task.fail') {
+    assert.equal(terminal.error.code, 'claude_exit_nonzero');
+    assert.ok(terminal.error.message.includes('model API unreachable'));
+  }
+});
+
+// nativeToolDispatch:false (the default) preserves the envelope path
+// bit-for-bit — same argv, same prompt, same artifact emission. Belt-and-
+// suspenders against accidentally flipping the new path on for every
+// caller.
+test('native dispatch off: envelope path unchanged (#213)', async () => {
+  const envelope = JSON.stringify({
+    tool_calls: [{ id: 'c', function: { name: 'fetch', arguments: '{}' } }],
+  });
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: envelope }] },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: envelope }),
+    ],
+    exitCode: 0,
+  });
+  // No nativeToolDispatch:true here — envelope path stays in force.
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(
+    {
+      ...assign('hi'),
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'hi' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tools: [
+              { type: 'function', function: { name: 'fetch' } },
+            ],
+          },
+        },
+      },
+    },
+    emit,
+    NEVER,
+  );
+
+  // The envelope-shaped agent message must still surface as a data part
+  // (existing behaviour — tested elsewhere too; this assertion guards
+  // the off-by-default invariant specifically).
+  const dataArt = frames.find(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
+      f.type === 'task.artifact' &&
+      f.artifact.parts[0]?.kind === 'data',
+  );
+  assert.ok(dataArt, 'envelope path emits data part as before');
+
+  // Argv has NO `caller-tools` server. The legacy envelope path
+  // doesn't bring up the MCP impersonation server at all.
+  const child = fake.lastChild()!;
+  const cfgIdx = child.args.indexOf('--mcp-config');
+  if (cfgIdx !== -1) {
+    const cfg = JSON.parse(child.args[cfgIdx + 1] as string) as {
+      mcpServers?: Record<string, unknown>;
+    };
+    assert.equal(cfg.mcpServers?.['caller-tools'], undefined);
+  }
 });

@@ -234,6 +234,7 @@ function pickBackend(name: string, args: Args): Backend {
         cwd: args.claudeCwd,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
         settings,
+        nativeToolDispatch: args.claudeNativeToolDispatch === true,
       });
     }
     case 'codex':
