@@ -43,11 +43,11 @@ export const setupCmd = command(
     })),
     // `--env-file` is an alias for `--write-env-file` (older docs used it).
     envFileAlias: optional(option('--env-file', string({ metavar: 'PATH' }))),
-    bridge: optional(option('--bridge', string({ metavar: 'URL' }), {
+    server: optional(option('--server', string({ metavar: 'URL' }), {
       description: message`Override the bridge URL from the saved owner-session. Pair with --token.`,
     })),
     token: optional(option('--token', string({ metavar: 'TOKEN' }), {
-      description: message`Override the owner-session token from disk. Pair with --bridge.`,
+      description: message`Override the owner-session token from disk. Pair with --server.`,
     })),
     json: withDefault(flag('--json', {
       description: message`Print the registerClient response as JSON to stdout instead of persisting to config.json.`,
@@ -78,11 +78,11 @@ export const agentRegisterCmd = command(
       description: message`Also emit a shell-sourceable env file. Daemon does NOT consume these env vars (#189 §5); the file is purely an operator-side credentials backup / scripting hook.`,
     })),
     envFileAlias: optional(option('--env-file', string({ metavar: 'PATH' }))),
-    bridge: optional(option('--bridge', string({ metavar: 'URL' }), {
+    server: optional(option('--server', string({ metavar: 'URL' }), {
       description: message`Override the bridge URL from the saved owner-session. Pair with --token.`,
     })),
     token: optional(option('--token', string({ metavar: 'TOKEN' }), {
-      description: message`Override the owner-session token from disk. Pair with --bridge.`,
+      description: message`Override the owner-session token from disk. Pair with --server.`,
     })),
     json: withDefault(flag('--json', {
       description: message`Print the registration response as JSON to stdout instead of persisting to config.json.`,
@@ -355,7 +355,10 @@ interface ExecuteRegistrationOpts {
   allowedAgentIds: string[];
   callers: string[];
   envFile: string | null;
-  bridge: string | null;
+  // Override URL for the bridge (was `--bridge` pre-rename). Surfaced as
+  // `--server` on the CLI for parity with the daemon flag (#225-style
+  // rename); kept as `server` here to match the args field name.
+  server: string | null;
   token: string | null;
   json: boolean;
   labels: RegistrationLabels;
@@ -373,22 +376,22 @@ async function executeRegistration(opts: ExecuteRegistrationOpts): Promise<numbe
   }
 
   const stored = resolveOwnerSession();
-  if ((opts.bridge && !opts.token) || (!opts.bridge && opts.token)) {
+  if ((opts.server && !opts.token) || (!opts.server && opts.token)) {
     process.stderr.write(
-      'Pass --bridge and --token together. Owner-session credentials are tied to their bridge URL.\n',
+      'Pass --server and --token together. Owner-session credentials are tied to their bridge URL.\n',
     );
     return 1;
   }
 
-  const session = opts.bridge && opts.token
-    ? { bridge: opts.bridge, token: opts.token }
+  const session = opts.server && opts.token
+    ? { bridge: opts.server, token: opts.token }
     : stored;
   const bridge = session?.bridge;
   const token = session?.token;
   if (!bridge || !token) {
     process.stderr.write(
-      'No owner-session bearer found. Run `vicoop-client login --bridge <URL>` first, ' +
-        'or pass --bridge and --token explicitly (or set VICOOP_BRIDGE / VICOOP_OWNER_TOKEN).\n',
+      'No owner-session bearer found. Run `vicoop-client auth login --server <URL>` first, ' +
+        'or pass --server and --token explicitly (or set VICOOP_BRIDGE / VICOOP_OWNER_TOKEN).\n',
     );
     return 1;
   }
@@ -399,7 +402,7 @@ async function executeRegistration(opts: ExecuteRegistrationOpts): Promise<numbe
   // exactly once from the bridge, and `writeConfigForSetup` then throws the
   // same "refusing to overwrite" error — leaving the operator with no token
   // and no record of it. Only `--json` is exempt (it skips persistence and
-  // prints the token to stdout); `--bridge/--token` overrides change *where*
+  // prints the token to stdout); `--server/--token` overrides change *where*
   // the owner session comes from, not *where* the credentials get persisted,
   // so they still write canonical config.json and need the same preflight.
   if (!opts.json) {
@@ -550,7 +553,7 @@ export async function runSetup(args: SetupArgs): Promise<number> {
     allowedAgentIds: args.allowedAgentIds,
     callers,
     envFile: args.envFile ?? args.envFileAlias ?? null,
-    bridge: args.bridge ?? null,
+    server: args.server ?? null,
     token: args.token ?? null,
     json: args.json,
     labels: {
@@ -573,7 +576,7 @@ export async function runAgentRegister(args: AgentRegisterArgs): Promise<number>
     allowedAgentIds: [args.agentId],
     callers,
     envFile: args.envFile ?? args.envFileAlias ?? null,
-    bridge: args.bridge ?? null,
+    server: args.server ?? null,
     token: args.token ?? null,
     json: args.json,
     labels: {

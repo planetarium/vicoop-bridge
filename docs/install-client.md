@@ -151,7 +151,7 @@ echo "$AGENT_ID"
 > default to the public bridge at `https://vicoop-bridge-server.fly.dev`
 > (HTTPS for `login` / `agent register` / admin commands; `wss://…` for the
 > daemon). If you
-> run your own bridge, pass `--bridge <https://your-bridge>` to `login` and
+> run your own bridge, pass `--server <https://your-bridge>` to `auth login` and
 > `--server <wss://your-bridge>` to the daemon (or persist `server_url`
 > in `config.json`). Every example below uses the public defaults; the
 > self-host overrides are the only place the URL has to change.
@@ -184,7 +184,7 @@ CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
   --caller "eth:0x<40-hex>"
 ```
 
-(Self-hosting? Pass `--bridge https://<your-bridge>` to `login`.)
+(Self-hosting? Pass `--server https://<your-bridge>` to `auth login`.)
 
 `login` prints a verification URL to stderr — open it in **any** browser
 (the same machine, or your laptop while running the CLI on a headless host)
@@ -700,7 +700,7 @@ published release:
 "$INSTALL_DIR/vicoop-client" agent callers add "$AGENT_ID" "eth:0x<40-hex>"
 "$INSTALL_DIR/vicoop-client" agent callers remove "$AGENT_ID" "google:email:caller@example.com"
 
-# Pass --json for machine-readable output, or --bridge / --token to override
+# Pass --json for machine-readable output, or --server / --token to override
 # the saved session for one call. VICOOP_BRIDGE / VICOOP_OWNER_TOKEN env vars
 # work too (handy for CI).
 ```
@@ -712,10 +712,10 @@ separate `owner-session.json` that `login` writes alongside it). If the
 saved bearer is missing or expired, refresh it without re-registering:
 
 ```sh
-"$INSTALL_DIR/vicoop-client" login
+"$INSTALL_DIR/vicoop-client" auth login
 ```
 
-(Self-hosting? Pass `--bridge https://<your-bridge>`.)
+(Self-hosting? Pass `--server https://<your-bridge>`.)
 
 These talk to the bridge's `/admin-api/*` routes — same logic the admin
 agent's tools run, but without an LLM round-trip per call.

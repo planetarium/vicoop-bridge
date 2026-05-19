@@ -21,8 +21,8 @@ import {
 // command. Defined once so the two parsers stay in lockstep — adding a
 // flag in one place automatically surfaces in the other.
 const loginFields = {
-  bridge: optional(
-    option('--bridge', string({ metavar: 'URL' }), {
+  server: optional(
+    option('--server', string({ metavar: 'URL' }), {
       description: message`Bridge HTTPS URL (defaults to ${DEFAULT_BRIDGE_HTTPS_URL}; override only when running your own bridge).`,
     }),
   ),
@@ -171,7 +171,7 @@ function saveOwnerSessionBearer(bridgeUrl: string, success: OwnerSessionSuccess)
 // accepts this so the handler body is written once and the two thin entry
 // points only differ in whether they emit a deprecation warning.
 interface LoginCommonArgs {
-  bridge?: string;
+  server?: string;
   json: boolean;
   pollOnce: boolean;
 }
@@ -190,9 +190,9 @@ export async function runLogin(args: LoginArgs): Promise<number> {
 }
 
 async function executeLogin(args: LoginCommonArgs): Promise<number> {
-  // No --bridge → public default (#189 §6). Self-hosters pass
-  // `--bridge https://bridge.example.com`.
-  const bridge = args.bridge ?? DEFAULT_BRIDGE_HTTPS_URL;
+  // No --server → public default (#189 §6). Self-hosters pass
+  // `--server https://bridge.example.com`.
+  const bridge = args.server ?? DEFAULT_BRIDGE_HTTPS_URL;
 
   let device: DeviceCodeResponse;
   try {

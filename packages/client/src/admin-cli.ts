@@ -20,11 +20,11 @@ import { agentRegisterCmd } from './setup.js';
 // All six admin subcommands share the same auth/output flags. Define them
 // once and splice into each command's parser to keep the surface uniform.
 const sharedFlags = {
-  bridge: optional(option('--bridge', string({ metavar: 'URL' }), {
+  server: optional(option('--server', string({ metavar: 'URL' }), {
     description: message`Override the bridge URL from the saved owner-session. Pair with --token.`,
   })),
   token: optional(option('--token', string({ metavar: 'TOKEN' }), {
-    description: message`Override the owner-session token from disk. Pair with --bridge.`,
+    description: message`Override the owner-session token from disk. Pair with --server.`,
   })),
   json: withDefault(flag('--json', {
     description: message`Emit a machine-readable JSON response.`,
@@ -220,26 +220,28 @@ interface Session {
   token: string;
 }
 
-// Auth resolution shared by every admin handler. Explicit --bridge/--token
-// wins; otherwise we fall back to the file `vicoop-client login` wrote (or
-// VICOOP_BRIDGE / VICOOP_OWNER_TOKEN if the operator prefers env, which is
-// owner-session-bootstrap, *not* daemon runtime config — see #189 §5
-// rationale).
+// Auth resolution shared by every admin handler. Explicit --server/--token
+// wins; otherwise we fall back to the file `vicoop-client auth login` wrote
+// (or VICOOP_BRIDGE / VICOOP_OWNER_TOKEN if the operator prefers env, which
+// is owner-session-bootstrap, *not* daemon runtime config — see #189 §5
+// rationale). The on-disk owner-session schema still names the field
+// `bridge`; only the args / flag layer was renamed to `server` for parity
+// with the daemon flag (#225-style rename folded into #218 / #224).
 function resolveSession(args: {
-  bridge?: string;
+  server?: string;
   token?: string;
 }): Session | { error: string } {
-  if (args.bridge && args.token) {
-    return { bridge: args.bridge.replace(/\/$/, ''), token: args.token };
+  if (args.server && args.token) {
+    return { bridge: args.server.replace(/\/$/, ''), token: args.token };
   }
   const stored = resolveOwnerSession();
-  const bridge = args.bridge ?? stored?.bridge;
+  const bridge = args.server ?? stored?.bridge;
   const token = args.token ?? stored?.token;
   if (!bridge || !token) {
     return {
       error:
-        'No owner-session bearer found. Run `vicoop-client login --bridge <URL>` first, ' +
-        'or pass --bridge and --token explicitly (or set VICOOP_BRIDGE / VICOOP_OWNER_TOKEN).',
+        'No owner-session bearer found. Run `vicoop-client auth login --server <URL>` first, ' +
+        'or pass --server and --token explicitly (or set VICOOP_BRIDGE / VICOOP_OWNER_TOKEN).',
     };
   }
   return { bridge: bridge.replace(/\/$/, ''), token };

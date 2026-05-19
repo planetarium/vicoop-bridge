@@ -31,7 +31,7 @@ import {
 // `runXxx` handlers now take the parser's discriminated-union output.
 // Tests construct that shape directly. Shared auth/output fields default
 // to undefined/false so each test only specifies what it cares about.
-const SHARED = { bridge: undefined, token: undefined, json: false } as const;
+const SHARED = { server: undefined, token: undefined, json: false } as const;
 const listAgentsArgs = (p: Partial<ListAgentsArgs> = {}): ListAgentsArgs =>
   ({ action: 'list-agents', ...SHARED, ...p });
 const listClientsArgs = (p: Partial<ListClientsArgs> = {}): ListClientsArgs =>
@@ -299,7 +299,7 @@ test('subcommand exits 1 with hint when no token is available', async (t) => {
 
   const code = await runListAgents(listAgentsArgs());
   assert.equal(code, 1);
-  assert.match(stderr.read(), /vicoop-client login --bridge/);
+  assert.match(stderr.read(), /vicoop-client auth login --server/);
 });
 
 test('subcommand surfaces network errors as a clean exit-1 instead of crashing', async (t) => {

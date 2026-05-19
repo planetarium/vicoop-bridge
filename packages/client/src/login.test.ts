@@ -10,11 +10,11 @@ import { runAuthLogin, runLogin } from './login.js';
 // construct that shape directly — argv-level parsing is owned by optique
 // and exercised at the integration level in cli.test (top-level `run()`).
 function loginArgs(p: Partial<Omit<LoginArgs, 'action'>> = {}): LoginArgs {
-  return { action: 'login', bridge: undefined, json: false, pollOnce: false, ...p };
+  return { action: 'login', server: undefined, json: false, pollOnce: false, ...p };
 }
 
 function authLoginArgs(p: Partial<Omit<AuthLoginArgs, 'action'>> = {}): AuthLoginArgs {
-  return { action: 'auth-login', bridge: undefined, json: false, pollOnce: false, ...p };
+  return { action: 'auth-login', server: undefined, json: false, pollOnce: false, ...p };
 }
 
 test('login saves owner-session bearer without registering a client', async (t) => {
@@ -79,7 +79,7 @@ test('login saves owner-session bearer without registering a client', async (t) 
     return true;
   });
 
-  const code = await runLogin(loginArgs({ bridge: 'https://bridge.test' }));
+  const code = await runLogin(loginArgs({ server: 'https://bridge.test' }));
 
   assert.equal(code, 0);
   assert.equal(calls.length, 2);
@@ -202,7 +202,7 @@ test('auth login dispatches to the same flow without emitting a deprecation warn
     return true;
   });
 
-  const code = await runAuthLogin(authLoginArgs({ bridge: 'https://bridge.test' }));
+  const code = await runAuthLogin(authLoginArgs({ server: 'https://bridge.test' }));
   assert.equal(code, 0);
   // Same handler body as runLogin (verified by the post-login hint), without
   // the deprecation banner the legacy `login` entry point emits.
@@ -248,7 +248,7 @@ test('legacy login prints a deprecation warning pointing at auth login', async (
     return true;
   });
 
-  const code = await runLogin(loginArgs({ bridge: 'https://bridge.test' }));
+  const code = await runLogin(loginArgs({ server: 'https://bridge.test' }));
   assert.equal(code, 0);
   assert.match(stderr, /vicoop-client login.*deprecated.*vicoop-client auth login/s);
 });

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,7 +16,7 @@ function setupArgs(
 ): SetupArgs {
   const {
     clientName, allowedAgentIds,
-    callers = [], envFile, envFileAlias, bridge, token, json = false,
+    callers = [], envFile, envFileAlias, server, token, json = false,
   } = p;
   return {
     action: 'setup',
@@ -25,7 +25,7 @@ function setupArgs(
     callers,
     envFile,
     envFileAlias,
-    bridge,
+    server,
     token,
     json,
   };
@@ -296,9 +296,9 @@ test('setup requires explicit bridge and token to be passed together', async (t)
   assert.equal(await runSetup(setupArgs({
     clientName: 'test client',
     allowedAgentIds: ['agent-1'],
-    bridge: 'https://other-bridge.test',
+    server: 'https://other-bridge.test',
   })), 1);
-  assert.match(stderr, /Pass --bridge and --token together/);
+  assert.match(stderr, /Pass --server and --token together/);
 
   stderr = '';
   assert.equal(await runSetup(setupArgs({
@@ -306,7 +306,7 @@ test('setup requires explicit bridge and token to be passed together', async (t)
     allowedAgentIds: ['agent-1'],
     token: 'vbc_owner_other',
   })), 1);
-  assert.match(stderr, /Pass --bridge and --token together/);
+  assert.match(stderr, /Pass --server and --token together/);
 });
 
 test('setup prompts for login when no owner-session is available', async (t) => {
@@ -352,7 +352,7 @@ test('setup prompts for login when no owner-session is available', async (t) => 
   const code = await runSetup(setupArgs({ clientName: 'test client', allowedAgentIds: ['agent-1'] }));
 
   assert.equal(code, 1);
-  assert.match(stderr, /vicoop-client login --bridge/);
+  assert.match(stderr, /vicoop-client auth login --server/);
 });
 
 test('setup writes config.json by default and preserves operator-edited fields', async (t) => {
@@ -901,7 +901,7 @@ function agentRegisterArgs(
 ): AgentRegisterArgs {
   const {
     name, agentId,
-    callers = [], envFile, envFileAlias, bridge, token, json = false,
+    callers = [], envFile, envFileAlias, server, token, json = false,
   } = p;
   return {
     action: 'agent-register',
@@ -910,16 +910,17 @@ function agentRegisterArgs(
     callers,
     envFile,
     envFileAlias,
-    bridge,
+    server,
     token,
     json,
   };
 }
 
-function installAgentRegisterFixture(t: {
-  after: (fn: () => void) => void;
-  mock: { method: (...args: unknown[]) => unknown };
-}): {
+// The test-context fixture type is intentionally permissive — node:test's
+// real TestContext.mock.method signature is heavily overloaded and not
+// portable across versions, so the fixture just relies on the runtime
+// shape it actually uses.
+function installAgentRegisterFixture(t: TestContext): {
   tmpHome: string;
   envFile: string;
   calls: Array<{ url: string; method?: string; body: string }>;
