@@ -930,11 +930,24 @@ function installAgentRegisterFixture(t: TestContext): {
   const envFile = join(tmpHome, 'vicoop-client.env');
   t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
 
+  // Pin both `VICOOP_HOME` and `HOME` so `resolveConfigDir()` lands inside the
+  // tmp dir on every host. Clearing `XDG_CONFIG_HOME` matters on CI runners
+  // (Linux) where it is exported by default — otherwise the config write goes
+  // to `$XDG_CONFIG_HOME/vicoop/config.json` while the assertion reads
+  // `${tmpHome}/.vicoop/config.json` and sees `null`.
   const prevHome = process.env.HOME;
+  const prevVicoop = process.env.VICOOP_HOME;
+  const prevXdg = process.env.XDG_CONFIG_HOME;
   process.env.HOME = tmpHome;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  delete process.env.XDG_CONFIG_HOME;
   t.after(() => {
     if (prevHome === undefined) delete process.env.HOME;
     else process.env.HOME = prevHome;
+    if (prevVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = prevVicoop;
+    if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prevXdg;
   });
 
   saveOwnerSession({
