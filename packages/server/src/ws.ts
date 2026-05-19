@@ -18,56 +18,18 @@ import { resolveHelloAgentCard } from './card-resolver.js';
 
 interface ClientRow {
   id: string;
-  owner_principal: string;
-  allowed_agent_ids: string[];
-}
-
-async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | null> {
-  const rows = await sql<ClientRow[]>`
-    SELECT id, owner_principal, allowed_agent_ids FROM clients WHERE token_hash = ${hash} AND revoked = false
-  `;
-  return rows[0] ?? null;
-}
-
-interface PolicyRow {
+  client_id: string;
   owner_principal: string;
   allowed_callers: string[];
 }
 
-async function ensureAgentPolicy(
-  sql: Sql,
-  agentId: string,
-  ownerPrincipal: string,
-  clientId: string,
-): Promise<{ ok: true; allowedCallers: string[] } | { ok: false; reason: string }> {
-  // Refresh client_id on re-registration so cascade follows the currently
-  // registering client. Principals are stored in canonical form (lowercased
-  // for eth/email/domain at issuance time; google:sub: is numeric so case is
-  // moot), so direct equality is sufficient. The IS DISTINCT FROM guard skips
-  // the write when nothing actually changed to avoid WAL churn on frequent
-  // reconnects.
-  await sql`
-    INSERT INTO agent_policies (agent_id, owner_principal, client_id)
-    VALUES (${agentId}, ${ownerPrincipal}, ${clientId})
-    ON CONFLICT (agent_id) DO UPDATE
-      SET owner_principal = EXCLUDED.owner_principal,
-          client_id = EXCLUDED.client_id,
-          updated_at = now()
-      WHERE agent_policies.owner_principal = EXCLUDED.owner_principal
-        AND (
-          agent_policies.client_id IS DISTINCT FROM EXCLUDED.client_id
-        )
+async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | null> {
+  const rows = await sql<ClientRow[]>`
+    SELECT id, client_id, owner_principal, allowed_callers
+    FROM agents
+    WHERE token_hash = ${hash} AND revoked = false
   `;
-  const rows = await sql<PolicyRow[]>`
-    SELECT owner_principal, allowed_callers FROM agent_policies WHERE agent_id = ${agentId}
-  `;
-  if (rows.length === 0) {
-    return { ok: false, reason: 'failed to create agent policy' };
-  }
-  if (rows[0].owner_principal !== ownerPrincipal) {
-    return { ok: false, reason: 'agent id owned by a different principal' };
-  }
-  return { ok: true, allowedCallers: rows[0].allowed_callers };
+  return rows[0] ?? null;
 }
 
 export interface ServerWsOptions {
@@ -116,16 +78,16 @@ async function authenticateAndRegister(
     logEvent('client_rejected', { reason: 'bad token', agentId: frame.agentId });
     return { ok: false, code: 4005, reason: 'bad token' };
   }
-  if (!client.allowed_agent_ids.includes(frame.agentId)) {
+  if (client.id !== frame.agentId) {
     logEvent('client_rejected', {
       reason: 'agent not allowed',
       agentId: frame.agentId,
-      clientId: client.id,
-      allowed: client.allowed_agent_ids,
+      clientId: client.client_id,
+      allowed: [client.id],
     });
     return { ok: false, code: 4008, reason: 'agent id not authorized for this client' };
   }
-  const clientId = client.id;
+  const clientId = client.client_id;
   const ownerPrincipal = client.owner_principal;
 
   const resolvedCard = resolveHelloAgentCard(frame);
@@ -141,22 +103,12 @@ async function authenticateAndRegister(
     return { ok: false, code: resolvedCard.code, reason: resolvedCard.reason };
   }
 
-  const policyResult = await ensureAgentPolicy(opts.db, frame.agentId, ownerPrincipal, clientId);
-  if (!policyResult.ok) {
-    logEvent('client_rejected', {
-      reason: policyResult.reason,
-      agentId: frame.agentId,
-      clientId,
-    });
-    return { ok: false, code: 4010, reason: policyResult.reason };
-  }
-
   const result = opts.registry.registerAgent({
     agentId: frame.agentId,
     clientId,
     ownerPrincipal,
     agentCard: resolvedCard.agentCard,
-    allowedCallers: policyResult.allowedCallers,
+    allowedCallers: client.allowed_callers,
     ws,
     connectedAt: Date.now(),
   });

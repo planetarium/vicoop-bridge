@@ -26,29 +26,22 @@ test(
 );
 
 test(
-  'returns false once an agent_policies row holds the id',
+  'returns false once an agents row holds the id',
   { skip: !hasDb },
   async () => {
     const sql = postgres(process.env.DATABASE_URL!);
     try {
       const agentId = `availability-taken-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const owner = 'eth:0x1111111111111111111111111111111111111111';
-      const clients = await sql<{ id: string }[]>`
-        INSERT INTO clients (owner_principal, client_name, token_hash, allowed_agent_ids)
-        VALUES (${owner}, 'availability-test', ${`fake-hash-${agentId}`}, ARRAY[${agentId}])
-        RETURNING id
-      `;
-      const clientId = clients[0]!.id;
       try {
         await sql`
-          INSERT INTO agent_policies (agent_id, owner_principal, client_id)
-          VALUES (${agentId}, ${owner}, ${clientId})
+          INSERT INTO agents (id, owner_principal, name, token_hash)
+          VALUES (${agentId}, ${owner}, 'availability-test', ${`fake-hash-${agentId}`})
         `;
 
         assert.equal(await callAvailable(sql, agentId), false);
       } finally {
-        // agent_policies row cascades via ON DELETE CASCADE.
-        await sql`DELETE FROM clients WHERE id = ${clientId}`;
+        await sql`DELETE FROM agents WHERE id = ${agentId}`;
       }
 
       // Once cleaned up, the id is free again.
@@ -63,7 +56,7 @@ test(
   'authenticated caller from a different principal still sees available=false (RLS bypass)',
   { skip: !hasDb },
   async () => {
-    // Guards the SECURITY DEFINER posture: agent_policies_select restricts
+    // Guards the SECURITY DEFINER posture: agents_select restricts
     // SELECT to the owning principal, so without RLS bypass a different
     // principal's direct query would return no rows and the function would
     // wrongly report the id as available. Exercising app_authenticated with a
@@ -74,16 +67,10 @@ test(
       const owner = 'eth:0x2222222222222222222222222222222222222222';
       const other = 'eth:0x3333333333333333333333333333333333333333';
 
-      const clients = await sql<{ id: string }[]>`
-        INSERT INTO clients (owner_principal, client_name, token_hash, allowed_agent_ids)
-        VALUES (${owner}, 'availability-test', ${`fake-hash-${agentId}`}, ARRAY[${agentId}])
-        RETURNING id
-      `;
-      const clientId = clients[0]!.id;
       try {
         await sql`
-          INSERT INTO agent_policies (agent_id, owner_principal, client_id)
-          VALUES (${agentId}, ${owner}, ${clientId})
+          INSERT INTO agents (id, owner_principal, name, token_hash)
+          VALUES (${agentId}, ${owner}, 'availability-test', ${`fake-hash-${agentId}`})
         `;
 
         const available = await sql.begin(async (tx) => {
@@ -96,7 +83,7 @@ test(
         });
         assert.equal(available, false);
       } finally {
-        await sql`DELETE FROM clients WHERE id = ${clientId}`;
+        await sql`DELETE FROM agents WHERE id = ${agentId}`;
       }
     } finally {
       await sql.end();
