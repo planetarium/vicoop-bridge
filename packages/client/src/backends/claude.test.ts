@@ -2548,3 +2548,80 @@ test('zero cacheRead does not surface a cached_tokens breakdown', async () => {
   // mirror — keeps the wire shape minimal.
   assert.equal(payload?.usage?.prompt_tokens_details, undefined);
 });
+
+test('AskUserQuestion: terminal frame uses state=input-required with DataPart payload (A2A spec §9.4)', async () => {
+  // Sequence: claude streams an AskUserQuestion tool_use, then a short
+  // assistant text + result event (what CC produces after we feed it the
+  // placeholder tool_result). The backend should:
+  //   1. Not emit a separate `ask-user-question` artifact
+  //   2. Suppress the placeholder-induced assistant text
+  //   3. Close the run with task.complete state=input-required carrying the
+  //      tool_call payload on status.message.parts[0] as a DataPart
+  //   4. Write the placeholder tool_result back to stdin and end it
+  const askInput = { questions: [{ question: 'Pick one', options: [{ label: 'A' }, { label: 'B' }] }] };
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'tu_aq_1',
+              name: 'AskUserQuestion',
+              input: askInput,
+            },
+          ],
+        },
+      }),
+      // CC's response to our placeholder tool_result — should be suppressed.
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'ok, waiting' }] },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok, waiting' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('please choose'), emit, NEVER);
+
+  // No `ask-user-question` artifact should be emitted (it migrated to
+  // status.message).
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  assert.equal(
+    artifacts.find((a) => a.artifact.name === 'ask-user-question'),
+    undefined,
+  );
+  // Placeholder-induced assistant text must also be suppressed.
+  assert.equal(
+    artifacts.find((a) => a.artifact.name === 'claude-message'),
+    undefined,
+  );
+
+  const complete = frames.at(-1);
+  assert.ok(complete && complete.type === 'task.complete');
+  assert.equal(complete.status.state, 'input-required');
+  const part = complete.status.message?.parts[0];
+  assert.ok(part && part.kind === 'data');
+  assert.deepEqual(part.data, {
+    kind: 'tool_call',
+    toolName: 'AskUserQuestion',
+    toolUseId: 'tu_aq_1',
+    input: askInput,
+  });
+
+  // Verify the placeholder tool_result was written to CC's stdin and stdin
+  // was closed so CC's session terminates cleanly (next turn can --resume).
+  const child = fake.lastChild();
+  assert.ok(child);
+  assert.equal(child.stdinClosed, true);
+  assert.match(child.stdinPayload, /tool_result/);
+  assert.match(child.stdinPayload, /tu_aq_1/);
+});
