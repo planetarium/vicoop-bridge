@@ -31,26 +31,47 @@ import {
   loadOwnerSession,
 } from './owner-session.js';
 
-export const logoutCmd = command(
+// Shared field shape for both the new `auth logout` and the legacy `logout`
+// command. Adding a flag in one place automatically surfaces in the other.
+const logoutFields = {
+  localOnly: withDefault(
+    flag('--local-only', {
+      description: message`Skip the server-side revoke; just delete the local owner-session file.`,
+    }),
+    false,
+  ),
+  keepLocal: withDefault(
+    flag('--keep-local', {
+      description: message`Revoke server-side but leave ~/.vicoop/owner-session.json in place.`,
+    }),
+    false,
+  ),
+};
+
+export const authLogoutCmd = command(
   'logout',
   object({
-    action: constant('logout' as const),
-    localOnly: withDefault(
-      flag('--local-only', {
-        description: message`Skip the server-side revoke; just delete the local owner-session file.`,
-      }),
-      false,
-    ),
-    keepLocal: withDefault(
-      flag('--keep-local', {
-        description: message`Revoke server-side but leave ~/.vicoop/owner-session.json in place.`,
-      }),
-      false,
-    ),
+    action: constant('auth-logout' as const),
+    ...logoutFields,
   }),
   {
     brief: message`Invalidate the owner-session bearer and clear the local copy.`,
     description: message`Calls the bridge's RFC 7009 /oauth/revoke endpoint with the stored owner-session bearer, then deletes ~/.vicoop/owner-session.json. Use --local-only when the bridge is unreachable, or --keep-local to revoke server-side without removing the file. A missing local session is reported but not an error.`,
+  },
+);
+
+export type AuthLogoutArgs = InferValue<typeof authLogoutCmd>;
+
+// Legacy flat `vicoop-client logout`. Kept as a deprecated alias.
+export const logoutCmd = command(
+  'logout',
+  object({
+    action: constant('logout' as const),
+    ...logoutFields,
+  }),
+  {
+    brief: message`[deprecated] Use \`auth logout\`.`,
+    description: message`Deprecated alias for \`vicoop-client auth logout\`. Will be removed in a future release.`,
   },
 );
 
@@ -74,7 +95,25 @@ async function revokeOnServer(bridge: string, token: string): Promise<{ ok: bool
   }
 }
 
+interface LogoutCommonArgs {
+  localOnly: boolean;
+  keepLocal: boolean;
+}
+
+export async function runAuthLogout(args: AuthLogoutArgs): Promise<number> {
+  return executeLogout(args);
+}
+
 export async function runLogout(args: LogoutArgs): Promise<number> {
+  process.stderr.write(
+    '[warning] `vicoop-client logout` is deprecated; ' +
+      'use `vicoop-client auth logout` instead. ' +
+      'The deprecated form will be removed in a future release.\n',
+  );
+  return executeLogout(args);
+}
+
+async function executeLogout(args: LogoutCommonArgs): Promise<number> {
   const path = defaultStorePath();
   const session = loadOwnerSession(path);
 

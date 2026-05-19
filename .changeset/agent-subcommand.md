@@ -2,9 +2,9 @@
 '@vicoop-bridge/client': minor
 ---
 
-Add `vicoop-client agent` command group as the operator-facing primary
-surface for agent state (#218, #224, follow-up to server-side unification
-in #219).
+Add `vicoop-client agent` and `vicoop-client auth` command groups as the
+operator-facing primary surfaces (#218, #224, follow-up to server-side
+unification in #219).
 
 New commands:
 
@@ -27,14 +27,21 @@ New commands:
   `revoke-client`).
 - `vicoop-client agent callers {list,add,remove}` — manage an agent's
   allowed-callers list.
+- `vicoop-client auth login` — owner-session sign-in (Google OAuth device
+  flow); identical behavior to the legacy `login`.
+- `vicoop-client auth logout` — revoke the owner-session bearer
+  server-side (RFC 7009) and delete the local copy. `--local-only` and
+  `--keep-local` still split the two effects.
+- `vicoop-client auth whoami` — print the agent's A2A identity (mention /
+  acct / WebFinger URL); also supports `--verify`.
 
-The older flat aliases (`setup`, `list-agents`, `list-clients`,
-`revoke-client`, `add-caller`, `remove-caller`, `list-callers`) keep
-working but now print a one-line deprecation warning to stderr pointing
-at their `agent <sub>` replacement. The legacy commands also keep their
-client-first vocabulary on stderr (`client_id`, `client_name`,
-`CLIENT_TOKEN`) so scripts that parse stderr are unaffected. They will
-be removed in a future release.
+The older flat aliases (`setup`, `login`, `logout`, `whoami`,
+`list-agents`, `list-clients`, `revoke-client`, `add-caller`,
+`remove-caller`, `list-callers`) keep working but now print a one-line
+deprecation warning to stderr pointing at their `agent <sub>` /
+`auth <sub>` replacement. `setup` additionally retains its client-first
+stderr vocabulary (`client_id`, `client_name`, `CLIENT_TOKEN`) so scripts
+that parse it are unaffected. All will be removed in a future release.
 
 The wire contracts and `--json` payload shape are unchanged: `agent
 register` calls the same `registerClient` GraphQL mutation as `setup`

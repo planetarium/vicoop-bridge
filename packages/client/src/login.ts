@@ -1,7 +1,9 @@
-// `vicoop-client login` — authenticate the operator and persist an
-// owner-session bearer. Client creation is deliberately handled by
-// `vicoop-client setup` so login has no server-side client-registration
-// side effects.
+// `vicoop-client auth login` — authenticate the operator and persist an
+// owner-session bearer. Agent registration is deliberately handled by
+// `vicoop-client agent register` so login has no server-side side effects.
+//
+// The legacy flat `vicoop-client login` parser stays exported as a
+// deprecated alias; both surfaces dispatch to the same handler.
 
 import { object } from '@optique/core/constructs';
 import { optional, withDefault } from '@optique/core/modifiers';
@@ -15,32 +17,54 @@ import {
   saveOwnerSession,
 } from './owner-session.js';
 
-// `login` is one branch of the top-level `or(...)` parser in cli.ts.
-// `action: constant("login")` is the discriminator the dispatch switch
-// reads after `run()` returns.
+// Shared field shape for both the new `auth login` and the legacy `login`
+// command. Defined once so the two parsers stay in lockstep — adding a
+// flag in one place automatically surfaces in the other.
+const loginFields = {
+  bridge: optional(
+    option('--bridge', string({ metavar: 'URL' }), {
+      description: message`Bridge HTTPS URL (defaults to ${DEFAULT_BRIDGE_HTTPS_URL}; override only when running your own bridge).`,
+    }),
+  ),
+  json: withDefault(
+    flag('--json', {
+      description: message`Print the token-endpoint response as JSON to stdout without persisting ~/.vicoop/owner-session.json.`,
+    }),
+    false,
+  ),
+  // Undocumented test/CI smoke flag — exits after the first poll cycle
+  // so login.test.ts can drive a deterministic fixture without sleeping
+  // through the real device-flow polling interval.
+  pollOnce: withDefault(flag('--poll-once'), false),
+};
+
+// New agent-first surface: `vicoop-client auth login`. Wired into
+// `authCmd` over in cli.ts (longestMatch with auth logout). The
+// `action: constant('auth-login')` discriminator drives dispatch.
+export const authLoginCmd = command(
+  'login',
+  object({
+    action: constant('auth-login' as const),
+    ...loginFields,
+  }),
+  {
+    brief: message`Sign in as the agent owner and save an owner-session bearer.`,
+    description: message`Drives Google OAuth device flow and issues an owner-session bearer used by \`agent register\`, \`agent list/revoke/callers\`. By default the token is saved to ~/.vicoop/owner-session.json (chmod 600) so admin subcommands pick it up automatically; pass --json to print the raw token-endpoint response to stdout instead (that mode does NOT persist the session).`,
+  },
+);
+
+export type AuthLoginArgs = InferValue<typeof authLoginCmd>;
+
+// Legacy flat `vicoop-client login`. Kept as a deprecated alias.
 export const loginCmd = command(
   'login',
   object({
     action: constant('login' as const),
-    bridge: optional(
-      option('--bridge', string({ metavar: 'URL' }), {
-        description: message`Bridge HTTPS URL (defaults to ${DEFAULT_BRIDGE_HTTPS_URL}; override only when running your own bridge).`,
-      }),
-    ),
-    json: withDefault(
-      flag('--json', {
-        description: message`Print the token-endpoint response as JSON to stdout without persisting ~/.vicoop/owner-session.json.`,
-      }),
-      false,
-    ),
-    // Undocumented test/CI smoke flag — exits after the first poll cycle
-    // so login.test.ts can drive a deterministic fixture without sleeping
-    // through the real device-flow polling interval.
-    pollOnce: withDefault(flag('--poll-once'), false),
+    ...loginFields,
   }),
   {
-    brief: message`Sign in as the client owner and save an owner-session bearer.`,
-    description: message`Drives Google OAuth device flow and issues an owner-session bearer used by setup / add-caller / list-callers / list-agents / remove-caller. By default the token is saved to ~/.vicoop/owner-session.json (chmod 600) so admin subcommands pick it up automatically; pass --json to print the raw token-endpoint response to stdout instead (that mode does NOT persist the session).`,
+    brief: message`[deprecated] Use \`auth login\`.`,
+    description: message`Deprecated alias for \`vicoop-client auth login\`. Will be removed in a future release.`,
   },
 );
 
@@ -143,7 +167,29 @@ function saveOwnerSessionBearer(bridgeUrl: string, success: OwnerSessionSuccess)
   return path;
 }
 
+// Common shape both LoginArgs and AuthLoginArgs satisfy — `executeLogin`
+// accepts this so the handler body is written once and the two thin entry
+// points only differ in whether they emit a deprecation warning.
+interface LoginCommonArgs {
+  bridge?: string;
+  json: boolean;
+  pollOnce: boolean;
+}
+
+export async function runAuthLogin(args: AuthLoginArgs): Promise<number> {
+  return executeLogin(args);
+}
+
 export async function runLogin(args: LoginArgs): Promise<number> {
+  process.stderr.write(
+    '[warning] `vicoop-client login` is deprecated; ' +
+      'use `vicoop-client auth login` instead. ' +
+      'The deprecated form will be removed in a future release.\n',
+  );
+  return executeLogin(args);
+}
+
+async function executeLogin(args: LoginCommonArgs): Promise<number> {
   // No --bridge → public default (#189 §6). Self-hosters pass
   // `--bridge https://bridge.example.com`.
   const bridge = args.bridge ?? DEFAULT_BRIDGE_HTTPS_URL;
@@ -190,13 +236,13 @@ export async function runLogin(args: LoginArgs): Promise<number> {
         const path = saveOwnerSessionBearer(bridge, success);
         process.stderr.write(
           `Saved owner-session bearer to ${path} (mode 600).\n` +
-            'Run `vicoop-client setup` to create a bridge client token.\n',
+            'Run `vicoop-client agent register` to register an agent and mint an agent token.\n',
         );
       }
       return 0;
     }
     if (result.kind === 'expired') {
-      process.stderr.write('\nDevice session expired. Re-run `vicoop-client login`.\n');
+      process.stderr.write('\nDevice session expired. Re-run `vicoop-client auth login`.\n');
       return 1;
     }
     if (result.kind === 'error') {

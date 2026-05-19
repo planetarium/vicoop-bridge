@@ -3,11 +3,15 @@ import test from 'node:test';
 import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { LogoutArgs } from './logout.js';
-import { runLogout } from './logout.js';
+import type { AuthLogoutArgs, LogoutArgs } from './logout.js';
+import { runAuthLogout, runLogout } from './logout.js';
 
 function logoutArgs(p: Partial<Omit<LogoutArgs, 'action'>> = {}): LogoutArgs {
   return { action: 'logout', localOnly: false, keepLocal: false, ...p };
+}
+
+function authLogoutArgs(p: Partial<Omit<AuthLogoutArgs, 'action'>> = {}): AuthLogoutArgs {
+  return { action: 'auth-logout', localOnly: false, keepLocal: false, ...p };
 }
 
 // Pins $VICOOP_HOME so loadOwnerSession / defaultStorePath route into the
@@ -187,4 +191,37 @@ test('logout --keep-local revokes server-side but leaves the file in place', asy
   assert.equal(calls.length, 1);
   assert.match(stderr, /--keep-local/);
   assert.equal(existsSync(sessionPath), true);
+});
+
+// ---- New `auth logout` surface --------------------------------------------
+
+test('auth logout does NOT emit a deprecation warning', async (t) => {
+  const { sessionPath, writeSession } = pinVicoopHome(t);
+  writeSession();
+  // No bridge fetch needed for --local-only; keep it offline.
+  let stderr = '';
+  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  });
+
+  const code = await runAuthLogout(authLogoutArgs({ localOnly: true }));
+  assert.equal(code, 0);
+  assert.equal(existsSync(sessionPath), false);
+  assert.doesNotMatch(stderr, /deprecated/i);
+});
+
+test('legacy logout prints a deprecation warning pointing at auth logout', async (t) => {
+  const { sessionPath, writeSession } = pinVicoopHome(t);
+  writeSession();
+  let stderr = '';
+  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  });
+
+  const code = await runLogout(logoutArgs({ localOnly: true }));
+  assert.equal(code, 0);
+  assert.equal(existsSync(sessionPath), false);
+  assert.match(stderr, /vicoop-client logout.*deprecated.*vicoop-client auth logout/s);
 });

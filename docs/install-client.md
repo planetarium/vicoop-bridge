@@ -166,17 +166,17 @@ pick a hostname/uuid prefix and skip the probe.
 
 ## Step 4 — Login and register your agent
 
-`vicoop-client login` only signs you in as the agent owner and saves an
-owner-session bearer to `~/.vicoop/owner-session.json`. It does **not** create
-an agent registration. `vicoop-client agent register` then uses that saved
-owner-session to call `registerClient` and mint a one-time `AGENT_TOKEN`. No
-wallet or SIWE required.
+`vicoop-client auth login` only signs you in as the agent owner and saves
+an owner-session bearer to `~/.vicoop/owner-session.json`. It does **not**
+create an agent registration. `vicoop-client agent register` then uses that
+saved owner-session to call `registerClient` and mint a one-time
+`AGENT_TOKEN`. No wallet or SIWE required.
 
 ```sh
 HOSTNAME=$(hostname)
 CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
 
-"$INSTALL_DIR/vicoop-client" login
+"$INSTALL_DIR/vicoop-client" auth login
 
 "$INSTALL_DIR/vicoop-client" agent register \
   --name "$CLIENT_NAME" \
@@ -212,11 +212,14 @@ The AGENT_TOKEN is one-time — the bridge cannot reissue it.
 Wrote /home/you/.vicoop/config.json (mode 600).
 ```
 
-> **Legacy `vicoop-client setup` alias.** The flat `setup` command still
-> works (with the old `--client-name` / `--agent-ids` flags and the
-> `CLIENT_TOKEN` / `client_id` / `client_name` vocabulary) but now prints
-> a one-line deprecation warning to stderr pointing at `agent register`.
-> It will be removed in a future release.
+> **Legacy flat aliases.** The flat `setup` / `login` / `logout` / `whoami`
+> commands still work (with the same flags as their umbrella replacements)
+> but now print a one-line deprecation warning to stderr pointing at their
+> `agent register` / `auth login` / `auth logout` / `auth whoami` form.
+> `setup` additionally keeps its old `--client-name` / `--agent-ids` flags
+> and the `CLIENT_TOKEN` / `client_id` / `client_name` vocabulary on
+> stderr for script back-compat. All four will be removed in a future
+> release.
 
 Verify it landed where you expect (matters when `$VICOOP_HOME` or
 `$XDG_CONFIG_HOME` is set):
@@ -396,7 +399,7 @@ card, for example to:
 
 To see what the bridge currently advertises for this agent (before deciding
 whether to override), connect the client once and `curl` the `a2a card` URL
-that `vicoop-client whoami` prints — see ["Check your agent's mention /
+that `vicoop-client auth whoami` prints — see ["Check your agent's mention /
 acct"](#check-your-agents-mention--acct-any-backend) in Step 6.
 
 Schema reference: `packages/protocol/src/index.ts` (`AgentCard` Zod schema,
@@ -443,7 +446,7 @@ runtime config (#189 §5). With `"backend": "openclaw"` persisted in
 `"$INSTALL_DIR/vicoop-client"`.
 
 On success you'll see a `[client] connected, sending hello` log followed
-by an identity block — same data `vicoop-client whoami` would print, so
+by an identity block — same data `vicoop-client auth whoami` would print, so
 you can copy the mention / acct / agent-card URL from here directly:
 
 ```text
@@ -565,13 +568,13 @@ derived from `--agentId` and the host part of `--server`.
 > on the server side. If the two differ (e.g. a custom domain in front of
 > a Fly hostname), the model is taught a mention that doesn't match what
 > users see via WebFinger and self-reference detection won't fire. Run
-> `vicoop-client whoami --verify` to confirm the WebFinger lookup actually
+> `vicoop-client auth whoami --verify` to confirm the WebFinger lookup actually
 > resolves the agent under the derived host; align `--server` with
 > `PUBLIC_URL`'s host if it doesn't.
 
 ### Check your agent's mention / acct (any backend)
 
-After the first `connected` log, run `vicoop-client whoami` to surface every
+After the first `connected` log, run `vicoop-client auth whoami` to surface every
 identifier external callers will see for this agent — the WebFinger acct, the
 `@<agentId>@<host>` mention, the JSON-RPC endpoint, and the agent-card URL.
 
@@ -803,9 +806,9 @@ section of `docs/local-testing.md` for the same note.
   GraphQL — the caller token was missing, malformed, or expired, so the
   request fell back to the `app_anonymous` Postgres role (see
   `packages/server/src/postgraphile.ts`) which has no EXECUTE on
-  authenticated functions. Re-run `vicoop-client login` to refresh.
+  authenticated functions. Re-run `vicoop-client auth login` to refresh.
 
-- **Device flow timed out** — the `vicoop-client login` deadline matches
+- **Device flow timed out** — the `vicoop-client auth login` deadline matches
   the bridge's `device_sessions.expires_at` (10 min by default). If the
   browser approval is delayed past that, re-run `login`; the previous
   device code is invalidated automatically.

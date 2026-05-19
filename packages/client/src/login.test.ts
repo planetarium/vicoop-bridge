@@ -3,14 +3,18 @@ import test from 'node:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { LoginArgs } from './login.js';
-import { runLogin } from './login.js';
+import type { AuthLoginArgs, LoginArgs } from './login.js';
+import { runAuthLogin, runLogin } from './login.js';
 
 // `runLogin` now takes the parser's discriminated-union output. Tests
 // construct that shape directly — argv-level parsing is owned by optique
 // and exercised at the integration level in cli.test (top-level `run()`).
 function loginArgs(p: Partial<Omit<LoginArgs, 'action'>> = {}): LoginArgs {
   return { action: 'login', bridge: undefined, json: false, pollOnce: false, ...p };
+}
+
+function authLoginArgs(p: Partial<Omit<AuthLoginArgs, 'action'>> = {}): AuthLoginArgs {
+  return { action: 'auth-login', bridge: undefined, json: false, pollOnce: false, ...p };
 }
 
 test('login saves owner-session bearer without registering a client', async (t) => {
@@ -87,7 +91,7 @@ test('login saves owner-session bearer without registering a client', async (t) 
   assert.equal(saved.bridge, 'https://bridge.test');
   assert.equal(saved.token, 'vbc_owner_test');
   assert.equal(saved.principal_id, 'google:123');
-  assert.match(stderr, /Run `vicoop-client setup`/);
+  assert.match(stderr, /Run `vicoop-client agent register`/);
 });
 
 test('login falls back to DEFAULT_BRIDGE_HTTPS_URL when --bridge is omitted', async (t) => {
@@ -157,4 +161,94 @@ test('login falls back to DEFAULT_BRIDGE_HTTPS_URL when --bridge is omitted', as
     seen.every((u) => u.startsWith('https://vicoop-bridge-server.fly.dev/')),
     `expected every fetch to hit the default bridge URL; got ${JSON.stringify(seen)}`,
   );
+});
+
+// ---- New `auth login` surface ----------------------------------------------
+
+test('auth login dispatches to the same flow without emitting a deprecation warning', async (t) => {
+  const previousHome = process.env.HOME;
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-auth-login-'));
+  process.env.HOME = tmpHome;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    delete process.env.VICOOP_HOME;
+    rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  const originalFetch = globalThis.fetch;
+  let call = 0;
+  globalThis.fetch = (async () => {
+    call++;
+    if (call === 1) {
+      return new Response(JSON.stringify({
+        device_code: 'D', user_code: 'AB-CD',
+        verification_uri: 'https://bridge.test/oauth/device',
+        verification_uri_complete: 'https://bridge.test/oauth/device?user_code=AB-CD',
+        expires_in: 600, interval: 1,
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      access_token: 'vbc_owner_x', token_type: 'Bearer', expires_in: 3600,
+      principal_id: 'google:123', email: 'op@example.com',
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  let stderr = '';
+  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  });
+
+  const code = await runAuthLogin(authLoginArgs({ bridge: 'https://bridge.test' }));
+  assert.equal(code, 0);
+  // Same handler body as runLogin (verified by the post-login hint), without
+  // the deprecation banner the legacy `login` entry point emits.
+  assert.doesNotMatch(stderr, /deprecated/i);
+  assert.match(stderr, /Saved owner-session bearer/);
+  assert.match(stderr, /Run `vicoop-client agent register`/);
+});
+
+test('legacy login prints a deprecation warning pointing at auth login', async (t) => {
+  const previousHome = process.env.HOME;
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-legacy-login-'));
+  process.env.HOME = tmpHome;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    delete process.env.VICOOP_HOME;
+    rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  const originalFetch = globalThis.fetch;
+  let call = 0;
+  globalThis.fetch = (async () => {
+    call++;
+    if (call === 1) {
+      return new Response(JSON.stringify({
+        device_code: 'D', user_code: 'AB-CD',
+        verification_uri: 'https://bridge.test/oauth/device',
+        verification_uri_complete: 'https://bridge.test/oauth/device?user_code=AB-CD',
+        expires_in: 600, interval: 1,
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      access_token: 'vbc_owner_x', token_type: 'Bearer', expires_in: 3600,
+      principal_id: 'google:123', email: null,
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  let stderr = '';
+  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  });
+
+  const code = await runLogin(loginArgs({ bridge: 'https://bridge.test' }));
+  assert.equal(code, 0);
+  assert.match(stderr, /vicoop-client login.*deprecated.*vicoop-client auth login/s);
 });

@@ -25,34 +25,58 @@ import {
   type AgentIdentity,
 } from './identity.js';
 
-export const whoamiCmd = command(
+// Shared parser fields so the new `auth whoami` and the legacy flat
+// `whoami` stay in lockstep.
+const whoamiFields = {
+  agentId: optional(
+    option('--agentId', string({ metavar: 'ID' }), {
+      description: message`Agent id. Falls back to the canonical config.json (\`agent_id\`).`,
+    }),
+  ),
+  server: optional(
+    option('--server', string({ metavar: 'WS_URL' }), {
+      description: message`Bridge WS URL. Falls back to the canonical config.json (\`server_url\`).`,
+    }),
+  ),
+  json: withDefault(
+    flag('--json', { description: message`Emit a machine-readable JSON record.` }),
+    false,
+  ),
+  verify: withDefault(
+    flag('--verify', {
+      description: message`Probe WebFinger to confirm the bridge resolves this agent's acct.`,
+    }),
+    false,
+  ),
+};
+
+// New `vicoop-client auth whoami` surface (#218 / #224). Sits under the
+// `auth` umbrella alongside `auth login` / `auth logout`. Identity surfaces
+// are owner-session-adjacent — the `auth` topic is the natural home.
+export const authWhoamiCmd = command(
   'whoami',
   object({
-    action: constant('whoami' as const),
-    agentId: optional(
-      option('--agentId', string({ metavar: 'ID' }), {
-        description: message`Agent id. Falls back to the canonical config.json (\`agent_id\`).`,
-      }),
-    ),
-    server: optional(
-      option('--server', string({ metavar: 'WS_URL' }), {
-        description: message`Bridge WS URL. Falls back to the canonical config.json (\`server_url\`).`,
-      }),
-    ),
-    json: withDefault(
-      flag('--json', { description: message`Emit a machine-readable JSON record.` }),
-      false,
-    ),
-    verify: withDefault(
-      flag('--verify', {
-        description: message`Probe WebFinger to confirm the bridge resolves this agent's acct.`,
-      }),
-      false,
-    ),
+    action: constant('auth-whoami' as const),
+    ...whoamiFields,
   }),
   {
     brief: message`Print the agent's A2A identity (mention / acct / WebFinger URL).`,
     description: message`Surfaces the identifiers external callers will see for this agent. Use the output to populate other agents' \`allowed_callers\` or the OpenClaw gateway persona for self-reference recognition. With \`--verify\`, additionally fetches WebFinger to confirm the bridge resolves the agent's acct under the derived host.`,
+  },
+);
+
+export type AuthWhoamiArgs = InferValue<typeof authWhoamiCmd>;
+
+// Legacy flat `vicoop-client whoami`. Kept as a deprecated alias.
+export const whoamiCmd = command(
+  'whoami',
+  object({
+    action: constant('whoami' as const),
+    ...whoamiFields,
+  }),
+  {
+    brief: message`[deprecated] Use \`auth whoami\`.`,
+    description: message`Deprecated alias for \`vicoop-client auth whoami\`. Will be removed in a future release.`,
   },
 );
 
@@ -206,7 +230,30 @@ function buildResult(id: AgentIdentity): WhoamiResult {
   };
 }
 
+interface WhoamiCommonArgs {
+  agentId?: string;
+  server?: string;
+  json: boolean;
+  verify: boolean;
+}
+
+export async function runAuthWhoami(
+  args: AuthWhoamiArgs,
+  io: WhoamiIO = defaultIO,
+): Promise<number> {
+  return executeWhoami(args, io);
+}
+
 export async function runWhoami(args: WhoamiArgs, io: WhoamiIO = defaultIO): Promise<number> {
+  io.stderr(
+    '[warning] `vicoop-client whoami` is deprecated; ' +
+      'use `vicoop-client auth whoami` instead. ' +
+      'The deprecated form will be removed in a future release.\n',
+  );
+  return executeWhoami(args, io);
+}
+
+async function executeWhoami(args: WhoamiCommonArgs, io: WhoamiIO): Promise<number> {
   // Fallback to canonical config.json (#189 §5 — env removed from daemon
   // config chain, and whoami reuses the same source so the two surfaces
   // can't drift). The file is optional: a fresh install with no `setup`

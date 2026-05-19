@@ -1,13 +1,24 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
-import { runWhoami, type WhoamiArgs, type WhoamiIO } from './whoami.js';
+import { runAuthWhoami, runWhoami, type AuthWhoamiArgs, type WhoamiArgs, type WhoamiIO } from './whoami.js';
 
 // `runWhoami` now takes the parser's discriminated-union output. Tests
 // construct that shape directly.
 function whoamiArgs(p: Partial<Omit<WhoamiArgs, 'action'>> = {}): WhoamiArgs {
   return {
     action: 'whoami',
+    agentId: undefined,
+    server: undefined,
+    json: false,
+    verify: false,
+    ...p,
+  };
+}
+
+function authWhoamiArgs(p: Partial<Omit<AuthWhoamiArgs, 'action'>> = {}): AuthWhoamiArgs {
+  return {
+    action: 'auth-whoami',
     agentId: undefined,
     server: undefined,
     json: false,
@@ -298,4 +309,27 @@ test('whoami --verify still surfaces a bare status when the body is not JSON', a
       }
     });
   });
+});
+
+// ---- New `auth whoami` surface --------------------------------------------
+
+test('auth whoami emits the agent identity without a deprecation warning', async () => {
+  const io = makeIO();
+  const code = await runAuthWhoami(
+    authWhoamiArgs({ agentId: 'my-agent', server: 'wss://bridge.example.com' }),
+    io,
+  );
+  assert.equal(code, 0);
+  assert.doesNotMatch(io.readStderr(), /deprecated/i);
+  assert.match(io.readStdout(), /mention:\s*@my-agent@bridge\.example\.com/);
+});
+
+test('legacy whoami prints a deprecation warning pointing at auth whoami', async () => {
+  const io = makeIO();
+  const code = await runWhoami(
+    whoamiArgs({ agentId: 'my-agent', server: 'wss://bridge.example.com' }),
+    io,
+  );
+  assert.equal(code, 0);
+  assert.match(io.readStderr(), /vicoop-client whoami.*deprecated.*vicoop-client auth whoami/s);
 });
