@@ -6,6 +6,8 @@
   "scripts": {
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
+    "install:client": "pnpm --filter @vicoop-bridge/client... build && npm install -g ./packages/client",
+    "uninstall:client": "npm uninstall -g @vicoop-bridge/client",
     "dev:server": "pnpm --filter @vicoop-bridge/server dev",
     "dev:client": "pnpm --filter @vicoop-bridge/client dev",
     "dev:admin-ui": "pnpm --filter @vicoop-bridge/admin-ui dev",

@@ -16,6 +16,7 @@ import {
   createCodexBackend,
   type ApprovalDecision,
 } from './backends/codex.js';
+import { createVicoopCodexBackend } from './backends/vicoop-codex.js';
 import type { Backend } from './backend.js';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
@@ -242,9 +243,11 @@ function pickBackend(name: string, args: Args): Backend {
         sandboxMode: coerceCodexSandbox(args, backends.codex?.sandbox_mode),
         approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
       });
+    case 'vicoop-codex':
+      return createVicoopCodexBackend();
     default:
       throw new Error(
-        `unknown backend: ${name} (supported: echo, openclaw, claude, codex)`,
+        `unknown backend: ${name} (supported: echo, openclaw, claude, codex, vicoop-codex)`,
       );
   }
 }
