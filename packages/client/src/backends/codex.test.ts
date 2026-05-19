@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createCodexBackend } from './codex.js';
+import {
+  composeNativeDevInstructions,
+  createCodexBackend,
+  openaiToolsToDynamicToolSpecs,
+} from './codex.js';
 import type {
   AppServerChildHandle,
   AppServerSpawnFn,
@@ -1007,23 +1011,100 @@ test('turn/start RPC error surfaces task.fail with turn_failed', async () => {
   assert.equal(last?.type === 'task.fail' && last.error.code, 'turn_failed');
 });
 
-test('openai-compat envelope agent message is emitted as a data part', async () => {
-  const envelope = JSON.stringify({
-    tool_calls: [{ id: '1', function: { name: 'fetch', arguments: '{}' } }],
-  });
-  const fake = makeFakeSpawn(() => happyPath({ agentMessageText: envelope }));
+// Native function-call surface (#209): codex sends `item/tool/call` as a
+// server request when the model invokes a caller-supplied dynamicTool. The
+// bridge captures it, emits an OpenAI-shaped `tool_calls` artifact, and
+// interrupts the turn so codex unwinds — the caller delivers the result on
+// the next A2A turn via `tool_call_history` (existing path). A2A surfaces
+// the task as `completed` (not `canceled`) so OpenAI Chat Completions
+// callers see `finish_reason: "tool_calls"` semantics.
+test('openai-compat dynamicTools: item/tool/call → tool_calls artifact + completed task (#209)', async () => {
+  const fake = makeFakeSpawn(() => ({
+    onLine(frame, child) {
+      const id = (frame as { id?: number | string }).id;
+      const method = (frame as { method?: string }).method;
+      if (method === 'initialize' && id !== undefined) {
+        child.emitStdout({ id, result: { userAgent: 'fake/0.130.0' } });
+        return;
+      }
+      if (method === 'thread/start' && id !== undefined) {
+        child.emitStdout({ id, result: { thread: { id: 'thr-1' } } });
+        return;
+      }
+      if (method === 'thread/inject_items' && id !== undefined) {
+        child.emitStdout({ id, result: {} });
+        return;
+      }
+      if (method === 'turn/start' && id !== undefined) {
+        child.emitStdout({
+          id,
+          result: { turn: { id: 'turn-1', status: 'inProgress' } },
+        });
+        // Codex fires `item/tool/call` as a server-initiated request once
+        // the model emits a function_call. The bridge must respond with a
+        // DynamicToolCallResponse to unblock codex.
+        queueMicrotask(() => {
+          child.emitStdout({
+            id: 'srv-1',
+            method: 'item/tool/call',
+            params: {
+              threadId: 'thr-1',
+              turnId: 'turn-1',
+              callId: 'call_xyz',
+              namespace: null,
+              tool: 'fetch',
+              arguments: { url: 'https://example.com' },
+            },
+          });
+        });
+        return;
+      }
+      if (method === 'turn/interrupt' && id !== undefined) {
+        child.emitStdout({ id, result: {} });
+        // After receiving turn/interrupt, codex emits the terminal
+        // notification with status:'interrupted'.
+        queueMicrotask(() => {
+          child.emitStdout({
+            method: 'turn/completed',
+            params: {
+              turn: {
+                id: 'turn-1',
+                status: 'interrupted',
+                items: [],
+                error: null,
+              },
+            },
+          });
+        });
+        return;
+      }
+    },
+  }));
   const backend = createCodexBackend({ spawn: fake.spawn });
   const { emit, frames } = collect();
   await backend.handle(
-    assign('what tools?', 'ctx-oai', {
+    assign('fetch example.com', 'ctx-oai', {
       message: {
         role: 'user',
         messageId: 'm',
-        parts: [{ kind: 'text', text: 'what tools?' }],
+        parts: [{ kind: 'text', text: 'fetch example.com' }],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
             system: 'be terse',
-            tools: [{ type: 'function', function: { name: 'fetch', parameters: {} } }],
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'fetch',
+                  description: 'Fetch a URL',
+                  parameters: {
+                    type: 'object',
+                    properties: { url: { type: 'string' } },
+                    required: ['url'],
+                  },
+                },
+              },
+            ],
           },
         },
       },
@@ -1032,40 +1113,321 @@ test('openai-compat envelope agent message is emitted as a data part', async () 
     NEVER,
   );
 
-  // The envelope-shaped agent message must be a `data` part.
+  // The artifact must carry the OpenAI `tool_calls` envelope as a `data`
+  // part — same wire shape PR #208 already emitted on the legacy envelope
+  // path, so downstream gateways see no difference.
   const artifact = frames.find((f) => f.type === 'task.artifact');
-  assert.ok(artifact);
+  assert.ok(artifact, 'tool_calls artifact emitted');
   if (artifact?.type === 'task.artifact') {
     const p = artifact.artifact.parts[0];
     assert.equal(p.kind, 'data');
-    assert.ok(artifact.artifact.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI));
+    assert.ok(
+      artifact.artifact.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI),
+    );
+    if (p.kind === 'data') {
+      const data = p.data as {
+        tool_calls?: Array<{
+          id?: string;
+          function?: { name?: string; arguments?: unknown };
+        }>;
+      };
+      assert.equal(data.tool_calls?.length, 1);
+      assert.equal(data.tool_calls?.[0]?.id, 'call_xyz');
+      assert.equal(data.tool_calls?.[0]?.function?.name, 'fetch');
+      assert.deepEqual(data.tool_calls?.[0]?.function?.arguments, {
+        url: 'https://example.com',
+      });
+    }
   }
 
-  // The envelope is the complete task output and must NOT be re-stamped on
-  // status.message.parts: per A2A "Messages SHOULD NOT be used to deliver
-  // task outputs", and downstream gateways (oai2a2a) used to re-parse the
-  // text part as tool_calls, double-emitting them and corrupting OpenAI
-  // streaming clients. See issue #200.
+  // Despite the underlying turn ending in `interrupted`, the A2A task must
+  // surface as `completed` because the model invoked a tool (caller asked
+  // for cancelation is the only other path).
   const complete = frames.find((f) => f.type === 'task.complete');
   assert.ok(complete && complete.type === 'task.complete');
-  const messageParts = complete.status.message?.parts ?? [];
-  for (const p of messageParts) {
-    if (p.kind !== 'text') continue;
-    assert.equal(
-      p.text.includes('"tool_calls"'),
-      false,
-      'status.message.parts must not echo the openai-compat envelope JSON',
-    );
-  }
+  assert.equal(complete.status.state, 'completed');
 
-  // developerInstructions must have been included in thread/start.
-  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
-  const params = (tsFrame as { params?: { developerInstructions?: string } }).params;
+  // Bridge must have sent `turn/interrupt` for our turn — that, plus
+  // codex's terminal `turn/completed` notification, is what unwinds the
+  // turn. (The bridge also sends back a `DynamicToolCallResponse` for the
+  // server-initiated `item/tool/call`, but the async handler's promise
+  // unwrap may schedule that write one microtask after `handle()` returns;
+  // we drain the queue below before asserting it was eventually sent.)
+  const sent = fake.lastChild().stdinFrames();
+  const interrupt = findRequest(sent, 'turn/interrupt');
+  assert.ok(interrupt, 'turn/interrupt was sent');
+
+  // Drain pending microtasks, then confirm the bridge eventually replied
+  // to the server-initiated `item/tool/call`. codex would block the turn
+  // indefinitely waiting for that response, so it must always be sent —
+  // even though the turn/interrupt path means codex won't act on its
+  // contents. A few macrotask cycles flush any chained promise resolutions
+  // that emit() and `respond()` queue independently of the await graph.
+  for (let i = 0; i < 4; i++) {
+    await new Promise<void>((r) => setImmediate(r));
+  }
+  const drained = fake.lastChild().stdinFrames();
+  const toolResp = drained.find(
+    (f) =>
+      f !== null &&
+      typeof f === 'object' &&
+      (f as { id?: unknown }).id === 'srv-1' &&
+      'result' in (f as object),
+  ) as { result?: { contentItems?: unknown[]; success?: boolean } } | undefined;
+  assert.ok(toolResp, 'bridge responded to item/tool/call');
+  assert.equal(typeof toolResp?.result?.success, 'boolean');
+
+  // dynamicTools must have been included on thread/start.
+  const tsFrame = findRequest(sent, 'thread/start') as
+    | { params?: { dynamicTools?: Array<{ name?: string }> } }
+    | undefined;
+  const dynTools = tsFrame?.params?.dynamicTools;
+  assert.ok(Array.isArray(dynTools) && dynTools.length === 1);
+  assert.equal(dynTools?.[0]?.name, 'fetch');
+
+  // developerInstructions must contain only the user's system text (no
+  // envelope-teaching block, no JSON contract block, no `tool_calls` literal).
+  const params = (tsFrame as { params?: { developerInstructions?: string } })
+    .params;
   assert.ok(
     typeof params?.developerInstructions === 'string' &&
       params.developerInstructions.length > 0,
     'developerInstructions sent on thread/start',
   );
+  assert.equal(
+    params.developerInstructions?.includes('tool_calls'),
+    false,
+    'native path must not teach the JSON envelope contract',
+  );
+});
+
+// Unit cover for the OpenAI → DynamicToolSpec mapping. Critical because the
+// gateway only validates the OpenAI shape; the bridge is the last filter
+// before codex's stricter `validate_dynamic_tools` rejects a malformed spec.
+test('openaiToolsToDynamicToolSpecs maps OpenAI tools and drops malformed entries (#209)', () => {
+  const out = openaiToolsToDynamicToolSpecs([
+    {
+      type: 'function',
+      function: {
+        name: 'fetch',
+        description: 'Fetch a URL',
+        parameters: { type: 'object', properties: { url: { type: 'string' } } },
+      },
+    },
+    // Entries below must be dropped:
+    { type: 'function' }, // no function body
+    { type: 'function', function: { description: 'no name' } }, // no name
+    { type: 'function', function: { name: '' } }, // empty name
+    null,
+    'oops',
+    { function: { name: 'no-type-wrapper' } }, // missing type:"function"
+  ] as unknown[]);
+  assert.ok(Array.isArray(out));
+  assert.equal(out?.length, 1);
+  assert.deepEqual(out?.[0], {
+    name: 'fetch',
+    description: 'Fetch a URL',
+    inputSchema: { type: 'object', properties: { url: { type: 'string' } } },
+  });
+
+  // Empty input ⇒ null so callers can branch without inspecting `.length`.
+  assert.equal(openaiToolsToDynamicToolSpecs([]), null);
+  assert.equal(openaiToolsToDynamicToolSpecs([null, undefined]), null);
+
+  // A tool with no `parameters` becomes the canonical empty-object schema —
+  // codex requires `inputSchema` to be present.
+  const noParams = openaiToolsToDynamicToolSpecs([
+    { type: 'function', function: { name: 'ping' } },
+  ]);
+  assert.deepEqual(noParams?.[0]?.inputSchema, {
+    type: 'object',
+    properties: {},
+  });
+});
+
+// Unit cover for the native-path developer-instructions composer. The
+// invariant matters because the envelope-teaching block in the legacy
+// helper is the very thing we are removing on #209 — accidentally
+// re-introducing it would put the model back into the parse-from-text
+// failure modes #208 catalogued.
+test('composeNativeDevInstructions includes system text, omits JSON envelope contract (#209)', () => {
+  assert.equal(
+    composeNativeDevInstructions({ system: 'be terse' }),
+    'be terse',
+  );
+  // tool_choice="required" gets a steering line.
+  const requiredOut = composeNativeDevInstructions({
+    system: 'sys',
+    tools: [],
+    tool_choice: 'required',
+  });
+  assert.ok(requiredOut.startsWith('sys'));
+  assert.ok(requiredOut.includes('tool_choice="required"'));
+  // Named function tool_choice gets a steering line naming the function.
+  const namedOut = composeNativeDevInstructions({
+    system: '',
+    tools: [],
+    tool_choice: { type: 'function', function: { name: 'fetch' } },
+  });
+  assert.ok(namedOut.includes('"fetch"'));
+  // Crucially: no envelope contract anywhere in the output, even when
+  // `tools` is present in the metadata.
+  const withTools = composeNativeDevInstructions({
+    system: 'sys',
+    tools: [{ type: 'function', function: { name: 'fetch' } }],
+    tool_choice: 'auto',
+  });
+  assert.equal(withTools.includes('tool_calls'), false);
+  assert.equal(withTools.includes('{"tool_calls"'), false);
+});
+
+// The handler is keyed on the resumed thread id because codex persists
+// `dynamicTools` with `SessionMeta` and the model can still invoke them on
+// a resumed turn. Without registering on resume, a tool call on the second
+// A2A turn would land on the default handler ("no caller tool handler
+// registered") and never surface to the caller — a silent regression
+// compared to start.
+test('dynamicTools handler is registered on thread/resume too (#209)', async () => {
+  let turnCount = 0;
+  const fake = makeFakeSpawn(() => ({
+    onLine(frame, child) {
+      const id = (frame as { id?: number | string }).id;
+      const method = (frame as { method?: string }).method;
+      if (method === 'initialize' && id !== undefined) {
+        child.emitStdout({ id, result: {} });
+        return;
+      }
+      if (
+        (method === 'thread/start' || method === 'thread/resume') &&
+        id !== undefined
+      ) {
+        child.emitStdout({ id, result: { thread: { id: 'thr-1' } } });
+        return;
+      }
+      if (method === 'thread/inject_items' && id !== undefined) {
+        child.emitStdout({ id, result: {} });
+        return;
+      }
+      if (method === 'turn/start' && id !== undefined) {
+        turnCount += 1;
+        const turnId = `turn-${turnCount}`;
+        child.emitStdout({
+          id,
+          result: { turn: { id: turnId, status: 'inProgress' } },
+        });
+        if (turnCount === 1) {
+          // First turn completes plainly so a resume happens on the second.
+          queueMicrotask(() => {
+            child.emitStdout({
+              method: 'item/completed',
+              params: {
+                turnId,
+                threadId: 'thr-1',
+                item: { type: 'agentMessage', id: 'a1', text: 'first' },
+              },
+            });
+            child.emitStdout({
+              method: 'turn/completed',
+              params: {
+                turn: { id: turnId, status: 'completed', items: [], error: null },
+              },
+            });
+          });
+        } else {
+          // Second turn (resume): fire item/tool/call to prove the handler
+          // is registered on the resumed thread.
+          queueMicrotask(() => {
+            child.emitStdout({
+              id: 'srv-r',
+              method: 'item/tool/call',
+              params: {
+                threadId: 'thr-1',
+                turnId,
+                callId: 'call_resume',
+                namespace: null,
+                tool: 'fetch',
+                arguments: { x: 1 },
+              },
+            });
+          });
+        }
+        return;
+      }
+      if (method === 'turn/interrupt' && id !== undefined) {
+        child.emitStdout({ id, result: {} });
+        queueMicrotask(() => {
+          child.emitStdout({
+            method: 'turn/completed',
+            params: {
+              turn: { id: 'turn-2', status: 'interrupted', items: [], error: null },
+            },
+          });
+        });
+        return;
+      }
+    },
+  }));
+  const backend = createCodexBackend({ spawn: fake.spawn });
+
+  const oaiMeta = {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      system: 'sys',
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'fetch', parameters: {} },
+        },
+      ],
+    },
+  };
+
+  // Turn 1: start.
+  await backend.handle(
+    assign('first', 'ctx-resume', {
+      message: {
+        role: 'user',
+        messageId: 'm1',
+        parts: [{ kind: 'text', text: 'first' }],
+        metadata: oaiMeta,
+      },
+    }),
+    () => {},
+    NEVER,
+  );
+
+  // Turn 2: same contextId triggers resume; we don't re-send dynamicTools
+  // but codex re-hydrates them — the handler must still fire.
+  const { emit, frames } = collect();
+  await backend.handle(
+    assign('second', 'ctx-resume', {
+      message: {
+        role: 'user',
+        messageId: 'm2',
+        parts: [{ kind: 'text', text: 'second' }],
+        metadata: oaiMeta,
+      },
+    }),
+    emit,
+    NEVER,
+  );
+
+  const artifact = frames.find((f) => f.type === 'task.artifact');
+  assert.ok(artifact, 'tool_calls artifact emitted on the resumed turn');
+  if (artifact?.type === 'task.artifact') {
+    assert.ok(
+      artifact.artifact.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI),
+    );
+  }
+  const complete = frames.find((f) => f.type === 'task.complete');
+  assert.ok(complete && complete.type === 'task.complete');
+  assert.equal(complete.status.state, 'completed');
+
+  // The second thread call must have been `thread/resume`, not `thread/start`.
+  const sent = fake.lastChild().stdinFrames();
+  const resumeCount = sent.filter(
+    (f) => (f as { method?: string }).method === 'thread/resume',
+  ).length;
+  assert.equal(resumeCount, 1);
 });
 
 // The full set of codex features the backend disables when caller-side

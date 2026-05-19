@@ -10,10 +10,8 @@ import {
 import type { Backend } from '../backend.js';
 import { createLogger, type Logger } from '../logger.js';
 import {
-  buildOpenAICompatSystemPrompt,
   callerToolDispatchActive,
   parseOpenAICompatMetadata,
-  tryParseToolCallsEnvelope,
 } from './claude.js';
 import {
   buildOpenAICompatUsage,
@@ -24,16 +22,20 @@ import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME } from './fetch-uri-file.js';
 import { createTimingRecorder } from './timing.js';
 import {
   AppServerRpcClient,
+  DYNAMIC_TOOL_CALL_METHOD,
   defaultAppServerSpawn,
   TRANSPORT_CLOSED,
   type AppServerSpawnFn,
+  type DynamicToolCallParams,
+  type DynamicToolCallResponse,
+  type DynamicToolSpec,
   type InitializeResult,
   type ResponsesApiItem,
   type SandboxMode,
   type ThreadItem,
   type UserInputItem,
 } from './codex-rpc.js';
-import type { OpenAICompatHistoryEntry } from './claude.js';
+import type { OpenAICompatHistoryEntry, OpenAICompatMetadata } from './claude.js';
 
 export type CodexSandboxMode = SandboxMode;
 export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline';
@@ -301,6 +303,69 @@ function buildUserInput(
   return items;
 }
 
+// Map the caller-provided OpenAI `tools` array (the wire shape used in
+// OpenAI Chat Completions: `{ type: 'function', function: { name, description,
+// parameters } }`) to codex's `DynamicToolSpec` shape used on
+// `thread/start.dynamicTools`. Entries missing the required pieces (name, or
+// a `function` envelope) are silently dropped — the gateway already validated
+// the OpenAI request shape, so this is a defensive last filter; an entirely
+// empty result is returned as `null` so callers can branch off "no tools to
+// inject" without checking `length`.
+export function openaiToolsToDynamicToolSpecs(
+  tools: readonly unknown[],
+): DynamicToolSpec[] | null {
+  const out: DynamicToolSpec[] = [];
+  for (const t of tools) {
+    if (!t || typeof t !== 'object') continue;
+    const wrap = t as { type?: unknown; function?: unknown };
+    if (wrap.type !== 'function') continue;
+    if (!wrap.function || typeof wrap.function !== 'object') continue;
+    const fn = wrap.function as {
+      name?: unknown;
+      description?: unknown;
+      parameters?: unknown;
+    };
+    if (typeof fn.name !== 'string' || !fn.name) continue;
+    out.push({
+      name: fn.name,
+      description: typeof fn.description === 'string' ? fn.description : '',
+      // codex requires an inputSchema; an empty object schema is the
+      // canonical "no parameters" shape per OpenAI.
+      inputSchema: fn.parameters ?? { type: 'object', properties: {} },
+    });
+  }
+  return out.length > 0 ? out : null;
+}
+
+// Compose `developerInstructions` for the native dispatch path. Includes the
+// caller's `system` text verbatim plus a short directive when `tool_choice`
+// is "required" or names a specific function — codex has no native
+// `tool_choice` field, so we steer the model with a one-line note. The
+// envelope-teaching block is omitted; the model sees the tools natively via
+// codex's function-call surface, so describing a JSON-emit contract would
+// only invite confusion.
+export function composeNativeDevInstructions(meta: OpenAICompatMetadata): string {
+  const sections: string[] = [];
+  if (meta.system) sections.push(meta.system);
+  const tc = meta.tool_choice;
+  if (tc === 'required') {
+    sections.push(
+      'tool_choice="required": you MUST invoke one of the available tools this turn; answering in natural language is not allowed.',
+    );
+  } else if (typeof tc === 'object' && tc !== null && !Array.isArray(tc)) {
+    const c = tc as { type?: unknown; function?: unknown };
+    if (c.type === 'function' && c.function && typeof c.function === 'object') {
+      const fn = c.function as { name?: unknown };
+      if (typeof fn.name === 'string' && fn.name.length > 0) {
+        sections.push(
+          `tool_choice: you MUST invoke the tool named "${fn.name}".`,
+        );
+      }
+    }
+  }
+  return sections.join('\n\n');
+}
+
 // Map an openai-compat `tool_call_history` to OpenAI Responses API items
 // suitable for `thread/inject_items`. Each `assistant.tool_calls[]` entry
 // fans out into one `function_call` item; each `role:"tool"` entry maps to
@@ -429,6 +494,19 @@ export function createCodexBackend(
   let initInFlight: Promise<AppServerRpcClient> | null = null;
   let serverInfo: InitializeResult | null = null;
 
+  // Per-thread handlers for `item/tool/call` (codex's native-function-call
+  // server request). Registered by the active `handle()` after thread/start
+  // returns a threadId, and unregistered in the matching `finally`. The
+  // app-server client has exactly one server-request handler installed at
+  // initialize time (see `ensureClient` below) — that handler dispatches by
+  // method, routing `item/tool/call` here keyed on `threadId` so each task
+  // sees only its own tool calls. Other server requests (approvals, MCP
+  // elicitation) fall through to the default `approvalDecision`.
+  const toolCallHandlers = new Map<
+    string,
+    (params: DynamicToolCallParams) => Promise<DynamicToolCallResponse> | DynamicToolCallResponse
+  >();
+
   // Spawn the app-server, do the handshake, register handlers. Subsequent
   // tasks reuse the same client until it dies; a dead client is replaced
   // on the next `ensureClient()` call.
@@ -444,7 +522,44 @@ export function createCodexBackend(
         logger,
         stderrCaptureBytes: stderrCap,
       });
-      c.setServerRequestHandler((_id, _method) => ({ decision: approvalDecision }));
+      c.setServerRequestHandler(async (_id, method, params) => {
+        // Native function-call dispatch: route to the per-thread handler the
+        // active task registered after `thread/start`. The dispatch table is
+        // keyed on `threadId`; if a task with `dynamicTools` registered a
+        // handler then codex's `item/tool/call` lands here with the model's
+        // arguments. Missing handler ⇒ the request arrived after the task
+        // unregistered (race against turn/interrupt) — respond `success:false`
+        // so codex unwinds the turn cleanly rather than blocking.
+        if (method === DYNAMIC_TOOL_CALL_METHOD) {
+          const p = params as DynamicToolCallParams | undefined;
+          const handler = p?.threadId ? toolCallHandlers.get(p.threadId) : null;
+          if (handler && p) {
+            try {
+              return await handler(p);
+            } catch (err) {
+              logger?.warn?.(
+                `[codex] tool-call handler for thread ${p.threadId} threw: ${errorMessage(err)}`,
+              );
+              return {
+                contentItems: [
+                  { type: 'inputText', text: 'caller tool handler failed' },
+                ],
+                success: false,
+              } satisfies DynamicToolCallResponse;
+            }
+          }
+          return {
+            contentItems: [
+              { type: 'inputText', text: 'no caller tool handler registered' },
+            ],
+            success: false,
+          } satisfies DynamicToolCallResponse;
+        }
+        // Default: approval prompts and friends. We surface a single decision
+        // for every approval-flavored request; the bridge's daemon mode has
+        // no interactive operator to ask.
+        return { decision: approvalDecision };
+      });
       try {
         c.start();
       } catch (err) {
@@ -551,6 +666,13 @@ export function createCodexBackend(
       // turns per thread, so we enforce that here rather than letting the
       // server reject the second `turn/start`.
       const releaseLock = await acquireContextLock(task.contextId);
+      // Captured by the inner try when the per-thread `item/tool/call`
+      // handler is registered (after `thread/start` / `thread/resume`
+      // succeed). Read in the outer finally to unregister the handler
+      // regardless of which path the turn took. Kept out here because
+      // `existing` / `observedThreadId` are block-scoped to the inner try
+      // and not visible in its finally.
+      let registeredThreadId: string | null = null;
       try {
         if (signal.aborted) {
           emit({
@@ -569,9 +691,22 @@ export function createCodexBackend(
         // function-call history rather than a JSON blob it has to be
         // instructed to interpret, eliminating the multi-turn re-call loop
         // observed under prompts like `"Use a tool to list …"` (#176).
+        //
+        // When the caller supplies tools, the codex backend dispatches them
+        // natively via `thread/start.dynamicTools` + `item/tool/call` server
+        // requests (#209), not via the JSON-text envelope contract — so the
+        // `developerInstructions` is just the user's `system` text plus a
+        // short `tool_choice` nudge when applicable. The wire shape we emit
+        // upstream (`tool_calls` artifact, `tool_call_history` input) is
+        // unchanged so callers see no difference.
         const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
-        const systemPrompt =
-          openaiCompat ? buildOpenAICompatSystemPrompt(openaiCompat) : '';
+        const dynamicTools =
+          openaiCompat && callerToolDispatchActive(openaiCompat) && openaiCompat.tools
+            ? openaiToolsToDynamicToolSpecs(openaiCompat.tools)
+            : null;
+        const systemPrompt = openaiCompat
+          ? composeNativeDevInstructions(openaiCompat)
+          : '';
         const historyInjectItems = openaiCompat?.tool_call_history
           ? historyToInjectItems(openaiCompat.tool_call_history)
           : null;
@@ -757,6 +892,11 @@ export function createCodexBackend(
                   ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),
                   ...(featuresOverride ? { config: featuresOverride } : {}),
                   ...(sendEmptyEnvironments ? { environments: [] } : {}),
+                  // Native function-call surface for caller-side tools (#209).
+                  // codex persists `dynamicTools` with `SessionMeta` and
+                  // re-hydrates them on `thread/resume`, so we only send
+                  // them on the initial start.
+                  ...(dynamicTools ? { dynamicTools } : {}),
                 },
               );
               threadId = startResult.thread.id;
@@ -818,30 +958,81 @@ export function createCodexBackend(
           let finalText: string | null = null;
           let finalUsage: OpenAICompatUsage | null = null;
           let emittedAnyArtifact = false;
+          // Set when an `item/tool/call` lands for this turn — the model
+          // invoked a caller-side tool, we emitted a `tool_calls` artifact,
+          // and asked codex to interrupt. The interrupted-turn outcome
+          // below is mapped to `completed` (instead of `canceled`) on this
+          // flag so the caller's A2A task surfaces as success with a
+          // `tool_calls` artifact, matching OpenAI Chat Completions'
+          // `finish_reason: "tool_calls"` semantics.
+          let capturedToolCall = false;
           const emitTraceArtifacts = traceabilityRequested(task);
+
+          // Register the per-thread `item/tool/call` handler for the
+          // duration of this turn. We always register when the openai-compat
+          // extension is active — even on `thread/resume` without
+          // `dynamicTools` in the current task — because codex persists
+          // dynamicTools with SessionMeta and the resumed thread can still
+          // invoke them. The handler is unregistered in the `finally` of
+          // the outer try that wraps the turn loop below.
+          if (openaiCompat) {
+            registeredThreadId = threadId;
+            toolCallHandlers.set(threadId, async (p) => {
+              capturedToolCall = true;
+              // The OpenAI Chat Completions wire shape callers expect.
+              // codex hands us `arguments` already parsed as a JSON value;
+              // the envelope path historically forwarded the parsed object
+              // verbatim, so the artifact stays byte-compatible with PR
+              // #208's output and downstream gateways (oai2a2a) don't have
+              // to special-case the source.
+              const envelope = {
+                tool_calls: [
+                  {
+                    id: p.callId,
+                    function: {
+                      name: p.tool,
+                      arguments: p.arguments,
+                    },
+                  },
+                ],
+              };
+              emit({
+                type: 'task.artifact',
+                taskId: task.taskId,
+                artifact: {
+                  artifactId: randomUUID(),
+                  name: 'codex-message',
+                  parts: [{ kind: 'data', data: envelope }],
+                  extensions: [OPENAI_COMPAT_EXTENSION_URI],
+                },
+                lastChunk: true,
+              });
+              emittedAnyArtifact = true;
+              // Best-effort `turn/interrupt` so codex unwinds the turn —
+              // the model's function_call is already surfaced upstream and
+              // we don't want it generating further text or chaining into
+              // another tool call before the caller has had a chance to
+              // reply via `tool_call_history`.
+              if (activeTurnId) {
+                void client
+                  .request('turn/interrupt', { threadId, turnId: activeTurnId })
+                  .catch(() => {
+                    // Best-effort; the turn loop watches for turn/completed.
+                  });
+              }
+              // codex still expects a structured answer to the server
+              // request; success=false signals the model that the result
+              // is unavailable, but since we are interrupting the turn the
+              // model never gets to act on it.
+              return {
+                contentItems: [],
+                success: false,
+              };
+            });
+          }
 
           const emitAgentArtifact = (text: string): void => {
             if (!text) return;
-            // openai-compat envelope detection — same contract the codex
-            // backend uses, so callers see identical `data` parts.
-            if (openaiCompat) {
-              const envelope = tryParseToolCallsEnvelope(text);
-              if (envelope) {
-                emit({
-                  type: 'task.artifact',
-                  taskId: task.taskId,
-                  artifact: {
-                    artifactId: randomUUID(),
-                    name: 'codex-message',
-                    parts: [{ kind: 'data', data: envelope }],
-                    extensions: [OPENAI_COMPAT_EXTENSION_URI],
-                  },
-                  lastChunk: true,
-                });
-                emittedAnyArtifact = true;
-                return;
-              }
-            }
             emit({
               type: 'task.artifact',
               taskId: task.taskId,
@@ -1050,14 +1241,27 @@ export function createCodexBackend(
 
           // Map turn outcome to A2A lifecycle.
           if (outcome.status === 'interrupted' || outcome.status === 'aborted') {
-            rollbackFreshThread();
-            rollbackResumeRefresh();
-            emit({
-              type: 'task.complete',
-              taskId: task.taskId,
-              status: { state: 'canceled', timestamp: new Date().toISOString() },
-            });
-            return;
+            // Caller-side abort (`signal.aborted`) takes precedence: surface
+            // as `canceled` regardless of whether we also captured a tool
+            // call, because the caller asked for cancelation.
+            const callerAborted = outcome.status === 'aborted' || signal.aborted;
+            if (capturedToolCall && !callerAborted) {
+              // We interrupted ourselves because the model invoked a caller
+              // tool. The `tool_calls` artifact is already on the wire;
+              // fall through to the completion path so the task surfaces as
+              // success with `finish_reason: "tool_calls"` semantics on the
+              // caller side (the next A2A turn ships the result via
+              // `tool_call_history`).
+            } else {
+              rollbackFreshThread();
+              rollbackResumeRefresh();
+              emit({
+                type: 'task.complete',
+                taskId: task.taskId,
+                status: { state: 'canceled', timestamp: new Date().toISOString() },
+              });
+              return;
+            }
           }
 
           if (outcome.status === 'failed') {
@@ -1087,17 +1291,15 @@ export function createCodexBackend(
           }
 
           const completeText = outcome.finalText ?? '';
-          // If the finalText is the openai-compat `{"tool_calls":[…]}`
-          // envelope, it was already routed to a `data` artifact via
-          // emitAgentArtifact. Re-stamping the raw JSON onto
-          // status.message.parts violates A2A's "Messages SHOULD NOT be
-          // used to deliver task outputs" and causes downstream gateways
-          // (oai2a2a) to re-extract and re-emit the same tool_calls,
-          // corrupting OpenAI streaming clients that concatenate
-          // arguments by index. See issue #200.
-          const envelopeAlreadyRouted =
-            openaiCompat !== null && tryParseToolCallsEnvelope(completeText) !== null;
-          const parts: Part[] = !envelopeAlreadyRouted && completeText
+          // When the model invoked a caller tool, the `tool_calls` artifact
+          // is the complete task output: any agent text codex streamed
+          // before the function_call is best treated as reasoning preamble
+          // and not re-stamped on `status.message.parts`. Re-stamping
+          // violates A2A's "Messages SHOULD NOT be used to deliver task
+          // outputs" and, downstream, caused gateways (oai2a2a) to
+          // double-emit `tool_calls` on the envelope path (#200) — keep
+          // the same invariant on the native path.
+          const parts: Part[] = !capturedToolCall && completeText
             ? [{ kind: 'text', text: completeText }]
             : [];
           if (!emittedAnyArtifact && completeText) {
@@ -1145,6 +1347,11 @@ export function createCodexBackend(
             },
           });
         } finally {
+          // Drop the per-thread `item/tool/call` handler if we registered
+          // one. Map.delete on a missing key is a no-op, so paths that
+          // failed before registration (failed start/resume, aborted-before-
+          // turn) cost nothing here.
+          if (registeredThreadId) toolCallHandlers.delete(registeredThreadId);
           if (mapped.tempDir) {
             try {
               await rm(mapped.tempDir, { recursive: true, force: true });
