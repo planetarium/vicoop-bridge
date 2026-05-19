@@ -18,6 +18,12 @@ import {
   type SendFileMcpServer,
 } from './send-file-mcp.js';
 import {
+  startCallerToolsMcpServer,
+  type CallerToolDefinition,
+  type CallerToolInvocation,
+  type CallerToolsMcpServer,
+} from './caller-tools-mcp.js';
+import {
   FetchUriError,
   fetchUriToBytes,
   INPUT_FILE_MAX_BYTES,
@@ -105,6 +111,15 @@ export interface ClaudeBackendOptions {
   // thrown Error from `createClaudeBackend(...)` so misconfiguration is
   // visible at startup rather than as a corrupted argv on the first task.
   settings?: Record<string, unknown>;
+  /**
+   * Test seam: invoked once per task with the caller-tools MCP server
+   * handle immediately after the bridge stands one up (when the
+   * openai-compat extension is active with `tools`). Used by unit tests
+   * to drive `invokeForTest` against the exact server the spawn will
+   * see, without going through a real MCP transport. Not part of the
+   * public API — leave unset in production.
+   */
+  onCallerToolsMcpReady?: (server: CallerToolsMcpServer) => void;
 }
 
 // Kept short and behaviour-focused. The risk we're guarding against is
@@ -617,6 +632,101 @@ export function buildOpenAICompatSystemPrompt(meta: OpenAICompatMetadata): strin
   return sections.join('\n\n');
 }
 
+// Map the caller-provided OpenAI `tools` array (the wire shape used in
+// OpenAI Chat Completions: `{ type: 'function', function: { name, description,
+// parameters } }`) to `CallerToolDefinition[]` for `caller-tools-mcp`. Mirrors
+// `openaiToolsToDynamicToolSpecs` on the codex backend (#212) byte-for-byte
+// in its mapping rules — same dropped entries (no name, missing function
+// envelope, unknown type) and same empty-object schema default for tools
+// declared without `parameters`. Returns `null` when no usable entries
+// remain so callers can branch off "no tools to register" without checking
+// `length`.
+export function openaiToolsToCallerToolDefs(
+  tools: readonly unknown[],
+): CallerToolDefinition[] | null {
+  const out: CallerToolDefinition[] = [];
+  for (const t of tools) {
+    if (!t || typeof t !== 'object') continue;
+    const wrap = t as { type?: unknown; function?: unknown };
+    if (wrap.type !== 'function') continue;
+    if (!wrap.function || typeof wrap.function !== 'object') continue;
+    const fn = wrap.function as {
+      name?: unknown;
+      description?: unknown;
+      parameters?: unknown;
+    };
+    if (typeof fn.name !== 'string' || !fn.name) continue;
+    out.push({
+      name: fn.name,
+      description: typeof fn.description === 'string' ? fn.description : '',
+      // Forward the JSON Schema verbatim. The MCP server in turn forwards
+      // it to claude unchanged, so the model sees exactly what the caller
+      // declared. Missing `parameters` ⇒ the canonical empty-object
+      // schema, matching OpenAI's convention for parameterless functions.
+      inputSchema: fn.parameters ?? { type: 'object', properties: {} },
+    });
+  }
+  return out.length > 0 ? out : null;
+}
+
+// Build the system-prompt text injected via `--append-system-prompt` for the
+// openai-compat path on the claude backend (#213). The caller's tools are
+// exposed to the model through the native MCP tool surface
+// (`caller-tools-mcp.ts`), so the prompt no longer teaches a JSON-emit
+// contract or duplicates the tool list — the model discovers tools via
+// `tools/list` and invokes them through its normal `tool_use` surface.
+//
+// What we still teach the model:
+//   - Caller's `system` text — verbatim, first. No other transport carries
+//     it: MCP `tools/list` only describes tools, not the conversation's
+//     system message.
+//   - How to read the `<tool_call_history>` block. Follow-up turns
+//     text-prepend the history (`formatToolCallHistory`) because claude has
+//     no native equivalent of codex's `thread/inject_items`. The model has
+//     to know the block is authoritative and not to re-emit a call whose
+//     result is already recorded.
+//   - tool_choice descriptor for `"required"` and `{type:"function",
+//     function:{name}}` — claude has no native `tool_choice` flag, so the
+//     prompt is the only place we can express it.
+//
+// What we DON'T teach anymore:
+//   - The "respond with ONLY a single JSON object …" envelope contract.
+//   - The full `JSON.stringify(meta.tools)` dump.
+//   - A "stop after invoking, don't chain" directive — `--max-turns 1` on
+//     the spawned claude enforces it mechanically. The model can still
+//     emit parallel `tool_use` blocks within one assistant message (which
+//     is fine per OpenAI semantics), but it cannot proceed to a second
+//     model turn within the same task.
+//   - A "session memory vs history block" disambiguation — openai-compat
+//     tasks always spawn with a fresh `--session-id` (see the session
+//     reuse gate in `handle()`), so there's no prior session memory to
+//     conflict with the history block.
+export function buildOpenAICompatNativeSystemPrompt(meta: OpenAICompatMetadata): string {
+  const sections: string[] = [];
+  if (meta.system) sections.push(meta.system);
+
+  const toolChoiceIsNone = meta.tool_choice === 'none';
+  const hasTools = meta.tools !== undefined && !toolChoiceIsNone;
+
+  if (hasTools) {
+    sections.push(
+      [
+        'You are routed through an OpenAI-compatible gateway. The caller has supplied function tools that appear in your native tool list — invoke them through your normal tool-use surface.',
+        '',
+        'The user message may begin with a <tool_call_history>...</tool_call_history> block holding a JSON array of prior round-trips: {"role":"assistant","tool_calls":[...]} for calls you previously emitted, and {"role":"tool","tool_call_id":"call_…","name":"…","content":"…"} for the authoritative result of each call. Treat the block as the source of truth for what has happened so far — do not re-emit a call whose `tool_call_id` already has a recorded result.',
+      ].join('\n'),
+    );
+    const tcDesc = describeToolChoice(meta.tool_choice);
+    if (tcDesc) sections.push(tcDesc);
+  } else if (toolChoiceIsNone) {
+    sections.push(
+      'A list of OpenAI-style tools was supplied with tool_choice="none". Do not invoke any caller-provided tool; always answer in natural language.',
+    );
+  }
+
+  return sections.join('\n\n');
+}
+
 // Render a `tool_call_history` payload as a `<tool_call_history>`-wrapped
 // JSON block. Goes at the front of the user content on follow-up turns so
 // the model reads the prior round before the new instruction; the wrapper
@@ -986,6 +1096,21 @@ export function createClaudeBackend(
       // path with no envelope-detection cost.
       const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
 
+      // Native MCP dispatch (#213): when the openai-compat extension is
+      // active and carries `tools` (and `tool_choice !== "none"`), the
+      // caller's tool surface is exposed through a per-task in-process MCP
+      // server (`caller-tools-mcp`) — the claude analog of codex's
+      // `dynamicTools` (#212). `callerToolDefs` is non-null only on that
+      // path; downstream gates (`--mcp-config caller-tools`, native system
+      // prompt, `--max-turns 1`) branch off this single check, so claude
+      // tasks without the openai-compat extension (or without `tools`)
+      // remain on the default agentic path with claude's built-ins intact.
+      const callerToolDefs =
+        callerToolDispatchActive(openaiCompat) && openaiCompat?.tools
+          ? openaiToolsToCallerToolDefs(openaiCompat.tools)
+          : null;
+      const nativeDispatchActive = callerToolDefs !== null;
+
       const mapped = await mapPartsToContentBlocks(task.message.parts, opts.fetchUriPolicy, signal);
       recorder.mark('map');
       if (mapped.ok && openaiCompat?.tool_call_history) {
@@ -1010,22 +1135,52 @@ export function createClaudeBackend(
         return;
       }
 
-      // Reuse a prior session bound to this contextId when the binding is
-      // still fresh; otherwise mint a new uuid and pre-assign it via
-      // --session-id so we can record it before the run produces any output.
+      // Session reuse is for A2A callers that want conversation continuity
+      // across tasks sharing a contextId. The openai-compat extension is
+      // stateless by design — every OpenAI Chat Completions request carries
+      // its own full message history, so resuming a prior claude session
+      // would risk feeding the model two sources of truth (claude's own
+      // session memory containing the sentinel "captured by bridge" result
+      // we returned from the MCP `onInvoke` handler, AND the user message's
+      // prepended `tool_call_history` JSON carrying the caller's real tool
+      // results). Skip the session map entirely for openai-compat tasks so
+      // every spawn starts on a clean `--session-id`; the history block in
+      // the user message is then the unambiguous source of truth.
+      const sessionReuseEligible = openaiCompat === null && sessionTtlMs > 0;
       const tNow = now();
-      if (sessionTtlMs > 0) evictExpired(tNow - sessionTtlMs);
-      const existing = sessionTtlMs > 0 ? sessions.get(task.contextId) : undefined;
+      if (sessionReuseEligible) evictExpired(tNow - sessionTtlMs);
+      const existing = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
       const sessionId = existing?.sessionId ?? randomUUID();
       const isResume = existing !== undefined;
       let writeId = 0;
-      if (sessionTtlMs > 0) {
+      if (sessionReuseEligible) {
         // Refresh lastUsedAt eagerly: a concurrent second task on the same
         // contextId arriving before this one finishes also resumes the same
         // session id (rather than racing to mint a new one).
         writeId = ++writeCounter;
         sessions.set(task.contextId, { sessionId, lastUsedAt: tNow, writeId });
       }
+
+      // Drop the freshly-minted (contextId → sessionId) binding when the
+      // run never reached a successful state, so the next task on this
+      // contextId mints a brand-new id instead of `--resume`-ing a session
+      // claude never persisted on disk. No-op if this run was already
+      // resuming an existing session, or if session reuse is disabled.
+      //
+      // Concurrency: only delete when the entry is still the one THIS task
+      // wrote. A second concurrent task on the same contextId would have
+      // bumped `writeId` when refreshing the binding; if we see a different
+      // writeId, that other task now "owns" the entry and should keep it.
+      // Declared early so the early-return paths below (sendFile MCP
+      // failure with a fatal escalation, caller-tools MCP failure) can
+      // reach it before the spawn block redeclares it.
+      const rollbackFreshSession = (): void => {
+        if (isResume || !sessionReuseEligible) return;
+        const cur = sessions.get(task.contextId);
+        if (cur?.sessionId === sessionId && cur.writeId === writeId) {
+          sessions.delete(task.contextId);
+        }
+      };
 
       // Bring up the MCP server first (if enabled) so we know its URL before
       // building argv. A startup failure disables the tool path for this task
@@ -1042,6 +1197,112 @@ export function createClaudeBackend(
         recorder.mark('mcp');
       }
 
+      // Flag flipped by the `caller-tools-mcp` invocation handler when the
+      // model invokes a caller-supplied tool. Read in the terminal block
+      // below to suppress re-stamping the model's wrap-up text on
+      // `status.message.parts` — the `tool_calls` data artifact is the
+      // complete output for this turn, matching OpenAI Chat Completions'
+      // `finish_reason: "tool_calls"` semantics (the same invariant codex
+      // backend enforces on its native path, see #212).
+      let capturedToolCall = false;
+
+      // Caller-side function tools, exposed as native MCP tools. Per-task
+      // lifecycle: stood up here BEFORE the spawn (so we know the URL to
+      // wire into `--mcp-config`), torn down in `closeCallerToolsMcp`
+      // which is called once per terminal path. A startup failure
+      // surfaces as a task.fail — there is no envelope-text fallback to
+      // fall back to (#213 removed the envelope-shape dispatch entirely),
+      // so a bind failure is a hard run failure that the caller needs to
+      // see rather than a silent downgrade.
+      let callerToolsMcp: CallerToolsMcpServer | null = null;
+      const closeCallerToolsMcp = async (): Promise<void> => {
+        // Idempotent: each return path may call this and we only want one
+        // real close. Nulling out before the await also avoids a race if a
+        // throw inside `close()` re-entered this function.
+        if (!callerToolsMcp) return;
+        const s = callerToolsMcp;
+        callerToolsMcp = null;
+        try {
+          await s.close();
+        } catch (err) {
+          console.warn(
+            `[claude] caller-tools MCP close failed: ${errorMessage(err)}`,
+          );
+        }
+      };
+      if (callerToolDefs) {
+        try {
+          callerToolsMcp = await startCallerToolsMcpServer({
+            // Tests drive this listener-free via `invokeForTest`; production
+            // leaves `skipHttp` unset so claude can connect over HTTP.
+            skipHttp: opts.onCallerToolsMcpReady !== undefined,
+            tools: callerToolDefs,
+            onInvoke: (invocation: CallerToolInvocation) => {
+              // Same OpenAI wire shape the envelope path emits — downstream
+              // gateways (oai2a2a) see no difference between native and
+              // envelope output, so this dispatch swap is invisible above
+              // the bridge layer.
+              const envelope = {
+                tool_calls: [
+                  {
+                    id: invocation.callId,
+                    function: {
+                      name: invocation.toolName,
+                      arguments: invocation.arguments,
+                    },
+                  },
+                ],
+              };
+              emit({
+                type: 'task.artifact',
+                taskId: task.taskId,
+                artifact: {
+                  artifactId: randomUUID(),
+                  name: 'claude-message',
+                  parts: [{ kind: 'data', data: envelope }],
+                  extensions: [OPENAI_COMPAT_EXTENSION_URI],
+                },
+                lastChunk: true,
+              });
+              capturedToolCall = true;
+              // The actual tool result is the caller's job — it arrives on
+              // the next A2A turn via `tool_call_history`. Returning a
+              // short structured-error ack here so claude sees "tool gave
+              // up; don't try again" rather than "tool succeeded with some
+              // text result" (which it might then try to summarise). The
+              // system-prompt directive in
+              // `buildOpenAICompatNativeSystemPrompt` reinforces the same
+              // stop-after-invoke rule from the prompt side.
+              return {
+                text: 'caller-tool call captured by bridge; the actual result will be delivered on the next turn',
+                isError: true,
+              };
+            },
+          });
+        } catch (err) {
+          rollbackFreshSession();
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: {
+              code: 'caller_tools_mcp_start_failed',
+              message: `caller-tools MCP server failed to start: ${errorMessage(err)}`,
+            },
+          });
+          return;
+        }
+        recorder.mark('caller-tools-mcp');
+        if (callerToolsMcp && opts.onCallerToolsMcpReady) {
+          opts.onCallerToolsMcpReady(callerToolsMcp);
+        }
+      }
+      // When the openai-compat extension carries `tools`, by here the MCP
+      // server is definitively up (a startup failure already short-circuited
+      // above into task.fail). nativeReady is therefore equivalent to
+      // nativeDispatchActive, but kept named so the argv conditions below
+      // read in terms of the model's view ("native tool surface is live").
+      const nativeReady = nativeDispatchActive && callerToolsMcp !== null;
+
       // Per-task `--append-system-prompt` carrying the openai-compat
       // extension's system / tools / tool_choice. Placed AFTER identityArgs
       // (so the self-identity directive is the model's first read) but
@@ -1049,7 +1310,10 @@ export function createClaudeBackend(
       // appending last — claude concatenates each --append-system-prompt
       // occurrence in argv order).
       const openaiCompatArgs: readonly string[] = openaiCompat
-        ? ['--append-system-prompt', buildOpenAICompatSystemPrompt(openaiCompat)]
+        ? [
+            '--append-system-prompt',
+            buildOpenAICompatNativeSystemPrompt(openaiCompat),
+          ]
         : [];
       // Disable claude's built-in tools (Read / Glob / Bash / Edit / Write /
       // ...) when the caller has supplied its own tool definitions via the
@@ -1063,6 +1327,22 @@ export function createClaudeBackend(
       const disableBuiltinToolArgs: readonly string[] = callerToolDispatchActive(openaiCompat)
         ? ['--tools', '']
         : [];
+      // Cap claude to a single model turn when caller-tools are dispatched
+      // natively (#213). Without this, the model would treat our MCP
+      // sentinel ack (`isError:true` "captured by bridge…") as a tool
+      // failure and CHAIN further tool calls within the same A2A turn —
+      // each chain step is a full Anthropic API round-trip paying the
+      // system-prompt + tools-definition cost, AND every chained call is
+      // decided on stale / wrong feedback (the model never sees the
+      // caller's real tool result until the next OpenAI request comes in).
+      // Capping the turn forces a clean unwind after one tool call,
+      // mirroring codex's `turn/interrupt` behaviour under PR #212. The
+      // single text artifact path (no tool invoked) is unaffected because
+      // it still fits in one model turn. Off when nativeReady is false so
+      // the envelope path's existing semantics are preserved.
+      const nativeTurnCapArgs: readonly string[] = nativeReady
+        ? ['--max-turns', '1']
+        : [];
 
       const args: string[] = [
         '-p',
@@ -1074,19 +1354,33 @@ export function createClaudeBackend(
         // prints a banner and exits instead of streaming.
         '--verbose',
         ...(isResume ? ['--resume', sessionId] : ['--session-id', sessionId]),
-        ...(mcpServerForTask
-          ? [
-              '--mcp-config',
-              JSON.stringify({
-                mcpServers: {
-                  'vicoop-bridge': { type: 'http', url: mcpServerForTask.url },
-                },
-              }),
-            ]
-          : []),
+        // Both MCP servers ride on a single `--mcp-config` argv with one
+        // JSON blob. Keys are the MCP server names claude exposes the
+        // tools under (`mcp__<name>__<tool>` is the resulting tool-id
+        // pattern in the model's view). Either or both can be absent
+        // depending on opts; an entirely empty `mcpServers` map is
+        // skipped entirely so we don't pass an unused argv to claude.
+        ...((): readonly string[] => {
+          const mcpServers: Record<string, unknown> = {};
+          if (mcpServerForTask) {
+            mcpServers['vicoop-bridge'] = {
+              type: 'http',
+              url: mcpServerForTask.url,
+            };
+          }
+          if (callerToolsMcp) {
+            mcpServers['caller-tools'] = {
+              type: 'http',
+              url: callerToolsMcp.url,
+            };
+          }
+          if (Object.keys(mcpServers).length === 0) return [];
+          return ['--mcp-config', JSON.stringify({ mcpServers })];
+        })(),
         ...identityArgs,
         ...openaiCompatArgs,
         ...disableBuiltinToolArgs,
+        ...nativeTurnCapArgs,
         ...settingsArgs,
         ...extraArgs,
       ];
@@ -1097,30 +1391,13 @@ export function createClaudeBackend(
         status: { state: 'working', timestamp: new Date().toISOString() },
       });
 
-      // Drop the freshly-minted (contextId → sessionId) binding when the
-      // run never reached a successful state, so the next task on this
-      // contextId mints a brand-new id instead of `--resume`-ing a session
-      // claude never persisted on disk. No-op if this run was already
-      // resuming an existing session, or if session reuse is disabled.
-      //
-      // Concurrency: only delete when the entry is still the one THIS task
-      // wrote. A second concurrent task on the same contextId would have
-      // bumped `writeId` when refreshing the binding; if we see a different
-      // writeId, that other task now "owns" the entry and should keep it.
-      const rollbackFreshSession = (): void => {
-        if (isResume || sessionTtlMs <= 0) return;
-        const cur = sessions.get(task.contextId);
-        if (cur?.sessionId === sessionId && cur.writeId === writeId) {
-          sessions.delete(task.contextId);
-        }
-      };
-
       let child: ClaudeChildHandle;
       try {
         child = spawnFn(command, args, { cwd });
         recorder.mark('spawn');
       } catch (err) {
         rollbackFreshSession();
+        await closeCallerToolsMcp();
         emit({
           type: 'task.fail',
           taskId: task.taskId,
@@ -1145,6 +1422,7 @@ export function createClaudeBackend(
         // The freshly-minted sessionId never reached claude, so a follow-up
         // task on the same contextId must mint a new id rather than --resume.
         rollbackFreshSession();
+        await closeCallerToolsMcp();
         emit({
           type: 'task.fail',
           taskId: task.taskId,
@@ -1213,32 +1491,11 @@ export function createClaudeBackend(
 
       const emitAssistantArtifact = (text: string): void => {
         if (!text) return;
-        // When the openai-compat extension is active for this task, the
-        // model was instructed to emit `{"tool_calls":[...]}` JSON for tool
-        // turns. Detect that shape and surface it as an A2A `data` part so
-        // the upstream gateway can forward it as `tool_calls` on the
-        // OpenAI response without re-parsing model prose. Non-envelope text
-        // (natural-language answers, or any turn from a task that didn't
-        // request the extension) falls through to the text artifact path
-        // unchanged.
-        if (openaiCompat) {
-          const envelope = tryParseToolCallsEnvelope(text);
-          if (envelope) {
-            emit({
-              type: 'task.artifact',
-              taskId: task.taskId,
-              artifact: {
-                artifactId: randomUUID(),
-                name: 'claude-message',
-                parts: [{ kind: 'data', data: envelope }],
-                extensions: [OPENAI_COMPAT_EXTENSION_URI],
-              },
-              lastChunk: true,
-            });
-            emittedAnyArtifact = true;
-            return;
-          }
-        }
+        // openai-compat caller tools land as a `tool_calls` data artifact
+        // through the caller-tools MCP onInvoke handler above, NOT via
+        // any text-shape parsing. Assistant-text turns (natural-language
+        // answers, or any turn from a task that didn't request the
+        // extension) are emitted unchanged as a `text` part artifact.
         emit({
           type: 'task.artifact',
           taskId: task.taskId,
@@ -1461,6 +1718,14 @@ export function createClaudeBackend(
       signal.removeEventListener('abort', onAbort);
       settled = true;
       sendFileRelease?.();
+      // Caller-tools MCP is per-task; release it as soon as claude has
+      // exited so a misbehaving model that keeps the MCP request open
+      // can't pin the listener after the run is conceptually done.
+      // Awaited so a slow close (the SDK's transport teardown is async)
+      // can't race a follow-up task starting a new server on the same
+      // port. Safe to await even on the success path because by here
+      // we're guaranteed claude has already disconnected.
+      await closeCallerToolsMcp();
       if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
 
       // Flush any trailing line without a newline. claude normally terminates
@@ -1485,6 +1750,7 @@ export function createClaudeBackend(
 
       if (exit.error) {
         rollbackFreshSession();
+        await closeCallerToolsMcp();
         emit({
           type: 'task.fail',
           taskId: task.taskId,
@@ -1496,7 +1762,21 @@ export function createClaudeBackend(
         return;
       }
 
-      if (exit.code !== 0) {
+      // Native dispatch (#213): under `--max-turns 1`, claude code exits
+      // with code 1 immediately after the model emits its tool_use(s) —
+      // it interprets the cap as "exceeded" the moment a follow-up turn
+      // would be needed to feed the tool_result back. The `tool_calls`
+      // data artifact(s) are already on the wire by this point, so the
+      // task IS effectively complete from the caller's perspective; the
+      // nonzero exit is bookkeeping noise, not a real failure. Same
+      // invariant codex backend enforces on its native path (PR #212
+      // maps `turn/interrupt` → `completed` when capturedToolCall is true).
+      // Caller-initiated abort still wins — surfacing a captured tool call
+      // when the caller explicitly canceled would override their request.
+      const treatExitAsSuccess =
+        capturedToolCall && exit.code !== 0 && !aborted;
+
+      if (exit.code !== 0 && !treatExitAsSuccess) {
         rollbackFreshSession();
         const detail = stderrTail.trim();
         const sigPart = exit.signal ? ` (signal ${exit.signal})` : '';
@@ -1533,17 +1813,15 @@ export function createClaudeBackend(
       }
 
       const completeText = finalText ?? '';
-      // If the finalText is the openai-compat `{"tool_calls":[…]}`
-      // envelope, it was already routed to a `data` artifact via
-      // emitAssistantArtifact. Re-stamping the raw JSON onto
-      // status.message.parts violates A2A's "Messages SHOULD NOT be used
-      // to deliver task outputs" and causes downstream gateways
-      // (oai2a2a) to re-extract and re-emit the same tool_calls,
-      // corrupting OpenAI streaming clients that concatenate arguments
-      // by index. See issue #200.
-      const envelopeAlreadyRouted =
-        openaiCompat !== null && tryParseToolCallsEnvelope(completeText) !== null;
-      const parts: Part[] = !envelopeAlreadyRouted && completeText
+      // Native MCP dispatch (#213): when the model invoked a caller tool,
+      // the `tool_calls` data artifact (emitted via the MCP onInvoke
+      // handler above) is the complete task output. Any wrap-up text the
+      // model produced before exiting the turn (the system-prompt
+      // directive tells it to stop, but models occasionally emit a brief
+      // acknowledgement anyway) is reasoning preamble and must NOT be
+      // re-stamped on `status.message.parts` — same invariant codex
+      // backend enforces under PR #212, same root-cause concern as #200.
+      const parts: Part[] = !capturedToolCall && completeText
         ? [{ kind: 'text', text: completeText }]
         : [];
 

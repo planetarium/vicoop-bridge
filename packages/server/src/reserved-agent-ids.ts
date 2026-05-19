@@ -1,6 +1,6 @@
-// Agent ids the bridge reserves for itself. A client cannot register one,
-// list one in `clients.allowed_agent_ids`, nor send a hello frame with one
-// — all three intake points enforce this set.
+// Agent ids the bridge reserves for itself. A registration cannot claim one,
+// and a daemon cannot send a hello frame with one — both intake points enforce
+// this set.
 //
 // `admin` is reserved because the bridge surfaces its built-in admin agent
 // at `@admin@<host>` via Mentionable WebFinger; letting a client register

@@ -351,8 +351,9 @@ export function mountDeviceFlow(app: Hono, opts: DeviceFlowOptions): void {
           if (!r) throw new Error('register_client returned no row');
 
           // Stamp owner_email so admin tooling can render a human-readable
-          // identity for Google-onboarded clients (sub is opaque).
+          // identity for Google-onboarded agents/clients (sub is opaque).
           if (email) {
+            await tx`UPDATE agents SET owner_email = ${email}, updated_at = now() WHERE client_id = ${r.id}`;
             await tx`UPDATE clients SET owner_email = ${email} WHERE id = ${r.id}`;
           }
 
