@@ -79,6 +79,28 @@ export interface ThreadConfigOverride {
   [key: string]: unknown;
 }
 
+// Subset of codex's `DynamicToolSpec` we send on `thread/start.dynamicTools`
+// to expose caller-side openai-compat tools as first-class function tools in
+// the model's tool registry. When the model invokes one, codex sends the
+// client an `item/tool/call` server request (see `DynamicToolCallParams`).
+// Gated behind the `experimentalApi` capability — which we already opt into
+// for `thread/start.environments` (#183). `deferLoading` mirrors codex's
+// legacy `exposeToContext = !defer_loading`: false (default) makes the tool
+// visible in the model's prompt; true hides it but keeps it callable via
+// `tool_search`. We always want visibility for the openai-compat path, so
+// callers leave `deferLoading` unset.
+export interface DynamicToolSpec {
+  namespace?: string;
+  name: string;
+  description: string;
+  // OpenAI parameters schema — codex calls this `inputSchema`. Modeled as
+  // `unknown` because the structure is a JSON Schema object whose shape is
+  // already enforced upstream (gateway side) and which codex itself only
+  // forwards opaquely to the model provider.
+  inputSchema: unknown;
+  deferLoading?: boolean;
+}
+
 export interface ThreadStartParams {
   cwd?: string | null;
   sandbox?: SandboxMode | null;
@@ -90,6 +112,11 @@ export interface ThreadStartParams {
   // handlers from the tool registry for this thread (sticky across resumes).
   // We model as opaque `unknown[]` because the only value we ever send is `[]`.
   environments?: unknown[] | null;
+  // Caller-provided function tools exposed natively to the model. Sticky on
+  // `thread/start` — codex persists them with `SessionMeta` and re-hydrates
+  // them on `thread/resume`, so `ThreadResumeParams` does not accept the
+  // field.
+  dynamicTools?: DynamicToolSpec[] | null;
 }
 
 export interface ThreadResumeParams {
@@ -154,6 +181,33 @@ export interface ThreadInjectItemsParams {
 
 export interface ApprovalResponse {
   decision: 'accept' | 'acceptForSession' | 'decline';
+}
+
+// Server-initiated method name for the model invoking a `DynamicToolSpec`.
+// codex sends a JSON-RPC request with this method and `DynamicToolCallParams`;
+// the client must respond with `DynamicToolCallResponse` or codex will block
+// the turn waiting for an answer.
+export const DYNAMIC_TOOL_CALL_METHOD = 'item/tool/call';
+
+export interface DynamicToolCallParams {
+  threadId: string;
+  turnId: string;
+  callId: string;
+  namespace: string | null;
+  tool: string;
+  // Model-produced arguments. codex parses the model's JSON output before
+  // forwarding, so this is a parsed JSON value (object, in practice, but
+  // typed `unknown` to reflect what's on the wire).
+  arguments: unknown;
+}
+
+export type DynamicToolCallOutputContentItem =
+  | { type: 'inputText'; text: string }
+  | { type: 'inputImage'; imageUrl: string };
+
+export interface DynamicToolCallResponse {
+  contentItems: DynamicToolCallOutputContentItem[];
+  success: boolean;
 }
 
 // Subset of `ThreadItem` we observe — others fall through to `{ type: string }`.
