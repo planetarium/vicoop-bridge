@@ -372,13 +372,31 @@ export function composeNativeDevInstructions(meta: OpenAICompatMetadata): string
 // a matching `function_call_output`. Order is preserved so call_id pairing
 // stays consistent with the originating conversation.
 //
+// When `userPrompt` is non-empty, a `message` item with `role: "user"` is
+// prepended to the result. Without this anchor the model sees the
+// function_call / function_call_output pairs as orphan tool dispatch with
+// no preceding user turn, and then takes the fresh `turn/start.input` text
+// as a new imperative — re-emitting the same tool call instead of
+// finalising on the existing results (#233). Putting the user message at
+// the head reconstructs OpenAI Chat Completions ordering
+// (`[user, assistant tool_call, tool result]`) so the model treats the
+// tool results as satisfying the request.
+//
 // Malformed entries (missing id / function name) are skipped silently —
 // the gateway already validated the OpenAI request shape, so this is a
 // defensive last filter rather than an error surface.
 export function historyToInjectItems(
   history: OpenAICompatHistoryEntry[],
+  userPrompt: string = '',
 ): ResponsesApiItem[] {
   const out: ResponsesApiItem[] = [];
+  if (userPrompt) {
+    out.push({
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: userPrompt }],
+    });
+  }
   for (const entry of history) {
     if (entry.role === 'assistant') {
       for (const tc of entry.tool_calls) {
@@ -707,9 +725,6 @@ export function createCodexBackend(
         const systemPrompt = openaiCompat
           ? composeNativeDevInstructions(openaiCompat)
           : '';
-        const historyInjectItems = openaiCompat?.tool_call_history
-          ? historyToInjectItems(openaiCompat.tool_call_history)
-          : null;
 
         const mapped = await mapPartsToCodexInput(task.message.parts, {
           mkdtemp,
@@ -726,8 +741,45 @@ export function createCodexBackend(
           return;
         }
 
+        // When `tool_call_history` is present, the user prompt is prepended
+        // to the injected history as a `message`-type item with
+        // `role: "user"` so the model sees a coherent
+        // `[user → assistant tool_call → tool result]` conversation. Without
+        // this anchor the function_call / function_call_output pairs read
+        // as orphan tool dispatch and the model takes the next user prompt
+        // as a fresh imperative — the re-call loop #233 captured.
+        //
+        // `turn/start.input` then carries a single empty-string text item
+        // instead of the user prompt:
+        //   - The user prompt is already in the injected history at the
+        //     head, so re-sending it at the tail would trigger
+        //     fresh-imperative interpretation and re-trigger #233.
+        //   - A truly empty input array (`[]`) goes silent on codex's
+        //     app-server — the model is called against pure history but
+        //     never emits a final assistant message. A present-but-empty
+        //     text item is enough to wake it up while leaving no visible
+        //     placeholder content in the conversation.
+        //   - Images still ride on `turn/start.input` via the existing
+        //     `localImage` path; codex's `ContentItem::InputImage` wants a
+        //     URL, not a local path, so they can't be inlined into the
+        //     injected user-message anchor.
+        // Combined with `config.include_environment_context: false` at
+        // thread/start (which suppresses codex's auto-injected
+        // `<environment_context>` user turn), the model receives an OpenAI
+        // Chat Completions-shaped conversation that ends in the tool
+        // result, and finalises off it.
+        const historyInjectItems = openaiCompat?.tool_call_history
+          ? historyToInjectItems(openaiCompat.tool_call_history, mapped.prompt)
+          : null;
+        const userPromptInjected = historyInjectItems !== null && mapped.prompt !== '';
+
         try {
-          const userInput = buildUserInput(mapped.prompt, mapped.imageFiles);
+          const userInput = userPromptInjected
+            ? [
+                { type: 'text' as const, text: '', text_elements: [] as never[] },
+                ...buildUserInput('', mapped.imageFiles),
+              ]
+            : buildUserInput(mapped.prompt, mapped.imageFiles);
 
           let client: AppServerRpcClient;
           try {
@@ -748,11 +800,24 @@ export function createCodexBackend(
           // Session-reuse map: same writeId-protected pattern as codex.ts
           // so a concurrent task on the same contextId doesn't get its
           // session entry rolled back from under it.
+          //
+          // openai-compat tasks opt OUT of session reuse for the same reason
+          // claude.ts does (see claude.ts session-reuse guard): the OpenAI
+          // Chat Completions request is stateless and replays the full
+          // history every turn, so resuming a prior codex thread would
+          // double-feed the model — once from the persisted thread items,
+          // once from the gateway-replayed `tool_call_history` we inject.
+          // The duplicate user prompts / function_call pairs that
+          // accumulate cause the model to drift (e.g. parroting an earlier
+          // tool result instead of answering a fresh question). Force a
+          // clean `thread/start` every openai-compat task; the injected
+          // history + turn/start.input is the unambiguous source of truth.
+          const sessionReuseEligible = openaiCompat === null && sessionTtlMs > 0;
           const tNow = now();
-          if (sessionTtlMs > 0) evictExpired(tNow - sessionTtlMs);
-          const existing = sessionTtlMs > 0 ? sessions.get(task.contextId) : undefined;
+          if (sessionReuseEligible) evictExpired(tNow - sessionTtlMs);
+          const existing = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
           let writeId = 0;
-          if (sessionTtlMs > 0) {
+          if (sessionReuseEligible) {
             writeId = ++writeCounter;
             if (existing) {
               sessions.set(task.contextId, {
@@ -766,7 +831,7 @@ export function createCodexBackend(
           let observedThreadId: string | null = null;
 
           const rollbackResumeRefresh = (): void => {
-            if (!isResume || sessionTtlMs <= 0) return;
+            if (!isResume || !sessionReuseEligible) return;
             const cur = sessions.get(task.contextId);
             if (cur?.threadId === existing.threadId && cur.writeId === writeId) {
               sessions.set(task.contextId, {
@@ -777,7 +842,7 @@ export function createCodexBackend(
             }
           };
           const rollbackFreshThread = (): void => {
-            if (isResume || sessionTtlMs <= 0 || !observedThreadId) return;
+            if (isResume || !sessionReuseEligible || !observedThreadId) return;
             const cur = sessions.get(task.contextId);
             if (cur?.threadId === observedThreadId && cur.writeId === writeId) {
               sessions.delete(task.contextId);
@@ -864,6 +929,24 @@ export function createCodexBackend(
                 },
               }
             : null;
+          // Suppress codex's auto-injected `<environment_context>` user
+          // message under openai-compat. Codex records one at thread/start
+          // and a fresh one at the head of every `turn/start`; the second
+          // one lands AT THE CONVERSATION TAIL when we drive a continuation
+          // turn with `turn/start.input: []`, which re-introduces a
+          // synthetic user turn after the injected tool history and lets
+          // the model interpret the prompt as a fresh imperative (#233).
+          // Suppressing it leaves a clean
+          // `[user → assistant tool_call → tool result]` tail so the model
+          // finalises naturally off the injected history. The cost is
+          // minor: the model loses date/timezone/cwd context, which
+          // openai-compat callers don't rely on.
+          const envContextOverride =
+            openaiCompat !== null ? { include_environment_context: false } : null;
+          const threadConfig =
+            featuresOverride || envContextOverride
+              ? { ...(featuresOverride ?? {}), ...(envContextOverride ?? {}) }
+              : null;
           // `environments: []` is sticky on `thread/start` and unsupported on
           // `thread/resume`, so we only send it on start. Gated by the same
           // condition as the feature override so non-openai-compat callers
@@ -879,7 +962,7 @@ export function createCodexBackend(
                   threadId: existing.threadId,
                   cwd,
                   sandbox: sandboxMode,
-                  ...(featuresOverride ? { config: featuresOverride } : {}),
+                  ...(threadConfig ? { config: threadConfig } : {}),
                 },
               );
               threadId = resumeResult.thread.id;
@@ -890,7 +973,7 @@ export function createCodexBackend(
                   cwd,
                   sandbox: sandboxMode,
                   ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),
-                  ...(featuresOverride ? { config: featuresOverride } : {}),
+                  ...(threadConfig ? { config: threadConfig } : {}),
                   ...(sendEmptyEnvironments ? { environments: [] } : {}),
                   // Native function-call surface for caller-side tools (#209).
                   // codex persists `dynamicTools` with `SessionMeta` and
@@ -901,7 +984,7 @@ export function createCodexBackend(
               );
               threadId = startResult.thread.id;
               observedThreadId = threadId;
-              if (sessionTtlMs > 0) {
+              if (sessionReuseEligible) {
                 sessions.set(task.contextId, {
                   threadId,
                   lastUsedAt: now(),
@@ -1279,7 +1362,7 @@ export function createCodexBackend(
           }
 
           // Refresh the resumed binding on success so TTL extends.
-          if (isResume && sessionTtlMs > 0) {
+          if (isResume && sessionReuseEligible) {
             const cur = sessions.get(task.contextId);
             if (cur?.threadId === existing.threadId && cur.writeId === writeId) {
               sessions.set(task.contextId, {
