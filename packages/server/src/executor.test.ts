@@ -158,6 +158,10 @@ test('executor records principalId in binding and strips _principalId from outgo
       '_principalId must be stripped before the WS frame leaves the bridge',
     );
     assert.equal((md as Record<string, unknown>).userField, 'keep');
+    // PR #241 prerequisite: the verified principal is forwarded to the
+    // client as a sibling field on the frame (NOT inside message.metadata,
+    // where it could leak to downstream handlers that forward metadata).
+    assert.equal(frame.callerPrincipal, 'eth:0xabc');
   }
 
   // Push a terminal status so the generator returns without hanging.
@@ -208,6 +212,7 @@ test('executor omits message.metadata entirely when the only entry was _principa
   assert.equal(frame.type, 'task.assign');
   if (frame.type === 'task.assign') {
     assert.equal(frame.message.metadata, undefined);
+    assert.equal(frame.callerPrincipal, 'eth:0xabc');
   }
 
   const binding = registry.getBinding('t-2')!;
@@ -262,6 +267,14 @@ test('executor binding has no principalId when message metadata is absent', asyn
   assert.equal(frame.type, 'task.assign');
   if (frame.type === 'task.assign') {
     assert.equal(frame.message.metadata, undefined);
+    // Public-agent path: no principal recorded, frame omits the field
+    // entirely (rather than emitting `callerPrincipal: undefined`).
+    assert.equal(frame.callerPrincipal, undefined);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(frame, 'callerPrincipal'),
+      false,
+      'callerPrincipal must be absent on the wire, not present-but-undefined',
+    );
   }
 
   binding.sink.pushStatus({

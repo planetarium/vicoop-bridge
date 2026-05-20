@@ -175,6 +175,14 @@ export const TaskAssignFrame = z.object({
   contextId: z.string(),
   message: Message,
   requestedExtensions: z.array(z.string()).optional(),
+  // The server-verified caller identity, forwarded to the client backend so
+  // it can key per-conversation state (e.g. the openai-compat session cache
+  // in #241) on the (callerPrincipal, contextId) pair rather than on the
+  // caller-supplied contextId alone. Absent on the public-agent path where
+  // no auth middleware ran. Optional + zod's default unknown-key strip on
+  // `z.object` keeps older clients forward-compatible with newer servers;
+  // PROTOCOL_VERSION is intentionally unchanged.
+  callerPrincipal: z.string().optional(),
 });
 
 export const TaskCancelFrame = z.object({

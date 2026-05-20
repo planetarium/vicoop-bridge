@@ -152,6 +152,7 @@ export class WSForwardingExecutor extends AgentExecutor {
         ...(message.extensions !== undefined ? { extensions: message.extensions } : {}),
       },
       ...(message.extensions !== undefined ? { requestedExtensions: message.extensions } : {}),
+      ...(principalId !== undefined ? { callerPrincipal: principalId } : {}),
     });
 
     if (!sent) {
