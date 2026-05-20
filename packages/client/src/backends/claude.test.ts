@@ -1024,11 +1024,12 @@ test('debug log records claude spawn shape and spawn errors', async () => {
       /claude\.spawn\.start/.test(line) &&
       /command=claude/.test(line) &&
       /argv=.*--settings/.test(line) &&
-      /<settings chars=/.test(line) &&
-      /<system-prompt chars=/.test(line) &&
-      !line.includes('operator secret-ish prompt')
+      line.includes('sandbox') &&
+      line.includes('enabled') &&
+      line.includes('true') &&
+      line.includes('operator secret-ish prompt')
     ),
-    `expected redacted spawn start debug log, got:\n${logs.join('\n')}`,
+    `expected raw spawn start debug log, got:\n${logs.join('\n')}`,
   );
   assert.ok(
     logs.some((line) =>

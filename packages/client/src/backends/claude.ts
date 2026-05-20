@@ -279,46 +279,6 @@ function errorMessage(e: unknown): string {
   }
 }
 
-const SPAWN_ARG_VALUE_FLAGS = new Set([
-  '--append-system-prompt',
-  '--mcp-config',
-  '--settings',
-]);
-
-function summarizeSpawnArgValue(flag: string, value: string): string {
-  if (flag === '--mcp-config') {
-    try {
-      const parsed = JSON.parse(value) as { mcpServers?: unknown };
-      const servers = parsed.mcpServers && typeof parsed.mcpServers === 'object'
-        ? Object.keys(parsed.mcpServers as Record<string, unknown>).join(',')
-        : 'unknown';
-      return `<mcp-config servers=${servers || 'none'} chars=${value.length}>`;
-    } catch {
-      return `<mcp-config chars=${value.length}>`;
-    }
-  }
-  if (flag === '--append-system-prompt') {
-    return `<system-prompt chars=${value.length}>`;
-  }
-  if (flag === '--settings') {
-    return `<settings chars=${value.length}>`;
-  }
-  return value;
-}
-
-function summarizeSpawnArgs(args: readonly string[]): string[] {
-  const out: string[] = [];
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i] ?? '';
-    out.push(arg);
-    if (SPAWN_ARG_VALUE_FLAGS.has(arg) && i + 1 < args.length) {
-      out.push(summarizeSpawnArgValue(arg, args[i + 1] ?? ''));
-      i += 1;
-    }
-  }
-  return out;
-}
-
 function decodedBase64Size(b64: string): number {
   if (b64.length === 0) return 0;
   let pad = 0;
@@ -1434,7 +1394,7 @@ export function createClaudeBackend(
       let child: ClaudeChildHandle;
       try {
         timingLogger.debug(
-          `claude.spawn.start taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${cwd ? safeToken(cwd) : '<default>'} argv=${safeToken(JSON.stringify(summarizeSpawnArgs(args)), 4000)}`,
+          `claude.spawn.start taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${cwd ? safeToken(cwd) : '<default>'} argv=${safeToken(JSON.stringify(args), 8000)}`,
         );
         child = spawnFn(command, args, { cwd });
         recorder.mark('spawn');
@@ -1442,7 +1402,7 @@ export function createClaudeBackend(
         rollbackFreshSession();
         await closeCallerToolsMcp();
         timingLogger.debug(
-          `claude.spawn.error taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${cwd ? safeToken(cwd) : '<default>'} argv=${safeToken(JSON.stringify(summarizeSpawnArgs(args)), 4000)} error=${safeToken(errorMessage(err), 1000)}`,
+          `claude.spawn.error taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${cwd ? safeToken(cwd) : '<default>'} argv=${safeToken(JSON.stringify(args), 8000)} error=${safeToken(errorMessage(err), 1000)}`,
         );
         emit({
           type: 'task.fail',
