@@ -1728,8 +1728,16 @@ test('send_file MCP: server is registered on first task and a registered handle 
   const cfg = JSON.parse(String(child.args[cfgIdx + 1])) as {
     mcpServers: Record<string, { type: string; url: string }>;
   };
-  assert.equal(cfg.mcpServers['vicoop-bridge'].type, 'http');
-  assert.equal(cfg.mcpServers['vicoop-bridge'].url, server.url);
+  assert.equal(cfg.mcpServers['_vb-send-file'].type, 'http');
+  assert.equal(cfg.mcpServers['_vb-send-file'].url, server.url);
+
+  // argv must also pre-approve the send_file MCP server's tools so the
+  // model's `send_file` invocation survives a default permission policy
+  // (#235). Without --allowedTools, claude's `defaultMode: "default"`
+  // would auto-deny in -p mode since there's no TTY to answer the prompt.
+  const allowedIdx = child.args.indexOf('--allowedTools');
+  assert.notEqual(allowedIdx, -1, '--allowedTools required when an MCP server is registered (#235)');
+  assert.equal(child.args[allowedIdx + 1], 'mcp___vb-send-file');
 
   // Re-register a synthetic handle to check the routing reaches the handle's
   // emit (the lifecycle inside handle() already ran and released).
@@ -2812,14 +2820,14 @@ test('argv: openai-compat caller tools wire caller-tools MCP + native prompt + -
   assert.ok(child);
   const args = child!.args;
 
-  // (a) --mcp-config carries a `caller-tools` server entry.
+  // (a) --mcp-config carries a `_vb-caller-tools` server entry.
   const cfgIdx = args.indexOf('--mcp-config');
   assert.notEqual(cfgIdx, -1, 'expected --mcp-config in argv');
   const cfg = JSON.parse(args[cfgIdx + 1] as string) as {
     mcpServers?: Record<string, { type?: string; url?: string }>;
   };
-  assert.ok(cfg.mcpServers?.['caller-tools'], 'caller-tools MCP server registered');
-  assert.equal(cfg.mcpServers?.['caller-tools']?.type, 'http');
+  assert.ok(cfg.mcpServers?.['_vb-caller-tools'], '_vb-caller-tools MCP server registered');
+  assert.equal(cfg.mcpServers?.['_vb-caller-tools']?.type, 'http');
 
   // (b) --append-system-prompt carries the native variant — the envelope
   // contract block (the literal `{"tool_calls"` substring the legacy
@@ -2836,6 +2844,81 @@ test('argv: openai-compat caller tools wire caller-tools MCP + native prompt + -
   const toolsIdx = args.indexOf('--tools');
   assert.notEqual(toolsIdx, -1);
   assert.equal(args[toolsIdx + 1], '');
+
+  // (d) --allowedTools pre-approves the caller-tools MCP server so the
+  // model's tool_use survives operator environments that leave claude's
+  // permission system in `defaultMode: "default"`. In `-p` mode there's
+  // no TTY to answer a permission prompt, so an un-allowlisted MCP
+  // tool auto-denies and the run dies at --max-turns 1 with
+  // `permission_denials` in the result event (issue #235).
+  const allowedIdx = args.indexOf('--allowedTools');
+  assert.notEqual(allowedIdx, -1, '--allowedTools required for caller-tools MCP (#235)');
+  assert.equal(args[allowedIdx + 1], 'mcp___vb-caller-tools');
+});
+
+// Regression for #235: --allowedTools must cover every MCP server the
+// bridge registers, not just caller-tools. When both `send_file`
+// (_vb-send-file) and caller-tools (_vb-caller-tools) are active, both
+// server-level rules must appear in a single space-separated
+// `--allowedTools` value.
+test('argv: --allowedTools covers all registered MCP servers (#235)', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-235-allowed-'));
+  const realRoot = await fs.realpath(root);
+  try {
+    const fake = scriptedSpawn({
+      lines: [
+        JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' }),
+        JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+      ],
+      exitCode: 0,
+    });
+    const backend = createClaudeBackend({
+      spawn: fake.spawn,
+      sendFileMcp: { allowedRoots: [realRoot], skipHttp: true },
+    });
+    await backend.handle(
+      {
+        ...assign('do a fetch'),
+        message: {
+          role: 'user',
+          messageId: 'm',
+          parts: [{ kind: 'text', text: 'do a fetch' }],
+          metadata: {
+            [OPENAI_COMPAT_EXTENSION_URI]: {
+              system: 'be terse',
+              tools: [
+                {
+                  type: 'function',
+                  function: {
+                    name: 'fetch',
+                    description: 'Fetch a URL',
+                    parameters: { type: 'object', properties: {} },
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+      collect().emit,
+      NEVER,
+    );
+    const child = fake.lastChild();
+    assert.ok(child);
+    const args = child!.args;
+    const allowedIdx = args.indexOf('--allowedTools');
+    assert.notEqual(allowedIdx, -1);
+    const tokens = String(args[allowedIdx + 1]).split(/\s+/).filter(Boolean);
+    // Order is insertion-order of `Object.keys(mcpServers)`:
+    // _vb-send-file first (added when sendFileMcp is enabled), then
+    // _vb-caller-tools (added when openai-compat tools are present).
+    assert.deepEqual(tokens.sort(), ['mcp___vb-caller-tools', 'mcp___vb-send-file']);
+
+    const closer = backend.getSendFileMcpServer();
+    if (closer) await closer.close();
+  } finally {
+    await fs.rm(realRoot, { recursive: true, force: true });
+  }
 });
 
 // End-to-end (with test seam): the model "invokes" the caller tool via
@@ -3128,7 +3211,7 @@ test('no openai-compat tools → no native dispatch argv (#213)', async () => {
     const cfg = JSON.parse(child.args[cfgIdx + 1] as string) as {
       mcpServers?: Record<string, unknown>;
     };
-    assert.equal(cfg.mcpServers?.['caller-tools'], undefined);
+    assert.equal(cfg.mcpServers?.['_vb-caller-tools'], undefined);
   }
   assert.equal(child.args.indexOf('--max-turns'), -1);
   // Built-in tools stay enabled (no `--tools ""`) so claude can operate
