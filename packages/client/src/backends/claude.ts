@@ -30,7 +30,7 @@ import {
   INPUT_IMAGE_MIME,
   type FetchUriPolicy,
 } from './fetch-uri-file.js';
-import { createLogger } from '../logger.js';
+import { createLogger, safeToken } from '../logger.js';
 import { createTimingRecorder } from './timing.js';
 
 // Slim subset of ChildProcess that the backend actually uses. Tests inject a
@@ -277,6 +277,46 @@ function errorMessage(e: unknown): string {
   } catch {
     return '<unrepresentable>';
   }
+}
+
+const SPAWN_ARG_VALUE_FLAGS = new Set([
+  '--append-system-prompt',
+  '--mcp-config',
+  '--settings',
+]);
+
+function summarizeSpawnArgValue(flag: string, value: string): string {
+  if (flag === '--mcp-config') {
+    try {
+      const parsed = JSON.parse(value) as { mcpServers?: unknown };
+      const servers = parsed.mcpServers && typeof parsed.mcpServers === 'object'
+        ? Object.keys(parsed.mcpServers as Record<string, unknown>).join(',')
+        : 'unknown';
+      return `<mcp-config servers=${servers || 'none'} chars=${value.length}>`;
+    } catch {
+      return `<mcp-config chars=${value.length}>`;
+    }
+  }
+  if (flag === '--append-system-prompt') {
+    return `<system-prompt chars=${value.length}>`;
+  }
+  if (flag === '--settings') {
+    return `<settings chars=${value.length}>`;
+  }
+  return value;
+}
+
+function summarizeSpawnArgs(args: readonly string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] ?? '';
+    out.push(arg);
+    if (SPAWN_ARG_VALUE_FLAGS.has(arg) && i + 1 < args.length) {
+      out.push(summarizeSpawnArgValue(arg, args[i + 1] ?? ''));
+      i += 1;
+    }
+  }
+  return out;
 }
 
 function decodedBase64Size(b64: string): number {
@@ -1393,11 +1433,17 @@ export function createClaudeBackend(
 
       let child: ClaudeChildHandle;
       try {
+        timingLogger.debug(
+          `claude.spawn.start taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${cwd ? safeToken(cwd) : '<default>'} argv=${safeToken(JSON.stringify(summarizeSpawnArgs(args)), 4000)}`,
+        );
         child = spawnFn(command, args, { cwd });
         recorder.mark('spawn');
       } catch (err) {
         rollbackFreshSession();
         await closeCallerToolsMcp();
+        timingLogger.debug(
+          `claude.spawn.error taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${cwd ? safeToken(cwd) : '<default>'} argv=${safeToken(JSON.stringify(summarizeSpawnArgs(args)), 4000)} error=${safeToken(errorMessage(err), 1000)}`,
+        );
         emit({
           type: 'task.fail',
           taskId: task.taskId,
@@ -1462,6 +1508,7 @@ export function createClaudeBackend(
       } | null = null;
       let finalText: string | null = null;
       let finalUsage: OpenAICompatUsage | null = null;
+      let stdoutTail = '';
       let stderrTail = '';
       let aborted = false;
       let settled = false;
@@ -1657,7 +1704,10 @@ export function createClaudeBackend(
       let stdoutBuf = '';
       child.stdout?.on('data', (chunk: Buffer | string) => {
         recorder.mark('firstOut');
-        stdoutBuf += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+        const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+        stdoutTail += text;
+        if (stdoutTail.length > stderrCap) stdoutTail = stdoutTail.slice(-stderrCap);
+        stdoutBuf += text;
         let nl: number;
         while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
           const line = stdoutBuf.slice(0, nl).trim();
@@ -1714,6 +1764,9 @@ export function createClaudeBackend(
         child.on('close', (code, sig) => resolve({ code, signal: sig }));
       });
       recorder.mark('closed');
+      timingLogger.debug(
+        `claude.spawn.close taskId=${safeToken(task.taskId)} command=${safeToken(command)} code=${exit.code === null ? 'null' : String(exit.code)} signal=${exit.signal ? safeToken(exit.signal) : 'null'} stdoutTailChars=${stdoutTail.length} stderrTailChars=${stderrTail.length}${exit.error ? ` error=${safeToken(errorMessage(exit.error), 1000)}` : ''}`,
+      );
 
       signal.removeEventListener('abort', onAbort);
       settled = true;
@@ -1779,8 +1832,10 @@ export function createClaudeBackend(
       if (exit.code !== 0 && !treatExitAsSuccess) {
         rollbackFreshSession();
         const detail = stderrTail.trim();
+        const stdoutDetail = stdoutTail.trim();
         const sigPart = exit.signal ? ` (signal ${exit.signal})` : '';
         const detailPart = detail ? `: ${detail.slice(-500)}` : '';
+        const stdoutPart = stdoutDetail ? ` [stdout: ${stdoutDetail.slice(-500)}]` : '';
         // If stdin write blew up and the process exited non-zero, surface
         // both: the stdin error is usually the proximate cause.
         const stdinPart = stdinError ? ` [stdin: ${errorMessage(stdinError)}]` : '';
@@ -1789,7 +1844,7 @@ export function createClaudeBackend(
           taskId: task.taskId,
           error: {
             code: 'claude_exit_nonzero',
-            message: `claude exited with code ${exit.code}${sigPart}${detailPart}${stdinPart}`,
+            message: `claude exited with code ${exit.code}${sigPart}${detailPart}${stdoutPart}${stdinPart}`,
           },
         });
         return;

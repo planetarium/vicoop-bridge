@@ -995,6 +995,50 @@ test('rolls back the session binding when spawn throws', async () => {
   assert.ok(child.args.indexOf('--session-id') !== -1);
 });
 
+test('debug log records claude spawn shape and spawn errors', async () => {
+  const oldLevel = process.env.VICOOP_CLIENT_LOG_LEVEL;
+  const oldLog = console.log;
+  const logs: string[] = [];
+  process.env.VICOOP_CLIENT_LOG_LEVEL = 'debug';
+  console.log = (...args: unknown[]) => {
+    logs.push(args.map(String).join(' '));
+  };
+  try {
+    const backend = createClaudeBackend({
+      spawn: () => {
+        throw new Error('ENOENT: claude missing');
+      },
+      settings: { sandbox: { enabled: true } },
+      extraArgs: ['--append-system-prompt', 'operator secret-ish prompt'],
+    });
+
+    await backend.handle(assign('one'), collect().emit, NEVER);
+  } finally {
+    console.log = oldLog;
+    if (oldLevel === undefined) delete process.env.VICOOP_CLIENT_LOG_LEVEL;
+    else process.env.VICOOP_CLIENT_LOG_LEVEL = oldLevel;
+  }
+
+  assert.ok(
+    logs.some((line) =>
+      /claude\.spawn\.start/.test(line) &&
+      /command=claude/.test(line) &&
+      /argv=.*--settings/.test(line) &&
+      /<settings chars=/.test(line) &&
+      /<system-prompt chars=/.test(line) &&
+      !line.includes('operator secret-ish prompt')
+    ),
+    `expected redacted spawn start debug log, got:\n${logs.join('\n')}`,
+  );
+  assert.ok(
+    logs.some((line) =>
+      /claude\.spawn\.error/.test(line) &&
+      /error=ENOENT: claude missing/.test(line)
+    ),
+    `expected spawn error debug log, got:\n${logs.join('\n')}`,
+  );
+});
+
 test('rolls back the session binding when claude exits non-zero on a fresh session', async () => {
   // First task: claude exits with a stderr message but no result. The
   // freshly-minted sessionId was never persisted on disk, so a follow-up
@@ -1027,6 +1071,24 @@ test('rolls back the session binding when claude exits non-zero on a fresh sessi
   const child = fakeOk.lastChild()!;
   assert.equal(child.args.indexOf('--resume'), -1, 'must not resume an aborted session');
   assert.ok(child.args.indexOf('--session-id') !== -1, 'must mint a fresh session id');
+});
+
+test('non-zero claude exit includes stdout tail when stderr is empty', async () => {
+  const fake = scriptedSpawn({
+    lines: ['fatal: stream-json setup failed before stderr'],
+    exitCode: 1,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('fail with stdout only'), emit, NEVER);
+
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.fail');
+  if (terminal.type === 'task.fail') {
+    assert.equal(terminal.error.code, 'claude_exit_nonzero');
+    assert.match(terminal.error.message, /\[stdout: fatal: stream-json setup failed before stderr\]/);
+  }
 });
 
 test('rollback does not delete a binding a concurrent task has refreshed', async () => {
