@@ -26,10 +26,11 @@ Backwards compatibility:
 - zod's default unknown-key strip on `z.object` means an older client
   parsing a newer server's frame silently drops the new field and behaves
   exactly as before.
-- A newer client parsing an older server's frame sees
-  `callerPrincipal === undefined` and treats the task as anonymous (never
-  resumable across turns), which is the same fail-safe path used for the
-  public-agent flow.
+- Deployment is server-first; older-server + newer-client isn't a
+  supported configuration. The only remaining trigger for
+  `callerPrincipal === undefined` at the client is public-agent traffic,
+  where the server intentionally omits the field; the follow-up PRs treat
+  that case as anonymous (never resumable across turns).
 
 No behaviour change in this release — `@vicoop-bridge/client` does not yet
 read the new field. The follow-up PRs for the claude and codex backends
