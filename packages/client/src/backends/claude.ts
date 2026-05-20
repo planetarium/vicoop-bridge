@@ -1344,6 +1344,39 @@ export function createClaudeBackend(
         ? ['--max-turns', '1']
         : [];
 
+      // Both MCP servers ride on a single `--mcp-config` argv with one
+      // JSON blob. Keys are the MCP server names claude exposes the
+      // tools under (`mcp__<name>__<tool>` is the resulting tool-id
+      // pattern in the model's view). Either or both can be absent
+      // depending on opts; an entirely empty `mcpServers` map skips
+      // both `--mcp-config` and the matching `--allowedTools` below.
+      const mcpServers: Record<string, { type: string; url: string }> = {};
+      if (mcpServerForTask) {
+        mcpServers['vicoop-bridge'] = { type: 'http', url: mcpServerForTask.url };
+      }
+      if (callerToolsMcp) {
+        mcpServers['caller-tools'] = { type: 'http', url: callerToolsMcp.url };
+      }
+      const mcpServerNames = Object.keys(mcpServers);
+      const mcpConfigArgs: readonly string[] =
+        mcpServerNames.length === 0
+          ? []
+          : ['--mcp-config', JSON.stringify({ mcpServers })];
+      // Pre-approve the MCP servers we register. claude's permission system
+      // runs even in `-p` mode, and with the built-in `defaultMode: "default"`
+      // there's no TTY to answer a permission prompt — the request silently
+      // auto-denies, the model's tool call never executes, and the run dies
+      // at `--max-turns 1` with `permission_denials` in the result event
+      // (see #235). Built-ins are already off via `--tools ""` so this
+      // allowlist only opens tools the bridge itself stood up; operator
+      // settings retain veto power because claude's `deny` rules beat
+      // `allow`. Server-level rule (`mcp__<server>`) covers every tool
+      // exposed by that server without naming them individually.
+      const mcpAllowedToolsArgs: readonly string[] =
+        mcpServerNames.length === 0
+          ? []
+          : ['--allowedTools', mcpServerNames.map((s) => `mcp__${s}`).join(' ')];
+
       const args: string[] = [
         '-p',
         '--input-format',
@@ -1354,29 +1387,8 @@ export function createClaudeBackend(
         // prints a banner and exits instead of streaming.
         '--verbose',
         ...(isResume ? ['--resume', sessionId] : ['--session-id', sessionId]),
-        // Both MCP servers ride on a single `--mcp-config` argv with one
-        // JSON blob. Keys are the MCP server names claude exposes the
-        // tools under (`mcp__<name>__<tool>` is the resulting tool-id
-        // pattern in the model's view). Either or both can be absent
-        // depending on opts; an entirely empty `mcpServers` map is
-        // skipped entirely so we don't pass an unused argv to claude.
-        ...((): readonly string[] => {
-          const mcpServers: Record<string, unknown> = {};
-          if (mcpServerForTask) {
-            mcpServers['vicoop-bridge'] = {
-              type: 'http',
-              url: mcpServerForTask.url,
-            };
-          }
-          if (callerToolsMcp) {
-            mcpServers['caller-tools'] = {
-              type: 'http',
-              url: callerToolsMcp.url,
-            };
-          }
-          if (Object.keys(mcpServers).length === 0) return [];
-          return ['--mcp-config', JSON.stringify({ mcpServers })];
-        })(),
+        ...mcpConfigArgs,
+        ...mcpAllowedToolsArgs,
         ...identityArgs,
         ...openaiCompatArgs,
         ...disableBuiltinToolArgs,

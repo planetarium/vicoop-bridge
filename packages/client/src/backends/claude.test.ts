@@ -1731,6 +1731,14 @@ test('send_file MCP: server is registered on first task and a registered handle 
   assert.equal(cfg.mcpServers['vicoop-bridge'].type, 'http');
   assert.equal(cfg.mcpServers['vicoop-bridge'].url, server.url);
 
+  // argv must also pre-approve the send_file MCP server's tools so the
+  // model's `send_file` invocation survives a default permission policy
+  // (#235). Without --allowedTools, claude's `defaultMode: "default"`
+  // would auto-deny in -p mode since there's no TTY to answer the prompt.
+  const allowedIdx = child.args.indexOf('--allowedTools');
+  assert.notEqual(allowedIdx, -1, '--allowedTools required when an MCP server is registered (#235)');
+  assert.equal(child.args[allowedIdx + 1], 'mcp__vicoop-bridge');
+
   // Re-register a synthetic handle to check the routing reaches the handle's
   // emit (the lifecycle inside handle() already ran and released).
   const captured: Array<{ artifactId: string; name: string }> = [];
@@ -2836,6 +2844,80 @@ test('argv: openai-compat caller tools wire caller-tools MCP + native prompt + -
   const toolsIdx = args.indexOf('--tools');
   assert.notEqual(toolsIdx, -1);
   assert.equal(args[toolsIdx + 1], '');
+
+  // (d) --allowedTools pre-approves the caller-tools MCP server so the
+  // model's tool_use survives operator environments that leave claude's
+  // permission system in `defaultMode: "default"`. In `-p` mode there's
+  // no TTY to answer a permission prompt, so an un-allowlisted MCP
+  // tool auto-denies and the run dies at --max-turns 1 with
+  // `permission_denials` in the result event (issue #235).
+  const allowedIdx = args.indexOf('--allowedTools');
+  assert.notEqual(allowedIdx, -1, '--allowedTools required for caller-tools MCP (#235)');
+  assert.equal(args[allowedIdx + 1], 'mcp__caller-tools');
+});
+
+// Regression for #235: --allowedTools must cover every MCP server the
+// bridge registers, not just caller-tools. When both `send_file`
+// (vicoop-bridge) and `caller-tools` are active, both server-level
+// rules must appear in a single space-separated `--allowedTools` value.
+test('argv: --allowedTools covers all registered MCP servers (#235)', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-235-allowed-'));
+  const realRoot = await fs.realpath(root);
+  try {
+    const fake = scriptedSpawn({
+      lines: [
+        JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' }),
+        JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+      ],
+      exitCode: 0,
+    });
+    const backend = createClaudeBackend({
+      spawn: fake.spawn,
+      sendFileMcp: { allowedRoots: [realRoot], skipHttp: true },
+    });
+    await backend.handle(
+      {
+        ...assign('do a fetch'),
+        message: {
+          role: 'user',
+          messageId: 'm',
+          parts: [{ kind: 'text', text: 'do a fetch' }],
+          metadata: {
+            [OPENAI_COMPAT_EXTENSION_URI]: {
+              system: 'be terse',
+              tools: [
+                {
+                  type: 'function',
+                  function: {
+                    name: 'fetch',
+                    description: 'Fetch a URL',
+                    parameters: { type: 'object', properties: {} },
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+      collect().emit,
+      NEVER,
+    );
+    const child = fake.lastChild();
+    assert.ok(child);
+    const args = child!.args;
+    const allowedIdx = args.indexOf('--allowedTools');
+    assert.notEqual(allowedIdx, -1);
+    const tokens = String(args[allowedIdx + 1]).split(/\s+/).filter(Boolean);
+    // Order is insertion-order of `Object.keys(mcpServers)`:
+    // vicoop-bridge first (added when sendFileMcp is enabled), then
+    // caller-tools (added when openai-compat tools are present).
+    assert.deepEqual(tokens.sort(), ['mcp__caller-tools', 'mcp__vicoop-bridge']);
+
+    const closer = backend.getSendFileMcpServer();
+    if (closer) await closer.close();
+  } finally {
+    await fs.rm(realRoot, { recursive: true, force: true });
+  }
 });
 
 // End-to-end (with test seam): the model "invokes" the caller tool via
