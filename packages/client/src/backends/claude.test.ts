@@ -3231,19 +3231,17 @@ test('no openai-compat tools → no native dispatch argv (#213)', async () => {
 // conflicting sources of truth on the same `tool_call_id`. Force fresh
 // `--session-id` instead. Plain claude tasks (no openai-compat metadata)
 // keep their existing session-reuse behaviour.
-test('openai-compat: same contextId still spawns a fresh --session-id (no --resume) (#213)', async () => {
-  const fake = scriptedSpawn({
-    lines: [
-      JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' }),
-      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
-    ],
-    exitCode: 0,
-  });
-  const backend = createClaudeBackend({
-    spawn: fake.spawn,
-    onCallerToolsMcpReady: () => {},
-  });
-  const { emit } = collect();
+test('openai-compat continuation: second turn with same contextId resumes via --resume (#241)', async () => {
+  // The body of #241: under the openai-compat extension, follow-up A2A
+  // turns on the same contextId resume the prior claude session via
+  // `--resume <sid>` instead of spawning a fresh `--session-id`. Without
+  // this, every continuation turn re-fed the full `tool_call_history`
+  // from scratch and the cumulative token cost grew O(N²) in the number
+  // of round-trips. Replaces the #213-era assertion that openai-compat
+  // ALWAYS spawned with `--session-id` — that invariant was the
+  // emergency workaround for #175 (double-feeding when session reuse
+  // was on and the gateway also replayed history), now replaced by the
+  // diff-based replay verified in the test below.
   const meta = {
     [OPENAI_COMPAT_EXTENSION_URI]: {
       tools: [
@@ -3251,10 +3249,21 @@ test('openai-compat: same contextId still spawns a fresh --session-id (no --resu
       ],
     },
   };
+  const sid = 'sid-shared-241';
 
-  // Two turns sharing the same contextId — without the openai-compat gate
-  // the second one would carry `--resume <sessionId-from-turn-1>`.
-  await backend.handle(
+  const fake1 = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: sid }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend1 = createClaudeBackend({
+    spawn: fake1.spawn,
+    onCallerToolsMcpReady: () => {},
+  });
+  const { emit } = collect();
+  await backend1.handle(
     {
       type: 'task.assign',
       taskId: 'oai-t1',
@@ -3264,7 +3273,20 @@ test('openai-compat: same contextId still spawns a fresh --session-id (no --resu
     emit,
     NEVER,
   );
-  await backend.handle(
+  const child1 = fake1.lastChild()!;
+  const sidIdx1 = child1.args.indexOf('--session-id');
+  assert.notEqual(sidIdx1, -1, 'first turn must spawn with --session-id');
+  assert.equal(child1.args.indexOf('--resume'), -1, 'first turn must NOT --resume');
+  // Capture the sessionId the backend minted on turn 1 so the second
+  // turn's assertion can name it explicitly. The fake claude echoes
+  // whatever id the backend supplied via the `system/init` line above —
+  // here we only care that argv carries the same value.
+  const mintedSid = child1.args[sidIdx1 + 1]!;
+
+  // Second turn on the same contextId reuses the entry minted above.
+  // The same backend instance carries the in-memory session map across
+  // tasks, so we keep using `backend1`.
+  await backend1.handle(
     {
       type: 'task.assign',
       taskId: 'oai-t2',
@@ -3274,11 +3296,215 @@ test('openai-compat: same contextId still spawns a fresh --session-id (no --resu
     emit,
     NEVER,
   );
+  const child2 = fake1.lastChild()!;
+  const resumeIdx = child2.args.indexOf('--resume');
+  assert.notEqual(resumeIdx, -1, 'second turn must --resume the prior session');
+  assert.equal(child2.args[resumeIdx + 1], mintedSid, '--resume must name the sid minted on turn 1');
+  assert.equal(child2.args.indexOf('--session-id'), -1, 'second turn must NOT also pass --session-id');
+});
 
-  const child = fake.lastChild()!;
-  // Every openai-compat spawn must use `--session-id`, never `--resume`.
-  assert.notEqual(child.args.indexOf('--session-id'), -1, 'second turn uses --session-id');
-  assert.equal(child.args.indexOf('--resume'), -1, 'second turn must NOT --resume');
+test('openai-compat continuation: prepended history contains only new role:"tool" results since the prior turn (#241)', async () => {
+  // The token-cost half of #241: a continuation turn on a resumed
+  // session prepends ONLY the `role:"tool"` entries whose `tool_call_id`
+  // isn't already in the session's ackSet. The matching
+  // `assistant.tool_calls` are in claude's session memory from the prior
+  // turn — re-feeding them is precisely the #233 / #175 failure mode the
+  // emergency workaround disabled session reuse to avoid.
+  const meta = (history?: unknown[]): Record<string, unknown> => ({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: [
+        { type: 'function', function: { name: 'fetch', parameters: { type: 'object' } } },
+      ],
+      ...(history ? { tool_call_history: history } : {}),
+    },
+  });
+
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-diff' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    onCallerToolsMcpReady: () => {},
+  });
+  const { emit } = collect();
+
+  // Turn 1: no history yet. The fresh-spawn path renders nothing.
+  await backend.handle(
+    {
+      type: 'task.assign',
+      taskId: 't1',
+      contextId: 'ctx-diff',
+      message: { role: 'user', messageId: 'm1', parts: [{ kind: 'text', text: 'hi' }], metadata: meta() },
+    },
+    emit,
+    NEVER,
+  );
+  const stdin1 = fake.lastChild()!.stdinPayload;
+  assert.equal(stdin1.includes('<tool_call_history>'), false, 'turn 1 has no history to prepend');
+
+  // Turn 2: history has one resolved round-trip (assistant call_a + its
+  // tool result) and a fresh assistant call_b that hasn't been resolved
+  // yet. Only the resolved-result entry (`role:"tool"` for call_a) is
+  // new — call_b's `assistant.tool_calls` lives in claude's session
+  // memory from turn 1, and there's no tool result for call_b yet.
+  const history2 = [
+    { role: 'assistant', tool_calls: [{ id: 'call_a', type: 'function', function: { name: 'fetch', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'call_a', name: 'fetch', content: 'A' },
+    { role: 'assistant', tool_calls: [{ id: 'call_b', type: 'function', function: { name: 'fetch', arguments: '{}' } }] },
+  ];
+  await backend.handle(
+    {
+      type: 'task.assign',
+      taskId: 't2',
+      contextId: 'ctx-diff',
+      message: { role: 'user', messageId: 'm2', parts: [{ kind: 'text', text: 'continue' }], metadata: meta(history2) },
+    },
+    emit,
+    NEVER,
+  );
+  // stdin is JSON-encoded so the inner history block's quotes are escaped
+  // when matched against the raw payload — parse out the envelope and
+  // inspect the prepended text block directly.
+  const histText2 = extractPrependedHistoryBlock(fake.lastChild()!.stdinPayload);
+  assert.ok(histText2, 'turn 2 prepends a history block');
+  assert.ok(histText2.includes('"tool_call_id": "call_a"'), 'turn 2 history contains the new role:"tool" entry');
+  assert.equal(
+    histText2.includes('"id": "call_a"'),
+    false,
+    'turn 2 history must NOT re-feed the assistant.tool_calls entry (claude has it in session memory)',
+  );
+  assert.equal(
+    histText2.includes('"id": "call_b"'),
+    false,
+    'turn 2 history must NOT re-feed the unresolved assistant call either',
+  );
+
+  // Turn 3: caller delivers the result for call_b. call_a is already in
+  // the ackSet from turn 2, so the prepended block must contain only
+  // call_b's result.
+  const history3 = [
+    ...history2,
+    { role: 'tool', tool_call_id: 'call_b', name: 'fetch', content: 'B' },
+  ];
+  await backend.handle(
+    {
+      type: 'task.assign',
+      taskId: 't3',
+      contextId: 'ctx-diff',
+      message: { role: 'user', messageId: 'm3', parts: [{ kind: 'text', text: 'continue' }], metadata: meta(history3) },
+    },
+    emit,
+    NEVER,
+  );
+  const histText3 = extractPrependedHistoryBlock(fake.lastChild()!.stdinPayload);
+  assert.ok(histText3, 'turn 3 prepends a history block');
+  assert.ok(histText3.includes('"tool_call_id": "call_b"'), 'turn 3 history contains the newly-acked tool result');
+  assert.equal(
+    histText3.includes('"tool_call_id": "call_a"'),
+    false,
+    'turn 3 must NOT re-feed call_a — already acked on turn 2',
+  );
+});
+
+// Extract the prepended `<tool_call_history>...</tool_call_history>` block
+// from a turn's stdin payload, returning the inner block's raw text (with
+// the wrapper tags) for substring assertions. Returns null when no block
+// was prepended. claude's stdin is one JSON line per message (`{type:"user",
+// message:{role,content}}`); we walk the first envelope's `content` for the
+// text part whose body starts with the wrapper tag.
+function extractPrependedHistoryBlock(stdin: string): string | null {
+  const firstLine = stdin.trim().split('\n')[0];
+  if (!firstLine) return null;
+  let env: unknown;
+  try {
+    env = JSON.parse(firstLine);
+  } catch {
+    return null;
+  }
+  const e = env as {
+    message?: { content?: Array<{ type?: string; text?: string }> };
+  };
+  for (const c of e.message?.content ?? []) {
+    if (c?.type === 'text' && typeof c.text === 'string' && c.text.includes('<tool_call_history>')) {
+      return c.text;
+    }
+  }
+  return null;
+}
+
+test('openai-compat continuation: regression guard against #175 double-feeding', async () => {
+  // Structural guarantee against #175: across the two A2A turns of a
+  // single openai-compat round-trip, no `tool_call_id` ever appears in
+  // the stdin envelope more than once. The previous emergency workaround
+  // (disable session reuse on openai-compat) achieved this by always
+  // feeding the full history every turn but with the model starting
+  // from a fresh session. The #241 redesign keeps the session alive and
+  // ALSO drops already-acked entries from the next turn's prepend, so
+  // we now have the strict "appears in stdin at most once" invariant
+  // that the prior workaround couldn't promise (it fed the full history
+  // every turn, just into a fresh session).
+  const meta = (history?: unknown[]): Record<string, unknown> => ({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      tools: [
+        { type: 'function', function: { name: 'fetch', parameters: { type: 'object' } } },
+      ],
+      ...(history ? { tool_call_history: history } : {}),
+    },
+  });
+
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-175' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    onCallerToolsMcpReady: () => {},
+  });
+  const { emit } = collect();
+
+  await backend.handle(
+    {
+      type: 'task.assign',
+      taskId: 'r1',
+      contextId: 'ctx-175',
+      message: { role: 'user', messageId: 'm1', parts: [{ kind: 'text', text: 'hi' }], metadata: meta() },
+    },
+    emit,
+    NEVER,
+  );
+  const stdin1 = fake.lastChild()!.stdinPayload;
+
+  const history = [
+    { role: 'assistant', tool_calls: [{ id: 'call_x', type: 'function', function: { name: 'fetch', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'call_x', name: 'fetch', content: 'result-of-x' },
+  ];
+  await backend.handle(
+    {
+      type: 'task.assign',
+      taskId: 'r2',
+      contextId: 'ctx-175',
+      message: { role: 'user', messageId: 'm2', parts: [{ kind: 'text', text: 'continue' }], metadata: meta(history) },
+    },
+    emit,
+    NEVER,
+  );
+  const stdin2 = fake.lastChild()!.stdinPayload;
+
+  // Count call_x occurrences across BOTH turns' stdin. The id should
+  // appear exactly once — turn 2's prepended `role:"tool"` block. Turn
+  // 1 had no history and the model emitted `call_x` to its stdout
+  // (artifact), which doesn't flow through stdin.
+  const occurrences = (haystack: string, needle: string): number =>
+    haystack.split(needle).length - 1;
+  const totalCallX = occurrences(stdin1, 'call_x') + occurrences(stdin2, 'call_x');
+  assert.equal(totalCallX, 1, `expected call_x exactly once across both stdin payloads, saw ${totalCallX}`);
 });
 
 test('AskUserQuestion: terminal frame uses state=input-required with DataPart payload (A2A spec §9.4)', async () => {

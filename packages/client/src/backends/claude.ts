@@ -143,6 +143,16 @@ interface SessionEntry {
   // second concurrent task on the same contextId that has since refreshed
   // the binding (and bumped writeId) is not robbed of its session id.
   writeId: number;
+  // `tool_call_id` values whose `role:"tool"` result has already been
+  // injected into this claude session on a prior turn. On a continuation
+  // turn the bridge prepends ONLY the new `role:"tool"` entries — entries
+  // whose id is in this set are dropped, since the model already saw the
+  // result on the earlier turn and re-feeding it triggers the #233 / #175
+  // re-call loop. Empty on the non-openai-compat path (no history to diff
+  // against) — the Set object is shared across refreshes of the same
+  // entry so a concurrent task on the same contextId accumulates into the
+  // same set without losing prior acks.
+  ackSet: Set<string>;
 }
 
 // claude --output-format stream-json writes one JSON object per line.
@@ -697,10 +707,13 @@ export function openaiToolsToCallerToolDefs(
 //     emit parallel `tool_use` blocks within one assistant message (which
 //     is fine per OpenAI semantics), but it cannot proceed to a second
 //     model turn within the same task.
-//   - A "session memory vs history block" disambiguation — openai-compat
-//     tasks always spawn with a fresh `--session-id` (see the session
-//     reuse gate in `handle()`), so there's no prior session memory to
-//     conflict with the history block.
+//   - A "session memory vs history block" disambiguation. On a
+//     continuation turn (`--resume`) the prior `assistant.tool_calls`
+//     live in claude's own session memory and the prepended history
+//     block contains ONLY the `role:"tool"` results that haven't been
+//     delivered to this session yet (see the ackSet-driven filter in
+//     `handle()`). The two sources never overlap, so there's nothing to
+//     disambiguate from the model's side.
 export function buildOpenAICompatNativeSystemPrompt(meta: OpenAICompatMetadata): string {
   const sections: string[] = [];
   if (meta.system) sections.push(meta.system);
@@ -1113,19 +1126,6 @@ export function createClaudeBackend(
 
       const mapped = await mapPartsToContentBlocks(task.message.parts, opts.fetchUriPolicy, signal);
       recorder.mark('map');
-      if (mapped.ok && openaiCompat?.tool_call_history) {
-        // Spec contract: bridges MUST replay the entire `tool_call_history`
-        // in order. We render it as a text block and prepend it to the user
-        // content so the model reads the prior round BEFORE the current
-        // user turn. Any internal optimisation (e.g. claude `--resume`
-        // already holds the prior `assistant.tool_calls` in session
-        // memory) is invisible to the wire and does not change replay
-        // semantics — the redundancy is the price of cross-bridge interop.
-        mapped.blocks.unshift({
-          type: 'text',
-          text: formatToolCallHistory(openaiCompat.tool_call_history),
-        });
-      }
       if (!mapped.ok) {
         emit({
           type: 'task.fail',
@@ -1135,31 +1135,75 @@ export function createClaudeBackend(
         return;
       }
 
-      // Session reuse is for A2A callers that want conversation continuity
-      // across tasks sharing a contextId. The openai-compat extension is
-      // stateless by design — every OpenAI Chat Completions request carries
-      // its own full message history, so resuming a prior claude session
-      // would risk feeding the model two sources of truth (claude's own
-      // session memory containing the sentinel "captured by bridge" result
-      // we returned from the MCP `onInvoke` handler, AND the user message's
-      // prepended `tool_call_history` JSON carrying the caller's real tool
-      // results). Skip the session map entirely for openai-compat tasks so
-      // every spawn starts on a clean `--session-id`; the history block in
-      // the user message is then the unambiguous source of truth.
-      const sessionReuseEligible = openaiCompat === null && sessionTtlMs > 0;
+      // Session reuse on a recurring contextId. The non-openai-compat path
+      // uses it to give the caller conversation continuity across A2A
+      // tasks; the openai-compat path uses it to avoid the quadratic-token
+      // cost of re-feeding the full `tool_call_history` on every
+      // continuation turn (#241). On the latter path, the model's prior
+      // `assistant.tool_calls` already live in claude's own session memory
+      // — only the *new* `role:"tool"` results since the last turn need to
+      // be injected via the in-prompt history block. `ackSet` tracks the
+      // `tool_call_id`s already delivered to this session so a duplicate
+      // can be filtered.
+      const sessionReuseEligible = sessionTtlMs > 0;
       const tNow = now();
       if (sessionReuseEligible) evictExpired(tNow - sessionTtlMs);
       const existing = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
       const sessionId = existing?.sessionId ?? randomUUID();
       const isResume = existing !== undefined;
+      // Share the Set object across refreshes of the same entry so a
+      // concurrent task on the same contextId accumulates acks into the
+      // same set rather than racing to overwrite.
+      const entryAckSet = existing?.ackSet ?? new Set<string>();
       let writeId = 0;
       if (sessionReuseEligible) {
         // Refresh lastUsedAt eagerly: a concurrent second task on the same
         // contextId arriving before this one finishes also resumes the same
         // session id (rather than racing to mint a new one).
         writeId = ++writeCounter;
-        sessions.set(task.contextId, { sessionId, lastUsedAt: tNow, writeId });
+        sessions.set(task.contextId, {
+          sessionId,
+          lastUsedAt: tNow,
+          writeId,
+          ackSet: entryAckSet,
+        });
       }
+
+      if (openaiCompat?.tool_call_history) {
+        // Continuation turns under the openai-compat extension prepend only
+        // the `role:"tool"` entries that aren't in `ackSet` — the matching
+        // `assistant.tool_calls` are in claude's session memory and the
+        // prior tool results are already acked. First-turn / fresh-fallback
+        // (no cached session) renders the full history so the model sees
+        // its prior round-trips for the first time. See `formatToolCallHistory`
+        // for the block wrapper that both paths share.
+        const renderable = isResume
+          ? openaiCompat.tool_call_history.filter(
+              (e) => e.role === 'tool' && !entryAckSet.has(e.tool_call_id),
+            )
+          : openaiCompat.tool_call_history;
+        if (renderable.length > 0) {
+          mapped.blocks.unshift({
+            type: 'text',
+            text: formatToolCallHistory(renderable),
+          });
+        }
+      }
+
+      // Add the `role:"tool"` `tool_call_id`s the model just consumed to
+      // the entry's ackSet so a future continuation turn doesn't replay
+      // the same results. Only called from the success exit paths — a
+      // failed turn leaves the invariant unchanged so the retry sees the
+      // same diff. Closes over `entryAckSet`, which is the same Set
+      // reference held by whatever entry currently lives in `sessions`
+      // (preserved across refreshes), so a concurrent task on the same
+      // contextId observes our additions.
+      const commitAckSet = (): void => {
+        if (!openaiCompat?.tool_call_history) return;
+        for (const e of openaiCompat.tool_call_history) {
+          if (e.role === 'tool') entryAckSet.add(e.tool_call_id);
+        }
+      };
 
       // Drop the freshly-minted (contextId → sessionId) binding when the
       // run never reached a successful state, so the next task on this
@@ -1832,6 +1876,7 @@ export function createClaudeBackend(
       }
 
       if (pendingInputRequest !== null) {
+        commitAckSet();
         emit({
           type: 'task.complete',
           taskId: task.taskId,
@@ -1886,6 +1931,7 @@ export function createClaudeBackend(
       const messageMetadata = finalUsage
         ? makeOpenAICompatUsageMetadata(finalUsage)
         : undefined;
+      commitAckSet();
       emit({
         type: 'task.complete',
         taskId: task.taskId,
