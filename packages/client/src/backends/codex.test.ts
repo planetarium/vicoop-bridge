@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import {
   composeNativeDevInstructions,
   createCodexBackend,
+  historyToInjectItems,
   openaiToolsToDynamicToolSpecs,
 } from './codex.js';
 import type {
@@ -749,12 +750,18 @@ test('image FilePart is materialised under a temp dir and passed as localImage U
   assert.equal(frames.at(-1)?.type, 'task.complete');
 });
 
-test('openai-compat tool_call_history is injected as native Responses API items, NOT folded into user text', async () => {
+test('openai-compat tool_call_history injects user-message anchor + function_call pairs and sends empty-text turn/start.input (#233)', async () => {
   // Codex absorbs `function_call` / `function_call_output` items as proper
   // prior tool dispatch — the model sees them as its own past actions and
-  // does not re-emit the same envelope (#176). The text input must NOT
-  // carry a `<tool_call_history>` blob anymore: the native channel is the
-  // single source of truth.
+  // does not re-emit the same envelope (#176). The user prompt is prepended
+  // to the injected history as a `message`-type item so the conversation
+  // reads as `[user → assistant tool_call → tool result]` instead of orphan
+  // tool dispatch followed by a fresh user imperative (#233). With the
+  // prompt at the head AND codex's auto `<environment_context>` suppressed
+  // via `config.include_environment_context: false`, `turn/start.input`
+  // carries only an empty-text wake-up item: no synthetic user turn lands
+  // at the conversation tail, and the model finalises off the injected
+  // tool result instead of re-emitting the call.
   const fake = makeFakeSpawn(() => happyPath());
   const backend = createCodexBackend({ spawn: fake.spawn });
   const { emit, frames } = collect();
@@ -784,26 +791,78 @@ test('openai-compat tool_call_history is injected as native Responses API items,
   );
 
   // thread/inject_items must be sent between thread/start and turn/start,
-  // with one function_call + one function_call_output item paired by call_id.
+  // with the user message at the head followed by the function_call +
+  // function_call_output pair.
   const inject = findRequest(fake.lastChild().stdinFrames(), 'thread/inject_items');
   assert.ok(inject, 'thread/inject_items observed');
   const injectParams = (inject as {
     params?: { items?: Array<Record<string, unknown>> };
   }).params;
   assert.deepEqual(injectParams?.items, [
+    {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'next' }],
+    },
     { type: 'function_call', call_id: 'tc1', name: 'lookup', arguments: '{}' },
     { type: 'function_call_output', call_id: 'tc1', output: 'OK' },
   ]);
 
-  // The user text part of turn/start carries ONLY the user's text — no
-  // history blob is folded in.
+  // turn/start.input carries a single empty-string text item — the user
+  // prompt is already in the injected history; we still need *some* item
+  // because a literal `input: []` makes codex's model go silent (it gets
+  // called but never emits a final assistant message). An empty text item
+  // wakes the model with no visible placeholder content.
   const turnStart = findRequest(fake.lastChild().stdinFrames(), 'turn/start');
   const params = (turnStart as {
     params?: { input?: Array<{ type: string; text?: string }> };
   }).params;
-  const textItem = params?.input?.find((it) => it.type === 'text');
-  assert.equal(textItem?.text, 'next');
+  assert.deepEqual(params?.input, [
+    { type: 'text', text: '', text_elements: [] },
+  ]);
   assert.equal(frames.at(-1)?.type, 'task.complete');
+});
+
+test('openai-compat thread/start sets include_environment_context: false to suppress codex auto user-msg tail (#233)', async () => {
+  // Without this, codex re-emits `<environment_context>` as a user-role
+  // message at the head of every `turn/start`, which lands AT THE TAIL of
+  // the model's conversation when `turn/start.input: []` drives a
+  // continuation off injected history — and the synthetic user turn is
+  // exactly what makes the model re-interpret the prompt as fresh.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('ask', 'ctx-no-envctx', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'ask' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as {
+    params?: { config?: { include_environment_context?: boolean } };
+  }).params;
+  assert.equal(params?.config?.include_environment_context, false);
+});
+
+test('non-openai-compat thread/start omits include_environment_context (default codex behaviour preserved)', async () => {
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(assign('hi', 'ctx-default-envctx'), collect().emit, NEVER);
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as {
+    params?: { config?: { include_environment_context?: boolean } };
+  }).params;
+  assert.equal(params?.config?.include_environment_context, undefined);
 });
 
 test('absent tool_call_history skips thread/inject_items entirely', async () => {
@@ -814,6 +873,102 @@ test('absent tool_call_history skips thread/inject_items entirely', async () => 
   await backend.handle(assign('hi', 'ctx-no-hist'), collect().emit, NEVER);
   const inject = findRequest(fake.lastChild().stdinFrames(), 'thread/inject_items');
   assert.equal(inject, null);
+});
+
+test('historyToInjectItems prepends a user message anchor when userPrompt is given (#233)', () => {
+  // Anchor: without a preceding user turn the model treats the
+  // function_call / function_call_output pairs as orphan tool dispatch and
+  // re-emits the same call on every continuation turn. Prepending a
+  // `message`-type item reconstructs the OpenAI chat ordering.
+  const items = historyToInjectItems(
+    [
+      { role: 'assistant', tool_calls: [{ id: 't1', function: { name: 'f', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 't1', content: 'ok' },
+    ],
+    'ask',
+  );
+  assert.deepEqual(items, [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'ask' }] },
+    { type: 'function_call', call_id: 't1', name: 'f', arguments: '{}' },
+    { type: 'function_call_output', call_id: 't1', output: 'ok' },
+  ]);
+});
+
+test('historyToInjectItems omits the user-message anchor when userPrompt is empty', () => {
+  // Default empty prompt → no anchor item. Preserves the legacy shape for
+  // call sites that have already folded the prompt elsewhere (none in-tree
+  // currently, but the function is exported for unit reuse).
+  const items = historyToInjectItems([
+    { role: 'assistant', tool_calls: [{ id: 't1', function: { name: 'f', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 't1', content: 'ok' },
+  ]);
+  assert.deepEqual(items, [
+    { type: 'function_call', call_id: 't1', name: 'f', arguments: '{}' },
+    { type: 'function_call_output', call_id: 't1', output: 'ok' },
+  ]);
+});
+
+test('tool_call_history + image FilePart: prompt anchors inject_items; turn/start carries only the image (no text) (#233)', async () => {
+  // History present → user-message anchor inject + empty turn/start.input
+  // for text. Images still ride on `turn/start.input` via the existing
+  // `localImage` path because codex's `ContentItem::InputImage` wants a
+  // URL, not a local path — so they can't be inlined into the injected
+  // user message.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    mkdtemp: async () => '/tmp/test-codex-hist-image',
+    writeFile: async () => undefined,
+    rm: async () => undefined,
+  });
+  await backend.handle(
+    assign('caption please', 'ctx-hist-img', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [
+          { kind: 'text', text: 'caption please' },
+          {
+            kind: 'file',
+            file: {
+              mimeType: 'image/png',
+              bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64'),
+            },
+          },
+        ],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            tool_call_history: [
+              { role: 'assistant', tool_calls: [{ id: 'tc1', function: { name: 'f', arguments: '{}' } }] },
+              { role: 'tool', tool_call_id: 'tc1', content: 'r' },
+            ],
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  const frames = fake.lastChild().stdinFrames();
+  const inject = findRequest(frames, 'thread/inject_items');
+  const injectItems = (inject as {
+    params?: { items?: Array<Record<string, unknown>> };
+  }).params?.items;
+  assert.deepEqual(injectItems?.[0], {
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_text', text: 'caption please' }],
+  });
+  const turnStart = findRequest(frames, 'turn/start');
+  const input = (turnStart as {
+    params?: { input?: Array<{ type: string; text?: string; path?: string }> };
+  }).params?.input;
+  // Empty-text wake-up item + the image; the user's text prompt is in the
+  // injected history, NOT duplicated at the tail.
+  assert.equal(input?.length, 2);
+  assert.equal(input?.[0]?.type, 'text');
+  assert.equal(input?.[0]?.text, '');
+  assert.equal(input?.[1]?.type, 'localImage');
 });
 
 test('parallel tool_calls in one assistant entry fan out into one function_call item each', async () => {
@@ -852,6 +1007,11 @@ test('parallel tool_calls in one assistant entry fan out into one function_call 
   const items = (inject as { params?: { items?: Array<Record<string, unknown>> } })
     .params?.items;
   assert.deepEqual(items, [
+    {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'next' }],
+    },
     { type: 'function_call', call_id: 'tc1', name: 'a', arguments: '{"x":1}' },
     { type: 'function_call', call_id: 'tc2', name: 'b', arguments: '{"y":2}' },
     { type: 'function_call_output', call_id: 'tc1', output: 'A' },
@@ -1281,13 +1441,12 @@ test('composeNativeDevInstructions includes system text, omits JSON envelope con
   assert.equal(withTools.includes('{"tool_calls"'), false);
 });
 
-// The handler is keyed on the resumed thread id because codex persists
-// `dynamicTools` with `SessionMeta` and the model can still invoke them on
-// a resumed turn. Without registering on resume, a tool call on the second
-// A2A turn would land on the default handler ("no caller tool handler
-// registered") and never surface to the caller — a silent regression
-// compared to start.
-test('dynamicTools handler is registered on thread/resume too (#209)', async () => {
+// openai-compat tasks always do `thread/start` (never thread/resume — see
+// the session-reuse guard for #233), but the second A2A turn still needs a
+// working caller-tools handler. This guards against a regression where the
+// handler is only registered on the *first* contextId encounter and a
+// follow-up turn silently lands on the default "no handler" path.
+test('dynamicTools handler is registered on every openai-compat turn (#209, #233)', async () => {
   let turnCount = 0;
   const fake = makeFakeSpawn(() => ({
     onLine(frame, child) {
@@ -1297,11 +1456,12 @@ test('dynamicTools handler is registered on thread/resume too (#209)', async () 
         child.emitStdout({ id, result: {} });
         return;
       }
-      if (
-        (method === 'thread/start' || method === 'thread/resume') &&
-        id !== undefined
-      ) {
-        child.emitStdout({ id, result: { thread: { id: 'thr-1' } } });
+      if (method === 'thread/start' && id !== undefined) {
+        // Mint a fresh thread id per call so the handler-registration test
+        // is meaningful — registration is keyed on threadId, so the second
+        // turn must register on its OWN id.
+        turnCount += 1;
+        child.emitStdout({ id, result: { thread: { id: `thr-${turnCount}` } } });
         return;
       }
       if (method === 'thread/inject_items' && id !== undefined) {
@@ -1309,20 +1469,20 @@ test('dynamicTools handler is registered on thread/resume too (#209)', async () 
         return;
       }
       if (method === 'turn/start' && id !== undefined) {
-        turnCount += 1;
         const turnId = `turn-${turnCount}`;
+        const threadId = `thr-${turnCount}`;
         child.emitStdout({
           id,
           result: { turn: { id: turnId, status: 'inProgress' } },
         });
         if (turnCount === 1) {
-          // First turn completes plainly so a resume happens on the second.
+          // First turn completes plainly so we can drive a second one.
           queueMicrotask(() => {
             child.emitStdout({
               method: 'item/completed',
               params: {
                 turnId,
-                threadId: 'thr-1',
+                threadId,
                 item: { type: 'agentMessage', id: 'a1', text: 'first' },
               },
             });
@@ -1334,16 +1494,16 @@ test('dynamicTools handler is registered on thread/resume too (#209)', async () 
             });
           });
         } else {
-          // Second turn (resume): fire item/tool/call to prove the handler
-          // is registered on the resumed thread.
+          // Second turn: fire item/tool/call against the fresh thread id to
+          // prove the handler is registered on the new turn's thread.
           queueMicrotask(() => {
             child.emitStdout({
               id: 'srv-r',
               method: 'item/tool/call',
               params: {
-                threadId: 'thr-1',
+                threadId,
                 turnId,
-                callId: 'call_resume',
+                callId: 'call_second_turn',
                 namespace: null,
                 tool: 'fetch',
                 arguments: { x: 1 },
@@ -1359,7 +1519,7 @@ test('dynamicTools handler is registered on thread/resume too (#209)', async () 
           child.emitStdout({
             method: 'turn/completed',
             params: {
-              turn: { id: 'turn-2', status: 'interrupted', items: [], error: null },
+              turn: { id: `turn-${turnCount}`, status: 'interrupted', items: [], error: null },
             },
           });
         });
@@ -1381,9 +1541,9 @@ test('dynamicTools handler is registered on thread/resume too (#209)', async () 
     },
   };
 
-  // Turn 1: start.
+  // Turn 1.
   await backend.handle(
-    assign('first', 'ctx-resume', {
+    assign('first', 'ctx-no-resume', {
       message: {
         role: 'user',
         messageId: 'm1',
@@ -1395,11 +1555,12 @@ test('dynamicTools handler is registered on thread/resume too (#209)', async () 
     NEVER,
   );
 
-  // Turn 2: same contextId triggers resume; we don't re-send dynamicTools
-  // but codex re-hydrates them — the handler must still fire.
+  // Turn 2: same contextId still does thread/start (no reuse under
+  // openai-compat). The handler must register on the new thread id so the
+  // model's tool_call surfaces as a `tool_calls` artifact.
   const { emit, frames } = collect();
   await backend.handle(
-    assign('second', 'ctx-resume', {
+    assign('second', 'ctx-no-resume', {
       message: {
         role: 'user',
         messageId: 'm2',
@@ -1412,7 +1573,7 @@ test('dynamicTools handler is registered on thread/resume too (#209)', async () 
   );
 
   const artifact = frames.find((f) => f.type === 'task.artifact');
-  assert.ok(artifact, 'tool_calls artifact emitted on the resumed turn');
+  assert.ok(artifact, 'tool_calls artifact emitted on the second turn');
   if (artifact?.type === 'task.artifact') {
     assert.ok(
       artifact.artifact.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI),
@@ -1422,12 +1583,17 @@ test('dynamicTools handler is registered on thread/resume too (#209)', async () 
   assert.ok(complete && complete.type === 'task.complete');
   assert.equal(complete.status.state, 'completed');
 
-  // The second thread call must have been `thread/resume`, not `thread/start`.
+  // Both turns went through thread/start; thread/resume is never used for
+  // openai-compat tasks (#233 session-reuse guard).
   const sent = fake.lastChild().stdinFrames();
-  const resumeCount = sent.filter(
+  const starts = sent.filter(
+    (f) => (f as { method?: string }).method === 'thread/start',
+  );
+  const resumes = sent.filter(
     (f) => (f as { method?: string }).method === 'thread/resume',
-  ).length;
-  assert.equal(resumeCount, 1);
+  );
+  assert.equal(starts.length, 2);
+  assert.equal(resumes.length, 0);
 });
 
 // The full set of codex features the backend disables when caller-side
@@ -1555,38 +1721,12 @@ test('thread/resume does NOT send `environments` (sticky on start; ResumeParams 
   // via the server-side session record. `ThreadResumeParams` in codex
   // app-server-protocol has no `environments` field, so sending it on
   // resume would either be ignored or rejected. Verify we only send it on
-  // start.
+  // start — uses a plain (non-openai-compat) flow because openai-compat
+  // never resumes (see #233 session-reuse guard).
   const fake = makeFakeSpawn(() => happyPath());
   const backend = createCodexBackend({ spawn: fake.spawn });
-  const meta = {
-    [OPENAI_COMPAT_EXTENSION_URI]: {
-      tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
-    },
-  };
-  await backend.handle(
-    assign('one', 'ctx-env-resume', {
-      message: {
-        role: 'user',
-        messageId: 'm1',
-        parts: [{ kind: 'text', text: 'one' }],
-        metadata: meta,
-      },
-    }),
-    collect().emit,
-    NEVER,
-  );
-  await backend.handle(
-    assign('two', 'ctx-env-resume', {
-      message: {
-        role: 'user',
-        messageId: 'm2',
-        parts: [{ kind: 'text', text: 'two' }],
-        metadata: meta,
-      },
-    }),
-    collect().emit,
-    NEVER,
-  );
+  await backend.handle(assign('one', 'ctx-env-resume'), collect().emit, NEVER);
+  await backend.handle(assign('two', 'ctx-env-resume'), collect().emit, NEVER);
 
   const frames = fake.lastChild().stdinFrames();
   const resume = findRequest(frames, 'thread/resume');
@@ -1606,10 +1746,12 @@ test('thread/start omits `config` when no caller tools are supplied', async () =
   assert.equal(params?.config, undefined);
 });
 
-test('history-only openai-compat payload (no `tools`) does not disable codex built-ins', async () => {
+test('history-only openai-compat payload (no `tools`) does not disable codex built-ins via features (but still suppresses env_context)', async () => {
   // Mirror of the codex (exec) backend test. With tools absent there is no
   // caller-side dispatch contract to protect; do not handicap codex's
-  // built-ins for this turn.
+  // built-ins for this turn. `include_environment_context: false` still
+  // applies — it's an openai-compat-wide invariant (#233), not gated on
+  // caller-tool dispatch.
   const fake = makeFakeSpawn(() => happyPath());
   const backend = createCodexBackend({ spawn: fake.spawn });
   await backend.handle(
@@ -1633,15 +1775,21 @@ test('history-only openai-compat payload (no `tools`) does not disable codex bui
   );
 
   const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
-  const params = (tsFrame as { params?: { config?: unknown } }).params;
-  assert.equal(params?.config, undefined);
+  const params = (tsFrame as {
+    params?: { config?: { features?: unknown; include_environment_context?: boolean } };
+  }).params;
+  assert.equal(params?.config?.features, undefined);
+  assert.equal(params?.config?.include_environment_context, false);
 });
 
-test('thread/resume re-passes `config.features` because feature flags do not persist across resume (#175)', async () => {
-  // Two turns on the same contextId: first thread/start, second
-  // thread/resume. Both must carry the disable flags — feature settings
-  // are scoped to a single resume span server-side, so a missing config on
-  // resume would silently re-enable shell_tool.
+test('openai-compat tasks always thread/start, never thread/resume — every turn re-sends config.features (#175, #233)', async () => {
+  // The OpenAI Chat Completions request is stateless: gateway replays the
+  // full message history every turn. Reusing a codex thread across turns
+  // would double-feed the model (persisted thread items + injected
+  // `tool_call_history`), which causes the model to drift onto stale
+  // results. So openai-compat opts out of session reuse entirely, and
+  // every turn does `thread/start` with the disable-flags `config.features`
+  // (no `thread/resume` to forget them on).
   const fake = makeFakeSpawn(() => happyPath());
   const backend = createCodexBackend({ spawn: fake.spawn });
   const meta = {
@@ -1650,7 +1798,7 @@ test('thread/resume re-passes `config.features` because feature flags do not per
     },
   };
   await backend.handle(
-    assign('one', 'ctx-feat-resume', {
+    assign('one', 'ctx-feat-no-resume', {
       message: {
         role: 'user',
         messageId: 'm1',
@@ -1662,7 +1810,7 @@ test('thread/resume re-passes `config.features` because feature flags do not per
     NEVER,
   );
   await backend.handle(
-    assign('two', 'ctx-feat-resume', {
+    assign('two', 'ctx-feat-no-resume', {
       message: {
         role: 'user',
         messageId: 'm2',
@@ -1675,14 +1823,13 @@ test('thread/resume re-passes `config.features` because feature flags do not per
   );
 
   const frames = fake.lastChild().stdinFrames();
-  const start = findRequest(frames, 'thread/start');
-  const resume = findRequest(frames, 'thread/resume');
-  assert.ok(start, 'thread/start observed');
-  assert.ok(resume, 'thread/resume observed');
-  const startFeatures = (start as { params?: { config?: { features?: Record<string, boolean> } } })
-    .params?.config?.features;
-  const resumeFeatures = (resume as { params?: { config?: { features?: Record<string, boolean> } } })
-    .params?.config?.features;
-  assert.deepEqual(startFeatures, EXPECTED_OPENAI_COMPAT_DISABLES);
-  assert.deepEqual(resumeFeatures, EXPECTED_OPENAI_COMPAT_DISABLES);
+  const starts = frames.filter((f) => (f as { method?: string }).method === 'thread/start');
+  const resumes = frames.filter((f) => (f as { method?: string }).method === 'thread/resume');
+  assert.equal(starts.length, 2, 'both openai-compat turns thread/start');
+  assert.equal(resumes.length, 0, 'never thread/resume for openai-compat');
+  for (const start of starts) {
+    const features = (start as { params?: { config?: { features?: Record<string, boolean> } } })
+      .params?.config?.features;
+    assert.deepEqual(features, EXPECTED_OPENAI_COMPAT_DISABLES);
+  }
 });
