@@ -1351,11 +1351,20 @@ export function createClaudeBackend(
       // depending on opts; an entirely empty `mcpServers` map skips
       // both `--mcp-config` and the matching `--allowedTools` below.
       const mcpServers: Record<string, { type: string; url: string }> = {};
+      // Registration keys use a `_vb-` ("vicoop-bridge") prefix so they
+      // can't collide with operator-supplied MCP server names under the
+      // same `--mcp-config` map. The previous keys (`vicoop-bridge`,
+      // `caller-tools`) were generic enough that an operator naming
+      // their own MCP server identically would last-wins overwrite the
+      // bridge's entry. The leading underscore marks these as internal
+      // and the short brand prefix keeps the resulting tool ids
+      // (`mcp___vb-<server>__<tool>`) readable. A future merge of these
+      // two servers under #216 would naturally land at a single `_vb`.
       if (mcpServerForTask) {
-        mcpServers['vicoop-bridge'] = { type: 'http', url: mcpServerForTask.url };
+        mcpServers['_vb-send-file'] = { type: 'http', url: mcpServerForTask.url };
       }
       if (callerToolsMcp) {
-        mcpServers['caller-tools'] = { type: 'http', url: callerToolsMcp.url };
+        mcpServers['_vb-caller-tools'] = { type: 'http', url: callerToolsMcp.url };
       }
       const mcpServerNames = Object.keys(mcpServers);
       const mcpConfigArgs: readonly string[] =
