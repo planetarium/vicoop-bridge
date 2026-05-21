@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install / upgrade the claude code CLI into /data/agents/claude/.
 #
-# This script is sourced (or called) by image/install-backend.sh. It must
+# This script is sourced (or called) by container/install-backend.sh. It must
 # define two functions and nothing else side-effecting at load time:
 #
 #   backend_install   <version|""> -> installs into $AGENT_DIR

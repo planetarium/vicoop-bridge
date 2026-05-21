@@ -26,13 +26,13 @@ installs):
 - `Dockerfile` — multi-stage build (node:20-bookworm-slim base, bun
   compiles the client binary, runtime stage installs the system deps each
   agent CLI needs at runtime).
-- `image/entrypoint.sh` — bootstrap modes: headless env-driven setup,
+- `container/entrypoint.sh` — bootstrap modes: headless env-driven setup,
   daemon mode (with `vicoop-client info`-driven compat check), and
   subcommand passthrough.
-- `image/install-backend.sh` + `image/backends/{claude,codex,openclaw}.sh`
+- `container/install-backend.sh` + `container/backends/{claude,codex,openclaw}.sh`
   — per-backend install/upgrade recipes. Operator-callable via
   `docker exec`.
-- `image/init-firewall.sh` — outbound-allowlist firewall ported from
+- `container/init-firewall.sh` — outbound-allowlist firewall ported from
   Anthropic's claude-code reference devcontainer. Domains: bridge server,
   LLM APIs, npm/github. Extend via `VICOOP_EXTRA_ALLOW_DOMAINS`.
 - `release.yml` — pushes the image to `ghcr.io/planetarium/vicoop-bridge-client`

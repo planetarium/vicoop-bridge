@@ -129,10 +129,10 @@ ENV DISABLE_AUTOUPDATER=1
 # Image scripts. The /usr/local/lib path matches install-backend.sh's
 # $VICOOP_LIB default so operators can `docker exec` them without env
 # overrides.
-COPY image/entrypoint.sh        /usr/local/bin/entrypoint.sh
-COPY image/install-backend.sh   /usr/local/lib/vicoop-bridge/install-backend.sh
-COPY image/init-firewall.sh     /usr/local/lib/vicoop-bridge/init-firewall.sh
-COPY image/backends/            /usr/local/lib/vicoop-bridge/backends/
+COPY container/entrypoint.sh        /usr/local/bin/entrypoint.sh
+COPY container/install-backend.sh   /usr/local/lib/vicoop-bridge/install-backend.sh
+COPY container/init-firewall.sh     /usr/local/lib/vicoop-bridge/init-firewall.sh
+COPY container/backends/            /usr/local/lib/vicoop-bridge/backends/
 RUN chmod 755 /usr/local/bin/entrypoint.sh \
               /usr/local/lib/vicoop-bridge/install-backend.sh \
               /usr/local/lib/vicoop-bridge/init-firewall.sh \
