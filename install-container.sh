@@ -52,9 +52,19 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 # --- 1. Pull --------------------------------------------------------------
+# Try to fetch the latest version of the requested tag. If the pull
+# fails but the operator already has a local image with that tag
+# (e.g. a `vicoop-bridge-client:dev` they built themselves while
+# debugging), continue with what's on disk — the pull is a refresh
+# convenience, not a hard requirement.
 log "pulling $IMAGE"
-docker pull "$IMAGE" >/dev/null \
-    || die "docker pull $IMAGE failed"
+if ! docker pull "$IMAGE" >/dev/null 2>&1; then
+    if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        log "pull failed but image is present locally — continuing"
+    else
+        die "docker pull $IMAGE failed and no local image with that tag"
+    fi
+fi
 
 # --- 2. Detect existing setup --------------------------------------------
 needs_wizard=false
