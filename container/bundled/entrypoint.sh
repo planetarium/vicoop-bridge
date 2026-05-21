@@ -218,9 +218,8 @@ wizard() {
 
     printf '\n'
     log 'step 2 of 3 — agent registration'
-    local agent_name agent_id backend_kind
-    read -r -p '  Agent name (e.g. my-claude): ' agent_name
-    read -r -p '  Agent id  (lowercase, hyphen-allowed): ' agent_id
+    local agent_id backend_kind
+    read -r -p '  Agent id  (routing key, e.g. my-claude): ' agent_id
     log    '  Backends:'
     log    '    echo       — smoke test, no LLM'
     log    '    claude     — Anthropic Claude Code'
@@ -228,15 +227,19 @@ wizard() {
     log    '    openclaw   — connects to an external openclaw gateway'
     read -r -p '  Backend: ' backend_kind
 
-    if [[ -z "$agent_name" || -z "$agent_id" || -z "$backend_kind" ]]; then
-        die "all three prompts are required; re-run when ready"
+    if [[ -z "$agent_id" || -z "$backend_kind" ]]; then
+        die "both prompts are required; re-run when ready"
     fi
     case "$backend_kind" in
         echo|claude|codex|openclaw|vicoop-codex) ;;
         *) die64 "backend '$backend_kind' is not one of: echo claude codex openclaw vicoop-codex" ;;
     esac
 
-    if ! vicoop-client agent register --name "$agent_name" --agent-id "$agent_id"; then
+    # `agent register` requires both --name and --agent-id. The wizard
+    # treats the operator-supplied id as both — operators who want a
+    # distinct display label can edit /data/config.json afterward or
+    # use the bare-metal CLI flow.
+    if ! vicoop-client agent register --name "$agent_id" --agent-id "$agent_id"; then
         die "agent register failed"
     fi
     # `agent register` writes server_url + server_token + agent_id into
