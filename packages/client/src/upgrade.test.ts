@@ -9,7 +9,6 @@ import {
   normalizeTag,
   parseChecksum,
   resolvePlatformAsset,
-  runUpgrade,
   sha256File,
   stripSuidBits,
 } from './upgrade.js';
@@ -143,34 +142,5 @@ test('stripSuidBits clears setuid and setgid bits while leaving other modes unto
     assert.equal(mode(both), 0o755, 'both cleared');
   } finally {
     rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// VICOOP_BRIDGE_IMAGE is set by the container image's Dockerfile. The env
-// guard short-circuits before any network IO, so we can exercise it
-// without a fixture server. Exit code 2 is the agreed-upon "use docker
-// pull instead" signal — operators / scripts can distinguish it from
-// generic upgrade failures (exit 1).
-test('runUpgrade exits 2 with image guidance when VICOOP_BRIDGE_IMAGE is set', async () => {
-  const prev = process.env.VICOOP_BRIDGE_IMAGE;
-  const prevWrite = process.stderr.write.bind(process.stderr);
-  process.env.VICOOP_BRIDGE_IMAGE = '0.19.0-test';
-  let captured = '';
-  process.stderr.write = ((chunk: string | Uint8Array) => {
-    captured += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
-    return true;
-  }) as typeof process.stderr.write;
-  try {
-    const code = await runUpgrade({ check: false, force: false });
-    assert.equal(code, 2);
-    assert.match(captured, /container image \(0\.19\.0-test\)/);
-    assert.match(captured, /docker pull/);
-  } finally {
-    process.stderr.write = prevWrite;
-    if (prev === undefined) {
-      delete process.env.VICOOP_BRIDGE_IMAGE;
-    } else {
-      process.env.VICOOP_BRIDGE_IMAGE = prev;
-    }
   }
 });

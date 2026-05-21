@@ -87,21 +87,8 @@ backend_install "$VERSION"
 # Probe the installed binary for its actual version (claude's `stable`
 # / `latest` aliases and npm@latest both leave us guessing otherwise).
 # Empty result is acceptable for recipes that don't expose a binary.
+# Callers that want the version after install should probe the binary
+# directly (`<bin> --version`) rather than relying on a manifest file —
+# see #249 for the rationale.
 INSTALLED_VERSION="$(backend_version)"
 echo "==> installed: $KIND ${INSTALLED_VERSION:-(no version)}" >&2
-
-# Update /data/installed.json. We rewrite it atomically so a partial write
-# during a crash doesn't leave a half-record the entrypoint reads at next
-# boot.
-MANIFEST="$VICOOP_DATA/installed.json"
-TMP="$(mktemp "${MANIFEST}.XXXXXX")"
-# Preserve other backends' entries; only mutate the entry for $KIND.
-if [[ -f "$MANIFEST" ]]; then
-  jq --arg kind "$KIND" --arg ver "$INSTALLED_VERSION" --arg ts "$(date -u +%FT%TZ)" \
-    '.[$kind] = {version: $ver, installedAt: $ts}' "$MANIFEST" > "$TMP"
-else
-  jq -n --arg kind "$KIND" --arg ver "$INSTALLED_VERSION" --arg ts "$(date -u +%FT%TZ)" \
-    '{($kind): {version: $ver, installedAt: $ts}}' > "$TMP"
-fi
-mv "$TMP" "$MANIFEST"
-echo "==> $MANIFEST updated" >&2
