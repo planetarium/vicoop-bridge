@@ -271,8 +271,13 @@ wizard() {
                 if [[ -n "${OPENAI_API_KEY:-}" ]]; then
                     log 'codex auth: OPENAI_API_KEY provided via env; skipping interactive login.'
                 else
-                    log 'codex login — a URL will print; open it, then paste the code back here.'
-                    if ! "$VICOOP_DATA/agents/codex/bin/codex" login; then
+                    # codex's default `login` spins up a localhost:1455
+                    # callback server, which the host browser can't
+                    # reach into the container. `--device-auth` is the
+                    # documented headless / remote-machine flow: prints
+                    # a URL + code, polls for approval.
+                    log 'codex login --device-auth — a URL + code will print; open the URL on any browser.'
+                    if ! "$VICOOP_DATA/agents/codex/bin/codex" login --device-auth; then
                         die "codex login failed; re-run wizard or run it manually via docker exec"
                     fi
                 fi
