@@ -81,18 +81,21 @@ const upgradeCmd = command(
   },
 );
 
-// Read-only self-introspection. Bundles the client's semver and the
-// backend compat manifest. Consumed by external tooling (e.g. #249's
-// agent runtime container orchestrator) that wants to validate the
-// installed agent CLI version against the range this client expects.
+// Read-only self-introspection. Bundles the client's semver, the
+// container image version (when running inside the bundled-direct
+// image, #244 — env `VICOOP_BRIDGE_IMAGE`), and the backend compat
+// manifest. Consumed by the bundled image's entrypoint, by #249's
+// external-runtime orchestrator, and by anyone wanting to validate
+// the installed agent CLI version against the range this client
+// expects.
 const infoCmd = command(
   'info',
   object({
     action: constant('info' as const),
   }),
   {
-    brief: message`Print client + backend compat manifest as JSON.`,
-    description: message`Emits a single JSON object with this client's version and the backend compat manifest. Useful for tooling that orchestrates agent runtimes around the client.`,
+    brief: message`Print client / image / backend metadata as JSON.`,
+    description: message`Emits a single JSON object with this client's version, the bundled image's version (if running inside one — \`VICOOP_BRIDGE_IMAGE\` env), and the backend compat manifest.`,
   },
 );
 
@@ -382,8 +385,10 @@ async function main(): Promise<void> {
       process.exit(await runUpgradeCmd(parsed));
       break;
     case 'info': {
+      const imageVersion = process.env.VICOOP_BRIDGE_IMAGE;
       const payload = {
         version: clientVersion,
+        ...(imageVersion ? { imageVersion } : {}),
         backends: BACKENDS_MANIFEST,
       };
       process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
