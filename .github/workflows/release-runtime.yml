@@ -1,0 +1,75 @@
+name: Release runtime image
+
+# Separate from release.yml — that workflow is the changesets/action
+# pipeline for the @vicoop-bridge/client package binaries. This one
+# rebuilds the agent-agnostic vicoop-runtime image (#249) only when
+# something the image actually depends on changes. The bundled-direct
+# image (#244, container/bundled/) is intentionally not published from
+# CI right now (see #250).
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - container/runtime/**
+      - container/init-firewall.sh
+      - container/install-backend.sh
+      - container/backends/**
+      - .github/workflows/release-runtime.yml
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  release-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      # buildx + qemu enable cross-arch builds (linux/amd64 + linux/arm64)
+      # from the ubuntu-latest x86_64 runner. The runtime image is small
+      # enough that emulated arm64 builds are tolerable; revisit a
+      # native-arm64 runner if cold-build times become a problem.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` + `sha-<short>` is enough for the external-runtime
+      # profile while we iterate. Once the image stabilizes we can wire
+      # a semver tag flow (either piggybacked on the client Version PR
+      # merge in release.yml, or its own changeset-equivalent).
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/vicoop-runtime
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: Build and push runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: container/runtime/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VICOOP_RUNTIME_IMAGE=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
