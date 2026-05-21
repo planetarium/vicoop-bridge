@@ -105,24 +105,47 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
     // (3) compat check — probe the installed binary's version and
     // compare it against the manifest. We fail loudly here rather
     // than at first-task-time so the operator sees the mismatch
-    // before pointing a real bridge at it.
+    // (or the broken install) before pointing a real bridge at it.
+    // A null probe means install-backend.sh "succeeded" but didn't
+    // leave a runnable binary at the expected path, or the binary
+    // doesn't honor --version — both are install failures, not
+    // skippable warnings.
     const installed = await probeBackendVersion(containerName, opts.kind);
-    const supportedRange = BACKENDS_MANIFEST[opts.kind].supportedRange;
     if (!installed) {
-      log.warn(`could not probe installed ${opts.kind} version — skipping compat check`);
-    } else if (!semver.satisfies(installed, supportedRange, { includePrerelease: true })) {
+      log.error(
+        `installed ${opts.kind} did not produce a parseable --version at /data/agents/${opts.kind}/bin/${opts.kind}. ` +
+          `The install recipe likely failed silently; rerun \`vicoop-client container init ${opts.kind}\` and inspect the [install] output.`,
+      );
+      return 1;
+    }
+    const supportedRange = BACKENDS_MANIFEST[opts.kind].supportedRange;
+    if (!semver.satisfies(installed, supportedRange, { includePrerelease: true })) {
       log.error(
         `installed ${opts.kind} ${installed} is outside this client's supportedRange ${supportedRange}`,
       );
       return 1;
-    } else {
-      log.info(`compat check: ${opts.kind} ${installed} satisfies ${supportedRange}`);
     }
+    log.info(`compat check: ${opts.kind} ${installed} satisfies ${supportedRange}`);
 
     // (4) creds. Either copy from host or leave empty for an
     // operator-driven OAuth flow.
     if (opts.fromHost) {
-      await copyHostCreds(containerName, opts.kind, log);
+      try {
+        await copyHostCreds(containerName, opts.kind, log);
+      } catch (err) {
+        // `--from-host` is an explicit opt-in. If the host doesn't
+        // actually have the creds we'd copy, treating that as a
+        // success-with-warning leaves the operator with a runtime
+        // container that will fail the first task on auth. Surface
+        // it now as a non-zero exit and point at the file/keychain
+        // entry we expected.
+        log.error(`--from-host: ${(err as Error).message}`);
+        log.error(
+          `Rerun without --from-host to leave creds empty for an interactive auth flow ` +
+            `(docker exec -it vicoop-runtime-${opts.kind} ${authHintFor(opts.kind)}).`,
+        );
+        return 1;
+      }
     } else {
       log.info(
         `--from-host not set: leaving creds empty. To auth inside the container run\n` +
@@ -211,26 +234,38 @@ async function probeBackendVersion(
   }
 }
 
+// Test seam for the host-creds collectors. Tests provide stub
+// platform / homedir / fs reads / keychain lookups so the missing-
+// creds and found-creds branches can be exercised without touching
+// the real $HOME or macOS Keychain. Production passes nothing and
+// each field defaults to the real node:fs / node:os / `security`
+// CLI call.
+export interface HostCredsEnv {
+  platform?: NodeJS.Platform;
+  homedir?: () => string;
+  existsSync?: (path: string) => boolean;
+  readFileSync?: (path: string) => Buffer;
+  // null => not found (keychain entry absent), throw => lookup failed
+  keychainLookup?: (service: string) => string | null;
+}
+
 // Per-kind host creds discovery + copy into the container creds
-// volume. Each helper returns the bytes-to-write keyed by target
-// path so the writer is one place.
+// volume. Throws with a kind-specific hint when --from-host was
+// requested but the host has no usable creds — the caller surfaces
+// that as a non-zero exit so the operator doesn't end up with a
+// runtime container that will fail auth on the first task.
 async function copyHostCreds(
   containerName: string,
   kind: InstallableBackendKind,
   log: Logger,
+  env: HostCredsEnv = {},
 ): Promise<void> {
-  let files: Array<{ target: string; data: Buffer }> = [];
-  if (kind === 'claude') {
-    files = collectClaudeHostCreds(log);
-  } else if (kind === 'codex') {
-    files = collectCodexHostCreds(log);
-  }
+  const files =
+    kind === 'claude' ? collectClaudeHostCreds(env) : collectCodexHostCreds(env);
   if (files.length === 0) {
-    log.warn(
-      `--from-host: no host creds found for ${kind}; continuing. ` +
-        `Run interactive auth inside the container or rerun with creds present.`,
+    throw new Error(
+      `no host creds found for ${kind}. Expected ${expectedHostCredsHint(kind)}.`,
     );
-    return;
   }
   for (const f of files) {
     await writeContainerFile(containerName, f.target, f.data);
@@ -238,47 +273,79 @@ async function copyHostCreds(
   }
 }
 
-function collectClaudeHostCreds(log: Logger): Array<{ target: string; data: Buffer }> {
+export function collectClaudeHostCreds(
+  env: HostCredsEnv = {},
+): Array<{ target: string; data: Buffer }> {
   // macOS: token lives in the Keychain under "Claude Code-credentials";
   // pull it out via `security` (read-only, no mutation). On linux the
   // CLI persists ~/.claude/.credentials.json — read it directly.
-  if (process.platform === 'darwin') {
+  const platform = env.platform ?? process.platform;
+  if (platform === 'darwin') {
+    const lookup = env.keychainLookup ?? defaultClaudeKeychainLookup;
+    let token: string | null;
     try {
-      const out = execSync(`security find-generic-password -s 'Claude Code-credentials' -w`, {
-        stdio: ['ignore', 'pipe', 'ignore'],
-      })
-        .toString()
-        .trim();
-      if (out.length === 0) return [];
-      return [{ target: '/data/creds/claude/.credentials.json', data: Buffer.from(`${out}\n`) }];
+      token = lookup('Claude Code-credentials');
     } catch {
-      log.warn('--from-host: macOS keychain lookup for claude creds failed');
       return [];
     }
+    if (!token || token.length === 0) return [];
+    return [{ target: '/data/creds/claude/.credentials.json', data: Buffer.from(`${token}\n`) }];
   }
-  const linuxPath = join(homedir(), '.claude', '.credentials.json');
-  if (existsSync(linuxPath)) {
-    return [{ target: '/data/creds/claude/.credentials.json', data: readFileSync(linuxPath) }];
+  const home = (env.homedir ?? homedir)();
+  const existsFn = env.existsSync ?? existsSync;
+  const readFn = env.readFileSync ?? readFileSync;
+  const linuxPath = join(home, '.claude', '.credentials.json');
+  if (existsFn(linuxPath)) {
+    return [{ target: '/data/creds/claude/.credentials.json', data: readFn(linuxPath) }];
   }
   return [];
 }
 
-function collectCodexHostCreds(_log: Logger): Array<{ target: string; data: Buffer }> {
+export function collectCodexHostCreds(
+  env: HostCredsEnv = {},
+): Array<{ target: string; data: Buffer }> {
   // codex stores its OAuth token + config in ~/.codex. We pick up
   // auth.json (token) and config.toml (model/provider config) when
   // present — anything else (sessions, cache) is intentionally
   // left behind so the named volume doesn't fill up with stale
   // local state.
+  const home = (env.homedir ?? homedir)();
+  const existsFn = env.existsSync ?? existsSync;
+  const readFn = env.readFileSync ?? readFileSync;
   const out: Array<{ target: string; data: Buffer }> = [];
-  const authPath = join(homedir(), '.codex', 'auth.json');
-  if (existsSync(authPath)) {
-    out.push({ target: '/data/creds/codex/auth.json', data: readFileSync(authPath) });
+  const authPath = join(home, '.codex', 'auth.json');
+  if (existsFn(authPath)) {
+    out.push({ target: '/data/creds/codex/auth.json', data: readFn(authPath) });
   }
-  const configPath = join(homedir(), '.codex', 'config.toml');
-  if (existsSync(configPath)) {
-    out.push({ target: '/data/creds/codex/config.toml', data: readFileSync(configPath) });
+  const configPath = join(home, '.codex', 'config.toml');
+  if (existsFn(configPath)) {
+    out.push({ target: '/data/creds/codex/config.toml', data: readFn(configPath) });
   }
   return out;
+}
+
+function defaultClaudeKeychainLookup(service: string): string | null {
+  try {
+    const out = execSync(`security find-generic-password -s '${service}' -w`, {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .toString()
+      .trim();
+    return out.length > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+function expectedHostCredsHint(kind: InstallableBackendKind): string {
+  if (kind === 'claude') {
+    return process.platform === 'darwin'
+      ? `a populated macOS Keychain entry named "Claude Code-credentials" ` +
+          `(login first with \`claude setup-token\`), ` +
+          `or ~/.claude/.credentials.json on linux`
+      : `~/.claude/.credentials.json (login first with \`claude setup-token\`)`;
+  }
+  return `~/.codex/auth.json (login first with \`codex login --device-auth\`)`;
 }
 
 // Pipe a small Buffer into `docker exec ... bash -c 'cat > path && chmod 600'`.
