@@ -37,10 +37,17 @@ ENV VICOOP_RUNTIME_IMAGE=$VICOOP_RUNTIME_IMAGE
 #   - tini: PID-1 reaper. agent CLI subprocesses spawn other children
 #     (e.g. claude code -> bash); without tini we leak zombies.
 #   - iptables, ipset, dnsutils, iproute2: init-firewall.sh
+#   - bubblewrap, socat: claude code's per-tool-call sandbox runtime;
+#     without them claude 2.1.x exits 1 with
+#     "sandbox.failIfUnavailable is set — refusing to start without a
+#     working sandbox" on first task. ~5MB combined; cheap insurance
+#     against an agent-CLI-specific landmine in an image whose entire
+#     point is to host claude / codex.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq openssh-client tini \
       iptables ipset dnsutils iproute2 \
+      bubblewrap socat \
  && rm -rf /var/lib/apt/lists/*
 
 # Persistent state root. The host bridge client mounts named volumes
