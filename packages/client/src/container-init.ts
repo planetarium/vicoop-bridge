@@ -41,8 +41,9 @@ export interface ContainerInitOptions {
   // the operator run an interactive auth flow themselves.
   fromHost: boolean;
   // Image override mirrors the daemon path (cli.ts:resolveRuntime).
-  // Resolved by the CLI before this function runs; included here
-  // so tests can pass a stub image without touching env.
+  // Precedence is applied inside runContainerInit:
+  //   opts.image > VICOOP_RUNTIME_IMAGE env > DEFAULT_RUNTIME_IMAGE.
+  // Tests pass an explicit value here to bypass env entirely.
   image?: string;
   // Override the bridge URL forwarded into the container's
   // init-firewall.sh. The CLI defaults this to whatever the daemon
@@ -124,7 +125,7 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
       await copyHostCreds(containerName, opts.kind, log);
     } else {
       log.info(
-        `--no-auth: leaving creds empty. To auth inside the container run\n` +
+        `--from-host not set: leaving creds empty. To auth inside the container run\n` +
           `    docker exec -it vicoop-runtime-${opts.kind} ${authHintFor(opts.kind)}`,
       );
     }
