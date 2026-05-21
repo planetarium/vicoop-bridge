@@ -15,17 +15,24 @@
 //
 //   - createHostSpawn(): the existing behavior (node:child_process.spawn).
 //     Used when `backends.<kind>.runtime === 'host'` (the default).
-//   - createDockerExecSpawn(runtime): runs the same command inside a
-//     long-lived RuntimeContainer via `docker exec`. Returns a
-//     ChildHandle that bridges PassThrough streams to the dockerode
-//     exec stream — close / error events fire when the remote exec
-//     finishes, mirroring what backends expect from a real subprocess.
+//   - createDockerExecSpawn(runtime): runs the same command inside the
+//     RuntimeContainer by shelling out to `docker exec -i`. ChildHandle
+//     is satisfied directly by the spawned process — its stdin /
+//     stdout / stderr are the host-visible pipes, and `close` /
+//     `error` events forward unchanged.
+//
+// Why shell out to the docker CLI instead of dockerode's
+// `exec.start({ hijack: true })`? bun's node:http client doesn't yet
+// implement the HTTP 101 'upgrade' event that docker's hijack
+// protocol relies on (oven-sh/bun#22412 is the in-flight fix). Under
+// node + tsx the dockerode hijack path works; under bun-compiled
+// binaries the stream never delivers data and the backend's
+// initialize / RPC handshake times out. `docker exec` is provided
+// by the same docker installation we already require (Decision §6),
+// so it doesn't add a new dependency — it just routes around bun's
+// missing http feature until the upstream fix lands.
 
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
 import { spawn as nodeSpawn } from 'node:child_process';
-import type { Duplex } from 'node:stream';
-import type { Exec } from 'dockerode';
 import type { RuntimeContainer } from './runtime-container.js';
 
 // Same shape as ClaudeChildHandle / AppServerChildHandle. We keep the
@@ -62,112 +69,28 @@ export function createHostSpawn(): SpawnFn {
     }) as unknown as ChildHandle;
 }
 
-// docker-exec implementation. Each call starts a fresh `docker exec`
-// inside the long-lived runtime container; the returned ChildHandle's
-// streams are wired to the demuxed exec stream and close events fire
-// when the remote process exits (inspect.ExitCode then propagates as
-// the `close` listener's `code`).
+// docker-exec implementation via the `docker` CLI. Each call spawns
+// `docker exec -i [-w CWD] <container> <cmd> <args...>` as a host
+// child process; the returned ChildHandle is just that subprocess
+// (already structurally satisfies ChildHandle). stdin / stdout /
+// stderr forward bidirectionally, close fires when the in-container
+// process exits, and signals propagate via the docker CLI's own
+// handling.
 //
-// `kill` is best-effort: dockerode exec has no direct signal channel.
-// We close stdin and unpipe streams; if the agent process honors EOF
-// on stdin (claude / codex both do for app-server-style protocols)
-// it exits promptly. Hard kill via `container.exec(['kill', '-9', pid])`
-// is out of scope for this PR — a separate issue if cancel-during-task
-// proves laggy in practice.
-export function createDockerExecSpawn(runtime: RuntimeContainer): SpawnFn {
-  return (command, args, options) => makeDockerExecHandle(runtime, command, args, options);
-}
-
-function makeDockerExecHandle(
-  runtime: RuntimeContainer,
-  command: string,
-  args: readonly string[],
-  options: SpawnOptions,
-): ChildHandle {
-  const stdin = new PassThrough();
-  const stdout = new PassThrough();
-  const stderr = new PassThrough();
-  const events = new EventEmitter();
-  let killed = false;
-  let execHandle: Exec | undefined;
-  let stream: Duplex | undefined;
-
-  // Async setup: build the exec, then wire the stream. Any failure
-  // surfaces as a synthetic 'error' event so the backend's existing
-  // child.on('error', ...) handler runs unchanged.
-  void (async () => {
-    try {
-      execHandle = await runtime.exec({
-        command,
-        args,
-        cwd: options.cwd,
-      });
-      // hijack + stdin: returns a duplex stream we can write stdin to
-      // and read multiplexed stdout/stderr from.
-      stream = (await execHandle.start({
-        hijack: true,
-        stdin: true,
-      })) as unknown as Duplex;
-
-      // demuxStream splits the multiplexed docker stream into stdout
-      // and stderr targets. We pass our PassThroughs so consumers (the
-      // backends) see independent stdout / stderr like real child
-      // processes do.
-      runtime.getDocker().modem.demuxStream(stream, stdout, stderr);
-
-      // Forward host-side stdin into the container.
-      stdin.pipe(stream);
-
-      stream.on('end', () => {
-        // Resolve the exit code via inspect once the stream closes.
-        // `inspect()` after end is reliable in dockerode; before it,
-        // ExitCode is null.
-        void (async () => {
-          let code: number | null = null;
-          try {
-            const info = await execHandle?.inspect();
-            code = info?.ExitCode ?? null;
-          } catch {
-            // Ignore — we still need to emit close so the backend's
-            // close handler runs and the task settles.
-          }
-          stdout.end();
-          stderr.end();
-          events.emit('close', code, null);
-        })();
-      });
-      stream.on('error', (err) => events.emit('error', err));
-    } catch (err) {
-      stdout.end();
-      stderr.end();
-      events.emit('error', err instanceof Error ? err : new Error(String(err)));
-    }
-  })();
-
-  return {
-    stdin,
-    stdout,
-    stderr,
-    kill(_signal) {
-      if (killed) return false;
-      killed = true;
-      // Best-effort: close stdin so an EOF-aware agent shuts down,
-      // and forcibly close the docker stream. No signal channel
-      // available through dockerode exec.
-      try {
-        stdin.end();
-      } catch {
-        // ignore
-      }
-      try {
-        stream?.destroy();
-      } catch {
-        // ignore
-      }
-      return true;
-    },
-    on(event, listener) {
-      events.on(event, listener as (...a: unknown[]) => void);
-    },
+// `spawnImpl` is a test seam — production passes through to
+// node:child_process.spawn unchanged.
+export function createDockerExecSpawn(
+  runtime: Pick<RuntimeContainer, 'getContainerName'>,
+  opts?: { spawnImpl?: typeof nodeSpawn },
+): SpawnFn {
+  const containerName = runtime.getContainerName();
+  const spawnImpl = opts?.spawnImpl ?? nodeSpawn;
+  return (command, args, options) => {
+    const dockerArgs = ['exec', '-i'];
+    if (options.cwd) dockerArgs.push('-w', options.cwd);
+    dockerArgs.push(containerName, command, ...args);
+    return spawnImpl('docker', dockerArgs, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }) as unknown as ChildHandle;
   };
 }

@@ -4,96 +4,68 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { createDockerExecSpawn } from './spawn-adapter.js';
 
-// Stub RuntimeContainer surface that spawn-adapter consumes:
-// only `exec()` (returns an Exec-like) and `getDocker()` (whose
-// `modem.demuxStream` splits the duplex stream into stdout/stderr).
-function makeRuntimeStub(opts: {
-  execScript?: (stream: PassThrough) => void;
-  exitCode?: number | null;
-  execStartShouldThrow?: boolean;
-}) {
-  const stream = new PassThrough();
-  const execEvents = new EventEmitter();
-  const exec = {
-    async start(_opts: { hijack: boolean; stdin: boolean }) {
-      if (opts.execStartShouldThrow) throw new Error('exec failed to start');
-      // Schedule the script to run after the consumer wires
-      // listeners (microtask boundary). Simulates the real docker
-      // hijack stream pushing data after start resolves.
-      queueMicrotask(() => opts.execScript?.(stream));
-      return stream;
-    },
-    async inspect() {
-      return { ExitCode: opts.exitCode ?? 0 };
-    },
-  };
-  const recordedCmds: Array<{ command: string; args: readonly string[] }> = [];
-  const runtime = {
-    async exec(spec: { command: string; args: readonly string[]; cwd?: string }) {
-      recordedCmds.push({ command: spec.command, args: spec.args });
-      return exec;
-    },
-    getDocker() {
-      return {
-        modem: {
-          demuxStream(src: PassThrough, stdout: PassThrough, stderr: PassThrough) {
-            // Trivial demux: forward all data to stdout. Tests that
-            // care about stderr can write a multiplex-like marker
-            // themselves; the real dockerode protocol's framing is
-            // out of scope for unit tests.
-            src.on('data', (chunk) => stdout.write(chunk));
-            src.on('end', () => {
-              stdout.end();
-              stderr.end();
-            });
-          },
-        },
-      };
-    },
-  };
-  return { runtime, stream, exec, execEvents, recordedCmds };
+// Capture spawn invocations so we can assert the docker CLI argv
+// shape without actually starting a docker exec. The returned
+// "child" is a stand-in EventEmitter with PassThrough streams that
+// the backend code accepts as ChildHandle.
+function makeSpawnStub() {
+  const calls: Array<{ command: string; args: readonly string[] }> = [];
+  const spawnImpl = ((command: string, args: readonly string[]) => {
+    calls.push({ command, args });
+    const child = new EventEmitter() as EventEmitter & {
+      stdin: PassThrough;
+      stdout: PassThrough;
+      stderr: PassThrough;
+      kill: (sig?: NodeJS.Signals) => boolean;
+    };
+    child.stdin = new PassThrough();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    return child;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  }) as any;
+  return { calls, spawnImpl };
 }
 
-test('docker-exec spawn: emits close with the exec exit code after stream ends', async () => {
-  const stub = makeRuntimeStub({
-    execScript: (stream) => {
-      stream.write('hello\n');
-      stream.end();
-    },
-    exitCode: 0,
-  });
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const spawn = createDockerExecSpawn(stub.runtime as any);
-  const child = spawn('claude', ['--version'], {});
+const runtimeStub = { getContainerName: () => 'vicoop-runtime-test' };
 
-  const collected: Buffer[] = [];
-  child.stdout?.on('data', (chunk: Buffer) => collected.push(chunk));
-
-  const exit = await new Promise<{ code: number | null }>((resolve) => {
-    child.on('close', (code) => resolve({ code }));
-  });
-  assert.equal(exit.code, 0);
-  assert.equal(Buffer.concat(collected).toString(), 'hello\n');
-  assert.deepEqual(stub.recordedCmds, [{ command: 'claude', args: ['--version'] }]);
+test('createDockerExecSpawn: argv shape passes through container + command + args', () => {
+  const { calls, spawnImpl } = makeSpawnStub();
+  const spawn = createDockerExecSpawn(runtimeStub, { spawnImpl });
+  spawn('claude', ['--version'], {});
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, 'docker');
+  assert.deepEqual(calls[0].args, [
+    'exec',
+    '-i',
+    'vicoop-runtime-test',
+    'claude',
+    '--version',
+  ]);
 });
 
-test('docker-exec spawn: surfaces start failures as the child error event', async () => {
-  const stub = makeRuntimeStub({ execStartShouldThrow: true });
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const spawn = createDockerExecSpawn(stub.runtime as any);
+test('createDockerExecSpawn: cwd becomes a docker -w flag', () => {
+  const { calls, spawnImpl } = makeSpawnStub();
+  const spawn = createDockerExecSpawn(runtimeStub, { spawnImpl });
+  spawn('codex', ['app-server'], { cwd: '/workspace' });
+  assert.deepEqual(calls[0].args, [
+    'exec',
+    '-i',
+    '-w',
+    '/workspace',
+    'vicoop-runtime-test',
+    'codex',
+    'app-server',
+  ]);
+});
+
+test('createDockerExecSpawn: handle exposes stdin/stdout/stderr + kill', () => {
+  const { spawnImpl } = makeSpawnStub();
+  const spawn = createDockerExecSpawn(runtimeStub, { spawnImpl });
   const child = spawn('claude', [], {});
-  const err = await new Promise<Error>((resolve) => {
-    child.on('error', (e) => resolve(e));
-  });
-  assert.match(err.message, /exec failed to start/);
-});
-
-test('docker-exec spawn: kill() ends stdin and is idempotent', async () => {
-  const stub = makeRuntimeStub({ execScript: () => {}, exitCode: 137 });
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const spawn = createDockerExecSpawn(stub.runtime as any);
-  const child = spawn('codex', ['app-server'], {});
-  // First kill returns true, second returns false (already killed).
+  assert.ok(child.stdin, 'stdin available');
+  assert.ok(child.stdout, 'stdout available');
+  assert.ok(child.stderr, 'stderr available');
   assert.equal(child.kill('SIGTERM'), true);
-  assert.equal(child.kill('SIGTERM'), false);
 });
