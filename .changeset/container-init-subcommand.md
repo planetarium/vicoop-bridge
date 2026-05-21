@@ -54,16 +54,16 @@ Also threads a `user` option through `RuntimeContainer.exec()` so
 the chown step can run as root inside an image whose default user
 is unprivileged.
 
-Bun compatibility: the docker-exec steps inside `container init`
-and the spawn-adapter's `createDockerExecSpawn` both shell out to
-the `docker` CLI rather than using dockerode's
-`exec.start({ hijack: true })`. bun's node:http client doesn't yet
-implement the HTTP 101 'upgrade' event docker's hijack protocol
-relies on (oven-sh/bun#22412 is the in-flight fix); under a
-bun-compiled vicoop-client the hijack stream deadlocks. dockerode's
-non-hijacked lifecycle calls (pull / volume / create / start /
-stop / inspect) stay on the programmatic API where they work
-cleanly under bun.
+Every docker interaction (the per-step `docker exec` inside
+`container init`, the spawn-adapter's per-task `docker exec`,
+and the runtime container lifecycle calls) goes through the
+`docker` CLI as a child process. The operator-side `docker`
+install is already a hard requirement (Decision §6), so this
+adds no new dependency surface — and it sidesteps oven-sh/bun#22412
+(bun's node:http client doesn't yet emit the HTTP 101 'upgrade'
+event docker's hijack protocol relies on), which would otherwise
+deadlock a bun-compiled vicoop-client the first time it tried to
+stream stdio through a programmatic Docker client.
 
 Out of scope (still PR C-shaped follow-ups if motivated by ops
 feedback):
