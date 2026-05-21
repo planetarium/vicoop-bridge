@@ -88,7 +88,7 @@ Two named volumes, by design (see #244 for the rationale):
 
 | Mount | What lives there |
 |-------|-------------------|
-| `/data` | `config.json`, `installed.json`, `agents/<kind>/...`, `creds/claude/`, `creds/codex/` |
+| `/data` | `config.json`, `agents/<kind>/...`, `creds/claude/`, `creds/codex/` |
 | `/home/node/work` | Working directory the agent CLIs operate in. Bind-mount a host path if you want operator visibility into the agent's edits. |
 
 The image sets `CLAUDE_CONFIG_DIR=/data/creds/claude` and
@@ -158,9 +158,11 @@ docker exec vicoop-bridge \
   /usr/local/lib/vicoop-bridge/install-backend.sh claude@2.1.146
 ```
 
-`install-backend.sh` writes the new version to `/data/installed.json`
-which the entrypoint reads on next boot to compat-check against the
-running bridge client's supported range.
+`install-backend.sh` installs the binary under `/data/agents/<kind>/`
+and exits. On next boot the entrypoint runs a compat check by probing
+each installed backend's `<bin> --version` directly and comparing
+against the supportedRange in `vicoop-client info` — no on-disk
+manifest cache.
 
 ### Inspect the bridge client's manifest
 
@@ -168,7 +170,7 @@ running bridge client's supported range.
 docker exec vicoop-bridge vicoop-client info
 ```
 
-Emits `{version, imageVersion, backends: {<kind>: {supportedRange, installable}}}`.
+Emits `{version, imageVersion, backends: {<kind>: {supportedRange}}}`.
 `docker exec` works because `info` is a passthrough subcommand — the
 entrypoint doesn't gate on config existence for it.
 
