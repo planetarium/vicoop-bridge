@@ -314,9 +314,22 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         cwd: args.codexCwd,
         bridgeUrl: args.server,
       });
+      // Container isolation supersedes codex's sandbox the same way
+      // it supersedes claude's bwrap one: the outer container caps
+      // what the agent can reach, so codex's host-process sandbox
+      // is double-duty. In host mode codex's own default ('read-only')
+      // is the right safety floor; in container mode we lift it to
+      // 'danger-full-access' so codex can actually write to
+      // /workspace and run bash — operator override (--codex-sandbox
+      // / config) still wins for the rare case where someone wants
+      // belt-and-suspenders.
+      const explicitSandbox = coerceCodexSandbox(args, backends.codex?.sandbox_mode);
+      const sandboxMode = runtime
+        ? (explicitSandbox ?? 'danger-full-access')
+        : explicitSandbox;
       const backend = createCodexBackend({
         cwd,
-        sandboxMode: coerceCodexSandbox(args, backends.codex?.sandbox_mode),
+        sandboxMode,
         approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
         ...(spawn ? { spawn: spawn as AppServerSpawnFn } : {}),
       });
