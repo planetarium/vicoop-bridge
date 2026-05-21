@@ -99,9 +99,17 @@ export function defaultOwnerSessionPath(): string {
   return join(resolveConfigDir(), OWNER_SESSION_FILENAME);
 }
 
+// Where the agent CLI actually runs.
+//   - 'host'      : node:child_process.spawn on the bridge-client host
+//                   (today's behavior; default).
+//   - 'container' : `docker exec` into a long-lived vicoop-runtime
+//                   container the bridge client orchestrates (#249).
+export type BackendRuntime = 'host' | 'container';
+
 export interface ClaudeBackendConfig {
   cwd?: string;
   settings?: Record<string, unknown>;
+  runtime?: BackendRuntime;
 }
 
 export interface CodexBackendConfig {
@@ -109,6 +117,7 @@ export interface CodexBackendConfig {
   sandbox_mode?: string;
   /** What to answer when codex requests user approval. Default `decline`. */
   approval_decision?: 'accept' | 'acceptForSession' | 'decline';
+  runtime?: BackendRuntime;
 }
 
 export interface OpenclawBackendConfig {
@@ -186,6 +195,15 @@ const KNOWN_CODEX_SANDBOX_MODES = new Set([
   'workspace-write',
   'danger-full-access',
 ]);
+const KNOWN_BACKEND_RUNTIMES = new Set<BackendRuntime>(['host', 'container']);
+
+function pickBackendRuntime(v: unknown): BackendRuntime | undefined {
+  if (typeof v !== 'string') return undefined;
+  const trimmed = v.trim();
+  return KNOWN_BACKEND_RUNTIMES.has(trimmed as BackendRuntime)
+    ? (trimmed as BackendRuntime)
+    : undefined;
+}
 
 // Hand-edited config files reliably ship malformed entries (typos, wrong
 // types, accidental nesting). Be permissive: drop bad fields silently and
@@ -212,10 +230,12 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
     if (claudeRaw) {
       const cwd = asString(claudeRaw.cwd);
       const settings = asRecord(claudeRaw.settings);
-      if (cwd || settings) {
+      const runtime = pickBackendRuntime(claudeRaw.runtime);
+      if (cwd || settings || runtime) {
         out.claude = {};
         if (cwd) out.claude.cwd = cwd;
         if (settings) out.claude.settings = settings;
+        if (runtime) out.claude.runtime = runtime;
       }
     }
     const codexRaw = asRecord(backends.codex);
@@ -229,11 +249,13 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
         approvalRaw && KNOWN_APPROVAL_DECISIONS.has(approvalRaw)
           ? (approvalRaw as 'accept' | 'acceptForSession' | 'decline')
           : undefined;
-      if (cwd || validSandbox || validApproval) {
+      const runtime = pickBackendRuntime(codexRaw.runtime);
+      if (cwd || validSandbox || validApproval || runtime) {
         out.codex = {};
         if (cwd) out.codex.cwd = cwd;
         if (validSandbox) out.codex.sandbox_mode = validSandbox;
         if (validApproval) out.codex.approval_decision = validApproval;
+        if (runtime) out.codex.runtime = runtime;
       }
     }
     const ocRaw = asRecord(backends.openclaw);

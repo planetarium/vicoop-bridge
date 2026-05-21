@@ -11,13 +11,16 @@ import { run } from '@optique/run';
 import { Client } from './client.js';
 import { echoBackend } from './backends/echo.js';
 import { createOpenclawBackend } from './backends/openclaw.js';
-import { createClaudeBackend } from './backends/claude.js';
+import { createClaudeBackend, type ClaudeSpawnFn } from './backends/claude.js';
 import {
   createCodexBackend,
   type ApprovalDecision,
 } from './backends/codex.js';
+import type { AppServerSpawnFn } from './backends/codex-rpc.js';
 import { createVicoopCodexBackend } from './backends/vicoop-codex.js';
 import type { Backend } from './backend.js';
+import { RuntimeContainer, DEFAULT_RUNTIME_IMAGE } from './runtime-container.js';
+import { createDockerExecSpawn, type SpawnFn } from './spawn-adapter.js';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
 import { BACKENDS_MANIFEST } from './backends-manifest.js';
@@ -237,10 +240,12 @@ function coerceCodexSandbox(
   return undefined;
 }
 
-function pickBackend(name: string, args: Args): Backend {
+async function pickBackend(name: string, args: Args): Promise<Backend> {
   // All backend-specific knobs are now threaded through `args` (merged from
   // flag + config in mergeClientArgs). `pickBackend` just constructs
-  // the right factory with those values; no env reads here.
+  // the right factory with those values; no env reads here — except for
+  // VICOOP_RUNTIME_IMAGE, which is image-identity (mirrors how the
+  // bundled profile resolves VICOOP_BRIDGE_IMAGE).
   const backends = args.backends ?? {};
   switch (name) {
     case 'echo':
@@ -266,18 +271,35 @@ function pickBackend(name: string, args: Args): Backend {
       const settings = args.claudeSettingsFile
         ? readClaudeSettingsFile(args.claudeSettingsFile)
         : backends.claude?.settings;
-      return createClaudeBackend({
+      const { spawn, cwd, runtime } = await resolveRuntime({
+        kind: 'claude',
+        runtime: args.claudeRuntime,
         cwd: args.claudeCwd,
+        bridgeUrl: args.server,
+      });
+      const backend = createClaudeBackend({
+        cwd,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
         settings,
+        ...(spawn ? { spawn: spawn as ClaudeSpawnFn } : {}),
       });
+      return runtime ? withRuntimeStop(backend, runtime) : backend;
     }
-    case 'codex':
-      return createCodexBackend({
+    case 'codex': {
+      const { spawn, cwd, runtime } = await resolveRuntime({
+        kind: 'codex',
+        runtime: args.codexRuntime,
         cwd: args.codexCwd,
+        bridgeUrl: args.server,
+      });
+      const backend = createCodexBackend({
+        cwd,
         sandboxMode: coerceCodexSandbox(args, backends.codex?.sandbox_mode),
         approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
+        ...(spawn ? { spawn: spawn as AppServerSpawnFn } : {}),
       });
+      return runtime ? withRuntimeStop(backend, runtime) : backend;
+    }
     case 'vicoop-codex':
       return createVicoopCodexBackend();
     default:
@@ -287,7 +309,63 @@ function pickBackend(name: string, args: Args): Backend {
   }
 }
 
-function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): void {
+// Resolves the runtime mode for a claude/codex backend.
+//
+// - 'host' (default): nothing to do. The backend factory's built-in
+//   defaultSpawn handles host child_process.spawn unchanged.
+// - 'container': starts a long-lived vicoop-runtime container for this
+//   kind and returns a docker-exec SpawnFn the backend factory plugs
+//   into its spawn slot. cwd, if any, is rewritten to /workspace; the
+//   original host path becomes the bind-mount source.
+async function resolveRuntime(args: {
+  kind: 'claude' | 'codex';
+  runtime: 'host' | 'container' | undefined;
+  cwd: string | undefined;
+  bridgeUrl: string;
+}): Promise<{ spawn?: SpawnFn; cwd?: string; runtime?: RuntimeContainer }> {
+  if ((args.runtime ?? 'host') !== 'container') {
+    return { cwd: args.cwd };
+  }
+  const runtime = new RuntimeContainer({
+    backendKind: args.kind,
+    image: process.env.VICOOP_RUNTIME_IMAGE || DEFAULT_RUNTIME_IMAGE,
+    workspaceDir: args.cwd,
+    bridgeUrl: args.bridgeUrl,
+  });
+  await runtime.start();
+  return {
+    runtime,
+    spawn: createDockerExecSpawn(runtime),
+    // Inside the container the workspace is always /workspace (when
+    // bind-mounted) — backends pass this through to claude/codex as
+    // their --cwd, so the host path the operator typed must not leak
+    // into the container's argv.
+    cwd: args.cwd ? '/workspace' : undefined,
+  };
+}
+
+// Wraps a backend so its stop() also stops the runtime container. The
+// Backend interface's stop() is synchronous and best-effort; we honor
+// that here by fire-and-forgetting runtime.stop(). The
+// `--restart unless-stopped` policy plus this explicit stop means an
+// orderly shutdown ends with no live runtime container, while a hard
+// crash leaves the container alive for the next bridge-client process
+// to reuse (see RuntimeContainer.start() reuse path).
+function withRuntimeStop(backend: Backend, runtime: RuntimeContainer): Backend {
+  return {
+    name: backend.name,
+    handle: backend.handle.bind(backend),
+    ...(backend.resolveCapabilities
+      ? { resolveCapabilities: backend.resolveCapabilities.bind(backend) }
+      : {}),
+    stop: () => {
+      backend.stop?.();
+      void runtime.stop();
+    },
+  };
+}
+
+async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promise<void> {
   const args = resolveDaemonArgs(parsed);
   const agentCard = args.card
     ? AgentCard.parse(JSON.parse(readFileSync(args.card, 'utf8')))
@@ -300,13 +378,17 @@ function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): void {
   // tell whether parsing landed where they expected.
   console.log(`[client] backend: ${args.backend}`);
 
+  // pickBackend is async because container-mode backends boot a
+  // long-lived runtime container before construction (#249).
+  const backend = await pickBackend(args.backend, args);
+
   const client = new Client({
     serverUrl: args.server,
     token: args.token,
     agentId: args.agentId,
     agentCard,
     backendKind: args.backend,
-    backend: pickBackend(args.backend, args),
+    backend,
     // Daemon entrypoint: a fatal terminal close (currently 4014 "client
     // revoked") should drop the process with a non-zero exit so
     // systemd / a parent supervisor sees the revocation as a hard
@@ -437,7 +519,10 @@ async function main(): Promise<void> {
     case 'daemon':
       // Long-running. Do not exit — client.start() keeps the event loop
       // alive and signal handlers will call process.exit on shutdown.
-      runDaemon(parsed);
+      // We await runDaemon's setup phase (which now boots a runtime
+      // container in container-mode) so startup errors surface through
+      // main's catch instead of unhandled rejections.
+      await runDaemon(parsed);
       break;
   }
 }
