@@ -22,6 +22,7 @@ import type { Backend } from './backend.js';
 import { RuntimeContainer, DEFAULT_RUNTIME_IMAGE } from './runtime-container.js';
 import { createDockerExecSpawn, type SpawnFn } from './spawn-adapter.js';
 import { containerCmd, runContainerInitCli } from './container-init.js';
+import isInsideContainer from 'is-inside-container';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
 import { BACKENDS_MANIFEST } from './backends-manifest.js';
@@ -301,13 +302,16 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         cwd: args.claudeCwd,
         bridgeUrl: args.server,
       });
-      // Container mode supersedes claude's bwrap sandbox with the
-      // outer container's own isolation, so the runtime image
-      // deliberately doesn't ship bwrap / socat. Without this
-      // override claude 2.1.x exits 1 on first task with
-      // "sandbox.failIfUnavailable is set" because its default
-      // setting refuses unsandboxed execution.
-      const settings = runtime ? disableClaudeSandboxGuard(baseSettings) : baseSettings;
+      // claude's bwrap sandbox is redundant when *we* are already
+      // isolated — either because the daemon spawned an external
+      // runtime container (`runtime` set) or because the daemon
+      // itself is running inside a container (bundled-direct #244).
+      // Either way the outer container is the real isolation
+      // boundary; layering bwrap inside it just makes the runtime
+      // image carry deps it doesn't need and trips
+      // `sandbox.failIfUnavailable` on first task.
+      const isolated = runtime !== undefined || isInsideContainer();
+      const settings = isolated ? disableClaudeSandboxGuard(baseSettings) : baseSettings;
       const backend = createClaudeBackend({
         cwd,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
@@ -323,17 +327,17 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         cwd: args.codexCwd,
         bridgeUrl: args.server,
       });
-      // Container isolation supersedes codex's sandbox the same way
-      // it supersedes claude's bwrap one: the outer container caps
-      // what the agent can reach, so codex's host-process sandbox
-      // is double-duty. In host mode codex's own default ('read-only')
-      // is the right safety floor; in container mode we lift it to
-      // 'danger-full-access' so codex can actually write to
-      // /workspace and run bash — operator override (--codex-sandbox
-      // / config) still wins for the rare case where someone wants
-      // belt-and-suspenders.
+      // Same reasoning as the claude branch: codex's host-process
+      // sandbox doubles up with the outer container's isolation.
+      // In a true host context (no runtime container, daemon
+      // running directly on the host) codex's own 'read-only'
+      // default is the right safety floor; in isolated contexts
+      // we lift it to 'danger-full-access' so codex can write to
+      // /workspace and run bash. Operator override
+      // (--codex-sandbox / config) still wins.
+      const isolated = runtime !== undefined || isInsideContainer();
       const explicitSandbox = coerceCodexSandbox(args, backends.codex?.sandbox_mode);
-      const sandboxMode = runtime
+      const sandboxMode = isolated
         ? (explicitSandbox ?? 'danger-full-access')
         : explicitSandbox;
       const backend = createCodexBackend({

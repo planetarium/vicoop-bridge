@@ -24,6 +24,7 @@
     "@optique/core": "1.0.2",
     "@optique/run": "1.0.2",
     "@vicoop-bridge/protocol": "workspace:*",
+    "is-inside-container": "^1.0.0",
     "semver": "^7.8.0",
     "ws": "^8.18.0",
     "zod": "^3.23.8"
