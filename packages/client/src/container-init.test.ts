@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runBackendInit } from './backend-init.js';
+import { runContainerInit } from './container-init.js';
 
 // A logger spy good enough for assertions on the "what got logged"
-// surface. Backend init's logger surface is the public contract for
-// operator-facing messages, so it's the right place to anchor tests
-// that don't want to mock the whole dockerode stack.
+// surface. container init's logger surface is the public contract
+// for operator-facing messages, so it's the right place to anchor
+// tests that don't want to mock the whole dockerode stack.
 function makeLogger() {
   const records: Array<{ level: string; args: unknown[] }> = [];
   return {
@@ -22,7 +22,7 @@ function makeLogger() {
 
 test('host runtime is rejected with code 64 and a clear hint', async () => {
   const { logger, records } = makeLogger();
-  const code = await runBackendInit({
+  const code = await runContainerInit({
     kind: 'codex',
     runtime: 'host',
     fromHost: false,

@@ -21,7 +21,7 @@ import { createVicoopCodexBackend } from './backends/vicoop-codex.js';
 import type { Backend } from './backend.js';
 import { RuntimeContainer, DEFAULT_RUNTIME_IMAGE } from './runtime-container.js';
 import { createDockerExecSpawn, type SpawnFn } from './spawn-adapter.js';
-import { backendCmd, runBackendInitCli } from './backend-init.js';
+import { containerCmd, runContainerInitCli } from './container-init.js';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
 import { BACKENDS_MANIFEST } from './backends-manifest.js';
@@ -152,7 +152,7 @@ const cli = longestMatch(
   upgradeCmd,
   infoCmd,
   agentCmd,
-  backendCmd,
+  containerCmd,
   legacyAdminCmds,
   whoamiCmd,
   daemonCmd,
@@ -605,8 +605,8 @@ async function main(): Promise<void> {
     case 'whoami':
       process.exit(await runWhoami(parsed));
       break;
-    case 'backend-init':
-      process.exit(await runBackendInitCli(parsed));
+    case 'container-init':
+      process.exit(await runContainerInitCli(parsed));
       break;
     case 'daemon':
       // Long-running. Do not exit — client.start() keeps the event loop

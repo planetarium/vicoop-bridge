@@ -1,14 +1,14 @@
-// `vicoop-client backend init <kind>` — operator one-shot
+// `vicoop-client container init <kind>` — operator one-shot
 // bootstrap for the external-runtime profile (#249 PR C).
 //
 // Boots the per-backend runtime container, runs the shared
 // install-backend.sh recipe inside it, sanity-checks the resulting
 // binary against this client's supportedRange manifest, and
-// (default) copies the host's existing agent CLI creds into the
-// container-scoped named volume so the operator can immediately go
-// daemon. `--no-auth` skips that copy when the operator wants to
-// hand-roll auth (`docker exec -it vicoop-runtime-<kind> claude
-// setup-token` or codex's device-flow login).
+// (with --from-host) copies the operator's existing agent CLI
+// creds into the container-scoped named volume so the operator can
+// immediately go daemon. Without --from-host the command leaves
+// creds empty and prints the docker-exec incantation for the
+// operator to do an interactive auth flow themselves.
 //
 // Companion to RuntimeContainer (lifecycle) + SpawnAdapter
 // (per-task spawn). RuntimeContainer is the unit of state that
@@ -30,7 +30,7 @@ import { RuntimeContainer, DEFAULT_RUNTIME_IMAGE } from './runtime-container.js'
 import { BACKENDS_MANIFEST, type InstallableBackendKind } from './backends-manifest.js';
 import { createLogger, type Logger } from './logger.js';
 
-export interface BackendInitOptions {
+export interface ContainerInitOptions {
   kind: InstallableBackendKind;
   // Future-proofing — today only 'container' is implemented. host
   // mode prints an actionable error rather than guessing how the
@@ -56,11 +56,11 @@ export interface BackendInitOptions {
 // Operational failures (docker unreachable, install recipe non-zero,
 // compat mismatch) are logged and surface as a non-zero return so
 // the CLI can `process.exit(code)` uniformly.
-export async function runBackendInit(opts: BackendInitOptions): Promise<number> {
+export async function runContainerInit(opts: ContainerInitOptions): Promise<number> {
   const log = opts.logger ?? createLogger();
   if (opts.runtime !== 'container') {
     log.error(
-      `backend init currently supports --runtime container only. ` +
+      `container init currently supports --runtime container only. ` +
         `For host mode, install ${opts.kind} via its official installer and ` +
         `run \`vicoop-client --backend ${opts.kind}\` directly.`,
     );
@@ -129,7 +129,7 @@ export async function runBackendInit(opts: BackendInitOptions): Promise<number> 
       );
     }
 
-    log.info(`backend ${opts.kind} ready. start daemon with:`);
+    log.info(`runtime container for ${opts.kind} ready. start daemon with:`);
     log.info(`    vicoop-client --backend ${opts.kind} --${opts.kind}-runtime container`);
     return 0;
   } finally {
@@ -309,20 +309,28 @@ function authHintFor(kind: InstallableBackendKind): string {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// CLI surface (`vicoop-client backend init <kind> [opts]`)
+// CLI surface (`vicoop-client container init <kind> [opts]`)
 //
 // Lives in the same module as the implementation so the command's
 // flags + the function's options stay obviously paired. cli.ts only
-// imports the top-level `backendCmd` and the dispatcher.
+// imports the top-level `containerCmd` and the dispatcher.
+//
+// Naming: the operator's mental model for this command is "wire up
+// the docker container that hosts my agent CLI" — so the group
+// reads as `container ...`, not `backend ...` (which is reserved
+// internal vocab in the codebase for the Backend interface +
+// BackendKind enum). The agent CLI being installed is still
+// identified by its backend kind (claude / codex) as the
+// positional argument.
 // ──────────────────────────────────────────────────────────────────────────
 
 const BACKEND_KINDS = ['claude', 'codex'] as const;
 const RUNTIME_MODES = ['host', 'container'] as const;
 
-const backendInitSubCmd = command(
+const containerInitSubCmd = command(
   'init',
   object({
-    action: constant('backend-init' as const),
+    action: constant('container-init' as const),
     kind: argument(choice([...BACKEND_KINDS])),
     runtime: withDefault(
       option('--runtime', choice([...RUNTIME_MODES]), {
@@ -348,29 +356,29 @@ const backendInitSubCmd = command(
     ),
   }),
   {
-    brief: message`Bootstrap an external-runtime backend (#249 PR C).`,
-    description: message`One-shot setup for the container-runtime profile: boots the per-backend runtime container, runs the install-backend.sh recipe inside it, verifies the installed CLI version against this client's supportedRange, and (with --from-host) copies the operator's existing host creds into the container creds volume. After this, launch the daemon with \`vicoop-client --backend <kind> --<kind>-runtime container\`.`,
+    brief: message`Bootstrap a per-backend runtime container (#249 PR C).`,
+    description: message`One-shot setup for the container-runtime profile: boots \`vicoop-runtime-<kind>\`, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and (with --from-host) copies the operator's existing host creds into the container creds volume. After this, launch the daemon with \`vicoop-client --backend <kind> --<kind>-runtime container\`.`,
   },
 );
 
-export const backendCmd = command(
-  'backend',
-  longestMatch(backendInitSubCmd),
+export const containerCmd = command(
+  'container',
+  longestMatch(containerInitSubCmd),
   {
-    brief: message`Manage external-runtime backends.`,
-    description: message`Subcommands: \`init\` (boot the runtime container, install the agent CLI, optionally copy host creds). Pairs with the daemon flags \`--claude-runtime container\` / \`--codex-runtime container\`.`,
+    brief: message`Manage per-backend runtime containers.`,
+    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<kind>\`, install the agent CLI, optionally copy host creds). Pairs with the daemon flags \`--claude-runtime container\` / \`--codex-runtime container\`.`,
   },
 );
 
-export type BackendCliArgs = InferValue<typeof backendCmd>;
-export type BackendInitArgs = Extract<BackendCliArgs, { action: 'backend-init' }>;
+export type ContainerCliArgs = InferValue<typeof containerCmd>;
+export type ContainerInitArgs = Extract<ContainerCliArgs, { action: 'container-init' }>;
 
-// Adapter from optique-parsed args → runBackendInit's typed
+// Adapter from optique-parsed args → runContainerInit's typed
 // options. Lives here (not in cli.ts) so the command surface and
 // its dispatcher are obviously co-located.
-export async function runBackendInitCli(args: BackendInitArgs): Promise<number> {
+export async function runContainerInitCli(args: ContainerInitArgs): Promise<number> {
   try {
-    return await runBackendInit({
+    return await runContainerInit({
       kind: args.kind,
       runtime: args.runtime,
       fromHost: args.fromHost,
@@ -378,7 +386,7 @@ export async function runBackendInitCli(args: BackendInitArgs): Promise<number> 
       ...(args.bridgeUrl ? { bridgeUrl: args.bridgeUrl } : {}),
     });
   } catch (err) {
-    console.error(`backend init failed: ${(err as Error).message}`);
+    console.error(`container init failed: ${(err as Error).message}`);
     return 1;
   }
 }
