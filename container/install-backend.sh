@@ -19,7 +19,7 @@ Usage:
   install-backend.sh <kind>[@<version>]
   install-backend.sh <kind> --version <version>
 
-Backends covered by this image: claude, codex, openclaw.
+Backends covered by this image: claude, codex.
 EOF
 }
 
@@ -84,9 +84,9 @@ echo "==> installing $KIND${VERSION:+@$VERSION} into $AGENT_DIR" >&2
 . "$RECIPE"
 backend_install "$VERSION"
 
-# Probe the installed binary for its actual version (npm@latest doesn't
-# tell us what semver it landed on). An empty result is acceptable for
-# recipes that don't have a binary (e.g. openclaw).
+# Probe the installed binary for its actual version (claude's `stable`
+# / `latest` aliases and npm@latest both leave us guessing otherwise).
+# Empty result is acceptable for recipes that don't expose a binary.
 INSTALLED_VERSION="$(backend_version)"
 echo "==> installed: $KIND ${INSTALLED_VERSION:-(no version)}" >&2
 

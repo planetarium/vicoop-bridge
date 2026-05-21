@@ -99,11 +99,13 @@ bootstrap_from_env() {
 }
 
 backend_is_installable() {
-    # Asks the bridge client which backends have a recipe. echo /
-    # vicoop-codex come back as installable:false and we skip them.
+    # Manifest membership is the contract — backends listed under
+    # `.backends` have an install-backend.sh recipe; everything else is a
+    # valid daemon choice with no install step (echo runs in-process,
+    # openclaw's gateway runs out-of-process).
     local kind="$1"
     vicoop-client info \
-      | jq -e --arg kind "$kind" '.backends[$kind].installable // false' >/dev/null
+      | jq -e --arg kind "$kind" '.backends | has($kind)' >/dev/null
 }
 
 backend_already_installed() {

@@ -119,7 +119,7 @@ ENV VICOOP_DATA=/data
 ENV VICOOP_HOME=/data
 ENV CLAUDE_CONFIG_DIR=/data/creds/claude
 ENV CODEX_HOME=/data/creds/codex
-ENV PATH=/data/agents/claude/bin:/data/agents/codex/bin:/data/agents/openclaw/bin:/data/agents/claude/.npm-global/bin:/data/agents/codex/.npm-global/bin:$PATH
+ENV PATH=/data/agents/claude/bin:/data/agents/codex/bin:/data/agents/claude/.npm-global/bin:/data/agents/codex/.npm-global/bin:$PATH
 
 # Disable agent CLI self-updaters inside the container. Each backend's
 # native upgrade flow gets driven from install-backend.sh instead so we
