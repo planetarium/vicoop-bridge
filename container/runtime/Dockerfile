@@ -37,6 +37,16 @@ ENV VICOOP_RUNTIME_IMAGE=$VICOOP_RUNTIME_IMAGE
 #   - tini: PID-1 reaper. agent CLI subprocesses spawn other children
 #     (e.g. claude code -> bash); without tini we leak zombies.
 #   - iptables, ipset, dnsutils, iproute2: init-firewall.sh
+#
+# Intentionally NOT installed: bubblewrap / socat. claude code uses
+# them to sandbox each tool call from the host. In the external-
+# runtime profile the outer container already provides isolation
+# (per-backend named volumes + init-firewall.sh egress allowlist),
+# so layering bwrap inside that container would double-isolate at
+# noticeable image cost without a security benefit. The bridge-client
+# side disables claude's sandbox guard via `sandbox.failIfUnavailable
+# = false` only when runtime === 'container'; host-mode claude keeps
+# its sandbox unchanged.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq openssh-client tini \

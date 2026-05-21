@@ -10,7 +10,7 @@ import { choice, integer, string } from '@optique/core/valueparser';
 import { parse } from '@optique/core/parser';
 import { formatMessage } from '@optique/core/message';
 import type { InferValue } from '@optique/core/parser';
-import type { ClientConfig, BackendConfigs } from './config.js';
+import type { ClientConfig, BackendConfigs, BackendRuntime } from './config.js';
 
 // Public bridge URL baked in so a fresh install on the public deployment
 // needs zero flags. Self-hosters override via --server / config.json. The
@@ -30,6 +30,8 @@ export type CodexSandboxMode = (typeof SANDBOX_MODES)[number];
 
 const BACKEND_KINDS = ['echo', 'openclaw', 'claude', 'codex', 'vicoop-codex'] as const;
 export type BackendKind = (typeof BACKEND_KINDS)[number];
+
+const BACKEND_RUNTIMES = ['host', 'container'] as const;
 
 // Optique daemon-mode grammar. Every operator-tunable knob is a flag here,
 // including the ones that used to be env-only (CLAUDE_CWD, CODEX_SANDBOX_MODE,
@@ -77,6 +79,9 @@ export const daemonFlagsFields = {
   claudeSettingsFile: optional(option('--claude-settings-file', string({ metavar: 'PATH' }), {
     description: message`Path to a JSON file used as Claude \`--settings\`.`,
   })),
+  claudeRuntime: optional(option('--claude-runtime', choice([...BACKEND_RUNTIMES]), {
+    description: message`Where to run \`claude\`. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside a vicoop-runtime container the bridge client orchestrates (#249).`,
+  })),
 
   // Backend-specific (Codex)
   codexCwd: optional(option('--codex-cwd', string({ metavar: 'PATH' }), {
@@ -84,6 +89,9 @@ export const daemonFlagsFields = {
   })),
   codexSandbox: optional(option('--codex-sandbox', choice([...SANDBOX_MODES]), {
     description: message`Codex sandbox mode.`,
+  })),
+  codexRuntime: optional(option('--codex-runtime', choice([...BACKEND_RUNTIMES]), {
+    description: message`Where to run \`codex\`. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside a vicoop-runtime container the bridge client orchestrates (#249).`,
   })),
 
   // Backend-specific (OpenClaw)
@@ -123,8 +131,10 @@ export interface DaemonArgs {
   // env when set; merge logic in cli.ts threads them into backend factories.
   claudeCwd?: string;
   claudeSettingsFile?: string;
+  claudeRuntime?: BackendRuntime;
   codexCwd?: string;
   codexSandbox?: CodexSandboxMode;
+  codexRuntime?: BackendRuntime;
   openclawGateway?: string;
   openclawGatewayToken?: string;
   openclawAgent?: string;
@@ -200,9 +210,11 @@ export function mergeClientArgs(
     backends: config.backends,
     claudeCwd: pick(flags.claudeCwd) || backends.claude?.cwd || undefined,
     claudeSettingsFile: pick(flags.claudeSettingsFile) || undefined,
+    claudeRuntime: flags.claudeRuntime ?? backends.claude?.runtime,
     codexCwd: pick(flags.codexCwd) || backends.codex?.cwd || undefined,
     codexSandbox:
       flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),
+    codexRuntime: flags.codexRuntime ?? backends.codex?.runtime,
     openclawGateway:
       pick(flags.openclawGateway) || backends.openclaw?.gateway_url || undefined,
     openclawGatewayToken:

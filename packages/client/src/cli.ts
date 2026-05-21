@@ -11,13 +11,16 @@ import { run } from '@optique/run';
 import { Client } from './client.js';
 import { echoBackend } from './backends/echo.js';
 import { createOpenclawBackend } from './backends/openclaw.js';
-import { createClaudeBackend } from './backends/claude.js';
+import { createClaudeBackend, type ClaudeSpawnFn } from './backends/claude.js';
 import {
   createCodexBackend,
   type ApprovalDecision,
 } from './backends/codex.js';
+import type { AppServerSpawnFn } from './backends/codex-rpc.js';
 import { createVicoopCodexBackend } from './backends/vicoop-codex.js';
 import type { Backend } from './backend.js';
+import { RuntimeContainer, DEFAULT_RUNTIME_IMAGE } from './runtime-container.js';
+import { createDockerExecSpawn, type SpawnFn } from './spawn-adapter.js';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
 import { BACKENDS_MANIFEST } from './backends-manifest.js';
@@ -237,49 +240,103 @@ function coerceCodexSandbox(
   return undefined;
 }
 
-function pickBackend(name: string, args: Args): Backend {
+// What pickBackend returns. The optional `shutdown` is an async
+// cleanup hook the daemon awaits **before** process.exit — Backend's
+// own `stop()` is documented as synchronous best-effort, which works
+// for kill-a-subprocess but not for "ask docker daemon to stop a
+// container and wait for the SIGTERM grace period to elapse." When
+// shutdown is set, the SIGINT/SIGTERM handler in runDaemon awaits it
+// (under a timeout) so an orderly exit really does end with the
+// runtime container stopped.
+interface PickedBackend {
+  backend: Backend;
+  shutdown?: () => Promise<void>;
+}
+
+async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
   // All backend-specific knobs are now threaded through `args` (merged from
   // flag + config in mergeClientArgs). `pickBackend` just constructs
-  // the right factory with those values; no env reads here.
+  // the right factory with those values; no env reads here — except for
+  // VICOOP_RUNTIME_IMAGE, which is image-identity (mirrors how the
+  // bundled profile resolves VICOOP_BRIDGE_IMAGE).
   const backends = args.backends ?? {};
   switch (name) {
     case 'echo':
-      return echoBackend;
+      return { backend: echoBackend };
     case 'openclaw': {
       // openclaw's persona / system prompt lives in the gateway-side config
       // (`/data/openclaw.json`), not in a per-message field on `chat.send`.
       // Self-identity is surfaced via `vicoop-client whoami` so operators
       // can paste it into their gateway persona; the bridge has no
       // wire-protocol hook to inject it from here.
-      return createOpenclawBackend({
-        url: args.openclawGateway ?? backends.openclaw?.gateway_url,
-        token: args.openclawGatewayToken ?? backends.openclaw?.gateway_token,
-        agent: args.openclawAgent ?? backends.openclaw?.agent,
-        openaiCompatAgent:
-          args.openclawOpenaiCompatAgent ?? backends.openclaw?.openai_compat_agent,
-        taskTimeoutMs: args.openclawTaskTimeoutMs,
-      });
+      return {
+        backend: createOpenclawBackend({
+          url: args.openclawGateway ?? backends.openclaw?.gateway_url,
+          token: args.openclawGatewayToken ?? backends.openclaw?.gateway_token,
+          agent: args.openclawAgent ?? backends.openclaw?.agent,
+          openaiCompatAgent:
+            args.openclawOpenaiCompatAgent ?? backends.openclaw?.openai_compat_agent,
+          taskTimeoutMs: args.openclawTaskTimeoutMs,
+        }),
+      };
     }
     case 'claude': {
       // settings precedence: --claude-settings-file (flag, path on disk) >
       // backends.claude.settings (config). No env layer (#189 §5).
-      const settings = args.claudeSettingsFile
+      const baseSettings = args.claudeSettingsFile
         ? readClaudeSettingsFile(args.claudeSettingsFile)
         : backends.claude?.settings;
-      return createClaudeBackend({
+      const { spawn, cwd, runtime } = await resolveRuntime({
+        kind: 'claude',
+        runtime: args.claudeRuntime,
         cwd: args.claudeCwd,
+        bridgeUrl: args.server,
+      });
+      // Container mode supersedes claude's bwrap sandbox with the
+      // outer container's own isolation, so the runtime image
+      // deliberately doesn't ship bwrap / socat. Without this
+      // override claude 2.1.x exits 1 on first task with
+      // "sandbox.failIfUnavailable is set" because its default
+      // setting refuses unsandboxed execution.
+      const settings = runtime ? disableClaudeSandboxGuard(baseSettings) : baseSettings;
+      const backend = createClaudeBackend({
+        cwd,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
         settings,
+        ...(spawn ? { spawn: spawn as ClaudeSpawnFn } : {}),
       });
+      return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };
     }
-    case 'codex':
-      return createCodexBackend({
+    case 'codex': {
+      const { spawn, cwd, runtime } = await resolveRuntime({
+        kind: 'codex',
+        runtime: args.codexRuntime,
         cwd: args.codexCwd,
-        sandboxMode: coerceCodexSandbox(args, backends.codex?.sandbox_mode),
-        approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
+        bridgeUrl: args.server,
       });
+      // Container isolation supersedes codex's sandbox the same way
+      // it supersedes claude's bwrap one: the outer container caps
+      // what the agent can reach, so codex's host-process sandbox
+      // is double-duty. In host mode codex's own default ('read-only')
+      // is the right safety floor; in container mode we lift it to
+      // 'danger-full-access' so codex can actually write to
+      // /workspace and run bash — operator override (--codex-sandbox
+      // / config) still wins for the rare case where someone wants
+      // belt-and-suspenders.
+      const explicitSandbox = coerceCodexSandbox(args, backends.codex?.sandbox_mode);
+      const sandboxMode = runtime
+        ? (explicitSandbox ?? 'danger-full-access')
+        : explicitSandbox;
+      const backend = createCodexBackend({
+        cwd,
+        sandboxMode,
+        approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
+        ...(spawn ? { spawn: spawn as AppServerSpawnFn } : {}),
+      });
+      return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };
+    }
     case 'vicoop-codex':
-      return createVicoopCodexBackend();
+      return { backend: createVicoopCodexBackend() };
     default:
       throw new Error(
         `unknown backend: ${name} (supported: echo, openclaw, claude, codex, vicoop-codex)`,
@@ -287,7 +344,88 @@ function pickBackend(name: string, args: Args): Backend {
   }
 }
 
-function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): void {
+// Resolves the runtime mode for a claude/codex backend.
+//
+// - 'host' (default): nothing to do. The backend factory's built-in
+//   defaultSpawn handles host child_process.spawn unchanged.
+// - 'container': starts a long-lived vicoop-runtime container for this
+//   kind and returns a docker-exec SpawnFn the backend factory plugs
+//   into its spawn slot. cwd, if any, is rewritten to /workspace; the
+//   original host path becomes the bind-mount source.
+async function resolveRuntime(args: {
+  kind: 'claude' | 'codex';
+  runtime: 'host' | 'container' | undefined;
+  cwd: string | undefined;
+  bridgeUrl: string;
+}): Promise<{ spawn?: SpawnFn; cwd?: string; runtime?: RuntimeContainer }> {
+  if ((args.runtime ?? 'host') !== 'container') {
+    return { cwd: args.cwd };
+  }
+  const runtime = new RuntimeContainer({
+    backendKind: args.kind,
+    image: process.env.VICOOP_RUNTIME_IMAGE || DEFAULT_RUNTIME_IMAGE,
+    workspaceDir: args.cwd,
+    bridgeUrl: args.bridgeUrl,
+  });
+  await runtime.start();
+  return {
+    runtime,
+    spawn: createDockerExecSpawn(runtime),
+    // Inside the container the workspace is always /workspace (when
+    // bind-mounted) — backends pass this through to claude/codex as
+    // their --cwd, so the host path the operator typed must not leak
+    // into the container's argv.
+    cwd: args.cwd ? '/workspace' : undefined,
+  };
+}
+
+// Container-mode override for claude's sandbox guard. Returns a new
+// settings object with `sandbox.failIfUnavailable: false` merged on
+// top of whatever the operator already had. Other sandbox keys —
+// including any future addition from claude-code — are preserved.
+// Exported for unit-testability; daemon-only usage doesn't need to
+// import it from outside cli.ts.
+export function disableClaudeSandboxGuard(
+  base: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...(base ?? {}) };
+  const existing = out.sandbox;
+  const sandbox: Record<string, unknown> =
+    existing && typeof existing === 'object' && !Array.isArray(existing)
+      ? { ...(existing as Record<string, unknown>) }
+      : {};
+  sandbox.failIfUnavailable = false;
+  out.sandbox = sandbox;
+  return out;
+}
+
+// Race a shutdown promise against a timeout. Container stop normally
+// completes within docker's grace period (RuntimeContainer.stop()
+// passes t: 10s) but we don't want a wedged daemon socket to hold
+// SIGINT hostage indefinitely — operators expect ctrl-c to actually
+// exit. Resolves either way; the caller decides whether to surface
+// the timeout in logs.
+const SHUTDOWN_TIMEOUT_MS = 15_000;
+async function runWithShutdownTimeout(shutdown: () => Promise<void>): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      shutdown(),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          console.warn(
+            `[client] runtime shutdown exceeded ${SHUTDOWN_TIMEOUT_MS}ms; exiting anyway`,
+          );
+          resolve();
+        }, SHUTDOWN_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promise<void> {
   const args = resolveDaemonArgs(parsed);
   const agentCard = args.card
     ? AgentCard.parse(JSON.parse(readFileSync(args.card, 'utf8')))
@@ -300,13 +438,17 @@ function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): void {
   // tell whether parsing landed where they expected.
   console.log(`[client] backend: ${args.backend}`);
 
+  // pickBackend is async because container-mode backends boot a
+  // long-lived runtime container before construction (#249).
+  const { backend, shutdown: backendShutdown } = await pickBackend(args.backend, args);
+
   const client = new Client({
     serverUrl: args.server,
     token: args.token,
     agentId: args.agentId,
     agentCard,
     backendKind: args.backend,
-    backend: pickBackend(args.backend, args),
+    backend,
     // Daemon entrypoint: a fatal terminal close (currently 4014 "client
     // revoked") should drop the process with a non-zero exit so
     // systemd / a parent supervisor sees the revocation as a hard
@@ -318,13 +460,33 @@ function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): void {
 
   client.start();
 
-  const shutdown = () => {
-    console.log('\n[client] shutting down');
-    client.stop();
-    process.exit(0);
+  // Async shutdown so the container-mode `runtime.stop()` actually
+  // completes before process.exit. Re-entry guarded: a second
+  // signal (e.g. impatient operator pressing ctrl-c twice) drops to
+  // an immediate exit so the daemon can't get pinned by a wedged
+  // docker socket.
+  let shuttingDown = false;
+  const onSignal = (signal: NodeJS.Signals) => {
+    if (shuttingDown) {
+      console.log(`[client] received second ${signal}; forcing exit`);
+      process.exit(130);
+    }
+    shuttingDown = true;
+    void (async () => {
+      console.log(`\n[client] shutting down (${signal})`);
+      client.stop();
+      if (backendShutdown) {
+        try {
+          await runWithShutdownTimeout(backendShutdown);
+        } catch (err) {
+          console.error('[client] shutdown error:', (err as Error).message);
+        }
+      }
+      process.exit(0);
+    })();
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
 }
 
 async function runUpgradeCmd(args: Extract<CliArgs, { action: 'upgrade' }>): Promise<number> {
@@ -437,7 +599,10 @@ async function main(): Promise<void> {
     case 'daemon':
       // Long-running. Do not exit — client.start() keeps the event loop
       // alive and signal handlers will call process.exit on shutdown.
-      runDaemon(parsed);
+      // We await runDaemon's setup phase (which now boots a runtime
+      // container in container-mode) so startup errors surface through
+      // main's catch instead of unhandled rejections.
+      await runDaemon(parsed);
       break;
   }
 }
