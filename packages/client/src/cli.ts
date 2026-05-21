@@ -240,7 +240,20 @@ function coerceCodexSandbox(
   return undefined;
 }
 
-async function pickBackend(name: string, args: Args): Promise<Backend> {
+// What pickBackend returns. The optional `shutdown` is an async
+// cleanup hook the daemon awaits **before** process.exit — Backend's
+// own `stop()` is documented as synchronous best-effort, which works
+// for kill-a-subprocess but not for "ask docker daemon to stop a
+// container and wait for the SIGTERM grace period to elapse." When
+// shutdown is set, the SIGINT/SIGTERM handler in runDaemon awaits it
+// (under a timeout) so an orderly exit really does end with the
+// runtime container stopped.
+interface PickedBackend {
+  backend: Backend;
+  shutdown?: () => Promise<void>;
+}
+
+async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
   // All backend-specific knobs are now threaded through `args` (merged from
   // flag + config in mergeClientArgs). `pickBackend` just constructs
   // the right factory with those values; no env reads here — except for
@@ -249,21 +262,23 @@ async function pickBackend(name: string, args: Args): Promise<Backend> {
   const backends = args.backends ?? {};
   switch (name) {
     case 'echo':
-      return echoBackend;
+      return { backend: echoBackend };
     case 'openclaw': {
       // openclaw's persona / system prompt lives in the gateway-side config
       // (`/data/openclaw.json`), not in a per-message field on `chat.send`.
       // Self-identity is surfaced via `vicoop-client whoami` so operators
       // can paste it into their gateway persona; the bridge has no
       // wire-protocol hook to inject it from here.
-      return createOpenclawBackend({
-        url: args.openclawGateway ?? backends.openclaw?.gateway_url,
-        token: args.openclawGatewayToken ?? backends.openclaw?.gateway_token,
-        agent: args.openclawAgent ?? backends.openclaw?.agent,
-        openaiCompatAgent:
-          args.openclawOpenaiCompatAgent ?? backends.openclaw?.openai_compat_agent,
-        taskTimeoutMs: args.openclawTaskTimeoutMs,
-      });
+      return {
+        backend: createOpenclawBackend({
+          url: args.openclawGateway ?? backends.openclaw?.gateway_url,
+          token: args.openclawGatewayToken ?? backends.openclaw?.gateway_token,
+          agent: args.openclawAgent ?? backends.openclaw?.agent,
+          openaiCompatAgent:
+            args.openclawOpenaiCompatAgent ?? backends.openclaw?.openai_compat_agent,
+          taskTimeoutMs: args.openclawTaskTimeoutMs,
+        }),
+      };
     }
     case 'claude': {
       // settings precedence: --claude-settings-file (flag, path on disk) >
@@ -283,7 +298,7 @@ async function pickBackend(name: string, args: Args): Promise<Backend> {
         settings,
         ...(spawn ? { spawn: spawn as ClaudeSpawnFn } : {}),
       });
-      return runtime ? withRuntimeStop(backend, runtime) : backend;
+      return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };
     }
     case 'codex': {
       const { spawn, cwd, runtime } = await resolveRuntime({
@@ -298,10 +313,10 @@ async function pickBackend(name: string, args: Args): Promise<Backend> {
         approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
         ...(spawn ? { spawn: spawn as AppServerSpawnFn } : {}),
       });
-      return runtime ? withRuntimeStop(backend, runtime) : backend;
+      return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };
     }
     case 'vicoop-codex':
-      return createVicoopCodexBackend();
+      return { backend: createVicoopCodexBackend() };
     default:
       throw new Error(
         `unknown backend: ${name} (supported: echo, openclaw, claude, codex, vicoop-codex)`,
@@ -344,25 +359,30 @@ async function resolveRuntime(args: {
   };
 }
 
-// Wraps a backend so its stop() also stops the runtime container. The
-// Backend interface's stop() is synchronous and best-effort; we honor
-// that here by fire-and-forgetting runtime.stop(). The
-// `--restart unless-stopped` policy plus this explicit stop means an
-// orderly shutdown ends with no live runtime container, while a hard
-// crash leaves the container alive for the next bridge-client process
-// to reuse (see RuntimeContainer.start() reuse path).
-function withRuntimeStop(backend: Backend, runtime: RuntimeContainer): Backend {
-  return {
-    name: backend.name,
-    handle: backend.handle.bind(backend),
-    ...(backend.resolveCapabilities
-      ? { resolveCapabilities: backend.resolveCapabilities.bind(backend) }
-      : {}),
-    stop: () => {
-      backend.stop?.();
-      void runtime.stop();
-    },
-  };
+// Race a shutdown promise against a timeout. Container stop normally
+// completes within docker's grace period (RuntimeContainer.stop()
+// passes t: 10s) but we don't want a wedged daemon socket to hold
+// SIGINT hostage indefinitely — operators expect ctrl-c to actually
+// exit. Resolves either way; the caller decides whether to surface
+// the timeout in logs.
+const SHUTDOWN_TIMEOUT_MS = 15_000;
+async function runWithShutdownTimeout(shutdown: () => Promise<void>): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      shutdown(),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          console.warn(
+            `[client] runtime shutdown exceeded ${SHUTDOWN_TIMEOUT_MS}ms; exiting anyway`,
+          );
+          resolve();
+        }, SHUTDOWN_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promise<void> {
@@ -380,7 +400,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
 
   // pickBackend is async because container-mode backends boot a
   // long-lived runtime container before construction (#249).
-  const backend = await pickBackend(args.backend, args);
+  const { backend, shutdown: backendShutdown } = await pickBackend(args.backend, args);
 
   const client = new Client({
     serverUrl: args.server,
@@ -400,13 +420,33 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
 
   client.start();
 
-  const shutdown = () => {
-    console.log('\n[client] shutting down');
-    client.stop();
-    process.exit(0);
+  // Async shutdown so the container-mode `runtime.stop()` actually
+  // completes before process.exit. Re-entry guarded: a second
+  // signal (e.g. impatient operator pressing ctrl-c twice) drops to
+  // an immediate exit so the daemon can't get pinned by a wedged
+  // docker socket.
+  let shuttingDown = false;
+  const onSignal = (signal: NodeJS.Signals) => {
+    if (shuttingDown) {
+      console.log(`[client] received second ${signal}; forcing exit`);
+      process.exit(130);
+    }
+    shuttingDown = true;
+    void (async () => {
+      console.log(`\n[client] shutting down (${signal})`);
+      client.stop();
+      if (backendShutdown) {
+        try {
+          await runWithShutdownTimeout(backendShutdown);
+        } catch (err) {
+          console.error('[client] shutdown error:', (err as Error).message);
+        }
+      }
+      process.exit(0);
+    })();
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
 }
 
 async function runUpgradeCmd(args: Extract<CliArgs, { action: 'upgrade' }>): Promise<number> {
