@@ -50,7 +50,7 @@ bootstrap_from_env() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         log "no /data/config.json and no TTY for an interactive setup."
         log "supply the headless bootstrap env vars (missing: ${missing[*]}) or"
-        log "re-run with -it so the interactive wizard can take over (PR 2)."
+        log "re-run with -it so the interactive wizard can take over."
         log ""
         log "minimum env set for headless bootstrap:"
         log "  -e VICOOP_BRIDGE_TOKEN=<your client token>"
@@ -187,6 +187,122 @@ maybe_init_firewall() {
 }
 
 # --------------------------------------------------------------------------
+# Interactive wizard. Triggered when no config exists AND stdin/stdout are
+# both TTYs (i.e. operator launched with `docker run -it`).
+#
+# Walks through:
+#   1. bridge sign-in (vicoop-client auth login — Google OAuth device flow)
+#   2. agent identity prompts (name / id / backend) + agent register
+#   3. backend install (if a recipe exists) + backend OAuth (if no env
+#      token already covers it).
+#
+# Wizard EXITS 0 on success. It does NOT transition into daemon mode —
+# the operator (or install-container.sh wrapper) starts the daemon
+# separately with `docker run -d ...`. Splitting the two phases keeps
+# the wrapper simple and lets manual invokers do their own thing after
+# setup completes.
+# --------------------------------------------------------------------------
+wizard() {
+    printf '\n'
+    log '====================================================='
+    log '  vicoop-bridge — first-time setup'
+    log '====================================================='
+    printf '\n'
+
+    log 'step 1 of 3 — bridge sign-in (Google OAuth device flow)'
+    log 'a URL + user code will print below; open the URL in any browser.'
+    printf '\n'
+    if ! vicoop-client auth login; then
+        die "auth login failed"
+    fi
+
+    printf '\n'
+    log 'step 2 of 3 — agent registration'
+    local agent_name agent_id backend_kind
+    read -r -p '  Agent name (e.g. my-claude): ' agent_name
+    read -r -p '  Agent id  (lowercase, hyphen-allowed): ' agent_id
+    log    '  Backends:'
+    log    '    echo       — smoke test, no LLM'
+    log    '    claude     — Anthropic Claude Code'
+    log    '    codex      — OpenAI Codex'
+    log    '    openclaw   — connects to an external openclaw gateway'
+    read -r -p '  Backend: ' backend_kind
+
+    if [[ -z "$agent_name" || -z "$agent_id" || -z "$backend_kind" ]]; then
+        die "all three prompts are required; re-run when ready"
+    fi
+    case "$backend_kind" in
+        echo|claude|codex|openclaw|vicoop-codex) ;;
+        *) die64 "backend '$backend_kind' is not one of: echo claude codex openclaw vicoop-codex" ;;
+    esac
+
+    if ! vicoop-client agent register --name "$agent_name" --agent-id "$agent_id"; then
+        die "agent register failed"
+    fi
+    # `agent register` writes server_url + server_token + agent_id into
+    # config.json. Inject the operator's backend choice — daemon flag /
+    # config field that `agent register` doesn't set.
+    local tmp
+    tmp="$(mktemp "${CONFIG}.XXXXXX")"
+    jq --arg bk "$backend_kind" '.backend = $bk' "$CONFIG" > "$tmp"
+    mv "$tmp" "$CONFIG"
+    chmod 600 "$CONFIG"
+
+    printf '\n'
+    log "step 3 of 3 — backend setup ($backend_kind)"
+    if backend_is_installable "$backend_kind"; then
+        "$VICOOP_LIB/install-backend.sh" "$backend_kind"
+        printf '\n'
+
+        case "$backend_kind" in
+            claude)
+                if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+                    log 'claude auth: CLAUDE_CODE_OAUTH_TOKEN provided via env; skipping interactive login.'
+                elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+                    log 'claude auth: ANTHROPIC_API_KEY provided via env; skipping interactive login.'
+                else
+                    log 'claude auth login — a URL will print; open it, then paste the code back here.'
+                    if ! "$VICOOP_DATA/agents/claude/bin/claude" auth login --claudeai; then
+                        die "claude auth login failed; re-run wizard or run it manually via docker exec"
+                    fi
+                fi
+                ;;
+            codex)
+                if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+                    log 'codex auth: OPENAI_API_KEY provided via env; skipping interactive login.'
+                else
+                    log 'codex login — a URL will print; open it, then paste the code back here.'
+                    if ! "$VICOOP_DATA/agents/codex/bin/codex" login; then
+                        die "codex login failed; re-run wizard or run it manually via docker exec"
+                    fi
+                fi
+                ;;
+        esac
+    else
+        log "no image-side install step for '$backend_kind' (gateway / built-in / non-installable)."
+        log "  echo / openclaw / vicoop-codex are valid daemon backends but skip the install step."
+    fi
+
+    printf '\n'
+    log '====================================================='
+    log '  setup complete'
+    log '====================================================='
+    log ''
+    log 'config written to /data/config.json; tokens + creds in /data.'
+    log 'start the daemon container:'
+    log ''
+    log "    docker run -d --restart unless-stopped \\"
+    log "      --name vicoop-bridge \\"
+    log "      -v vicoop-data:/data \\"
+    log "      -v vicoop-work:/home/node/work \\"
+    log "      --cap-add NET_ADMIN --cap-add NET_RAW \\"
+    log "      ghcr.io/planetarium/vicoop-bridge-client"
+    log ''
+    log '(or just re-run install-container.sh — it picks up from here.)'
+    printf '\n'
+}
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 # Daemon mode is the bare invocation or flags-only. Subcommands like
@@ -204,8 +320,11 @@ is_daemon_invocation() {
 if is_daemon_invocation "$@"; then
     if [[ ! -f "$CONFIG" ]]; then
         if [[ -t 0 && -t 1 ]]; then
-            log "TTY detected but interactive wizard isn't shipped yet (PR 2)."
-            log "use the headless env-bootstrap path for now — see below."
+            # Interactive wizard. Exits 0 on success and we exit too —
+            # daemon-mode is a separate `docker run -d ...` (or the
+            # install-container.sh wrapper handles it).
+            wizard
+            exit 0
         fi
         bootstrap_from_env || exit $?
     else

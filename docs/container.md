@@ -2,9 +2,21 @@
 
 This document covers the **bundled-direct deployment profile**: a single
 container image (`container/bundled/Dockerfile`) hosting both the bridge
-client and the agent CLI install machinery. The headless / env-driven
-path is described below; an interactive setup wizard for first-time
-operators is on a separate branch and not yet merged.
+client and the agent CLI install machinery. Two operator paths inside
+the profile:
+
+- **Interactive setup wizard** (the easy path, recommended for first-
+  time operators with a TTY available). A wrapper script
+  ([`install-container.sh`](#interactive-wizard-install-containersh))
+  drives `docker pull`, the one-shot wizard, and the long-lived daemon
+  in a single command.
+- **Headless env-driven setup** (for CI / automation / hosts where the
+  operator already provisioned tokens elsewhere). Documented in the
+  "Headless / case A" section below.
+
+Both paths produce the same `/data` volume layout and run the same
+image — the wizard just collects the same inputs interactively that
+the env path expects pre-baked.
 
 An alternative deployment profile — **external-runtime** ([#249][249]) —
 keeps the bridge client bare-metal on the host and spawns per-backend
@@ -34,7 +46,58 @@ bridge server, so the container exposes zero inbound ports.
 - Base: `node:20-bookworm-slim`
 - Size: ~250 MB before any agent CLI is installed
 
-## Quick start
+## Interactive wizard (`install-container.sh`)
+
+The recommended path for first-time operators. One command on the host
+takes care of `docker pull`, an interactive wizard (bridge OAuth +
+agent register + per-backend OAuth), and a long-lived daemon container
+with `--restart unless-stopped`. Subsequent invocations skip the
+wizard but refresh the daemon (useful after `docker pull`).
+
+```bash
+# from a clone of this repo
+./install-container.sh
+
+# or one-liner via curl
+curl -fsSL https://raw.githubusercontent.com/planetarium/vicoop-bridge/main/install-container.sh | bash
+```
+
+You'll be walked through three steps inside a one-shot `-it`
+container:
+
+1. **bridge sign-in** — Google OAuth device flow. A URL + user code
+   prints; open the URL in any browser, enter the code.
+2. **agent registration** — prompts for `name`, `agent-id`, and
+   `backend` (echo / claude / codex / openclaw). Writes
+   `/data/config.json`.
+3. **backend setup** — `install-backend.sh` installs the chosen CLI
+   (claude / codex) into `/data/agents/<kind>/`, then walks its own
+   OAuth flow. Skipped when an equivalent token is already in env
+   (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`).
+
+Wizard exits on completion. The wrapper then starts a fresh detached
+daemon container (`-d --restart unless-stopped`) bound to the same
+named volumes, so the daemon picks up the config the wizard just
+wrote.
+
+Environment variable overrides for the wrapper:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `VICOOP_IMAGE` | `ghcr.io/planetarium/vicoop-bridge-client:latest` | image to pull |
+| `VICOOP_CONTAINER` | `vicoop-bridge` | name for the daemon container |
+| `VICOOP_DATA_VOLUME` | `vicoop-data` | named volume for `/data` |
+| `VICOOP_WORK_VOLUME` | `vicoop-work` | named volume for `/home/node/work` |
+
+The wizard is non-destructive on re-run: if a `config.json` already
+exists in the data volume, the wrapper skips it and just refreshes
+the daemon.
+
+## Headless / case A — env-driven
+
+When you'd rather provision tokens on a host (CI, automation, fleet
+deploys), you can bypass the wizard entirely by pre-baking the
+bootstrap env vars.
 
 You need three things:
 
