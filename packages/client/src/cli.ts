@@ -20,6 +20,7 @@ import { createVicoopCodexBackend } from './backends/vicoop-codex.js';
 import type { Backend } from './backend.js';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
+import { BACKENDS_MANIFEST } from './backends-manifest.js';
 import { authLoginCmd, loginCmd, runAuthLogin, runLogin } from './login.js';
 import { authLogoutCmd, logoutCmd, runAuthLogout, runLogout } from './logout.js';
 import { setupCmd, runAgentRegister, runSetup } from './setup.js';
@@ -80,6 +81,22 @@ const upgradeCmd = command(
   },
 );
 
+// Read-only self-introspection. Bundles the client's semver, the container
+// image semver (when running inside the image), and the backend compat
+// manifest. Primarily consumed by the image's entrypoint to decide whether
+// /data/installed.json is still compatible after an image bump; also useful
+// for `docker exec ... vicoop-client info` troubleshooting.
+const infoCmd = command(
+  'info',
+  object({
+    action: constant('info' as const),
+  }),
+  {
+    brief: message`Print client / image / backend metadata as JSON.`,
+    description: message`Emits a single JSON object with this client's version, the container image's version (if running inside one — \`VICOOP_BRIDGE_IMAGE\` env), and the backend compat manifest. Bare-metal operators rarely need this; the image entrypoint shells out to it.`,
+  },
+);
+
 // Daemon mode is the bare invocation (no subcommand). `constant('daemon')`
 // gives the dispatch switch a discriminator alongside the named commands.
 // `daemonFlagsFields` is the raw parser-field map exported from cli-args.ts
@@ -115,6 +132,7 @@ const cli = longestMatch(
   logoutCmd,
   setupCmd,
   upgradeCmd,
+  infoCmd,
   agentCmd,
   addCallerCmd,
   removeCallerCmd,
@@ -364,6 +382,17 @@ async function main(): Promise<void> {
     case 'upgrade':
       process.exit(await runUpgradeCmd(parsed));
       break;
+    case 'info': {
+      const imageVersion = process.env.VICOOP_BRIDGE_IMAGE;
+      const payload = {
+        version: clientVersion,
+        ...(imageVersion ? { imageVersion } : {}),
+        backends: BACKENDS_MANIFEST,
+      };
+      process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
+      process.exit(0);
+      break;
+    }
     case 'agent-register':
       process.exit(await runAgentRegister(parsed));
       break;

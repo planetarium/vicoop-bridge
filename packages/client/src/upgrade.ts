@@ -71,7 +71,28 @@ export function assetName(version: string, asset: PlatformAsset = resolvePlatfor
   return `vicoop-client-${version}-${asset.slug}${asset.ext}`;
 }
 
+// The vicoop-bridge-client container image bakes its semver into
+// VICOOP_BRIDGE_IMAGE. The bridge client binary lives in the image's layer,
+// so writing a new one via this self-upgrade path "works" until the next
+// `docker recreate` reverts it — a confusing UX trap. Refuse early and point
+// the operator at the right channel (image tag bump via docker pull).
+const CONTAINER_IMAGE_ENV = 'VICOOP_BRIDGE_IMAGE';
+const CONTAINER_IMAGE_REPO = 'ghcr.io/planetarium/vicoop-bridge-client';
+
 export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
+  const imageVersion = process.env[CONTAINER_IMAGE_ENV];
+  if (imageVersion) {
+    err(
+      `running inside vicoop-bridge container image (${imageVersion}); ` +
+        'self-upgrade is disabled because the binary lives in the image layer ' +
+        'and will revert on container recreate.',
+    );
+    err('to update, bump the image tag:');
+    err(`  docker pull ${CONTAINER_IMAGE_REPO}:<tag>`);
+    err('  docker compose up -d   # or restart the container');
+    return 2;
+  }
+
   const execPath = process.execPath;
   log(`current: ${clientVersion} (${execPath})`);
 
