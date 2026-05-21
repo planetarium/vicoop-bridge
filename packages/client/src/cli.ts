@@ -283,7 +283,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
     case 'claude': {
       // settings precedence: --claude-settings-file (flag, path on disk) >
       // backends.claude.settings (config). No env layer (#189 §5).
-      const settings = args.claudeSettingsFile
+      const baseSettings = args.claudeSettingsFile
         ? readClaudeSettingsFile(args.claudeSettingsFile)
         : backends.claude?.settings;
       const { spawn, cwd, runtime } = await resolveRuntime({
@@ -292,6 +292,13 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         cwd: args.claudeCwd,
         bridgeUrl: args.server,
       });
+      // Container mode supersedes claude's bwrap sandbox with the
+      // outer container's own isolation, so the runtime image
+      // deliberately doesn't ship bwrap / socat. Without this
+      // override claude 2.1.x exits 1 on first task with
+      // "sandbox.failIfUnavailable is set" because its default
+      // setting refuses unsandboxed execution.
+      const settings = runtime ? disableClaudeSandboxGuard(baseSettings) : baseSettings;
       const backend = createClaudeBackend({
         cwd,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
@@ -357,6 +364,26 @@ async function resolveRuntime(args: {
     // into the container's argv.
     cwd: args.cwd ? '/workspace' : undefined,
   };
+}
+
+// Container-mode override for claude's sandbox guard. Returns a new
+// settings object with `sandbox.failIfUnavailable: false` merged on
+// top of whatever the operator already had. Other sandbox keys —
+// including any future addition from claude-code — are preserved.
+// Exported for unit-testability; daemon-only usage doesn't need to
+// import it from outside cli.ts.
+export function disableClaudeSandboxGuard(
+  base: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...(base ?? {}) };
+  const existing = out.sandbox;
+  const sandbox: Record<string, unknown> =
+    existing && typeof existing === 'object' && !Array.isArray(existing)
+      ? { ...(existing as Record<string, unknown>) }
+      : {};
+  sandbox.failIfUnavailable = false;
+  out.sandbox = sandbox;
+  return out;
 }
 
 // Race a shutdown promise against a timeout. Container stop normally
