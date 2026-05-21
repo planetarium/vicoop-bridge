@@ -24,13 +24,11 @@
     "@optique/core": "1.0.2",
     "@optique/run": "1.0.2",
     "@vicoop-bridge/protocol": "workspace:*",
-    "dockerode": "^5.0.0",
     "semver": "^7.8.0",
     "ws": "^8.18.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@types/dockerode": "^4.0.1",
     "@types/semver": "^7.7.1",
     "@types/ws": "^8.5.13"
   }

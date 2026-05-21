@@ -26,14 +26,17 @@ New surface:
   existing `ClaudeSpawnFn` / `AppServerSpawnFn` shape regardless of
   mode. The host implementation is the same `node:child_process.spawn`
   the backends use today; the container implementation runs the
-  command via `docker exec` inside the runtime container and bridges
-  stdin/stdout/stderr to PassThrough streams so backends see a normal
-  child-handle.
-- `dockerode` is a new runtime dependency (#249 Decision §1).
+  command via `docker exec` (shelled out as a child process) so the
+  backend sees a normal child-handle either way.
+- All docker interactions go through the `docker` CLI as child
+  processes — image pull, volume / container lifecycle, and the
+  per-task `docker exec` for agent spawn. No programmatic Docker
+  client library; the operator-side `docker` install we already
+  require (Decision §6) is the dependency surface.
 
 Decisions reflected (#249 §Decisions):
 
-- §1 dockerode (programmatic API, not shell-out).
+- §1 docker CLI as the daemon-interaction surface.
 - §2 `--restart unless-stopped` + bridge-client-side reuse on restart.
 - §3 Per-backend long-lived only; no per-context runtime.
 - §4 Creds in a container-only named volume — the host's `~/.claude`
