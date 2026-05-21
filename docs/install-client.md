@@ -173,13 +173,9 @@ saved owner-session to call `registerClient` and mint a one-time
 `AGENT_TOKEN`. No wallet or SIWE required.
 
 ```sh
-HOSTNAME=$(hostname)
-CLIENT_NAME="openclaw on ${HOSTNAME%%.*}"
-
 "$INSTALL_DIR/vicoop-client" auth login
 
 "$INSTALL_DIR/vicoop-client" agent register \
-  --name "$CLIENT_NAME" \
   --agent-id "$AGENT_ID" \
   --caller "eth:0x<40-hex>"
 ```
@@ -198,7 +194,6 @@ consolidated config layout. The success output looks like:
 ```text
   agent_id         openclaw-my-host
   owner_principal  google:sub:<sub>
-  name             openclaw on my-host
 
 The AGENT_TOKEN is one-time — the bridge cannot reissue it.
   agent register persists it to the canonical config below; --json prints it to
@@ -324,7 +319,6 @@ compose with shell tooling (no disk side effects, raw response on stdout):
 
 ```sh
 "$INSTALL_DIR/vicoop-client" agent register \
-  --name "$CLIENT_NAME" \
   --agent-id "$AGENT_ID" \
   --caller "eth:0x<40-hex>" --json \
   | tee /tmp/vicoop-agent.json
@@ -692,7 +686,6 @@ published release:
 ```sh
 # Step 4 login saves the owner-session bearer, so these work without re-authenticating:
 "$INSTALL_DIR/vicoop-client" agent register \
-  --name "$CLIENT_NAME" \
   --agent-id "$AGENT_ID" \
   --caller "eth:0x<40-hex>"
 "$INSTALL_DIR/vicoop-client" agent list --connected

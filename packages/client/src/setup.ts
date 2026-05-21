@@ -65,9 +65,6 @@ export const agentRegisterCmd = command(
   'register',
   object({
     action: constant('agent-register' as const),
-    name: option('--name', string({ metavar: 'NAME' }), {
-      description: message`Human-readable label saved with this agent registration.`,
-    }),
     agentId: option('--agent-id', string({ metavar: 'ID' }), {
       description: message`Agent id (routing key external A2A callers will use). After #219 the server enforces a single agent per registration.`,
     }),
@@ -524,7 +521,6 @@ function renderAgentRegisterSuccessBlock(success: ClientRegisterSuccess): string
   return [
     `  agent_id         ${success.allowed_agent_ids[0] ?? ''}`,
     `  owner_principal  ${success.owner_principal}`,
-    `  name             ${success.client_name}`,
   ].join('\n');
 }
 
@@ -540,7 +536,7 @@ function renderAgentRegisterRecoveryBlock(success: ClientRegisterSuccess, server
 export async function runSetup(args: SetupArgs): Promise<number> {
   process.stderr.write(
     '[warning] `vicoop-client setup` is deprecated; ' +
-      'use `vicoop-client agent register --name NAME --agent-id ID` instead. ' +
+      'use `vicoop-client agent register --agent-id ID` instead. ' +
       'The deprecated form will be removed in a future release.\n',
   );
   // `--caller` is repeatable AND accepts comma-separated values within each
@@ -571,8 +567,13 @@ export async function runAgentRegister(args: AgentRegisterArgs): Promise<number>
   const callers = args.callers.flatMap((c) =>
     c.split(',').map((s) => s.trim()).filter(Boolean),
   );
+  // `clientName` is required by the server's `register_client` SQL function
+  // (NOT NULL on `agents.name` / `clients.client_name`) but is no longer
+  // operator-supplied — it's pure display metadata that no authz / lookup
+  // path depends on. Default to the agent id so the field stays populated
+  // without surfacing a redundant flag in the CLI.
   return executeRegistration({
-    name: args.name,
+    name: args.agentId,
     allowedAgentIds: [args.agentId],
     callers,
     envFile: args.envFile ?? args.envFileAlias ?? null,

@@ -896,16 +896,15 @@ test('setup quotes env values so shell metacharacters cannot trigger expansion',
 // ---- New `agent register` surface (#224) -----------------------------------
 
 function agentRegisterArgs(
-  p: { name: string; agentId: string }
-    & Partial<Omit<AgentRegisterArgs, 'action' | 'name' | 'agentId'>>,
+  p: { agentId: string }
+    & Partial<Omit<AgentRegisterArgs, 'action' | 'agentId'>>,
 ): AgentRegisterArgs {
   const {
-    name, agentId,
+    agentId,
     callers = [], envFile, envFileAlias, server, token, json = false,
   } = p;
   return {
     action: 'agent-register',
-    name,
     agentId,
     callers,
     envFile,
@@ -1003,7 +1002,7 @@ test('agent register calls registerClient with a 1-element allowedAgentIds and w
   const fix = installAgentRegisterFixture(t);
 
   const code = await runAgentRegister(agentRegisterArgs({
-    name: 'codex on Mac', agentId: 'codex-Mac', envFile: fix.envFile,
+    agentId: 'codex-Mac', envFile: fix.envFile,
   }));
 
   assert.equal(code, 0);
@@ -1014,7 +1013,9 @@ test('agent register calls registerClient with a 1-element allowedAgentIds and w
   // GraphQL mutation body is JSON-encoded, so inner double quotes appear
   // escaped as \" — accept either form.
   assert.match(fix.calls[0].body, /allowedAgentIds:\[\\"codex-Mac\\"\]/);
-  assert.match(fix.calls[0].body, /clientName:\\"codex on Mac\\"/);
+  // `--name` was removed; the daemon defaults `clientName` to the agent id
+  // (server schema still requires a non-empty name). Asserts the fallback.
+  assert.match(fix.calls[0].body, /clientName:\\"codex-Mac\\"/);
 
   const config = readConfig(join(fix.tmpHome, '.vicoop', 'config.json'));
   assert.deepEqual(config, {
@@ -1024,11 +1025,11 @@ test('agent register calls registerClient with a 1-element allowedAgentIds and w
   });
 });
 
-test('agent register stderr surfaces agent-first labels (agent_id, name, AGENT_TOKEN)', async (t) => {
+test('agent register stderr surfaces agent-first labels (agent_id, AGENT_TOKEN)', async (t) => {
   const fix = installAgentRegisterFixture(t);
 
   const code = await runAgentRegister(agentRegisterArgs({
-    name: 'codex on Mac', agentId: 'codex-Mac',
+    agentId: 'codex-Mac',
   }));
 
   assert.equal(code, 0);
@@ -1036,7 +1037,9 @@ test('agent register stderr surfaces agent-first labels (agent_id, name, AGENT_T
   // Operator-supplied agent_id (not the server's registration UUID) is the
   // primary identifier in the success block.
   assert.match(out, /agent_id\s+codex-Mac/);
-  assert.match(out, /name\s+codex on Mac/);
+  // The `name` line was removed alongside `--name`; the field would have just
+  // echoed the agent id back, so dropping it kills the redundancy.
+  assert.doesNotMatch(out, /^\s*name\s/m);
   assert.match(out, /The AGENT_TOKEN is one-time/);
   assert.match(out, /agent register persists it to the canonical config/);
   // Recovery hint and "add caller" pointer also use the new vocabulary.
@@ -1055,7 +1058,7 @@ test('agent register --json prints the registerClient response shape unchanged f
   });
 
   const code = await runAgentRegister(agentRegisterArgs({
-    name: 'codex on Mac', agentId: 'codex-Mac', json: true,
+    agentId: 'codex-Mac', json: true,
   }));
 
   assert.equal(code, 0);
@@ -1072,7 +1075,7 @@ test('agent register configures callers when --caller is passed', async (t) => {
   const fix = installAgentRegisterFixture(t);
 
   const code = await runAgentRegister(agentRegisterArgs({
-    name: 'codex on Mac', agentId: 'codex-Mac',
+    agentId: 'codex-Mac',
     callers: ['eth:0xabc'],
   }));
 
@@ -1097,7 +1100,7 @@ test('legacy setup prints a stderr deprecation warning pointing at agent registe
   assert.equal(code, 0);
   assert.match(
     fix.stderr(),
-    /vicoop-client setup.*deprecated.*vicoop-client agent register --name NAME --agent-id ID/s,
+    /vicoop-client setup.*deprecated.*vicoop-client agent register --agent-id ID/s,
   );
   // Old vocabulary stays present on the legacy surface (back-compat for scripts
   // that parse stderr) — only the new path uses agent-first labels.
