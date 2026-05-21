@@ -183,6 +183,13 @@ export class RuntimeContainer {
     return this.container;
   }
 
+  // Canonical container name for this backend kind. Used by
+  // spawn-adapter's docker-exec implementation (which shells out to
+  // the docker CLI for bun-compat reasons — see spawn-adapter.ts).
+  getContainerName(): string {
+    return containerName(this.opts.backendKind);
+  }
+
   // ──────────────────────────────────────────────────────────────────
   private async ensureDaemonReachable(): Promise<void> {
     try {

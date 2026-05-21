@@ -18,8 +18,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { PassThrough } from 'node:stream';
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import semver from 'semver';
 import { longestMatch, object } from '@optique/core/constructs';
 import { optional, withDefault } from '@optique/core/modifiers';
@@ -78,15 +77,16 @@ export async function runBackendInit(opts: BackendInitOptions): Promise<number> 
   try {
     await runtime.start();
 
+    const containerName = `vicoop-runtime-${opts.kind}`;
+
     // (1) chown the per-kind sub-trees so subsequent install-backend
     // (running as the image's `node` user) can mkdir into them.
     // Docker creates named-volume mount points root-owned even when
     // the image pre-creates them with chown — the volume's empty
     // state takes over at mount time. This is the documented
     // workaround.
-    await execAndStream(runtime, {
-      command: 'chown',
-      args: ['-R', 'node:node', `/data/agents/${opts.kind}`, `/data/creds/${opts.kind}`],
+    await dockerExecStream(containerName, {
+      cmd: ['chown', '-R', 'node:node', `/data/agents/${opts.kind}`, `/data/creds/${opts.kind}`],
       user: '0',
       label: 'chown',
       log,
@@ -95,9 +95,8 @@ export async function runBackendInit(opts: BackendInitOptions): Promise<number> 
     // (2) install the agent CLI into /data/agents/<kind>/ via the
     // shared shell recipe baked into the runtime image. node user;
     // the binary lands in /data/agents/<kind>/bin/<kind>.
-    await execAndStream(runtime, {
-      command: '/usr/local/lib/vicoop-bridge/install-backend.sh',
-      args: [opts.kind],
+    await dockerExecStream(containerName, {
+      cmd: ['/usr/local/lib/vicoop-bridge/install-backend.sh', opts.kind],
       label: 'install',
       log,
     });
@@ -106,7 +105,7 @@ export async function runBackendInit(opts: BackendInitOptions): Promise<number> 
     // compare it against the manifest. We fail loudly here rather
     // than at first-task-time so the operator sees the mismatch
     // before pointing a real bridge at it.
-    const installed = await probeBackendVersion(runtime, opts.kind);
+    const installed = await probeBackendVersion(containerName, opts.kind);
     const supportedRange = BACKENDS_MANIFEST[opts.kind].supportedRange;
     if (!installed) {
       log.warn(`could not probe installed ${opts.kind} version — skipping compat check`);
@@ -122,7 +121,7 @@ export async function runBackendInit(opts: BackendInitOptions): Promise<number> 
     // (4) creds. Either copy from host or leave empty for an
     // operator-driven OAuth flow.
     if (opts.fromHost) {
-      await copyHostCreds(runtime, opts.kind, log);
+      await copyHostCreds(containerName, opts.kind, log);
     } else {
       log.info(
         `--no-auth: leaving creds empty. To auth inside the container run\n` +
@@ -141,37 +140,49 @@ export async function runBackendInit(opts: BackendInitOptions): Promise<number> 
   }
 }
 
-// Stream a docker-exec command's stdout/stderr to the host
-// console + reject on non-zero exit. Used by the chown / install /
-// version-probe steps where we want the operator to see the
-// install recipe's output in real time.
-async function execAndStream(
-  runtime: RuntimeContainer,
+// Run `docker exec [--user U] <container> <cmd...>` with stdio
+// inherited so the operator sees install-backend's npm/native-binary
+// download chatter in real time. Throws on non-zero exit.
+//
+// History: an earlier draft used `runtime.exec()` + dockerode's
+// hijacked stream + an end/close event wait. That worked under tsx
+// but the bun-compiled binary never observed stream 'end' on
+// docker's hijacked socket — the await hung forever and bun
+// exited 0 with no diagnostic when the microtask queue drained.
+// Shelling out to the docker CLI keeps the boot-strap path
+// portable across runtimes; the dockerode-driven lifecycle
+// (start/stop/pull/volume) stays on the programmatic path because
+// those calls *do* work cleanly under bun.
+async function dockerExecStream(
+  containerName: string,
   opts: {
-    command: string;
-    args: readonly string[];
+    cmd: readonly string[];
     user?: string;
     label: string;
     log: Logger;
   },
 ): Promise<void> {
-  opts.log.info(`[${opts.label}] ${opts.command} ${opts.args.join(' ')}`);
-  const exec = await runtime.exec({
-    command: opts.command,
-    args: opts.args,
-    ...(opts.user ? { user: opts.user } : {}),
+  opts.log.info(`[${opts.label}] ${opts.cmd.join(' ')}`);
+  const args = ['exec'];
+  if (opts.user) args.push('--user', opts.user);
+  args.push(containerName, ...opts.cmd);
+  await runDockerCli(args);
+}
+
+function runDockerCli(args: string[], stdin?: Buffer): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('docker', args, {
+      stdio: [stdin !== undefined ? 'pipe' : 'ignore', 'inherit', 'inherit'],
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`docker ${args[0]} exited with code ${code}`));
+    });
+    if (stdin !== undefined && child.stdin) {
+      child.stdin.end(stdin);
+    }
   });
-  const stream = await exec.start({ hijack: true, stdin: true });
-  const stdout = new PassThrough();
-  const stderr = new PassThrough();
-  runtime.getDocker().modem.demuxStream(stream, stdout, stderr);
-  stdout.on('data', (chunk) => process.stdout.write(chunk));
-  stderr.on('data', (chunk) => process.stderr.write(chunk));
-  await new Promise<void>((resolve) => stream.on('end', resolve));
-  const info = await exec.inspect();
-  if (info.ExitCode !== 0) {
-    throw new Error(`[${opts.label}] exited with code ${info.ExitCode}`);
-  }
 }
 
 // Quietly run `<kind> --version` and extract a semver-shaped token.
@@ -181,33 +192,29 @@ async function execAndStream(
 // for the first `X.Y.Z` (with optional pre-release / build suffix)
 // anywhere in the line. Same convention container/backends/*.sh
 // uses for its own backend_version function.
+//
+// Uses docker CLI (not dockerode) for the same bun-compatibility
+// reason as dockerExecStream — see its history comment.
 async function probeBackendVersion(
-  runtime: RuntimeContainer,
+  containerName: string,
   kind: InstallableBackendKind,
 ): Promise<string | null> {
-  const exec = await runtime.exec({
-    command: `/data/agents/${kind}/bin/${kind}`,
-    args: ['--version'],
-  });
-  const stream = await exec.start({ hijack: true, stdin: true });
-  const stdout = new PassThrough();
-  const stderr = new PassThrough();
-  runtime.getDocker().modem.demuxStream(stream, stdout, stderr);
-  const chunks: Buffer[] = [];
-  stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
-  await new Promise<void>((resolve) => stream.on('end', resolve));
-  const info = await exec.inspect();
-  if (info.ExitCode !== 0) return null;
-  const out = Buffer.concat(chunks).toString();
-  const match = out.match(/\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/);
-  return match?.[0] ?? null;
+  try {
+    const out = execSync(`docker exec ${containerName} /data/agents/${kind}/bin/${kind} --version`, {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).toString();
+    const match = out.match(/\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/);
+    return match?.[0] ?? null;
+  } catch {
+    return null;
+  }
 }
 
 // Per-kind host creds discovery + copy into the container creds
 // volume. Each helper returns the bytes-to-write keyed by target
 // path so the writer is one place.
 async function copyHostCreds(
-  runtime: RuntimeContainer,
+  containerName: string,
   kind: InstallableBackendKind,
   log: Logger,
 ): Promise<void> {
@@ -225,7 +232,7 @@ async function copyHostCreds(
     return;
   }
   for (const f of files) {
-    await writeContainerFile(runtime, f.target, f.data);
+    await writeContainerFile(containerName, f.target, f.data);
     log.info(`copied ${kind} creds → ${f.target}`);
   }
 }
@@ -273,26 +280,26 @@ function collectCodexHostCreds(_log: Logger): Array<{ target: string; data: Buff
   return out;
 }
 
-// Write a small file into the container by piping through
-// `bash -c 'cat > <target>'`. Uses dockerode exec so we don't shell
-// out to the `docker` CLI; the dependency surface stays consistent
-// with the rest of the runtime module.
+// Pipe a small Buffer into `docker exec ... bash -c 'cat > path && chmod 600'`.
+// Uses the docker CLI for the same bun-compatibility reason as
+// dockerExecStream — dockerode's hijacked-stream stdin pipe is the
+// one part of dockerode that doesn't survive bun compilation.
 async function writeContainerFile(
-  runtime: RuntimeContainer,
+  containerName: string,
   targetPath: string,
   data: Buffer,
 ): Promise<void> {
-  const exec = await runtime.exec({
-    command: 'bash',
-    args: ['-c', `cat > ${targetPath} && chmod 600 ${targetPath}`],
-  });
-  const stream = await exec.start({ hijack: true, stdin: true });
-  stream.end(data);
-  await new Promise<void>((resolve) => stream.on('end', resolve));
-  const info = await exec.inspect();
-  if (info.ExitCode !== 0) {
-    throw new Error(`failed to write ${targetPath} (exit ${info.ExitCode})`);
-  }
+  await runDockerCli(
+    [
+      'exec',
+      '-i',
+      containerName,
+      'bash',
+      '-c',
+      `cat > ${targetPath} && chmod 600 ${targetPath}`,
+    ],
+    data,
+  );
 }
 
 function authHintFor(kind: InstallableBackendKind): string {
