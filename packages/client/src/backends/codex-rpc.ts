@@ -28,8 +28,16 @@ export type AppServerSpawnFn = (
 ) => AppServerChildHandle;
 
 // Default spawn — node:child_process.spawn cast to our minimal surface.
+// On Windows the `codex` bin lands as a `.cmd` shim; bare `spawn` without
+// `shell:true` fails with ENOENT on the shim. Route through the shell on
+// win32. `command`/`args` are module-internal — no operator-supplied
+// tokens enter the argv.
 export const defaultAppServerSpawn: AppServerSpawnFn = (command, args, options) =>
-  nodeSpawn(command, args, { cwd: options.cwd, stdio: ['pipe', 'pipe', 'pipe'] }) as unknown as AppServerChildHandle;
+  nodeSpawn(command, args, {
+    cwd: options.cwd,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    shell: process.platform === 'win32',
+  }) as unknown as AppServerChildHandle;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Narrow typed views of the app-server protocol. We do NOT pull in the 81
