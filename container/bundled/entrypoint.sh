@@ -33,7 +33,6 @@ export VICOOP_HOME
 DEFAULT_BRIDGE_URL="${VICOOP_BRIDGE_URL:-wss://vicoop-bridge-server.fly.dev}"
 
 CONFIG="$VICOOP_DATA/config.json"
-INSTALLED="$VICOOP_DATA/installed.json"
 
 log()  { printf '[entrypoint] %s\n' "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
@@ -109,42 +108,46 @@ backend_is_installable() {
 }
 
 backend_already_installed() {
+    # Probe the recipe's expected binary directly — no installed.json
+    # cache. Recipes that don't produce a binary (e.g. echo-style) are
+    # always "installed" in the trivial sense.
     local kind="$1"
-    [[ -f "$INSTALLED" ]] || return 1
-    jq -e --arg kind "$kind" '.[$kind].version // empty' "$INSTALLED" >/dev/null
+    local bin="$VICOOP_DATA/agents/$kind/bin/$kind"
+    [[ -x "$bin" ]]
 }
 
 # --------------------------------------------------------------------------
 # Daemon-mode compatibility check.
-# Compares /data/installed.json against `vicoop-client info` for every
-# backend that has both a recorded version and a supportedRange.
+# Probes each installable backend's binary for its version and compares
+# against the supportedRange `vicoop-client info` advertises. Empty
+# probes / unbounded ranges are skipped.
 # --------------------------------------------------------------------------
 compat_check() {
-    [[ -f "$INSTALLED" ]] || return 0  # nothing recorded yet — nothing to check
-    local info installed
+    local info
     info="$(vicoop-client info)"
-    installed="$(cat "$INSTALLED")"
 
-    # For every <kind> in installed.json: read its version, look up its
-    # supportedRange in info, and ask node's semver to compare. We shell
-    # out to node because the alpine-style `semver` CLI isn't installed
-    # by default; node is in this image regardless of whether bun is.
-    local kinds kind version range
-    kinds="$(jq -r 'keys[]' <<< "$installed")"
+    local kinds kind range bin actual
+    kinds="$(jq -r '.backends | keys[]' <<< "$info")"
     while IFS= read -r kind; do
         [[ -z "$kind" ]] && continue
-        version="$(jq -r --arg k "$kind" '.[$k].version // empty' <<< "$installed")"
-        range="$(jq   -r --arg k "$kind" '.backends[$k].supportedRange // empty' <<< "$info")"
-        if [[ -z "$version" || -z "$range" || "$range" == "*" ]]; then
-            continue
-        fi
+        bin="$VICOOP_DATA/agents/$kind/bin/$kind"
+        [[ -x "$bin" ]] || continue  # not installed -> nothing to check
+
+        range="$(jq -r --arg k "$kind" '.backends[$k].supportedRange // empty' <<< "$info")"
+        [[ -z "$range" || "$range" == "*" ]] && continue
+
+        # Take the first whitespace-separated token from `<bin> --version`
+        # as the semver. Recipes that don't print a semver get skipped.
+        actual="$("$bin" --version 2>/dev/null | awk '{print $1; exit}' || true)"
+        [[ -z "$actual" ]] && continue
+
         if ! node -e "
             const semver = require('semver');
-            if (!semver.satisfies('$version', '$range')) {
+            if (!semver.satisfies('$actual', '$range')) {
                 process.exit(2);
             }
         " 2>/dev/null; then
-            die64 "backend '$kind' version $version is outside this image's supported range '$range'. To fix:
+            die64 "backend '$kind' version $actual is outside this image's supported range '$range'. To fix:
     docker exec <container> $VICOOP_LIB/install-backend.sh $kind@<version-in-range>
 or pull a newer / older image whose supportedRange covers the installed version."
         fi

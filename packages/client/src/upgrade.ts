@@ -71,11 +71,14 @@ export function assetName(version: string, asset: PlatformAsset = resolvePlatfor
   return `vicoop-client-${version}-${asset.slug}${asset.ext}`;
 }
 
-// The vicoop-bridge-client container image bakes its semver into
-// VICOOP_BRIDGE_IMAGE. The bridge client binary lives in the image's layer,
-// so writing a new one via this self-upgrade path "works" until the next
-// `docker recreate` reverts it — a confusing UX trap. Refuse early and point
-// the operator at the right channel (image tag bump via docker pull).
+// The vicoop-bridge-client container image (bundled-direct profile,
+// #244) bakes its semver into VICOOP_BRIDGE_IMAGE. The bridge client
+// binary lives in the image's layer, so writing a new one via this
+// self-upgrade path "works" until the next `docker recreate` reverts
+// it — a confusing UX trap. Refuse early and point the operator at
+// the right channel (image tag bump via docker pull). The external-
+// runtime profile (#249) leaves this env unset, so bare-metal upgrade
+// is unaffected.
 const CONTAINER_IMAGE_ENV = 'VICOOP_BRIDGE_IMAGE';
 const CONTAINER_IMAGE_REPO = 'ghcr.io/planetarium/vicoop-bridge-client';
 

@@ -146,11 +146,11 @@ test('stripSuidBits clears setuid and setgid bits while leaving other modes unto
   }
 });
 
-// VICOOP_BRIDGE_IMAGE is set by the container image's Dockerfile. The env
-// guard short-circuits before any network IO, so we can exercise it
-// without a fixture server. Exit code 2 is the agreed-upon "use docker
-// pull instead" signal — operators / scripts can distinguish it from
-// generic upgrade failures (exit 1).
+// The bundled-direct image (#244) sets VICOOP_BRIDGE_IMAGE on the
+// runtime. The env guard short-circuits before any network IO so we
+// can exercise it without a fixture server. Exit code 2 is the
+// agreed-upon "use docker pull instead" signal — operators / scripts
+// can distinguish it from generic upgrade failures (exit 1).
 test('runUpgrade exits 2 with image guidance when VICOOP_BRIDGE_IMAGE is set', async () => {
   const prev = process.env.VICOOP_BRIDGE_IMAGE;
   const prevWrite = process.stderr.write.bind(process.stderr);

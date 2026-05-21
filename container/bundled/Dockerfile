@@ -1,18 +1,24 @@
 # syntax=docker/dockerfile:1.6
 #
-# vicoop-bridge-client container image. Two stages:
+# vicoop-bridge — bundled-direct deployment profile. The bridge client +
+# agent CLI install machinery share one image; the operator runs a single
+# container. The alternative profile (#249) keeps the bridge bare-metal
+# and spawns a per-backend agent runtime container; both profiles
+# coexist.
+#
+# Two stages:
 #
 #   1. build  — `bun build --compile` produces a self-contained vicoop-client
-#               native binary for linux-x64. The build stage uses pnpm to
-#               install workspace deps + builds the protocol package whose
-#               dist/index.js is resolved by bun at compile time.
+#               native binary. The build stage uses pnpm to install workspace
+#               deps and builds the protocol package whose dist/index.js
+#               is resolved by bun at compile time.
 #   2. runtime — node:20-bookworm-slim with the system tools each agent CLI
 #               needs at runtime (node, git, curl, jq). Backend CLIs are
 #               NOT baked into the image; entrypoint.sh installs them into
 #               /data on first boot.
 #
-# See docs/container.md for operator-facing usage; see #244 for the design
-# this implements.
+# See docs/container.md for operator-facing usage; see #244 (this profile)
+# and #249 (external-runtime profile) for the design.
 
 ARG NODE_BASE=node:20-bookworm-slim
 ARG BUN_VERSION=1.2.20
@@ -129,10 +135,10 @@ ENV DISABLE_AUTOUPDATER=1
 # Image scripts. The /usr/local/lib path matches install-backend.sh's
 # $VICOOP_LIB default so operators can `docker exec` them without env
 # overrides.
-COPY container/entrypoint.sh        /usr/local/bin/entrypoint.sh
-COPY container/install-backend.sh   /usr/local/lib/vicoop-bridge/install-backend.sh
-COPY container/init-firewall.sh     /usr/local/lib/vicoop-bridge/init-firewall.sh
-COPY container/backends/            /usr/local/lib/vicoop-bridge/backends/
+COPY container/bundled/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY container/install-backend.sh    /usr/local/lib/vicoop-bridge/install-backend.sh
+COPY container/init-firewall.sh      /usr/local/lib/vicoop-bridge/init-firewall.sh
+COPY container/backends/             /usr/local/lib/vicoop-bridge/backends/
 RUN chmod 755 /usr/local/bin/entrypoint.sh \
               /usr/local/lib/vicoop-bridge/install-backend.sh \
               /usr/local/lib/vicoop-bridge/init-firewall.sh \
