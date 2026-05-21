@@ -20,7 +20,12 @@ set -euo pipefail
 CLAUDE_RELEASES_BASE="https://downloads.claude.ai/claude-code-releases"
 
 backend_install() {
-  local requested="${1:-stable}"
+  # Default to `latest` rather than `stable` — Anthropic's own install.sh
+  # downloads from the `latest` channel ("which has the most up-to-date
+  # installer"), and container builds disable claude's auto-updater so a
+  # `stable`-default would lag behind operator expectations. Operators
+  # who want the conservative track can pass `claude@stable` explicitly.
+  local requested="${1:-latest}"
   local version
 
   # Channel aliases ("stable", "latest") get resolved by fetching the
