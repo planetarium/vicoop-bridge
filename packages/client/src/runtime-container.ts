@@ -130,11 +130,16 @@ export class RuntimeContainer {
   // Run a one-shot command inside the long-lived runtime container.
   // Returns the dockerode Exec handle; the caller (spawn-adapter)
   // wires its stream into the ChildHandle the backends consume.
+  //
+  // `user` lets backend init do the one-time chown step against
+  // named volumes that mount in root-owned (anonymous-bind path).
+  // Default unset → docker uses the image's configured USER (node).
   async exec(opts: {
     command: string;
     args: readonly string[];
     cwd?: string;
     env?: readonly string[];
+    user?: string;
   }): Promise<Exec> {
     if (!this.started || !this.container) {
       throw new Error('runtime container not started');
@@ -147,6 +152,7 @@ export class RuntimeContainer {
       Tty: false,
       ...(opts.cwd ? { WorkingDir: opts.cwd } : {}),
       ...(opts.env && opts.env.length > 0 ? { Env: [...opts.env] } : {}),
+      ...(opts.user ? { User: opts.user } : {}),
     });
   }
 

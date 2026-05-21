@@ -21,6 +21,7 @@ import { createVicoopCodexBackend } from './backends/vicoop-codex.js';
 import type { Backend } from './backend.js';
 import { RuntimeContainer, DEFAULT_RUNTIME_IMAGE } from './runtime-container.js';
 import { createDockerExecSpawn, type SpawnFn } from './spawn-adapter.js';
+import { backendCmd, runBackendInitCli } from './backend-init.js';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
 import { BACKENDS_MANIFEST } from './backends-manifest.js';
@@ -131,6 +132,18 @@ const authCmd = command(
   },
 );
 
+// Deprecated flat aliases — kept for backward-compat (DEPRECATION_HINTS
+// in admin-cli.ts) but folded into one slot so optique's longestMatch
+// overload table doesn't blow up as we keep adding top-level commands.
+const legacyAdminCmds = longestMatch(
+  addCallerCmd,
+  removeCallerCmd,
+  listCallersCmd,
+  listAgentsCmd,
+  listClientsCmd,
+  revokeClientCmd,
+);
+
 const cli = longestMatch(
   authCmd,
   loginCmd,
@@ -139,12 +152,8 @@ const cli = longestMatch(
   upgradeCmd,
   infoCmd,
   agentCmd,
-  addCallerCmd,
-  removeCallerCmd,
-  listCallersCmd,
-  listAgentsCmd,
-  listClientsCmd,
-  revokeClientCmd,
+  backendCmd,
+  legacyAdminCmds,
   whoamiCmd,
   daemonCmd,
 );
@@ -595,6 +604,9 @@ async function main(): Promise<void> {
       break;
     case 'whoami':
       process.exit(await runWhoami(parsed));
+      break;
+    case 'backend-init':
+      process.exit(await runBackendInitCli(parsed));
       break;
     case 'daemon':
       // Long-running. Do not exit — client.start() keeps the event loop
