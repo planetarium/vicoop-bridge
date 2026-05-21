@@ -24,8 +24,12 @@
 // `vicoop-runtime-<kind>` shape keeps it human-readable and easy to
 // `docker exec` / `docker logs` into from the host.
 
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import Docker from 'dockerode';
-import type { Container, ContainerInspectInfo, Exec } from 'dockerode';
+import type { Container, ContainerInspectInfo, DockerOptions, Exec } from 'dockerode';
 import { createLogger, type Logger } from './logger.js';
 
 export const DEFAULT_RUNTIME_IMAGE = 'ghcr.io/planetarium/vicoop-runtime:latest';
@@ -83,7 +87,7 @@ export class RuntimeContainer {
     // (unix:///var/run/docker.sock on linux/mac). We don't pass an
     // explicit socket path so DOCKER_HOST env still wins for operators
     // running rootless / podman-with-docker-shim.
-    this.docker = opts.docker ?? new Docker();
+    this.docker = opts.docker ?? new Docker(resolveDockerOptions());
     this.log = opts.logger ?? createLogger();
   }
 
@@ -304,4 +308,74 @@ function sleep(ms: number): Promise<void> {
 
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+// Pick the socket / TCP host dockerode should connect to.
+//
+// dockerode's zero-arg constructor honors $DOCKER_HOST and otherwise
+// falls back to `/var/run/docker.sock`. That misses the common macOS
+// reality where colima / orbstack / rancher-desktop publish their
+// socket somewhere under $HOME and rely on `docker context` to wire
+// the CLI. dockerode doesn't read docker contexts itself, so without
+// this resolver every container-mode bridge client on those setups
+// would fail with `ENOENT /var/run/docker.sock`.
+//
+// Precedence:
+//   1. $DOCKER_HOST  -> return undefined; dockerode parses it.
+//   2. `currentContext` from ~/.docker/config.json -> read its
+//      meta.json's Endpoints.docker.Host (unix:// or tcp://).
+//   3. anything we don't recognize -> return undefined and let
+//      dockerode use its default.
+//
+// Exported so unit tests can exercise it without spinning up a real
+// daemon connection.
+export function resolveDockerOptions(env: NodeJS.ProcessEnv = process.env): DockerOptions | undefined {
+  if (env.DOCKER_HOST) return undefined;
+
+  const home = homedir();
+  const configPath = join(home, '.docker', 'config.json');
+  if (!existsSync(configPath)) return undefined;
+
+  let currentContext: string;
+  try {
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    currentContext = typeof config.currentContext === 'string' ? config.currentContext : 'default';
+  } catch {
+    return undefined;
+  }
+  if (!currentContext || currentContext === 'default') return undefined;
+
+  // docker stores per-context metadata under a sha256-of-context-name
+  // directory. The format is stable enough to lean on directly; the
+  // alternative (shelling out to `docker context inspect`) would
+  // defeat the point of using a programmatic API.
+  const hash = createHash('sha256').update(currentContext).digest('hex');
+  const metaPath = join(home, '.docker', 'contexts', 'meta', hash, 'meta.json');
+  if (!existsSync(metaPath)) return undefined;
+
+  let host: unknown;
+  try {
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+    host = meta?.Endpoints?.docker?.Host;
+  } catch {
+    return undefined;
+  }
+  if (typeof host !== 'string') return undefined;
+
+  if (host.startsWith('unix://')) {
+    return { socketPath: host.slice('unix://'.length) };
+  }
+  if (host.startsWith('tcp://')) {
+    try {
+      const url = new URL(host);
+      return {
+        host: url.hostname,
+        port: Number(url.port) || 2375,
+        protocol: url.protocol === 'https:' ? 'https' : 'http',
+      };
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
 }

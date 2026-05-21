@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { RuntimeContainer } from './runtime-container.js';
+import { RuntimeContainer, resolveDockerOptions } from './runtime-container.js';
 
 // Minimal dockerode-compatible stub. Records what was called so the
 // tests can assert lifecycle behavior (volumes ensured, container
@@ -214,6 +214,14 @@ test('stop: calls container.stop and tolerates 304 already-stopped', async () =>
   await rc.start();
   await rc.stop();
   assert.deepEqual(stub.stoppedContainers, ['vicoop-runtime-claude']);
+});
+
+test('resolveDockerOptions: defers to dockerode when DOCKER_HOST is set', () => {
+  // When the operator (or systemd unit) already exports DOCKER_HOST,
+  // returning undefined lets dockerode parse it itself — we don't
+  // want our context-file resolver to fight a fully-explicit env.
+  const opts = resolveDockerOptions({ DOCKER_HOST: 'tcp://example:2375' });
+  assert.equal(opts, undefined);
 });
 
 test('Env carries VICOOP_BRIDGE_URL and optional skip-firewall toggle', async () => {
