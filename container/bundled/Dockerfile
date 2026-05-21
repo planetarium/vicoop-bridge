@@ -115,7 +115,12 @@ RUN apt-get update \
 
 # Node's `semver` is bundled with npm; we install it as a global lib here
 # so entrypoint.sh can `node -e "require('semver')..."` for compat checks.
+# NODE_PATH points at the global modules dir so `node -e` invocations
+# (which don't have a local `package.json` to anchor resolution) can
+# actually find the install — without it the require fails with
+# MODULE_NOT_FOUND even though `npm install -g semver` succeeded.
 RUN npm install -g semver
+ENV NODE_PATH=/usr/local/lib/node_modules
 
 # Canonical data root for all persistent state. Mounted as a named volume
 # in operator-side compose. Per backend creds get redirected here via

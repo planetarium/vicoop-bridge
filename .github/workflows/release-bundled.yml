@@ -1,0 +1,94 @@
+name: Release bundled image
+
+# Restarts the bundled-direct image publish that #250 removed from
+# release.yml. Separate from release.yml (the changesets/action
+# pipeline for the @vicoop-bridge/client binary release) and from
+# release-runtime.yml (#249's agent-agnostic vicoop-runtime image).
+#
+# The bundled-direct image (#244) is the "docker run -d
+# ghcr.io/.../vicoop-bridge-client" one-shot deployment shape — it
+# ships the vicoop-client binary plus the same install-backend.sh
+# / init-firewall.sh / backends recipes the external-runtime image
+# ships, so its paths-filter includes the bridge-client source as
+# well as the shared container/ scripts.
+#
+# Tags are `latest` + `sha-<short>` while the profile iterates;
+# wiring a semver flow alongside the client Version PR is a
+# follow-up.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - container/bundled/**
+      - container/init-firewall.sh
+      - container/install-backend.sh
+      - container/backends/**
+      - packages/client/src/**
+      - packages/client/package.json
+      - packages/protocol/src/**
+      - packages/protocol/package.json
+      - pnpm-lock.yaml
+      - .github/workflows/release-bundled.yml
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  release-bundled:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      # buildx + qemu enable cross-arch builds (linux/amd64 +
+      # linux/arm64) from the ubuntu-latest x86_64 runner. The bundled
+      # image is heavier than the runtime image (it embeds the
+      # bun-compiled vicoop-client binary on top of the same base +
+      # deps), so emulated arm64 build time is noticeable; if it
+      # becomes a CI bottleneck, move to a native-arm64 runner for
+      # the arm64 leg.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/vicoop-bridge-client
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: Build and push bundled image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: container/bundled/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # bundled Dockerfile's runtime stage stamps VICOOP_BRIDGE_IMAGE
+          # into ENV so `vicoop-client info` / `upgrade` can fingerprint
+          # the image. metadata-action's `version` is whatever tag
+          # logic picked (`latest` here); SHORT_SHA gets stitched into
+          # the same value so operators see something more diagnostic
+          # than just "latest".
+          build-args: |
+            VICOOP_BRIDGE_IMAGE=${{ steps.meta.outputs.version }}-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

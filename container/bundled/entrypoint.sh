@@ -136,9 +136,18 @@ compat_check() {
         range="$(jq -r --arg k "$kind" '.backends[$k].supportedRange // empty' <<< "$info")"
         [[ -z "$range" || "$range" == "*" ]] && continue
 
-        # Take the first whitespace-separated token from `<bin> --version`
-        # as the semver. Recipes that don't print a semver get skipped.
-        actual="$("$bin" --version 2>/dev/null | awk '{print $1; exit}' || true)"
+        # Pull the first semver-shaped token out of `<bin> --version`.
+        # Naive "first whitespace token" gets fooled by codex, which
+        # prints `codex-cli 0.132.0` (program-name first, semver
+        # second); claude prints `2.1.146 (Claude Code)` (semver
+        # leads) and works either way. The pattern also tolerates
+        # pre-release / build suffixes (`X.Y.Z-rc.1`, `X.Y.Z+sha`).
+        # Recipes that don't print a semver-shaped token at all get
+        # skipped.
+        actual="$("$bin" --version 2>/dev/null \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-+][[:alnum:].-]+)?' \
+            | head -n1 \
+            || true)"
         [[ -z "$actual" ]] && continue
 
         if ! node -e "
