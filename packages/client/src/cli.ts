@@ -522,7 +522,10 @@ async function main(): Promise<void> {
   const parsed = run(cli, {
     programName: 'vicoop-client',
     brief: message`A2A bridge client daemon. Connects a local backend (echo, openclaw, claude, codex) to a deployed vicoop-bridge server.`,
-    footer: message`Precedence: CLI flag > --config <path> > canonical config.json > built-in default. Env vars are not consulted for runtime config (config-location vars like VICOOP_HOME / XDG_CONFIG_HOME / HOME are honored separately). See docs/install-client.md for the full operator guide.`,
+    // `description` only renders on the top-level `--help` (optique gates it
+    // behind `!isSubcommandHelp`); a `footer` here would leak into every
+    // subcommand's help as a fallback. Keep precedence detail root-only.
+    description: message`Precedence: CLI flag > --config <path> > canonical config.json > built-in default. Env vars are not consulted for runtime config (config-location vars like VICOOP_HOME / XDG_CONFIG_HOME / HOME are honored separately). See docs/install-client.md for the full operator guide.`,
     // Both `--help`/`-h` and the `help` subcommand. The explicit `names`
     // list enables the `-h` short alias optique doesn't register by
     // default. Same for `--version`/`-v`.
@@ -534,7 +537,12 @@ async function main(): Promise<void> {
       value: clientVersion,
       option: { names: ['--version', '-v'] },
     },
-    aboveError: 'usage',
+    // `help` scopes the pre-error doc to whatever subcommand was
+    // partially parsed (optique calls `getDocPage(parser, args)`), so
+    // `vicoop-client container` prints just the `container` group's
+    // help instead of dumping the full root usage block. Falls back
+    // to `usage` automatically when no scoped doc is available.
+    aboveError: 'help',
   });
 
   switch (parsed.action) {
