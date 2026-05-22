@@ -421,10 +421,7 @@ export function listRuntimeContainers(opts: ContainerListOptions = {}): RuntimeL
   const dockerRun = opts.dockerRun ?? defaultDockerRun;
   const containers = readManagedContainers(dockerRun);
   const volumes = readManagedVolumes(dockerRun);
-  const keys = new Set<string>();
-  for (const kind of BACKEND_KINDS) keys.add(runtimeKey(kind, undefined));
-  for (const key of containers.keys()) keys.add(key);
-  for (const key of volumes.keys()) keys.add(key);
+  const keys = new Set(containers.keys());
 
   return Array.from(keys).map(parseRuntimeKey).sort(compareRuntimeKeys).map(({ kind, runtimeName }) => {
     const key = runtimeKey(kind, runtimeName);

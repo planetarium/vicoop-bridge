@@ -184,7 +184,7 @@ test('listRuntimeContainers: fixed rows from managed docker labels', () => {
   assert.equal(rows[1].volumes.sessions.present, false);
 });
 
-test('listRuntimeContainers: missing resources stay visible', () => {
+test('listRuntimeContainers: no containers returns no rows', () => {
   const rows = listRuntimeContainers({
     dockerRun: (args) => {
       assert.ok(args[0] === 'ps' || args[0] === 'volume');
@@ -192,30 +192,55 @@ test('listRuntimeContainers: missing resources stay visible', () => {
     },
   });
 
-  assert.deepEqual(
-    rows.map((row) => [row.kind, row.container.state, row.container.image]),
-    [
-      ['claude', 'missing', null],
-      ['codex', 'missing', null],
-    ],
-  );
-  assert.equal(rows.every((row) => !row.volumes.agents.present), true);
+  assert.deepEqual(rows, []);
 });
 
 test('formatRuntimeList and JSON output include volume state', () => {
   const rows = listRuntimeContainers({
     dockerRun: (args) => {
-      if (args[0] === 'ps') return ok('');
-      return ok(JSON.stringify({ Name: 'vicoop-creds-codex' }));
+      if (args[0] === 'ps') {
+        return ok(
+          JSON.stringify({
+            Names: 'vicoop-runtime-codex',
+            State: 'exited',
+            Image: 'runtime:latest',
+            Labels: 'vicoop.kind=codex,vicoop.name=default',
+          }),
+        );
+      }
+      return ok(
+        JSON.stringify({
+          Name: 'vicoop-creds-codex',
+          Labels: 'vicoop.kind=codex,vicoop.name=default',
+        }),
+      );
     },
   });
 
   assert.match(formatRuntimeList(rows), /KIND\s+NAME\s+CONTAINER\s+IMAGE\s+AGENTS\s+CREDS\s+SESSIONS/);
-  assert.match(formatRuntimeList(rows), /codex\s+default\s+missing\s+-\s+no\s+yes\s+no/);
+  assert.match(formatRuntimeList(rows), /codex\s+default\s+stopped\s+runtime:latest\s+no\s+yes\s+no/);
   const parsed = JSON.parse(formatRuntimeListJson(rows));
-  assert.equal(parsed[1].name, 'default');
-  assert.equal(parsed[1].volumes.creds.name, 'vicoop-creds-codex');
-  assert.equal(parsed[1].volumes.creds.present, true);
+  assert.equal(parsed[0].name, 'default');
+  assert.equal(parsed[0].volumes.creds.name, 'vicoop-creds-codex');
+  assert.equal(parsed[0].volumes.creds.present, true);
+});
+
+test('listRuntimeContainers: volume-only leftovers do not create rows', () => {
+  const rows = listRuntimeContainers({
+    dockerRun: (args) => {
+      if (args[0] === 'ps') return ok('');
+      return ok(
+        JSON.stringify({
+          Name: 'vicoop-creds-codex-work',
+          Labels: 'vicoop.kind=codex,vicoop.name=work',
+        }),
+      );
+    },
+  });
+
+  assert.deepEqual(rows, []);
+  assert.equal(formatRuntimeList(rows), 'KIND  NAME  CONTAINER  IMAGE  AGENTS  CREDS  SESSIONS');
+  assert.equal(formatRuntimeListJson(rows), '[]');
 });
 
 test('listRuntimeContainers: includes named runtime instances discovered from labels', () => {
@@ -248,13 +273,9 @@ test('listRuntimeContainers: includes named runtime instances discovered from la
 
   assert.deepEqual(
     rows.map((row) => [row.kind, row.name, row.container.name, row.container.state]),
-    [
-      ['claude', 'default', 'vicoop-runtime-claude', 'missing'],
-      ['codex', 'default', 'vicoop-runtime-codex', 'missing'],
-      ['codex', 'work', 'vicoop-runtime-codex-work', 'running'],
-    ],
+    [['codex', 'work', 'vicoop-runtime-codex-work', 'running']],
   );
-  const named = rows[2];
+  const named = rows[0];
   assert.equal(named.volumes.agents.present, true);
   assert.equal(named.volumes.creds.present, true);
   assert.equal(named.volumes.sessions.name, 'vicoop-sessions-codex-work');
