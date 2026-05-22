@@ -277,7 +277,7 @@ export class RuntimeContainer {
     if (existing.length === 0) return;
     throw new Error(
       `runtime volumes already exist: ${existing.join(', ')}. ` +
-        `Remove them first with \`${this.removeHint()} --volumes\`, then rerun init.`,
+        `Remove them first with \`${this.removeHint()}\`, then rerun init.`,
     );
   }
 

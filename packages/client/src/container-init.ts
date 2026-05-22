@@ -85,7 +85,7 @@ export interface ContainerListOptions {
 
 export interface ContainerRemoveOptions {
   name: string;
-  removeVolumes: boolean;
+  preserveVolumes: boolean;
   dockerRun?: DockerRun;
 }
 
@@ -499,10 +499,10 @@ export function removeRuntimeContainer(opts: ContainerRemoveOptions): RuntimeRem
   for (const volumeName of volumeNames) {
     result.volumes.push({
       name: volumeName,
-      removed: opts.removeVolumes
-        ? removeDockerResource(dockerRun, ['volume', 'rm', volumeName], 'volume')
-        : false,
-      skipped: !opts.removeVolumes,
+      removed: opts.preserveVolumes
+        ? false
+        : removeDockerResource(dockerRun, ['volume', 'rm', volumeName], 'volume'),
+      skipped: opts.preserveVolumes,
     });
   }
 
@@ -533,7 +533,7 @@ export function formatRuntimeRemoveResult(result: RuntimeRemoveResult): string {
   ];
   if (result.volumes.every((v) => v.skipped)) {
     lines.push(
-      `kept volumes ${result.volumes.map((v) => v.name).join(', ')} (pass --volumes to remove)`,
+      `kept volumes ${result.volumes.map((v) => v.name).join(', ')}`,
     );
   } else {
     for (const volume of result.volumes) {
@@ -849,8 +849,8 @@ function containerRemoveCommand(name: 'rm' | 'remove') {
       name: argument(string({ metavar: 'NAME' }), {
         description: message`Runtime instance name to remove.`,
       }),
-      volumes: withDefault(flag('--volumes', {
-        description: message`Also remove the runtime's agents, creds, and sessions named volumes. Off by default so credentials and sessions survive container recreation.`,
+      preserveVolumes: withDefault(flag('--preserve-volumes', {
+        description: message`Keep the runtime's agents, creds, and sessions named volumes. Off by default so cleanup removes all runtime Docker resources.`,
       }), false),
       json: withDefault(flag('--json', {
         description: message`Emit machine-readable JSON.`,
@@ -858,7 +858,7 @@ function containerRemoveCommand(name: 'rm' | 'remove') {
     }),
     {
       brief: message`Remove a runtime container.`,
-      description: message`Removes a runtime container by name. Volumes are kept by default; pass --volumes to remove the agents, creds, and sessions volumes too.`,
+      description: message`Removes a runtime container and its agents, creds, and sessions volumes by name. Pass --preserve-volumes to keep the volumes.`,
     },
   );
 }
@@ -873,7 +873,7 @@ export const containerCmd = command(
   longestMatch(containerInitSubCmd, containerListSubCmd, containerRemoveSubCmd),
   {
     brief: message`Manage per-backend runtime containers.`,
-    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<name>\`, install the agent CLI, optionally copy host creds), \`ls\` / \`list\` (show managed runtime container and volume state), \`rm\` / \`remove\` (remove a runtime container by name, optionally volumes). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
+    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<name>\`, install the agent CLI, optionally copy host creds), \`ls\` / \`list\` (show managed runtime container and volume state), \`rm\` / \`remove\` (remove a runtime container and volumes by name). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
   },
 );
 
@@ -915,7 +915,7 @@ export async function runContainerRemoveCli(args: ContainerRemoveArgs): Promise<
   try {
     const result = removeRuntimeContainer({
       name: args.name,
-      removeVolumes: args.volumes,
+      preserveVolumes: args.preserveVolumes,
     });
     process.stdout.write(
       (args.json ? formatRuntimeRemoveJson(result) : formatRuntimeRemoveResult(result)) + '\n',

@@ -186,7 +186,7 @@ test('start: failIfExists rejects existing volumes before creating a container',
 
   await assert.rejects(
     rc.start(),
-    /runtime volumes already exist: vicoop-creds-claude.*container rm claude --volumes/s,
+    /runtime volumes already exist: vicoop-creds-claude.*container rm claude/s,
   );
   assert.equal(calls.filter((c) => c[0] === 'image').length, 0);
   assert.equal(calls.filter((c) => c[0] === 'create').length, 0);

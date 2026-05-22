@@ -342,11 +342,11 @@ test('listRuntimeContainers: includes named runtime instances discovered from la
 // container rm
 // ──────────────────────────────────────────────────────────────────
 
-test('removeRuntimeContainer: removes container and keeps volumes by default', () => {
+test('removeRuntimeContainer: removes container and volumes by default', () => {
   const calls: Array<readonly string[]> = [];
   const result = removeRuntimeContainer({
     name: 'work',
-    removeVolumes: false,
+    preserveVolumes: false,
     dockerRun: (args) => {
       calls.push(args);
       return ok('');
@@ -367,25 +367,28 @@ test('removeRuntimeContainer: removes container and keeps volumes by default', (
     ['ps', '-a', '--filter', 'name=^vicoop-runtime-', '--format', '{{json .}}'],
     ['volume', 'ls', '--format', '{{json .}}'],
     ['rm', '-f', 'vicoop-runtime-work'],
+    ['volume', 'rm', 'vicoop-agents-work'],
+    ['volume', 'rm', 'vicoop-creds-work'],
+    ['volume', 'rm', 'vicoop-sessions-work'],
   ]);
   assert.equal(result.container.removed, true);
   assert.equal(result.name, 'work');
   assert.deepEqual(
     result.volumes.map((v) => [v.name, v.removed, v.skipped]),
     [
-      ['vicoop-agents-work', false, true],
-      ['vicoop-creds-work', false, true],
-      ['vicoop-sessions-work', false, true],
+      ['vicoop-agents-work', true, false],
+      ['vicoop-creds-work', true, false],
+      ['vicoop-sessions-work', true, false],
     ],
   );
-  assert.match(formatRuntimeRemoveResult(result), /kept volumes/);
+  assert.match(formatRuntimeRemoveResult(result), /removed volume vicoop-agents-work/);
 });
 
-test('removeRuntimeContainer: --volumes removes all canonical volumes', () => {
+test('removeRuntimeContainer: --preserve-volumes keeps all canonical volumes', () => {
   const calls: Array<readonly string[]> = [];
   const result = removeRuntimeContainer({
     name: 'codex',
-    removeVolumes: true,
+    preserveVolumes: true,
     dockerRun: (args) => {
       calls.push(args);
       return ok('');
@@ -406,17 +409,15 @@ test('removeRuntimeContainer: --volumes removes all canonical volumes', () => {
     ['ps', '-a', '--filter', 'name=^vicoop-runtime-', '--format', '{{json .}}'],
     ['volume', 'ls', '--format', '{{json .}}'],
     ['rm', '-f', 'vicoop-runtime-codex'],
-    ['volume', 'rm', 'vicoop-agents-codex'],
-    ['volume', 'rm', 'vicoop-creds-codex'],
-    ['volume', 'rm', 'vicoop-sessions-codex'],
   ]);
-  assert.equal(result.volumes.every((v) => v.removed && !v.skipped), true);
+  assert.equal(result.volumes.every((v) => !v.removed && v.skipped), true);
+  assert.match(formatRuntimeRemoveResult(result), /kept volumes/);
 });
 
 test('removeRuntimeContainer: missing resources are reported without throwing', () => {
   const result = removeRuntimeContainer({
     name: 'claude',
-    removeVolumes: true,
+    preserveVolumes: false,
     dockerRun: (args) => {
       if (args[0] === 'ps' || (args[0] === 'volume' && args[1] === 'ls')) return ok('');
       return fail('Error: No such container or volume', 1);
@@ -433,7 +434,7 @@ test('removeRuntimeContainer: missing resources are reported without throwing', 
 test('removeRuntimeContainer: docker can report missing resources on stdout with exit 0', () => {
   const result = removeRuntimeContainer({
     name: 'claude',
-    removeVolumes: true,
+    preserveVolumes: false,
     dockerRun: (args) => {
       if (args[0] === 'ps' || (args[0] === 'volume' && args[1] === 'ls')) return ok('');
       return ok('Error response from daemon: No such container: vicoop-runtime-claude');
@@ -449,7 +450,7 @@ test('removeRuntimeContainer: unexpected docker failures throw', () => {
     () =>
       removeRuntimeContainer({
         name: 'codex',
-        removeVolumes: false,
+        preserveVolumes: true,
         dockerRun: (args) => {
           if (args[0] === 'ps' || (args[0] === 'volume' && args[1] === 'ls')) return ok('');
           return fail('permission denied', 1);
