@@ -21,15 +21,15 @@
 # Tunables via env:
 #   VICOOP_BRIDGE_IMAGE         (default ghcr.io/planetarium/vicoop-bridge-client:latest)
 #   VICOOP_BRIDGE_CONTAINER     (default vicoop-bridge)
-#   VICOOP_BRIDGE_DATA_VOLUME   (default vicoop-bridge-data)
-#   VICOOP_BRIDGE_WORK_VOLUME   (default vicoop-bridge-work)
+#   VICOOP_BRIDGE_STATE_VOLUME      (default vicoop-bridge-state)
+#   VICOOP_BRIDGE_WORKSPACE_VOLUME  (default vicoop-bridge-workspace)
 
 set -euo pipefail
 
 IMAGE="${VICOOP_BRIDGE_IMAGE:-ghcr.io/planetarium/vicoop-bridge-client:latest}"
 NAME="${VICOOP_BRIDGE_CONTAINER:-vicoop-bridge}"
-DATA_VOLUME="${VICOOP_BRIDGE_DATA_VOLUME:-vicoop-bridge-data}"
-WORK_VOLUME="${VICOOP_BRIDGE_WORK_VOLUME:-vicoop-bridge-work}"
+STATE_VOLUME="${VICOOP_BRIDGE_STATE_VOLUME:-vicoop-bridge-state}"
+WORKSPACE_VOLUME="${VICOOP_BRIDGE_WORKSPACE_VOLUME:-vicoop-bridge-workspace}"
 
 log()  { printf '[install] %s\n' "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
@@ -73,13 +73,14 @@ if [[ -n "$existing_id" ]]; then
 fi
 
 # ── Volumes: idempotent ──────────────────────────────────────────
-docker volume create "$DATA_VOLUME" >/dev/null
-docker volume create "$WORK_VOLUME" >/dev/null
+docker volume create "$STATE_VOLUME" >/dev/null
+docker volume create "$WORKSPACE_VOLUME" >/dev/null
 
 # ── Run wizard ────────────────────────────────────────────────────
 log ""
 log "launching wizard ($NAME)…"
-log "  Volumes: $DATA_VOLUME (config + creds), $WORK_VOLUME (working dir)"
+log "  State volume:     $STATE_VOLUME -> /data (config, credentials, installed CLIs)"
+log "  Workspace volume: $WORKSPACE_VOLUME -> /home/node/work"
 log ""
 log "When setup finishes the daemon takes over in this same container."
 log "Hit Ctrl-C to detach when you're done watching the boot."
@@ -87,8 +88,8 @@ log ""
 
 set +e
 docker run --rm -it --name "$NAME" \
-    -v "$DATA_VOLUME:/data" \
-    -v "$WORK_VOLUME:/home/node/work" \
+    -v "$STATE_VOLUME:/data" \
+    -v "$WORKSPACE_VOLUME:/home/node/work" \
     "$IMAGE"
 exit_code=$?
 set -e
@@ -98,11 +99,12 @@ log "Container exited (status $exit_code)."
 log ""
 log "To start the daemon again later (background, restart-on-host-reboot):"
 log "  docker run -d --restart unless-stopped --name $NAME \\"
-log "    -v $DATA_VOLUME:/data \\"
-log "    -v $WORK_VOLUME:/home/node/work \\"
+log "    -v $STATE_VOLUME:/data \\"
+log "    -v $WORKSPACE_VOLUME:/home/node/work \\"
 log "    $IMAGE"
 log ""
-log "Your config + creds are on the '$DATA_VOLUME' volume; subsequent"
+log "Your config, credentials, and installed backend CLIs are on the"
+log "'$STATE_VOLUME' volume; subsequent"
 log "starts skip the wizard and go straight to daemon mode."
 
 exit "$exit_code"
