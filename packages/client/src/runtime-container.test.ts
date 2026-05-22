@@ -29,15 +29,15 @@ function fail(stderr: string, exitCode = 1): DockerResult {
   return { stdout: '', stderr, exitCode };
 }
 
-// Helper for the "happy start" sequence shape. The image pull path
-// is bypassed (ensureImage finds the image on the first inspect),
-// the three volumes are inspected → created, then the container is
-// inspected (absent) → created → started, then waitUntilRunning's
-// first poll sees `running`. That's what most tests need; the
-// negative tests override the relevant entries to inject failures.
-function happyStartResponses(): RunResponse[] {
+// Helper for the container-init creation sequence shape. The image
+// pull path is bypassed (ensureImage finds the image on the first
+// inspect), the three volumes are inspected → created, then the
+// container is inspected (absent) → created → started, then
+// waitUntilRunning's first poll sees `running`.
+function happyCreateResponses(): RunResponse[] {
   return [
     ok('28.0.0'), // version (ensureDaemonReachable)
+    ok(''), // ps -a --filter (no existing container)
     ok(), // image inspect — found
     fail('volume not found', 1), // volume inspect agents
     ok(), // volume create agents
@@ -45,28 +45,29 @@ function happyStartResponses(): RunResponse[] {
     ok(), // volume create creds
     fail('volume not found', 1), // volume inspect sessions
     ok(), // volume create sessions
-    ok(''), // ps -a --filter (no existing container)
     ok(), // create container
     ok(), // start container
     ok('running'), // waitUntilRunning poll
   ];
 }
 
-test('start: pulls nothing when image is cached, creates+starts a fresh container', async () => {
-  const { run, calls } = makeDockerFixture(happyStartResponses());
+test('start: with createIfMissing pulls nothing when image is cached, creates+starts a fresh container', async () => {
+  const { run, calls } = makeDockerFixture(happyCreateResponses());
   const rc = new RuntimeContainer({
     backendKind: 'claude',
     image: 'test/runtime:latest',
     workspaceDir: '/host/workspace',
     bridgeUrl: 'wss://bridge.example',
+    createIfMissing: true,
     dockerRun: run,
   });
   await rc.start();
 
-  // version → image inspect → 3×volume(inspect|create) → ps → create → start → inspect-running
+  // version → ps → image inspect → 3×volume(inspect|create) → create → start → inspect-running
   assert.equal(calls.length, 12);
   assert.deepEqual(calls[0].slice(0, 2), ['version', '--format']);
-  assert.deepEqual(calls[1], ['image', 'inspect', 'test/runtime:latest']);
+  assert.deepEqual(calls[1].slice(0, 2), ['ps', '-a']);
+  assert.deepEqual(calls[2], ['image', 'inspect', 'test/runtime:latest']);
 
   // Volumes created with the expected labels
   const volumeCreates = calls.filter((c) => c[0] === 'volume' && c[1] === 'create');
@@ -115,10 +116,6 @@ test('start: pulls nothing when image is cached, creates+starts a fresh containe
 test('start: reuses an existing running container (no create, no start)', async () => {
   const { run, calls } = makeDockerFixture([
     ok('28.0.0'),
-    ok(), // image inspect
-    ok(), // volume inspect agents — present
-    ok(), // volume inspect creds
-    ok(), // volume inspect sessions
     ok('abc123'), // ps -a — match
     ok('true'), // inspect Running
     ok('running'), // wait poll
@@ -145,10 +142,6 @@ test('start: reuses an existing running container (no create, no start)', async 
 test('start: starts an existing stopped container', async () => {
   const { run, calls } = makeDockerFixture([
     ok('28.0.0'),
-    ok(),
-    ok(),
-    ok(),
-    ok(),
     ok('abc123'), // ps -a — found
     ok('false'), // inspect Running — stopped
     ok(), // start
@@ -165,6 +158,26 @@ test('start: starts an existing stopped container', async () => {
     calls.filter((c) => c[0] === 'start'),
     [['start', 'vicoop-runtime-codex']],
   );
+});
+
+test('start: missing container is a hard error unless createIfMissing is set', async () => {
+  const { run, calls } = makeDockerFixture([
+    ok('28.0.0'),
+    ok(''), // ps -a — absent
+  ]);
+  const rc = new RuntimeContainer({
+    backendKind: 'codex',
+    image: 'test/runtime:latest',
+    dockerRun: run,
+  });
+
+  await assert.rejects(
+    rc.start(),
+    /runtime container 'vicoop-runtime-codex' does not exist.*vicoop-client container init codex/s,
+  );
+  assert.equal(calls.filter((c) => c[0] === 'create').length, 0);
+  assert.equal(calls.filter((c) => c[0] === 'volume').length, 0);
+  assert.equal(calls.filter((c) => c[0] === 'image').length, 0);
 });
 
 test('start: docker daemon unreachable surfaces an actionable error', async () => {
@@ -192,12 +205,13 @@ test('stop: tolerates already-stopped containers', async () => {
 });
 
 test('Env carries VICOOP_BRIDGE_URL and optional skip-firewall toggle', async () => {
-  const { run, calls } = makeDockerFixture(happyStartResponses());
+  const { run, calls } = makeDockerFixture(happyCreateResponses());
   const rc = new RuntimeContainer({
     backendKind: 'claude',
     image: 'test/runtime:latest',
     bridgeUrl: 'wss://bridge.example',
     skipFirewall: true,
+    createIfMissing: true,
     dockerRun: run,
   });
   await rc.start();

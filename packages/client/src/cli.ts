@@ -364,10 +364,11 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
 //
 // - 'host' (default): nothing to do. The backend factory's built-in
 //   defaultSpawn handles host child_process.spawn unchanged.
-// - 'container': starts a long-lived vicoop-runtime container for this
-//   kind and returns a docker-exec SpawnFn the backend factory plugs
-//   into its spawn slot. cwd, if any, is rewritten to /workspace; the
-//   original host path becomes the bind-mount source.
+// - 'container': reuses or starts an existing long-lived vicoop-runtime
+//   container for this kind and returns a docker-exec SpawnFn the
+//   backend factory plugs into its spawn slot. cwd, if any, is
+//   rewritten to /workspace; the original host path is expected to be
+//   the bind-mount source from container init.
 async function resolveRuntime(args: {
   kind: 'claude' | 'codex';
   runtime: 'host' | 'container' | undefined;

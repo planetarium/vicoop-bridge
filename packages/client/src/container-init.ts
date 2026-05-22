@@ -60,6 +60,7 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
     backendKind: opts.kind,
     image: opts.image ?? process.env.VICOOP_RUNTIME_IMAGE ?? DEFAULT_RUNTIME_IMAGE,
     bridgeUrl: opts.bridgeUrl,
+    createIfMissing: true,
     logger: opts.logger,
   });
 
@@ -142,7 +143,7 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
     }
 
     log.info(`runtime container for ${opts.kind} ready. start daemon with:`);
-    log.info(`    vicoop-client --backend ${opts.kind} --${opts.kind}-runtime container`);
+    log.info(`    vicoop-client --backend ${opts.kind} --runtime container`);
     return 0;
   } finally {
     // Leave the container running. The next daemon launch reuses
