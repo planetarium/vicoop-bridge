@@ -277,6 +277,17 @@ test('removeRuntimeContainer: missing resources are reported without throwing', 
   assert.equal(parsed.container.removed, false);
 });
 
+test('removeRuntimeContainer: docker can report missing resources on stdout with exit 0', () => {
+  const result = removeRuntimeContainer({
+    kind: 'claude',
+    removeVolumes: true,
+    dockerRun: () => ok('Error response from daemon: No such container: vicoop-runtime-claude'),
+  });
+
+  assert.equal(result.container.removed, false);
+  assert.equal(result.volumes.every((v) => !v.removed && !v.skipped), true);
+});
+
 test('removeRuntimeContainer: unexpected docker failures throw', () => {
   assert.throws(
     () =>

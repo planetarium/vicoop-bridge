@@ -509,8 +509,9 @@ function removeDockerResource(
   resource: 'container' | 'volume',
 ): boolean {
   const r = dockerRun(args);
+  const output = `${r.stdout}\n${r.stderr}`;
+  if (/No such container|No such volume|not found/i.test(output)) return false;
   if (r.exitCode === 0) return true;
-  if (/No such container|No such volume|not found/i.test(r.stderr)) return false;
   throw new Error(`docker ${args.join(' ')} failed (exit ${r.exitCode}): ${r.stderr.trim()}`);
 }
 
