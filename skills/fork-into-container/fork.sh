@@ -17,6 +17,87 @@ set -euo pipefail
 log() { printf '[fork] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 
+DAEMON_MODE="${VICOOP_FORK_DAEMON:-start}"
+case "$DAEMON_MODE" in
+    start|manual|stop|restart) ;;
+    *) die "unsupported VICOOP_FORK_DAEMON='$DAEMON_MODE' (expected start|manual|stop|restart)" ;;
+esac
+
+STATE_DIR="${VICOOP_FORK_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/vicoop-fork-into-container}"
+mkdir -p "$STATE_DIR"
+
+daemon_pid_file() { printf '%s/vicoop-%s.pid' "$STATE_DIR" "$KIND"; }
+daemon_log_file() { printf '%s/vicoop-%s.log' "$STATE_DIR" "$KIND"; }
+
+daemon_command_matches() {
+    local pid="$1"
+    ps -p "$pid" -o command= 2>/dev/null \
+        | grep -Eq "vicoop-client .*--backend[ =]$KIND( |$).*--runtime[ =]container( |$).*--runtime-name[ =]$KIND( |$)"
+}
+
+daemon_running_pid() {
+    local pid_file pid
+    pid_file="$(daemon_pid_file)"
+    [[ -f "$pid_file" ]] || return 1
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    daemon_command_matches "$pid" || return 1
+    printf '%s\n' "$pid"
+}
+
+stop_daemon() {
+    local pid_file pid
+    pid_file="$(daemon_pid_file)"
+    pid="$(daemon_running_pid 2>/dev/null || true)"
+    if [[ -z "$pid" ]]; then
+        [[ -f "$pid_file" ]] && rm -f "$pid_file"
+        log "daemon not running for $KIND"
+        return 0
+    fi
+
+    log "stopping daemon pid $pid"
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        log "daemon pid $pid did not exit after SIGTERM; sending SIGKILL"
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pid_file"
+}
+
+start_daemon() {
+    local pid pid_file log_file
+    pid_file="$(daemon_pid_file)"
+    log_file="$(daemon_log_file)"
+
+    pid="$(daemon_running_pid 2>/dev/null || true)"
+    if [[ -n "$pid" ]]; then
+        log "daemon already running for $KIND (pid $pid)"
+        log "log: $log_file"
+        printf '%s\n' "$pid"
+        return 0
+    fi
+    [[ -f "$pid_file" ]] && rm -f "$pid_file"
+
+    log "starting bridge daemon in background"
+    log "log: $log_file"
+    nohup vicoop-client --backend "$KIND" --runtime container --runtime-name "$KIND" \
+        >>"$log_file" 2>&1 &
+    pid="$!"
+    echo "$pid" > "$pid_file"
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$pid_file"
+        die "daemon exited during startup; inspect $log_file"
+    fi
+    log "daemon pid: $pid"
+    printf '%s\n' "$pid"
+}
+
 # ── detect parent kind ────────────────────────────────────────────────────
 # Priority (strongest signal first):
 #   1) VICOOP_FORK_KIND env override                     (caller handles)
@@ -60,13 +141,20 @@ esac
 [[ -d "$SRC_DIR" ]] || die "source config dir not found: $SRC_DIR"
 log "source: $SRC_DIR"
 
+CONTAINER="vicoop-runtime-$KIND"
+TARGET="/data/creds/$KIND"
+
+if [[ "$DAEMON_MODE" == "stop" ]]; then
+    stop_daemon
+    printf '{"container":"%s","runtime_name":"%s","kind":"%s","daemon_mode":"stop","daemon_pid":null,"daemon_log":"%s"}\n' \
+        "$CONTAINER" "$KIND" "$KIND" "$(daemon_log_file)"
+    exit 0
+fi
+
 # ── preflight ─────────────────────────────────────────────────────────────
 command -v docker         >/dev/null 2>&1 || die "docker not found in PATH"
 command -v vicoop-client  >/dev/null 2>&1 || die "vicoop-client not found in PATH (install: https://github.com/planetarium/vicoop-bridge)"
 docker info >/dev/null 2>&1 || die "docker daemon not reachable"
-
-CONTAINER="vicoop-runtime-$KIND"
-TARGET="/data/creds/$KIND"
 
 # ── ensure runtime container exists (delegates auth + image + volume) ──────
 if docker inspect "$CONTAINER" >/dev/null 2>&1; then
@@ -215,9 +303,31 @@ else
     log "nothing to inject (source has no skills/agents/commands/$MEMORY_FILE)"
 fi
 
-log ""
-log "done. start the bridge daemon (in another shell) with:"
-log "    vicoop-client --backend $KIND --runtime container --runtime-name $KIND"
+# Restore the runtime container before starting the daemon. That avoids
+# racing the short-lived inject window cleanup against RuntimeContainer.start().
+cleanup
+trap - EXIT
 
-printf '{"container":"%s","runtime_name":"%s","kind":"%s","injected_into":"%s"}\n' \
-    "$CONTAINER" "$KIND" "$KIND" "$TARGET"
+DAEMON_PID=""
+case "$DAEMON_MODE" in
+    manual)
+        log ""
+        log "done. start the bridge daemon (in another shell) with:"
+        log "    vicoop-client --backend $KIND --runtime container --runtime-name $KIND"
+        ;;
+    restart)
+        stop_daemon
+        DAEMON_PID="$(start_daemon)"
+        ;;
+    start)
+        DAEMON_PID="$(start_daemon)"
+        ;;
+esac
+
+if [[ -n "$DAEMON_PID" ]]; then
+    printf '{"container":"%s","runtime_name":"%s","kind":"%s","injected_into":"%s","daemon_mode":"%s","daemon_pid":%s,"daemon_log":"%s"}\n' \
+        "$CONTAINER" "$KIND" "$KIND" "$TARGET" "$DAEMON_MODE" "$DAEMON_PID" "$(daemon_log_file)"
+else
+    printf '{"container":"%s","runtime_name":"%s","kind":"%s","injected_into":"%s","daemon_mode":"%s","daemon_pid":null,"daemon_log":"%s"}\n' \
+        "$CONTAINER" "$KIND" "$KIND" "$TARGET" "$DAEMON_MODE" "$(daemon_log_file)"
+fi

@@ -89,6 +89,20 @@ Optional env overrides:
 | Var | Meaning |
 |---|---|
 | `VICOOP_FORK_KIND` | force `claude` or `codex` (only needed when invoked from outside a skill tree with both config dirs present) |
+| `VICOOP_FORK_DAEMON` | daemon handling mode: `start` (default), `manual`, `restart`, or `stop` |
+| `VICOOP_FORK_STATE_DIR` | override pid/log directory (default: `$XDG_STATE_HOME/vicoop-fork-into-container` or `~/.local/state/vicoop-fork-into-container`) |
+
+Daemon modes:
+
+- `start`: after injecting the harness, start
+  `vicoop-client --backend <kind> --runtime container --runtime-name <kind>`
+  in the background unless the skill's pidfile already points at a
+  matching live process.
+- `manual`: preserve the old behavior and only print the daemon command.
+- `restart`: terminate the skill-owned daemon if present, then start it
+  again.
+- `stop`: terminate the skill-owned daemon and exit without touching the
+  runtime container or harness.
 
 ## What the script does
 
@@ -109,16 +123,24 @@ Optional env overrides:
 5. `tar -C $STAGE --no-xattrs -cf - . | docker exec -i -u node $CONTAINER bash -c "tar -C /data/creds/<kind> -xf -"`.
    Tar-pipe (not `docker cp`) so the extract runs as the `node` user
    and the agent CLI can traverse the files immediately.
-6. Print the daemon-start command:
-   `vicoop-client --backend <kind> --runtime container --runtime-name <kind>`
-7. Emit `{container, runtime_name, kind, injected_into}` JSON for the
-   parent agent to chain off of.
+6. Restore the runtime container to its original stopped/running state
+   after the inject window.
+7. Start, restart, stop, or skip the bridge daemon according to
+   `VICOOP_FORK_DAEMON`. Background daemon output is appended to the
+   per-kind log file in the state dir.
+8. Emit `{container, runtime_name, kind, injected_into, daemon_mode,
+   daemon_pid, daemon_log}` JSON for the parent agent to chain off of.
 
 ## What this skill does NOT do
 
-- **Start the daemon.** The bridge client is a long-running process;
-  the operator launches it in their own shell after this skill
-  finishes. (Auto-starting from inside a skill is awkward and racy.)
+- **Claim ownership of arbitrary daemons.** It only reuses or stops a
+  process whose pidfile still points at a live `vicoop-client` command
+  with the expected backend/runtime flags. Anything the operator started
+  by hand is left alone.
+- **Guarantee session-end cleanup.** Agent runtimes differ in whether
+  they expose a reliable session-end hook. Use
+  `VICOOP_FORK_DAEMON=stop` from such a hook if you want automatic
+  teardown; otherwise the next skill run will reuse the existing daemon.
 - **Re-inject on every call.** Tar-extract overlays existing files;
   re-running the skill refreshes the harness in place. Removed files
   on the host stay in the container until the operator wipes the
