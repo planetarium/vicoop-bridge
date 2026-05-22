@@ -1,5 +1,344 @@
 # @vicoop-bridge/client
 
+## 0.20.0
+
+### Minor Changes
+
+- a7a890d: Rename `agent revoke` to `agent delete` and align with the server's
+  hard-delete semantics.
+
+  The server-side soft-delete machinery is being removed (see companion
+  server changeset / `feat(server,client)!:` commit); the CLI follows
+  suit. The deprecated flat alias `vicoop-client revoke-client` is
+  preserved with a deprecation warning that now points at
+  `agent delete`, so existing scripts keep working through this
+  release — that's why this is shipped as a minor rather than a major
+  bump.
+
+  **New / changed**
+
+  - `vicoop-client agent revoke <TARGET>` →
+    `vicoop-client agent delete <TARGET>`. The new `delete` subcommand
+    prompts `Delete agent "<TARGET>"? [y/N]` before calling the API;
+    pass `--yes` / `-y` to skip (required for non-TTY usage like
+    scripts and CI).
+  - The deprecated `vicoop-client revoke-client` flat alias now points
+    at `agent delete` in its warning text. It still calls the same
+    endpoint and skips the prompt (preserving script behavior).
+  - Daemon close-code 4014 reason text changes from `"client revoked"`
+    to `"client deleted"`; the log line is now `client deleted by
+owner; stopping`. The behavior (exit non-zero, no reconnect) is
+    unchanged.
+
+  **Migration**
+
+  - Interactive users on `vicoop-client agent revoke …`: switch to
+    `agent delete …` and confirm the prompt.
+  - Scripts on the same: switch to `agent delete --yes …`.
+  - Scripts on the legacy `vicoop-client revoke-client …` flat form:
+    no immediate action required, but plan to move to `agent delete
+--yes` before the deprecated alias is removed.
+
+- fd40f34: Remove `--name` from `vicoop-client agent register`. The flag was a
+  display-only label with no authz, routing, or lookup logic tied to it
+  (admin UI does not render it; active-agent listings pull from the
+  runtime `AgentCard`, not the registration row). The CLI now sends the
+  operator-supplied `--agent-id` as `clientName` so the server's
+  `register_client()` NOT NULL contract on `agents.name` /
+  `clients.client_name` stays satisfied without a schema migration. The
+  redundant `name` line in the `agent register` stderr success block is
+  dropped for the same reason — it used to just echo the flag back.
+
+  Migration: drop `--name "$CLIENT_NAME"` from your `agent register`
+  invocation. The legacy `setup` alias still accepts `--client-name` for
+  back-compat (it's already deprecated and slated for removal).
+
+- 14cdfe5: Add `vicoop-client container init <kind>` — operator one-shot
+  bootstrap for the external-runtime container profile (#249 PR C).
+
+  Lands the host-side UX that PR #251 (image) and PR #252 (spawn
+  adapter + runtime container) left to the operator to wire up by
+  hand. Before this, "use container runtime" looked like: docker
+  run, docker exec --user 0 chown, docker exec install-backend.sh,
+  manually copy creds into the named volume. Now:
+
+  ```
+  $ vicoop-client container init codex --from-host
+  $ vicoop-client --backend codex --codex-runtime container
+  ```
+
+  The command:
+
+  1. Boots the per-backend runtime container (`vicoop-runtime-<kind>`),
+     reusing an existing one when present.
+  2. Chowns the per-kind subtrees inside `/data/agents/<kind>` and
+     `/data/creds/<kind>` to the image's `node` user — works around
+     docker's named-volume permission landmine where the mount point
+     ends up root-owned even when the image pre-creates and chowns
+     it (the volume's empty state takes over at mount time).
+  3. Runs the shared `install-backend.sh <kind>` recipe baked into
+     the runtime image (PR A).
+  4. Probes the installed binary's version via `<bin> --version` and
+     verifies it satisfies `BACKENDS_MANIFEST[kind].supportedRange`.
+     Bad versions surface a clear error here rather than at first-
+     task-time.
+  5. With `--from-host`, copies the operator's existing host creds
+     into the container creds volume:
+     - claude: macOS Keychain (`security find-generic-password -s
+'Claude Code-credentials'`) or `~/.claude/.credentials.json`
+       on linux.
+     - codex: `~/.codex/auth.json` plus `~/.codex/config.toml` when
+       present.
+
+  `--from-host` is opt-in (off by default) so the Decision §4
+  container-creds-isolation default still holds; operators who want
+  the convenience explicitly accept the tradeoff.
+
+  Naming: the group reads as `container ...` rather than `backend
+...` because the operator's mental model is "wire up the docker
+  container hosting my agent CLI"; `backend` is reserved internal
+  vocab in the codebase for the Backend interface + BackendKind
+  enum. The positional argument is still the backend kind
+  (claude / codex).
+
+  Also threads a `user` option through `RuntimeContainer.exec()` so
+  the chown step can run as root inside an image whose default user
+  is unprivileged.
+
+  Every docker interaction (the per-step `docker exec` inside
+  `container init`, the spawn-adapter's per-task `docker exec`,
+  and the runtime container lifecycle calls) goes through the
+  `docker` CLI as a child process. The operator-side `docker`
+  install is already a hard requirement (Decision §6), so this
+  adds no new dependency surface — and it sidesteps oven-sh/bun#22412
+  (bun's node:http client doesn't yet emit the HTTP 101 'upgrade'
+  event docker's hijack protocol relies on), which would otherwise
+  deadlock a bun-compiled vicoop-client the first time it tried to
+  stream stdio through a programmatic Docker client.
+
+  Out of scope (still PR C-shaped follow-ups if motivated by ops
+  feedback):
+
+  - Interactive `claude setup-token` / `codex login --device-auth`
+    passthrough as a first-class auth path (today the command
+    prints the `docker exec -it …` hint to run yourself).
+  - Host-mode install automation (`--runtime host`); today the
+    command errors out with a clear "install via the official
+    installer" pointer.
+  - `container status` / `container rm` siblings — operators still
+    reach for `docker ps` / `docker rm -f` / `docker volume rm` for
+    those today.
+
+- 6e29469: Add `runtime: 'host' | 'container'` to the claude and codex backends
+  (#249 PR B). This is the bridge-client side of the external-runtime
+  profile landed in PR A (#251) — when an operator opts in, the agent
+  CLI runs inside a long-lived `vicoop-runtime` container the bridge
+  client orchestrates via `docker exec`, instead of being spawned as a
+  host child process.
+
+  New surface:
+
+  - Config: `backends.claude.runtime` / `backends.codex.runtime` accept
+    `'host'` (default) or `'container'`.
+  - CLI flags: `--claude-runtime host|container`, `--codex-runtime host|container`.
+    Standard precedence (flag > config) applies.
+  - A `RuntimeContainer` module (`src/runtime-container.ts`) owns the
+    per-backend lifecycle: docker daemon ping, image pull, named-volume
+    provisioning (`vicoop-agents-<kind>`, `vicoop-creds-<kind>`,
+    `vicoop-sessions-<kind>`), container create with
+    `--restart unless-stopped` + `NET_ADMIN/NET_RAW`, reuse of an
+    existing container on bridge-client restart, and an explicit stop
+    on shutdown.
+  - A `SpawnAdapter` module (`src/spawn-adapter.ts`) presents the
+    existing `ClaudeSpawnFn` / `AppServerSpawnFn` shape regardless of
+    mode. The host implementation is the same `node:child_process.spawn`
+    the backends use today; the container implementation runs the
+    command via `docker exec` (shelled out as a child process) so the
+    backend sees a normal child-handle either way.
+  - All docker interactions go through the `docker` CLI as child
+    processes — image pull, volume / container lifecycle, and the
+    per-task `docker exec` for agent spawn. No programmatic Docker
+    client library; the operator-side `docker` install we already
+    require (Decision §6) is the dependency surface.
+
+  Decisions reflected (#249 §Decisions):
+
+  - §1 docker CLI as the daemon-interaction surface.
+  - §2 `--restart unless-stopped` + bridge-client-side reuse on restart.
+  - §3 Per-backend long-lived only; no per-context runtime.
+  - §4 Creds in a container-only named volume — the host's `~/.claude`
+    never enters the container.
+  - §5 Sessions volume mounted into the container so claude/codex
+    session resume survives container re-creation.
+  - §6 No docker daemon → explicit error from `RuntimeContainer.start()`
+    with a "switch to runtime: 'host' or start docker" hint; no
+    fallback.
+  - §8 The two backend kinds keep their identity; runtime mode is the
+    `runtime` field, and backend internals stay unaware of it.
+
+  Out of scope (separate work):
+
+  - Per-context workspace branching (today the host bind-mount is whole).
+  - `vicoop-client backend init` operator-UX subcommand (PR C of #249).
+  - Bundled-direct image publishing (still off per #250).
+
+### Patch Changes
+
+- 739d776: Auto-detect when the bridge client itself is running inside a
+  container (bundled-direct profile, #244) and apply the same
+  sandbox-relaxation the external-runtime profile (#249) already
+  gets when it spawns an _outside_ runtime container.
+
+  Previously, `--<kind>-runtime container` was the only path that
+  flipped claude's `sandbox.failIfUnavailable=false` and codex's
+  default to `danger-full-access`. The bundled image's in-container
+  `vicoop-client` daemon had no way to know its own context — so it
+  defaulted to the host-process safety floor (read-only / refuse-
+  unsandboxed) and a codex file-write task got rejected as
+  "escalation request was rejected" on the first try.
+
+  Detection delegates to [`is-inside-container`][lib] (37M weekly
+  downloads, MIT, single dep on `is-docker`), which already covers
+  the signals we care about for the operator footprint
+  (`/.dockerenv`, `/run/.containerenv`, `/proc/self/cgroup`,
+  `/proc/self/mountinfo`). `pickBackend` treats
+  `runtime !== undefined || isInsideContainer()` as the unified
+  "already isolated" condition for both claude and codex; the
+  runtime-container lifecycle flow is untouched. Operator-explicit
+  overrides (`--codex-sandbox …`, claude settings file) always win.
+
+  Verified end-to-end: rebuilt the bundled image, ran headless
+  bootstrap, injected codex creds, restarted, and ran a
+  `stream` task that writes `/tmp/d.txt` and reads it back —
+  previously this rejected on codex's read-only sandbox
+  escalation; now it completes cleanly.
+
+  [lib]: https://github.com/sindresorhus/is-inside-container
+
+- 33aa80a: Reorganize #245's container scaffolding to clarify it's the
+  **bundled-direct deployment profile**, and prepare for #249's
+  **external-runtime profile** to land alongside (not replace) it.
+
+  The two profiles coexist:
+
+  ```
+  execution=direct
+    - host direct                          (existing bare-metal)
+    - bundled bridge container direct      (#244 — this profile)
+
+  execution=container
+    - external runtime container           (#249 — landing later)
+  ```
+
+  Moved
+
+  - `Dockerfile` → `container/bundled/Dockerfile`
+  - `container/entrypoint.sh` → `container/bundled/entrypoint.sh`
+  - The non-`bundled/` `container/` content (`install-backend.sh`,
+    `backends/*.sh`, `init-firewall.sh`) stays shared between profiles.
+
+  Removed
+
+  - `.github/workflows/release.yml` ghcr image build/push step +
+    `packages: write` permission. The bundled image's release pipeline
+    will land when the profile is officially supported; until then we
+    avoid emitting a "shipped" signal for an image whose design is
+    still settling.
+  - `installed.json` write at the end of `container/install-backend.sh`
+    - the entrypoint's reads of it. Both profiles probe agent CLI
+      versions directly (`<bin> --version`) — no on-disk manifest cache.
+      See #249 §"State management" for the rationale.
+  - The pre-existing `.changeset/container-image-foundation.md` —
+    superseded by this changeset and a future bundled-image release
+    changeset when the image actually publishes.
+
+  Unchanged from #245's PR 1
+
+  - `vicoop-client info` subcommand (still emits `version`,
+    `imageVersion` when running under the bundled image, and the
+    backend compat manifest).
+  - `vicoop-client upgrade` `VICOOP_BRIDGE_IMAGE` guard — still useful
+    inside the bundled image to prevent the overlay-fs upgrade trap.
+  - `packages/client/src/backends-manifest.ts` — supportedRange data,
+    consumed by both profiles' compat checks.
+  - `container/init-firewall.sh`, `container/install-backend.sh`,
+    `container/backends/{claude,codex}.sh` — shared assets.
+
+  See #249 for the new external-runtime profile design and #244 for the
+  bundled-direct profile it complements.
+
+- cd0634a: Add the external-runtime container image (#249, PR A). Lands the
+  agent-agnostic `vicoop-runtime` image alongside the bundled-direct
+  profile (#244, `container/bundled/`) so the two profiles can coexist:
+
+  ```
+  execution=direct
+    - host direct                          (existing bare-metal)
+    - bundled bridge container direct      (#244 — container/bundled/)
+
+  execution=container
+    - external runtime container           (#249 — container/runtime/)
+  ```
+
+  The image is intentionally agent-agnostic: agent CLIs (claude / codex)
+  are NOT baked in. The host-resident bridge client provisions them into
+  a named volume at backend init time via
+  `docker exec <c> install-backend.sh <kind>` (the shared install
+  machinery under `container/` works inside either profile's container).
+  Container body is `sleep infinity` after firewall init; per-task work
+  flows through `docker exec` from the host.
+
+  Published to `ghcr.io/planetarium/vicoop-runtime` from a new
+  `.github/workflows/release-runtime.yml` that builds linux/amd64 +
+  linux/arm64 on main pushes that touch image inputs (`container/runtime/**`,
+  shared scripts under `container/`).
+
+  Bridge client wiring (a `SpawnAdapter` + `runtime: host | container`
+  config) lands in PR B of #249. This PR only ships the image so the
+  runtime artifact exists by the time the host-side code starts
+  exec'ing into it.
+
+- 56d3b8d: Restart the bundled-direct image publish (#244). Adds
+  `.github/workflows/release-bundled.yml` so `container/bundled/`'s
+  Dockerfile rebuilds and pushes to
+  `ghcr.io/planetarium/vicoop-bridge-client` whenever its inputs
+  change — paths filter covers `container/bundled/**`, the shared
+  `container/` scripts, and the bridge-client source (the image
+  embeds the bun-compiled `vicoop-client` binary).
+
+  Companion to PR A's `release-runtime.yml` (#249); the two image
+  families now have their own workflows so the changesets/action
+  release for the npm artifact stays independent of either image's
+  publish schedule. PR #250 removed the in-line bundled push from
+  `release.yml` precisely so a separate workflow could own it.
+
+  No bridge-client behavior change — the image artifact was the only
+  missing piece between the bundled code on disk (landed in #245,
+  reorganized in #250) and operators being able to
+  `docker pull ghcr.io/planetarium/vicoop-bridge-client` again.
+
+  `VICOOP_BRIDGE_IMAGE` build-arg is stamped with `<tag>-<full-sha>`
+  so `vicoop-client info` / `vicoop-client upgrade`'s in-container
+  fingerprint reads more diagnostic than just `latest`.
+
+- a7a890d: Route `node:child_process.spawn` through the shell on Windows so the
+  codex / vicoop-codex backends can resolve the npm-installed `.cmd`
+  shims (#254).
+
+  `spawn('vicoop-codex', …)` and `spawn('codex', …)` fail with ENOENT
+  on Windows because npm publishes the binaries as `.cmd` shims that
+  Node cannot resolve without going through `cmd.exe`. Setting
+  `shell: process.platform === 'win32'` in both `defaultSpawn`
+  (vicoop-codex backend) and `defaultAppServerSpawn` (codex app-server
+  RPC) lets win32 take the shim-resolution path; POSIX hosts keep
+  `shell: false` to avoid the spawn-with-shell deprecation warning and
+  quoting surprises.
+
+  Safe because `command` and `args` at both call sites are fully
+  internal to the bridge client (`'vicoop-codex' / ['call']` and
+  `'codex' / ['app-server']`); no operator-supplied tokens enter the
+  argv, so shell-injection is not a concern.
+
 ## 0.19.1
 
 ### Patch Changes
