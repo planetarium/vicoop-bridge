@@ -1,5 +1,61 @@
 # @vicoop-bridge/client
 
+## 0.22.0
+
+### Minor Changes
+
+- 2a6518a: Surface Claude Task subagent activity as user-visible bookend messages.
+  When the model invokes the built-in `Task` tool, the bridge now emits a
+  `claude-message` artifact reading `Task started: <description>` (and a
+  matching `Task completed: <description>` / `Task failed: <description>`
+  when the subagent's `tool_result` returns). These bookends fire
+  regardless of the traceability extension opt-in, closing the otherwise
+  silent window between the model's Task call and its final response —
+  previously callers (e.g. a Slack relay) saw zero progress while the
+  subagent ran and could not tell whether the run had stalled. Artifact
+  `metadata.event` carries `subagent-started` / `subagent-completed` /
+  `subagent-failed` plus the `toolUseId` so consumers can correlate or
+  style the lifecycle.
+- b06cb88: Recognize WebSocket close code 4009 (another daemon connected with the
+  same `CLIENT_TOKEN`, i.e. the bridge's clientId-level duplicate-token
+  collision) as a distinct failure mode: log a dedicated warn line naming
+  the cause and the remediation (`pgrep -fl vicoop-client`), and floor the
+  next reconnect at `collisionBackoffMs` (default 5 min) so a
+  duplicate-token ping-pong damps out within one cycle instead of looping
+  at the 30 s exponential-backoff cap forever. 4009 remains non-fatal — if
+  the other daemon goes away, this side still recovers on its own.
+- ff58d0b: Reshape the Claude subagent lifecycle bookend (added in #274) as a
+  proper trace artifact. The previous version emitted unconditionally as
+  a `claude-message`, which leaked execution-trace detail to callers
+  that had not opted into the traceability extension and made the
+  artifact-name semantics ("model's words to the user") incorrect. The
+  bookend now rides the same opt-in as `claude-tool-call` /
+  `claude-tool-result`:
+
+  - Artifact name: `claude-subagent-event`
+  - `extensions: [traceability/v1]` and `metadata.traceType: "subagent-event"`
+  - Carries the same lifecycle text (`Task started/completed/failed:
+<description>`) plus a structured `data` part
+    (`{event, toolUseId, description}`) for correlation
+  - Only emitted when the task's `requestedExtensions` (or the inbound
+    message's `extensions`) includes the traceability URI
+
+  Trace-aware A2A consumers already render `claude-tool-call` for the
+  underlying `Agent` invocation; the bookend pair adds value over that
+  alone because text-only subagent results don't fire a
+  `claude-tool-result` — without the explicit "completed" marker, trace
+  consumers would see "started" with no matching finish event.
+
+  Verified end-to-end against the deployed bridge: trace ON → both
+  bookend artifacts plus the raw `claude-tool-call` line up around the
+  subagent run; trace OFF → only the model's final `claude-message`,
+  nothing else.
+
+### Patch Changes
+
+- 29a8898: Add `vicoop-client container ls` / `list` to show managed runtime container and volume state, plus `container rm` / `remove` for name-based cleanup and named runtime instances for multi-instance workflows. `container rm` removes the container and volumes by default, with `--preserve-volumes` for credential/session retention. `container init` now assigns a runtime name even when `--name` is omitted, stops the initialized container until daemon startup, and fails when the target runtime already exists instead of reinstalling into it.
+- efe5823: Require `vicoop-client container init <kind>` before daemon container runtime startup instead of auto-creating missing runtime containers.
+
 ## 0.21.0
 
 ### Minor Changes
