@@ -43,10 +43,12 @@ chmod +x "$DEST/fork.sh"
 ## Prerequisites
 
 - **`docker`** reachable from the parent shell (`docker info` works)
-- **`vicoop-client` on `$PATH`** — install with `npm i -g @vicoop-bridge/client`
-  or symlink the binary out of a built workspace checkout. The script
-  invokes `vicoop-client` directly and aborts (`set -e`) at preflight if
-  it's missing.
+- **`vicoop-client` on `$PATH`** — install via the one-liner in
+  [`docs/install-client.md`](../../docs/install-client.md) (downloads the
+  released binary and drops it into `$INSTALL_DIR`), or build from
+  source and symlink. The package is workspace-private — not on npm.
+  The script invokes `vicoop-client` directly and aborts (`set -e`)
+  at preflight if it's missing.
 - **One-time auth on the host** (nothing to re-export per invocation):
   - `claude setup-token` (claude) or `codex login --device-auth` (codex)
   - `vicoop-client auth login` (bridge owner session)
@@ -73,11 +75,20 @@ bash ~/.claude/skills/vicoop-fork-into-container/fork.sh
 bash ~/.codex/skills/vicoop-fork-into-container/fork.sh
 ```
 
+Parent kind (claude vs codex) is detected from the **install path of the
+script itself** — running `~/.codex/skills/.../fork.sh` picks codex,
+running `~/.claude/skills/.../fork.sh` picks claude. The script falls
+back to checking host config-dir presence only when invoked from
+outside either skill tree (e.g. a dev checkout); in the rare case both
+`~/.claude` and `~/.codex` exist *and* the script is outside both
+trees, you'll get a hard error with an instruction to set the override
+below.
+
 Optional env overrides:
 
 | Var | Meaning |
 |---|---|
-| `VICOOP_FORK_KIND` | force `claude` or `codex` instead of auto-detect |
+| `VICOOP_FORK_KIND` | force `claude` or `codex` (only needed when invoked from outside a skill tree with both config dirs present) |
 
 ## What the script does
 

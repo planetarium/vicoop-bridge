@@ -18,16 +18,33 @@ log() { printf '[fork] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 
 # ── detect parent kind ────────────────────────────────────────────────────
+# Priority (strongest signal first):
+#   1) VICOOP_FORK_KIND env override                     (caller handles)
+#   2) Install path of *this script* — if it lives under
+#      ~/.codex/skills/... or ~/.claude/skills/... the operator
+#      explicitly put it in that agent's tree, which is a far stronger
+#      intent signal than "both config dirs happen to exist"
+#   3) Host config-dir presence (claude / codex / both → ask)
 detect_kind() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+    # Require the full ".../<agent>/skills/..." shape so we don't
+    # false-match unrelated paths that just happen to contain
+    # `/.claude/` as an ancestor (e.g. `~/foo/.claude/worktrees/...`).
+    case "/$script_dir/" in
+        */.codex/skills/*)  echo codex;  return ;;
+        */.claude/skills/*) echo claude; return ;;
+    esac
+
     local has_claude=0 has_codex=0
     [[ -n "${CLAUDE_CONFIG_DIR:-}" || -d "$HOME/.claude" ]] && has_claude=1
     [[ -n "${CODEX_HOME:-}"        || -d "$HOME/.codex"  ]] && has_codex=1
     if (( has_claude && ! has_codex )); then echo claude; return; fi
     if (( has_codex  && ! has_claude )); then echo codex;  return; fi
     if (( has_claude && has_codex )); then
-        log "both ~/.claude and ~/.codex present — defaulting to claude."
-        log "set VICOOP_FORK_KIND=codex to override."
-        echo claude; return
+        log "both ~/.claude and ~/.codex present and script is outside either"
+        log "skill tree — set VICOOP_FORK_KIND=claude|codex to disambiguate."
+        die "cannot pick parent kind unambiguously"
     fi
     die "could not detect parent kind — set VICOOP_FORK_KIND=claude|codex"
 }
