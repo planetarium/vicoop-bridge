@@ -60,6 +60,11 @@ export interface RuntimeContainerOptions {
   // consume a runtime container the operator already initialized with
   // `vicoop-client container init <kind>`.
   createIfMissing?: boolean;
+  // When creating from `container init`, fail if the target container
+  // or any canonical volume already exists. This keeps init as a
+  // fresh-create command instead of silently reinstalling into an
+  // existing runtime.
+  failIfExists?: boolean;
   logger?: Logger;
   // Test seam — inject a custom docker CLI runner so tests can
   // capture argv + script responses without shelling out.
@@ -146,6 +151,12 @@ export class RuntimeContainer {
 
     const name = containerName(this.opts.backendKind, this.opts.runtimeName);
     if (this.findContainer(name)) {
+      if (this.opts.failIfExists) {
+        throw new Error(
+          `runtime container '${name}' already exists. ` +
+            `Remove it first with \`${this.removeHint()}\`, then rerun init.`,
+        );
+      }
       if (this.inspectRunning(name)) {
         this.log.info(`runtime container '${name}' already running — reusing`);
       } else {
@@ -164,6 +175,9 @@ export class RuntimeContainer {
               this.opts.runtimeName ? ` --runtime-name ${this.opts.runtimeName}` : ''
             }\`.`,
         );
+      }
+      if (this.opts.failIfExists) {
+        this.ensureFreshVolumes();
       }
       await this.ensureImage();
       this.ensureVolumes();
@@ -245,12 +259,7 @@ export class RuntimeContainer {
   private ensureVolumes(): void {
     const kind = this.opts.backendKind;
     const runtimeName = this.opts.runtimeName;
-    const names = [
-      agentsVolumeName(kind, runtimeName),
-      credsVolumeName(kind, runtimeName),
-      sessionsVolumeName(kind, runtimeName),
-    ];
-    for (const name of names) {
+    for (const name of this.volumeNames()) {
       const inspect = this.run(['volume', 'inspect', name]);
       if (inspect.exitCode === 0) continue;
       this.runDocker([
@@ -268,6 +277,27 @@ export class RuntimeContainer {
       ]);
       this.log.info(`created named volume '${name}'`);
     }
+  }
+
+  private ensureFreshVolumes(): void {
+    const existing = this.volumeNames().filter(
+      (name) => this.run(['volume', 'inspect', name]).exitCode === 0,
+    );
+    if (existing.length === 0) return;
+    throw new Error(
+      `runtime volumes already exist: ${existing.join(', ')}. ` +
+        `Remove them first with \`${this.removeHint()} --volumes\`, then rerun init.`,
+    );
+  }
+
+  private volumeNames(): string[] {
+    const kind = this.opts.backendKind;
+    const runtimeName = this.opts.runtimeName;
+    return [
+      agentsVolumeName(kind, runtimeName),
+      credsVolumeName(kind, runtimeName),
+      sessionsVolumeName(kind, runtimeName),
+    ];
   }
 
   private findContainer(name: string): boolean {
@@ -345,6 +375,12 @@ export class RuntimeContainer {
     }
     args.push(this.opts.image);
     this.runDocker(args);
+  }
+
+  private removeHint(): string {
+    return `vicoop-client container rm ${this.opts.backendKind}${
+      this.opts.runtimeName ? ` --name ${this.opts.runtimeName}` : ''
+    }`;
   }
 
   private async waitUntilRunning(name: string): Promise<void> {

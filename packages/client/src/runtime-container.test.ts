@@ -146,6 +146,52 @@ test('start: reuses an existing running container (no create, no start)', async 
   );
 });
 
+test('start: failIfExists rejects an existing container during init', async () => {
+  const { run, calls } = makeDockerFixture([
+    ok('28.0.0'),
+    ok('abc123'), // ps -a — match
+  ]);
+  const rc = new RuntimeContainer({
+    backendKind: 'codex',
+    runtimeName: 'work',
+    image: 'test/runtime:latest',
+    createIfMissing: true,
+    failIfExists: true,
+    dockerRun: run,
+  });
+
+  await assert.rejects(
+    rc.start(),
+    /runtime container 'vicoop-runtime-codex-work' already exists.*container rm codex --name work/s,
+  );
+  assert.equal(calls.filter((c) => c[0] === 'start').length, 0);
+  assert.equal(calls.filter((c) => c[0] === 'create').length, 0);
+});
+
+test('start: failIfExists rejects existing volumes before creating a container', async () => {
+  const { run, calls } = makeDockerFixture([
+    ok('28.0.0'),
+    ok(''), // ps -a — no container
+    fail('volume not found', 1), // agents absent
+    ok(), // creds exists
+    fail('volume not found', 1), // sessions absent
+  ]);
+  const rc = new RuntimeContainer({
+    backendKind: 'claude',
+    image: 'test/runtime:latest',
+    createIfMissing: true,
+    failIfExists: true,
+    dockerRun: run,
+  });
+
+  await assert.rejects(
+    rc.start(),
+    /runtime volumes already exist: vicoop-creds-claude.*container rm claude --volumes/s,
+  );
+  assert.equal(calls.filter((c) => c[0] === 'image').length, 0);
+  assert.equal(calls.filter((c) => c[0] === 'create').length, 0);
+});
+
 test('start: starts an existing stopped container', async () => {
   const { run, calls } = makeDockerFixture([
     ok('28.0.0'),

@@ -112,6 +112,7 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
     image: opts.image ?? process.env.VICOOP_RUNTIME_IMAGE ?? DEFAULT_RUNTIME_IMAGE,
     bridgeUrl: opts.bridgeUrl,
     createIfMissing: true,
+    failIfExists: true,
     logger: opts.logger,
   });
 
@@ -776,7 +777,7 @@ const containerInitSubCmd = command(
   }),
   {
     brief: message`Bootstrap a per-backend runtime container.`,
-    description: message`One-shot setup for the container-runtime profile: boots \`vicoop-runtime-<kind>\` or \`vicoop-runtime-<kind>-<name>\`, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and (with --from-host) copies the operator's existing host creds into the container creds volume. After this, launch the daemon with \`vicoop-client --backend <kind> --runtime container\` and, for named runtimes, \`--runtime-name <name>\`.`,
+    description: message`One-shot setup for the container-runtime profile: creates \`vicoop-runtime-<kind>\` or \`vicoop-runtime-<kind>-<name>\`, fails if that runtime already exists, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and (with --from-host) copies the operator's existing host creds into the container creds volume. After this, launch the daemon with \`vicoop-client --backend <kind> --runtime container\` and, for named runtimes, \`--runtime-name <name>\`.`,
   },
 );
 
