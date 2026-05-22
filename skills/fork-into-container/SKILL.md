@@ -14,23 +14,66 @@ volume. What upstream intentionally does **not** carry is the operator's
 *harness* — `skills/`, sub-agents, slash-commands, the project memory
 file. That gap is what this skill fills.
 
-## What you need before invoking
+## Install
 
-Just be **logged in once** on the host:
+This repo just ships the skill source under `skills/fork-into-container/`.
+To actually use it, drop it into your agent's skills tree on the host:
 
-- `claude setup-token` (claude) or `codex login --device-auth` (codex)
-- `vicoop-client auth login` (bridge owner session)
+**Claude Code** (user-wide):
 
-That's it. No env vars, no manually-passed tokens — `--from-host` reads
-the right keychain entry / disk file itself.
+```bash
+DEST=~/.claude/skills/vicoop-fork-into-container
+mkdir -p "$DEST"
+cp -R skills/fork-into-container/. "$DEST/"
+chmod +x "$DEST/fork.sh"
+```
+
+Project-scoped variant: replace `~/.claude` with `.claude` inside the repo
+you're working in.
+
+**Codex**:
+
+```bash
+DEST=~/.codex/skills/vicoop-fork-into-container
+mkdir -p "$DEST"
+cp -R skills/fork-into-container/. "$DEST/"
+chmod +x "$DEST/fork.sh"
+```
+
+## Prerequisites
+
+- **`docker`** reachable from the parent shell (`docker info` works)
+- **`vicoop-client` on `$PATH`** — install with `npm i -g @vicoop-bridge/client`
+  or symlink the binary out of a built workspace checkout. The script
+  invokes `vicoop-client` directly and aborts (`set -e`) at preflight if
+  it's missing.
+- **One-time auth on the host** (nothing to re-export per invocation):
+  - `claude setup-token` (claude) or `codex login --device-auth` (codex)
+  - `vicoop-client auth login` (bridge owner session)
+- **A registered bridge agent** via `vicoop-client agent register`. The
+  skill itself doesn't read the agent id / client token — they sit on
+  disk for the daemon launch step that follows.
 
 ## Invocation
 
+The skill ships one script, `fork.sh`, alongside this SKILL.md. It takes
+no positional arguments; behavior is fully auto-detected or env-driven
+(see the env table below).
+
+When the agent runtime invokes the skill, it already knows the skill's
+directory and runs `fork.sh` from there — no environment plumbing needed.
+
+For manual invocation from a shell, point at the installed path:
+
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT:-$(dirname "$0")}/fork.sh"
+# Claude install path:
+bash ~/.claude/skills/vicoop-fork-into-container/fork.sh
+
+# Codex install path:
+bash ~/.codex/skills/vicoop-fork-into-container/fork.sh
 ```
 
-Optional override:
+Optional env overrides:
 
 | Var | Meaning |
 |---|---|
@@ -39,21 +82,26 @@ Optional override:
 ## What the script does
 
 1. Detect parent kind from env / `~/.claude` vs `~/.codex` presence.
-2. If `vicoop-runtime-<kind>` is **not** already running, invoke
+2. If `vicoop-runtime-<kind>` is **not** present at all, invoke
    `vicoop-client container init <kind> --from-host`. Upstream pulls
-   creds, installs the agent CLI, compat-checks the version.
-3. Stage a curated payload to `mktemp -d`:
+   creds, installs the agent CLI, compat-checks the version, and (per
+   #271) leaves the container stopped.
+3. Capture the container's running state. If stopped, `docker start`
+   it for the inject window; restore it to its original state on exit
+   so the upstream "stopped after init" convention isn't broken.
+4. Stage a curated payload to `mktemp -d`:
    - `skills/`, `agents/`, `commands/` subtrees
-   - `CLAUDE.md` or `AGENTS.md`
-   - Defensive `find -delete` for anything credential-shaped that a
-     skill may have shipped inline.
-4. `tar -C $STAGE -cf - . | docker exec -i -u node $CONTAINER bash -c "tar -C /data/creds/<kind> -xf -"`.
+   - `CLAUDE.md` (and its transitive `@`-imports — claude only;
+     `AGENTS.md` has no equivalent directive) or `AGENTS.md`
+   - Defensive `find -delete` for credential-shaped names and macOS
+     AppleDouble `._*` sidecars.
+5. `tar -C $STAGE --no-xattrs -cf - . | docker exec -i -u node $CONTAINER bash -c "tar -C /data/creds/<kind> -xf -"`.
    Tar-pipe (not `docker cp`) so the extract runs as the `node` user
    and the agent CLI can traverse the files immediately.
-5. Print the daemon-start command:
-   `vicoop-client --backend <kind> --runtime container`
-6. Emit `{container, kind, injected_into}` JSON for the parent agent
-   to chain off of.
+6. Print the daemon-start command:
+   `vicoop-client --backend <kind> --runtime container --runtime-name <kind>`
+7. Emit `{container, runtime_name, kind, injected_into}` JSON for the
+   parent agent to chain off of.
 
 ## What this skill does NOT do
 
