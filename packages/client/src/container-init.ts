@@ -534,31 +534,42 @@ function removeDockerResource(
 function readManagedContainers(
   dockerRun: DockerRun,
 ): Map<string, { state: string; image: string | null }> {
-  const r = dockerRun([
-    'ps',
-    '-a',
-    '--filter',
-    `label=${RUNTIME_MANAGED_BY_LABEL}`,
-    '--filter',
-    `label=${RUNTIME_COMPONENT_LABEL}`,
-    '--format',
-    '{{json .}}',
-  ]);
-  if (r.exitCode !== 0) {
-    throw new Error(`docker ps failed (exit ${r.exitCode}): ${r.stderr.trim()}`);
-  }
-
   const result = new Map<string, { state: string; image: string | null }>();
-  for (const entry of parseDockerJsonLines(r.stdout, 'docker ps')) {
-    const name = stringField(entry, 'Names') ?? stringField(entry, 'Name');
-    if (!name) continue;
-    const labels = parseDockerLabels(stringField(entry, 'Labels'));
-    const runtime = runtimeFromLabelsOrName(labels, name, 'container');
-    if (!runtime) continue;
-    result.set(runtimeKey(runtime.kind, runtime.runtimeName), {
-      state: stringField(entry, 'State') ?? '',
-      image: stringField(entry, 'Image'),
-    });
+  for (const args of [
+    [
+      'ps',
+      '-a',
+      '--filter',
+      `label=${RUNTIME_MANAGED_BY_LABEL}`,
+      '--filter',
+      `label=${RUNTIME_COMPONENT_LABEL}`,
+      '--format',
+      '{{json .}}',
+    ],
+    [
+      'ps',
+      '-a',
+      '--filter',
+      'name=^vicoop-runtime-',
+      '--format',
+      '{{json .}}',
+    ],
+  ] as const) {
+    const r = dockerRun(args);
+    if (r.exitCode !== 0) {
+      throw new Error(`docker ps failed (exit ${r.exitCode}): ${r.stderr.trim()}`);
+    }
+    for (const entry of parseDockerJsonLines(r.stdout, 'docker ps')) {
+      const name = stringField(entry, 'Names') ?? stringField(entry, 'Name');
+      if (!name) continue;
+      const labels = parseDockerLabels(stringField(entry, 'Labels'));
+      const runtime = runtimeFromLabelsOrName(labels, name, 'container');
+      if (!runtime) continue;
+      result.set(runtimeKey(runtime.kind, runtime.runtimeName), {
+        state: stringField(entry, 'State') ?? '',
+        image: stringField(entry, 'Image'),
+      });
+    }
   }
   return result;
 }
@@ -567,10 +578,6 @@ function readManagedVolumes(dockerRun: DockerRun): Map<string, Set<string>> {
   const r = dockerRun([
     'volume',
     'ls',
-    '--filter',
-    `label=${RUNTIME_MANAGED_BY_LABEL}`,
-    '--filter',
-    `label=${RUNTIME_COMPONENT_LABEL}`,
     '--format',
     '{{json .}}',
   ]);

@@ -162,12 +162,16 @@ test('listRuntimeContainers: fixed rows from managed docker labels', () => {
     '{{json .}}',
   ]);
   assert.deepEqual(calls[1], [
+    'ps',
+    '-a',
+    '--filter',
+    'name=^vicoop-runtime-',
+    '--format',
+    '{{json .}}',
+  ]);
+  assert.deepEqual(calls[2], [
     'volume',
     'ls',
-    '--filter',
-    'label=vicoop.managed-by=vicoop-bridge',
-    '--filter',
-    'label=vicoop.component=runtime',
     '--format',
     '{{json .}}',
   ]);
@@ -193,6 +197,58 @@ test('listRuntimeContainers: no containers returns no rows', () => {
   });
 
   assert.deepEqual(rows, []);
+});
+
+test('listRuntimeContainers: includes legacy canonical containers by name', () => {
+  const rows = listRuntimeContainers({
+    dockerRun: (args) => {
+      if (args[0] === 'ps' && args.includes('label=vicoop.managed-by=vicoop-bridge')) {
+        return ok('');
+      }
+      if (args[0] === 'ps') {
+        return ok(
+          JSON.stringify({
+            Names: 'vicoop-runtime-codex',
+            State: 'running',
+            Image: 'runtime:legacy',
+            Labels: 'vicoop.kind=codex',
+          }),
+        );
+      }
+      return ok(
+        [
+          JSON.stringify({ Name: 'vicoop-agents-codex', Labels: 'vicoop.kind=codex' }),
+          JSON.stringify({ Name: 'vicoop-creds-codex', Labels: 'vicoop.kind=codex' }),
+          JSON.stringify({ Name: 'vicoop-sessions-codex', Labels: 'vicoop.kind=codex' }),
+        ].join('\n'),
+      );
+    },
+  });
+
+  assert.deepEqual(
+    rows.map((row) => [
+      row.kind,
+      row.name,
+      row.container.name,
+      row.container.state,
+      row.container.image,
+      row.volumes.agents.present,
+      row.volumes.creds.present,
+      row.volumes.sessions.present,
+    ]),
+    [
+      [
+        'codex',
+        'default',
+        'vicoop-runtime-codex',
+        'running',
+        'runtime:legacy',
+        true,
+        true,
+        true,
+      ],
+    ],
+  );
 });
 
 test('formatRuntimeList and JSON output include volume state', () => {
