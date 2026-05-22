@@ -522,10 +522,6 @@ async function main(): Promise<void> {
   const parsed = run(cli, {
     programName: 'vicoop-client',
     brief: message`A2A bridge client daemon. Connects a local backend (echo, openclaw, claude, codex) to a deployed vicoop-bridge server.`,
-    // `description` only renders on the top-level `--help` (optique gates it
-    // behind `!isSubcommandHelp`); a `footer` here would leak into every
-    // subcommand's help as a fallback. Keep precedence detail root-only.
-    description: message`Precedence: CLI flag > --config <path> > canonical config.json > built-in default. Env vars are not consulted for runtime config (config-location vars like VICOOP_HOME / XDG_CONFIG_HOME / HOME are honored separately). See docs/install-client.md for the full operator guide.`,
     // Both `--help`/`-h` and the `help` subcommand. The explicit `names`
     // list enables the `-h` short alias optique doesn't register by
     // default. Same for `--version`/`-v`.
