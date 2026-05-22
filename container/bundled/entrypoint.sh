@@ -208,7 +208,7 @@ maybe_init_firewall() {
 #      into config.json. We then patch the `backend` field with the
 #      prompt result (agent register doesn't take a backend arg).
 #   4. For installable backends (claude / codex), run install-backend.sh
-#      and then invoke the native OAuth (`claude setup-token` /
+#      and then invoke the native OAuth (`claude auth login --claudeai` /
 #      `codex login --device-auth`) inline. Operator's TTY is inherited
 #      by the child, so the URL+code flow lands on their terminal
 #      directly.
@@ -286,10 +286,10 @@ wizard() {
         local bin="$VICOOP_DATA/agents/$backend/bin/$backend"
         case "$backend" in
             claude)
-                log "Running \`claude setup-token\` — follow the URL it prints,"
-                log "  paste the resulting token back here:"
-                "$bin" setup-token \
-                    || die "claude setup-token failed"
+                log "Running \`claude auth login --claudeai\` — follow the URL it prints"
+                log "  and complete the Claude subscription login flow:"
+                "$bin" auth login --claudeai \
+                    || die "claude auth login failed"
                 ;;
             codex)
                 log "Running \`codex login --device-auth\` — open the URL it prints"
