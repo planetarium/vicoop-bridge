@@ -74,6 +74,50 @@ test('missing required args reported as a list', () => {
   // backend defaults to 'echo' and server defaults to DEFAULT_BRIDGE_URL,
   // so only the two credential fields can be missing.
   assert.deepEqual(r.missing, ['token', 'agentId']);
+  assert.deepEqual(r.errors, []);
+});
+
+test('--runtime with a non-runtime-capable backend is a hard error', () => {
+  // echo (and openclaw / vicoop-codex) don't have a runtime container
+  // profile; passing --runtime with one of them is almost always an
+  // operator typo, so surface it instead of silently ignoring.
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'echo', runtime: 'container' },
+    {},
+  );
+  assert.equal(r.ok, false);
+  if (r.ok) return;
+  assert.ok(
+    r.errors.some((e) => e.includes('--runtime') && e.includes('echo')),
+    `expected error mentioning --runtime and echo, got: ${r.errors.join(' | ')}`,
+  );
+});
+
+test('--cwd with a non-process-spawning backend is a hard error', () => {
+  // openclaw routes tasks over a gateway WS; there's no host-side child
+  // process to give a working directory to.
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'openclaw', cwd: '/some/dir' },
+    {},
+  );
+  assert.equal(r.ok, false);
+  if (r.ok) return;
+  assert.ok(
+    r.errors.some((e) => e.includes('--cwd') && e.includes('openclaw')),
+    `expected error mentioning --cwd and openclaw, got: ${r.errors.join(' | ')}`,
+  );
+});
+
+test('--runtime + --cwd with --backend claude is accepted', () => {
+  // Positive control: the supported pairing must still parse cleanly.
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude', runtime: 'container', cwd: '/repo' },
+    {},
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.runtime, 'container');
+  assert.equal(r.args.cwd, '/repo');
 });
 
 test('parseFlags picks up known flags', () => {

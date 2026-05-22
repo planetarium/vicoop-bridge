@@ -200,7 +200,10 @@ function resolveDaemonArgs(parsed: Extract<CliArgs, { action: 'daemon' }>): Args
   }
   const result = mergeClientArgs(parsed, config);
   if (!result.ok) {
-    console.error(`missing required args: ${result.missing.join(', ')}`);
+    if (result.missing.length) {
+      console.error(`missing required args: ${result.missing.join(', ')}`);
+    }
+    for (const e of result.errors) console.error(e);
     process.exit(1);
   }
   return result.args;

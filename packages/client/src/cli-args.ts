@@ -74,10 +74,10 @@ export const daemonFlagsFields = {
 
   // Backend runtime placement (applies to the active --backend)
   cwd: optional(option('--cwd', string({ metavar: 'PATH' }), {
-    description: message`Working directory for the spawned backend process (claude / codex). Ignored by backends without a host-side process.`,
+    description: message`Working directory for the spawned backend process. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
   })),
   runtime: optional(option('--runtime', choice([...BACKEND_RUNTIMES]), {
-    description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside a vicoop-runtime container the bridge client orchestrates. Applies to claude / codex; ignored by backends without a runtime container profile.`,
+    description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside a vicoop-runtime container the bridge client orchestrates. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
   })),
 
   // Backend-specific (Claude)
@@ -190,10 +190,23 @@ function pickSandbox(v: string | undefined): CodexSandboxMode | undefined {
 // shorthand. At runtime, `parseFlags()` returns the full shape — every key
 // present with `undefined` for unset flags — but the merge logic reads each
 // field independently and tolerates missing keys.
+// Backends that actually consume the unified --cwd / --runtime flags. The
+// other backends (echo / openclaw / vicoop-codex) don't spawn a per-task
+// child process and don't have a vicoop-runtime container profile, so
+// passing the flag with one of them is almost always an operator typo —
+// surface it as a parse-time error rather than letting the value sit
+// inert.
+const CWD_BACKENDS: ReadonlySet<string> = new Set(['claude', 'codex']);
+const RUNTIME_BACKENDS: ReadonlySet<string> = new Set(['claude', 'codex']);
+
+export type MergeClientArgsResult =
+  | { ok: true; args: DaemonArgs }
+  | { ok: false; missing: string[]; errors: string[] };
+
 export function mergeClientArgs(
   flags: Partial<DaemonFlags>,
   config: ClientConfig,
-): { ok: true; args: DaemonArgs } | { ok: false; missing: string[] } {
+): MergeClientArgsResult {
   const card = pick(flags.card) || config.card;
   const backends = config.backends ?? {};
   const backend = pick(flags.backend) || config.backend || 'echo';
@@ -253,6 +266,23 @@ export function mergeClientArgs(
   if (!resolved.agentId) missing.push('agentId');
   // `server` always has DEFAULT_BRIDGE_URL fallback so it's never missing.
   // `backend` always has 'echo' fallback.
-  if (missing.length) return { ok: false, missing };
+
+  // Backend-compat checks for the unified flags. We only flag the *flag*
+  // (operator-set) variant; values that come purely from a stale config
+  // overlay are silently dropped above by the active-backend-scoped
+  // lookup, which is the correct behaviour for that source.
+  const errors: string[] = [];
+  if (flags.runtime !== undefined && !RUNTIME_BACKENDS.has(backend)) {
+    errors.push(
+      `--runtime is not supported by --backend ${backend}; only claude / codex have a runtime container profile`,
+    );
+  }
+  if (pick(flags.cwd) && !CWD_BACKENDS.has(backend)) {
+    errors.push(
+      `--cwd is not supported by --backend ${backend}; only claude / codex spawn a backend process with a working directory`,
+    );
+  }
+
+  if (missing.length || errors.length) return { ok: false, missing, errors };
   return { ok: true, args: resolved };
 }
