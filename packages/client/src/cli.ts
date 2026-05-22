@@ -33,7 +33,7 @@ import {
   addCallerCmd, agentCmd, listAgentsCmd, listCallersCmd, listClientsCmd,
   removeCallerCmd, revokeClientCmd,
   runAddCaller, runAgentCallersAdd, runAgentCallersList, runAgentCallersRemove,
-  runAgentList, runAgentRevoke, runListAgents, runListCallers, runListClients,
+  runAgentDelete, runAgentList, runListAgents, runListCallers, runListClients,
   runRemoveCaller, runRevokeClient,
 } from './admin-cli.js';
 import { authWhoamiCmd, whoamiCmd, runAuthWhoami, runWhoami } from './whoami.js';
@@ -463,8 +463,8 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     backendKind: args.backend,
     backend,
     // Daemon entrypoint: a fatal terminal close (currently 4014 "client
-    // revoked") should drop the process with a non-zero exit so
-    // systemd / a parent supervisor sees the revocation as a hard
+    // deleted") should drop the process with a non-zero exit so
+    // systemd / a parent supervisor sees the deletion as a hard
     // failure instead of masking it as a transient disconnect. The
     // Client class deliberately does not call process.exit itself —
     // tests and future in-process embedders pass a non-exiting callback.
@@ -576,8 +576,8 @@ async function main(): Promise<void> {
     case 'agent-list':
       process.exit(await runAgentList(parsed));
       break;
-    case 'agent-revoke':
-      process.exit(await runAgentRevoke(parsed));
+    case 'agent-delete':
+      process.exit(await runAgentDelete(parsed));
       break;
     case 'agent-callers-list':
       process.exit(await runAgentCallersList(parsed));

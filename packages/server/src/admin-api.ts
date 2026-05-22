@@ -224,7 +224,6 @@ export interface ClientListItem {
   client_name: string;
   owner_principal: string;
   allowed_agent_ids: string[];
-  revoked: boolean;
   created_at: string;
   /**
    * True iff at least one agent owned by this client is currently registered
@@ -243,7 +242,7 @@ export async function listClientsForOwner(
   const rows = await db.begin(async (tx) => {
     await setRlsContext(tx, principalId);
     return tx`
-      SELECT client_id, id, owner_principal, name, revoked, created_at
+      SELECT client_id, id, owner_principal, name, created_at
       FROM agents
       ORDER BY created_at DESC
     `;
@@ -263,7 +262,6 @@ export async function listClientsForOwner(
     client_name: r.name as string,
     owner_principal: r.owner_principal as string,
     allowed_agent_ids: [r.id as string],
-    revoked: r.revoked as boolean,
     created_at:
       r.created_at instanceof Date
         ? r.created_at.toISOString()
@@ -272,11 +270,11 @@ export async function listClientsForOwner(
   }));
 }
 
-export interface RevokeClientResult {
+export interface DeleteClientResult {
   client_id: string;
   client_name: string;
-  revoked: boolean;
-  /** Number of live WebSocket connections closed as part of this revoke. */
+  deleted: true;
+  /** Number of live WebSocket connections closed as part of this delete. */
   closed_connections: number;
 }
 
@@ -320,29 +318,26 @@ async function resolveClient(
   return { id: byName[0].id as string, client_name: byName[0].client_name as string };
 }
 
-export async function revokeClientForOwner(
+export async function deleteClientForOwner(
   db: Sql,
   registry: Registry,
   principalId: string,
   target: string,
-): Promise<RevokeClientResult> {
+): Promise<DeleteClientResult> {
   const resolved = await resolveClient(db, principalId, target);
 
   await db.begin(async (tx) => {
     await setRlsContext(tx, principalId);
-    // revoke_client() is SECURITY INVOKER and re-checks RLS; resolveClient()
-    // already verified the row is visible to this principal so the UPDATE
-    // inside will succeed (or NOT FOUND if a concurrent delete happened, in
-    // which case the function raises — we let that propagate as 500 because
-    // it's a genuinely unexpected race, not a user-facing error condition).
+    // RLS-scoped DELETE; resolveClient() already verified the row is visible
+    // to this principal so the DELETE inside will succeed (or affect zero
+    // rows if a concurrent delete happened, which is acceptable — the
+    // resulting closed_connections=0 is still a correct response).
     await tx`
-      UPDATE agents
-      SET revoked = TRUE, updated_at = now()
+      DELETE FROM agents
       WHERE client_id = ${resolved.id}
     `;
     await tx`
-      UPDATE clients
-      SET revoked = TRUE
+      DELETE FROM clients
       WHERE id = ${resolved.id}
     `;
   });
@@ -354,7 +349,7 @@ export async function revokeClientForOwner(
   return {
     client_id: resolved.id,
     client_name: resolved.client_name,
-    revoked: true,
+    deleted: true,
     closed_connections: closedConnections,
   };
 }

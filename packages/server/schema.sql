@@ -73,6 +73,7 @@ BEGIN
     DROP FUNCTION IF EXISTS rotate_client_token(TEXT);
     DROP FUNCTION IF EXISTS revoke_client(TEXT);
     DROP FUNCTION IF EXISTS unrevoke_client(TEXT);
+    DROP FUNCTION IF EXISTS delete_client(TEXT);
     DROP FUNCTION IF EXISTS update_client_allowed_agents(TEXT, TEXT[]);
     DROP TYPE IF EXISTS client_with_token CASCADE;
     -- normalize_wallet_address used to validate VARCHAR(42); not needed
@@ -180,13 +181,16 @@ CREATE TABLE IF NOT EXISTS clients (
   client_name       TEXT NOT NULL,
   token_hash        TEXT NOT NULL UNIQUE,
   allowed_agent_ids TEXT[] NOT NULL DEFAULT '{}',
-  revoked           BOOLEAN NOT NULL DEFAULT FALSE,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Idempotent: existing dev DBs from PR A only have the columns above sans
 -- owner_email. Add it here so re-applying schema.sql brings them forward.
 ALTER TABLE clients ADD COLUMN IF NOT EXISTS owner_email TEXT;
+-- Drop the legacy soft-delete column. As of #XXX agents/clients are
+-- hard-deleted; the column is unused everywhere and the trigger / function
+-- paths below stop referencing it in the same change.
+ALTER TABLE clients DROP COLUMN IF EXISTS revoked;
 
 ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
 
@@ -245,7 +249,6 @@ CREATE TABLE IF NOT EXISTS agents (
   name              TEXT NOT NULL,
   token_hash        TEXT NOT NULL UNIQUE,
   allowed_callers   TEXT[] NOT NULL DEFAULT '{}',
-  revoked           BOOLEAN NOT NULL DEFAULT FALSE,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -253,8 +256,9 @@ CREATE TABLE IF NOT EXISTS agents (
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS owner_email TEXT;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS client_id TEXT UNIQUE DEFAULT gen_random_uuid()::text;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS allowed_callers TEXT[] NOT NULL DEFAULT '{}';
-ALTER TABLE agents ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+-- See clients.revoked drop note above. Agents was the shadow column.
+ALTER TABLE agents DROP COLUMN IF EXISTS revoked;
 UPDATE agents SET client_id = gen_random_uuid()::text WHERE client_id IS NULL;
 ALTER TABLE agents ALTER COLUMN client_id SET NOT NULL;
 
@@ -359,19 +363,17 @@ CREATE TRIGGER agents_assert_no_reserved_agent_id
   FOR EACH ROW EXECUTE FUNCTION trg_agents_assert_no_reserved_agent_id();
 
 -- Token-carrying return type for register / rotate.
--- Wrapped in DO so the migration is idempotent.
-DO $$ BEGIN
-  CREATE TYPE client_with_token AS (
-    id                TEXT,
-    owner_principal   TEXT,
-    client_name       TEXT,
-    allowed_agent_ids TEXT[],
-    revoked           BOOLEAN,
-    created_at        TIMESTAMPTZ,
-    token             TEXT
-  );
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
+-- Wrapped in DO so the migration is idempotent. Dropped-and-recreated to
+-- match the post-#XXX shape after the `revoked` field was removed.
+DROP TYPE IF EXISTS client_with_token CASCADE;
+CREATE TYPE client_with_token AS (
+  id                TEXT,
+  owner_principal   TEXT,
+  client_name       TEXT,
+  allowed_agent_ids TEXT[],
+  created_at        TIMESTAMPTZ,
+  token             TEXT
+);
 
 -- Register a new client. Admins may pass an explicit owner_principal to create
 -- on behalf of another principal; non-admins own the client themselves
@@ -434,7 +436,7 @@ BEGIN
   )
   ON CONFLICT (id) DO NOTHING;
 
-  SELECT v_client_id, a.owner_principal, a.name, ARRAY[a.id], a.revoked, a.created_at, v_raw_token
+  SELECT v_client_id, a.owner_principal, a.name, ARRAY[a.id], a.created_at, v_raw_token
   FROM agents a
   WHERE a.id = v_agent_id
   INTO v_row;
@@ -446,62 +448,55 @@ $$;
 COMMENT ON FUNCTION register_client(TEXT, TEXT[], TEXT) IS
   'Register a new client. Admins may pass ownerPrincipal to create on behalf of another principal; non-admins always own the resulting client. Returns the raw bearer token — shown only once.';
 
--- Mark a client as revoked. Does not delete the row so history is preserved.
--- RLS authorizes the update (owner or admin).
-CREATE OR REPLACE FUNCTION revoke_client(client_id TEXT)
+-- Drop the legacy soft-delete functions on re-deploy. The top-of-file
+-- migration block only runs them on the wallet→principal path; on a DB
+-- that's already migrated we still want the obsolete functions gone so
+-- nothing can call them.
+DROP FUNCTION IF EXISTS revoke_client(TEXT);
+DROP FUNCTION IF EXISTS unrevoke_client(TEXT);
+
+-- Hard-delete a client and its shadow agents row. Replaces the legacy
+-- revoke/unrevoke pair: the soft-delete flag was never observed by any
+-- audit/log path, and the only consumer (`ws.ts`) treated revoked rows as
+-- "not found" anyway, so the soft state added no real value. Deleting the
+-- `clients` row cascades to `agent_policies` via FK ON DELETE CASCADE.
+-- RLS authorizes the delete (owner or admin).
+CREATE OR REPLACE FUNCTION delete_client(client_id TEXT)
 RETURNS clients
   LANGUAGE plpgsql
   SECURITY INVOKER
 AS $$
 DECLARE
   v_row clients;
+  v_target_client_id TEXT;
 BEGIN
-  UPDATE agents AS a SET revoked = TRUE, updated_at = now()
-  WHERE a.client_id = revoke_client.client_id OR a.id = revoke_client.client_id;
+  -- Resolve to the canonical clients.id whether the caller passed the
+  -- client_id or the agent_id (which is the same string after #218).
+  SELECT a.client_id INTO v_target_client_id
+  FROM agents a
+  WHERE a.client_id = delete_client.client_id OR a.id = delete_client.client_id;
 
-  UPDATE clients AS c SET revoked = TRUE
-  WHERE c.id = revoke_client.client_id
-     OR c.id = (SELECT client_id FROM agents WHERE id = revoke_client.client_id)
+  IF v_target_client_id IS NULL THEN
+    v_target_client_id := delete_client.client_id;
+  END IF;
+
+  DELETE FROM agents AS a
+  WHERE a.client_id = v_target_client_id;
+
+  DELETE FROM clients AS c
+  WHERE c.id = v_target_client_id
   RETURNING c.* INTO v_row;
 
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'client not found or not authorized: %', revoke_client.client_id;
+    RAISE EXCEPTION 'client not found or not authorized: %', delete_client.client_id;
   END IF;
 
   RETURN v_row;
 END;
 $$;
 
-COMMENT ON FUNCTION revoke_client(TEXT) IS
-  'Set revoked=true on a client. Active WebSocket sessions keep running until they reconnect; registry sync is out of scope here.';
-
--- Clear the revoked flag.
-CREATE OR REPLACE FUNCTION unrevoke_client(client_id TEXT)
-RETURNS clients
-  LANGUAGE plpgsql
-  SECURITY INVOKER
-AS $$
-DECLARE
-  v_row clients;
-BEGIN
-  UPDATE agents AS a SET revoked = FALSE, updated_at = now()
-  WHERE a.client_id = unrevoke_client.client_id OR a.id = unrevoke_client.client_id;
-
-  UPDATE clients AS c SET revoked = FALSE
-  WHERE c.id = unrevoke_client.client_id
-     OR c.id = (SELECT client_id FROM agents WHERE id = unrevoke_client.client_id)
-  RETURNING c.* INTO v_row;
-
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'client not found or not authorized: %', unrevoke_client.client_id;
-  END IF;
-
-  RETURN v_row;
-END;
-$$;
-
-COMMENT ON FUNCTION unrevoke_client(TEXT) IS
-  'Clear the revoked flag on a client.';
+COMMENT ON FUNCTION delete_client(TEXT) IS
+  'Hard-delete a client and its agent registration. Active WebSocket sessions are closed asynchronously by the admin-api caller (Registry.disconnectClient) — registry sync is out of scope here.';
 
 -- Issue a new bearer token for an existing client, replacing token_hash.
 -- Returns the raw token — shown only once.
@@ -526,7 +521,7 @@ BEGIN
   SET token_hash = v_token_hash
   WHERE c.id = rotate_client_token.client_id
      OR c.id = (SELECT client_id FROM agents WHERE id = rotate_client_token.client_id)
-  RETURNING c.id, c.owner_principal, c.client_name, c.allowed_agent_ids, c.revoked, c.created_at, v_raw_token
+  RETURNING c.id, c.owner_principal, c.client_name, c.allowed_agent_ids, c.created_at, v_raw_token
   INTO v_row;
 
   IF NOT FOUND THEN
@@ -684,7 +679,6 @@ INSERT INTO agents (
   name,
   token_hash,
   allowed_callers,
-  revoked,
   created_at,
   updated_at
 )
@@ -696,7 +690,6 @@ SELECT
   c.client_name,
   c.token_hash,
   COALESCE(ap.allowed_callers, '{}'),
-  c.revoked,
   c.created_at,
   COALESCE(ap.updated_at, c.created_at)
 FROM clients c
@@ -879,17 +872,14 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE O
 -- surface entirely). Revoke PUBLIC and grant back only to the authenticated
 -- role and to app_postgraphile (used for introspection).
 REVOKE EXECUTE ON FUNCTION register_client(TEXT, TEXT[], TEXT) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION revoke_client(TEXT) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION unrevoke_client(TEXT) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION delete_client(TEXT) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION rotate_client_token(TEXT) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION update_client_allowed_agents(TEXT, TEXT[]) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION agent_id_available(TEXT) FROM PUBLIC;
 
 GRANT EXECUTE ON FUNCTION register_client(TEXT, TEXT[], TEXT)
   TO app_authenticated, app_postgraphile;
-GRANT EXECUTE ON FUNCTION revoke_client(TEXT)
-  TO app_authenticated, app_postgraphile;
-GRANT EXECUTE ON FUNCTION unrevoke_client(TEXT)
+GRANT EXECUTE ON FUNCTION delete_client(TEXT)
   TO app_authenticated, app_postgraphile;
 GRANT EXECUTE ON FUNCTION rotate_client_token(TEXT)
   TO app_authenticated, app_postgraphile;

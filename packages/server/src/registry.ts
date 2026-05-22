@@ -74,11 +74,11 @@ export class Registry {
   }
 
   // Close every live WebSocket whose ClientConnection.clientId matches.
-  // Used by the admin-api revoke-client path so a daemon whose client row
-  // was just revoked sees a distinct close code (4014) and exits without
+  // Used by the admin-api delete-client path so a daemon whose client row
+  // was just deleted sees a distinct close code (4014) and exits without
   // reconnecting. Returns the number of connections closed; callers
   // surface that to the operator as confirmation that an orphan vs a
-  // live daemon was revoked.
+  // live daemon was deleted.
   //
   // 4014 is the next unused slot in the bridge's WS close-code range:
   //   - 4001-4008 ws.ts (hello timeout, invalid frame, expected hello,
@@ -90,7 +90,7 @@ export class Registry {
   //   - 4012-4013 card-resolver.ts (missing card-or-backend, unknown
   //     backend kind)
   // Reusing any of those would make the daemon misclassify unrelated
-  // handshake failures as revocation and exit instead of backing off.
+  // handshake failures as deletion and exit instead of backing off.
   //
   // The close itself fires this WS's own `close` handler asynchronously,
   // which in turn calls unregisterAgent and removes the entry from the
@@ -101,7 +101,7 @@ export class Registry {
     let closed = 0;
     for (const conn of this.agents.values()) {
       if (conn.clientId !== clientId) continue;
-      conn.ws.close(4014, 'client revoked');
+      conn.ws.close(4014, 'client deleted');
       closed++;
     }
     return closed;

@@ -351,8 +351,8 @@ test('Client reconnects after WebSocket close and sends hello again', async () =
   }
 });
 
-test('Client stops on 4014 "client revoked", invokes onFatal, and does NOT reconnect (#166)', async () => {
-  // When the bridge revokes the client mid-flight, the daemon must:
+test('Client stops on 4014 "client deleted", invokes onFatal, and does NOT reconnect (#166)', async () => {
+  // When the bridge deletes the client mid-flight, the daemon must:
   //   1. surface the fatal close via `onFatal` so the entrypoint can
   //      drive process exit (the Client itself never calls process.exit),
   //   2. mark itself stopped and clear the reconnect timer so it does
@@ -396,10 +396,10 @@ test('Client stops on 4014 "client revoked", invokes onFatal, and does NOT recon
   try {
     client.start();
     await waitFor(() => helloCount === 1, 'expected initial hello');
-    connections[0]!.close(4014, 'client revoked');
+    connections[0]!.close(4014, 'client deleted');
     await waitFor(() => fatalCalls.length === 1, 'expected onFatal to fire');
     assert.equal(fatalCalls[0]!.code, 4014);
-    assert.equal(fatalCalls[0]!.reason, 'client revoked');
+    assert.equal(fatalCalls[0]!.reason, 'client deleted');
     assert.equal(internals.stopped, true, 'client must mark itself stopped');
     assert.equal(internals.reconnectTimer, null, 'reconnect must not be scheduled');
     // Give the (would-be) reconnect plenty of headroom to misfire — if
@@ -413,10 +413,10 @@ test('Client stops on 4014 "client revoked", invokes onFatal, and does NOT recon
   }
 });
 
-test('Client stops on 4005 "bad token" too (revoke-then-relaunch case, #166)', async () => {
+test('Client stops on 4005 "bad token" too (delete-then-relaunch case, #166)', async () => {
   // 4005 is what ws.ts emits when the token lookup returns no row —
   // either the operator pasted the wrong secret, or the daemon was
-  // relaunched after revocation without rotating. Both are permanent
+  // relaunched after deletion without rotating. Both are permanent
   // auth failures, so the daemon must surface onFatal instead of
   // looping reconnects against an unreachable row.
   const server = createServer();

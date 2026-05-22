@@ -24,10 +24,14 @@ interface ClientRow {
 }
 
 async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | null> {
+  // Agent registrations are hard-deleted by admin-api.deleteClientForOwner,
+  // so token_hash lookup alone is sufficient: a stale token whose row was
+  // deleted simply matches nothing and the daemon sees the 4005 "bad token"
+  // path.
   const rows = await sql<ClientRow[]>`
     SELECT id, client_id, owner_principal, allowed_callers
     FROM agents
-    WHERE token_hash = ${hash} AND revoked = false
+    WHERE token_hash = ${hash}
   `;
   return rows[0] ?? null;
 }

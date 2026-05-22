@@ -47,20 +47,23 @@ const agentListSubCmd = command(
   }),
   {
     brief: message`List agent registrations under this owner.`,
-    description: message`Calls GET /admin-api/clients (backed by the unified \`agents\` table) and prints one block per agent, including revoked and disconnected ones. Use --connected to filter to live daemons.`,
+    description: message`Calls GET /admin-api/clients (backed by the unified \`agents\` table) and prints one block per agent, including disconnected ones. Use --connected to filter to live daemons.`,
   },
 );
 
-const agentRevokeSubCmd = command(
-  'revoke',
+const agentDeleteSubCmd = command(
+  'delete',
   object({
-    action: constant('agent-revoke' as const),
+    action: constant('agent-delete' as const),
     ...sharedFlags,
     target: argument(string({ metavar: 'AGENT_ID' })),
+    yes: withDefault(flag('--yes', {
+      description: message`Skip the confirmation prompt.`,
+    }), false),
   }),
   {
-    brief: message`Revoke an agent by id (or registration name).`,
-    description: message`Calls DELETE /admin-api/clients/<AGENT_ID>. Marks the agent revoked=true and, if a daemon is live, closes its WebSocket with code 4014. The row is preserved for audit history. The legacy client_id and the registration name are still accepted for backward compatibility.`,
+    brief: message`Delete an agent by id (or registration name).`,
+    description: message`Calls DELETE /admin-api/clients/<AGENT_ID>. Hard-deletes the agents and clients rows, and if a daemon is live closes its WebSocket with code 4014 ("client deleted") so it exits without reconnecting. There is no undo. The legacy client_id and the registration name are still accepted for backward compatibility. Prompts for Y/N confirmation unless --yes / -y is set.`,
   },
 );
 
@@ -114,16 +117,16 @@ const agentCallersSubCmd = command(
 
 export const agentCmd = command(
   'agent',
-  longestMatch(agentRegisterCmd, agentListSubCmd, agentRevokeSubCmd, agentCallersSubCmd),
+  longestMatch(agentRegisterCmd, agentListSubCmd, agentDeleteSubCmd, agentCallersSubCmd),
   {
     brief: message`Manage agent registrations and their allowed callers.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`revoke\`, \`callers {list,add,remove}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`delete\`, \`callers {list,add,remove}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
   },
 );
 
 export type AgentCliArgs = InferValue<typeof agentCmd>;
 export type AgentListArgs = Extract<AgentCliArgs, { action: 'agent-list' }>;
-export type AgentRevokeArgs = Extract<AgentCliArgs, { action: 'agent-revoke' }>;
+export type AgentDeleteArgs = Extract<AgentCliArgs, { action: 'agent-delete' }>;
 export type AgentCallersListArgs = Extract<AgentCliArgs, { action: 'agent-callers-list' }>;
 export type AgentCallersAddArgs = Extract<AgentCliArgs, { action: 'agent-callers-add' }>;
 export type AgentCallersRemoveArgs = Extract<AgentCliArgs, { action: 'agent-callers-remove' }>;
@@ -203,8 +206,8 @@ export const revokeClientCmd = command(
     target: argument(string({ metavar: 'CLIENT_ID_OR_NAME' })),
   }),
   {
-    brief: message`[deprecated] Use \`agent revoke\`.`,
-    description: message`Deprecated alias for \`vicoop-client agent revoke\`. Will be removed in a future release.`,
+    brief: message`[deprecated] Use \`agent delete\`.`,
+    description: message`Deprecated alias for \`vicoop-client agent delete\`. Hard-deletes the agent (renamed from revoke). Will be removed in a future release.`,
   },
 );
 
@@ -371,11 +374,10 @@ function renderAgentRegistrationList(body: unknown, connectedOnly: boolean): str
     String(c.agent_id ?? ((c.allowed_agent_ids as string[] | undefined)?.[0] ?? '')),
     String(c.client_name ?? ''),
     String(c.connected),
-    String(c.revoked),
     String(c.created_at ?? ''),
   ]);
   return renderTable(
-    ['AGENT_ID', 'NAME', 'CONNECTED', 'REVOKED', 'REGISTERED_AT'],
+    ['AGENT_ID', 'NAME', 'CONNECTED', 'REGISTERED_AT'],
     tableRows,
   );
 }
@@ -397,28 +399,27 @@ function renderClientList(body: unknown): string {
     String(c.client_id ?? ''),
     String(c.client_name ?? ''),
     (c.allowed_agent_ids as string[] | undefined)?.join(',') ?? '',
-    String(c.revoked),
     String(c.connected),
     String(c.created_at ?? ''),
   ]);
   return renderTable(
-    ['CLIENT_ID', 'CLIENT_NAME', 'ALLOWED_AGENT_IDS', 'REVOKED', 'CONNECTED', 'CREATED_AT'],
+    ['CLIENT_ID', 'CLIENT_NAME', 'ALLOWED_AGENT_IDS', 'CONNECTED', 'CREATED_AT'],
     tableRows,
   );
 }
 
-function renderRevokeResult(body: unknown): string {
+function renderDeleteResult(body: unknown): string {
   if (!body || typeof body !== 'object') return String(body);
   const b = body as {
     client_id?: string;
     client_name?: string;
-    revoked?: boolean;
+    deleted?: boolean;
     closed_connections?: number;
   };
   return [
     `client_id:          ${b.client_id}`,
     `client_name:        ${b.client_name}`,
-    `revoked:            ${b.revoked}`,
+    `deleted:            ${b.deleted}`,
     `closed_connections: ${b.closed_connections}`,
   ].join('\n');
 }
@@ -467,21 +468,62 @@ export async function runAgentList(args: AgentListArgs): Promise<number> {
   return emit(filtered, args.json, (b) => renderAgentRegistrationList(b, args.connected));
 }
 
-export async function runAgentRevoke(args: AgentRevokeArgs): Promise<number> {
+// Y/N confirmation prompt for destructive actions. Returns true when the
+// operator typed `y` / `yes` (case-insensitive). Any other input — including
+// EOF, just-pressing-enter, or stdin not being a TTY — returns false so a
+// non-interactive invocation does not silently delete. Operators in scripts
+// must pass --yes / -y to bypass.
+async function confirmYN(promptText: string): Promise<boolean> {
+  if (!process.stdin.isTTY) return false;
+  process.stdout.write(`${promptText} [y/N] `);
+  return new Promise((resolve) => {
+    let buf = '';
+    const onData = (chunk: Buffer): void => {
+      buf += chunk.toString('utf8');
+      const nl = buf.indexOf('\n');
+      if (nl < 0) return;
+      process.stdin.off('data', onData);
+      process.stdin.pause();
+      const answer = buf.slice(0, nl).trim().toLowerCase();
+      resolve(answer === 'y' || answer === 'yes');
+    };
+    process.stdin.resume();
+    process.stdin.on('data', onData);
+  });
+}
+
+async function execAgentDelete(
+  session: Session,
+  target: string,
+  json: boolean,
+): Promise<number> {
+  const result = await callApi({
+    session,
+    method: 'DELETE',
+    path: `/admin-api/clients/${encodeURIComponent(target)}`,
+  });
+  return emit(result, json, renderDeleteResult);
+}
+
+export async function runAgentDelete(args: AgentDeleteArgs): Promise<number> {
   const session = resolveSession(args);
   if ('error' in session) {
     process.stderr.write(`${session.error}\n`);
     return 1;
   }
+  if (!args.yes) {
+    const ok = await confirmYN(
+      `Delete agent "${args.target}"? This hard-deletes the registration and cannot be undone.`,
+    );
+    if (!ok) {
+      process.stderr.write('aborted\n');
+      return 1;
+    }
+  }
   // The server-side resolver accepts agent_id, legacy client_id, or the
   // registration name (admin-api.ts resolveClient), so we can keep the
   // same endpoint and let the operator pass any of those.
-  const result = await callApi({
-    session,
-    method: 'DELETE',
-    path: `/admin-api/clients/${encodeURIComponent(args.target)}`,
-  });
-  return emit(result, args.json, renderRevokeResult);
+  return execAgentDelete(session, args.target, args.json);
 }
 
 interface CallerCommonArgs {
@@ -589,18 +631,16 @@ export async function runListClients(args: ListClientsArgs): Promise<number> {
 }
 
 export async function runRevokeClient(args: RevokeClientArgs): Promise<number> {
-  warnDeprecated('revoke-client', 'agent revoke');
+  warnDeprecated('revoke-client', 'agent delete');
   const session = resolveSession(args);
   if ('error' in session) {
     process.stderr.write(`${session.error}\n`);
     return 1;
   }
-  const result = await callApi({
-    session,
-    method: 'DELETE',
-    path: `/admin-api/clients/${encodeURIComponent(args.target)}`,
-  });
-  return emit(result, args.json, renderRevokeResult);
+  // The deprecated alias intentionally skips the Y/N prompt to preserve the
+  // previous behavior of revoke-client (revocation was script-friendly). The
+  // new `agent delete` command is the prompting form.
+  return execAgentDelete(session, args.target, args.json);
 }
 
 export async function runListAgents(args: ListAgentsArgs): Promise<number> {
