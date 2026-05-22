@@ -796,6 +796,60 @@ function extractAssistantToolUses(content: unknown): ToolUseBlock[] {
   return out;
 }
 
+// Cap on the Task `description` text we surface in subagent bookend
+// messages. Same head-truncation rule as tool-call summaries — long
+// descriptions get a single-char ellipsis so consumers can still tell
+// the message was clipped.
+const TASK_DESCRIPTION_MAX_CHARS = 200;
+
+// Pull the human-readable description out of a Task tool's input object.
+// Claude Code's built-in Task tool accepts `{ description, prompt,
+// subagent_type }`; `description` is the short 3-5-word label the model
+// is supposed to write. Returns the empty string if the field is missing
+// or unusable — the caller falls back to a bare "Task" label.
+function extractTaskDescription(input: unknown): string {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return '';
+  const i = input as { description?: unknown };
+  if (typeof i.description !== 'string') return '';
+  const trimmed = i.description.trim();
+  if (!trimmed) return '';
+  return clipTo(trimmed, TASK_DESCRIPTION_MAX_CHARS);
+}
+
+interface TaskCompletion {
+  toolUseId: string;
+  description: string;
+  isError: boolean;
+}
+
+// Walk a `user`-role event's content array for `tool_result` blocks
+// matching tool_use_ids we previously registered as in-flight Task runs.
+// We surface a bookend message per match so callers see the subagent
+// finished even when the subagent itself emitted no user-visible text
+// (its output is packed into the tool_result fed back to the main
+// agent, not into the assistant stream).
+function extractTaskCompletions(
+  content: unknown,
+  registry: ReadonlyMap<string, string>,
+): TaskCompletion[] {
+  if (!Array.isArray(content)) return [];
+  const out: TaskCompletion[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    const b = block as { type?: unknown; tool_use_id?: unknown; is_error?: unknown };
+    if (b.type !== 'tool_result') continue;
+    if (typeof b.tool_use_id !== 'string') continue;
+    const description = registry.get(b.tool_use_id);
+    if (description === undefined) continue;
+    out.push({
+      toolUseId: b.tool_use_id,
+      description,
+      isError: b.is_error === true,
+    });
+  }
+  return out;
+}
+
 // Pull image/document blocks out of a `user`-role event's `tool_result`
 // content array. MCP screenshot tools, image-generation tools, and built-in
 // Read on a media file all surface here. Returned in encounter order.
@@ -1498,6 +1552,14 @@ export function createClaudeBackend(
       let aborted = false;
       let settled = false;
       const emitTraceArtifacts = traceabilityRequested(task);
+      // tool_use_id → description for in-flight Task subagent runs.
+      // Populated when a `Task` tool_use is observed; drained when the
+      // matching tool_result returns so we can bookend the long silence
+      // while the subagent is running with a visible "started/completed"
+      // message. Surfaces regardless of the traceability opt-in because
+      // without it callers see ZERO progress between the model's Task
+      // call and its final response.
+      const activeTaskRuns = new Map<string, string>();
 
       // Register this task with the send_file MCP server (if running) so
       // tool calls landing during this run resolve to this task's emit().
@@ -1555,6 +1617,37 @@ export function createClaudeBackend(
             parts,
             extensions: [TRACEABILITY_EXTENSION_URI],
             metadata: { traceType: 'tool-result' },
+          },
+          lastChunk: true,
+        });
+        emittedAnyArtifact = true;
+      };
+
+      // Surface a subagent lifecycle bookend as a `claude-message`
+      // artifact (NOT a trace artifact) so callers see it without opting
+      // into the traceability extension. The structured event +
+      // toolUseId on `metadata` let smart consumers style/correlate
+      // start↔end, but a plain text reader sees a normal chat message.
+      const emitSubagentEventArtifact = (
+        event: 'subagent-started' | 'subagent-completed' | 'subagent-failed',
+        toolUseId: string,
+        description: string,
+      ): void => {
+        const verb =
+          event === 'subagent-started'
+            ? 'started'
+            : event === 'subagent-completed'
+              ? 'completed'
+              : 'failed';
+        const label = description || 'Task';
+        emit({
+          type: 'task.artifact',
+          taskId: task.taskId,
+          artifact: {
+            artifactId: randomUUID(),
+            name: 'claude-message',
+            parts: [{ kind: 'text', text: `Task ${verb}: ${label}` }],
+            metadata: { event, toolUseId },
           },
           lastChunk: true,
         });
@@ -1624,13 +1717,38 @@ export function createClaudeBackend(
               });
               child.stdin.write(toolResult + '\n');
               try { child.stdin.end(); } catch { /* best effort */ }
-            } else if (emitTraceArtifacts) {
-              emitToolCallArtifact(tu);
+            } else {
+              // Surface Task starts as user-visible messages independently
+              // of the trace artifact stream — they bookend the otherwise
+              // silent window while the subagent runs. Trace artifact (if
+              // requested) still fires so trace-aware consumers see the
+              // structured tool-call alongside the human-readable bookend.
+              if (tu.toolName === 'Task' && tu.toolUseId) {
+                const description = extractTaskDescription(tu.input);
+                activeTaskRuns.set(tu.toolUseId, description);
+                emitSubagentEventArtifact('subagent-started', tu.toolUseId, description);
+              }
+              if (emitTraceArtifacts) emitToolCallArtifact(tu);
             }
           }
           return;
         }
         if (evt.type === 'user') {
+          // Task completion bookends must fire BEFORE the trace gate —
+          // they are always user-visible, regardless of the traceability
+          // opt-in, to close the loop on the start message we emitted
+          // above. A subagent that errored surfaces as "Task failed: ..."
+          // so the caller can tell their request didn't quietly succeed.
+          if (activeTaskRuns.size > 0) {
+            for (const done of extractTaskCompletions(evt.message?.content, activeTaskRuns)) {
+              activeTaskRuns.delete(done.toolUseId);
+              emitSubagentEventArtifact(
+                done.isError ? 'subagent-failed' : 'subagent-completed',
+                done.toolUseId,
+                done.description,
+              );
+            }
+          }
           if (!emitTraceArtifacts) return;
           // tool_result events come in as a synthetic user message in the
           // stream-json transcript; pull out any image/document blocks and

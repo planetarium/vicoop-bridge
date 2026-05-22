@@ -1542,6 +1542,200 @@ test('truncates a long tool_use input summary to a bounded length', async () => 
   assert.ok(textPart.text.endsWith('…'), 'truncation marker expected at tail');
 });
 
+test('Task tool_use surfaces start/finish bookend messages without traceability opt-in', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'tu_task_1',
+              name: 'Task',
+              input: { description: 'Search Bson transaction handlers', prompt: 'Find …' },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tu_task_1',
+              content: [{ type: 'text', text: 'subagent done' }],
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Here is the summary.' }] },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'Here is the summary.' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
+  const { emit, frames } = collect();
+  // Note: assign() — NO traceability extension.
+  await backend.handle(assign('look into Bson'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  // Without trace, we get: subagent-started, subagent-completed, then the
+  // final assistant text. No claude-tool-call / claude-tool-result.
+  assert.deepEqual(
+    artifacts.map((a) => a.artifact.name),
+    ['claude-message', 'claude-message', 'claude-message'],
+  );
+  assert.equal(textOf(artifacts[0]), 'Task started: Search Bson transaction handlers');
+  assert.equal(artifacts[0].artifact.metadata?.event, 'subagent-started');
+  assert.equal(artifacts[0].artifact.metadata?.toolUseId, 'tu_task_1');
+  assert.equal(textOf(artifacts[1]), 'Task completed: Search Bson transaction handlers');
+  assert.equal(artifacts[1].artifact.metadata?.event, 'subagent-completed');
+  assert.equal(artifacts[1].artifact.metadata?.toolUseId, 'tu_task_1');
+  assert.equal(textOf(artifacts[2]), 'Here is the summary.');
+});
+
+test('Task tool_result with is_error=true emits a "Task failed" bookend', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'tu_task_err',
+              name: 'Task',
+              input: { description: 'Audit migrations', prompt: 'Check …' },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tu_task_err',
+              is_error: true,
+              content: [{ type: 'text', text: 'subagent error' }],
+            },
+          ],
+        },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'gave up' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
+  const { emit, frames } = collect();
+  await backend.handle(assign('try the audit'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  const failed = artifacts.find((a) => a.artifact.metadata?.event === 'subagent-failed');
+  assert.ok(failed, 'expected a subagent-failed message');
+  assert.equal(textOf(failed), 'Task failed: Audit migrations');
+});
+
+test('Task bookend messages co-exist with trace artifacts when traceability is requested', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'tu_task_trace',
+              name: 'Task',
+              input: { description: 'Trace flow' },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tu_task_trace',
+              content: [{ type: 'text', text: 'ok' }],
+            },
+          ],
+        },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'done' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
+  const { emit, frames } = collect();
+  await backend.handle(assignWithTraceability('trace it'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  const names = artifacts.map((a) => a.artifact.name);
+  // Sequence: started bookend, tool-call trace, completed bookend.
+  // Text-only tool_result content emits no claude-tool-result (only
+  // image/document blocks do), so we don't expect one for this run.
+  assert.deepEqual(names, ['claude-message', 'claude-tool-call', 'claude-message']);
+  assert.equal(artifacts[0].artifact.metadata?.event, 'subagent-started');
+  assert.equal(artifacts[2].artifact.metadata?.event, 'subagent-completed');
+});
+
+test('Task description falls back to bare "Task" when input.description is missing', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'tu_task_nodesc',
+              name: 'Task',
+              input: { prompt: 'Do something' },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
+  const { emit, frames } = collect();
+  await backend.handle(assign('go'), emit, NEVER);
+
+  const started = frames
+    .filter((f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact')
+    .find((a) => a.artifact.metadata?.event === 'subagent-started');
+  assert.ok(started, 'expected a subagent-started message even without description');
+  assert.equal(textOf(started), 'Task started: Task');
+});
+
 test('heartbeat: emits task.status after heartbeatMs of silence and stops at terminal time', async () => {
   // Initialize as a no-op so the type stays `() => void` instead of
   // `(() => void) | null`. The closure-mutation path through setIntervalFn
