@@ -182,28 +182,33 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
         log.error(`--from-host: ${(err as Error).message}`);
         log.error(
           `Rerun without --from-host to leave creds empty for an interactive auth flow ` +
-            `(docker exec -it ${containerName} ${authHintFor(opts.kind)}).`,
+            `(${authCommandFor(containerName, opts.kind)}).`,
         );
         return 1;
       }
     } else {
       log.info(
         `--from-host not set: leaving creds empty. To auth inside the container run\n` +
-          `    docker exec -it ${containerName} ${authHintFor(opts.kind)}`,
+          `    ${authCommandFor(containerName, opts.kind)}`,
       );
     }
 
-    log.info(`runtime container for ${opts.kind} ready. start daemon with:`);
+    log.info(`runtime container for ${opts.kind} initialized. start daemon with:`);
     log.info(
       `    vicoop-client --backend ${opts.kind} --runtime container --runtime-name ${runtimeName}`,
     );
     return 0;
   } finally {
-    // Leave the container running. The next daemon launch reuses
-    // it; an explicit cleanup is `vicoop-client container rm <name>`
-    // (operator's job, on purpose — they may be about to start the
-    // daemon).
+    await runtime.stop();
   }
+}
+
+function authCommandFor(containerName: string, kind: InstallableBackendKind): string {
+  return (
+    `docker start ${containerName} >/dev/null && ` +
+    `docker exec -it ${containerName} ${authHintFor(kind)} && ` +
+    `docker stop ${containerName} >/dev/null`
+  );
 }
 
 // Run `docker exec [--user U] <container> <cmd...>` with stdio
