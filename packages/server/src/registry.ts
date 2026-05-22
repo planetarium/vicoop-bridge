@@ -61,7 +61,25 @@ export class Registry {
     const existing = this.agents.get(conn.agentId);
     if (existing) {
       if (existing.clientId === conn.clientId) {
-        existing.ws.close(4009, 'replaced by new connection');
+        // Two daemons authenticated with the same CLIENT_TOKEN (so they
+        // resolve to the same clientId row) and racing to register the
+        // same agent. Surface a distinct structured event so fly logs /
+        // admin tooling can spot flapping agents independently of the
+        // normal client_connected / client_disconnected pair — without
+        // this, a duplicate-token loop is indistinguishable from a flaky
+        // network in aggregate logs.
+        // agentId is user-controlled (hello frame), so truncate before
+        // logging — same defense applied in notifyAgentChange below.
+        logEvent('client_collision', {
+          agentId: truncate(String(conn.agentId), 128),
+          clientId: conn.clientId,
+          previousConnectedAt: existing.connectedAt,
+        });
+        // The close `reason` is what the client surfaces in its disconnect
+        // log line. Spelling out the cause here means an operator reading
+        // the foreground log can recognize the duplicate-token scenario
+        // without cross-referencing close codes.
+        existing.ws.close(4009, 'another client with the same token connected');
         this.agents.set(conn.agentId, conn);
         this.notifyAgentChange(conn.agentId);
         return { ok: true };
@@ -84,7 +102,8 @@ export class Registry {
   //   - 4001-4008 ws.ts (hello timeout, invalid frame, expected hello,
   //     protocol-version mismatch, bad token, registry registration
   //     failed, duplicate hello, agent id not in client allowlist)
-  //   - 4009 registry.ts (this file: `replaced by new connection`)
+  //   - 4009 registry.ts (this file: `another client with the same token
+  //     connected` — duplicate-token collision)
   //   - 4010-4011 ws.ts (agent id owned by a different principal,
   //     reserved agent id)
   //   - 4012-4013 card-resolver.ts (missing card-or-backend, unknown

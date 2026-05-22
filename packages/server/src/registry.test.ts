@@ -277,6 +277,51 @@ test('disconnectClient closes every ws bound to the client_id with code 4014', (
   assert.deepEqual(ws3.closeArgs, []);
 });
 
+test('registerAgent emits client_collision and closes the prior ws with the descriptive 4009 reason', (t) => {
+  // Two daemons authenticated with the same CLIENT_TOKEN — so the token
+  // hash resolves to the same client row, hence the same clientId — show
+  // up here as a second registerAgent() for the same agentId + clientId.
+  // The prior ws must
+  // receive close(4009, 'another client with the same token connected')
+  // — both the code and the reason text — so the surviving client surfaces
+  // the cause directly in its disconnect log line. A structured
+  // `client_collision` event must also fire so aggregated server logs can
+  // be grepped for flapping agents independently of normal connect/
+  // disconnect noise.
+  const logs: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => {
+    logs.push(args.map(String).join(' '));
+  });
+  const registry = new Registry();
+  const ws1 = makeRecordingWs();
+  const ws2 = makeRecordingWs();
+  const base = {
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+  };
+  registry.registerAgent({ ...base, ws: ws1, connectedAt: 1000 });
+  registry.registerAgent({ ...base, ws: ws2, connectedAt: 2000 });
+  assert.deepEqual(ws1.closeArgs, [
+    { code: 4009, reason: 'another client with the same token connected' },
+  ]);
+  // The new ws is the live one and must not have been closed.
+  assert.deepEqual(ws2.closeArgs, []);
+  const collisionLine = logs.find((l) => l.includes('client_collision'));
+  assert.ok(collisionLine, `expected client_collision event, got: ${logs.join(' | ')}`);
+  const parsed = JSON.parse(collisionLine) as Record<string, unknown>;
+  assert.equal(parsed.event, 'client_collision');
+  assert.equal(parsed.agentId, 'a1');
+  assert.equal(parsed.clientId, 'c1');
+  // previousConnectedAt surfaces the displaced connection's connectedAt so
+  // operators can see how long the loser had been live before being
+  // replaced — useful when triaging a fast ping-pong vs. a legit handoff
+  // after a long-stable session.
+  assert.equal(parsed.previousConnectedAt, 1000);
+});
+
 test('disconnectClient returns 0 when no agents are bound to the client', () => {
   const registry = new Registry();
   registry.registerAgent({

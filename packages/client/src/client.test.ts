@@ -460,6 +460,86 @@ test('Client stops on 4005 "bad token" too (delete-then-relaunch case, #166)', a
   }
 });
 
+test('Client surfaces 4009 "duplicate token" with a dedicated warn and floors the reconnect delay (#270)', async () => {
+  // The default 4009 path before this fix logged only the generic
+  // "disconnected: 4009 …" line and looped reconnects at the normal
+  // exponential backoff. Two daemons authenticated with the same
+  // CLIENT_TOKEN (the bridge's clientId-level collision check, not the
+  // operator-visible agent identity) ended up ping-ponging each other
+  // indefinitely at the 30 s cap.
+  //
+  // The contract we're locking in here:
+  //   1. A clear warn line names both the cause (same CLIENT_TOKEN) and
+  //      the remediation (`pgrep -fl vicoop-client`).
+  //   2. The next reconnect waits at least `collisionBackoffMs` so the
+  //      duplicate-token loop damps out on the first cycle instead of
+  //      hammering the server at the 30 s cap forever.
+  //   3. 4009 is NOT fatal — if the other daemon goes away, this side
+  //      still recovers automatically (just slowly).
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  const connections: WebSocket[] = [];
+  let helloCount = 0;
+  wss.on('connection', (ws) => {
+    connections.push(ws);
+    ws.on('message', () => helloCount++);
+  });
+
+  const fatalCalls: Array<{ code: number; reason: string }> = [];
+  const captured = makeSink();
+  // Small collisionBackoffMs keeps the test fast — the production default
+  // is 5 min, which would dominate the test runtime. The point of the
+  // assertion below is the floor *exists*, not its specific value.
+  const COLLISION_FLOOR = 200;
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => {
+      /* no tasks */
+    }),
+    // Normal backoff would be 10 ms here. The collision floor (200 ms)
+    // must override it.
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    reconnectStableMs: 0,
+    heartbeatIntervalMs: 0,
+    collisionBackoffMs: COLLISION_FLOOR,
+    onFatal: (info) => fatalCalls.push(info),
+    logSink: captured.sink,
+  });
+
+  try {
+    client.start();
+    await waitFor(() => helloCount === 1, 'expected initial hello');
+    const closedAt = Date.now();
+    connections[0]!.close(4009, 'another client with the same token connected');
+    // The warn line must name both the CLIENT_TOKEN cause and the
+    // pgrep-based remediation — both halves of the contract above.
+    await waitFor(
+      () => captured.warn.some((l) => l.includes('CLIENT_TOKEN') && l.includes('pgrep')),
+      `expected dedicated 4009 warn, got warns: ${captured.warn.join(' | ')}`,
+    );
+    // Reconnect must respect the collision floor, not the 10 ms normal
+    // delay. Wait until the second hello lands and verify the elapsed time
+    // is at least the floor (with a small slack for test scheduling).
+    await waitFor(() => helloCount === 2, 'expected reconnect after collision', 2000);
+    const elapsed = Date.now() - closedAt;
+    assert.ok(
+      elapsed >= COLLISION_FLOOR - 20,
+      `reconnect fired in ${elapsed}ms, expected >= ~${COLLISION_FLOOR}ms (collision floor)`,
+    );
+    // 4009 is not fatal — onFatal must NOT have fired.
+    assert.deepEqual(fatalCalls, [], 'onFatal must not fire on 4009');
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
 test('Client treats reconnectable closes (1012) as non-terminal and does NOT call onFatal', async () => {
   // Companion to the 4014/4005 tests: a transient close code (here 1012
   // service restart, the same code the reconnect-happy-path test uses)
