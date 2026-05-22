@@ -32,6 +32,9 @@ import { createLogger, type Logger } from './logger.js';
 
 export const DEFAULT_RUNTIME_IMAGE = 'ghcr.io/planetarium/vicoop-runtime:latest';
 
+export const RUNTIME_MANAGED_BY_LABEL = 'vicoop.managed-by=vicoop-bridge';
+export const RUNTIME_COMPONENT_LABEL = 'vicoop.component=runtime';
+
 export interface RuntimeContainerOptions {
   // Which backend this container hosts. Used in the canonical
   // container/volume names so claude and codex get isolated runtimes.
@@ -67,7 +70,7 @@ export interface DockerResult {
 
 export type DockerRun = (args: readonly string[]) => DockerResult;
 
-function defaultDockerRun(args: readonly string[]): DockerResult {
+export function defaultDockerRun(args: readonly string[]): DockerResult {
   const r = spawnSync('docker', Array.from(args), { encoding: 'utf8' });
   return {
     stdout: r.stdout ?? '',
@@ -76,16 +79,16 @@ function defaultDockerRun(args: readonly string[]): DockerResult {
   };
 }
 
-function containerName(kind: string): string {
+export function containerName(kind: string): string {
   return `vicoop-runtime-${kind}`;
 }
-function agentsVolumeName(kind: string): string {
+export function agentsVolumeName(kind: string): string {
   return `vicoop-agents-${kind}`;
 }
-function credsVolumeName(kind: string): string {
+export function credsVolumeName(kind: string): string {
   return `vicoop-creds-${kind}`;
 }
-function sessionsVolumeName(kind: string): string {
+export function sessionsVolumeName(kind: string): string {
   return `vicoop-sessions-${kind}`;
 }
 
@@ -216,6 +219,10 @@ export class RuntimeContainer {
         'volume',
         'create',
         '--label',
+        RUNTIME_MANAGED_BY_LABEL,
+        '--label',
+        RUNTIME_COMPONENT_LABEL,
+        '--label',
         `vicoop.kind=${kind}`,
         name,
       ]);
@@ -260,6 +267,10 @@ export class RuntimeContainer {
       'NET_ADMIN',
       '--cap-add',
       'NET_RAW',
+      '--label',
+      RUNTIME_MANAGED_BY_LABEL,
+      '--label',
+      RUNTIME_COMPONENT_LABEL,
       '--label',
       `vicoop.kind=${kind}`,
     ];

@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import {
   collectClaudeHostCreds,
   collectCodexHostCreds,
+  formatRuntimeList,
+  formatRuntimeListJson,
+  listRuntimeContainers,
 } from './container-init.js';
+import type { DockerResult } from './runtime-container.js';
 
 // ──────────────────────────────────────────────────────────────────
 // collectClaudeHostCreds
@@ -104,3 +108,110 @@ test('collectCodexHostCreds: neither file present returns empty', () => {
   });
   assert.deepEqual(files, []);
 });
+
+// ──────────────────────────────────────────────────────────────────
+// container ls
+// ──────────────────────────────────────────────────────────────────
+
+test('listRuntimeContainers: fixed rows from managed docker labels', () => {
+  const calls: Array<readonly string[]> = [];
+  const dockerRun = (args: readonly string[]): DockerResult => {
+    calls.push(args);
+    if (args[0] === 'ps') {
+      return ok(
+        [
+          JSON.stringify({
+            Names: 'vicoop-runtime-claude',
+            State: 'running',
+            Image: 'runtime:latest',
+          }),
+          JSON.stringify({
+            Names: 'vicoop-runtime-codex',
+            State: 'exited',
+            Image: 'runtime:old',
+          }),
+        ].join('\n'),
+      );
+    }
+    if (args[0] === 'volume') {
+      return ok(
+        [
+          JSON.stringify({ Name: 'vicoop-agents-claude' }),
+          JSON.stringify({ Name: 'vicoop-creds-claude' }),
+          JSON.stringify({ Name: 'vicoop-sessions-claude' }),
+          JSON.stringify({ Name: 'vicoop-agents-codex' }),
+        ].join('\n'),
+      );
+    }
+    throw new Error(`unexpected docker args: ${args.join(' ')}`);
+  };
+
+  const rows = listRuntimeContainers({ dockerRun });
+
+  assert.deepEqual(calls[0], [
+    'ps',
+    '-a',
+    '--filter',
+    'label=vicoop.managed-by=vicoop-bridge',
+    '--filter',
+    'label=vicoop.component=runtime',
+    '--format',
+    '{{json .}}',
+  ]);
+  assert.deepEqual(calls[1], [
+    'volume',
+    'ls',
+    '--filter',
+    'label=vicoop.managed-by=vicoop-bridge',
+    '--filter',
+    'label=vicoop.component=runtime',
+    '--format',
+    '{{json .}}',
+  ]);
+  assert.equal(rows[0].kind, 'claude');
+  assert.equal(rows[0].container.state, 'running');
+  assert.equal(rows[0].container.image, 'runtime:latest');
+  assert.equal(rows[0].volumes.sessions.present, true);
+  assert.equal(rows[1].kind, 'codex');
+  assert.equal(rows[1].container.state, 'stopped');
+  assert.equal(rows[1].volumes.agents.present, true);
+  assert.equal(rows[1].volumes.creds.present, false);
+  assert.equal(rows[1].volumes.sessions.present, false);
+});
+
+test('listRuntimeContainers: missing resources stay visible', () => {
+  const rows = listRuntimeContainers({
+    dockerRun: (args) => {
+      assert.ok(args[0] === 'ps' || args[0] === 'volume');
+      return ok('');
+    },
+  });
+
+  assert.deepEqual(
+    rows.map((row) => [row.kind, row.container.state, row.container.image]),
+    [
+      ['claude', 'missing', null],
+      ['codex', 'missing', null],
+    ],
+  );
+  assert.equal(rows.every((row) => !row.volumes.agents.present), true);
+});
+
+test('formatRuntimeList and JSON output include volume state', () => {
+  const rows = listRuntimeContainers({
+    dockerRun: (args) => {
+      if (args[0] === 'ps') return ok('');
+      return ok(JSON.stringify({ Name: 'vicoop-creds-codex' }));
+    },
+  });
+
+  assert.match(formatRuntimeList(rows), /KIND\s+CONTAINER\s+IMAGE\s+AGENTS\s+CREDS\s+SESSIONS/);
+  assert.match(formatRuntimeList(rows), /codex\s+missing\s+-\s+no\s+yes\s+no/);
+  const parsed = JSON.parse(formatRuntimeListJson(rows));
+  assert.equal(parsed[1].volumes.creds.name, 'vicoop-creds-codex');
+  assert.equal(parsed[1].volumes.creds.present, true);
+});
+
+function ok(stdout = ''): DockerResult {
+  return { stdout, stderr: '', exitCode: 0 };
+}

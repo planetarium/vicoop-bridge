@@ -77,6 +77,8 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
   );
   for (const v of volumeCreates) {
     assert.ok(v.includes('vicoop.kind=claude'), `label on ${v.join(' ')}`);
+    assert.ok(v.includes('vicoop.managed-by=vicoop-bridge'), `managed label on ${v.join(' ')}`);
+    assert.ok(v.includes('vicoop.component=runtime'), `component label on ${v.join(' ')}`);
   }
 
   // Container create argv: --name, --restart unless-stopped, NET_ADMIN+RAW,
@@ -90,6 +92,9 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
   assert.equal(argv[restartIdx + 1], 'unless-stopped');
   assert.ok(argv.includes('NET_ADMIN'));
   assert.ok(argv.includes('NET_RAW'));
+  assert.ok(argv.includes('vicoop.managed-by=vicoop-bridge'));
+  assert.ok(argv.includes('vicoop.component=runtime'));
+  assert.ok(argv.includes('vicoop.kind=claude'));
   assert.ok(
     argv.some((a) => a === 'type=bind,source=/host/workspace,target=/workspace'),
     'host workspace mounted',

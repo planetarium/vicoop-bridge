@@ -26,7 +26,18 @@ import { argument, command, constant, flag, option } from '@optique/core/primiti
 import { message } from '@optique/core/message';
 import { choice, string } from '@optique/core/valueparser';
 import type { InferValue } from '@optique/core/parser';
-import { RuntimeContainer, DEFAULT_RUNTIME_IMAGE } from './runtime-container.js';
+import {
+  agentsVolumeName,
+  containerName,
+  credsVolumeName,
+  defaultDockerRun,
+  RuntimeContainer,
+  DEFAULT_RUNTIME_IMAGE,
+  RUNTIME_COMPONENT_LABEL,
+  RUNTIME_MANAGED_BY_LABEL,
+  sessionsVolumeName,
+  type DockerRun,
+} from './runtime-container.js';
 import { BACKENDS_MANIFEST, type InstallableBackendKind } from './backends-manifest.js';
 import { createLogger, type Logger } from './logger.js';
 
@@ -46,6 +57,26 @@ export interface ContainerInitOptions {
   // would use; included as a parameter so tests can override.
   bridgeUrl?: string;
   logger?: Logger;
+}
+
+type RuntimeContainerState = 'running' | 'stopped' | 'missing';
+
+export interface RuntimeListRow {
+  kind: InstallableBackendKind;
+  container: {
+    name: string;
+    state: RuntimeContainerState;
+    image: string | null;
+  };
+  volumes: {
+    agents: { name: string; present: boolean };
+    creds: { name: string; present: boolean };
+    sessions: { name: string; present: boolean };
+  };
+}
+
+export interface ContainerListOptions {
+  dockerRun?: DockerRun;
 }
 
 // Returns the process exit code the CLI should use. Throws only on
@@ -365,6 +396,138 @@ function authHintFor(kind: InstallableBackendKind): string {
   return `<kind>-specific auth command`;
 }
 
+export function listRuntimeContainers(opts: ContainerListOptions = {}): RuntimeListRow[] {
+  const dockerRun = opts.dockerRun ?? defaultDockerRun;
+  const containers = readManagedContainers(dockerRun);
+  const volumes = readManagedVolumes(dockerRun);
+
+  return BACKEND_KINDS.map((kind) => {
+    const expectedContainerName = containerName(kind);
+    const container = containers.get(expectedContainerName);
+    return {
+      kind,
+      container: {
+        name: expectedContainerName,
+        state: container ? normalizeContainerState(container.state) : 'missing',
+        image: container?.image ?? null,
+      },
+      volumes: {
+        agents: volumePresence(volumes, agentsVolumeName(kind)),
+        creds: volumePresence(volumes, credsVolumeName(kind)),
+        sessions: volumePresence(volumes, sessionsVolumeName(kind)),
+      },
+    };
+  });
+}
+
+export function formatRuntimeList(rows: readonly RuntimeListRow[]): string {
+  const table = [
+    ['KIND', 'CONTAINER', 'IMAGE', 'AGENTS', 'CREDS', 'SESSIONS'],
+    ...rows.map((row) => [
+      row.kind,
+      row.container.state,
+      row.container.image ?? '-',
+      presentCell(row.volumes.agents.present),
+      presentCell(row.volumes.creds.present),
+      presentCell(row.volumes.sessions.present),
+    ]),
+  ];
+  const widths = table[0].map((_, i) => Math.max(...table.map((r) => r[i].length)));
+  return table
+    .map((row) => row.map((cell, i) => cell.padEnd(widths[i])).join('  ').trimEnd())
+    .join('\n');
+}
+
+export function formatRuntimeListJson(rows: readonly RuntimeListRow[]): string {
+  return JSON.stringify(rows, null, 2);
+}
+
+function readManagedContainers(
+  dockerRun: DockerRun,
+): Map<string, { state: string; image: string | null }> {
+  const r = dockerRun([
+    'ps',
+    '-a',
+    '--filter',
+    `label=${RUNTIME_MANAGED_BY_LABEL}`,
+    '--filter',
+    `label=${RUNTIME_COMPONENT_LABEL}`,
+    '--format',
+    '{{json .}}',
+  ]);
+  if (r.exitCode !== 0) {
+    throw new Error(`docker ps failed (exit ${r.exitCode}): ${r.stderr.trim()}`);
+  }
+
+  const result = new Map<string, { state: string; image: string | null }>();
+  for (const entry of parseDockerJsonLines(r.stdout, 'docker ps')) {
+    const name = stringField(entry, 'Names') ?? stringField(entry, 'Name');
+    if (!name) continue;
+    result.set(name, {
+      state: stringField(entry, 'State') ?? '',
+      image: stringField(entry, 'Image'),
+    });
+  }
+  return result;
+}
+
+function readManagedVolumes(dockerRun: DockerRun): Set<string> {
+  const r = dockerRun([
+    'volume',
+    'ls',
+    '--filter',
+    `label=${RUNTIME_MANAGED_BY_LABEL}`,
+    '--filter',
+    `label=${RUNTIME_COMPONENT_LABEL}`,
+    '--format',
+    '{{json .}}',
+  ]);
+  if (r.exitCode !== 0) {
+    throw new Error(`docker volume ls failed (exit ${r.exitCode}): ${r.stderr.trim()}`);
+  }
+
+  const result = new Set<string>();
+  for (const entry of parseDockerJsonLines(r.stdout, 'docker volume ls')) {
+    const name = stringField(entry, 'Name');
+    if (name) result.add(name);
+  }
+  return result;
+}
+
+function parseDockerJsonLines(stdout: string, command: string): Record<string, unknown>[] {
+  const rows: Record<string, unknown>[] = [];
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        rows.push(parsed as Record<string, unknown>);
+      }
+    } catch (e) {
+      throw new Error(`${command} returned invalid JSON: ${(e as Error).message}`);
+    }
+  }
+  return rows;
+}
+
+function normalizeContainerState(state: string): RuntimeContainerState {
+  return state === 'running' ? 'running' : 'stopped';
+}
+
+function volumePresence(volumes: Set<string>, name: string): RuntimeListRow['volumes']['agents'] {
+  return { name, present: volumes.has(name) };
+}
+
+function presentCell(present: boolean): string {
+  return present ? 'yes' : 'no';
+}
+
+function stringField(row: Record<string, unknown>, field: string): string | null {
+  const value = row[field];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // CLI surface (`vicoop-client container init <kind> [opts]`)
 //
@@ -413,17 +576,39 @@ const containerInitSubCmd = command(
   },
 );
 
+function containerListCommand(name: 'ls' | 'list') {
+  return command(
+    name,
+    object({
+      action: constant('container-list' as const),
+      json: withDefault(flag('--json', {
+        description: message`Emit machine-readable JSON.`,
+      }), false),
+    }),
+    {
+      brief: message`List runtime containers and volumes.`,
+      description: message`Prints one row per supported runtime kind, showing whether the managed Docker container is running, stopped, or missing and whether each expected named volume exists.`,
+    },
+  );
+}
+
+const containerListSubCmd = longestMatch(
+  containerListCommand('ls'),
+  containerListCommand('list'),
+);
+
 export const containerCmd = command(
   'container',
-  longestMatch(containerInitSubCmd),
+  longestMatch(containerInitSubCmd, containerListSubCmd),
   {
     brief: message`Manage per-backend runtime containers.`,
-    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<kind>\`, install the agent CLI, optionally copy host creds). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
+    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<kind>\`, install the agent CLI, optionally copy host creds), \`ls\` / \`list\` (show managed runtime container and volume state). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
   },
 );
 
 export type ContainerCliArgs = InferValue<typeof containerCmd>;
 export type ContainerInitArgs = Extract<ContainerCliArgs, { action: 'container-init' }>;
+export type ContainerListArgs = Extract<ContainerCliArgs, { action: 'container-list' }>;
 
 // Adapter from optique-parsed args → runContainerInit's typed
 // options. Lives here (not in cli.ts) so the command surface and
@@ -438,6 +623,17 @@ export async function runContainerInitCli(args: ContainerInitArgs): Promise<numb
     });
   } catch (err) {
     console.error(`container init failed: ${(err as Error).message}`);
+    return 1;
+  }
+}
+
+export async function runContainerListCli(args: ContainerListArgs): Promise<number> {
+  try {
+    const rows = listRuntimeContainers();
+    process.stdout.write((args.json ? formatRuntimeListJson(rows) : formatRuntimeList(rows)) + '\n');
+    return 0;
+  } catch (err) {
+    console.error(`container ls failed: ${(err as Error).message}`);
     return 1;
   }
 }
