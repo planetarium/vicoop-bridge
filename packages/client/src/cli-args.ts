@@ -80,7 +80,7 @@ export const daemonFlagsFields = {
     description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside an existing vicoop-runtime container created by \`vicoop-client container init <kind>\`. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
   })),
   runtimeName: optional(option('--runtime-name', string({ metavar: 'NAME' }), {
-    description: message`Named runtime container instance to use with \`--runtime container\`. Omit for the default per-kind runtime.`,
+    description: message`Runtime container instance name to use with \`--runtime container\`. Omit to use the active backend kind as the generated name.`,
   })),
 
   // Backend-specific (Claude)

@@ -34,14 +34,13 @@ export const DEFAULT_RUNTIME_IMAGE = 'ghcr.io/planetarium/vicoop-runtime:latest'
 
 export const RUNTIME_MANAGED_BY_LABEL = 'vicoop.managed-by=vicoop-bridge';
 export const RUNTIME_COMPONENT_LABEL = 'vicoop.component=runtime';
-export const DEFAULT_RUNTIME_INSTANCE = 'default';
 
 export interface RuntimeContainerOptions {
-  // Which backend this container hosts. Used in the canonical
-  // container/volume names so claude and codex get isolated runtimes.
+  // Which backend this container hosts. Stored as metadata and used for
+  // backend-specific install paths inside the shared runtime image.
   backendKind: string;
-  // Optional per-kind runtime instance name. Omitted means the legacy
-  // default names (`vicoop-runtime-<kind>`, `vicoop-agents-<kind>`, ...).
+  // Runtime instance name. Omitted means the backend kind is used as the
+  // generated name, so identity stays name-based without an unnamed mode.
   runtimeName?: string;
   // OCI image to run. Defaults to DEFAULT_RUNTIME_IMAGE; env override
   // `VICOOP_RUNTIME_IMAGE` is resolved by the caller (cli.ts) so this
@@ -96,37 +95,34 @@ export function validateRuntimeName(name: string | undefined): string | undefine
       `runtime name must match [a-z0-9][a-z0-9_.-]{0,31}; got '${name}'`,
     );
   }
-  if (trimmed === DEFAULT_RUNTIME_INSTANCE) {
-    throw new Error(
-      `runtime name '${DEFAULT_RUNTIME_INSTANCE}' is reserved; omit --name/--runtime-name for the default runtime`,
-    );
-  }
   return trimmed;
 }
 
-export function runtimeInstanceLabel(name: string | undefined): string {
-  return name ?? DEFAULT_RUNTIME_INSTANCE;
+export function defaultRuntimeName(kind: string): string {
+  const name = validateRuntimeName(kind);
+  if (!name) throw new Error(`backend kind '${kind}' cannot be used as a runtime name`);
+  return name;
 }
 
-function runtimeSuffix(name: string | undefined): string {
-  return name ? `-${name}` : '';
+export function runtimeInstanceName(kind: string, name: string | undefined): string {
+  return validateRuntimeName(name) ?? defaultRuntimeName(kind);
 }
 
 export function containerName(kind: string, runtimeName?: string): string {
-  return `vicoop-runtime-${kind}${runtimeSuffix(runtimeName)}`;
+  return `vicoop-runtime-${runtimeInstanceName(kind, runtimeName)}`;
 }
 export function agentsVolumeName(kind: string, runtimeName?: string): string {
-  return `vicoop-agents-${kind}${runtimeSuffix(runtimeName)}`;
+  return `vicoop-agents-${runtimeInstanceName(kind, runtimeName)}`;
 }
 export function credsVolumeName(kind: string, runtimeName?: string): string {
-  return `vicoop-creds-${kind}${runtimeSuffix(runtimeName)}`;
+  return `vicoop-creds-${runtimeInstanceName(kind, runtimeName)}`;
 }
 export function sessionsVolumeName(kind: string, runtimeName?: string): string {
-  return `vicoop-sessions-${kind}${runtimeSuffix(runtimeName)}`;
+  return `vicoop-sessions-${runtimeInstanceName(kind, runtimeName)}`;
 }
 
 export class RuntimeContainer {
-  private readonly opts: Required<Pick<RuntimeContainerOptions, 'backendKind' | 'image'>> &
+  private readonly opts: Required<Pick<RuntimeContainerOptions, 'backendKind' | 'image' | 'runtimeName'>> &
     RuntimeContainerOptions;
   private readonly log: Logger;
   private readonly run: DockerRun;
@@ -135,7 +131,7 @@ export class RuntimeContainer {
   constructor(opts: RuntimeContainerOptions) {
     this.opts = {
       ...opts,
-      runtimeName: validateRuntimeName(opts.runtimeName),
+      runtimeName: runtimeInstanceName(opts.backendKind, opts.runtimeName),
       image: opts.image ?? DEFAULT_RUNTIME_IMAGE,
     };
     this.log = opts.logger ?? createLogger();
@@ -165,15 +161,10 @@ export class RuntimeContainer {
       }
     } else {
       if (!this.opts.createIfMissing) {
-        const initHint = this.opts.runtimeName
-          ? `vicoop-client container init ${this.opts.backendKind} --name ${this.opts.runtimeName}`
-          : `vicoop-client container init ${this.opts.backendKind}`;
         throw new Error(
           `runtime container '${name}' does not exist. ` +
-            `Create it first with \`${initHint}\`, ` +
-            `then retry \`vicoop-client --backend ${this.opts.backendKind} --runtime container${
-              this.opts.runtimeName ? ` --runtime-name ${this.opts.runtimeName}` : ''
-            }\`.`,
+            `Create it first with \`vicoop-client container init ${this.opts.backendKind} --name ${this.opts.runtimeName}\`, ` +
+            `then retry \`vicoop-client --backend ${this.opts.backendKind} --runtime container --runtime-name ${this.opts.runtimeName}\`.`,
         );
       }
       if (this.opts.failIfExists) {
@@ -272,7 +263,7 @@ export class RuntimeContainer {
         '--label',
         `vicoop.kind=${kind}`,
         '--label',
-        `vicoop.name=${runtimeInstanceLabel(runtimeName)}`,
+        `vicoop.name=${runtimeName}`,
         name,
       ]);
       this.log.info(`created named volume '${name}'`);
@@ -345,7 +336,7 @@ export class RuntimeContainer {
       '--label',
       `vicoop.kind=${kind}`,
       '--label',
-      `vicoop.name=${runtimeInstanceLabel(runtimeName)}`,
+      `vicoop.name=${runtimeName}`,
     ];
     if (this.opts.bridgeUrl) {
       args.push('-e', `VICOOP_BRIDGE_URL=${this.opts.bridgeUrl}`);
@@ -378,9 +369,7 @@ export class RuntimeContainer {
   }
 
   private removeHint(): string {
-    return `vicoop-client container rm ${this.opts.backendKind}${
-      this.opts.runtimeName ? ` --name ${this.opts.runtimeName}` : ''
-    }`;
+    return `vicoop-client container rm ${this.opts.runtimeName}`;
   }
 
   private async waitUntilRunning(name: string): Promise<void> {

@@ -33,10 +33,9 @@ import {
   defaultDockerRun,
   RuntimeContainer,
   DEFAULT_RUNTIME_IMAGE,
-  DEFAULT_RUNTIME_INSTANCE,
   RUNTIME_COMPONENT_LABEL,
   RUNTIME_MANAGED_BY_LABEL,
-  runtimeInstanceLabel,
+  runtimeInstanceName,
   sessionsVolumeName,
   validateRuntimeName,
   type DockerRun,
@@ -85,14 +84,13 @@ export interface ContainerListOptions {
 }
 
 export interface ContainerRemoveOptions {
-  kind: InstallableBackendKind;
-  runtimeName?: string;
+  name: string;
   removeVolumes: boolean;
   dockerRun?: DockerRun;
 }
 
 export interface RuntimeRemoveResult {
-  kind: InstallableBackendKind;
+  kind: InstallableBackendKind | null;
   name: string;
   container: { name: string; removed: boolean };
   volumes: Array<{ name: string; removed: boolean; skipped: boolean }>;
@@ -119,7 +117,7 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
   try {
     await runtime.start();
 
-    const runtimeName = validateRuntimeName(opts.runtimeName);
+    const runtimeName = runtimeInstanceName(opts.kind, opts.runtimeName);
     const containerName = containerNameFor(opts.kind, runtimeName);
 
     // (1) chown the per-kind sub-trees so subsequent install-backend
@@ -156,7 +154,7 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
     if (!installed) {
       log.error(
         `installed ${opts.kind} did not produce a parseable --version at /data/agents/${opts.kind}/bin/${opts.kind}. ` +
-          `The install recipe likely failed silently; rerun \`vicoop-client container init ${opts.kind}\` and inspect the [install] output.`,
+          `The install recipe likely failed silently; rerun \`vicoop-client container init ${opts.kind} --name ${runtimeName}\` and inspect the [install] output.`,
       );
       return 1;
     }
@@ -184,7 +182,7 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
         log.error(`--from-host: ${(err as Error).message}`);
         log.error(
           `Rerun without --from-host to leave creds empty for an interactive auth flow ` +
-            `(docker exec -it vicoop-runtime-${opts.kind} ${authHintFor(opts.kind)}).`,
+            `(docker exec -it ${containerName} ${authHintFor(opts.kind)}).`,
         );
         return 1;
       }
@@ -196,11 +194,13 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
     }
 
     log.info(`runtime container for ${opts.kind} ready. start daemon with:`);
-    log.info(`    vicoop-client --backend ${opts.kind} --runtime container`);
+    log.info(
+      `    vicoop-client --backend ${opts.kind} --runtime container --runtime-name ${runtimeName}`,
+    );
     return 0;
   } finally {
     // Leave the container running. The next daemon launch reuses
-    // it; an explicit cleanup is `docker stop vicoop-runtime-<kind>`
+    // it; an explicit cleanup is `vicoop-client container rm <name>`
     // (operator's job, on purpose — they may be about to start the
     // daemon).
   }
@@ -424,26 +424,29 @@ export function listRuntimeContainers(opts: ContainerListOptions = {}): RuntimeL
   const volumes = readManagedVolumes(dockerRun);
   const keys = new Set(containers.keys());
 
-  return Array.from(keys).map(parseRuntimeKey).sort(compareRuntimeKeys).map(({ kind, runtimeName }) => {
-    const key = runtimeKey(kind, runtimeName);
-    const expectedContainerName = containerNameFor(kind, runtimeName);
-    const container = containers.get(key);
-    const runtimeVolumes = volumes.get(key) ?? new Set<string>();
-    return {
-      kind,
-      name: runtimeInstanceLabel(runtimeName),
-      container: {
-        name: expectedContainerName,
-        state: container ? normalizeContainerState(container.state) : 'missing',
-        image: container?.image ?? null,
-      },
-      volumes: {
-        agents: volumePresence(runtimeVolumes, agentsVolumeName(kind, runtimeName)),
-        creds: volumePresence(runtimeVolumes, credsVolumeName(kind, runtimeName)),
-        sessions: volumePresence(runtimeVolumes, sessionsVolumeName(kind, runtimeName)),
-      },
-    };
-  });
+  return Array.from(keys)
+    .map((key) => parseRuntimeKey(key, containers))
+    .sort(compareRuntimeKeys)
+    .map(({ kind, runtimeName }) => {
+      const key = runtimeKey(runtimeName);
+      const expectedContainerName = containerNameFor(kind, runtimeName);
+      const container = containers.get(key);
+      const runtimeVolumes = volumes.get(key) ?? new Set<string>();
+      return {
+        kind,
+        name: runtimeName,
+        container: {
+          name: container?.name ?? expectedContainerName,
+          state: container ? normalizeContainerState(container.state) : 'missing',
+          image: container?.image ?? null,
+        },
+        volumes: {
+          agents: volumePresence(runtimeVolumes, agentsVolumeName(kind, runtimeName)),
+          creds: volumePresence(runtimeVolumes, credsVolumeName(kind, runtimeName)),
+          sessions: volumePresence(runtimeVolumes, sessionsVolumeName(kind, runtimeName)),
+        },
+      };
+    });
 }
 
 export function formatRuntimeList(rows: readonly RuntimeListRow[]): string {
@@ -471,23 +474,29 @@ export function formatRuntimeListJson(rows: readonly RuntimeListRow[]): string {
 
 export function removeRuntimeContainer(opts: ContainerRemoveOptions): RuntimeRemoveResult {
   const dockerRun = opts.dockerRun ?? defaultDockerRun;
-  const runtimeName = validateRuntimeName(opts.runtimeName);
-  const name = containerNameFor(opts.kind, runtimeName);
+  const runtimeName = validateRuntimeName(opts.name);
+  if (!runtimeName) throw new Error('runtime name is required');
+  const runtime = findRuntimeByName(dockerRun, runtimeName);
+  const kind = runtime?.kind ?? null;
+  const containerResourceName = runtime?.container.name ?? runtimeContainerResourceName(runtimeName);
+  const volumeNames = runtime
+    ? [runtime.volumes.agents.name, runtime.volumes.creds.name, runtime.volumes.sessions.name]
+    : [
+        runtimeVolumeResourceName('agents', runtimeName),
+        runtimeVolumeResourceName('creds', runtimeName),
+        runtimeVolumeResourceName('sessions', runtimeName),
+      ];
   const result: RuntimeRemoveResult = {
-    kind: opts.kind,
-    name: runtimeInstanceLabel(runtimeName),
+    kind,
+    name: runtimeName,
     container: {
-      name,
-      removed: removeDockerResource(dockerRun, ['rm', '-f', name], 'container'),
+      name: containerResourceName,
+      removed: removeDockerResource(dockerRun, ['rm', '-f', containerResourceName], 'container'),
     },
     volumes: [],
   };
 
-  for (const volumeName of [
-    agentsVolumeName(opts.kind, runtimeName),
-    credsVolumeName(opts.kind, runtimeName),
-    sessionsVolumeName(opts.kind, runtimeName),
-  ]) {
+  for (const volumeName of volumeNames) {
     result.volumes.push({
       name: volumeName,
       removed: opts.removeVolumes
@@ -498,6 +507,24 @@ export function removeRuntimeContainer(opts: ContainerRemoveOptions): RuntimeRem
   }
 
   return result;
+}
+
+function findRuntimeByName(
+  dockerRun: DockerRun,
+  runtimeName: string,
+): RuntimeListRow | null {
+  return listRuntimeContainers({ dockerRun }).find((row) => row.name === runtimeName) ?? null;
+}
+
+function runtimeContainerResourceName(runtimeName: string): string {
+  return `vicoop-runtime-${runtimeName}`;
+}
+
+function runtimeVolumeResourceName(
+  volume: 'agents' | 'creds' | 'sessions',
+  runtimeName: string,
+): string {
+  return `vicoop-${volume}-${runtimeName}`;
 }
 
 export function formatRuntimeRemoveResult(result: RuntimeRemoveResult): string {
@@ -534,8 +561,14 @@ function removeDockerResource(
 
 function readManagedContainers(
   dockerRun: DockerRun,
-): Map<string, { state: string; image: string | null }> {
-  const result = new Map<string, { state: string; image: string | null }>();
+): Map<
+  string,
+  { kind: InstallableBackendKind; name: string; state: string; image: string | null }
+> {
+  const result = new Map<
+    string,
+    { kind: InstallableBackendKind; name: string; state: string; image: string | null }
+  >();
   for (const args of [
     [
       'ps',
@@ -566,7 +599,9 @@ function readManagedContainers(
       const labels = parseDockerLabels(stringField(entry, 'Labels'));
       const runtime = runtimeFromLabelsOrName(labels, name, 'container');
       if (!runtime) continue;
-      result.set(runtimeKey(runtime.kind, runtime.runtimeName), {
+      result.set(runtimeKey(runtime.runtimeName), {
+        kind: runtime.kind,
+        name,
         state: stringField(entry, 'State') ?? '',
         image: stringField(entry, 'Image'),
       });
@@ -593,7 +628,7 @@ function readManagedVolumes(dockerRun: DockerRun): Map<string, Set<string>> {
     const labels = parseDockerLabels(stringField(entry, 'Labels'));
     const runtime = runtimeFromLabelsOrName(labels, name, 'volume');
     if (!runtime) continue;
-    const key = runtimeKey(runtime.kind, runtime.runtimeName);
+    const key = runtimeKey(runtime.runtimeName);
     const names = result.get(key) ?? new Set<string>();
     names.add(name);
     result.set(key, names);
@@ -622,7 +657,10 @@ function normalizeContainerState(state: string): RuntimeContainerState {
   return state === 'running' ? 'running' : 'stopped';
 }
 
-function volumePresence(volumes: Set<string>, name: string): RuntimeListRow['volumes']['agents'] {
+function volumePresence(
+  volumes: Set<string>,
+  name: string,
+): RuntimeListRow['volumes']['agents'] {
   return { name, present: volumes.has(name) };
 }
 
@@ -635,28 +673,30 @@ function stringField(row: Record<string, unknown>, field: string): string | null
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
-function containerNameFor(kind: InstallableBackendKind, runtimeName: string | undefined): string {
+function containerNameFor(kind: InstallableBackendKind, runtimeName: string): string {
   return containerName(kind, runtimeName);
 }
 
-function runtimeKey(kind: InstallableBackendKind, runtimeName: string | undefined): string {
-  return `${kind}\0${runtimeName ?? ''}`;
+function runtimeKey(runtimeName: string): string {
+  return runtimeName;
 }
 
-function parseRuntimeKey(key: string): { kind: InstallableBackendKind; runtimeName: string | undefined } {
-  const [kind, runtimeName] = key.split('\0') as [InstallableBackendKind, string | undefined];
-  return { kind, runtimeName: runtimeName || undefined };
+function parseRuntimeKey(
+  key: string,
+  containers: Map<string, { kind: InstallableBackendKind }>,
+): { kind: InstallableBackendKind; runtimeName: string } {
+  const container = containers.get(key);
+  if (!container) throw new Error(`runtime '${key}' disappeared while listing`);
+  return { kind: container.kind, runtimeName: key };
 }
 
 function compareRuntimeKeys(
-  a: { kind: InstallableBackendKind; runtimeName: string | undefined },
-  b: { kind: InstallableBackendKind; runtimeName: string | undefined },
+  a: { kind: InstallableBackendKind; runtimeName: string },
+  b: { kind: InstallableBackendKind; runtimeName: string },
 ): number {
   const kindDiff = BACKEND_KINDS.indexOf(a.kind) - BACKEND_KINDS.indexOf(b.kind);
   if (kindDiff !== 0) return kindDiff;
-  if (!a.runtimeName && b.runtimeName) return -1;
-  if (a.runtimeName && !b.runtimeName) return 1;
-  return (a.runtimeName ?? '').localeCompare(b.runtimeName ?? '');
+  return a.runtimeName.localeCompare(b.runtimeName);
 }
 
 function parseDockerLabels(raw: string | null): Map<string, string> {
@@ -674,7 +714,7 @@ function runtimeFromLabelsOrName(
   labels: Map<string, string>,
   resourceName: string,
   resource: 'container' | 'volume',
-): { kind: InstallableBackendKind; runtimeName: string | undefined } | null {
+): { kind: InstallableBackendKind; runtimeName: string } | null {
   const kindLabel = labels.get('vicoop.kind');
   const kind =
     kindLabel && (BACKEND_KINDS as readonly string[]).includes(kindLabel)
@@ -683,12 +723,11 @@ function runtimeFromLabelsOrName(
   if (!kind) return null;
   const rawName = labels.get('vicoop.name');
   if (rawName) {
-    return {
-      kind,
-      runtimeName: rawName === DEFAULT_RUNTIME_INSTANCE ? undefined : validateRuntimeName(rawName),
-    };
+    const runtimeName = validateRuntimeName(rawName);
+    if (runtimeName) return { kind, runtimeName };
   }
-  return { kind, runtimeName: parseRuntimeNameFromResourceName(resourceName, kind, resource) };
+  const runtimeName = parseRuntimeNameFromResourceName(resourceName, kind, resource);
+  return runtimeName ? { kind, runtimeName } : null;
 }
 
 function parseKindFromResourceName(
@@ -712,7 +751,7 @@ function parseRuntimeNameFromResourceName(
   name: string,
   kind: InstallableBackendKind,
   resource: 'container' | 'volume',
-): string | undefined {
+): string | null {
   const bases =
     resource === 'container'
       ? [containerName(kind)]
@@ -722,10 +761,10 @@ function parseRuntimeNameFromResourceName(
           sessionsVolumeName(kind),
         ];
   for (const base of bases) {
-    if (name === base) return undefined;
-    if (name.startsWith(`${base}-`)) return validateRuntimeName(name.slice(base.length + 1));
+    if (name === base) return kind;
+    if (name.startsWith(`${base}-`)) return validateRuntimeName(name.slice(base.length + 1)) ?? null;
   }
-  return undefined;
+  return null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -755,7 +794,7 @@ const containerInitSubCmd = command(
     }),
     name: optional(
       option('--name', string({ metavar: 'NAME' }), {
-        description: message`Optional runtime instance name. Omit for the default per-kind runtime; named runtimes use Docker resources suffixed with -<name>.`,
+        description: message`Runtime instance name. Omit to use the backend kind as the generated name.`,
       }),
     ),
     fromHost: withDefault(
@@ -777,7 +816,7 @@ const containerInitSubCmd = command(
   }),
   {
     brief: message`Bootstrap a per-backend runtime container.`,
-    description: message`One-shot setup for the container-runtime profile: creates \`vicoop-runtime-<kind>\` or \`vicoop-runtime-<kind>-<name>\`, fails if that runtime already exists, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and (with --from-host) copies the operator's existing host creds into the container creds volume. After this, launch the daemon with \`vicoop-client --backend <kind> --runtime container\` and, for named runtimes, \`--runtime-name <name>\`.`,
+    description: message`One-shot setup for the container-runtime profile: creates \`vicoop-runtime-<name>\`, where --name defaults to the backend kind, fails if that runtime already exists, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and (with --from-host) copies the operator's existing host creds into the container creds volume. After this, launch the daemon with \`vicoop-client --backend <kind> --runtime container --runtime-name <name>\`.`,
   },
 );
 
@@ -792,7 +831,7 @@ function containerListCommand(name: 'ls' | 'list') {
     }),
     {
       brief: message`List runtime containers and volumes.`,
-      description: message`Prints one row per supported runtime kind, showing whether the managed Docker container is running, stopped, or missing and whether each expected named volume exists.`,
+      description: message`Prints one row per managed runtime container, showing its kind, name, running state, image, and volume presence.`,
     },
   );
 }
@@ -807,14 +846,9 @@ function containerRemoveCommand(name: 'rm' | 'remove') {
     name,
     object({
       action: constant('container-remove' as const),
-      kind: argument(choice([...BACKEND_KINDS], { metavar: 'KIND' }), {
-        description: message`Runtime kind to remove. One of: \`claude\`, \`codex\`.`,
+      name: argument(string({ metavar: 'NAME' }), {
+        description: message`Runtime instance name to remove.`,
       }),
-      name: optional(
-        option('--name', string({ metavar: 'NAME' }), {
-          description: message`Optional runtime instance name to remove. Omit for the default per-kind runtime.`,
-        }),
-      ),
       volumes: withDefault(flag('--volumes', {
         description: message`Also remove the runtime's agents, creds, and sessions named volumes. Off by default so credentials and sessions survive container recreation.`,
       }), false),
@@ -824,7 +858,7 @@ function containerRemoveCommand(name: 'rm' | 'remove') {
     }),
     {
       brief: message`Remove a runtime container.`,
-      description: message`Removes the per-kind runtime container, or a named runtime when --name is set. Named volumes are kept by default; pass --volumes to remove the agents, creds, and sessions volumes too.`,
+      description: message`Removes a runtime container by name. Volumes are kept by default; pass --volumes to remove the agents, creds, and sessions volumes too.`,
     },
   );
 }
@@ -839,7 +873,7 @@ export const containerCmd = command(
   longestMatch(containerInitSubCmd, containerListSubCmd, containerRemoveSubCmd),
   {
     brief: message`Manage per-backend runtime containers.`,
-    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<kind>\`, install the agent CLI, optionally copy host creds), \`ls\` / \`list\` (show managed runtime container and volume state), \`rm\` / \`remove\` (remove a runtime container, optionally volumes). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
+    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<name>\`, install the agent CLI, optionally copy host creds), \`ls\` / \`list\` (show managed runtime container and volume state), \`rm\` / \`remove\` (remove a runtime container by name, optionally volumes). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
   },
 );
 
@@ -880,8 +914,7 @@ export async function runContainerListCli(args: ContainerListArgs): Promise<numb
 export async function runContainerRemoveCli(args: ContainerRemoveArgs): Promise<number> {
   try {
     const result = removeRuntimeContainer({
-      kind: args.kind,
-      runtimeName: args.name,
+      name: args.name,
       removeVolumes: args.volumes,
     });
     process.stdout.write(

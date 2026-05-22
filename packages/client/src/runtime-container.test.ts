@@ -79,7 +79,7 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
     assert.ok(v.includes('vicoop.kind=claude'), `label on ${v.join(' ')}`);
     assert.ok(v.includes('vicoop.managed-by=vicoop-bridge'), `managed label on ${v.join(' ')}`);
     assert.ok(v.includes('vicoop.component=runtime'), `component label on ${v.join(' ')}`);
-    assert.ok(v.includes('vicoop.name=default'), `instance label on ${v.join(' ')}`);
+    assert.ok(v.includes('vicoop.name=claude'), `instance label on ${v.join(' ')}`);
   }
 
   // Container create argv: --name, --restart unless-stopped, NET_ADMIN+RAW,
@@ -96,7 +96,7 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
   assert.ok(argv.includes('vicoop.managed-by=vicoop-bridge'));
   assert.ok(argv.includes('vicoop.component=runtime'));
   assert.ok(argv.includes('vicoop.kind=claude'));
-  assert.ok(argv.includes('vicoop.name=default'));
+  assert.ok(argv.includes('vicoop.name=claude'));
   assert.ok(
     argv.some((a) => a === 'type=bind,source=/host/workspace,target=/workspace'),
     'host workspace mounted',
@@ -162,7 +162,7 @@ test('start: failIfExists rejects an existing container during init', async () =
 
   await assert.rejects(
     rc.start(),
-    /runtime container 'vicoop-runtime-codex-work' already exists.*container rm codex --name work/s,
+    /runtime container 'vicoop-runtime-work' already exists.*container rm work/s,
   );
   assert.equal(calls.filter((c) => c[0] === 'start').length, 0);
   assert.equal(calls.filter((c) => c[0] === 'create').length, 0);
@@ -281,7 +281,7 @@ test('getContainerName returns the canonical per-kind name', () => {
   assert.equal(rc.getContainerName(), 'vicoop-runtime-codex');
 });
 
-test('runtimeName suffixes container and volumes', async () => {
+test('runtimeName selects container and volume names', async () => {
   const { run, calls } = makeDockerFixture(happyCreateResponses());
   const rc = new RuntimeContainer({
     backendKind: 'codex',
@@ -292,21 +292,21 @@ test('runtimeName suffixes container and volumes', async () => {
   });
   await rc.start();
 
-  assert.equal(rc.getContainerName(), 'vicoop-runtime-codex-work');
+  assert.equal(rc.getContainerName(), 'vicoop-runtime-work');
   const volumeCreates = calls.filter((c) => c[0] === 'volume' && c[1] === 'create');
   assert.deepEqual(
     volumeCreates.map((c) => c[c.length - 1]).sort(),
     [
-      'vicoop-agents-codex-work',
-      'vicoop-creds-codex-work',
-      'vicoop-sessions-codex-work',
+      'vicoop-agents-work',
+      'vicoop-creds-work',
+      'vicoop-sessions-work',
     ].sort(),
   );
   assert.equal(volumeCreates.every((c) => c.includes('vicoop.name=work')), true);
   const createCmd = calls.find((c) => c[0] === 'create') as readonly string[];
-  assert.ok(createCmd.includes('vicoop-runtime-codex-work'));
+  assert.ok(createCmd.includes('vicoop-runtime-work'));
   assert.ok(createCmd.includes('vicoop.name=work'));
   assert.ok(
-    createCmd.some((a) => a === 'type=volume,source=vicoop-creds-codex-work,target=/data/creds/codex'),
+    createCmd.some((a) => a === 'type=volume,source=vicoop-creds-work,target=/data/creds/codex'),
   );
 });

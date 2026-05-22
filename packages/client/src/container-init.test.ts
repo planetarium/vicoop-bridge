@@ -176,12 +176,12 @@ test('listRuntimeContainers: fixed rows from managed docker labels', () => {
     '{{json .}}',
   ]);
   assert.equal(rows[0].kind, 'claude');
-  assert.equal(rows[0].name, 'default');
+  assert.equal(rows[0].name, 'claude');
   assert.equal(rows[0].container.state, 'running');
   assert.equal(rows[0].container.image, 'runtime:latest');
   assert.equal(rows[0].volumes.sessions.present, true);
   assert.equal(rows[1].kind, 'codex');
-  assert.equal(rows[1].name, 'default');
+  assert.equal(rows[1].name, 'codex');
   assert.equal(rows[1].container.state, 'stopped');
   assert.equal(rows[1].volumes.agents.present, true);
   assert.equal(rows[1].volumes.creds.present, false);
@@ -199,7 +199,7 @@ test('listRuntimeContainers: no containers returns no rows', () => {
   assert.deepEqual(rows, []);
 });
 
-test('listRuntimeContainers: includes legacy canonical containers by name', () => {
+test('listRuntimeContainers: includes unlabeled canonical containers by name', () => {
   const rows = listRuntimeContainers({
     dockerRun: (args) => {
       if (args[0] === 'ps' && args.includes('label=vicoop.managed-by=vicoop-bridge')) {
@@ -210,7 +210,7 @@ test('listRuntimeContainers: includes legacy canonical containers by name', () =
           JSON.stringify({
             Names: 'vicoop-runtime-codex',
             State: 'running',
-            Image: 'runtime:legacy',
+            Image: 'runtime:unlabeled',
             Labels: 'vicoop.kind=codex',
           }),
         );
@@ -239,10 +239,10 @@ test('listRuntimeContainers: includes legacy canonical containers by name', () =
     [
       [
         'codex',
-        'default',
+        'codex',
         'vicoop-runtime-codex',
         'running',
-        'runtime:legacy',
+        'runtime:unlabeled',
         true,
         true,
         true,
@@ -260,23 +260,23 @@ test('formatRuntimeList and JSON output include volume state', () => {
             Names: 'vicoop-runtime-codex',
             State: 'exited',
             Image: 'runtime:latest',
-            Labels: 'vicoop.kind=codex,vicoop.name=default',
+            Labels: 'vicoop.kind=codex,vicoop.name=codex',
           }),
         );
       }
       return ok(
         JSON.stringify({
           Name: 'vicoop-creds-codex',
-          Labels: 'vicoop.kind=codex,vicoop.name=default',
+          Labels: 'vicoop.kind=codex,vicoop.name=codex',
         }),
       );
     },
   });
 
   assert.match(formatRuntimeList(rows), /KIND\s+NAME\s+CONTAINER\s+IMAGE\s+AGENTS\s+CREDS\s+SESSIONS/);
-  assert.match(formatRuntimeList(rows), /codex\s+default\s+stopped\s+runtime:latest\s+no\s+yes\s+no/);
+  assert.match(formatRuntimeList(rows), /codex\s+codex\s+stopped\s+runtime:latest\s+no\s+yes\s+no/);
   const parsed = JSON.parse(formatRuntimeListJson(rows));
-  assert.equal(parsed[0].name, 'default');
+  assert.equal(parsed[0].name, 'codex');
   assert.equal(parsed[0].volumes.creds.name, 'vicoop-creds-codex');
   assert.equal(parsed[0].volumes.creds.present, true);
 });
@@ -305,7 +305,7 @@ test('listRuntimeContainers: includes named runtime instances discovered from la
       if (args[0] === 'ps') {
         return ok(
           JSON.stringify({
-            Names: 'vicoop-runtime-codex-work',
+            Names: 'vicoop-runtime-work',
             State: 'running',
             Image: 'runtime:named',
             Labels: 'vicoop.kind=codex,vicoop.name=work',
@@ -315,11 +315,11 @@ test('listRuntimeContainers: includes named runtime instances discovered from la
       return ok(
         [
           JSON.stringify({
-            Name: 'vicoop-agents-codex-work',
+            Name: 'vicoop-agents-work',
             Labels: 'vicoop.kind=codex,vicoop.name=work',
           }),
           JSON.stringify({
-            Name: 'vicoop-creds-codex-work',
+            Name: 'vicoop-creds-work',
             Labels: 'vicoop.kind=codex,vicoop.name=work',
           }),
         ].join('\n'),
@@ -329,12 +329,12 @@ test('listRuntimeContainers: includes named runtime instances discovered from la
 
   assert.deepEqual(
     rows.map((row) => [row.kind, row.name, row.container.name, row.container.state]),
-    [['codex', 'work', 'vicoop-runtime-codex-work', 'running']],
+    [['codex', 'work', 'vicoop-runtime-work', 'running']],
   );
   const named = rows[0];
   assert.equal(named.volumes.agents.present, true);
   assert.equal(named.volumes.creds.present, true);
-  assert.equal(named.volumes.sessions.name, 'vicoop-sessions-codex-work');
+  assert.equal(named.volumes.sessions.name, 'vicoop-sessions-work');
   assert.equal(named.volumes.sessions.present, false);
 });
 
@@ -345,8 +345,7 @@ test('listRuntimeContainers: includes named runtime instances discovered from la
 test('removeRuntimeContainer: removes container and keeps volumes by default', () => {
   const calls: Array<readonly string[]> = [];
   const result = removeRuntimeContainer({
-    kind: 'claude',
-    runtimeName: 'work',
+    name: 'work',
     removeVolumes: false,
     dockerRun: (args) => {
       calls.push(args);
@@ -354,15 +353,29 @@ test('removeRuntimeContainer: removes container and keeps volumes by default', (
     },
   });
 
-  assert.deepEqual(calls, [['rm', '-f', 'vicoop-runtime-claude-work']]);
+  assert.deepEqual(calls, [
+    [
+      'ps',
+      '-a',
+      '--filter',
+      'label=vicoop.managed-by=vicoop-bridge',
+      '--filter',
+      'label=vicoop.component=runtime',
+      '--format',
+      '{{json .}}',
+    ],
+    ['ps', '-a', '--filter', 'name=^vicoop-runtime-', '--format', '{{json .}}'],
+    ['volume', 'ls', '--format', '{{json .}}'],
+    ['rm', '-f', 'vicoop-runtime-work'],
+  ]);
   assert.equal(result.container.removed, true);
   assert.equal(result.name, 'work');
   assert.deepEqual(
     result.volumes.map((v) => [v.name, v.removed, v.skipped]),
     [
-      ['vicoop-agents-claude-work', false, true],
-      ['vicoop-creds-claude-work', false, true],
-      ['vicoop-sessions-claude-work', false, true],
+      ['vicoop-agents-work', false, true],
+      ['vicoop-creds-work', false, true],
+      ['vicoop-sessions-work', false, true],
     ],
   );
   assert.match(formatRuntimeRemoveResult(result), /kept volumes/);
@@ -371,7 +384,7 @@ test('removeRuntimeContainer: removes container and keeps volumes by default', (
 test('removeRuntimeContainer: --volumes removes all canonical volumes', () => {
   const calls: Array<readonly string[]> = [];
   const result = removeRuntimeContainer({
-    kind: 'codex',
+    name: 'codex',
     removeVolumes: true,
     dockerRun: (args) => {
       calls.push(args);
@@ -380,6 +393,18 @@ test('removeRuntimeContainer: --volumes removes all canonical volumes', () => {
   });
 
   assert.deepEqual(calls, [
+    [
+      'ps',
+      '-a',
+      '--filter',
+      'label=vicoop.managed-by=vicoop-bridge',
+      '--filter',
+      'label=vicoop.component=runtime',
+      '--format',
+      '{{json .}}',
+    ],
+    ['ps', '-a', '--filter', 'name=^vicoop-runtime-', '--format', '{{json .}}'],
+    ['volume', 'ls', '--format', '{{json .}}'],
     ['rm', '-f', 'vicoop-runtime-codex'],
     ['volume', 'rm', 'vicoop-agents-codex'],
     ['volume', 'rm', 'vicoop-creds-codex'],
@@ -390,9 +415,12 @@ test('removeRuntimeContainer: --volumes removes all canonical volumes', () => {
 
 test('removeRuntimeContainer: missing resources are reported without throwing', () => {
   const result = removeRuntimeContainer({
-    kind: 'claude',
+    name: 'claude',
     removeVolumes: true,
-    dockerRun: () => fail('Error: No such container or volume', 1),
+    dockerRun: (args) => {
+      if (args[0] === 'ps' || (args[0] === 'volume' && args[1] === 'ls')) return ok('');
+      return fail('Error: No such container or volume', 1);
+    },
   });
 
   assert.equal(result.container.removed, false);
@@ -404,9 +432,12 @@ test('removeRuntimeContainer: missing resources are reported without throwing', 
 
 test('removeRuntimeContainer: docker can report missing resources on stdout with exit 0', () => {
   const result = removeRuntimeContainer({
-    kind: 'claude',
+    name: 'claude',
     removeVolumes: true,
-    dockerRun: () => ok('Error response from daemon: No such container: vicoop-runtime-claude'),
+    dockerRun: (args) => {
+      if (args[0] === 'ps' || (args[0] === 'volume' && args[1] === 'ls')) return ok('');
+      return ok('Error response from daemon: No such container: vicoop-runtime-claude');
+    },
   });
 
   assert.equal(result.container.removed, false);
@@ -417,9 +448,12 @@ test('removeRuntimeContainer: unexpected docker failures throw', () => {
   assert.throws(
     () =>
       removeRuntimeContainer({
-        kind: 'codex',
+        name: 'codex',
         removeVolumes: false,
-        dockerRun: () => fail('permission denied', 1),
+        dockerRun: (args) => {
+          if (args[0] === 'ps' || (args[0] === 'volume' && args[1] === 'ls')) return ok('');
+          return fail('permission denied', 1);
+        },
       }),
     /docker rm -f vicoop-runtime-codex failed/,
   );
