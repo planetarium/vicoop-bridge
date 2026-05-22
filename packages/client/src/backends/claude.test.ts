@@ -1542,7 +1542,56 @@ test('truncates a long tool_use input summary to a bounded length', async () => 
   assert.ok(textPart.text.endsWith('…'), 'truncation marker expected at tail');
 });
 
-test('Task tool_use surfaces start/finish bookend messages without traceability opt-in', async () => {
+test('subagent tool_use under the legacy "Task" name also fires bookends', async () => {
+  // The wire-level name from `claude -p --output-format stream-json` is
+  // `Agent` (verified against claude 2.1.148), but the user-facing
+  // surface and historical name is `Task`. We accept both so the
+  // bookends keep working if Claude Code renames the wire identifier.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'tu_legacy_name',
+              name: 'Task',
+              input: { description: 'Legacy name path' },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tu_legacy_name',
+              content: [{ type: 'text', text: 'ok' }],
+            },
+          ],
+        },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'done' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
+  const { emit, frames } = collect();
+  await backend.handle(assign('legacy path'), emit, NEVER);
+
+  const events = frames
+    .filter((f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact')
+    .map((a) => a.artifact.metadata?.event)
+    .filter(Boolean);
+  assert.deepEqual(events, ['subagent-started', 'subagent-completed']);
+});
+
+test('subagent tool_use surfaces start/finish bookend messages without traceability opt-in', async () => {
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({
@@ -1553,7 +1602,7 @@ test('Task tool_use surfaces start/finish bookend messages without traceability 
             {
               type: 'tool_use',
               id: 'tu_task_1',
-              name: 'Task',
+              name: 'Agent',
               input: { description: 'Search Bson transaction handlers', prompt: 'Find …' },
             },
           ],
@@ -1615,7 +1664,7 @@ test('Task tool_result with is_error=true emits a "Task failed" bookend', async 
             {
               type: 'tool_use',
               id: 'tu_task_err',
-              name: 'Task',
+              name: 'Agent',
               input: { description: 'Audit migrations', prompt: 'Check …' },
             },
           ],
@@ -1663,7 +1712,7 @@ test('Task bookend messages co-exist with trace artifacts when traceability is r
             {
               type: 'tool_use',
               id: 'tu_task_trace',
-              name: 'Task',
+              name: 'Agent',
               input: { description: 'Trace flow' },
             },
           ],
@@ -1714,7 +1763,7 @@ test('Task description falls back to bare "Task" when input.description is missi
             {
               type: 'tool_use',
               id: 'tu_task_nodesc',
-              name: 'Task',
+              name: 'Agent',
               input: { prompt: 'Do something' },
             },
           ],

@@ -802,8 +802,16 @@ function extractAssistantToolUses(content: unknown): ToolUseBlock[] {
 // the message was clipped.
 const TASK_DESCRIPTION_MAX_CHARS = 200;
 
-// Pull the human-readable description out of a Task tool's input object.
-// Claude Code's built-in Task tool accepts `{ description, prompt,
+// Tool names that, on the wire, identify a Claude Code subagent
+// invocation. The user-facing tool is "Task" in the docs and the
+// interactive UI, but `claude -p --output-format stream-json` emits
+// `name: "Agent"` in the assistant tool_use block (verified against
+// claude 2.1.148). We accept both so the bookends stay correct if
+// Claude Code renames the wire identifier in either direction.
+const SUBAGENT_TOOL_NAMES: ReadonlySet<string> = new Set(['Agent', 'Task']);
+
+// Pull the human-readable description out of a subagent tool's input
+// object. Claude Code's Agent/Task tool accepts `{ description, prompt,
 // subagent_type }`; `description` is the short 3-5-word label the model
 // is supposed to write. Returns the empty string if the field is missing
 // or unusable — the caller falls back to a bare "Task" label.
@@ -1718,12 +1726,13 @@ export function createClaudeBackend(
               child.stdin.write(toolResult + '\n');
               try { child.stdin.end(); } catch { /* best effort */ }
             } else {
-              // Surface Task starts as user-visible messages independently
-              // of the trace artifact stream — they bookend the otherwise
-              // silent window while the subagent runs. Trace artifact (if
-              // requested) still fires so trace-aware consumers see the
-              // structured tool-call alongside the human-readable bookend.
-              if (tu.toolName === 'Task' && tu.toolUseId) {
+              // Surface subagent starts as user-visible messages
+              // independently of the trace artifact stream — they
+              // bookend the otherwise silent window while the subagent
+              // runs. Trace artifact (if requested) still fires so
+              // trace-aware consumers see the structured tool-call
+              // alongside the human-readable bookend.
+              if (SUBAGENT_TOOL_NAMES.has(tu.toolName) && tu.toolUseId) {
                 const description = extractTaskDescription(tu.input);
                 activeTaskRuns.set(tu.toolUseId, description);
                 emitSubagentEventArtifact('subagent-started', tu.toolUseId, description);
