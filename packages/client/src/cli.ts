@@ -298,8 +298,8 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         : backends.claude?.settings;
       const { spawn, cwd, runtime } = await resolveRuntime({
         kind: 'claude',
-        runtime: args.claudeRuntime,
-        cwd: args.claudeCwd,
+        runtime: args.runtime,
+        cwd: args.cwd,
         bridgeUrl: args.server,
       });
       // claude's bwrap sandbox is redundant when *we* are already
@@ -323,8 +323,8 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
     case 'codex': {
       const { spawn, cwd, runtime } = await resolveRuntime({
         kind: 'codex',
-        runtime: args.codexRuntime,
-        cwd: args.codexCwd,
+        runtime: args.runtime,
+        cwd: args.cwd,
         bridgeUrl: args.server,
       });
       // Same reasoning as the claude branch: codex's host-process

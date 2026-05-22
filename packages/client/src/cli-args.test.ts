@@ -127,14 +127,14 @@ test('parseFlags promotes env-only knobs to first-class flags (issue #189 §1)',
   // backend factories receive them via DaemonArgs rather than reading
   // process.env directly.
   const r = parseFlags([
-    '--claude-cwd', '/workspaces/repo',
+    '--cwd', '/workspaces/repo',
     '--codex-sandbox', 'workspace-write',
     '--openclaw-gateway', 'ws://gw:18789',
     '--openclaw-task-timeout-ms', '60000',
   ]);
   assert.equal(r.ok, true);
   if (!r.ok) return;
-  assert.equal(r.flags.claudeCwd, '/workspaces/repo');
+  assert.equal(r.flags.cwd, '/workspaces/repo');
   assert.equal(r.flags.codexSandbox, 'workspace-write');
   assert.equal(r.flags.openclawGateway, 'ws://gw:18789');
   assert.equal(r.flags.openclawTaskTimeoutMs, 60000);
@@ -178,34 +178,48 @@ test('mergeClientArgs trims and treats whitespace-only flag values as unset', ()
   assert.equal(r.args.card, undefined);
 });
 
-test('CLI backend flag wins over config backends.claude.cwd', () => {
-  // Issue #189 §1: --claude-cwd is a first-class flag. Config layer wins last.
+test('--cwd flag overrides the active backend\'s config cwd', () => {
+  // Issue #189 §1: --cwd is a first-class flag. Config layer wins last.
+  // After the per-backend → unified flag refactor the merge step scopes
+  // the config fallback to whichever `--backend` is active.
   const r = mergeClientArgs(
-    { token: 't', agentId: 'a', claudeCwd: '/from-flag' },
+    { token: 't', agentId: 'a', backend: 'claude', cwd: '/from-flag' },
     { backends: { claude: { cwd: '/from-config' } } },
   );
   assert.equal(r.ok, true);
   if (!r.ok) return;
-  assert.equal(r.args.claudeCwd, '/from-flag');
+  assert.equal(r.args.cwd, '/from-flag');
 });
 
-test('config backends.claude.cwd is the only fallback (no env)', () => {
+test('config backends.<active>.cwd is the only fallback (no env)', () => {
   // Issue #189 §5: env is out of the chain entirely. Setting CLAUDE_CWD
   // in process.env has no effect here.
   const previous = process.env.CLAUDE_CWD;
   process.env.CLAUDE_CWD = '/from-env';
   try {
     const r = mergeClientArgs(
-      { token: 't', agentId: 'a' },
+      { token: 't', agentId: 'a', backend: 'claude' },
       { backends: { claude: { cwd: '/from-config' } } },
     );
     assert.equal(r.ok, true);
     if (!r.ok) return;
-    assert.equal(r.args.claudeCwd, '/from-config');
+    assert.equal(r.args.cwd, '/from-config');
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_CWD;
     else process.env.CLAUDE_CWD = previous;
   }
+});
+
+test('config backends.codex.cwd resolves when --backend codex is active', () => {
+  // Mirror of the claude case: the unified flag resolution must pick the
+  // correct per-backend config key based on the active backend selection.
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'codex' },
+    { backends: { codex: { cwd: '/codex-from-config' }, claude: { cwd: '/claude-from-config' } } },
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.cwd, '/codex-from-config');
 });
 
 test('env vars in the daemon-config chain are ignored entirely (issue #189 §5)', () => {

@@ -408,7 +408,7 @@ const containerInitSubCmd = command(
   }),
   {
     brief: message`Bootstrap a per-backend runtime container.`,
-    description: message`One-shot setup for the container-runtime profile: boots \`vicoop-runtime-<kind>\`, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and (with --from-host) copies the operator's existing host creds into the container creds volume. After this, launch the daemon with \`vicoop-client --backend <kind> --<kind>-runtime container\`.`,
+    description: message`One-shot setup for the container-runtime profile: boots \`vicoop-runtime-<kind>\`, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and (with --from-host) copies the operator's existing host creds into the container creds volume. After this, launch the daemon with \`vicoop-client --backend <kind> --runtime container\`.`,
   },
 );
 
@@ -417,7 +417,7 @@ export const containerCmd = command(
   longestMatch(containerInitSubCmd),
   {
     brief: message`Manage per-backend runtime containers.`,
-    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<kind>\`, install the agent CLI, optionally copy host creds). Pairs with the daemon flags \`--claude-runtime container\` / \`--codex-runtime container\`.`,
+    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<kind>\`, install the agent CLI, optionally copy host creds). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
   },
 );
 
