@@ -16,11 +16,11 @@ import { getAdminWallets } from './admin-scope.js';
 import {
   AdminApiError,
   addCaller,
+  deleteClientForOwner,
   listActiveAgents,
   listCallers,
   listClientsForOwner,
   removeCaller,
-  revokeClientForOwner,
 } from './admin-api.js';
 import { agentAuthMiddleware, getAgentConn, getCaller } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
@@ -386,7 +386,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       // not through this path, but kept in the union so a future
       // AdminApiError with status 401 still typechecks), 403 forbidden,
       // 404 not-found / RLS-hidden, 409 ambiguous-client-name from
-      // revokeClientForOwner.
+      // deleteClientForOwner.
       return c.json({ error: err.message }, err.status as 400 | 401 | 403 | 404 | 409);
     }
     logEvent('admin_api_error', { error: String(err) });
@@ -454,17 +454,17 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }
   });
 
-  // Revoke a client by id or unique name. The target travels in the URL path
+  // Delete a client by id or unique name. The target travels in the URL path
   // and may be a UUID `client_id` or a `client_name`; the server resolves
   // the ambiguity (404 if neither matches, 409 with the candidate ids if a
-  // name matches multiple rows). On success, sets `revoked = true` and
-  // closes every live WS bound to the client with code 4014 — see the
-  // close-code rationale in Registry.disconnectClient.
+  // name matches multiple rows). On success, hard-deletes the agents +
+  // clients rows and closes every live WS bound to the client with code
+  // 4014 — see the close-code rationale in Registry.disconnectClient.
   app.delete('/admin-api/clients/:target', async (c) => {
     const auth = await authOwnerSession(c);
     if (!auth.ok) return adminApiUnauthorized(c, auth);
     try {
-      const result = await revokeClientForOwner(
+      const result = await deleteClientForOwner(
         opts.db,
         opts.registry,
         auth.principalId,

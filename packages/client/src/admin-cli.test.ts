@@ -8,8 +8,8 @@ import {
   runAgentCallersAdd,
   runAgentCallersList,
   runAgentCallersRemove,
+  runAgentDelete,
   runAgentList,
-  runAgentRevoke,
   runListAgents,
   runListCallers,
   runListClients,
@@ -19,8 +19,8 @@ import {
   type AgentCallersAddArgs,
   type AgentCallersListArgs,
   type AgentCallersRemoveArgs,
+  type AgentDeleteArgs,
   type AgentListArgs,
-  type AgentRevokeArgs,
   type ListAgentsArgs,
   type ListCallersArgs,
   type ListClientsArgs,
@@ -57,10 +57,10 @@ const revokeClientArgs = (
 ): RevokeClientArgs => ({ action: 'revoke-client', target, ...SHARED, ...p });
 const agentListArgsFn = (p: Partial<AgentListArgs> = {}): AgentListArgs =>
   ({ action: 'agent-list', ...SHARED, connected: false, ...p });
-const agentRevokeArgsFn = (
+const agentDeleteArgsFn = (
   target: string,
-  p: Partial<AgentRevokeArgs> = {},
-): AgentRevokeArgs => ({ action: 'agent-revoke', target, ...SHARED, ...p });
+  p: Partial<AgentDeleteArgs> = {},
+): AgentDeleteArgs => ({ action: 'agent-delete', target, yes: true, ...SHARED, ...p });
 const agentCallersListArgsFn = (
   agentId: string,
   p: Partial<AgentCallersListArgs> = {},
@@ -330,7 +330,6 @@ test('list-clients calls GET /admin-api/clients and renders rows with connected 
           client_name: 'usage-test-1',
           owner_principal: 'eth:0xabc',
           allowed_agent_ids: ['agent-a'],
-          revoked: false,
           connected: false,
           created_at: '2026-05-07T00:00:00.000Z',
         },
@@ -347,7 +346,7 @@ test('list-clients calls GET /admin-api/clients and renders rows with connected 
   const out = stdout.read();
   // Table-form: header row + data row.
   assert.match(out, /CLIENT_ID\s+CLIENT_NAME\s+ALLOWED_AGENT_IDS/);
-  assert.match(out, /^cid-1\s+usage-test-1\s+agent-a\s+false\s+false\b/m);
+  assert.match(out, /^cid-1\s+usage-test-1\s+agent-a\s+false\b/m);
 });
 
 test('list-clients --json prints raw JSON', async (t) => {
@@ -368,7 +367,7 @@ test('revoke-client DELETEs /admin-api/clients/<target>', async (t) => {
     body: {
       client_id: 'cid-1',
       client_name: 'usage-test-1',
-      revoked: true,
+      deleted: true,
       closed_connections: 0,
     },
   });
@@ -384,7 +383,7 @@ test('revoke-client URL-encodes the target (so names with /, : survive)', async 
   captureStdout(t);
   const target = 'weird/name:with-colon';
   const { calls } = installFetch(t, {
-    body: { client_id: 'cid', client_name: target, revoked: true, closed_connections: 0 },
+    body: { client_id: 'cid', client_name: target, deleted: true, closed_connections: 0 },
   });
   const code = await runRevokeClient(revokeClientArgs(target));
   assert.equal(code, 0);
@@ -426,7 +425,7 @@ test('subcommand surfaces server error on non-2xx response', async (t) => {
 // `agent list` calls the same /admin-api/clients endpoint as the legacy
 // list-clients (the server-side unified persistence in #219 makes them
 // equivalent), but renders rows agent-id-first to match the operator-facing
-// model and includes registration_id/revoked/connected fields.
+// model.
 test('agent list calls GET /admin-api/clients and renders agent-centric rows', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   const stdout = captureStdout(t);
@@ -439,7 +438,6 @@ test('agent list calls GET /admin-api/clients and renders agent-centric rows', a
           client_name: 'codex on Mac',
           owner_principal: 'eth:0xabc',
           allowed_agent_ids: ['agent-a'],
-          revoked: false,
           connected: true,
           created_at: '2026-05-07T00:00:00.000Z',
         },
@@ -454,8 +452,8 @@ test('agent list calls GET /admin-api/clients and renders agent-centric rows', a
   const out = stdout.read();
   // Header row puts AGENT_ID first. The legacy client_id is intentionally
   // omitted from the human table — it remains available via --json.
-  assert.match(out, /AGENT_ID\s+NAME\s+CONNECTED\s+REVOKED\s+REGISTERED_AT\s*$/m);
-  assert.match(out, /^agent-a\s+codex on Mac\s+true\s+false\s+\S+\s*$/m);
+  assert.match(out, /AGENT_ID\s+NAME\s+CONNECTED\s+REGISTERED_AT\s*$/m);
+  assert.match(out, /^agent-a\s+codex on Mac\s+true\s+\S+\s*$/m);
   assert.doesNotMatch(out, /cid-1/);
 });
 
@@ -470,13 +468,13 @@ test('agent list --connected filters to connected rows in human + JSON output', 
         {
           client_id: 'cid-1', agent_id: 'agent-a', client_name: 'live',
           owner_principal: 'eth:0xabc', allowed_agent_ids: ['agent-a'],
-          revoked: false, connected: true,
+          connected: true,
           created_at: '2026-05-07T00:00:00.000Z',
         },
         {
           client_id: 'cid-2', agent_id: 'agent-b', client_name: 'stale',
           owner_principal: 'eth:0xabc', allowed_agent_ids: ['agent-b'],
-          revoked: false, connected: false,
+          connected: false,
           created_at: '2026-05-07T00:00:00.000Z',
         },
       ],
@@ -499,21 +497,39 @@ test('agent list --connected with no live agents prints the empty-state line', a
   assert.match(stdout.read(), /no connected agents/);
 });
 
-// `agent revoke` keeps the legacy DELETE /admin-api/clients/<target> endpoint
+// `agent delete` keeps the legacy DELETE /admin-api/clients/<target> endpoint
 // because the server-side resolver (admin-api.ts resolveClient) accepts an
 // agent_id, the legacy client_id, or the registration name. No new endpoint
 // is required.
-test('agent revoke DELETEs /admin-api/clients/<AGENT_ID>', async (t) => {
+test('agent delete --yes DELETEs /admin-api/clients/<AGENT_ID>', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   captureStdout(t);
   const { calls } = installFetch(t, {
-    body: { client_id: 'cid', client_name: 'agent-a', revoked: true, closed_connections: 1 },
+    body: { client_id: 'cid', client_name: 'agent-a', deleted: true, closed_connections: 1 },
   });
 
-  const code = await runAgentRevoke(agentRevokeArgsFn('agent-a'));
+  // agentDeleteArgsFn defaults `yes: true` so the handler skips the Y/N
+  // prompt; the prompt path is exercised in a separate test below.
+  const code = await runAgentDelete(agentDeleteArgsFn('agent-a'));
   assert.equal(code, 0);
   assert.equal(calls[0].method, 'DELETE');
   assert.equal(calls[0].url, `${BRIDGE}/admin-api/clients/agent-a`);
+});
+
+test('agent delete without --yes aborts when stdin is not a TTY', async (t) => {
+  // Confirm-or-abort is unconditional for non-TTY stdin (e.g. CI, pipes) so
+  // a script that forgot --yes does not silently delete. The test harness
+  // runs under node:test which is non-TTY, exercising the abort branch.
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stderr = captureStderr(t);
+  const { calls } = installFetch(t, {
+    body: { client_id: 'cid', client_name: 'agent-a', deleted: true, closed_connections: 0 },
+  });
+
+  const code = await runAgentDelete(agentDeleteArgsFn('agent-a', { yes: false }));
+  assert.equal(code, 1);
+  assert.match(stderr.read(), /aborted/);
+  assert.equal(calls.length, 0, 'must not have hit the API');
 });
 
 test('agent callers list/add/remove hit the existing /admin-api/agents/:id/callers routes', async (t) => {
@@ -574,14 +590,14 @@ test('legacy list-clients warns and points at agent list', async (t) => {
   assert.match(stderr.read(), /list-clients.*deprecated.*agent list/s);
 });
 
-test('legacy revoke-client warns and points at agent revoke', async (t) => {
+test('legacy revoke-client warns and points at agent delete', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   captureStdout(t);
   const stderr = captureStderr(t);
-  installFetch(t, { body: { client_id: 'c', client_name: 'n', revoked: true, closed_connections: 0 } });
+  installFetch(t, { body: { client_id: 'c', client_name: 'n', deleted: true, closed_connections: 0 } });
 
   assert.equal(await runRevokeClient(revokeClientArgs('n')), 0);
-  assert.match(stderr.read(), /revoke-client.*deprecated.*agent revoke/s);
+  assert.match(stderr.read(), /revoke-client.*deprecated.*agent delete/s);
 });
 
 test('legacy {add,remove,list}-caller all emit the agent-callers deprecation hint', async (t) => {

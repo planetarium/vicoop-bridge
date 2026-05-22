@@ -61,7 +61,7 @@ export interface ClientOptions {
   // this unset and logs land on `console.log` / `.warn` / `.error`.
   logSink?: ConsoleSink;
   // Invoked when the daemon hits a non-recoverable terminal close code
-  // (currently 4014 "client revoked" and 4005 "bad token" — see the
+  // (currently 4014 "client deleted" and 4005 "bad token" — see the
   // close-handler in `connect()` for the rationale on each). The Client
   // itself only tears down its own state — `stopped = true`, reconnect
   // timer cleared, inflight tasks aborted — and delegates the
@@ -70,7 +70,7 @@ export interface ClientOptions {
   // tests that construct a Client can't recover from a forced exit,
   // and future embedders (a long-running parent process hosting
   // multiple clients) need to keep running after one client is
-  // revoked. The production entrypoint (`cli.ts runClient`) wires this
+  // deleted. The production entrypoint (`cli.ts runClient`) wires this
   // to `process.exit(1)`; tests pass a capturing callback.
   onFatal?: (info: { code: number; reason: string }) => void;
 }
@@ -339,20 +339,19 @@ export class Client {
       this.ws = null;
       // Terminal auth failures the daemon cannot recover from by waiting:
       //
-      //   - **4014 "client revoked"** (issue #166). The DB row was just
-      //     flagged `revoked = true` by an owner-side `vicoop-client
-      //     revoke-client` (the row stays — soft revocation, not
-      //     deletion — but ws.ts's `revoked = false` filter excludes it).
-      //     Future hellos will be rejected with 4005 anyway, so we exit
-      //     immediately rather than wait one more reconnect cycle.
+      //   - **4014 "client deleted"** (issue #166). The DB row was just
+      //     hard-deleted by an owner-side `vicoop-client agent delete`.
+      //     Future hellos will be rejected with 4005 anyway (the row is
+      //     gone), so we exit immediately rather than wait one more
+      //     reconnect cycle.
       //
       //   - **4005 "bad token"**. ws.ts only emits 4005 after a
-      //     `SELECT … WHERE token_hash = $1 AND revoked = false` returns
-      //     no row — either the token is wrong (operator copy/paste, or
-      //     daemon was relaunched after revocation without rotating) or
-      //     the row is revoked but the daemon missed the live 4014 close.
-      //     In both cases the failure is permanent: no amount of backoff
-      //     produces a row that matches. Looping just spams the bridge.
+      //     `SELECT … WHERE token_hash = $1` returns no row — either the
+      //     token is wrong (operator copy/paste, or daemon was relaunched
+      //     after deletion without rotating) or the row was deleted and
+      //     the daemon missed the live 4014 close. In both cases the
+      //     failure is permanent: no amount of backoff produces a row
+      //     that matches. Looping just spams the bridge.
       //
       // Other close codes (4001-4004 / 4006-4013) might be transient or
       // bug-shaped but are out of scope for this PR — they continue to
@@ -364,7 +363,7 @@ export class Client {
       // surfaces the failure instead of masking it as a transient
       // network hiccup.
       if (code === 4014 || code === 4005) {
-        const label = code === 4014 ? 'client revoked by owner' : 'bridge rejected token';
+        const label = code === 4014 ? 'client deleted by owner' : 'bridge rejected token';
         this.logger.error(`${label}; stopping (code=${code})`);
         this.stopped = true;
         this.clearReconnectTimer();

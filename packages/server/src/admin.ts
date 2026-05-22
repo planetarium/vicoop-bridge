@@ -126,7 +126,6 @@ Agents are local services that connect to the server via WebSocket and expose an
 - **owner_principal**: Principal of the owner (e.g. \`eth:0x<40 hex>\` or \`google:sub:<sub>\`)
 - **name**: Human-readable label
 - **allowed_callers**: Principals allowed to call this agent; empty means public
-- **revoked**: Whether this agent registration has been revoked
 - **created_at**: When it was created
 - **token_hash**: Not exposed via GraphQL — use \`mutate_registerClient\` or \`mutate_rotateClientToken\` to obtain tokens
 
@@ -135,10 +134,10 @@ Agents are local services that connect to the server via WebSocket and expose an
 - Use \`query_*\` tools to read agents and compatibility client rows. RLS enforces ownership (admins see all).
 - Client lifecycle mutations are exposed as custom GraphQL functions:
   - \`mutate_registerClient(clientName, allowedAgentIds, ownerPrincipal?)\` — compatibility wrapper that creates one agent registration and returns the raw bearer token (shown only once). \`allowedAgentIds\` must contain exactly one id. Admins may pass \`ownerPrincipal\` to create on behalf of another principal; non-admins always own the resulting agent.
-  - \`mutate_revokeClient(clientId)\` / \`mutate_unrevokeClient(clientId)\` — toggle the \`revoked\` flag. Existing WebSocket sessions stay connected until they reconnect.
+  - \`mutate_deleteClient(clientId)\` — hard-deletes the agent + client rows. Active WebSocket sessions are closed with code 4014 ("client deleted") so the daemon exits without reconnecting. There is no undo; re-register if you need the agent back.
   - \`mutate_rotateClientToken(clientId)\` — issues a new bearer token and invalidates the previous one. Returns the raw token once.
   - \`mutate_updateClientAllowedAgents(clientId, allowedAgentIds)\` — compatibility wrapper for changing the single agent id; \`allowedAgentIds\` must contain exactly one id.
-- Do NOT use the auto-generated \`mutate_updateClientById\` or \`mutate_deleteClientById\` for revoke/token rotation — always prefer the semantic mutations above.
+- Do NOT use the auto-generated \`mutate_updateClientById\` or \`mutate_deleteClientById\` for delete/token rotation — always prefer the semantic mutations above.
 - Use \`list_active_agents\` to see currently connected agents.
 - Use \`add_caller\` / \`remove_caller\` / \`list_callers\` to manage per-agent access control. Do not use GraphQL mutations to manage \`allowed_callers\`.
 - Use \`list_caller_tokens\` / \`revoke_caller_token\` (admin only) to manage opaque caller tokens. Issued via either Google OAuth device flow (provider=google) or SIWE exchange (provider=siwe).
@@ -173,7 +172,7 @@ Your conversation history is persisted in PostgreSQL. You remember all previous 
 ## PostGraphile Conventions
 
 - **Connection types**: List queries return \`{ nodes { ...fields } totalCount }\`.
-- **Filtering**: Use \`condition\` argument, e.g. \`condition: { revoked: false }\`.
+- **Filtering**: Use \`condition\` argument, e.g. \`condition: { ownerPrincipal: "eth:0x..." }\`.
 - **Sorting**: Use \`orderBy\` with values like \`CREATED_AT_DESC\`.
 - **Field naming**: snake_case SQL → camelCase GraphQL (e.g. \`owner_principal\` → \`ownerPrincipal\`).
 `;
@@ -473,7 +472,7 @@ export interface AdminAgentOptions {
 }
 
 const ADMIN_DESCRIPTION =
-  'Manages client registration, revocation, and access control for Vicoop Bridge Server. ' +
+  'Manages client registration, deletion, and access control for Vicoop Bridge Server. ' +
   'Clients are WebSocket services that bridge local A2A agents to the server. Each client ' +
   'is scoped to an owner wallet and an explicit agent ID allowlist. Requires a bridge-issued ' +
   'opaque caller token (vbc_caller_*) tied to a wallet principal; obtain one by signing a ' +
@@ -502,7 +501,7 @@ export function createAdminA2XAgent(opts: AdminAgentOptions): {
       id: 'client-management',
       name: 'Client Management',
       description:
-        'Register, revoke, and list clients with per-agent-id authorization. Wallet-based ownership with RLS.',
+        'Register, delete, and list clients with per-agent-id authorization. Wallet-based ownership with RLS.',
       tags: ['admin', 'auth', 'client', 'siwe'],
     })
     .addSecurityScheme(

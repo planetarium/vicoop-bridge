@@ -365,7 +365,7 @@ test(
       });
       assert.equal(res.status, 200);
       const body = (await res.json()) as {
-        clients: Array<{ client_id: string; connected: boolean; revoked: boolean }>;
+        clients: Array<{ client_id: string; connected: boolean }>;
       };
       const setupAClientId = setupA.clientId;
       const ids = body.clients.map((c) => c.client_id);
@@ -373,7 +373,6 @@ test(
       assert.ok(!ids.includes(setupB.clientId), 'should not see other owner’s client');
       const a = body.clients.find((c) => c.client_id === setupAClientId)!;
       assert.equal(a.connected, true);
-      assert.equal(a.revoked, false);
     } finally {
       if (setupA) await teardown(sql, ownerA, setupA.clientId);
       if (setupB) await teardown(sql, ownerB, setupB.clientId);
@@ -413,7 +412,7 @@ test(
 );
 
 test(
-  'DELETE /admin-api/clients/:target sets revoked=true and closes the live WS with 4014',
+  'DELETE /admin-api/clients/:target hard-deletes the row and closes the live WS with 4014',
   { skip: !hasDb },
   async () => {
     const sql = postgres(process.env.DATABASE_URL!);
@@ -448,19 +447,23 @@ test(
       assert.equal(res.status, 200);
       const body = (await res.json()) as {
         client_id: string;
-        revoked: boolean;
+        deleted: boolean;
         closed_connections: number;
       };
       assert.equal(body.client_id, setup.clientId);
-      assert.equal(body.revoked, true);
+      assert.equal(body.deleted, true);
       assert.equal(body.closed_connections, 1);
-      assert.deepEqual(closeArgs, [{ code: 4014, reason: 'client revoked' }]);
+      assert.deepEqual(closeArgs, [{ code: 4014, reason: 'client deleted' }]);
 
-      // DB row reflects the revocation.
-      const rows = await sql<{ revoked: boolean }[]>`
-        SELECT revoked FROM clients WHERE id = ${setup.clientId}
+      // DB rows are gone.
+      const clientsRows = await sql<{ id: string }[]>`
+        SELECT id FROM clients WHERE id = ${setup.clientId}
       `;
-      assert.equal(rows[0]?.revoked, true);
+      assert.equal(clientsRows.length, 0);
+      const agentsRows = await sql<{ id: string }[]>`
+        SELECT id FROM agents WHERE client_id = ${setup.clientId}
+      `;
+      assert.equal(agentsRows.length, 0);
     } finally {
       if (setup) await teardown(sql, owner, setup.clientId);
       await sql.end();
@@ -474,7 +477,7 @@ test(
   async () => {
     const sql = postgres(process.env.DATABASE_URL!);
     const owner = `eth:0x${'7'.repeat(40)}`;
-    const uniqueName = `revoke-test-name-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const uniqueName = `delete-test-name-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     let setup: SetupResult | null = null;
     try {
       setup = await setupOwner(sql, owner);
@@ -524,12 +527,12 @@ test(
       assert.match(body.error, /Ambiguous client name/);
       assert.match(body.error, /Specify client_id/);
 
-      // Neither client should be revoked — the ambiguous lookup must abort
+      // Neither client should be deleted — the ambiguous lookup must abort
       // before any state change.
-      const rows = await sql<{ id: string; revoked: boolean }[]>`
-        SELECT id, revoked FROM clients WHERE id IN (${setupA.clientId}, ${setupB.clientId})
+      const rows = await sql<{ id: string }[]>`
+        SELECT id FROM clients WHERE id IN (${setupA.clientId}, ${setupB.clientId})
       `;
-      for (const r of rows) assert.equal(r.revoked, false);
+      assert.equal(rows.length, 2);
     } finally {
       if (setupA) await teardown(sql, owner, setupA.clientId);
       if (setupB) await teardown(sql, owner, setupB.clientId);
@@ -584,11 +587,11 @@ test(
       );
       assert.equal(res.status, 404);
 
-      // ownerB's row remains intact.
-      const rows = await sql<{ revoked: boolean }[]>`
-        SELECT revoked FROM clients WHERE id = ${setupB.clientId}
+      // ownerB's row remains intact (not deleted by A's request).
+      const rows = await sql<{ id: string }[]>`
+        SELECT id FROM clients WHERE id = ${setupB.clientId}
       `;
-      assert.equal(rows[0]?.revoked, false);
+      assert.equal(rows.length, 1);
     } finally {
       if (setupA) await teardown(sql, ownerA, setupA.clientId);
       if (setupB) await teardown(sql, ownerB, setupB.clientId);
@@ -607,8 +610,8 @@ test(
       const app = createHttpApp({ db: sql, registry });
       const list = await app.request('/admin-api/clients');
       assert.equal(list.status, 401);
-      const revoke = await app.request('/admin-api/clients/anything', { method: 'DELETE' });
-      assert.equal(revoke.status, 401);
+      const del = await app.request('/admin-api/clients/anything', { method: 'DELETE' });
+      assert.equal(del.status, 401);
     } finally {
       await sql.end();
     }
