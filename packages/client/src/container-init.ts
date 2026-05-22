@@ -32,10 +32,6 @@ import { createLogger, type Logger } from './logger.js';
 
 export interface ContainerInitOptions {
   kind: InstallableBackendKind;
-  // Future-proofing — today only 'container' is implemented. host
-  // mode prints an actionable error rather than guessing how the
-  // operator wants the agent CLI installed on their OS.
-  runtime: 'host' | 'container';
   // When true, copy the operator's existing host creds into the
   // container creds volume. When false, leave creds empty and let
   // the operator run an interactive auth flow themselves.
@@ -59,14 +55,6 @@ export interface ContainerInitOptions {
 // the CLI can `process.exit(code)` uniformly.
 export async function runContainerInit(opts: ContainerInitOptions): Promise<number> {
   const log = opts.logger ?? createLogger();
-  if (opts.runtime !== 'container') {
-    log.error(
-      `container init currently supports --runtime container only. ` +
-        `For host mode, install ${opts.kind} via its official installer and ` +
-        `run \`vicoop-client --backend ${opts.kind}\` directly.`,
-    );
-    return 64;
-  }
 
   const runtime = new RuntimeContainer({
     backendKind: opts.kind,
@@ -393,19 +381,14 @@ function authHintFor(kind: InstallableBackendKind): string {
 // ──────────────────────────────────────────────────────────────────────────
 
 const BACKEND_KINDS = ['claude', 'codex'] as const;
-const RUNTIME_MODES = ['host', 'container'] as const;
 
 const containerInitSubCmd = command(
   'init',
   object({
     action: constant('container-init' as const),
-    kind: argument(choice([...BACKEND_KINDS])),
-    runtime: withDefault(
-      option('--runtime', choice([...RUNTIME_MODES]), {
-        description: message`Where the backend runs. \`container\` (default) boots a vicoop-runtime container; \`host\` is reserved for a future cut.`,
-      }),
-      'container' as const,
-    ),
+    kind: argument(choice([...BACKEND_KINDS], { metavar: 'KIND' }), {
+      description: message`Backend agent CLI to install into the runtime container. One of: \`claude\`, \`codex\`.`,
+    }),
     fromHost: withDefault(
       flag('--from-host', {
         description: message`Copy the operator's existing host creds into the container's per-backend creds volume (macOS keychain for claude, ~/.codex for codex). Off by default — explicit opt-in for the runtime-isolation tradeoff.`,
@@ -424,8 +407,8 @@ const containerInitSubCmd = command(
     ),
   }),
   {
-    brief: message`Bootstrap a per-backend runtime container (#249 PR C).`,
-    description: message`One-shot setup for the container-runtime profile: boots \`vicoop-runtime-<kind>\`, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and (with --from-host) copies the operator's existing host creds into the container creds volume. After this, launch the daemon with \`vicoop-client --backend <kind> --<kind>-runtime container\`.`,
+    brief: message`Bootstrap a per-backend runtime container.`,
+    description: message`One-shot setup for the container-runtime profile: boots \`vicoop-runtime-<kind>\`, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and (with --from-host) copies the operator's existing host creds into the container creds volume. After this, launch the daemon with \`vicoop-client --backend <kind> --runtime container\`.`,
   },
 );
 
@@ -434,7 +417,7 @@ export const containerCmd = command(
   longestMatch(containerInitSubCmd),
   {
     brief: message`Manage per-backend runtime containers.`,
-    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<kind>\`, install the agent CLI, optionally copy host creds). Pairs with the daemon flags \`--claude-runtime container\` / \`--codex-runtime container\`.`,
+    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<kind>\`, install the agent CLI, optionally copy host creds). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
   },
 );
 
@@ -448,7 +431,6 @@ export async function runContainerInitCli(args: ContainerInitArgs): Promise<numb
   try {
     return await runContainerInit({
       kind: args.kind,
-      runtime: args.runtime,
       fromHost: args.fromHost,
       ...(args.image ? { image: args.image } : {}),
       ...(args.bridgeUrl ? { bridgeUrl: args.bridgeUrl } : {}),

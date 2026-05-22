@@ -278,11 +278,13 @@ re-runs.
 > reachable as a CLI flag and as a `config.json` field — pick whichever
 > surface fits the deployment. Top-level fields (`server_url`,
 > `server_token`, `agent_id`, `backend`, `card`) map to `--server`,
-> `--token`, `--agentId`, `--backend`, `--card`. Backend-specific fields
-> under `backends.*` map to `--claude-cwd`, `--claude-settings-file`,
-> `--codex-cwd`, `--codex-sandbox`, `--openclaw-gateway`,
-> `--openclaw-gateway-token`, `--openclaw-agent`,
-> `--openclaw-openai-compat-agent`, `--openclaw-task-timeout-ms`.
+> `--token`, `--agentId`, `--backend`, `--card`. Per-backend `cwd` /
+> `runtime` keys under `backends.<active>.*` map to the unified
+> `--cwd` / `--runtime` flags (scoped to whichever backend `--backend`
+> selected). Backend-specific fields map to `--claude-settings-file`,
+> `--codex-sandbox`, `--openclaw-gateway`, `--openclaw-gateway-token`,
+> `--openclaw-agent`, `--openclaw-openai-compat-agent`,
+> `--openclaw-task-timeout-ms`.
 
 > **Env vars are out of the runtime-config chain.** Past releases also
 > consulted `SERVER_URL` / `SERVER_TOKEN` / `AGENT_ID` / `BACKEND` /
@@ -522,7 +524,7 @@ different repository than the one `vicoop-client` itself runs in:
 ```sh
 "$INSTALL_DIR/vicoop-client" \
   --backend claude \
-  --claude-cwd "$HOME/vicoop-bridge"
+  --cwd "$HOME/vicoop-bridge"
 ```
 
 Both knobs can also live in the canonical `config.json` (resolved per Step
@@ -533,7 +535,7 @@ the daemon-level precedence (Step 6 intro).
 
 | Flag | `backends.claude.*` |
 |---|---|
-| `--claude-cwd` | `cwd` |
+| `--cwd` | `cwd` |
 | `--claude-settings-file` | `settings` (JSON object) |
 
 > **Sandbox-on by default.** When neither `--claude-settings-file` nor
@@ -546,9 +548,10 @@ the daemon-level precedence (Step 6 intro).
 > complete `settings` object — it replaces the default entirely. To run
 > without a sandbox, pass `{ "sandbox": { "enabled": false } }`.
 
-`--claude-cwd` defaults to the current working directory of the client
+`--cwd` defaults to the current working directory of the client
 process. Set it when the released bundle lives outside the repository you
-want Claude to edit.
+want Claude to edit. (Same flag is shared with the Codex backend; it's
+scoped to whichever backend `--backend` selects.)
 
 The Claude backend also injects a small `--append-system-prompt` on every
 spawned `claude` telling it its own A2A mention (`@<agentId>@<host>`) so
@@ -620,7 +623,7 @@ different repository / loosen the sandbox:
 ```sh
 "$INSTALL_DIR/vicoop-client" \
   --backend codex \
-  --codex-cwd "$HOME/vicoop-bridge" \
+  --cwd "$HOME/vicoop-bridge" \
   --codex-sandbox workspace-write
 ```
 
@@ -631,15 +634,17 @@ The flag wins over config.
 
 | Flag | `backends.codex.*` |
 |---|---|
-| `--codex-cwd` | `cwd` |
+| `--cwd` | `cwd` |
 | `--codex-sandbox` | `sandbox_mode` |
 
-`--codex-cwd` defaults to the current working directory of the client
-process. The v1 backend accepts text plus inline image `file.bytes`
-inputs and returns text output. `--codex-sandbox` is optional and
-accepts `read-only`, `workspace-write`, or `danger-full-access`; the
-client passes it to Codex as `-c sandbox_mode="<mode>"` so the same
-setting applies to fresh and resumed Codex sessions.
+`--cwd` defaults to the current working directory of the client
+process (shared with the Claude backend; scoped to whichever backend
+`--backend` selects). The v1 backend accepts text plus inline image
+`file.bytes` inputs and returns text output. `--codex-sandbox` is
+optional and accepts `read-only`, `workspace-write`, or
+`danger-full-access`; the client passes it to Codex as
+`-c sandbox_mode="<mode>"` so the same setting applies to fresh and
+resumed Codex sessions.
 
 > **Sandbox-on by default.** With neither `--codex-sandbox` nor
 > `backends.codex.sandbox_mode` set, the backend passes

@@ -39,7 +39,7 @@ export const setupCmd = command(
       description: message`Principal allowed to call this agent. Repeatable; comma-separated lists also accepted within a single occurrence.`,
     })),
     envFile: optional(option('--write-env-file', string({ metavar: 'PATH' }), {
-      description: message`Also emit a shell-sourceable env file. Daemon does NOT consume these env vars (#189 §5); the file is purely an operator-side credentials backup / scripting hook.`,
+      description: message`Also emit a shell-sourceable env file. Daemon does NOT consume these env vars; the file is purely an operator-side credentials backup / scripting hook.`,
     })),
     // `--env-file` is an alias for `--write-env-file` (older docs used it).
     envFileAlias: optional(option('--env-file', string({ metavar: 'PATH' }))),
@@ -55,7 +55,7 @@ export const setupCmd = command(
   }),
   {
     brief: message`[deprecated] Use \`agent register\`.`,
-    description: message`Deprecated alias for \`vicoop-client agent register\` (#224). Calls the bridge's \`registerClient\` GraphQL mutation, persists daemon credentials to \`~/.vicoop/config.json\`, and supports \`--write-env-file\` for an optional shell-sourceable env file. Will be removed in a future release.`,
+    description: message`Deprecated alias for \`vicoop-client agent register\`. Calls the bridge's \`registerClient\` GraphQL mutation, persists daemon credentials to \`~/.vicoop/config.json\`, and supports \`--write-env-file\` for an optional shell-sourceable env file. Will be removed in a future release.`,
   },
 );
 
@@ -66,13 +66,13 @@ export const agentRegisterCmd = command(
   object({
     action: constant('agent-register' as const),
     agentId: option('--agent-id', string({ metavar: 'ID' }), {
-      description: message`Agent id (routing key external A2A callers will use). After #219 the server enforces a single agent per registration.`,
+      description: message`Agent id (routing key external A2A callers will use). The server enforces a single agent per registration.`,
     }),
     callers: multiple(option('--caller', string({ metavar: 'PRINCIPAL' }), {
       description: message`Principal allowed to call this agent. Repeatable; comma-separated lists also accepted within a single occurrence.`,
     })),
     envFile: optional(option('--write-env-file', string({ metavar: 'PATH' }), {
-      description: message`Also emit a shell-sourceable env file. Daemon does NOT consume these env vars (#189 §5); the file is purely an operator-side credentials backup / scripting hook.`,
+      description: message`Also emit a shell-sourceable env file. Daemon does NOT consume these env vars; the file is purely an operator-side credentials backup / scripting hook.`,
     })),
     envFileAlias: optional(option('--env-file', string({ metavar: 'PATH' }))),
     server: optional(option('--server', string({ metavar: 'URL' }), {
@@ -87,7 +87,7 @@ export const agentRegisterCmd = command(
   }),
   {
     brief: message`Register an agent and persist daemon credentials.`,
-    description: message`Calls the bridge's \`registerClient\` GraphQL mutation (compat name; the unified server model from #219 is agent-first) using the owner-session bearer saved by \`vicoop-client login\`, receives a one-time AGENT_TOKEN, and writes the daemon credentials into the canonical \`~/.vicoop/config.json\` (mode 600). The token is unrecoverable after this single output; back up config.json before rotating hosts. \`--json\` skips disk persistence and prints the raw response instead.`,
+    description: message`Calls the bridge's \`registerClient\` GraphQL mutation (compat name; the unified server model is agent-first) using the owner-session bearer saved by \`vicoop-client login\`, receives a one-time AGENT_TOKEN, and writes the daemon credentials into the canonical \`~/.vicoop/config.json\` (mode 600). The token is unrecoverable after this single output; back up config.json before rotating hosts. \`--json\` skips disk persistence and prints the raw response instead.`,
   },
 );
 
