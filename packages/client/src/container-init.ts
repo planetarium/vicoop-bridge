@@ -79,6 +79,18 @@ export interface ContainerListOptions {
   dockerRun?: DockerRun;
 }
 
+export interface ContainerRemoveOptions {
+  kind: InstallableBackendKind;
+  removeVolumes: boolean;
+  dockerRun?: DockerRun;
+}
+
+export interface RuntimeRemoveResult {
+  kind: InstallableBackendKind;
+  container: { name: string; removed: boolean };
+  volumes: Array<{ name: string; removed: boolean; skipped: boolean }>;
+}
+
 // Returns the process exit code the CLI should use. Throws only on
 // programmer-error (e.g. unsupported kind reaching this function).
 // Operational failures (docker unreachable, install recipe non-zero,
@@ -442,6 +454,66 @@ export function formatRuntimeListJson(rows: readonly RuntimeListRow[]): string {
   return JSON.stringify(rows, null, 2);
 }
 
+export function removeRuntimeContainer(opts: ContainerRemoveOptions): RuntimeRemoveResult {
+  const dockerRun = opts.dockerRun ?? defaultDockerRun;
+  const name = containerName(opts.kind);
+  const result: RuntimeRemoveResult = {
+    kind: opts.kind,
+    container: {
+      name,
+      removed: removeDockerResource(dockerRun, ['rm', '-f', name], 'container'),
+    },
+    volumes: [],
+  };
+
+  for (const volumeName of [
+    agentsVolumeName(opts.kind),
+    credsVolumeName(opts.kind),
+    sessionsVolumeName(opts.kind),
+  ]) {
+    result.volumes.push({
+      name: volumeName,
+      removed: opts.removeVolumes
+        ? removeDockerResource(dockerRun, ['volume', 'rm', volumeName], 'volume')
+        : false,
+      skipped: !opts.removeVolumes,
+    });
+  }
+
+  return result;
+}
+
+export function formatRuntimeRemoveResult(result: RuntimeRemoveResult): string {
+  const lines = [
+    `${result.container.removed ? 'removed' : 'missing'} container ${result.container.name}`,
+  ];
+  if (result.volumes.every((v) => v.skipped)) {
+    lines.push(
+      `kept volumes ${result.volumes.map((v) => v.name).join(', ')} (pass --volumes to remove)`,
+    );
+  } else {
+    for (const volume of result.volumes) {
+      lines.push(`${volume.removed ? 'removed' : 'missing'} volume ${volume.name}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+export function formatRuntimeRemoveJson(result: RuntimeRemoveResult): string {
+  return JSON.stringify(result, null, 2);
+}
+
+function removeDockerResource(
+  dockerRun: DockerRun,
+  args: readonly string[],
+  resource: 'container' | 'volume',
+): boolean {
+  const r = dockerRun(args);
+  if (r.exitCode === 0) return true;
+  if (/No such container|No such volume|not found/i.test(r.stderr)) return false;
+  throw new Error(`docker ${args.join(' ')} failed (exit ${r.exitCode}): ${r.stderr.trim()}`);
+}
+
 function readManagedContainers(
   dockerRun: DockerRun,
 ): Map<string, { state: string; image: string | null }> {
@@ -597,18 +669,46 @@ const containerListSubCmd = longestMatch(
   containerListCommand('list'),
 );
 
+function containerRemoveCommand(name: 'rm' | 'remove') {
+  return command(
+    name,
+    object({
+      action: constant('container-remove' as const),
+      kind: argument(choice([...BACKEND_KINDS], { metavar: 'KIND' }), {
+        description: message`Runtime kind to remove. One of: \`claude\`, \`codex\`.`,
+      }),
+      volumes: withDefault(flag('--volumes', {
+        description: message`Also remove the runtime's agents, creds, and sessions named volumes. Off by default so credentials and sessions survive container recreation.`,
+      }), false),
+      json: withDefault(flag('--json', {
+        description: message`Emit machine-readable JSON.`,
+      }), false),
+    }),
+    {
+      brief: message`Remove a runtime container.`,
+      description: message`Removes the per-kind runtime container. Named volumes are kept by default; pass --volumes to remove the agents, creds, and sessions volumes too.`,
+    },
+  );
+}
+
+const containerRemoveSubCmd = longestMatch(
+  containerRemoveCommand('rm'),
+  containerRemoveCommand('remove'),
+);
+
 export const containerCmd = command(
   'container',
-  longestMatch(containerInitSubCmd, containerListSubCmd),
+  longestMatch(containerInitSubCmd, containerListSubCmd, containerRemoveSubCmd),
   {
     brief: message`Manage per-backend runtime containers.`,
-    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<kind>\`, install the agent CLI, optionally copy host creds), \`ls\` / \`list\` (show managed runtime container and volume state). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
+    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<kind>\`, install the agent CLI, optionally copy host creds), \`ls\` / \`list\` (show managed runtime container and volume state), \`rm\` / \`remove\` (remove a runtime container, optionally volumes). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
   },
 );
 
 export type ContainerCliArgs = InferValue<typeof containerCmd>;
 export type ContainerInitArgs = Extract<ContainerCliArgs, { action: 'container-init' }>;
 export type ContainerListArgs = Extract<ContainerCliArgs, { action: 'container-list' }>;
+export type ContainerRemoveArgs = Extract<ContainerCliArgs, { action: 'container-remove' }>;
 
 // Adapter from optique-parsed args → runContainerInit's typed
 // options. Lives here (not in cli.ts) so the command surface and
@@ -634,6 +734,22 @@ export async function runContainerListCli(args: ContainerListArgs): Promise<numb
     return 0;
   } catch (err) {
     console.error(`container ls failed: ${(err as Error).message}`);
+    return 1;
+  }
+}
+
+export async function runContainerRemoveCli(args: ContainerRemoveArgs): Promise<number> {
+  try {
+    const result = removeRuntimeContainer({
+      kind: args.kind,
+      removeVolumes: args.volumes,
+    });
+    process.stdout.write(
+      (args.json ? formatRuntimeRemoveJson(result) : formatRuntimeRemoveResult(result)) + '\n',
+    );
+    return 0;
+  } catch (err) {
+    console.error(`container rm failed: ${(err as Error).message}`);
     return 1;
   }
 }
