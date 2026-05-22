@@ -59,11 +59,34 @@ else
     vicoop-client container init "$KIND" --from-host
 fi
 
+# ── bring container up only for the inject window ────────────────────────
+# Upstream `container init` (post-#271) leaves the runtime stopped; the
+# bridge daemon's RuntimeContainer.start() will bring it up at launch.
+# `docker exec` for inject needs it running *now* though — so start it
+# if we found it stopped, and put it back the way we found it on exit
+# (matches the state convention upstream introduced).
+WAS_RUNNING=0
+if docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+    WAS_RUNNING=1
+fi
+if (( ! WAS_RUNNING )); then
+    log "starting $CONTAINER for inject (was stopped)"
+    docker start "$CONTAINER" >/dev/null
+fi
+
+cleanup() {
+    [[ -n "${STAGE:-}" ]] && rm -rf "$STAGE"
+    if (( ! WAS_RUNNING )); then
+        log "restoring $CONTAINER to stopped state"
+        docker stop "$CONTAINER" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
 # ── stage curated harness ─────────────────────────────────────────────────
 # Allowlist only — credentials live in upstream's --from-host path,
 # session/project state stays host-side on purpose.
 STAGE="$(mktemp -d -t vicoop-fork.XXXXXX)"
-trap 'rm -rf "$STAGE"' EXIT
 log "staging at: $STAGE"
 
 for d in skills agents commands; do
@@ -177,7 +200,7 @@ fi
 
 log ""
 log "done. start the bridge daemon (in another shell) with:"
-log "    vicoop-client --backend $KIND --runtime container"
+log "    vicoop-client --backend $KIND --runtime container --runtime-name $KIND"
 
-printf '{"container":"%s","kind":"%s","injected_into":"%s"}\n' \
-    "$CONTAINER" "$KIND" "$TARGET"
+printf '{"container":"%s","runtime_name":"%s","kind":"%s","injected_into":"%s"}\n' \
+    "$CONTAINER" "$KIND" "$KIND" "$TARGET"
