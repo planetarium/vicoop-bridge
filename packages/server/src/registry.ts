@@ -61,11 +61,13 @@ export class Registry {
     const existing = this.agents.get(conn.agentId);
     if (existing) {
       if (existing.clientId === conn.clientId) {
-        // Two daemons running with the same AGENT_TOKEN. Surface a distinct
-        // structured event so fly logs / admin tooling can spot flapping
-        // agents independently of the normal client_connected /
-        // client_disconnected pair — without this, a duplicate-token loop
-        // is indistinguishable from a flaky network in aggregate logs.
+        // Two daemons authenticated with the same CLIENT_TOKEN (so they
+        // resolve to the same clientId row) and racing to register the
+        // same agent. Surface a distinct structured event so fly logs /
+        // admin tooling can spot flapping agents independently of the
+        // normal client_connected / client_disconnected pair — without
+        // this, a duplicate-token loop is indistinguishable from a flaky
+        // network in aggregate logs.
         // agentId is user-controlled (hello frame), so truncate before
         // logging — same defense applied in notifyAgentChange below.
         logEvent('client_collision', {

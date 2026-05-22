@@ -278,8 +278,10 @@ test('disconnectClient closes every ws bound to the client_id with code 4014', (
 });
 
 test('registerAgent emits client_collision and closes the prior ws with the descriptive 4009 reason', (t) => {
-  // Two daemons running with the same AGENT_TOKEN show up here as a second
-  // registerAgent() for the same agentId + clientId. The prior ws must
+  // Two daemons authenticated with the same CLIENT_TOKEN — so the token
+  // hash resolves to the same client row, hence the same clientId — show
+  // up here as a second registerAgent() for the same agentId + clientId.
+  // The prior ws must
   // receive close(4009, 'another client with the same token connected')
   // — both the code and the reason text — so the surviving client surfaces
   // the cause directly in its disconnect log line. A structured

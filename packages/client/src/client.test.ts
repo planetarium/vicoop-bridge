@@ -463,12 +463,14 @@ test('Client stops on 4005 "bad token" too (delete-then-relaunch case, #166)', a
 test('Client surfaces 4009 "duplicate token" with a dedicated warn and floors the reconnect delay (#270)', async () => {
   // The default 4009 path before this fix logged only the generic
   // "disconnected: 4009 …" line and looped reconnects at the normal
-  // exponential backoff. Two daemons running with the same AGENT_TOKEN
-  // ended up ping-ponging each other indefinitely at the 30 s cap.
+  // exponential backoff. Two daemons authenticated with the same
+  // CLIENT_TOKEN (the bridge's clientId-level collision check, not the
+  // operator-visible agent identity) ended up ping-ponging each other
+  // indefinitely at the 30 s cap.
   //
   // The contract we're locking in here:
-  //   1. A clear warn line names both the cause (same AGENT_TOKEN) and the
-  //      remediation (`pgrep -fl vicoop-client`).
+  //   1. A clear warn line names both the cause (same CLIENT_TOKEN) and
+  //      the remediation (`pgrep -fl vicoop-client`).
   //   2. The next reconnect waits at least `collisionBackoffMs` so the
   //      duplicate-token loop damps out on the first cycle instead of
   //      hammering the server at the 30 s cap forever.
@@ -515,10 +517,10 @@ test('Client surfaces 4009 "duplicate token" with a dedicated warn and floors th
     await waitFor(() => helloCount === 1, 'expected initial hello');
     const closedAt = Date.now();
     connections[0]!.close(4009, 'another client with the same token connected');
-    // The warn line must name both the AGENT_TOKEN cause and the
+    // The warn line must name both the CLIENT_TOKEN cause and the
     // pgrep-based remediation — both halves of the contract above.
     await waitFor(
-      () => captured.warn.some((l) => l.includes('AGENT_TOKEN') && l.includes('pgrep')),
+      () => captured.warn.some((l) => l.includes('CLIENT_TOKEN') && l.includes('pgrep')),
       `expected dedicated 4009 warn, got warns: ${captured.warn.join(' | ')}`,
     );
     // Reconnect must respect the collision floor, not the 10 ms normal

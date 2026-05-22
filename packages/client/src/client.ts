@@ -40,14 +40,16 @@ export interface ClientOptions {
   reconnectJitterRatio?: number;
   reconnectStableMs?: number;
   // Minimum reconnect delay after a 4009 "another client with the same
-  // token connected" close. The default is intentionally large (5 min) so
-  // a duplicate-token ping-pong damps out within one cycle instead of
-  // hammering the bridge — see vicoop-bridge#270. A legitimate handoff
-  // (operator restarts the daemon, old process exits) still recovers; it
-  // just waits this long before reconnecting. Tests override to a small
-  // value so the 4009-specific path is exercisable without a multi-minute
-  // sleep. Setting this below the normal computed backoff has no effect —
-  // the floor only raises the delay, never lowers it.
+  // token connected" close — i.e. two daemons authenticated with the
+  // same CLIENT_TOKEN colliding at the registry's clientId check. The
+  // default is intentionally large (5 min) so a duplicate-token
+  // ping-pong damps out within one cycle instead of hammering the
+  // bridge — see vicoop-bridge#270. A legitimate handoff (operator
+  // restarts the daemon, old process exits) still recovers; it just
+  // waits this long before reconnecting. Tests override to a small value
+  // so the 4009-specific path is exercisable without a multi-minute
+  // sleep. Setting this below the normal computed backoff has no
+  // effect — the floor only raises the delay, never lowers it.
   collisionBackoffMs?: number;
   // WebSocket protocol ping interval. The client terminates the socket when
   // a previous ping has not received a pong by the next tick, which turns
@@ -382,13 +384,16 @@ export class Client {
         this.opts.onFatal?.({ code, reason: reason.toString() });
         return;
       }
-      // 4009 = another daemon registered with the same AGENT_TOKEN and the
-      // bridge replaced us. The "disconnected: 4009 …" line above already
-      // logs the sanitized reason, but on its own it reads like any other
-      // disconnect — operators have to know the close-code table to
-      // recognize the duplicate-token failure mode. Surface a dedicated
-      // WARN with the concrete remediation so the foreground log names
-      // both the cause and the fix on one line (vicoop-bridge#270).
+      // 4009 = another daemon registered with the same CLIENT_TOKEN (the
+      // token that authenticates the client_id row; 4009 fires when the
+      // bridge sees two live registrations resolving to the same
+      // clientId — see registry.ts) and the bridge replaced us. The
+      // "disconnected: 4009 …" line above already logs the sanitized
+      // reason, but on its own it reads like any other disconnect —
+      // operators have to know the close-code table to recognize the
+      // duplicate-token failure mode. Surface a dedicated WARN with the
+      // concrete remediation so the foreground log names both the cause
+      // and the fix on one line (vicoop-bridge#270).
       //
       // We deliberately do NOT treat this as fatal: if the other daemon
       // exits (operator kills it, or it crashes), this side should still
@@ -400,7 +405,7 @@ export class Client {
       // ping-pong damps out after a single cycle.
       if (code === 4009) {
         this.logger.warn(
-          'another vicoop-client is connected with the same AGENT_TOKEN — ' +
+          'another vicoop-client is connected with the same CLIENT_TOKEN — ' +
             'kill duplicates (`pgrep -fl vicoop-client`) or this daemon will keep being replaced',
         );
         this.scheduleReconnect(this.opts.collisionBackoffMs ?? DEFAULT_COLLISION_BACKOFF_MS);
