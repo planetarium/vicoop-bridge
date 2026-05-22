@@ -1542,7 +1542,65 @@ test('truncates a long tool_use input summary to a bounded length', async () => 
   assert.ok(textPart.text.endsWith('…'), 'truncation marker expected at tail');
 });
 
-test('subagent tool_use under the legacy "Task" name also fires bookends', async () => {
+test('subagent tool_use is silent without traceability opt-in', async () => {
+  // The subagent lifecycle is execution-trace detail (which tool ran,
+  // when it finished) and must ride the traceability extension just
+  // like `claude-tool-call` / `claude-tool-result`. A task that did NOT
+  // request the extension sees only assistant text, never the bookend.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'tu_no_trace',
+              name: 'Agent',
+              input: { description: 'No trace allowed' },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tu_no_trace',
+              content: [{ type: 'text', text: 'subagent done' }],
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Final.' }] },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'Final.' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
+  const { emit, frames } = collect();
+  await backend.handle(assign('no trace'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  // Only the final assistant-text artifact survives — no
+  // claude-subagent-event, no claude-tool-call, no claude-tool-result.
+  assert.deepEqual(
+    artifacts.map((a) => a.artifact.name),
+    ['claude-message'],
+  );
+  assert.equal(textOf(artifacts[0]), 'Final.');
+});
+
+test('subagent tool_use under the legacy "Task" name also fires the trace bookend', async () => {
   // The wire-level name from `claude -p --output-format stream-json` is
   // `Agent` (verified against claude 2.1.148), but the user-facing
   // surface and historical name is `Task`. We accept both so the
@@ -1582,16 +1640,16 @@ test('subagent tool_use under the legacy "Task" name also fires bookends', async
   });
   const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
   const { emit, frames } = collect();
-  await backend.handle(assign('legacy path'), emit, NEVER);
+  await backend.handle(assignWithTraceability('legacy path'), emit, NEVER);
 
   const events = frames
     .filter((f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact')
-    .map((a) => a.artifact.metadata?.event)
-    .filter(Boolean);
+    .filter((a) => a.artifact.name === 'claude-subagent-event')
+    .map((a) => a.artifact.metadata?.event);
   assert.deepEqual(events, ['subagent-started', 'subagent-completed']);
 });
 
-test('subagent tool_use surfaces start/finish bookend messages without traceability opt-in', async () => {
+test('subagent tool_use surfaces start/finish trace artifacts when traceability is requested', async () => {
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({
@@ -1632,28 +1690,39 @@ test('subagent tool_use surfaces start/finish bookend messages without traceabil
 
   const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
   const { emit, frames } = collect();
-  // Note: assign() — NO traceability extension.
-  await backend.handle(assign('look into Bson'), emit, NEVER);
+  await backend.handle(assignWithTraceability('look into Bson'), emit, NEVER);
 
   const artifacts = frames.filter(
     (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
   );
-  // Without trace, we get: subagent-started, subagent-completed, then the
-  // final assistant text. No claude-tool-call / claude-tool-result.
+  // Sequence with trace ON: subagent-started, the raw tool-call,
+  // subagent-completed, then the final assistant text. Text-only
+  // tool_result content does not produce a claude-tool-result.
   assert.deepEqual(
     artifacts.map((a) => a.artifact.name),
-    ['claude-message', 'claude-message', 'claude-message'],
+    ['claude-subagent-event', 'claude-tool-call', 'claude-subagent-event', 'claude-message'],
   );
-  assert.equal(textOf(artifacts[0]), 'Task started: Search Bson transaction handlers');
-  assert.equal(artifacts[0].artifact.metadata?.event, 'subagent-started');
-  assert.equal(artifacts[0].artifact.metadata?.toolUseId, 'tu_task_1');
-  assert.equal(textOf(artifacts[1]), 'Task completed: Search Bson transaction handlers');
-  assert.equal(artifacts[1].artifact.metadata?.event, 'subagent-completed');
-  assert.equal(artifacts[1].artifact.metadata?.toolUseId, 'tu_task_1');
-  assert.equal(textOf(artifacts[2]), 'Here is the summary.');
+  const started = artifacts[0];
+  assert.equal(textOf(started), 'Task started: Search Bson transaction handlers');
+  assert.equal(started.artifact.metadata?.event, 'subagent-started');
+  assert.equal(started.artifact.metadata?.traceType, 'subagent-event');
+  assert.equal(started.artifact.metadata?.toolUseId, 'tu_task_1');
+  assert.deepEqual(started.artifact.extensions, [TRACEABILITY_EXTENSION_URI]);
+  const dataPart = started.artifact.parts[1];
+  assert.equal(dataPart.kind, 'data');
+  if (dataPart.kind === 'data') {
+    assert.equal(dataPart.data.event, 'subagent-started');
+    assert.equal(dataPart.data.toolUseId, 'tu_task_1');
+    assert.equal(dataPart.data.description, 'Search Bson transaction handlers');
+  }
+  const completed = artifacts[2];
+  assert.equal(textOf(completed), 'Task completed: Search Bson transaction handlers');
+  assert.equal(completed.artifact.metadata?.event, 'subagent-completed');
+  assert.equal(completed.artifact.metadata?.toolUseId, 'tu_task_1');
+  assert.equal(textOf(artifacts[3]), 'Here is the summary.');
 });
 
-test('Task tool_result with is_error=true emits a "Task failed" bookend', async () => {
+test('subagent tool_result with is_error=true emits a "Task failed" trace bookend', async () => {
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({
@@ -1691,68 +1760,17 @@ test('Task tool_result with is_error=true emits a "Task failed" bookend', async 
 
   const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
   const { emit, frames } = collect();
-  await backend.handle(assign('try the audit'), emit, NEVER);
+  await backend.handle(assignWithTraceability('try the audit'), emit, NEVER);
 
-  const artifacts = frames.filter(
-    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
-  );
-  const failed = artifacts.find((a) => a.artifact.metadata?.event === 'subagent-failed');
-  assert.ok(failed, 'expected a subagent-failed message');
+  const failed = frames
+    .filter((f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact')
+    .find((a) => a.artifact.metadata?.event === 'subagent-failed');
+  assert.ok(failed, 'expected a subagent-failed trace artifact');
+  assert.equal(failed.artifact.name, 'claude-subagent-event');
   assert.equal(textOf(failed), 'Task failed: Audit migrations');
 });
 
-test('Task bookend messages co-exist with trace artifacts when traceability is requested', async () => {
-  const fake = scriptedSpawn({
-    lines: [
-      JSON.stringify({
-        type: 'assistant',
-        message: {
-          role: 'assistant',
-          content: [
-            {
-              type: 'tool_use',
-              id: 'tu_task_trace',
-              name: 'Agent',
-              input: { description: 'Trace flow' },
-            },
-          ],
-        },
-      }),
-      JSON.stringify({
-        type: 'user',
-        message: {
-          role: 'user',
-          content: [
-            {
-              type: 'tool_result',
-              tool_use_id: 'tu_task_trace',
-              content: [{ type: 'text', text: 'ok' }],
-            },
-          ],
-        },
-      }),
-      JSON.stringify({ type: 'result', subtype: 'success', result: 'done' }),
-    ],
-    exitCode: 0,
-  });
-
-  const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
-  const { emit, frames } = collect();
-  await backend.handle(assignWithTraceability('trace it'), emit, NEVER);
-
-  const artifacts = frames.filter(
-    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
-  );
-  const names = artifacts.map((a) => a.artifact.name);
-  // Sequence: started bookend, tool-call trace, completed bookend.
-  // Text-only tool_result content emits no claude-tool-result (only
-  // image/document blocks do), so we don't expect one for this run.
-  assert.deepEqual(names, ['claude-message', 'claude-tool-call', 'claude-message']);
-  assert.equal(artifacts[0].artifact.metadata?.event, 'subagent-started');
-  assert.equal(artifacts[2].artifact.metadata?.event, 'subagent-completed');
-});
-
-test('Task description falls back to bare "Task" when input.description is missing', async () => {
+test('subagent description falls back to bare "Task" when input.description is missing', async () => {
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({
@@ -1776,12 +1794,12 @@ test('Task description falls back to bare "Task" when input.description is missi
 
   const backend = createClaudeBackend({ spawn: fake.spawn, heartbeatMs: 0 });
   const { emit, frames } = collect();
-  await backend.handle(assign('go'), emit, NEVER);
+  await backend.handle(assignWithTraceability('go'), emit, NEVER);
 
   const started = frames
     .filter((f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact')
     .find((a) => a.artifact.metadata?.event === 'subagent-started');
-  assert.ok(started, 'expected a subagent-started message even without description');
+  assert.ok(started, 'expected a subagent-started trace artifact even without description');
   assert.equal(textOf(started), 'Task started: Task');
 });
 
