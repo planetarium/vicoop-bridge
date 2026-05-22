@@ -307,6 +307,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       const { spawn, cwd, runtime } = await resolveRuntime({
         kind: 'claude',
         runtime: args.runtime,
+        runtimeName: args.runtimeName,
         cwd: args.cwd,
         bridgeUrl: args.server,
       });
@@ -332,6 +333,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       const { spawn, cwd, runtime } = await resolveRuntime({
         kind: 'codex',
         runtime: args.runtime,
+        runtimeName: args.runtimeName,
         cwd: args.cwd,
         bridgeUrl: args.server,
       });
@@ -377,6 +379,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
 async function resolveRuntime(args: {
   kind: 'claude' | 'codex';
   runtime: 'host' | 'container' | undefined;
+  runtimeName: string | undefined;
   cwd: string | undefined;
   bridgeUrl: string;
 }): Promise<{ spawn?: SpawnFn; cwd?: string; runtime?: RuntimeContainer }> {
@@ -385,6 +388,7 @@ async function resolveRuntime(args: {
   }
   const runtime = new RuntimeContainer({
     backendKind: args.kind,
+    runtimeName: args.runtimeName,
     image: process.env.VICOOP_RUNTIME_IMAGE || DEFAULT_RUNTIME_IMAGE,
     workspaceDir: args.cwd,
     bridgeUrl: args.bridgeUrl,

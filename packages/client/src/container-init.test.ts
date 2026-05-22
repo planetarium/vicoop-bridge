@@ -172,10 +172,12 @@ test('listRuntimeContainers: fixed rows from managed docker labels', () => {
     '{{json .}}',
   ]);
   assert.equal(rows[0].kind, 'claude');
+  assert.equal(rows[0].name, 'default');
   assert.equal(rows[0].container.state, 'running');
   assert.equal(rows[0].container.image, 'runtime:latest');
   assert.equal(rows[0].volumes.sessions.present, true);
   assert.equal(rows[1].kind, 'codex');
+  assert.equal(rows[1].name, 'default');
   assert.equal(rows[1].container.state, 'stopped');
   assert.equal(rows[1].volumes.agents.present, true);
   assert.equal(rows[1].volumes.creds.present, false);
@@ -208,11 +210,55 @@ test('formatRuntimeList and JSON output include volume state', () => {
     },
   });
 
-  assert.match(formatRuntimeList(rows), /KIND\s+CONTAINER\s+IMAGE\s+AGENTS\s+CREDS\s+SESSIONS/);
-  assert.match(formatRuntimeList(rows), /codex\s+missing\s+-\s+no\s+yes\s+no/);
+  assert.match(formatRuntimeList(rows), /KIND\s+NAME\s+CONTAINER\s+IMAGE\s+AGENTS\s+CREDS\s+SESSIONS/);
+  assert.match(formatRuntimeList(rows), /codex\s+default\s+missing\s+-\s+no\s+yes\s+no/);
   const parsed = JSON.parse(formatRuntimeListJson(rows));
+  assert.equal(parsed[1].name, 'default');
   assert.equal(parsed[1].volumes.creds.name, 'vicoop-creds-codex');
   assert.equal(parsed[1].volumes.creds.present, true);
+});
+
+test('listRuntimeContainers: includes named runtime instances discovered from labels', () => {
+  const rows = listRuntimeContainers({
+    dockerRun: (args) => {
+      if (args[0] === 'ps') {
+        return ok(
+          JSON.stringify({
+            Names: 'vicoop-runtime-codex-work',
+            State: 'running',
+            Image: 'runtime:named',
+            Labels: 'vicoop.kind=codex,vicoop.name=work',
+          }),
+        );
+      }
+      return ok(
+        [
+          JSON.stringify({
+            Name: 'vicoop-agents-codex-work',
+            Labels: 'vicoop.kind=codex,vicoop.name=work',
+          }),
+          JSON.stringify({
+            Name: 'vicoop-creds-codex-work',
+            Labels: 'vicoop.kind=codex,vicoop.name=work',
+          }),
+        ].join('\n'),
+      );
+    },
+  });
+
+  assert.deepEqual(
+    rows.map((row) => [row.kind, row.name, row.container.name, row.container.state]),
+    [
+      ['claude', 'default', 'vicoop-runtime-claude', 'missing'],
+      ['codex', 'default', 'vicoop-runtime-codex', 'missing'],
+      ['codex', 'work', 'vicoop-runtime-codex-work', 'running'],
+    ],
+  );
+  const named = rows[2];
+  assert.equal(named.volumes.agents.present, true);
+  assert.equal(named.volumes.creds.present, true);
+  assert.equal(named.volumes.sessions.name, 'vicoop-sessions-codex-work');
+  assert.equal(named.volumes.sessions.present, false);
 });
 
 // ──────────────────────────────────────────────────────────────────
@@ -223,6 +269,7 @@ test('removeRuntimeContainer: removes container and keeps volumes by default', (
   const calls: Array<readonly string[]> = [];
   const result = removeRuntimeContainer({
     kind: 'claude',
+    runtimeName: 'work',
     removeVolumes: false,
     dockerRun: (args) => {
       calls.push(args);
@@ -230,14 +277,15 @@ test('removeRuntimeContainer: removes container and keeps volumes by default', (
     },
   });
 
-  assert.deepEqual(calls, [['rm', '-f', 'vicoop-runtime-claude']]);
+  assert.deepEqual(calls, [['rm', '-f', 'vicoop-runtime-claude-work']]);
   assert.equal(result.container.removed, true);
+  assert.equal(result.name, 'work');
   assert.deepEqual(
     result.volumes.map((v) => [v.name, v.removed, v.skipped]),
     [
-      ['vicoop-agents-claude', false, true],
-      ['vicoop-creds-claude', false, true],
-      ['vicoop-sessions-claude', false, true],
+      ['vicoop-agents-claude-work', false, true],
+      ['vicoop-creds-claude-work', false, true],
+      ['vicoop-sessions-claude-work', false, true],
     ],
   );
   assert.match(formatRuntimeRemoveResult(result), /kept volumes/);

@@ -120,6 +120,35 @@ test('--runtime + --cwd with --backend claude is accepted', () => {
   assert.equal(r.args.cwd, '/repo');
 });
 
+test('--runtime-name is accepted for container-capable backends', () => {
+  const r = mergeClientArgs(
+    {
+      token: 't',
+      agentId: 'a',
+      backend: 'codex',
+      runtime: 'container',
+      runtimeName: 'work',
+    },
+    {},
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.runtimeName, 'work');
+});
+
+test('--runtime-name with a non-runtime-capable backend is a hard error', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'echo', runtimeName: 'work' },
+    {},
+  );
+  assert.equal(r.ok, false);
+  if (r.ok) return;
+  assert.ok(
+    r.errors.some((e) => e.includes('--runtime-name') && e.includes('echo')),
+    `expected error mentioning --runtime-name and echo, got: ${r.errors.join(' | ')}`,
+  );
+});
+
 test('parseFlags picks up known flags', () => {
   const r = parseFlags([
     '--server', 'wss://x',
@@ -128,11 +157,13 @@ test('parseFlags picks up known flags', () => {
     '--backend', 'claude',
     '--card', '/c.json',
     '--config', '/etc/vicoop/config.json',
+    '--runtime-name', 'work',
   ]);
   assert.equal(r.ok, true);
   if (!r.ok) return;
   assert.equal(r.flags.server, 'wss://x');
   assert.equal(r.flags.token, 't');
+  assert.equal(r.flags.runtimeName, 'work');
   assert.equal(r.flags.agentId, 'a');
   assert.equal(r.flags.backend, 'claude');
   assert.equal(r.flags.card, '/c.json');

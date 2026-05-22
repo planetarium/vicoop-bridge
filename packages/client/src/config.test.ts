@@ -165,7 +165,7 @@ test('writeConfig writes JSON at mode 0600 and readConfig round-trips', (t) => {
     card: '/path/card.json',
     backends: {
       claude: { cwd: '/srv/work', settings: { sandbox: { enabled: true } } },
-      codex: { cwd: '/srv/work', sandbox_mode: 'workspace-write' },
+      codex: { cwd: '/srv/work', sandbox_mode: 'workspace-write', runtime_name: 'work' },
       openclaw: {
         gateway_url: 'ws://127.0.0.1:18789',
         gateway_token: 'gt',
@@ -183,7 +183,7 @@ test('writeConfig writes JSON at mode 0600 and readConfig round-trips', (t) => {
     card: '/path/card.json',
     backends: {
       claude: { cwd: '/srv/work', settings: { sandbox: { enabled: true } } },
-      codex: { cwd: '/srv/work', sandbox_mode: 'workspace-write' },
+      codex: { cwd: '/srv/work', sandbox_mode: 'workspace-write', runtime_name: 'work' },
       openclaw: {
         gateway_url: 'ws://127.0.0.1:18789',
         gateway_token: 'gt',
@@ -315,6 +315,7 @@ test('normalizeConfig accepts backends.codex with sandbox_mode and approval_deci
           cwd: '/srv',
           sandbox_mode: 'workspace-write',
           approval_decision: 'acceptForSession',
+          runtime_name: 'work',
         },
       },
     }),
@@ -327,6 +328,7 @@ test('normalizeConfig accepts backends.codex with sandbox_mode and approval_deci
         cwd: '/srv',
         sandbox_mode: 'workspace-write',
         approval_decision: 'acceptForSession',
+        runtime_name: 'work',
       },
     },
   });
