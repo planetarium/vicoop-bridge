@@ -220,26 +220,53 @@ wizard() {
     log ""
     log "=== vicoop-bridge first-time setup ==="
     log "No config detected and a TTY is attached, so I'll walk you through it."
-    log ""
 
-    log "Step 1/3: bridge owner sign-in"
+    log ""
+    log "--- Step 1/3: bridge owner sign-in ---"
     vicoop-client auth login || die "auth login failed"
 
     log ""
-    log "Step 2/3: pick a backend + agent id"
-    local default_agent
-    default_agent="$(hostname 2>/dev/null || echo agent)"
-    local agent_id backend
-    read -rp "  Agent ID [$default_agent]: " agent_id
-    agent_id="${agent_id:-$default_agent}"
-    while :; do
-        read -rp "  Backend [echo|claude|codex|openclaw|vicoop-codex]: " backend
-        case "$backend" in
-            echo|claude|codex|openclaw|vicoop-codex) break ;;
-            *) log "  unknown backend; try again." ;;
-        esac
+    log "--- Step 2/3: pick a backend + agent id ---"
+    log ""
+    log "The agent id is the routing key external A2A callers will use"
+    log "to reach this daemon. Pick something memorable (alphanumeric +"
+    log "dashes are safe)."
+    log ""
+    local agent_id=""
+    while [[ -z "${agent_id// }" ]]; do
+        read -rp "  Agent ID: " agent_id
+        if [[ -z "${agent_id// }" ]]; then
+            log "  Agent ID cannot be empty."
+        fi
     done
 
+    log ""
+    log "Available backends:"
+    # bash `select` does the keystroke loop + invalid-input retry on
+    # its own. We render two parallel arrays — `descriptions` is what
+    # operators see, `kinds` is what we feed to install-backend.sh and
+    # write into config.json. REPLY (set by select to the chosen 1-based
+    # index) ties the two.
+    local options=(
+        "claude       - Anthropic Claude Code CLI"
+        "codex        - OpenAI Codex CLI"
+        "echo         - in-process echo (testing only; no LLM)"
+        "openclaw     - external OpenClaw gateway"
+        "vicoop-codex - codex via vicoop's traceability bridge"
+    )
+    local kinds=(claude codex echo openclaw vicoop-codex)
+    local backend="" choice
+    PS3="  Pick a backend (number): "
+    select choice in "${options[@]}"; do
+        if [[ -n "$choice" ]]; then
+            backend="${kinds[$((REPLY - 1))]}"
+            break
+        fi
+        log "  Invalid; enter a number from 1 to ${#options[@]}."
+    done
+    unset PS3
+
+    log ""
     vicoop-client agent register --agent-id "$agent_id" \
         || die "agent register failed"
 
@@ -253,7 +280,7 @@ wizard() {
     mv "$tmp" "$CONFIG"
 
     log ""
-    log "Step 3/3: backend install + sign-in"
+    log "--- Step 3/3: backend install + sign-in ---"
     if backend_is_installable "$backend"; then
         "$VICOOP_LIB/install-backend.sh" "$backend"
         local bin="$VICOOP_DATA/agents/$backend/bin/$backend"
