@@ -407,7 +407,7 @@ const containerInitSubCmd = command(
     ),
   }),
   {
-    brief: message`Bootstrap a per-backend runtime container (#249 PR C).`,
+    brief: message`Bootstrap a per-backend runtime container.`,
     description: message`One-shot setup for the container-runtime profile: boots \`vicoop-runtime-<kind>\`, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and (with --from-host) copies the operator's existing host creds into the container creds volume. After this, launch the daemon with \`vicoop-client --backend <kind> --<kind>-runtime container\`.`,
   },
 );

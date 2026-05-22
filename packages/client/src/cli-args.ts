@@ -80,7 +80,7 @@ export const daemonFlagsFields = {
     description: message`Path to a JSON file used as Claude \`--settings\`.`,
   })),
   claudeRuntime: optional(option('--claude-runtime', choice([...BACKEND_RUNTIMES]), {
-    description: message`Where to run \`claude\`. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside a vicoop-runtime container the bridge client orchestrates (#249).`,
+    description: message`Where to run \`claude\`. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside a vicoop-runtime container the bridge client orchestrates.`,
   })),
 
   // Backend-specific (Codex)
@@ -91,7 +91,7 @@ export const daemonFlagsFields = {
     description: message`Codex sandbox mode.`,
   })),
   codexRuntime: optional(option('--codex-runtime', choice([...BACKEND_RUNTIMES]), {
-    description: message`Where to run \`codex\`. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside a vicoop-runtime container the bridge client orchestrates (#249).`,
+    description: message`Where to run \`codex\`. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside a vicoop-runtime container the bridge client orchestrates.`,
   })),
 
   // Backend-specific (OpenClaw)

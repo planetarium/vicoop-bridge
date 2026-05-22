@@ -169,7 +169,7 @@ export class RuntimeContainer {
     if (r.exitCode !== 0 || r.stdout.trim().length === 0) {
       throw new Error(
         `docker daemon is not reachable (${r.stderr.trim() || `exit ${r.exitCode}`}). ` +
-          `The container runtime profile (#249) requires a local docker daemon. ` +
+          `The container runtime profile requires a local docker daemon. ` +
           `Switch to runtime: 'host' for this backend, or start docker and retry.`,
       );
     }
