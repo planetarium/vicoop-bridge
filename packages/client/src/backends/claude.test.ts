@@ -1092,6 +1092,73 @@ test('non-zero claude exit includes stdout tail when stderr is empty', async () 
   }
 });
 
+test('non-zero claude exit with completed result and no stderr completes', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'result',
+        result: '',
+        terminal_reason: 'completed',
+        is_error: false,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+        },
+        modelUsage: {},
+        permission_denials: [],
+      }),
+    ],
+    exitCode: 1,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('completed but nonzero'), emit, NEVER);
+
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.complete');
+  if (terminal.type === 'task.complete') {
+    assert.equal(terminal.status.state, 'completed');
+  }
+  assert.equal(frames.find((f) => f.type === 'task.fail'), undefined);
+});
+
+test('non-zero claude exit with completed error result still fails', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Not logged in · Please run /login' }],
+        },
+        error: 'authentication_failed',
+      }),
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: true,
+        result: 'Not logged in · Please run /login',
+        terminal_reason: 'completed',
+        modelUsage: {},
+        permission_denials: [],
+      }),
+    ],
+    exitCode: 1,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('auth expired'), emit, NEVER);
+
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.fail');
+  if (terminal.type === 'task.fail') {
+    assert.equal(terminal.error.code, 'claude_exit_nonzero');
+    assert.match(terminal.error.message, /Not logged in/);
+  }
+});
+
 test('rollback does not delete a binding a concurrent task has refreshed', async () => {
   // Task A (first) holds open without finishing. Task B (second) starts
   // on the same contextId, sees the binding A wrote, refreshes lastUsedAt
