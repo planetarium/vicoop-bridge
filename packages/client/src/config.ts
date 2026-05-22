@@ -110,6 +110,7 @@ export interface ClaudeBackendConfig {
   cwd?: string;
   settings?: Record<string, unknown>;
   runtime?: BackendRuntime;
+  runtime_name?: string;
 }
 
 export interface CodexBackendConfig {
@@ -118,6 +119,7 @@ export interface CodexBackendConfig {
   /** What to answer when codex requests user approval. Default `decline`. */
   approval_decision?: 'accept' | 'acceptForSession' | 'decline';
   runtime?: BackendRuntime;
+  runtime_name?: string;
 }
 
 export interface OpenclawBackendConfig {
@@ -231,11 +233,13 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const cwd = asString(claudeRaw.cwd);
       const settings = asRecord(claudeRaw.settings);
       const runtime = pickBackendRuntime(claudeRaw.runtime);
-      if (cwd || settings || runtime) {
+      const runtimeName = asString(claudeRaw.runtime_name);
+      if (cwd || settings || runtime || runtimeName) {
         out.claude = {};
         if (cwd) out.claude.cwd = cwd;
         if (settings) out.claude.settings = settings;
         if (runtime) out.claude.runtime = runtime;
+        if (runtimeName) out.claude.runtime_name = runtimeName;
       }
     }
     const codexRaw = asRecord(backends.codex);
@@ -250,12 +254,14 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
           ? (approvalRaw as 'accept' | 'acceptForSession' | 'decline')
           : undefined;
       const runtime = pickBackendRuntime(codexRaw.runtime);
-      if (cwd || validSandbox || validApproval || runtime) {
+      const runtimeName = asString(codexRaw.runtime_name);
+      if (cwd || validSandbox || validApproval || runtime || runtimeName) {
         out.codex = {};
         if (cwd) out.codex.cwd = cwd;
         if (validSandbox) out.codex.sandbox_mode = validSandbox;
         if (validApproval) out.codex.approval_decision = validApproval;
         if (runtime) out.codex.runtime = runtime;
+        if (runtimeName) out.codex.runtime_name = runtimeName;
       }
     }
     const ocRaw = asRecord(backends.openclaw);

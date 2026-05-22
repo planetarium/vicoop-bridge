@@ -79,6 +79,9 @@ export const daemonFlagsFields = {
   runtime: optional(option('--runtime', choice([...BACKEND_RUNTIMES]), {
     description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside an existing vicoop-runtime container created by \`vicoop-client container init <kind>\`. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
   })),
+  runtimeName: optional(option('--runtime-name', string({ metavar: 'NAME' }), {
+    description: message`Runtime container instance name to use with \`--runtime container\`. Omit to use the active backend kind as the generated name.`,
+  })),
 
   // Backend-specific (Claude)
   claudeSettingsFile: optional(option('--claude-settings-file', string({ metavar: 'PATH' }), {
@@ -129,6 +132,7 @@ export interface DaemonArgs {
   // step resolves the config fallback against `backends.<active>.{cwd,runtime}`.
   cwd?: string;
   runtime?: BackendRuntime;
+  runtimeName?: string;
   claudeSettingsFile?: string;
   codexSandbox?: CodexSandboxMode;
   openclawGateway?: string;
@@ -222,6 +226,10 @@ export function mergeClientArgs(
     backend === 'claude' ? backends.claude?.runtime
     : backend === 'codex' ? backends.codex?.runtime
     : undefined;
+  const activeRuntimeName =
+    backend === 'claude' ? backends.claude?.runtime_name
+    : backend === 'codex' ? backends.codex?.runtime_name
+    : undefined;
 
   const resolved: DaemonArgs = {
     server: pick(flags.server) || config.server_url || DEFAULT_BRIDGE_URL,
@@ -232,6 +240,7 @@ export function mergeClientArgs(
     backends: config.backends,
     cwd: pick(flags.cwd) || activeCwd || undefined,
     runtime: flags.runtime ?? activeRuntime,
+    runtimeName: pick(flags.runtimeName) || activeRuntimeName || undefined,
     claudeSettingsFile: pick(flags.claudeSettingsFile) || undefined,
     codexSandbox:
       flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),
@@ -257,6 +266,7 @@ export function mergeClientArgs(
   if (resolved.openclawGateway === '') resolved.openclawGateway = undefined;
   if (resolved.openclawGatewayToken === '') resolved.openclawGatewayToken = undefined;
   if (resolved.openclawAgent === '') resolved.openclawAgent = undefined;
+  if (resolved.runtimeName === '') resolved.runtimeName = undefined;
   if (resolved.openclawOpenaiCompatAgent === '') {
     resolved.openclawOpenaiCompatAgent = undefined;
   }
@@ -275,6 +285,11 @@ export function mergeClientArgs(
   if (flags.runtime !== undefined && !RUNTIME_BACKENDS.has(backend)) {
     errors.push(
       `--runtime is not supported by --backend ${backend}; only claude / codex have a runtime container profile`,
+    );
+  }
+  if (pick(flags.runtimeName) && !RUNTIME_BACKENDS.has(backend)) {
+    errors.push(
+      `--runtime-name is not supported by --backend ${backend}; only claude / codex have a runtime container profile`,
     );
   }
   if (pick(flags.cwd) && !CWD_BACKENDS.has(backend)) {

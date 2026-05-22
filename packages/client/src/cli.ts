@@ -21,7 +21,12 @@ import { createVicoopCodexBackend } from './backends/vicoop-codex.js';
 import type { Backend } from './backend.js';
 import { RuntimeContainer, DEFAULT_RUNTIME_IMAGE } from './runtime-container.js';
 import { createDockerExecSpawn, type SpawnFn } from './spawn-adapter.js';
-import { containerCmd, runContainerInitCli } from './container-init.js';
+import {
+  containerCmd,
+  runContainerInitCli,
+  runContainerListCli,
+  runContainerRemoveCli,
+} from './container-init.js';
 import isInsideContainer from 'is-inside-container';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
@@ -302,6 +307,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       const { spawn, cwd, runtime } = await resolveRuntime({
         kind: 'claude',
         runtime: args.runtime,
+        runtimeName: args.runtimeName,
         cwd: args.cwd,
         bridgeUrl: args.server,
       });
@@ -327,6 +333,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       const { spawn, cwd, runtime } = await resolveRuntime({
         kind: 'codex',
         runtime: args.runtime,
+        runtimeName: args.runtimeName,
         cwd: args.cwd,
         bridgeUrl: args.server,
       });
@@ -372,6 +379,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
 async function resolveRuntime(args: {
   kind: 'claude' | 'codex';
   runtime: 'host' | 'container' | undefined;
+  runtimeName: string | undefined;
   cwd: string | undefined;
   bridgeUrl: string;
 }): Promise<{ spawn?: SpawnFn; cwd?: string; runtime?: RuntimeContainer }> {
@@ -380,6 +388,7 @@ async function resolveRuntime(args: {
   }
   const runtime = new RuntimeContainer({
     backendKind: args.kind,
+    runtimeName: args.runtimeName,
     image: process.env.VICOOP_RUNTIME_IMAGE || DEFAULT_RUNTIME_IMAGE,
     workspaceDir: args.cwd,
     bridgeUrl: args.bridgeUrl,
@@ -619,6 +628,12 @@ async function main(): Promise<void> {
       break;
     case 'container-init':
       process.exit(await runContainerInitCli(parsed));
+      break;
+    case 'container-list':
+      process.exit(await runContainerListCli(parsed));
+      break;
+    case 'container-remove':
+      process.exit(await runContainerRemoveCli(parsed));
       break;
     case 'daemon':
       // Long-running. Do not exit — client.start() keeps the event loop

@@ -32,10 +32,16 @@ import { createLogger, type Logger } from './logger.js';
 
 export const DEFAULT_RUNTIME_IMAGE = 'ghcr.io/planetarium/vicoop-runtime:latest';
 
+export const RUNTIME_MANAGED_BY_LABEL = 'vicoop.managed-by=vicoop-bridge';
+export const RUNTIME_COMPONENT_LABEL = 'vicoop.component=runtime';
+
 export interface RuntimeContainerOptions {
-  // Which backend this container hosts. Used in the canonical
-  // container/volume names so claude and codex get isolated runtimes.
+  // Which backend this container hosts. Stored as metadata and used for
+  // backend-specific install paths inside the shared runtime image.
   backendKind: string;
+  // Runtime instance name. Omitted means the backend kind is used as the
+  // generated name, so identity stays name-based without an unnamed mode.
+  runtimeName?: string;
   // OCI image to run. Defaults to DEFAULT_RUNTIME_IMAGE; env override
   // `VICOOP_RUNTIME_IMAGE` is resolved by the caller (cli.ts) so this
   // module stays env-clean.
@@ -53,6 +59,11 @@ export interface RuntimeContainerOptions {
   // consume a runtime container the operator already initialized with
   // `vicoop-client container init <kind>`.
   createIfMissing?: boolean;
+  // When creating from `container init`, fail if the target container
+  // or any canonical volume already exists. This keeps init as a
+  // fresh-create command instead of silently reinstalling into an
+  // existing runtime.
+  failIfExists?: boolean;
   logger?: Logger;
   // Test seam — inject a custom docker CLI runner so tests can
   // capture argv + script responses without shelling out.
@@ -67,7 +78,7 @@ export interface DockerResult {
 
 export type DockerRun = (args: readonly string[]) => DockerResult;
 
-function defaultDockerRun(args: readonly string[]): DockerResult {
+export function defaultDockerRun(args: readonly string[]): DockerResult {
   const r = spawnSync('docker', Array.from(args), { encoding: 'utf8' });
   return {
     stdout: r.stdout ?? '',
@@ -76,28 +87,53 @@ function defaultDockerRun(args: readonly string[]): DockerResult {
   };
 }
 
-function containerName(kind: string): string {
-  return `vicoop-runtime-${kind}`;
+export function validateRuntimeName(name: string | undefined): string | undefined {
+  const trimmed = name?.trim();
+  if (!trimmed) return undefined;
+  if (!/^[a-z0-9][a-z0-9_.-]{0,31}$/.test(trimmed)) {
+    throw new Error(
+      `runtime name must match [a-z0-9][a-z0-9_.-]{0,31}; got '${name}'`,
+    );
+  }
+  return trimmed;
 }
-function agentsVolumeName(kind: string): string {
-  return `vicoop-agents-${kind}`;
+
+export function defaultRuntimeName(kind: string): string {
+  const name = validateRuntimeName(kind);
+  if (!name) throw new Error(`backend kind '${kind}' cannot be used as a runtime name`);
+  return name;
 }
-function credsVolumeName(kind: string): string {
-  return `vicoop-creds-${kind}`;
+
+export function runtimeInstanceName(kind: string, name: string | undefined): string {
+  return validateRuntimeName(name) ?? defaultRuntimeName(kind);
 }
-function sessionsVolumeName(kind: string): string {
-  return `vicoop-sessions-${kind}`;
+
+export function containerName(kind: string, runtimeName?: string): string {
+  return `vicoop-runtime-${runtimeInstanceName(kind, runtimeName)}`;
+}
+export function agentsVolumeName(kind: string, runtimeName?: string): string {
+  return `vicoop-agents-${runtimeInstanceName(kind, runtimeName)}`;
+}
+export function credsVolumeName(kind: string, runtimeName?: string): string {
+  return `vicoop-creds-${runtimeInstanceName(kind, runtimeName)}`;
+}
+export function sessionsVolumeName(kind: string, runtimeName?: string): string {
+  return `vicoop-sessions-${runtimeInstanceName(kind, runtimeName)}`;
 }
 
 export class RuntimeContainer {
-  private readonly opts: Required<Pick<RuntimeContainerOptions, 'backendKind' | 'image'>> &
+  private readonly opts: Required<Pick<RuntimeContainerOptions, 'backendKind' | 'image' | 'runtimeName'>> &
     RuntimeContainerOptions;
   private readonly log: Logger;
   private readonly run: DockerRun;
   private started = false;
 
   constructor(opts: RuntimeContainerOptions) {
-    this.opts = { ...opts, image: opts.image ?? DEFAULT_RUNTIME_IMAGE };
+    this.opts = {
+      ...opts,
+      runtimeName: runtimeInstanceName(opts.backendKind, opts.runtimeName),
+      image: opts.image ?? DEFAULT_RUNTIME_IMAGE,
+    };
     this.log = opts.logger ?? createLogger();
     this.run = opts.dockerRun ?? defaultDockerRun;
   }
@@ -109,8 +145,14 @@ export class RuntimeContainer {
   async start(): Promise<void> {
     this.ensureDaemonReachable();
 
-    const name = containerName(this.opts.backendKind);
+    const name = containerName(this.opts.backendKind, this.opts.runtimeName);
     if (this.findContainer(name)) {
+      if (this.opts.failIfExists) {
+        throw new Error(
+          `runtime container '${name}' already exists. ` +
+            `Remove it first with \`${this.removeHint()}\`, then rerun init.`,
+        );
+      }
       if (this.inspectRunning(name)) {
         this.log.info(`runtime container '${name}' already running — reusing`);
       } else {
@@ -121,9 +163,12 @@ export class RuntimeContainer {
       if (!this.opts.createIfMissing) {
         throw new Error(
           `runtime container '${name}' does not exist. ` +
-            `Create it first with \`vicoop-client container init ${this.opts.backendKind}\`, ` +
-            `then retry \`vicoop-client --backend ${this.opts.backendKind} --runtime container\`.`,
+            `Create it first with \`vicoop-client container init ${this.opts.backendKind} --name ${this.opts.runtimeName}\`, ` +
+            `then retry \`vicoop-client --backend ${this.opts.backendKind} --runtime container --runtime-name ${this.opts.runtimeName}\`.`,
         );
+      }
+      if (this.opts.failIfExists) {
+        this.ensureFreshVolumes();
       }
       await this.ensureImage();
       this.ensureVolumes();
@@ -140,7 +185,7 @@ export class RuntimeContainer {
   // handler so an orderly shutdown actually ends with the container
   // stopped. Already-stopped / missing containers are tolerated.
   async stop(): Promise<void> {
-    const name = containerName(this.opts.backendKind);
+    const name = containerName(this.opts.backendKind, this.opts.runtimeName);
     const r = this.run(['stop', '-t', '10', name]);
     if (r.exitCode === 0) {
       this.log.info(`runtime container '${name}' stopped`);
@@ -157,7 +202,7 @@ export class RuntimeContainer {
   // Canonical container name. Used by spawn-adapter to build the
   // `docker exec` argv for each per-task spawn.
   getContainerName(): string {
-    return containerName(this.opts.backendKind);
+    return containerName(this.opts.backendKind, this.opts.runtimeName);
   }
 
   // ──────────────────────────────────────────────────────────────────
@@ -204,23 +249,46 @@ export class RuntimeContainer {
 
   private ensureVolumes(): void {
     const kind = this.opts.backendKind;
-    const names = [
-      agentsVolumeName(kind),
-      credsVolumeName(kind),
-      sessionsVolumeName(kind),
-    ];
-    for (const name of names) {
+    const runtimeName = this.opts.runtimeName;
+    for (const name of this.volumeNames()) {
       const inspect = this.run(['volume', 'inspect', name]);
       if (inspect.exitCode === 0) continue;
       this.runDocker([
         'volume',
         'create',
         '--label',
+        RUNTIME_MANAGED_BY_LABEL,
+        '--label',
+        RUNTIME_COMPONENT_LABEL,
+        '--label',
         `vicoop.kind=${kind}`,
+        '--label',
+        `vicoop.name=${runtimeName}`,
         name,
       ]);
       this.log.info(`created named volume '${name}'`);
     }
+  }
+
+  private ensureFreshVolumes(): void {
+    const existing = this.volumeNames().filter(
+      (name) => this.run(['volume', 'inspect', name]).exitCode === 0,
+    );
+    if (existing.length === 0) return;
+    throw new Error(
+      `runtime volumes already exist: ${existing.join(', ')}. ` +
+        `Remove them first with \`${this.removeHint()}\`, then rerun init.`,
+    );
+  }
+
+  private volumeNames(): string[] {
+    const kind = this.opts.backendKind;
+    const runtimeName = this.opts.runtimeName;
+    return [
+      agentsVolumeName(kind, runtimeName),
+      credsVolumeName(kind, runtimeName),
+      sessionsVolumeName(kind, runtimeName),
+    ];
   }
 
   private findContainer(name: string): boolean {
@@ -244,6 +312,7 @@ export class RuntimeContainer {
 
   private createContainer(name: string): void {
     const kind = this.opts.backendKind;
+    const runtimeName = this.opts.runtimeName;
     const args: string[] = [
       'create',
       '--name',
@@ -261,7 +330,13 @@ export class RuntimeContainer {
       '--cap-add',
       'NET_RAW',
       '--label',
+      RUNTIME_MANAGED_BY_LABEL,
+      '--label',
+      RUNTIME_COMPONENT_LABEL,
+      '--label',
       `vicoop.kind=${kind}`,
+      '--label',
+      `vicoop.name=${runtimeName}`,
     ];
     if (this.opts.bridgeUrl) {
       args.push('-e', `VICOOP_BRIDGE_URL=${this.opts.bridgeUrl}`);
@@ -274,11 +349,11 @@ export class RuntimeContainer {
     // persistent across container re-creation. Decisions §4, §5.
     args.push(
       '--mount',
-      `type=volume,source=${agentsVolumeName(kind)},target=/data/agents/${kind}`,
+      `type=volume,source=${agentsVolumeName(kind, runtimeName)},target=/data/agents/${kind}`,
       '--mount',
-      `type=volume,source=${credsVolumeName(kind)},target=/data/creds/${kind}`,
+      `type=volume,source=${credsVolumeName(kind, runtimeName)},target=/data/creds/${kind}`,
       '--mount',
-      `type=volume,source=${sessionsVolumeName(kind)},target=/data/sessions/${kind}`,
+      `type=volume,source=${sessionsVolumeName(kind, runtimeName)},target=/data/sessions/${kind}`,
     );
     if (this.opts.workspaceDir) {
       // Workspace as a host bind-mount. Per-context branching
@@ -291,6 +366,10 @@ export class RuntimeContainer {
     }
     args.push(this.opts.image);
     this.runDocker(args);
+  }
+
+  private removeHint(): string {
+    return `vicoop-client container rm ${this.opts.runtimeName}`;
   }
 
   private async waitUntilRunning(name: string): Promise<void> {
