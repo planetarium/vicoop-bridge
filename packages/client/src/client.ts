@@ -39,6 +39,16 @@ export interface ClientOptions {
   reconnectMaxDelayMs?: number;
   reconnectJitterRatio?: number;
   reconnectStableMs?: number;
+  // Minimum reconnect delay after a 4009 "another client with the same
+  // token connected" close. The default is intentionally large (5 min) so
+  // a duplicate-token ping-pong damps out within one cycle instead of
+  // hammering the bridge — see vicoop-bridge#270. A legitimate handoff
+  // (operator restarts the daemon, old process exits) still recovers; it
+  // just waits this long before reconnecting. Tests override to a small
+  // value so the 4009-specific path is exercisable without a multi-minute
+  // sleep. Setting this below the normal computed backoff has no effect —
+  // the floor only raises the delay, never lowers it.
+  collisionBackoffMs?: number;
   // WebSocket protocol ping interval. The client terminates the socket when
   // a previous ping has not received a pong by the next tick, which turns
   // half-open network failures into a normal reconnect path. Set to 0 to
@@ -81,6 +91,7 @@ const DEFAULT_RECONNECT_MAX_DELAY_MS = 30_000;
 const DEFAULT_RECONNECT_JITTER_RATIO = 0.2;
 const DEFAULT_RECONNECT_STABLE_MS = 60_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
+const DEFAULT_COLLISION_BACKOFF_MS = 300_000;
 
 export class Client {
   private ws: WebSocket | null = null;
@@ -371,6 +382,30 @@ export class Client {
         this.opts.onFatal?.({ code, reason: reason.toString() });
         return;
       }
+      // 4009 = another daemon registered with the same AGENT_TOKEN and the
+      // bridge replaced us. The "disconnected: 4009 …" line above already
+      // logs the sanitized reason, but on its own it reads like any other
+      // disconnect — operators have to know the close-code table to
+      // recognize the duplicate-token failure mode. Surface a dedicated
+      // WARN with the concrete remediation so the foreground log names
+      // both the cause and the fix on one line (vicoop-bridge#270).
+      //
+      // We deliberately do NOT treat this as fatal: if the other daemon
+      // exits (operator kills it, or it crashes), this side should still
+      // recover automatically. But the default ~30 s exponential backoff
+      // is far too eager — two daemons running concurrently will ping-pong
+      // at the 30 s cap forever, never letting either reach the 60 s
+      // stable window that resets the attempt counter. Floor the next
+      // reconnect at `collisionBackoffMs` (5 min by default) so the
+      // ping-pong damps out after a single cycle.
+      if (code === 4009) {
+        this.logger.warn(
+          'another vicoop-client is connected with the same AGENT_TOKEN — ' +
+            'kill duplicates (`pgrep -fl vicoop-client`) or this daemon will keep being replaced',
+        );
+        this.scheduleReconnect(this.opts.collisionBackoffMs ?? DEFAULT_COLLISION_BACKOFF_MS);
+        return;
+      }
       this.scheduleReconnect();
     });
 
@@ -445,10 +480,17 @@ export class Client {
     this.reconnectResetTimer.unref?.();
   }
 
-  private scheduleReconnect(): void {
+  private scheduleReconnect(floorMs?: number): void {
     if (this.stopped || this.reconnectTimer) return;
     const attempt = this.reconnectAttempt++;
-    const delay = this.nextReconnectDelay(attempt);
+    // `floorMs` lets specific close codes (currently only 4009 duplicate-
+    // token collision) raise the delay above the computed backoff. It only
+    // raises, never lowers — a transient close that happens to schedule
+    // after a collision-floored cycle still uses the normal backoff. Pure
+    // additive change: omitting the argument preserves the previous
+    // behavior byte-for-byte.
+    const computed = this.nextReconnectDelay(attempt);
+    const delay = floorMs !== undefined ? Math.max(computed, floorMs) : computed;
     this.logger.info(`reconnecting in ${delay}ms attempt=${attempt + 1}`);
     // Intentionally NOT unref'd. By the time we get here the WS is gone and
     // the heartbeat / reconnect-reset timers have been cleared, so this timer
