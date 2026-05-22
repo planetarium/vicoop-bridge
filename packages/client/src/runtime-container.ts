@@ -7,10 +7,9 @@
 //     → pickBackend (cli.ts) decides runtime = 'container'
 //       → new RuntimeContainer({ backendKind, ... }).start()
 //         - pings docker daemon (Decision §6)
-//         - ensures named volumes exist (agents, creds, sessions)
 //         - looks for an existing container by canonical name; reuses
-//           if found, otherwise pulls the image and creates a new one
-//         - starts the container (firewall + sleep infinity from
+//           if found, otherwise fails with an init hint
+//         - starts a stopped container (firewall + sleep infinity from
 //           container/runtime/entrypoint.sh in PR A)
 //       → wires a docker-exec SpawnAdapter (spawn-adapter.ts) into the
 //         backend factory; backend sees a normal SpawnFn signature
@@ -50,6 +49,10 @@ export interface RuntimeContainerOptions {
   // Skip the in-container firewall init. Mostly a dev / CI escape
   // hatch; production runs should leave this off and pass NET_ADMIN.
   skipFirewall?: boolean;
+  // Creation is intentionally opt-in. Daemon startup should only
+  // consume a runtime container the operator already initialized with
+  // `vicoop-client container init <kind>`.
+  createIfMissing?: boolean;
   logger?: Logger;
   // Test seam — inject a custom docker CLI runner so tests can
   // capture argv + script responses without shelling out.
@@ -105,8 +108,6 @@ export class RuntimeContainer {
   // than degrade silently.
   async start(): Promise<void> {
     this.ensureDaemonReachable();
-    await this.ensureImage();
-    this.ensureVolumes();
 
     const name = containerName(this.opts.backendKind);
     if (this.findContainer(name)) {
@@ -117,6 +118,15 @@ export class RuntimeContainer {
         this.runDocker(['start', name]);
       }
     } else {
+      if (!this.opts.createIfMissing) {
+        throw new Error(
+          `runtime container '${name}' does not exist. ` +
+            `Create it first with \`vicoop-client container init ${this.opts.backendKind}\`, ` +
+            `then retry \`vicoop-client --backend ${this.opts.backendKind} --runtime container\`.`,
+        );
+      }
+      await this.ensureImage();
+      this.ensureVolumes();
       this.createContainer(name);
       this.runDocker(['start', name]);
       this.log.info(`runtime container '${name}' created and started`);
