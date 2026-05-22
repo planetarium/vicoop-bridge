@@ -233,7 +233,12 @@ COMMENT ON COLUMN clients.token_hash IS E'@omit';
 -- Block the auto-generated create mutation: token_hash cannot be supplied via
 -- GraphQL (it is @omit) so PostGraphile's createClient would fail at runtime.
 -- Clients must be created through register_client() which generates the token.
-COMMENT ON TABLE clients IS E'@omit create';
+-- Also block auto-generated delete: the custom delete_client(TEXT) SQL
+-- function (below) is the canonical path because it cleans up both the
+-- legacy clients row and the agents shadow row; exposing PostGraphile's
+-- deleteClientById alongside it also causes a `DeleteClientPayload` type
+-- name conflict on schema build.
+COMMENT ON TABLE clients IS E'@omit create,delete';
 
 -- ============================================================
 -- 3b. Agents table (unified server-side persistence model)
@@ -292,7 +297,12 @@ CREATE POLICY agents_postgraphile ON agents
   WITH CHECK (true);
 
 COMMENT ON COLUMN agents.token_hash IS E'@omit';
-COMMENT ON TABLE agents IS E'@omit create';
+-- Mirrors `clients`: token_hash is server-managed (no create), and the
+-- semantic delete path is `delete_client(TEXT)` which removes both the
+-- agents row and the legacy clients row in one transaction. Letting
+-- GraphQL clients call `deleteAgentById` directly would leave an orphan
+-- `clients` row.
+COMMENT ON TABLE agents IS E'@omit create,delete';
 
 -- ------------------------------------------------------------
 -- 3a. Client CRUD mutations (exposed by PostGraphile)
