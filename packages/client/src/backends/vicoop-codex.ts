@@ -326,8 +326,14 @@ function defaultSpawn(
   args: readonly string[],
   options: VicoopCodexSpawnOptions,
 ): VicoopCodexChildHandle {
+  // On Windows npm installs the `vicoop-codex` bin as a `.cmd` shim; bare
+  // `spawn('vicoop-codex', …)` without `shell:true` doesn't pick up the
+  // extension and fails with ENOENT. Route through the shell on win32 so
+  // the shim resolves. Safe here because `command` and `args` are fully
+  // determined by this module — no user-supplied tokens enter the argv.
   return nodeSpawn(command, Array.from(args), {
     stdio: ['pipe', 'pipe', 'pipe'],
+    shell: process.platform === 'win32',
     ...(options.cwd ? { cwd: options.cwd } : {}),
   }) as ChildProcess;
 }
