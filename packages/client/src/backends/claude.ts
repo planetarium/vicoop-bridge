@@ -175,6 +175,8 @@ interface StreamEvent {
     content?: unknown;
   };
   result?: unknown;
+  terminal_reason?: unknown;
+  is_error?: unknown;
   // Present on the terminal `result` event. `modelUsage` is the per-model
   // breakdown — preferred over the top-level `usage` because Claude Code
   // can route through internal sub-models (e.g. haiku for summarisation)
@@ -1489,6 +1491,8 @@ export function createClaudeBackend(
       } | null = null;
       let finalText: string | null = null;
       let finalUsage: OpenAICompatUsage | null = null;
+      let sawCompletedResult = false;
+      let sawErrorResult = false;
       let stdoutTail = '';
       let stderrTail = '';
       let aborted = false;
@@ -1659,6 +1663,8 @@ export function createClaudeBackend(
         }
         if (evt.type === 'result') {
           if (typeof evt.result === 'string' && !emittedAskUserQuestion) finalText = evt.result;
+          if (evt.terminal_reason === 'completed') sawCompletedResult = true;
+          if (evt.is_error === true) sawErrorResult = true;
           // openai-compat/v1 response-side usage: prefer modelUsage over the
           // top-level `usage` (latter omits internal sub-model invocations).
           // Best-effort: a malformed shape just leaves finalUsage null and
@@ -1807,8 +1813,23 @@ export function createClaudeBackend(
       // maps `turn/interrupt` → `completed` when capturedToolCall is true).
       // Caller-initiated abort still wins — surfacing a captured tool call
       // when the caller explicitly canceled would override their request.
+      //
+      // Separately, recent Claude Code builds can emit a structured,
+      // non-error terminal result with terminal_reason:"completed" and no
+      // stderr, then still close with code 1. Treat the structured result as
+      // authoritative in that narrow case; keep explicit is_error results,
+      // stderr/stdin-error exits, and real startup/auth/model failures
+      // failing.
       const treatExitAsSuccess =
-        capturedToolCall && exit.code !== 0 && !aborted;
+        (capturedToolCall && exit.code !== 0 && !aborted) ||
+        (
+          exit.code !== 0 &&
+          sawCompletedResult &&
+          !sawErrorResult &&
+          stderrTail.trim() === '' &&
+          stdinError === null &&
+          !aborted
+        );
 
       if (exit.code !== 0 && !treatExitAsSuccess) {
         rollbackFreshSession();

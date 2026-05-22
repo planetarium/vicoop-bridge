@@ -187,6 +187,129 @@ maybe_init_firewall() {
 }
 
 # --------------------------------------------------------------------------
+# Interactive wizard: TTY-only first-time setup.
+#
+# Triggered when:
+#   - no /data/config.json
+#   - no headless env-token (VICOOP_BRIDGE_TOKEN etc. unset — we don't
+#     want to surprise an operator who *meant* to do env-bootstrap and
+#     only fat-fingered one variable)
+#   - stdin AND stdout are both TTY
+#
+# Composition:
+#   1. `vicoop-client auth login` — Google device-flow OAuth against
+#      the bridge. URL + code print to the operator's terminal; the
+#      client polls until they finish.
+#   2. Prompt for backend kind + agent id (default agent id =
+#      `hostname` so an operator who just hits enter still gets a
+#      valid registration).
+#   3. `vicoop-client agent register --agent-id <id>` — mints the
+#      one-time AGENT_TOKEN and writes server_url/server_token/agent_id
+#      into config.json. We then patch the `backend` field with the
+#      prompt result (agent register doesn't take a backend arg).
+#   4. For installable backends (claude / codex), run install-backend.sh
+#      and then invoke the native OAuth (`claude auth login --claudeai` /
+#      `codex login --device-auth`) inline. Operator's TTY is inherited
+#      by the child, so the URL+code flow lands on their terminal
+#      directly.
+#   5. Return to main, which proceeds into the daemon `exec` below —
+#      same image, same `docker run`, just with config.json + creds
+#      written by the wizard.
+# --------------------------------------------------------------------------
+wizard() {
+    log ""
+    log "=== vicoop-bridge first-time setup ==="
+    log "No config detected and a TTY is attached, so I'll walk you through it."
+
+    log ""
+    log "--- Step 1/3: bridge owner sign-in ---"
+    vicoop-client auth login || die "auth login failed"
+
+    log ""
+    log "--- Step 2/3: pick a backend + agent id ---"
+    log ""
+    log "The agent id is the routing key external A2A callers will use"
+    log "to reach this daemon. Pick something memorable (alphanumeric +"
+    log "dashes are safe)."
+    log ""
+    local agent_id=""
+    while [[ -z "${agent_id// }" ]]; do
+        read -rp "  Agent ID: " agent_id
+        if [[ -z "${agent_id// }" ]]; then
+            log "  Agent ID cannot be empty."
+        fi
+    done
+
+    log ""
+    log "Available backends:"
+    # bash `select` does the keystroke loop + invalid-input retry on
+    # its own. We render two parallel arrays — `descriptions` is what
+    # operators see, `kinds` is what we feed to install-backend.sh and
+    # write into config.json. REPLY (set by select to the chosen 1-based
+    # index) ties the two.
+    local options=(
+        "claude       - Anthropic Claude Code CLI"
+        "codex        - OpenAI Codex CLI"
+        "echo         - in-process echo (testing only; no LLM)"
+        "openclaw     - external OpenClaw gateway"
+        "vicoop-codex - codex via vicoop's traceability bridge"
+    )
+    local kinds=(claude codex echo openclaw vicoop-codex)
+    local backend="" choice
+    PS3="  Pick a backend (number): "
+    select choice in "${options[@]}"; do
+        if [[ -n "$choice" ]]; then
+            backend="${kinds[$((REPLY - 1))]}"
+            break
+        fi
+        log "  Invalid; enter a number from 1 to ${#options[@]}."
+    done
+    unset PS3
+
+    log ""
+    vicoop-client agent register --agent-id "$agent_id" \
+        || die "agent register failed"
+
+    # `agent register` writes server_url / server_token / agent_id;
+    # the `backend` field is ours to set from the prompt. jq edit
+    # in-place via tmp + rename to preserve mode 600.
+    local tmp
+    tmp="$(mktemp "${CONFIG}.XXXXXX")"
+    jq --arg b "$backend" '. + {backend: $b}' "$CONFIG" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$CONFIG"
+
+    log ""
+    log "--- Step 3/3: backend install + sign-in ---"
+    if backend_is_installable "$backend"; then
+        "$VICOOP_LIB/install-backend.sh" "$backend"
+        local bin="$VICOOP_DATA/agents/$backend/bin/$backend"
+        case "$backend" in
+            claude)
+                log "Running \`claude auth login --claudeai\` — follow the URL it prints"
+                log "  and complete the Claude subscription login flow:"
+                "$bin" auth login --claudeai \
+                    || die "claude auth login failed"
+                ;;
+            codex)
+                log "Running \`codex login --device-auth\` — open the URL it prints"
+                log "  and complete the device-flow code:"
+                "$bin" login --device-auth \
+                    || die "codex login --device-auth failed"
+                ;;
+        esac
+    else
+        log "Backend '$backend' has no install step; skipping."
+    fi
+
+    log ""
+    log "Setup complete. Starting daemon..."
+    log "(Future starts skip the wizard since config.json is now on the data volume."
+    log " Re-run with the volume mounted to keep your sign-in.)"
+    log ""
+}
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 # Daemon mode is the bare invocation or flags-only. Subcommands like
@@ -201,13 +324,24 @@ is_daemon_invocation() {
     esac
 }
 
+# Only fall into the wizard when the operator clearly hasn't tried
+# headless yet. If they set even one of the env-token vars we assume
+# headless intent and let bootstrap_from_env emit its usual error
+# with the missing-var list, rather than launching a wizard that
+# might overwrite their setup mid-flow.
+has_any_env_token() {
+    [[ -n "${VICOOP_BRIDGE_TOKEN:-}" ]] \
+        || [[ -n "${VICOOP_AGENT_ID:-}" ]] \
+        || [[ -n "${VICOOP_BACKEND:-}" ]]
+}
+
 if is_daemon_invocation "$@"; then
     if [[ ! -f "$CONFIG" ]]; then
-        if [[ -t 0 && -t 1 ]]; then
-            log "TTY detected but interactive wizard isn't shipped yet (PR 2)."
-            log "use the headless env-bootstrap path for now — see below."
+        if [[ -t 0 && -t 1 ]] && ! has_any_env_token; then
+            wizard
+        else
+            bootstrap_from_env || exit $?
         fi
-        bootstrap_from_env || exit $?
     else
         compat_check
     fi
