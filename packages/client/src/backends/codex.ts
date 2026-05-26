@@ -30,6 +30,8 @@ import {
   type DynamicToolCallResponse,
   type DynamicToolSpec,
   type InitializeResult,
+  type ModelListEntry,
+  type ModelListResult,
   type ResponsesApiItem,
   type SandboxMode,
   type ThreadItem,
@@ -711,37 +713,79 @@ export function createCodexBackend(
   return {
     name: 'codex',
 
-    // Advertise the underlying model on the openai-compat/v1 extension's
-    // `params.models[]` slot (planetarium/oai2a2a#63) by reading codex's
-    // own `config.toml`. We honour `CODEX_HOME` (same override codex CLI
-    // respects) so a wrapped install resolves to the right file.
+    // Advertise the underlying model(s) on the openai-compat/v1 extension's
+    // `params.models[]` slot (planetarium/oai2a2a#63) using codex's own
+    // `model/list` RPC. The RPC requires an initialized `app-server`, so
+    // this triggers the same one-time spawn that would otherwise happen on
+    // the first task — subsequent tasks reuse the existing client.
     //
-    // Best-effort: any failure (file missing, malformed TOML, no `model`
-    // key) returns `{}` and leaves the card's declared capabilities
-    // untouched. Operators who hot-swap models via `-c model=...` on the
-    // codex CLI won't be reflected here — but our spawn (`codex
-    // app-server`) doesn't carry that override, so the config file is
-    // authoritative for what codex actually loads under us.
+    // Default picking, in order:
+    //   1. operator override in `${CODEX_HOME ?? ~/.codex}/config.toml`'s
+    //      root `model = "..."` — that's the value codex actually loads
+    //      under us, even though `model/list.isDefault` reports its own
+    //      recommended id;
+    //   2. the entry where `isDefault: true` (codex's recommendation);
+    //   3. the first non-hidden entry as a last resort.
     //
-    // `reasoning: true` is set only when `model_reasoning_effort` is
-    // configured to a non-`none` value, since the spec defines the flag
-    // by whether the model emits `completion_tokens_details.reasoning_tokens`.
+    // `reasoning: true` is set when codex's own per-model
+    // `supportedReasoningEfforts` is non-empty — that flag tracks whether
+    // the model emits `completion_tokens_details.reasoning_tokens`, which
+    // matches the openai-compat/v1 spec's definition exactly.
+    //
+    // Best-effort: any failure (app-server not installed, `model/list`
+    // unsupported on an older codex, transport closes) returns `{}` and
+    // the card's declared capabilities are left untouched.
     async resolveCapabilities() {
-      let text: string | null;
+      let operatorOverride: string | null = null;
       try {
-        text = await readConfigToml();
+        const tomlText = await readConfigToml();
+        if (tomlText) {
+          operatorOverride = parseCodexConfigTomlForModel(tomlText).model;
+        }
+      } catch {
+        // config.toml read failure is tolerable — we'll fall back to
+        // model/list.isDefault for the default-entry pick.
+      }
+
+      let client: AppServerRpcClient;
+      try {
+        client = await ensureClient();
       } catch {
         return {};
       }
-      if (!text) return {};
-      const parsed = parseCodexConfigTomlForModel(text);
-      if (!parsed.model) return {};
-      const entry: { id: string; reasoning?: boolean; default: true } = {
-        id: parsed.model,
-        default: true,
-      };
-      if (parsed.hasReasoningEffort) entry.reasoning = true;
-      return { openaiCompatModels: [entry] };
+
+      let modelList: ModelListEntry[];
+      try {
+        const result = await client.request<ModelListResult>('model/list', {});
+        modelList = Array.isArray(result?.data) ? result.data : [];
+      } catch {
+        return {};
+      }
+
+      const visible = modelList.filter((m) => m && typeof m.id === 'string' && m.id.length > 0 && !m.hidden);
+      if (visible.length === 0) return {};
+
+      const defaultId =
+        (operatorOverride && visible.find((m) => m.id === operatorOverride)?.id) ??
+        operatorOverride ?? // operator pinned a model codex doesn't list (custom provider) — still honour it as the default tag
+        visible.find((m) => m.isDefault)?.id ??
+        visible[0].id;
+
+      const openaiCompatModels = visible.map((m) => {
+        const entry: { id: string; reasoning?: boolean; default?: true } = { id: m.id };
+        if ((m.supportedReasoningEfforts?.length ?? 0) > 0) entry.reasoning = true;
+        if (m.id === defaultId) entry.default = true;
+        return entry;
+      });
+
+      // If the operator pinned a model that wasn't in `model/list` (custom
+      // provider, beta access, etc.), surface it as its own entry so the
+      // advertise still reflects what actually runs.
+      if (operatorOverride && !visible.some((m) => m.id === operatorOverride)) {
+        openaiCompatModels.unshift({ id: operatorOverride, default: true });
+      }
+
+      return { openaiCompatModels };
     },
 
     // Daemon shutdown hook. Per-task abort flows through `signal` in
