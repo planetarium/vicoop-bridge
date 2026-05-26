@@ -22,6 +22,7 @@ import type { Backend } from './backend.js';
 import { RuntimeContainer, DEFAULT_RUNTIME_IMAGE } from './runtime-container.js';
 import { createDockerExecSpawn, type SpawnFn } from './spawn-adapter.js';
 import {
+  assertContainerCredsPresent,
   containerCmd,
   runContainerInitCli,
   runContainerListCli,
@@ -394,6 +395,16 @@ async function resolveRuntime(args: {
     bridgeUrl: args.bridgeUrl,
   });
   await runtime.start();
+  // Fail fast if the operator started the daemon against a runtime that
+  // was initialised without --from-host and has not been authenticated
+  // yet. Without this check the daemon would happily accept tasks until
+  // the first spawn, then surface a backend-specific auth error.
+  try {
+    await assertContainerCredsPresent(runtime.getContainerName(), args.kind);
+  } catch (err) {
+    await runtime.stop();
+    throw err;
+  }
   return {
     runtime,
     spawn: createDockerExecSpawn(runtime),
