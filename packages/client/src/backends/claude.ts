@@ -370,10 +370,18 @@ export async function probeClaudeModel(probeOpts: {
       return;
     }
     let settled = false;
+    // No `.unref()` here. The probe always settles via either the timeout,
+    // a `system/init` line, or the child's close/error — and `settle()`
+    // clears the timer in every path. Calling `.unref()` only matters if
+    // the timer would otherwise outlive a daemon shutdown, but the probe
+    // runs once at startup and is awaited; the `await` already prevents
+    // any "linger after daemon exit" hazard. Worse, on Node's built-in
+    // test runner an unref'd timer can let the event loop idle out while
+    // the awaiting promise is still pending, which surfaces as
+    // `Promise resolution is still pending but the event loop has
+    // already resolved` and cancels the test plus everything after it
+    // in the same file. See vicoop-bridge#282 for the failure mode.
     const timer = setTimeout(() => settle(null), probeOpts.timeoutMs);
-    if (typeof (timer as { unref?: () => void }).unref === 'function') {
-      (timer as { unref: () => void }).unref();
-    }
     function settle(value: string | null): void {
       if (settled) return;
       settled = true;
