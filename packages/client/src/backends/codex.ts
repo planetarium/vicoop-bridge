@@ -74,6 +74,12 @@ export interface CodexBackendOptions {
   // (no client-side timeout — the server is authoritative). Set to a
   // positive value to fail-fast against a hung agent.
   turnTimeoutMs?: number;
+  // Test seam — overrides the default codex config.toml reader used by
+  // `resolveCapabilities` to advertise the underlying model on the
+  // openai-compat/v1 extension. Returning `null` (or rejecting) keeps the
+  // probe silent and the card's declared capabilities unchanged. Defaults
+  // to reading `${CODEX_HOME ?? ~/.codex}/config.toml` via `fs.readFile`.
+  readCodexConfigToml?: () => Promise<string | null>;
 }
 
 interface SessionEntry {
@@ -88,6 +94,75 @@ const COMMAND_TRACE_MAX_CHARS = 2_000;
 function errorMessage(e: unknown): string {
   if (e instanceof Error) return e.message;
   return String(e);
+}
+
+// Extract a basic TOML string value: `"…"` or `'…'`. Returns null if the
+// raw value doesn't match either form. Intentionally narrow — codex writes
+// these specific keys as plain quoted strings, and we don't want to pull
+// in a full TOML parser for two fields.
+function extractTomlStringValue(raw: string): string | null {
+  let m = /^"((?:[^"\\]|\\[^])*)"$/.exec(raw);
+  if (m) return m[1];
+  m = /^'([^']*)'$/.exec(raw);
+  if (m) return m[1];
+  return null;
+}
+
+// Minimal TOML extractor for codex's root-level `model` and
+// `model_reasoning_effort` keys. We deliberately do NOT depend on a real
+// TOML parser: codex's config schema places both keys at the top, and a
+// line-based scan that bails at the first `[table]` header covers our
+// case without dragging a parser into the client bundle.
+//
+// Exported for unit testing the parser separately from the resolveCapabilities
+// wiring.
+export function parseCodexConfigTomlForModel(text: string): {
+  model: string | null;
+  hasReasoningEffort: boolean;
+} {
+  let model: string | null = null;
+  let hasReasoningEffort = false;
+  for (const rawLine of text.split(/\r?\n/)) {
+    // Strip comments. We accept the simple form (value contains no '#'
+    // inside its quoted region) — sufficient because codex never embeds
+    // '#' in a model id and `model_reasoning_effort` is a known enum.
+    const stripped = rawLine.replace(/(^|\s)#.*$/, '').trim();
+    if (!stripped) continue;
+    // First `[section]` header ends the root section — any later
+    // occurrence of `model =` is a sub-table key (e.g. a profile) and
+    // does NOT override the agent's default.
+    if (stripped.startsWith('[')) break;
+    const m = /^([A-Za-z0-9_]+)\s*=\s*(.+)$/.exec(stripped);
+    if (!m) continue;
+    const key = m[1];
+    const rawVal = m[2].trim();
+    if (key === 'model') {
+      const v = extractTomlStringValue(rawVal);
+      if (v !== null && v.length > 0) model = v;
+    } else if (key === 'model_reasoning_effort') {
+      const v = extractTomlStringValue(rawVal);
+      // `none` is the explicit "no effort" enum value — treat it as
+      // "model is not used in reasoning mode here" and leave
+      // `hasReasoningEffort` false so we don't claim reasoning_tokens
+      // will land for runs configured this way.
+      if (v !== null && v.length > 0 && v.toLowerCase() !== 'none') {
+        hasReasoningEffort = true;
+      }
+    }
+  }
+  return { model, hasReasoningEffort };
+}
+
+// Default config.toml reader. Honours `CODEX_HOME` to match the codex CLI's
+// own override hook, falling back to `~/.codex/config.toml`. Returns null on
+// any error so `resolveCapabilities` silently skips the advertise.
+async function defaultReadCodexConfigToml(): Promise<string | null> {
+  const home = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
+  try {
+    return await fs.readFile(path.join(home, 'config.toml'), 'utf8');
+  } catch {
+    return null;
+  }
 }
 
 function traceabilityRequested(task: {
@@ -631,8 +706,43 @@ export function createCodexBackend(
     return initInFlight;
   }
 
+  const readConfigToml = opts.readCodexConfigToml ?? defaultReadCodexConfigToml;
+
   return {
     name: 'codex',
+
+    // Advertise the underlying model on the openai-compat/v1 extension's
+    // `params.models[]` slot (planetarium/oai2a2a#63) by reading codex's
+    // own `config.toml`. We honour `CODEX_HOME` (same override codex CLI
+    // respects) so a wrapped install resolves to the right file.
+    //
+    // Best-effort: any failure (file missing, malformed TOML, no `model`
+    // key) returns `{}` and leaves the card's declared capabilities
+    // untouched. Operators who hot-swap models via `-c model=...` on the
+    // codex CLI won't be reflected here — but our spawn (`codex
+    // app-server`) doesn't carry that override, so the config file is
+    // authoritative for what codex actually loads under us.
+    //
+    // `reasoning: true` is set only when `model_reasoning_effort` is
+    // configured to a non-`none` value, since the spec defines the flag
+    // by whether the model emits `completion_tokens_details.reasoning_tokens`.
+    async resolveCapabilities() {
+      let text: string | null;
+      try {
+        text = await readConfigToml();
+      } catch {
+        return {};
+      }
+      if (!text) return {};
+      const parsed = parseCodexConfigTomlForModel(text);
+      if (!parsed.model) return {};
+      const entry: { id: string; reasoning?: boolean; default: true } = {
+        id: parsed.model,
+        default: true,
+      };
+      if (parsed.hasReasoningEffort) entry.reasoning = true;
+      return { openaiCompatModels: [entry] };
+    },
 
     // Daemon shutdown hook. Per-task abort flows through `signal` in
     // `handle()`, but the `codex app-server` subprocess is a singleton kept

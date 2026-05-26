@@ -12,8 +12,10 @@ import {
   formatToolCallHistory,
   openaiToolsToCallerToolDefs,
   parseOpenAICompatMetadata,
+  probeClaudeModel,
   summarizeToolInput,
   tryParseToolCallsEnvelope,
+  CLAUDE_PROBE_ARGS,
   type ClaudeChildHandle,
   type ClaudeSpawnOptions,
 } from './claude.js';
@@ -3684,4 +3686,163 @@ test('AskUserQuestion: terminal frame uses state=input-required with DataPart pa
   assert.equal(child.stdinClosed, true);
   assert.match(child.stdinPayload, /tool_result/);
   assert.match(child.stdinPayload, /tu_aq_1/);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resolveCapabilities — startup probe that captures the underlying model from
+// the `system/init` stream-json event for openai-compat/v1 `params.models`
+// advertise (planetarium/oai2a2a#63). The probe SIGTERMs before any LLM call
+// is issued.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('probeClaudeModel returns model from system/init and SIGTERMs the child', async () => {
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      // Real claude emits a rate_limit_event before system/init in some
+      // sessions; the probe must ignore non-init events and keep reading.
+      child.emitStdout(
+        JSON.stringify({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed' } }) + '\n',
+      );
+      child.emitStdout(
+        JSON.stringify({
+          type: 'system',
+          subtype: 'init',
+          session_id: 'sid',
+          model: 'claude-opus-4-7[1m]',
+        }) + '\n',
+      );
+    });
+  });
+
+  const model = await probeClaudeModel({
+    command: 'claude',
+    spawn: fake.spawn,
+    timeoutMs: 1000,
+  });
+
+  assert.equal(model, 'claude-opus-4-7[1m]');
+  const child = fake.lastChild();
+  assert.ok(child);
+  assert.equal(child.killed, true);
+  assert.equal(child.killSignal, 'SIGTERM');
+  // The probe invokes the stream-json + verbose argv documented in
+  // https://code.claude.com/docs/en/headless — pin it so a future spawn
+  // refactor that drops a required flag (e.g. --verbose) is caught here
+  // rather than only in production where system/init silently never lands.
+  assert.deepEqual(Array.from(child.args), Array.from(CLAUDE_PROBE_ARGS));
+});
+
+test('probeClaudeModel returns null on timeout when no system/init arrives', async () => {
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      // Emit only a non-init event so the probe never settles on its own.
+      child.emitStdout(
+        JSON.stringify({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed' } }) + '\n',
+      );
+      // Never call child.finish().
+    });
+  });
+
+  const model = await probeClaudeModel({
+    command: 'claude',
+    spawn: fake.spawn,
+    timeoutMs: 50,
+  });
+
+  assert.equal(model, null);
+  const child = fake.lastChild();
+  assert.ok(child);
+  assert.equal(child.killed, true, 'timeout path must SIGTERM the child');
+});
+
+test('probeClaudeModel ignores malformed JSON lines and still extracts model', async () => {
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      // Garbage line, then a half-line, then valid system/init. The probe
+      // must skip the non-JSON noise rather than abort.
+      child.emitStdout('not json at all\n');
+      child.emitStdout('{ "type": "system", "subtype": "init"');
+      child.emitStdout(', "model": "claude-sonnet-4-6" }\n');
+    });
+  });
+
+  const model = await probeClaudeModel({
+    command: 'claude',
+    spawn: fake.spawn,
+    timeoutMs: 1000,
+  });
+
+  assert.equal(model, 'claude-sonnet-4-6');
+});
+
+test('probeClaudeModel returns null when child exits before init', async () => {
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      // Exit immediately with no useful output (mimics `claude: command
+      // not found` / auth-required exit path).
+      child.finish(127, null);
+    });
+  });
+
+  const model = await probeClaudeModel({
+    command: 'claude',
+    spawn: fake.spawn,
+    timeoutMs: 1000,
+  });
+
+  assert.equal(model, null);
+});
+
+test('probeClaudeModel returns null when spawn itself throws', async () => {
+  const spawn: import('./claude.js').ClaudeSpawnFn = () => {
+    throw new Error('ENOENT');
+  };
+  const model = await probeClaudeModel({
+    command: 'claude',
+    spawn,
+    timeoutMs: 1000,
+  });
+  assert.equal(model, null);
+});
+
+test('claude backend resolveCapabilities advertises model from system/init probe', async () => {
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      child.emitStdout(
+        JSON.stringify({
+          type: 'system',
+          subtype: 'init',
+          model: 'claude-opus-4-7',
+        }) + '\n',
+      );
+    });
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, probeTimeoutMs: 1000 });
+  assert.ok(backend.resolveCapabilities, 'claude backend must expose resolveCapabilities');
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [{ id: 'claude-opus-4-7', default: true }],
+  });
+});
+
+test('claude backend resolveCapabilities returns {} on probe timeout', async () => {
+  const fake = makeFakeSpawn(() => {
+    // No output, no finish — the probe must time out and return {}.
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, probeTimeoutMs: 25 });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {});
+});
+
+test('claude backend resolveCapabilities short-circuits when probeTimeoutMs is 0', async () => {
+  let spawned = 0;
+  const fake = makeFakeSpawn(() => {
+    spawned += 1;
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn, probeTimeoutMs: 0 });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {});
+  assert.equal(spawned, 0, 'probeTimeoutMs:0 must skip the spawn entirely');
 });

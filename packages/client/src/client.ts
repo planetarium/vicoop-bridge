@@ -3,6 +3,7 @@ import {
   PROTOCOL_VERSION,
   encodeFrame,
   parseDownFrame,
+  withOpenAICompatModelsAdvertise,
   type AgentCard,
   type Part,
   type TaskAssignFrame,
@@ -204,17 +205,34 @@ export class Client {
         // object must leave the card byte-for-byte unchanged, including an
         // absent `capabilities` field. Only materialize `capabilities` when
         // the probe actually reports a value we need to apply.
-        if (detected.streaming === undefined && detected.pushNotifications === undefined) {
+        const hasModels = (detected.openaiCompatModels?.length ?? 0) > 0;
+        if (
+          detected.streaming === undefined &&
+          detected.pushNotifications === undefined &&
+          !hasModels
+        ) {
           return base;
         }
-        const merged: AgentCard['capabilities'] = {
-          ...(base.capabilities ?? {}),
-          ...(detected.streaming !== undefined ? { streaming: detected.streaming } : {}),
-          ...(detected.pushNotifications !== undefined
-            ? { pushNotifications: detected.pushNotifications }
-            : {}),
-        };
-        return { ...base, capabilities: merged };
+        let next = base;
+        if (
+          detected.streaming !== undefined ||
+          detected.pushNotifications !== undefined
+        ) {
+          const merged: AgentCard['capabilities'] = {
+            ...(base.capabilities ?? {}),
+            ...(detected.streaming !== undefined ? { streaming: detected.streaming } : {}),
+            ...(detected.pushNotifications !== undefined
+              ? { pushNotifications: detected.pushNotifications }
+              : {}),
+          };
+          next = { ...next, capabilities: merged };
+        }
+        if (hasModels && detected.openaiCompatModels) {
+          // No-op if the card doesn't declare openai-compat/v1 — see
+          // `withOpenAICompatModelsAdvertise` for the rationale.
+          next = withOpenAICompatModelsAdvertise(next, detected.openaiCompatModels);
+        }
+        return next;
       } finally {
         // Clear the deadline timer so a fast probe doesn't leave an extra
         // callback and its closure alive until `deadlineMs` elapses. The
