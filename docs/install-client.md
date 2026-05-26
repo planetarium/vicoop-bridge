@@ -79,6 +79,7 @@ would still default to `/data/vicoop-bridge-client`.
 | `INSTALL_DIR` | `/data/vicoop-bridge-client` | Target directory. Pick a writable path on a volume that survives restarts. |
 | `VERSION` | latest `@vicoop-bridge/client@*` | Pin a specific tag, e.g. `@vicoop-bridge/client@0.1.1`. With `VERSION` set, `jq` is no longer required. |
 | `FORCE` | `0` | If `1`, overwrite a non-empty `INSTALL_DIR`. |
+| `NO_MODIFY_PATH` | `0` | If `1`, skip the shell-rc PATH edit described in [Step 1b](#step-1b--add-vicoop-client-to-path). Useful on NixOS, immutable OSes, or when a dotfile manager (chezmoi, etc.) owns your rc files. |
 
 What you get after install:
 
@@ -103,6 +104,57 @@ keeps `curl | sh` a true one-liner.
 > issue #186 tracks the rework. For now the supported entrypoint is the
 > foreground run in Step 6.
 
+## Step 1b — Add `vicoop-client` to PATH
+
+`install.sh` detects your login shell from `$SHELL` and appends one line to
+the matching rc file so `vicoop-client` works from any new terminal:
+
+| Shell | File edited | Line appended |
+|---|---|---|
+| `zsh` | `${ZDOTDIR:-$HOME}/.zshrc` | `export PATH="$INSTALL_DIR:$PATH"` |
+| `bash` (macOS) | `~/.bash_profile` | `export PATH="$INSTALL_DIR:$PATH"` |
+| `bash` (Linux) | `~/.bashrc` | `export PATH="$INSTALL_DIR:$PATH"` |
+| `fish` | `${XDG_CONFIG_HOME:-~/.config}/fish/config.fish` | `fish_add_path $INSTALL_DIR` |
+
+Each entry is prefixed with a `# vicoop-bridge-client (vicoop-client)`
+marker comment. Re-running `install.sh` (including with `FORCE=1` or with
+a different `$INSTALL_DIR`) strips the existing marker block and
+re-appends it with the current target so the rc file never accumulates
+duplicates or stale paths. If `$INSTALL_DIR` sits under `$HOME`, the
+appended line is written with a literal `$HOME/...` prefix so it stays
+portable across machines for the same operator.
+
+To pick the change up in the shell where you just ran `install.sh`, either
+open a new terminal or `source` the rc file the installer prints in its
+post-install summary:
+
+```sh
+source ~/.zshrc           # or ~/.bash_profile, ~/.bashrc, ~/.config/fish/config.fish
+vicoop-client --version   # sanity-check
+```
+
+The rest of this doc uses bare `vicoop-client` everywhere. If you opted out
+of this step with `NO_MODIFY_PATH=1` (see below), prefix every example
+with `"$INSTALL_DIR/"` — e.g. `"$INSTALL_DIR/vicoop-client" --version`.
+
+### Opting out
+
+Set `NO_MODIFY_PATH=1` on the same `install.sh` invocation if you'd rather
+manage `PATH` yourself — recommended on NixOS, immutable OSes, or when a
+dotfile manager (chezmoi, yadm, etc.) owns your shell rc files. The
+installer prints both the exact line it would have appended **and** the
+shell-specific rc file it would have appended to, so you can route the
+line wherever your dotfile setup expects:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/planetarium/vicoop-bridge/main/install.sh \
+  | INSTALL_DIR="$HOME/vicoop-bridge-client" NO_MODIFY_PATH=1 sh
+```
+
+Operators on tcsh / ksh / other shells `install.sh` can't auto-detect get
+the same printed instructions automatically — no need to set
+`NO_MODIFY_PATH=1` explicitly.
+
 ## Step 2 — Verify the installed bundle
 
 If `$INSTALL_DIR` already existed before Step 1, `install.sh` refuses to
@@ -123,14 +175,17 @@ If you'd rather keep the old install around, pick a different
 new bundle there instead.
 
 Before continuing, verify that the installed bundle is recent enough to
-include the `login` command used in Step 4:
+include the `auth login` command used in Step 4:
 
 ```sh
-"$INSTALL_DIR/vicoop-client" -v
-"$INSTALL_DIR/vicoop-client" login --help
+vicoop-client -v
+vicoop-client auth login --help
 ```
 
-If `login --help` prints usage, you're on a current binary and can move on.
+If `auth login --help` prints usage, you're on a current binary and can
+move on. The flat `login` alias still works on current binaries but emits a
+`[deprecated] Use auth login` notice to stderr — see the legacy aliases
+note in Step 4.
 
 ## Step 3 — Pick an agent id
 
@@ -173,9 +228,9 @@ saved owner-session to call `registerClient` and mint a one-time
 `AGENT_TOKEN`. No wallet or SIWE required.
 
 ```sh
-"$INSTALL_DIR/vicoop-client" auth login
+vicoop-client auth login
 
-"$INSTALL_DIR/vicoop-client" agent register \
+vicoop-client agent register \
   --agent-id "$AGENT_ID" \
   --caller "eth:0x<40-hex>"
 ```
@@ -320,7 +375,7 @@ For scripting, pass `--json` instead of writing `config.json` if you want to
 compose with shell tooling (no disk side effects, raw response on stdout):
 
 ```sh
-"$INSTALL_DIR/vicoop-client" agent register \
+vicoop-client agent register \
   --agent-id "$AGENT_ID" \
   --caller "eth:0x<40-hex>" --json \
   | tee /tmp/vicoop-agent.json
@@ -432,14 +487,14 @@ the daemon picks up `server_url`, `server_token`, and `agent_id` on its own;
 pick the backend with `--backend`:
 
 ```sh
-"$INSTALL_DIR/vicoop-client" --backend openclaw
+vicoop-client --backend openclaw
 ```
 
 Precedence at startup is **CLI flag > `--config <path>` > canonical
 `config.json` > built-in default**. Env vars are not consulted for
 runtime config (#189 §5). With `"backend": "openclaw"` persisted in
 `config.json`, the daemon needs no flags at all:
-`"$INSTALL_DIR/vicoop-client"`.
+`vicoop-client`.
 
 On success you'll see a `[client] connected, sending hello` log followed
 by an identity block — same data `vicoop-client auth whoami` would print, so
@@ -522,7 +577,7 @@ For the Claude backend, pass `--backend claude` (or persist
 different repository than the one `vicoop-client` itself runs in:
 
 ```sh
-"$INSTALL_DIR/vicoop-client" \
+vicoop-client \
   --backend claude \
   --cwd "$HOME/vicoop-bridge"
 ```
@@ -530,7 +585,7 @@ different repository than the one `vicoop-client` itself runs in:
 Both knobs can also live in the canonical `config.json` (resolved per Step
 4 — `~/.vicoop/config.json` by default) under `backends.claude`
 (`cwd`, `settings`) so the foreground command shrinks to just
-`"$INSTALL_DIR/vicoop-client"`; the flag wins over config, mirroring
+`vicoop-client`; the flag wins over config, mirroring
 the daemon-level precedence (Step 6 intro).
 
 | Flag | `backends.claude.*` |
@@ -576,7 +631,7 @@ identifier external callers will see for this agent — the WebFinger acct, the
 `@<agentId>@<host>` mention, the JSON-RPC endpoint, and the agent-card URL.
 
 ```sh
-"$INSTALL_DIR/vicoop-client" whoami
+vicoop-client whoami
 # agentId:    my-agent
 # host:       bridge.example.com
 # mention:    @my-agent@bridge.example.com
@@ -602,7 +657,7 @@ Typical follow-ups from this output:
    response doesn't match what you expect, that's the cue to override.
 
    ```sh
-   CARD_URL=$("$INSTALL_DIR/vicoop-client" whoami --json | jq -r .a2aCardUrl)
+   CARD_URL=$(vicoop-client whoami --json | jq -r .a2aCardUrl)
    curl -sf "$CARD_URL" | jq .
    ```
 3. **Verify WebFinger actually resolves the acct.** `whoami --verify`
@@ -621,7 +676,7 @@ For the Codex backend, pass `--backend codex` (or persist
 different repository / loosen the sandbox:
 
 ```sh
-"$INSTALL_DIR/vicoop-client" \
+vicoop-client \
   --backend codex \
   --cwd "$HOME/vicoop-bridge" \
   --codex-sandbox workspace-write
@@ -629,7 +684,7 @@ different repository / loosen the sandbox:
 
 Both knobs can also live in the canonical `config.json` (resolved per Step
 4 — `~/.vicoop/config.json` by default) under `backends.codex` so the
-foreground command can shrink to just `"$INSTALL_DIR/vicoop-client"`.
+foreground command can shrink to just `vicoop-client`.
 The flag wins over config.
 
 | Flag | `backends.codex.*` |
@@ -683,20 +738,20 @@ below — `upgrade --check` reports the live version against the latest
 published release:
 
 ```sh
-"$INSTALL_DIR/vicoop-client" -v
-"$INSTALL_DIR/vicoop-client" upgrade --check   # report latest vs current
-"$INSTALL_DIR/vicoop-client" upgrade           # upgrade in place if behind
+vicoop-client -v
+vicoop-client upgrade --check   # report latest vs current
+vicoop-client upgrade           # upgrade in place if behind
 ```
 
 ```sh
 # Step 4 login saves the owner-session bearer, so these work without re-authenticating:
-"$INSTALL_DIR/vicoop-client" agent register \
+vicoop-client agent register \
   --agent-id "$AGENT_ID" \
   --caller "eth:0x<40-hex>"
-"$INSTALL_DIR/vicoop-client" agent list --connected
-"$INSTALL_DIR/vicoop-client" agent callers list "$AGENT_ID" --json
-"$INSTALL_DIR/vicoop-client" agent callers add "$AGENT_ID" "eth:0x<40-hex>"
-"$INSTALL_DIR/vicoop-client" agent callers remove "$AGENT_ID" "google:email:caller@example.com"
+vicoop-client agent list --connected
+vicoop-client agent callers list "$AGENT_ID" --json
+vicoop-client agent callers add "$AGENT_ID" "eth:0x<40-hex>"
+vicoop-client agent callers remove "$AGENT_ID" "google:email:caller@example.com"
 
 # Pass --json for machine-readable output, or --server / --token to override
 # the saved session for one call. VICOOP_BRIDGE / VICOOP_OWNER_TOKEN env vars
@@ -710,7 +765,7 @@ separate `owner-session.json` that `login` writes alongside it). If the
 saved bearer is missing or expired, refresh it without re-registering:
 
 ```sh
-"$INSTALL_DIR/vicoop-client" auth login
+vicoop-client auth login
 ```
 
 (Self-hosting? Pass `--server https://<your-bridge>`.)
@@ -744,10 +799,10 @@ installer's `FORCE=1` path is destructive (it `rm -rf`s `$INSTALL_DIR`) and
 is reserved for bootstrapping.
 
 ```sh
-"$INSTALL_DIR/vicoop-client" upgrade --check      # report latest vs current
-"$INSTALL_DIR/vicoop-client" upgrade              # upgrade to latest @vicoop-bridge/client@*
-"$INSTALL_DIR/vicoop-client" upgrade --version 0.2.0   # pin / downgrade (bare version, v0.2.0, or @vicoop-bridge/client@0.2.0 all accepted)
-"$INSTALL_DIR/vicoop-client" upgrade --force      # reinstall the resolved target even if already on it
+vicoop-client upgrade --check      # report latest vs current
+vicoop-client upgrade              # upgrade to latest @vicoop-bridge/client@*
+vicoop-client upgrade --version 0.2.0   # pin / downgrade (bare version, v0.2.0, or @vicoop-bridge/client@0.2.0 all accepted)
+vicoop-client upgrade --force      # reinstall the resolved target even if already on it
 ```
 
 The upgrade command:

@@ -5,17 +5,19 @@
 #   curl -fsSL https://raw.githubusercontent.com/planetarium/vicoop-bridge/main/install.sh | sh
 #
 # Environment overrides:
-#   INSTALL_DIR  Target directory (default: /data/vicoop-bridge-client)
-#   VERSION      Specific tag, e.g. @vicoop-bridge/client@0.16.0
-#                (default: latest @vicoop-bridge/client@* release)
-#   FORCE        If "1", overwrite a non-empty INSTALL_DIR
+#   INSTALL_DIR      Target directory (default: /data/vicoop-bridge-client)
+#   VERSION          Specific tag, e.g. @vicoop-bridge/client@0.16.0
+#                    (default: latest @vicoop-bridge/client@* release)
+#   FORCE            If "1", overwrite a non-empty INSTALL_DIR
+#   NO_MODIFY_PATH   If "1", skip appending INSTALL_DIR to the shell rc file
 #
 # What it does:
 #   1. Verifies prerequisites (curl, sha256 tool, jq when auto-resolving).
 #   2. Detects OS/arch and resolves the matching release asset.
 #   3. Downloads the binary + .sha256, verifies integrity, chmod +x.
 #   4. Drops macOS quarantine xattr so first launch isn't Gatekeeper-blocked.
-#   5. Prints next-step instructions for login and a foreground first run.
+#   5. Appends INSTALL_DIR to the detected shell rc file (skip with NO_MODIFY_PATH=1).
+#   6. Prints next-step instructions for login and a foreground first run.
 
 set -eu
 
@@ -23,6 +25,7 @@ REPO="planetarium/vicoop-bridge"
 INSTALL_DIR="${INSTALL_DIR:-/data/vicoop-bridge-client}"
 VERSION="${VERSION:-}"
 FORCE="${FORCE:-0}"
+NO_MODIFY_PATH="${NO_MODIFY_PATH:-0}"
 
 log() { printf '==> %s\n' "$*"; }
 err() { printf 'error: %s\n' "$*" >&2; }
@@ -181,42 +184,210 @@ if [ "$OS_NAME" = "Darwin" ] && command -v xattr >/dev/null 2>&1; then
   xattr -d com.apple.quarantine "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null || true
 fi
 
-# ---- 5. Next steps ----------------------------------------------------------
+# ---- 5. Add INSTALL_DIR to the shell rc file --------------------------------
+# Auto-edit pattern matches Bun / uv / fnm: detect the operator's login shell
+# from $SHELL, append an export to the appropriate rc file (re-runs strip
+# and re-append the marker block so a changed $INSTALL_DIR refreshes the
+# entry instead of leaving it stale), and fall back to printing manual
+# instructions when the file isn't writable or the shell is unknown.
+# Operators that manage PATH themselves (NixOS, immutable OSes, dotfile
+# managers like chezmoi) opt out with NO_MODIFY_PATH=1 — they still get
+# the exact line to copy into their dotfiles in the Next steps block.
+
+# Filled in by setup_shell_path() so the Next-steps block below can tell
+# the operator exactly which file to `source` (when we wrote it) or which
+# line to copy manually (when we didn't).
+PATH_RC_FILE=""
+PATH_MANUAL_HINT=""
+PATH_MANUAL_TARGET=""
+
+setup_shell_path() {
+  # If INSTALL_DIR sits under $HOME, persist it as $HOME/... so the line
+  # remains portable across machines for the same operator.
+  case "$INSTALL_DIR" in
+    "$HOME"/*) install_dir_expr="\$HOME${INSTALL_DIR#"$HOME"}" ;;
+    *)         install_dir_expr="$INSTALL_DIR" ;;
+  esac
+
+  # Detect login shell first so even the NO_MODIFY_PATH / unknown-shell
+  # branches can hand the operator the exact line and target file to add.
+  shell_name="$(basename "${SHELL:-}")"
+  case "$shell_name" in
+    zsh)
+      rc_file="${ZDOTDIR:-$HOME}/.zshrc"
+      add_line="export PATH=\"$install_dir_expr:\$PATH\""
+      ;;
+    bash)
+      # macOS login shells read .bash_profile; Linux interactive shells
+      # default to .bashrc. Pick the one most likely to be sourced on the
+      # operator's next terminal.
+      if [ "$OS_NAME" = "Darwin" ]; then
+        rc_file="$HOME/.bash_profile"
+      else
+        rc_file="$HOME/.bashrc"
+      fi
+      add_line="export PATH=\"$install_dir_expr:\$PATH\""
+      ;;
+    fish)
+      rc_file="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+      add_line="fish_add_path $install_dir_expr"
+      ;;
+    *)
+      # No rc-file convention we recognize — print-only fallback.
+      PATH_MANUAL_HINT="export PATH=\"$install_dir_expr:\$PATH\""
+      log "could not detect shell from \$SHELL ($shell_name) — see Next steps for manual PATH instructions"
+      return 0
+      ;;
+  esac
+
+  if [ "$NO_MODIFY_PATH" = "1" ]; then
+    PATH_MANUAL_HINT="$add_line"
+    PATH_MANUAL_TARGET="$rc_file"
+    log "NO_MODIFY_PATH=1 — see Next steps for the line to add to $rc_file"
+    return 0
+  fi
+
+  rc_dir="$(dirname "$rc_file")"
+  rc_writable=1
+  if ! mkdir -p "$rc_dir" 2>/dev/null; then
+    rc_writable=0
+  elif [ -e "$rc_file" ] && [ ! -w "$rc_file" ]; then
+    rc_writable=0
+  elif [ ! -e "$rc_file" ] && [ ! -w "$rc_dir" ]; then
+    rc_writable=0
+  fi
+
+  if [ "$rc_writable" = "0" ]; then
+    PATH_MANUAL_HINT="$add_line"
+    PATH_MANUAL_TARGET="$rc_file"
+    log "$rc_file is not writable — see Next steps for manual PATH instructions"
+    return 0
+  fi
+
+  marker="# vicoop-bridge-client (vicoop-client)"
+
+  # If a marker already exists, strip the existing block (an optional
+  # leading blank line + marker line + the PATH/fish_add_path line
+  # immediately below it) and fall through to a fresh append. This keeps
+  # re-runs idempotent AND refreshes the PATH entry when INSTALL_DIR
+  # changes between runs (the marker alone can't tell which is which).
+  marker_existed=0
+  if [ -f "$rc_file" ] && grep -Fq "$marker" "$rc_file"; then
+    marker_existed=1
+    new_content=$(
+      awk -v m="$marker" '
+        $0 == m {
+          # Drop a buffered blank line so reinstalls do not accumulate
+          # empty lines before the (re-)appended marker.
+          if (have && buf == "") have = 0
+          skip = 1
+          next
+        }
+        skip { skip = 0; next }
+        {
+          if (have) print buf
+          buf = $0
+          have = 1
+        }
+        END { if (have) print buf }
+      ' "$rc_file"
+    ) || die "failed to refresh $rc_file — leaving it untouched"
+    # `> "$rc_file"` truncates in place, preserving the file's existing
+    # ownership and mode (important when rc is mode 0600).
+    # When new_content is empty (rc file had only the marker block),
+    # truncate to zero bytes — `printf '%s\n' ""` would otherwise write
+    # a stray newline that accumulates across re-runs.
+    if [ -n "$new_content" ]; then
+      printf '%s\n' "$new_content" > "$rc_file"
+    else
+      : > "$rc_file"
+    fi
+  fi
+
+  {
+    printf '\n%s\n' "$marker"
+    printf '%s\n' "$add_line"
+  } >> "$rc_file"
+
+  if [ "$marker_existed" = "1" ]; then
+    log "refreshed vicoop-client PATH entry in $rc_file"
+  else
+    log "added vicoop-client to PATH in $rc_file"
+  fi
+  PATH_RC_FILE="$rc_file"
+}
+
+setup_shell_path
+
+# ---- 6. Next steps ----------------------------------------------------------
 cat <<EOF
 
 ==> installed $VERSION to $INSTALL_DIR/$BINARY_NAME
+EOF
+
+if [ -n "$PATH_RC_FILE" ]; then
+  cat <<EOF
+
+To use \`vicoop-client\` in this shell, open a new terminal — or run:
+
+    source "$PATH_RC_FILE"
+EOF
+elif [ -n "$PATH_MANUAL_HINT" ]; then
+  if [ -n "$PATH_MANUAL_TARGET" ]; then
+    cat <<EOF
+
+To use \`vicoop-client\` from any shell, add this line to $PATH_MANUAL_TARGET
+(or wherever your dotfile setup expects):
+
+    $PATH_MANUAL_HINT
+
+Then open a new terminal (or source the file you edited).
+EOF
+  else
+    cat <<EOF
+
+To use \`vicoop-client\` from any shell, add this line to your shell config:
+
+    $PATH_MANUAL_HINT
+
+Then open a new terminal (or source the file you edited).
+EOF
+  fi
+fi
+
+cat <<EOF
 
 Next steps (the agent that owns this client should perform these):
 
   1. Verify and sign in (device flow). The owner-session bearer is saved
      to ~/.vicoop/owner-session.json; admin subcommands pick it up:
 
-       "$INSTALL_DIR/$BINARY_NAME" --version
-       "$INSTALL_DIR/$BINARY_NAME" login
+       vicoop-client --version
+       vicoop-client auth login
 
-  2. Register this client. \`setup\` writes the one-time CLIENT_TOKEN plus
-     server_url / agent_id into the canonical ~/.vicoop/config.json
-     (mode 600); the daemon picks those up on its next launch:
+  2. Register the agent. \`agent register\` writes the one-time AGENT_TOKEN
+     plus server_url / agent_id into ~/.vicoop/config.json (mode 600);
+     the daemon picks those up on its next launch:
 
-       "$INSTALL_DIR/$BINARY_NAME" setup \\
-         --client-name "my client" --agent-ids "\$AGENT_ID"
+       vicoop-client agent register \\
+         --agent-id "\$AGENT_ID" --caller "eth:0x<40-hex>"
 
   3. Run the daemon in the foreground. With config.json populated, only
      the backend choice (echo / openclaw / claude / codex) is left:
 
-       "$INSTALL_DIR/$BINARY_NAME" --backend openclaw
+       vicoop-client --backend openclaw
 
      Or persist \`"backend": "openclaw"\` in config.json and run with no
      flags at all:
 
-       "$INSTALL_DIR/$BINARY_NAME"
+       vicoop-client
 
      An always-on supervisor (systemd unit, launchd plist, …) is not
      provided by this installer; the foreground run above is the
      supported entrypoint while the design is in flux (issue #190).
 
-  Future updates: run \`"$INSTALL_DIR/$BINARY_NAME" upgrade\` — no need
-  to re-run this installer. Pass --check to see if a newer release is
-  available.
-
+  Future updates: run \`vicoop-client upgrade\` — no need to re-run this
+  installer. Pass --check to see if a newer release is available.
 EOF
+
+echo
