@@ -117,10 +117,12 @@ the matching rc file so `vicoop-client` works from any new terminal:
 | `fish` | `${XDG_CONFIG_HOME:-~/.config}/fish/config.fish` | `fish_add_path $INSTALL_DIR` |
 
 Each entry is prefixed with a `# vicoop-bridge-client (vicoop-client)`
-marker comment so re-running `install.sh` (including with `FORCE=1`)
-detects the existing line and won't duplicate it. If `$INSTALL_DIR` sits
-under `$HOME`, the appended line is written with a literal `$HOME/...`
-prefix so it stays portable across machines for the same operator.
+marker comment. Re-running `install.sh` (including with `FORCE=1` or with
+a different `$INSTALL_DIR`) strips the existing marker block and
+re-appends it with the current target so the rc file never accumulates
+duplicates or stale paths. If `$INSTALL_DIR` sits under `$HOME`, the
+appended line is written with a literal `$HOME/...` prefix so it stays
+portable across machines for the same operator.
 
 To pick the change up in the shell where you just ran `install.sh`, either
 open a new terminal or `source` the rc file the installer prints in its
@@ -140,8 +142,9 @@ with `"$INSTALL_DIR/"` — e.g. `"$INSTALL_DIR/vicoop-client" --version`.
 Set `NO_MODIFY_PATH=1` on the same `install.sh` invocation if you'd rather
 manage `PATH` yourself — recommended on NixOS, immutable OSes, or when a
 dotfile manager (chezmoi, yadm, etc.) owns your shell rc files. The
-installer prints the exact line it would have appended so you can place it
-wherever your dotfile setup expects:
+installer prints both the exact line it would have appended **and** the
+shell-specific rc file it would have appended to, so you can route the
+line wherever your dotfile setup expects:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/planetarium/vicoop-bridge/main/install.sh \
@@ -172,14 +175,17 @@ If you'd rather keep the old install around, pick a different
 new bundle there instead.
 
 Before continuing, verify that the installed bundle is recent enough to
-include the `login` command used in Step 4:
+include the `auth login` command used in Step 4:
 
 ```sh
 vicoop-client -v
-vicoop-client login --help
+vicoop-client auth login --help
 ```
 
-If `login --help` prints usage, you're on a current binary and can move on.
+If `auth login --help` prints usage, you're on a current binary and can
+move on. The flat `login` alias still works on current binaries but emits a
+`[deprecated] Use auth login` notice to stderr — see the legacy aliases
+note in Step 4.
 
 ## Step 3 — Pick an agent id
 

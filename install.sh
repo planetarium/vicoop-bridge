@@ -186,23 +186,22 @@ fi
 
 # ---- 5. Add INSTALL_DIR to the shell rc file --------------------------------
 # Auto-edit pattern matches Bun / uv / fnm: detect the operator's login shell
-# from $SHELL, append an export to the appropriate rc file (skipped on
-# re-runs via a marker comment), and fall back to printing manual
+# from $SHELL, append an export to the appropriate rc file (re-runs strip
+# and re-append the marker block so a changed $INSTALL_DIR refreshes the
+# entry instead of leaving it stale), and fall back to printing manual
 # instructions when the file isn't writable or the shell is unknown.
 # Operators that manage PATH themselves (NixOS, immutable OSes, dotfile
-# managers like chezmoi) opt out with NO_MODIFY_PATH=1.
+# managers like chezmoi) opt out with NO_MODIFY_PATH=1 — they still get
+# the exact line to copy into their dotfiles in the Next steps block.
 
 # Filled in by setup_shell_path() so the Next-steps block below can tell
-# the operator exactly which file to `source` to pick up the change.
+# the operator exactly which file to `source` (when we wrote it) or which
+# line to copy manually (when we didn't).
 PATH_RC_FILE=""
 PATH_MANUAL_HINT=""
+PATH_MANUAL_TARGET=""
 
 setup_shell_path() {
-  if [ "$NO_MODIFY_PATH" = "1" ]; then
-    log "NO_MODIFY_PATH=1 — leaving shell PATH alone"
-    return 0
-  fi
-
   # If INSTALL_DIR sits under $HOME, persist it as $HOME/... so the line
   # remains portable across machines for the same operator.
   case "$INSTALL_DIR" in
@@ -210,6 +209,8 @@ setup_shell_path() {
     *)         install_dir_expr="$INSTALL_DIR" ;;
   esac
 
+  # Detect login shell first so even the NO_MODIFY_PATH / unknown-shell
+  # branches can hand the operator the exact line and target file to add.
   shell_name="$(basename "${SHELL:-}")"
   case "$shell_name" in
     zsh)
@@ -232,16 +233,17 @@ setup_shell_path() {
       add_line="fish_add_path $install_dir_expr"
       ;;
     *)
+      # No rc-file convention we recognize — print-only fallback.
       PATH_MANUAL_HINT="export PATH=\"$install_dir_expr:\$PATH\""
       log "could not detect shell from \$SHELL ($shell_name) — see Next steps for manual PATH instructions"
       return 0
       ;;
   esac
 
-  marker="# vicoop-bridge-client (vicoop-client)"
-  if [ -f "$rc_file" ] && grep -Fq "$marker" "$rc_file"; then
-    log "PATH entry already present in $rc_file — skipping"
-    PATH_RC_FILE="$rc_file"
+  if [ "$NO_MODIFY_PATH" = "1" ]; then
+    PATH_MANUAL_HINT="$add_line"
+    PATH_MANUAL_TARGET="$rc_file"
+    log "NO_MODIFY_PATH=1 — see Next steps for the line to add to $rc_file"
     return 0
   fi
 
@@ -257,15 +259,61 @@ setup_shell_path() {
 
   if [ "$rc_writable" = "0" ]; then
     PATH_MANUAL_HINT="$add_line"
+    PATH_MANUAL_TARGET="$rc_file"
     log "$rc_file is not writable — see Next steps for manual PATH instructions"
     return 0
+  fi
+
+  marker="# vicoop-bridge-client (vicoop-client)"
+
+  # If a marker already exists, strip the existing block (an optional
+  # leading blank line + marker line + the PATH/fish_add_path line
+  # immediately below it) and fall through to a fresh append. This keeps
+  # re-runs idempotent AND refreshes the PATH entry when INSTALL_DIR
+  # changes between runs (the marker alone can't tell which is which).
+  marker_existed=0
+  if [ -f "$rc_file" ] && grep -Fq "$marker" "$rc_file"; then
+    marker_existed=1
+    new_content=$(
+      awk -v m="$marker" '
+        $0 == m {
+          # Drop a buffered blank line so reinstalls do not accumulate
+          # empty lines before the (re-)appended marker.
+          if (have && buf == "") have = 0
+          skip = 1
+          next
+        }
+        skip { skip = 0; next }
+        {
+          if (have) print buf
+          buf = $0
+          have = 1
+        }
+        END { if (have) print buf }
+      ' "$rc_file"
+    ) || die "failed to refresh $rc_file — leaving it untouched"
+    # `> "$rc_file"` truncates in place, preserving the file's existing
+    # ownership and mode (important when rc is mode 0600).
+    # When new_content is empty (rc file had only the marker block),
+    # truncate to zero bytes — `printf '%s\n' ""` would otherwise write
+    # a stray newline that accumulates across re-runs.
+    if [ -n "$new_content" ]; then
+      printf '%s\n' "$new_content" > "$rc_file"
+    else
+      : > "$rc_file"
+    fi
   fi
 
   {
     printf '\n%s\n' "$marker"
     printf '%s\n' "$add_line"
   } >> "$rc_file"
-  log "added vicoop-client to PATH in $rc_file"
+
+  if [ "$marker_existed" = "1" ]; then
+    log "refreshed vicoop-client PATH entry in $rc_file"
+  else
+    log "added vicoop-client to PATH in $rc_file"
+  fi
   PATH_RC_FILE="$rc_file"
 }
 
@@ -285,14 +333,26 @@ To use \`vicoop-client\` in this shell, open a new terminal — or run:
     source "$PATH_RC_FILE"
 EOF
 elif [ -n "$PATH_MANUAL_HINT" ]; then
-  cat <<EOF
+  if [ -n "$PATH_MANUAL_TARGET" ]; then
+    cat <<EOF
 
-To use \`vicoop-client\` from any shell, add this to your shell config:
+To use \`vicoop-client\` from any shell, add this line to $PATH_MANUAL_TARGET
+(or wherever your dotfile setup expects):
 
     $PATH_MANUAL_HINT
 
 Then open a new terminal (or source the file you edited).
 EOF
+  else
+    cat <<EOF
+
+To use \`vicoop-client\` from any shell, add this line to your shell config:
+
+    $PATH_MANUAL_HINT
+
+Then open a new terminal (or source the file you edited).
+EOF
+  fi
 fi
 
 cat <<EOF
@@ -329,13 +389,5 @@ Next steps (the agent that owns this client should perform these):
   Future updates: run \`vicoop-client upgrade\` — no need to re-run this
   installer. Pass --check to see if a newer release is available.
 EOF
-
-if [ -z "$PATH_RC_FILE" ] && [ -z "$PATH_MANUAL_HINT" ]; then
-  cat <<EOF
-
-  Opted out of PATH setup with NO_MODIFY_PATH=1? Prefix every command
-  above with "$INSTALL_DIR/" — e.g. \`"$INSTALL_DIR/vicoop-client" --version\`.
-EOF
-fi
 
 echo
