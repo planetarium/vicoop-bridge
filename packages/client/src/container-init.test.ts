@@ -1,16 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  assertContainerCredsPresent,
   collectClaudeHostCreds,
   collectCodexHostCreds,
+  expectedCredsPath,
   formatRuntimeList,
   formatRuntimeListJson,
   formatRuntimeRemoveJson,
   formatRuntimeRemoveResult,
   listRuntimeContainers,
+  maybeAutoLoginAfterInit,
   removeRuntimeContainer,
 } from './container-init.js';
 import type { DockerResult } from './runtime-container.js';
+import type { Logger } from './logger.js';
 
 // ──────────────────────────────────────────────────────────────────
 // collectClaudeHostCreds
@@ -459,6 +463,163 @@ test('removeRuntimeContainer: unexpected docker failures throw', () => {
     /docker rm -f vicoop-runtime-codex failed/,
   );
 });
+
+// ──────────────────────────────────────────────────────────────────
+// assertContainerCredsPresent — daemon-startup fail-fast probe
+// ──────────────────────────────────────────────────────────────────
+
+test('assertContainerCredsPresent: claude path probes /data/creds/claude/.credentials.json', async () => {
+  const calls: Array<readonly string[]> = [];
+  await assertContainerCredsPresent('vicoop-runtime-claude', 'claude', {
+    dockerRun: (args) => {
+      calls.push(args);
+      return ok('');
+    },
+  });
+  assert.deepEqual(calls, [[
+    'exec',
+    'vicoop-runtime-claude',
+    'test',
+    '-f',
+    '/data/creds/claude/.credentials.json',
+  ]]);
+});
+
+test('assertContainerCredsPresent: codex path probes /data/creds/codex/auth.json', async () => {
+  const calls: Array<readonly string[]> = [];
+  await assertContainerCredsPresent('vicoop-runtime-codex', 'codex', {
+    dockerRun: (args) => {
+      calls.push(args);
+      return ok('');
+    },
+  });
+  assert.deepEqual(calls[0], [
+    'exec',
+    'vicoop-runtime-codex',
+    'test',
+    '-f',
+    '/data/creds/codex/auth.json',
+  ]);
+});
+
+test('assertContainerCredsPresent: throws with auth-command hint when probe fails', async () => {
+  await assert.rejects(
+    () =>
+      assertContainerCredsPresent('vicoop-runtime-claude', 'claude', {
+        dockerRun: () => fail('', 1),
+      }),
+    (err: Error) => {
+      assert.match(err.message, /no claude creds at \/data\/creds\/claude\/\.credentials\.json/);
+      assert.match(err.message, /docker exec -it vicoop-runtime-claude claude setup-token/);
+      return true;
+    },
+  );
+});
+
+test('assertContainerCredsPresent: codex hint uses codex login --device-auth', async () => {
+  await assert.rejects(
+    () =>
+      assertContainerCredsPresent('vicoop-runtime-codex', 'codex', {
+        dockerRun: () => fail('', 1),
+      }),
+    /docker exec -it vicoop-runtime-codex codex login --device-auth/,
+  );
+});
+
+test('expectedCredsPath: stable canonical paths per kind', () => {
+  assert.equal(expectedCredsPath('claude'), '/data/creds/claude/.credentials.json');
+  assert.equal(expectedCredsPath('codex'), '/data/creds/codex/auth.json');
+});
+
+// ──────────────────────────────────────────────────────────────────
+// maybeAutoLoginAfterInit — TTY-gated interactive auth at init time
+// ──────────────────────────────────────────────────────────────────
+
+test('maybeAutoLoginAfterInit: TTY off skips interactive auth and prints docker-exec hint', async () => {
+  const log = recordingLogger();
+  const argvs: Array<readonly string[]> = [];
+  const result = await maybeAutoLoginAfterInit('vicoop-runtime-claude', 'claude', log, {
+    isTTY: () => false,
+    runDockerInteractive: async (argv) => {
+      argvs.push(argv);
+      return 0;
+    },
+  });
+  assert.deepEqual(result, { attempted: false, exitCode: 0 });
+  assert.deepEqual(argvs, []);
+  const infos = log.entries.filter((e) => e.level === 'info').map((e) => e.msg);
+  assert.ok(infos.some((m) => /not a TTY/.test(m)));
+  assert.ok(infos.some((m) => /claude setup-token/.test(m)));
+});
+
+test('maybeAutoLoginAfterInit: TTY on runs claude auth via docker exec -it', async () => {
+  const log = recordingLogger();
+  let captured: readonly string[] | null = null;
+  const result = await maybeAutoLoginAfterInit('vicoop-runtime-claude', 'claude', log, {
+    isTTY: () => true,
+    runDockerInteractive: async (argv) => {
+      captured = argv;
+      return 0;
+    },
+  });
+  assert.deepEqual(result, { attempted: true, exitCode: 0 });
+  assert.deepEqual(captured, [
+    'exec',
+    '-it',
+    'vicoop-runtime-claude',
+    'claude',
+    'setup-token',
+  ]);
+});
+
+test('maybeAutoLoginAfterInit: TTY on runs codex auth with --device-auth', async () => {
+  const log = recordingLogger();
+  let captured: readonly string[] | null = null;
+  await maybeAutoLoginAfterInit('vicoop-runtime-codex', 'codex', log, {
+    isTTY: () => true,
+    runDockerInteractive: async (argv) => {
+      captured = argv;
+      return 0;
+    },
+  });
+  assert.deepEqual(captured, [
+    'exec',
+    '-it',
+    'vicoop-runtime-codex',
+    'codex',
+    'login',
+    '--device-auth',
+  ]);
+});
+
+test('maybeAutoLoginAfterInit: failed interactive auth returns exitCode 1 and surfaces retry hint', async () => {
+  const log = recordingLogger();
+  const result = await maybeAutoLoginAfterInit('vicoop-runtime-claude', 'claude', log, {
+    isTTY: () => true,
+    runDockerInteractive: async () => 130,
+  });
+  assert.deepEqual(result, { attempted: true, exitCode: 1 });
+  const errors = log.entries.filter((e) => e.level === 'error').map((e) => e.msg);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /interactive auth exited with code 130/);
+  assert.match(errors[0], /docker exec -it vicoop-runtime-claude claude setup-token/);
+  assert.match(errors[0], /left in place/);
+});
+
+function recordingLogger(): Logger & {
+  entries: Array<{ level: 'error' | 'warn' | 'info' | 'debug'; msg: string }>;
+} {
+  const entries: Array<{ level: 'error' | 'warn' | 'info' | 'debug'; msg: string }> = [];
+  const join = (args: unknown[]) => args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+  return {
+    level: 'debug',
+    error: (...args) => entries.push({ level: 'error', msg: join(args) }),
+    warn: (...args) => entries.push({ level: 'warn', msg: join(args) }),
+    info: (...args) => entries.push({ level: 'info', msg: join(args) }),
+    debug: (...args) => entries.push({ level: 'debug', msg: join(args) }),
+    entries,
+  };
+}
 
 function ok(stdout = ''): DockerResult {
   return { stdout, stderr: '', exitCode: 0 };

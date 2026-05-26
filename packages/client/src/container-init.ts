@@ -6,9 +6,11 @@
 // binary against this client's supportedRange manifest, and
 // (with --from-host) copies the operator's existing agent CLI
 // creds into the container-scoped named volume so the operator can
-// immediately go daemon. Without --from-host the command leaves
-// creds empty and prints the docker-exec incantation for the
-// operator to do an interactive auth flow themselves.
+// immediately go daemon. Without --from-host: if stdin is a TTY,
+// runs the agent CLI's interactive auth (claude setup-token /
+// codex login --device-auth) in the running container right then;
+// otherwise falls back to printing the docker-exec incantation
+// the operator can run themselves.
 //
 // Companion to RuntimeContainer (lifecycle) + SpawnAdapter
 // (per-task spawn). RuntimeContainer is the unit of state that
@@ -59,7 +61,17 @@ export interface ContainerInitOptions {
   // init-firewall.sh. The CLI defaults this to whatever the daemon
   // would use; included as a parameter so tests can override.
   bridgeUrl?: string;
+  // Test seam — inject a stub TTY probe + interactive runner so the
+  // auto-login branch can be exercised without a real terminal /
+  // docker daemon. Production passes nothing; defaults fall through
+  // to process.stdin.isTTY + spawn('docker', argv, {stdio:'inherit'}).
+  authRunner?: Partial<AuthRunner>;
   logger?: Logger;
+}
+
+export interface AuthRunner {
+  isTTY: () => boolean;
+  runDockerInteractive: (argv: readonly string[]) => Promise<number>;
 }
 
 type RuntimeContainerState = 'running' | 'stopped' | 'missing';
@@ -187,10 +199,13 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
         return 1;
       }
     } else {
-      log.info(
-        `--from-host not set: leaving creds empty. To auth inside the container run\n` +
-          `    ${authCommandFor(containerName, opts.kind)}`,
+      const autoLogin = await maybeAutoLoginAfterInit(
+        containerName,
+        opts.kind,
+        log,
+        opts.authRunner,
       );
+      if (autoLogin.exitCode !== 0) return autoLogin.exitCode;
     }
 
     log.info(`runtime container for ${opts.kind} initialized. start daemon with:`);
@@ -208,6 +223,92 @@ function authCommandFor(containerName: string, kind: InstallableBackendKind): st
     `docker start ${containerName} >/dev/null && ` +
     `docker exec -it ${containerName} ${authHintFor(kind)} && ` +
     `docker stop ${containerName} >/dev/null`
+  );
+}
+
+// Decides whether to run the agent CLI's interactive auth flow in
+// the freshly-installed runtime container, and runs it inline when
+// the operator is on an interactive terminal. Non-TTY callers
+// (CI, piped input, automation) fall back to the hint-only path so
+// init stays scriptable. Caller in runContainerInit treats a
+// non-zero exitCode as a fatal init failure but leaves the runtime
+// container in place so the operator can retry the auth without
+// re-running install-backend.sh.
+export async function maybeAutoLoginAfterInit(
+  containerName: string,
+  kind: InstallableBackendKind,
+  log: Logger,
+  runner: Partial<AuthRunner> = {},
+): Promise<{ attempted: boolean; exitCode: number }> {
+  const isTTY = (runner.isTTY ?? defaultIsTTY)();
+  if (!isTTY) {
+    log.info(
+      `--from-host not set and stdin is not a TTY: leaving creds empty. To auth inside the container run\n` +
+        `    ${authCommandFor(containerName, kind)}`,
+    );
+    return { attempted: false, exitCode: 0 };
+  }
+  log.info(
+    `--from-host not set; starting interactive auth (${authHintFor(kind)}) inside ${containerName}...`,
+  );
+  const run = runner.runDockerInteractive ?? defaultRunDockerInteractive;
+  const code = await run(['exec', '-it', containerName, ...authHintFor(kind).split(' ')]);
+  if (code === 0) {
+    log.info(`auth complete for ${kind}.`);
+    return { attempted: true, exitCode: 0 };
+  }
+  log.error(
+    `interactive auth exited with code ${code}. Runtime container '${containerName}' was left in place; ` +
+      `retry with:\n    ${authCommandFor(containerName, kind)}`,
+  );
+  return { attempted: true, exitCode: 1 };
+}
+
+function defaultIsTTY(): boolean {
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+function defaultRunDockerInteractive(argv: readonly string[]): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('docker', Array.from(argv), { stdio: 'inherit' });
+    child.on('error', reject);
+    child.on('close', (code) => resolve(code ?? -1));
+  });
+}
+
+// Canonical in-container path of the file the backend will read on
+// first task. Probed by the daemon at startup (assertContainerCredsPresent)
+// so a missing-creds runtime container fails before any task is
+// accepted, instead of failing at first spawn with whatever
+// backend-specific "not authenticated" error the CLI emits.
+export function expectedCredsPath(kind: InstallableBackendKind): string {
+  switch (kind) {
+    case 'claude':
+      return '/data/creds/claude/.credentials.json';
+    case 'codex':
+      return '/data/creds/codex/auth.json';
+  }
+}
+
+// Daemon-startup fail-fast probe. Run after RuntimeContainer.start()
+// has the container running; checks that the per-kind creds file the
+// agent CLI will read actually exists in the creds volume. Throws
+// with the same auth-hint container-init prints when --from-host was
+// omitted, so the operator's recovery path is identical regardless of
+// where they hit the missing-creds case.
+export async function assertContainerCredsPresent(
+  containerName: string,
+  kind: InstallableBackendKind,
+  opts: { dockerRun?: DockerRun } = {},
+): Promise<void> {
+  const dockerRun = opts.dockerRun ?? defaultDockerRun;
+  const path = expectedCredsPath(kind);
+  const r = dockerRun(['exec', containerName, 'test', '-f', path]);
+  if (r.exitCode === 0) return;
+  throw new Error(
+    `runtime container '${containerName}' has no ${kind} creds at ${path}. ` +
+      `Authenticate inside the container, then restart the daemon:\n` +
+      `    ${authCommandFor(containerName, kind)}`,
   );
 }
 
@@ -336,14 +437,14 @@ export function collectClaudeHostCreds(
       return [];
     }
     if (!token || token.length === 0) return [];
-    return [{ target: '/data/creds/claude/.credentials.json', data: Buffer.from(`${token}\n`) }];
+    return [{ target: expectedCredsPath('claude'), data: Buffer.from(`${token}\n`) }];
   }
   const home = (env.homedir ?? homedir)();
   const existsFn = env.existsSync ?? existsSync;
   const readFn = env.readFileSync ?? readFileSync;
   const linuxPath = join(home, '.claude', '.credentials.json');
   if (existsFn(linuxPath)) {
-    return [{ target: '/data/creds/claude/.credentials.json', data: readFn(linuxPath) }];
+    return [{ target: expectedCredsPath('claude'), data: readFn(linuxPath) }];
   }
   return [];
 }
@@ -362,7 +463,7 @@ export function collectCodexHostCreds(
   const out: Array<{ target: string; data: Buffer }> = [];
   const authPath = join(home, '.codex', 'auth.json');
   if (existsFn(authPath)) {
-    out.push({ target: '/data/creds/codex/auth.json', data: readFn(authPath) });
+    out.push({ target: expectedCredsPath('codex'), data: readFn(authPath) });
   }
   const configPath = join(home, '.codex', 'config.toml');
   if (existsFn(configPath)) {
