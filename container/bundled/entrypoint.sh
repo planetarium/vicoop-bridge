@@ -242,11 +242,11 @@ wizard() {
 
     log ""
     log "Available backends:"
-    # bash `select` does the keystroke loop + invalid-input retry on
-    # its own. We render two parallel arrays — `descriptions` is what
-    # operators see, `kinds` is what we feed to install-backend.sh and
-    # write into config.json. REPLY (set by select to the chosen 1-based
-    # index) ties the two.
+    # We render two parallel arrays — `options` is what operators see,
+    # `kinds` is what we feed to install-backend.sh and write into
+    # config.json. Hand-rolled rather than `select` because bash's
+    # builtin reflows long labels into multiple columns, which mangles
+    # the alignment we want here.
     local options=(
         "claude       - Anthropic Claude Code CLI"
         "codex        - OpenAI Codex CLI"
@@ -255,16 +255,21 @@ wizard() {
         "vicoop-codex - codex via vicoop's traceability bridge"
     )
     local kinds=(claude codex echo openclaw vicoop-codex)
-    local backend="" choice
-    PS3="  Pick a backend (number): "
-    select choice in "${options[@]}"; do
-        if [[ -n "$choice" ]]; then
-            backend="${kinds[$((REPLY - 1))]}"
+    local i
+    for i in "${!options[@]}"; do
+        printf '  %d) %s\n' "$((i + 1))" "${options[$i]}" >&2
+    done
+    printf '\n' >&2
+
+    local backend="" reply
+    while true; do
+        read -rp "  Pick a backend [1-${#options[@]}]: " reply
+        if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#options[@]} )); then
+            backend="${kinds[$((reply - 1))]}"
             break
         fi
         log "  Invalid; enter a number from 1 to ${#options[@]}."
     done
-    unset PS3
 
     log ""
     vicoop-client agent register --agent-id "$agent_id" \
