@@ -88,7 +88,14 @@ export interface ClientOptions {
   onFatal?: (info: { code: number; reason: string }) => void;
 }
 
-const DEFAULT_PROBE_DEADLINE_MS = 3000;
+// Outer race deadline for `backend.resolveCapabilities()` — caps how long
+// the bridge-server hello frame waits on the backend probe before falling
+// back to the declared card. 12s accommodates the claude backend's worst
+// case (operator cwd with hooks / skills / MCP / a large CLAUDE.md can
+// push `system/init` emit to 5–10s) plus headroom; faster backends (codex
+// reads config.toml in ~1ms) settle well before this and the deadline
+// never fires.
+const DEFAULT_PROBE_DEADLINE_MS = 12_000;
 const DEFAULT_RECONNECT_DELAY_MS = 3000;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 30_000;
 const DEFAULT_RECONNECT_JITTER_RATIO = 0.2;
