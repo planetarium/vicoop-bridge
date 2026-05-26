@@ -10,7 +10,9 @@ import {
   callerToolDispatchActive,
   createClaudeBackend,
   formatToolCallHistory,
+  normalizeClaudeModelId,
   openaiToolsToCallerToolDefs,
+  parseClaudeModelUsageForOpenAICompat,
   parseOpenAICompatMetadata,
   probeClaudeModel,
   summarizeToolInput,
@@ -2861,7 +2863,9 @@ test('single-model modelUsage maps cleanly and advertises the extension', async 
   assert.equal(payload?.usage?.completion_tokens, 8);
   assert.equal(payload?.usage?.total_tokens, 6 + 24933 + 23 + 8);
   assert.deepEqual(payload?.usage?.prompt_tokens_details, { cached_tokens: 24933 });
-  assert.equal(payload?.usage?.model, 'claude-opus-4-7[1m]');
+  // Normalised to the canonical Anthropic id so it matches what
+  // `params.models[].id` advertises — see `normalizeClaudeModelId`.
+  assert.equal(payload?.usage?.model, 'claude-opus-4-7');
 });
 
 test('absent modelUsage → no openai-compat metadata is attached', async () => {
@@ -3695,7 +3699,7 @@ test('AskUserQuestion: terminal frame uses state=input-required with DataPart pa
 // is issued.
 // ─────────────────────────────────────────────────────────────────────────────
 
-test('probeClaudeModel returns model from system/init and SIGTERMs the child', async () => {
+test('probeClaudeModel returns normalised model from system/init and SIGTERMs the child', async () => {
   const fake = makeFakeSpawn((child) => {
     setImmediate(() => {
       // Real claude emits a rate_limit_event before system/init in some
@@ -3708,6 +3712,8 @@ test('probeClaudeModel returns model from system/init and SIGTERMs the child', a
           type: 'system',
           subtype: 'init',
           session_id: 'sid',
+          // The 1M-tier suffix MUST be stripped so the advertise matches
+          // the canonical Anthropic model id (and `usage.model`).
           model: 'claude-opus-4-7[1m]',
         }) + '\n',
       );
@@ -3720,7 +3726,7 @@ test('probeClaudeModel returns model from system/init and SIGTERMs the child', a
     timeoutMs: 1000,
   });
 
-  assert.equal(model, 'claude-opus-4-7[1m]');
+  assert.equal(model, 'claude-opus-4-7');
   const child = fake.lastChild();
   assert.ok(child);
   assert.equal(child.killed, true);
@@ -3805,14 +3811,14 @@ test('probeClaudeModel returns null when spawn itself throws', async () => {
   assert.equal(model, null);
 });
 
-test('claude backend resolveCapabilities advertises model from system/init probe', async () => {
+test('claude backend resolveCapabilities advertises normalised model from system/init probe', async () => {
   const fake = makeFakeSpawn((child) => {
     setImmediate(() => {
       child.emitStdout(
         JSON.stringify({
           type: 'system',
           subtype: 'init',
-          model: 'claude-opus-4-7',
+          model: 'claude-opus-4-7[1m]',
         }) + '\n',
       );
     });
@@ -3824,6 +3830,49 @@ test('claude backend resolveCapabilities advertises model from system/init probe
   assert.deepEqual(caps, {
     openaiCompatModels: [{ id: 'claude-opus-4-7', default: true }],
   });
+});
+
+test('normalizeClaudeModelId strips trailing tier suffix and is a no-op otherwise', () => {
+  assert.equal(normalizeClaudeModelId('claude-opus-4-7[1m]'), 'claude-opus-4-7');
+  assert.equal(normalizeClaudeModelId('claude-opus-4-7[200k]'), 'claude-opus-4-7');
+  assert.equal(normalizeClaudeModelId('claude-opus-4-7'), 'claude-opus-4-7');
+  assert.equal(
+    normalizeClaudeModelId('claude-opus-4-7-20251101'),
+    'claude-opus-4-7-20251101',
+    'dated form has no brackets — pass through verbatim',
+  );
+  assert.equal(normalizeClaudeModelId('claude-haiku-4-5[1m]'), 'claude-haiku-4-5');
+});
+
+test('probeClaudeModel returns null if the whole id was a bracket tier marker', async () => {
+  // Pathological: model = "[1m]" only. Stripping leaves empty string, and
+  // an empty `id` would trip the protocol's z.string().min(1). Treat as
+  // no signal so the daemon ships its declared card unchanged.
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      child.emitStdout(
+        JSON.stringify({ type: 'system', subtype: 'init', model: '[1m]' }) + '\n',
+      );
+    });
+  });
+  const model = await probeClaudeModel({
+    command: 'claude',
+    spawn: fake.spawn,
+    timeoutMs: 1000,
+  });
+  assert.equal(model, null);
+});
+
+test('parseClaudeModelUsageForOpenAICompat strips bracket tier suffix on usage.model', () => {
+  // The advertise and the usage.model echo MUST resolve to the same
+  // string so the openai-compat/v1 spec's "id SHOULD match usage.model"
+  // cross-check holds for callers doing exact-match routing.
+  const usage = parseClaudeModelUsageForOpenAICompat({
+    'claude-haiku-4-5-20251001': { inputTokens: 100, outputTokens: 5 },
+    'claude-opus-4-7[1m]': { inputTokens: 100, outputTokens: 50 },
+  });
+  assert.ok(usage);
+  assert.equal(usage!.model, 'claude-opus-4-7');
 });
 
 test('claude backend resolveCapabilities returns {} on probe timeout', async () => {

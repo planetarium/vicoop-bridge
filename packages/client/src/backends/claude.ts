@@ -198,6 +198,22 @@ interface StreamEvent {
   modelUsage?: unknown;
 }
 
+// Strip Claude Code's trailing tier suffix (e.g. `[1m]` for the 1M-context
+// variant) from a model id. The suffix appears in `system/init.model` and
+// `result.modelUsage` keys verbatim, but it is not part of the canonical
+// Anthropic API model ID (`claude-opus-4-7`, `claude-opus-4-7-<date>`,
+// etc.) that callers see elsewhere.
+//
+// Applied at both emission sites — the openai-compat/v1 `params.models[]`
+// advertise (from `system/init`) and the `usage.model` echo (from
+// `result.modelUsage`) — so the spec's "id SHOULD match usage.model"
+// cross-check holds against the canonical form.
+//
+// Exported for unit tests.
+export function normalizeClaudeModelId(raw: string): string {
+  return raw.replace(/\[[^\]]+\]$/, '');
+}
+
 // Parse Claude Code's `result.modelUsage` (a map keyed by model id with
 // per-model { inputTokens, outputTokens, cacheCreationInputTokens,
 // cacheReadInputTokens, ... }) into a spec-compliant OpenAICompatUsage.
@@ -240,7 +256,7 @@ export function parseClaudeModelUsageForOpenAICompat(raw: unknown): OpenAICompat
     prompt_tokens: promptSum,
     completion_tokens: completionSum,
     cached_tokens: cacheReadSum > 0 ? cacheReadSum : undefined,
-    model: primaryModel ?? undefined,
+    model: primaryModel ? normalizeClaudeModelId(primaryModel) : undefined,
   });
 }
 
@@ -422,7 +438,18 @@ export async function probeClaudeModel(probeOpts: {
           typeof e.model === 'string' &&
           e.model.length > 0
         ) {
-          settle(e.model);
+          // Normalise here (and not at the resolveCapabilities caller) so
+          // the function's contract — "returns the model id you'll see in
+          // `usage.model`" — holds across both emission sites.
+          const normalised = normalizeClaudeModelId(e.model);
+          if (normalised.length === 0) {
+            // The whole id was a bracketed tier marker — pathological,
+            // but treat as no signal rather than advertise an empty id
+            // and trip downstream zod min(1) checks.
+            settle(null);
+            return;
+          }
+          settle(normalised);
           return;
         }
       }
