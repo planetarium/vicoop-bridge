@@ -200,14 +200,21 @@ interface StreamEvent {
 
 // Strip Claude Code's trailing tier suffix (e.g. `[1m]` for the 1M-context
 // variant) from a model id. The suffix appears in `system/init.model` and
-// `result.modelUsage` keys verbatim, but it is not part of the canonical
-// Anthropic API model ID (`claude-opus-4-7`, `claude-opus-4-7-<date>`,
-// etc.) that callers see elsewhere.
+// `result.modelUsage` keys verbatim, but it is a Claude Code-specific
+// notation (the CLI reads it off `--model` / `ANTHROPIC_MODEL` /
+// settings.json `model` per-variable to pick a context tier); the
+// canonical Anthropic API id is just `claude-opus-4-7` (or its dated
+// form). Neither `@anthropic-ai/sdk` nor `@ai-sdk/anthropic` expose a
+// normaliser, and the openai-compat/v1 spec is silent on id format, so
+// this regex is the pragmatic option.
 //
 // Applied at both emission sites — the openai-compat/v1 `params.models[]`
 // advertise (from `system/init`) and the `usage.model` echo (from
 // `result.modelUsage`) — so the spec's "id SHOULD match usage.model"
-// cross-check holds against the canonical form.
+// cross-check holds against the canonical form. Side-effect: the
+// "running on the 1M tier" signal is dropped from the advertise; if a
+// caller ever needs that, it should ride a forward-compat sub-field
+// (e.g. `params.models[].contextWindow`), not the id itself.
 //
 // Exported for unit tests.
 export function normalizeClaudeModelId(raw: string): string {
