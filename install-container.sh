@@ -33,6 +33,11 @@ WORKSPACE_VOLUME="${VICOOP_BRIDGE_WORKSPACE_VOLUME:-vicoop-bridge-workspace}"
 
 log()  { printf '[install] %s\n' "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
+# `log` prefixes every line with `[install] ` so the script's chatter is
+# easy to distinguish from the container's output. For shell snippets we
+# want the operator to copy verbatim, that prefix is a hazard — emit
+# those through `snippet` instead, which writes raw lines to stderr.
+snippet() { printf '%s\n' "$@" >&2; }
 
 # ── Preflight ────────────────────────────────────────────────────
 command -v docker >/dev/null 2>&1 \
@@ -43,8 +48,9 @@ if [[ ! -t 0 || ! -t 1 ]]; then
     log "If you ran it via \`curl … | bash\` (which redirects stdin to the pipe),"
     log "download the script first and re-run it directly:"
     log ""
-    log "  curl -fsSL https://raw.githubusercontent.com/planetarium/vicoop-bridge/main/install-container.sh -o install-container.sh"
-    log "  bash install-container.sh"
+    snippet \
+        "  curl -fsSL https://raw.githubusercontent.com/planetarium/vicoop-bridge/main/install-container.sh -o install-container.sh" \
+        "  bash install-container.sh"
     exit 1
 fi
 
@@ -67,7 +73,7 @@ existing_id="$(docker ps -a --filter "name=^${NAME}$" --format '{{.ID}}')"
 if [[ -n "$existing_id" ]]; then
     log "ERROR: a container named '$NAME' already exists ($existing_id)."
     log "If you're sure it's stale, remove it first:"
-    log "  docker rm -f $NAME"
+    snippet "  docker rm -f $NAME"
     log "Otherwise pass a different name via VICOOP_BRIDGE_CONTAINER=…"
     exit 1
 fi
@@ -98,10 +104,12 @@ log ""
 log "Container exited (status $exit_code)."
 log ""
 log "To start the daemon again later (background, restart-on-host-reboot):"
-log "  docker run -d --restart unless-stopped --name $NAME \\"
-log "    -v $STATE_VOLUME:/data \\"
-log "    -v $WORKSPACE_VOLUME:/home/node/work \\"
-log "    $IMAGE"
+log ""
+snippet \
+    "  docker run -d --restart unless-stopped --name $NAME \\" \
+    "    -v $STATE_VOLUME:/data \\" \
+    "    -v $WORKSPACE_VOLUME:/home/node/work \\" \
+    "    $IMAGE"
 log ""
 log "Your config, credentials, and installed backend CLIs are on the"
 log "'$STATE_VOLUME' volume; subsequent"
