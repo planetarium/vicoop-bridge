@@ -121,10 +121,16 @@ export interface ClaudeBackendOptions {
    */
   onCallerToolsMcpReady?: (server: CallerToolsMcpServer) => void;
   // Max time the startup probe (`resolveCapabilities`) waits for the
-  // `system/init` event before giving up. Default 5000 ms. Set to 0 to
-  // disable the probe entirely — the daemon will simply not advertise
-  // `params.models` in its hello card, which is harmless (the spec is
-  // advisory) but blinds clients that want to route by declared model.
+  // `system/init` event before giving up. Default 10000 ms — `claude`
+  // startup can take 5s+ on an operator cwd loaded with hooks, skills,
+  // MCP servers, or a large CLAUDE.md (auto-discovery still runs because
+  // we deliberately *don't* use `--bare`: bare mode skips
+  // user/project settings.json, including its `model` field, which would
+  // make the probed model diverge from the model the real task spawn
+  // actually loads). Set to 0 to disable the probe entirely — the daemon
+  // will simply not advertise `params.models` in its hello card, which
+  // is harmless (the spec is advisory) but blinds clients that want to
+  // route by declared model.
   probeTimeoutMs?: number;
 }
 
@@ -1220,7 +1226,7 @@ export function createClaudeBackend(
     }
   }
 
-  const probeTimeoutMs = opts.probeTimeoutMs ?? 5000;
+  const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
 
   return {
     name: 'claude',
