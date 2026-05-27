@@ -319,33 +319,35 @@ export async function mapPartsToCodexInput(
   return { ok: true, prompt, imageFiles, tempDir };
 }
 
-// Parse codex `turn.completed.usage` (or any equivalent shape codex
-// app-server emits on the terminal turn notification) into a spec-compliant
-// OpenAICompatUsage payload.
+// Parse codex `thread/tokenUsage/updated.tokenUsage.last` into a
+// spec-compliant OpenAICompatUsage payload.
 //
-// Native shape (codex 0.130+):
-//   { input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens }
+// Native shape (codex app-server 0.134+):
+//   { totalTokens, inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens }
 //
 // Mapping per the openai-compat/v1 native-fields appendix:
-//   prompt_tokens                              = input_tokens
-//                                                (cached_input_tokens is ALREADY
-//                                                 included in input_tokens; do not
+//   prompt_tokens                              = inputTokens
+//                                                (cachedInputTokens is ALREADY
+//                                                 included in inputTokens; do not
 //                                                 add again)
-//   prompt_tokens_details.cached_tokens        = cached_input_tokens
-//   completion_tokens                          = output_tokens
-//                                                (reasoning_output_tokens is a
-//                                                 breakdown of output_tokens, not
+//   prompt_tokens_details.cached_tokens        = cachedInputTokens
+//   completion_tokens                          = outputTokens
+//                                                (reasoningOutputTokens is a
+//                                                 breakdown of outputTokens, not
 //                                                 additive)
-//   completion_tokens_details.reasoning_tokens = reasoning_output_tokens
-export function parseCodexTurnUsageForOpenAICompat(raw: unknown): OpenAICompatUsage | null {
+//   completion_tokens_details.reasoning_tokens = reasoningOutputTokens
+export function parseCodexTokenUsageForOpenAICompat(raw: unknown): OpenAICompatUsage | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const u = raw as Record<string, unknown>;
-  const input = typeof u.input_tokens === 'number' ? u.input_tokens : null;
-  const output = typeof u.output_tokens === 'number' ? u.output_tokens : null;
+  const tokenUsage = raw as Record<string, unknown>;
+  const last = tokenUsage.last;
+  if (!last || typeof last !== 'object' || Array.isArray(last)) return null;
+  const u = last as Record<string, unknown>;
+  const input = typeof u.inputTokens === 'number' ? u.inputTokens : null;
+  const output = typeof u.outputTokens === 'number' ? u.outputTokens : null;
   if (input === null || output === null) return null;
-  const cached = typeof u.cached_input_tokens === 'number' ? u.cached_input_tokens : undefined;
+  const cached = typeof u.cachedInputTokens === 'number' ? u.cachedInputTokens : undefined;
   const reasoning =
-    typeof u.reasoning_output_tokens === 'number' ? u.reasoning_output_tokens : undefined;
+    typeof u.reasoningOutputTokens === 'number' ? u.reasoningOutputTokens : undefined;
   return buildOpenAICompatUsage({
     prompt_tokens: input,
     completion_tokens: output,
@@ -574,6 +576,19 @@ interface TurnRunOutcome {
   status: 'completed' | 'failed' | 'interrupted' | 'aborted';
   error?: { message: string };
   finalText: string | null;
+}
+
+function extractAgentMessageDelta(params: unknown): string {
+  if (!params || typeof params !== 'object') return '';
+  const p = params as Record<string, unknown>;
+  if (typeof p.delta === 'string') return p.delta;
+  if (p.delta && typeof p.delta === 'object') {
+    const d = p.delta as Record<string, unknown>;
+    if (typeof d.text === 'string') return d.text;
+    if (typeof d.content === 'string') return d.content;
+  }
+  if (typeof p.text === 'string') return p.text;
+  return '';
 }
 
 export function createCodexBackend(
@@ -1347,17 +1362,22 @@ export function createCodexBackend(
             });
           }
 
-          const emitAgentArtifact = (text: string): void => {
+          let responseArtifactId: string | null = null;
+          let streamedResponseText = '';
+
+          const emitAgentArtifact = (text: string, append = false, lastChunk = true): void => {
             if (!text) return;
+            responseArtifactId ??= randomUUID();
             emit({
               type: 'task.artifact',
               taskId: task.taskId,
               artifact: {
-                artifactId: randomUUID(),
+                artifactId: responseArtifactId,
                 name: 'codex-message',
                 parts: [{ kind: 'text', text }],
               },
-              lastChunk: true,
+              ...(append ? { append: true } : {}),
+              lastChunk,
             });
             emittedAnyArtifact = true;
           };
@@ -1406,6 +1426,25 @@ export function createCodexBackend(
             };
 
             const cleanupNotifications = client.onNotification((method, params) => {
+              if (method === 'thread/tokenUsage/updated') {
+                const p = params as
+                  | {
+                      threadId?: string;
+                      turnId?: string;
+                      tokenUsage?: unknown;
+                    }
+                  | undefined;
+                if (activeTurnId && p?.turnId !== activeTurnId) return;
+                const parsed = parseCodexTokenUsageForOpenAICompat(p?.tokenUsage);
+                if (openaiCompatTrace) {
+                  console.error(
+                    `[openai-compat trace] codex tokenUsage raw=${JSON.stringify(p?.tokenUsage ?? null)} ` +
+                      `parsed=${JSON.stringify(parsed)}`,
+                  );
+                }
+                if (parsed) finalUsage = parsed;
+                return;
+              }
               if (method === 'item/completed') {
                 const p = params as { item?: ThreadItem; turnId?: string } | undefined;
                 if (activeTurnId && p?.turnId !== activeTurnId) return;
@@ -1414,7 +1453,14 @@ export function createCodexBackend(
                 if (item.type === 'agentMessage' && typeof item.text === 'string') {
                   recorder.mark('firstFinal');
                   finalText = item.text;
-                  emitAgentArtifact(item.text);
+                  if (streamedResponseText) {
+                    const tail = item.text.startsWith(streamedResponseText)
+                      ? item.text.slice(streamedResponseText.length)
+                      : '';
+                    emitAgentArtifact(tail, true, true);
+                  } else {
+                    emitAgentArtifact(item.text);
+                  }
                   return;
                 }
                 if (item.type === 'commandExecution') {
@@ -1426,6 +1472,11 @@ export function createCodexBackend(
                 const p = params as { turnId?: string } | undefined;
                 if (activeTurnId && p?.turnId !== activeTurnId) return;
                 recorder.mark('firstDelta');
+                const delta = extractAgentMessageDelta(params);
+                if (delta) {
+                  streamedResponseText += delta;
+                  emitAgentArtifact(delta, true, false);
+                }
                 return;
               }
               if (method === 'turn/completed') {
@@ -1442,15 +1493,6 @@ export function createCodexBackend(
                   | undefined;
                 const t = p?.turn;
                 if (activeTurnId && t?.id !== activeTurnId) return;
-                // openai-compat/v1 response-side usage. Best-effort: codex
-                // 0.130+ flat usage object on `turn.usage` (or `params.usage`,
-                // depending on app-server schema version). A malformed shape
-                // leaves finalUsage null and the gateway falls back to its
-                // own estimate.
-                const parsed =
-                  parseCodexTurnUsageForOpenAICompat(t?.usage) ??
-                  parseCodexTurnUsageForOpenAICompat(p?.usage);
-                if (parsed) finalUsage = parsed;
                 if (t?.status === 'completed') {
                   finish({ status: 'completed', finalText });
                 } else if (t?.status === 'interrupted') {

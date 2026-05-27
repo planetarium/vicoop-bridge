@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
-import { TaskState, type Message, type Task, type TaskStore } from '@a2x/sdk';
+import { TaskState, type Artifact, type Message, type Task, type TaskStore } from '@a2x/sdk';
 import { parseDownFrame, type AgentCard } from '@vicoop-bridge/protocol';
 import { Registry, type ClientConnection } from './registry.js';
 import {
@@ -350,6 +350,64 @@ test('executor persists inbound and agent status messages in task history', asyn
     task.history?.map((m) => m.messageId),
     ['m-4', 'agent-working', 'agent-done'],
   );
+});
+
+test('executor merges appended artifact chunks before persisting task artifacts', async () => {
+  const { ws } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'a-artifact',
+    clientId: 'c-artifact',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+  const taskStore = captureTaskStore();
+  const executor = new WSForwardingExecutor('a-artifact', registry, taskStore);
+  const task = {
+    id: 't-artifact',
+    contextId: 'ctx-artifact',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-artifact',
+  } as unknown as Message;
+
+  const gen = executor.executeStream(task, message);
+  const firstEvent = gen.next();
+  const binding = registry.getBinding('t-artifact')!;
+
+  binding.sink.pushArtifact({
+    taskId: 't-artifact',
+    contextId: 'ctx-artifact',
+    append: true,
+    artifact: { artifactId: 'response', parts: [{ text: 'one' }] },
+  });
+  binding.sink.pushArtifact({
+    taskId: 't-artifact',
+    contextId: 'ctx-artifact',
+    append: true,
+    artifact: { artifactId: 'response', parts: [{ text: ' two' }] },
+  });
+  binding.sink.pushStatus({
+    taskId: 't-artifact',
+    contextId: 'ctx-artifact',
+    final: true,
+    status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
+  });
+  binding.sink.finish();
+
+  await firstEvent;
+  for await (const _event of gen) void _event;
+
+  assert.equal(task.artifacts?.length, 1);
+  assert.deepEqual(task.artifacts?.[0]?.parts, [{ text: 'one two' }]);
+  const update = taskStore.updates.at(-1) as { artifacts?: Artifact[] };
+  assert.deepEqual(update.artifacts?.[0]?.parts, [{ text: 'one two' }]);
 });
 
 test('executor persists history when agent is unreachable', async () => {

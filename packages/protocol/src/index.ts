@@ -206,6 +206,7 @@ export const TaskArtifactFrame = z.object({
   type: z.literal('task.artifact'),
   taskId: z.string(),
   artifact: Artifact,
+  append: z.boolean().optional(),
   lastChunk: z.boolean().optional(),
 });
 

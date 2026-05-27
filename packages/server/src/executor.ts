@@ -36,6 +36,35 @@ const NOOP_RUNNER = new InMemoryRunner({
   appName: 'vicoop-bridge-noop',
 });
 
+function appendArtifactChunk(accumulated: Artifact[], event: TaskArtifactUpdateEvent): void {
+  if (event.append !== true) {
+    accumulated.push(event.artifact);
+    return;
+  }
+
+  const existing = accumulated.find((a) => a.artifactId === event.artifact.artifactId);
+  if (!existing) {
+    accumulated.push(event.artifact);
+    return;
+  }
+
+  existing.parts = mergeArtifactParts(existing.parts, event.artifact.parts);
+  existing.name = event.artifact.name ?? existing.name;
+  existing.metadata = event.artifact.metadata ?? existing.metadata;
+  existing.extensions = event.artifact.extensions ?? existing.extensions;
+}
+
+function mergeArtifactParts(existing: Artifact['parts'], chunk: Artifact['parts']): Artifact['parts'] {
+  if (existing.length === 1 && chunk.length === 1) {
+    const current = existing[0] as Record<string, unknown>;
+    const next = chunk[0] as Record<string, unknown>;
+    if (typeof current.text === 'string' && typeof next.text === 'string') {
+      return [{ ...current, text: current.text + next.text }] as Artifact['parts'];
+    }
+  }
+  return [...existing, ...chunk];
+}
+
 /**
  * Drop server-internal `_`-prefixed metadata keys (e.g. `_principalId`)
  * before forwarding a message to the connected client. The convention is
@@ -203,7 +232,7 @@ export class WSForwardingExecutor extends AgentExecutor {
           // post-stream `getTask()` path (push notifications, sync
           // `message/send`) sees the same artifacts the streaming
           // consumers received.
-          accumulatedArtifacts.push(event.artifact);
+          appendArtifactChunk(accumulatedArtifacts, event);
           yield event;
           continue;
         }

@@ -220,6 +220,7 @@ interface HappyPathOptions {
   agentMessageText?: string;
   threadId?: string;
   turnId?: string;
+  tokenUsage?: unknown;
   /**
    * After how many `turn/start` requests we should pretend the agent
    * emitted a `commandExecution` item before completing. Default 0.
@@ -302,6 +303,16 @@ function happyPath(opts: HappyPathOptions = {}): ChildScenario {
               },
             });
           }
+          if (opts.tokenUsage) {
+            child.emitStdout({
+              method: 'thread/tokenUsage/updated',
+              params: {
+                threadId: activeThreadId,
+                turnId: localTurnId,
+                tokenUsage: opts.tokenUsage,
+              },
+            });
+          }
           child.emitStdout({
             method: 'item/completed',
             params: {
@@ -344,6 +355,11 @@ function assign(
 function collect(): { emit: (f: UpFrame) => void; frames: UpFrame[] } {
   const frames: UpFrame[] = [];
   return { emit: (f) => frames.push(f), frames };
+}
+
+function artifactText(frame: Extract<UpFrame, { type: 'task.artifact' }>): string {
+  const part = frame.artifact.parts[0];
+  return part?.kind === 'text' ? part.text : '';
 }
 
 function findRequest(frames: unknown[], method: string): Record<string, unknown> | null {
@@ -415,6 +431,72 @@ test('first task runs initialize + thread/start + turn/start and emits agent art
   const last = frames.at(-1);
   assert.equal(last?.type, 'task.complete');
   assert.equal(last?.type === 'task.complete' && last.status.state, 'completed');
+});
+
+test('agentMessage deltas stream as append artifact chunks without duplicating final text', async () => {
+  const fake = makeFakeSpawn(() => {
+    let localTurnId = '';
+    return {
+      onLine(frame, child) {
+        const id = (frame as { id?: number | string }).id;
+        const method = (frame as { method?: string }).method;
+        if (method === 'initialize' && id !== undefined) {
+          child.emitStdout({
+            id,
+            result: {
+              userAgent: 'fake-codex/0.130.0',
+              codexHome: '/tmp',
+              platformFamily: 'unix',
+              platformOs: 'macos',
+            },
+          });
+          return;
+        }
+        if (method === 'thread/start' && id !== undefined) {
+          child.emitStdout({ id, result: { thread: { id: 'thr-1' } } });
+          return;
+        }
+        if (method === 'turn/start' && id !== undefined) {
+          localTurnId = 'turn-1';
+          child.emitStdout({ id, result: { turn: { id: localTurnId } } });
+          queueMicrotask(() => {
+            child.emitStdout({
+              method: 'item/agentMessage/delta',
+              params: { itemId: 'item-1', delta: 'one', turnId: localTurnId },
+            });
+            child.emitStdout({
+              method: 'item/agentMessage/delta',
+              params: { itemId: 'item-1', delta: ' two', turnId: localTurnId },
+            });
+            child.emitStdout({
+              method: 'item/completed',
+              params: {
+                turnId: localTurnId,
+                item: { type: 'agentMessage', id: 'item-1', text: 'one two' },
+              },
+            });
+            child.emitStdout({
+              method: 'turn/completed',
+              params: { turn: { id: localTurnId, status: 'completed' } },
+            });
+          });
+        }
+      },
+    };
+  });
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('hello'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  assert.equal(artifacts.length, 2);
+  assert.deepEqual(artifacts.map(artifactText), ['one', ' two']);
+  assert.equal(new Set(artifacts.map((a) => a.artifact.artifactId)).size, 1);
+  assert.deepEqual(artifacts.map((a) => a.append), [true, true]);
+  assert.equal(frames.at(-1)?.type, 'task.complete');
 });
 
 test('backend.stop() sends SIGTERM to the long-lived app-server child (#186)', async () => {
@@ -1891,6 +1973,47 @@ test('openai-compat tasks always thread/start, never thread/resume — every tur
       .params?.config?.features;
     assert.deepEqual(features, EXPECTED_OPENAI_COMPAT_DISABLES);
   }
+});
+
+test('thread/tokenUsage/updated is forwarded as openai-compat usage metadata', async () => {
+  const fake = makeFakeSpawn(() =>
+    happyPath({
+      agentMessageText: 'usage ok',
+      tokenUsage: {
+        total: {
+          totalTokens: 200,
+          inputTokens: 160,
+          cachedInputTokens: 96,
+          outputTokens: 40,
+          reasoningOutputTokens: 12,
+        },
+        last: {
+          totalTokens: 200,
+          inputTokens: 160,
+          cachedInputTokens: 96,
+          outputTokens: 40,
+          reasoningOutputTokens: 12,
+        },
+        modelContextWindow: 258400,
+      },
+    }),
+  );
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('hi'), emit, NEVER);
+
+  const complete = frames.find((f) => f.type === 'task.complete');
+  assert.ok(complete && complete.type === 'task.complete');
+  assert.deepEqual(complete.status.message?.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+  const payload = complete.status.message?.metadata?.[OPENAI_COMPAT_EXTENSION_URI] as {
+    usage?: Record<string, unknown>;
+  };
+  assert.equal(payload?.usage?.prompt_tokens, 160);
+  assert.equal(payload?.usage?.completion_tokens, 40);
+  assert.equal(payload?.usage?.total_tokens, 200);
+  assert.deepEqual(payload?.usage?.prompt_tokens_details, { cached_tokens: 96 });
+  assert.deepEqual(payload?.usage?.completion_tokens_details, { reasoning_tokens: 12 });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
