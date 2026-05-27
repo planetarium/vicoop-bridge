@@ -77,6 +77,7 @@ export const whoamiCmd = command(
   {
     brief: message`[deprecated] Use \`auth whoami\`.`,
     description: message`Deprecated alias for \`vicoop-client auth whoami\`. Will be removed in a future release.`,
+    hidden: 'help',
   },
 );
 

@@ -72,6 +72,7 @@ export const logoutCmd = command(
   {
     brief: message`[deprecated] Use \`auth logout\`.`,
     description: message`Deprecated alias for \`vicoop-client auth logout\`. Will be removed in a future release.`,
+    hidden: 'help',
   },
 );
 

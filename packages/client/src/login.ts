@@ -65,6 +65,10 @@ export const loginCmd = command(
   {
     brief: message`[deprecated] Use \`auth login\`.`,
     description: message`Deprecated alias for \`vicoop-client auth login\`. Will be removed in a future release.`,
+    // Drops out of the top-level usage + brief listing; `vicoop-client login
+    // --help` and typo suggestions still resolve so the runtime deprecation
+    // warning is discoverable.
+    hidden: 'help',
   },
 );
 
