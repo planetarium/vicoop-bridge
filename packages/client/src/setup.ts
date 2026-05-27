@@ -57,6 +57,7 @@ export const setupCmd = command(
   {
     brief: message`[deprecated] Use \`agent register\`.`,
     description: message`Deprecated alias for \`vicoop-client agent register\`. Calls the bridge's \`registerClient\` GraphQL mutation, persists daemon credentials to \`~/.vicoop/config.json\`, and supports \`--write-env-file\` for an optional shell-sourceable env file. Will be removed in a future release.`,
+    hidden: 'help',
   },
 );
 

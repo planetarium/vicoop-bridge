@@ -980,6 +980,7 @@ export const containerCmd = command(
   {
     brief: message`Manage per-backend runtime containers.`,
     description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<name>\`, install the agent CLI, optionally copy host creds), \`ls\` / \`list\` (show managed runtime container and volume state), \`rm\` / \`remove\` (remove a runtime container and volumes by name). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
+    hidden: 'usage',
   },
 );
 

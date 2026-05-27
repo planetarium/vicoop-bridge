@@ -321,6 +321,12 @@ wizard() {
 # `info`, `upgrade`, `auth login` are passed through unchanged — operators
 # need them to work whether or not config has been bootstrapped yet (e.g.
 # `docker run ... vicoop-client info` for compat checks from outside).
+#
+# The bridge client itself no longer treats bare argv as "start the
+# daemon" — empty argv now prints help and exits 0. The entrypoint
+# preserves the historical `docker run … <image>` ergonomics by
+# translating the daemon-shaped invocations (no args / flags-only) into
+# explicit `vicoop-client start "$@"` before the final exec.
 is_daemon_invocation() {
     [[ $# -eq 0 ]] && return 0
     case "$1" in
@@ -351,9 +357,11 @@ if is_daemon_invocation "$@"; then
         compat_check
     fi
     maybe_init_firewall
+    # exec replaces this shell so signals from tini reach vicoop-client
+    # directly (no double-process orphaning of agent CLI children).
+    exec vicoop-client start "$@"
 fi
 
-# Hand off to the bridge client. exec replaces this shell so signals from
-# tini reach vicoop-client directly (no double-process orphaning of agent
-# CLI children).
+# Non-daemon subcommand: pass through unchanged so `docker run … <image>
+# info` / `… auth login` still work.
 exec vicoop-client "$@"

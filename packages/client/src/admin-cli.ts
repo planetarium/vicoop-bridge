@@ -34,7 +34,8 @@ const sharedFlags = {
 // ----- New `agent <sub>` command group (#218) --------------------------------
 // `agent` is the operator-facing primary resource. The legacy `list-agents` /
 // `list-clients` / `revoke-client` / `{add,remove,list}-caller` commands below
-// remain as deprecated aliases (see DEPRECATION_HINTS).
+// remain as deprecated aliases; each handler calls `warnDeprecated` before
+// dispatching to the new shape.
 
 const agentListSubCmd = command(
   'list',
@@ -121,6 +122,7 @@ export const agentCmd = command(
   {
     brief: message`Manage agent registrations and their allowed callers.`,
     description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`delete\`, \`callers {list,add,remove}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    hidden: 'usage',
   },
 );
 
@@ -132,6 +134,12 @@ export type AgentCallersAddArgs = Extract<AgentCliArgs, { action: 'agent-callers
 export type AgentCallersRemoveArgs = Extract<AgentCliArgs, { action: 'agent-callers-remove' }>;
 
 // ----- Legacy flat commands (deprecated, kept as aliases) --------------------
+//
+// `hidden: 'help'` drops these from both the Usage: block and the brief
+// listing at top-level help, while keeping scoped help
+// (`vicoop-client add-caller --help`) and "did you mean?" suggestions —
+// so operators still on the old form discover the deprecation warning
+// from runtime stderr and from the per-command help page.
 
 export const addCallerCmd = command(
   'add-caller',
@@ -144,6 +152,7 @@ export const addCallerCmd = command(
   {
     brief: message`[deprecated] Use \`agent callers add\`.`,
     description: message`Deprecated alias for \`vicoop-client agent callers add\`. Will be removed in a future release.`,
+    hidden: 'help',
   },
 );
 
@@ -158,6 +167,7 @@ export const removeCallerCmd = command(
   {
     brief: message`[deprecated] Use \`agent callers remove\`.`,
     description: message`Deprecated alias for \`vicoop-client agent callers remove\`. Will be removed in a future release.`,
+    hidden: 'help',
   },
 );
 
@@ -171,6 +181,7 @@ export const listCallersCmd = command(
   {
     brief: message`[deprecated] Use \`agent callers list\`.`,
     description: message`Deprecated alias for \`vicoop-client agent callers list\`. Will be removed in a future release.`,
+    hidden: 'help',
   },
 );
 
@@ -183,6 +194,7 @@ export const listAgentsCmd = command(
   {
     brief: message`[deprecated] Use \`agent list --connected\`.`,
     description: message`Deprecated alias for \`vicoop-client agent list --connected\`. Will be removed in a future release.`,
+    hidden: 'help',
   },
 );
 
@@ -195,6 +207,7 @@ export const listClientsCmd = command(
   {
     brief: message`[deprecated] Use \`agent list\`.`,
     description: message`Deprecated alias for \`vicoop-client agent list\`. Will be removed in a future release.`,
+    hidden: 'help',
   },
 );
 
@@ -208,6 +221,7 @@ export const revokeClientCmd = command(
   {
     brief: message`[deprecated] Use \`agent delete\`.`,
     description: message`Deprecated alias for \`vicoop-client agent delete\`. Hard-deletes the agent (renamed from revoke). Will be removed in a future release.`,
+    hidden: 'help',
   },
 );
 

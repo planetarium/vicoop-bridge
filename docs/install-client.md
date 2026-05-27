@@ -482,19 +482,27 @@ JSON
 
 ## Step 6 — Run the client
 
-Run the client in the foreground first. With `config.json` written by Step 4,
-the daemon picks up `server_url`, `server_token`, and `agent_id` on its own;
+Run the client in the foreground first. The daemon entrypoint is the
+explicit `start` subcommand. With `config.json` written by Step 4 the
+daemon picks up `server_url`, `server_token`, and `agent_id` on its own;
 pick the backend with `--backend`:
 
 ```sh
-vicoop-client --backend openclaw
+vicoop-client start --backend openclaw
 ```
 
 Precedence at startup is **CLI flag > `--config <path>` > canonical
 `config.json` > built-in default**. Env vars are not consulted for
 runtime config (#189 §5). With `"backend": "openclaw"` persisted in
 `config.json`, the daemon needs no flags at all:
-`vicoop-client`.
+`vicoop-client start`.
+
+> Bare `vicoop-client` (no subcommand) prints the top-level help and
+> exits 0; it no longer starts the daemon. Earlier releases booted the
+> daemon on empty argv, which made an operator who just wanted to see
+> the help inadvertently open the WS. The flags-only form
+> (`vicoop-client --backend ...`) is rejected with a parse error now —
+> use `vicoop-client start --backend ...` instead.
 
 On success you'll see a `[client] connected, sending hello` log followed
 by an identity block — same data `vicoop-client auth whoami` would print, so
@@ -577,7 +585,7 @@ For the Claude backend, pass `--backend claude` (or persist
 different repository than the one `vicoop-client` itself runs in:
 
 ```sh
-vicoop-client \
+vicoop-client start \
   --backend claude \
   --cwd "$HOME/vicoop-bridge"
 ```
@@ -585,7 +593,7 @@ vicoop-client \
 Both knobs can also live in the canonical `config.json` (resolved per Step
 4 — `~/.vicoop/config.json` by default) under `backends.claude`
 (`cwd`, `settings`) so the foreground command shrinks to just
-`vicoop-client`; the flag wins over config, mirroring
+`vicoop-client start`; the flag wins over config, mirroring
 the daemon-level precedence (Step 6 intro).
 
 | Flag | `backends.claude.*` |
@@ -676,7 +684,7 @@ For the Codex backend, pass `--backend codex` (or persist
 different repository / loosen the sandbox:
 
 ```sh
-vicoop-client \
+vicoop-client start \
   --backend codex \
   --cwd "$HOME/vicoop-bridge" \
   --codex-sandbox workspace-write
@@ -684,7 +692,7 @@ vicoop-client \
 
 Both knobs can also live in the canonical `config.json` (resolved per Step
 4 — `~/.vicoop/config.json` by default) under `backends.codex` so the
-foreground command can shrink to just `vicoop-client`.
+foreground command can shrink to just `vicoop-client start`.
 The flag wins over config.
 
 | Flag | `backends.codex.*` |
