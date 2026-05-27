@@ -380,12 +380,12 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       });
       return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };
     }
-    case 'vicoop-codex':
-      return {
-        backend: createVicoopCodexBackend({
-          openaiCompatTrace: args.openaiCompatTrace,
-        }),
-      };
+    case 'vicoop-codex': {
+      const { backend, shutdown } = createVicoopCodexBackend({
+        openaiCompatTrace: args.openaiCompatTrace,
+      });
+      return { backend, shutdown };
+    }
     default:
       throw new Error(
         `unknown backend: ${name} (supported: echo, openclaw, claude, codex, vicoop-codex)`,

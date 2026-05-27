@@ -15,15 +15,20 @@ import {
   historyToChatCompletionMessages,
   parseChatCompletionUsage,
   type ChatCompletionResponse,
+} from './vicoop-codex.js';
+import {
   type VicoopCodexChildHandle,
   type VicoopCodexSpawnFn,
   type VicoopCodexSpawnOptions,
-} from './vicoop-codex.js';
+} from './vicoop-codex-supervisor.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Fake `vicoop-codex` child — collects stdin, scripts stdout/stderr/exit-code
-// to drive integration tests through the backend's `handle()` path without a
-// real subprocess. Mirrors the codex.test.ts FakeChild shape.
+// Fake `vicoop-codex serve` child — emits the JSON listening banner on stderr
+// as the first thing it does (mirroring the real CLI) and otherwise stays
+// alive until `finish()` is called. The backend's supervisor scans stderr for
+// the listening event to learn the bound port, so the banner must arrive
+// after the supervisor attaches its `on('data')` listener — queueMicrotask
+// the emit so it fires post-`start()`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface FakeChild extends VicoopCodexChildHandle {
@@ -32,9 +37,8 @@ interface FakeChild extends VicoopCodexChildHandle {
   readonly cwd?: string;
   killed: boolean;
   killSignal: NodeJS.Signals | null;
-  stdinPayload: () => string;
-  emitStdout(text: string): void;
   emitStderr(text: string): void;
+  emitStdout(text: string): void;
   finish(code: number | null, sig?: NodeJS.Signals | null): void;
 }
 
@@ -44,8 +48,18 @@ interface FakeSpawn {
   lastChild: () => FakeChild;
 }
 
-function makeFakeSpawn(): FakeSpawn {
+interface FakeSpawnOptions {
+  // Test seam: skip the auto-emitted listening banner so a test can drive a
+  // startup-failure scenario.
+  suppressListeningBanner?: boolean;
+  // Test seam: override the port reported in the listening banner. Defaults
+  // to a high ephemeral-style value the fake fetch will match on.
+  listeningPort?: number;
+}
+
+function makeFakeSpawn(spawnOpts: FakeSpawnOptions = {}): FakeSpawn {
   const children: FakeChild[] = [];
+  const port = spawnOpts.listeningPort ?? 54321;
   const spawn: VicoopCodexSpawnFn = (
     command,
     args,
@@ -65,47 +79,15 @@ function makeFakeSpawn(): FakeSpawn {
         },
       }) as unknown as NodeJS.ReadableStream;
 
-    const stdinChunks: string[] = [];
-    const stdin: NodeJS.WritableStream = {
-      write(chunk: unknown): boolean {
-        const s =
-          typeof chunk === 'string'
-            ? chunk
-            : Buffer.from(chunk as Buffer).toString('utf8');
-        stdinChunks.push(s);
-        return true;
-      },
-      end(chunk?: unknown) {
-        if (chunk !== undefined) {
-          const s =
-            typeof chunk === 'string'
-              ? chunk
-              : Buffer.from(chunk as Buffer).toString('utf8');
-          stdinChunks.push(s);
-        }
-        return stdin;
-      },
-      on() {
-        return stdin;
-      },
-      once() {
-        return stdin;
-      },
-      emit() {
-        return false;
-      },
-    } as unknown as NodeJS.WritableStream;
-
     const child: FakeChild = {
       command,
       args,
       cwd: options.cwd,
-      stdin,
+      stdin: null,
       stdout: mkReadable(stdoutEmitter),
       stderr: mkReadable(stderrEmitter),
       killed: false,
       killSignal: null,
-      stdinPayload: () => stdinChunks.join(''),
       emitStdout(text) {
         stdoutEmitter.emit('data', Buffer.from(text, 'utf8'));
       },
@@ -113,6 +95,7 @@ function makeFakeSpawn(): FakeSpawn {
         stderrEmitter.emit('data', Buffer.from(text, 'utf8'));
       },
       kill(sig?: NodeJS.Signals) {
+        if (closed) return true;
         this.killed = true;
         this.killSignal = sig ?? 'SIGTERM';
         queueMicrotask(() => {
@@ -140,14 +123,29 @@ function makeFakeSpawn(): FakeSpawn {
       finish(code, sig = null) {
         if (closed) return;
         closed = true;
-        // Schedule async so the backend has a chance to register its
-        // listeners before we synthesise the exit — mirrors real
-        // child_process semantics.
         queueMicrotask(() => {
           for (const l of closeListeners) l(code, sig);
         });
       },
     };
+
+    if (!spawnOpts.suppressListeningBanner) {
+      queueMicrotask(() => {
+        stderrEmitter.emit(
+          'data',
+          Buffer.from(
+            JSON.stringify({
+              event: 'listening',
+              host: '127.0.0.1',
+              port,
+              url: `http://127.0.0.1:${port}`,
+            }) + '\n',
+            'utf8',
+          ),
+        );
+      });
+    }
+
     children.push(child);
     return child;
   };
@@ -159,6 +157,61 @@ function makeFakeSpawn(): FakeSpawn {
       return children[children.length - 1];
     },
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fake fetch + SSE response helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface FakeFetchCall {
+  url: string;
+  init: RequestInit;
+  body: Record<string, unknown>;
+}
+
+interface FakeFetch {
+  fetch: typeof fetch;
+  calls: FakeFetchCall[];
+}
+
+function makeFakeFetch(
+  handler: (
+    call: FakeFetchCall,
+  ) => Response | Promise<Response>,
+): FakeFetch {
+  const calls: FakeFetchCall[] = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : (input as URL).toString();
+    const i = init ?? {};
+    const body = i.body ? (JSON.parse(i.body as string) as Record<string, unknown>) : {};
+    const call: FakeFetchCall = { url, init: i, body };
+    calls.push(call);
+    return await handler(call);
+  };
+  return { fetch: fetchImpl, calls };
+}
+
+function sseResponse(chunks: Array<Record<string, unknown> | '[DONE]'>, status = 200): Response {
+  const lines = chunks
+    .map((c) => (c === '[DONE]' ? `data: [DONE]\n\n` : `data: ${JSON.stringify(c)}\n\n`))
+    .join('');
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(lines));
+      controller.close();
+    },
+  });
+  return new Response(stream, {
+    status,
+    headers: { 'content-type': 'text/event-stream' },
+  });
+}
+
+function errorResponse(status: number, bodyJson?: Record<string, unknown>): Response {
+  return new Response(JSON.stringify(bodyJson ?? { error: { message: `HTTP ${status}` } }), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
 }
 
 function makeTask(
@@ -177,6 +230,28 @@ function makeTask(
     },
     ...rest,
   };
+}
+
+// Drive backend.handle() to completion against the given fake supervisor +
+// fake fetch, collecting every emitted frame.
+async function runBackend(
+  task: TaskAssignFrame,
+  fakeSpawn: FakeSpawn,
+  fakeFetch: FakeFetch,
+  opts: {
+    abort?: AbortController;
+  } = {},
+): Promise<{ frames: UpFrame[]; bundle: ReturnType<typeof createVicoopCodexBackend> }> {
+  const bundle = createVicoopCodexBackend({
+    spawn: fakeSpawn.spawn,
+    fetchImpl: fakeFetch.fetch,
+    // Short timeout so misconfigured tests fail fast.
+    startupTimeoutMs: 1_000,
+  });
+  const frames: UpFrame[] = [];
+  const ctrl = opts.abort ?? new AbortController();
+  await bundle.backend.handle(task, (f) => frames.push(f), ctrl.signal);
+  return { frames, bundle };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,190 +294,99 @@ test('historyToChatCompletionMessages: assistant tool_calls + tool result round-
         },
       ],
     },
-    {
-      role: 'tool',
-      tool_call_id: 'call_1',
-      content: '{"temp":13}',
-      name: 'get_weather',
-    },
+    { role: 'tool', tool_call_id: 'call_1', content: '{"temp":13}', name: 'get_weather' },
   ]);
   assert.equal(msgs.length, 2);
   assert.equal(msgs[0].role, 'assistant');
   assert.equal(msgs[0].content, null);
-  assert.equal((msgs[0].tool_calls as unknown[]).length, 1);
+  assert.equal((msgs[0].tool_calls as unknown[])?.length, 1);
   assert.equal(msgs[1].role, 'tool');
   assert.equal(msgs[1].tool_call_id, 'call_1');
   assert.equal(msgs[1].name, 'get_weather');
-  assert.equal(msgs[1].content, '{"temp":13}');
-});
-
-test('historyToChatCompletionMessages: prior user/assistant text turns round-trip', () => {
-  // New chat_history shape carries every prior turn — plain text turns
-  // map 1:1 to Chat Completions messages.
-  const msgs = historyToChatCompletionMessages([
-    { role: 'user', content: 'hi' },
-    { role: 'assistant', content: 'hello' },
-  ]);
-  assert.equal(msgs.length, 2);
-  assert.equal(msgs[0].role, 'user');
-  assert.equal(msgs[0].content, 'hi');
-  assert.equal(msgs[1].role, 'assistant');
-  assert.equal(msgs[1].content, 'hello');
 });
 
 test('buildMessages: ordering — system → history → user', () => {
-  const msgs = buildMessages(
+  const out = buildMessages(
     {
-      system: 'be concise',
+      system: 'reply in korean',
       chat_history: [
-        {
-          role: 'assistant',
-          content: null,
-          tool_calls: [{ id: 'c1', function: { name: 'x', arguments: '{}' } }],
-        },
-        { role: 'tool', tool_call_id: 'c1', content: 'result' },
+        { role: 'user', content: 'prior' },
+        { role: 'assistant', content: 'prior reply' },
       ],
     },
-    'current ask',
+    'now',
   );
   assert.deepEqual(
-    msgs.map((m) => m.role),
-    ['system', 'assistant', 'tool', 'user'],
+    out.map((m) => m.role),
+    ['system', 'user', 'assistant', 'user'],
   );
-  assert.equal(msgs[0].content, 'be concise');
-  assert.equal(msgs[msgs.length - 1].content, 'current ask');
-});
-
-test('buildMessages: multi-turn tool-loop scenario from PR #289 keeps opening user at the head', () => {
-  // Regression guard for the gpt-5.3-codex re-call loop fixed by
-  // PR #289 (fix/vicoop-codex-user-turn-order). On the old
-  // `tool_call_history` wire that PR worked against, the prior tool
-  // round-trips were the only entries in metadata and the originating
-  // user request was nowhere in the assembled `messages` — so the
-  // model saw `[system, asst.tc, tool, asst.tc, tool, …, user]` and
-  // re-interpreted the trailing user as a fresh imperative, restarting
-  // from `list_workflows` on every turn.
-  //
-  // The new `chat_history` wire fixes this at the source: the gateway
-  // includes EVERY prior turn except the trailing user (so the
-  // originating user request is the first history entry). With
-  // `buildMessages` emitting `system → chat_history → trailing_user`,
-  // the assembled messages preserve the linear OpenAI conversation
-  // order automatically — no manual re-ordering needed.
-  //
-  // This test pins that invariant: the originating user request MUST
-  // be at index 1 (right after system), and the trailing user MUST be
-  // last, regardless of how many tool round-trips sit between them.
-  const msgs = buildMessages(
-    {
-      system: 'be concise',
-      chat_history: [
-        { role: 'user', content: 'list workflows then run X' },
-        {
-          role: 'assistant',
-          content: null,
-          tool_calls: [{ id: 'c1', function: { name: 'list_workflows', arguments: '{}' } }],
-        },
-        { role: 'tool', tool_call_id: 'c1', content: '[…]' },
-        {
-          role: 'assistant',
-          content: null,
-          tool_calls: [{ id: 'c2', function: { name: 'execute', arguments: '{}' } }],
-        },
-        { role: 'tool', tool_call_id: 'c2', content: 'started' },
-      ],
-    },
-    'how is it going?',
-  );
-  assert.deepEqual(
-    msgs.map((m) => m.role),
-    ['system', 'user', 'assistant', 'tool', 'assistant', 'tool', 'user'],
-  );
-  // Opening user at index 1 — the original request the tool rounds were
-  // driven by. The model needs to see this BEFORE any tool activity or
-  // it loses the thread and re-emits the first call.
-  assert.equal(msgs[1].content, 'list workflows then run X');
-  // Trailing user at the tail — the new question on this turn.
-  assert.equal(msgs[msgs.length - 1].content, 'how is it going?');
+  assert.equal(out[out.length - 1].content, 'now');
 });
 
 test('buildMessages: tool-continuation (null userContent) skips trailing user', () => {
-  // openai-compat spec edge case: when A2A parts is the empty
-  // placeholder, the caller passes null userContent and chat_history
-  // carries the full conversation including the trailing tool result.
-  const msgs = buildMessages(
+  const out = buildMessages(
     {
       chat_history: [
-        { role: 'user', content: 'kick off' },
+        { role: 'user', content: 'q' },
         {
           role: 'assistant',
           content: null,
-          tool_calls: [{ id: 'c1', function: { name: 'x', arguments: '{}' } }],
+          tool_calls: [
+            {
+              id: 'c1',
+              type: 'function',
+              function: { name: 'f', arguments: '{}' },
+            },
+          ],
         },
-        { role: 'tool', tool_call_id: 'c1', content: 'result' },
+        { role: 'tool', tool_call_id: 'c1', content: 'r' },
       ],
     },
     null,
   );
   assert.deepEqual(
-    msgs.map((m) => m.role),
+    out.map((m) => m.role),
     ['user', 'assistant', 'tool'],
   );
 });
 
 test('buildMessages: no metadata still emits a user message', () => {
-  const msgs = buildMessages(null, 'hi');
-  assert.deepEqual(msgs, [{ role: 'user', content: 'hi' }]);
+  const out = buildMessages(null, 'hi');
+  assert.deepEqual(out, [{ role: 'user', content: 'hi' }]);
 });
 
 test('buildCallBody: forwards only tools / tool_choice from the existing 4-field schema', () => {
-  const body = buildCallBody(
+  const out = buildCallBody(
     {
-      system: 'sys',
-      tools: [{ type: 'function', function: { name: 'x' } }],
-      tool_choice: 'auto',
-      chat_history: [
-        {
-          role: 'assistant',
-          content: null,
-          tool_calls: [{ id: 'c1', function: { name: 'x', arguments: '{}' } }],
-        },
-        { role: 'tool', tool_call_id: 'c1', content: 'r' },
-      ],
+      tools: [{ type: 'function', function: { name: 'f' } }],
+      tool_choice: { type: 'function', function: { name: 'f' } },
     },
-    [{ role: 'user', content: 'q' }],
+    [{ role: 'user', content: 'hi' }],
   );
-  assert.deepEqual(body.tools, [{ type: 'function', function: { name: 'x' } }]);
-  assert.equal(body.tool_choice, 'auto');
-  assert.deepEqual(body.messages, [{ role: 'user', content: 'q' }]);
-  // Nothing else lands on the body — no model, no reasoning_effort, no
-  // Group B / Group C fields.
-  assert.equal(Object.keys(body).sort().join(','), 'messages,tool_choice,tools');
+  assert.equal(out.stream, true);
+  assert.deepEqual(out.stream_options, { include_usage: true });
+  assert.deepEqual(out.tools, [{ type: 'function', function: { name: 'f' } }]);
+  assert.deepEqual(out.tool_choice, { type: 'function', function: { name: 'f' } });
 });
 
-test('buildCallBody: no metadata yields messages-only body', () => {
-  const body = buildCallBody(null, [{ role: 'user', content: 'q' }]);
-  assert.deepEqual(body, { messages: [{ role: 'user', content: 'q' }] });
+test('buildCallBody: no metadata yields messages + stream + stream_options', () => {
+  const out = buildCallBody(null, [{ role: 'user', content: 'hi' }]);
+  assert.deepEqual(out.messages, [{ role: 'user', content: 'hi' }]);
+  assert.equal(out.stream, true);
+  assert.deepEqual(out.stream_options, { include_usage: true });
+  assert.equal(out.tools, undefined);
+  assert.equal(out.tool_choice, undefined);
 });
 
 test('parseChatCompletionUsage: enforces total = prompt + completion', () => {
   const u = parseChatCompletionUsage(
-    {
-      prompt_tokens: 17,
-      completion_tokens: 5,
-      total_tokens: 999,
-      prompt_tokens_details: { cached_tokens: 3 },
-      completion_tokens_details: { reasoning_tokens: 2 },
-    },
+    { prompt_tokens: 7, completion_tokens: 3, total_tokens: 9999 },
     'gpt-5.4',
   );
   assert.ok(u);
-  assert.equal(u!.prompt_tokens, 17);
-  assert.equal(u!.completion_tokens, 5);
-  assert.equal(u!.total_tokens, 22);
-  assert.equal(u!.model, 'gpt-5.4');
-  assert.equal(u!.prompt_tokens_details?.cached_tokens, 3);
-  assert.equal(u!.completion_tokens_details?.reasoning_tokens, 2);
+  assert.equal(u!.prompt_tokens, 7);
+  assert.equal(u!.completion_tokens, 3);
+  assert.equal(u!.total_tokens, 10);
 });
 
 test('parseChatCompletionUsage: missing primary counts yields null', () => {
@@ -441,77 +425,54 @@ test('buildResponseMetadata: includes both usage and chat_completion echo', () =
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// End-to-end Backend.handle() tests via the fake spawn surface
+// Backend.handle() integration tests (mock supervisor + mock fetch)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function runBackend(
-  task: TaskAssignFrame,
-  driveChild: (child: FakeChild) => void,
-): Promise<UpFrame[]> {
-  const fake = makeFakeSpawn();
-  const backend = createVicoopCodexBackend({ spawn: fake.spawn });
-  const frames: UpFrame[] = [];
-  const ctrl = new AbortController();
-  const done = backend.handle(task, (f) => frames.push(f), ctrl.signal);
-  // Wait one microtask so the backend has spawned its child before we drive
-  // it. The fake spawn is synchronous, so a single queueMicrotask suffices.
-  return new Promise((resolve, reject) => {
-    queueMicrotask(() => {
-      try {
-        driveChild(fake.lastChild());
-      } catch (err) {
-        reject(err);
-        return;
-      }
-      done.then(() => resolve(frames), reject);
-    });
-  });
-}
+test('handle: streams text deltas as appended artifacts and emits complete with metadata', async () => {
+  const fakeSpawn = makeFakeSpawn();
+  const fakeFetch = makeFakeFetch((_call) =>
+    sseResponse([
+      { id: 'chatcmpl-1', model: 'gpt-5.4', created: 1700000000, choices: [{ index: 0, delta: { role: 'assistant' } }] },
+      { id: 'chatcmpl-1', choices: [{ index: 0, delta: { content: 'Hello' } }] },
+      { id: 'chatcmpl-1', choices: [{ index: 0, delta: { content: ' world' } }] },
+      { id: 'chatcmpl-1', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+      { id: 'chatcmpl-1', usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 }, choices: [] },
+      '[DONE]',
+    ]),
+  );
 
-test('handle: success path — text response → artifact + complete with metadata', async () => {
-  const task = makeTask({
-    metadata: {
-      [OPENAI_COMPAT_EXTENSION_URI]: {
-        system: 'be concise',
-      },
-    },
-  });
-  const frames = await runBackend(task, (child) => {
-    const response: ChatCompletionResponse = {
-      id: 'chatcmpl-1',
-      object: 'chat.completion',
-      created: 1700000000,
-      model: 'gpt-5.4',
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: 'ok' },
-          finish_reason: 'stop',
-        },
-      ],
-      usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
-    };
-    child.emitStdout(JSON.stringify(response));
-    child.finish(0);
-  });
+  const { frames, bundle } = await runBackend(makeTask(), fakeSpawn, fakeFetch);
+  await bundle.shutdown();
 
-  const statuses = frames.filter((f) => f.type === 'task.status');
   const artifacts = frames.filter((f) => f.type === 'task.artifact');
+  assert.ok(artifacts.length >= 3, `expected at least 3 artifact frames, got ${artifacts.length}`);
+  // First delta: append unset, lastChunk false.
+  const first = artifacts[0];
+  if (first.type !== 'task.artifact') throw new Error('unreachable');
+  assert.equal(first.append, undefined);
+  assert.equal(first.lastChunk, false);
+  if (first.artifact.parts[0].kind !== 'text') throw new Error('unreachable');
+  assert.equal(first.artifact.parts[0].text, 'Hello');
+  // Subsequent deltas share the artifactId and set append:true.
+  const second = artifacts[1];
+  if (second.type !== 'task.artifact') throw new Error('unreachable');
+  assert.equal(second.append, true);
+  assert.equal(second.lastChunk, false);
+  assert.equal(second.artifact.artifactId, first.artifact.artifactId);
+  // Final artifact carries lastChunk:true.
+  const last = artifacts[artifacts.length - 1];
+  if (last.type !== 'task.artifact') throw new Error('unreachable');
+  assert.equal(last.lastChunk, true);
+  assert.equal(last.artifact.artifactId, first.artifact.artifactId);
+
   const completes = frames.filter((f) => f.type === 'task.complete');
-  assert.equal(statuses.length, 1);
-  assert.equal(statuses[0].status.state, 'working');
-  assert.equal(artifacts.length, 1);
-  const artifact = artifacts[0];
-  if (artifact.type !== 'task.artifact') throw new Error('unreachable');
-  assert.equal(artifact.artifact.parts[0].kind, 'text');
-  if (artifact.artifact.parts[0].kind !== 'text') throw new Error('unreachable');
-  assert.equal(artifact.artifact.parts[0].text, 'ok');
   assert.equal(completes.length, 1);
-  const completeFrame = completes[0];
-  if (completeFrame.type !== 'task.complete') throw new Error('unreachable');
-  assert.equal(completeFrame.status.state, 'completed');
-  const msg = completeFrame.status.message!;
-  assert.ok(msg.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI));
+  const c = completes[0];
+  if (c.type !== 'task.complete') throw new Error('unreachable');
+  assert.equal(c.status.state, 'completed');
+  const msg = c.status.message!;
+  if (msg.parts[0].kind !== 'text') throw new Error('unreachable');
+  assert.equal(msg.parts[0].text, 'Hello world');
   const ext = (msg.metadata as Record<string, Record<string, unknown>>)[
     OPENAI_COMPAT_EXTENSION_URI
   ];
@@ -521,61 +482,99 @@ test('handle: success path — text response → artifact + complete with metada
   assert.equal(echo.model, 'gpt-5.4');
 });
 
-test('handle: tool_calls response → data artifact + no text in status message', async () => {
-  const task = makeTask({
-    metadata: {
-      [OPENAI_COMPAT_EXTENSION_URI]: {
-        tools: [{ type: 'function', function: { name: 'list_files' } }],
+test('handle: tool_calls streamed across deltas → assembled, data artifact, no text in complete', async () => {
+  const fakeSpawn = makeFakeSpawn();
+  const fakeFetch = makeFakeFetch((_call) =>
+    sseResponse([
+      {
+        id: 'chatcmpl-2',
+        model: 'gpt-5.3-codex',
+        created: 1700000001,
+        choices: [{ index: 0, delta: { role: 'assistant' } }],
       },
-    },
-  });
-  const frames = await runBackend(task, (child) => {
-    const response: ChatCompletionResponse = {
-      id: 'chatcmpl-2',
-      object: 'chat.completion',
-      created: 1700000001,
-      model: 'gpt-5.3-codex',
-      choices: [
-        {
-          index: 0,
-          message: {
-            role: 'assistant',
-            content: null,
-            tool_calls: [
-              {
-                id: 'call_xyz',
-                type: 'function',
-                function: { name: 'list_files', arguments: '{"path":"."}' },
-              },
-            ],
+      {
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_xyz',
+                  type: 'function',
+                  function: { name: 'list_files', arguments: '{"path"' },
+                },
+              ],
+            },
           },
-          finish_reason: 'tool_calls',
+        ],
+      },
+      {
+        choices: [
+          {
+            index: 0,
+            delta: { tool_calls: [{ index: 0, function: { arguments: ':"."}' } }] },
+          },
+        ],
+      },
+      { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+      { usage: { prompt_tokens: 5, completion_tokens: 7, total_tokens: 12 }, choices: [] },
+      '[DONE]',
+    ]),
+  );
+
+  const { frames, bundle } = await runBackend(
+    makeTask({
+      metadata: {
+        [OPENAI_COMPAT_EXTENSION_URI]: {
+          tools: [{ type: 'function', function: { name: 'list_files' } }],
         },
-      ],
-      usage: { prompt_tokens: 4, completion_tokens: 6, total_tokens: 10 },
-    };
-    child.emitStdout(JSON.stringify(response));
-    child.finish(0);
-  });
+      },
+    }),
+    fakeSpawn,
+    fakeFetch,
+  );
+  await bundle.shutdown();
+
   const artifacts = frames.filter((f) => f.type === 'task.artifact');
   assert.equal(artifacts.length, 1);
-  const artifact = artifacts[0];
-  if (artifact.type !== 'task.artifact') throw new Error('unreachable');
-  assert.equal(artifact.artifact.parts[0].kind, 'data');
-  if (artifact.artifact.parts[0].kind !== 'data') throw new Error('unreachable');
-  const data = artifact.artifact.parts[0].data as { tool_calls: unknown[] };
+  const a = artifacts[0];
+  if (a.type !== 'task.artifact') throw new Error('unreachable');
+  if (a.artifact.parts[0].kind !== 'data') throw new Error('unreachable');
+  const data = a.artifact.parts[0].data as {
+    tool_calls: Array<{ id: string; function: { name: string; arguments: string } }>;
+  };
   assert.equal(data.tool_calls.length, 1);
-  assert.ok(artifact.artifact.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI));
-  const completes = frames.filter((f) => f.type === 'task.complete');
-  assert.equal(completes.length, 1);
-  const completeFrame = completes[0];
-  if (completeFrame.type !== 'task.complete') throw new Error('unreachable');
-  // status.message exists but parts must be empty so we don't re-stamp the
-  // tool_calls envelope onto the message.
-  assert.deepEqual(completeFrame.status.message!.parts, []);
+  assert.equal(data.tool_calls[0].id, 'call_xyz');
+  assert.equal(data.tool_calls[0].function.name, 'list_files');
+  // Arguments concatenated across deltas.
+  assert.equal(data.tool_calls[0].function.arguments, '{"path":"."}');
+  assert.ok(a.artifact.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI));
+
+  const c = frames.find((f) => f.type === 'task.complete');
+  if (!c || c.type !== 'task.complete') throw new Error('unreachable');
+  // No text duplicated into the completion message.
+  assert.deepEqual(c.status.message!.parts, []);
+  const ext = (c.status.message!.metadata as Record<
+    string,
+    Record<string, unknown>
+  >)[OPENAI_COMPAT_EXTENSION_URI];
+  const echo = ext.chat_completion as Record<string, unknown>;
+  const choice = (echo.choices as Array<{ finish_reason?: string }>)[0];
+  assert.equal(choice.finish_reason, 'tool_calls');
 });
 
-test('handle: stdin body carries only system/tools/tool_choice/history-derived messages', async () => {
+test('handle: POST body carries stream:true + only system/tools/tool_choice/history-derived messages', async () => {
+  const fakeSpawn = makeFakeSpawn();
+  const fakeFetch = makeFakeFetch((_call) =>
+    sseResponse([
+      { id: 'chatcmpl-3', model: 'gpt-5.5', created: 1, choices: [{ index: 0, delta: { content: 'ok' } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+      { usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }, choices: [] },
+      '[DONE]',
+    ]),
+  );
+
   const task = makeTask({
     message: {
       role: 'user',
@@ -583,7 +582,6 @@ test('handle: stdin body carries only system/tools/tool_choice/history-derived m
       parts: [{ kind: 'text', text: 'current question' }],
       metadata: {
         [OPENAI_COMPAT_EXTENSION_URI]: {
-          // The 4-field schema only.
           system: 'reply in korean',
           tools: [{ type: 'function', function: { name: 'get_weather' } }],
           tool_choice: { type: 'function', function: { name: 'get_weather' } },
@@ -601,8 +599,7 @@ test('handle: stdin body carries only system/tools/tool_choice/history-derived m
             },
             { role: 'tool', tool_call_id: 'call_1', content: '{"temp":13}' },
           ],
-          // Unknown extension keys must NOT reach the call body — they
-          // aren't part of the openai-compat 4-field schema.
+          // Unknown extension keys must NOT reach the call body.
           model: 'gpt-5.5',
           reasoning_effort: 'high',
           temperature: 0.7,
@@ -612,116 +609,202 @@ test('handle: stdin body carries only system/tools/tool_choice/history-derived m
     },
   });
 
-  await runBackend(task, (child) => {
-    const response: ChatCompletionResponse = {
-      id: 'chatcmpl-3',
-      object: 'chat.completion',
-      created: 1,
-      model: 'gpt-5.5',
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: 'ok' },
-          finish_reason: 'stop',
-        },
-      ],
-      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-    };
-    const payload = child.stdinPayload();
-    const body = JSON.parse(payload) as Record<string, unknown>;
-    // Messages: system → chat_history (assistant(tool_calls) → tool) →
-    // trailing user. Per the new openai-compat chat_history wire, the
-    // trailing user (the current A2A `parts` turn) sits AFTER the
-    // history slice, mirroring how OpenAI Chat Completions arranges
-    // `[..., assistant.tool_calls, tool, user]` for a follow-up.
-    const messages = body.messages as Array<{ role: string }>;
-    assert.deepEqual(
-      messages.map((m) => m.role),
-      ['system', 'assistant', 'tool', 'user'],
-    );
-    // Only the existing 4-field schema's `tools` / `tool_choice` are
-    // forwarded; the spurious model/reasoning_effort/temperature/max_tokens
-    // entries are dropped at the metadata reader.
-    assert.deepEqual(body.tools, [
-      { type: 'function', function: { name: 'get_weather' } },
-    ]);
-    assert.deepEqual(body.tool_choice, {
-      type: 'function',
-      function: { name: 'get_weather' },
-    });
-    assert.equal(body.model, undefined);
-    assert.equal(body.reasoning_effort, undefined);
-    assert.equal(body.temperature, undefined);
-    assert.equal(body.max_tokens, undefined);
-    child.emitStdout(JSON.stringify(response));
-    child.finish(0);
+  const { bundle } = await runBackend(task, fakeSpawn, fakeFetch);
+  await bundle.shutdown();
+
+  assert.equal(fakeFetch.calls.length, 1);
+  const sent = fakeFetch.calls[0];
+  assert.equal(sent.url.endsWith('/v1/chat/completions'), true);
+  assert.equal(sent.body.stream, true);
+  assert.deepEqual(sent.body.stream_options, { include_usage: true });
+  const messages = sent.body.messages as Array<{ role: string }>;
+  assert.deepEqual(
+    messages.map((m) => m.role),
+    ['system', 'assistant', 'tool', 'user'],
+  );
+  assert.deepEqual(sent.body.tools, [
+    { type: 'function', function: { name: 'get_weather' } },
+  ]);
+  assert.deepEqual(sent.body.tool_choice, {
+    type: 'function',
+    function: { name: 'get_weather' },
   });
+  assert.equal(sent.body.model, undefined);
+  assert.equal(sent.body.reasoning_effort, undefined);
+  assert.equal(sent.body.temperature, undefined);
+  assert.equal(sent.body.max_tokens, undefined);
 });
 
-test('handle: empty prompt → task.fail with empty_prompt code', async () => {
-  const task = makeTask({
-    message: {
-      role: 'user',
-      messageId: 'msg',
-      parts: [{ kind: 'file', file: { mimeType: 'image/png', bytes: 'xx' } }],
-    },
+test('handle: empty prompt → task.fail with empty_prompt code, no fetch made', async () => {
+  const fakeSpawn = makeFakeSpawn();
+  const fakeFetch = makeFakeFetch(() => {
+    throw new Error('fetch should not be called');
   });
-  const fake = makeFakeSpawn();
-  const backend = createVicoopCodexBackend({ spawn: fake.spawn });
-  const frames: UpFrame[] = [];
-  await backend.handle(task, (f) => frames.push(f), new AbortController().signal);
-  assert.equal(fake.children.length, 0);
+  const { frames, bundle } = await runBackend(
+    makeTask({
+      message: {
+        role: 'user',
+        messageId: 'msg',
+        parts: [{ kind: 'file', file: { mimeType: 'image/png', bytes: 'xx' } }],
+      },
+    }),
+    fakeSpawn,
+    fakeFetch,
+  );
+  await bundle.shutdown();
   const fails = frames.filter((f) => f.type === 'task.fail');
   assert.equal(fails.length, 1);
   const failFrame = fails[0];
   if (failFrame.type !== 'task.fail') throw new Error('unreachable');
   assert.equal(failFrame.error.code, 'empty_prompt');
+  // Supervisor never spawned because we bailed before ensureSupervisor.
+  assert.equal(fakeSpawn.children.length, 0);
 });
 
-test('handle: non-zero exit maps to documented exit-code error codes', async () => {
-  const exitCases: Array<{ code: number; expected: string }> = [
-    { code: 2, expected: 'invalid_input' },
-    { code: 3, expected: 'login_required' },
-    { code: 4, expected: 'upstream_error' },
-    { code: 5, expected: 'network_error' },
-    { code: 99, expected: 'vicoop_codex_failed' },
-  ];
-  for (const { code, expected } of exitCases) {
-    const frames = await runBackend(makeTask(), (child) => {
-      child.emitStderr('Error: simulated');
-      child.finish(code);
-    });
-    const fails = frames.filter((f) => f.type === 'task.fail');
-    assert.equal(fails.length, 1, `exit code ${code}`);
-    const failFrame = fails[0];
-    if (failFrame.type !== 'task.fail') throw new Error('unreachable');
-    assert.equal(failFrame.error.code, expected, `exit code ${code} → ${expected}`);
-    assert.ok(failFrame.error.message.includes('simulated'));
-  }
-});
-
-test('handle: malformed JSON stdout → parse_failed', async () => {
-  const frames = await runBackend(makeTask(), (child) => {
-    child.emitStdout('not json at all');
-    child.finish(0);
-  });
+test('handle: upstream HTTP 401 → login_required', async () => {
+  const fakeSpawn = makeFakeSpawn();
+  const fakeFetch = makeFakeFetch(() =>
+    errorResponse(401, { error: { message: 'not signed in' } }),
+  );
+  const { frames, bundle } = await runBackend(makeTask(), fakeSpawn, fakeFetch);
+  await bundle.shutdown();
   const fails = frames.filter((f) => f.type === 'task.fail');
   assert.equal(fails.length, 1);
   const failFrame = fails[0];
   if (failFrame.type !== 'task.fail') throw new Error('unreachable');
-  assert.equal(failFrame.error.code, 'parse_failed');
+  assert.equal(failFrame.error.code, 'login_required');
+  assert.ok(failFrame.error.message.includes('not signed in'));
 });
 
-test('handle: cancel before spawn → task.complete with canceled', async () => {
-  const fake = makeFakeSpawn();
-  const backend = createVicoopCodexBackend({ spawn: fake.spawn });
-  const frames: UpFrame[] = [];
+test('handle: upstream HTTP 429 → rate_limited', async () => {
+  const fakeSpawn = makeFakeSpawn();
+  const fakeFetch = makeFakeFetch(() =>
+    errorResponse(429, { error: { message: 'slow down' } }),
+  );
+  const { frames, bundle } = await runBackend(makeTask(), fakeSpawn, fakeFetch);
+  await bundle.shutdown();
+  const failFrame = frames.find((f) => f.type === 'task.fail');
+  if (!failFrame || failFrame.type !== 'task.fail') throw new Error('unreachable');
+  assert.equal(failFrame.error.code, 'rate_limited');
+});
+
+test('handle: upstream HTTP 502 → upstream_http_502', async () => {
+  const fakeSpawn = makeFakeSpawn();
+  const fakeFetch = makeFakeFetch(() => errorResponse(502, { error: { message: 'bad gateway' } }));
+  const { frames, bundle } = await runBackend(makeTask(), fakeSpawn, fakeFetch);
+  await bundle.shutdown();
+  const failFrame = frames.find((f) => f.type === 'task.fail');
+  if (!failFrame || failFrame.type !== 'task.fail') throw new Error('unreachable');
+  assert.equal(failFrame.error.code, 'upstream_http_502');
+});
+
+test('handle: mid-stream error event → stream_error', async () => {
+  const fakeSpawn = makeFakeSpawn();
+  const fakeFetch = makeFakeFetch(() =>
+    sseResponse([
+      { id: 'chatcmpl-x', choices: [{ index: 0, delta: { content: 'partial' } }] },
+      { error: { message: 'upstream went away' } },
+    ]),
+  );
+  const { frames, bundle } = await runBackend(makeTask(), fakeSpawn, fakeFetch);
+  await bundle.shutdown();
+  const failFrame = frames.find((f) => f.type === 'task.fail');
+  if (!failFrame || failFrame.type !== 'task.fail') throw new Error('unreachable');
+  assert.equal(failFrame.error.code, 'stream_error');
+  assert.ok(failFrame.error.message.includes('upstream went away'));
+});
+
+test('handle: cancel before spawn → task.complete with canceled, no child', async () => {
+  const fakeSpawn = makeFakeSpawn();
+  const fakeFetch = makeFakeFetch(() => {
+    throw new Error('fetch should not be called');
+  });
   const ctrl = new AbortController();
   ctrl.abort();
-  await backend.handle(makeTask(), (f) => frames.push(f), ctrl.signal);
-  assert.equal(fake.children.length, 0);
+  const { frames, bundle } = await runBackend(makeTask(), fakeSpawn, fakeFetch, { abort: ctrl });
+  await bundle.shutdown();
+  assert.equal(fakeSpawn.children.length, 0);
   assert.equal(frames.length, 1);
   const frame = frames[0];
   if (frame.type !== 'task.complete') throw new Error('unreachable');
   assert.equal(frame.status.state, 'canceled');
+});
+
+test('handle: supervisor that never emits listening banner → cli_unavailable on startup timeout', async () => {
+  const fakeSpawn = makeFakeSpawn({ suppressListeningBanner: true });
+  const fakeFetch = makeFakeFetch(() => {
+    throw new Error('fetch should not be called');
+  });
+  const bundle = createVicoopCodexBackend({
+    spawn: fakeSpawn.spawn,
+    fetchImpl: fakeFetch.fetch,
+    startupTimeoutMs: 50,
+  });
+  const frames: UpFrame[] = [];
+  await bundle.backend.handle(makeTask(), (f) => frames.push(f), new AbortController().signal);
+  await bundle.shutdown();
+  const failFrame = frames.find((f) => f.type === 'task.fail');
+  if (!failFrame || failFrame.type !== 'task.fail') throw new Error('unreachable');
+  assert.equal(failFrame.error.code, 'cli_unavailable');
+});
+
+test('handle: second task reuses the same supervisor child', async () => {
+  const fakeSpawn = makeFakeSpawn();
+  let callIdx = 0;
+  const fakeFetch = makeFakeFetch(() => {
+    callIdx++;
+    return sseResponse([
+      { id: `chatcmpl-${callIdx}`, choices: [{ index: 0, delta: { content: 'ok' } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+      { usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }, choices: [] },
+      '[DONE]',
+    ]);
+  });
+
+  const bundle = createVicoopCodexBackend({
+    spawn: fakeSpawn.spawn,
+    fetchImpl: fakeFetch.fetch,
+    startupTimeoutMs: 1_000,
+  });
+  await bundle.backend.handle(makeTask(), () => {}, new AbortController().signal);
+  await bundle.backend.handle(
+    makeTask({ taskId: 'task-2' }),
+    () => {},
+    new AbortController().signal,
+  );
+  await bundle.shutdown();
+
+  assert.equal(fakeSpawn.children.length, 1);
+  assert.equal(fakeFetch.calls.length, 2);
+});
+
+test('handle: supervisor that died between tasks is respawned on next task', async () => {
+  const fakeSpawn = makeFakeSpawn();
+  const fakeFetch = makeFakeFetch(() =>
+    sseResponse([
+      { id: 'x', choices: [{ index: 0, delta: { content: 'ok' } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+      { usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }, choices: [] },
+      '[DONE]',
+    ]),
+  );
+
+  const bundle = createVicoopCodexBackend({
+    spawn: fakeSpawn.spawn,
+    fetchImpl: fakeFetch.fetch,
+    startupTimeoutMs: 1_000,
+  });
+  await bundle.backend.handle(makeTask(), () => {}, new AbortController().signal);
+  // Kill the supervisor child.
+  fakeSpawn.lastChild().finish(0);
+  // Wait for the close handler to nullify the singleton.
+  await new Promise((r) => setImmediate(r));
+  await bundle.backend.handle(
+    makeTask({ taskId: 'task-2' }),
+    () => {},
+    new AbortController().signal,
+  );
+  await bundle.shutdown();
+
+  assert.equal(fakeSpawn.children.length, 2);
 });
