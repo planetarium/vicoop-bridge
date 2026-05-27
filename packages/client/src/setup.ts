@@ -3,19 +3,26 @@
 // backed by `executeRegistration`. `setup` keeps working but prints a
 // deprecation hint to stderr.
 
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { object } from '@optique/core/constructs';
 import { map, multiple, optional, withDefault } from '@optique/core/modifiers';
 import { command, constant, flag, option } from '@optique/core/primitives';
 import { message } from '@optique/core/message';
 import type { InferValue } from '@optique/core/parser';
-import { choice, string } from '@optique/core/valueparser';
+import { choice, integer, string } from '@optique/core/valueparser';
 import { atomicWriteFile, resolveOwnerSession } from './owner-session.js';
-import { BACKEND_KINDS, type BackendKind } from './cli-args.js';
+import {
+  BACKEND_KINDS,
+  SANDBOX_MODES,
+  type BackendKind,
+  type CodexSandboxMode,
+} from './cli-args.js';
 import {
   defaultConfigPath,
   readConfigRaw,
   writeConfig,
+  type BackendConfigs,
+  type BackendRuntime,
 } from './config.js';
 
 export const setupCmd = command(
@@ -75,6 +82,41 @@ export const agentRegisterCmd = command(
     })),
     backend: optional(option('--backend', choice([...BACKEND_KINDS]), {
       description: message`Persist this backend choice into config.json so the daemon picks it up on next start. Without this flag, the daemon falls back to the existing \`backend\` field (or the entrypoint wizard).`,
+    })),
+    // Backend-specific defaults that get written into config.backends.<kind>.
+    // Each flag is validated against the chosen --backend in the handler;
+    // a mismatch (e.g. --codex-sandbox without --backend codex) is rejected
+    // before any GraphQL call so the operator doesn't end up with a token
+    // minted against an incoherent config.
+    cwd: optional(option('--cwd', string({ metavar: 'PATH' }), {
+      description: message`Working directory for the spawned backend process. Only valid with --backend claude or --backend codex.`,
+    })),
+    runtime: optional(option('--runtime', choice(['host', 'container']), {
+      description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside a vicoop-runtime container. Only valid with --backend claude or --backend codex.`,
+    })),
+    runtimeName: optional(option('--runtime-name', string({ metavar: 'NAME' }), {
+      description: message`Runtime container instance name. Only valid with --backend claude or --backend codex.`,
+    })),
+    claudeSettingsFile: optional(option('--claude-settings-file', string({ metavar: 'PATH' }), {
+      description: message`Path to a JSON file used as Claude \`--settings\`. The file is read at register time and its parsed contents are embedded into config.backends.claude.settings. Only valid with --backend claude.`,
+    })),
+    codexSandbox: optional(option('--codex-sandbox', choice([...SANDBOX_MODES]), {
+      description: message`Codex sandbox mode. Only valid with --backend codex.`,
+    })),
+    openclawGateway: optional(option('--openclaw-gateway', string({ metavar: 'WS_URL' }), {
+      description: message`OpenClaw gateway WS URL. Only valid with --backend openclaw.`,
+    })),
+    openclawGatewayToken: optional(option('--openclaw-gateway-token', string({ metavar: 'TOKEN' }), {
+      description: message`OpenClaw gateway auth token. Only valid with --backend openclaw.`,
+    })),
+    openclawAgent: optional(option('--openclaw-agent', string({ metavar: 'NAME' }), {
+      description: message`Primary OpenClaw agent name. Only valid with --backend openclaw.`,
+    })),
+    openclawOpenaiCompatAgent: optional(option('--openclaw-openai-compat-agent', string({ metavar: 'NAME' }), {
+      description: message`Secondary OpenClaw agent for openai-compat-extension tasks. Only valid with --backend openclaw.`,
+    })),
+    openclawTaskTimeoutMs: optional(option('--openclaw-task-timeout-ms', integer({ metavar: 'MS', min: 1 }), {
+      description: message`OpenClaw per-task timeout in milliseconds. Only valid with --backend openclaw.`,
     })),
     envFile: optional(option('--write-env-file', string({ metavar: 'PATH' }), {
       description: message`Also emit a shell-sourceable env file. Daemon does NOT consume these env vars; the file is purely an operator-side credentials backup / scripting hook.`,
@@ -164,6 +206,141 @@ function writeClientEnvFile(path: string, success: ClientRegisterSuccess, bridge
   ].join('\n'), 0o600);
 }
 
+// Subset of agent-register flags that may populate per-backend defaults in
+// config.json. Pulled out of `AgentRegisterArgs` so the validator/builder
+// below has a narrower contract than the full command surface.
+interface BackendDefaultFlags {
+  cwd?: string;
+  runtime?: BackendRuntime;
+  runtimeName?: string;
+  claudeSettingsFile?: string;
+  codexSandbox?: CodexSandboxMode;
+  openclawGateway?: string;
+  openclawGatewayToken?: string;
+  openclawAgent?: string;
+  openclawOpenaiCompatAgent?: string;
+  openclawTaskTimeoutMs?: number;
+}
+
+// `--cwd` / `--runtime` / `--runtime-name` are shared across claude and codex
+// (the two backends that actually spawn a per-task child process / have a
+// runtime container profile) — mirrors `CWD_BACKENDS` / `RUNTIME_BACKENDS`
+// in cli-args.ts for the daemon side.
+const SHARED_BACKEND_FLAGS: ReadonlySet<BackendKind> = new Set<BackendKind>(['claude', 'codex']);
+
+interface BuildBackendDefaultsOk {
+  ok: true;
+  defaults: BackendConfigs | null;
+}
+interface BuildBackendDefaultsErr {
+  ok: false;
+  error: string;
+}
+
+// Read + parse the claude settings file at register time so the persisted
+// config.json is self-contained — daemon startup never needs the source path.
+// Operators who want live-reload behavior can hand-edit config.json directly
+// or omit this flag and keep using --claude-settings-file at daemon start.
+function readClaudeSettingsFile(path: string): Record<string, unknown> {
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (e) {
+    throw new Error(`--claude-settings-file ${path}: ${(e as Error).message}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`--claude-settings-file ${path}: invalid JSON (${(e as Error).message})`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`--claude-settings-file ${path}: must contain a JSON object at the top level`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+// Validate the backend-specific flag set against the chosen --backend and,
+// on success, fold the values into a partial `BackendConfigs` keyed only on
+// the active backend slot. Other slots are left null so the per-slot merge
+// in `writeConfigForSetup` doesn't touch them.
+//
+// Validation rules — fail-fast BEFORE registerClient is called so the
+// operator never ends up with a minted token plus an incoherent config:
+//   - Any backend-specific flag requires --backend to be set.
+//   - --cwd / --runtime / --runtime-name require --backend claude|codex.
+//   - --codex-sandbox requires --backend codex.
+//   - --claude-settings-file requires --backend claude.
+//   - --openclaw-* require --backend openclaw.
+function buildBackendDefaults(
+  flags: BackendDefaultFlags,
+  backend: BackendKind | null,
+): BuildBackendDefaultsOk | BuildBackendDefaultsErr {
+  const set: Array<[keyof BackendDefaultFlags, string, ReadonlySet<BackendKind>]> = [
+    ['cwd', '--cwd', SHARED_BACKEND_FLAGS],
+    ['runtime', '--runtime', SHARED_BACKEND_FLAGS],
+    ['runtimeName', '--runtime-name', SHARED_BACKEND_FLAGS],
+    ['claudeSettingsFile', '--claude-settings-file', new Set<BackendKind>(['claude'])],
+    ['codexSandbox', '--codex-sandbox', new Set<BackendKind>(['codex'])],
+    ['openclawGateway', '--openclaw-gateway', new Set<BackendKind>(['openclaw'])],
+    ['openclawGatewayToken', '--openclaw-gateway-token', new Set<BackendKind>(['openclaw'])],
+    ['openclawAgent', '--openclaw-agent', new Set<BackendKind>(['openclaw'])],
+    ['openclawOpenaiCompatAgent', '--openclaw-openai-compat-agent', new Set<BackendKind>(['openclaw'])],
+    ['openclawTaskTimeoutMs', '--openclaw-task-timeout-ms', new Set<BackendKind>(['openclaw'])],
+  ];
+
+  for (const [key, label, allowed] of set) {
+    if (flags[key] === undefined) continue;
+    if (!backend) {
+      return { ok: false, error: `${label} requires --backend to be set` };
+    }
+    if (!allowed.has(backend)) {
+      const allowedList = [...allowed].join(' / ');
+      return {
+        ok: false,
+        error: `${label} is not supported by --backend ${backend}; only ${allowedList} accept this flag`,
+      };
+    }
+  }
+
+  if (!backend) return { ok: true, defaults: null };
+
+  if (backend === 'claude') {
+    const claude: BackendConfigs['claude'] = {};
+    if (flags.cwd) claude.cwd = flags.cwd;
+    if (flags.runtime) claude.runtime = flags.runtime;
+    if (flags.runtimeName) claude.runtime_name = flags.runtimeName;
+    if (flags.claudeSettingsFile) {
+      try {
+        claude.settings = readClaudeSettingsFile(flags.claudeSettingsFile);
+      } catch (e) {
+        return { ok: false, error: (e as Error).message };
+      }
+    }
+    return { ok: true, defaults: Object.keys(claude).length > 0 ? { claude } : null };
+  }
+  if (backend === 'codex') {
+    const codex: BackendConfigs['codex'] = {};
+    if (flags.cwd) codex.cwd = flags.cwd;
+    if (flags.runtime) codex.runtime = flags.runtime;
+    if (flags.runtimeName) codex.runtime_name = flags.runtimeName;
+    if (flags.codexSandbox) codex.sandbox_mode = flags.codexSandbox;
+    return { ok: true, defaults: Object.keys(codex).length > 0 ? { codex } : null };
+  }
+  if (backend === 'openclaw') {
+    const openclaw: BackendConfigs['openclaw'] = {};
+    if (flags.openclawGateway) openclaw.gateway_url = flags.openclawGateway;
+    if (flags.openclawGatewayToken) openclaw.gateway_token = flags.openclawGatewayToken;
+    if (flags.openclawAgent) openclaw.agent = flags.openclawAgent;
+    if (flags.openclawOpenaiCompatAgent) openclaw.openai_compat_agent = flags.openclawOpenaiCompatAgent;
+    if (flags.openclawTaskTimeoutMs !== undefined) openclaw.task_timeout_ms = flags.openclawTaskTimeoutMs;
+    return { ok: true, defaults: Object.keys(openclaw).length > 0 ? { openclaw } : null };
+  }
+  // echo / vicoop-codex: no per-backend defaults to persist. The validation
+  // pass above already rejected any backend-specific flag for these.
+  return { ok: true, defaults: null };
+}
+
 // Merge into any existing config.json so operator-edited fields (backend
 // defaults, card path, etc.) survive a setup re-run that's only rotating
 // the server token. Returns the path written for the success message.
@@ -178,6 +355,7 @@ function writeConfigForSetup(
   success: ClientRegisterSuccess,
   bridgeUrl: string,
   backend: BackendKind | null,
+  backendDefaults: BackendConfigs | null,
 ): string {
   const firstAgentId = success.allowed_agent_ids[0];
   if (!firstAgentId) {
@@ -212,8 +390,28 @@ function writeConfigForSetup(
   existing.server_token = success.client_token;
   existing.agent_id = firstAgentId;
   if (backend) existing.backend = backend;
+  if (backendDefaults) {
+    // Per-slot shallow merge: an operator passing `--backend codex --cwd /foo`
+    // should populate `backends.codex.cwd` without disturbing
+    // `backends.claude` or `backends.openclaw`. Within the active slot,
+    // operator-supplied fields override the prior value while unspecified
+    // fields are preserved (e.g. an existing `backends.codex.sandbox_mode`
+    // survives a register call that only sets `--cwd`).
+    const prior = isPlainObject(existing.backends) ? existing.backends : {};
+    const merged: Record<string, unknown> = { ...prior };
+    for (const [slot, values] of Object.entries(backendDefaults)) {
+      if (!values) continue;
+      const priorSlot = isPlainObject(merged[slot]) ? merged[slot] : {};
+      merged[slot] = { ...priorSlot, ...values };
+    }
+    existing.backends = merged;
+  }
   writeConfig(path, existing);
   return path;
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
 }
 
 // Persist the canonical credentials. Returns the path written (or `null` on
@@ -224,7 +422,11 @@ function writeConfigForSetup(
 // here; see `writeOptionalEnvFile` for that path's separate failure
 // handling.
 function persistCanonical(
-  args: { json: boolean; backend: BackendKind | null },
+  args: {
+    json: boolean;
+    backend: BackendKind | null;
+    backendDefaults: BackendConfigs | null;
+  },
   success: ClientRegisterSuccess,
   bridgeUrl: string,
 ): string | null {
@@ -234,7 +436,12 @@ function persistCanonical(
     process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
     return null;
   }
-  const configPath = writeConfigForSetup(success, bridgeUrl, args.backend);
+  const configPath = writeConfigForSetup(
+    success,
+    bridgeUrl,
+    args.backend,
+    args.backendDefaults,
+  );
   process.stderr.write(`Wrote ${configPath} (mode 600).\n`);
   return configPath;
 }
@@ -371,6 +578,11 @@ interface ExecuteRegistrationOpts {
   // null means "leave whatever is already there"; the daemon's existing
   // precedence (CLI flag > env > config > default 'echo') still applies.
   backend: BackendKind | null;
+  // Per-backend defaults to merge into config.backends.<slot>. null means
+  // the operator didn't pass any backend-specific flags; existing slots
+  // (claude / codex / openclaw) are preserved as-is. Only the active
+  // backend's slot is touched; other slots survive unmodified.
+  backendDefaults: BackendConfigs | null;
   json: boolean;
   labels: RegistrationLabels;
 }
@@ -456,7 +668,11 @@ async function executeRegistration(opts: ExecuteRegistrationOpts): Promise<numbe
   let canonicalPath: string | null;
   try {
     canonicalPath = persistCanonical(
-      { json: opts.json, backend: opts.backend },
+      {
+        json: opts.json,
+        backend: opts.backend,
+        backendDefaults: opts.backendDefaults,
+      },
       success,
       bridge,
     );
@@ -570,6 +786,7 @@ export async function runSetup(args: SetupArgs): Promise<number> {
     server: args.server ?? null,
     token: args.token ?? null,
     backend: null,
+    backendDefaults: null,
     json: args.json,
     labels: {
       cmdName: 'setup',
@@ -586,6 +803,15 @@ export async function runAgentRegister(args: AgentRegisterArgs): Promise<number>
   const callers = args.callers.flatMap((c) =>
     c.split(',').map((s) => s.trim()).filter(Boolean),
   );
+  const backend = args.backend ?? null;
+  // Validate backend-specific flags BEFORE the GraphQL call so a flag/backend
+  // mismatch (or unreadable --claude-settings-file) is caught up front and
+  // never leaves the operator holding a token they can't persist.
+  const built = buildBackendDefaults(args, backend);
+  if (!built.ok) {
+    process.stderr.write(`${built.error}\n`);
+    return 1;
+  }
   // `clientName` is required by the server's `register_client` SQL function
   // (NOT NULL on `agents.name` / `clients.client_name`) but is no longer
   // operator-supplied — it's pure display metadata that no authz / lookup
@@ -598,7 +824,8 @@ export async function runAgentRegister(args: AgentRegisterArgs): Promise<number>
     envFile: args.envFile ?? args.envFileAlias ?? null,
     server: args.server ?? null,
     token: args.token ?? null,
-    backend: args.backend ?? null,
+    backend,
+    backendDefaults: built.defaults,
     json: args.json,
     labels: {
       cmdName: 'agent register',
