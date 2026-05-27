@@ -90,6 +90,10 @@ const upgradeCmd = command(
   {
     brief: message`Upgrade the installed client bundle in place.`,
     description: message`Downloads the latest \`@vicoop-bridge/client@*\` release (or the pinned --version), verifies its sha256, extracts into a sibling directory, healthchecks, and atomically swaps it into place. Operator-added cards / files under \$INSTALL_DIR are preserved across the swap; \`~/.vicoop/config.json\` and \`~/.vicoop/owner-session.json\` are never touched.`,
+    // Drop from the top-level Usage: block — per-command details are
+    // already a `vicoop-client upgrade --help` away. Keeps the brief
+    // listing entry (under the "Maintenance" group header).
+    hidden: 'usage',
   },
 );
 
@@ -108,6 +112,7 @@ const infoCmd = command(
   {
     brief: message`Print client / image / backend metadata as JSON.`,
     description: message`Emits a single JSON object with this client's version, the bundled image's version (if running inside one — \`VICOOP_BRIDGE_IMAGE\` env), and the backend compat manifest.`,
+    hidden: 'usage',
   },
 );
 
@@ -127,6 +132,7 @@ const startCmd = command(
   {
     brief: message`Start the bridge client daemon.`,
     description: message`Connects to the bridge server, advertises the chosen backend's agent card, and runs until interrupted. With \`config.json\` populated by \`agent register\`, this needs no flags. Precedence over the canonical \`config.json\` is the same as documented in \`docs/install-client.md\` (CLI flag > \`--config\` overlay > canonical config > built-in default).`,
+    hidden: 'usage',
   },
 );
 
@@ -139,6 +145,7 @@ const authCmd = command(
   {
     brief: message`Manage owner-session and identity (sign in / out / whoami).`,
     description: message`Operator-facing umbrella for owner-session and agent-identity. Subcommands: \`login\`, \`logout\`, \`whoami\`. Replaces the older flat \`login\` / \`logout\` / \`whoami\` commands, which remain as deprecated aliases.`,
+    hidden: 'usage',
   },
 );
 

@@ -121,6 +121,7 @@ export const agentCmd = command(
   {
     brief: message`Manage agent registrations and their allowed callers.`,
     description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`delete\`, \`callers {list,add,remove}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    hidden: 'usage',
   },
 );
 
