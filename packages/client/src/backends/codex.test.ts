@@ -220,6 +220,7 @@ interface HappyPathOptions {
   agentMessageText?: string;
   threadId?: string;
   turnId?: string;
+  tokenUsage?: unknown;
   /**
    * After how many `turn/start` requests we should pretend the agent
    * emitted a `commandExecution` item before completing. Default 0.
@@ -299,6 +300,16 @@ function happyPath(opts: HappyPathOptions = {}): ChildScenario {
                   exitCode: 0,
                   aggregatedOutput: 'foo\nbar\n',
                 },
+              },
+            });
+          }
+          if (opts.tokenUsage) {
+            child.emitStdout({
+              method: 'thread/tokenUsage/updated',
+              params: {
+                threadId: activeThreadId,
+                turnId: localTurnId,
+                tokenUsage: opts.tokenUsage,
               },
             });
           }
@@ -1962,6 +1973,47 @@ test('openai-compat tasks always thread/start, never thread/resume — every tur
       .params?.config?.features;
     assert.deepEqual(features, EXPECTED_OPENAI_COMPAT_DISABLES);
   }
+});
+
+test('thread/tokenUsage/updated is forwarded as openai-compat usage metadata', async () => {
+  const fake = makeFakeSpawn(() =>
+    happyPath({
+      agentMessageText: 'usage ok',
+      tokenUsage: {
+        total: {
+          totalTokens: 200,
+          inputTokens: 160,
+          cachedInputTokens: 96,
+          outputTokens: 40,
+          reasoningOutputTokens: 12,
+        },
+        last: {
+          totalTokens: 200,
+          inputTokens: 160,
+          cachedInputTokens: 96,
+          outputTokens: 40,
+          reasoningOutputTokens: 12,
+        },
+        modelContextWindow: 258400,
+      },
+    }),
+  );
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('hi'), emit, NEVER);
+
+  const complete = frames.find((f) => f.type === 'task.complete');
+  assert.ok(complete && complete.type === 'task.complete');
+  assert.deepEqual(complete.status.message?.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+  const payload = complete.status.message?.metadata?.[OPENAI_COMPAT_EXTENSION_URI] as {
+    usage?: Record<string, unknown>;
+  };
+  assert.equal(payload?.usage?.prompt_tokens, 160);
+  assert.equal(payload?.usage?.completion_tokens, 40);
+  assert.equal(payload?.usage?.total_tokens, 200);
+  assert.deepEqual(payload?.usage?.prompt_tokens_details, { cached_tokens: 96 });
+  assert.deepEqual(payload?.usage?.completion_tokens_details, { reasoning_tokens: 12 });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

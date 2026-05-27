@@ -198,6 +198,7 @@ interface StreamEvent {
     role?: unknown;
     content?: unknown;
   };
+  event?: unknown;
   result?: unknown;
   terminal_reason?: unknown;
   is_error?: unknown;
@@ -493,6 +494,22 @@ function extractAssistantText(content: unknown): string {
     if (b.type === 'text' && typeof b.text === 'string') out += b.text;
   }
   return out;
+}
+
+function extractClaudeStreamTextDelta(evt: StreamEvent): string {
+  if (evt.type !== 'stream_event') return '';
+  const event = evt.event;
+  if (!event || typeof event !== 'object') return '';
+  const e = event as { type?: unknown; delta?: unknown; content_block?: unknown };
+  if (e.type === 'content_block_delta' && e.delta && typeof e.delta === 'object') {
+    const delta = e.delta as { type?: unknown; text?: unknown };
+    if (delta.type === 'text_delta' && typeof delta.text === 'string') return delta.text;
+  }
+  if (e.type === 'content_block_start' && e.content_block && typeof e.content_block === 'object') {
+    const block = e.content_block as { type?: unknown; text?: unknown };
+    if (block.type === 'text' && typeof block.text === 'string') return block.text;
+  }
+  return '';
 }
 
 interface ToolUseBlock {
@@ -1730,6 +1747,29 @@ export function createClaudeBackend(
 
       const handleEvent = (evt: StreamEvent): void => {
         if (settled) return;
+        if (openaiCompatTrace) {
+          const textLen =
+            evt.type === 'assistant'
+              ? extractAssistantText(evt.message?.content).length
+              : evt.type === 'stream_event'
+                ? extractClaudeStreamTextDelta(evt).length
+              : evt.type === 'result' && typeof evt.result === 'string'
+                ? evt.result.length
+                : undefined;
+          console.error(
+            `[openai-compat trace] claude event type=${evt.type}` +
+              (textLen !== undefined ? ` textLen=${textLen}` : ''),
+          );
+        }
+        if (evt.type === 'stream_event') {
+          const delta = extractClaudeStreamTextDelta(evt);
+          if (delta && !emittedAskUserQuestion) {
+            recorder.mark('firstAssistant');
+            streamedResponseText += delta;
+            emitAssistantArtifact(delta, true, false);
+          }
+          return;
+        }
         if (evt.type === 'assistant') {
           if (evt.message?.role !== 'assistant') return;
           recorder.mark('firstAssistant');

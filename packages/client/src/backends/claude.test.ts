@@ -272,6 +272,46 @@ test('streams cumulative Claude partial messages as append deltas on one artifac
   assert.deepEqual(artifacts.map((a) => a.append), [true, true, true]);
 });
 
+test('streams Claude stream_event text deltas as append chunks', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          delta: { type: 'text_delta', text: 'one' },
+        },
+      }),
+      JSON.stringify({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          delta: { type: 'text_delta', text: ' two' },
+        },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'one two' }] },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'one two' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('hello'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  assert.equal(artifacts.length, 2);
+  assert.deepEqual(artifacts.map(textOf), ['one', ' two']);
+  assert.equal(new Set(artifacts.map((a) => a.artifact.artifactId)).size, 1);
+  assert.deepEqual(artifacts.map((a) => a.append), [true, true]);
+});
+
 test('falls back to result artifact when streaming produced nothing', async () => {
   const fake = scriptedSpawn({
     lines: [
