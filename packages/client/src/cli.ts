@@ -314,6 +314,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
           openaiCompatAgent:
             args.openclawOpenaiCompatAgent ?? backends.openclaw?.openai_compat_agent,
           taskTimeoutMs: args.openclawTaskTimeoutMs,
+          openaiCompatTrace: args.openaiCompatTrace,
         }),
       };
     }
@@ -344,6 +345,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         cwd,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
         settings,
+        openaiCompatTrace: args.openaiCompatTrace,
         ...(spawn ? { spawn: spawn as ClaudeSpawnFn } : {}),
       });
       return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };
@@ -373,12 +375,17 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         cwd,
         sandboxMode,
         approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
+        openaiCompatTrace: args.openaiCompatTrace,
         ...(spawn ? { spawn: spawn as AppServerSpawnFn } : {}),
       });
       return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };
     }
     case 'vicoop-codex':
-      return { backend: createVicoopCodexBackend() };
+      return {
+        backend: createVicoopCodexBackend({
+          openaiCompatTrace: args.openaiCompatTrace,
+        }),
+      };
     default:
       throw new Error(
         `unknown backend: ${name} (supported: echo, openclaw, claude, codex, vicoop-codex)`,

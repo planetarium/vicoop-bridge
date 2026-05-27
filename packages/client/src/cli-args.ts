@@ -4,7 +4,7 @@
 
 import { object } from '@optique/core/constructs';
 import { optional } from '@optique/core/modifiers';
-import { option } from '@optique/core/primitives';
+import { flag, option } from '@optique/core/primitives';
 import { message } from '@optique/core/message';
 import { choice, integer, string } from '@optique/core/valueparser';
 import { parse } from '@optique/core/parser';
@@ -113,6 +113,13 @@ export const daemonFlagsFields = {
       description: message`Per-task timeout in milliseconds.`,
     }),
   ),
+
+  // Diagnostics
+  openaiCompatTrace: optional(
+    flag('--openai-compat-trace', {
+      description: message`Dump A2A \`parts\` shape, metadata keys, and the raw \`chat_history\` array on every incoming task. Operator diagnostic for openai-compat wire issues — leave off in production.`,
+    }),
+  ),
 };
 
 export const daemonFlagsParser = object(daemonFlagsFields);
@@ -140,6 +147,7 @@ export interface DaemonArgs {
   openclawAgent?: string;
   openclawOpenaiCompatAgent?: string;
   openclawTaskTimeoutMs?: number;
+  openaiCompatTrace?: boolean;
 }
 
 export type ParseFlagsResult =
@@ -257,6 +265,7 @@ export function mergeClientArgs(
       undefined,
     openclawTaskTimeoutMs:
       flags.openclawTaskTimeoutMs ?? backends.openclaw?.task_timeout_ms,
+    openaiCompatTrace: flags.openaiCompatTrace || undefined,
   };
 
   // Empty-string normalisation for the optional path-ish fields so callers

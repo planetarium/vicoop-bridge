@@ -35,6 +35,7 @@ import { createTimingRecorder } from './timing.js';
 import {
   callerToolDispatchActive,
   describeToolChoice,
+  dumpOpenAICompatTaskWire,
   formatChatHistory,
   parseOpenAICompatMetadata,
   type OpenAICompatMetadata,
@@ -139,6 +140,10 @@ export interface ClaudeBackendOptions {
   // is harmless (the spec is advisory) but blinds clients that want to
   // route by declared model.
   probeTimeoutMs?: number;
+  // When true, dump A2A `parts` shape + metadata keys + raw
+  // `chat_history` to stderr on every task. Operator diagnostic exposed
+  // via `--openai-compat-trace`. Leave off in production.
+  openaiCompatTrace?: boolean;
 }
 
 // Kept short and behaviour-focused. The risk we're guarding against is
@@ -934,6 +939,7 @@ export function createClaudeBackend(
   const sessionTtlMs = opts.sessionTtlMs ?? 60 * 60 * 1000;
   const now = opts.now ?? Date.now;
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const openaiCompatTrace = opts.openaiCompatTrace === true;
   const setIntervalImpl = opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
   const clearIntervalImpl = opts.clearIntervalFn ?? ((h) => clearInterval(h as ReturnType<typeof setInterval>));
   const timingLogger = createLogger();
@@ -1115,6 +1121,15 @@ export function createClaudeBackend(
       // malformed metadata leaves the run on the original non-extension code
       // path with no envelope-detection cost.
       const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+      if (openaiCompatTrace) {
+        dumpOpenAICompatTaskWire(
+          'claude',
+          task.taskId,
+          task.message.parts,
+          task.message.metadata,
+          openaiCompat,
+        );
+      }
 
       // Native MCP dispatch (#213): when the openai-compat extension is
       // active and carries `tools` (and `tool_choice !== "none"`), the

@@ -7,6 +7,7 @@ import { OPENAI_COMPAT_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol'
 import type { Backend } from '../backend.js';
 import {
   buildOpenAICompatSystemPrompt,
+  dumpOpenAICompatTaskWire,
   formatChatHistory,
   parseOpenAICompatMetadata,
   tryParseToolCallsEnvelope,
@@ -726,6 +727,12 @@ export interface OpenclawBackendOptions {
    * policy. Enabled by default; set enabled:false to require inline bytes.
    */
   fetchUriPolicy?: FetchUriPolicy;
+  /**
+   * When true, dump A2A `parts` shape + metadata keys + raw
+   * `chat_history` to stderr on every task. Operator diagnostic exposed
+   * via `--openai-compat-trace`. Leave off in production.
+   */
+  openaiCompatTrace?: boolean;
 }
 
 const DEFAULT_ATTACH_OUTPUTS_MAX_BYTES = 20 * 1024 * 1024;
@@ -972,6 +979,7 @@ export function createOpenclawBackend(
   );
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const now = opts.now ?? Date.now;
+  const openaiCompatTrace = opts.openaiCompatTrace === true;
   const setIntervalImpl =
     opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
   const clearIntervalImpl =
@@ -1407,6 +1415,15 @@ export function createOpenclawBackend(
       // part). Absent / malformed metadata leaves the run on the original
       // non-extension code path with no envelope-detection cost.
       const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+      if (openaiCompatTrace) {
+        dumpOpenAICompatTaskWire(
+          'openclaw',
+          task.taskId,
+          task.message.parts,
+          task.message.metadata,
+          openaiCompat,
+        );
+      }
       if (openaiCompat) {
         mapped.input.message = composeOpenAICompatUserMessage(
           openaiCompat,

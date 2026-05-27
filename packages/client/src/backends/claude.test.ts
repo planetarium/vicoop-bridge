@@ -19,6 +19,7 @@ import {
 import {
   buildOpenAICompatSystemPrompt,
   callerToolDispatchActive,
+  dumpOpenAICompatTaskWire,
   formatChatHistory,
   parseOpenAICompatMetadata,
   tryParseToolCallsEnvelope,
@@ -2801,6 +2802,94 @@ test('formatChatHistory: wraps the full history as a JSON array verbatim', () =>
 
 test('formatChatHistory: returns empty when the history is empty', () => {
   assert.equal(formatChatHistory([]), '');
+});
+
+test('dumpOpenAICompatTaskWire: emits header + tools + parts + chat_history sections', () => {
+  const captured: string[] = [];
+  const origErr = console.error;
+  console.error = (...args: unknown[]) => {
+    captured.push(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+  };
+  try {
+    const metadata = {
+      [OPENAI_COMPAT_EXTENSION_URI]: {
+        system: 'be terse',
+        tools: SAMPLE_TOOLS,
+        chat_history: SAMPLE_HISTORY,
+      },
+    };
+    const parsed = parseOpenAICompatMetadata(metadata);
+    dumpOpenAICompatTaskWire(
+      'claude',
+      'task-1',
+      [{ kind: 'text', text: 'hello' }],
+      metadata,
+      parsed,
+    );
+  } finally {
+    console.error = origErr;
+  }
+  // Header (1) + tools header (1) + tools entries (SAMPLE_TOOLS.length)
+  // + parts header (1) + parts entries (1) + history header (1)
+  // + history entries (2). SAMPLE_TOOLS has 1 entry → total = 8.
+  assert.equal(captured.length, 8);
+  // Header sanity: tools count surfaced, hist count surfaced.
+  assert.match(captured[0], /^\[openai-compat trace\] backend=claude taskId=task-1/);
+  assert.match(captured[0], /"tools":1/);
+  assert.match(captured[0], /"hist":2/);
+  // Tools section.
+  assert.match(captured[1], /^\[openai-compat trace\] tools \(1 entries\):/);
+  assert.match(captured[2], /^  \[0\] get_weather: /);
+  // Parts section (trailing user text).
+  assert.match(captured[3], /^\[openai-compat trace\] parts \(1 entries\):/);
+  assert.match(captured[4], /^  \[0\] text: "hello"/);
+  // chat_history section.
+  assert.match(captured[5], /^\[openai-compat trace\] raw chat_history \(2 entries\):/);
+  assert.match(captured[6], /^  \[0\] /);
+  assert.match(captured[7], /^  \[1\] /);
+});
+
+test('dumpOpenAICompatTaskWire: parts file entry shows shape without bytes', () => {
+  const captured: string[] = [];
+  const origErr = console.error;
+  console.error = (...args: unknown[]) => {
+    captured.push(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+  };
+  try {
+    dumpOpenAICompatTaskWire(
+      'codex',
+      't',
+      [{ kind: 'file', file: { name: 'i.png', mimeType: 'image/png', bytes: 'AAAA' } }],
+      undefined,
+      null,
+    );
+  } finally {
+    console.error = origErr;
+  }
+  const fileLine = captured.find((l) => l.startsWith('  [0] file:'));
+  assert.ok(fileLine, 'expected a file part line');
+  // bytes value must not leak into the trace.
+  assert.equal(fileLine!.includes('AAAA'), false);
+  assert.match(fileLine!, /"hasBytes":true/);
+  assert.match(fileLine!, /"mimeType":"image\/png"/);
+});
+
+test('dumpOpenAICompatTaskWire: minimal case (no tools, no history, just parts header)', () => {
+  const captured: string[] = [];
+  const origErr = console.error;
+  console.error = (...args: unknown[]) => {
+    captured.push(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+  };
+  try {
+    dumpOpenAICompatTaskWire('codex', 't', [{ kind: 'text', text: 'hi' }], undefined, null);
+  } finally {
+    console.error = origErr;
+  }
+  // Header + parts header + 1 part entry = 3 lines. No tools / history.
+  assert.equal(captured.length, 3);
+  assert.match(captured[0], /parsed=null/);
+  assert.match(captured[1], /^\[openai-compat trace\] parts \(1 entries\):/);
+  assert.match(captured[2], /^  \[0\] text: "hi"/);
 });
 
 test('multi-turn: chat_history block is prepended to the final user content (single envelope)', async () => {

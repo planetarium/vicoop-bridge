@@ -8,7 +8,7 @@
 // prompt, codex's `thread/inject_items` mapping) stay in the respective
 // backend file.
 
-import { OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
+import { OPENAI_COMPAT_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol';
 
 // OpenAI content-part shapes carried in `user` / `assistant` `content` arrays.
 // We only constrain the discriminator so the wire shape stays forward-compat
@@ -366,6 +366,122 @@ export function formatChatHistory(history: OpenAICompatHistoryEntry[]): string {
     JSON.stringify(history, null, 2),
     '</chat_history>',
   ].join('\n');
+}
+
+// Wire-level diagnostic dump for a single incoming A2A task. Gated by
+// the `--openai-compat-trace` operator flag (see cli-args.ts). Emits to
+// stderr to keep the trace separate from the bridge's structured stdout
+// frames. Designed for paste-into-issue-report ergonomics: parts shape
+// summary, metadata key list, then each chat_history entry on its own
+// line (clipped to 500 chars per entry so a long tool result doesn't
+// flood the operator's terminal).
+//
+// Lives in `openai-compat.ts` so every backend can share one canonical
+// shape — operator support traffic stays grep-able against a single
+// `[openai-compat trace]` prefix regardless of which backend handled
+// the task.
+//
+// Intentionally tolerant: any exception inside the formatter swallows
+// silently. A diagnostic that crashes the task path is worse than no
+// diagnostic.
+// Per-entry / per-part clip ceiling. Tool schemas and tool results can
+// be large (thousands of chars); 500 keeps an operator's terminal
+// scannable without losing the head of each item — enough to spot the
+// shape regression that needs investigating.
+const TRACE_ITEM_CLIP = 500;
+
+export function dumpOpenAICompatTaskWire(
+  backend: string,
+  taskId: string,
+  parts: readonly Part[] | undefined,
+  metadata: Record<string, unknown> | undefined,
+  parsed: OpenAICompatMetadata | null,
+): void {
+  try {
+    const partsSummary = (parts ?? []).map((p) => {
+      if (p.kind === 'text') return { kind: 'text', len: p.text.length };
+      if (p.kind === 'file') return { kind: 'file', mime: p.file.mimeType };
+      return { kind: 'data' };
+    });
+    const metaKeys = Object.keys(metadata ?? {});
+    const oai = parsed
+      ? {
+          sys: !!parsed.system,
+          tools: parsed.tools?.length ?? 0,
+          tool_choice: parsed.tool_choice,
+          hist: parsed.chat_history?.length ?? 0,
+        }
+      : null;
+    console.error(
+      `[openai-compat trace] backend=${backend} taskId=${taskId} ` +
+        `parts=${JSON.stringify(partsSummary)} ` +
+        `metaKeys=${JSON.stringify(metaKeys)} ` +
+        `parsed=${JSON.stringify(oai)}`,
+    );
+
+    // Tools[] — caller-side function schemas. Dump each entry as
+    // `{name}: <clipped JSON>` so the operator can spot a missing /
+    // mistyped tool without scrolling through a multi-line JSON dump.
+    if (parsed?.tools && parsed.tools.length > 0) {
+      console.error(
+        `[openai-compat trace] tools (${parsed.tools.length} entries):`,
+      );
+      for (const [i, t] of parsed.tools.entries()) {
+        const name =
+          t && typeof t === 'object' && 'function' in t
+            ? (t as { function?: { name?: unknown } }).function?.name
+            : undefined;
+        const label = typeof name === 'string' ? name : '<unnamed>';
+        console.error(
+          `  [${i}] ${label}: ${JSON.stringify(t).slice(0, TRACE_ITEM_CLIP)}`,
+        );
+      }
+    }
+
+    // Parts payload — the current turn's actual content (trailing user
+    // text, data parts JSON, file part metadata). Useful for spotting
+    // empty `parts: [{text:""}]` tool-continuation placeholders and
+    // diff-ing what the caller actually asked vs. what the model saw.
+    if (parts && parts.length > 0) {
+      console.error(`[openai-compat trace] parts (${parts.length} entries):`);
+      for (const [i, p] of parts.entries()) {
+        if (p.kind === 'text') {
+          console.error(
+            `  [${i}] text: ${JSON.stringify(p.text).slice(0, TRACE_ITEM_CLIP)}`,
+          );
+        } else if (p.kind === 'data') {
+          console.error(
+            `  [${i}] data: ${JSON.stringify(p.data).slice(0, TRACE_ITEM_CLIP)}`,
+          );
+        } else {
+          // file part — don't print bytes/base64; just shape.
+          const f = p.file;
+          const shape = {
+            name: f.name,
+            mimeType: f.mimeType,
+            hasBytes: !!f.bytes,
+            uri: f.uri,
+          };
+          console.error(`  [${i}] file: ${JSON.stringify(shape)}`);
+        }
+      }
+    }
+
+    const ext = metadata?.[OPENAI_COMPAT_EXTENSION_URI];
+    if (ext && typeof ext === 'object') {
+      const rawHist = (ext as Record<string, unknown>).chat_history;
+      if (Array.isArray(rawHist) && rawHist.length > 0) {
+        console.error(
+          `[openai-compat trace] raw chat_history (${rawHist.length} entries):`,
+        );
+        for (const [i, e] of rawHist.entries()) {
+          console.error(`  [${i}] ${JSON.stringify(e).slice(0, TRACE_ITEM_CLIP)}`);
+        }
+      }
+    }
+  } catch {
+    // Diagnostics must never crash the task.
+  }
 }
 
 // Attempt to interpret an assistant message as the OpenAI tool-call envelope

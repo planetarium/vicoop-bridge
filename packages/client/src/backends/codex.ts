@@ -11,6 +11,7 @@ import type { Backend } from '../backend.js';
 import { createLogger, type Logger } from '../logger.js';
 import {
   callerToolDispatchActive,
+  dumpOpenAICompatTaskWire,
   parseOpenAICompatMetadata,
 } from './openai-compat.js';
 import {
@@ -86,6 +87,10 @@ export interface CodexBackendOptions {
   // probe silent and the card's declared capabilities unchanged. Defaults
   // to reading `${CODEX_HOME ?? ~/.codex}/config.toml` via `fs.readFile`.
   readCodexConfigToml?: () => Promise<string | null>;
+  // When true, dump A2A `parts` shape + metadata keys + raw
+  // `chat_history` to stderr on every task. Operator diagnostic exposed
+  // via `--openai-compat-trace`. Leave off in production.
+  openaiCompatTrace?: boolean;
 }
 
 interface SessionEntry {
@@ -584,6 +589,7 @@ export function createCodexBackend(
   const sessionTtlMs = opts.sessionTtlMs ?? 60 * 60 * 1000;
   const now = opts.now ?? Date.now;
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const openaiCompatTrace = opts.openaiCompatTrace === true;
   const setIntervalImpl =
     opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
   const clearIntervalImpl =
@@ -927,6 +933,15 @@ export function createCodexBackend(
         // upstream (`tool_calls` artifact, `chat_history` input) is
         // unchanged so callers see no difference.
         const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+        if (openaiCompatTrace) {
+          dumpOpenAICompatTaskWire(
+            'codex',
+            task.taskId,
+            task.message.parts,
+            task.message.metadata,
+            openaiCompat,
+          );
+        }
         const dynamicTools =
           openaiCompat && callerToolDispatchActive(openaiCompat) && openaiCompat.tools
             ? openaiToolsToDynamicToolSpecs(openaiCompat.tools)

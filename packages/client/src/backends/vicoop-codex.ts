@@ -7,6 +7,7 @@ import {
 import type { Backend } from '../backend.js';
 import { createLogger, type Logger } from '../logger.js';
 import {
+  dumpOpenAICompatTaskWire,
   parseOpenAICompatMetadata,
   type OpenAICompatHistoryEntry,
   type OpenAICompatMessageContent,
@@ -52,6 +53,10 @@ export interface VicoopCodexBackendOptions {
   stderrCaptureBytes?: number;
   callTimeoutMs?: number;
   logger?: Logger;
+  // When true, dump A2A `parts` shape + metadata keys + raw
+  // `chat_history` to stderr on every task. Operator diagnostic exposed
+  // via `--openai-compat-trace`. Leave off in production.
+  openaiCompatTrace?: boolean;
 }
 
 // `vicoop-codex call` body shape — only the fields this backend actually
@@ -539,6 +544,7 @@ export function createVicoopCodexBackend(
   const stderrCap = opts.stderrCaptureBytes ?? 16 * 1024;
   const callTimeoutMs = opts.callTimeoutMs ?? 0;
   const logger = opts.logger ?? createLogger();
+  const openaiCompatTrace = opts.openaiCompatTrace === true;
 
   return {
     name: 'vicoop-codex',
@@ -560,6 +566,15 @@ export function createVicoopCodexBackend(
       // here: extending the extension schema unilaterally would risk
       // breaking the contract other backends rely on.
       const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+      if (openaiCompatTrace) {
+        dumpOpenAICompatTaskWire(
+          'vicoop-codex',
+          task.taskId,
+          task.message.parts,
+          task.message.metadata,
+          openaiCompat,
+        );
+      }
 
       const userContent = flattenA2AUserContent(task.message.parts);
       // Tool-continuation edge case (openai-compat spec): A2A parts is the
