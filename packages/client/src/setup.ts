@@ -9,8 +9,9 @@ import { map, multiple, optional, withDefault } from '@optique/core/modifiers';
 import { command, constant, flag, option } from '@optique/core/primitives';
 import { message } from '@optique/core/message';
 import type { InferValue } from '@optique/core/parser';
-import { string } from '@optique/core/valueparser';
+import { choice, string } from '@optique/core/valueparser';
 import { atomicWriteFile, resolveOwnerSession } from './owner-session.js';
+import { BACKEND_KINDS, type BackendKind } from './cli-args.js';
 import {
   defaultConfigPath,
   readConfigRaw,
@@ -70,6 +71,9 @@ export const agentRegisterCmd = command(
     }),
     callers: multiple(option('--caller', string({ metavar: 'PRINCIPAL' }), {
       description: message`Principal allowed to call this agent. Repeatable; comma-separated lists also accepted within a single occurrence.`,
+    })),
+    backend: optional(option('--backend', choice([...BACKEND_KINDS]), {
+      description: message`Persist this backend choice into config.json so the daemon picks it up on next start. Without this flag, the daemon falls back to the existing \`backend\` field (or the entrypoint wizard).`,
     })),
     envFile: optional(option('--write-env-file', string({ metavar: 'PATH' }), {
       description: message`Also emit a shell-sourceable env file. Daemon does NOT consume these env vars; the file is purely an operator-side credentials backup / scripting hook.`,
@@ -169,7 +173,11 @@ function writeClientEnvFile(path: string, success: ClientRegisterSuccess, bridge
 // response. Failing here is safer than silently overwriting a populated
 // `agent_id` in config.json with `""`, which would break the daemon on
 // next start with no obvious cause.
-function writeConfigForSetup(success: ClientRegisterSuccess, bridgeUrl: string): string {
+function writeConfigForSetup(
+  success: ClientRegisterSuccess,
+  bridgeUrl: string,
+  backend: BackendKind | null,
+): string {
   const firstAgentId = success.allowed_agent_ids[0];
   if (!firstAgentId) {
     throw new Error(
@@ -202,6 +210,7 @@ function writeConfigForSetup(success: ClientRegisterSuccess, bridgeUrl: string):
   existing.server_url = wsUrlFromBridge(bridgeUrl);
   existing.server_token = success.client_token;
   existing.agent_id = firstAgentId;
+  if (backend) existing.backend = backend;
   writeConfig(path, existing);
   return path;
 }
@@ -214,7 +223,7 @@ function writeConfigForSetup(success: ClientRegisterSuccess, bridgeUrl: string):
 // here; see `writeOptionalEnvFile` for that path's separate failure
 // handling.
 function persistCanonical(
-  args: { json: boolean },
+  args: { json: boolean; backend: BackendKind | null },
   success: ClientRegisterSuccess,
   bridgeUrl: string,
 ): string | null {
@@ -224,7 +233,7 @@ function persistCanonical(
     process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
     return null;
   }
-  const configPath = writeConfigForSetup(success, bridgeUrl);
+  const configPath = writeConfigForSetup(success, bridgeUrl, args.backend);
   process.stderr.write(`Wrote ${configPath} (mode 600).\n`);
   return configPath;
 }
@@ -357,6 +366,10 @@ interface ExecuteRegistrationOpts {
   // rename); kept as `server` here to match the args field name.
   server: string | null;
   token: string | null;
+  // Backend choice to persist into config.json (top-level `backend` field).
+  // null means "leave whatever is already there"; the daemon's existing
+  // precedence (CLI flag > env > config > default 'echo') still applies.
+  backend: BackendKind | null;
   json: boolean;
   labels: RegistrationLabels;
 }
@@ -441,7 +454,11 @@ async function executeRegistration(opts: ExecuteRegistrationOpts): Promise<numbe
   // recovery hatch.
   let canonicalPath: string | null;
   try {
-    canonicalPath = persistCanonical({ json: opts.json }, success, bridge);
+    canonicalPath = persistCanonical(
+      { json: opts.json, backend: opts.backend },
+      success,
+      bridge,
+    );
   } catch (e) {
     process.stderr.write(`${(e as Error).message}\n`);
     process.stderr.write(
@@ -551,6 +568,7 @@ export async function runSetup(args: SetupArgs): Promise<number> {
     envFile: args.envFile ?? args.envFileAlias ?? null,
     server: args.server ?? null,
     token: args.token ?? null,
+    backend: null,
     json: args.json,
     labels: {
       cmdName: 'setup',
@@ -579,6 +597,7 @@ export async function runAgentRegister(args: AgentRegisterArgs): Promise<number>
     envFile: args.envFile ?? args.envFileAlias ?? null,
     server: args.server ?? null,
     token: args.token ?? null,
+    backend: args.backend ?? null,
     json: args.json,
     labels: {
       cmdName: 'agent register',
