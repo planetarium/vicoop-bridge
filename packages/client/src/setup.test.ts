@@ -901,13 +901,27 @@ function agentRegisterArgs(
 ): AgentRegisterArgs {
   const {
     agentId,
-    callers = [], backend, envFile, envFileAlias, server, token, json = false,
+    callers = [], backend,
+    cwd, runtime, runtimeName, claudeSettingsFile, codexSandbox,
+    openclawGateway, openclawGatewayToken, openclawAgent,
+    openclawOpenaiCompatAgent, openclawTaskTimeoutMs,
+    envFile, envFileAlias, server, token, json = false,
   } = p;
   return {
     action: 'agent-register',
     agentId,
     callers,
     backend,
+    cwd,
+    runtime,
+    runtimeName,
+    claudeSettingsFile,
+    codexSandbox,
+    openclawGateway,
+    openclawGatewayToken,
+    openclawAgent,
+    openclawOpenaiCompatAgent,
+    openclawTaskTimeoutMs,
     envFile,
     envFileAlias,
     server,
@@ -1124,6 +1138,191 @@ test('agent register without --backend leaves the existing backend field intact'
   assert.equal(code, 0);
   const config = readConfig(configPath);
   assert.equal(config?.backend, 'claude');
+});
+
+// ---- Per-backend defaults (#284 follow-up) --------------------------------
+
+test('agent register --backend codex with --cwd/--codex-sandbox/--runtime writes backends.codex', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    agentId: 'codex-Mac',
+    backend: 'codex',
+    cwd: '/tmp/wks',
+    codexSandbox: 'workspace-write',
+    runtime: 'container',
+    runtimeName: 'codex-1',
+  }));
+
+  assert.equal(code, 0);
+  const config = readConfig(join(fix.tmpHome, '.vicoop', 'config.json'));
+  assert.equal(config?.backend, 'codex');
+  assert.deepEqual(config?.backends?.codex, {
+    cwd: '/tmp/wks',
+    sandbox_mode: 'workspace-write',
+    runtime: 'container',
+    runtime_name: 'codex-1',
+  });
+});
+
+test('agent register --backend claude with --claude-settings-file embeds the parsed JSON', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+  const settingsPath = join(fix.tmpHome, 'claude-settings.json');
+  writeFileSync(
+    settingsPath,
+    JSON.stringify({ permissions: { allow: ['Bash(ls:*)'] } }, null, 2),
+  );
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    agentId: 'claude-Mac',
+    backend: 'claude',
+    claudeSettingsFile: settingsPath,
+    cwd: '/work',
+  }));
+
+  assert.equal(code, 0);
+  const config = readConfig(join(fix.tmpHome, '.vicoop', 'config.json'));
+  assert.equal(config?.backend, 'claude');
+  assert.deepEqual(config?.backends?.claude, {
+    cwd: '/work',
+    settings: { permissions: { allow: ['Bash(ls:*)'] } },
+  });
+});
+
+test('agent register --backend openclaw writes the openclaw slot with gateway/token/agent', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    agentId: 'oc-1',
+    backend: 'openclaw',
+    openclawGateway: 'ws://127.0.0.1:18789',
+    openclawGatewayToken: 'oc-tok',
+    openclawAgent: 'main',
+    openclawOpenaiCompatAgent: 'compat',
+    openclawTaskTimeoutMs: 60_000,
+  }));
+
+  assert.equal(code, 0);
+  const config = readConfig(join(fix.tmpHome, '.vicoop', 'config.json'));
+  assert.deepEqual(config?.backends?.openclaw, {
+    gateway_url: 'ws://127.0.0.1:18789',
+    gateway_token: 'oc-tok',
+    agent: 'main',
+    openai_compat_agent: 'compat',
+    task_timeout_ms: 60_000,
+  });
+});
+
+test('agent register only touches the active backend slot, preserving others', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+
+  // Pre-seed claude + openclaw slots; the codex register call must leave
+  // them untouched while populating its own slot.
+  const configPath = join(fix.tmpHome, '.vicoop', 'config.json');
+  mkdirSync(dirname(configPath), { recursive: true });
+  writeFileSync(configPath, JSON.stringify({
+    backends: {
+      claude: { cwd: '/old/claude' },
+      openclaw: { gateway_url: 'ws://old' },
+    },
+  }, null, 2));
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    agentId: 'codex-Mac',
+    backend: 'codex',
+    cwd: '/new/codex',
+  }));
+
+  assert.equal(code, 0);
+  const config = readConfig(configPath);
+  assert.deepEqual(config?.backends?.claude, { cwd: '/old/claude' });
+  assert.deepEqual(config?.backends?.openclaw, { gateway_url: 'ws://old' });
+  assert.deepEqual(config?.backends?.codex, { cwd: '/new/codex' });
+});
+
+test('agent register merges into the existing active-backend slot instead of replacing it', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+
+  // Operator already set sandbox_mode via the entrypoint wizard or by hand;
+  // a follow-up register --backend codex --cwd /foo should keep sandbox_mode
+  // while adding cwd — the slot is a shallow merge, not an all-or-nothing
+  // replace.
+  const configPath = join(fix.tmpHome, '.vicoop', 'config.json');
+  mkdirSync(dirname(configPath), { recursive: true });
+  writeFileSync(configPath, JSON.stringify({
+    backends: { codex: { sandbox_mode: 'workspace-write' } },
+  }, null, 2));
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    agentId: 'codex-Mac',
+    backend: 'codex',
+    cwd: '/foo',
+  }));
+
+  assert.equal(code, 0);
+  const config = readConfig(configPath);
+  assert.deepEqual(config?.backends?.codex, {
+    cwd: '/foo',
+    sandbox_mode: 'workspace-write',
+  });
+});
+
+test('agent register rejects backend-specific flags when --backend is missing', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    agentId: 'codex-Mac',
+    codexSandbox: 'workspace-write',
+  }));
+
+  assert.equal(code, 1);
+  // Fail-fast guard: no GraphQL call should have happened.
+  assert.equal(fix.calls.length, 0);
+  assert.match(fix.stderr(), /--codex-sandbox requires --backend to be set/);
+});
+
+test('agent register rejects --codex-sandbox when --backend claude is set', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    agentId: 'claude-Mac',
+    backend: 'claude',
+    codexSandbox: 'workspace-write',
+  }));
+
+  assert.equal(code, 1);
+  assert.equal(fix.calls.length, 0);
+  assert.match(fix.stderr(), /--codex-sandbox is not supported by --backend claude/);
+});
+
+test('agent register rejects --cwd with --backend echo (echo has no spawn child)', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    agentId: 'echo-1',
+    backend: 'echo',
+    cwd: '/tmp',
+  }));
+
+  assert.equal(code, 1);
+  assert.equal(fix.calls.length, 0);
+  assert.match(fix.stderr(), /--cwd is not supported by --backend echo/);
+});
+
+test('agent register surfaces a clear error when --claude-settings-file points at invalid JSON', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+  const badPath = join(fix.tmpHome, 'bad.json');
+  writeFileSync(badPath, '{ this is not json');
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    agentId: 'claude-Mac',
+    backend: 'claude',
+    claudeSettingsFile: badPath,
+  }));
+
+  assert.equal(code, 1);
+  assert.equal(fix.calls.length, 0);
+  assert.match(fix.stderr(), /--claude-settings-file.*invalid JSON/);
 });
 
 // ---- Legacy `setup` alias: deprecation warning -----------------------------

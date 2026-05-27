@@ -25,7 +25,7 @@ export const DEFAULT_BRIDGE_URL = 'wss://vicoop-bridge-server.fly.dev';
 // /admin-api use HTTPS.
 export const DEFAULT_BRIDGE_HTTPS_URL = 'https://vicoop-bridge-server.fly.dev';
 
-const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const;
+export const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const;
 export type CodexSandboxMode = (typeof SANDBOX_MODES)[number];
 
 export const BACKEND_KINDS = ['echo', 'openclaw', 'claude', 'codex', 'vicoop-codex'] as const;
