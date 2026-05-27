@@ -1,5 +1,5 @@
 ---
-'@vicoop-bridge/client': major
+'@vicoop-bridge/client': minor
 ---
 
 Promote the daemon entrypoint to an explicit `vicoop-client start`
