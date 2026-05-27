@@ -111,23 +111,25 @@ const infoCmd = command(
   },
 );
 
-// Daemon mode is the bare invocation (no subcommand). `constant('daemon')`
-// gives the dispatch switch a discriminator alongside the named commands.
+// `vicoop-client start`: the long-running daemon entrypoint. Promoted to an
+// explicit subcommand so bare `vicoop-client` no longer connects to the
+// bridge — an operator running `vicoop-client` to grep for help should not
+// silently boot a network process. The action discriminator stays
+// `'daemon'` so runDaemon and the dispatch switch don't need to change.
 // `daemonFlagsFields` is the raw parser-field map exported from cli-args.ts
 // so we can splice it in here without losing per-field types.
-const daemonCmd = object({
-  action: constant('daemon' as const),
-  ...daemonFlagsFields,
-});
+const startCmd = command(
+  'start',
+  object({
+    action: constant('daemon' as const),
+    ...daemonFlagsFields,
+  }),
+  {
+    brief: message`Start the bridge client daemon.`,
+    description: message`Connects to the bridge server, advertises the chosen backend's agent card, and runs until interrupted. With \`config.json\` populated by \`agent register\`, this needs no flags. Precedence over the canonical \`config.json\` is the same as documented in \`docs/install-client.md\` (CLI flag > \`--config\` overlay > canonical config > built-in default).`,
+  },
+);
 
-// All subcommands + the bare daemon-mode parser in one parser. We use
-// `longestMatch` (not `or`) so that bare invocation — `vicoop-client` with
-// no tokens — falls through to `daemonCmd`, which consumes zero tokens
-// successfully via all-optional fields. `or()` requires at least one
-// branch to consume something, so it would reject empty argv even though
-// daemonCmd structurally matches. With longestMatch, subcommand branches
-// win whenever their keyword is present (longer match), and daemonCmd
-// wins otherwise.
 // Owner-session umbrella. Mirrors the `agent` umbrella from #218: both new
 // subcommands sit under their topic, the flat versions stay as deprecated
 // aliases.
@@ -152,6 +154,9 @@ const legacyAdminCmds = longestMatch(
   revokeClientCmd,
 );
 
+// All subcommands in one parser. `longestMatch` (rather than `or`) keeps
+// behavior stable as more sibling commands are added — branches with a
+// keyword match consume more tokens and win deterministically.
 const cli = longestMatch(
   authCmd,
   loginCmd,
@@ -163,7 +168,7 @@ const cli = longestMatch(
   containerCmd,
   legacyAdminCmds,
   whoamiCmd,
-  daemonCmd,
+  startCmd,
 );
 
 type CliArgs = InferValue<typeof cli>;
@@ -550,9 +555,18 @@ async function runUpgradeCmd(args: Extract<CliArgs, { action: 'upgrade' }>): Pro
 }
 
 async function main(): Promise<void> {
+  // Bare invocation prints help and exits 0. Pre-`start`-subcommand
+  // releases booted the daemon on empty argv; that surprised operators
+  // who ran `vicoop-client` expecting --help, and the daemon would
+  // happily open the WS until they noticed. Injecting `--help` lets
+  // optique render its own usage page and exit cleanly rather than
+  // surfacing the "no subcommand" parse failure as a non-zero exit.
+  if (process.argv.length <= 2) {
+    process.argv.push('--help');
+  }
   // Optique handles --help, --version, parse errors, and "did you mean?"
   // suggestions inside `run()`. Anything that reaches the switch is a
-  // successfully-parsed subcommand or daemon-mode payload.
+  // successfully-parsed subcommand.
   const parsed = run(cli, {
     programName: 'vicoop-client',
     brief: message`A2A bridge client daemon. Connects a local backend (echo, openclaw, claude, codex) to a deployed vicoop-bridge server.`,

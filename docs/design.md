@@ -69,23 +69,23 @@ vicoop-bridge/
 
 ```bash
 # OpenClaw (native integration)
-vicoop-client \
+vicoop-client start \
   --server wss://bridge.vicoop.xyz \
   --token $TOKEN \
   --backend openclaw
 
 # Claude Code
-vicoop-client \
+vicoop-client start \
   --backend claude
   # internally: `claude -p --session-id <ctx> --resume ...`
 
 # Codex CLI
-vicoop-client \
+vicoop-client start \
   --backend codex
   # internally: `codex app-server` (one persistent JSON-RPC over stdio process)
 
 # Generic webhook
-vicoop-client \
+vicoop-client start \
   --backend webhook \
   --backend-url http://localhost:8080/agent \
   --card ./cards/custom.json

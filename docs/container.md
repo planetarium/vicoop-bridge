@@ -77,7 +77,7 @@ On first start the entrypoint:
 2. Installs the backend CLI into `/data/agents/<kind>/` (claude / codex
    via npm; openclaw is no-op because the gateway runs out-of-process).
 3. Applies the outbound-allowlist firewall (if `NET_ADMIN` was granted).
-4. Hands off to `vicoop-client` daemon mode.
+4. Hands off to `vicoop-client start` (daemon mode).
 
 On every subsequent start the entrypoint skips bootstrap and just
 re-runs the firewall + compatibility check.

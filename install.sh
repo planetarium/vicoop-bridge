@@ -375,12 +375,12 @@ Next steps (the agent that owns this client should perform these):
   3. Run the daemon in the foreground. With config.json populated, only
      the backend choice (echo / openclaw / claude / codex) is left:
 
-       vicoop-client --backend openclaw
+       vicoop-client start --backend openclaw
 
-     Or persist \`"backend": "openclaw"\` in config.json and run with no
+     Or persist \`"backend": "openclaw"\` in config.json and start with no
      flags at all:
 
-       vicoop-client
+       vicoop-client start
 
      An always-on supervisor (systemd unit, launchd plist, …) is not
      provided by this installer; the foreground run above is the
