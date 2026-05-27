@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { saveOwnerSession } from './owner-session.js';
 import { runAgentRegister, runSetup, type AgentRegisterArgs, type SetupArgs } from './setup.js';
 import { readConfig } from './config.js';
@@ -901,12 +901,13 @@ function agentRegisterArgs(
 ): AgentRegisterArgs {
   const {
     agentId,
-    callers = [], envFile, envFileAlias, server, token, json = false,
+    callers = [], backend, envFile, envFileAlias, server, token, json = false,
   } = p;
   return {
     action: 'agent-register',
     agentId,
     callers,
+    backend,
     envFile,
     envFileAlias,
     server,
@@ -1086,6 +1087,43 @@ test('agent register configures callers when --caller is passed', async (t) => {
     fix.calls[1].url,
     'https://bridge.test/admin-api/agents/codex-Mac/callers',
   );
+});
+
+test('agent register --backend persists the backend choice into config.json', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    agentId: 'codex-Mac', backend: 'codex',
+  }));
+
+  assert.equal(code, 0);
+  const config = readConfig(join(fix.tmpHome, '.vicoop', 'config.json'));
+  assert.deepEqual(config, {
+    server_url: 'wss://bridge.test',
+    server_token: 'agent-token-1',
+    agent_id: 'codex-Mac',
+    backend: 'codex',
+  });
+});
+
+test('agent register without --backend leaves the existing backend field intact', async (t) => {
+  const fix = installAgentRegisterFixture(t);
+
+  // Pre-seed an operator-edited config.json with a backend choice already set,
+  // then run register without --backend. The backend field must survive the
+  // credential rewrite so re-running register to rotate a token doesn't wipe
+  // the operator's prior setup.
+  const configPath = join(fix.tmpHome, '.vicoop', 'config.json');
+  mkdirSync(dirname(configPath), { recursive: true });
+  writeFileSync(configPath, JSON.stringify({ backend: 'claude' }, null, 2));
+
+  const code = await runAgentRegister(agentRegisterArgs({
+    agentId: 'codex-Mac',
+  }));
+
+  assert.equal(code, 0);
+  const config = readConfig(configPath);
+  assert.equal(config?.backend, 'claude');
 });
 
 // ---- Legacy `setup` alias: deprecation warning -----------------------------
