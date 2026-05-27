@@ -346,6 +346,11 @@ function collect(): { emit: (f: UpFrame) => void; frames: UpFrame[] } {
   return { emit: (f) => frames.push(f), frames };
 }
 
+function artifactText(frame: Extract<UpFrame, { type: 'task.artifact' }>): string {
+  const part = frame.artifact.parts[0];
+  return part?.kind === 'text' ? part.text : '';
+}
+
 function findRequest(frames: unknown[], method: string): Record<string, unknown> | null {
   for (const f of frames) {
     if (f === null || typeof f !== 'object') continue;
@@ -415,6 +420,72 @@ test('first task runs initialize + thread/start + turn/start and emits agent art
   const last = frames.at(-1);
   assert.equal(last?.type, 'task.complete');
   assert.equal(last?.type === 'task.complete' && last.status.state, 'completed');
+});
+
+test('agentMessage deltas stream as append artifact chunks without duplicating final text', async () => {
+  const fake = makeFakeSpawn(() => {
+    let localTurnId = '';
+    return {
+      onLine(frame, child) {
+        const id = (frame as { id?: number | string }).id;
+        const method = (frame as { method?: string }).method;
+        if (method === 'initialize' && id !== undefined) {
+          child.emitStdout({
+            id,
+            result: {
+              userAgent: 'fake-codex/0.130.0',
+              codexHome: '/tmp',
+              platformFamily: 'unix',
+              platformOs: 'macos',
+            },
+          });
+          return;
+        }
+        if (method === 'thread/start' && id !== undefined) {
+          child.emitStdout({ id, result: { thread: { id: 'thr-1' } } });
+          return;
+        }
+        if (method === 'turn/start' && id !== undefined) {
+          localTurnId = 'turn-1';
+          child.emitStdout({ id, result: { turn: { id: localTurnId } } });
+          queueMicrotask(() => {
+            child.emitStdout({
+              method: 'item/agentMessage/delta',
+              params: { itemId: 'item-1', delta: 'one', turnId: localTurnId },
+            });
+            child.emitStdout({
+              method: 'item/agentMessage/delta',
+              params: { itemId: 'item-1', delta: ' two', turnId: localTurnId },
+            });
+            child.emitStdout({
+              method: 'item/completed',
+              params: {
+                turnId: localTurnId,
+                item: { type: 'agentMessage', id: 'item-1', text: 'one two' },
+              },
+            });
+            child.emitStdout({
+              method: 'turn/completed',
+              params: { turn: { id: localTurnId, status: 'completed' } },
+            });
+          });
+        }
+      },
+    };
+  });
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('hello'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  assert.equal(artifacts.length, 2);
+  assert.deepEqual(artifacts.map(artifactText), ['one', ' two']);
+  assert.equal(new Set(artifacts.map((a) => a.artifact.artifactId)).size, 1);
+  assert.deepEqual(artifacts.map((a) => a.append), [true, true]);
+  assert.equal(frames.at(-1)?.type, 'task.complete');
 });
 
 test('backend.stop() sends SIGTERM to the long-lived app-server child (#186)', async () => {

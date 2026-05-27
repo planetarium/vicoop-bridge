@@ -1479,6 +1479,7 @@ export function createClaudeBackend(
         ...openaiCompatArgs,
         ...disableBuiltinToolArgs,
         ...nativeTurnCapArgs,
+        '--include-partial-messages',
         ...settingsArgs,
         ...extraArgs,
       ];
@@ -1566,6 +1567,8 @@ export function createClaudeBackend(
       } | null = null;
       let finalText: string | null = null;
       let finalUsage: OpenAICompatUsage | null = null;
+      let responseArtifactId: string | null = null;
+      let streamedResponseText = '';
       let sawCompletedResult = false;
       let sawErrorResult = false;
       let stdoutTail = '';
@@ -1580,6 +1583,7 @@ export function createClaudeBackend(
       // completed/failed bookend in the trace stream. Outside trace
       // mode it stays empty — see the assistant handler below.
       const activeTaskRuns = new Map<string, string>();
+      const seenAssistantToolUseIds = new Set<string>();
 
       // Register this task with the send_file MCP server (if running) so
       // tool calls landing during this run resolve to this task's emit().
@@ -1603,8 +1607,9 @@ export function createClaudeBackend(
         sendFileRelease = handle.release;
       }
 
-      const emitAssistantArtifact = (text: string): void => {
+      const emitAssistantArtifact = (text: string, append = false, lastChunk = true): void => {
         if (!text) return;
+        responseArtifactId ??= randomUUID();
         // openai-compat caller tools land as a `tool_calls` data artifact
         // through the caller-tools MCP onInvoke handler above, NOT via
         // any text-shape parsing. Assistant-text turns (natural-language
@@ -1614,15 +1619,32 @@ export function createClaudeBackend(
           type: 'task.artifact',
           taskId: task.taskId,
           artifact: {
-            artifactId: randomUUID(),
+            artifactId: responseArtifactId,
             name: 'claude-message',
             parts: [{ kind: 'text', text }],
           },
-          // Each assistant message is a complete artifact on its own (same
-          // shape openclaw uses for session.message streaming).
-          lastChunk: true,
+          ...(append ? { append: true } : {}),
+          lastChunk,
         });
         emittedAnyArtifact = true;
+      };
+
+      const emitAssistantTextUpdate = (text: string): void => {
+        if (!text) return;
+        if (!streamedResponseText) {
+          streamedResponseText = text;
+          emitAssistantArtifact(text, true, false);
+          return;
+        }
+        if (text.startsWith(streamedResponseText)) {
+          const delta = text.slice(streamedResponseText.length);
+          streamedResponseText = text;
+          emitAssistantArtifact(delta, true, false);
+          return;
+        }
+        responseArtifactId = null;
+        streamedResponseText = text;
+        emitAssistantArtifact(text, false, true);
       };
 
       const emitToolResultMedia = (parts: Part[]): void => {
@@ -1716,10 +1738,14 @@ export function createClaudeBackend(
           // model said" before "what tools it then called", matching the
           // visible CLI ordering inside that turn.
           if (!emittedAskUserQuestion) {
-            emitAssistantArtifact(extractAssistantText(evt.message.content));
+            emitAssistantTextUpdate(extractAssistantText(evt.message.content));
           }
           if (emittedAskUserQuestion) return;
           for (const tu of extractAssistantToolUses(evt.message.content)) {
+            if (tu.toolUseId) {
+              if (seenAssistantToolUseIds.has(tu.toolUseId)) continue;
+              seenAssistantToolUseIds.add(tu.toolUseId);
+            }
             if (tu.toolName === 'AskUserQuestion' && tu.toolUseId && child.stdin) {
               // Stash for input-required terminal frame (A2A spec §9.4).
               // Placeholder tool_result + stdin.end() flushes CC's session state
@@ -2051,6 +2077,8 @@ export function createClaudeBackend(
           },
           lastChunk: true,
         });
+      } else if (streamedResponseText && completeText.startsWith(streamedResponseText)) {
+        emitAssistantArtifact(completeText.slice(streamedResponseText.length), true, true);
       }
 
       // Attach the openai-compat/v1 `usage` payload to the final A2A

@@ -576,6 +576,19 @@ interface TurnRunOutcome {
   finalText: string | null;
 }
 
+function extractAgentMessageDelta(params: unknown): string {
+  if (!params || typeof params !== 'object') return '';
+  const p = params as Record<string, unknown>;
+  if (typeof p.delta === 'string') return p.delta;
+  if (p.delta && typeof p.delta === 'object') {
+    const d = p.delta as Record<string, unknown>;
+    if (typeof d.text === 'string') return d.text;
+    if (typeof d.content === 'string') return d.content;
+  }
+  if (typeof p.text === 'string') return p.text;
+  return '';
+}
+
 export function createCodexBackend(
   opts: CodexBackendOptions = {},
 ): Backend {
@@ -1347,17 +1360,22 @@ export function createCodexBackend(
             });
           }
 
-          const emitAgentArtifact = (text: string): void => {
+          let responseArtifactId: string | null = null;
+          let streamedResponseText = '';
+
+          const emitAgentArtifact = (text: string, append = false, lastChunk = true): void => {
             if (!text) return;
+            responseArtifactId ??= randomUUID();
             emit({
               type: 'task.artifact',
               taskId: task.taskId,
               artifact: {
-                artifactId: randomUUID(),
+                artifactId: responseArtifactId,
                 name: 'codex-message',
                 parts: [{ kind: 'text', text }],
               },
-              lastChunk: true,
+              ...(append ? { append: true } : {}),
+              lastChunk,
             });
             emittedAnyArtifact = true;
           };
@@ -1414,7 +1432,14 @@ export function createCodexBackend(
                 if (item.type === 'agentMessage' && typeof item.text === 'string') {
                   recorder.mark('firstFinal');
                   finalText = item.text;
-                  emitAgentArtifact(item.text);
+                  if (streamedResponseText) {
+                    const tail = item.text.startsWith(streamedResponseText)
+                      ? item.text.slice(streamedResponseText.length)
+                      : '';
+                    emitAgentArtifact(tail, true, true);
+                  } else {
+                    emitAgentArtifact(item.text);
+                  }
                   return;
                 }
                 if (item.type === 'commandExecution') {
@@ -1426,6 +1451,11 @@ export function createCodexBackend(
                 const p = params as { turnId?: string } | undefined;
                 if (activeTurnId && p?.turnId !== activeTurnId) return;
                 recorder.mark('firstDelta');
+                const delta = extractAgentMessageDelta(params);
+                if (delta) {
+                  streamedResponseText += delta;
+                  emitAgentArtifact(delta, true, false);
+                }
                 return;
               }
               if (method === 'turn/completed') {

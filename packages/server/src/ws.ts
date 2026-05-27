@@ -243,6 +243,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
             // Wire-shape parts; see wireMessageToA2X for the shape note.
             parts: frame.artifact.parts as unknown as Part[] as never,
           },
+          append: frame.append,
           lastChunk: frame.lastChunk,
         });
         break;
