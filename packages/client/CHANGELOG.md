@@ -1,5 +1,69 @@
 # @vicoop-bridge/client
 
+## 0.24.0
+
+### Minor Changes
+
+- 49e97bc: `vicoop-client agent register` now accepts the backend's core defaults
+  inline so a fresh install can be configured in a single command. Per the
+  chosen `--backend`:
+
+  - `claude`: `--cwd`, `--runtime`, `--runtime-name`, `--claude-settings-file`
+  - `codex`: `--cwd`, `--runtime`, `--runtime-name`, `--codex-sandbox`
+  - `openclaw`: `--openclaw-gateway`, `--openclaw-gateway-token`,
+    `--openclaw-agent`, `--openclaw-openai-compat-agent`,
+    `--openclaw-task-timeout-ms`
+
+  `--claude-settings-file` is read at register time and its parsed JSON is
+  embedded into `backends.claude.settings` so the persisted config.json is
+  self-contained. Mismatched pairings (e.g. `--codex-sandbox` with
+  `--backend claude`, or any backend-specific flag without `--backend`)
+  are rejected up front — before the GraphQL call — so the operator
+  never ends up holding a minted token that can't be persisted into a
+  coherent config. Only the active backend's slot in `backends.*` is
+  touched; other slots survive unmodified and within the active slot
+  unspecified fields are preserved.
+
+- cd18578: Migrate the openai-compat A2A extension reader from `tool_call_history`
+  to `chat_history` (planetarium/oai2a2a#74). The new field carries every
+  prior conversation turn except the trailing user turn (which rides A2A
+  `parts` as before), so backends now replay the full multi-turn context
+  rather than just the tool round-trips. Plain prior user/assistant text
+  turns ride each backend's native conversation channel where one exists
+  (claude stream-json envelopes, vicoop-codex Chat Completions `messages[]`,
+  codex Responses API `message` items); openclaw folds them into its
+  single-channel `<chat_history>` block. Backends also tolerate the
+  spec's tool-continuation edge case where A2A `parts` is the placeholder
+  `[{ "text": "" }]` and the conversation lives entirely in `chat_history`.
+- 95e3540: Promote the daemon entrypoint to an explicit `vicoop-client start`
+  subcommand and stop treating bare invocation as "start the daemon".
+  Running `vicoop-client` with no arguments now prints the top-level help
+  and exits 0, where previous releases would open the bridge WS. The
+  flags-only form (`vicoop-client --backend ...`) also no longer starts
+  the daemon — it now fails with a parse error pointing at the missing
+  subcommand. Replace any operator scripts / systemd units / docker
+  commands that ran `vicoop-client …` with `vicoop-client start …`; the
+  flag surface is unchanged. The bundled container entrypoint
+  (`container/bundled/entrypoint.sh`) rewrites the historical flags-only
+  / no-args invocation to `vicoop-client start` before exec'ing, so
+  `docker run … <image>` keeps working unchanged.
+
+### Patch Changes
+
+- 96b5a63: fix(vicoop-codex): place the current user turn before tool_call_history
+
+  The vicoop-codex backend assembled the `vicoop-codex call` body as
+  `system → tool_call_history → user`, leaving the current user request after
+  every prior assistant/tool round. With a growing multi-turn history,
+  gpt-5.3-codex read its own request as a brand-new instruction arriving after
+  all that tool activity and restarted from the first tool (e.g. re-calling
+  `list_workflows` every turn) instead of progressing to completion.
+
+  `buildMessages` now emits `system → user → tool_call_history`, preserving the
+  original linear OpenAI conversation order (the user request first, then the
+  tool rounds it drove). This matches what the model sees when talking to
+  `vicoop-codex serve` directly, eliminating the re-call loop.
+
 ## 0.23.1
 
 ### Patch Changes
