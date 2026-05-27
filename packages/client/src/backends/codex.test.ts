@@ -6,11 +6,13 @@ import {
   createCodexBackend,
   historyToInjectItems,
   openaiToolsToDynamicToolSpecs,
+  parseCodexConfigTomlForModel,
 } from './codex.js';
 import type {
   AppServerChildHandle,
   AppServerSpawnFn,
   AppServerSpawnOptions,
+  ModelListEntry,
 } from './codex-rpc.js';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
@@ -1832,4 +1834,244 @@ test('openai-compat tasks always thread/start, never thread/resume — every tur
       .params?.config?.features;
     assert.deepEqual(features, EXPECTED_OPENAI_COMPAT_DISABLES);
   }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resolveCapabilities — reads codex's `config.toml` to advertise the
+// underlying model on the openai-compat/v1 extension (planetarium/oai2a2a#63).
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('parseCodexConfigTomlForModel extracts model + reasoning from real-shape config', () => {
+  const text = [
+    'model = "gpt-5.4"',
+    'model_reasoning_effort = "medium"',
+    '[projects."/home/op/repo"]',
+    'trust_level = "trusted"',
+  ].join('\n');
+  const out = parseCodexConfigTomlForModel(text);
+  assert.equal(out.model, 'gpt-5.4');
+  assert.equal(out.hasReasoningEffort, true);
+});
+
+test('parseCodexConfigTomlForModel treats reasoning_effort="none" as not-reasoning', () => {
+  const text = ['model = "gpt-4o"', 'model_reasoning_effort = "none"'].join('\n');
+  const out = parseCodexConfigTomlForModel(text);
+  assert.equal(out.model, 'gpt-4o');
+  assert.equal(out.hasReasoningEffort, false);
+});
+
+test('parseCodexConfigTomlForModel ignores model = inside a [section]', () => {
+  // codex permits per-profile overrides under sub-tables; those MUST NOT
+  // be read as the agent's default model, because our spawn does not
+  // select a profile.
+  const text = [
+    'model = "gpt-5.4"',
+    '',
+    '[profiles.qa]',
+    'model = "gpt-3.5"',
+  ].join('\n');
+  const out = parseCodexConfigTomlForModel(text);
+  assert.equal(out.model, 'gpt-5.4');
+});
+
+test('parseCodexConfigTomlForModel returns null model when key is absent', () => {
+  const text = '[projects."/x"]\ntrust_level = "trusted"\n';
+  const out = parseCodexConfigTomlForModel(text);
+  assert.equal(out.model, null);
+  assert.equal(out.hasReasoningEffort, false);
+});
+
+test('parseCodexConfigTomlForModel accepts literal-string values and ignores comments', () => {
+  const text = [
+    "model = 'gpt-5.4'  # default for the agent",
+    '# model = "decoy"',
+    'model_reasoning_effort = "high"',
+  ].join('\n');
+  const out = parseCodexConfigTomlForModel(text);
+  assert.equal(out.model, 'gpt-5.4');
+  assert.equal(out.hasReasoningEffort, true);
+});
+
+// Scenario helper: respond to `initialize` then to `model/list` with the
+// supplied entries. Any other inbound RPC is ignored — the probe never
+// issues a thread/start or turn/start, so we don't bother modelling
+// those response paths here.
+function modelListScenario(
+  entries: ModelListEntry[],
+  opts: { failModelList?: boolean } = {},
+): ChildScenario {
+  return {
+    onLine(frame, child) {
+      const id = (frame as { id?: number | string }).id;
+      const method = (frame as { method?: string }).method;
+      if (method === 'initialize' && id !== undefined) {
+        child.emitStdout({
+          id,
+          result: {
+            userAgent: 'fake-codex/0.133.0',
+            codexHome: '/tmp',
+            platformFamily: 'unix',
+            platformOs: 'macos',
+          },
+        });
+        return;
+      }
+      if (method === 'model/list' && id !== undefined) {
+        if (opts.failModelList) {
+          child.emitStdout({ id, error: { code: -32601, message: 'Method not found' } });
+        } else {
+          child.emitStdout({ id, result: { data: entries } });
+        }
+        return;
+      }
+    },
+  };
+}
+
+test('codex backend resolveCapabilities advertises full model/list with default tag', async () => {
+  const fake = makeFakeSpawn(() =>
+    modelListScenario([
+      {
+        id: 'gpt-5.5',
+        isDefault: true,
+        supportedReasoningEfforts: [{ reasoningEffort: 'medium' }],
+      },
+      {
+        id: 'gpt-5.4',
+        supportedReasoningEfforts: [{ reasoningEffort: 'low' }],
+      },
+      { id: 'gpt-4o' },
+    ]),
+  );
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    readCodexConfigToml: async () => null, // no operator override
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [
+      { id: 'gpt-5.5', reasoning: true, default: true },
+      { id: 'gpt-5.4', reasoning: true },
+      { id: 'gpt-4o' },
+    ],
+  });
+  backend.stop?.();
+});
+
+test('codex backend resolveCapabilities tags operator override as default, not model/list.isDefault', async () => {
+  const fake = makeFakeSpawn(() =>
+    modelListScenario([
+      { id: 'gpt-5.5', isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: 'medium' }] },
+      { id: 'gpt-5.4', supportedReasoningEfforts: [{ reasoningEffort: 'low' }] },
+    ]),
+  );
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    readCodexConfigToml: async () => 'model = "gpt-5.4"\n',
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [
+      { id: 'gpt-5.5', reasoning: true }, // codex's recommended default loses to operator override
+      { id: 'gpt-5.4', reasoning: true, default: true },
+    ],
+  });
+  backend.stop?.();
+});
+
+test('codex backend resolveCapabilities surfaces operator override that is absent from model/list', async () => {
+  // Custom provider / beta access: the operator pinned a model codex's
+  // own picker doesn't surface. We still advertise it (and tag default)
+  // because that's what the spawn actually loads.
+  const fake = makeFakeSpawn(() =>
+    modelListScenario([{ id: 'gpt-5.5', isDefault: true }]),
+  );
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    readCodexConfigToml: async () => 'model = "claude-opus-via-litellm"\n',
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [
+      { id: 'claude-opus-via-litellm', default: true },
+      { id: 'gpt-5.5' },
+    ],
+  });
+  backend.stop?.();
+});
+
+test('codex backend resolveCapabilities omits reasoning when supportedReasoningEfforts is empty', async () => {
+  const fake = makeFakeSpawn(() =>
+    modelListScenario([
+      { id: 'gpt-4o', isDefault: true, supportedReasoningEfforts: [] },
+    ]),
+  );
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    readCodexConfigToml: async () => null,
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [{ id: 'gpt-4o', default: true }],
+  });
+  backend.stop?.();
+});
+
+test('codex backend resolveCapabilities skips hidden entries', async () => {
+  const fake = makeFakeSpawn(() =>
+    modelListScenario([
+      { id: 'gpt-5.5', isDefault: true },
+      { id: 'gpt-3.5-legacy', hidden: true },
+    ]),
+  );
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    readCodexConfigToml: async () => null,
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [{ id: 'gpt-5.5', default: true }],
+  });
+  backend.stop?.();
+});
+
+test('codex backend resolveCapabilities returns {} when model/list is unsupported', async () => {
+  const fake = makeFakeSpawn(() => modelListScenario([], { failModelList: true }));
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    readCodexConfigToml: async () => null,
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {});
+  backend.stop?.();
+});
+
+test('codex backend resolveCapabilities returns {} when model/list response is empty', async () => {
+  const fake = makeFakeSpawn(() => modelListScenario([]));
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    readCodexConfigToml: async () => null,
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {});
+  backend.stop?.();
+});
+
+test('codex backend resolveCapabilities tolerates a config.toml reader that throws', async () => {
+  // The operator override is a soft signal — its absence shouldn't take
+  // the whole probe down. model/list still drives the advertise.
+  const fake = makeFakeSpawn(() =>
+    modelListScenario([{ id: 'gpt-5.5', isDefault: true }]),
+  );
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    readCodexConfigToml: async () => {
+      throw new Error('boom');
+    },
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [{ id: 'gpt-5.5', default: true }],
+  });
+  backend.stop?.();
 });

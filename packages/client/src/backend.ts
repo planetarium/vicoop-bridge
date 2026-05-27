@@ -1,4 +1,8 @@
-import type { UpFrame, TaskAssignFrame } from '@vicoop-bridge/protocol';
+import type {
+  OpenAICompatModelAdvertise,
+  UpFrame,
+  TaskAssignFrame,
+} from '@vicoop-bridge/protocol';
 
 export type TaskAssign = TaskAssignFrame;
 
@@ -7,6 +11,12 @@ export type Emit = (frame: UpFrame) => void;
 export interface DetectedCapabilities {
   streaming?: boolean;
   pushNotifications?: boolean;
+  // openai-compat/v1 `params.models[]` advertise block. When set, the
+  // bridge-server hello frame's `agentCard` will carry these on the
+  // openai-compat extension entry, so A2A callers can pick backends by
+  // declared model (planetarium/oai2a2a#63). Best-effort: a backend that
+  // cannot determine its model in time SHOULD omit this rather than guess.
+  openaiCompatModels?: OpenAICompatModelAdvertise[];
 }
 
 export interface Backend {

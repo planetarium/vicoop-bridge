@@ -138,6 +138,29 @@ export interface ThreadStartOrResumeResult {
   thread: { id: string };
 }
 
+// Subset of codex's `model/list` response entry we read. The full schema is
+// wider (display name, description, NUX message, service tiers, input
+// modalities, …), but `resolveCapabilities` only needs:
+//   - `id`: the model identifier we advertise + that lands in `usage.model`
+//   - `isDefault`: codex's recommended default (used when the operator
+//     hasn't pinned a different one via `config.toml`)
+//   - `hidden`: codex hides legacy / deprecated models from pickers; we
+//     skip them in the advertise too
+//   - `supportedReasoningEfforts`: presence (length > 0) is codex's own
+//     signal that the model emits `completion_tokens_details.reasoning_tokens`,
+//     so we can set the openai-compat/v1 `reasoning` flag without the
+//     `model_reasoning_effort` heuristic the config.toml path used.
+export interface ModelListEntry {
+  id: string;
+  isDefault?: boolean;
+  hidden?: boolean;
+  supportedReasoningEfforts?: Array<{ reasoningEffort?: string }>;
+}
+
+export interface ModelListResult {
+  data: ModelListEntry[];
+}
+
 export type UserInputItem =
   | { type: 'text'; text: string; text_elements: never[] }
   | { type: 'localImage'; path: string };

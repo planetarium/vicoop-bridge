@@ -3,6 +3,7 @@ import {
   PROTOCOL_VERSION,
   encodeFrame,
   parseDownFrame,
+  withOpenAICompatModelsAdvertise,
   type AgentCard,
   type Part,
   type TaskAssignFrame,
@@ -87,7 +88,14 @@ export interface ClientOptions {
   onFatal?: (info: { code: number; reason: string }) => void;
 }
 
-const DEFAULT_PROBE_DEADLINE_MS = 3000;
+// Outer race deadline for `backend.resolveCapabilities()` — caps how long
+// the bridge-server hello frame waits on the backend probe before falling
+// back to the declared card. 12s accommodates the claude backend's worst
+// case (operator cwd with hooks / skills / MCP / a large CLAUDE.md can
+// push `system/init` emit to 5–10s) plus headroom; faster backends (codex
+// reads config.toml in ~1ms) settle well before this and the deadline
+// never fires.
+const DEFAULT_PROBE_DEADLINE_MS = 12_000;
 const DEFAULT_RECONNECT_DELAY_MS = 3000;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 30_000;
 const DEFAULT_RECONNECT_JITTER_RATIO = 0.2;
@@ -204,17 +212,34 @@ export class Client {
         // object must leave the card byte-for-byte unchanged, including an
         // absent `capabilities` field. Only materialize `capabilities` when
         // the probe actually reports a value we need to apply.
-        if (detected.streaming === undefined && detected.pushNotifications === undefined) {
+        const hasModels = (detected.openaiCompatModels?.length ?? 0) > 0;
+        if (
+          detected.streaming === undefined &&
+          detected.pushNotifications === undefined &&
+          !hasModels
+        ) {
           return base;
         }
-        const merged: AgentCard['capabilities'] = {
-          ...(base.capabilities ?? {}),
-          ...(detected.streaming !== undefined ? { streaming: detected.streaming } : {}),
-          ...(detected.pushNotifications !== undefined
-            ? { pushNotifications: detected.pushNotifications }
-            : {}),
-        };
-        return { ...base, capabilities: merged };
+        let next = base;
+        if (
+          detected.streaming !== undefined ||
+          detected.pushNotifications !== undefined
+        ) {
+          const merged: AgentCard['capabilities'] = {
+            ...(base.capabilities ?? {}),
+            ...(detected.streaming !== undefined ? { streaming: detected.streaming } : {}),
+            ...(detected.pushNotifications !== undefined
+              ? { pushNotifications: detected.pushNotifications }
+              : {}),
+          };
+          next = { ...next, capabilities: merged };
+        }
+        if (hasModels && detected.openaiCompatModels) {
+          // No-op if the card doesn't declare openai-compat/v1 — see
+          // `withOpenAICompatModelsAdvertise` for the rationale.
+          next = withOpenAICompatModelsAdvertise(next, detected.openaiCompatModels);
+        }
+        return next;
       } finally {
         // Clear the deadline timer so a fast probe doesn't leave an extra
         // callback and its closure alive until `deadlineMs` elapses. The

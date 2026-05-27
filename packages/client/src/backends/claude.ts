@@ -120,6 +120,18 @@ export interface ClaudeBackendOptions {
    * public API — leave unset in production.
    */
   onCallerToolsMcpReady?: (server: CallerToolsMcpServer) => void;
+  // Max time the startup probe (`resolveCapabilities`) waits for the
+  // `system/init` event before giving up. Default 10000 ms — `claude`
+  // startup can take 5s+ on an operator cwd loaded with hooks, skills,
+  // MCP servers, or a large CLAUDE.md (auto-discovery still runs because
+  // we deliberately *don't* use `--bare`: bare mode skips
+  // user/project settings.json, including its `model` field, which would
+  // make the probed model diverge from the model the real task spawn
+  // actually loads). Set to 0 to disable the probe entirely — the daemon
+  // will simply not advertise `params.models` in its hello card, which
+  // is harmless (the spec is advisory) but blinds clients that want to
+  // route by declared model.
+  probeTimeoutMs?: number;
 }
 
 // Kept short and behaviour-focused. The risk we're guarding against is
@@ -186,6 +198,29 @@ interface StreamEvent {
   modelUsage?: unknown;
 }
 
+// Strip Claude Code's trailing tier suffix (e.g. `[1m]` for the 1M-context
+// variant) from a model id. The suffix appears in `system/init.model` and
+// `result.modelUsage` keys verbatim, but it is a Claude Code-specific
+// notation (the CLI reads it off `--model` / `ANTHROPIC_MODEL` /
+// settings.json `model` per-variable to pick a context tier); the
+// canonical Anthropic API id is just `claude-opus-4-7` (or its dated
+// form). Neither `@anthropic-ai/sdk` nor `@ai-sdk/anthropic` expose a
+// normaliser, and the openai-compat/v1 spec is silent on id format, so
+// this regex is the pragmatic option.
+//
+// Applied at both emission sites — the openai-compat/v1 `params.models[]`
+// advertise (from `system/init`) and the `usage.model` echo (from
+// `result.modelUsage`) — so the spec's "id SHOULD match usage.model"
+// cross-check holds against the canonical form. Side-effect: the
+// "running on the 1M tier" signal is dropped from the advertise; if a
+// caller ever needs that, it should ride a forward-compat sub-field
+// (e.g. `params.models[].contextWindow`), not the id itself.
+//
+// Exported for unit tests.
+export function normalizeClaudeModelId(raw: string): string {
+  return raw.replace(/\[[^\]]+\]$/, '');
+}
+
 // Parse Claude Code's `result.modelUsage` (a map keyed by model id with
 // per-model { inputTokens, outputTokens, cacheCreationInputTokens,
 // cacheReadInputTokens, ... }) into a spec-compliant OpenAICompatUsage.
@@ -228,7 +263,7 @@ export function parseClaudeModelUsageForOpenAICompat(raw: unknown): OpenAICompat
     prompt_tokens: promptSum,
     completion_tokens: completionSum,
     cached_tokens: cacheReadSum > 0 ? cacheReadSum : undefined,
-    model: primaryModel ?? undefined,
+    model: primaryModel ? normalizeClaudeModelId(primaryModel) : undefined,
   });
 }
 
@@ -316,6 +351,125 @@ function defaultSpawn(
     stdio: ['pipe', 'pipe', 'pipe'],
     ...(options.cwd ? { cwd: options.cwd } : {}),
   }) as ChildProcess;
+}
+
+// Argv for the resolveCapabilities probe. Stream-json so `system/init`
+// (the first non-rate-limit event, carrying the resolved `model`) lands
+// as a parseable line we can read and bail out from before any LLM call
+// is issued. We pass a minimal prompt because Claude Code rejects an
+// empty `-p` argument — the probe SIGTERMs the child as soon as the
+// init frame arrives, so the prompt is never actually sent to the API.
+//
+// Exported so tests can pin the exact argv the production resolveCapabilities
+// expects, without coupling to a string literal in two places.
+export const CLAUDE_PROBE_ARGS: readonly string[] = [
+  '-p',
+  'probe',
+  '--output-format',
+  'stream-json',
+  '--verbose',
+  '--include-partial-messages',
+];
+
+// Spawn `claude` with stream-json output, read until the `system/init`
+// event lands, capture its `model` field, and SIGTERM the child. Returns
+// `null` on any failure (spawn error, timeout, malformed stream, child
+// exits before init) so the caller can silently skip advertising.
+//
+// LLM cost: `system/init` is session metadata emitted before the model
+// is called — see https://code.claude.com/docs/en/headless ("The
+// system/init event reports session metadata including the model … It
+// is the first event in the stream"). Killing the child at this stage
+// produces no token usage. The rate_limit_event line that may precede
+// it is also pre-LLM and is ignored here.
+export async function probeClaudeModel(probeOpts: {
+  command: string;
+  spawn: ClaudeSpawnFn;
+  cwd?: string;
+  timeoutMs: number;
+}): Promise<string | null> {
+  return new Promise<string | null>((resolve) => {
+    let child: ClaudeChildHandle;
+    try {
+      child = probeOpts.spawn(probeOpts.command, CLAUDE_PROBE_ARGS, {
+        ...(probeOpts.cwd ? { cwd: probeOpts.cwd } : {}),
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+    let settled = false;
+    // No `.unref()` here. The probe always settles via either the timeout,
+    // a `system/init` line, or the child's close/error — and `settle()`
+    // clears the timer in every path. Calling `.unref()` only matters if
+    // the timer would otherwise outlive a daemon shutdown, but the probe
+    // runs once at startup and is awaited; the `await` already prevents
+    // any "linger after daemon exit" hazard. Worse, on Node's built-in
+    // test runner an unref'd timer can let the event loop idle out while
+    // the awaiting promise is still pending, which surfaces as
+    // `Promise resolution is still pending but the event loop has
+    // already resolved` and cancels the test plus everything after it
+    // in the same file. See vicoop-bridge#282 for the failure mode.
+    const timer = setTimeout(() => settle(null), probeOpts.timeoutMs);
+    function settle(value: string | null): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // best-effort
+      }
+      resolve(value);
+    }
+    let buf = '';
+    child.stdout?.on('data', (chunk: Buffer | string) => {
+      if (settled) return;
+      buf += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let evt: unknown;
+        try {
+          evt = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (!evt || typeof evt !== 'object' || Array.isArray(evt)) continue;
+        const e = evt as { type?: unknown; subtype?: unknown; model?: unknown };
+        if (
+          e.type === 'system' &&
+          e.subtype === 'init' &&
+          typeof e.model === 'string' &&
+          e.model.length > 0
+        ) {
+          // Normalise here (and not at the resolveCapabilities caller) so
+          // the function's contract — "returns the model id you'll see in
+          // `usage.model`" — holds across both emission sites.
+          const normalised = normalizeClaudeModelId(e.model);
+          if (normalised.length === 0) {
+            // The whole id was a bracketed tier marker — pathological,
+            // but treat as no signal rather than advertise an empty id
+            // and trip downstream zod min(1) checks.
+            settle(null);
+            return;
+          }
+          settle(normalised);
+          return;
+        }
+      }
+    });
+    // stderr is intentionally not surfaced — the probe is best-effort and
+    // a noisy `Notice:` from claude on a non-init code path should not
+    // produce a log line on every daemon start.
+    child.stderr?.on('data', () => {
+      /* drain */
+    });
+    child.on('close', () => settle(null));
+    child.on('error', () => settle(null));
+  });
 }
 
 function extractAssistantText(content: unknown): string {
@@ -1106,10 +1260,37 @@ export function createClaudeBackend(
     }
   }
 
+  const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
+
   return {
     name: 'claude',
 
     getSendFileMcpServer: () => sendFileMcp,
+
+    // Advertise the underlying model via the openai-compat/v1
+    // `params.models[]` slot (planetarium/oai2a2a#63) so A2A callers can
+    // route by declared model before the first task lands. The probe
+    // spawns `claude` with stream-json output, reads the `system/init`
+    // line, captures `model`, and SIGTERMs — no LLM call is made.
+    // Any failure (timeout, missing binary, malformed stream) returns
+    // `{}` and the card's declared capabilities are left untouched.
+    //
+    // `reasoning` is not set: Claude Code does not currently emit
+    // `completion_tokens_details.reasoning_tokens` in `usage`, and per
+    // spec "Absence means 'unspecified,' not 'false.'"
+    async resolveCapabilities() {
+      if (probeTimeoutMs <= 0) return {};
+      const model = await probeClaudeModel({
+        command,
+        spawn: spawnFn,
+        cwd,
+        timeoutMs: probeTimeoutMs,
+      });
+      if (!model) return {};
+      return {
+        openaiCompatModels: [{ id: model, default: true }],
+      };
+    },
 
     async handle(task, rawEmit, signal) {
       // Idle-silence heartbeat needs to observe every outbound frame so

@@ -81,6 +81,79 @@ export const AgentExtension = z.object({
 });
 export type AgentExtension = z.infer<typeof AgentExtension>;
 
+// Per planetarium/oai2a2a#63: `openai-compat/v1` AgentExtension may carry an
+// optional `params.models[]` advertise block. Each entry: `id` required;
+// `reasoning` / `default` optional. The shape is advisory and forward-compat
+// — receivers MUST ignore unknown sub-fields.
+export const OpenAICompatModelAdvertise = z.object({
+  id: z.string().min(1),
+  reasoning: z.boolean().optional(),
+  default: z.boolean().optional(),
+});
+export type OpenAICompatModelAdvertise = z.infer<typeof OpenAICompatModelAdvertise>;
+
+// `.passthrough()` so a future forward-compatible sub-field added in the same
+// extension URI (the spec explicitly allows additive growth without a new
+// URI) parses through ours instead of stripping the value.
+export const OpenAICompatExtensionParams = z
+  .object({
+    models: z.array(OpenAICompatModelAdvertise).optional(),
+  })
+  .passthrough();
+export type OpenAICompatExtensionParams = z.infer<typeof OpenAICompatExtensionParams>;
+
+// Build the `params` value for the openai-compat/v1 AgentExtension entry.
+// Returns `undefined` when `models` is empty so callers can omit `params`
+// entirely rather than emit a `{ models: [] }` that advertises emptiness —
+// per spec, absence of `params.models` MUST NOT be read as "no models
+// supported."
+//
+// First-wins `default` normalisation: spec says "At most one entry SHOULD
+// set default: true; if multiple do, receivers SHOULD treat the first as
+// the default." We enforce on the producer side by stripping `default` from
+// subsequent entries, so the wire we emit is always conformant.
+export function buildOpenAICompatExtensionParams(
+  models: readonly OpenAICompatModelAdvertise[],
+): OpenAICompatExtensionParams | undefined {
+  if (models.length === 0) return undefined;
+  let sawDefault = false;
+  const normalised = models.map((m) => {
+    if (!m.default) return { ...m };
+    if (sawDefault) {
+      const { default: _drop, ...rest } = m;
+      return { ...rest };
+    }
+    sawDefault = true;
+    return { ...m };
+  });
+  return { models: normalised };
+}
+
+// Return a shallow copy of `card` with `params.models` set on the
+// `openai-compat/v1` extension entry. No-op (returns the input as-is) when
+// `models` is empty or when the card does not declare the extension — we
+// never *add* the extension just to advertise models, because that would
+// imply support the agent may not have.
+export function withOpenAICompatModelsAdvertise(
+  card: AgentCard,
+  models: readonly OpenAICompatModelAdvertise[],
+): AgentCard {
+  const params = buildOpenAICompatExtensionParams(models);
+  if (!params) return card;
+  const exts = card.capabilities?.extensions;
+  if (!exts) return card;
+  const idx = exts.findIndex((e) => e.uri === OPENAI_COMPAT_EXTENSION_URI);
+  if (idx < 0) return card;
+  const target = exts[idx];
+  const mergedParams = { ...(target.params ?? {}), ...params };
+  const nextExts = exts.slice();
+  nextExts[idx] = { ...target, params: mergedParams };
+  return {
+    ...card,
+    capabilities: { ...card.capabilities, extensions: nextExts },
+  };
+}
+
 export const SecurityScheme = z.object({
   type: z.string(),
   scheme: z.string().optional(),
