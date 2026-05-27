@@ -149,9 +149,10 @@ const authCmd = command(
   },
 );
 
-// Deprecated flat aliases — kept for backward-compat (DEPRECATION_HINTS
-// in admin-cli.ts) but folded into one slot so optique's longestMatch
-// overload table doesn't blow up as we keep adding top-level commands.
+// Deprecated flat aliases — kept for backward-compat (each handler in
+// admin-cli.ts calls `warnDeprecated` before dispatching to the new
+// shape) but folded into one slot so optique's longestMatch overload
+// table doesn't blow up as we keep adding top-level commands.
 const legacyAdminCmds = longestMatch(
   addCallerCmd,
   removeCallerCmd,
@@ -169,15 +170,17 @@ const legacyAdminCmds = longestMatch(
 const cli = longestMatch(
   group('Run the daemon', startCmd),
   group('Identity', authCmd),
-  group('Agents', longestMatch(agentCmd, setupCmd)),
+  group('Agents', agentCmd),
   group('Runtime containers', containerCmd),
   group('Maintenance', longestMatch(upgradeCmd, infoCmd)),
   // Hidden by `hidden: 'help'` on each command; kept in the parser tree
-  // for back-compat and "did you mean?" suggestions.
+  // for back-compat and "did you mean?" suggestions. Sit outside the
+  // group() wrappers so they don't appear under any section header.
   loginCmd,
   logoutCmd,
-  legacyAdminCmds,
+  setupCmd,
   whoamiCmd,
+  legacyAdminCmds,
 );
 
 type CliArgs = InferValue<typeof cli>;
@@ -565,11 +568,11 @@ async function runUpgradeCmd(args: Extract<CliArgs, { action: 'upgrade' }>): Pro
 
 async function main(): Promise<void> {
   // Bare invocation prints help and exits 0. Pre-`start`-subcommand
-  // releases booted the daemon on empty argv; that surprised operators
-  // who ran `vicoop-client` expecting --help, and the daemon would
-  // happily open the WS until they noticed. Injecting `--help` lets
-  // optique render its own usage page and exit cleanly rather than
-  // surfacing the "no subcommand" parse failure as a non-zero exit.
+  // releases booted the daemon on empty argv; an operator who typed
+  // `vicoop-client` to see what was available would silently open the WS
+  // until they noticed. Injecting `--help` lets optique render its own
+  // usage page and exit cleanly rather than surfacing the "no subcommand"
+  // parse failure as a non-zero exit.
   if (process.argv.length <= 2) {
     process.argv.push('--help');
   }

@@ -499,8 +499,10 @@ runtime config (#189 §5). With `"backend": "openclaw"` persisted in
 
 > Bare `vicoop-client` (no subcommand) prints the top-level help and
 > exits 0; it no longer starts the daemon. Earlier releases booted the
-> daemon on empty argv, which would silently open the WS when an
-> operator only meant to run `--help`.
+> daemon on empty argv, which made an operator who just wanted to see
+> the help inadvertently open the WS. The flags-only form
+> (`vicoop-client --backend ...`) is rejected with a parse error now —
+> use `vicoop-client start --backend ...` instead.
 
 On success you'll see a `[client] connected, sending hello` log followed
 by an identity block — same data `vicoop-client auth whoami` would print, so

@@ -34,7 +34,8 @@ const sharedFlags = {
 // ----- New `agent <sub>` command group (#218) --------------------------------
 // `agent` is the operator-facing primary resource. The legacy `list-agents` /
 // `list-clients` / `revoke-client` / `{add,remove,list}-caller` commands below
-// remain as deprecated aliases (see DEPRECATION_HINTS).
+// remain as deprecated aliases; each handler calls `warnDeprecated` before
+// dispatching to the new shape.
 
 const agentListSubCmd = command(
   'list',
