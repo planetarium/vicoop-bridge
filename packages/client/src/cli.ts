@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import { existsSync, readFileSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { AgentCard } from '@vicoop-bridge/protocol';
+import { resolveBundledCard } from './bundled-cards.js';
 import { longestMatch, object } from '@optique/core/constructs';
 import { optional, withDefault } from '@optique/core/modifiers';
 import { command, constant, flag, option } from '@optique/core/primitives';
@@ -466,30 +465,18 @@ async function runWithShutdownTimeout(shutdown: () => Promise<void>): Promise<vo
 
 // Resolve the agent card the daemon should send inline on `hello`. Order:
 //   1. operator-supplied `--card` path (highest priority — full override)
-//   2. bundled `cards/<backend>.json` shipped with this package (default)
+//   2. embedded `BUNDLED_CARDS[backend]` shipped with this package (default)
 //   3. undefined — server falls back to its own canonical card for the
 //      backend kind. The server card is the right shape but lacks anything
 //      we'd want to advertise dynamically (e.g. openai-compat/v1
 //      `params.models`, per planetarium/oai2a2a#63), so always preferring
 //      the local bundle when present makes the advertise reachable.
-//
-// The lookup uses `import.meta.url` so it works both from `src/cli.ts`
-// during dev (resolves to `<pkg>/cards/<kind>.json`) and from the
-// published bundle's `dist/cli.js` (also `<pkg>/cards/<kind>.json`,
-// since `package.json` files include both `dist/` and `cards/`).
-function resolveBundledCardPath(backendKind: string): string | null {
-  const cliDir = path.dirname(fileURLToPath(import.meta.url));
-  // From `src/cli.ts` and `dist/cli.js` alike, `cards/` sits one level up.
-  const candidate = path.join(cliDir, '..', 'cards', `${backendKind}.json`);
-  return existsSync(candidate) ? candidate : null;
-}
-
 async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promise<void> {
   const args = resolveDaemonArgs(parsed);
-  const cardPath = args.card ?? resolveBundledCardPath(args.backend);
-  const agentCard = cardPath
-    ? AgentCard.parse(JSON.parse(readFileSync(cardPath, 'utf8')))
-    : undefined;
+  const raw = args.card
+    ? JSON.parse(readFileSync(args.card, 'utf8'))
+    : resolveBundledCard(args.backend);
+  const agentCard = raw ? AgentCard.parse(raw) : undefined;
 
   // Emit the resolved backend at startup so operators can verify which
   // backend the precedence chain picked (flag vs. config vs. default
