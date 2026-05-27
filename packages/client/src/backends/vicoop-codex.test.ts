@@ -210,6 +210,7 @@ test('historyToChatCompletionMessages: assistant tool_calls + tool result round-
   const msgs = historyToChatCompletionMessages([
     {
       role: 'assistant',
+      content: null,
       tool_calls: [
         {
           id: 'call_1',
@@ -235,13 +236,28 @@ test('historyToChatCompletionMessages: assistant tool_calls + tool result round-
   assert.equal(msgs[1].content, '{"temp":13}');
 });
 
-test('buildMessages: ordering — system → user → history', () => {
+test('historyToChatCompletionMessages: prior user/assistant text turns round-trip', () => {
+  // New chat_history shape carries every prior turn — plain text turns
+  // map 1:1 to Chat Completions messages.
+  const msgs = historyToChatCompletionMessages([
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: 'hello' },
+  ]);
+  assert.equal(msgs.length, 2);
+  assert.equal(msgs[0].role, 'user');
+  assert.equal(msgs[0].content, 'hi');
+  assert.equal(msgs[1].role, 'assistant');
+  assert.equal(msgs[1].content, 'hello');
+});
+
+test('buildMessages: ordering — system → history → user', () => {
   const msgs = buildMessages(
     {
       system: 'be concise',
-      tool_call_history: [
+      chat_history: [
         {
           role: 'assistant',
+          content: null,
           tool_calls: [{ id: 'c1', function: { name: 'x', arguments: '{}' } }],
         },
         { role: 'tool', tool_call_id: 'c1', content: 'result' },
@@ -251,10 +267,87 @@ test('buildMessages: ordering — system → user → history', () => {
   );
   assert.deepEqual(
     msgs.map((m) => m.role),
-    ['system', 'user', 'assistant', 'tool'],
+    ['system', 'assistant', 'tool', 'user'],
   );
   assert.equal(msgs[0].content, 'be concise');
-  assert.equal(msgs[1].content, 'current ask');
+  assert.equal(msgs[msgs.length - 1].content, 'current ask');
+});
+
+test('buildMessages: multi-turn tool-loop scenario from PR #289 keeps opening user at the head', () => {
+  // Regression guard for the gpt-5.3-codex re-call loop fixed by
+  // PR #289 (fix/vicoop-codex-user-turn-order). On the old
+  // `tool_call_history` wire that PR worked against, the prior tool
+  // round-trips were the only entries in metadata and the originating
+  // user request was nowhere in the assembled `messages` — so the
+  // model saw `[system, asst.tc, tool, asst.tc, tool, …, user]` and
+  // re-interpreted the trailing user as a fresh imperative, restarting
+  // from `list_workflows` on every turn.
+  //
+  // The new `chat_history` wire fixes this at the source: the gateway
+  // includes EVERY prior turn except the trailing user (so the
+  // originating user request is the first history entry). With
+  // `buildMessages` emitting `system → chat_history → trailing_user`,
+  // the assembled messages preserve the linear OpenAI conversation
+  // order automatically — no manual re-ordering needed.
+  //
+  // This test pins that invariant: the originating user request MUST
+  // be at index 1 (right after system), and the trailing user MUST be
+  // last, regardless of how many tool round-trips sit between them.
+  const msgs = buildMessages(
+    {
+      system: 'be concise',
+      chat_history: [
+        { role: 'user', content: 'list workflows then run X' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{ id: 'c1', function: { name: 'list_workflows', arguments: '{}' } }],
+        },
+        { role: 'tool', tool_call_id: 'c1', content: '[…]' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{ id: 'c2', function: { name: 'execute', arguments: '{}' } }],
+        },
+        { role: 'tool', tool_call_id: 'c2', content: 'started' },
+      ],
+    },
+    'how is it going?',
+  );
+  assert.deepEqual(
+    msgs.map((m) => m.role),
+    ['system', 'user', 'assistant', 'tool', 'assistant', 'tool', 'user'],
+  );
+  // Opening user at index 1 — the original request the tool rounds were
+  // driven by. The model needs to see this BEFORE any tool activity or
+  // it loses the thread and re-emits the first call.
+  assert.equal(msgs[1].content, 'list workflows then run X');
+  // Trailing user at the tail — the new question on this turn.
+  assert.equal(msgs[msgs.length - 1].content, 'how is it going?');
+});
+
+test('buildMessages: tool-continuation (null userContent) skips trailing user', () => {
+  // openai-compat spec edge case: when A2A parts is the empty
+  // placeholder, the caller passes null userContent and chat_history
+  // carries the full conversation including the trailing tool result.
+  const msgs = buildMessages(
+    {
+      chat_history: [
+        { role: 'user', content: 'kick off' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{ id: 'c1', function: { name: 'x', arguments: '{}' } }],
+        },
+        { role: 'tool', tool_call_id: 'c1', content: 'result' },
+      ],
+    },
+    null,
+  );
+  assert.deepEqual(
+    msgs.map((m) => m.role),
+    ['user', 'assistant', 'tool'],
+  );
 });
 
 test('buildMessages: no metadata still emits a user message', () => {
@@ -268,9 +361,10 @@ test('buildCallBody: forwards only tools / tool_choice from the existing 4-field
       system: 'sys',
       tools: [{ type: 'function', function: { name: 'x' } }],
       tool_choice: 'auto',
-      tool_call_history: [
+      chat_history: [
         {
           role: 'assistant',
+          content: null,
           tool_calls: [{ id: 'c1', function: { name: 'x', arguments: '{}' } }],
         },
         { role: 'tool', tool_call_id: 'c1', content: 'r' },
@@ -493,9 +587,10 @@ test('handle: stdin body carries only system/tools/tool_choice/history-derived m
           system: 'reply in korean',
           tools: [{ type: 'function', function: { name: 'get_weather' } }],
           tool_choice: { type: 'function', function: { name: 'get_weather' } },
-          tool_call_history: [
+          chat_history: [
             {
               role: 'assistant',
+              content: null,
               tool_calls: [
                 {
                   id: 'call_1',
@@ -534,11 +629,15 @@ test('handle: stdin body carries only system/tools/tool_choice/history-derived m
     };
     const payload = child.stdinPayload();
     const body = JSON.parse(payload) as Record<string, unknown>;
-    // Messages: system → user → assistant(tool_calls) → tool
+    // Messages: system → chat_history (assistant(tool_calls) → tool) →
+    // trailing user. Per the new openai-compat chat_history wire, the
+    // trailing user (the current A2A `parts` turn) sits AFTER the
+    // history slice, mirroring how OpenAI Chat Completions arranges
+    // `[..., assistant.tool_calls, tool, user]` for a follow-up.
     const messages = body.messages as Array<{ role: string }>;
     assert.deepEqual(
       messages.map((m) => m.role),
-      ['system', 'user', 'assistant', 'tool'],
+      ['system', 'assistant', 'tool', 'user'],
     );
     // Only the existing 4-field schema's `tools` / `tool_choice` are
     // forwarded; the spurious model/reasoning_effort/temperature/max_tokens

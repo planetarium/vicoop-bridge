@@ -7,10 +7,12 @@ import {
 import type { Backend } from '../backend.js';
 import { createLogger, type Logger } from '../logger.js';
 import {
+  dumpOpenAICompatTaskWire,
   parseOpenAICompatMetadata,
   type OpenAICompatHistoryEntry,
+  type OpenAICompatMessageContent,
   type OpenAICompatMetadata,
-} from './claude.js';
+} from './openai-compat.js';
 import {
   buildOpenAICompatUsage,
   type OpenAICompatUsage,
@@ -51,12 +53,16 @@ export interface VicoopCodexBackendOptions {
   stderrCaptureBytes?: number;
   callTimeoutMs?: number;
   logger?: Logger;
+  // When true, dump A2A `parts` shape + metadata keys + raw
+  // `chat_history` to stderr on every task. Operator diagnostic exposed
+  // via `--openai-compat-trace`. Leave off in production.
+  openaiCompatTrace?: boolean;
 }
 
 // `vicoop-codex call` body shape — only the fields this backend actually
 // emits. The openai-compat A2A extension defines `system` / `tools` /
-// `tool_choice` / `tool_call_history`, of which `system` and
-// `tool_call_history` fold into `messages`; the remaining two ride out
+// `tool_choice` / `chat_history`, of which `system` and
+// `chat_history` fold into `messages`; the remaining two ride out
 // verbatim. Everything else (model, reasoning_effort, parallel_tool_calls,
 // the Group B / Group C parameters from the call command's input doc) is
 // intentionally not on this shape because no input surface we currently
@@ -169,21 +175,46 @@ export function flattenA2AUserContent(parts: readonly Part[]): string | null {
   return sections.join('\n\n');
 }
 
-// Render `tool_call_history` entries as OpenAI Chat Completions messages
-// the way the doc's worked examples show: each `assistant.tool_calls[]`
-// entry maps to one assistant message with `content:null` and the full
-// `tool_calls` array, and each `role:"tool"` entry maps to one tool
-// message with `tool_call_id` + `content` (string).
+// Render `chat_history` entries as OpenAI Chat Completions messages
+// one-for-one — this backend speaks Chat Completions natively, so the
+// mapping is the identity:
+//   - role:"user"                       → user message (content string)
+//   - role:"assistant" (plain text)     → assistant message with the text content
+//   - role:"assistant" (text + tool_calls) → assistant message with BOTH the text
+//                                            content AND the tool_calls array
+//                                            (OpenAI Chat Completions allows the
+//                                            hybrid shape)
+//   - role:"assistant" (no text + tool_calls) → assistant message with
+//                                                content:null + tool_calls
+//   - role:"tool"                        → tool message with tool_call_id +
+//                                          (optional) name + content
 export function historyToChatCompletionMessages(
   history: OpenAICompatHistoryEntry[],
 ): ChatCompletionMessage[] {
   const out: ChatCompletionMessage[] = [];
   for (const entry of history) {
+    if (entry.role === 'user') {
+      out.push({
+        role: 'user',
+        content: openAIMessageContentToString(entry.content),
+      });
+      continue;
+    }
     if (entry.role === 'assistant') {
+      if ('tool_calls' in entry) {
+        out.push({
+          role: 'assistant',
+          content:
+            entry.content === null
+              ? null
+              : openAIMessageContentToString(entry.content),
+          tool_calls: entry.tool_calls,
+        });
+        continue;
+      }
       out.push({
         role: 'assistant',
-        content: null,
-        tool_calls: entry.tool_calls,
+        content: openAIMessageContentToString(entry.content),
       });
       continue;
     }
@@ -198,29 +229,61 @@ export function historyToChatCompletionMessages(
   return out;
 }
 
-// Assemble the messages array in linear conversation order: system, the
-// current user turn, then the prior tool_call_history (assistant → tool
-// round-trips).
+// vicoop-codex's `call` binary accepts string-or-multimodal-parts on
+// `messages[].content` but the binary's "Known limitations" section
+// states only text is forwarded — image / audio parts are silently
+// dropped. Flatten multimodal arrays to plain text here so the
+// downstream binary sees the shape it actually consumes.
+function openAIMessageContentToString(
+  content: OpenAICompatMessageContent,
+): string {
+  if (typeof content === 'string') return content;
+  const sections: string[] = [];
+  for (const part of content) {
+    if (part.type === 'text') {
+      const text = (part as { text?: unknown }).text;
+      if (typeof text === 'string' && text.length > 0) sections.push(text);
+    }
+    // image_url / unknown content-part types: dropped, mirroring the
+    // backend's documented text-only limitation.
+  }
+  return sections.join('\n\n');
+}
+
+// Assemble the full `messages` array for the call body. Order, per the
+// doc's "Per-role message JSON examples" section:
+//   1. system (from openai-compat.system; one entry)
+//   2. chat_history entries (prior user / assistant text turns + tool
+//      round-trips) mapped 1:1 to OpenAI Chat Completions messages
+//   3. current user turn (flattened from A2A parts)
+//
+// The user turn comes last so the model sees prior context before the
+// new instruction. When `userContent` is null (tool-continuation edge
+// case: A2A parts is the placeholder `[{text:""}]`), the trailing user
+// is omitted — the chat_history's last entry is the tool result the
+// model should respond to.
 export function buildMessages(
   meta: OpenAICompatMetadata | null,
-  userContent: string,
+  userContent: string | null,
 ): ChatCompletionMessage[] {
   const messages: ChatCompletionMessage[] = [];
   if (meta?.system) {
     messages.push({ role: 'system', content: meta.system });
   }
-  messages.push({ role: 'user', content: userContent });
-  if (meta?.tool_call_history) {
-    for (const m of historyToChatCompletionMessages(meta.tool_call_history)) {
+  if (meta?.chat_history) {
+    for (const m of historyToChatCompletionMessages(meta.chat_history)) {
       messages.push(m);
     }
+  }
+  if (userContent !== null) {
+    messages.push({ role: 'user', content: userContent });
   }
   return messages;
 }
 
 // Assemble the call body from the existing openai-compat A2A extension:
 //   - `tools` / `tool_choice` (read by the existing `parseOpenAICompatMetadata`)
-//   - the assembled `messages` array (from `system` + `tool_call_history`
+//   - the assembled `messages` array (from `system` + `chat_history`
 //     + current user turn — the other two fields of the extension)
 //
 // Nothing else is forwarded. The openai-compat A2A extension only defines
@@ -481,6 +544,7 @@ export function createVicoopCodexBackend(
   const stderrCap = opts.stderrCaptureBytes ?? 16 * 1024;
   const callTimeoutMs = opts.callTimeoutMs ?? 0;
   const logger = opts.logger ?? createLogger();
+  const openaiCompatTrace = opts.openaiCompatTrace === true;
 
   return {
     name: 'vicoop-codex',
@@ -497,14 +561,28 @@ export function createVicoopCodexBackend(
 
       // Use the existing openai-compat A2A extension reader (claude.ts).
       // It returns the 4-field schema { system, tools, tool_choice,
-      // tool_call_history } — the canonical surface every backend in this
+      // chat_history } — the canonical surface every backend in this
       // package already speaks. We do NOT define additional reader fields
       // here: extending the extension schema unilaterally would risk
       // breaking the contract other backends rely on.
       const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+      if (openaiCompatTrace) {
+        dumpOpenAICompatTaskWire(
+          'vicoop-codex',
+          task.taskId,
+          task.message.parts,
+          task.message.metadata,
+          openaiCompat,
+        );
+      }
 
       const userContent = flattenA2AUserContent(task.message.parts);
-      if (userContent === null) {
+      // Tool-continuation edge case (openai-compat spec): A2A parts is the
+      // placeholder `[{text:""}]` and the conversation lives in
+      // chat_history. Skip the empty_prompt check when chat_history will
+      // supply the user-side content via the prior-turns sequence.
+      const hasHistory = (openaiCompat?.chat_history?.length ?? 0) > 0;
+      if (userContent === null && !hasHistory) {
         emit({
           type: 'task.fail',
           taskId: task.taskId,
@@ -694,7 +772,7 @@ export function createVicoopCodexBackend(
       // echo above. The A2A `task.complete` state is always `completed`
       // (incl. `finish_reason: "tool_calls"`) because the tool-call round
       // is a successful turn from the bridge's perspective — the next A2A
-      // turn brings back the tool result via `tool_call_history`.
+      // turn brings back the tool result via `chat_history`.
       void finishReason;
     },
   };

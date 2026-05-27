@@ -752,32 +752,31 @@ test('image FilePart is materialised under a temp dir and passed as localImage U
   assert.equal(frames.at(-1)?.type, 'task.complete');
 });
 
-test('openai-compat tool_call_history injects user-message anchor + function_call pairs and sends empty-text turn/start.input (#233)', async () => {
+test('openai-compat chat_history injects prior turns as Responses API items; trailing user rides turn/start.input', async () => {
   // Codex absorbs `function_call` / `function_call_output` items as proper
   // prior tool dispatch — the model sees them as its own past actions and
-  // does not re-emit the same envelope (#176). The user prompt is prepended
-  // to the injected history as a `message`-type item so the conversation
-  // reads as `[user → assistant tool_call → tool result]` instead of orphan
-  // tool dispatch followed by a fresh user imperative (#233). With the
-  // prompt at the head AND codex's auto `<environment_context>` suppressed
-  // via `config.include_environment_context: false`, `turn/start.input`
-  // carries only an empty-text wake-up item: no synthetic user turn lands
-  // at the conversation tail, and the model finalises off the injected
-  // tool result instead of re-emitting the call.
+  // does not re-emit the same envelope (#176). Per the new chat_history
+  // spec (planetarium/oai2a2a#74), chat_history carries every prior turn
+  // EXCEPT the trailing user — so the originating user message is in
+  // chat_history as a `message` item, the tool round-trip follows, and
+  // the trailing user (the new question on this turn) rides
+  // `turn/start.input` normally. No synthetic anchor needed.
   const fake = makeFakeSpawn(() => happyPath());
   const backend = createCodexBackend({ spawn: fake.spawn });
   const { emit, frames } = collect();
   await backend.handle(
-    assign('next', 'ctx-hist', {
+    assign('follow up', 'ctx-hist', {
       message: {
         role: 'user',
         messageId: 'm',
-        parts: [{ kind: 'text', text: 'next' }],
+        parts: [{ kind: 'text', text: 'follow up' }],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
-            tool_call_history: [
+            chat_history: [
+              { role: 'user', content: 'kick off' },
               {
                 role: 'assistant',
+                content: null,
                 tool_calls: [
                   { id: 'tc1', function: { name: 'lookup', arguments: '{}' } },
                 ],
@@ -792,9 +791,9 @@ test('openai-compat tool_call_history injects user-message anchor + function_cal
     NEVER,
   );
 
-  // thread/inject_items must be sent between thread/start and turn/start,
-  // with the user message at the head followed by the function_call +
-  // function_call_output pair.
+  // thread/inject_items carries every chat_history entry in order. The
+  // originating user turn comes through as a message item (no separate
+  // anchor), the tool round-trip as the function_call + output pair.
   const inject = findRequest(fake.lastChild().stdinFrames(), 'thread/inject_items');
   assert.ok(inject, 'thread/inject_items observed');
   const injectParams = (inject as {
@@ -804,17 +803,60 @@ test('openai-compat tool_call_history injects user-message anchor + function_cal
     {
       type: 'message',
       role: 'user',
-      content: [{ type: 'input_text', text: 'next' }],
+      content: [{ type: 'input_text', text: 'kick off' }],
     },
     { type: 'function_call', call_id: 'tc1', name: 'lookup', arguments: '{}' },
     { type: 'function_call_output', call_id: 'tc1', output: 'OK' },
   ]);
 
-  // turn/start.input carries a single empty-string text item — the user
-  // prompt is already in the injected history; we still need *some* item
-  // because a literal `input: []` makes codex's model go silent (it gets
-  // called but never emits a final assistant message). An empty text item
-  // wakes the model with no visible placeholder content.
+  // turn/start.input carries the trailing user (the new question) — same
+  // path a non-extension task takes.
+  const turnStart = findRequest(fake.lastChild().stdinFrames(), 'turn/start');
+  const params = (turnStart as {
+    params?: { input?: Array<{ type: string; text?: string }> };
+  }).params;
+  assert.deepEqual(params?.input, [
+    { type: 'text', text: 'follow up', text_elements: [] },
+  ]);
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+});
+
+test('openai-compat chat_history with empty parts (tool-continuation) sends empty-text turn/start.input', async () => {
+  // Spec edge case: the inbound OpenAI request ends with `assistant.tool_calls`
+  // + `tool` (no trailing user), so the gateway emits A2A `parts` as the
+  // placeholder `[{text:""}]` and packs the full sequence into chat_history.
+  // The bridge must still wake the model — `input: []` makes codex go silent —
+  // so we synthesise a single empty-text item.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(
+    assign('', 'ctx-tool-cont', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: '' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            chat_history: [
+              { role: 'user', content: 'kick off' },
+              {
+                role: 'assistant',
+                content: null,
+                tool_calls: [
+                  { id: 'tc1', function: { name: 'lookup', arguments: '{}' } },
+                ],
+              },
+              { role: 'tool', tool_call_id: 'tc1', content: 'OK' },
+            ],
+          },
+        },
+      },
+    }),
+    emit,
+    NEVER,
+  );
+
   const turnStart = findRequest(fake.lastChild().stdinFrames(), 'turn/start');
   const params = (turnStart as {
     params?: { input?: Array<{ type: string; text?: string }> };
@@ -867,7 +909,7 @@ test('non-openai-compat thread/start omits include_environment_context (default 
   assert.equal(params?.config?.include_environment_context, undefined);
 });
 
-test('absent tool_call_history skips thread/inject_items entirely', async () => {
+test('absent chat_history skips thread/inject_items entirely', async () => {
   // First-turn tasks (no prior round-trips) must NOT send a dangling
   // empty-items inject.
   const fake = makeFakeSpawn(() => happyPath());
@@ -877,31 +919,43 @@ test('absent tool_call_history skips thread/inject_items entirely', async () => 
   assert.equal(inject, null);
 });
 
-test('historyToInjectItems prepends a user message anchor when userPrompt is given (#233)', () => {
-  // Anchor: without a preceding user turn the model treats the
-  // function_call / function_call_output pairs as orphan tool dispatch and
-  // re-emits the same call on every continuation turn. Prepending a
-  // `message`-type item reconstructs the OpenAI chat ordering.
-  const items = historyToInjectItems(
-    [
-      { role: 'assistant', tool_calls: [{ id: 't1', function: { name: 'f', arguments: '{}' } }] },
-      { role: 'tool', tool_call_id: 't1', content: 'ok' },
-    ],
-    'ask',
-  );
+test('historyToInjectItems maps prior user/assistant text turns to message items', () => {
+  // Per the new chat_history spec, plain user/assistant turns map 1:1 to
+  // OpenAI Responses API message items (`input_text` for user,
+  // `output_text` for assistant). The tool round-trip slice still fans
+  // out into function_call / function_call_output items.
+  const items = historyToInjectItems([
+    { role: 'user', content: 'kick off' },
+    { role: 'assistant', content: 'sure, on it' },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{ id: 't1', function: { name: 'f', arguments: '{}' } }],
+    },
+    { role: 'tool', tool_call_id: 't1', content: 'ok' },
+  ]);
   assert.deepEqual(items, [
-    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'ask' }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'kick off' }] },
+    {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'sure, on it' }],
+    },
     { type: 'function_call', call_id: 't1', name: 'f', arguments: '{}' },
     { type: 'function_call_output', call_id: 't1', output: 'ok' },
   ]);
 });
 
-test('historyToInjectItems omits the user-message anchor when userPrompt is empty', () => {
-  // Default empty prompt → no anchor item. Preserves the legacy shape for
-  // call sites that have already folded the prompt elsewhere (none in-tree
-  // currently, but the function is exported for unit reuse).
+test('historyToInjectItems: tool-only slice emits only function_call/function_call_output items', () => {
+  // A history slice that's only tool round-trips (no plain text) still
+  // produces the matching codex items — same shape the pre-spec wire used
+  // to carry.
   const items = historyToInjectItems([
-    { role: 'assistant', tool_calls: [{ id: 't1', function: { name: 'f', arguments: '{}' } }] },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{ id: 't1', function: { name: 'f', arguments: '{}' } }],
+    },
     { role: 'tool', tool_call_id: 't1', content: 'ok' },
   ]);
   assert.deepEqual(items, [
@@ -910,12 +964,11 @@ test('historyToInjectItems omits the user-message anchor when userPrompt is empt
   ]);
 });
 
-test('tool_call_history + image FilePart: prompt anchors inject_items; turn/start carries only the image (no text) (#233)', async () => {
-  // History present → user-message anchor inject + empty turn/start.input
-  // for text. Images still ride on `turn/start.input` via the existing
-  // `localImage` path because codex's `ContentItem::InputImage` wants a
-  // URL, not a local path — so they can't be inlined into the injected
-  // user message.
+test('chat_history + image FilePart: trailing user (text+image) rides turn/start.input', async () => {
+  // Per the new chat_history spec, chat_history holds the prior tool
+  // round-trip only; the trailing user (this turn's text + image) goes
+  // through `turn/start.input` normally — no synthetic anchor, no
+  // empty-text placeholder.
   const fake = makeFakeSpawn(() => happyPath());
   const backend = createCodexBackend({
     spawn: fake.spawn,
@@ -940,8 +993,12 @@ test('tool_call_history + image FilePart: prompt anchors inject_items; turn/star
         ],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
-            tool_call_history: [
-              { role: 'assistant', tool_calls: [{ id: 'tc1', function: { name: 'f', arguments: '{}' } }] },
+            chat_history: [
+              {
+                role: 'assistant',
+                content: null,
+                tool_calls: [{ id: 'tc1', function: { name: 'f', arguments: '{}' } }],
+              },
               { role: 'tool', tool_call_id: 'tc1', content: 'r' },
             ],
           },
@@ -956,20 +1013,20 @@ test('tool_call_history + image FilePart: prompt anchors inject_items; turn/star
   const injectItems = (inject as {
     params?: { items?: Array<Record<string, unknown>> };
   }).params?.items;
-  assert.deepEqual(injectItems?.[0], {
-    type: 'message',
-    role: 'user',
-    content: [{ type: 'input_text', text: 'caption please' }],
-  });
+  // Inject carries only the tool round-trip slice — no user-message
+  // anchor (the trailing user goes via turn/start.input).
+  assert.deepEqual(injectItems, [
+    { type: 'function_call', call_id: 'tc1', name: 'f', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'tc1', output: 'r' },
+  ]);
   const turnStart = findRequest(frames, 'turn/start');
   const input = (turnStart as {
     params?: { input?: Array<{ type: string; text?: string; path?: string }> };
   }).params?.input;
-  // Empty-text wake-up item + the image; the user's text prompt is in the
-  // injected history, NOT duplicated at the tail.
+  // The user's text + the image both ride turn/start.input normally.
   assert.equal(input?.length, 2);
   assert.equal(input?.[0]?.type, 'text');
-  assert.equal(input?.[0]?.text, '');
+  assert.equal(input?.[0]?.text, 'caption please');
   assert.equal(input?.[1]?.type, 'localImage');
 });
 
@@ -987,9 +1044,10 @@ test('parallel tool_calls in one assistant entry fan out into one function_call 
         parts: [{ kind: 'text', text: 'next' }],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
-            tool_call_history: [
+            chat_history: [
               {
                 role: 'assistant',
+                content: null,
                 tool_calls: [
                   { id: 'tc1', function: { name: 'a', arguments: '{"x":1}' } },
                   { id: 'tc2', function: { name: 'b', arguments: '{"y":2}' } },
@@ -1009,11 +1067,6 @@ test('parallel tool_calls in one assistant entry fan out into one function_call 
   const items = (inject as { params?: { items?: Array<Record<string, unknown>> } })
     .params?.items;
   assert.deepEqual(items, [
-    {
-      type: 'message',
-      role: 'user',
-      content: [{ type: 'input_text', text: 'next' }],
-    },
     { type: 'function_call', call_id: 'tc1', name: 'a', arguments: '{"x":1}' },
     { type: 'function_call', call_id: 'tc2', name: 'b', arguments: '{"y":2}' },
     { type: 'function_call_output', call_id: 'tc1', output: 'A' },
@@ -1177,7 +1230,7 @@ test('turn/start RPC error surfaces task.fail with turn_failed', async () => {
 // server request when the model invokes a caller-supplied dynamicTool. The
 // bridge captures it, emits an OpenAI-shaped `tool_calls` artifact, and
 // interrupts the turn so codex unwinds — the caller delivers the result on
-// the next A2A turn via `tool_call_history` (existing path). A2A surfaces
+// the next A2A turn via `chat_history` (existing path). A2A surfaces
 // the task as `completed` (not `canceled`) so OpenAI Chat Completions
 // callers see `finish_reason: "tool_calls"` semantics.
 test('openai-compat dynamicTools: item/tool/call → tool_calls artifact + completed task (#209)', async () => {
@@ -1764,8 +1817,12 @@ test('history-only openai-compat payload (no `tools`) does not disable codex bui
         parts: [{ kind: 'text', text: 'continue' }],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
-            tool_call_history: [
-              { role: 'assistant', tool_calls: [{ id: 'tc1', function: { name: 'x', arguments: '{}' } }] },
+            chat_history: [
+              {
+                role: 'assistant',
+                content: null,
+                tool_calls: [{ id: 'tc1', function: { name: 'x', arguments: '{}' } }],
+              },
               { role: 'tool', tool_call_id: 'tc1', content: 'OK' },
             ],
           },
@@ -1788,7 +1845,7 @@ test('openai-compat tasks always thread/start, never thread/resume — every tur
   // The OpenAI Chat Completions request is stateless: gateway replays the
   // full message history every turn. Reusing a codex thread across turns
   // would double-feed the model (persisted thread items + injected
-  // `tool_call_history`), which causes the model to drift onto stale
+  // `chat_history`), which causes the model to drift onto stale
   // results. So openai-compat opts out of session reuse entirely, and
   // every turn does `thread/start` with the disable-flags `config.features`
   // (no `thread/resume` to forget them on).

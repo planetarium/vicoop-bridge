@@ -7,11 +7,12 @@ import { OPENAI_COMPAT_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol'
 import type { Backend } from '../backend.js';
 import {
   buildOpenAICompatSystemPrompt,
-  formatToolCallHistory,
+  dumpOpenAICompatTaskWire,
+  formatChatHistory,
   parseOpenAICompatMetadata,
   tryParseToolCallsEnvelope,
   type OpenAICompatMetadata,
-} from './claude.js';
+} from './openai-compat.js';
 import {
   createBoundedFileReader,
   inferMimeFromPath,
@@ -545,7 +546,7 @@ export async function mapPartsToChatInput(
 // itself — so the contract is folded in as tagged XML blocks:
 //
 //   <system_instructions>…envelope contract + tools + tool_choice…</system_instructions>
-//   <tool_call_history>…JSON array of prior round-trips…</tool_call_history>  // optional
+//   <chat_history>…JSON array of prior conversation turns…</chat_history>  // optional
 //   <user_message>…the caller's actual text…</user_message>
 //
 // The wrapper tags exist so a host model that respects user-injected
@@ -557,9 +558,13 @@ export async function mapPartsToChatInput(
 //
 // `system_instructions` is omitted when `buildOpenAICompatSystemPrompt`
 // returns empty (e.g. a history-only payload with no tools / system /
-// tool_choice). `tool_call_history` is omitted when absent. The user-message
-// wrapper is always present so the model's mental model of where its
-// instructions end and the user's prompt begins is stable across turns.
+// tool_choice). `chat_history` is omitted when absent. Unlike claude,
+// openclaw folds the *entire* history (user/assistant text turns AND
+// tool round-trips) into the block — its single user-message channel
+// has no native multi-turn path to peel text turns off to. The
+// user-message wrapper is always present so the model's mental model of
+// where its instructions end and the user's prompt begins is stable
+// across turns.
 export function composeOpenAICompatUserMessage(
   meta: OpenAICompatMetadata,
   userText: string,
@@ -569,8 +574,9 @@ export function composeOpenAICompatUserMessage(
   if (sys) {
     blocks.push(`<system_instructions>\n${sys}\n</system_instructions>`);
   }
-  if (meta.tool_call_history) {
-    blocks.push(formatToolCallHistory(meta.tool_call_history));
+  if (meta.chat_history) {
+    const historyBlock = formatChatHistory(meta.chat_history);
+    if (historyBlock) blocks.push(historyBlock);
   }
   blocks.push(`<user_message>\n${userText}\n</user_message>`);
   return blocks.join('\n\n');
@@ -721,6 +727,12 @@ export interface OpenclawBackendOptions {
    * policy. Enabled by default; set enabled:false to require inline bytes.
    */
   fetchUriPolicy?: FetchUriPolicy;
+  /**
+   * When true, dump A2A `parts` shape + metadata keys + raw
+   * `chat_history` to stderr on every task. Operator diagnostic exposed
+   * via `--openai-compat-trace`. Leave off in production.
+   */
+  openaiCompatTrace?: boolean;
 }
 
 const DEFAULT_ATTACH_OUTPUTS_MAX_BYTES = 20 * 1024 * 1024;
@@ -967,6 +979,7 @@ export function createOpenclawBackend(
   );
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const now = opts.now ?? Date.now;
+  const openaiCompatTrace = opts.openaiCompatTrace === true;
   const setIntervalImpl =
     opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
   const clearIntervalImpl =
@@ -1396,12 +1409,21 @@ export function createOpenclawBackend(
 
       // Detect the openai-compat extension payload once per task so the
       // result feeds both the chat.send.message composition (system /
-      // tools / tool_choice / tool_call_history → tagged XML blocks
+      // tools / tool_choice / chat_history → tagged XML blocks
       // prepended to the user content, since OpenClaw has no system-prompt
       // wire seam) and the assistant artifact path (envelope JSON → data
       // part). Absent / malformed metadata leaves the run on the original
       // non-extension code path with no envelope-detection cost.
       const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+      if (openaiCompatTrace) {
+        dumpOpenAICompatTaskWire(
+          'openclaw',
+          task.taskId,
+          task.message.parts,
+          task.message.metadata,
+          openaiCompat,
+        );
+      }
       if (openaiCompat) {
         mapped.input.message = composeOpenAICompatUserMessage(
           openaiCompat,

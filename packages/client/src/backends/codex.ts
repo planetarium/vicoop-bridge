@@ -11,8 +11,9 @@ import type { Backend } from '../backend.js';
 import { createLogger, type Logger } from '../logger.js';
 import {
   callerToolDispatchActive,
+  dumpOpenAICompatTaskWire,
   parseOpenAICompatMetadata,
-} from './claude.js';
+} from './openai-compat.js';
 import {
   buildOpenAICompatUsage,
   makeOpenAICompatUsageMetadata,
@@ -37,7 +38,11 @@ import {
   type ThreadItem,
   type UserInputItem,
 } from './codex-rpc.js';
-import type { OpenAICompatHistoryEntry, OpenAICompatMetadata } from './claude.js';
+import type {
+  OpenAICompatHistoryEntry,
+  OpenAICompatMessageContent,
+  OpenAICompatMetadata,
+} from './openai-compat.js';
 
 export type CodexSandboxMode = SandboxMode;
 export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline';
@@ -82,6 +87,10 @@ export interface CodexBackendOptions {
   // probe silent and the card's declared capabilities unchanged. Defaults
   // to reading `${CODEX_HOME ?? ~/.codex}/config.toml` via `fs.readFile`.
   readCodexConfigToml?: () => Promise<string | null>;
+  // When true, dump A2A `parts` shape + metadata keys + raw
+  // `chat_history` to stderr on every task. Operator diagnostic exposed
+  // via `--openai-compat-trace`. Leave off in production.
+  openaiCompatTrace?: boolean;
 }
 
 interface SessionEntry {
@@ -443,67 +452,117 @@ export function composeNativeDevInstructions(meta: OpenAICompatMetadata): string
   return sections.join('\n\n');
 }
 
-// Map an openai-compat `tool_call_history` to OpenAI Responses API items
-// suitable for `thread/inject_items`. Each `assistant.tool_calls[]` entry
-// fans out into one `function_call` item; each `role:"tool"` entry maps to
-// a matching `function_call_output`. Order is preserved so call_id pairing
-// stays consistent with the originating conversation.
+// Flatten an OpenAI message `content` (string or content-part array) into
+// the codex Responses API text payload. The Responses API's
+// `content[].type` discriminator differs by role — `input_text` for
+// user/system input, `output_text` for assistant output — so the caller
+// passes which one applies. `image_url` content parts and unknown part
+// types are dropped: honouring `image_url` would require fetching the URL
+// to a local file (Responses API `input_image` takes a path/URL we'd have
+// to materialise) which we do not run on chat_history. Multimodal prior
+// turns are out of scope for the inject path; the trailing user's images
+// ride via `turn/start.input` as before.
+function chatHistoryContentToCodexParts(
+  content: OpenAICompatMessageContent,
+  partType: 'input_text' | 'output_text',
+): Array<{ type: string; text: string }> {
+  const flat: string[] = [];
+  if (typeof content === 'string') {
+    if (content) flat.push(content);
+  } else {
+    for (const part of content) {
+      if (part.type === 'text') {
+        const text = (part as { text?: unknown }).text;
+        if (typeof text === 'string' && text.length > 0) flat.push(text);
+      }
+    }
+  }
+  if (flat.length === 0) return [];
+  return [{ type: partType, text: flat.join('\n\n') }];
+}
+
+// Map an openai-compat `chat_history` to OpenAI Responses API items
+// suitable for `thread/inject_items`. Each entry maps as follows:
+//   - role:"user"               → message item with role:"user",
+//                                  content: [{ type: "input_text", ... }]
+//   - role:"assistant" (text)   → message item with role:"assistant",
+//                                  content: [{ type: "output_text", ... }]
+//   - role:"assistant" (tool_calls) → one `function_call` item per call
+//                                       (preceded by an output_text
+//                                       `message` item when the entry also
+//                                       carries text content — OpenAI Chat
+//                                       Completions permits the hybrid
+//                                       shape)
+//   - role:"tool"               → `function_call_output` item
+// Order is preserved so call_id pairing and turn ordering stay consistent
+// with the originating conversation.
 //
-// When `userPrompt` is non-empty, a `message` item with `role: "user"` is
-// prepended to the result. Without this anchor the model sees the
-// function_call / function_call_output pairs as orphan tool dispatch with
-// no preceding user turn, and then takes the fresh `turn/start.input` text
-// as a new imperative — re-emitting the same tool call instead of
-// finalising on the existing results (#233). Putting the user message at
-// the head reconstructs OpenAI Chat Completions ordering
-// (`[user, assistant tool_call, tool result]`) so the model treats the
-// tool results as satisfying the request.
+// Per the new chat_history spec, the trailing user turn is NOT in
+// chat_history — it rides A2A `parts` and reaches the model via
+// `turn/start.input`. The historic anchoring trick (#233 — prepend a
+// synthetic user-message item to give the function_call pairs context) is
+// therefore no longer needed: chat_history already opens with the
+// originating user turn.
 //
 // Malformed entries (missing id / function name) are skipped silently —
 // the gateway already validated the OpenAI request shape, so this is a
 // defensive last filter rather than an error surface.
 export function historyToInjectItems(
   history: OpenAICompatHistoryEntry[],
-  userPrompt: string = '',
 ): ResponsesApiItem[] {
   const out: ResponsesApiItem[] = [];
-  if (userPrompt) {
-    out.push({
-      type: 'message',
-      role: 'user',
-      content: [{ type: 'input_text', text: userPrompt }],
-    });
-  }
   for (const entry of history) {
-    if (entry.role === 'assistant') {
-      for (const tc of entry.tool_calls) {
-        if (!tc || typeof tc !== 'object') continue;
-        const call = tc as { id?: unknown; function?: unknown };
-        if (typeof call.id !== 'string' || !call.id) continue;
-        if (!call.function || typeof call.function !== 'object') continue;
-        const fn = call.function as { name?: unknown; arguments?: unknown };
-        if (typeof fn.name !== 'string' || !fn.name) continue;
-        // OpenAI spec: `function.arguments` is a JSON-encoded string. Some
-        // producers send the parsed object instead — re-stringify so the
-        // Responses API item is spec-compliant either way.
-        const args =
-          typeof fn.arguments === 'string'
-            ? fn.arguments
-            : JSON.stringify(fn.arguments ?? {});
-        out.push({
-          type: 'function_call',
-          call_id: call.id,
-          name: fn.name,
-          arguments: args,
-        });
-      }
-    } else {
-      out.push({
-        type: 'function_call_output',
-        call_id: entry.tool_call_id,
-        output: entry.content,
-      });
+    if (entry.role === 'user') {
+      const content = chatHistoryContentToCodexParts(entry.content, 'input_text');
+      if (content.length === 0) continue;
+      out.push({ type: 'message', role: 'user', content });
+      continue;
     }
+    if (entry.role === 'assistant') {
+      if ('tool_calls' in entry) {
+        // Hybrid (text + tool_calls): emit the assistant text message
+        // FIRST, then the function_call items — matching the order the
+        // model emitted them so the conversation reads as
+        // "{explanation} → {tool dispatch}".
+        if (entry.content !== null) {
+          const content = chatHistoryContentToCodexParts(entry.content, 'output_text');
+          if (content.length > 0) {
+            out.push({ type: 'message', role: 'assistant', content });
+          }
+        }
+        for (const tc of entry.tool_calls) {
+          if (!tc || typeof tc !== 'object') continue;
+          const call = tc as { id?: unknown; function?: unknown };
+          if (typeof call.id !== 'string' || !call.id) continue;
+          if (!call.function || typeof call.function !== 'object') continue;
+          const fn = call.function as { name?: unknown; arguments?: unknown };
+          if (typeof fn.name !== 'string' || !fn.name) continue;
+          // OpenAI spec: `function.arguments` is a JSON-encoded string.
+          // Some producers send the parsed object instead — re-stringify
+          // so the Responses API item is spec-compliant either way.
+          const args =
+            typeof fn.arguments === 'string'
+              ? fn.arguments
+              : JSON.stringify(fn.arguments ?? {});
+          out.push({
+            type: 'function_call',
+            call_id: call.id,
+            name: fn.name,
+            arguments: args,
+          });
+        }
+        continue;
+      }
+      const content = chatHistoryContentToCodexParts(entry.content, 'output_text');
+      if (content.length === 0) continue;
+      out.push({ type: 'message', role: 'assistant', content });
+      continue;
+    }
+    out.push({
+      type: 'function_call_output',
+      call_id: entry.tool_call_id,
+      output: entry.content,
+    });
   }
   return out;
 }
@@ -530,6 +589,7 @@ export function createCodexBackend(
   const sessionTtlMs = opts.sessionTtlMs ?? 60 * 60 * 1000;
   const now = opts.now ?? Date.now;
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const openaiCompatTrace = opts.openaiCompatTrace === true;
   const setIntervalImpl =
     opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
   const clearIntervalImpl =
@@ -857,21 +917,31 @@ export function createCodexBackend(
 
         // Detect the openai-compat extension once. The system-prompt text
         // feeds `developerInstructions` on the next thread/start; any
-        // `tool_call_history` is materialised as native Responses API
-        // items and pushed through `thread/inject_items` after thread/start
-        // (see `historyToInjectItems` below) — this gives the model a real
-        // function-call history rather than a JSON blob it has to be
-        // instructed to interpret, eliminating the multi-turn re-call loop
-        // observed under prompts like `"Use a tool to list …"` (#176).
+        // `chat_history` is materialised as native Responses API items and
+        // pushed through `thread/inject_items` after thread/start (see
+        // `historyToInjectItems` below) — this gives the model a real
+        // prior conversation (user/assistant text turns + function-call
+        // history) rather than a JSON blob it has to be instructed to
+        // interpret, eliminating the multi-turn re-call loop observed under
+        // prompts like `"Use a tool to list …"` (#176).
         //
         // When the caller supplies tools, the codex backend dispatches them
         // natively via `thread/start.dynamicTools` + `item/tool/call` server
         // requests (#209), not via the JSON-text envelope contract — so the
         // `developerInstructions` is just the user's `system` text plus a
         // short `tool_choice` nudge when applicable. The wire shape we emit
-        // upstream (`tool_calls` artifact, `tool_call_history` input) is
+        // upstream (`tool_calls` artifact, `chat_history` input) is
         // unchanged so callers see no difference.
         const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+        if (openaiCompatTrace) {
+          dumpOpenAICompatTaskWire(
+            'codex',
+            task.taskId,
+            task.message.parts,
+            task.message.metadata,
+            openaiCompat,
+          );
+        }
         const dynamicTools =
           openaiCompat && callerToolDispatchActive(openaiCompat) && openaiCompat.tools
             ? openaiToolsToDynamicToolSpecs(openaiCompat.tools)
@@ -880,34 +950,44 @@ export function createCodexBackend(
           ? composeNativeDevInstructions(openaiCompat)
           : '';
 
-        const mapped = await mapPartsToCodexInput(task.message.parts, {
+        const mappedRaw = await mapPartsToCodexInput(task.message.parts, {
           mkdtemp,
           writeFile,
           rm,
         });
         recorder.mark('map');
-        if (!mapped.ok) {
+
+        // Tool-continuation edge case (openai-compat spec): the inbound
+        // request ends with `assistant.tool_calls` + `tool` rather than a
+        // user turn, so the gateway emits A2A `parts` as `[{ text: "" }]`
+        // and stuffs the whole sequence into `chat_history`.
+        // `mapPartsToCodexInput` returns `empty_prompt` on those parts;
+        // tolerate it when the history carries entries that will end up as
+        // the conversation context.
+        const isToolContinuation =
+          !mappedRaw.ok &&
+          mappedRaw.code === 'empty_prompt' &&
+          (openaiCompat?.chat_history?.length ?? 0) > 0;
+        if (!mappedRaw.ok && !isToolContinuation) {
           emit({
             type: 'task.fail',
             taskId: task.taskId,
-            error: { code: mapped.code, message: mapped.message },
+            error: { code: mappedRaw.code, message: mappedRaw.message },
           });
           return;
         }
+        const mapped = mappedRaw.ok
+          ? mappedRaw
+          : { ok: true as const, prompt: '', imageFiles: [], tempDir: null };
 
-        // When `tool_call_history` is present, the user prompt is prepended
-        // to the injected history as a `message`-type item with
-        // `role: "user"` so the model sees a coherent
-        // `[user → assistant tool_call → tool result]` conversation. Without
-        // this anchor the function_call / function_call_output pairs read
-        // as orphan tool dispatch and the model takes the next user prompt
-        // as a fresh imperative — the re-call loop #233 captured.
+        // Per the new chat_history spec, chat_history already includes the
+        // originating user turn, so the inject pass needs no anchor — we
+        // emit user / assistant text turns as `message` items and tool
+        // round-trips as `function_call`/`function_call_output` items. The
+        // trailing user (from A2A `parts`) rides `turn/start.input` as it
+        // always did.
         //
-        // `turn/start.input` then carries a single empty-string text item
-        // instead of the user prompt:
-        //   - The user prompt is already in the injected history at the
-        //     head, so re-sending it at the tail would trigger
-        //     fresh-imperative interpretation and re-trigger #233.
+        // Empty-text input note (kept for the tool-continuation edge case):
         //   - A truly empty input array (`[]`) goes silent on codex's
         //     app-server — the model is called against pure history but
         //     never emits a final assistant message. A present-but-empty
@@ -915,20 +995,19 @@ export function createCodexBackend(
         //     placeholder content in the conversation.
         //   - Images still ride on `turn/start.input` via the existing
         //     `localImage` path; codex's `ContentItem::InputImage` wants a
-        //     URL, not a local path, so they can't be inlined into the
-        //     injected user-message anchor.
+        //     URL, not a local path, so they can't be inlined into injected
+        //     message items.
         // Combined with `config.include_environment_context: false` at
         // thread/start (which suppresses codex's auto-injected
         // `<environment_context>` user turn), the model receives an OpenAI
-        // Chat Completions-shaped conversation that ends in the tool
-        // result, and finalises off it.
-        const historyInjectItems = openaiCompat?.tool_call_history
-          ? historyToInjectItems(openaiCompat.tool_call_history, mapped.prompt)
+        // Chat Completions-shaped conversation built from chat_history + the
+        // trailing user, and finalises off it.
+        const historyInjectItems = openaiCompat?.chat_history
+          ? historyToInjectItems(openaiCompat.chat_history)
           : null;
-        const userPromptInjected = historyInjectItems !== null && mapped.prompt !== '';
 
         try {
-          const userInput = userPromptInjected
+          const userInput = isToolContinuation
             ? [
                 { type: 'text' as const, text: '', text_elements: [] as never[] },
                 ...buildUserInput('', mapped.imageFiles),
@@ -960,7 +1039,7 @@ export function createCodexBackend(
           // Chat Completions request is stateless and replays the full
           // history every turn, so resuming a prior codex thread would
           // double-feed the model — once from the persisted thread items,
-          // once from the gateway-replayed `tool_call_history` we inject.
+          // once from the gateway-replayed `chat_history` we inject.
           // The duplicate user prompts / function_call pairs that
           // accumulate cause the model to drift (e.g. parroting an earlier
           // tool result instead of answering a fresh question). Force a
@@ -1146,13 +1225,13 @@ export function createCodexBackend(
                 });
               }
             }
-            // Append prior round-trips (if any) as native Responses API
+            // Append prior conversation (if any) as native Responses API
             // items so codex's session builder includes them in the model
-            // prompt as proper function-call history. Without this, the
-            // model only sees a JSON `tool_call_history` blob in user text
-            // and may re-emit the same envelope when the user prompt
-            // contains a "use a tool" imperative (#176). Skip when there
-            // are no items to inject.
+            // prompt as proper user/assistant turns + function-call
+            // history. Without this, the model only sees a JSON
+            // `chat_history` blob in user text and may re-emit the same
+            // envelope when the user prompt contains a "use a tool"
+            // imperative (#176). Skip when there are no items to inject.
             if (historyInjectItems && historyInjectItems.length > 0) {
               await client.request('thread/inject_items', {
                 threadId,
@@ -1249,7 +1328,7 @@ export function createCodexBackend(
               // the model's function_call is already surfaced upstream and
               // we don't want it generating further text or chaining into
               // another tool call before the caller has had a chance to
-              // reply via `tool_call_history`.
+              // reply via `chat_history`.
               if (activeTurnId) {
                 void client
                   .request('turn/interrupt', { threadId, turnId: activeTurnId })
@@ -1488,7 +1567,7 @@ export function createCodexBackend(
               // fall through to the completion path so the task surfaces as
               // success with `finish_reason: "tool_calls"` semantics on the
               // caller side (the next A2A turn ships the result via
-              // `tool_call_history`).
+              // `chat_history`).
             } else {
               rollbackFreshThread();
               rollbackResumeRefresh();

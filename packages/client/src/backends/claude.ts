@@ -32,6 +32,14 @@ import {
 } from './fetch-uri-file.js';
 import { createLogger, safeToken } from '../logger.js';
 import { createTimingRecorder } from './timing.js';
+import {
+  callerToolDispatchActive,
+  describeToolChoice,
+  dumpOpenAICompatTaskWire,
+  formatChatHistory,
+  parseOpenAICompatMetadata,
+  type OpenAICompatMetadata,
+} from './openai-compat.js';
 
 // Slim subset of ChildProcess that the backend actually uses. Tests inject a
 // fake that satisfies this without wiring up a real OS process.
@@ -132,6 +140,10 @@ export interface ClaudeBackendOptions {
   // is harmless (the spec is advisory) but blinds clients that want to
   // route by declared model.
   probeTimeoutMs?: number;
+  // When true, dump A2A `parts` shape + metadata keys + raw
+  // `chat_history` to stderr on every task. Operator diagnostic exposed
+  // via `--openai-compat-trace`. Leave off in production.
+  openaiCompatTrace?: boolean;
 }
 
 // Kept short and behaviour-focused. The risk we're guarding against is
@@ -594,199 +606,6 @@ function traceabilityRequested(task: {
   );
 }
 
-// One entry of `tool_call_history` — either an `assistant` turn echoing the
-// model's prior tool_calls envelope, or a `tool` turn carrying the function
-// return that the gateway executed externally. Mirrors OpenAI Chat
-// Completions message shape for these two roles.
-export interface OpenAICompatHistoryAssistant {
-  role: 'assistant';
-  tool_calls: unknown[];
-}
-export interface OpenAICompatHistoryTool {
-  role: 'tool';
-  tool_call_id: string;
-  name?: string;
-  // OpenAI permits string-or-content-parts; on the wire we require string so
-  // gateways own the normalisation. Bridges treat it as opaque text.
-  content: string;
-}
-export type OpenAICompatHistoryEntry =
-  | OpenAICompatHistoryAssistant
-  | OpenAICompatHistoryTool;
-
-// Payload of the openai-compat A2A extension as carried under
-// `Message.metadata[OPENAI_COMPAT_EXTENSION_URI]`. Each field is optional and
-// is forwarded verbatim from the OpenAI-shaped originating request.
-export interface OpenAICompatMetadata {
-  system?: string;
-  tools?: unknown[];
-  tool_choice?: unknown;
-  tool_call_history?: OpenAICompatHistoryEntry[];
-}
-
-// Whole-array validator for `tool_call_history`. Returns null (caller drops
-// the field) on ANY malformed entry rather than skipping it — order and
-// id-pairings between `assistant.tool_calls` and `role:"tool"` results
-// matter, so dropping a middle entry would silently break the model's view
-// of the prior round. Strict-or-nothing is safer than forgiving-with-holes.
-function parseToolCallHistory(raw: unknown[]): OpenAICompatHistoryEntry[] | null {
-  if (raw.length === 0) return null;
-  const out: OpenAICompatHistoryEntry[] = [];
-  for (const entry of raw) {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
-    const e = entry as Record<string, unknown>;
-    if (
-      e.role === 'assistant' &&
-      Array.isArray(e.tool_calls) &&
-      e.tool_calls.length > 0
-    ) {
-      out.push({ role: 'assistant', tool_calls: e.tool_calls });
-      continue;
-    }
-    if (
-      e.role === 'tool' &&
-      typeof e.tool_call_id === 'string' &&
-      e.tool_call_id.length > 0 &&
-      typeof e.content === 'string'
-    ) {
-      const toolEntry: OpenAICompatHistoryTool = {
-        role: 'tool',
-        tool_call_id: e.tool_call_id,
-        content: e.content,
-      };
-      if (typeof e.name === 'string' && e.name.length > 0) toolEntry.name = e.name;
-      out.push(toolEntry);
-      continue;
-    }
-    return null;
-  }
-  return out;
-}
-
-// True when the caller has supplied tool definitions AND has not explicitly
-// disabled tool use (`tool_choice === "none"`). Backends consult this to
-// decide whether to suppress agent-side built-in tools that would otherwise
-// bypass the envelope-emit contract — see #175 for the codex case (built-in
-// shell/exec executed `ls` directly instead of emitting a `tool_calls`
-// envelope for the caller's `bash` definition) and #178 for the same
-// pattern in claude (built-in Read/Glob/Bash served a `ls` request without
-// surfacing the caller's `List`). The condition mirrors `hasTools` in
-// `buildOpenAICompatSystemPrompt` so the gate that enables the envelope
-// contract in the prompt is the same gate that disables the conflicting
-// built-ins.
-export function callerToolDispatchActive(meta: OpenAICompatMetadata | null): boolean {
-  if (!meta) return false;
-  if (meta.tools === undefined) return false;
-  return meta.tool_choice !== 'none';
-}
-
-// Extract and shape-check the openai-compat metadata key. Returns null when
-// the metadata key is absent, malformed, or actionably empty (all four
-// fields missing or trivial) so the caller can fall back to its non-extension
-// path without conditional null-checks on every read.
-export function parseOpenAICompatMetadata(
-  metadata: Record<string, unknown> | undefined,
-): OpenAICompatMetadata | null {
-  if (!metadata) return null;
-  const raw = metadata[OPENAI_COMPAT_EXTENSION_URI];
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const r = raw as Record<string, unknown>;
-  const out: OpenAICompatMetadata = {};
-  if (typeof r.system === 'string' && r.system.length > 0) out.system = r.system;
-  if (Array.isArray(r.tools) && r.tools.length > 0) out.tools = r.tools;
-  if (r.tool_choice !== undefined && r.tool_choice !== null) out.tool_choice = r.tool_choice;
-  if (Array.isArray(r.tool_call_history)) {
-    const history = parseToolCallHistory(r.tool_call_history);
-    if (history) out.tool_call_history = history;
-  }
-  if (
-    out.system === undefined &&
-    out.tools === undefined &&
-    out.tool_choice === undefined &&
-    out.tool_call_history === undefined
-  ) {
-    return null;
-  }
-  return out;
-}
-
-function describeToolChoice(toolChoice: unknown): string | null {
-  if (toolChoice === undefined || toolChoice === null) return null;
-  if (toolChoice === 'auto') {
-    return 'tool_choice="auto": call a function only if appropriate; otherwise answer in natural language.';
-  }
-  if (toolChoice === 'required') {
-    return 'tool_choice="required": you MUST emit a tool_calls envelope — answering in natural language is not allowed for this turn.';
-  }
-  if (typeof toolChoice === 'object' && !Array.isArray(toolChoice)) {
-    const c = toolChoice as { type?: unknown; function?: unknown };
-    if (c.type === 'function' && c.function && typeof c.function === 'object') {
-      const fn = c.function as { name?: unknown };
-      if (typeof fn.name === 'string' && fn.name.length > 0) {
-        return `tool_choice: you MUST emit a tool_calls envelope that calls the function named "${fn.name}".`;
-      }
-    }
-  }
-  return null;
-}
-
-// Build the system-prompt text injected via `--append-system-prompt` when the
-// openai-compat extension is active. Composition rules:
-//
-//   - User-supplied `system` (if any) is included verbatim, first.
-//   - The tool-envelope contract block is included only when `tools` were
-//     provided and `tool_choice` is not "none" — without tools the envelope
-//     would be a contract the model can't satisfy. With tool_choice="none"
-//     we instead emit a short "do not use the envelope" directive so the
-//     gateway's intent is preserved.
-//   - A tool_choice descriptor line is appended when the value is one of
-//     the recognised shapes (`"auto"` / `"required"` / `{type:"function",
-//     function:{name}}`); unrecognised values are silently dropped because
-//     the model can't act on a shape it doesn't understand.
-export function buildOpenAICompatSystemPrompt(meta: OpenAICompatMetadata): string {
-  const sections: string[] = [];
-  if (meta.system) sections.push(meta.system);
-
-  const toolChoiceIsNone = meta.tool_choice === 'none';
-  const hasTools = meta.tools !== undefined && !toolChoiceIsNone;
-
-  if (hasTools) {
-    sections.push(
-      [
-        'You are routed through an OpenAI-compatible gateway and have access to the following callable functions.',
-        '',
-        'When you decide a function should be called, respond with ONLY a single JSON object (no prose, no code fences, no markdown) of the exact shape:',
-        '',
-        '{"tool_calls":[{"id":"call_<unique>","function":{"name":"<fn name>","arguments":{<args as JSON object>}}}]}',
-        '',
-        '- "id" must be a unique string starting with "call_".',
-        '- "arguments" must be a JSON object matching the function\'s parameters schema.',
-        '- Emit nothing outside the JSON object.',
-        '- Do not execute the function yourself; just emit the call.',
-        '- If no function should be called, answer normally in natural language.',
-        '',
-        // History-block contract: aligned with `formatToolCallHistory`'s
-        // rendering. The model needs to know how to read the block AND that
-        // already-resolved calls must not be repeated, otherwise it'll loop.
-        'On follow-up turns the user message may begin with a <tool_call_history>...</tool_call_history> block containing a JSON array of prior round-trips. Each entry is one of:',
-        '  - {"role":"assistant","tool_calls":[...]} — calls you previously emitted on an earlier turn.',
-        '  - {"role":"tool","tool_call_id":"call_…","name":"…","content":"…"} — the authoritative return value for one of those calls.',
-        'Treat the history as the source of truth for what has happened so far. Do NOT repeat a call whose tool_call_id already appears in the history. Either emit a NEW tool_calls envelope (to chain another call) or compose a natural-language answer using the prior results.',
-        '',
-        'Available functions:',
-        JSON.stringify(meta.tools, null, 2),
-      ].join('\n'),
-    );
-    const tcDesc = describeToolChoice(meta.tool_choice);
-    if (tcDesc) sections.push(tcDesc);
-  } else if (toolChoiceIsNone) {
-    sections.push(
-      'A list of OpenAI-style tools was supplied with tool_choice="none". Do not emit a tool_calls envelope; always answer in natural language.',
-    );
-  }
-
-  return sections.join('\n\n');
-}
 
 // Map the caller-provided OpenAI `tools` array (the wire shape used in
 // OpenAI Chat Completions: `{ type: 'function', function: { name, description,
@@ -836,11 +655,14 @@ export function openaiToolsToCallerToolDefs(
 //   - Caller's `system` text — verbatim, first. No other transport carries
 //     it: MCP `tools/list` only describes tools, not the conversation's
 //     system message.
-//   - How to read the `<tool_call_history>` block. Follow-up turns
-//     text-prepend the history (`formatToolCallHistory`) because claude has
-//     no native equivalent of codex's `thread/inject_items`. The model has
-//     to know the block is authoritative and not to re-emit a call whose
-//     result is already recorded.
+//   - How to read the `<chat_history>` block. Follow-up turns text-prepend
+//     the tool-round-trip slice of chat_history (`formatChatHistory`)
+//     because claude has no native equivalent of codex's
+//     `thread/inject_items`. The model has to know the block is
+//     authoritative and not to re-emit a call whose result is already
+//     recorded. Prior plain user/assistant text turns ride the native
+//     conversation surface (assistant-role messages prepended to
+//     `contentBlocks`), not the block.
 //   - tool_choice descriptor for `"required"` and `{type:"function",
 //     function:{name}}` — claude has no native `tool_choice` flag, so the
 //     prompt is the only place we can express it.
@@ -869,7 +691,7 @@ export function buildOpenAICompatNativeSystemPrompt(meta: OpenAICompatMetadata):
       [
         'You are routed through an OpenAI-compatible gateway. The caller has supplied function tools that appear in your native tool list — invoke them through your normal tool-use surface.',
         '',
-        'The user message may begin with a <tool_call_history>...</tool_call_history> block holding a JSON array of prior round-trips: {"role":"assistant","tool_calls":[...]} for calls you previously emitted, and {"role":"tool","tool_call_id":"call_…","name":"…","content":"…"} for the authoritative result of each call. Treat the block as the source of truth for what has happened so far — do not re-emit a call whose `tool_call_id` already has a recorded result.',
+        'The user message may begin with a <chat_history>...</chat_history> block holding a JSON array of the prior conversation: prior {"role":"user","content":"…"} and {"role":"assistant","content":"…"} text turns, plus {"role":"assistant","content":null,"tool_calls":[...]} for calls you previously emitted and {"role":"tool","tool_call_id":"call_…","name":"…","content":"…"} for the authoritative result of each call. Treat the block as the source of truth for what has happened so far — read it as prior conversation, not as a fresh instruction. Do not re-emit a call whose `tool_call_id` already has a recorded result.',
       ].join('\n'),
     );
     const tcDesc = describeToolChoice(meta.tool_choice);
@@ -883,50 +705,6 @@ export function buildOpenAICompatNativeSystemPrompt(meta: OpenAICompatMetadata):
   return sections.join('\n\n');
 }
 
-// Render a `tool_call_history` payload as a `<tool_call_history>`-wrapped
-// JSON block. Goes at the front of the user content on follow-up turns so
-// the model reads the prior round before the new instruction; the wrapper
-// tag makes the boundary unambiguous against the user's own text. The
-// inner array is the parsed history verbatim — same shape as on the wire,
-// so the model only has to learn one structure (also taught in the
-// SYSTEM_INSTRUCTION above).
-//
-// Note: the `codex` backend bypasses this text-prepend and instead injects
-// native Responses API `function_call` / `function_call_output` items via
-// `thread/inject_items` (see historyToInjectItems in codex.ts) — that gives
-// the model proper native tool-call history rather than a JSON blob it has
-// to be instructed to interpret. claude / openclaw still use this textual
-// form because their native conversation channels are different.
-export function formatToolCallHistory(history: OpenAICompatHistoryEntry[]): string {
-  return [
-    '<tool_call_history>',
-    JSON.stringify(history, null, 2),
-    '</tool_call_history>',
-  ].join('\n');
-}
-
-// Attempt to interpret an assistant message as the OpenAI tool-call envelope
-// the SYSTEM_INSTRUCTION above teaches the model to emit. Returns the parsed
-// envelope verbatim (preserving unknown keys) when the trimmed text parses as
-// a JSON object carrying a `tool_calls` array; otherwise null so the caller
-// falls back to a text artifact. Strict: a leading non-`{` character (prose
-// preamble, code fence, etc.) short-circuits without paying the JSON.parse.
-export function tryParseToolCallsEnvelope(
-  text: string,
-): (Record<string, unknown> & { tool_calls: unknown[] }) | null {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith('{')) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-  const obj = parsed as Record<string, unknown>;
-  if (!Array.isArray(obj.tool_calls)) return null;
-  return obj as Record<string, unknown> & { tool_calls: unknown[] };
-}
 
 // Pull `tool_use` blocks out of an `assistant`-role message's content
 // array. Each one becomes one `claude-tool-call` artifact upstream, with
@@ -1161,6 +939,7 @@ export function createClaudeBackend(
   const sessionTtlMs = opts.sessionTtlMs ?? 60 * 60 * 1000;
   const now = opts.now ?? Date.now;
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const openaiCompatTrace = opts.openaiCompatTrace === true;
   const setIntervalImpl = opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
   const clearIntervalImpl = opts.clearIntervalFn ?? ((h) => clearInterval(h as ReturnType<typeof setInterval>));
   const timingLogger = createLogger();
@@ -1342,6 +1121,15 @@ export function createClaudeBackend(
       // malformed metadata leaves the run on the original non-extension code
       // path with no envelope-detection cost.
       const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+      if (openaiCompatTrace) {
+        dumpOpenAICompatTaskWire(
+          'claude',
+          task.taskId,
+          task.message.parts,
+          task.message.metadata,
+          openaiCompat,
+        );
+      }
 
       // Native MCP dispatch (#213): when the openai-compat extension is
       // active and carries `tools` (and `tool_choice !== "none"`), the
@@ -1358,26 +1146,68 @@ export function createClaudeBackend(
           : null;
       const nativeDispatchActive = callerToolDefs !== null;
 
-      const mapped = await mapPartsToContentBlocks(task.message.parts, opts.fetchUriPolicy, signal);
+      const mappedRaw = await mapPartsToContentBlocks(task.message.parts, opts.fetchUriPolicy, signal);
       recorder.mark('map');
-      if (mapped.ok && openaiCompat?.tool_call_history) {
-        // Spec contract: bridges MUST replay the entire `tool_call_history`
-        // in order. We render it as a text block and prepend it to the user
-        // content so the model reads the prior round BEFORE the current
-        // user turn. Any internal optimisation (e.g. claude `--resume`
-        // already holds the prior `assistant.tool_calls` in session
-        // memory) is invisible to the wire and does not change replay
-        // semantics — the redundancy is the price of cross-bridge interop.
-        mapped.blocks.unshift({
-          type: 'text',
-          text: formatToolCallHistory(openaiCompat.tool_call_history),
-        });
-      }
-      if (!mapped.ok) {
+
+      // Tool-continuation edge case (openai-compat spec): the inbound
+      // OpenAI request ends with `assistant.tool_calls` + `tool` rather
+      // than a user turn, so the gateway emits A2A `parts` as
+      // `[{ text: "" }]` and stuffs the whole sequence into
+      // `chat_history`. `mapPartsToContentBlocks` returns
+      // `empty_prompt` on those parts; tolerate it when the history
+      // carries entries that will end up as the user content.
+      const hasHistory = (openaiCompat?.chat_history?.length ?? 0) > 0;
+      const isToolContinuation =
+        !mappedRaw.ok &&
+        mappedRaw.code === 'empty_prompt' &&
+        hasHistory;
+      if (!mappedRaw.ok && !isToolContinuation) {
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: { code: mapped.code, message: mapped.message },
+          error: { code: mappedRaw.code, message: mappedRaw.message },
+        });
+        return;
+      }
+      const mapped: {
+        ok: true;
+        blocks: InputContentBlock[];
+        inboundHashes: Set<string>;
+      } = mappedRaw.ok
+        ? mappedRaw
+        : { ok: true, blocks: [], inboundHashes: new Set() };
+
+      if (openaiCompat?.chat_history) {
+        // Spec contract: bridges MUST replay the entire `chat_history`
+        // in order. We render it as a single `<chat_history>` JSON
+        // block (every entry — text turns AND tool round-trips —
+        // verbatim from the wire) and prepend it to the final user
+        // content so the model reads the prior conversation BEFORE the
+        // current user turn.
+        //
+        // Why not split text turns into native stream-json envelopes:
+        // claude's stream-json input treats every `{type:"user"}`
+        // envelope as a fresh LLM call, and the matching
+        // `{type:"assistant"}` envelopes are ignored rather than
+        // recognised as prior model output. Sending N user envelopes
+        // produces N separate assistant results, not one assistant
+        // turn over a multi-turn conversation. Folding everything into
+        // a single user message via this block is the only way to give
+        // the model the conversation in one shot on this backend.
+        const block = formatChatHistory(openaiCompat.chat_history);
+        if (block) {
+          mapped.blocks.unshift({ type: 'text', text: block });
+        }
+      }
+
+      // Final guard: a request with no text/files AND no history would
+      // mint an envelope with zero content blocks. Claude rejects
+      // those; surface the original empty_prompt to the caller.
+      if (mapped.blocks.length === 0) {
+        emit({
+          type: 'task.fail',
+          taskId: task.taskId,
+          error: { code: 'empty_prompt', message: 'no content in message' },
         });
         return;
       }
@@ -1389,8 +1219,8 @@ export function createClaudeBackend(
       // would risk feeding the model two sources of truth (claude's own
       // session memory containing the sentinel "captured by bridge" result
       // we returned from the MCP `onInvoke` handler, AND the user message's
-      // prepended `tool_call_history` JSON carrying the caller's real tool
-      // results). Skip the session map entirely for openai-compat tasks so
+      // prepended `<chat_history>` JSON block carrying the caller's real
+      // tool results). Skip the session map entirely for openai-compat tasks so
       // every spawn starts on a clean `--session-id`; the history block in
       // the user message is then the unambiguous source of truth.
       const sessionReuseEligible = openaiCompat === null && sessionTtlMs > 0;
@@ -1513,7 +1343,7 @@ export function createClaudeBackend(
               });
               capturedToolCall = true;
               // The actual tool result is the caller's job — it arrives on
-              // the next A2A turn via `tool_call_history`. Returning a
+              // the next A2A turn via `chat_history`. Returning a
               // short structured-error ack here so claude sees "tool gave
               // up; don't try again" rather than "tool succeeded with some
               // text result" (which it might then try to summarise). The
