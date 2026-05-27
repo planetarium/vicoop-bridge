@@ -2,7 +2,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { AgentCard } from '@vicoop-bridge/protocol';
 import { resolveBundledCard } from './bundled-cards.js';
-import { longestMatch, object } from '@optique/core/constructs';
+import { group, longestMatch, object } from '@optique/core/constructs';
 import { optional, withDefault } from '@optique/core/modifiers';
 import { command, constant, flag, option } from '@optique/core/primitives';
 import { message } from '@optique/core/message';
@@ -156,19 +156,21 @@ const legacyAdminCmds = longestMatch(
 
 // All subcommands in one parser. `longestMatch` (rather than `or`) keeps
 // behavior stable as more sibling commands are added — branches with a
-// keyword match consume more tokens and win deterministically.
+// keyword match consume more tokens and win deterministically. `group()`
+// gives optique's help renderer section headers so the top-level help
+// scans as an operator workflow rather than a 17-line wall.
 const cli = longestMatch(
-  authCmd,
+  group('Run the daemon', startCmd),
+  group('Identity', authCmd),
+  group('Agents', longestMatch(agentCmd, setupCmd)),
+  group('Runtime containers', containerCmd),
+  group('Maintenance', longestMatch(upgradeCmd, infoCmd)),
+  // Hidden by `hidden: 'help'` on each command; kept in the parser tree
+  // for back-compat and "did you mean?" suggestions.
   loginCmd,
   logoutCmd,
-  setupCmd,
-  upgradeCmd,
-  infoCmd,
-  agentCmd,
-  containerCmd,
   legacyAdminCmds,
   whoamiCmd,
-  startCmd,
 );
 
 type CliArgs = InferValue<typeof cli>;
