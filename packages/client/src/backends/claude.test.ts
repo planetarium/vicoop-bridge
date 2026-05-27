@@ -6,21 +6,23 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import {
   buildOpenAICompatNativeSystemPrompt,
-  buildOpenAICompatSystemPrompt,
-  callerToolDispatchActive,
   createClaudeBackend,
-  formatToolCallHistory,
   normalizeClaudeModelId,
   openaiToolsToCallerToolDefs,
   parseClaudeModelUsageForOpenAICompat,
-  parseOpenAICompatMetadata,
   probeClaudeModel,
   summarizeToolInput,
-  tryParseToolCallsEnvelope,
   CLAUDE_PROBE_ARGS,
   type ClaudeChildHandle,
   type ClaudeSpawnOptions,
 } from './claude.js';
+import {
+  buildOpenAICompatSystemPrompt,
+  callerToolDispatchActive,
+  formatChatHistory,
+  parseOpenAICompatMetadata,
+  tryParseToolCallsEnvelope,
+} from './openai-compat.js';
 import { startCallerToolsMcpServer } from './caller-tools-mcp.js';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
@@ -2372,7 +2374,7 @@ test('spawn argv carries --append-system-prompt with the native directive when m
   // The slim native prompt teaches the model to use the native tool surface
   // and how to read the history block — nothing more.
   assert.match(args[idx] as string, /native tool list/);
-  assert.match(args[idx] as string, /<tool_call_history>/);
+  assert.match(args[idx] as string, /<chat_history>/);
   // Envelope contract phrase MUST NOT appear under #213.
   assert.equal(
     (args[idx] as string).includes('"tool_calls":[{"id":"call_<unique>"'),
@@ -2438,7 +2440,7 @@ test('caller tools active → spawn argv carries `--tools ""` to disable claude 
 
 test('history-only payload (no tools) leaves claude built-in tools enabled', async () => {
   // Counterpart to the active-tools case: when the caller's payload carries
-  // only `tool_call_history` (replay context for a follow-up turn) and no
+  // only `chat_history` (replay context for a follow-up turn) and no
   // `tools` array, there is no caller-side dispatch contract to protect this
   // turn — `--tools ""` MUST NOT appear or claude would lose its built-ins
   // for a turn the caller never intended to constrain.
@@ -2452,7 +2454,7 @@ test('history-only payload (no tools) leaves claude built-in tools enabled', asy
   const backend = createClaudeBackend({ spawn: fake.spawn });
   const { emit } = collect();
   await backend.handle(
-    assignWithOpenAICompat('continue', { tool_call_history: SAMPLE_HISTORY }),
+    assignWithOpenAICompat('continue', { chat_history: SAMPLE_HISTORY }),
     emit,
     NEVER,
   );
@@ -2553,12 +2555,13 @@ test('extension off: a coincidental {"tool_calls":[...]} text stays a text artif
 });
 
 // ---------------------------------------------------------------------------
-// openai-compat extension: multi-turn (tool_call_history)
+// openai-compat extension: multi-turn (chat_history)
 // ---------------------------------------------------------------------------
 
 const SAMPLE_HISTORY: ReadonlyArray<Record<string, unknown>> = [
   {
     role: 'assistant',
+    content: null,
     tool_calls: [
       { id: 'call_abc', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
     ],
@@ -2571,22 +2574,24 @@ const SAMPLE_HISTORY: ReadonlyArray<Record<string, unknown>> = [
   },
 ];
 
-test('parseOpenAICompatMetadata: accepts well-formed tool_call_history', () => {
+test('parseOpenAICompatMetadata: accepts well-formed chat_history', () => {
   const m = parseOpenAICompatMetadata({
     [OPENAI_COMPAT_EXTENSION_URI]: {
       tools: SAMPLE_TOOLS,
-      tool_call_history: SAMPLE_HISTORY,
+      chat_history: SAMPLE_HISTORY,
     },
   });
   assert.ok(m);
-  assert.equal(m.tool_call_history?.length, 2);
-  // assistant entry preserves tool_calls verbatim.
-  const a = m.tool_call_history![0];
+  assert.equal(m.chat_history?.length, 2);
+  // assistant entry preserves tool_calls verbatim with content:null.
+  const a = m.chat_history![0];
   assert.equal(a.role, 'assistant');
   if (a.role !== 'assistant') throw new Error('expected assistant entry');
+  if (!('tool_calls' in a)) throw new Error('expected tool-call assistant');
+  if (a.content !== null) throw new Error('expected tool-call assistant (content:null)');
   assert.equal(a.tool_calls.length, 1);
   // tool entry preserves content as string + optional name.
-  const t = m.tool_call_history![1];
+  const t = m.chat_history![1];
   assert.equal(t.role, 'tool');
   if (t.role !== 'tool') throw new Error('expected tool entry');
   assert.equal(t.tool_call_id, 'call_abc');
@@ -2594,18 +2599,115 @@ test('parseOpenAICompatMetadata: accepts well-formed tool_call_history', () => {
   assert.equal(t.content, '{"temp":15,"cond":"sunny"}');
 });
 
+test('parseOpenAICompatMetadata: hybrid assistant (text + tool_calls) preserves the text', () => {
+  // OpenAI Chat Completions permits an assistant turn to emit both a
+  // brief explanation AND `tool_calls`. Real gateway traffic was
+  // observed sending `{role:"assistant", content:"explanation",
+  // tool_calls:[...]}` — locking this down keeps the text from being
+  // dropped (or the entry from being rejected entirely as it was in an
+  // earlier strict-or-nothing pass).
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      chat_history: [
+        {
+          role: 'assistant',
+          content: 'Let me check that for you.',
+          tool_calls: [{ id: 'c', function: { name: 'f', arguments: '{}' } }],
+        },
+      ],
+    },
+  });
+  assert.ok(m);
+  const a = m.chat_history![0];
+  if (a.role !== 'assistant' || !('tool_calls' in a)) {
+    throw new Error('expected hybrid assistant entry');
+  }
+  assert.equal(a.content, 'Let me check that for you.');
+  assert.equal((a.tool_calls as unknown[]).length, 1);
+});
+
+test('parseOpenAICompatMetadata: tool-call assistant accepts content as null, missing, or empty string', () => {
+  // OpenAI Chat Completions wire is loose: producers emit any of `null`,
+  // omit the field, or send `""`. Receivers MUST accept all three and
+  // normalise to `null` (the spec's documented shape) so backends downstream
+  // only handle one case. Real gateway traffic (oai2a2a forwarding the
+  // OpenAI codex CLI) was observed emitting `""`; locking this down keeps
+  // that path from regressing.
+  for (const variant of [
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c', function: { name: 'f' } }] },
+    { role: 'assistant', tool_calls: [{ id: 'c', function: { name: 'f' } }] },
+    { role: 'assistant', content: '', tool_calls: [{ id: 'c', function: { name: 'f' } }] },
+  ]) {
+    const m = parseOpenAICompatMetadata({
+      [OPENAI_COMPAT_EXTENSION_URI]: { chat_history: [variant] },
+    });
+    assert.ok(m, `variant ${JSON.stringify(variant)} should parse`);
+    const a = m.chat_history![0];
+    if (a.role !== 'assistant' || a.content !== null) {
+      throw new Error(`variant ${JSON.stringify(variant)} did not normalise to content:null`);
+    }
+  }
+});
+
 test('parseOpenAICompatMetadata: tool entry without optional name is accepted', () => {
   const m = parseOpenAICompatMetadata({
     [OPENAI_COMPAT_EXTENSION_URI]: {
-      tool_call_history: [
+      chat_history: [
         { role: 'tool', tool_call_id: 'call_x', content: 'ok' },
       ],
     },
   });
   assert.ok(m);
-  const t = m.tool_call_history![0];
+  const t = m.chat_history![0];
   if (t.role !== 'tool') throw new Error('expected tool entry');
   assert.equal(t.name, undefined);
+});
+
+test('parseOpenAICompatMetadata: accepts prior user/assistant text turns in chat_history', () => {
+  // New entry shapes per spec PR planetarium/oai2a2a#74: chat_history
+  // carries every prior message turn (not just tool round-trips).
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      chat_history: [
+        { role: 'user', content: 'what was the weather yesterday?' },
+        { role: 'assistant', content: 'It was sunny, 18°C.' },
+      ],
+    },
+  });
+  assert.ok(m);
+  assert.equal(m.chat_history?.length, 2);
+  const u = m.chat_history![0];
+  assert.equal(u.role, 'user');
+  if (u.role !== 'user') throw new Error('expected user entry');
+  assert.equal(u.content, 'what was the weather yesterday?');
+  const a = m.chat_history![1];
+  assert.equal(a.role, 'assistant');
+  if (a.role !== 'assistant') throw new Error('expected assistant entry');
+  // Plain-text assistant has string content (not null) and no tool_calls.
+  assert.equal(a.content, 'It was sunny, 18°C.');
+});
+
+test('parseOpenAICompatMetadata: accepts multimodal content-part array on user/assistant turns', () => {
+  // Spec requires receivers to accept the content-part array shape for
+  // prior multimodal turns; unknown part types pass through verbatim.
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      chat_history: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'describe this' },
+            { type: 'image_url', image_url: { url: 'https://example/i.png' } },
+          ],
+        },
+      ],
+    },
+  });
+  assert.ok(m);
+  const u = m.chat_history![0];
+  if (u.role !== 'user') throw new Error('expected user entry');
+  assert.ok(Array.isArray(u.content));
+  assert.equal((u.content as unknown[]).length, 2);
 });
 
 test('parseOpenAICompatMetadata: malformed history entry drops the whole array', () => {
@@ -2615,15 +2717,15 @@ test('parseOpenAICompatMetadata: malformed history entry drops the whole array',
   const m = parseOpenAICompatMetadata({
     [OPENAI_COMPAT_EXTENSION_URI]: {
       tools: SAMPLE_TOOLS,
-      tool_call_history: [
-        { role: 'assistant', tool_calls: [] },
+      chat_history: [
+        { role: 'assistant', content: null, tool_calls: [] },
         { role: 'tool', tool_call_id: 'call_a', content: 'ok' },
       ],
     },
   });
   // tools survived; history dropped → still a valid metadata (not null).
   assert.ok(m);
-  assert.equal(m.tool_call_history, undefined);
+  assert.equal(m.chat_history, undefined);
   assert.equal(m.tools?.length, 1);
 });
 
@@ -2631,42 +2733,42 @@ test('parseOpenAICompatMetadata: tool entry missing content drops the whole arra
   const m = parseOpenAICompatMetadata({
     [OPENAI_COMPAT_EXTENSION_URI]: {
       tools: SAMPLE_TOOLS,
-      tool_call_history: [
-        { role: 'assistant', tool_calls: [{ id: 'call_a', function: { name: 'f' } }] },
+      chat_history: [
+        { role: 'assistant', content: null, tool_calls: [{ id: 'call_a', function: { name: 'f' } }] },
         // Missing `content` — invalid.
         { role: 'tool', tool_call_id: 'call_a' },
       ],
     },
   });
   assert.ok(m);
-  assert.equal(m.tool_call_history, undefined);
+  assert.equal(m.chat_history, undefined);
 });
 
 test('parseOpenAICompatMetadata: empty history is treated as absent', () => {
   const m = parseOpenAICompatMetadata({
     [OPENAI_COMPAT_EXTENSION_URI]: {
       tools: SAMPLE_TOOLS,
-      tool_call_history: [],
+      chat_history: [],
     },
   });
   assert.ok(m);
-  assert.equal(m.tool_call_history, undefined);
+  assert.equal(m.chat_history, undefined);
 });
 
 test('parseOpenAICompatMetadata: history-only payload (no tools/system) still returns metadata', () => {
   // Tolerant degradation: gateway sent only history, no tools schema. Bridge
   // can still replay; model will answer naturally without tool affordances.
   const m = parseOpenAICompatMetadata({
-    [OPENAI_COMPAT_EXTENSION_URI]: { tool_call_history: SAMPLE_HISTORY },
+    [OPENAI_COMPAT_EXTENSION_URI]: { chat_history: SAMPLE_HISTORY },
   });
   assert.ok(m);
-  assert.equal(m.tool_call_history?.length, 2);
+  assert.equal(m.chat_history?.length, 2);
   assert.equal(m.tools, undefined);
 });
 
-test('buildOpenAICompatSystemPrompt: includes the tool_call_history paragraph when tools are present', () => {
+test('buildOpenAICompatSystemPrompt: includes the chat_history paragraph when tools are present', () => {
   const prompt = buildOpenAICompatSystemPrompt({ tools: SAMPLE_TOOLS });
-  assert.match(prompt, /<tool_call_history>\.\.\.<\/tool_call_history>/);
+  assert.match(prompt, /<chat_history>\.\.\.<\/chat_history>/);
   // Anti-loop directive must survive any future wording revisions to this
   // paragraph — the model needs to be told not to repeat calls already in
   // the history, otherwise tool turns chain forever.
@@ -2677,26 +2779,35 @@ test('buildOpenAICompatSystemPrompt: omits the history paragraph when tools are 
   // No tools → no envelope contract → no history paragraph either; the
   // paragraph references a tool_calls envelope that wouldn't be valid.
   const prompt = buildOpenAICompatSystemPrompt({ system: 'Be terse.' });
-  assert.doesNotMatch(prompt, /<tool_call_history>/);
+  assert.doesNotMatch(prompt, /<chat_history>/);
 });
 
-test('formatToolCallHistory: wraps the JSON array verbatim', () => {
-  const rendered = formatToolCallHistory([
-    { role: 'assistant', tool_calls: [{ id: 'call_x', function: { name: 'f' } }] },
+test('formatChatHistory: wraps the full history as a JSON array verbatim', () => {
+  const rendered = formatChatHistory([
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: 'hello' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'call_x', function: { name: 'f' } }] },
     { role: 'tool', tool_call_id: 'call_x', content: 'ok' },
   ]);
-  assert.match(rendered, /^<tool_call_history>\n/);
-  assert.match(rendered, /\n<\/tool_call_history>$/);
+  assert.match(rendered, /^<chat_history>\n/);
+  assert.match(rendered, /\n<\/chat_history>$/);
   // Pretty-printed JSON makes the structure scannable for the model and for
-  // operators reading bridge logs; the test pins indentation to lock in the
-  // contract.
+  // operators reading bridge logs; the test pins shape so future
+  // reformatting failures surface as deltas, not silently.
+  assert.match(rendered, /"role": "user"/);
   assert.match(rendered, /"role": "assistant"/);
   assert.match(rendered, /"tool_call_id": "call_x"/);
 });
 
-test('multi-turn: history block is prepended to the user content sent to claude', async () => {
-  // We need to inspect the stdin payload claude received, which carries the
-  // user message envelope as JSON — see the existing `assign(...)` flow.
+test('formatChatHistory: returns empty when the history is empty', () => {
+  assert.equal(formatChatHistory([]), '');
+});
+
+test('multi-turn: chat_history block is prepended to the final user content (single envelope)', async () => {
+  // Claude's stream-json input treats every `{type:"user"}` envelope as a
+  // fresh LLM call and ignores `{type:"assistant"}` envelopes — so we
+  // fold the entire transcript into a single user envelope under a
+  // `<chat_history>` JSON block prepended to the live prompt.
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
@@ -2709,7 +2820,7 @@ test('multi-turn: history block is prepended to the user content sent to claude'
   await backend.handle(
     assignWithOpenAICompat('continue, please', {
       tools: SAMPLE_TOOLS,
-      tool_call_history: SAMPLE_HISTORY,
+      chat_history: SAMPLE_HISTORY,
     }),
     emit,
     NEVER,
@@ -2717,20 +2828,66 @@ test('multi-turn: history block is prepended to the user content sent to claude'
 
   const child = fake.lastChild();
   assert.ok(child, 'expected a spawned child');
-  // The envelope is a single JSON line on stdin; parse it back to inspect
-  // the content block order.
-  const envelope = JSON.parse(child.stdinPayload.trim()) as {
+  // Single newline-delimited envelope on stdin.
+  const lines = child.stdinPayload.split('\n').filter((l: string) => l.length > 0);
+  assert.equal(lines.length, 1, 'exactly one envelope (no native multi-turn split)');
+  const envelope = JSON.parse(lines[0]) as {
     message: { content: Array<{ type: string; text?: string }> };
   };
   assert.equal(envelope.message.content[0].type, 'text');
   // First block is the history; the user's actual prompt is second.
-  assert.match(envelope.message.content[0].text ?? '', /^<tool_call_history>/);
+  assert.match(envelope.message.content[0].text ?? '', /^<chat_history>/);
   assert.match(envelope.message.content[0].text ?? '', /"role": "assistant"/);
   assert.equal(envelope.message.content[1].type, 'text');
   assert.equal(envelope.message.content[1].text, 'continue, please');
 });
 
-test('multi-turn: absent tool_call_history leaves the user content untouched', async () => {
+test('multi-turn: prior plain user/assistant text turns land inside the single chat_history block', async () => {
+  // Prior text turns ride the same `<chat_history>` block as tool
+  // round-trips — single envelope on the wire (multi-envelope
+  // stream-json gets reinterpreted by claude as N separate LLM calls;
+  // see formatChatHistory for the rationale).
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('follow up question', {
+      tools: SAMPLE_TOOLS,
+      chat_history: [
+        { role: 'user', content: 'what was the weather?' },
+        { role: 'assistant', content: 'sunny, 18°C' },
+      ],
+    }),
+    emit,
+    NEVER,
+  );
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  const lines = child.stdinPayload.split('\n').filter((l: string) => l.length > 0);
+  assert.equal(lines.length, 1, 'exactly one envelope');
+  const envelope = JSON.parse(lines[0]) as {
+    type: string;
+    message: { content: Array<{ type: string; text?: string }> };
+  };
+  assert.equal(envelope.type, 'user');
+  const blockText = envelope.message.content[0]?.text ?? '';
+  assert.match(blockText, /^<chat_history>/);
+  // Both prior text turns appear in the block.
+  assert.match(blockText, /"role": "user"/);
+  assert.match(blockText, /what was the weather\?/);
+  assert.match(blockText, /sunny, 18/);
+  // The trailing user (the new question) is its own content block.
+  assert.equal(envelope.message.content[1]?.text, 'follow up question');
+});
+
+test('multi-turn: absent chat_history leaves the user content untouched', async () => {
   // First-turn / no-history path: only the user text reaches claude, no
   // injected XML wrapper. Guards against the history block leaking onto
   // tasks that didn't ask for it.
@@ -2977,7 +3134,7 @@ test('openaiToolsToCallerToolDefs maps OpenAI tools and drops malformed entries 
 
 // Native system-prompt: slim. Must NOT carry the envelope contract (#213
 // removed it wholesale), MUST carry the user's `system` text + the
-// `<tool_call_history>` reading hint, and MUST NOT carry the
+// `<chat_history>` reading hint, and MUST NOT carry the
 // stop-after-invoke directive — `--max-turns 1` on the spawned claude
 // enforces single-turn semantics mechanically, so prompting the model to
 // "stop" duplicates work and pollutes its context.
@@ -2995,8 +3152,8 @@ test('buildOpenAICompatNativeSystemPrompt: slim shape (#213)', () => {
   assert.equal(out.includes('{"tool_calls"'), false);
   assert.equal(out.includes('respond with ONLY a single JSON object'), false);
   // History-reading hint stays — the model still has to know how to read
-  // the prepended `<tool_call_history>` JSON.
-  assert.ok(out.includes('<tool_call_history>'));
+  // the prepended `<chat_history>` JSON.
+  assert.ok(out.includes('<chat_history>'));
   // Tools are exposed via MCP `tools/list`; the prompt only mentions the
   // native tool surface and does not re-dump the schema.
   assert.ok(out.includes('native tool list'));

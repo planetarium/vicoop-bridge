@@ -42,7 +42,7 @@ import {
   parseLsofListeningPorts,
   redactUrl,
 } from './openclaw.js';
-import type { OpenAICompatHistoryEntry } from './claude.js';
+import type { OpenAICompatHistoryEntry } from './openai-compat.js';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
   type TaskAssignFrame,
@@ -2921,7 +2921,7 @@ test('heartbeat: suppressed after signal.abort so canceled tasks do not look lik
 // openai-compat extension
 //
 // The pure helpers (parseOpenAICompatMetadata, buildOpenAICompatSystemPrompt,
-// formatToolCallHistory, tryParseToolCallsEnvelope) live in claude.ts and are
+// formatChatHistory, tryParseToolCallsEnvelope) live in claude.ts and are
 // covered by claude.test.ts — openclaw.ts imports them verbatim, so we only
 // test the openclaw-specific wiring here: chat.send.message composition with
 // the XML-wrapped contract blocks, envelope→data-part on session.message,
@@ -2948,6 +2948,7 @@ const OAI_SAMPLE_TOOLS = [
 const OAI_SAMPLE_HISTORY: OpenAICompatHistoryEntry[] = [
   {
     role: 'assistant',
+    content: null,
     tool_calls: [
       { id: 'call_abc', function: { name: 'get_weather', arguments: { city: 'Seoul' } } },
     ],
@@ -3004,15 +3005,15 @@ test('composeOpenAICompatUserMessage: history-only payload omits system_instruct
   // returns "". We MUST NOT emit an empty <system_instructions></system_instructions>
   // shell (the block-presence-vs-absence signal is part of the contract).
   const out = composeOpenAICompatUserMessage(
-    { tool_call_history: OAI_SAMPLE_HISTORY },
+    { chat_history: OAI_SAMPLE_HISTORY },
     'continue, please',
   );
   assert.doesNotMatch(out, /<system_instructions>/);
   // History block is still injected — spec contract requires per-turn replay.
-  assert.match(out, /^<tool_call_history>\n/);
+  assert.match(out, /^<chat_history>\n/);
   assert.match(out, /"role": "assistant"/);
   assert.match(out, /"tool_call_id": "call_abc"/);
-  assert.match(out, /\n<\/tool_call_history>\n\n<user_message>/);
+  assert.match(out, /\n<\/chat_history>\n\n<user_message>/);
   // User content follows.
   assert.match(out, /<user_message>\ncontinue, please\n<\/user_message>$/);
 });
@@ -3320,7 +3321,7 @@ test('extension on but model answered in prose → text artifact, no extension t
   }
 });
 
-test('multi-turn: tool_call_history block is prepended to chat.send.message on follow-up turn', async () => {
+test('multi-turn: chat_history block is prepended to chat.send.message on follow-up turn', async () => {
   let sentMessage: string | null = null;
   const fake = await createFakeGateway({
     onRequest: (sock, req) => {
@@ -3346,7 +3347,7 @@ test('multi-turn: tool_call_history block is prepended to chat.send.message on f
     await backend.handle(
       makeOpenAICompatTask('t-mt', 'natural language please', {
         tools: OAI_SAMPLE_TOOLS,
-        tool_call_history: OAI_SAMPLE_HISTORY,
+        chat_history: OAI_SAMPLE_HISTORY,
       }),
       () => {},
       NEVER,
@@ -3355,10 +3356,10 @@ test('multi-turn: tool_call_history block is prepended to chat.send.message on f
     // System instructions block precedes the history block.
     assert.match(sentMessage!, /^<system_instructions>/);
     // History block is present, in order, between system_instructions and user_message.
-    assert.match(sentMessage!, /<\/system_instructions>\n\n<tool_call_history>\n/);
+    assert.match(sentMessage!, /<\/system_instructions>\n\n<chat_history>\n/);
     assert.match(sentMessage!, /"role": "assistant"/);
     assert.match(sentMessage!, /"tool_call_id": "call_abc"/);
-    assert.match(sentMessage!, /\n<\/tool_call_history>\n\n<user_message>/);
+    assert.match(sentMessage!, /\n<\/chat_history>\n\n<user_message>/);
     // User content closes the message.
     assert.match(sentMessage!, /<user_message>\nnatural language please\n<\/user_message>$/);
   } finally {

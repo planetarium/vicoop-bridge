@@ -48,7 +48,7 @@ export interface CallerToolDefinition {
 /**
  * What the bridge wants to know when the model invokes a tool. `callId`
  * is the MCP request id (a stable handle for pairing with the eventual
- * `tool_call_history` entry the caller sends on the next A2A turn).
+ * `chat_history` entry the caller sends on the next A2A turn).
  */
 export interface CallerToolInvocation {
   callId: string;
@@ -59,7 +59,7 @@ export interface CallerToolInvocation {
 /**
  * What the bridge tells claude in response to a `tools/call`. The actual
  * tool result lives on the caller side and arrives on the next A2A turn
- * via `tool_call_history`; this response just unblocks claude's MCP
+ * via `chat_history`; this response just unblocks claude's MCP
  * request so its turn can wind down.
  *
  * `text` becomes the body of a single `text` content item in the MCP
