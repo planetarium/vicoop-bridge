@@ -198,15 +198,9 @@ export function historyToChatCompletionMessages(
   return out;
 }
 
-// Assemble the full `messages` array for the call body. Order, per the
-// doc's "Per-role message JSON examples" section:
-//   1. system (from openai-compat.system; one entry)
-//   2. tool_call_history (assistant → tool round-trips)
-//   3. current user turn (flattened from A2A parts)
-//
-// The user turn comes last so the model sees prior tool results before the
-// new instruction — same convention as claude.ts's `formatToolCallHistory`
-// prepending the block to the user content.
+// Assemble the messages array in linear conversation order: system, the
+// current user turn, then the prior tool_call_history (assistant → tool
+// round-trips).
 export function buildMessages(
   meta: OpenAICompatMetadata | null,
   userContent: string,
@@ -215,12 +209,12 @@ export function buildMessages(
   if (meta?.system) {
     messages.push({ role: 'system', content: meta.system });
   }
+  messages.push({ role: 'user', content: userContent });
   if (meta?.tool_call_history) {
     for (const m of historyToChatCompletionMessages(meta.tool_call_history)) {
       messages.push(m);
     }
   }
-  messages.push({ role: 'user', content: userContent });
   return messages;
 }
 

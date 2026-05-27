@@ -235,7 +235,7 @@ test('historyToChatCompletionMessages: assistant tool_calls + tool result round-
   assert.equal(msgs[1].content, '{"temp":13}');
 });
 
-test('buildMessages: ordering — system → history → user', () => {
+test('buildMessages: ordering — system → user → history', () => {
   const msgs = buildMessages(
     {
       system: 'be concise',
@@ -251,10 +251,10 @@ test('buildMessages: ordering — system → history → user', () => {
   );
   assert.deepEqual(
     msgs.map((m) => m.role),
-    ['system', 'assistant', 'tool', 'user'],
+    ['system', 'user', 'assistant', 'tool'],
   );
   assert.equal(msgs[0].content, 'be concise');
-  assert.equal(msgs[msgs.length - 1].content, 'current ask');
+  assert.equal(msgs[1].content, 'current ask');
 });
 
 test('buildMessages: no metadata still emits a user message', () => {
@@ -534,11 +534,11 @@ test('handle: stdin body carries only system/tools/tool_choice/history-derived m
     };
     const payload = child.stdinPayload();
     const body = JSON.parse(payload) as Record<string, unknown>;
-    // Messages: system → assistant(tool_calls) → tool → user
+    // Messages: system → user → assistant(tool_calls) → tool
     const messages = body.messages as Array<{ role: string }>;
     assert.deepEqual(
       messages.map((m) => m.role),
-      ['system', 'assistant', 'tool', 'user'],
+      ['system', 'user', 'assistant', 'tool'],
     );
     // Only the existing 4-field schema's `tools` / `tool_choice` are
     // forwarded; the spurious model/reasoning_effort/temperature/max_tokens
