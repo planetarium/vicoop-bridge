@@ -6,7 +6,7 @@ import {
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
-import { formatAcct, formatMention, type AgentIdentity } from '../identity.js';
+import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
 import {
   buildOpenAICompatUsage,
   makeOpenAICompatUsageMetadata,
@@ -144,19 +144,6 @@ export interface ClaudeBackendOptions {
   // `chat_history` to stderr on every task. Operator diagnostic exposed
   // via `--openai-compat-trace`. Leave off in production.
   openaiCompatTrace?: boolean;
-}
-
-// Kept short and behaviour-focused. The risk we're guarding against is
-// concrete: a Claude-as-caller skill (a2a-wallet) interpreting the agent's
-// own mention as an external destination. Anything beyond self-reference
-// detection belongs in the operator-controlled prompt, not here.
-export function buildSelfIdentitySystemPrompt(id: AgentIdentity): string {
-  const mention = formatMention(id);
-  const acct = formatAcct(id);
-  return [
-    `You are an A2A agent reachable as the mention \`${mention}\` (${acct}).`,
-    `If a user message references this mention or acct, treat it as a self-reference and respond directly — do not invoke any outbound A2A tool or skill (e.g. a2a-wallet) to contact this address as if it were a separate agent.`,
-  ].join(' ');
 }
 
 interface SessionEntry {

@@ -1578,6 +1578,101 @@ test('composeNativeDevInstructions includes system text, omits JSON envelope con
   assert.equal(withTools.includes('{"tool_calls"'), false);
 });
 
+// Mirrors PR #129 for the codex backend: when `identity` is configured, every
+// `thread/start` must carry a `developerInstructions` field naming the agent's
+// own mention + acct, so codex doesn't try to a2a-call its own address via the
+// a2a-wallet skill on receiving a message that contains its own mention.
+test('developerInstructions carries self-identity directive when `identity` is configured', async () => {
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    identity: {
+      agentId: '6eec0b6e-codex',
+      host: 'vicoop-bridge-server.fly.dev',
+      httpOrigin: 'https://vicoop-bridge-server.fly.dev',
+    },
+  });
+  const { emit, frames } = collect();
+  await backend.handle(assign('hi'), emit, NEVER);
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { developerInstructions?: string } }).params;
+  assert.ok(
+    typeof params?.developerInstructions === 'string',
+    'developerInstructions field is present on thread/start',
+  );
+  assert.match(
+    params.developerInstructions ?? '',
+    /@6eec0b6e-codex@vicoop-bridge-server\.fly\.dev/,
+  );
+  assert.match(
+    params.developerInstructions ?? '',
+    /acct:6eec0b6e-codex@vicoop-bridge-server\.fly\.dev/,
+  );
+});
+
+// In openai-compat mode the bridge is acting as a model endpoint, not an
+// A2A agent — the gateway owns conversation context and never delivers
+// the agent's own mention to codex as a user-typed reference. Identity
+// directive must therefore be SUPPRESSED on these tasks so the caller's
+// system text isn't competing with bridge-injected wording the model
+// doesn't need.
+test('developerInstructions omits self-identity directive on openai-compat tasks (model-endpoint mode)', async () => {
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    identity: {
+      agentId: 'me',
+      host: 'h.example',
+      httpOrigin: 'https://h.example',
+    },
+  });
+  const { emit } = collect();
+  await backend.handle(
+    {
+      type: 'task.assign',
+      taskId: 'task-id-compat',
+      contextId: 'ctx-id-compat',
+      message: {
+        role: 'user',
+        messageId: 'm1',
+        parts: [{ kind: 'text', text: 'hi' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: { system: 'be terse' },
+        },
+      },
+    },
+    emit,
+    NEVER,
+  );
+
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const di = (tsFrame as { params?: { developerInstructions?: string } }).params
+    ?.developerInstructions;
+  assert.equal(di, 'be terse');
+  assert.equal((di ?? '').includes('@me@h.example'), false);
+  assert.equal((di ?? '').includes('acct:me@h.example'), false);
+});
+
+// Default (no `identity` set): developerInstructions stays whatever it was
+// before — i.e. omitted entirely on a plain task, or the caller's system text
+// alone on an openai-compat task. Locks in the "no-op when not configured"
+// contract.
+test('developerInstructions omitted entirely on plain task when no identity is configured', async () => {
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(assign('hi'), emit, NEVER);
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as { params?: { developerInstructions?: string } }).params;
+  assert.equal(
+    params?.developerInstructions,
+    undefined,
+    'no identity + no openai-compat → no developerInstructions key',
+  );
+});
+
 // openai-compat tasks always do `thread/start` (never thread/resume — see
 // the session-reuse guard for #233), but the second A2A turn still needs a
 // working caller-tools handler. This guards against a regression where the

@@ -34,6 +34,24 @@ export function formatAcct(id: AgentIdentity): string {
   return `acct:${id.agentId}@${id.host}`;
 }
 
+// Self-identity directive injected into the spawned backend's system / developer
+// prompt so the model recognises its OWN A2A mention / acct in a user message
+// and answers directly instead of treating it as an external destination. The
+// concrete failure mode this prevents: a Claude-as-caller or codex-as-caller
+// skill (a2a-wallet) interpreting the agent's own mention as another agent and
+// emitting an outbound A2A call that the bridge then rejects (the agent's own
+// wallet isn't in its own `allowed_callers`). See PR #129 / issue #128. Lives
+// in identity.ts (not a backend file) so the claude and codex backends both
+// inject the exact same wording without one cross-importing the other.
+export function buildSelfIdentitySystemPrompt(id: AgentIdentity): string {
+  const mention = formatMention(id);
+  const acct = formatAcct(id);
+  return [
+    `You are an A2A agent reachable as the mention \`${mention}\` (${acct}).`,
+    `If a user message references this mention or acct, treat it as a self-reference and respond directly — do not invoke any outbound A2A tool or skill (e.g. a2a-wallet) to contact this address as if it were a separate agent.`,
+  ].join(' ');
+}
+
 // WebFinger lookup URL, useful for sanity-checking that the bridge actually
 // resolves this agent's acct from outside.
 export function webfingerUrl(id: AgentIdentity): string {
