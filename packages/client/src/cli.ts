@@ -376,6 +376,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         sandboxMode,
         approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
         openaiCompatTrace: args.openaiCompatTrace,
+        identity: deriveIdentity(args.agentId, args.server) ?? undefined,
         ...(spawn ? { spawn: spawn as AppServerSpawnFn } : {}),
       });
       return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };

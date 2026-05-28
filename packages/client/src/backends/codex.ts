@@ -8,6 +8,7 @@ import {
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
 import { createLogger, type Logger } from '../logger.js';
 import {
   callerToolDispatchActive,
@@ -91,6 +92,16 @@ export interface CodexBackendOptions {
   // `chat_history` to stderr on every task. Operator diagnostic exposed
   // via `--openai-compat-trace`. Leave off in production.
   openaiCompatTrace?: boolean;
+  // Agent's own A2A identity. When present, a self-identity directive is
+  // sent as `developerInstructions` on every plain-task `thread/start` so
+  // codex recognises its own mention (`@<agentId>@<host>`) / acct in user
+  // messages and answers directly instead of attempting an outbound A2A
+  // call to its own address via a2a-wallet. Mirrors what the claude backend
+  // does via `--append-system-prompt`; see PR #129 / issue #128 for the
+  // failure mode. Skipped entirely on openai-compat tasks (codex is a model
+  // endpoint, not an A2A agent, there). Carries through `thread/resume`
+  // because codex persists `developerInstructions` server-side per thread.
+  identity?: AgentIdentity;
 }
 
 interface SessionEntry {
@@ -616,6 +627,12 @@ export function createCodexBackend(
   const logger = opts.logger ?? createLogger();
   const initializeTimeoutMs = opts.initializeTimeoutMs ?? 10_000;
   const turnTimeoutMs = opts.turnTimeoutMs ?? 0;
+  // Precomputed once at construction (identity is per-daemon, not per-task).
+  // Prepended to `developerInstructions` on every `thread/start` so the model
+  // recognises its own mention / acct in user messages. See PR #129.
+  const identityDevInstructions: string = opts.identity
+    ? buildSelfIdentitySystemPrompt(opts.identity)
+    : '';
 
   // contextId → (threadId, lastUsedAt). writeId-protected rollback so a
   // concurrent task on the same contextId doesn't get its session entry
@@ -961,9 +978,17 @@ export function createCodexBackend(
           openaiCompat && callerToolDispatchActive(openaiCompat) && openaiCompat.tools
             ? openaiToolsToDynamicToolSpecs(openaiCompat.tools)
             : null;
+        // In openai-compat mode codex is acting as a *model endpoint*, not
+        // as an A2A agent — the gateway in front of it owns conversation
+        // context and never delivers the bridge's own mention to the model
+        // as a user-typed reference, so the self-identity directive doesn't
+        // apply and would just be wording the caller's system text has to
+        // compete with. Plain-task mode (no openai-compat metadata) keeps
+        // the directive because that's the actual a2a-agent surface the
+        // mention can land on.
         const systemPrompt = openaiCompat
           ? composeNativeDevInstructions(openaiCompat)
-          : '';
+          : identityDevInstructions;
 
         const mappedRaw = await mapPartsToCodexInput(task.message.parts, {
           mkdtemp,
