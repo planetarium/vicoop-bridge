@@ -14,6 +14,7 @@ import {
   type OpenAICompatMetadata,
 } from './openai-compat.js';
 import {
+  buildOpenAICompatResponseMetadata,
   buildOpenAICompatUsage,
   type OpenAICompatUsage,
 } from './openai-compat-usage.js';
@@ -350,32 +351,84 @@ export function parseChatCompletionUsage(
   });
 }
 
+// Assemble the OpenAI ChatCompletion envelope echoed under
+// `metadata[OPENAI_COMPAT_EXTENSION_URI].chat_completion` on the terminal
+// A2A message, per the openai-compat/v1 echo-only contract (oai2a2a#80).
+// The codec on the gateway unwraps this verbatim, so we own every required
+// field — id / object / created / model / choices[*]{message, finish_reason,
+// logprobs} / usage.
+//
+// `vicoop-codex call` already prints a near-complete OpenAI ChatCompletion
+// envelope on stdout (see vicoop-codex-cli/src/translate/chat-completions.ts
+// `buildChatCompletion`), so we mostly forward it verbatim. We:
+//   - Synthesize defensive defaults for id / object / created / model when
+//     upstream omits them (the spec REQUIREs them; advertising agents
+//     SHOULD always provide them but a wrapper bug shouldn't break clients).
+//   - Inject `logprobs: null` on each choice when upstream didn't surface
+//     them — the spec marks logprobs as required on each choice (defaults
+//     to null) and the upstream binary does not emit them.
+//   - Put the normalized `OpenAICompatUsage` (with the spec-mandated
+//     `total === prompt + completion` invariant) in `chat_completion.usage`
+//     rather than the raw upstream usage — so consumers reading
+//     `chat_completion.usage` get the same totals as the legacy top-level
+//     `usage` field.
+//
+// Spec: extensions/openai-compat/v1/README.md#response-metadata-payload-agent--gateway
+export function buildChatCompletionEcho(
+  response: ChatCompletionResponse,
+  usage: OpenAICompatUsage | null,
+  taskId: string,
+): Record<string, unknown> {
+  const envelope: Record<string, unknown> = {
+    id: typeof response.id === 'string' && response.id.length > 0
+      ? response.id
+      : `chatcmpl-vicoop-codex-${taskId}`,
+    object: typeof response.object === 'string' && response.object.length > 0
+      ? response.object
+      : 'chat.completion',
+    created: typeof response.created === 'number'
+      ? response.created
+      : Math.floor(Date.now() / 1000),
+    model: typeof response.model === 'string' && response.model.length > 0
+      ? response.model
+      : 'vicoop-codex',
+    choices: Array.isArray(response.choices) && response.choices.length > 0
+      ? response.choices.map((c) => {
+          // Spread upstream verbatim and only add `logprobs: null` when the
+          // upstream binary didn't emit it (which is the common case today).
+          // Preserves any future fields codex may add (`message.refusal`,
+          // etc.) without a spec or codec change.
+          if (c && typeof c === 'object' && !('logprobs' in c)) {
+            return { ...c, logprobs: null };
+          }
+          return c;
+        })
+      : [],
+  };
+  if (usage) envelope.usage = usage;
+  return envelope;
+}
+
 // Build the metadata payload spread onto the final A2A message under
-// `OPENAI_COMPAT_EXTENSION_URI`. Includes the spec's `usage` field plus a
-// `chat_completion` echo of the binary's response envelope (id / model /
-// created / choices / finish_reason) so callers that need the full OpenAI
-// response shape (e.g. an oai2a2a gateway) can recover it from a single
-// metadata block instead of reconstructing from the text artifact.
+// `OPENAI_COMPAT_EXTENSION_URI`. Includes the chat_completion echo per
+// the echo-only contract (oai2a2a#80) plus a transitional top-level
+// `usage` sibling for back-compat with codecs that read it as a fallback
+// when the echo lacks `usage`. New codecs prefer `chat_completion.usage`;
+// the sibling exists so v1-era consumers that only read the top-level
+// field keep working during the transition.
 export function buildResponseMetadata(
   response: ChatCompletionResponse,
   usage: OpenAICompatUsage | null,
+  taskId: string,
 ): Record<string, unknown> {
-  const payload: Record<string, unknown> = {};
-  if (usage) payload.usage = usage;
-  // Echo the upstream response envelope so callers downstream get the
-  // complete OpenAI Chat Completions shape (id / object / created / model /
-  // choices) without having to round-trip through the text artifact. Empty
-  // `choices` arrays still ride along — a malformed-but-non-fatal upstream
-  // payload is more useful to surface than to silently drop.
-  const echo: Record<string, unknown> = {};
-  if (response.id) echo.id = response.id;
-  if (response.object) echo.object = response.object;
-  if (typeof response.created === 'number') echo.created = response.created;
-  if (response.model) echo.model = response.model;
-  if (Array.isArray(response.choices)) echo.choices = response.choices;
-  if (response.usage) echo.usage = response.usage;
-  if (Object.keys(echo).length > 0) payload.chat_completion = echo;
-  return { [OPENAI_COMPAT_EXTENSION_URI]: payload };
+  const echo = buildChatCompletionEcho(response, usage, taskId);
+  // `buildOpenAICompatResponseMetadata` returns `undefined` when both
+  // `echo` and `usage` are absent — for vicoop-codex we always have at
+  // least the synthesized envelope, so the non-undefined branch is
+  // guaranteed. Coerce here to keep the call-site type narrow.
+  return buildOpenAICompatResponseMetadata(echo, usage) ?? {
+    [OPENAI_COMPAT_EXTENSION_URI]: { chat_completion: echo },
+  };
 }
 
 function defaultSpawn(
@@ -709,24 +762,14 @@ export function createVicoopCodexBackend(
         : [];
       const finishReason = typeof choice?.finish_reason === 'string' ? choice.finish_reason : '';
 
-      // When the model emitted a `tool_calls` envelope we mirror codex.ts's
-      // native dispatch artifact shape: a `data` part carrying the
-      // `tool_calls` array under the OPENAI_COMPAT_EXTENSION_URI. Callers
-      // downstream (oai2a2a) special-case this artifact to recover the
-      // OpenAI Chat Completions wire shape on the way out.
-      if (toolCalls.length > 0) {
-        emit({
-          type: 'task.artifact',
-          taskId: task.taskId,
-          artifact: {
-            artifactId: randomUUID(),
-            name: 'vicoop-codex-message',
-            parts: [{ kind: 'data', data: { tool_calls: toolCalls } }],
-            extensions: [OPENAI_COMPAT_EXTENSION_URI],
-          },
-          lastChunk: true,
-        });
-      } else if (contentText) {
+      // Echo-only contract (oai2a2a#80): tool_calls flow exclusively through
+      // the terminal `chat_completion` echo metadata — NOT as a data-part
+      // artifact. The legacy `data` part shaped `{ "tool_calls": [...] }`
+      // is removed from this extension; consumers ignore it. Text content
+      // still rides as a text artifact so non-OpenAI A2A consumers
+      // (debugging UIs, traceability tooling) see the task's response
+      // natively, per the spec's "Relationship to A2A artifacts" note.
+      if (toolCalls.length === 0 && contentText) {
         emit({
           type: 'task.artifact',
           taskId: task.taskId,
@@ -740,7 +783,7 @@ export function createVicoopCodexBackend(
       }
 
       const usage = parseChatCompletionUsage(response.usage, response.model);
-      const responseMetadata = buildResponseMetadata(response, usage);
+      const responseMetadata = buildResponseMetadata(response, usage, task.taskId);
 
       // The final `task.complete` message mirrors codex.ts's pattern:
       //   - `parts`: the assistant's text content (omitted on the tool-call

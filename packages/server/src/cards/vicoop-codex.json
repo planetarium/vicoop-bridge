@@ -8,7 +8,7 @@
     "extensions": [
       {
         "uri": "https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1",
-        "description": "Reads the standard 4-field openai-compat metadata (system / tools / tool_choice / tool_call_history) to assemble the call body; emits OpenAI Chat Completions tool_calls back as an A2A data part and the full response envelope on the final message metadata.",
+        "description": "Reads the standard 4-field openai-compat metadata (system / tools / tool_choice / chat_history) to assemble the call body; surfaces the model's response (text, tool_calls, usage) as a complete OpenAI ChatCompletion envelope echoed on the final A2A message's metadata under the extension URI (chat_completion key).",
         "required": false
       }
     ]
