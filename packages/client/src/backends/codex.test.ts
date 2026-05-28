@@ -282,11 +282,11 @@ function happyPath(opts: HappyPathOptions = {}): ChildScenario {
         return;
       }
       if (method === 'model/list' && id !== undefined) {
-        // #302: codex backend caches `model/list` to gate `envelope.model`
-        // forwarding. Default `{ data: [] }` exercises the "unavailable"
-        // branch (validation is skipped, envelope.model rides through
-        // unchanged). Tests that want to drive the validation path supply
-        // `opts.modelList` with the model ids that should pass the gate.
+        // #302: `resolveCapabilities` issues `model/list` once to populate
+        // both the agent card advertise and the envelope.model gate cache.
+        // Tests that don't call `resolveCapabilities` never hit this; tests
+        // that do drive the validation path supply `opts.modelList` with
+        // the ids that should pass the gate.
         child.emitStdout({ id, result: { data: opts.modelList ?? [] } });
         return;
       }
@@ -2113,6 +2113,9 @@ test('envelope.model is forwarded when codex advertises it in model/list (#302)'
     }),
   );
   const backend = createCodexBackend({ spawn: fake.spawn });
+  // Daemon-mode contract: `resolveCapabilities` runs once at startup so
+  // the backend caches the model/list ids before any task lands.
+  await backend.resolveCapabilities?.();
   await backend.handle(
     assign('hello', 'ctx-model-known', {
       message: {
@@ -2152,6 +2155,7 @@ test('envelope.model is dropped when codex does NOT advertise it in model/list (
     }),
   );
   const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.resolveCapabilities?.();
   await backend.handle(
     assign('hello', 'ctx-model-unknown', {
       message: {
