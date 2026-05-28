@@ -55,6 +55,12 @@ export interface VicoopCodexBackendOptions {
   spawn?: VicoopCodexSpawnFn;
   stderrCaptureBytes?: number;
   callTimeoutMs?: number;
+  // Max time the startup probe (`vicoop-codex models --json` via
+  // `resolveCapabilities`) waits for the model list before giving up.
+  // Setting to 0 disables the probe entirely — the agent card carries no
+  // declared models and `envelope.model` validation is skipped. Default
+  // 10s mirrors claude's probeTimeoutMs.
+  probeTimeoutMs?: number;
   logger?: Logger;
   // When true, dump A2A `parts` shape + metadata keys + raw
   // `chat_history` to stderr on every task. Operator diagnostic exposed
@@ -605,6 +611,71 @@ async function runVicoopCodexCall(
 // non-streaming `vicoop-codex call` invocation: read the existing
 // openai-compat extension metadata → assemble messages → invoke →
 // translate response to A2A artifacts + final message metadata.
+// Probe the vicoop-codex CLI's `models --json` subcommand to discover the
+// model ids this account / install advertises. Returns null on any failure
+// (binary missing, timeout, non-JSON stdout, unexpected shape) so the
+// caller can skip the advertise / `envelope.model` gate silently. Mirrors
+// `probeClaudeModel`'s "best-effort, fail-open" contract.
+export async function probeVicoopCodexModels(args: {
+  command: string;
+  spawn: VicoopCodexSpawnFn;
+  cwd?: string;
+  timeoutMs: number;
+}): Promise<string[] | null> {
+  if (args.timeoutMs <= 0) return null;
+  let child: VicoopCodexChildHandle;
+  try {
+    child = args.spawn(args.command, ['models', '--json'], { cwd: args.cwd });
+  } catch {
+    return null;
+  }
+  return await new Promise<string[] | null>((resolve) => {
+    let stdout = '';
+    let settled = false;
+    const finish = (value: string[] | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // best-effort
+      }
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), args.timeoutMs);
+    if (child.stdout) {
+      child.stdout.on('data', (chunk: Buffer | string) => {
+        stdout += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      });
+    }
+    child.on('error', () => finish(null));
+    child.on('close', (code) => {
+      if (code !== 0) {
+        finish(null);
+        return;
+      }
+      try {
+        const parsed = JSON.parse(stdout) as { models?: unknown };
+        if (!Array.isArray(parsed.models)) {
+          finish(null);
+          return;
+        }
+        const ids: string[] = [];
+        for (const m of parsed.models) {
+          if (m && typeof m === 'object' && typeof (m as { id?: unknown }).id === 'string') {
+            const id = (m as { id: string }).id;
+            if (id.length > 0) ids.push(id);
+          }
+        }
+        finish(ids.length > 0 ? ids : null);
+      } catch {
+        finish(null);
+      }
+    });
+  });
+}
+
 export function createVicoopCodexBackend(
   opts: VicoopCodexBackendOptions = {},
 ): Backend {
@@ -614,11 +685,42 @@ export function createVicoopCodexBackend(
   const spawnFn = opts.spawn ?? defaultSpawn;
   const stderrCap = opts.stderrCaptureBytes ?? 16 * 1024;
   const callTimeoutMs = opts.callTimeoutMs ?? 0;
+  const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
   const logger = opts.logger ?? createLogger();
   const openaiCompatTrace = opts.openaiCompatTrace === true;
 
+  // Supported-models cache, populated by `resolveCapabilities` at daemon
+  // startup and read sync from `handle()` to gate `envelope.model`
+  // forwarding (#302). Mirrors claude's pattern — `undefined` = "never
+  // probed", `null` = "probed but unavailable", non-empty `Set` = the
+  // model ids the CLI's `models --json` advertised.
+  let cachedSupportedModels: Set<string> | null | undefined = undefined;
+
   return {
     name: 'vicoop-codex',
+
+    async resolveCapabilities() {
+      const ids = await probeVicoopCodexModels({
+        command,
+        spawn: spawnFn,
+        cwd,
+        timeoutMs: probeTimeoutMs,
+      });
+      if (!ids || ids.length === 0) {
+        cachedSupportedModels = null;
+        return {};
+      }
+      cachedSupportedModels = new Set(ids);
+      // Advertise on the openai-compat/v1 `params.models[]` slot so
+      // upstream A2A callers (and the gateway's model resolver) can see
+      // the list without round-tripping through `vicoop-codex models`.
+      // The first id is tagged as default — vicoop-codex's `models`
+      // output is already ordered with the recommended model first.
+      const openaiCompatModels = ids.map((id, i) =>
+        i === 0 ? { id, default: true as const } : { id },
+      );
+      return { openaiCompatModels };
+    },
 
     async handle(task, emit, signal) {
       if (signal.aborted) {
@@ -668,8 +770,32 @@ export function createVicoopCodexBackend(
         return;
       }
 
+      // Validate envelope.model against the cache populated by
+      // `resolveCapabilities`. When the gateway sends a value this
+      // vicoop-codex install does not advertise (e.g. an unresolved routing
+      // key like `a2a/<card-url>`), drop the override so the CLI falls
+      // back to its DEFAULT_MODEL rather than failing the call with an
+      // upstream "model not found" error (#302). When the cache is
+      // unpopulated (probeTimeoutMs ≤ 0, probe failed, or
+      // `resolveCapabilities` hasn't been called yet) the validation is
+      // skipped and `envelope.model` rides through unchanged.
+      let effectiveEnvelope = envelope;
+      if (
+        envelope &&
+        typeof envelope.model === 'string' &&
+        envelope.model.length > 0 &&
+        cachedSupportedModels instanceof Set &&
+        !cachedSupportedModels.has(envelope.model)
+      ) {
+        logger.warn?.(
+          `[vicoop-codex] envelope.model=${JSON.stringify(envelope.model)} is not in this account's advertised models list; falling back to vicoop-codex default`,
+        );
+        const { model: _droppedModel, ...rest } = envelope;
+        effectiveEnvelope = rest as OpenAICompatRequestEnvelope;
+      }
+
       const messages = buildMessages(system, chatHistory, userContent);
-      const body = buildCallBody(envelope, messages);
+      const body = buildCallBody(effectiveEnvelope, messages);
       let serialized: string;
       try {
         serialized = JSON.stringify(body);

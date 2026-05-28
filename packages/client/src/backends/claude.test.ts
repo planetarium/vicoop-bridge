@@ -2535,6 +2535,72 @@ test('envelope without model omits --model from claude spawn (#302)', async () =
   assert.equal(args.indexOf('--model'), -1);
 });
 
+test('envelope.model is dropped when claude probed model differs (#302)', async () => {
+  // Regression guard for the gateway sending an unresolved routing key
+  // (e.g. `a2a/<card-url>`) as `envelope.model`. Without the gate, the
+  // bridge would pass the garbage to claude via `--model <…>` and the
+  // run would fail at the Anthropic API. With the gate, the override is
+  // dropped and claude falls back to its own default.
+  const fake = scriptedSpawn({
+    lines: [
+      // probe + handle share the same scripted stream; system/init carries
+      // the advertised model id so resolveCapabilities's probe captures it
+      // into the backend's cache for the handle that follows.
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'sid',
+        model: 'claude-opus-4-7',
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  // Daemon-mode contract: resolveCapabilities runs once at startup so the
+  // backend caches the probed model id before any task lands. Reproduce
+  // that ordering here.
+  await backend.resolveCapabilities?.();
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('hi', {
+      model: 'a2a/https://example.com/agents/x/.well-known/agent-card.json',
+    }),
+    emit,
+    NEVER,
+  );
+  const args = fake.lastChild()?.args ?? [];
+  // No --model override on argv — claude uses its own default.
+  assert.equal(args.indexOf('--model'), -1);
+});
+
+test('envelope.model is forwarded when it matches claude probed model (#302)', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'sid',
+        model: 'claude-opus-4-7',
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  await backend.resolveCapabilities?.();
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('hi', { model: 'claude-opus-4-7' }),
+    emit,
+    NEVER,
+  );
+  const args = fake.lastChild()?.args ?? [];
+  const modelIdx = args.indexOf('--model');
+  assert.notEqual(modelIdx, -1, '--model present when envelope.model matches the probe');
+  assert.equal(args[modelIdx + 1], 'claude-opus-4-7');
+});
+
 test('tryParseToolCallsEnvelope: recognises a well-formed envelope and preserves unknown keys', () => {
   const out = tryParseToolCallsEnvelope(
     JSON.stringify({

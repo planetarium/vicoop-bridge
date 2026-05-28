@@ -1100,6 +1100,18 @@ export function createClaudeBackend(
 
   const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
 
+  // Probed-model cache, populated by `resolveCapabilities` at daemon
+  // startup and read sync from `handle()` to gate `envelope.model`
+  // forwarding (#302). `undefined` = "never probed", `null` = "probed but
+  // unavailable", string = "this is the only model id this claude install
+  // advertises". `handle()` deliberately does NOT trigger the probe on a
+  // miss — the probe spawns its own short-lived child, and the daemon
+  // already calls `resolveCapabilities` once at startup, so the cache is
+  // populated before any task lands in production. Tests that want to
+  // exercise the gate populate the cache via `resolveCapabilities`
+  // explicitly.
+  let cachedProbedModel: string | null | undefined = undefined;
+
   return {
     name: 'claude',
 
@@ -1117,13 +1129,17 @@ export function createClaudeBackend(
     // `completion_tokens_details.reasoning_tokens` in `usage`, and per
     // spec "Absence means 'unspecified,' not 'false.'"
     async resolveCapabilities() {
-      if (probeTimeoutMs <= 0) return {};
+      if (probeTimeoutMs <= 0) {
+        cachedProbedModel = null;
+        return {};
+      }
       const model = await probeClaudeModel({
         command,
         spawn: spawnFn,
         cwd,
         timeoutMs: probeTimeoutMs,
       });
+      cachedProbedModel = model;
       if (!model) return {};
       return {
         openaiCompatModels: [{ id: model, default: true }],
@@ -1199,10 +1215,28 @@ export function createClaudeBackend(
         envelope && Array.isArray(envelope.messages)
           ? chatHistoryFromMessages(envelope.messages)
           : null;
-      const envelopeModel =
+      const envelopeModelRaw =
         envelope && typeof envelope.model === 'string' && envelope.model.length > 0
           ? envelope.model
           : undefined;
+      // Validate against the probed model id (cached by `resolveCapabilities`).
+      // When the gateway sends a value claude doesn't advertise — e.g. an
+      // unresolved routing key like `a2a/<card-url>` — drop the override so
+      // claude falls back to its own default rather than failing the turn
+      // (#302). When the cache is unpopulated (probeTimeoutMs ≤ 0, probe
+      // failed, or `resolveCapabilities` hasn't been called yet) the
+      // validation is skipped and `envelope.model` rides through unchanged.
+      let envelopeModel: string | undefined = envelopeModelRaw;
+      if (
+        envelopeModelRaw !== undefined &&
+        typeof cachedProbedModel === 'string' &&
+        envelopeModelRaw !== cachedProbedModel
+      ) {
+        timingLogger.warn?.(
+          `[claude] envelope.model=${JSON.stringify(envelopeModelRaw)} does not match this claude install's advertised model (${JSON.stringify(cachedProbedModel)}); falling back to claude default`,
+        );
+        envelopeModel = undefined;
+      }
 
       // Native MCP dispatch (#213): when the openai-compat extension is
       // active and carries `tools` (and `tool_choice !== "none"`), the

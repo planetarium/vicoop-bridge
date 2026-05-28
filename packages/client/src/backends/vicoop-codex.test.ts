@@ -14,6 +14,7 @@ import {
   flattenA2AUserContent,
   historyToChatCompletionMessages,
   parseChatCompletionUsage,
+  probeVicoopCodexModels,
   type ChatCompletionResponse,
   type VicoopCodexChildHandle,
   type VicoopCodexSpawnFn,
@@ -815,4 +816,202 @@ test('handle: cancel before spawn → task.complete with canceled', async () => 
   const frame = frames[0];
   if (frame.type !== 'task.complete') throw new Error('unreachable');
   assert.equal(frame.status.state, 'canceled');
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// `probeVicoopCodexModels` + envelope.model gate (#302). The probe spawns
+// `vicoop-codex models --json`, reads the model id list, and feeds the
+// backend's cache so `resolveCapabilities` can advertise on the agent card
+// and `handle` can drop unresolved routing keys before forwarding to the
+// CLI.
+// ───────────────────────────────────────────────────────────────────────────
+
+test('probeVicoopCodexModels: parses `models --json` shape into a string[] id list', async () => {
+  const fake = makeFakeSpawn();
+  const probe = probeVicoopCodexModels({
+    command: 'vicoop-codex',
+    spawn: fake.spawn,
+    timeoutMs: 1000,
+  });
+  // The fake's child is spawned synchronously when probeVicoopCodexModels
+  // calls spawn; drive it on the next microtask so the .on('data') listener
+  // is registered first.
+  queueMicrotask(() => {
+    const child = fake.lastChild();
+    child.emitStdout(
+      JSON.stringify({
+        client_version: '0.133.0',
+        models: [
+          { id: 'gpt-5.5', service_tiers: [] },
+          { id: 'gpt-5.4', service_tiers: [] },
+        ],
+      }),
+    );
+    child.finish(0);
+  });
+  const ids = await probe;
+  assert.deepEqual(ids, ['gpt-5.5', 'gpt-5.4']);
+});
+
+test('probeVicoopCodexModels: non-zero exit returns null', async () => {
+  const fake = makeFakeSpawn();
+  const probe = probeVicoopCodexModels({
+    command: 'vicoop-codex',
+    spawn: fake.spawn,
+    timeoutMs: 1000,
+  });
+  queueMicrotask(() => fake.lastChild().finish(1));
+  assert.equal(await probe, null);
+});
+
+test('probeVicoopCodexModels: timeoutMs:0 short-circuits without spawning', async () => {
+  const fake = makeFakeSpawn();
+  const ids = await probeVicoopCodexModels({
+    command: 'vicoop-codex',
+    spawn: fake.spawn,
+    timeoutMs: 0,
+  });
+  assert.equal(ids, null);
+  assert.equal(fake.children.length, 0);
+});
+
+test('resolveCapabilities advertises openaiCompatModels with the first id tagged default (#302)', async () => {
+  const fake = makeFakeSpawn();
+  const backend = createVicoopCodexBackend({ spawn: fake.spawn });
+  const capPromise = backend.resolveCapabilities?.();
+  queueMicrotask(() => {
+    fake.lastChild().emitStdout(
+      JSON.stringify({
+        models: [{ id: 'gpt-5.5' }, { id: 'gpt-5.4' }],
+      }),
+    );
+    fake.lastChild().finish(0);
+  });
+  const cap = await capPromise;
+  assert.deepEqual(cap, {
+    openaiCompatModels: [
+      { id: 'gpt-5.5', default: true },
+      { id: 'gpt-5.4' },
+    ],
+  });
+});
+
+test('envelope.model is forwarded when the probed list advertises it (#302)', async () => {
+  const fake = makeFakeSpawn();
+  const backend = createVicoopCodexBackend({ spawn: fake.spawn });
+  const capPromise = backend.resolveCapabilities?.();
+  queueMicrotask(() => {
+    fake.lastChild().emitStdout(
+      JSON.stringify({ models: [{ id: 'gpt-5.5' }, { id: 'gpt-5.4' }] }),
+    );
+    fake.lastChild().finish(0);
+  });
+  await capPromise;
+
+  const frames: UpFrame[] = [];
+  const ctrl = new AbortController();
+  const done = backend.handle(
+    {
+      type: 'task.assign',
+      taskId: 't',
+      contextId: 'c',
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'hi' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            chat_completions_request: {
+              model: 'gpt-5.5',
+              messages: [{ role: 'user', content: 'hi' }],
+            },
+          },
+        },
+      },
+    },
+    (f) => frames.push(f),
+    ctrl.signal,
+  );
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  // index 0 was the probe child; the call child is the second one.
+  const callChild = fake.children[1];
+  const body = JSON.parse(callChild.stdinPayload()) as Record<string, unknown>;
+  assert.equal(body.model, 'gpt-5.5');
+  // Drive the call child to a clean exit so done resolves.
+  callChild.emitStdout(
+    JSON.stringify({
+      id: 'x',
+      object: 'chat.completion',
+      created: 1,
+      model: 'gpt-5.5',
+      choices: [
+        { index: 0, message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }),
+  );
+  callChild.finish(0);
+  await done;
+});
+
+test('envelope.model is dropped when the probed list does NOT advertise it (#302)', async () => {
+  // Regression guard for the gateway sending an unresolved routing key
+  // (e.g. `a2a/<card-url>`) as `envelope.model`. Without the gate the
+  // bridge would forward garbage to vicoop-codex, which would then fail
+  // upstream with `model not found`. With the gate the override is
+  // dropped and the CLI falls back to its DEFAULT_MODEL.
+  const fake = makeFakeSpawn();
+  const backend = createVicoopCodexBackend({ spawn: fake.spawn });
+  const capPromise = backend.resolveCapabilities?.();
+  queueMicrotask(() => {
+    fake.lastChild().emitStdout(
+      JSON.stringify({ models: [{ id: 'gpt-5.5' }, { id: 'gpt-5.4' }] }),
+    );
+    fake.lastChild().finish(0);
+  });
+  await capPromise;
+
+  const frames: UpFrame[] = [];
+  const ctrl = new AbortController();
+  const done = backend.handle(
+    {
+      type: 'task.assign',
+      taskId: 't',
+      contextId: 'c',
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'hi' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            chat_completions_request: {
+              model: 'a2a/https://example.com/agents/x/.well-known/agent-card.json',
+              messages: [{ role: 'user', content: 'hi' }],
+            },
+          },
+        },
+      },
+    },
+    (f) => frames.push(f),
+    ctrl.signal,
+  );
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  const callChild = fake.children[1];
+  const body = JSON.parse(callChild.stdinPayload()) as Record<string, unknown>;
+  // model field absent — CLI falls back to DEFAULT_MODEL.
+  assert.equal(body.model, undefined);
+  callChild.emitStdout(
+    JSON.stringify({
+      id: 'x',
+      object: 'chat.completion',
+      created: 1,
+      model: 'gpt-5.5',
+      choices: [
+        { index: 0, message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }),
+  );
+  callChild.finish(0);
+  await done;
 });
