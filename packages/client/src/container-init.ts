@@ -926,7 +926,11 @@ const containerInitSubCmd = command(
   },
 );
 
-function containerListCommand(name: 'ls' | 'list') {
+// `ls` / `rm` are registered as hidden aliases of `list` / `remove` so help
+// only shows the canonical long form. They still parse and still surface in
+// "did you mean?" suggestions.
+
+function containerListCommand(name: 'list' | 'ls', alias: boolean) {
   return command(
     name,
     object({
@@ -936,18 +940,19 @@ function containerListCommand(name: 'ls' | 'list') {
       }), false),
     }),
     {
-      brief: message`List runtime containers and volumes.`,
+      brief: message`List runtime containers and volumes. (alias: \`ls\`)`,
       description: message`Prints one row per managed runtime container, showing its kind, name, running state, image, and volume presence.`,
+      ...(alias ? { hidden: 'help' as const } : {}),
     },
   );
 }
 
 const containerListSubCmd = longestMatch(
-  containerListCommand('ls'),
-  containerListCommand('list'),
+  containerListCommand('list', false),
+  containerListCommand('ls', true),
 );
 
-function containerRemoveCommand(name: 'rm' | 'remove') {
+function containerRemoveCommand(name: 'remove' | 'rm', alias: boolean) {
   return command(
     name,
     object({
@@ -963,15 +968,16 @@ function containerRemoveCommand(name: 'rm' | 'remove') {
       }), false),
     }),
     {
-      brief: message`Remove a runtime container.`,
+      brief: message`Remove a runtime container. (alias: \`rm\`)`,
       description: message`Removes a runtime container and its agents, creds, and sessions volumes by name. Pass --preserve-volumes to keep the volumes.`,
+      ...(alias ? { hidden: 'help' as const } : {}),
     },
   );
 }
 
 const containerRemoveSubCmd = longestMatch(
-  containerRemoveCommand('rm'),
-  containerRemoveCommand('remove'),
+  containerRemoveCommand('remove', false),
+  containerRemoveCommand('rm', true),
 );
 
 export const containerCmd = command(
@@ -979,7 +985,7 @@ export const containerCmd = command(
   longestMatch(containerInitSubCmd, containerListSubCmd, containerRemoveSubCmd),
   {
     brief: message`Manage per-backend runtime containers.`,
-    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<name>\`, install the agent CLI, optionally copy host creds), \`ls\` / \`list\` (show managed runtime container and volume state), \`rm\` / \`remove\` (remove a runtime container and volumes by name). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
+    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<name>\`, install the agent CLI, optionally copy host creds), \`list\` (show managed runtime container and volume state), \`remove\` (remove a runtime container and volumes by name). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
     hidden: 'usage',
   },
 );

@@ -590,14 +590,14 @@ test('legacy list-clients warns and points at agent list', async (t) => {
   assert.match(stderr.read(), /list-clients.*deprecated.*agent list/s);
 });
 
-test('legacy revoke-client warns and points at agent delete', async (t) => {
+test('legacy revoke-client warns and points at agent remove', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   captureStdout(t);
   const stderr = captureStderr(t);
   installFetch(t, { body: { client_id: 'c', client_name: 'n', deleted: true, closed_connections: 0 } });
 
   assert.equal(await runRevokeClient(revokeClientArgs('n')), 0);
-  assert.match(stderr.read(), /revoke-client.*deprecated.*agent delete/s);
+  assert.match(stderr.read(), /revoke-client.*deprecated.*agent remove/s);
 });
 
 test('legacy {add,remove,list}-caller all emit the agent-callers deprecation hint', async (t) => {
