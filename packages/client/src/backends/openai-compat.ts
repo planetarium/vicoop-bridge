@@ -160,10 +160,16 @@ function parseUserOrAssistantContent(raw: unknown): OpenAICompatMessageContent |
 // `buildOpenAICompatSystemPrompt` so the gate that enables the envelope
 // contract in the prompt is the same gate that disables the conflicting
 // built-ins.
-export function callerToolDispatchActive(meta: OpenAICompatMetadata | null): boolean {
-  if (!meta) return false;
-  if (meta.tools === undefined) return false;
-  return meta.tool_choice !== 'none';
+//
+// Takes the envelope's `tools` and `tool_choice` directly so callers in the
+// envelope-direct migration (#302) don't have to go through the decomposed
+// metadata view.
+export function callerToolDispatchActive(
+  tools: unknown,
+  toolChoice: unknown,
+): boolean {
+  if (!Array.isArray(tools) || tools.length === 0) return false;
+  return toolChoice !== 'none';
 }
 
 // Extract the openai-compat extension's request envelope verbatim. Reads

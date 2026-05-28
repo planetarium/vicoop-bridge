@@ -1195,7 +1195,8 @@ export function createClaudeBackend(
       // tasks without the openai-compat extension (or without `tools`)
       // remain on the default agentic path with claude's built-ins intact.
       const callerToolDefs =
-        callerToolDispatchActive(openaiCompat) && openaiCompat?.tools
+        callerToolDispatchActive(openaiCompat?.tools, openaiCompat?.tool_choice) &&
+        openaiCompat?.tools
           ? openaiToolsToCallerToolDefs(openaiCompat.tools)
           : null;
       const nativeDispatchActive = callerToolDefs !== null;
@@ -1461,7 +1462,10 @@ export function createClaudeBackend(
       // from agent-side filesystem). `--tools ""` is the documented switch
       // for blanket-disabling built-ins; MCP-registered tools (e.g.
       // `send_file`) continue to load via `--mcp-config`.
-      const disableBuiltinToolArgs: readonly string[] = callerToolDispatchActive(openaiCompat)
+      const disableBuiltinToolArgs: readonly string[] = callerToolDispatchActive(
+        openaiCompat?.tools,
+        openaiCompat?.tool_choice,
+      )
         ? ['--tools', '']
         : [];
       // Cap claude to a single model turn when caller-tools are dispatched

@@ -2448,21 +2448,15 @@ test('callerToolDispatchActive: gates on `tools` present and `tool_choice !== "n
   // The same gate `buildOpenAICompatSystemPrompt` uses for the envelope
   // contract block. Backends consult this to decide whether to suppress
   // agent-side built-in tools (#175).
-  assert.equal(callerToolDispatchActive(null), false);
-  assert.equal(callerToolDispatchActive({}), false);
-  assert.equal(callerToolDispatchActive({ system: 'hi' }), false);
-  assert.equal(callerToolDispatchActive({ tools: [] }), true);
-  assert.equal(callerToolDispatchActive({ tools: [{ type: 'function' }] }), true);
+  assert.equal(callerToolDispatchActive(undefined, undefined), false);
+  assert.equal(callerToolDispatchActive(null, undefined), false);
+  // Empty array carries no definitions — not "tools present".
+  assert.equal(callerToolDispatchActive([], undefined), false);
+  assert.equal(callerToolDispatchActive([{ type: 'function' }], undefined), true);
   // Caller catalogued tools but explicitly opted out for this turn — don't
   // handicap the agent's built-ins; the contract isn't being enforced now.
-  assert.equal(
-    callerToolDispatchActive({ tools: [{ type: 'function' }], tool_choice: 'none' }),
-    false,
-  );
-  assert.equal(
-    callerToolDispatchActive({ tools: [{ type: 'function' }], tool_choice: 'auto' }),
-    true,
-  );
+  assert.equal(callerToolDispatchActive([{ type: 'function' }], 'none'), false);
+  assert.equal(callerToolDispatchActive([{ type: 'function' }], 'auto'), true);
 });
 
 test('tryParseToolCallsEnvelope: recognises a well-formed envelope and preserves unknown keys', () => {
