@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import {
+  buildClaudeChatCompletionEnvelope,
   buildOpenAICompatNativeSystemPrompt,
   createClaudeBackend,
   normalizeClaudeModelId,
@@ -3668,10 +3669,11 @@ test('argv: --allowedTools covers all registered MCP servers (#235)', async () =
 
 // End-to-end (with test seam): the model "invokes" the caller tool via
 // the MCP server's `invokeForTest` while claude is mid-run; the bridge
-// emits a `tool_calls` data artifact with the OpenAI wire shape and
-// suppresses any subsequent agent text from `status.message.parts` on
-// completion. Same invariant codex backend enforces under #212.
-test('native dispatch: tool invocation emits tool_calls artifact + suppresses final text (#213)', async () => {
+// surfaces the call on the terminal `chat_completion` envelope metadata
+// (oai2a2a#80) and suppresses any subsequent agent text from
+// `status.message.parts` on completion. Same invariant codex backend
+// enforces under #212.
+test('native dispatch: tool invocation → chat_completion envelope on terminal status + suppresses final text (#213, oai2a2a#80)', async () => {
   // Drive claude's stream-json from outside so we can interleave the
   // MCP invocation. The fake child stays alive until `finish()` so the
   // bridge can route the artifact emit through the live `emit` capture.
@@ -3757,33 +3759,24 @@ test('native dispatch: tool invocation emits tool_calls artifact + suppresses fi
     NEVER,
   );
 
-  // Locate the tool_calls artifact (data part with the OPENAI_COMPAT
-  // extension). Bridge emits it as soon as onInvoke fires.
-  const toolCallsArtifact = frames.find(
+  // Envelope contract (oai2a2a#80): no data-part `tool_calls` artifact.
+  // The model's function_call is delivered exclusively on the terminal
+  // status message metadata as `chat_completion.choices[0].message.tool_calls`.
+  const dataArtifacts = frames.filter(
     (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
       f.type === 'task.artifact' &&
       f.artifact.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI) === true &&
       f.artifact.parts[0]?.kind === 'data',
   );
-  assert.ok(toolCallsArtifact, 'tool_calls data artifact emitted under openai-compat extension');
-  if (toolCallsArtifact) {
-    const data = (toolCallsArtifact.artifact.parts[0] as { data: unknown }).data as {
-      tool_calls?: Array<{
-        id?: string;
-        function?: { name?: string; arguments?: unknown };
-      }>;
-    };
-    assert.equal(data.tool_calls?.length, 1);
-    assert.equal(data.tool_calls?.[0]?.id, 'call_xyz');
-    assert.equal(data.tool_calls?.[0]?.function?.name, 'fetch');
-    assert.deepEqual(data.tool_calls?.[0]?.function?.arguments, {
-      url: 'https://example.com',
-    });
-  }
+  assert.equal(
+    dataArtifacts.length,
+    0,
+    'no data-part tool_calls artifact under the envelope contract',
+  );
 
   // Terminal frame: state=completed, NO text in status.message.parts.
-  // The tool_calls artifact is the complete output; any wrap-up text the
-  // model emitted ("OK, calling that for you.") is reasoning preamble
+  // The chat_completion envelope is the complete output; any wrap-up text
+  // the model emitted ("OK, calling that for you.") is reasoning preamble
   // and is dropped on completion to avoid the #200-style double-emit
   // downstream gateways would otherwise produce.
   const complete = frames.find(
@@ -3794,16 +3787,60 @@ test('native dispatch: tool invocation emits tool_calls artifact + suppresses fi
   const parts = complete?.status.message?.parts ?? [];
   const hasText = parts.some((p) => p.kind === 'text');
   assert.equal(hasText, false, 'no text in status.message.parts when tool was captured');
+
+  // Envelope verification: the terminal status message metadata carries the
+  // complete OpenAI ChatCompletion envelope with tool_calls.
+  if (complete && complete.type === 'task.complete') {
+    const metadata = complete.status.message?.metadata as
+      | Record<string, Record<string, unknown>>
+      | undefined;
+    const ext = metadata?.[OPENAI_COMPAT_EXTENSION_URI];
+    assert.ok(ext, 'openai-compat metadata present on terminal message');
+    const envelope = ext.chat_completion as Record<string, unknown> | undefined;
+    assert.ok(envelope, 'chat_completion envelope present');
+    assert.equal(typeof envelope.id, 'string');
+    assert.ok((envelope.id as string).startsWith('chatcmpl-claude-'));
+    assert.equal(envelope.object, 'chat.completion');
+    assert.equal(typeof envelope.created, 'number');
+    assert.equal(typeof envelope.model, 'string');
+    const choices = envelope.choices as Array<Record<string, unknown>>;
+    assert.equal(choices.length, 1);
+    const choice = choices[0];
+    assert.equal(choice.finish_reason, 'tool_calls');
+    assert.equal(choice.logprobs, null);
+    const message = choice.message as {
+      role: string;
+      content: unknown;
+      tool_calls?: Array<{
+        id?: string;
+        type?: string;
+        function?: { name?: string; arguments?: unknown };
+      }>;
+    };
+    assert.equal(message.role, 'assistant');
+    assert.equal(message.content, null);
+    assert.equal(message.tool_calls?.length, 1);
+    assert.equal(message.tool_calls?.[0]?.id, 'call_xyz');
+    assert.equal(message.tool_calls?.[0]?.type, 'function');
+    assert.equal(message.tool_calls?.[0]?.function?.name, 'fetch');
+    // OpenAI spec requires `arguments` to be a JSON-encoded string.
+    const argsRaw = message.tool_calls?.[0]?.function?.arguments;
+    assert.equal(typeof argsRaw, 'string');
+    assert.deepEqual(JSON.parse(argsRaw as string), {
+      url: 'https://example.com',
+    });
+  }
 });
 
 // `--max-turns 1` + exit-code-1 mapping (#213): with native dispatch active,
 // claude code hits the turn cap immediately after the model emits its
 // tool_use(s) and exits with code 1. The bridge MUST map that exit to a
-// successful task.complete when a tool call was captured (the `tool_calls`
-// artifact is the complete output for this turn — same invariant codex
-// backend enforces under PR #212). Without this mapping every native
-// tool-using task would surface as task.fail to the caller, breaking the
-// OpenAI Chat Completions `finish_reason: "tool_calls"` round-trip.
+// successful task.complete when a tool call was captured (the
+// `chat_completion` envelope on the terminal status message IS the complete
+// output for this turn — same invariant codex backend enforces under PR
+// #212). Without this mapping every native tool-using task would surface
+// as task.fail to the caller, breaking the OpenAI Chat Completions
+// `finish_reason: "tool_calls"` round-trip.
 test('native dispatch: --max-turns 1 exits with code 1; bridge maps to completed when tool captured (#213)', async () => {
   const fake = makeFakeSpawn((child) => {
     setImmediate(() => {
@@ -3874,12 +3911,30 @@ test('native dispatch: --max-turns 1 exits with code 1; bridge maps to completed
   const failFrame = frames.find((f) => f.type === 'task.fail');
   assert.equal(failFrame, undefined, 'task.fail must not be emitted');
 
-  // The tool_calls artifact is still on the wire.
+  // Envelope contract (oai2a2a#80): no data-part `tool_calls` artifact;
+  // the tool_calls ride exclusively on the terminal status message's
+  // chat_completion envelope. Verify the envelope is present with
+  // finish_reason: 'tool_calls' and the captured call.
   const dataArt = frames.find(
     (f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
       f.type === 'task.artifact' && f.artifact.parts[0]?.kind === 'data',
   );
-  assert.ok(dataArt, 'tool_calls artifact emitted before exit');
+  assert.equal(dataArt, undefined, 'no data-part tool_calls artifact under the envelope contract');
+
+  if (terminal?.type === 'task.complete') {
+    const metadata = terminal.status.message?.metadata as
+      | Record<string, Record<string, unknown>>
+      | undefined;
+    const envelope = metadata?.[OPENAI_COMPAT_EXTENSION_URI]?.chat_completion as
+      | Record<string, unknown>
+      | undefined;
+    assert.ok(envelope, 'chat_completion envelope present on terminal status');
+    const choices = envelope.choices as Array<Record<string, unknown>>;
+    assert.equal(choices[0]?.finish_reason, 'tool_calls');
+    const msg = choices[0]?.message as { tool_calls?: Array<{ id?: string }> };
+    assert.equal(msg.tool_calls?.length, 1);
+    assert.equal(msg.tool_calls?.[0]?.id, 'call_xyz');
+  }
 });
 
 // Inverse: claude exits non-zero WITHOUT any tool capture (e.g., a real
@@ -4285,6 +4340,95 @@ test('parseClaudeModelUsageForOpenAICompat strips bracket tier suffix on usage.m
   assert.ok(usage);
   assert.equal(usage!.model, 'claude-opus-4-7');
 });
+
+// Envelope shape: text-only turn (no tool calls, with usage) produces a
+// spec-compliant ChatCompletion envelope — id synthesized from taskId,
+// object/created/model defaults, logprobs:null on the choice, content as
+// the assistant text, and finish_reason:'stop'.
+test('buildClaudeChatCompletionEnvelope: text-only turn shape with synthesized defaults (oai2a2a#80)', () => {
+  const usage = buildOpenAICompatUsageFromInputs(120, 30, 'claude-opus-4-7');
+  const envelope = buildClaudeChatCompletionEnvelope({
+    taskId: 't-abc',
+    model: 'claude-opus-4-7',
+    content: 'hello there',
+    toolCalls: undefined,
+    finishReason: 'stop',
+    usage,
+  });
+  assert.equal(envelope.id, 'chatcmpl-claude-t-abc');
+  assert.equal(envelope.object, 'chat.completion');
+  assert.equal(typeof envelope.created, 'number');
+  assert.equal(envelope.model, 'claude-opus-4-7');
+  const choices = envelope.choices as Array<Record<string, unknown>>;
+  assert.equal(choices.length, 1);
+  assert.equal(choices[0]?.index, 0);
+  assert.equal(choices[0]?.finish_reason, 'stop');
+  assert.equal(choices[0]?.logprobs, null);
+  const message = choices[0]?.message as { role: string; content: unknown; tool_calls?: unknown };
+  assert.equal(message.role, 'assistant');
+  assert.equal(message.content, 'hello there');
+  assert.equal('tool_calls' in message, false);
+  // Usage rides inside the envelope.
+  const envUsage = envelope.usage as { prompt_tokens?: number; total_tokens?: number; model?: string };
+  assert.equal(envUsage.prompt_tokens, 120);
+  assert.equal(envUsage.total_tokens, 150);
+  assert.equal(envUsage.model, 'claude-opus-4-7');
+});
+
+// Defensive defaults: when claude never surfaced a model id (e.g. the run
+// failed before any modelUsage frame landed), the envelope still satisfies
+// the spec's "model is required" obligation via the placeholder fallback.
+// Tool-call envelopes carry `content: null` and a populated tool_calls
+// array; finish_reason flips to 'tool_calls'.
+test('buildClaudeChatCompletionEnvelope: tool-call envelope with model fallback (oai2a2a#80)', () => {
+  const envelope = buildClaudeChatCompletionEnvelope({
+    taskId: 'task-xyz',
+    model: undefined,
+    content: null,
+    toolCalls: [
+      {
+        id: 'call_1',
+        type: 'function',
+        function: { name: 'fetch', arguments: '{"url":"https://example.com"}' },
+      },
+    ],
+    finishReason: 'tool_calls',
+    usage: null,
+  });
+  assert.equal(envelope.id, 'chatcmpl-claude-task-xyz');
+  assert.equal(envelope.model, 'claude');
+  assert.equal('usage' in envelope, false, 'usage omitted when not reported');
+  const choices = envelope.choices as Array<Record<string, unknown>>;
+  assert.equal(choices[0]?.finish_reason, 'tool_calls');
+  assert.equal(choices[0]?.logprobs, null);
+  const message = choices[0]?.message as {
+    role: string;
+    content: unknown;
+    tool_calls?: Array<{ id?: string; type?: string; function?: { arguments?: unknown } }>;
+  };
+  assert.equal(message.role, 'assistant');
+  assert.equal(message.content, null);
+  assert.equal(message.tool_calls?.length, 1);
+  assert.equal(message.tool_calls?.[0]?.id, 'call_1');
+  assert.equal(message.tool_calls?.[0]?.type, 'function');
+  // `arguments` MUST be a JSON-encoded string per OpenAI Chat Completions.
+  assert.equal(typeof message.tool_calls?.[0]?.function?.arguments, 'string');
+});
+
+// Local helper — keeps the envelope test self-contained without leaning on
+// internal usage-builder import.
+function buildOpenAICompatUsageFromInputs(
+  prompt: number,
+  completion: number,
+  model: string,
+): { prompt_tokens: number; completion_tokens: number; total_tokens: number; model: string } {
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    model,
+  };
+}
 
 test('claude backend resolveCapabilities returns {} on probe timeout', async () => {
   const fake = makeFakeSpawn(() => {

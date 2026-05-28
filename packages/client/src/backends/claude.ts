@@ -8,8 +8,8 @@ import {
 import type { Backend } from '../backend.js';
 import { formatAcct, formatMention, type AgentIdentity } from '../identity.js';
 import {
+  buildOpenAICompatResponseMetadata,
   buildOpenAICompatUsage,
-  makeOpenAICompatUsageMetadata,
   type OpenAICompatUsage,
 } from './openai-compat-usage.js';
 import {
@@ -278,6 +278,56 @@ export function parseClaudeModelUsageForOpenAICompat(raw: unknown): OpenAICompat
     cached_tokens: cacheReadSum > 0 ? cacheReadSum : undefined,
     model: primaryModel ? normalizeClaudeModelId(primaryModel) : undefined,
   });
+}
+
+// Assemble a complete OpenAI ChatCompletion envelope for the openai-compat/v1
+// envelope contract (oai2a2a#80). The codec on the gateway unwraps this
+// verbatim, so we own every required field — id / object / created / model /
+// choices / finish_reason / logprobs / usage. `id` is synthesized from the
+// A2A task id (Claude Code does not expose a stable response id we can
+// forward); `model` falls back to a placeholder when the run never reported
+// modelUsage (e.g. an early-exit failure before any LLM round-trip). Mirrors
+// `buildCodexChatCompletionEnvelope` in codex.ts so the two backends cannot
+// drift on the response shape.
+//
+// `finishReason` is constrained to the values Claude Code can produce on this
+// path: `tool_calls` when the model invoked a caller-side function tool,
+// otherwise `stop`. Claude does not surface `length` or `refusal` through the
+// stream-json transcript today, so we don't synthesize either — passing
+// through whatever the SDK exposes when it gains the field is a future
+// extension.
+//
+// Spec: extensions/openai-compat/v1/README.md#response-metadata-payload-agent--gateway
+export function buildClaudeChatCompletionEnvelope(args: {
+  taskId: string;
+  model: string | undefined;
+  content: string | null;
+  toolCalls:
+    | Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>
+    | undefined;
+  finishReason: 'stop' | 'tool_calls';
+  usage: OpenAICompatUsage | null;
+}): Record<string, unknown> {
+  const message: Record<string, unknown> = { role: 'assistant', content: args.content };
+  if (args.toolCalls && args.toolCalls.length > 0) {
+    message.tool_calls = args.toolCalls;
+  }
+  const envelope: Record<string, unknown> = {
+    id: `chatcmpl-claude-${args.taskId}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: args.model ?? 'claude',
+    choices: [
+      {
+        index: 0,
+        message,
+        finish_reason: args.finishReason,
+        logprobs: null,
+      },
+    ],
+  };
+  if (args.usage) envelope.usage = args.usage;
+  return envelope;
 }
 
 // Anthropic-shaped content block we send on stdin.
@@ -1134,9 +1184,10 @@ export function createClaudeBackend(
 
       // Detect the openai-compat extension payload once per task so the
       // result feeds both the spawn argv (--append-system-prompt) and the
-      // assistant artifact path (tool_calls JSON → data part). Absent or
-      // malformed metadata leaves the run on the original non-extension code
-      // path with no envelope-detection cost.
+      // terminal `chat_completion` envelope (oai2a2a#80) on
+      // `status.message.metadata`. Absent or malformed metadata leaves the
+      // run on the original non-extension code path with no envelope-
+      // detection cost.
       const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
       if (openaiCompatTrace) {
         dumpOpenAICompatTaskWire(
@@ -1294,11 +1345,22 @@ export function createClaudeBackend(
       // Flag flipped by the `caller-tools-mcp` invocation handler when the
       // model invokes a caller-supplied tool. Read in the terminal block
       // below to suppress re-stamping the model's wrap-up text on
-      // `status.message.parts` — the `tool_calls` data artifact is the
-      // complete output for this turn, matching OpenAI Chat Completions'
-      // `finish_reason: "tool_calls"` semantics (the same invariant codex
-      // backend enforces on its native path, see #212).
+      // `status.message.parts` — the terminal `chat_completion` envelope
+      // (oai2a2a#80) is the complete output for this turn, matching OpenAI
+      // Chat Completions' `finish_reason: "tool_calls"` semantics (the same
+      // invariant codex backend enforces on its native path, see #212).
       let capturedToolCall = false;
+      // OpenAI Chat Completions tool_calls accumulated from caller-tools MCP
+      // invocations during this turn. Surfaced to the gateway via the
+      // terminal `chat_completion` envelope on
+      // `status.message.metadata[OPENAI_COMPAT_EXTENSION_URI]` per the
+      // openai-compat/v1 envelope contract (oai2a2a#80). Replaces the legacy
+      // data-part `tool_calls` artifact this backend used to emit.
+      const capturedToolCalls: Array<{
+        id: string;
+        type: 'function';
+        function: { name: string; arguments: string };
+      }> = [];
 
       // Caller-side function tools, exposed as native MCP tools. Per-task
       // lifecycle: stood up here BEFORE the spawn (so we know the URL to
@@ -1332,31 +1394,26 @@ export function createClaudeBackend(
             skipHttp: opts.onCallerToolsMcpReady !== undefined,
             tools: callerToolDefs,
             onInvoke: (invocation: CallerToolInvocation) => {
-              // Same OpenAI wire shape the envelope path emits — downstream
-              // gateways (oai2a2a) see no difference between native and
-              // envelope output, so this dispatch swap is invisible above
-              // the bridge layer.
-              const envelope = {
-                tool_calls: [
-                  {
-                    id: invocation.callId,
-                    function: {
-                      name: invocation.toolName,
-                      arguments: invocation.arguments,
-                    },
-                  },
-                ],
-              };
-              emit({
-                type: 'task.artifact',
-                taskId: task.taskId,
-                artifact: {
-                  artifactId: randomUUID(),
-                  name: 'claude-message',
-                  parts: [{ kind: 'data', data: envelope }],
-                  extensions: [OPENAI_COMPAT_EXTENSION_URI],
+              // Envelope contract (oai2a2a#80): tool_calls flow exclusively
+              // through the terminal `chat_completion` envelope metadata —
+              // NOT as a data-part artifact. Accumulate here; the terminal
+              // block below builds the envelope from `capturedToolCalls` and
+              // stamps it on `status.message.metadata`. OpenAI Chat
+              // Completions requires `arguments` as a JSON-encoded string;
+              // the MCP transport hands us a parsed JSON value, so we
+              // stringify here for spec compliance (mirrors codex.ts's
+              // capture path).
+              const argsString =
+                typeof invocation.arguments === 'string'
+                  ? invocation.arguments
+                  : JSON.stringify(invocation.arguments ?? {});
+              capturedToolCalls.push({
+                id: invocation.callId,
+                type: 'function',
+                function: {
+                  name: invocation.toolName,
+                  arguments: argsString,
                 },
-                lastChunk: true,
               });
               capturedToolCall = true;
               // The actual tool result is the caller's job — it arrives on
@@ -1583,7 +1640,13 @@ export function createClaudeBackend(
         input: unknown
       } | null = null;
       let finalText: string | null = null;
-      let finalUsage: OpenAICompatUsage | null = null;
+      // Explicit widening type — without this TS infers a too-narrow type
+      // through the `if (parsed) finalUsage = parsed;` assignment when
+      // `parseClaudeModelUsageForOpenAICompat` returns `OpenAICompatUsage | null`,
+      // because the only assignment site narrows out the `null` branch and
+      // later flow analysis collapses the type. Mirrors codex.ts's
+      // `finalUsage` declaration for the same reason.
+      let finalUsage: OpenAICompatUsage | null = null as OpenAICompatUsage | null;
       let responseArtifactId: string | null = null;
       let streamedResponseText = '';
       let sawCompletedResult = false;
@@ -1627,11 +1690,12 @@ export function createClaudeBackend(
       const emitAssistantArtifact = (text: string, append = false, lastChunk = true): void => {
         if (!text) return;
         responseArtifactId ??= randomUUID();
-        // openai-compat caller tools land as a `tool_calls` data artifact
-        // through the caller-tools MCP onInvoke handler above, NOT via
-        // any text-shape parsing. Assistant-text turns (natural-language
-        // answers, or any turn from a task that didn't request the
-        // extension) are emitted unchanged as a `text` part artifact.
+        // openai-compat caller tools surface via the terminal
+        // `chat_completion` envelope (oai2a2a#80) on the final A2A status
+        // message, NOT as any in-stream artifact. Assistant-text turns
+        // (natural-language answers, or any turn from a task that didn't
+        // request the extension) are emitted unchanged as a `text` part
+        // artifact for A2A debuggability and non-OpenAI consumers.
         emit({
           type: 'task.artifact',
           taskId: task.taskId,
@@ -2092,13 +2156,13 @@ export function createClaudeBackend(
 
       const completeText = finalText ?? '';
       // Native MCP dispatch (#213): when the model invoked a caller tool,
-      // the `tool_calls` data artifact (emitted via the MCP onInvoke
-      // handler above) is the complete task output. Any wrap-up text the
-      // model produced before exiting the turn (the system-prompt
-      // directive tells it to stop, but models occasionally emit a brief
-      // acknowledgement anyway) is reasoning preamble and must NOT be
-      // re-stamped on `status.message.parts` — same invariant codex
-      // backend enforces under PR #212, same root-cause concern as #200.
+      // the terminal `chat_completion` envelope (assembled below) is the
+      // complete task output. Any wrap-up text the model produced before
+      // exiting the turn (the system-prompt directive tells it to stop, but
+      // models occasionally emit a brief acknowledgement anyway) is
+      // reasoning preamble and must NOT be re-stamped on
+      // `status.message.parts` — same invariant codex backend enforces
+      // under PR #212, same root-cause concern as #200.
       const parts: Part[] = !capturedToolCall && completeText
         ? [{ kind: 'text', text: completeText }]
         : [];
@@ -2121,15 +2185,38 @@ export function createClaudeBackend(
         emitAssistantArtifact(completeText.slice(streamedResponseText.length), true, true);
       }
 
-      // Attach the openai-compat/v1 `usage` payload to the final A2A
-      // message of this turn when the underlying claude run reported it.
-      // Per spec the carrier is `Task.status.message.metadata[<URI>].usage`,
-      // so when usage is present but there is no completion text we still
-      // emit a message frame (with empty parts) to carry the metadata.
-      const hasMessage = parts.length > 0 || finalUsage !== null;
-      const messageMetadata = finalUsage
-        ? makeOpenAICompatUsageMetadata(finalUsage)
+      // Envelope response contract (oai2a2a#80): emit a complete OpenAI
+      // ChatCompletion envelope under
+      // `metadata[OPENAI_COMPAT_EXTENSION_URI].chat_completion` on the final
+      // A2A message of this turn. The codec unwraps the envelope verbatim,
+      // so we own id / created / model / choices / usage. The legacy
+      // top-level `usage` field is also emitted (via the shared metadata
+      // builder) for back-compat with codecs that read it as a fallback
+      // when the envelope lacks `usage`. When the openai-compat extension
+      // wasn't on the request at all we skip the envelope (no advertising
+      // consumer to feed it) but still emit the bare `usage` payload when
+      // claude reported one — preserves the pre-envelope behaviour for
+      // plain claude tasks. Mirrors codex.ts's emit pattern via the shared
+      // `buildOpenAICompatResponseMetadata` helper so claude and codex
+      // cannot drift on the wire shape.
+      const finishReason: 'tool_calls' | 'stop' =
+        capturedToolCalls.length > 0 ? 'tool_calls' : 'stop';
+      const assistantContent = capturedToolCalls.length > 0 ? null : completeText;
+      const envelope = openaiCompat
+        ? buildClaudeChatCompletionEnvelope({
+            taskId: task.taskId,
+            model: finalUsage?.model,
+            content: assistantContent,
+            toolCalls: capturedToolCalls.length > 0 ? capturedToolCalls : undefined,
+            finishReason,
+            usage: finalUsage,
+          })
         : undefined;
+
+      const messageMetadata = buildOpenAICompatResponseMetadata(envelope, finalUsage);
+      // When parts is empty but we have envelope/usage to convey, still
+      // emit the message frame so the metadata reaches the gateway.
+      const hasMessage = parts.length > 0 || messageMetadata !== undefined;
       emit({
         type: 'task.complete',
         taskId: task.taskId,
