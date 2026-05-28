@@ -2312,6 +2312,93 @@ test('parseOpenAICompatMetadata: picks up system / tools / tool_choice and drops
   assert.equal(m2.tools?.length, 1);
 });
 
+test('parseOpenAICompatMetadata: envelope path decomposes chat_completions_request into system/history', () => {
+  // Symmetric envelope contract (oai2a2a#80): the full inbound OpenAI
+  // ChatCompletionsRequest body rides under `chat_completions_request`.
+  // The parser decomposes it into the same {system, tools, tool_choice,
+  // chat_history} projection backends already consume — so existing
+  // backend code paths keep working unchanged.
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      chat_completions_request: {
+        model: 'gpt-4o',
+        messages: [
+          { role: 'system', content: 'You are concise.' },
+          { role: 'developer', content: 'Reply in english.' },
+          { role: 'user', content: 'Will it rain in Seoul?' },
+          {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              { id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{}' } },
+            ],
+          },
+          { role: 'tool', tool_call_id: 'call_1', content: 'sunny' },
+          { role: 'user', content: 'Thanks.' },
+        ],
+        tools: SAMPLE_TOOLS,
+        tool_choice: 'auto',
+      },
+    },
+  });
+  assert.ok(m);
+  // system + developer joined with \n.
+  assert.equal(m.system, 'You are concise.\nReply in english.');
+  assert.equal(m.tool_choice, 'auto');
+  assert.equal(m.tools?.length, 1);
+  // chat_history excludes the trailing user turn (it rides A2A parts) and
+  // the system / developer entries (they go through the system channel).
+  assert.equal(m.chat_history?.length, 3);
+  assert.equal((m.chat_history![0] as { role: string }).role, 'user');
+  assert.equal((m.chat_history![1] as { role: string }).role, 'assistant');
+  assert.equal((m.chat_history![2] as { role: string }).role, 'tool');
+});
+
+test('parseOpenAICompatMetadata: envelope tool-continuation keeps the full transcript in chat_history', () => {
+  // When the inbound messages[] does not end with a user turn the gateway
+  // emits A2A parts as the empty placeholder; the agent should see the
+  // whole sequence in chat_history.
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      chat_completions_request: {
+        model: 'gpt-4o',
+        messages: [
+          { role: 'user', content: 'Will it rain in Seoul?' },
+          {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              { id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{}' } },
+            ],
+          },
+          { role: 'tool', tool_call_id: 'call_1', content: 'sunny' },
+        ],
+      },
+    },
+  });
+  assert.ok(m);
+  assert.equal(m.chat_history?.length, 3);
+  assert.equal((m.chat_history![2] as { role: string }).role, 'tool');
+});
+
+test('parseOpenAICompatMetadata: envelope path with only a trailing user turn yields no chat_history', () => {
+  // Plain single-turn request: nothing for chat_history to carry — every
+  // entry would either be the trailing user (split off into parts) or
+  // a system entry (split off into the system channel).
+  const m = parseOpenAICompatMetadata({
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      chat_completions_request: {
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: SAMPLE_TOOLS,
+      },
+    },
+  });
+  assert.ok(m);
+  assert.equal(m.chat_history, undefined);
+  assert.equal(m.tools?.length, 1);
+});
+
 test('buildOpenAICompatSystemPrompt: includes tools JSON and tool_choice line when tools present', () => {
   const prompt = buildOpenAICompatSystemPrompt({
     system: 'You are concise.',
