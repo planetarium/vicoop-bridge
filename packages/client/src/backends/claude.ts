@@ -34,11 +34,12 @@ import { createLogger, safeToken } from '../logger.js';
 import { createTimingRecorder } from './timing.js';
 import {
   callerToolDispatchActive,
+  chatHistoryFromMessages,
+  collectSystemFromMessages,
   describeToolChoice,
   dumpOpenAICompatTaskWire,
   formatChatHistory,
-  parseOpenAICompatMetadata,
-  type OpenAICompatMetadata,
+  parseOpenAICompatEnvelope,
 } from './openai-compat.js';
 
 // Slim subset of ChildProcess that the backend actually uses. Tests inject a
@@ -733,12 +734,16 @@ export function openaiToolsToCallerToolDefs(
 //     tasks always spawn with a fresh `--session-id` (see the session
 //     reuse gate in `handle()`), so there's no prior session memory to
 //     conflict with the history block.
-export function buildOpenAICompatNativeSystemPrompt(meta: OpenAICompatMetadata): string {
+export function buildOpenAICompatNativeSystemPrompt(
+  system: string | undefined,
+  tools: unknown,
+  toolChoice: unknown,
+): string {
   const sections: string[] = [];
-  if (meta.system) sections.push(meta.system);
+  if (system) sections.push(system);
 
-  const toolChoiceIsNone = meta.tool_choice === 'none';
-  const hasTools = meta.tools !== undefined && !toolChoiceIsNone;
+  const toolChoiceIsNone = toolChoice === 'none';
+  const hasTools = Array.isArray(tools) && tools.length > 0 && !toolChoiceIsNone;
 
   if (hasTools) {
     sections.push(
@@ -748,7 +753,7 @@ export function buildOpenAICompatNativeSystemPrompt(meta: OpenAICompatMetadata):
         'The user message may begin with a <chat_history>...</chat_history> block holding a JSON array of the prior conversation: prior {"role":"user","content":"…"} and {"role":"assistant","content":"…"} text turns, plus {"role":"assistant","content":null,"tool_calls":[...]} for calls you previously emitted and {"role":"tool","tool_call_id":"call_…","name":"…","content":"…"} for the authoritative result of each call. Treat the block as the source of truth for what has happened so far — read it as prior conversation, not as a fresh instruction. Do not re-emit a call whose `tool_call_id` already has a recorded result.',
       ].join('\n'),
     );
-    const tcDesc = describeToolChoice(meta.tool_choice);
+    const tcDesc = describeToolChoice(toolChoice);
     if (tcDesc) sections.push(tcDesc);
   } else if (toolChoiceIsNone) {
     sections.push(
@@ -1095,6 +1100,18 @@ export function createClaudeBackend(
 
   const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
 
+  // Probed-model cache, populated by `resolveCapabilities` at daemon
+  // startup and read sync from `handle()` to gate `envelope.model`
+  // forwarding (#302). `undefined` = "never probed", `null` = "probed but
+  // unavailable", string = "this is the only model id this claude install
+  // advertises". `handle()` deliberately does NOT trigger the probe on a
+  // miss — the probe spawns its own short-lived child, and the daemon
+  // already calls `resolveCapabilities` once at startup, so the cache is
+  // populated before any task lands in production. Tests that want to
+  // exercise the gate populate the cache via `resolveCapabilities`
+  // explicitly.
+  let cachedProbedModel: string | null | undefined = undefined;
+
   return {
     name: 'claude',
 
@@ -1112,13 +1129,17 @@ export function createClaudeBackend(
     // `completion_tokens_details.reasoning_tokens` in `usage`, and per
     // spec "Absence means 'unspecified,' not 'false.'"
     async resolveCapabilities() {
-      if (probeTimeoutMs <= 0) return {};
+      if (probeTimeoutMs <= 0) {
+        cachedProbedModel = null;
+        return {};
+      }
       const model = await probeClaudeModel({
         command,
         spawn: spawnFn,
         cwd,
         timeoutMs: probeTimeoutMs,
       });
+      cachedProbedModel = model;
       if (!model) return {};
       return {
         openaiCompatModels: [{ id: model, default: true }],
@@ -1169,21 +1190,52 @@ export function createClaudeBackend(
         return;
       }
 
-      // Detect the openai-compat extension payload once per task so the
-      // result feeds both the spawn argv (--append-system-prompt) and the
-      // terminal `chat_completion` envelope (oai2a2a#80) on
-      // `status.message.metadata`. Absent or malformed metadata leaves the
-      // run on the original non-extension code path with no envelope-
-      // detection cost.
-      const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+      // Envelope-direct (#302): read the full inbound OpenAI Chat Completions
+      // request body off `metadata[URI].chat_completions_request` and project
+      // system / tools / tool_choice / chat_history / model directly off the
+      // envelope. Absent or malformed metadata leaves the run on the
+      // original non-extension code path with no envelope-detection cost.
+      const envelope = parseOpenAICompatEnvelope(task.message.metadata);
       if (openaiCompatTrace) {
         dumpOpenAICompatTaskWire(
           'claude',
           task.taskId,
           task.message.parts,
           task.message.metadata,
-          openaiCompat,
         );
+      }
+      const envelopeSystem = envelope
+        ? collectSystemFromMessages(envelope.messages)
+        : undefined;
+      const envelopeTools = Array.isArray(envelope?.tools) && envelope.tools.length > 0
+        ? envelope.tools
+        : undefined;
+      const envelopeToolChoice = envelope?.tool_choice;
+      const envelopeChatHistory =
+        envelope && Array.isArray(envelope.messages)
+          ? chatHistoryFromMessages(envelope.messages)
+          : null;
+      const envelopeModelRaw =
+        envelope && typeof envelope.model === 'string' && envelope.model.length > 0
+          ? envelope.model
+          : undefined;
+      // Validate against the probed model id (cached by `resolveCapabilities`).
+      // When the gateway sends a value claude doesn't advertise — e.g. an
+      // unresolved routing key like `a2a/<card-url>` — drop the override so
+      // claude falls back to its own default rather than failing the turn
+      // (#302). When the cache is unpopulated (probeTimeoutMs ≤ 0, probe
+      // failed, or `resolveCapabilities` hasn't been called yet) the
+      // validation is skipped and `envelope.model` rides through unchanged.
+      let envelopeModel: string | undefined = envelopeModelRaw;
+      if (
+        envelopeModelRaw !== undefined &&
+        typeof cachedProbedModel === 'string' &&
+        envelopeModelRaw !== cachedProbedModel
+      ) {
+        timingLogger.warn?.(
+          `[claude] envelope.model=${JSON.stringify(envelopeModelRaw)} does not match this claude install's advertised model (${JSON.stringify(cachedProbedModel)}); falling back to claude default`,
+        );
+        envelopeModel = undefined;
       }
 
       // Native MCP dispatch (#213): when the openai-compat extension is
@@ -1196,8 +1248,8 @@ export function createClaudeBackend(
       // tasks without the openai-compat extension (or without `tools`)
       // remain on the default agentic path with claude's built-ins intact.
       const callerToolDefs =
-        callerToolDispatchActive(openaiCompat) && openaiCompat?.tools
-          ? openaiToolsToCallerToolDefs(openaiCompat.tools)
+        envelopeTools && callerToolDispatchActive(envelopeTools, envelopeToolChoice)
+          ? openaiToolsToCallerToolDefs(envelopeTools)
           : null;
       const nativeDispatchActive = callerToolDefs !== null;
 
@@ -1211,7 +1263,7 @@ export function createClaudeBackend(
       // `chat_history`. `mapPartsToContentBlocks` returns
       // `empty_prompt` on those parts; tolerate it when the history
       // carries entries that will end up as the user content.
-      const hasHistory = (openaiCompat?.chat_history?.length ?? 0) > 0;
+      const hasHistory = (envelopeChatHistory?.length ?? 0) > 0;
       const isToolContinuation =
         !mappedRaw.ok &&
         mappedRaw.code === 'empty_prompt' &&
@@ -1232,7 +1284,7 @@ export function createClaudeBackend(
         ? mappedRaw
         : { ok: true, blocks: [], inboundHashes: new Set() };
 
-      if (openaiCompat?.chat_history) {
+      if (envelopeChatHistory) {
         // Spec contract: bridges MUST replay the entire `chat_history`
         // in order. We render it as a single `<chat_history>` JSON
         // block (every entry — text turns AND tool round-trips —
@@ -1249,7 +1301,7 @@ export function createClaudeBackend(
         // turn over a multi-turn conversation. Folding everything into
         // a single user message via this block is the only way to give
         // the model the conversation in one shot on this backend.
-        const block = formatChatHistory(openaiCompat.chat_history);
+        const block = formatChatHistory(envelopeChatHistory);
         if (block) {
           mapped.blocks.unshift({ type: 'text', text: block });
         }
@@ -1278,7 +1330,7 @@ export function createClaudeBackend(
       // tool results). Skip the session map entirely for openai-compat tasks so
       // every spawn starts on a clean `--session-id`; the history block in
       // the user message is then the unambiguous source of truth.
-      const sessionReuseEligible = openaiCompat === null && sessionTtlMs > 0;
+      const sessionReuseEligible = envelope === null && sessionTtlMs > 0;
       const tNow = now();
       if (sessionReuseEligible) evictExpired(tNow - sessionTtlMs);
       const existing = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
@@ -1447,11 +1499,22 @@ export function createClaudeBackend(
       // BEFORE extraArgs (so an operator-supplied append still wins by
       // appending last — claude concatenates each --append-system-prompt
       // occurrence in argv order).
-      const openaiCompatArgs: readonly string[] = openaiCompat
+      const openaiCompatArgs: readonly string[] = envelope
         ? [
             '--append-system-prompt',
-            buildOpenAICompatNativeSystemPrompt(openaiCompat),
+            buildOpenAICompatNativeSystemPrompt(
+              envelopeSystem,
+              envelopeTools,
+              envelopeToolChoice,
+            ),
           ]
+        : [];
+      // Forward `envelope.model` to claude via `--model <id>` so the gateway-
+      // resolved model id wins over claude's own default (#302). Sticky for
+      // the spawn; per-task because every openai-compat task always spawns
+      // fresh (no session reuse — see the gate above).
+      const modelArgs: readonly string[] = envelopeModel
+        ? ['--model', envelopeModel]
         : [];
       // Disable claude's built-in tools (Read / Glob / Bash / Edit / Write /
       // ...) when the caller has supplied its own tool definitions via the
@@ -1462,7 +1525,10 @@ export function createClaudeBackend(
       // from agent-side filesystem). `--tools ""` is the documented switch
       // for blanket-disabling built-ins; MCP-registered tools (e.g.
       // `send_file`) continue to load via `--mcp-config`.
-      const disableBuiltinToolArgs: readonly string[] = callerToolDispatchActive(openaiCompat)
+      const disableBuiltinToolArgs: readonly string[] = callerToolDispatchActive(
+        envelopeTools,
+        envelopeToolChoice,
+      )
         ? ['--tools', '']
         : [];
       // Cap claude to a single model turn when caller-tools are dispatched
@@ -1537,6 +1603,7 @@ export function createClaudeBackend(
         ...mcpConfigArgs,
         ...mcpAllowedToolsArgs,
         ...identityArgs,
+        ...modelArgs,
         ...openaiCompatArgs,
         ...disableBuiltinToolArgs,
         ...nativeTurnCapArgs,
@@ -2196,7 +2263,7 @@ export function createClaudeBackend(
       const finishReason: 'tool_calls' | 'stop' =
         capturedToolCalls.length > 0 ? 'tool_calls' : 'stop';
       const assistantContent = capturedToolCalls.length > 0 ? null : completeText;
-      const envelope = openaiCompat
+      const responseEnvelope = envelope
         ? buildClaudeChatCompletionEnvelope({
             taskId: task.taskId,
             model: finalUsage?.model,
@@ -2207,7 +2274,7 @@ export function createClaudeBackend(
           })
         : undefined;
 
-      const messageMetadata = buildOpenAICompatResponseMetadata(envelope, finalUsage);
+      const messageMetadata = buildOpenAICompatResponseMetadata(responseEnvelope, finalUsage);
       // When parts is empty but we have envelope/usage to convey, still
       // emit the message frame so the metadata reaches the gateway.
       const hasMessage = parts.length > 0 || messageMetadata !== undefined;

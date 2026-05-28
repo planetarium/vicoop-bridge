@@ -2254,15 +2254,50 @@ const SAMPLE_TOOLS = [
   },
 ];
 
+// Shape decomposed test inputs into a `chat_completions_request` envelope
+// so the same fixture style the legacy tests used (a flat `{ system, tools,
+// tool_choice, chat_history, model }` map) continues to work after the
+// envelope-direct migration (#302). The helper folds `system` into a
+// leading system message, `chat_history` into the middle, and appends a
+// trailing user message matching the A2A `parts` text so backends that
+// excise the trailing user from the history projection still receive the
+// caller's request through the regular A2A parts path.
 function assignWithOpenAICompat(
   text: string,
-  payload: Record<string, unknown>,
+  payload: {
+    system?: string;
+    tools?: unknown;
+    tool_choice?: unknown;
+    chat_history?: readonly unknown[];
+    model?: string;
+    // Escape hatch for tests that already supply a full envelope and want
+    // to override the convenience-mapping above.
+    chat_completions_request?: Record<string, unknown>;
+  },
 ): TaskAssignFrame {
+  const messages: Array<Record<string, unknown>> = [];
+  if (typeof payload.system === 'string' && payload.system.length > 0) {
+    messages.push({ role: 'system', content: payload.system });
+  }
+  if (Array.isArray(payload.chat_history)) {
+    for (const entry of payload.chat_history) {
+      messages.push(entry as Record<string, unknown>);
+    }
+  }
+  // Trailing user — split into A2A parts for non-extension-aware consumers
+  // per the spec; the backend's history projection drops this entry.
+  messages.push({ role: 'user', content: text });
+  const envelope: Record<string, unknown> = payload.chat_completions_request ?? {
+    messages,
+    ...(payload.model !== undefined ? { model: payload.model } : {}),
+    ...(payload.tools !== undefined ? { tools: payload.tools } : {}),
+    ...(payload.tool_choice !== undefined ? { tool_choice: payload.tool_choice } : {}),
+  };
   return {
     ...assign(text),
     message: {
       ...assign(text).message,
-      metadata: { [OPENAI_COMPAT_EXTENSION_URI]: payload },
+      metadata: { [OPENAI_COMPAT_EXTENSION_URI]: { chat_completions_request: envelope } },
     },
   };
 }
@@ -2448,21 +2483,122 @@ test('callerToolDispatchActive: gates on `tools` present and `tool_choice !== "n
   // The same gate `buildOpenAICompatSystemPrompt` uses for the envelope
   // contract block. Backends consult this to decide whether to suppress
   // agent-side built-in tools (#175).
-  assert.equal(callerToolDispatchActive(null), false);
-  assert.equal(callerToolDispatchActive({}), false);
-  assert.equal(callerToolDispatchActive({ system: 'hi' }), false);
-  assert.equal(callerToolDispatchActive({ tools: [] }), true);
-  assert.equal(callerToolDispatchActive({ tools: [{ type: 'function' }] }), true);
+  assert.equal(callerToolDispatchActive(undefined, undefined), false);
+  assert.equal(callerToolDispatchActive(null, undefined), false);
+  // Empty array carries no definitions — not "tools present".
+  assert.equal(callerToolDispatchActive([], undefined), false);
+  assert.equal(callerToolDispatchActive([{ type: 'function' }], undefined), true);
   // Caller catalogued tools but explicitly opted out for this turn — don't
   // handicap the agent's built-ins; the contract isn't being enforced now.
-  assert.equal(
-    callerToolDispatchActive({ tools: [{ type: 'function' }], tool_choice: 'none' }),
-    false,
+  assert.equal(callerToolDispatchActive([{ type: 'function' }], 'none'), false);
+  assert.equal(callerToolDispatchActive([{ type: 'function' }], 'auto'), true);
+});
+
+test('envelope.model is forwarded as --model on the claude spawn (#302)', async () => {
+  // Per #302, the gateway-resolved model id (planetarium/oai2a2a#80
+  // ResolvedAgent.modelOverride) reaches claude as `--model <id>` so
+  // claude dispatches to the caller's selection instead of its own
+  // default.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('hi', { model: 'claude-opus-4-7' }),
+    emit,
+    NEVER,
   );
-  assert.equal(
-    callerToolDispatchActive({ tools: [{ type: 'function' }], tool_choice: 'auto' }),
-    true,
+  const args = fake.lastChild()?.args ?? [];
+  const modelIdx = args.indexOf('--model');
+  assert.notEqual(modelIdx, -1, '--model present');
+  assert.equal(args[modelIdx + 1], 'claude-opus-4-7');
+});
+
+test('envelope without model omits --model from claude spawn (#302)', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  // No `model` in payload → no --model on argv.
+  await backend.handle(assignWithOpenAICompat('hi', {}), emit, NEVER);
+  const args = fake.lastChild()?.args ?? [];
+  assert.equal(args.indexOf('--model'), -1);
+});
+
+test('envelope.model is dropped when claude probed model differs (#302)', async () => {
+  // Regression guard for the gateway sending an unresolved routing key
+  // (e.g. `a2a/<card-url>`) as `envelope.model`. Without the gate, the
+  // bridge would pass the garbage to claude via `--model <…>` and the
+  // run would fail at the Anthropic API. With the gate, the override is
+  // dropped and claude falls back to its own default.
+  const fake = scriptedSpawn({
+    lines: [
+      // probe + handle share the same scripted stream; system/init carries
+      // the advertised model id so resolveCapabilities's probe captures it
+      // into the backend's cache for the handle that follows.
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'sid',
+        model: 'claude-opus-4-7',
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  // Daemon-mode contract: resolveCapabilities runs once at startup so the
+  // backend caches the probed model id before any task lands. Reproduce
+  // that ordering here.
+  await backend.resolveCapabilities?.();
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('hi', {
+      model: 'a2a/https://example.com/agents/x/.well-known/agent-card.json',
+    }),
+    emit,
+    NEVER,
   );
+  const args = fake.lastChild()?.args ?? [];
+  // No --model override on argv — claude uses its own default.
+  assert.equal(args.indexOf('--model'), -1);
+});
+
+test('envelope.model is forwarded when it matches claude probed model (#302)', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'sid',
+        model: 'claude-opus-4-7',
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  await backend.resolveCapabilities?.();
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('hi', { model: 'claude-opus-4-7' }),
+    emit,
+    NEVER,
+  );
+  const args = fake.lastChild()?.args ?? [];
+  const modelIdx = args.indexOf('--model');
+  assert.notEqual(modelIdx, -1, '--model present when envelope.model matches the probe');
+  assert.equal(args[modelIdx + 1], 'claude-opus-4-7');
 });
 
 test('tryParseToolCallsEnvelope: recognises a well-formed envelope and preserves unknown keys', () => {
@@ -2984,13 +3120,11 @@ test('dumpOpenAICompatTaskWire: emits header + tools + parts + chat_history sect
         chat_history: SAMPLE_HISTORY,
       },
     };
-    const parsed = parseOpenAICompatMetadata(metadata);
     dumpOpenAICompatTaskWire(
       'claude',
       'task-1',
       [{ kind: 'text', text: 'hello' }],
       metadata,
-      parsed,
     );
   } finally {
     console.error = origErr;
@@ -3027,7 +3161,6 @@ test('dumpOpenAICompatTaskWire: parts file entry shows shape without bytes', () 
       't',
       [{ kind: 'file', file: { name: 'i.png', mimeType: 'image/png', bytes: 'AAAA' } }],
       undefined,
-      null,
     );
   } finally {
     console.error = origErr;
@@ -3047,7 +3180,7 @@ test('dumpOpenAICompatTaskWire: minimal case (no tools, no history, just parts h
     captured.push(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
   };
   try {
-    dumpOpenAICompatTaskWire('codex', 't', [{ kind: 'text', text: 'hi' }], undefined, null);
+    dumpOpenAICompatTaskWire('codex', 't', [{ kind: 'text', text: 'hi' }], undefined);
   } finally {
     console.error = origErr;
   }
@@ -3394,11 +3527,11 @@ test('openaiToolsToCallerToolDefs maps OpenAI tools and drops malformed entries 
 // enforces single-turn semantics mechanically, so prompting the model to
 // "stop" duplicates work and pollutes its context.
 test('buildOpenAICompatNativeSystemPrompt: slim shape (#213)', () => {
-  const out = buildOpenAICompatNativeSystemPrompt({
-    system: 'be terse',
-    tools: [{ type: 'function', function: { name: 'fetch' } }],
-    tool_choice: 'auto',
-  });
+  const out = buildOpenAICompatNativeSystemPrompt(
+    'be terse',
+    [{ type: 'function', function: { name: 'fetch' } }],
+    'auto',
+  );
   // The user's system text leads.
   assert.ok(out.startsWith('be terse'));
   // The envelope contract — the very thing this path replaces — must be
@@ -3421,23 +3554,25 @@ test('buildOpenAICompatNativeSystemPrompt: slim shape (#213)', () => {
 
   // tool_choice="required" gets a steering line (same descriptor the
   // envelope path uses; `describeToolChoice` is shared).
-  const required = buildOpenAICompatNativeSystemPrompt({
-    tools: [],
-    tool_choice: 'required',
-  });
+  const required = buildOpenAICompatNativeSystemPrompt(
+    undefined,
+    [{ type: 'function', function: { name: 'x' } }],
+    'required',
+  );
   assert.ok(required.includes('tool_choice="required"'));
 
   // tool_choice="none" → no envelope, just a "don't invoke caller tools"
   // directive.
-  const none = buildOpenAICompatNativeSystemPrompt({
-    tools: [],
-    tool_choice: 'none',
-  });
+  const none = buildOpenAICompatNativeSystemPrompt(
+    undefined,
+    [{ type: 'function', function: { name: 'x' } }],
+    'none',
+  );
   assert.ok(none.includes('tool_choice="none"'));
 
   // Bare `system` with no tools — emits just the system text.
   assert.equal(
-    buildOpenAICompatNativeSystemPrompt({ system: 'just be terse' }),
+    buildOpenAICompatNativeSystemPrompt('just be terse', undefined, undefined),
     'just be terse',
   );
 });
@@ -3533,29 +3668,19 @@ test('argv: openai-compat caller tools wire caller-tools MCP + native prompt + -
 
   const { emit } = collect();
   await backend2.handle(
-    {
-      ...assign('do a fetch'),
-      message: {
-        role: 'user',
-        messageId: 'm',
-        parts: [{ kind: 'text', text: 'do a fetch' }],
-        metadata: {
-          [OPENAI_COMPAT_EXTENSION_URI]: {
-            system: 'be terse',
-            tools: [
-              {
-                type: 'function',
-                function: {
-                  name: 'fetch',
-                  description: 'Fetch a URL',
-                  parameters: { type: 'object', properties: {} },
-                },
-              },
-            ],
+    assignWithOpenAICompat('do a fetch', {
+      system: 'be terse',
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'fetch',
+            description: 'Fetch a URL',
+            parameters: { type: 'object', properties: {} },
           },
         },
-      },
-    },
+      ],
+    }),
     emit,
     NEVER,
   );
@@ -3623,29 +3748,19 @@ test('argv: --allowedTools covers all registered MCP servers (#235)', async () =
       sendFileMcp: { allowedRoots: [realRoot], skipHttp: true },
     });
     await backend.handle(
-      {
-        ...assign('do a fetch'),
-        message: {
-          role: 'user',
-          messageId: 'm',
-          parts: [{ kind: 'text', text: 'do a fetch' }],
-          metadata: {
-            [OPENAI_COMPAT_EXTENSION_URI]: {
-              system: 'be terse',
-              tools: [
-                {
-                  type: 'function',
-                  function: {
-                    name: 'fetch',
-                    description: 'Fetch a URL',
-                    parameters: { type: 'object', properties: {} },
-                  },
-                },
-              ],
+      assignWithOpenAICompat('do a fetch', {
+        system: 'be terse',
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'fetch',
+              description: 'Fetch a URL',
+              parameters: { type: 'object', properties: {} },
             },
           },
-        },
-      },
+        ],
+      }),
       collect().emit,
       NEVER,
     );
@@ -3728,33 +3843,23 @@ test('native dispatch: tool invocation → chat_completion envelope on terminal 
   });
 
   await backend.handle(
-    {
-      ...assign('fetch example.com'),
-      message: {
-        role: 'user',
-        messageId: 'm',
-        parts: [{ kind: 'text', text: 'fetch example.com' }],
-        metadata: {
-          [OPENAI_COMPAT_EXTENSION_URI]: {
-            system: 'be terse',
-            tools: [
-              {
-                type: 'function',
-                function: {
-                  name: 'fetch',
-                  description: 'Fetch a URL',
-                  parameters: {
-                    type: 'object',
-                    properties: { url: { type: 'string' } },
-                    required: ['url'],
-                  },
-                },
-              },
-            ],
+    assignWithOpenAICompat('fetch example.com', {
+      system: 'be terse',
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'fetch',
+            description: 'Fetch a URL',
+            parameters: {
+              type: 'object',
+              properties: { url: { type: 'string' } },
+              required: ['url'],
+            },
           },
         },
-      },
-    },
+      ],
+    }),
     emit,
     NEVER,
   );
@@ -3869,24 +3974,14 @@ test('native dispatch: --max-turns 1 exits with code 1; bridge maps to completed
   });
 
   await backend.handle(
-    {
-      ...assign('fetch example.com'),
-      message: {
-        role: 'user',
-        messageId: 'm',
-        parts: [{ kind: 'text', text: 'fetch example.com' }],
-        metadata: {
-          [OPENAI_COMPAT_EXTENSION_URI]: {
-            tools: [
-              {
-                type: 'function',
-                function: { name: 'fetch', parameters: { type: 'object' } },
-              },
-            ],
-          },
+    assignWithOpenAICompat('fetch example.com', {
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'fetch', parameters: { type: 'object' } },
         },
-      },
-    },
+      ],
+    }),
     emit,
     NEVER,
   );
@@ -3955,24 +4050,14 @@ test('native dispatch: exit-code-1 with NO tool capture still fails (#213)', asy
   });
 
   await backend.handle(
-    {
-      ...assign('do a fetch'),
-      message: {
-        role: 'user',
-        messageId: 'm',
-        parts: [{ kind: 'text', text: 'do a fetch' }],
-        metadata: {
-          [OPENAI_COMPAT_EXTENSION_URI]: {
-            tools: [
-              {
-                type: 'function',
-                function: { name: 'fetch', parameters: { type: 'object' } },
-              },
-            ],
-          },
+    assignWithOpenAICompat('do a fetch', {
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'fetch', parameters: { type: 'object' } },
         },
-      },
-    },
+      ],
+    }),
     emit,
     NEVER,
   );
@@ -4044,13 +4129,16 @@ test('openai-compat: same contextId still spawns a fresh --session-id (no --resu
     onCallerToolsMcpReady: () => {},
   });
   const { emit } = collect();
-  const meta = {
+  const metaFor = (text: string): Record<string, unknown> => ({
     [OPENAI_COMPAT_EXTENSION_URI]: {
-      tools: [
-        { type: 'function', function: { name: 'fetch', parameters: { type: 'object' } } },
-      ],
+      chat_completions_request: {
+        messages: [{ role: 'user', content: text }],
+        tools: [
+          { type: 'function', function: { name: 'fetch', parameters: { type: 'object' } } },
+        ],
+      },
     },
-  };
+  });
 
   // Two turns sharing the same contextId — without the openai-compat gate
   // the second one would carry `--resume <sessionId-from-turn-1>`.
@@ -4059,7 +4147,7 @@ test('openai-compat: same contextId still spawns a fresh --session-id (no --resu
       type: 'task.assign',
       taskId: 'oai-t1',
       contextId: 'ctx-shared',
-      message: { role: 'user', messageId: 'm1', parts: [{ kind: 'text', text: 'a' }], metadata: meta },
+      message: { role: 'user', messageId: 'm1', parts: [{ kind: 'text', text: 'a' }], metadata: metaFor('a') },
     },
     emit,
     NEVER,
@@ -4069,7 +4157,7 @@ test('openai-compat: same contextId still spawns a fresh --session-id (no --resu
       type: 'task.assign',
       taskId: 'oai-t2',
       contextId: 'ctx-shared',
-      message: { role: 'user', messageId: 'm2', parts: [{ kind: 'text', text: 'b' }], metadata: meta },
+      message: { role: 'user', messageId: 'm2', parts: [{ kind: 'text', text: 'b' }], metadata: metaFor('b') },
     },
     emit,
     NEVER,

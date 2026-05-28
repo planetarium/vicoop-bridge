@@ -228,6 +228,16 @@ interface HappyPathOptions {
   emitCommandExecutionTurns?: number[];
   /** Optional override of the initialize result payload. */
   initializeResult?: Record<string, unknown>;
+  /**
+   * `model/list` response shape returned to the backend's envelope.model
+   * validation (#302). Default `null` returns `{ data: [] }` — the empty
+   * list is treated by the backend as "unavailable" and the validation
+   * silently falls through, so existing tests that set `envelope.model`
+   * see no behaviour change. Explicit arrays drive the validation path:
+   * an entry the backend doesn't know about is dropped before reaching
+   * `thread/start.config.model`.
+   */
+  modelList?: ModelListEntry[];
 }
 
 function happyPath(opts: HappyPathOptions = {}): ChildScenario {
@@ -269,6 +279,15 @@ function happyPath(opts: HappyPathOptions = {}): ChildScenario {
         // Empty-object result mirrors the real server's response shape;
         // the backend treats it as fire-and-confirm.
         child.emitStdout({ id, result: {} });
+        return;
+      }
+      if (method === 'model/list' && id !== undefined) {
+        // #302: `resolveCapabilities` issues `model/list` once to populate
+        // both the agent card advertise and the envelope.model gate cache.
+        // Tests that don't call `resolveCapabilities` never hit this; tests
+        // that do drive the validation path supply `opts.modelList` with
+        // the ids that should pass the gate.
+        child.emitStdout({ id, result: { data: opts.modelList ?? [] } });
         return;
       }
       if (method === 'turn/start' && id !== undefined) {
@@ -854,17 +873,22 @@ test('openai-compat chat_history injects prior turns as Responses API items; tra
         parts: [{ kind: 'text', text: 'follow up' }],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
-            chat_history: [
-              { role: 'user', content: 'kick off' },
-              {
-                role: 'assistant',
-                content: null,
-                tool_calls: [
-                  { id: 'tc1', function: { name: 'lookup', arguments: '{}' } },
-                ],
-              },
-              { role: 'tool', tool_call_id: 'tc1', content: 'OK' },
-            ],
+            chat_completions_request: {
+              messages: [
+                { role: 'user', content: 'kick off' },
+                {
+                  role: 'assistant',
+                  content: null,
+                  tool_calls: [
+                    { id: 'tc1', function: { name: 'lookup', arguments: '{}' } },
+                  ],
+                },
+                { role: 'tool', tool_call_id: 'tc1', content: 'OK' },
+                // Trailing user — split off into A2A parts; the decomposition
+                // drops this index from chat_history.
+                { role: 'user', content: 'follow up' },
+              ],
+            },
           },
         },
       },
@@ -920,17 +944,22 @@ test('openai-compat chat_history with empty parts (tool-continuation) sends empt
         parts: [{ kind: 'text', text: '' }],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
-            chat_history: [
-              { role: 'user', content: 'kick off' },
-              {
-                role: 'assistant',
-                content: null,
-                tool_calls: [
-                  { id: 'tc1', function: { name: 'lookup', arguments: '{}' } },
-                ],
-              },
-              { role: 'tool', tool_call_id: 'tc1', content: 'OK' },
-            ],
+            chat_completions_request: {
+              messages: [
+                { role: 'user', content: 'kick off' },
+                {
+                  role: 'assistant',
+                  content: null,
+                  tool_calls: [
+                    { id: 'tc1', function: { name: 'lookup', arguments: '{}' } },
+                  ],
+                },
+                { role: 'tool', tool_call_id: 'tc1', content: 'OK' },
+                // Trailing entry is a `tool` — chatHistoryFromMessages
+                // recognises this as a tool-continuation envelope and keeps
+                // the full sequence in chat_history.
+              ],
+            },
           },
         },
       },
@@ -965,7 +994,10 @@ test('openai-compat thread/start sets include_environment_context: false to supp
         parts: [{ kind: 'text', text: 'ask' }],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
-            tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+            chat_completions_request: {
+              messages: [{ role: 'user', content: 'ask' }],
+              tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+            },
           },
         },
       },
@@ -1075,14 +1107,17 @@ test('chat_history + image FilePart: trailing user (text+image) rides turn/start
         ],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
-            chat_history: [
-              {
-                role: 'assistant',
-                content: null,
-                tool_calls: [{ id: 'tc1', function: { name: 'f', arguments: '{}' } }],
-              },
-              { role: 'tool', tool_call_id: 'tc1', content: 'r' },
-            ],
+            chat_completions_request: {
+              messages: [
+                {
+                  role: 'assistant',
+                  content: null,
+                  tool_calls: [{ id: 'tc1', function: { name: 'f', arguments: '{}' } }],
+                },
+                { role: 'tool', tool_call_id: 'tc1', content: 'r' },
+                { role: 'user', content: 'caption please' },
+              ],
+            },
           },
         },
       },
@@ -1126,18 +1161,21 @@ test('parallel tool_calls in one assistant entry fan out into one function_call 
         parts: [{ kind: 'text', text: 'next' }],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
-            chat_history: [
-              {
-                role: 'assistant',
-                content: null,
-                tool_calls: [
-                  { id: 'tc1', function: { name: 'a', arguments: '{"x":1}' } },
-                  { id: 'tc2', function: { name: 'b', arguments: '{"y":2}' } },
-                ],
-              },
-              { role: 'tool', tool_call_id: 'tc1', content: 'A' },
-              { role: 'tool', tool_call_id: 'tc2', content: 'B' },
-            ],
+            chat_completions_request: {
+              messages: [
+                {
+                  role: 'assistant',
+                  content: null,
+                  tool_calls: [
+                    { id: 'tc1', function: { name: 'a', arguments: '{"x":1}' } },
+                    { id: 'tc2', function: { name: 'b', arguments: '{"y":2}' } },
+                  ],
+                },
+                { role: 'tool', tool_call_id: 'tc1', content: 'A' },
+                { role: 'tool', tool_call_id: 'tc2', content: 'B' },
+                { role: 'user', content: 'next' },
+              ],
+            },
           },
         },
       },
@@ -1388,21 +1426,26 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion envelope on
         parts: [{ kind: 'text', text: 'fetch example.com' }],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
-            system: 'be terse',
-            tools: [
-              {
-                type: 'function',
-                function: {
-                  name: 'fetch',
-                  description: 'Fetch a URL',
-                  parameters: {
-                    type: 'object',
-                    properties: { url: { type: 'string' } },
-                    required: ['url'],
+            chat_completions_request: {
+              messages: [
+                { role: 'system', content: 'be terse' },
+                { role: 'user', content: 'fetch example.com' },
+              ],
+              tools: [
+                {
+                  type: 'function',
+                  function: {
+                    name: 'fetch',
+                    description: 'Fetch a URL',
+                    parameters: {
+                      type: 'object',
+                      properties: { url: { type: 'string' } },
+                      required: ['url'],
+                    },
                   },
                 },
-              },
-            ],
+              ],
+            },
           },
         },
       },
@@ -1577,32 +1620,20 @@ test('openaiToolsToDynamicToolSpecs maps OpenAI tools and drops malformed entrie
 // re-introducing it would put the model back into the parse-from-text
 // failure modes #208 catalogued.
 test('composeNativeDevInstructions includes system text, omits JSON envelope contract (#209)', () => {
-  assert.equal(
-    composeNativeDevInstructions({ system: 'be terse' }),
-    'be terse',
-  );
+  assert.equal(composeNativeDevInstructions('be terse', undefined), 'be terse');
   // tool_choice="required" gets a steering line.
-  const requiredOut = composeNativeDevInstructions({
-    system: 'sys',
-    tools: [],
-    tool_choice: 'required',
-  });
+  const requiredOut = composeNativeDevInstructions('sys', 'required');
   assert.ok(requiredOut.startsWith('sys'));
   assert.ok(requiredOut.includes('tool_choice="required"'));
   // Named function tool_choice gets a steering line naming the function.
-  const namedOut = composeNativeDevInstructions({
-    system: '',
-    tools: [],
-    tool_choice: { type: 'function', function: { name: 'fetch' } },
+  const namedOut = composeNativeDevInstructions(undefined, {
+    type: 'function',
+    function: { name: 'fetch' },
   });
   assert.ok(namedOut.includes('"fetch"'));
-  // Crucially: no envelope contract anywhere in the output, even when
-  // `tools` is present in the metadata.
-  const withTools = composeNativeDevInstructions({
-    system: 'sys',
-    tools: [{ type: 'function', function: { name: 'fetch' } }],
-    tool_choice: 'auto',
-  });
+  // Crucially: no envelope contract anywhere in the output, even when the
+  // caller supplied tools (tool_choice="auto").
+  const withTools = composeNativeDevInstructions('sys', 'auto');
   assert.equal(withTools.includes('tool_calls'), false);
   assert.equal(withTools.includes('{"tool_calls"'), false);
 });
@@ -1668,7 +1699,14 @@ test('developerInstructions omits self-identity directive on openai-compat tasks
         messageId: 'm1',
         parts: [{ kind: 'text', text: 'hi' }],
         metadata: {
-          [OPENAI_COMPAT_EXTENSION_URI]: { system: 'be terse' },
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            chat_completions_request: {
+              messages: [
+                { role: 'system', content: 'be terse' },
+                { role: 'user', content: 'hi' },
+              ],
+            },
+          },
         },
       },
     },
@@ -1790,17 +1828,22 @@ test('dynamicTools handler is registered on every openai-compat turn (#209, #233
   }));
   const backend = createCodexBackend({ spawn: fake.spawn });
 
-  const oaiMeta = {
+  const oaiMetaFor = (text: string): Record<string, unknown> => ({
     [OPENAI_COMPAT_EXTENSION_URI]: {
-      system: 'sys',
-      tools: [
-        {
-          type: 'function',
-          function: { name: 'fetch', parameters: {} },
-        },
-      ],
+      chat_completions_request: {
+        messages: [
+          { role: 'system', content: 'sys' },
+          { role: 'user', content: text },
+        ],
+        tools: [
+          {
+            type: 'function',
+            function: { name: 'fetch', parameters: {} },
+          },
+        ],
+      },
     },
-  };
+  });
 
   // Turn 1.
   await backend.handle(
@@ -1809,7 +1852,7 @@ test('dynamicTools handler is registered on every openai-compat turn (#209, #233
         role: 'user',
         messageId: 'm1',
         parts: [{ kind: 'text', text: 'first' }],
-        metadata: oaiMeta,
+        metadata: oaiMetaFor('first'),
       },
     }),
     () => {},
@@ -1827,7 +1870,7 @@ test('dynamicTools handler is registered on every openai-compat turn (#209, #233
         role: 'user',
         messageId: 'm2',
         parts: [{ kind: 'text', text: 'second' }],
-        metadata: oaiMeta,
+        metadata: oaiMetaFor('second'),
       },
     }),
     emit,
@@ -1929,7 +1972,10 @@ test('thread/start disables every codex direct-execution feature when caller too
         parts: [{ kind: 'text', text: 'list files' }],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
-            tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+            chat_completions_request: {
+              messages: [{ role: 'user', content: 'list files' }],
+              tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+            },
           },
         },
       },
@@ -1964,7 +2010,10 @@ test('thread/start sends `environments: []` when caller tools are active (#183)'
         parts: [{ kind: 'text', text: 'list files' }],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
-            tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+            chat_completions_request: {
+              messages: [{ role: 'user', content: 'list files' }],
+              tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+            },
           },
         },
       },
@@ -2021,6 +2070,119 @@ test('thread/start omits `config` when no caller tools are supplied', async () =
   assert.equal(params?.config, undefined);
 });
 
+test('envelope.model is forwarded as thread/start config.model (#302)', async () => {
+  // Per #302, the gateway-resolved model id (planetarium/oai2a2a#80
+  // ResolvedAgent.modelOverride) flows end-to-end so codex dispatches to
+  // the caller's selection rather than the operator's config.toml default.
+  // We carry it via `config.model` on thread/start.
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('hello', 'ctx-model-fwd', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'hello' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            chat_completions_request: {
+              model: 'gpt-5.5-mini',
+              messages: [{ role: 'user', content: 'hello' }],
+            },
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as {
+    params?: { config?: { model?: string } };
+  }).params;
+  assert.equal(params?.config?.model, 'gpt-5.5-mini');
+});
+
+test('envelope.model is forwarded when codex advertises it in model/list (#302)', async () => {
+  const fake = makeFakeSpawn(() =>
+    happyPath({
+      modelList: [
+        { id: 'gpt-5.5-mini' },
+        { id: 'gpt-5.5', isDefault: true },
+      ],
+    }),
+  );
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  // Daemon-mode contract: `resolveCapabilities` runs once at startup so
+  // the backend caches the model/list ids before any task lands.
+  await backend.resolveCapabilities?.();
+  await backend.handle(
+    assign('hello', 'ctx-model-known', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'hello' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            chat_completions_request: {
+              model: 'gpt-5.5-mini',
+              messages: [{ role: 'user', content: 'hello' }],
+            },
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as {
+    params?: { config?: { model?: string } };
+  }).params;
+  assert.equal(params?.config?.model, 'gpt-5.5-mini');
+});
+
+test('envelope.model is dropped when codex does NOT advertise it in model/list (#302)', async () => {
+  // Regression guard for the gateway sending an unresolved routing key
+  // (e.g. `a2a/<card-url>`) as `envelope.model`. Without the model/list
+  // gate, the bridge would forward the garbage to codex which rejects it
+  // with `invalid_request_error` — see the screenshot in the PR's review
+  // thread. With the gate, the override is dropped and codex falls back
+  // to its config.toml default.
+  const fake = makeFakeSpawn(() =>
+    happyPath({
+      modelList: [{ id: 'gpt-5.5-mini' }, { id: 'gpt-5.5', isDefault: true }],
+    }),
+  );
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.resolveCapabilities?.();
+  await backend.handle(
+    assign('hello', 'ctx-model-unknown', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'hello' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            chat_completions_request: {
+              model: 'a2a/https://example.com/agents/x/.well-known/agent-card.json',
+              messages: [{ role: 'user', content: 'hello' }],
+            },
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as {
+    params?: { config?: { model?: string } };
+  }).params;
+  // No model override on threadConfig — codex uses its own default.
+  assert.equal(params?.config?.model, undefined);
+});
+
 test('history-only openai-compat payload (no `tools`) does not disable codex built-ins via features (but still suppresses env_context)', async () => {
   // Mirror of the codex (exec) backend test. With tools absent there is no
   // caller-side dispatch contract to protect; do not handicap codex's
@@ -2037,14 +2199,17 @@ test('history-only openai-compat payload (no `tools`) does not disable codex bui
         parts: [{ kind: 'text', text: 'continue' }],
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
-            chat_history: [
-              {
-                role: 'assistant',
-                content: null,
-                tool_calls: [{ id: 'tc1', function: { name: 'x', arguments: '{}' } }],
-              },
-              { role: 'tool', tool_call_id: 'tc1', content: 'OK' },
-            ],
+            chat_completions_request: {
+              messages: [
+                {
+                  role: 'assistant',
+                  content: null,
+                  tool_calls: [{ id: 'tc1', function: { name: 'x', arguments: '{}' } }],
+                },
+                { role: 'tool', tool_call_id: 'tc1', content: 'OK' },
+                { role: 'user', content: 'continue' },
+              ],
+            },
           },
         },
       },
@@ -2071,18 +2236,21 @@ test('openai-compat tasks always thread/start, never thread/resume — every tur
   // (no `thread/resume` to forget them on).
   const fake = makeFakeSpawn(() => happyPath());
   const backend = createCodexBackend({ spawn: fake.spawn });
-  const meta = {
+  const metaFor = (text: string): Record<string, unknown> => ({
     [OPENAI_COMPAT_EXTENSION_URI]: {
-      tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+      chat_completions_request: {
+        messages: [{ role: 'user', content: text }],
+        tools: [{ type: 'function', function: { name: 'bash', parameters: {} } }],
+      },
     },
-  };
+  });
   await backend.handle(
     assign('one', 'ctx-feat-no-resume', {
       message: {
         role: 'user',
         messageId: 'm1',
         parts: [{ kind: 'text', text: 'one' }],
-        metadata: meta,
+        metadata: metaFor('one'),
       },
     }),
     collect().emit,
@@ -2094,7 +2262,7 @@ test('openai-compat tasks always thread/start, never thread/resume — every tur
         role: 'user',
         messageId: 'm2',
         parts: [{ kind: 'text', text: 'two' }],
-        metadata: meta,
+        metadata: metaFor('two'),
       },
     }),
     collect().emit,

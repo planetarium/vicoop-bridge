@@ -7,11 +7,13 @@ import {
 import type { Backend } from '../backend.js';
 import { createLogger, type Logger } from '../logger.js';
 import {
+  chatHistoryFromMessages,
+  collectSystemFromMessages,
   dumpOpenAICompatTaskWire,
-  parseOpenAICompatMetadata,
+  parseOpenAICompatEnvelope,
   type OpenAICompatHistoryEntry,
   type OpenAICompatMessageContent,
-  type OpenAICompatMetadata,
+  type OpenAICompatRequestEnvelope,
 } from './openai-compat.js';
 import {
   buildOpenAICompatResponseMetadata,
@@ -53,6 +55,12 @@ export interface VicoopCodexBackendOptions {
   spawn?: VicoopCodexSpawnFn;
   stderrCaptureBytes?: number;
   callTimeoutMs?: number;
+  // Max time the startup probe (`vicoop-codex models --json` via
+  // `resolveCapabilities`) waits for the model list before giving up.
+  // Setting to 0 disables the probe entirely — the agent card carries no
+  // declared models and `envelope.model` validation is skipped. Default
+  // 10s mirrors claude's probeTimeoutMs.
+  probeTimeoutMs?: number;
   logger?: Logger;
   // When true, dump A2A `parts` shape + metadata keys + raw
   // `chat_history` to stderr on every task. Operator diagnostic exposed
@@ -61,14 +69,18 @@ export interface VicoopCodexBackendOptions {
 }
 
 // `vicoop-codex call` body shape — only the fields this backend actually
-// emits. The openai-compat A2A extension defines `system` / `tools` /
-// `tool_choice` / `chat_history`, of which `system` and
-// `chat_history` fold into `messages`; the remaining two ride out
-// verbatim. Everything else (model, reasoning_effort, parallel_tool_calls,
-// the Group B / Group C parameters from the call command's input doc) is
-// intentionally not on this shape because no input surface we currently
-// read carries them. The binary applies its own defaults.
+// emits. The openai-compat A2A extension envelope (oai2a2a#80) carries a
+// full OpenAI Chat Completions request body; the bridge forwards `model`
+// (so the gateway-resolved model id reaches the CLI rather than the CLI's
+// own DEFAULT_MODEL), the assembled `messages[]` (envelope's system +
+// prior turns + the trailing user content flattened from A2A parts),
+// `tools`, and `tool_choice`. Everything else (reasoning_effort,
+// parallel_tool_calls, the Group B / Group C parameters from the call
+// command's input doc) is intentionally not on this shape because no
+// input surface we currently read carries them. The binary applies its
+// own defaults.
 export interface VicoopCodexCallBody {
+  model?: string;
   messages: ChatCompletionMessage[];
   tools?: unknown[];
   tool_choice?: unknown;
@@ -253,9 +265,11 @@ function openAIMessageContentToString(
 
 // Assemble the full `messages` array for the call body. Order, per the
 // doc's "Per-role message JSON examples" section:
-//   1. system (from openai-compat.system; one entry)
+//   1. system (concatenated from envelope's `messages[]` system/developer
+//      entries; one entry)
 //   2. chat_history entries (prior user / assistant text turns + tool
-//      round-trips) mapped 1:1 to OpenAI Chat Completions messages
+//      round-trips, derived from envelope's `messages[]` minus the
+//      trailing user) mapped 1:1 to OpenAI Chat Completions messages
 //   3. current user turn (flattened from A2A parts)
 //
 // The user turn comes last so the model sees prior context before the
@@ -264,15 +278,16 @@ function openAIMessageContentToString(
 // is omitted — the chat_history's last entry is the tool result the
 // model should respond to.
 export function buildMessages(
-  meta: OpenAICompatMetadata | null,
+  system: string | undefined,
+  chatHistory: OpenAICompatHistoryEntry[] | null,
   userContent: string | null,
 ): ChatCompletionMessage[] {
   const messages: ChatCompletionMessage[] = [];
-  if (meta?.system) {
-    messages.push({ role: 'system', content: meta.system });
+  if (system) {
+    messages.push({ role: 'system', content: system });
   }
-  if (meta?.chat_history) {
-    for (const m of historyToChatCompletionMessages(meta.chat_history)) {
+  if (chatHistory) {
+    for (const m of historyToChatCompletionMessages(chatHistory)) {
       messages.push(m);
     }
   }
@@ -282,23 +297,32 @@ export function buildMessages(
   return messages;
 }
 
-// Assemble the call body from the existing openai-compat A2A extension:
-//   - `tools` / `tool_choice` (read by the existing `parseOpenAICompatMetadata`)
-//   - the assembled `messages` array (from `system` + `chat_history`
-//     + current user turn — the other two fields of the extension)
+// Assemble the call body from the openai-compat envelope. Forwards:
+//   - `model`: the gateway-resolved model id so the CLI dispatches to the
+//     caller's selection rather than the binary's DEFAULT_MODEL (#302).
+//   - `tools` / `tool_choice`: verbatim off the envelope.
+//   - `messages`: the pre-assembled array (system + chat_history + current
+//     user turn).
 //
-// Nothing else is forwarded. The openai-compat A2A extension only defines
-// those four fields, and we read no other A2A or operator-side input on
-// behalf of this backend. `model`, `reasoning_effort`, `parallel_tool_calls`,
+// Nothing else is forwarded. `reasoning_effort`, `parallel_tool_calls`,
 // and every Group B / Group C parameter from the call command's input doc
 // are left unset — the vicoop-codex binary applies its own defaults.
 export function buildCallBody(
-  meta: OpenAICompatMetadata | null,
+  envelope: OpenAICompatRequestEnvelope | null,
   messages: ChatCompletionMessage[],
 ): VicoopCodexCallBody {
   const body: VicoopCodexCallBody = { messages };
-  if (meta?.tools) body.tools = meta.tools;
-  if (meta?.tool_choice !== undefined) body.tool_choice = meta.tool_choice;
+  if (envelope) {
+    if (typeof envelope.model === 'string' && envelope.model.length > 0) {
+      body.model = envelope.model;
+    }
+    if (Array.isArray(envelope.tools) && envelope.tools.length > 0) {
+      body.tools = envelope.tools;
+    }
+    if (envelope.tool_choice !== undefined && envelope.tool_choice !== null) {
+      body.tool_choice = envelope.tool_choice;
+    }
+  }
   return body;
 }
 
@@ -587,6 +611,71 @@ async function runVicoopCodexCall(
 // non-streaming `vicoop-codex call` invocation: read the existing
 // openai-compat extension metadata → assemble messages → invoke →
 // translate response to A2A artifacts + final message metadata.
+// Probe the vicoop-codex CLI's `models --json` subcommand to discover the
+// model ids this account / install advertises. Returns null on any failure
+// (binary missing, timeout, non-JSON stdout, unexpected shape) so the
+// caller can skip the advertise / `envelope.model` gate silently. Mirrors
+// `probeClaudeModel`'s "best-effort, fail-open" contract.
+export async function probeVicoopCodexModels(args: {
+  command: string;
+  spawn: VicoopCodexSpawnFn;
+  cwd?: string;
+  timeoutMs: number;
+}): Promise<string[] | null> {
+  if (args.timeoutMs <= 0) return null;
+  let child: VicoopCodexChildHandle;
+  try {
+    child = args.spawn(args.command, ['models', '--json'], { cwd: args.cwd });
+  } catch {
+    return null;
+  }
+  return await new Promise<string[] | null>((resolve) => {
+    let stdout = '';
+    let settled = false;
+    const finish = (value: string[] | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // best-effort
+      }
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), args.timeoutMs);
+    if (child.stdout) {
+      child.stdout.on('data', (chunk: Buffer | string) => {
+        stdout += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      });
+    }
+    child.on('error', () => finish(null));
+    child.on('close', (code) => {
+      if (code !== 0) {
+        finish(null);
+        return;
+      }
+      try {
+        const parsed = JSON.parse(stdout) as { models?: unknown };
+        if (!Array.isArray(parsed.models)) {
+          finish(null);
+          return;
+        }
+        const ids: string[] = [];
+        for (const m of parsed.models) {
+          if (m && typeof m === 'object' && typeof (m as { id?: unknown }).id === 'string') {
+            const id = (m as { id: string }).id;
+            if (id.length > 0) ids.push(id);
+          }
+        }
+        finish(ids.length > 0 ? ids : null);
+      } catch {
+        finish(null);
+      }
+    });
+  });
+}
+
 export function createVicoopCodexBackend(
   opts: VicoopCodexBackendOptions = {},
 ): Backend {
@@ -596,11 +685,42 @@ export function createVicoopCodexBackend(
   const spawnFn = opts.spawn ?? defaultSpawn;
   const stderrCap = opts.stderrCaptureBytes ?? 16 * 1024;
   const callTimeoutMs = opts.callTimeoutMs ?? 0;
+  const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
   const logger = opts.logger ?? createLogger();
   const openaiCompatTrace = opts.openaiCompatTrace === true;
 
+  // Supported-models cache, populated by `resolveCapabilities` at daemon
+  // startup and read sync from `handle()` to gate `envelope.model`
+  // forwarding (#302). Mirrors claude's pattern — `undefined` = "never
+  // probed", `null` = "probed but unavailable", non-empty `Set` = the
+  // model ids the CLI's `models --json` advertised.
+  let cachedSupportedModels: Set<string> | null | undefined = undefined;
+
   return {
     name: 'vicoop-codex',
+
+    async resolveCapabilities() {
+      const ids = await probeVicoopCodexModels({
+        command,
+        spawn: spawnFn,
+        cwd,
+        timeoutMs: probeTimeoutMs,
+      });
+      if (!ids || ids.length === 0) {
+        cachedSupportedModels = null;
+        return {};
+      }
+      cachedSupportedModels = new Set(ids);
+      // Advertise on the openai-compat/v1 `params.models[]` slot so
+      // upstream A2A callers (and the gateway's model resolver) can see
+      // the list without round-tripping through `vicoop-codex models`.
+      // The first id is tagged as default — vicoop-codex's `models`
+      // output is already ordered with the recommended model first.
+      const openaiCompatModels = ids.map((id, i) =>
+        i === 0 ? { id, default: true as const } : { id },
+      );
+      return { openaiCompatModels };
+    },
 
     async handle(task, emit, signal) {
       if (signal.aborted) {
@@ -612,29 +732,32 @@ export function createVicoopCodexBackend(
         return;
       }
 
-      // Use the existing openai-compat A2A extension reader (claude.ts).
-      // It returns the 4-field schema { system, tools, tool_choice,
-      // chat_history } — the canonical surface every backend in this
-      // package already speaks. We do NOT define additional reader fields
-      // here: extending the extension schema unilaterally would risk
-      // breaking the contract other backends rely on.
-      const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+      // Envelope-direct (#302): read the full inbound OpenAI Chat Completions
+      // request body off `metadata[URI].chat_completions_request` and drive
+      // the call body from the envelope's fields (`model`, `messages[]`,
+      // `tools`, `tool_choice`) instead of the legacy decomposed view.
+      const envelope = parseOpenAICompatEnvelope(task.message.metadata);
       if (openaiCompatTrace) {
         dumpOpenAICompatTaskWire(
           'vicoop-codex',
           task.taskId,
           task.message.parts,
           task.message.metadata,
-          openaiCompat,
         );
       }
+
+      const system = envelope ? collectSystemFromMessages(envelope.messages) : undefined;
+      const chatHistory =
+        envelope && Array.isArray(envelope.messages)
+          ? chatHistoryFromMessages(envelope.messages)
+          : null;
 
       const userContent = flattenA2AUserContent(task.message.parts);
       // Tool-continuation edge case (openai-compat spec): A2A parts is the
       // placeholder `[{text:""}]` and the conversation lives in
       // chat_history. Skip the empty_prompt check when chat_history will
       // supply the user-side content via the prior-turns sequence.
-      const hasHistory = (openaiCompat?.chat_history?.length ?? 0) > 0;
+      const hasHistory = (chatHistory?.length ?? 0) > 0;
       if (userContent === null && !hasHistory) {
         emit({
           type: 'task.fail',
@@ -647,8 +770,32 @@ export function createVicoopCodexBackend(
         return;
       }
 
-      const messages = buildMessages(openaiCompat, userContent);
-      const body = buildCallBody(openaiCompat, messages);
+      // Validate envelope.model against the cache populated by
+      // `resolveCapabilities`. When the gateway sends a value this
+      // vicoop-codex install does not advertise (e.g. an unresolved routing
+      // key like `a2a/<card-url>`), drop the override so the CLI falls
+      // back to its DEFAULT_MODEL rather than failing the call with an
+      // upstream "model not found" error (#302). When the cache is
+      // unpopulated (probeTimeoutMs ≤ 0, probe failed, or
+      // `resolveCapabilities` hasn't been called yet) the validation is
+      // skipped and `envelope.model` rides through unchanged.
+      let effectiveEnvelope = envelope;
+      if (
+        envelope &&
+        typeof envelope.model === 'string' &&
+        envelope.model.length > 0 &&
+        cachedSupportedModels instanceof Set &&
+        !cachedSupportedModels.has(envelope.model)
+      ) {
+        logger.warn?.(
+          `[vicoop-codex] envelope.model=${JSON.stringify(envelope.model)} is not in this account's advertised models list; falling back to vicoop-codex default`,
+        );
+        const { model: _droppedModel, ...rest } = envelope;
+        effectiveEnvelope = rest as OpenAICompatRequestEnvelope;
+      }
+
+      const messages = buildMessages(system, chatHistory, userContent);
+      const body = buildCallBody(effectiveEnvelope, messages);
       let serialized: string;
       try {
         serialized = JSON.stringify(body);

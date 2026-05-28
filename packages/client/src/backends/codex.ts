@@ -12,8 +12,10 @@ import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.j
 import { createLogger, type Logger } from '../logger.js';
 import {
   callerToolDispatchActive,
+  chatHistoryFromMessages,
+  collectSystemFromMessages,
   dumpOpenAICompatTaskWire,
-  parseOpenAICompatMetadata,
+  parseOpenAICompatEnvelope,
 } from './openai-compat.js';
 import {
   buildOpenAICompatResponseMetadata,
@@ -42,7 +44,6 @@ import {
 import type {
   OpenAICompatHistoryEntry,
   OpenAICompatMessageContent,
-  OpenAICompatMetadata,
 } from './openai-compat.js';
 
 export type CodexSandboxMode = SandboxMode;
@@ -482,10 +483,13 @@ export function openaiToolsToDynamicToolSpecs(
 // envelope-teaching block is omitted; the model sees the tools natively via
 // codex's function-call surface, so describing a JSON-emit contract would
 // only invite confusion.
-export function composeNativeDevInstructions(meta: OpenAICompatMetadata): string {
+export function composeNativeDevInstructions(
+  system: string | undefined,
+  toolChoice: unknown,
+): string {
   const sections: string[] = [];
-  if (meta.system) sections.push(meta.system);
-  const tc = meta.tool_choice;
+  if (system) sections.push(system);
+  const tc = toolChoice;
   if (tc === 'required') {
     sections.push(
       'tool_choice="required": you MUST invoke one of the available tools this turn; answering in natural language is not allowed.',
@@ -672,6 +676,17 @@ export function createCodexBackend(
   const identityDevInstructions: string = opts.identity
     ? buildSelfIdentitySystemPrompt(opts.identity)
     : '';
+
+  // Supported-models cache, populated by `resolveCapabilities` at daemon
+  // startup and read sync from `handle()` to gate `envelope.model`
+  // forwarding (#302). Mirrors the claude / vicoop-codex pattern.
+  // `undefined` = "never populated" — daemon hasn't called
+  // `resolveCapabilities` yet or tests skipped it, so validation is
+  // silently bypassed. `null` = "model/list was unavailable" — older
+  // codex builds, app-server transport failure, advertise dropped — so
+  // validation is again skipped. Non-empty Set = the visible model ids
+  // (plus any operator-pinned override the agent card surfaces).
+  let cachedSupportedModelIds: Set<string> | null | undefined = undefined;
 
   // contextId → (threadId, lastUsedAt). writeId-protected rollback so a
   // concurrent task on the same contextId doesn't get its session entry
@@ -882,6 +897,7 @@ export function createCodexBackend(
       try {
         client = await ensureClient();
       } catch {
+        cachedSupportedModelIds = null;
         return {};
       }
 
@@ -890,11 +906,15 @@ export function createCodexBackend(
         const result = await client.request<ModelListResult>('model/list', {});
         modelList = Array.isArray(result?.data) ? result.data : [];
       } catch {
+        cachedSupportedModelIds = null;
         return {};
       }
 
       const visible = modelList.filter((m) => m && typeof m.id === 'string' && m.id.length > 0 && !m.hidden);
-      if (visible.length === 0) return {};
+      if (visible.length === 0) {
+        cachedSupportedModelIds = null;
+        return {};
+      }
 
       const defaultId =
         (operatorOverride && visible.find((m) => m.id === operatorOverride)?.id) ??
@@ -915,6 +935,12 @@ export function createCodexBackend(
       if (operatorOverride && !visible.some((m) => m.id === operatorOverride)) {
         openaiCompatModels.unshift({ id: operatorOverride, default: true });
       }
+
+      // Populate the envelope.model validation cache from the same set of
+      // ids we just advertised. `handle()` does a sync `has()` against it
+      // without re-issuing `model/list` (#302).
+      const advertisedIds = new Set(openaiCompatModels.map((entry) => entry.id));
+      cachedSupportedModelIds = advertisedIds.size > 0 ? advertisedIds : null;
 
       return { openaiCompatModels };
     },
@@ -1003,19 +1029,58 @@ export function createCodexBackend(
         // short `tool_choice` nudge when applicable. The wire shape we emit
         // upstream (`tool_calls` artifact, `chat_history` input) is
         // unchanged so callers see no difference.
-        const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+        // Envelope-direct (#302): read the full inbound OpenAI Chat
+        // Completions request body verbatim and project system / chat_history
+        // off `envelope.messages[]` rather than going through the legacy
+        // decomposed view. `envelope.model` flows into the thread/start
+        // config so the gateway-resolved model id reaches codex instead of
+        // its config-pinned default.
+        const envelope = parseOpenAICompatEnvelope(task.message.metadata);
         if (openaiCompatTrace) {
           dumpOpenAICompatTaskWire(
             'codex',
             task.taskId,
             task.message.parts,
             task.message.metadata,
-            openaiCompat,
           );
         }
+        const envelopeTools = Array.isArray(envelope?.tools) && envelope.tools.length > 0
+          ? envelope.tools
+          : undefined;
+        const envelopeToolChoice = envelope?.tool_choice;
+        const envelopeSystem = envelope
+          ? collectSystemFromMessages(envelope.messages)
+          : undefined;
+        const envelopeChatHistory =
+          envelope && Array.isArray(envelope.messages)
+            ? chatHistoryFromMessages(envelope.messages)
+            : null;
+        const envelopeModelRaw =
+          envelope && typeof envelope.model === 'string' && envelope.model.length > 0
+            ? envelope.model
+            : undefined;
+        // Validate against the cache populated by `resolveCapabilities`.
+        // When the gateway sends a value codex doesn't advertise (#302) —
+        // e.g. an unresolved routing key like `a2a/<card-url>` — drop the
+        // override so the CLI falls back to its config.toml default rather
+        // than failing with `invalid_request_error`. When the cache is
+        // unpopulated (older codex, transport failure, or
+        // `resolveCapabilities` hasn't been called yet) the validation is
+        // skipped and `envelope.model` rides through unchanged.
+        let envelopeModel: string | undefined = envelopeModelRaw;
+        if (
+          envelopeModelRaw !== undefined &&
+          cachedSupportedModelIds instanceof Set &&
+          !cachedSupportedModelIds.has(envelopeModelRaw)
+        ) {
+          logger?.warn?.(
+            `[codex] envelope.model=${JSON.stringify(envelopeModelRaw)} is not in this codex install's advertised model/list; falling back to codex default`,
+          );
+          envelopeModel = undefined;
+        }
         const dynamicTools =
-          openaiCompat && callerToolDispatchActive(openaiCompat) && openaiCompat.tools
-            ? openaiToolsToDynamicToolSpecs(openaiCompat.tools)
+          envelopeTools && callerToolDispatchActive(envelopeTools, envelopeToolChoice)
+            ? openaiToolsToDynamicToolSpecs(envelopeTools)
             : null;
         // In openai-compat mode codex is acting as a *model endpoint*, not
         // as an A2A agent — the gateway in front of it owns conversation
@@ -1025,8 +1090,8 @@ export function createCodexBackend(
         // compete with. Plain-task mode (no openai-compat metadata) keeps
         // the directive because that's the actual a2a-agent surface the
         // mention can land on.
-        const systemPrompt = openaiCompat
-          ? composeNativeDevInstructions(openaiCompat)
+        const systemPrompt = envelope
+          ? composeNativeDevInstructions(envelopeSystem, envelopeToolChoice)
           : identityDevInstructions;
 
         const mappedRaw = await mapPartsToCodexInput(task.message.parts, {
@@ -1046,7 +1111,7 @@ export function createCodexBackend(
         const isToolContinuation =
           !mappedRaw.ok &&
           mappedRaw.code === 'empty_prompt' &&
-          (openaiCompat?.chat_history?.length ?? 0) > 0;
+          (envelopeChatHistory?.length ?? 0) > 0;
         if (!mappedRaw.ok && !isToolContinuation) {
           emit({
             type: 'task.fail',
@@ -1081,8 +1146,8 @@ export function createCodexBackend(
         // `<environment_context>` user turn), the model receives an OpenAI
         // Chat Completions-shaped conversation built from chat_history + the
         // trailing user, and finalises off it.
-        const historyInjectItems = openaiCompat?.chat_history
-          ? historyToInjectItems(openaiCompat.chat_history)
+        const historyInjectItems = envelopeChatHistory
+          ? historyToInjectItems(envelopeChatHistory)
           : null;
 
         try {
@@ -1124,7 +1189,7 @@ export function createCodexBackend(
           // tool result instead of answering a fresh question). Force a
           // clean `thread/start` every openai-compat task; the injected
           // history + turn/start.input is the unambiguous source of truth.
-          const sessionReuseEligible = openaiCompat === null && sessionTtlMs > 0;
+          const sessionReuseEligible = envelope === null && sessionTtlMs > 0;
           const tNow = now();
           if (sessionReuseEligible) evictExpired(tNow - sessionTtlMs);
           const existing = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
@@ -1208,7 +1273,7 @@ export function createCodexBackend(
           // elicitation reply that never arrives under openai-compat).
           // `list_mcp_resources` and siblings are gated by codex's per-server
           // `mcp_tools` config — out of scope for this flag plumbing.
-          const featuresOverride = callerToolDispatchActive(openaiCompat)
+          const featuresOverride = callerToolDispatchActive(envelopeTools, envelopeToolChoice)
             ? {
                 features: {
                   // Hosted modalities that bypass the caller's text envelope.
@@ -1254,16 +1319,27 @@ export function createCodexBackend(
           // minor: the model loses date/timezone/cwd context, which
           // openai-compat callers don't rely on.
           const envContextOverride =
-            openaiCompat !== null ? { include_environment_context: false } : null;
+            envelope !== null ? { include_environment_context: false } : null;
+          // Forward the gateway-resolved model id via `config.model` so the
+          // CLI dispatches to the caller's selection rather than the
+          // operator's `config.toml` default (#302). Sticky on thread/start;
+          // re-sent on thread/resume because `ThreadConfigOverride` keys
+          // do not persist across resume.
+          const modelOverride =
+            envelopeModel !== undefined ? { model: envelopeModel } : null;
           const threadConfig =
-            featuresOverride || envContextOverride
-              ? { ...(featuresOverride ?? {}), ...(envContextOverride ?? {}) }
+            featuresOverride || envContextOverride || modelOverride
+              ? {
+                  ...(featuresOverride ?? {}),
+                  ...(envContextOverride ?? {}),
+                  ...(modelOverride ?? {}),
+                }
               : null;
           // `environments: []` is sticky on `thread/start` and unsupported on
           // `thread/resume`, so we only send it on start. Gated by the same
           // condition as the feature override so non-openai-compat callers
           // keep their normal codex environment.
-          const sendEmptyEnvironments = callerToolDispatchActive(openaiCompat);
+          const sendEmptyEnvironments = callerToolDispatchActive(envelopeTools, envelopeToolChoice);
 
           let threadId: string;
           try {
@@ -1385,7 +1461,7 @@ export function createCodexBackend(
           // dynamicTools with SessionMeta and the resumed thread can still
           // invoke them. The handler is unregistered in the `finally` of
           // the outer try that wraps the turn loop below.
-          if (openaiCompat) {
+          if (envelope) {
             registeredThreadId = threadId;
             toolCallHandlers.set(threadId, async (p) => {
               capturedToolCall = true;
@@ -1756,13 +1832,13 @@ export function createCodexBackend(
           // missing_usage 502). The zeros honestly signal "runtime did
           // not report" rather than fabricating a tokenizer estimate the
           // codex runtime never produced.
-          const finalUsageSnapshot: OpenAICompatUsage | null = openaiCompat && !finalUsage
+          const finalUsageSnapshot: OpenAICompatUsage | null = envelope && !finalUsage
             ? buildOpenAICompatUsage({
                 prompt_tokens: 0,
                 completion_tokens: 0,
               })
             : finalUsage;
-          const envelope = openaiCompat
+          const responseEnvelope = envelope
             ? buildCodexChatCompletionEnvelope({
                 taskId: task.taskId,
                 model: finalUsageSnapshot?.model,
@@ -1773,7 +1849,7 @@ export function createCodexBackend(
               })
             : undefined;
 
-          const messageMetadata = buildOpenAICompatResponseMetadata(envelope, finalUsage);
+          const messageMetadata = buildOpenAICompatResponseMetadata(responseEnvelope, finalUsage);
           // When parts is empty but we have envelope/usage to convey, still
           // emit the message frame so the metadata reaches the gateway.
           const hasMessage = parts.length > 0 || messageMetadata !== undefined;
