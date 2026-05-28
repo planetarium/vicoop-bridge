@@ -2041,6 +2041,24 @@ export function createClaudeBackend(
       );
 
       signal.removeEventListener('abort', onAbort);
+
+      // Flush any trailing line without a newline. claude normally terminates
+      // each event with \n but recent CC builds can flush the final `result`
+      // event without a trailing newline and exit. This MUST run before
+      // `settled = true` — `handleEvent` returns early when `settled` is
+      // set, and a swallowed trailing `result` event leaves
+      // `sawCompletedResult` false, which then collapses the otherwise-
+      // legitimate "exit 1 after completed result" case into a
+      // `claude_exit_nonzero` failure.
+      const trailing = stdoutBuf.trim();
+      if (trailing) {
+        try {
+          handleEvent(JSON.parse(trailing) as StreamEvent);
+        } catch {
+          // ignore
+        }
+      }
+
       settled = true;
       sendFileRelease?.();
       // Caller-tools MCP is per-task; release it as soon as claude has
@@ -2052,17 +2070,6 @@ export function createClaudeBackend(
       // we're guaranteed claude has already disconnected.
       await closeCallerToolsMcp();
       if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
-
-      // Flush any trailing line without a newline. claude normally terminates
-      // each event with \n but a crash mid-write could leave one orphan.
-      const trailing = stdoutBuf.trim();
-      if (trailing) {
-        try {
-          handleEvent(JSON.parse(trailing) as StreamEvent);
-        } catch {
-          // ignore
-        }
-      }
 
       if (aborted) {
         emit({
