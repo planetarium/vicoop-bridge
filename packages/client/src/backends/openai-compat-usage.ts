@@ -59,6 +59,30 @@ export function makeOpenAICompatUsageMetadata(usage: OpenAICompatUsage): Record<
   return { [OPENAI_COMPAT_EXTENSION_URI]: { usage } };
 }
 
+// Build the `Message.metadata` payload to attach to the terminal A2A
+// message under the openai-compat extension URI. Bundles the
+// `chat_completion` envelope (envelope contract per oai2a2a#80 — the
+// codec on the gateway unwraps this verbatim) with a transitional
+// top-level `usage` sibling for back-compat with codecs that read it as a
+// fallback when the envelope lacks `usage`.
+//
+// Both backends (codex.ts, vicoop-codex.ts) emit the same metadata shape;
+// this helper exists so the wire stays consistent and neither backend
+// silently drifts. Returns `undefined` when neither field has content so
+// callers don't stamp an empty extension block onto the message.
+//
+// Spec: extensions/openai-compat/v1/README.md#response-metadata-payload-agent--gateway
+export function buildOpenAICompatResponseMetadata(
+  envelope: Record<string, unknown> | undefined,
+  usage: OpenAICompatUsage | null,
+): Record<string, unknown> | undefined {
+  if (!envelope && !usage) return undefined;
+  const payload: Record<string, unknown> = {};
+  if (usage) payload.usage = usage;
+  if (envelope) payload.chat_completion = envelope;
+  return { [OPENAI_COMPAT_EXTENSION_URI]: payload };
+}
+
 function isCount(n: unknown): n is number {
   return typeof n === 'number' && Number.isFinite(n) && n >= 0 && Number.isInteger(n);
 }

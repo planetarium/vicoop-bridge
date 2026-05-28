@@ -16,8 +16,8 @@ import {
   parseOpenAICompatMetadata,
 } from './openai-compat.js';
 import {
+  buildOpenAICompatResponseMetadata,
   buildOpenAICompatUsage,
-  makeOpenAICompatUsageMetadata,
   type OpenAICompatUsage,
 } from './openai-compat-usage.js';
 import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME } from './fetch-uri-file.js';
@@ -365,6 +365,45 @@ export function parseCodexTokenUsageForOpenAICompat(raw: unknown): OpenAICompatU
     cached_tokens: cached,
     reasoning_tokens: reasoning,
   });
+}
+
+// Assemble a complete OpenAI ChatCompletion envelope for the openai-compat/v1
+// envelope contract. The codec on the gateway unwraps this verbatim, so we
+// own every required field — id / object / created / model / choices /
+// finish_reason / logprobs / usage. `id` is synthesized from the A2A task id
+// (codex's app-server doesn't expose a stable response id we can forward);
+// `model` falls back to a placeholder when codex didn't surface it via
+// tokenUsage.
+//
+// Spec: extensions/openai-compat/v1/README.md#response-metadata-payload-agent--gateway
+export function buildCodexChatCompletionEnvelope(args: {
+  taskId: string;
+  model: string | undefined;
+  content: string | null;
+  toolCalls: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> | undefined;
+  finishReason: 'stop' | 'tool_calls';
+  usage: OpenAICompatUsage | null;
+}): Record<string, unknown> {
+  const message: Record<string, unknown> = { role: 'assistant', content: args.content };
+  if (args.toolCalls && args.toolCalls.length > 0) {
+    message.tool_calls = args.toolCalls;
+  }
+  const envelope: Record<string, unknown> = {
+    id: `chatcmpl-codex-${args.taskId}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: args.model ?? 'codex',
+    choices: [
+      {
+        index: 0,
+        message,
+        finish_reason: args.finishReason,
+        logprobs: null,
+      },
+    ],
+  };
+  if (args.usage) envelope.usage = args.usage;
+  return envelope;
 }
 
 // app-server `commandExecution` item summary.
@@ -1312,7 +1351,12 @@ export function createCodexBackend(
           // ignore turn-level events (no turn of ours is yet on the wire).
           let activeTurnId: string | null = null;
           let finalText: string | null = null;
-          let finalUsage: OpenAICompatUsage | null = null;
+          // Explicit widening type — without this TS infers a too-narrow type
+          // through the `if (parsed) finalUsage = parsed;` assignment when
+          // `parseCodexTokenUsageForOpenAICompat` returns `OpenAICompatUsage | null`,
+          // because the only assignment site narrows out the `null` branch and
+          // later flow analysis collapses the type.
+          let finalUsage: OpenAICompatUsage | null = null as OpenAICompatUsage | null;
           let emittedAnyArtifact = false;
           // Set when an `item/tool/call` lands for this turn — the model
           // invoked a caller-side tool, we emitted a `tool_calls` artifact,
@@ -1322,6 +1366,16 @@ export function createCodexBackend(
           // `tool_calls` artifact, matching OpenAI Chat Completions'
           // `finish_reason: "tool_calls"` semantics.
           let capturedToolCall = false;
+          // OpenAI Chat Completions tool_calls accumulated from codex's
+          // server-initiated `item/tool/call` events. Surfaced to the gateway
+          // via the terminal `chat_completion` envelope on
+          // `status.message.metadata[OPENAI_COMPAT_EXTENSION_URI]` per the
+          // openai-compat/v1 envelope contract (oai2a2a#80).
+          const capturedToolCalls: Array<{
+            id: string;
+            type: 'function';
+            function: { name: string; arguments: string };
+          }> = [];
           const emitTraceArtifacts = traceabilityRequested(task);
 
           // Register the per-thread `item/tool/call` handler for the
@@ -1335,35 +1389,20 @@ export function createCodexBackend(
             registeredThreadId = threadId;
             toolCallHandlers.set(threadId, async (p) => {
               capturedToolCall = true;
-              // The OpenAI Chat Completions wire shape callers expect.
-              // codex hands us `arguments` already parsed as a JSON value;
-              // the envelope path historically forwarded the parsed object
-              // verbatim, so the artifact stays byte-compatible with PR
-              // #208's output and downstream gateways (oai2a2a) don't have
-              // to special-case the source.
-              const envelope = {
-                tool_calls: [
-                  {
-                    id: p.callId,
-                    function: {
-                      name: p.tool,
-                      arguments: p.arguments,
-                    },
-                  },
-                ],
-              };
-              emit({
-                type: 'task.artifact',
-                taskId: task.taskId,
-                artifact: {
-                  artifactId: randomUUID(),
-                  name: 'codex-message',
-                  parts: [{ kind: 'data', data: envelope }],
-                  extensions: [OPENAI_COMPAT_EXTENSION_URI],
-                },
-                lastChunk: true,
+              // OpenAI Chat Completions requires `arguments` as a JSON-encoded
+              // string; codex hands us a parsed JSON value, so we stringify
+              // here for spec compliance. The captured call rides out via the
+              // terminal chat_completion envelope (no data-part artifact under
+              // the envelope contract — oai2a2a#80).
+              const argsString =
+                typeof p.arguments === 'string'
+                  ? p.arguments
+                  : JSON.stringify(p.arguments ?? {});
+              capturedToolCalls.push({
+                id: p.callId,
+                type: 'function',
+                function: { name: p.tool, arguments: argsString },
               });
-              emittedAnyArtifact = true;
               // Best-effort `turn/interrupt` so codex unwinds the turn —
               // the model's function_call is already surfaced upstream and
               // we don't want it generating further text or chaining into
@@ -1511,9 +1550,7 @@ export function createCodexBackend(
                         id?: string;
                         status?: string;
                         error?: { message?: string } | null;
-                        usage?: unknown;
                       };
-                      usage?: unknown;
                     }
                   | undefined;
                 const t = p?.turn;
@@ -1674,14 +1711,13 @@ export function createCodexBackend(
           }
 
           const completeText = outcome.finalText ?? '';
-          // When the model invoked a caller tool, the `tool_calls` artifact
-          // is the complete task output: any agent text codex streamed
-          // before the function_call is best treated as reasoning preamble
-          // and not re-stamped on `status.message.parts`. Re-stamping
-          // violates A2A's "Messages SHOULD NOT be used to deliver task
-          // outputs" and, downstream, caused gateways (oai2a2a) to
-          // double-emit `tool_calls` on the envelope path (#200) — keep
-          // the same invariant on the native path.
+          // When the model invoked a caller tool, the assistant text codex
+          // streamed before the function_call is best treated as reasoning
+          // preamble and not re-stamped on `status.message.parts`. Stamping
+          // it violates A2A's "Messages SHOULD NOT be used to deliver task
+          // outputs"; the model's final answer in that turn IS the
+          // function_call which now rides via the chat_completion envelope
+          // (oai2a2a#80).
           const parts: Part[] = !capturedToolCall && completeText
             ? [{ kind: 'text', text: completeText }]
             : [];
@@ -1698,14 +1734,49 @@ export function createCodexBackend(
             });
           }
 
-          // Attach the openai-compat/v1 `usage` payload to the final A2A
-          // message of this turn when codex reported it on turn/completed.
-          // When usage is present but there are no parts we still emit the
-          // message frame (with empty parts) to carry the metadata.
-          const hasMessage = parts.length > 0 || finalUsage !== null;
-          const messageMetadata = finalUsage
-            ? makeOpenAICompatUsageMetadata(finalUsage)
+          // Envelope response contract (oai2a2a#80): emit a complete OpenAI
+          // ChatCompletion envelope under
+          // `metadata[OPENAI_COMPAT_EXTENSION_URI].chat_completion` on the
+          // final A2A message of this turn. The codec unwraps the envelope
+          // verbatim, so we own id / created / model / choices / usage. The
+          // legacy top-level `usage` field is also emitted for back-compat
+          // with codecs that read it as a fallback when the envelope lacks
+          // `usage`. When the openai-compat extension wasn't on the request
+          // at all we skip the envelope (no advertising consumer to feed it).
+          const finishReason: 'tool_calls' | 'stop' =
+            capturedToolCalls.length > 0 ? 'tool_calls' : 'stop';
+          const assistantContent = capturedToolCalls.length > 0 ? null : completeText;
+          // Placeholder fallback for codex app-server's known limitation:
+          // `thread/tokenUsage/updated` does not fire on tool-call-only
+          // (interrupted) turns, and `turn/completed` carries no usage
+          // payload for those turns either. The openai-compat/v1 envelope
+          // contract requires `usage` to be present — when codex genuinely
+          // didn't surface it, emit `{0,0,0}` as a placeholder rather than
+          // omit the field (which would trip the gateway's strict
+          // missing_usage 502). The zeros honestly signal "runtime did
+          // not report" rather than fabricating a tokenizer estimate the
+          // codex runtime never produced.
+          const finalUsageSnapshot: OpenAICompatUsage | null = openaiCompat && !finalUsage
+            ? buildOpenAICompatUsage({
+                prompt_tokens: 0,
+                completion_tokens: 0,
+              })
+            : finalUsage;
+          const envelope = openaiCompat
+            ? buildCodexChatCompletionEnvelope({
+                taskId: task.taskId,
+                model: finalUsageSnapshot?.model,
+                content: assistantContent,
+                toolCalls: capturedToolCalls.length > 0 ? capturedToolCalls : undefined,
+                finishReason,
+                usage: finalUsageSnapshot,
+              })
             : undefined;
+
+          const messageMetadata = buildOpenAICompatResponseMetadata(envelope, finalUsage);
+          // When parts is empty but we have envelope/usage to convey, still
+          // emit the message frame so the metadata reaches the gateway.
+          const hasMessage = parts.length > 0 || messageMetadata !== undefined;
           emit({
             type: 'task.complete',
             taskId: task.taskId,

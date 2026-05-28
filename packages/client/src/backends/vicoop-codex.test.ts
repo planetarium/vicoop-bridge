@@ -410,7 +410,7 @@ test('parseChatCompletionUsage: missing primary counts yields null', () => {
   assert.equal(parseChatCompletionUsage({ prompt_tokens: 1 }, undefined), null);
 });
 
-test('buildResponseMetadata: includes both usage and chat_completion echo', () => {
+test('buildResponseMetadata: chat_completion envelope carries spec-required fields + normalized usage', () => {
   const response: ChatCompletionResponse = {
     id: 'chatcmpl-abc',
     object: 'chat.completion',
@@ -426,18 +426,55 @@ test('buildResponseMetadata: includes both usage and chat_completion echo', () =
     usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
   };
   const usage = parseChatCompletionUsage(response.usage, response.model);
-  const meta = buildResponseMetadata(response, usage) as Record<
+  const meta = buildResponseMetadata(response, usage, 'task-xyz') as Record<
     string,
     Record<string, unknown>
   >;
   const ext = meta[OPENAI_COMPAT_EXTENSION_URI] as Record<string, unknown>;
+  // Legacy top-level `usage` sibling for back-compat with v1-era codecs
+  // that only read it; new codecs prefer `chat_completion.usage`.
   assert.ok(ext.usage);
-  const echo = ext.chat_completion as Record<string, unknown>;
-  assert.equal(echo.id, 'chatcmpl-abc');
-  assert.equal(echo.model, 'gpt-5.4');
-  assert.equal(echo.created, 1779177411);
-  assert.deepEqual(echo.usage, response.usage);
-  assert.ok(Array.isArray(echo.choices));
+  const envelope = ext.chat_completion as Record<string, unknown>;
+  assert.equal(envelope.id, 'chatcmpl-abc');
+  assert.equal(envelope.object, 'chat.completion');
+  assert.equal(envelope.model, 'gpt-5.4');
+  assert.equal(envelope.created, 1779177411);
+  // chat_completion.usage carries the normalized OpenAICompatUsage
+  // (with the spec-mandated total === prompt + completion invariant)
+  // — same value as the top-level sibling. Codec prefers this path.
+  assert.deepEqual(envelope.usage, usage);
+  // logprobs must be present on each choice per the spec (defaults to null
+  // when the underlying runtime doesn't surface them — which vicoop-codex
+  // never does today).
+  const choices = envelope.choices as Array<Record<string, unknown>>;
+  assert.equal(choices.length, 1);
+  assert.equal(choices[0].logprobs, null);
+  assert.equal(choices[0].finish_reason, 'stop');
+});
+
+test('buildResponseMetadata: synthesizes defensive defaults when upstream omits id/object/created/model', () => {
+  // Advertising agents SHOULD always emit a complete envelope, but a wrapper
+  // bug shouldn't break OpenAI clients downstream — the codec relies on
+  // these fields being present.
+  const response: ChatCompletionResponse = {
+    choices: [
+      {
+        index: 0,
+        message: { role: 'assistant', content: 'ok' },
+        finish_reason: 'stop',
+      },
+    ],
+  };
+  const meta = buildResponseMetadata(response, null, 'task-fallback') as Record<
+    string,
+    Record<string, unknown>
+  >;
+  const envelope = (meta[OPENAI_COMPAT_EXTENSION_URI] as Record<string, unknown>)
+    .chat_completion as Record<string, unknown>;
+  assert.equal(envelope.id, 'chatcmpl-vicoop-codex-task-fallback');
+  assert.equal(envelope.object, 'chat.completion');
+  assert.equal(typeof envelope.created, 'number');
+  assert.equal(envelope.model, 'vicoop-codex');
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -515,13 +552,25 @@ test('handle: success path — text response → artifact + complete with metada
   const ext = (msg.metadata as Record<string, Record<string, unknown>>)[
     OPENAI_COMPAT_EXTENSION_URI
   ];
+  // Legacy top-level `usage` for v1-era back-compat.
   assert.ok(ext.usage);
-  const echo = ext.chat_completion as Record<string, unknown>;
-  assert.equal(echo.id, 'chatcmpl-1');
-  assert.equal(echo.model, 'gpt-5.4');
+  const envelope = ext.chat_completion as Record<string, unknown>;
+  assert.equal(envelope.id, 'chatcmpl-1');
+  assert.equal(envelope.model, 'gpt-5.4');
+  // The envelope carries `usage` natively (preferred by the codec); same
+  // numeric totals as the legacy sibling above.
+  const envelopeUsage = envelope.usage as Record<string, number>;
+  assert.equal(envelopeUsage.prompt_tokens, 3);
+  assert.equal(envelopeUsage.completion_tokens, 1);
+  assert.equal(envelopeUsage.total_tokens, 4);
+  // Spec requires logprobs on each choice (null when not surfaced).
+  const choices = envelope.choices as Array<Record<string, unknown>>;
+  assert.equal(choices.length, 1);
+  assert.equal(choices[0].logprobs, null);
+  assert.equal(choices[0].finish_reason, 'stop');
 });
 
-test('handle: tool_calls response → data artifact + no text in status message', async () => {
+test('handle: tool_calls response → no data artifact; tool_calls only on terminal chat_completion envelope (envelope contract, oai2a2a#80)', async () => {
   const task = makeTask({
     metadata: {
       [OPENAI_COMPAT_EXTENSION_URI]: {
@@ -557,22 +606,62 @@ test('handle: tool_calls response → data artifact + no text in status message'
     child.emitStdout(JSON.stringify(response));
     child.finish(0);
   });
-  const artifacts = frames.filter((f) => f.type === 'task.artifact');
-  assert.equal(artifacts.length, 1);
-  const artifact = artifacts[0];
-  if (artifact.type !== 'task.artifact') throw new Error('unreachable');
-  assert.equal(artifact.artifact.parts[0].kind, 'data');
-  if (artifact.artifact.parts[0].kind !== 'data') throw new Error('unreachable');
-  const data = artifact.artifact.parts[0].data as { tool_calls: unknown[] };
-  assert.equal(data.tool_calls.length, 1);
-  assert.ok(artifact.artifact.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI));
+  // Envelope contract: no data-part `tool_calls` artifact. The legacy
+  // `data` part shaped `{ "tool_calls": [...] }` is removed from this
+  // extension — consumers ignore it, so emitting it would only confuse
+  // non-OpenAI A2A inspectors.
+  const dataArtifacts = frames.filter(
+    (f) =>
+      f.type === 'task.artifact' &&
+      (f.artifact.parts[0] as { kind?: string })?.kind === 'data',
+  );
+  assert.equal(
+    dataArtifacts.length,
+    0,
+    'no data-part tool_calls artifact under the envelope contract',
+  );
+  // No text artifact either when there's no text content to surface
+  // (content: null on a tool_calls turn).
+  const textArtifacts = frames.filter(
+    (f) =>
+      f.type === 'task.artifact' &&
+      (f.artifact.parts[0] as { kind?: string })?.kind === 'text',
+  );
+  assert.equal(textArtifacts.length, 0);
+
   const completes = frames.filter((f) => f.type === 'task.complete');
   assert.equal(completes.length, 1);
   const completeFrame = completes[0];
   if (completeFrame.type !== 'task.complete') throw new Error('unreachable');
   // status.message exists but parts must be empty so we don't re-stamp the
-  // tool_calls envelope onto the message.
+  // tool_calls envelope onto the message (A2A: "Messages SHOULD NOT be
+  // used to deliver task outputs").
   assert.deepEqual(completeFrame.status.message!.parts, []);
+  // The chat_completion envelope is the sole recovery wire for tool_calls.
+  const ext = (completeFrame.status.message!.metadata as Record<
+    string,
+    Record<string, unknown>
+  >)[OPENAI_COMPAT_EXTENSION_URI];
+  const envelope = ext.chat_completion as Record<string, unknown>;
+  const choices = envelope.choices as Array<{
+    message: { role: string; content: unknown; tool_calls?: Array<Record<string, unknown>> };
+    finish_reason: string;
+    logprobs: unknown;
+  }>;
+  assert.equal(choices.length, 1);
+  assert.equal(choices[0].finish_reason, 'tool_calls');
+  assert.equal(choices[0].logprobs, null);
+  assert.equal(choices[0].message.role, 'assistant');
+  assert.equal(choices[0].message.content, null);
+  const calls = choices[0].message.tool_calls!;
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].id, 'call_xyz');
+  assert.equal(calls[0].type, 'function');
+  const fn = calls[0].function as { name: string; arguments: string };
+  assert.equal(fn.name, 'list_files');
+  // OpenAI spec: arguments is a JSON-encoded string (vicoop-codex CLI
+  // already emits it that way).
+  assert.equal(fn.arguments, '{"path":"."}');
 });
 
 test('handle: stdin body carries only system/tools/tool_choice/history-derived messages', async () => {
