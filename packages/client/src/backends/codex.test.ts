@@ -1410,32 +1410,19 @@ test('openai-compat dynamicTools: item/tool/call → tool_calls artifact + compl
     NEVER,
   );
 
-  // The artifact must carry the OpenAI `tool_calls` envelope as a `data`
-  // part — same wire shape PR #208 already emitted on the legacy envelope
-  // path, so downstream gateways see no difference.
-  const artifact = frames.find((f) => f.type === 'task.artifact');
-  assert.ok(artifact, 'tool_calls artifact emitted');
-  if (artifact?.type === 'task.artifact') {
-    const p = artifact.artifact.parts[0];
-    assert.equal(p.kind, 'data');
-    assert.ok(
-      artifact.artifact.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI),
-    );
-    if (p.kind === 'data') {
-      const data = p.data as {
-        tool_calls?: Array<{
-          id?: string;
-          function?: { name?: string; arguments?: unknown };
-        }>;
-      };
-      assert.equal(data.tool_calls?.length, 1);
-      assert.equal(data.tool_calls?.[0]?.id, 'call_xyz');
-      assert.equal(data.tool_calls?.[0]?.function?.name, 'fetch');
-      assert.deepEqual(data.tool_calls?.[0]?.function?.arguments, {
-        url: 'https://example.com',
-      });
-    }
-  }
+  // Per the openai-compat/v1 structured-only contract (#80), tool_calls
+  // ride on the final A2A message's `metadata[URI].tool_calls` field —
+  // NOT as a `data` part artifact. The data-part wire is gone.
+  const dataArtifact = frames.find(
+    (f) =>
+      f.type === 'task.artifact' &&
+      f.artifact.parts.some((p) => p.kind === 'data'),
+  );
+  assert.equal(
+    dataArtifact,
+    undefined,
+    'no data-part tool_calls artifact under the structured-only contract (#80)',
+  );
 
   // Despite the underlying turn ending in `interrupted`, the A2A task must
   // surface as `completed` because the model invoked a tool (caller asked
@@ -1443,6 +1430,38 @@ test('openai-compat dynamicTools: item/tool/call → tool_calls artifact + compl
   const complete = frames.find((f) => f.type === 'task.complete');
   assert.ok(complete && complete.type === 'task.complete');
   assert.equal(complete.status.state, 'completed');
+
+  // The structured tool_calls payload lives on the final message's
+  // metadata under the openai-compat extension URI, with `arguments` as
+  // a JSON-encoded string (OpenAI's wire shape).
+  const message = complete.status.message;
+  assert.ok(message, 'final task.complete carries a message frame');
+  assert.ok(
+    message.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI),
+    'message advertises the openai-compat extension',
+  );
+  const ext = (message.metadata as Record<string, unknown> | undefined)?.[
+    OPENAI_COMPAT_EXTENSION_URI
+  ] as Record<string, unknown> | undefined;
+  assert.ok(ext, 'message.metadata carries the openai-compat extension payload');
+  assert.equal(ext.finish_reason, 'tool_calls');
+  const calls = ext.tool_calls as Array<{
+    id: string;
+    type: string;
+    function: { name: string; arguments: string };
+  }>;
+  assert.ok(Array.isArray(calls) && calls.length === 1);
+  assert.equal(calls[0].id, 'call_xyz');
+  assert.equal(calls[0].type, 'function');
+  assert.equal(calls[0].function.name, 'fetch');
+  // arguments MUST be a JSON-encoded string per OpenAI / spec.
+  assert.equal(typeof calls[0].function.arguments, 'string');
+  assert.deepEqual(JSON.parse(calls[0].function.arguments), {
+    url: 'https://example.com',
+  });
+  // No text parts in `status.message.parts` when the only output is a
+  // tool call (matches OpenAI `content: null` semantics).
+  assert.equal(message.parts.length, 0);
 
   // Bridge must have sent `turn/interrupt` for our turn — that, plus
   // codex's terminal `turn/completed` notification, is what unwinds the
@@ -1694,7 +1713,8 @@ test('dynamicTools handler is registered on every openai-compat turn (#209, #233
 
   // Turn 2: same contextId still does thread/start (no reuse under
   // openai-compat). The handler must register on the new thread id so the
-  // model's tool_call surfaces as a `tool_calls` artifact.
+  // model's tool_call surfaces on the final message's
+  // `metadata[URI].tool_calls` (structured-only contract, #80).
   const { emit, frames } = collect();
   await backend.handle(
     assign('second', 'ctx-no-resume', {
@@ -1709,16 +1729,19 @@ test('dynamicTools handler is registered on every openai-compat turn (#209, #233
     NEVER,
   );
 
-  const artifact = frames.find((f) => f.type === 'task.artifact');
-  assert.ok(artifact, 'tool_calls artifact emitted on the second turn');
-  if (artifact?.type === 'task.artifact') {
-    assert.ok(
-      artifact.artifact.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI),
-    );
-  }
   const complete = frames.find((f) => f.type === 'task.complete');
   assert.ok(complete && complete.type === 'task.complete');
   assert.equal(complete.status.state, 'completed');
+  const ext = (
+    complete.status.message?.metadata as
+      | Record<string, unknown>
+      | undefined
+  )?.[OPENAI_COMPAT_EXTENSION_URI] as Record<string, unknown> | undefined;
+  assert.ok(
+    ext && Array.isArray(ext.tool_calls) && ext.tool_calls.length === 1,
+    'tool_calls surfaced on the second turn via the structured metadata field',
+  );
+  assert.equal(ext.finish_reason, 'tool_calls');
 
   // Both turns went through thread/start; thread/resume is never used for
   // openai-compat tasks (#233 session-reuse guard).

@@ -13,7 +13,7 @@
       },
       {
         "uri": "https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1",
-        "description": "Honors OpenAI-style system/tools/tool_choice via message metadata; emulates tool calls by instructing the model to emit a {\"tool_calls\":[...]} JSON envelope, returned as an A2A data part.",
+        "description": "Honors OpenAI-style system/tools/tool_choice via message metadata. Tool calls invoked by the model are surfaced on the final A2A message's metadata[URI].tool_calls (with finish_reason: \"tool_calls\") per the structured-only response contract; usage and finish_reason ride the same metadata payload.",
         "required": false
       }
     ]
