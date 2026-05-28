@@ -1532,6 +1532,29 @@ export function createCodexBackend(
                   | undefined;
                 const t = p?.turn;
                 if (activeTurnId && t?.id !== activeTurnId) return;
+                // Tool-call-only turns sometimes don't get a
+                // `thread/tokenUsage/updated` notification (or it arrives
+                // after `turn/completed`). Try to pull usage off the
+                // `turn/completed.turn.usage` payload as a fallback so the
+                // openai-compat/v1 envelope's strict usage MUST stays
+                // satisfied. We accept both shapes the app-server has used
+                // in practice: the wrapper `{ last: {...} }` or the inner
+                // `last`-shaped object directly.
+                if (!finalUsage && (t?.usage !== undefined || p?.usage !== undefined)) {
+                  const candidate = t?.usage ?? p?.usage;
+                  const direct = parseCodexTokenUsageForOpenAICompat(candidate);
+                  const wrapped = direct
+                    ? null
+                    : parseCodexTokenUsageForOpenAICompat({ last: candidate });
+                  const parsed = direct ?? wrapped;
+                  if (openaiCompatTrace) {
+                    console.error(
+                      `[openai-compat trace] codex turn.usage fallback raw=${JSON.stringify(candidate ?? null)} ` +
+                        `parsed=${JSON.stringify(parsed)}`,
+                    );
+                  }
+                  if (parsed) finalUsage = parsed;
+                }
                 if (t?.status === 'completed') {
                   finish({ status: 'completed', finalText });
                 } else if (t?.status === 'interrupted') {
@@ -1723,7 +1746,22 @@ export function createCodexBackend(
           const finishReason: 'tool_calls' | 'stop' =
             capturedToolCalls.length > 0 ? 'tool_calls' : 'stop';
           const assistantContent = capturedToolCalls.length > 0 ? null : completeText;
-          const finalUsageSnapshot: OpenAICompatUsage | null = finalUsage;
+          // Placeholder fallback for codex app-server's known limitation:
+          // `thread/tokenUsage/updated` does not fire on tool-call-only
+          // (interrupted) turns, and `turn/completed` carries no usage
+          // payload for those turns either. The openai-compat/v1 envelope
+          // contract requires `usage` to be present — when codex genuinely
+          // didn't surface it, emit `{0,0,0}` as a placeholder rather than
+          // omit the field (which would trip the gateway's strict
+          // missing_usage 502). The zeros honestly signal "runtime did
+          // not report" rather than fabricating a tokenizer estimate the
+          // codex runtime never produced.
+          const finalUsageSnapshot: OpenAICompatUsage | null = openaiCompat && !finalUsage
+            ? buildOpenAICompatUsage({
+                prompt_tokens: 0,
+                completion_tokens: 0,
+              })
+            : finalUsage;
           const envelope = openaiCompat
             ? buildCodexChatCompletionEnvelope({
                 taskId: task.taskId,
