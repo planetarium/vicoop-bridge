@@ -677,6 +677,41 @@ export function createCodexBackend(
     ? buildSelfIdentitySystemPrompt(opts.identity)
     : '';
 
+  // Cache for codex's `model/list` response, used to gate `envelope.model`
+  // forwarding (#302). When the gateway sends a model id this codex install
+  // does not advertise, we drop the override and let codex fall back to its
+  // own default rather than handing it a value the CLI rejects (e.g. the
+  // ChatGPT-account codex rejects unknown ids with `invalid_request_error`).
+  //
+  // `null` after the fetch means "model/list unavailable" — older codex
+  // builds, app-server transport failure, etc. — and the bridge skips the
+  // validation entirely (forwards `envelope.model` verbatim) so we don't
+  // break installs that have no list to check against.
+  let supportedModelIds: Set<string> | null = null;
+  let supportedModelIdsFetched = false;
+
+  async function getSupportedModelIds(): Promise<Set<string> | null> {
+    if (supportedModelIdsFetched) return supportedModelIds;
+    supportedModelIdsFetched = true;
+    try {
+      const client = await ensureClient();
+      const result = await client.request<ModelListResult>('model/list', {});
+      const ids = (Array.isArray(result?.data) ? result.data : [])
+        .filter(
+          (m): m is ModelListEntry =>
+            !!m && typeof m.id === 'string' && m.id.length > 0,
+        )
+        .map((m) => m.id);
+      supportedModelIds = ids.length > 0 ? new Set(ids) : null;
+    } catch (err) {
+      logger?.warn?.(
+        `[codex] model/list lookup failed for envelope.model validation: ${errorMessage(err)}`,
+      );
+      supportedModelIds = null;
+    }
+    return supportedModelIds;
+  }
+
   // contextId → (threadId, lastUsedAt). writeId-protected rollback so a
   // concurrent task on the same contextId doesn't get its session entry
   // rolled back from under it.
@@ -1033,10 +1068,15 @@ export function createCodexBackend(
           envelope && Array.isArray(envelope.messages)
             ? chatHistoryFromMessages(envelope.messages)
             : null;
-        const envelopeModel =
+        const envelopeModelRaw =
           envelope && typeof envelope.model === 'string' && envelope.model.length > 0
             ? envelope.model
             : undefined;
+        // Resolved against `getSupportedModelIds()` after the app-server is
+        // up — see the `await client.request('thread/start' …)` block below.
+        // Declared here so the threadConfig assembly downstream can branch
+        // off the final value.
+        let envelopeModel: string | undefined = envelopeModelRaw;
         const dynamicTools =
           envelopeTools && callerToolDispatchActive(envelopeTools, envelopeToolChoice)
             ? openaiToolsToDynamicToolSpecs(envelopeTools)
@@ -1121,6 +1161,23 @@ export function createCodexBackend(
           try {
             client = await ensureClient();
             recorder.mark('initialized');
+            // Validate `envelope.model` against codex's advertised list now
+            // that the app-server is up. Drops the override when the gateway
+            // sends a value codex doesn't recognise (#302) — e.g. an unresolved
+            // routing key like `a2a/<card-url>` — so the CLI falls back to its
+            // own default rather than failing with `invalid_request_error`.
+            // Silent forward when `model/list` is unavailable (older codex,
+            // transport failure) — see `getSupportedModelIds`'s null-return
+            // contract.
+            if (envelopeModelRaw !== undefined) {
+              const supported = await getSupportedModelIds();
+              if (supported && !supported.has(envelopeModelRaw)) {
+                logger?.warn?.(
+                  `[codex] envelope.model=${JSON.stringify(envelopeModelRaw)} is not in this codex install's advertised model/list; falling back to codex default`,
+                );
+                envelopeModel = undefined;
+              }
+            }
           } catch (err) {
             emit({
               type: 'task.fail',

@@ -228,6 +228,16 @@ interface HappyPathOptions {
   emitCommandExecutionTurns?: number[];
   /** Optional override of the initialize result payload. */
   initializeResult?: Record<string, unknown>;
+  /**
+   * `model/list` response shape returned to the backend's envelope.model
+   * validation (#302). Default `null` returns `{ data: [] }` — the empty
+   * list is treated by the backend as "unavailable" and the validation
+   * silently falls through, so existing tests that set `envelope.model`
+   * see no behaviour change. Explicit arrays drive the validation path:
+   * an entry the backend doesn't know about is dropped before reaching
+   * `thread/start.config.model`.
+   */
+  modelList?: ModelListEntry[];
 }
 
 function happyPath(opts: HappyPathOptions = {}): ChildScenario {
@@ -269,6 +279,15 @@ function happyPath(opts: HappyPathOptions = {}): ChildScenario {
         // Empty-object result mirrors the real server's response shape;
         // the backend treats it as fire-and-confirm.
         child.emitStdout({ id, result: {} });
+        return;
+      }
+      if (method === 'model/list' && id !== undefined) {
+        // #302: codex backend caches `model/list` to gate `envelope.model`
+        // forwarding. Default `{ data: [] }` exercises the "unavailable"
+        // branch (validation is skipped, envelope.model rides through
+        // unchanged). Tests that want to drive the validation path supply
+        // `opts.modelList` with the model ids that should pass the gate.
+        child.emitStdout({ id, result: { data: opts.modelList ?? [] } });
         return;
       }
       if (method === 'turn/start' && id !== undefined) {
@@ -2082,6 +2101,82 @@ test('envelope.model is forwarded as thread/start config.model (#302)', async ()
     params?: { config?: { model?: string } };
   }).params;
   assert.equal(params?.config?.model, 'gpt-5.5-mini');
+});
+
+test('envelope.model is forwarded when codex advertises it in model/list (#302)', async () => {
+  const fake = makeFakeSpawn(() =>
+    happyPath({
+      modelList: [
+        { id: 'gpt-5.5-mini' },
+        { id: 'gpt-5.5', isDefault: true },
+      ],
+    }),
+  );
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('hello', 'ctx-model-known', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'hello' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            chat_completions_request: {
+              model: 'gpt-5.5-mini',
+              messages: [{ role: 'user', content: 'hello' }],
+            },
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as {
+    params?: { config?: { model?: string } };
+  }).params;
+  assert.equal(params?.config?.model, 'gpt-5.5-mini');
+});
+
+test('envelope.model is dropped when codex does NOT advertise it in model/list (#302)', async () => {
+  // Regression guard for the gateway sending an unresolved routing key
+  // (e.g. `a2a/<card-url>`) as `envelope.model`. Without the model/list
+  // gate, the bridge would forward the garbage to codex which rejects it
+  // with `invalid_request_error` — see the screenshot in the PR's review
+  // thread. With the gate, the override is dropped and codex falls back
+  // to its config.toml default.
+  const fake = makeFakeSpawn(() =>
+    happyPath({
+      modelList: [{ id: 'gpt-5.5-mini' }, { id: 'gpt-5.5', isDefault: true }],
+    }),
+  );
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  await backend.handle(
+    assign('hello', 'ctx-model-unknown', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'hello' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            chat_completions_request: {
+              model: 'a2a/https://example.com/agents/x/.well-known/agent-card.json',
+              messages: [{ role: 'user', content: 'hello' }],
+            },
+          },
+        },
+      },
+    }),
+    collect().emit,
+    NEVER,
+  );
+  const tsFrame = findRequest(fake.lastChild().stdinFrames(), 'thread/start');
+  const params = (tsFrame as {
+    params?: { config?: { model?: string } };
+  }).params;
+  // No model override on threadConfig — codex uses its own default.
+  assert.equal(params?.config?.model, undefined);
 });
 
 test('history-only openai-compat payload (no `tools`) does not disable codex built-ins via features (but still suppresses env_context)', async () => {
