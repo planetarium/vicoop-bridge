@@ -36,48 +36,80 @@ const sharedFlags = {
 // `list-clients` / `revoke-client` / `{add,remove,list}-caller` commands below
 // remain as deprecated aliases; each handler calls `warnDeprecated` before
 // dispatching to the new shape.
+//
+// `list` / `remove` accept the docker-style short aliases (`ls` / `rm`) for
+// parity with the `container` group; `agent delete` is kept as a third alias
+// on the remove command because it was the canonical form briefly after the
+// `revoke-client` rename. Each alias is registered with `hidden: 'help'` so
+// only the canonical name shows in usage/docs — the aliases still parse and
+// still surface in "did you mean?" suggestions.
 
-const agentListSubCmd = command(
-  'list',
-  object({
-    action: constant('agent-list' as const),
-    ...sharedFlags,
-    connected: withDefault(flag('--connected', {
-      description: message`Only show agents whose daemon is currently connected.`,
-    }), false),
-  }),
-  {
-    brief: message`List agent registrations under this owner.`,
-    description: message`Calls GET /admin-api/clients (backed by the unified \`agents\` table) and prints one block per agent, including disconnected ones. Use --connected to filter to live daemons.`,
-  },
+function agentListCommand(name: 'list' | 'ls', alias: boolean) {
+  return command(
+    name,
+    object({
+      action: constant('agent-list' as const),
+      ...sharedFlags,
+      connected: withDefault(flag('--connected', {
+        description: message`Only show agents whose daemon is currently connected.`,
+      }), false),
+    }),
+    {
+      brief: message`List agent registrations under this owner. (alias: \`ls\`)`,
+      description: message`Calls GET /admin-api/clients (backed by the unified \`agents\` table) and prints one block per agent, including disconnected ones. Use --connected to filter to live daemons.`,
+      ...(alias ? { hidden: 'help' as const } : {}),
+    },
+  );
+}
+
+const agentListSubCmd = longestMatch(
+  agentListCommand('list', false),
+  agentListCommand('ls', true),
 );
 
-const agentDeleteSubCmd = command(
-  'delete',
-  object({
-    action: constant('agent-delete' as const),
-    ...sharedFlags,
-    target: argument(string({ metavar: 'AGENT_ID' })),
-    yes: withDefault(flag('--yes', {
-      description: message`Skip the confirmation prompt.`,
-    }), false),
-  }),
-  {
-    brief: message`Delete an agent by id (or registration name).`,
-    description: message`Calls DELETE /admin-api/clients/<AGENT_ID>. Hard-deletes the agents and clients rows, and if a daemon is live closes its WebSocket with code 4014 ("client deleted") so it exits without reconnecting. There is no undo. The legacy client_id and the registration name are still accepted for backward compatibility. Prompts for Y/N confirmation unless --yes / -y is set.`,
-  },
+function agentRemoveCommand(name: 'remove' | 'rm' | 'delete', alias: boolean) {
+  return command(
+    name,
+    object({
+      action: constant('agent-delete' as const),
+      ...sharedFlags,
+      target: argument(string({ metavar: 'AGENT_ID' })),
+      yes: withDefault(flag('--yes', {
+        description: message`Skip the confirmation prompt.`,
+      }), false),
+    }),
+    {
+      brief: message`Remove an agent by id (or registration name). (aliases: \`rm\`, \`delete\`)`,
+      description: message`Calls DELETE /admin-api/clients/<AGENT_ID>. Hard-deletes the agents and clients rows, and if a daemon is live closes its WebSocket with code 4014 ("client deleted") so it exits without reconnecting. There is no undo. The legacy client_id and the registration name are still accepted for backward compatibility. Prompts for Y/N confirmation unless --yes / -y is set.`,
+      ...(alias ? { hidden: 'help' as const } : {}),
+    },
+  );
+}
+
+const agentRemoveSubCmd = longestMatch(
+  agentRemoveCommand('remove', false),
+  agentRemoveCommand('rm', true),
+  agentRemoveCommand('delete', true),
 );
 
-const agentCallersListSubCmd = command(
-  'list',
-  object({
-    action: constant('agent-callers-list' as const),
-    ...sharedFlags,
-    agentId: argument(string({ metavar: 'AGENT_ID' })),
-  }),
-  {
-    brief: message`Show the agent's allowed-callers list.`,
-  },
+function agentCallersListCommand(name: 'list' | 'ls', alias: boolean) {
+  return command(
+    name,
+    object({
+      action: constant('agent-callers-list' as const),
+      ...sharedFlags,
+      agentId: argument(string({ metavar: 'AGENT_ID' })),
+    }),
+    {
+      brief: message`Show the agent's allowed-callers list. (alias: \`ls\`)`,
+      ...(alias ? { hidden: 'help' as const } : {}),
+    },
+  );
+}
+
+const agentCallersListSubCmd = longestMatch(
+  agentCallersListCommand('list', false),
+  agentCallersListCommand('ls', true),
 );
 
 const agentCallersAddSubCmd = command(
@@ -94,18 +126,26 @@ const agentCallersAddSubCmd = command(
   },
 );
 
-const agentCallersRemoveSubCmd = command(
-  'remove',
-  object({
-    action: constant('agent-callers-remove' as const),
-    ...sharedFlags,
-    agentId: argument(string({ metavar: 'AGENT_ID' })),
-    principal: argument(string({ metavar: 'PRINCIPAL' })),
-  }),
-  {
-    brief: message`Remove a principal from the agent's allowed-callers list.`,
-    description: message`Calls DELETE /admin-api/agents/<AGENT_ID>/callers?principal=<PRINCIPAL>. Hot-reloaded.`,
-  },
+function agentCallersRemoveCommand(name: 'remove' | 'rm', alias: boolean) {
+  return command(
+    name,
+    object({
+      action: constant('agent-callers-remove' as const),
+      ...sharedFlags,
+      agentId: argument(string({ metavar: 'AGENT_ID' })),
+      principal: argument(string({ metavar: 'PRINCIPAL' })),
+    }),
+    {
+      brief: message`Remove a principal from the agent's allowed-callers list. (alias: \`rm\`)`,
+      description: message`Calls DELETE /admin-api/agents/<AGENT_ID>/callers?principal=<PRINCIPAL>. Hot-reloaded.`,
+      ...(alias ? { hidden: 'help' as const } : {}),
+    },
+  );
+}
+
+const agentCallersRemoveSubCmd = longestMatch(
+  agentCallersRemoveCommand('remove', false),
+  agentCallersRemoveCommand('rm', true),
 );
 
 const agentCallersSubCmd = command(
@@ -118,10 +158,10 @@ const agentCallersSubCmd = command(
 
 export const agentCmd = command(
   'agent',
-  longestMatch(agentRegisterCmd, agentListSubCmd, agentDeleteSubCmd, agentCallersSubCmd),
+  longestMatch(agentRegisterCmd, agentListSubCmd, agentRemoveSubCmd, agentCallersSubCmd),
   {
     brief: message`Manage agent registrations and their allowed callers.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`delete\`, \`callers {list,add,remove}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
     hidden: 'usage',
   },
 );
@@ -219,8 +259,8 @@ export const revokeClientCmd = command(
     target: argument(string({ metavar: 'CLIENT_ID_OR_NAME' })),
   }),
   {
-    brief: message`[deprecated] Use \`agent delete\`.`,
-    description: message`Deprecated alias for \`vicoop-client agent delete\`. Hard-deletes the agent (renamed from revoke). Will be removed in a future release.`,
+    brief: message`[deprecated] Use \`agent remove\`.`,
+    description: message`Deprecated alias for \`vicoop-client agent remove\` (also accepts \`rm\` / \`delete\`). Hard-deletes the agent (renamed from revoke). Will be removed in a future release.`,
     hidden: 'help',
   },
 );
@@ -645,7 +685,7 @@ export async function runListClients(args: ListClientsArgs): Promise<number> {
 }
 
 export async function runRevokeClient(args: RevokeClientArgs): Promise<number> {
-  warnDeprecated('revoke-client', 'agent delete');
+  warnDeprecated('revoke-client', 'agent remove');
   const session = resolveSession(args);
   if ('error' in session) {
     process.stderr.write(`${session.error}\n`);
