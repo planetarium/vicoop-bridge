@@ -1182,7 +1182,6 @@ export function createClaudeBackend(
           task.taskId,
           task.message.parts,
           task.message.metadata,
-          openaiCompat,
         );
       }
 

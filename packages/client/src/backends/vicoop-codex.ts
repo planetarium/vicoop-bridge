@@ -7,11 +7,13 @@ import {
 import type { Backend } from '../backend.js';
 import { createLogger, type Logger } from '../logger.js';
 import {
+  chatHistoryFromMessages,
+  collectSystemFromMessages,
   dumpOpenAICompatTaskWire,
-  parseOpenAICompatMetadata,
+  parseOpenAICompatEnvelope,
   type OpenAICompatHistoryEntry,
   type OpenAICompatMessageContent,
-  type OpenAICompatMetadata,
+  type OpenAICompatRequestEnvelope,
 } from './openai-compat.js';
 import {
   buildOpenAICompatResponseMetadata,
@@ -61,14 +63,18 @@ export interface VicoopCodexBackendOptions {
 }
 
 // `vicoop-codex call` body shape — only the fields this backend actually
-// emits. The openai-compat A2A extension defines `system` / `tools` /
-// `tool_choice` / `chat_history`, of which `system` and
-// `chat_history` fold into `messages`; the remaining two ride out
-// verbatim. Everything else (model, reasoning_effort, parallel_tool_calls,
-// the Group B / Group C parameters from the call command's input doc) is
-// intentionally not on this shape because no input surface we currently
-// read carries them. The binary applies its own defaults.
+// emits. The openai-compat A2A extension envelope (oai2a2a#80) carries a
+// full OpenAI Chat Completions request body; the bridge forwards `model`
+// (so the gateway-resolved model id reaches the CLI rather than the CLI's
+// own DEFAULT_MODEL), the assembled `messages[]` (envelope's system +
+// prior turns + the trailing user content flattened from A2A parts),
+// `tools`, and `tool_choice`. Everything else (reasoning_effort,
+// parallel_tool_calls, the Group B / Group C parameters from the call
+// command's input doc) is intentionally not on this shape because no
+// input surface we currently read carries them. The binary applies its
+// own defaults.
 export interface VicoopCodexCallBody {
+  model?: string;
   messages: ChatCompletionMessage[];
   tools?: unknown[];
   tool_choice?: unknown;
@@ -253,9 +259,11 @@ function openAIMessageContentToString(
 
 // Assemble the full `messages` array for the call body. Order, per the
 // doc's "Per-role message JSON examples" section:
-//   1. system (from openai-compat.system; one entry)
+//   1. system (concatenated from envelope's `messages[]` system/developer
+//      entries; one entry)
 //   2. chat_history entries (prior user / assistant text turns + tool
-//      round-trips) mapped 1:1 to OpenAI Chat Completions messages
+//      round-trips, derived from envelope's `messages[]` minus the
+//      trailing user) mapped 1:1 to OpenAI Chat Completions messages
 //   3. current user turn (flattened from A2A parts)
 //
 // The user turn comes last so the model sees prior context before the
@@ -264,15 +272,16 @@ function openAIMessageContentToString(
 // is omitted — the chat_history's last entry is the tool result the
 // model should respond to.
 export function buildMessages(
-  meta: OpenAICompatMetadata | null,
+  system: string | undefined,
+  chatHistory: OpenAICompatHistoryEntry[] | null,
   userContent: string | null,
 ): ChatCompletionMessage[] {
   const messages: ChatCompletionMessage[] = [];
-  if (meta?.system) {
-    messages.push({ role: 'system', content: meta.system });
+  if (system) {
+    messages.push({ role: 'system', content: system });
   }
-  if (meta?.chat_history) {
-    for (const m of historyToChatCompletionMessages(meta.chat_history)) {
+  if (chatHistory) {
+    for (const m of historyToChatCompletionMessages(chatHistory)) {
       messages.push(m);
     }
   }
@@ -282,23 +291,32 @@ export function buildMessages(
   return messages;
 }
 
-// Assemble the call body from the existing openai-compat A2A extension:
-//   - `tools` / `tool_choice` (read by the existing `parseOpenAICompatMetadata`)
-//   - the assembled `messages` array (from `system` + `chat_history`
-//     + current user turn — the other two fields of the extension)
+// Assemble the call body from the openai-compat envelope. Forwards:
+//   - `model`: the gateway-resolved model id so the CLI dispatches to the
+//     caller's selection rather than the binary's DEFAULT_MODEL (#302).
+//   - `tools` / `tool_choice`: verbatim off the envelope.
+//   - `messages`: the pre-assembled array (system + chat_history + current
+//     user turn).
 //
-// Nothing else is forwarded. The openai-compat A2A extension only defines
-// those four fields, and we read no other A2A or operator-side input on
-// behalf of this backend. `model`, `reasoning_effort`, `parallel_tool_calls`,
+// Nothing else is forwarded. `reasoning_effort`, `parallel_tool_calls`,
 // and every Group B / Group C parameter from the call command's input doc
 // are left unset — the vicoop-codex binary applies its own defaults.
 export function buildCallBody(
-  meta: OpenAICompatMetadata | null,
+  envelope: OpenAICompatRequestEnvelope | null,
   messages: ChatCompletionMessage[],
 ): VicoopCodexCallBody {
   const body: VicoopCodexCallBody = { messages };
-  if (meta?.tools) body.tools = meta.tools;
-  if (meta?.tool_choice !== undefined) body.tool_choice = meta.tool_choice;
+  if (envelope) {
+    if (typeof envelope.model === 'string' && envelope.model.length > 0) {
+      body.model = envelope.model;
+    }
+    if (Array.isArray(envelope.tools) && envelope.tools.length > 0) {
+      body.tools = envelope.tools;
+    }
+    if (envelope.tool_choice !== undefined && envelope.tool_choice !== null) {
+      body.tool_choice = envelope.tool_choice;
+    }
+  }
   return body;
 }
 
@@ -612,29 +630,32 @@ export function createVicoopCodexBackend(
         return;
       }
 
-      // Use the existing openai-compat A2A extension reader (claude.ts).
-      // It returns the 4-field schema { system, tools, tool_choice,
-      // chat_history } — the canonical surface every backend in this
-      // package already speaks. We do NOT define additional reader fields
-      // here: extending the extension schema unilaterally would risk
-      // breaking the contract other backends rely on.
-      const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+      // Envelope-direct (#302): read the full inbound OpenAI Chat Completions
+      // request body off `metadata[URI].chat_completions_request` and drive
+      // the call body from the envelope's fields (`model`, `messages[]`,
+      // `tools`, `tool_choice`) instead of the legacy decomposed view.
+      const envelope = parseOpenAICompatEnvelope(task.message.metadata);
       if (openaiCompatTrace) {
         dumpOpenAICompatTaskWire(
           'vicoop-codex',
           task.taskId,
           task.message.parts,
           task.message.metadata,
-          openaiCompat,
         );
       }
+
+      const system = envelope ? collectSystemFromMessages(envelope.messages) : undefined;
+      const chatHistory =
+        envelope && Array.isArray(envelope.messages)
+          ? chatHistoryFromMessages(envelope.messages)
+          : null;
 
       const userContent = flattenA2AUserContent(task.message.parts);
       // Tool-continuation edge case (openai-compat spec): A2A parts is the
       // placeholder `[{text:""}]` and the conversation lives in
       // chat_history. Skip the empty_prompt check when chat_history will
       // supply the user-side content via the prior-turns sequence.
-      const hasHistory = (openaiCompat?.chat_history?.length ?? 0) > 0;
+      const hasHistory = (chatHistory?.length ?? 0) > 0;
       if (userContent === null && !hasHistory) {
         emit({
           type: 'task.fail',
@@ -647,8 +668,8 @@ export function createVicoopCodexBackend(
         return;
       }
 
-      const messages = buildMessages(openaiCompat, userContent);
-      const body = buildCallBody(openaiCompat, messages);
+      const messages = buildMessages(system, chatHistory, userContent);
+      const body = buildCallBody(envelope, messages);
       let serialized: string;
       try {
         serialized = JSON.stringify(body);

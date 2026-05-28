@@ -1421,7 +1421,6 @@ export function createOpenclawBackend(
           task.taskId,
           task.message.parts,
           task.message.metadata,
-          openaiCompat,
         );
       }
       if (openaiCompat) {

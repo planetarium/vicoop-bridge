@@ -1010,7 +1010,6 @@ export function createCodexBackend(
             task.taskId,
             task.message.parts,
             task.message.metadata,
-            openaiCompat,
           );
         }
         const dynamicTools =

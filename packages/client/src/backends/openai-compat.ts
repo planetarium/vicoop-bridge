@@ -166,6 +166,33 @@ export function callerToolDispatchActive(meta: OpenAICompatMetadata | null): boo
   return meta.tool_choice !== 'none';
 }
 
+// Extract the openai-compat extension's request envelope verbatim. Reads
+// `metadata[OPENAI_COMPAT_EXTENSION_URI].chat_completions_request` (the
+// symmetric envelope contract — oai2a2a#80 — places the full inbound
+// OpenAI Chat Completions request body there) and returns it without
+// decomposition.
+//
+// This is the envelope-direct entry point used by backends migrating off
+// `parseOpenAICompatMetadata`'s decomposed view (#302). Backends consume
+// the envelope's fields directly (`model`, `tools`, `tool_choice`,
+// `messages[]`) and reuse the exported projection helpers
+// (`collectSystemFromMessages`, `chatHistoryFromMessages`) to derive the
+// system text and the multi-turn replay block.
+//
+// Returns null when the envelope key is absent or malformed so callers
+// can short-circuit before touching projection helpers.
+export function parseOpenAICompatEnvelope(
+  metadata: Record<string, unknown> | undefined,
+): OpenAICompatRequestEnvelope | null {
+  if (!metadata) return null;
+  const raw = metadata[OPENAI_COMPAT_EXTENSION_URI];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const env = r.chat_completions_request;
+  if (!env || typeof env !== 'object' || Array.isArray(env)) return null;
+  return env as OpenAICompatRequestEnvelope;
+}
+
 // Extract and shape-check the openai-compat extension metadata. Reads the
 // `chat_completions_request` envelope (the symmetric envelope contract —
 // oai2a2a#80 — places the full inbound OpenAI Chat Completions request
@@ -315,7 +342,7 @@ function parseLegacyChatHistory(raw: unknown[]): OpenAICompatHistoryEntry[] | nu
 // prompts). Non-text parts (image_url etc.) in a system message are
 // silently dropped — system channels are text-only on every supported
 // backend.
-function collectSystemFromMessages(messages: unknown): string | undefined {
+export function collectSystemFromMessages(messages: unknown): string | undefined {
   if (!Array.isArray(messages)) return undefined;
   const parts: string[] = [];
   for (const entry of messages) {
@@ -354,7 +381,7 @@ function collectSystemFromMessages(messages: unknown): string | undefined {
 // Returns null when the projection is empty (e.g. a single-turn
 // trailing-user-only request) so callers can omit history-replay code
 // paths cleanly.
-function chatHistoryFromMessages(
+export function chatHistoryFromMessages(
   messages: unknown[],
 ): OpenAICompatHistoryEntry[] | null {
   // Find the index of the trailing user turn. Per spec it is split into
@@ -620,9 +647,14 @@ export function dumpOpenAICompatTaskWire(
   taskId: string,
   parts: readonly Part[] | undefined,
   metadata: Record<string, unknown> | undefined,
-  parsed: OpenAICompatMetadata | null,
 ): void {
   try {
+    // Derive the summary view from metadata in one place so backends never
+    // pass a parsed projection — the parser+envelope helpers already cover
+    // every shape (envelope contract + legacy decomposed) the dump cares
+    // about. Keeps the trace one-line shape stable across backend migration.
+    const parsed = parseOpenAICompatMetadata(metadata);
+    const envelope = parseOpenAICompatEnvelope(metadata);
     const partsSummary = (parts ?? []).map((p) => {
       if (p.kind === 'text') return { kind: 'text', len: p.text.length };
       if (p.kind === 'file') return { kind: 'file', mime: p.file.mimeType };
@@ -635,6 +667,10 @@ export function dumpOpenAICompatTaskWire(
           tools: parsed.tools?.length ?? 0,
           tool_choice: parsed.tool_choice,
           hist: parsed.chat_history?.length ?? 0,
+          // `model` is envelope-only — the legacy decomposed shape never
+          // carried it, so it stays `undefined` for legacy-shape traces.
+          model:
+            envelope && typeof envelope.model === 'string' ? envelope.model : undefined,
         }
       : null;
     console.error(

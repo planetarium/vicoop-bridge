@@ -252,17 +252,15 @@ test('historyToChatCompletionMessages: prior user/assistant text turns round-tri
 
 test('buildMessages: ordering — system → history → user', () => {
   const msgs = buildMessages(
-    {
-      system: 'be concise',
-      chat_history: [
-        {
-          role: 'assistant',
-          content: null,
-          tool_calls: [{ id: 'c1', function: { name: 'x', arguments: '{}' } }],
-        },
-        { role: 'tool', tool_call_id: 'c1', content: 'result' },
-      ],
-    },
+    'be concise',
+    [
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'c1', function: { name: 'x', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'c1', content: 'result' },
+    ],
     'current ask',
   );
   assert.deepEqual(
@@ -294,24 +292,22 @@ test('buildMessages: multi-turn tool-loop scenario from PR #289 keeps opening us
   // be at index 1 (right after system), and the trailing user MUST be
   // last, regardless of how many tool round-trips sit between them.
   const msgs = buildMessages(
-    {
-      system: 'be concise',
-      chat_history: [
-        { role: 'user', content: 'list workflows then run X' },
-        {
-          role: 'assistant',
-          content: null,
-          tool_calls: [{ id: 'c1', function: { name: 'list_workflows', arguments: '{}' } }],
-        },
-        { role: 'tool', tool_call_id: 'c1', content: '[…]' },
-        {
-          role: 'assistant',
-          content: null,
-          tool_calls: [{ id: 'c2', function: { name: 'execute', arguments: '{}' } }],
-        },
-        { role: 'tool', tool_call_id: 'c2', content: 'started' },
-      ],
-    },
+    'be concise',
+    [
+      { role: 'user', content: 'list workflows then run X' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'c1', function: { name: 'list_workflows', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'c1', content: '[…]' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'c2', function: { name: 'execute', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'c2', content: 'started' },
+    ],
     'how is it going?',
   );
   assert.deepEqual(
@@ -331,17 +327,16 @@ test('buildMessages: tool-continuation (null userContent) skips trailing user', 
   // placeholder, the caller passes null userContent and chat_history
   // carries the full conversation including the trailing tool result.
   const msgs = buildMessages(
-    {
-      chat_history: [
-        { role: 'user', content: 'kick off' },
-        {
-          role: 'assistant',
-          content: null,
-          tool_calls: [{ id: 'c1', function: { name: 'x', arguments: '{}' } }],
-        },
-        { role: 'tool', tool_call_id: 'c1', content: 'result' },
-      ],
-    },
+    undefined,
+    [
+      { role: 'user', content: 'kick off' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'c1', function: { name: 'x', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'c1', content: 'result' },
+    ],
     null,
   );
   assert.deepEqual(
@@ -351,36 +346,42 @@ test('buildMessages: tool-continuation (null userContent) skips trailing user', 
 });
 
 test('buildMessages: no metadata still emits a user message', () => {
-  const msgs = buildMessages(null, 'hi');
+  const msgs = buildMessages(undefined, null, 'hi');
   assert.deepEqual(msgs, [{ role: 'user', content: 'hi' }]);
 });
 
-test('buildCallBody: forwards only tools / tool_choice from the existing 4-field schema', () => {
+test('buildCallBody: forwards model / tools / tool_choice from the envelope', () => {
   const body = buildCallBody(
     {
-      system: 'sys',
+      model: 'gpt-5.4',
       tools: [{ type: 'function', function: { name: 'x' } }],
       tool_choice: 'auto',
-      chat_history: [
-        {
-          role: 'assistant',
-          content: null,
-          tool_calls: [{ id: 'c1', function: { name: 'x', arguments: '{}' } }],
-        },
-        { role: 'tool', tool_call_id: 'c1', content: 'r' },
-      ],
+      messages: [],
     },
     [{ role: 'user', content: 'q' }],
   );
+  assert.equal(body.model, 'gpt-5.4');
   assert.deepEqual(body.tools, [{ type: 'function', function: { name: 'x' } }]);
   assert.equal(body.tool_choice, 'auto');
   assert.deepEqual(body.messages, [{ role: 'user', content: 'q' }]);
-  // Nothing else lands on the body — no model, no reasoning_effort, no
-  // Group B / Group C fields.
-  assert.equal(Object.keys(body).sort().join(','), 'messages,tool_choice,tools');
+  // Nothing else lands on the body — no reasoning_effort, no Group B /
+  // Group C fields.
+  assert.equal(
+    Object.keys(body).sort().join(','),
+    'messages,model,tool_choice,tools',
+  );
 });
 
-test('buildCallBody: no metadata yields messages-only body', () => {
+test('buildCallBody: envelope without model omits the model field', () => {
+  const body = buildCallBody(
+    { tools: [{ type: 'function', function: { name: 'x' } }], messages: [] },
+    [{ role: 'user', content: 'q' }],
+  );
+  assert.equal(body.model, undefined);
+  assert.ok(body.tools);
+});
+
+test('buildCallBody: no envelope yields messages-only body', () => {
   const body = buildCallBody(null, [{ role: 'user', content: 'q' }]);
   assert.deepEqual(body, { messages: [{ role: 'user', content: 'q' }] });
 });
@@ -664,7 +665,7 @@ test('handle: tool_calls response → no data artifact; tool_calls only on termi
   assert.equal(fn.arguments, '{"path":"."}');
 });
 
-test('handle: stdin body carries only system/tools/tool_choice/history-derived messages', async () => {
+test('handle: stdin body carries envelope-derived model/messages/tools/tool_choice', async () => {
   const task = makeTask({
     message: {
       role: 'user',
@@ -672,30 +673,30 @@ test('handle: stdin body carries only system/tools/tool_choice/history-derived m
       parts: [{ kind: 'text', text: 'current question' }],
       metadata: {
         [OPENAI_COMPAT_EXTENSION_URI]: {
-          // The 4-field schema only.
-          system: 'reply in korean',
-          tools: [{ type: 'function', function: { name: 'get_weather' } }],
-          tool_choice: { type: 'function', function: { name: 'get_weather' } },
-          chat_history: [
-            {
-              role: 'assistant',
-              content: null,
-              tool_calls: [
-                {
-                  id: 'call_1',
-                  type: 'function',
-                  function: { name: 'get_weather', arguments: '{"city":"Seoul"}' },
-                },
-              ],
-            },
-            { role: 'tool', tool_call_id: 'call_1', content: '{"temp":13}' },
-          ],
-          // Unknown extension keys must NOT reach the call body — they
-          // aren't part of the openai-compat 4-field schema.
-          model: 'gpt-5.5',
-          reasoning_effort: 'high',
-          temperature: 0.7,
-          max_tokens: 200,
+          chat_completions_request: {
+            model: 'gpt-5.5',
+            messages: [
+              { role: 'system', content: 'reply in korean' },
+              {
+                role: 'assistant',
+                content: null,
+                tool_calls: [
+                  {
+                    id: 'call_1',
+                    type: 'function',
+                    function: { name: 'get_weather', arguments: '{"city":"Seoul"}' },
+                  },
+                ],
+              },
+              { role: 'tool', tool_call_id: 'call_1', content: '{"temp":13}' },
+              // Trailing user — split into A2A parts; chatHistoryFromMessages
+              // drops this from the replay so the test's A2A `parts` text
+              // becomes the trailing user instead.
+              { role: 'user', content: 'current question' },
+            ],
+            tools: [{ type: 'function', function: { name: 'get_weather' } }],
+            tool_choice: { type: 'function', function: { name: 'get_weather' } },
+          },
         },
       },
     },
@@ -728,9 +729,11 @@ test('handle: stdin body carries only system/tools/tool_choice/history-derived m
       messages.map((m) => m.role),
       ['system', 'assistant', 'tool', 'user'],
     );
-    // Only the existing 4-field schema's `tools` / `tool_choice` are
-    // forwarded; the spurious model/reasoning_effort/temperature/max_tokens
-    // entries are dropped at the metadata reader.
+    // Envelope contract: model + tools + tool_choice forward verbatim.
+    // Group B / Group C fields (reasoning_effort, temperature, max_tokens
+    // etc.) are intentionally not on the call body shape — the binary
+    // applies its own defaults.
+    assert.equal(body.model, 'gpt-5.5');
     assert.deepEqual(body.tools, [
       { type: 'function', function: { name: 'get_weather' } },
     ]);
@@ -738,7 +741,6 @@ test('handle: stdin body carries only system/tools/tool_choice/history-derived m
       type: 'function',
       function: { name: 'get_weather' },
     });
-    assert.equal(body.model, undefined);
     assert.equal(body.reasoning_effort, undefined);
     assert.equal(body.temperature, undefined);
     assert.equal(body.max_tokens, undefined);

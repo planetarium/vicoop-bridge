@@ -2984,13 +2984,11 @@ test('dumpOpenAICompatTaskWire: emits header + tools + parts + chat_history sect
         chat_history: SAMPLE_HISTORY,
       },
     };
-    const parsed = parseOpenAICompatMetadata(metadata);
     dumpOpenAICompatTaskWire(
       'claude',
       'task-1',
       [{ kind: 'text', text: 'hello' }],
       metadata,
-      parsed,
     );
   } finally {
     console.error = origErr;
@@ -3027,7 +3025,6 @@ test('dumpOpenAICompatTaskWire: parts file entry shows shape without bytes', () 
       't',
       [{ kind: 'file', file: { name: 'i.png', mimeType: 'image/png', bytes: 'AAAA' } }],
       undefined,
-      null,
     );
   } finally {
     console.error = origErr;
@@ -3047,7 +3044,7 @@ test('dumpOpenAICompatTaskWire: minimal case (no tools, no history, just parts h
     captured.push(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
   };
   try {
-    dumpOpenAICompatTaskWire('codex', 't', [{ kind: 'text', text: 'hi' }], undefined, null);
+    dumpOpenAICompatTaskWire('codex', 't', [{ kind: 'text', text: 'hi' }], undefined);
   } finally {
     console.error = origErr;
   }
