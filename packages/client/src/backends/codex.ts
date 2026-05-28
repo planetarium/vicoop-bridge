@@ -357,7 +357,7 @@ export function parseCodexTokenUsageForOpenAICompat(raw: unknown): OpenAICompatU
 }
 
 // Assemble a complete OpenAI ChatCompletion envelope for the openai-compat/v1
-// echo-only contract. The codec on the gateway unwraps this verbatim, so we
+// envelope contract. The codec on the gateway unwraps this verbatim, so we
 // own every required field — id / object / created / model / choices /
 // finish_reason / logprobs / usage. `id` is synthesized from the A2A task id
 // (codex's app-server doesn't expose a stable response id we can forward);
@@ -365,7 +365,7 @@ export function parseCodexTokenUsageForOpenAICompat(raw: unknown): OpenAICompatU
 // tokenUsage.
 //
 // Spec: extensions/openai-compat/v1/README.md#response-metadata-payload-agent--gateway
-export function buildCodexChatCompletionEcho(args: {
+export function buildCodexChatCompletionEnvelope(args: {
   taskId: string;
   model: string | undefined;
   content: string | null;
@@ -1343,9 +1343,9 @@ export function createCodexBackend(
           let capturedToolCall = false;
           // OpenAI Chat Completions tool_calls accumulated from codex's
           // server-initiated `item/tool/call` events. Surfaced to the gateway
-          // via the terminal `chat_completion` echo on
+          // via the terminal `chat_completion` envelope on
           // `status.message.metadata[OPENAI_COMPAT_EXTENSION_URI]` per the
-          // openai-compat/v1 echo-only contract (oai2a2a#80).
+          // openai-compat/v1 envelope contract (oai2a2a#80).
           const capturedToolCalls: Array<{
             id: string;
             type: 'function';
@@ -1367,8 +1367,8 @@ export function createCodexBackend(
               // OpenAI Chat Completions requires `arguments` as a JSON-encoded
               // string; codex hands us a parsed JSON value, so we stringify
               // here for spec compliance. The captured call rides out via the
-              // terminal chat_completion echo (no data-part artifact under the
-              // echo-only contract — oai2a2a#80).
+              // terminal chat_completion envelope (no data-part artifact under
+              // the envelope contract — oai2a2a#80).
               const argsString =
                 typeof p.arguments === 'string'
                   ? p.arguments
@@ -1693,7 +1693,7 @@ export function createCodexBackend(
           // preamble and not re-stamped on `status.message.parts`. Stamping
           // it violates A2A's "Messages SHOULD NOT be used to deliver task
           // outputs"; the model's final answer in that turn IS the
-          // function_call which now rides via the chat_completion echo
+          // function_call which now rides via the chat_completion envelope
           // (oai2a2a#80).
           const parts: Part[] = !capturedToolCall && completeText
             ? [{ kind: 'text', text: completeText }]
@@ -1711,21 +1711,21 @@ export function createCodexBackend(
             });
           }
 
-          // Echo-only response contract (oai2a2a#80): emit a complete OpenAI
+          // Envelope response contract (oai2a2a#80): emit a complete OpenAI
           // ChatCompletion envelope under
           // `metadata[OPENAI_COMPAT_EXTENSION_URI].chat_completion` on the
           // final A2A message of this turn. The codec unwraps the envelope
           // verbatim, so we own id / created / model / choices / usage. The
           // legacy top-level `usage` field is also emitted for back-compat
-          // with codecs that read it as a fallback when the echo lacks
+          // with codecs that read it as a fallback when the envelope lacks
           // `usage`. When the openai-compat extension wasn't on the request
-          // at all we skip the echo (no advertising consumer to feed it).
+          // at all we skip the envelope (no advertising consumer to feed it).
           const finishReason: 'tool_calls' | 'stop' =
             capturedToolCalls.length > 0 ? 'tool_calls' : 'stop';
           const assistantContent = capturedToolCalls.length > 0 ? null : completeText;
           const finalUsageSnapshot: OpenAICompatUsage | null = finalUsage;
-          const echo = openaiCompat
-            ? buildCodexChatCompletionEcho({
+          const envelope = openaiCompat
+            ? buildCodexChatCompletionEnvelope({
                 taskId: task.taskId,
                 model: finalUsageSnapshot?.model,
                 content: assistantContent,
@@ -1735,9 +1735,9 @@ export function createCodexBackend(
               })
             : undefined;
 
-          const messageMetadata = buildOpenAICompatResponseMetadata(echo, finalUsage);
-          // When parts is empty but we have echo/usage to convey, still emit
-          // the message frame so the metadata reaches the gateway.
+          const messageMetadata = buildOpenAICompatResponseMetadata(envelope, finalUsage);
+          // When parts is empty but we have envelope/usage to convey, still
+          // emit the message frame so the metadata reaches the gateway.
           const hasMessage = parts.length > 0 || messageMetadata !== undefined;
           emit({
             type: 'task.complete',

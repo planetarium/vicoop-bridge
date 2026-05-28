@@ -1308,15 +1308,15 @@ test('turn/start RPC error surfaces task.fail with turn_failed', async () => {
   assert.equal(last?.type === 'task.fail' && last.error.code, 'turn_failed');
 });
 
-// Native function-call surface (#209) + echo-only response contract
+// Native function-call surface (#209) + envelope response contract
 // (oai2a2a#80): codex sends `item/tool/call` as a server request when the
 // model invokes a caller-supplied dynamicTool. The bridge captures it,
-// surfaces it on the terminal `chat_completion` echo metadata, and
+// surfaces it on the terminal `chat_completion` envelope metadata, and
 // interrupts the turn so codex unwinds — the caller delivers the result on
 // the next A2A turn via `chat_history` (existing path). A2A surfaces the
 // task as `completed` (not `canceled`) so OpenAI Chat Completions callers
 // see `finish_reason: "tool_calls"` semantics.
-test('openai-compat dynamicTools: item/tool/call → chat_completion echo on terminal status + completed task (#209, oai2a2a#80)', async () => {
+test('openai-compat dynamicTools: item/tool/call → chat_completion envelope on terminal status + completed task (#209, oai2a2a#80)', async () => {
   const fake = makeFakeSpawn(() => ({
     onLine(frame, child) {
       const id = (frame as { id?: number | string }).id;
@@ -1411,7 +1411,7 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion echo on ter
     NEVER,
   );
 
-  // Echo-only contract (oai2a2a#80): no data-part `tool_calls` artifact.
+  // Envelope contract (oai2a2a#80): no data-part `tool_calls` artifact.
   // The model's function_call is delivered exclusively on the terminal
   // status message metadata as `chat_completion.choices[0].message.tool_calls`.
   const dataArtifacts = frames.filter(
@@ -1422,7 +1422,7 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion echo on ter
   assert.equal(
     dataArtifacts.length,
     0,
-    'no data-part tool_calls artifact under the echo-only contract',
+    'no data-part tool_calls artifact under the envelope contract',
   );
 
   // Despite the underlying turn ending in `interrupted`, the A2A task must
@@ -1432,7 +1432,7 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion echo on ter
   assert.ok(complete && complete.type === 'task.complete');
   assert.equal(complete.status.state, 'completed');
 
-  // Echo verification: the terminal status message metadata carries the
+  // Envelope verification: the terminal status message metadata carries the
   // complete OpenAI ChatCompletion envelope with tool_calls.
   if (complete && complete.type === 'task.complete') {
     const metadata = complete.status.message?.metadata as
@@ -1440,13 +1440,13 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion echo on ter
       | undefined;
     const ext = metadata?.[OPENAI_COMPAT_EXTENSION_URI];
     assert.ok(ext, 'openai-compat metadata present on terminal message');
-    const echo = ext.chat_completion as Record<string, unknown> | undefined;
-    assert.ok(echo, 'chat_completion echo present');
-    assert.equal(typeof echo.id, 'string');
-    assert.equal(echo.object, 'chat.completion');
-    assert.equal(typeof echo.created, 'number');
-    assert.equal(typeof echo.model, 'string');
-    const choices = echo.choices as Array<Record<string, unknown>>;
+    const envelope = ext.chat_completion as Record<string, unknown> | undefined;
+    assert.ok(envelope, 'chat_completion envelope present');
+    assert.equal(typeof envelope.id, 'string');
+    assert.equal(envelope.object, 'chat.completion');
+    assert.equal(typeof envelope.created, 'number');
+    assert.equal(typeof envelope.model, 'string');
+    const choices = envelope.choices as Array<Record<string, unknown>>;
     assert.equal(choices.length, 1);
     const choice = choices[0];
     assert.equal(choice.finish_reason, 'tool_calls');
@@ -1723,8 +1723,8 @@ test('dynamicTools handler is registered on every openai-compat turn (#209, #233
 
   // Turn 2: same contextId still does thread/start (no reuse under
   // openai-compat). The handler must register on the new thread id so the
-  // model's tool_call surfaces on the terminal chat_completion echo
-  // (echo-only contract, oai2a2a#80).
+  // model's tool_call surfaces on the terminal chat_completion envelope
+  // (envelope contract, oai2a2a#80).
   const { emit, frames } = collect();
   await backend.handle(
     assign('second', 'ctx-no-resume', {
@@ -1743,7 +1743,7 @@ test('dynamicTools handler is registered on every openai-compat turn (#209, #233
   assert.ok(complete && complete.type === 'task.complete');
   assert.equal(complete.status.state, 'completed');
 
-  // Echo verification: terminal status message metadata carries the
+  // Envelope verification: terminal status message metadata carries the
   // chat_completion envelope with tool_calls — no data-part artifact.
   const dataArtifacts = frames.filter(
     (f) =>
@@ -1757,9 +1757,9 @@ test('dynamicTools handler is registered on every openai-compat turn (#209, #233
       | undefined;
     const ext = metadata?.[OPENAI_COMPAT_EXTENSION_URI];
     assert.ok(ext, 'openai-compat metadata present on second turn terminal message');
-    const echo = ext.chat_completion as { choices?: Array<{ message?: { tool_calls?: unknown[] } }> } | undefined;
-    assert.ok(echo, 'chat_completion echo present on second turn');
-    const calls = echo.choices?.[0]?.message?.tool_calls;
+    const envelope = ext.chat_completion as { choices?: Array<{ message?: { tool_calls?: unknown[] } }> } | undefined;
+    assert.ok(envelope, 'chat_completion envelope present on second turn');
+    const calls = envelope.choices?.[0]?.message?.tool_calls;
     assert.ok(Array.isArray(calls) && calls.length === 1);
   }
 

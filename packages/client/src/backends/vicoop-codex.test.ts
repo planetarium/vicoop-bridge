@@ -410,7 +410,7 @@ test('parseChatCompletionUsage: missing primary counts yields null', () => {
   assert.equal(parseChatCompletionUsage({ prompt_tokens: 1 }, undefined), null);
 });
 
-test('buildResponseMetadata: chat_completion echo carries spec-required fields + normalized usage', () => {
+test('buildResponseMetadata: chat_completion envelope carries spec-required fields + normalized usage', () => {
   const response: ChatCompletionResponse = {
     id: 'chatcmpl-abc',
     object: 'chat.completion',
@@ -434,19 +434,19 @@ test('buildResponseMetadata: chat_completion echo carries spec-required fields +
   // Legacy top-level `usage` sibling for back-compat with v1-era codecs
   // that only read it; new codecs prefer `chat_completion.usage`.
   assert.ok(ext.usage);
-  const echo = ext.chat_completion as Record<string, unknown>;
-  assert.equal(echo.id, 'chatcmpl-abc');
-  assert.equal(echo.object, 'chat.completion');
-  assert.equal(echo.model, 'gpt-5.4');
-  assert.equal(echo.created, 1779177411);
+  const envelope = ext.chat_completion as Record<string, unknown>;
+  assert.equal(envelope.id, 'chatcmpl-abc');
+  assert.equal(envelope.object, 'chat.completion');
+  assert.equal(envelope.model, 'gpt-5.4');
+  assert.equal(envelope.created, 1779177411);
   // chat_completion.usage carries the normalized OpenAICompatUsage
   // (with the spec-mandated total === prompt + completion invariant)
   // — same value as the top-level sibling. Codec prefers this path.
-  assert.deepEqual(echo.usage, usage);
+  assert.deepEqual(envelope.usage, usage);
   // logprobs must be present on each choice per the spec (defaults to null
   // when the underlying runtime doesn't surface them — which vicoop-codex
   // never does today).
-  const choices = echo.choices as Array<Record<string, unknown>>;
+  const choices = envelope.choices as Array<Record<string, unknown>>;
   assert.equal(choices.length, 1);
   assert.equal(choices[0].logprobs, null);
   assert.equal(choices[0].finish_reason, 'stop');
@@ -469,12 +469,12 @@ test('buildResponseMetadata: synthesizes defensive defaults when upstream omits 
     string,
     Record<string, unknown>
   >;
-  const echo = (meta[OPENAI_COMPAT_EXTENSION_URI] as Record<string, unknown>)
+  const envelope = (meta[OPENAI_COMPAT_EXTENSION_URI] as Record<string, unknown>)
     .chat_completion as Record<string, unknown>;
-  assert.equal(echo.id, 'chatcmpl-vicoop-codex-task-fallback');
-  assert.equal(echo.object, 'chat.completion');
-  assert.equal(typeof echo.created, 'number');
-  assert.equal(echo.model, 'vicoop-codex');
+  assert.equal(envelope.id, 'chatcmpl-vicoop-codex-task-fallback');
+  assert.equal(envelope.object, 'chat.completion');
+  assert.equal(typeof envelope.created, 'number');
+  assert.equal(envelope.model, 'vicoop-codex');
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -554,23 +554,23 @@ test('handle: success path — text response → artifact + complete with metada
   ];
   // Legacy top-level `usage` for v1-era back-compat.
   assert.ok(ext.usage);
-  const echo = ext.chat_completion as Record<string, unknown>;
-  assert.equal(echo.id, 'chatcmpl-1');
-  assert.equal(echo.model, 'gpt-5.4');
-  // Echo carries `usage` natively (preferred by the codec); same numeric
-  // totals as the legacy sibling above.
-  const echoUsage = echo.usage as Record<string, number>;
-  assert.equal(echoUsage.prompt_tokens, 3);
-  assert.equal(echoUsage.completion_tokens, 1);
-  assert.equal(echoUsage.total_tokens, 4);
+  const envelope = ext.chat_completion as Record<string, unknown>;
+  assert.equal(envelope.id, 'chatcmpl-1');
+  assert.equal(envelope.model, 'gpt-5.4');
+  // The envelope carries `usage` natively (preferred by the codec); same
+  // numeric totals as the legacy sibling above.
+  const envelopeUsage = envelope.usage as Record<string, number>;
+  assert.equal(envelopeUsage.prompt_tokens, 3);
+  assert.equal(envelopeUsage.completion_tokens, 1);
+  assert.equal(envelopeUsage.total_tokens, 4);
   // Spec requires logprobs on each choice (null when not surfaced).
-  const choices = echo.choices as Array<Record<string, unknown>>;
+  const choices = envelope.choices as Array<Record<string, unknown>>;
   assert.equal(choices.length, 1);
   assert.equal(choices[0].logprobs, null);
   assert.equal(choices[0].finish_reason, 'stop');
 });
 
-test('handle: tool_calls response → no data artifact; tool_calls only on terminal chat_completion echo (echo-only contract, oai2a2a#80)', async () => {
+test('handle: tool_calls response → no data artifact; tool_calls only on terminal chat_completion envelope (envelope contract, oai2a2a#80)', async () => {
   const task = makeTask({
     metadata: {
       [OPENAI_COMPAT_EXTENSION_URI]: {
@@ -606,7 +606,7 @@ test('handle: tool_calls response → no data artifact; tool_calls only on termi
     child.emitStdout(JSON.stringify(response));
     child.finish(0);
   });
-  // Echo-only contract: no data-part `tool_calls` artifact. The legacy
+  // Envelope contract: no data-part `tool_calls` artifact. The legacy
   // `data` part shaped `{ "tool_calls": [...] }` is removed from this
   // extension — consumers ignore it, so emitting it would only confuse
   // non-OpenAI A2A inspectors.
@@ -618,7 +618,7 @@ test('handle: tool_calls response → no data artifact; tool_calls only on termi
   assert.equal(
     dataArtifacts.length,
     0,
-    'no data-part tool_calls artifact under the echo-only contract',
+    'no data-part tool_calls artifact under the envelope contract',
   );
   // No text artifact either when there's no text content to surface
   // (content: null on a tool_calls turn).
@@ -637,13 +637,13 @@ test('handle: tool_calls response → no data artifact; tool_calls only on termi
   // tool_calls envelope onto the message (A2A: "Messages SHOULD NOT be
   // used to deliver task outputs").
   assert.deepEqual(completeFrame.status.message!.parts, []);
-  // The chat_completion echo is the sole recovery wire for tool_calls.
+  // The chat_completion envelope is the sole recovery wire for tool_calls.
   const ext = (completeFrame.status.message!.metadata as Record<
     string,
     Record<string, unknown>
   >)[OPENAI_COMPAT_EXTENSION_URI];
-  const echo = ext.chat_completion as Record<string, unknown>;
-  const choices = echo.choices as Array<{
+  const envelope = ext.chat_completion as Record<string, unknown>;
+  const choices = envelope.choices as Array<{
     message: { role: string; content: unknown; tool_calls?: Array<Record<string, unknown>> };
     finish_reason: string;
     logprobs: unknown;

@@ -351,9 +351,9 @@ export function parseChatCompletionUsage(
   });
 }
 
-// Assemble the OpenAI ChatCompletion envelope echoed under
+// Assemble the OpenAI ChatCompletion envelope placed under
 // `metadata[OPENAI_COMPAT_EXTENSION_URI].chat_completion` on the terminal
-// A2A message, per the openai-compat/v1 echo-only contract (oai2a2a#80).
+// A2A message, per the openai-compat/v1 envelope contract (oai2a2a#80).
 // The codec on the gateway unwraps this verbatim, so we own every required
 // field — id / object / created / model / choices[*]{message, finish_reason,
 // logprobs} / usage.
@@ -374,7 +374,7 @@ export function parseChatCompletionUsage(
 //     `usage` field.
 //
 // Spec: extensions/openai-compat/v1/README.md#response-metadata-payload-agent--gateway
-export function buildChatCompletionEcho(
+export function buildChatCompletionEnvelope(
   response: ChatCompletionResponse,
   usage: OpenAICompatUsage | null,
   taskId: string,
@@ -410,24 +410,24 @@ export function buildChatCompletionEcho(
 }
 
 // Build the metadata payload spread onto the final A2A message under
-// `OPENAI_COMPAT_EXTENSION_URI`. Includes the chat_completion echo per
-// the echo-only contract (oai2a2a#80) plus a transitional top-level
+// `OPENAI_COMPAT_EXTENSION_URI`. Includes the chat_completion envelope per
+// the envelope contract (oai2a2a#80) plus a transitional top-level
 // `usage` sibling for back-compat with codecs that read it as a fallback
-// when the echo lacks `usage`. New codecs prefer `chat_completion.usage`;
-// the sibling exists so v1-era consumers that only read the top-level
-// field keep working during the transition.
+// when the envelope lacks `usage`. New codecs prefer
+// `chat_completion.usage`; the sibling exists so v1-era consumers that
+// only read the top-level field keep working during the transition.
 export function buildResponseMetadata(
   response: ChatCompletionResponse,
   usage: OpenAICompatUsage | null,
   taskId: string,
 ): Record<string, unknown> {
-  const echo = buildChatCompletionEcho(response, usage, taskId);
+  const envelope = buildChatCompletionEnvelope(response, usage, taskId);
   // `buildOpenAICompatResponseMetadata` returns `undefined` when both
-  // `echo` and `usage` are absent — for vicoop-codex we always have at
+  // `envelope` and `usage` are absent — for vicoop-codex we always have at
   // least the synthesized envelope, so the non-undefined branch is
   // guaranteed. Coerce here to keep the call-site type narrow.
-  return buildOpenAICompatResponseMetadata(echo, usage) ?? {
-    [OPENAI_COMPAT_EXTENSION_URI]: { chat_completion: echo },
+  return buildOpenAICompatResponseMetadata(envelope, usage) ?? {
+    [OPENAI_COMPAT_EXTENSION_URI]: { chat_completion: envelope },
   };
 }
 
@@ -762,8 +762,8 @@ export function createVicoopCodexBackend(
         : [];
       const finishReason = typeof choice?.finish_reason === 'string' ? choice.finish_reason : '';
 
-      // Echo-only contract (oai2a2a#80): tool_calls flow exclusively through
-      // the terminal `chat_completion` echo metadata — NOT as a data-part
+      // Envelope contract (oai2a2a#80): tool_calls flow exclusively through
+      // the terminal `chat_completion` envelope metadata — NOT as a data-part
       // artifact. The legacy `data` part shaped `{ "tool_calls": [...] }`
       // is removed from this extension; consumers ignore it. Text content
       // still rides as a text artifact so non-OpenAI A2A consumers
@@ -790,9 +790,9 @@ export function createVicoopCodexBackend(
       //     path so we don't double-stamp the tool_calls envelope onto the
       //     status message).
       //   - `metadata[OPENAI_COMPAT_EXTENSION_URI]`: usage + the full
-      //     chat_completion echo. Always emitted so the caller has access
-      //     to id / model / created / choices / finish_reason without
-      //     parsing the artifact.
+      //     chat_completion envelope. Always emitted so the caller has
+      //     access to id / model / created / choices / finish_reason
+      //     without parsing the artifact.
       //   - `extensions`: the OPENAI_COMPAT_EXTENSION_URI marker.
       const parts: Part[] =
         toolCalls.length === 0 && contentText ? [{ kind: 'text', text: contentText }] : [];
@@ -812,7 +812,7 @@ export function createVicoopCodexBackend(
         },
       });
       // finish_reason is informational; surfaced only via the metadata
-      // echo above. The A2A `task.complete` state is always `completed`
+      // envelope above. The A2A `task.complete` state is always `completed`
       // (incl. `finish_reason: "tool_calls"`) because the tool-call round
       // is a successful turn from the bridge's perspective — the next A2A
       // turn brings back the tool result via `chat_history`.
