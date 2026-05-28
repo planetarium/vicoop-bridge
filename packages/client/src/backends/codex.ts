@@ -1525,36 +1525,11 @@ export function createCodexBackend(
                         id?: string;
                         status?: string;
                         error?: { message?: string } | null;
-                        usage?: unknown;
                       };
-                      usage?: unknown;
                     }
                   | undefined;
                 const t = p?.turn;
                 if (activeTurnId && t?.id !== activeTurnId) return;
-                // Tool-call-only turns sometimes don't get a
-                // `thread/tokenUsage/updated` notification (or it arrives
-                // after `turn/completed`). Try to pull usage off the
-                // `turn/completed.turn.usage` payload as a fallback so the
-                // openai-compat/v1 envelope's strict usage MUST stays
-                // satisfied. We accept both shapes the app-server has used
-                // in practice: the wrapper `{ last: {...} }` or the inner
-                // `last`-shaped object directly.
-                if (!finalUsage && (t?.usage !== undefined || p?.usage !== undefined)) {
-                  const candidate = t?.usage ?? p?.usage;
-                  const direct = parseCodexTokenUsageForOpenAICompat(candidate);
-                  const wrapped = direct
-                    ? null
-                    : parseCodexTokenUsageForOpenAICompat({ last: candidate });
-                  const parsed = direct ?? wrapped;
-                  if (openaiCompatTrace) {
-                    console.error(
-                      `[openai-compat trace] codex turn.usage fallback raw=${JSON.stringify(candidate ?? null)} ` +
-                        `parsed=${JSON.stringify(parsed)}`,
-                    );
-                  }
-                  if (parsed) finalUsage = parsed;
-                }
                 if (t?.status === 'completed') {
                   finish({ status: 'completed', finalText });
                 } else if (t?.status === 'interrupted') {
