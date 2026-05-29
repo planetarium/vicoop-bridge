@@ -95,7 +95,7 @@ cd packages/client
 The WS registration auto-creates an `agent_policies` row with
 `allowed_callers = '{}'` (public). Two ways to populate it:
 
-- **`vicoop-client add-caller`** (Paths B/C below) — hot-reloads via
+- **`vicoop-client agent callers add`** (Paths B/C below) — hot-reloads via
   `registry.updateAllowedCallers`, no restart needed. Requires an
   owner-session bearer (issued via SIWE exchange or Google device flow).
 - **Raw SQL `UPDATE agent_policies SET allowed_callers = …`** (Path A
@@ -184,11 +184,11 @@ psql vicoop_bridge_dev -c \
 #     (`CLI` is just shorthand for the local-source invocation — see the
 #     callout below if you're working from a published bundle.)
 CLI="pnpm --filter @vicoop-bridge/client exec tsx src/cli.ts"
-$CLI login --bridge http://localhost:8787
+$CLI auth login --bridge http://localhost:8787
 
 # 5b. Add the caller principal — hot-reloads via registry.updateAllowedCallers,
 #     no client restart needed.
-$CLI add-caller echo-agent "google:sub:<YOUR_SUB>"
+$CLI agent callers add echo-agent "google:sub:<YOUR_SUB>"
 
 # 6. Call the agent with the issued Bearer
 TOKEN="vbc_caller_..."   # from step 3
@@ -285,7 +285,7 @@ echo "$OWNER_TOKEN"   # vbc_owner_...
 
 CLI="pnpm --filter @vicoop-bridge/client exec tsx src/cli.ts"
 VICOOP_BRIDGE=http://localhost:8787 VICOOP_OWNER_TOKEN="$OWNER_TOKEN" \
-  $CLI add-caller echo-agent \
+  $CLI agent callers add echo-agent \
   'eth:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266'
 
 # Call the agent with the caller-audience opaque token from step 3.
@@ -322,8 +322,8 @@ DATABASE_URL="postgres://$USER@localhost:5432/vicoop_bridge_dev" \
 - **`allowed_callers` edits via raw SQL don't hot-reload** — `registry.ts`
   caches the list in memory at WS registration. After a `psql` `UPDATE`
   (Path A), kill and re-run the echo client so it re-registers and the
-  registry re-reads the row. The `vicoop-client add-caller` /
-  `remove-caller` subcommands and the admin agent's `add_caller` tool
+  registry re-reads the row. The `vicoop-client agent callers add` /
+  `remove` subcommands and the admin agent's `add_caller` tool
   call `registry.updateAllowedCallers` and don't need a restart.
 - **Client `--server` URL must not include `/connect`** — client.ts appends it.
   `--server ws://localhost:8787/connect` results in `/connect/connect` and

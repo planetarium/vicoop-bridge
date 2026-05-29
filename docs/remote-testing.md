@@ -201,8 +201,8 @@ subject, so mutations on agents you own are authorized. Admin scope
 WALLET_PRINCIPAL=eth:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266   # lowercase
 
 # Deterministic CLI path:
-vicoop-client login --bridge "$BRIDGE_URL"   # one-time
-vicoop-client add-caller "$AGENT_ID" "$WALLET_PRINCIPAL"
+vicoop-client auth login --bridge "$BRIDGE_URL"   # one-time
+vicoop-client agent callers add "$AGENT_ID" "$WALLET_PRINCIPAL"
 
 # Or the natural-language admin agent (uses $OWNER_TOKEN, a vbc_owner_*
 # bearer obtained via /auth/siwe/exchange or device flow with
