@@ -2250,16 +2250,13 @@ export function createClaudeBackend(
       // ChatCompletion envelope under
       // `metadata[OPENAI_COMPAT_EXTENSION_URI].chat_completion` on the final
       // A2A message of this turn. The codec unwraps the envelope verbatim,
-      // so we own id / created / model / choices / usage. The legacy
-      // top-level `usage` field is also emitted (via the shared metadata
-      // builder) for back-compat with codecs that read it as a fallback
-      // when the envelope lacks `usage`. When the openai-compat extension
-      // wasn't on the request at all we skip the envelope (no advertising
-      // consumer to feed it) but still emit the bare `usage` payload when
-      // claude reported one — preserves the pre-envelope behaviour for
-      // plain claude tasks. Mirrors codex.ts's emit pattern via the shared
-      // `buildOpenAICompatResponseMetadata` helper so claude and codex
-      // cannot drift on the wire shape.
+      // so we own id / created / model / choices / usage. When the
+      // openai-compat extension wasn't on the request at all we skip the
+      // envelope (no advertising consumer to feed it) but still emit the
+      // bare `usage` payload when claude reported one — preserves the
+      // pre-envelope behaviour for plain claude tasks. Mirrors codex.ts's
+      // emit pattern via the shared `buildOpenAICompatResponseMetadata`
+      // helper so claude and codex cannot drift on the wire shape.
       const finishReason: 'tool_calls' | 'stop' =
         capturedToolCalls.length > 0 ? 'tool_calls' : 'stop';
       const assistantContent = capturedToolCalls.length > 0 ? null : completeText;

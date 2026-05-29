@@ -2920,11 +2920,12 @@ test('heartbeat: suppressed after signal.abort so canceled tasks do not look lik
 // ---------------------------------------------------------------------------
 // openai-compat extension
 //
-// The pure helpers (parseOpenAICompatMetadata, buildOpenAICompatSystemPrompt,
-// formatChatHistory, tryParseToolCallsEnvelope) live in claude.ts and are
-// covered by claude.test.ts — openclaw.ts imports them verbatim, so we only
-// test the openclaw-specific wiring here: chat.send.message composition with
-// the XML-wrapped contract blocks, envelope→data-part on session.message,
+// The pure helpers (parseOpenAICompatEnvelope, collectSystemFromMessages,
+// chatHistoryFromMessages, buildOpenAICompatSystemPrompt, formatChatHistory,
+// tryParseToolCallsEnvelope) live in openai-compat.ts and are covered by
+// claude.test.ts — openclaw.ts imports them verbatim, so we only test the
+// openclaw-specific wiring here: chat.send.message composition with the
+// XML-wrapped contract blocks, envelope→data-part on session.message,
 // non-streaming envelope on the terminal chat event, and the false-positive
 // defence when the extension is off.
 // ---------------------------------------------------------------------------
@@ -2961,12 +2962,43 @@ const OAI_SAMPLE_HISTORY: OpenAICompatHistoryEntry[] = [
   },
 ];
 
+// Shape the legacy decomposed test inputs into a `chat_completions_request`
+// envelope so the existing fixture style (a flat
+// `{ system, tools, tool_choice, chat_history, model }` map) keeps working
+// after the envelope-direct migration (#302). The helper folds `system`
+// into a leading system message, `chat_history` into the middle, and
+// appends a trailing user message matching the A2A `parts` text so the
+// backend's history projection (which excludes the trailing user) still
+// receives the caller's prompt through the A2A parts path.
 function makeOpenAICompatTask(
   taskId: string,
   text: string,
-  payload: Record<string, unknown>,
+  payload: {
+    system?: string;
+    tools?: unknown;
+    tool_choice?: unknown;
+    chat_history?: readonly unknown[];
+    model?: string;
+    chat_completions_request?: Record<string, unknown>;
+  },
   contextId = `ctx-${taskId}`,
 ): TaskAssignFrame {
+  const messages: Array<Record<string, unknown>> = [];
+  if (typeof payload.system === 'string' && payload.system.length > 0) {
+    messages.push({ role: 'system', content: payload.system });
+  }
+  if (Array.isArray(payload.chat_history)) {
+    for (const entry of payload.chat_history) {
+      messages.push(entry as Record<string, unknown>);
+    }
+  }
+  messages.push({ role: 'user', content: text });
+  const envelope: Record<string, unknown> = payload.chat_completions_request ?? {
+    messages,
+    ...(payload.model !== undefined ? { model: payload.model } : {}),
+    ...(payload.tools !== undefined ? { tools: payload.tools } : {}),
+    ...(payload.tool_choice !== undefined ? { tool_choice: payload.tool_choice } : {}),
+  };
   return {
     type: 'task.assign',
     taskId,
@@ -2975,14 +3007,21 @@ function makeOpenAICompatTask(
       role: 'user',
       messageId: `msg-${taskId}`,
       parts: [{ kind: 'text', text }],
-      metadata: { [OPENAI_COMPAT_EXTENSION_URI]: payload },
+      metadata: {
+        [OPENAI_COMPAT_EXTENSION_URI]: { chat_completions_request: envelope },
+      },
     },
   };
 }
 
 test('composeOpenAICompatUserMessage: wraps system_instructions + user_message with tools+tool_choice present', () => {
   const out = composeOpenAICompatUserMessage(
-    { tools: OAI_SAMPLE_TOOLS, tool_choice: 'auto', system: 'Be terse.' },
+    {
+      system: 'Be terse.',
+      tools: OAI_SAMPLE_TOOLS,
+      toolChoice: 'auto',
+      chatHistory: null,
+    },
     'what is the weather?',
   );
   // User system precedes the envelope contract inside the system_instructions block.
@@ -3005,7 +3044,12 @@ test('composeOpenAICompatUserMessage: history-only payload omits system_instruct
   // returns "". We MUST NOT emit an empty <system_instructions></system_instructions>
   // shell (the block-presence-vs-absence signal is part of the contract).
   const out = composeOpenAICompatUserMessage(
-    { chat_history: OAI_SAMPLE_HISTORY },
+    {
+      system: undefined,
+      tools: undefined,
+      toolChoice: undefined,
+      chatHistory: OAI_SAMPLE_HISTORY,
+    },
     'continue, please',
   );
   assert.doesNotMatch(out, /<system_instructions>/);
@@ -3020,7 +3064,12 @@ test('composeOpenAICompatUserMessage: history-only payload omits system_instruct
 
 test('composeOpenAICompatUserMessage: tool_choice="none" suppresses envelope contract but keeps no-envelope directive', () => {
   const out = composeOpenAICompatUserMessage(
-    { tools: OAI_SAMPLE_TOOLS, tool_choice: 'none' },
+    {
+      system: undefined,
+      tools: OAI_SAMPLE_TOOLS,
+      toolChoice: 'none',
+      chatHistory: null,
+    },
     'hi',
   );
   // The envelope contract block is gone under tool_choice="none".

@@ -393,9 +393,7 @@ export function parseChatCompletionUsage(
 //     to null) and the upstream binary does not emit them.
 //   - Put the normalized `OpenAICompatUsage` (with the spec-mandated
 //     `total === prompt + completion` invariant) in `chat_completion.usage`
-//     rather than the raw upstream usage — so consumers reading
-//     `chat_completion.usage` get the same totals as the legacy top-level
-//     `usage` field.
+//     rather than the raw upstream usage.
 //
 // Spec: extensions/openai-compat/v1/README.md#response-metadata-payload-agent--gateway
 export function buildChatCompletionEnvelope(
@@ -434,22 +432,22 @@ export function buildChatCompletionEnvelope(
 }
 
 // Build the metadata payload spread onto the final A2A message under
-// `OPENAI_COMPAT_EXTENSION_URI`. Includes the chat_completion envelope per
-// the envelope contract (oai2a2a#80) plus a transitional top-level
-// `usage` sibling for back-compat with codecs that read it as a fallback
-// when the envelope lacks `usage`. New codecs prefer
-// `chat_completion.usage`; the sibling exists so v1-era consumers that
-// only read the top-level field keep working during the transition.
+// `OPENAI_COMPAT_EXTENSION_URI`. Carries the chat_completion envelope per
+// the envelope contract (oai2a2a#80); usage lives inside
+// `chat_completion.usage`. `usage` is also passed through so the shared
+// builder can fall back to a bare `{ usage }` payload on the plain-task
+// path (envelope absent) — vicoop-codex never hits that path in practice
+// because every turn synthesises an envelope.
 export function buildResponseMetadata(
   response: ChatCompletionResponse,
   usage: OpenAICompatUsage | null,
   taskId: string,
 ): Record<string, unknown> {
   const envelope = buildChatCompletionEnvelope(response, usage, taskId);
-  // `buildOpenAICompatResponseMetadata` returns `undefined` when both
-  // `envelope` and `usage` are absent — for vicoop-codex we always have at
-  // least the synthesized envelope, so the non-undefined branch is
-  // guaranteed. Coerce here to keep the call-site type narrow.
+  // `buildOpenAICompatResponseMetadata` returns `undefined` only when the
+  // envelope is absent — for vicoop-codex we always synthesise an envelope
+  // so the non-undefined branch is guaranteed. Coerce here to keep the
+  // call-site type narrow.
   return buildOpenAICompatResponseMetadata(envelope, usage) ?? {
     [OPENAI_COMPAT_EXTENSION_URI]: { chat_completion: envelope },
   };
