@@ -639,7 +639,7 @@ identifier external callers will see for this agent — the WebFinger acct, the
 `@<agentId>@<host>` mention, the JSON-RPC endpoint, and the agent-card URL.
 
 ```sh
-vicoop-client whoami
+vicoop-client auth whoami
 # agentId:    my-agent
 # host:       bridge.example.com
 # mention:    @my-agent@bridge.example.com
@@ -665,10 +665,10 @@ Typical follow-ups from this output:
    response doesn't match what you expect, that's the cue to override.
 
    ```sh
-   CARD_URL=$(vicoop-client whoami --json | jq -r .a2aCardUrl)
+   CARD_URL=$(vicoop-client auth whoami --json | jq -r .a2aCardUrl)
    curl -sf "$CARD_URL" | jq .
    ```
-3. **Verify WebFinger actually resolves the acct.** `whoami --verify`
+3. **Verify WebFinger actually resolves the acct.** `auth whoami --verify`
    additionally fetches the WebFinger URL and reports whether the bridge
    resolves this agent's acct under the derived host. This catches the
    client server URL host vs bridge `PUBLIC_URL` mismatch flagged in the
