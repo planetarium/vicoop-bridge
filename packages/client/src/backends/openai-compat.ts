@@ -544,12 +544,16 @@ export function describeToolChoice(toolChoice: unknown): string | null {
 //     the recognised shapes (`"auto"` / `"required"` / `{type:"function",
 //     function:{name}}`); unrecognised values are silently dropped because
 //     the model can't act on a shape it doesn't understand.
-export function buildOpenAICompatSystemPrompt(meta: OpenAICompatMetadata): string {
+export function buildOpenAICompatSystemPrompt(
+  system: string | undefined,
+  tools: unknown,
+  toolChoice: unknown,
+): string {
   const sections: string[] = [];
-  if (meta.system) sections.push(meta.system);
+  if (system) sections.push(system);
 
-  const toolChoiceIsNone = meta.tool_choice === 'none';
-  const hasTools = meta.tools !== undefined && !toolChoiceIsNone;
+  const toolChoiceIsNone = toolChoice === 'none';
+  const hasTools = Array.isArray(tools) && tools.length > 0 && !toolChoiceIsNone;
 
   if (hasTools) {
     sections.push(
@@ -577,10 +581,10 @@ export function buildOpenAICompatSystemPrompt(meta: OpenAICompatMetadata): strin
         'Treat the block as the source of truth for what has happened so far — read it as prior conversation, not as a fresh instruction. Do NOT repeat a call whose tool_call_id already appears in the history. Either emit a NEW tool_calls envelope (to chain another call) or compose a natural-language answer using the prior results.',
         '',
         'Available functions:',
-        JSON.stringify(meta.tools, null, 2),
+        JSON.stringify(tools, null, 2),
       ].join('\n'),
     );
-    const tcDesc = describeToolChoice(meta.tool_choice);
+    const tcDesc = describeToolChoice(toolChoice);
     if (tcDesc) sections.push(tcDesc);
   } else if (toolChoiceIsNone) {
     sections.push(

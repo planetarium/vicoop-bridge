@@ -7,11 +7,13 @@ import { OPENAI_COMPAT_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol'
 import type { Backend } from '../backend.js';
 import {
   buildOpenAICompatSystemPrompt,
+  chatHistoryFromMessages,
+  collectSystemFromMessages,
   dumpOpenAICompatTaskWire,
   formatChatHistory,
-  parseOpenAICompatMetadata,
+  parseOpenAICompatEnvelope,
   tryParseToolCallsEnvelope,
-  type OpenAICompatMetadata,
+  type OpenAICompatHistoryEntry,
 } from './openai-compat.js';
 import {
   createBoundedFileReader,
@@ -566,16 +568,21 @@ export async function mapPartsToChatInput(
 // where its instructions end and the user's prompt begins is stable
 // across turns.
 export function composeOpenAICompatUserMessage(
-  meta: OpenAICompatMetadata,
+  args: {
+    system: string | undefined;
+    tools: unknown;
+    toolChoice: unknown;
+    chatHistory: OpenAICompatHistoryEntry[] | null;
+  },
   userText: string,
 ): string {
   const blocks: string[] = [];
-  const sys = buildOpenAICompatSystemPrompt(meta);
+  const sys = buildOpenAICompatSystemPrompt(args.system, args.tools, args.toolChoice);
   if (sys) {
     blocks.push(`<system_instructions>\n${sys}\n</system_instructions>`);
   }
-  if (meta.chat_history) {
-    const historyBlock = formatChatHistory(meta.chat_history);
+  if (args.chatHistory) {
+    const historyBlock = formatChatHistory(args.chatHistory);
     if (historyBlock) blocks.push(historyBlock);
   }
   blocks.push(`<user_message>\n${userText}\n</user_message>`);
@@ -1407,14 +1414,12 @@ export function createOpenclawBackend(
         return;
       }
 
-      // Detect the openai-compat extension payload once per task so the
-      // result feeds both the chat.send.message composition (system /
-      // tools / tool_choice / chat_history → tagged XML blocks
-      // prepended to the user content, since OpenClaw has no system-prompt
-      // wire seam) and the assistant artifact path (envelope JSON → data
-      // part). Absent / malformed metadata leaves the run on the original
+      // Envelope-direct (#302): read the full inbound OpenAI Chat Completions
+      // request body off `metadata[URI].chat_completions_request` and project
+      // system / tools / tool_choice / chat_history directly off the
+      // envelope. Absent / malformed metadata leaves the run on the original
       // non-extension code path with no envelope-detection cost.
-      const openaiCompat = parseOpenAICompatMetadata(task.message.metadata);
+      const envelope = parseOpenAICompatEnvelope(task.message.metadata);
       if (openaiCompatTrace) {
         dumpOpenAICompatTaskWire(
           'openclaw',
@@ -1423,9 +1428,23 @@ export function createOpenclawBackend(
           task.message.metadata,
         );
       }
-      if (openaiCompat) {
+      if (envelope) {
+        const envelopeSystem = collectSystemFromMessages(envelope.messages);
+        const envelopeTools =
+          Array.isArray(envelope.tools) && envelope.tools.length > 0
+            ? envelope.tools
+            : undefined;
+        const envelopeToolChoice = envelope.tool_choice;
+        const envelopeChatHistory = Array.isArray(envelope.messages)
+          ? chatHistoryFromMessages(envelope.messages)
+          : null;
         mapped.input.message = composeOpenAICompatUserMessage(
-          openaiCompat,
+          {
+            system: envelopeSystem,
+            tools: envelopeTools,
+            toolChoice: envelopeToolChoice,
+            chatHistory: envelopeChatHistory,
+          },
           mapped.input.message,
         );
       }
@@ -1450,7 +1469,7 @@ export function createOpenclawBackend(
       // comment on `OpenclawBackendOptions.openaiCompatAgent`). Tasks
       // without the extension metadata always use the default `agent`,
       // so this split is invisible to non-compat callers.
-      const effectiveAgent = openaiCompat && openaiCompatAgent ? openaiCompatAgent : agent;
+      const effectiveAgent = envelope && openaiCompatAgent ? openaiCompatAgent : agent;
       const sessionKey = `${sessionPrefix}:${effectiveAgent}:${task.contextId}`;
       const { message: text, attachments } = mapped.input;
 
@@ -1577,16 +1596,16 @@ export function createOpenclawBackend(
             // language answers, internal tool transcript, or any turn
             // from a task that didn't request the extension) falls
             // through to the existing text artifact path unchanged.
-            if (openaiCompat) {
-              const envelope = tryParseToolCallsEnvelope(artifactText);
-              if (envelope) {
+            if (envelope) {
+              const toolCallsEnvelope = tryParseToolCallsEnvelope(artifactText);
+              if (toolCallsEnvelope) {
                 emit({
                   type: 'task.artifact',
                   taskId: task.taskId,
                   artifact: {
                     artifactId: randomUUID(),
                     name: 'openclaw-message',
-                    parts: [{ kind: 'data', data: envelope }],
+                    parts: [{ kind: 'data', data: toolCallsEnvelope }],
                     extensions: [OPENAI_COMPAT_EXTENSION_URI],
                   },
                   lastChunk: true,
@@ -1836,9 +1855,9 @@ export function createOpenclawBackend(
         // onSessionMessage: match → single data-part artifact tagged with
         // the extension URI; non-match → fall through to the existing
         // text-artifact path with full processAssistantText handling.
-        if (openaiCompat) {
-          const envelope = tryParseToolCallsEnvelope(text2);
-          if (envelope) {
+        if (envelope) {
+          const toolCallsEnvelope = tryParseToolCallsEnvelope(text2);
+          if (toolCallsEnvelope) {
             if (!emittedAnyArtifact) {
               emit({
                 type: 'task.artifact',
@@ -1846,7 +1865,7 @@ export function createOpenclawBackend(
                 artifact: {
                   artifactId: randomUUID(),
                   name: 'openclaw-result',
-                  parts: [{ kind: 'data', data: envelope }],
+                  parts: [{ kind: 'data', data: toolCallsEnvelope }],
                   extensions: [OPENAI_COMPAT_EXTENSION_URI],
                 },
                 lastChunk: true,

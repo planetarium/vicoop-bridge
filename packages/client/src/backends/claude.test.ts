@@ -2436,11 +2436,7 @@ test('parseOpenAICompatMetadata: envelope path with only a trailing user turn yi
 });
 
 test('buildOpenAICompatSystemPrompt: includes tools JSON and tool_choice line when tools present', () => {
-  const prompt = buildOpenAICompatSystemPrompt({
-    system: 'You are concise.',
-    tools: SAMPLE_TOOLS,
-    tool_choice: 'auto',
-  });
+  const prompt = buildOpenAICompatSystemPrompt('You are concise.', SAMPLE_TOOLS, 'auto');
   // User system precedes the envelope contract.
   assert.match(prompt, /^You are concise\./);
   // Envelope contract is present verbatim — the exact phrasing is the
@@ -2454,19 +2450,15 @@ test('buildOpenAICompatSystemPrompt: includes tools JSON and tool_choice line wh
 });
 
 test('buildOpenAICompatSystemPrompt: forced-function tool_choice surfaces the name', () => {
-  const prompt = buildOpenAICompatSystemPrompt({
-    tools: SAMPLE_TOOLS,
-    tool_choice: { type: 'function', function: { name: 'get_weather' } },
+  const prompt = buildOpenAICompatSystemPrompt(undefined, SAMPLE_TOOLS, {
+    type: 'function',
+    function: { name: 'get_weather' },
   });
   assert.match(prompt, /calls the function named "get_weather"/);
 });
 
 test('buildOpenAICompatSystemPrompt: tool_choice="none" suppresses the envelope contract', () => {
-  const prompt = buildOpenAICompatSystemPrompt({
-    system: 'Stay polite.',
-    tools: SAMPLE_TOOLS,
-    tool_choice: 'none',
-  });
+  const prompt = buildOpenAICompatSystemPrompt('Stay polite.', SAMPLE_TOOLS, 'none');
   assert.match(prompt, /^Stay polite\./);
   // No envelope contract emitted — instead the explicit "do not emit"
   // directive runs so the gateway's intent is preserved.
@@ -2475,7 +2467,7 @@ test('buildOpenAICompatSystemPrompt: tool_choice="none" suppresses the envelope 
 });
 
 test('buildOpenAICompatSystemPrompt: system only (no tools) returns just the user system', () => {
-  const prompt = buildOpenAICompatSystemPrompt({ system: 'Be terse.' });
+  const prompt = buildOpenAICompatSystemPrompt('Be terse.', undefined, undefined);
   assert.equal(prompt, 'Be terse.');
 });
 
@@ -3070,7 +3062,7 @@ test('parseOpenAICompatMetadata: history-only payload (no tools/system) still re
 });
 
 test('buildOpenAICompatSystemPrompt: includes the chat_history paragraph when tools are present', () => {
-  const prompt = buildOpenAICompatSystemPrompt({ tools: SAMPLE_TOOLS });
+  const prompt = buildOpenAICompatSystemPrompt(undefined, SAMPLE_TOOLS, undefined);
   assert.match(prompt, /<chat_history>\.\.\.<\/chat_history>/);
   // Anti-loop directive must survive any future wording revisions to this
   // paragraph — the model needs to be told not to repeat calls already in
@@ -3081,7 +3073,7 @@ test('buildOpenAICompatSystemPrompt: includes the chat_history paragraph when to
 test('buildOpenAICompatSystemPrompt: omits the history paragraph when tools are absent', () => {
   // No tools → no envelope contract → no history paragraph either; the
   // paragraph references a tool_calls envelope that wouldn't be valid.
-  const prompt = buildOpenAICompatSystemPrompt({ system: 'Be terse.' });
+  const prompt = buildOpenAICompatSystemPrompt('Be terse.', undefined, undefined);
   assert.doesNotMatch(prompt, /<chat_history>/);
 });
 
