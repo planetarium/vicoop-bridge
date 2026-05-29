@@ -2920,11 +2920,12 @@ test('heartbeat: suppressed after signal.abort so canceled tasks do not look lik
 // ---------------------------------------------------------------------------
 // openai-compat extension
 //
-// The pure helpers (parseOpenAICompatMetadata, buildOpenAICompatSystemPrompt,
-// formatChatHistory, tryParseToolCallsEnvelope) live in claude.ts and are
-// covered by claude.test.ts — openclaw.ts imports them verbatim, so we only
-// test the openclaw-specific wiring here: chat.send.message composition with
-// the XML-wrapped contract blocks, envelope→data-part on session.message,
+// The pure helpers (parseOpenAICompatEnvelope, collectSystemFromMessages,
+// chatHistoryFromMessages, buildOpenAICompatSystemPrompt, formatChatHistory,
+// tryParseToolCallsEnvelope) live in openai-compat.ts and are covered by
+// claude.test.ts — openclaw.ts imports them verbatim, so we only test the
+// openclaw-specific wiring here: chat.send.message composition with the
+// XML-wrapped contract blocks, envelope→data-part on session.message,
 // non-streaming envelope on the terminal chat event, and the false-positive
 // defence when the extension is off.
 // ---------------------------------------------------------------------------

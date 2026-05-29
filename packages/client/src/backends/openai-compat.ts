@@ -70,25 +70,6 @@ export type OpenAICompatHistoryEntry =
   | OpenAICompatHistoryAssistantToolCalls
   | OpenAICompatHistoryTool;
 
-// Decomposed view of the openai-compat A2A extension. The wire payload
-// under `Message.metadata[OPENAI_COMPAT_EXTENSION_URI]` carries the
-// *complete* OpenAI Chat Completions request body inside
-// `chat_completions_request` (envelope contract, oai2a2a#80 symmetric
-// envelope completion). This struct is the parser's decomposed view of
-// that envelope — it splits the body into the four logical channels every
-// backend in this package has historically consumed (system text, tools,
-// tool_choice, prior conversation turns) so backend code does not have to
-// re-walk `messages[]` itself. The decomposition is lossy by design (the
-// gateway-internal `a2a` field is dropped, `system`/`developer` messages
-// are concatenated, the trailing user turn is split off into A2A `parts`);
-// for the raw envelope, read the metadata key directly.
-export interface OpenAICompatMetadata {
-  system?: string;
-  tools?: unknown[];
-  tool_choice?: unknown;
-  chat_history?: OpenAICompatHistoryEntry[];
-}
-
 // Top-level shape of the openai-compat extension wire payload. The full
 // inbound OpenAI Chat Completions request body lives under
 // `chat_completions_request` — forwarded verbatim by the gateway with at
@@ -178,10 +159,8 @@ export function callerToolDispatchActive(
 // OpenAI Chat Completions request body there) and returns it without
 // decomposition.
 //
-// This is the envelope-direct entry point used by backends migrating off
-// `parseOpenAICompatMetadata`'s decomposed view (#302). Backends consume
-// the envelope's fields directly (`model`, `tools`, `tool_choice`,
-// `messages[]`) and reuse the exported projection helpers
+// Backends consume the envelope's fields directly (`model`, `tools`,
+// `tool_choice`, `messages[]`) and reuse the exported projection helpers
 // (`collectSystemFromMessages`, `chatHistoryFromMessages`) to derive the
 // system text and the multi-turn replay block.
 //
@@ -197,145 +176,6 @@ export function parseOpenAICompatEnvelope(
   const env = r.chat_completions_request;
   if (!env || typeof env !== 'object' || Array.isArray(env)) return null;
   return env as OpenAICompatRequestEnvelope;
-}
-
-// Extract and shape-check the openai-compat extension metadata. Reads the
-// `chat_completions_request` envelope (the symmetric envelope contract —
-// oai2a2a#80 — places the full inbound OpenAI Chat Completions request
-// body under that key) and decomposes it into the four logical channels
-// every backend in this package consumes:
-//
-//   - `system`: concatenation of every `messages[i].role in {system,
-//     developer}` entry's text content, `\n`-joined.
-//   - `tools`: the envelope's `tools[]` verbatim (when non-empty).
-//   - `tool_choice`: the envelope's `tool_choice` verbatim.
-//   - `chat_history`: every non-system / non-developer entry of `messages[]`
-//     *except* the trailing user turn (which rides A2A `parts` for
-//     non-extension-aware consumers and is already in the envelope itself).
-//
-// Returns null when the envelope key is absent, malformed, or
-// decomposes to no actionable content, so callers can branch on
-// truthiness without per-field null checks.
-export function parseOpenAICompatMetadata(
-  metadata: Record<string, unknown> | undefined,
-): OpenAICompatMetadata | null {
-  if (!metadata) return null;
-  const raw = metadata[OPENAI_COMPAT_EXTENSION_URI];
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const r = raw as Record<string, unknown>;
-
-  // Envelope contract (oai2a2a#80 symmetric): the full inbound
-  // ChatCompletionsRequest body lives under `chat_completions_request`.
-  if (r.chat_completions_request && typeof r.chat_completions_request === 'object') {
-    return parseEnvelope(r.chat_completions_request as OpenAICompatRequestEnvelope);
-  }
-
-  // Legacy / direct-decomposed shape: pre-envelope gateways and unit-test
-  // fixtures place `{system, tools, tool_choice, chat_history}` directly
-  // under the URI key. The parser still accepts this for transitional
-  // compatibility — the envelope path above is the production wire shape.
-  return parseLegacyDecomposed(r);
-}
-
-function parseEnvelope(envelope: OpenAICompatRequestEnvelope): OpenAICompatMetadata | null {
-  const out: OpenAICompatMetadata = {};
-
-  const system = collectSystemFromMessages(envelope.messages);
-  if (system) out.system = system;
-
-  if (Array.isArray(envelope.tools) && envelope.tools.length > 0) {
-    out.tools = envelope.tools;
-  }
-  if (envelope.tool_choice !== undefined && envelope.tool_choice !== null) {
-    out.tool_choice = envelope.tool_choice;
-  }
-
-  if (Array.isArray(envelope.messages)) {
-    const history = chatHistoryFromMessages(envelope.messages);
-    if (history) out.chat_history = history;
-  }
-
-  if (
-    out.system === undefined &&
-    out.tools === undefined &&
-    out.tool_choice === undefined &&
-    out.chat_history === undefined
-  ) {
-    return null;
-  }
-  return out;
-}
-
-function parseLegacyDecomposed(r: Record<string, unknown>): OpenAICompatMetadata | null {
-  const out: OpenAICompatMetadata = {};
-  if (typeof r.system === 'string' && r.system.length > 0) out.system = r.system;
-  if (Array.isArray(r.tools) && r.tools.length > 0) out.tools = r.tools;
-  if (r.tool_choice !== undefined && r.tool_choice !== null) out.tool_choice = r.tool_choice;
-  if (Array.isArray(r.chat_history)) {
-    const history = parseLegacyChatHistory(r.chat_history);
-    if (history) out.chat_history = history;
-  }
-  if (
-    out.system === undefined &&
-    out.tools === undefined &&
-    out.tool_choice === undefined &&
-    out.chat_history === undefined
-  ) {
-    return null;
-  }
-  return out;
-}
-
-// Strict-or-nothing parser for the legacy `chat_history` field. Mirrors
-// the pre-envelope gateway behaviour exactly (e.g. tool entries require
-// `content` to be a plain string — no normalisation) — used only by the
-// legacy shape path and existing test fixtures.
-function parseLegacyChatHistory(raw: unknown[]): OpenAICompatHistoryEntry[] | null {
-  if (raw.length === 0) return null;
-  const out: OpenAICompatHistoryEntry[] = [];
-  for (const entry of raw) {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
-    const e = entry as Record<string, unknown>;
-    if (e.role === 'user') {
-      const content = parseUserOrAssistantContent(e.content);
-      if (content === null) return null;
-      out.push({ role: 'user', content });
-      continue;
-    }
-    if (e.role === 'assistant') {
-      if (Array.isArray(e.tool_calls) && e.tool_calls.length > 0) {
-        if (e.content === null || e.content === undefined || e.content === '') {
-          out.push({ role: 'assistant', content: null, tool_calls: e.tool_calls });
-          continue;
-        }
-        const content = parseUserOrAssistantContent(e.content);
-        if (content === null) return null;
-        out.push({ role: 'assistant', content, tool_calls: e.tool_calls });
-        continue;
-      }
-      const content = parseUserOrAssistantContent(e.content);
-      if (content === null) return null;
-      out.push({ role: 'assistant', content });
-      continue;
-    }
-    if (
-      e.role === 'tool' &&
-      typeof e.tool_call_id === 'string' &&
-      e.tool_call_id.length > 0 &&
-      typeof e.content === 'string'
-    ) {
-      const tool: OpenAICompatHistoryTool = {
-        role: 'tool',
-        tool_call_id: e.tool_call_id,
-        content: e.content,
-      };
-      if (typeof e.name === 'string' && e.name.length > 0) tool.name = e.name;
-      out.push(tool);
-      continue;
-    }
-    return null;
-  }
-  return out;
 }
 
 // Concatenate every `system`/`developer` role entry's text content from
@@ -659,11 +499,10 @@ export function dumpOpenAICompatTaskWire(
   metadata: Record<string, unknown> | undefined,
 ): void {
   try {
-    // Derive the summary view from metadata in one place so backends never
-    // pass a parsed projection — the parser+envelope helpers already cover
-    // every shape (envelope contract + legacy decomposed) the dump cares
-    // about. Keeps the trace one-line shape stable across backend migration.
-    const parsed = parseOpenAICompatMetadata(metadata);
+    // Derive the summary view from the envelope in one place so backends
+    // never pass a parsed projection. The trace one-line shape is stable
+    // across backend migration; absent / malformed metadata produces
+    // `parsed=null` for the operator's quick at-a-glance check.
     const envelope = parseOpenAICompatEnvelope(metadata);
     const partsSummary = (parts ?? []).map((p) => {
       if (p.kind === 'text') return { kind: 'text', len: p.text.length };
@@ -671,16 +510,20 @@ export function dumpOpenAICompatTaskWire(
       return { kind: 'data' };
     });
     const metaKeys = Object.keys(metadata ?? {});
-    const oai = parsed
+    const envelopeTools =
+      envelope && Array.isArray(envelope.tools) ? envelope.tools : undefined;
+    const envelopeSystem = envelope ? collectSystemFromMessages(envelope.messages) : undefined;
+    const envelopeHistory =
+      envelope && Array.isArray(envelope.messages)
+        ? chatHistoryFromMessages(envelope.messages)
+        : null;
+    const oai = envelope
       ? {
-          sys: !!parsed.system,
-          tools: parsed.tools?.length ?? 0,
-          tool_choice: parsed.tool_choice,
-          hist: parsed.chat_history?.length ?? 0,
-          // `model` is envelope-only — the legacy decomposed shape never
-          // carried it, so it stays `undefined` for legacy-shape traces.
-          model:
-            envelope && typeof envelope.model === 'string' ? envelope.model : undefined,
+          sys: !!envelopeSystem,
+          tools: envelopeTools?.length ?? 0,
+          tool_choice: envelope.tool_choice,
+          hist: envelopeHistory?.length ?? 0,
+          model: typeof envelope.model === 'string' ? envelope.model : undefined,
         }
       : null;
     console.error(
@@ -693,11 +536,11 @@ export function dumpOpenAICompatTaskWire(
     // Tools[] — caller-side function schemas. Dump each entry as
     // `{name}: <clipped JSON>` so the operator can spot a missing /
     // mistyped tool without scrolling through a multi-line JSON dump.
-    if (parsed?.tools && parsed.tools.length > 0) {
+    if (envelopeTools && envelopeTools.length > 0) {
       console.error(
-        `[openai-compat trace] tools (${parsed.tools.length} entries):`,
+        `[openai-compat trace] tools (${envelopeTools.length} entries):`,
       );
-      for (const [i, t] of parsed.tools.entries()) {
+      for (const [i, t] of envelopeTools.entries()) {
         const name =
           t && typeof t === 'object' && 'function' in t
             ? (t as { function?: { name?: unknown } }).function?.name
@@ -740,35 +583,14 @@ export function dumpOpenAICompatTaskWire(
 
     // Raw envelope dump: surface the inbound conversation so operators can
     // diff what the gateway sent vs. what the backend ended up using. The
-    // decomposed `parsed` view above already shows the chat_history
-    // projection — this section is the raw shape pre-decomposition.
-    //
-    // Reads `chat_completions_request.messages[]` (envelope contract,
-    // oai2a2a#80) when present; falls back to the legacy `chat_history`
-    // shape so pre-envelope gateways still produce a useful trace.
-    const ext = metadata?.[OPENAI_COMPAT_EXTENSION_URI];
-    if (ext && typeof ext === 'object') {
-      const env = (ext as Record<string, unknown>).chat_completions_request;
-      if (env && typeof env === 'object') {
-        const rawMessages = (env as Record<string, unknown>).messages;
-        if (Array.isArray(rawMessages) && rawMessages.length > 0) {
-          console.error(
-            `[openai-compat trace] envelope.messages (${rawMessages.length} entries):`,
-          );
-          for (const [i, e] of rawMessages.entries()) {
-            console.error(`  [${i}] ${JSON.stringify(e).slice(0, TRACE_ITEM_CLIP)}`);
-          }
-        }
-      } else {
-        const rawHist = (ext as Record<string, unknown>).chat_history;
-        if (Array.isArray(rawHist) && rawHist.length > 0) {
-          console.error(
-            `[openai-compat trace] raw chat_history (${rawHist.length} entries):`,
-          );
-          for (const [i, e] of rawHist.entries()) {
-            console.error(`  [${i}] ${JSON.stringify(e).slice(0, TRACE_ITEM_CLIP)}`);
-          }
-        }
+    // `parsed` summary above already shows the chat_history projection —
+    // this section is the raw shape pre-decomposition.
+    if (envelope && Array.isArray(envelope.messages) && envelope.messages.length > 0) {
+      console.error(
+        `[openai-compat trace] envelope.messages (${envelope.messages.length} entries):`,
+      );
+      for (const [i, e] of envelope.messages.entries()) {
+        console.error(`  [${i}] ${JSON.stringify(e).slice(0, TRACE_ITEM_CLIP)}`);
       }
     }
   } catch {
