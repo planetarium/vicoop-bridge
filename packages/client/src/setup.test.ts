@@ -996,6 +996,18 @@ function installAgentRegisterFixture(t: TestContext): {
         },
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
+    // auto-minted API key (no --caller path)
+    if (url.endsWith('/apikeys')) {
+      return new Response(JSON.stringify({
+        agent_id: 'codex-Mac',
+        key_id: 'AUTOKEY1',
+        principal: 'apikey:AUTOKEY1',
+        api_key: 'vbc_caller_AUTOSECRET1',
+        label: 'auto (agent register)',
+        expires_at: '2027-06-01T00:00:00.000Z',
+        allowed_callers: ['apikey:AUTOKEY1'],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
     // caller add success
     return new Response(JSON.stringify({
       agent_id: 'codex-Mac', principal: 'eth:0xabc', allowed_callers: ['eth:0xabc'],
@@ -1021,8 +1033,11 @@ test('agent register calls registerClient with a 1-element allowedAgentIds and w
   }));
 
   assert.equal(code, 0);
-  assert.equal(fix.calls.length, 1);
+  // graphql register, then the auto-minted API key (no --caller given).
+  assert.equal(fix.calls.length, 2);
   assert.equal(fix.calls[0].url, 'https://bridge.test/graphql');
+  assert.equal(fix.calls[1].url, 'https://bridge.test/admin-api/agents/codex-Mac/apikeys');
+  assert.equal(fix.calls[1].method, 'POST');
   // Server-side 1:1 enforcement (#219) means the array must contain exactly
   // one id; the new flag is singular so this is the natural shape.
   // GraphQL mutation body is JSON-encoded, so inner double quotes appear
@@ -1062,9 +1077,14 @@ test('agent register stderr surfaces agent-first labels (agent_id, AGENT_TOKEN)'
   // The legacy CLIENT_TOKEN label should not appear on this surface.
   assert.doesNotMatch(out, /CLIENT_TOKEN/);
   assert.doesNotMatch(out, /client_id\b/);
+  // No --caller was given, so instead of the old public-agent warning the
+  // command auto-mints an API key and prints the one-time secret.
+  assert.doesNotMatch(out, /no callers configured/);
+  assert.match(out, /Minted an API key for codex-Mac/);
+  assert.match(out, /vbc_caller_AUTOSECRET1/);
 });
 
-test('agent register --json prints the registerClient response shape unchanged for back-compat', async (t) => {
+test('agent register --json keeps the registerClient fields and adds auto-minted api_keys', async (t) => {
   const fix = installAgentRegisterFixture(t);
   let stdout = '';
   t.mock.method(process.stdout, 'write', (chunk: string | Uint8Array) => {
@@ -1079,11 +1099,24 @@ test('agent register --json prints the registerClient response shape unchanged f
   assert.equal(code, 0);
   const parsed = JSON.parse(stdout) as Record<string, unknown>;
   // Existing scripts depend on these field names; #224 explicitly keeps the
-  // JSON shape stable across the rename.
+  // JSON shape stable across the rename. The new `api_keys` field is additive.
   assert.equal(parsed.intent, 'client_register');
   assert.equal(parsed.client_token, 'agent-token-1');
   assert.equal(parsed.client_id, 'reg-uuid-1');
   assert.deepEqual(parsed.allowed_agent_ids, ['codex-Mac']);
+  // No --caller given → the one-time API key rides along in the same payload
+  // so scripted callers can capture it without a second command.
+  assert.deepEqual(parsed.api_keys, [
+    {
+      agent_id: 'codex-Mac',
+      key_id: 'AUTOKEY1',
+      principal: 'apikey:AUTOKEY1',
+      api_key: 'vbc_caller_AUTOSECRET1',
+      label: 'auto (agent register)',
+      expires_at: '2027-06-01T00:00:00.000Z',
+      allowed_callers: ['apikey:AUTOKEY1'],
+    },
+  ]);
 });
 
 test('agent register configures callers when --caller is passed', async (t) => {

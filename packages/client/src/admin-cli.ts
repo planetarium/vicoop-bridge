@@ -13,7 +13,7 @@ import { optional, withDefault } from '@optique/core/modifiers';
 import { argument, command, constant, flag, option } from '@optique/core/primitives';
 import { message } from '@optique/core/message';
 import type { InferValue } from '@optique/core/parser';
-import { string } from '@optique/core/valueparser';
+import { integer, string } from '@optique/core/valueparser';
 import { resolveOwnerSession } from './owner-session.js';
 import { agentRegisterCmd } from './setup.js';
 
@@ -148,11 +148,41 @@ const agentCallersRemoveSubCmd = longestMatch(
   agentCallersRemoveCommand('rm', true),
 );
 
+// `issue-api-key` mints a static API key — a caller the bridge creates a
+// secret for, for non-interactive callers (CI, backend services) that can't
+// run the Google/SIWE login flow. It lives under `callers` alongside
+// add/remove/list because a key is just another caller: the `apikey:<key-id>`
+// principal it returns is added to allowed-callers and listed/revoked through
+// the same `callers list` / `callers remove` commands.
+const agentCallersIssueSubCmd = command(
+  'issue-api-key',
+  object({
+    action: constant('agent-callers-issue' as const),
+    ...sharedFlags,
+    agentId: argument(string({ metavar: 'AGENT_ID' })),
+    label: optional(option('--label', string({ metavar: 'LABEL' }), {
+      description: message`Human-readable label stored alongside the key (e.g. "ci-deploy").`,
+    })),
+    ttlDays: optional(option('--ttl-days', integer({ metavar: 'DAYS', min: 1 }), {
+      description: message`Key lifetime in days. Defaults to 365 on the server.`,
+    })),
+  }),
+  {
+    brief: message`Mint a static API key caller for the agent.`,
+    description: message`Calls POST /admin-api/agents/<AGENT_ID>/apikeys. Prints the raw key exactly once — store it now; it cannot be recovered. The returned \`apikey:<key-id>\` principal is added to allowed-callers (hot-reloaded); list it with \`agent callers list\` and revoke with \`agent callers remove <AGENT_ID> apikey:<key-id>\`.`,
+  },
+);
+
 const agentCallersSubCmd = command(
   'callers',
-  longestMatch(agentCallersListSubCmd, agentCallersAddSubCmd, agentCallersRemoveSubCmd),
+  longestMatch(
+    agentCallersListSubCmd,
+    agentCallersAddSubCmd,
+    agentCallersRemoveSubCmd,
+    agentCallersIssueSubCmd,
+  ),
   {
-    brief: message`Manage the agent's allowed-callers list.`,
+    brief: message`Manage the agent's callers — external identities and API keys.`,
   },
 );
 
@@ -160,14 +190,20 @@ export const agentCmd = command(
   'agent',
   // `agentCallersSubCmd` MUST come before `agentListSubCmd` / `agentRemoveSubCmd`.
   // `@optique` `longestMatch` breaks consumed-token ties by source order, and the
-  // top-level `list` / `remove` commands have all-optional bodies that tie with the
-  // nested `callers {list,remove} <AGENT_ID>` match — when they win the tie the
-  // AGENT_ID positional is dropped and parsing fails with "Unexpected ... <id>".
-  // Putting `callers` first makes the correct branch win. See admin-cli.test.ts.
-  longestMatch(agentRegisterCmd, agentCallersSubCmd, agentListSubCmd, agentRemoveSubCmd),
+  // top-level `list` / `remove` commands have all-optional bodies that tie with
+  // the nested `callers {list,remove} <AGENT_ID>` match — when they win the tie
+  // the AGENT_ID positional is dropped and parsing fails with "Unexpected ... <id>".
+  // Putting the AGENT_ID-consuming group first makes the correct branch win.
+  // See admin-cli.test.ts.
+  longestMatch(
+    agentRegisterCmd,
+    agentCallersSubCmd,
+    agentListSubCmd,
+    agentRemoveSubCmd,
+  ),
   {
-    brief: message`Manage agent registrations and their allowed callers.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    brief: message`Manage agent registrations and their callers.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, issue-api-key}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
     hidden: 'usage',
   },
 );
@@ -178,6 +214,7 @@ export type AgentDeleteArgs = Extract<AgentCliArgs, { action: 'agent-delete' }>;
 export type AgentCallersListArgs = Extract<AgentCliArgs, { action: 'agent-callers-list' }>;
 export type AgentCallersAddArgs = Extract<AgentCliArgs, { action: 'agent-callers-add' }>;
 export type AgentCallersRemoveArgs = Extract<AgentCliArgs, { action: 'agent-callers-remove' }>;
+export type AgentCallersIssueArgs = Extract<AgentCliArgs, { action: 'agent-callers-issue' }>;
 
 // ----- Legacy flat commands (deprecated, kept as aliases) --------------------
 //
@@ -398,6 +435,28 @@ function renderCallerMutation(body: unknown): string {
   const callers = (b.allowed_callers ?? []).join(', ') || '(none — agent is public)';
   const note = b.message ? ` (${b.message})` : '';
   return `agent: ${b.agent_id}\nallowed_callers: ${callers}${note}`;
+}
+
+function renderIssuedKey(body: unknown): string {
+  if (!body || typeof body !== 'object') return String(body);
+  const b = body as {
+    agent_id?: string;
+    key_id?: string;
+    principal?: string;
+    api_key?: string;
+    label?: string | null;
+    expires_at?: string;
+  };
+  return [
+    `agent:      ${b.agent_id}`,
+    `key_id:     ${b.key_id}`,
+    `principal:  ${b.principal}`,
+    `label:      ${b.label ?? '(none)'}`,
+    `expires_at: ${b.expires_at}`,
+    '',
+    'API key (shown once — store it now, it cannot be recovered):',
+    `  ${b.api_key}`,
+  ].join('\n');
 }
 
 // The `TYPE` column of the callers table is display-only; the `PRINCIPAL`
@@ -666,6 +725,26 @@ export async function runAgentCallersAdd(args: AgentCallersAddArgs): Promise<num
 
 export async function runAgentCallersRemove(args: AgentCallersRemoveArgs): Promise<number> {
   return execRemoveCaller(args);
+}
+
+// ----- agent callers issue-api-key (API key minting, #308) --------------------------
+
+export async function runAgentCallersIssue(args: AgentCallersIssueArgs): Promise<number> {
+  const session = resolveSession(args);
+  if ('error' in session) {
+    process.stderr.write(`${session.error}\n`);
+    return 1;
+  }
+  const body: { label?: string; ttlDays?: number } = {};
+  if (args.label !== undefined) body.label = args.label;
+  if (args.ttlDays !== undefined) body.ttlDays = args.ttlDays;
+  const result = await callApi({
+    session,
+    method: 'POST',
+    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/apikeys`,
+    body,
+  });
+  return emit(result, args.json, renderIssuedKey);
 }
 
 // ----- Deprecated flat handlers ---------------------------------------------

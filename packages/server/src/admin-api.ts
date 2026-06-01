@@ -7,6 +7,7 @@ import type postgres from 'postgres';
 import type { Sql } from './db.js';
 import type { Registry } from './registry.js';
 import { validatePrincipal } from './auth/principal.js';
+import { generateApiKeyId, issueSessionToken } from './auth/caller-token.js';
 import { isAdmin } from './admin-scope.js';
 
 type Tx = postgres.TransactionSql;
@@ -171,6 +172,22 @@ export async function removeCaller(
   }
 
   const callers = result[0].allowed_callers as string[];
+
+  // Unify model (#308): an `apikey:<id>` principal IS a bridge-minted
+  // credential, not an external identity. Removing it from the allowlist must
+  // also kill the underlying token — otherwise the secret stays valid (just
+  // unauthorized for this agent) and could be re-added elsewhere. Privileged
+  // write; `callers` is server-only. No-op for eth/google principals, whose
+  // session tokens are ephemeral and identity-scoped (de-authorizing the
+  // identity in allowed_callers is sufficient).
+  if (normalized.startsWith('apikey:')) {
+    await db`
+      UPDATE callers
+      SET revoked = true
+      WHERE provider = 'apikey' AND principal_id = ${normalized}
+    `;
+  }
+
   registry.updateAllowedCallers(agentId, callers);
   return { agent_id: agentId, principal: normalized, allowed_callers: callers };
 }
@@ -199,6 +216,135 @@ export async function listCallers(
     is_public: callers.length === 0,
     created_at: policy.created_at instanceof Date ? policy.created_at.toISOString() : policy.created_at as string | undefined,
     updated_at: policy.updated_at instanceof Date ? policy.updated_at.toISOString() : policy.updated_at as string | undefined,
+  };
+}
+
+// ----- Static API keys (issue #308) -----------------------------------------
+//
+// An API key is a regular caller token (provider='apikey', audience='caller')
+// whose principal is `apikey:<key-id>`, with that principal auto-added to the
+// target agent's allowed_callers so the key authorizes exactly that agent and
+// nothing else. Verification reuses the existing caller-token path entirely.
+//
+// Unified model: an API key is just "a caller the bridge minted a secret for",
+// so the only apikey-specific operation is minting (issueAgentApiKey). Listing
+// and de-authorizing fold into the regular caller surface — `agent callers
+// list` shows `apikey:<id>` rows (TYPE=apikey) and `removeCaller` both drops
+// the principal AND revokes the underlying token (see its apikey branch).
+//
+// RLS note: ownership is enforced against the `agents` table under the
+// operator's app_authenticated context (RLS hides agents they don't own). The
+// server-managed `callers` table has no app_authenticated policy (it is
+// `@omit` / server-only), so its reads/writes go through the privileged
+// top-level `db` connection, which bypasses RLS as the table owner. We scope
+// those callers queries to principals we just read out of the owner's own
+// agent row, so the privileged access never leaks another operator's keys.
+
+const DEFAULT_API_KEY_TTL_DAYS = 365;
+// Sanity cap so a typo (ttlDays: 100000) can't mint a de-facto immortal key.
+const MAX_API_KEY_TTL_DAYS = 365 * 5;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+export interface ApiKeyIssueResult {
+  agent_id: string;
+  key_id: string;
+  principal: string;
+  /** Raw bearer token — shown exactly once; never recoverable afterwards. */
+  api_key: string;
+  label: string | null;
+  expires_at: string;
+  allowed_callers: string[];
+}
+
+// Append `principal` to an owned agent's allowed_callers under RLS and return
+// the new array, or null if the agent is not visible to this principal (not
+// found / not owned). Used by apikey issuance; listing/removal of keys goes
+// through the unified `agent callers list` / `removeCaller` path.
+async function appendAllowedCallerOwned(
+  db: Sql,
+  principalId: string,
+  agentId: string,
+  principal: string,
+): Promise<string[] | null> {
+  const rows = await db.begin(async (tx) => {
+    await setRlsContext(tx, principalId);
+    return tx`
+      UPDATE agents
+      SET allowed_callers = array_append(allowed_callers, ${principal}),
+          updated_at = now()
+      WHERE id = ${agentId}
+      RETURNING allowed_callers
+    `;
+  });
+  if (rows.length === 0) return null;
+  return rows[0].allowed_callers as string[];
+}
+
+export async function issueAgentApiKey(
+  db: Sql,
+  registry: Registry,
+  principalId: string,
+  agentId: string,
+  opts: { label?: string; ttlDays?: number },
+): Promise<ApiKeyIssueResult> {
+  const ttlDays = opts.ttlDays ?? DEFAULT_API_KEY_TTL_DAYS;
+  if (!Number.isInteger(ttlDays) || ttlDays < 1 || ttlDays > MAX_API_KEY_TTL_DAYS) {
+    throw new AdminApiError(
+      `ttlDays must be an integer between 1 and ${MAX_API_KEY_TTL_DAYS}.`,
+      400,
+    );
+  }
+  const label = opts.label?.trim() ? opts.label.trim() : undefined;
+
+  const keyId = generateApiKeyId();
+  const principal = 'apikey:' + keyId;
+
+  // Step 1: enforce ownership by appending under RLS. A non-owner sees no row
+  // (RLS) → null → 404, and crucially no token is ever minted for them.
+  const allowedCallers = await appendAllowedCallerOwned(db, principalId, agentId, principal);
+  if (!allowedCallers) {
+    throw new AdminApiError('Agent not found or not authorized.', 404);
+  }
+
+  // Step 2: mint the bearer token (privileged path; callers is server-only).
+  // If this fails after the append, roll the principal back so we don't leave
+  // an orphan entry in allowed_callers.
+  let issued;
+  try {
+    issued = await issueSessionToken(db, {
+      principalId: principal,
+      provider: 'apikey',
+      audience: 'caller',
+      label,
+      ttlMs: ttlDays * MS_PER_DAY,
+    });
+  } catch (err) {
+    try {
+      await db.begin(async (tx) => {
+        await setRlsContext(tx, principalId);
+        await tx`
+          UPDATE agents
+          SET allowed_callers = array_remove(allowed_callers, ${principal}),
+              updated_at = now()
+          WHERE id = ${agentId}
+        `;
+      });
+    } catch {
+      // Best-effort compensation; surface the original failure regardless.
+    }
+    throw err;
+  }
+
+  registry.updateAllowedCallers(agentId, allowedCallers);
+
+  return {
+    agent_id: agentId,
+    key_id: keyId,
+    principal,
+    api_key: issued.rawToken,
+    label: label ?? null,
+    expires_at: issued.expiresAt.toISOString(),
+    allowed_callers: allowedCallers,
   };
 }
 

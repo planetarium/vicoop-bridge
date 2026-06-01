@@ -9,7 +9,8 @@ import type { WebSocket } from 'ws';
 import type { AgentCard } from '@vicoop-bridge/protocol';
 import { createHttpApp } from './http.js';
 import { Registry, type ClientConnection } from './registry.js';
-import { issueSessionToken } from './auth/caller-token.js';
+import { issueSessionToken, verifyCallerToken, CALLER_TOKEN_PREFIX } from './auth/caller-token.js';
+import { matchPrincipal } from './auth/principal.js';
 
 const hasDb = !!process.env.DATABASE_URL;
 
@@ -613,6 +614,220 @@ test(
       const del = await app.request('/admin-api/clients/anything', { method: 'DELETE' });
       assert.equal(del.status, 401);
     } finally {
+      await sql.end();
+    }
+  },
+);
+
+// ----- Static API keys (issue #308) -----------------------------------------
+
+// apikey callers rows carry principal_id='apikey:<id>', not the owner
+// principal, so the standard teardown() (which deletes by owner principal)
+// misses them. Clean them up explicitly off the agent's allowed_callers.
+async function teardownApiKeys(sql: postgres.Sql, agentId: string): Promise<void> {
+  const rows = await sql<{ allowed_callers: string[] }[]>`
+    SELECT allowed_callers FROM agents WHERE id = ${agentId}
+  `;
+  const principals = (rows[0]?.allowed_callers ?? []).filter((p) => p.startsWith('apikey:'));
+  if (principals.length > 0) {
+    await sql`DELETE FROM callers WHERE principal_id = ANY(${sql.array(principals)})`;
+  }
+}
+
+test(
+  'POST /admin-api/agents/:id/apikeys mints a usable key and authorizes it',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'a1'.repeat(20)}`;
+    let setup: SetupResult | null = null;
+    try {
+      setup = await setupOwner(sql, owner);
+      const registry = new Registry();
+      registry.registerAgent(fakeConnection({
+        agentId: setup.agentId,
+        clientId: setup.clientId,
+        ownerPrincipal: owner,
+      }));
+      const callerSeen: string[][] = [];
+      registry.onCallerChange((_agentId, callers) => callerSeen.push([...callers]));
+
+      const app = createHttpApp({ db: sql, registry });
+      const res = await app.request(`/admin-api/agents/${setup.agentId}/apikeys`, {
+        method: 'POST',
+        headers: { ...authHeaders(setup.ownerToken), 'content-type': 'application/json' },
+        body: JSON.stringify({ label: 'ci-deploy' }),
+      });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as {
+        agent_id: string;
+        key_id: string;
+        principal: string;
+        api_key: string;
+        label: string | null;
+        expires_at: string;
+        allowed_callers: string[];
+      };
+      assert.equal(body.principal, `apikey:${body.key_id}`);
+      assert.ok(body.api_key.startsWith(CALLER_TOKEN_PREFIX), 'raw key is a vbc_caller_* token');
+      assert.equal(body.label, 'ci-deploy');
+      assert.deepEqual(body.allowed_callers, [body.principal]);
+
+      // The principal was hot-reloaded into the registry.
+      assert.ok(
+        callerSeen.some((c) => c.includes(body.principal)),
+        'caller-change listener fired with the apikey principal',
+      );
+
+      // End-to-end: the raw token verifies to the apikey principal, and that
+      // principal satisfies the agent's allowed_callers entry.
+      const verified = await verifyCallerToken(sql, body.api_key);
+      assert.equal(verified.principalId, body.principal);
+      assert.equal(matchPrincipal(body.allowed_callers[0]!, verified), true);
+
+      // Default TTL is ~365 days out.
+      const days = (new Date(body.expires_at).getTime() - Date.now()) / (24 * 60 * 60 * 1000);
+      assert.ok(days > 360 && days < 366, `expected ~365d TTL, got ${days}d`);
+    } finally {
+      if (setup) {
+        await teardownApiKeys(sql, setup.agentId);
+        await teardown(sql, owner, setup.clientId);
+      }
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'unified surface: GET callers lists an apikey, DELETE callers revokes its token',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'b2'.repeat(20)}`;
+    let setup: SetupResult | null = null;
+    try {
+      setup = await setupOwner(sql, owner);
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+
+      // Mint with an explicit short TTL.
+      const mint = await app.request(`/admin-api/agents/${setup.agentId}/apikeys`, {
+        method: 'POST',
+        headers: { ...authHeaders(setup.ownerToken), 'content-type': 'application/json' },
+        body: JSON.stringify({ ttlDays: 1 }),
+      });
+      assert.equal(mint.status, 200);
+      const minted = (await mint.json()) as { key_id: string; principal: string; api_key: string; expires_at: string };
+      const ttlDays = (new Date(minted.expires_at).getTime() - Date.now()) / (24 * 60 * 60 * 1000);
+      assert.ok(ttlDays > 0.9 && ttlDays < 1.1, `expected ~1d TTL, got ${ttlDays}d`);
+
+      // The unified caller list shows the apikey principal (no secret).
+      const list = await app.request(`/admin-api/agents/${setup.agentId}/callers`, {
+        headers: authHeaders(setup.ownerToken),
+      });
+      assert.equal(list.status, 200);
+      const listBody = (await list.json()) as { allowed_callers: string[] };
+      assert.deepEqual(listBody.allowed_callers, [minted.principal]);
+
+      // DELETE on the caller surface removes the principal AND revokes the
+      // underlying token (the apikey-specific branch in removeCaller).
+      const del = await app.request(
+        `/admin-api/agents/${setup.agentId}/callers?principal=${encodeURIComponent(minted.principal)}`,
+        { method: 'DELETE', headers: authHeaders(setup.ownerToken) },
+      );
+      assert.equal(del.status, 200);
+      const delBody = (await del.json()) as { allowed_callers: string[] };
+      assert.deepEqual(delBody.allowed_callers, []);
+
+      // Token no longer verifies (revoked) — not merely de-authorized.
+      await assert.rejects(() => verifyCallerToken(sql, minted.api_key), /revoked/i);
+
+      // And the DB row is flipped.
+      const rows = await sql<{ revoked: boolean }[]>`
+        SELECT revoked FROM callers WHERE provider = 'apikey' AND principal_id = ${minted.principal}
+      `;
+      assert.equal(rows[0]?.revoked, true);
+    } finally {
+      if (setup) {
+        await teardownApiKeys(sql, setup.agentId);
+        await teardown(sql, owner, setup.clientId);
+      }
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'POST /admin-api/agents/:id/apikeys rejects an out-of-range ttlDays with 400',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'c3'.repeat(20)}`;
+    let setup: SetupResult | null = null;
+    try {
+      setup = await setupOwner(sql, owner);
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+      for (const ttlDays of [0, -5, 10000]) {
+        const res = await app.request(`/admin-api/agents/${setup.agentId}/apikeys`, {
+          method: 'POST',
+          headers: { ...authHeaders(setup.ownerToken), 'content-type': 'application/json' },
+          body: JSON.stringify({ ttlDays }),
+        });
+        assert.equal(res.status, 400, `ttlDays=${ttlDays} should be rejected`);
+      }
+      // No keys should have been minted.
+      const rows = await sql<{ allowed_callers: string[] }[]>`
+        SELECT allowed_callers FROM agents WHERE id = ${setup.agentId}
+      `;
+      assert.deepEqual(rows[0]!.allowed_callers, []);
+    } finally {
+      if (setup) {
+        await teardownApiKeys(sql, setup.agentId);
+        await teardown(sql, owner, setup.clientId);
+      }
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'apikey endpoints return 404 for another owner’s agent (RLS)',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const ownerA = `eth:0x${'d4'.repeat(20)}`;
+    const ownerB = `eth:0x${'e5'.repeat(20)}`;
+    let setupA: SetupResult | null = null;
+    let setupB: SetupResult | null = null;
+    try {
+      setupA = await setupOwner(sql, ownerA);
+      setupB = await setupOwner(sql, ownerB);
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+
+      // ownerB tries to mint a key on ownerA's agent → 404 (RLS hides it).
+      const mint = await app.request(`/admin-api/agents/${setupA.agentId}/apikeys`, {
+        method: 'POST',
+        headers: { ...authHeaders(setupB.ownerToken), 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      assert.equal(mint.status, 404);
+
+      // ownerA's agent still has no callers — nothing leaked through.
+      const rows = await sql<{ allowed_callers: string[] }[]>`
+        SELECT allowed_callers FROM agents WHERE id = ${setupA.agentId}
+      `;
+      assert.deepEqual(rows[0]!.allowed_callers, []);
+    } finally {
+      if (setupA) {
+        await teardownApiKeys(sql, setupA.agentId);
+        await teardown(sql, ownerA, setupA.clientId);
+      }
+      if (setupB) {
+        await teardownApiKeys(sql, setupB.agentId);
+        await teardown(sql, ownerB, setupB.clientId);
+      }
       await sql.end();
     }
   },

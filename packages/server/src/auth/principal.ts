@@ -5,6 +5,9 @@
 //   google:sub:<sub>            Specific Google account (stable numeric id)
 //   google:email:<email>        Google account by email; pinned to sub on first match
 //   google:domain:<domain>      Any verified Google Workspace account from <domain>
+//   apikey:<key-id>             Static API key (provider='apikey' callers row);
+//                               the <key-id> is the public identifier, the bearer
+//                               secret is the vbc_caller_* token itself
 
 export type Principal = string;
 
@@ -12,7 +15,8 @@ export type ParsedPrincipal =
   | { kind: 'eth'; address: string }
   | { kind: 'google-sub'; sub: string }
   | { kind: 'google-email'; email: string }
-  | { kind: 'google-domain'; domain: string };
+  | { kind: 'google-domain'; domain: string }
+  | { kind: 'apikey'; keyId: string };
 
 export interface VerifiedCaller {
   principalId: string;       // e.g. 'google:<sub>' | 'eth:0x...'
@@ -23,6 +27,10 @@ export interface VerifiedCaller {
 
 const ETH_ADDR_RE = /^0x[0-9a-f]{40}$/i;
 const DOMAIN_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/;
+// API key ids are minted from randomBytes(...).toString('base64url'), so the
+// alphabet is url-safe base64. Case-sensitive — a key id is an opaque token,
+// not a human-typed identifier.
+const API_KEY_ID_RE = /^[A-Za-z0-9_-]+$/;
 
 // Parse a stored principal string. Returns null for invalid input.
 export function parsePrincipal(s: string): ParsedPrincipal | null {
@@ -61,6 +69,12 @@ export function parsePrincipal(s: string): ParsedPrincipal | null {
     return { kind: 'google-domain', domain: lower };
   }
 
+  if (s.startsWith('apikey:')) {
+    const keyId = s.slice('apikey:'.length);
+    if (!API_KEY_ID_RE.test(keyId)) return null;
+    return { kind: 'apikey', keyId };
+  }
+
   return null;
 }
 
@@ -89,6 +103,8 @@ export function validatePrincipal(raw: string): Principal | null {
       return 'google:email:' + parsed.email;
     case 'google-domain':
       return 'google:domain:' + parsed.domain;
+    case 'apikey':
+      return 'apikey:' + parsed.keyId;
   }
 }
 
@@ -125,6 +141,12 @@ export function matchPrincipal(entry: Principal, caller: VerifiedCaller): boolea
         }
       }
       return false;
+    }
+    case 'apikey': {
+      // The verified caller's principal is set at issue time to
+      // 'apikey:<key-id>'; matching is exact identity on the key id. No
+      // email/domain semantics — possession of the bearer token is the proof.
+      return caller.principalId === 'apikey:' + parsed.keyId;
     }
   }
 }

@@ -17,6 +17,7 @@ import {
   AdminApiError,
   addCaller,
   deleteClientForOwner,
+  issueAgentApiKey,
   listActiveAgents,
   listCallers,
   listClientsForOwner,
@@ -493,6 +494,48 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         auth.principalId,
         c.req.param('id'),
         principal,
+      );
+      return c.json(result);
+    } catch (err) {
+      return adminApiErrorResponse(c, err);
+    }
+  });
+
+  // Static API keys (issue #308). An API key is a server-minted caller token
+  // (provider='apikey') whose `apikey:<key-id>` principal is auto-added to the
+  // agent's allowed_callers, so non-interactive callers (CI, backend services)
+  // can authenticate with a single Bearer instead of a Google/SIWE login flow.
+  // Minting is the only apikey-specific route — listing and revoking fold into
+  // the unified caller surface (GET/DELETE /admin-api/agents/:id/callers; the
+  // DELETE revokes the underlying token when the principal is an apikey).
+  app.post('/admin-api/agents/:id/apikeys', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    // Body is optional: {} mints a key with the default TTL and no label.
+    let body: unknown = {};
+    const raw = await c.req.text();
+    if (raw.trim().length > 0) {
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return c.json({ error: 'Body must be JSON: { "label"?: string, "ttlDays"?: number }' }, 400);
+      }
+    }
+    if (!isRecord(body)) {
+      return c.json({ error: 'Body must be a JSON object.' }, 400);
+    }
+    const label = typeof body.label === 'string' ? body.label : undefined;
+    if (body.ttlDays !== undefined && typeof body.ttlDays !== 'number') {
+      return c.json({ error: '"ttlDays" must be a number (days).' }, 400);
+    }
+    const ttlDays = typeof body.ttlDays === 'number' ? body.ttlDays : undefined;
+    try {
+      const result = await issueAgentApiKey(
+        opts.db,
+        opts.registry,
+        auth.principalId,
+        c.req.param('id'),
+        { label, ttlDays },
       );
       return c.json(result);
     } catch (err) {

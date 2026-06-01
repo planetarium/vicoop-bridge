@@ -429,11 +429,16 @@ function persistCanonical(
   },
   success: ClientRegisterSuccess,
   bridgeUrl: string,
+  apiKeys: MintedApiKey[] = [],
 ): string | null {
   // --json keeps its scripting contract: no disk side effects, raw response
-  // on stdout.
+  // on stdout. Auto-minted API keys (when no --caller was given) are folded
+  // into the same object under `api_keys` so scripts get the secret too — the
+  // field is additive, so existing consumers of the success fields are
+  // unaffected. Omitted entirely when no key was minted.
   if (args.json) {
-    process.stdout.write(`${JSON.stringify(success, null, 2)}\n`);
+    const payload = apiKeys.length > 0 ? { ...success, api_keys: apiKeys } : success;
+    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
     return null;
   }
   const configPath = writeConfigForSetup(
@@ -549,6 +554,91 @@ async function configureCallers(
   }
 }
 
+// An API key minted at registration time so a fresh agent is never left
+// publicly callable. Shape mirrors the server's POST /apikeys response; the
+// raw `api_key` is shown exactly once.
+interface MintedApiKey {
+  agent_id: string;
+  key_id: string;
+  principal: string;
+  api_key: string;
+  expires_at: string;
+}
+
+async function mintApiKey(
+  session: { bridge: string; token: string },
+  agentId: string,
+  label: string,
+): Promise<MintedApiKey> {
+  const res = await fetch(
+    `${session.bridge.replace(/\/$/, '')}/admin-api/agents/${encodeURIComponent(agentId)}/apikeys`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${session.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ label }),
+    },
+  );
+  const text = await res.text();
+  let parsed: unknown = text;
+  if (text) {
+    try {
+      parsed = JSON.parse(text) as unknown;
+    } catch {
+      // leave raw text
+    }
+  }
+  if (!res.ok) {
+    const detail =
+      parsed && typeof parsed === 'object' && 'error' in parsed
+        ? String((parsed as { error: unknown }).error)
+        : String(parsed);
+    throw new Error(`apikey mint failed for ${agentId} (${res.status}): ${detail}`);
+  }
+  return parsed as MintedApiKey;
+}
+
+// Best-effort: mint one API key per agent. Registration has already minted
+// (and persisted) the agent token by this point, so a mint hiccup must not
+// fail the whole command — failures are collected and the caller degrades to
+// the public-agent warning. Returns both the successful keys and per-agent
+// error strings.
+async function mintApiKeysForAgents(
+  session: { bridge: string; token: string },
+  agentIds: readonly string[],
+  label: string,
+): Promise<{ keys: MintedApiKey[]; errors: string[] }> {
+  const keys: MintedApiKey[] = [];
+  const errors: string[] = [];
+  for (const agentId of agentIds) {
+    try {
+      keys.push(await mintApiKey(session, agentId, label));
+    } catch (e) {
+      errors.push((e as Error).message);
+    }
+  }
+  return { keys, errors };
+}
+
+function renderMintedApiKeyBlock(key: MintedApiKey): string {
+  return [
+    `Minted an API key for ${key.agent_id} (no --caller was given, so the agent`,
+    'is restricted to this key instead of being left public):',
+    `  key_id      ${key.key_id}`,
+    `  principal   ${key.principal}`,
+    `  expires_at  ${key.expires_at}`,
+    '',
+    '  API key (shown once — store it now, it cannot be recovered):',
+    `    ${key.api_key}`,
+    '',
+    '  Callers present it as `Authorization: Bearer <api_key>`. List or revoke',
+    '  it with `vicoop-client agent callers {list,remove}`, or add interactive',
+    '  callers with `vicoop-client agent callers add`.',
+  ].join('\n');
+}
+
 // Label set for human-output text. The new `agent register` and the
 // deprecated `setup` share the same wire path (and identical --json shape so
 // scripts on either entry point keep working) but diverge in their stderr
@@ -560,6 +650,10 @@ interface RegistrationLabels {
   agentsFlag: string;     // '--agent-id' or '--agent-ids'
   tokenLabel: string;     // 'AGENT_TOKEN' or 'CLIENT_TOKEN'
   addCallerHint: string;  // 'vicoop-client agent callers add' or 'vicoop-client add-caller'
+  // When true and no --caller is given, mint an API key per agent instead of
+  // leaving it public + warning. Enabled for `agent register`; the deprecated
+  // `setup` alias keeps its historical public-agent warning unchanged.
+  autoMintApiKeyWhenNoCaller: boolean;
   renderSuccessBlock: (s: ClientRegisterSuccess) => string;
   renderRecoveryBlock: (s: ClientRegisterSuccess, serverUrl: string) => string;
 }
@@ -650,6 +744,24 @@ async function executeRegistration(opts: ExecuteRegistrationOpts): Promise<numbe
     return 1;
   }
 
+  // When no explicit callers were requested, mint an API key per agent up
+  // front instead of leaving it public. Done before persistCanonical so the
+  // --json payload can carry the secret; printed (human mode) later, after the
+  // success/persistence blocks. Best-effort — failures degrade to the
+  // public-agent warning below rather than failing a registration whose token
+  // is already minted.
+  let mintedKeys: MintedApiKey[] = [];
+  let mintErrors: string[] = [];
+  if (opts.callers.length === 0 && opts.labels.autoMintApiKeyWhenNoCaller) {
+    const result = await mintApiKeysForAgents(
+      { bridge, token },
+      success.allowed_agent_ids,
+      `auto (${opts.labels.cmdName})`,
+    );
+    mintedKeys = result.keys;
+    mintErrors = result.errors;
+  }
+
   process.stderr.write(
     `${opts.labels.renderSuccessBlock(success)}\n\n` +
       `The ${opts.labels.tokenLabel} is one-time — the bridge cannot reissue it.\n` +
@@ -675,6 +787,7 @@ async function executeRegistration(opts: ExecuteRegistrationOpts): Promise<numbe
       },
       success,
       bridge,
+      mintedKeys,
     );
   } catch (e) {
     process.stderr.write(`${(e as Error).message}\n`);
@@ -715,11 +828,32 @@ async function executeRegistration(opts: ExecuteRegistrationOpts): Promise<numbe
       return 1;
     }
     process.stderr.write('\n');
-  } else {
+  } else if (!opts.labels.autoMintApiKeyWhenNoCaller) {
+    // Legacy `setup`: keep the historical public-agent warning unchanged.
     process.stderr.write(
       `WARNING: no callers configured. The agent is public until you run ` +
         `\`${opts.labels.addCallerHint} <agent_id> <principal>\`.\n\n`,
     );
+  } else {
+    // `agent register` with no --caller: surface the auto-minted API key(s).
+    // In --json they already rode along in the stdout payload, so only print
+    // the human block otherwise. If minting failed for every agent, fall back
+    // to the public-agent warning so the operator still knows to lock it down.
+    if (mintedKeys.length > 0 && !opts.json) {
+      for (const key of mintedKeys) {
+        process.stderr.write(`${renderMintedApiKeyBlock(key)}\n\n`);
+      }
+    }
+    for (const err of mintErrors) {
+      process.stderr.write(`WARNING: ${err}\n`);
+    }
+    if (mintedKeys.length === 0) {
+      process.stderr.write(
+        `WARNING: no callers configured and API key minting failed. The agent is ` +
+          `public until you run \`${opts.labels.addCallerHint} <agent_id> <principal>\` ` +
+          'or `vicoop-client agent callers issue-api-key <agent_id>`.\n\n',
+      );
+    }
   }
 
   return 0;
@@ -793,6 +927,7 @@ export async function runSetup(args: SetupArgs): Promise<number> {
       agentsFlag: '--agent-ids',
       tokenLabel: 'CLIENT_TOKEN',
       addCallerHint: 'vicoop-client add-caller',
+      autoMintApiKeyWhenNoCaller: false,
       renderSuccessBlock: renderSetupSuccessBlock,
       renderRecoveryBlock: renderSetupRecoveryBlock,
     },
@@ -832,6 +967,7 @@ export async function runAgentRegister(args: AgentRegisterArgs): Promise<number>
       agentsFlag: '--agent-id',
       tokenLabel: 'AGENT_TOKEN',
       addCallerHint: 'vicoop-client agent callers add',
+      autoMintApiKeyWhenNoCaller: true,
       renderSuccessBlock: renderAgentRegisterSuccessBlock,
       renderRecoveryBlock: renderAgentRegisterRecoveryBlock,
     },

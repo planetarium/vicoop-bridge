@@ -27,10 +27,16 @@ export type Audience = 'caller' | 'owner_session';
 
 // Provider label persisted on the row. Expands as new issuance methods
 // are added (e.g. passkey, ssh-agent). Not enforced by schema.
-export type CallerProvider = 'google' | 'siwe';
+//
+//   'google' | 'siwe'  — interactive login flows; principal is the resolved
+//                        identity ('google:<sub>' / 'eth:0x<addr>').
+//   'apikey'           — owner-minted static key for non-interactive callers
+//                        (CI, backend services); principal is 'apikey:<key-id>'
+//                        and the row never carries an email.
+export type CallerProvider = 'google' | 'siwe' | 'apikey';
 
 export interface IssueSessionTokenInput {
-  principalId: string;        // 'google:<sub>' | 'eth:0x<addr>'
+  principalId: string;        // 'google:<sub>' | 'eth:0x<addr>' | 'apikey:<key-id>'
   provider: CallerProvider;
   audience: Audience;
   email?: string;
@@ -98,6 +104,15 @@ export function generateSessionToken(audience: Audience): string {
 // New code should call generateSessionToken(audience) directly.
 export function generateCallerToken(): string {
   return generateSessionToken('caller');
+}
+
+// Public identifier for an API key, embedded in the 'apikey:<key-id>'
+// principal. Distinct from the bearer secret (the vbc_caller_* token): the id
+// is shown in `agent apikey list` and used for revocation, while the token is
+// shown once at mint time. 9 random bytes → 12 url-safe base64 chars; the
+// alphabet matches API_KEY_ID_RE in principal.ts.
+export function generateApiKeyId(): string {
+  return randomBytes(9).toString('base64url');
 }
 
 // sha256 hex of the raw token, for DB lookup.

@@ -40,6 +40,7 @@ import {
   addCallerCmd, agentCmd, listAgentsCmd, listCallersCmd, listClientsCmd,
   removeCallerCmd, revokeClientCmd,
   runAddCaller, runAgentCallersAdd, runAgentCallersList, runAgentCallersRemove,
+  runAgentCallersIssue,
   runAgentDelete, runAgentList, runListAgents, runListCallers, runListClients,
   runRemoveCaller, runRevokeClient,
 } from './admin-cli.js';
@@ -659,6 +660,9 @@ async function main(): Promise<void> {
       break;
     case 'agent-callers-remove':
       process.exit(await runAgentCallersRemove(parsed));
+      break;
+    case 'agent-callers-issue':
+      process.exit(await runAgentCallersIssue(parsed));
       break;
     case 'add-caller':
       process.exit(await runAddCaller(parsed));

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   runAddCaller,
+  runAgentCallersIssue,
   runAgentCallersAdd,
   runAgentCallersList,
   runAgentCallersRemove,
@@ -18,6 +19,7 @@ import {
   runRevokeClient,
   agentCmd,
   type AddCallerArgs,
+  type AgentCallersIssueArgs,
   type AgentCallersAddArgs,
   type AgentCallersListArgs,
   type AgentCallersRemoveArgs,
@@ -79,6 +81,11 @@ const agentCallersRemoveArgsFn = (
   p: Partial<AgentCallersRemoveArgs> = {},
 ): AgentCallersRemoveArgs =>
   ({ action: 'agent-callers-remove', agentId, principal, ...SHARED, ...p });
+const agentCallersIssueArgsFn = (
+  agentId: string,
+  p: Partial<AgentCallersIssueArgs> = {},
+): AgentCallersIssueArgs =>
+  ({ action: 'agent-callers-issue', agentId, label: undefined, ttlDays: undefined, ...SHARED, ...p });
 
 interface Captured {
   url: string;
@@ -597,6 +604,71 @@ test('agent callers list/add/remove hit the existing /admin-api/agents/:id/calle
   );
 });
 
+// ---- `agent callers issue-api-key` — API key minting (#308) ------------------------
+
+test('agent callers issue-api-key POSTs to /apikeys and prints the secret once', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  const { calls } = installFetch(t, {
+    body: {
+      agent_id: 'foo',
+      key_id: 'Ab3-_xYz12',
+      principal: 'apikey:Ab3-_xYz12',
+      api_key: 'vbc_caller_SECRETSECRETSECRET',
+      label: 'ci-deploy',
+      expires_at: '2027-06-01T00:00:00.000Z',
+      allowed_callers: ['apikey:Ab3-_xYz12'],
+    },
+  });
+
+  const code = await runAgentCallersIssue(
+    agentCallersIssueArgsFn('foo', { label: 'ci-deploy', ttlDays: 365 }),
+  );
+  assert.equal(code, 0);
+  assert.equal(calls[0].method, 'POST');
+  assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/apikeys`);
+  assert.equal(calls[0].headers['content-type'], 'application/json');
+  assert.deepEqual(JSON.parse(calls[0].body!), { label: 'ci-deploy', ttlDays: 365 });
+  const out = stdout.read();
+  assert.match(out, /key_id:\s+Ab3-_xYz12/);
+  assert.match(out, /vbc_caller_SECRETSECRETSECRET/);
+});
+
+test('agent callers issue-api-key omits unset label/ttlDays from the body', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, {
+    body: {
+      agent_id: 'foo', key_id: 'k', principal: 'apikey:k',
+      api_key: 'vbc_caller_x', label: null, expires_at: '2027-06-01T00:00:00.000Z',
+      allowed_callers: ['apikey:k'],
+    },
+  });
+
+  const code = await runAgentCallersIssue(agentCallersIssueArgsFn('foo'));
+  assert.equal(code, 0);
+  // Empty object body — server applies its defaults.
+  assert.deepEqual(JSON.parse(calls[0].body!), {});
+});
+
+// Minting lives under `callers` (issue); listing/revoking are `callers
+// list`/`remove` — there is no separate `apikey` group. No deprecation warning.
+test('agent callers issue-api-key does NOT emit deprecation warnings', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const stderr = captureStderr(t);
+  installFetch(t, {
+    body: {
+      agent_id: 'foo', key_id: 'k', principal: 'apikey:k',
+      api_key: 'vbc_caller_x', label: null, expires_at: '2027-06-01T00:00:00.000Z',
+      allowed_callers: ['apikey:k'],
+    },
+  });
+
+  assert.equal(await runAgentCallersIssue(agentCallersIssueArgsFn('foo')), 0);
+  assert.doesNotMatch(stderr.read(), /deprecated/i);
+});
+
 // Regression: the sub-subcommands `agent callers list <ID>` and
 // `agent callers remove <ID> <PRINCIPAL>` share the literal names `list` /
 // `remove` with the top-level `agent list` / `agent remove` commands. Those
@@ -607,7 +679,7 @@ test('agent callers list/add/remove hit the existing /admin-api/agents/:id/calle
 // before the colliding siblings so the correct branch wins. These assertions
 // go through the real optique parser (the `runXxx` tests above construct the
 // parsed shape directly and would not have caught the parse-level regression).
-test('agent callers {list,remove} parse through the real parser with their AGENT_ID', () => {
+test('agent callers {list,remove,issue-api-key} parse through the real parser with their AGENT_ID', () => {
   const expectOk = (argv: string[], expected: Record<string, unknown>) => {
     const r = parse(agentCmd, argv);
     assert.equal(r.success, true, `expected ${argv.join(' ')} to parse`);
@@ -630,6 +702,14 @@ test('agent callers {list,remove} parse through the real parser with their AGENT
     action: 'agent-callers-remove',
     agentId: 'foo',
     principal,
+  });
+  // `issue` is in the same tie-class (AGENT_ID positional vs the all-optional
+  // top-level `list`/`remove`) — it must keep its AGENT_ID through the parser.
+  expectOk(['agent', 'callers', 'issue-api-key', 'foo'], {
+    action: 'agent-callers-issue',
+    agentId: 'foo',
+    label: undefined,
+    ttlDays: undefined,
   });
   // The top-level siblings must keep working after the reorder.
   expectOk(['agent', 'list'], { action: 'agent-list', connected: false });

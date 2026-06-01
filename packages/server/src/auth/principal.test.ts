@@ -104,6 +104,29 @@ test('parsePrincipal: google:domain invalid chars', () => {
   assert.equal(parsePrincipal('google:domain:foo_bar.com'), null);
 });
 
+test('parsePrincipal: apikey valid (url-safe base64 id)', () => {
+  assert.deepEqual(
+    parsePrincipal('apikey:Ab3-_xYz12'),
+    { kind: 'apikey', keyId: 'Ab3-_xYz12' },
+  );
+});
+
+test('parsePrincipal: apikey preserves case (id is opaque)', () => {
+  assert.deepEqual(
+    parsePrincipal('apikey:AbCdEf'),
+    { kind: 'apikey', keyId: 'AbCdEf' },
+  );
+});
+
+test('parsePrincipal: apikey empty id', () => {
+  assert.equal(parsePrincipal('apikey:'), null);
+});
+
+test('parsePrincipal: apikey invalid chars', () => {
+  assert.equal(parsePrincipal('apikey:has spaces'), null);
+  assert.equal(parsePrincipal('apikey:has:colon'), null);
+});
+
 test('parsePrincipal: unknown prefix', () => {
   assert.equal(parsePrincipal('facebook:123'), null);
 });
@@ -185,6 +208,18 @@ test('validatePrincipal: unknown prefix', () => {
 
 test('validatePrincipal: malformed email', () => {
   assert.equal(validatePrincipal('google:email:notanemail'), null);
+});
+
+test('validatePrincipal: apikey passes through unchanged', () => {
+  assert.equal(validatePrincipal('apikey:Ab3-_xYz12'), 'apikey:Ab3-_xYz12');
+});
+
+test('validatePrincipal: apikey trims surrounding whitespace', () => {
+  assert.equal(validatePrincipal('  apikey:Ab3-_xYz12 '), 'apikey:Ab3-_xYz12');
+});
+
+test('validatePrincipal: apikey empty id', () => {
+  assert.equal(validatePrincipal('apikey:'), null);
 });
 
 // ---------- matchPrincipal ----------
@@ -315,6 +350,26 @@ test('matchPrincipal: google:domain miss when email suffix is a subdomain (not e
     emailVerified: true,
   };
   assert.equal(matchPrincipal('google:domain:example.com', caller), false);
+});
+
+test('matchPrincipal: apikey hit (exact id, no email needed)', () => {
+  const caller = { principalId: 'apikey:Ab3-_xYz12' };
+  assert.equal(matchPrincipal('apikey:Ab3-_xYz12', caller), true);
+});
+
+test('matchPrincipal: apikey miss (different id)', () => {
+  const caller = { principalId: 'apikey:DIFFERENT01' };
+  assert.equal(matchPrincipal('apikey:Ab3-_xYz12', caller), false);
+});
+
+test('matchPrincipal: apikey is case-sensitive', () => {
+  const caller = { principalId: 'apikey:abcdef' };
+  assert.equal(matchPrincipal('apikey:ABCDEF', caller), false);
+});
+
+test('matchPrincipal: apikey entry but caller is google', () => {
+  const caller = { principalId: 'google:1234567890' };
+  assert.equal(matchPrincipal('apikey:Ab3-_xYz12', caller), false);
 });
 
 test('matchPrincipal: unparseable entry returns false', () => {
