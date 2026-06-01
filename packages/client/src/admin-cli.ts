@@ -182,56 +182,14 @@ const agentApikeyGenerateSubCmd = command(
   },
 );
 
-function agentApikeyListCommand(name: 'list' | 'ls', alias: boolean) {
-  return command(
-    name,
-    object({
-      action: constant('agent-apikey-list' as const),
-      ...sharedFlags,
-      agentId: argument(string({ metavar: 'AGENT_ID' })),
-    }),
-    {
-      brief: message`List the agent's API keys. (alias: \`ls\`)`,
-      description: message`Calls GET /admin-api/agents/<AGENT_ID>/apikeys. Shows key ids, labels, and expiry — never the raw secret.`,
-      ...(alias ? { hidden: 'help' as const } : {}),
-    },
-  );
-}
-
-const agentApikeyListSubCmd = longestMatch(
-  agentApikeyListCommand('list', false),
-  agentApikeyListCommand('ls', true),
-);
-
-function agentApikeyRevokeCommand(name: 'revoke' | 'rm', alias: boolean) {
-  return command(
-    name,
-    object({
-      action: constant('agent-apikey-revoke' as const),
-      ...sharedFlags,
-      agentId: argument(string({ metavar: 'AGENT_ID' })),
-      keyId: argument(string({ metavar: 'KEY_ID' })),
-    }),
-    {
-      brief: message`Revoke an API key by id. (alias: \`rm\`)`,
-      description: message`Calls DELETE /admin-api/agents/<AGENT_ID>/apikeys/<KEY_ID>. Removes the principal from allowed-callers and marks the token revoked; takes effect within ~60s.`,
-      ...(alias ? { hidden: 'help' as const } : {}),
-    },
-  );
-}
-
-const agentApikeyRevokeSubCmd = longestMatch(
-  agentApikeyRevokeCommand('revoke', false),
-  agentApikeyRevokeCommand('rm', true),
-);
-
-const agentApikeySubCmd = command(
-  'apikey',
-  longestMatch(agentApikeyGenerateSubCmd, agentApikeyListSubCmd, agentApikeyRevokeSubCmd),
-  {
-    brief: message`Manage the agent's static API keys.`,
-  },
-);
+// Minting (generating a one-time secret) is the only apikey-specific
+// operation. Listing and de-authorizing fold into the unified caller surface:
+// `agent callers list` shows apikey rows (TYPE=apikey) and
+// `agent callers remove <AGENT_ID> apikey:<key-id>` drops the principal AND
+// revokes the underlying token server-side.
+const agentApikeySubCmd = command('apikey', agentApikeyGenerateSubCmd, {
+  brief: message`Mint static API keys (list/remove via \`agent callers\`).`,
+});
 
 export const agentCmd = command(
   'agent',
@@ -239,10 +197,10 @@ export const agentCmd = command(
   // `agentListSubCmd` / `agentRemoveSubCmd`. `@optique` `longestMatch` breaks
   // consumed-token ties by source order, and the top-level `list` / `remove`
   // commands have all-optional bodies that tie with the nested
-  // `callers {list,remove} <AGENT_ID>` (and `apikey {list,revoke} <AGENT_ID>`)
-  // match — when they win the tie the AGENT_ID positional is dropped and
-  // parsing fails with "Unexpected ... <id>". Putting the AGENT_ID-consuming
-  // groups first makes the correct branch win. See admin-cli.test.ts.
+  // `callers {list,remove} <AGENT_ID>` match — when they win the tie the
+  // AGENT_ID positional is dropped and parsing fails with "Unexpected ... <id>".
+  // Putting the AGENT_ID-consuming groups first makes the correct branch win.
+  // (`apikey generate <AGENT_ID>` is in the same tie-class.) See admin-cli.test.ts.
   longestMatch(
     agentRegisterCmd,
     agentCallersSubCmd,
@@ -252,7 +210,7 @@ export const agentCmd = command(
   ),
   {
     brief: message`Manage agent registrations, allowed callers, and API keys.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove}\`, \`apikey {generate, list, revoke}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove}\`, \`apikey generate\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
     hidden: 'usage',
   },
 );
@@ -264,8 +222,6 @@ export type AgentCallersListArgs = Extract<AgentCliArgs, { action: 'agent-caller
 export type AgentCallersAddArgs = Extract<AgentCliArgs, { action: 'agent-callers-add' }>;
 export type AgentCallersRemoveArgs = Extract<AgentCliArgs, { action: 'agent-callers-remove' }>;
 export type AgentApikeyGenerateArgs = Extract<AgentCliArgs, { action: 'agent-apikey-generate' }>;
-export type AgentApikeyListArgs = Extract<AgentCliArgs, { action: 'agent-apikey-list' }>;
-export type AgentApikeyRevokeArgs = Extract<AgentCliArgs, { action: 'agent-apikey-revoke' }>;
 
 // ----- Legacy flat commands (deprecated, kept as aliases) --------------------
 //
@@ -508,29 +464,6 @@ function renderApikeyGenerate(body: unknown): string {
     'API key (shown once — store it now, it cannot be recovered):',
     `  ${b.api_key}`,
   ].join('\n');
-}
-
-function renderApikeyList(body: unknown): string {
-  if (!body || typeof body !== 'object' || !('keys' in body)) return String(body);
-  const keys = (body as { keys: Array<Record<string, unknown>> }).keys;
-  if (keys.length === 0) return '(no API keys)';
-  const tableRows = keys.map((k) => [
-    String(k.key_id ?? ''),
-    String((k.label as string | null) ?? ''),
-    String(k.revoked),
-    String(k.expires_at ?? ''),
-    String((k.last_used_at as string | null) ?? '(never)'),
-  ]);
-  return renderTable(
-    ['KEY_ID', 'LABEL', 'REVOKED', 'EXPIRES_AT', 'LAST_USED_AT'],
-    tableRows,
-  );
-}
-
-function renderApikeyRevoke(body: unknown): string {
-  if (!body || typeof body !== 'object') return String(body);
-  const b = body as { agent_id?: string; key_id?: string; revoked?: boolean };
-  return `agent: ${b.agent_id}\nkey_id: ${b.key_id}\nrevoked: ${b.revoked}`;
 }
 
 // The `TYPE` column of the callers table is display-only; the `PRINCIPAL`
@@ -819,34 +752,6 @@ export async function runAgentApikeyGenerate(args: AgentApikeyGenerateArgs): Pro
     body,
   });
   return emit(result, args.json, renderApikeyGenerate);
-}
-
-export async function runAgentApikeyList(args: AgentApikeyListArgs): Promise<number> {
-  const session = resolveSession(args);
-  if ('error' in session) {
-    process.stderr.write(`${session.error}\n`);
-    return 1;
-  }
-  const result = await callApi({
-    session,
-    method: 'GET',
-    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/apikeys`,
-  });
-  return emit(result, args.json, renderApikeyList);
-}
-
-export async function runAgentApikeyRevoke(args: AgentApikeyRevokeArgs): Promise<number> {
-  const session = resolveSession(args);
-  if ('error' in session) {
-    process.stderr.write(`${session.error}\n`);
-    return 1;
-  }
-  const result = await callApi({
-    session,
-    method: 'DELETE',
-    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/apikeys/${encodeURIComponent(args.keyId)}`,
-  });
-  return emit(result, args.json, renderApikeyRevoke);
 }
 
 // ----- Deprecated flat handlers ---------------------------------------------

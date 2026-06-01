@@ -372,13 +372,16 @@ is restricted to this key instead of being left public):
     vbc_caller_…
 ```
 
-Callers present it as `Authorization: Bearer <api_key>`; manage keys with
-`vicoop-client agent apikey {list,revoke}` or add interactive (Google/SIWE)
-callers with `vicoop-client agent callers add`. With `--json`, the key rides
-along in the same payload under an `api_keys` array. If key minting fails (an
-older bridge without the apikeys route, or a transient error), the command
-falls back to the legacy public-agent warning so you can lock it down by hand.
-The deprecated `setup` alias keeps the old warning behavior unchanged.
+Callers present it as `Authorization: Bearer <api_key>`. Keys are unified with
+the regular caller surface: list them with `vicoop-client agent callers list`
+(shown as TYPE=apikey) and revoke with
+`vicoop-client agent callers remove <agent-id> apikey:<key-id>` (this drops the
+principal **and** kills the token), or add interactive (Google/SIWE) callers
+with `vicoop-client agent callers add`. With `--json`, the key rides along in
+the register payload under an `api_keys` array. If key minting fails (an older
+bridge without the apikeys route, or a transient error), the command falls back
+to the legacy public-agent warning so you can lock it down by hand. The
+deprecated `setup` alias keeps the old warning behavior unchanged.
 
 > `--caller` / auto-minted API keys require a bridge server version that
 > stores caller allowlists on registered agents. If you are testing against
@@ -833,23 +836,27 @@ script — mint a **static API key** instead. The key is a long-lived
 agent's `allowed_callers`, so issuing it both creates the credential and
 authorizes it in one step:
 
+Minting is the only key-specific command; everything else is the regular
+caller surface (a key is just "a caller the bridge issued a secret for"):
+
 ```sh
 # Mint a key (the raw secret is printed exactly once — store it now):
 vicoop-client agent apikey generate "$AGENT_ID" --label ci-deploy
 # Optional: override the default 365-day lifetime
 vicoop-client agent apikey generate "$AGENT_ID" --ttl-days 30 --json
 
-# List a key's metadata (never the secret) and revoke by key id:
-vicoop-client agent apikey list "$AGENT_ID"
-vicoop-client agent apikey revoke "$AGENT_ID" "<KEY_ID>"
+# List / revoke through the unified caller commands:
+vicoop-client agent callers list "$AGENT_ID"                      # apikey rows show TYPE=apikey
+vicoop-client agent callers remove "$AGENT_ID" "apikey:<key-id>"  # drops principal AND revokes token
 ```
 
 The caller then presents the key as a normal bearer:
 `Authorization: Bearer vbc_caller_…` against
-`POST $BRIDGE_URL/agents/$AGENT_ID`. Revocation removes the principal from
-`allowed_callers` and marks the token revoked; it takes effect within ~60s.
-These talk to the same owner-authenticated `/admin-api/agents/:id/apikeys`
-routes and require the owner-session bearer like the commands above.
+`POST $BRIDGE_URL/agents/$AGENT_ID`. Removing the `apikey:<key-id>` principal
+both de-authorizes it and revokes the underlying token; it takes effect within
+~60s. Minting hits `POST /admin-api/agents/:id/apikeys` and listing/removal hit
+`/admin-api/agents/:id/callers` — all owner-authenticated like the commands
+above.
 
 ## Updating the client
 

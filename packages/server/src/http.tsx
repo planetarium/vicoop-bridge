@@ -19,11 +19,9 @@ import {
   deleteClientForOwner,
   issueAgentApiKey,
   listActiveAgents,
-  listAgentApiKeys,
   listCallers,
   listClientsForOwner,
   removeCaller,
-  revokeAgentApiKey,
 } from './admin-api.js';
 import { agentAuthMiddleware, getAgentConn, getCaller } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
@@ -507,17 +505,9 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // (provider='apikey') whose `apikey:<key-id>` principal is auto-added to the
   // agent's allowed_callers, so non-interactive callers (CI, backend services)
   // can authenticate with a single Bearer instead of a Google/SIWE login flow.
-  app.get('/admin-api/agents/:id/apikeys', async (c) => {
-    const auth = await authOwnerSession(c);
-    if (!auth.ok) return adminApiUnauthorized(c, auth);
-    try {
-      const result = await listAgentApiKeys(opts.db, auth.principalId, c.req.param('id'));
-      return c.json(result);
-    } catch (err) {
-      return adminApiErrorResponse(c, err);
-    }
-  });
-
+  // Minting is the only apikey-specific route — listing and revoking fold into
+  // the unified caller surface (GET/DELETE /admin-api/agents/:id/callers; the
+  // DELETE revokes the underlying token when the principal is an apikey).
   app.post('/admin-api/agents/:id/apikeys', async (c) => {
     const auth = await authOwnerSession(c);
     if (!auth.ok) return adminApiUnauthorized(c, auth);
@@ -546,23 +536,6 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         auth.principalId,
         c.req.param('id'),
         { label, ttlDays },
-      );
-      return c.json(result);
-    } catch (err) {
-      return adminApiErrorResponse(c, err);
-    }
-  });
-
-  app.delete('/admin-api/agents/:id/apikeys/:keyId', async (c) => {
-    const auth = await authOwnerSession(c);
-    if (!auth.ok) return adminApiUnauthorized(c, auth);
-    try {
-      const result = await revokeAgentApiKey(
-        opts.db,
-        opts.registry,
-        auth.principalId,
-        c.req.param('id'),
-        c.req.param('keyId'),
       );
       return c.json(result);
     } catch (err) {

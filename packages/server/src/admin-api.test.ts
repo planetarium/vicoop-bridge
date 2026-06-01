@@ -699,7 +699,7 @@ test(
 );
 
 test(
-  'GET/DELETE /admin-api/agents/:id/apikeys list and revoke the key',
+  'unified surface: GET callers lists an apikey, DELETE callers revokes its token',
   { skip: !hasDb },
   async () => {
     const sql = postgres(process.env.DATABASE_URL!);
@@ -721,36 +721,32 @@ test(
       const ttlDays = (new Date(minted.expires_at).getTime() - Date.now()) / (24 * 60 * 60 * 1000);
       assert.ok(ttlDays > 0.9 && ttlDays < 1.1, `expected ~1d TTL, got ${ttlDays}d`);
 
-      // List shows it, never the secret.
-      const list = await app.request(`/admin-api/agents/${setup.agentId}/apikeys`, {
+      // The unified caller list shows the apikey principal (no secret).
+      const list = await app.request(`/admin-api/agents/${setup.agentId}/callers`, {
         headers: authHeaders(setup.ownerToken),
       });
       assert.equal(list.status, 200);
-      const listBody = (await list.json()) as { keys: Array<{ key_id: string; revoked: boolean; api_key?: string }> };
-      assert.equal(listBody.keys.length, 1);
-      assert.equal(listBody.keys[0]!.key_id, minted.key_id);
-      assert.equal(listBody.keys[0]!.revoked, false);
-      assert.equal(listBody.keys[0]!.api_key, undefined);
+      const listBody = (await list.json()) as { allowed_callers: string[] };
+      assert.deepEqual(listBody.allowed_callers, [minted.principal]);
 
-      // Revoke removes the principal and flips the row.
+      // DELETE on the caller surface removes the principal AND revokes the
+      // underlying token (the apikey-specific branch in removeCaller).
       const del = await app.request(
-        `/admin-api/agents/${setup.agentId}/apikeys/${encodeURIComponent(minted.key_id)}`,
+        `/admin-api/agents/${setup.agentId}/callers?principal=${encodeURIComponent(minted.principal)}`,
         { method: 'DELETE', headers: authHeaders(setup.ownerToken) },
       );
       assert.equal(del.status, 200);
-      const delBody = (await del.json()) as { revoked: boolean; allowed_callers: string[] };
-      assert.equal(delBody.revoked, true);
+      const delBody = (await del.json()) as { allowed_callers: string[] };
       assert.deepEqual(delBody.allowed_callers, []);
 
-      // The token no longer verifies (revoked).
+      // Token no longer verifies (revoked) — not merely de-authorized.
       await assert.rejects(() => verifyCallerToken(sql, minted.api_key), /revoked/i);
 
-      // Revoking an unknown key id is a 404.
-      const missing = await app.request(
-        `/admin-api/agents/${setup.agentId}/apikeys/does-not-exist`,
-        { method: 'DELETE', headers: authHeaders(setup.ownerToken) },
-      );
-      assert.equal(missing.status, 404);
+      // And the DB row is flipped.
+      const rows = await sql<{ revoked: boolean }[]>`
+        SELECT revoked FROM callers WHERE provider = 'apikey' AND principal_id = ${minted.principal}
+      `;
+      assert.equal(rows[0]?.revoked, true);
     } finally {
       if (setup) {
         await teardownApiKeys(sql, setup.agentId);
@@ -810,18 +806,13 @@ test(
       const registry = new Registry();
       const app = createHttpApp({ db: sql, registry });
 
-      // ownerB tries to mint / list a key on ownerA's agent → 404 (RLS hides it).
+      // ownerB tries to mint a key on ownerA's agent → 404 (RLS hides it).
       const mint = await app.request(`/admin-api/agents/${setupA.agentId}/apikeys`, {
         method: 'POST',
         headers: { ...authHeaders(setupB.ownerToken), 'content-type': 'application/json' },
         body: JSON.stringify({}),
       });
       assert.equal(mint.status, 404);
-
-      const list = await app.request(`/admin-api/agents/${setupA.agentId}/apikeys`, {
-        headers: authHeaders(setupB.ownerToken),
-      });
-      assert.equal(list.status, 404);
 
       // ownerA's agent still has no callers — nothing leaked through.
       const rows = await sql<{ allowed_callers: string[] }[]>`

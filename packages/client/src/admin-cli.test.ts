@@ -7,8 +7,6 @@ import { join } from 'node:path';
 import {
   runAddCaller,
   runAgentApikeyGenerate,
-  runAgentApikeyList,
-  runAgentApikeyRevoke,
   runAgentCallersAdd,
   runAgentCallersList,
   runAgentCallersRemove,
@@ -22,8 +20,6 @@ import {
   agentCmd,
   type AddCallerArgs,
   type AgentApikeyGenerateArgs,
-  type AgentApikeyListArgs,
-  type AgentApikeyRevokeArgs,
   type AgentCallersAddArgs,
   type AgentCallersListArgs,
   type AgentCallersRemoveArgs,
@@ -90,16 +86,6 @@ const agentApikeyGenerateArgsFn = (
   p: Partial<AgentApikeyGenerateArgs> = {},
 ): AgentApikeyGenerateArgs =>
   ({ action: 'agent-apikey-generate', agentId, label: undefined, ttlDays: undefined, ...SHARED, ...p });
-const agentApikeyListArgsFn = (
-  agentId: string,
-  p: Partial<AgentApikeyListArgs> = {},
-): AgentApikeyListArgs => ({ action: 'agent-apikey-list', agentId, ...SHARED, ...p });
-const agentApikeyRevokeArgsFn = (
-  agentId: string,
-  keyId: string,
-  p: Partial<AgentApikeyRevokeArgs> = {},
-): AgentApikeyRevokeArgs =>
-  ({ action: 'agent-apikey-revoke', agentId, keyId, ...SHARED, ...p });
 
 interface Captured {
   url: string;
@@ -665,51 +651,21 @@ test('agent apikey generate omits unset label/ttlDays from the body', async (t) 
   assert.deepEqual(JSON.parse(calls[0].body!), {});
 });
 
-test('agent apikey list GETs /apikeys and never shows a secret', async (t) => {
-  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
-  const stdout = captureStdout(t);
-  const { calls } = installFetch(t, {
-    body: {
-      agent_id: 'foo',
-      keys: [
-        {
-          key_id: 'Ab3-_xYz12', principal: 'apikey:Ab3-_xYz12', label: 'ci-deploy',
-          expires_at: '2027-06-01T00:00:00.000Z', last_used_at: null,
-          revoked: false, created_at: '2026-06-01T00:00:00.000Z',
-        },
-      ],
-    },
-  });
-
-  const code = await runAgentApikeyList(agentApikeyListArgsFn('foo'));
-  assert.equal(code, 0);
-  assert.equal(calls[0].method, 'GET');
-  assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/apikeys`);
-  const out = stdout.read();
-  assert.match(out, /KEY_ID\s+LABEL\s+REVOKED\s+EXPIRES_AT\s+LAST_USED_AT/);
-  assert.match(out, /^Ab3-_xYz12\s+ci-deploy\s+false\b/m);
-});
-
-test('agent apikey revoke DELETEs /apikeys/<KEY_ID>', async (t) => {
-  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
-  captureStdout(t);
-  const { calls } = installFetch(t, {
-    body: { agent_id: 'foo', key_id: 'Ab3-_xYz12', principal: 'apikey:Ab3-_xYz12', revoked: true, allowed_callers: [] },
-  });
-
-  const code = await runAgentApikeyRevoke(agentApikeyRevokeArgsFn('foo', 'Ab3-_xYz12'));
-  assert.equal(code, 0);
-  assert.equal(calls[0].method, 'DELETE');
-  assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/apikeys/Ab3-_xYz12`);
-});
-
-test('agent apikey subcommands do NOT emit deprecation warnings', async (t) => {
+// Listing and revoking fold into `agent callers list/remove` under the unified
+// model (#308) — `agent apikey` only mints.
+test('agent apikey generate does NOT emit deprecation warnings', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   captureStdout(t);
   const stderr = captureStderr(t);
-  installFetch(t, { body: { agent_id: 'foo', keys: [] } });
+  installFetch(t, {
+    body: {
+      agent_id: 'foo', key_id: 'k', principal: 'apikey:k',
+      api_key: 'vbc_caller_x', label: null, expires_at: '2027-06-01T00:00:00.000Z',
+      allowed_callers: ['apikey:k'],
+    },
+  });
 
-  assert.equal(await runAgentApikeyList(agentApikeyListArgsFn('foo')), 0);
+  assert.equal(await runAgentApikeyGenerate(agentApikeyGenerateArgsFn('foo')), 0);
   assert.doesNotMatch(stderr.read(), /deprecated/i);
 });
 
@@ -752,34 +708,22 @@ test('agent callers {list,remove} parse through the real parser with their AGENT
   expectOk(['agent', 'remove', 'foo', '--yes'], { action: 'agent-delete', target: 'foo', yes: true });
 });
 
-// Same tie-class as `callers`: `agent apikey {list,revoke} <AGENT_ID>` carry a
+// Same tie-class as `callers`: `agent apikey generate <AGENT_ID>` carries a
 // required positional that ties with the all-optional top-level `list` /
 // `remove`. `agentApikeySubCmd` is ordered before those siblings; assert the
 // positional survives through the real parser.
-test('agent apikey {generate,list,revoke} parse through the real parser with their AGENT_ID', () => {
-  const expectOk = (argv: string[], expected: Record<string, unknown>) => {
-    const r = parse(agentCmd, argv);
-    assert.equal(r.success, true, `expected ${argv.join(' ')} to parse`);
-    if (r.success) assert.deepEqual(r.value, { ...SHARED, ...expected });
-  };
-  expectOk(['agent', 'apikey', 'generate', 'foo'], {
-    action: 'agent-apikey-generate',
-    agentId: 'foo',
-    label: undefined,
-    ttlDays: undefined,
-  });
-  expectOk(['agent', 'apikey', 'list', 'foo'], { action: 'agent-apikey-list', agentId: 'foo' });
-  expectOk(['agent', 'apikey', 'ls', 'foo'], { action: 'agent-apikey-list', agentId: 'foo' });
-  expectOk(['agent', 'apikey', 'revoke', 'foo', 'KEY1'], {
-    action: 'agent-apikey-revoke',
-    agentId: 'foo',
-    keyId: 'KEY1',
-  });
-  expectOk(['agent', 'apikey', 'rm', 'foo', 'KEY1'], {
-    action: 'agent-apikey-revoke',
-    agentId: 'foo',
-    keyId: 'KEY1',
-  });
+test('agent apikey generate parses through the real parser with its AGENT_ID', () => {
+  const r = parse(agentCmd, ['agent', 'apikey', 'generate', 'foo']);
+  assert.equal(r.success, true);
+  if (r.success) {
+    assert.deepEqual(r.value, {
+      ...SHARED,
+      action: 'agent-apikey-generate',
+      agentId: 'foo',
+      label: undefined,
+      ttlDays: undefined,
+    });
+  }
 });
 
 // The new `agent` commands must not print a deprecation warning — that's

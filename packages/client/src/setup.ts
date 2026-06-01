@@ -633,9 +633,9 @@ function renderMintedApiKeyBlock(key: MintedApiKey): string {
     '  API key (shown once — store it now, it cannot be recovered):',
     `    ${key.api_key}`,
     '',
-    '  Callers present it as `Authorization: Bearer <api_key>`. Manage with',
-    '  `vicoop-client agent apikey {list,revoke}`, or add interactive callers',
-    '  with `vicoop-client agent callers add`.',
+    '  Callers present it as `Authorization: Bearer <api_key>`. List or revoke',
+    '  it with `vicoop-client agent callers {list,remove}`, or add interactive',
+    '  callers with `vicoop-client agent callers add`.',
   ].join('\n');
 }
 

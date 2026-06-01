@@ -172,6 +172,22 @@ export async function removeCaller(
   }
 
   const callers = result[0].allowed_callers as string[];
+
+  // Unify model (#308): an `apikey:<id>` principal IS a bridge-minted
+  // credential, not an external identity. Removing it from the allowlist must
+  // also kill the underlying token — otherwise the secret stays valid (just
+  // unauthorized for this agent) and could be re-added elsewhere. Privileged
+  // write; `callers` is server-only. No-op for eth/google principals, whose
+  // session tokens are ephemeral and identity-scoped (de-authorizing the
+  // identity in allowed_callers is sufficient).
+  if (normalized.startsWith('apikey:')) {
+    await db`
+      UPDATE callers
+      SET revoked = true
+      WHERE provider = 'apikey' AND principal_id = ${normalized}
+    `;
+  }
+
   registry.updateAllowedCallers(agentId, callers);
   return { agent_id: agentId, principal: normalized, allowed_callers: callers };
 }
@@ -208,8 +224,13 @@ export async function listCallers(
 // An API key is a regular caller token (provider='apikey', audience='caller')
 // whose principal is `apikey:<key-id>`, with that principal auto-added to the
 // target agent's allowed_callers so the key authorizes exactly that agent and
-// nothing else. Verification reuses the existing caller-token path entirely —
-// the only new surface is minting, listing, and revoking.
+// nothing else. Verification reuses the existing caller-token path entirely.
+//
+// Unified model: an API key is just "a caller the bridge minted a secret for",
+// so the only apikey-specific operation is minting (issueAgentApiKey). Listing
+// and de-authorizing fold into the regular caller surface — `agent callers
+// list` shows `apikey:<id>` rows (TYPE=apikey) and `removeCaller` both drops
+// the principal AND revokes the underlying token (see its apikey branch).
 //
 // RLS note: ownership is enforced against the `agents` table under the
 // operator's app_authenticated context (RLS hides agents they don't own). The
@@ -224,16 +245,6 @@ const DEFAULT_API_KEY_TTL_DAYS = 365;
 const MAX_API_KEY_TTL_DAYS = 365 * 5;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
-export interface ApiKeyInfo {
-  key_id: string;
-  principal: string;
-  label: string | null;
-  expires_at: string;
-  last_used_at: string | null;
-  revoked: boolean;
-  created_at: string;
-}
-
 export interface ApiKeyIssueResult {
   agent_id: string;
   key_id: string;
@@ -245,32 +256,10 @@ export interface ApiKeyIssueResult {
   allowed_callers: string[];
 }
 
-export interface ApiKeyListResult {
-  agent_id: string;
-  keys: ApiKeyInfo[];
-}
-
-export interface ApiKeyRevokeResult {
-  agent_id: string;
-  key_id: string;
-  principal: string;
-  revoked: true;
-  allowed_callers: string[];
-}
-
-function toIso(v: unknown): string {
-  return v instanceof Date ? v.toISOString() : (v as string);
-}
-
-function toIsoOrNull(v: unknown): string | null {
-  if (v == null) return null;
-  return v instanceof Date ? v.toISOString() : (v as string);
-}
-
 // Append `principal` to an owned agent's allowed_callers under RLS and return
 // the new array, or null if the agent is not visible to this principal (not
-// found / not owned). Shared by issue (append) — revoke uses array_remove
-// inline since it needs a presence check.
+// found / not owned). Used by apikey issuance; listing/removal of keys goes
+// through the unified `agent callers list` / `removeCaller` path.
 async function appendAllowedCallerOwned(
   db: Sql,
   principalId: string,
@@ -355,115 +344,6 @@ export async function issueAgentApiKey(
     api_key: issued.rawToken,
     label: label ?? null,
     expires_at: issued.expiresAt.toISOString(),
-    allowed_callers: allowedCallers,
-  };
-}
-
-export async function listAgentApiKeys(
-  db: Sql,
-  principalId: string,
-  agentId: string,
-): Promise<ApiKeyListResult> {
-  // Ownership gate via RLS: a non-owner sees no agent row → 404.
-  const agentRows = await db.begin(async (tx) => {
-    await setRlsContext(tx, principalId);
-    return tx`SELECT allowed_callers FROM agents WHERE id = ${agentId}`;
-  });
-  if (agentRows.length === 0) {
-    throw new AdminApiError('Agent not found or not authorized.', 404);
-  }
-  const allowed = agentRows[0].allowed_callers as string[];
-  const apiKeyPrincipals = allowed.filter((p) => p.startsWith('apikey:'));
-  if (apiKeyPrincipals.length === 0) {
-    return { agent_id: agentId, keys: [] };
-  }
-
-  // Privileged read scoped to exactly this owner's apikey principals.
-  const rows = await db<
-    {
-      principal_id: string;
-      label: string | null;
-      expires_at: Date;
-      last_used_at: Date | null;
-      revoked: boolean;
-      created_at: Date;
-    }[]
-  >`
-    SELECT principal_id, label, expires_at, last_used_at, revoked, created_at
-    FROM callers
-    WHERE provider = 'apikey'
-      AND audience = 'caller'
-      AND principal_id = ANY(${db.array(apiKeyPrincipals)})
-    ORDER BY created_at DESC
-  `;
-
-  return {
-    agent_id: agentId,
-    keys: rows.map((r) => ({
-      key_id: r.principal_id.slice('apikey:'.length),
-      principal: r.principal_id,
-      label: r.label,
-      expires_at: toIso(r.expires_at),
-      last_used_at: toIsoOrNull(r.last_used_at),
-      revoked: r.revoked,
-      created_at: toIso(r.created_at),
-    })),
-  };
-}
-
-export async function revokeAgentApiKey(
-  db: Sql,
-  registry: Registry,
-  principalId: string,
-  agentId: string,
-  keyId: string,
-): Promise<ApiKeyRevokeResult> {
-  const principal = 'apikey:' + keyId;
-
-  // Step 1: remove the principal from the owned agent under RLS. The
-  // `= ANY(allowed_callers)` guard means 0 rows can mean either "not owned"
-  // or "key not on this agent"; disambiguate with a follow-up existence read.
-  const removed = await db.begin(async (tx) => {
-    await setRlsContext(tx, principalId);
-    return tx`
-      UPDATE agents
-      SET allowed_callers = array_remove(allowed_callers, ${principal}),
-          updated_at = now()
-      WHERE id = ${agentId}
-        AND ${principal} = ANY(allowed_callers)
-      RETURNING allowed_callers
-    `;
-  });
-
-  if (removed.length === 0) {
-    const exists = await db.begin(async (tx) => {
-      await setRlsContext(tx, principalId);
-      return tx`SELECT 1 FROM agents WHERE id = ${agentId}`;
-    });
-    if (exists.length === 0) {
-      throw new AdminApiError('Agent not found or not authorized.', 404);
-    }
-    throw new AdminApiError('API key not found for this agent.', 404);
-  }
-
-  const allowedCallers = removed[0].allowed_callers as string[];
-
-  // Step 2: flip the callers row to revoked (privileged). Idempotent — the
-  // in-memory verify cache is bounded to ~60s so revocation takes effect even
-  // without explicit cache invalidation (see caller-token.ts).
-  await db`
-    UPDATE callers
-    SET revoked = true
-    WHERE provider = 'apikey' AND principal_id = ${principal}
-  `;
-
-  registry.updateAllowedCallers(agentId, allowedCallers);
-
-  return {
-    agent_id: agentId,
-    key_id: keyId,
-    principal,
-    revoked: true,
     allowed_callers: allowedCallers,
   };
 }
