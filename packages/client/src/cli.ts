@@ -40,7 +40,7 @@ import {
   addCallerCmd, agentCmd, listAgentsCmd, listCallersCmd, listClientsCmd,
   removeCallerCmd, revokeClientCmd,
   runAddCaller, runAgentCallersAdd, runAgentCallersList, runAgentCallersRemove,
-  runAgentApikeyGenerate,
+  runAgentCallersIssue,
   runAgentDelete, runAgentList, runListAgents, runListCallers, runListClients,
   runRemoveCaller, runRevokeClient,
 } from './admin-cli.js';
@@ -661,8 +661,8 @@ async function main(): Promise<void> {
     case 'agent-callers-remove':
       process.exit(await runAgentCallersRemove(parsed));
       break;
-    case 'agent-apikey-generate':
-      process.exit(await runAgentApikeyGenerate(parsed));
+    case 'agent-callers-issue':
+      process.exit(await runAgentCallersIssue(parsed));
       break;
     case 'add-caller':
       process.exit(await runAddCaller(parsed));

@@ -148,25 +148,16 @@ const agentCallersRemoveSubCmd = longestMatch(
   agentCallersRemoveCommand('rm', true),
 );
 
-const agentCallersSubCmd = command(
-  'callers',
-  longestMatch(agentCallersListSubCmd, agentCallersAddSubCmd, agentCallersRemoveSubCmd),
-  {
-    brief: message`Manage the agent's allowed-callers list.`,
-  },
-);
-
-// ----- `agent apikey <sub>` command group (#308) -----------------------------
-// Static API keys let non-interactive callers (CI, backend services)
-// authenticate with a single Bearer instead of a Google/SIWE login flow. Each
-// key is a server-minted caller token whose `apikey:<key-id>` principal is
-// auto-added to the agent's allowed-callers, so issuing a key both creates the
-// credential and authorizes it for the agent in one step.
-
-const agentApikeyGenerateSubCmd = command(
-  'generate',
+// `issue` mints a static API key — a caller the bridge creates a secret for,
+// for non-interactive callers (CI, backend services) that can't run the
+// Google/SIWE login flow. It lives under `callers` alongside add/remove/list
+// because a key is just another caller: the `apikey:<key-id>` principal it
+// returns is added to allowed-callers and listed/revoked through the same
+// `callers list` / `callers remove` commands.
+const agentCallersIssueSubCmd = command(
+  'issue',
   object({
-    action: constant('agent-apikey-generate' as const),
+    action: constant('agent-callers-issue' as const),
     ...sharedFlags,
     agentId: argument(string({ metavar: 'AGENT_ID' })),
     label: optional(option('--label', string({ metavar: 'LABEL' }), {
@@ -177,40 +168,42 @@ const agentApikeyGenerateSubCmd = command(
     })),
   }),
   {
-    brief: message`Mint a static API key for the agent.`,
-    description: message`Calls POST /admin-api/agents/<AGENT_ID>/apikeys. Prints the raw key exactly once — store it now; it cannot be recovered. The key's principal is auto-added to the agent's allowed-callers and hot-reloaded.`,
+    brief: message`Mint a static API key caller for the agent.`,
+    description: message`Calls POST /admin-api/agents/<AGENT_ID>/apikeys. Prints the raw key exactly once — store it now; it cannot be recovered. The returned \`apikey:<key-id>\` principal is added to allowed-callers (hot-reloaded); list it with \`agent callers list\` and revoke with \`agent callers remove <AGENT_ID> apikey:<key-id>\`.`,
   },
 );
 
-// Minting (generating a one-time secret) is the only apikey-specific
-// operation. Listing and de-authorizing fold into the unified caller surface:
-// `agent callers list` shows apikey rows (TYPE=apikey) and
-// `agent callers remove <AGENT_ID> apikey:<key-id>` drops the principal AND
-// revokes the underlying token server-side.
-const agentApikeySubCmd = command('apikey', agentApikeyGenerateSubCmd, {
-  brief: message`Mint static API keys (list/remove via \`agent callers\`).`,
-});
+const agentCallersSubCmd = command(
+  'callers',
+  longestMatch(
+    agentCallersListSubCmd,
+    agentCallersAddSubCmd,
+    agentCallersRemoveSubCmd,
+    agentCallersIssueSubCmd,
+  ),
+  {
+    brief: message`Manage the agent's callers — external identities and API keys.`,
+  },
+);
 
 export const agentCmd = command(
   'agent',
-  // `agentCallersSubCmd` / `agentApikeySubCmd` MUST come before
-  // `agentListSubCmd` / `agentRemoveSubCmd`. `@optique` `longestMatch` breaks
-  // consumed-token ties by source order, and the top-level `list` / `remove`
-  // commands have all-optional bodies that tie with the nested
-  // `callers {list,remove} <AGENT_ID>` match — when they win the tie the
-  // AGENT_ID positional is dropped and parsing fails with "Unexpected ... <id>".
-  // Putting the AGENT_ID-consuming groups first makes the correct branch win.
-  // (`apikey generate <AGENT_ID>` is in the same tie-class.) See admin-cli.test.ts.
+  // `agentCallersSubCmd` MUST come before `agentListSubCmd` / `agentRemoveSubCmd`.
+  // `@optique` `longestMatch` breaks consumed-token ties by source order, and the
+  // top-level `list` / `remove` commands have all-optional bodies that tie with
+  // the nested `callers {list,remove} <AGENT_ID>` match — when they win the tie
+  // the AGENT_ID positional is dropped and parsing fails with "Unexpected ... <id>".
+  // Putting the AGENT_ID-consuming group first makes the correct branch win.
+  // See admin-cli.test.ts.
   longestMatch(
     agentRegisterCmd,
     agentCallersSubCmd,
-    agentApikeySubCmd,
     agentListSubCmd,
     agentRemoveSubCmd,
   ),
   {
-    brief: message`Manage agent registrations, allowed callers, and API keys.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove}\`, \`apikey generate\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    brief: message`Manage agent registrations and their callers.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, issue}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
     hidden: 'usage',
   },
 );
@@ -221,7 +214,7 @@ export type AgentDeleteArgs = Extract<AgentCliArgs, { action: 'agent-delete' }>;
 export type AgentCallersListArgs = Extract<AgentCliArgs, { action: 'agent-callers-list' }>;
 export type AgentCallersAddArgs = Extract<AgentCliArgs, { action: 'agent-callers-add' }>;
 export type AgentCallersRemoveArgs = Extract<AgentCliArgs, { action: 'agent-callers-remove' }>;
-export type AgentApikeyGenerateArgs = Extract<AgentCliArgs, { action: 'agent-apikey-generate' }>;
+export type AgentCallersIssueArgs = Extract<AgentCliArgs, { action: 'agent-callers-issue' }>;
 
 // ----- Legacy flat commands (deprecated, kept as aliases) --------------------
 //
@@ -444,7 +437,7 @@ function renderCallerMutation(body: unknown): string {
   return `agent: ${b.agent_id}\nallowed_callers: ${callers}${note}`;
 }
 
-function renderApikeyGenerate(body: unknown): string {
+function renderIssuedKey(body: unknown): string {
   if (!body || typeof body !== 'object') return String(body);
   const b = body as {
     agent_id?: string;
@@ -734,9 +727,9 @@ export async function runAgentCallersRemove(args: AgentCallersRemoveArgs): Promi
   return execRemoveCaller(args);
 }
 
-// ----- agent apikey handlers (#308) -----------------------------------------
+// ----- agent callers issue (API key minting, #308) --------------------------
 
-export async function runAgentApikeyGenerate(args: AgentApikeyGenerateArgs): Promise<number> {
+export async function runAgentCallersIssue(args: AgentCallersIssueArgs): Promise<number> {
   const session = resolveSession(args);
   if ('error' in session) {
     process.stderr.write(`${session.error}\n`);
@@ -751,7 +744,7 @@ export async function runAgentApikeyGenerate(args: AgentApikeyGenerateArgs): Pro
     path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/apikeys`,
     body,
   });
-  return emit(result, args.json, renderApikeyGenerate);
+  return emit(result, args.json, renderIssuedKey);
 }
 
 // ----- Deprecated flat handlers ---------------------------------------------

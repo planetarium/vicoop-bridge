@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   runAddCaller,
-  runAgentApikeyGenerate,
+  runAgentCallersIssue,
   runAgentCallersAdd,
   runAgentCallersList,
   runAgentCallersRemove,
@@ -19,7 +19,7 @@ import {
   runRevokeClient,
   agentCmd,
   type AddCallerArgs,
-  type AgentApikeyGenerateArgs,
+  type AgentCallersIssueArgs,
   type AgentCallersAddArgs,
   type AgentCallersListArgs,
   type AgentCallersRemoveArgs,
@@ -81,11 +81,11 @@ const agentCallersRemoveArgsFn = (
   p: Partial<AgentCallersRemoveArgs> = {},
 ): AgentCallersRemoveArgs =>
   ({ action: 'agent-callers-remove', agentId, principal, ...SHARED, ...p });
-const agentApikeyGenerateArgsFn = (
+const agentCallersIssueArgsFn = (
   agentId: string,
-  p: Partial<AgentApikeyGenerateArgs> = {},
-): AgentApikeyGenerateArgs =>
-  ({ action: 'agent-apikey-generate', agentId, label: undefined, ttlDays: undefined, ...SHARED, ...p });
+  p: Partial<AgentCallersIssueArgs> = {},
+): AgentCallersIssueArgs =>
+  ({ action: 'agent-callers-issue', agentId, label: undefined, ttlDays: undefined, ...SHARED, ...p });
 
 interface Captured {
   url: string;
@@ -604,9 +604,9 @@ test('agent callers list/add/remove hit the existing /admin-api/agents/:id/calle
   );
 });
 
-// ---- `agent apikey <sub>` command group (#308) -----------------------------
+// ---- `agent callers issue` — API key minting (#308) ------------------------
 
-test('agent apikey generate POSTs to /apikeys and prints the secret once', async (t) => {
+test('agent callers issue POSTs to /apikeys and prints the secret once', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   const stdout = captureStdout(t);
   const { calls } = installFetch(t, {
@@ -621,8 +621,8 @@ test('agent apikey generate POSTs to /apikeys and prints the secret once', async
     },
   });
 
-  const code = await runAgentApikeyGenerate(
-    agentApikeyGenerateArgsFn('foo', { label: 'ci-deploy', ttlDays: 365 }),
+  const code = await runAgentCallersIssue(
+    agentCallersIssueArgsFn('foo', { label: 'ci-deploy', ttlDays: 365 }),
   );
   assert.equal(code, 0);
   assert.equal(calls[0].method, 'POST');
@@ -634,7 +634,7 @@ test('agent apikey generate POSTs to /apikeys and prints the secret once', async
   assert.match(out, /vbc_caller_SECRETSECRETSECRET/);
 });
 
-test('agent apikey generate omits unset label/ttlDays from the body', async (t) => {
+test('agent callers issue omits unset label/ttlDays from the body', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   captureStdout(t);
   const { calls } = installFetch(t, {
@@ -645,15 +645,15 @@ test('agent apikey generate omits unset label/ttlDays from the body', async (t) 
     },
   });
 
-  const code = await runAgentApikeyGenerate(agentApikeyGenerateArgsFn('foo'));
+  const code = await runAgentCallersIssue(agentCallersIssueArgsFn('foo'));
   assert.equal(code, 0);
   // Empty object body — server applies its defaults.
   assert.deepEqual(JSON.parse(calls[0].body!), {});
 });
 
-// Listing and revoking fold into `agent callers list/remove` under the unified
-// model (#308) — `agent apikey` only mints.
-test('agent apikey generate does NOT emit deprecation warnings', async (t) => {
+// Minting lives under `callers` (issue); listing/revoking are `callers
+// list`/`remove` — there is no separate `apikey` group. No deprecation warning.
+test('agent callers issue does NOT emit deprecation warnings', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   captureStdout(t);
   const stderr = captureStderr(t);
@@ -665,7 +665,7 @@ test('agent apikey generate does NOT emit deprecation warnings', async (t) => {
     },
   });
 
-  assert.equal(await runAgentApikeyGenerate(agentApikeyGenerateArgsFn('foo')), 0);
+  assert.equal(await runAgentCallersIssue(agentCallersIssueArgsFn('foo')), 0);
   assert.doesNotMatch(stderr.read(), /deprecated/i);
 });
 
@@ -679,7 +679,7 @@ test('agent apikey generate does NOT emit deprecation warnings', async (t) => {
 // before the colliding siblings so the correct branch wins. These assertions
 // go through the real optique parser (the `runXxx` tests above construct the
 // parsed shape directly and would not have caught the parse-level regression).
-test('agent callers {list,remove} parse through the real parser with their AGENT_ID', () => {
+test('agent callers {list,remove,issue} parse through the real parser with their AGENT_ID', () => {
   const expectOk = (argv: string[], expected: Record<string, unknown>) => {
     const r = parse(agentCmd, argv);
     assert.equal(r.success, true, `expected ${argv.join(' ')} to parse`);
@@ -703,27 +703,17 @@ test('agent callers {list,remove} parse through the real parser with their AGENT
     agentId: 'foo',
     principal,
   });
+  // `issue` is in the same tie-class (AGENT_ID positional vs the all-optional
+  // top-level `list`/`remove`) — it must keep its AGENT_ID through the parser.
+  expectOk(['agent', 'callers', 'issue', 'foo'], {
+    action: 'agent-callers-issue',
+    agentId: 'foo',
+    label: undefined,
+    ttlDays: undefined,
+  });
   // The top-level siblings must keep working after the reorder.
   expectOk(['agent', 'list'], { action: 'agent-list', connected: false });
   expectOk(['agent', 'remove', 'foo', '--yes'], { action: 'agent-delete', target: 'foo', yes: true });
-});
-
-// Same tie-class as `callers`: `agent apikey generate <AGENT_ID>` carries a
-// required positional that ties with the all-optional top-level `list` /
-// `remove`. `agentApikeySubCmd` is ordered before those siblings; assert the
-// positional survives through the real parser.
-test('agent apikey generate parses through the real parser with its AGENT_ID', () => {
-  const r = parse(agentCmd, ['agent', 'apikey', 'generate', 'foo']);
-  assert.equal(r.success, true);
-  if (r.success) {
-    assert.deepEqual(r.value, {
-      ...SHARED,
-      action: 'agent-apikey-generate',
-      agentId: 'foo',
-      label: undefined,
-      ttlDays: undefined,
-    });
-  }
 });
 
 // The new `agent` commands must not print a deprecation warning — that's

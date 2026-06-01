@@ -841,9 +841,9 @@ caller surface (a key is just "a caller the bridge issued a secret for"):
 
 ```sh
 # Mint a key (the raw secret is printed exactly once — store it now):
-vicoop-client agent apikey generate "$AGENT_ID" --label ci-deploy
+vicoop-client agent callers issue "$AGENT_ID" --label ci-deploy
 # Optional: override the default 365-day lifetime
-vicoop-client agent apikey generate "$AGENT_ID" --ttl-days 30 --json
+vicoop-client agent callers issue "$AGENT_ID" --ttl-days 30 --json
 
 # List / revoke through the unified caller commands:
 vicoop-client agent callers list "$AGENT_ID"                      # apikey rows show TYPE=apikey

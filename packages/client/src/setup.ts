@@ -851,7 +851,7 @@ async function executeRegistration(opts: ExecuteRegistrationOpts): Promise<numbe
       process.stderr.write(
         `WARNING: no callers configured and API key minting failed. The agent is ` +
           `public until you run \`${opts.labels.addCallerHint} <agent_id> <principal>\` ` +
-          'or `vicoop-client agent apikey generate <agent_id>`.\n\n',
+          'or `vicoop-client agent callers issue <agent_id>`.\n\n',
       );
     }
   }
