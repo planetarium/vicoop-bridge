@@ -31,7 +31,8 @@ pnpm -r build                               # build all packages (run this befor
 pnpm -r typecheck                           # typecheck all packages
 pnpm --filter @vicoop-bridge/client test    # client tests (~490 today)
 pnpm --filter @vicoop-bridge/server test    # server tests
-pnpm dev:client                             # tsx watch on the client CLI
+pnpm dev:client                             # tsx watch on the client CLI (long-running daemon)
+pnpm -s cli:client <args>                   # run a one-shot client subcommand from source (no watch), e.g. `pnpm -s cli:client agent callers list <id>`
 pnpm dev:server                             # tsx watch on the server
 pnpm dev:admin-ui                           # vite dev server for the admin UI
 pnpm deploy:server                          # fly deploy the server
