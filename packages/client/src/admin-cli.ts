@@ -475,26 +475,19 @@ function principalType(principal: string): string {
 
 function renderCallerList(body: unknown): string {
   if (!body || typeof body !== 'object') return String(body);
-  const b = body as {
-    agent_id?: string;
-    owner_principal?: string;
-    allowed_callers?: string[];
-    is_public?: boolean;
-  };
+  const b = body as { allowed_callers?: string[] };
   const callers = b.allowed_callers ?? [];
-  const header = [
-    `agent:           ${b.agent_id}`,
-    `owner_principal: ${b.owner_principal}`,
-    `is_public:       ${b.is_public}`,
-  ].join('\n');
+  // Empty allowed_callers means the dispatcher treats the agent as public.
+  // Surface that as the table's empty-state, matching the other `list`
+  // commands (e.g. `agent list` → "(no connected agents)"). The agent_id /
+  // owner_principal / is_public fields remain available via --json.
   if (callers.length === 0) {
-    return `${header}\nallowed_callers: (none — agent is public)`;
+    return '(no callers — agent is public)';
   }
-  const table = renderTable(
+  return renderTable(
     ['TYPE', 'PRINCIPAL'],
     callers.map((p) => [principalType(p), p]),
   );
-  return `${header}\n\n${table}`;
 }
 
 // Agent-centric renderer for `agent list`. The /admin-api/clients response
