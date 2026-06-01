@@ -800,6 +800,34 @@ curl -sX POST "$BRIDGE_URL/" \
 Either path hot-reloads via `registry.updateAllowedCallers` — no client
 restart needed.
 
+### Static API keys (non-interactive callers)
+
+`eth:`, `google:sub:`, `google:email:`, and `google:domain:` callers all
+authenticate through an interactive login (a wallet signature or a Google
+OAuth flow). For callers that can't do that — a CI job, a backend service, a
+script — mint a **static API key** instead. The key is a long-lived
+`vbc_caller_*` bearer whose `apikey:<key-id>` principal is auto-added to the
+agent's `allowed_callers`, so issuing it both creates the credential and
+authorizes it in one step:
+
+```sh
+# Mint a key (the raw secret is printed exactly once — store it now):
+vicoop-client agent apikey generate "$AGENT_ID" --label ci-deploy
+# Optional: override the default 365-day lifetime
+vicoop-client agent apikey generate "$AGENT_ID" --ttl-days 30 --json
+
+# List a key's metadata (never the secret) and revoke by key id:
+vicoop-client agent apikey list "$AGENT_ID"
+vicoop-client agent apikey revoke "$AGENT_ID" "<KEY_ID>"
+```
+
+The caller then presents the key as a normal bearer:
+`Authorization: Bearer vbc_caller_…` against
+`POST $BRIDGE_URL/agents/$AGENT_ID`. Revocation removes the principal from
+`allowed_callers` and marks the token revoked; it takes effect within ~60s.
+These talk to the same owner-authenticated `/admin-api/agents/:id/apikeys`
+routes and require the owner-session bearer like the commands above.
+
 ## Updating the client
 
 Once installed, the client updates itself — do not re-run `install.sh`. The

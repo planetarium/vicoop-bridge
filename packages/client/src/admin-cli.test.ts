@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   runAddCaller,
+  runAgentApikeyGenerate,
+  runAgentApikeyList,
+  runAgentApikeyRevoke,
   runAgentCallersAdd,
   runAgentCallersList,
   runAgentCallersRemove,
@@ -16,6 +19,9 @@ import {
   runRemoveCaller,
   runRevokeClient,
   type AddCallerArgs,
+  type AgentApikeyGenerateArgs,
+  type AgentApikeyListArgs,
+  type AgentApikeyRevokeArgs,
   type AgentCallersAddArgs,
   type AgentCallersListArgs,
   type AgentCallersRemoveArgs,
@@ -77,6 +83,21 @@ const agentCallersRemoveArgsFn = (
   p: Partial<AgentCallersRemoveArgs> = {},
 ): AgentCallersRemoveArgs =>
   ({ action: 'agent-callers-remove', agentId, principal, ...SHARED, ...p });
+const agentApikeyGenerateArgsFn = (
+  agentId: string,
+  p: Partial<AgentApikeyGenerateArgs> = {},
+): AgentApikeyGenerateArgs =>
+  ({ action: 'agent-apikey-generate', agentId, label: undefined, ttlDays: undefined, ...SHARED, ...p });
+const agentApikeyListArgsFn = (
+  agentId: string,
+  p: Partial<AgentApikeyListArgs> = {},
+): AgentApikeyListArgs => ({ action: 'agent-apikey-list', agentId, ...SHARED, ...p });
+const agentApikeyRevokeArgsFn = (
+  agentId: string,
+  keyId: string,
+  p: Partial<AgentApikeyRevokeArgs> = {},
+): AgentApikeyRevokeArgs =>
+  ({ action: 'agent-apikey-revoke', agentId, keyId, ...SHARED, ...p });
 
 interface Captured {
   url: string;
@@ -554,6 +575,101 @@ test('agent callers list/add/remove hit the existing /admin-api/agents/:id/calle
     calls[2].url,
     `${BRIDGE}/admin-api/agents/foo/callers?principal=${encodeURIComponent(principal)}`,
   );
+});
+
+// ---- `agent apikey <sub>` command group (#308) -----------------------------
+
+test('agent apikey generate POSTs to /apikeys and prints the secret once', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  const { calls } = installFetch(t, {
+    body: {
+      agent_id: 'foo',
+      key_id: 'Ab3-_xYz12',
+      principal: 'apikey:Ab3-_xYz12',
+      api_key: 'vbc_caller_SECRETSECRETSECRET',
+      label: 'ci-deploy',
+      expires_at: '2027-06-01T00:00:00.000Z',
+      allowed_callers: ['apikey:Ab3-_xYz12'],
+    },
+  });
+
+  const code = await runAgentApikeyGenerate(
+    agentApikeyGenerateArgsFn('foo', { label: 'ci-deploy', ttlDays: 365 }),
+  );
+  assert.equal(code, 0);
+  assert.equal(calls[0].method, 'POST');
+  assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/apikeys`);
+  assert.equal(calls[0].headers['content-type'], 'application/json');
+  assert.deepEqual(JSON.parse(calls[0].body!), { label: 'ci-deploy', ttlDays: 365 });
+  const out = stdout.read();
+  assert.match(out, /key_id:\s+Ab3-_xYz12/);
+  assert.match(out, /vbc_caller_SECRETSECRETSECRET/);
+});
+
+test('agent apikey generate omits unset label/ttlDays from the body', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, {
+    body: {
+      agent_id: 'foo', key_id: 'k', principal: 'apikey:k',
+      api_key: 'vbc_caller_x', label: null, expires_at: '2027-06-01T00:00:00.000Z',
+      allowed_callers: ['apikey:k'],
+    },
+  });
+
+  const code = await runAgentApikeyGenerate(agentApikeyGenerateArgsFn('foo'));
+  assert.equal(code, 0);
+  // Empty object body — server applies its defaults.
+  assert.deepEqual(JSON.parse(calls[0].body!), {});
+});
+
+test('agent apikey list GETs /apikeys and never shows a secret', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  const { calls } = installFetch(t, {
+    body: {
+      agent_id: 'foo',
+      keys: [
+        {
+          key_id: 'Ab3-_xYz12', principal: 'apikey:Ab3-_xYz12', label: 'ci-deploy',
+          expires_at: '2027-06-01T00:00:00.000Z', last_used_at: null,
+          revoked: false, created_at: '2026-06-01T00:00:00.000Z',
+        },
+      ],
+    },
+  });
+
+  const code = await runAgentApikeyList(agentApikeyListArgsFn('foo'));
+  assert.equal(code, 0);
+  assert.equal(calls[0].method, 'GET');
+  assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/apikeys`);
+  const out = stdout.read();
+  assert.match(out, /KEY_ID\s+LABEL\s+REVOKED\s+EXPIRES_AT\s+LAST_USED_AT/);
+  assert.match(out, /^Ab3-_xYz12\s+ci-deploy\s+false\b/m);
+});
+
+test('agent apikey revoke DELETEs /apikeys/<KEY_ID>', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, {
+    body: { agent_id: 'foo', key_id: 'Ab3-_xYz12', principal: 'apikey:Ab3-_xYz12', revoked: true, allowed_callers: [] },
+  });
+
+  const code = await runAgentApikeyRevoke(agentApikeyRevokeArgsFn('foo', 'Ab3-_xYz12'));
+  assert.equal(code, 0);
+  assert.equal(calls[0].method, 'DELETE');
+  assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/apikeys/Ab3-_xYz12`);
+});
+
+test('agent apikey subcommands do NOT emit deprecation warnings', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const stderr = captureStderr(t);
+  installFetch(t, { body: { agent_id: 'foo', keys: [] } });
+
+  assert.equal(await runAgentApikeyList(agentApikeyListArgsFn('foo')), 0);
+  assert.doesNotMatch(stderr.read(), /deprecated/i);
 });
 
 // The new `agent` commands must not print a deprecation warning — that's

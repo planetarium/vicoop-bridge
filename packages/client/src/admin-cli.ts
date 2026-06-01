@@ -13,7 +13,7 @@ import { optional, withDefault } from '@optique/core/modifiers';
 import { argument, command, constant, flag, option } from '@optique/core/primitives';
 import { message } from '@optique/core/message';
 import type { InferValue } from '@optique/core/parser';
-import { string } from '@optique/core/valueparser';
+import { integer, string } from '@optique/core/valueparser';
 import { resolveOwnerSession } from './owner-session.js';
 import { agentRegisterCmd } from './setup.js';
 
@@ -156,12 +156,95 @@ const agentCallersSubCmd = command(
   },
 );
 
+// ----- `agent apikey <sub>` command group (#308) -----------------------------
+// Static API keys let non-interactive callers (CI, backend services)
+// authenticate with a single Bearer instead of a Google/SIWE login flow. Each
+// key is a server-minted caller token whose `apikey:<key-id>` principal is
+// auto-added to the agent's allowed-callers, so issuing a key both creates the
+// credential and authorizes it for the agent in one step.
+
+const agentApikeyGenerateSubCmd = command(
+  'generate',
+  object({
+    action: constant('agent-apikey-generate' as const),
+    ...sharedFlags,
+    agentId: argument(string({ metavar: 'AGENT_ID' })),
+    label: optional(option('--label', string({ metavar: 'LABEL' }), {
+      description: message`Human-readable label stored alongside the key (e.g. "ci-deploy").`,
+    })),
+    ttlDays: optional(option('--ttl-days', integer({ metavar: 'DAYS', min: 1 }), {
+      description: message`Key lifetime in days. Defaults to 365 on the server.`,
+    })),
+  }),
+  {
+    brief: message`Mint a static API key for the agent.`,
+    description: message`Calls POST /admin-api/agents/<AGENT_ID>/apikeys. Prints the raw key exactly once — store it now; it cannot be recovered. The key's principal is auto-added to the agent's allowed-callers and hot-reloaded.`,
+  },
+);
+
+function agentApikeyListCommand(name: 'list' | 'ls', alias: boolean) {
+  return command(
+    name,
+    object({
+      action: constant('agent-apikey-list' as const),
+      ...sharedFlags,
+      agentId: argument(string({ metavar: 'AGENT_ID' })),
+    }),
+    {
+      brief: message`List the agent's API keys. (alias: \`ls\`)`,
+      description: message`Calls GET /admin-api/agents/<AGENT_ID>/apikeys. Shows key ids, labels, and expiry — never the raw secret.`,
+      ...(alias ? { hidden: 'help' as const } : {}),
+    },
+  );
+}
+
+const agentApikeyListSubCmd = longestMatch(
+  agentApikeyListCommand('list', false),
+  agentApikeyListCommand('ls', true),
+);
+
+function agentApikeyRevokeCommand(name: 'revoke' | 'rm', alias: boolean) {
+  return command(
+    name,
+    object({
+      action: constant('agent-apikey-revoke' as const),
+      ...sharedFlags,
+      agentId: argument(string({ metavar: 'AGENT_ID' })),
+      keyId: argument(string({ metavar: 'KEY_ID' })),
+    }),
+    {
+      brief: message`Revoke an API key by id. (alias: \`rm\`)`,
+      description: message`Calls DELETE /admin-api/agents/<AGENT_ID>/apikeys/<KEY_ID>. Removes the principal from allowed-callers and marks the token revoked; takes effect within ~60s.`,
+      ...(alias ? { hidden: 'help' as const } : {}),
+    },
+  );
+}
+
+const agentApikeyRevokeSubCmd = longestMatch(
+  agentApikeyRevokeCommand('revoke', false),
+  agentApikeyRevokeCommand('rm', true),
+);
+
+const agentApikeySubCmd = command(
+  'apikey',
+  longestMatch(agentApikeyGenerateSubCmd, agentApikeyListSubCmd, agentApikeyRevokeSubCmd),
+  {
+    brief: message`Manage the agent's static API keys.`,
+  },
+);
+
 export const agentCmd = command(
   'agent',
-  longestMatch(agentRegisterCmd, agentListSubCmd, agentRemoveSubCmd, agentCallersSubCmd),
+  longestMatch(
+    agentRegisterCmd,
+    agentListSubCmd,
+    agentRemoveSubCmd,
+    agentCallersSubCmd,
+    agentApikeySubCmd,
+  ),
   {
-    brief: message`Manage agent registrations and their allowed callers.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    brief: message`Manage agent registrations, allowed callers, and API keys.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove}\`, \`apikey {generate, list, revoke}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
     hidden: 'usage',
   },
 );
@@ -172,6 +255,9 @@ export type AgentDeleteArgs = Extract<AgentCliArgs, { action: 'agent-delete' }>;
 export type AgentCallersListArgs = Extract<AgentCliArgs, { action: 'agent-callers-list' }>;
 export type AgentCallersAddArgs = Extract<AgentCliArgs, { action: 'agent-callers-add' }>;
 export type AgentCallersRemoveArgs = Extract<AgentCliArgs, { action: 'agent-callers-remove' }>;
+export type AgentApikeyGenerateArgs = Extract<AgentCliArgs, { action: 'agent-apikey-generate' }>;
+export type AgentApikeyListArgs = Extract<AgentCliArgs, { action: 'agent-apikey-list' }>;
+export type AgentApikeyRevokeArgs = Extract<AgentCliArgs, { action: 'agent-apikey-revoke' }>;
 
 // ----- Legacy flat commands (deprecated, kept as aliases) --------------------
 //
@@ -392,6 +478,51 @@ function renderCallerMutation(body: unknown): string {
   const callers = (b.allowed_callers ?? []).join(', ') || '(none — agent is public)';
   const note = b.message ? ` (${b.message})` : '';
   return `agent: ${b.agent_id}\nallowed_callers: ${callers}${note}`;
+}
+
+function renderApikeyGenerate(body: unknown): string {
+  if (!body || typeof body !== 'object') return String(body);
+  const b = body as {
+    agent_id?: string;
+    key_id?: string;
+    principal?: string;
+    api_key?: string;
+    label?: string | null;
+    expires_at?: string;
+  };
+  return [
+    `agent:      ${b.agent_id}`,
+    `key_id:     ${b.key_id}`,
+    `principal:  ${b.principal}`,
+    `label:      ${b.label ?? '(none)'}`,
+    `expires_at: ${b.expires_at}`,
+    '',
+    'API key (shown once — store it now, it cannot be recovered):',
+    `  ${b.api_key}`,
+  ].join('\n');
+}
+
+function renderApikeyList(body: unknown): string {
+  if (!body || typeof body !== 'object' || !('keys' in body)) return String(body);
+  const keys = (body as { keys: Array<Record<string, unknown>> }).keys;
+  if (keys.length === 0) return '(no API keys)';
+  const tableRows = keys.map((k) => [
+    String(k.key_id ?? ''),
+    String((k.label as string | null) ?? ''),
+    String(k.revoked),
+    String(k.expires_at ?? ''),
+    String((k.last_used_at as string | null) ?? '(never)'),
+  ]);
+  return renderTable(
+    ['KEY_ID', 'LABEL', 'REVOKED', 'EXPIRES_AT', 'LAST_USED_AT'],
+    tableRows,
+  );
+}
+
+function renderApikeyRevoke(body: unknown): string {
+  if (!body || typeof body !== 'object') return String(body);
+  const b = body as { agent_id?: string; key_id?: string; revoked?: boolean };
+  return `agent: ${b.agent_id}\nkey_id: ${b.key_id}\nrevoked: ${b.revoked}`;
 }
 
 function renderCallerList(body: unknown): string {
@@ -640,6 +771,54 @@ export async function runAgentCallersAdd(args: AgentCallersAddArgs): Promise<num
 
 export async function runAgentCallersRemove(args: AgentCallersRemoveArgs): Promise<number> {
   return execRemoveCaller(args);
+}
+
+// ----- agent apikey handlers (#308) -----------------------------------------
+
+export async function runAgentApikeyGenerate(args: AgentApikeyGenerateArgs): Promise<number> {
+  const session = resolveSession(args);
+  if ('error' in session) {
+    process.stderr.write(`${session.error}\n`);
+    return 1;
+  }
+  const body: { label?: string; ttlDays?: number } = {};
+  if (args.label !== undefined) body.label = args.label;
+  if (args.ttlDays !== undefined) body.ttlDays = args.ttlDays;
+  const result = await callApi({
+    session,
+    method: 'POST',
+    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/apikeys`,
+    body,
+  });
+  return emit(result, args.json, renderApikeyGenerate);
+}
+
+export async function runAgentApikeyList(args: AgentApikeyListArgs): Promise<number> {
+  const session = resolveSession(args);
+  if ('error' in session) {
+    process.stderr.write(`${session.error}\n`);
+    return 1;
+  }
+  const result = await callApi({
+    session,
+    method: 'GET',
+    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/apikeys`,
+  });
+  return emit(result, args.json, renderApikeyList);
+}
+
+export async function runAgentApikeyRevoke(args: AgentApikeyRevokeArgs): Promise<number> {
+  const session = resolveSession(args);
+  if ('error' in session) {
+    process.stderr.write(`${session.error}\n`);
+    return 1;
+  }
+  const result = await callApi({
+    session,
+    method: 'DELETE',
+    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/apikeys/${encodeURIComponent(args.keyId)}`,
+  });
+  return emit(result, args.json, renderApikeyRevoke);
 }
 
 // ----- Deprecated flat handlers ---------------------------------------------
