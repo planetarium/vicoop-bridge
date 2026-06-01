@@ -297,16 +297,17 @@ test('callers list renders allowed_callers as a TYPE/PRINCIPAL table', async (t)
 
   assert.equal(await runListCallers(listCallersArgs('foo')), 0);
   const out = stdout.read();
-  assert.match(out, /^agent:\s+foo$/m);
-  assert.match(out, /^is_public:\s+false$/m);
-  assert.match(out, /TYPE\s+PRINCIPAL/);
-  // The PRINCIPAL column keeps the full canonical form so it pastes straight
-  // into `agent callers remove`.
+  // Pure TYPE/PRINCIPAL table — no agent/owner/is_public header block (those
+  // stay in --json). The PRINCIPAL column keeps the full canonical form so it
+  // pastes straight into `agent callers remove`.
+  assert.match(out, /^TYPE\s+PRINCIPAL$/m);
   assert.match(out, /^eth\s+eth:0x1111111111111111111111111111111111111111$/m);
   assert.match(out, /^google:email\s+google:email:alice@example\.com$/m);
+  assert.doesNotMatch(out, /^agent:/m);
+  assert.doesNotMatch(out, /^is_public:/m);
 });
 
-test('callers list shows the public sentinel when there are no allowed_callers', async (t) => {
+test('callers list shows the public empty-state when there are no allowed_callers', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   const stdout = captureStdout(t);
   installFetch(t, {
@@ -315,7 +316,7 @@ test('callers list shows the public sentinel when there are no allowed_callers',
 
   assert.equal(await runListCallers(listCallersArgs('foo')), 0);
   const out = stdout.read();
-  assert.match(out, /allowed_callers: \(none — agent is public\)/);
+  assert.match(out, /\(no callers — agent is public\)/);
   assert.doesNotMatch(out, /TYPE\s+PRINCIPAL/);
 });
 
