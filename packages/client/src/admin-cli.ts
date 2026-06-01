@@ -158,7 +158,13 @@ const agentCallersSubCmd = command(
 
 export const agentCmd = command(
   'agent',
-  longestMatch(agentRegisterCmd, agentListSubCmd, agentRemoveSubCmd, agentCallersSubCmd),
+  // `agentCallersSubCmd` MUST come before `agentListSubCmd` / `agentRemoveSubCmd`.
+  // `@optique` `longestMatch` breaks consumed-token ties by source order, and the
+  // top-level `list` / `remove` commands have all-optional bodies that tie with the
+  // nested `callers {list,remove} <AGENT_ID>` match — when they win the tie the
+  // AGENT_ID positional is dropped and parsing fails with "Unexpected ... <id>".
+  // Putting `callers` first makes the correct branch win. See admin-cli.test.ts.
+  longestMatch(agentRegisterCmd, agentCallersSubCmd, agentListSubCmd, agentRemoveSubCmd),
   {
     brief: message`Manage agent registrations and their allowed callers.`,
     description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,

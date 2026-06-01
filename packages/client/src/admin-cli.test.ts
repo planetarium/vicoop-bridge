@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { parse } from '@optique/core/parser';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +16,7 @@ import {
   runListClients,
   runRemoveCaller,
   runRevokeClient,
+  agentCmd,
   type AddCallerArgs,
   type AgentCallersAddArgs,
   type AgentCallersListArgs,
@@ -554,6 +556,45 @@ test('agent callers list/add/remove hit the existing /admin-api/agents/:id/calle
     calls[2].url,
     `${BRIDGE}/admin-api/agents/foo/callers?principal=${encodeURIComponent(principal)}`,
   );
+});
+
+// Regression: the sub-subcommands `agent callers list <ID>` and
+// `agent callers remove <ID> <PRINCIPAL>` share the literal names `list` /
+// `remove` with the top-level `agent list` / `agent remove` commands. Those
+// top-level commands have all-optional bodies, so `@optique` `longestMatch`
+// used to break the consumed-token tie in their favour — swallowing the
+// branch and dropping the `AGENT_ID` positional, which surfaced as
+// "Unexpected option or subcommand: <id>". `agentCallersSubCmd` is now ordered
+// before the colliding siblings so the correct branch wins. These assertions
+// go through the real optique parser (the `runXxx` tests above construct the
+// parsed shape directly and would not have caught the parse-level regression).
+test('agent callers {list,remove} parse through the real parser with their AGENT_ID', () => {
+  const expectOk = (argv: string[], expected: Record<string, unknown>) => {
+    const r = parse(agentCmd, argv);
+    assert.equal(r.success, true, `expected ${argv.join(' ')} to parse`);
+    if (r.success) assert.deepEqual(r.value, { ...SHARED, ...expected });
+  };
+  const principal = 'eth:0xabcdefabcdefabcdefabcdefabcdefabcdefabcd';
+  expectOk(['agent', 'callers', 'list', 'foo'], { action: 'agent-callers-list', agentId: 'foo' });
+  expectOk(['agent', 'callers', 'ls', 'foo'], { action: 'agent-callers-list', agentId: 'foo' });
+  expectOk(['agent', 'callers', 'add', 'foo', principal], {
+    action: 'agent-callers-add',
+    agentId: 'foo',
+    principal,
+  });
+  expectOk(['agent', 'callers', 'remove', 'foo', principal], {
+    action: 'agent-callers-remove',
+    agentId: 'foo',
+    principal,
+  });
+  expectOk(['agent', 'callers', 'rm', 'foo', principal], {
+    action: 'agent-callers-remove',
+    agentId: 'foo',
+    principal,
+  });
+  // The top-level siblings must keep working after the reorder.
+  expectOk(['agent', 'list'], { action: 'agent-list', connected: false });
+  expectOk(['agent', 'remove', 'foo', '--yes'], { action: 'agent-delete', target: 'foo', yes: true });
 });
 
 // The new `agent` commands must not print a deprecation warning — that's
