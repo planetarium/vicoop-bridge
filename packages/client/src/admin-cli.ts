@@ -148,14 +148,14 @@ const agentCallersRemoveSubCmd = longestMatch(
   agentCallersRemoveCommand('rm', true),
 );
 
-// `issue` mints a static API key — a caller the bridge creates a secret for,
-// for non-interactive callers (CI, backend services) that can't run the
-// Google/SIWE login flow. It lives under `callers` alongside add/remove/list
-// because a key is just another caller: the `apikey:<key-id>` principal it
-// returns is added to allowed-callers and listed/revoked through the same
-// `callers list` / `callers remove` commands.
+// `issue-api-key` mints a static API key — a caller the bridge creates a
+// secret for, for non-interactive callers (CI, backend services) that can't
+// run the Google/SIWE login flow. It lives under `callers` alongside
+// add/remove/list because a key is just another caller: the `apikey:<key-id>`
+// principal it returns is added to allowed-callers and listed/revoked through
+// the same `callers list` / `callers remove` commands.
 const agentCallersIssueSubCmd = command(
-  'issue',
+  'issue-api-key',
   object({
     action: constant('agent-callers-issue' as const),
     ...sharedFlags,
@@ -203,7 +203,7 @@ export const agentCmd = command(
   ),
   {
     brief: message`Manage agent registrations and their callers.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, issue}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, issue-api-key}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
     hidden: 'usage',
   },
 );
@@ -727,7 +727,7 @@ export async function runAgentCallersRemove(args: AgentCallersRemoveArgs): Promi
   return execRemoveCaller(args);
 }
 
-// ----- agent callers issue (API key minting, #308) --------------------------
+// ----- agent callers issue-api-key (API key minting, #308) --------------------------
 
 export async function runAgentCallersIssue(args: AgentCallersIssueArgs): Promise<number> {
   const session = resolveSession(args);

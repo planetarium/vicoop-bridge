@@ -604,9 +604,9 @@ test('agent callers list/add/remove hit the existing /admin-api/agents/:id/calle
   );
 });
 
-// ---- `agent callers issue` — API key minting (#308) ------------------------
+// ---- `agent callers issue-api-key` — API key minting (#308) ------------------------
 
-test('agent callers issue POSTs to /apikeys and prints the secret once', async (t) => {
+test('agent callers issue-api-key POSTs to /apikeys and prints the secret once', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   const stdout = captureStdout(t);
   const { calls } = installFetch(t, {
@@ -634,7 +634,7 @@ test('agent callers issue POSTs to /apikeys and prints the secret once', async (
   assert.match(out, /vbc_caller_SECRETSECRETSECRET/);
 });
 
-test('agent callers issue omits unset label/ttlDays from the body', async (t) => {
+test('agent callers issue-api-key omits unset label/ttlDays from the body', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   captureStdout(t);
   const { calls } = installFetch(t, {
@@ -653,7 +653,7 @@ test('agent callers issue omits unset label/ttlDays from the body', async (t) =>
 
 // Minting lives under `callers` (issue); listing/revoking are `callers
 // list`/`remove` — there is no separate `apikey` group. No deprecation warning.
-test('agent callers issue does NOT emit deprecation warnings', async (t) => {
+test('agent callers issue-api-key does NOT emit deprecation warnings', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   captureStdout(t);
   const stderr = captureStderr(t);
@@ -679,7 +679,7 @@ test('agent callers issue does NOT emit deprecation warnings', async (t) => {
 // before the colliding siblings so the correct branch wins. These assertions
 // go through the real optique parser (the `runXxx` tests above construct the
 // parsed shape directly and would not have caught the parse-level regression).
-test('agent callers {list,remove,issue} parse through the real parser with their AGENT_ID', () => {
+test('agent callers {list,remove,issue-api-key} parse through the real parser with their AGENT_ID', () => {
   const expectOk = (argv: string[], expected: Record<string, unknown>) => {
     const r = parse(agentCmd, argv);
     assert.equal(r.success, true, `expected ${argv.join(' ')} to parse`);
@@ -705,7 +705,7 @@ test('agent callers {list,remove,issue} parse through the real parser with their
   });
   // `issue` is in the same tie-class (AGENT_ID positional vs the all-optional
   // top-level `list`/`remove`) — it must keep its AGENT_ID through the parser.
-  expectOk(['agent', 'callers', 'issue', 'foo'], {
+  expectOk(['agent', 'callers', 'issue-api-key', 'foo'], {
     action: 'agent-callers-issue',
     agentId: 'foo',
     label: undefined,
