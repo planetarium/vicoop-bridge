@@ -400,6 +400,20 @@ function renderCallerMutation(body: unknown): string {
   return `agent: ${b.agent_id}\nallowed_callers: ${callers}${note}`;
 }
 
+// The `TYPE` column of the callers table is display-only; the `PRINCIPAL`
+// column keeps the full canonical form (`eth:0x…`, `google:email:…`) so an
+// operator can copy a row straight into `agent callers remove <id> <principal>`.
+// `eth` is a single-segment scheme; the google schemes carry a sub-kind, so the
+// type is the first two colon-separated segments.
+function principalType(principal: string): string {
+  if (principal.startsWith('google:')) {
+    const [, kind] = principal.split(':');
+    return kind ? `google:${kind}` : 'google';
+  }
+  const idx = principal.indexOf(':');
+  return idx === -1 ? '' : principal.slice(0, idx);
+}
+
 function renderCallerList(body: unknown): string {
   if (!body || typeof body !== 'object') return String(body);
   const b = body as {
@@ -408,14 +422,20 @@ function renderCallerList(body: unknown): string {
     allowed_callers?: string[];
     is_public?: boolean;
   };
-  const callers = (b.allowed_callers ?? []).join('\n  ') || '(none — agent is public)';
-  return [
+  const callers = b.allowed_callers ?? [];
+  const header = [
     `agent:           ${b.agent_id}`,
     `owner_principal: ${b.owner_principal}`,
     `is_public:       ${b.is_public}`,
-    'allowed_callers:',
-    `  ${callers}`,
   ].join('\n');
+  if (callers.length === 0) {
+    return `${header}\nallowed_callers: (none — agent is public)`;
+  }
+  const table = renderTable(
+    ['TYPE', 'PRINCIPAL'],
+    callers.map((p) => [principalType(p), p]),
+  );
+  return `${header}\n\n${table}`;
 }
 
 // Agent-centric renderer for `agent list`. The /admin-api/clients response

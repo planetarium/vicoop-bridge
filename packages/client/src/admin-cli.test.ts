@@ -273,6 +273,45 @@ test('list-callers GETs the agent endpoint', async (t) => {
   assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/callers`);
 });
 
+test('callers list renders allowed_callers as a TYPE/PRINCIPAL table', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  installFetch(t, {
+    body: {
+      agent_id: 'foo',
+      owner_principal: 'eth:0xabc',
+      is_public: false,
+      allowed_callers: [
+        'eth:0x1111111111111111111111111111111111111111',
+        'google:email:alice@example.com',
+      ],
+    },
+  });
+
+  assert.equal(await runListCallers(listCallersArgs('foo')), 0);
+  const out = stdout.read();
+  assert.match(out, /^agent:\s+foo$/m);
+  assert.match(out, /^is_public:\s+false$/m);
+  assert.match(out, /TYPE\s+PRINCIPAL/);
+  // The PRINCIPAL column keeps the full canonical form so it pastes straight
+  // into `agent callers remove`.
+  assert.match(out, /^eth\s+eth:0x1111111111111111111111111111111111111111$/m);
+  assert.match(out, /^google:email\s+google:email:alice@example\.com$/m);
+});
+
+test('callers list shows the public sentinel when there are no allowed_callers', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  installFetch(t, {
+    body: { agent_id: 'foo', owner_principal: 'eth:0xabc', is_public: true, allowed_callers: [] },
+  });
+
+  assert.equal(await runListCallers(listCallersArgs('foo')), 0);
+  const out = stdout.read();
+  assert.match(out, /allowed_callers: \(none — agent is public\)/);
+  assert.doesNotMatch(out, /TYPE\s+PRINCIPAL/);
+});
+
 test('subcommand exits 1 with hint when no token is available', async (t) => {
   // Hermetic missing-auth: redirect HOME (and USERPROFILE on Windows) to an
   // empty temp dir so os.homedir() resolves into a location without an
