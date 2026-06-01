@@ -42,6 +42,25 @@ export type VicoopCodexSpawnFn = (
   options: VicoopCodexSpawnOptions,
 ) => VicoopCodexChildHandle;
 
+// Minimal subset of `fetch`'s Response the backend consumes from
+// `vicoop-codex serve`'s streaming `POST /v1/chat/completions`. Production
+// wraps the global `fetch` (see `defaultFetch`); tests inject a fake that
+// satisfies this without an HTTP round-trip.
+export interface VicoopCodexStreamResponse {
+  readonly ok: boolean;
+  readonly status: number;
+  // Full body as text — read only on the non-2xx error path for diagnostics.
+  text(): Promise<string>;
+  // Decoded UTF-8 chunks of the SSE body, in arrival order. Chunk boundaries
+  // are arbitrary (not aligned to SSE events); the parser reassembles lines.
+  chunks(): AsyncIterable<string>;
+}
+
+export type VicoopCodexFetchFn = (
+  url: string,
+  init: { body: string; signal: AbortSignal },
+) => Promise<VicoopCodexStreamResponse>;
+
 export interface VicoopCodexBackendOptions {
   // Test seams only — the production CLI calls `createVicoopCodexBackend()`
   // with no arguments. We don't expose operator-facing knobs here because
@@ -54,7 +73,13 @@ export interface VicoopCodexBackendOptions {
   extraArgs?: readonly string[];
   spawn?: VicoopCodexSpawnFn;
   stderrCaptureBytes?: number;
-  callTimeoutMs?: number;
+  // Test seam for the streaming HTTP call to `vicoop-codex serve`'s
+  // `/v1/chat/completions`. Production defaults to the global `fetch`; tests
+  // inject a fake that returns a scripted SSE body without a real socket.
+  fetch?: VicoopCodexFetchFn;
+  // Max time `ensureServe` waits for the spawned `vicoop-codex serve` to
+  // print its `listening` line before giving up. Default 10s.
+  serveStartupTimeoutMs?: number;
   // Max time the startup probe (`vicoop-codex models --json` via
   // `resolveCapabilities`) waits for the model list before giving up.
   // Setting to 0 disables the probe entirely — the agent card carries no
@@ -97,10 +122,11 @@ export interface ChatCompletionMessage {
   name?: string;
 }
 
-// Parsed OpenAI Chat Completions non-streaming response (the shape
-// `vicoop-codex call` prints to stdout). All optional / nullable
-// per OpenAI — the binary always emits `id` / `object` / `model` / `choices`
-// but we tolerate missing fields rather than crash on a future schema bump.
+// OpenAI Chat Completions response shape. The backend no longer parses this
+// off `vicoop-codex call` stdout — it synthesises one (`synthesizeStreamedResponse`)
+// from the `chat.completion.chunk` SSE deltas streamed by `vicoop-codex serve`
+// so the existing envelope builders below can be reused unchanged. All fields
+// optional / nullable so a future schema bump degrades rather than crashes.
 export interface ChatCompletionResponse {
   id?: string;
   object?: string;
@@ -326,25 +352,6 @@ export function buildCallBody(
   return body;
 }
 
-// Map `vicoop-codex call` exit codes (doc's "Exit codes" section) to A2A
-// task.fail error codes. Anything outside the documented set surfaces as
-// `vicoop_codex_failed` so an operator can grep stderr without needing to
-// memorise the table.
-function exitCodeToA2ACode(code: number | null): string {
-  switch (code) {
-    case 2:
-      return 'invalid_input';
-    case 3:
-      return 'login_required';
-    case 4:
-      return 'upstream_error';
-    case 5:
-      return 'network_error';
-    default:
-      return 'vicoop_codex_failed';
-  }
-}
-
 // Convert the parsed `usage` block to a spec-compliant OpenAICompatUsage.
 // vicoop-codex prints the standard OpenAI shape so the mapping is direct;
 // total_tokens is recomputed by `buildOpenAICompatUsage` to enforce the
@@ -470,145 +477,294 @@ function defaultSpawn(
   }) as ChildProcess;
 }
 
-// Internal record of the binary's exit + collected streams. Returned by
-// `runVicoopCodexCall` so `handle()` can branch on exit code without
-// re-parsing the stderr / stdout itself.
-interface CallResult {
-  code: number | null;
-  signal: NodeJS.Signals | null;
-  stdout: string;
-  stderr: string;
-}
-
-// Spawn `vicoop-codex call`, write the JSON body on stdin, and collect
-// the result. Honours abort/cancel via `signal` — on abort we SIGTERM the
-// child so the daemon doesn't wait on a stale subprocess after the
-// caller's A2A `tasks/cancel` lands. Stderr is captured in full (no cap)
-// because vicoop-codex's user-facing error guidance lives there and the
-// task.fail message is operator-visible.
-async function runVicoopCodexCall(
-  body: string,
-  opts: {
-    command: string;
-    args: readonly string[];
-    cwd?: string;
-    spawn: VicoopCodexSpawnFn;
-    timeoutMs: number;
-    signal: AbortSignal;
-    stderrCap: number;
-    logger?: Logger;
-  },
-): Promise<CallResult> {
-  return await new Promise<CallResult>((resolve, reject) => {
-    let child: VicoopCodexChildHandle;
-    try {
-      child = opts.spawn(opts.command, opts.args, { cwd: opts.cwd });
-    } catch (err) {
-      reject(err);
-      return;
-    }
-
-    let stdout = '';
-    let stderr = '';
-    let timer: NodeJS.Timeout | null = null;
-    let aborted = false;
-    let settled = false;
-
-    const finish = (result: CallResult): void => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      opts.signal.removeEventListener('abort', onAbort);
-      resolve(result);
-    };
-
-    const fail = (err: Error): void => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      opts.signal.removeEventListener('abort', onAbort);
-      reject(err);
-    };
-
-    const onAbort = (): void => {
-      aborted = true;
-      try {
-        child.kill('SIGTERM');
-      } catch {
-        // best-effort
-      }
-    };
-    if (opts.signal.aborted) {
-      try {
-        child.kill('SIGTERM');
-      } catch {
-        // best-effort
-      }
-    } else {
-      opts.signal.addEventListener('abort', onAbort);
-    }
-
-    if (opts.timeoutMs > 0) {
-      timer = setTimeout(() => {
-        if (settled) return;
-        try {
-          child.kill('SIGTERM');
-        } catch {
-          // best-effort
-        }
-        fail(new Error(`vicoop-codex call timed out after ${opts.timeoutMs}ms`));
-      }, opts.timeoutMs);
-    }
-
-    if (child.stdout) {
-      child.stdout.on('data', (chunk: Buffer | string) => {
-        stdout += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-      });
-    }
-    if (child.stderr) {
-      child.stderr.on('data', (chunk: Buffer | string) => {
-        const piece = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-        if (stderr.length < opts.stderrCap) {
-          const remaining = opts.stderrCap - stderr.length;
-          stderr += piece.length > remaining ? piece.slice(0, remaining) : piece;
-        }
-      });
-    }
-
-    child.on('error', (err) => {
-      fail(err);
-    });
-    child.on('close', (code, signal) => {
-      finish({
-        code: aborted ? null : code,
-        signal,
-        stdout,
-        stderr,
-      });
-    });
-
-    if (child.stdin) {
-      child.stdin.on('error', (err: NodeJS.ErrnoException) => {
-        // EPIPE on early exit is expected (e.g. exit code 2 before reading
-        // the body) — surface it as a normal close, not a hard error.
-        if (err.code !== 'EPIPE') {
-          opts.logger?.warn?.(`[vicoop-codex] stdin error: ${errorMessage(err)}`);
-        }
-      });
-      try {
-        child.stdin.write(body);
-        child.stdin.end();
-      } catch (err) {
-        opts.logger?.warn?.(`[vicoop-codex] failed to write stdin: ${errorMessage(err)}`);
-      }
-    }
+// Default streaming transport: wrap the global `fetch` into the slim
+// `VicoopCodexStreamResponse` the backend consumes. The SSE body is exposed
+// as an async iterable of decoded UTF-8 string chunks read off the response's
+// `ReadableStream`.
+async function defaultFetch(
+  url: string,
+  init: { body: string; signal: AbortSignal },
+): Promise<VicoopCodexStreamResponse> {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: init.body,
+    signal: init.signal,
   });
+  return {
+    ok: res.ok,
+    status: res.status,
+    text: () => res.text(),
+    async *chunks() {
+      const body = res.body;
+      if (!body) return;
+      const reader = body.getReader();
+      const decoder = new TextDecoder();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) yield decoder.decode(value, { stream: true });
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    },
+  };
 }
 
-// Construct the A2A Backend. The handler turns each task into a single
-// non-streaming `vicoop-codex call` invocation: read the existing
-// openai-compat extension metadata → assemble messages → invoke →
-// translate response to A2A artifacts + final message metadata.
+// A live `vicoop-codex serve` instance: the child process plus the base URL
+// (`http://127.0.0.1:<port>`) parsed from its `listening` line.
+interface ServeHandle {
+  child: VicoopCodexChildHandle;
+  baseUrl: string;
+}
+
+// `vicoop-codex serve` prints a single JSON line on stdout when the HTTP
+// server is up, e.g.
+//   {"event":"listening","host":"127.0.0.1","port":8787,"url":"http://127.0.0.1:8787"}
+// followed by human-readable text lines. Parse the JSON line to recover the
+// base URL; ignore everything else. Returns null for non-JSON / non-listening
+// lines so the caller keeps scanning.
+export function parseServeListeningUrl(line: string): string | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('{')) return null;
+  let obj: unknown;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== 'object') return null;
+  const o = obj as Record<string, unknown>;
+  if (o.event !== 'listening') return null;
+  if (typeof o.url === 'string' && o.url.length > 0) return o.url.replace(/\/$/, '');
+  if (typeof o.host === 'string' && typeof o.port === 'number') {
+    return `http://${o.host}:${o.port}`;
+  }
+  return null;
+}
+
+// A typed error carrying the A2A `task.fail` code the streaming layer wants
+// the handler to surface, so HTTP/transport failures map cleanly without the
+// handler re-inspecting error shapes.
+class ServeRequestError extends Error {
+  constructor(
+    readonly a2aCode: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ServeRequestError';
+  }
+}
+
+// One `chat.completion.chunk` SSE frame. Only the fields the accumulator
+// reads — everything optional / nullable per OpenAI's streaming schema.
+interface ChatCompletionChunk {
+  id?: string;
+  object?: string;
+  created?: number;
+  model?: string;
+  choices?: Array<{
+    index?: number;
+    delta?: {
+      role?: string;
+      content?: string | null;
+      tool_calls?: Array<{
+        index?: number;
+        id?: string;
+        type?: string;
+        function?: { name?: string; arguments?: string };
+      }>;
+    };
+    finish_reason?: string | null;
+  }>;
+  usage?: ChatCompletionResponse['usage'];
+}
+
+// Per-index tool-call assembly buffer. OpenAI streams a tool call's
+// `function.arguments` as a sequence of string fragments across chunks, so we
+// concatenate; `id` / `type` / `name` arrive on the first fragment for that
+// index but we tolerate them landing on any.
+interface ToolCallBuffer {
+  id?: string;
+  type?: string;
+  name?: string;
+  arguments: string;
+}
+
+// Running fold over the SSE stream — assembled into a `ChatCompletionResponse`
+// by `synthesizeStreamedResponse` once the stream ends.
+interface StreamAccumulator {
+  id?: string;
+  model?: string;
+  created?: number;
+  content: string;
+  toolCalls: Map<number, ToolCallBuffer>;
+  finishReason?: string;
+  usage?: ChatCompletionResponse['usage'];
+}
+
+function applyChunk(
+  acc: StreamAccumulator,
+  chunk: ChatCompletionChunk,
+  onContentDelta: (text: string) => void,
+): void {
+  if (typeof chunk.id === 'string' && chunk.id.length > 0) acc.id = chunk.id;
+  if (typeof chunk.model === 'string' && chunk.model.length > 0) acc.model = chunk.model;
+  if (typeof chunk.created === 'number') acc.created = chunk.created;
+  if (chunk.usage) acc.usage = chunk.usage;
+  const choice = chunk.choices?.[0];
+  if (!choice) return;
+  if (typeof choice.finish_reason === 'string') acc.finishReason = choice.finish_reason;
+  const delta = choice.delta;
+  if (!delta) return;
+  if (typeof delta.content === 'string' && delta.content.length > 0) {
+    acc.content += delta.content;
+    onContentDelta(delta.content);
+  }
+  if (Array.isArray(delta.tool_calls)) {
+    for (const tc of delta.tool_calls) {
+      const idx = typeof tc.index === 'number' ? tc.index : 0;
+      let cur = acc.toolCalls.get(idx);
+      if (!cur) {
+        cur = { arguments: '' };
+        acc.toolCalls.set(idx, cur);
+      }
+      if (typeof tc.id === 'string') cur.id = tc.id;
+      if (typeof tc.type === 'string') cur.type = tc.type;
+      if (tc.function) {
+        if (typeof tc.function.name === 'string') cur.name = tc.function.name;
+        if (typeof tc.function.arguments === 'string') cur.arguments += tc.function.arguments;
+      }
+    }
+  }
+}
+
+// Fold the accumulated SSE state into the non-streaming `ChatCompletionResponse`
+// shape the existing envelope builders consume. Mirrors the OpenAI contract:
+// a tool-call turn carries `content:null` + `tool_calls`, a text turn carries
+// the assembled content.
+function synthesizeStreamedResponse(acc: StreamAccumulator): ChatCompletionResponse {
+  const toolCalls = [...acc.toolCalls.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, t]) => ({
+      id: t.id,
+      type: t.type ?? 'function',
+      function: { name: t.name, arguments: t.arguments },
+    }));
+  const hasToolCalls = toolCalls.length > 0;
+  return {
+    id: acc.id,
+    object: 'chat.completion',
+    created: acc.created,
+    model: acc.model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: hasToolCalls ? null : acc.content,
+          ...(hasToolCalls ? { tool_calls: toolCalls } : {}),
+        },
+        finish_reason: acc.finishReason ?? (hasToolCalls ? 'tool_calls' : 'stop'),
+      },
+    ],
+    usage: acc.usage,
+  };
+}
+
+// POST the Chat Completions request (with `stream:true`) to `vicoop-codex
+// serve` and fold the `chat.completion.chunk` SSE stream into a single
+// `ChatCompletionResponse`. `onContentDelta` fires for each incremental text
+// fragment so the caller can emit `append:true` artifacts. Throws
+// `ServeRequestError` (with an A2A code) on HTTP / transport failure; the
+// caller maps abort separately via `signal.aborted`.
+async function streamChatCompletions(
+  fetchFn: VicoopCodexFetchFn,
+  url: string,
+  body: string,
+  signal: AbortSignal,
+  onContentDelta: (text: string) => void,
+): Promise<ChatCompletionResponse> {
+  let res: VicoopCodexStreamResponse;
+  try {
+    res = await fetchFn(url, { body, signal });
+  } catch (err) {
+    throw new ServeRequestError(
+      'network_error',
+      `vicoop-codex serve request failed: ${errorMessage(err)}`,
+    );
+  }
+  if (!res.ok) {
+    let detail = '';
+    try {
+      detail = (await res.text()).trim().slice(0, 512);
+    } catch {
+      // best-effort — diagnostics only
+    }
+    throw new ServeRequestError(
+      'upstream_error',
+      `vicoop-codex serve returned HTTP ${res.status}${detail ? `: ${detail}` : ''}`,
+    );
+  }
+
+  const acc: StreamAccumulator = { content: '', toolCalls: new Map() };
+  // Process one `data:` payload; returns true when the stream's `[DONE]`
+  // sentinel is seen so the reader can stop.
+  const consume = (data: string): boolean => {
+    if (data === '[DONE]') return true;
+    let chunk: ChatCompletionChunk;
+    try {
+      chunk = JSON.parse(data) as ChatCompletionChunk;
+    } catch {
+      // Defensive: OpenAI guarantees valid JSON per data line, but a stray
+      // keep-alive / comment shouldn't abort the turn — skip it.
+      return false;
+    }
+    applyChunk(acc, chunk, onContentDelta);
+    return false;
+  };
+
+  let buf = '';
+  try {
+    let done = false;
+    for await (const piece of res.chunks()) {
+      buf += piece;
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).replace(/\r$/, '');
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith('data:')) continue; // blank lines, `event:`, comments
+        const data = line.slice(5).trim();
+        if (data.length === 0) continue;
+        if (consume(data)) {
+          done = true;
+          break;
+        }
+      }
+      if (done) break;
+    }
+    if (!done) {
+      // Flush a trailing `data:` payload that arrived without a final newline.
+      const tail = buf.replace(/\r$/, '');
+      if (tail.startsWith('data:')) {
+        const data = tail.slice(5).trim();
+        if (data.length > 0) consume(data);
+      }
+    }
+  } catch (err) {
+    // Surface as a transport error; the handler prioritises `signal.aborted`
+    // (→ canceled) over this mapping when the abort caused the interruption.
+    throw new ServeRequestError(
+      'network_error',
+      `vicoop-codex serve stream interrupted: ${errorMessage(err)}`,
+    );
+  }
+
+  return synthesizeStreamedResponse(acc);
+}
+
 // Probe the vicoop-codex CLI's `models --json` subcommand to discover the
 // model ids this account / install advertises. Returns null on any failure
 // (binary missing, timeout, non-JSON stdout, unexpected shape) so the
@@ -678,11 +834,22 @@ export function createVicoopCodexBackend(
   opts: VicoopCodexBackendOptions = {},
 ): Backend {
   const command = opts.command ?? 'vicoop-codex';
-  const baseArgs: readonly string[] = ['call', ...(opts.extraArgs ?? [])];
+  // `vicoop-codex serve -p 0` binds an ephemeral loopback port and prints its
+  // URL on stdout (`parseServeListeningUrl`). One server is spawned lazily and
+  // shared across every task (mirrors codex's `app-server` singleton).
+  const serveArgs: readonly string[] = [
+    'serve',
+    '-p',
+    '0',
+    '-H',
+    '127.0.0.1',
+    ...(opts.extraArgs ?? []),
+  ];
   const cwd = opts.cwd;
   const spawnFn = opts.spawn ?? defaultSpawn;
+  const fetchFn = opts.fetch ?? defaultFetch;
   const stderrCap = opts.stderrCaptureBytes ?? 16 * 1024;
-  const callTimeoutMs = opts.callTimeoutMs ?? 0;
+  const serveStartupTimeoutMs = opts.serveStartupTimeoutMs ?? 10_000;
   const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
   const logger = opts.logger ?? createLogger();
   const openaiCompatTrace = opts.openaiCompatTrace === true;
@@ -694,8 +861,149 @@ export function createVicoopCodexBackend(
   // model ids the CLI's `models --json` advertised.
   let cachedSupportedModels: Set<string> | null | undefined = undefined;
 
+  // Lazy `vicoop-codex serve` singleton + in-flight startup dedup. `serve`
+  // holds the live server; `servePending` coalesces concurrent first-task
+  // starts so we never spawn two servers. Both clear when the child dies so
+  // the next task respawns.
+  let serve: ServeHandle | null = null;
+  let servePending: Promise<ServeHandle> | null = null;
+
+  function startServe(): Promise<ServeHandle> {
+    return new Promise<ServeHandle>((resolve, reject) => {
+      let child: VicoopCodexChildHandle;
+      try {
+        child = spawnFn(command, serveArgs, { cwd });
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error(errorMessage(err)));
+        return;
+      }
+
+      // `vicoop-codex serve` prints its `listening` JSON line — and all other
+      // human-readable startup text — to STDERR, not stdout. We scan both
+      // streams for the line (robust to a future change) and separately keep a
+      // capped stderr buffer for the exit-before-listening diagnostic.
+      let outBuf = '';
+      let errBuf = '';
+      let stderrDiag = '';
+      let settled = false;
+      let timer: NodeJS.Timeout | null = null;
+
+      const clearSingletonFor = (): void => {
+        if (serve?.child === child) serve = null;
+      };
+
+      const scanForListening = (buf: string): { url: string | null; rest: string } => {
+        let nl: number;
+        let rest = buf;
+        while ((nl = rest.indexOf('\n')) >= 0) {
+          const line = rest.slice(0, nl);
+          rest = rest.slice(nl + 1);
+          const url = parseServeListeningUrl(line);
+          if (url) return { url, rest };
+        }
+        return { url: null, rest };
+      };
+
+      const onLine = (url: string | null): void => {
+        if (settled || !url) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve({ child, baseUrl: url });
+      };
+
+      child.on('close', (code) => {
+        clearSingletonFor();
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        const head = stderrDiag.trim().slice(0, 512);
+        reject(
+          new Error(
+            `vicoop-codex serve exited (code ${code}) before reporting listening` +
+              (head ? `: ${head}` : ''),
+          ),
+        );
+      });
+      child.on('error', (err) => {
+        clearSingletonFor();
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        reject(err);
+      });
+
+      if (child.stdout) {
+        child.stdout.on('data', (chunk: Buffer | string) => {
+          if (settled) return;
+          outBuf += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+          const { url, rest } = scanForListening(outBuf);
+          outBuf = rest;
+          onLine(url);
+        });
+      }
+      if (child.stderr) {
+        child.stderr.on('data', (chunk: Buffer | string) => {
+          const piece = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+          if (stderrDiag.length < stderrCap) {
+            stderrDiag += piece.slice(0, stderrCap - stderrDiag.length);
+          }
+          if (settled) return;
+          errBuf += piece;
+          const { url, rest } = scanForListening(errBuf);
+          errBuf = rest;
+          onLine(url);
+        });
+      }
+
+      if (serveStartupTimeoutMs > 0) {
+        timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          try {
+            child.kill('SIGTERM');
+          } catch {
+            // best-effort
+          }
+          reject(
+            new Error(
+              `vicoop-codex serve did not report listening within ${serveStartupTimeoutMs}ms`,
+            ),
+          );
+        }, serveStartupTimeoutMs);
+      }
+    });
+  }
+
+  async function ensureServe(): Promise<ServeHandle> {
+    if (serve) return serve;
+    if (servePending) return servePending;
+    servePending = startServe().then(
+      (h) => {
+        serve = h;
+        servePending = null;
+        return h;
+      },
+      (err) => {
+        servePending = null;
+        throw err;
+      },
+    );
+    return servePending;
+  }
+
   return {
     name: 'vicoop-codex',
+
+    stop() {
+      if (serve) {
+        try {
+          serve.child.kill('SIGTERM');
+        } catch {
+          // best-effort
+        }
+        serve = null;
+      }
+    },
 
     async resolveCapabilities() {
       const ids = await probeVicoopCodexModels({
@@ -796,7 +1104,10 @@ export function createVicoopCodexBackend(
       const body = buildCallBody(effectiveEnvelope, messages);
       let serialized: string;
       try {
-        serialized = JSON.stringify(body);
+        // `stream:true` switches `vicoop-codex serve`'s `/v1/chat/completions`
+        // into the `chat.completion.chunk` SSE mode we fold in
+        // `streamChatCompletions`.
+        serialized = JSON.stringify({ ...body, stream: true });
       } catch (err) {
         emit({
           type: 'task.fail',
@@ -815,18 +1126,12 @@ export function createVicoopCodexBackend(
         status: { state: 'working', timestamp: new Date().toISOString() },
       });
 
-      let result: CallResult;
+      // Ensure the shared `vicoop-codex serve` is up. A startup failure (binary
+      // missing, too old to expose `serve`, port never opened) is terminal for
+      // this task — surface `serve_unavailable` with the captured stderr.
+      let serveHandle: ServeHandle;
       try {
-        result = await runVicoopCodexCall(serialized, {
-          command,
-          args: baseArgs,
-          cwd,
-          spawn: spawnFn,
-          timeoutMs: callTimeoutMs,
-          signal,
-          stderrCap,
-          logger,
-        });
+        serveHandle = await ensureServe();
       } catch (err) {
         if (signal.aborted) {
           emit({
@@ -840,57 +1145,71 @@ export function createVicoopCodexBackend(
           type: 'task.fail',
           taskId: task.taskId,
           error: {
-            code: 'spawn_failed',
-            message: `failed to spawn vicoop-codex: ${errorMessage(err)}`,
+            code: 'serve_unavailable',
+            message: `failed to start vicoop-codex serve: ${errorMessage(err)}`,
           },
         });
         return;
       }
 
-      // Aborted mid-flight — caller already pulled the plug, surface as
-      // canceled regardless of what the subprocess did before SIGTERM
-      // delivered.
+      // Stream the response. Each `delta.content` fragment is emitted as an
+      // `append:true` text artifact (single reused artifactId) so the gateway
+      // codec maps it to an OpenAI SSE `delta.content` chunk (#293/#294).
+      let responseArtifactId: string | null = null;
+      let emittedAnyArtifact = false;
+      const emitDelta = (text: string): void => {
+        if (!text) return;
+        responseArtifactId ??= randomUUID();
+        emit({
+          type: 'task.artifact',
+          taskId: task.taskId,
+          artifact: {
+            artifactId: responseArtifactId,
+            name: 'vicoop-codex-message',
+            parts: [{ kind: 'text', text }],
+          },
+          append: true,
+          lastChunk: false,
+        });
+        emittedAnyArtifact = true;
+      };
+
+      let response: ChatCompletionResponse;
+      try {
+        response = await streamChatCompletions(
+          fetchFn,
+          `${serveHandle.baseUrl}/v1/chat/completions`,
+          serialized,
+          signal,
+          emitDelta,
+        );
+      } catch (err) {
+        // Abort wins over any transport-error mapping — the caller pulled the
+        // plug, so surface canceled.
+        if (signal.aborted) {
+          emit({
+            type: 'task.complete',
+            taskId: task.taskId,
+            status: { state: 'canceled', timestamp: new Date().toISOString() },
+          });
+          return;
+        }
+        const code = err instanceof ServeRequestError ? err.a2aCode : 'vicoop_codex_failed';
+        emit({
+          type: 'task.fail',
+          taskId: task.taskId,
+          error: { code, message: errorMessage(err) },
+        });
+        return;
+      }
+
+      // Aborted mid-stream — surface as canceled regardless of what arrived
+      // before the abort delivered.
       if (signal.aborted) {
         emit({
           type: 'task.complete',
           taskId: task.taskId,
           status: { state: 'canceled', timestamp: new Date().toISOString() },
-        });
-        return;
-      }
-
-      if (result.code !== 0) {
-        const trimmedStderr = result.stderr.trim();
-        const message =
-          trimmedStderr.length > 0
-            ? trimmedStderr
-            : `vicoop-codex exited with code ${result.code}`;
-        emit({
-          type: 'task.fail',
-          taskId: task.taskId,
-          error: {
-            code: exitCodeToA2ACode(result.code),
-            message,
-          },
-        });
-        return;
-      }
-
-      // Parse the stdout payload. A malformed (non-JSON) stdout shouldn't
-      // crash the backend — surface as `parse_failed` with the head of
-      // the output so the operator can diagnose without `--verbose`.
-      let response: ChatCompletionResponse;
-      try {
-        response = JSON.parse(result.stdout) as ChatCompletionResponse;
-      } catch (err) {
-        const head = result.stdout.slice(0, 256);
-        emit({
-          type: 'task.fail',
-          taskId: task.taskId,
-          error: {
-            code: 'parse_failed',
-            message: `failed to parse vicoop-codex stdout as JSON: ${errorMessage(err)}; head: ${JSON.stringify(head)}`,
-          },
         });
         return;
       }
@@ -909,12 +1228,11 @@ export function createVicoopCodexBackend(
 
       // Envelope contract (oai2a2a#80): tool_calls flow exclusively through
       // the terminal `chat_completion` envelope metadata — NOT as a data-part
-      // artifact. The legacy `data` part shaped `{ "tool_calls": [...] }`
-      // is removed from this extension; consumers ignore it. Text content
-      // still rides as a text artifact so non-OpenAI A2A consumers
-      // (debugging UIs, traceability tooling) see the task's response
-      // natively, per the spec's "Relationship to A2A artifacts" note.
-      if (toolCalls.length === 0 && contentText) {
+      // artifact. Text content already streamed as `append:true` artifacts
+      // above. Fallback: if the server returned text WITHOUT chunking it (no
+      // deltas seen), emit it once here so non-OpenAI A2A consumers still see
+      // the response — mirrors codex's `!emittedAnyArtifact` guard.
+      if (!emittedAnyArtifact && toolCalls.length === 0 && contentText) {
         emit({
           type: 'task.artifact',
           taskId: task.taskId,

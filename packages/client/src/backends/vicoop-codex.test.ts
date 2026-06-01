@@ -14,9 +14,11 @@ import {
   flattenA2AUserContent,
   historyToChatCompletionMessages,
   parseChatCompletionUsage,
+  parseServeListeningUrl,
   probeVicoopCodexModels,
   type ChatCompletionResponse,
   type VicoopCodexChildHandle,
+  type VicoopCodexFetchFn,
   type VicoopCodexSpawnFn,
   type VicoopCodexSpawnOptions,
 } from './vicoop-codex.js';
@@ -483,31 +485,110 @@ test('buildResponseMetadata: synthesizes defensive defaults when upstream omits 
 // End-to-end Backend.handle() tests via the fake spawn surface
 // ─────────────────────────────────────────────────────────────────────────────
 
-function runBackend(
+// ── Streaming HTTP fake ──────────────────────────────────────────────────
+// The backend now drives each task through `vicoop-codex serve`'s
+// `/v1/chat/completions` over `fetch`, parsing a `chat.completion.chunk` SSE
+// stream. These fakes script the serve child's `listening` line (via the
+// spawn fake) and the SSE body (via an injected `fetch`).
+
+interface RecordingFetch {
+  fetch: VicoopCodexFetchFn;
+  calls: Array<{ url: string; body: string }>;
+}
+
+// A fetch that records each request and returns a fixed SSE body. `status`
+// < 200 || >= 300 marks the response not-ok (drives the upstream_error path);
+// `bodyText` is what `.text()` returns on that error path.
+function makeSseFetch(
+  sse: string,
+  opts: { status?: number; bodyText?: string } = {},
+): RecordingFetch {
+  const calls: Array<{ url: string; body: string }> = [];
+  const status = opts.status ?? 200;
+  const fetch: VicoopCodexFetchFn = async (url, init) => {
+    calls.push({ url, body: init.body });
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      async text() {
+        return opts.bodyText ?? '';
+      },
+      async *chunks() {
+        yield sse;
+      },
+    };
+  };
+  return { fetch, calls };
+}
+
+// Serialise a list of chunk objects into an SSE body terminated by `[DONE]`.
+function sseStream(chunks: Array<Record<string, unknown>>): string {
+  return (
+    chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join('') + 'data: [DONE]\n\n'
+  );
+}
+
+// Emit the `listening` line a freshly-spawned serve child prints. The real
+// `vicoop-codex serve` writes this (and all startup text) to STDERR, so the
+// fake drives it there to match production wiring.
+function driveServeListening(child: FakeChild, port = 8787): void {
+  child.emitStderr(
+    JSON.stringify({
+      event: 'listening',
+      host: '127.0.0.1',
+      port,
+      url: `http://127.0.0.1:${port}`,
+    }) + '\n',
+  );
+}
+
+// Run handle() end-to-end with a serve + fetch fake. `handle()` spawns the
+// serve child synchronously inside `ensureServe`, so we drive its listening
+// line on the next microtask, then await completion.
+async function runStreaming(
   task: TaskAssignFrame,
-  driveChild: (child: FakeChild) => void,
+  fetchRec: RecordingFetch,
 ): Promise<UpFrame[]> {
   const fake = makeFakeSpawn();
-  const backend = createVicoopCodexBackend({ spawn: fake.spawn });
+  const backend = createVicoopCodexBackend({
+    spawn: fake.spawn,
+    fetch: fetchRec.fetch,
+  });
   const frames: UpFrame[] = [];
   const ctrl = new AbortController();
   const done = backend.handle(task, (f) => frames.push(f), ctrl.signal);
-  // Wait one microtask so the backend has spawned its child before we drive
-  // it. The fake spawn is synchronous, so a single queueMicrotask suffices.
-  return new Promise((resolve, reject) => {
+  await new Promise<void>((resolve, reject) => {
     queueMicrotask(() => {
       try {
-        driveChild(fake.lastChild());
+        driveServeListening(fake.lastChild());
       } catch (err) {
-        reject(err);
+        reject(err as Error);
         return;
       }
-      done.then(() => resolve(frames), reject);
+      done.then(() => resolve(), reject);
     });
   });
+  return frames;
 }
 
-test('handle: success path — text response → artifact + complete with metadata', async () => {
+test('parseServeListeningUrl: reads the listening line, ignores other lines', () => {
+  assert.equal(
+    parseServeListeningUrl(
+      '{"event":"listening","host":"127.0.0.1","port":8787,"url":"http://127.0.0.1:8787"}',
+    ),
+    'http://127.0.0.1:8787',
+  );
+  // Falls back to host+port when `url` is absent; strips a trailing slash.
+  assert.equal(
+    parseServeListeningUrl('{"event":"listening","host":"127.0.0.1","port":9000}'),
+    'http://127.0.0.1:9000',
+  );
+  assert.equal(parseServeListeningUrl('vicoop-codex serve listening on:'), null);
+  assert.equal(parseServeListeningUrl('{"event":"other"}'), null);
+  assert.equal(parseServeListeningUrl('not json'), null);
+});
+
+test('handle: streamed text → one append artifact per delta + complete with metadata', async () => {
   const task = makeTask({
     metadata: {
       [OPENAI_COMPAT_EXTENSION_URI]: {
@@ -515,65 +596,160 @@ test('handle: success path — text response → artifact + complete with metada
       },
     },
   });
-  const frames = await runBackend(task, (child) => {
-    const response: ChatCompletionResponse = {
+  // `chat.completion.chunk` SSE: role preamble → two content deltas → final
+  // chunk carrying finish_reason + usage.
+  const sse = sseStream([
+    {
       id: 'chatcmpl-1',
-      object: 'chat.completion',
+      object: 'chat.completion.chunk',
       created: 1700000000,
       model: 'gpt-5.4',
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: 'ok' },
-          finish_reason: 'stop',
-        },
-      ],
+      choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-1',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { content: 'o' }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-1',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { content: 'k' }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-1',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
       usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
-    };
-    child.emitStdout(JSON.stringify(response));
-    child.finish(0);
-  });
+    },
+  ]);
+  const frames = await runStreaming(task, makeSseFetch(sse));
 
   const statuses = frames.filter((f) => f.type === 'task.status');
   const artifacts = frames.filter((f) => f.type === 'task.artifact');
   const completes = frames.filter((f) => f.type === 'task.complete');
   assert.equal(statuses.length, 1);
   assert.equal(statuses[0].status.state, 'working');
-  assert.equal(artifacts.length, 1);
-  const artifact = artifacts[0];
-  if (artifact.type !== 'task.artifact') throw new Error('unreachable');
-  assert.equal(artifact.artifact.parts[0].kind, 'text');
-  if (artifact.artifact.parts[0].kind !== 'text') throw new Error('unreachable');
-  assert.equal(artifact.artifact.parts[0].text, 'ok');
+  // One incremental append artifact per content delta.
+  assert.equal(artifacts.length, 2);
+  const texts: string[] = [];
+  const ids = new Set<string>();
+  for (const a of artifacts) {
+    if (a.type !== 'task.artifact') throw new Error('unreachable');
+    assert.equal(a.append, true, 'streamed deltas are append:true');
+    const part = a.artifact.parts[0];
+    if (part.kind !== 'text') throw new Error('unreachable');
+    texts.push(part.text);
+    ids.add(a.artifact.artifactId);
+  }
+  assert.deepEqual(texts, ['o', 'k']);
+  // All deltas share one artifactId so the server merges them into one
+  // artifact (and the gateway into one OpenAI message).
+  assert.equal(ids.size, 1);
+
   assert.equal(completes.length, 1);
   const completeFrame = completes[0];
   if (completeFrame.type !== 'task.complete') throw new Error('unreachable');
   assert.equal(completeFrame.status.state, 'completed');
   const msg = completeFrame.status.message!;
+  // Terminal message carries the full assembled text for A2A history /
+  // non-streaming consumers.
+  assert.deepEqual(msg.parts, [{ kind: 'text', text: 'ok' }]);
   assert.ok(msg.extensions?.includes(OPENAI_COMPAT_EXTENSION_URI));
   const ext = (msg.metadata as Record<string, Record<string, unknown>>)[
     OPENAI_COMPAT_EXTENSION_URI
   ];
-  // Envelope contract: only `chat_completion` is stamped — the
-  // transitional top-level `usage` sibling for v1-era codecs has been
-  // retired.
   assert.equal(ext.usage, undefined);
   const envelope = ext.chat_completion as Record<string, unknown>;
   assert.equal(envelope.id, 'chatcmpl-1');
   assert.equal(envelope.model, 'gpt-5.4');
-  // The envelope carries `usage` natively (codec reads it here).
   const envelopeUsage = envelope.usage as Record<string, number>;
   assert.equal(envelopeUsage.prompt_tokens, 3);
   assert.equal(envelopeUsage.completion_tokens, 1);
   assert.equal(envelopeUsage.total_tokens, 4);
-  // Spec requires logprobs on each choice (null when not surfaced).
   const choices = envelope.choices as Array<Record<string, unknown>>;
   assert.equal(choices.length, 1);
   assert.equal(choices[0].logprobs, null);
   assert.equal(choices[0].finish_reason, 'stop');
+  const choiceMsg = choices[0].message as Record<string, unknown>;
+  assert.equal(choiceMsg.content, 'ok');
 });
 
-test('handle: tool_calls response → no data artifact; tool_calls only on terminal chat_completion envelope (envelope contract, oai2a2a#80)', async () => {
+test('handle: request body carries stream:true + envelope-derived model/messages/tools', async () => {
+  const task = makeTask({
+    message: {
+      role: 'user',
+      messageId: 'msg',
+      parts: [{ kind: 'text', text: 'current question' }],
+      metadata: {
+        [OPENAI_COMPAT_EXTENSION_URI]: {
+          chat_completions_request: {
+            model: 'gpt-5.5',
+            messages: [
+              { role: 'system', content: 'reply in korean' },
+              {
+                role: 'assistant',
+                content: null,
+                tool_calls: [
+                  {
+                    id: 'call_1',
+                    type: 'function',
+                    function: { name: 'get_weather', arguments: '{"city":"Seoul"}' },
+                  },
+                ],
+              },
+              { role: 'tool', tool_call_id: 'call_1', content: '{"temp":13}' },
+              { role: 'user', content: 'current question' },
+            ],
+            tools: [{ type: 'function', function: { name: 'get_weather' } }],
+            tool_choice: { type: 'function', function: { name: 'get_weather' } },
+          },
+        },
+      },
+    },
+  });
+  const sse = sseStream([
+    {
+      id: 'chatcmpl-3',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.5',
+      choices: [{ index: 0, delta: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    },
+  ]);
+  const fetchRec = makeSseFetch(sse);
+  await runStreaming(task, fetchRec);
+
+  assert.equal(fetchRec.calls.length, 1);
+  assert.ok(fetchRec.calls[0].url.endsWith('/v1/chat/completions'));
+  const body = JSON.parse(fetchRec.calls[0].body) as Record<string, unknown>;
+  // Streaming flag is set on the wire.
+  assert.equal(body.stream, true);
+  // Messages: system → chat_history (assistant(tool_calls) → tool) →
+  // trailing user.
+  const messages = body.messages as Array<{ role: string }>;
+  assert.deepEqual(
+    messages.map((m) => m.role),
+    ['system', 'assistant', 'tool', 'user'],
+  );
+  assert.equal(body.model, 'gpt-5.5');
+  assert.deepEqual(body.tools, [
+    { type: 'function', function: { name: 'get_weather' } },
+  ]);
+  assert.deepEqual(body.tool_choice, {
+    type: 'function',
+    function: { name: 'get_weather' },
+  });
+  // Group B / Group C fields stay off the wire — the binary applies defaults.
+  assert.equal(body.reasoning_effort, undefined);
+  assert.equal(body.temperature, undefined);
+  assert.equal(body.max_tokens, undefined);
+});
+
+test('handle: streamed tool_calls → no artifact; tool_calls only on terminal chat_completion envelope (envelope contract, oai2a2a#80)', async () => {
   const task = makeTask({
     metadata: {
       [OPENAI_COMPAT_EXTENSION_URI]: {
@@ -581,34 +757,59 @@ test('handle: tool_calls response → no data artifact; tool_calls only on termi
       },
     },
   });
-  const frames = await runBackend(task, (child) => {
-    const response: ChatCompletionResponse = {
+  // Tool-call stream: role preamble (content null) → tool_calls delta (with
+  // arguments split across two fragments to exercise the accumulator) →
+  // terminal finish_reason + usage.
+  const sse = sseStream([
+    {
       id: 'chatcmpl-2',
-      object: 'chat.completion',
+      object: 'chat.completion.chunk',
       created: 1700000001,
+      model: 'gpt-5.3-codex',
+      choices: [{ index: 0, delta: { role: 'assistant', content: null }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-2',
+      object: 'chat.completion.chunk',
       model: 'gpt-5.3-codex',
       choices: [
         {
           index: 0,
-          message: {
-            role: 'assistant',
-            content: null,
+          delta: {
             tool_calls: [
               {
+                index: 0,
                 id: 'call_xyz',
                 type: 'function',
-                function: { name: 'list_files', arguments: '{"path":"."}' },
+                function: { name: 'list_files', arguments: '{"path"' },
               },
             ],
           },
-          finish_reason: 'tool_calls',
+          finish_reason: null,
         },
       ],
+    },
+    {
+      id: 'chatcmpl-2',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.3-codex',
+      choices: [
+        {
+          index: 0,
+          delta: { tool_calls: [{ index: 0, function: { arguments: ':"."}' } }] },
+          finish_reason: null,
+        },
+      ],
+    },
+    {
+      id: 'chatcmpl-2',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.3-codex',
+      choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
       usage: { prompt_tokens: 4, completion_tokens: 6, total_tokens: 10 },
-    };
-    child.emitStdout(JSON.stringify(response));
-    child.finish(0);
-  });
+    },
+  ]);
+  const frames = await runStreaming(task, makeSseFetch(sse));
   // Envelope contract: no data-part `tool_calls` artifact. The legacy
   // `data` part shaped `{ "tool_calls": [...] }` is removed from this
   // extension — consumers ignore it, so emitting it would only confuse
@@ -667,90 +868,6 @@ test('handle: tool_calls response → no data artifact; tool_calls only on termi
   assert.equal(fn.arguments, '{"path":"."}');
 });
 
-test('handle: stdin body carries envelope-derived model/messages/tools/tool_choice', async () => {
-  const task = makeTask({
-    message: {
-      role: 'user',
-      messageId: 'msg',
-      parts: [{ kind: 'text', text: 'current question' }],
-      metadata: {
-        [OPENAI_COMPAT_EXTENSION_URI]: {
-          chat_completions_request: {
-            model: 'gpt-5.5',
-            messages: [
-              { role: 'system', content: 'reply in korean' },
-              {
-                role: 'assistant',
-                content: null,
-                tool_calls: [
-                  {
-                    id: 'call_1',
-                    type: 'function',
-                    function: { name: 'get_weather', arguments: '{"city":"Seoul"}' },
-                  },
-                ],
-              },
-              { role: 'tool', tool_call_id: 'call_1', content: '{"temp":13}' },
-              // Trailing user — split into A2A parts; chatHistoryFromMessages
-              // drops this from the replay so the test's A2A `parts` text
-              // becomes the trailing user instead.
-              { role: 'user', content: 'current question' },
-            ],
-            tools: [{ type: 'function', function: { name: 'get_weather' } }],
-            tool_choice: { type: 'function', function: { name: 'get_weather' } },
-          },
-        },
-      },
-    },
-  });
-
-  await runBackend(task, (child) => {
-    const response: ChatCompletionResponse = {
-      id: 'chatcmpl-3',
-      object: 'chat.completion',
-      created: 1,
-      model: 'gpt-5.5',
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: 'ok' },
-          finish_reason: 'stop',
-        },
-      ],
-      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-    };
-    const payload = child.stdinPayload();
-    const body = JSON.parse(payload) as Record<string, unknown>;
-    // Messages: system → chat_history (assistant(tool_calls) → tool) →
-    // trailing user. Per the new openai-compat chat_history wire, the
-    // trailing user (the current A2A `parts` turn) sits AFTER the
-    // history slice, mirroring how OpenAI Chat Completions arranges
-    // `[..., assistant.tool_calls, tool, user]` for a follow-up.
-    const messages = body.messages as Array<{ role: string }>;
-    assert.deepEqual(
-      messages.map((m) => m.role),
-      ['system', 'assistant', 'tool', 'user'],
-    );
-    // Envelope contract: model + tools + tool_choice forward verbatim.
-    // Group B / Group C fields (reasoning_effort, temperature, max_tokens
-    // etc.) are intentionally not on the call body shape — the binary
-    // applies its own defaults.
-    assert.equal(body.model, 'gpt-5.5');
-    assert.deepEqual(body.tools, [
-      { type: 'function', function: { name: 'get_weather' } },
-    ]);
-    assert.deepEqual(body.tool_choice, {
-      type: 'function',
-      function: { name: 'get_weather' },
-    });
-    assert.equal(body.reasoning_effort, undefined);
-    assert.equal(body.temperature, undefined);
-    assert.equal(body.max_tokens, undefined);
-    child.emitStdout(JSON.stringify(response));
-    child.finish(0);
-  });
-});
-
 test('handle: empty prompt → task.fail with empty_prompt code', async () => {
   const task = makeTask({
     message: {
@@ -771,38 +888,85 @@ test('handle: empty prompt → task.fail with empty_prompt code', async () => {
   assert.equal(failFrame.error.code, 'empty_prompt');
 });
 
-test('handle: non-zero exit maps to documented exit-code error codes', async () => {
-  const exitCases: Array<{ code: number; expected: string }> = [
-    { code: 2, expected: 'invalid_input' },
-    { code: 3, expected: 'login_required' },
-    { code: 4, expected: 'upstream_error' },
-    { code: 5, expected: 'network_error' },
-    { code: 99, expected: 'vicoop_codex_failed' },
-  ];
-  for (const { code, expected } of exitCases) {
-    const frames = await runBackend(makeTask(), (child) => {
-      child.emitStderr('Error: simulated');
-      child.finish(code);
+test('handle: serve exits before listening → task.fail serve_unavailable', async () => {
+  // Simulates an old binary that has no `serve` subcommand (exits non-zero
+  // with usage on stderr) — startup never reports listening.
+  const fake = makeFakeSpawn();
+  const backend = createVicoopCodexBackend({
+    spawn: fake.spawn,
+    fetch: makeSseFetch('').fetch,
+  });
+  const frames: UpFrame[] = [];
+  const ctrl = new AbortController();
+  const done = backend.handle(makeTask(), (f) => frames.push(f), ctrl.signal);
+  await new Promise<void>((resolve, reject) => {
+    queueMicrotask(() => {
+      const child = fake.lastChild();
+      child.emitStderr("error: unknown command 'serve'");
+      child.finish(1);
+      done.then(() => resolve(), reject);
     });
-    const fails = frames.filter((f) => f.type === 'task.fail');
-    assert.equal(fails.length, 1, `exit code ${code}`);
-    const failFrame = fails[0];
-    if (failFrame.type !== 'task.fail') throw new Error('unreachable');
-    assert.equal(failFrame.error.code, expected, `exit code ${code} → ${expected}`);
-    assert.ok(failFrame.error.message.includes('simulated'));
-  }
-});
-
-test('handle: malformed JSON stdout → parse_failed', async () => {
-  const frames = await runBackend(makeTask(), (child) => {
-    child.emitStdout('not json at all');
-    child.finish(0);
   });
   const fails = frames.filter((f) => f.type === 'task.fail');
   assert.equal(fails.length, 1);
   const failFrame = fails[0];
   if (failFrame.type !== 'task.fail') throw new Error('unreachable');
-  assert.equal(failFrame.error.code, 'parse_failed');
+  assert.equal(failFrame.error.code, 'serve_unavailable');
+  assert.ok(failFrame.error.message.includes('serve'));
+});
+
+test('handle: non-2xx from serve → task.fail upstream_error', async () => {
+  const frames = await runStreaming(
+    makeTask(),
+    makeSseFetch('', { status: 500, bodyText: 'model overloaded' }),
+  );
+  const fails = frames.filter((f) => f.type === 'task.fail');
+  assert.equal(fails.length, 1);
+  const failFrame = fails[0];
+  if (failFrame.type !== 'task.fail') throw new Error('unreachable');
+  assert.equal(failFrame.error.code, 'upstream_error');
+  assert.ok(failFrame.error.message.includes('500'));
+  assert.ok(failFrame.error.message.includes('overloaded'));
+});
+
+test('handle: serve is a shared singleton — two tasks reuse one server', async () => {
+  const fake = makeFakeSpawn();
+  const sse = sseStream([
+    {
+      id: 'c',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    },
+  ]);
+  const fetchRec = makeSseFetch(sse);
+  const backend = createVicoopCodexBackend({ spawn: fake.spawn, fetch: fetchRec.fetch });
+
+  const runOne = async (): Promise<UpFrame[]> => {
+    const frames: UpFrame[] = [];
+    const done = backend.handle(makeTask(), (f) => frames.push(f), new AbortController().signal);
+    await new Promise<void>((resolve, reject) => {
+      queueMicrotask(() => {
+        // Drive the listening line only on the first spawn; a second task
+        // reuses the already-listening singleton (lastChild stays the same
+        // serve child, and re-driving is an inert no-op).
+        driveServeListening(fake.lastChild());
+        done.then(() => resolve(), reject);
+      });
+    });
+    return frames;
+  };
+
+  const first = await runOne();
+  const second = await runOne();
+
+  // Exactly one serve child spawned across both tasks.
+  assert.equal(fake.children.length, 1);
+  // Both tasks completed and both issued a fetch to the shared server.
+  assert.equal(first.filter((f) => f.type === 'task.complete').length, 1);
+  assert.equal(second.filter((f) => f.type === 'task.complete').length, 1);
+  assert.equal(fetchRec.calls.length, 2);
 });
 
 test('handle: cancel before spawn → task.complete with canceled', async () => {
@@ -897,9 +1061,24 @@ test('resolveCapabilities advertises openaiCompatModels with the first id tagged
   });
 });
 
-test('envelope.model is forwarded when the probed list advertises it (#302)', async () => {
+// Shared SSE body + driver for the #302 envelope.model gate tests: probe
+// child (children[0]) feeds the cache, then handle() spawns the serve child
+// (children[1]) and the request rides over `fetch` — so we assert on the
+// recorded fetch body, not subprocess stdin.
+const OK_STREAM = sseStream([
+  {
+    id: 'x',
+    object: 'chat.completion.chunk',
+    model: 'gpt-5.5',
+    choices: [{ index: 0, delta: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  },
+]);
+
+async function runModelGate(envelopeModel: string): Promise<Record<string, unknown>> {
   const fake = makeFakeSpawn();
-  const backend = createVicoopCodexBackend({ spawn: fake.spawn });
+  const fetchRec = makeSseFetch(OK_STREAM);
+  const backend = createVicoopCodexBackend({ spawn: fake.spawn, fetch: fetchRec.fetch });
   const capPromise = backend.resolveCapabilities?.();
   queueMicrotask(() => {
     fake.lastChild().emitStdout(
@@ -910,7 +1089,6 @@ test('envelope.model is forwarded when the probed list advertises it (#302)', as
   await capPromise;
 
   const frames: UpFrame[] = [];
-  const ctrl = new AbortController();
   const done = backend.handle(
     {
       type: 'task.assign',
@@ -923,7 +1101,7 @@ test('envelope.model is forwarded when the probed list advertises it (#302)', as
         metadata: {
           [OPENAI_COMPAT_EXTENSION_URI]: {
             chat_completions_request: {
-              model: 'gpt-5.5',
+              model: envelopeModel,
               messages: [{ role: 'user', content: 'hi' }],
             },
           },
@@ -931,88 +1109,33 @@ test('envelope.model is forwarded when the probed list advertises it (#302)', as
       },
     },
     (f) => frames.push(f),
-    ctrl.signal,
+    new AbortController().signal,
   );
-  await new Promise<void>((resolve) => queueMicrotask(resolve));
-  // index 0 was the probe child; the call child is the second one.
-  const callChild = fake.children[1];
-  const body = JSON.parse(callChild.stdinPayload()) as Record<string, unknown>;
+  // handle() spawns the serve child synchronously inside ensureServe; drive
+  // its listening line, then await completion.
+  await new Promise<void>((resolve, reject) => {
+    queueMicrotask(() => {
+      driveServeListening(fake.lastChild());
+      done.then(() => resolve(), reject);
+    });
+  });
+  assert.equal(fetchRec.calls.length, 1);
+  return JSON.parse(fetchRec.calls[0].body) as Record<string, unknown>;
+}
+
+test('envelope.model is forwarded when the probed list advertises it (#302)', async () => {
+  const body = await runModelGate('gpt-5.5');
   assert.equal(body.model, 'gpt-5.5');
-  // Drive the call child to a clean exit so done resolves.
-  callChild.emitStdout(
-    JSON.stringify({
-      id: 'x',
-      object: 'chat.completion',
-      created: 1,
-      model: 'gpt-5.5',
-      choices: [
-        { index: 0, message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' },
-      ],
-      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-    }),
-  );
-  callChild.finish(0);
-  await done;
 });
 
 test('envelope.model is dropped when the probed list does NOT advertise it (#302)', async () => {
   // Regression guard for the gateway sending an unresolved routing key
-  // (e.g. `a2a/<card-url>`) as `envelope.model`. Without the gate the
-  // bridge would forward garbage to vicoop-codex, which would then fail
-  // upstream with `model not found`. With the gate the override is
-  // dropped and the CLI falls back to its DEFAULT_MODEL.
-  const fake = makeFakeSpawn();
-  const backend = createVicoopCodexBackend({ spawn: fake.spawn });
-  const capPromise = backend.resolveCapabilities?.();
-  queueMicrotask(() => {
-    fake.lastChild().emitStdout(
-      JSON.stringify({ models: [{ id: 'gpt-5.5' }, { id: 'gpt-5.4' }] }),
-    );
-    fake.lastChild().finish(0);
-  });
-  await capPromise;
-
-  const frames: UpFrame[] = [];
-  const ctrl = new AbortController();
-  const done = backend.handle(
-    {
-      type: 'task.assign',
-      taskId: 't',
-      contextId: 'c',
-      message: {
-        role: 'user',
-        messageId: 'm',
-        parts: [{ kind: 'text', text: 'hi' }],
-        metadata: {
-          [OPENAI_COMPAT_EXTENSION_URI]: {
-            chat_completions_request: {
-              model: 'a2a/https://example.com/agents/x/.well-known/agent-card.json',
-              messages: [{ role: 'user', content: 'hi' }],
-            },
-          },
-        },
-      },
-    },
-    (f) => frames.push(f),
-    ctrl.signal,
+  // (e.g. `a2a/<card-url>`) as `envelope.model`. Without the gate the bridge
+  // would forward garbage to vicoop-codex, which would then fail upstream
+  // with `model not found`. With the gate the override is dropped and the
+  // CLI falls back to its DEFAULT_MODEL.
+  const body = await runModelGate(
+    'a2a/https://example.com/agents/x/.well-known/agent-card.json',
   );
-  await new Promise<void>((resolve) => queueMicrotask(resolve));
-  const callChild = fake.children[1];
-  const body = JSON.parse(callChild.stdinPayload()) as Record<string, unknown>;
-  // model field absent — CLI falls back to DEFAULT_MODEL.
   assert.equal(body.model, undefined);
-  callChild.emitStdout(
-    JSON.stringify({
-      id: 'x',
-      object: 'chat.completion',
-      created: 1,
-      model: 'gpt-5.5',
-      choices: [
-        { index: 0, message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' },
-      ],
-      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-    }),
-  );
-  callChild.finish(0);
-  await done;
 });
