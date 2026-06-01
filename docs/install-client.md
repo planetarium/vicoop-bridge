@@ -357,12 +357,32 @@ re-runs.
 > (admin-command owner-session bootstrap, same role as `KUBECONFIG`),
 > `VICOOP_CLIENT_LOG_LEVEL` (logging diagnostic).
 
-If you omit `--caller`, `agent register` succeeds but prints a warning that
-the agent will be public until you restrict callers:
+If you omit `--caller`, `agent register` does **not** leave the agent public.
+Instead it auto-mints a static API key for the agent and prints the secret
+**once**, so the agent is immediately callable only by holders of that key:
 
-> `--caller` requires a bridge server version that stores caller allowlists
-> on registered agents. If you are testing against your own deployment,
-> deploy the matching server/schema before this step.
+```text
+Minted an API key for <agent-id> (no --caller was given, so the agent
+is restricted to this key instead of being left public):
+  key_id      Ab3-_xYz12
+  principal   apikey:Ab3-_xYz12
+  expires_at  2027-06-01T00:00:00.000Z
+
+  API key (shown once — store it now, it cannot be recovered):
+    vbc_caller_…
+```
+
+Callers present it as `Authorization: Bearer <api_key>`; manage keys with
+`vicoop-client agent apikey {list,revoke}` or add interactive (Google/SIWE)
+callers with `vicoop-client agent callers add`. With `--json`, the key rides
+along in the same payload under an `api_keys` array. If key minting fails (an
+older bridge without the apikeys route, or a transient error), the command
+falls back to the legacy public-agent warning so you can lock it down by hand.
+The deprecated `setup` alias keeps the old warning behavior unchanged.
+
+> `--caller` / auto-minted API keys require a bridge server version that
+> stores caller allowlists on registered agents. If you are testing against
+> your own deployment, deploy the matching server/schema before this step.
 
 > ⚠ The `AGENT_TOKEN` is unrecoverable after this single output.
 > `config.json` is the only place it persists; back it up if you need to
@@ -522,8 +542,9 @@ After that:
 
 - The bridge loads the `allowed_callers` list for your agent. If Step 4 (the
   `agent register` call) included `--caller`, that allowlist is already in
-  place; otherwise
-  `allowed_callers` is empty, meaning **publicly callable** until you restrict it.
+  place; otherwise `agent register` auto-minted an API key (printed once) and
+  added its `apikey:<key-id>` principal to `allowed_callers`, so the agent is
+  restricted to that key rather than being publicly callable.
 - `POST $BRIDGE_URL/agents/$AGENT_ID` with a JSON-RPC `message/send` payload
   reaches your backend and the reply is returned inline.
 
@@ -730,11 +751,13 @@ resumed Codex sessions.
 
 ## Manage caller allowlists
 
-If Step 4 `agent register` did not include `--caller`, the policy has empty
-`allowed_callers`, which the dispatcher treats as "public". For normal use,
-pass `--caller` during initial registration, or add an allowlist entry afterward
-with the `vicoop-client` subcommands (deterministic, scriptable) or a
-natural-language request to the admin agent. These paths require an
+If Step 4 `agent register` did not include `--caller`, it auto-minted a static
+API key and seeded `allowed_callers` with that key's principal, so the agent is
+restricted to the key rather than "public" (an empty `allowed_callers` is what
+the dispatcher treats as public). To broaden access, pass `--caller` during
+initial registration, or add an allowlist entry afterward with the
+`vicoop-client` subcommands (deterministic, scriptable) or a natural-language
+request to the admin agent. These paths require an
 **owner-session token** (`vbc_owner_*`). Step 4 login saves one locally;
 you only need to rerun `login` if that file is missing or expired. Admin
 scope (`is_admin()`) is wallet-only and gates only the cross-owner tools.
