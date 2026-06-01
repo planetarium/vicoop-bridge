@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { parse } from '@optique/core/parser';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +16,7 @@ import {
   runListClients,
   runRemoveCaller,
   runRevokeClient,
+  agentCmd,
   type AddCallerArgs,
   type AgentCallersAddArgs,
   type AgentCallersListArgs,
@@ -269,6 +271,45 @@ test('list-callers GETs the agent endpoint', async (t) => {
   assert.equal(code, 0);
   assert.equal(calls[0].method, 'GET');
   assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/callers`);
+});
+
+test('callers list renders allowed_callers as a TYPE/PRINCIPAL table', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  installFetch(t, {
+    body: {
+      agent_id: 'foo',
+      owner_principal: 'eth:0xabc',
+      is_public: false,
+      allowed_callers: [
+        'eth:0x1111111111111111111111111111111111111111',
+        'google:email:alice@example.com',
+      ],
+    },
+  });
+
+  assert.equal(await runListCallers(listCallersArgs('foo')), 0);
+  const out = stdout.read();
+  assert.match(out, /^agent:\s+foo$/m);
+  assert.match(out, /^is_public:\s+false$/m);
+  assert.match(out, /TYPE\s+PRINCIPAL/);
+  // The PRINCIPAL column keeps the full canonical form so it pastes straight
+  // into `agent callers remove`.
+  assert.match(out, /^eth\s+eth:0x1111111111111111111111111111111111111111$/m);
+  assert.match(out, /^google:email\s+google:email:alice@example\.com$/m);
+});
+
+test('callers list shows the public sentinel when there are no allowed_callers', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  installFetch(t, {
+    body: { agent_id: 'foo', owner_principal: 'eth:0xabc', is_public: true, allowed_callers: [] },
+  });
+
+  assert.equal(await runListCallers(listCallersArgs('foo')), 0);
+  const out = stdout.read();
+  assert.match(out, /allowed_callers: \(none — agent is public\)/);
+  assert.doesNotMatch(out, /TYPE\s+PRINCIPAL/);
 });
 
 test('subcommand exits 1 with hint when no token is available', async (t) => {
@@ -554,6 +595,45 @@ test('agent callers list/add/remove hit the existing /admin-api/agents/:id/calle
     calls[2].url,
     `${BRIDGE}/admin-api/agents/foo/callers?principal=${encodeURIComponent(principal)}`,
   );
+});
+
+// Regression: the sub-subcommands `agent callers list <ID>` and
+// `agent callers remove <ID> <PRINCIPAL>` share the literal names `list` /
+// `remove` with the top-level `agent list` / `agent remove` commands. Those
+// top-level commands have all-optional bodies, so `@optique` `longestMatch`
+// used to break the consumed-token tie in their favour — swallowing the
+// branch and dropping the `AGENT_ID` positional, which surfaced as
+// "Unexpected option or subcommand: <id>". `agentCallersSubCmd` is now ordered
+// before the colliding siblings so the correct branch wins. These assertions
+// go through the real optique parser (the `runXxx` tests above construct the
+// parsed shape directly and would not have caught the parse-level regression).
+test('agent callers {list,remove} parse through the real parser with their AGENT_ID', () => {
+  const expectOk = (argv: string[], expected: Record<string, unknown>) => {
+    const r = parse(agentCmd, argv);
+    assert.equal(r.success, true, `expected ${argv.join(' ')} to parse`);
+    if (r.success) assert.deepEqual(r.value, { ...SHARED, ...expected });
+  };
+  const principal = 'eth:0xabcdefabcdefabcdefabcdefabcdefabcdefabcd';
+  expectOk(['agent', 'callers', 'list', 'foo'], { action: 'agent-callers-list', agentId: 'foo' });
+  expectOk(['agent', 'callers', 'ls', 'foo'], { action: 'agent-callers-list', agentId: 'foo' });
+  expectOk(['agent', 'callers', 'add', 'foo', principal], {
+    action: 'agent-callers-add',
+    agentId: 'foo',
+    principal,
+  });
+  expectOk(['agent', 'callers', 'remove', 'foo', principal], {
+    action: 'agent-callers-remove',
+    agentId: 'foo',
+    principal,
+  });
+  expectOk(['agent', 'callers', 'rm', 'foo', principal], {
+    action: 'agent-callers-remove',
+    agentId: 'foo',
+    principal,
+  });
+  // The top-level siblings must keep working after the reorder.
+  expectOk(['agent', 'list'], { action: 'agent-list', connected: false });
+  expectOk(['agent', 'remove', 'foo', '--yes'], { action: 'agent-delete', target: 'foo', yes: true });
 });
 
 // The new `agent` commands must not print a deprecation warning — that's
