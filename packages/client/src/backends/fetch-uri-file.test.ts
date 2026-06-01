@@ -72,20 +72,26 @@ test('fetchUriToBytes: blocks direct IPv6 loopback hosts', async () => {
   );
 });
 
-test('fetchUriToBytes: timeout bounds hostname resolution', async () => {
-  await assert.rejects(
-    fetchUriToBytes(
-      'https://example.com/x.png',
-      'image/png',
-      {
-        timeoutMs: 5,
-        fetchImplForTest: async () => new Response(Buffer.from('unused'), { headers: { 'content-type': 'image/png' } }),
-        resolveHost: async () => new Promise<string[]>(() => undefined),
-      },
-      NEVER,
-    ),
-    { name: 'FetchUriError', code: 'fetch_failed' },
+test('fetchUriToBytes: timeout bounds hostname resolution', async (t) => {
+  // Drive the deadline with mock timers instead of a real sub-10ms timer.
+  // A real short timer racing a never-resolving resolveHost is flaky under
+  // CI load: the timeout timer is unref'd, so if it becomes the only live
+  // handle the runner can begin to exit and cancel in-flight siblings
+  // (`cancelledByParent`). Ticking deterministically keeps it instant and
+  // off the wall clock. See issue #312.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const pending = fetchUriToBytes(
+    'https://example.com/x.png',
+    'image/png',
+    {
+      timeoutMs: 5,
+      fetchImplForTest: async () => new Response(Buffer.from('unused'), { headers: { 'content-type': 'image/png' } }),
+      resolveHost: async () => new Promise<string[]>(() => undefined),
+    },
+    NEVER,
   );
+  t.mock.timers.tick(5);
+  await assert.rejects(pending, { name: 'FetchUriError', code: 'fetch_failed' });
 });
 
 test('fetchUriToBytes: revalidates redirect targets', async () => {
