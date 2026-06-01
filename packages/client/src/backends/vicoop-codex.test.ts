@@ -433,17 +433,17 @@ test('buildResponseMetadata: chat_completion envelope carries spec-required fiel
     Record<string, unknown>
   >;
   const ext = meta[OPENAI_COMPAT_EXTENSION_URI] as Record<string, unknown>;
-  // Legacy top-level `usage` sibling for back-compat with v1-era codecs
-  // that only read it; new codecs prefer `chat_completion.usage`.
-  assert.ok(ext.usage);
+  // Envelope contract: usage lives inside chat_completion.usage. The
+  // transitional top-level `usage` sibling for v1-era codecs has been
+  // retired — only `chat_completion` is stamped on openai-compat tasks.
+  assert.equal(ext.usage, undefined);
   const envelope = ext.chat_completion as Record<string, unknown>;
   assert.equal(envelope.id, 'chatcmpl-abc');
   assert.equal(envelope.object, 'chat.completion');
   assert.equal(envelope.model, 'gpt-5.4');
   assert.equal(envelope.created, 1779177411);
   // chat_completion.usage carries the normalized OpenAICompatUsage
-  // (with the spec-mandated total === prompt + completion invariant)
-  // — same value as the top-level sibling. Codec prefers this path.
+  // (with the spec-mandated total === prompt + completion invariant).
   assert.deepEqual(envelope.usage, usage);
   // logprobs must be present on each choice per the spec (defaults to null
   // when the underlying runtime doesn't surface them — which vicoop-codex
@@ -554,13 +554,14 @@ test('handle: success path — text response → artifact + complete with metada
   const ext = (msg.metadata as Record<string, Record<string, unknown>>)[
     OPENAI_COMPAT_EXTENSION_URI
   ];
-  // Legacy top-level `usage` for v1-era back-compat.
-  assert.ok(ext.usage);
+  // Envelope contract: only `chat_completion` is stamped — the
+  // transitional top-level `usage` sibling for v1-era codecs has been
+  // retired.
+  assert.equal(ext.usage, undefined);
   const envelope = ext.chat_completion as Record<string, unknown>;
   assert.equal(envelope.id, 'chatcmpl-1');
   assert.equal(envelope.model, 'gpt-5.4');
-  // The envelope carries `usage` natively (preferred by the codec); same
-  // numeric totals as the legacy sibling above.
+  // The envelope carries `usage` natively (codec reads it here).
   const envelopeUsage = envelope.usage as Record<string, number>;
   assert.equal(envelopeUsage.prompt_tokens, 3);
   assert.equal(envelopeUsage.completion_tokens, 1);

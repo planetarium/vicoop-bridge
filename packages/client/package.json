@@ -1,6 +1,6 @@
 {
   "name": "@vicoop-bridge/client",
-  "version": "0.25.0",
+  "version": "0.25.1",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
@@ -16,6 +16,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx watch src/cli.ts",
+    "cli": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "test": "tsx --test \"src/**/*.test.ts\""
   },

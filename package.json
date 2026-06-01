@@ -10,6 +10,7 @@
     "uninstall:client": "npm uninstall -g @vicoop-bridge/client",
     "dev:server": "pnpm --filter @vicoop-bridge/server dev",
     "dev:client": "pnpm --filter @vicoop-bridge/client dev",
+    "cli:client": "pnpm --filter @vicoop-bridge/client cli",
     "dev:admin-ui": "pnpm --filter @vicoop-bridge/admin-ui dev",
     "deploy:server": "fly deploy -c packages/server/fly.toml .",
     "changeset": "changeset"

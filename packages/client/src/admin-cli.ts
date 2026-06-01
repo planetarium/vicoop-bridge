@@ -235,12 +235,20 @@ const agentApikeySubCmd = command(
 
 export const agentCmd = command(
   'agent',
+  // `agentCallersSubCmd` / `agentApikeySubCmd` MUST come before
+  // `agentListSubCmd` / `agentRemoveSubCmd`. `@optique` `longestMatch` breaks
+  // consumed-token ties by source order, and the top-level `list` / `remove`
+  // commands have all-optional bodies that tie with the nested
+  // `callers {list,remove} <AGENT_ID>` (and `apikey {list,revoke} <AGENT_ID>`)
+  // match — when they win the tie the AGENT_ID positional is dropped and
+  // parsing fails with "Unexpected ... <id>". Putting the AGENT_ID-consuming
+  // groups first makes the correct branch win. See admin-cli.test.ts.
   longestMatch(
     agentRegisterCmd,
-    agentListSubCmd,
-    agentRemoveSubCmd,
     agentCallersSubCmd,
     agentApikeySubCmd,
+    agentListSubCmd,
+    agentRemoveSubCmd,
   ),
   {
     brief: message`Manage agent registrations, allowed callers, and API keys.`,
@@ -525,6 +533,20 @@ function renderApikeyRevoke(body: unknown): string {
   return `agent: ${b.agent_id}\nkey_id: ${b.key_id}\nrevoked: ${b.revoked}`;
 }
 
+// The `TYPE` column of the callers table is display-only; the `PRINCIPAL`
+// column keeps the full canonical form (`eth:0x…`, `google:email:…`) so an
+// operator can copy a row straight into `agent callers remove <id> <principal>`.
+// `eth` is a single-segment scheme; the google schemes carry a sub-kind, so the
+// type is the first two colon-separated segments.
+function principalType(principal: string): string {
+  if (principal.startsWith('google:')) {
+    const [, kind] = principal.split(':');
+    return kind ? `google:${kind}` : 'google';
+  }
+  const idx = principal.indexOf(':');
+  return idx === -1 ? '' : principal.slice(0, idx);
+}
+
 function renderCallerList(body: unknown): string {
   if (!body || typeof body !== 'object') return String(body);
   const b = body as {
@@ -533,14 +555,20 @@ function renderCallerList(body: unknown): string {
     allowed_callers?: string[];
     is_public?: boolean;
   };
-  const callers = (b.allowed_callers ?? []).join('\n  ') || '(none — agent is public)';
-  return [
+  const callers = b.allowed_callers ?? [];
+  const header = [
     `agent:           ${b.agent_id}`,
     `owner_principal: ${b.owner_principal}`,
     `is_public:       ${b.is_public}`,
-    'allowed_callers:',
-    `  ${callers}`,
   ].join('\n');
+  if (callers.length === 0) {
+    return `${header}\nallowed_callers: (none — agent is public)`;
+  }
+  const table = renderTable(
+    ['TYPE', 'PRINCIPAL'],
+    callers.map((p) => [principalType(p), p]),
+  );
+  return `${header}\n\n${table}`;
 }
 
 // Agent-centric renderer for `agent list`. The /admin-api/clients response
