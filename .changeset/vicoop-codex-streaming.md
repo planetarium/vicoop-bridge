@@ -1,0 +1,5 @@
+---
+"@vicoop-bridge/client": minor
+---
+
+The `vicoop-codex` backend now streams responses token-by-token in openai-compat mode. Instead of a single buffered `vicoop-codex call` invocation that emitted the whole response as one artifact, the backend now drives a shared `vicoop-codex serve` instance and streams its `POST /v1/chat/completions` (`stream:true`) SSE, emitting each `delta.content` fragment as an incremental `append:true` A2A artifact. The oai2a2a gateway maps these to OpenAI SSE `delta.content` chunks, so callers see sub-second time-to-first-token and progressive rendering (matching the `claude` / `codex` backends fixed in #294). The terminal `chat_completion` envelope (tool_calls assembled from streamed `delta.tool_calls`, usage, finish_reason) is unchanged. The bundled `vicoop-codex` agent card now advertises `capabilities.streaming: true` so the gateway takes the `message/stream` path. Requires a `vicoop-codex` build that exposes the `serve` subcommand; an older binary fails the task with `serve_unavailable`.

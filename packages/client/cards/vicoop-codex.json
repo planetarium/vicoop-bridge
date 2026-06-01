@@ -1,10 +1,10 @@
 {
   "name": "vicoop-codex",
-  "description": "OpenAI Codex agent driven via the `vicoop-codex call` CLI. Each A2A task spawns a single non-streaming `vicoop-codex call` invocation with an OpenAI Chat Completions body assembled from the openai-compat A2A extension, and returns the response payload as A2A artifacts plus an openai-compat usage / chat_completion envelope on the final message metadata.",
+  "description": "OpenAI Codex agent driven via the `vicoop-codex` CLI. Each A2A task streams an OpenAI Chat Completions request (assembled from the openai-compat A2A extension) through a shared local `vicoop-codex serve` instance, emitting the model's response token-by-token as incremental A2A artifacts plus an openai-compat usage / chat_completion envelope on the final message metadata.",
   "version": "0.0.1",
   "protocolVersion": "0.3.0",
   "capabilities": {
-    "streaming": false,
+    "streaming": true,
     "extensions": [
       {
         "uri": "https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1",
