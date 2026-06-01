@@ -1,5 +1,28 @@
 # @vicoop-bridge/client
 
+## 0.26.0
+
+### Minor Changes
+
+- fd22ef8: Add static API key callers, unified under the `agent callers` command group. `vicoop-client agent callers issue-api-key <agent>` mints a long-lived bearer key — for CI jobs and backend services that can't run the interactive Google/SIWE login — printing the secret exactly once and auto-authorizing its `apikey:<key-id>` principal on the agent (`--ttl-days` overrides the default 365-day lifetime). Keys are just callers: `agent callers list` shows them (TYPE=apikey) and `agent callers remove <agent> apikey:<key-id>` both de-authorizes the principal and revokes the underlying token.
+
+  `agent register` without `--caller` no longer leaves the agent publicly callable: it auto-mints a static API key, seeds `allowed_callers` with the key's principal, and prints the one-time secret (under `api_keys` in `--json`). If minting fails it falls back to the previous public-agent warning. The deprecated `setup` alias keeps its old warning behavior.
+
+### Patch Changes
+
+- 65e3e99: `vicoop-client agent callers list` now renders allowed callers as a plain `TYPE`/`PRINCIPAL` table (matching `agent list` and the other list commands), with a `(no callers — agent is public)` empty-state, instead of the old multi-line `agent:` / `owner_principal:` / `is_public:` header block. The `--json` output is unchanged (it still carries `agent_id`, `owner_principal`, `is_public`, and `allowed_callers`).
+- 4f2bcae: Fix `agent callers list/remove <AGENT_ID>` failing to parse. The
+  sub-subcommands shared the literal names `list`/`remove` with the
+  top-level `agent list`/`agent remove` commands, and optique's
+  `longestMatch` resolved the tie in favour of the all-optional top-level
+  commands — dropping the `AGENT_ID` positional and erroring with
+  "Unexpected option or subcommand: <id>". Reordered the `agent` command
+  group so `callers` is matched first.
+
+  Also render `agent callers list` as a `TYPE` / `PRINCIPAL` table; the
+  `PRINCIPAL` column keeps the full canonical form so a row can be pasted
+  straight into `agent callers remove`.
+
 ## 0.25.1
 
 ### Patch Changes
