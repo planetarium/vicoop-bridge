@@ -728,6 +728,11 @@ test('handle: request body carries stream:true + envelope-derived model/messages
   const body = JSON.parse(fetchRec.calls[0].body) as Record<string, unknown>;
   // Streaming flag is set on the wire.
   assert.equal(body.stream, true);
+  // `stream_options.include_usage` is forced on so `vicoop-codex serve` is
+  // contractually obliged to emit the terminal usage chunk — without it the
+  // runtime may drop usage on some turns, silently $0-billing downstream
+  // (#317).
+  assert.deepEqual(body.stream_options, { include_usage: true });
   // Messages: system → chat_history (assistant(tool_calls) → tool) →
   // trailing user.
   const messages = body.messages as Array<{ role: string }>;
