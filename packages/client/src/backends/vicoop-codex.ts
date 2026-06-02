@@ -1107,7 +1107,21 @@ export function createVicoopCodexBackend(
         // `stream:true` switches `vicoop-codex serve`'s `/v1/chat/completions`
         // into the `chat.completion.chunk` SSE mode we fold in
         // `streamChatCompletions`.
-        serialized = JSON.stringify({ ...body, stream: true });
+        //
+        // `stream_options.include_usage:true` makes the terminal usage chunk
+        // contractual. Per the OpenAI streaming contract `usage` is only
+        // guaranteed in the stream when this flag is set — without it
+        // `vicoop-codex serve` is free to omit usage on a given turn, which
+        // surfaces downstream as a silently $0-billed 0-token call (#317).
+        // We fold whichever chunk carries `usage` (piggybacked on the
+        // finish_reason frame or a trailing `choices:[]` frame) into
+        // `acc.usage`, so requesting it here is the robust fix regardless of
+        // which frame the runtime chooses.
+        serialized = JSON.stringify({
+          ...body,
+          stream: true,
+          stream_options: { include_usage: true },
+        });
       } catch (err) {
         emit({
           type: 'task.fail',
@@ -1246,6 +1260,21 @@ export function createVicoopCodexBackend(
       }
 
       const usage = parseChatCompletionUsage(response.usage, response.model);
+      // We force `stream_options.include_usage` on the request, so a missing
+      // usage block here means the runtime dropped it on this turn despite
+      // being asked for it — the #317 failure mode. Leave a breadcrumb in
+      // the logs rather than fabricating counts: a non-undefined `usage`
+      // omission is exactly what bills $0 downstream, so it should be
+      // diagnosable from fly logs by task id + finish_reason.
+      if (!usage) {
+        logger.warn?.(
+          `[vicoop-codex] task=${task.taskId} finish_reason=${JSON.stringify(
+            typeof response.choices?.[0]?.finish_reason === 'string'
+              ? response.choices[0].finish_reason
+              : null,
+          )}: streamed response carried no usage despite stream_options.include_usage; downstream will record 0 tokens`,
+        );
+      }
       const responseMetadata = buildResponseMetadata(response, usage, task.taskId);
 
       // The final `task.complete` message mirrors codex.ts's pattern:
