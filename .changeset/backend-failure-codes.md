@@ -2,4 +2,4 @@
 "@vicoop-bridge/client": patch
 ---
 
-Normalize backend runtime failure codes for router availability classification.
+Align backend terminal failure codes with the openai-compat/v1 terminal error contract.
