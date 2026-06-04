@@ -204,10 +204,10 @@ test('Client logs identity block (mention/acct/a2a/card/webfinger) once on conne
       (l) =>
         l.includes('mention:') ||
         l.includes('acct:') ||
-        l.startsWith('[client] a2a:') ||
+        l.includes('[client] a2a:') ||
         l.includes('a2a card:') ||
         l.includes('webfinger:') ||
-        l.startsWith('[client] agentId:'),
+        l.includes('[client] agentId:'),
     );
     assert.equal(identityLines.length, 6, `expected 6 identity lines, got ${identityLines.length}: ${JSON.stringify(identityLines)}`);
     // Spot-check that the URLs were derived from the test server URL.

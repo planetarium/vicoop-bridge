@@ -58,6 +58,7 @@ import {
   mergeClientArgs,
   type DaemonArgs as Args,
 } from './cli-args.js';
+import { createLogger, type Logger } from './logger.js';
 
 const KNOWN_CODEX_SANDBOX_MODES = new Set([
   'read-only',
@@ -470,16 +471,17 @@ export function disableClaudeSandboxGuard(
 // exit. Resolves either way; the caller decides whether to surface
 // the timeout in logs.
 const SHUTDOWN_TIMEOUT_MS = 15_000;
-async function runWithShutdownTimeout(shutdown: () => Promise<void>): Promise<void> {
+async function runWithShutdownTimeout(
+  shutdown: () => Promise<void>,
+  logger: Logger,
+): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
   try {
     await Promise.race([
       shutdown(),
       new Promise<void>((resolve) => {
         timer = setTimeout(() => {
-          console.warn(
-            `[client] runtime shutdown exceeded ${SHUTDOWN_TIMEOUT_MS}ms; exiting anyway`,
-          );
+          logger.warn(`runtime shutdown exceeded ${SHUTDOWN_TIMEOUT_MS}ms; exiting anyway`);
           resolve();
         }, SHUTDOWN_TIMEOUT_MS);
       }),
@@ -499,6 +501,7 @@ async function runWithShutdownTimeout(shutdown: () => Promise<void>): Promise<vo
 //      the local bundle when present makes the advertise reachable.
 async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promise<void> {
   const args = resolveDaemonArgs(parsed);
+  const logger = createLogger();
   const raw = args.card
     ? JSON.parse(readFileSync(args.card, 'utf8'))
     : resolveBundledCard(args.backend);
@@ -509,7 +512,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   // 'echo'). Without this the only signal is downstream behavior —
   // operators reading boot logs to diagnose "wrong backend ran" can't
   // tell whether parsing landed where they expected.
-  console.log(`[client] backend: ${args.backend}`);
+  logger.info(`backend: ${args.backend}`);
 
   // pickBackend is async because container-mode backends boot a
   // long-lived runtime container before construction (#249).
@@ -522,6 +525,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     agentCard,
     backendKind: args.backend,
     backend,
+    logLevel: logger.level,
     // Daemon entrypoint: a fatal terminal close (currently 4014 "client
     // deleted") should drop the process with a non-zero exit so
     // systemd / a parent supervisor sees the deletion as a hard
@@ -541,18 +545,18 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   let shuttingDown = false;
   const onSignal = (signal: NodeJS.Signals) => {
     if (shuttingDown) {
-      console.log(`[client] received second ${signal}; forcing exit`);
+      logger.info(`received second ${signal}; forcing exit`);
       process.exit(130);
     }
     shuttingDown = true;
     void (async () => {
-      console.log(`\n[client] shutting down (${signal})`);
+      logger.info(`shutting down (${signal})`);
       client.stop();
       if (backendShutdown) {
         try {
-          await runWithShutdownTimeout(backendShutdown);
+          await runWithShutdownTimeout(backendShutdown, logger);
         } catch (err) {
-          console.error('[client] shutdown error:', (err as Error).message);
+          logger.error('shutdown error:', (err as Error).message);
         }
       }
       process.exit(0);
