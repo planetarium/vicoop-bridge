@@ -1,7 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
-import { TaskState, type Artifact, type Message, type Task, type TaskStore } from '@a2x/sdk';
+import {
+  TaskState,
+  type Artifact,
+  type Message,
+  type Task,
+  type TaskStatusUpdateEvent,
+  type TaskStore,
+} from '@a2x/sdk';
 import { parseDownFrame, type AgentCard } from '@vicoop-bridge/protocol';
 import { Registry, type ClientConnection } from './registry.js';
 import {
@@ -425,11 +432,20 @@ test('executor persists history when agent is unreachable', async () => {
     messageId: 'm-5',
   } as unknown as Message;
 
-  for await (const _event of executor.executeStream(task, message)) void _event;
+  const statuses: TaskStatusUpdateEvent[] = [];
+  for await (const event of executor.executeStream(task, message)) {
+    if ('status' in event) statuses.push(event);
+  }
 
   const update = taskStore.updates.at(-1) as { history?: Message[] };
   assert.deepEqual(
     update.history?.map((m) => m.messageId),
     ['m-5', 't-5-unreach'],
   );
+  assert.deepEqual(statuses[0]?.status.message?.metadata, {
+    error: {
+      code: 'client_not_connected',
+      message: 'client not connected',
+    },
+  });
 });

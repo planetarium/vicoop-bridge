@@ -201,6 +201,12 @@ export class WSForwardingExecutor extends AgentExecutor {
             messageId: `${taskId}-unreach`,
             role: 'agent',
             parts: [{ text: 'client not connected' }],
+            metadata: {
+              error: {
+                code: 'client_not_connected',
+                message: 'client not connected',
+              },
+            },
             taskId,
             contextId,
           },

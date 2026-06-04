@@ -149,6 +149,12 @@ export class Registry {
             messageId: `${binding.taskId}-disc`,
             role: 'agent',
             parts: [{ text: 'client disconnected mid-task' }],
+            metadata: {
+              error: {
+                code: 'disconnected',
+                message: 'client disconnected mid-task',
+              },
+            },
             taskId: binding.taskId,
             contextId: binding.contextId,
           },

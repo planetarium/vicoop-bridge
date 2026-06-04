@@ -126,6 +126,46 @@ test('onAgentChange fires on disconnect (unregister) so stale transports do not 
   assert.deepEqual(seen, ['a1']);
 });
 
+test('unregisterAgent reports mid-task disconnect with structured error metadata', () => {
+  const registry = new Registry();
+  const ws = makeWs();
+  registry.registerAgent({
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+
+  const statuses: Array<{ status: { message?: { metadata?: unknown } } }> = [];
+  let finished = false;
+  registry.bindTask({
+    agentId: 'a1',
+    taskId: 't-disc',
+    contextId: 'ctx-disc',
+    sink: {
+      pushStatus: (event) => statuses.push(event),
+      pushArtifact: () => undefined,
+      finish: () => {
+        finished = true;
+      },
+    },
+  });
+
+  registry.unregisterAgent('a1', ws);
+
+  assert.equal(finished, true);
+  assert.equal(registry.getBinding('t-disc'), undefined);
+  assert.deepEqual(statuses[0]?.status.message?.metadata, {
+    error: {
+      code: 'disconnected',
+      message: 'client disconnected mid-task',
+    },
+  });
+});
+
 test('onAgentChange does NOT fire on unregister if the ws does not match the current connection', () => {
   // Defensive: a late-arriving close event from a superseded socket must not
   // trigger invalidation of the new connection's cached transport.
