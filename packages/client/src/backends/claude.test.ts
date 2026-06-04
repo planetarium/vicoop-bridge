@@ -3525,6 +3525,138 @@ test('native dispatch: exit-code-1 with NO tool capture still fails (#213)', asy
   }
 });
 
+// Tool-name qualification (fix #1): under native dispatch the caller's tools
+// are live as `mcp___vb-caller-tools__<name>`, but the wire chat_history
+// records prior calls by their bare OpenAI name (`read`). The bridge must
+// rewrite the replayed history names to the MCP ids so the model's historical
+// view matches its live tool list — otherwise it re-emits the bare name,
+// claude rejects it ("No such tool available"), and the run dies at the cap.
+test('native dispatch: chat_history caller-tool names are qualified to MCP ids on stdin', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' }),
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        terminal_reason: 'completed',
+        result: 'ok',
+      }),
+    ],
+    exitCode: 0,
+  });
+  const { emit } = collect();
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    onCallerToolsMcpReady: () => {},
+  });
+
+  await backend.handle(
+    assignWithOpenAICompat('continue', {
+      tools: [
+        { type: 'function', function: { name: 'read', parameters: { type: 'object' } } },
+      ],
+      chat_history: [
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: { name: 'read', arguments: '{"filePath":"/a"}' },
+            },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'call_1', name: 'read', content: 'file contents' },
+      ],
+    }),
+    emit,
+    NEVER,
+  );
+
+  const child = fake.lastChild()!;
+  const env = JSON.parse(child.stdinPayload.trim()) as {
+    message: { content: Array<{ type: string; text?: string }> };
+  };
+  const histBlock = env.message.content.find(
+    (c) => c.type === 'text' && (c.text ?? '').includes('<chat_history>'),
+  );
+  assert.ok(histBlock, 'chat_history block present on stdin');
+  const text = histBlock!.text!;
+  // Both the assistant tool_calls name AND the tool result name are qualified.
+  assert.match(text, /mcp___vb-caller-tools__read/);
+  // The bare OpenAI name no longer appears as a tool name (would re-condition
+  // the model to call the unqualified id). The arguments value `/a` and the
+  // qualified `..._read` both still contain "read" as a substring, so we pin
+  // the exact key/value form that the bare name would have produced.
+  assert.doesNotMatch(text, /"name": "read"/);
+});
+
+// Diagnostic (fix #3): a tool-name mismatch that slips through (model invents
+// an unregistered name) shows up as "No such tool available", the call is
+// never captured, and the `--max-turns 1` cap kills the run. The terminal
+// failure must spell out the proximate cause rather than a bare exit-1.
+test('native dispatch: "No such tool available" exit surfaces a tool-mismatch hint', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' }),
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'tu1', name: 'read', input: { filePath: '/a' } }],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tu1',
+              is_error: true,
+              content: '<tool_use_error>Error: No such tool available: read</tool_use_error>',
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'result',
+        subtype: 'error_max_turns',
+        is_error: true,
+        terminal_reason: 'max_turns',
+        errors: ['Reached maximum number of turns (1)'],
+      }),
+    ],
+    exitCode: 1,
+  });
+  const { emit, frames } = collect();
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    onCallerToolsMcpReady: () => {},
+  });
+
+  await backend.handle(
+    assignWithOpenAICompat('read the file', {
+      tools: [
+        { type: 'function', function: { name: 'read', parameters: { type: 'object' } } },
+      ],
+    }),
+    emit,
+    NEVER,
+  );
+
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.fail');
+  if (terminal.type === 'task.fail') {
+    assert.equal(terminal.error.code, 'claude_exit_nonzero');
+    // The hint names the proximate cause and the expected id shape.
+    assert.match(terminal.error.message, /hint: model called a tool name claude does not expose/);
+    assert.match(terminal.error.message, /mcp___vb-caller-tools__/);
+  }
+});
+
 // Without an openai-compat `tools` field, no caller-tools MCP is stood
 // up and none of the native-dispatch argv (`--mcp-config caller-tools`,
 // `--max-turns 1`, native system prompt) attaches. Guards against the

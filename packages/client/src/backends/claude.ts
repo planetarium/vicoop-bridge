@@ -40,6 +40,7 @@ import {
   dumpOpenAICompatTaskWire,
   formatChatHistory,
   parseOpenAICompatEnvelope,
+  requalifyHistoryToolNames,
 } from './openai-compat.js';
 
 // Slim subset of ChildProcess that the backend actually uses. Tests inject a
@@ -671,6 +672,19 @@ function traceabilityRequested(task: {
 // declared without `parameters`. Returns `null` when no usable entries
 // remain so callers can branch off "no tools to register" without checking
 // `length`.
+// MCP server name the bridge registers the per-task caller-tools server
+// under (`--mcp-config`). claude exposes that server's tools to the model as
+// `mcp__${CALLER_TOOLS_MCP_SERVER}__<tool>` — e.g. `mcp___vb-caller-tools__read`
+// (the leading `_` of the server name abuts the `mcp__` prefix, hence the
+// triple underscore). Single source of truth so the registration and the
+// chat_history name-qualification below cannot drift.
+const CALLER_TOOLS_MCP_SERVER = '_vb-caller-tools';
+
+// The id the model must use to call a caller tool under native MCP dispatch.
+function callerToolMcpId(toolName: string): string {
+  return `mcp__${CALLER_TOOLS_MCP_SERVER}__${toolName}`;
+}
+
 export function openaiToolsToCallerToolDefs(
   tools: readonly unknown[],
 ): CallerToolDefinition[] | null {
@@ -1252,6 +1266,12 @@ export function createClaudeBackend(
           ? openaiToolsToCallerToolDefs(envelopeTools)
           : null;
       const nativeDispatchActive = callerToolDefs !== null;
+      // Registered caller-tool names, used to qualify matching references in
+      // the replayed chat_history to their live MCP ids (see the history
+      // projection below). Empty on the non-native path.
+      const callerToolNameSet = new Set(
+        (callerToolDefs ?? []).map((d) => d.name),
+      );
 
       const mappedRaw = await mapPartsToContentBlocks(task.message.parts, opts.fetchUriPolicy, signal);
       recorder.mark('map');
@@ -1301,7 +1321,24 @@ export function createClaudeBackend(
         // turn over a multi-turn conversation. Folding everything into
         // a single user message via this block is the only way to give
         // the model the conversation in one shot on this backend.
-        const block = formatChatHistory(envelopeChatHistory);
+        //
+        // Under native MCP dispatch (#213) the caller's tools are live as
+        // `mcp___vb-caller-tools__<name>`, but the wire history records each
+        // prior call by its bare OpenAI name (e.g. `read`). Replaying the bare
+        // name conditions the model to re-emit it, and claude then rejects the
+        // call ("No such tool available: read") — it never reaches the
+        // caller-tools MCP (so it isn't captured), the model retries, and the
+        // run dies at `--max-turns 1`. Qualify the history names to the live
+        // MCP ids so the model's historical view matches its tool list. Only
+        // names that are actually registered caller tools are rewritten;
+        // everything else (and the non-native path, where callerToolDefs is
+        // null) passes through untouched.
+        const projectedHistory = callerToolDefs
+          ? requalifyHistoryToolNames(envelopeChatHistory, (name) =>
+              callerToolNameSet.has(name) ? callerToolMcpId(name) : name,
+            )
+          : envelopeChatHistory;
+        const block = formatChatHistory(projectedHistory);
         if (block) {
           mapped.blocks.unshift({ type: 'text', text: block });
         }
@@ -1568,7 +1605,7 @@ export function createClaudeBackend(
         mcpServers['_vb-send-file'] = { type: 'http', url: mcpServerForTask.url };
       }
       if (callerToolsMcp) {
-        mcpServers['_vb-caller-tools'] = { type: 'http', url: callerToolsMcp.url };
+        mcpServers[CALLER_TOOLS_MCP_SERVER] = { type: 'http', url: callerToolsMcp.url };
       }
       const mcpServerNames = Object.keys(mcpServers);
       const mcpConfigArgs: readonly string[] =
@@ -1705,6 +1742,16 @@ export function createClaudeBackend(
       let streamedResponseText = '';
       let sawCompletedResult = false;
       let sawErrorResult = false;
+      // Set when a tool_result comes back as claude's "No such tool available:
+      // <name>" error. Under native dispatch this is the signature of a
+      // tool-name mismatch — the model called a tool by a name claude doesn't
+      // expose (usually the bare OpenAI name when it should use the
+      // `mcp___vb-caller-tools__<name>` id). The call never reaches the
+      // caller-tools MCP, so it isn't captured, and the model burns the
+      // `--max-turns 1` budget retrying. fix #1 (history name qualification)
+      // should prevent it; this flag lets the terminal failure say WHY rather
+      // than surfacing a bare `claude_exit_nonzero`.
+      let sawUnknownToolError = false;
       let stdoutTail = '';
       let stderrTail = '';
       let aborted = false;
@@ -1955,6 +2002,28 @@ export function createClaudeBackend(
           return;
         }
         if (evt.type === 'user') {
+          // Tool-name-mismatch detection (native dispatch): a tool_result of
+          // "No such tool available: <name>" means the model called a tool id
+          // claude doesn't expose. Flag it so the terminal failure can explain
+          // the cause instead of a bare exit-nonzero. Cheap substring scan over
+          // the tool_result text; only meaningful on the native path but
+          // harmless elsewhere.
+          if (!sawUnknownToolError && nativeDispatchActive) {
+            const content = evt.message?.content;
+            if (Array.isArray(content)) {
+              for (const block of content) {
+                if (!block || typeof block !== 'object') continue;
+                const b = block as { type?: unknown; content?: unknown };
+                if (b.type !== 'tool_result') continue;
+                const text =
+                  typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+                if (text.includes('No such tool available')) {
+                  sawUnknownToolError = true;
+                  break;
+                }
+              }
+            }
+          }
           // Pair subagent completions back to the start events emitted
           // above. The registry is only populated when trace is on (see
           // the assistant handler above), so this loop is a no-op when
@@ -2187,12 +2256,20 @@ export function createClaudeBackend(
         // If stdin write blew up and the process exited non-zero, surface
         // both: the stdin error is usually the proximate cause.
         const stdinPart = stdinError ? ` [stdin: ${errorMessage(stdinError)}]` : '';
+        // Tool-name-mismatch diagnostic: a max_turns exit preceded by "No such
+        // tool available" almost always means the model called a caller tool
+        // by an id claude doesn't expose. Spell out the proximate cause so the
+        // failure isn't an inscrutable exit-1 (fix #1 should keep this from
+        // happening, but a model can still invent an unregistered name).
+        const toolMismatchPart = sawUnknownToolError
+          ? ' [hint: model called a tool name claude does not expose ("No such tool available"); caller tools are registered as mcp___vb-caller-tools__<name> — the call was never captured and the turn cap was exhausted retrying]'
+          : '';
         emit({
           type: 'task.fail',
           taskId: task.taskId,
           error: {
             code: 'claude_exit_nonzero',
-            message: `claude exited with code ${exit.code}${sigPart}${detailPart}${stdoutPart}${stdinPart}`,
+            message: `claude exited with code ${exit.code}${sigPart}${detailPart}${stdoutPart}${stdinPart}${toolMismatchPart}`,
           },
         });
         return;

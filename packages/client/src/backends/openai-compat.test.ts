@@ -9,6 +9,7 @@ import {
   dumpOpenAICompatTaskWire,
   formatChatHistory,
   parseOpenAICompatEnvelope,
+  requalifyHistoryToolNames,
   tryParseToolCallsEnvelope,
 } from './openai-compat.js';
 
@@ -439,6 +440,79 @@ test('formatChatHistory: wraps the full history as a JSON array verbatim', () =>
 
 test('formatChatHistory: returns empty when the history is empty', () => {
   assert.equal(formatChatHistory([]), '');
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// requalifyHistoryToolNames — rename caller-tool references in replayed
+// history to a backend's live tool ids (claude native MCP dispatch, #213).
+// ───────────────────────────────────────────────────────────────────────────
+
+test('requalifyHistoryToolNames: renames assistant.tool_calls and tool result names', () => {
+  const history = [
+    { role: 'user' as const, content: 'go' },
+    {
+      role: 'assistant' as const,
+      content: null,
+      tool_calls: [
+        { id: 'call_1', type: 'function', function: { name: 'read', arguments: '{"p":1}' } },
+        { id: 'call_2', type: 'function', function: { name: 'write', arguments: '{}' } },
+      ],
+    },
+    { role: 'tool' as const, tool_call_id: 'call_1', name: 'read', content: 'data' },
+  ];
+  const out = requalifyHistoryToolNames(history, (n) => `mcp___vb-caller-tools__${n}`);
+
+  const calls = (out[1] as { tool_calls: Array<{ function: { name: string; arguments: string } }> })
+    .tool_calls;
+  assert.equal(calls[0]?.function.name, 'mcp___vb-caller-tools__read');
+  // arguments + id (and everything else) ride through untouched.
+  assert.equal(calls[0]?.function.arguments, '{"p":1}');
+  assert.equal(calls[1]?.function.name, 'mcp___vb-caller-tools__write');
+  assert.equal((out[2] as { name: string }).name, 'mcp___vb-caller-tools__read');
+  // Non-tool entries pass through unchanged.
+  assert.deepEqual(out[0], { role: 'user', content: 'go' });
+});
+
+test('requalifyHistoryToolNames: leaves names the renamer returns unchanged + does not mutate input', () => {
+  const history = [
+    {
+      role: 'assistant' as const,
+      content: null,
+      tool_calls: [{ id: 'c', type: 'function', function: { name: 'read', arguments: '{}' } }],
+    },
+  ];
+  // Renamer only qualifies registered names; 'read' is not registered here.
+  const registered = new Set(['write']);
+  const out = requalifyHistoryToolNames(history, (n) =>
+    registered.has(n) ? `mcp___vb-caller-tools__${n}` : n,
+  );
+  assert.equal(
+    (out[0] as { tool_calls: Array<{ function: { name: string } }> }).tool_calls[0]?.function.name,
+    'read',
+  );
+  // Original array/object untouched (pure projection).
+  assert.equal(
+    (history[0] as { tool_calls: Array<{ function: { name: string } }> }).tool_calls[0]?.function
+      .name,
+    'read',
+  );
+  assert.notEqual(out[0], history[0]);
+});
+
+test('requalifyHistoryToolNames: tolerates malformed tool_calls items', () => {
+  const history = [
+    {
+      role: 'assistant' as const,
+      content: null,
+      // null item, item without function, function without string name.
+      tool_calls: [null, { id: 'x' }, { function: {} }, { function: { name: 42 } }],
+    },
+    // tool entry without a name is left alone.
+    { role: 'tool' as const, tool_call_id: 'x', content: 'r' },
+  ];
+  const out = requalifyHistoryToolNames(history, (n) => `Q_${n}`);
+  // Nothing renamable → structurally equal to the input.
+  assert.deepEqual(out, history);
 });
 
 // ───────────────────────────────────────────────────────────────────────────

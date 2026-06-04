@@ -470,6 +470,50 @@ export function formatChatHistory(history: OpenAICompatHistoryEntry[]): string {
   ].join('\n');
 }
 
+// Return a copy of `history` with every caller-tool reference renamed via
+// `rename`. Touches the `function.name` on each `assistant.tool_calls[]`
+// entry and the `name` on each `tool` result entry; everything else passes
+// through unchanged (and unknown `tool_calls[]` item shapes are left intact).
+//
+// Why this exists: the wire history records each prior tool call by the
+// caller's bare OpenAI function name (e.g. `read`), but a backend whose live
+// tool surface exposes caller tools under a transport-specific id (claude's
+// native MCP dispatch registers them as `mcp___vb-caller-tools__<name>`) needs
+// the replayed history to use that id too. Replaying the bare names conditions
+// the model to re-emit them; the backend then has no such tool and rejects the
+// call ("No such tool available: read"), the call never reaches the capture
+// path, the model retries, and the run dies at its turn cap. `rename` receives
+// the wire name and returns the backend id — return the input unchanged to
+// leave a name alone (e.g. names that aren't registered caller tools).
+export function requalifyHistoryToolNames(
+  history: OpenAICompatHistoryEntry[],
+  rename: (name: string) => string,
+): OpenAICompatHistoryEntry[] {
+  return history.map((entry) => {
+    if (
+      entry.role === 'assistant' &&
+      'tool_calls' in entry &&
+      Array.isArray(entry.tool_calls)
+    ) {
+      return {
+        ...entry,
+        tool_calls: entry.tool_calls.map((call) => {
+          if (!call || typeof call !== 'object') return call;
+          const fn = (call as { function?: unknown }).function;
+          if (!fn || typeof fn !== 'object') return call;
+          const name = (fn as { name?: unknown }).name;
+          if (typeof name !== 'string') return call;
+          return { ...call, function: { ...(fn as object), name: rename(name) } };
+        }),
+      };
+    }
+    if (entry.role === 'tool' && typeof entry.name === 'string') {
+      return { ...entry, name: rename(entry.name) };
+    }
+    return entry;
+  });
+}
+
 // Wire-level diagnostic dump for a single incoming A2A task. Gated by
 // the `--openai-compat-trace` operator flag (see cli-args.ts). Emits to
 // stderr to keep the trace separate from the bridge's structured stdout
