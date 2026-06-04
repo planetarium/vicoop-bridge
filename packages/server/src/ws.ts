@@ -281,6 +281,12 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
               messageId: `${frame.taskId}-err`,
               role: 'agent',
               parts: [{ text: `${frame.error.code}: ${frame.error.message}` }],
+              metadata: {
+                error: {
+                  code: frame.error.code,
+                  message: frame.error.message,
+                },
+              },
               taskId: frame.taskId,
               contextId: b.contextId,
             },
