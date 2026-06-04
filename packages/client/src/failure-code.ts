@@ -43,28 +43,26 @@ const SEMANTIC_CODES = new Set([
 ]);
 
 export function normalizeTaskFailError(error: TaskFailError): TaskFailError {
-  const code = normalizeTaskFailCode(error.code, error.message);
-  if (code === error.code) return error;
-  return { ...error, code };
-}
-
-export function normalizeTaskFailCode(code: string, message: string): string {
-  if (SEMANTIC_CODES.has(code)) return code;
-  if (PRESERVED_INPUT_CODES.has(code)) return code;
+  const { code, message } = error;
+  if (SEMANTIC_CODES.has(code)) return error;
+  if (PRESERVED_INPUT_CODES.has(code)) return error;
 
   const text = `${code} ${message}`.toLowerCase();
-  if (isQuotaExceeded(text)) return 'quota_exceeded';
-  if (isRateLimited(text)) return 'rate_limited';
-  if (isLoginRequired(text)) return 'login_required';
-  if (isAuthRequired(text)) return 'auth_required';
-  if (isAgentUnavailable(text)) return 'agent_unavailable';
-  if (isModelUnavailable(text)) return 'model_unavailable';
-  if (DISCONNECTED_CODES.has(code)) return 'disconnected';
-  if (isNetworkError(text)) return 'network_error';
-  if (isDisconnected(text)) return 'disconnected';
-  if (code === 'task_timeout' || isTimeout(text)) return 'timeout';
-  if (UPSTREAM_CODES.has(code) || isUpstreamError(text)) return 'upstream_error';
-  return code;
+  let normalizedCode = code;
+  if (isQuotaExceeded(text)) normalizedCode = 'quota_exceeded';
+  else if (isRateLimited(text)) normalizedCode = 'rate_limited';
+  else if (isLoginRequired(text)) normalizedCode = 'login_required';
+  else if (isAuthRequired(text)) normalizedCode = 'auth_required';
+  else if (isAgentUnavailable(text)) normalizedCode = 'agent_unavailable';
+  else if (isModelUnavailable(text)) normalizedCode = 'model_unavailable';
+  else if (DISCONNECTED_CODES.has(code)) normalizedCode = 'disconnected';
+  else if (isNetworkError(text)) normalizedCode = 'network_error';
+  else if (isDisconnected(text)) normalizedCode = 'disconnected';
+  else if (code === 'task_timeout' || isTimeout(text)) normalizedCode = 'timeout';
+  else if (UPSTREAM_CODES.has(code) || isUpstreamError(text)) normalizedCode = 'upstream_error';
+
+  if (normalizedCode === error.code) return error;
+  return { ...error, code: normalizedCode };
 }
 
 function isQuotaExceeded(text: string): boolean {
