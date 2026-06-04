@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import WebSocket from 'ws';
 import { OPENAI_COMPAT_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { normalizeTaskFailError } from '../failure-code.js';
 import {
   buildOpenAICompatSystemPrompt,
   chatHistoryFromMessages,
@@ -1456,7 +1457,7 @@ export function createOpenclawBackend(
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: { code: 'gateway_closed', message: errorMessage(err) },
+          error: normalizeTaskFailError({ code: 'gateway_closed', message: errorMessage(err) }),
         });
         return;
       }
@@ -1756,10 +1757,10 @@ export function createOpenclawBackend(
           emit({
             type: 'task.fail',
             taskId: task.taskId,
-            error: {
+            error: normalizeTaskFailError({
               code: closed ? 'gateway_closed' : 'gateway_send_failed',
               message: errorMessage(err),
-            },
+            }),
           });
           return;
         }
@@ -1795,10 +1796,10 @@ export function createOpenclawBackend(
           emit({
             type: 'task.fail',
             taskId: task.taskId,
-            error: {
+            error: normalizeTaskFailError({
               code: 'task_timeout',
               message: result.errorMessage ?? 'task timed out',
-            },
+            }),
           });
           return;
         }
@@ -1806,10 +1807,10 @@ export function createOpenclawBackend(
           emit({
             type: 'task.fail',
             taskId: task.taskId,
-            error: {
+            error: normalizeTaskFailError({
               code: 'gateway_closed',
               message: result.errorMessage ?? 'gateway closed',
-            },
+            }),
           });
           return;
         }
@@ -1817,10 +1818,10 @@ export function createOpenclawBackend(
           emit({
             type: 'task.fail',
             taskId: task.taskId,
-            error: {
+            error: normalizeTaskFailError({
               code: 'gateway_abort_failed',
               message: result.errorMessage ?? 'chat.abort request failed',
-            },
+            }),
           });
           return;
         }
@@ -1828,10 +1829,10 @@ export function createOpenclawBackend(
           emit({
             type: 'task.fail',
             taskId: task.taskId,
-            error: {
+            error: normalizeTaskFailError({
               code: 'gateway_chat_error',
               message: result.errorMessage ?? 'unknown gateway error',
-            },
+            }),
           });
           return;
         }

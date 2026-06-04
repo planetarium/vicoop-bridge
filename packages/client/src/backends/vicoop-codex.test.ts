@@ -893,7 +893,7 @@ test('handle: empty prompt → task.fail with empty_prompt code', async () => {
   assert.equal(failFrame.error.code, 'empty_prompt');
 });
 
-test('handle: serve exits before listening → task.fail serve_unavailable', async () => {
+test('handle: serve exits before listening -> task.fail disconnected', async () => {
   // Simulates an old binary that has no `serve` subcommand (exits non-zero
   // with usage on stderr) — startup never reports listening.
   const fake = makeFakeSpawn();
@@ -916,7 +916,7 @@ test('handle: serve exits before listening → task.fail serve_unavailable', asy
   assert.equal(fails.length, 1);
   const failFrame = fails[0];
   if (failFrame.type !== 'task.fail') throw new Error('unreachable');
-  assert.equal(failFrame.error.code, 'serve_unavailable');
+  assert.equal(failFrame.error.code, 'disconnected');
   assert.ok(failFrame.error.message.includes('serve'));
 });
 

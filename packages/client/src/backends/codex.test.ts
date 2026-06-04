@@ -741,7 +741,7 @@ test('approval server-request gets auto-decline by default', async () => {
   assert.equal(frames.at(-1)?.type, 'task.complete');
 });
 
-test('app-server spawn failure surfaces app_server_unavailable', async () => {
+test('app-server spawn failure surfaces disconnected', async () => {
   const failingSpawn: AppServerSpawnFn = () => {
     throw new Error('ENOENT');
   };
@@ -753,7 +753,7 @@ test('app-server spawn failure surfaces app_server_unavailable', async () => {
   assert.equal(last?.type, 'task.fail');
   assert.equal(
     last?.type === 'task.fail' && last.error.code,
-    'app_server_unavailable',
+    'disconnected',
   );
 });
 
@@ -783,7 +783,7 @@ test('transport closing mid-turn emits task.fail', async () => {
 
   const last = frames.at(-1);
   assert.equal(last?.type, 'task.fail');
-  assert.equal(last?.type === 'task.fail' && last.error.code, 'turn_failed');
+  assert.equal(last?.type === 'task.fail' && last.error.code, 'disconnected');
 });
 
 test('traceability extension surfaces commandExecution item as a trace artifact', async () => {

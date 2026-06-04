@@ -9,6 +9,7 @@ import {
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { normalizeTaskFailError } from '../failure-code.js';
 import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
 import {
   buildOpenAICompatResponseMetadata,
@@ -1573,10 +1574,10 @@ export function createClaudeBackend(
           emit({
             type: 'task.fail',
             taskId: task.taskId,
-            error: {
+            error: normalizeTaskFailError({
               code: 'caller_tools_mcp_start_failed',
               message: `caller-tools MCP server failed to start: ${errorMessage(err)}`,
-            },
+            }),
           });
           return;
         }
@@ -1782,7 +1783,7 @@ export function createClaudeBackend(
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: { code: 'spawn_failed', message: errorMessage(err) },
+          error: normalizeTaskFailError({ code: 'spawn_failed', message: errorMessage(err) }),
         });
         return;
       }
@@ -1807,10 +1808,10 @@ export function createClaudeBackend(
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: {
+          error: normalizeTaskFailError({
             code: 'spawn_no_stdin',
             message: 'spawned claude has no stdin pipe; cannot deliver user message',
-          },
+          }),
         });
         return;
       }
@@ -2323,7 +2324,7 @@ export function createClaudeBackend(
           // exit.error is typed Error from the child `error` event but a
           // custom spawn / fake child could emit a non-Error here. Route
           // through errorMessage so .message access can't crash the frame.
-          error: { code: 'spawn_failed', message: errorMessage(exit.error) },
+          error: normalizeTaskFailError({ code: 'spawn_failed', message: errorMessage(exit.error) }),
         });
         return;
       }
@@ -2378,10 +2379,10 @@ export function createClaudeBackend(
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: {
+          error: normalizeTaskFailError({
             code: 'claude_exit_nonzero',
             message: `claude exited with code ${exit.code}${sigPart}${detailPart}${stdoutPart}${stdinPart}${toolMismatchPart}`,
-          },
+          }),
         });
         return;
       }
