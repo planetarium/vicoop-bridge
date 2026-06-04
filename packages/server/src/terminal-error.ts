@@ -23,3 +23,18 @@ export function terminalErrorMetadata(error: TerminalError): Record<string, unkn
 export function terminalErrorExtensions(): string[] {
   return [OPENAI_COMPAT_EXTENSION_URI];
 }
+
+export function hasOpenAICompatExtension(extensions: readonly string[] | undefined): boolean {
+  return extensions?.includes(OPENAI_COMPAT_EXTENSION_URI) === true;
+}
+
+export function terminalErrorMessageFields(
+  error: TerminalError,
+  requestedExtensions: readonly string[] | undefined,
+): { metadata?: Record<string, unknown>; extensions?: string[] } {
+  if (!hasOpenAICompatExtension(requestedExtensions)) return {};
+  return {
+    metadata: terminalErrorMetadata(error),
+    extensions: terminalErrorExtensions(),
+  };
+}

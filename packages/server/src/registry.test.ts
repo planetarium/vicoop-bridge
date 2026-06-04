@@ -145,6 +145,7 @@ test('unregisterAgent reports mid-task disconnect with structured error metadata
     agentId: 'a1',
     taskId: 't-disc',
     contextId: 'ctx-disc',
+    requestedExtensions: [OPENAI_COMPAT_EXTENSION_URI],
     sink: {
       pushStatus: (event) => statuses.push(event),
       pushArtifact: () => undefined,
@@ -171,6 +172,37 @@ test('unregisterAgent reports mid-task disconnect with structured error metadata
     },
   });
   assert.deepEqual(statuses[0]?.status.message?.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+});
+
+test('unregisterAgent omits terminal error metadata when openai-compat extension was not requested', () => {
+  const registry = new Registry();
+  const ws = makeWs();
+  registry.registerAgent({
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+
+  const statuses: Array<{ status: { message?: { metadata?: unknown; extensions?: string[] } } }> = [];
+  registry.bindTask({
+    agentId: 'a1',
+    taskId: 't-disc-plain',
+    contextId: 'ctx-disc-plain',
+    sink: {
+      pushStatus: (event) => statuses.push(event),
+      pushArtifact: () => undefined,
+      finish: () => undefined,
+    },
+  });
+
+  registry.unregisterAgent('a1', ws);
+
+  assert.equal(statuses[0]?.status.message?.metadata, undefined);
+  assert.equal(statuses[0]?.status.message?.extensions, undefined);
 });
 
 test('onAgentChange does NOT fire on unregister if the ws does not match the current connection', () => {

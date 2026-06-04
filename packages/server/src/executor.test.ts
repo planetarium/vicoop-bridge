@@ -434,6 +434,7 @@ test('executor persists history when agent is unreachable', async () => {
     role: 'user',
     parts: [{ kind: 'text', text: 'hi' }],
     messageId: 'm-5',
+    extensions: [OPENAI_COMPAT_EXTENSION_URI],
   } as unknown as Message;
 
   const statuses: TaskStatusUpdateEvent[] = [];
@@ -459,4 +460,28 @@ test('executor persists history when agent is unreachable', async () => {
     },
   });
   assert.deepEqual(statuses[0]?.status.message?.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+});
+
+test('executor omits terminal error metadata when openai-compat extension was not requested', async () => {
+  const registry = new Registry();
+  const taskStore = captureTaskStore();
+  const executor = new WSForwardingExecutor('missing', registry, taskStore);
+  const task = {
+    id: 't-plain',
+    contextId: 'ctx-plain',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-plain',
+  } as unknown as Message;
+
+  const statuses: TaskStatusUpdateEvent[] = [];
+  for await (const event of executor.executeStream(task, message)) {
+    if ('status' in event) statuses.push(event);
+  }
+
+  assert.equal(statuses[0]?.status.message?.metadata, undefined);
+  assert.equal(statuses[0]?.status.message?.extensions, undefined);
 });

@@ -96,6 +96,7 @@ test('task.fail preserves backend error code and message on status message metad
       taskId: 'task-1',
       contextId: 'ctx-1',
       sink,
+      requestedExtensions: [OPENAI_COMPAT_EXTENSION_URI],
     });
 
     ws.send(encodeFrame({
@@ -130,6 +131,57 @@ test('task.fail preserves backend error code and message on status message metad
     });
     assert.deepEqual(event.status.message?.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
     assert.equal(registry.getBinding('task-1'), undefined);
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});
+
+test('task.fail omits terminal error metadata when openai-compat extension was not requested', async () => {
+  const server = createServer();
+  const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+  try {
+    await once(ws, 'open');
+    ws.send(encodeFrame({
+      type: 'hello',
+      version: PROTOCOL_VERSION,
+      agentId: 'agent-1',
+      token: 'token',
+      agentCard: {
+        name: 'agent',
+        version: '0.0.0',
+        protocolVersion: '0.3.0',
+      },
+    }));
+    await waitForAgent(registry, 'agent-1');
+
+    const sink = makeSink();
+    registry.bindTask({
+      agentId: 'agent-1',
+      taskId: 'task-plain',
+      contextId: 'ctx-plain',
+      sink,
+    });
+
+    ws.send(encodeFrame({
+      type: 'task.fail',
+      taskId: 'task-plain',
+      error: {
+        code: 'rate_limited',
+        message: 'slow down',
+      },
+    }));
+
+    await sink.finished;
+
+    const event = sink.statuses[0]!;
+    assert.equal(event.status.state, 'failed');
+    assert.deepEqual(event.status.message?.parts, [{ text: 'rate_limited: slow down' }]);
+    assert.equal(event.status.message?.metadata, undefined);
+    assert.equal(event.status.message?.extensions, undefined);
   } finally {
     ws.close();
     await closeServer(server);
