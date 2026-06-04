@@ -5,6 +5,7 @@ export interface TaskFailError {
 
 const PRESERVED_INPUT_CODES = new Set([
   'empty_prompt',
+  'invalid_input',
   'invalid_file_part',
   'unsupported_file_uri',
   'unsupported_file_mime',
@@ -19,7 +20,6 @@ const PRESERVED_INPUT_CODES = new Set([
 ]);
 
 const DISCONNECTED_CODES = new Set([
-  'network_error',
   'serve_unavailable',
   'app_server_unavailable',
   'app_server_crashed',
@@ -36,6 +36,9 @@ const SEMANTIC_CODES = new Set([
   'auth_required',
   'client_not_connected',
   'disconnected',
+  'network_error',
+  'agent_unavailable',
+  'model_unavailable',
   'timeout',
 ]);
 
@@ -54,7 +57,11 @@ export function normalizeTaskFailCode(code: string, message: string): string {
   if (isRateLimited(text)) return 'rate_limited';
   if (isLoginRequired(text)) return 'login_required';
   if (isAuthRequired(text)) return 'auth_required';
-  if (isDisconnected(text) || DISCONNECTED_CODES.has(code)) return 'disconnected';
+  if (isAgentUnavailable(text)) return 'agent_unavailable';
+  if (isModelUnavailable(text)) return 'model_unavailable';
+  if (DISCONNECTED_CODES.has(code)) return 'disconnected';
+  if (isNetworkError(text)) return 'network_error';
+  if (isDisconnected(text)) return 'disconnected';
   if (code === 'task_timeout' || isTimeout(text)) return 'timeout';
   if (UPSTREAM_CODES.has(code) || isUpstreamError(text)) return 'upstream_error';
   return code;
@@ -122,13 +129,39 @@ function isDisconnected(text: string): boolean {
     text.includes('socket closed') ||
     text.includes('econnrefused') ||
     text.includes('econnreset') ||
-    text.includes('enotfound') ||
-    text.includes('network error')
+    text.includes('enotfound')
   );
 }
 
 function isTimeout(text: string): boolean {
   return text.includes('timeout') || text.includes('timed out');
+}
+
+function isNetworkError(text: string): boolean {
+  return (
+    text.includes('network_error') ||
+    text.includes('network error') ||
+    text.includes('transport failure') ||
+    text.includes('transport failed')
+  );
+}
+
+function isAgentUnavailable(text: string): boolean {
+  return (
+    text.includes('agent_unavailable') ||
+    text.includes('agent unavailable') ||
+    text.includes('agent is unavailable') ||
+    text.includes('agent temporarily unavailable')
+  );
+}
+
+function isModelUnavailable(text: string): boolean {
+  return (
+    text.includes('model_unavailable') ||
+    text.includes('model unavailable') ||
+    text.includes('model is unavailable') ||
+    text.includes('model temporarily unavailable')
+  );
 }
 
 function isUpstreamError(text: string): boolean {

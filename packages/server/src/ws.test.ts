@@ -4,7 +4,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import WebSocket from 'ws';
 import type { TaskArtifactUpdateEvent, TaskStatusUpdateEvent } from '@a2x/sdk';
-import { encodeFrame, PROTOCOL_VERSION } from '@vicoop-bridge/protocol';
+import {
+  encodeFrame,
+  OPENAI_COMPAT_EXTENSION_URI,
+  PROTOCOL_VERSION,
+} from '@vicoop-bridge/protocol';
 import { Registry, type TaskSink } from './registry.js';
 import { attachWsServer } from './ws.js';
 import type { Sql } from './db.js';
@@ -113,11 +117,18 @@ test('task.fail preserves backend error code and message on status message metad
     assert.equal(event.status.state, 'failed');
     assert.deepEqual(event.status.message?.parts, [{ text: 'rate_limited: slow down' }]);
     assert.deepEqual(event.status.message?.metadata, {
+      [OPENAI_COMPAT_EXTENSION_URI]: {
+        terminal_error: {
+          code: 'rate_limited',
+          message: 'slow down',
+        },
+      },
       error: {
         code: 'rate_limited',
         message: 'slow down',
       },
     });
+    assert.deepEqual(event.status.message?.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
     assert.equal(registry.getBinding('task-1'), undefined);
   } finally {
     ws.close();

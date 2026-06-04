@@ -15,6 +15,16 @@ test('normalizeTaskFailError preserves caller/input validation failures', () => 
   );
   assert.deepEqual(
     normalizeTaskFailError({
+      code: 'invalid_input',
+      message: 'bad request shape',
+    }),
+    {
+      code: 'invalid_input',
+      message: 'bad request shape',
+    },
+  );
+  assert.deepEqual(
+    normalizeTaskFailError({
       code: 'file_too_large',
       message: 'FilePart exceeds INPUT_FILE_MAX_BYTES (10485761 > 10485760)',
     }),
@@ -76,10 +86,41 @@ test('normalizeTaskFailError maps local transport failures and timeouts', () => 
   );
   assert.equal(
     normalizeTaskFailError({
+      code: 'network_error',
+      message: 'vicoop-codex serve request failed',
+    }).code,
+    'network_error',
+  );
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'turn_failed',
+      message: 'transport failure prevented completion after dispatch',
+    }).code,
+    'network_error',
+  );
+  assert.equal(
+    normalizeTaskFailError({
       code: 'task_timeout',
       message: 'task timed out',
     }).code,
     'timeout',
+  );
+});
+
+test('normalizeTaskFailError maps agent and model availability failures', () => {
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'turn_failed',
+      message: 'agent temporarily unavailable',
+    }).code,
+    'agent_unavailable',
+  );
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'turn_failed',
+      message: 'model unavailable',
+    }).code,
+    'model_unavailable',
   );
 });
 

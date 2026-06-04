@@ -9,7 +9,11 @@ import {
   type TaskStatusUpdateEvent,
   type TaskStore,
 } from '@a2x/sdk';
-import { parseDownFrame, type AgentCard } from '@vicoop-bridge/protocol';
+import {
+  OPENAI_COMPAT_EXTENSION_URI,
+  parseDownFrame,
+  type AgentCard,
+} from '@vicoop-bridge/protocol';
 import { Registry, type ClientConnection } from './registry.js';
 import {
   WSForwardingExecutor,
@@ -443,9 +447,16 @@ test('executor persists history when agent is unreachable', async () => {
     ['m-5', 't-5-unreach'],
   );
   assert.deepEqual(statuses[0]?.status.message?.metadata, {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      terminal_error: {
+        code: 'client_not_connected',
+        message: 'client not connected',
+      },
+    },
     error: {
       code: 'client_not_connected',
       message: 'client not connected',
     },
   });
+  assert.deepEqual(statuses[0]?.status.message?.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
 });

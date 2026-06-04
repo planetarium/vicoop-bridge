@@ -15,6 +15,7 @@ import { hashToken } from './token.js';
 import { logEvent, truncate } from './log.js';
 import { isReservedAgentId } from './reserved-agent-ids.js';
 import { resolveHelloAgentCard } from './card-resolver.js';
+import { terminalErrorExtensions, terminalErrorMetadata } from './terminal-error.js';
 
 interface ClientRow {
   id: string;
@@ -281,12 +282,8 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
               messageId: `${frame.taskId}-err`,
               role: 'agent',
               parts: [{ text: `${frame.error.code}: ${frame.error.message}` }],
-              metadata: {
-                error: {
-                  code: frame.error.code,
-                  message: frame.error.message,
-                },
-              },
+              metadata: terminalErrorMetadata(frame.error),
+              extensions: terminalErrorExtensions(),
               taskId: frame.taskId,
               contextId: b.contextId,
             },

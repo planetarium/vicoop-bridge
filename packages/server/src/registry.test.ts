@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
-import type { AgentCard } from '@vicoop-bridge/protocol';
+import { OPENAI_COMPAT_EXTENSION_URI, type AgentCard } from '@vicoop-bridge/protocol';
 import { Registry } from './registry.js';
 
 // Minimal WebSocket stub — Registry only uses `.close()` on replacement and
@@ -139,7 +139,7 @@ test('unregisterAgent reports mid-task disconnect with structured error metadata
     connectedAt: 0,
   });
 
-  const statuses: Array<{ status: { message?: { metadata?: unknown } } }> = [];
+  const statuses: Array<{ status: { message?: { metadata?: unknown; extensions?: string[] } } }> = [];
   let finished = false;
   registry.bindTask({
     agentId: 'a1',
@@ -159,11 +159,18 @@ test('unregisterAgent reports mid-task disconnect with structured error metadata
   assert.equal(finished, true);
   assert.equal(registry.getBinding('t-disc'), undefined);
   assert.deepEqual(statuses[0]?.status.message?.metadata, {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      terminal_error: {
+        code: 'disconnected',
+        message: 'client disconnected mid-task',
+      },
+    },
     error: {
       code: 'disconnected',
       message: 'client disconnected mid-task',
     },
   });
+  assert.deepEqual(statuses[0]?.status.message?.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
 });
 
 test('onAgentChange does NOT fire on unregister if the ws does not match the current connection', () => {

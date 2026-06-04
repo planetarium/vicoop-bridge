@@ -3,6 +3,7 @@ import type { AgentCard, DownFrame } from '@vicoop-bridge/protocol';
 import { encodeFrame } from '@vicoop-bridge/protocol';
 import type { TaskArtifactUpdateEvent, TaskStatusUpdateEvent } from '@a2x/sdk';
 import { logEvent, truncate } from './log.js';
+import { terminalErrorExtensions, terminalErrorMetadata } from './terminal-error.js';
 
 export interface ClientConnection {
   agentId: string;
@@ -149,12 +150,11 @@ export class Registry {
             messageId: `${binding.taskId}-disc`,
             role: 'agent',
             parts: [{ text: 'client disconnected mid-task' }],
-            metadata: {
-              error: {
-                code: 'disconnected',
-                message: 'client disconnected mid-task',
-              },
-            },
+            metadata: terminalErrorMetadata({
+              code: 'disconnected',
+              message: 'client disconnected mid-task',
+            }),
+            extensions: terminalErrorExtensions(),
             taskId: binding.taskId,
             contextId: binding.contextId,
           },
