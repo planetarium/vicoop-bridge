@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.28.1
+
+### Patch Changes
+
+- a9c36e0: Align backend terminal failure codes with the openai-compat/v1 terminal error contract.
+
 ## 0.28.0
 
 ### Minor Changes
