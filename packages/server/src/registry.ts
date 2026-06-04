@@ -3,6 +3,7 @@ import type { AgentCard, DownFrame } from '@vicoop-bridge/protocol';
 import { encodeFrame } from '@vicoop-bridge/protocol';
 import type { TaskArtifactUpdateEvent, TaskStatusUpdateEvent } from '@a2x/sdk';
 import { logEvent, truncate } from './log.js';
+import { terminalErrorMessageFields } from './terminal-error.js';
 
 export interface ClientConnection {
   agentId: string;
@@ -36,6 +37,7 @@ export interface TaskBinding {
   // route does not create TaskBindings — it has its own executor
   // (AdminA2XExecutor) that never calls registry.bindTask().
   principalId?: string;
+  requestedExtensions?: string[];
 }
 
 export type CallerChangeListener = (agentId: string, callers: string[]) => void;
@@ -149,6 +151,13 @@ export class Registry {
             messageId: `${binding.taskId}-disc`,
             role: 'agent',
             parts: [{ text: 'client disconnected mid-task' }],
+            ...terminalErrorMessageFields(
+              {
+                code: 'disconnected',
+                message: 'client disconnected mid-task',
+              },
+              binding.requestedExtensions,
+            ),
             taskId: binding.taskId,
             contextId: binding.contextId,
           },

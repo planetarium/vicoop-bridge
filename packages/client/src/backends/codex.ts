@@ -8,6 +8,7 @@ import {
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { normalizeTaskFailError } from '../failure-code.js';
 import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
 import { createLogger, type Logger } from '../logger.js';
 import {
@@ -1166,10 +1167,10 @@ export function createCodexBackend(
             emit({
               type: 'task.fail',
               taskId: task.taskId,
-              error: {
+              error: normalizeTaskFailError({
                 code: 'app_server_unavailable',
                 message: `codex app-server failed to start: ${errorMessage(err)}`,
-              },
+              }),
             });
             return;
           }
@@ -1403,20 +1404,20 @@ export function createCodexBackend(
               emit({
                 type: 'task.fail',
                 taskId: task.taskId,
-                error: {
+                error: normalizeTaskFailError({
                   code: 'app_server_crashed',
                   message: `codex app-server transport closed during ${isResume ? 'thread/resume' : 'thread/start'}: ${err.message}`,
-                },
+                }),
               });
               return;
             }
             emit({
               type: 'task.fail',
               taskId: task.taskId,
-              error: {
+              error: normalizeTaskFailError({
                 code: isResume ? 'thread_resume_failed' : 'thread_start_failed',
                 message: errorMessage(err),
-              },
+              }),
             });
             return;
           }
@@ -1766,10 +1767,10 @@ export function createCodexBackend(
             emit({
               type: 'task.fail',
               taskId: task.taskId,
-              error: {
+              error: normalizeTaskFailError({
                 code: 'turn_failed',
                 message: outcome.error?.message ?? 'turn failed',
-              },
+              }),
             });
             return;
           }

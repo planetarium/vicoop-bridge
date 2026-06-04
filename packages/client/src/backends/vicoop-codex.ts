@@ -5,6 +5,7 @@ import {
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { normalizeTaskFailError } from '../failure-code.js';
 import { createLogger, type Logger } from '../logger.js';
 import {
   chatHistoryFromMessages,
@@ -1158,10 +1159,10 @@ export function createVicoopCodexBackend(
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: {
+          error: normalizeTaskFailError({
             code: 'serve_unavailable',
             message: `failed to start vicoop-codex serve: ${errorMessage(err)}`,
-          },
+          }),
         });
         return;
       }
@@ -1209,10 +1210,11 @@ export function createVicoopCodexBackend(
           return;
         }
         const code = err instanceof ServeRequestError ? err.a2aCode : 'vicoop_codex_failed';
+        const message = errorMessage(err);
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: { code, message: errorMessage(err) },
+          error: normalizeTaskFailError({ code, message }),
         });
         return;
       }

@@ -16,6 +16,7 @@ import {
 import type { Registry, TaskSink } from './registry.js';
 import { AsyncEventQueue } from './event-queue.js';
 import { logEvent } from './log.js';
+import { terminalErrorMessageFields } from './terminal-error.js';
 
 // AgentExecutor's constructor requires a Runner+BaseAgent because Layer 2
 // (the in-process LLM model) is the default. Our WS-forwarding path
@@ -154,6 +155,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     const principalId =
       typeof rawMetadata?._principalId === 'string' ? rawMetadata._principalId : undefined;
     const forwardMetadata = stripInternalMetadata(rawMetadata);
+    const requestedExtensions = message.extensions;
 
     this.registry.bindTask({
       agentId: this.agentId,
@@ -161,6 +163,7 @@ export class WSForwardingExecutor extends AgentExecutor {
       contextId,
       sink,
       ...(principalId !== undefined ? { principalId } : {}),
+      ...(requestedExtensions !== undefined ? { requestedExtensions } : {}),
     });
 
     let history = appendHistoryMessage(task.history ?? [], message);
@@ -201,6 +204,13 @@ export class WSForwardingExecutor extends AgentExecutor {
             messageId: `${taskId}-unreach`,
             role: 'agent',
             parts: [{ text: 'client not connected' }],
+            ...terminalErrorMessageFields(
+              {
+                code: 'client_not_connected',
+                message: 'client not connected',
+              },
+              requestedExtensions,
+            ),
             taskId,
             contextId,
           },

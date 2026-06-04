@@ -1,8 +1,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
-import { TaskState, type Artifact, type Message, type Task, type TaskStore } from '@a2x/sdk';
-import { parseDownFrame, type AgentCard } from '@vicoop-bridge/protocol';
+import {
+  TaskState,
+  type Artifact,
+  type Message,
+  type Task,
+  type TaskStatusUpdateEvent,
+  type TaskStore,
+} from '@a2x/sdk';
+import {
+  OPENAI_COMPAT_EXTENSION_URI,
+  parseDownFrame,
+  type AgentCard,
+} from '@vicoop-bridge/protocol';
 import { Registry, type ClientConnection } from './registry.js';
 import {
   WSForwardingExecutor,
@@ -423,13 +434,54 @@ test('executor persists history when agent is unreachable', async () => {
     role: 'user',
     parts: [{ kind: 'text', text: 'hi' }],
     messageId: 'm-5',
+    extensions: [OPENAI_COMPAT_EXTENSION_URI],
   } as unknown as Message;
 
-  for await (const _event of executor.executeStream(task, message)) void _event;
+  const statuses: TaskStatusUpdateEvent[] = [];
+  for await (const event of executor.executeStream(task, message)) {
+    if ('status' in event) statuses.push(event);
+  }
 
   const update = taskStore.updates.at(-1) as { history?: Message[] };
   assert.deepEqual(
     update.history?.map((m) => m.messageId),
     ['m-5', 't-5-unreach'],
   );
+  assert.deepEqual(statuses[0]?.status.message?.metadata, {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      terminal_error: {
+        code: 'client_not_connected',
+        message: 'client not connected',
+      },
+    },
+    error: {
+      code: 'client_not_connected',
+      message: 'client not connected',
+    },
+  });
+  assert.deepEqual(statuses[0]?.status.message?.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+});
+
+test('executor omits terminal error metadata when openai-compat extension was not requested', async () => {
+  const registry = new Registry();
+  const taskStore = captureTaskStore();
+  const executor = new WSForwardingExecutor('missing', registry, taskStore);
+  const task = {
+    id: 't-plain',
+    contextId: 'ctx-plain',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-plain',
+  } as unknown as Message;
+
+  const statuses: TaskStatusUpdateEvent[] = [];
+  for await (const event of executor.executeStream(task, message)) {
+    if ('status' in event) statuses.push(event);
+  }
+
+  assert.equal(statuses[0]?.status.message?.metadata, undefined);
+  assert.equal(statuses[0]?.status.message?.extensions, undefined);
 });

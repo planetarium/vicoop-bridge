@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
-import type { AgentCard } from '@vicoop-bridge/protocol';
+import { OPENAI_COMPAT_EXTENSION_URI, type AgentCard } from '@vicoop-bridge/protocol';
 import { Registry } from './registry.js';
 
 // Minimal WebSocket stub — Registry only uses `.close()` on replacement and
@@ -124,6 +124,85 @@ test('onAgentChange fires on disconnect (unregister) so stale transports do not 
   registry.onAgentChange((id) => seen.push(id));
   registry.unregisterAgent('a1', ws);
   assert.deepEqual(seen, ['a1']);
+});
+
+test('unregisterAgent reports mid-task disconnect with structured error metadata', () => {
+  const registry = new Registry();
+  const ws = makeWs();
+  registry.registerAgent({
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+
+  const statuses: Array<{ status: { message?: { metadata?: unknown; extensions?: string[] } } }> = [];
+  let finished = false;
+  registry.bindTask({
+    agentId: 'a1',
+    taskId: 't-disc',
+    contextId: 'ctx-disc',
+    requestedExtensions: [OPENAI_COMPAT_EXTENSION_URI],
+    sink: {
+      pushStatus: (event) => statuses.push(event),
+      pushArtifact: () => undefined,
+      finish: () => {
+        finished = true;
+      },
+    },
+  });
+
+  registry.unregisterAgent('a1', ws);
+
+  assert.equal(finished, true);
+  assert.equal(registry.getBinding('t-disc'), undefined);
+  assert.deepEqual(statuses[0]?.status.message?.metadata, {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      terminal_error: {
+        code: 'disconnected',
+        message: 'client disconnected mid-task',
+      },
+    },
+    error: {
+      code: 'disconnected',
+      message: 'client disconnected mid-task',
+    },
+  });
+  assert.deepEqual(statuses[0]?.status.message?.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+});
+
+test('unregisterAgent omits terminal error metadata when openai-compat extension was not requested', () => {
+  const registry = new Registry();
+  const ws = makeWs();
+  registry.registerAgent({
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+
+  const statuses: Array<{ status: { message?: { metadata?: unknown; extensions?: string[] } } }> = [];
+  registry.bindTask({
+    agentId: 'a1',
+    taskId: 't-disc-plain',
+    contextId: 'ctx-disc-plain',
+    sink: {
+      pushStatus: (event) => statuses.push(event),
+      pushArtifact: () => undefined,
+      finish: () => undefined,
+    },
+  });
+
+  registry.unregisterAgent('a1', ws);
+
+  assert.equal(statuses[0]?.status.message?.metadata, undefined);
+  assert.equal(statuses[0]?.status.message?.extensions, undefined);
 });
 
 test('onAgentChange does NOT fire on unregister if the ws does not match the current connection', () => {

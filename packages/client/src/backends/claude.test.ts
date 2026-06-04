@@ -344,7 +344,7 @@ test('maps non-zero exit to task.fail with stderr tail', async () => {
 
   const fail = frames.find((f): f is Extract<UpFrame, { type: 'task.fail' }> => f.type === 'task.fail');
   assert.ok(fail, 'expected task.fail');
-  assert.equal(fail.error.code, 'claude_exit_nonzero');
+  assert.equal(fail.error.code, 'auth_required');
   assert.match(fail.error.message, /code 2/);
   assert.match(fail.error.message, /auth required/);
 });
@@ -1149,7 +1149,7 @@ test('rolls back the session binding when claude exits non-zero on a fresh sessi
   t1.contextId = ctx;
   const c1 = collect();
   await backend.handle(t1, c1.emit, NEVER);
-  assert.equal(c1.frames.find((f) => f.type === 'task.fail')?.error.code, 'claude_exit_nonzero');
+  assert.equal(c1.frames.find((f) => f.type === 'task.fail')?.error.code, 'auth_required');
 
   const t2 = assign('second');
   t2.contextId = ctx;
@@ -1239,7 +1239,7 @@ test('non-zero claude exit with completed error result still fails', async () =>
   const terminal = frames.at(-1);
   assert.ok(terminal && terminal.type === 'task.fail');
   if (terminal.type === 'task.fail') {
-    assert.equal(terminal.error.code, 'claude_exit_nonzero');
+    assert.equal(terminal.error.code, 'login_required');
     assert.match(terminal.error.message, /Not logged in/);
   }
 });

@@ -488,7 +488,7 @@ test('fast terminal event: final arrives on same socket read as ack and is still
   }
 });
 
-test('task timeout: no terminal event triggers task_timeout failure', async () => {
+test('task timeout: no terminal event triggers timeout failure', async () => {
   const fake = await createFakeGateway({
     onRequest: (sock, req) => {
       if (req.method === 'chat.send') {
@@ -510,7 +510,7 @@ test('task timeout: no terminal event triggers task_timeout failure', async () =
     await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), NEVER);
     const fail = frames.find((f) => f.type === 'task.fail');
     assert.ok(fail, 'task must fail on timeout');
-    assert.equal(fail!.error.code, 'task_timeout');
+    assert.equal(fail!.error.code, 'timeout');
   } finally {
     await fake.close();
   }
@@ -767,7 +767,7 @@ test('cancel: chat.abort failure surfaces as gateway_abort_failed instead of han
   }
 });
 
-test('gateway close before ack emits gateway_closed (not gateway_send_failed)', async () => {
+test('gateway close before ack emits disconnected', async () => {
   const fake = await createFakeGateway({
     onRequest: (sock, req) => {
       if (req.method === 'chat.send') {
@@ -783,7 +783,7 @@ test('gateway close before ack emits gateway_closed (not gateway_send_failed)', 
     await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), NEVER);
     const fail = frames.find((f) => f.type === 'task.fail');
     assert.ok(fail, 'task must fail');
-    assert.equal(fail!.error.code, 'gateway_closed');
+    assert.equal(fail!.error.code, 'disconnected');
   } finally {
     await fake.close();
   }
@@ -871,8 +871,8 @@ test('invalid URL: WebSocket constructor throwing does not wedge ensureConnected
   await backend.handle(makeTask('tB', 'b'), (f) => framesB.push(f), NEVER);
   const failA = framesA.find((f) => f.type === 'task.fail');
   const failB = framesB.find((f) => f.type === 'task.fail');
-  assert.ok(failA && failA.error.code === 'gateway_closed');
-  assert.ok(failB && failB.error.code === 'gateway_closed');
+  assert.ok(failA && failA.error.code === 'disconnected');
+  assert.ok(failB && failB.error.code === 'disconnected');
 });
 
 test('handshake timeout: gateway accepts TCP but never completes handshake', async () => {
@@ -887,7 +887,7 @@ test('handshake timeout: gateway accepts TCP but never completes handshake', asy
     await backend.handle(makeTask('t1', 'hi'), (f) => frames.push(f), NEVER);
     const fail = frames.find((f) => f.type === 'task.fail');
     assert.ok(fail, 'task must fail when handshake never completes');
-    assert.equal(fail!.error.code, 'gateway_closed');
+    assert.equal(fail!.error.code, 'disconnected');
     assert.match(fail!.error.message, /handshake timed out/);
   } finally {
     await fake.close();
@@ -972,7 +972,7 @@ test('gateway close mid-run fails in-flight task deterministically', async () =>
     await pending;
     const fail = frames.find((f) => f.type === 'task.fail');
     assert.ok(fail, 'task must fail after gateway close');
-    assert.equal(fail!.error.code, 'gateway_closed');
+    assert.equal(fail!.error.code, 'disconnected');
   } finally {
     await fake.close();
   }
@@ -1745,7 +1745,7 @@ test('discovery fallback: when primary URL is dead and no candidates match, orig
   await backend.handle(makeTask('t-disc', 'hi'), (f) => frames.push(f), NEVER);
   const fail = frames.find((f) => f.type === 'task.fail');
   assert.ok(fail, 'task must fail when no gateway is reachable');
-  assert.equal(fail!.error.code, 'gateway_closed');
+  assert.equal(fail!.error.code, 'disconnected');
 });
 
 test('discovery fallback: primary URL dead, discovered candidate completes handshake, task succeeds', async () => {
@@ -1828,7 +1828,7 @@ test('discovery: when all candidates fail, the original primary connect error is
   await backend.handle(makeTask('t-allfail', 'hi'), (f) => frames.push(f), NEVER);
   const fail = frames.find((f) => f.type === 'task.fail');
   assert.ok(fail);
-  assert.equal(fail!.error.code, 'gateway_closed');
+  assert.equal(fail!.error.code, 'disconnected');
   // Primary URL was 127.0.0.1:1. The error message from connect ECONNREFUSED
   // mentions the port that failed. The surfaced error must reference port 1
   // (the configured primary), not 3 (the last candidate).
@@ -1850,7 +1850,7 @@ test('discovery errors are swallowed so the primary connect failure still propag
   await backend.handle(makeTask('t-boom', 'hi'), (f) => frames.push(f), NEVER);
   const fail = frames.find((f) => f.type === 'task.fail');
   assert.ok(fail, 'task must fail even when discovery itself throws');
-  assert.equal(fail!.error.code, 'gateway_closed');
+  assert.equal(fail!.error.code, 'disconnected');
   // The message should be the original connect error, not "boom: discovery
   // exploded" — discovery failures are best-effort and must not mask it.
   assert.ok(
@@ -1877,7 +1877,7 @@ test('discovery error logging is defensive against non-Error rejections', async 
   await backend.handle(makeTask('t-null', 'hi'), (f) => frames.push(f), NEVER);
   const fail = frames.find((f) => f.type === 'task.fail');
   assert.ok(fail, 'task must fail, not hang, on a null discovery rejection');
-  assert.equal(fail!.error.code, 'gateway_closed');
+  assert.equal(fail!.error.code, 'disconnected');
 });
 
 test('discovery runs when configured URL uses a wildcard bind address (0.0.0.0 / ::)', async () => {
@@ -1897,7 +1897,7 @@ test('discovery runs when configured URL uses a wildcard bind address (0.0.0.0 /
   assert.equal(discoverCalls, 1, 'discover must run for wildcard bind URLs');
   const fail = frames.find((f) => f.type === 'task.fail');
   assert.ok(fail);
-  assert.equal(fail!.error.code, 'gateway_closed');
+  assert.equal(fail!.error.code, 'disconnected');
 });
 
 test('discovery skipped when configured URL is remote (non-loopback)', async () => {
@@ -1917,7 +1917,7 @@ test('discovery skipped when configured URL is remote (non-loopback)', async () 
   await backend.handle(makeTask('t-remote', 'hi'), (f) => frames.push(f), NEVER);
   const fail = frames.find((f) => f.type === 'task.fail');
   assert.ok(fail, 'task must fail when remote gateway is unreachable');
-  assert.equal(fail!.error.code, 'gateway_closed');
+  assert.equal(fail!.error.code, 'disconnected');
   assert.equal(discoverCalls, 0, 'discover must not be invoked for non-loopback URLs');
 });
 
