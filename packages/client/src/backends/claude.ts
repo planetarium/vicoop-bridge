@@ -1,5 +1,8 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
   TRACEABILITY_EXTENSION_URI,
@@ -56,6 +59,11 @@ export interface ClaudeChildHandle {
 
 export interface ClaudeSpawnOptions {
   cwd?: string;
+  // Extra environment variables for the spawned process, merged OVER the parent
+  // env (so the child still inherits the daemon's environment). Used for the
+  // per-spawn knobs Claude Code only reads from the environment — it exposes no
+  // CLI flag for them — e.g. `ENABLE_PROMPT_CACHING_1H`.
+  env?: Record<string, string>;
 }
 
 export type ClaudeSpawnFn = (
@@ -67,6 +75,17 @@ export type ClaudeSpawnFn = (
 export interface ClaudeBackendOptions {
   command?: string;
   cwd?: string;
+  // Working directory for stateless openai-compat spawns, overriding `cwd` for
+  // those tasks only. They have no legitimate use for the operator's `cwd`:
+  // native dispatch disables claude's built-ins (`--tools ""`) and the path
+  // replaces claude's default prompt via `--system-prompt` (so cwd never even
+  // reaches the model), while the operator-cwd's CLAUDE.md, project settings,
+  // and hooks are all off-target for a generic chat/completions proxy turn —
+  // and re-paid on every fresh session. Pointing these spawns at an empty dir
+  // with no CLAUDE.md / project-settings ancestors drops that overhead.
+  // Defaults to a stable dir under the OS temp root (created on first use);
+  // overridable for tests. Plain A2A tasks keep `cwd` untouched.
+  openaiCompatCwd?: string;
   extraArgs?: readonly string[];
   spawn?: ClaudeSpawnFn;
   stderrCaptureBytes?: number;
@@ -402,6 +421,9 @@ function defaultSpawn(
   return nodeSpawn(command, Array.from(args), {
     stdio: ['pipe', 'pipe', 'pipe'],
     ...(options.cwd ? { cwd: options.cwd } : {}),
+    // Merge over (not replace) the inherited env so the child keeps the
+    // daemon's environment and only the per-spawn overrides change.
+    ...(options.env ? { env: { ...process.env, ...options.env } } : {}),
   }) as ChildProcess;
 }
 
@@ -775,8 +797,24 @@ export function buildOpenAICompatNativeSystemPrompt(
     );
   }
 
+  // Never return an empty prompt. A bare chat-completion (no caller `system`,
+  // no tools, and tool_choice !== "none") would otherwise leave `sections`
+  // empty. Appending "" to claude's default prompt is harmless, but feeding
+  // "" to `--system-prompt` would *replace* the default with nothing — so the
+  // builder owns a neutral fallback here, keeping its output safe to use via
+  // either `--append-system-prompt` or `--system-prompt`.
+  if (sections.length === 0) {
+    return DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT;
+  }
   return sections.join('\n\n');
 }
+
+// Neutral base prompt for a bare openai-compat chat-completion turn that
+// carries no caller `system` and no tools. Kept minimal and transport-flavoured
+// (not a coding-agent persona) because the openai-compat path serves a generic
+// chat/completions proxy, not Claude Code's interactive CLI.
+export const DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT =
+  'You are a helpful assistant accessed through an OpenAI-compatible gateway. Respond to the user directly in natural language.';
 
 
 // Pull `tool_use` blocks out of an `assistant`-role message's content
@@ -1006,6 +1044,14 @@ export function createClaudeBackend(
 ): Backend & { getSendFileMcpServer(): SendFileMcpServer | null } {
   const command = opts.command ?? 'claude';
   const cwd = opts.cwd;
+  // Isolation cwd for openai-compat spawns (see ClaudeBackendOptions). Resolved
+  // lazily on first use and memoized — including the fallback to the operator
+  // `cwd` if the dir can't be created — so a hostile temp root degrades to the
+  // pre-isolation behaviour rather than failing the task.
+  const openaiCompatCwd = opts.openaiCompatCwd ?? join(tmpdir(), 'vicoop-bridge-claude-oai');
+  // `null` = not yet resolved; afterwards holds the dir to spawn in (or the
+  // operator cwd / undefined on a creation failure).
+  let openaiCompatCwdResolved: string | undefined | null = null;
   const extraArgs = opts.extraArgs ?? [];
   const spawnFn = opts.spawn ?? defaultSpawn;
   const stderrCap = opts.stderrCaptureBytes ?? 8192;
@@ -1016,6 +1062,22 @@ export function createClaudeBackend(
   const setIntervalImpl = opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
   const clearIntervalImpl = opts.clearIntervalFn ?? ((h) => clearInterval(h as ReturnType<typeof setInterval>));
   const timingLogger = createLogger();
+  // Resolve (and create-on-first-use) the openai-compat isolation cwd. Memoized
+  // so the mkdir runs at most once per backend; on failure we fall back to the
+  // operator `cwd` and remember that so we don't retry-and-warn every task.
+  const resolveOpenAICompatCwd = (): string | undefined => {
+    if (openaiCompatCwdResolved !== null) return openaiCompatCwdResolved;
+    try {
+      mkdirSync(openaiCompatCwd, { recursive: true });
+      openaiCompatCwdResolved = openaiCompatCwd;
+    } catch (err) {
+      timingLogger.warn?.(
+        `[claude] openai-compat isolation cwd ${openaiCompatCwd} could not be created; falling back to operator cwd: ${errorMessage(err)}`,
+      );
+      openaiCompatCwdResolved = cwd;
+    }
+    return openaiCompatCwdResolved;
+  };
   const sendFileMcpOpts =
     opts.sendFileMcp && opts.sendFileMcp.allowedRoots.length > 0
       ? opts.sendFileMcp
@@ -1530,21 +1592,51 @@ export function createClaudeBackend(
       // read in terms of the model's view ("native tool surface is live").
       const nativeReady = nativeDispatchActive && callerToolsMcp !== null;
 
-      // Per-task `--append-system-prompt` carrying the openai-compat
-      // extension's system / tools / tool_choice. Placed AFTER identityArgs
-      // (so the self-identity directive is the model's first read) but
-      // BEFORE extraArgs (so an operator-supplied append still wins by
-      // appending last — claude concatenates each --append-system-prompt
-      // occurrence in argv order).
+      // Per-task `--system-prompt` carrying the openai-compat extension's
+      // system / tools / tool_choice. We *replace* claude's default agent
+      // prompt (rather than `--append-system-prompt`-ing onto it) for two
+      // reasons:
+      //   - Cost: every openai-compat task spawns a fresh session (no reuse),
+      //     so claude's multi-thousand-token coding-agent base prompt is
+      //     re-paid on each request. Replacing it with this slim, caller-
+      //     scoped prompt removes that fixed per-request overhead.
+      //   - Correctness: the openai-compat path is a generic chat/completions
+      //     proxy, not Claude Code's interactive CLI — the default persona
+      //     (TodoWrite, file-edit conventions, CLI verbosity) is off-target.
+      // Tool use is native to the model, not taught by the default prompt, so
+      // native MCP dispatch is unaffected. `buildOpenAICompatNativeSystemPrompt`
+      // never returns "" (it owns a neutral fallback), so the replacement is
+      // always a non-empty base. Identity (`identityArgs`) and operator
+      // `extraArgs` still ride `--append-system-prompt`, which claude appends
+      // onto this base; note the base is therefore the model's first read,
+      // ahead of any appended identity directive (a change from the prior
+      // append-only ordering, immaterial on the stateless proxy turn).
       const openaiCompatArgs: readonly string[] = envelope
         ? [
-            '--append-system-prompt',
+            '--system-prompt',
             buildOpenAICompatNativeSystemPrompt(
               envelopeSystem,
               envelopeTools,
               envelopeToolChoice,
             ),
           ]
+        : [];
+      // Trim the cold-start overhead for openai-compat tasks. Every such task
+      // spawns a fresh claude session (no reuse — see the gate above), so any
+      // fixed per-request context is re-paid each time. `--disable-slash-commands`
+      // drops the skills catalogue: the served backend never invokes skills
+      // under openai-compat (the caller drives tool use), so the listing is dead
+      // weight here. Auth-neutral, unlike `--bare`, so the operator's OAuth login
+      // still works.
+      //
+      // Note we do NOT pass `--exclude-dynamic-system-prompt-sections`: it only
+      // applies to claude's default system prompt and is ignored once we replace
+      // that prompt via `--system-prompt` (see openaiCompatArgs above), which
+      // already carries no per-machine dynamic sections. CLAUDE.md auto-discovery
+      // can only be disabled via `--bare` (API-key auth only — out of reach under
+      // OAuth), so it stays loaded.
+      const leanContextArgs: readonly string[] = envelope
+        ? ['--disable-slash-commands']
         : [];
       // Forward `envelope.model` to claude via `--model <id>` so the gateway-
       // resolved model id wins over claude's own default (#302). Sticky for
@@ -1642,6 +1734,7 @@ export function createClaudeBackend(
         ...identityArgs,
         ...modelArgs,
         ...openaiCompatArgs,
+        ...leanContextArgs,
         ...disableBuiltinToolArgs,
         ...nativeTurnCapArgs,
         '--include-partial-messages',
@@ -1655,18 +1748,36 @@ export function createClaudeBackend(
         status: { state: 'working', timestamp: new Date().toISOString() },
       });
 
+      // openai-compat tasks spawn in the isolation cwd (no operator CLAUDE.md /
+      // project settings / hooks); plain A2A tasks keep the operator cwd.
+      const effectiveCwd = envelope ? resolveOpenAICompatCwd() : cwd;
+
+      // Opt openai-compat spawns into Anthropic's 1-hour extended prompt cache.
+      // These turns are stateless (fresh session each time) and a conversation
+      // often pauses for minutes between user turns, so the default 5-min cache
+      // can lapse between turns even though our system+tools prefix is byte-
+      // stable. The 1h cache keeps that prefix warm across longer gaps. Claude
+      // Code reads this only from the environment (no CLI flag), so we set it on
+      // the child process — scoped to openai-compat; plain A2A tasks keep the
+      // 5-min default. Trade-off: a 1h cache *write* costs 2x base (vs 1.25x for
+      // 5m), paid once per prefix; reads stay 0.1x, so it wins whenever the
+      // prefix is reused at all within the hour.
+      const effectiveEnv = envelope
+        ? { ENABLE_PROMPT_CACHING_1H: '1' }
+        : undefined;
+
       let child: ClaudeChildHandle;
       try {
         timingLogger.debug(
-          `claude.spawn.start taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${cwd ? safeToken(cwd) : '<default>'} argv=${safeToken(JSON.stringify(args), 8000)}`,
+          `claude.spawn.start taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${effectiveCwd ? safeToken(effectiveCwd) : '<default>'} argv=${safeToken(JSON.stringify(args), 8000)}`,
         );
-        child = spawnFn(command, args, { cwd });
+        child = spawnFn(command, args, { cwd: effectiveCwd, env: effectiveEnv });
         recorder.mark('spawn');
       } catch (err) {
         rollbackFreshSession();
         await closeCallerToolsMcp();
         timingLogger.debug(
-          `claude.spawn.error taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${cwd ? safeToken(cwd) : '<default>'} argv=${safeToken(JSON.stringify(args), 8000)} error=${safeToken(errorMessage(err), 1000)}`,
+          `claude.spawn.error taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${effectiveCwd ? safeToken(effectiveCwd) : '<default>'} argv=${safeToken(JSON.stringify(args), 8000)} error=${safeToken(errorMessage(err), 1000)}`,
         );
         emit({
           type: 'task.fail',

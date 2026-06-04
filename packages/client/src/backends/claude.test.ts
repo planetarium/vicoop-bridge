@@ -7,6 +7,7 @@ import { EventEmitter } from 'node:events';
 import {
   buildClaudeChatCompletionEnvelope,
   buildOpenAICompatNativeSystemPrompt,
+  DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT,
   createClaudeBackend,
   normalizeClaudeModelId,
   openaiToolsToCallerToolDefs,
@@ -35,6 +36,7 @@ interface FakeChild extends ClaudeChildHandle {
   readonly command: string;
   readonly args: readonly string[];
   readonly cwd?: string;
+  readonly env?: Record<string, string>;
   killed: boolean;
   killSignal: NodeJS.Signals | null;
   stdinPayload: string;
@@ -90,6 +92,7 @@ function makeFakeSpawn(configure: (child: FakeChild) => void): FakeSpawn {
         command,
         args,
         cwd: options.cwd,
+        env: options.env,
         stdin,
         stdout: mkReadable(stdoutEmitter),
         stderr: mkReadable(stderrEmitter),
@@ -2339,6 +2342,129 @@ test('envelope without model omits --model from claude spawn (#302)', async () =
   assert.equal(args.indexOf('--model'), -1);
 });
 
+test('openai-compat spawn trims cold-start context (--disable-slash-commands)', async () => {
+  // Every openai-compat task spawns a fresh session, so the skills catalogue is
+  // re-paid on each request for no benefit (the caller drives tool use). The
+  // flag is auth-neutral (unlike `--bare`) and applies whenever the envelope is
+  // present — tools or not. `--exclude-dynamic-system-prompt-sections` is NOT
+  // passed: replacing the default prompt via `--system-prompt` makes it a no-op.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(assignWithOpenAICompat('hi', {}), emit, NEVER);
+  const args = fake.lastChild()?.args ?? [];
+  assert.ok(
+    args.includes('--disable-slash-commands'),
+    'expected --disable-slash-commands on the openai-compat spawn',
+  );
+  assert.equal(
+    args.includes('--exclude-dynamic-system-prompt-sections'),
+    false,
+    'no --exclude-dynamic-system-prompt-sections (redundant once --system-prompt replaces the default)',
+  );
+});
+
+test('non-openai-compat spawn keeps skills intact (no lean-context flags)', async () => {
+  // The trims are scoped to the stateless openai-compat path; a plain A2A
+  // task keeps claude's full context (skills, memory, env) intact.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(assign('hi'), emit, NEVER);
+  const args = fake.lastChild()?.args ?? [];
+  assert.equal(args.includes('--disable-slash-commands'), false);
+});
+
+test('openai-compat task spawns in the isolation cwd, not the operator cwd', async () => {
+  // The operator cwd carries CLAUDE.md / project settings / hooks that are
+  // off-target for a stateless chat/completions proxy turn; openai-compat
+  // spawns are redirected to an empty isolation dir instead.
+  const isolation = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-oai-cwd-'));
+  try {
+    const fake = scriptedSpawn({
+      lines: [
+        JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+        JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+      ],
+      exitCode: 0,
+    });
+    const backend = createClaudeBackend({
+      spawn: fake.spawn,
+      cwd: '/operator/project',
+      openaiCompatCwd: isolation,
+    });
+    const { emit } = collect();
+    await backend.handle(assignWithOpenAICompat('hi', {}), emit, NEVER);
+    assert.equal(fake.lastChild()?.cwd, isolation);
+  } finally {
+    await fs.rm(isolation, { recursive: true, force: true });
+  }
+});
+
+test('non-openai-compat task keeps the operator cwd', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    cwd: '/operator/project',
+    openaiCompatCwd: '/should/not/be/used',
+  });
+  const { emit } = collect();
+  await backend.handle(assign('hi'), emit, NEVER);
+  assert.equal(fake.lastChild()?.cwd, '/operator/project');
+});
+
+test('openai-compat spawn opts into the 1-hour prompt cache (ENABLE_PROMPT_CACHING_1H)', async () => {
+  // Stateless openai-compat turns can pause minutes between turns; the 1h cache
+  // keeps the byte-stable system+tools prefix warm past the 5-min default.
+  // Claude Code reads this only from the env, so we set it on the child.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(assignWithOpenAICompat('hi', {}), emit, NEVER);
+  assert.equal(fake.lastChild()?.env?.ENABLE_PROMPT_CACHING_1H, '1');
+});
+
+test('non-openai-compat spawn does not set the 1-hour cache env', async () => {
+  // The 1h opt-in is scoped to openai-compat; plain A2A tasks keep the default
+  // (a 1h cache write costs 2x, only worth it for the stateless proxy pattern).
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(assign('hi'), emit, NEVER);
+  // No env override at all on the plain path (child inherits parent env only).
+  assert.equal(fake.lastChild()?.env, undefined);
+});
+
 test('envelope.model is dropped when claude probed model differs (#302)', async () => {
   // Regression guard for the gateway sending an unresolved routing key
   // (e.g. `a2a/<card-url>`) as `envelope.model`. Without the gate, the
@@ -2405,7 +2531,7 @@ test('envelope.model is forwarded when it matches claude probed model (#302)', a
   assert.equal(args[modelIdx + 1], 'claude-opus-4-7');
 });
 
-test('spawn argv carries --append-system-prompt with the native directive when metadata is present', async () => {
+test('spawn argv carries --system-prompt with the native directive when metadata is present', async () => {
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
@@ -2431,17 +2557,17 @@ test('spawn argv carries --append-system-prompt with the native directive when m
   );
 
   const args = fake.lastChild()?.args ?? [];
-  // The flag occurs at least once (operator can pass additional ones via
-  // extraArgs; identity-injecting variant may also fire). The openai-compat
+  // The openai-compat path REPLACES claude's default prompt via --system-prompt
+  // (no identity configured here, so this is the only --system-prompt). The
   // value carries the user's `system` text plus the native-dispatch directive
   // — NOT the old envelope JSON contract, which #213 removed.
   const idx = args.findIndex(
     (a, i) =>
-      args[i - 1] === '--append-system-prompt' &&
+      args[i - 1] === '--system-prompt' &&
       typeof a === 'string' &&
       a.includes('You are concise.'),
   );
-  assert.ok(idx >= 0, 'expected --append-system-prompt carrying the openai-compat system text');
+  assert.ok(idx >= 0, 'expected --system-prompt carrying the openai-compat system text');
   // The slim native prompt teaches the model to use the native tool surface
   // and how to read the history block — nothing more.
   assert.match(args[idx] as string, /native tool list/);
@@ -2460,7 +2586,7 @@ test('spawn argv carries --append-system-prompt with the native directive when m
   );
 });
 
-test('absent metadata → no openai-compat --append-system-prompt is injected', async () => {
+test('absent metadata → no openai-compat system prompt is injected', async () => {
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
@@ -3030,6 +3156,14 @@ test('buildOpenAICompatNativeSystemPrompt: slim shape (#213)', () => {
     buildOpenAICompatNativeSystemPrompt('just be terse', undefined, undefined),
     'just be terse',
   );
+
+  // No system, no tools, tool_choice undefined → the builder still yields a
+  // non-empty neutral base. This is the invariant that makes the output safe
+  // to pass to `--system-prompt` (which would replace claude's default with ""
+  // otherwise). The append path used to receive "" here harmlessly.
+  const bare = buildOpenAICompatNativeSystemPrompt(undefined, undefined, undefined);
+  assert.equal(bare, DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT);
+  assert.ok(bare.trim().length > 0, 'bare invocation must never return an empty prompt');
 });
 
 // caller-tools MCP module: the onInvoke wiring. We drive the tool through
@@ -3155,11 +3289,11 @@ test('argv: openai-compat caller tools wire caller-tools MCP + native prompt + -
   assert.ok(cfg.mcpServers?.['_vb-caller-tools'], '_vb-caller-tools MCP server registered');
   assert.equal(cfg.mcpServers?.['_vb-caller-tools']?.type, 'http');
 
-  // (b) --append-system-prompt carries the native variant — the envelope
-  // contract block (the literal `{"tool_calls"` substring the legacy
-  // prompt teaches) must be absent.
-  const apsIdx = args.indexOf('--append-system-prompt');
-  assert.notEqual(apsIdx, -1, '--append-system-prompt present');
+  // (b) --system-prompt carries the native variant (replacing claude's
+  // default) — the envelope contract block (the literal `{"tool_calls"`
+  // substring the legacy prompt teaches) must be absent.
+  const apsIdx = args.indexOf('--system-prompt');
+  assert.notEqual(apsIdx, -1, '--system-prompt present');
   const prompt = args[apsIdx + 1] as string;
   assert.equal(prompt.includes('{"tool_calls"'), false);
   assert.ok(prompt.startsWith('be terse'));
