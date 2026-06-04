@@ -17,6 +17,8 @@ interface Captured {
   sink: ConsoleSink;
 }
 
+const TIMESTAMPED_CLIENT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z \[client\] /;
+
 // Capturing sink. Tests inject this instead of monkey-patching the global
 // console so a parallel test file in the same process (or a future change
 // to test-runner isolation) cannot interleave global mutations.
@@ -189,11 +191,12 @@ test('resolveLogLevel: warn passes PREFIX as a separate sink argument', () => {
     resolveLogLevel(undefined, sink);
   });
   assert.equal(calls.length, 1);
-  // First arg is the prefix, second is the structured message — same shape
+  // First arg is the timestamp, second is the prefix, third is the structured message — same shape
   // the logger's own .warn() uses, so structured-logging sinks can treat
   // them consistently.
-  assert.equal(calls[0][0], '[client]');
-  assert.match(String(calls[0][1]), /ignoring invalid VICOOP_CLIENT_LOG_LEVEL="bogus"/);
+  assert.match(String(calls[0][0]), /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  assert.equal(calls[0][1], '[client]');
+  assert.match(String(calls[0][2]), /ignoring invalid VICOOP_CLIENT_LOG_LEVEL="bogus"/);
 });
 
 test('createLogger at info: error/warn/info pass, debug filtered', () => {
@@ -203,9 +206,12 @@ test('createLogger at info: error/warn/info pass, debug filtered', () => {
   logger.warn('careful');
   logger.info('hello');
   logger.debug('quiet');
-  assert.deepEqual(c.error, ['[client] boom']);
-  assert.deepEqual(c.warn, ['[client] careful']);
-  assert.deepEqual(c.log, ['[client] hello']);
+  assert.equal(c.error.length, 1);
+  assert.match(c.error[0], new RegExp(`${TIMESTAMPED_CLIENT_RE.source}boom$`));
+  assert.equal(c.warn.length, 1);
+  assert.match(c.warn[0], new RegExp(`${TIMESTAMPED_CLIENT_RE.source}careful$`));
+  assert.equal(c.log.length, 1);
+  assert.match(c.log[0], new RegExp(`${TIMESTAMPED_CLIENT_RE.source}hello$`));
 });
 
 test('createLogger at debug: every level passes through', () => {
@@ -215,9 +221,13 @@ test('createLogger at debug: every level passes through', () => {
   logger.warn('w');
   logger.info('i');
   logger.debug('d');
-  assert.deepEqual(c.error, ['[client] e']);
-  assert.deepEqual(c.warn, ['[client] w']);
-  assert.deepEqual(c.log, ['[client] i', '[client] d']);
+  assert.equal(c.error.length, 1);
+  assert.match(c.error[0], new RegExp(`${TIMESTAMPED_CLIENT_RE.source}e$`));
+  assert.equal(c.warn.length, 1);
+  assert.match(c.warn[0], new RegExp(`${TIMESTAMPED_CLIENT_RE.source}w$`));
+  assert.equal(c.log.length, 2);
+  assert.match(c.log[0], new RegExp(`${TIMESTAMPED_CLIENT_RE.source}i$`));
+  assert.match(c.log[1], new RegExp(`${TIMESTAMPED_CLIENT_RE.source}d$`));
 });
 
 test('createLogger at warn: info and debug filtered', () => {
@@ -227,7 +237,8 @@ test('createLogger at warn: info and debug filtered', () => {
   logger.debug('d');
   logger.warn('w');
   assert.deepEqual(c.log, []);
-  assert.deepEqual(c.warn, ['[client] w']);
+  assert.equal(c.warn.length, 1);
+  assert.match(c.warn[0], new RegExp(`${TIMESTAMPED_CLIENT_RE.source}w$`));
 });
 
 test('createLogger at silent: every level filtered', () => {

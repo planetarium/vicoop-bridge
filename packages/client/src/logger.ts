@@ -9,6 +9,7 @@ const LEVEL_RANK: Record<LogLevel, number> = {
 };
 
 const PREFIX = '[client]';
+const timestamp = (): string => new Date().toISOString();
 export const LOG_LEVEL_ENV = 'VICOOP_CLIENT_LOG_LEVEL';
 
 export interface Logger {
@@ -49,7 +50,7 @@ export function _resetLogLevelWarningsForTests(): void {
 function warnOnce(sink: ConsoleSink, key: string, message: string): void {
   if (warnedKeys.has(key)) return;
   warnedKeys.add(key);
-  sink.warn(PREFIX, message);
+  sink.warn(timestamp(), PREFIX, message);
 }
 
 // JSON.stringify covers \n / \r / control chars and the standard JSON
@@ -155,16 +156,16 @@ export function createLogger(
   return {
     level: resolved,
     error: (...args) => {
-      if (enabled('error')) sink.error(PREFIX, ...args);
+      if (enabled('error')) sink.error(timestamp(), PREFIX, ...args);
     },
     warn: (...args) => {
-      if (enabled('warn')) sink.warn(PREFIX, ...args);
+      if (enabled('warn')) sink.warn(timestamp(), PREFIX, ...args);
     },
     info: (...args) => {
-      if (enabled('info')) sink.log(PREFIX, ...args);
+      if (enabled('info')) sink.log(timestamp(), PREFIX, ...args);
     },
     debug: (...args) => {
-      if (enabled('debug')) sink.log(PREFIX, ...args);
+      if (enabled('debug')) sink.log(timestamp(), PREFIX, ...args);
     },
   };
 }
