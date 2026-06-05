@@ -109,6 +109,13 @@ export type BackendRuntime = 'host' | 'container';
 export interface ClaudeBackendConfig {
   cwd?: string;
   settings?: Record<string, unknown>;
+  /**
+   * Model id for the spawned `claude`, e.g. `claude-opus-4-8`. Folded into
+   * the `--settings` JSON as its `model` field at launch (a per-request
+   * openai-compat `model` still overrides it). Mirrors the `--claude-model`
+   * flag.
+   */
+  model?: string;
   runtime?: BackendRuntime;
   runtime_name?: string;
 }
@@ -232,12 +239,14 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
     if (claudeRaw) {
       const cwd = asString(claudeRaw.cwd);
       const settings = asRecord(claudeRaw.settings);
+      const model = asString(claudeRaw.model);
       const runtime = pickBackendRuntime(claudeRaw.runtime);
       const runtimeName = asString(claudeRaw.runtime_name);
-      if (cwd || settings || runtime || runtimeName) {
+      if (cwd || settings || model || runtime || runtimeName) {
         out.claude = {};
         if (cwd) out.claude.cwd = cwd;
         if (settings) out.claude.settings = settings;
+        if (model) out.claude.model = model;
         if (runtime) out.claude.runtime = runtime;
         if (runtimeName) out.claude.runtime_name = runtimeName;
       }

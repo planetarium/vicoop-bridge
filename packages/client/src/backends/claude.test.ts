@@ -804,6 +804,51 @@ test('injects default sandbox-on --settings when settings option is not provided
   });
 });
 
+test('model option folds into --settings as `model`, keeping the default sandbox', async () => {
+  // `--claude-model` with no explicit settings must NOT wipe the
+  // sandbox-on-by-default guard: the model is merged onto DEFAULT_SETTINGS,
+  // not substituted for it.
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, model: 'claude-opus-4-8' });
+  await backend.handle(assign('hi'), collect().emit, NEVER);
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  const idx = child.args.indexOf('--settings');
+  assert.ok(idx !== -1, 'expected --settings flag');
+  assert.deepEqual(JSON.parse(String(child.args[idx + 1])), {
+    sandbox: { enabled: true, failIfUnavailable: true },
+    model: 'claude-opus-4-8',
+  });
+});
+
+test('model option wins over a `model` already present in operator settings', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    settings: { sandbox: { enabled: false }, model: 'claude-sonnet-4-6' },
+    model: 'claude-opus-4-8',
+  });
+  await backend.handle(assign('hi'), collect().emit, NEVER);
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  const idx = child.args.indexOf('--settings');
+  assert.ok(idx !== -1, 'expected --settings flag');
+  assert.deepEqual(JSON.parse(String(child.args[idx + 1])), {
+    sandbox: { enabled: false },
+    model: 'claude-opus-4-8',
+  });
+});
+
 test('createClaudeBackend throws a named error if settings is not JSON-serializable', () => {
   // Circular reference — JSON.stringify throws TypeError. The wrapped Error
   // must name the option so an operator can find the misconfiguration

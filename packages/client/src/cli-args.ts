@@ -87,6 +87,9 @@ export const daemonFlagsFields = {
   claudeSettingsFile: optional(option('--claude-settings-file', string({ metavar: 'PATH' }), {
     description: message`Path to a JSON file used as Claude \`--settings\`.`,
   })),
+  claudeModel: optional(option('--claude-model', string({ metavar: 'MODEL' }), {
+    description: message`Model id for the spawned Claude, e.g. \`claude-opus-4-8\`. Sets the \`model\` field in Claude \`--settings\`; a per-request openai-compat \`model\` still overrides it. Only valid with \`--backend claude\`; pairing with another backend exits non-zero.`,
+  })),
 
   // Backend-specific (Codex)
   codexSandbox: optional(option('--codex-sandbox', choice([...SANDBOX_MODES]), {
@@ -141,6 +144,7 @@ export interface DaemonArgs {
   runtime?: BackendRuntime;
   runtimeName?: string;
   claudeSettingsFile?: string;
+  claudeModel?: string;
   codexSandbox?: CodexSandboxMode;
   openclawGateway?: string;
   openclawGatewayToken?: string;
@@ -250,6 +254,7 @@ export function mergeClientArgs(
     runtime: flags.runtime ?? activeRuntime,
     runtimeName: pick(flags.runtimeName) || activeRuntimeName || undefined,
     claudeSettingsFile: pick(flags.claudeSettingsFile) || undefined,
+    claudeModel: pick(flags.claudeModel) || backends.claude?.model || undefined,
     codexSandbox:
       flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),
     openclawGateway:
@@ -272,6 +277,7 @@ export function mergeClientArgs(
   // can `if (resolved.cwd)` cleanly instead of having to filter "".
   if (resolved.cwd === '') resolved.cwd = undefined;
   if (resolved.claudeSettingsFile === '') resolved.claudeSettingsFile = undefined;
+  if (resolved.claudeModel === '') resolved.claudeModel = undefined;
   if (resolved.openclawGateway === '') resolved.openclawGateway = undefined;
   if (resolved.openclawGatewayToken === '') resolved.openclawGatewayToken = undefined;
   if (resolved.openclawAgent === '') resolved.openclawAgent = undefined;
@@ -304,6 +310,11 @@ export function mergeClientArgs(
   if (pick(flags.cwd) && !CWD_BACKENDS.has(backend)) {
     errors.push(
       `--cwd is not supported by --backend ${backend}; only claude / codex spawn a backend process with a working directory`,
+    );
+  }
+  if (pick(flags.claudeModel) && backend !== 'claude') {
+    errors.push(
+      `--claude-model is not supported by --backend ${backend}; only the claude backend takes a model id`,
     );
   }
 

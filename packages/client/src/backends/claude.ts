@@ -141,6 +141,15 @@ export interface ClaudeBackendOptions {
   // thrown Error from `createClaudeBackend(...)` so misconfiguration is
   // visible at startup rather than as a corrupted argv on the first task.
   settings?: Record<string, unknown>;
+  // Model id for the spawned `claude` (e.g. `claude-opus-4-8`), exposed via
+  // the `--claude-model` flag. Merged into the resolved `--settings` JSON as
+  // its `model` field so it survives alongside the default sandbox guard and
+  // any operator-supplied `settings`. A per-request openai-compat envelope
+  // `model` still wins: that path adds an explicit `--model <id>` argv, which
+  // claude prioritises over the settings.json `model` field. When unset, the
+  // model falls back to claude's own resolution (project/user settings.json,
+  // ANTHROPIC_MODEL, built-in default).
+  model?: string;
   /**
    * Test seam: invoked once per task with the caller-tools MCP server
    * handle immediately after the bridge stands one up (when the
@@ -1100,7 +1109,14 @@ export function createClaudeBackend(
   const DEFAULT_SETTINGS: Record<string, unknown> = {
     sandbox: { enabled: true, failIfUnavailable: true },
   };
-  const resolvedSettings = opts.settings ?? DEFAULT_SETTINGS;
+  // Fold `--claude-model` into the resolved settings as its `model` field.
+  // Merging here (rather than at the cli.ts layer) means an operator who
+  // passes only `--claude-model` still keeps the DEFAULT_SETTINGS sandbox
+  // guard above — a naive `{ model }` at the call site would have replaced
+  // it. The flag wins over a `model` already present in operator settings.
+  const resolvedSettings = opts.model
+    ? { ...(opts.settings ?? DEFAULT_SETTINGS), model: opts.model }
+    : (opts.settings ?? DEFAULT_SETTINGS);
   // Serialize once at backend construction so per-task spawn stays cheap and
   // a malformed settings object (circular reference, BigInt value, etc.)
   // fails loud at setup time rather than producing a corrupted argv on the
