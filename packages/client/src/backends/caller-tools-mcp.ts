@@ -197,17 +197,22 @@ export async function startCallerToolsMcpServer(
     })),
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
+  server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const name = req.params.name;
     const argsRaw = req.params.arguments;
-    // MCP's wire-level call id (request id from the JSON-RPC envelope) is
-    // the most stable handle for round-tripping back to the caller. Fall
-    // back to a fresh UUID only if `requestId` is missing — which would
-    // be unusual for a real client but keeps the path total.
-    const callId =
-      typeof extra?.requestId === 'string' || typeof extra?.requestId === 'number'
-        ? String(extra.requestId)
-        : `call_${randomUUID()}`;
+    // Always mint a fresh UUID for the tool_call id. We must NOT reuse the
+    // MCP JSON-RPC request id (`extra.requestId`): it is only monotonic
+    // within a single MCP session, and the bridge stands up a brand-new
+    // caller-tools MCP server (and claude process) per A2A turn. So the
+    // request id resets every turn — `2` for the first tools/call of each
+    // turn, `3,4,5…` for further calls in the same turn. The OpenAI loop
+    // then replays the accumulated history, and those non-unique ids
+    // collide across turns: every single-call turn carries `tool_call_id`
+    // "2", breaking the call↔result pairing the model relies on (and the
+    // "don't repeat a call whose tool_call_id already appears" guard). The
+    // id only needs to be unique and echoed back verbatim on the next
+    // turn's chat_history — a UUID satisfies both.
+    const callId = `call_${randomUUID()}`;
     const ack = await performInvoke({
       callId,
       toolName: name,
