@@ -141,6 +141,15 @@ export interface ClaudeBackendOptions {
   // thrown Error from `createClaudeBackend(...)` so misconfiguration is
   // visible at startup rather than as a corrupted argv on the first task.
   settings?: Record<string, unknown>;
+  // Model id for the spawned `claude` (e.g. `claude-opus-4-8`), exposed via
+  // the `--claude-model` flag. Merged into the resolved `--settings` JSON as
+  // its `model` field so it survives alongside the default sandbox guard and
+  // any operator-supplied `settings`. A per-request openai-compat envelope
+  // `model` still wins: that path adds an explicit `--model <id>` argv, which
+  // claude prioritises over the settings.json `model` field. When unset, the
+  // model falls back to claude's own resolution (project/user settings.json,
+  // ANTHROPIC_MODEL, built-in default).
+  model?: string;
   /**
    * Test seam: invoked once per task with the caller-tools MCP server
    * handle immediately after the bridge stands one up (when the
@@ -1100,7 +1109,14 @@ export function createClaudeBackend(
   const DEFAULT_SETTINGS: Record<string, unknown> = {
     sandbox: { enabled: true, failIfUnavailable: true },
   };
-  const resolvedSettings = opts.settings ?? DEFAULT_SETTINGS;
+  // Fold `--claude-model` into the resolved settings as its `model` field.
+  // Merging here (rather than at the cli.ts layer) means an operator who
+  // passes only `--claude-model` still keeps the DEFAULT_SETTINGS sandbox
+  // guard above — a naive `{ model }` at the call site would have replaced
+  // it. The flag wins over a `model` already present in operator settings.
+  const resolvedSettings = opts.model
+    ? { ...(opts.settings ?? DEFAULT_SETTINGS), model: opts.model }
+    : (opts.settings ?? DEFAULT_SETTINGS);
   // Serialize once at backend construction so per-task spawn stays cheap and
   // a malformed settings object (circular reference, BigInt value, etc.)
   // fails loud at setup time rather than producing a corrupted argv on the
@@ -1187,7 +1203,17 @@ export function createClaudeBackend(
   // populated before any task lands in production. Tests that want to
   // exercise the gate populate the cache via `resolveCapabilities`
   // explicitly.
-  let cachedProbedModel: string | null | undefined = undefined;
+  //
+  // A `--claude-model` pin seeds the cache directly: the pin IS the
+  // advertised model (every spawn loads it via settings.model), so it must
+  // be what the `envelope.model` gate compares against. Without this seed
+  // the probe — which deliberately runs WITHOUT our `--settings` (see
+  // `CLAUDE_PROBE_ARGS`) — would report claude's *unpinned* default, the
+  // gateway would route by that default, and the matching `--model <default>`
+  // argv would then override the pin on the spawn (CLI `--model` beats
+  // settings.model). Seeding here holds the pin even if `resolveCapabilities`
+  // never runs.
+  let cachedProbedModel: string | null | undefined = opts.model ?? undefined;
 
   return {
     name: 'claude',
@@ -1206,6 +1232,13 @@ export function createClaudeBackend(
     // `completion_tokens_details.reasoning_tokens` in `usage`, and per
     // spec "Absence means 'unspecified,' not 'false.'"
     async resolveCapabilities() {
+      // A pinned model is authoritative — there's nothing to discover, so
+      // skip the probe spawn entirely (it can't see our `--settings` anyway)
+      // and advertise the pin, which the construction-time seed already put
+      // in `cachedProbedModel`.
+      if (opts.model) {
+        return { openaiCompatModels: [{ id: opts.model, default: true }] };
+      }
       if (probeTimeoutMs <= 0) {
         cachedProbedModel = null;
         return {};

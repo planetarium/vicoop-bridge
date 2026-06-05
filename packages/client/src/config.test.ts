@@ -164,7 +164,11 @@ test('writeConfig writes JSON at mode 0600 and readConfig round-trips', (t) => {
     backend: 'claude',
     card: '/path/card.json',
     backends: {
-      claude: { cwd: '/srv/work', settings: { sandbox: { enabled: true } } },
+      claude: {
+        cwd: '/srv/work',
+        settings: { sandbox: { enabled: true } },
+        model: 'claude-opus-4-8',
+      },
       codex: { cwd: '/srv/work', sandbox_mode: 'workspace-write', runtime_name: 'work' },
       openclaw: {
         gateway_url: 'ws://127.0.0.1:18789',
@@ -182,7 +186,11 @@ test('writeConfig writes JSON at mode 0600 and readConfig round-trips', (t) => {
     backend: 'claude',
     card: '/path/card.json',
     backends: {
-      claude: { cwd: '/srv/work', settings: { sandbox: { enabled: true } } },
+      claude: {
+        cwd: '/srv/work',
+        settings: { sandbox: { enabled: true } },
+        model: 'claude-opus-4-8',
+      },
       codex: { cwd: '/srv/work', sandbox_mode: 'workspace-write', runtime_name: 'work' },
       openclaw: {
         gateway_url: 'ws://127.0.0.1:18789',

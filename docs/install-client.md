@@ -611,12 +611,13 @@ different repository than the one `vicoop-client` itself runs in:
 ```sh
 vicoop-client start \
   --backend claude \
-  --cwd "$HOME/vicoop-bridge"
+  --cwd "$HOME/vicoop-bridge" \
+  --claude-model claude-opus-4-8
 ```
 
-Both knobs can also live in the canonical `config.json` (resolved per Step
+These knobs can also live in the canonical `config.json` (resolved per Step
 4 — `~/.vicoop/config.json` by default) under `backends.claude`
-(`cwd`, `settings`) so the foreground command shrinks to just
+(`cwd`, `settings`, `model`) so the foreground command shrinks to just
 `vicoop-client start`; the flag wins over config, mirroring
 the daemon-level precedence (Step 6 intro).
 
@@ -624,6 +625,15 @@ the daemon-level precedence (Step 6 intro).
 |---|---|
 | `--cwd` | `cwd` |
 | `--claude-settings-file` | `settings` (JSON object) |
+| `--claude-model` | `model` |
+
+> **Picking a model.** `--claude-model <id>` (e.g. `claude-opus-4-8`) is
+> folded into Claude `--settings` as its `model` field, so it composes with
+> the sandbox default and any `--claude-settings-file` you supply rather than
+> replacing them. Leave it unset to let `claude` resolve its own model
+> (project / user `settings.json`, `ANTHROPIC_MODEL`, built-in default). A
+> per-request openai-compat `model` still overrides it. The flag is
+> claude-only — pairing it with another `--backend` exits non-zero.
 
 > **Sandbox-on by default.** When neither `--claude-settings-file` nor
 > `backends.claude.settings` is set, the backend forwards

@@ -149,6 +149,52 @@ test('--runtime-name with a non-runtime-capable backend is a hard error', () => 
   );
 });
 
+test('--claude-model resolves from the flag for the claude backend', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude', claudeModel: 'claude-opus-4-8' },
+    {},
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.claudeModel, 'claude-opus-4-8');
+});
+
+test('--claude-model flag beats backends.claude.model from config', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude', claudeModel: 'claude-opus-4-8' },
+    { backends: { claude: { model: 'claude-sonnet-4-6' } } },
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.claudeModel, 'claude-opus-4-8');
+});
+
+test('backends.claude.model fills in when the flag is absent', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude' },
+    { backends: { claude: { model: 'claude-sonnet-4-6' } } },
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.claudeModel, 'claude-sonnet-4-6');
+});
+
+test('--claude-model with a non-claude backend is a hard error', () => {
+  // Only the claude backend takes an operator-selectable model id; codex
+  // reads its model from config.toml and openclaw from the remote gateway,
+  // so pairing the flag with either is almost always an operator mistake.
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'codex', claudeModel: 'claude-opus-4-8' },
+    {},
+  );
+  assert.equal(r.ok, false);
+  if (r.ok) return;
+  assert.ok(
+    r.errors.some((e) => e.includes('--claude-model') && e.includes('codex')),
+    `expected error mentioning --claude-model and codex, got: ${r.errors.join(' | ')}`,
+  );
+});
+
 test('parseFlags picks up known flags', () => {
   const r = parseFlags([
     '--server', 'wss://x',
@@ -158,12 +204,14 @@ test('parseFlags picks up known flags', () => {
     '--card', '/c.json',
     '--config', '/etc/vicoop/config.json',
     '--runtime-name', 'work',
+    '--claude-model', 'claude-opus-4-8',
   ]);
   assert.equal(r.ok, true);
   if (!r.ok) return;
   assert.equal(r.flags.server, 'wss://x');
   assert.equal(r.flags.token, 't');
   assert.equal(r.flags.runtimeName, 'work');
+  assert.equal(r.flags.claudeModel, 'claude-opus-4-8');
   assert.equal(r.flags.agentId, 'a');
   assert.equal(r.flags.backend, 'claude');
   assert.equal(r.flags.card, '/c.json');
