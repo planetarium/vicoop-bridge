@@ -1,5 +1,32 @@
 # @vicoop-bridge/client
 
+## 0.29.0
+
+### Minor Changes
+
+- 88f38cc: Add a `--claude-model` flag (and matching `backends.claude.model` config
+  key) to pin the model for the spawned `claude`, e.g.
+  `vicoop-client start --backend claude --claude-model claude-opus-4-8`. The
+  value is folded into Claude `--settings` as its `model` field, so the
+  default sandbox guard and any operator-supplied settings are preserved. A
+  per-request openai-compat `model` still overrides it (Claude is treated as a
+  multi-model backend); a value the install doesn't advertise is dropped and
+  falls back to the pin rather than erroring. When pinned, the agent advertises
+  the pinned id (and skips the startup model probe) so the openai-compat
+  model-match gate can't override the pin with claude's unpinned default.
+  Pairing the flag with a non-claude backend exits non-zero.
+
+### Patch Changes
+
+- bb9e414: claude backend: mint a conversation-unique `call_<uuid>` for each
+  caller-tool invocation instead of reusing the MCP JSON-RPC request id.
+  The request id only counts within a single MCP session, and the bridge
+  stands up a fresh MCP server per A2A turn, so it reset every turn —
+  every single-call turn emitted `tool_call_id` "2". Once the OpenAI loop
+  replayed the accumulated history those duplicate ids collided, breaking
+  the call↔result pairing and making the model restate its whole plan
+  before each tool call.
+
 ## 0.28.1
 
 ### Patch Changes
