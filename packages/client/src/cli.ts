@@ -32,7 +32,7 @@ import {
 import isInsideContainer from 'is-inside-container';
 import { clientVersion } from './version.js';
 import { runUpgrade } from './upgrade.js';
-import { BACKENDS_MANIFEST } from './backends-manifest.js';
+import { BACKEND_COMPAT } from './backends-manifest.js';
 import { authLoginCmd, loginCmd, runAuthLogin, runLogin } from './login.js';
 import { authLogoutCmd, logoutCmd, runAuthLogout, runLogout } from './logout.js';
 import { setupCmd, runAgentRegister, runSetup } from './setup.js';
@@ -642,7 +642,7 @@ async function main(): Promise<void> {
       const payload = {
         version: clientVersion,
         ...(imageVersion ? { imageVersion } : {}),
-        backends: BACKENDS_MANIFEST,
+        backends: BACKEND_COMPAT,
       };
       process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
       process.exit(0);
