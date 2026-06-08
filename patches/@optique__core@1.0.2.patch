@@ -1,0 +1,52 @@
+diff --git a/dist/usage.cjs b/dist/usage.cjs
+index 1ccca6be76ddebf844e6e02da15a8b39593f8206..a28c16ad86841e7ef59679a703a142cf411ad947 100644
+--- a/dist/usage.cjs
++++ b/dist/usage.cjs
+@@ -181,7 +181,20 @@ function extractArgumentMetavars(usage) {
+ */
+ function formatUsage(programName, usage, options = {}) {
+ 	require_validate.validateProgramName(programName);
+-	usage = normalizeUsage(filterUsageForDisplay(usage));
++	// PATCH(vicoop-bridge): preserve leading command-path terms even when they
++	// are `hidden: 'usage'`. Those terms identify the command whose help page
++	// this is (e.g. `auth login` for `vicoop-client auth login --help`), so
++	// they must stay in the synopsis. Upstream `filterUsageForDisplay` strips
++	// every hidden command unconditionally, which dropped the umbrella prefix
++	// from each subcommand's own `--help`. The top-level synopsis is unaffected
++	// because it renders via the `expandCommands` path below (which hides these
++	// commands at its own branch check), never this flat fallback.
++	let leadingCommandCount = 0;
++	while (leadingCommandCount < usage.length && usage[leadingCommandCount].type === "command") leadingCommandCount++;
++	usage = [
++		...usage.slice(0, leadingCommandCount),
++		...normalizeUsage(filterUsageForDisplay(usage.slice(leadingCommandCount)))
++	];
+ 	if (options.expandCommands) {
+ 		const lastTerm = usage.at(-1);
+ 		if (usage.length > 0 && usage.slice(0, -1).every((t) => t.type === "command") && lastTerm.type === "exclusive" && lastTerm.terms.every((t) => t.length > 0 && (t[0].type === "command" || t[0].type === "option" || t[0].type === "argument" || t[0].type === "optional" && t[0].terms.length === 1 && (t[0].terms[0].type === "command" || t[0].terms[0].type === "option" || t[0].terms[0].type === "argument")))) {
+diff --git a/dist/usage.js b/dist/usage.js
+index e55cf01234e239290dd7c036dfda091d0b375cea..830938ac06e6f5d2692ca6546b1d615d1fbcfb53 100644
+--- a/dist/usage.js
++++ b/dist/usage.js
+@@ -181,7 +181,20 @@ function extractArgumentMetavars(usage) {
+ */
+ function formatUsage(programName, usage, options = {}) {
+ 	validateProgramName(programName);
+-	usage = normalizeUsage(filterUsageForDisplay(usage));
++	// PATCH(vicoop-bridge): preserve leading command-path terms even when they
++	// are `hidden: 'usage'`. Those terms identify the command whose help page
++	// this is (e.g. `auth login` for `vicoop-client auth login --help`), so
++	// they must stay in the synopsis. Upstream `filterUsageForDisplay` strips
++	// every hidden command unconditionally, which dropped the umbrella prefix
++	// from each subcommand's own `--help`. The top-level synopsis is unaffected
++	// because it renders via the `expandCommands` path below (which hides these
++	// commands at its own branch check), never this flat fallback.
++	let leadingCommandCount = 0;
++	while (leadingCommandCount < usage.length && usage[leadingCommandCount].type === "command") leadingCommandCount++;
++	usage = [
++		...usage.slice(0, leadingCommandCount),
++		...normalizeUsage(filterUsageForDisplay(usage.slice(leadingCommandCount)))
++	];
+ 	if (options.expandCommands) {
+ 		const lastTerm = usage.at(-1);
+ 		if (usage.length > 0 && usage.slice(0, -1).every((t) => t.type === "command") && lastTerm.type === "exclusive" && lastTerm.terms.every((t) => t.length > 0 && (t[0].type === "command" || t[0].type === "option" || t[0].type === "argument" || t[0].type === "optional" && t[0].terms.length === 1 && (t[0].terms[0].type === "command" || t[0].terms[0].type === "option" || t[0].terms[0].type === "argument")))) {
