@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.31.0
+
+### Minor Changes
+
+- d2d4be4: Add short aliases for the two most-typed daemon flags: `-c` for `--config` and `-d` for `--detach` (e.g. `vicoop-client start -d -c ./config.json`). The detached child is now kept in the foreground daemon path by the `VICOOP_DETACHED` env guard rather than by argv stripping, so the re-exec stays correct even for optique's bundled short flags (`-dc value` parses as `-d -c value`).
+
 ## 0.30.1
 
 ### Patch Changes
