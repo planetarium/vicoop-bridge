@@ -1,5 +1,32 @@
 # @vicoop-bridge/client
 
+## 0.29.2
+
+### Patch Changes
+
+- bde860d: fix(vicoop-codex): send a `prompt_cache_key` so prompt caching engages across
+  turns. The `vicoop-codex` backend now attaches a stable key on each
+  `/v1/chat/completions` request, pinning a conversation's successive turns to one
+  ChatGPT-codex-backend cache shard so the upstream prompt cache actually hits
+  instead of scattering — previously a genuine multi-turn A2A conversation
+  recorded `cached_tokens: 0` on every follow-up turn. The key is resolved as: a
+  caller-supplied key off the inbound envelope (read from BOTH the OpenAI wire
+  name `prompt_cache_key` and the camelCase `promptCacheKey` that the Vercel AI
+  SDK / opencode emit, normalised to snake_case for the binary), else the
+  conversation's `task.contextId`. Requires a `vicoop-codex` build that forwards
+  `prompt_cache_key` upstream (vicoop-codex-cli#12, shipped in 0.3.2); older
+  builds ignore the field harmlessly.
+- bde860d: fix(vicoop-codex): backfill zero usage when `serve` drops it, instead of
+  emitting a usage-less envelope. The openai-compat/v1 extension REQUIRES
+  `chat_completion.usage` with numeric prompt/completion/total tokens; when
+  `vicoop-codex serve` intermittently omits usage on a turn (the #317 failure
+  mode despite forced `stream_options.include_usage`), the backend previously
+  emitted the terminal envelope without usage and the gateway hard-rejected the
+  whole response ("missing required usage"), so the caller lost an otherwise-valid
+  answer. The backend now backfills a zero-filled usage block on that path,
+  keeping the turn spec-compliant and delivered (the existing warning still logs
+  the under-billing for diagnosis).
+
 ## 0.29.1
 
 ### Patch Changes
