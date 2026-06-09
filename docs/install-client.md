@@ -99,10 +99,13 @@ the download so first launch isn't Gatekeeper-blocked. Developer ID
 signing + notarization are planned (issue #188 follow-up); until then this
 keeps `curl | sh` a true one-liner.
 
-> The installer no longer generates an always-on service unit. The design
-> for unattended operation (systemd, launchd, etc.) is still in flux —
-> issue #186 tracks the rework. For now the supported entrypoint is the
-> foreground run in Step 6.
+> The installer no longer generates an always-on service unit. For
+> background operation without a service manager, `start --detach` (Step
+> 6b) backgrounds the daemon under a pidfile managed by `stop` / `status`.
+> A reboot/crash-persistent service tier (systemd `--user` / launchd via a
+> `service install` subcommand) is still being designed — issue #190 tracks
+> it. Until then `--detach` is the no-supervisor-available option and the
+> foreground run in Step 6 is the supervised one.
 
 ## Step 1b — Add `vicoop-client` to PATH
 
@@ -550,6 +553,41 @@ After that:
   restricted to that key rather than being publicly callable.
 - `POST $BRIDGE_URL/agents/$AGENT_ID` with a JSON-RPC `message/send` payload
   reaches your backend and the reply is returned inline.
+
+## Step 6b — Run unattended (`--detach`)
+
+Once the foreground run is healthy, background it with `--detach`:
+
+```sh
+vicoop-client start --detach --backend openclaw
+vicoop-client status        # running (pid …, up …, logs …)
+vicoop-client stop          # SIGTERM → grace → SIGKILL
+```
+
+`--detach` re-execs the daemon as a new **session / process-group leader**
+and returns immediately. Unlike `nohup vicoop-client … &` — which only
+ignores SIGHUP and stays in the launching shell's process group — the
+detached daemon survives the session/pgrp teardown that agent-driven exec
+sandboxes (e.g. Codex `exec_command`) send when a shell turn ends. It writes
+a pidfile (`vicoop.pid`) and redirects stdout+stderr to a log
+(`vicoop.log`, override with `--log-file`) under the canonical home dir; both
+`stop` and `status` read that pidfile.
+
+- `status` exit codes: **0** running, **3** stopped (no pidfile), **1** stale
+  (pidfile present but no live `vicoop-client` daemon behind it — `stop`
+  cleans it up). `stop` / `status` refuse to act on a recycled PID: they
+  confirm the live process still looks like a `vicoop-client` daemon before
+  signaling it.
+- A second `start --detach` while one is already running is rejected; `stop`
+  first.
+
+> **Scope caveat.** `--detach` survives **session / process-group** reaping,
+> which is what the agent-sandbox case needs. It does **not** survive
+> **cgroup / container** teardown (an environment that kills the whole cgroup
+> at turn end) or a reboot — for those you need an out-of-cgroup supervisor
+> (systemd `--user` / launchd). That persistence tier is tracked in issue
+> #190. `--detach` is POSIX-only; on Windows run `vicoop-client start` in the
+> foreground under a Windows service manager (e.g. NSSM).
 
 ### OpenClaw-specific knobs
 

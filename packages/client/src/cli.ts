@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync } from 'node:fs';
+import { spawn as spawnProcess, type ChildProcess } from 'node:child_process';
 import { AgentCard } from '@vicoop-bridge/protocol';
 import { resolveBundledCard } from './bundled-cards.js';
 import { group, longestMatch, object } from '@optique/core/constructs';
@@ -59,6 +60,15 @@ import {
   type DaemonArgs as Args,
 } from './cli-args.js';
 import { createLogger, type Logger } from './logger.js';
+import {
+  defaultLogPath,
+  formatUptime,
+  inspectDaemon,
+  pidFilePath,
+  removePidFile,
+  stopDaemon,
+  writePidRecord,
+} from './daemon-control.js';
 
 const KNOWN_CODEX_SANDBOX_MODES = new Set([
   'read-only',
@@ -129,11 +139,49 @@ const startCmd = command(
   'start',
   object({
     action: constant('daemon' as const),
+    // Launch-control flags. Kept separate from `daemonFlagsFields` (which is
+    // the runtime-config surface threaded into the backend) because
+    // `--detach` / `--log-file` only steer *how* the daemon is launched, not
+    // what it does once running — see `startDetached`.
+    detach: withDefault(flag('--detach', {
+      description: message`Run the daemon in a detached background session (new session/process-group leader) and return immediately. Survives the session/pgrp reaping that kills \`nohup … &\` in agent-driven exec sandboxes (#186). Writes a pidfile so \`stop\` / \`status\` can manage it. POSIX only. Caveat: survives session/pgrp teardown but NOT cgroup/container teardown — for reboot/crash persistence use a real service manager (systemd --user / launchd).`,
+    }), false),
+    logFile: optional(option('--log-file', string({ metavar: 'PATH' }), {
+      description: message`With \`--detach\`, where to redirect the daemon's stdout+stderr. Defaults to \`vicoop.log\` under the canonical home dir. Ignored without \`--detach\`.`,
+    })),
     ...daemonFlagsFields,
   }),
   {
     brief: message`Start the bridge client daemon.`,
-    description: message`Connects to the bridge server, advertises the chosen backend's agent card, and runs until interrupted. With \`config.json\` populated by \`agent register\`, this needs no flags. Precedence over the canonical \`config.json\` is the same as documented in \`docs/install-client.md\` (CLI flag > \`--config\` overlay > canonical config > built-in default).`,
+    description: message`Connects to the bridge server, advertises the chosen backend's agent card, and runs until interrupted. With \`config.json\` populated by \`agent register\`, this needs no flags. Precedence over the canonical \`config.json\` is the same as documented in \`docs/install-client.md\` (CLI flag > \`--config\` overlay > canonical config > built-in default). Pass \`--detach\` to background it under a pidfile managed by \`stop\` / \`status\`.`,
+    hidden: 'usage',
+  },
+);
+
+// `vicoop-client stop` / `status`: pidfile-driven lifecycle for a daemon
+// started with `start --detach`. Both refuse to act on a stale / recycled
+// PID — `inspectDaemon` confirms the live process still looks like a
+// vicoop-client daemon before stop signals it or status reports it running.
+const stopCmd = command(
+  'stop',
+  object({
+    action: constant('stop' as const),
+  }),
+  {
+    brief: message`Stop a detached daemon (SIGTERM → grace → SIGKILL).`,
+    description: message`Reads the pidfile written by \`start --detach\`, sends SIGTERM, waits a grace period, then escalates to SIGKILL if still alive. A stale pidfile (process gone, or a recycled PID that no longer looks like vicoop-client) is cleaned up without signaling anything.`,
+    hidden: 'usage',
+  },
+);
+
+const statusCmd = command(
+  'status',
+  object({
+    action: constant('status' as const),
+  }),
+  {
+    brief: message`Report whether a detached daemon is running.`,
+    description: message`Inspects the \`start --detach\` pidfile. Exit code: 0 running, 3 stopped (no pidfile), 1 stale (pidfile present but not a live vicoop-client daemon).`,
     hidden: 'usage',
   },
 );
@@ -170,7 +218,7 @@ const legacyAdminCmds = longestMatch(
 // gives optique's help renderer section headers so the top-level help
 // scans as an operator workflow rather than a 17-line wall.
 const cli = longestMatch(
-  group('Run the daemon', startCmd),
+  group('Run the daemon', longestMatch(startCmd, stopCmd, statusCmd)),
   group('Identity', authCmd),
   group('Agents', agentCmd),
   group('Runtime containers', containerCmd),
@@ -543,6 +591,13 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   // signal (e.g. impatient operator pressing ctrl-c twice) drops to
   // an immediate exit so the daemon can't get pinned by a wedged
   // docker socket.
+  // When we are the detached child (spawned by `start --detach`, marked via
+  // VICOOP_DETACHED), we own the pidfile the parent wrote on our behalf.
+  // Remove it on a graceful exit so a daemon that's asked to stop — whether
+  // by `vicoop-client stop` or a direct SIGTERM from a supervisor — doesn't
+  // leave a corpse pidfile behind. A crash exit still leaves a stale file,
+  // but `stop`/`status` detect and clean that.
+  const ownsPidFile = process.env.VICOOP_DETACHED === '1';
   let shuttingDown = false;
   const onSignal = (signal: NodeJS.Signals) => {
     if (shuttingDown) {
@@ -553,6 +608,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     void (async () => {
       logger.info(`shutting down (${signal})`);
       client.stop();
+      if (ownsPidFile) removePidFile();
       if (backendShutdown) {
         try {
           await runWithShutdownTimeout(backendShutdown, logger);
@@ -565,6 +621,188 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   };
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
+}
+
+// Re-exec ourselves with the daemon argv minus the launch-control flags, so
+// the child runs the foreground daemon path inside its own fresh session.
+// process.argv is `[execPath, (scriptPath?), ...args]` — `slice(1)` keeps the
+// script path for node-from-source and is empty for the Bun single-file build
+// (where execPath IS the binary), so the same reconstruction works for both.
+function buildDetachChildArgv(): string[] {
+  const out: string[] = [];
+  const rest = process.argv.slice(1);
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '--detach') continue;
+    if (a === '--log-file') {
+      i++; // drop the flag and its value; the child logs to the inherited fd
+      continue;
+    }
+    if (a.startsWith('--log-file=')) continue;
+    out.push(a);
+  }
+  return out;
+}
+
+// Race the spawned child's early exit against a short grace timer. A daemon
+// that dies instantly on bad config / missing credentials should surface as a
+// failed launch (with a pointer to the log) rather than a cheerful "started"
+// message and a pidfile pointing at a corpse. Resolves `true` if the child is
+// still alive when the grace window elapses, `false` if it exited/errored
+// first. The pending timer keeps the event loop alive across the window even
+// though the child itself is unref'd.
+function childSurvivesGrace(child: ChildProcess, ms: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(v);
+    };
+    const timer = setTimeout(() => done(true), ms);
+    child.once('exit', () => done(false));
+    child.once('error', () => done(false));
+  });
+}
+
+const DETACH_GRACE_MS = 600;
+
+// `start --detach`: spawn a detached copy of ourselves, write the pidfile from
+// the parent (we already hold the child pid — no read-before-write race), and
+// exit 0 once the child has survived the grace window. Never returns.
+async function startDetached(
+  parsed: Extract<CliArgs, { action: 'daemon' }>,
+): Promise<never> {
+  if (process.platform === 'win32') {
+    console.error(
+      'start --detach is not supported on Windows. Run `vicoop-client start` ' +
+        'in the foreground under a Windows service manager (e.g. NSSM) instead.',
+    );
+    process.exit(1);
+  }
+
+  const path = pidFilePath();
+  const existing = inspectDaemon(path);
+  if (existing.status === 'running') {
+    console.error(
+      `a detached daemon is already running (pid ${existing.record.pid}); ` +
+        'run `vicoop-client stop` first, or `vicoop-client status` to inspect it.',
+    );
+    process.exit(1);
+  }
+  if (existing.status === 'stale') {
+    // A leftover pidfile from a crashed/killed daemon. Clear it so the fresh
+    // record we're about to write isn't conflated with the corpse.
+    removePidFile(path);
+  }
+
+  const logPath = parsed.logFile?.trim() || defaultLogPath();
+  let logFd: number;
+  try {
+    logFd = openSync(logPath, 'a', 0o600);
+  } catch (e) {
+    console.error(`cannot open --log-file ${logPath}: ${(e as Error).message}`);
+    process.exit(1);
+  }
+
+  const childArgv = buildDetachChildArgv();
+  const child = spawnProcess(process.execPath, childArgv, {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+    // VICOOP_DETACHED tells the child it owns the pidfile (cleanup on exit).
+    env: { ...process.env, VICOOP_DETACHED: '1' },
+  });
+  // The child inherited a dup of the log fd; the parent doesn't need it.
+  try {
+    closeSync(logFd);
+  } catch {
+    /* ignore */
+  }
+
+  if (typeof child.pid !== 'number') {
+    console.error('failed to spawn the detached daemon (no pid).');
+    process.exit(1);
+  }
+  // Detach from the parent's reference-counted event loop so our own exit
+  // below doesn't wait on the child.
+  child.unref();
+
+  writePidRecord(
+    {
+      pid: child.pid,
+      startedAt: Date.now(),
+      argv: [process.execPath, ...childArgv],
+      logPath,
+      version: clientVersion,
+    },
+    path,
+  );
+
+  const survived = await childSurvivesGrace(child, DETACH_GRACE_MS);
+  if (!survived) {
+    removePidFile(path);
+    console.error(
+      `the daemon exited immediately after launch; see ${logPath} for the cause.`,
+    );
+    process.exit(1);
+  }
+
+  console.log(
+    `vicoop-client daemon started (pid ${child.pid}, logs ${logPath}).`,
+  );
+  console.log(
+    'Manage it with `vicoop-client status` / `vicoop-client stop`.',
+  );
+  process.exit(0);
+}
+
+async function runStop(): Promise<number> {
+  const r = await stopDaemon();
+  switch (r.outcome) {
+    case 'not-running':
+      console.log('no detached daemon is running.');
+      return 0;
+    case 'already-gone':
+      console.log(
+        `daemon (pid ${r.pid}) was already gone; cleaned up the stale pidfile.`,
+      );
+      return 0;
+    case 'stopped':
+      console.log(`stopped daemon (pid ${r.pid}).`);
+      return 0;
+    case 'killed':
+      console.log(
+        `daemon (pid ${r.pid}) ignored SIGTERM within the grace period; sent SIGKILL.`,
+      );
+      return 0;
+  }
+}
+
+// Exit codes follow the LSB `status` convention: 0 running, 3 stopped. Stale
+// (pidfile present but not a live daemon) gets a distinct 1 so a supervisor /
+// script can tell "needs cleanup" apart from "cleanly stopped".
+function runStatus(): number {
+  const state = inspectDaemon();
+  if (state.status === 'stopped') {
+    console.log('stopped (no pidfile).');
+    return 3;
+  }
+  if (state.status === 'stale') {
+    console.log(
+      `stale: pidfile points at pid ${state.record.pid}, which is not a ` +
+        'running vicoop-client daemon. Run `vicoop-client stop` to clean up.',
+    );
+    return 1;
+  }
+  const { record } = state;
+  const uptime = record.startedAt
+    ? formatUptime(Date.now() - record.startedAt)
+    : 'unknown';
+  console.log(
+    `running (pid ${record.pid}, up ${uptime}, logs ${record.logPath || 'n/a'}).`,
+  );
+  return 0;
 }
 
 async function runUpgradeCmd(args: Extract<CliArgs, { action: 'upgrade' }>): Promise<number> {
@@ -700,12 +938,23 @@ async function main(): Promise<void> {
       process.exit(await runContainerRemoveCli(parsed));
       break;
     case 'daemon':
-      // Long-running. Do not exit — client.start() keeps the event loop
-      // alive and signal handlers will call process.exit on shutdown.
-      // We await runDaemon's setup phase (which now boots a runtime
-      // container in container-mode) so startup errors surface through
-      // main's catch instead of unhandled rejections.
-      await runDaemon(parsed);
+      // `--detach` re-execs a backgrounded copy and exits the foreground
+      // process; the plain path runs the long-lived daemon in place. Both
+      // are awaited so launch errors surface through main's catch instead
+      // of as unhandled rejections.
+      if (parsed.detach) {
+        await startDetached(parsed);
+      } else {
+        // Long-running. Do not exit — client.start() keeps the event loop
+        // alive and signal handlers will call process.exit on shutdown.
+        await runDaemon(parsed);
+      }
+      break;
+    case 'stop':
+      process.exit(await runStop());
+      break;
+    case 'status':
+      process.exit(runStatus());
       break;
   }
 }
