@@ -7,9 +7,12 @@ import { join } from 'node:path';
 import {
   type LivenessProbe,
   type PidRecord,
+  claimPidFile,
   formatUptime,
   inspectDaemon,
   processAlive,
+  processIsOurs,
+  processStartId,
   readPidRecord,
   removePidFile,
   stopDaemon,
@@ -26,6 +29,7 @@ const sampleRecord: PidRecord = {
   argv: ['/usr/bin/node', '/opt/vicoop/cli.js', 'start', '--backend', 'claude'],
   logPath: '/home/op/.vicoop/vicoop.log',
   version: '0.29.0',
+  procStartId: '998877',
 };
 
 // A probe that reports everything alive + ours, for "running" assertions.
@@ -69,6 +73,7 @@ test('readPidRecord defaults best-effort fields when partial', () => {
       argv: [],
       logPath: '',
       version: '',
+      procStartId: '',
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -266,6 +271,81 @@ test('stopDaemon: SIGTERM throwing (raced exit) is treated as already-gone', asy
     });
     assert.equal(r.outcome, 'already-gone');
     assert.equal(readPidRecord(path), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('processStartId is stable + non-empty for our own pid (linux/darwin)', () => {
+  if (process.platform !== 'linux' && process.platform !== 'darwin') return;
+  const a = processStartId(process.pid);
+  assert.ok(a.length > 0, 'expected a start id on linux/darwin');
+  // Same process queried twice ⇒ identical identity.
+  assert.equal(processStartId(process.pid), a);
+});
+
+test('processIsOurs: start-id match is authoritative over the heuristic', () => {
+  if (process.platform !== 'linux' && process.platform !== 'darwin') return;
+  const id = processStartId(process.pid);
+  // Same pid + recorded start id that matches the live one ⇒ ours, even though
+  // the test runner's command line is NOT a vicoop-client daemon (so the
+  // fallback heuristic alone would say "not ours").
+  assert.equal(
+    processIsOurs(process.pid, { ...sampleRecord, pid: process.pid, procStartId: id }),
+    true,
+  );
+  // Recorded start id that does NOT match the live one ⇒ a recycled PID. The
+  // mismatch is authoritative; the heuristic must not rescue it.
+  assert.equal(
+    processIsOurs(process.pid, {
+      ...sampleRecord,
+      pid: process.pid,
+      procStartId: 'not-the-real-start-id',
+    }),
+    false,
+  );
+});
+
+test('claimPidFile: claims an unheld pidfile and writes the placeholder', () => {
+  const dir = tmpDir();
+  try {
+    const path = join(dir, 'vicoop.pid');
+    const r = claimPidFile(sampleRecord, { path });
+    assert.equal(r.ok, true);
+    // The placeholder is on disk and readable.
+    assert.deepEqual(readPidRecord(path), sampleRecord);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('claimPidFile: refuses when a live+ours daemon already holds it', () => {
+  const dir = tmpDir();
+  try {
+    const path = join(dir, 'vicoop.pid');
+    writePidRecord(sampleRecord, path);
+    const r = claimPidFile(sampleRecord, { path, probe: aliveProbe });
+    assert.equal(r.ok, false);
+    assert.equal(r.ok === false ? r.reason : undefined, 'running');
+    assert.equal(r.ok === false ? r.record.pid : undefined, 4242);
+    // Existing record untouched.
+    assert.deepEqual(readPidRecord(path), sampleRecord);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('claimPidFile: clears a stale pidfile and claims it', () => {
+  const dir = tmpDir();
+  try {
+    const path = join(dir, 'vicoop.pid');
+    // A corpse: present on disk but the process is gone / not ours.
+    writePidRecord({ ...sampleRecord, pid: 4242 }, path);
+    const deadProbe: LivenessProbe = { alive: () => false, matches: () => true };
+    const placeholder = { ...sampleRecord, pid: 5555 };
+    const r = claimPidFile(placeholder, { path, probe: deadProbe });
+    assert.equal(r.ok, true);
+    assert.deepEqual(readPidRecord(path), placeholder);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

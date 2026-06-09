@@ -61,10 +61,12 @@ import {
 } from './cli-args.js';
 import { createLogger, type Logger } from './logger.js';
 import {
+  claimPidFile,
   defaultLogPath,
   formatUptime,
   inspectDaemon,
   pidFilePath,
+  processStartId,
   removePidFile,
   stopDaemon,
   writePidRecord,
@@ -668,9 +670,10 @@ function childSurvivesGrace(child: ChildProcess, ms: number): Promise<boolean> {
 
 const DETACH_GRACE_MS = 600;
 
-// `start --detach`: spawn a detached copy of ourselves, write the pidfile from
-// the parent (we already hold the child pid — no read-before-write race), and
-// exit 0 once the child has survived the grace window. Never returns.
+// `start --detach`: atomically claim the pidfile (the O_EXCL create is the
+// lock against a concurrent `start --detach`), spawn a detached copy of
+// ourselves, overwrite the pidfile with the real child record, and exit 0
+// once the child has survived the grace window. Never returns.
 async function startDetached(
   parsed: Extract<CliArgs, { action: 'daemon' }>,
 ): Promise<never> {
@@ -683,25 +686,34 @@ async function startDetached(
   }
 
   const path = pidFilePath();
-  const existing = inspectDaemon(path);
-  if (existing.status === 'running') {
+  const logPath = parsed.logFile?.trim() || defaultLogPath();
+
+  // Claim the pidfile BEFORE doing anything observable. The placeholder
+  // records *this* launcher process — alive and command-matching for the whole
+  // start window — so a racing `start --detach` that loses the O_EXCL create
+  // sees a coherent "running" record and backs off instead of double-spawning.
+  // From here on, every failure path must release the claim via removePidFile.
+  const claim = claimPidFile({
+    pid: process.pid,
+    startedAt: Date.now(),
+    argv: process.argv,
+    logPath,
+    version: clientVersion,
+    procStartId: processStartId(process.pid),
+  }, { path });
+  if (!claim.ok) {
     console.error(
-      `a detached daemon is already running (pid ${existing.record.pid}); ` +
+      `a detached daemon is already running (pid ${claim.record.pid}); ` +
         'run `vicoop-client stop` first, or `vicoop-client status` to inspect it.',
     );
     process.exit(1);
   }
-  if (existing.status === 'stale') {
-    // A leftover pidfile from a crashed/killed daemon. Clear it so the fresh
-    // record we're about to write isn't conflated with the corpse.
-    removePidFile(path);
-  }
 
-  const logPath = parsed.logFile?.trim() || defaultLogPath();
   let logFd: number;
   try {
     logFd = openSync(logPath, 'a', 0o600);
   } catch (e) {
+    removePidFile(path);
     console.error(`cannot open --log-file ${logPath}: ${(e as Error).message}`);
     process.exit(1);
   }
@@ -721,6 +733,7 @@ async function startDetached(
   }
 
   if (typeof child.pid !== 'number') {
+    removePidFile(path);
     console.error('failed to spawn the detached daemon (no pid).');
     process.exit(1);
   }
@@ -728,6 +741,9 @@ async function startDetached(
   // below doesn't wait on the child.
   child.unref();
 
+  // Overwrite the placeholder with the real child record. We hold the child
+  // pid directly (no read-before-write race), and capture the child's OS start
+  // identity so `stop`/`status` can later tell it apart from a recycled PID.
   writePidRecord(
     {
       pid: child.pid,
@@ -735,6 +751,7 @@ async function startDetached(
       argv: [process.execPath, ...childArgv],
       logPath,
       version: clientVersion,
+      procStartId: processStartId(child.pid),
     },
     path,
   );

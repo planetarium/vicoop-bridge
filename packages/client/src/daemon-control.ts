@@ -21,7 +21,13 @@
 // environments for this feature are Linux/macOS agent sandboxes.
 
 import { execFileSync } from 'node:child_process';
-import { readFileSync, unlinkSync } from 'node:fs';
+import {
+  closeSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { resolveConfigDir } from './config.js';
 import { atomicWriteFile } from './fs-util.js';
@@ -46,6 +52,13 @@ export interface PidRecord {
   logPath: string;
   // Client semver that wrote the file, for cross-version diagnostics.
   version: string;
+  // The OS process start identity of `pid` at the moment we recorded it
+  // (Linux: /proc/<pid>/stat starttime ticks; macOS: `ps -o lstart`). This
+  // is the PRINCIPLED PID-reuse guard: a recycled PID gets a different start
+  // identity, so `stop`/`status` compare this against the live value before
+  // acting. Empty string when the platform / permissions don't expose it, in
+  // which case the lifecycle falls back to the command-line heuristic.
+  procStartId: string;
 }
 
 export function pidFilePath(dir: string = resolveConfigDir()): string {
@@ -87,6 +100,7 @@ export function readPidRecord(path: string = pidFilePath()): PidRecord | null {
       : [],
     logPath: typeof o.logPath === 'string' ? o.logPath : '',
     version: typeof o.version === 'string' ? o.version : '',
+    procStartId: typeof o.procStartId === 'string' ? o.procStartId : '',
   };
 }
 
@@ -118,18 +132,43 @@ export function processAlive(pid: number): boolean {
   }
 }
 
-// Best-effort defense against PID reuse. `processAlive` only proves *some*
-// process holds that PID — once the daemon dies and the OS recycles its PID,
-// that could be anything (a shell, a worker, an editor). Before we signal it
-// (`stop`) or report it as our daemon (`status`), confirm the live process's
-// command line still looks like a vicoop-client daemon.
-//
-// POSIX-only via `ps`; returns true on win32 (no `ps`) so the caller falls
-// back to liveness-only there. Returns false when `ps` can't confirm
-// (process vanished mid-check, ps absent, perms) — the conservative choice,
-// since acting on an unconfirmed PID is the failure mode we're guarding
-// against.
-export function processCommandMatches(pid: number, _rec: PidRecord): boolean {
+// The OS process start identity of `pid` — a value that stays constant for
+// the life of a process but (crucially) differs for a later process that
+// reuses the same PID. This is the principled half of the PID-reuse guard.
+//   - Linux: field 22 (starttime, in clock ticks since boot) of
+//     /proc/<pid>/stat. The comm field (2) is parenthesized and may itself
+//     contain spaces/parens, so we slice from the LAST ')' — everything after
+//     it is space-delimited starting at the `state` field (3), making
+//     starttime index 19 in that tail.
+//   - macOS: `ps -o lstart` (process start wall-clock; second granularity,
+//     stable string for a given process).
+// Returns '' when unavailable (unsupported platform, /proc or ps unreadable),
+// signalling the caller to fall back to the command-line heuristic.
+export function processStartId(pid: number): string {
+  try {
+    if (process.platform === 'linux') {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const tail = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+      return tail[19] ?? '';
+    }
+    if (process.platform === 'darwin') {
+      return execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+        encoding: 'utf8',
+      }).trim();
+    }
+  } catch {
+    return '';
+  }
+  return '';
+}
+
+// Command-line heuristic — the FALLBACK reuse guard for when start identity
+// is unavailable (older record with no procStartId, unsupported platform,
+// /proc or ps unreadable). Confirms the live process's command line still
+// looks like a vicoop-client daemon. POSIX-only via `ps`; true on win32 (no
+// `ps`). False when `ps` can't confirm — the conservative choice, since
+// acting on an unconfirmed PID is exactly the failure mode we guard against.
+function processCommandLooksLikeDaemon(pid: number): boolean {
   if (process.platform === 'win32') return true;
   let out: string;
   try {
@@ -151,6 +190,17 @@ export function processCommandMatches(pid: number, _rec: PidRecord): boolean {
   return hasEntrypoint && hasStart;
 }
 
+// Is the live process holding `rec.pid` actually the daemon we recorded — or
+// a recycled PID? Prefers the strong start-identity comparison; falls back to
+// the command-line heuristic only when an identity isn't available on both
+// sides (so an exact start-id MISMATCH is authoritative and is never masked
+// by the looser heuristic).
+export function processIsOurs(pid: number, rec: PidRecord): boolean {
+  const liveId = processStartId(pid);
+  if (rec.procStartId && liveId) return rec.procStartId === liveId;
+  return processCommandLooksLikeDaemon(pid);
+}
+
 // Injectable liveness seam so the lifecycle helpers below can be unit-tested
 // without spawning real OS processes or shelling out to `ps`.
 export interface LivenessProbe {
@@ -160,7 +210,7 @@ export interface LivenessProbe {
 
 const defaultProbe: LivenessProbe = {
   alive: processAlive,
-  matches: processCommandMatches,
+  matches: processIsOurs,
 };
 
 export type DaemonState =
@@ -182,6 +232,62 @@ export function inspectDaemon(
     return { status: 'running', record };
   }
   return { status: 'stale', record };
+}
+
+export type ClaimResult =
+  // We now hold the pidfile — a coherent `placeholder` record is on disk and
+  // the caller must `removePidFile` on any subsequent failure to release it.
+  | { ok: true }
+  // Another live, confirmed-ours daemon already holds it.
+  | { ok: false; reason: 'running'; record: PidRecord };
+
+// Atomically claim the pidfile so two concurrent `start --detach` invocations
+// can't both come up. The claim IS the lock: `openSync(path, 'wx')` is an
+// O_EXCL create that exactly one racer can win. The loser inspects the
+// existing file — a live+ours daemon means "already running" (refuse); a
+// stale file (crashed daemon, recycled PID) is removed and the claim retried
+// once. On winning we immediately write a valid `placeholder` record (rather
+// than leaving the file empty) so a concurrent inspector sees a coherent,
+// live, matching record during the start window instead of a half-written
+// file. The caller overwrites it with the real child record once spawned.
+export function claimPidFile(
+  placeholder: PidRecord,
+  opts: { path?: string; probe?: LivenessProbe } = {},
+): ClaimResult {
+  const path = opts.path ?? pidFilePath();
+  const probe = opts.probe ?? defaultProbe;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let fd: number;
+    try {
+      fd = openSync(path, 'wx', 0o600);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      const state = inspectDaemon(path, probe);
+      if (state.status === 'running') {
+        return { ok: false, reason: 'running', record: state.record };
+      }
+      // Stale (or unreadable): clear and retry the O_EXCL claim once.
+      removePidFile(path);
+      continue;
+    }
+    try {
+      writeFileSync(fd, `${JSON.stringify(placeholder, null, 2)}\n`);
+    } finally {
+      closeSync(fd);
+    }
+    return { ok: true };
+  }
+
+  // Both attempts lost the create race to another concurrent starter — by
+  // now it owns a (presumably live) daemon, so report running rather than
+  // stomping its pidfile.
+  const state = inspectDaemon(path, probe);
+  return {
+    ok: false,
+    reason: 'running',
+    record: state.status === 'stopped' ? placeholder : state.record,
+  };
 }
 
 export type StopOutcome =
