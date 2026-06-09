@@ -146,7 +146,7 @@ const startCmd = command(
     // the runtime-config surface threaded into the backend) because
     // `--detach` / `--log-file` only steer *how* the daemon is launched, not
     // what it does once running — see `startDetached`.
-    detach: withDefault(flag('--detach', {
+    detach: withDefault(flag('--detach', '-d', {
       description: message`Run the daemon in a detached background session (new session/process-group leader) and return immediately. Survives the session/pgrp reaping that kills \`nohup … &\` in agent-driven exec sandboxes. Writes a pidfile so \`stop\` / \`status\` can manage it. POSIX only. Caveat: survives session/pgrp teardown but NOT cgroup/container teardown — for reboot/crash persistence use a real service manager (systemd --user / launchd).`,
     }), false),
     logFile: optional(option('--log-file', string({ metavar: 'PATH' }), {
@@ -972,11 +972,18 @@ async function main(): Promise<void> {
       process.exit(await runContainerRemoveCli(parsed));
       break;
     case 'daemon':
-      // `--detach` re-execs a backgrounded copy and exits the foreground
-      // process; the plain path runs the long-lived daemon in place. Both
-      // are awaited so launch errors surface through main's catch instead
-      // of as unhandled rejections.
-      if (parsed.detach) {
+      // `--detach`/`-d` re-execs a backgrounded copy and exits the foreground
+      // process; the plain path runs the long-lived daemon in place. Both are
+      // awaited so launch errors surface through main's catch instead of as
+      // unhandled rejections.
+      //
+      // The detached child is spawned with VICOOP_DETACHED=1, and we suppress
+      // re-detach when it's set: that, not argv stripping, is what guarantees
+      // the child runs the daemon rather than detaching again. It makes the
+      // re-exec robust against detach flags that survive reconstruction —
+      // notably optique's bundled short flags (`-dc value` parses as
+      // `-d -c value`), which a token-level strip can't reliably remove.
+      if (parsed.detach && process.env.VICOOP_DETACHED !== '1') {
         await startDetached(parsed);
       } else {
         // Long-running. Do not exit — client.start() keeps the event loop

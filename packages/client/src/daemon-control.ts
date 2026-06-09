@@ -398,6 +398,12 @@ export function isEmbeddedEntryPoint(entry: string | undefined): boolean {
 // In every runtime the user args are argv.slice(2) (argv[1] is the real or
 // virtual entry). We re-prepend the entry path ONLY when it's a real script the
 // runtime needs, never the embedded virtual path of a compiled binary.
+//
+// Stripping the launch-control flags here is cosmetic — it keeps the child's
+// process command line and the recorded pidfile argv clean. Correctness (the
+// child must NOT re-detach) is guaranteed by the VICOOP_DETACHED env guard in
+// the dispatch, not by this strip, so a detach flag that slips through (e.g.
+// an optique bundled short flag like `-dc`) is harmless.
 export function detachChildArgv(argv: string[]): string[] {
   const entry = argv[1];
   const head =
@@ -407,7 +413,7 @@ export function detachChildArgv(argv: string[]): string[] {
   const out: string[] = [...head];
   for (let i = 0; i < userArgs.length; i++) {
     const a = userArgs[i];
-    if (a === '--detach') continue;
+    if (a === '--detach' || a === '-d') continue;
     if (a === '--log-file') {
       i++; // drop the flag and its value; the child logs to the inherited fd
       continue;

@@ -63,7 +63,7 @@ export const daemonFlagsFields = {
   card: optional(option('--card', string({ metavar: 'PATH' }), {
     description: message`Agent card JSON override (defaults to the server-published card for the chosen backend).`,
   })),
-  config: optional(option('--config', string({ metavar: 'PATH' }), {
+  config: optional(option('--config', '-c', string({ metavar: 'PATH' }), {
     description: message`Explicit config.json overlaid on the canonical file.`,
   })),
 

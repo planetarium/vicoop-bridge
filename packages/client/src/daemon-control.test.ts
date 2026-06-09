@@ -388,6 +388,13 @@ test('detachChildArgv reconstructs Bun compiled argv (drops the $bunfs entry)', 
   assert.deepEqual(detachChildArgv(argv), ['start', '--backend', 'echo']);
 });
 
+test('detachChildArgv strips the short -d detach flag too', () => {
+  const argv = ['/usr/bin/node', '/opt/vicoop/dist/cli.js', 'start', '-d', '-c', '/tmp/cfg.json'];
+  // `-c` (config) is preserved — the child needs it; only the detach trigger
+  // is dropped.
+  assert.deepEqual(detachChildArgv(argv), ['/opt/vicoop/dist/cli.js', 'start', '-c', '/tmp/cfg.json']);
+});
+
 test('detachChildArgv strips --log-file and its value (both forms)', () => {
   const spaced = ['node', 'cli.js', 'start', '--log-file', '/tmp/x.log', '--detach', '--backend', 'echo'];
   assert.deepEqual(detachChildArgv(spaced), ['cli.js', 'start', '--backend', 'echo']);
