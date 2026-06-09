@@ -670,6 +670,30 @@ function childSurvivesGrace(child: ChildProcess, ms: number): Promise<boolean> {
 
 const DETACH_GRACE_MS = 600;
 
+// The whole detached-daemon lifecycle — `start --detach`, `stop`, `status` —
+// is POSIX-only and refused as a unit on Windows. Three reasons it can't just
+// half-work there:
+//   - The detach mechanism differs: `spawn({detached:true})` gives the child
+//     its own console window, not a new session/process-group leader, so the
+//     "survive session/pgrp reaping" rationale (#186) doesn't even apply.
+//   - The PID-reuse guard is gone: `processStartId` (/proc, `ps -o lstart`)
+//     and the `ps` command match are POSIX-only, so on win32 `processIsOurs`
+//     degrades to always-true. A `stop` against any stray pidfile would then
+//     SIGTERM/SIGKILL a bare live PID with NO recycled-PID protection — the
+//     exact mis-kill we hardened against everywhere else.
+//   - Signal semantics differ: `process.kill` on Windows can't deliver real
+//     POSIX SIGTERM/SIGKILL.
+// Exposing `status`/`stop` but not `start` would also mislead — a Windows
+// `status` printing "stopped" reads as "feature works, just not running".
+const DETACH_UNSUPPORTED_MSG =
+  'the detached daemon lifecycle (start --detach / stop / status) is not ' +
+  'supported on Windows. Run `vicoop-client start` in the foreground under a ' +
+  'Windows service manager (e.g. NSSM) instead.';
+
+function detachSupportedHere(): boolean {
+  return process.platform !== 'win32';
+}
+
 // `start --detach`: atomically claim the pidfile (the O_EXCL create is the
 // lock against a concurrent `start --detach`), spawn a detached copy of
 // ourselves, overwrite the pidfile with the real child record, and exit 0
@@ -677,11 +701,8 @@ const DETACH_GRACE_MS = 600;
 async function startDetached(
   parsed: Extract<CliArgs, { action: 'daemon' }>,
 ): Promise<never> {
-  if (process.platform === 'win32') {
-    console.error(
-      'start --detach is not supported on Windows. Run `vicoop-client start` ' +
-        'in the foreground under a Windows service manager (e.g. NSSM) instead.',
-    );
+  if (!detachSupportedHere()) {
+    console.error(DETACH_UNSUPPORTED_MSG);
     process.exit(1);
   }
 
@@ -782,6 +803,10 @@ async function startDetached(
 }
 
 async function runStop(): Promise<number> {
+  if (!detachSupportedHere()) {
+    console.error(DETACH_UNSUPPORTED_MSG);
+    return 1;
+  }
   const r = await stopDaemon();
   switch (r.outcome) {
     case 'not-running':
@@ -805,8 +830,13 @@ async function runStop(): Promise<number> {
 
 // Exit codes follow the LSB `status` convention: 0 running, 3 stopped. Stale
 // (pidfile present but not a live daemon) gets a distinct 1 so a supervisor /
-// script can tell "needs cleanup" apart from "cleanly stopped".
+// script can tell "needs cleanup" apart from "cleanly stopped". On Windows the
+// lifecycle is unsupported entirely (exit 1) — see DETACH_UNSUPPORTED_MSG.
 function runStatus(): number {
+  if (!detachSupportedHere()) {
+    console.error(DETACH_UNSUPPORTED_MSG);
+    return 1;
+  }
   const state = inspectDaemon();
   if (state.status === 'stopped') {
     console.log('stopped (no pidfile).');

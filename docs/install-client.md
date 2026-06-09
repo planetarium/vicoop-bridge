@@ -593,8 +593,11 @@ a pidfile (`vicoop.pid`) and redirects stdout+stderr to a log
 > **cgroup / container** teardown (an environment that kills the whole cgroup
 > at turn end) or a reboot — for those you need an out-of-cgroup supervisor
 > (systemd `--user` / launchd). That persistence tier is tracked in issue
-> #190. `--detach` is POSIX-only; on Windows run `vicoop-client start` in the
-> foreground under a Windows service manager (e.g. NSSM).
+> #190. The detached lifecycle (`start --detach` / `stop` / `status`) is
+> POSIX-only and refused as a unit on Windows (the detach mechanism, the
+> PID-reuse guard, and signal semantics all differ there) — on Windows run
+> `vicoop-client start` in the foreground under a Windows service manager
+> (e.g. NSSM) instead.
 
 ### OpenClaw-specific knobs
 
