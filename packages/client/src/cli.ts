@@ -702,9 +702,16 @@ async function startDetached(
     procStartId: processStartId(process.pid),
   }, { path });
   if (!claim.ok) {
+    // Refusing the second daemon is the point of the lock: two daemons sharing
+    // this client token don't coexist — the bridge keeps only the newest
+    // connection and evicts the other with close 4009, so the pair would
+    // ping-pong (each reconnect kicking the other) with no server-side
+    // resolution. The lock stops that duplicate-process state at the source.
     console.error(
-      `a detached daemon is already running (pid ${claim.record.pid}); ` +
-        'run `vicoop-client stop` first, or `vicoop-client status` to inspect it.',
+      `a detached daemon is already running (pid ${claim.record.pid}); refusing ` +
+        'to start a second (two daemons sharing this token would fight over the ' +
+        'bridge connection — close 4009 ping-pong). Run `vicoop-client stop` ' +
+        'first, or `vicoop-client status` to inspect it.',
     );
     process.exit(1);
   }

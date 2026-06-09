@@ -576,10 +576,17 @@ a pidfile (`vicoop.pid`) and redirects stdout+stderr to a log
 - `status` exit codes: **0** running, **3** stopped (no pidfile), **1** stale
   (pidfile present but no live `vicoop-client` daemon behind it — `stop`
   cleans it up). `stop` / `status` refuse to act on a recycled PID: they
-  confirm the live process still looks like a `vicoop-client` daemon before
-  signaling it.
-- A second `start --detach` while one is already running is rejected; `stop`
-  first.
+  confirm the live process is the same one recorded (by its OS start identity)
+  before signaling it.
+- A second `start --detach` while one is already running is **rejected** (the
+  pidfile is claimed atomically, so this holds even under a concurrent
+  double-launch). This is deliberate, not just tidiness: two daemons sharing
+  the same client token **don't coexist** — the bridge keeps only the newest
+  connection and evicts the other with close code **4009**, so the pair would
+  *ping-pong* (each reconnect kicking the other) with no server-side
+  resolution, leaving you to hunt down and kill the duplicate by hand. The
+  `--detach` lock prevents that duplicate-process state at the source; `stop`
+  the running daemon first if you really mean to restart it.
 
 > **Scope caveat.** `--detach` survives **session / process-group** reaping,
 > which is what the agent-sandbox case needs. It does **not** survive
