@@ -389,6 +389,35 @@ test('buildCallBody: no envelope yields messages-only body', () => {
   assert.deepEqual(body, { messages: [{ role: 'user', content: 'q' }] });
 });
 
+test('buildCallBody: fallback cache key becomes prompt_cache_key', () => {
+  const body = buildCallBody(null, [{ role: 'user', content: 'q' }], 'ctx-1');
+  assert.equal(body.prompt_cache_key, 'ctx-1');
+});
+
+test('buildCallBody: empty fallback cache key is omitted', () => {
+  const body = buildCallBody(null, [{ role: 'user', content: 'q' }], '');
+  assert.equal(body.prompt_cache_key, undefined);
+  assert.equal('prompt_cache_key' in body, false);
+});
+
+test('buildCallBody: caller-supplied envelope.prompt_cache_key wins over fallback', () => {
+  const body = buildCallBody(
+    { prompt_cache_key: 'caller-key', messages: [] },
+    [{ role: 'user', content: 'q' }],
+    'ctx-1',
+  );
+  assert.equal(body.prompt_cache_key, 'caller-key');
+});
+
+test('buildCallBody: blank envelope.prompt_cache_key falls back to contextId', () => {
+  const body = buildCallBody(
+    { prompt_cache_key: '', messages: [] },
+    [{ role: 'user', content: 'q' }],
+    'ctx-1',
+  );
+  assert.equal(body.prompt_cache_key, 'ctx-1');
+});
+
 test('parseChatCompletionUsage: enforces total = prompt + completion', () => {
   const u = parseChatCompletionUsage(
     {
@@ -748,6 +777,9 @@ test('handle: request body carries stream:true + envelope-derived model/messages
     type: 'function',
     function: { name: 'get_weather' },
   });
+  // prompt_cache_key carries the conversation's contextId so successive turns
+  // stay sticky to one upstream cache shard (#11 / vicoop-codex-cli#12).
+  assert.equal(body.prompt_cache_key, 'ctx-1');
   // Group B / Group C fields stay off the wire — the binary applies defaults.
   assert.equal(body.reasoning_effort, undefined);
   assert.equal(body.temperature, undefined);

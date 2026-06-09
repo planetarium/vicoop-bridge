@@ -110,6 +110,14 @@ export interface VicoopCodexCallBody {
   messages: ChatCompletionMessage[];
   tools?: unknown[];
   tool_choice?: unknown;
+  // Cache-routing key forwarded verbatim to `vicoop-codex serve`, which
+  // passes it upstream as the Responses API `prompt_cache_key`
+  // (vicoop-codex-cli#12). It pins the same conversation's successive turns
+  // to one ChatGPT-codex-backend cache shard so the prompt cache actually
+  // hits across turns instead of scattering — without it a genuine
+  // multi-turn A2A conversation records `cached_tokens: 0` on every
+  // follow-up turn (#11).
+  prompt_cache_key?: string;
 }
 
 export interface ChatCompletionMessage {
@@ -331,12 +339,21 @@ export function buildMessages(
 //   - `messages`: the pre-assembled array (system + chat_history + current
 //     user turn).
 //
-// Nothing else is forwarded. `reasoning_effort`, `parallel_tool_calls`,
-// and every Group B / Group C parameter from the call command's input doc
-// are left unset — the vicoop-codex binary applies its own defaults.
+// Besides those, a `prompt_cache_key` is attached for prompt-cache stickiness
+// (see below). `reasoning_effort`, `parallel_tool_calls`, and every Group B /
+// Group C parameter from the call command's input doc are left unset — the
+// vicoop-codex binary applies its own defaults.
+//
+// `fallbackCacheKey` is the bridge's per-conversation id (`task.contextId`).
+// The resolved `prompt_cache_key` is: an explicit caller-supplied
+// `envelope.prompt_cache_key` if present, else the fallback. Routing the
+// same conversation's turns through one key is what makes the upstream
+// prompt cache hit across turns (#11 / vicoop-codex-cli#12); a caller that
+// already manages its own key wins so we don't override their grouping.
 export function buildCallBody(
   envelope: OpenAICompatRequestEnvelope | null,
   messages: ChatCompletionMessage[],
+  fallbackCacheKey?: string,
 ): VicoopCodexCallBody {
   const body: VicoopCodexCallBody = { messages };
   if (envelope) {
@@ -350,6 +367,16 @@ export function buildCallBody(
       body.tool_choice = envelope.tool_choice;
     }
   }
+  const callerCacheKey =
+    envelope &&
+    typeof envelope.prompt_cache_key === 'string' &&
+    envelope.prompt_cache_key.length > 0
+      ? envelope.prompt_cache_key
+      : undefined;
+  const cacheKey =
+    callerCacheKey ??
+    (fallbackCacheKey && fallbackCacheKey.length > 0 ? fallbackCacheKey : undefined);
+  if (cacheKey) body.prompt_cache_key = cacheKey;
   return body;
 }
 
@@ -1102,7 +1129,10 @@ export function createVicoopCodexBackend(
       }
 
       const messages = buildMessages(system, chatHistory, userContent);
-      const body = buildCallBody(effectiveEnvelope, messages);
+      // Pass `task.contextId` as the prompt-cache fallback key so successive
+      // turns of one A2A conversation stay sticky to the same upstream cache
+      // shard (#11). A caller-supplied `envelope.prompt_cache_key` still wins.
+      const body = buildCallBody(effectiveEnvelope, messages, task.contextId);
       let serialized: string;
       try {
         // `stream:true` switches `vicoop-codex serve`'s `/v1/chat/completions`
