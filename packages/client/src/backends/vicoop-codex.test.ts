@@ -389,6 +389,54 @@ test('buildCallBody: no envelope yields messages-only body', () => {
   assert.deepEqual(body, { messages: [{ role: 'user', content: 'q' }] });
 });
 
+test('buildCallBody: fallback cache key becomes prompt_cache_key', () => {
+  const body = buildCallBody(null, [{ role: 'user', content: 'q' }], 'ctx-1');
+  assert.equal(body.prompt_cache_key, 'ctx-1');
+});
+
+test('buildCallBody: empty fallback cache key is omitted', () => {
+  const body = buildCallBody(null, [{ role: 'user', content: 'q' }], '');
+  assert.equal(body.prompt_cache_key, undefined);
+  assert.equal('prompt_cache_key' in body, false);
+});
+
+test('buildCallBody: caller-supplied envelope.prompt_cache_key wins over fallback', () => {
+  const body = buildCallBody(
+    { prompt_cache_key: 'caller-key', messages: [] },
+    [{ role: 'user', content: 'q' }],
+    'ctx-1',
+  );
+  assert.equal(body.prompt_cache_key, 'caller-key');
+});
+
+test('buildCallBody: blank envelope.prompt_cache_key falls back to contextId', () => {
+  const body = buildCallBody(
+    { prompt_cache_key: '', messages: [] },
+    [{ role: 'user', content: 'q' }],
+    'ctx-1',
+  );
+  assert.equal(body.prompt_cache_key, 'ctx-1');
+});
+
+test('buildCallBody: camelCase promptCacheKey (AI SDK / opencode) is normalized to snake_case', () => {
+  const body = buildCallBody(
+    { promptCacheKey: 'session-42', messages: [] },
+    [{ role: 'user', content: 'q' }],
+    'ctx-1',
+  );
+  // Read from the camelCase wire field, emitted as snake_case for serve.
+  assert.equal(body.prompt_cache_key, 'session-42');
+  assert.equal('promptCacheKey' in body, false);
+});
+
+test('buildCallBody: snake_case prompt_cache_key wins over camelCase when both present', () => {
+  const body = buildCallBody(
+    { prompt_cache_key: 'snake', promptCacheKey: 'camel', messages: [] },
+    [{ role: 'user', content: 'q' }],
+  );
+  assert.equal(body.prompt_cache_key, 'snake');
+});
+
 test('parseChatCompletionUsage: enforces total = prompt + completion', () => {
   const u = parseChatCompletionUsage(
     {
@@ -678,6 +726,46 @@ test('handle: streamed text → one append artifact per delta + complete with me
   assert.equal(choiceMsg.content, 'ok');
 });
 
+test('handle: serve drops usage on the stream → envelope backfills zero usage (spec-required, no gateway hard-reject)', async () => {
+  const task = makeTask();
+  // Final chunk carries finish_reason but NO usage block — the #317 failure
+  // mode where `vicoop-codex serve` omits usage despite include_usage. Without
+  // a backfill the terminal chat_completion envelope would lack the
+  // spec-mandated usage and the gateway rejects the whole response.
+  const sse = sseStream([
+    {
+      id: 'chatcmpl-z',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.5',
+      choices: [{ index: 0, delta: { role: 'assistant', content: 'hi' }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-z',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.5',
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      // no `usage` here
+    },
+  ]);
+  const frames = await runStreaming(task, makeSseFetch(sse));
+
+  const completes = frames.filter((f) => f.type === 'task.complete');
+  assert.equal(completes.length, 1);
+  const completeFrame = completes[0];
+  if (completeFrame.type !== 'task.complete') throw new Error('unreachable');
+  assert.equal(completeFrame.status.state, 'completed');
+  const ext = (completeFrame.status.message!.metadata as Record<
+    string,
+    Record<string, unknown>
+  >)[OPENAI_COMPAT_EXTENSION_URI];
+  const envelope = ext.chat_completion as Record<string, unknown>;
+  // Spec-required usage is present and numeric (zero-filled), not omitted.
+  const envelopeUsage = envelope.usage as Record<string, number>;
+  assert.equal(envelopeUsage.prompt_tokens, 0);
+  assert.equal(envelopeUsage.completion_tokens, 0);
+  assert.equal(envelopeUsage.total_tokens, 0);
+});
+
 test('handle: request body carries stream:true + envelope-derived model/messages/tools', async () => {
   const task = makeTask({
     message: {
@@ -748,6 +836,9 @@ test('handle: request body carries stream:true + envelope-derived model/messages
     type: 'function',
     function: { name: 'get_weather' },
   });
+  // prompt_cache_key carries the conversation's contextId so successive turns
+  // stay sticky to one upstream cache shard (#11 / vicoop-codex-cli#12).
+  assert.equal(body.prompt_cache_key, 'ctx-1');
   // Group B / Group C fields stay off the wire — the binary applies defaults.
   assert.equal(body.reasoning_effort, undefined);
   assert.equal(body.temperature, undefined);
