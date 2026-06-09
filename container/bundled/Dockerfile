@@ -51,6 +51,11 @@ COPY packages/protocol/package.json packages/protocol/
 COPY packages/client/package.json   packages/client/
 COPY packages/server/package.json   packages/server/
 COPY packages/admin-ui/package.json packages/admin-ui/
+# Root package.json declares `patchedDependencies` (e.g. @optique/core); pnpm
+# reads the referenced patch file during install, so the patches/ dir must be
+# present before `pnpm install` or it fails with ENOENT under
+# --frozen-lockfile (#337).
+COPY patches/ patches/
 
 # Only install deps the client build actually needs (protocol + client),
 # leaving admin-ui/server's native-compile-heavy deps (keccak / etc.) out
