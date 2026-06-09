@@ -370,6 +370,54 @@ export async function stopDaemon(
   return { outcome: 'killed', pid };
 }
 
+// True when argv[1] is a runtime-supplied *virtual* entry point rather than a
+// real script path — i.e. we're a Bun single-file compiled binary, whose entry
+// lives in the embedded filesystem (`/$bunfs/...` on POSIX, `B:\~BUN\...` on
+// Windows).
+export function isEmbeddedEntryPoint(entry: string | undefined): boolean {
+  return (
+    typeof entry === 'string' &&
+    (entry.startsWith('/$bunfs/') ||
+      entry.includes('/~BUN/') ||
+      /^[A-Za-z]:[\\/]~BUN[\\/]/.test(entry))
+  );
+}
+
+// Reconstruct the argv to re-exec (via `process.execPath`) for `start
+// --detach`, dropping the launch-control flags so the child runs the plain
+// foreground daemon. The reconstruction has to account for how argv differs by
+// runtime — getting this wrong was the 0.30.0 `--detach` regression:
+//
+//   - node (dev/source):   argv = [node, <cli.js>, ...userArgs]. execPath is
+//     node, so the child needs the script path AND the user args.
+//   - Bun compiled binary: argv = [<self-binary>, '/$bunfs/root/<entry>',
+//     ...userArgs]. execPath is the self-binary, which runs its OWN embedded
+//     entry — passing the '/$bunfs' path back makes the relaunched CLI parse it
+//     as a subcommand ("Unexpected option or subcommand: /$bunfs/...") and die.
+//
+// In every runtime the user args are argv.slice(2) (argv[1] is the real or
+// virtual entry). We re-prepend the entry path ONLY when it's a real script the
+// runtime needs, never the embedded virtual path of a compiled binary.
+export function detachChildArgv(argv: string[]): string[] {
+  const entry = argv[1];
+  const head =
+    isEmbeddedEntryPoint(entry) || typeof entry !== 'string' ? [] : [entry];
+  const userArgs = argv.slice(2);
+
+  const out: string[] = [...head];
+  for (let i = 0; i < userArgs.length; i++) {
+    const a = userArgs[i];
+    if (a === '--detach') continue;
+    if (a === '--log-file') {
+      i++; // drop the flag and its value; the child logs to the inherited fd
+      continue;
+    }
+    if (a.startsWith('--log-file=')) continue;
+    out.push(a);
+  }
+  return out;
+}
+
 // Human-friendly "up 2h 3m 4s" for `status`. Always ends with a seconds
 // component so a sub-minute uptime still reads as a duration. Guards
 // non-finite / negative inputs (e.g. an absent or future `startedAt`).

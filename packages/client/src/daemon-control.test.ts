@@ -8,8 +8,10 @@ import {
   type LivenessProbe,
   type PidRecord,
   claimPidFile,
+  detachChildArgv,
   formatUptime,
   inspectDaemon,
+  isEmbeddedEntryPoint,
   processAlive,
   processIsOurs,
   processStartId,
@@ -349,6 +351,48 @@ test('claimPidFile: clears a stale pidfile and claims it', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('isEmbeddedEntryPoint detects Bun compiled-binary entry paths', () => {
+  assert.equal(isEmbeddedEntryPoint('/$bunfs/root/vicoop-client-0.30.0-macos-arm64'), true);
+  assert.equal(isEmbeddedEntryPoint('B:\\~BUN\\root\\vicoop-client'), true);
+  assert.equal(isEmbeddedEntryPoint('B:/~BUN/root/vicoop-client'), true);
+  // Real script paths are NOT embedded entries.
+  assert.equal(isEmbeddedEntryPoint('/opt/vicoop/dist/cli.js'), false);
+  assert.equal(isEmbeddedEntryPoint('/usr/local/bin/vicoop-client'), false);
+  assert.equal(isEmbeddedEntryPoint(undefined), false);
+});
+
+test('detachChildArgv reconstructs node argv (keeps the script path)', () => {
+  // node dist/cli.js start --detach --backend echo
+  const argv = ['/usr/bin/node', '/opt/vicoop/dist/cli.js', 'start', '--detach', '--backend', 'echo'];
+  assert.deepEqual(detachChildArgv(argv), [
+    '/opt/vicoop/dist/cli.js',
+    'start',
+    '--backend',
+    'echo',
+  ]);
+});
+
+test('detachChildArgv reconstructs Bun compiled argv (drops the $bunfs entry)', () => {
+  // The 0.30.0 regression: argv[1] is the embedded virtual entry, which must
+  // NOT be passed back or the relaunched CLI parses it as a subcommand.
+  const argv = [
+    '/Users/op/.vicoop/bin/vicoop-client',
+    '/$bunfs/root/vicoop-client-0.30.0-macos-arm64',
+    'start',
+    '--detach',
+    '--backend',
+    'echo',
+  ];
+  assert.deepEqual(detachChildArgv(argv), ['start', '--backend', 'echo']);
+});
+
+test('detachChildArgv strips --log-file and its value (both forms)', () => {
+  const spaced = ['node', 'cli.js', 'start', '--log-file', '/tmp/x.log', '--detach', '--backend', 'echo'];
+  assert.deepEqual(detachChildArgv(spaced), ['cli.js', 'start', '--backend', 'echo']);
+  const eq = ['node', 'cli.js', 'start', '--log-file=/tmp/x.log', '--backend', 'echo', '--detach'];
+  assert.deepEqual(detachChildArgv(eq), ['cli.js', 'start', '--backend', 'echo']);
 });
 
 test('formatUptime renders compact durations', () => {
