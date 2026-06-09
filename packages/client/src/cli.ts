@@ -63,6 +63,7 @@ import { createLogger, type Logger } from './logger.js';
 import {
   claimPidFile,
   defaultLogPath,
+  detachChildArgv,
   formatUptime,
   inspectDaemon,
   pidFilePath,
@@ -146,7 +147,7 @@ const startCmd = command(
     // `--detach` / `--log-file` only steer *how* the daemon is launched, not
     // what it does once running — see `startDetached`.
     detach: withDefault(flag('--detach', {
-      description: message`Run the daemon in a detached background session (new session/process-group leader) and return immediately. Survives the session/pgrp reaping that kills \`nohup … &\` in agent-driven exec sandboxes (#186). Writes a pidfile so \`stop\` / \`status\` can manage it. POSIX only. Caveat: survives session/pgrp teardown but NOT cgroup/container teardown — for reboot/crash persistence use a real service manager (systemd --user / launchd).`,
+      description: message`Run the daemon in a detached background session (new session/process-group leader) and return immediately. Survives the session/pgrp reaping that kills \`nohup … &\` in agent-driven exec sandboxes. Writes a pidfile so \`stop\` / \`status\` can manage it. POSIX only. Caveat: survives session/pgrp teardown but NOT cgroup/container teardown — for reboot/crash persistence use a real service manager (systemd --user / launchd).`,
     }), false),
     logFile: optional(option('--log-file', string({ metavar: 'PATH' }), {
       description: message`With \`--detach\`, where to redirect the daemon's stdout+stderr. Defaults to \`vicoop.log\` under the canonical home dir. Ignored without \`--detach\`.`,
@@ -625,27 +626,6 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   process.on('SIGTERM', onSignal);
 }
 
-// Re-exec ourselves with the daemon argv minus the launch-control flags, so
-// the child runs the foreground daemon path inside its own fresh session.
-// process.argv is `[execPath, (scriptPath?), ...args]` — `slice(1)` keeps the
-// script path for node-from-source and is empty for the Bun single-file build
-// (where execPath IS the binary), so the same reconstruction works for both.
-function buildDetachChildArgv(): string[] {
-  const out: string[] = [];
-  const rest = process.argv.slice(1);
-  for (let i = 0; i < rest.length; i++) {
-    const a = rest[i];
-    if (a === '--detach') continue;
-    if (a === '--log-file') {
-      i++; // drop the flag and its value; the child logs to the inherited fd
-      continue;
-    }
-    if (a.startsWith('--log-file=')) continue;
-    out.push(a);
-  }
-  return out;
-}
-
 // Race the spawned child's early exit against a short grace timer. A daemon
 // that dies instantly on bad config / missing credentials should surface as a
 // failed launch (with a pointer to the log) rather than a cheerful "started"
@@ -746,7 +726,7 @@ async function startDetached(
     process.exit(1);
   }
 
-  const childArgv = buildDetachChildArgv();
+  const childArgv = detachChildArgv(process.argv);
   const child = spawnProcess(process.execPath, childArgv, {
     detached: true,
     stdio: ['ignore', logFd, logFd],
