@@ -568,6 +568,17 @@ export function dumpOpenAICompatTaskWire(
           tool_choice: envelope.tool_choice,
           hist: envelopeHistory?.length ?? 0,
           model: typeof envelope.model === 'string' ? envelope.model : undefined,
+          // Surface the caller's prompt_cache_key (a top-level
+          // chat_completions_request field, not inside messages) so an
+          // operator can confirm whether it rode through the gateway — the
+          // routing key that makes upstream prompt caching stick across turns.
+          prompt_cache_key:
+            typeof envelope.prompt_cache_key === 'string'
+              ? envelope.prompt_cache_key
+              : undefined,
+          // All top-level envelope keys, so any other forwarded field
+          // (user, reasoning_effort, …) is visible at a glance.
+          keys: Object.keys(envelope),
         }
       : null;
     console.error(

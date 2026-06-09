@@ -345,11 +345,19 @@ export function buildMessages(
 // vicoop-codex binary applies its own defaults.
 //
 // `fallbackCacheKey` is the bridge's per-conversation id (`task.contextId`).
-// The resolved `prompt_cache_key` is: an explicit caller-supplied
-// `envelope.prompt_cache_key` if present, else the fallback. Routing the
-// same conversation's turns through one key is what makes the upstream
-// prompt cache hit across turns (#11 / vicoop-codex-cli#12); a caller that
-// already manages its own key wins so we don't override their grouping.
+// The resolved `prompt_cache_key` is: an explicit caller-supplied key if
+// present, else the fallback. Routing the same conversation's turns through
+// one key is what makes the upstream prompt cache hit across turns (#11 /
+// vicoop-codex-cli#12); a caller that already manages its own key wins so we
+// don't override their grouping.
+//
+// The caller key is read from BOTH `prompt_cache_key` (the OpenAI wire name)
+// and `promptCacheKey` (the camelCase form the Vercel AI SDK / opencode emit
+// as a raw body field on openai-compatible providers — see opencode #4386).
+// The gateway forwards the request body verbatim, so whichever spelling the
+// client used rides through unchanged; we normalise to the snake_case
+// `prompt_cache_key` that `vicoop-codex serve` actually reads. Snake_case wins
+// when somehow both are present.
 export function buildCallBody(
   envelope: OpenAICompatRequestEnvelope | null,
   messages: ChatCompletionMessage[],
@@ -367,15 +375,12 @@ export function buildCallBody(
       body.tool_choice = envelope.tool_choice;
     }
   }
-  const callerCacheKey =
-    envelope &&
-    typeof envelope.prompt_cache_key === 'string' &&
-    envelope.prompt_cache_key.length > 0
-      ? envelope.prompt_cache_key
-      : undefined;
-  const cacheKey =
-    callerCacheKey ??
-    (fallbackCacheKey && fallbackCacheKey.length > 0 ? fallbackCacheKey : undefined);
+  const asKey = (v: unknown): string | undefined =>
+    typeof v === 'string' && v.length > 0 ? v : undefined;
+  const callerCacheKey = envelope
+    ? asKey(envelope.prompt_cache_key) ?? asKey(envelope.promptCacheKey)
+    : undefined;
+  const cacheKey = callerCacheKey ?? asKey(fallbackCacheKey);
   if (cacheKey) body.prompt_cache_key = cacheKey;
   return body;
 }
@@ -1291,21 +1296,31 @@ export function createVicoopCodexBackend(
         });
       }
 
-      const usage = parseChatCompletionUsage(response.usage, response.model);
+      let usage = parseChatCompletionUsage(response.usage, response.model);
       // We force `stream_options.include_usage` on the request, so a missing
       // usage block here means the runtime dropped it on this turn despite
-      // being asked for it — the #317 failure mode. Leave a breadcrumb in
-      // the logs rather than fabricating counts: a non-undefined `usage`
-      // omission is exactly what bills $0 downstream, so it should be
-      // diagnosable from fly logs by task id + finish_reason.
+      // being asked for it — the #317 failure mode, which still recurs
+      // intermittently. Log it (the $0-billed breadcrumb, diagnosable by task
+      // id + finish_reason) AND backfill a zero usage: the openai-compat/v1
+      // extension REQUIRES `chat_completion.usage` with numeric
+      // prompt/completion/total, so omitting it makes the gateway hard-reject
+      // the entire response ("missing required usage") and the caller loses an
+      // otherwise-valid answer. A zero-filled usage keeps the turn spec-
+      // compliant and delivered — it under-bills, which the warning surfaces,
+      // but a delivered-but-unbilled turn beats a dropped one.
       if (!usage) {
         logger.warn?.(
           `[vicoop-codex] task=${task.taskId} finish_reason=${JSON.stringify(
             typeof response.choices?.[0]?.finish_reason === 'string'
               ? response.choices[0].finish_reason
               : null,
-          )}: streamed response carried no usage despite stream_options.include_usage; downstream will record 0 tokens`,
+          )}: streamed response carried no usage despite stream_options.include_usage; backfilling zero usage to stay spec-compliant (downstream will record 0 tokens)`,
         );
+        usage = buildOpenAICompatUsage({
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          model: response.model,
+        });
       }
       const responseMetadata = buildResponseMetadata(response, usage, task.taskId);
 
