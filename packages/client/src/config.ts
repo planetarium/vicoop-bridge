@@ -116,6 +116,16 @@ export interface ClaudeBackendConfig {
    * flag.
    */
   model?: string;
+  /**
+   * Additional model ids this claude install can serve alongside `model` /
+   * the probed default, e.g. `["claude-sonnet-4-6", "claude-haiku-4-5"]`.
+   * Advertised on the openai-compat `params.models[]` block and accepted as
+   * per-request openai-compat `model` overrides (forwarded to the spawn as
+   * `--model <id>`). Not validated against the account — a model the
+   * account cannot access fails at task time with claude's own
+   * `model_not_found`. Mirrors the `--claude-models` flag.
+   */
+  models?: string[];
   runtime?: BackendRuntime;
   runtime_name?: string;
 }
@@ -183,6 +193,19 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v as Record<string, unknown>;
 }
 
+// String-array fields: keep the string entries (trimmed, empties dropped),
+// silently discard everything else — same permissive posture as the scalar
+// pickers above. A non-array value or an array that yields no usable entry
+// returns undefined so the field is omitted rather than set to [].
+function asStringArray(v: unknown): string[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out = v
+    .filter((e): e is string => typeof e === 'string')
+    .map((e) => e.trim())
+    .filter((e) => e.length > 0);
+  return out.length > 0 ? out : undefined;
+}
+
 // Enum surfaces validated at normalize time so a hand-edited typo doesn't
 // reach a downstream parser that does `process.exit(1)`. Anything outside
 // these sets is treated like any other malformed field — dropped, the rest
@@ -240,13 +263,15 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const cwd = asString(claudeRaw.cwd);
       const settings = asRecord(claudeRaw.settings);
       const model = asString(claudeRaw.model);
+      const models = asStringArray(claudeRaw.models);
       const runtime = pickBackendRuntime(claudeRaw.runtime);
       const runtimeName = asString(claudeRaw.runtime_name);
-      if (cwd || settings || model || runtime || runtimeName) {
+      if (cwd || settings || model || models || runtime || runtimeName) {
         out.claude = {};
         if (cwd) out.claude.cwd = cwd;
         if (settings) out.claude.settings = settings;
         if (model) out.claude.model = model;
+        if (models) out.claude.models = models;
         if (runtime) out.claude.runtime = runtime;
         if (runtimeName) out.claude.runtime_name = runtimeName;
       }

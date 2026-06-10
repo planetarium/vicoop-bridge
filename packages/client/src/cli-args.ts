@@ -90,6 +90,9 @@ export const daemonFlagsFields = {
   claudeModel: optional(option('--claude-model', string({ metavar: 'MODEL' }), {
     description: message`Model id for the spawned Claude, e.g. \`claude-opus-4-8\`. Sets the \`model\` field in Claude \`--settings\`; a per-request openai-compat \`model\` still overrides it. Only valid with \`--backend claude\`; pairing with another backend exits non-zero.`,
   })),
+  claudeModels: optional(option('--claude-models', string({ metavar: 'MODELS' }), {
+    description: message`Comma-separated additional model ids this Claude install can serve, e.g. \`claude-sonnet-4-6,claude-haiku-4-5\`. Advertised alongside the default model and accepted as per-request openai-compat \`model\` overrides (Claude has no headless model listing, so the set is operator-declared and not validated against the account). Only valid with \`--backend claude\`; pairing with another backend exits non-zero.`,
+  })),
 
   // Backend-specific (Codex)
   codexSandbox: optional(option('--codex-sandbox', choice([...SANDBOX_MODES]), {
@@ -145,6 +148,7 @@ export interface DaemonArgs {
   runtimeName?: string;
   claudeSettingsFile?: string;
   claudeModel?: string;
+  claudeModels?: string[];
   codexSandbox?: CodexSandboxMode;
   openclawGateway?: string;
   openclawGatewayToken?: string;
@@ -180,6 +184,18 @@ export function parseFlags(argv: string[]): ParseFlagsResult {
 //      connect" mystery.
 function pick(v: string | undefined): string {
   return v?.trim() ?? '';
+}
+
+// Comma-separated model list (--claude-models). Trim entries, drop empties;
+// undefined when nothing usable remains so the merge's `??` fallback to the
+// config layer fires on a blank/whitespace-only flag, matching `pick()`'s
+// empty-means-unset convention.
+function pickModelsList(v: string | undefined): string[] | undefined {
+  const entries = (v ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return entries.length > 0 ? entries : undefined;
 }
 
 function pickSandbox(v: string | undefined): CodexSandboxMode | undefined {
@@ -255,6 +271,9 @@ export function mergeClientArgs(
     runtimeName: pick(flags.runtimeName) || activeRuntimeName || undefined,
     claudeSettingsFile: pick(flags.claudeSettingsFile) || undefined,
     claudeModel: pick(flags.claudeModel) || backends.claude?.model || undefined,
+    claudeModels:
+      pickModelsList(flags.claudeModels) ??
+      (backends.claude?.models?.length ? backends.claude.models : undefined),
     codexSandbox:
       flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),
     openclawGateway:
@@ -315,6 +334,11 @@ export function mergeClientArgs(
   if (pick(flags.claudeModel) && backend !== 'claude') {
     errors.push(
       `--claude-model is not supported by --backend ${backend}; only the claude backend takes a model id`,
+    );
+  }
+  if (pick(flags.claudeModels) && backend !== 'claude') {
+    errors.push(
+      `--claude-models is not supported by --backend ${backend}; only the claude backend takes model ids`,
     );
   }
 

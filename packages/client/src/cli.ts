@@ -399,6 +399,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
         settings,
         model: args.claudeModel,
+        models: args.claudeModels,
         openaiCompatTrace: args.openaiCompatTrace,
         ...(spawn ? { spawn: spawn as ClaudeSpawnFn } : {}),
       });

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
   TRACEABILITY_EXTENSION_URI,
+  type OpenAICompatModelAdvertise,
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
@@ -150,6 +151,20 @@ export interface ClaudeBackendOptions {
   // model falls back to claude's own resolution (project/user settings.json,
   // ANTHROPIC_MODEL, built-in default).
   model?: string;
+  // Additional model ids this claude install can serve (e.g.
+  // ['claude-sonnet-4-6', 'claude-haiku-4-5']), exposed via the
+  // `--claude-models` flag. Claude Code has no headless "list models"
+  // interface — the startup probe only reveals the single resolved default
+  // (`system/init.model` echoes whatever `--model` was passed, verbatim,
+  // without validating account access) — so multi-model support is
+  // operator-declared: entries are advertised on the openai-compat/v1
+  // `params.models[]` block after the default (the `--claude-model` pin or
+  // the probed model) and accepted by the `envelope.model` gate, riding to
+  // the spawn as `--model <id>`. The list is NOT validated against the
+  // account: a declared model the account cannot access fails at task time
+  // with claude's own `model_not_found` error, which is the operator's
+  // signal to fix the declaration.
+  models?: readonly string[];
   /**
    * Test seam: invoked once per task with the caller-tools MCP server
    * handle immediately after the bridge stands one up (when the
@@ -167,9 +182,10 @@ export interface ClaudeBackendOptions {
   // user/project settings.json, including its `model` field, which would
   // make the probed model diverge from the model the real task spawn
   // actually loads). Set to 0 to disable the probe entirely — the daemon
-  // will simply not advertise `params.models` in its hello card, which
-  // is harmless (the spec is advisory) but blinds clients that want to
-  // route by declared model.
+  // then advertises only the operator-declared `models` (if any) without a
+  // default entry, or no `params.models` at all, which is harmless (the
+  // spec is advisory) but blinds clients that want to route by declared
+  // model.
   probeTimeoutMs?: number;
   // When true, dump A2A `parts` shape + metadata keys + raw
   // `chat_history` to stderr on every task. Operator diagnostic exposed
@@ -1193,27 +1209,53 @@ export function createClaudeBackend(
 
   const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
 
-  // Probed-model cache, populated by `resolveCapabilities` at daemon
+  // Operator-declared additional models (`opts.models`), deduped on the
+  // normalized form — against each other and against the `--claude-model`
+  // pin — so the advertise never carries the same canonical id twice.
+  // Original (un-normalized) spellings are preserved for the advertise so an
+  // operator declaring `claude-opus-4-8[1m]` advertises the tiered form they
+  // asked for; normalization is applied only where ids are compared.
+  const declaredModels: string[] = [];
+  {
+    const seen = new Set<string>();
+    if (opts.model) seen.add(normalizeClaudeModelId(opts.model));
+    for (const raw of opts.models ?? []) {
+      const id = raw.trim();
+      if (!id) continue;
+      const norm = normalizeClaudeModelId(id);
+      if (!norm || seen.has(norm)) continue;
+      seen.add(norm);
+      declaredModels.push(id);
+    }
+  }
+
+  // Advertised-model cache, populated by `resolveCapabilities` at daemon
   // startup and read sync from `handle()` to gate `envelope.model`
-  // forwarding (#302). `undefined` = "never probed", `null` = "probed but
-  // unavailable", string = "this is the only model id this claude install
-  // advertises". `handle()` deliberately does NOT trigger the probe on a
-  // miss — the probe spawns its own short-lived child, and the daemon
-  // already calls `resolveCapabilities` once at startup, so the cache is
-  // populated before any task lands in production. Tests that want to
-  // exercise the gate populate the cache via `resolveCapabilities`
-  // explicitly.
+  // forwarding (#302). Ids are stored normalized (tier suffix stripped) so
+  // the gate's membership check is canonical-form on both sides.
+  // `undefined` = "never probed", `null` = "probed but unavailable",
+  // Set = "these are the model ids this claude install advertises".
+  // `handle()` deliberately does NOT trigger the probe on a miss — the
+  // probe spawns its own short-lived child, and the daemon already calls
+  // `resolveCapabilities` once at startup, so the cache is populated before
+  // any task lands in production. Tests that want to exercise the gate
+  // populate the cache via `resolveCapabilities` explicitly.
   //
-  // A `--claude-model` pin seeds the cache directly: the pin IS the
-  // advertised model (every spawn loads it via settings.model), so it must
-  // be what the `envelope.model` gate compares against. Without this seed
-  // the probe — which deliberately runs WITHOUT our `--settings` (see
-  // `CLAUDE_PROBE_ARGS`) — would report claude's *unpinned* default, the
-  // gateway would route by that default, and the matching `--model <default>`
-  // argv would then override the pin on the spawn (CLI `--model` beats
-  // settings.model). Seeding here holds the pin even if `resolveCapabilities`
-  // never runs.
-  let cachedProbedModel: string | null | undefined = opts.model ?? undefined;
+  // A `--claude-model` pin (and any `--claude-models` declarations) seeds
+  // the cache directly: the pin IS the advertised default (every spawn
+  // loads it via settings.model), so it must be what the `envelope.model`
+  // gate compares against. Without this seed the probe — which deliberately
+  // runs WITHOUT our `--settings` (see `CLAUDE_PROBE_ARGS`) — would report
+  // claude's *unpinned* default, the gateway would route by that default,
+  // and the matching `--model <default>` argv would then override the pin
+  // on the spawn (CLI `--model` beats settings.model). Seeding here holds
+  // the pin even if `resolveCapabilities` never runs.
+  const seededModelIds = [
+    ...(opts.model ? [opts.model] : []),
+    ...declaredModels,
+  ].map(normalizeClaudeModelId);
+  let cachedAllowedModels: Set<string> | null | undefined =
+    seededModelIds.length > 0 ? new Set(seededModelIds) : undefined;
 
   return {
     name: 'claude',
@@ -1234,14 +1276,28 @@ export function createClaudeBackend(
     async resolveCapabilities() {
       // A pinned model is authoritative — there's nothing to discover, so
       // skip the probe spawn entirely (it can't see our `--settings` anyway)
-      // and advertise the pin, which the construction-time seed already put
-      // in `cachedProbedModel`.
+      // and advertise the pin (plus any operator-declared extra models),
+      // which the construction-time seed already put in
+      // `cachedAllowedModels`.
       if (opts.model) {
-        return { openaiCompatModels: [{ id: opts.model, default: true }] };
+        return {
+          openaiCompatModels: [
+            { id: opts.model, default: true },
+            ...declaredModels.map((id) => ({ id })),
+          ],
+        };
       }
       if (probeTimeoutMs <= 0) {
-        cachedProbedModel = null;
-        return {};
+        // No probe means no discovered default; operator-declared models
+        // (if any) are still advertised — without a `default: true` entry,
+        // which the spec allows (`default` is optional).
+        cachedAllowedModels =
+          declaredModels.length > 0
+            ? new Set(declaredModels.map(normalizeClaudeModelId))
+            : null;
+        return declaredModels.length > 0
+          ? { openaiCompatModels: declaredModels.map((id) => ({ id })) }
+          : {};
       }
       const model = await probeClaudeModel({
         command,
@@ -1249,11 +1305,22 @@ export function createClaudeBackend(
         cwd,
         timeoutMs: probeTimeoutMs,
       });
-      cachedProbedModel = model;
-      if (!model) return {};
-      return {
-        openaiCompatModels: [{ id: model, default: true }],
-      };
+      // The probed default may collide with a declared extra (the
+      // construction-time dedupe can only see the pin); drop the duplicate
+      // declaration so the advertise stays one-entry-per-canonical-id.
+      const extras = declaredModels.filter(
+        (id) => model === null || normalizeClaudeModelId(id) !== model,
+      );
+      const allowed = new Set([
+        ...(model ? [model] : []),
+        ...extras.map(normalizeClaudeModelId),
+      ]);
+      cachedAllowedModels = allowed.size > 0 ? allowed : null;
+      const entries: OpenAICompatModelAdvertise[] = [
+        ...(model ? [{ id: model, default: true }] : []),
+        ...extras.map((id) => ({ id })),
+      ];
+      return entries.length > 0 ? { openaiCompatModels: entries } : {};
     },
 
     async handle(task, rawEmit, signal) {
@@ -1329,21 +1396,27 @@ export function createClaudeBackend(
         envelope && typeof envelope.model === 'string' && envelope.model.length > 0
           ? envelope.model
           : undefined;
-      // Validate against the probed model id (cached by `resolveCapabilities`).
-      // When the gateway sends a value claude doesn't advertise — e.g. an
-      // unresolved routing key like `a2a/<card-url>` — drop the override so
-      // claude falls back to its own default rather than failing the turn
-      // (#302). When the cache is unpopulated (probeTimeoutMs ≤ 0, probe
-      // failed, or `resolveCapabilities` hasn't been called yet) the
-      // validation is skipped and `envelope.model` rides through unchanged.
+      // Validate against the advertised model ids (cached by
+      // `resolveCapabilities` from the probe, the `--claude-model` pin, and
+      // any `--claude-models` declarations). When the gateway sends a value
+      // claude doesn't advertise — e.g. an unresolved routing key like
+      // `a2a/<card-url>` — drop the override so claude falls back to its own
+      // default rather than failing the turn (#302). Membership is checked
+      // on the normalized (tier-suffix-stripped) form so a caller requesting
+      // `claude-opus-4-8[1m]` matches an advertised `claude-opus-4-8`; the
+      // raw inbound value still rides to the spawn so the tier selection
+      // survives. When the cache is unpopulated (probeTimeoutMs ≤ 0 with no
+      // declared models, probe failed, or `resolveCapabilities` hasn't been
+      // called yet) the validation is skipped and `envelope.model` rides
+      // through unchanged.
       let envelopeModel: string | undefined = envelopeModelRaw;
       if (
         envelopeModelRaw !== undefined &&
-        typeof cachedProbedModel === 'string' &&
-        envelopeModelRaw !== cachedProbedModel
+        cachedAllowedModels instanceof Set &&
+        !cachedAllowedModels.has(normalizeClaudeModelId(envelopeModelRaw))
       ) {
         timingLogger.warn?.(
-          `[claude] envelope.model=${JSON.stringify(envelopeModelRaw)} does not match this claude install's advertised model (${JSON.stringify(cachedProbedModel)}); falling back to claude default`,
+          `[claude] envelope.model=${JSON.stringify(envelopeModelRaw)} is not among this claude install's advertised models (${JSON.stringify([...cachedAllowedModels])}); falling back to claude default`,
         );
         envelopeModel = undefined;
       }

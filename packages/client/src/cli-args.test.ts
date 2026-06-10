@@ -195,6 +195,54 @@ test('--claude-model with a non-claude backend is a hard error', () => {
   );
 });
 
+test('--claude-models splits the comma-separated flag into a trimmed list', () => {
+  const r = mergeClientArgs(
+    {
+      token: 't',
+      agentId: 'a',
+      backend: 'claude',
+      claudeModels: ' claude-sonnet-4-6 , claude-haiku-4-5 ,',
+    },
+    {},
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.deepEqual(r.args.claudeModels, ['claude-sonnet-4-6', 'claude-haiku-4-5']);
+});
+
+test('--claude-models flag beats backends.claude.models from config', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude', claudeModels: 'claude-haiku-4-5' },
+    { backends: { claude: { models: ['claude-sonnet-4-6'] } } },
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.deepEqual(r.args.claudeModels, ['claude-haiku-4-5']);
+});
+
+test('backends.claude.models fills in when the flag is absent', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude' },
+    { backends: { claude: { models: ['claude-sonnet-4-6', 'claude-haiku-4-5'] } } },
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.deepEqual(r.args.claudeModels, ['claude-sonnet-4-6', 'claude-haiku-4-5']);
+});
+
+test('--claude-models with a non-claude backend is a hard error', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'codex', claudeModels: 'claude-haiku-4-5' },
+    {},
+  );
+  assert.equal(r.ok, false);
+  if (r.ok) return;
+  assert.ok(
+    r.errors.some((e) => e.includes('--claude-models') && e.includes('codex')),
+    `expected error mentioning --claude-models and codex, got: ${r.errors.join(' | ')}`,
+  );
+});
+
 test('parseFlags picks up known flags', () => {
   const r = parseFlags([
     '--server', 'wss://x',
