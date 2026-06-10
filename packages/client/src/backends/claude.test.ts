@@ -2659,7 +2659,7 @@ test('envelope.model differing from the --claude-model pin falls back to the pin
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Multi-model declarations (`models` option / --claude-models). Claude Code
+// Multi-model declarations (`models` option / --claude-supported-models). Claude Code
 // has no headless model listing, so extra models are operator-declared:
 // advertised after the default and accepted by the envelope.model gate.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2679,7 +2679,7 @@ test('declared models are advertised after the probed default', async () => {
   });
   const backend = createClaudeBackend({
     spawn: fake.spawn,
-    models: ['claude-sonnet-4-6', 'claude-haiku-4-5'],
+    supportedModels: ['claude-sonnet-4-6', 'claude-haiku-4-5'],
   });
   const caps = await backend.resolveCapabilities!();
   assert.deepEqual(caps, {
@@ -2707,7 +2707,7 @@ test('declared models are advertised after a --claude-model pin without probing'
   const backend = createClaudeBackend({
     spawn: countingSpawn,
     model: 'claude-opus-4-8',
-    models: ['claude-sonnet-4-6'],
+    supportedModels: ['claude-sonnet-4-6'],
   });
   const caps = await backend.resolveCapabilities!();
   assert.deepEqual(caps, {
@@ -2727,7 +2727,7 @@ test('declared models deduplicate against the pin and the probed default on the 
   const pinned = createClaudeBackend({
     spawn: fakePin.spawn,
     model: 'claude-opus-4-8',
-    models: ['claude-opus-4-8[1m]', 'claude-sonnet-4-6', 'claude-sonnet-4-6'],
+    supportedModels: ['claude-opus-4-8[1m]', 'claude-sonnet-4-6', 'claude-sonnet-4-6'],
   });
   assert.deepEqual(await pinned.resolveCapabilities!(), {
     openaiCompatModels: [
@@ -2752,7 +2752,7 @@ test('declared models deduplicate against the pin and the probed default on the 
   });
   const probed = createClaudeBackend({
     spawn: fakeProbe.spawn,
-    models: ['claude-opus-4-8', 'claude-haiku-4-5'],
+    supportedModels: ['claude-opus-4-8', 'claude-haiku-4-5'],
   });
   assert.deepEqual(await probed.resolveCapabilities!(), {
     openaiCompatModels: [
@@ -2773,7 +2773,7 @@ test('envelope.model matching a declared model rides through as --model', async 
   const backend = createClaudeBackend({
     spawn: fake.spawn,
     model: 'claude-opus-4-8',
-    models: ['claude-sonnet-4-6'],
+    supportedModels: ['claude-sonnet-4-6'],
   });
   await backend.resolveCapabilities?.();
   const { emit } = collect();
@@ -2799,7 +2799,7 @@ test('envelope.model outside the declared set is still dropped', async () => {
   const backend = createClaudeBackend({
     spawn: fake.spawn,
     model: 'claude-opus-4-8',
-    models: ['claude-sonnet-4-6'],
+    supportedModels: ['claude-sonnet-4-6'],
   });
   await backend.resolveCapabilities?.();
   const { emit } = collect();
@@ -2850,7 +2850,7 @@ test('probeTimeoutMs:0 with declared models advertises them without a default en
   const backend = createClaudeBackend({
     spawn: countingSpawn,
     probeTimeoutMs: 0,
-    models: ['claude-sonnet-4-6', 'claude-haiku-4-5'],
+    supportedModels: ['claude-sonnet-4-6', 'claude-haiku-4-5'],
   });
   const caps = await backend.resolveCapabilities!();
   assert.deepEqual(caps, {

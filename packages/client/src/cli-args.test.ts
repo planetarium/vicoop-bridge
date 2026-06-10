@@ -195,51 +195,51 @@ test('--claude-model with a non-claude backend is a hard error', () => {
   );
 });
 
-test('--claude-models splits the comma-separated flag into a trimmed list', () => {
+test('--claude-supported-models splits the comma-separated flag into a trimmed list', () => {
   const r = mergeClientArgs(
     {
       token: 't',
       agentId: 'a',
       backend: 'claude',
-      claudeModels: ' claude-sonnet-4-6 , claude-haiku-4-5 ,',
+      claudeSupportedModels: ' claude-sonnet-4-6 , claude-haiku-4-5 ,',
     },
     {},
   );
   assert.equal(r.ok, true);
   if (!r.ok) return;
-  assert.deepEqual(r.args.claudeModels, ['claude-sonnet-4-6', 'claude-haiku-4-5']);
+  assert.deepEqual(r.args.claudeSupportedModels, ['claude-sonnet-4-6', 'claude-haiku-4-5']);
 });
 
-test('--claude-models flag beats backends.claude.models from config', () => {
+test('--claude-supported-models flag beats backends.claude.supported_models from config', () => {
   const r = mergeClientArgs(
-    { token: 't', agentId: 'a', backend: 'claude', claudeModels: 'claude-haiku-4-5' },
-    { backends: { claude: { models: ['claude-sonnet-4-6'] } } },
+    { token: 't', agentId: 'a', backend: 'claude', claudeSupportedModels: 'claude-haiku-4-5' },
+    { backends: { claude: { supported_models: ['claude-sonnet-4-6'] } } },
   );
   assert.equal(r.ok, true);
   if (!r.ok) return;
-  assert.deepEqual(r.args.claudeModels, ['claude-haiku-4-5']);
+  assert.deepEqual(r.args.claudeSupportedModels, ['claude-haiku-4-5']);
 });
 
-test('backends.claude.models fills in when the flag is absent', () => {
+test('backends.claude.supported_models fills in when the flag is absent', () => {
   const r = mergeClientArgs(
     { token: 't', agentId: 'a', backend: 'claude' },
-    { backends: { claude: { models: ['claude-sonnet-4-6', 'claude-haiku-4-5'] } } },
+    { backends: { claude: { supported_models: ['claude-sonnet-4-6', 'claude-haiku-4-5'] } } },
   );
   assert.equal(r.ok, true);
   if (!r.ok) return;
-  assert.deepEqual(r.args.claudeModels, ['claude-sonnet-4-6', 'claude-haiku-4-5']);
+  assert.deepEqual(r.args.claudeSupportedModels, ['claude-sonnet-4-6', 'claude-haiku-4-5']);
 });
 
-test('--claude-models with a non-claude backend is a hard error', () => {
+test('--claude-supported-models with a non-claude backend is a hard error', () => {
   const r = mergeClientArgs(
-    { token: 't', agentId: 'a', backend: 'codex', claudeModels: 'claude-haiku-4-5' },
+    { token: 't', agentId: 'a', backend: 'codex', claudeSupportedModels: 'claude-haiku-4-5' },
     {},
   );
   assert.equal(r.ok, false);
   if (r.ok) return;
   assert.ok(
-    r.errors.some((e) => e.includes('--claude-models') && e.includes('codex')),
-    `expected error mentioning --claude-models and codex, got: ${r.errors.join(' | ')}`,
+    r.errors.some((e) => e.includes('--claude-supported-models') && e.includes('codex')),
+    `expected error mentioning --claude-supported-models and codex, got: ${r.errors.join(' | ')}`,
   );
 });
 

@@ -123,9 +123,9 @@ export interface ClaudeBackendConfig {
    * per-request openai-compat `model` overrides (forwarded to the spawn as
    * `--model <id>`). Not validated against the account — a model the
    * account cannot access fails at task time with claude's own
-   * `model_not_found`. Mirrors the `--claude-models` flag.
+   * `model_not_found`. Mirrors the `--claude-supported-models` flag.
    */
-  models?: string[];
+  supported_models?: string[];
   runtime?: BackendRuntime;
   runtime_name?: string;
 }
@@ -263,7 +263,7 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const cwd = asString(claudeRaw.cwd);
       const settings = asRecord(claudeRaw.settings);
       const model = asString(claudeRaw.model);
-      const models = asStringArray(claudeRaw.models);
+      const models = asStringArray(claudeRaw.supported_models);
       const runtime = pickBackendRuntime(claudeRaw.runtime);
       const runtimeName = asString(claudeRaw.runtime_name);
       if (cwd || settings || model || models || runtime || runtimeName) {
@@ -271,7 +271,7 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
         if (cwd) out.claude.cwd = cwd;
         if (settings) out.claude.settings = settings;
         if (model) out.claude.model = model;
-        if (models) out.claude.models = models;
+        if (models) out.claude.supported_models = models;
         if (runtime) out.claude.runtime = runtime;
         if (runtimeName) out.claude.runtime_name = runtimeName;
       }
