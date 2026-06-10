@@ -3415,15 +3415,20 @@ test('envelope.model reports the assistant turn model, not the modelUsage winner
   assert.equal(payload.usage, undefined);
 });
 
-test('envelope.model falls back to the requested model id when no assistant event names one (#348)', async () => {
-  // result-only turn: claude emits a `result` event (with modelUsage) but no
-  // `assistant` event carrying a model. The envelope must then report the
-  // requested model id — already forwarded to claude as `--model` (#302) —
-  // not the largest-output sub-model. The requested id carries the `[1m]`
-  // tier suffix on the wire; the envelope normalises it off.
+test('envelope.model falls back to the system/init model when no assistant event names one (#348)', async () => {
+  // result-only turn: claude emits a `system/init` (carrying the resolved
+  // model) and a `result` event (with modelUsage), but no `assistant` event
+  // carrying a model. The envelope must report claude's resolved model — not
+  // the largest-output sub-model. The init model carries the `[1m]` tier
+  // suffix; the envelope normalises it off.
   const fake = scriptedSpawn({
     lines: [
-      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'sid',
+        model: 'claude-opus-4-8[1m]',
+      }),
       JSON.stringify({
         type: 'result',
         subtype: 'success',
@@ -3448,7 +3453,7 @@ test('envelope.model falls back to the requested model id when no assistant even
   const backend = createClaudeBackend({ spawn: fake.spawn });
   const { emit, frames } = collect();
   await backend.handle(
-    assignWithOpenAICompat('reply router-ok', { model: 'claude-opus-4-8[1m]' }),
+    assignWithOpenAICompat('reply router-ok', { model: 'claude-opus-4-8' }),
     emit,
     NEVER,
   );
@@ -3460,10 +3465,42 @@ test('envelope.model falls back to the requested model id when no assistant even
   };
   const envelope = payload?.chat_completion;
   assert.ok(envelope, 'chat_completion envelope present');
-  // Requested model id, tier suffix stripped — NOT the haiku modelUsage winner.
+  // system/init model id, tier suffix stripped — NOT the haiku modelUsage winner.
   assert.equal(envelope.model, 'claude-opus-4-8');
   const envUsage = envelope.usage as { model?: string };
   assert.equal(envUsage.model, 'claude-opus-4-8');
+});
+
+test('envelope.model never reports the requested routing slug / card url (#348)', async () => {
+  // The gateway can send an unresolved routing key (e.g. an A2A card url) as
+  // `envelope.model`; claude drops it before `--model` and runs its own
+  // default (#302). The envelope must report the REAL model claude resolved
+  // (from system/init), never echo the slug back as if it were a model.
+  const slug = 'a2a/https://example.com/agents/x/.well-known/agent-card.json';
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'sid',
+        model: 'claude-opus-4-8[1m]',
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'router-ok' }),
+    ],
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assignWithOpenAICompat('reply router-ok', { model: slug }), emit, NEVER);
+
+  const metadata = completionMessageMetadata(frames);
+  assert.ok(metadata, 'task.complete message should carry metadata');
+  const payload = metadata[OPENAI_COMPAT_EXTENSION_URI] as {
+    chat_completion?: Record<string, unknown>;
+  };
+  const envelope = payload?.chat_completion;
+  assert.ok(envelope, 'chat_completion envelope present');
+  assert.equal(envelope.model, 'claude-opus-4-8', 'reports claude resolved model, not the slug');
+  assert.notEqual(envelope.model, slug);
 });
 
 test('zero cacheRead does not surface a cached_tokens breakdown', async () => {

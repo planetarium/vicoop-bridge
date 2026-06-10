@@ -228,6 +228,15 @@ interface SessionEntry {
 // filter/count tool calls reliably even after the text was clipped.
 interface StreamEvent {
   type?: unknown;
+  // `subtype` + top-level `model` ride on the `system/init` event — the
+  // session metadata claude emits first, before any turn. `model` is the
+  // model claude actually resolved to run with (real model id; a routing
+  // slug / A2A card url is dropped before reaching `--model`, so init
+  // reports claude's resolved default, never the slug). Used as the
+  // openai-compat envelope's model fallback when no assistant turn named one
+  // (e.g. a result-only turn) (#348).
+  subtype?: unknown;
+  model?: unknown;
   message?: {
     role?: unknown;
     content?: unknown;
@@ -1968,6 +1977,12 @@ export function createClaudeBackend(
       // model directly. Last writer wins — under `--max-turns 1` there is a
       // single response turn.
       let assistantModel: string | null = null;
+      // The model claude resolved to run with, from the `system/init` event.
+      // Fallback for the envelope's `model` when no assistant turn named one
+      // (e.g. a result-only turn). Always a real model id — a routing slug /
+      // A2A card url in the request is dropped before reaching `--model`, so
+      // init reports claude's resolved default rather than the slug (#348).
+      let initModel: string | null = null;
       let responseArtifactId: string | null = null;
       let streamedResponseText = '';
       let sawCompletedResult = false;
@@ -2155,6 +2170,16 @@ export function createClaudeBackend(
             `[openai-compat trace] claude event type=${evt.type}` +
               (textLen !== undefined ? ` textLen=${textLen}` : ''),
           );
+        }
+        if (evt.type === 'system' && evt.subtype === 'init') {
+          // Record claude's resolved model for the openai-compat envelope
+          // fallback (#348). Normalised to drop the `[1m]` tier suffix so it
+          // matches the advertised id form and `usage.model`.
+          if (typeof evt.model === 'string' && evt.model.length > 0) {
+            const normalised = normalizeClaudeModelId(evt.model);
+            if (normalised.length > 0) initModel = normalised;
+          }
+          return;
         }
         if (evt.type === 'stream_event') {
           const delta = extractClaudeStreamTextDelta(evt);
@@ -2573,19 +2598,19 @@ export function createClaudeBackend(
       const finishReason: 'tool_calls' | 'stop' =
         capturedToolCalls.length > 0 ? 'tool_calls' : 'stop';
       const assistantContent = capturedToolCalls.length > 0 ? null : completeText;
-      // Resolve the response model (#348). Two authoritative sources, in
-      // order: (1) the model the `assistant` turn reported — the model that
-      // actually produced the answer; (2) the requested model id, which the
-      // gateway already forwarded to claude as `--model` (#302), used when no
-      // assistant event named a model (e.g. claude emitted only a `result`
-      // event). The old `modelUsage` largest-output-share heuristic is gone —
-      // it mislabelled short responses with an internal sub-model (haiku for
-      // title generation). When neither source is available the envelope falls
-      // back to its `'claude'` placeholder. `envelopeModel` carries the raw
-      // inbound tier suffix; normalise it to match the advertised id form (the
-      // assistant id is already normalised at capture).
-      const responseModel =
-        assistantModel ?? (envelopeModel ? normalizeClaudeModelId(envelopeModel) : undefined);
+      // Resolve the response model (#348). Both sources come from claude
+      // itself and are always real model ids, in order: (1) the model the
+      // `assistant` turn reported — the model that actually produced the
+      // answer; (2) the `system/init` model — claude's resolved model — used
+      // when no assistant event named one (e.g. claude emitted only a `result`
+      // event). We deliberately do NOT fall back to the requested
+      // `envelope.model`: that is the caller's request, which may be a routing
+      // slug or an A2A card url (dropped before reaching `--model`, #302), not
+      // a real model id. The old `modelUsage` largest-output-share heuristic is
+      // gone — it mislabelled short responses with an internal sub-model (haiku
+      // for title generation). When neither source is available the envelope
+      // falls back to its `'claude'` placeholder.
+      const responseModel = assistantModel ?? initModel ?? undefined;
       // Stamp the resolved id onto the usage so `usage.model` stays consistent
       // with the envelope's top-level `model` (the spec's "id SHOULD match
       // usage.model" cross-check). The token *sums* are untouched — they
