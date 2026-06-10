@@ -5,6 +5,7 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import { stream } from 'hono/streaming';
 import { html } from 'hono/html';
 import { cors } from 'hono/cors';
+import { sentry } from '@sentry/hono/node';
 import {
   A2XAgent,
   DefaultRequestHandler,
@@ -95,6 +96,11 @@ export function stripCallerSuppliedInternalKeys(message: Record<string, unknown>
 
 export function createHttpApp(opts: ServerHttpOptions): Hono {
   const app = new Hono();
+
+  // Sentry request tracing + error capture. Sentry.init() runs in instrument.ts
+  // (imported first in cli.ts); register this before any other middleware so it
+  // wraps the entire request lifecycle and captures errors from app.onError.
+  app.use(sentry(app));
 
   // The deployed admin UI lives at the same origin as the bridge (mounted
   // under /admin), but during local dev it runs on Vite. Reflect the

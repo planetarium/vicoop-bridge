@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+// Imported first so Sentry.init() runs before any other module is evaluated.
+import './instrument.js';
 import { startServer } from './index.js';
 import { createDb, ensureSchema } from './db.js';
 import { startPostGraphile } from './postgraphile.js';
