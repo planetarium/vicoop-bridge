@@ -231,6 +231,12 @@ interface StreamEvent {
   message?: {
     role?: unknown;
     content?: unknown;
+    // Present on `assistant` events: the model that produced this turn's
+    // user-facing content. This is the authoritative model id for the
+    // openai-compat envelope — unlike `result.modelUsage`, which can be
+    // dominated by an internal sub-model (e.g. haiku for title generation)
+    // on short responses and so mislabel the envelope's `model` (#348).
+    model?: unknown;
   };
   event?: unknown;
   result?: unknown;
@@ -277,18 +283,20 @@ export function normalizeClaudeModelId(raw: string): string {
 //   prompt_tokens = Σ_M (inputTokens + cacheCreationInputTokens + cacheReadInputTokens)
 //   prompt_tokens_details.cached_tokens = Σ_M cacheReadInputTokens  (lossless mirror)
 //   completion_tokens = Σ_M outputTokens
-// `model` is reported as the entry with the largest output share — usually
-// the user-facing primary model; ties go to whichever Object.entries returns
-// first, which is fine for telemetry.
+//
+// This computes token SUMS only — it does NOT pick a `model` label. The
+// envelope's `model` is resolved by the caller from the model that actually
+// answered (the `assistant` event) or the requested model id, not from a
+// largest-output-share heuristic over `modelUsage` (which mislabels short
+// responses — #348). The caller stamps the resolved id onto the returned
+// usage so `usage.model` stays consistent with the envelope's top-level id.
 export function parseClaudeModelUsageForOpenAICompat(raw: unknown): OpenAICompatUsage | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   let promptSum = 0;
   let completionSum = 0;
   let cacheReadSum = 0;
-  let primaryModel: string | null = null;
-  let primaryOutput = -1;
   let saw = false;
-  for (const [modelKey, perModel] of Object.entries(raw as Record<string, unknown>)) {
+  for (const [, perModel] of Object.entries(raw as Record<string, unknown>)) {
     if (!perModel || typeof perModel !== 'object' || Array.isArray(perModel)) continue;
     const m = perModel as Record<string, unknown>;
     const input = typeof m.inputTokens === 'number' ? m.inputTokens : 0;
@@ -299,10 +307,6 @@ export function parseClaudeModelUsageForOpenAICompat(raw: unknown): OpenAICompat
     promptSum += input + cacheCreate + cacheRead;
     completionSum += output;
     cacheReadSum += cacheRead;
-    if (output > primaryOutput) {
-      primaryOutput = output;
-      primaryModel = modelKey;
-    }
     saw = true;
   }
   if (!saw) return null;
@@ -310,7 +314,6 @@ export function parseClaudeModelUsageForOpenAICompat(raw: unknown): OpenAICompat
     prompt_tokens: promptSum,
     completion_tokens: completionSum,
     cached_tokens: cacheReadSum > 0 ? cacheReadSum : undefined,
-    model: primaryModel ? normalizeClaudeModelId(primaryModel) : undefined,
   });
 }
 
@@ -1956,6 +1959,15 @@ export function createClaudeBackend(
       // later flow analysis collapses the type. Mirrors codex.ts's
       // `finalUsage` declaration for the same reason.
       let finalUsage: OpenAICompatUsage | null = null as OpenAICompatUsage | null;
+      // The model id reported on `assistant` events — the model that actually
+      // produced the user-facing turn. Preferred over the `result.modelUsage`
+      // heuristic for the openai-compat envelope's `model` field (#348): on
+      // short responses an internal sub-model (haiku for title generation) can
+      // out-produce the response model in token count, so the largest-output
+      // heuristic mislabels the envelope. The assistant event names the right
+      // model directly. Last writer wins — under `--max-turns 1` there is a
+      // single response turn.
+      let assistantModel: string | null = null;
       let responseArtifactId: string | null = null;
       let streamedResponseText = '';
       let sawCompletedResult = false;
@@ -2156,6 +2168,12 @@ export function createClaudeBackend(
         if (evt.type === 'assistant') {
           if (evt.message?.role !== 'assistant') return;
           recorder.mark('firstAssistant');
+          // Record the model that produced this turn for the openai-compat
+          // envelope (#348). Normalised to drop CC's `[1m]` tier suffix so it
+          // matches the advertised model id and `usage.model`.
+          if (typeof evt.message.model === 'string' && evt.message.model.length > 0) {
+            assistantModel = normalizeClaudeModelId(evt.message.model);
+          }
           // A single assistant turn can interleave plain text and tool_use
           // blocks. Emit the text (if any) first so observers see "what the
           // model said" before "what tools it then called", matching the
@@ -2555,18 +2573,40 @@ export function createClaudeBackend(
       const finishReason: 'tool_calls' | 'stop' =
         capturedToolCalls.length > 0 ? 'tool_calls' : 'stop';
       const assistantContent = capturedToolCalls.length > 0 ? null : completeText;
+      // Resolve the response model (#348). Two authoritative sources, in
+      // order: (1) the model the `assistant` turn reported — the model that
+      // actually produced the answer; (2) the requested model id, which the
+      // gateway already forwarded to claude as `--model` (#302), used when no
+      // assistant event named a model (e.g. claude emitted only a `result`
+      // event). The old `modelUsage` largest-output-share heuristic is gone —
+      // it mislabelled short responses with an internal sub-model (haiku for
+      // title generation). When neither source is available the envelope falls
+      // back to its `'claude'` placeholder. `envelopeModel` carries the raw
+      // inbound tier suffix; normalise it to match the advertised id form (the
+      // assistant id is already normalised at capture).
+      const responseModel =
+        assistantModel ?? (envelopeModel ? normalizeClaudeModelId(envelopeModel) : undefined);
+      // Stamp the resolved id onto the usage so `usage.model` stays consistent
+      // with the envelope's top-level `model` (the spec's "id SHOULD match
+      // usage.model" cross-check). The token *sums* are untouched — they
+      // remain the across-sub-model totals from `modelUsage`.
+      const envelopeUsage =
+        finalUsage && responseModel ? { ...finalUsage, model: responseModel } : finalUsage;
       const responseEnvelope = envelope
         ? buildClaudeChatCompletionEnvelope({
             taskId: task.taskId,
-            model: finalUsage?.model,
+            model: responseModel,
             content: assistantContent,
             toolCalls: capturedToolCalls.length > 0 ? capturedToolCalls : undefined,
             finishReason,
-            usage: finalUsage,
+            usage: envelopeUsage,
           })
         : undefined;
 
-      const messageMetadata = buildOpenAICompatResponseMetadata(responseEnvelope, finalUsage);
+      // The bare `usage` path (no envelope) gets the same model stamp so plain
+      // A2A telemetry consumers see the response model whenever one was
+      // resolved (#348).
+      const messageMetadata = buildOpenAICompatResponseMetadata(responseEnvelope, envelopeUsage);
       // When parts is empty but we have envelope/usage to convey, still
       // emit the message frame so the metadata reaches the gateway.
       const hasMessage = parts.length > 0 || messageMetadata !== undefined;
