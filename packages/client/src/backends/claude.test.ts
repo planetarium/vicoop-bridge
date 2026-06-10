@@ -2658,6 +2658,207 @@ test('envelope.model differing from the --claude-model pin falls back to the pin
   assert.equal(JSON.parse(String(args[settingsIdx + 1])).model, 'claude-opus-4-8');
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-model declarations (`models` option / --claude-models). Claude Code
+// has no headless model listing, so extra models are operator-declared:
+// advertised after the default and accepted by the envelope.model gate.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('declared models are advertised after the probed default', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'sid',
+        model: 'claude-opus-4-8',
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    models: ['claude-sonnet-4-6', 'claude-haiku-4-5'],
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [
+      { id: 'claude-opus-4-8', default: true },
+      { id: 'claude-sonnet-4-6' },
+      { id: 'claude-haiku-4-5' },
+    ],
+  });
+});
+
+test('declared models are advertised after a --claude-model pin without probing', async () => {
+  let spawned = 0;
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const countingSpawn: typeof fake.spawn = (cmd, a, o) => {
+    spawned += 1;
+    return fake.spawn(cmd, a, o);
+  };
+  const backend = createClaudeBackend({
+    spawn: countingSpawn,
+    model: 'claude-opus-4-8',
+    models: ['claude-sonnet-4-6'],
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [
+      { id: 'claude-opus-4-8', default: true },
+      { id: 'claude-sonnet-4-6' },
+    ],
+  });
+  assert.equal(spawned, 0, 'pinned model must not trigger a probe spawn');
+});
+
+test('declared models deduplicate against the pin and the probed default on the normalized form', async () => {
+  // Pin path: a declared entry that normalizes to the pin must not produce
+  // a second advertise entry (the operator wrote the same canonical model
+  // twice, once with a tier suffix).
+  const fakePin = scriptedSpawn({ lines: [], exitCode: 0 });
+  const pinned = createClaudeBackend({
+    spawn: fakePin.spawn,
+    model: 'claude-opus-4-8',
+    models: ['claude-opus-4-8[1m]', 'claude-sonnet-4-6', 'claude-sonnet-4-6'],
+  });
+  assert.deepEqual(await pinned.resolveCapabilities!(), {
+    openaiCompatModels: [
+      { id: 'claude-opus-4-8', default: true },
+      { id: 'claude-sonnet-4-6' },
+    ],
+  });
+
+  // Probe path: the probed default may collide with a declared entry too —
+  // construction-time dedupe can't see it, so resolveCapabilities drops it.
+  const fakeProbe = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'sid',
+        model: 'claude-opus-4-8',
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const probed = createClaudeBackend({
+    spawn: fakeProbe.spawn,
+    models: ['claude-opus-4-8', 'claude-haiku-4-5'],
+  });
+  assert.deepEqual(await probed.resolveCapabilities!(), {
+    openaiCompatModels: [
+      { id: 'claude-opus-4-8', default: true },
+      { id: 'claude-haiku-4-5' },
+    ],
+  });
+});
+
+test('envelope.model matching a declared model rides through as --model', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    model: 'claude-opus-4-8',
+    models: ['claude-sonnet-4-6'],
+  });
+  await backend.resolveCapabilities?.();
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('hi', { model: 'claude-sonnet-4-6' }),
+    emit,
+    NEVER,
+  );
+  const args = fake.lastChild()?.args ?? [];
+  const modelIdx = args.indexOf('--model');
+  assert.notEqual(modelIdx, -1, '--model present for a declared model');
+  assert.equal(args[modelIdx + 1], 'claude-sonnet-4-6');
+});
+
+test('envelope.model outside the declared set is still dropped', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    model: 'claude-opus-4-8',
+    models: ['claude-sonnet-4-6'],
+  });
+  await backend.resolveCapabilities?.();
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('hi', {
+      model: 'a2a/https://example.com/agents/x/.well-known/agent-card.json',
+    }),
+    emit,
+    NEVER,
+  );
+  const args = fake.lastChild()?.args ?? [];
+  assert.equal(args.indexOf('--model'), -1, 'undeclared envelope.model must be dropped');
+});
+
+test('envelope.model gate matches on the normalized form but forwards the raw value', async () => {
+  // A caller selecting the 1M tier of an advertised model
+  // (`claude-opus-4-8[1m]` vs advertised `claude-opus-4-8`) must pass the
+  // gate AND keep the tier suffix on the spawned argv — the suffix is how
+  // Claude Code picks the context tier.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn, model: 'claude-opus-4-8' });
+  await backend.resolveCapabilities?.();
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('hi', { model: 'claude-opus-4-8[1m]' }),
+    emit,
+    NEVER,
+  );
+  const args = fake.lastChild()?.args ?? [];
+  const modelIdx = args.indexOf('--model');
+  assert.notEqual(modelIdx, -1, 'tier-suffixed request for an advertised model must pass');
+  assert.equal(args[modelIdx + 1], 'claude-opus-4-8[1m]', 'raw tiered id rides to the spawn');
+});
+
+test('probeTimeoutMs:0 with declared models advertises them without a default entry', async () => {
+  let spawned = 0;
+  const fake = scriptedSpawn({ lines: [], exitCode: 0 });
+  const countingSpawn: typeof fake.spawn = (cmd, a, o) => {
+    spawned += 1;
+    return fake.spawn(cmd, a, o);
+  };
+  const backend = createClaudeBackend({
+    spawn: countingSpawn,
+    probeTimeoutMs: 0,
+    models: ['claude-sonnet-4-6', 'claude-haiku-4-5'],
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [{ id: 'claude-sonnet-4-6' }, { id: 'claude-haiku-4-5' }],
+  });
+  assert.equal(spawned, 0, 'probeTimeoutMs:0 must skip the probe spawn');
+});
+
 test('spawn argv carries --system-prompt with the native directive when metadata is present', async () => {
   const fake = scriptedSpawn({
     lines: [

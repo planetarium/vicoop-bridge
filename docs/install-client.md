@@ -660,13 +660,14 @@ different repository than the one `vicoop-client` itself runs in:
 vicoop-client start \
   --backend claude \
   --cwd "$HOME/vicoop-bridge" \
-  --claude-model claude-opus-4-8
+  --claude-model claude-opus-4-8 \
+  --claude-models claude-sonnet-4-6,claude-haiku-4-5
 ```
 
 These knobs can also live in the canonical `config.json` (resolved per Step
 4 — `~/.vicoop/config.json` by default) under `backends.claude`
-(`cwd`, `settings`, `model`) so the foreground command shrinks to just
-`vicoop-client start`; the flag wins over config, mirroring
+(`cwd`, `settings`, `model`, `models`) so the foreground command shrinks to
+just `vicoop-client start`; the flag wins over config, mirroring
 the daemon-level precedence (Step 6 intro).
 
 | Flag | `backends.claude.*` |
@@ -674,6 +675,7 @@ the daemon-level precedence (Step 6 intro).
 | `--cwd` | `cwd` |
 | `--claude-settings-file` | `settings` (JSON object) |
 | `--claude-model` | `model` |
+| `--claude-models` | `models` (string array) |
 
 > **Picking a model.** `--claude-model <id>` (e.g. `claude-opus-4-8`) is
 > folded into Claude `--settings` as its `model` field, so it composes with
@@ -682,6 +684,20 @@ the daemon-level precedence (Step 6 intro).
 > (project / user `settings.json`, `ANTHROPIC_MODEL`, built-in default). A
 > per-request openai-compat `model` still overrides it. The flag is
 > claude-only — pairing it with another `--backend` exits non-zero.
+
+> **Serving more than one model.** Claude Code has no headless "list
+> models" interface, so by default the bridge advertises (and accepts
+> per-request `model` overrides for) only the single default model —
+> the `--claude-model` pin or the startup-probed id. To open up more,
+> declare them: `--claude-models claude-sonnet-4-6,claude-haiku-4-5`
+> (comma-separated) or `backends.claude.models` in `config.json`. Declared
+> ids are advertised on the agent card's openai-compat `params.models[]`
+> after the default, and a per-request openai-compat `model` matching one
+> rides to the spawned `claude` as `--model <id>`. The list is **not
+> validated against your account** — a declared model your plan can't
+> access fails at task time with Claude's own `model_not_found` error, so
+> only declare models you've confirmed work in your local `claude`. The
+> flag is claude-only, same as `--claude-model`.
 
 > **Sandbox-on by default.** When neither `--claude-settings-file` nor
 > `backends.claude.settings` is set, the backend forwards
