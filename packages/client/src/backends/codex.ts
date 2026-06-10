@@ -84,6 +84,15 @@ export interface CodexBackendOptions {
   // (no client-side timeout — the server is authoritative). Set to a
   // positive value to fail-fast against a hung agent.
   turnTimeoutMs?: number;
+  // How long to hold the `turn/interrupt` after an `item/tool/call`,
+  // waiting for codex's `thread/tokenUsage/updated` to land first (#351).
+  // Interrupting immediately races ahead of codex's token accounting and
+  // the turn's usage is dropped entirely; the notification arrives within
+  // tens of ms of the tool call once the bridge has answered it, while the
+  // next model iteration takes ~500ms to start — so a short hold recovers
+  // real usage at no extra model cost. On timeout the interrupt is sent
+  // anyway and the `{0,0,0}` placeholder path applies. Default 1s.
+  toolCallUsageWaitMs?: number;
   // Test seam — overrides the default codex config.toml reader used by
   // `resolveCapabilities` to advertise the underlying model on the
   // openai-compat/v1 extension. Returning `null` (or rejecting) keeps the
@@ -671,6 +680,7 @@ export function createCodexBackend(
   const logger = opts.logger ?? createLogger();
   const initializeTimeoutMs = opts.initializeTimeoutMs ?? 10_000;
   const turnTimeoutMs = opts.turnTimeoutMs ?? 0;
+  const toolCallUsageWaitMs = opts.toolCallUsageWaitMs ?? 1_000;
   // Precomputed once at construction (identity is per-daemon, not per-task).
   // Prepended to `developerInstructions` on every `thread/start` so the model
   // recognises its own mention / acct in user messages. See PR #129.
@@ -1443,6 +1453,38 @@ export function createCodexBackend(
           // `tool_calls` artifact, matching OpenAI Chat Completions'
           // `finish_reason: "tool_calls"` semantics.
           let capturedToolCall = false;
+          // Deferred `turn/interrupt` for tool-call turns (#351). codex
+          // app-server runs its token accounting (and the resulting
+          // `thread/tokenUsage/updated`) only AFTER the bridge has answered
+          // the `item/tool/call` server request — and an interrupt that
+          // lands before that point aborts the turn task with the usage
+          // dropped everywhere (no notification, no `turn/completed`
+          // payload, `info: null` even in codex's own rollout record). So
+          // instead of interrupting inside the tool-call handler, we arm a
+          // deferred interrupt here: it fires as soon as the usage
+          // notification for this turn arrives, or after
+          // `toolCallUsageWaitMs` as a backstop. Measured against codex
+          // 0.139, usage lands within tens of ms of the tool-call response
+          // while the next model iteration needs ~500ms to start, so the
+          // hold recovers real usage without letting the model continue.
+          let interruptRequested = false;
+          let interruptSent = false;
+          let interruptTimer: ReturnType<typeof setTimeout> | null = null;
+          const sendDeferredInterrupt = (): void => {
+            if (interruptSent) return;
+            interruptSent = true;
+            if (interruptTimer !== null) {
+              clearTimeout(interruptTimer);
+              interruptTimer = null;
+            }
+            if (activeTurnId) {
+              void client
+                .request('turn/interrupt', { threadId, turnId: activeTurnId })
+                .catch(() => {
+                  // Best-effort; the turn loop watches for turn/completed.
+                });
+            }
+          };
           // OpenAI Chat Completions tool_calls accumulated from codex's
           // server-initiated `item/tool/call` events. Surfaced to the gateway
           // via the terminal `chat_completion` envelope on
@@ -1480,17 +1522,27 @@ export function createCodexBackend(
                 type: 'function',
                 function: { name: p.tool, arguments: argsString },
               });
-              // Best-effort `turn/interrupt` so codex unwinds the turn —
-              // the model's function_call is already surfaced upstream and
-              // we don't want it generating further text or chaining into
-              // another tool call before the caller has had a chance to
-              // reply via `chat_history`.
-              if (activeTurnId) {
-                void client
-                  .request('turn/interrupt', { threadId, turnId: activeTurnId })
-                  .catch(() => {
-                    // Best-effort; the turn loop watches for turn/completed.
-                  });
+              // Arm the deferred `turn/interrupt` so codex unwinds the
+              // turn — the model's function_call is already surfaced
+              // upstream and we don't want it generating further text or
+              // chaining into another tool call before the caller has had
+              // a chance to reply via `chat_history`. The interrupt is
+              // NOT sent here: codex only runs token accounting after our
+              // tool-call response below, and an interrupt in flight at
+              // that point drops the turn's usage entirely (#351). The
+              // tokenUsage notification handler fires it the moment usage
+              // lands; the timer is the no-usage backstop.
+              // Always wait for the NEXT usage notification, even when an
+              // earlier model iteration already populated `finalUsage`:
+              // accounting for the iteration that produced THIS
+              // function_call only runs after our response below, so its
+              // notification is always still ahead of us at this point.
+              if (!interruptRequested) {
+                interruptRequested = true;
+                interruptTimer = setTimeout(
+                  sendDeferredInterrupt,
+                  toolCallUsageWaitMs,
+                );
               }
               // codex still expects a structured answer to the server
               // request; success=false signals the model that the result
@@ -1561,6 +1613,13 @@ export function createCodexBackend(
               if (settled) return;
               settled = true;
               cleanupNotifications();
+              // Disarm a pending deferred interrupt — the turn already
+              // reached a terminal state, so firing it later would only
+              // poke a dead turn.
+              if (interruptTimer !== null) {
+                clearTimeout(interruptTimer);
+                interruptTimer = null;
+              }
               if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
               signal.removeEventListener('abort', onAbort);
               resolve(o);
@@ -1584,6 +1643,9 @@ export function createCodexBackend(
                   );
                 }
                 if (parsed) finalUsage = parsed;
+                // Usage is in — release any interrupt held back by the
+                // tool-call handler (#351).
+                if (parsed && interruptRequested) sendDeferredInterrupt();
                 return;
               }
               if (method === 'item/completed') {
@@ -1821,16 +1883,27 @@ export function createCodexBackend(
           const finishReason: 'tool_calls' | 'stop' =
             capturedToolCalls.length > 0 ? 'tool_calls' : 'stop';
           const assistantContent = capturedToolCalls.length > 0 ? null : completeText;
-          // Placeholder fallback for codex app-server's known limitation:
-          // `thread/tokenUsage/updated` does not fire on tool-call-only
-          // (interrupted) turns, and `turn/completed` carries no usage
-          // payload for those turns either. The openai-compat/v1 envelope
-          // contract requires `usage` to be present — when codex genuinely
-          // didn't surface it, emit `{0,0,0}` as a placeholder rather than
-          // omit the field (which would trip the gateway's strict
-          // missing_usage 502). The zeros honestly signal "runtime did
-          // not report" rather than fabricating a tokenizer estimate the
-          // codex runtime never produced.
+          // Placeholder fallback: with the deferred interrupt above,
+          // tool-call turns normally get real usage before unwinding, but
+          // codex can still end a turn without ever emitting
+          // `thread/tokenUsage/updated` (usage held past
+          // `toolCallUsageWaitMs`, or an upstream accounting drop — #351).
+          // The openai-compat/v1 envelope contract requires `usage` to be
+          // present — when codex genuinely didn't surface it, emit
+          // `{0,0,0}` as a placeholder rather than omit the field (which
+          // would trip the gateway's strict missing_usage 502). The zeros
+          // honestly signal "runtime did not report" rather than
+          // fabricating a tokenizer estimate the codex runtime never
+          // produced.
+          if (envelope && !finalUsage) {
+            logger?.warn?.(
+              `[codex] tokenUsage unavailable for task ${task.taskId}: ` +
+                (capturedToolCall
+                  ? `codex emitted no thread/tokenUsage/updated within ${toolCallUsageWaitMs}ms of the tool call before the turn was interrupted`
+                  : 'codex emitted no thread/tokenUsage/updated for this turn') +
+                '; emitting {0,0,0} placeholder usage',
+            );
+          }
           const finalUsageSnapshot: OpenAICompatUsage | null = envelope && !finalUsage
             ? buildOpenAICompatUsage({
                 prompt_tokens: 0,

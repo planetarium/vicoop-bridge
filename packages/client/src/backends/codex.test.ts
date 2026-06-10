@@ -1395,6 +1395,35 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion envelope on
         });
         return;
       }
+      if (id === 'srv-1' && 'result' in (frame as object)) {
+        // codex runs token accounting only after the bridge answers the
+        // tool call (#351) — emit the usage notification at that point,
+        // mirroring the real app-server's ordering.
+        child.emitStdout({
+          method: 'thread/tokenUsage/updated',
+          params: {
+            threadId: 'thr-1',
+            turnId: 'turn-1',
+            tokenUsage: {
+              total: {
+                totalTokens: 1234,
+                inputTokens: 1200,
+                cachedInputTokens: 1000,
+                outputTokens: 34,
+                reasoningOutputTokens: 5,
+              },
+              last: {
+                totalTokens: 1234,
+                inputTokens: 1200,
+                cachedInputTokens: 1000,
+                outputTokens: 34,
+                reasoningOutputTokens: 5,
+              },
+            },
+          },
+        });
+        return;
+      }
       if (method === 'turn/interrupt' && id !== undefined) {
         child.emitStdout({ id, result: {} });
         // After receiving turn/interrupt, codex emits the terminal
@@ -1514,20 +1543,36 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion envelope on
     assert.deepEqual(JSON.parse(argsRaw as string), {
       url: 'https://example.com',
     });
+    // Deferred-interrupt usage recovery (#351): the bridge held the
+    // interrupt until codex's post-tool-call `thread/tokenUsage/updated`
+    // landed, so the envelope carries REAL usage — not the `{0,0,0}`
+    // placeholder an immediate interrupt used to force.
+    const usage = envelope.usage as
+      | {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          total_tokens?: number;
+          prompt_tokens_details?: { cached_tokens?: number };
+          completion_tokens_details?: { reasoning_tokens?: number };
+        }
+      | undefined;
+    assert.ok(usage, 'usage present on tool-call envelope');
+    assert.equal(usage?.prompt_tokens, 1200);
+    assert.equal(usage?.completion_tokens, 34);
+    assert.equal(usage?.total_tokens, 1234);
+    assert.equal(usage?.prompt_tokens_details?.cached_tokens, 1000);
+    assert.equal(usage?.completion_tokens_details?.reasoning_tokens, 5);
   }
 
   // Bridge must have sent `turn/interrupt` for our turn — that, plus
   // codex's terminal `turn/completed` notification, is what unwinds the
-  // turn. (The bridge also sends back a `DynamicToolCallResponse` for the
-  // server-initiated `item/tool/call`, but the async handler's promise
-  // unwrap may schedule that write one microtask after `handle()` returns;
-  // we drain the queue below before asserting it was eventually sent.)
+  // turn.
   const sent = fake.lastChild().stdinFrames();
   const interrupt = findRequest(sent, 'turn/interrupt');
   assert.ok(interrupt, 'turn/interrupt was sent');
 
-  // Drain pending microtasks, then confirm the bridge eventually replied
-  // to the server-initiated `item/tool/call`. codex would block the turn
+  // Drain pending microtasks, then confirm the bridge replied to the
+  // server-initiated `item/tool/call`. codex would block the turn
   // indefinitely waiting for that response, so it must always be sent —
   // even though the turn/interrupt path means codex won't act on its
   // contents. A few macrotask cycles flush any chained promise resolutions
@@ -1536,15 +1581,32 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion envelope on
     await new Promise<void>((r) => setImmediate(r));
   }
   const drained = fake.lastChild().stdinFrames();
-  const toolResp = drained.find(
+  const toolRespIdx = drained.findIndex(
     (f) =>
       f !== null &&
       typeof f === 'object' &&
       (f as { id?: unknown }).id === 'srv-1' &&
       'result' in (f as object),
-  ) as { result?: { contentItems?: unknown[]; success?: boolean } } | undefined;
+  );
+  const toolResp = drained[toolRespIdx] as
+    | { result?: { contentItems?: unknown[]; success?: boolean } }
+    | undefined;
   assert.ok(toolResp, 'bridge responded to item/tool/call');
   assert.equal(typeof toolResp?.result?.success, 'boolean');
+  // Deferred interrupt (#351): the tool-call response must hit the wire
+  // BEFORE turn/interrupt — codex's token accounting is blocked on the
+  // response, and an interrupt ahead of it drops the turn's usage.
+  const interruptIdx = drained.findIndex(
+    (f) =>
+      f !== null &&
+      typeof f === 'object' &&
+      (f as { method?: string }).method === 'turn/interrupt',
+  );
+  assert.ok(interruptIdx !== -1, 'turn/interrupt present in drained frames');
+  assert.ok(
+    toolRespIdx !== -1 && toolRespIdx < interruptIdx,
+    'item/tool/call response precedes the deferred turn/interrupt',
+  );
 
   // dynamicTools must have been included on thread/start.
   const tsFrame = findRequest(sent, 'thread/start') as
@@ -1567,6 +1629,126 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion envelope on
     params.developerInstructions?.includes('tool_calls'),
     false,
     'native path must not teach the JSON envelope contract',
+  );
+});
+
+// Deferred-interrupt backstop (#351): when codex never emits
+// `thread/tokenUsage/updated` after the tool call, the interrupt still
+// fires after `toolCallUsageWaitMs`, the envelope falls back to the
+// `{0,0,0}` placeholder, and the operator gets a diagnostic warn so
+// zero-usage records are explainable without --openai-compat-trace.
+test('deferred interrupt times out without tokenUsage → placeholder usage + diagnostic warn (#351)', async () => {
+  const fake = makeFakeSpawn(() => ({
+    onLine(frame, child) {
+      const id = (frame as { id?: number | string }).id;
+      const method = (frame as { method?: string }).method;
+      if (method === 'initialize' && id !== undefined) {
+        child.emitStdout({ id, result: {} });
+        return;
+      }
+      if (method === 'thread/start' && id !== undefined) {
+        child.emitStdout({ id, result: { thread: { id: 'thr-1' } } });
+        return;
+      }
+      if (method === 'thread/inject_items' && id !== undefined) {
+        child.emitStdout({ id, result: {} });
+        return;
+      }
+      if (method === 'turn/start' && id !== undefined) {
+        child.emitStdout({
+          id,
+          result: { turn: { id: 'turn-1', status: 'inProgress' } },
+        });
+        queueMicrotask(() => {
+          child.emitStdout({
+            id: 'srv-1',
+            method: 'item/tool/call',
+            params: {
+              threadId: 'thr-1',
+              turnId: 'turn-1',
+              callId: 'call_nousage',
+              namespace: null,
+              tool: 'fetch',
+              arguments: { url: 'https://example.com' },
+            },
+          });
+        });
+        return;
+      }
+      // No thread/tokenUsage/updated is ever emitted — the deferred
+      // interrupt must fall back to its timer.
+      if (method === 'turn/interrupt' && id !== undefined) {
+        child.emitStdout({ id, result: {} });
+        queueMicrotask(() => {
+          child.emitStdout({
+            method: 'turn/completed',
+            params: {
+              turn: { id: 'turn-1', status: 'interrupted', items: [], error: null },
+            },
+          });
+        });
+        return;
+      }
+    },
+  }));
+  const warns: string[] = [];
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    toolCallUsageWaitMs: 10,
+    logger: {
+      level: 'warn',
+      error: () => {},
+      warn: (...args: unknown[]) => {
+        warns.push(args.map(String).join(' '));
+      },
+      info: () => {},
+      debug: () => {},
+    },
+  });
+  const { emit, frames } = collect();
+  await backend.handle(
+    assign('fetch example.com', 'ctx-oai-timeout', {
+      message: {
+        role: 'user',
+        messageId: 'm',
+        parts: [{ kind: 'text', text: 'fetch example.com' }],
+        metadata: {
+          [OPENAI_COMPAT_EXTENSION_URI]: {
+            chat_completions_request: {
+              messages: [{ role: 'user', content: 'fetch example.com' }],
+              tools: [
+                {
+                  type: 'function',
+                  function: { name: 'fetch', parameters: {} },
+                },
+              ],
+            },
+          },
+        },
+      },
+    }),
+    emit,
+    NEVER,
+  );
+
+  const complete = frames.find((f) => f.type === 'task.complete');
+  assert.ok(complete && complete.type === 'task.complete');
+  assert.equal(complete.status.state, 'completed');
+  const metadata = complete.status.message?.metadata as
+    | Record<string, Record<string, unknown>>
+    | undefined;
+  const envelope = metadata?.[OPENAI_COMPAT_EXTENSION_URI]?.chat_completion as
+    | Record<string, unknown>
+    | undefined;
+  assert.ok(envelope, 'chat_completion envelope present');
+  assert.deepEqual(envelope.usage, {
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+  });
+  assert.ok(
+    warns.some((w) => w.includes('tokenUsage unavailable')),
+    `diagnostic warn emitted (got: ${JSON.stringify(warns)})`,
   );
 });
 
@@ -1826,7 +2008,9 @@ test('dynamicTools handler is registered on every openai-compat turn (#209, #233
       }
     },
   }));
-  const backend = createCodexBackend({ spawn: fake.spawn });
+  // This fake never emits thread/tokenUsage/updated, so the deferred
+  // interrupt (#351) only fires on its backstop timer — keep it short.
+  const backend = createCodexBackend({ spawn: fake.spawn, toolCallUsageWaitMs: 5 });
 
   const oaiMetaFor = (text: string): Record<string, unknown> => ({
     [OPENAI_COMPAT_EXTENSION_URI]: {
