@@ -56,6 +56,35 @@ function rejectionErrorBody(
   };
 }
 
+// Issue #352 — a bare 404 is reserved for agent ids the bridge has never
+// heard of (unknown / unrouteable / misconfigured). A row in `agents` with no
+// live WebSocket route means the agent is registered but currently offline
+// (operator stopped it, mid-restart) — a transient condition that downstream
+// routers should retry shortly, signaled as 503 + Retry-After instead.
+//
+// On a DB error we can't tell the two apart; report 'offline' (503) so a
+// bridge-side outage reads as transient to consumers rather than parking
+// known-good agents in a long misconfiguration cooldown.
+export async function classifyMissingAgent(
+  sql: Sql,
+  agentId: string,
+): Promise<'unknown' | 'offline'> {
+  try {
+    const rows = await sql`SELECT 1 FROM agents WHERE id = ${agentId}`;
+    return rows.length > 0 ? 'offline' : 'unknown';
+  } catch (err) {
+    logEvent('agent_lookup_failed', {
+      agentId,
+      detail: truncate((err as Error).message, 256),
+    });
+    return 'offline';
+  }
+}
+
+// Hint for consumers sizing their retry backoff when an agent is registered
+// but offline. Operator restarts typically complete within a minute.
+export const AGENT_UNAVAILABLE_RETRY_AFTER_SECONDS = 60;
+
 // Cap the error_description so a long upstream err.message can't push the
 // WWW-Authenticate header past common proxy/server limits (often ~8KB total).
 const ERROR_DESCRIPTION_MAX_LEN = 200;
@@ -136,6 +165,22 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
     const conn = registry.getAgent(agentId);
     if (!conn) {
       const rejectionId = newRejectionId();
+      if ((await classifyMissingAgent(opts.sql, agentId)) === 'offline') {
+        logEvent('agent_request_rejected', {
+          agentId,
+          reason: 'agent_unavailable',
+          rejectionId,
+        });
+        c.header('Retry-After', String(AGENT_UNAVAILABLE_RETRY_AFTER_SECONDS));
+        return c.json(
+          rejectionErrorBody(
+            -32000,
+            'Agent temporarily unavailable (registered but not connected)',
+            rejectionId,
+          ),
+          503,
+        );
+      }
       logEvent('agent_request_rejected', {
         agentId,
         reason: 'agent_not_connected',
