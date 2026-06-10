@@ -3278,10 +3278,12 @@ test('result.modelUsage is summed across models and forwarded as openai-compat u
   assert.equal(payload.usage.total_tokens, 25287 + 21);
   // cached_tokens mirrors Σ_M cacheRead (lossless): 0 + 18029.
   assert.deepEqual(payload.usage.prompt_tokens_details, { cached_tokens: 18029 });
-  // `model` reports the entry with the largest output share — opus had 8 vs
-  // haiku's 13, so haiku wins by raw output_tokens count. The contract is
-  // "largest output", documenting that the field is telemetry only.
-  assert.equal(payload.usage.model, 'claude-haiku-4-5-20251001');
+  // No `model` label: `parseClaudeModelUsageForOpenAICompat` only sums tokens
+  // now — the model is resolved from the assistant turn / requested id, not a
+  // largest-output-share heuristic over modelUsage (#348). This fixture has
+  // no assistant event and is a plain (non-openai-compat) task, so no model
+  // is resolved and the field is omitted rather than guessed.
+  assert.equal('model' in payload.usage, false);
 });
 
 test('single-model modelUsage maps cleanly and advertises the extension', async () => {
@@ -3317,9 +3319,9 @@ test('single-model modelUsage maps cleanly and advertises the extension', async 
   assert.equal(payload?.usage?.completion_tokens, 8);
   assert.equal(payload?.usage?.total_tokens, 6 + 24933 + 23 + 8);
   assert.deepEqual(payload?.usage?.prompt_tokens_details, { cached_tokens: 24933 });
-  // Normalised to the canonical Anthropic id so it matches what
-  // `params.models[].id` advertises — see `normalizeClaudeModelId`.
-  assert.equal(payload?.usage?.model, 'claude-opus-4-7');
+  // Token sums only — no model label is derived from modelUsage anymore (#348);
+  // this plain task has no assistant event to name one.
+  assert.equal(payload?.usage && 'model' in payload.usage, false);
 });
 
 test('absent modelUsage → no openai-compat metadata is attached', async () => {
@@ -3337,6 +3339,168 @@ test('absent modelUsage → no openai-compat metadata is attached', async () => 
   assert.ok(complete && complete.type === 'task.complete');
   assert.equal(complete.status.message?.metadata, undefined);
   assert.equal(complete.status.message?.extensions, undefined);
+});
+
+test('envelope.model reports the assistant turn model, not the modelUsage winner (#348)', async () => {
+  // Repro for #348: a short response ("router-ok") routes the user-facing
+  // turn through claude-sonnet-4-6, but an internal haiku sub-model
+  // out-produces it in raw output_tokens. The `result.modelUsage`
+  // largest-output heuristic therefore reports haiku — correct for usage
+  // telemetry, WRONG for the envelope's top-level `model`. The assistant
+  // event names the model that actually answered, so the envelope must use
+  // that.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          // CC stamps the running tier suffix; the envelope normalises it off.
+          model: 'claude-sonnet-4-6[1m]',
+          content: [{ type: 'text', text: 'router-ok' }],
+        },
+      }),
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: 'router-ok',
+        modelUsage: {
+          // haiku wins by raw output_tokens (13 > 8) — the heuristic trap.
+          'claude-haiku-4-5-20251001': {
+            inputTokens: 348,
+            outputTokens: 13,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          },
+          'claude-sonnet-4-6[1m]': {
+            inputTokens: 6,
+            outputTokens: 8,
+            cacheReadInputTokens: 18029,
+            cacheCreationInputTokens: 6904,
+          },
+        },
+      }),
+    ],
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('reply router-ok', { model: 'claude-sonnet-4-6' }),
+    emit,
+    NEVER,
+  );
+
+  const metadata = completionMessageMetadata(frames);
+  assert.ok(metadata, 'task.complete message should carry metadata');
+  const payload = metadata[OPENAI_COMPAT_EXTENSION_URI] as {
+    chat_completion?: Record<string, unknown>;
+    usage?: Record<string, unknown>;
+  };
+  const envelope = payload?.chat_completion;
+  assert.ok(envelope, 'chat_completion envelope present');
+  // The fix: envelope model is the model that produced the turn, suffix
+  // stripped — NOT the haiku modelUsage winner.
+  assert.equal(envelope.model, 'claude-sonnet-4-6');
+  // The envelope's embedded usage.model is realigned to the same id so the
+  // envelope stays internally consistent (id SHOULD match usage.model)...
+  const envUsage = envelope.usage as { model?: string; prompt_tokens?: number; completion_tokens?: number };
+  assert.equal(envUsage.model, 'claude-sonnet-4-6', 'envelope usage mirrors the response model');
+  // ...while the token SUMS remain the across-sub-model totals (haiku tokens
+  // still counted): Σ output = 13 + 8 = 21, Σ prompt = 348 + (6+18029+6904).
+  assert.equal(envUsage.completion_tokens, 21);
+  assert.equal(envUsage.prompt_tokens, 25287);
+  // Under the envelope contract the bare top-level `usage` sibling is not
+  // emitted — usage lives inside the envelope only.
+  assert.equal(payload.usage, undefined);
+});
+
+test('envelope.model falls back to the system/init model when no assistant event names one (#348)', async () => {
+  // result-only turn: claude emits a `system/init` (carrying the resolved
+  // model) and a `result` event (with modelUsage), but no `assistant` event
+  // carrying a model. The envelope must report claude's resolved model — not
+  // the largest-output sub-model. The init model carries the `[1m]` tier
+  // suffix; the envelope normalises it off.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'sid',
+        model: 'claude-opus-4-8[1m]',
+      }),
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: 'router-ok',
+        modelUsage: {
+          'claude-haiku-4-5-20251001': {
+            inputTokens: 348,
+            outputTokens: 13,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          },
+          'claude-opus-4-8[1m]': {
+            inputTokens: 6,
+            outputTokens: 8,
+            cacheReadInputTokens: 18029,
+            cacheCreationInputTokens: 6904,
+          },
+        },
+      }),
+    ],
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('reply router-ok', { model: 'claude-opus-4-8' }),
+    emit,
+    NEVER,
+  );
+
+  const metadata = completionMessageMetadata(frames);
+  assert.ok(metadata, 'task.complete message should carry metadata');
+  const payload = metadata[OPENAI_COMPAT_EXTENSION_URI] as {
+    chat_completion?: Record<string, unknown>;
+  };
+  const envelope = payload?.chat_completion;
+  assert.ok(envelope, 'chat_completion envelope present');
+  // system/init model id, tier suffix stripped — NOT the haiku modelUsage winner.
+  assert.equal(envelope.model, 'claude-opus-4-8');
+  const envUsage = envelope.usage as { model?: string };
+  assert.equal(envUsage.model, 'claude-opus-4-8');
+});
+
+test('envelope.model never reports the requested routing slug / card url (#348)', async () => {
+  // The gateway can send an unresolved routing key (e.g. an A2A card url) as
+  // `envelope.model`; claude drops it before `--model` and runs its own
+  // default (#302). The envelope must report the REAL model claude resolved
+  // (from system/init), never echo the slug back as if it were a model.
+  const slug = 'a2a/https://example.com/agents/x/.well-known/agent-card.json';
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'sid',
+        model: 'claude-opus-4-8[1m]',
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'router-ok' }),
+    ],
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assignWithOpenAICompat('reply router-ok', { model: slug }), emit, NEVER);
+
+  const metadata = completionMessageMetadata(frames);
+  assert.ok(metadata, 'task.complete message should carry metadata');
+  const payload = metadata[OPENAI_COMPAT_EXTENSION_URI] as {
+    chat_completion?: Record<string, unknown>;
+  };
+  const envelope = payload?.chat_completion;
+  assert.ok(envelope, 'chat_completion envelope present');
+  assert.equal(envelope.model, 'claude-opus-4-8', 'reports claude resolved model, not the slug');
+  assert.notEqual(envelope.model, slug);
 });
 
 test('zero cacheRead does not surface a cached_tokens breakdown', async () => {
@@ -4466,16 +4630,18 @@ test('probeClaudeModel returns null if the whole id was a bracket tier marker', 
   assert.equal(model, null);
 });
 
-test('parseClaudeModelUsageForOpenAICompat strips bracket tier suffix on usage.model', () => {
-  // The advertise and the usage.model echo MUST resolve to the same
-  // string so the openai-compat/v1 spec's "id SHOULD match usage.model"
-  // cross-check holds for callers doing exact-match routing.
+test('parseClaudeModelUsageForOpenAICompat sums token counts without picking a model', () => {
+  // The model label is resolved by the caller (assistant turn / requested id),
+  // NOT from a largest-output-share heuristic over modelUsage (#348). This
+  // helper now only sums tokens across the per-model entries.
   const usage = parseClaudeModelUsageForOpenAICompat({
     'claude-haiku-4-5-20251001': { inputTokens: 100, outputTokens: 5 },
     'claude-opus-4-7[1m]': { inputTokens: 100, outputTokens: 50 },
   });
   assert.ok(usage);
-  assert.equal(usage!.model, 'claude-opus-4-7');
+  assert.equal(usage!.prompt_tokens, 200);
+  assert.equal(usage!.completion_tokens, 55);
+  assert.equal('model' in usage!, false);
 });
 
 // Envelope shape: text-only turn (no tool calls, with usage) produces a
