@@ -168,7 +168,7 @@ test('writeConfig writes JSON at mode 0600 and readConfig round-trips', (t) => {
         cwd: '/srv/work',
         settings: { sandbox: { enabled: true } },
         model: 'claude-opus-4-8',
-        models: ['claude-sonnet-4-6', 'claude-haiku-4-5'],
+        supported_models: ['claude-sonnet-4-6', 'claude-haiku-4-5'],
       },
       codex: { cwd: '/srv/work', sandbox_mode: 'workspace-write', runtime_name: 'work' },
       openclaw: {
@@ -191,7 +191,7 @@ test('writeConfig writes JSON at mode 0600 and readConfig round-trips', (t) => {
         cwd: '/srv/work',
         settings: { sandbox: { enabled: true } },
         model: 'claude-opus-4-8',
-        models: ['claude-sonnet-4-6', 'claude-haiku-4-5'],
+        supported_models: ['claude-sonnet-4-6', 'claude-haiku-4-5'],
       },
       codex: { cwd: '/srv/work', sandbox_mode: 'workspace-write', runtime_name: 'work' },
       openclaw: {
@@ -397,7 +397,7 @@ test('readConfig drops malformed fields and keeps the rest', (t) => {
   });
 });
 
-test('normalizeConfig keeps usable backends.claude.models entries and drops the rest', (t) => {
+test('normalizeConfig keeps usable backends.claude.supported_models entries and drops the rest', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-models-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const path = join(dir, 'config.json');
@@ -407,7 +407,7 @@ test('normalizeConfig keeps usable backends.claude.models entries and drops the 
       backends: {
         claude: {
           // non-string / empty entries dropped, strings trimmed
-          models: [' claude-sonnet-4-6 ', 42, '', null, 'claude-haiku-4-5'],
+          supported_models: [' claude-sonnet-4-6 ', 42, '', null, 'claude-haiku-4-5'],
         },
         codex: {
           cwd: '/srv/work',
@@ -417,7 +417,7 @@ test('normalizeConfig keeps usable backends.claude.models entries and drops the 
   );
   assert.deepEqual(readConfig(path), {
     backends: {
-      claude: { models: ['claude-sonnet-4-6', 'claude-haiku-4-5'] },
+      claude: { supported_models: ['claude-sonnet-4-6', 'claude-haiku-4-5'] },
       codex: { cwd: '/srv/work' },
     },
   });
@@ -426,7 +426,7 @@ test('normalizeConfig keeps usable backends.claude.models entries and drops the 
   // field — and with it the whole claude slot when nothing else is set.
   writeFileSync(
     path,
-    JSON.stringify({ backends: { claude: { models: 'claude-haiku-4-5' } } }),
+    JSON.stringify({ backends: { claude: { supported_models: 'claude-haiku-4-5' } } }),
   );
   assert.deepEqual(readConfig(path), {});
 });

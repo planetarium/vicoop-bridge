@@ -153,7 +153,7 @@ export interface ClaudeBackendOptions {
   model?: string;
   // Additional model ids this claude install can serve (e.g.
   // ['claude-sonnet-4-6', 'claude-haiku-4-5']), exposed via the
-  // `--claude-models` flag. Claude Code has no headless "list models"
+  // `--claude-supported-models` flag. Claude Code has no headless "list models"
   // interface — the startup probe only reveals the single resolved default
   // (`system/init.model` echoes whatever `--model` was passed, verbatim,
   // without validating account access) — so multi-model support is
@@ -164,7 +164,7 @@ export interface ClaudeBackendOptions {
   // account: a declared model the account cannot access fails at task time
   // with claude's own `model_not_found` error, which is the operator's
   // signal to fix the declaration.
-  models?: readonly string[];
+  supportedModels?: readonly string[];
   /**
    * Test seam: invoked once per task with the caller-tools MCP server
    * handle immediately after the bridge stands one up (when the
@@ -182,7 +182,7 @@ export interface ClaudeBackendOptions {
   // user/project settings.json, including its `model` field, which would
   // make the probed model diverge from the model the real task spawn
   // actually loads). Set to 0 to disable the probe entirely — the daemon
-  // then advertises only the operator-declared `models` (if any) without a
+  // then advertises only the operator-declared `supportedModels` (if any) without a
   // default entry, or no `params.models` at all, which is harmless (the
   // spec is advisory) but blinds clients that want to route by declared
   // model.
@@ -1209,7 +1209,7 @@ export function createClaudeBackend(
 
   const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
 
-  // Operator-declared additional models (`opts.models`), deduped on the
+  // Operator-declared additional models (`opts.supportedModels`), deduped on the
   // normalized form — against each other and against the `--claude-model`
   // pin — so the advertise never carries the same canonical id twice.
   // Original (un-normalized) spellings are preserved for the advertise so an
@@ -1219,7 +1219,7 @@ export function createClaudeBackend(
   {
     const seen = new Set<string>();
     if (opts.model) seen.add(normalizeClaudeModelId(opts.model));
-    for (const raw of opts.models ?? []) {
+    for (const raw of opts.supportedModels ?? []) {
       const id = raw.trim();
       if (!id) continue;
       const norm = normalizeClaudeModelId(id);
@@ -1241,7 +1241,7 @@ export function createClaudeBackend(
   // any task lands in production. Tests that want to exercise the gate
   // populate the cache via `resolveCapabilities` explicitly.
   //
-  // A `--claude-model` pin (and any `--claude-models` declarations) seeds
+  // A `--claude-model` pin (and any `--claude-supported-models` declarations) seeds
   // the cache directly: the pin IS the advertised default (every spawn
   // loads it via settings.model), so it must be what the `envelope.model`
   // gate compares against. Without this seed the probe — which deliberately
@@ -1398,7 +1398,7 @@ export function createClaudeBackend(
           : undefined;
       // Validate against the advertised model ids (cached by
       // `resolveCapabilities` from the probe, the `--claude-model` pin, and
-      // any `--claude-models` declarations). When the gateway sends a value
+      // any `--claude-supported-models` declarations). When the gateway sends a value
       // claude doesn't advertise — e.g. an unresolved routing key like
       // `a2a/<card-url>` — drop the override so claude falls back to its own
       // default rather than failing the turn (#302). Membership is checked
