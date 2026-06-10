@@ -23,7 +23,13 @@ import {
   listClientsForOwner,
   removeCaller,
 } from './admin-api.js';
-import { agentAuthMiddleware, getAgentConn, getCaller } from './agent-auth.js';
+import {
+  AGENT_UNAVAILABLE_RETRY_AFTER_SECONDS,
+  agentAuthMiddleware,
+  classifyMissingAgent,
+  getAgentConn,
+  getCaller,
+} from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
 import { mountDeviceUi } from './auth/device-ui.js';
@@ -583,10 +589,18 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   });
 
   // Client agent cards
-  app.get('/agents/:id/.well-known/agent-card.json', (c) => {
+  app.get('/agents/:id/.well-known/agent-card.json', async (c) => {
     const id = c.req.param('id');
     const conn = opts.registry.getAgent(id);
-    if (!conn) return c.json({ error: 'agent not connected' }, 404);
+    if (!conn) {
+      // Issue #352 — the card itself only exists on a live connection, but a
+      // registered-but-offline agent is still a transient 503, not a 404.
+      if ((await classifyMissingAgent(opts.db, id)) === 'offline') {
+        c.header('Retry-After', String(AGENT_UNAVAILABLE_RETRY_AFTER_SECONDS));
+        return c.json({ error: 'agent temporarily unavailable' }, 503);
+      }
+      return c.json({ error: 'agent not connected' }, 404);
+    }
     return c.json(getAgentForConn(conn).getAgentCard() as AgentCardV03);
   });
 

@@ -39,11 +39,18 @@ async function mintBearer(opts: { domain: string; uri: string }): Promise<string
     .replace(/=+$/, '');
 }
 
-// The reject paths exercised here never touch postgres — the middleware short-
-// circuits on missing/malformed bearer headers before reaching verifyCallerToken
-// (vbc_caller_* branch) or verifySiweBearerToken (SIWE branch). A stub Sql is
-// sufficient.
-const stubSql = {} as Sql;
+// Most reject paths exercised here never touch postgres — the middleware
+// short-circuits on missing/malformed bearer headers before reaching
+// verifyCallerToken (vbc_caller_* branch) or verifySiweBearerToken (SIWE
+// branch). The exception is the missing-agent branch (issue #352), which
+// checks the `agents` table to tell registered-but-offline (503) apart from
+// unknown (404) — fakeSql answers that single query shape.
+function fakeSql(registeredAgentIds: string[]): Sql {
+  return (async (_strings: TemplateStringsArray, ...values: unknown[]) =>
+    registeredAgentIds.includes(values[0] as string)
+      ? [{ '?column?': 1 }]
+      : []) as unknown as Sql;
+}
 
 function fakeAgentCard(name: string): AgentCard {
   return { name, version: '0.0.1', protocolVersion: '0.3.0' };
@@ -66,11 +73,14 @@ function registerAgent(
   registry.registerAgent(conn);
 }
 
-function buildApp(opts: { siweDomain?: string } = {}): { app: Hono; registry: Registry } {
+function buildApp(opts: { siweDomain?: string; sql?: Sql } = {}): {
+  app: Hono;
+  registry: Registry;
+} {
   const registry = new Registry();
   const app = new Hono();
   const mw = agentAuthMiddleware(registry, {
-    sql: stubSql,
+    sql: opts.sql ?? fakeSql([]),
     deviceFlowEnabled: false,
     siweDomain: opts.siweDomain,
   });
@@ -168,6 +178,39 @@ test('unknown agent returns 404 without auth challenge', async () => {
   assert.equal(res.headers.get('WWW-Authenticate'), null);
 });
 
+// Issue #352 — a registered agent whose client is not connected is a
+// transient condition (operator stopped it / mid-restart), signaled as 503 +
+// Retry-After so downstream routers retry shortly instead of applying the
+// long misconfiguration cooldown they reserve for bare 404s.
+test('registered-but-offline agent returns 503 with Retry-After, not 404', async () => {
+  const { app } = buildApp({ sql: fakeSql(['ghost']) });
+
+  const res = await app.request('/agents/ghost', { method: 'POST' });
+  assert.equal(res.status, 503);
+  assert.equal(res.headers.get('Retry-After'), '60');
+  // Unavailability is not an auth failure either.
+  assert.equal(res.headers.get('WWW-Authenticate'), null);
+  const body = (await res.json()) as {
+    error: { code: number; message: string; data?: { rejectionId?: string } };
+  };
+  assert.equal(body.error.code, -32000);
+  assert.match(body.error.message, /temporarily unavailable/i);
+});
+
+test('registration lookup failure degrades to 503 (transient), not 404', async () => {
+  // When the agents-table query itself fails, the bridge can't tell offline
+  // from unknown — report transient so a bridge-side DB outage doesn't park
+  // known-good agents in consumers' long misconfiguration cooldown.
+  const failingSql = (async () => {
+    throw new Error('connection refused');
+  }) as unknown as Sql;
+  const { app } = buildApp({ sql: failingSql });
+
+  const res = await app.request('/agents/maybe-registered', { method: 'POST' });
+  assert.equal(res.status, 503);
+  assert.equal(res.headers.get('Retry-After'), '60');
+});
+
 test('caller not in allowedCallers responds 403 with WWW-Authenticate error="insufficient_scope"', async () => {
   _resetSiweBearerCacheForTests();
   // The agent only allows a different principal — the bearer's address is
@@ -236,6 +279,18 @@ test('agent_not_connected (404) body carries rejectionId in error.data', async (
 
   const res = await app.request('/agents/missing', { method: 'POST' });
   assert.equal(res.status, 404);
+  const body = (await res.json()) as {
+    error: { code: number; data?: { rejectionId?: string } };
+  };
+  assert.equal(body.error.code, -32000);
+  assert.match(body.error.data?.rejectionId ?? '', REJECTION_ID_RE);
+});
+
+test('agent_unavailable (503) body carries rejectionId in error.data', async () => {
+  const { app } = buildApp({ sql: fakeSql(['ghost']) });
+
+  const res = await app.request('/agents/ghost', { method: 'POST' });
+  assert.equal(res.status, 503);
   const body = (await res.json()) as {
     error: { code: number; data?: { rejectionId?: string } };
   };
