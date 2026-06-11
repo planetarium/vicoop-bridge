@@ -15,4 +15,13 @@ Sentry.init({
   enabled: process.env.SENTRY_ENABLED === 'true',
   // Backend service: trace all requests by default. Tune via SENTRY_TRACES_SAMPLE_RATE.
   tracesSampleRate: Number(process.env.SENTRY_TRACES_SAMPLE_RATE ?? '1.0'),
+  // Send logs to the shared "vicoop-router-monitoring" project. `enableLogs`
+  // only opens the transport; consoleLoggingIntegration is what feeds it —
+  // forwarding the server's console.* output as structured Sentry logs. (No
+  // Fly auto-stop flush concern here: packages/server/fly.toml keeps
+  // min_machines_running=1, so the periodic log flush always runs.)
+  enableLogs: true,
+  integrations: [
+    Sentry.consoleLoggingIntegration({ levels: ['log', 'info', 'warn', 'error'] }),
+  ],
 });
