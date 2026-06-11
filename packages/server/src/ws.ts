@@ -21,6 +21,7 @@ interface ClientRow {
   id: string;
   client_id: string;
   owner_principal: string;
+  owner_email: string | null;
   allowed_callers: string[];
 }
 
@@ -30,7 +31,7 @@ async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | nu
   // deleted simply matches nothing and the daemon sees the 4005 "bad token"
   // path.
   const rows = await sql<ClientRow[]>`
-    SELECT id, client_id, owner_principal, allowed_callers
+    SELECT id, client_id, owner_principal, owner_email, allowed_callers
     FROM agents
     WHERE token_hash = ${hash}
   `;
@@ -58,7 +59,14 @@ export function attachWsServer(server: Server, opts: ServerWsOptions): void {
 }
 
 type AuthResult =
-  | { ok: true; clientId: string; cardName: string; cardSource: 'inline' | 'canonical' }
+  | {
+      ok: true;
+      clientId: string;
+      cardName: string;
+      cardSource: 'inline' | 'canonical';
+      ownerPrincipal: string;
+      ownerEmail: string | null;
+    }
   | { ok: false; code: number; reason: string };
 
 async function authenticateAndRegister(
@@ -112,6 +120,8 @@ async function authenticateAndRegister(
     agentId: frame.agentId,
     clientId,
     ownerPrincipal,
+    ownerEmail: client.owner_email,
+    backendKind: frame.backendKind,
     agentCard: resolvedCard.agentCard,
     allowedCallers: client.allowed_callers,
     ws,
@@ -131,6 +141,8 @@ async function authenticateAndRegister(
     clientId,
     cardName: resolvedCard.agentCard.name,
     cardSource: resolvedCard.source,
+    ownerPrincipal,
+    ownerEmail: client.owner_email,
   };
 }
 
@@ -208,6 +220,12 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         logEvent('client_connected', {
           agentId,
           clientId: result.clientId,
+          email: result.ownerEmail ?? undefined,
+          ownerPrincipal: result.ownerPrincipal,
+          backend:
+            result.cardSource === 'canonical'
+              ? truncate(frame.backendKind ?? 'unknown', 64)
+              : 'inline',
           name: result.cardName,
           cardSource: result.cardSource,
         });
@@ -262,7 +280,9 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         opts.registry.unbindTask(frame.taskId);
         logEvent('task_completed', {
           agentId: b.agentId,
+          backend: opts.registry.getAgent(b.agentId)?.backendKind ?? 'inline',
           taskId: frame.taskId,
+          contextId: b.contextId,
           state: frame.status.state,
           ...(b.principalId !== undefined ? { principalId: b.principalId } : {}),
         });
@@ -292,7 +312,9 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         opts.registry.unbindTask(frame.taskId);
         logEvent('task_failed_by_client', {
           agentId: b.agentId,
+          backend: opts.registry.getAgent(b.agentId)?.backendKind ?? 'inline',
           taskId: frame.taskId,
+          contextId: b.contextId,
           errorCode: frame.error.code,
           errorMessage: truncate(frame.error.message, 256),
           ...(b.principalId !== undefined ? { principalId: b.principalId } : {}),
@@ -310,7 +332,21 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
   ws.on('close', () => {
     clearTimeout(helloTimeout);
     if (agentId) {
-      logEvent('client_disconnected', { agentId });
+      // Look up the live connection BEFORE unregistering so the disconnect log
+      // carries the same identifying detail as client_connected.
+      const conn = opts.registry.getAgent(agentId);
+      logEvent('client_disconnected', {
+        agentId,
+        ...(conn
+          ? {
+              clientId: conn.clientId,
+              email: conn.ownerEmail ?? undefined,
+              ownerPrincipal: conn.ownerPrincipal,
+              backend: conn.backendKind ?? 'inline',
+              connectedMs: Date.now() - conn.connectedAt,
+            }
+          : {}),
+      });
       opts.registry.unregisterAgent(agentId, ws);
     }
   });

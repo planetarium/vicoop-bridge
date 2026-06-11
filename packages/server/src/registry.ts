@@ -9,6 +9,12 @@ export interface ClientConnection {
   agentId: string;
   clientId: string;
   ownerPrincipal: string;
+  // Owner's email (device-flow registrations); null for SIWE-onboarded clients
+  // that only have a wallet principal. Carried for observability/logging.
+  ownerEmail?: string | null;
+  // Canonical backend kind (e.g. "claude", "codex", "vicoop-codex"); undefined
+  // when the client supplied an inline agent card. Used for logging the backend.
+  backendKind?: string;
   agentCard: AgentCard;
   allowedCallers: string[];
   ws: WebSocket;

@@ -6,6 +6,7 @@ import { stream } from 'hono/streaming';
 import { html } from 'hono/html';
 import { cors } from 'hono/cors';
 import { sentry } from '@sentry/hono/node';
+import * as Sentry from '@sentry/hono/node';
 import {
   A2XAgent,
   DefaultRequestHandler,
@@ -625,8 +626,23 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const caller = getCaller(c);
     logEvent('agent_request', {
       agentId: conn.agentId,
+      backend: conn.backendKind ?? 'inline',
+      ownerEmail: conn.ownerEmail ?? undefined,
       hasAuth: !!c.req.header('Authorization'),
-      ...(caller !== undefined ? { principalId: caller.principalId } : {}),
+      ...(caller !== undefined
+        ? {
+            principalId: caller.principalId,
+            ...(caller.email ? { callerEmail: caller.email } : {}),
+          }
+        : {}),
+    });
+    // Tie this request session to its trace: the @sentry/hono transaction wraps
+    // the whole handler (the executor + the WS round-trip to the provider run
+    // within it), so these attributes make the session identifiable in the trace.
+    Sentry.getActiveSpan()?.setAttributes({
+      'bridge.agent': conn.agentId,
+      'bridge.backend': conn.backendKind ?? 'inline',
+      'bridge.caller': caller?.principalId ?? 'public',
     });
 
     const rawBody = await c.req.text();
