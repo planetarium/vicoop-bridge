@@ -227,11 +227,29 @@ export const TaskFailFrame = z.object({
 
 export const PongFrame = z.object({ type: z.literal('pong') });
 
+// Response to a server-initiated `usage.request` (see DownFrame). Correlated by
+// `requestId`. `usage` is the backend's opaque usage payload (e.g. the
+// vicoop-codex `{ accounts: [...] }` shape) — kept `unknown` so the payload can
+// evolve without a protocol bump; the server passes it through verbatim.
+export const UsageResponseFrame = z.object({
+  type: z.literal('usage.response'),
+  requestId: z.string(),
+  ok: z.boolean(),
+  usage: z.unknown().optional(),
+  error: z
+    .object({
+      code: z.string(),
+      message: z.string(),
+    })
+    .optional(),
+});
+
 export type HelloFrame = z.infer<typeof HelloFrame>;
 export type TaskStatusFrame = z.infer<typeof TaskStatusFrame>;
 export type TaskArtifactFrame = z.infer<typeof TaskArtifactFrame>;
 export type TaskCompleteFrame = z.infer<typeof TaskCompleteFrame>;
 export type TaskFailFrame = z.infer<typeof TaskFailFrame>;
+export type UsageResponseFrame = z.infer<typeof UsageResponseFrame>;
 
 export const UpFrame = z.discriminatedUnion('type', [
   HelloFrame,
@@ -240,6 +258,7 @@ export const UpFrame = z.discriminatedUnion('type', [
   TaskCompleteFrame,
   TaskFailFrame,
   PongFrame,
+  UsageResponseFrame,
 ]);
 export type UpFrame = z.infer<typeof UpFrame>;
 
@@ -258,13 +277,23 @@ export const TaskCancelFrame = z.object({
 
 export const PingFrame = z.object({ type: z.literal('ping') });
 
+// Server→client request for the backend's current usage snapshot. The client
+// replies with a `usage.response` UpFrame carrying the same `requestId`. Only
+// backends that implement `usage()` can satisfy it; others reply with an error.
+export const UsageRequestFrame = z.object({
+  type: z.literal('usage.request'),
+  requestId: z.string(),
+});
+
 export type TaskAssignFrame = z.infer<typeof TaskAssignFrame>;
 export type TaskCancelFrame = z.infer<typeof TaskCancelFrame>;
+export type UsageRequestFrame = z.infer<typeof UsageRequestFrame>;
 
 export const DownFrame = z.discriminatedUnion('type', [
   TaskAssignFrame,
   TaskCancelFrame,
   PingFrame,
+  UsageRequestFrame,
 ]);
 export type DownFrame = z.infer<typeof DownFrame>;
 

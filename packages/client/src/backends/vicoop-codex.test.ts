@@ -1235,3 +1235,53 @@ test('envelope.model is dropped when the probed list does NOT advertise it (#302
   );
   assert.equal(body.model, undefined);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// usage(): GET <serve baseUrl>/usage (uses the global fetch, not the injected
+// streaming fetchFn). The fake spawn provides the serve baseUrl; we stub
+// globalThis.fetch to script the /usage response.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Drive the lazy `ensureServe()` (which spawns synchronously and awaits the
+// listening line) by emitting that line on the next microtask, then await the
+// in-flight usage() promise.
+async function runUsage(stubFetch: typeof globalThis.fetch): Promise<unknown> {
+  const fake = makeFakeSpawn();
+  const backend = createVicoopCodexBackend({ spawn: fake.spawn });
+  const orig = globalThis.fetch;
+  globalThis.fetch = stubFetch;
+  try {
+    const p = backend.usage!();
+    await new Promise<void>((resolve) => queueMicrotask(() => {
+      driveServeListening(fake.lastChild());
+      resolve();
+    }));
+    return await p;
+  } finally {
+    globalThis.fetch = orig;
+  }
+}
+
+test('usage(): GETs the serve /usage endpoint and returns the parsed JSON', async () => {
+  const calls: Array<{ url: string; method: string }> = [];
+  const payload = { accounts: [{ key: 'k1', email: 'a@x.com', primary: { remaining_percent: 80 } }] };
+  const usage = await runUsage((async (url, init) => {
+    calls.push({ url: String(url), method: (init?.method as string) ?? 'GET' });
+    return new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as typeof globalThis.fetch);
+  assert.deepEqual(usage, payload);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, 'GET');
+  assert.match(calls[0].url, /^http:\/\/127\.0\.0\.1:8787\/usage$/);
+});
+
+test('usage(): a non-OK serve response throws (with status in the message)', async () => {
+  await assert.rejects(
+    runUsage((async () =>
+      new Response('nope', { status: 503 })) as typeof globalThis.fetch),
+    /HTTP 503/,
+  );
+});

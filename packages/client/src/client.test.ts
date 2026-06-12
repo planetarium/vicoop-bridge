@@ -7,6 +7,7 @@ import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
+  encodeFrame,
   parseUpFrame,
   type Part,
   type TaskAssignFrame,
@@ -1156,4 +1157,89 @@ test('processTask: forwards non-terminal frames (e.g. task.artifact, task.status
     s.sent.map((f) => f.type),
     ['task.status', 'task.artifact', 'task.complete'],
   );
+});
+
+// ── usage.request → usage.response dispatch ──────────────────────────────────
+// Stand up a fake bridge server that, on hello, sends a `usage.request` down
+// the wire, and capture the client's `usage.response`.
+async function runUsageDispatch(backend: Backend): Promise<UpFrame[]> {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  const upFrames: UpFrame[] = [];
+  wss.on('connection', (ws) => {
+    ws.on('message', (raw) => {
+      const f = parseUpFrame(typeof raw === 'string' ? raw : raw.toString('utf8'));
+      if (f.type === 'hello') {
+        ws.send(encodeFrame({ type: 'usage.request', requestId: 'req-1' }));
+      } else {
+        upFrames.push(f);
+      }
+    });
+  });
+  const c = makeSink();
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: backend.name,
+    backend,
+    logSink: c.sink,
+    logLevel: 'info',
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    reconnectStableMs: 0,
+    heartbeatIntervalMs: 0,
+  });
+  try {
+    client.start();
+    await waitFor(
+      () => upFrames.some((f) => f.type === 'usage.response'),
+      'expected a usage.response frame',
+    );
+    return upFrames;
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+}
+
+test('usage.request: client queries backend.usage() and replies usage.response', async () => {
+  const payload = { accounts: [{ key: 'k1', email: 'a@x.com' }] };
+  const backend: Backend = {
+    name: 'vicoop-codex',
+    handle: async () => {},
+    usage: async () => payload,
+  };
+  const frames = await runUsageDispatch(backend);
+  const resp = frames.find((f) => f.type === 'usage.response');
+  assert.ok(resp && resp.type === 'usage.response');
+  assert.equal(resp.requestId, 'req-1');
+  assert.equal(resp.ok, true);
+  assert.deepEqual(resp.usage, payload);
+});
+
+test('usage.request: backend without usage() replies ok:false / unsupported', async () => {
+  const frames = await runUsageDispatch(backendOf('echo', async () => {}));
+  const resp = frames.find((f) => f.type === 'usage.response');
+  assert.ok(resp && resp.type === 'usage.response');
+  assert.equal(resp.ok, false);
+  assert.equal(resp.error?.code, 'unsupported');
+});
+
+test('usage.request: a throwing backend.usage() replies ok:false / usage_failed', async () => {
+  const backend: Backend = {
+    name: 'vicoop-codex',
+    handle: async () => {},
+    usage: async () => {
+      throw new Error('serve down');
+    },
+  };
+  const frames = await runUsageDispatch(backend);
+  const resp = frames.find((f) => f.type === 'usage.response');
+  assert.ok(resp && resp.type === 'usage.response');
+  assert.equal(resp.ok, false);
+  assert.equal(resp.error?.code, 'usage_failed');
+  assert.match(resp.error?.message ?? '', /serve down/);
 });
