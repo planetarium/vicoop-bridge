@@ -55,8 +55,8 @@ CLIENT_DIR="$ROOT_DIR/packages/client"
 # $VICOOP_CLIENT_SENTRY_DSN is set (release.yml passes it from a GitHub
 # secret), Bun's `--define` rewrites the `process.env.VICOOP_CLIENT_SENTRY_DSN`
 # lookup in src/instrument.ts to this string literal. When it's unset (local
-# builds, forks, CI smoke compiles), no define is added and the daemon falls
-# back to the empty BAKED_IN_DSN — i.e. telemetry stays disabled. A DSN is a
+# builds, forks, CI smoke compiles), no define is added and that lookup stays a
+# runtime read that resolves to '' — i.e. telemetry stays disabled. A DSN is a
 # submit-only credential, so baking it into the public binary is expected and
 # safe (see docs/install-client.md → Telemetry).
 BUILD_DEFINES=()
