@@ -286,6 +286,26 @@ function resolveDaemonArgs(parsed: Extract<CliArgs, { action: 'daemon' }>): Args
   return result.args;
 }
 
+// Resolve whether crash telemetry is opted in, following the same
+// canonical-then-`--config`-overlay precedence as resolveDaemonArgs (CLI has no
+// flag for this — telemetry is operational policy, set once in config.json via
+// `agent register --enable-telemetry`, not a per-launch knob). Returns false
+// unless a readable config explicitly sets `"telemetry": "on"`; any
+// missing/unreadable/typo'd value reads as off.
+function resolveTelemetryEnabled(
+  parsed: Extract<CliArgs, { action: 'daemon' }>,
+): boolean {
+  const canonical = readConfig(defaultConfigPath());
+  let telemetry = canonical?.telemetry;
+  if (parsed.config) {
+    // `resolveDaemonArgs` already ran and exited on an unreadable --config, so
+    // a null here just means the overlay didn't set telemetry — keep canonical.
+    const overlay = readConfig(parsed.config);
+    if (overlay?.telemetry !== undefined) telemetry = overlay.telemetry;
+  }
+  return telemetry === 'on';
+}
+
 // Read & JSON-parse a `--claude-settings-file <path>` flag value. Parse errors
 // exit non-zero so an operator's typo doesn't silently fall through to the
 // next layer with no sandbox.
@@ -555,6 +575,50 @@ async function runWithShutdownTimeout(
 async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promise<void> {
   const args = resolveDaemonArgs(parsed);
   const logger = createLogger();
+
+  // Opt-in crash telemetry. The Sentry SDK is dynamically imported (and only
+  // then initialized) when config opted in, so operators who didn't opt in
+  // never load it. We install the process-level crash handlers only when it's
+  // actually live so default Node crash semantics (print + non-zero exit) are
+  // untouched for everyone else.
+  if (resolveTelemetryEnabled(parsed)) {
+    const { initTelemetry, captureException, flushTelemetry } = await import(
+      './instrument.js'
+    );
+    if (initTelemetry()) {
+      logger.info(
+        'telemetry: on — crash reports (stack traces only) → Sentry. ' +
+          'No prompts, code, agent output, or logs are sent.',
+      );
+      // Capture-then-exit. Preserves Node's default "fatal → exit non-zero"
+      // semantics (the daemon never installed these handlers before, so an
+      // uncaught error already terminated the process); we just flush the
+      // report out first. unhandledRejection is treated as fatal too, matching
+      // Node's modern default.
+      process.on('uncaughtException', (err) => {
+        captureException(err);
+        void flushTelemetry().finally(() => {
+          logger.error('uncaught exception:', err);
+          process.exit(1);
+        });
+      });
+      process.on('unhandledRejection', (reason) => {
+        captureException(reason);
+        void flushTelemetry().finally(() => {
+          logger.error('unhandled rejection:', reason);
+          process.exit(1);
+        });
+      });
+    } else {
+      // Opted in but no DSN is baked in / configured yet — say so rather than
+      // letting the operator believe reports are flowing.
+      logger.warn(
+        'telemetry: on in config but no Sentry DSN is configured; ' +
+          'nothing will be sent (set VICOOP_CLIENT_SENTRY_DSN or ship a build with a baked-in DSN).',
+      );
+    }
+  }
+
   const raw = args.card
     ? JSON.parse(readFileSync(args.card, 'utf8'))
     : resolveBundledCard(args.backend);

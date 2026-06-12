@@ -332,6 +332,32 @@ runtime config (#189 §5) — secrets and overrides live in `config.json`
 `server_token`, and `agent_id` — hand-edits to the other fields survive
 re-runs.
 
+### Telemetry (opt-in)
+
+Crash telemetry is **off by default**. The client runs on your machine, so
+it never sends anything unless you opt in. When you do, the daemon reports
+**only crash data**: an exception's class and stack trace, with your home
+directory path redacted. It does **not** send prompts, code, agent output,
+tokens, or console logs — tracing is disabled, breadcrumb/console capture is
+suppressed, and no PII is attached. When telemetry is off, the Sentry SDK is
+never even loaded.
+
+Opt in either way:
+
+```bash
+# at registration time (persists "telemetry": "on" into config.json)
+vicoop-client agent register --agent-id <id> --enable-telemetry
+
+# or by hand-editing config.json
+{ "telemetry": "on" }
+```
+
+Turn it back off by removing the field or setting `"telemetry": "off"`. A
+register re-run without `--enable-telemetry` never silently disables a prior
+opt-in. The daemon prints a one-line `telemetry: on …` notice at startup so
+you can confirm the state. The Sentry endpoint is overridable with
+`VICOOP_CLIENT_SENTRY_DSN`.
+
 > **Top-level vs `backends.*` parity.** Every operator-tunable knob is
 > reachable as a CLI flag and as a `config.json` field — pick whichever
 > surface fits the deployment. Top-level fields (`server_url`,
