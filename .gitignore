@@ -9,3 +9,6 @@ build/
 .turbo/
 coverage/
 *.tsbuildinfo
+# Bun `--compile` intermediate artifacts (release client build runs from the
+# client package dir; Bun may leave these if a compile is interrupted).
+*.bun-build

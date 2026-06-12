@@ -95,7 +95,7 @@ importers:
       '@optique/run':
         specifier: 1.0.2
         version: 1.0.2
-      '@sentry/node':
+      '@sentry/bun':
         specifier: ^10.57.0
         version: 10.57.0
       '@vicoop-bridge/protocol':
@@ -140,7 +140,7 @@ importers:
         version: 1.19.14(hono@4.12.12)
       '@sentry/hono':
         specifier: ^10.57.0
-        version: 10.57.0(@sentry/node@10.57.0)(hono@4.12.12)
+        version: 10.57.0(@sentry/bun@10.57.0)(@sentry/node@10.57.0)(hono@4.12.12)
       '@sentry/node':
         specifier: ^10.57.0
         version: 10.57.0
@@ -1000,7 +1000,7 @@ packages:
 
   '@paulmillr/qr@0.2.1':
     resolution: {integrity: sha512-IHnV6A+zxU7XwmKFinmYjUcwlyK9+xkG3/s9KcQhI9BjQKycrJ1JRO+FbNYPwZiPKW3je/DR0k7w8/gLa5eaxQ==}
-    deprecated: 'Switch to "qr" (new package name) for security updates: npm install qr'
+    deprecated: 'The package is now available as "qr": npm install qr'
 
   '@rainbow-me/rainbowkit@2.2.10':
     resolution: {integrity: sha512-8+E4die1A2ovN9t3lWxWnwqTGEdFqThXDQRj+E4eDKuUKyymYD+66Gzm6S9yfg8E95c6hmGlavGUfYPtl1EagA==}
@@ -1206,6 +1206,10 @@ packages:
 
   '@sentry-internal/server-utils@10.57.0':
     resolution: {integrity: sha512-Qu8ETmX/ITzteG7Im46b9HOxKKzeaIeqNvftaIlFURu1RUQdHbtGerS7QOmXzwnhuqNGNeiCQYkduB798IfRqA==}
+    engines: {node: '>=18'}
+
+  '@sentry/bun@10.57.0':
+    resolution: {integrity: sha512-bh62U3UiXYs0Uu37DX0vfO+JdwXXG16KvMUUHi/KfQdFO5VMuCDTdtLEMt+1fEXnjOi7DfQaaItoNPkagQc52w==}
     engines: {node: '>=18'}
 
   '@sentry/core@10.57.0':
@@ -6636,14 +6640,23 @@ snapshots:
     dependencies:
       '@sentry/core': 10.57.0
 
+  '@sentry/bun@10.57.0':
+    dependencies:
+      '@sentry/core': 10.57.0
+      '@sentry/node': 10.57.0
+    transitivePeerDependencies:
+      - '@opentelemetry/exporter-trace-otlp-http'
+      - supports-color
+
   '@sentry/core@10.57.0': {}
 
-  '@sentry/hono@10.57.0(@sentry/node@10.57.0)(hono@4.12.12)':
+  '@sentry/hono@10.57.0(@sentry/bun@10.57.0)(@sentry/node@10.57.0)(hono@4.12.12)':
     dependencies:
       '@opentelemetry/api': 1.9.1
       '@sentry/core': 10.57.0
       hono: 4.12.12
     optionalDependencies:
+      '@sentry/bun': 10.57.0
       '@sentry/node': 10.57.0
 
   '@sentry/node-core@10.57.0(@opentelemetry/api@1.9.1)(@opentelemetry/core@2.7.1(@opentelemetry/api@1.9.1))(@opentelemetry/instrumentation@0.214.0(@opentelemetry/api@1.9.1))(@opentelemetry/sdk-trace-base@2.7.1(@opentelemetry/api@1.9.1))(@opentelemetry/semantic-conventions@1.41.1)':

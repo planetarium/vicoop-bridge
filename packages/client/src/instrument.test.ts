@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { homedir } from 'node:os';
-import type { ErrorEvent } from '@sentry/node';
+import type { ErrorEvent } from '@sentry/bun';
 import { scrubEvent } from './instrument.js';
 
 // scrubEvent is the last line of defense before an event leaves the process.

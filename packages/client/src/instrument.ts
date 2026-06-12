@@ -20,19 +20,31 @@
 // or console logs.
 
 import { homedir } from 'node:os';
-import type { ErrorEvent, EventHint } from '@sentry/node';
-import * as Sentry from '@sentry/node';
+// `@sentry/bun` (not `@sentry/node`): the released client is a `bun build
+// --compile` single-file binary, so it runs on the Bun runtime — and that's
+// the only context where telemetry is ever live. `@sentry/bun` extends the
+// node SDK with Bun's native fetch transport; it also imports cleanly under
+// Node, so dev (`tsx`) and the test runner are unaffected (telemetry is opt-in
+// and never initialized there anyway).
+import type { ErrorEvent, EventHint } from '@sentry/bun';
+import * as Sentry from '@sentry/bun';
 import { clientVersion } from './version.js';
 
-// Baked-in DSN for the client's own Sentry project. A DSN is a *submit-only*
+// Fallback DSN for the client's own Sentry project. A DSN is a *submit-only*
 // credential — it cannot read, list, modify, or delete events — so shipping it
 // inside the distributed binary is safe, the same posture Sentry documents for
-// browser SDKs. Override at runtime with VICOOP_CLIENT_SENTRY_DSN.
+// browser SDKs.
 //
-// Left empty until the client Sentry project is provisioned. An empty DSN means
-// `initTelemetry` stays disabled and sends nothing even when an operator opts
-// in, so it is always safe to ship empty: fill this in (or set the env var)
-// when the project exists.
+// Kept empty on purpose: the real DSN is injected at *build time*, not stored
+// here. The release build (scripts/package-client-release.sh) passes
+// `--define process.env.VICOOP_CLIENT_SENTRY_DSN="<dsn>"` to `bun build`, which
+// rewrites the lookup in resolveDsn() to a string literal in the compiled
+// binary. The value comes from the VICOOP_CLIENT_SENTRY_DSN GitHub secret (see
+// .github/workflows/release.yml). Builds without that secret (local, forks, CI
+// smoke compiles) leave the lookup as a normal runtime read — undefined there —
+// and fall through to this empty string, so telemetry stays disabled and sends
+// nothing. The same env var also works as a plain runtime override for local
+// testing (`VICOOP_CLIENT_SENTRY_DSN=… vicoop-client start`).
 const BAKED_IN_DSN = '';
 
 function resolveDsn(): string {
