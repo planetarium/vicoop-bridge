@@ -622,7 +622,7 @@ test('setup preserves operator-added / future-version keys via raw round-trip', 
   const configPath = join(process.env.VICOOP_HOME, 'config.json');
   mkdirSync(process.env.VICOOP_HOME, { recursive: true, mode: 0o700 });
   // Hand-edited config with two kinds of unknown keys: a future top-level
-  // section (`telemetry`) and an unknown subkey of a known backend
+  // section (`experimental`) and an unknown subkey of a known backend
   // (`backends.claude.future_flag`). Both should survive the round trip.
   writeFileSync(configPath, JSON.stringify({
     server_url: 'wss://old',
@@ -633,7 +633,7 @@ test('setup preserves operator-added / future-version keys via raw round-trip', 
         future_flag: 'keep me',
       },
     },
-    telemetry: { otel_endpoint: 'http://otel:4317' },
+    experimental: { otel_endpoint: 'http://otel:4317' },
   }));
 
   const originalFetch = globalThis.fetch;
@@ -667,7 +667,7 @@ test('setup preserves operator-added / future-version keys via raw round-trip', 
   assert.equal(after.server_token, 'fresh-token');
   assert.equal(after.agent_id, 'agent-1');
   assert.equal(after.backend, 'claude');
-  assert.deepEqual(after.telemetry, { otel_endpoint: 'http://otel:4317' });
+  assert.deepEqual(after.experimental, { otel_endpoint: 'http://otel:4317' });
   assert.deepEqual(
     (after.backends as Record<string, unknown>).claude,
     { settings: { sandbox: { enabled: true } }, future_flag: 'keep me' },
@@ -754,6 +754,90 @@ test('setup: env-file write failure does NOT trip the canonical-recovery block',
   assert.match(stderr, /CLIENT_TOKEN was persisted/);
   assert.match(stderr, /would mint a NEW CLIENT_TOKEN/);
   assert.doesNotMatch(stderr, /\[recovery\] canonical persistence failed/);
+});
+
+test('agent register --enable-telemetry persists telemetry:on; a re-run without it leaves the opt-in intact', async (t) => {
+  const tmpHome = mkdtempSync(join(tmpdir(), 'vicoop-register-telemetry-'));
+  t.after(() => rmSync(tmpHome, { recursive: true, force: true }));
+
+  const previousHome = process.env.HOME;
+  const previousVicoop = process.env.VICOOP_HOME;
+  process.env.VICOOP_HOME = join(tmpHome, '.vicoop');
+  process.env.HOME = tmpHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousVicoop === undefined) delete process.env.VICOOP_HOME;
+    else process.env.VICOOP_HOME = previousVicoop;
+  });
+
+  saveOwnerSession({
+    bridge: 'https://bridge.test',
+    token: 'vbc_owner_test',
+    principal_id: 'google:123',
+    email: null,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    saved_at: new Date().toISOString(),
+  });
+
+  // Mint succeeds; an API key is auto-minted (no --caller) — both go through
+  // the same fetch mock, which just echoes a generic success for any POST.
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: string, init?: { body?: string }) => {
+    const body = String(init?.body ?? '');
+    if (body.includes('registerClient')) {
+      return new Response(JSON.stringify({
+        data: {
+          registerClient: {
+            clientWithToken: {
+              id: 'client-1',
+              token: 'fresh-token',
+              ownerPrincipal: 'google:123',
+              allowedAgentIds: ['agent-1'],
+            },
+          },
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    // apikey mint endpoint
+    return new Response(JSON.stringify({
+      agent_id: 'agent-1',
+      key_id: 'k1',
+      principal: 'apikey:k1',
+      api_key: 'secret',
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let stderr = '';
+  t.mock.method(process.stderr, 'write', (chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  });
+
+  const configPath = join(process.env.VICOOP_HOME, 'config.json');
+
+  // First run WITH the flag: telemetry persisted as 'on', disclosure printed.
+  assert.equal(
+    await runAgentRegister(agentRegisterArgs({ agentId: 'agent-1', enableTelemetry: true })),
+    0,
+  );
+  assert.equal(readConfig(configPath)?.telemetry, 'on');
+  assert.match(stderr, /Telemetry: ON/);
+
+  // Second run WITHOUT the flag must NOT silently flip the prior opt-in off.
+  stderr = '';
+  assert.equal(
+    await runAgentRegister(agentRegisterArgs({ agentId: 'agent-1', enableTelemetry: false })),
+    0,
+  );
+  assert.equal(readConfig(configPath)?.telemetry, 'on');
+  // The no-flag disclosure is phrased around what this command did, not the
+  // resulting state — so it never falsely claims telemetry is off.
+  assert.match(stderr, /Telemetry was not enabled by this command/);
 });
 
 test('setup refuses to overwrite an existing-but-malformed config.json', async (t) => {
@@ -906,6 +990,7 @@ function agentRegisterArgs(
     openclawGateway, openclawGatewayToken, openclawAgent,
     openclawOpenaiCompatAgent, openclawTaskTimeoutMs,
     envFile, envFileAlias, server, token, json = false,
+    enableTelemetry = false,
   } = p;
   return {
     action: 'agent-register',
@@ -922,6 +1007,7 @@ function agentRegisterArgs(
     openclawAgent,
     openclawOpenaiCompatAgent,
     openclawTaskTimeoutMs,
+    enableTelemetry,
     envFile,
     envFileAlias,
     server,

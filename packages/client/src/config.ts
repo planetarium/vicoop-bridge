@@ -172,6 +172,14 @@ export interface ClientConfig {
   backend?: string;
   card?: string;
   backends?: BackendConfigs;
+  // Opt-in crash telemetry. Absent / 'off' => the daemon never loads or
+  // initializes the Sentry SDK. 'on' => crash reports (stack traces only — no
+  // prompts, code, agent output, or console logs) are sent to the project's
+  // Sentry. Default OFF is deliberate: the client runs on operators' own
+  // machines, so reporting must be an explicit choice, not a silent default.
+  // Flip it on with `agent register --enable-telemetry` or by hand-editing
+  // this field. See packages/client/src/instrument.ts for what is/isn't sent.
+  telemetry?: 'on' | 'off';
 }
 
 // Trim hand-edited values and drop the result when it's whitespace-only.
@@ -255,6 +263,13 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
   if (backend && KNOWN_BACKENDS.has(backend)) c.backend = backend;
   const card = asString(raw.card);
   if (card) c.card = card;
+  // Telemetry is a closed enum: only the two known string literals are
+  // honoured. Anything else (typo, bool, number) is dropped — and a dropped
+  // value reads as "off" downstream, which is the safe, privacy-preserving
+  // default. So a malformed telemetry field can never accidentally *enable*
+  // reporting.
+  const telemetry = asString(raw.telemetry);
+  if (telemetry === 'on' || telemetry === 'off') c.telemetry = telemetry;
   const backends = asRecord(raw.backends);
   if (backends) {
     const out: BackendConfigs = {};
@@ -386,6 +401,7 @@ export function overlayConfig(base: ClientConfig, top: ClientConfig): ClientConf
     agent_id: top.agent_id ?? base.agent_id,
     backend: top.backend ?? base.backend,
     card: top.card ?? base.card,
+    telemetry: top.telemetry ?? base.telemetry,
     backends: mergedBackends,
   };
 }

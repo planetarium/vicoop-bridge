@@ -24,6 +24,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@optique/core": "1.0.2",
     "@optique/run": "1.0.2",
+    "@sentry/bun": "^10.57.0",
     "@vicoop-bridge/protocol": "workspace:*",
     "is-inside-container": "^1.0.0",
     "semver": "^7.8.0",

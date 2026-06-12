@@ -77,3 +77,10 @@ jobs:
       # no `published` signal.
       - name: Upload client release assets
         run: ./scripts/upload-client-release-assets.sh
+        env:
+          # Baked into the cross-compiled client binaries at build time so
+          # opt-in crash telemetry has somewhere to report. A Sentry DSN is a
+          # submit-only credential (safe to ship in a public binary); it's kept
+          # as a secret here only so it stays out of CI logs. Unset (e.g. forks
+          # without the secret) → binaries build with telemetry disabled.
+          VICOOP_CLIENT_SENTRY_DSN: ${{ secrets.VICOOP_CLIENT_SENTRY_DSN }}

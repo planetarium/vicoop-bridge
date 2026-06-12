@@ -118,6 +118,9 @@ export const agentRegisterCmd = command(
     openclawTaskTimeoutMs: optional(option('--openclaw-task-timeout-ms', integer({ metavar: 'MS', min: 1 }), {
       description: message`OpenClaw per-task timeout in milliseconds. Only valid with --backend openclaw.`,
     })),
+    enableTelemetry: withDefault(flag('--enable-telemetry', {
+      description: message`Opt in to crash telemetry: persists \`"telemetry": "on"\` into config.json so the daemon sends crash reports (stack traces only — never prompts, code, agent output, or logs) to the project's Sentry. Off by default; omit to keep it off. Disable later by removing the field or setting it to "off" in config.json.`,
+    }), false),
     envFile: optional(option('--write-env-file', string({ metavar: 'PATH' }), {
       description: message`Also emit a shell-sourceable env file. Daemon does NOT consume these env vars; the file is purely an operator-side credentials backup / scripting hook.`,
     })),
@@ -356,6 +359,7 @@ function writeConfigForSetup(
   bridgeUrl: string,
   backend: BackendKind | null,
   backendDefaults: BackendConfigs | null,
+  enableTelemetry: boolean,
 ): string {
   const firstAgentId = success.allowed_agent_ids[0];
   if (!firstAgentId) {
@@ -390,6 +394,10 @@ function writeConfigForSetup(
   existing.server_token = success.client_token;
   existing.agent_id = firstAgentId;
   if (backend) existing.backend = backend;
+  // Only ever *enable* on an explicit opt-in flag. A register re-run without
+  // `--enable-telemetry` must not silently flip a prior opt-in back off — so we
+  // leave any existing `telemetry` field untouched when the flag is absent.
+  if (enableTelemetry) existing.telemetry = 'on';
   if (backendDefaults) {
     // Per-slot shallow merge: an operator passing `--backend codex --cwd /foo`
     // should populate `backends.codex.cwd` without disturbing
@@ -426,6 +434,7 @@ function persistCanonical(
     json: boolean;
     backend: BackendKind | null;
     backendDefaults: BackendConfigs | null;
+    enableTelemetry: boolean;
   },
   success: ClientRegisterSuccess,
   bridgeUrl: string,
@@ -446,6 +455,7 @@ function persistCanonical(
     bridgeUrl,
     args.backend,
     args.backendDefaults,
+    args.enableTelemetry,
   );
   process.stderr.write(`Wrote ${configPath} (mode 600).\n`);
   return configPath;
@@ -654,6 +664,11 @@ interface RegistrationLabels {
   // leaving it public + warning. Enabled for `agent register`; the deprecated
   // `setup` alias keeps its historical public-agent warning unchanged.
   autoMintApiKeyWhenNoCaller: boolean;
+  // When true, print the telemetry disclosure (opted-in confirmation, or the
+  // "it's off, here's how to opt in" notice). Enabled for `agent register`;
+  // the deprecated `setup` alias stays quiet — it has no --enable-telemetry
+  // flag and we don't want to grow its surface.
+  showTelemetryNotice: boolean;
   renderSuccessBlock: (s: ClientRegisterSuccess) => string;
   renderRecoveryBlock: (s: ClientRegisterSuccess, serverUrl: string) => string;
 }
@@ -677,6 +692,10 @@ interface ExecuteRegistrationOpts {
   // (claude / codex / openclaw) are preserved as-is. Only the active
   // backend's slot is touched; other slots survive unmodified.
   backendDefaults: BackendConfigs | null;
+  // Opt-in crash telemetry: when true, persist `"telemetry": "on"` into
+  // config.json. Absent flag leaves any existing value untouched (a re-run
+  // never silently disables a prior opt-in).
+  enableTelemetry: boolean;
   json: boolean;
   labels: RegistrationLabels;
 }
@@ -784,6 +803,7 @@ async function executeRegistration(opts: ExecuteRegistrationOpts): Promise<numbe
         json: opts.json,
         backend: opts.backend,
         backendDefaults: opts.backendDefaults,
+        enableTelemetry: opts.enableTelemetry,
       },
       success,
       bridge,
@@ -817,6 +837,30 @@ async function executeRegistration(opts: ExecuteRegistrationOpts): Promise<numbe
           `  Re-running \`${opts.labels.cmdName} --write-env-file ...\` would mint a NEW ${opts.labels.tokenLabel} and invalidate the one just written.\n`,
       );
       return 1;
+    }
+  }
+
+  // Telemetry disclosure. Required transparency for opt-in crash reporting:
+  // confirm when opted in, and otherwise tell the operator the toggle exists
+  // and exactly what it would (and would not) send. Skipped under --json so the
+  // scripting contract stays machine-clean.
+  if (opts.labels.showTelemetryNotice && !opts.json) {
+    if (opts.enableTelemetry) {
+      process.stderr.write(
+        'Telemetry: ON. Crash reports (stack traces only — never prompts, code,\n' +
+          '  agent output, or logs) will be sent to help debug the client. Turn it\n' +
+          '  off anytime by removing the `telemetry` field from config.json.\n\n',
+      );
+    } else {
+      // Phrased around what THIS command did (it didn't enable telemetry)
+      // rather than claiming the resulting state is off — a prior run may have
+      // already opted in, and we don't re-read config here to find out.
+      process.stderr.write(
+        'Telemetry was not enabled by this command (off by default). To send crash\n' +
+          '  reports, re-run with `--enable-telemetry`, or set `"telemetry": "on"` in\n' +
+          '  config.json. Only crash stack traces are sent — never prompts, code, agent\n' +
+          '  output, or logs.\n\n',
+      );
     }
   }
 
@@ -921,6 +965,9 @@ export async function runSetup(args: SetupArgs): Promise<number> {
     token: args.token ?? null,
     backend: null,
     backendDefaults: null,
+    // The deprecated `setup` alias has no --enable-telemetry flag; never
+    // touches the telemetry field.
+    enableTelemetry: false,
     json: args.json,
     labels: {
       cmdName: 'setup',
@@ -928,6 +975,7 @@ export async function runSetup(args: SetupArgs): Promise<number> {
       tokenLabel: 'CLIENT_TOKEN',
       addCallerHint: 'vicoop-client add-caller',
       autoMintApiKeyWhenNoCaller: false,
+      showTelemetryNotice: false,
       renderSuccessBlock: renderSetupSuccessBlock,
       renderRecoveryBlock: renderSetupRecoveryBlock,
     },
@@ -961,6 +1009,7 @@ export async function runAgentRegister(args: AgentRegisterArgs): Promise<number>
     token: args.token ?? null,
     backend,
     backendDefaults: built.defaults,
+    enableTelemetry: args.enableTelemetry,
     json: args.json,
     labels: {
       cmdName: 'agent register',
@@ -968,6 +1017,7 @@ export async function runAgentRegister(args: AgentRegisterArgs): Promise<number>
       tokenLabel: 'AGENT_TOKEN',
       addCallerHint: 'vicoop-client agent callers add',
       autoMintApiKeyWhenNoCaller: true,
+      showTelemetryNotice: true,
       renderSuccessBlock: renderAgentRegisterSuccessBlock,
       renderRecoveryBlock: renderAgentRegisterRecoveryBlock,
     },

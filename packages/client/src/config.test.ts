@@ -366,6 +366,30 @@ test('normalizeConfig drops invalid codex approval_decision', (t) => {
   });
 });
 
+test('normalizeConfig keeps telemetry on/off and drops anything else', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-telemetry-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const onPath = join(dir, 'on.json');
+  writeFileSync(onPath, JSON.stringify({ telemetry: 'on' }));
+  assert.deepEqual(readConfig(onPath), { telemetry: 'on' });
+
+  const offPath = join(dir, 'off.json');
+  writeFileSync(offPath, JSON.stringify({ telemetry: 'off' }));
+  assert.deepEqual(readConfig(offPath), { telemetry: 'off' });
+
+  // A garbage / typo'd / wrong-type value is dropped — and a dropped value
+  // reads as "off" downstream, so a malformed field can never enable reporting.
+  for (const bad of ['true', 'ON', 'enabled', 'yes', '1']) {
+    const p = join(dir, `bad-${bad}.json`);
+    writeFileSync(p, JSON.stringify({ telemetry: bad }));
+    assert.deepEqual(readConfig(p), {}, `telemetry=${bad} should be dropped`);
+  }
+  const boolPath = join(dir, 'bool.json');
+  writeFileSync(boolPath, JSON.stringify({ telemetry: true }));
+  assert.deepEqual(readConfig(boolPath), {});
+});
+
 test('readConfig drops malformed fields and keeps the rest', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-bad-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -469,12 +493,15 @@ test('overlayConfig: top fields win per key, missing keys fall through from base
     agent_id: 'explicit-agent',
     backend: 'claude',
     card: '/canonical/card.json',
+    // Neither side set telemetry, so it falls through as undefined — the
+    // fixed-shape overlay always carries the key (see the next test).
+    telemetry: undefined,
     backends: { claude: { settings: { sandbox: { enabled: true } } } },
   });
 });
 
 test('overlayConfig: empty top leaves base values intact; empty base passes top through', () => {
-  // The result object always carries the six known keys; missing inputs land
+  // The result object always carries the known keys; missing inputs land
   // as `undefined` rather than absent properties. mergeClientArgs's `||`
   // chain treats both shapes identically, so this is just shape — assert the
   // values rather than the key set.

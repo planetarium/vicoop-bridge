@@ -49,6 +49,24 @@ mkdir -p "$OUT_DIR"
 
 CLIENT_DIR="$ROOT_DIR/packages/client"
 
+# Build-time injection of the opt-in crash-telemetry Sentry DSN. The client is
+# a distributed binary, so it can't read a runtime secret on the operator's
+# host — the DSN has to be baked into the binary at compile time. When
+# $VICOOP_CLIENT_SENTRY_DSN is set (release.yml passes it from a GitHub
+# secret), Bun's `--define` rewrites the `process.env.VICOOP_CLIENT_SENTRY_DSN`
+# lookup in src/instrument.ts to this string literal. When it's unset (local
+# builds, forks, CI smoke compiles), no define is added and that lookup stays a
+# runtime read that resolves to '' — i.e. telemetry stays disabled. A DSN is a
+# submit-only credential, so baking it into the public binary is expected and
+# safe (see docs/install-client.md → Telemetry).
+BUILD_DEFINES=()
+if [[ -n "${VICOOP_CLIENT_SENTRY_DSN:-}" ]]; then
+  BUILD_DEFINES+=( --define "process.env.VICOOP_CLIENT_SENTRY_DSN=\"${VICOOP_CLIENT_SENTRY_DSN}\"" )
+  echo "==> telemetry: injecting Sentry DSN at build time"
+else
+  echo "==> telemetry: no VICOOP_CLIENT_SENTRY_DSN set; building with telemetry disabled"
+fi
+
 # (bun-target, asset-slug, file-extension) — keep this table identical to
 # resolvePlatformAsset() in upgrade.ts. Anything added here also needs a
 # matching branch there, otherwise `vicoop-client upgrade` will fail to
@@ -82,7 +100,12 @@ for entry in "${TARGETS[@]}"; do
   asset="vicoop-client-${VERSION}-${slug}${ext}"
 
   echo "==> building $target -> $asset"
-  ( cd "$CLIENT_DIR" && bun build --compile --target="$target" src/cli.ts --outfile "$OUT_DIR/$asset" )
+  # `${BUILD_DEFINES[@]+...}` guards the empty-array expansion under `set -u`
+  # on bash 3.2 (macOS dev hosts); on the CI runner the array carries the
+  # --define pair built above.
+  ( cd "$CLIENT_DIR" && bun build --compile --target="$target" \
+      ${BUILD_DEFINES[@]+"${BUILD_DEFINES[@]}"} \
+      src/cli.ts --outfile "$OUT_DIR/$asset" )
   chmod +x "$OUT_DIR/$asset"
 
   # Write the checksum file with a *bare filename*, not the absolute build
