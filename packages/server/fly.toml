@@ -10,8 +10,9 @@ primary_region = "nrt"
 [env]
   PORT = "8787"
   POSTGRAPHILE_PORT = "5433"
-  # Sentry → shared "vicoop-router-monitoring" project. Enables the SDK in this
-  # deployment (see packages/server/src/instrument.ts; DSN is a baked default).
+  # Sentry → dedicated "vicoop-bridge-server" project (spans + logs both land
+  # there). Enables the SDK in this deployment; the DSN comes from the
+  # SENTRY_DSN Fly secret (see packages/server/src/instrument.ts).
   SENTRY_ENABLED = "true"
   SENTRY_ENVIRONMENT = "production"
 
