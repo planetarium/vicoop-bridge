@@ -1,5 +1,50 @@
 # @vicoop-bridge/client
 
+## 0.33.0
+
+### Minor Changes
+
+- 9627f0e: Add opt-in crash telemetry. Off by default — the client only loads or
+  initializes the Sentry SDK when config.json has `"telemetry": "on"`. Opt in
+  with `vicoop-client agent register --enable-telemetry` (persists the field) or
+  by hand-editing config.json; disable by removing the field. When on, only
+  crash reports are sent: exception class + stack trace with the operator's home
+  path redacted. Tracing is disabled, breadcrumbs/console capture are suppressed,
+  and `sendDefaultPii` is off — so prompts, code, agent output, tokens, and logs
+  are never transmitted. The daemon prints a one-line disclosure at registration
+  and at startup. DSN is configurable via `VICOOP_CLIENT_SENTRY_DSN`.
+- 8b91fe3: vicoop-codex backend: report per-account Codex usage to the bridge on request. The client answers the new `usage.request` frame by querying its local `vicoop-codex serve` `/usage` endpoint, which backs the server's admin/owner-only `GET /admin-api/agents/:id/usage` API.
+
+### Patch Changes
+
+- 7b92dbf: claude backend: report the actual response model in the OpenAI-compatible
+  envelope. The envelope's top-level `model` (and its embedded `usage.model`)
+  now resolve from model ids claude itself reports — the model named on the
+  `assistant` turn, falling back to the `system/init` resolved model — instead
+  of the `result.modelUsage` largest-output-share heuristic, which on short
+  responses could be dominated by an internal sub-model (e.g.
+  `claude-haiku-4-5-*` used for title generation) and mislabel the envelope even
+  when the requested override model handled the request. The requested
+  `envelope.model` is deliberately not used as a fallback, since it may be a
+  routing slug or an A2A card url rather than a real model id. `modelUsage` is
+  now used only to sum token counts (#348).
+- 00c9a6a: codex backend: recover real token usage on OpenAI-compatible tool-call
+  turns by deferring `turn/interrupt` until codex's
+  `thread/tokenUsage/updated` lands (#351). Previously the bridge
+  interrupted the turn the moment the model invoked a caller tool, which
+  raced ahead of codex app-server's token accounting — the accounting only
+  runs after the bridge answers the `item/tool/call` request, and an
+  interrupt in flight at that point drops the turn's usage everywhere (no
+  notification, no `turn/completed` payload, `info: null` even in codex's
+  own rollout record), so the router billed the request as
+  `total_tokens=0`. The interrupt is now held until the usage notification
+  for the turn arrives (measured at 15–40ms on codex 0.139, well ahead of
+  the ~500ms a next model iteration needs to start) with a 1s backstop
+  timer, configurable via `toolCallUsageWaitMs`. When codex still reports
+  nothing, the `{0,0,0}` placeholder remains, and the bridge now logs a
+  `tokenUsage unavailable` diagnostic so zero-usage records are
+  explainable without `--openai-compat-trace`.
+
 ## 0.32.0
 
 ### Minor Changes
