@@ -113,18 +113,27 @@ export function initTelemetry(opts: { environment?: string } = {}): boolean {
     tracesSampleRate: 0,
     // Never attach IP, cookies, headers, or user identifiers.
     sendDefaultPii: false,
-    // Suppress ALL breadcrumbs. @sentry/node's default integrations turn
-    // console.* calls into breadcrumbs; for this client those calls carry agent
-    // output, so dropping every breadcrumb is what keeps that data out of
-    // events. (We also filter the Console integration below for good measure.)
+    // Suppress ALL breadcrumbs. Even with default integrations off (below),
+    // this guarantees nothing the daemon logs — agent prompts, code, task
+    // output — is ever attached to an event as a breadcrumb.
     beforeBreadcrumb: () => null,
     // Last-line scrub: strip request/user/host data and redact home paths.
     beforeSend: scrubEvent,
-    // Drop the Console integration so it never even builds breadcrumbs from the
-    // daemon's logging. Keeping the rest of the defaults (e.g. the global error
-    // handlers) intact.
-    integrations: (defaults) =>
-      defaults.filter((i) => i.name !== 'Console'),
+    // `@sentry/bun` carries the full @sentry/node + OpenTelemetry default
+    // integration set: ~25 auto-instrumentations (Fastify, Postgres, Kafka,
+    // Anthropic, http/undici patching, OTel global registration, …). None of
+    // it is relevant to a CLI that only reports crashes, and on init it would
+    // monkey-patch the daemon's own networking and register OTel globals. Turn
+    // the whole default set off and add back only the two event-shaping
+    // integrations crash reports benefit from. Stack-trace capture is core
+    // client behavior (the stack parser), not an integration, so it's
+    // unaffected — and our own process-level handlers (cli.ts) are what feed
+    // uncaughtException / unhandledRejection, so we don't need Sentry's.
+    defaultIntegrations: false,
+    integrations: [
+      Sentry.dedupeIntegration(), // collapse identical repeated crash reports
+      Sentry.linkedErrorsIntegration(), // unwrap `error.cause` chains
+    ],
   });
   initialized = true;
   return true;
