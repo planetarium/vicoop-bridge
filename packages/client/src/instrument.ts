@@ -95,6 +95,12 @@ export function initTelemetry(opts: { environment?: string } = {}): boolean {
 
   Sentry.init({
     dsn,
+    // Operability hatch: `VICOOP_CLIENT_SENTRY_DEBUG=1` makes the SDK log its
+    // own transport (event queued / sent / rejected) to the console. An
+    // operator who opted in but sees nothing in Sentry can flip this to confirm
+    // events are actually leaving the host. Off by default; logs go to the
+    // local console only (they are not themselves telemetry).
+    debug: process.env.VICOOP_CLIENT_SENTRY_DEBUG === '1',
     release: `@vicoop-bridge/client@${clientVersion}`,
     // Same shared-project tagging convention as the server: the `service` tag
     // is how client vs. server events are told apart.

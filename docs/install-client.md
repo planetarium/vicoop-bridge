@@ -356,7 +356,9 @@ Turn it back off by removing the field or setting `"telemetry": "off"`. A
 register re-run without `--enable-telemetry` never silently disables a prior
 opt-in. The daemon prints a one-line `telemetry: on …` notice at startup so
 you can confirm the state. The Sentry endpoint is overridable with
-`VICOOP_CLIENT_SENTRY_DSN`.
+`VICOOP_CLIENT_SENTRY_DSN`, and `VICOOP_CLIENT_SENTRY_DEBUG=1` makes the SDK
+log each event it sends to the console — handy to confirm reports are actually
+leaving the host.
 
 > **Top-level vs `backends.*` parity.** Every operator-tunable knob is
 > reachable as a CLI flag and as a `config.json` field — pick whichever
