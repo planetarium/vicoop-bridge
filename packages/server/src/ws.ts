@@ -16,6 +16,7 @@ import { logEvent, truncate } from './log.js';
 import { isReservedAgentId } from './reserved-agent-ids.js';
 import { resolveHelloAgentCard } from './card-resolver.js';
 import { terminalErrorMessageFields } from './terminal-error.js';
+import { resolveUsageResponse } from './usage-rpc.js';
 
 interface ClientRow {
   id: string;
@@ -321,6 +322,10 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         });
         break;
       }
+      case 'usage.response':
+        // Only the agent the request was issued to may resolve it.
+        if (agentId) resolveUsageResponse(agentId, frame);
+        break;
       case 'pong':
         break;
       case 'hello':

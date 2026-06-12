@@ -1038,6 +1038,25 @@ export function createVicoopCodexBackend(
       }
     },
 
+    // Per-account Codex usage, served on demand for the bridge's usage API.
+    // Reuses the shared `serve` singleton and hits its read-only GET /usage
+    // (which does not consume quota). The payload is forwarded verbatim.
+    async usage() {
+      const handle = await ensureServe();
+      const res = await fetch(`${handle.baseUrl}/usage`, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        throw new Error(
+          `vicoop-codex serve /usage returned HTTP ${res.status}` +
+            (detail ? `: ${detail.slice(0, 300)}` : ''),
+        );
+      }
+      return res.json();
+    },
+
     async resolveCapabilities() {
       const ids = await probeVicoopCodexModels({
         command,

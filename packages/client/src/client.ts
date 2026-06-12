@@ -358,6 +358,9 @@ export class Client {
         case 'ping':
           this.send({ type: 'pong' });
           break;
+        case 'usage.request':
+          this.handleUsageRequest(frame);
+          break;
       }
     });
 
@@ -552,6 +555,45 @@ export class Client {
   private send(frame: UpFrame): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.ws.send(encodeFrame(frame));
+  }
+
+  // Answer a server-initiated usage.request by querying the backend's optional
+  // usage() capability. Fire-and-forget (errors surface as usage.response with
+  // ok:false rather than throwing) so it never stalls the message loop.
+  private handleUsageRequest(
+    frame: import('@vicoop-bridge/protocol').UsageRequestFrame,
+  ): void {
+    const backend = this.opts.backend;
+    if (!backend.usage) {
+      this.send({
+        type: 'usage.response',
+        requestId: frame.requestId,
+        ok: false,
+        error: {
+          code: 'unsupported',
+          message: `backend '${backend.name}' does not support usage queries`,
+        },
+      });
+      return;
+    }
+    this.logger.info(`usage.request requestId=${safeToken(frame.requestId)}`);
+    backend.usage().then(
+      (usage) => {
+        this.send({ type: 'usage.response', requestId: frame.requestId, ok: true, usage });
+      },
+      (err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger.error(
+          `usage.request failed requestId=${safeToken(frame.requestId)}: ${safeToken(message)}`,
+        );
+        this.send({
+          type: 'usage.response',
+          requestId: frame.requestId,
+          ok: false,
+          error: { code: 'usage_failed', message },
+        });
+      },
+    );
   }
 
   private async runTask(frame: import('@vicoop-bridge/protocol').DownFrame): Promise<void> {

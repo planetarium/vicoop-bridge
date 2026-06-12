@@ -42,4 +42,10 @@ export interface Backend {
   // implementations should send a kill signal / close a socket and return
   // immediately rather than wait for graceful shutdown.
   stop?(): void;
+  // Optional: return the backend's current usage / rate-limit snapshot, served
+  // on demand in response to a server-initiated `usage.request` frame. Only
+  // backends that have such a concept implement this (today: vicoop-codex,
+  // which queries its local `serve`'s GET /usage). The returned value is opaque
+  // and forwarded verbatim to the caller, so the shape can evolve freely.
+  usage?(): Promise<unknown>;
 }

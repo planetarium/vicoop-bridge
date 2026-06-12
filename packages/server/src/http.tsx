@@ -14,7 +14,8 @@ import {
 } from '@a2x/sdk';
 import type { ClientConnection, Registry } from './registry.js';
 import { createAdminA2XAgent } from './admin.js';
-import { getAdminWallets } from './admin-scope.js';
+import { getAdminWallets, isAdmin } from './admin-scope.js';
+import { requestUsage, UsageRpcError } from './usage-rpc.js';
 import {
   AdminApiError,
   addCaller,
@@ -421,6 +422,41 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       return c.json(result);
     } catch (err) {
       return adminApiErrorResponse(c, err);
+    }
+  });
+
+  // Per-account backend usage for a connected agent. Restricted to the bridge
+  // admin or the agent's owning user. Only the `vicoop-codex` backend supports
+  // it; the data is pulled from the client over the WS (usage-rpc) and the
+  // client's serve `/usage` payload is returned verbatim.
+  app.get('/admin-api/agents/:id/usage', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    const agentId = c.req.param('id');
+    const conn = opts.registry.getAgent(agentId);
+    // Collapse "not connected" and "not authorized" into one 404 so a
+    // non-owner can't probe which agent ids exist / are online.
+    if (!conn || !(isAdmin(auth.principalId) || conn.ownerPrincipal === auth.principalId)) {
+      return c.json({ error: 'Agent not found, not connected, or not authorized.' }, 404);
+    }
+    if (conn.backendKind !== 'vicoop-codex') {
+      return c.json(
+        {
+          error: `Usage is not available for backend '${conn.backendKind ?? 'unknown'}' (supported: vicoop-codex).`,
+        },
+        400,
+      );
+    }
+    try {
+      const usage = await requestUsage(opts.registry, agentId);
+      return c.json(usage as Record<string, unknown>);
+    } catch (err) {
+      if (err instanceof UsageRpcError) {
+        const status = err.code === 'offline' ? 503 : err.code === 'timeout' ? 504 : 502;
+        return c.json({ error: err.message, code: err.code }, status);
+      }
+      logEvent('admin_api_error', { error: String(err) });
+      return c.json({ error: 'Internal error' }, 500);
     }
   });
 
