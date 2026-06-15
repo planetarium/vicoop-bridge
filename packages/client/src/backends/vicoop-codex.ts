@@ -6,7 +6,7 @@ import {
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
 import { normalizeTaskFailError } from '../failure-code.js';
-import { createLogger, type Logger } from '../logger.js';
+import { createLogger, escapeLineSeparators, type Logger } from '../logger.js';
 import {
   chatHistoryFromMessages,
   collectSystemFromMessages,
@@ -393,8 +393,24 @@ export function buildCallBody(
 export function parseChatCompletionUsage(
   raw: ChatCompletionResponse['usage'],
   model: string | undefined,
+  logger?: Logger,
 ): OpenAICompatUsage | null {
   if (!raw) return null;
+  // Debug breadcrumb (a2x-internal-router#74): dump the FULL upstream usage
+  // payload before the spec-compliant mapping below narrows it. The mapping
+  // only carries `cached_tokens` / `reasoning_tokens` forward; any other
+  // `*_tokens_details` sub-field the provider reports (cache-creation,
+  // accepted/rejected prediction, audio, …) is dropped past this point, so
+  // operators reconciling router token counts against the provider's raw
+  // numbers can't see it downstream. `JSON.stringify` serialises every key
+  // actually present at runtime — including ones absent from the closed
+  // `ChatCompletionResponse['usage']` type. Gated on the logger's `debug`
+  // level (VICOOP_CLIENT_LOG_LEVEL=debug); stderr only, never persisted.
+  logger?.debug(
+    `[vicoop-codex] raw usage model=${model ?? '(none)'} ${escapeLineSeparators(
+      JSON.stringify(raw),
+    )}`,
+  );
   const prompt = typeof raw.prompt_tokens === 'number' ? raw.prompt_tokens : null;
   const completion = typeof raw.completion_tokens === 'number' ? raw.completion_tokens : null;
   if (prompt === null || completion === null) return null;
@@ -1315,7 +1331,7 @@ export function createVicoopCodexBackend(
         });
       }
 
-      let usage = parseChatCompletionUsage(response.usage, response.model);
+      let usage = parseChatCompletionUsage(response.usage, response.model, logger);
       // We force `stream_options.include_usage` on the request, so a missing
       // usage block here means the runtime dropped it on this turn despite
       // being asked for it — the #317 failure mode, which still recurs
