@@ -6,6 +6,7 @@ import {
   type TaskAssignFrame,
   type UpFrame,
 } from '@vicoop-bridge/protocol';
+import type { Logger } from '../logger.js';
 import {
   buildCallBody,
   buildMessages,
@@ -1284,4 +1285,81 @@ test('usage(): a non-OK serve response throws (with status in the message)', asy
       new Response('nope', { status: 503 })) as typeof globalThis.fetch),
     /HTTP 503/,
   );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-task timing breadcrumb: handle() emits one `timing …` debug line at the
+// terminal frame, stamping serveReady / firstByte / firstDelta / total so an
+// operator can split model-wait from streaming on a slow turn.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Capturing logger whose `debug` records the raw message string. `level` is
+// 'debug' so the recorder's debug emit is meaningful in the structural type;
+// the fake records unconditionally regardless of level.
+function makeCapturingLogger(): { logger: Logger; debugLines: string[] } {
+  const debugLines: string[] = [];
+  const logger: Logger = {
+    level: 'debug',
+    error: () => {},
+    warn: () => {},
+    info: () => {},
+    debug: (...args: unknown[]) => debugLines.push(args.map(String).join(' ')),
+  };
+  return { logger, debugLines };
+}
+
+test('handle: emits a timing line with serveReady/firstByte/firstDelta/total milestones', async () => {
+  const sse = sseStream([
+    {
+      choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
+    },
+    { choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: null }] },
+    {
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+    },
+  ]);
+  const { logger, debugLines } = makeCapturingLogger();
+  // Deterministic monotonic clock: every now() call advances by 5ms, so each
+  // milestone lands at a distinct, strictly increasing offset from t0.
+  let clk = 1000;
+  const now = () => (clk += 5);
+
+  const fake = makeFakeSpawn();
+  const backend = createVicoopCodexBackend({
+    spawn: fake.spawn,
+    fetch: makeSseFetch(sse).fetch,
+    logger,
+    now,
+  });
+  const frames: UpFrame[] = [];
+  const done = backend.handle(makeTask(), (f) => frames.push(f), new AbortController().signal);
+  await new Promise<void>((resolve, reject) => {
+    queueMicrotask(() => {
+      driveServeListening(fake.lastChild());
+      done.then(() => resolve(), reject);
+    });
+  });
+
+  const timing = debugLines.find((l) => l.startsWith('timing '));
+  assert.ok(timing, 'a timing line is emitted at the terminal frame');
+  assert.match(timing!, /backend=vicoop-codex/);
+  assert.match(timing!, /taskId=task-1/);
+  assert.match(timing!, /contextId=ctx-1/);
+  assert.match(timing!, /state=completed/);
+
+  // Pull every `<name>Ms=<n>` pair and assert the milestone ordering holds:
+  // serveReady ≤ firstByte ≤ firstDelta ≤ total. This is the property the
+  // model-wait-vs-streaming split relies on.
+  const ms = new Map<string, number>();
+  for (const m of timing!.matchAll(/(\w+)Ms=(\d+)/g)) ms.set(m[1], Number(m[2]));
+  for (const k of ['serveReady', 'firstByte', 'firstDelta', 'total']) {
+    assert.ok(ms.has(k), `timing line carries ${k}Ms`);
+  }
+  assert.ok(ms.get('serveReady')! <= ms.get('firstByte')!, 'serveReady ≤ firstByte');
+  assert.ok(ms.get('firstByte')! <= ms.get('firstDelta')!, 'firstByte ≤ firstDelta');
+  assert.ok(ms.get('firstDelta')! <= ms.get('total')!, 'firstDelta ≤ total');
+
+  // Exactly one timing line per task — no duplicate emit on the terminal frame.
+  assert.equal(debugLines.filter((l) => l.startsWith('timing ')).length, 1);
 });
