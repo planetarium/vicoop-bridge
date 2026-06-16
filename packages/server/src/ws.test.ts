@@ -39,6 +39,24 @@ function mockSql(): Sql {
   return fn as unknown as Sql;
 }
 
+// Like mockSql, but the token lookup blocks on `gate` so a test can close the
+// socket while authenticateAndRegister is mid-await (#364).
+function gatedSql(gate: Promise<void>): Sql {
+  const fn = async () => {
+    await gate;
+    return [
+      {
+        id: 'agent-1',
+        client_id: 'client-1',
+        owner_principal: 'eth:0x0',
+        owner_email: null,
+        allowed_callers: [],
+      },
+    ];
+  };
+  return fn as unknown as Sql;
+}
+
 function makeSink(): TaskSink & {
   statuses: TaskStatusUpdateEvent[];
   artifacts: TaskArtifactUpdateEvent[];
@@ -133,6 +151,56 @@ test('task.fail preserves backend error code and message on status message metad
     assert.equal(registry.getBinding('task-1'), undefined);
   } finally {
     ws.close();
+    await closeServer(server);
+  }
+});
+
+test('a socket closing during async auth does not leave a zombie registration', async () => {
+  const server = createServer();
+  const registry = new Registry();
+  let releaseAuth!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseAuth = resolve;
+  });
+  attachWsServer(server, { db: gatedSql(gate), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+
+  try {
+    await once(ws, 'open');
+    ws.send(encodeFrame({
+      type: 'hello',
+      version: PROTOCOL_VERSION,
+      agentId: 'agent-1',
+      token: 'token',
+      agentCard: {
+        name: 'agent',
+        version: '0.0.0',
+        protocolVersion: '0.3.0',
+      },
+    }));
+
+    // Let the server enter authenticateAndRegister and block on the gated
+    // token lookup, then close the socket while auth is still in flight.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    ws.close();
+    await once(ws, 'close');
+
+    // Wait for the *server-side* close handler to run — it fires shortly after
+    // the client close and, with agentId still null, skips its own cleanup.
+    // This ordering (close handler before auth resolves) is exactly what makes
+    // the registration a zombie: nothing else will tear it down. Releasing auth
+    // before this point would let the close handler observe a set agentId and
+    // clean up normally, masking the bug.
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    // Release auth: registerAgent now runs against the already-dead socket.
+    // The post-auth reconciliation must tear that entry back out.
+    releaseAuth();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    assert.equal(registry.getAgent('agent-1'), undefined);
+  } finally {
     await closeServer(server);
   }
 });

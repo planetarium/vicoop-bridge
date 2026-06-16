@@ -215,6 +215,18 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           ws.close(result.code, result.reason);
           return;
         }
+        // The socket may have closed while authenticateAndRegister was
+        // awaiting (token lookup, etc.). If so, the `close` handler already
+        // ran with agentId still null and skipped cleanup — but registerAgent
+        // has just put this now-dead ws into the registry. Reconcile here so we
+        // don't leave a zombie agent that getAgent() reports as live and
+        // sendToAgent() writes into a dead socket. unregisterAgent is idempotent
+        // (no-ops unless the stored ws is this one), so racing a later close
+        // event is safe. (#364)
+        if (ws.readyState !== ws.OPEN) {
+          opts.registry.unregisterAgent(frame.agentId, ws);
+          return;
+        }
         agentId = frame.agentId;
         authed = true;
         clearTimeout(helloTimeout);
