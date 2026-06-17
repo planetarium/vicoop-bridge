@@ -3139,6 +3139,99 @@ test('multi-turn: chat_history block is prepended to the final user content (sin
   assert.equal(envelope.message.content[1].text, 'continue, please');
 });
 
+// A history whose frozen prefix (all but the last exchange) clears the
+// ~16k-char cache threshold in formatChatHistoryBlocks.
+function bigChatHistory(): Array<Record<string, unknown>> {
+  const filler = 'z'.repeat(500);
+  const h: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < 30; i++) {
+    h.push({ role: 'user', content: `q${i} ${filler}` });
+    h.push({ role: 'assistant', content: `a${i} ${filler}` });
+  }
+  return h;
+}
+
+function stdinEnvelope(child: { stdinPayload: string }) {
+  const lines = child.stdinPayload.split('\n').filter((l: string) => l.length > 0);
+  assert.equal(lines.length, 1, 'exactly one envelope');
+  return JSON.parse(lines[0]) as {
+    message: { content: Array<{ type: string; text?: string; cache_control?: unknown }> };
+  };
+}
+
+test('history-cache off (default): single chat_history block, no cache_control', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('go', { tools: SAMPLE_TOOLS, chat_history: bigChatHistory() }),
+    emit,
+    NEVER,
+  );
+  const env = stdinEnvelope(fake.lastChild()!);
+  assert.match(env.message.content[0].text ?? '', /^<chat_history>/);
+  assert.equal(env.message.content[0].cache_control, undefined);
+  // history (1 block) + live prompt
+  assert.equal(env.message.content[1].text, 'go');
+});
+
+test('history-cache on: frozen prefix split out with a 1h cache_control breakpoint', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn, openaiCompatHistoryCache: true });
+  const { emit } = collect();
+  const history = bigChatHistory();
+  await backend.handle(
+    assignWithOpenAICompat('go', { tools: SAMPLE_TOOLS, chat_history: history }),
+    emit,
+    NEVER,
+  );
+  const env = stdinEnvelope(fake.lastChild()!);
+  const [frozen, tail, live] = env.message.content;
+  // Frozen prefix carries the breakpoint; tail and live prompt do not.
+  assert.deepEqual(frozen!.cache_control, { type: 'ephemeral', ttl: '1h' });
+  assert.match(frozen!.text ?? '', /^<chat_history>\n\[\n/);
+  assert.equal(tail!.cache_control, undefined);
+  assert.match(tail!.text ?? '', /<\/chat_history>$/);
+  assert.equal(live!.text, 'go');
+  // The two history pieces re-concatenate to one valid <chat_history> block.
+  const joined = (frozen!.text ?? '') + (tail!.text ?? '');
+  assert.match(joined, /^<chat_history>\n\[\n/);
+  assert.match(joined, /\n\]\n<\/chat_history>$/);
+});
+
+test('history-cache on: short history stays a single uncached block', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn, openaiCompatHistoryCache: true });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('go', { tools: SAMPLE_TOOLS, chat_history: SAMPLE_HISTORY }),
+    emit,
+    NEVER,
+  );
+  const env = stdinEnvelope(fake.lastChild()!);
+  assert.match(env.message.content[0].text ?? '', /^<chat_history>/);
+  assert.equal(env.message.content[0].cache_control, undefined);
+  assert.equal(env.message.content[1].text, 'go');
+});
+
 test('multi-turn: prior plain user/assistant text turns land inside the single chat_history block', async () => {
   // Prior text turns ride the same `<chat_history>` block as tool
   // round-trips — single envelope on the wire (multi-envelope

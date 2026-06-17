@@ -8,6 +8,8 @@ import {
   collectSystemFromMessages,
   dumpOpenAICompatTaskWire,
   formatChatHistory,
+  formatChatHistoryBlocks,
+  MIN_CACHEABLE_FROZEN_CHARS,
   parseOpenAICompatEnvelope,
   requalifyHistoryToolNames,
   tryParseToolCallsEnvelope,
@@ -440,6 +442,83 @@ test('formatChatHistory: wraps the full history as a JSON array verbatim', () =>
 
 test('formatChatHistory: returns empty when the history is empty', () => {
   assert.equal(formatChatHistory([]), '');
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// formatChatHistoryBlocks — splits the replay block into a cacheable frozen
+// prefix + tail for the openai-compat history-cache path.
+// ───────────────────────────────────────────────────────────────────────────
+
+// A history whose frozen prefix comfortably clears the cache threshold.
+function bigHistory(): Array<Record<string, unknown>> {
+  const filler = 'x'.repeat(400);
+  const h: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < 20; i++) {
+    h.push({ role: 'user', content: `q${i} ${filler}` });
+    h.push({ role: 'assistant', content: `a${i} ${filler}` });
+  }
+  return h;
+}
+
+test('formatChatHistoryBlocks: split=false returns the single legacy block', () => {
+  const h = bigHistory();
+  const blocks = formatChatHistoryBlocks(h);
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0]!.cache, false);
+  assert.equal(blocks[0]!.text, formatChatHistory(h));
+});
+
+test('formatChatHistoryBlocks: empty history yields no blocks', () => {
+  assert.deepEqual(formatChatHistoryBlocks([], { split: true }), []);
+});
+
+test('formatChatHistoryBlocks: split concatenates byte-identically to the single block', () => {
+  // The invariant the model relies on: however we slice the block for cache
+  // breakpoints, the rendered text it reads is exactly formatChatHistory().
+  const h = bigHistory();
+  const blocks = formatChatHistoryBlocks(h, { split: true });
+  assert.equal(blocks.length, 2);
+  assert.equal(blocks.map((b) => b.text).join(''), formatChatHistory(h));
+});
+
+test('formatChatHistoryBlocks: split marks only the frozen prefix for caching', () => {
+  const h = bigHistory();
+  const [frozen, tail] = formatChatHistoryBlocks(h, { split: true });
+  assert.equal(frozen!.cache, true);
+  assert.equal(tail!.cache, false);
+  // Frozen prefix excludes the last exchange (final two entries) — the slice an
+  // OpenAI client is most likely to edit, kept out so the prefix stays stable.
+  assert.match(frozen!.text, /^<chat_history>\n\[\n/);
+  assert.ok(!frozen!.text.includes('"content": "q19'), 'last user turn must be in the tail');
+  assert.ok(!frozen!.text.includes('"content": "a19'), 'last assistant turn must be in the tail');
+  assert.ok(tail!.text.includes('q19'));
+  assert.ok(tail!.text.includes('a19'));
+  assert.match(tail!.text, /\n<\/chat_history>$/);
+});
+
+test('formatChatHistoryBlocks: frozen prefix below threshold falls back to one block', () => {
+  // Short conversation — splitting would mark a sub-threshold prefix that the
+  // API silently won't cache, wasting a breakpoint. Stay single.
+  const h = [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: 'hello' },
+    { role: 'user', content: 'and now?' },
+    { role: 'assistant', content: 'sure' },
+  ];
+  const blocks = formatChatHistoryBlocks(h, { split: true });
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0]!.cache, false);
+  assert.ok(MIN_CACHEABLE_FROZEN_CHARS > 0);
+});
+
+test('formatChatHistoryBlocks: <=2 entries never splits even when split=true', () => {
+  const h = [
+    { role: 'user', content: 'x'.repeat(MIN_CACHEABLE_FROZEN_CHARS + 100) },
+    { role: 'assistant', content: 'y' },
+  ];
+  const blocks = formatChatHistoryBlocks(h, { split: true });
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0]!.cache, false);
 });
 
 // ───────────────────────────────────────────────────────────────────────────

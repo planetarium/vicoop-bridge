@@ -470,6 +470,67 @@ export function formatChatHistory(history: OpenAICompatHistoryEntry[]): string {
   ].join('\n');
 }
 
+// One rendered piece of the `<chat_history>` block. `cache` flags the frozen
+// prefix piece that a backend should mark with a prompt-cache breakpoint
+// (`cache_control`). Concatenating every `text` in order reproduces
+// `formatChatHistory(history)` byte-for-byte, so the model sees an identical
+// single `<chat_history>…</chat_history>` block regardless of how it was split.
+export interface ChatHistoryBlock {
+  text: string;
+  cache: boolean;
+}
+
+// Minimum serialized size (chars) of the frozen prefix before splitting it out
+// for caching is worthwhile. Anthropic silently declines to cache a prefix
+// shorter than the per-model minimum (~4096 tokens on Opus); below that a
+// `cache_control` marker is a no-op that still spends one of the 4 breakpoint
+// slots. ~4 chars/token ⇒ ~16k chars clears the Opus floor with margin.
+export const MIN_CACHEABLE_FROZEN_CHARS = 16_000;
+
+// Serialize history entries as the *inner* lines of a 2-space-indented JSON
+// array (no enclosing brackets), comma-joined. Mirrors what
+// `JSON.stringify(history, null, 2)` emits between `[` and `]`, so frozen and
+// tail pieces re-concatenate into exactly that.
+function serializeHistoryEntries(entries: OpenAICompatHistoryEntry[]): string {
+  return entries
+    .map((e) => '  ' + JSON.stringify(e, null, 2).replace(/\n/g, '\n  '))
+    .join(',\n');
+}
+
+// Split the `<chat_history>` block so the stable prefix can carry its own
+// prompt-cache breakpoint, instead of one blob that grows (and so re-bills at
+// full price) every turn.
+//
+// `split: false` (default) returns the legacy single block — byte-identical to
+// `formatChatHistory`. With `split: true` we freeze everything except the last
+// exchange (the final two entries): the tail is the slice an OpenAI client is
+// most likely to edit or regenerate, so excluding it keeps the frozen prefix
+// byte-stable turn-to-turn (the precondition for a cache *read* next turn). The
+// frozen piece is emitted only when it clears `MIN_CACHEABLE_FROZEN_CHARS`;
+// otherwise we fall back to the single unmarked block. The split is purely
+// about breakpoint placement — the rendered text the model reads is unchanged.
+export function formatChatHistoryBlocks(
+  history: OpenAICompatHistoryEntry[],
+  opts: { split?: boolean; minFrozenChars?: number } = {},
+): ChatHistoryBlock[] {
+  if (history.length === 0) return [];
+  const single = (): ChatHistoryBlock[] => [
+    { text: formatChatHistory(history), cache: false },
+  ];
+  if (!opts.split || history.length <= 2) return single();
+
+  const frozen = history.slice(0, history.length - 2);
+  const tail = history.slice(history.length - 2);
+  const frozenText = '<chat_history>\n[\n' + serializeHistoryEntries(frozen);
+  if (frozenText.length < (opts.minFrozenChars ?? MIN_CACHEABLE_FROZEN_CHARS)) {
+    return single();
+  }
+  return [
+    { text: frozenText, cache: true },
+    { text: ',\n' + serializeHistoryEntries(tail) + '\n]\n</chat_history>', cache: false },
+  ];
+}
+
 // Return a copy of `history` with every caller-tool reference renamed via
 // `rename`. Touches the `function.name` on each `assistant.tool_calls[]`
 // entry and the `name` on each `tool` result entry; everything else passes

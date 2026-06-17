@@ -43,7 +43,7 @@ import {
   collectSystemFromMessages,
   describeToolChoice,
   dumpOpenAICompatTaskWire,
-  formatChatHistory,
+  formatChatHistoryBlocks,
   parseOpenAICompatEnvelope,
   requalifyHistoryToolNames,
 } from './openai-compat.js';
@@ -191,6 +191,16 @@ export interface ClaudeBackendOptions {
   // `chat_history` to stderr on every task. Operator diagnostic exposed
   // via `--openai-compat-trace`. Leave off in production.
   openaiCompatTrace?: boolean;
+  // When true, split the replayed `<chat_history>` into a frozen prefix
+  // (carrying a `cache_control` breakpoint) plus a small tail, so the stable
+  // history reads from Anthropic's prompt cache instead of re-billing every
+  // turn. Opt-in via `--openai-compat-history-cache`: it relies on claude's
+  // stream-json input forwarding caller `cache_control` (verified on the
+  // pinned CLI, but undocumented), and shares the API's 4-breakpoint budget
+  // with claude's own system/tools markers — a future CLI change to that
+  // placement could push a request over the limit (a hard 400). Leave off
+  // unless validated against the deployed claude version.
+  openaiCompatHistoryCache?: boolean;
 }
 
 interface SessionEntry {
@@ -378,7 +388,15 @@ export function buildClaudeChatCompletionEnvelope(args: {
 
 // Anthropic-shaped content block we send on stdin.
 type InputContentBlock =
-  | { type: 'text'; text: string }
+  | {
+      type: 'text';
+      text: string;
+      // Optional prompt-cache breakpoint, passed through verbatim to the
+      // Anthropic Messages API via claude's stream-json stdin. Only set on the
+      // frozen `<chat_history>` prefix under the openai-compat history-cache
+      // path (see openaiCompatHistoryCache).
+      cache_control?: { type: 'ephemeral'; ttl?: '1h' | '5m' };
+    }
   | {
       type: 'image' | 'document';
       source: { type: 'base64'; media_type: string; data: string };
@@ -1097,6 +1115,7 @@ export function createClaudeBackend(
   const now = opts.now ?? Date.now;
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const openaiCompatTrace = opts.openaiCompatTrace === true;
+  const openaiCompatHistoryCache = opts.openaiCompatHistoryCache === true;
   const setIntervalImpl = opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
   const clearIntervalImpl = opts.clearIntervalFn ?? ((h) => clearInterval(h as ReturnType<typeof setInterval>));
   const timingLogger = createLogger();
@@ -1519,9 +1538,29 @@ export function createClaudeBackend(
               callerToolNameSet.has(name) ? callerToolMcpId(name) : name,
             )
           : envelopeChatHistory;
-        const block = formatChatHistory(projectedHistory);
-        if (block) {
-          mapped.blocks.unshift({ type: 'text', text: block });
+        // One block by default; under `--openai-compat-history-cache` the
+        // frozen prefix is split out with a `cache_control` breakpoint so it
+        // reads from Anthropic's prompt cache instead of re-billing every turn.
+        // Concatenating the pieces is byte-identical to the single-block form,
+        // so the model reads the same `<chat_history>` regardless.
+        const historyBlocks = formatChatHistoryBlocks(projectedHistory, {
+          split: openaiCompatHistoryCache,
+        });
+        const inputHistoryBlocks: InputContentBlock[] = historyBlocks.map((b) =>
+          b.cache
+            ? {
+                type: 'text',
+                text: b.text,
+                // 1h TTL to match the system/tools breakpoints claude itself
+                // sets under ENABLE_PROMPT_CACHING_1H — the API rejects a 5m
+                // block ordered after a 1h one (tools → system → messages).
+                cache_control: { type: 'ephemeral', ttl: '1h' },
+              }
+            : { type: 'text', text: b.text },
+        );
+        // unshift preserves order: [frozen, tail, ...live content blocks].
+        if (inputHistoryBlocks.length) {
+          mapped.blocks.unshift(...inputHistoryBlocks);
         }
       }
 
