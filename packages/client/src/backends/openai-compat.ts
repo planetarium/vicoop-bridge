@@ -470,6 +470,87 @@ export function formatChatHistory(history: OpenAICompatHistoryEntry[]): string {
   ].join('\n');
 }
 
+// One rendered piece of the `<chat_history>` block. `cache` flags the frozen
+// prefix piece that a backend should mark with a prompt-cache breakpoint
+// (`cache_control`). Concatenating every `text` in order reproduces
+// `formatChatHistory(history)` byte-for-byte, so the model sees an identical
+// single `<chat_history>…</chat_history>` block regardless of how it was split.
+export interface ChatHistoryBlock {
+  text: string;
+  cache: boolean;
+}
+
+// Minimum serialized size (chars) of the frozen prefix before splitting it out
+// for caching is worthwhile. Anthropic silently declines to cache a prefix
+// shorter than the per-model minimum (~4096 tokens on Opus); below that a
+// `cache_control` marker is a no-op that still spends one of the 4 breakpoint
+// slots. ~4 chars/token ⇒ ~16k chars clears the Opus floor with margin.
+export const MIN_CACHEABLE_FROZEN_CHARS = 16_000;
+
+// The frozen boundary is rounded down to a multiple of this many entries. A
+// prompt-cache READ only lands if the frozen block is *byte-identical* to a
+// prior turn's, but a real conversation grows by ~one exchange per turn — so a
+// boundary like "all but the last exchange" shifts every turn and never
+// matches. Quantizing it means the boundary (and the frozen block's bytes) only
+// advance every FREEZE_STEP_ENTRIES entries; in between, consecutive turns ship
+// the identical frozen block and read it from cache. The cost is a single cold
+// re-write on each rollover turn (1 in FREEZE_STEP_ENTRIES) plus up to
+// ~FREEZE_STEP_ENTRIES recent entries left uncached in the tail.
+export const FREEZE_STEP_ENTRIES = 10;
+
+// Serialize history entries as the *inner* lines of a 2-space-indented JSON
+// array (no enclosing brackets), comma-joined. Mirrors what
+// `JSON.stringify(history, null, 2)` emits between `[` and `]`, so frozen and
+// tail pieces re-concatenate into exactly that.
+function serializeHistoryEntries(entries: OpenAICompatHistoryEntry[]): string {
+  return entries
+    .map((e) => '  ' + JSON.stringify(e, null, 2).replace(/\n/g, '\n  '))
+    .join(',\n');
+}
+
+// Split the `<chat_history>` block so the stable prefix can carry its own
+// prompt-cache breakpoint, instead of one blob that grows (and so re-bills at
+// full price) every turn.
+//
+// `split: false` (default) returns the legacy single block — byte-identical to
+// `formatChatHistory`. With `split: true` we freeze a prefix of the history and
+// give it its own `cache_control` breakpoint. The freeze boundary is the last
+// exchange dropped, then quantized down to a multiple of `FREEZE_STEP_ENTRIES`
+// (see that const): that quantization is what makes the frozen block recur
+// byte-for-byte across consecutive turns so the cache actually *reads* it,
+// rather than shifting every turn. The frozen piece is emitted only when it
+// clears `MIN_CACHEABLE_FROZEN_CHARS`; otherwise we fall back to the single
+// unmarked block. The split is purely about breakpoint placement — the rendered
+// text the model reads is unchanged.
+export function formatChatHistoryBlocks(
+  history: OpenAICompatHistoryEntry[],
+  opts: { split?: boolean; minFrozenChars?: number; stepEntries?: number } = {},
+): ChatHistoryBlock[] {
+  if (history.length === 0) return [];
+  const single = (): ChatHistoryBlock[] => [
+    { text: formatChatHistory(history), cache: false },
+  ];
+  if (!opts.split || history.length <= 2) return single();
+
+  // Drop the last exchange (most likely to be edited), then round down to a
+  // FREEZE_STEP_ENTRIES boundary so the frozen block is byte-stable between
+  // rollovers.
+  const step = opts.stepEntries ?? FREEZE_STEP_ENTRIES;
+  const frozenCount = Math.floor((history.length - 2) / step) * step;
+  if (frozenCount < 1) return single();
+
+  const frozen = history.slice(0, frozenCount);
+  const tail = history.slice(frozenCount);
+  const frozenText = '<chat_history>\n[\n' + serializeHistoryEntries(frozen);
+  if (frozenText.length < (opts.minFrozenChars ?? MIN_CACHEABLE_FROZEN_CHARS)) {
+    return single();
+  }
+  return [
+    { text: frozenText, cache: true },
+    { text: ',\n' + serializeHistoryEntries(tail) + '\n]\n</chat_history>', cache: false },
+  ];
+}
+
 // Return a copy of `history` with every caller-tool reference renamed via
 // `rename`. Touches the `function.name` on each `assistant.tool_calls[]`
 // entry and the `name` on each `tool` result entry; everything else passes

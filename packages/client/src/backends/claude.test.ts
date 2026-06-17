@@ -3139,6 +3139,128 @@ test('multi-turn: chat_history block is prepended to the final user content (sin
   assert.equal(envelope.message.content[1].text, 'continue, please');
 });
 
+// A history whose frozen prefix (all but the last exchange) clears the
+// ~16k-char cache threshold in formatChatHistoryBlocks.
+function bigChatHistory(): Array<Record<string, unknown>> {
+  const filler = 'z'.repeat(500);
+  const h: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < 30; i++) {
+    h.push({ role: 'user', content: `q${i} ${filler}` });
+    h.push({ role: 'assistant', content: `a${i} ${filler}` });
+  }
+  return h;
+}
+
+function stdinEnvelope(child: { stdinPayload: string }) {
+  const lines = child.stdinPayload.split('\n').filter((l: string) => l.length > 0);
+  assert.equal(lines.length, 1, 'exactly one envelope');
+  return JSON.parse(lines[0]) as {
+    message: { content: Array<{ type: string; text?: string; cache_control?: unknown }> };
+  };
+}
+
+const OK_SCRIPT = {
+  lines: [
+    JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+    JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+  ],
+  exitCode: 0,
+} as const;
+
+test('history-cache (default ON): frozen prefix split out with a 1h cache_control breakpoint', async () => {
+  const fake = scriptedSpawn(OK_SCRIPT);
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('go', { tools: SAMPLE_TOOLS, chat_history: bigChatHistory() }),
+    emit,
+    NEVER,
+  );
+  const env = stdinEnvelope(fake.lastChild()!);
+  const [frozen, tail, live] = env.message.content;
+  // Frozen prefix carries the breakpoint; tail and live prompt do not.
+  assert.deepEqual(frozen!.cache_control, { type: 'ephemeral', ttl: '1h' });
+  assert.match(frozen!.text ?? '', /^<chat_history>\n\[\n/);
+  assert.equal(tail!.cache_control, undefined);
+  assert.match(tail!.text ?? '', /<\/chat_history>$/);
+  assert.equal(live!.text, 'go');
+  // The two history pieces re-concatenate to one valid <chat_history> block.
+  const joined = (frozen!.text ?? '') + (tail!.text ?? '');
+  assert.match(joined, /^<chat_history>\n\[\n/);
+  assert.match(joined, /\n\]\n<\/chat_history>$/);
+});
+
+test('history-cache: openaiCompatHistoryCache=false disables the split', async () => {
+  const fake = scriptedSpawn(OK_SCRIPT);
+  const backend = createClaudeBackend({ spawn: fake.spawn, openaiCompatHistoryCache: false });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('go', { tools: SAMPLE_TOOLS, chat_history: bigChatHistory() }),
+    emit,
+    NEVER,
+  );
+  const env = stdinEnvelope(fake.lastChild()!);
+  assert.match(env.message.content[0].text ?? '', /^<chat_history>/);
+  assert.equal(env.message.content[0].cache_control, undefined);
+  assert.equal(env.message.content[1].text, 'go');
+});
+
+test('history-cache (default ON): short history stays a single uncached block', async () => {
+  const fake = scriptedSpawn(OK_SCRIPT);
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('go', { tools: SAMPLE_TOOLS, chat_history: SAMPLE_HISTORY }),
+    emit,
+    NEVER,
+  );
+  const env = stdinEnvelope(fake.lastChild()!);
+  assert.match(env.message.content[0].text ?? '', /^<chat_history>/);
+  assert.equal(env.message.content[0].cache_control, undefined);
+  assert.equal(env.message.content[1].text, 'go');
+});
+
+test('history-cache latch: a cache_control 400 disables the split for later tasks', async () => {
+  // First task trips the latch (claude rejects the breakpoint); the second
+  // task on the same backend must fall back to the unsplit block.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'result',
+        subtype: 'error',
+        is_error: true,
+        result:
+          'API Error: 400 messages.0.content.1.cache_control: A maximum of 4 blocks with cache_control may be provided',
+      }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+
+  // Turn 1: split is used (frozen block carries cache_control), then the error
+  // result trips the latch.
+  await backend.handle(
+    assignWithOpenAICompat('one', { tools: SAMPLE_TOOLS, chat_history: bigChatHistory() }),
+    emit,
+    NEVER,
+  );
+  const env1 = stdinEnvelope(fake.lastChild()!);
+  assert.deepEqual(env1.message.content[0].cache_control, { type: 'ephemeral', ttl: '1h' });
+
+  // Turn 2: latch is set → single unsplit block, no cache_control.
+  await backend.handle(
+    assignWithOpenAICompat('two', { tools: SAMPLE_TOOLS, chat_history: bigChatHistory() }),
+    emit,
+    NEVER,
+  );
+  const env2 = stdinEnvelope(fake.lastChild()!);
+  assert.match(env2.message.content[0].text ?? '', /^<chat_history>/);
+  assert.equal(env2.message.content[0].cache_control, undefined);
+  assert.equal(env2.message.content[1].text, 'two');
+});
+
 test('multi-turn: prior plain user/assistant text turns land inside the single chat_history block', async () => {
   // Prior text turns ride the same `<chat_history>` block as tool
   // round-trips — single envelope on the wire (multi-envelope
