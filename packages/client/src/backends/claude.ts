@@ -47,7 +47,7 @@ import {
   collectSystemFromMessages,
   describeToolChoice,
   dumpOpenAICompatTaskWire,
-  formatChatHistory,
+  formatChatHistoryBlocks,
   parseOpenAICompatEnvelope,
   requalifyHistoryToolNames,
 } from './openai-compat.js';
@@ -195,6 +195,19 @@ export interface ClaudeBackendOptions {
   // `chat_history` to stderr on every task. Operator diagnostic exposed
   // via `--openai-compat-trace`. Leave off in production.
   openaiCompatTrace?: boolean;
+  // Split the replayed `<chat_history>` into a frozen prefix (carrying a
+  // `cache_control` breakpoint) plus a small tail so the stable history reads
+  // from Anthropic's prompt cache instead of re-billing every turn. Defaults
+  // ON for the claude backend; pass `false` (or set
+  // `VICOOP_DISABLE_OAI_HISTORY_CACHE=1`) to hard-disable. It relies on
+  // claude's stream-json input forwarding caller `cache_control` (verified on
+  // the pinned CLI, but undocumented) and shares the API's 4-breakpoint budget
+  // with claude's own system/tools markers; if a request is ever rejected for
+  // the breakpoint (e.g. a future CLI build whose own markers exhaust the
+  // budget), a process-wide latch auto-disables the split — that one task
+  // fails, every later task falls back to the unsplit block, and a daemon
+  // restart re-arms it (so a CLI fix/downgrade self-heals).
+  openaiCompatHistoryCache?: boolean;
   // Remaining-usage (`usage()`) injection seams. The provider reads the
   // Claude subscription OAuth token from the host and calls
   // api.anthropic.com/api/oauth/usage; these let tests stub the network, the
@@ -394,7 +407,15 @@ export function buildClaudeChatCompletionEnvelope(args: {
 
 // Anthropic-shaped content block we send on stdin.
 type InputContentBlock =
-  | { type: 'text'; text: string }
+  | {
+      type: 'text';
+      text: string;
+      // Optional prompt-cache breakpoint, passed through verbatim to the
+      // Anthropic Messages API via claude's stream-json stdin. Only set on the
+      // frozen `<chat_history>` prefix under the openai-compat history-cache
+      // path (see openaiCompatHistoryCache).
+      cache_control?: { type: 'ephemeral'; ttl?: '1h' | '5m' };
+    }
   | {
       type: 'image' | 'document';
       source: { type: 'base64'; media_type: string; data: string };
@@ -1113,6 +1134,15 @@ export function createClaudeBackend(
   const now = opts.now ?? Date.now;
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const openaiCompatTrace = opts.openaiCompatTrace === true;
+  // openai-compat chat_history prompt-cache: ON by default for claude. Hard
+  // off via `openaiCompatHistoryCache: false` or VICOOP_DISABLE_OAI_HISTORY_CACHE.
+  const historyCacheConfigured =
+    opts.openaiCompatHistoryCache !== false &&
+    process.env.VICOOP_DISABLE_OAI_HISTORY_CACHE !== '1';
+  // Process-wide latch: set if claude ever rejects our cache_control breakpoint
+  // (budget/ordering 400). Auto-falls back to the unsplit block for every later
+  // task; a daemon restart re-arms the split, so a CLI fix self-heals.
+  let historyCacheBudgetTripped = false;
   const setIntervalImpl = opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
   const clearIntervalImpl = opts.clearIntervalFn ?? ((h) => clearInterval(h as ReturnType<typeof setInterval>));
   const timingLogger = createLogger();
@@ -1520,6 +1550,9 @@ export function createClaudeBackend(
         ? mappedRaw
         : { ok: true, blocks: [], inboundHashes: new Set() };
 
+      // Set when this task emits a history `cache_control` breakpoint; lets the
+      // result handler latch off the split only on an error our marker caused.
+      let usedHistoryCacheSplit = false;
       if (envelopeChatHistory) {
         // Spec contract: bridges MUST replay the entire `chat_history`
         // in order. We render it as a single `<chat_history>` JSON
@@ -1554,9 +1587,34 @@ export function createClaudeBackend(
               callerToolNameSet.has(name) ? callerToolMcpId(name) : name,
             )
           : envelopeChatHistory;
-        const block = formatChatHistory(projectedHistory);
-        if (block) {
-          mapped.blocks.unshift({ type: 'text', text: block });
+        // On by default (claude backend): split the frozen prefix out with a
+        // `cache_control` breakpoint so it reads from Anthropic's prompt cache
+        // instead of re-billing every turn. The latch disables it after a
+        // breakpoint rejection. Concatenating the pieces is byte-identical to
+        // the single-block form, so the model reads the same `<chat_history>`.
+        const historyBlocks = formatChatHistoryBlocks(projectedHistory, {
+          split: historyCacheConfigured && !historyCacheBudgetTripped,
+        });
+        const inputHistoryBlocks: InputContentBlock[] = historyBlocks.map((b) =>
+          b.cache
+            ? {
+                type: 'text',
+                text: b.text,
+                // 1h TTL to match the system/tools breakpoints claude itself
+                // sets under ENABLE_PROMPT_CACHING_1H — the API rejects a 5m
+                // block ordered after a 1h one (tools → system → messages).
+                cache_control: { type: 'ephemeral', ttl: '1h' },
+              }
+            : { type: 'text', text: b.text },
+        );
+        // Whether this task actually emitted a cache_control breakpoint — gates
+        // the latch so we only disable on an error our own marker could cause.
+        usedHistoryCacheSplit = inputHistoryBlocks.some(
+          (b) => b.type === 'text' && b.cache_control !== undefined,
+        );
+        // unshift preserves order: [frozen, tail, ...live content blocks].
+        if (inputHistoryBlocks.length) {
+          mapped.blocks.unshift(...inputHistoryBlocks);
         }
       }
 
@@ -2377,6 +2435,23 @@ export function createClaudeBackend(
           if (typeof evt.result === 'string' && !emittedAskUserQuestion) finalText = evt.result;
           if (evt.terminal_reason === 'completed') sawCompletedResult = true;
           if (evt.is_error === true) sawErrorResult = true;
+          // Latch off the history prompt-cache split if claude rejected our
+          // `cache_control` breakpoint (budget/ordering 400). Gated on this
+          // task actually having emitted the marker, so unrelated errors don't
+          // trip it. The task still fails; every later task falls back to the
+          // unsplit block until a daemon restart re-arms the split.
+          if (
+            evt.is_error === true &&
+            usedHistoryCacheSplit &&
+            !historyCacheBudgetTripped &&
+            typeof evt.result === 'string' &&
+            /cache_control/i.test(evt.result)
+          ) {
+            historyCacheBudgetTripped = true;
+            console.error(
+              `[claude] openai-compat history prompt-cache disabled for this process — claude rejected the cache_control breakpoint: ${evt.result.slice(0, 200)}. Falling back to the unsplit chat_history block; restart re-enables it.`,
+            );
+          }
           // openai-compat/v1 response-side usage: prefer modelUsage over the
           // top-level `usage` (latter omits internal sub-model invocations).
           // Best-effort: a malformed shape just leaves finalUsage null and

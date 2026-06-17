@@ -7,6 +7,7 @@ import {
 import type { Backend } from '../backend.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import { createLogger, type Logger } from '../logger.js';
+import { createTimingRecorder } from './timing.js';
 import {
   chatHistoryFromMessages,
   collectSystemFromMessages,
@@ -88,6 +89,10 @@ export interface VicoopCodexBackendOptions {
   // 10s mirrors claude's probeTimeoutMs.
   probeTimeoutMs?: number;
   logger?: Logger;
+  // Test seam for the per-task timing recorder's clock. Production uses
+  // `Date.now`; tests inject a deterministic counter to assert the emitted
+  // `[client] timing …` milestones.
+  now?: () => number;
   // When true, dump A2A `parts` shape + metadata keys + raw
   // `chat_history` to stderr on every task. Operator diagnostic exposed
   // via `--openai-compat-trace`. Leave off in production.
@@ -710,7 +715,9 @@ function synthesizeStreamedResponse(acc: StreamAccumulator): ChatCompletionRespo
 // POST the Chat Completions request (with `stream:true`) to `vicoop-codex
 // serve` and fold the `chat.completion.chunk` SSE stream into a single
 // `ChatCompletionResponse`. `onContentDelta` fires for each incremental text
-// fragment so the caller can emit `append:true` artifacts. Throws
+// fragment so the caller can emit `append:true` artifacts. `onFirstByte`
+// fires once when the upstream HTTP response resolves OK (before any chunk),
+// letting the caller split connection/model-wait from streaming time. Throws
 // `ServeRequestError` (with an A2A code) on HTTP / transport failure; the
 // caller maps abort separately via `signal.aborted`.
 async function streamChatCompletions(
@@ -719,6 +726,7 @@ async function streamChatCompletions(
   body: string,
   signal: AbortSignal,
   onContentDelta: (text: string) => void,
+  onFirstByte?: () => void,
 ): Promise<ChatCompletionResponse> {
   let res: VicoopCodexStreamResponse;
   try {
@@ -729,6 +737,7 @@ async function streamChatCompletions(
       `vicoop-codex serve request failed: ${errorMessage(err)}`,
     );
   }
+  if (res.ok) onFirstByte?.();
   if (!res.ok) {
     let detail = '';
     try {
@@ -885,6 +894,7 @@ export function createVicoopCodexBackend(
   const serveStartupTimeoutMs = opts.serveStartupTimeoutMs ?? 10_000;
   const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
   const logger = opts.logger ?? createLogger();
+  const now = opts.now ?? Date.now;
   const openaiCompatTrace = opts.openaiCompatTrace === true;
 
   // Supported-models cache, populated by `resolveCapabilities` at daemon
@@ -1080,7 +1090,34 @@ export function createVicoopCodexBackend(
       return { openaiCompatModels };
     },
 
-    async handle(task, emit, signal) {
+    async handle(task, rawEmit, signal) {
+      // Per-task timing breadcrumb. Stamps milestones (serve readiness, first
+      // upstream byte, first streamed delta) relative to handle entry and
+      // emits one `[client] timing backend=vicoop-codex …` line at the
+      // terminal frame — gated to `debug`, so operators opt in via
+      // `VICOOP_CLIENT_LOG_LEVEL=debug` when diagnosing slow turns. The split
+      // (firstByte → firstDelta ≈ model wait; total − firstDelta ≈ streaming)
+      // is the only thing that distinguishes a long-but-healthy turn from a
+      // stall, since this backend is a thin pass-through with no per-turn log.
+      const recorder = createTimingRecorder({
+        logger,
+        backend: 'vicoop-codex',
+        taskId: task.taskId,
+        contextId: task.contextId,
+        now,
+      });
+      const emit: typeof rawEmit = (frame) => {
+        const terminal = frame.type === 'task.complete' || frame.type === 'task.fail';
+        if (terminal) recorder.mark('emit');
+        rawEmit(frame);
+        if (terminal) {
+          const state =
+            frame.type === 'task.fail' ? 'failed' : frame.status?.state ?? 'completed';
+          const code = frame.type === 'task.fail' ? frame.error?.code : undefined;
+          recorder.finish({ state, code });
+        }
+      };
+
       if (signal.aborted) {
         emit({
           type: 'task.complete',
@@ -1220,6 +1257,7 @@ export function createVicoopCodexBackend(
         });
         return;
       }
+      recorder.mark('serveReady');
 
       // Stream the response. Each `delta.content` fragment is emitted as an
       // `append:true` text artifact (single reused artifactId) so the gateway
@@ -1228,6 +1266,7 @@ export function createVicoopCodexBackend(
       let emittedAnyArtifact = false;
       const emitDelta = (text: string): void => {
         if (!text) return;
+        recorder.mark('firstDelta');
         responseArtifactId ??= randomUUID();
         emit({
           type: 'task.artifact',
@@ -1251,6 +1290,7 @@ export function createVicoopCodexBackend(
           serialized,
           signal,
           emitDelta,
+          () => recorder.mark('firstByte'),
         );
       } catch (err) {
         // Abort wins over any transport-error mapping — the caller pulled the
