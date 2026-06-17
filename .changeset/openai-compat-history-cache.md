@@ -1,5 +1,5 @@
 ---
-"@vicoop-bridge/client": minor
+"@vicoop-bridge/client": patch
 ---
 
 Cache openai-compat `chat_history` on the claude backend (on by default).
