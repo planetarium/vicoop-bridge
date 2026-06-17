@@ -126,11 +126,6 @@ export const daemonFlagsFields = {
       description: message`Dump A2A \`parts\` shape, metadata keys, and the raw \`chat_history\` array on every incoming task. Operator diagnostic for openai-compat wire issues — leave off in production.`,
     }),
   ),
-  openaiCompatHistoryCache: optional(
-    flag('--openai-compat-history-cache', {
-      description: message`(claude backend) Split the replayed \`chat_history\` into a cacheable frozen prefix + tail so stable history reads from Anthropic's prompt cache instead of re-billing every turn. Relies on claude forwarding caller \`cache_control\` (undocumented) and shares the 4-breakpoint budget — validate against the deployed claude version before enabling.`,
-    }),
-  ),
 };
 
 export const daemonFlagsParser = object(daemonFlagsFields);
@@ -161,7 +156,6 @@ export interface DaemonArgs {
   openclawOpenaiCompatAgent?: string;
   openclawTaskTimeoutMs?: number;
   openaiCompatTrace?: boolean;
-  openaiCompatHistoryCache?: boolean;
 }
 
 export type ParseFlagsResult =
@@ -296,7 +290,6 @@ export function mergeClientArgs(
     openclawTaskTimeoutMs:
       flags.openclawTaskTimeoutMs ?? backends.openclaw?.task_timeout_ms,
     openaiCompatTrace: flags.openaiCompatTrace || undefined,
-    openaiCompatHistoryCache: flags.openaiCompatHistoryCache || undefined,
   };
 
   // Empty-string normalisation for the optional path-ish fields so callers

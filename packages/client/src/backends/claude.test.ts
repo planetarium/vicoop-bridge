@@ -3159,41 +3159,20 @@ function stdinEnvelope(child: { stdinPayload: string }) {
   };
 }
 
-test('history-cache off (default): single chat_history block, no cache_control', async () => {
-  const fake = scriptedSpawn({
-    lines: [
-      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
-      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
-    ],
-    exitCode: 0,
-  });
+const OK_SCRIPT = {
+  lines: [
+    JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+    JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+  ],
+  exitCode: 0,
+} as const;
+
+test('history-cache (default ON): frozen prefix split out with a 1h cache_control breakpoint', async () => {
+  const fake = scriptedSpawn(OK_SCRIPT);
   const backend = createClaudeBackend({ spawn: fake.spawn });
   const { emit } = collect();
   await backend.handle(
     assignWithOpenAICompat('go', { tools: SAMPLE_TOOLS, chat_history: bigChatHistory() }),
-    emit,
-    NEVER,
-  );
-  const env = stdinEnvelope(fake.lastChild()!);
-  assert.match(env.message.content[0].text ?? '', /^<chat_history>/);
-  assert.equal(env.message.content[0].cache_control, undefined);
-  // history (1 block) + live prompt
-  assert.equal(env.message.content[1].text, 'go');
-});
-
-test('history-cache on: frozen prefix split out with a 1h cache_control breakpoint', async () => {
-  const fake = scriptedSpawn({
-    lines: [
-      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
-      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
-    ],
-    exitCode: 0,
-  });
-  const backend = createClaudeBackend({ spawn: fake.spawn, openaiCompatHistoryCache: true });
-  const { emit } = collect();
-  const history = bigChatHistory();
-  await backend.handle(
-    assignWithOpenAICompat('go', { tools: SAMPLE_TOOLS, chat_history: history }),
     emit,
     NEVER,
   );
@@ -3211,15 +3190,24 @@ test('history-cache on: frozen prefix split out with a 1h cache_control breakpoi
   assert.match(joined, /\n\]\n<\/chat_history>$/);
 });
 
-test('history-cache on: short history stays a single uncached block', async () => {
-  const fake = scriptedSpawn({
-    lines: [
-      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
-      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
-    ],
-    exitCode: 0,
-  });
-  const backend = createClaudeBackend({ spawn: fake.spawn, openaiCompatHistoryCache: true });
+test('history-cache: openaiCompatHistoryCache=false disables the split', async () => {
+  const fake = scriptedSpawn(OK_SCRIPT);
+  const backend = createClaudeBackend({ spawn: fake.spawn, openaiCompatHistoryCache: false });
+  const { emit } = collect();
+  await backend.handle(
+    assignWithOpenAICompat('go', { tools: SAMPLE_TOOLS, chat_history: bigChatHistory() }),
+    emit,
+    NEVER,
+  );
+  const env = stdinEnvelope(fake.lastChild()!);
+  assert.match(env.message.content[0].text ?? '', /^<chat_history>/);
+  assert.equal(env.message.content[0].cache_control, undefined);
+  assert.equal(env.message.content[1].text, 'go');
+});
+
+test('history-cache (default ON): short history stays a single uncached block', async () => {
+  const fake = scriptedSpawn(OK_SCRIPT);
+  const backend = createClaudeBackend({ spawn: fake.spawn });
   const { emit } = collect();
   await backend.handle(
     assignWithOpenAICompat('go', { tools: SAMPLE_TOOLS, chat_history: SAMPLE_HISTORY }),
@@ -3230,6 +3218,47 @@ test('history-cache on: short history stays a single uncached block', async () =
   assert.match(env.message.content[0].text ?? '', /^<chat_history>/);
   assert.equal(env.message.content[0].cache_control, undefined);
   assert.equal(env.message.content[1].text, 'go');
+});
+
+test('history-cache latch: a cache_control 400 disables the split for later tasks', async () => {
+  // First task trips the latch (claude rejects the breakpoint); the second
+  // task on the same backend must fall back to the unsplit block.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'result',
+        subtype: 'error',
+        is_error: true,
+        result:
+          'API Error: 400 messages.0.content.1.cache_control: A maximum of 4 blocks with cache_control may be provided',
+      }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+
+  // Turn 1: split is used (frozen block carries cache_control), then the error
+  // result trips the latch.
+  await backend.handle(
+    assignWithOpenAICompat('one', { tools: SAMPLE_TOOLS, chat_history: bigChatHistory() }),
+    emit,
+    NEVER,
+  );
+  const env1 = stdinEnvelope(fake.lastChild()!);
+  assert.deepEqual(env1.message.content[0].cache_control, { type: 'ephemeral', ttl: '1h' });
+
+  // Turn 2: latch is set → single unsplit block, no cache_control.
+  await backend.handle(
+    assignWithOpenAICompat('two', { tools: SAMPLE_TOOLS, chat_history: bigChatHistory() }),
+    emit,
+    NEVER,
+  );
+  const env2 = stdinEnvelope(fake.lastChild()!);
+  assert.match(env2.message.content[0].text ?? '', /^<chat_history>/);
+  assert.equal(env2.message.content[0].cache_control, undefined);
+  assert.equal(env2.message.content[1].text, 'two');
 });
 
 test('multi-turn: prior plain user/assistant text turns land inside the single chat_history block', async () => {

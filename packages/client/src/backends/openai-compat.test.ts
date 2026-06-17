@@ -10,6 +10,7 @@ import {
   formatChatHistory,
   formatChatHistoryBlocks,
   MIN_CACHEABLE_FROZEN_CHARS,
+  type OpenAICompatHistoryEntry,
   parseOpenAICompatEnvelope,
   requalifyHistoryToolNames,
   tryParseToolCallsEnvelope,
@@ -450,9 +451,9 @@ test('formatChatHistory: returns empty when the history is empty', () => {
 // ───────────────────────────────────────────────────────────────────────────
 
 // A history whose frozen prefix comfortably clears the cache threshold.
-function bigHistory(): Array<Record<string, unknown>> {
+function bigHistory(): OpenAICompatHistoryEntry[] {
   const filler = 'x'.repeat(400);
-  const h: Array<Record<string, unknown>> = [];
+  const h: OpenAICompatHistoryEntry[] = [];
   for (let i = 0; i < 20; i++) {
     h.push({ role: 'user', content: `q${i} ${filler}` });
     h.push({ role: 'assistant', content: `a${i} ${filler}` });
@@ -499,7 +500,7 @@ test('formatChatHistoryBlocks: split marks only the frozen prefix for caching', 
 test('formatChatHistoryBlocks: frozen prefix below threshold falls back to one block', () => {
   // Short conversation — splitting would mark a sub-threshold prefix that the
   // API silently won't cache, wasting a breakpoint. Stay single.
-  const h = [
+  const h: OpenAICompatHistoryEntry[] = [
     { role: 'user', content: 'hi' },
     { role: 'assistant', content: 'hello' },
     { role: 'user', content: 'and now?' },
@@ -512,7 +513,7 @@ test('formatChatHistoryBlocks: frozen prefix below threshold falls back to one b
 });
 
 test('formatChatHistoryBlocks: <=2 entries never splits even when split=true', () => {
-  const h = [
+  const h: OpenAICompatHistoryEntry[] = [
     { role: 'user', content: 'x'.repeat(MIN_CACHEABLE_FROZEN_CHARS + 100) },
     { role: 'assistant', content: 'y' },
   ];

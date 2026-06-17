@@ -421,7 +421,6 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         model: args.claudeModel,
         supportedModels: args.claudeSupportedModels,
         openaiCompatTrace: args.openaiCompatTrace,
-        openaiCompatHistoryCache: args.openaiCompatHistoryCache,
         ...(spawn ? { spawn: spawn as ClaudeSpawnFn } : {}),
       });
       return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };
