@@ -38,6 +38,10 @@ import {
 import { createLogger, safeToken } from '../logger.js';
 import { createTimingRecorder } from './timing.js';
 import {
+  createClaudeUsageProvider,
+  type ClaudeCredEnv,
+} from './claude-usage.js';
+import {
   callerToolDispatchActive,
   chatHistoryFromMessages,
   collectSystemFromMessages,
@@ -191,6 +195,13 @@ export interface ClaudeBackendOptions {
   // `chat_history` to stderr on every task. Operator diagnostic exposed
   // via `--openai-compat-trace`. Leave off in production.
   openaiCompatTrace?: boolean;
+  // Remaining-usage (`usage()`) injection seams. The provider reads the
+  // Claude subscription OAuth token from the host and calls
+  // api.anthropic.com/api/oauth/usage; these let tests stub the network, the
+  // cred source, and the cache TTL. Production leaves them unset.
+  fetchImpl?: typeof fetch;
+  claudeCredEnv?: ClaudeCredEnv;
+  usageCacheTtlMs?: number;
 }
 
 interface SessionEntry {
@@ -258,6 +269,11 @@ interface StreamEvent {
   // all entries honours the openai-compat/v1 spec's "every model invocation
   // that contributed to producing this response" requirement.
   modelUsage?: unknown;
+  // Present on the `rate_limit_event` line claude emits at the head of the
+  // stream. Carries the single representative quota window
+  // ({status, resetsAt, rateLimitType, utilization, …}); captured for the
+  // backend's usage() fallback. Pre-LLM and carries no token cost.
+  rate_limit_info?: unknown;
 }
 
 // Strip Claude Code's trailing tier suffix (e.g. `[1m]` for the 1M-context
@@ -1269,10 +1285,29 @@ export function createClaudeBackend(
   let cachedAllowedModels: Set<string> | null | undefined =
     seededModelIds.length > 0 ? new Set(seededModelIds) : undefined;
 
+  // Claude subscription remaining-usage. The provider's primary source is the
+  // authenticated GET api.anthropic.com/api/oauth/usage call (the same data
+  // `/usage` shows); the stream-derived rate_limit_event captured in
+  // `handleEvent` below is its fallback. State lives in this closure so both
+  // `handle()` (which records the event) and `usage()` (which serves it) share
+  // one cache.
+  const usageProvider = createClaudeUsageProvider({
+    now,
+    fetchImpl: opts.fetchImpl,
+    credEnv: opts.claudeCredEnv,
+    cacheTtlMs: opts.usageCacheTtlMs,
+  });
+
   return {
     name: 'claude',
 
     getSendFileMcpServer: () => sendFileMcp,
+
+    // Claude subscription remaining-usage snapshot, served on demand for the
+    // bridge usage API. Primary: authenticated api/oauth/usage (full window
+    // breakdown, cached to respect the endpoint's self-429). Fallback: the
+    // latest stream-derived rate_limit_event window.
+    usage: () => usageProvider.usage(),
 
     // Advertise the underlying model via the openai-compat/v1
     // `params.models[]` slot (planetarium/oai2a2a#63) so A2A callers can
@@ -2170,6 +2205,14 @@ export function createClaudeBackend(
             `[openai-compat trace] claude event type=${evt.type}` +
               (textLen !== undefined ? ` textLen=${textLen}` : ''),
           );
+        }
+        if (evt.type === 'rate_limit_event') {
+          // Capture the quota window claude reports at the head of the stream
+          // so the usage() capability can fall back to it when the
+          // authenticated oauth/usage call is unavailable. Pre-LLM, no token
+          // cost. Only the single representative window is reported here.
+          usageProvider.recordRateLimitEvent(evt.rate_limit_info);
+          return;
         }
         if (evt.type === 'system' && evt.subtype === 'init') {
           // Record claude's resolved model for the openai-compat envelope

@@ -426,9 +426,9 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   });
 
   // Per-account backend usage for a connected agent. Restricted to the bridge
-  // admin or the agent's owning user. Only the `vicoop-codex` backend supports
-  // it; the data is pulled from the client over the WS (usage-rpc) and the
-  // client's serve `/usage` payload is returned verbatim.
+  // admin or the agent's owning user. Supported by the `vicoop-codex` and
+  // `claude` backends; the data is pulled from the client over the WS
+  // (usage-rpc) and the backend's usage() payload is returned verbatim.
   app.get('/admin-api/agents/:id/usage', async (c) => {
     const auth = await authOwnerSession(c);
     if (!auth.ok) return adminApiUnauthorized(c, auth);
@@ -439,10 +439,11 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     if (!conn || !(isAdmin(auth.principalId) || conn.ownerPrincipal === auth.principalId)) {
       return c.json({ error: 'Agent not found, not connected, or not authorized.' }, 404);
     }
-    if (conn.backendKind !== 'vicoop-codex') {
+    const USAGE_SUPPORTED_BACKENDS = ['vicoop-codex', 'claude'];
+    if (!USAGE_SUPPORTED_BACKENDS.includes(conn.backendKind ?? '')) {
       return c.json(
         {
-          error: `Usage is not available for backend '${conn.backendKind ?? 'unknown'}' (supported: vicoop-codex).`,
+          error: `Usage is not available for backend '${conn.backendKind ?? 'unknown'}' (supported: ${USAGE_SUPPORTED_BACKENDS.join(', ')}).`,
         },
         400,
       );
