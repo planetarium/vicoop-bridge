@@ -442,6 +442,66 @@ test('formatChatHistory: returns empty when the history is empty', () => {
   assert.equal(formatChatHistory([]), '');
 });
 
+test('formatChatHistory: strips cache_control markers wherever they ride', () => {
+  // Anthropic-style cache_control markers ride inbound on messages[] (gateway /
+  // caller places an ephemeral breakpoint). They are transport hints, not
+  // conversation content — rendering them verbatim leaks API noise into the
+  // prompt and, because the marker moves each turn, thrashes the prompt cache.
+  const rendered = formatChatHistory([
+    // marker at message level
+    { role: 'user', content: 'hi', cache_control: { type: 'ephemeral' } } as never,
+    // marker nested inside a tool_calls entry (the shape seen on the wire)
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        {
+          id: 'call_x',
+          function: { name: 'f', arguments: '{}' },
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    } as never,
+    { role: 'tool', tool_call_id: 'call_x', content: 'ok' },
+  ]);
+  assert.ok(!rendered.includes('cache_control'), 'cache_control must not appear in rendered history');
+  // Semantic content survives the strip.
+  assert.match(rendered, /"role": "user"/);
+  assert.match(rendered, /"name": "f"/);
+  assert.match(rendered, /"tool_call_id": "call_x"/);
+});
+
+test('formatChatHistory: identical history minus a moved marker renders byte-identical', () => {
+  // The core caching invariant: two requests whose only difference is WHERE the
+  // moving cache_control marker sits must produce the same prefix, so an
+  // append-only conversation stays cache-readable across turns.
+  const base = [
+    { role: 'user' as const, content: 'turn 1' },
+    { role: 'assistant' as const, content: 'reply 1' },
+    { role: 'user' as const, content: 'turn 2' },
+  ];
+  const markerOnFirst = formatChatHistory([
+    { ...base[0], cache_control: { type: 'ephemeral' } } as never,
+    base[1] as never,
+    base[2] as never,
+  ]);
+  const markerOnLast = formatChatHistory([
+    base[0] as never,
+    base[1] as never,
+    { ...base[2], cache_control: { type: 'ephemeral' } } as never,
+  ]);
+  assert.equal(markerOnFirst, markerOnLast);
+  assert.equal(markerOnFirst, formatChatHistory(base));
+});
+
+test('formatChatHistory: does not mutate the caller history', () => {
+  const history = [
+    { role: 'user' as const, content: 'hi', cache_control: { type: 'ephemeral' } } as never,
+  ];
+  formatChatHistory(history);
+  assert.deepEqual(history[0], { role: 'user', content: 'hi', cache_control: { type: 'ephemeral' } });
+});
+
 // ───────────────────────────────────────────────────────────────────────────
 // requalifyHistoryToolNames — rename caller-tool references in replayed
 // history to a backend's live tool ids (claude native MCP dispatch, #213).

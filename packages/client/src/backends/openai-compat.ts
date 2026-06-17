@@ -465,9 +465,48 @@ export function formatChatHistory(history: OpenAICompatHistoryEntry[]): string {
   if (history.length === 0) return '';
   return [
     '<chat_history>',
-    JSON.stringify(history, null, 2),
+    JSON.stringify(stripCacheControl(history), null, 2),
     '</chat_history>',
   ].join('\n');
+}
+
+// Deep-strip every `cache_control` key from a value (returns a copy; input is
+// not mutated). Used to scrub the replayed history before it is rendered into
+// the `<chat_history>` text block.
+//
+// Why this matters for caching: Anthropic-style `cache_control`
+// ({"type":"ephemeral"}) markers ride inbound on the OpenAI `messages[]` — the
+// gateway / calling agent places one ephemeral breakpoint on a recent turn.
+// They are an API-transport hint, NOT conversation content, and the documented
+// history shapes (taught in buildOpenAICompat*SystemPrompt) don't include them.
+// Left in, two things go wrong:
+//
+//   1. The marker MOVES to the latest turn on every request and is removed from
+//      the previously-marked entry. Rendering the history verbatim therefore
+//      re-encodes an entry in the MIDDLE of the otherwise byte-identical array
+//      on every follow-up turn. That mutation breaks the Anthropic prompt-cache
+//      prefix match at the marker's position, so the entire replayed transcript
+//      after it is re-written to cache (1.25x) instead of read (0.1x) — the
+//      dominant cost on long openai-compat conversations, which resend the full
+//      growing history every turn.
+//   2. A literal `cache_control` field in the JSON is noise the model has to
+//      read past and was never part of the contract it's told to expect.
+//
+// Stripping it makes the rendered block a stable append-only prefix across
+// turns, restoring cross-request cache reads for the replayed history.
+function stripCacheControl<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((v) => stripCacheControl(v)) as unknown as T;
+  }
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (k === 'cache_control') continue;
+      out[k] = stripCacheControl(v);
+    }
+    return out as unknown as T;
+  }
+  return value;
 }
 
 // Return a copy of `history` with every caller-tool reference renamed via
