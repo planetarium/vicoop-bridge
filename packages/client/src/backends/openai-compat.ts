@@ -487,6 +487,17 @@ export interface ChatHistoryBlock {
 // slots. ~4 chars/token ⇒ ~16k chars clears the Opus floor with margin.
 export const MIN_CACHEABLE_FROZEN_CHARS = 16_000;
 
+// The frozen boundary is rounded down to a multiple of this many entries. A
+// prompt-cache READ only lands if the frozen block is *byte-identical* to a
+// prior turn's, but a real conversation grows by ~one exchange per turn — so a
+// boundary like "all but the last exchange" shifts every turn and never
+// matches. Quantizing it means the boundary (and the frozen block's bytes) only
+// advance every FREEZE_STEP_ENTRIES entries; in between, consecutive turns ship
+// the identical frozen block and read it from cache. The cost is a single cold
+// re-write on each rollover turn (1 in FREEZE_STEP_ENTRIES) plus up to
+// ~FREEZE_STEP_ENTRIES recent entries left uncached in the tail.
+export const FREEZE_STEP_ENTRIES = 10;
+
 // Serialize history entries as the *inner* lines of a 2-space-indented JSON
 // array (no enclosing brackets), comma-joined. Mirrors what
 // `JSON.stringify(history, null, 2)` emits between `[` and `]`, so frozen and
@@ -502,16 +513,18 @@ function serializeHistoryEntries(entries: OpenAICompatHistoryEntry[]): string {
 // full price) every turn.
 //
 // `split: false` (default) returns the legacy single block — byte-identical to
-// `formatChatHistory`. With `split: true` we freeze everything except the last
-// exchange (the final two entries): the tail is the slice an OpenAI client is
-// most likely to edit or regenerate, so excluding it keeps the frozen prefix
-// byte-stable turn-to-turn (the precondition for a cache *read* next turn). The
-// frozen piece is emitted only when it clears `MIN_CACHEABLE_FROZEN_CHARS`;
-// otherwise we fall back to the single unmarked block. The split is purely
-// about breakpoint placement — the rendered text the model reads is unchanged.
+// `formatChatHistory`. With `split: true` we freeze a prefix of the history and
+// give it its own `cache_control` breakpoint. The freeze boundary is the last
+// exchange dropped, then quantized down to a multiple of `FREEZE_STEP_ENTRIES`
+// (see that const): that quantization is what makes the frozen block recur
+// byte-for-byte across consecutive turns so the cache actually *reads* it,
+// rather than shifting every turn. The frozen piece is emitted only when it
+// clears `MIN_CACHEABLE_FROZEN_CHARS`; otherwise we fall back to the single
+// unmarked block. The split is purely about breakpoint placement — the rendered
+// text the model reads is unchanged.
 export function formatChatHistoryBlocks(
   history: OpenAICompatHistoryEntry[],
-  opts: { split?: boolean; minFrozenChars?: number } = {},
+  opts: { split?: boolean; minFrozenChars?: number; stepEntries?: number } = {},
 ): ChatHistoryBlock[] {
   if (history.length === 0) return [];
   const single = (): ChatHistoryBlock[] => [
@@ -519,8 +532,15 @@ export function formatChatHistoryBlocks(
   ];
   if (!opts.split || history.length <= 2) return single();
 
-  const frozen = history.slice(0, history.length - 2);
-  const tail = history.slice(history.length - 2);
+  // Drop the last exchange (most likely to be edited), then round down to a
+  // FREEZE_STEP_ENTRIES boundary so the frozen block is byte-stable between
+  // rollovers.
+  const step = opts.stepEntries ?? FREEZE_STEP_ENTRIES;
+  const frozenCount = Math.floor((history.length - 2) / step) * step;
+  if (frozenCount < 1) return single();
+
+  const frozen = history.slice(0, frozenCount);
+  const tail = history.slice(frozenCount);
   const frozenText = '<chat_history>\n[\n' + serializeHistoryEntries(frozen);
   if (frozenText.length < (opts.minFrozenChars ?? MIN_CACHEABLE_FROZEN_CHARS)) {
     return single();

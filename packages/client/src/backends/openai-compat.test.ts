@@ -450,11 +450,13 @@ test('formatChatHistory: returns empty when the history is empty', () => {
 // prefix + tail for the openai-compat history-cache path.
 // ───────────────────────────────────────────────────────────────────────────
 
-// A history whose frozen prefix comfortably clears the cache threshold.
-function bigHistory(): OpenAICompatHistoryEntry[] {
-  const filler = 'x'.repeat(400);
+// A history whose quantized frozen prefix comfortably clears the cache
+// threshold. 30 exchanges with ~600-char entries → frozen (rounded to a
+// FREEZE_STEP_ENTRIES boundary, well over 16k chars).
+function bigHistory(n = 30): OpenAICompatHistoryEntry[] {
+  const filler = 'x'.repeat(600);
   const h: OpenAICompatHistoryEntry[] = [];
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < n; i++) {
     h.push({ role: 'user', content: `q${i} ${filler}` });
     h.push({ role: 'assistant', content: `a${i} ${filler}` });
   }
@@ -483,18 +485,42 @@ test('formatChatHistoryBlocks: split concatenates byte-identically to the single
 });
 
 test('formatChatHistoryBlocks: split marks only the frozen prefix for caching', () => {
-  const h = bigHistory();
+  const h = bigHistory(); // 60 entries → frozen rounds to 50, tail = last 10
   const [frozen, tail] = formatChatHistoryBlocks(h, { split: true });
   assert.equal(frozen!.cache, true);
   assert.equal(tail!.cache, false);
-  // Frozen prefix excludes the last exchange (final two entries) — the slice an
-  // OpenAI client is most likely to edit, kept out so the prefix stays stable.
   assert.match(frozen!.text, /^<chat_history>\n\[\n/);
-  assert.ok(!frozen!.text.includes('"content": "q19'), 'last user turn must be in the tail');
-  assert.ok(!frozen!.text.includes('"content": "a19'), 'last assistant turn must be in the tail');
-  assert.ok(tail!.text.includes('q19'));
-  assert.ok(tail!.text.includes('a19'));
+  // The most recent turns (incl. the last exchange) live in the uncached tail,
+  // so the frozen prefix can stay byte-stable across turns.
+  assert.ok(!frozen!.text.includes('"content": "q29'), 'last user turn must be in the tail');
+  assert.ok(!frozen!.text.includes('"content": "a29'), 'last assistant turn must be in the tail');
+  assert.ok(tail!.text.includes('q29'));
+  assert.ok(tail!.text.includes('a29'));
   assert.match(tail!.text, /\n<\/chat_history>$/);
+});
+
+test('formatChatHistoryBlocks: frozen block is byte-identical as the conversation grows within a step', () => {
+  // The property the cache *read* depends on: appending turns must not change
+  // the frozen block until the quantized boundary rolls over. Two histories one
+  // exchange apart (same FREEZE_STEP window) must produce the identical frozen
+  // text — otherwise next turn's breakpoint never matches and nothing caches.
+  const base = bigHistory(28); // 56 entries → frozenCount floor(54/10)*10 = 50
+  const grown = [...base, { role: 'user' as const, content: 'next q' }, { role: 'assistant' as const, content: 'next a' }]; // 58 → floor(56/10)*10 = 50
+  const [f1] = formatChatHistoryBlocks(base, { split: true });
+  const [f2] = formatChatHistoryBlocks(grown, { split: true });
+  assert.equal(f1!.cache, true);
+  assert.equal(f2!.cache, true);
+  assert.equal(f1!.text, f2!.text); // identical frozen block → cacheable across turns
+});
+
+test('formatChatHistoryBlocks: frozen boundary advances only on step rollover', () => {
+  const a = bigHistory(); // 60 entries → frozenCount 50
+  const b = bigHistory(35); // 70 entries → frozenCount floor(68/10)*10 = 60
+  const [fa] = formatChatHistoryBlocks(a, { split: true });
+  const [fb] = formatChatHistoryBlocks(b, { split: true });
+  // Different windows → different (longer) frozen prefix.
+  assert.notEqual(fa!.text, fb!.text);
+  assert.ok(fb!.text.length > fa!.text.length);
 });
 
 test('formatChatHistoryBlocks: frozen prefix below threshold falls back to one block', () => {
