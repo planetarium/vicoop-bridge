@@ -243,6 +243,56 @@ test('--claude-supported-models with a non-claude backend is a hard error', () =
   );
 });
 
+test('claudeReasoning defaults ON when neither flag nor config sets it', () => {
+  const r = mergeClientArgs({ token: 't', agentId: 'a', backend: 'claude' }, {});
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.claudeReasoning, true);
+});
+
+test('--no-claude-reasoning flag turns the reasoning channel off', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude', noClaudeReasoning: true },
+    {},
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.claudeReasoning, false);
+});
+
+test('backends.claude.reasoning:false turns the reasoning channel off', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude' },
+    { backends: { claude: { reasoning: false } } },
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.claudeReasoning, false);
+});
+
+test('--no-claude-reasoning beats config reasoning:true', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude', noClaudeReasoning: true },
+    { backends: { claude: { reasoning: true } } },
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.claudeReasoning, false);
+});
+
+test('--no-claude-reasoning with a non-claude backend is a hard error', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'codex', noClaudeReasoning: true },
+    {},
+  );
+  assert.equal(r.ok, false);
+  if (r.ok) return;
+  assert.ok(
+    r.errors.some((e) => e.includes('--no-claude-reasoning') && e.includes('codex')),
+    `expected error mentioning --no-claude-reasoning and codex, got: ${r.errors.join(' | ')}`,
+  );
+});
+
 test('parseFlags picks up known flags', () => {
   const r = parseFlags([
     '--server', 'wss://x',

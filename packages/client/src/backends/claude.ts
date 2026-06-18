@@ -204,6 +204,22 @@ export interface ClaudeBackendOptions {
   // fails, every later task falls back to the unsplit block, and a daemon
   // restart re-arms it (so a CLI fix/downgrade self-heals).
   openaiCompatHistoryCache?: boolean;
+  // Forward Claude's extended-thinking as a live `reasoning` channel: an
+  // additive `openai-compat/v1` wire marker (a reasoning-channel artifact with
+  // `metadata[ext-uri] = { channel: 'reasoning' }`) that the oai2a2a codec maps
+  // to `delta.reasoning_content` so the a2x-internal-router stops
+  // false-failing-over long silent reasoning turns
+  // (planetarium/a2x-internal-router#95, vicoop-bridge#376).
+  //
+  // ON by default; set `false` (CLI `--no-claude-reasoning` / config
+  // `backends.claude.reasoning: false`) to disable. Disable when the deployed
+  // oai2a2a codec predates 0.6.0 — an old codec doesn't understand the
+  // `reasoning` channel marker and would fold the thinking artifact into the
+  // answer (the #95 rollout-order hazard). When on, openai-compat spawns also
+  // get `MAX_THINKING_TOKENS` injected so Claude Code actually emits thinking on
+  // the wire (its `-p` headless mode defaults extended thinking off); operators
+  // can override the budget by exporting `MAX_THINKING_TOKENS` themselves.
+  claudeReasoning?: boolean;
 }
 
 interface SessionEntry {
@@ -433,6 +449,13 @@ const TOOL_CALL_SUMMARY_MAX_CHARS = 200;
 // `task.status: working` so bytes keep flowing.
 const DEFAULT_HEARTBEAT_MS = 30_000;
 
+// Thinking budget injected via `MAX_THINKING_TOKENS` on openai-compat spawns
+// when the reasoning channel is enabled (see `claudeReasoning`). Claude Code's
+// `-p` headless mode emits no thinking on the wire unless this is set; the
+// reasoning forwarding is a no-op without it. Only applied when the operator
+// hasn't already exported their own `MAX_THINKING_TOKENS`.
+const DEFAULT_MAX_THINKING_TOKENS = '8000';
+
 // Defensive stringification — `(e as Error).message` is unsafe when the
 // thrown value is null/undefined or a non-Error primitive (common in JS).
 // Always returns a string suitable for logs/frames without throwing.
@@ -628,6 +651,34 @@ function extractClaudeStreamTextDelta(evt: StreamEvent): string {
   if (e.type === 'content_block_start' && e.content_block && typeof e.content_block === 'object') {
     const block = e.content_block as { type?: unknown; text?: unknown };
     if (block.type === 'text' && typeof block.text === 'string') return block.text;
+  }
+  return '';
+}
+
+// Extract a thinking (extended-reasoning) delta from a partial-message
+// `stream_event`. Mirrors `extractClaudeStreamTextDelta` but reads the
+// thinking content block: `content_block_delta` carries `thinking_delta`
+// (`delta.thinking`) and the opening `content_block_start` can prefill a
+// `thinking` block. These ride the wire today (claude spawns with
+// `--include-partial-messages`) but are otherwise dropped, since
+// `extractClaudeStreamTextDelta` only matches text blocks.
+//
+// `redacted_thinking` is deliberately NOT surfaced: its `data` is an encrypted
+// blob, not human-readable reasoning, so forwarding it as `reasoning_content`
+// would emit ciphertext to the caller. We skip it (the answer is unaffected —
+// redacted blocks never carried user-facing text).
+function extractClaudeStreamReasoningDelta(evt: StreamEvent): string {
+  if (evt.type !== 'stream_event') return '';
+  const event = evt.event;
+  if (!event || typeof event !== 'object') return '';
+  const e = event as { type?: unknown; delta?: unknown; content_block?: unknown };
+  if (e.type === 'content_block_delta' && e.delta && typeof e.delta === 'object') {
+    const delta = e.delta as { type?: unknown; thinking?: unknown };
+    if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') return delta.thinking;
+  }
+  if (e.type === 'content_block_start' && e.content_block && typeof e.content_block === 'object') {
+    const block = e.content_block as { type?: unknown; thinking?: unknown };
+    if (block.type === 'thinking' && typeof block.thinking === 'string') return block.thinking;
   }
   return '';
 }
@@ -1118,6 +1169,10 @@ export function createClaudeBackend(
   const now = opts.now ?? Date.now;
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const openaiCompatTrace = opts.openaiCompatTrace === true;
+  // openai-compat/v1 reasoning channel (#95 / #376). ON by default; disable via
+  // `claudeReasoning: false` (CLI `--no-claude-reasoning` / config) when the
+  // deployed codec predates 0.6.0 and can't yet understand the marker.
+  const reasoningEnabled = opts.claudeReasoning !== false;
   // openai-compat chat_history prompt-cache: ON by default for claude. Hard
   // off via `openaiCompatHistoryCache: false` or VICOOP_DISABLE_OAI_HISTORY_CACHE.
   const historyCacheConfigured =
@@ -1939,8 +1994,17 @@ export function createClaudeBackend(
       // 5-min default. Trade-off: a 1h cache *write* costs 2x base (vs 1.25x for
       // 5m), paid once per prefix; reads stay 0.1x, so it wins whenever the
       // prefix is reused at all within the hour.
+      // When the reasoning channel is on, ensure Claude Code actually emits
+      // thinking on the wire by setting a `MAX_THINKING_TOKENS` budget (its
+      // `-p` headless mode is otherwise silent). Don't clobber an operator's
+      // own export. Scoped to openai-compat spawns — the same path the
+      // reasoning-channel artifact and the router care about.
+      const reasoningBudget =
+        reasoningEnabled && envelope && !process.env.MAX_THINKING_TOKENS
+          ? { MAX_THINKING_TOKENS: DEFAULT_MAX_THINKING_TOKENS }
+          : undefined;
       const effectiveEnv = envelope
-        ? { ENABLE_PROMPT_CACHING_1H: '1' }
+        ? { ENABLE_PROMPT_CACHING_1H: '1', ...reasoningBudget }
         : undefined;
 
       let child: ClaudeChildHandle;
@@ -2042,6 +2106,10 @@ export function createClaudeBackend(
       // init reports claude's resolved default rather than the slug (#348).
       let initModel: string | null = null;
       let responseArtifactId: string | null = null;
+      // Distinct artifact id for the reasoning channel (#95 / #376), kept
+      // separate from `responseArtifactId` so thinking never co-mingles with
+      // the answer artifact. Lazily minted on the first thinking delta.
+      let reasoningArtifactId: string | null = null;
       let streamedResponseText = '';
       let sawCompletedResult = false;
       let sawErrorResult = false;
@@ -2110,6 +2178,34 @@ export function createClaudeBackend(
           },
           ...(append ? { append: true } : {}),
           lastChunk,
+        });
+        emittedAnyArtifact = true;
+      };
+
+      // Emit a thinking delta on the dedicated `reasoning` channel: a separate
+      // `artifactId` carrying the openai-compat/v1 marker
+      // `metadata[OPENAI_COMPAT_EXTENSION_URI] = { channel: 'reasoning' }`,
+      // appended with `lastChunk:false`. The oai2a2a codec maps this to
+      // `delta.reasoning_content`; the a2x-internal-router treats it as a
+      // commit/liveness signal so a healthy long-reasoning turn is never
+      // false-failed-over (#95). NOT a `claude-message` artifact — thinking
+      // must stay out of the answer. Gated by `reasoningEnabled` at the call
+      // site (and emits nothing until thinking is actually on the wire).
+      const emitReasoningArtifact = (text: string): void => {
+        if (!text) return;
+        reasoningArtifactId ??= randomUUID();
+        emit({
+          type: 'task.artifact',
+          taskId: task.taskId,
+          artifact: {
+            artifactId: reasoningArtifactId,
+            name: 'claude-reasoning',
+            parts: [{ kind: 'text', text }],
+            extensions: [OPENAI_COMPAT_EXTENSION_URI],
+            metadata: { [OPENAI_COMPAT_EXTENSION_URI]: { channel: 'reasoning' } },
+          },
+          append: true,
+          lastChunk: false,
         });
         emittedAnyArtifact = true;
       };
@@ -2240,6 +2336,18 @@ export function createClaudeBackend(
           return;
         }
         if (evt.type === 'stream_event') {
+          if (reasoningEnabled && !emittedAskUserQuestion) {
+            const reasoning = extractClaudeStreamReasoningDelta(evt);
+            if (reasoning) {
+              // Liveness: a reasoning byte is "alive and committing" for the
+              // router, so stamp the heartbeat clock too (a long thinking
+              // burst must not look idle). The reasoning artifact rides the
+              // wrapped `emit`, which already refreshes `lastEmitAt`.
+              recorder.mark('firstAssistant');
+              emitReasoningArtifact(reasoning);
+              return;
+            }
+          }
           const delta = extractClaudeStreamTextDelta(evt);
           if (delta && !emittedAskUserQuestion) {
             recorder.mark('firstAssistant');
@@ -2479,6 +2587,13 @@ export function createClaudeBackend(
           // fresh window and skips. Calling `rawEmit` here would leave
           // `lastEmitAt` stale and let several ticks emit back-to-back
           // if the timer fired multiple times after a long pause.
+          // NOTE (#95 / #376): the heartbeat liveness marker
+          // (`metadata[OPENAI_COMPAT_EXTENSION_URI] = { heartbeat: true }`) is
+          // intentionally NOT stamped here. `TaskStatus` has no `metadata`
+          // field in the protocol (it would be stripped), and routing it to the
+          // A2A `TaskStatusUpdateEvent.metadata` needs a protocol + server
+          // change. That lands with the shared-loop heartbeat follow-up; this
+          // bare `working` heartbeat already keeps bytes on the wire today.
           emit({
             type: 'task.status',
             taskId: task.taskId,

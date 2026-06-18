@@ -126,6 +126,15 @@ export interface ClaudeBackendConfig {
    * `model_not_found`. Mirrors the `--claude-supported-models` flag.
    */
   supported_models?: string[];
+  /**
+   * Forward Claude's extended-thinking on the openai-compat/v1 `reasoning`
+   * channel (so the a2x-internal-router stops false-failing-over long silent
+   * reasoning turns — planetarium/a2x-internal-router#95). ON by default; set
+   * `false` to disable when the deployed oai2a2a codec predates 0.6.0 and can't
+   * understand the channel marker yet. Mirrors the `--no-claude-reasoning`
+   * flag.
+   */
+  reasoning?: boolean;
   runtime?: BackendRuntime;
   runtime_name?: string;
 }

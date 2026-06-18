@@ -93,6 +93,11 @@ export const daemonFlagsFields = {
   claudeSupportedModels: optional(option('--claude-supported-models', string({ metavar: 'MODELS' }), {
     description: message`Comma-separated additional model ids this Claude install can serve, e.g. \`claude-sonnet-4-6,claude-haiku-4-5\`. Advertised alongside the default model and accepted as per-request openai-compat \`model\` overrides (Claude has no headless model listing, so the set is operator-declared and not validated against the account). Only valid with \`--backend claude\`; pairing with another backend exits non-zero.`,
   })),
+  noClaudeReasoning: optional(
+    flag('--no-claude-reasoning', {
+      description: message`Disable forwarding Claude's extended-thinking on the openai-compat/v1 \`reasoning\` channel (on by default). Use when the deployed oai2a2a codec predates 0.6.0 and can't yet interpret the channel marker — otherwise the thinking would fold into the answer (planetarium/a2x-internal-router#95). Mirrors config \`backends.claude.reasoning: false\`.`,
+    }),
+  ),
 
   // Backend-specific (Codex)
   codexSandbox: optional(option('--codex-sandbox', choice([...SANDBOX_MODES]), {
@@ -149,6 +154,10 @@ export interface DaemonArgs {
   claudeSettingsFile?: string;
   claudeModel?: string;
   claudeSupportedModels?: string[];
+  // Resolved openai-compat/v1 reasoning channel toggle. Defaults ON; the
+  // `--no-claude-reasoning` flag or `backends.claude.reasoning: false` flips it
+  // off (#95 / #376). Always defined after `resolveDaemonArgs`.
+  claudeReasoning?: boolean;
   codexSandbox?: CodexSandboxMode;
   openclawGateway?: string;
   openclawGatewayToken?: string;
@@ -274,6 +283,9 @@ export function mergeClientArgs(
     claudeSupportedModels:
       pickModelsList(flags.claudeSupportedModels) ??
       (backends.claude?.supported_models?.length ? backends.claude.supported_models : undefined),
+    // ON unless the config opts out (`reasoning: false`) or the CLI flag forces
+    // it off; the flag wins over config, matching the other flag>config knobs.
+    claudeReasoning: backends.claude?.reasoning !== false && !flags.noClaudeReasoning,
     codexSandbox:
       flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),
     openclawGateway:
@@ -339,6 +351,11 @@ export function mergeClientArgs(
   if (pick(flags.claudeSupportedModels) && backend !== 'claude') {
     errors.push(
       `--claude-supported-models is not supported by --backend ${backend}; only the claude backend takes model ids`,
+    );
+  }
+  if (flags.noClaudeReasoning && backend !== 'claude') {
+    errors.push(
+      `--no-claude-reasoning is not supported by --backend ${backend}; only the claude backend forwards a reasoning channel`,
     );
   }
 
