@@ -462,6 +462,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       return {
         backend: createVicoopCodexBackend({
           openaiCompatTrace: args.openaiCompatTrace,
+          reasoning: args.vicoopCodexReasoning,
         }),
       };
     default:

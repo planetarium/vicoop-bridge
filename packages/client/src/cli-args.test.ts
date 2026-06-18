@@ -343,6 +343,68 @@ test('--claude-thinking-budget with a non-claude backend is a hard error', () =>
   );
 });
 
+test('vicoopCodexReasoning defaults ON when neither flag nor config sets it', () => {
+  const r = mergeClientArgs({ token: 't', agentId: 'a', backend: 'vicoop-codex' }, {});
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.vicoopCodexReasoning, true);
+});
+
+test('--no-vicoop-codex-reasoning flag turns the reasoning channel off', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'vicoop-codex', noVicoopCodexReasoning: true },
+    {},
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.vicoopCodexReasoning, false);
+});
+
+test('backends.vicoop-codex.reasoning:false turns the reasoning channel off', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'vicoop-codex' },
+    { backends: { 'vicoop-codex': { reasoning: false } } },
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.vicoopCodexReasoning, false);
+});
+
+test('--no-vicoop-codex-reasoning beats config reasoning:true', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'vicoop-codex', noVicoopCodexReasoning: true },
+    { backends: { 'vicoop-codex': { reasoning: true } } },
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.vicoopCodexReasoning, false);
+});
+
+test('--no-vicoop-codex-reasoning with a non-vicoop-codex backend is a hard error', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude', noVicoopCodexReasoning: true },
+    {},
+  );
+  assert.equal(r.ok, false);
+  if (r.ok) return;
+  assert.ok(
+    r.errors.some((e) => e.includes('--no-vicoop-codex-reasoning') && e.includes('claude')),
+    `expected error mentioning --no-vicoop-codex-reasoning and claude, got: ${r.errors.join(' | ')}`,
+  );
+});
+
+test('parseFlags picks up --no-vicoop-codex-reasoning', () => {
+  const r = parseFlags([
+    '--token', 't',
+    '--agentId', 'a',
+    '--backend', 'vicoop-codex',
+    '--no-vicoop-codex-reasoning',
+  ]);
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.flags.noVicoopCodexReasoning, true);
+});
+
 test('parseFlags picks up known flags', () => {
   const r = parseFlags([
     '--server', 'wss://x',
