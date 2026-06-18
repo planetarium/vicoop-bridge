@@ -312,6 +312,205 @@ test('streams Claude stream_event text deltas as append chunks', async () => {
   assert.deepEqual(artifacts.map((a) => a.append), [true, true]);
 });
 
+test('forwards thinking_delta on a reasoning channel when claudeReasoning is on', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_start', content_block: { type: 'thinking', thinking: 'let me' } },
+      }),
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: ' think' } },
+      }),
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'answer' } },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'answer' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeReasoning: true });
+  const { emit, frames } = collect();
+  await backend.handle(assign('hello'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  const reasoning = artifacts.filter((a) => a.artifact.name === 'claude-reasoning');
+  const answer = artifacts.filter((a) => a.artifact.name === 'claude-message');
+
+  // Thinking rides its own channel: separate id, the openai-compat marker,
+  // appended and non-terminal — never co-mingled with the answer artifact.
+  assert.deepEqual(reasoning.map(textOf), ['let me', ' think']);
+  assert.equal(new Set(reasoning.map((a) => a.artifact.artifactId)).size, 1);
+  for (const r of reasoning) {
+    assert.deepEqual(r.artifact.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+    assert.deepEqual(r.artifact.metadata?.[OPENAI_COMPAT_EXTENSION_URI], { channel: 'reasoning' });
+    assert.equal(r.append, true);
+    assert.equal(r.lastChunk, false);
+  }
+  // The answer is a distinct artifact id and carries only the text delta.
+  assert.deepEqual(answer.map(textOf), ['answer']);
+  assert.notEqual(reasoning[0].artifact.artifactId, answer[0].artifact.artifactId);
+});
+
+test('forwards thinking_delta by default (no claudeReasoning option)', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'hmm' } },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: '' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(assign('hello'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  // Reasoning is ON by default — the thinking delta surfaces on its channel.
+  assert.deepEqual(
+    artifacts.filter((a) => a.artifact.name === 'claude-reasoning').map(textOf),
+    ['hmm'],
+  );
+});
+
+test('drops thinking_delta entirely when claudeReasoning is false', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'secret' } },
+      }),
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'answer' } },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'answer' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeReasoning: false });
+  const { emit, frames } = collect();
+  await backend.handle(assign('hello'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  // No reasoning channel, and the thinking text never leaks into the answer.
+  assert.equal(artifacts.filter((a) => a.artifact.name === 'claude-reasoning').length, 0);
+  assert.deepEqual(
+    artifacts.filter((a) => a.artifact.name === 'claude-message').map(textOf),
+    ['answer'],
+  );
+});
+
+test('does not forward redacted_thinking content even with reasoning on', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_start', content_block: { type: 'redacted_thinking', data: 'ENCRYPTED' } },
+      }),
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'answer' } },
+      }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'answer' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeReasoning: true });
+  const { emit, frames } = collect();
+  await backend.handle(assign('hello'), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  // Encrypted redacted-thinking blob must never reach the wire.
+  assert.equal(artifacts.filter((a) => a.artifact.name === 'claude-reasoning').length, 0);
+  const all = JSON.stringify(artifacts);
+  assert.equal(all.includes('ENCRYPTED'), false);
+});
+
+test('injects MAX_THINKING_TOKENS on openai-compat spawns when reasoning is on', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeReasoning: true });
+  const { emit } = collect();
+  const envelopeTask: TaskAssignFrame = {
+    ...assign('hello'),
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [{ kind: 'text', text: 'hello' }],
+      metadata: {
+        [OPENAI_COMPAT_EXTENSION_URI]: {
+          chat_completions_request: { model: 'gpt', messages: [{ role: 'user', content: 'hello' }] },
+        },
+      },
+    },
+    requestedExtensions: [OPENAI_COMPAT_EXTENSION_URI],
+  };
+  await backend.handle(envelopeTask, emit, NEVER);
+
+  assert.equal(fake.lastChild()?.env?.MAX_THINKING_TOKENS, '8000');
+});
+
+test('claudeThinkingBudget overrides the injected MAX_THINKING_TOKENS', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    claudeReasoning: true,
+    claudeThinkingBudget: 12000,
+  });
+  const { emit } = collect();
+  const envelopeTask: TaskAssignFrame = {
+    ...assign('hello'),
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [{ kind: 'text', text: 'hello' }],
+      metadata: {
+        [OPENAI_COMPAT_EXTENSION_URI]: {
+          chat_completions_request: { model: 'gpt', messages: [{ role: 'user', content: 'hello' }] },
+        },
+      },
+    },
+    requestedExtensions: [OPENAI_COMPAT_EXTENSION_URI],
+  };
+  await backend.handle(envelopeTask, emit, NEVER);
+
+  assert.equal(fake.lastChild()?.env?.MAX_THINKING_TOKENS, '12000');
+});
+
 test('falls back to result artifact when streaming produced nothing', async () => {
   const fake = scriptedSpawn({
     lines: [
