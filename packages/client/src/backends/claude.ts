@@ -220,6 +220,13 @@ export interface ClaudeBackendOptions {
   // the wire (its `-p` headless mode defaults extended thinking off); operators
   // can override the budget by exporting `MAX_THINKING_TOKENS` themselves.
   claudeReasoning?: boolean;
+  // Thinking budget (in tokens) injected as `MAX_THINKING_TOKENS` on
+  // openai-compat spawns when the reasoning channel is on. Operator-facing knob
+  // for the default below (CLI `--claude-thinking-budget` / config
+  // `backends.claude.thinking_budget`). Precedence: this option > an operator's
+  // own `MAX_THINKING_TOKENS` env export > `DEFAULT_MAX_THINKING_TOKENS`. Unset
+  // (the default) keeps the env-or-default behaviour.
+  claudeThinkingBudget?: number;
 }
 
 interface SessionEntry {
@@ -449,11 +456,12 @@ const TOOL_CALL_SUMMARY_MAX_CHARS = 200;
 // `task.status: working` so bytes keep flowing.
 const DEFAULT_HEARTBEAT_MS = 30_000;
 
-// Thinking budget injected via `MAX_THINKING_TOKENS` on openai-compat spawns
-// when the reasoning channel is enabled (see `claudeReasoning`). Claude Code's
-// `-p` headless mode emits no thinking on the wire unless this is set; the
-// reasoning forwarding is a no-op without it. Only applied when the operator
-// hasn't already exported their own `MAX_THINKING_TOKENS`.
+// Default thinking budget injected via `MAX_THINKING_TOKENS` on openai-compat
+// spawns when the reasoning channel is enabled (see `claudeReasoning`). Claude
+// Code's `-p` headless mode emits no thinking on the wire unless this is set;
+// the reasoning forwarding is a no-op without it. Used when no explicit
+// `claudeThinkingBudget` override is given and the operator hasn't exported
+// their own `MAX_THINKING_TOKENS`.
 const DEFAULT_MAX_THINKING_TOKENS = '8000';
 
 // Defensive stringification — `(e as Error).message` is unsafe when the
@@ -1173,6 +1181,15 @@ export function createClaudeBackend(
   // `claudeReasoning: false` (CLI `--no-claude-reasoning` / config) when the
   // deployed codec predates 0.6.0 and can't yet understand the marker.
   const reasoningEnabled = opts.claudeReasoning !== false;
+  // Operator-facing override for the injected `MAX_THINKING_TOKENS` budget; a
+  // positive integer or undefined (use env-or-default). Non-positive values are
+  // ignored so a stray `0` / negative can't silently disable thinking.
+  const thinkingBudgetOverride =
+    typeof opts.claudeThinkingBudget === 'number' &&
+    Number.isFinite(opts.claudeThinkingBudget) &&
+    opts.claudeThinkingBudget > 0
+      ? String(Math.floor(opts.claudeThinkingBudget))
+      : undefined;
   // openai-compat chat_history prompt-cache: ON by default for claude. Hard
   // off via `openaiCompatHistoryCache: false` or VICOOP_DISABLE_OAI_HISTORY_CACHE.
   const historyCacheConfigured =
@@ -1996,12 +2013,19 @@ export function createClaudeBackend(
       // prefix is reused at all within the hour.
       // When the reasoning channel is on, ensure Claude Code actually emits
       // thinking on the wire by setting a `MAX_THINKING_TOKENS` budget (its
-      // `-p` headless mode is otherwise silent). Don't clobber an operator's
-      // own export. Scoped to openai-compat spawns — the same path the
-      // reasoning-channel artifact and the router care about.
+      // `-p` headless mode is otherwise silent). Scoped to openai-compat spawns
+      // — the same path the reasoning-channel artifact and the router care
+      // about. Precedence: an explicit `--claude-thinking-budget` / config knob
+      // wins (and overrides the env, since defaultSpawn merges options.env over
+      // process.env); otherwise an operator's own `MAX_THINKING_TOKENS` export
+      // passes through untouched; otherwise the built-in default.
       const reasoningBudget =
-        reasoningEnabled && envelope && !process.env.MAX_THINKING_TOKENS
-          ? { MAX_THINKING_TOKENS: DEFAULT_MAX_THINKING_TOKENS }
+        reasoningEnabled && envelope
+          ? thinkingBudgetOverride !== undefined
+            ? { MAX_THINKING_TOKENS: thinkingBudgetOverride }
+            : !process.env.MAX_THINKING_TOKENS
+              ? { MAX_THINKING_TOKENS: DEFAULT_MAX_THINKING_TOKENS }
+              : undefined
           : undefined;
       const effectiveEnv = envelope
         ? { ENABLE_PROMPT_CACHING_1H: '1', ...reasoningBudget }

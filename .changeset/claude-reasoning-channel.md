@@ -12,4 +12,6 @@ reasoning turn as alive instead of false-failing-over it
 (planetarium/a2x-internal-router#95, #376). ON by default; disable with
 `--no-claude-reasoning` or `backends.claude.reasoning: false` when the deployed
 oai2a2a codec predates 0.6.0 and can't yet interpret the channel marker.
-Redacted-thinking blocks are never forwarded.
+Redacted-thinking blocks are never forwarded. The injected thinking budget
+(default 8000) is configurable via `--claude-thinking-budget` /
+`backends.claude.thinking_budget`.

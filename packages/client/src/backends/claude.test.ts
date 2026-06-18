@@ -477,6 +477,40 @@ test('injects MAX_THINKING_TOKENS on openai-compat spawns when reasoning is on',
   assert.equal(fake.lastChild()?.env?.MAX_THINKING_TOKENS, '8000');
 });
 
+test('claudeThinkingBudget overrides the injected MAX_THINKING_TOKENS', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    claudeReasoning: true,
+    claudeThinkingBudget: 12000,
+  });
+  const { emit } = collect();
+  const envelopeTask: TaskAssignFrame = {
+    ...assign('hello'),
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [{ kind: 'text', text: 'hello' }],
+      metadata: {
+        [OPENAI_COMPAT_EXTENSION_URI]: {
+          chat_completions_request: { model: 'gpt', messages: [{ role: 'user', content: 'hello' }] },
+        },
+      },
+    },
+    requestedExtensions: [OPENAI_COMPAT_EXTENSION_URI],
+  };
+  await backend.handle(envelopeTask, emit, NEVER);
+
+  assert.equal(fake.lastChild()?.env?.MAX_THINKING_TOKENS, '12000');
+});
+
 test('falls back to result artifact when streaming produced nothing', async () => {
   const fake = scriptedSpawn({
     lines: [

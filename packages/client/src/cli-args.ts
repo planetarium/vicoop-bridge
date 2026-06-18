@@ -98,6 +98,11 @@ export const daemonFlagsFields = {
       description: message`Disable forwarding Claude's extended-thinking on the openai-compat/v1 \`reasoning\` channel (on by default). Use when the deployed oai2a2a codec predates 0.6.0 and can't yet interpret the channel marker — otherwise the thinking would fold into the answer (planetarium/a2x-internal-router#95). Mirrors config \`backends.claude.reasoning: false\`.`,
     }),
   ),
+  claudeThinkingBudget: optional(
+    option('--claude-thinking-budget', integer({ metavar: 'TOKENS', min: 1 }), {
+      description: message`Thinking budget in tokens, injected as \`MAX_THINKING_TOKENS\` on openai-compat spawns so Claude emits thinking on the wire (default 8000). Takes precedence over an operator's own \`MAX_THINKING_TOKENS\` export. Only valid with \`--backend claude\`. Mirrors config \`backends.claude.thinking_budget\`.`,
+    }),
+  ),
 
   // Backend-specific (Codex)
   codexSandbox: optional(option('--codex-sandbox', choice([...SANDBOX_MODES]), {
@@ -158,6 +163,10 @@ export interface DaemonArgs {
   // `--no-claude-reasoning` flag or `backends.claude.reasoning: false` flips it
   // off (#95 / #376). Always defined after `resolveDaemonArgs`.
   claudeReasoning?: boolean;
+  // Resolved `MAX_THINKING_TOKENS` budget override (`--claude-thinking-budget`
+  // / `backends.claude.thinking_budget`). Undefined keeps the backend's
+  // env-or-default behaviour.
+  claudeThinkingBudget?: number;
   codexSandbox?: CodexSandboxMode;
   openclawGateway?: string;
   openclawGatewayToken?: string;
@@ -286,6 +295,7 @@ export function mergeClientArgs(
     // ON unless the config opts out (`reasoning: false`) or the CLI flag forces
     // it off; the flag wins over config, matching the other flag>config knobs.
     claudeReasoning: backends.claude?.reasoning !== false && !flags.noClaudeReasoning,
+    claudeThinkingBudget: flags.claudeThinkingBudget ?? backends.claude?.thinking_budget,
     codexSandbox:
       flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),
     openclawGateway:
@@ -356,6 +366,11 @@ export function mergeClientArgs(
   if (flags.noClaudeReasoning && backend !== 'claude') {
     errors.push(
       `--no-claude-reasoning is not supported by --backend ${backend}; only the claude backend forwards a reasoning channel`,
+    );
+  }
+  if (flags.claudeThinkingBudget !== undefined && backend !== 'claude') {
+    errors.push(
+      `--claude-thinking-budget is not supported by --backend ${backend}; only the claude backend takes a thinking budget`,
     );
   }
 

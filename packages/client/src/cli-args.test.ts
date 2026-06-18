@@ -293,6 +293,56 @@ test('--no-claude-reasoning with a non-claude backend is a hard error', () => {
   );
 });
 
+test('claudeThinkingBudget is undefined when neither flag nor config sets it', () => {
+  const r = mergeClientArgs({ token: 't', agentId: 'a', backend: 'claude' }, {});
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.claudeThinkingBudget, undefined);
+});
+
+test('--claude-thinking-budget flag sets the budget', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude', claudeThinkingBudget: 16000 },
+    {},
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.claudeThinkingBudget, 16000);
+});
+
+test('--claude-thinking-budget flag beats backends.claude.thinking_budget from config', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude', claudeThinkingBudget: 16000 },
+    { backends: { claude: { thinking_budget: 4000 } } },
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.claudeThinkingBudget, 16000);
+});
+
+test('backends.claude.thinking_budget fills in when the flag is absent', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude' },
+    { backends: { claude: { thinking_budget: 4000 } } },
+  );
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.args.claudeThinkingBudget, 4000);
+});
+
+test('--claude-thinking-budget with a non-claude backend is a hard error', () => {
+  const r = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'codex', claudeThinkingBudget: 16000 },
+    {},
+  );
+  assert.equal(r.ok, false);
+  if (r.ok) return;
+  assert.ok(
+    r.errors.some((e) => e.includes('--claude-thinking-budget') && e.includes('codex')),
+    `expected error mentioning --claude-thinking-budget and codex, got: ${r.errors.join(' | ')}`,
+  );
+});
+
 test('parseFlags picks up known flags', () => {
   const r = parseFlags([
     '--server', 'wss://x',

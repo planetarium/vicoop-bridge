@@ -135,6 +135,14 @@ export interface ClaudeBackendConfig {
    * flag.
    */
   reasoning?: boolean;
+  /**
+   * Thinking budget (in tokens) injected as `MAX_THINKING_TOKENS` on
+   * openai-compat spawns when `reasoning` is on, so Claude Code emits thinking
+   * on the wire. A positive integer; defaults to 8000. Takes precedence over an
+   * operator's own `MAX_THINKING_TOKENS` env export. Mirrors the
+   * `--claude-thinking-budget` flag.
+   */
+  thinking_budget?: number;
   runtime?: BackendRuntime;
   runtime_name?: string;
 }
