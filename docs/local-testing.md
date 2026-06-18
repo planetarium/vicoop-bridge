@@ -338,6 +338,20 @@ DATABASE_URL="postgres://$USER@localhost:5432/vicoop_bridge_dev" \
 - **Caller token LRU cache is 60s**. After `UPDATE callers SET revoked=true`,
   revocation only takes effect on the next verify after ~60s. For immediate
   testing, wait out the window or restart the server.
+- **Probing the `claude` CLI directly? Pass `--strict-mcp-config`.** When you
+  spawn `claude -p ...` by hand to reproduce a claude-backend behavior (e.g.
+  inspecting `stream-json` frames), it otherwise loads *your operator* MCP
+  servers from `~/.claude` / project `.mcp.json` — sentry, github, etc. — which
+  spawn extra child processes and eat CPU/RAM, and aren't part of the bridge's
+  spawn anyway. `--strict-mcp-config` with no `--mcp-config` uses zero MCP
+  servers (`system/init` shows `mcp_servers=[]`):
+  ```bash
+  claude -p "..." --strict-mcp-config \
+    --input-format stream-json --output-format stream-json --verbose \
+    --include-partial-messages --model claude-opus-4-8
+  ```
+  If a probe still leaks server processes, clean up with
+  `pkill -f 'sentry-mcp'` (substitute the server binary).
 
 ## Tear-down
 
