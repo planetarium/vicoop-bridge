@@ -8,6 +8,7 @@ import {
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
 import { createLogger, type Logger } from '../logger.js';
@@ -121,7 +122,7 @@ interface SessionEntry {
   writeId: number;
 }
 
-const DEFAULT_HEARTBEAT_MS = 30_000;
+const DEFAULT_HEARTBEAT_MS = HEARTBEAT_INTERVAL_MS;
 const COMMAND_TRACE_MAX_CHARS = 2_000;
 
 function errorMessage(e: unknown): string {
@@ -1620,7 +1621,7 @@ export function createCodexBackend(
                 clearTimeout(interruptTimer);
                 interruptTimer = null;
               }
-              if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
+              heartbeat.stop();
               signal.removeEventListener('abort', onAbort);
               resolve(o);
             };
@@ -1735,19 +1736,20 @@ export function createCodexBackend(
             };
             signal.addEventListener('abort', onAbort);
 
-            // Idle-silence heartbeat — same shape as codex.ts.
-            let heartbeatHandle: unknown = null;
-            if (heartbeatMs > 0) {
-              heartbeatHandle = setIntervalImpl(() => {
-                if (settled) return;
-                if (now() - lastEmitAt < heartbeatMs) return;
-                emit({
-                  type: 'task.status',
-                  taskId: task.taskId,
-                  status: { state: 'working', timestamp: new Date().toISOString() },
-                });
-              }, heartbeatMs);
-            }
+            // Shared liveness heartbeat — see heartbeat.ts. Routes through the
+            // wrapped `emit` so a heartbeat refreshes the silence window;
+            // suppressed once settled / aborted.
+            const heartbeat = startLivenessHeartbeat({
+              taskId: task.taskId,
+              emit,
+              now,
+              lastActivityAt: () => lastEmitAt,
+              isSettled: () => settled,
+              isAborted: () => signal.aborted,
+              setIntervalFn: setIntervalImpl,
+              clearIntervalFn: clearIntervalImpl,
+              intervalMs: heartbeatMs,
+            });
 
             // Wire client-side timeout if configured. The default 0 means
             // wait for the server.

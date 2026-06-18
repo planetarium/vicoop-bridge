@@ -10,6 +10,7 @@ import {
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
 import {
@@ -108,11 +109,12 @@ export interface ClaudeBackendOptions {
    * calls across overlapping tasks are rejected with `ambiguous-task`.
    */
   sendFileMcp?: SendFileMcpOptions;
-  // Idle-silence heartbeat. While a task is running, if no other frame has
-  // gone out for at least `heartbeatMs`, emit a bare `task.status` (state:
-  // working, no message body) so callers and intermediaries (Fly edge,
-  // SSE consumers) see bytes on the wire and don't tear down the
-  // connection as a dead read. Default 30000 ms; pass 0 to disable.
+  // Liveness heartbeat interval. While a task is running, if no other frame
+  // has gone out for at least `heartbeatMs`, emit a tagged `task.status`
+  // (state: working, no message body, openai-compat heartbeat marker) so
+  // callers, Fly edge / SSE consumers, and the router's stall watchdog see
+  // bytes on the wire. Defaults to the shared `HEARTBEAT_INTERVAL_MS` (10s);
+  // pass 0 to disable.
   heartbeatMs?: number;
   // Test seam: timer impls. Defaults to global setInterval/clearInterval.
   setIntervalFn?: (fn: () => void, ms: number) => unknown;
@@ -426,12 +428,12 @@ const TOOL_RESULT_MEDIA_MAX_BYTES = 5 * 1024 * 1024;
 // summaries off entirely; #100 part B follow-up).
 const TOOL_CALL_SUMMARY_MAX_CHARS = 200;
 
-// Default idle-silence heartbeat. `dist/backends/claude.js` events that
-// do tool work (Bash/Read/Grep/Edit/MCP) can run minute-plus without
-// producing any assistant text — long enough to trip Fly edge and SSE
-// caller idle timeouts. Below this many ms of silence, emit a bare
-// `task.status: working` so bytes keep flowing.
-const DEFAULT_HEARTBEAT_MS = 30_000;
+// Default liveness heartbeat. claude tool work (Bash/Read/Grep/Edit/MCP) can
+// run minute-plus without producing any assistant text — long enough to trip
+// Fly edge / SSE caller idle timeouts AND the router's content-stall watchdog.
+// Below this many ms of silence, emit a tagged `task.status: working` (see
+// the shared heartbeat helper) so bytes keep flowing and the router re-arms.
+const DEFAULT_HEARTBEAT_MS = HEARTBEAT_INTERVAL_MS;
 
 // Defensive stringification — `(e as Error).message` is unsafe when the
 // thrown value is null/undefined or a non-Error primitive (common in JS).
@@ -2459,33 +2461,23 @@ export function createClaudeBackend(
         if (stderrTail.length > stderrCap) stderrTail = stderrTail.slice(-stderrCap);
       });
 
-      // Idle-silence heartbeat: while the child is alive, every
-      // `heartbeatMs` of no outbound traffic produces a bare
-      // `task.status: working` so callers and intermediaries see bytes
-      // on the wire. Disabled when heartbeatMs <= 0.
-      let heartbeatHandle: unknown = null;
-      if (heartbeatMs > 0) {
-        heartbeatHandle = setIntervalImpl(() => {
-          if (settled) return;
-          // After abort the run is going to settle as `canceled` once
-          // the child finishes tearing down; emitting more
-          // `state: working` heartbeats in that window would actively
-          // misrepresent the task status to the caller. Suppress them.
-          if (aborted) return;
-          if (now() - lastEmitAt < heartbeatMs) return;
-          // Route through the wrapped `emit` (NOT `rawEmit`): the
-          // wrapper refreshes `lastEmitAt` before forwarding the frame,
-          // so a follow-up tick arriving at the same instant sees a
-          // fresh window and skips. Calling `rawEmit` here would leave
-          // `lastEmitAt` stale and let several ticks emit back-to-back
-          // if the timer fired multiple times after a long pause.
-          emit({
-            type: 'task.status',
-            taskId: task.taskId,
-            status: { state: 'working', timestamp: new Date().toISOString() },
-          });
-        }, heartbeatMs);
-      }
+      // Shared liveness heartbeat: while the child is alive, every
+      // `heartbeatMs` of no outbound traffic produces a tagged
+      // `task.status: working` so callers and the router see bytes on the
+      // wire and re-arm their stall watchdog. Disabled when heartbeatMs <= 0.
+      // The tick routes through the wrapped `emit` so a heartbeat refreshes
+      // `lastEmitAt`; suppressed after abort/settle. See heartbeat.ts.
+      const heartbeat = startLivenessHeartbeat({
+        taskId: task.taskId,
+        emit,
+        now,
+        lastActivityAt: () => lastEmitAt,
+        isSettled: () => settled,
+        isAborted: () => aborted,
+        setIntervalFn: setIntervalImpl,
+        clearIntervalFn: clearIntervalImpl,
+        intervalMs: heartbeatMs,
+      });
 
       const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: unknown }>((resolve) => {
         // The `error` event is *typed* with `Error`, but EventEmitter at
@@ -2528,7 +2520,7 @@ export function createClaudeBackend(
       // port. Safe to await even on the success path because by here
       // we're guaranteed claude has already disconnected.
       await closeCallerToolsMcp();
-      if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
+      heartbeat.stop();
 
       if (aborted) {
         emit({
