@@ -99,6 +99,13 @@ export const daemonFlagsFields = {
     description: message`Codex sandbox mode.`,
   })),
 
+  // Backend-specific (vicoop-codex)
+  noVicoopCodexReasoning: optional(
+    flag('--no-vicoop-codex-reasoning', {
+      description: message`Disable forwarding vicoop-codex's reasoning summary on the openai-compat/v1 \`reasoning\` channel (on by default). Use when the deployed oai2a2a codec predates 0.6.0 and can't yet interpret the channel marker — otherwise the reasoning would fold into the answer (planetarium/a2x-internal-router#95). Mirrors config \`backends.vicoop-codex.reasoning: false\`.`,
+    }),
+  ),
+
   // Backend-specific (OpenClaw)
   openclawGateway: optional(option('--openclaw-gateway', string({ metavar: 'WS_URL' }), {
     description: message`Gateway WS URL (default ws://127.0.0.1:18789).`,
@@ -150,6 +157,11 @@ export interface DaemonArgs {
   claudeModel?: string;
   claudeSupportedModels?: string[];
   codexSandbox?: CodexSandboxMode;
+  // Resolved openai-compat/v1 reasoning channel toggle for the vicoop-codex
+  // backend. Defaults ON; the `--no-vicoop-codex-reasoning` flag or
+  // `backends['vicoop-codex'].reasoning: false` flips it off (#95 / #375).
+  // Always defined after `resolveDaemonArgs`.
+  vicoopCodexReasoning?: boolean;
   openclawGateway?: string;
   openclawGatewayToken?: string;
   openclawAgent?: string;
@@ -276,6 +288,10 @@ export function mergeClientArgs(
       (backends.claude?.supported_models?.length ? backends.claude.supported_models : undefined),
     codexSandbox:
       flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),
+    // ON unless the config opts out (`reasoning: false`) or the CLI flag forces
+    // it off; the flag wins over config, matching the other flag>config knobs.
+    vicoopCodexReasoning:
+      backends['vicoop-codex']?.reasoning !== false && !flags.noVicoopCodexReasoning,
     openclawGateway:
       pick(flags.openclawGateway) || backends.openclaw?.gateway_url || undefined,
     openclawGatewayToken:
@@ -339,6 +355,11 @@ export function mergeClientArgs(
   if (pick(flags.claudeSupportedModels) && backend !== 'claude') {
     errors.push(
       `--claude-supported-models is not supported by --backend ${backend}; only the claude backend takes model ids`,
+    );
+  }
+  if (flags.noVicoopCodexReasoning && backend !== 'vicoop-codex') {
+    errors.push(
+      `--no-vicoop-codex-reasoning is not supported by --backend ${backend}; only the vicoop-codex backend forwards a reasoning channel`,
     );
   }
 
