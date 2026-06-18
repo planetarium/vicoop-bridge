@@ -1323,6 +1323,7 @@ export function createClaudeBackend(
   // one cache.
   const usageProvider = createClaudeUsageProvider({
     now,
+    claudeCommand: command,
     fetchImpl: opts.fetchImpl,
     credEnv: opts.claudeCredEnv,
     cacheTtlMs: opts.usageCacheTtlMs,

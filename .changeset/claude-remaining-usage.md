@@ -8,3 +8,5 @@ The bridge usage API now reports a canonical, backend-agnostic shape (`BridgeUsa
 - **vicoop-codex**: its serve `/usage` payload is now normalised into the same shape (was forwarded verbatim).
 
 Canonical shape: `{ backend, source, fetchedAt, accounts: [{ id, label?, plan?, windows: [{ id, label, usedPercent, resetsAt, severity }], spend? }], note?, raw }`. Conventions are fixed — `usedPercent` is 0–100 percent used (remaining = 100 − usedPercent), `resetsAt` is ISO 8601 — and the verbatim upstream payload is preserved under `raw`.
+
+The claude OAuth read path also gained, to match the reference monitor's robustness: `$CLAUDE_CONFIG_DIR` support for the credentials file; an official-client `User-Agent: claude-code/<version>` (discovered from the CLI) + `Content-Type`; `Retry-After`-aware backoff on 429; serving the last successful snapshot (stale, annotated) instead of dropping to the stream window on a transient failure; best-effort CLI-delegated token refresh on auth expiry/401; and a retry-storm guard that won't re-send a known-dead token until it rotates.
