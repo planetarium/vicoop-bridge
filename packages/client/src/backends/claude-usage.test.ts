@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import type { BridgeUsage, UsageWindow } from '@vicoop-bridge/protocol';
 import {
   CLAUDE_OAUTH_USAGE_URL,
   createClaudeUsageProvider,
@@ -136,31 +137,78 @@ test('fetchClaudeOAuthUsage: surfaces a non-2xx as {ok:false,status}', async () 
 
 // ── createClaudeUsageProvider ─────────────────────────────────────
 
-const okCreds = () => ({ accessToken: 'sk-ant-oat01-X', expiresAt: 9_999_999_999_999 });
+const okCreds = () => ({
+  accessToken: 'sk-ant-oat01-X',
+  expiresAt: 9_999_999_999_999,
+  subscriptionType: 'team',
+});
 
-test('usage(): returns the oauth snapshot when the token + endpoint are healthy', async () => {
-  const { fn, state } = fetchStub(() => ({ ok: true, json: { five_hour: { utilization: 21 } } }));
-  const provider = createClaudeUsageProvider({
-    now: () => 1000,
-    fetchImpl: fn,
-    readCreds: okCreds,
-  });
+// A realistic /api/oauth/usage payload (windows in 0–100, plus a monetary
+// extra-usage `spend` block).
+const OAUTH_PAYLOAD = {
+  five_hour: { utilization: 21, resets_at: '2026-06-17T09:19:59Z' },
+  seven_day: { utilization: 35, resets_at: '2026-06-22T01:59:59Z' },
+  seven_day_sonnet: { utilization: 12, resets_at: '2026-06-22T01:59:59Z' },
+  seven_day_opus: null,
+  extra_usage: { is_enabled: true, monthly_limit: 10000, used_credits: 9290, utilization: 92.9, currency: 'SGD' },
+  spend: { used: { amount_minor: 9290, currency: 'SGD' }, limit: { amount_minor: 10000, currency: 'SGD' }, percent: 93, enabled: true },
+} as const;
+
+function windowById(snap: BridgeUsage, id: string): UsageWindow | undefined {
+  return snap.accounts[0]?.windows.find((w) => w.id === id);
+}
+
+test('usage(): maps a healthy oauth payload to canonical windows + spend', async () => {
+  const { fn, state } = fetchStub(() => ({ ok: true, json: OAUTH_PAYLOAD }));
+  const provider = createClaudeUsageProvider({ now: () => 1000, fetchImpl: fn, readCreds: okCreds });
   const snap = await provider.usage();
+
+  assert.equal(snap.backend, 'claude');
   assert.equal(snap.source, 'oauth');
-  assert.deepEqual(snap.usage, { five_hour: { utilization: 21 } });
   assert.equal(typeof snap.fetchedAt, 'string');
+  assert.equal(snap.accounts.length, 1);
+  assert.equal(snap.accounts[0].plan, 'team');
+
+  // five_hour → canonical session_5h, utilization 21 → usedPercent 21, ISO reset.
+  assert.deepEqual(windowById(snap, 'session_5h'), {
+    id: 'session_5h',
+    label: '5-hour session',
+    usedPercent: 21,
+    resetsAt: '2026-06-17T09:19:59Z',
+    severity: 'ok',
+  });
+  assert.equal(windowById(snap, 'weekly')?.usedPercent, 35);
+  assert.equal(windowById(snap, 'weekly_sonnet')?.usedPercent, 12);
+  // seven_day_opus was null → not emitted; extra_usage/spend are NOT windows.
+  assert.equal(windowById(snap, 'weekly_opus'), undefined);
+  assert.equal(snap.accounts[0].windows.length, 3);
+
+  // Monetary overage → spend block (minor units), severity-critical percent.
+  assert.deepEqual(snap.accounts[0].spend, {
+    usedMinor: 9290,
+    limitMinor: 10000,
+    currency: 'SGD',
+    usedPercent: 93,
+    resetsAt: null,
+  });
+  // Raw payload preserved verbatim.
+  assert.deepEqual(snap.raw, OAUTH_PAYLOAD);
   assert.equal(state.calls, 1);
+});
+
+test('usage(): threads the overage reset from a captured rate_limit_event into spend', async () => {
+  const { fn } = fetchStub(() => ({ ok: true, json: OAUTH_PAYLOAD }));
+  const provider = createClaudeUsageProvider({ now: () => 1000, fetchImpl: fn, readCreds: okCreds });
+  // resetsAt 1782864000 (epoch s) → ISO.
+  provider.recordRateLimitEvent({ rateLimitType: 'overage', utilization: 0.93, resetsAt: 1782864000 });
+  const snap = await provider.usage();
+  assert.equal(snap.accounts[0].spend?.resetsAt, new Date(1782864000 * 1000).toISOString());
 });
 
 test('usage(): caches a successful snapshot within the TTL (no second fetch)', async () => {
   let clock = 1000;
-  const { fn, state } = fetchStub(() => ({ ok: true, json: { a: 1 } }));
-  const provider = createClaudeUsageProvider({
-    now: () => clock,
-    fetchImpl: fn,
-    readCreds: okCreds,
-    cacheTtlMs: 60_000,
-  });
+  const { fn, state } = fetchStub(() => ({ ok: true, json: OAUTH_PAYLOAD }));
+  const provider = createClaudeUsageProvider({ now: () => clock, fetchImpl: fn, readCreds: okCreds, cacheTtlMs: 60_000 });
   await provider.usage();
   clock += 30_000; // still inside the window
   await provider.usage();
@@ -170,22 +218,22 @@ test('usage(): caches a successful snapshot within the TTL (no second fetch)', a
   assert.equal(state.calls, 2);
 });
 
-test('usage(): falls back to the rate_limit_event window when no token is found', async () => {
+test('usage(): falls back to the rate_limit_event window (0–1 → 0–100) when no token', async () => {
   const { fn, state } = fetchStub(() => ({ ok: true, json: {} }));
-  const provider = createClaudeUsageProvider({
-    now: () => 1000,
-    fetchImpl: fn,
-    readCreds: () => null,
-  });
-  provider.recordRateLimitEvent({ utilization: 0.93, rateLimitType: 'overage' });
+  const provider = createClaudeUsageProvider({ now: () => 1000, fetchImpl: fn, readCreds: () => null });
+  provider.recordRateLimitEvent({ utilization: 0.93, rateLimitType: 'overage', resetsAt: 1782864000 });
   const snap = await provider.usage();
   assert.equal(snap.source, 'rate_limit_event');
-  assert.deepEqual(snap.rateLimit, { utilization: 0.93, rateLimitType: 'overage' });
+  assert.equal(snap.accounts.length, 1);
+  const w = snap.accounts[0].windows[0];
+  assert.equal(w.id, 'overage');
+  assert.equal(w.usedPercent, 93); // 0.93 ratio → 93%
+  assert.equal(w.resetsAt, new Date(1782864000 * 1000).toISOString());
   assert.match(snap.note ?? '', /no Claude OAuth token/);
   assert.equal(state.calls, 0); // never reached the network
 });
 
-test('usage(): source "none" when neither a token nor a stream window exists', async () => {
+test('usage(): source "none" with empty accounts when neither token nor stream window exists', async () => {
   const provider = createClaudeUsageProvider({
     now: () => 1000,
     fetchImpl: fetchStub(() => ({ ok: true, json: {} })).fn,
@@ -193,11 +241,11 @@ test('usage(): source "none" when neither a token nor a stream window exists', a
   });
   const snap = await provider.usage();
   assert.equal(snap.source, 'none');
-  assert.equal(snap.rateLimit, undefined);
+  assert.deepEqual(snap.accounts, []);
 });
 
 test('usage(): skips the network for an expired token', async () => {
-  const { fn, state } = fetchStub(() => ({ ok: true, json: {} }));
+  const { fn, state } = fetchStub(() => ({ ok: true, json: OAUTH_PAYLOAD }));
   const provider = createClaudeUsageProvider({
     now: () => 10_000,
     fetchImpl: fn,
@@ -211,12 +259,7 @@ test('usage(): skips the network for an expired token', async () => {
 test('usage(): throttles network attempts after an HTTP failure', async () => {
   let clock = 1000;
   const { fn, state } = fetchStub(() => ({ ok: false, status: 429, text: 'slow down' }));
-  const provider = createClaudeUsageProvider({
-    now: () => clock,
-    fetchImpl: fn,
-    readCreds: okCreds,
-    cacheTtlMs: 60_000,
-  });
+  const provider = createClaudeUsageProvider({ now: () => clock, fetchImpl: fn, readCreds: okCreds, cacheTtlMs: 60_000 });
   const first = await provider.usage();
   assert.match(first.note ?? '', /HTTP 429/);
   clock += 30_000; // inside the throttle window
@@ -225,18 +268,4 @@ test('usage(): throttles network attempts after an HTTP failure', async () => {
   clock += 60_000; // window elapsed
   await provider.usage();
   assert.equal(state.calls, 2);
-});
-
-test('usage(): oauth snapshot also carries the latest stream window for cross-check', async () => {
-  const { fn } = fetchStub(() => ({ ok: true, json: { seven_day: { utilization: 35 } } }));
-  const provider = createClaudeUsageProvider({
-    now: () => 1000,
-    fetchImpl: fn,
-    readCreds: okCreds,
-  });
-  provider.recordRateLimitEvent({ utilization: 0.93 });
-  const snap = await provider.usage();
-  assert.equal(snap.source, 'oauth');
-  assert.deepEqual(snap.usage, { seven_day: { utilization: 35 } });
-  assert.deepEqual(snap.rateLimit, { utilization: 0.93 });
 });

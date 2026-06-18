@@ -22,6 +22,19 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
+import type {
+  BridgeUsage,
+  UsageAccount,
+  UsageSpend,
+  UsageWindow,
+} from '@vicoop-bridge/protocol';
+import {
+  clampPercent,
+  deriveSeverity,
+  epochSecondsToIso,
+  isoOrNull,
+} from './usage-normalize.js';
+
 export const CLAUDE_OAUTH_USAGE_URL =
   'https://api.anthropic.com/api/oauth/usage';
 
@@ -152,22 +165,96 @@ export async function fetchClaudeOAuthUsage(
   return { ok: true, data: await res.json() };
 }
 
-export interface ClaudeUsageSnapshot {
-  backend: 'claude';
-  // 'oauth' = full authenticated window breakdown; 'rate_limit_event' = the
-  // single stream-derived window; 'none' = neither source available yet.
-  source: 'oauth' | 'rate_limit_event' | 'none';
-  fetchedAt?: string;
-  // The verbatim /api/oauth/usage payload, present when source === 'oauth'.
-  usage?: unknown;
-  // The latest stream-derived rate_limit_event window. Included whenever one
-  // has been observed this session — it is the only data when source !==
-  // 'oauth', and a cross-check alongside it when source === 'oauth'.
-  rateLimit?: unknown;
-  rateLimitCapturedAt?: string;
-  // Operator-facing reason oauth data is absent (token missing/expired,
-  // endpoint HTTP status, throttled, …).
-  note?: string;
+// Canonical id + label for the named windows the oauth payload returns; unknown
+// keys pass through with their raw name as id.
+const CLAUDE_WINDOW_META: Record<string, { id: string; label: string }> = {
+  five_hour: { id: 'session_5h', label: '5-hour session' },
+  seven_day: { id: 'weekly', label: 'Weekly (all models)' },
+  seven_day_sonnet: { id: 'weekly_sonnet', label: 'Weekly (Sonnet)' },
+  seven_day_opus: { id: 'weekly_opus', label: 'Weekly (Opus)' },
+};
+// Keys in the oauth payload that are NOT percent windows.
+const CLAUDE_NON_WINDOW_KEYS = new Set(['extra_usage', 'spend', 'limits']);
+
+function isWindowObject(v: unknown): v is { utilization: number; resets_at?: unknown } {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    !Array.isArray(v) &&
+    typeof (v as { utilization?: unknown }).utilization === 'number'
+  );
+}
+
+function numberOr(v: unknown, fallback: number): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+}
+
+// Map the verbatim /api/oauth/usage payload to canonical windows + spend.
+// `overageResetsAt` (ISO) is threaded in from a captured `rate_limit_event`
+// because the oauth `extra_usage`/`spend` block carries no reset timestamp.
+function oauthToWindowsAndSpend(
+  raw: unknown,
+  overageResetsAt: string | null,
+): { windows: UsageWindow[]; spend?: UsageSpend } {
+  const obj = (raw ?? {}) as Record<string, unknown>;
+  const windows: UsageWindow[] = [];
+  for (const [key, value] of Object.entries(obj)) {
+    if (CLAUDE_NON_WINDOW_KEYS.has(key) || !isWindowObject(value)) continue;
+    const usedPercent = clampPercent(numberOr(value.utilization, 0));
+    const meta = CLAUDE_WINDOW_META[key] ?? { id: key, label: key };
+    windows.push({
+      id: meta.id,
+      label: meta.label,
+      usedPercent,
+      resetsAt: isoOrNull(value.resets_at),
+      severity: deriveSeverity(usedPercent),
+    });
+  }
+
+  // Monetary overage budget. Prefer `spend` (already in minor units); fall back
+  // to `extra_usage`.
+  let spend: UsageSpend | undefined;
+  const spendRaw = obj.spend as
+    | { used?: { amount_minor?: unknown; currency?: unknown }; limit?: { amount_minor?: unknown; currency?: unknown }; percent?: unknown; enabled?: unknown }
+    | undefined;
+  const extra = obj.extra_usage as
+    | { is_enabled?: unknown; monthly_limit?: unknown; used_credits?: unknown; utilization?: unknown; currency?: unknown }
+    | undefined;
+  if (spendRaw && spendRaw.enabled !== false && typeof spendRaw.used?.amount_minor === 'number') {
+    spend = {
+      usedMinor: numberOr(spendRaw.used?.amount_minor, 0),
+      limitMinor: numberOr(spendRaw.limit?.amount_minor, 0),
+      currency: typeof spendRaw.used?.currency === 'string' ? spendRaw.used.currency : (typeof extra?.currency === 'string' ? extra.currency : 'USD'),
+      usedPercent: clampPercent(numberOr(spendRaw.percent, 0)),
+      resetsAt: overageResetsAt,
+    };
+  } else if (extra && extra.is_enabled === true && typeof extra.monthly_limit === 'number') {
+    spend = {
+      usedMinor: numberOr(extra.used_credits, 0),
+      limitMinor: numberOr(extra.monthly_limit, 0),
+      currency: typeof extra.currency === 'string' ? extra.currency : 'USD',
+      usedPercent: clampPercent(numberOr(extra.utilization, 0)),
+      resetsAt: overageResetsAt,
+    };
+  }
+  return spend ? { windows, spend } : { windows };
+}
+
+// The `rate_limit_event` window uses utilization as a 0–1 ratio (unlike the
+// oauth payload's 0–100). Build a single representative window from it.
+function rateLimitToWindow(info: unknown): UsageWindow | null {
+  if (typeof info !== 'object' || info === null) return null;
+  const rl = info as { utilization?: unknown; rateLimitType?: unknown; resetsAt?: unknown };
+  if (typeof rl.utilization !== 'number') return null;
+  const usedPercent = clampPercent(rl.utilization <= 1 ? rl.utilization * 100 : rl.utilization);
+  const type = typeof rl.rateLimitType === 'string' ? rl.rateLimitType : 'representative';
+  return {
+    id: type,
+    label: `Representative window (${type})`,
+    usedPercent,
+    resetsAt: epochSecondsToIso(rl.resetsAt),
+    severity: deriveSeverity(usedPercent),
+  };
 }
 
 export interface ClaudeUsageProviderDeps {
@@ -185,9 +272,10 @@ export interface ClaudeUsageProviderDeps {
 export interface ClaudeUsageProvider {
   // Capture the latest rate_limit_event window seen on the task stream.
   recordRateLimitEvent(info: unknown): void;
-  // Resolve the on-demand usage snapshot for the bridge usage API. Never
-  // rejects — failures degrade to the stream-derived window with a `note`.
-  usage(): Promise<ClaudeUsageSnapshot>;
+  // Resolve the on-demand canonical usage snapshot for the bridge usage API.
+  // Never rejects — failures degrade to the stream-derived window (or an empty
+  // account list) with a `note`.
+  usage(): Promise<BridgeUsage>;
 }
 
 function errorMessage(e: unknown): string {
@@ -203,26 +291,33 @@ export function createClaudeUsageProvider(
   const ttl = deps.cacheTtlMs ?? DEFAULT_USAGE_CACHE_TTL_MS;
 
   let lastRateLimit: { info: unknown; at: number } | undefined;
-  let cachedOauth: { value: ClaudeUsageSnapshot; at: number } | undefined;
+  let lastPlan: string | undefined;
+  let cachedOauth: { value: BridgeUsage; at: number } | undefined;
   // -Infinity so the first call is never mistaken for "attempted recently"
   // (a real Date.now() minus 0 already exceeds any TTL, but the sentinel keeps
   // the throttle correct for any clock origin, including test clocks near 0).
   let lastAttemptAt = -Infinity;
 
-  const rateLimitFields = (): Partial<ClaudeUsageSnapshot> =>
-    lastRateLimit
-      ? {
-          rateLimit: lastRateLimit.info,
-          rateLimitCapturedAt: new Date(lastRateLimit.at).toISOString(),
-        }
-      : {};
+  // Best-effort monthly-overage reset, lifted from a captured overage event
+  // (the oauth extra_usage block has no reset timestamp of its own).
+  function overageResetsAt(): string | null {
+    const rl = lastRateLimit?.info as { rateLimitType?: unknown; resetsAt?: unknown } | undefined;
+    return rl && rl.rateLimitType === 'overage' ? epochSecondsToIso(rl.resetsAt) : null;
+  }
 
-  function fallback(note: string): ClaudeUsageSnapshot {
+  // Degraded snapshot: a single account built from the latest stream window if
+  // we have one, else an empty account list.
+  function fallback(ts: number, note: string): BridgeUsage {
+    const window = lastRateLimit ? rateLimitToWindow(lastRateLimit.info) : null;
     return {
       backend: 'claude',
       source: lastRateLimit ? 'rate_limit_event' : 'none',
+      fetchedAt: new Date(ts).toISOString(),
+      accounts: window
+        ? [{ id: 'default', plan: lastPlan, windows: [window] }]
+        : [],
       note,
-      ...rateLimitFields(),
+      ...(lastRateLimit ? { raw: lastRateLimit.info } : {}),
     };
   }
 
@@ -234,42 +329,46 @@ export function createClaudeUsageProvider(
 
     async usage() {
       const ts = now();
-      // Fresh successful snapshot — serve without touching the network, but
-      // re-stamp the latest stream-derived window onto it.
-      if (cachedOauth && ts - cachedOauth.at < ttl) {
-        return { ...cachedOauth.value, ...rateLimitFields() };
-      }
+      if (cachedOauth && ts - cachedOauth.at < ttl) return cachedOauth.value;
       // Throttle: at most one network attempt per TTL so we never trip the
-      // endpoint's self-429. Between attempts, prefer the last good snapshot,
-      // otherwise the stream-derived window.
+      // endpoint's self-429. Between attempts, prefer the last good snapshot.
       if (ts - lastAttemptAt < ttl) {
         return cachedOauth
-          ? { ...cachedOauth.value, ...rateLimitFields() }
-          : fallback('oauth usage throttled (awaiting next attempt window)');
+          ? cachedOauth.value
+          : fallback(ts, 'oauth usage throttled (awaiting next attempt window)');
       }
 
       const creds = readCreds(deps.credEnv);
-      if (!creds) return fallback('no Claude OAuth token found on host');
+      if (!creds) return fallback(ts, 'no Claude OAuth token found on host');
+      lastPlan = creds.subscriptionType ?? lastPlan;
       if (typeof creds.expiresAt === 'number' && creds.expiresAt <= ts) {
-        return fallback('Claude OAuth token expired; using last stream window');
+        return fallback(ts, 'Claude OAuth token expired; using last stream window');
       }
 
       lastAttemptAt = ts;
       try {
         const res = await fetchClaudeOAuthUsage(creds.accessToken, fetchImpl);
         if (!res.ok) {
-          return fallback(`api/oauth/usage returned HTTP ${res.status}`);
+          return fallback(ts, `api/oauth/usage returned HTTP ${res.status}`);
         }
-        const value: ClaudeUsageSnapshot = {
+        const { windows, spend } = oauthToWindowsAndSpend(res.data, overageResetsAt());
+        const account: UsageAccount = {
+          id: 'default',
+          plan: creds.subscriptionType,
+          windows,
+          ...(spend ? { spend } : {}),
+        };
+        const value: BridgeUsage = {
           backend: 'claude',
           source: 'oauth',
           fetchedAt: new Date(ts).toISOString(),
-          usage: res.data,
+          accounts: [account],
+          raw: res.data,
         };
         cachedOauth = { value, at: ts };
-        return { ...value, ...rateLimitFields() };
+        return value;
       } catch (err) {
-        return fallback(`api/oauth/usage request failed: ${errorMessage(err)}`);
+        return fallback(ts, `api/oauth/usage request failed: ${errorMessage(err)}`);
       }
     },
   };
