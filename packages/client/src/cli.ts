@@ -421,6 +421,8 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         model: args.claudeModel,
         supportedModels: args.claudeSupportedModels,
         openaiCompatTrace: args.openaiCompatTrace,
+        claudeReasoning: args.claudeReasoning,
+        claudeThinkingBudget: args.claudeThinkingBudget,
         ...(spawn ? { spawn: spawn as ClaudeSpawnFn } : {}),
       });
       return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };
@@ -460,6 +462,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       return {
         backend: createVicoopCodexBackend({
           openaiCompatTrace: args.openaiCompatTrace,
+          reasoning: args.vicoopCodexReasoning,
         }),
       };
     default:
