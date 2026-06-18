@@ -205,6 +205,113 @@ test('a socket closing during async auth does not leave a zombie registration', 
   }
 });
 
+test('task.status propagates frame metadata onto the top-level TaskStatusUpdateEvent.metadata (liveness heartbeat marker)', async () => {
+  const server = createServer();
+  const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+
+  try {
+    await once(ws, 'open');
+    ws.send(encodeFrame({
+      type: 'hello',
+      version: PROTOCOL_VERSION,
+      agentId: 'agent-1',
+      token: 'token',
+      agentCard: {
+        name: 'agent',
+        version: '0.0.0',
+        protocolVersion: '0.3.0',
+      },
+    }));
+    await waitForAgent(registry, 'agent-1');
+
+    const sink = makeSink();
+    registry.bindTask({
+      agentId: 'agent-1',
+      taskId: 'task-hb',
+      contextId: 'ctx-hb',
+      sink,
+    });
+
+    ws.send(encodeFrame({
+      type: 'task.status',
+      taskId: 'task-hb',
+      status: { state: 'working', timestamp: '2026-06-18T00:00:00.000Z' },
+      metadata: { [OPENAI_COMPAT_EXTENSION_URI]: { heartbeat: true } },
+    }));
+
+    // The status frame is non-terminal, so the sink never finishes — poll for
+    // the pushed event instead.
+    const deadline = Date.now() + 1_000;
+    while (sink.statuses.length === 0) {
+      assert.ok(Date.now() < deadline, 'timed out waiting for heartbeat status');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const event = sink.statuses[0]!;
+    assert.equal(event.final, false);
+    assert.equal(event.taskId, 'task-hb');
+    assert.equal(event.contextId, 'ctx-hb');
+    assert.equal(event.status.state, 'working');
+    // Marker lands on the EVENT's top-level metadata (the surface the
+    // oai2a2a codec reads), not on status.message.metadata.
+    assert.deepEqual(event.metadata, {
+      [OPENAI_COMPAT_EXTENSION_URI]: { heartbeat: true },
+    });
+    assert.equal(event.status.message, undefined);
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});
+
+test('task.status without metadata leaves TaskStatusUpdateEvent.metadata unset', async () => {
+  const server = createServer();
+  const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+
+  try {
+    await once(ws, 'open');
+    ws.send(encodeFrame({
+      type: 'hello',
+      version: PROTOCOL_VERSION,
+      agentId: 'agent-1',
+      token: 'token',
+      agentCard: { name: 'agent', version: '0.0.0', protocolVersion: '0.3.0' },
+    }));
+    await waitForAgent(registry, 'agent-1');
+
+    const sink = makeSink();
+    registry.bindTask({
+      agentId: 'agent-1',
+      taskId: 'task-plain-status',
+      contextId: 'ctx-plain-status',
+      sink,
+    });
+
+    ws.send(encodeFrame({
+      type: 'task.status',
+      taskId: 'task-plain-status',
+      status: { state: 'working' },
+    }));
+
+    const deadline = Date.now() + 1_000;
+    while (sink.statuses.length === 0) {
+      assert.ok(Date.now() < deadline, 'timed out waiting for status');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    assert.equal(sink.statuses[0]!.metadata, undefined);
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});
+
 test('task.fail omits terminal error metadata when openai-compat extension was not requested', async () => {
   const server = createServer();
   const registry = new Registry();

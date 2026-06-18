@@ -200,6 +200,14 @@ export const TaskStatusFrame = z.object({
   type: z.literal('task.status'),
   taskId: z.string(),
   status: TaskStatus,
+  // Optional, passed through verbatim onto the A2A
+  // `TaskStatusUpdateEvent.metadata` (top-level) by the server. Used by the
+  // openai-compat/v1 liveness heartbeat: a non-terminal `working` status
+  // tagged `metadata[OPENAI_COMPAT_EXTENSION_URI] = { heartbeat: true }` is
+  // translated by the oai2a2a codec into a `: a2a-heartbeat` SSE comment so a
+  // byte-silent-but-live backend re-arms the consumer's stall watchdog rather
+  // than being false-failed-over (planetarium/a2x-internal-router#95).
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
 export const TaskArtifactFrame = z.object({

@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import WebSocket from 'ws';
 import { OPENAI_COMPAT_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import {
   buildOpenAICompatSystemPrompt,
@@ -718,11 +719,12 @@ export interface OpenclawBackendOptions {
    */
   sendFileMcp?: SendFileMcpOptions;
   /**
-   * Idle-silence heartbeat. While a task is running, if no other frame has
-   * gone out for at least `heartbeatMs`, emit a bare `task.status` (state:
-   * working, no message body) so callers and intermediaries (Fly edge,
-   * SSE consumers) see bytes on the wire and don't tear down the
-   * connection as a dead read. Default 30000 ms; pass 0 to disable.
+   * Liveness heartbeat interval. While a task is running, if no other frame
+   * has gone out for at least `heartbeatMs`, emit a tagged `task.status`
+   * (state: working, no message body, openai-compat heartbeat marker) so
+   * callers, Fly edge / SSE consumers, and the router's stall watchdog see
+   * bytes on the wire. Defaults to the shared `HEARTBEAT_INTERVAL_MS` (10s);
+   * pass 0 to disable.
    */
   heartbeatMs?: number;
   /** Test seam: deterministic clock for heartbeat. Defaults to Date.now. */
@@ -753,7 +755,7 @@ const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10 * 1000;
 // many ms of silence, emit a bare `task.status: working` so bytes keep
 // flowing. Mirrors the claude backend's heartbeat (issue #100 part C,
 // ported in #102).
-const DEFAULT_HEARTBEAT_MS = 30_000;
+const DEFAULT_HEARTBEAT_MS = HEARTBEAT_INTERVAL_MS;
 const DEFAULT_DISCOVERY_PROCESS_NAME = 'openclaw';
 const DEFAULT_DISCOVERY_HANDSHAKE_TIMEOUT_MS = 3_000;
 const DISCOVERY_LSOF_TIMEOUT_MS = 2_000;
@@ -1480,30 +1482,23 @@ export function createOpenclawBackend(
         status: { state: 'working', timestamp: new Date().toISOString() },
       });
 
-      // Idle-silence heartbeat: while the task is in flight, every
-      // `heartbeatMs` of no outbound traffic produces a bare
-      // `task.status: working` so callers and intermediaries see bytes on
-      // the wire. Disabled when heartbeatMs <= 0. Cleared in finally{}.
-      let heartbeatHandle: unknown = null;
-      if (heartbeatMs > 0) {
-        heartbeatHandle = setIntervalImpl(() => {
-          if (terminalSettled) return;
-          // After abort the run is heading toward a `canceled` terminal
-          // frame; emitting more `state: working` heartbeats in that
-          // window would actively misrepresent the task status. Suppress.
-          if (signal.aborted) return;
-          if (now() - lastEmitAt < heartbeatMs) return;
-          // Route through the wrapped `emit` (NOT `rawEmit`): the wrapper
-          // refreshes `lastEmitAt` before forwarding the frame, so a
-          // follow-up tick arriving at the same instant sees a fresh
-          // window and skips.
-          emit({
-            type: 'task.status',
-            taskId: task.taskId,
-            status: { state: 'working', timestamp: new Date().toISOString() },
-          });
-        }, heartbeatMs);
-      }
+      // Shared liveness heartbeat: while the task is in flight, every
+      // `heartbeatMs` of no outbound traffic produces a tagged
+      // `task.status: working` so callers and the router see bytes on the
+      // wire and re-arm their stall watchdog. Disabled when heartbeatMs <= 0.
+      // Routes through the wrapped `emit` so a heartbeat refreshes
+      // `lastEmitAt`; suppressed once settled / aborted. See heartbeat.ts.
+      const heartbeat = startLivenessHeartbeat({
+        taskId: task.taskId,
+        emit,
+        now,
+        lastActivityAt: () => lastEmitAt,
+        isSettled: () => terminalSettled,
+        isAborted: () => signal.aborted,
+        setIntervalFn: setIntervalImpl,
+        clearIntervalFn: clearIntervalImpl,
+        intervalMs: heartbeatMs,
+      });
 
       // Subscribe to per-message transcript events for this sessionKey so we
       // can forward each assistant message as a separate A2A artifact while
@@ -1942,7 +1937,7 @@ export function createOpenclawBackend(
         // bails instead of squeezing a `state: working` frame in past the
         // terminal emit.
         terminalSettled = true;
-        if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
+        heartbeat.stop();
         if (ownedSession && sessionMessageOwners.get(sessionKey)?.taskId === task.taskId) {
           sessionMessageOwners.delete(sessionKey);
         }

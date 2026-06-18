@@ -2066,6 +2066,59 @@ test('heartbeat: suppressed after signal.abort so canceled tasks do not look lik
   assert.equal(last.status.state, 'canceled');
 });
 
+test('heartbeat: the idle beat carries the openai-compat liveness marker (shared loop)', async () => {
+  // End-to-end through the claude backend's shared heartbeat loop: the idle
+  // tick must emit a non-terminal `working` status tagged
+  // metadata[OPENAI_COMPAT_EXTENSION_URI]={heartbeat:true} — the surface the
+  // oai2a2a codec reads to map it to a `: a2a-heartbeat` SSE comment.
+  let scheduledFn: () => void = () => {};
+  let nowMs = 1_000_000;
+  let releaseFinish: () => void = () => {};
+  const finishReady = new Promise<void>((r) => {
+    releaseFinish = r;
+  });
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(async () => {
+      await finishReady;
+      child.emitStdout(JSON.stringify({ type: 'result', result: 'ok' }) + '\n');
+      setImmediate(() => child.finish(0));
+    });
+  });
+
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    heartbeatMs: 100,
+    now: () => nowMs,
+    setIntervalFn: (fn) => {
+      scheduledFn = fn;
+      return { tag: 'fake-interval' };
+    },
+    clearIntervalFn: () => {},
+  });
+  const { emit, frames } = collect();
+
+  const runP = backend.handle(assign('x'), emit, NEVER);
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+
+  nowMs += 250;
+  scheduledFn();
+
+  const beat = frames.find(
+    (f) =>
+      f.type === 'task.status' &&
+      (f as Extract<UpFrame, { type: 'task.status' }>).metadata !== undefined,
+  ) as Extract<UpFrame, { type: 'task.status' }> | undefined;
+  assert.ok(beat, 'a tagged heartbeat task.status must be emitted');
+  assert.equal(beat.status.state, 'working');
+  assert.equal(beat.status.message, undefined, 'heartbeat carries no message parts');
+  assert.deepEqual(beat.metadata, {
+    [OPENAI_COMPAT_EXTENSION_URI]: { heartbeat: true },
+  });
+
+  releaseFinish();
+  await runP;
+});
+
 test('summarizeToolInput bails early on a top-level object with many keys (deterministic visit count)', async () => {
   // Deterministic regression guard for the bounded-walk behavior.
   // Each key is an instrumented enumerable getter that records when
