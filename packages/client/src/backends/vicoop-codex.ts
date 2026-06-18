@@ -6,6 +6,7 @@ import {
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
 import { normalizeTaskFailError } from '../failure-code.js';
+import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { createLogger, type Logger } from '../logger.js';
 import { createTimingRecorder } from './timing.js';
 import {
@@ -91,6 +92,17 @@ export interface VicoopCodexBackendOptions {
   // `Date.now`; tests inject a deterministic counter to assert the emitted
   // `[client] timing …` milestones.
   now?: () => number;
+  // Idle-silence liveness heartbeat — same semantics as `codex` / `claude`.
+  // While a task is in-flight and no other frame has gone out for
+  // `heartbeatMs`, emit a tagged `working` `task.status` so the gateway /
+  // router sees bytes on the wire and re-arms its stall watchdog. This is the
+  // exact backend from the production false-failover incident
+  // (planetarium/a2x-internal-router#95), so it MUST heartbeat. Defaults to the
+  // shared `HEARTBEAT_INTERVAL_MS` (10s); `0` disables it (used by tests that
+  // don't drive the timer). `setIntervalFn` / `clearIntervalFn` are test seams.
+  heartbeatMs?: number;
+  setIntervalFn?: (fn: () => void, ms: number) => unknown;
+  clearIntervalFn?: (handle: unknown) => void;
   // When true, dump A2A `parts` shape + metadata keys + raw
   // `chat_history` to stderr on every task. Operator diagnostic exposed
   // via `--openai-compat-trace`. Leave off in production.
@@ -924,6 +936,12 @@ export function createVicoopCodexBackend(
   const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
   const logger = opts.logger ?? createLogger();
   const now = opts.now ?? Date.now;
+  const heartbeatMs = opts.heartbeatMs ?? HEARTBEAT_INTERVAL_MS;
+  const setIntervalImpl =
+    opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
+  const clearIntervalImpl =
+    opts.clearIntervalFn ??
+    ((h) => clearInterval(h as ReturnType<typeof setInterval>));
   const openaiCompatTrace = opts.openaiCompatTrace === true;
   // openai-compat/v1 reasoning channel (#95 / #375). ON by default; disable via
   // `reasoning: false` (CLI `--no-vicoop-codex-reasoning` / config) when the
@@ -1139,9 +1157,19 @@ export function createVicoopCodexBackend(
         contextId: task.contextId,
         now,
       });
+      // Timestamp of the last outbound frame, refreshed by the wrapped `emit`.
+      // The shared liveness heartbeat reads it each tick so real traffic OR a
+      // prior heartbeat resets the silence window. `settled` flips once a
+      // terminal frame goes out so the heartbeat stops emitting `working`.
+      let lastEmitAt = now();
+      let settled = false;
       const emit: typeof rawEmit = (frame) => {
+        lastEmitAt = now();
         const terminal = frame.type === 'task.complete' || frame.type === 'task.fail';
-        if (terminal) recorder.mark('emit');
+        if (terminal) {
+          settled = true;
+          recorder.mark('emit');
+        }
         rawEmit(frame);
         if (terminal) {
           const state =
@@ -1349,6 +1377,25 @@ export function createVicoopCodexBackend(
         });
       };
 
+      // Shared liveness heartbeat — see heartbeat.ts. Armed for the duration of
+      // the streaming call: a long silent reasoning turn (no `delta.content`
+      // bytes for a while) must still keep `working` frames flowing so the
+      // router doesn't false-fail-over (#95 — the exact incident this backend
+      // caused). Routes through the wrapped `emit` so a heartbeat refreshes the
+      // silence window; suppressed once settled / aborted. Stopped in `finally`
+      // on every exit path.
+      const heartbeat = startLivenessHeartbeat({
+        taskId: task.taskId,
+        emit,
+        now,
+        lastActivityAt: () => lastEmitAt,
+        isSettled: () => settled,
+        isAborted: () => signal.aborted,
+        setIntervalFn: setIntervalImpl,
+        clearIntervalFn: clearIntervalImpl,
+        intervalMs: heartbeatMs,
+      });
+
       let response: ChatCompletionResponse;
       try {
         response = await streamChatCompletions(
@@ -1382,6 +1429,11 @@ export function createVicoopCodexBackend(
           error: normalizeTaskFailError({ code, message }),
         });
         return;
+      } finally {
+        // Stop the heartbeat once streaming has resolved/thrown. Everything
+        // after this point is synchronous (no further awaits), so the loop is
+        // over and the terminal frame is imminent on every remaining path.
+        heartbeat.stop();
       }
 
       // Aborted mid-stream — surface as canceled regardless of what arrived

@@ -1555,3 +1555,147 @@ test('handle: emits a timing line with serveReady/firstByte/firstDelta/total mil
   // Exactly one timing line per task — no duplicate emit on the terminal frame.
   assert.equal(debugLines.filter((l) => l.startsWith('timing ')).length, 1);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared liveness heartbeat (gap fix): vicoop-codex was the exact backend from
+// the production false-failover incident (planetarium/a2x-internal-router#95),
+// so it MUST keep `working` frames flowing during a long silent streaming turn
+// — same shared loop as claude.ts / codex.ts.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A fetch whose SSE stream stays open until `release()` is called, so the test
+// can drive heartbeat ticks while the streaming call is still in-flight.
+function makeGatedSseFetch(sse: string): {
+  fetch: VicoopCodexFetchFn;
+  release: () => void;
+} {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const fetch: VicoopCodexFetchFn = async () => ({
+    ok: true,
+    status: 200,
+    async text() {
+      return '';
+    },
+    async *chunks() {
+      await gate;
+      yield sse;
+    },
+  });
+  return { fetch, release };
+}
+
+test('heartbeat: the idle beat during streaming carries the openai-compat liveness marker (shared loop)', async () => {
+  // End-to-end through the vicoop-codex backend's shared heartbeat loop: while
+  // the streaming call is silent (no `delta.content`), the idle tick must emit
+  // a non-terminal `working` status tagged
+  // metadata[OPENAI_COMPAT_EXTENSION_URI]={heartbeat:true} — the surface the
+  // oai2a2a codec maps to a `: a2a-heartbeat` SSE comment.
+  let scheduledFn: () => void = () => {};
+  let cleared = false;
+  let nowMs = 1_000_000;
+
+  const sse = sseStream([
+    {
+      id: 'chatcmpl-hb',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    },
+  ]);
+  const gated = makeGatedSseFetch(sse);
+  const fake = makeFakeSpawn();
+  const backend = createVicoopCodexBackend({
+    spawn: fake.spawn,
+    fetch: gated.fetch,
+    heartbeatMs: 100,
+    now: () => nowMs,
+    setIntervalFn: (fn) => {
+      scheduledFn = fn;
+      return { tag: 'fake-interval' };
+    },
+    clearIntervalFn: () => {
+      cleared = true;
+    },
+  });
+
+  const frames: UpFrame[] = [];
+  const ctrl = new AbortController();
+  const done = backend.handle(makeTask(), (f) => frames.push(f), ctrl.signal);
+  // Drive the serve `listening` line, then yield enough microtasks for the
+  // streaming call to start and the heartbeat to be armed.
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  driveServeListening(fake.lastChild());
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+
+  const countStatus = () =>
+    frames.filter((f) => f.type === 'task.status').length;
+  assert.equal(countStatus(), 1, 'only the initial working status so far');
+
+  // Advance past the threshold → one tagged heartbeat status emitted.
+  nowMs += 250;
+  scheduledFn();
+  assert.equal(countStatus(), 2);
+
+  const beat = frames.find(
+    (f) =>
+      f.type === 'task.status' &&
+      (f as Extract<UpFrame, { type: 'task.status' }>).metadata !== undefined,
+  ) as Extract<UpFrame, { type: 'task.status' }> | undefined;
+  assert.ok(beat, 'a tagged heartbeat task.status must be emitted');
+  assert.equal(beat.status.state, 'working');
+  assert.equal(beat.status.message, undefined, 'heartbeat carries no message parts');
+  assert.deepEqual(beat.metadata, {
+    [OPENAI_COMPAT_EXTENSION_URI]: { heartbeat: true },
+  });
+
+  // A follow-up tick at the same instant must NOT double-fire — the prior beat
+  // refreshed lastActivity through the wrapped emitter.
+  scheduledFn();
+  assert.equal(countStatus(), 2);
+
+  // Release the stream so the run completes; the heartbeat must be cleared.
+  gated.release();
+  await done;
+  assert.ok(cleared, 'heartbeat handle must be cleared once streaming settles');
+});
+
+test('heartbeat: heartbeatMs:0 disables the interval entirely', async () => {
+  let scheduled = false;
+  const sse = sseStream([
+    {
+      id: 'chatcmpl-hb0',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    },
+  ]);
+  const fake = makeFakeSpawn();
+  const backend = createVicoopCodexBackend({
+    spawn: fake.spawn,
+    fetch: makeSseFetch(sse).fetch,
+    heartbeatMs: 0,
+    setIntervalFn: () => {
+      scheduled = true;
+      return { tag: 'fake-interval' };
+    },
+    clearIntervalFn: () => {},
+  });
+  const frames: UpFrame[] = [];
+  const ctrl = new AbortController();
+  const done = backend.handle(makeTask(), (f) => frames.push(f), ctrl.signal);
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  driveServeListening(fake.lastChild());
+  await done;
+
+  assert.equal(scheduled, false, 'no interval scheduled when heartbeatMs is 0');
+  assert.equal(
+    frames.filter((f) => f.type === 'task.status').length,
+    1,
+    'only the initial working status — no heartbeats',
+  );
+});
