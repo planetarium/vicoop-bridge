@@ -1,16 +1,20 @@
 // Claude subscription remaining-usage support for the bridge `usage()`
 // capability.
 //
-// Two data sources, in priority order:
-//   1. Authenticated GET https://api.anthropic.com/api/oauth/usage — the same
-//      endpoint Claude Code's interactive `/usage` calls. Returns the full
-//      window breakdown (5-hour session, weekly all-models, weekly Sonnet, …)
-//      plus `extra_usage`. Requires the subscription OAuth access token that
-//      the `claude` CLI already stores on the host.
-//   2. The `rate_limit_event` line claude emits at the head of every
-//      stream-json task. It carries only the single *representative* window
-//      (whichever is closest to its limit), so it is a fallback for when the
-//      token is missing/expired or the endpoint refuses — not a full picture.
+// The single authoritative source is the authenticated
+// GET https://api.anthropic.com/api/oauth/usage — the same endpoint Claude
+// Code's interactive `/usage` calls. It returns the full window breakdown
+// (5-hour session, weekly all-models, weekly Sonnet, …) plus `extra_usage`, and
+// requires the subscription OAuth access token the `claude` CLI stores on the
+// host. When it is unavailable, we serve the last successful snapshot (stale)
+// if we have one, otherwise an explicit `source: 'none'`.
+//
+// We also capture the `rate_limit_event` line claude emits at the head of every
+// stream-json task, but ONLY to enrich `spend.resetsAt` (its monthly overage
+// reset, which the oauth `extra_usage` block omits). It is NOT used as a usage
+// fallback: that event reports only the single most-constrained window (e.g. a
+// near-cap overage meter), so presenting it as the usage would hide the
+// subscription windows the caller wants and misrepresent the quota.
 //
 // The endpoint self-rate-limits (HTTP 429 + retry-after ~257s after one or two
 // calls), so successful snapshots are cached and network attempts are throttled
@@ -291,23 +295,6 @@ function oauthToWindowsAndSpend(
   return spend ? { windows, spend } : { windows };
 }
 
-// The `rate_limit_event` window uses utilization as a 0–1 ratio (unlike the
-// oauth payload's 0–100). Build a single representative window from it.
-function rateLimitToWindow(info: unknown): UsageWindow | null {
-  if (typeof info !== 'object' || info === null) return null;
-  const rl = info as { utilization?: unknown; rateLimitType?: unknown; resetsAt?: unknown };
-  if (typeof rl.utilization !== 'number') return null;
-  const usedPercent = clampPercent(rl.utilization <= 1 ? rl.utilization * 100 : rl.utilization);
-  const type = typeof rl.rateLimitType === 'string' ? rl.rateLimitType : 'representative';
-  return {
-    id: type,
-    label: `Representative window (${type})`,
-    usedPercent,
-    resetsAt: epochSecondsToIso(rl.resetsAt),
-    severity: deriveSeverity(usedPercent),
-  };
-}
-
 export interface ClaudeUsageProviderDeps {
   now?: () => number;
   fetchImpl?: typeof fetch;
@@ -331,11 +318,12 @@ export interface ClaudeUsageProviderDeps {
 }
 
 export interface ClaudeUsageProvider {
-  // Capture the latest rate_limit_event window seen on the task stream.
+  // Capture the latest rate_limit_event seen on the task stream. Used only to
+  // enrich `spend.resetsAt` on a successful oauth read — NOT as a usage source.
   recordRateLimitEvent(info: unknown): void;
   // Resolve the on-demand canonical usage snapshot for the bridge usage API.
-  // Never rejects — failures degrade to the stream-derived window (or an empty
-  // account list) with a `note`.
+  // Never rejects — when the oauth read fails it degrades to the last
+  // successful snapshot (stale) or an explicit `source: 'none'`, with a `note`.
   usage(): Promise<BridgeUsage>;
 }
 
@@ -417,7 +405,13 @@ export function createClaudeUsageProvider(
   }
 
   // Degraded result. Prefer the last successful oauth snapshot (stale, with a
-  // note) over the single stream-derived window, over an empty account list.
+  // note); otherwise return an explicit "none". We deliberately do NOT
+  // synthesise a usage window from the stream's `rate_limit_event`: that event
+  // reports only the single most-constrained window (e.g. a near-cap overage
+  // meter), so it would surface that one number as if it were the subscription
+  // quota and hide the windows the caller actually wants. The event is still
+  // captured (recordRateLimitEvent) — but only to enrich `spend.resetsAt` on a
+  // successful oauth read.
   function degraded(ts: number, note: string): BridgeUsage {
     if (cachedOauth) {
       return {
@@ -425,16 +419,12 @@ export function createClaudeUsageProvider(
         note: `${note}; serving last successful snapshot (fetched ${cachedOauth.value.fetchedAt})`,
       };
     }
-    const window = lastRateLimit ? rateLimitToWindow(lastRateLimit.info) : null;
     return {
       backend: 'claude',
-      source: lastRateLimit ? 'rate_limit_event' : 'none',
+      source: 'none',
       fetchedAt: new Date(ts).toISOString(),
-      accounts: window
-        ? [{ id: 'default', ...(lastPlan ? { plan: lastPlan } : {}), windows: [window] }]
-        : [],
+      accounts: [],
       note,
-      ...(lastRateLimit ? { raw: lastRateLimit.info } : {}),
     };
   }
 

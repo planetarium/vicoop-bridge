@@ -1335,9 +1335,9 @@ export function createClaudeBackend(
     getSendFileMcpServer: () => sendFileMcp,
 
     // Claude subscription remaining-usage snapshot, served on demand for the
-    // bridge usage API. Primary: authenticated api/oauth/usage (full window
-    // breakdown, cached to respect the endpoint's self-429). Fallback: the
-    // latest stream-derived rate_limit_event window.
+    // bridge usage API. Source: authenticated api/oauth/usage (full window
+    // breakdown, cached to respect the endpoint's self-429). On failure it
+    // degrades to the last successful snapshot (stale) or `source: 'none'`.
     usage: () => usageProvider.usage(),
 
     // Advertise the underlying model via the openai-compat/v1
@@ -2266,10 +2266,10 @@ export function createClaudeBackend(
           );
         }
         if (evt.type === 'rate_limit_event') {
-          // Capture the quota window claude reports at the head of the stream
-          // so the usage() capability can fall back to it when the
-          // authenticated oauth/usage call is unavailable. Pre-LLM, no token
-          // cost. Only the single representative window is reported here.
+          // Capture the quota window claude reports at the head of the stream.
+          // Pre-LLM, no token cost. Used only to enrich `spend.resetsAt` on a
+          // successful oauth read — NOT as a usage fallback, since it reports
+          // only the single most-constrained window (e.g. overage).
           usageProvider.recordRateLimitEvent(evt.rate_limit_info);
           return;
         }

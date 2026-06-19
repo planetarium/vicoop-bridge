@@ -260,17 +260,15 @@ test('usage(): caches a successful snapshot within the TTL (no second fetch)', a
   assert.equal(state.calls, 2);
 });
 
-test('usage(): falls back to the rate_limit_event window (0–1 → 0–100) when no token', async () => {
+test('usage(): a recorded rate_limit_event is NOT surfaced as a window; degrades to "none"', async () => {
   const { fn, state } = fetchStub(() => ({ ok: true, json: {} }));
   const provider = makeProvider({ now: () => 1000, fetchImpl: fn, readCreds: () => null });
+  // An overage event is recorded — it must NOT be turned into a usage window
+  // (it would misrepresent the subscription quota), only used for spend reset.
   provider.recordRateLimitEvent({ utilization: 0.93, rateLimitType: 'overage', resetsAt: 1782864000 });
   const snap = await provider.usage();
-  assert.equal(snap.source, 'rate_limit_event');
-  assert.equal(snap.accounts.length, 1);
-  const w = snap.accounts[0].windows[0];
-  assert.equal(w.id, 'overage');
-  assert.equal(w.usedPercent, 93); // 0.93 ratio → 93%
-  assert.equal(w.resetsAt, new Date(1782864000 * 1000).toISOString());
+  assert.equal(snap.source, 'none');
+  assert.deepEqual(snap.accounts, []);
   assert.match(snap.note ?? '', /no Claude OAuth token/);
   assert.equal(state.calls, 0); // never reached the network
 });
