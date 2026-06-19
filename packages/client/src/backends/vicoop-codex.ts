@@ -2,13 +2,21 @@ import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
+  type BridgeUsage,
   type Part,
+  type UsageAccount,
+  type UsageWindow,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { createLogger, type Logger } from '../logger.js';
 import { createTimingRecorder } from './timing.js';
+import {
+  clampPercent,
+  deriveSeverity,
+  epochSecondsToIso,
+} from './usage-normalize.js';
 import {
   chatHistoryFromMessages,
   collectSystemFromMessages,
@@ -23,6 +31,97 @@ import {
   buildOpenAICompatUsage,
   type OpenAICompatUsage,
 } from './openai-compat-usage.js';
+
+// vicoop-codex serve reports rolling windows by their length in seconds; map the
+// standard ones to canonical ids (unknown lengths keep a positional fallback).
+const CODEX_WINDOW_META: Record<string, { id: string; label: string }> = {
+  '18000': { id: 'session_5h', label: '5-hour session' },
+  '604800': { id: 'weekly', label: 'Weekly (all models)' },
+};
+
+function codexWindow(
+  raw: unknown,
+  fallbackId: string,
+  fallbackLabel: string,
+  nowMs: number,
+): UsageWindow | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const w = raw as {
+    used_percent?: unknown;
+    remaining_percent?: unknown;
+    limit_window_seconds?: unknown;
+    reset_after_seconds?: unknown;
+    reset_at?: unknown;
+  };
+  const usedPercent = clampPercent(
+    typeof w.used_percent === 'number'
+      ? w.used_percent
+      : typeof w.remaining_percent === 'number'
+        ? 100 - w.remaining_percent
+        : 0,
+  );
+  const meta =
+    typeof w.limit_window_seconds === 'number'
+      ? CODEX_WINDOW_META[String(w.limit_window_seconds)]
+      : undefined;
+  const resetsAt =
+    typeof w.reset_at === 'number'
+      ? epochSecondsToIso(w.reset_at)
+      : typeof w.reset_after_seconds === 'number'
+        ? epochSecondsToIso(Math.floor(nowMs / 1000) + w.reset_after_seconds)
+        : null;
+  return {
+    id: meta?.id ?? fallbackId,
+    label: meta?.label ?? fallbackLabel,
+    usedPercent,
+    resetsAt,
+    severity: deriveSeverity(usedPercent),
+  };
+}
+
+// Normalise vicoop-codex serve's GET /usage `{ accounts: [...] }` payload into
+// the canonical BridgeUsage shape (see @vicoop-bridge/protocol). Exported for
+// unit tests.
+export function normalizeCodexServeUsage(
+  raw: unknown,
+  fetchedAt: string,
+  nowMs: number,
+): BridgeUsage {
+  const accountsRaw = (raw as { accounts?: unknown } | null)?.accounts;
+  if (!Array.isArray(accountsRaw)) {
+    return {
+      backend: 'vicoop-codex',
+      source: 'serve',
+      fetchedAt,
+      accounts: [],
+      note: 'unexpected serve /usage shape (no accounts array)',
+      raw,
+    };
+  }
+  const accounts: UsageAccount[] = accountsRaw.map((a) => {
+    const acct = (a ?? {}) as {
+      key?: unknown;
+      email?: unknown;
+      plan_type?: unknown;
+      error?: unknown;
+      primary?: unknown;
+      secondary?: unknown;
+    };
+    const windows: UsageWindow[] = [];
+    const primary = codexWindow(acct.primary, 'primary', 'Primary window', nowMs);
+    if (primary) windows.push(primary);
+    const secondary = codexWindow(acct.secondary, 'secondary', 'Secondary window', nowMs);
+    if (secondary) windows.push(secondary);
+    return {
+      id: typeof acct.key === 'string' ? acct.key : 'unknown',
+      ...(typeof acct.email === 'string' ? { label: acct.email } : {}),
+      ...(typeof acct.plan_type === 'string' ? { plan: acct.plan_type } : {}),
+      windows,
+      ...(typeof acct.error === 'string' ? { note: acct.error } : {}),
+    };
+  });
+  return { backend: 'vicoop-codex', source: 'serve', fetchedAt, accounts, raw };
+}
 
 // Slim subset of ChildProcess the backend actually uses. Tests inject a
 // fake that satisfies this without wiring up a real OS process.
@@ -1101,8 +1200,9 @@ export function createVicoopCodexBackend(
 
     // Per-account Codex usage, served on demand for the bridge's usage API.
     // Reuses the shared `serve` singleton and hits its read-only GET /usage
-    // (which does not consume quota). The payload is forwarded verbatim.
-    async usage() {
+    // (which does not consume quota), then normalises it into the canonical
+    // BridgeUsage shape (the raw payload is preserved under `raw`).
+    async usage(): Promise<BridgeUsage> {
       const handle = await ensureServe();
       const res = await fetch(`${handle.baseUrl}/usage`, {
         method: 'GET',
@@ -1115,7 +1215,11 @@ export function createVicoopCodexBackend(
             (detail ? `: ${detail.slice(0, 300)}` : ''),
         );
       }
-      return res.json();
+      return normalizeCodexServeUsage(
+        await res.json(),
+        new Date().toISOString(),
+        Date.now(),
+      );
     },
 
     async resolveCapabilities() {

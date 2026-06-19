@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
+  type BridgeUsage,
   type TaskAssignFrame,
   type UpFrame,
 } from '@vicoop-bridge/protocol';
@@ -1438,7 +1439,7 @@ test('envelope.model is dropped when the probed list does NOT advertise it (#302
 // Drive the lazy `ensureServe()` (which spawns synchronously and awaits the
 // listening line) by emitting that line on the next microtask, then await the
 // in-flight usage() promise.
-async function runUsage(stubFetch: typeof globalThis.fetch): Promise<unknown> {
+async function runUsage(stubFetch: typeof globalThis.fetch): Promise<BridgeUsage> {
   const fake = makeFakeSpawn();
   const backend = createVicoopCodexBackend({ spawn: fake.spawn });
   const orig = globalThis.fetch;
@@ -1449,15 +1450,26 @@ async function runUsage(stubFetch: typeof globalThis.fetch): Promise<unknown> {
       driveServeListening(fake.lastChild());
       resolve();
     }));
-    return await p;
+    return (await p) as BridgeUsage;
   } finally {
     globalThis.fetch = orig;
   }
 }
 
-test('usage(): GETs the serve /usage endpoint and returns the parsed JSON', async () => {
+test('usage(): GETs serve /usage and normalises it to the canonical BridgeUsage shape', async () => {
   const calls: Array<{ url: string; method: string }> = [];
-  const payload = { accounts: [{ key: 'k1', email: 'a@x.com', primary: { remaining_percent: 80 } }] };
+  const payload = {
+    accounts: [
+      {
+        key: 'k1',
+        email: 'a@x.com',
+        plan_type: 'plus',
+        primary: { used_percent: 41, limit_window_seconds: 18000, reset_at: 1750153200 },
+        // secondary uses remaining_percent only → mapper derives used = 100 - 68.
+        secondary: { remaining_percent: 32, limit_window_seconds: 604800, reset_at: 1750547400 },
+      },
+    ],
+  };
   const usage = await runUsage((async (url, init) => {
     calls.push({ url: String(url), method: (init?.method as string) ?? 'GET' });
     return new Response(JSON.stringify(payload), {
@@ -1465,7 +1477,28 @@ test('usage(): GETs the serve /usage endpoint and returns the parsed JSON', asyn
       headers: { 'content-type': 'application/json' },
     });
   }) as typeof globalThis.fetch);
-  assert.deepEqual(usage, payload);
+
+  assert.equal(usage.backend, 'vicoop-codex');
+  assert.equal(usage.source, 'serve');
+  assert.equal(usage.accounts.length, 1);
+  const acct = usage.accounts[0];
+  assert.equal(acct.id, 'k1');
+  assert.equal(acct.label, 'a@x.com');
+  assert.equal(acct.plan, 'plus');
+  // primary 5h window: used_percent forwarded, canonical id, epoch → ISO.
+  assert.deepEqual(acct.windows[0], {
+    id: 'session_5h',
+    label: '5-hour session',
+    usedPercent: 41,
+    resetsAt: new Date(1750153200 * 1000).toISOString(),
+    severity: 'ok',
+  });
+  // secondary weekly window: remaining_percent 32 → usedPercent 68 (warning).
+  assert.equal(acct.windows[1].id, 'weekly');
+  assert.equal(acct.windows[1].usedPercent, 68);
+  assert.equal(acct.windows[1].severity, 'ok');
+  // Raw payload preserved verbatim under `raw`.
+  assert.deepEqual(usage.raw, payload);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, 'GET');
   assert.match(calls[0].url, /^http:\/\/127\.0\.0\.1:8787\/usage$/);

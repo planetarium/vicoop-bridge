@@ -249,9 +249,10 @@ export const TaskFailFrame = z.object({
 export const PongFrame = z.object({ type: z.literal('pong') });
 
 // Response to a server-initiated `usage.request` (see DownFrame). Correlated by
-// `requestId`. `usage` is the backend's opaque usage payload (e.g. the
-// vicoop-codex `{ accounts: [...] }` shape) — kept `unknown` so the payload can
-// evolve without a protocol bump; the server passes it through verbatim.
+// `requestId`. `usage` is the backend's usage payload — backends normalise their
+// upstream into the canonical `BridgeUsage` shape below, but the wire field is
+// kept `unknown` so a future/edge payload can still pass through verbatim
+// without a protocol bump; the server forwards it unchanged.
 export const UsageResponseFrame = z.object({
   type: z.literal('usage.response'),
   requestId: z.string(),
@@ -264,6 +265,68 @@ export const UsageResponseFrame = z.object({
     })
     .optional(),
 });
+
+// ── Canonical usage shape (backend-agnostic) ──────────────────────────────
+// Both the claude and vicoop-codex backends normalise their upstream usage
+// source into `BridgeUsage` so a single consumer can read any backend's
+// remaining quota with one schema. Conventions are FIXED to avoid the
+// used-vs-remaining / units / time-format muddle the raw upstreams have:
+//   - usedPercent: number 0–100, percent USED (remaining = 100 − usedPercent)
+//   - resetsAt:    ISO 8601 absolute timestamp, or null when unknown / none
+//   - accounts:    always an array (codex is multi-account; claude has one)
+// The verbatim upstream payload is preserved under `raw` so nothing is lost.
+
+export const UsageSeverity = z.enum(['ok', 'warning', 'critical']);
+export type UsageSeverity = z.infer<typeof UsageSeverity>;
+
+// A single rolling quota window (e.g. a 5-hour or weekly limit).
+export const UsageWindow = z.object({
+  // Canonical id: 'session_5h' | 'weekly' | 'weekly_sonnet' | 'weekly_opus' |
+  // … ; unknown upstream windows pass through with a stable source-derived id.
+  id: z.string(),
+  label: z.string(),
+  usedPercent: z.number(),
+  resetsAt: z.string().nullable(),
+  severity: UsageSeverity,
+});
+export type UsageWindow = z.infer<typeof UsageWindow>;
+
+// A monetary spend budget (e.g. Claude extra-usage / overage). Kept separate
+// from percent windows because it is denominated in money, not a rate window.
+export const UsageSpend = z.object({
+  usedMinor: z.number(),
+  limitMinor: z.number(),
+  currency: z.string(),
+  usedPercent: z.number(),
+  resetsAt: z.string().nullable(),
+});
+export type UsageSpend = z.infer<typeof UsageSpend>;
+
+export const UsageAccount = z.object({
+  id: z.string(),
+  label: z.string().optional(),
+  plan: z.string().optional(),
+  windows: z.array(UsageWindow),
+  spend: UsageSpend.optional(),
+  // Per-account issue (e.g. a codex account whose lookup failed while others
+  // resolved); the account is still listed.
+  note: z.string().optional(),
+});
+export type UsageAccount = z.infer<typeof UsageAccount>;
+
+export const BridgeUsage = z.object({
+  backend: z.string(),
+  // Where the snapshot came from: 'oauth' | 'serve' | 'rate_limit_event' |
+  // 'none'. Lets a consumer tell an authoritative read from a degraded one.
+  source: z.string(),
+  fetchedAt: z.string(),
+  accounts: z.array(UsageAccount),
+  // Why the data is partial/degraded (token missing/expired, endpoint refused…).
+  note: z.string().optional(),
+  // The verbatim upstream payload, for forward-compat / debugging.
+  raw: z.unknown().optional(),
+});
+export type BridgeUsage = z.infer<typeof BridgeUsage>;
 
 export type HelloFrame = z.infer<typeof HelloFrame>;
 export type TaskStatusFrame = z.infer<typeof TaskStatusFrame>;
