@@ -10,6 +10,7 @@ import {
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
 import {
@@ -112,11 +113,12 @@ export interface ClaudeBackendOptions {
    * calls across overlapping tasks are rejected with `ambiguous-task`.
    */
   sendFileMcp?: SendFileMcpOptions;
-  // Idle-silence heartbeat. While a task is running, if no other frame has
-  // gone out for at least `heartbeatMs`, emit a bare `task.status` (state:
-  // working, no message body) so callers and intermediaries (Fly edge,
-  // SSE consumers) see bytes on the wire and don't tear down the
-  // connection as a dead read. Default 30000 ms; pass 0 to disable.
+  // Liveness heartbeat interval. While a task is running, if no other frame
+  // has gone out for at least `heartbeatMs`, emit a tagged `task.status`
+  // (state: working, no message body, openai-compat heartbeat marker) so
+  // callers, Fly edge / SSE consumers, and the router's stall watchdog see
+  // bytes on the wire. Defaults to the shared `HEARTBEAT_INTERVAL_MS` (10s);
+  // pass 0 to disable.
   heartbeatMs?: number;
   // Test seam: timer impls. Defaults to global setInterval/clearInterval.
   setIntervalFn?: (fn: () => void, ms: number) => unknown;
@@ -208,6 +210,29 @@ export interface ClaudeBackendOptions {
   // fails, every later task falls back to the unsplit block, and a daemon
   // restart re-arms it (so a CLI fix/downgrade self-heals).
   openaiCompatHistoryCache?: boolean;
+  // Forward Claude's extended-thinking as a live `reasoning` channel: an
+  // additive `openai-compat/v1` wire marker (a reasoning-channel artifact with
+  // `metadata[ext-uri] = { channel: 'reasoning' }`) that the oai2a2a codec maps
+  // to `delta.reasoning_content` so the a2x-internal-router stops
+  // false-failing-over long silent reasoning turns
+  // (planetarium/a2x-internal-router#95, vicoop-bridge#376).
+  //
+  // ON by default; set `false` (CLI `--no-claude-reasoning` / config
+  // `backends.claude.reasoning: false`) to disable. Disable when the deployed
+  // oai2a2a codec predates 0.6.0 — an old codec doesn't understand the
+  // `reasoning` channel marker and would fold the thinking artifact into the
+  // answer (the #95 rollout-order hazard). When on, openai-compat spawns also
+  // get `MAX_THINKING_TOKENS` injected so Claude Code actually emits thinking on
+  // the wire (its `-p` headless mode defaults extended thinking off); operators
+  // can override the budget by exporting `MAX_THINKING_TOKENS` themselves.
+  claudeReasoning?: boolean;
+  // Thinking budget (in tokens) injected as `MAX_THINKING_TOKENS` on
+  // openai-compat spawns when the reasoning channel is on. Operator-facing knob
+  // for the default below (CLI `--claude-thinking-budget` / config
+  // `backends.claude.thinking_budget`). Precedence: this option > an operator's
+  // own `MAX_THINKING_TOKENS` env export > `DEFAULT_MAX_THINKING_TOKENS`. Unset
+  // (the default) keeps the env-or-default behaviour.
+  claudeThinkingBudget?: number;
   // Remaining-usage (`usage()`) injection seams. The provider reads the
   // Claude subscription OAuth token from the host and calls
   // api.anthropic.com/api/oauth/usage; these let tests stub the network, the
@@ -442,12 +467,20 @@ const TOOL_RESULT_MEDIA_MAX_BYTES = 5 * 1024 * 1024;
 // summaries off entirely; #100 part B follow-up).
 const TOOL_CALL_SUMMARY_MAX_CHARS = 200;
 
-// Default idle-silence heartbeat. `dist/backends/claude.js` events that
-// do tool work (Bash/Read/Grep/Edit/MCP) can run minute-plus without
-// producing any assistant text — long enough to trip Fly edge and SSE
-// caller idle timeouts. Below this many ms of silence, emit a bare
-// `task.status: working` so bytes keep flowing.
-const DEFAULT_HEARTBEAT_MS = 30_000;
+// Default liveness heartbeat. claude tool work (Bash/Read/Grep/Edit/MCP) can
+// run minute-plus without producing any assistant text — long enough to trip
+// Fly edge / SSE caller idle timeouts AND the router's content-stall watchdog.
+// Below this many ms of silence, emit a tagged `task.status: working` (see
+// the shared heartbeat helper) so bytes keep flowing and the router re-arms.
+const DEFAULT_HEARTBEAT_MS = HEARTBEAT_INTERVAL_MS;
+
+// Default thinking budget injected via `MAX_THINKING_TOKENS` on openai-compat
+// spawns when the reasoning channel is enabled (see `claudeReasoning`). Claude
+// Code's `-p` headless mode emits no thinking on the wire unless this is set;
+// the reasoning forwarding is a no-op without it. Used when no explicit
+// `claudeThinkingBudget` override is given and the operator hasn't exported
+// their own `MAX_THINKING_TOKENS`.
+const DEFAULT_MAX_THINKING_TOKENS = '8000';
 
 // Defensive stringification — `(e as Error).message` is unsafe when the
 // thrown value is null/undefined or a non-Error primitive (common in JS).
@@ -644,6 +677,34 @@ function extractClaudeStreamTextDelta(evt: StreamEvent): string {
   if (e.type === 'content_block_start' && e.content_block && typeof e.content_block === 'object') {
     const block = e.content_block as { type?: unknown; text?: unknown };
     if (block.type === 'text' && typeof block.text === 'string') return block.text;
+  }
+  return '';
+}
+
+// Extract a thinking (extended-reasoning) delta from a partial-message
+// `stream_event`. Mirrors `extractClaudeStreamTextDelta` but reads the
+// thinking content block: `content_block_delta` carries `thinking_delta`
+// (`delta.thinking`) and the opening `content_block_start` can prefill a
+// `thinking` block. These ride the wire today (claude spawns with
+// `--include-partial-messages`) but are otherwise dropped, since
+// `extractClaudeStreamTextDelta` only matches text blocks.
+//
+// `redacted_thinking` is deliberately NOT surfaced: its `data` is an encrypted
+// blob, not human-readable reasoning, so forwarding it as `reasoning_content`
+// would emit ciphertext to the caller. We skip it (the answer is unaffected —
+// redacted blocks never carried user-facing text).
+function extractClaudeStreamReasoningDelta(evt: StreamEvent): string {
+  if (evt.type !== 'stream_event') return '';
+  const event = evt.event;
+  if (!event || typeof event !== 'object') return '';
+  const e = event as { type?: unknown; delta?: unknown; content_block?: unknown };
+  if (e.type === 'content_block_delta' && e.delta && typeof e.delta === 'object') {
+    const delta = e.delta as { type?: unknown; thinking?: unknown };
+    if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') return delta.thinking;
+  }
+  if (e.type === 'content_block_start' && e.content_block && typeof e.content_block === 'object') {
+    const block = e.content_block as { type?: unknown; thinking?: unknown };
+    if (block.type === 'thinking' && typeof block.thinking === 'string') return block.thinking;
   }
   return '';
 }
@@ -1134,6 +1195,19 @@ export function createClaudeBackend(
   const now = opts.now ?? Date.now;
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const openaiCompatTrace = opts.openaiCompatTrace === true;
+  // openai-compat/v1 reasoning channel (#95 / #376). ON by default; disable via
+  // `claudeReasoning: false` (CLI `--no-claude-reasoning` / config) when the
+  // deployed codec predates 0.6.0 and can't yet understand the marker.
+  const reasoningEnabled = opts.claudeReasoning !== false;
+  // Operator-facing override for the injected `MAX_THINKING_TOKENS` budget; a
+  // positive integer or undefined (use env-or-default). Non-positive values are
+  // ignored so a stray `0` / negative can't silently disable thinking.
+  const thinkingBudgetOverride =
+    typeof opts.claudeThinkingBudget === 'number' &&
+    Number.isFinite(opts.claudeThinkingBudget) &&
+    opts.claudeThinkingBudget > 0
+      ? String(Math.floor(opts.claudeThinkingBudget))
+      : undefined;
   // openai-compat chat_history prompt-cache: ON by default for claude. Hard
   // off via `openaiCompatHistoryCache: false` or VICOOP_DISABLE_OAI_HISTORY_CACHE.
   const historyCacheConfigured =
@@ -1975,8 +2049,24 @@ export function createClaudeBackend(
       // 5-min default. Trade-off: a 1h cache *write* costs 2x base (vs 1.25x for
       // 5m), paid once per prefix; reads stay 0.1x, so it wins whenever the
       // prefix is reused at all within the hour.
+      // When the reasoning channel is on, ensure Claude Code actually emits
+      // thinking on the wire by setting a `MAX_THINKING_TOKENS` budget (its
+      // `-p` headless mode is otherwise silent). Scoped to openai-compat spawns
+      // — the same path the reasoning-channel artifact and the router care
+      // about. Precedence: an explicit `--claude-thinking-budget` / config knob
+      // wins (and overrides the env, since defaultSpawn merges options.env over
+      // process.env); otherwise an operator's own `MAX_THINKING_TOKENS` export
+      // passes through untouched; otherwise the built-in default.
+      const reasoningBudget =
+        reasoningEnabled && envelope
+          ? thinkingBudgetOverride !== undefined
+            ? { MAX_THINKING_TOKENS: thinkingBudgetOverride }
+            : !process.env.MAX_THINKING_TOKENS
+              ? { MAX_THINKING_TOKENS: DEFAULT_MAX_THINKING_TOKENS }
+              : undefined
+          : undefined;
       const effectiveEnv = envelope
-        ? { ENABLE_PROMPT_CACHING_1H: '1' }
+        ? { ENABLE_PROMPT_CACHING_1H: '1', ...reasoningBudget }
         : undefined;
 
       let child: ClaudeChildHandle;
@@ -2078,6 +2168,10 @@ export function createClaudeBackend(
       // init reports claude's resolved default rather than the slug (#348).
       let initModel: string | null = null;
       let responseArtifactId: string | null = null;
+      // Distinct artifact id for the reasoning channel (#95 / #376), kept
+      // separate from `responseArtifactId` so thinking never co-mingles with
+      // the answer artifact. Lazily minted on the first thinking delta.
+      let reasoningArtifactId: string | null = null;
       let streamedResponseText = '';
       let sawCompletedResult = false;
       let sawErrorResult = false;
@@ -2146,6 +2240,34 @@ export function createClaudeBackend(
           },
           ...(append ? { append: true } : {}),
           lastChunk,
+        });
+        emittedAnyArtifact = true;
+      };
+
+      // Emit a thinking delta on the dedicated `reasoning` channel: a separate
+      // `artifactId` carrying the openai-compat/v1 marker
+      // `metadata[OPENAI_COMPAT_EXTENSION_URI] = { channel: 'reasoning' }`,
+      // appended with `lastChunk:false`. The oai2a2a codec maps this to
+      // `delta.reasoning_content`; the a2x-internal-router treats it as a
+      // commit/liveness signal so a healthy long-reasoning turn is never
+      // false-failed-over (#95). NOT a `claude-message` artifact — thinking
+      // must stay out of the answer. Gated by `reasoningEnabled` at the call
+      // site (and emits nothing until thinking is actually on the wire).
+      const emitReasoningArtifact = (text: string): void => {
+        if (!text) return;
+        reasoningArtifactId ??= randomUUID();
+        emit({
+          type: 'task.artifact',
+          taskId: task.taskId,
+          artifact: {
+            artifactId: reasoningArtifactId,
+            name: 'claude-reasoning',
+            parts: [{ kind: 'text', text }],
+            extensions: [OPENAI_COMPAT_EXTENSION_URI],
+            metadata: { [OPENAI_COMPAT_EXTENSION_URI]: { channel: 'reasoning' } },
+          },
+          append: true,
+          lastChunk: false,
         });
         emittedAnyArtifact = true;
       };
@@ -2284,6 +2406,18 @@ export function createClaudeBackend(
           return;
         }
         if (evt.type === 'stream_event') {
+          if (reasoningEnabled && !emittedAskUserQuestion) {
+            const reasoning = extractClaudeStreamReasoningDelta(evt);
+            if (reasoning) {
+              // Liveness: a reasoning byte is "alive and committing" for the
+              // router, so stamp the heartbeat clock too (a long thinking
+              // burst must not look idle). The reasoning artifact rides the
+              // wrapped `emit`, which already refreshes `lastEmitAt`.
+              recorder.mark('firstAssistant');
+              emitReasoningArtifact(reasoning);
+              return;
+            }
+          }
           const delta = extractClaudeStreamTextDelta(evt);
           if (delta && !emittedAskUserQuestion) {
             recorder.mark('firstAssistant');
@@ -2503,33 +2637,23 @@ export function createClaudeBackend(
         if (stderrTail.length > stderrCap) stderrTail = stderrTail.slice(-stderrCap);
       });
 
-      // Idle-silence heartbeat: while the child is alive, every
-      // `heartbeatMs` of no outbound traffic produces a bare
-      // `task.status: working` so callers and intermediaries see bytes
-      // on the wire. Disabled when heartbeatMs <= 0.
-      let heartbeatHandle: unknown = null;
-      if (heartbeatMs > 0) {
-        heartbeatHandle = setIntervalImpl(() => {
-          if (settled) return;
-          // After abort the run is going to settle as `canceled` once
-          // the child finishes tearing down; emitting more
-          // `state: working` heartbeats in that window would actively
-          // misrepresent the task status to the caller. Suppress them.
-          if (aborted) return;
-          if (now() - lastEmitAt < heartbeatMs) return;
-          // Route through the wrapped `emit` (NOT `rawEmit`): the
-          // wrapper refreshes `lastEmitAt` before forwarding the frame,
-          // so a follow-up tick arriving at the same instant sees a
-          // fresh window and skips. Calling `rawEmit` here would leave
-          // `lastEmitAt` stale and let several ticks emit back-to-back
-          // if the timer fired multiple times after a long pause.
-          emit({
-            type: 'task.status',
-            taskId: task.taskId,
-            status: { state: 'working', timestamp: new Date().toISOString() },
-          });
-        }, heartbeatMs);
-      }
+      // Shared liveness heartbeat: while the child is alive, every
+      // `heartbeatMs` of no outbound traffic produces a tagged
+      // `task.status: working` so callers and the router see bytes on the
+      // wire and re-arm their stall watchdog. Disabled when heartbeatMs <= 0.
+      // The tick routes through the wrapped `emit` so a heartbeat refreshes
+      // `lastEmitAt`; suppressed after abort/settle. See heartbeat.ts.
+      const heartbeat = startLivenessHeartbeat({
+        taskId: task.taskId,
+        emit,
+        now,
+        lastActivityAt: () => lastEmitAt,
+        isSettled: () => settled,
+        isAborted: () => aborted,
+        setIntervalFn: setIntervalImpl,
+        clearIntervalFn: clearIntervalImpl,
+        intervalMs: heartbeatMs,
+      });
 
       const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: unknown }>((resolve) => {
         // The `error` event is *typed* with `Error`, but EventEmitter at
@@ -2572,7 +2696,7 @@ export function createClaudeBackend(
       // port. Safe to await even on the success path because by here
       // we're guaranteed claude has already disconnected.
       await closeCallerToolsMcp();
-      if (heartbeatHandle !== null) clearIntervalImpl(heartbeatHandle);
+      heartbeat.stop();
 
       if (aborted) {
         emit({

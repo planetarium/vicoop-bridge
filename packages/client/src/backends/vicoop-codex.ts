@@ -9,6 +9,7 @@ import {
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
 import { normalizeTaskFailError } from '../failure-code.js';
+import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { createLogger, type Logger } from '../logger.js';
 import { createTimingRecorder } from './timing.js';
 import {
@@ -163,12 +164,10 @@ export type VicoopCodexFetchFn = (
 ) => Promise<VicoopCodexStreamResponse>;
 
 export interface VicoopCodexBackendOptions {
-  // Test seams only — the production CLI calls `createVicoopCodexBackend()`
-  // with no arguments. We don't expose operator-facing knobs here because
-  // anything an operator could set would have to ride through the existing
-  // CLI / config surface, and we are not extending that surface for this
-  // backend. Defaults below cover the production path; tests inject
-  // `spawn` / `logger` / timing overrides.
+  // Mostly test seams — the production CLI calls `createVicoopCodexBackend()`
+  // with just the operator-facing knobs below (`reasoning`,
+  // `openaiCompatTrace`). Defaults below cover the production path; tests
+  // inject `spawn` / `logger` / `fetch` / timing overrides.
   command?: string;
   cwd?: string;
   extraArgs?: readonly string[];
@@ -192,10 +191,38 @@ export interface VicoopCodexBackendOptions {
   // `Date.now`; tests inject a deterministic counter to assert the emitted
   // `[client] timing …` milestones.
   now?: () => number;
+  // Idle-silence liveness heartbeat — same semantics as `codex` / `claude`.
+  // While a task is in-flight and no other frame has gone out for
+  // `heartbeatMs`, emit a tagged `working` `task.status` so the gateway /
+  // router sees bytes on the wire and re-arms its stall watchdog. This is the
+  // exact backend from the production false-failover incident
+  // (planetarium/a2x-internal-router#95), so it MUST heartbeat. Defaults to the
+  // shared `HEARTBEAT_INTERVAL_MS` (10s); `0` disables it (used by tests that
+  // don't drive the timer). `setIntervalFn` / `clearIntervalFn` are test seams.
+  heartbeatMs?: number;
+  setIntervalFn?: (fn: () => void, ms: number) => unknown;
+  clearIntervalFn?: (handle: unknown) => void;
   // When true, dump A2A `parts` shape + metadata keys + raw
   // `chat_history` to stderr on every task. Operator diagnostic exposed
   // via `--openai-compat-trace`. Leave off in production.
   openaiCompatTrace?: boolean;
+  // Forward vicoop-codex's reasoning summary as a live `reasoning` channel: an
+  // additive `openai-compat/v1` wire marker (a reasoning-channel artifact with
+  // `metadata[ext-uri] = { channel: 'reasoning' }`) that the oai2a2a codec maps
+  // to `delta.reasoning_content` so the a2x-internal-router stops
+  // false-failing-over long silent reasoning turns
+  // (planetarium/a2x-internal-router#95, vicoop-bridge#375).
+  //
+  // ON by default; set `false` (CLI `--no-vicoop-codex-reasoning` / config
+  // `backends['vicoop-codex'].reasoning: false`) to disable. Disable when the
+  // deployed oai2a2a codec predates 0.6.0 — an old codec doesn't understand the
+  // `reasoning` channel marker and would fold the reasoning artifact into the
+  // answer (the #95 rollout-order hazard).
+  //
+  // Unlike claude there is NO thinking-enablement injection here: `vicoop-codex
+  // serve` emits `delta.reasoning_content` on the wire serve-side (via
+  // `summary:"auto"`, already shipped), so this is purely forwarding + the flag.
+  reasoning?: boolean;
 }
 
 // `vicoop-codex call` body shape — only the fields this backend actually
@@ -707,6 +734,10 @@ interface ChatCompletionChunk {
     delta?: {
       role?: string;
       content?: string | null;
+      // Reasoning summary streamed by `vicoop-codex serve` (`summary:"auto"`,
+      // vicoop-codex-cli). Forwarded as a `reasoning`-channel artifact, never
+      // folded into `acc.content` — reasoning must stay out of the answer.
+      reasoning_content?: string | null;
       tool_calls?: Array<{
         index?: number;
         id?: string;
@@ -746,6 +777,7 @@ function applyChunk(
   acc: StreamAccumulator,
   chunk: ChatCompletionChunk,
   onContentDelta: (text: string) => void,
+  onReasoningDelta: (text: string) => void,
 ): void {
   if (typeof chunk.id === 'string' && chunk.id.length > 0) acc.id = chunk.id;
   if (typeof chunk.model === 'string' && chunk.model.length > 0) acc.model = chunk.model;
@@ -756,6 +788,12 @@ function applyChunk(
   if (typeof choice.finish_reason === 'string') acc.finishReason = choice.finish_reason;
   const delta = choice.delta;
   if (!delta) return;
+  // Reasoning summary fragment — surfaced on the dedicated `reasoning` channel
+  // by the caller. Deliberately NOT appended to `acc.content`: reasoning must
+  // never co-mingle with the answer artifact / synthesised response text.
+  if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0) {
+    onReasoningDelta(delta.reasoning_content);
+  }
   if (typeof delta.content === 'string' && delta.content.length > 0) {
     acc.content += delta.content;
     onContentDelta(delta.content);
@@ -814,17 +852,20 @@ function synthesizeStreamedResponse(acc: StreamAccumulator): ChatCompletionRespo
 // POST the Chat Completions request (with `stream:true`) to `vicoop-codex
 // serve` and fold the `chat.completion.chunk` SSE stream into a single
 // `ChatCompletionResponse`. `onContentDelta` fires for each incremental text
-// fragment so the caller can emit `append:true` artifacts. `onFirstByte`
-// fires once when the upstream HTTP response resolves OK (before any chunk),
-// letting the caller split connection/model-wait from streaming time. Throws
-// `ServeRequestError` (with an A2A code) on HTTP / transport failure; the
-// caller maps abort separately via `signal.aborted`.
+// fragment so the caller can emit `append:true` artifacts. `onReasoningDelta`
+// fires for each incremental `reasoning_content` fragment so the caller can
+// emit them on the separate `reasoning` channel. `onFirstByte` fires once when
+// the upstream HTTP response resolves OK (before any chunk), letting the caller
+// split connection/model-wait from streaming time. Throws `ServeRequestError`
+// (with an A2A code) on HTTP / transport failure; the caller maps abort
+// separately via `signal.aborted`.
 async function streamChatCompletions(
   fetchFn: VicoopCodexFetchFn,
   url: string,
   body: string,
   signal: AbortSignal,
   onContentDelta: (text: string) => void,
+  onReasoningDelta: (text: string) => void,
   onFirstByte?: () => void,
 ): Promise<ChatCompletionResponse> {
   let res: VicoopCodexStreamResponse;
@@ -863,7 +904,7 @@ async function streamChatCompletions(
       // keep-alive / comment shouldn't abort the turn — skip it.
       return false;
     }
-    applyChunk(acc, chunk, onContentDelta);
+    applyChunk(acc, chunk, onContentDelta, onReasoningDelta);
     return false;
   };
 
@@ -994,7 +1035,17 @@ export function createVicoopCodexBackend(
   const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
   const logger = opts.logger ?? createLogger();
   const now = opts.now ?? Date.now;
+  const heartbeatMs = opts.heartbeatMs ?? HEARTBEAT_INTERVAL_MS;
+  const setIntervalImpl =
+    opts.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
+  const clearIntervalImpl =
+    opts.clearIntervalFn ??
+    ((h) => clearInterval(h as ReturnType<typeof setInterval>));
   const openaiCompatTrace = opts.openaiCompatTrace === true;
+  // openai-compat/v1 reasoning channel (#95 / #375). ON by default; disable via
+  // `reasoning: false` (CLI `--no-vicoop-codex-reasoning` / config) when the
+  // deployed codec predates 0.6.0 and can't yet understand the marker.
+  const reasoningEnabled = opts.reasoning !== false;
 
   // Supported-models cache, populated by `resolveCapabilities` at daemon
   // startup and read sync from `handle()` to gate `envelope.model`
@@ -1210,9 +1261,19 @@ export function createVicoopCodexBackend(
         contextId: task.contextId,
         now,
       });
+      // Timestamp of the last outbound frame, refreshed by the wrapped `emit`.
+      // The shared liveness heartbeat reads it each tick so real traffic OR a
+      // prior heartbeat resets the silence window. `settled` flips once a
+      // terminal frame goes out so the heartbeat stops emitting `working`.
+      let lastEmitAt = now();
+      let settled = false;
       const emit: typeof rawEmit = (frame) => {
+        lastEmitAt = now();
         const terminal = frame.type === 'task.complete' || frame.type === 'task.fail';
-        if (terminal) recorder.mark('emit');
+        if (terminal) {
+          settled = true;
+          recorder.mark('emit');
+        }
         rawEmit(frame);
         if (terminal) {
           const state =
@@ -1386,6 +1447,59 @@ export function createVicoopCodexBackend(
         emittedAnyArtifact = true;
       };
 
+      // Distinct artifact id for the reasoning channel (#95 / #375), kept
+      // separate from `responseArtifactId` so reasoning never co-mingles with
+      // the answer artifact. Lazily minted on the first reasoning delta.
+      let reasoningArtifactId: string | null = null;
+      // Emit a reasoning-summary fragment on the dedicated `reasoning` channel:
+      // a separate `artifactId` carrying the openai-compat/v1 marker
+      // `metadata[OPENAI_COMPAT_EXTENSION_URI] = { channel: 'reasoning' }`,
+      // appended with `lastChunk:false`. The oai2a2a codec maps this to
+      // `delta.reasoning_content`; the a2x-internal-router treats it as a
+      // liveness signal so a healthy long-reasoning turn is never
+      // false-failed-over (#95). NOT a `vicoop-codex-message` artifact —
+      // reasoning must stay out of the answer. Deliberately does NOT touch
+      // `emittedAnyArtifact` (the answer's finalization gate): a turn that
+      // streamed only reasoning still hits the `!emittedAnyArtifact` fallback
+      // that emits the assembled answer once. Gated by `reasoningEnabled` at
+      // the call site below.
+      const emitReasoningArtifact = (text: string): void => {
+        if (!text) return;
+        reasoningArtifactId ??= randomUUID();
+        emit({
+          type: 'task.artifact',
+          taskId: task.taskId,
+          artifact: {
+            artifactId: reasoningArtifactId,
+            name: 'vicoop-codex-reasoning',
+            parts: [{ kind: 'text', text }],
+            extensions: [OPENAI_COMPAT_EXTENSION_URI],
+            metadata: { [OPENAI_COMPAT_EXTENSION_URI]: { channel: 'reasoning' } },
+          },
+          append: true,
+          lastChunk: false,
+        });
+      };
+
+      // Shared liveness heartbeat — see heartbeat.ts. Armed for the duration of
+      // the streaming call: a long silent reasoning turn (no `delta.content`
+      // bytes for a while) must still keep `working` frames flowing so the
+      // router doesn't false-fail-over (#95 — the exact incident this backend
+      // caused). Routes through the wrapped `emit` so a heartbeat refreshes the
+      // silence window; suppressed once settled / aborted. Stopped in `finally`
+      // on every exit path.
+      const heartbeat = startLivenessHeartbeat({
+        taskId: task.taskId,
+        emit,
+        now,
+        lastActivityAt: () => lastEmitAt,
+        isSettled: () => settled,
+        isAborted: () => signal.aborted,
+        setIntervalFn: setIntervalImpl,
+        clearIntervalFn: clearIntervalImpl,
+        intervalMs: heartbeatMs,
+      });
+
       let response: ChatCompletionResponse;
       try {
         response = await streamChatCompletions(
@@ -1394,6 +1508,10 @@ export function createVicoopCodexBackend(
           serialized,
           signal,
           emitDelta,
+          // When the reasoning channel is off, swallow reasoning deltas
+          // entirely — no artifact, and (since reasoning never enters
+          // `acc.content`) no leak into the answer.
+          reasoningEnabled ? emitReasoningArtifact : () => {},
           () => recorder.mark('firstByte'),
         );
       } catch (err) {
@@ -1415,6 +1533,11 @@ export function createVicoopCodexBackend(
           error: normalizeTaskFailError({ code, message }),
         });
         return;
+      } finally {
+        // Stop the heartbeat once streaming has resolved/thrown. Everything
+        // after this point is synchronous (no further awaits), so the loop is
+        // over and the terminal frame is imminent on every remaining path.
+        heartbeat.stop();
       }
 
       // Aborted mid-stream — surface as canceled regardless of what arrived

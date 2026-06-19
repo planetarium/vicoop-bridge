@@ -93,11 +93,28 @@ export const daemonFlagsFields = {
   claudeSupportedModels: optional(option('--claude-supported-models', string({ metavar: 'MODELS' }), {
     description: message`Comma-separated additional model ids this Claude install can serve, e.g. \`claude-sonnet-4-6,claude-haiku-4-5\`. Advertised alongside the default model and accepted as per-request openai-compat \`model\` overrides (Claude has no headless model listing, so the set is operator-declared and not validated against the account). Only valid with \`--backend claude\`; pairing with another backend exits non-zero.`,
   })),
+  noClaudeReasoning: optional(
+    flag('--no-claude-reasoning', {
+      description: message`Disable forwarding Claude's extended-thinking on the openai-compat/v1 \`reasoning\` channel (on by default). Use when the deployed oai2a2a codec predates 0.6.0 and can't yet interpret the channel marker — otherwise the thinking would fold into the answer (planetarium/a2x-internal-router#95). Mirrors config \`backends.claude.reasoning: false\`.`,
+    }),
+  ),
+  claudeThinkingBudget: optional(
+    option('--claude-thinking-budget', integer({ metavar: 'TOKENS', min: 1 }), {
+      description: message`Thinking budget in tokens, injected as \`MAX_THINKING_TOKENS\` on openai-compat spawns so Claude emits thinking on the wire (default 8000). Takes precedence over an operator's own \`MAX_THINKING_TOKENS\` export. Only valid with \`--backend claude\`. Mirrors config \`backends.claude.thinking_budget\`.`,
+    }),
+  ),
 
   // Backend-specific (Codex)
   codexSandbox: optional(option('--codex-sandbox', choice([...SANDBOX_MODES]), {
     description: message`Codex sandbox mode.`,
   })),
+
+  // Backend-specific (vicoop-codex)
+  noVicoopCodexReasoning: optional(
+    flag('--no-vicoop-codex-reasoning', {
+      description: message`Disable forwarding vicoop-codex's reasoning summary on the openai-compat/v1 \`reasoning\` channel (on by default). Use when the deployed oai2a2a codec predates 0.6.0 and can't yet interpret the channel marker — otherwise the reasoning would fold into the answer (planetarium/a2x-internal-router#95). Mirrors config \`backends.vicoop-codex.reasoning: false\`.`,
+    }),
+  ),
 
   // Backend-specific (OpenClaw)
   openclawGateway: optional(option('--openclaw-gateway', string({ metavar: 'WS_URL' }), {
@@ -149,7 +166,20 @@ export interface DaemonArgs {
   claudeSettingsFile?: string;
   claudeModel?: string;
   claudeSupportedModels?: string[];
+  // Resolved openai-compat/v1 reasoning channel toggle. Defaults ON; the
+  // `--no-claude-reasoning` flag or `backends.claude.reasoning: false` flips it
+  // off (#95 / #376). Always defined after `resolveDaemonArgs`.
+  claudeReasoning?: boolean;
+  // Resolved `MAX_THINKING_TOKENS` budget override (`--claude-thinking-budget`
+  // / `backends.claude.thinking_budget`). Undefined keeps the backend's
+  // env-or-default behaviour.
+  claudeThinkingBudget?: number;
   codexSandbox?: CodexSandboxMode;
+  // Resolved openai-compat/v1 reasoning channel toggle for the vicoop-codex
+  // backend. Defaults ON; the `--no-vicoop-codex-reasoning` flag or
+  // `backends['vicoop-codex'].reasoning: false` flips it off (#95 / #375).
+  // Always defined after `resolveDaemonArgs`.
+  vicoopCodexReasoning?: boolean;
   openclawGateway?: string;
   openclawGatewayToken?: string;
   openclawAgent?: string;
@@ -274,8 +304,16 @@ export function mergeClientArgs(
     claudeSupportedModels:
       pickModelsList(flags.claudeSupportedModels) ??
       (backends.claude?.supported_models?.length ? backends.claude.supported_models : undefined),
+    // ON unless the config opts out (`reasoning: false`) or the CLI flag forces
+    // it off; the flag wins over config, matching the other flag>config knobs.
+    claudeReasoning: backends.claude?.reasoning !== false && !flags.noClaudeReasoning,
+    claudeThinkingBudget: flags.claudeThinkingBudget ?? backends.claude?.thinking_budget,
     codexSandbox:
       flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),
+    // ON unless the config opts out (`reasoning: false`) or the CLI flag forces
+    // it off; the flag wins over config, matching the other flag>config knobs.
+    vicoopCodexReasoning:
+      backends['vicoop-codex']?.reasoning !== false && !flags.noVicoopCodexReasoning,
     openclawGateway:
       pick(flags.openclawGateway) || backends.openclaw?.gateway_url || undefined,
     openclawGatewayToken:
@@ -339,6 +377,21 @@ export function mergeClientArgs(
   if (pick(flags.claudeSupportedModels) && backend !== 'claude') {
     errors.push(
       `--claude-supported-models is not supported by --backend ${backend}; only the claude backend takes model ids`,
+    );
+  }
+  if (flags.noClaudeReasoning && backend !== 'claude') {
+    errors.push(
+      `--no-claude-reasoning is not supported by --backend ${backend}; only the claude backend forwards a reasoning channel`,
+    );
+  }
+  if (flags.claudeThinkingBudget !== undefined && backend !== 'claude') {
+    errors.push(
+      `--claude-thinking-budget is not supported by --backend ${backend}; only the claude backend takes a thinking budget`,
+    );
+  }
+  if (flags.noVicoopCodexReasoning && backend !== 'vicoop-codex') {
+    errors.push(
+      `--no-vicoop-codex-reasoning is not supported by --backend ${backend}; only the vicoop-codex backend forwards a reasoning channel`,
     );
   }
 

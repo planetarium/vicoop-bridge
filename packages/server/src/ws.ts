@@ -258,6 +258,12 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           contextId: b.contextId,
           final: false,
           status: wireStatusToA2X(frame.status, frame.taskId, b.contextId),
+          // Pass the frame's metadata through verbatim onto the A2A
+          // `TaskStatusUpdateEvent.metadata` (top-level — NOT
+          // status.message.metadata). The oai2a2a codec reads the liveness
+          // heartbeat marker off `event.metadata[<URI>].heartbeat` here
+          // (planetarium/a2x-internal-router#95).
+          ...(frame.metadata !== undefined ? { metadata: frame.metadata } : {}),
         });
         break;
       }

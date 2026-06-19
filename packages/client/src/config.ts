@@ -126,6 +126,23 @@ export interface ClaudeBackendConfig {
    * `model_not_found`. Mirrors the `--claude-supported-models` flag.
    */
   supported_models?: string[];
+  /**
+   * Forward Claude's extended-thinking on the openai-compat/v1 `reasoning`
+   * channel (so the a2x-internal-router stops false-failing-over long silent
+   * reasoning turns — planetarium/a2x-internal-router#95). ON by default; set
+   * `false` to disable when the deployed oai2a2a codec predates 0.6.0 and can't
+   * understand the channel marker yet. Mirrors the `--no-claude-reasoning`
+   * flag.
+   */
+  reasoning?: boolean;
+  /**
+   * Thinking budget (in tokens) injected as `MAX_THINKING_TOKENS` on
+   * openai-compat spawns when `reasoning` is on, so Claude Code emits thinking
+   * on the wire. A positive integer; defaults to 8000. Takes precedence over an
+   * operator's own `MAX_THINKING_TOKENS` env export. Mirrors the
+   * `--claude-thinking-budget` flag.
+   */
+  thinking_budget?: number;
   runtime?: BackendRuntime;
   runtime_name?: string;
 }
@@ -154,10 +171,23 @@ export interface OpenclawBackendConfig {
   task_timeout_ms?: number;
 }
 
+export interface VicoopCodexBackendConfig {
+  /**
+   * Forward vicoop-codex's reasoning summary on the openai-compat/v1
+   * `reasoning` channel (so the a2x-internal-router stops false-failing-over
+   * long silent reasoning turns — planetarium/a2x-internal-router#95). ON by
+   * default; set `false` to disable when the deployed oai2a2a codec predates
+   * 0.6.0 and can't understand the channel marker yet. Mirrors the
+   * `--no-vicoop-codex-reasoning` flag.
+   */
+  reasoning?: boolean;
+}
+
 export interface BackendConfigs {
   claude?: ClaudeBackendConfig;
   codex?: CodexBackendConfig;
   openclaw?: OpenclawBackendConfig;
+  'vicoop-codex'?: VicoopCodexBackendConfig;
 }
 
 // Mirrors the daemon's CLI flag surface (--server / --token / --agentId /
@@ -199,6 +229,13 @@ function asNumber(v: unknown): number | undefined {
 function asRecord(v: unknown): Record<string, unknown> | undefined {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
   return v as Record<string, unknown>;
+}
+
+// Boolean fields: honour only an actual boolean; anything else (string,
+// number, null) is dropped so a hand-edited typo reads as "unset" and the
+// downstream default applies. Same permissive posture as the scalar pickers.
+function asBoolean(v: unknown): boolean | undefined {
+  return typeof v === 'boolean' ? v : undefined;
 }
 
 // String-array fields: keep the string entries (trimmed, empties dropped),
@@ -311,6 +348,13 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
         if (validApproval) out.codex.approval_decision = validApproval;
         if (runtime) out.codex.runtime = runtime;
         if (runtimeName) out.codex.runtime_name = runtimeName;
+      }
+    }
+    const vcRaw = asRecord(backends['vicoop-codex']);
+    if (vcRaw) {
+      const reasoning = asBoolean(vcRaw.reasoning);
+      if (reasoning !== undefined) {
+        out['vicoop-codex'] = { reasoning };
       }
     }
     const ocRaw = asRecord(backends.openclaw);

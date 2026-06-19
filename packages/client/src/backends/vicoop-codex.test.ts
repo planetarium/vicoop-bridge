@@ -598,11 +598,13 @@ function driveServeListening(child: FakeChild, port = 8787): void {
 async function runStreaming(
   task: TaskAssignFrame,
   fetchRec: RecordingFetch,
+  opts: { reasoning?: boolean } = {},
 ): Promise<UpFrame[]> {
   const fake = makeFakeSpawn();
   const backend = createVicoopCodexBackend({
     spawn: fake.spawn,
     fetch: fetchRec.fetch,
+    ...(opts.reasoning !== undefined ? { reasoning: opts.reasoning } : {}),
   });
   const frames: UpFrame[] = [];
   const ctrl = new AbortController();
@@ -726,6 +728,196 @@ test('handle: streamed text → one append artifact per delta + complete with me
   assert.equal(choices[0].finish_reason, 'stop');
   const choiceMsg = choices[0].message as Record<string, unknown>;
   assert.equal(choiceMsg.content, 'ok');
+});
+
+test('handle: reasoning_content (default ON) → separate reasoning-channel artifact, never in the answer', async () => {
+  const task = makeTask();
+  // role preamble → two reasoning deltas → two content deltas → finish+usage.
+  const sse = sseStream([
+    {
+      id: 'chatcmpl-r',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-r',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { reasoning_content: 'think' }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-r',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { reasoning_content: 'ing' }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-r',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { content: 'an' }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-r',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { content: 'swer' }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-r',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    },
+  ]);
+  const frames = await runStreaming(task, makeSseFetch(sse));
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  const reasoning = artifacts.filter((a) => a.artifact.name === 'vicoop-codex-reasoning');
+  const answer = artifacts.filter((a) => a.artifact.name === 'vicoop-codex-message');
+
+  // Two reasoning deltas → two reasoning-channel artifacts.
+  assert.equal(reasoning.length, 2);
+  const reasoningTexts: string[] = [];
+  const reasoningIds = new Set<string>();
+  for (const a of reasoning) {
+    assert.equal(a.append, true, 'reasoning deltas are append:true');
+    assert.equal(a.lastChunk, false, 'reasoning deltas are lastChunk:false');
+    assert.deepEqual(a.artifact.extensions, [OPENAI_COMPAT_EXTENSION_URI]);
+    assert.deepEqual(a.artifact.metadata, {
+      [OPENAI_COMPAT_EXTENSION_URI]: { channel: 'reasoning' },
+    });
+    const part = a.artifact.parts[0];
+    if (part.kind !== 'text') throw new Error('unreachable');
+    reasoningTexts.push(part.text);
+    reasoningIds.add(a.artifact.artifactId);
+  }
+  assert.deepEqual(reasoningTexts, ['think', 'ing']);
+  // All reasoning deltas share one (reused) artifactId.
+  assert.equal(reasoningIds.size, 1);
+
+  // The answer artifacts are distinct: different id, no reasoning marker.
+  assert.equal(answer.length, 2);
+  const answerTexts: string[] = [];
+  const answerIds = new Set<string>();
+  for (const a of answer) {
+    assert.equal(a.artifact.metadata, undefined, 'answer artifact carries no reasoning marker');
+    const part = a.artifact.parts[0];
+    if (part.kind !== 'text') throw new Error('unreachable');
+    answerTexts.push(part.text);
+    answerIds.add(a.artifact.artifactId);
+  }
+  assert.deepEqual(answerTexts, ['an', 'swer']);
+  assert.equal(answerIds.size, 1);
+  // Reasoning and answer never share an artifactId.
+  assert.equal(reasoningIds.has([...answerIds][0]), false);
+
+  // Terminal message carries only the answer text — reasoning never leaks in.
+  const completes = frames.filter((f) => f.type === 'task.complete');
+  assert.equal(completes.length, 1);
+  const completeFrame = completes[0];
+  if (completeFrame.type !== 'task.complete') throw new Error('unreachable');
+  assert.deepEqual(completeFrame.status.message!.parts, [{ kind: 'text', text: 'answer' }]);
+  const ext = (completeFrame.status.message!.metadata as Record<
+    string,
+    Record<string, unknown>
+  >)[OPENAI_COMPAT_EXTENSION_URI];
+  const envelope = ext.chat_completion as Record<string, unknown>;
+  const choices = envelope.choices as Array<Record<string, unknown>>;
+  const choiceMsg = choices[0].message as Record<string, unknown>;
+  assert.equal(choiceMsg.content, 'answer', 'reasoning never folds into the answer content');
+});
+
+test('handle: reasoning:false drops reasoning entirely, answer unaffected (no leak)', async () => {
+  const task = makeTask();
+  const sse = sseStream([
+    {
+      id: 'chatcmpl-r2',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-r2',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { reasoning_content: 'secret thinking' }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-r2',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { content: 'answer' }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-r2',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+    },
+  ]);
+  const frames = await runStreaming(task, makeSseFetch(sse), { reasoning: false });
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  // No reasoning-channel artifact at all.
+  assert.equal(artifacts.filter((a) => a.artifact.name === 'vicoop-codex-reasoning').length, 0);
+  // The answer streamed normally.
+  const answer = artifacts.filter((a) => a.artifact.name === 'vicoop-codex-message');
+  assert.equal(answer.length, 1);
+  const answerPart = answer[0].artifact.parts[0];
+  if (answerPart.kind !== 'text') throw new Error('unreachable');
+  assert.equal(answerPart.text, 'answer');
+
+  // The reasoning text never appears anywhere — not in artifacts, not in the
+  // terminal answer.
+  const completes = frames.filter((f) => f.type === 'task.complete');
+  const completeFrame = completes[0];
+  if (completeFrame.type !== 'task.complete') throw new Error('unreachable');
+  assert.deepEqual(completeFrame.status.message!.parts, [{ kind: 'text', text: 'answer' }]);
+  const serializedAll = JSON.stringify(frames);
+  assert.equal(serializedAll.includes('secret thinking'), false, 'no reasoning leak anywhere');
+});
+
+test('handle: reasoning-only stream (no content) still finalizes the answer fallback', async () => {
+  // A turn that streamed reasoning but produced its answer non-chunked (no
+  // content deltas): reasoning must NOT satisfy the answer's
+  // `emittedAnyArtifact` gate, so the assembled content still emits once.
+  const task = makeTask();
+  const sse = sseStream([
+    {
+      id: 'chatcmpl-r3',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { reasoning_content: 'pondering' }, finish_reason: null }],
+    },
+    {
+      id: 'chatcmpl-r3',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      // Whole answer arrives on the finish frame (not chunked).
+      choices: [{ index: 0, delta: { content: 'final' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+    },
+  ]);
+  const frames = await runStreaming(task, makeSseFetch(sse));
+
+  const artifacts = frames.filter(
+    (f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact',
+  );
+  // One reasoning artifact + one answer artifact (the content delta path).
+  assert.equal(artifacts.filter((a) => a.artifact.name === 'vicoop-codex-reasoning').length, 1);
+  const answer = artifacts.filter((a) => a.artifact.name === 'vicoop-codex-message');
+  assert.equal(answer.length, 1);
+  const answerPart = answer[0].artifact.parts[0];
+  if (answerPart.kind !== 'text') throw new Error('unreachable');
+  assert.equal(answerPart.text, 'final');
 });
 
 test('handle: serve drops usage on the stream → envelope backfills zero usage (spec-required, no gateway hard-reject)', async () => {
@@ -1395,4 +1587,148 @@ test('handle: emits a timing line with serveReady/firstByte/firstDelta/total mil
 
   // Exactly one timing line per task — no duplicate emit on the terminal frame.
   assert.equal(debugLines.filter((l) => l.startsWith('timing ')).length, 1);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared liveness heartbeat (gap fix): vicoop-codex was the exact backend from
+// the production false-failover incident (planetarium/a2x-internal-router#95),
+// so it MUST keep `working` frames flowing during a long silent streaming turn
+// — same shared loop as claude.ts / codex.ts.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A fetch whose SSE stream stays open until `release()` is called, so the test
+// can drive heartbeat ticks while the streaming call is still in-flight.
+function makeGatedSseFetch(sse: string): {
+  fetch: VicoopCodexFetchFn;
+  release: () => void;
+} {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const fetch: VicoopCodexFetchFn = async () => ({
+    ok: true,
+    status: 200,
+    async text() {
+      return '';
+    },
+    async *chunks() {
+      await gate;
+      yield sse;
+    },
+  });
+  return { fetch, release };
+}
+
+test('heartbeat: the idle beat during streaming carries the openai-compat liveness marker (shared loop)', async () => {
+  // End-to-end through the vicoop-codex backend's shared heartbeat loop: while
+  // the streaming call is silent (no `delta.content`), the idle tick must emit
+  // a non-terminal `working` status tagged
+  // metadata[OPENAI_COMPAT_EXTENSION_URI]={heartbeat:true} — the surface the
+  // oai2a2a codec maps to a `: a2a-heartbeat` SSE comment.
+  let scheduledFn: () => void = () => {};
+  let cleared = false;
+  let nowMs = 1_000_000;
+
+  const sse = sseStream([
+    {
+      id: 'chatcmpl-hb',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    },
+  ]);
+  const gated = makeGatedSseFetch(sse);
+  const fake = makeFakeSpawn();
+  const backend = createVicoopCodexBackend({
+    spawn: fake.spawn,
+    fetch: gated.fetch,
+    heartbeatMs: 100,
+    now: () => nowMs,
+    setIntervalFn: (fn) => {
+      scheduledFn = fn;
+      return { tag: 'fake-interval' };
+    },
+    clearIntervalFn: () => {
+      cleared = true;
+    },
+  });
+
+  const frames: UpFrame[] = [];
+  const ctrl = new AbortController();
+  const done = backend.handle(makeTask(), (f) => frames.push(f), ctrl.signal);
+  // Drive the serve `listening` line, then yield enough microtasks for the
+  // streaming call to start and the heartbeat to be armed.
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  driveServeListening(fake.lastChild());
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+
+  const countStatus = () =>
+    frames.filter((f) => f.type === 'task.status').length;
+  assert.equal(countStatus(), 1, 'only the initial working status so far');
+
+  // Advance past the threshold → one tagged heartbeat status emitted.
+  nowMs += 250;
+  scheduledFn();
+  assert.equal(countStatus(), 2);
+
+  const beat = frames.find(
+    (f) =>
+      f.type === 'task.status' &&
+      (f as Extract<UpFrame, { type: 'task.status' }>).metadata !== undefined,
+  ) as Extract<UpFrame, { type: 'task.status' }> | undefined;
+  assert.ok(beat, 'a tagged heartbeat task.status must be emitted');
+  assert.equal(beat.status.state, 'working');
+  assert.equal(beat.status.message, undefined, 'heartbeat carries no message parts');
+  assert.deepEqual(beat.metadata, {
+    [OPENAI_COMPAT_EXTENSION_URI]: { heartbeat: true },
+  });
+
+  // A follow-up tick at the same instant must NOT double-fire — the prior beat
+  // refreshed lastActivity through the wrapped emitter.
+  scheduledFn();
+  assert.equal(countStatus(), 2);
+
+  // Release the stream so the run completes; the heartbeat must be cleared.
+  gated.release();
+  await done;
+  assert.ok(cleared, 'heartbeat handle must be cleared once streaming settles');
+});
+
+test('heartbeat: heartbeatMs:0 disables the interval entirely', async () => {
+  let scheduled = false;
+  const sse = sseStream([
+    {
+      id: 'chatcmpl-hb0',
+      object: 'chat.completion.chunk',
+      model: 'gpt-5.4',
+      choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    },
+  ]);
+  const fake = makeFakeSpawn();
+  const backend = createVicoopCodexBackend({
+    spawn: fake.spawn,
+    fetch: makeSseFetch(sse).fetch,
+    heartbeatMs: 0,
+    setIntervalFn: () => {
+      scheduled = true;
+      return { tag: 'fake-interval' };
+    },
+    clearIntervalFn: () => {},
+  });
+  const frames: UpFrame[] = [];
+  const ctrl = new AbortController();
+  const done = backend.handle(makeTask(), (f) => frames.push(f), ctrl.signal);
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  driveServeListening(fake.lastChild());
+  await done;
+
+  assert.equal(scheduled, false, 'no interval scheduled when heartbeatMs is 0');
+  assert.equal(
+    frames.filter((f) => f.type === 'task.status').length,
+    1,
+    'only the initial working status — no heartbeats',
+  );
 });

@@ -200,6 +200,27 @@ export const TaskStatusFrame = z.object({
   type: z.literal('task.status'),
   taskId: z.string(),
   status: TaskStatus,
+  // Optional, passed through verbatim onto the A2A
+  // `TaskStatusUpdateEvent.metadata` (top-level) by the server. Used by the
+  // openai-compat/v1 liveness heartbeat: a non-terminal `working` status
+  // tagged `metadata[OPENAI_COMPAT_EXTENSION_URI] = { heartbeat: true }` is
+  // translated by the oai2a2a codec into a `: a2a-heartbeat` SSE comment so a
+  // byte-silent-but-live backend re-arms the consumer's stall watchdog rather
+  // than being false-failed-over (planetarium/a2x-internal-router#95).
+  //
+  // Intentionally FREEFORM (mirrors `Message.metadata` / `Artifact.metadata`
+  // above, and the A2A SDK's own `TaskStatusUpdateEvent.metadata`). This is the
+  // generic transport layer; it stays a namespaced-by-extension-URI passthrough
+  // and deliberately does NOT schematize `heartbeat` (or any other marker).
+  // Schematizing here would couple the transport to one extension's semantics
+  // and force a protocol change for every future marker — defeating the A2A
+  // extension model (additive, transport-agnostic, "receivers MUST ignore
+  // unknown metadata"). The marker's schema lives at the edges that own the
+  // semantics: the typed producer `buildHeartbeatStatusFrame()` (client) and
+  // the oai2a2a codec + openai-compat/v1 spec (consumer). Go structured here
+  // only if liveness ever becomes a first-class transport concept rather than
+  // an extension marker.
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
 export const TaskArtifactFrame = z.object({

@@ -18,9 +18,13 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
   }
 }
