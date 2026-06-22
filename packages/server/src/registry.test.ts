@@ -419,28 +419,38 @@ test('same-token reconnect fails the displaced connection in-flight bindings (is
   };
   registry.registerAgent({ ...base, ws: oldWs });
 
-  const statuses: Array<{ status: { state?: string; message?: { metadata?: unknown } } }> = [];
-  let finished = false;
-  registry.bindTask({
-    agentId: 'a1',
-    taskId: 't-live',
-    contextId: 'ctx-live',
-    requestedExtensions: [OPENAI_COMPAT_EXTENSION_URI],
-    sink: {
-      pushStatus: (event) => statuses.push(event),
-      pushArtifact: () => undefined,
-      finish: () => {
-        finished = true;
+  // Two in-flight tasks on the displaced connection — both must be failed, so
+  // a future reintroduction of an early-return in the loop regresses loudly.
+  const statuses: Array<{
+    status: { state?: string; message?: { messageId?: string; metadata?: unknown } };
+  }> = [];
+  const finished = new Set<string>();
+  for (const taskId of ['t-live', 't-live-2']) {
+    registry.bindTask({
+      agentId: 'a1',
+      taskId,
+      contextId: `ctx-${taskId}`,
+      requestedExtensions: [OPENAI_COMPAT_EXTENSION_URI],
+      sink: {
+        pushStatus: (event) => statuses.push(event),
+        pushArtifact: () => undefined,
+        finish: () => {
+          finished.add(taskId);
+        },
       },
-    },
-  });
+    });
+  }
 
   // Same token (clientId) reconnects on a fresh socket → replacement branch.
   registry.registerAgent({ ...base, ws: makeWs(), connectedAt: 1 });
 
-  assert.equal(finished, true, 'displaced binding sink must be finished');
+  assert.deepEqual([...finished].sort(), ['t-live', 't-live-2'], 'every displaced sink must be finished');
   assert.equal(registry.getBinding('t-live'), undefined, 'binding must be dropped');
+  assert.equal(registry.getBinding('t-live-2'), undefined, 'binding must be dropped');
   assert.equal(statuses[0]?.status.state, 'failed');
+  // messageId carries the per-path suffix wired through failBindingsForAgent —
+  // the disconnect path uses `-disc`, this reconnect path uses `-superseded`.
+  assert.equal(statuses[0]?.status.message?.messageId, 't-live-superseded');
   assert.deepEqual(statuses[0]?.status.message?.metadata, {
     [OPENAI_COMPAT_EXTENSION_URI]: {
       terminal_error: {
