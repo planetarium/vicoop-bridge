@@ -4,8 +4,10 @@ import postgres from 'postgres';
 import {
   CALLER_TOKEN_PREFIX,
   generateCallerToken,
+  generateSessionToken,
   hashCallerToken,
   issueCallerToken,
+  verifySessionToken,
   verifyCallerToken,
   revokeCallerToken,
   listCallerTokens,
@@ -45,6 +47,42 @@ test('hashCallerToken returns 64-char sha256 hex', () => {
 
 test('different tokens produce different hashes', () => {
   assert.notEqual(hashCallerToken('a'), hashCallerToken('b'));
+});
+
+// A read-only DB (e.g. volume full → Fly postgres-flex flips read-only) makes
+// the last_used_at touch UPDATE throw. That stamp is observability-only and
+// must not fail verification, otherwise callers see a spurious 401 that masks
+// the real cause. See issue #385.
+test('verifySessionToken tolerates a failing last_used_at write (read-only DB)', async () => {
+  const token = generateSessionToken('caller');
+  const validRow = {
+    id: 'caller-id',
+    principal_id: 'google:readonly-test',
+    audience: 'caller',
+    email: 'ro@example.com',
+    expires_at: new Date(Date.now() + 60_000),
+    revoked: false,
+  };
+
+  let updateAttempted = false;
+  const sqlStub = ((strings: TemplateStringsArray) => {
+    const text = strings.join('?');
+    if (/UPDATE callers SET last_used_at/.test(text)) {
+      updateAttempted = true;
+      return Promise.reject(
+        new Error('cannot execute UPDATE in a read-only transaction'),
+      );
+    }
+    if (/SELECT/.test(text)) return Promise.resolve([validRow]);
+    return Promise.resolve([]);
+  }) as unknown as Parameters<typeof verifySessionToken>[0];
+
+  // Verification still succeeds despite the read-only write failure.
+  const caller = await verifySessionToken(sqlStub, token, { expectedAudience: 'caller' });
+  assert.equal(updateAttempted, true);
+  assert.equal(caller.principalId, 'google:readonly-test');
+  assert.equal(caller.email, 'ro@example.com');
+  assert.equal(caller.emailVerified, true);
 });
 
 // ---------- DB-gated tests ----------
