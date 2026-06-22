@@ -401,6 +401,111 @@ test('registerAgent emits client_collision and closes the prior ws with the desc
   assert.equal(parsed.previousConnectedAt, 1000);
 });
 
+test('same-token reconnect fails the displaced connection in-flight bindings (issue #365)', () => {
+  // A second daemon authenticating with the same CLIENT_TOKEN replaces the
+  // incumbent. The old connection's in-flight task must receive a terminal
+  // `failed` status and have its sink finished + binding dropped — otherwise
+  // the task's HTTP stream hangs forever (the new daemon is a separate process
+  // that never knew the old taskId, so it can't complete it either).
+  const registry = new Registry();
+  const oldWs = makeWs();
+  const base = {
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    connectedAt: 0,
+  };
+  registry.registerAgent({ ...base, ws: oldWs });
+
+  // Two in-flight tasks on the displaced connection — both must be failed, so
+  // a future reintroduction of an early-return in the loop regresses loudly.
+  const statuses: Array<{
+    status: { state?: string; message?: { messageId?: string; metadata?: unknown } };
+  }> = [];
+  const finished = new Set<string>();
+  for (const taskId of ['t-live', 't-live-2']) {
+    registry.bindTask({
+      agentId: 'a1',
+      taskId,
+      contextId: `ctx-${taskId}`,
+      requestedExtensions: [OPENAI_COMPAT_EXTENSION_URI],
+      sink: {
+        pushStatus: (event) => statuses.push(event),
+        pushArtifact: () => undefined,
+        finish: () => {
+          finished.add(taskId);
+        },
+      },
+    });
+  }
+
+  // Same token (clientId) reconnects on a fresh socket → replacement branch.
+  registry.registerAgent({ ...base, ws: makeWs(), connectedAt: 1 });
+
+  assert.deepEqual([...finished].sort(), ['t-live', 't-live-2'], 'every displaced sink must be finished');
+  assert.equal(registry.getBinding('t-live'), undefined, 'binding must be dropped');
+  assert.equal(registry.getBinding('t-live-2'), undefined, 'binding must be dropped');
+  assert.equal(statuses[0]?.status.state, 'failed');
+  // messageId carries the per-path suffix wired through failBindingsForAgent —
+  // the disconnect path uses `-disc`, this reconnect path uses `-superseded`.
+  assert.equal(statuses[0]?.status.message?.messageId, 't-live-superseded');
+  assert.deepEqual(statuses[0]?.status.message?.metadata, {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      terminal_error: {
+        code: 'superseded',
+        message: 'superseded by a reconnect from the same client token',
+      },
+    },
+    error: {
+      code: 'superseded',
+      message: 'superseded by a reconnect from the same client token',
+    },
+  });
+});
+
+test('a late close from the superseded socket does not double-fail the new connection bindings (issue #365)', () => {
+  // After the reconnect path has already terminated the old connection's
+  // bindings, the old socket's close handler eventually fires
+  // unregisterAgent(agentId, oldWs). The ws-identity guard must make that a
+  // no-op so it can't touch a task the *new* connection has since bound.
+  const registry = new Registry();
+  const oldWs = makeWs();
+  const base = {
+    agentId: 'a1',
+    clientId: 'c1',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    connectedAt: 0,
+  };
+  registry.registerAgent({ ...base, ws: oldWs });
+  const newWs = makeWs();
+  registry.registerAgent({ ...base, ws: newWs, connectedAt: 1 });
+
+  // New connection binds a fresh task after the swap.
+  let finished = false;
+  registry.bindTask({
+    agentId: 'a1',
+    taskId: 't-new',
+    contextId: 'ctx-new',
+    sink: {
+      pushStatus: () => undefined,
+      pushArtifact: () => undefined,
+      finish: () => {
+        finished = true;
+      },
+    },
+  });
+
+  // Late close from the displaced socket — must not disturb t-new.
+  registry.unregisterAgent('a1', oldWs);
+
+  assert.equal(finished, false, 'new connection binding must survive a stale unregister');
+  assert.ok(registry.getBinding('t-new'), 'new binding must still be present');
+});
+
 test('disconnectClient returns 0 when no agents are bound to the client', () => {
   const registry = new Registry();
   registry.registerAgent({

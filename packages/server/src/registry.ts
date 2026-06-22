@@ -88,6 +88,18 @@ export class Registry {
         // the foreground log can recognize the duplicate-token scenario
         // without cross-referencing close codes.
         existing.ws.close(4009, 'another client with the same token connected');
+        // Fail the displaced connection's in-flight tasks *before* swapping the
+        // map. The old socket's close fires asynchronously and, by the time its
+        // unregisterAgent runs, the map already points at `conn` — so the
+        // ws-identity guard makes it a no-op and it can't clean these up. Doing
+        // it here (while the bindings still belong to the old conn) is the only
+        // point that sees them. The new conn hasn't bound any tasks yet, so
+        // this only terminates the superseded ones.
+        this.failBindingsForAgent(conn.agentId, {
+          code: 'superseded',
+          message: 'superseded by a reconnect from the same client token',
+          messageIdSuffix: 'superseded',
+        });
         this.agents.set(conn.agentId, conn);
         this.notifyAgentChange(conn.agentId);
         return { ok: true };
@@ -139,6 +151,27 @@ export class Registry {
     if (!existing || existing.ws !== ws) return;
     this.agents.delete(agentId);
     this.notifyAgentChange(agentId);
+    this.failBindingsForAgent(agentId, {
+      code: 'disconnected',
+      message: 'client disconnected mid-task',
+      messageIdSuffix: 'disc',
+    });
+  }
+
+  // Push a terminal `failed` status to every in-flight task bound to this
+  // agent, finish its sink, and drop the binding. Both the normal disconnect
+  // (unregisterAgent) and the same-token reconnect replacement (registerAgent)
+  // funnel through here so an in-flight task is never left without a terminal
+  // event — the HTTP stream for that task would otherwise hang forever waiting
+  // on AsyncEventQueue.iterate(), since the bound sink's finish() is what
+  // closes the iterator. The reconnect path in particular MUST call this
+  // explicitly before swapping the agents map: once the map points at the new
+  // conn, the old socket's late close handler hits the ws-identity guard in
+  // unregisterAgent and early-returns, so it can no longer fail these bindings.
+  private failBindingsForAgent(
+    agentId: string,
+    error: { code: string; message: string; messageIdSuffix: string },
+  ): void {
     for (const binding of [...this.bindings.values()]) {
       if (binding.agentId !== agentId) continue;
       binding.sink.pushStatus({
@@ -154,13 +187,13 @@ export class Registry {
           state: 'failed' as never,
           timestamp: new Date().toISOString(),
           message: {
-            messageId: `${binding.taskId}-disc`,
+            messageId: `${binding.taskId}-${error.messageIdSuffix}`,
             role: 'agent',
-            parts: [{ text: 'client disconnected mid-task' }],
+            parts: [{ text: error.message }],
             ...terminalErrorMessageFields(
               {
-                code: 'disconnected',
-                message: 'client disconnected mid-task',
+                code: error.code,
+                message: error.message,
               },
               binding.requestedExtensions,
             ),
