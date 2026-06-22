@@ -7,7 +7,7 @@ import type {
   TaskStore,
 } from '@a2x/sdk';
 import { TaskState, TERMINAL_STATES } from '@a2x/sdk';
-import type { Sql } from './db.js';
+import type { Sql, SqlExecutor } from './db.js';
 
 const MAX_CONTEXT_TASKS = 10;
 
@@ -61,7 +61,9 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
       status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
       metadata: params.metadata,
     };
-    await this.upsert(task);
+    await this.writeTask(task);
+    // A freshly-created task is SUBMITTED, never terminal, so retention is a
+    // no-op here — skip it entirely.
     return task;
   }
 
@@ -73,16 +75,48 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   }
 
   async updateTask(taskId: string, update: TaskUpdate): Promise<Task> {
-    const existing = await this.getTask(taskId);
-    if (!existing) {
-      throw new Error(`Task not found: ${taskId}`);
-    }
-    const merged: Task = { ...existing };
-    if (update.status !== undefined) merged.status = update.status;
-    if (update.artifacts !== undefined) merged.artifacts = update.artifacts;
-    if (update.history !== undefined) merged.history = update.history;
-    if (update.metadata !== undefined) merged.metadata = update.metadata;
-    await this.upsert(merged);
+    // read-modify-write must be serialized per task row. Two concurrent
+    // updateTask calls for the same taskId (e.g. executeStream's terminal
+    // save racing message/cancel's save — separate HTTP requests) would
+    // otherwise both read the same `existing`, each merge only their own
+    // fields, and the later write would clobber the earlier one's changes
+    // (lost update): one writes `status`, the other `history`/`artifacts`,
+    // and only one survives. `ON CONFLICT DO UPDATE` serializes the row
+    // write but not the JS merge spanning the read→write await boundary.
+    //
+    // SELECT ... FOR UPDATE inside a transaction takes a row lock so a
+    // concurrent updateTask blocks until this one commits, then reads the
+    // freshly-written row and merges on top of it. READ COMMITTED (the
+    // default) is sufficient: FOR UPDATE blocks the second SELECT until the
+    // first transaction commits, after which it reads the just-written row —
+    // we don't need REPEATABLE READ because the lock, not snapshot isolation,
+    // is what serializes the two read-modify-writes.
+    const merged = await this.sql.begin(async (sql) => {
+      const rows = await sql<{ task_json: Task }[]>`
+        SELECT task_json FROM infra.a2a_tasks WHERE task_id = ${taskId} FOR UPDATE
+      `;
+      const existing = rows[0]?.task_json ?? null;
+      if (!existing) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+      const next: Task = { ...existing };
+      if (update.status !== undefined) next.status = update.status;
+      if (update.artifacts !== undefined) next.artifacts = update.artifacts;
+      if (update.history !== undefined) next.history = update.history;
+      if (update.metadata !== undefined) next.metadata = update.metadata;
+      await this.writeTask(next, sql);
+      return next;
+    });
+    // Retention runs AFTER the transaction commits, on the pool connection —
+    // deliberately NOT inside the FOR UPDATE transaction. Two same-context
+    // tasks reaching a terminal state at once would otherwise each hold the
+    // lock on their own row while the retention DELETE tries to remove the
+    // OTHER's row, producing a lock-order cycle: Postgres aborts one and
+    // rolls back its task-state write with it. Running retention post-commit
+    // keeps the state write durable (it has already committed) and confines
+    // the row lock to the single task being updated, so two updateTask calls
+    // can never deadlock each other.
+    await this.enforceRetention(merged);
     return merged;
   }
 
@@ -123,10 +157,10 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
    * long-running context keeps ALL its turns (its newest task's updated_at is
    * recent, so the whole context is spared), and only contexts with no recent
    * activity are reclaimed. This is the orthogonal axis to the count-based cap
-   * in upsert() (which bounds a single context to MAX_CONTEXT_TASKS): the count
-   * cap stops one context from bloating, this stops the table from growing
-   * monotonically with the number of stale contexts over time (the root cause
-   * in #385). It also reclaims old terminal contexts whose rows have no
+   * in enforceRetention() (which bounds a single context to MAX_CONTEXT_TASKS):
+   * the count cap stops one context from bloating, this stops the table from
+   * growing monotonically with the number of stale contexts over time (the root
+   * cause in #385). It also reclaims old terminal contexts whose rows have no
    * owner_principal, which the count-based path skips.
    *
    * Any context that still holds a non-terminal task is spared regardless of
@@ -156,18 +190,21 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     return res.count;
   }
 
-  private async upsert(task: Task): Promise<void> {
+  // Write (insert-or-replace) the full task row. `sql` defaults to the pool
+  // connection but updateTask passes its transaction-scoped connection so the
+  // row write participates in the same FOR UPDATE transaction that read it.
+  private async writeTask(task: Task, sql: SqlExecutor = this.sql): Promise<void> {
     const ownerPrincipal = extractOwnerPrincipal(task);
     const sanitized = stripSensitiveMetadata(task);
     const contextId = task.contextId ?? task.id;
 
-    await this.sql`
+    await sql`
       INSERT INTO infra.a2a_tasks (task_id, context_id, state, task_json, owner_principal)
       VALUES (
         ${task.id},
         ${contextId},
         ${task.status.state},
-        ${this.sql.json(JSON.parse(JSON.stringify(sanitized)))},
+        ${sql.json(JSON.parse(JSON.stringify(sanitized)))},
         ${ownerPrincipal ?? null}
       )
       ON CONFLICT (task_id) DO UPDATE SET
@@ -177,21 +214,36 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
         owner_principal = COALESCE(infra.a2a_tasks.owner_principal, EXCLUDED.owner_principal),
         updated_at = now()
     `;
+  }
 
-    // Enforce retention only when this task reaches a terminal state
-    const isTerminal = TERMINAL_STATES.has(task.status.state);
-    if (ownerPrincipal && isTerminal) {
-      await this.sql`
-        DELETE FROM infra.a2a_tasks
-        WHERE task_id IN (
-          SELECT task_id FROM infra.a2a_tasks
-          WHERE context_id = ${contextId}
-            AND owner_principal = ${ownerPrincipal}
-            AND state IN ('completed', 'failed', 'canceled', 'rejected')
-          ORDER BY created_at DESC, task_id DESC
-          OFFSET ${MAX_CONTEXT_TASKS}
-        )
-      `;
-    }
+  // Trim a context's terminal tasks down to MAX_CONTEXT_TASKS. Always runs on
+  // the pool connection (never a caller's transaction) so it can't hold a
+  // task-row lock while scanning/deleting sibling rows — that held lock is
+  // what let the old in-transaction version deadlock (see the note in
+  // updateTask), and dropping it removes the cycle entirely. Two concurrent
+  // retention passes for the same context could in principle still contend on
+  // the same victim rows, but the blast radius is tiny: retention only fires
+  // for owned terminal tasks, deletes a short tail beyond the cap, and holds
+  // no other lock — so they serialize on row locks rather than deadlocking in
+  // practice. (Lock-acquisition order across a `DELETE ... WHERE task_id IN
+  // (SELECT ... ORDER BY ...)` is planner-dependent, so this is a
+  // probabilistic argument, not a guarantee — acceptable given the rarity.)
+  // No-op unless the task is terminal and owned.
+  private async enforceRetention(task: Task): Promise<void> {
+    const ownerPrincipal = extractOwnerPrincipal(task);
+    if (!ownerPrincipal || !TERMINAL_STATES.has(task.status.state)) return;
+    const contextId = task.contextId ?? task.id;
+
+    await this.sql`
+      DELETE FROM infra.a2a_tasks
+      WHERE task_id IN (
+        SELECT task_id FROM infra.a2a_tasks
+        WHERE context_id = ${contextId}
+          AND owner_principal = ${ownerPrincipal}
+          AND state IN ('completed', 'failed', 'canceled', 'rejected')
+        ORDER BY created_at DESC, task_id DESC
+        OFFSET ${MAX_CONTEXT_TASKS}
+      )
+    `;
   }
 }
