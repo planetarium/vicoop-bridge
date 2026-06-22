@@ -148,6 +148,48 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     return rows.map((r) => r.task_json).reverse();
   }
 
+  /**
+   * Time-based retention. Deletes every task belonging to a context that has
+   * been idle (no task created or updated) for longer than `retentionDays`
+   * AND has no in-flight (non-terminal) task.
+   *
+   * Pruning is context-scoped rather than per-row on purpose: an actively-used
+   * long-running context keeps ALL its turns (its newest task's updated_at is
+   * recent, so the whole context is spared), and only contexts with no recent
+   * activity are reclaimed. This is the orthogonal axis to the count-based cap
+   * in enforceRetention() (which bounds a single context to MAX_CONTEXT_TASKS):
+   * the count cap stops one context from bloating, this stops the table from
+   * growing monotonically with the number of stale contexts over time (the root
+   * cause in #385). It also reclaims old terminal contexts whose rows have no
+   * owner_principal, which the count-based path skips.
+   *
+   * Any context that still holds a non-terminal task is spared regardless of
+   * age: the executor only persists a task at terminal/stream-end (no
+   * intermediate writes), so a legitimately long-running task's updated_at
+   * stays frozen at creation time, and a per-row age test would reap it out
+   * from under the live executor. Genuinely-stuck non-terminal tasks are
+   * therefore not collected here by design — handle those separately if needed.
+   *
+   * Purely timestamp-driven (no dependence on task_json contents). Deletion
+   * relies on autovacuum to return space for reuse; it does not shrink the
+   * relation on disk (run VACUUM FULL / pg_repack once for the historical
+   * backlog). Returns the number of rows deleted.
+   */
+  async pruneStaleContexts(retentionDays: number): Promise<number> {
+    const res = await this.sql`
+      DELETE FROM infra.a2a_tasks
+      WHERE context_id IN (
+        SELECT context_id FROM infra.a2a_tasks
+        GROUP BY context_id
+        HAVING max(updated_at) < now() - ${retentionDays} * interval '1 day'
+           AND count(*) FILTER (
+                 WHERE state NOT IN ('completed', 'failed', 'canceled', 'rejected')
+               ) = 0
+      )
+    `;
+    return res.count;
+  }
+
   // Write (insert-or-replace) the full task row. `sql` defaults to the pool
   // connection but updateTask passes its transaction-scoped connection so the
   // row write participates in the same FOR UPDATE transaction that read it.

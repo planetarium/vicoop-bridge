@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { Sql } from '../db.js';
+import { logEvent } from '../log.js';
 import type { VerifiedCaller } from './principal.js';
 
 // Bridge-issued opaque session tokens.
@@ -245,9 +246,21 @@ export async function verifySessionToken(
     );
   }
 
-  // Stamp last_used_at. Awaited for test determinism; the write is cheap
-  // and only happens on cache misses (so at most once per 60s per token).
-  await sql`UPDATE callers SET last_used_at = now() WHERE id = ${row.id}`;
+  // Stamp last_used_at — best-effort, observability only. The authorization
+  // decision is already made above (revoked / expired / audience all checked),
+  // so this write must never fail the request. In particular, when the DB is
+  // read-only (e.g. volume full → Fly postgres-flex flips read-only) this
+  // UPDATE would otherwise throw and surface to callers as a spurious 401,
+  // masking the real cause; swallow + log so auth degrades gracefully instead.
+  // See issue #385. Awaited for test determinism; the write is cheap and only
+  // happens on cache misses (so at most once per 60s per token), and the
+  // result is cached below regardless so a failing write isn't retried per
+  // request within the cache window.
+  try {
+    await sql`UPDATE callers SET last_used_at = now() WHERE id = ${row.id}`;
+  } catch (err) {
+    logEvent('caller_last_used_touch_failed', { callerId: row.id, error: String(err) });
+  }
 
   // email_verified inference: we only persist email at issue time when the
   // upstream provider (google-oauth) has already validated it, so a non-null
