@@ -2,10 +2,17 @@ import { serve } from '@hono/node-server';
 import { Registry } from './registry.js';
 import { createHttpApp } from './http.js';
 import { attachWsServer } from './ws.js';
+import { PostgresTaskStore } from './postgres-task-store.js';
+import { logEvent } from './log.js';
 import type { Sql } from './db.js';
 import type { GoogleConfig } from './auth/google-oauth.js';
 
 const TRANSIENT_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1h
+
+// Time-based retention for infra.a2a_tasks (issue #385). Contexts idle for
+// longer than this are reclaimed whole; 0 (or non-positive) disables the job.
+// Complements the count-based per-context cap in PostgresTaskStore.upsert().
+const TASK_RETENTION_DAYS = Number(process.env.A2A_TASK_RETENTION_DAYS ?? 30);
 
 async function cleanupExpiredTransients(db: Sql): Promise<void> {
   try {
@@ -17,6 +24,18 @@ async function cleanupExpiredTransients(db: Sql): Promise<void> {
     await db`DELETE FROM used_siwe_nonces WHERE expires_at <= now()`;
   } catch (err) {
     console.error('[server] used_siwe_nonces cleanup failed:', err);
+  }
+}
+
+async function cleanupStaleTasks(db: Sql): Promise<void> {
+  if (!Number.isFinite(TASK_RETENTION_DAYS) || TASK_RETENTION_DAYS <= 0) return;
+  try {
+    const deleted = await new PostgresTaskStore(db).pruneStaleContexts(TASK_RETENTION_DAYS);
+    if (deleted > 0) {
+      logEvent('a2a_tasks_pruned', { deleted, retentionDays: TASK_RETENTION_DAYS });
+    }
+  } catch (err) {
+    console.error('[server] a2a_tasks retention cleanup failed:', err);
   }
 }
 
@@ -50,13 +69,14 @@ export async function startServer(opts: ServerOptions) {
     registry,
   });
 
-  // Cleanup expired transient rows (device_sessions, used_siwe_nonces) on
-  // startup and periodically.
-  void cleanupExpiredTransients(opts.db);
-  const cleanupTimer = setInterval(
-    () => void cleanupExpiredTransients(opts.db),
-    TRANSIENT_CLEANUP_INTERVAL_MS,
-  );
+  // Cleanup expired transient rows (device_sessions, used_siwe_nonces) and
+  // prune stale a2a_tasks contexts, on startup and periodically.
+  const runCleanup = (): void => {
+    void cleanupExpiredTransients(opts.db);
+    void cleanupStaleTasks(opts.db);
+  };
+  runCleanup();
+  const cleanupTimer = setInterval(runCleanup, TRANSIENT_CLEANUP_INTERVAL_MS);
   cleanupTimer.unref();
 
   console.log(`[server] listening on :${opts.port}`);
