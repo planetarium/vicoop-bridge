@@ -42,7 +42,7 @@ test(
       await seed(sql, { taskId: `${tag}-b2`, contextId: `${tag}-ctxB`, state: 'completed', age: '1 hour' });
 
       const deleted = await store.pruneStaleContexts(30);
-      assert.ok(deleted >= 1, 'at least the idle context A row is deleted');
+      assert.equal(deleted, 1, 'exactly the one idle context A row is deleted');
 
       const surviving = await sql<{ task_id: string }[]>`
         SELECT task_id FROM infra.a2a_tasks WHERE task_id LIKE ${tag + '-%'} ORDER BY task_id
@@ -52,6 +52,31 @@ test(
         [`${tag}-b1`, `${tag}-b2`],
         'idle context A gone; active context B fully retained (old turn included)',
       );
+    } finally {
+      await sql`DELETE FROM infra.a2a_tasks WHERE task_id LIKE ${tag + '-%'}`;
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'pruneStaleContexts spares an idle context that still holds an in-flight task',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const store = new PostgresTaskStore(sql);
+    const tag = `prune-inflight-${Date.now()}`;
+    try {
+      // Old, but non-terminal (working): a legitimately long-running task whose
+      // updated_at is frozen at creation. Must NOT be reaped out from under the
+      // live executor even though the context looks idle by timestamp.
+      await seed(sql, { taskId: `${tag}-1`, contextId: `${tag}-ctx`, state: 'working', age: '40 days' });
+      const deleted = await store.pruneStaleContexts(30);
+      assert.equal(deleted, 0, 'context with an in-flight task is spared');
+      const after = await sql<{ c: number }[]>`
+        SELECT count(*)::int c FROM infra.a2a_tasks WHERE task_id = ${tag + '-1'}
+      `;
+      assert.equal(after[0]!.c, 1);
     } finally {
       await sql`DELETE FROM infra.a2a_tasks WHERE task_id LIKE ${tag + '-%'}`;
       await sql.end();

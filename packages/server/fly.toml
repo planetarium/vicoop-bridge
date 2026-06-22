@@ -15,6 +15,11 @@ primary_region = "nrt"
   # SENTRY_DSN Fly secret (see packages/server/src/instrument.ts).
   SENTRY_ENABLED = "true"
   SENTRY_ENVIRONMENT = "production"
+  # Time-based retention for infra.a2a_tasks (see #385 and
+  # PostgresTaskStore.pruneStaleContexts). Contexts idle longer than this are
+  # reclaimed by the hourly cleanup job; "0" disables it. Complements the
+  # count-based per-context cap in upsert().
+  A2A_TASK_RETENTION_DAYS = "30"
 
 [http_service]
   internal_port = 8787

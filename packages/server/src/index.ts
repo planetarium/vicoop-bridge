@@ -10,9 +10,14 @@ import type { GoogleConfig } from './auth/google-oauth.js';
 const TRANSIENT_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1h
 
 // Time-based retention for infra.a2a_tasks (issue #385). Contexts idle for
-// longer than this are reclaimed whole; 0 (or non-positive) disables the job.
+// longer than this are reclaimed whole; an explicit 0 (or non-positive)
+// disables the job. Unset OR empty-string falls back to the 30-day default
+// (Number('') is 0, so we must treat '' as unset rather than as "disable").
 // Complements the count-based per-context cap in PostgresTaskStore.upsert().
-const TASK_RETENTION_DAYS = Number(process.env.A2A_TASK_RETENTION_DAYS ?? 30);
+const TASK_RETENTION_DAYS =
+  process.env.A2A_TASK_RETENTION_DAYS
+    ? Number(process.env.A2A_TASK_RETENTION_DAYS)
+    : 30;
 
 async function cleanupExpiredTransients(db: Sql): Promise<void> {
   try {
