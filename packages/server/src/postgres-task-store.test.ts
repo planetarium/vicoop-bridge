@@ -46,7 +46,12 @@ test(
 
       // Repeat to give an unserialized read-modify-write ample chance to
       // interleave and clobber. With the FOR UPDATE row lock both writes
-      // always survive, so this is deterministic under the fix.
+      // always survive, so this is deterministic under the fix. Detecting the
+      // *bug* is probabilistic — it relies on the two Promise.all calls
+      // actually interleaving on the connection pool; on a degenerate
+      // single-connection setup that serialized them it could false-pass. In
+      // practice (and as verified by running this against the pre-fix code,
+      // which failed on iteration 1) the pool interleaves reliably.
       for (let i = 0; i < 25; i++) {
         const created = await store.createTask({});
         const taskId = created.id;
@@ -136,22 +141,33 @@ test(
       await ensureSchema(sql);
       const store = new PostgresTaskStore(sql);
 
-      // Seed >MAX_CONTEXT_TASKS terminal tasks so the retention DELETE fires.
-      for (let i = 0; i < 11; i++) {
+      // Seed MAX_CONTEXT_TASKS terminal tasks so the context already sits at
+      // the retention cap before each round.
+      for (let i = 0; i < 10; i++) {
         const seed = await store.createTask({ contextId });
         await store.updateTask(seed.id, { status: ownedTerminalStatus(principalId, `seed-${i}`) });
       }
 
-      // Two fresh tasks in the same context, terminalized concurrently.
-      const a = await store.createTask({ contextId });
-      const b = await store.createTask({ contextId });
+      // Each round introduces TWO fresh tasks and terminalizes them
+      // concurrently. With the context already at the cap, both rounds'
+      // retention DELETEs fire every time (the two new terminal rows push the
+      // count over MAX_CONTEXT_TASKS) — so the lock window that the in-txn
+      // version deadlocked on is exercised on every round, not just the first.
       for (let round = 0; round < 20; round++) {
+        const a = await store.createTask({ contextId });
+        const b = await store.createTask({ contextId });
         const results = await Promise.allSettled([
           store.updateTask(a.id, { status: ownedTerminalStatus(principalId, `a-${round}`) }),
           store.updateTask(b.id, { status: ownedTerminalStatus(principalId, `b-${round}`) }),
         ]);
         for (const r of results) {
-          assert.equal(r.status, 'fulfilled', `round ${round}: updateTask must not throw/deadlock`);
+          assert.equal(
+            r.status,
+            'fulfilled',
+            `round ${round}: updateTask must not throw/deadlock — ${
+              r.status === 'rejected' ? String(r.reason) : ''
+            }`,
+          );
         }
       }
     } finally {

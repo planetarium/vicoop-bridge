@@ -176,10 +176,17 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
 
   // Trim a context's terminal tasks down to MAX_CONTEXT_TASKS. Always runs on
   // the pool connection (never a caller's transaction) so it can't hold a
-  // task-row lock while scanning/deleting sibling rows — see the deadlock note
-  // in updateTask. The DELETE's subquery uses a fixed ORDER BY, so concurrent
-  // retention passes for the same context lock rows in the same order and
-  // wait rather than deadlock. No-op unless the task is terminal and owned.
+  // task-row lock while scanning/deleting sibling rows — that held lock is
+  // what let the old in-transaction version deadlock (see the note in
+  // updateTask), and dropping it removes the cycle entirely. Two concurrent
+  // retention passes for the same context could in principle still contend on
+  // the same victim rows, but the blast radius is tiny: retention only fires
+  // for owned terminal tasks, deletes a short tail beyond the cap, and holds
+  // no other lock — so they serialize on row locks rather than deadlocking in
+  // practice. (Lock-acquisition order across a `DELETE ... WHERE task_id IN
+  // (SELECT ... ORDER BY ...)` is planner-dependent, so this is a
+  // probabilistic argument, not a guarantee — acceptable given the rarity.)
+  // No-op unless the task is terminal and owned.
   private async enforceRetention(task: Task): Promise<void> {
     const ownerPrincipal = extractOwnerPrincipal(task);
     if (!ownerPrincipal || !TERMINAL_STATES.has(task.status.state)) return;
