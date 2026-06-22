@@ -61,7 +61,9 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
       status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
       metadata: params.metadata,
     };
-    await this.upsert(task);
+    await this.writeTask(task);
+    // A freshly-created task is SUBMITTED, never terminal, so retention is a
+    // no-op here — skip it entirely.
     return task;
   }
 
@@ -84,25 +86,38 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     //
     // SELECT ... FOR UPDATE inside a transaction takes a row lock so a
     // concurrent updateTask blocks until this one commits, then reads the
-    // freshly-written row and merges on top of it. Keeps all the existing
-    // JS merge / sanitization / owner-extraction / retention logic intact
-    // (upsert runs on the same transaction connection).
-    return this.sql.begin(async (sql) => {
+    // freshly-written row and merges on top of it. READ COMMITTED (the
+    // default) is sufficient: FOR UPDATE blocks the second SELECT until the
+    // first transaction commits, after which it reads the just-written row —
+    // we don't need REPEATABLE READ because the lock, not snapshot isolation,
+    // is what serializes the two read-modify-writes.
+    const merged = await this.sql.begin(async (sql) => {
       const rows = await sql<{ task_json: Task }[]>`
-        SELECT task_json FROM infra.a2a_tasks WHERE task_id = ${taskId} LIMIT 1 FOR UPDATE
+        SELECT task_json FROM infra.a2a_tasks WHERE task_id = ${taskId} FOR UPDATE
       `;
       const existing = rows[0]?.task_json ?? null;
       if (!existing) {
         throw new Error(`Task not found: ${taskId}`);
       }
-      const merged: Task = { ...existing };
-      if (update.status !== undefined) merged.status = update.status;
-      if (update.artifacts !== undefined) merged.artifacts = update.artifacts;
-      if (update.history !== undefined) merged.history = update.history;
-      if (update.metadata !== undefined) merged.metadata = update.metadata;
-      await this.upsert(merged, sql);
-      return merged;
+      const next: Task = { ...existing };
+      if (update.status !== undefined) next.status = update.status;
+      if (update.artifacts !== undefined) next.artifacts = update.artifacts;
+      if (update.history !== undefined) next.history = update.history;
+      if (update.metadata !== undefined) next.metadata = update.metadata;
+      await this.writeTask(next, sql);
+      return next;
     });
+    // Retention runs AFTER the transaction commits, on the pool connection —
+    // deliberately NOT inside the FOR UPDATE transaction. Two same-context
+    // tasks reaching a terminal state at once would otherwise each hold the
+    // lock on their own row while the retention DELETE tries to remove the
+    // OTHER's row, producing a lock-order cycle: Postgres aborts one and
+    // rolls back its task-state write with it. Running retention post-commit
+    // keeps the state write durable (it has already committed) and confines
+    // the row lock to the single task being updated, so two updateTask calls
+    // can never deadlock each other.
+    await this.enforceRetention(merged);
+    return merged;
   }
 
   async deleteTask(taskId: string): Promise<void> {
@@ -133,10 +148,10 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     return rows.map((r) => r.task_json).reverse();
   }
 
-  // `sql` defaults to the pool connection but callers inside a transaction
-  // (updateTask) pass the transaction-scoped connection so the upsert and
-  // its retention DELETE participate in the same row-locked transaction.
-  private async upsert(task: Task, sql: SqlExecutor = this.sql): Promise<void> {
+  // Write (insert-or-replace) the full task row. `sql` defaults to the pool
+  // connection but updateTask passes its transaction-scoped connection so the
+  // row write participates in the same FOR UPDATE transaction that read it.
+  private async writeTask(task: Task, sql: SqlExecutor = this.sql): Promise<void> {
     const ownerPrincipal = extractOwnerPrincipal(task);
     const sanitized = stripSensitiveMetadata(task);
     const contextId = task.contextId ?? task.id;
@@ -157,21 +172,29 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
         owner_principal = COALESCE(infra.a2a_tasks.owner_principal, EXCLUDED.owner_principal),
         updated_at = now()
     `;
+  }
 
-    // Enforce retention only when this task reaches a terminal state
-    const isTerminal = TERMINAL_STATES.has(task.status.state);
-    if (ownerPrincipal && isTerminal) {
-      await sql`
-        DELETE FROM infra.a2a_tasks
-        WHERE task_id IN (
-          SELECT task_id FROM infra.a2a_tasks
-          WHERE context_id = ${contextId}
-            AND owner_principal = ${ownerPrincipal}
-            AND state IN ('completed', 'failed', 'canceled', 'rejected')
-          ORDER BY created_at DESC, task_id DESC
-          OFFSET ${MAX_CONTEXT_TASKS}
-        )
-      `;
-    }
+  // Trim a context's terminal tasks down to MAX_CONTEXT_TASKS. Always runs on
+  // the pool connection (never a caller's transaction) so it can't hold a
+  // task-row lock while scanning/deleting sibling rows — see the deadlock note
+  // in updateTask. The DELETE's subquery uses a fixed ORDER BY, so concurrent
+  // retention passes for the same context lock rows in the same order and
+  // wait rather than deadlock. No-op unless the task is terminal and owned.
+  private async enforceRetention(task: Task): Promise<void> {
+    const ownerPrincipal = extractOwnerPrincipal(task);
+    if (!ownerPrincipal || !TERMINAL_STATES.has(task.status.state)) return;
+    const contextId = task.contextId ?? task.id;
+
+    await this.sql`
+      DELETE FROM infra.a2a_tasks
+      WHERE task_id IN (
+        SELECT task_id FROM infra.a2a_tasks
+        WHERE context_id = ${contextId}
+          AND owner_principal = ${ownerPrincipal}
+          AND state IN ('completed', 'failed', 'canceled', 'rejected')
+        ORDER BY created_at DESC, task_id DESC
+        OFFSET ${MAX_CONTEXT_TASKS}
+      )
+    `;
   }
 }
