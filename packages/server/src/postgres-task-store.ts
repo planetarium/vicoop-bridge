@@ -7,7 +7,7 @@ import type {
   TaskStore,
 } from '@a2x/sdk';
 import { TaskState, TERMINAL_STATES } from '@a2x/sdk';
-import type { Sql } from './db.js';
+import type { Sql, SqlExecutor } from './db.js';
 
 const MAX_CONTEXT_TASKS = 10;
 
@@ -73,17 +73,36 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   }
 
   async updateTask(taskId: string, update: TaskUpdate): Promise<Task> {
-    const existing = await this.getTask(taskId);
-    if (!existing) {
-      throw new Error(`Task not found: ${taskId}`);
-    }
-    const merged: Task = { ...existing };
-    if (update.status !== undefined) merged.status = update.status;
-    if (update.artifacts !== undefined) merged.artifacts = update.artifacts;
-    if (update.history !== undefined) merged.history = update.history;
-    if (update.metadata !== undefined) merged.metadata = update.metadata;
-    await this.upsert(merged);
-    return merged;
+    // read-modify-write must be serialized per task row. Two concurrent
+    // updateTask calls for the same taskId (e.g. executeStream's terminal
+    // save racing message/cancel's save — separate HTTP requests) would
+    // otherwise both read the same `existing`, each merge only their own
+    // fields, and the later write would clobber the earlier one's changes
+    // (lost update): one writes `status`, the other `history`/`artifacts`,
+    // and only one survives. `ON CONFLICT DO UPDATE` serializes the row
+    // write but not the JS merge spanning the read→write await boundary.
+    //
+    // SELECT ... FOR UPDATE inside a transaction takes a row lock so a
+    // concurrent updateTask blocks until this one commits, then reads the
+    // freshly-written row and merges on top of it. Keeps all the existing
+    // JS merge / sanitization / owner-extraction / retention logic intact
+    // (upsert runs on the same transaction connection).
+    return this.sql.begin(async (sql) => {
+      const rows = await sql<{ task_json: Task }[]>`
+        SELECT task_json FROM infra.a2a_tasks WHERE task_id = ${taskId} LIMIT 1 FOR UPDATE
+      `;
+      const existing = rows[0]?.task_json ?? null;
+      if (!existing) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+      const merged: Task = { ...existing };
+      if (update.status !== undefined) merged.status = update.status;
+      if (update.artifacts !== undefined) merged.artifacts = update.artifacts;
+      if (update.history !== undefined) merged.history = update.history;
+      if (update.metadata !== undefined) merged.metadata = update.metadata;
+      await this.upsert(merged, sql);
+      return merged;
+    });
   }
 
   async deleteTask(taskId: string): Promise<void> {
@@ -114,18 +133,21 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     return rows.map((r) => r.task_json).reverse();
   }
 
-  private async upsert(task: Task): Promise<void> {
+  // `sql` defaults to the pool connection but callers inside a transaction
+  // (updateTask) pass the transaction-scoped connection so the upsert and
+  // its retention DELETE participate in the same row-locked transaction.
+  private async upsert(task: Task, sql: SqlExecutor = this.sql): Promise<void> {
     const ownerPrincipal = extractOwnerPrincipal(task);
     const sanitized = stripSensitiveMetadata(task);
     const contextId = task.contextId ?? task.id;
 
-    await this.sql`
+    await sql`
       INSERT INTO infra.a2a_tasks (task_id, context_id, state, task_json, owner_principal)
       VALUES (
         ${task.id},
         ${contextId},
         ${task.status.state},
-        ${this.sql.json(JSON.parse(JSON.stringify(sanitized)))},
+        ${sql.json(JSON.parse(JSON.stringify(sanitized)))},
         ${ownerPrincipal ?? null}
       )
       ON CONFLICT (task_id) DO UPDATE SET
@@ -139,7 +161,7 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     // Enforce retention only when this task reaches a terminal state
     const isTerminal = TERMINAL_STATES.has(task.status.state);
     if (ownerPrincipal && isTerminal) {
-      await this.sql`
+      await sql`
         DELETE FROM infra.a2a_tasks
         WHERE task_id IN (
           SELECT task_id FROM infra.a2a_tasks
