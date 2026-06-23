@@ -642,15 +642,41 @@ interface CachedSchema {
 }
 
 let cachedSchema: CachedSchema | null = null;
+// In-flight introspection, shared across concurrent first callers so a cold
+// cache triggers exactly one introspection (single-flight). Cleared on settle
+// so a failed introspection can be retried by the next caller.
+let schemaInFlight: Promise<CachedSchema> | null = null;
+// Bumped by invalidateToolCache(). A build captures the generation at start and
+// only adopts its result (and clears its in-flight slot) if the generation is
+// still current — so an invalidation that fires mid-build cannot be undone by
+// the stale build resolving afterwards and writing back into the cache.
+let cacheGeneration = 0;
 
 export function invalidateToolCache(): void {
   cachedSchema = null;
   cachedTools = null;
+  schemaInFlight = null;
+  toolsInFlight = null;
+  cacheGeneration++;
 }
 
-async function getOrBuildSchema(): Promise<CachedSchema> {
-  if (cachedSchema) return cachedSchema;
+function getOrBuildSchema(): Promise<CachedSchema> {
+  if (cachedSchema) return Promise.resolve(cachedSchema);
+  if (!schemaInFlight) {
+    const generation = cacheGeneration;
+    schemaInFlight = buildSchema()
+      .then((schema) => {
+        if (generation === cacheGeneration) cachedSchema = schema;
+        return schema;
+      })
+      .finally(() => {
+        if (generation === cacheGeneration) schemaInFlight = null;
+      });
+  }
+  return schemaInFlight;
+}
 
+async function buildSchema(): Promise<CachedSchema> {
   // 1. Full introspection (only needs to run once — schema is the same for all users)
   const result = await executeGraphQL<{
     __schema: {
@@ -731,11 +757,10 @@ async function getOrBuildSchema(): Promise<CachedSchema> {
   // 5. Generate SDL
   const sdl = generateSDL(queryFields, mutationFields, typeMap);
 
-  cachedSchema = {
+  return {
     queryFields, mutationFields, allQueryNames, allMutationNames,
     typeMap, sdl, queryToolDefs, mutationToolDefs,
   };
-  return cachedSchema;
 }
 
 // ── Main: build tools + SDL ──────────────────────────────────────
@@ -744,13 +769,35 @@ async function getOrBuildSchema(): Promise<CachedSchema> {
 // Tool execute functions read the bearer token from AsyncLocalStorage
 // at execution time, so a single set of tools works for all users.
 let cachedTools: { tools: Record<string, ReturnType<typeof tool>>; sdl: string } | null = null;
+// In-flight tool build, shared across concurrent first callers (single-flight).
+let toolsInFlight: Promise<{
+  tools: Record<string, ReturnType<typeof tool>>;
+  sdl: string;
+}> | null = null;
 
-export async function getSchemaTools(): Promise<{
+export function getSchemaTools(): Promise<{
   tools: Record<string, ReturnType<typeof tool>>;
   sdl: string;
 }> {
-  if (cachedTools) return cachedTools;
+  if (cachedTools) return Promise.resolve(cachedTools);
+  if (!toolsInFlight) {
+    const generation = cacheGeneration;
+    toolsInFlight = buildSchemaTools()
+      .then((built) => {
+        if (generation === cacheGeneration) cachedTools = built;
+        return built;
+      })
+      .finally(() => {
+        if (generation === cacheGeneration) toolsInFlight = null;
+      });
+  }
+  return toolsInFlight;
+}
 
+async function buildSchemaTools(): Promise<{
+  tools: Record<string, ReturnType<typeof tool>>;
+  sdl: string;
+}> {
   const schema = await getOrBuildSchema();
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -863,6 +910,5 @@ export async function getSchemaTools(): Promise<{
     },
   });
 
-  cachedTools = { tools, sdl: schema.sdl };
-  return cachedTools;
+  return { tools, sdl: schema.sdl };
 }
