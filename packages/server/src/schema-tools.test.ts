@@ -98,12 +98,13 @@ test('invalidateToolCache forces a fresh introspection', async (t) => {
 
 test('invalidation mid-build does not resurrect the stale result into the cache', async (t) => {
   invalidateToolCache();
-  // Two distinct schemas so we can tell which build populated the cache. The
-  // first build is invalidated while its fetch is still in flight; when it
-  // resolves it must NOT write its (now stale) result back into cachedTools.
-  // Build #1's fetch is deliberately slow (40ms) so it resolves *after* the
-  // post-invalidation build #2 (5ms). Without the epoch guard, build #1's late
-  // .then would overwrite cachedTools with its stale result — the bug.
+  // Both builds use the same payload; we distinguish them by the object
+  // identity of the tool set each build() returns. Build #1 is invalidated
+  // while its fetch is still in flight; when it resolves it must NOT write its
+  // (now stale) result back into cachedTools. Build #1's fetch is deliberately
+  // slow (40ms) so it resolves *after* the post-invalidation build #2 (5ms).
+  // Without the epoch guard, build #1's late .then would overwrite cachedTools
+  // with its stale result — the bug.
   const { fn, callCount } = deferredFetch(
     () => EMPTY_SCHEMA,
     (i) => (i === 0 ? 40 : 5),
