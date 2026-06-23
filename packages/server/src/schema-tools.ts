@@ -646,24 +646,31 @@ let cachedSchema: CachedSchema | null = null;
 // cache triggers exactly one introspection (single-flight). Cleared on settle
 // so a failed introspection can be retried by the next caller.
 let schemaInFlight: Promise<CachedSchema> | null = null;
+// Bumped by invalidateToolCache(). A build captures the generation at start and
+// only adopts its result (and clears its in-flight slot) if the generation is
+// still current — so an invalidation that fires mid-build cannot be undone by
+// the stale build resolving afterwards and writing back into the cache.
+let cacheGeneration = 0;
 
 export function invalidateToolCache(): void {
   cachedSchema = null;
   cachedTools = null;
   schemaInFlight = null;
   toolsInFlight = null;
+  cacheGeneration++;
 }
 
 function getOrBuildSchema(): Promise<CachedSchema> {
   if (cachedSchema) return Promise.resolve(cachedSchema);
   if (!schemaInFlight) {
+    const generation = cacheGeneration;
     schemaInFlight = buildSchema()
       .then((schema) => {
-        cachedSchema = schema;
+        if (generation === cacheGeneration) cachedSchema = schema;
         return schema;
       })
       .finally(() => {
-        schemaInFlight = null;
+        if (generation === cacheGeneration) schemaInFlight = null;
       });
   }
   return schemaInFlight;
@@ -774,13 +781,14 @@ export function getSchemaTools(): Promise<{
 }> {
   if (cachedTools) return Promise.resolve(cachedTools);
   if (!toolsInFlight) {
+    const generation = cacheGeneration;
     toolsInFlight = buildSchemaTools()
       .then((built) => {
-        cachedTools = built;
+        if (generation === cacheGeneration) cachedTools = built;
         return built;
       })
       .finally(() => {
-        toolsInFlight = null;
+        if (generation === cacheGeneration) toolsInFlight = null;
       });
   }
   return toolsInFlight;

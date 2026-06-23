@@ -29,13 +29,17 @@ function jsonResponse(payload: unknown) {
   };
 }
 
-// Mock fetch so the introspection round-trip resolves on the next tick,
-// guaranteeing concurrent callers overlap on the in-flight promise.
-function deferredFetch(payloadFor: (callIndex: number) => unknown) {
+// Mock fetch so the introspection round-trip resolves after a delay,
+// guaranteeing concurrent callers overlap on the in-flight promise. The delay
+// can vary per call so a test can control which build resolves last.
+function deferredFetch(
+  payloadFor: (callIndex: number) => unknown,
+  delayFor: (callIndex: number) => number = () => 5,
+) {
   let calls = 0;
   const fn = async () => {
     const index = calls++;
-    await new Promise((r) => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, delayFor(index)));
     return jsonResponse(payloadFor(index)) as unknown as Response;
   };
   return { fn, callCount: () => calls };
@@ -46,13 +50,19 @@ test('concurrent first calls trigger exactly one introspection (single-flight)',
   const { fn, callCount } = deferredFetch(() => EMPTY_SCHEMA);
   t.mock.method(globalThis, 'fetch', fn);
 
-  const results = await Promise.all([
+  // Issue the calls synchronously so they race on the cold cache, and keep the
+  // returned promises so we can assert they are the *same* in-flight promise
+  // (true single-flight, not just "second caller read a warm cache").
+  const pending = [
     getSchemaTools(),
     getSchemaTools(),
     getSchemaTools(),
     getSchemaTools(),
     getSchemaTools(),
-  ]);
+  ];
+  for (const p of pending) assert.equal(p, pending[0], 'concurrent callers share one in-flight promise');
+
+  const results = await Promise.all(pending);
 
   assert.equal(callCount(), 1, 'introspection should run once across concurrent callers');
   // All callers observe the same cached object identity.
@@ -82,6 +92,38 @@ test('invalidateToolCache forces a fresh introspection', async (t) => {
   const second = await getSchemaTools();
   assert.equal(callCount(), 2, 'invalidation should drop the cache and re-introspect');
   assert.notEqual(second, first, 'a rebuilt tool set is a new object');
+
+  invalidateToolCache();
+});
+
+test('invalidation mid-build does not resurrect the stale result into the cache', async (t) => {
+  invalidateToolCache();
+  // Two distinct schemas so we can tell which build populated the cache. The
+  // first build is invalidated while its fetch is still in flight; when it
+  // resolves it must NOT write its (now stale) result back into cachedTools.
+  // Build #1's fetch is deliberately slow (40ms) so it resolves *after* the
+  // post-invalidation build #2 (5ms). Without the epoch guard, build #1's late
+  // .then would overwrite cachedTools with its stale result — the bug.
+  const { fn, callCount } = deferredFetch(
+    () => EMPTY_SCHEMA,
+    (i) => (i === 0 ? 40 : 5),
+  );
+  t.mock.method(globalThis, 'fetch', fn);
+
+  // Start build #1 (captures generation 0) but don't await it yet.
+  const stalePromise = getSchemaTools();
+  // Invalidate while build #1 is parked on its slow fetch → bumps generation.
+  invalidateToolCache();
+  // Build #2 starts fresh under the new generation.
+  const fresh = await getSchemaTools();
+  // Drain build #1 so its .then runs; under the epoch guard it must be a no-op.
+  await stalePromise;
+
+  assert.equal(callCount(), 2, 'invalidation mid-build forces a second introspection');
+  // The warm cache must reflect build #2, not the resurrected build #1.
+  const afterDrain = await getSchemaTools();
+  assert.equal(afterDrain, fresh, 'cache holds the fresh build, not the stale resurrected one');
+  assert.equal(callCount(), 2, 'reading the warm cache after drain must not re-introspect');
 
   invalidateToolCache();
 });
