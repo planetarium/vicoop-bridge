@@ -537,6 +537,12 @@ function serializeHistoryEntries(entries: OpenAICompatHistoryEntry[]): string {
 // reproduces `formatChatHistory(history)` byte-for-byte
 // (`serialize(a) + ",\n" + serialize(b) == serialize(a ++ b)`), so the rendered
 // text the model reads is unchanged.
+//
+// Scope: this optimizes the pure-append case (one or a few exchanges per turn).
+// A turn that appends > ~20 segments at once (frozenCount jumps > 20*step) pushes
+// the prior boundary past the 20-block lookback window, and editing a past entry
+// changes that segment's hash and every later one — both fall back to recreating
+// the full prefix (the old cost), never to incorrect output.
 export function formatChatHistoryBlocks(
   history: OpenAICompatHistoryEntry[],
   opts: { split?: boolean; minFrozenChars?: number; stepEntries?: number } = {},

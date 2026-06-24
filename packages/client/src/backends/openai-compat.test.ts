@@ -562,6 +562,56 @@ test('formatChatHistoryBlocks: <=2 entries never splits even when split=true', (
   assert.equal(blocks[0]!.cache, false);
 });
 
+test('formatChatHistoryBlocks: byte-identical at non-multiple-of-step lengths (varying tail)', () => {
+  // frozenCount = floor((len-2)/step)*step, so the tail size varies with len.
+  // Exercise lengths whose tail is 1..(2*step) to pin the head/separator/closing
+  // bytes at a partial tail boundary — not just the clean bigHistory()=60 case.
+  for (let n = 26; n <= 32; n++) {
+    const h = bigHistory(n); // 52..64 entries
+    const odd = [...h, { role: 'user' as const, content: 'tail-only ' + 'z'.repeat(40) }]; // make length odd too
+    for (const hist of [h, odd]) {
+      const blocks = formatChatHistoryBlocks(hist, { split: true });
+      assert.equal(
+        blocks.map((b) => b.text).join(''),
+        formatChatHistory(hist),
+        `byte-identity must hold at ${hist.length} entries`,
+      );
+      assert.equal(blocks.filter((b) => b.cache).length, 1, `one breakpoint at ${hist.length} entries`);
+    }
+  }
+});
+
+test('formatChatHistoryBlocks: single frozen segment (frozenCount == step) carries the breakpoint', () => {
+  // Entries large enough that 10 frozen entries alone clear the cache floor, so
+  // the frozen prefix is exactly ONE segment — the edge where seg0 is both first
+  // and last and must still be the (only) cache_control block.
+  const filler = 'q'.repeat(1700); // ~1.7k chars/entry → 10 entries > MIN_CACHEABLE_FROZEN_CHARS
+  const h: OpenAICompatHistoryEntry[] = [];
+  for (let i = 0; i < 7; i++) {
+    h.push({ role: 'user', content: `u${i} ${filler}` });
+    h.push({ role: 'assistant', content: `a${i} ${filler}` }); // 14 entries → frozenCount floor(12/10)*10 = 10
+  }
+  const blocks = formatChatHistoryBlocks(h, { split: true });
+  assert.equal(blocks.length, 2); // single frozen segment + tail
+  assert.equal(blocks[0]!.cache, true);
+  assert.equal(blocks[1]!.cache, false);
+  assert.match(blocks[0]!.text, /^<chat_history>\n\[\n/);
+  assert.match(blocks[1]!.text, /\n<\/chat_history>$/);
+  assert.equal(blocks.map((b) => b.text).join(''), formatChatHistory(h));
+});
+
+test('formatChatHistoryBlocks: exactly one breakpoint and byte-identity at large depth (21 segments)', () => {
+  // The 4-breakpoint budget is the whole point: regardless of segment count, only
+  // the last frozen segment may carry cache_control (claude's system+tools+1 + 1).
+  const h = bigHistory(110); // 220 entries → frozenCount floor(218/10)*10 = 210 → 21 frozen segments
+  const blocks = formatChatHistoryBlocks(h, { split: true });
+  assert.ok(blocks.length >= 22, 'many fixed segments + tail');
+  assert.equal(blocks.filter((b) => b.cache).length, 1);
+  assert.equal(blocks.at(-2)!.cache, true); // breakpoint on the last frozen segment
+  assert.equal(blocks.at(-1)!.cache, false); // tail uncached
+  assert.equal(blocks.map((b) => b.text).join(''), formatChatHistory(h));
+});
+
 // ───────────────────────────────────────────────────────────────────────────
 // requalifyHistoryToolNames — rename caller-tool references in replayed
 // history to a backend's live tool ids (claude native MCP dispatch, #213).
