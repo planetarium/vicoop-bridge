@@ -53,6 +53,13 @@ export class AsyncEventQueue<T> {
       }
       if (this.failure) throw this.failure.error;
       if (this.closed) return;
+      // Cleared once the awaited promise settles so the per-iteration
+      // abort listener is removed on the normal (push/close) path too —
+      // `{ once: true }` only self-removes when abort actually fires, so
+      // without this every buffered event would leave a dangling listener
+      // on the (task-lived) signal, leaking closures and accumulating a
+      // listener storm that all fires synchronously on eventual abort.
+      let cleanupAbort: (() => void) | undefined;
       const result = await new Promise<IteratorResult<T> | { error: unknown }>((resolve) => {
         this.waiter = resolve;
         if (signal) {
@@ -63,9 +70,13 @@ export class AsyncEventQueue<T> {
             }
           };
           if (signal.aborted) onAbort();
-          else signal.addEventListener('abort', onAbort, { once: true });
+          else {
+            signal.addEventListener('abort', onAbort, { once: true });
+            cleanupAbort = () => signal.removeEventListener('abort', onAbort);
+          }
         }
       });
+      cleanupAbort?.();
       if ('error' in result) throw result.error;
       if (result.done) return;
       yield result.value;
