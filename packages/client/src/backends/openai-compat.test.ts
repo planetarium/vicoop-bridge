@@ -480,47 +480,61 @@ test('formatChatHistoryBlocks: split concatenates byte-identically to the single
   // breakpoints, the rendered text it reads is exactly formatChatHistory().
   const h = bigHistory();
   const blocks = formatChatHistoryBlocks(h, { split: true });
-  assert.equal(blocks.length, 2);
+  assert.ok(blocks.length > 2, 'frozen prefix splits into fixed segments + tail');
   assert.equal(blocks.map((b) => b.text).join(''), formatChatHistory(h));
+  // Exactly one cache_control breakpoint (the last frozen segment) -> fits the
+  // 4-block budget alongside claude's own system+tools+1.
+  assert.equal(blocks.filter((b) => b.cache).length, 1);
 });
 
-test('formatChatHistoryBlocks: split marks only the frozen prefix for caching', () => {
-  const h = bigHistory(); // 60 entries → frozen rounds to 50, tail = last 10
-  const [frozen, tail] = formatChatHistoryBlocks(h, { split: true });
-  assert.equal(frozen!.cache, true);
-  assert.equal(tail!.cache, false);
-  assert.match(frozen!.text, /^<chat_history>\n\[\n/);
+test('formatChatHistoryBlocks: split marks only the last frozen segment; tail holds recent turns', () => {
+  const h = bigHistory(); // 60 entries → frozenCount 50, tail = last 10
+  const blocks = formatChatHistoryBlocks(h, { split: true });
+  const tail = blocks.at(-1)!;
+  const frozenSegs = blocks.slice(0, -1);
+  // One breakpoint, on the last frozen segment (not the tail).
+  assert.equal(blocks.filter((b) => b.cache).length, 1);
+  assert.equal(frozenSegs.at(-1)!.cache, true);
+  assert.equal(tail.cache, false);
+  assert.match(blocks[0]!.text, /^<chat_history>\n\[\n/);
   // The most recent turns (incl. the last exchange) live in the uncached tail,
-  // so the frozen prefix can stay byte-stable across turns.
-  assert.ok(!frozen!.text.includes('"content": "q29'), 'last user turn must be in the tail');
-  assert.ok(!frozen!.text.includes('"content": "a29'), 'last assistant turn must be in the tail');
-  assert.ok(tail!.text.includes('q29'));
-  assert.ok(tail!.text.includes('a29'));
-  assert.match(tail!.text, /\n<\/chat_history>$/);
+  // so the frozen segments stay byte-stable across turns.
+  const frozenText = frozenSegs.map((b) => b.text).join('');
+  assert.ok(!frozenText.includes('"content": "q29'), 'last user turn must be in the tail');
+  assert.ok(!frozenText.includes('"content": "a29'), 'last assistant turn must be in the tail');
+  assert.ok(tail.text.includes('q29'));
+  assert.ok(tail.text.includes('a29'));
+  assert.match(tail.text, /\n<\/chat_history>$/);
 });
 
-test('formatChatHistoryBlocks: frozen block is byte-identical as the conversation grows within a step', () => {
+test('formatChatHistoryBlocks: frozen segments are byte-identical as the conversation grows within a step', () => {
   // The property the cache *read* depends on: appending turns must not change
-  // the frozen block until the quantized boundary rolls over. Two histories one
-  // exchange apart (same FREEZE_STEP window) must produce the identical frozen
-  // text — otherwise next turn's breakpoint never matches and nothing caches.
+  // any frozen segment (incl. the breakpoint segment) until the quantized
+  // boundary rolls over — otherwise next turn's lookback never matches.
   const base = bigHistory(28); // 56 entries → frozenCount floor(54/10)*10 = 50
   const grown = [...base, { role: 'user' as const, content: 'next q' }, { role: 'assistant' as const, content: 'next a' }]; // 58 → floor(56/10)*10 = 50
-  const [f1] = formatChatHistoryBlocks(base, { split: true });
-  const [f2] = formatChatHistoryBlocks(grown, { split: true });
-  assert.equal(f1!.cache, true);
-  assert.equal(f2!.cache, true);
-  assert.equal(f1!.text, f2!.text); // identical frozen block → cacheable across turns
+  const b1 = formatChatHistoryBlocks(base, { split: true });
+  const b2 = formatChatHistoryBlocks(grown, { split: true });
+  // Same frozenCount → identical frozen segments (everything but the tail).
+  assert.deepEqual(b1.slice(0, -1).map((b) => b.text), b2.slice(0, -1).map((b) => b.text));
+  // One breakpoint each, byte-identical across the within-step turn.
+  assert.equal(b1.find((b) => b.cache)!.text, b2.find((b) => b.cache)!.text);
 });
 
-test('formatChatHistoryBlocks: frozen boundary advances only on step rollover', () => {
-  const a = bigHistory(); // 60 entries → frozenCount 50
-  const b = bigHistory(35); // 70 entries → frozenCount floor(68/10)*10 = 60
-  const [fa] = formatChatHistoryBlocks(a, { split: true });
-  const [fb] = formatChatHistoryBlocks(b, { split: true });
-  // Different windows → different (longer) frozen prefix.
-  assert.notEqual(fa!.text, fb!.text);
-  assert.ok(fb!.text.length > fa!.text.length);
+test('formatChatHistoryBlocks: frozen prefix advances by one segment on step rollover', () => {
+  const a = bigHistory(); // 60 entries → frozenCount 50 (5 frozen segments + tail)
+  const b = bigHistory(35); // 70 entries → frozenCount floor(68/10)*10 = 60 (6 + tail)
+  const ba = formatChatHistoryBlocks(a, { split: true });
+  const bb = formatChatHistoryBlocks(b, { split: true });
+  // One more frozen segment after rollover; the shared earlier segments stay
+  // byte-identical so the rollover lookback finds the prior entry one block back.
+  assert.equal(bb.length, ba.length + 1);
+  assert.deepEqual(
+    ba.slice(0, -1).map((s) => s.text),
+    bb.slice(0, ba.length - 1).map((s) => s.text),
+  );
+  // The breakpoint advanced to a new, longer prefix.
+  assert.notEqual(ba.find((s) => s.cache)!.text, bb.find((s) => s.cache)!.text);
 });
 
 test('formatChatHistoryBlocks: frozen prefix below threshold falls back to one block', () => {
@@ -546,6 +560,56 @@ test('formatChatHistoryBlocks: <=2 entries never splits even when split=true', (
   const blocks = formatChatHistoryBlocks(h, { split: true });
   assert.equal(blocks.length, 1);
   assert.equal(blocks[0]!.cache, false);
+});
+
+test('formatChatHistoryBlocks: byte-identical at non-multiple-of-step lengths (varying tail)', () => {
+  // frozenCount = floor((len-2)/step)*step, so the tail size varies with len.
+  // Exercise lengths whose tail is 1..(2*step) to pin the head/separator/closing
+  // bytes at a partial tail boundary — not just the clean bigHistory()=60 case.
+  for (let n = 26; n <= 32; n++) {
+    const h = bigHistory(n); // 52..64 entries
+    const odd = [...h, { role: 'user' as const, content: 'tail-only ' + 'z'.repeat(40) }]; // make length odd too
+    for (const hist of [h, odd]) {
+      const blocks = formatChatHistoryBlocks(hist, { split: true });
+      assert.equal(
+        blocks.map((b) => b.text).join(''),
+        formatChatHistory(hist),
+        `byte-identity must hold at ${hist.length} entries`,
+      );
+      assert.equal(blocks.filter((b) => b.cache).length, 1, `one breakpoint at ${hist.length} entries`);
+    }
+  }
+});
+
+test('formatChatHistoryBlocks: single frozen segment (frozenCount == step) carries the breakpoint', () => {
+  // Entries large enough that 10 frozen entries alone clear the cache floor, so
+  // the frozen prefix is exactly ONE segment — the edge where seg0 is both first
+  // and last and must still be the (only) cache_control block.
+  const filler = 'q'.repeat(1700); // ~1.7k chars/entry → 10 entries > MIN_CACHEABLE_FROZEN_CHARS
+  const h: OpenAICompatHistoryEntry[] = [];
+  for (let i = 0; i < 7; i++) {
+    h.push({ role: 'user', content: `u${i} ${filler}` });
+    h.push({ role: 'assistant', content: `a${i} ${filler}` }); // 14 entries → frozenCount floor(12/10)*10 = 10
+  }
+  const blocks = formatChatHistoryBlocks(h, { split: true });
+  assert.equal(blocks.length, 2); // single frozen segment + tail
+  assert.equal(blocks[0]!.cache, true);
+  assert.equal(blocks[1]!.cache, false);
+  assert.match(blocks[0]!.text, /^<chat_history>\n\[\n/);
+  assert.match(blocks[1]!.text, /\n<\/chat_history>$/);
+  assert.equal(blocks.map((b) => b.text).join(''), formatChatHistory(h));
+});
+
+test('formatChatHistoryBlocks: exactly one breakpoint and byte-identity at large depth (21 segments)', () => {
+  // The 4-breakpoint budget is the whole point: regardless of segment count, only
+  // the last frozen segment may carry cache_control (claude's system+tools+1 + 1).
+  const h = bigHistory(110); // 220 entries → frozenCount floor(218/10)*10 = 210 → 21 frozen segments
+  const blocks = formatChatHistoryBlocks(h, { split: true });
+  assert.ok(blocks.length >= 22, 'many fixed segments + tail');
+  assert.equal(blocks.filter((b) => b.cache).length, 1);
+  assert.equal(blocks.at(-2)!.cache, true); // breakpoint on the last frozen segment
+  assert.equal(blocks.at(-1)!.cache, false); // tail uncached
+  assert.equal(blocks.map((b) => b.text).join(''), formatChatHistory(h));
 });
 
 // ───────────────────────────────────────────────────────────────────────────

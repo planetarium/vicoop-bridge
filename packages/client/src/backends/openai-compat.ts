@@ -508,20 +508,41 @@ function serializeHistoryEntries(entries: OpenAICompatHistoryEntry[]): string {
     .join(',\n');
 }
 
-// Split the `<chat_history>` block so the stable prefix can carry its own
-// prompt-cache breakpoint, instead of one blob that grows (and so re-bills at
-// full price) every turn.
+// Split the `<chat_history>` block into fixed, append-only segments so a
+// growing conversation reads its prefix from cache and re-creates only the new
+// turn — instead of re-billing the whole history on every forward turn.
 //
 // `split: false` (default) returns the legacy single block — byte-identical to
-// `formatChatHistory`. With `split: true` we freeze a prefix of the history and
-// give it its own `cache_control` breakpoint. The freeze boundary is the last
-// exchange dropped, then quantized down to a multiple of `FREEZE_STEP_ENTRIES`
-// (see that const): that quantization is what makes the frozen block recur
-// byte-for-byte across consecutive turns so the cache actually *reads* it,
-// rather than shifting every turn. The frozen piece is emitted only when it
-// clears `MIN_CACHEABLE_FROZEN_CHARS`; otherwise we fall back to the single
-// unmarked block. The split is purely about breakpoint placement — the rendered
+// `formatChatHistory`. With `split: true` we serialize the frozen prefix as one
+// block per `FREEZE_STEP_ENTRIES` entries, with boundaries at *absolute*
+// multiples of the step so they never re-flow as the history grows. Only the
+// LAST complete segment carries a `cache_control` breakpoint: that single
+// breakpoint writes one cache entry for the whole frozen prefix and fits
+// alongside claude's own system+tools+1 within Anthropic's 4-breakpoint budget.
+//
+// Why segments and not one growing frozen block: the cache matches at *block
+// boundaries* via prefix-hash, and reads walk back up to 20 blocks looking for a
+// prior entry. A single frozen block has no boundary at the previous turn's
+// freeze point, so when it grows the block's bytes change and the lookback only
+// re-matches at the stable system+tools boundary → the entire history is
+// re-created every turn (measured: rollover cache_read collapses to system+tools
+// only). Fixed segments keep the previous turn's boundary as a byte-stable block
+// edge one step back, so the rollover turn's lookback finds the prior entry and
+// reads the whole prefix, re-creating only the new segment + tail. This is what
+// the rolling-anchor approach was reaching for, without spending a 5th
+// breakpoint (reads use the lookback, not an explicit anchor).
+//
+// Emitted only when the frozen prefix clears `MIN_CACHEABLE_FROZEN_CHARS`;
+// otherwise we fall back to the single unmarked block. Concatenating every piece
+// reproduces `formatChatHistory(history)` byte-for-byte
+// (`serialize(a) + ",\n" + serialize(b) == serialize(a ++ b)`), so the rendered
 // text the model reads is unchanged.
+//
+// Scope: this optimizes the pure-append case (one or a few exchanges per turn).
+// A turn that appends > ~20 segments at once (frozenCount jumps > 20*step) pushes
+// the prior boundary past the 20-block lookback window, and editing a past entry
+// changes that segment's hash and every later one — both fall back to recreating
+// the full prefix (the old cost), never to incorrect output.
 export function formatChatHistoryBlocks(
   history: OpenAICompatHistoryEntry[],
   opts: { split?: boolean; minFrozenChars?: number; stepEntries?: number } = {},
@@ -539,16 +560,31 @@ export function formatChatHistoryBlocks(
   const frozenCount = Math.floor((history.length - 2) / step) * step;
   if (frozenCount < 1) return single();
 
-  const frozen = history.slice(0, frozenCount);
-  const tail = history.slice(frozenCount);
-  const frozenText = '<chat_history>\n[\n' + serializeHistoryEntries(frozen);
+  // Min-cacheable guard on the *whole* frozen prefix — the `cache_control` sits
+  // on the last segment, whose cached prefix is everything up to `frozenCount`.
+  const frozenText = '<chat_history>\n[\n' + serializeHistoryEntries(history.slice(0, frozenCount));
   if (frozenText.length < (opts.minFrozenChars ?? MIN_CACHEABLE_FROZEN_CHARS)) {
     return single();
   }
-  return [
-    { text: frozenText, cache: true },
-    { text: ',\n' + serializeHistoryEntries(tail) + '\n]\n</chat_history>', cache: false },
-  ];
+
+  // One block per `step` entries at absolute boundaries; cache_control only on
+  // the last complete segment (single breakpoint). Older segment boundaries stay
+  // byte-stable across turns, so the rollover read-lookback finds the prior
+  // turn's entry one block back and only the new segment + tail re-creates.
+  const blocks: ChatHistoryBlock[] = [];
+  for (let start = 0; start < frozenCount; start += step) {
+    const end = Math.min(start + step, frozenCount);
+    const head = start === 0 ? '<chat_history>\n[\n' : ',\n';
+    blocks.push({
+      text: head + serializeHistoryEntries(history.slice(start, end)),
+      cache: end >= frozenCount,
+    });
+  }
+  blocks.push({
+    text: ',\n' + serializeHistoryEntries(history.slice(frozenCount)) + '\n]\n</chat_history>',
+    cache: false,
+  });
+  return blocks;
 }
 
 // Return a copy of `history` with every caller-tool reference renamed via

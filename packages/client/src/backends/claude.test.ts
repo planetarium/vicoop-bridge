@@ -3429,15 +3429,22 @@ test('history-cache (default ON): frozen prefix split out with a 1h cache_contro
     NEVER,
   );
   const env = stdinEnvelope(fake.lastChild()!);
-  const [frozen, tail, live] = env.message.content;
-  // Frozen prefix carries the breakpoint; tail and live prompt do not.
-  assert.deepEqual(frozen!.cache_control, { type: 'ephemeral', ttl: '1h' });
-  assert.match(frozen!.text ?? '', /^<chat_history>\n\[\n/);
-  assert.equal(tail!.cache_control, undefined);
-  assert.match(tail!.text ?? '', /<\/chat_history>$/);
-  assert.equal(live!.text, 'go');
-  // The two history pieces re-concatenate to one valid <chat_history> block.
-  const joined = (frozen!.text ?? '') + (tail!.text ?? '');
+  const content = env.message.content;
+  const live = content.at(-1)!;
+  const historyBlocks = content.slice(0, -1); // [...frozen segments, tail]
+  const tail = historyBlocks.at(-1)!;
+  // Exactly one breakpoint, on the LAST frozen segment (not seg0, the tail, or
+  // the live prompt) — so it fits alongside claude's system+tools+1.
+  const cached = content.filter((b) => b.cache_control);
+  assert.equal(cached.length, 1);
+  assert.deepEqual(cached[0]!.cache_control, { type: 'ephemeral', ttl: '1h' });
+  assert.equal(historyBlocks.at(-2), cached[0]); // last frozen segment carries it
+  assert.match(content[0]!.text ?? '', /^<chat_history>\n\[\n/);
+  assert.equal(tail.cache_control, undefined);
+  assert.match(tail.text ?? '', /<\/chat_history>$/);
+  assert.equal(live.text, 'go');
+  // The history pieces re-concatenate to one valid <chat_history> block.
+  const joined = historyBlocks.map((b) => b.text ?? '').join('');
   assert.match(joined, /^<chat_history>\n\[\n/);
   assert.match(joined, /\n\]\n<\/chat_history>$/);
 });
@@ -3499,7 +3506,10 @@ test('history-cache latch: a cache_control 400 disables the split for later task
     NEVER,
   );
   const env1 = stdinEnvelope(fake.lastChild()!);
-  assert.deepEqual(env1.message.content[0].cache_control, { type: 'ephemeral', ttl: '1h' });
+  // Turn 1 used the split: exactly one frozen segment carries the breakpoint.
+  const cached1 = env1.message.content.filter((b) => b.cache_control);
+  assert.equal(cached1.length, 1);
+  assert.deepEqual(cached1[0].cache_control, { type: 'ephemeral', ttl: '1h' });
 
   // Turn 2: latch is set → single unsplit block, no cache_control.
   await backend.handle(
