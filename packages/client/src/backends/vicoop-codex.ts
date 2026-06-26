@@ -748,6 +748,12 @@ interface ChatCompletionChunk {
     finish_reason?: string | null;
   }>;
   usage?: ChatCompletionResponse['usage'];
+  // In-band error frame. `vicoop-codex serve` relays an upstream `/responses`
+  // error (e.g. "input exceeds the context window") as `{"error":{...}}` on an
+  // otherwise-200 SSE stream. It carries no `choices`, so without explicit
+  // handling the accumulator drops it and the turn synthesizes an empty
+  // `finish_reason:"stop"` completion — a silent empty answer.
+  error?: { message?: string; type?: string; code?: string | null } | null;
 }
 
 // Per-index tool-call assembly buffer. OpenAI streams a tool call's
@@ -892,8 +898,13 @@ async function streamChatCompletions(
   }
 
   const acc: StreamAccumulator = { content: '', toolCalls: new Map() };
-  // Process one `data:` payload; returns true when the stream's `[DONE]`
-  // sentinel is seen so the reader can stop.
+  // Set when an in-band `{"error":{...}}` frame is seen. Thrown after the read
+  // loop (NOT from inside `consume`, whose throws are caught and re-wrapped as
+  // a generic "stream interrupted" transport error below — that would mask the
+  // upstream message and a2a code).
+  let streamError: ServeRequestError | null = null;
+  // Process one `data:` payload; returns true when the stream should stop —
+  // the `[DONE]` sentinel or a terminal error frame.
   const consume = (data: string): boolean => {
     if (data === '[DONE]') return true;
     let chunk: ChatCompletionChunk;
@@ -903,6 +914,18 @@ async function streamChatCompletions(
       // Defensive: OpenAI guarantees valid JSON per data line, but a stray
       // keep-alive / comment shouldn't abort the turn — skip it.
       return false;
+    }
+    // In-band error frame (200 stream): surface it as a task failure carrying
+    // the upstream message instead of dropping it and completing empty. This is
+    // the path the oversized-context "input exceeds the context window" error
+    // takes — serve relays it here, and it has no `choices` for applyChunk.
+    if (chunk.error && typeof chunk.error === 'object') {
+      const msg =
+        typeof chunk.error.message === 'string' && chunk.error.message.length > 0
+          ? chunk.error.message
+          : 'vicoop-codex serve reported an upstream error with no message';
+      streamError = new ServeRequestError('upstream_error', `vicoop-codex serve stream error: ${msg}`);
+      return true; // terminal — stop reading
     }
     applyChunk(acc, chunk, onContentDelta, onReasoningDelta);
     return false;
@@ -943,6 +966,11 @@ async function streamChatCompletions(
       `vicoop-codex serve stream interrupted: ${errorMessage(err)}`,
     );
   }
+
+  // A terminal error frame outranks whatever (empty) content accumulated —
+  // thrown here, outside the transport catch, so its message and a2a code
+  // survive to the handler's `task.fail` instead of a silent empty completion.
+  if (streamError) throw streamError;
 
   return synthesizeStreamedResponse(acc);
 }
