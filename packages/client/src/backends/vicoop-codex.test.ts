@@ -1219,12 +1219,14 @@ test('handle: non-2xx from serve → task.fail upstream_error', async () => {
   assert.ok(failFrame.error.message.includes('overloaded'));
 });
 
-test('handle: in-band error frame (200 stream) → task.fail upstream_error, not empty complete', async () => {
+test('handle: in-band context-window error frame → task.fail context_length_exceeded, not empty complete', async () => {
   // `vicoop-codex serve` relays an upstream `/responses` error (e.g. an
   // oversized context) as `{"error":{...}}` on a 200 SSE stream. The frame has
   // no `choices`, so before the fix it was dropped and the turn synthesized an
   // empty `finish_reason:"stop"` completion (the silent "Response Generated"
-  // with no body). It must now fail the task carrying the upstream message.
+  // with no body). It must now fail the task carrying the upstream message AND,
+  // for a context overflow, tag it with the standard `context_length_exceeded`
+  // code so OpenAI-SDK callers can compact-and-retry.
   const sse = sseStream([
     { id: 'chatcmpl-x', object: 'chat.completion.chunk', model: 'gpt-5.5', choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] },
     { error: { message: 'Your input exceeds the context window of this model. Please adjust your input and try again.', type: 'api_error', code: null } },
@@ -1237,8 +1239,24 @@ test('handle: in-band error frame (200 stream) → task.fail upstream_error, not
   assert.equal(fails.length, 1);
   const failFrame = fails[0];
   if (failFrame.type !== 'task.fail') throw new Error('unreachable');
-  assert.equal(failFrame.error.code, 'upstream_error');
+  assert.equal(failFrame.error.code, 'context_length_exceeded');
   assert.ok(failFrame.error.message.includes('context window'));
+});
+
+test('handle: a NON-context in-band error frame stays upstream_error', async () => {
+  const sse = sseStream([
+    { id: 'chatcmpl-y', object: 'chat.completion.chunk', model: 'gpt-5.5', choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] },
+    { error: { message: 'The model is overloaded. Please try again later.', type: 'api_error', code: null } },
+  ]);
+  const frames = await runStreaming(makeTask(), makeSseFetch(sse));
+
+  assert.equal(frames.filter((f) => f.type === 'task.complete').length, 0);
+  const fails = frames.filter((f) => f.type === 'task.fail');
+  assert.equal(fails.length, 1);
+  const failFrame = fails[0];
+  if (failFrame.type !== 'task.fail') throw new Error('unreachable');
+  assert.equal(failFrame.error.code, 'upstream_error');
+  assert.ok(failFrame.error.message.includes('overloaded'));
 });
 
 test('handle: serve is a shared singleton — two tasks reuse one server', async () => {

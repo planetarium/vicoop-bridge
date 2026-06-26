@@ -709,6 +709,24 @@ export function parseServeListeningUrl(line: string): string | null {
   return null;
 }
 
+// Recognise an upstream "input exceeds the context window" failure from its
+// message text, so it can be tagged with the standard `context_length_exceeded`
+// code rather than a generic `upstream_error`. The vicoop-codex backend
+// (ChatGPT Codex) returns this as a plain message with no machine code, so a
+// text match is the only signal. Patterns mirror the ones OpenAI-SDK agents
+// (e.g. opencode's `isContextOverflow`) use to detect the same condition.
+const CONTEXT_OVERFLOW_PATTERNS = [
+  /exceeds the context window/i,
+  /context[_ ]length[_ ]exceeded/i,
+  /maximum context length is \d+/i,
+  /reduce the length of the messages/i,
+  /prompt is too long/i,
+  /input is too long/i,
+];
+function isContextOverflowMessage(message: string): boolean {
+  return CONTEXT_OVERFLOW_PATTERNS.some((re) => re.test(message));
+}
+
 // A typed error carrying the A2A `task.fail` code the streaming layer wants
 // the handler to surface, so HTTP/transport failures map cleanly without the
 // handler re-inspecting error shapes.
@@ -924,7 +942,15 @@ async function streamChatCompletions(
         typeof chunk.error.message === 'string' && chunk.error.message.length > 0
           ? chunk.error.message
           : 'vicoop-codex serve reported an upstream error with no message';
-      streamError = new ServeRequestError('upstream_error', `vicoop-codex serve stream error: ${msg}`);
+      // Classify a context-window overflow into the standard OpenAI error code
+      // `context_length_exceeded`. The codec passes this terminal code through
+      // verbatim into the OpenAI error envelope, so OpenAI-SDK callers (and
+      // agents like opencode) can recognise it as a context overflow and react
+      // — e.g. compact the conversation and retry — instead of treating it as a
+      // generic, unrecoverable upstream failure. Any other in-band error stays
+      // `upstream_error`.
+      const code = isContextOverflowMessage(msg) ? 'context_length_exceeded' : 'upstream_error';
+      streamError = new ServeRequestError(code, `vicoop-codex serve stream error: ${msg}`);
       return true; // terminal — stop reading
     }
     applyChunk(acc, chunk, onContentDelta, onReasoningDelta);
