@@ -70,7 +70,9 @@ function isQuotaExceeded(text: string): boolean {
     /\bquota\b/.test(text) ||
     text.includes('insufficient_quota') ||
     text.includes('exceeded your current quota') ||
-    text.includes('usage limit')
+    text.includes('usage limit') ||
+    // Claude subscription cap: "You've hit your session limit · resets 3pm (UTC)".
+    text.includes('session limit')
   );
 }
 
@@ -169,6 +171,9 @@ function isUpstreamError(text: string): boolean {
     text.includes('provider failure') ||
     text.includes('server error') ||
     text.includes('internal server error') ||
+    // Anthropic server-side overload, e.g. "API Error: 529 Overloaded ...";
+    // the bare word can also arrive without the numeric status.
+    text.includes('overloaded') ||
     /\b5\d\d\b/.test(text)
   );
 }

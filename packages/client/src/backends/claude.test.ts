@@ -1488,11 +1488,12 @@ test('non-zero claude exit with completed error result still fails', async () =>
   }
 });
 
-test('non-zero claude exit surfaces the terminal result reason ahead of the stdout dump', async () => {
+test('non-zero claude exit carries the terminal reason as a structured code, clean message', async () => {
   // Real-world burst: claude prints a terminal result whose `result` field
-  // carries the human reason (session limit / rate limit / overloaded) and
-  // then exits 1 with zero usage. Without surfacing that reason the failure
-  // reaching the router was an inscrutable "exit 1 [stdout: <raw JSON>]".
+  // carries the human reason (session limit) and then exits 1 with zero usage.
+  // The failure should travel as a structured code the router consumes
+  // directly — not a raw "exit 1 [stdout: <JSON>]" blob — with the reason as a
+  // clean message rather than concatenated into the diagnostic.
   const reason = "You've hit your session limit · resets 3pm (UTC)";
   const fake = scriptedSpawn({
     lines: [
@@ -1517,15 +1518,34 @@ test('non-zero claude exit surfaces the terminal result reason ahead of the stdo
   const terminal = frames.at(-1);
   assert.ok(terminal && terminal.type === 'task.fail');
   if (terminal.type === 'task.fail') {
-    const msg = terminal.error.message;
-    // The reason rides up in the terminal message itself (the router
-    // persists this and keyword-classifies it) ...
-    assert.match(msg, /session limit · resets 3pm/);
-    // ... and it comes before the raw [stdout: ...] diagnostic dump.
-    assert.ok(
-      msg.indexOf(reason) < msg.indexOf('[stdout:'),
-      `reason should precede the stdout dump: ${msg}`,
-    );
+    // Structured: the reason classifies into a semantic code the router maps
+    // via reasonForTerminalCode — not the opaque claude_exit_nonzero.
+    assert.equal(terminal.error.code, 'quota_exceeded');
+    // Clean message: claude's own reason verbatim, with no exit-code preamble
+    // or stdout dump jammed in.
+    assert.equal(terminal.error.message, reason);
+    assert.doesNotMatch(terminal.error.message, /\[stdout:|exited with code/);
+  }
+});
+
+test('non-zero claude exit with no terminal reason keeps the diagnostic dump', async () => {
+  // No parseable result event → finalText stays empty → fall back to the
+  // exit/stdout diagnostic so a real crash is still triageable (#119).
+  const fake = scriptedSpawn({
+    lines: ['fatal: boom before any result event'],
+    exitCode: 1,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('crash without reason'), emit, NEVER);
+
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.fail');
+  if (terminal.type === 'task.fail') {
+    assert.equal(terminal.error.code, 'claude_exit_nonzero');
+    assert.match(terminal.error.message, /claude exited with code 1/);
+    assert.match(terminal.error.message, /\[stdout: fatal: boom before any result event\]/);
   }
 });
 

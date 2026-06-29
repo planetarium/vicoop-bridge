@@ -52,6 +52,32 @@ test('normalizeTaskFailError maps quota and rate limit messages before generic u
   );
 });
 
+test('normalizeTaskFailError maps claude subscription/overload terminal reasons', () => {
+  // Claude's "session limit" cap surfaces as a usage/quota exhaustion.
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'claude_exit_nonzero',
+      message: "You've hit your session limit · resets 3pm (UTC)",
+    }).code,
+    'quota_exceeded',
+  );
+  // Server-side overload, both with and without the numeric 529.
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'claude_exit_nonzero',
+      message: 'API Error: 529 Overloaded. This is a server-side issue, usually temporary',
+    }).code,
+    'upstream_error',
+  );
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'claude_exit_nonzero',
+      message: 'Overloaded',
+    }).code,
+    'upstream_error',
+  );
+});
+
 test('normalizeTaskFailError maps login and auth failures separately', () => {
   assert.equal(
     normalizeTaskFailError({
