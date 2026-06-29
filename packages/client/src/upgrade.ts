@@ -23,9 +23,11 @@ const REPO = 'planetarium/vicoop-bridge';
 // close to this timeout is a regression we'd rather surface than block on.
 const HEALTHCHECK_TIMEOUT_MS = 10_000;
 
-// Short cap for the GitHub release-feed lookup. A stalled DNS resolution or
-// captive portal shouldn't strand the operator on a hung process.
-const API_TIMEOUT_MS = 15_000;
+// Short cap for the small metadata fetches (the release-feed lookup and the
+// checksum file), as opposed to the large binary download below. A stalled
+// DNS resolution or captive portal shouldn't strand the operator on a hung
+// process.
+const METADATA_TIMEOUT_MS = 15_000;
 
 // Generous cap for the actual asset download. `AbortSignal.timeout` is a
 // total-operation timeout, so this has to cover slow-but-real networks
@@ -330,7 +332,7 @@ async function resolveLatestTag(): Promise<string> {
   const res = await fetchWithTimeout(
     url,
     { headers: { 'User-Agent': 'vicoop-client-upgrade', Accept: 'application/atom+xml' } },
-    API_TIMEOUT_MS,
+    METADATA_TIMEOUT_MS,
   );
   if (!res.ok) {
     throw new Error(`GitHub releases feed request failed: ${res.status} ${res.statusText} (${url})`);
@@ -381,7 +383,7 @@ async function download(url: string, dest: string): Promise<void> {
 }
 
 async function downloadText(url: string): Promise<string> {
-  const res = await fetchWithTimeout(url, { redirect: 'follow' }, API_TIMEOUT_MS);
+  const res = await fetchWithTimeout(url, { redirect: 'follow' }, METADATA_TIMEOUT_MS);
   if (!res.ok) {
     throw new Error(`download failed: ${res.status} ${res.statusText || ''} (${url})`.trim());
   }
