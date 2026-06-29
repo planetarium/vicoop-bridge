@@ -70,7 +70,9 @@ function isQuotaExceeded(text: string): boolean {
     /\bquota\b/.test(text) ||
     text.includes('insufficient_quota') ||
     text.includes('exceeded your current quota') ||
-    text.includes('usage limit')
+    text.includes('usage limit') ||
+    // Claude subscription cap: "You've hit your session limit · resets 3pm (UTC)".
+    text.includes('session limit')
   );
 }
 
@@ -169,6 +171,10 @@ function isUpstreamError(text: string): boolean {
     text.includes('provider failure') ||
     text.includes('server error') ||
     text.includes('internal server error') ||
+    // Anthropic server-side overload arrives as "API Error: 529 Overloaded
+    // ..." — matched by the numeric status below. The bare word "overloaded"
+    // is deliberately NOT keyed on: a generic RPC turn error can carry it and
+    // should stay its own code (see codex turn/start `turn_failed` test).
     /\b5\d\d\b/.test(text)
   );
 }

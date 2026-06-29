@@ -2768,12 +2768,29 @@ export function createClaudeBackend(
         const toolMismatchPart = sawUnknownToolError
           ? ' [hint: model called a tool name claude does not expose ("No such tool available"); caller tools are registered as mcp___vb-caller-tools__<name> — the call was never captured and the turn cap was exhausted retrying]'
           : '';
+        const diagnostic = `claude exited with code ${exit.code}${sigPart}${detailPart}${stdoutPart}${stdinPart}${toolMismatchPart}`;
+        // When claude emits its own terminal reason (the `result` field,
+        // captured in finalText) — "You've hit your session limit · resets 3pm
+        // (UTC)", "... · Rate limited", "Overloaded", "Prompt is too long" — use
+        // it verbatim as the failure message so normalizeTaskFailError maps it
+        // onto a structured code (quota_exceeded / rate_limited / upstream_error
+        // / login_required / ...). The router prefers that code
+        // (reasonForTerminalCode) over scraping the message, so the cause
+        // travels as structured data rather than a string baked into the
+        // diagnostic. Fall back to the exit/stdout diagnostic only when claude
+        // gave no such reason (a real crash → keep the dump for triage, #119).
+        //
+        // finalText is assigned inside the stdout-handler closure, so TS narrows
+        // it to its initial `null` here; the `?? ''` idiom (same as
+        // `completeText` on the success path below) reads the runtime value
+        // without tripping control-flow narrowing.
+        const reasonText = (finalText ?? '').trim();
         emit({
           type: 'task.fail',
           taskId: task.taskId,
           error: normalizeTaskFailError({
             code: 'claude_exit_nonzero',
-            message: `claude exited with code ${exit.code}${sigPart}${detailPart}${stdoutPart}${stdinPart}${toolMismatchPart}`,
+            message: reasonText || diagnostic,
           }),
         });
         return;

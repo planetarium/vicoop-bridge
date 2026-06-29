@@ -1488,6 +1488,67 @@ test('non-zero claude exit with completed error result still fails', async () =>
   }
 });
 
+test('non-zero claude exit carries the terminal reason as a structured code, clean message', async () => {
+  // Real-world burst: claude prints a terminal result whose `result` field
+  // carries the human reason (session limit) and then exits 1 with zero usage.
+  // The failure should travel as a structured code the router consumes
+  // directly — not a raw "exit 1 [stdout: <JSON>]" blob — with the reason as a
+  // clean message rather than concatenated into the diagnostic.
+  const reason = "You've hit your session limit · resets 3pm (UTC)";
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: true,
+        result: reason,
+        terminal_reason: 'completed',
+        usage: { input_tokens: 0, output_tokens: 0 },
+        modelUsage: {},
+        permission_denials: [],
+      }),
+    ],
+    exitCode: 1,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('session limit'), emit, NEVER);
+
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.fail');
+  if (terminal.type === 'task.fail') {
+    // Structured: the reason classifies into a semantic code the router maps
+    // via reasonForTerminalCode — not the opaque claude_exit_nonzero.
+    assert.equal(terminal.error.code, 'quota_exceeded');
+    // Clean message: claude's own reason verbatim, with no exit-code preamble
+    // or stdout dump jammed in.
+    assert.equal(terminal.error.message, reason);
+    assert.doesNotMatch(terminal.error.message, /\[stdout:|exited with code/);
+  }
+});
+
+test('non-zero claude exit with no terminal reason keeps the diagnostic dump', async () => {
+  // No parseable result event → finalText stays empty → fall back to the
+  // exit/stdout diagnostic so a real crash is still triageable (#119).
+  const fake = scriptedSpawn({
+    lines: ['fatal: boom before any result event'],
+    exitCode: 1,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('crash without reason'), emit, NEVER);
+
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.fail');
+  if (terminal.type === 'task.fail') {
+    assert.equal(terminal.error.code, 'claude_exit_nonzero');
+    assert.match(terminal.error.message, /claude exited with code 1/);
+    assert.match(terminal.error.message, /\[stdout: fatal: boom before any result event\]/);
+  }
+});
+
 test('rollback does not delete a binding a concurrent task has refreshed', async () => {
   // Task A (first) holds open without finishing. Task B (second) starts
   // on the same contextId, sees the binding A wrote, refreshes lastUsedAt
