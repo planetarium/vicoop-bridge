@@ -7,6 +7,7 @@ import {
   assertLooksLikeInstall,
   assetName,
   normalizeTag,
+  parseAtomTags,
   parseChecksum,
   resolvePlatformAsset,
   runUpgrade,
@@ -51,6 +52,46 @@ test('normalizeTag rejects path-traversal and shell-metacharacter payloads', () 
   ]) {
     assert.throws(() => normalizeTag(bad), /invalid version/, `expected rejection for ${JSON.stringify(bad)}`);
   }
+});
+
+// A trimmed-down copy of the real `releases.atom` shape: a feed-level <id>
+// (which must NOT be mistaken for a release), then entries newest-first whose
+// release tag lives in the entry <id> as `...Repository/<repoId>/<tag>`.
+const ATOM_FIXTURE = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>tag:github.com,2008:https://github.com/planetarium/vicoop-bridge/releases</id>
+  <title>Release notes from vicoop-bridge</title>
+  <entry>
+    <id>tag:github.com,2008:Repository/1211055185/@vicoop-bridge/client@0.35.3</id>
+    <title>@vicoop-bridge/client@0.35.3</title>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/1211055185/@vicoop-bridge/client@0.35.2</id>
+    <title>a custom release name, not the tag</title>
+  </entry>
+</feed>`;
+
+test('parseAtomTags reads release tags from entry ids, newest first', () => {
+  assert.deepEqual(parseAtomTags(ATOM_FIXTURE), [
+    '@vicoop-bridge/client@0.35.3',
+    '@vicoop-bridge/client@0.35.2',
+  ]);
+});
+
+test('parseAtomTags ignores the feed-level id and prefers the id over a custom title', () => {
+  const tags = parseAtomTags(ATOM_FIXTURE);
+  // The feed-level <id> (the releases URL) must not leak in as a tag.
+  assert.ok(!tags.some((t) => t.includes('https://')));
+  // Second entry has a non-tag <title>; the id still yields the real tag.
+  assert.equal(tags[1], '@vicoop-bridge/client@0.35.2');
+});
+
+test('parseAtomTags returns [] for an empty or entry-less feed', () => {
+  assert.deepEqual(parseAtomTags(''), []);
+  assert.deepEqual(
+    parseAtomTags('<feed><id>tag:github.com,2008:https://x/releases</id></feed>'),
+    [],
+  );
 });
 
 test('parseChecksum extracts hash from `<hash>  <path>` and bare-hash forms', () => {

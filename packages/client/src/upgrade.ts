@@ -23,8 +23,8 @@ const REPO = 'planetarium/vicoop-bridge';
 // close to this timeout is a regression we'd rather surface than block on.
 const HEALTHCHECK_TIMEOUT_MS = 10_000;
 
-// Short cap for GitHub API calls. A stalled DNS resolution or captive portal
-// shouldn't strand the operator on a hung process.
+// Short cap for the GitHub release-feed lookup. A stalled DNS resolution or
+// captive portal shouldn't strand the operator on a hung process.
 const API_TIMEOUT_MS = 15_000;
 
 // Generous cap for the actual asset download. `AbortSignal.timeout` is a
@@ -298,31 +298,50 @@ function assertSafeTag(tag: string, raw: string = tag): void {
   }
 }
 
+// Pull release tags out of a GitHub `releases.atom` feed, in feed order
+// (newest first). The tag is read from each `<entry>`'s `<id>`
+// (`tag:github.com,2008:Repository/<repoId>/<TAG>`) rather than `<title>`,
+// because a release title can be a custom name while the id always carries
+// the literal git tag. Exported for unit testing without network IO.
+export function parseAtomTags(xml: string): string[] {
+  const tags: string[] = [];
+  const idRe = /<id>\s*tag:github\.com,\d+:Repository\/\d+\/([\s\S]*?)\s*<\/id>/;
+  for (const entry of xml.matchAll(/<entry\b[\s\S]*?<\/entry>/g)) {
+    const m = idRe.exec(entry[0]);
+    if (m) tags.push(m[1].trim());
+  }
+  return tags;
+}
+
 async function resolveLatestTag(): Promise<string> {
-  const url = `https://api.github.com/repos/${REPO}/releases?per_page=30`;
+  // Resolve the latest release from the public Atom feed on github.com
+  // instead of api.github.com. The REST API caps *unauthenticated* requests
+  // at 60/hr per IP, which bricks self-update on shared provider egress IPs
+  // exactly when an operator is rolling out a release (#405); the web feed
+  // carries its own, far more generous anonymous limit and needs no token.
+  //
+  // Tradeoff vs the old `/releases` API call: the feed doesn't expose
+  // draft/prerelease flags, so we can't filter them out here. That's a
+  // non-issue for this repo — GitHub releases are client-only and always
+  // published as full (non-prerelease) releases via `changeset tag`. The
+  // TAG_PREFIX filter still drops any unrelated tag that shows up in the
+  // feed, and assertSafeTag rejects anything malformed.
+  const url = `https://github.com/${REPO}/releases.atom`;
   const res = await fetchWithTimeout(
     url,
-    { headers: { 'User-Agent': 'vicoop-client-upgrade', Accept: 'application/vnd.github+json' } },
+    { headers: { 'User-Agent': 'vicoop-client-upgrade', Accept: 'application/atom+xml' } },
     API_TIMEOUT_MS,
   );
-  if (!res.ok) throw new Error(`GitHub API request failed: ${res.status} ${res.statusText} (${url})`);
-  const body = (await res.json()) as unknown;
-  // GitHub returns an object (`{ message, ... }`) for rate-limit/abuse/auth
-  // errors with 2xx-shaped bodies on some legacy paths, so don't trust the
-  // HTTP status alone — confirm we got an array before iterating.
-  if (!Array.isArray(body)) {
-    const msg = (body as { message?: unknown })?.message;
-    const detail = typeof msg === 'string' ? msg : JSON.stringify(body).slice(0, 200);
-    throw new Error(`GitHub API returned a non-array payload at ${url}: ${detail}`);
+  if (!res.ok) {
+    throw new Error(`GitHub releases feed request failed: ${res.status} ${res.statusText} (${url})`);
   }
-  const releases = body as Array<{ tag_name?: unknown; draft?: unknown; prerelease?: unknown }>;
-  for (const r of releases) {
-    if (typeof r.tag_name !== 'string' || !r.tag_name.startsWith(TAG_PREFIX)) continue;
-    if (r.draft === true || r.prerelease === true) continue;
-    assertSafeTag(r.tag_name);
-    return r.tag_name;
+  const xml = await res.text();
+  for (const tag of parseAtomTags(xml)) {
+    if (!tag.startsWith(TAG_PREFIX)) continue;
+    assertSafeTag(tag);
+    return tag;
   }
-  throw new Error(`no published (non-draft, non-prerelease) ${TAG_PREFIX}* release found in ${REPO}`);
+  throw new Error(`no published ${TAG_PREFIX}* release found in ${REPO} feed (${url})`);
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
