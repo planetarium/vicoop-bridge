@@ -2755,6 +2755,23 @@ export function createClaudeBackend(
         const detail = stderrTail.trim();
         const stdoutDetail = stdoutTail.trim();
         const sigPart = exit.signal ? ` (signal ${exit.signal})` : '';
+        // claude emits its own human-readable terminal reason as the
+        // `result` field of the terminal event (captured in finalText) and
+        // then still exits non-zero with zero usage — e.g. "You've hit your
+        // session limit · resets 3pm (UTC)", "API Error: Server is
+        // temporarily limiting requests ... · Rate limited", "Overloaded".
+        // Surface it first so the failure reaching the router is the actual
+        // cause rather than an inscrutable "exit 1 [stdout: <raw JSON>]":
+        // the router persists this message as the terminal error and its
+        // keyword classifier can then tag rate-limit/quota/auth, and
+        // operators read the reason without parsing the stdout dump (which
+        // is still appended below for diagnostics).
+        // `finalText` is assigned inside the stdout handler closure, so TS
+        // narrows it to its initial `null` out here; the `?? ''` idiom (as
+        // used for `completeText` on the success path below) reads the real
+        // runtime value without tripping control-flow narrowing.
+        const reasonText = (finalText ?? '').trim();
+        const reasonPart = reasonText ? `: ${reasonText.slice(0, 300)}` : '';
         const detailPart = detail ? `: ${detail.slice(-500)}` : '';
         const stdoutPart = stdoutDetail ? ` [stdout: ${stdoutDetail.slice(-500)}]` : '';
         // If stdin write blew up and the process exited non-zero, surface
@@ -2773,7 +2790,7 @@ export function createClaudeBackend(
           taskId: task.taskId,
           error: normalizeTaskFailError({
             code: 'claude_exit_nonzero',
-            message: `claude exited with code ${exit.code}${sigPart}${detailPart}${stdoutPart}${stdinPart}${toolMismatchPart}`,
+            message: `claude exited with code ${exit.code}${sigPart}${reasonPart}${detailPart}${stdoutPart}${stdinPart}${toolMismatchPart}`,
           }),
         });
         return;

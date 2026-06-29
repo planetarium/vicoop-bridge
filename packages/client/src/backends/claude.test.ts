@@ -1488,6 +1488,47 @@ test('non-zero claude exit with completed error result still fails', async () =>
   }
 });
 
+test('non-zero claude exit surfaces the terminal result reason ahead of the stdout dump', async () => {
+  // Real-world burst: claude prints a terminal result whose `result` field
+  // carries the human reason (session limit / rate limit / overloaded) and
+  // then exits 1 with zero usage. Without surfacing that reason the failure
+  // reaching the router was an inscrutable "exit 1 [stdout: <raw JSON>]".
+  const reason = "You've hit your session limit · resets 3pm (UTC)";
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: true,
+        result: reason,
+        terminal_reason: 'completed',
+        usage: { input_tokens: 0, output_tokens: 0 },
+        modelUsage: {},
+        permission_denials: [],
+      }),
+    ],
+    exitCode: 1,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('session limit'), emit, NEVER);
+
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.fail');
+  if (terminal.type === 'task.fail') {
+    const msg = terminal.error.message;
+    // The reason rides up in the terminal message itself (the router
+    // persists this and keyword-classifies it) ...
+    assert.match(msg, /session limit · resets 3pm/);
+    // ... and it comes before the raw [stdout: ...] diagnostic dump.
+    assert.ok(
+      msg.indexOf(reason) < msg.indexOf('[stdout:'),
+      `reason should precede the stdout dump: ${msg}`,
+    );
+  }
+});
+
 test('rollback does not delete a binding a concurrent task has refreshed', async () => {
   // Task A (first) holds open without finishing. Task B (second) starts
   // on the same contextId, sees the binding A wrote, refreshes lastUsedAt
