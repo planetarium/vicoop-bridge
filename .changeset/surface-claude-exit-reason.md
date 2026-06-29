@@ -22,6 +22,6 @@ the diagnostic. When claude emits no such reason (a real crash) the message
 falls back to the exit/stdout diagnostic dump so triage data is preserved
 (#119).
 
-Also teaches `normalizeTaskFailError` two claude-specific phrasings: the
-subscription "session limit" cap → `quota_exceeded`, and server-side
-"Overloaded" (with or without the `529`) → `upstream_error`.
+Also teaches `normalizeTaskFailError` the claude subscription "session limit"
+cap → `quota_exceeded` (server-side "529 Overloaded" already classifies as
+`upstream_error` via the existing numeric-status match).

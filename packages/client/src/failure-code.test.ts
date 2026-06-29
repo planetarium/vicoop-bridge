@@ -61,18 +61,13 @@ test('normalizeTaskFailError maps claude subscription/overload terminal reasons'
     }).code,
     'quota_exceeded',
   );
-  // Server-side overload, both with and without the numeric 529.
+  // Anthropic server-side overload, "API Error: 529 Overloaded ..." — keyed on
+  // the numeric status, not the bare word (which a generic RPC turn error can
+  // carry; see the codex turn/start `turn_failed` test).
   assert.equal(
     normalizeTaskFailError({
       code: 'claude_exit_nonzero',
       message: 'API Error: 529 Overloaded. This is a server-side issue, usually temporary',
-    }).code,
-    'upstream_error',
-  );
-  assert.equal(
-    normalizeTaskFailError({
-      code: 'claude_exit_nonzero',
-      message: 'Overloaded',
     }).code,
     'upstream_error',
   );
