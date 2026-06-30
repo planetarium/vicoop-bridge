@@ -7,6 +7,7 @@ import type {
   TaskStore,
 } from '@a2x/sdk';
 import { TaskState, TERMINAL_STATES } from '@a2x/sdk';
+import { OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import type { Sql, SqlExecutor } from './db.js';
 
 const MAX_CONTEXT_TASKS = 10;
@@ -36,8 +37,44 @@ function stripMessageMetadata(msg: Message): Message {
   return m as Message;
 }
 
-function stripSensitiveMetadata(task: Task): Task {
-  const result = { ...task };
+// Drop the request-scoped `chat_completions_request` envelope from the
+// persisted copy of an openai-compat task. Per the openai-compat/v1 extension
+// (planetarium/oai2a2a), the gateway is stateless and re-emits the full
+// request envelope on EVERY turn, so the agent/server is never expected to read
+// it back from storage — persisting it just bloats the row (it is ~half of
+// task_json on this deployment, see issue #408). The response side of the
+// envelope (`chat_completion` / `terminal_error`, carried on message metadata)
+// is the codec's read-back source and is intentionally left untouched.
+//
+// Non-mutating: returns the input unchanged when there is no envelope to strip
+// (non-openai-compat tasks, admin agent), and otherwise returns a shallow copy
+// with a pruned `metadata` so the live task object the caller still forwards
+// from is never altered.
+function stripPersistedEnvelope(task: Task): Task {
+  const metadata = task.metadata as Record<string, unknown> | undefined;
+  const ext: unknown = metadata?.[OPENAI_COMPAT_EXTENSION_URI];
+  if (
+    !ext ||
+    typeof ext !== 'object' ||
+    Array.isArray(ext) ||
+    !('chat_completions_request' in ext)
+  ) {
+    return task;
+  }
+  const { chat_completions_request: _drop, ...restExt } = ext;
+  void _drop;
+  const nextMetadata = { ...metadata };
+  if (Object.keys(restExt).length > 0) {
+    nextMetadata[OPENAI_COMPAT_EXTENSION_URI] = restExt;
+  } else {
+    delete nextMetadata[OPENAI_COMPAT_EXTENSION_URI];
+  }
+  const hasMetadata = Object.keys(nextMetadata).length > 0;
+  return { ...task, metadata: hasMetadata ? nextMetadata : undefined };
+}
+
+export function stripSensitiveMetadata(task: Task): Task {
+  const result = { ...stripPersistedEnvelope(task) };
   if (result.history?.length) {
     result.history = result.history.map(stripMessageMetadata);
   }
