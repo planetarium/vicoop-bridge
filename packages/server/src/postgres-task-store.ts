@@ -52,10 +52,13 @@ function stripMessageMetadata(msg: Message): Message {
 // from is never altered.
 function stripPersistedEnvelope(task: Task): Task {
   const metadata = task.metadata as Record<string, unknown> | undefined;
-  const ext = metadata?.[OPENAI_COMPAT_EXTENSION_URI] as
-    | Record<string, unknown>
-    | undefined;
-  if (!ext || typeof ext !== 'object' || !('chat_completions_request' in ext)) {
+  const ext: unknown = metadata?.[OPENAI_COMPAT_EXTENSION_URI];
+  if (
+    !ext ||
+    typeof ext !== 'object' ||
+    Array.isArray(ext) ||
+    !('chat_completions_request' in ext)
+  ) {
     return task;
   }
   const { chat_completions_request: _drop, ...restExt } = ext;

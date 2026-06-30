@@ -118,6 +118,41 @@ test('stripSensitiveMetadata leaves a non-openai-compat task untouched', () => {
   assert.deepEqual(persisted.metadata, { someOtherKey: { a: 1 } });
 });
 
+test('stripSensitiveMetadata preserves an openai-compat key that has no request envelope (e.g. response-only / heartbeat marker)', () => {
+  const ext = { chat_completion: { id: 'resp-2' } };
+  const task = {
+    id: 't3',
+    contextId: 'c3',
+    status: { state: TaskState.COMPLETED, timestamp: '2026-01-01T00:00:00.000Z' },
+    metadata: { [OAI]: ext },
+  } as unknown as Task;
+  const persisted = stripSensitiveMetadata(task);
+  // No `chat_completions_request` to strip → the key (and its contents) is left as-is.
+  assert.deepEqual((persisted.metadata as Record<string, unknown>)[OAI], ext);
+});
+
+test('stripSensitiveMetadata does not throw on absent or malformed metadata', () => {
+  const base = {
+    id: 't4',
+    contextId: 'c4',
+    status: { state: TaskState.COMPLETED, timestamp: '2026-01-01T00:00:00.000Z' },
+  };
+  // metadata entirely absent
+  assert.doesNotThrow(() => stripSensitiveMetadata({ ...base } as unknown as Task));
+  // openai-compat value is null
+  assert.doesNotThrow(() =>
+    stripSensitiveMetadata({ ...base, metadata: { [OAI]: null } } as unknown as Task),
+  );
+  // openai-compat value is an array
+  assert.doesNotThrow(() =>
+    stripSensitiveMetadata({ ...base, metadata: { [OAI]: [1, 2, 3] } } as unknown as Task),
+  );
+  // openai-compat value is a primitive
+  assert.doesNotThrow(() =>
+    stripSensitiveMetadata({ ...base, metadata: { [OAI]: 'x' } } as unknown as Task),
+  );
+});
+
 // ── updateTask concurrency (issue #366) ─────────────────────────────────────
 
 test(
