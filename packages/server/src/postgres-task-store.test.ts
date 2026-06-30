@@ -9,8 +9,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import postgres from 'postgres';
 import { TaskState } from '@a2x/sdk';
-import type { Message } from '@a2x/sdk';
-import { PostgresTaskStore } from './postgres-task-store.js';
+import type { Message, Task } from '@a2x/sdk';
+import { OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
+import { PostgresTaskStore, stripSensitiveMetadata } from './postgres-task-store.js';
 import { ensureSchema } from './db.js';
 
 const hasDb = !!process.env.DATABASE_URL;
@@ -52,6 +53,70 @@ async function seed(
     )
   `;
 }
+
+// ── stripSensitiveMetadata: openai-compat request-envelope strip (issue #408) ─
+// Pure (no DB), so these always run. The persisted copy must drop the
+// request-scoped `chat_completions_request` envelope (~half of task_json) while
+// leaving the live object, the response envelope, and everything else intact.
+
+const OAI = OPENAI_COMPAT_EXTENSION_URI;
+
+function taskWithRequestEnvelope(extra?: Record<string, unknown>): Task {
+  return {
+    id: 't1',
+    contextId: 'c1',
+    status: { state: TaskState.COMPLETED, timestamp: '2026-01-01T00:00:00.000Z' },
+    metadata: {
+      [OAI]: {
+        chat_completions_request: {
+          model: 'gpt-4',
+          messages: [{ role: 'user', content: 'x'.repeat(1000) }],
+        },
+        ...extra,
+      },
+    },
+  } as unknown as Task;
+}
+
+test('stripSensitiveMetadata drops the openai-compat chat_completions_request from the persisted copy', () => {
+  const task = taskWithRequestEnvelope();
+  const persisted = stripSensitiveMetadata(task);
+  const ext = (persisted.metadata as Record<string, Record<string, unknown>> | undefined)?.[OAI];
+  // The whole extension key is gone because the request envelope was its only member.
+  assert.equal(ext, undefined, 'request envelope must not be persisted');
+  // Empty metadata collapses to undefined rather than `{}`.
+  assert.equal(persisted.metadata, undefined);
+});
+
+test('stripSensitiveMetadata does not mutate the live task object', () => {
+  const task = taskWithRequestEnvelope();
+  stripSensitiveMetadata(task);
+  const liveExt = (task.metadata as Record<string, Record<string, unknown>>)[OAI];
+  assert.ok(
+    liveExt && 'chat_completions_request' in liveExt,
+    'the in-flight task the caller still forwards from must keep the envelope',
+  );
+});
+
+test('stripSensitiveMetadata keeps sibling openai-compat keys (e.g. response envelope) while dropping only the request', () => {
+  const task = taskWithRequestEnvelope({ chat_completion: { id: 'resp-1', usage: { total_tokens: 5 } } });
+  const persisted = stripSensitiveMetadata(task);
+  const ext = (persisted.metadata as Record<string, Record<string, unknown>>)[OAI];
+  assert.ok(ext, 'extension key survives when a sibling key remains');
+  assert.equal('chat_completions_request' in ext, false, 'request envelope dropped');
+  assert.deepEqual(ext.chat_completion, { id: 'resp-1', usage: { total_tokens: 5 } });
+});
+
+test('stripSensitiveMetadata leaves a non-openai-compat task untouched', () => {
+  const task = {
+    id: 't2',
+    contextId: 'c2',
+    status: { state: TaskState.COMPLETED, timestamp: '2026-01-01T00:00:00.000Z' },
+    metadata: { someOtherKey: { a: 1 } },
+  } as unknown as Task;
+  const persisted = stripSensitiveMetadata(task);
+  assert.deepEqual(persisted.metadata, { someOtherKey: { a: 1 } });
+});
 
 // ── updateTask concurrency (issue #366) ─────────────────────────────────────
 
