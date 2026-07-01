@@ -123,6 +123,47 @@ Expected (≈ 16 s):
 The harness uses `--permission-mode bypassPermissions` so the model
 isn't blocked on a permission prompt for the new MCP tool.
 
+### 6. Stateful-context delta — `e2e-claude-delta.mjs`
+
+Verifies the stateful-context delta path (issue #410): a delta-only turn
+(just the new message, marked `delta: true`) on an existing `contextId`
+must produce a response that accounts for the prior turns — where those
+prior turns are delivered **only** via the server-reconstructed
+`task.contextHistory` field on the `task.assign` frame, not the envelope.
+
+A/B against an unguessable random secret (`zephyr-quokka-<n>`) that lives
+**only** in `contextHistory`; the envelope carries just the new question:
+
+- **Arm A (WITH `contextHistory`)** — the model must reveal the secret,
+  proving the connector's `mergeChatHistory` +
+  `chatHistoryFromA2AMessages` fold delivered the prior conversation.
+- **Arm B (WITHOUT `contextHistory`, control)** — the model must NOT know
+  the secret, proving the envelope alone never carried it.
+
+```bash
+node packages/client/scripts/e2e-claude-delta.mjs
+```
+
+Expected:
+
+```
+[e2e] --- Arm A: WITH contextHistory ---
+[e2e] terminal=task.complete answer="zephyr-quokka-124858"
+[e2e] --- Arm B: WITHOUT contextHistory (control) ---
+[e2e] terminal=task.complete answer="I don't have any earlier codeword ..."
+[e2e] PASS: Arm A (WITH contextHistory) reveals the secret ...
+[e2e] PASS: Arm B (WITHOUT contextHistory) does NOT reveal the secret ...
+[e2e] RESULT: PASS — #410 delta contextHistory verified end-to-end
+```
+
+Sibling harnesses `e2e-codex-delta.mjs` and `e2e-vicoop-codex-delta.mjs`
+run the same A/B against the `codex` / `vicoop-codex` CLIs (each needs
+its own CLI on PATH + auth). The three advertised backends
+(claude / codex / vicoop-codex) carry `params.statefulContext: true` on
+their cards precisely because this harness passes for each. openclaw
+shares the same connector-side merge but is not yet delta-verified, so
+its card stays unadvertised.
+
 ## Troubleshooting
 
 ### `claude` exits with `auth required`
@@ -190,6 +231,7 @@ present in argv) or is blocked on the first model call. Re-run with
 | URI image FilePart → model | input-image-uri | client-side file URI fetch, image content block reaches vision |
 | PDF FilePart → model | input-pdf | document content block reaches doc parser |
 | Model → file artifact | send-file | `--mcp-config` injection, R1 routing, MCP `send_file` tool, bounded read, `task.artifact` round-trip |
+| Delta turn → prior context | delta | `task.contextHistory` fold (`mergeChatHistory`), A/B secret proves the prior conversation reaches the model (#410) |
 
 The `tool_result` image passthrough (issue #86 task 2a) is covered by
 the unit test `emits FilePart artifact when tool_result contains an
