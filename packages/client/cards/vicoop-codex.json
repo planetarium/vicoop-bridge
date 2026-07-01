@@ -9,7 +9,10 @@
       {
         "uri": "https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1",
         "description": "Reads the full OpenAI Chat Completions request envelope (chat_completions_request) from the openai-compat A2A metadata and forwards it to the vicoop-codex CLI; surfaces the model's response (text, tool_calls, usage) as a complete OpenAI ChatCompletion envelope echoed on the final A2A message's metadata under the extension URI (chat_completion key).",
-        "required": false
+        "required": false,
+        "params": {
+          "statefulContext": true
+        }
       }
     ]
   },
