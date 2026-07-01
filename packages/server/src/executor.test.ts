@@ -7,7 +7,6 @@ import {
   type Message,
   type Task,
   type TaskStatusUpdateEvent,
-  type TaskStore,
 } from '@a2x/sdk';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
@@ -15,6 +14,7 @@ import {
   type AgentCard,
 } from '@vicoop-bridge/protocol';
 import { Registry, type ClientConnection } from './registry.js';
+import type { ContextAwareTaskStore } from './postgres-task-store.js';
 import {
   WSForwardingExecutor,
   appendHistoryMessage,
@@ -36,19 +36,21 @@ function makeAgentCard(): AgentCard {
   };
 }
 
-function noopTaskStore(): TaskStore {
+function noopTaskStore(): ContextAwareTaskStore {
   // The strip/binding behavior under test runs before any taskStore call,
   // and the test pushes a terminal status so the executor's persistence
   // path (taskStore.updateTask) only fires after assertions land — stubs
-  // are sufficient.
+  // are sufficient. `loadByContextId` returns [] — these tests are not
+  // delta requests, so the stateful-context reconstruction never fires.
   return {
     save: async () => {},
     load: async () => undefined,
     updateTask: async () => {},
-  } as unknown as TaskStore;
+    loadByContextId: async () => [],
+  } as unknown as ContextAwareTaskStore;
 }
 
-function captureTaskStore(): TaskStore & { updates: unknown[] } {
+function captureTaskStore(): ContextAwareTaskStore & { updates: unknown[] } {
   const updates: unknown[] = [];
   return {
     updates,
@@ -57,7 +59,8 @@ function captureTaskStore(): TaskStore & { updates: unknown[] } {
     updateTask: async (_taskId: string, update: unknown) => {
       updates.push(update);
     },
-  } as unknown as TaskStore & { updates: unknown[] };
+    loadByContextId: async () => [],
+  } as unknown as ContextAwareTaskStore & { updates: unknown[] };
 }
 
 function makeWsCapture(): { ws: WebSocket; sent: string[] } {
@@ -484,4 +487,227 @@ test('executor omits terminal error metadata when openai-compat extension was no
 
   assert.equal(statuses[0]?.status.message?.metadata, undefined);
   assert.equal(statuses[0]?.status.message?.extensions, undefined);
+});
+
+// ---- Stateful-context delta reconstruction (#410) ----
+
+type LoadCall = { contextId: string; principalId: string; excludeTaskId?: string };
+
+function contextStore(prior: Task[]): ContextAwareTaskStore & { loadCalls: LoadCall[] } {
+  const loadCalls: LoadCall[] = [];
+  return {
+    loadCalls,
+    save: async () => {},
+    load: async () => undefined,
+    updateTask: async () => {},
+    loadByContextId: async (contextId: string, principalId: string, excludeTaskId?: string) => {
+      loadCalls.push({ contextId, principalId, excludeTaskId });
+      return prior;
+    },
+  } as unknown as ContextAwareTaskStore & { loadCalls: LoadCall[] };
+}
+
+// Kick the generator to the first yield (bindTask + reconstruction + sendToAgent
+// all run before it), then push a terminal status so it returns cleanly.
+async function driveToAssign(
+  executor: WSForwardingExecutor,
+  registry: Registry,
+  task: Task,
+  message: Message,
+): Promise<void> {
+  const gen = executor.executeStream(task, message);
+  const firstEvent = gen.next();
+  const binding = registry.getBinding(task.id)!;
+  binding.sink.pushStatus({
+    taskId: task.id,
+    contextId: task.contextId ?? task.id,
+    final: true,
+    status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
+  });
+  binding.sink.finish();
+  await firstEvent;
+  for await (const _event of gen) void _event;
+}
+
+function deltaMetadata(principalId: string): Record<string, unknown> {
+  return {
+    _principalId: principalId,
+    [OPENAI_COMPAT_EXTENSION_URI]: { delta: true },
+  };
+}
+
+test('executor reconstructs contextHistory for a delta request and ships it stripped', async () => {
+  const { ws, sent } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'a-delta',
+    clientId: 'c',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+  // One prior task with two history turns, plus a terminal status.message that
+  // is NOT already in history (must be appended, deduped by messageId). The
+  // stored user turn still carries `_principalId`, which must be stripped
+  // before it leaves the bridge.
+  const prior: Task[] = [
+    {
+      id: 't-prev',
+      contextId: 'ctx-d',
+      status: {
+        state: TaskState.COMPLETED,
+        message: {
+          role: 'agent',
+          parts: [{ kind: 'text', text: 'reply 1' }],
+          messageId: 'a-1',
+        },
+      },
+      history: [
+        {
+          role: 'user',
+          parts: [{ kind: 'text', text: 'turn 1' }],
+          messageId: 'u-1',
+          metadata: { _principalId: 'eth:0xabc', keep: 'me' },
+        },
+      ],
+    } as unknown as Task,
+  ];
+  const taskStore = contextStore(prior);
+  const executor = new WSForwardingExecutor('a-delta', registry, taskStore);
+  const task = {
+    id: 't-delta',
+    contextId: 'ctx-d',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'turn 2' }],
+    messageId: 'u-2',
+    metadata: deltaMetadata('eth:0xabc'),
+  } as unknown as Message;
+
+  await driveToAssign(executor, registry, task, message);
+
+  // Reconstruction ran, principal-scoped, excluding the current task.
+  assert.deepEqual(taskStore.loadCalls, [
+    { contextId: 'ctx-d', principalId: 'eth:0xabc', excludeTaskId: 't-delta' },
+  ]);
+
+  const frame = parseDownFrame(sent[0]!);
+  if (frame.type !== 'task.assign') throw new Error('unreachable');
+  assert.ok(frame.contextHistory, 'expected contextHistory on the frame');
+  // history turn (u-1) + terminal status.message (a-1), oldest→newest.
+  assert.deepEqual(frame.contextHistory!.map((m) => m.messageId), ['u-1', 'a-1']);
+  // Internal `_`-prefixed metadata stripped; caller-visible key survives.
+  const u1 = frame.contextHistory![0]!;
+  assert.equal((u1.metadata as Record<string, unknown> | undefined)?._principalId, undefined);
+  assert.equal((u1.metadata as Record<string, unknown> | undefined)?.keep, 'me');
+});
+
+test('executor does not reconstruct context history for a non-delta request', async () => {
+  const { ws, sent } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'a-full',
+    clientId: 'c',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+  const taskStore = contextStore([{ id: 't-prev' } as unknown as Task]);
+  const executor = new WSForwardingExecutor('a-full', registry, taskStore);
+  const task = {
+    id: 't-full',
+    contextId: 'ctx-f',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  // Full-replay: has a principal but NO delta marker → envelope carries history.
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'u-f',
+    metadata: { _principalId: 'eth:0xabc' },
+  } as unknown as Message;
+
+  await driveToAssign(executor, registry, task, message);
+
+  assert.equal(taskStore.loadCalls.length, 0, 'loadByContextId must not run for full-replay');
+  const frame = parseDownFrame(sent[0]!);
+  if (frame.type !== 'task.assign') throw new Error('unreachable');
+  assert.equal(frame.contextHistory, undefined);
+});
+
+test('executor skips reconstruction when a delta request has no principalId', async () => {
+  const { ws, sent } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'a-anon',
+    clientId: 'c',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+  const taskStore = contextStore([{ id: 't-prev' } as unknown as Task]);
+  const executor = new WSForwardingExecutor('a-anon', registry, taskStore);
+  const task = {
+    id: 't-anon',
+    contextId: 'ctx-a',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'u-a',
+    // delta marker present but no `_principalId` — the load is principal-scoped,
+    // so it must be skipped rather than run unscoped.
+    metadata: { [OPENAI_COMPAT_EXTENSION_URI]: { delta: true } },
+  } as unknown as Message;
+
+  await driveToAssign(executor, registry, task, message);
+
+  assert.equal(taskStore.loadCalls.length, 0);
+  const frame = parseDownFrame(sent[0]!);
+  if (frame.type !== 'task.assign') throw new Error('unreachable');
+  assert.equal(frame.contextHistory, undefined);
+});
+
+test('executor omits contextHistory when a delta context has no prior turns', async () => {
+  const { ws, sent } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'a-fresh',
+    clientId: 'c',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+  // Unknown/expired contextId → empty load → fresh context, no error, no field.
+  const taskStore = contextStore([]);
+  const executor = new WSForwardingExecutor('a-fresh', registry, taskStore);
+  const task = {
+    id: 't-fresh',
+    contextId: 'ctx-fresh',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'u-fresh',
+    metadata: deltaMetadata('eth:0xabc'),
+  } as unknown as Message;
+
+  await driveToAssign(executor, registry, task, message);
+
+  assert.equal(taskStore.loadCalls.length, 1);
+  const frame = parseDownFrame(sent[0]!);
+  if (frame.type !== 'task.assign') throw new Error('unreachable');
+  assert.equal(frame.contextHistory, undefined);
 });

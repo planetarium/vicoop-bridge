@@ -11,9 +11,10 @@ import {
   type Task,
   type TaskArtifactUpdateEvent,
   type TaskStatusUpdateEvent,
-  type TaskStore,
 } from '@a2x/sdk';
+import { isDeltaRequest } from '@vicoop-bridge/protocol';
 import type { Registry, TaskSink } from './registry.js';
+import type { ContextAwareTaskStore } from './postgres-task-store.js';
 import { AsyncEventQueue } from './event-queue.js';
 import { logEvent } from './log.js';
 import { terminalErrorMessageFields } from './terminal-error.js';
@@ -95,6 +96,60 @@ export function appendHistoryMessage(history: Message[], message: Message | unde
 }
 
 /**
+ * Project a stored A2A history message onto the WS `task.assign` wire shape
+ * (`{ role, parts, messageId, metadata?, extensions? }`), stripping
+ * `_`-prefixed internal metadata the same way the live turn is stripped
+ * before forwarding. Used to ship reconstructed `contextHistory` to the
+ * connected client for stateful-context delta requests (#410).
+ */
+function projectHistoryMessage(m: Message): {
+  role: Message['role'];
+  parts: Message['parts'];
+  messageId: string;
+  metadata?: Record<string, unknown>;
+  extensions?: string[];
+} {
+  const forwardMetadata = stripInternalMetadata(
+    (m as { metadata?: Record<string, unknown> }).metadata,
+  );
+  return {
+    role: m.role,
+    parts: m.parts,
+    messageId: m.messageId,
+    ...(forwardMetadata !== undefined ? { metadata: forwardMetadata } : {}),
+    ...(m.extensions !== undefined ? { extensions: m.extensions } : {}),
+  };
+}
+
+/**
+ * Reconstruct the prior turns of a `contextId` from the task store, oldest→
+ * newest, for a stateful-context delta request (#410). Mirrors the admin
+ * agent's reconstruction (`admin.ts`): flatten each prior sibling task's
+ * `history`, plus its terminal `status.message` when that isn't already in
+ * `history` (deduped by `messageId`). Returns `undefined` when there is no
+ * prior context — an unknown/expired/cross-principal `contextId` yields an
+ * empty load, which the caller treats as a fresh context (never an error),
+ * matching the router's `previous_response_id` fallback contract.
+ */
+async function reconstructContextHistory(
+  taskStore: ContextAwareTaskStore,
+  contextId: string,
+  principalId: string,
+  excludeTaskId: string,
+): Promise<Message[] | undefined> {
+  const previousTasks = await taskStore.loadByContextId(contextId, principalId, excludeTaskId);
+  const collected: Message[] = [];
+  for (const prev of previousTasks) {
+    if (prev.history) collected.push(...prev.history);
+    const statusMsg = prev.status?.message;
+    if (statusMsg && !prev.history?.some((m) => m.messageId === statusMsg.messageId)) {
+      collected.push(statusMsg);
+    }
+  }
+  return collected.length > 0 ? collected : undefined;
+}
+
+/**
  * AgentExecutor that forwards A2A requests to a WebSocket-connected
  * client and pipes the client's task.* frames back as A2A streaming
  * events.
@@ -112,7 +167,7 @@ export class WSForwardingExecutor extends AgentExecutor {
   constructor(
     private readonly agentId: string,
     private readonly registry: Registry,
-    private readonly taskStore: TaskStore,
+    private readonly taskStore: ContextAwareTaskStore,
   ) {
     super({
       runner: NOOP_RUNNER,
@@ -169,6 +224,33 @@ export class WSForwardingExecutor extends AgentExecutor {
     let history = appendHistoryMessage(task.history ?? [], message);
     task.history = history;
 
+    // Stateful-context delta path (#410): when the router forwards only the
+    // new turn (marking the request `delta: true` on the openai-compat
+    // metadata) it holds no transcript — so reconstruct the prior turns of
+    // this `contextId` from the store and ship them on the frame. Only when a
+    // verified `principalId` is present (the load is principal-scoped) and the
+    // request is actually a delta; classic full-replay requests carry every
+    // turn in the envelope already and get no `contextHistory`. A failed load
+    // must not sink the turn — fall back to delta-only (fresh context).
+    let contextHistory: Message[] | undefined;
+    if (principalId !== undefined && isDeltaRequest(rawMetadata)) {
+      try {
+        contextHistory = await reconstructContextHistory(
+          this.taskStore,
+          contextId,
+          principalId,
+          taskId,
+        );
+      } catch (err) {
+        logEvent('context_history_load_error', {
+          agentId: this.agentId,
+          taskId,
+          contextId,
+          error: String(err),
+        });
+      }
+    }
+
     const sent = this.registry.sendToAgent(this.agentId, {
       type: 'task.assign',
       taskId,
@@ -183,6 +265,9 @@ export class WSForwardingExecutor extends AgentExecutor {
         ...(forwardMetadata !== undefined ? { metadata: forwardMetadata } : {}),
         ...(message.extensions !== undefined ? { extensions: message.extensions } : {}),
       },
+      ...(contextHistory !== undefined
+        ? { contextHistory: contextHistory.map(projectHistoryMessage) as never }
+        : {}),
       ...(message.extensions !== undefined ? { requestedExtensions: message.extensions } : {}),
     });
 

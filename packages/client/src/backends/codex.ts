@@ -14,9 +14,11 @@ import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.j
 import { createLogger, type Logger } from '../logger.js';
 import {
   callerToolDispatchActive,
+  chatHistoryFromA2AMessages,
   chatHistoryFromMessages,
   collectSystemFromMessages,
   dumpOpenAICompatTaskWire,
+  mergeChatHistory,
   parseOpenAICompatEnvelope,
 } from './openai-compat.js';
 import {
@@ -1063,10 +1065,15 @@ export function createCodexBackend(
         const envelopeSystem = envelope
           ? collectSystemFromMessages(envelope.messages)
           : undefined;
-        const envelopeChatHistory =
+        // Stateful-context delta (#410): fold server-reconstructed prior turns
+        // (`task.contextHistory`) ahead of the envelope's own chat_history. In
+        // classic full-replay mode contextHistory is absent → no-op.
+        const envelopeChatHistory = mergeChatHistory(
+          chatHistoryFromA2AMessages(task.contextHistory),
           envelope && Array.isArray(envelope.messages)
             ? chatHistoryFromMessages(envelope.messages)
-            : null;
+            : null,
+        );
         const envelopeModelRaw =
           envelope && typeof envelope.model === 'string' && envelope.model.length > 0
             ? envelope.model

@@ -4,11 +4,13 @@ import { OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import {
   buildOpenAICompatSystemPrompt,
   callerToolDispatchActive,
+  chatHistoryFromA2AMessages,
   chatHistoryFromMessages,
   collectSystemFromMessages,
   dumpOpenAICompatTaskWire,
   formatChatHistory,
   formatChatHistoryBlocks,
+  mergeChatHistory,
   MIN_CACHEABLE_FROZEN_CHARS,
   type OpenAICompatHistoryEntry,
   parseOpenAICompatEnvelope,
@@ -779,4 +781,58 @@ test('dumpOpenAICompatTaskWire: minimal case (no tools, no history, just parts h
   assert.match(captured[0], /parsed=null/);
   assert.match(captured[1], /^\[openai-compat trace\] parts \(1 entries\):/);
   assert.match(captured[2], /^  \[0\] text: "hi"/);
+});
+
+// ---- Stateful-context history projection (#410) ----
+
+test('chatHistoryFromA2AMessages maps roles and concatenates text parts', () => {
+  const out = chatHistoryFromA2AMessages([
+    { role: 'user', parts: [{ kind: 'text', text: 'hello ' }, { kind: 'text', text: 'world' }] },
+    { role: 'agent', parts: [{ kind: 'text', text: 'hi there' }] },
+  ]);
+  assert.deepEqual(out, [
+    { role: 'user', content: 'hello world' },
+    { role: 'assistant', content: 'hi there' },
+  ]);
+});
+
+test('chatHistoryFromA2AMessages drops non-text parts and empty-text messages', () => {
+  const out = chatHistoryFromA2AMessages([
+    { role: 'user', parts: [{ kind: 'text', text: 'keep' }] },
+    // File-only agent turn → no text → dropped.
+    { role: 'agent', parts: [{ kind: 'file', file: { uri: 'x' } } as never] },
+    { role: 'agent', parts: [{ kind: 'text', text: 'also keep' }] },
+  ]);
+  assert.deepEqual(out, [
+    { role: 'user', content: 'keep' },
+    { role: 'assistant', content: 'also keep' },
+  ]);
+});
+
+test('chatHistoryFromA2AMessages returns null for absent or fully-empty input', () => {
+  assert.equal(chatHistoryFromA2AMessages(undefined), null);
+  assert.equal(chatHistoryFromA2AMessages([]), null);
+  assert.equal(
+    chatHistoryFromA2AMessages([{ role: 'user', parts: [{ kind: 'text', text: '' }] }]),
+    null,
+  );
+});
+
+test('mergeChatHistory prepends context history ahead of the envelope history', () => {
+  const context: OpenAICompatHistoryEntry[] = [{ role: 'user', content: 'prior' }];
+  const envelope: OpenAICompatHistoryEntry[] = [{ role: 'assistant', content: 'env' }];
+  assert.deepEqual(mergeChatHistory(context, envelope), [
+    { role: 'user', content: 'prior' },
+    { role: 'assistant', content: 'env' },
+  ]);
+});
+
+test('mergeChatHistory returns the non-empty side, or null when both empty', () => {
+  const only: OpenAICompatHistoryEntry[] = [{ role: 'user', content: 'x' }];
+  // Delta mode: envelope history is null (only the new turn), context supplies it.
+  assert.deepEqual(mergeChatHistory(only, null), only);
+  // Full-replay mode: context is null, envelope rides through unchanged.
+  assert.deepEqual(mergeChatHistory(null, only), only);
+  assert.equal(mergeChatHistory(null, null), null);
+  assert.equal(mergeChatHistory([], null), null);
 });

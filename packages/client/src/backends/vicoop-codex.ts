@@ -18,9 +18,11 @@ import {
   epochSecondsToIso,
 } from './usage-normalize.js';
 import {
+  chatHistoryFromA2AMessages,
   chatHistoryFromMessages,
   collectSystemFromMessages,
   dumpOpenAICompatTaskWire,
+  mergeChatHistory,
   parseOpenAICompatEnvelope,
   type OpenAICompatHistoryEntry,
   type OpenAICompatMessageContent,
@@ -1335,10 +1337,15 @@ export function createVicoopCodexBackend(
       }
 
       const system = envelope ? collectSystemFromMessages(envelope.messages) : undefined;
-      const chatHistory =
+      // Stateful-context delta (#410): fold server-reconstructed prior turns
+      // (`task.contextHistory`) ahead of the envelope's own chat_history. In
+      // classic full-replay mode contextHistory is absent → no-op.
+      const chatHistory = mergeChatHistory(
+        chatHistoryFromA2AMessages(task.contextHistory),
         envelope && Array.isArray(envelope.messages)
           ? chatHistoryFromMessages(envelope.messages)
-          : null;
+          : null,
+      );
 
       const userContent = flattenA2AUserContent(task.message.parts);
       // Tool-continuation edge case (openai-compat spec): A2A parts is the

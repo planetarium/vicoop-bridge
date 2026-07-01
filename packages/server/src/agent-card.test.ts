@@ -8,6 +8,17 @@ import {
 } from '@vicoop-bridge/protocol';
 import { buildAgentA2XAgent } from './agent-card.js';
 import { Registry, type ClientConnection } from './registry.js';
+import type { ContextAwareTaskStore } from './postgres-task-store.js';
+
+// buildAgentA2XAgent now takes a ContextAwareTaskStore (the executor
+// reconstructs per-context history for stateful-context delta requests, #410).
+// These card-surface tests don't exercise that path, so a no-op
+// `loadByContextId` over the SDK in-memory store is sufficient.
+class TestTaskStore extends InMemoryTaskStore implements ContextAwareTaskStore {
+  async loadByContextId(): Promise<[]> {
+    return [];
+  }
+}
 
 function fakeConn(card: AgentCard, overrides: Partial<ClientConnection> = {}): ClientConnection {
   return {
@@ -35,7 +46,7 @@ test('buildAgentA2XAgent preserves advertised optional extensions', () => {
       },
       skills: [],
     }),
-    new InMemoryTaskStore(),
+    new TestTaskStore(),
     new Registry(),
     { publicUrl: 'https://bridge.example', deviceFlowEnabled: false },
   );
@@ -59,7 +70,7 @@ test('buildAgentA2XAgent advertises SIWE bearer-auth extension when restricted',
       },
       { allowedCallers: ['eth:0x0000000000000000000000000000000000000002'] },
     ),
-    new InMemoryTaskStore(),
+    new TestTaskStore(),
     new Registry(),
     { publicUrl: 'https://bridge.example', deviceFlowEnabled: false },
   );
@@ -89,7 +100,7 @@ test('buildAgentA2XAgent exposes bearerAuth + deviceFlow security schemes when r
       },
       { allowedCallers: ['eth:0x0000000000000000000000000000000000000002'] },
     ),
-    new InMemoryTaskStore(),
+    new TestTaskStore(),
     new Registry(),
     { publicUrl: 'https://bridge.example', deviceFlowEnabled: true },
   );
@@ -121,7 +132,7 @@ test('buildAgentA2XAgent omits deviceFlow when device flow is not enabled', () =
       },
       { allowedCallers: ['eth:0x0000000000000000000000000000000000000002'] },
     ),
-    new InMemoryTaskStore(),
+    new TestTaskStore(),
     new Registry(),
     { publicUrl: 'https://bridge.example', deviceFlowEnabled: false },
   );
@@ -143,7 +154,7 @@ test('buildAgentA2XAgent omits SIWE extension for public agents', () => {
       capabilities: { streaming: true },
       skills: [],
     }),
-    new InMemoryTaskStore(),
+    new TestTaskStore(),
     new Registry(),
     { publicUrl: 'https://bridge.example', deviceFlowEnabled: false },
   );
@@ -179,7 +190,7 @@ test('buildAgentA2XAgent overrides a wire-declared SIWE extension with the bridg
       },
       { allowedCallers: ['eth:0x0000000000000000000000000000000000000002'] },
     ),
-    new InMemoryTaskStore(),
+    new TestTaskStore(),
     new Registry(),
     { publicUrl: 'https://bridge.example', deviceFlowEnabled: false },
   );
@@ -221,7 +232,7 @@ test('buildAgentA2XAgent drops a wire-declared SIWE extension on restricted agen
       },
       { allowedCallers: ['eth:0x0000000000000000000000000000000000000002'] },
     ),
-    new InMemoryTaskStore(),
+    new TestTaskStore(),
     new Registry(),
     { publicUrl: undefined, deviceFlowEnabled: false },
   );
@@ -250,7 +261,7 @@ test('buildAgentA2XAgent leaves a wire-declared SIWE extension alone when not re
       },
       skills: [],
     }),
-    new InMemoryTaskStore(),
+    new TestTaskStore(),
     new Registry(),
     { publicUrl: 'https://bridge.example', deviceFlowEnabled: false },
   );

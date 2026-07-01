@@ -44,11 +44,13 @@ import {
 } from './claude-usage.js';
 import {
   callerToolDispatchActive,
+  chatHistoryFromA2AMessages,
   chatHistoryFromMessages,
   collectSystemFromMessages,
   describeToolChoice,
   dumpOpenAICompatTaskWire,
   formatChatHistoryBlocks,
+  mergeChatHistory,
   parseOpenAICompatEnvelope,
   requalifyHistoryToolNames,
 } from './openai-compat.js';
@@ -1540,10 +1542,18 @@ export function createClaudeBackend(
         ? envelope.tools
         : undefined;
       const envelopeToolChoice = envelope?.tool_choice;
-      const envelopeChatHistory =
+      // Stateful-context delta (#410): the server reconstructs prior turns of
+      // this `contextId` and ships them on `task.contextHistory` when the
+      // router forwarded only the new turn. Fold them ahead of the envelope's
+      // own `chat_history` so the model reads the whole conversation. In
+      // classic full-replay mode `contextHistory` is absent and this is a
+      // no-op — the envelope already carries every turn.
+      const envelopeChatHistory = mergeChatHistory(
+        chatHistoryFromA2AMessages(task.contextHistory),
         envelope && Array.isArray(envelope.messages)
           ? chatHistoryFromMessages(envelope.messages)
-          : null;
+          : null,
+      );
       const envelopeModelRaw =
         envelope && typeof envelope.model === 'string' && envelope.model.length > 0
           ? envelope.model

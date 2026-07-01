@@ -9,10 +9,12 @@ import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import {
   buildOpenAICompatSystemPrompt,
+  chatHistoryFromA2AMessages,
   chatHistoryFromMessages,
   collectSystemFromMessages,
   dumpOpenAICompatTaskWire,
   formatChatHistory,
+  mergeChatHistory,
   parseOpenAICompatEnvelope,
   tryParseToolCallsEnvelope,
   type OpenAICompatHistoryEntry,
@@ -1438,9 +1440,13 @@ export function createOpenclawBackend(
             ? envelope.tools
             : undefined;
         const envelopeToolChoice = envelope.tool_choice;
-        const envelopeChatHistory = Array.isArray(envelope.messages)
-          ? chatHistoryFromMessages(envelope.messages)
-          : null;
+        // Stateful-context delta (#410): fold server-reconstructed prior turns
+        // (`task.contextHistory`) ahead of the envelope's own chat_history. In
+        // classic full-replay mode contextHistory is absent → no-op.
+        const envelopeChatHistory = mergeChatHistory(
+          chatHistoryFromA2AMessages(task.contextHistory),
+          Array.isArray(envelope.messages) ? chatHistoryFromMessages(envelope.messages) : null,
+        );
         mapped.input.message = composeOpenAICompatUserMessage(
           {
             system: envelopeSystem,

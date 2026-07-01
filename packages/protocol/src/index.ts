@@ -85,6 +85,21 @@ export type AgentExtension = z.infer<typeof AgentExtension>;
 // optional `params.models[]` advertise block. Each entry: `id` required;
 // `reasoning` / `default` optional. The shape is advisory and forward-compat
 // — receivers MUST ignore unknown sub-fields.
+// Detect a stateful-context delta request (issue #410, oai2a2a#106/#107).
+// Under Responses `store:true` semantics the router maps `previous_response_id`
+// onto the A2A `contextId` and forwards ONLY the new turn, marking the request
+// `delta: true` on the openai-compat extension metadata. When set, the agent is
+// expected to reconstruct prior turns of the `contextId` itself (rather than
+// receive the full transcript in the envelope). Reads
+// `metadata[OPENAI_COMPAT_EXTENSION_URI].delta === true`; anything else — the
+// key absent, malformed, or `false` — is a classic full-replay request.
+export function isDeltaRequest(metadata: Record<string, unknown> | undefined): boolean {
+  if (!metadata) return false;
+  const raw = metadata[OPENAI_COMPAT_EXTENSION_URI];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  return (raw as Record<string, unknown>).delta === true;
+}
+
 export const OpenAICompatModelAdvertise = z.object({
   id: z.string().min(1),
   reasoning: z.boolean().optional(),
@@ -352,6 +367,14 @@ export const TaskAssignFrame = z.object({
   contextId: z.string(),
   message: Message,
   requestedExtensions: z.array(z.string()).optional(),
+  // Prior turns of the same `contextId`, reconstructed server-side from the
+  // task store, oldest→newest (issue #410). Present ONLY on stateful-context
+  // delta requests: under Responses `store:true` semantics the router forwards
+  // just the new turn (`message`) plus `previous_response_id` mapped onto
+  // `contextId`, holding no transcript itself — so the agent must be handed the
+  // history to reconstruct the conversation. Absent for classic full-replay
+  // requests, where the openai-compat envelope already carries every turn.
+  contextHistory: z.array(Message).optional(),
 });
 
 export const TaskCancelFrame = z.object({

@@ -270,6 +270,62 @@ export function chatHistoryFromMessages(
   return out.length > 0 ? out : null;
 }
 
+// Flatten an A2A message's parts into a single plain-text string. Text parts
+// are concatenated in order; non-text parts (file / data) are dropped — the
+// stateful-context history channel is text-only, matching the system channel
+// and the backends this ships to. Returns "" when no text survives.
+function a2aMessageText(parts: readonly Part[] | undefined): string {
+  if (!Array.isArray(parts)) return '';
+  const chunks: string[] = [];
+  for (const part of parts) {
+    if (part && (part as { kind?: unknown }).kind === 'text') {
+      const text = (part as { text?: unknown }).text;
+      if (typeof text === 'string' && text.length > 0) chunks.push(text);
+    }
+  }
+  return chunks.join('');
+}
+
+// Project server-reconstructed A2A `contextHistory` (issue #410) — the prior
+// turns of a stateful-context `contextId`, oldest→newest — onto the
+// `chat_history` shape backends already replay. Each A2A message maps by role
+// (`user` → user, `agent` → assistant) with its text parts concatenated into
+// `content`. Messages with no text (e.g. a tool-only agent turn) are dropped —
+// this channel carries text turns, and an empty entry would just add noise to
+// the replayed conversation. Returns null when nothing usable remains so
+// callers can treat it identically to an absent history.
+export function chatHistoryFromA2AMessages(
+  messages: readonly { role: 'user' | 'agent'; parts?: readonly Part[] }[] | undefined,
+): OpenAICompatHistoryEntry[] | null {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  const out: OpenAICompatHistoryEntry[] = [];
+  for (const m of messages) {
+    const text = a2aMessageText(m.parts);
+    if (text.length === 0) continue;
+    out.push(
+      m.role === 'agent'
+        ? { role: 'assistant', content: text }
+        : { role: 'user', content: text },
+    );
+  }
+  return out.length > 0 ? out : null;
+}
+
+// Merge server-reconstructed context history (delta-mode prior turns) ahead of
+// the envelope's own `chat_history`. In delta mode the envelope carries only
+// the new turn (so `envelopeHistory` is null and `contextHistory` supplies the
+// conversation); in classic full-replay mode `contextHistory` is null and the
+// envelope's history rides through unchanged. Returns null when both are empty
+// so backends keep their existing "no history" code paths.
+export function mergeChatHistory(
+  contextHistory: OpenAICompatHistoryEntry[] | null,
+  envelopeHistory: OpenAICompatHistoryEntry[] | null,
+): OpenAICompatHistoryEntry[] | null {
+  if (!contextHistory || contextHistory.length === 0) return envelopeHistory;
+  if (!envelopeHistory || envelopeHistory.length === 0) return contextHistory;
+  return [...contextHistory, ...envelopeHistory];
+}
+
 // Parse a single envelope `messages[]` entry into the chat_history
 // projection. Mirrors the historic on-wire shapes — string-or-content-part
 // `content`, assistant with optional `tool_calls`, tool result strings —

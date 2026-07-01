@@ -2,10 +2,10 @@ import {
   A2XAgent,
   HttpBearerAuthorization,
   OAuth2DeviceCodeAuthorization,
-  type TaskStore,
 } from '@a2x/sdk';
 import { SIWE_BEARER_AUTH_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import type { ClientConnection, Registry } from './registry.js';
+import type { ContextAwareTaskStore } from './postgres-task-store.js';
 import { WSForwardingExecutor } from './executor.js';
 
 export interface AgentA2XOptions {
@@ -27,7 +27,7 @@ export interface AgentA2XOptions {
  */
 export function buildAgentA2XAgent(
   conn: ClientConnection,
-  taskStore: TaskStore,
+  taskStore: ContextAwareTaskStore,
   registry: Registry,
   opts: AgentA2XOptions,
 ): A2XAgent {
