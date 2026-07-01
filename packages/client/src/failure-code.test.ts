@@ -52,6 +52,44 @@ test('normalizeTaskFailError maps quota and rate limit messages before generic u
   );
 });
 
+test('normalizeTaskFailError canonicalizes rate-limit messages to carry the literal phrase', () => {
+  // Bare `429` with no phrase: classified rate_limited, message gets the phrase
+  // a post-content OpenAI-compatible retry heuristic (opencode) matches on.
+  assert.deepEqual(
+    normalizeTaskFailError({
+      code: 'upstream_error',
+      message: 'vicoop-codex serve returned HTTP 429',
+    }),
+    {
+      code: 'rate_limited',
+      message: 'rate limit: vicoop-codex serve returned HTTP 429',
+    },
+  );
+  // Hyphen/underscore spellings the broad classifier accepts but the phrase
+  // matcher would miss are canonicalized too.
+  assert.equal(
+    normalizeTaskFailError({ code: 'turn_failed', message: 'provider rate-limited the request' }).message,
+    'rate limit: provider rate-limited the request',
+  );
+  // A caller that already emits the semantic `rate_limited` code (early-return
+  // path) still gets its bare message canonicalized.
+  assert.equal(
+    normalizeTaskFailError({ code: 'rate_limited', message: 'slow down (429)' }).message,
+    'rate limit: slow down (429)',
+  );
+  // Already carries the phrase: left untouched, no double prefix.
+  assert.deepEqual(
+    normalizeTaskFailError({
+      code: 'upstream_error',
+      message: 'HTTP 429: too many requests',
+    }),
+    {
+      code: 'rate_limited',
+      message: 'HTTP 429: too many requests',
+    },
+  );
+});
+
 test('normalizeTaskFailError maps claude subscription/overload terminal reasons', () => {
   // Claude's "session limit" cap surfaces as a usage/quota exhaustion.
   assert.equal(

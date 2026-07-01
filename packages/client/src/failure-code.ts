@@ -44,25 +44,50 @@ const SEMANTIC_CODES = new Set([
 
 export function normalizeTaskFailError(error: TaskFailError): TaskFailError {
   const { code, message } = error;
-  if (SEMANTIC_CODES.has(code)) return error;
-  if (PRESERVED_INPUT_CODES.has(code)) return error;
+  const normalizedCode = classifyFailureCode(code, message);
+  const normalizedMessage = canonicalizeFailureMessage(normalizedCode, message);
+
+  if (normalizedCode === error.code && normalizedMessage === error.message) {
+    return error;
+  }
+  return { ...error, code: normalizedCode, message: normalizedMessage };
+}
+
+function classifyFailureCode(code: string, message: string): string {
+  if (SEMANTIC_CODES.has(code)) return code;
+  if (PRESERVED_INPUT_CODES.has(code)) return code;
 
   const text = `${code} ${message}`.toLowerCase();
-  let normalizedCode = code;
-  if (isQuotaExceeded(text)) normalizedCode = 'quota_exceeded';
-  else if (isRateLimited(text)) normalizedCode = 'rate_limited';
-  else if (isLoginRequired(text)) normalizedCode = 'login_required';
-  else if (isAuthRequired(text)) normalizedCode = 'auth_required';
-  else if (isAgentUnavailable(text)) normalizedCode = 'agent_unavailable';
-  else if (isModelUnavailable(text)) normalizedCode = 'model_unavailable';
-  else if (DISCONNECTED_CODES.has(code)) normalizedCode = 'disconnected';
-  else if (isNetworkError(text)) normalizedCode = 'network_error';
-  else if (isDisconnected(text)) normalizedCode = 'disconnected';
-  else if (code === 'task_timeout' || isTimeout(text)) normalizedCode = 'timeout';
-  else if (UPSTREAM_CODES.has(code) || isUpstreamError(text)) normalizedCode = 'upstream_error';
+  if (isQuotaExceeded(text)) return 'quota_exceeded';
+  if (isRateLimited(text)) return 'rate_limited';
+  if (isLoginRequired(text)) return 'login_required';
+  if (isAuthRequired(text)) return 'auth_required';
+  if (isAgentUnavailable(text)) return 'agent_unavailable';
+  if (isModelUnavailable(text)) return 'model_unavailable';
+  if (DISCONNECTED_CODES.has(code)) return 'disconnected';
+  if (isNetworkError(text)) return 'network_error';
+  if (isDisconnected(text)) return 'disconnected';
+  if (code === 'task_timeout' || isTimeout(text)) return 'timeout';
+  if (UPSTREAM_CODES.has(code) || isUpstreamError(text)) return 'upstream_error';
+  return code;
+}
 
-  if (normalizedCode === error.code) return error;
-  return { ...error, code: normalizedCode };
+// The machine `code` is dropped before it reaches a downstream OpenAI-compatible
+// client's retry heuristic (@ai-sdk/openai-compatible collapses an in-band
+// `{error:{...}}` chunk to just its message string), so once a stream has
+// committed content the only signal such a client can classify on is the message
+// text. opencode's post-content retry matcher keys on the literal phrases
+// "rate limit" / "too many requests", but `isRateLimited` above also fires on a
+// bare `429`, `rate-limited` (hyphen), or `rate_limit` (underscore) — genuine
+// rate limits whose upstream text lacks the exact phrase. Canonicalize those so
+// the message carries the phrase. This is honest translation, not a mode change:
+// the failure *is* a rate limit (we only reach here when it was classified as
+// one); the upstream detail is preserved after the prefix.
+function canonicalizeFailureMessage(code: string, message: string): string {
+  if (code === 'rate_limited' && !/rate limit|too many requests/i.test(message)) {
+    return message ? `rate limit: ${message}` : 'rate limit';
+  }
+  return message;
 }
 
 function isQuotaExceeded(text: string): boolean {
