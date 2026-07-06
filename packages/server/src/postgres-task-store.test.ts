@@ -380,3 +380,112 @@ test(
     }
   },
 );
+
+// ── updateTask timing instrumentation (issue #414) ──────────────────────────
+
+// logEvent() writes one JSON object per line to console.log. Capture those
+// lines while `fn` runs and return the parsed events plus any thrown error, so
+// a test can assert on both the emitted telemetry and the rethrow.
+async function captureLogEvents(
+  fn: () => Promise<void>,
+): Promise<{ events: Array<Record<string, unknown>>; error: unknown }> {
+  const events: Array<Record<string, unknown>> = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => {
+    const line = args[0];
+    if (typeof line !== 'string') return;
+    try {
+      const obj = JSON.parse(line) as Record<string, unknown>;
+      if (obj && typeof obj === 'object' && 'event' in obj) events.push(obj);
+    } catch {
+      // non-JSON console output — ignore
+    }
+  };
+  let error: unknown;
+  try {
+    await fn();
+  } catch (err) {
+    error = err;
+  } finally {
+    console.log = original;
+  }
+  return { events, error };
+}
+
+test(
+  'updateTask logs task_store_slow_update with per-phase timing when it crosses the threshold (issue #414)',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const prev = process.env.VICOOP_TASKSTORE_SLOW_MS;
+    try {
+      await ensureSchema(sql);
+      const store = new PostgresTaskStore(sql);
+      const created = await store.createTask({});
+      const status = { state: TaskState.WORKING, timestamp: new Date().toISOString() };
+
+      // Threshold 0 → every write counts as "slow", so a normal beat is logged.
+      process.env.VICOOP_TASKSTORE_SLOW_MS = '0';
+      const { events, error } = await captureLogEvents(async () => {
+        await store.updateTask(created.id, { status });
+      });
+      assert.equal(error, undefined, 'updateTask must succeed');
+      const slow = events.filter((e) => e.event === 'task_store_slow_update');
+      assert.equal(slow.length, 1, 'exactly one slow-update event per updateTask');
+      const e = slow[0]!;
+      assert.equal(e.taskId, created.id);
+      assert.equal(e.state, TaskState.WORKING);
+      assert.equal(typeof e.totalMs, 'number');
+      assert.equal(typeof e.txnMs, 'number');
+      // A non-terminal (working) write is heartbeat-shaped: enforceRetention is
+      // a no-op, so its phase time is 0 — the beat's cost is the txn alone.
+      assert.equal(e.retentionMs, 0);
+
+      // A high threshold suppresses the log for the same fast write.
+      process.env.VICOOP_TASKSTORE_SLOW_MS = '600000';
+      const quiet = await captureLogEvents(async () => {
+        await store.updateTask(created.id, { status });
+      });
+      assert.equal(
+        quiet.events.filter((ev) => ev.event === 'task_store_slow_update').length,
+        0,
+        'no slow-update event below the threshold',
+      );
+
+      await store.deleteTask(created.id);
+    } finally {
+      if (prev === undefined) delete process.env.VICOOP_TASKSTORE_SLOW_MS;
+      else process.env.VICOOP_TASKSTORE_SLOW_MS = prev;
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'updateTask logs task_store_update_error and rethrows when the write fails (issue #414)',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    try {
+      await ensureSchema(sql);
+      const store = new PostgresTaskStore(sql);
+      const missingId = `missing-${Date.now()}`;
+      const status = { state: TaskState.WORKING, timestamp: new Date().toISOString() };
+
+      const { events, error } = await captureLogEvents(async () => {
+        // No row exists → the FOR UPDATE read throws "Task not found".
+        await store.updateTask(missingId, { status });
+      });
+
+      assert.ok(error, 'updateTask must rethrow the underlying failure');
+      assert.match(String(error), /Task not found/);
+      const errs = events.filter((ev) => ev.event === 'task_store_update_error');
+      assert.equal(errs.length, 1, 'the failure is logged once');
+      assert.equal(errs[0]!.taskId, missingId);
+      assert.equal(errs[0]!.state, TaskState.WORKING);
+      assert.equal(typeof errs[0]!.totalMs, 'number');
+    } finally {
+      await sql.end();
+    }
+  },
+);

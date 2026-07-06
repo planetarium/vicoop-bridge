@@ -9,8 +9,25 @@ import type {
 import { TaskState, TERMINAL_STATES } from '@a2x/sdk';
 import { OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import type { Sql, SqlExecutor } from './db.js';
+import { logEvent } from './log.js';
 
 const MAX_CONTEXT_TASKS = 10;
+
+// Diagnostic threshold (issue #414): emit a `task_store_slow_update` log event
+// when an `updateTask` takes at least this long. `updateTask` sits on the A2A
+// SSE critical path — the @a2x/sdk `await`s it (un-caught) before yielding each
+// streamed non-terminal status, INCLUDING every 10s liveness heartbeat, to the
+// router's stream — so a slow/blocked write here freezes the outbound stream
+// and can trip the router's stall watchdog while the client runs on to a normal
+// completion. Logging slow writes lets a router stall be correlated against a
+// concrete write duration. Configurable via `VICOOP_TASKSTORE_SLOW_MS`
+// (milliseconds); default 1000. Set to 0 to log every write. Read per call
+// (the cost is nil next to a DB round-trip) so it stays reconfigurable/testable.
+function slowUpdateThresholdMs(): number {
+  const raw = process.env.VICOOP_TASKSTORE_SLOW_MS;
+  const n = raw ? Number(raw) : Number.NaN;
+  return Number.isFinite(n) && n >= 0 ? n : 1000;
+}
 
 type MessageWithMetadata = Message & { metadata?: Record<string, unknown> };
 
@@ -128,33 +145,71 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     // first transaction commits, after which it reads the just-written row —
     // we don't need REPEATABLE READ because the lock, not snapshot isolation,
     // is what serializes the two read-modify-writes.
-    const merged = await this.sql.begin(async (sql) => {
-      const rows = await sql<{ task_json: Task }[]>`
-        SELECT task_json FROM infra.a2a_tasks WHERE task_id = ${taskId} FOR UPDATE
-      `;
-      const existing = rows[0]?.task_json ?? null;
-      if (!existing) {
-        throw new Error(`Task not found: ${taskId}`);
+    // Diagnostic timing (issue #414): time the FOR UPDATE transaction and the
+    // (terminal-only) retention DELETE separately so a slow beat can be
+    // attributed to the right phase. `retentionMs` stays 0 for non-terminal
+    // writes (heartbeats), where enforceRetention is a no-op — so a heartbeat's
+    // cost is purely the transaction below.
+    const startedAt = Date.now();
+    let txnMs = 0;
+    let retentionMs = 0;
+    try {
+      const txnStart = Date.now();
+      const merged = await this.sql.begin(async (sql) => {
+        const rows = await sql<{ task_json: Task }[]>`
+          SELECT task_json FROM infra.a2a_tasks WHERE task_id = ${taskId} FOR UPDATE
+        `;
+        const existing = rows[0]?.task_json ?? null;
+        if (!existing) {
+          throw new Error(`Task not found: ${taskId}`);
+        }
+        const next: Task = { ...existing };
+        if (update.status !== undefined) next.status = update.status;
+        if (update.artifacts !== undefined) next.artifacts = update.artifacts;
+        if (update.history !== undefined) next.history = update.history;
+        if (update.metadata !== undefined) next.metadata = update.metadata;
+        await this.writeTask(next, sql);
+        return next;
+      });
+      txnMs = Date.now() - txnStart;
+      // Retention runs AFTER the transaction commits, on the pool connection —
+      // deliberately NOT inside the FOR UPDATE transaction. Two same-context
+      // tasks reaching a terminal state at once would otherwise each hold the
+      // lock on their own row while the retention DELETE tries to remove the
+      // OTHER's row, producing a lock-order cycle: Postgres aborts one and
+      // rolls back its task-state write with it. Running retention post-commit
+      // keeps the state write durable (it has already committed) and confines
+      // the row lock to the single task being updated, so two updateTask calls
+      // can never deadlock each other.
+      const retentionStart = Date.now();
+      await this.enforceRetention(merged);
+      retentionMs = Date.now() - retentionStart;
+      const totalMs = Date.now() - startedAt;
+      if (totalMs >= slowUpdateThresholdMs()) {
+        logEvent('task_store_slow_update', {
+          taskId,
+          state: merged.status.state,
+          totalMs,
+          txnMs,
+          retentionMs,
+        });
       }
-      const next: Task = { ...existing };
-      if (update.status !== undefined) next.status = update.status;
-      if (update.artifacts !== undefined) next.artifacts = update.artifacts;
-      if (update.history !== undefined) next.history = update.history;
-      if (update.metadata !== undefined) next.metadata = update.metadata;
-      await this.writeTask(next, sql);
-      return next;
-    });
-    // Retention runs AFTER the transaction commits, on the pool connection —
-    // deliberately NOT inside the FOR UPDATE transaction. Two same-context
-    // tasks reaching a terminal state at once would otherwise each hold the
-    // lock on their own row while the retention DELETE tries to remove the
-    // OTHER's row, producing a lock-order cycle: Postgres aborts one and
-    // rolls back its task-state write with it. Running retention post-commit
-    // keeps the state write durable (it has already committed) and confines
-    // the row lock to the single task being updated, so two updateTask calls
-    // can never deadlock each other.
-    await this.enforceRetention(merged);
-    return merged;
+      return merged;
+    } catch (err) {
+      // Surface the timing on the failure path too. The SDK's streamed
+      // updateTask (@a2x/sdk `_handleStreamMessage`) is un-caught, so a throw
+      // here otherwise tears down the SSE with no local trace of how long it
+      // ran or which phase it died in.
+      logEvent('task_store_update_error', {
+        taskId,
+        state: update.status?.state ?? null,
+        totalMs: Date.now() - startedAt,
+        txnMs,
+        retentionMs,
+        error: String(err),
+      });
+      throw err;
+    }
   }
 
   async deleteTask(taskId: string): Promise<void> {

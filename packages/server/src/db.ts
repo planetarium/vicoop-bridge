@@ -13,7 +13,23 @@ export type Sql = postgres.Sql;
 export type SqlExecutor = postgres.Sql | postgres.TransactionSql;
 
 export function createDb(databaseUrl: string): Sql {
-  return postgres(databaseUrl);
+  // Opt-in server-side statement timeout (issue #414). Off by default — no
+  // behavior change unless `VICOOP_DB_STATEMENT_TIMEOUT_MS` is set. When set, a
+  // wedged query (e.g. an `updateTask` blocked on a row lock or a saturated
+  // pool) self-aborts with a Postgres error instead of freezing the A2A SSE
+  // stream for the router's full stall window — turning a silent ~300s stall
+  // into a fast, logged failure the router can fail over on. Applies to every
+  // pooled connection (statement_timeout is per-session), so keep it well above
+  // normal write latency; it also bounds `ensureSchema` and retention DELETEs.
+  const statementTimeoutMs = (() => {
+    const raw = process.env.VICOOP_DB_STATEMENT_TIMEOUT_MS;
+    const n = raw ? Number(raw) : Number.NaN;
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+  })();
+  if (statementTimeoutMs === undefined) return postgres(databaseUrl);
+  return postgres(databaseUrl, {
+    connection: { statement_timeout: statementTimeoutMs },
+  });
 }
 
 export async function ensureSchema(sql: Sql): Promise<void> {
