@@ -438,8 +438,10 @@ test(
       assert.equal(typeof e.totalMs, 'number');
       assert.equal(typeof e.txnMs, 'number');
       // A non-terminal (working) write is heartbeat-shaped: enforceRetention is
-      // a no-op, so its phase time is 0 — the beat's cost is the txn alone.
-      assert.equal(e.retentionMs, 0);
+      // a no-op that returns before any awaited work, so its phase time is ~0
+      // — the beat's cost is the txn alone. (<=1 rather than ===0 to tolerate a
+      // scheduling hiccup crossing a millisecond boundary between the samples.)
+      assert.ok((e.retentionMs as number) <= 1, `retentionMs should be ~0, got ${e.retentionMs}`);
 
       // A high threshold suppresses the log for the same fast write.
       process.env.VICOOP_TASKSTORE_SLOW_MS = '600000';

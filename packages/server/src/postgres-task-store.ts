@@ -9,7 +9,7 @@ import type {
 import { TaskState, TERMINAL_STATES } from '@a2x/sdk';
 import { OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import type { Sql, SqlExecutor } from './db.js';
-import { logEvent } from './log.js';
+import { logEvent, truncate } from './log.js';
 
 const MAX_CONTEXT_TASKS = 10;
 
@@ -152,9 +152,9 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     // cost is purely the transaction below.
     const startedAt = Date.now();
     let txnMs = 0;
+    let retentionStart = 0;
     let retentionMs = 0;
     try {
-      const txnStart = Date.now();
       const merged = await this.sql.begin(async (sql) => {
         const rows = await sql<{ task_json: Task }[]>`
           SELECT task_json FROM infra.a2a_tasks WHERE task_id = ${taskId} FOR UPDATE
@@ -171,7 +171,7 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
         await this.writeTask(next, sql);
         return next;
       });
-      txnMs = Date.now() - txnStart;
+      txnMs = Date.now() - startedAt;
       // Retention runs AFTER the transaction commits, on the pool connection —
       // deliberately NOT inside the FOR UPDATE transaction. Two same-context
       // tasks reaching a terminal state at once would otherwise each hold the
@@ -181,7 +181,7 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
       // keeps the state write durable (it has already committed) and confines
       // the row lock to the single task being updated, so two updateTask calls
       // can never deadlock each other.
-      const retentionStart = Date.now();
+      retentionStart = Date.now();
       await this.enforceRetention(merged);
       retentionMs = Date.now() - retentionStart;
       const totalMs = Date.now() - startedAt;
@@ -199,14 +199,21 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
       // Surface the timing on the failure path too. The SDK's streamed
       // updateTask (@a2x/sdk `_handleStreamMessage`) is un-caught, so a throw
       // here otherwise tears down the SSE with no local trace of how long it
-      // ran or which phase it died in.
+      // ran or which phase it died in. Attribute the elapsed time to whichever
+      // phase was in flight when it threw — a `begin()` throw (a wedged FOR
+      // UPDATE / statement_timeout abort, the primary case this exists to
+      // catch) would otherwise be misreported as `txnMs: 0`.
+      if (txnMs === 0) txnMs = Date.now() - startedAt;
+      else if (retentionMs === 0 && retentionStart !== 0) {
+        retentionMs = Date.now() - retentionStart;
+      }
       logEvent('task_store_update_error', {
         taskId,
         state: update.status?.state ?? null,
         totalMs: Date.now() - startedAt,
         txnMs,
         retentionMs,
-        error: String(err),
+        error: truncate(String(err), 500),
       });
       throw err;
     }
