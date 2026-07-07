@@ -6,6 +6,11 @@ export interface TaskFailError {
 const PRESERVED_INPUT_CODES = new Set([
   'empty_prompt',
   'invalid_input',
+  // Canonical OpenAI code for a context-window overflow. Backends tag it
+  // directly (codex: in-band "exceeds the context window" frames, #402) and
+  // the gateway maps it to 400 (oai2a2a#114/#115) so OpenAI-compatible
+  // clients can compact-and-retry. Must survive normalization verbatim.
+  'context_length_exceeded',
   'invalid_file_part',
   'unsupported_file_uri',
   'unsupported_file_mime',
@@ -42,9 +47,18 @@ const SEMANTIC_CODES = new Set([
   'timeout',
 ]);
 
-export function normalizeTaskFailError(error: TaskFailError): TaskFailError {
+// `classifyText`, when provided, is matched INSTEAD of the (often noisy) human
+// message — callers that have a clean terminal signal (e.g. claude's terminal
+// `result` error string + `terminal_reason`) pass it so classification keys
+// off the actual cause rather than an opaque stdout dump. Falls back to
+// `message` when the hint is empty, preserving the single-arg behaviour.
+export function normalizeTaskFailError(
+  error: TaskFailError,
+  classifyText?: string,
+): TaskFailError {
   const { code, message } = error;
-  const normalizedCode = classifyFailureCode(code, message);
+  const basis = classifyText && classifyText.trim() ? classifyText : message;
+  const normalizedCode = classifyFailureCode(code, basis);
   const normalizedMessage = canonicalizeFailureMessage(normalizedCode, message);
 
   if (normalizedCode === error.code && normalizedMessage === error.message) {
@@ -58,6 +72,14 @@ function classifyFailureCode(code: string, message: string): string {
   if (PRESERVED_INPUT_CODES.has(code)) return code;
 
   const text = `${code} ${message}`.toLowerCase();
+  // A context overflow is a non-retryable CALLER error: no pool member can
+  // serve the same oversized prompt, so it must not look like quota/agent
+  // unavailability (which would cool the agent down and fan out a doomed
+  // failover). Match it first — overflow texts mention limits/tokens that
+  // later matchers could misread — and use the canonical OpenAI code so the
+  // gateway surfaces 400 context_length_exceeded (oai2a2a#114) and clients
+  // can compact-and-retry.
+  if (isContextOverflow(text)) return 'context_length_exceeded';
   if (isQuotaExceeded(text)) return 'quota_exceeded';
   if (isRateLimited(text)) return 'rate_limited';
   if (isLoginRequired(text)) return 'login_required';
@@ -90,12 +112,31 @@ function canonicalizeFailureMessage(code: string, message: string): string {
   return message;
 }
 
+function isContextOverflow(text: string): boolean {
+  // Claude surfaces "Prompt is too long" and the terminal result carries
+  // terminal_reason "blocking_limit"; OpenAI-style upstreams say "context
+  // length" / "maximum context" / "too many tokens".
+  return (
+    text.includes('prompt is too long') ||
+    text.includes('prompt too long') ||
+    text.includes('input is too long') ||
+    text.includes('blocking_limit') ||
+    text.includes('context length') ||
+    text.includes('context_length_exceeded') ||
+    text.includes('maximum context') ||
+    text.includes('too many tokens')
+  );
+}
+
 function isQuotaExceeded(text: string): boolean {
   return (
     /\bquota\b/.test(text) ||
     text.includes('insufficient_quota') ||
     text.includes('exceeded your current quota') ||
-    text.includes('usage limit') ||
+    // "usage limit", but NOT the server-throttle disclaimer "Server is
+    // temporarily limiting requests (not your usage limit)" — that's a
+    // transient rate limit (classified below), not account exhaustion.
+    (text.includes('usage limit') && !text.includes('not your usage limit')) ||
     // Claude subscription cap: "You've hit your session limit · resets 3pm (UTC)".
     text.includes('session limit')
   );

@@ -2145,6 +2145,13 @@ export function createClaudeBackend(
         input: unknown
       } | null = null;
       let finalText: string | null = null;
+      // The run's last `terminal_reason` from the terminal `result` event.
+      // Rides separately from the result text — e.g. a context overflow
+      // reports `terminal_reason: "blocking_limit"` — so a non-zero exit can
+      // be classified by its actual cause even when the result text is absent
+      // or phrased differently. Feeds the classification hint only, never the
+      // caller-facing failure message.
+      let lastTerminalReason: string | null = null;
       // Explicit widening type — without this TS infers a too-narrow type
       // through the `if (parsed) finalUsage = parsed;` assignment when
       // `parseClaudeModelUsageForOpenAICompat` returns `OpenAICompatUsage | null`,
@@ -2568,6 +2575,7 @@ export function createClaudeBackend(
         }
         if (evt.type === 'result') {
           if (typeof evt.result === 'string' && !emittedAskUserQuestion) finalText = evt.result;
+          if (typeof evt.terminal_reason === 'string') lastTerminalReason = evt.terminal_reason;
           if (evt.terminal_reason === 'completed') sawCompletedResult = true;
           if (evt.is_error === true) sawErrorResult = true;
           // Latch off the history prompt-cache split if claude rejected our
@@ -2785,13 +2793,26 @@ export function createClaudeBackend(
         // `completeText` on the success path below) reads the runtime value
         // without tripping control-flow narrowing.
         const reasonText = (finalText ?? '').trim();
+        // Classify off the clean terminal signals — the result text plus the
+        // terminal_reason (e.g. "blocking_limit" for a context overflow, which
+        // never appears in the result text) — rather than the noisy stdout
+        // diagnostic. The hint feeds classification only; the caller-facing
+        // message stays the verbatim reason (or the diagnostic dump when
+        // claude gave no reason, preserving triage data).
+        const terminalReason = (lastTerminalReason ?? '').trim();
+        const classifyHint = [reasonText, terminalReason]
+          .filter((s) => s.length > 0)
+          .join(' ');
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: normalizeTaskFailError({
-            code: 'claude_exit_nonzero',
-            message: reasonText || diagnostic,
-          }),
+          error: normalizeTaskFailError(
+            {
+              code: 'claude_exit_nonzero',
+              message: reasonText || diagnostic,
+            },
+            classifyHint,
+          ),
         });
         return;
       }

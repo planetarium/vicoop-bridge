@@ -1528,6 +1528,75 @@ test('non-zero claude exit carries the terminal reason as a structured code, cle
   }
 });
 
+test('non-zero claude exit on a context overflow classifies as context_length_exceeded', async () => {
+  // A too-long prompt: claude prints "Prompt is too long" in the terminal
+  // result and reports terminal_reason "blocking_limit". The failure must
+  // carry the canonical OpenAI overflow code so the gateway surfaces 400
+  // context_length_exceeded (oai2a2a#114) and the router treats it as a
+  // caller error instead of cooling the agent and failing over the pool.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: true,
+        result: 'Prompt is too long',
+        terminal_reason: 'blocking_limit',
+        usage: { input_tokens: 0, output_tokens: 0 },
+        modelUsage: {},
+        permission_denials: [],
+      }),
+    ],
+    exitCode: 1,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('oversized prompt'), emit, NEVER);
+
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.fail');
+  if (terminal.type === 'task.fail') {
+    assert.equal(terminal.error.code, 'context_length_exceeded');
+    assert.equal(terminal.error.message, 'Prompt is too long');
+  }
+});
+
+test('non-zero claude exit classifies off terminal_reason when the result text is absent', async () => {
+  // blocking_limit rides only on terminal_reason here — no result text. The
+  // classification hint still catches it while the caller-facing message
+  // keeps the diagnostic dump for triage. The padding pushes terminal_reason
+  // out of the stdout tail's last 500 bytes, mirroring real result JSON where
+  // the interesting fields ride early — so this test fails if classification
+  // ever falls back to scraping the diagnostic instead of the hint.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: true,
+        terminal_reason: 'blocking_limit',
+        usage: { input_tokens: 0, output_tokens: 0 },
+        modelUsage: {},
+        permission_denials: [],
+        padding: 'x'.repeat(600),
+      }),
+    ],
+    exitCode: 1,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('oversized prompt, reason only'), emit, NEVER);
+
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.fail');
+  if (terminal.type === 'task.fail') {
+    assert.equal(terminal.error.code, 'context_length_exceeded');
+    assert.match(terminal.error.message, /claude exited with code 1/);
+  }
+});
+
 test('non-zero claude exit with no terminal reason keeps the diagnostic dump', async () => {
   // No parseable result event → finalText stays empty → fall back to the
   // exit/stdout diagnostic so a real crash is still triageable (#119).
