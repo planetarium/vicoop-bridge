@@ -2,19 +2,20 @@
 '@vicoop-bridge/client': patch
 ---
 
-fix(client): classify claude context overflows as `context_length_exceeded`
+fix(client): classify context overflows as `context_length_exceeded`
 and guard the "not your usage limit" server throttle
 
-A claude context-window overflow (`Prompt is too long` /
-`terminal_reason: blocking_limit`) previously collapsed into the opaque
-`claude_exit_nonzero`, so the gateway surfaced a generic 502 and the router
-cooled the agent down and fanned out a doomed failover that could empty the
-pool. Overflow is a non-retryable caller error: it now classifies as the
-canonical OpenAI `context_length_exceeded` (matching the codex backend's
-tagging), which the gateway maps to `400` (oai2a2a#114) so OpenAI-compatible
-clients can compact-and-retry. `context_length_exceeded` is also preserved
-verbatim through `normalizeTaskFailError` so backends that tag it directly
-survive normalization.
+A context-window overflow previously collapsed into an opaque generic code
+(claude: `Prompt is too long` / `terminal_reason: blocking_limit` →
+`claude_exit_nonzero`; codex: the relayed in-band "input exceeds the context
+window" → `upstream_error`), so the gateway surfaced a generic 502 and the
+router cooled the agent down and fanned out a doomed failover that could
+empty the pool. Overflow is a non-retryable caller error: the shared
+`normalizeTaskFailError` matcher now classifies it — for every backend —
+as the canonical OpenAI `context_length_exceeded`, which the gateway maps
+to `400` (oai2a2a#114) so OpenAI-compatible clients can compact-and-retry.
+`context_length_exceeded` is also preserved verbatim through normalization
+so backends that tag it directly survive.
 
 Two supporting fixes:
 

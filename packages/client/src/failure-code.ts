@@ -114,13 +114,15 @@ function canonicalizeFailureMessage(code: string, message: string): string {
 
 function isContextOverflow(text: string): boolean {
   // Claude surfaces "Prompt is too long" and the terminal result carries
-  // terminal_reason "blocking_limit"; OpenAI-style upstreams say "context
-  // length" / "maximum context" / "too many tokens".
+  // terminal_reason "blocking_limit"; codex relays the upstream "Your input
+  // exceeds the context window of this model"; other OpenAI-style upstreams
+  // say "context length" / "maximum context" / "too many tokens".
   return (
     text.includes('prompt is too long') ||
     text.includes('prompt too long') ||
     text.includes('input is too long') ||
     text.includes('blocking_limit') ||
+    text.includes('exceeds the context window') ||
     text.includes('context length') ||
     text.includes('context_length_exceeded') ||
     text.includes('maximum context') ||

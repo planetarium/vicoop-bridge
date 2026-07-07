@@ -131,6 +131,16 @@ test('normalizeTaskFailError classifies context overflow with the canonical Open
     }).code,
     'context_length_exceeded',
   );
+  // codex's in-band relay of the upstream overflow, behind the generic
+  // upstream_error code and the serve prefix.
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'upstream_error',
+      message:
+        'vicoop-codex serve stream error: Your input exceeds the context window of this model. Please adjust your input and try again.',
+    }).code,
+    'context_length_exceeded',
+  );
   // A backend that already tags the canonical code passes through verbatim.
   assert.deepEqual(
     normalizeTaskFailError({
