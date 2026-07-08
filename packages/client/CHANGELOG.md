@@ -1,5 +1,57 @@
 # @vicoop-bridge/client
 
+## 0.35.5
+
+### Patch Changes
+
+- aee81d1: fix(client): classify context overflows as `context_length_exceeded`
+  and guard the "not your usage limit" server throttle
+
+  A context-window overflow previously collapsed into an opaque generic code
+  (claude: `Prompt is too long` / `terminal_reason: blocking_limit` →
+  `claude_exit_nonzero`; codex: the relayed in-band "input exceeds the context
+  window" → `upstream_error`), so the gateway surfaced a generic 502 and the
+  router cooled the agent down and fanned out a doomed failover that could
+  empty the pool. Overflow is a non-retryable caller error: the shared
+  `normalizeTaskFailError` matcher now classifies it — for every backend —
+  as the canonical OpenAI `context_length_exceeded`, which the gateway maps
+  to `400` (oai2a2a#114) so OpenAI-compatible clients can compact-and-retry.
+  `context_length_exceeded` is also preserved verbatim through normalization.
+
+  Scope details:
+
+  - The overflow matcher uses provider-evidenced phrasings only (Anthropic,
+    OpenAI, codex-relayed, Gemini) — no generic fragments like "context
+    length" or "too many tokens", which would reclassify TPM rate limits or
+    assistant prose quoted in crash diagnostics as caller errors.
+  - claude's `terminal_reason: "blocking_limit"` (an overflow signal that can
+    arrive with no result text) is handled in `claude.ts` as a post-
+    classification override: it tags `context_length_exceeded` only when the
+    failure message classified nothing more specific, so explicit quota/rate
+    text always wins over the bare enum token.
+  - `isQuotaExceeded`'s `usage limit` pattern is guarded against the explicit
+    server-throttle disclaimer "Server is temporarily limiting requests (not
+    your usage limit)", which now classifies as `rate_limited` (with or
+    without the "· Rate limited" suffix).
+
+- cd33e7a: Canonicalize `rate_limited` failure messages so post-content OpenAI-compatible
+  clients auto-retry.
+
+  Once a stream has committed content, a downstream OpenAI-compatible client
+  (e.g. opencode) can no longer see the machine `code` — `@ai-sdk/openai-compatible`
+  collapses an in-band `{error:{...}}` chunk to just its message string — so its
+  retry heuristic classifies on the message text alone. That heuristic keys on the
+  literal phrases "rate limit" / "too many requests", but `normalizeTaskFailError`
+  classifies rate limits more broadly (a bare `429`, `rate-limited` with a hyphen,
+  or `rate_limit` with an underscore). A genuine rate limit whose upstream text
+  lacked the exact phrase therefore would not trigger the client's auto-retry.
+
+  `normalizeTaskFailError` now prefixes such messages with `rate limit:` when the
+  final code is `rate_limited` and the phrase is absent. This is an honest
+  translation, not a failure-mode change — the branch is only reached for errors
+  already classified as rate limits — and the original upstream detail is preserved
+  after the prefix. Messages that already carry the phrase are left untouched.
+
 ## 0.35.4
 
 ### Patch Changes
