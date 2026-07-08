@@ -300,6 +300,16 @@ export class WSForwardingExecutor extends AgentExecutor {
       }, this.inactivityTimeoutMs);
     };
 
+    // Observability for the "response arrived but the stream never closed"
+    // class: track whether the client ever sent a frame it marked `final`
+    // (terminal OR a final non-terminal state like input-required). A stream
+    // that closes without ever seeing one ended abnormally (client abort, or a
+    // queue closed by something other than a proper terminal) — exactly the
+    // shape we want to catch. Emitted once, only for those cases (clean
+    // terminals are already covered by ws.ts task_completed/task_failed).
+    const streamStartedAt = Date.now();
+    let sawFinalEvent = false;
+
     try {
       armWatchdog();
       for await (const event of queue.iterate(ac.signal)) {
@@ -314,6 +324,7 @@ export class WSForwardingExecutor extends AgentExecutor {
           continue;
         }
         // status event
+        if (event.final) sawFinalEvent = true;
         history = appendHistoryMessage(history, event.status.message);
         task.history = history;
         if (TERMINAL_STATES.has(event.status.state)) {
@@ -355,6 +366,18 @@ export class WSForwardingExecutor extends AgentExecutor {
       }
     } finally {
       clearWatchdog();
+      if (!sawFinalEvent) {
+        // Closed without any client-marked-final frame — abnormal teardown.
+        logEvent('task_stream_closed', {
+          agentId: this.agentId,
+          taskId,
+          contextId,
+          durationMs: Date.now() - streamStartedAt,
+          reason: ac.signal.aborted ? 'aborted' : 'no_final_frame',
+          finalState: task.status.state,
+          ...(principalId !== undefined ? { principalId } : {}),
+        });
+      }
       this.registry.unbindTask(taskId, binding);
       if (this.abortControllers.get(taskId) === ac) this.abortControllers.delete(taskId);
     }
