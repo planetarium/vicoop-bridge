@@ -111,6 +111,88 @@ test('normalizeTaskFailError maps claude subscription/overload terminal reasons'
   );
 });
 
+test('normalizeTaskFailError classifies context overflow with the canonical OpenAI code', () => {
+  // Anthropic phrasing from a claude non-zero exit — a non-retryable CALLER
+  // error. The canonical code lets the gateway surface 400
+  // context_length_exceeded (oai2a2a#114) so clients compact-and-retry, and
+  // keeps the router from cooling the agent / fanning out a doomed failover.
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'claude_exit_nonzero',
+      message: 'Prompt is too long',
+    }).code,
+    'context_length_exceeded',
+  );
+  // OpenAI-style upstream phrasing behind a generic code.
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'upstream_error',
+      message: "This model's maximum context length is 128000 tokens",
+    }).code,
+    'context_length_exceeded',
+  );
+  // Gemini phrasing relayed under a generic gateway code (openclaw).
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'gateway_chat_error',
+      message:
+        'The input token count (1200000) exceeds the maximum number of tokens allowed (1048576).',
+    }).code,
+    'context_length_exceeded',
+  );
+  // A backend that already tags the canonical code passes through verbatim.
+  assert.deepEqual(
+    normalizeTaskFailError({
+      code: 'context_length_exceeded',
+      message: 'Your input exceeds the context window of this model.',
+    }),
+    {
+      code: 'context_length_exceeded',
+      message: 'Your input exceeds the context window of this model.',
+    },
+  );
+});
+
+test('normalizeTaskFailError keeps throttles and generic fragments out of the overflow class', () => {
+  // Server-side throttle: explicitly "not your usage limit" → transient rate
+  // limit, must NOT be misread as quota exhaustion.
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'claude_exit_nonzero',
+      message:
+        'API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited',
+    }).code,
+    'rate_limited',
+  );
+  // The same throttle without the "· Rate limited" suffix still classifies
+  // as a rate limit — the quota guard hands the text off, never drops it.
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'claude_exit_nonzero',
+      message: 'API Error: Server is temporarily limiting requests (not your usage limit)',
+    }).code,
+    'rate_limited',
+  );
+  // A TPM-style throttle mentioning tokens is a rate limit, not an overflow.
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'upstream_error',
+      message: '429 Too Many Requests: too many tokens per minute, retry after 20s',
+    }).code,
+    'rate_limited',
+  );
+  // Assistant prose quoted in a crash diagnostic must not classify: generic
+  // fragments ("context length", "too many tokens") are not overflow signals.
+  assert.equal(
+    normalizeTaskFailError({
+      code: 'claude_exit_nonzero',
+      message:
+        'claude exited with code 1 [stdout: ..."text":"we discussed context length limits and too many tokens"...]',
+    }).code,
+    'claude_exit_nonzero',
+  );
+});
+
 test('normalizeTaskFailError maps login and auth failures separately', () => {
   assert.equal(
     normalizeTaskFailError({

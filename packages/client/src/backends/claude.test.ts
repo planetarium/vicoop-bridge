@@ -1528,6 +1528,69 @@ test('non-zero claude exit carries the terminal reason as a structured code, cle
   }
 });
 
+test('non-zero claude exit with terminal_reason blocking_limit classifies as context_length_exceeded', async () => {
+  // A context overflow where blocking_limit rides only on terminal_reason —
+  // no result text. The override tags the canonical OpenAI code (so the
+  // gateway surfaces 400 context_length_exceeded, oai2a2a#114) while the
+  // caller-facing message keeps the diagnostic dump for triage.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: true,
+        terminal_reason: 'blocking_limit',
+        usage: { input_tokens: 0, output_tokens: 0 },
+        modelUsage: {},
+        permission_denials: [],
+      }),
+    ],
+    exitCode: 1,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('oversized prompt, reason only'), emit, NEVER);
+
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.fail');
+  if (terminal.type === 'task.fail') {
+    assert.equal(terminal.error.code, 'context_length_exceeded');
+    assert.match(terminal.error.message, /claude exited with code 1/);
+  }
+});
+
+test('explicit failure text beats a stale blocking_limit signal', async () => {
+  // blocking_limit is claude's overflow signal, but a message that classifies
+  // on its own (here: the session-limit quota text) must win — the enum token
+  // never overrides a more specific cause.
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: true,
+        result: "You've hit your session limit · resets 3pm (UTC)",
+        terminal_reason: 'blocking_limit',
+        usage: { input_tokens: 0, output_tokens: 0 },
+        modelUsage: {},
+        permission_denials: [],
+      }),
+    ],
+    exitCode: 1,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+
+  await backend.handle(assign('session limit with blocking_limit reason'), emit, NEVER);
+
+  const terminal = frames.at(-1);
+  assert.ok(terminal && terminal.type === 'task.fail');
+  if (terminal.type === 'task.fail') {
+    assert.equal(terminal.error.code, 'quota_exceeded');
+  }
+});
+
 test('non-zero claude exit with no terminal reason keeps the diagnostic dump', async () => {
   // No parseable result event → finalText stays empty → fall back to the
   // exit/stdout diagnostic so a real crash is still triageable (#119).

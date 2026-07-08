@@ -2145,6 +2145,10 @@ export function createClaudeBackend(
         input: unknown
       } | null = null;
       let finalText: string | null = null;
+      // Set when an error result reports terminal_reason "blocking_limit" —
+      // claude's context-window-overflow signal, which rides separately from
+      // the result text. Drives the failure-code override on the exit path.
+      let sawBlockingLimit = false;
       // Explicit widening type — without this TS infers a too-narrow type
       // through the `if (parsed) finalUsage = parsed;` assignment when
       // `parseClaudeModelUsageForOpenAICompat` returns `OpenAICompatUsage | null`,
@@ -2569,7 +2573,12 @@ export function createClaudeBackend(
         if (evt.type === 'result') {
           if (typeof evt.result === 'string' && !emittedAskUserQuestion) finalText = evt.result;
           if (evt.terminal_reason === 'completed') sawCompletedResult = true;
-          if (evt.is_error === true) sawErrorResult = true;
+          if (evt.is_error === true) {
+            sawErrorResult = true;
+            // Gated on is_error so a benign reason from an earlier result
+            // can never masquerade as an overflow signal.
+            if (evt.terminal_reason === 'blocking_limit') sawBlockingLimit = true;
+          }
           // Latch off the history prompt-cache split if claude rejected our
           // `cache_control` breakpoint (budget/ordering 400). Gated on this
           // task actually having emitted the marker, so unrelated errors don't
@@ -2785,13 +2794,21 @@ export function createClaudeBackend(
         // `completeText` on the success path below) reads the runtime value
         // without tripping control-flow narrowing.
         const reasonText = (finalText ?? '').trim();
+        const normalized = normalizeTaskFailError({
+          code: 'claude_exit_nonzero',
+          message: reasonText || diagnostic,
+        });
+        // claude signals a context overflow via terminal_reason
+        // "blocking_limit", sometimes with no result text at all. Override
+        // only when the message classified nothing more specific — explicit
+        // quota/rate/overflow text always wins over the bare enum token.
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: normalizeTaskFailError({
-            code: 'claude_exit_nonzero',
-            message: reasonText || diagnostic,
-          }),
+          error:
+            normalized.code === 'claude_exit_nonzero' && sawBlockingLimit
+              ? { ...normalized, code: 'context_length_exceeded' }
+              : normalized,
         });
         return;
       }
