@@ -2145,13 +2145,10 @@ export function createClaudeBackend(
         input: unknown
       } | null = null;
       let finalText: string | null = null;
-      // The run's last `terminal_reason` from the terminal `result` event.
-      // Rides separately from the result text — e.g. a context overflow
-      // reports `terminal_reason: "blocking_limit"` — so a non-zero exit can
-      // be classified by its actual cause even when the result text is absent
-      // or phrased differently. Feeds the classification hint only, never the
-      // caller-facing failure message.
-      let lastTerminalReason: string | null = null;
+      // Set when an error result reports terminal_reason "blocking_limit" —
+      // claude's context-window-overflow signal, which rides separately from
+      // the result text. Drives the failure-code override on the exit path.
+      let sawBlockingLimit = false;
       // Explicit widening type — without this TS infers a too-narrow type
       // through the `if (parsed) finalUsage = parsed;` assignment when
       // `parseClaudeModelUsageForOpenAICompat` returns `OpenAICompatUsage | null`,
@@ -2575,9 +2572,13 @@ export function createClaudeBackend(
         }
         if (evt.type === 'result') {
           if (typeof evt.result === 'string' && !emittedAskUserQuestion) finalText = evt.result;
-          if (typeof evt.terminal_reason === 'string') lastTerminalReason = evt.terminal_reason;
           if (evt.terminal_reason === 'completed') sawCompletedResult = true;
-          if (evt.is_error === true) sawErrorResult = true;
+          if (evt.is_error === true) {
+            sawErrorResult = true;
+            // Gated on is_error so a benign reason from an earlier result
+            // can never masquerade as an overflow signal.
+            if (evt.terminal_reason === 'blocking_limit') sawBlockingLimit = true;
+          }
           // Latch off the history prompt-cache split if claude rejected our
           // `cache_control` breakpoint (budget/ordering 400). Gated on this
           // task actually having emitted the marker, so unrelated errors don't
@@ -2793,26 +2794,21 @@ export function createClaudeBackend(
         // `completeText` on the success path below) reads the runtime value
         // without tripping control-flow narrowing.
         const reasonText = (finalText ?? '').trim();
-        // Classify off the clean terminal signals — the result text plus the
-        // terminal_reason (e.g. "blocking_limit" for a context overflow, which
-        // never appears in the result text) — rather than the noisy stdout
-        // diagnostic. The hint feeds classification only; the caller-facing
-        // message stays the verbatim reason (or the diagnostic dump when
-        // claude gave no reason, preserving triage data).
-        const terminalReason = (lastTerminalReason ?? '').trim();
-        const classifyHint = [reasonText, terminalReason]
-          .filter((s) => s.length > 0)
-          .join(' ');
+        const normalized = normalizeTaskFailError({
+          code: 'claude_exit_nonzero',
+          message: reasonText || diagnostic,
+        });
+        // claude signals a context overflow via terminal_reason
+        // "blocking_limit", sometimes with no result text at all. Override
+        // only when the message classified nothing more specific — explicit
+        // quota/rate/overflow text always wins over the bare enum token.
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: normalizeTaskFailError(
-            {
-              code: 'claude_exit_nonzero',
-              message: reasonText || diagnostic,
-            },
-            classifyHint,
-          ),
+          error:
+            normalized.code === 'claude_exit_nonzero' && sawBlockingLimit
+              ? { ...normalized, code: 'context_length_exceeded' }
+              : normalized,
         });
         return;
       }

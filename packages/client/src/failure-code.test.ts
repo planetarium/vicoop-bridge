@@ -131,13 +131,12 @@ test('normalizeTaskFailError classifies context overflow with the canonical Open
     }).code,
     'context_length_exceeded',
   );
-  // codex's in-band relay of the upstream overflow, behind the generic
-  // upstream_error code and the serve prefix.
+  // Gemini phrasing relayed under a generic gateway code (openclaw).
   assert.equal(
     normalizeTaskFailError({
-      code: 'upstream_error',
+      code: 'gateway_chat_error',
       message:
-        'vicoop-codex serve stream error: Your input exceeds the context window of this model. Please adjust your input and try again.',
+        'The input token count (1200000) exceeds the maximum number of tokens allowed (1048576).',
     }).code,
     'context_length_exceeded',
   );
@@ -154,49 +153,43 @@ test('normalizeTaskFailError classifies context overflow with the canonical Open
   );
 });
 
-test('normalizeTaskFailError classifies claude terminal causes via the classify hint', () => {
-  const noisyMessage = 'claude exited with code 1 [stdout: ..."modelUsage":{}...]';
-  // claude's 5h subscription session window — account exhaustion, not a crash.
-  assert.equal(
-    normalizeTaskFailError(
-      { code: 'claude_exit_nonzero', message: noisyMessage },
-      "You've hit your session limit · resets 12:10pm (UTC)",
-    ).code,
-    'quota_exceeded',
-  );
+test('normalizeTaskFailError keeps throttles and generic fragments out of the overflow class', () => {
   // Server-side throttle: explicitly "not your usage limit" → transient rate
   // limit, must NOT be misread as quota exhaustion.
   assert.equal(
-    normalizeTaskFailError(
-      { code: 'claude_exit_nonzero', message: noisyMessage },
-      'API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited',
-    ).code,
+    normalizeTaskFailError({
+      code: 'claude_exit_nonzero',
+      message:
+        'API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited',
+    }).code,
     'rate_limited',
   );
-  // Context overflow signalled only by the terminal_reason (no result text).
+  // The same throttle without the "· Rate limited" suffix still classifies
+  // as a rate limit — the quota guard hands the text off, never drops it.
   assert.equal(
-    normalizeTaskFailError(
-      { code: 'claude_exit_nonzero', message: noisyMessage },
-      'blocking_limit',
-    ).code,
-    'context_length_exceeded',
+    normalizeTaskFailError({
+      code: 'claude_exit_nonzero',
+      message: 'API Error: Server is temporarily limiting requests (not your usage limit)',
+    }).code,
+    'rate_limited',
   );
-  // Empty hint falls back to matching the message (single-arg behaviour).
+  // A TPM-style throttle mentioning tokens is a rate limit, not an overflow.
   assert.equal(
-    normalizeTaskFailError(
-      { code: 'claude_exit_nonzero', message: 'Prompt is too long' },
-      '',
-    ).code,
-    'context_length_exceeded',
+    normalizeTaskFailError({
+      code: 'upstream_error',
+      message: '429 Too Many Requests: too many tokens per minute, retry after 20s',
+    }).code,
+    'rate_limited',
   );
-  // The hint feeds classification only — the message is left as-is (modulo
-  // rate-limit phrase canonicalization, which keys off the message itself).
+  // Assistant prose quoted in a crash diagnostic must not classify: generic
+  // fragments ("context length", "too many tokens") are not overflow signals.
   assert.equal(
-    normalizeTaskFailError(
-      { code: 'claude_exit_nonzero', message: noisyMessage },
-      'blocking_limit',
-    ).message,
-    noisyMessage,
+    normalizeTaskFailError({
+      code: 'claude_exit_nonzero',
+      message:
+        'claude exited with code 1 [stdout: ..."text":"we discussed context length limits and too many tokens"...]',
+    }).code,
+    'claude_exit_nonzero',
   );
 });
 
