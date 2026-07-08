@@ -519,3 +519,74 @@ test('disconnectClient returns 0 when no agents are bound to the client', () => 
   });
   assert.equal(registry.disconnectClient('orphan-client'), 0);
 });
+
+// A recording sink whose finish() flips a flag — enough to observe whether a
+// binding was terminated by the registry.
+function recordingBinding(agentId: string, taskId: string) {
+  const statuses: unknown[] = [];
+  const state = { finished: false };
+  const binding = {
+    agentId,
+    taskId,
+    contextId: `ctx-${taskId}`,
+    sink: {
+      pushStatus: (e: unknown) => statuses.push(e),
+      pushArtifact: () => undefined,
+      finish: () => {
+        state.finished = true;
+      },
+    },
+  };
+  return { binding, statuses, state };
+}
+
+test('unbindTask is identity-scoped — a stale binding never clobbers a newer one', () => {
+  const registry = new Registry();
+  const first = recordingBinding('a1', 't-reuse');
+  registry.bindTask(first.binding);
+
+  // A second run claims the SAME taskId. bindTask terminates the first (it is a
+  // live binding) and installs the second.
+  const second = recordingBinding('a1', 't-reuse');
+  registry.bindTask(second.binding);
+  assert.equal(first.state.finished, true, 'displaced live binding must be finished');
+  assert.equal(registry.getBinding('t-reuse'), second.binding);
+
+  // The first run's late teardown must NOT delete the second's binding.
+  registry.unbindTask('t-reuse', first.binding);
+  assert.equal(
+    registry.getBinding('t-reuse'),
+    second.binding,
+    'stale unbind must not clobber the newer binding',
+  );
+
+  // The second run's own teardown removes it.
+  registry.unbindTask('t-reuse', second.binding);
+  assert.equal(registry.getBinding('t-reuse'), undefined);
+});
+
+test('bindTask leaves a self-rebind untouched (same object is not a displacement)', () => {
+  const registry = new Registry();
+  const only = recordingBinding('a1', 't-self');
+  registry.bindTask(only.binding);
+  registry.bindTask(only.binding);
+  assert.equal(only.state.finished, false, 'rebinding the same object must not fail it');
+  assert.equal(registry.getBinding('t-self'), only.binding);
+});
+
+test('bindTask displacing a live binding emits a superseded terminal on the old sink', () => {
+  const registry = new Registry();
+  const first = recordingBinding('a1', 't-sup');
+  registry.bindTask(first.binding);
+  const second = recordingBinding('a1', 't-sup');
+  registry.bindTask(second.binding);
+
+  assert.equal(first.state.finished, true);
+  const terminal = first.statuses[0] as {
+    final?: boolean;
+    status?: { state?: string; message?: { parts?: Array<{ text?: string }> } };
+  };
+  assert.equal(terminal?.final, true);
+  assert.equal(terminal?.status?.state, 'failed');
+  assert.match(terminal?.status?.message?.parts?.[0]?.text ?? '', /superseded/);
+});

@@ -288,7 +288,19 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       }
       case 'task.complete': {
         const b = opts.registry.getBinding(frame.taskId);
-        if (!b) return;
+        if (!b) {
+          // No live binding for this taskId — the terminal frame cannot be
+          // delivered and the corresponding stream (if any) will not close via
+          // this frame. Surface it: a dropped terminal is the signature of a
+          // wedged SSE stream, and this path is otherwise silent.
+          logEvent('dropped_terminal_frame', {
+            agentId: agentId ?? undefined,
+            taskId: frame.taskId,
+            kind: 'task.complete',
+            state: frame.status.state,
+          });
+          return;
+        }
         b.sink.pushStatus({
           taskId: frame.taskId,
           contextId: b.contextId,
@@ -296,7 +308,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           status: wireStatusToA2X(frame.status, frame.taskId, b.contextId),
         });
         b.sink.finish();
-        opts.registry.unbindTask(frame.taskId);
+        opts.registry.unbindTask(frame.taskId, b);
         logEvent('task_completed', {
           agentId: b.agentId,
           backend: opts.registry.getAgent(b.agentId)?.backendKind ?? 'inline',
@@ -309,7 +321,15 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       }
       case 'task.fail': {
         const b = opts.registry.getBinding(frame.taskId);
-        if (!b) return;
+        if (!b) {
+          logEvent('dropped_terminal_frame', {
+            agentId: agentId ?? undefined,
+            taskId: frame.taskId,
+            kind: 'task.fail',
+            errorCode: frame.error.code,
+          });
+          return;
+        }
         b.sink.pushStatus({
           taskId: frame.taskId,
           contextId: b.contextId,
@@ -328,7 +348,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           },
         });
         b.sink.finish();
-        opts.registry.unbindTask(frame.taskId);
+        opts.registry.unbindTask(frame.taskId, b);
         logEvent('task_failed_by_client', {
           agentId: b.agentId,
           backend: opts.registry.getAgent(b.agentId)?.backendKind ?? 'inline',

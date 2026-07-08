@@ -13,7 +13,7 @@ import {
   type TaskStatusUpdateEvent,
   type TaskStore,
 } from '@a2x/sdk';
-import type { Registry, TaskSink } from './registry.js';
+import type { Registry, TaskBinding, TaskSink } from './registry.js';
 import { AsyncEventQueue } from './event-queue.js';
 import { logEvent } from './log.js';
 import { terminalErrorMessageFields } from './terminal-error.js';
@@ -36,6 +36,20 @@ const NOOP_RUNNER = new InMemoryRunner({
   agent: new NoopAgent(),
   appName: 'vicoop-bridge-noop',
 });
+
+// Server-authoritative inactivity backstop. If a bound task produces NO inbound
+// frame — content, artifact, OR a heartbeat `task.status` — for this long, the
+// bridge fabricates a terminal `failed` status so the SSE stream closes instead
+// of hanging forever on a lost/absent terminal frame (a connected-but-silent
+// daemon, or any future path that drops the terminal). Every inbound frame
+// resets it, so a healthily-heartbeating long task is never reaped. `0`
+// disables it. Default 10 min: comfortably above the longest legitimate silent
+// gap for backends that heartbeat, while still reaping a genuinely dead stream.
+const DEFAULT_INACTIVITY_TIMEOUT_MS = (() => {
+  const raw = process.env.BRIDGE_TASK_INACTIVITY_TIMEOUT_MS;
+  const n = raw ? Number(raw) : Number.NaN;
+  return Number.isFinite(n) && n >= 0 ? n : 600_000;
+})();
 
 function appendArtifactChunk(accumulated: Artifact[], event: TaskArtifactUpdateEvent): void {
   if (event.append !== true) {
@@ -113,6 +127,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     private readonly agentId: string,
     private readonly registry: Registry,
     private readonly taskStore: TaskStore,
+    private readonly inactivityTimeoutMs: number = DEFAULT_INACTIVITY_TIMEOUT_MS,
   ) {
     super({
       runner: NOOP_RUNNER,
@@ -157,14 +172,15 @@ export class WSForwardingExecutor extends AgentExecutor {
     const forwardMetadata = stripInternalMetadata(rawMetadata);
     const requestedExtensions = message.extensions;
 
-    this.registry.bindTask({
+    const binding: TaskBinding = {
       agentId: this.agentId,
       taskId,
       contextId,
       sink,
       ...(principalId !== undefined ? { principalId } : {}),
       ...(requestedExtensions !== undefined ? { requestedExtensions } : {}),
-    });
+    };
+    this.registry.bindTask(binding);
 
     let history = appendHistoryMessage(task.history ?? [], message);
     task.history = history;
@@ -219,8 +235,8 @@ export class WSForwardingExecutor extends AgentExecutor {
       task.status = failEvent.status;
       history = appendHistoryMessage(history, failEvent.status.message);
       task.history = history;
-      this.registry.unbindTask(taskId);
-      this.abortControllers.delete(taskId);
+      this.registry.unbindTask(taskId, binding);
+      if (this.abortControllers.get(taskId) === ac) this.abortControllers.delete(taskId);
       yield failEvent;
       try {
         await this.taskStore.updateTask(taskId, {
@@ -235,8 +251,59 @@ export class WSForwardingExecutor extends AgentExecutor {
 
     const accumulatedArtifacts: Artifact[] = [];
 
+    // Inactivity backstop: reset on every inbound frame; on expiry, fabricate a
+    // terminal `failed` status and close the queue so this generator returns
+    // and the SSE stream closes. Push-after-end and end-after-terminal are
+    // no-ops (AsyncEventQueue), so racing a real terminal frame is harmless.
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    const clearWatchdog = (): void => {
+      if (watchdog !== undefined) {
+        clearTimeout(watchdog);
+        watchdog = undefined;
+      }
+    };
+    const armWatchdog = (): void => {
+      if (this.inactivityTimeoutMs <= 0) return;
+      clearWatchdog();
+      watchdog = setTimeout(() => {
+        queue.push({
+          taskId,
+          contextId,
+          final: true,
+          status: {
+            state: TaskState.FAILED,
+            timestamp: new Date().toISOString(),
+            message: {
+              messageId: `${taskId}-inactivity`,
+              role: 'agent',
+              parts: [{ text: 'task timed out: no activity from the connected agent' }],
+              ...terminalErrorMessageFields(
+                {
+                  code: 'inactivity_timeout',
+                  message: 'no activity from the connected agent',
+                },
+                requestedExtensions,
+              ),
+              taskId,
+              contextId,
+            },
+          },
+        });
+        queue.end();
+        logEvent('task_inactivity_timeout', {
+          agentId: this.agentId,
+          taskId,
+          contextId,
+          inactivityMs: this.inactivityTimeoutMs,
+          ...(principalId !== undefined ? { principalId } : {}),
+        });
+      }, this.inactivityTimeoutMs);
+    };
+
     try {
+      armWatchdog();
       for await (const event of queue.iterate(ac.signal)) {
+        armWatchdog();
         if ('artifact' in event) {
           // Mirror the streamed artifact onto the task object so the
           // post-stream `getTask()` path (push notifications, sync
@@ -261,6 +328,9 @@ export class WSForwardingExecutor extends AgentExecutor {
         }
         yield event;
       }
+      // Stop the watchdog before the awaited persist below — the stream is done
+      // producing, so a timer firing during the DB write would be spurious.
+      clearWatchdog();
 
       if (!TERMINAL_STATES.has(task.status.state)) {
         // Stream ended without a terminal frame (e.g. queue closed by
@@ -284,8 +354,9 @@ export class WSForwardingExecutor extends AgentExecutor {
         logEvent('task_persist_error', { taskId, error: String(err) });
       }
     } finally {
-      this.registry.unbindTask(taskId);
-      this.abortControllers.delete(taskId);
+      clearWatchdog();
+      this.registry.unbindTask(taskId, binding);
+      if (this.abortControllers.get(taskId) === ac) this.abortControllers.delete(taskId);
     }
   }
 

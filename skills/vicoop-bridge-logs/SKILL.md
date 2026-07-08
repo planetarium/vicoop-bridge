@@ -87,6 +87,9 @@ omitted when absent.
 | `task_completed`         | `ws.ts`               | `agentId`, `backend`, `taskId`, `contextId`, `state`, `principalId?` | client reported the task terminal; `state` is usually `completed` |
 | `task_failed_by_client`  | `ws.ts`               | `agentId`, `backend`, `taskId`, `contextId`, `errorCode`, `errorMessage`, `principalId?` | the connected agent failed the task |
 | `task_unreachable`       | `executor.ts`         | `agentId`, `taskId`, `contextId`, `principalId?` | no live client to deliver the task to (agent dropped mid-flight) |
+| `task_inactivity_timeout`| `executor.ts`         | `agentId`, `taskId`, `contextId`, `inactivityMs`, `principalId?` | server-side backstop fired — no inbound frame (content/artifact/heartbeat) for `inactivityMs`; a terminal `failed` was fabricated so the SSE stream closes. A recurring signal here means a backend goes silent without a terminal frame |
+| `dropped_terminal_frame` | `ws.ts`               | `agentId?`, `taskId`, `kind` (`task.complete`/`task.fail`), `state?`/`errorCode?` | a terminal frame arrived for a taskId with **no live binding** — the frame could not be delivered. The key signature of a wedged/mis-bound stream; should be rare-to-never in healthy operation |
+| `binding_displaced`      | `registry.ts`         | `agentId`, `taskId`, `principalId?` | a new task run claimed a taskId already held by a different live binding (duplicate/retried request or fast turn reuse); the old binding was terminated with a `failed` (`task_superseded`) so its stream closes instead of orphaning |
 
 **`agent_request_rejected` reasons** (from `agent-auth.ts`, roughly in check order):
 `missing_bearer`, `bad_token_prefix`, `invalid_token`, `invalid_siwe_bearer`,

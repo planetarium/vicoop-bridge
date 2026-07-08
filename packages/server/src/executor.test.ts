@@ -183,6 +183,51 @@ test('executor records principalId in binding and strips _principalId from outgo
   for await (const _event of gen) void _event;
 });
 
+test('executor inactivity watchdog closes a silent stream with a failed terminal', async () => {
+  // A bound task that never receives a terminal frame (connected-but-silent
+  // daemon, or any path that drops the terminal) must not hang forever: the
+  // server-side inactivity backstop fabricates a `failed` terminal so the
+  // stream closes and the binding is released.
+  const { ws } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'aw',
+    clientId: 'cw',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+  // 25ms inactivity budget so the test is fast; no frame is ever pushed.
+  const executor = new WSForwardingExecutor('aw', registry, noopTaskStore(), 25);
+  const task = {
+    id: 't-wd',
+    contextId: 'ctx-wd',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-wd',
+  } as unknown as Message;
+
+  const events: TaskStatusUpdateEvent[] = [];
+  for await (const event of executor.executeStream(task, message)) {
+    events.push(event as TaskStatusUpdateEvent);
+  }
+
+  assert.ok(events.length >= 1, 'expected at least the fabricated terminal event');
+  const last = events[events.length - 1]!;
+  assert.equal(last.final, true);
+  assert.equal(last.status.state, TaskState.FAILED);
+  assert.match(
+    (last.status.message?.parts?.[0] as { text?: string } | undefined)?.text ?? '',
+    /timed out/,
+  );
+  assert.equal(registry.getBinding('t-wd'), undefined, 'binding must be released');
+});
+
 test('executor omits message.metadata entirely when the only entry was _principalId', async () => {
   // Wire-compat guarantee: a message that had no caller-visible metadata
   // before injection must look identical on the wire after stripping. A
