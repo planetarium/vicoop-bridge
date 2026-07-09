@@ -174,37 +174,53 @@ export class Registry {
   ): void {
     for (const binding of [...this.bindings.values()]) {
       if (binding.agentId !== agentId) continue;
-      binding.sink.pushStatus({
-        taskId: binding.taskId,
-        contextId: binding.contextId,
-        final: true,
-        status: {
-          // `failed` is the spec's terminal failure state; mirrors the
-          // pre-migration behavior where mid-task client disconnects
-          // were surfaced as a failed status with an explanatory message.
-          // Cast keeps this file decoupled from the @a2x/sdk TaskState
-          // enum value while still emitting the wire-correct string.
-          state: 'failed' as never,
-          timestamp: new Date().toISOString(),
-          message: {
-            messageId: `${binding.taskId}-${error.messageIdSuffix}`,
-            role: 'agent',
-            parts: [{ text: error.message }],
-            ...terminalErrorMessageFields(
-              {
-                code: error.code,
-                message: error.message,
-              },
-              binding.requestedExtensions,
-            ),
-            taskId: binding.taskId,
-            contextId: binding.contextId,
-          },
-        },
-      });
-      binding.sink.finish();
-      this.bindings.delete(binding.taskId);
+      this.failBinding(binding, error);
+      // Identity-guarded: only drop the entry if it is still THIS binding, so a
+      // concurrent rebind of the same taskId is never clobbered.
+      if (this.bindings.get(binding.taskId) === binding) {
+        this.bindings.delete(binding.taskId);
+      }
     }
+  }
+
+  // Push a terminal `failed` status onto a binding's sink and close it, so the
+  // executor consuming that sink's queue observes a terminal event and its
+  // executeStream() generator returns (closing the SSE stream) instead of
+  // hanging forever on AsyncEventQueue.iterate(). Does NOT touch the bindings
+  // map — callers decide whether to delete (disconnect) or overwrite (rebind).
+  private failBinding(
+    binding: TaskBinding,
+    error: { code: string; message: string; messageIdSuffix: string },
+  ): void {
+    binding.sink.pushStatus({
+      taskId: binding.taskId,
+      contextId: binding.contextId,
+      final: true,
+      status: {
+        // `failed` is the spec's terminal failure state; mirrors the
+        // pre-migration behavior where mid-task client disconnects
+        // were surfaced as a failed status with an explanatory message.
+        // Cast keeps this file decoupled from the @a2x/sdk TaskState
+        // enum value while still emitting the wire-correct string.
+        state: 'failed' as never,
+        timestamp: new Date().toISOString(),
+        message: {
+          messageId: `${binding.taskId}-${error.messageIdSuffix}`,
+          role: 'agent',
+          parts: [{ text: error.message }],
+          ...terminalErrorMessageFields(
+            {
+              code: error.code,
+              message: error.message,
+            },
+            binding.requestedExtensions,
+          ),
+          taskId: binding.taskId,
+          contextId: binding.contextId,
+        },
+      },
+    });
+    binding.sink.finish();
   }
 
   getAgent(agentId: string): ClientConnection | undefined {
@@ -216,6 +232,27 @@ export class Registry {
   }
 
   bindTask(binding: TaskBinding): void {
+    // A taskId can be reused across turns (A2A keeps the same taskId for an
+    // `input-required` continuation) or arrive on a duplicate/retried request
+    // while the prior run is still in flight. If a DIFFERENT live binding
+    // already holds this taskId, terminate it first — otherwise the displaced
+    // executor's AsyncEventQueue is never closed and its SSE stream hangs
+    // forever (the connected client's frames would now route to the new
+    // binding). Terminating it emits a `failed` terminal so that stream closes
+    // cleanly instead of orphaning.
+    const existing = this.bindings.get(binding.taskId);
+    if (existing && existing !== binding) {
+      logEvent('binding_displaced', {
+        agentId: binding.agentId,
+        taskId: binding.taskId,
+        ...(binding.principalId !== undefined ? { principalId: binding.principalId } : {}),
+      });
+      this.failBinding(existing, {
+        code: 'task_superseded',
+        message: 'task superseded by a newer request for the same task id',
+        messageIdSuffix: 'superseded',
+      });
+    }
     this.bindings.set(binding.taskId, binding);
   }
 
@@ -223,7 +260,14 @@ export class Registry {
     return this.bindings.get(taskId);
   }
 
-  unbindTask(taskId: string): void {
+  // Identity-scoped: only remove the entry when it is still the SAME binding
+  // this caller installed. A stale executor tearing down (after its awaited
+  // taskStore.updateTask) must never delete a newer binding that has since
+  // claimed the same taskId — that clobber is what silently drops the new
+  // turn's terminal frame and wedges its stream open. Mirrors the ws-identity
+  // guard already applied to the agents map in unregisterAgent (issue #365).
+  unbindTask(taskId: string, binding: TaskBinding): void {
+    if (this.bindings.get(taskId) !== binding) return;
     this.bindings.delete(taskId);
   }
 

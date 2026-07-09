@@ -20,6 +20,14 @@ primary_region = "nrt"
   # reclaimed by the hourly cleanup job; "0" disables it. Complements the
   # count-based per-context cap in upsert().
   A2A_TASK_RETENTION_DAYS = "30"
+  # Server-authoritative inactivity backstop (ms) for an in-flight task's SSE
+  # stream: if the connected daemon sends NO frame — content, artifact, or
+  # heartbeat task.status — for this long, the bridge fabricates a terminal
+  # `failed` status so the stream closes instead of hanging on a lost/absent
+  # terminal frame (see WSForwardingExecutor). Any inbound frame resets it, so a
+  # healthily-heartbeating long task is never reaped. "0" disables it. Must sit
+  # above the longest legitimate silent gap for non-heartbeating backends.
+  BRIDGE_TASK_INACTIVITY_TIMEOUT_MS = "600000"
 
 [http_service]
   internal_port = 8787
