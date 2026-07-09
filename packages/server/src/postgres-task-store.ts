@@ -73,8 +73,16 @@ function stripPersistedEnvelope(task: Task): Task {
   return { ...task, metadata: hasMetadata ? nextMetadata : undefined };
 }
 
-export function stripSensitiveMetadata(task: Task): Task {
-  const result = { ...stripPersistedEnvelope(task) };
+export function stripSensitiveMetadata(
+  task: Task,
+  opts?: { preserveEnvelope?: boolean },
+): Task {
+  // `preserveEnvelope` keeps the request envelope on the persisted row (see
+  // PostgresTaskStore's persistRequestEnvelope flag / issue #419); the
+  // message-metadata scrub below (bearer token / principal) always runs
+  // regardless — those must never be persisted.
+  const base = opts?.preserveEnvelope ? task : stripPersistedEnvelope(task);
+  const result = { ...base };
   if (result.history?.length) {
     result.history = result.history.map(stripMessageMetadata);
   }
@@ -88,8 +96,45 @@ export interface ContextAwareTaskStore extends TaskStore {
   loadByContextId(contextId: string, principalId: string, excludeTaskId?: string): Promise<Task[]>;
 }
 
+export interface PostgresTaskStoreOptions {
+  // Retain the full inbound request envelope (`chat_completions_request`) on the
+  // persisted task row instead of stripping it at write time (issue #419).
+  //
+  // Default (false) strips the envelope on every write — the post-#409 behavior
+  // that keeps the table lean. The envelope is redundant by design (the gateway
+  // re-sends the full conversation every turn) and, re-persisted per turn up to
+  // MAX_CONTEXT_TASKS times per context, was the near-quadratic source of the
+  // #408 disk-full incident, so stripping stays the safe default.
+  //
+  // Flipping it to true is an operational forensics switch: it makes every
+  // persisted task a complete, replayable record of its input — needed when a
+  // failure only surfaces at the very end (e.g. an error carried inside an
+  // otherwise-"completed" terminal frame, which a task-state test would miss),
+  // so we cannot reliably decide per-task at write time whether to keep it.
+  // Ops turns it on for a debugging window and off again; it re-introduces the
+  // #408 growth for as long as it is on, so it is NOT meant to be left on.
+  // (Reads still strip on the hot replay path regardless — see loadByContextId.)
+  persistRequestEnvelope?: boolean;
+}
+
+// Parse the A2A_PERSIST_REQUEST_ENVELOPE env value into the store flag. Accepts
+// the usual truthy spellings (case-insensitive); anything else — including
+// unset, empty, "0", "false", "off", or garbage — is false, so the lean,
+// disk-safe default (issue #419) holds unless it is explicitly turned on. Kept
+// pure (no process.env read) so both the caller and its unit test drive it.
+export function parsePersistRequestEnvelope(raw: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test(raw ?? '');
+}
+
 export class PostgresTaskStore implements ContextAwareTaskStore {
-  constructor(private readonly sql: Sql) {}
+  private readonly persistRequestEnvelope: boolean;
+
+  constructor(
+    private readonly sql: Sql,
+    options?: PostgresTaskStoreOptions,
+  ) {
+    this.persistRequestEnvelope = options?.persistRequestEnvelope ?? false;
+  }
 
   async createTask(params: CreateTaskParams): Promise<Task> {
     const task: Task = {
@@ -108,6 +153,12 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     const rows = await this.sql<{ task_json: Task }[]>`
       SELECT task_json FROM infra.a2a_tasks WHERE task_id = ${taskId} LIMIT 1
     `;
+    // Returns the stored row verbatim — including the request envelope when
+    // persistRequestEnvelope is on (issue #419); this is the forensic read path.
+    // Unlike loadByContextId (hot per-turn replay), this is a single on-demand
+    // fetch, so carrying the envelope here is not a bloat concern. The envelope
+    // is never read back for request forwarding (the gateway re-sends it every
+    // turn), so returning it here changes no execution behavior.
     return rows[0]?.task_json ?? null;
   }
 
@@ -182,7 +233,14 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
           ORDER BY created_at DESC, task_id DESC
           LIMIT ${MAX_CONTEXT_TASKS}
         `;
-    return rows.map((r) => r.task_json).reverse();
+    // Strip the request envelope from replayed tasks unconditionally — even
+    // when persistRequestEnvelope is on and the stored rows carry it (issue
+    // #419). The per-turn context replay must stay lean: re-reading a large
+    // cumulative envelope for up to MAX_CONTEXT_TASKS rows every turn is exactly
+    // the read amplification #409 removed, and replay never needs it (the
+    // gateway re-sends the envelope every turn). Forensic access to the retained
+    // envelope is via getTask / SQL instead.
+    return rows.map((r) => stripPersistedEnvelope(r.task_json)).reverse();
   }
 
   /**
@@ -232,7 +290,9 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   // row write participates in the same FOR UPDATE transaction that read it.
   private async writeTask(task: Task, sql: SqlExecutor = this.sql): Promise<void> {
     const ownerPrincipal = extractOwnerPrincipal(task);
-    const sanitized = stripSensitiveMetadata(task);
+    const sanitized = stripSensitiveMetadata(task, {
+      preserveEnvelope: this.persistRequestEnvelope,
+    });
     const contextId = task.contextId ?? task.id;
 
     await sql`
