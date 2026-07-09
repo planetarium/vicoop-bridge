@@ -389,13 +389,16 @@ export class WSForwardingExecutor extends AgentExecutor {
     const ac = this.abortControllers.get(taskId);
 
     // Notify the connected client so it can abort in-flight work and
-    // emit its own task.fail / task.complete frame. Even if the client
-    // ignores it, the local AbortController + binding cleanup proceeds
-    // so the executor's stream terminates promptly.
+    // emit its own task.fail / task.complete frame.
     this.registry.sendToAgent(this.agentId, { type: 'task.cancel', taskId });
 
-    if (ac && !ac.signal.aborted) ac.abort();
-
+    // Deliver the CANCELED terminal through the sink FIRST, then finish the
+    // queue: the executor's iterate() consumes the terminal event (breaking on
+    // TERMINAL_STATES) and yields it to the client before the stream closes.
+    // Aborting first would resolve iterate() with `done` and leave this event
+    // buffered-but-unyielded — the stream would close without ever delivering
+    // the terminal frame. The ac.abort() below is then only a fallback to
+    // unblock a parked executor when there was no binding to deliver through.
     const binding = this.registry.getBinding(taskId);
     if (binding) {
       const cancelStatus: TaskStatusUpdateEvent = {
@@ -410,6 +413,8 @@ export class WSForwardingExecutor extends AgentExecutor {
       binding.sink.pushStatus(cancelStatus);
       binding.sink.finish();
     }
+
+    if (ac && !ac.signal.aborted) ac.abort();
 
     task.status = {
       state: TaskState.CANCELED,

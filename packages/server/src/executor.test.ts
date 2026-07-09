@@ -228,6 +228,49 @@ test('executor inactivity watchdog closes a silent stream with a failed terminal
   assert.equal(registry.getBinding('t-wd'), undefined, 'binding must be released');
 });
 
+test('cancel delivers a CANCELED terminal event through the stream before aborting', async () => {
+  // Regression: cancel() must push the CANCELED terminal + finish BEFORE
+  // ac.abort(); aborting first resolves iterate() with `done` and the terminal
+  // event stays buffered-but-unyielded, closing the stream without ever
+  // delivering a terminal frame to the client.
+  const { ws } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'ac',
+    clientId: 'cc',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+  const executor = new WSForwardingExecutor('ac', registry, noopTaskStore());
+  const task = {
+    id: 't-cancel',
+    contextId: 'ctx-cancel',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-cancel',
+  } as unknown as Message;
+
+  const gen = executor.executeStream(task, message);
+  const first = gen.next(); // runs bindTask + sendToAgent, then parks on iterate()
+  assert.ok(registry.getBinding('t-cancel'), 'binding must exist before cancel');
+
+  await executor.cancel(task);
+
+  const r = await first;
+  assert.equal(r.done, false, 'the CANCELED terminal must be yielded, not swallowed by abort');
+  const ev = r.value as TaskStatusUpdateEvent;
+  assert.equal(ev.final, true);
+  assert.equal(ev.status.state, TaskState.CANCELED);
+  for await (const _event of gen) void _event; // drain to completion
+  assert.equal(registry.getBinding('t-cancel'), undefined, 'binding released');
+});
+
 test('executor omits message.metadata entirely when the only entry was _principalId', async () => {
   // Wire-compat guarantee: a message that had no caller-visible metadata
   // before injection must look identical on the wire after stripping. A
