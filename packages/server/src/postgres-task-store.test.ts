@@ -11,7 +11,11 @@ import postgres from 'postgres';
 import { TaskState } from '@a2x/sdk';
 import type { Message, Task } from '@a2x/sdk';
 import { OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
-import { PostgresTaskStore, stripSensitiveMetadata } from './postgres-task-store.js';
+import {
+  PostgresTaskStore,
+  stripSensitiveMetadata,
+  parsePersistRequestEnvelope,
+} from './postgres-task-store.js';
 import { ensureSchema } from './db.js';
 
 const hasDb = !!process.env.DATABASE_URL;
@@ -24,9 +28,13 @@ function msg(id: string, text: string): Message {
 // owner_principal is derived (extractOwnerPrincipal reads status.message
 // .metadata._principalId). Needed for the count-based retention path, which
 // only fires for owned terminal tasks.
-function ownedTerminalStatus(principalId: string, id: string) {
+function ownedTerminalStatus(
+  principalId: string,
+  id: string,
+  state: TaskState = TaskState.COMPLETED,
+) {
   return {
-    state: TaskState.COMPLETED,
+    state,
     timestamp: new Date().toISOString(),
     message: {
       messageId: id,
@@ -160,14 +168,25 @@ test('stripSensitiveMetadata does not throw on absent or malformed metadata', ()
 // path. `stripSensitiveMetadata`'s preserveEnvelope option is the write-side
 // primitive the flag drives.
 
-test('stripSensitiveMetadata with preserveEnvelope keeps the request envelope', () => {
+test('parsePersistRequestEnvelope: truthy spellings enable, everything else (incl. unset) stays off', () => {
+  for (const on of ['1', 'true', 'TRUE', 'yes', 'Yes', 'on', 'ON']) {
+    assert.equal(parsePersistRequestEnvelope(on), true, `${on} must enable`);
+  }
+  for (const off of [undefined, '', '0', 'false', 'off', 'no', 'nope', ' 1', '1 ', 'enabled']) {
+    assert.equal(parsePersistRequestEnvelope(off), false, `${String(off)} must stay off (safe default)`);
+  }
+});
+
+test('stripSensitiveMetadata with preserveEnvelope keeps the request envelope intact', () => {
   const task = taskWithRequestEnvelope();
+  const original = (task.metadata as Record<string, Record<string, unknown>>)[OAI]
+    .chat_completions_request;
   const persisted = stripSensitiveMetadata(task, { preserveEnvelope: true });
   const ext = (persisted.metadata as Record<string, Record<string, unknown>> | undefined)?.[OAI];
-  assert.ok(
-    ext && 'chat_completions_request' in ext,
-    'the envelope must be retained when preserveEnvelope is set',
-  );
+  assert.ok(ext, 'the openai-compat extension must survive');
+  // Content equality, not just presence — a shallow-copy bug that dropped
+  // messages[] would pass a presence-only check.
+  assert.deepEqual(ext.chat_completions_request, original);
 });
 
 test('stripSensitiveMetadata with preserveEnvelope still scrubs bearer/principal from message metadata', () => {
@@ -409,6 +428,85 @@ test(
           undefined,
           'loadByContextId must strip the envelope even when persistRequestEnvelope is on',
         );
+      }
+    } finally {
+      await sql`DELETE FROM infra.a2a_tasks WHERE context_id = ${contextId}`;
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'persistRequestEnvelope retains the envelope on a FAILED terminal row (the named forensics case, #419)',
+  { skip: !hasDb },
+  async () => {
+    // The feature exists for failures — drive a task all the way to FAILED with
+    // the flag on and confirm getTask still hands back its full input.
+    const sql = postgres(process.env.DATABASE_URL!);
+    const contextId = `ctx-envelope-fail-${Date.now()}`;
+    const principalId = `eth:0xenvelope-fail-${Date.now()}`;
+    try {
+      await ensureSchema(sql);
+      const store = new PostgresTaskStore(sql, { persistRequestEnvelope: true });
+
+      const envelope = { model: 'gpt-4', messages: [{ role: 'user', content: 'kaboom'.repeat(400) }] };
+      const task = await store.createTask({
+        contextId,
+        metadata: { [OAI]: { chat_completions_request: envelope } },
+      });
+      await store.updateTask(task.id, {
+        status: ownedTerminalStatus(principalId, 'boom', TaskState.FAILED),
+      });
+
+      const failed = await store.getTask(task.id);
+      assert.equal(failed?.status.state, TaskState.FAILED, 'task reached FAILED');
+      const ext = (failed?.metadata as Record<string, Record<string, unknown>> | undefined)?.[OAI];
+      assert.deepEqual(ext?.chat_completions_request, envelope, 'failed row retains its full input');
+    } finally {
+      await sql`DELETE FROM infra.a2a_tasks WHERE context_id = ${contextId}`;
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'persistRequestEnvelope keeps each row\'s own envelope across a multi-turn context (no cross-contamination)',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const contextId = `ctx-envelope-multi-${Date.now()}`;
+    const principalId = `eth:0xenvelope-multi-${Date.now()}`;
+    try {
+      await ensureSchema(sql);
+      const store = new PostgresTaskStore(sql, { persistRequestEnvelope: true });
+
+      // Three turns in one context, each with a distinct envelope.
+      const ids: string[] = [];
+      const envelopes: Record<string, unknown>[] = [];
+      for (let i = 0; i < 3; i++) {
+        const envelope = { model: 'gpt-4', messages: [{ role: 'user', content: `turn-${i}` }] };
+        envelopes.push(envelope);
+        const t = await store.createTask({
+          contextId,
+          metadata: { [OAI]: { chat_completions_request: envelope } },
+        });
+        await store.updateTask(t.id, { status: ownedTerminalStatus(principalId, `m-${i}`) });
+        ids.push(t.id);
+      }
+
+      // Each stored row must carry ITS OWN envelope, not a neighbour's.
+      for (let i = 0; i < ids.length; i++) {
+        const stored = await store.getTask(ids[i]!);
+        const ext = (stored?.metadata as Record<string, Record<string, unknown>> | undefined)?.[OAI];
+        assert.deepEqual(ext?.chat_completions_request, envelopes[i], `row ${i} keeps its own envelope`);
+      }
+
+      // Replay of the whole context stays lean regardless.
+      const replay = await store.loadByContextId(contextId, principalId);
+      assert.equal(replay.length, 3, 'all three turns replayed');
+      for (const t of replay) {
+        const ext = (t.metadata as Record<string, Record<string, unknown>> | undefined)?.[OAI];
+        assert.equal(ext?.chat_completions_request, undefined, 'replay strips every row');
       }
     } finally {
       await sql`DELETE FROM infra.a2a_tasks WHERE context_id = ${contextId}`;

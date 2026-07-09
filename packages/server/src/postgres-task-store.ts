@@ -117,6 +117,15 @@ export interface PostgresTaskStoreOptions {
   persistRequestEnvelope?: boolean;
 }
 
+// Parse the A2A_PERSIST_REQUEST_ENVELOPE env value into the store flag. Accepts
+// the usual truthy spellings (case-insensitive); anything else — including
+// unset, empty, "0", "false", "off", or garbage — is false, so the lean,
+// disk-safe default (issue #419) holds unless it is explicitly turned on. Kept
+// pure (no process.env read) so both the caller and its unit test drive it.
+export function parsePersistRequestEnvelope(raw: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test(raw ?? '');
+}
+
 export class PostgresTaskStore implements ContextAwareTaskStore {
   private readonly persistRequestEnvelope: boolean;
 
