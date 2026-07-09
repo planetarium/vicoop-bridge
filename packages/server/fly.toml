@@ -20,6 +20,16 @@ primary_region = "nrt"
   # reclaimed by the hourly cleanup job; "0" disables it. Complements the
   # count-based per-context cap in upsert().
   A2A_TASK_RETENTION_DAYS = "30"
+  # Forensics switch for the inbound request envelope (see #419 / #408 / #409).
+  # Unset/false (the default) strips the full `chat_completions_request` from
+  # every persisted task row — the lean post-#409 behavior. Set to "1"/"true" to
+  # retain it, making each stored task a complete, replayable record of its input
+  # (inspect via getTask / SQL: `task_json`). This re-introduces the #408
+  # near-quadratic growth for as long as it is on, so it is an ON-DEMAND
+  # debugging toggle to enable for a window and turn back off — NOT a steady
+  # state. Left off here on purpose; flip it with `fly secrets set` / a deploy
+  # when investigating, then revert (and VACUUM FULL to reclaim the disk).
+  # A2A_PERSIST_REQUEST_ENVELOPE = "1"
   # Server-authoritative inactivity backstop (ms) for an in-flight task's SSE
   # stream: if the connected daemon sends NO frame — content, artifact, or
   # heartbeat task.status — for this long, the bridge fabricates a terminal

@@ -153,6 +153,48 @@ test('stripSensitiveMetadata does not throw on absent or malformed metadata', ()
   );
 });
 
+// ── issue #419: opt-in retention of the request envelope ────────────────────
+// Stripping is the default (post-#409, keeps the table lean). The
+// persistRequestEnvelope store flag flips it into a forensics mode that keeps
+// the full envelope on every persisted row; reads still strip on the hot replay
+// path. `stripSensitiveMetadata`'s preserveEnvelope option is the write-side
+// primitive the flag drives.
+
+test('stripSensitiveMetadata with preserveEnvelope keeps the request envelope', () => {
+  const task = taskWithRequestEnvelope();
+  const persisted = stripSensitiveMetadata(task, { preserveEnvelope: true });
+  const ext = (persisted.metadata as Record<string, Record<string, unknown>> | undefined)?.[OAI];
+  assert.ok(
+    ext && 'chat_completions_request' in ext,
+    'the envelope must be retained when preserveEnvelope is set',
+  );
+});
+
+test('stripSensitiveMetadata with preserveEnvelope still scrubs bearer/principal from message metadata', () => {
+  const task = {
+    id: 't5',
+    contextId: 'c5',
+    status: {
+      state: TaskState.FAILED,
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message: {
+        messageId: 'm',
+        role: 'agent',
+        parts: [{ kind: 'text', text: 'x' }],
+        metadata: { _bearerToken: 'secret', _principalId: 'eth:0x1', keep: 1 },
+      },
+    },
+    metadata: { [OAI]: { chat_completions_request: { model: 'gpt-4', messages: [] } } },
+  } as unknown as Task;
+  const persisted = stripSensitiveMetadata(task, { preserveEnvelope: true });
+  const ext = (persisted.metadata as Record<string, Record<string, unknown>>)[OAI];
+  assert.ok(ext && 'chat_completions_request' in ext, 'envelope retained');
+  const sm = (persisted.status.message as { metadata: Record<string, unknown> }).metadata;
+  assert.equal(sm._bearerToken, undefined, 'bearer token scrubbed even with preserveEnvelope');
+  assert.equal(sm._principalId, undefined, 'principal scrubbed even with preserveEnvelope');
+  assert.equal(sm.keep, 1, 'non-sensitive message metadata retained');
+});
+
 // ── updateTask concurrency (issue #366) ─────────────────────────────────────
 
 test(
@@ -287,6 +329,86 @@ test(
             }`,
           );
         }
+      }
+    } finally {
+      await sql`DELETE FROM infra.a2a_tasks WHERE context_id = ${contextId}`;
+      await sql.end();
+    }
+  },
+);
+
+// ── request-envelope retention end-to-end (issue #419) ──────────────────────
+
+test(
+  'default store strips the request envelope from persisted rows',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const contextId = `ctx-envelope-off-${Date.now()}`;
+    const principalId = `eth:0xenvelope-off-${Date.now()}`;
+    try {
+      await ensureSchema(sql);
+      const store = new PostgresTaskStore(sql); // persistRequestEnvelope defaults to false
+
+      const envelope = { model: 'gpt-4', messages: [{ role: 'user', content: 'x'.repeat(2000) }] };
+      const metadata = { [OAI]: { chat_completions_request: envelope } };
+
+      const task = await store.createTask({ contextId, metadata });
+      await store.updateTask(task.id, { status: ownedTerminalStatus(principalId, 'done') });
+
+      const stored = await store.getTask(task.id);
+      assert.equal(
+        (stored?.metadata as Record<string, unknown> | undefined)?.[OAI],
+        undefined,
+        'default store must strip the request envelope even for getTask',
+      );
+    } finally {
+      await sql`DELETE FROM infra.a2a_tasks WHERE context_id = ${contextId}`;
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'persistRequestEnvelope store retains the envelope for getTask/SQL but still strips it from replay (issue #419)',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const contextId = `ctx-envelope-on-${Date.now()}`;
+    const principalId = `eth:0xenvelope-on-${Date.now()}`;
+    try {
+      await ensureSchema(sql);
+      const store = new PostgresTaskStore(sql, { persistRequestEnvelope: true });
+
+      const envelope = {
+        model: 'gpt-4',
+        messages: [{ role: 'user', content: 'boom'.repeat(500) }],
+      };
+      const metadata = { [OAI]: { chat_completions_request: envelope } };
+
+      // createTask persists SUBMITTED with the envelope; the terminal update
+      // merges onto that row. The envelope must survive into the stored row even
+      // though the update itself carries only status (the merge reads the raw
+      // row, so the carrier envelope is preserved regardless of terminal state).
+      const task = await store.createTask({ contextId, metadata });
+      await store.updateTask(task.id, { status: ownedTerminalStatus(principalId, 'done') });
+
+      // Forensic read (getTask): full envelope retained.
+      const stored = await store.getTask(task.id);
+      const ext = (stored?.metadata as Record<string, Record<string, unknown>> | undefined)?.[OAI];
+      assert.ok(ext?.chat_completions_request, 'getTask must retain the request envelope when on');
+      assert.deepEqual(ext.chat_completions_request, envelope);
+
+      // Hot replay (loadByContextId): envelope stripped regardless of the flag.
+      const replay = await store.loadByContextId(contextId, principalId);
+      assert.ok(replay.length >= 1, 'the owned task is replayed');
+      for (const t of replay) {
+        const rext = (t.metadata as Record<string, Record<string, unknown>> | undefined)?.[OAI];
+        assert.equal(
+          rext?.chat_completions_request,
+          undefined,
+          'loadByContextId must strip the envelope even when persistRequestEnvelope is on',
+        );
       }
     } finally {
       await sql`DELETE FROM infra.a2a_tasks WHERE context_id = ${contextId}`;

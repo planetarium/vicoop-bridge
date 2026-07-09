@@ -483,7 +483,16 @@ export function createAdminA2XAgent(opts: AdminAgentOptions): {
   handler: DefaultRequestHandler;
   taskStore: PostgresTaskStore;
 } {
-  const taskStore = new PostgresTaskStore(opts.db);
+  // Operational forensics switch (issue #419): when A2A_PERSIST_REQUEST_ENVELOPE
+  // is truthy, retain the full inbound request envelope on persisted task rows
+  // instead of stripping it (the lean post-#409 default). Left on it re-creates
+  // the #408 growth, so it is an on-demand debugging toggle, not a steady state.
+  // This store is shared by the admin agent and every WS-forwarding agent (see
+  // buildAgentA2XAgent in http.tsx), so the flag governs all persisted tasks.
+  const persistRequestEnvelope = /^(1|true|yes|on)$/i.test(
+    process.env.A2A_PERSIST_REQUEST_ENVELOPE ?? '',
+  );
+  const taskStore = new PostgresTaskStore(opts.db, { persistRequestEnvelope });
   const executor = new AdminA2XExecutor(opts.db, opts.registry, taskStore);
 
   const a2xAgent = new A2XAgent({
