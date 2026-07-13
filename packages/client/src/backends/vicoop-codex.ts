@@ -980,12 +980,22 @@ async function streamChatCompletions(
 // (binary missing, timeout, non-JSON stdout, unexpected shape) so the
 // caller can skip the advertise / `envelope.model` gate silently. Mirrors
 // `probeClaudeModel`'s "best-effort, fail-open" contract.
+// A model advertised by `vicoop-codex models --json`, reduced to the fields the
+// bridge mirrors onto the openai-compat/v1 advertise. `contextWindow` is the
+// effective window in tokens (null when the CLI doesn't report one — e.g. a
+// vicoop-codex predating the field). vicoop-codex exposes no output-token
+// ceiling, so `maxOutputTokens` is never advertised for this backend.
+export interface VicoopCodexModel {
+  id: string;
+  contextWindow: number | null;
+}
+
 export async function probeVicoopCodexModels(args: {
   command: string;
   spawn: VicoopCodexSpawnFn;
   cwd?: string;
   timeoutMs: number;
-}): Promise<string[] | null> {
+}): Promise<VicoopCodexModel[] | null> {
   if (args.timeoutMs <= 0) return null;
   let child: VicoopCodexChildHandle;
   try {
@@ -993,10 +1003,10 @@ export async function probeVicoopCodexModels(args: {
   } catch {
     return null;
   }
-  return await new Promise<string[] | null>((resolve) => {
+  return await new Promise<VicoopCodexModel[] | null>((resolve) => {
     let stdout = '';
     let settled = false;
-    const finish = (value: string[] | null): void => {
+    const finish = (value: VicoopCodexModel[] | null): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -1025,14 +1035,20 @@ export async function probeVicoopCodexModels(args: {
           finish(null);
           return;
         }
-        const ids: string[] = [];
+        const models: VicoopCodexModel[] = [];
         for (const m of parsed.models) {
-          if (m && typeof m === 'object' && typeof (m as { id?: unknown }).id === 'string') {
-            const id = (m as { id: string }).id;
-            if (id.length > 0) ids.push(id);
-          }
+          if (!m || typeof m !== 'object') continue;
+          const raw = m as { id?: unknown; context_window?: unknown };
+          const id = typeof raw.id === 'string' ? raw.id : '';
+          if (id.length === 0) continue;
+          // Positive-integer guard: a missing / zero / negative / fractional
+          // context_window degrades to null (no hint) rather than a bogus value.
+          const cw = raw.context_window;
+          const contextWindow =
+            typeof cw === 'number' && Number.isInteger(cw) && cw > 0 ? cw : null;
+          models.push({ id, contextWindow });
         }
-        finish(ids.length > 0 ? ids : null);
+        finish(models.length > 0 ? models : null);
       } catch {
         finish(null);
       }
@@ -1251,24 +1267,35 @@ export function createVicoopCodexBackend(
     },
 
     async resolveCapabilities() {
-      const ids = await probeVicoopCodexModels({
+      const models = await probeVicoopCodexModels({
         command,
         spawn: spawnFn,
         cwd,
         timeoutMs: probeTimeoutMs,
       });
-      if (!ids || ids.length === 0) {
+      if (!models || models.length === 0) {
         cachedSupportedModels = null;
         return {};
       }
-      cachedSupportedModels = new Set(ids);
+      cachedSupportedModels = new Set(models.map((m) => m.id));
       // Advertise on the openai-compat/v1 `params.models[]` slot so
       // upstream A2A callers (and the gateway's model resolver) can see
       // the list without round-tripping through `vicoop-codex models`.
       // The first id is tagged as default — vicoop-codex's `models`
       // output is already ordered with the recommended model first.
-      const openaiCompatModels = ids.map((id, i) =>
-        i === 0 ? { id, default: true as const } : { id },
+      // `contextWindow` (when the CLI reports it) rides along as the
+      // openai-compat/v1 hint; vicoop-codex has no output-token ceiling.
+      const openaiCompatModels = models.map((m, i) =>
+        i === 0
+          ? {
+              id: m.id,
+              default: true as const,
+              ...(m.contextWindow != null ? { contextWindow: m.contextWindow } : {}),
+            }
+          : {
+              id: m.id,
+              ...(m.contextWindow != null ? { contextWindow: m.contextWindow } : {}),
+            },
       );
       return { openaiCompatModels };
     },

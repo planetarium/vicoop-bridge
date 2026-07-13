@@ -83,12 +83,23 @@ export type AgentExtension = z.infer<typeof AgentExtension>;
 
 // Per planetarium/oai2a2a#63: `openai-compat/v1` AgentExtension may carry an
 // optional `params.models[]` advertise block. Each entry: `id` required;
-// `reasoning` / `default` optional. The shape is advisory and forward-compat
-// — receivers MUST ignore unknown sub-fields.
+// `reasoning` / `default` / `contextWindow` / `maxOutputTokens` optional. The
+// shape is advisory and forward-compat — receivers MUST ignore unknown
+// sub-fields.
+//
+// `contextWindow` / `maxOutputTokens` are the token-limit hints added in the
+// spec's additive revision: `contextWindow` is the effective total window
+// (prompt + completion) and `maxOutputTokens` the single-completion output
+// ceiling. Both positive integers. NOTE: this is a strict `z.object` (no
+// `.passthrough()`), so an entry field must be declared here or it is stripped
+// before it can reach the wire — that is why these two are added explicitly
+// rather than relying on the params-level passthrough below.
 export const OpenAICompatModelAdvertise = z.object({
   id: z.string().min(1),
   reasoning: z.boolean().optional(),
   default: z.boolean().optional(),
+  contextWindow: z.number().int().positive().optional(),
+  maxOutputTokens: z.number().int().positive().optional(),
 });
 export type OpenAICompatModelAdvertise = z.infer<typeof OpenAICompatModelAdvertise>;
 

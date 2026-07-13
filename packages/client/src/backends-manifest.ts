@@ -39,12 +39,17 @@ export const BACKENDS_MANIFEST: Record<InstallableBackendKind, BackendManifestEn
 // but `info` still advertises their supported CLI range so operators running
 // them on the host can check compatibility.
 //
-// vicoop-codex: driven via `vicoop-codex serve` + `vicoop-codex models
-// --json`, both of which land in the 0.3.x line — hence the >=0.3.0 floor.
+// vicoop-codex: driven via `vicoop-codex serve` + `vicoop-codex models --json`.
+// The >=0.7.0 floor tracks the `context_window` field the bridge reads from
+// `models --json` for the openai-compat/v1 `contextWindow` advertise, which
+// vicoop-codex first surfaces in 0.7.0 (planetarium/vicoop-codex-cli#34). This
+// is a host-only backend, so the range is advisory (shown in `info`, NOT gated
+// like the container backends): older 0.3.x–0.6.x still run — they just
+// advertise no window.
 export type HostOnlyBackendKind = 'vicoop-codex';
 
 export const HOST_ONLY_BACKENDS: Record<HostOnlyBackendKind, BackendManifestEntry> = {
-  'vicoop-codex': { supportedRange: '>=0.3.0' },
+  'vicoop-codex': { supportedRange: '>=0.7.0' },
 };
 
 // What `vicoop-client info` reports under `backends`: every backend the client

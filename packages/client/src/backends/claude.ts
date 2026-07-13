@@ -42,6 +42,7 @@ import {
   createClaudeUsageProvider,
   type ClaudeCredEnv,
 } from './claude-usage.js';
+import type { ClaudeModelLimits } from './claude-models.js';
 import {
   callerToolDispatchActive,
   chatHistoryFromMessages,
@@ -240,6 +241,17 @@ export interface ClaudeBackendOptions {
   fetchImpl?: typeof fetch;
   claudeCredEnv?: ClaudeCredEnv;
   usageCacheTtlMs?: number;
+  // openai-compat/v1 `contextWindow` / `maxOutputTokens` advertise. When set,
+  // `resolveCapabilities` calls it ONCE and tier-corrects each advertised entry
+  // (canonical id → Models API limits; the ceiling is capped to the 200k base
+  // unless the entry carries the `[1m]` tier marker; `max_tokens` →
+  // `maxOutputTokens`). Left UNSET by default — and by every test that asserts
+  // the bare id/reasoning/default advertise — so enrichment is strictly
+  // opt-in and never reaches for the network or the host keychain implicitly.
+  // Production wires it in cli.ts to `loadClaudeModelCatalog`; tests stub a
+  // fixed catalog. Best-effort: a rejection is swallowed and the hints are
+  // omitted.
+  resolveModelLimits?: () => Promise<Map<string, ClaudeModelLimits>>;
 }
 
 interface SessionEntry {
@@ -335,6 +347,51 @@ interface StreamEvent {
 // Exported for unit tests.
 export function normalizeClaudeModelId(raw: string): string {
   return raw.replace(/\[[^\]]+\]$/, '');
+}
+
+// The 1M-context tier marker Claude Code appends to a model id (`[1m]`). Its
+// presence on an advertised id is the signal that the effective context window
+// is the model's full ceiling rather than the 200k base (see
+// `enrichEntriesWithModelLimits`).
+const ONE_MILLION_TIER_RE = /\[1m\]$/i;
+// Anthropic's base context window; the 1M window is an opt-in tier over it, so
+// a model advertised WITHOUT the `[1m]` marker serves at most this many
+// prompt+completion tokens even when the model's ceiling is higher.
+const CLAUDE_BASE_CONTEXT_WINDOW = 200_000;
+
+// An advertised entry paired with the string the 1M-tier decision reads. They
+// differ on the probe path: the entry `id` is canonical (must match
+// `usage.model` and must not become a `[1m]` pool slug), while `tierId` is the
+// raw `system/init.model` (tier suffix intact). On the pin/declared paths both
+// are the same operator-supplied id.
+export interface ClaudeAdvertiseEntry {
+  entry: OpenAICompatModelAdvertise;
+  tierId: string;
+}
+
+// Enrich advertised model entries with the openai-compat/v1 `contextWindow` /
+// `maxOutputTokens` hints from the Models API catalog (keyed by canonical id).
+// Option B (tier-corrected effective window): `max_input_tokens` is the model's
+// ceiling, but the effective window is only that large when the `[1m]` tier is
+// active — so an entry whose `tierId` lacks the `[1m]` marker is capped at the
+// 200k base. `max_tokens` is tier-agnostic and maps straight to
+// `maxOutputTokens`. Entries with no catalog match (or an empty catalog) pass
+// through unchanged, so a stale/unknown id degrades to "unspecified" rather
+// than a wrong number. Tier is read from `tierId`, NOT `entry.id`, so a probe
+// default advertised under its canonical id still gets the 1M lift.
+export function enrichEntriesWithModelLimits(
+  inputs: readonly ClaudeAdvertiseEntry[],
+  catalog: Map<string, ClaudeModelLimits>,
+): OpenAICompatModelAdvertise[] {
+  if (catalog.size === 0) return inputs.map((i) => i.entry);
+  return inputs.map(({ entry, tierId }) => {
+    const limits = catalog.get(normalizeClaudeModelId(entry.id));
+    if (!limits) return entry;
+    const contextWindow = ONE_MILLION_TIER_RE.test(tierId)
+      ? limits.maxInputTokens
+      : Math.min(CLAUDE_BASE_CONTEXT_WINDOW, limits.maxInputTokens);
+    return { ...entry, contextWindow, maxOutputTokens: limits.maxTokens };
+  });
 }
 
 // Parse Claude Code's `result.modelUsage` (a map keyed by model id with
@@ -564,13 +621,24 @@ export const CLAUDE_PROBE_ARGS: readonly string[] = [
 // is the first event in the stream"). Killing the child at this stage
 // produces no token usage. The rate_limit_event line that may precede
 // it is also pre-LLM and is ignored here.
+export interface ProbedClaudeModel {
+  // The canonical model id (tier suffix stripped) — matches `usage.model` and
+  // is what the backend advertises / gates on.
+  id: string;
+  // The verbatim `system/init.model` string, tier suffix INCLUDED (e.g.
+  // `claude-sonnet-4-5[1m]`). Retained so the caller can detect the 1M tier for
+  // the `contextWindow` advertise — the normalised `id` alone can't, and the
+  // advertise id must stay canonical (see `enrichEntriesWithModelLimits`).
+  raw: string;
+}
+
 export async function probeClaudeModel(probeOpts: {
   command: string;
   spawn: ClaudeSpawnFn;
   cwd?: string;
   timeoutMs: number;
-}): Promise<string | null> {
-  return new Promise<string | null>((resolve) => {
+}): Promise<ProbedClaudeModel | null> {
+  return new Promise<ProbedClaudeModel | null>((resolve) => {
     let child: ClaudeChildHandle;
     try {
       child = probeOpts.spawn(probeOpts.command, CLAUDE_PROBE_ARGS, {
@@ -593,7 +661,7 @@ export async function probeClaudeModel(probeOpts: {
     // already resolved` and cancels the test plus everything after it
     // in the same file. See vicoop-bridge#282 for the failure mode.
     const timer = setTimeout(() => settle(null), probeOpts.timeoutMs);
-    function settle(value: string | null): void {
+    function settle(value: ProbedClaudeModel | null): void {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -627,9 +695,9 @@ export async function probeClaudeModel(probeOpts: {
           typeof e.model === 'string' &&
           e.model.length > 0
         ) {
-          // Normalise here (and not at the resolveCapabilities caller) so
-          // the function's contract — "returns the model id you'll see in
-          // `usage.model`" — holds across both emission sites.
+          // Return BOTH the canonical id (for the advertise / gate) and the
+          // raw string (tier suffix intact) so the caller can detect the 1M
+          // tier without the advertise id having to carry `[1m]`.
           const normalised = normalizeClaudeModelId(e.model);
           if (normalised.length === 0) {
             // The whole id was a bracketed tier marker — pathological,
@@ -638,7 +706,7 @@ export async function probeClaudeModel(probeOpts: {
             settle(null);
             return;
           }
-          settle(normalised);
+          settle({ id: normalised, raw: e.model });
           return;
         }
       }
@@ -1426,17 +1494,33 @@ export function createClaudeBackend(
     // `completion_tokens_details.reasoning_tokens` in `usage`, and per
     // spec "Absence means 'unspecified,' not 'false.'"
     async resolveCapabilities() {
+      // Fetch the contextWindow / maxOutputTokens catalog once, best-effort.
+      // Opt-in via `opts.resolveModelLimits`; an empty map (the default, a
+      // fetch failure, or a missing host token) leaves every entry un-enriched,
+      // so the advertise degrades to the bare id/reasoning/default set. Applied
+      // to ALL return paths below via `advertise()`.
+      const modelLimits = opts.resolveModelLimits
+        ? await opts
+            .resolveModelLimits()
+            .catch(() => new Map<string, ClaudeModelLimits>())
+        : new Map<string, ClaudeModelLimits>();
+      const advertise = (
+        inputs: ClaudeAdvertiseEntry[],
+      ): OpenAICompatModelAdvertise[] =>
+        enrichEntriesWithModelLimits(inputs, modelLimits);
+
       // A pinned model is authoritative — there's nothing to discover, so
       // skip the probe spawn entirely (it can't see our `--settings` anyway)
       // and advertise the pin (plus any operator-declared extra models),
       // which the construction-time seed already put in
-      // `cachedAllowedModels`.
+      // `cachedAllowedModels`. The advertised id == tierId here (both the raw
+      // operator string), so a pinned `[1m]` gets the 1M lift.
       if (opts.model) {
         return {
-          openaiCompatModels: [
-            { id: opts.model, default: true },
-            ...declaredModels.map((id) => ({ id })),
-          ],
+          openaiCompatModels: advertise([
+            { entry: { id: opts.model, default: true }, tierId: opts.model },
+            ...declaredModels.map((id) => ({ entry: { id }, tierId: id })),
+          ]),
         };
       }
       if (probeTimeoutMs <= 0) {
@@ -1448,15 +1532,20 @@ export function createClaudeBackend(
             ? new Set(declaredModels.map(normalizeClaudeModelId))
             : null;
         return declaredModels.length > 0
-          ? { openaiCompatModels: declaredModels.map((id) => ({ id })) }
+          ? {
+              openaiCompatModels: advertise(
+                declaredModels.map((id) => ({ entry: { id }, tierId: id })),
+              ),
+            }
           : {};
       }
-      const model = await probeClaudeModel({
+      const probed = await probeClaudeModel({
         command,
         spawn: spawnFn,
         cwd,
         timeoutMs: probeTimeoutMs,
       });
+      const model = probed?.id ?? null; // canonical id (tier suffix stripped)
       // The probed default may collide with a declared extra (the
       // construction-time dedupe can only see the pin); drop the duplicate
       // declaration so the advertise stays one-entry-per-canonical-id.
@@ -1468,11 +1557,16 @@ export function createClaudeBackend(
         ...extras.map(normalizeClaudeModelId),
       ]);
       cachedAllowedModels = allowed.size > 0 ? allowed : null;
-      const entries: OpenAICompatModelAdvertise[] = [
-        ...(model ? [{ id: model, default: true }] : []),
-        ...extras.map((id) => ({ id })),
+      // Advertise the canonical `model` id, but read the tier off the RAW probe
+      // string (`probed.raw`, e.g. `claude-sonnet-4-5[1m]`) so a 1M-tier default
+      // gets the full window without the advertise id carrying `[1m]`.
+      const inputs: ClaudeAdvertiseEntry[] = [
+        ...(model && probed
+          ? [{ entry: { id: model, default: true as const }, tierId: probed.raw }]
+          : []),
+        ...extras.map((id) => ({ entry: { id }, tierId: id })),
       ];
-      return entries.length > 0 ? { openaiCompatModels: entries } : {};
+      return inputs.length > 0 ? { openaiCompatModels: advertise(inputs) } : {};
     },
 
     async handle(task, rawEmit, signal) {

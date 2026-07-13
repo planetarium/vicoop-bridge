@@ -150,11 +150,17 @@ export interface ThreadStartOrResumeResult {
 //     signal that the model emits `completion_tokens_details.reasoning_tokens`,
 //     so we can set the openai-compat/v1 `reasoning` flag without the
 //     `model_reasoning_effort` heuristic the config.toml path used.
+//   - `context_window`: codex's effective per-model context window in tokens
+//     (the runtime value, as opposed to `max_context_window` which is the
+//     model ceiling). Advertised on the openai-compat/v1 `contextWindow`
+//     hint. codex's `model/list` carries no output-token ceiling, so
+//     `maxOutputTokens` is left unadvertised for this backend.
 export interface ModelListEntry {
   id: string;
   isDefault?: boolean;
   hidden?: boolean;
   supportedReasoningEfforts?: Array<{ reasoningEffort?: string }>;
+  context_window?: number;
 }
 
 export interface ModelListResult {

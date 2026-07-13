@@ -1322,7 +1322,7 @@ test('handle: cancel before spawn → task.complete with canceled', async () => 
 // CLI.
 // ───────────────────────────────────────────────────────────────────────────
 
-test('probeVicoopCodexModels: parses `models --json` shape into a string[] id list', async () => {
+test('probeVicoopCodexModels: parses `models --json` into {id, contextWindow}, guarding the window', async () => {
   const fake = makeFakeSpawn();
   const probe = probeVicoopCodexModels({
     command: 'vicoop-codex',
@@ -1338,15 +1338,20 @@ test('probeVicoopCodexModels: parses `models --json` shape into a string[] id li
       JSON.stringify({
         client_version: '0.133.0',
         models: [
-          { id: 'gpt-5.5', service_tiers: [] },
-          { id: 'gpt-5.4', service_tiers: [] },
+          { id: 'gpt-5.5', context_window: 272000, service_tiers: [] },
+          { id: 'gpt-5.4', context_window: 0, service_tiers: [] }, // non-positive → null
+          { id: 'gpt-5.3', service_tiers: [] }, // missing → null
         ],
       }),
     );
     child.finish(0);
   });
-  const ids = await probe;
-  assert.deepEqual(ids, ['gpt-5.5', 'gpt-5.4']);
+  const models = await probe;
+  assert.deepEqual(models, [
+    { id: 'gpt-5.5', contextWindow: 272000 },
+    { id: 'gpt-5.4', contextWindow: null },
+    { id: 'gpt-5.3', contextWindow: null },
+  ]);
 });
 
 test('probeVicoopCodexModels: non-zero exit returns null', async () => {
@@ -1378,7 +1383,10 @@ test('resolveCapabilities advertises openaiCompatModels with the first id tagged
   queueMicrotask(() => {
     fake.lastChild().emitStdout(
       JSON.stringify({
-        models: [{ id: 'gpt-5.5' }, { id: 'gpt-5.4' }],
+        models: [
+          { id: 'gpt-5.5', context_window: 272000 },
+          { id: 'gpt-5.4' }, // no window → hint omitted
+        ],
       }),
     );
     fake.lastChild().finish(0);
@@ -1386,7 +1394,7 @@ test('resolveCapabilities advertises openaiCompatModels with the first id tagged
   const cap = await capPromise;
   assert.deepEqual(cap, {
     openaiCompatModels: [
-      { id: 'gpt-5.5', default: true },
+      { id: 'gpt-5.5', default: true, contextWindow: 272000 },
       { id: 'gpt-5.4' },
     ],
   });

@@ -9,6 +9,7 @@ import {
   buildOpenAICompatNativeSystemPrompt,
   DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT,
   createClaudeBackend,
+  enrichEntriesWithModelLimits,
   normalizeClaudeModelId,
   openaiToolsToCallerToolDefs,
   parseClaudeModelUsageForOpenAICompat,
@@ -18,6 +19,7 @@ import {
   type ClaudeChildHandle,
   type ClaudeSpawnOptions,
 } from './claude.js';
+import type { ClaudeModelLimits } from './claude-models.js';
 // The pure helpers in `./openai-compat.js` are covered by
 // `openai-compat.test.ts`. `claude.test.ts` only exercises the
 // claude-specific wiring (spawn argv, native-MCP dispatch, capabilities
@@ -2982,6 +2984,122 @@ test('a --claude-model pin makes resolveCapabilities advertise the pin without p
   assert.equal(spawned, 0, 'pinned model must not trigger a probe spawn');
 });
 
+// --- openai-compat/v1 contextWindow / maxOutputTokens advertise (option B) ---
+
+const SAMPLE_CATALOG = (): Map<string, ClaudeModelLimits> =>
+  new Map([
+    ['claude-sonnet-4-5', { maxInputTokens: 1_000_000, maxTokens: 64_000 }],
+    ['claude-opus-4-8', { maxInputTokens: 1_000_000, maxTokens: 128_000 }],
+    ['claude-opus-4-5', { maxInputTokens: 200_000, maxTokens: 64_000 }],
+  ]);
+
+test('enrichEntriesWithModelLimits caps a 1M-capable model to the 200k base without the [1m] tier', () => {
+  const out = enrichEntriesWithModelLimits(
+    [{ entry: { id: 'claude-sonnet-4-5', default: true }, tierId: 'claude-sonnet-4-5' }],
+    SAMPLE_CATALOG(),
+  );
+  assert.deepEqual(out, [
+    { id: 'claude-sonnet-4-5', default: true, contextWindow: 200_000, maxOutputTokens: 64_000 },
+  ]);
+});
+
+test('enrichEntriesWithModelLimits advertises the full ceiling for a [1m]-tiered id', () => {
+  const out = enrichEntriesWithModelLimits(
+    [{ entry: { id: 'claude-sonnet-4-5[1m]', default: true }, tierId: 'claude-sonnet-4-5[1m]' }],
+    SAMPLE_CATALOG(),
+  );
+  // Looks up by the canonical id (suffix stripped), but the [1m] marker lifts
+  // the cap to the full 1M ceiling. maxOutputTokens is tier-agnostic.
+  assert.deepEqual(out, [
+    {
+      id: 'claude-sonnet-4-5[1m]',
+      default: true,
+      contextWindow: 1_000_000,
+      maxOutputTokens: 64_000,
+    },
+  ]);
+});
+
+test('enrichEntriesWithModelLimits lifts a canonical id when the tierId (not entry.id) carries [1m]', () => {
+  // The probe path: the advertised entry.id is canonical (no [1m]), but tierId
+  // is the raw system/init string. The 1M lift must key off tierId.
+  const out = enrichEntriesWithModelLimits(
+    [{ entry: { id: 'claude-sonnet-4-5', default: true }, tierId: 'claude-sonnet-4-5[1m]' }],
+    SAMPLE_CATALOG(),
+  );
+  assert.deepEqual(out, [
+    { id: 'claude-sonnet-4-5', default: true, contextWindow: 1_000_000, maxOutputTokens: 64_000 },
+  ]);
+});
+
+test('enrichEntriesWithModelLimits passes a 200k-only model through unchanged in value', () => {
+  const out = enrichEntriesWithModelLimits(
+    [{ entry: { id: 'claude-opus-4-5' }, tierId: 'claude-opus-4-5' }],
+    SAMPLE_CATALOG(),
+  );
+  assert.deepEqual(out, [
+    { id: 'claude-opus-4-5', contextWindow: 200_000, maxOutputTokens: 64_000 },
+  ]);
+});
+
+test('enrichEntriesWithModelLimits leaves an unknown id un-enriched', () => {
+  const out = enrichEntriesWithModelLimits(
+    [{ entry: { id: 'claude-future-9', default: true }, tierId: 'claude-future-9' }],
+    SAMPLE_CATALOG(),
+  );
+  assert.deepEqual(out, [{ id: 'claude-future-9', default: true }]);
+});
+
+test('enrichEntriesWithModelLimits with an empty catalog is a no-op', () => {
+  const entry = { id: 'claude-opus-4-8', default: true as const };
+  const out = enrichEntriesWithModelLimits([{ entry, tierId: entry.id }], new Map());
+  assert.deepEqual(out, [entry]);
+});
+
+test('resolveCapabilities enriches the pinned advertise via resolveModelLimits', async () => {
+  const backend = createClaudeBackend({
+    model: 'claude-opus-4-8',
+    resolveModelLimits: async () => SAMPLE_CATALOG(),
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [
+      { id: 'claude-opus-4-8', default: true, contextWindow: 200_000, maxOutputTokens: 128_000 },
+    ],
+  });
+});
+
+test('resolveCapabilities enriches a pinned [1m] id with the full window', async () => {
+  const backend = createClaudeBackend({
+    model: 'claude-sonnet-4-5[1m]',
+    resolveModelLimits: async () => SAMPLE_CATALOG(),
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [
+      {
+        id: 'claude-sonnet-4-5[1m]',
+        default: true,
+        contextWindow: 1_000_000,
+        maxOutputTokens: 64_000,
+      },
+    ],
+  });
+});
+
+test('resolveCapabilities swallows a resolveModelLimits rejection and advertises without hints', async () => {
+  const backend = createClaudeBackend({
+    model: 'claude-opus-4-8',
+    resolveModelLimits: async () => {
+      throw new Error('network down');
+    },
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [{ id: 'claude-opus-4-8', default: true }],
+  });
+});
+
 test('envelope.model matching the --claude-model pin rides through as --model', async () => {
   const fake = scriptedSpawn({
     lines: [
@@ -5001,7 +5119,9 @@ test('probeClaudeModel returns normalised model from system/init and SIGTERMs th
     timeoutMs: 1000,
   });
 
-  assert.equal(model, 'claude-opus-4-7');
+  // Canonical id for the advertise/gate; raw string (tier intact) for the
+  // caller's 1M-tier detection.
+  assert.deepEqual(model, { id: 'claude-opus-4-7', raw: 'claude-opus-4-7[1m]' });
   const child = fake.lastChild();
   assert.ok(child);
   assert.equal(child.killed, true);
@@ -5053,7 +5173,7 @@ test('probeClaudeModel ignores malformed JSON lines and still extracts model', a
     timeoutMs: 1000,
   });
 
-  assert.equal(model, 'claude-sonnet-4-6');
+  assert.deepEqual(model, { id: 'claude-sonnet-4-6', raw: 'claude-sonnet-4-6' });
 });
 
 test('probeClaudeModel returns null when child exits before init', async () => {
@@ -5104,6 +5224,44 @@ test('claude backend resolveCapabilities advertises normalised model from system
   const caps = await backend.resolveCapabilities!();
   assert.deepEqual(caps, {
     openaiCompatModels: [{ id: 'claude-opus-4-7', default: true }],
+  });
+});
+
+test('resolveCapabilities lifts a PROBED [1m] default to the full window under its canonical id', () => {
+  // Regression: the probe strips [1m] from the advertised id (so it stays
+  // canonical / matches usage.model), but the 1M tier must still be detected
+  // from the raw system/init string — otherwise a 1M-tier default silently
+  // advertises only the 200k base. Exercises the probe path (no pin).
+  const fake = makeFakeSpawn((child) => {
+    setImmediate(() => {
+      child.emitStdout(
+        JSON.stringify({
+          type: 'system',
+          subtype: 'init',
+          model: 'claude-sonnet-4-5[1m]',
+        }) + '\n',
+      );
+    });
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    probeTimeoutMs: 1000,
+    resolveModelLimits: async () =>
+      new Map<string, ClaudeModelLimits>([
+        ['claude-sonnet-4-5', { maxInputTokens: 1_000_000, maxTokens: 64_000 }],
+      ]),
+  });
+  return backend.resolveCapabilities!().then((caps) => {
+    assert.deepEqual(caps, {
+      openaiCompatModels: [
+        {
+          id: 'claude-sonnet-4-5', // canonical — NOT claude-sonnet-4-5[1m]
+          default: true,
+          contextWindow: 1_000_000, // full ceiling, because the raw tier was [1m]
+          maxOutputTokens: 64_000,
+        },
+      ],
+    });
   });
 });
 

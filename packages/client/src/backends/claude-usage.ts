@@ -47,8 +47,9 @@ const DEFAULT_USAGE_CACHE_TTL_MS = 5 * 60 * 1000;
 // We mirror the official Claude Code client's `User-Agent: claude-code/<version>`
 // so the OAuth endpoint sees a request shaped like the official client. The
 // version is discovered from the installed CLI; this is the fallback when that
-// discovery fails.
-const CLAUDE_CODE_UA_FALLBACK_VERSION = '2.1.85';
+// discovery fails. Exported so sibling OAuth callers (claude-models.ts) reuse
+// the same fallback instead of duplicating the literal.
+export const CLAUDE_CODE_UA_FALLBACK_VERSION = '2.1.85';
 
 export interface ClaudeOAuthCreds {
   accessToken: string;
