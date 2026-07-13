@@ -14,6 +14,7 @@ import { Client } from './client.js';
 import { echoBackend } from './backends/echo.js';
 import { createOpenclawBackend } from './backends/openclaw.js';
 import { createClaudeBackend, type ClaudeSpawnFn } from './backends/claude.js';
+import { loadClaudeModelCatalog } from './backends/claude-models.js';
 import {
   createCodexBackend,
   type ApprovalDecision,
@@ -423,6 +424,10 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         openaiCompatTrace: args.openaiCompatTrace,
         claudeReasoning: args.claudeReasoning,
         claudeThinkingBudget: args.claudeThinkingBudget,
+        // Enrich the openai-compat/v1 advertise with contextWindow /
+        // maxOutputTokens from the Models API (authenticated with the host's
+        // subscription OAuth token — same cred the usage path reads).
+        resolveModelLimits: () => loadClaudeModelCatalog(),
         ...(spawn ? { spawn: spawn as ClaudeSpawnFn } : {}),
       });
       return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };

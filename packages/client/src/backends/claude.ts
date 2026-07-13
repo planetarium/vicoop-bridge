@@ -42,6 +42,7 @@ import {
   createClaudeUsageProvider,
   type ClaudeCredEnv,
 } from './claude-usage.js';
+import type { ClaudeModelLimits } from './claude-models.js';
 import {
   callerToolDispatchActive,
   chatHistoryFromMessages,
@@ -240,6 +241,17 @@ export interface ClaudeBackendOptions {
   fetchImpl?: typeof fetch;
   claudeCredEnv?: ClaudeCredEnv;
   usageCacheTtlMs?: number;
+  // openai-compat/v1 `contextWindow` / `maxOutputTokens` advertise. When set,
+  // `resolveCapabilities` calls it ONCE and tier-corrects each advertised entry
+  // (canonical id → Models API limits; the ceiling is capped to the 200k base
+  // unless the entry carries the `[1m]` tier marker; `max_tokens` →
+  // `maxOutputTokens`). Left UNSET by default — and by every test that asserts
+  // the bare id/reasoning/default advertise — so enrichment is strictly
+  // opt-in and never reaches for the network or the host keychain implicitly.
+  // Production wires it in cli.ts to `loadClaudeModelCatalog`; tests stub a
+  // fixed catalog. Best-effort: a rejection is swallowed and the hints are
+  // omitted.
+  resolveModelLimits?: () => Promise<Map<string, ClaudeModelLimits>>;
 }
 
 interface SessionEntry {
@@ -335,6 +347,39 @@ interface StreamEvent {
 // Exported for unit tests.
 export function normalizeClaudeModelId(raw: string): string {
   return raw.replace(/\[[^\]]+\]$/, '');
+}
+
+// The 1M-context tier marker Claude Code appends to a model id (`[1m]`). Its
+// presence on an advertised id is the signal that the effective context window
+// is the model's full ceiling rather than the 200k base (see
+// `enrichEntriesWithModelLimits`).
+const ONE_MILLION_TIER_RE = /\[1m\]$/i;
+// Anthropic's base context window; the 1M window is an opt-in tier over it, so
+// a model advertised WITHOUT the `[1m]` marker serves at most this many
+// prompt+completion tokens even when the model's ceiling is higher.
+const CLAUDE_BASE_CONTEXT_WINDOW = 200_000;
+
+// Enrich advertised model entries with the openai-compat/v1 `contextWindow` /
+// `maxOutputTokens` hints from the Models API catalog (keyed by canonical id).
+// Option B (tier-corrected effective window): `max_input_tokens` is the model's
+// ceiling, but the effective window is only that large when the `[1m]` tier is
+// active — so an entry without the `[1m]` marker is capped at the 200k base.
+// `max_tokens` is tier-agnostic and maps straight to `maxOutputTokens`. Entries
+// with no catalog match (or an empty catalog) pass through unchanged, so a
+// stale/unknown id degrades to "unspecified" rather than a wrong number.
+export function enrichEntriesWithModelLimits(
+  entries: readonly OpenAICompatModelAdvertise[],
+  catalog: Map<string, ClaudeModelLimits>,
+): OpenAICompatModelAdvertise[] {
+  if (catalog.size === 0) return entries.slice();
+  return entries.map((entry) => {
+    const limits = catalog.get(normalizeClaudeModelId(entry.id));
+    if (!limits) return entry;
+    const contextWindow = ONE_MILLION_TIER_RE.test(entry.id)
+      ? limits.maxInputTokens
+      : Math.min(CLAUDE_BASE_CONTEXT_WINDOW, limits.maxInputTokens);
+    return { ...entry, contextWindow, maxOutputTokens: limits.maxTokens };
+  });
 }
 
 // Parse Claude Code's `result.modelUsage` (a map keyed by model id with
@@ -1426,6 +1471,21 @@ export function createClaudeBackend(
     // `completion_tokens_details.reasoning_tokens` in `usage`, and per
     // spec "Absence means 'unspecified,' not 'false.'"
     async resolveCapabilities() {
+      // Fetch the contextWindow / maxOutputTokens catalog once, best-effort.
+      // Opt-in via `opts.resolveModelLimits`; an empty map (the default, a
+      // fetch failure, or a missing host token) leaves every entry un-enriched,
+      // so the advertise degrades to the bare id/reasoning/default set. Applied
+      // to ALL return paths below via `advertise()`.
+      const modelLimits = opts.resolveModelLimits
+        ? await opts
+            .resolveModelLimits()
+            .catch(() => new Map<string, ClaudeModelLimits>())
+        : new Map<string, ClaudeModelLimits>();
+      const advertise = (
+        entries: OpenAICompatModelAdvertise[],
+      ): OpenAICompatModelAdvertise[] =>
+        enrichEntriesWithModelLimits(entries, modelLimits);
+
       // A pinned model is authoritative — there's nothing to discover, so
       // skip the probe spawn entirely (it can't see our `--settings` anyway)
       // and advertise the pin (plus any operator-declared extra models),
@@ -1433,10 +1493,10 @@ export function createClaudeBackend(
       // `cachedAllowedModels`.
       if (opts.model) {
         return {
-          openaiCompatModels: [
+          openaiCompatModels: advertise([
             { id: opts.model, default: true },
             ...declaredModels.map((id) => ({ id })),
-          ],
+          ]),
         };
       }
       if (probeTimeoutMs <= 0) {
@@ -1448,7 +1508,7 @@ export function createClaudeBackend(
             ? new Set(declaredModels.map(normalizeClaudeModelId))
             : null;
         return declaredModels.length > 0
-          ? { openaiCompatModels: declaredModels.map((id) => ({ id })) }
+          ? { openaiCompatModels: advertise(declaredModels.map((id) => ({ id }))) }
           : {};
       }
       const model = await probeClaudeModel({
@@ -1472,7 +1532,7 @@ export function createClaudeBackend(
         ...(model ? [{ id: model, default: true }] : []),
         ...extras.map((id) => ({ id })),
       ];
-      return entries.length > 0 ? { openaiCompatModels: entries } : {};
+      return entries.length > 0 ? { openaiCompatModels: advertise(entries) } : {};
     },
 
     async handle(task, rawEmit, signal) {

@@ -2628,6 +2628,31 @@ test('codex backend resolveCapabilities advertises full model/list with default 
   backend.stop?.();
 });
 
+test('codex backend resolveCapabilities advertises context_window as contextWindow (positive integers only)', async () => {
+  const fake = makeFakeSpawn(() =>
+    modelListScenario([
+      { id: 'gpt-5.5', isDefault: true, context_window: 272000 },
+      { id: 'gpt-5.4', context_window: 1000000 },
+      { id: 'gpt-4o' }, // no context_window → hint omitted
+      { id: 'gpt-zero', context_window: 0 }, // non-positive → hint omitted
+    ]),
+  );
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    readCodexConfigToml: async () => null, // no operator override
+  });
+  const caps = await backend.resolveCapabilities!();
+  assert.deepEqual(caps, {
+    openaiCompatModels: [
+      { id: 'gpt-5.5', default: true, contextWindow: 272000 },
+      { id: 'gpt-5.4', contextWindow: 1000000 },
+      { id: 'gpt-4o' },
+      { id: 'gpt-zero' },
+    ],
+  });
+  backend.stop?.();
+});
+
 test('codex backend resolveCapabilities tags operator override as default, not model/list.isDefault', async () => {
   const fake = makeFakeSpawn(() =>
     modelListScenario([

@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
+  OpenAICompatModelAdvertise,
+  buildOpenAICompatExtensionParams,
   TaskStatusFrame,
   encodeFrame,
   parseUpFrame,
@@ -31,6 +33,30 @@ test('TaskStatusFrame round-trips an optional metadata object verbatim', () => {
   assert.deepEqual(decoded.metadata, {
     [OPENAI_COMPAT_EXTENSION_URI]: { heartbeat: true },
   });
+});
+
+test('OpenAICompatModelAdvertise carries contextWindow / maxOutputTokens through to the wire', () => {
+  const entry = OpenAICompatModelAdvertise.parse({
+    id: 'claude-sonnet-4-5[1m]',
+    default: true,
+    reasoning: true,
+    contextWindow: 1_000_000,
+    maxOutputTokens: 64_000,
+  });
+  assert.equal(entry.contextWindow, 1_000_000);
+  assert.equal(entry.maxOutputTokens, 64_000);
+
+  // The strict `z.object` must NOT strip the hints, and
+  // `buildOpenAICompatExtensionParams` must carry them onto the params block
+  // that reaches the AgentCard on the wire.
+  const params = buildOpenAICompatExtensionParams([entry]);
+  assert.deepEqual(params?.models, [entry]);
+});
+
+test('OpenAICompatModelAdvertise rejects a non-positive / non-integer contextWindow', () => {
+  assert.throws(() => OpenAICompatModelAdvertise.parse({ id: 'm', contextWindow: 0 }));
+  assert.throws(() => OpenAICompatModelAdvertise.parse({ id: 'm', maxOutputTokens: -1 }));
+  assert.throws(() => OpenAICompatModelAdvertise.parse({ id: 'm', contextWindow: 1.5 }));
 });
 
 test('TaskStatusFrame.metadata is optional — frames without it parse and omit the field', () => {

@@ -935,9 +935,25 @@ export function createCodexBackend(
         visible[0].id;
 
       const openaiCompatModels = visible.map((m) => {
-        const entry: { id: string; reasoning?: boolean; default?: true } = { id: m.id };
+        const entry: {
+          id: string;
+          reasoning?: boolean;
+          default?: true;
+          contextWindow?: number;
+        } = { id: m.id };
         if ((m.supportedReasoningEfforts?.length ?? 0) > 0) entry.reasoning = true;
         if (m.id === defaultId) entry.default = true;
+        // codex's effective per-model window (advisory openai-compat/v1 hint).
+        // Guard against a non-positive / non-integer value from a future
+        // schema so we never advertise a bogus `contextWindow` (zod would
+        // reject it downstream, dropping the whole entry).
+        if (
+          typeof m.context_window === 'number' &&
+          Number.isInteger(m.context_window) &&
+          m.context_window > 0
+        ) {
+          entry.contextWindow = m.context_window;
+        }
         return entry;
       });
 
