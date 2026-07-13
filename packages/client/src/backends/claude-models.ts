@@ -18,16 +18,19 @@
 
 import {
   readClaudeOAuthCreds,
-  defaultClaudeCliVersion,
+  CLAUDE_CODE_UA_FALLBACK_VERSION,
   type ClaudeCredEnv,
 } from './claude-usage.js';
 
 export const CLAUDE_MODELS_URL = 'https://api.anthropic.com/v1/models';
 
-// Fallback User-Agent version, mirroring claude-usage.ts — we shape the request
-// like the official Claude Code client (which is the sanctioned caller of a
-// consumer OAuth token) so the endpoint sees a familiar client.
-const CLAUDE_CODE_UA_FALLBACK_VERSION = '2.1.85';
+// The catalog fetch runs at daemon startup on `resolveCapabilities`, ahead of
+// the model probe and under the client's ~12s hello deadline (client.ts). A
+// hung `api.anthropic.com` must NOT eat that budget — a slow catalog would else
+// suppress the ENTIRE advertise (not just these hints) and push `hello` past
+// the server's window. Bound it with an AbortSignal so a slow fetch degrades to
+// "no hints" quickly instead. 4s leaves ample room under the deadline.
+const CLAUDE_MODELS_FETCH_TIMEOUT_MS = 4_000;
 
 export interface ClaudeModelLimits {
   // `max_input_tokens`: the model's context-window ceiling in tokens.
@@ -45,11 +48,15 @@ export async function fetchClaudeModelCatalog(
   accessToken: string,
   fetchImpl: typeof fetch = fetch,
   userAgent?: string,
+  timeoutMs: number = CLAUDE_MODELS_FETCH_TIMEOUT_MS,
 ): Promise<Map<string, ClaudeModelLimits>> {
   const out = new Map<string, ClaudeModelLimits>();
   try {
     const res = await fetchImpl(`${CLAUDE_MODELS_URL}?limit=1000`, {
       method: 'GET',
+      // Time-bound the request so a hung endpoint can't stall daemon startup;
+      // an abort surfaces as a rejection caught below → empty map (no hints).
+      signal: AbortSignal.timeout(timeoutMs),
       // Header set mirrors the usage path (Authorization, anthropic-beta,
       // anthropic-version, User-Agent): the subscription OAuth token is
       // accepted here only when the request is shaped like the official client.
@@ -101,17 +108,18 @@ export async function fetchClaudeModelCatalog(
 export async function loadClaudeModelCatalog(opts?: {
   credEnv?: ClaudeCredEnv;
   fetchImpl?: typeof fetch;
-  // Claude CLI command, used only to discover the version for the User-Agent.
-  command?: string;
 }): Promise<Map<string, ClaudeModelLimits>> {
   const creds = readClaudeOAuthCreds(opts?.credEnv);
   if (!creds?.accessToken) return new Map();
-  const version =
-    defaultClaudeCliVersion(opts?.command ?? 'claude') ??
-    CLAUDE_CODE_UA_FALLBACK_VERSION;
+  // Use a static `claude-code/<fallback>` User-Agent rather than discovering the
+  // installed CLI version: version discovery is a synchronous `claude --version`
+  // spawn (up to 10s) and this runs on the startup hello path, so paying a
+  // subprocess for a cosmetic header would reintroduce the very latency the
+  // fetch timeout guards against. /v1/models accepts the OAuth token without a
+  // version-exact UA (verified), so a plausible static UA suffices.
   return fetchClaudeModelCatalog(
     creds.accessToken,
     opts?.fetchImpl ?? fetch,
-    `claude-code/${version}`,
+    `claude-code/${CLAUDE_CODE_UA_FALLBACK_VERSION}`,
   );
 }
