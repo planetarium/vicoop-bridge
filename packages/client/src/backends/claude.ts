@@ -359,6 +359,29 @@ const ONE_MILLION_TIER_RE = /\[1m\]$/i;
 // prompt+completion tokens even when the model's ceiling is higher.
 const CLAUDE_BASE_CONTEXT_WINDOW = 200_000;
 
+// Canonical ids of models Claude Code serves at 1M by DEFAULT — there is no
+// separate 200k tier and no `[1m]` variant to opt into, so a bare id already
+// runs the full 1M window. For these the 200k base cap must NOT apply; the
+// effective window is the model's ceiling regardless of the `[1m]` marker.
+//
+// This is an explicit set (not probed) on purpose: there is no reliable runtime
+// signal to tell a "1M-default" model from a "200k-default, 1M-opt-in" one. The
+// Anthropic Models API reports only the ceiling (1M for all of these), and
+// Claude Code's own `[1m]`-suffix handling is inconsistent — e.g. it strips
+// `claude-fable-5[1m]` but keeps `claude-sonnet-5[1m]`. So membership is decided
+// per model from documented + verified behaviour, kept deliberately small and
+// conservative: a model is added only when it is BOTH released and confirmed to
+// default to 1M, so we never over-advertise a 200k-default (or not-yet-shipped)
+// model. Models absent from this set fall through to the `[1m]`-gated Option B.
+//
+// Only `claude-fable-5` qualifies today: it is released and serving in
+// production, Anthropic documents it as 1M-by-default, and Claude Code drops its
+// `[1m]` suffix (confirming no separate tier). Other "5"-gen models are left out
+// until each is likewise confirmed — e.g. Sonnet 5 is not yet released and its
+// `[1m]` handling is inconsistent, so it stays on Option B (bare → 200k), which
+// under-advertises safely rather than over-promising an unconfirmed 1M default.
+const CLAUDE_ONE_MILLION_DEFAULT_MODELS = new Set<string>(['claude-fable-5']);
+
 // An advertised entry paired with the string the 1M-tier decision reads. They
 // differ on the probe path: the entry `id` is canonical (must match
 // `usage.model` and must not become a `[1m]` pool slug), while `tierId` is the
@@ -371,25 +394,31 @@ export interface ClaudeAdvertiseEntry {
 
 // Enrich advertised model entries with the openai-compat/v1 `contextWindow` /
 // `maxOutputTokens` hints from the Models API catalog (keyed by canonical id).
-// Option B (tier-corrected effective window): `max_input_tokens` is the model's
-// ceiling, but the effective window is only that large when the `[1m]` tier is
-// active — so an entry whose `tierId` lacks the `[1m]` marker is capped at the
-// 200k base. `max_tokens` is tier-agnostic and maps straight to
-// `maxOutputTokens`. Entries with no catalog match (or an empty catalog) pass
-// through unchanged, so a stale/unknown id degrades to "unspecified" rather
-// than a wrong number. Tier is read from `tierId`, NOT `entry.id`, so a probe
-// default advertised under its canonical id still gets the 1M lift.
+// The effective window is tier-corrected:
+//   - A model in `CLAUDE_ONE_MILLION_DEFAULT_MODELS` runs 1M by default, so it
+//     gets the full ceiling regardless of the `[1m]` marker.
+//   - Otherwise Option B applies: `max_input_tokens` is the model's ceiling, but
+//     the effective window is only that large when the `[1m]` tier is active, so
+//     an entry whose `tierId` lacks the `[1m]` marker is capped at the 200k base.
+// `max_tokens` is tier-agnostic and maps straight to `maxOutputTokens`. Entries
+// with no catalog match (or an empty catalog) pass through unchanged, so a
+// stale/unknown id degrades to "unspecified" rather than a wrong number. Tier is
+// read from `tierId`, NOT `entry.id`, so a probe default advertised under its
+// canonical id still gets the 1M lift.
 export function enrichEntriesWithModelLimits(
   inputs: readonly ClaudeAdvertiseEntry[],
   catalog: Map<string, ClaudeModelLimits>,
 ): OpenAICompatModelAdvertise[] {
   if (catalog.size === 0) return inputs.map((i) => i.entry);
   return inputs.map(({ entry, tierId }) => {
-    const limits = catalog.get(normalizeClaudeModelId(entry.id));
+    const canonicalId = normalizeClaudeModelId(entry.id);
+    const limits = catalog.get(canonicalId);
     if (!limits) return entry;
-    const contextWindow = ONE_MILLION_TIER_RE.test(tierId)
-      ? limits.maxInputTokens
-      : Math.min(CLAUDE_BASE_CONTEXT_WINDOW, limits.maxInputTokens);
+    const oneMillionByDefault = CLAUDE_ONE_MILLION_DEFAULT_MODELS.has(canonicalId);
+    const contextWindow =
+      oneMillionByDefault || ONE_MILLION_TIER_RE.test(tierId)
+        ? limits.maxInputTokens
+        : Math.min(CLAUDE_BASE_CONTEXT_WINDOW, limits.maxInputTokens);
     return { ...entry, contextWindow, maxOutputTokens: limits.maxTokens };
   });
 }

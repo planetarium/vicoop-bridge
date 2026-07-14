@@ -2991,7 +2991,28 @@ const SAMPLE_CATALOG = (): Map<string, ClaudeModelLimits> =>
     ['claude-sonnet-4-5', { maxInputTokens: 1_000_000, maxTokens: 64_000 }],
     ['claude-opus-4-8', { maxInputTokens: 1_000_000, maxTokens: 128_000 }],
     ['claude-opus-4-5', { maxInputTokens: 200_000, maxTokens: 64_000 }],
+    // 1M-by-default (no 200k tier): must NOT be capped even when advertised bare.
+    ['claude-fable-5', { maxInputTokens: 1_000_000, maxTokens: 128_000 }],
+    ['claude-sonnet-5', { maxInputTokens: 1_000_000, maxTokens: 128_000 }],
   ]);
+
+test('enrichEntriesWithModelLimits: allowlisted 1M-default model gets full ceiling bare; a non-allowlisted 1M-capable one is capped', () => {
+  // fable-5 is allowlisted (1M by default in Claude Code), so a bare-advertised
+  // id gets the ceiling, NOT the 200k Option-B cap. sonnet-5 is 1M-CAPABLE
+  // (ceiling 1M in the catalog) but NOT allowlisted — it stays on Option B and
+  // caps at 200k bare (safe under-advertise for an unconfirmed 1M default).
+  const out = enrichEntriesWithModelLimits(
+    [
+      { entry: { id: 'claude-fable-5', default: true }, tierId: 'claude-fable-5' },
+      { entry: { id: 'claude-sonnet-5' }, tierId: 'claude-sonnet-5' },
+    ],
+    SAMPLE_CATALOG(),
+  );
+  assert.deepEqual(out, [
+    { id: 'claude-fable-5', default: true, contextWindow: 1_000_000, maxOutputTokens: 128_000 },
+    { id: 'claude-sonnet-5', contextWindow: 200_000, maxOutputTokens: 128_000 },
+  ]);
+});
 
 test('enrichEntriesWithModelLimits caps a 1M-capable model to the 200k base without the [1m] tier', () => {
   const out = enrichEntriesWithModelLimits(
