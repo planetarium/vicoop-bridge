@@ -649,12 +649,24 @@ async function defaultFetch(
   url: string,
   init: { body: string; signal: AbortSignal },
 ): Promise<VicoopCodexStreamResponse> {
-  const res = await fetch(url, {
+  const reqInit: RequestInit = {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: init.body,
     signal: init.signal,
-  });
+  };
+  // Disable Bun's native fetch idle timeout (~255s) for the request to the
+  // local `vicoop-codex serve`. A legitimately slow upstream (long reasoning /
+  // slow first byte) can take minutes before serve emits its first SSE bytes —
+  // observed first-byte latencies up to ~440s — and Bun would otherwise abort
+  // at ~255s with "The operation timed out.", failing the task even though
+  // serve's own 9-min upstream deadline has NOT fired and the request would
+  // succeed. The request stays bounded by `init.signal` (the task abort) and by
+  // serve's upstream deadline, so this never hangs unbounded. `timeout` is a Bun
+  // extension to the DOM `RequestInit` type (Node's fetch ignores it), matching
+  // vicoop-codex's own `postUpstream`; hence the cast.
+  (reqInit as { timeout?: boolean }).timeout = false;
+  const res = await fetch(url, reqInit);
   return {
     ok: res.ok,
     status: res.status,
