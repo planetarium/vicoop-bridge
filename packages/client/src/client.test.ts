@@ -9,6 +9,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import {
   encodeFrame,
   parseUpFrame,
+  OPENAI_COMPAT_EXTENSION_URI,
   type Part,
   type TaskAssignFrame,
   type UpFrame,
@@ -828,6 +829,27 @@ test('processTask: artifacts are deduped by artifactId across chunks', async () 
   const completeLog = c.log.find((l) => l.includes('task.complete'));
   assert.ok(completeLog, 'task.complete log should be emitted');
   assert.match(completeLog, /artifacts=2/);
+});
+
+test('processTask: counts tagged liveness heartbeats and logs the count, ignoring plain working statuses (issue #414 hop-1 instrumentation)', async () => {
+  const c = makeSink();
+  const s = captureSend();
+  const hb = { [OPENAI_COMPAT_EXTENSION_URI]: { heartbeat: true } };
+  const backend = backendOf('stub', async (_t, emit: Emit) => {
+    emit({ type: 'task.status', taskId: 'T1', status: { state: 'working' }, metadata: hb });
+    emit({ type: 'task.status', taskId: 'T1', status: { state: 'working' }, metadata: hb });
+    // A plain working status (no heartbeat marker) must NOT count as a beat.
+    emit({ type: 'task.status', taskId: 'T1', status: { state: 'working' } });
+    emit({ type: 'task.complete', taskId: 'T1', status: { state: 'completed' } });
+  });
+  await processTask(makeAssign('T1'), new AbortController().signal, {
+    backend,
+    send: s.send,
+    logger: createLogger('debug', c.sink),
+  });
+  const completeLog = c.log.find((l) => l.includes('task.complete'));
+  assert.ok(completeLog, 'task.complete log should be emitted');
+  assert.match(completeLog, /heartbeats=2/);
 });
 
 test('processTask: backend emits task.fail -> logs task.fail with code and message (#147)', async () => {

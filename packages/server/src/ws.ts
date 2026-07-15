@@ -3,6 +3,7 @@ import type { IncomingMessage, Server } from 'node:http';
 import {
   parseUpFrame,
   PROTOCOL_VERSION,
+  OPENAI_COMPAT_EXTENSION_URI,
   type Part,
   type TaskStatus as WireTaskStatus,
   type Message as WireMessage,
@@ -17,6 +18,16 @@ import { isReservedAgentId } from './reserved-agent-ids.js';
 import { resolveHelloAgentCard } from './card-resolver.js';
 import { terminalErrorMessageFields } from './terminal-error.js';
 import { resolveUsageResponse } from './usage-rpc.js';
+
+// Diagnostic (issue #414): is this `task.status` frame a tagged liveness
+// heartbeat (non-terminal working status carrying
+// `metadata[<URI>].heartbeat === true`)? Used to count beats forwarded per task.
+function isHeartbeatStatusFrame(metadata: unknown): boolean {
+  if (typeof metadata !== 'object' || metadata === null) return false;
+  const ext = (metadata as Record<string, unknown>)[OPENAI_COMPAT_EXTENSION_URI];
+  if (typeof ext !== 'object' || ext === null) return false;
+  return (ext as Record<string, unknown>).heartbeat === true;
+}
 
 interface ClientRow {
   id: string;
@@ -253,6 +264,13 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       case 'task.status': {
         const b = opts.registry.getBinding(frame.taskId);
         if (!b) return;
+        // Diagnostic (issue #414): count liveness-heartbeat beats forwarded for
+        // this task (hop 2). A heartbeat is a non-terminal working status tagged
+        // `metadata[<URI>].heartbeat === true`; other `task.status` frames don't
+        // count. Surfaced on the terminal log below.
+        if (isHeartbeatStatusFrame(frame.metadata)) {
+          b.heartbeats = (b.heartbeats ?? 0) + 1;
+        }
         b.sink.pushStatus({
           taskId: frame.taskId,
           contextId: b.contextId,
@@ -315,6 +333,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           taskId: frame.taskId,
           contextId: b.contextId,
           state: frame.status.state,
+          heartbeatsForwarded: b.heartbeats ?? 0,
           ...(b.principalId !== undefined ? { principalId: b.principalId } : {}),
         });
         break;
@@ -356,6 +375,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           contextId: b.contextId,
           errorCode: frame.error.code,
           errorMessage: truncate(frame.error.message, 256),
+          heartbeatsForwarded: b.heartbeats ?? 0,
           ...(b.principalId !== undefined ? { principalId: b.principalId } : {}),
         });
         break;

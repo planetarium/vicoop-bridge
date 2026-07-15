@@ -267,6 +267,65 @@ test('task.status propagates frame metadata onto the top-level TaskStatusUpdateE
   }
 });
 
+test('task.complete log carries the forwarded heartbeat count, ignoring plain working statuses (issue #414 hop-2 instrumentation)', async () => {
+  const server = createServer();
+  const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+  const events: Array<Record<string, unknown>> = [];
+  const origLog = console.log;
+  console.log = (...args: unknown[]) => {
+    if (typeof args[0] !== 'string') return;
+    try {
+      const o = JSON.parse(args[0]) as Record<string, unknown>;
+      if (o && typeof o === 'object' && 'event' in o) events.push(o);
+    } catch {
+      // non-JSON console output — ignore
+    }
+  };
+
+  try {
+    await once(ws, 'open');
+    ws.send(encodeFrame({
+      type: 'hello',
+      version: PROTOCOL_VERSION,
+      agentId: 'agent-1',
+      token: 'token',
+      agentCard: { name: 'agent', version: '0.0.0', protocolVersion: '0.3.0' },
+    }));
+    await waitForAgent(registry, 'agent-1');
+
+    registry.bindTask({
+      agentId: 'agent-1',
+      taskId: 'task-hbc',
+      contextId: 'ctx-hbc',
+      sink: makeSink(),
+    });
+
+    const ts = '2026-06-18T00:00:00.000Z';
+    const hbMeta = { [OPENAI_COMPAT_EXTENSION_URI]: { heartbeat: true } };
+    // Two tagged heartbeats...
+    ws.send(encodeFrame({ type: 'task.status', taskId: 'task-hbc', status: { state: 'working', timestamp: ts }, metadata: hbMeta }));
+    ws.send(encodeFrame({ type: 'task.status', taskId: 'task-hbc', status: { state: 'working', timestamp: ts }, metadata: hbMeta }));
+    // ...and a plain working status that must NOT be counted as a beat.
+    ws.send(encodeFrame({ type: 'task.status', taskId: 'task-hbc', status: { state: 'working', timestamp: ts } }));
+    ws.send(encodeFrame({ type: 'task.complete', taskId: 'task-hbc', status: { state: 'completed', timestamp: ts } }));
+
+    const deadline = Date.now() + 1_000;
+    let ev: Record<string, unknown> | undefined;
+    while (!(ev = events.find((e) => e.event === 'task_completed' && e.taskId === 'task-hbc'))) {
+      assert.ok(Date.now() < deadline, 'timed out waiting for task_completed');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(ev.heartbeatsForwarded, 2);
+  } finally {
+    console.log = origLog;
+    ws.close();
+    await closeServer(server);
+  }
+});
+
 test('task.status without metadata leaves TaskStatusUpdateEvent.metadata unset', async () => {
   const server = createServer();
   const registry = new Registry();

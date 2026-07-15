@@ -44,6 +44,14 @@ export interface TaskBinding {
   // (AdminA2XExecutor) that never calls registry.bindTask().
   principalId?: string;
   requestedExtensions?: string[];
+  // Diagnostic counter (issue #414): number of liveness-heartbeat `task.status`
+  // frames the server has received from the client and pushed to the sink for
+  // this task. Surfaced on the terminal log so a router stall can be checked
+  // against whether the server was actually forwarding heartbeats (hop 2) — a
+  // high count with a stalled router points downstream (updateTask freeze /
+  // router), a ~0 count points upstream (client never emitted). Lazily
+  // initialized; incremented in ws.ts's `task.status` handler.
+  heartbeats?: number;
 }
 
 export type CallerChangeListener = (agentId: string, callers: string[]) => void;
