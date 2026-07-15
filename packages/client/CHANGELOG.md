@@ -1,5 +1,43 @@
 # @vicoop-bridge/client
 
+## 0.36.3
+
+### Patch Changes
+
+- d6852f7: diag(client): count liveness heartbeats emitted per task and log the count on the
+  task lifecycle line (`heartbeats=N` on `task.complete` / `task.canceled` /
+  `task.fail`) — issue #414 hop-1 instrumentation.
+
+  The router intermittently trips its 300s stream-stall watchdog on a byte-silent
+  turn even though the 10s liveness heartbeat should keep it alive. Static analysis
+  found every hop individually correct, so this adds a cheap, always-on counter at
+  the point the client emits heartbeat `task.status` frames onto the wire. A
+  multi-minute task that logs `heartbeats=0` means the beats never fired/left the
+  client (hop 1); a healthy count (≈ elapsedMs / 10s) shifts suspicion downstream
+  (server forward / router re-arm). Counts only the tagged liveness beat
+  (`metadata[openai-compat/v1].heartbeat === true`), not ordinary working-status
+  frames. Logging-only; no behavior change.
+
+  Pairs with the server-side hop-2 counter (`heartbeatsForwarded` on the bridge's
+  `task_completed` / `task_failed_by_client` events) and the `task_store_slow_update`
+  latency probe, so a future stall can be localized to a specific hop.
+
+- 1151e3d: client daemon: reap the vicoop-codex `serve` child on every non-SIGKILL exit
+
+  The `vicoop-codex` host backend spawns a long-lived `vicoop-codex serve`
+  app-server whose only teardown is `backend.stop()`, reached via
+  `client.stop()`. But the daemon also exits WITHOUT running the SIGINT/SIGTERM
+  handler — on a fatal terminal WS close (`onFatal` → `process.exit(1)`), an
+  `uncaughtException`/`unhandledRejection`, or SIGHUP (previously unhandled) —
+  so `stop()` never fired and the serve child leaked as an orphan (reparented to
+  init, still LISTENing), accumulating one per restart.
+
+  Register SIGHUP through the graceful path, and add a `process.once('exit')`
+  last-resort that calls `client.stop()` synchronously — it runs on every
+  `process.exit()` path, so the child is reliably reaped on all non-SIGKILL
+  exits. (SIGKILL can't be trapped; vicoop-codex-cli's `serve` carries its own
+  parent-death watchdog for that case.)
+
 ## 0.36.2
 
 ### Patch Changes
