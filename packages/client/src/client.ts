@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 import {
   PROTOCOL_VERSION,
+  OPENAI_COMPAT_EXTENSION_URI,
   encodeFrame,
   parseDownFrame,
   withOpenAICompatModelsAdvertise,
@@ -612,6 +613,16 @@ export class Client {
   }
 }
 
+// Diagnostic (issue #414): is this `task.status` frame's metadata the tagged
+// liveness-heartbeat marker (`metadata[<URI>].heartbeat === true`)? Other
+// `task.status` frames (initial working, progress) don't count as beats.
+function isHeartbeatStatusFrame(metadata: unknown): boolean {
+  if (typeof metadata !== 'object' || metadata === null) return false;
+  const ext = (metadata as Record<string, unknown>)[OPENAI_COMPAT_EXTENSION_URI];
+  if (typeof ext !== 'object' || ext === null) return false;
+  return (ext as Record<string, unknown>).heartbeat === true;
+}
+
 export interface ProcessTaskDeps {
   backend: Backend;
   // Wire send. Receives every frame the backend emits, plus a fallback
@@ -641,12 +652,19 @@ export async function processTask(
   // so a per-frame counter would over-report.
   const state: {
     artifactIds: Set<string>;
+    // Diagnostic counter (issue #414): liveness-heartbeat `task.status` frames
+    // this task emitted onto the wire (hop 1). Surfaced on the lifecycle log so
+    // a router stall can be checked against whether the client actually emitted
+    // heartbeats during a long silent turn — a ~0 count over a multi-minute task
+    // means the beats never fired/left; a healthy count (~elapsedMs/10s) shifts
+    // suspicion downstream (server forward / router re-arm).
+    heartbeats: number;
     terminal:
       | { kind: 'complete' }
       | { kind: 'canceled' }
       | { kind: 'fail'; code: string; message: string }
       | null;
-  } = { artifactIds: new Set(), terminal: null };
+  } = { artifactIds: new Set(), heartbeats: 0, terminal: null };
 
   // Wrap emit so we can observe terminal frames the backend sends and
   // report taskId/elapsedMs/artifacts/code from the same code path,
@@ -656,7 +674,9 @@ export async function processTask(
   // distinctly so the lifecycle log doesn't mislabel cancels as completions.
   const emit: Emit = (f) => {
     if (f.type === 'task.artifact') state.artifactIds.add(f.artifact.artifactId);
-    else if (f.type === 'task.complete') {
+    else if (f.type === 'task.status' && isHeartbeatStatusFrame(f.metadata)) {
+      state.heartbeats += 1;
+    } else if (f.type === 'task.complete') {
       state.terminal =
         f.status.state === 'canceled' ? { kind: 'canceled' } : { kind: 'complete' };
     } else if (f.type === 'task.fail') {
@@ -688,11 +708,11 @@ export async function processTask(
       );
     } else if (terminal.kind === 'complete') {
       deps.logger.info(
-        `task.complete taskId=${taskTok} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
+        `task.complete taskId=${taskTok} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size} heartbeats=${state.heartbeats}`,
       );
     } else if (terminal.kind === 'canceled') {
       deps.logger.info(
-        `task.canceled taskId=${taskTok} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
+        `task.canceled taskId=${taskTok} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size} heartbeats=${state.heartbeats}`,
       );
     } else {
       // Surface error.message alongside the code so operators can debug
@@ -707,7 +727,7 @@ export async function processTask(
         ? ` message=${safeToken(terminal.message, 4000)}`
         : '';
       deps.logger.info(
-        `task.fail taskId=${taskTok} code=${safeToken(terminal.code)} elapsedMs=${elapsedMs}${msgPart}`,
+        `task.fail taskId=${taskTok} code=${safeToken(terminal.code)} elapsedMs=${elapsedMs} heartbeats=${state.heartbeats}${msgPart}`,
       );
     }
   } catch (err) {
@@ -747,7 +767,7 @@ export async function processTask(
         status: { state: 'canceled', timestamp: new Date().toISOString() },
       });
       deps.logger.info(
-        `task.canceled taskId=${taskTok} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size}`,
+        `task.canceled taskId=${taskTok} elapsedMs=${elapsedMs} artifacts=${state.artifactIds.size} heartbeats=${state.heartbeats}`,
       );
     } else {
       const code = 'backend_error';
@@ -758,7 +778,7 @@ export async function processTask(
       });
       const msgPart = message ? ` message=${safeToken(message, 4000)}` : '';
       deps.logger.info(
-        `task.fail taskId=${taskTok} code=${code} elapsedMs=${elapsedMs}${msgPart}`,
+        `task.fail taskId=${taskTok} code=${code} elapsedMs=${elapsedMs} heartbeats=${state.heartbeats}${msgPart}`,
       );
     }
   }
