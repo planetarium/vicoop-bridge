@@ -704,7 +704,7 @@ export async function processTask(
       // bridge server will likely time the task out; surface it at warn so
       // operators see the broken contract instead of a silent gap.
       deps.logger.warn(
-        `backend.end taskId=${taskTok} elapsedMs=${elapsedMs} (no terminal frame)`,
+        `backend.end taskId=${taskTok} elapsedMs=${elapsedMs} heartbeats=${state.heartbeats} (no terminal frame)`,
       );
     } else if (terminal.kind === 'complete') {
       deps.logger.info(
