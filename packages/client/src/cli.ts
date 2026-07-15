@@ -697,6 +697,37 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   };
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
+  // SIGHUP — e.g. the controlling terminal / login session going away under a
+  // launcher like cmux — otherwise terminates the daemon with Node's default
+  // disposition, WITHOUT running onSignal, orphaning the backend's long-lived
+  // child (the `vicoop-codex serve` app-server). Route it through the same
+  // graceful path so `backend.stop()` reaps the child.
+  process.on('SIGHUP', onSignal);
+  // Last-resort synchronous cleanup. onSignal covers the graceful signals, but
+  // the daemon also leaves via process.exit() on a fatal terminal WS close
+  // (`onFatal`), an `uncaughtException`, or an `unhandledRejection` — none of
+  // which run onSignal, so `backend.stop()` (which SIGTERMs the serve child)
+  // would never fire and the child would leak as an orphan (reparented to init,
+  // still LISTENing). `process.exit()` runs 'exit' listeners synchronously and
+  // `client.stop()` is synchronous + idempotent, so this reliably reaps the
+  // child on every non-SIGKILL exit. (SIGKILL can't be trapped; the serve side
+  // carries its own parent-death watchdog for that case.)
+  process.once('exit', () => {
+    // Reap the backend's long-lived child FIRST and independently: it is the
+    // whole point of this hook, and `client.stop()` only reaches `backend.stop()`
+    // as its last step (after aborting inflight + closing the WS), so a throw in
+    // one of those earlier steps must not be able to skip the kill.
+    try {
+      backend.stop?.();
+    } catch {
+      // best-effort — never throw out of an exit handler
+    }
+    try {
+      client.stop();
+    } catch {
+      // best-effort — never throw out of an exit handler
+    }
+  });
 }
 
 // Race the spawned child's early exit against a short grace timer. A daemon
