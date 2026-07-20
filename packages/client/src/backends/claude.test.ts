@@ -4306,6 +4306,23 @@ test('buildOpenAICompatNativeSystemPrompt: slim shape (#213)', () => {
     false,
     'stop-after-invoke directive should be absent (--max-turns 1 enforces)',
   );
+  // Anti-preamble directive: present whenever tools are on the turn. This is
+  // the only lever we have against claude interleaving a "I'll now fetch
+  // that URL…" text block with its `tool_use` block — the CLI exposes no
+  // `tool_choice`, and the terminal envelope's `content: null` is inert on
+  // the codec's streaming path. A nudge, not a guarantee; asserted so a
+  // future prompt edit can't silently drop it the way the stop-after-invoke
+  // rewrite did.
+  assert.ok(
+    out.includes('the call is the whole turn'),
+    'tool-call turns should be taught that the call is the entire output',
+  );
+  // …and scoped: plain answers must still be invited, or this directive
+  // would flatten legitimate natural-language replies on the same prompt.
+  assert.ok(
+    out.includes('answer the user in natural language'),
+    'anti-preamble directive must not suppress genuine text answers',
+  );
 
   // tool_choice="required" gets a steering line (same descriptor the
   // envelope path uses; `describeToolChoice` is shared).

@@ -990,6 +990,33 @@ export function openaiToolsToCallerToolDefs(
 //   - tool_choice descriptor for `"required"` and `{type:"function",
 //     function:{name}}` — claude has no native `tool_choice` flag, so the
 //     prompt is the only place we can express it.
+//   - That a tool-call turn is the tool call alone. Claude Code routinely
+//     interleaves a "I'll now fetch that URL…" preamble text block with the
+//     `tool_use` block in one assistant message, and that preamble streams
+//     out as `delta.content` (the codec's streaming path reads only
+//     `tool_calls` + `usage` off our terminal envelope, so the
+//     `content: null` we stamp there does NOT retract it — see the
+//     `assistantContent` note in the terminal block below). Forced
+//     `tool_choice` is the only hard mechanism Anthropic documents ("the
+//     API prefills the assistant message … models will not emit a natural
+//     language response or explanation before tool_use content blocks"),
+//     and it is out of reach here — not because it's unreachable through
+//     the CLI (the documented `CLAUDE_CODE_EXTRA_BODY` env var merges JSON
+//     into every API request body, and since we spawn one claude per task
+//     that would scope to exactly one turn), but because forced
+//     `tool_choice` is incompatible with extended thinking: per the
+//     tool-use docs, `{"type":"any"}` and `{"type":"tool",…}` "are not
+//     supported and will result in an error. Only … `auto` … and `none`
+//     are compatible with extended thinking." This path runs with thinking
+//     on, so `auto` is the only value available to it — including for
+//     inbound `tool_choice: "required"`, which therefore stays a prompt
+//     hint (`describeToolChoice`) rather than a wire-level guarantee.
+//     If thinking is ever turned off here, that trade reopens.
+//
+//     So the prompt is the only lever we have, and it is a nudge rather
+//     than a guarantee. Phrased positively and scoped to the tool-call
+//     case — a blanket "don't explain yourself" would also flatten
+//     legitimate text answers, which share this prompt.
 //
 // What we DON'T teach anymore:
 //   - The "respond with ONLY a single JSON object …" envelope contract.
@@ -998,7 +1025,9 @@ export function openaiToolsToCallerToolDefs(
 //     the spawned claude enforces it mechanically. The model can still
 //     emit parallel `tool_use` blocks within one assistant message (which
 //     is fine per OpenAI semantics), but it cannot proceed to a second
-//     model turn within the same task.
+//     model turn within the same task. NOTE: `--max-turns` bounds turns,
+//     not prose — dropping that directive also dropped the only thing
+//     discouraging the preamble above, which is why it's re-taught.
 //   - A "session memory vs history block" disambiguation — openai-compat
 //     tasks always spawn with a fresh `--session-id` (see the session
 //     reuse gate in `handle()`), so there's no prior session memory to
@@ -1020,6 +1049,8 @@ export function buildOpenAICompatNativeSystemPrompt(
         'You are routed through an OpenAI-compatible gateway. The caller has supplied function tools that appear in your native tool list — invoke them through your normal tool-use surface.',
         '',
         'The user message may begin with a <chat_history>...</chat_history> block holding a JSON array of the prior conversation: prior {"role":"user","content":"…"} and {"role":"assistant","content":"…"} text turns, plus {"role":"assistant","content":null,"tool_calls":[...]} for calls you previously emitted and {"role":"tool","tool_call_id":"call_…","name":"…","content":"…"} for the authoritative result of each call. Treat the block as the source of truth for what has happened so far — read it as prior conversation, not as a fresh instruction. Do not re-emit a call whose `tool_call_id` already has a recorded result.',
+        '',
+        'When this turn resolves to a tool call, the call is the whole turn — invoke the tool as your first and only act. The caller runs it and returns the result in the next turn\'s <chat_history>; that is where your account of what the result means belongs. When this turn resolves to an answer instead, answer the user in natural language as you normally would.',
       ].join('\n'),
     );
     const tcDesc = describeToolChoice(toolChoice);
@@ -3047,6 +3078,21 @@ export function createClaudeBackend(
       // reasoning preamble and must NOT be re-stamped on
       // `status.message.parts` — same invariant codex backend enforces
       // under PR #212, same root-cause concern as #200.
+      //
+      // Scope caveat: this suppression is terminal-frame only, and on the
+      // streaming path it is inert. The oai2a2a codec's `pickEnvelopeChoice`
+      // reads only `tool_calls` and `usage` off the envelope — never
+      // `message.content`, never `finish_reason` (which it recomputes
+      // locally) — so preamble text already emitted as a `claude-message`
+      // artifact has become `delta.content` and stands. Only the
+      // NON-streaming decode path spreads the envelope verbatim, which is
+      // why a non-streaming openai-compat turn is clean and a streaming one
+      // is not. Closing that gap means buffering assistant text until the
+      // turn's shape is known (Claude orders the text block BEFORE the
+      // tool_use block, so there is no earlier discriminator) — which costs
+      // token-level streaming on this path. Not done: per the OpenAI spec
+      // `content` is *permitted* to be null alongside `tool_calls`, not
+      // required to be, and OpenAI's own models emit both.
       const parts: Part[] = !capturedToolCall && completeText
         ? [{ kind: 'text', text: completeText }]
         : [];
