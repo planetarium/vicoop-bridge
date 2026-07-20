@@ -1,0 +1,5 @@
+---
+"@vicoop-bridge/client": patch
+---
+
+Stop the claude backend from smearing provider identity into openai-compat answers. Served through the openai-compat path, the model volunteered "I'm Claude, made by Anthropic" and a coding-agent persona ("here to help you with coding and technical tasks") on plain questions like "what is your name and role?" — off-target for a generic chat/completions proxy. The per-task `--system-prompt` now always closes with an identity-neutrality clause. Verified against the real claude CLI: replacing the base prompt alone does not stop this (the identity is weights-baked, not prompt-taught), while the explicit clause does. The clause is deliberately soft — it suppresses *volunteering* the vendor/persona, and still lets the model answer a direct question about its identity honestly rather than denying what it is. Also corrects the `--exclude-dynamic-system-prompt-sections` note: that flag has no effect here, and claude's injected per-machine date leaks regardless of the prompt replacement, the flag, or an explicit instruction not to reveal it.

@@ -8,6 +8,8 @@ import {
   buildClaudeChatCompletionEnvelope,
   buildOpenAICompatNativeSystemPrompt,
   DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT,
+  OPENAI_COMPAT_IDENTITY_CLAUSE,
+  OPENAI_COMPAT_OPERATOR_PRIVACY_CLAUSE,
   createClaudeBackend,
   enrichEntriesWithModelLimits,
   normalizeClaudeModelId,
@@ -2791,6 +2793,18 @@ test('openai-compat spawn trims cold-start context (--disable-slash-commands)', 
     false,
     'no --exclude-dynamic-system-prompt-sections (redundant once --system-prompt replaces the default)',
   );
+  // Privacy boundary, not a trim: without this an openai-compat caller (an
+  // arbitrary user) can read the operator's user-global `~/.claude/CLAUDE.md`
+  // — which the isolation cwd does NOT cover — straight out of the model's
+  // context. Asserted as an adjacent pair so a reordering can't satisfy it by
+  // accident.
+  const si = args.indexOf('--setting-sources');
+  assert.ok(si !== -1, 'expected --setting-sources on the openai-compat spawn');
+  assert.equal(
+    args[si + 1],
+    'project',
+    'expected --setting-sources project (drops the operator user-global CLAUDE.md)',
+  );
 });
 
 test('non-openai-compat spawn keeps skills intact (no lean-context flags)', async () => {
@@ -2808,6 +2822,10 @@ test('non-openai-compat spawn keeps skills intact (no lean-context flags)', asyn
   await backend.handle(assign('hi'), emit, NEVER);
   const args = fake.lastChild()?.args ?? [];
   assert.equal(args.includes('--disable-slash-commands'), false);
+  // A plain A2A task runs in the operator's own cwd on the operator's behalf,
+  // so its CLAUDE.md is context, not leakage — the privacy flag stays scoped
+  // to the openai-compat path.
+  assert.equal(args.includes('--setting-sources'), false);
 });
 
 test('openai-compat task spawns in the isolation cwd, not the operator cwd', async () => {
@@ -4254,6 +4272,17 @@ test('buildOpenAICompatNativeSystemPrompt: slim shape (#213)', () => {
   );
   // The user's system text leads.
   assert.ok(out.startsWith('be terse'));
+  // The identity-neutrality and operator-privacy clauses are always appended,
+  // in that order, with the privacy clause LAST — the design is "freshest
+  // instruction wins", so the ordering is the invariant, not just presence.
+  assert.ok(
+    out.includes(OPENAI_COMPAT_IDENTITY_CLAUSE),
+    'identity-neutrality clause must be present',
+  );
+  assert.ok(
+    out.endsWith(OPENAI_COMPAT_OPERATOR_PRIVACY_CLAUSE),
+    'operator-privacy clause must close the prompt',
+  );
   // The envelope contract — the very thing this path replaces — must be
   // absent. The legacy helper emits a literal '{"tool_calls":' substring
   // in its contract block; we assert it's missing here.
@@ -4290,18 +4319,21 @@ test('buildOpenAICompatNativeSystemPrompt: slim shape (#213)', () => {
   );
   assert.ok(none.includes('tool_choice="none"'));
 
-  // Bare `system` with no tools — emits just the system text.
-  assert.equal(
-    buildOpenAICompatNativeSystemPrompt('just be terse', undefined, undefined),
-    'just be terse',
-  );
+  // Bare `system` with no tools — the system text leads, then the always-on
+  // closing clauses.
+  const terse = buildOpenAICompatNativeSystemPrompt('just be terse', undefined, undefined);
+  assert.ok(terse.startsWith('just be terse'));
+  assert.ok(terse.includes(OPENAI_COMPAT_IDENTITY_CLAUSE));
+  assert.ok(terse.endsWith(OPENAI_COMPAT_OPERATOR_PRIVACY_CLAUSE));
 
   // No system, no tools, tool_choice undefined → the builder still yields a
-  // non-empty neutral base. This is the invariant that makes the output safe
-  // to pass to `--system-prompt` (which would replace claude's default with ""
-  // otherwise). The append path used to receive "" here harmlessly.
+  // non-empty neutral base (the DEFAULT greeting), then the closing clauses.
+  // This is the invariant that makes the output safe to pass to
+  // `--system-prompt` (which would replace claude's default with "" otherwise).
   const bare = buildOpenAICompatNativeSystemPrompt(undefined, undefined, undefined);
-  assert.equal(bare, DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT);
+  assert.ok(bare.startsWith(DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT));
+  assert.ok(bare.includes(OPENAI_COMPAT_IDENTITY_CLAUSE));
+  assert.ok(bare.endsWith(OPENAI_COMPAT_OPERATOR_PRIVACY_CLAUSE));
   assert.ok(bare.trim().length > 0, 'bare invocation must never return an empty prompt');
 });
 
