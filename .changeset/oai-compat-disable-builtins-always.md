@@ -1,5 +1,0 @@
----
-"@vicoop-bridge/client": patch
----
-
-Disable claude's built-in tools on every openai-compat task, not just when the caller supplies tools. The gate used to be caller-tool dispatch, so a bare chat-completion ran with built-ins (Bash / Read / Glob / ...) live — an arbitrary gateway caller got filesystem/shell reach on the operator's machine, and the agentic mode that enables is what defeated the operator-privacy clause shipped in 0.36.4: probed through a live router, the operator's account email leaked in 4/6 turns with tools live and 0/6 with them off (the clause holds in plain-chat mode). `--tools ""` now rides every envelope spawn. MCP-registered tools are unaffected — verified functionally with an http MCP tool invoked 4/4 under the flag, matching the caller-tools path, which has always shipped it; a many-tool session can lose deferred MCP tools because `--tools ""` also removes the built-in ToolSearch they load through, but the bridge's one-or-two-tool MCP surface is not deferred. Plain A2A tasks are untouched and keep claude's full tool surface.
