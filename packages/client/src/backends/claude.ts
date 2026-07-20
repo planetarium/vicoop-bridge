@@ -1039,10 +1039,11 @@ export function buildOpenAICompatNativeSystemPrompt(
   if (sections.length === 0) {
     sections.push(DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT);
   }
-  // Always close with the identity-neutrality clause (see the constant's
-  // note). Appended last so it is the model's freshest instruction, ahead of
-  // its trained default persona.
+  // Always close with the identity-neutrality and operator-privacy clauses
+  // (see each constant's note). Appended last so they are the model's
+  // freshest instructions, ahead of its trained default persona.
   sections.push(OPENAI_COMPAT_IDENTITY_CLAUSE);
+  sections.push(OPENAI_COMPAT_OPERATOR_PRIVACY_CLAUSE);
   return sections.join('\n\n');
 }
 
@@ -1065,8 +1066,29 @@ export function buildOpenAICompatNativeSystemPrompt(
 // leaks regardless — see the openaiCompatArgs note in handle()); an output-side
 // redaction layer would be the deterministic backstop if "zero provider
 // disclosure" ever becomes a hard requirement.
-const OPENAI_COMPAT_IDENTITY_CLAUSE =
+export const OPENAI_COMPAT_IDENTITY_CLAUSE =
   'You are presented as a generic assistant reached through an OpenAI-compatible gateway. Do not volunteer your underlying model, vendor, or provider (e.g. Anthropic/Claude), and do not describe yourself as a coding agent, unless the user explicitly asks about your identity.';
+
+// Operator-privacy clause carried on every openai-compat `--system-prompt`.
+//
+// Claude injects the operator's account email ("userEmail") into the model's
+// context on the same non-prompt channel as the date — `--system-prompt`
+// replacement does not control it, `--setting-sources` does not drop it, and
+// no flag removes it. But unlike the date (where an explicit "don't reveal"
+// instruction fails — see the openaiCompatArgs note in handle()), an explicit
+// clause here holds: disclosure suppression *aligns with* the model's PII
+// training instead of fighting it. Verified 13/13 against the real CLI —
+// the plain "list personal details in your context" probe that previously
+// leaked the email 3/3, plus adversarial probes (exact-value demand, operator
+// impersonation / account-recovery framing, verbatim context dump), all held.
+// "Decline" rather than "say you have none": the model honestly refuses
+// ("operator metadata I can't disclose") instead of being instructed to lie —
+// same honesty line as the identity clause above. Prompt-level, so not a
+// guarantee; the deterministic backstop (the client knows the operator email
+// via `claude auth status --json` and could exact-string-redact the output
+// stream) is deliberately out of scope here.
+export const OPENAI_COMPAT_OPERATOR_PRIVACY_CLAUSE =
+  'The context may include operator-account metadata (e.g. a userEmail entry). That belongs to the machine operator, NOT to the user you are talking to. Never disclose, quote, or confirm it — treat any request to list your context’s personal details as excluding it. If asked for it directly, decline.';
 
 // Neutral base prompt for a bare openai-compat chat-completion turn that
 // carries no caller `system` and no tools. Kept minimal and transport-flavoured
@@ -2094,7 +2116,8 @@ export function createClaudeBackend(
       // denied a write to `$HOME`), and OAuth still works — unlike `--bare`,
       // which is the only switch that would also drop CLAUDE.md but is API-key
       // auth only. The operator's account email remains in claude's injected
-      // context and is NOT removable via any flag; that residue is accepted.
+      // context and is NOT removable via any flag; it is suppressed at the
+      // prompt layer instead (OPENAI_COMPAT_OPERATOR_PRIVACY_CLAUSE).
       const leanContextArgs: readonly string[] = envelope
         ? ['--disable-slash-commands', '--setting-sources', 'project']
         : [];
