@@ -3496,12 +3496,14 @@ test('caller tools active → spawn argv carries `--tools ""` to disable claude 
   assert.equal(args[idx + 1], '');
 });
 
-test('history-only payload (no tools) leaves claude built-in tools enabled', async () => {
-  // Counterpart to the active-tools case: when the caller's payload carries
-  // only `chat_history` (replay context for a follow-up turn) and no
-  // `tools` array, there is no caller-side dispatch contract to protect this
-  // turn — `--tools ""` MUST NOT appear or claude would lose its built-ins
-  // for a turn the caller never intended to constrain.
+test('history-only payload (no tools) still disables claude built-in tools', async () => {
+  // Built-ins are off for EVERY openai-compat turn, not just active-dispatch
+  // ones. This used to be gated on caller tools, which left the tool-less
+  // chat-completion path running with built-ins LIVE — an arbitrary gateway
+  // caller got filesystem/shell reach, and the agentic mode it enables is
+  // what defeated the operator-privacy clause (the email leaked through the
+  // router with tools live, held with them off). A generic chat proxy turn
+  // has no business driving claude's built-ins.
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
@@ -3518,15 +3520,17 @@ test('history-only payload (no tools) leaves claude built-in tools enabled', asy
   );
 
   const args = fake.lastChild()?.args ?? [];
-  assert.equal(args.includes('--tools'), false);
+  const idx = args.indexOf('--tools');
+  assert.ok(idx >= 0, 'expected --tools "" on a history-only openai-compat spawn');
+  assert.equal(args[idx + 1], '');
 });
 
-test('tool_choice="none" suppresses `--tools ""` even when `tools` are present', async () => {
-  // `tool_choice="none"` is the caller explicitly opting out of tool
-  // dispatch for this turn even though it sent a catalogue (e.g. for future
-  // turns of the same conversation). The envelope contract block in the
-  // system prompt is suppressed under the same gate, so handicapping
-  // claude's built-ins here would be incoherent.
+test('tool_choice="none" still disables claude built-in tools', async () => {
+  // `tool_choice="none"` opts out of CALLER tool dispatch — it does not opt
+  // back in to claude's own built-ins. The caller asked for a plain
+  // natural-language turn; letting claude answer it by running Bash/Read
+  // against the operator's machine is exactly the #178 failure plus the
+  // privacy hole the envelope-wide gate closes.
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
@@ -3543,7 +3547,9 @@ test('tool_choice="none" suppresses `--tools ""` even when `tools` are present',
   );
 
   const args = fake.lastChild()?.args ?? [];
-  assert.equal(args.includes('--tools'), false);
+  const idx = args.indexOf('--tools');
+  assert.ok(idx >= 0, 'expected --tools "" on a tool_choice="none" openai-compat spawn');
+  assert.equal(args[idx + 1], '');
 });
 
 test('non-envelope assistant text still streams as a text artifact under the extension', async () => {
