@@ -2129,18 +2129,27 @@ export function createClaudeBackend(
         ? ['--model', envelopeModel]
         : [];
       // Disable claude's built-in tools (Read / Glob / Bash / Edit / Write /
-      // ...) when the caller has supplied its own tool definitions via the
-      // openai-compat extension. Without this, claude silently uses its own
-      // tools to satisfy a request like "list the cwd" and emits the result
-      // as plain text, bypassing the caller's `tool_calls` envelope contract
-      // — see #178 for the observed case (envelope absent, response served
-      // from agent-side filesystem). `--tools ""` is the documented switch
-      // for blanket-disabling built-ins; MCP-registered tools (e.g.
-      // `send_file`) continue to load via `--mcp-config`.
-      const disableBuiltinToolArgs: readonly string[] = callerToolDispatchActive(
-        envelopeTools,
-        envelopeToolChoice,
-      )
+      // ...) on EVERY openai-compat task, tools or not. Two reasons:
+      //   - Caller-tools contract: without it claude silently uses its own
+      //     tools to satisfy a request like "list the cwd" and emits the
+      //     result as plain text, bypassing the caller's `tool_calls`
+      //     envelope contract (#178).
+      //   - Privacy/attack surface on the bare chat-completion path: the
+      //     gate used to be callerToolDispatchActive, so a tool-less
+      //     completion ran with built-ins LIVE — an arbitrary gateway caller
+      //     got filesystem/shell reach, and the agentic mode it enables is
+      //     what defeated the operator-privacy clause (email leaked 4/6
+      //     through the router with tools live, 0/6 with them off; the
+      //     clause holds in plain-chat mode).
+      // `--tools ""` disables the built-in set only. MCP-registered tools
+      // (e.g. `send_file`, caller-tools) still work — verified functionally:
+      // an http MCP tool is invoked 4/4 under `--tools ""` (matching the
+      // production caller-tools path, which has always shipped this flag),
+      // while a many-tool session can lose access for a different reason —
+      // deferred MCP tools need the built-in ToolSearch to load, and
+      // `--tools ""` removes it. The bridge's one-or-two-tool MCP surface
+      // is not deferred, so it is unaffected.
+      const disableBuiltinToolArgs: readonly string[] = envelope
         ? ['--tools', '']
         : [];
       // Cap claude to a single model turn when caller-tools are dispatched
