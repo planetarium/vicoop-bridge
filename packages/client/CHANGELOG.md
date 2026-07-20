@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.36.6
+
+### Patch Changes
+
+- 9d84bfc: claude: discourage the pre-tool-call preamble on openai-compat turns. Tool-enabled requests now teach the model that a tool-call turn is the tool call alone, so it stops prefixing "I'll now fetch that URL…" narration to its `tool_use` blocks. Genuine natural-language answers are unaffected.
+
 ## 0.36.5
 
 ### Patch Changes
