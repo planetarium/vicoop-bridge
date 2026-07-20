@@ -2077,11 +2077,26 @@ export function createClaudeBackend(
       // built-in tools off and an explicit "don't reveal the date" instruction.
       // So the flag would buy us nothing here; the date leak is not addressable
       // via these prompt-level switches (an output-side redaction layer would
-      // be the deterministic fix if it ever must be suppressed). CLAUDE.md
-      // auto-discovery can only be disabled via `--bare` (API-key auth only —
-      // out of reach under OAuth), so it stays loaded.
+      // be the deterministic fix if it ever must be suppressed).
+      //
+      // `--setting-sources project` drops the operator's *user-global* settings
+      // — and with them `~/.claude/CLAUDE.md` — from the openai-compat spawn.
+      // This is a privacy boundary, not a trim: openai-compat callers are
+      // arbitrary users, and without it a caller can extract the operator's
+      // private global CLAUDE.md verbatim (plus `$HOME`, hence the OS account
+      // name) by just asking the model what is in its context. The isolation
+      // cwd does NOT cover this — it only keeps *project* CLAUDE.md and project
+      // settings out; the user-global file loads regardless of cwd. `project`
+      // rather than `""` states the intent (exclude `user`/`local`); in the
+      // isolation cwd there is no project settings file to load either way.
+      // Verified: the sandbox guard rides `--settings`, which is a separate
+      // channel and still applies (a sandboxed spawn under this flag is still
+      // denied a write to `$HOME`), and OAuth still works — unlike `--bare`,
+      // which is the only switch that would also drop CLAUDE.md but is API-key
+      // auth only. The operator's account email remains in claude's injected
+      // context and is NOT removable via any flag; that residue is accepted.
       const leanContextArgs: readonly string[] = envelope
-        ? ['--disable-slash-commands']
+        ? ['--disable-slash-commands', '--setting-sources', 'project']
         : [];
       // Forward `envelope.model` to claude via `--model <id>` so the gateway-
       // resolved model id wins over claude's own default (#302). Sticky for
@@ -2193,8 +2208,11 @@ export function createClaudeBackend(
         status: { state: 'working', timestamp: new Date().toISOString() },
       });
 
-      // openai-compat tasks spawn in the isolation cwd (no operator CLAUDE.md /
-      // project settings / hooks); plain A2A tasks keep the operator cwd.
+      // openai-compat tasks spawn in the isolation cwd (no *project* CLAUDE.md /
+      // project settings / hooks); plain A2A tasks keep the operator cwd. Note
+      // the isolation cwd does not cover the operator's user-global
+      // `~/.claude/CLAUDE.md`, which claude loads regardless of cwd — that is
+      // what `--setting-sources project` above is for.
       const effectiveCwd = envelope ? resolveOpenAICompatCwd() : cwd;
 
       // Opt openai-compat spawns into Anthropic's 1-hour extended prompt cache.

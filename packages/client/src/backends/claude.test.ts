@@ -2791,6 +2791,18 @@ test('openai-compat spawn trims cold-start context (--disable-slash-commands)', 
     false,
     'no --exclude-dynamic-system-prompt-sections (redundant once --system-prompt replaces the default)',
   );
+  // Privacy boundary, not a trim: without this an openai-compat caller (an
+  // arbitrary user) can read the operator's user-global `~/.claude/CLAUDE.md`
+  // — which the isolation cwd does NOT cover — straight out of the model's
+  // context. Asserted as an adjacent pair so a reordering can't satisfy it by
+  // accident.
+  const si = args.indexOf('--setting-sources');
+  assert.ok(si !== -1, 'expected --setting-sources on the openai-compat spawn');
+  assert.equal(
+    args[si + 1],
+    'project',
+    'expected --setting-sources project (drops the operator user-global CLAUDE.md)',
+  );
 });
 
 test('non-openai-compat spawn keeps skills intact (no lean-context flags)', async () => {
@@ -2808,6 +2820,10 @@ test('non-openai-compat spawn keeps skills intact (no lean-context flags)', asyn
   await backend.handle(assign('hi'), emit, NEVER);
   const args = fake.lastChild()?.args ?? [];
   assert.equal(args.includes('--disable-slash-commands'), false);
+  // A plain A2A task runs in the operator's own cwd on the operator's behalf,
+  // so its CLAUDE.md is context, not leakage — the privacy flag stays scoped
+  // to the openai-compat path.
+  assert.equal(args.includes('--setting-sources'), false);
 });
 
 test('openai-compat task spawns in the isolation cwd, not the operator cwd', async () => {
