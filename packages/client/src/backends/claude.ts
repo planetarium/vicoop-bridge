@@ -1030,17 +1030,43 @@ export function buildOpenAICompatNativeSystemPrompt(
     );
   }
 
-  // Never return an empty prompt. A bare chat-completion (no caller `system`,
+  // Seed a neutral base when a bare chat-completion (no caller `system`,
   // no tools, and tool_choice !== "none") would otherwise leave `sections`
-  // empty. Appending "" to claude's default prompt is harmless, but feeding
-  // "" to `--system-prompt` would *replace* the default with nothing — so the
-  // builder owns a neutral fallback here, keeping its output safe to use via
-  // either `--append-system-prompt` or `--system-prompt`.
+  // empty. Feeding "" to `--system-prompt` would *replace* the default with
+  // nothing, so the builder always owns at least this base — keeping its
+  // output safe to use via either `--append-system-prompt` or
+  // `--system-prompt`.
   if (sections.length === 0) {
-    return DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT;
+    sections.push(DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT);
   }
+  // Always close with the identity-neutrality clause (see the constant's
+  // note). Appended last so it is the model's freshest instruction, ahead of
+  // its trained default persona.
+  sections.push(OPENAI_COMPAT_IDENTITY_CLAUSE);
   return sections.join('\n\n');
 }
+
+// Identity-neutrality clause carried on every openai-compat `--system-prompt`.
+//
+// The served model's trained self-identity ("I'm Claude, made by Anthropic",
+// "here to help with coding") is baked into the weights, so it survives
+// replacing the base prompt via `--system-prompt` — verified empirically that
+// neither the replacement nor `--exclude-dynamic-system-prompt-sections`
+// strips it, and the model volunteers "made by Anthropic" / a coding-agent
+// persona on a plain "who are you?". An explicit clause in the replaced prompt
+// DOES suppress the volunteered mention (also verified). The openai-compat
+// path is a generic chat/completions proxy, not Claude Code, so we tell the
+// model not to smear provider/vendor identity or a coding-agent persona into
+// answers that never asked for it. Deliberately "soft": it suppresses
+// *volunteering* the identity, not a direct, explicit user question about it
+// (which the model may answer normally) — we shape the default, we don't make
+// the model deny what it is. This cannot touch weights-baked identity beyond
+// steering it, nor per-machine dynamic sections (e.g. the injected date, which
+// leaks regardless — see the openaiCompatArgs note in handle()); an output-side
+// redaction layer would be the deterministic backstop if "zero provider
+// disclosure" ever becomes a hard requirement.
+const OPENAI_COMPAT_IDENTITY_CLAUSE =
+  'You are presented as a generic assistant reached through an OpenAI-compatible gateway. Do not volunteer your underlying model, vendor, or provider (e.g. Anthropic/Claude), and do not describe yourself as a coding agent, unless the user explicitly asks about your identity.';
 
 // Neutral base prompt for a bare openai-compat chat-completion turn that
 // carries no caller `system` and no tools. Kept minimal and transport-flavoured
@@ -2016,11 +2042,15 @@ export function createClaudeBackend(
       // Tool use is native to the model, not taught by the default prompt, so
       // native MCP dispatch is unaffected. `buildOpenAICompatNativeSystemPrompt`
       // never returns "" (it owns a neutral fallback), so the replacement is
-      // always a non-empty base. Identity (`identityArgs`) and operator
-      // `extraArgs` still ride `--append-system-prompt`, which claude appends
-      // onto this base; note the base is therefore the model's first read,
-      // ahead of any appended identity directive (a change from the prior
-      // append-only ordering, immaterial on the stateless proxy turn).
+      // always a non-empty base, and it closes with an identity-neutrality
+      // clause so the model does not smear its trained "Claude / made by
+      // Anthropic / coding agent" persona into proxy answers (the replacement
+      // alone does NOT stop that — the identity is weights-baked, not prompt-
+      // taught; see OPENAI_COMPAT_IDENTITY_CLAUSE). Identity (`identityArgs`)
+      // and operator `extraArgs` still ride `--append-system-prompt`, which
+      // claude appends onto this base; note the base is therefore the model's
+      // first read, ahead of any appended identity directive (a change from the
+      // prior append-only ordering, immaterial on the stateless proxy turn).
       const openaiCompatArgs: readonly string[] = envelope
         ? [
             '--system-prompt',
@@ -2039,12 +2069,17 @@ export function createClaudeBackend(
       // weight here. Auth-neutral, unlike `--bare`, so the operator's OAuth login
       // still works.
       //
-      // Note we do NOT pass `--exclude-dynamic-system-prompt-sections`: it only
-      // applies to claude's default system prompt and is ignored once we replace
-      // that prompt via `--system-prompt` (see openaiCompatArgs above), which
-      // already carries no per-machine dynamic sections. CLAUDE.md auto-discovery
-      // can only be disabled via `--bare` (API-key auth only — out of reach under
-      // OAuth), so it stays loaded.
+      // Note we do NOT pass `--exclude-dynamic-system-prompt-sections`: it has
+      // no effect on this path. Replacing the base via `--system-prompt` does
+      // NOT strip claude's per-machine dynamic context — verified empirically
+      // that the injected date (e.g. "Today's date is …") still leaks with the
+      // replacement in place, AND still leaks with the flag added, even with
+      // built-in tools off and an explicit "don't reveal the date" instruction.
+      // So the flag would buy us nothing here; the date leak is not addressable
+      // via these prompt-level switches (an output-side redaction layer would
+      // be the deterministic fix if it ever must be suppressed). CLAUDE.md
+      // auto-discovery can only be disabled via `--bare` (API-key auth only —
+      // out of reach under OAuth), so it stays loaded.
       const leanContextArgs: readonly string[] = envelope
         ? ['--disable-slash-commands']
         : [];

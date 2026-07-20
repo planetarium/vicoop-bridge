@@ -4254,6 +4254,13 @@ test('buildOpenAICompatNativeSystemPrompt: slim shape (#213)', () => {
   );
   // The user's system text leads.
   assert.ok(out.startsWith('be terse'));
+  // The identity-neutrality clause is always appended (soft — suppresses the
+  // model *volunteering* "Claude / made by Anthropic / coding agent").
+  assert.ok(
+    out.includes('Do not volunteer your underlying model, vendor, or provider'),
+    'identity-neutrality clause must be present',
+  );
+  assert.ok(out.includes('unless the user explicitly asks about your identity'));
   // The envelope contract — the very thing this path replaces — must be
   // absent. The legacy helper emits a literal '{"tool_calls":' substring
   // in its contract block; we assert it's missing here.
@@ -4290,18 +4297,19 @@ test('buildOpenAICompatNativeSystemPrompt: slim shape (#213)', () => {
   );
   assert.ok(none.includes('tool_choice="none"'));
 
-  // Bare `system` with no tools — emits just the system text.
-  assert.equal(
-    buildOpenAICompatNativeSystemPrompt('just be terse', undefined, undefined),
-    'just be terse',
-  );
+  // Bare `system` with no tools — the system text leads, then the always-on
+  // identity-neutrality clause.
+  const terse = buildOpenAICompatNativeSystemPrompt('just be terse', undefined, undefined);
+  assert.ok(terse.startsWith('just be terse'));
+  assert.ok(terse.includes('Do not volunteer your underlying model'));
 
   // No system, no tools, tool_choice undefined → the builder still yields a
-  // non-empty neutral base. This is the invariant that makes the output safe
-  // to pass to `--system-prompt` (which would replace claude's default with ""
-  // otherwise). The append path used to receive "" here harmlessly.
+  // non-empty neutral base (the DEFAULT greeting), then the identity clause.
+  // This is the invariant that makes the output safe to pass to
+  // `--system-prompt` (which would replace claude's default with "" otherwise).
   const bare = buildOpenAICompatNativeSystemPrompt(undefined, undefined, undefined);
-  assert.equal(bare, DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT);
+  assert.ok(bare.startsWith(DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT));
+  assert.ok(bare.includes('Do not volunteer your underlying model'));
   assert.ok(bare.trim().length > 0, 'bare invocation must never return an empty prompt');
 });
 
