@@ -1,6 +1,6 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -86,7 +86,7 @@ export interface ClaudeBackendOptions {
   // Working directory for stateless openai-compat spawns, overriding `cwd` for
   // those tasks only. They have no legitimate use for the operator's `cwd`:
   // native dispatch disables claude's built-ins (`--tools ""`) and the path
-  // replaces claude's default prompt via `--system-prompt` (so cwd never even
+  // replaces claude's default prompt via `--system-prompt-file` (so cwd never even
   // reaches the model), while the operator-cwd's CLAUDE.md, project settings,
   // and hooks are all off-target for a generic chat/completions proxy turn —
   // and re-paid on every fresh session. Pointing these spawns at an empty dir
@@ -2081,10 +2081,22 @@ export function createClaudeBackend(
       // read in terms of the model's view ("native tool surface is live").
       const nativeReady = nativeDispatchActive && callerToolsMcp !== null;
 
-      // Per-task `--system-prompt` carrying the openai-compat extension's
-      // system / tools / tool_choice. We *replace* claude's default agent
-      // prompt (rather than `--append-system-prompt`-ing onto it) for two
-      // reasons:
+      // Announce `working` BEFORE staging the system-prompt file below: a
+      // caller-provided emit that throws would escape handle() past the
+      // staging block, and firing it while no temp dir exists yet keeps that
+      // escape leak-free (the later emits all run after the child's close
+      // listener owns cleanup). Ordering is also uniform for consumers: every
+      // pre-spawn failure now arrives as working → task.fail.
+      emit({
+        type: 'task.status',
+        taskId: task.taskId,
+        status: { state: 'working', timestamp: new Date().toISOString() },
+      });
+
+      // Per-task system-prompt replacement carrying the openai-compat
+      // extension's system / tools / tool_choice. We *replace* claude's
+      // default agent prompt (rather than `--append-system-prompt`-ing onto
+      // it) for two reasons:
       //   - Cost: every openai-compat task spawns a fresh session (no reuse),
       //     so claude's multi-thousand-token coding-agent base prompt is
       //     re-paid on each request. Replacing it with this slim, caller-
@@ -2104,16 +2116,58 @@ export function createClaudeBackend(
       // claude appends onto this base; note the base is therefore the model's
       // first read, ahead of any appended identity directive (a change from the
       // prior append-only ordering, immaterial on the stateless proxy turn).
-      const openaiCompatArgs: readonly string[] = envelope
-        ? [
-            '--system-prompt',
+      //
+      // Delivered via `--system-prompt-file` (the file-sourced twin of
+      // `--system-prompt`, same replacement semantics) rather than argv:
+      // real openai-compat system prompts can run to hundreds of KB
+      // (character-chat consumers ship character+world+scene state in
+      // `system`), and an argv-borne prompt past the OS per-arg ARG_MAX
+      // limit kills the spawn with E2BIG before claude even starts, so the
+      // backend never gets a chance to fail cleanly (#437). The prompt is
+      // staged in a per-task mkdtemp dir (0700) as a 0600 file — caller
+      // system prompts can carry secrets — and reclaimed on process close;
+      // deleting any earlier would race claude's startup read of the file.
+      let openaiCompatSystemPromptDir: string | null = null;
+      const cleanupOpenAICompatSystemPromptFile = (): void => {
+        if (openaiCompatSystemPromptDir === null) return;
+        const dir = openaiCompatSystemPromptDir;
+        openaiCompatSystemPromptDir = null;
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // Best effort — the OS tmpdir reaper is the backstop.
+        }
+      };
+      let openaiCompatArgs: readonly string[] = [];
+      if (envelope) {
+        try {
+          openaiCompatSystemPromptDir = mkdtempSync(join(tmpdir(), 'vicoop-claude-sp-'));
+          const promptFile = join(openaiCompatSystemPromptDir, 'system-prompt.txt');
+          writeFileSync(
+            promptFile,
             buildOpenAICompatNativeSystemPrompt(
               envelopeSystem,
               envelopeTools,
               envelopeToolChoice,
             ),
-          ]
-        : [];
+            { mode: 0o600 },
+          );
+          openaiCompatArgs = ['--system-prompt-file', promptFile];
+        } catch (err) {
+          cleanupOpenAICompatSystemPromptFile();
+          rollbackFreshSession();
+          await closeCallerToolsMcp();
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: normalizeTaskFailError({
+              code: 'spawn_failed',
+              message: `failed to stage openai-compat system prompt file: ${errorMessage(err)}`,
+            }),
+          });
+          return;
+        }
+      }
       // Trim the cold-start overhead for openai-compat tasks. Every such task
       // spawns a fresh claude session (no reuse — see the gate above), so any
       // fixed per-request context is re-paid each time. `--disable-slash-commands`
@@ -2265,12 +2319,6 @@ export function createClaudeBackend(
         ...extraArgs,
       ];
 
-      emit({
-        type: 'task.status',
-        taskId: task.taskId,
-        status: { state: 'working', timestamp: new Date().toISOString() },
-      });
-
       // openai-compat tasks spawn in the isolation cwd (no *project* CLAUDE.md /
       // project settings / hooks); plain A2A tasks keep the operator cwd. Note
       // the isolation cwd does not cover the operator's user-global
@@ -2316,6 +2364,7 @@ export function createClaudeBackend(
         child = spawnFn(command, args, { cwd: effectiveCwd, env: effectiveEnv });
         recorder.mark('spawn');
       } catch (err) {
+        cleanupOpenAICompatSystemPromptFile();
         rollbackFreshSession();
         await closeCallerToolsMcp();
         timingLogger.debug(
@@ -2328,6 +2377,13 @@ export function createClaudeBackend(
         });
         return;
       }
+
+      // Reclaim the staged system-prompt file once the spawned process is
+      // done with it. `close` covers every post-spawn path (success, failure,
+      // kill, abort); `error` covers a child that never reaches close (e.g.
+      // ENOENT surfacing async). Idempotent, so double-firing is harmless.
+      child.on('close', cleanupOpenAICompatSystemPromptFile);
+      child.on('error', cleanupOpenAICompatSystemPromptFile);
 
       // Write the user message envelope and close stdin so claude sees EOF
       // and proceeds. Errors here are recorded; the close listener still
@@ -2342,6 +2398,11 @@ export function createClaudeBackend(
         } catch {
           /* best effort */
         }
+        // The kill SHOULD surface as `close` and fire the cleanup listener,
+        // but this branch exists precisely because the custom spawn is
+        // misbehaving — don't trust it to emit close either. Idempotent, so
+        // a later close double-fire is harmless.
+        cleanupOpenAICompatSystemPromptFile();
         // The freshly-minted sessionId never reached claude, so a follow-up
         // task on the same contextId must mint a new id rather than --resume.
         rollbackFreshSession();
