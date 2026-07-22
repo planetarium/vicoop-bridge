@@ -2081,6 +2081,18 @@ export function createClaudeBackend(
       // read in terms of the model's view ("native tool surface is live").
       const nativeReady = nativeDispatchActive && callerToolsMcp !== null;
 
+      // Announce `working` BEFORE staging the system-prompt file below: a
+      // caller-provided emit that throws would escape handle() past the
+      // staging block, and firing it while no temp dir exists yet keeps that
+      // escape leak-free (the later emits all run after the child's close
+      // listener owns cleanup). Ordering is also uniform for consumers: every
+      // pre-spawn failure now arrives as working → task.fail.
+      emit({
+        type: 'task.status',
+        taskId: task.taskId,
+        status: { state: 'working', timestamp: new Date().toISOString() },
+      });
+
       // Per-task system-prompt replacement carrying the openai-compat
       // extension's system / tools / tool_choice. We *replace* claude's
       // default agent prompt (rather than `--append-system-prompt`-ing onto
@@ -2307,12 +2319,6 @@ export function createClaudeBackend(
         ...extraArgs,
       ];
 
-      emit({
-        type: 'task.status',
-        taskId: task.taskId,
-        status: { state: 'working', timestamp: new Date().toISOString() },
-      });
-
       // openai-compat tasks spawn in the isolation cwd (no *project* CLAUDE.md /
       // project settings / hooks); plain A2A tasks keep the operator cwd. Note
       // the isolation cwd does not cover the operator's user-global
@@ -2392,6 +2398,11 @@ export function createClaudeBackend(
         } catch {
           /* best effort */
         }
+        // The kill SHOULD surface as `close` and fire the cleanup listener,
+        // but this branch exists precisely because the custom spawn is
+        // misbehaving — don't trust it to emit close either. Idempotent, so
+        // a later close double-fire is harmless.
+        cleanupOpenAICompatSystemPromptFile();
         // The freshly-minted sessionId never reached claude, so a follow-up
         // task on the same contextId must mint a new id rather than --resume.
         rollbackFreshSession();
