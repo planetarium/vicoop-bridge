@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync, statSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -41,6 +42,12 @@ interface FakeChild extends ClaudeChildHandle {
   readonly args: readonly string[];
   readonly cwd?: string;
   readonly env?: Record<string, string>;
+  // Snapshot of the staged `--system-prompt-file` taken at spawn time — the
+  // backend deletes the file when the child closes, so assertions that run
+  // after handle() resolves can't read it from disk.
+  readonly systemPromptFilePath: string | null;
+  readonly systemPromptFileContent: string | null;
+  readonly systemPromptFileMode: number | null;
   killed: boolean;
   killSignal: NodeJS.Signals | null;
   stdinPayload: string;
@@ -92,11 +99,19 @@ function makeFakeSpawn(configure: (child: FakeChild) => void): FakeSpawn {
         emit() { return false; },
       } as unknown as NodeJS.WritableStream;
 
+      const spIdx = args.indexOf('--system-prompt-file');
+      const systemPromptFilePath = spIdx !== -1 ? String(args[spIdx + 1]) : null;
+
       const child: FakeChild = {
         command,
         args,
         cwd: options.cwd,
         env: options.env,
+        systemPromptFilePath,
+        systemPromptFileContent:
+          systemPromptFilePath !== null ? readFileSync(systemPromptFilePath, 'utf8') : null,
+        systemPromptFileMode:
+          systemPromptFilePath !== null ? statSync(systemPromptFilePath).mode & 0o777 : null,
         stdin,
         stdout: mkReadable(stdoutEmitter),
         stderr: mkReadable(stderrEmitter),
@@ -3392,7 +3407,7 @@ test('probeTimeoutMs:0 with declared models advertises them without a default en
   assert.equal(spawned, 0, 'probeTimeoutMs:0 must skip the probe spawn');
 });
 
-test('spawn argv carries --system-prompt with the native directive when metadata is present', async () => {
+test('spawn stages --system-prompt-file with the native directive when metadata is present', async () => {
   const fake = scriptedSpawn({
     lines: [
       JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
@@ -3417,33 +3432,77 @@ test('spawn argv carries --system-prompt with the native directive when metadata
     NEVER,
   );
 
-  const args = fake.lastChild()?.args ?? [];
-  // The openai-compat path REPLACES claude's default prompt via --system-prompt
-  // (no identity configured here, so this is the only --system-prompt). The
-  // value carries the user's `system` text plus the native-dispatch directive
-  // — NOT the old envelope JSON contract, which #213 removed.
-  const idx = args.findIndex(
-    (a, i) =>
-      args[i - 1] === '--system-prompt' &&
-      typeof a === 'string' &&
-      a.includes('You are concise.'),
+  const child = fake.lastChild();
+  const args = child?.args ?? [];
+  // The openai-compat path REPLACES claude's default prompt, staged via
+  // --system-prompt-file rather than argv — a real-size system prompt on
+  // argv dies with E2BIG at posix_spawn (#437). The staged file carries the
+  // user's `system` text plus the native-dispatch directive — NOT the old
+  // envelope JSON contract, which #213 removed.
+  assert.ok(
+    args.includes('--system-prompt-file'),
+    'expected --system-prompt-file staging the openai-compat system text',
   );
-  assert.ok(idx >= 0, 'expected --system-prompt carrying the openai-compat system text');
+  assert.equal(args.includes('--system-prompt'), false, 'prompt must not ride argv (#437)');
+  const prompt = child?.systemPromptFileContent ?? '';
+  assert.ok(prompt.includes('You are concise.'), 'staged file carries the caller system text');
   // The slim native prompt teaches the model to use the native tool surface
   // and how to read the history block — nothing more.
-  assert.match(args[idx] as string, /native tool list/);
-  assert.match(args[idx] as string, /<chat_history>/);
+  assert.match(prompt, /native tool list/);
+  assert.match(prompt, /<chat_history>/);
   // Envelope contract phrase MUST NOT appear under #213.
-  assert.equal(
-    (args[idx] as string).includes('"tool_calls":[{"id":"call_<unique>"'),
-    false,
-  );
+  assert.equal(prompt.includes('"tool_calls":[{"id":"call_<unique>"'), false);
   // The "stop after invoking" directive was dropped because `--max-turns 1`
   // enforces single-turn semantics mechanically.
   assert.equal(
-    (args[idx] as string).toLowerCase().includes('after invoking'),
+    prompt.toLowerCase().includes('after invoking'),
     false,
     'stop-after-invoke directive should be absent (--max-turns 1 enforces)',
+  );
+});
+
+// #437: openai-compat system prompts can be hundreds of KB (character-chat
+// consumers). On argv they blow the OS per-arg ARG_MAX limit and posix_spawn
+// dies with E2BIG before claude starts. The prompt therefore ALWAYS rides a
+// temp file: written 0600 (caller prompts can carry secrets), passed via
+// --system-prompt-file, and reclaimed once the spawned process closes.
+test('large system prompt is staged 0600 on disk and reclaimed after the task (#437)', async () => {
+  const fake = scriptedSpawn({
+    lines: [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'ok' }),
+    ],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit } = collect();
+  // Well past any single-arg comfort zone (macOS caps one argv entry around
+  // 256KB in practice) — this is the size class the argv delivery choked on.
+  const hugeSystem = `character sheet: ${'lore '.repeat(120_000)}`;
+  await backend.handle(
+    assignWithOpenAICompat('hello', { system: hugeSystem }),
+    emit,
+    NEVER,
+  );
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  // Argv stays small: the flag + a path, never the prompt body.
+  assert.ok(child!.args.includes('--system-prompt-file'));
+  assert.equal(child!.args.includes('--system-prompt'), false);
+  for (const a of child!.args) {
+    assert.ok(String(a).length < 4096, 'no argv entry may carry the prompt body');
+  }
+  // The staged file carried the full prompt, owner-read/write only.
+  assert.ok(child!.systemPromptFileContent?.includes('character sheet:'));
+  assert.ok((child!.systemPromptFileContent?.length ?? 0) > hugeSystem.length - 1);
+  assert.equal(child!.systemPromptFileMode, 0o600);
+  // And it is reclaimed (file AND its per-task dir) once the child closed.
+  assert.ok(child!.systemPromptFilePath);
+  await assert.rejects(fs.stat(child!.systemPromptFilePath!), 'prompt file must be deleted');
+  await assert.rejects(
+    fs.stat(path.dirname(child!.systemPromptFilePath!)),
+    'per-task temp dir must be deleted',
   );
 });
 
@@ -3466,6 +3525,9 @@ test('absent metadata → no openai-compat system prompt is injected', async () 
     (a) => typeof a === 'string' && a.includes('"tool_calls":[{"id":"call_<unique>"'),
   );
   assert.equal(hasEnvelope, false);
+  // And no staged system-prompt file either — plain A2A tasks keep claude's
+  // default prompt.
+  assert.equal(args.includes('--system-prompt-file'), false);
 });
 
 test('caller tools active → spawn argv carries `--tools ""` to disable claude built-ins', async () => {
@@ -4483,12 +4545,11 @@ test('argv: openai-compat caller tools wire caller-tools MCP + native prompt + -
   assert.ok(cfg.mcpServers?.['_vb-caller-tools'], '_vb-caller-tools MCP server registered');
   assert.equal(cfg.mcpServers?.['_vb-caller-tools']?.type, 'http');
 
-  // (b) --system-prompt carries the native variant (replacing claude's
+  // (b) --system-prompt-file stages the native variant (replacing claude's
   // default) — the envelope contract block (the literal `{"tool_calls"`
   // substring the legacy prompt teaches) must be absent.
-  const apsIdx = args.indexOf('--system-prompt');
-  assert.notEqual(apsIdx, -1, '--system-prompt present');
-  const prompt = args[apsIdx + 1] as string;
+  assert.ok(args.includes('--system-prompt-file'), '--system-prompt-file present');
+  const prompt = child!.systemPromptFileContent ?? '';
   assert.equal(prompt.includes('{"tool_calls"'), false);
   assert.ok(prompt.startsWith('be terse'));
 
