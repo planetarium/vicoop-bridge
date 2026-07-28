@@ -2709,6 +2709,22 @@ export function createClaudeBackend(
           }
           return;
         }
+        if (evt.type === 'system') {
+          // Every non-`init` system subtype the SDK reports out-of-band. The
+          // one that prompted this: `model_refusal_fallback`, emitted when the
+          // requested model's safeguards flag a message and claude silently
+          // retries the turn on a different model. A caller asking for model X
+          // then gets model Y with no trace anywhere in the bridge's logs —
+          // the only record is the on-disk session transcript. (Measured at
+          // 24% of turns in one incident.) Logged generically rather than by
+          // subtype whitelist so a subtype added later is never silent.
+          timingLogger.warn?.(
+            `[claude] system event taskId=${task.taskId} ` +
+              `subtype=${safeToken(String(evt.subtype ?? ''), 60)} ` +
+              `detail=${safeToken(String((evt as { content?: unknown }).content ?? ''), 300)}`,
+          );
+          return;
+        }
         if (evt.type === 'stream_event') {
           if (reasoningEnabled && !emittedAskUserQuestion) {
             const reasoning = extractClaudeStreamReasoningDelta(evt);
