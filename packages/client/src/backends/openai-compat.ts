@@ -267,7 +267,97 @@ export function chatHistoryFromMessages(
     }
     out.push(parsed);
   }
-  return out.length > 0 ? out : null;
+  return out.length > 0 ? repairOrphanedToolCalls(out) : null;
+}
+
+// The in-band text a synthesized result carries.
+//
+// Deliberately NOT "re-issue the call if you still need it": that invites the
+// re-dispatch storm this repair exists to stop, and worse, invites a second
+// execution of a call whose side effects may already have landed (a write, a
+// send, a spawn). The wording below bounds the retry to read-only calls and
+// tells the model it is free to proceed with what it has.
+export const ORPHANED_TOOL_RESULT_CONTENT =
+  '[vicoop-bridge] The caller returned no result for this call; its outcome ' +
+  'is unknown. Do not repeat calls that have side effects. Re-issue a ' +
+  'read-only call only if its output is still required to finish the current ' +
+  'task; otherwise proceed with what you have.';
+
+// Every `tool_calls` entry an assistant turn emits MUST be answered by a
+// matching `role:"tool"` message — OpenAI Chat Completions rejects an unpaired
+// call, and a model reads one as "that dispatch is still in flight".
+//
+// The caller-tool protocol makes the unpaired state reachable in normal
+// operation: a turn ends with its calls captured by the bridge, and the caller
+// is expected to run them and return results on the next turn. When a result
+// never comes back, the orphan is replayed verbatim on EVERY later turn. The
+// model sees its own dispatch dangling, concludes the work was cut off,
+// re-dispatches — and the new call is orphaned the same way. The loop is
+// structural: nothing in-band ever tells the model the result is not coming,
+// so it can only keep retrying until the run dies at its turn cap. (Same shape
+// as the unqualified-name failure `requalifyHistoryToolNames` below fixes.)
+//
+// Defensive hardening, not a fix for an observed incident: an audit of 29
+// production caller-tool tasks found every call correctly paired, so this has
+// never been seen to fire. It is cheap insurance — a well-formed history is a
+// verified no-op (measured on a real 87-entry transcript: zero synthesized
+// entries, zero rendered-byte delta) — against a state the wire format calls
+// invalid and the real OpenAI API rejects with a 400.
+//
+// So we close the pairing here: any call id with no result anywhere in the
+// history gets a synthesized error result inserted directly after the
+// assistant turn that made it (the position the wire format requires). The
+// model is told the truth and can make a deliberate choice instead of looping.
+//
+// Byte-stability: this is a pure function of the input history and an orphan
+// stays an orphan on later turns, so the frozen prompt-cache prefix in
+// `formatChatHistoryBlocks` keeps hashing identically. A late-arriving real
+// result does change the bytes from that entry onward — correct, and worth the
+// one cache miss.
+export function repairOrphanedToolCalls(
+  history: OpenAICompatHistoryEntry[],
+): OpenAICompatHistoryEntry[] {
+  // Seeded from the WHOLE history: a result legitimately follows its call, so
+  // only an id answered nowhere at all counts as orphaned.
+  const answered = new Set<string>();
+  for (const entry of history) {
+    if (entry.role === 'tool') answered.add(entry.tool_call_id);
+  }
+
+  const out: OpenAICompatHistoryEntry[] = [];
+  for (const entry of history) {
+    out.push(entry);
+    if (entry.role !== 'assistant' || !('tool_calls' in entry)) continue;
+    if (!Array.isArray(entry.tool_calls)) continue;
+    for (const call of entry.tool_calls) {
+      if (!call || typeof call !== 'object') continue;
+      const id = (call as { id?: unknown }).id;
+      if (typeof id !== 'string' || id.length === 0) continue;
+      // Mirror codex's skip predicate (`historyToInjectItems`, codex.ts): it
+      // drops a tool_call with no usable `function.name` and emits no
+      // `function_call` item for it. Synthesizing a result for one would
+      // inject an unpaired `function_call_output` that the Responses API
+      // rejects — turning a silent degradation into a hard failure. A nameless
+      // call is malformed input anyway; leave it exactly as the backends
+      // already treat it. Carrying the name also guarantees the synthesized
+      // result is renamed in lockstep with its call by
+      // `requalifyHistoryToolNames`.
+      const fn = (call as { function?: unknown }).function;
+      const name =
+        fn && typeof fn === 'object' ? (fn as { name?: unknown }).name : undefined;
+      if (typeof name !== 'string' || name.length === 0) continue;
+      if (answered.has(id)) continue;
+      // A duplicated id within one turn is answered once.
+      answered.add(id);
+      out.push({
+        role: 'tool',
+        tool_call_id: id,
+        name,
+        content: ORPHANED_TOOL_RESULT_CONTENT,
+      });
+    }
+  }
+  return out;
 }
 
 // Parse a single envelope `messages[]` entry into the chat_history

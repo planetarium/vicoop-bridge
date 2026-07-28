@@ -11,7 +11,9 @@ import {
   formatChatHistoryBlocks,
   MIN_CACHEABLE_FROZEN_CHARS,
   type OpenAICompatHistoryEntry,
+  ORPHANED_TOOL_RESULT_CONTENT,
   parseOpenAICompatEnvelope,
+  repairOrphanedToolCalls,
   requalifyHistoryToolNames,
   tryParseToolCallsEnvelope,
 } from './openai-compat.js';
@@ -683,6 +685,141 @@ test('requalifyHistoryToolNames: tolerates malformed tool_calls items', () => {
   const out = requalifyHistoryToolNames(history, (n) => `Q_${n}`);
   // Nothing renamable → structurally equal to the input.
   assert.deepEqual(out, history);
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// repairOrphanedToolCalls — close the tool_call/tool_result pairing so a
+// dispatch whose result never came back cannot read as "still in flight".
+// An unanswered call is otherwise replayed on every later turn, the model
+// concludes its work was cut off and re-dispatches, and the run loops until
+// its turn cap. Defensive: no production incident has exercised this, so the
+// no-op-on-well-formed-input cases below matter as much as the repair itself.
+// ───────────────────────────────────────────────────────────────────────────
+
+const orphanCall = (id: string, name = 'read') => ({
+  id,
+  type: 'function' as const,
+  function: { name, arguments: '{}' },
+});
+
+test('repairOrphanedToolCalls: answers an unanswered call right after its assistant turn', () => {
+  const out = repairOrphanedToolCalls([
+    { role: 'assistant', content: null, tool_calls: [orphanCall('call_A')] },
+    { role: 'user', content: 'keep going' },
+  ]);
+  assert.deepEqual(out, [
+    { role: 'assistant', content: null, tool_calls: [orphanCall('call_A')] },
+    // Inserted directly after the call, not appended at the end — the wire
+    // format requires results to follow the turn that made them.
+    {
+      role: 'tool',
+      tool_call_id: 'call_A',
+      name: 'read',
+      content: ORPHANED_TOOL_RESULT_CONTENT,
+    },
+    { role: 'user', content: 'keep going' },
+  ]);
+});
+
+test('repairOrphanedToolCalls: a fully answered history is returned unchanged', () => {
+  const history: OpenAICompatHistoryEntry[] = [
+    { role: 'assistant', content: null, tool_calls: [orphanCall('call_A')] },
+    { role: 'tool', tool_call_id: 'call_A', content: 'real result' },
+  ];
+  // No false positives: a result legitimately follows its call, so the scan
+  // must consider the whole history before declaring an orphan.
+  assert.deepEqual(repairOrphanedToolCalls(history), history);
+});
+
+test('repairOrphanedToolCalls: partially answered turn repairs only the gaps, in call order', () => {
+  const out = repairOrphanedToolCalls([
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [orphanCall('call_A'), orphanCall('call_B'), orphanCall('call_C')],
+    },
+    { role: 'tool', tool_call_id: 'call_B', content: 'real result' },
+  ]);
+  assert.deepEqual(
+    out.map((e) => (e.role === 'tool' ? `tool:${e.tool_call_id}` : e.role)),
+    ['assistant', 'tool:call_A', 'tool:call_C', 'tool:call_B'],
+  );
+  assert.equal(out.filter((e) => e.role === 'tool').length, 3);
+});
+
+test('repairOrphanedToolCalls: is idempotent (prompt-cache prefix stays byte-stable)', () => {
+  // formatChatHistoryBlocks freezes a prefix and relies on it hashing
+  // identically turn over turn; a repair that grew on each pass would
+  // invalidate the cache on every request.
+  const once = repairOrphanedToolCalls([
+    { role: 'assistant', content: null, tool_calls: [orphanCall('call_A')] },
+  ]);
+  assert.deepEqual(repairOrphanedToolCalls(once), once);
+  assert.equal(formatChatHistory(repairOrphanedToolCalls(once)), formatChatHistory(once));
+});
+
+test('repairOrphanedToolCalls: skips calls with no usable function.name', () => {
+  // codex's historyToInjectItems drops these, emitting no `function_call`
+  // item; synthesizing a result anyway would inject an unpaired
+  // `function_call_output` that the Responses API rejects.
+  const history: OpenAICompatHistoryEntry[] = [
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        null,
+        { id: 'call_noFn' },
+        { id: 'call_emptyName', function: { name: '' } },
+        { id: 'call_numName', function: { name: 42 } },
+        { function: { name: 'read' } },
+      ],
+    },
+  ];
+  assert.deepEqual(repairOrphanedToolCalls(history), history);
+});
+
+test('repairOrphanedToolCalls: answers a duplicated id once', () => {
+  const out = repairOrphanedToolCalls([
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [orphanCall('call_A'), orphanCall('call_A')],
+    },
+  ]);
+  assert.equal(out.filter((e) => e.role === 'tool').length, 1);
+});
+
+test('repairOrphanedToolCalls: synthesized results survive requalifyHistoryToolNames', () => {
+  // claude applies the rename AFTER the projection. The synthesized result
+  // must carry the same name as the call it answers, or the rename splits the
+  // pair and claude rejects the replayed call ("No such tool available").
+  const repaired = repairOrphanedToolCalls([
+    { role: 'assistant', content: null, tool_calls: [orphanCall('call_A')] },
+  ]);
+  const renamed = requalifyHistoryToolNames(repaired, (n) => `mcp___vb-caller-tools__${n}`);
+  const call = renamed[0] as { tool_calls: { function: { name: string } }[] };
+  const result = renamed[1] as { name: string };
+  assert.equal(call.tool_calls[0].function.name, 'mcp___vb-caller-tools__read');
+  assert.equal(result.name, 'mcp___vb-caller-tools__read');
+});
+
+test('chatHistoryFromMessages: repairs orphaned calls in the projected history', () => {
+  // End-to-end: the repair is wired into the shared projection, so all four
+  // envelope-consuming backends (claude, codex, vicoop-codex, openclaw)
+  // inherit it rather than each re-implementing the pairing rule. `echo` never
+  // touches the envelope, so it is unaffected.
+  const history = chatHistoryFromMessages([
+    { role: 'assistant', content: null, tool_calls: [orphanCall('call_A')] },
+    { role: 'user', content: 'continue' },
+  ]);
+  assert.ok(history);
+  assert.equal(history.length, 2);
+  assert.deepEqual(history[1], {
+    role: 'tool',
+    tool_call_id: 'call_A',
+    name: 'read',
+    content: ORPHANED_TOOL_RESULT_CONTENT,
+  });
 });
 
 // ───────────────────────────────────────────────────────────────────────────

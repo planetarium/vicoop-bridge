@@ -13,6 +13,7 @@ import {
   OPENAI_COMPAT_OPERATOR_PRIVACY_CLAUSE,
   createClaudeBackend,
   enrichEntriesWithModelLimits,
+  describeClaudeSystemEvent,
   normalizeClaudeModelId,
   openaiToolsToCallerToolDefs,
   parseClaudeModelUsageForOpenAICompat,
@@ -5555,4 +5556,85 @@ test('claude backend resolveCapabilities short-circuits when probeTimeoutMs is 0
   const caps = await backend.resolveCapabilities!();
   assert.deepEqual(caps, {});
   assert.equal(spawned, 0, 'probeTimeoutMs:0 must skip the spawn entirely');
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// describeClaudeSystemEvent — non-`init` SDK system events. Previously every
+// one of them fell through the event loop unlogged, so a silent model switch
+// left no trace outside the on-disk session transcript.
+// ───────────────────────────────────────────────────────────────────────────
+
+// Verbatim from a production transcript (vicoop-client 0.36.7 / CC 2.1.215),
+// minus the uuid/session fields the logger never reads.
+const REFUSAL_FALLBACK_EVENT = {
+  type: 'system',
+  subtype: 'model_refusal_fallback',
+  direction: 'retry',
+  content:
+    "Fable 5's safeguards flagged this message. This sometimes happens with safe, " +
+    'normal conversations. Switched to Opus 4.8. Send feedback with /feedback or ' +
+    'learn more: https://support.claude.com/en/articles/15363606',
+  level: 'warning',
+  trigger: 'refusal',
+  originalModel: 'claude-fable-5',
+  fallbackModel: 'claude-opus-4-8',
+  apiRefusalCategory: 'reasoning_extraction',
+};
+
+test('describeClaudeSystemEvent: a refusal fallback warns and names both models', () => {
+  const { level, line } = describeClaudeSystemEvent('task-1', REFUSAL_FALLBACK_EVENT);
+  assert.equal(level, 'warn');
+  assert.match(line, /taskId=task-1/);
+  assert.match(line, /subtype=model_refusal_fallback/);
+  // The model transition must come from the structured fields — an operator
+  // must never have to parse the English blurb to learn what served the turn.
+  assert.match(line, /from=claude-fable-5/);
+  assert.match(line, /to=claude-opus-4-8/);
+  assert.match(line, /trigger=refusal/);
+  assert.match(line, /category=reasoning_extraction/);
+});
+
+test('describeClaudeSystemEvent: high-frequency subtypes stay off the warn channel', () => {
+  // Measured: `thinking_tokens` fires per reasoning-token delta — 10 events in
+  // one trivial turn. Warning on those would bury the fallback signal and make
+  // warn-level alerting useless on a long-running daemon.
+  const { level, line } = describeClaudeSystemEvent('task-2', {
+    type: 'system',
+    subtype: 'thinking_tokens',
+    estimated_tokens: 5,
+    estimated_tokens_delta: 5,
+  });
+  assert.equal(level, 'debug');
+  // Still logged, just quietly — a new subtype is never silent.
+  assert.match(line, /subtype=thinking_tokens/);
+  // No empty `detail=` / `from=` noise when the fields are absent.
+  assert.doesNotMatch(line, /detail=|from=|to=/);
+});
+
+test('describeClaudeSystemEvent: an unknown future subtype escalates on the SDK level', () => {
+  // Shape-driven, not a subtype whitelist: whatever ships next inherits the
+  // routing for free.
+  assert.equal(
+    describeClaudeSystemEvent('t', { subtype: 'not_invented_yet', level: 'error' }).level,
+    'warn',
+  );
+  assert.equal(describeClaudeSystemEvent('t', { subtype: 'not_invented_yet' }).level, 'debug');
+});
+
+test('describeClaudeSystemEvent: hostile content cannot forge a log line', () => {
+  const { line } = describeClaudeSystemEvent('t', {
+    subtype: 'x',
+    level: 'warning',
+    content: 'evil\n[client] FAKE ENTRY',
+  });
+  assert.equal(line.includes('\n'), false);
+  assert.match(line, /detail=/);
+});
+
+test('describeClaudeSystemEvent: tolerates a malformed event', () => {
+  for (const evt of [null, undefined, {}, { subtype: 42 }]) {
+    const { level, line } = describeClaudeSystemEvent('t', evt);
+    assert.equal(level, 'debug');
+    assert.match(line, /\[claude\] system event taskId=t subtype=/);
+  }
 });
