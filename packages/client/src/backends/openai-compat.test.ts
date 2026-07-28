@@ -804,8 +804,10 @@ test('repairOrphanedToolCalls: synthesized results survive requalifyHistoryToolN
 });
 
 test('chatHistoryFromMessages: repairs orphaned calls in the projected history', () => {
-  // End-to-end: the repair is wired into the shared projection, so all five
-  // backends inherit it rather than each re-implementing the pairing rule.
+  // End-to-end: the repair is wired into the shared projection, so all four
+  // envelope-consuming backends (claude, codex, vicoop-codex, openclaw)
+  // inherit it rather than each re-implementing the pairing rule. `echo` never
+  // touches the envelope, so it is unaffected.
   const history = chatHistoryFromMessages([
     { role: 'assistant', content: null, tool_calls: [orphanCall('call_A')] },
     { role: 'user', content: 'continue' },

@@ -349,6 +349,60 @@ export function normalizeClaudeModelId(raw: string): string {
   return raw.replace(/\[[^\]]+\]$/, '');
 }
 
+// Render a non-`init` SDK `system` event into one log line, and decide how
+// loudly to say it.
+//
+// The event that motivated this is `model_refusal_fallback`: the requested
+// model's safeguards flag a message, claude silently retries the turn on a
+// different model, and the caller gets model Y after asking for model X. None
+// of it reached a log — the loop handled only `subtype === 'init'` and every
+// other subtype fell through — so the only record was the on-disk session
+// transcript. One measured window ran at 24% of turns before anyone noticed.
+//
+// Handled by SHAPE, not by a subtype whitelist, so a subtype added later is
+// never silent. Two shape facts drive it:
+//
+//   - The operator-actionable payload rides structured fields
+//     (`originalModel` / `fallbackModel` / `trigger` / `apiRefusalCategory`),
+//     not the prose `content` blurb. Log both, but never make an operator
+//     parse English to learn which model actually served the turn.
+//   - The SDK stamps `level` on the subtypes that represent an anomaly
+//     (`model_refusal_fallback` carries `level: "warning"`). Everything else
+//     goes to debug — `thinking_tokens` alone fires per reasoning-token delta,
+//     measured at 10 events in a single trivial turn, and warning on that
+//     would bury the very signal this exists to surface and make warn-level
+//     alerting useless on a long-running daemon.
+//
+// Exported for unit tests.
+export function describeClaudeSystemEvent(
+  taskId: string,
+  evt: unknown,
+): { level: 'warn' | 'debug'; line: string } {
+  const sys = (evt ?? {}) as {
+    subtype?: unknown;
+    level?: unknown;
+    content?: unknown;
+    trigger?: unknown;
+    originalModel?: unknown;
+    fallbackModel?: unknown;
+    apiRefusalCategory?: unknown;
+  };
+  const field = (label: string, value: unknown, max = 60): string[] =>
+    typeof value === 'string' && value.length > 0 ? [`${label}=${safeToken(value, max)}`] : [];
+  const line =
+    `[claude] system event taskId=${taskId} ` +
+    [
+      `subtype=${safeToken(String(sys.subtype ?? ''), 60)}`,
+      ...field('from', sys.originalModel),
+      ...field('to', sys.fallbackModel),
+      ...field('trigger', sys.trigger),
+      ...field('category', sys.apiRefusalCategory),
+      ...field('detail', sys.content, 300),
+    ].join(' ');
+  const level = sys.level === 'warning' || sys.level === 'error' ? 'warn' : 'debug';
+  return { level, line };
+}
+
 // The 1M-context tier marker Claude Code appends to a model id (`[1m]`). Its
 // presence on an advertised id is the signal that the effective context window
 // is the model's full ceiling rather than the 200k base (see
@@ -2710,19 +2764,9 @@ export function createClaudeBackend(
           return;
         }
         if (evt.type === 'system') {
-          // Every non-`init` system subtype the SDK reports out-of-band. The
-          // one that prompted this: `model_refusal_fallback`, emitted when the
-          // requested model's safeguards flag a message and claude silently
-          // retries the turn on a different model. A caller asking for model X
-          // then gets model Y with no trace anywhere in the bridge's logs —
-          // the only record is the on-disk session transcript. (Measured at
-          // 24% of turns in one incident.) Logged generically rather than by
-          // subtype whitelist so a subtype added later is never silent.
-          timingLogger.warn?.(
-            `[claude] system event taskId=${task.taskId} ` +
-              `subtype=${safeToken(String(evt.subtype ?? ''), 60)} ` +
-              `detail=${safeToken(String((evt as { content?: unknown }).content ?? ''), 300)}`,
-          );
+          const { level, line } = describeClaudeSystemEvent(task.taskId, evt);
+          if (level === 'warn') timingLogger.warn?.(line);
+          else timingLogger.debug?.(line);
           return;
         }
         if (evt.type === 'stream_event') {

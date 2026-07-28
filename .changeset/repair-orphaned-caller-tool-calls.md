@@ -2,14 +2,18 @@
 '@vicoop-bridge/client': patch
 ---
 
-claude: log every non-`init` SDK system event; openai-compat: harden tool-call pairing
+claude: surface silent model switches in the logs; openai-compat: harden tool-call pairing
 
 `model_refusal_fallback` — emitted when the requested model's safeguards flag a
 message and claude silently retries the turn on a different model — reached no
 log at all. A caller asking for model X would get model Y with the only record
 being the on-disk session transcript; one incident ran at 24% of turns before
-anyone noticed. All non-`init` system subtypes are now logged generically, so a
-subtype added later is never silent either.
+anyone noticed. Every non-`init` system event is now logged, with the model
+transition taken from the SDK's structured fields (`originalModel` /
+`fallbackModel` / `trigger` / `apiRefusalCategory`) rather than its prose blurb.
+Severity follows the SDK's own `level`, so anomalies warn while high-frequency
+bookkeeping subtypes such as `thinking_tokens` — measured at 10 events in one
+trivial turn — stay on the debug channel and leave warn usable for alerting.
 
 Alongside it, `chatHistoryFromMessages` now synthesizes an error result for any
 `tool_calls` id with no result anywhere in the replayed history, inserted
