@@ -357,7 +357,8 @@ export function normalizeClaudeModelId(raw: string): string {
 // different model, and the caller gets model Y after asking for model X. None
 // of it reached a log — the loop handled only `subtype === 'init'` and every
 // other subtype fell through — so the only record was the on-disk session
-// transcript. One measured window ran at 24% of turns before anyone noticed.
+// transcript. In one measured incident it hit 7 of the 8 turns in a
+// conversation — every turn after the first — before anyone noticed.
 //
 // Handled by SHAPE, not by a subtype whitelist, so a subtype added later is
 // never silent. Two shape facts drive it:
