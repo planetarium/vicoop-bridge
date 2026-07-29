@@ -16,6 +16,8 @@ import {
   describeClaudeSystemEvent,
   describeEmptyDispatchTurn,
   resolveTurnText,
+  NARRATED_TOOL_CALL_NUDGE,
+  shouldRetryNarratedToolCall,
   normalizeClaudeModelId,
   openaiToolsToCallerToolDefs,
   parseClaudeModelUsageForOpenAICompat,
@@ -5734,4 +5736,235 @@ test('resolveTurnText: a non-empty result wins over the streamed text', () => {
 test('resolveTurnText: both empty yields empty', () => {
   assert.equal(resolveTurnText(null, ''), '');
   assert.equal(resolveTurnText('', ''), '');
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// shouldRetryNarratedToolCall — narrows the tool-less-turn population to the
+// subset worth a corrective retry (#441). Tuned for precision: a false positive
+// asks a model that legitimately finished to invent a tool call it doesn't need.
+// ───────────────────────────────────────────────────────────────────────────
+
+const REGISTERED = ['read', 'write', 'edit', 'glob', 'grep', 'bash', 'todowrite', 'task'];
+const retry = (text: string) =>
+  shouldRetryNarratedToolCall({ text, registeredToolNames: REGISTERED });
+
+test('shouldRetryNarratedToolCall: catches the three observed stall renderings', () => {
+  // No shared surface form between them — this is why the check is on the tool
+  // name rather than on any markup shape.
+  assert.equal(retry('…리스트업하겠습니다.\n\n**todowrite**\n\nRequest\n\n```javascript\n{"todos":[]}\n```'), true);
+  assert.equal(retry("I'll create the game. Let me first check the template.\n\nRead\n\n{\n  \"path\": \"/home/project\"\n}"), true);
+  assert.equal(retry('**Tool Call: Glob**\n```json\n{ "pattern": "**/*", "path": "/home/project" }\n```'), true);
+});
+
+test('shouldRetryNarratedToolCall: leaves legitimate tool-less answers alone', () => {
+  // Complete inline deliverables and sub-agent completion reports, verbatim in
+  // shape from the observed runs. Retrying these is the expensive mistake.
+  assert.equal(
+    retry("Here's a complete match-3 puzzle game in a single HTML file. Save it as `match3.html` and open it in a browser."),
+    false,
+  );
+  assert.equal(
+    retry('**미해결 항목: 없음** — 14/14 저장 완료. 단, 마법사 coat 2종은 대체 선택입니다.'),
+    false,
+  );
+});
+
+test('shouldRetryNarratedToolCall: a tool name inside a longer word does not count', () => {
+  // `read` must not fire on "already" / "spreadsheet" / "thread".
+  assert.equal(retry('The spreadsheet is already threaded through the loader.'), false);
+  assert.equal(retry('I will read the file.'), true);
+});
+
+test('shouldRetryNarratedToolCall: matches case-insensitively and on the bare wire name', () => {
+  assert.equal(retry('**Tool Call: GLOB**'), true);
+  assert.equal(
+    shouldRetryNarratedToolCall({
+      text: 'Calling read now.',
+      // Live MCP ids carry the caller-tools prefix; the model narrates the short form.
+      registeredToolNames: ['mcp___vb-caller-tools__read'],
+    }),
+    true,
+  );
+});
+
+test('shouldRetryNarratedToolCall: empty text or no registered tools never retries', () => {
+  assert.equal(retry(''), false);
+  assert.equal(shouldRetryNarratedToolCall({ text: 'read the file', registeredToolNames: [] }), false);
+  // Very short names would match far too much; they are skipped.
+  assert.equal(shouldRetryNarratedToolCall({ text: 'go do it', registeredToolNames: ['go'] }), false);
+});
+
+test('NARRATED_TOOL_CALL_NUDGE: names the failure and forbids re-narrating', () => {
+  assert.match(NARRATED_TOOL_CALL_NUDGE, /described a tool call in prose/i);
+  assert.match(NARRATED_TOOL_CALL_NUDGE, /Do not restate, summarise, or re-render/i);
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Corrective retry for a narrated tool call (#441), end-to-end through
+// handle(). Opt-in via `claudeRetryNarratedToolCall`.
+// ───────────────────────────────────────────────────────────────────────────
+
+// A task carrying caller tools, which is what turns on native dispatch — the
+// only mode where a tool-less turn is a dead end rather than a plain answer.
+function narratedToolCallTask(): TaskAssignFrame {
+  return {
+    ...assign('build it'),
+    message: {
+      role: 'user',
+      messageId: 'm1',
+      parts: [{ kind: 'text', text: 'build it' }],
+      metadata: {
+        [OPENAI_COMPAT_EXTENSION_URI]: {
+          chat_completions_request: {
+            model: 'claude-fable-5',
+            messages: [{ role: 'user', content: 'build it' }],
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'glob',
+                  description: 'List files matching a pattern.',
+                  parameters: { type: 'object', properties: { pattern: { type: 'string' } } },
+                },
+              },
+            ],
+            tool_choice: 'auto',
+          },
+        },
+      },
+    },
+    requestedExtensions: [OPENAI_COMPAT_EXTENSION_URI],
+  };
+}
+
+// Scripts each spawn separately so attempt 1 can narrate and attempt 2 emit a
+// real tool call, and records the argv of every spawn.
+function twoAttemptSpawn(scripts: readonly (readonly string[])[]): FakeSpawn & {
+  argvs: string[][];
+  stdins: string[][];
+} {
+  const argvs: string[][] = [];
+  const stdins: string[][] = [];
+  let n = 0;
+  const base = makeFakeSpawn((child) => {
+    const lines = scripts[Math.min(n, scripts.length - 1)] ?? [];
+    n++;
+    setImmediate(() => {
+      for (const l of lines) child.emitStdout(l.endsWith('\n') ? l : `${l}\n`);
+      setImmediate(() => child.finish(0, null));
+    });
+  });
+  const wrapped = {
+    ...base,
+    spawn(cmd: string, args: readonly string[], options: ClaudeSpawnOptions) {
+      argvs.push([...args]);
+      const handle = base.spawn(cmd, args, options);
+      stdins.push((base.lastChild() as unknown as { stdinChunks?: string[] })?.stdinChunks ?? []);
+      return handle;
+    },
+    argvs,
+    stdins,
+  };
+  return wrapped as FakeSpawn & { argvs: string[][]; stdins: string[][] };
+}
+
+const NARRATED = JSON.stringify({
+  type: 'assistant',
+  message: {
+    role: 'assistant',
+    model: 'claude-fable-5',
+    content: [{ type: 'text', text: '**Tool Call: Glob**\n```json\n{ "pattern": "**/*" }\n```' }],
+  },
+});
+const REAL_CALL = JSON.stringify({
+  type: 'assistant',
+  message: {
+    role: 'assistant',
+    model: 'claude-fable-5',
+    content: [
+      {
+        type: 'tool_use',
+        id: 'toolu_1',
+        name: 'mcp___vb-caller-tools__glob',
+        input: { pattern: '**/*' },
+      },
+    ],
+  },
+});
+const OK_RESULT = JSON.stringify({ type: 'result', subtype: 'success', terminal_reason: 'completed', result: '' });
+
+test('narrated tool call: opt-in resumes the session once and the retry lands a real call', async () => {
+  const fake = twoAttemptSpawn([
+    [NARRATED, OK_RESULT],
+    [REAL_CALL, OK_RESULT],
+  ]);
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeRetryNarratedToolCall: true });
+  const { emit, frames } = collect();
+  await backend.handle(narratedToolCallTask(), emit, NEVER);
+
+  assert.equal(fake.argvs.length, 2, 'expected exactly one corrective retry');
+  // Attempt 1 mints the session, attempt 2 continues it — same id either way.
+  assert.ok(fake.argvs[0].includes('--session-id'));
+  assert.ok(fake.argvs[1].includes('--resume'));
+  assert.equal(fake.argvs[1].includes('--session-id'), false);
+  const id1 = fake.argvs[0][fake.argvs[0].indexOf('--session-id') + 1];
+  const id2 = fake.argvs[1][fake.argvs[1].indexOf('--resume') + 1];
+  assert.equal(id1, id2, 'the corrective turn must land in the session it is correcting');
+  // Everything except the session flag stays byte-identical.
+  assert.deepEqual(
+    fake.argvs[0].map((a) => (a === '--session-id' ? '--resume' : a)),
+    fake.argvs[1],
+  );
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+});
+
+test('narrated tool call: off by default — no retry, no extra spawn', async () => {
+  const fake = twoAttemptSpawn([[NARRATED, OK_RESULT]]);
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  await backend.handle(narratedToolCallTask(), emit, NEVER);
+
+  assert.equal(fake.argvs.length, 1);
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+});
+
+test('narrated tool call: a turn that did emit a tool call is never retried', async () => {
+  const fake = twoAttemptSpawn([[REAL_CALL, OK_RESULT]]);
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeRetryNarratedToolCall: true });
+  const { emit } = collect();
+  await backend.handle(narratedToolCallTask(), emit, NEVER);
+
+  assert.equal(fake.argvs.length, 1);
+});
+
+test('narrated tool call: retries at most once even if the model narrates again', async () => {
+  // A model that narrates twice will not be argued out of it; an unbounded loop
+  // would burn the caller's turn budget invisibly.
+  const fake = twoAttemptSpawn([
+    [NARRATED, OK_RESULT],
+    [NARRATED, OK_RESULT],
+    [NARRATED, OK_RESULT],
+  ]);
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeRetryNarratedToolCall: true });
+  const { emit } = collect();
+  await backend.handle(narratedToolCallTask(), emit, NEVER);
+
+  assert.equal(fake.argvs.length, 2);
+});
+
+test('narrated tool call: a tool-less turn that names no tool is left alone', async () => {
+  const answer = JSON.stringify({
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      model: 'claude-fable-5',
+      content: [{ type: 'text', text: "Here's a complete match-3 game in a single HTML file." }],
+    },
+  });
+  const fake = twoAttemptSpawn([[answer, OK_RESULT]]);
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeRetryNarratedToolCall: true });
+  const { emit } = collect();
+  await backend.handle(narratedToolCallTask(), emit, NEVER);
+
+  assert.equal(fake.argvs.length, 1, 'a legitimate final answer must not be retried');
 });
