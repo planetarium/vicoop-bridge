@@ -1,6 +1,6 @@
 {
   "name": "@vicoop-bridge/client",
-  "version": "0.36.8",
+  "version": "0.36.9",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
