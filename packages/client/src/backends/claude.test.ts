@@ -14,6 +14,8 @@ import {
   createClaudeBackend,
   enrichEntriesWithModelLimits,
   describeClaudeSystemEvent,
+  describeEmptyDispatchTurn,
+  resolveTurnText,
   normalizeClaudeModelId,
   openaiToolsToCallerToolDefs,
   parseClaudeModelUsageForOpenAICompat,
@@ -5637,4 +5639,99 @@ test('describeClaudeSystemEvent: tolerates a malformed event', () => {
     assert.equal(level, 'debug');
     assert.match(line, /\[claude\] system event taskId=t subtype=/);
   }
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// describeEmptyDispatchTurn — rate instrumentation for #441. Under caller-tool
+// dispatch (`--max-turns 1`) a turn that emits no tool calls hands the caller
+// nothing to run. Legitimate for a final answer, a silent dead end when the
+// text was an announcement. Deliberately unclassified: measure first.
+// ───────────────────────────────────────────────────────────────────────────
+
+const EMPTY_DISPATCH_BASE = {
+  taskId: 'task-1',
+  dispatchActive: true,
+  toolUseCount: 0,
+  completed: true,
+  isError: false,
+  textLength: 3840,
+  model: 'claude-fable-5',
+};
+
+test('describeEmptyDispatchTurn: reports a completed caller-tool turn with no tool calls', () => {
+  const line = describeEmptyDispatchTurn(EMPTY_DISPATCH_BASE);
+  assert.ok(line);
+  assert.match(line, /taskId=task-1/);
+  assert.match(line, /model=claude-fable-5/);
+  // textLen is the one cheap signal separating a short "I'll start now" from a
+  // long final report, without copying model output into the logs.
+  assert.match(line, /textLen=3840/);
+  assert.doesNotMatch(line, /I'll|Let me/);
+});
+
+test('describeEmptyDispatchTurn: silent once any tool call was emitted', () => {
+  assert.equal(
+    describeEmptyDispatchTurn({ ...EMPTY_DISPATCH_BASE, toolUseCount: 1 }),
+    null,
+  );
+});
+
+test('describeEmptyDispatchTurn: silent when caller-tool dispatch is not active', () => {
+  // The default agentic path keeps claude's built-ins and is not turn-capped,
+  // so a tool-less turn there carries no signal.
+  assert.equal(
+    describeEmptyDispatchTurn({ ...EMPTY_DISPATCH_BASE, dispatchActive: false }),
+    null,
+  );
+});
+
+test('describeEmptyDispatchTurn: silent on a failed or non-terminal run', () => {
+  // Those already surface through the failure path; the interesting case is a
+  // run that reported success while producing nothing executable.
+  assert.equal(describeEmptyDispatchTurn({ ...EMPTY_DISPATCH_BASE, isError: true }), null);
+  assert.equal(describeEmptyDispatchTurn({ ...EMPTY_DISPATCH_BASE, completed: false }), null);
+});
+
+test('describeEmptyDispatchTurn: does not classify — a long final report reports too', () => {
+  // A 4957-char completion report and a 72-char announcement both produce a
+  // line. Classifying on two observed sessions would be overfit; the rate is
+  // what this exists to measure.
+  const report = describeEmptyDispatchTurn({ ...EMPTY_DISPATCH_BASE, textLength: 4957 });
+  const stall = describeEmptyDispatchTurn({ ...EMPTY_DISPATCH_BASE, textLength: 72 });
+  assert.ok(report);
+  assert.ok(stall);
+  assert.match(report, /textLen=4957/);
+  assert.match(stall, /textLen=72/);
+});
+
+test('describeEmptyDispatchTurn: an unknown model cannot forge a log line', () => {
+  const line = describeEmptyDispatchTurn({
+    ...EMPTY_DISPATCH_BASE,
+    model: 'evil\n[client] FAKE',
+  });
+  assert.ok(line);
+  assert.equal(line.includes('\n'), false);
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// resolveTurnText — which text a finished turn actually produced. Split out
+// because the `??`-vs-`||` distinction is easy to re-break at a call site and
+// fails silently (a length of 0, never an error).
+// ───────────────────────────────────────────────────────────────────────────
+
+test('resolveTurnText: an empty result falls back to the streamed text', () => {
+  // This is the real shape: a `result` event carrying `result: ""` alongside
+  // text the model streamed earlier in the turn. `??` would keep the empty
+  // string and report an empty turn.
+  assert.equal(resolveTurnText('', '**Tool Call: Glob**'), '**Tool Call: Glob**');
+  assert.equal(resolveTurnText(null, 'streamed'), 'streamed');
+});
+
+test('resolveTurnText: a non-empty result wins over the streamed text', () => {
+  assert.equal(resolveTurnText('final answer', 'partial'), 'final answer');
+});
+
+test('resolveTurnText: both empty yields empty', () => {
+  assert.equal(resolveTurnText(null, ''), '');
+  assert.equal(resolveTurnText('', ''), '');
 });

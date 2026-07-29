@@ -404,6 +404,68 @@ export function describeClaudeSystemEvent(
   return { level, line };
 }
 
+// The text a finished turn actually produced.
+//
+// `||`, deliberately not `??`. A `result` event routinely carries `result: ""`
+// on a turn that spent itself on tool calls, and `??` treats that empty string
+// as a real value — so the streamed text is discarded and every consumer sees
+// an empty turn. `finalText` is authoritative when it has content; otherwise
+// fall back to what was streamed.
+//
+// Exported for unit tests: this rule is easy to re-break at a call site, and
+// the failure is silent (a length of 0, not an error).
+export function resolveTurnText(
+  finalText: string | null,
+  streamedText: string,
+): string {
+  return finalText || streamedText;
+}
+
+// Under caller-tool dispatch the bridge runs `--max-turns 1`: the model gets
+// one turn, its tool calls are captured, and the caller executes them and
+// returns results next turn. A turn that ends having emitted NO tool calls
+// therefore hands the caller nothing to run — the run is simply over.
+//
+// That is correct when the text was a final answer or a completion report, and
+// a silent dead end when it was an announcement of work about to be done. fable
+// produces the second kind: it writes the call out as prose and stops (#441).
+// Two renderings seen so far — `**todowrite**` + `Request` + a fenced block, and
+// a bare `Read` followed by a JSON object — which is why nothing here tries to
+// pattern-match the text.
+//
+// So this deliberately does NOT classify. It logs every caller-tool turn that
+// ended with nothing executable and lets the rate be measured first; a
+// classifier built on the two sessions observed so far would be overfit. The
+// line carries `taskId` so an analyst can join it to the session transcript,
+// and `textLen` as the one cheap signal that separates a 72-char "I'll start
+// now" from a 4957-char final report, without copying model output into logs.
+//
+// `info`, not `warn`: this fires on legitimate final answers too (~15% of turns
+// in the observed window), so it is instrumentation, not an anomaly — warn has
+// to stay alertable.
+//
+// Exported for unit tests.
+export function describeEmptyDispatchTurn(opts: {
+  taskId: string;
+  dispatchActive: boolean;
+  toolUseCount: number;
+  completed: boolean;
+  isError: boolean;
+  textLength: number;
+  model: string | null;
+}): string | null {
+  if (!opts.dispatchActive) return null;
+  if (opts.toolUseCount > 0) return null;
+  // An errored or aborted run already surfaces through the failure path; the
+  // interesting case is a run that reported success while producing nothing to
+  // execute.
+  if (!opts.completed || opts.isError) return null;
+  return (
+    `[claude] caller-tool turn produced no tool calls taskId=${opts.taskId} ` +
+    `model=${safeToken(opts.model ?? 'unknown', 60)} textLen=${opts.textLength}`
+  );
+}
+
 // The 1M-context tier marker Claude Code appends to a model id (`[1m]`). Its
 // presence on an advertised id is the signal that the effective context window
 // is the model's full ceiling rather than the 200k base (see
@@ -2534,6 +2596,11 @@ export function createClaudeBackend(
       let streamedResponseText = '';
       let sawCompletedResult = false;
       let sawErrorResult = false;
+      // Tool calls the model actually emitted this run. Counted separately from
+      // `seenAssistantToolUseIds` so it stays independent of that set's dedup
+      // semantics and still counts a block that arrives without an id.
+      // Feeds the empty-dispatch diagnostic at the terminal `result` (#441).
+      let emittedToolUseCount = 0;
       // Set when a tool_result comes back as claude's "No such tool available:
       // <name>" error. Under native dispatch this is the signature of a
       // tool-name mismatch — the model called a tool by a name claude doesn't
@@ -2813,6 +2880,7 @@ export function createClaudeBackend(
               if (seenAssistantToolUseIds.has(tu.toolUseId)) continue;
               seenAssistantToolUseIds.add(tu.toolUseId);
             }
+            emittedToolUseCount++;
             if (tu.toolName === 'AskUserQuestion' && tu.toolUseId && child.stdin) {
               // Stash for input-required terminal frame (A2A spec §9.4).
               // Placeholder tool_result + stdin.end() flushes CC's session state
@@ -2963,6 +3031,19 @@ export function createClaudeBackend(
           // the gateway falls back to its own estimate.
           const parsed = parseClaudeModelUsageForOpenAICompat(evt.modelUsage);
           if (parsed) finalUsage = parsed;
+          // Rate instrumentation for #441: a caller-tool turn that completed
+          // having emitted nothing for the caller to execute. Unclassified on
+          // purpose — see `describeEmptyDispatchTurn`.
+          const emptyDispatch = describeEmptyDispatchTurn({
+            taskId: task.taskId,
+            dispatchActive: nativeDispatchActive,
+            toolUseCount: emittedToolUseCount,
+            completed: evt.terminal_reason === 'completed',
+            isError: evt.is_error === true,
+            textLength: resolveTurnText(finalText, streamedResponseText).length,
+            model: assistantModel ?? initModel ?? null,
+          });
+          if (emptyDispatch) timingLogger.info?.(emptyDispatch);
           // CC finished — close stdin now that no more tool_results need writing.
           try { child.stdin?.end(); } catch { /* best effort */ }
         }
