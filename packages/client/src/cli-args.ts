@@ -103,6 +103,11 @@ export const daemonFlagsFields = {
       description: message`Thinking budget in tokens, injected as \`MAX_THINKING_TOKENS\` on openai-compat spawns so Claude emits thinking on the wire (default 8000). Takes precedence over an operator's own \`MAX_THINKING_TOKENS\` export. Only valid with \`--backend claude\`. Mirrors config \`backends.claude.thinking_budget\`.`,
     }),
   ),
+  claudeRetryNarratedToolCall: optional(
+    flag('--claude-retry-narrated-tool-call', {
+      description: message`On a caller-tool turn that ends having described a tool call in prose instead of invoking it, resume the session once with a corrective instruction (planetarium/vicoop-bridge#441). Off by default: it costs an extra turn when it fires and the detection is a heuristic. Only valid with \`--backend claude\`.`,
+    }),
+  ),
 
   // Backend-specific (Codex)
   codexSandbox: optional(option('--codex-sandbox', choice([...SANDBOX_MODES]), {
@@ -174,6 +179,7 @@ export interface DaemonArgs {
   // / `backends.claude.thinking_budget`). Undefined keeps the backend's
   // env-or-default behaviour.
   claudeThinkingBudget?: number;
+  claudeRetryNarratedToolCall?: boolean;
   codexSandbox?: CodexSandboxMode;
   // Resolved openai-compat/v1 reasoning channel toggle for the vicoop-codex
   // backend. Defaults ON; the `--no-vicoop-codex-reasoning` flag or
@@ -308,6 +314,8 @@ export function mergeClientArgs(
     // it off; the flag wins over config, matching the other flag>config knobs.
     claudeReasoning: backends.claude?.reasoning !== false && !flags.noClaudeReasoning,
     claudeThinkingBudget: flags.claudeThinkingBudget ?? backends.claude?.thinking_budget,
+    claudeRetryNarratedToolCall:
+      flags.claudeRetryNarratedToolCall ?? backends.claude?.retry_narrated_tool_call,
     codexSandbox:
       flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),
     // ON unless the config opts out (`reasoning: false`) or the CLI flag forces
@@ -387,6 +395,11 @@ export function mergeClientArgs(
   if (flags.claudeThinkingBudget !== undefined && backend !== 'claude') {
     errors.push(
       `--claude-thinking-budget is not supported by --backend ${backend}; only the claude backend takes a thinking budget`,
+    );
+  }
+  if (flags.claudeRetryNarratedToolCall && backend !== 'claude') {
+    errors.push(
+      `--claude-retry-narrated-tool-call is not supported by --backend ${backend}; only the claude backend runs caller-tool turns`,
     );
   }
   if (flags.noVicoopCodexReasoning && backend !== 'vicoop-codex') {

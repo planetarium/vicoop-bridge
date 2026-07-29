@@ -234,6 +234,11 @@ export interface ClaudeBackendOptions {
   // own `MAX_THINKING_TOKENS` env export > `DEFAULT_MAX_THINKING_TOKENS`. Unset
   // (the default) keeps the env-or-default behaviour.
   claudeThinkingBudget?: number;
+  // Opt into the corrective retry for a caller-tool turn that narrated its tool
+  // call instead of making one (#441). Off by default — it spends an extra turn
+  // when it fires and the detection is a heuristic. See
+  // `shouldRetryNarratedToolCall`.
+  claudeRetryNarratedToolCall?: boolean;
   // Remaining-usage (`usage()`) injection seams. The provider reads the
   // Claude subscription OAuth token from the host and calls
   // api.anthropic.com/api/oauth/usage; these let tests stub the network, the
@@ -464,6 +469,58 @@ export function describeEmptyDispatchTurn(opts: {
     `[claude] caller-tool turn produced no tool calls taskId=${opts.taskId} ` +
     `model=${safeToken(opts.model ?? 'unknown', 60)} textLen=${opts.textLength}`
   );
+}
+
+// The corrective turn fed back to claude when it described a tool call instead
+// of making one. Deliberately narrow: it names the failure, forbids re-writing
+// the call as prose, and does not otherwise re-state the task — the model still
+// has the whole conversation via `--resume`, and a longer instruction risks
+// steering the work itself rather than just the call mechanics.
+export const NARRATED_TOOL_CALL_NUDGE =
+  'Your previous message described a tool call in prose instead of invoking it, ' +
+  'so nothing ran. Invoke the tool now through the real tool-call mechanism. ' +
+  'Do not restate, summarise, or re-render the call as text.';
+
+// Decide whether a turn that emitted no tool call was a model that *meant* to
+// call one (#441). Only ever consulted for a completed caller-tool turn that
+// produced zero tool calls — `describeEmptyDispatchTurn` covers that whole
+// population; this narrows it to the retry-worthy subset.
+//
+// Tuned for PRECISION, not recall. A false positive costs a wasted turn AND
+// asks a model that legitimately finished to invent a tool call it does not
+// need, which is worse than missing a stall. The signal: the text names one of
+// the tools actually registered for this task. Measured against the observed
+// population — 3 of 4 known stalls named a registered tool (`todowrite`/`task`,
+// `Read`, `Glob`), while all 7 legitimate tool-less turns (complete inline
+// deliverables of 9.7k–12.5k chars, and sub-agent completion reports) named
+// none.
+//
+// Known miss: one stall ended "…저장을 시작하겠습니다" ("I will start saving")
+// without naming a tool. Recall is deliberately traded away here; the
+// unclassified `describeEmptyDispatchTurn` line still records it, so the gap
+// stays measurable rather than invisible.
+//
+// Exported for unit tests.
+export function shouldRetryNarratedToolCall(opts: {
+  text: string;
+  registeredToolNames: readonly string[];
+}): boolean {
+  const text = opts.text;
+  if (!text) return false;
+  for (const raw of opts.registeredToolNames) {
+    // Compare on the bare wire name; the live id is
+    // `mcp___vb-caller-tools__<name>` and the model narrates the short form.
+    const name = raw.replace(/^mcp___vb-caller-tools__/, '');
+    if (name.length < 3) continue;
+    // Word-ish boundary so `read` does not match "already" / "spreadsheet".
+    const re = new RegExp(`(^|[^A-Za-z0-9_])${escapeRegExp(name)}([^A-Za-z0-9_]|$)`, 'i');
+    if (re.test(text)) return true;
+  }
+  return false;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 // The 1M-context tier marker Claude Code appends to a model id (`[1m]`). Its
@@ -1495,6 +1552,8 @@ export function createClaudeBackend(
   // Operator-facing override for the injected `MAX_THINKING_TOKENS` budget; a
   // positive integer or undefined (use env-or-default). Non-positive values are
   // ignored so a stray `0` / negative can't silently disable thinking.
+  // #441 opt-in: corrective retry for a turn that narrated its tool call.
+  const retryNarratedToolCall = opts.claudeRetryNarratedToolCall === true;
   const thinkingBudgetOverride =
     typeof opts.claudeThinkingBudget === 'number' &&
     Number.isFinite(opts.claudeThinkingBudget) &&
@@ -3062,31 +3121,37 @@ export function createClaudeBackend(
       signal.addEventListener('abort', onAbort);
 
       let stdoutBuf = '';
-      child.stdout?.on('data', (chunk: Buffer | string) => {
-        recorder.mark('firstOut');
-        const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-        stdoutTail += text;
-        if (stdoutTail.length > stderrCap) stdoutTail = stdoutTail.slice(-stderrCap);
-        stdoutBuf += text;
-        let nl: number;
-        while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
-          const line = stdoutBuf.slice(0, nl).trim();
-          stdoutBuf = stdoutBuf.slice(nl + 1);
-          if (!line) continue;
-          let evt: StreamEvent;
-          try {
-            evt = JSON.parse(line) as StreamEvent;
-          } catch {
-            continue;
+      // Extracted so the corrective-retry child (#441) reuses the identical
+      // parsing and the same `handleEvent` closure — its tool calls must land
+      // in the same artifact/counter state as the first attempt's.
+      const attachStreams = (c: ClaudeChildHandle): void => {
+        c.stdout?.on('data', (chunk: Buffer | string) => {
+          recorder.mark('firstOut');
+          const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+          stdoutTail += text;
+          if (stdoutTail.length > stderrCap) stdoutTail = stdoutTail.slice(-stderrCap);
+          stdoutBuf += text;
+          let nl: number;
+          while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
+            const line = stdoutBuf.slice(0, nl).trim();
+            stdoutBuf = stdoutBuf.slice(nl + 1);
+            if (!line) continue;
+            let evt: StreamEvent;
+            try {
+              evt = JSON.parse(line) as StreamEvent;
+            } catch {
+              continue;
+            }
+            handleEvent(evt);
           }
-          handleEvent(evt);
-        }
-      });
+        });
 
-      child.stderr?.on('data', (chunk: Buffer | string) => {
-        stderrTail += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-        if (stderrTail.length > stderrCap) stderrTail = stderrTail.slice(-stderrCap);
-      });
+        c.stderr?.on('data', (chunk: Buffer | string) => {
+          stderrTail += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+          if (stderrTail.length > stderrCap) stderrTail = stderrTail.slice(-stderrCap);
+        });
+      };
+      attachStreams(child);
 
       // Shared liveness heartbeat: while the child is alive, every
       // `heartbeatMs` of no outbound traffic produces a tagged
@@ -3106,36 +3171,107 @@ export function createClaudeBackend(
         intervalMs: heartbeatMs,
       });
 
-      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: unknown }>((resolve) => {
-        // The `error` event is *typed* with `Error`, but EventEmitter at
-        // runtime can emit any value. Carry it as unknown so the frame
-        // builder routes through `errorMessage` safely.
-        child.on('error', (err) => resolve({ code: null, signal: null, error: err }));
-        child.on('close', (code, sig) => resolve({ code, signal: sig }));
-      });
+      type ChildExit = { code: number | null; signal: NodeJS.Signals | null; error?: unknown };
+      // Await the *current* `child` and drain whatever it left unterminated.
+      // Factored out so the corrective retry (#441) can run a second child
+      // through the identical settle path. The trailing flush MUST stay paired
+      // with the await: `handleEvent` returns early once `settled` is set, and a
+      // swallowed trailing `result` event leaves `sawCompletedResult` false,
+      // which collapses the otherwise-legitimate "exit 1 after completed
+      // result" case into a `claude_exit_nonzero` failure.
+      const awaitChild = async (): Promise<ChildExit> => {
+        const current = child;
+        const e = await new Promise<ChildExit>((resolve) => {
+          // The `error` event is *typed* with `Error`, but EventEmitter at
+          // runtime can emit any value. Carry it as unknown so the frame
+          // builder routes through `errorMessage` safely.
+          current.on('error', (err) => resolve({ code: null, signal: null, error: err }));
+          current.on('close', (code, sig) => resolve({ code, signal: sig }));
+        });
+        // claude normally terminates each event with \n but recent CC builds
+        // can flush the final `result` event without one and exit.
+        const trailing = stdoutBuf.trim();
+        stdoutBuf = '';
+        if (trailing) {
+          try {
+            handleEvent(JSON.parse(trailing) as StreamEvent);
+          } catch {
+            // ignore
+          }
+        }
+        return e;
+      };
+
+      let exit = await awaitChild();
       recorder.mark('closed');
       timingLogger.debug(
         `claude.spawn.close taskId=${safeToken(task.taskId)} command=${safeToken(command)} code=${exit.code === null ? 'null' : String(exit.code)} signal=${exit.signal ? safeToken(exit.signal) : 'null'} stdoutTailChars=${stdoutTail.length} stderrTailChars=${stderrTail.length}${exit.error ? ` error=${safeToken(errorMessage(exit.error), 1000)}` : ''}`,
       );
 
-      signal.removeEventListener('abort', onAbort);
-
-      // Flush any trailing line without a newline. claude normally terminates
-      // each event with \n but recent CC builds can flush the final `result`
-      // event without a trailing newline and exit. This MUST run before
-      // `settled = true` — `handleEvent` returns early when `settled` is
-      // set, and a swallowed trailing `result` event leaves
-      // `sawCompletedResult` false, which then collapses the otherwise-
-      // legitimate "exit 1 after completed result" case into a
-      // `claude_exit_nonzero` failure.
-      const trailing = stdoutBuf.trim();
-      if (trailing) {
+      // #441 — the turn ended having described a tool call instead of making
+      // one, so the caller has nothing to execute and the run is a dead end.
+      // Resume the session once with a corrective instruction. Opt-in
+      // (`--claude-retry-narrated-tool-call`): it spends an extra turn when it
+      // fires, and `shouldRetryNarratedToolCall` is a heuristic.
+      //
+      // Deliberately at most ONE extra attempt — a model that narrates twice is
+      // not going to be argued out of it, and an unbounded loop here would burn
+      // the caller's turn budget invisibly.
+      //
+      // Note the narrated text has already streamed to the caller as an
+      // assistant artifact and cannot be recalled; the caller sees prose
+      // followed by the real tool calls. Cosmetic, and the same trade-off #431
+      // already accepts for pre-tool-call preamble.
+      if (
+        retryNarratedToolCall &&
+        !aborted &&
+        nativeDispatchActive &&
+        emittedToolUseCount === 0 &&
+        sawCompletedResult &&
+        !sawErrorResult &&
+        child.stdin !== null &&
+        shouldRetryNarratedToolCall({
+          text: resolveTurnText(finalText, streamedResponseText),
+          registeredToolNames: [...callerToolNameSet],
+        })
+      ) {
+        // Only the session flag changes: `--session-id` mints, `--resume`
+        // continues. Everything else — mcp config, model, turn cap, system
+        // prompt — must stay byte-identical or the corrective turn lands in a
+        // different context than the one it is correcting.
+        const retryArgs = args.map((a) => (a === '--session-id' ? '--resume' : a));
+        timingLogger.info?.(
+          `[claude] retrying narrated tool call taskId=${task.taskId} ` +
+            `model=${safeToken(assistantModel ?? initModel ?? 'unknown', 60)}`,
+        );
         try {
-          handleEvent(JSON.parse(trailing) as StreamEvent);
-        } catch {
-          // ignore
+          child = spawnFn(command, retryArgs, { cwd: effectiveCwd, env: effectiveEnv });
+          recorder.mark('spawn');
+          attachStreams(child);
+          child.stdin?.on('error', (err: unknown) => {
+            if (!stdinError) stdinError = err;
+          });
+          child.stdin?.write(
+            JSON.stringify({
+              type: 'user',
+              message: {
+                role: 'user',
+                content: [{ type: 'text', text: NARRATED_TOOL_CALL_NUDGE }],
+              },
+            }) + '\n',
+          );
+          exit = await awaitChild();
+        } catch (err) {
+          // A failed retry must not fail the task: the first attempt already
+          // produced a legitimate (if useless) completed result, and surfacing
+          // a spawn error here would turn a degraded turn into a hard failure.
+          timingLogger.warn?.(
+            `[claude] narrated-tool-call retry failed taskId=${task.taskId} error=${safeToken(errorMessage(err), 300)}`,
+          );
         }
       }
+
+      signal.removeEventListener('abort', onAbort);
 
       settled = true;
       sendFileRelease?.();

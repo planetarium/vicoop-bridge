@@ -424,6 +424,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         openaiCompatTrace: args.openaiCompatTrace,
         claudeReasoning: args.claudeReasoning,
         claudeThinkingBudget: args.claudeThinkingBudget,
+        claudeRetryNarratedToolCall: args.claudeRetryNarratedToolCall,
         // Enrich the openai-compat/v1 advertise with contextWindow /
         // maxOutputTokens from the Models API (authenticated with the host's
         // subscription OAuth token — same cred the usage path reads).
