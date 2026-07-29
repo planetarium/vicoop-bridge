@@ -143,6 +143,15 @@ export interface ClaudeBackendConfig {
    * `--claude-thinking-budget` flag.
    */
   thinking_budget?: number;
+  /**
+   * When a caller-tool turn ends having described a tool call in prose instead
+   * of invoking it, resume the session once with a corrective instruction so
+   * the call actually runs (planetarium/vicoop-bridge#441). OFF by default: it
+   * costs an extra turn whenever it fires, and the detection is a heuristic
+   * (the text naming a registered tool), so it can both miss and — in
+   * principle — misfire. Mirrors the `--claude-retry-narrated-tool-call` flag.
+   */
+  retry_narrated_tool_call?: boolean;
   runtime?: BackendRuntime;
   runtime_name?: string;
 }
