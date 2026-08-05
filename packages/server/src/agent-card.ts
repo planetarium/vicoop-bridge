@@ -144,15 +144,31 @@ export function buildAgentA2XServer(
     a2xServer.addExtension({
       uri: X402_FOUNDATION_EXTENSION_URI,
       description:
-        'x402 payments. Calls are answered with an input-required task carrying x402.payment.required; sign the payload and resubmit against the same taskId.',
+        pricing.scheme === 'upto'
+          ? 'x402 metered payments. Calls are answered with an input-required task carrying x402.payment.required; sign the payload (upto requires opting in on the client) and resubmit against the same taskId. You are charged for the tokens actually consumed, up to the authorized maximum.'
+          : 'x402 payments. Calls are answered with an input-required task carrying x402.payment.required; sign the payload and resubmit against the same taskId.',
       required: false,
-      params: {
-        network: pricing.network,
-        amount: pricing.amount,
-        asset: pricing.asset,
-        payTo: pricing.payTo,
-        scheme: 'exact',
-      },
+      params:
+        pricing.scheme === 'upto'
+          ? {
+              scheme: 'upto',
+              network: pricing.network,
+              asset: pricing.asset,
+              payTo: pricing.payTo,
+              // The ceiling, not the charge — named to match, because a
+              // client that read it as the price would refuse offers it can
+              // comfortably afford.
+              maxAmount: pricing.maxAmount,
+              ratesPerMTok: pricing.rates,
+              ...(pricing.minAmount !== undefined ? { minAmount: pricing.minAmount } : {}),
+            }
+          : {
+              scheme: 'exact',
+              network: pricing.network,
+              amount: pricing.amount,
+              asset: pricing.asset,
+              payTo: pricing.payTo,
+            },
     });
   }
 

@@ -19,6 +19,7 @@ import { AsyncEventQueue } from './event-queue.js';
 import { logEvent } from './log.js';
 import { terminalErrorMessageFields } from './terminal-error.js';
 import { X402Gate, createPostgresX402Context } from './x402/gate.js';
+import { readTaskUsage } from './x402/usage.js';
 import type { Sql } from './db.js';
 
 /**
@@ -194,12 +195,17 @@ export class WSForwardingExecutor extends AgentExecutor {
    * Charge for a verified payment now that the agent has produced a terminal
    * event, and fold the outcome into that event.
    *
-   * Only a `completed` task is settled. An `exact` payment buys delivered
-   * work, so a task that failed or was cancelled leaves the payer's signed
+   * Only a `completed` task is settled. Payment buys delivered work, so a
+   * task that failed or was cancelled leaves the payer's signed
    * authorization unused — they are never charged for work they didn't get.
    * A settlement that itself fails replaces the terminal event with a
    * `failed` one: the merchant wasn't paid, so the call must not report
    * success.
+   *
+   * For a metered (`upto`) agent the charge comes from the token counts the
+   * backend already stamped onto this very event — the connected agent
+   * reports per-turn usage on its `task.complete` frame and `ws.ts` carries
+   * the metadata through, so nothing has to be plumbed for this.
    */
   private async settleTerminal(
     gate: X402Gate,
@@ -213,7 +219,12 @@ export class WSForwardingExecutor extends AgentExecutor {
       return event;
     }
 
-    const result = await gate.settle({ taskId, contextId, classified });
+    const result = await gate.settle({
+      taskId,
+      contextId,
+      classified,
+      ...(gate.metered ? { usage: readTaskUsage(event.status.message?.metadata) } : {}),
+    });
     if (result.kind === 'failed') return result.event;
 
     // Attach the settlement receipt to the final status message, which is

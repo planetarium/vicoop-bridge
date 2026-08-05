@@ -5,9 +5,16 @@ The bridge can charge callers per invocation using
 facilitator. Pricing is configured per agent; an agent with no pricing row is
 free and takes no payment code path at all.
 
-Only the **`exact`** scheme is implemented today — a fixed price per call,
-agreed before the work happens. See [Roadmap](#roadmap) for usage-based
-billing.
+Two pricing schemes are supported:
+
+| scheme | what the caller pays | when to use it |
+| --- | --- | --- |
+| `exact` | a flat fee per call, agreed before the work happens | predictable pricing; the only option for backends that can't report token usage |
+| `upto` | the tokens actually consumed, up to a ceiling they authorize | metered LLM access, where a one-line question and a long research task shouldn't cost the same |
+
+`exact` is the default and works on every backend. `upto` needs two things
+the caller and the backend must both supply — see
+[Metered pricing](#metered-pricing-upto) before choosing it.
 
 ## How a paid call runs
 
@@ -47,7 +54,8 @@ reporting success would hide that.
 
 ## Configuring an agent's price
 
-Pricing lives in `agents.x402_pricing` (JSONB, NULL by default):
+Pricing lives in `agents.x402_pricing` (JSONB, NULL by default). A row with no
+`scheme` is `exact`:
 
 ```json
 {
@@ -68,11 +76,11 @@ Pricing lives in `agents.x402_pricing` (JSONB, NULL by default):
 | `description` | Shown in the payer's wallet consent prompt. Optional. |
 | `extra` | EIP-712 domain override (`{ name, version }`). Only needed for tokens outside the well-known USDC deployments the SDK special-cases — a wrong domain produces signatures the facilitator can never verify. Optional. |
 
-`amount` is a string on purpose. It is atomic units, not dollars: writing
-`0.01` when you meant one cent of USDC is the classic mistake, and 18-decimal
-assets exceed the exact integer range of a JavaScript number. The server
-rejects anything that is not a positive decimal integer string at startup of
-the connection rather than at payment time.
+Every amount is a string on purpose. They are atomic units, not dollars:
+writing `0.01` when you meant one cent of USDC is the classic mistake, and
+18-decimal assets exceed the exact integer range of a JavaScript number. The
+server rejects anything that is not a decimal integer string when the agent
+connects, rather than at payment time.
 
 **Pricing is read from the database, never from the client's `hello` frame.**
 `payTo` decides who gets paid, and the hello frame is authored by the
@@ -83,6 +91,78 @@ against a configuration the server could not read.
 
 Repricing takes effect on the next call — the executor reads the live
 connection each turn rather than caching pricing at connect time.
+
+## Metered pricing (`upto`)
+
+Under `upto` the payer signs a Permit2 authorization for a **ceiling**, the
+agent does the work, and the bridge settles only what the call actually
+consumed.
+
+```json
+{
+  "scheme": "upto",
+  "network": "eip155:84532",
+  "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+  "payTo": "0x1111111111111111111111111111111111111111",
+  "facilitatorAddress": "0x3333333333333333333333333333333333333333",
+  "maxAmount": "1000000",
+  "rates": { "input": "3000000", "output": "15000000", "cachedInput": "300000" },
+  "minAmount": "1000"
+}
+```
+
+| field | meaning |
+| --- | --- |
+| `maxAmount` | The ceiling the payer authorizes. Also the blast radius of a pricing mistake — the charge is clamped to it. |
+| `rates` | Price per **million tokens**, in atomic units — the unit model vendors quote in, so a price list transcribes directly. `"3000000"` at 6 decimals is $3.00/MTok. |
+| `rates.cachedInput` | Rate for cache-read prompt tokens. **Absent means "same as `input`", not "free"** — treating an unstated discount as 100% would give away most of a cache-heavy call. |
+| `minAmount` | Floor for a completed call, and what is charged when usage is unavailable (below). Absent means zero. |
+| `facilitatorAddress` | The payer's Permit2 witness binds to this, so it must match the facilitator that settles. Read it from the facilitator's `GET /supported` (`extra.facilitatorAddress`). The SDK substitutes no default here. |
+
+The charge is `ceil((fresh_input×input + cached×cachedInput + output×output) / 1e6)`,
+computed in BigInt. `cached_tokens` is a *breakdown* of `prompt_tokens` and
+`reasoning_tokens` a breakdown of `completion_tokens` — neither is additive,
+so neither is double-counted. Rounding is up, which keeps a very small call
+from pricing to zero.
+
+The SDK clamps the settled amount to the minimum of what we metered, the
+ceiling we offered, and the payer's signed cap. **A metering bug can therefore
+only ever undercharge** — the clamp is defence in depth on top of the
+facilitator enforcing the same bound on-chain.
+
+### Two prerequisites
+
+**x402 V2.** `upto` does not exist in V1. This deployment defaults to V2, but
+if `BRIDGE_X402_VERSION=1` an `upto` agent refuses every call with
+`invalid_x402_version` and logs `x402_config_invalid` — a permanent
+misconfiguration, reported as one rather than as a transient outage.
+
+**The caller has to opt in.** Signing `upto` authorizes spending up to the
+maximum at the merchant's discretion, which is broader consent than `exact`.
+The SDK's default requirement selector therefore *never* auto-picks an `upto`
+offer: clients must pass `allowUpto` (on `A2XClient`'s `x402` config or
+`signX402Payment`) or select the requirement explicitly. An `upto`-only agent
+is unusable by a default-configured client, so check your callers before
+switching an existing agent over.
+
+### When the backend reports no usage
+
+Not every completed call can be priced:
+
+- **openclaw reports no token usage at any layer.** Metered pricing is not
+  possible for that backend — leave it on `exact`.
+- **codex and vicoop-codex can emit `{0,0,0}`** when their runtime dropped its
+  accounting for a turn. Both log a warning when they do.
+
+`total_tokens: 0` therefore means "the runtime did not report", not "the call
+was free". The bridge treats both cases identically: it charges `minAmount`
+(zero if unset) and logs `x402_usage_unavailable` with what it charged.
+
+The default direction is deliberately payer-favourable. Billing the authorized
+ceiling because *our* instrumentation lost the token count would be a
+user-visible wrong; undercharging is our own loss to fix. **If you run a
+metered agent, set `minAmount`** — otherwise those calls are free, and the log
+event is the only thing telling you so.
 
 ## Deployment settings
 
@@ -129,10 +209,17 @@ All events are structured JSON on stdout (see
 | `x402_payment_verified` | turn 2 — the facilitator accepted the payload |
 | `x402_payment_refused` | the submission was invalid (no offering, wrong network, bad shape) |
 | `x402_verify_failed` | the facilitator rejected the payload |
-| `x402_settled` | settled on-chain; carries the transaction hash |
+| `x402_metered` | `upto` only — what the call priced to, with the token counts and the `basis` (`metered` / `floor` / `no-usage`) |
+| `x402_usage_unavailable` | `upto` only — work was delivered that could not be priced; carries what was charged instead |
+| `x402_settled` | settled on-chain; carries the transaction hash and the facilitator-confirmed amount |
 | `x402_settle_failed` / `x402_settle_error` | settlement was refused or unreachable |
 | `x402_gate_error` | the payment rail was unavailable; the call was refused rather than served free |
 | `x402_pricing_invalid` | a malformed pricing row; the agent connected as free |
+| `x402_config_invalid` | `upto` pricing on a V1 deployment; every call is refused until fixed |
+
+Two worth alerting on: `x402_usage_unavailable` means revenue is being left on
+the table, and a sustained `x402_settle_failed` means work is being delivered
+without payment landing.
 
 ## Testing locally
 
@@ -144,15 +231,25 @@ The gate's own tests (`packages/server/src/x402/gate.test.ts`) run against a
 stub facilitator, so the full round-trip — including the refusal paths — is
 verifiable without a chain or a database.
 
-## Roadmap
+## Where the token counts come from
 
-**Usage-based billing (the `upto` scheme).** Conceptually the better fit for
-an LLM bridge: the payer signs a Permit2 authorization up to a ceiling, and
-the merchant settles only the metered consumption. The SDK supports it (x402
-V2 only), and the settlement clamp means a metering bug can only ever
-undercharge.
+Metering needs no protocol extension. The claude, codex, and vicoop-codex
+backends already stamp per-turn token counts onto the `task.complete` frame,
+under the openai-compat extension URI in `status.message.metadata` — and they
+do it even when the caller did not activate that extension, precisely so
+"billing telemetry" can read them. `wireMessageToA2X` carries the metadata
+through untouched, so the counts are already on the terminal event the
+settlement path receives.
 
-It is blocked on one thing: the bridge has no per-task usage signal. The
-`usage.request` RPC returns a per-agent snapshot, and `TaskCompleteFrame`
-carries only `status`. Adding an optional `usage` field to that frame, filled
-in by the backends, is the prerequisite.
+Two wire shapes appear there depending on whether the caller activated the
+openai-compat extension, and `readTaskUsage` handles both:
+
+```
+{ usage: {...} }                        plain A2A callers
+{ chat_completion: { usage: {...} } }   openai-compat envelope
+```
+
+Note this is **not** the `usage.request` / `usage.response` RPC. That returns
+a cumulative account-level quota snapshot (rolling subscription windows,
+overage budget) and is rate-limited and cached — useful for capacity
+dashboards, useless for metering a single call.

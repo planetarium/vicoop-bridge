@@ -264,10 +264,21 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS allowed_callers TEXT[] NOT NULL DEFA
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 -- x402 pricing for this agent, or NULL for a free agent (the default).
 -- Shape is validated in the server by `X402PricingSchema`
--- (src/x402/pricing.ts): { network, amount, asset, payTo, description?, extra? }.
--- Kept JSONB rather than columns because the offering shape follows the x402
--- spec, which adds scheme-specific fields (`extra`, and the `upto` scheme's
--- facilitatorAddress) that would otherwise be a column migration each time.
+-- (src/x402/pricing.ts), a union discriminated on `scheme`:
+--
+--   exact (default when `scheme` is absent) — a flat fee per call:
+--     { network, amount, asset, payTo, description?, extra? }
+--
+--   upto — metered, billed on the tokens the call actually consumed:
+--     { scheme: 'upto', network, asset, payTo, maxAmount, facilitatorAddress,
+--       rates: { input, output, cachedInput? },   -- atomic units per MTok
+--       minAmount?, description?, extra? }
+--
+-- Every amount is a decimal string in the asset's smallest unit, never a
+-- number: 18-decimal assets exceed a double's exact integer range.
+--
+-- JSONB rather than columns because the offering follows the x402 spec, whose
+-- scheme-specific fields would otherwise be a column migration each time.
 --
 -- Writable only through the admin API, never through GraphQL: `payTo` decides
 -- who receives money, so it gets the same DB-owned trust boundary as

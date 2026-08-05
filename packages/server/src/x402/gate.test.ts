@@ -8,14 +8,17 @@ import {
   X402_PAYMENT_STATUS,
   type X402Facilitator,
   type X402PaymentPayload,
+  type X402ValidClassification,
   type X402VerifyResponse,
   type X402FacilitatorSettleResponse,
 } from '@a2x/sdk/x402';
 import { X402Gate } from './gate.js';
 import { parseX402Pricing, type X402Pricing } from './pricing.js';
+import type { TaskUsage } from './usage.js';
 
 const RESOURCE = 'https://bridge.test/agents/a1';
 const PAY_TO = '0x1111111111111111111111111111111111111111';
+const FACILITATOR = '0x3333333333333333333333333333333333333333';
 
 const PRICING: X402Pricing = parseX402Pricing({
   network: 'eip155:84532',
@@ -33,16 +36,28 @@ function stubFacilitator(
     settle?: X402FacilitatorSettleResponse;
     settleThrows?: boolean;
   } = {},
-): X402Facilitator & { verifyCalls: number; settleCalls: number } {
+): X402Facilitator & {
+  verifyCalls: number;
+  settleCalls: number;
+  // The amount on the requirement handed to `settle` — under `upto` this is
+  // the metered charge after the SDK's clamp, i.e. what the payer is billed.
+  settledAmount?: string;
+} {
   const state = {
     verifyCalls: 0,
     settleCalls: 0,
+    settledAmount: undefined as string | undefined,
     async verify(): Promise<X402VerifyResponse> {
       state.verifyCalls += 1;
       return opts.verify ?? { isValid: true };
     },
-    async settle(): Promise<X402FacilitatorSettleResponse> {
+    async settle(
+      _payload: unknown,
+      requirements: unknown,
+    ): Promise<X402FacilitatorSettleResponse> {
       state.settleCalls += 1;
+      const r = requirements as { amount?: string; maxAmountRequired?: string };
+      state.settledAmount = r.amount ?? r.maxAmountRequired;
       if (opts.settleThrows) throw new Error('facilitator unreachable');
       return (
         opts.settle ?? {
@@ -54,13 +69,13 @@ function stubFacilitator(
       );
     },
   };
-  return state;
+  return state as X402Facilitator & typeof state;
 }
 
-function makeGate(facilitator: X402Facilitator): X402Gate {
+function makeGate(facilitator: X402Facilitator, pricing: X402Pricing = PRICING): X402Gate {
   return new X402Gate(
     'a1',
-    PRICING,
+    pricing,
     new X402Context({ store: new InMemoryX402Store(), facilitator, x402Version: 2 }),
   );
 }
@@ -408,4 +423,221 @@ test('a throwing settlement is reported as a failure, not propagated', async () 
     classified: second.classified,
   });
   assert.equal(result.kind, 'failed');
+});
+
+// ── upto: metered settlement ──────────────────────────────────────────────
+
+const UPTO_PRICING: X402Pricing = parseX402Pricing({
+  scheme: 'upto',
+  network: 'eip155:84532',
+  asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+  payTo: PAY_TO,
+  maxAmount: '1000000', // 1 USDC ceiling
+  rates: { input: '3000000', output: '15000000' }, // $3 / $15 per MTok
+  facilitatorAddress: FACILITATOR,
+})!;
+
+/** A turn-2 message carrying a Permit2 witness — the `upto` signed shape. */
+function uptoSubmissionMessage(
+  requirement: Record<string, unknown>,
+  overrides: { authorized?: string } = {},
+): Message {
+  const payload: X402PaymentPayload = {
+    x402Version: 2,
+    accepted: requirement as never,
+    payload: {
+      signature: `0x${'cd'.repeat(65)}`,
+      permit2Authorization: {
+        from: '0x2222222222222222222222222222222222222222',
+        permitted: {
+          token: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+          amount: overrides.authorized ?? '1000000',
+        },
+        spender: '0x4444444444444444444444444444444444444444',
+        nonce: `0x${'22'.repeat(32)}`,
+        deadline: String(Math.floor(Date.now() / 1000) + 3600),
+        witness: {
+          to: PAY_TO,
+          facilitator: FACILITATOR,
+          validAfter: '0',
+        },
+      },
+    },
+  } as X402PaymentPayload;
+
+  return userMessage({
+    [X402_METADATA_KEYS.STATUS]: X402_PAYMENT_STATUS.SUBMITTED,
+    [X402_METADATA_KEYS.PAYLOAD]: payload,
+  });
+}
+
+/** Run an upto round-trip to a verified payment, ready to settle. */
+async function uptoVerified(
+  facilitator: X402Facilitator,
+  taskId: string,
+  pricing: X402Pricing = UPTO_PRICING,
+): Promise<{ gate: X402Gate; classified: X402ValidClassification }> {
+  const gate = makeGate(facilitator, pricing);
+  const first = await gate.open({
+    taskId,
+    contextId: `ctx-${taskId}`,
+    message: userMessage(),
+    resource: RESOURCE,
+  });
+  assert.equal(first.kind, 'halt');
+  if (first.kind !== 'halt') throw new Error('unreachable');
+
+  const second = await gate.open({
+    taskId,
+    contextId: `ctx-${taskId}`,
+    message: uptoSubmissionMessage(offeredRequirement(first.event)),
+    resource: RESOURCE,
+  });
+  assert.equal(second.kind, 'proceed', 'upto submission should verify');
+  if (second.kind !== 'proceed' || !second.classified) throw new Error('unreachable');
+  return { gate, classified: second.classified };
+}
+
+test('an upto offering advertises the ceiling and the facilitator address', async () => {
+  const facilitator = stubFacilitator();
+  const gate = makeGate(facilitator, UPTO_PRICING);
+
+  const outcome = await gate.open({
+    taskId: 'u-1',
+    contextId: 'ctx-u1',
+    message: userMessage(),
+    resource: RESOURCE,
+  });
+  assert.equal(outcome.kind, 'halt');
+  if (outcome.kind !== 'halt') return;
+
+  const requirement = offeredRequirement(outcome.event);
+  assert.equal(requirement.scheme, 'upto');
+  assert.equal(requirement.amount, '1000000');
+  assert.deepEqual(requirement.extra, { facilitatorAddress: FACILITATOR });
+});
+
+test('upto settles the metered charge, not the authorized ceiling', async () => {
+  const facilitator = stubFacilitator();
+  const { gate, classified } = await uptoVerified(facilitator, 'u-2');
+
+  // 100k in @ $3/MTok + 10k out @ $15/MTok = 450000 atomic, well under the
+  // 1000000 ceiling the payer authorized.
+  const usage: TaskUsage = {
+    prompt_tokens: 100_000,
+    completion_tokens: 10_000,
+    total_tokens: 110_000,
+  };
+  const result = await gate.settle({
+    taskId: 'u-2',
+    contextId: 'ctx-u-2',
+    classified,
+    usage,
+  });
+
+  assert.equal(result.kind, 'settled');
+  assert.equal(facilitator.settledAmount, '450000');
+});
+
+test('a metered charge above the ceiling is clamped down to it', async () => {
+  const facilitator = stubFacilitator();
+  const { gate, classified } = await uptoVerified(facilitator, 'u-3');
+
+  // 10M input tokens prices to 30000000 — 30x the authorized ceiling. The
+  // SDK clamps, which is what makes a pricing mistake unable to overcharge.
+  const result = await gate.settle({
+    taskId: 'u-3',
+    contextId: 'ctx-u-3',
+    classified,
+    usage: { prompt_tokens: 10_000_000, completion_tokens: 0, total_tokens: 10_000_000 },
+  });
+
+  assert.equal(result.kind, 'settled');
+  assert.equal(facilitator.settledAmount, '1000000');
+});
+
+test('upto settles the floor when the backend reported no usage', async () => {
+  // openclaw reports nothing; codex can emit {0,0,0} when its runtime drops
+  // accounting. Charging zero for delivered work is a real loss, so an
+  // operator who sets minAmount gets that instead.
+  const facilitator = stubFacilitator();
+  const priced = parseX402Pricing({
+    scheme: 'upto',
+    network: 'eip155:84532',
+    asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+    payTo: PAY_TO,
+    maxAmount: '1000000',
+    rates: { input: '3000000', output: '15000000' },
+    minAmount: '25000',
+    facilitatorAddress: FACILITATOR,
+  })!;
+  const { gate, classified } = await uptoVerified(facilitator, 'u-4', priced);
+
+  const result = await gate.settle({
+    taskId: 'u-4',
+    contextId: 'ctx-u-4',
+    classified,
+    usage: undefined,
+  });
+
+  assert.equal(result.kind, 'settled');
+  assert.equal(facilitator.settledAmount, '25000');
+});
+
+test('upto with no usage and no floor settles zero rather than the ceiling', async () => {
+  // The default direction is payer-favourable on purpose: billing the
+  // maximum because *our* instrumentation lost the token count would be a
+  // user-visible wrong, where undercharging is our own loss to fix.
+  const facilitator = stubFacilitator();
+  const { gate, classified } = await uptoVerified(facilitator, 'u-5');
+
+  const result = await gate.settle({
+    taskId: 'u-5',
+    contextId: 'ctx-u-5',
+    classified,
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
+
+  assert.equal(result.kind, 'settled');
+  assert.equal(facilitator.settledAmount, '0');
+});
+
+test('an exact agent ignores usage and settles the signed amount', async () => {
+  // Metering an `exact` requirement throws in the SDK, so the gate must not
+  // pass an amount through for a flat-fee agent even when usage is present.
+  const facilitator = stubFacilitator();
+  const gate = makeGate(facilitator);
+
+  const first = await gate.open({
+    taskId: 'u-6',
+    contextId: 'ctx-u-6',
+    message: userMessage(),
+    resource: RESOURCE,
+  });
+  assert.equal(first.kind, 'halt');
+  if (first.kind !== 'halt') return;
+
+  const second = await gate.open({
+    taskId: 'u-6',
+    contextId: 'ctx-u-6',
+    message: submissionMessage(offeredRequirement(first.event)),
+    resource: RESOURCE,
+  });
+  assert.equal(second.kind, 'proceed');
+  if (second.kind !== 'proceed' || !second.classified) return;
+
+  const result = await gate.settle({
+    taskId: 'u-6',
+    contextId: 'ctx-u-6',
+    classified: second.classified,
+    usage: { prompt_tokens: 999, completion_tokens: 999, total_tokens: 1998 },
+  });
+
+  assert.equal(result.kind, 'settled');
+  assert.equal(facilitator.settledAmount, '10000');
+});
+
+test('the gate reports whether it meters, so the executor knows to read usage', () => {
+  assert.equal(makeGate(stubFacilitator(), UPTO_PRICING).metered, true);
+  assert.equal(makeGate(stubFacilitator()).metered, false);
 });

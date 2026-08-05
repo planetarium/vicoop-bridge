@@ -9,16 +9,17 @@ import { TaskState, type Message, type TaskStatusUpdateEvent } from '@a2x/sdk';
 import type { Sql } from '../db.js';
 import { logEvent } from '../log.js';
 import { PostgresX402Store } from './store.js';
-import { pricingToAccepts, type X402Pricing } from './pricing.js';
+import { meterUsage, pricingToAccepts, type X402Pricing } from './pricing.js';
+import type { TaskUsage } from './usage.js';
 
 export { X402_FOUNDATION_EXTENSION_URI };
 
 // The x402 wire version this deployment emits. V2 is the x402 Foundation
 // A2A transport — CAIP-2 networks, top-level `resource`, and the only version
-// with a path to the usage-based `upto` scheme, which is where metered
-// per-token billing eventually goes. The SDK still defaults to V1 for
-// compatibility with the older reference lineage, so we opt in explicitly and
-// leave an escape hatch for a deployment that has to serve V1-only clients.
+// that has the usage-based `upto` scheme at all. The SDK still defaults to V1
+// for compatibility with the older reference lineage, so we opt in explicitly
+// and leave an escape hatch for a deployment that has to serve V1-only
+// clients — one that an `upto` agent cannot use.
 const X402_VERSION: 1 | 2 = process.env.BRIDGE_X402_VERSION === '1' ? 1 : 2;
 
 // How long a payer has to sign and resubmit before the offering lapses. Past
@@ -85,9 +86,10 @@ export interface X402GateParams {
  * only the events need translating, which `haltEvent` does.
  *
  * Settlement is deliberately deferred until the agent has finished
- * successfully: an `exact` payment is a charge for delivered work, so a task
- * that fails or is cancelled is never settled and the payer's signed
- * authorization simply goes unused.
+ * successfully: payment buys delivered work, so a task that fails or is
+ * cancelled is never settled and the payer's signed authorization simply goes
+ * unused. Under `upto` that deferral is also what makes metering possible —
+ * the token counts only exist once the work is done.
  */
 export class X402Gate {
   constructor(
@@ -95,6 +97,32 @@ export class X402Gate {
     private readonly pricing: X402Pricing,
     private readonly x402: BaseX402Context,
   ) {}
+
+  /** True when this agent bills by consumption rather than a flat fee. */
+  get metered(): boolean {
+    return this.pricing.scheme === 'upto';
+  }
+
+  /**
+   * Scheme-independent description of what was offered, for logs. Under
+   * `upto` the amount is the authorized ceiling, so it is labelled as such
+   * rather than reported as a price that will be charged.
+   */
+  private offeringFields(): Record<string, string> {
+    return this.pricing.scheme === 'upto'
+      ? {
+          scheme: 'upto',
+          ceiling: this.pricing.maxAmount,
+          network: this.pricing.network,
+          asset: this.pricing.asset,
+        }
+      : {
+          scheme: 'exact',
+          amount: this.pricing.amount,
+          network: this.pricing.network,
+          asset: this.pricing.asset,
+        };
+  }
 
   /**
    * Classify the inbound turn and either request payment, refuse it, or clear
@@ -107,6 +135,26 @@ export class X402Gate {
   async open(params: X402GateParams): Promise<X402GateOutcome> {
     const { taskId, contextId, message, resource } = params;
     const ctx = { taskId, message };
+
+    // `upto` exists only in x402 V2. The SDK would throw from
+    // `requestPayment`, which the catch below would report as a transient
+    // outage — misleading for what is a permanent misconfiguration.
+    if (this.pricing.scheme === 'upto' && X402_VERSION === 1) {
+      logEvent('x402_config_invalid', {
+        agentId: this.agentId,
+        taskId,
+        reason: 'upto pricing requires x402 V2, but BRIDGE_X402_VERSION is 1',
+      });
+      return {
+        kind: 'halt',
+        event: this.failedEvent({
+          taskId,
+          contextId,
+          code: 'invalid_x402_version',
+          reason: 'Metered pricing requires x402 V2, which this deployment does not serve.',
+        }),
+      };
+    }
 
     try {
       const classified = await this.x402.classify(ctx);
@@ -135,9 +183,7 @@ export class X402Gate {
         logEvent('x402_payment_required', {
           agentId: this.agentId,
           taskId,
-          amount: this.pricing.amount,
-          asset: this.pricing.asset,
-          network: this.pricing.network,
+          ...this.offeringFields(),
         });
         return {
           kind: 'halt',
@@ -188,8 +234,7 @@ export class X402Gate {
       logEvent('x402_payment_verified', {
         agentId: this.agentId,
         taskId,
-        amount: this.pricing.amount,
-        network: this.pricing.network,
+        ...this.offeringFields(),
       });
       return { kind: 'proceed', classified };
     } catch (err) {
@@ -214,6 +259,12 @@ export class X402Gate {
   /**
    * Settle a verified payment after the agent completed the work.
    *
+   * Under `exact` the charge is the amount the payer already signed for and
+   * `usage` is ignored. Under `upto` the charge is metered from `usage` and
+   * the SDK clamps it down to the minimum of the metered value, the offered
+   * ceiling, and the payer's signed cap — so a pricing or metering mistake
+   * here can only ever undercharge.
+   *
    * Returns metadata to merge onto the task's final status message on
    * success, or a replacement terminal event when settlement failed — the
    * merchant was not paid, so the task must not report success.
@@ -222,15 +273,51 @@ export class X402Gate {
     taskId: string;
     contextId: string;
     classified: X402ValidClassification;
+    usage?: TaskUsage | undefined;
   }): Promise<
     | { kind: 'settled'; metadata: Record<string, unknown> }
     | { kind: 'failed'; event: TaskStatusUpdateEvent }
   > {
-    const { taskId, contextId, classified } = params;
+    const { taskId, contextId, classified, usage } = params;
     const ctx = { taskId };
+
+    // Metering an `exact` requirement throws in the SDK — the signature binds
+    // it to one value — so the option is only ever passed for `upto`.
+    let settleOpts: { amountAtomic?: string } | undefined;
+    if (this.pricing.scheme === 'upto') {
+      const charge = meterUsage(this.pricing, usage);
+      settleOpts = { amountAtomic: charge.amountAtomic };
+      logEvent('x402_metered', {
+        agentId: this.agentId,
+        taskId,
+        basis: charge.basis,
+        amount: charge.amountAtomic,
+        ceiling: this.pricing.maxAmount,
+        ...(usage !== undefined
+          ? {
+              promptTokens: usage.prompt_tokens,
+              completionTokens: usage.completion_tokens,
+              ...(usage.cached_tokens !== undefined ? { cachedTokens: usage.cached_tokens } : {}),
+              ...(usage.model !== undefined ? { model: usage.model } : {}),
+            }
+          : {}),
+      });
+      if (charge.basis === 'no-usage') {
+        // Loud on purpose: the backend delivered work the bridge could not
+        // price. Either the runtime dropped its accounting (codex #351) or
+        // the backend has none at all (openclaw), and both mean this agent
+        // is being given away at `minAmount` on every such call.
+        logEvent('x402_usage_unavailable', {
+          agentId: this.agentId,
+          taskId,
+          charged: charge.amountAtomic,
+        });
+      }
+    }
+
     let receipt: X402SettleResponse;
     try {
-      receipt = await this.x402.settle(ctx, classified);
+      receipt = await this.x402.settle(ctx, classified, settleOpts);
     } catch (err) {
       logEvent('x402_settle_error', {
         agentId: this.agentId,
@@ -272,6 +359,11 @@ export class X402Gate {
       transaction: receipt.transaction,
       network: receipt.network,
       ...(receipt.payer !== undefined ? { payer: receipt.payer } : {}),
+      // What the facilitator confirmed charging, which under `upto` is the
+      // reconciliation datum and is not recoverable from the offering. Absent
+      // whenever the facilitator reported no amount — the SDK does not
+      // backfill it from what was requested.
+      ...(receipt.amount !== undefined ? { amount: receipt.amount } : {}),
     });
 
     const done = this.x402.completedEvent({ receipt });
