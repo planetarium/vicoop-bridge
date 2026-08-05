@@ -9,6 +9,7 @@ import type { Registry } from './registry.js';
 import { validatePrincipal } from './auth/principal.js';
 import { generateApiKeyId, issueSessionToken } from './auth/caller-token.js';
 import { isAdmin } from './admin-scope.js';
+import { X402PricingSchema, parseX402Pricing, type X402Pricing } from './x402/pricing.js';
 
 type Tx = postgres.TransactionSql;
 
@@ -217,6 +218,101 @@ export async function listCallers(
     created_at: policy.created_at instanceof Date ? policy.created_at.toISOString() : policy.created_at as string | undefined,
     updated_at: policy.updated_at instanceof Date ? policy.updated_at.toISOString() : policy.updated_at as string | undefined,
   };
+}
+
+// ----- x402 pricing ---------------------------------------------------------
+//
+// `agents.x402_pricing` is DB-owned rather than declared in the WS hello
+// frame, because `payTo` names the wallet that receives money and the hello
+// frame is authored by the connecting agent. That makes this the only write
+// path, so it validates through the same `parseX402Pricing` the runtime uses:
+// a bad address or a dollars-instead-of-atomic-units amount is rejected here,
+// at write time, rather than silently disabling payments at the agent's next
+// connect.
+
+export interface X402PricingResult {
+  agent_id: string;
+  x402_pricing: X402Pricing | null;
+}
+
+export async function getX402Pricing(
+  db: Sql,
+  principalId: string,
+  agentId: string,
+): Promise<X402PricingResult> {
+  const rows = await db.begin(async (tx) => {
+    await setRlsContext(tx, principalId);
+    return tx`SELECT id AS agent_id, x402_pricing FROM agents WHERE id = ${agentId}`;
+  });
+  if (rows.length === 0) throw new AdminApiError('Agent not found.', 404);
+
+  // A row that fails to parse is reported rather than thrown: the operator
+  // asking "what does this agent charge?" is exactly who needs to be told it
+  // is currently unreadable (and therefore being served for free).
+  let pricing: X402Pricing | null = null;
+  try {
+    pricing = parseX402Pricing(rows[0].x402_pricing) ?? null;
+  } catch (err) {
+    throw new AdminApiError(
+      `Stored pricing for this agent is invalid and is being ignored at runtime: ${String(err)}`,
+      409,
+    );
+  }
+  return { agent_id: agentId, x402_pricing: pricing };
+}
+
+export async function setX402Pricing(
+  db: Sql,
+  registry: Registry,
+  principalId: string,
+  agentId: string,
+  pricing: unknown,
+): Promise<X402PricingResult> {
+  let parsed: X402Pricing;
+  try {
+    parsed = X402PricingSchema.parse(pricing);
+  } catch (err) {
+    throw new AdminApiError(`Invalid x402 pricing: ${String(err)}`, 400);
+  }
+
+  const rows = await db.begin(async (tx) => {
+    await setRlsContext(tx, principalId);
+    return tx`
+      UPDATE agents
+      SET x402_pricing = ${tx.json(JSON.parse(JSON.stringify(parsed)))},
+          updated_at = now()
+      WHERE id = ${agentId}
+      RETURNING id AS agent_id
+    `;
+  });
+  // RLS hides agents the operator doesn't own, so zero rows is
+  // indistinguishable from "no such agent" — and deliberately so, since
+  // distinguishing them would confirm the existence of someone else's agent.
+  if (rows.length === 0) throw new AdminApiError('Agent not found or not authorized.', 404);
+
+  registry.updateX402Pricing(agentId, parsed);
+  return { agent_id: agentId, x402_pricing: parsed };
+}
+
+export async function clearX402Pricing(
+  db: Sql,
+  registry: Registry,
+  principalId: string,
+  agentId: string,
+): Promise<X402PricingResult> {
+  const rows = await db.begin(async (tx) => {
+    await setRlsContext(tx, principalId);
+    return tx`
+      UPDATE agents
+      SET x402_pricing = NULL, updated_at = now()
+      WHERE id = ${agentId}
+      RETURNING id AS agent_id
+    `;
+  });
+  if (rows.length === 0) throw new AdminApiError('Agent not found or not authorized.', 404);
+
+  registry.updateX402Pricing(agentId, undefined);
+  return { agent_id: agentId, x402_pricing: null };
 }
 
 // ----- Static API keys (issue #308) -----------------------------------------

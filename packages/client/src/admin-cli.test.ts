@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parse } from '@optique/core/parser';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -17,7 +17,11 @@ import {
   runListClients,
   runRemoveCaller,
   runRevokeClient,
+  runAgentX402Show,
+  runAgentX402Set,
+  runAgentX402Clear,
   agentCmd,
+  type AgentX402SetArgs,
   type AddCallerArgs,
   type AgentCallersIssueArgs,
   type AgentCallersAddArgs,
@@ -156,12 +160,22 @@ function withEnv(
   });
 }
 
+// Captures stdout for assertions while still forwarding to the real stream.
+//
+// Forwarding is not cosmetic. `node --test` pipes its reporter into this same
+// `process.stdout`, emitting each test's result line as that test completes —
+// which usually lands while the *next* test has stdout patched. Swallowing
+// writes therefore eats the runner's own output: the results vanish and the
+// final counts shrink to whatever happened to be emitted outside a capture
+// window. That silently dropped 32 of this file's tests once, with a green
+// "0 failed" summary, so the noise of echoing the CLI's own output is the
+// cheaper trade. Assertions are unaffected — they read `captured`.
 function captureStdout(t: { after: (fn: () => void) => void }): { read: () => string } {
   let captured = '';
   const original = process.stdout.write.bind(process.stdout);
-  process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+  process.stdout.write = ((chunk: string | Uint8Array, ...rest: unknown[]): boolean => {
     captured += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
-    return true;
+    return (original as (...args: unknown[]) => boolean)(chunk, ...rest);
   }) as typeof process.stdout.write;
   t.after(() => {
     process.stdout.write = original;
@@ -715,6 +729,248 @@ test('agent callers {list,remove,issue-api-key} parse through the real parser wi
   // The top-level siblings must keep working after the reorder.
   expectOk(['agent', 'list'], { action: 'agent-list', connected: false });
   expectOk(['agent', 'remove', 'foo', '--yes'], { action: 'agent-delete', target: 'foo', yes: true });
+});
+
+// `agent x402 {show,clear}` are in the same tie-class as `callers {list,remove}`:
+// an AGENT_ID positional competing with the all-optional top-level `list` /
+// `remove`. They are registered before those siblings for the same reason, and
+// this asserts the ordering holds.
+test('agent x402 subcommands parse through the real parser with their AGENT_ID', () => {
+  const setDefaults = {
+    file: undefined,
+    scheme: undefined,
+    network: undefined,
+    asset: undefined,
+    payTo: undefined,
+    amount: undefined,
+    maxAmount: undefined,
+    minAmount: undefined,
+    rateInput: undefined,
+    rateOutput: undefined,
+    rateCachedInput: undefined,
+    facilitator: undefined,
+    description: undefined,
+  };
+  const expectOk = (argv: string[], expected: Record<string, unknown>) => {
+    const r = parse(agentCmd, argv);
+    assert.equal(r.success, true, `expected ${argv.join(' ')} to parse`);
+    if (r.success) assert.deepEqual(r.value, { ...SHARED, ...expected });
+  };
+
+  expectOk(['agent', 'x402', 'show', 'foo'], { action: 'agent-x402-show', agentId: 'foo' });
+  expectOk(['agent', 'x402', 'clear', 'foo'], { action: 'agent-x402-clear', agentId: 'foo' });
+  expectOk(['agent', 'x402', 'set', 'foo', '--amount', '10000'], {
+    action: 'agent-x402-set',
+    agentId: 'foo',
+    ...setDefaults,
+    amount: '10000',
+  });
+  expectOk(['agent', 'x402', 'set', 'foo', '--file', '-'], {
+    action: 'agent-x402-set',
+    agentId: 'foo',
+    ...setDefaults,
+    file: '-',
+  });
+});
+
+// ---- agent x402 (pricing) ---------------------------------------------------
+
+const x402ShowArgs = (agentId: string) =>
+  ({ action: 'agent-x402-show' as const, agentId, ...SHARED });
+const x402ClearArgs = (agentId: string) =>
+  ({ action: 'agent-x402-clear' as const, agentId, ...SHARED });
+const x402SetArgs = (agentId: string, p: Record<string, unknown> = {}) =>
+  ({
+    action: 'agent-x402-set' as const,
+    agentId,
+    ...SHARED,
+    file: undefined,
+    scheme: undefined,
+    network: undefined,
+    asset: undefined,
+    payTo: undefined,
+    amount: undefined,
+    maxAmount: undefined,
+    minAmount: undefined,
+    rateInput: undefined,
+    rateOutput: undefined,
+    rateCachedInput: undefined,
+    facilitator: undefined,
+    description: undefined,
+    ...p,
+  }) as unknown as AgentX402SetArgs;
+
+const PAY_TO = '0x1111111111111111111111111111111111111111';
+const ASSET = '0x036CbD53842c5426634e7929541eC2318f3dCF7e';
+
+test('agent x402 show GETs the pricing endpoint', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, { body: { agent_id: 'foo', x402_pricing: null } });
+
+  assert.equal(await runAgentX402Show(x402ShowArgs('foo')), 0);
+  assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/x402`);
+  assert.equal(calls[0].method, 'GET');
+  assert.equal(calls[0].headers.authorization, `Bearer ${TOKEN}`);
+});
+
+test('agent x402 show renders a free agent as free rather than as an empty table', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  installFetch(t, { body: { agent_id: 'foo', x402_pricing: null } });
+
+  await runAgentX402Show(x402ShowArgs('foo'));
+  assert.match(stdout.read(), /free \(no x402 pricing configured\)/);
+});
+
+test('agent x402 show warns that an upto agent without a floor serves unmeterable calls free', async (t) => {
+  // The one operational footgun of metered pricing: a backend that reports no
+  // tokens is charged `minAmount`, which defaults to zero. Surfacing it in
+  // `show` is how an operator finds out before the invoices do.
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  installFetch(t, {
+    body: {
+      agent_id: 'foo',
+      x402_pricing: {
+        scheme: 'upto',
+        network: 'eip155:84532',
+        asset: ASSET,
+        payTo: PAY_TO,
+        maxAmount: '1000000',
+        rates: { input: '3000000', output: '15000000' },
+        facilitatorAddress: '0x3333333333333333333333333333333333333333',
+      },
+    },
+  });
+
+  await runAgentX402Show(x402ShowArgs('foo'));
+  const out = stdout.read();
+  assert.match(out, /calls the backend cannot meter are FREE/);
+  // The ceiling must not read as the price.
+  assert.match(out, /authorized maximum, not the charge/);
+  // An omitted cache rate is "same as input", not free — say so.
+  assert.match(out, /cached=same as in/);
+});
+
+test('agent x402 set PUTs the assembled pricing object', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, {
+    body: { agent_id: 'foo', x402_pricing: { scheme: 'exact' } },
+  });
+
+  const code = await runAgentX402Set(
+    x402SetArgs('foo', {
+      network: 'eip155:84532',
+      asset: ASSET,
+      payTo: PAY_TO,
+      amount: '10000',
+    }),
+  );
+  assert.equal(code, 0);
+  assert.equal(calls[0].method, 'PUT');
+  assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/x402`);
+  assert.deepEqual(JSON.parse(calls[0].body as string), {
+    network: 'eip155:84532',
+    asset: ASSET,
+    payTo: PAY_TO,
+    amount: '10000',
+  });
+});
+
+test('agent x402 set nests the --rate-* flags under rates', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, { body: { agent_id: 'foo', x402_pricing: {} } });
+
+  await runAgentX402Set(
+    x402SetArgs('foo', {
+      scheme: 'upto',
+      network: 'eip155:84532',
+      asset: ASSET,
+      payTo: PAY_TO,
+      maxAmount: '1000000',
+      minAmount: '1000',
+      rateInput: '3000000',
+      rateOutput: '15000000',
+      rateCachedInput: '300000',
+      facilitator: '0x3333333333333333333333333333333333333333',
+    }),
+  );
+  assert.deepEqual(JSON.parse(calls[0].body as string), {
+    scheme: 'upto',
+    network: 'eip155:84532',
+    asset: ASSET,
+    payTo: PAY_TO,
+    maxAmount: '1000000',
+    minAmount: '1000',
+    facilitatorAddress: '0x3333333333333333333333333333333333333333',
+    rates: { input: '3000000', output: '15000000', cachedInput: '300000' },
+  });
+});
+
+test('agent x402 set refuses --file combined with field flags', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const stderr = captureStderr(t);
+  const { calls } = installFetch(t, { body: {} });
+
+  const code = await runAgentX402Set(
+    x402SetArgs('foo', { file: 'pricing.json', amount: '10000' }),
+  );
+  assert.equal(code, 1);
+  assert.equal(calls.length, 0, 'must not reach the server with an ambiguous request');
+  assert.match(stderr.read(), /--file cannot be combined/);
+});
+
+test('agent x402 set with nothing to set explains itself instead of clearing pricing', async (t) => {
+  // An empty PUT would otherwise be indistinguishable from `clear`, which is
+  // a destructive difference for a money setting.
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const stderr = captureStderr(t);
+  const { calls } = installFetch(t, { body: {} });
+
+  assert.equal(await runAgentX402Set(x402SetArgs('foo')), 1);
+  assert.equal(calls.length, 0);
+  assert.match(stderr.read(), /Nothing to set/);
+});
+
+test('agent x402 set reads a pricing object from a file', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, { body: { agent_id: 'foo', x402_pricing: {} } });
+
+  const dir = mkdtempSync(join(tmpdir(), 'x402-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'pricing.json');
+  const pricing = { network: 'eip155:84532', asset: ASSET, payTo: PAY_TO, amount: '10000' };
+  writeFileSync(path, JSON.stringify(pricing));
+
+  assert.equal(await runAgentX402Set(x402SetArgs('foo', { file: path })), 0);
+  assert.deepEqual(JSON.parse(calls[0].body as string), pricing);
+});
+
+test('agent x402 clear DELETEs the pricing endpoint', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, { body: { agent_id: 'foo', x402_pricing: null } });
+
+  assert.equal(await runAgentX402Clear(x402ClearArgs('foo')), 0);
+  assert.equal(calls[0].method, 'DELETE');
+  assert.equal(calls[0].url, `${BRIDGE}/admin-api/agents/foo/x402`);
+});
+
+test('agent x402 surfaces a server rejection as a non-zero exit', async (t) => {
+  // The server owns validation; the CLI must not swallow its 400.
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const stderr = captureStderr(t);
+  installFetch(t, { status: 400, body: { error: 'Invalid x402 pricing: bad payTo' } });
+
+  assert.equal(await runAgentX402Set(x402SetArgs('foo', { amount: '10000' })), 1);
+  assert.match(stderr.read(), /error \(400\).*Invalid x402 pricing/);
 });
 
 // The new `agent` commands must not print a deprecation warning — that's

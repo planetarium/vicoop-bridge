@@ -54,6 +54,47 @@ reporting success would hide that.
 
 ## Configuring an agent's price
 
+From the operator's machine, with the same owner-session bearer `agent callers`
+uses (`vicoop-client auth login --server <URL>` first):
+
+```bash
+# What does this agent charge?
+vicoop-client agent x402 show <AGENT_ID>
+
+# Flat fee: 0.01 USDC per call on Base Sepolia
+vicoop-client agent x402 set <AGENT_ID> \
+  --network eip155:84532 \
+  --asset 0x036CbD53842c5426634e7929541eC2318f3dCF7e \
+  --pay-to 0xYourWallet \
+  --amount 10000
+
+# Metered: $3/MTok in, $15/MTok out, 1 USDC ceiling, 0.001 USDC floor
+vicoop-client agent x402 set <AGENT_ID> \
+  --scheme upto \
+  --network eip155:84532 \
+  --asset 0x036CbD53842c5426634e7929541eC2318f3dCF7e \
+  --pay-to 0xYourWallet \
+  --facilitator 0xFacilitatorAddress \
+  --max-amount 1000000 --min-amount 1000 \
+  --rate-input 3000000 --rate-output 15000000
+
+# Or supply the whole object (also reads stdin with `-`)
+vicoop-client agent x402 set <AGENT_ID> --file pricing.json
+
+# Back to free
+vicoop-client agent x402 clear <AGENT_ID>
+```
+
+These call `GET`/`PUT`/`DELETE /admin-api/agents/:id/x402`. The body is
+validated server-side against the same schema the payment gate uses, so a bad
+address or a dollars-instead-of-atomic amount is rejected at write time rather
+than silently disabling payments at the agent's next connect. Changes are
+hot-reloaded — no daemon restart, no reconnect.
+
+Note the auth boundary: these take the **owner-session** bearer, not the agent
+token. A stolen agent token can impersonate the agent but cannot reprice it or
+redirect its payments.
+
 Pricing lives in `agents.x402_pricing` (JSONB, NULL by default). A row with no
 `scheme` is `exact`:
 

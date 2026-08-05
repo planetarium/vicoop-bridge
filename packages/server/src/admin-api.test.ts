@@ -832,3 +832,221 @@ test(
     }
   },
 );
+
+// ---- x402 pricing ----------------------------------------------------------
+
+const EXACT_PRICING = {
+  network: 'eip155:84532',
+  amount: '10000',
+  asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+  payTo: '0x1111111111111111111111111111111111111111',
+};
+
+test(
+  'PUT /admin-api/agents/:id/x402 stores pricing and GET reads it back',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'c'.repeat(40)}`;
+    let setup: SetupResult | null = null;
+    try {
+      setup = await setupOwner(sql, owner);
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+
+      // A brand-new agent is free.
+      const before = await app.request(`/admin-api/agents/${setup.agentId}/x402`, {
+        headers: authHeaders(setup.ownerToken),
+      });
+      assert.equal(before.status, 200);
+      assert.equal(((await before.json()) as { x402_pricing: unknown }).x402_pricing, null);
+
+      const put = await app.request(`/admin-api/agents/${setup.agentId}/x402`, {
+        method: 'PUT',
+        headers: { ...authHeaders(setup.ownerToken), 'content-type': 'application/json' },
+        body: JSON.stringify(EXACT_PRICING),
+      });
+      assert.equal(put.status, 200);
+      // The stored value is the parsed one, so the scheme discriminator is
+      // filled in even though the operator omitted it.
+      assert.deepEqual(((await put.json()) as { x402_pricing: unknown }).x402_pricing, {
+        ...EXACT_PRICING,
+        scheme: 'exact',
+      });
+
+      const after = await app.request(`/admin-api/agents/${setup.agentId}/x402`, {
+        headers: authHeaders(setup.ownerToken),
+      });
+      assert.deepEqual(((await after.json()) as { x402_pricing: unknown }).x402_pricing, {
+        ...EXACT_PRICING,
+        scheme: 'exact',
+      });
+    } finally {
+      if (setup) await teardown(sql, owner, setup.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'PUT /admin-api/agents/:id/x402 rejects malformed pricing before it reaches the DB',
+  { skip: !hasDb },
+  async () => {
+    // The whole point of routing pricing through the admin API is that a bad
+    // payTo or a dollars-instead-of-atomic amount fails here, loudly, rather
+    // than silently disabling payments at the agent's next connect.
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'d'.repeat(40)}`;
+    let setup: SetupResult | null = null;
+    try {
+      setup = await setupOwner(sql, owner);
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+
+      for (const bad of [
+        { ...EXACT_PRICING, payTo: '0xnope' },
+        { ...EXACT_PRICING, amount: '0.01' },
+        { ...EXACT_PRICING, amount: 10000 },
+        { ...EXACT_PRICING, scheme: 'upto' }, // upto needs rates + facilitator
+      ]) {
+        const res = await app.request(`/admin-api/agents/${setup.agentId}/x402`, {
+          method: 'PUT',
+          headers: { ...authHeaders(setup.ownerToken), 'content-type': 'application/json' },
+          body: JSON.stringify(bad),
+        });
+        assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(bad)}`);
+      }
+
+      const rows = await sql<{ x402_pricing: unknown }[]>`
+        SELECT x402_pricing FROM agents WHERE id = ${setup.agentId}
+      `;
+      assert.equal(rows[0]!.x402_pricing, null, 'no rejected value should have been persisted');
+    } finally {
+      if (setup) await teardown(sql, owner, setup.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'x402 pricing routes require an owner session and are scoped by RLS',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const ownerA = `eth:0x${'e'.repeat(40)}`;
+    const ownerB = `eth:0x${'f'.repeat(40)}`;
+    let setupA: SetupResult | null = null;
+    let setupB: SetupResult | null = null;
+    try {
+      setupA = await setupOwner(sql, ownerA);
+      setupB = await setupOwner(sql, ownerB);
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+
+      const noAuth = await app.request(`/admin-api/agents/${setupA.agentId}/x402`);
+      assert.equal(noAuth.status, 401);
+
+      // B must not be able to reprice — or even confirm the existence of — A's
+      // agent. Both surface as 404 rather than 403 for that reason.
+      const cross = await app.request(`/admin-api/agents/${setupA.agentId}/x402`, {
+        method: 'PUT',
+        headers: { ...authHeaders(setupB.ownerToken), 'content-type': 'application/json' },
+        body: JSON.stringify(EXACT_PRICING),
+      });
+      assert.equal(cross.status, 404);
+
+      const rows = await sql<{ x402_pricing: unknown }[]>`
+        SELECT x402_pricing FROM agents WHERE id = ${setupA.agentId}
+      `;
+      assert.equal(rows[0]!.x402_pricing, null, "another owner must not have repriced A's agent");
+    } finally {
+      if (setupA) await teardown(sql, ownerA, setupA.clientId);
+      if (setupB) await teardown(sql, ownerB, setupB.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'DELETE /admin-api/agents/:id/x402 makes the agent free again',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'1'.repeat(40)}`;
+    let setup: SetupResult | null = null;
+    try {
+      setup = await setupOwner(sql, owner);
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+
+      await app.request(`/admin-api/agents/${setup.agentId}/x402`, {
+        method: 'PUT',
+        headers: { ...authHeaders(setup.ownerToken), 'content-type': 'application/json' },
+        body: JSON.stringify(EXACT_PRICING),
+      });
+
+      const del = await app.request(`/admin-api/agents/${setup.agentId}/x402`, {
+        method: 'DELETE',
+        headers: authHeaders(setup.ownerToken),
+      });
+      assert.equal(del.status, 200);
+      assert.equal(((await del.json()) as { x402_pricing: unknown }).x402_pricing, null);
+
+      const rows = await sql<{ x402_pricing: unknown }[]>`
+        SELECT x402_pricing FROM agents WHERE id = ${setup.agentId}
+      `;
+      assert.equal(rows[0]!.x402_pricing, null);
+    } finally {
+      if (setup) await teardown(sql, owner, setup.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'repricing a connected agent takes effect without a reconnect',
+  { skip: !hasDb },
+  async () => {
+    // The executor reads pricing off the live connection every turn, and the
+    // AgentCard advertises it — so a write must both patch the connection and
+    // evict the cached card.
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'2'.repeat(40)}`;
+    let setup: SetupResult | null = null;
+    try {
+      setup = await setupOwner(sql, owner);
+      const registry = new Registry();
+      const conn = fakeConnection({
+        agentId: setup.agentId,
+        clientId: setup.clientId,
+        ownerPrincipal: owner,
+      });
+      registry.registerAgent(conn);
+      let cardEvictions = 0;
+      registry.onAgentChange(() => {
+        cardEvictions += 1;
+      });
+      const app = createHttpApp({ db: sql, registry });
+
+      assert.equal(registry.getAgent(setup.agentId)?.x402Pricing, undefined);
+
+      await app.request(`/admin-api/agents/${setup.agentId}/x402`, {
+        method: 'PUT',
+        headers: { ...authHeaders(setup.ownerToken), 'content-type': 'application/json' },
+        body: JSON.stringify(EXACT_PRICING),
+      });
+      assert.equal(registry.getAgent(setup.agentId)?.x402Pricing?.scheme, 'exact');
+      assert.equal(cardEvictions, 1, 'the cached AgentCard must be evicted so it re-advertises');
+
+      await app.request(`/admin-api/agents/${setup.agentId}/x402`, {
+        method: 'DELETE',
+        headers: authHeaders(setup.ownerToken),
+      });
+      assert.equal(registry.getAgent(setup.agentId)?.x402Pricing, undefined);
+      assert.equal(cardEvictions, 2);
+    } finally {
+      if (setup) await teardown(sql, owner, setup.clientId);
+      await sql.end();
+    }
+  },
+);

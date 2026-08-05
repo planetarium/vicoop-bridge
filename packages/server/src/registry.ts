@@ -301,6 +301,27 @@ export class Registry {
     }
   }
 
+  /**
+   * Apply a pricing change to the live connection.
+   *
+   * The executor re-reads `x402Pricing` off the connection on every turn, so
+   * this alone makes repricing take effect on the next call. It also fires
+   * the agent-change signal because the AgentCard advertises the price, and
+   * the card (plus the request handler built around it) is cached per agent —
+   * without the eviction a repriced agent would keep publishing the old
+   * figures until it reconnected.
+   *
+   * A no-op when the agent is not currently connected: the new pricing is
+   * already in the database and will be read at its next hello.
+   */
+  updateX402Pricing(agentId: string, pricing: X402Pricing | undefined): void {
+    const conn = this.agents.get(agentId);
+    if (!conn) return;
+    if (pricing === undefined) delete conn.x402Pricing;
+    else conn.x402Pricing = pricing;
+    this.notifyAgentChange(agentId);
+  }
+
   private notifyAgentChange(agentId: string): void {
     for (const listener of this.agentChangeListeners) {
       try {
