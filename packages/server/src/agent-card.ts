@@ -1,5 +1,5 @@
 import {
-  A2XAgent,
+  A2XServer,
   HttpBearerAuthorization,
   OAuth2DeviceCodeAuthorization,
   type TaskStore,
@@ -14,7 +14,7 @@ export interface AgentA2XOptions {
 }
 
 /**
- * Build the A2XAgent for a WS-connected client. Each per-agent A2XAgent
+ * Build the A2XServer for a WS-connected client. Each per-agent A2XServer
  * owns a `WSForwardingExecutor` bound to that agent's id and the
  * shared task store.
  *
@@ -25,12 +25,12 @@ export interface AgentA2XOptions {
  * when Google OAuth is configured on this deployment, so the AgentCard
  * stays consistent with the actually-mounted endpoints).
  */
-export function buildAgentA2XAgent(
+export function buildAgentA2XServer(
   conn: ClientConnection,
   taskStore: TaskStore,
   registry: Registry,
   opts: AgentA2XOptions,
-): A2XAgent {
+): A2XServer {
   const wire = conn.agentCard;
   const url = opts.publicUrl
     ? `${opts.publicUrl}/agents/${conn.agentId}`
@@ -38,7 +38,7 @@ export function buildAgentA2XAgent(
 
   const executor = new WSForwardingExecutor(conn.agentId, registry, taskStore);
 
-  const a2xAgent = new A2XAgent({
+  const a2xServer = new A2XServer({
     taskStore,
     executor,
     protocolVersion: '0.3',
@@ -94,14 +94,14 @@ export function buildAgentA2XAgent(
       // publicUrl).
       continue;
     }
-    a2xAgent.addExtension(extension);
+    a2xServer.addExtension(extension);
   }
   if (bridgeWillEmitSiwe) {
     // Match http.tsx's siwe domain derivation (.hostname strips the port) so
     // the advertised domain matches what /auth/siwe/exchange and the bearer
     // fast-path actually validate against.
     const siweDomain = new URL(opts.publicUrl!).hostname;
-    a2xAgent.addExtension({
+    a2xServer.addExtension({
       uri: SIWE_BEARER_AUTH_EXTENSION_URI,
       description:
         'Sign-In with Ethereum (EIP-4361) bearer auth. Clients sign a SIWE message locally and present it as a base64url-encoded Bearer token; no exchange step needed.',
@@ -120,7 +120,7 @@ export function buildAgentA2XAgent(
   }
 
   for (const skill of wire.skills ?? []) {
-    a2xAgent.addSkill({
+    a2xServer.addSkill({
       id: skill.id,
       name: skill.name,
       description: skill.description ?? '',
@@ -144,7 +144,7 @@ export function buildAgentA2XAgent(
     // `security` lists the schemes as alternatives (OR), so a caller may
     // satisfy either.
     if (opts.publicUrl) {
-      a2xAgent.addSecurityScheme(
+      a2xServer.addSecurityScheme(
         'bearerAuth',
         new HttpBearerAuthorization({
           scheme: 'bearer',
@@ -153,10 +153,10 @@ export function buildAgentA2XAgent(
             'Sign-In with Ethereum (EIP-4361) bearer auth. Sign a SIWE message and present it as a base64url-encoded Bearer token, or exchange it at POST /auth/siwe/exchange for an opaque vbc_caller_* token first.',
         }),
       );
-      a2xAgent.addSecurityRequirement({ bearerAuth: [] });
+      a2xServer.addSecurityRequirement({ bearerAuth: [] });
 
       if (opts.deviceFlowEnabled) {
-        a2xAgent.addSecurityScheme(
+        a2xServer.addSecurityScheme(
           'deviceFlow',
           new OAuth2DeviceCodeAuthorization({
             deviceAuthorizationUrl: `${opts.publicUrl}/oauth/device/code`,
@@ -166,13 +166,13 @@ export function buildAgentA2XAgent(
               'Bridge-issued opaque bearer token (vbc_caller_*) via Google OAuth device flow.',
           }),
         );
-        a2xAgent.addSecurityRequirement({ deviceFlow: [] });
+        a2xServer.addSecurityRequirement({ deviceFlow: [] });
       }
     } else {
       // No publicUrl configured (typically local dev with custom hostname):
       // SIWE bearer fast-path can't run without a stable domain, so fall
       // back to advertising opaque-only bearer auth.
-      a2xAgent.addSecurityScheme(
+      a2xServer.addSecurityScheme(
         'bearerAuth',
         new HttpBearerAuthorization({
           scheme: 'bearer',
@@ -181,9 +181,9 @@ export function buildAgentA2XAgent(
             'Bridge-issued opaque bearer token (vbc_caller_*). Acquire via POST /auth/siwe/exchange by signing a SIWE message.',
         }),
       );
-      a2xAgent.addSecurityRequirement({ bearerAuth: [] });
+      a2xServer.addSecurityRequirement({ bearerAuth: [] });
     }
   }
 
-  return a2xAgent;
+  return a2xServer;
 }

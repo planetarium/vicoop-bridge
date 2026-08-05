@@ -58,7 +58,7 @@ export type CallerChangeListener = (agentId: string, callers: string[]) => void;
 // Fires whenever the agent connection (including its embedded agentCard) is
 // newly registered, replaced, or removed. Downstream consumers that cache
 // objects derived from the card — e.g. the HTTP layer's per-agent
-// A2XAgent / DefaultRequestHandler, which captures the card snapshot at
+// A2XServer / DefaultRequestHandler, which captures the card snapshot at
 // construction time — must evict on this signal, otherwise a client that
 // reconnects with an updated card (say, `streaming: false` → `true`) will
 // continue to be served by a transport built against the old card until the

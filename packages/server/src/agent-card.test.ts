@@ -6,7 +6,7 @@ import {
   TRACEABILITY_EXTENSION_URI,
   type AgentCard,
 } from '@vicoop-bridge/protocol';
-import { buildAgentA2XAgent } from './agent-card.js';
+import { buildAgentA2XServer } from './agent-card.js';
 import { Registry, type ClientConnection } from './registry.js';
 
 function fakeConn(card: AgentCard, overrides: Partial<ClientConnection> = {}): ClientConnection {
@@ -22,8 +22,8 @@ function fakeConn(card: AgentCard, overrides: Partial<ClientConnection> = {}): C
   };
 }
 
-test('buildAgentA2XAgent preserves advertised optional extensions', () => {
-  const agent = buildAgentA2XAgent(
+test('buildAgentA2XServer preserves advertised optional extensions', () => {
+  const agent = buildAgentA2XServer(
     fakeConn({
       name: 'claude',
       description: 'Claude Code',
@@ -46,8 +46,8 @@ test('buildAgentA2XAgent preserves advertised optional extensions', () => {
   ]);
 });
 
-test('buildAgentA2XAgent advertises SIWE bearer-auth extension when restricted', () => {
-  const agent = buildAgentA2XAgent(
+test('buildAgentA2XServer advertises SIWE bearer-auth extension when restricted', () => {
+  const agent = buildAgentA2XServer(
     fakeConn(
       {
         name: 'claude',
@@ -76,8 +76,8 @@ test('buildAgentA2XAgent advertises SIWE bearer-auth extension when restricted',
   assert.equal((siwe.params as { uri: string }).uri, 'https://bridge.example');
 });
 
-test('buildAgentA2XAgent exposes bearerAuth + deviceFlow security schemes when restricted (mirrors dba)', () => {
-  const agent = buildAgentA2XAgent(
+test('buildAgentA2XServer exposes bearerAuth + deviceFlow security schemes when restricted (mirrors dba)', () => {
+  const agent = buildAgentA2XServer(
     fakeConn(
       {
         name: 'claude',
@@ -108,8 +108,8 @@ test('buildAgentA2XAgent exposes bearerAuth + deviceFlow security schemes when r
   assert.equal((schemes as Record<string, unknown>).bridge, undefined);
 });
 
-test('buildAgentA2XAgent omits deviceFlow when device flow is not enabled', () => {
-  const agent = buildAgentA2XAgent(
+test('buildAgentA2XServer omits deviceFlow when device flow is not enabled', () => {
+  const agent = buildAgentA2XServer(
     fakeConn(
       {
         name: 'claude',
@@ -133,8 +133,8 @@ test('buildAgentA2XAgent omits deviceFlow when device flow is not enabled', () =
   assert.deepEqual(card.security, [{ bearerAuth: [] }]);
 });
 
-test('buildAgentA2XAgent omits SIWE extension for public agents', () => {
-  const agent = buildAgentA2XAgent(
+test('buildAgentA2XServer omits SIWE extension for public agents', () => {
+  const agent = buildAgentA2XServer(
     fakeConn({
       name: 'claude',
       description: 'Claude Code',
@@ -155,10 +155,10 @@ test('buildAgentA2XAgent omits SIWE extension for public agents', () => {
   assert.equal(siwe, undefined);
 });
 
-test('buildAgentA2XAgent overrides a wire-declared SIWE extension with the bridge version', () => {
+test('buildAgentA2XServer overrides a wire-declared SIWE extension with the bridge version', () => {
   // The bridge is authoritative for params (domain / endpoint / hints) and
   // for `required: true`; a client cannot weaken either via the wire card.
-  const agent = buildAgentA2XAgent(
+  const agent = buildAgentA2XServer(
     fakeConn(
       {
         name: 'claude',
@@ -199,12 +199,12 @@ test('buildAgentA2XAgent overrides a wire-declared SIWE extension with the bridg
   );
 });
 
-test('buildAgentA2XAgent drops a wire-declared SIWE extension on restricted agents without publicUrl', () => {
+test('buildAgentA2XServer drops a wire-declared SIWE extension on restricted agents without publicUrl', () => {
   // Without publicUrl the middleware can't accept SIWE bearers (no
   // siweDomain). Letting a wire-declared SIWE extension pass through here
   // would advertise auth the server won't actually honor, so it must be
   // stripped — even though the bridge isn't emitting its own replacement.
-  const agent = buildAgentA2XAgent(
+  const agent = buildAgentA2XServer(
     fakeConn(
       {
         name: 'claude',
@@ -233,10 +233,10 @@ test('buildAgentA2XAgent drops a wire-declared SIWE extension on restricted agen
   assert.equal(siweEntries.length, 0);
 });
 
-test('buildAgentA2XAgent leaves a wire-declared SIWE extension alone when not restricted', () => {
+test('buildAgentA2XServer leaves a wire-declared SIWE extension alone when not restricted', () => {
   // Public agent: the bridge does not enforce SIWE auth, so a wire card that
   // happens to declare the URI passes through unchanged.
-  const agent = buildAgentA2XAgent(
+  const agent = buildAgentA2XServer(
     fakeConn({
       name: 'claude',
       description: 'Claude Code',
