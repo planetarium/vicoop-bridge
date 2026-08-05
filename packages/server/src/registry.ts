@@ -1,5 +1,5 @@
 import type { WebSocket } from 'ws';
-import type { AgentCard, DownFrame } from '@vicoop-bridge/protocol';
+import type { AgentCard, DownFrame, TaskUsage } from '@vicoop-bridge/protocol';
 import { encodeFrame } from '@vicoop-bridge/protocol';
 import type { TaskArtifactUpdateEvent, TaskStatusUpdateEvent } from '@a2x/sdk';
 import { logEvent, truncate } from './log.js';
@@ -58,6 +58,13 @@ export interface TaskBinding {
   // router), a ~0 count points upstream (client never emitted). Lazily
   // initialized; incremented in ws.ts's `task.status` handler.
   heartbeats?: number;
+  // Token consumption reported on the client's `task.complete` frame, stashed
+  // here by ws.ts so the executor can price the task without re-deriving it
+  // from wire metadata. Server-internal: it is billing input and is never
+  // published back onto the A2A event. Set before the terminal status is
+  // pushed to the sink, so it is always visible by the time the executor
+  // reads the terminal event off the queue.
+  usage?: TaskUsage;
 }
 
 export type CallerChangeListener = (agentId: string, callers: string[]) => void;

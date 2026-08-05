@@ -337,6 +337,11 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           });
           return;
         }
+        // Stash the reported token usage before the terminal status reaches
+        // the sink: the executor prices the task off the binding when it
+        // consumes that event, and pushStatus only enqueues, so setting it
+        // first makes the ordering unconditional.
+        if (frame.usage !== undefined) b.usage = frame.usage;
         b.sink.pushStatus({
           taskId: frame.taskId,
           contextId: b.contextId,

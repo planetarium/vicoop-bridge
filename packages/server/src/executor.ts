@@ -19,7 +19,7 @@ import { AsyncEventQueue } from './event-queue.js';
 import { logEvent } from './log.js';
 import { terminalErrorMessageFields } from './terminal-error.js';
 import { X402Gate, createPostgresX402Context } from './x402/gate.js';
-import { readTaskUsage } from './x402/usage.js';
+import { readTaskUsage, type TaskUsage } from './x402/usage.js';
 import type { Sql } from './db.js';
 
 /**
@@ -203,14 +203,14 @@ export class WSForwardingExecutor extends AgentExecutor {
    * success.
    *
    * For a metered (`upto`) agent the charge comes from the token counts the
-   * backend already stamped onto this very event — the connected agent
-   * reports per-turn usage on its `task.complete` frame and `ws.ts` carries
-   * the metadata through, so nothing has to be plumbed for this.
+   * connected agent reported on its `task.complete` frame, which `ws.ts`
+   * stashes on the binding.
    */
   private async settleTerminal(
     gate: X402Gate,
     classified: X402ValidClassification,
     event: TaskStatusUpdateEvent,
+    binding: TaskBinding,
     taskId: string,
     contextId: string,
   ): Promise<TaskStatusUpdateEvent> {
@@ -219,12 +219,19 @@ export class WSForwardingExecutor extends AgentExecutor {
       return event;
     }
 
-    const result = await gate.settle({
-      taskId,
-      contextId,
-      classified,
-      ...(gate.metered ? { usage: readTaskUsage(event.status.message?.metadata) } : {}),
-    });
+    let metered: { usage?: TaskUsage } = {};
+    if (gate.metered) {
+      const read = readTaskUsage(binding.usage, event.status.message?.metadata);
+      if (read.source === 'openai-compat') {
+        // The client is old enough not to send the protocol field. Billing
+        // still works off the legacy key, but this is the signal to chase the
+        // client upgrade — the fallback is meant to be retired.
+        logEvent('x402_usage_legacy_source', { agentId: this.agentId, taskId });
+      }
+      metered = { usage: read.usage };
+    }
+
+    const result = await gate.settle({ taskId, contextId, classified, ...metered });
     if (result.kind === 'failed') return result.event;
 
     // Attach the settlement receipt to the final status message, which is
@@ -473,7 +480,7 @@ export class WSForwardingExecutor extends AgentExecutor {
           // first would leave both in history.
           const terminal =
             gate && settlement
-              ? await this.settleTerminal(gate, settlement, event, taskId, contextId)
+              ? await this.settleTerminal(gate, settlement, event, binding, taskId, contextId)
               : event;
           // Terminal — mutate task in place so the request-handler's
           // post-stream read reflects the final state.

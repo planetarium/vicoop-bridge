@@ -15,6 +15,7 @@ import { normalizeTaskFailError } from '../failure-code.js';
 import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
 import {
   buildOpenAICompatResponseMetadata,
+  toProtocolTaskUsage,
   buildOpenAICompatUsage,
   type OpenAICompatUsage,
 } from './openai-compat-usage.js';
@@ -3502,12 +3503,17 @@ export function createClaudeBackend(
       // A2A telemetry consumers see the response model whenever one was
       // resolved (#348).
       const messageMetadata = buildOpenAICompatResponseMetadata(responseEnvelope, envelopeUsage);
+      // Token counts also go out as the protocol's own `usage` field, which is
+      // what the bridge bills on. Same numbers, but owned by the transport
+      // rather than by the openai-compat extension's namespace.
+      const protocolUsage = toProtocolTaskUsage(envelopeUsage);
       // When parts is empty but we have envelope/usage to convey, still
       // emit the message frame so the metadata reaches the gateway.
       const hasMessage = parts.length > 0 || messageMetadata !== undefined;
       emit({
         type: 'task.complete',
         taskId: task.taskId,
+        ...(protocolUsage !== undefined ? { usage: protocolUsage } : {}),
         status: {
           state: 'completed',
           timestamp: new Date().toISOString(),

@@ -242,10 +242,41 @@ export const TaskArtifactFrame = z.object({
   lastChunk: z.boolean().optional(),
 });
 
+// Token consumption for one completed task, reported by the backend that ran
+// it. Backend-agnostic and deliberately minimal: this is a transport-level
+// fact about the task, not a marker owned by any extension.
+//
+// It is a first-class frame field rather than a `metadata` entry because the
+// bridge *bills* on it — the x402 `upto` scheme settles the metered charge
+// from these counts. Reading billing input out of another extension's
+// namespace (the counts also ride under the openai-compat URI, for that
+// extension's own consumers) would make revenue depend on an unrelated
+// extension's URI staying put: rename or version it and the numbers silently
+// become "unreported", which bills the floor instead of the charge. So the
+// protocol owns this one.
+//
+// Absent means "the runtime did not report", which is NOT the same as zero —
+// several runtimes drop their accounting for a turn, and openclaw has none at
+// all. Consumers must distinguish the two.
+export const TaskUsage = z.object({
+  // Total input tokens for the turn, INCLUDING any cached portion.
+  promptTokens: z.number().int().nonnegative(),
+  // Total output tokens, including any reasoning tokens.
+  completionTokens: z.number().int().nonnegative(),
+  // Portion of `promptTokens` served from cache. A breakdown, never additive.
+  cachedInputTokens: z.number().int().nonnegative().optional(),
+  // The model that answered, when the runtime names one. Advisory: on some
+  // backends the counts are summed across internal sub-model calls while the
+  // label names only the answering model.
+  model: z.string().min(1).optional(),
+});
+export type TaskUsage = z.infer<typeof TaskUsage>;
+
 export const TaskCompleteFrame = z.object({
   type: z.literal('task.complete'),
   taskId: z.string(),
   status: TaskStatus,
+  usage: TaskUsage.optional(),
 });
 
 export const TaskFailFrame = z.object({

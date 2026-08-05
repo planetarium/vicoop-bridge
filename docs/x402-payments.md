@@ -192,12 +192,17 @@ Not every completed call can be priced:
 
 - **openclaw reports no token usage at any layer.** Metered pricing is not
   possible for that backend — leave it on `exact`.
-- **codex and vicoop-codex can emit `{0,0,0}`** when their runtime dropped its
-  accounting for a turn. Both log a warning when they do.
+- **codex and vicoop-codex omit the counts** when their runtime dropped its
+  accounting for a turn. Both log a warning when they do. (They still emit a
+  `{0,0,0}` placeholder into the openai-compat metadata, which that
+  extension's contract requires — but the protocol's `usage` field is left
+  absent, so the meter is not fooled.)
 
-`total_tokens: 0` therefore means "the runtime did not report", not "the call
-was free". The bridge treats both cases identically: it charges `minAmount`
-(zero if unset) and logs `x402_usage_unavailable` with what it charged.
+Both cases arrive as "no usage reported", which is **not** "the call was
+free". The bridge charges `minAmount` (zero if unset) and logs
+`x402_usage_unavailable` with what it charged. A reported zero is treated the
+same way, since a runtime that genuinely consumed nothing did no billable
+work either.
 
 The default direction is deliberately payer-favourable. Billing the authorized
 ceiling because *our* instrumentation lost the token count would be a
@@ -252,6 +257,7 @@ All events are structured JSON on stdout (see
 | `x402_verify_failed` | the facilitator rejected the payload |
 | `x402_metered` | `upto` only — what the call priced to, with the token counts and the `basis` (`metered` / `floor` / `no-usage`) |
 | `x402_usage_unavailable` | `upto` only — work was delivered that could not be priced; carries what was charged instead |
+| `x402_usage_legacy_source` | `upto` only — the counts came from the openai-compat fallback because the client is too old to send `TaskCompleteFrame.usage`. Chase the client upgrade; the fallback is meant to be retired |
 | `x402_settled` | settled on-chain; carries the transaction hash and the facilitator-confirmed amount |
 | `x402_settle_failed` / `x402_settle_error` | settlement was refused or unreachable |
 | `x402_gate_error` | the payment rail was unavailable; the call was refused rather than served free |
@@ -274,23 +280,38 @@ verifiable without a chain or a database.
 
 ## Where the token counts come from
 
-Metering needs no protocol extension. The claude, codex, and vicoop-codex
-backends already stamp per-turn token counts onto the `task.complete` frame,
-under the openai-compat extension URI in `status.message.metadata` — and they
-do it even when the caller did not activate that extension, precisely so
-"billing telemetry" can read them. `wireMessageToA2X` carries the metadata
-through untouched, so the counts are already on the terminal event the
-settlement path receives.
+`TaskCompleteFrame.usage` — a first-class, optional field on the bridge's own
+wire protocol:
 
-Two wire shapes appear there depending on whether the caller activated the
-openai-compat extension, and `readTaskUsage` handles both:
-
-```
-{ usage: {...} }                        plain A2A callers
-{ chat_completion: { usage: {...} } }   openai-compat envelope
+```ts
+{ promptTokens, completionTokens, cachedInputTokens?, model? }
 ```
 
-Note this is **not** the `usage.request` / `usage.response` RPC. That returns
-a cumulative account-level quota snapshot (rolling subscription windows,
-overage budget) and is rate-limited and cached — useful for capacity
+The claude, codex, and vicoop-codex backends populate it from the counts they
+already have at the end of a turn. `ws.ts` stashes it on the task binding, and
+the settlement path prices from there.
+
+**This is deliberately independent of the openai-compat extension.** The same
+counts do also ride under `OPENAI_COMPAT_EXTENSION_URI` in
+`status.message.metadata`, for that extension's own consumers — but billing
+does not read them from there by choice. Deriving revenue from another
+extension's namespace would mean that renaming or versioning that extension
+turns every charge into "unreported", which bills the floor, silently, with
+nothing failing. Usage is a transport-level fact about a task, so the protocol
+owns it.
+
+`readTaskUsage` still falls back to the openai-compat key when the frame field
+is absent, purely so a client too old to send it stays priceable during a
+rollout. That fallback logs `x402_usage_legacy_source` and is meant to be
+retired once no such clients remain.
+
+One consequence worth knowing: the openai-compat envelope *requires* a `usage`
+block, so codex and vicoop-codex substitute `{0,0,0}` there when their runtime
+reported nothing. The protocol field has no such requirement, so it is simply
+**absent** in that case — which is the truth, and is what lets the meter tell
+"reported zero" apart from "reported nothing".
+
+Note this is also **not** the `usage.request` / `usage.response` RPC. That
+returns a cumulative account-level quota snapshot (rolling subscription
+windows, overage budget), rate-limited and cached — useful for capacity
 dashboards, useless for metering a single call.

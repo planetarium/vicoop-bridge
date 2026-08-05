@@ -28,6 +28,7 @@ import {
 } from './openai-compat.js';
 import {
   buildOpenAICompatResponseMetadata,
+  toProtocolTaskUsage,
   buildOpenAICompatUsage,
   type OpenAICompatUsage,
 } from './openai-compat-usage.js';
@@ -1650,6 +1651,12 @@ export function createVicoopCodexBackend(
       }
 
       let usage = parseChatCompletionUsage(response.usage, response.model);
+      // Captured before the zero-backfill below. The protocol's `usage` field
+      // is what the bridge bills on and has no "must be present" contract, so
+      // it stays absent when the runtime reported nothing — absent is the
+      // truth, and a fabricated zero would be indistinguishable from a
+      // genuinely free call.
+      const protocolUsage = toProtocolTaskUsage(usage);
       // We force `stream_options.include_usage` on the request, so a missing
       // usage block here means the runtime dropped it on this turn despite
       // being asked for it — the #317 failure mode, which still recurs
@@ -1691,6 +1698,7 @@ export function createVicoopCodexBackend(
       emit({
         type: 'task.complete',
         taskId: task.taskId,
+        ...(protocolUsage !== undefined ? { usage: protocolUsage } : {}),
         status: {
           state: 'completed',
           timestamp: new Date().toISOString(),

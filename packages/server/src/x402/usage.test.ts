@@ -1,15 +1,50 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
+import { OPENAI_COMPAT_EXTENSION_URI, type TaskUsage as WireTaskUsage } from '@vicoop-bridge/protocol';
 import { readTaskUsage } from './usage.js';
 
-test('readTaskUsage reads the bare {usage} shape plain A2A callers receive', () => {
-  const usage = readTaskUsage({
-    [OPENAI_COMPAT_EXTENSION_URI]: {
-      usage: { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150, model: 'sonnet' },
-    },
+const oaiMetadata = (payload: Record<string, unknown>) => ({
+  [OPENAI_COMPAT_EXTENSION_URI]: payload,
+});
+
+test('readTaskUsage prefers the protocol frame field', () => {
+  const reported: WireTaskUsage = {
+    promptTokens: 120,
+    completionTokens: 30,
+    cachedInputTokens: 20,
+    model: 'sonnet',
+  };
+  const result = readTaskUsage(reported, undefined);
+  assert.equal(result.source, 'protocol');
+  assert.deepEqual(result.usage, {
+    prompt_tokens: 120,
+    completion_tokens: 30,
+    total_tokens: 150,
+    cached_tokens: 20,
+    model: 'sonnet',
   });
-  assert.deepEqual(usage, {
+});
+
+test('the protocol field wins even when openai-compat metadata disagrees', () => {
+  // Billing must not depend on which of two sources happens to be read first,
+  // and the protocol field is the one the bridge owns.
+  const result = readTaskUsage(
+    { promptTokens: 10, completionTokens: 5 },
+    oaiMetadata({ usage: { prompt_tokens: 9999, completion_tokens: 9999 } }),
+  );
+  assert.equal(result.source, 'protocol');
+  assert.equal(result.usage?.total_tokens, 15);
+});
+
+test('readTaskUsage falls back to the bare openai-compat usage shape', () => {
+  // A client too old to send the frame field must stay priceable rather than
+  // silently billing the floor.
+  const result = readTaskUsage(
+    undefined,
+    oaiMetadata({ usage: { prompt_tokens: 120, completion_tokens: 30, model: 'sonnet' } }),
+  );
+  assert.equal(result.source, 'openai-compat');
+  assert.deepEqual(result.usage, {
     prompt_tokens: 120,
     completion_tokens: 30,
     total_tokens: 150,
@@ -17,98 +52,100 @@ test('readTaskUsage reads the bare {usage} shape plain A2A callers receive', () 
   });
 });
 
-test('readTaskUsage reads the chat_completion envelope shape', () => {
-  // The backends switch to this shape when the caller activated the
-  // openai-compat extension; both must price identically.
-  const usage = readTaskUsage({
-    [OPENAI_COMPAT_EXTENSION_URI]: {
+test('readTaskUsage falls back to the chat_completion envelope shape', () => {
+  const result = readTaskUsage(
+    undefined,
+    oaiMetadata({
       chat_completion: {
         id: 'chatcmpl-x',
         usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
       },
-    },
+    }),
+  );
+  assert.equal(result.source, 'openai-compat');
+  assert.deepEqual(result.usage, {
+    prompt_tokens: 10,
+    completion_tokens: 5,
+    total_tokens: 15,
   });
-  assert.deepEqual(usage, { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
-});
-
-test('readTaskUsage extracts cached and model details', () => {
-  const usage = readTaskUsage({
-    [OPENAI_COMPAT_EXTENSION_URI]: {
-      usage: {
-        prompt_tokens: 1000,
-        completion_tokens: 100,
-        total_tokens: 1100,
-        prompt_tokens_details: { cached_tokens: 900 },
-        completion_tokens_details: { reasoning_tokens: 40 },
-        model: 'claude-sonnet-4',
-      },
-    },
-  });
-  assert.equal(usage?.cached_tokens, 900);
-  assert.equal(usage?.model, 'claude-sonnet-4');
 });
 
 test('readTaskUsage recomputes the total rather than trusting the reported one', () => {
-  // The charge is derived from prompt + completion, so a backend that
-  // miscomputed `total_tokens` must not be able to move the price.
-  const usage = readTaskUsage({
-    [OPENAI_COMPAT_EXTENSION_URI]: {
-      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 99999 },
-    },
-  });
-  assert.equal(usage?.total_tokens, 15);
+  // The charge derives from prompt + completion, so a backend that
+  // miscomputed the total must not be able to move the price.
+  const result = readTaskUsage(
+    undefined,
+    oaiMetadata({ usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 99999 } }),
+  );
+  assert.equal(result.usage?.total_tokens, 15);
 });
 
 test('readTaskUsage drops an incoherent cache count instead of discounting on it', () => {
-  // cached_tokens is a breakdown of prompt_tokens; a larger value is
-  // nonsense, and honouring it would discount tokens that were never cached.
-  const usage = readTaskUsage({
-    [OPENAI_COMPAT_EXTENSION_URI]: {
+  // cached is a breakdown of prompt; a larger value would discount tokens
+  // that were never cached.
+  const fromProtocol = readTaskUsage(
+    { promptTokens: 100, completionTokens: 0, cachedInputTokens: 5000 },
+    undefined,
+  );
+  assert.equal(fromProtocol.usage?.cached_tokens, undefined);
+  assert.equal(fromProtocol.usage?.prompt_tokens, 100);
+
+  const fromLegacy = readTaskUsage(
+    undefined,
+    oaiMetadata({
       usage: {
         prompt_tokens: 100,
         completion_tokens: 0,
-        total_tokens: 100,
         prompt_tokens_details: { cached_tokens: 5000 },
       },
-    },
-  });
-  assert.equal(usage?.cached_tokens, undefined);
-  assert.equal(usage?.prompt_tokens, 100);
+    }),
+  );
+  assert.equal(fromLegacy.usage?.cached_tokens, undefined);
 });
 
-test('readTaskUsage returns undefined when there is nothing usable', () => {
-  assert.equal(readTaskUsage(undefined), undefined);
-  assert.equal(readTaskUsage({}), undefined);
-  assert.equal(readTaskUsage({ [OPENAI_COMPAT_EXTENSION_URI]: {} }), undefined);
-  // Missing required counts, negative, and non-integer values are all
-  // unusable — better to report "unpriceable" than to invent a number.
+test('readTaskUsage reports nothing usable as undefined with no source', () => {
+  const nothing = readTaskUsage(undefined, undefined);
+  assert.equal(nothing.usage, undefined);
+  assert.equal(nothing.source, undefined);
+
+  assert.equal(readTaskUsage(undefined, {}).usage, undefined);
+  assert.equal(readTaskUsage(undefined, oaiMetadata({})).usage, undefined);
   assert.equal(
-    readTaskUsage({ [OPENAI_COMPAT_EXTENSION_URI]: { usage: { prompt_tokens: 10 } } }),
+    readTaskUsage(undefined, oaiMetadata({ usage: { prompt_tokens: 10 } })).usage,
     undefined,
   );
   assert.equal(
-    readTaskUsage({
-      [OPENAI_COMPAT_EXTENSION_URI]: { usage: { prompt_tokens: -1, completion_tokens: 5 } },
-    }),
+    readTaskUsage(undefined, oaiMetadata({ usage: { prompt_tokens: -1, completion_tokens: 5 } }))
+      .usage,
     undefined,
   );
   assert.equal(
-    readTaskUsage({
-      [OPENAI_COMPAT_EXTENSION_URI]: { usage: { prompt_tokens: 1.5, completion_tokens: 5 } },
-    }),
+    readTaskUsage(undefined, oaiMetadata({ usage: { prompt_tokens: 1.5, completion_tokens: 5 } }))
+      .usage,
     undefined,
   );
 });
 
-test('readTaskUsage surfaces the {0,0,0} placeholder as zero, not as absent', () => {
-  // codex emits this when its runtime dropped accounting. It must reach
-  // `meterUsage` as a real zero so that path is logged as unpriceable rather
-  // than silently priced — the two are handled identically there, but the
-  // reader must not paper over the difference here.
-  const usage = readTaskUsage({
-    [OPENAI_COMPAT_EXTENSION_URI]: {
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    },
+test('a malformed protocol field falls through to the legacy source', () => {
+  // Rather than treating a broken frame as "unpriceable" while a perfectly
+  // good legacy value sits right there.
+  const result = readTaskUsage(
+    { promptTokens: -1, completionTokens: 5 } as unknown as WireTaskUsage,
+    oaiMetadata({ usage: { prompt_tokens: 10, completion_tokens: 5 } }),
+  );
+  assert.equal(result.source, 'openai-compat');
+  assert.equal(result.usage?.total_tokens, 15);
+});
+
+test('a zero-token report is surfaced as a real zero, not as absent', () => {
+  // Some runtimes emit {0,0} when their accounting dropped. `meterUsage`
+  // treats that as unpriceable, but the reader must not paper over the
+  // difference between "reported zero" and "reported nothing".
+  const result = readTaskUsage({ promptTokens: 0, completionTokens: 0 }, undefined);
+  assert.equal(result.source, 'protocol');
+  assert.deepEqual(result.usage, {
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
   });
-  assert.deepEqual(usage, { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
 });

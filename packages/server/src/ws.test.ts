@@ -326,6 +326,125 @@ test('task.complete log carries the forwarded heartbeat count, ignoring plain wo
   }
 });
 
+test('task.complete usage lands on the binding before the terminal status is delivered', async () => {
+  // This is the billing input for the x402 `upto` scheme. The executor reads
+  // it off the binding when it consumes the terminal event, so it has to be
+  // set by the time that event is pushed — asserting it from inside the sink
+  // is what pins that ordering.
+  const server = createServer();
+  const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+
+  try {
+    await once(ws, 'open');
+    ws.send(encodeFrame({
+      type: 'hello',
+      version: PROTOCOL_VERSION,
+      agentId: 'agent-1',
+      token: 'token',
+      agentCard: { name: 'agent', version: '0.0.0', protocolVersion: '0.3.0' },
+    }));
+    await waitForAgent(registry, 'agent-1');
+
+    let usageAtTerminal: unknown;
+    const binding = {
+      agentId: 'agent-1',
+      taskId: 'task-usage',
+      contextId: 'ctx-usage',
+      sink: {
+        pushStatus: () => {
+          usageAtTerminal = binding.usage;
+        },
+        pushArtifact: () => {},
+        finish: () => {},
+      },
+    } as Parameters<Registry['bindTask']>[0];
+    registry.bindTask(binding);
+
+    ws.send(encodeFrame({
+      type: 'task.complete',
+      taskId: 'task-usage',
+      status: { state: 'completed', timestamp: '2026-06-18T00:00:00.000Z' },
+      usage: {
+        promptTokens: 1000,
+        completionTokens: 200,
+        cachedInputTokens: 900,
+        model: 'claude-sonnet-4',
+      },
+    }));
+
+    const deadline = Date.now() + 1_000;
+    while (usageAtTerminal === undefined) {
+      assert.ok(Date.now() < deadline, 'timed out waiting for the terminal status');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.deepEqual(usageAtTerminal, {
+      promptTokens: 1000,
+      completionTokens: 200,
+      cachedInputTokens: 900,
+      model: 'claude-sonnet-4',
+    });
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});
+
+test('a task.complete without usage leaves the binding unpriced rather than zeroed', async () => {
+  // Absent must not be normalized into a zero anywhere along the path: the
+  // two mean different things to the meter, and only one of them is free.
+  const server = createServer();
+  const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+
+  try {
+    await once(ws, 'open');
+    ws.send(encodeFrame({
+      type: 'hello',
+      version: PROTOCOL_VERSION,
+      agentId: 'agent-1',
+      token: 'token',
+      agentCard: { name: 'agent', version: '0.0.0', protocolVersion: '0.3.0' },
+    }));
+    await waitForAgent(registry, 'agent-1');
+
+    let delivered = false;
+    const binding = {
+      agentId: 'agent-1',
+      taskId: 'task-nousage',
+      contextId: 'ctx-nousage',
+      sink: {
+        pushStatus: () => {
+          delivered = true;
+        },
+        pushArtifact: () => {},
+        finish: () => {},
+      },
+    } as Parameters<Registry['bindTask']>[0];
+    registry.bindTask(binding);
+
+    ws.send(encodeFrame({
+      type: 'task.complete',
+      taskId: 'task-nousage',
+      status: { state: 'completed', timestamp: '2026-06-18T00:00:00.000Z' },
+    }));
+
+    const deadline = Date.now() + 1_000;
+    while (!delivered) {
+      assert.ok(Date.now() < deadline, 'timed out waiting for the terminal status');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(binding.usage, undefined);
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});
+
 test('task.status without metadata leaves TaskStatusUpdateEvent.metadata unset', async () => {
   const server = createServer();
   const registry = new Registry();
