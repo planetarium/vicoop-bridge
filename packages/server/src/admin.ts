@@ -3,7 +3,7 @@ import { anthropic } from '@ai-sdk/anthropic';
 import { generateText, tool, stepCountIs, type ModelMessage } from 'ai';
 import { z } from 'zod';
 import {
-  A2XAgent,
+  A2XServer,
   AgentExecutor,
   BaseAgent,
   DefaultRequestHandler,
@@ -483,7 +483,7 @@ const ADMIN_DESCRIPTION =
   'SIWE message at POST /auth/siwe/exchange.';
 
 export function createAdminA2XAgent(opts: AdminAgentOptions): {
-  a2xAgent: A2XAgent;
+  a2xAgent: A2XServer;
   handler: DefaultRequestHandler;
   taskStore: PostgresTaskStore;
 } {
@@ -499,7 +499,7 @@ export function createAdminA2XAgent(opts: AdminAgentOptions): {
   const taskStore = new PostgresTaskStore(opts.db, { persistRequestEnvelope });
   const executor = new AdminA2XExecutor(opts.db, opts.registry, taskStore);
 
-  const a2xAgent = new A2XAgent({
+  const a2xAgent = new A2XServer({
     taskStore,
     executor,
     protocolVersion: '0.3',

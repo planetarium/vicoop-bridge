@@ -8,7 +8,7 @@ import { cors } from 'hono/cors';
 import { sentry } from '@sentry/hono/node';
 import * as Sentry from '@sentry/hono/node';
 import {
-  A2XAgent,
+  A2XServer,
   DefaultRequestHandler,
   type AgentCardV03,
 } from '@a2x/sdk';
@@ -139,7 +139,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
 
   // Per-agent A2XAgent cache. Rebuilds on caller-/agent-change so the
   // card reflects the latest connection state.
-  const agentCache = new Map<string, A2XAgent>();
+  const agentCache = new Map<string, A2XServer>();
   const handlerCache = new Map<string, DefaultRequestHandler>();
 
   // Device flow endpoints (/oauth/device/code, /oauth/token) are only mounted
@@ -152,7 +152,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     deviceFlowEnabled,
   };
 
-  function getAgentForConn(conn: ClientConnection): A2XAgent {
+  function getAgentForConn(conn: ClientConnection): A2XServer {
     const cached = agentCache.get(conn.agentId);
     if (cached) return cached;
     const a2x = buildAgentA2XAgent(conn, adminTaskStore, opts.registry, agentCardOpts);

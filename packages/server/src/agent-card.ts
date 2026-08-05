@@ -1,5 +1,5 @@
 import {
-  A2XAgent,
+  A2XServer,
   HttpBearerAuthorization,
   OAuth2DeviceCodeAuthorization,
   type TaskStore,
@@ -30,7 +30,7 @@ export function buildAgentA2XAgent(
   taskStore: TaskStore,
   registry: Registry,
   opts: AgentA2XOptions,
-): A2XAgent {
+): A2XServer {
   const wire = conn.agentCard;
   const url = opts.publicUrl
     ? `${opts.publicUrl}/agents/${conn.agentId}`
@@ -38,7 +38,7 @@ export function buildAgentA2XAgent(
 
   const executor = new WSForwardingExecutor(conn.agentId, registry, taskStore);
 
-  const a2xAgent = new A2XAgent({
+  const a2xAgent = new A2XServer({
     taskStore,
     executor,
     protocolVersion: '0.3',
