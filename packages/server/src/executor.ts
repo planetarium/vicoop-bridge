@@ -13,10 +13,23 @@ import {
   type TaskStatusUpdateEvent,
   type TaskStore,
 } from '@a2x/sdk';
+import type { X402ValidClassification } from '@a2x/sdk/x402';
 import type { Registry, TaskBinding, TaskSink } from './registry.js';
 import { AsyncEventQueue } from './event-queue.js';
 import { logEvent } from './log.js';
 import { terminalErrorMessageFields } from './terminal-error.js';
+import { X402Gate, createPostgresX402Context } from './x402/gate.js';
+import type { Sql } from './db.js';
+
+/**
+ * What the executor needs to run the x402 payment gate: a DB handle for the
+ * offering store, and the public URL of this agent, which is what the payer
+ * is shown they are paying for.
+ */
+export interface X402ExecutorOptions {
+  sql: Sql;
+  resource: string;
+}
 
 // AgentExecutor's constructor requires a Runner+BaseAgent because Layer 2
 // (the in-process LLM model) is the default. Our WS-forwarding path
@@ -122,17 +135,49 @@ export function appendHistoryMessage(history: Message[], message: Message | unde
  */
 export class WSForwardingExecutor extends AgentExecutor {
   private readonly abortControllers = new Map<string, AbortController>();
+  // Gate for the agent's current pricing, rebuilt when the pricing changes.
+  // Pricing is read from the live `ClientConnection` on every turn rather
+  // than captured here, so an admin repricing an agent takes effect on the
+  // next call instead of on the next reconnect.
+  private gateCache: { key: string; gate: X402Gate } | undefined;
 
   constructor(
     private readonly agentId: string,
     private readonly registry: Registry,
     private readonly taskStore: TaskStore,
     private readonly inactivityTimeoutMs: number = DEFAULT_INACTIVITY_TIMEOUT_MS,
+    // Absent in tests and on deployments without a DB-backed payment path;
+    // the gate is then never installed and every agent is free.
+    private readonly x402: X402ExecutorOptions | undefined = undefined,
   ) {
     super({
       runner: NOOP_RUNNER,
       runConfig: { streamingMode: StreamingMode.SSE },
     });
+  }
+
+  /**
+   * The payment gate for this turn, or `undefined` when the agent is free.
+   */
+  private currentGate(): X402Gate | undefined {
+    if (this.x402 === undefined) return undefined;
+    const pricing = this.registry.getAgent(this.agentId)?.x402Pricing;
+    if (pricing === undefined) {
+      this.gateCache = undefined;
+      return undefined;
+    }
+    const key = JSON.stringify(pricing);
+    if (this.gateCache?.key !== key) {
+      this.gateCache = {
+        key,
+        gate: new X402Gate(
+          this.agentId,
+          pricing,
+          createPostgresX402Context(this.x402.sql, this.agentId),
+        ),
+      };
+    }
+    return this.gateCache.gate;
   }
 
   override async execute(task: Task, message: Message): Promise<Task> {
@@ -145,12 +190,98 @@ export class WSForwardingExecutor extends AgentExecutor {
     return task;
   }
 
+  /**
+   * Charge for a verified payment now that the agent has produced a terminal
+   * event, and fold the outcome into that event.
+   *
+   * Only a `completed` task is settled. An `exact` payment buys delivered
+   * work, so a task that failed or was cancelled leaves the payer's signed
+   * authorization unused — they are never charged for work they didn't get.
+   * A settlement that itself fails replaces the terminal event with a
+   * `failed` one: the merchant wasn't paid, so the call must not report
+   * success.
+   */
+  private async settleTerminal(
+    gate: X402Gate,
+    classified: X402ValidClassification,
+    event: TaskStatusUpdateEvent,
+    taskId: string,
+    contextId: string,
+  ): Promise<TaskStatusUpdateEvent> {
+    if (event.status.state !== TaskState.COMPLETED) {
+      await gate.clear(taskId);
+      return event;
+    }
+
+    const result = await gate.settle({ taskId, contextId, classified });
+    if (result.kind === 'failed') return result.event;
+
+    // Attach the settlement receipt to the final status message, which is
+    // where the x402 transport specifies clients read it from.
+    const existing = event.status.message;
+    return {
+      ...event,
+      status: {
+        ...event.status,
+        message: {
+          ...(existing ?? {
+            messageId: `${taskId}-x402-receipt`,
+            role: 'agent' as const,
+            parts: [],
+            taskId,
+            contextId,
+          }),
+          metadata: { ...(existing?.metadata ?? {}), ...result.metadata },
+        },
+      },
+    };
+  }
+
   override async *executeStream(
     task: Task,
     message: Message,
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     const taskId = task.id;
     const contextId = task.contextId ?? taskId;
+
+    // x402 payment gate. Runs before the task is bound or forwarded, so an
+    // unpaid call never reaches the connected agent and never consumes its
+    // capacity. `settlement` is set only when a payment was verified and is
+    // therefore owed once the work completes.
+    const gate = this.currentGate();
+    let settlement: X402ValidClassification | undefined;
+    if (gate) {
+      const outcome = await gate.open({
+        taskId,
+        contextId,
+        message,
+        resource: this.x402!.resource,
+      });
+      if (outcome.kind === 'halt') {
+        task.status = outcome.event.status;
+        task.history = appendHistoryMessage(
+          appendHistoryMessage(task.history ?? [], message),
+          outcome.event.status.message,
+        );
+        yield outcome.event;
+        // The SDK persists non-terminal statuses mid-stream on the streaming
+        // path but not on `message/send`, so write it here for both. The
+        // resume turn does not depend on this — it reads the offering from
+        // the x402 store — but `tasks/get` should report input-required
+        // rather than the state the task was loaded with.
+        try {
+          await this.taskStore.updateTask(taskId, {
+            status: task.status,
+            history: task.history,
+          });
+        } catch (err) {
+          logEvent('task_persist_error', { taskId, error: String(err) });
+        }
+        return;
+      }
+      settlement = outcome.classified;
+    }
+
     const queue = new AsyncEventQueue<TaskStatusUpdateEvent | TaskArtifactUpdateEvent>();
     const ac = new AbortController();
     this.abortControllers.set(taskId, ac);
@@ -325,18 +456,27 @@ export class WSForwardingExecutor extends AgentExecutor {
         }
         // status event
         if (event.final) sawFinalEvent = true;
-        history = appendHistoryMessage(history, event.status.message);
-        task.history = history;
         if (TERMINAL_STATES.has(event.status.state)) {
+          // Settle before recording anything: a settlement failure replaces
+          // the agent's terminal event outright, and appending the original
+          // first would leave both in history.
+          const terminal =
+            gate && settlement
+              ? await this.settleTerminal(gate, settlement, event, taskId, contextId)
+              : event;
           // Terminal — mutate task in place so the request-handler's
           // post-stream read reflects the final state.
-          task.status = event.status;
+          history = appendHistoryMessage(history, terminal.status.message);
+          task.history = history;
+          task.status = terminal.status;
           if (accumulatedArtifacts.length > 0) {
             task.artifacts = accumulatedArtifacts;
           }
-          yield event;
+          yield terminal;
           break;
         }
+        history = appendHistoryMessage(history, event.status.message);
+        task.history = history;
         yield event;
       }
       // Stop the watchdog before the awaited persist below — the stream is done

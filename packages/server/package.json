@@ -21,6 +21,8 @@
     "@sentry/hono": "^10.57.0",
     "@sentry/node": "^10.57.0",
     "@vicoop-bridge/protocol": "workspace:*",
+    "@x402/core": "^2.21.0",
+    "@x402/evm": "^2.21.0",
     "ai": "^6.0.162",
     "express": "^5.2.1",
     "google-auth-library": "^10.6.2",
@@ -30,8 +32,8 @@
     "postgres": "^3.4.9",
     "siwe": "^3.0.0",
     "tsx": "^4.19.2",
+    "viem": "^2",
     "ws": "^8.18.0",
-    "x402": "^1.2.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

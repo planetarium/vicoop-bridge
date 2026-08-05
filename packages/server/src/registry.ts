@@ -4,6 +4,7 @@ import { encodeFrame } from '@vicoop-bridge/protocol';
 import type { TaskArtifactUpdateEvent, TaskStatusUpdateEvent } from '@a2x/sdk';
 import { logEvent, truncate } from './log.js';
 import { terminalErrorMessageFields } from './terminal-error.js';
+import type { X402Pricing } from './x402/pricing.js';
 
 export interface ClientConnection {
   agentId: string;
@@ -17,6 +18,11 @@ export interface ClientConnection {
   backendKind?: string;
   agentCard: AgentCard;
   allowedCallers: string[];
+  // x402 pricing from the agent's DB row, or undefined for a free agent (the
+  // default). DB-sourced, never read off the hello frame: `payTo` names the
+  // wallet that gets paid, so the same trust boundary applies as to
+  // `allowedCallers`.
+  x402Pricing?: X402Pricing;
   ws: WebSocket;
   connectedAt: number;
 }

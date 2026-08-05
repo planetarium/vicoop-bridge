@@ -66,3 +66,4 @@ authoring or cleaning up changesets.**
 - [`docs/local-testing.md`](./docs/local-testing.md), [`docs/remote-testing.md`](./docs/remote-testing.md) — testing flows
 - [`docs/claude-e2e.md`](./docs/claude-e2e.md), [`docs/openclaw-e2e.md`](./docs/openclaw-e2e.md) — backend-specific E2E
 - [`docs/container.md`](./docs/container.md) — container runtime profiles (bundled-direct + external-runtime)
+- [`docs/x402-payments.md`](./docs/x402-payments.md) — per-agent x402 pricing, the payment round-trip, and settlement

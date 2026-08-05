@@ -150,6 +150,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   const agentCardOpts: AgentA2XOptions = {
     publicUrl: opts.publicUrl,
     deviceFlowEnabled,
+    db: opts.db,
   };
 
   function getAgentForConn(conn: ClientConnection): A2XServer {

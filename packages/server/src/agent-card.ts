@@ -7,10 +7,15 @@ import {
 import { SIWE_BEARER_AUTH_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import type { ClientConnection, Registry } from './registry.js';
 import { WSForwardingExecutor } from './executor.js';
+import { X402_FOUNDATION_EXTENSION_URI } from './x402/gate.js';
+import type { Sql } from './db.js';
 
 export interface AgentA2XOptions {
   publicUrl: string | undefined;
   deviceFlowEnabled: boolean;
+  // DB handle for the x402 offering store. Absent on deployments assembled
+  // without a payment path; the executor then never installs the gate.
+  db?: Sql;
 }
 
 /**
@@ -36,7 +41,13 @@ export function buildAgentA2XServer(
     ? `${opts.publicUrl}/agents/${conn.agentId}`
     : `/agents/${conn.agentId}`;
 
-  const executor = new WSForwardingExecutor(conn.agentId, registry, taskStore);
+  const executor = new WSForwardingExecutor(
+    conn.agentId,
+    registry,
+    taskStore,
+    undefined,
+    opts.db ? { sql: opts.db, resource: url } : undefined,
+  );
 
   const a2xServer = new A2XServer({
     taskStore,
@@ -115,6 +126,32 @@ export function buildAgentA2XServer(
           mintToken: `a2a-wallet siwe auth --domain ${siweDomain} --uri ${opts.publicUrl} --ttl 1h --json | jq -r '.token'`,
           sendMessage: `a2a-wallet a2a send --bearer "$TOKEN" ${opts.publicUrl}/agents/${conn.agentId}/.well-known/agent-card.json "Hello"`,
         },
+      },
+    });
+  }
+
+  // Advertise x402 when this agent charges. The bridge owns this
+  // advertisement for the same reason it owns the SIWE one: it is the only
+  // side that knows whether a payment gate is actually installed, and pricing
+  // is DB-owned rather than declared by the connecting client.
+  //
+  // `required: false` — a caller that cannot pay still gets a well-formed
+  // `input-required` response naming the price, which is more useful than
+  // being refused at extension activation. `params` mirrors the offering so a
+  // client can decide whether it is willing to pay before spending a turn.
+  if (conn.x402Pricing) {
+    const pricing = conn.x402Pricing;
+    a2xServer.addExtension({
+      uri: X402_FOUNDATION_EXTENSION_URI,
+      description:
+        'x402 payments. Calls are answered with an input-required task carrying x402.payment.required; sign the payload and resubmit against the same taskId.',
+      required: false,
+      params: {
+        network: pricing.network,
+        amount: pricing.amount,
+        asset: pricing.asset,
+        payTo: pricing.payTo,
+        scheme: 'exact',
       },
     });
   }

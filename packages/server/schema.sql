@@ -262,6 +262,17 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS owner_email TEXT;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS client_id TEXT UNIQUE DEFAULT gen_random_uuid()::text;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS allowed_callers TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+-- x402 pricing for this agent, or NULL for a free agent (the default).
+-- Shape is validated in the server by `X402PricingSchema`
+-- (src/x402/pricing.ts): { network, amount, asset, payTo, description?, extra? }.
+-- Kept JSONB rather than columns because the offering shape follows the x402
+-- spec, which adds scheme-specific fields (`extra`, and the `upto` scheme's
+-- facilitatorAddress) that would otherwise be a column migration each time.
+--
+-- Writable only through the admin API, never through GraphQL: `payTo` decides
+-- who receives money, so it gets the same DB-owned trust boundary as
+-- allowed_callers.
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS x402_pricing JSONB;
 -- See clients.revoked drop note above. Agents was the shadow column.
 ALTER TABLE agents DROP COLUMN IF EXISTS revoked;
 UPDATE agents SET client_id = gen_random_uuid()::text WHERE client_id IS NULL;
@@ -297,6 +308,10 @@ CREATE POLICY agents_postgraphile ON agents
   WITH CHECK (true);
 
 COMMENT ON COLUMN agents.token_hash IS E'@omit';
+-- Readable (an owner should see what their agent charges) but never writable
+-- through GraphQL — the admin API is the only write path, mirroring
+-- agent_policies.allowed_callers.
+COMMENT ON COLUMN agents.x402_pricing IS E'@omit create,update';
 -- Mirrors `clients`: token_hash is server-managed (no create), and the
 -- semantic delete path is `delete_client(TEXT)` which removes both the
 -- agents row and the legacy clients row in one transaction. Letting
@@ -866,6 +881,55 @@ CREATE POLICY used_siwe_nonces_postgraphile ON used_siwe_nonces
   FOR ALL TO app_postgraphile USING (true) WITH CHECK (true);
 
 COMMENT ON TABLE used_siwe_nonces IS E'@omit';
+
+-- ============================================================
+-- 6c. x402 payment offerings
+-- ============================================================
+-- One row per x402 payment round-trip, keyed by the A2A task it gates.
+-- Backs `PostgresX402Store` (src/x402/store.ts), which implements the SDK's
+-- `BaseX402Store`.
+--
+-- Why this must be in Postgres and not in process memory: the round-trip
+-- spans two HTTP requests — turn 1 advertises the offering and answers
+-- `input-required`, turn 2 carries the signed payload — and the bridge runs
+-- several Fly instances behind a load balancer. Turn 2 regularly lands on an
+-- instance that never saw turn 1. With an in-memory store that reads as "no
+-- offering for this task" and the payment is refused (the payer is not
+-- charged, but the call fails). Restarts do the same to a single instance.
+--
+-- `entry` is the SDK's `X402StoreEntry` verbatim — the advertised offering,
+-- lifecycle status, and, once settled, the receipt (tx hash, payer, amount).
+-- It is the audit record of what was charged, so rows outlive the task only
+-- until it terminates, at which point `clearOffering` deletes them.
+--
+-- `expires_at` is duplicated out of `entry` so expiry is a WHERE clause: the
+-- store contract requires `get` to return nothing past the deadline, and a
+-- filtered read satisfies it lazily, with no background reaper.
+CREATE TABLE IF NOT EXISTS x402_offerings (
+  task_id     TEXT PRIMARY KEY,
+  agent_id    TEXT NOT NULL,
+  entry       JSONB NOT NULL,
+  expires_at  TIMESTAMPTZ,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Supports the expiry sweep and per-agent operational queries.
+CREATE INDEX IF NOT EXISTS x402_offerings_expires_idx
+  ON x402_offerings(expires_at);
+CREATE INDEX IF NOT EXISTS x402_offerings_agent_idx
+  ON x402_offerings(agent_id);
+
+ALTER TABLE x402_offerings ENABLE ROW LEVEL SECURITY;
+
+-- Server-only, like `callers` and `device_sessions`: the row holds in-flight
+-- payment state that no GraphQL consumer should read or write, so it gets the
+-- app_postgraphile bypass alone and no app_authenticated policies.
+DROP POLICY IF EXISTS x402_offerings_postgraphile ON x402_offerings;
+CREATE POLICY x402_offerings_postgraphile ON x402_offerings
+  FOR ALL TO app_postgraphile USING (true) WITH CHECK (true);
+
+COMMENT ON TABLE x402_offerings IS E'@omit';
 
 -- ============================================================
 -- 7. Grants
