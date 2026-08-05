@@ -9,7 +9,12 @@ import type { Registry } from './registry.js';
 import { validatePrincipal } from './auth/principal.js';
 import { generateApiKeyId, issueSessionToken } from './auth/caller-token.js';
 import { isAdmin } from './admin-scope.js';
-import { X402PricingSchema, parseX402Pricing, type X402Pricing } from './x402/pricing.js';
+import {
+  X402PricingWriteSchema,
+  formatPricingError,
+  parseX402Pricing,
+  type X402Pricing,
+} from './x402/pricing.js';
 
 type Tx = postgres.TransactionSql;
 
@@ -268,11 +273,14 @@ export async function setX402Pricing(
   agentId: string,
   pricing: unknown,
 ): Promise<X402PricingResult> {
+  // The strict schema: an unrecognized key fails here rather than being
+  // dropped. Every optional field on a pricing object changes what is
+  // charged, so a silently-ignored typo is a silently-wrong price.
   let parsed: X402Pricing;
   try {
-    parsed = X402PricingSchema.parse(pricing);
+    parsed = X402PricingWriteSchema.parse(pricing);
   } catch (err) {
-    throw new AdminApiError(`Invalid x402 pricing: ${String(err)}`, 400);
+    throw new AdminApiError(`Invalid x402 pricing: ${formatPricingError(err)}`, 400);
   }
 
   const rows = await db.begin(async (tx) => {

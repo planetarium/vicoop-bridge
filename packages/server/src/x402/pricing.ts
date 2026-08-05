@@ -79,16 +79,51 @@ const UptoPricingSchema = z.object({
   facilitatorAddress: EvmAddress,
 });
 
-/**
- * Pricing as stored. `scheme` defaults to `exact` so the common flat-fee row
- * stays a four-field object.
- */
-export const X402PricingSchema = z.preprocess((raw) => {
+// `scheme` defaults to `exact` so the common flat-fee row stays a four-field
+// object.
+function withSchemeDefault(raw: unknown): unknown {
   if (typeof raw === 'object' && raw !== null && !Array.isArray(raw) && !('scheme' in raw)) {
     return { ...(raw as Record<string, unknown>), scheme: 'exact' };
   }
   return raw;
-}, z.discriminatedUnion('scheme', [ExactPricingSchema, UptoPricingSchema]));
+}
+
+/**
+ * Pricing as **read** from storage. Unknown keys are dropped rather than
+ * rejected, on purpose: a row written by a newer server (a field this build
+ * doesn't know yet) must still price correctly here. Rejecting it would make
+ * `parseX402Pricing` throw, which downgrades the agent to free — a rollback
+ * would quietly stop charging for every paid agent.
+ */
+export const X402PricingSchema = z.preprocess(
+  withSchemeDefault,
+  z.discriminatedUnion('scheme', [ExactPricingSchema, UptoPricingSchema]),
+);
+
+/**
+ * Pricing as **written** through the admin API. Strict: an unrecognized key
+ * is an error, not something to drop silently.
+ *
+ * The asymmetry with the read schema is deliberate. Every field here is
+ * optional-with-a-consequential-default, so a typo does not fail — it changes
+ * the price. `minamount` instead of `minAmount` leaves the floor unset, which
+ * makes every call the backend cannot meter free. `cachedinput` instead of
+ * `cachedInput` charges cache reads at the full input rate, overcharging the
+ * payer. Both would return 200 under the lenient schema, and the operator
+ * would find out from an invoice. Writes are the one place where the caller
+ * is present to be told, so they are told.
+ */
+export const X402PricingWriteSchema = z.preprocess(
+  withSchemeDefault,
+  z.discriminatedUnion('scheme', [
+    ExactPricingSchema.strict(),
+    // `.strict()` only guards the level it is applied to, so the nested rate
+    // table needs its own — that is where two of the three typo-able optional
+    // fields live. `extra` stays a free-form record by design: it is a
+    // passthrough for scheme-specific fields the SDK owns.
+    UptoPricingSchema.extend({ rates: RatesSchema.strict() }).strict(),
+  ]),
+);
 
 export type X402Pricing = z.infer<typeof X402PricingSchema>;
 export type X402ExactPricing = z.infer<typeof ExactPricingSchema>;
@@ -102,6 +137,22 @@ export type X402UptoPricing = z.infer<typeof UptoPricingSchema>;
 export function parseX402Pricing(raw: unknown): X402Pricing | undefined {
   if (raw === null || raw === undefined) return undefined;
   return X402PricingSchema.parse(raw);
+}
+
+/**
+ * Render a validation failure as one line an operator can act on.
+ *
+ * `String(zodError)` is a multi-line JSON dump that reaches the CLI as a wall
+ * of text; the field path and the reason are the only parts that matter.
+ */
+export function formatPricingError(err: unknown): string {
+  if (!(err instanceof z.ZodError)) return String(err);
+  return err.issues
+    .map((issue) => {
+      const path = issue.path.join('.');
+      return path ? `${path}: ${issue.message}` : issue.message;
+    })
+    .join('; ');
 }
 
 /**

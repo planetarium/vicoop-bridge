@@ -908,6 +908,10 @@ test(
         { ...EXACT_PRICING, amount: '0.01' },
         { ...EXACT_PRICING, amount: 10000 },
         { ...EXACT_PRICING, scheme: 'upto' }, // upto needs rates + facilitator
+        // A typo'd optional field must fail rather than be dropped: every
+        // optional field here changes what is charged, so silently ignoring
+        // one is a silently-wrong price.
+        { ...EXACT_PRICING, amout: '10000' },
       ]) {
         const res = await app.request(`/admin-api/agents/${setup.agentId}/x402`, {
           method: 'PUT',
@@ -921,6 +925,47 @@ test(
         SELECT x402_pricing FROM agents WHERE id = ${setup.agentId}
       `;
       assert.equal(rows[0]!.x402_pricing, null, 'no rejected value should have been persisted');
+    } finally {
+      if (setup) await teardown(sql, owner, setup.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'a typo in a metered pricing field is rejected by name, not silently dropped',
+  { skip: !hasDb },
+  async () => {
+    // `minamount` would leave the floor unset, which makes every call the
+    // backend cannot meter free. The operator is present at write time, so
+    // this is the one chance to tell them.
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'3'.repeat(40)}`;
+    let setup: SetupResult | null = null;
+    try {
+      setup = await setupOwner(sql, owner);
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+
+      const res = await app.request(`/admin-api/agents/${setup.agentId}/x402`, {
+        method: 'PUT',
+        headers: { ...authHeaders(setup.ownerToken), 'content-type': 'application/json' },
+        body: JSON.stringify({
+          scheme: 'upto',
+          network: 'eip155:84532',
+          asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+          payTo: '0x1111111111111111111111111111111111111111',
+          facilitatorAddress: '0x3333333333333333333333333333333333333333',
+          maxAmount: '1000000',
+          minamount: '1000',
+          rates: { input: '3000000', output: '15000000' },
+        }),
+      });
+
+      assert.equal(res.status, 400);
+      const body = (await res.json()) as { error: string };
+      assert.match(body.error, /minamount/, 'the message must name the offending key');
+      assert.equal(body.error.includes('\n'), false, 'must stay one line for the CLI');
     } finally {
       if (setup) await teardown(sql, owner, setup.clientId);
       await sql.end();

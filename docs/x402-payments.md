@@ -86,10 +86,21 @@ vicoop-client agent x402 clear <AGENT_ID>
 ```
 
 These call `GET`/`PUT`/`DELETE /admin-api/agents/:id/x402`. The body is
-validated server-side against the same schema the payment gate uses, so a bad
-address or a dollars-instead-of-atomic amount is rejected at write time rather
-than silently disabling payments at the agent's next connect. Changes are
-hot-reloaded — no daemon restart, no reconnect.
+validated server-side, so a bad address or a dollars-instead-of-atomic amount
+is rejected at write time rather than silently disabling payments at the
+agent's next connect. Changes are hot-reloaded — no daemon restart, no
+reconnect.
+
+**Writes reject unrecognized keys.** Every optional field here changes what is
+charged, so a dropped typo is a wrong price rather than a no-op: `minamount`
+would leave the floor unset and make unmeterable calls free, `cachedinput`
+would charge cache reads at the full input rate. Both fail with a 400 naming
+the key.
+
+Reads are deliberately lenient about the same thing — a row written by a newer
+server must keep pricing correctly on an older one. Rejecting it would make
+the agent connect as free, so a rollback would quietly stop charging for every
+paid agent.
 
 Note the auth boundary: these take the **owner-session** bearer, not the agent
 token. A stolen agent token can impersonate the agent but cannot reprice it or

@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  X402PricingSchema,
+  X402PricingWriteSchema,
+  formatPricingError,
   meterUsage,
   parseX402Pricing,
   pricingToAccepts,
@@ -200,6 +203,85 @@ test('meterUsage treats missing or zero usage as unpriceable, not free', () => {
     const withFloor = meterUsage(upto({ minAmount: '25000' }), usage);
     assert.equal(withFloor.basis, 'no-usage');
     assert.equal(withFloor.amountAtomic, '25000');
+  }
+});
+
+// ── write-time strictness ─────────────────────────────────────────────────
+//
+// Every optional field on a pricing object changes what is charged, so a
+// dropped typo is a wrong price rather than a no-op. The write path rejects
+// unknown keys; the read path still drops them, so a row written by a newer
+// server keeps pricing correctly after a rollback instead of silently
+// downgrading the agent to free.
+
+test('the write schema rejects a typo in the floor instead of dropping it', () => {
+  // `minamount` would leave minAmount unset, making every call the backend
+  // cannot meter free — the exact footgun the docs warn about.
+  const typo = { ...UPTO, minamount: '1000' };
+  assert.throws(() => X402PricingWriteSchema.parse(typo), /minamount/);
+
+  // The read path still tolerates it, and drops it.
+  const read = X402PricingSchema.parse(typo) as X402UptoPricing;
+  assert.equal(read.minAmount, undefined);
+});
+
+test('the write schema rejects a typo in the nested rate table', () => {
+  // `.strict()` guards one level, so the nested rates object needs its own —
+  // `cachedinput` would charge cache reads at the full input rate.
+  assert.throws(
+    () =>
+      X402PricingWriteSchema.parse({
+        ...UPTO,
+        rates: { input: '3000000', output: '15000000', cachedinput: '300000' },
+      }),
+    /cachedinput/,
+  );
+});
+
+test('the write schema rejects an unknown key on exact pricing too', () => {
+  assert.throws(() => X402PricingWriteSchema.parse({ ...VALID, amout: '10000' }), /amout/);
+});
+
+test('the write schema still accepts every documented field', () => {
+  assert.doesNotThrow(() =>
+    X402PricingWriteSchema.parse({
+      ...UPTO,
+      minAmount: '1000',
+      description: 'Metered research',
+      rates: { input: '3000000', output: '15000000', cachedInput: '300000' },
+    }),
+  );
+  assert.doesNotThrow(() => X402PricingWriteSchema.parse(VALID));
+  assert.doesNotThrow(() => X402PricingWriteSchema.parse({ ...VALID, scheme: 'exact' }));
+});
+
+test('the write schema leaves `extra` free-form', () => {
+  // It is a passthrough for scheme-specific fields the SDK owns (the EIP-712
+  // domain), so strictness must not reach inside it.
+  assert.doesNotThrow(() =>
+    X402PricingWriteSchema.parse({
+      ...VALID,
+      extra: { name: 'USD Coin', version: '2', somethingNew: true },
+    }),
+  );
+});
+
+test('the read schema tolerates a field a newer server wrote', () => {
+  // Rejecting would make parseX402Pricing throw, which connects the agent as
+  // free — a rollback would quietly stop charging for every paid agent.
+  const fromFuture = { ...UPTO, chargeSource: 'client' };
+  assert.doesNotThrow(() => X402PricingSchema.parse(fromFuture));
+  assert.equal((X402PricingSchema.parse(fromFuture) as X402UptoPricing).maxAmount, '1000000');
+});
+
+test('formatPricingError names the offending field on one line', () => {
+  try {
+    X402PricingWriteSchema.parse({ ...UPTO, minamount: '1000' });
+    assert.fail('expected a validation error');
+  } catch (err) {
+    const message = formatPricingError(err);
+    assert.match(message, /minamount/);
+    assert.equal(message.includes('\n'), false, 'must stay a single line for the CLI');
   }
 });
 
