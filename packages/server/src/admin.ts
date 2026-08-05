@@ -482,8 +482,8 @@ const ADMIN_DESCRIPTION =
   'opaque caller token (vbc_caller_*) tied to a wallet principal; obtain one by signing a ' +
   'SIWE message at POST /auth/siwe/exchange.';
 
-export function createAdminA2XAgent(opts: AdminAgentOptions): {
-  a2xAgent: A2XServer;
+export function createAdminA2XServer(opts: AdminAgentOptions): {
+  a2xServer: A2XServer;
   handler: DefaultRequestHandler;
   taskStore: PostgresTaskStore;
 } {
@@ -492,14 +492,14 @@ export function createAdminA2XAgent(opts: AdminAgentOptions): {
   // instead of stripping it (the lean post-#409 default). Left on it re-creates
   // the #408 growth, so it is an on-demand debugging toggle, not a steady state.
   // This store is shared by the admin agent and every WS-forwarding agent (see
-  // buildAgentA2XAgent in http.tsx), so the flag governs all persisted tasks.
+  // buildAgentA2XServer in http.tsx), so the flag governs all persisted tasks.
   const persistRequestEnvelope = parsePersistRequestEnvelope(
     process.env.A2A_PERSIST_REQUEST_ENVELOPE,
   );
   const taskStore = new PostgresTaskStore(opts.db, { persistRequestEnvelope });
   const executor = new AdminA2XExecutor(opts.db, opts.registry, taskStore);
 
-  const a2xAgent = new A2XServer({
+  const a2xServer = new A2XServer({
     taskStore,
     executor,
     protocolVersion: '0.3',
@@ -534,6 +534,6 @@ export function createAdminA2XAgent(opts: AdminAgentOptions): {
   // (declarative, for spec-compliant card consumers) but the schemes'
   // `validator` callbacks are never reached at runtime.
 
-  const handler = new DefaultRequestHandler(a2xAgent);
-  return { a2xAgent, handler, taskStore };
+  const handler = new DefaultRequestHandler(a2xServer);
+  return { a2xServer, handler, taskStore };
 }

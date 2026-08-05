@@ -13,7 +13,7 @@ import {
   type AgentCardV03,
 } from '@a2x/sdk';
 import type { ClientConnection, Registry } from './registry.js';
-import { createAdminA2XAgent } from './admin.js';
+import { createAdminA2XServer } from './admin.js';
 import { getAdminWallets, isAdmin } from './admin-scope.js';
 import { requestUsage, UsageRpcError } from './usage-rpc.js';
 import {
@@ -47,7 +47,7 @@ import type { GoogleConfig } from './auth/google-oauth.js';
 import type { Sql } from './db.js';
 import { Landing } from './landing.js';
 import { logEvent } from './log.js';
-import { buildAgentA2XAgent, type AgentA2XOptions } from './agent-card.js';
+import { buildAgentA2XServer, type AgentA2XOptions } from './agent-card.js';
 import {
   buildLandingDirectory,
   mountWellKnown,
@@ -129,15 +129,15 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // (Postgres-backed) for context-aware history loading; client agents
   // share a separate taskStore so their state isn't entangled with the
   // admin's persistence model.
-  const { handler: adminHandler, a2xAgent: adminA2X, taskStore: adminTaskStore } =
-    createAdminA2XAgent({
+  const { handler: adminHandler, a2xServer: adminA2X, taskStore: adminTaskStore } =
+    createAdminA2XServer({
       db: opts.db,
       registry: opts.registry,
       publicUrl: opts.publicUrl,
     });
   const adminCard = adminA2X.getAgentCard() as AgentCardV03;
 
-  // Per-agent A2XAgent cache. Rebuilds on caller-/agent-change so the
+  // Per-agent A2XServer cache. Rebuilds on caller-/agent-change so the
   // card reflects the latest connection state.
   const agentCache = new Map<string, A2XServer>();
   const handlerCache = new Map<string, DefaultRequestHandler>();
@@ -155,7 +155,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   function getAgentForConn(conn: ClientConnection): A2XServer {
     const cached = agentCache.get(conn.agentId);
     if (cached) return cached;
-    const a2x = buildAgentA2XAgent(conn, adminTaskStore, opts.registry, agentCardOpts);
+    const a2x = buildAgentA2XServer(conn, adminTaskStore, opts.registry, agentCardOpts);
     agentCache.set(conn.agentId, a2x);
     return a2x;
   }
@@ -168,7 +168,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     return handler;
   }
 
-  // Invalidate cached A2XAgent + handler when allowedCallers changes so
+  // Invalidate cached A2XServer + handler when allowedCallers changes so
   // the rendered card reflects the updated security fields.
   opts.registry.onCallerChange((agentId) => {
     agentCache.delete(agentId);
