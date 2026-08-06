@@ -12,7 +12,7 @@ import {
   type X402VerifyResponse,
   type X402FacilitatorSettleResponse,
 } from '@a2x/sdk/x402';
-import { X402Gate, type X402OfferingSidecar } from './gate.js';
+import { X402Gate, type X402GateOutcome, type X402OfferingSidecar } from './gate.js';
 import { parseX402Pricing, type X402Pricing } from './pricing.js';
 import type { TaskUsage } from './usage.js';
 
@@ -222,9 +222,18 @@ test('turn 2 with a valid signed payload verifies and proceeds', async () => {
   });
 
   assert.equal(second.kind, 'proceed');
+  if (second.kind !== 'proceed') return;
   assert.equal(facilitator.verifyCalls, 1);
-  // Verification alone must not move money — settlement waits for the work.
-  assert.equal(facilitator.settleCalls, 0);
+  // Flat-fee agents charge here, before the caller's work is forwarded — the
+  // amount was fixed at offer time, so there is nothing to learn by doing the
+  // work first.
+  assert.equal(facilitator.settleCalls, 1);
+  assert.equal(second.settlement?.mode, 'settled');
+  if (second.settlement?.mode !== 'settled') return;
+  const receipts = second.settlement.metadata[X402_METADATA_KEYS.RECEIPTS] as {
+    transaction: string;
+  }[];
+  assert.equal(receipts[0]!.transaction, '0xdeadbeef');
 });
 
 test('a submission whose taskId was never offered is refused', async () => {
@@ -351,112 +360,67 @@ test('a store or facilitator error fails closed instead of serving the call free
   assert.equal(outcome.event.status.state, TaskState.FAILED);
 });
 
-test('settle attaches the receipt metadata on success', async () => {
-  const facilitator = stubFacilitator();
+/** Turn 1 then turn 2 for a flat-fee agent, returning turn 2's outcome. */
+async function exactTurnTwo(
+  facilitator: X402Facilitator,
+  taskId: string,
+): Promise<X402GateOutcome> {
   const gate = makeGate(facilitator);
-
   const first = await gate.open({
-    taskId: 't-6',
-    contextId: 'ctx-6',
+    taskId,
+    contextId: `ctx-${taskId}`,
     message: userMessage(),
     resource: RESOURCE,
   });
   assert.equal(first.kind, 'halt');
-  if (first.kind !== 'halt') return;
-
-  const second = await gate.open({
-    taskId: 't-6',
-    contextId: 'ctx-6',
+  if (first.kind !== 'halt') throw new Error('unreachable');
+  return gate.open({
+    taskId,
+    contextId: `ctx-${taskId}`,
     message: submissionMessage(offeredRequirement(first.event)),
     resource: RESOURCE,
   });
-  assert.equal(second.kind, 'proceed');
-  if (second.kind !== 'proceed' || !second.classified) return;
+}
 
-  const result = await gate.settle({
-    taskId: 't-6',
-    contextId: 'ctx-6',
-    classified: second.classified,
-    pricing: second.pricing!,
-  });
+test('a flat fee settles before the work and hands back the receipt', async () => {
+  const facilitator = stubFacilitator();
+  const outcome = await exactTurnTwo(facilitator, 't-6');
 
-  assert.equal(result.kind, 'settled');
-  if (result.kind !== 'settled') return;
-  assert.equal(result.metadata[X402_METADATA_KEYS.STATUS], X402_PAYMENT_STATUS.COMPLETED);
-  const receipts = result.metadata[X402_METADATA_KEYS.RECEIPTS] as { transaction: string }[];
+  assert.equal(outcome.kind, 'proceed');
+  if (outcome.kind !== 'proceed' || outcome.settlement?.mode !== 'settled') return;
+  assert.equal(
+    outcome.settlement.metadata[X402_METADATA_KEYS.STATUS],
+    X402_PAYMENT_STATUS.COMPLETED,
+  );
+  const receipts = outcome.settlement.metadata[X402_METADATA_KEYS.RECEIPTS] as {
+    transaction: string;
+  }[];
   assert.equal(receipts[0]!.transaction, '0xdeadbeef');
   assert.equal(facilitator.settleCalls, 1);
 });
 
-test('a failed settlement replaces the terminal event so the task cannot report success', async () => {
+test('a flat fee that cannot be collected never reaches the agent', async () => {
+  // The point of settling first: a drained authorization costs the merchant
+  // nothing, because the work has not been done yet. Under the previous
+  // settle-after-work order this same failure meant the caller kept the output.
   const facilitator = stubFacilitator({
     settle: { success: false, errorReason: 'INSUFFICIENT_FUNDS' },
   });
-  const gate = makeGate(facilitator);
+  const outcome = await exactTurnTwo(facilitator, 't-7');
 
-  const first = await gate.open({
-    taskId: 't-7',
-    contextId: 'ctx-7',
-    message: userMessage(),
-    resource: RESOURCE,
-  });
-  assert.equal(first.kind, 'halt');
-  if (first.kind !== 'halt') return;
-
-  const second = await gate.open({
-    taskId: 't-7',
-    contextId: 'ctx-7',
-    message: submissionMessage(offeredRequirement(first.event)),
-    resource: RESOURCE,
-  });
-  assert.equal(second.kind, 'proceed');
-  if (second.kind !== 'proceed' || !second.classified) return;
-
-  const result = await gate.settle({
-    taskId: 't-7',
-    contextId: 'ctx-7',
-    classified: second.classified,
-    pricing: second.pricing!,
-  });
-
-  assert.equal(result.kind, 'failed');
-  if (result.kind !== 'failed') return;
-  assert.equal(result.event.status.state, TaskState.FAILED);
+  assert.equal(outcome.kind, 'halt', 'the turn must not proceed to the backend');
+  if (outcome.kind !== 'halt') return;
+  assert.equal(outcome.event.status.state, TaskState.FAILED);
   assert.equal(
-    result.event.status.message?.metadata?.[X402_METADATA_KEYS.STATUS],
+    outcome.event.status.message?.metadata?.[X402_METADATA_KEYS.STATUS],
     X402_PAYMENT_STATUS.FAILED,
   );
 });
 
-test('a throwing settlement is reported as a failure, not propagated', async () => {
+test('a throwing settlement halts the turn rather than propagating', async () => {
   const facilitator = stubFacilitator({ settleThrows: true });
-  const gate = makeGate(facilitator);
-
-  const first = await gate.open({
-    taskId: 't-8',
-    contextId: 'ctx-8',
-    message: userMessage(),
-    resource: RESOURCE,
-  });
-  assert.equal(first.kind, 'halt');
-  if (first.kind !== 'halt') return;
-
-  const second = await gate.open({
-    taskId: 't-8',
-    contextId: 'ctx-8',
-    message: submissionMessage(offeredRequirement(first.event)),
-    resource: RESOURCE,
-  });
-  assert.equal(second.kind, 'proceed');
-  if (second.kind !== 'proceed' || !second.classified) return;
-
-  const result = await gate.settle({
-    taskId: 't-8',
-    contextId: 'ctx-8',
-    classified: second.classified,
-    pricing: second.pricing!,
-  });
-  assert.equal(result.kind, 'failed');
+  const outcome = await exactTurnTwo(facilitator, 't-8');
+  assert.equal(outcome.kind, 'halt');
 });
 
 // ── upto: metered settlement ──────────────────────────────────────────────
@@ -528,9 +492,17 @@ async function uptoVerified(
     resource: RESOURCE,
   });
   assert.equal(second.kind, 'proceed', 'upto submission should verify');
-  if (second.kind !== 'proceed' || !second.classified) throw new Error('unreachable');
-  assert.ok(second.pricing, 'open must hand back the offering pricing snapshot');
-  return { gate, classified: second.classified, pricing: second.pricing };
+  if (second.kind !== 'proceed' || second.settlement?.mode !== 'deferred') {
+    throw new Error('a metered offering must defer settlement until after the work');
+  }
+  // Metered agents must not have moved money yet — the charge does not exist
+  // until the work has been done.
+  assert.equal((facilitator as { settleCalls?: number }).settleCalls, 0);
+  return {
+    gate,
+    classified: second.settlement.classified,
+    pricing: second.settlement.pricing,
+  };
 }
 
 test('an upto offering advertises the ceiling and the facilitator address', async () => {
@@ -662,18 +634,11 @@ test('an exact agent ignores usage and settles the signed amount', async () => {
     message: submissionMessage(offeredRequirement(first.event)),
     resource: RESOURCE,
   });
+  // Settled inside `open`, at the signed amount, with usage nowhere in play —
+  // metering an `exact` requirement throws in the SDK.
   assert.equal(second.kind, 'proceed');
-  if (second.kind !== 'proceed' || !second.classified) return;
-
-  const result = await gate.settle({
-    taskId: 'u-6',
-    contextId: 'ctx-u-6',
-    classified: second.classified,
-    pricing: second.pricing!,
-    usage: { prompt_tokens: 999, completion_tokens: 999, total_tokens: 1998 },
-  });
-
-  assert.equal(result.kind, 'settled');
+  if (second.kind !== 'proceed') return;
+  assert.equal(second.settlement?.mode, 'settled');
   assert.equal(facilitator.settledAmount, '10000');
 });
 
@@ -711,16 +676,18 @@ test('settlement prices from the offering, not from a reprice that landed betwee
     resource: RESOURCE,
   });
   assert.equal(second.kind, 'proceed');
-  if (second.kind !== 'proceed' || !second.classified || !second.pricing) return;
+  if (second.kind !== 'proceed' || second.settlement?.mode !== 'deferred') return;
 
-  // `open` hands back the frozen terms, not what the agent charges now.
-  assert.equal(second.pricing.scheme, 'upto');
+  // `open` hands back the frozen terms, not what the agent charges now — and
+  // defers, because the offering was metered even though the agent is now
+  // flat-fee. Settling here as `exact` would have charged the ceiling.
+  assert.equal(second.settlement.pricing.scheme, 'upto');
 
   await afterReprice.settle({
     taskId: 'reprice',
     contextId: 'ctx-reprice',
-    classified: second.classified,
-    pricing: second.pricing,
+    classified: second.settlement.classified,
+    pricing: second.settlement.pricing,
     usage: { prompt_tokens: 100_000, completion_tokens: 10_000, total_tokens: 110_000 },
   });
 

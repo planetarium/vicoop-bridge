@@ -18,9 +18,8 @@ import type { Registry, TaskBinding, TaskSink } from './registry.js';
 import { AsyncEventQueue } from './event-queue.js';
 import { logEvent } from './log.js';
 import { terminalErrorMessageFields } from './terminal-error.js';
-import { X402Gate, createPostgresX402Context } from './x402/gate.js';
-import { readTaskUsage, type TaskUsage } from './x402/usage.js';
-import type { X402Pricing } from './x402/pricing.js';
+import { X402Gate, createPostgresX402Context, type X402Settlement } from './x402/gate.js';
+import { readTaskUsage } from './x402/usage.js';
 import type { Sql } from './db.js';
 
 /**
@@ -33,18 +32,6 @@ export interface X402ExecutorOptions {
   resource: string;
 }
 
-/**
- * A verified payment awaiting settlement, carried from the gate's `open` to
- * its `settle` within one turn.
- *
- * `pricing` travels with the classification on purpose: it is the offering's
- * frozen terms, and settling from the agent's live pricing instead would meter
- * against terms the payer never signed.
- */
-interface X402Settlement {
-  classified: X402ValidClassification;
-  pricing: X402Pricing;
-}
 
 // AgentExecutor's constructor requires a Runner+BaseAgent because Layer 2
 // (the in-process LLM model) is the default. Our WS-forwarding path
@@ -203,33 +190,28 @@ export class WSForwardingExecutor extends AgentExecutor {
   }
 
   /**
-   * Charge for a verified payment now that the agent has produced a terminal
-   * event, and fold the outcome into that event.
+   * Fold the payment outcome into the agent's terminal event, and release the
+   * offering.
    *
-   * Only a `completed` task is settled. Payment buys delivered work, so a
-   * task that failed or was cancelled leaves the payer's signed
-   * authorization unused — they are never charged for work they didn't get.
-   * A settlement that itself fails replaces the terminal event with a
-   * `failed` one: the merchant wasn't paid, so the call must not report
-   * success.
+   * Which half runs depends on when the scheme could settle:
    *
-   * For a metered (`upto`) agent the charge comes from the token counts the
-   * connected agent reported on its `task.complete` frame, which `ws.ts`
-   * stashes on the binding.
+   * - `settled` (`exact`) — already charged before the agent was contacted.
+   *   Only the receipt is attached here, on success *and* on failure: the
+   *   payer paid either way and the receipt is their proof. A task that fails
+   *   after payment is a real cost to them, which is what
+   *   `x402_paid_task_failed` counts.
+   * - `deferred` (`upto`) — the charge is metered from consumption, which does
+   *   not exist until now, so this is the first moment it can be computed. The
+   *   token counts come from the `task.complete` frame, which `ws.ts` stashes
+   *   on the binding.
    *
-   * **The output has already reached the caller by the time this runs.**
-   * Artifacts stream out as the agent produces them, and settlement cannot
-   * begin until the work is done — under `upto` there is nothing to meter
-   * before then. So a payer who invalidates their authorization between
-   * `verify` and here receives the full result and a `failed` status.
-   *
-   * That window is accepted rather than closed. The alternatives are worse:
-   * buffering output until settlement lands would remove streaming from
-   * exactly the agents people pay for, and settling before the work would
-   * charge for tasks that fail — which, on a bridge fronting coding agents
-   * that time out and error, is the far more common case. Undercharging on a
-   * rare adversarial payer beats overcharging on routine failure. The
-   * exposure is one task's work, and `x402_unpaid_delivery` measures it.
+   * Only a completed task is settled under `upto`: a failure leaves the
+   * payer's authorization unused rather than charging for work they did not
+   * get. The corollary is that the output has already streamed to the caller
+   * by the time this runs, so a payer who invalidates their authorization
+   * mid-task receives the result and a `failed` status. `upto` cannot avoid
+   * that — there is nothing to meter before the work — and
+   * `x402_unpaid_delivery` counts it.
    */
   private async settleTerminal(
     gate: X402Gate,
@@ -239,23 +221,33 @@ export class WSForwardingExecutor extends AgentExecutor {
     taskId: string,
     contextId: string,
   ): Promise<TaskStatusUpdateEvent> {
-    if (event.status.state !== TaskState.COMPLETED) {
+    // The offering row outlives the work — under `exact` it holds the claim
+    // that stops a resubmission being charged a second time — so releasing it
+    // is this function's job regardless of which branch runs.
+    const done = async <T>(value: T): Promise<T> => {
       await gate.clear(taskId);
-      return event;
+      return value;
+    };
+
+    if (settlement.mode === 'settled') {
+      if (event.status.state !== TaskState.COMPLETED) {
+        logEvent('x402_paid_task_failed', {
+          agentId: this.agentId,
+          taskId,
+          state: event.status.state,
+        });
+      }
+      return done(this.withReceipt(event, settlement.metadata, taskId, contextId));
     }
 
-    let metered: { usage?: TaskUsage } = {};
-    // Metered-ness comes from the offering's frozen terms, not from what the
-    // agent charges now — the same reason `settle` prices from them.
-    if (settlement.pricing.scheme === 'upto') {
-      const read = readTaskUsage(binding.usage, event.status.message?.metadata);
-      if (read.source === 'openai-compat') {
-        // The client is old enough not to send the protocol field. Billing
-        // still works off the legacy key, but this is the signal to chase the
-        // client upgrade — the fallback is meant to be retired.
-        logEvent('x402_usage_legacy_source', { agentId: this.agentId, taskId });
-      }
-      metered = { usage: read.usage };
+    if (event.status.state !== TaskState.COMPLETED) return done(event);
+
+    const read = readTaskUsage(binding.usage, event.status.message?.metadata);
+    if (read.source === 'openai-compat') {
+      // The client is old enough not to send the protocol field. Billing still
+      // works off the legacy key, but this is the signal to chase the client
+      // upgrade — the fallback is meant to be retired.
+      logEvent('x402_usage_legacy_source', { agentId: this.agentId, taskId });
     }
 
     const result = await gate.settle({
@@ -263,22 +255,28 @@ export class WSForwardingExecutor extends AgentExecutor {
       contextId,
       classified: settlement.classified,
       pricing: settlement.pricing,
-      ...metered,
+      usage: read.usage,
     });
     if (result.kind === 'failed') {
       // The caller already has the output — see the note above. This is the
-      // event that quantifies the accepted window, so it is emitted here
-      // rather than left implicit in the settlement failure.
-      logEvent('x402_unpaid_delivery', {
-        agentId: this.agentId,
-        taskId,
-        artifacts: event.status.message !== undefined ? 1 : 0,
-      });
-      return result.event;
+      // event that quantifies the window, so it is emitted here rather than
+      // left implicit in the settlement failure.
+      logEvent('x402_unpaid_delivery', { agentId: this.agentId, taskId });
+      return done(result.event);
     }
+    return done(this.withReceipt(event, result.metadata, taskId, contextId));
+  }
 
-    // Attach the settlement receipt to the final status message, which is
-    // where the x402 transport specifies clients read it from.
+  /**
+   * Attach settlement metadata to a terminal event's status message, which is
+   * where the x402 transport specifies clients read receipts from.
+   */
+  private withReceipt(
+    event: TaskStatusUpdateEvent,
+    metadata: Record<string, unknown>,
+    taskId: string,
+    contextId: string,
+  ): TaskStatusUpdateEvent {
     const existing = event.status.message;
     return {
       ...event,
@@ -292,7 +290,7 @@ export class WSForwardingExecutor extends AgentExecutor {
             taskId,
             contextId,
           }),
-          metadata: { ...(existing?.metadata ?? {}), ...result.metadata },
+          metadata: { ...(existing?.metadata ?? {}), ...metadata },
         },
       },
     };
@@ -340,10 +338,7 @@ export class WSForwardingExecutor extends AgentExecutor {
         }
         return;
       }
-      settlement =
-        outcome.classified && outcome.pricing
-          ? { classified: outcome.classified, pricing: outcome.pricing }
-          : undefined;
+      settlement = outcome.settlement;
     }
 
     const queue = new AsyncEventQueue<TaskStatusUpdateEvent | TaskArtifactUpdateEvent>();

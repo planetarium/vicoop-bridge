@@ -7,10 +7,10 @@ free and takes no payment code path at all.
 
 Two pricing schemes are supported:
 
-| scheme | what the caller pays | when to use it |
-| --- | --- | --- |
-| `exact` | a flat fee per call, agreed before the work happens | predictable pricing; the only option for backends that can't report token usage |
-| `upto` | the tokens actually consumed, up to a ceiling they authorize | metered LLM access, where a one-line question and a long research task shouldn't cost the same |
+| scheme | what the caller pays | charged | when to use it |
+| --- | --- | --- | --- |
+| `exact` | a flat fee per call, agreed before the work happens | up front | predictable pricing; the only option for backends that can't report token usage |
+| `upto` | the tokens actually consumed, up to a ceiling they authorize | after the work | metered LLM access, where a one-line question and a long research task shouldn't cost the same |
 
 `exact` is the default and works on every backend. `upto` needs two things
 the caller and the backend must both supply — see
@@ -31,44 +31,45 @@ turn 2   caller → bridge          message/send { message.taskId: <same task> }
                                     metadata['x402.payment.status'] = 'payment-submitted'
                                     metadata['x402.payment.payload'] = <signed>
          bridge                   classify → facilitator.verify
-         bridge → agent           task.assign        (only now does work start)
+         bridge                   facilitator.settle   (exact only — see below)
+         bridge → agent           task.assign          (only now does work start)
          agent  → bridge          task.complete
-         bridge                   facilitator.settle
+         bridge                   facilitator.settle   (upto only — needs the meter)
          bridge → caller          Task(completed)
                                     metadata['x402.payment.receipts'] = [{ transaction, ... }]
 ```
 
-Two properties that follow from the ordering, and are worth stating because
-they are the ones an operator gets asked about:
+**Unpaid calls never reach the agent.** The gate runs before the task is bound
+or forwarded, so an unpaid or invalid request costs the backend nothing.
 
-- **Unpaid calls never reach the agent.** The gate runs before the task is
-  bound or forwarded, so an unpaid or invalid request costs the backend
-  nothing.
-- **Failed work is not charged.** Settlement happens only on a `completed`
-  task. If the agent fails, is cancelled, or times out, the payer's signed
-  authorization simply goes unused — it expires on its own.
+### When each scheme settles, and who carries the risk
 
-If settlement itself fails, the task is reported `failed` rather than
-`completed`: the caller got the work but the merchant was not paid, and
+The two schemes settle at opposite ends of the work, and the difference decides
+what happens when something goes wrong.
+
+**`exact` settles first, before the agent is contacted.** The amount was fixed
+at offer time and the payer signed for exactly it, so there is nothing to learn
+by doing the work first. A drained or invalidated authorization then costs
+nobody: no charge, no work, and the turn halts before `task.assign`.
+
+The price is that a task which fails *after* payment is a real loss to the
+payer — they paid and got an error. That is the accepted trade for closing the
+give-away-the-work window, and `x402_paid_task_failed` counts it. The receipt is
+still attached to the failed task, so the payer has proof of what they paid.
+
+**`upto` settles last, because the charge does not exist until the work does.**
+There is nothing to meter before the agent has run, so settlement can only
+follow it — and artifacts have already streamed to the caller by then. A payer
+who invalidates their authorization mid-task therefore receives the result and
+a `failed` status. That window is inherent to metered billing rather than a
+choice, and `x402_unpaid_delivery` counts it.
+
+Under `upto`, a task that fails is not charged at all: the authorization simply
+goes unused.
+
+If settlement fails on the `upto` path the task is reported `failed` rather
+than `completed` — the caller got the work but the merchant was not paid, and
 reporting success would hide that.
-
-### The accepted window: output ships before settlement
-
-Artifacts stream to the caller as the agent produces them, and settlement
-cannot start until the work is done — under `upto` there is nothing to meter
-before then. **A payer who invalidates their authorization between `verify` and
-settlement therefore receives the full result and a `failed` status.**
-
-This window is accepted rather than closed, because both ways of closing it are
-worse. Buffering output until settlement lands would remove streaming from
-exactly the agents people pay for. Settling before the work would charge for
-tasks that fail — and on a bridge fronting coding agents, timeouts and backend
-errors are far more common than an adversarial payer. Undercharging in a rare
-attack beats overcharging on routine failure.
-
-The exposure is one task's work per occurrence, and `x402_unpaid_delivery`
-counts it. A rising rate is worth investigating; a flat zero is the expected
-state.
 
 ## Configuring an agent's price
 
@@ -327,7 +328,8 @@ All events are structured JSON on stdout (see
 | `x402_submission_replayed` | a payment already used for this task was submitted again; refused before the backend was reached |
 | `x402_pricing_snapshot_missing` | the offering's frozen terms were gone at settle time; the call was refused rather than priced from live pricing |
 | `x402_scheme_mismatch` | the frozen terms and the signed requirement named different schemes; refused rather than mispriced |
-| `x402_unpaid_delivery` | settlement failed after the caller already had the output — the accepted window above, made countable |
+| `x402_unpaid_delivery` | `upto` only — settlement failed after the caller already had the output |
+| `x402_paid_task_failed` | `exact` only — the payer was charged up front and the task then failed |
 | `x402_wire_advertisement_dropped` | a connecting agent tried to advertise its own x402 terms on its card; discarded |
 | `x402_pricing_invalid` | a malformed pricing row; the agent is treated as free |
 | `x402_config_invalid` | `upto` pricing on a V1 deployment; every call is refused until fixed |

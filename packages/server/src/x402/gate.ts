@@ -67,18 +67,35 @@ export function createPostgresX402Context(
  *   (`input-required`, awaiting the client's signed resubmission) or it was
  *   refused (`failed`).
  */
-export type X402GateOutcome =
+/**
+ * What the caller still owes, once the gate has cleared a turn to run.
+ *
+ * The two schemes settle at opposite ends of the work, and the difference is
+ * not an implementation detail — it decides who carries the risk when things
+ * go wrong.
+ *
+ * - `settled` (`exact`): already charged, before the agent was contacted. The
+ *   amount is fixed and known up front, so there is no reason to hand over the
+ *   work first and hope the authorization is still good afterwards.
+ * - `deferred` (`upto`): the charge comes from consumption, which does not
+ *   exist until the work is done, so settlement can only follow it.
+ */
+export type X402Settlement =
+  | { mode: 'settled'; metadata: Record<string, unknown> }
   | {
-      kind: 'proceed';
-      classified?: X402ValidClassification;
+      mode: 'deferred';
+      classified: X402ValidClassification;
       /**
        * The pricing the offering was published under, read back from the
        * store. Settlement uses this, never the agent's live pricing — the two
        * turns are separate requests and a reprice in between would otherwise
        * meter against terms the payer never signed.
        */
-      pricing?: X402Pricing;
-    }
+      pricing: X402Pricing;
+    };
+
+export type X402GateOutcome =
+  | { kind: 'proceed'; settlement?: X402Settlement }
   | { kind: 'halt'; event: TaskStatusUpdateEvent };
 
 export interface X402GateParams {
@@ -336,7 +353,32 @@ export class X402Gate {
         taskId,
         ...this.offeringFields(settlementPricing),
       });
-      return { kind: 'proceed', classified, pricing: settlementPricing };
+
+      if (settlementPricing.scheme === 'upto') {
+        // Metered: the charge does not exist until the work has been done, so
+        // settlement has to follow it. See the note on `settleTerminal`.
+        return {
+          kind: 'proceed',
+          settlement: { mode: 'deferred', classified, pricing: settlementPricing },
+        };
+      }
+
+      // Flat fee: charge now, before the agent is contacted. The amount was
+      // fixed at offer time and the payer has signed for exactly it, so there
+      // is nothing to learn by doing the work first — and doing it first means
+      // handing over the result and only then discovering the authorization
+      // has been drained. A failure here costs nobody: no charge, no work.
+      //
+      // Safe to do here only because `claim` above is a one-shot: without it a
+      // replayed submission would settle a second time.
+      const settled = await this.settle({
+        taskId,
+        contextId,
+        classified,
+        pricing: settlementPricing,
+      });
+      if (settled.kind === 'failed') return { kind: 'halt', event: settled.event };
+      return { kind: 'proceed', settlement: { mode: 'settled', metadata: settled.metadata } };
     } catch (err) {
       // Facilitator unreachable, DB down, malformed offering — fail closed.
       logEvent('x402_gate_error', {
@@ -475,7 +517,10 @@ export class X402Gate {
 
     const done = this.x402.completedEvent({ receipt });
     const metadata = done.type === 'done' ? (done.metadata ?? {}) : {};
-    await this.clear(taskId);
+    // Deliberately does not clear the offering. Under `exact` this runs before
+    // the work, and dropping the row would release the claim mid-task — a
+    // resubmission would then be treated as a fresh payment and charged again.
+    // The executor clears once the task reaches a terminal state.
     return { kind: 'settled', metadata };
   }
 
