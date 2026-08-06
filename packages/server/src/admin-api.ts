@@ -15,6 +15,7 @@ import {
   parseX402Pricing,
   type X402Pricing,
 } from './x402/pricing.js';
+import { notifyX402PricingChanged } from './x402/pricing-watch.js';
 
 type Tx = postgres.TransactionSql;
 
@@ -298,7 +299,11 @@ export async function setX402Pricing(
   // distinguishing them would confirm the existence of someone else's agent.
   if (rows.length === 0) throw new AdminApiError('Agent not found or not authorized.', 404);
 
+  // Patch this instance, then tell the others. The agent's WebSocket usually
+  // lives on a different instance than the one that served this request, and
+  // that one is the one whose cached pricing decides what the agent charges.
   registry.updateX402Pricing(agentId, parsed);
+  await notifyX402PricingChanged(db, agentId);
   return { agent_id: agentId, x402_pricing: parsed };
 }
 
@@ -319,7 +324,10 @@ export async function clearX402Pricing(
   });
   if (rows.length === 0) throw new AdminApiError('Agent not found or not authorized.', 404);
 
+  // The direction that matters most: an agent made free here must stop being
+  // billed everywhere, not just on this instance.
   registry.updateX402Pricing(agentId, undefined);
+  await notifyX402PricingChanged(db, agentId);
   return { agent_id: agentId, x402_pricing: null };
 }
 

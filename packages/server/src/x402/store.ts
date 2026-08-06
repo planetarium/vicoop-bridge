@@ -4,6 +4,7 @@ import {
   type X402StoreEntryPatch,
 } from '@a2x/sdk/x402';
 import type { Sql } from '../db.js';
+import { parseX402Pricing, type X402Pricing } from './pricing.js';
 
 // Postgres-backed x402 offering store.
 //
@@ -72,9 +73,15 @@ function reviveEntry(raw: unknown): X402StoreEntry {
 export class PostgresX402Store extends BaseX402Store {
   constructor(
     private readonly sql: Sql,
-    // Recorded on the row so operational queries ("what did agent X charge
-    // this week") don't have to join through the task table. Not part of the
-    // SDK entry, which is keyed by taskId alone.
+    /**
+     * The agent this store is scoped to. **Every** operation filters on it.
+     *
+     * Not merely a label for operational queries: tasks resolve by id from a
+     * store shared across all agents (#453), so a task created at agent A can
+     * be resumed at agent B's endpoint. Were offerings keyed on `taskId`
+     * alone, B's gate would load A's offering and accept A's cheap signature
+     * as payment for B's work.
+     */
     private readonly agentId: string,
   ) {
     super();
@@ -85,6 +92,10 @@ export class PostgresX402Store extends BaseX402Store {
     // The entry is round-tripped through JSON — the repo's pattern for JSONB
     // writes — which also lowers every Date to an ISO string, exactly what
     // `reviveEntry` reverses on the way back out.
+    //
+    // `pricing` and `claimed_at` are left alone on conflict: the SDK patches
+    // the entry repeatedly through the round-trip, and neither the pricing
+    // snapshot nor the claim may be reset by a lifecycle update.
     await this.sql`
       INSERT INTO x402_offerings (task_id, agent_id, entry, expires_at, updated_at)
       VALUES (
@@ -94,9 +105,8 @@ export class PostgresX402Store extends BaseX402Store {
         ${expiresAt},
         now()
       )
-      ON CONFLICT (task_id) DO UPDATE
+      ON CONFLICT (agent_id, task_id) DO UPDATE
         SET entry = EXCLUDED.entry,
-            agent_id = EXCLUDED.agent_id,
             expires_at = EXCLUDED.expires_at,
             updated_at = now()
     `;
@@ -106,7 +116,8 @@ export class PostgresX402Store extends BaseX402Store {
     const rows = await this.sql<OfferingRow[]>`
       SELECT task_id, entry
       FROM x402_offerings
-      WHERE task_id = ${taskId}
+      WHERE agent_id = ${this.agentId}
+        AND task_id = ${taskId}
         AND (expires_at IS NULL OR expires_at > now())
     `;
     const row = rows[0];
@@ -117,28 +128,90 @@ export class PostgresX402Store extends BaseX402Store {
     // Read-modify-write rather than a JSONB merge: the patch carries nested
     // Date values that would have to be hand-serialized into a jsonb_set
     // chain anyway, and the round-trip stays inside one statement's worth of
-    // latency. Concurrent patches for one task don't occur — a task's
-    // payment round-trip is driven by a single in-flight request.
+    // latency. Racing writers are not a correctness problem here because the
+    // one operation that must not run twice — accepting a submission — is
+    // gated by `claim()` below rather than by the entry's status.
     const current = await this.get(taskId);
     if (!current) return;
     await this.put({ ...current, ...patch, updatedAt: new Date() });
   }
 
   async delete(taskId: string): Promise<void> {
-    await this.sql`DELETE FROM x402_offerings WHERE task_id = ${taskId}`;
+    await this.sql`
+      DELETE FROM x402_offerings
+      WHERE agent_id = ${this.agentId} AND task_id = ${taskId}
+    `;
   }
 
   /**
-   * Drop rows whose expiry has passed. Lazy expiry already hides them from
-   * `get`, so this only reclaims space for offerings whose task was never
-   * completed or cancelled. Returns the number of rows removed.
+   * Record the pricing an offering was published under.
+   *
+   * Settlement prices from this rather than from the agent's live pricing.
+   * The two turns of a payment are separate requests, so a reprice in between
+   * would otherwise meter turn 2 against terms turn 1 never signed.
    */
-  async sweepExpired(): Promise<number> {
+  async putPricing(taskId: string, pricing: X402Pricing): Promise<void> {
+    await this.sql`
+      UPDATE x402_offerings
+      SET pricing = ${this.sql.json(JSON.parse(JSON.stringify(pricing)))}
+      WHERE agent_id = ${this.agentId} AND task_id = ${taskId}
+    `;
+  }
+
+  /** The pricing snapshot taken when the offering was published. */
+  async getPricing(taskId: string): Promise<X402Pricing | undefined> {
+    const rows = await this.sql<{ pricing: unknown }[]>`
+      SELECT pricing
+      FROM x402_offerings
+      WHERE agent_id = ${this.agentId} AND task_id = ${taskId}
+    `;
+    const raw = rows[0]?.pricing;
+    if (raw === undefined || raw === null) return undefined;
+    // Read-side parsing is lenient about unknown keys on purpose (see
+    // pricing.ts) — a snapshot written by a newer build must still price here.
+    return parseX402Pricing(raw);
+  }
+
+  /**
+   * Take the one-shot right to act on this task's submission.
+   *
+   * Returns `true` for the caller that wins and `false` for every other. The
+   * SDK's `classify()` does not inspect the entry's status, so without this a
+   * replayed submission classifies valid twice and the backend runs the work
+   * twice against a single authorization.
+   *
+   * Deliberately never released. A failed verify leaves the offering claimed
+   * and the payer starts a new task; re-opening the window on failure would
+   * restore the double-spend it exists to prevent, and nothing has been
+   * charged at that point.
+   */
+  async claim(taskId: string): Promise<boolean> {
     const rows = await this.sql`
-      DELETE FROM x402_offerings
-      WHERE expires_at IS NOT NULL AND expires_at <= now()
+      UPDATE x402_offerings
+      SET claimed_at = now(), updated_at = now()
+      WHERE agent_id = ${this.agentId}
+        AND task_id = ${taskId}
+        AND claimed_at IS NULL
+        AND (expires_at IS NULL OR expires_at > now())
       RETURNING task_id
     `;
-    return rows.length;
+    return rows.length > 0;
   }
+}
+
+/**
+ * Drop offerings whose expiry has passed, across every agent.
+ *
+ * Lazy expiry already hides them from `get`, so this only reclaims space — but
+ * it has to run: a caller that walks away at the `input-required` turn leaves
+ * a row behind, and on a public paid agent that is an unauthenticated way to
+ * grow the table. Returns the number of rows removed.
+ */
+export async function sweepExpiredX402Offerings(sql: Sql): Promise<number> {
+  const rows = await sql`
+    DELETE FROM x402_offerings
+    WHERE expires_at IS NOT NULL AND expires_at <= now()
+    RETURNING task_id
+  `;
+  return rows.length;
 }

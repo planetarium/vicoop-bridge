@@ -916,14 +916,52 @@ COMMENT ON TABLE used_siwe_nonces IS E'@omit';
 -- `expires_at` is duplicated out of `entry` so expiry is a WHERE clause: the
 -- store contract requires `get` to return nothing past the deadline, and a
 -- filtered read satisfies it lazily, with no background reaper.
+-- The key is `(agent_id, task_id)`, not `task_id` alone. Tasks are resolved by
+-- id from a store shared across every agent (see #453), so a task created at
+-- agent A can be resumed at agent B's endpoint. Keyed on task_id alone, B's
+-- gate would find A's offering and accept A's cheap signature as payment for
+-- B's work.
+--
+-- `pricing` is the agent's pricing captured when the offering was published.
+-- Settlement must price from this, never from the agent's live pricing: the
+-- two turns of a payment are separate requests, and a reprice in between would
+-- otherwise meter turn 2 against a requirement turn 1 signed under different
+-- terms — which settles the wrong amount.
+--
+-- `claimed_at` is a one-shot concurrency guard. The SDK's `classify()` does not
+-- inspect the entry's status, so replaying one signed submission before
+-- settlement would classify valid twice and run the backend work twice for a
+-- single authorization. Claiming is a conditional UPDATE; the loser is refused.
 CREATE TABLE IF NOT EXISTS x402_offerings (
-  task_id     TEXT PRIMARY KEY,
+  task_id     TEXT NOT NULL,
   agent_id    TEXT NOT NULL,
   entry       JSONB NOT NULL,
+  pricing     JSONB,
+  claimed_at  TIMESTAMPTZ,
   expires_at  TIMESTAMPTZ,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (agent_id, task_id)
 );
+
+-- Converge a dev DB created from the first cut of this table, which keyed on
+-- task_id alone and had neither column. Never deployed, so this is only here
+-- so re-applying schema.sql on such a database doesn't fail.
+ALTER TABLE x402_offerings ADD COLUMN IF NOT EXISTS pricing JSONB;
+ALTER TABLE x402_offerings ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE i.indrelid = 'x402_offerings'::regclass
+      AND i.indisprimary
+      AND array_length(i.indkey::int2[], 1) = 1
+  ) THEN
+    ALTER TABLE x402_offerings DROP CONSTRAINT x402_offerings_pkey;
+    ALTER TABLE x402_offerings ADD PRIMARY KEY (agent_id, task_id);
+  END IF;
+END $$;
 
 -- Supports the expiry sweep and per-agent operational queries.
 CREATE INDEX IF NOT EXISTS x402_offerings_expires_idx

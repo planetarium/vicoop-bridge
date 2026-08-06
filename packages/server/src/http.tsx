@@ -122,7 +122,10 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         A2A_EXTENSIONS_HEADER,
         A2A_EXTENSIONS_LEGACY_HEADER,
       ],
-      allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+      // PUT is here for /admin-api/agents/:id/x402. Without it a browser
+      // client (the Vite dev UI) fails preflight even though the CLI's Node
+      // fetch, which sends no preflight, gets through.
+      allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
       credentials: true,
       maxAge: 600,
     }),

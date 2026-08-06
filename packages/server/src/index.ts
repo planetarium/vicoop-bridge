@@ -4,6 +4,8 @@ import { createHttpApp } from './http.js';
 import { attachWsServer } from './ws.js';
 import { PostgresTaskStore } from './postgres-task-store.js';
 import { logEvent } from './log.js';
+import { sweepExpiredX402Offerings } from './x402/store.js';
+import { watchX402PricingChanges } from './x402/pricing-watch.js';
 import type { Sql } from './db.js';
 import type { GoogleConfig } from './auth/google-oauth.js';
 
@@ -29,6 +31,16 @@ async function cleanupExpiredTransients(db: Sql): Promise<void> {
     await db`DELETE FROM used_siwe_nonces WHERE expires_at <= now()`;
   } catch (err) {
     console.error('[server] used_siwe_nonces cleanup failed:', err);
+  }
+  try {
+    // Lazy expiry hides a lapsed offering from `get` but never deletes it, so
+    // every caller that walks away at the `input-required` turn leaves a row
+    // behind. On a public paid agent that is an unauthenticated way to grow
+    // the table, which is why this runs rather than relying on task teardown.
+    const deleted = await sweepExpiredX402Offerings(db);
+    if (deleted > 0) logEvent('x402_offerings_swept', { deleted });
+  } catch (err) {
+    console.error('[server] x402_offerings cleanup failed:', err);
   }
 }
 
@@ -83,6 +95,13 @@ export async function startServer(opts: ServerOptions) {
   runCleanup();
   const cleanupTimer = setInterval(runCleanup, TRANSIENT_CLEANUP_INTERVAL_MS);
   cleanupTimer.unref();
+
+  // Pricing is cached on the live connection, and an admin write only patches
+  // the instance that served it. Without this, an agent repriced (or made
+  // free) on one instance keeps billing at the old price from another until it
+  // reconnects. Best-effort: a failed subscription degrades to that same
+  // reconnect-scoped behavior rather than blocking startup.
+  void watchX402PricingChanges(opts.db, registry);
 
   console.log(`[server] listening on :${opts.port}`);
   return { registry, server };

@@ -20,6 +20,7 @@ import { logEvent } from './log.js';
 import { terminalErrorMessageFields } from './terminal-error.js';
 import { X402Gate, createPostgresX402Context } from './x402/gate.js';
 import { readTaskUsage, type TaskUsage } from './x402/usage.js';
+import type { X402Pricing } from './x402/pricing.js';
 import type { Sql } from './db.js';
 
 /**
@@ -30,6 +31,19 @@ import type { Sql } from './db.js';
 export interface X402ExecutorOptions {
   sql: Sql;
   resource: string;
+}
+
+/**
+ * A verified payment awaiting settlement, carried from the gate's `open` to
+ * its `settle` within one turn.
+ *
+ * `pricing` travels with the classification on purpose: it is the offering's
+ * frozen terms, and settling from the agent's live pricing instead would meter
+ * against terms the payer never signed.
+ */
+interface X402Settlement {
+  classified: X402ValidClassification;
+  pricing: X402Pricing;
 }
 
 // AgentExecutor's constructor requires a Runner+BaseAgent because Layer 2
@@ -169,13 +183,10 @@ export class WSForwardingExecutor extends AgentExecutor {
     }
     const key = JSON.stringify(pricing);
     if (this.gateCache?.key !== key) {
+      const { context, sidecar } = createPostgresX402Context(this.x402.sql, this.agentId);
       this.gateCache = {
         key,
-        gate: new X402Gate(
-          this.agentId,
-          pricing,
-          createPostgresX402Context(this.x402.sql, this.agentId),
-        ),
+        gate: new X402Gate(this.agentId, pricing, context, sidecar),
       };
     }
     return this.gateCache.gate;
@@ -208,7 +219,7 @@ export class WSForwardingExecutor extends AgentExecutor {
    */
   private async settleTerminal(
     gate: X402Gate,
-    classified: X402ValidClassification,
+    settlement: X402Settlement,
     event: TaskStatusUpdateEvent,
     binding: TaskBinding,
     taskId: string,
@@ -220,7 +231,9 @@ export class WSForwardingExecutor extends AgentExecutor {
     }
 
     let metered: { usage?: TaskUsage } = {};
-    if (gate.metered) {
+    // Metered-ness comes from the offering's frozen terms, not from what the
+    // agent charges now — the same reason `settle` prices from them.
+    if (settlement.pricing.scheme === 'upto') {
       const read = readTaskUsage(binding.usage, event.status.message?.metadata);
       if (read.source === 'openai-compat') {
         // The client is old enough not to send the protocol field. Billing
@@ -231,7 +244,13 @@ export class WSForwardingExecutor extends AgentExecutor {
       metered = { usage: read.usage };
     }
 
-    const result = await gate.settle({ taskId, contextId, classified, ...metered });
+    const result = await gate.settle({
+      taskId,
+      contextId,
+      classified: settlement.classified,
+      pricing: settlement.pricing,
+      ...metered,
+    });
     if (result.kind === 'failed') return result.event;
 
     // Attach the settlement receipt to the final status message, which is
@@ -267,7 +286,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     // capacity. `settlement` is set only when a payment was verified and is
     // therefore owed once the work completes.
     const gate = this.currentGate();
-    let settlement: X402ValidClassification | undefined;
+    let settlement: X402Settlement | undefined;
     if (gate) {
       const outcome = await gate.open({
         taskId,
@@ -297,7 +316,10 @@ export class WSForwardingExecutor extends AgentExecutor {
         }
         return;
       }
-      settlement = outcome.classified;
+      settlement =
+        outcome.classified && outcome.pricing
+          ? { classified: outcome.classified, pricing: outcome.pricing }
+          : undefined;
     }
 
     const queue = new AsyncEventQueue<TaskStatusUpdateEvent | TaskArtifactUpdateEvent>();

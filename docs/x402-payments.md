@@ -141,8 +141,15 @@ A malformed pricing row does not take the agent offline: it is logged
 (`x402_pricing_invalid`) and the agent connects as free, so nobody is charged
 against a configuration the server could not read.
 
-Repricing takes effect on the next call — the executor reads the live
-connection each turn rather than caching pricing at connect time.
+Repricing takes effect on the next call, on every instance. The executor reads
+the live connection each turn rather than caching pricing at connect time, and
+because the agent's WebSocket usually lives on a different instance than the
+one that served the admin write, the write also emits a Postgres `NOTIFY` that
+makes the holding instance re-read the row. Without that an agent you just made
+free would keep billing from somewhere else until it reconnected.
+
+If the notification is lost the deployment degrades to the old behavior —
+pricing refreshes when the agent reconnects — rather than failing the write.
 
 ## Metered pricing (`upto`)
 
@@ -248,12 +255,32 @@ the payer is not charged, but the call fails for no reason the caller can act
 on. Restarts do the same to a single instance.
 
 Rows are deleted when the task terminates. Expiry is lazy (a `WHERE` clause on
-read), so no background reaper is required; `PostgresX402Store.sweepExpired()`
-exists to reclaim rows whose task never terminated at all.
+read), and the hourly cleanup job sweeps lapsed rows so that callers who walk
+away at the `input-required` turn cannot grow the table indefinitely — on a
+public paid agent that would otherwise be an unauthenticated write.
 
-The row's `entry` column is the audit record of what was charged — the
-advertised offering, the lifecycle status, and on success the receipt
-(transaction hash, payer, settled amount).
+The row's `entry` column is the advertised offering plus its lifecycle status
+and, on success, the receipt (transaction hash, payer, settled amount).
+
+Three properties of this table are load-bearing rather than incidental:
+
+- **Keyed on `(agent_id, task_id)`, not `task_id`.** Tasks resolve by id from a
+  store shared across every agent (#453), so a task created at agent A can be
+  resumed at agent B's endpoint. Keyed on the task alone, B's gate would find
+  A's offering and accept A's cheap signature as payment for B's work. Every
+  store operation filters on the agent.
+- **`pricing` freezes the terms the offering was published under.** Settlement
+  prices from this, never from the agent's live pricing: the two turns are
+  separate requests, and a reprice in between would otherwise meter turn 2
+  against terms turn 1 never signed. A missing snapshot refuses the call rather
+  than guessing.
+- **`claimed_at` makes a submission usable once.** The SDK's `classify()` does
+  not inspect the entry's status, so a replayed `payment-submitted` classifies
+  valid every time; the claim is a conditional `UPDATE` and the loser is
+  refused before the backend is reached. It is never released — a failed verify
+  leaves the offering spent and the payer starts a new task, because re-opening
+  the window would restore the double-spend it exists to prevent. Nothing has
+  been charged at that point.
 
 ## Observability
 
@@ -272,8 +299,12 @@ All events are structured JSON on stdout (see
 | `x402_settled` | settled on-chain; carries the transaction hash and the facilitator-confirmed amount |
 | `x402_settle_failed` / `x402_settle_error` | settlement was refused or unreachable |
 | `x402_gate_error` | the payment rail was unavailable; the call was refused rather than served free |
-| `x402_pricing_invalid` | a malformed pricing row; the agent connected as free |
+| `x402_submission_replayed` | a payment already used for this task was submitted again; refused before the backend was reached |
+| `x402_pricing_snapshot_missing` | the offering's frozen terms were gone at settle time; the call was refused rather than priced from live pricing |
+| `x402_pricing_invalid` | a malformed pricing row; the agent is treated as free |
 | `x402_config_invalid` | `upto` pricing on a V1 deployment; every call is refused until fixed |
+| `x402_pricing_refreshed` | this instance re-read an agent's pricing after another instance changed it |
+| `x402_offerings_swept` | the hourly job reclaimed lapsed offerings |
 
 Two worth alerting on: `x402_usage_unavailable` means revenue is being left on
 the table, and a sustained `x402_settle_failed` means work is being delivered

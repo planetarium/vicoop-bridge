@@ -1,6 +1,7 @@
 import {
   X402Context,
   X402_FOUNDATION_EXTENSION_URI,
+  requirementScheme,
   type BaseX402Context,
   type X402ValidClassification,
   type X402SettleResponse,
@@ -39,13 +40,22 @@ const OFFERING_TTL_SECONDS = (() => {
  * Separate from `X402Gate` so tests can drive the gate with an in-memory
  * store and a stub facilitator instead of a database and a live chain.
  */
-export function createPostgresX402Context(sql: Sql, agentId: string): X402Context {
+export function createPostgresX402Context(
+  sql: Sql,
+  agentId: string,
+): { context: X402Context; sidecar: X402OfferingSidecar } {
   const url = process.env.BRIDGE_X402_FACILITATOR_URL;
-  return new X402Context({
-    store: new PostgresX402Store(sql, agentId),
-    x402Version: X402_VERSION,
-    ...(url ? { facilitator: { url } } : {}),
-  });
+  const store = new PostgresX402Store(sql, agentId);
+  return {
+    context: new X402Context({
+      store,
+      x402Version: X402_VERSION,
+      ...(url ? { facilitator: { url } } : {}),
+    }),
+    // Same instance: the sidecar rows live on the offering row, so they share
+    // the store's agent scoping rather than re-deriving it.
+    sidecar: store,
+  };
 }
 
 /**
@@ -58,7 +68,17 @@ export function createPostgresX402Context(sql: Sql, agentId: string): X402Contex
  *   refused (`failed`).
  */
 export type X402GateOutcome =
-  | { kind: 'proceed'; classified?: X402ValidClassification }
+  | {
+      kind: 'proceed';
+      classified?: X402ValidClassification;
+      /**
+       * The pricing the offering was published under, read back from the
+       * store. Settlement uses this, never the agent's live pricing — the two
+       * turns are separate requests and a reprice in between would otherwise
+       * meter against terms the payer never signed.
+       */
+      pricing?: X402Pricing;
+    }
   | { kind: 'halt'; event: TaskStatusUpdateEvent };
 
 export interface X402GateParams {
@@ -91,36 +111,47 @@ export interface X402GateParams {
  * unused. Under `upto` that deferral is also what makes metering possible —
  * the token counts only exist once the work is done.
  */
+/**
+ * The per-offering state the bridge keeps alongside the SDK's entry: the
+ * pricing an offering was published under, and a one-shot claim.
+ *
+ * Separate from `BaseX402Store` because the SDK owns that shape, and separate
+ * from the gate's constructor argument so tests can drive the round-trip
+ * without a database.
+ */
+export interface X402OfferingSidecar {
+  putPricing(taskId: string, pricing: X402Pricing): Promise<void>;
+  getPricing(taskId: string): Promise<X402Pricing | undefined>;
+  /** `true` for the one caller that wins the right to act on a submission. */
+  claim(taskId: string): Promise<boolean>;
+}
+
 export class X402Gate {
   constructor(
     private readonly agentId: string,
     private readonly pricing: X402Pricing,
     private readonly x402: BaseX402Context,
+    private readonly sidecar: X402OfferingSidecar,
   ) {}
 
-  /** True when this agent bills by consumption rather than a flat fee. */
-  get metered(): boolean {
-    return this.pricing.scheme === 'upto';
-  }
-
   /**
-   * Scheme-independent description of what was offered, for logs. Under
-   * `upto` the amount is the authorized ceiling, so it is labelled as such
-   * rather than reported as a price that will be charged.
+   * Scheme-independent description of an offering, for logs. Under `upto` the
+   * amount is the authorized ceiling, so it is labelled as such rather than
+   * reported as a price that will be charged.
    */
-  private offeringFields(): Record<string, string> {
-    return this.pricing.scheme === 'upto'
+  private offeringFields(pricing: X402Pricing): Record<string, string> {
+    return pricing.scheme === 'upto'
       ? {
           scheme: 'upto',
-          ceiling: this.pricing.maxAmount,
-          network: this.pricing.network,
-          asset: this.pricing.asset,
+          ceiling: pricing.maxAmount,
+          network: pricing.network,
+          asset: pricing.asset,
         }
       : {
           scheme: 'exact',
-          amount: this.pricing.amount,
-          network: this.pricing.network,
-          asset: this.pricing.asset,
+          amount: pricing.amount,
+          network: pricing.network,
+          asset: pricing.asset,
         };
   }
 
@@ -180,10 +211,14 @@ export class X402Gate {
           // silently serve the call for free.
           throw new Error('x402 requestPayment yielded no request-input event');
         }
+        // Freeze the terms alongside the offering. Turn 2 settles from this,
+        // so a reprice between the turns cannot change what the payer is
+        // charged for a requirement they already signed.
+        await this.sidecar.putPricing(taskId, this.pricing);
         logEvent('x402_payment_required', {
           agentId: this.agentId,
           taskId,
-          ...this.offeringFields(),
+          ...this.offeringFields(this.pricing),
         });
         return {
           kind: 'halt',
@@ -216,6 +251,41 @@ export class X402Gate {
         };
       }
 
+      // One submission, one execution. `classify` above does not inspect the
+      // entry's status, so a replayed `payment-submitted` classifies valid
+      // every time; without this the backend would run the work again for the
+      // same authorization. The claim is never released — see `claim`.
+      if (!(await this.sidecar.claim(taskId))) {
+        logEvent('x402_submission_replayed', { agentId: this.agentId, taskId });
+        return {
+          kind: 'halt',
+          event: this.failedEvent({
+            taskId,
+            contextId,
+            code: 'DUPLICATE_NONCE',
+            reason: 'This payment has already been submitted for this task.',
+          }),
+        };
+      }
+
+      // Terms are the ones the offering was published under, not whatever the
+      // agent charges right now.
+      const settlementPricing = await this.sidecar.getPricing(taskId);
+      if (settlementPricing === undefined) {
+        // Written in the same breath as the offering, so this is corruption
+        // rather than a normal state. Refuse instead of guessing a price.
+        logEvent('x402_pricing_snapshot_missing', { agentId: this.agentId, taskId });
+        return {
+          kind: 'halt',
+          event: this.failedEvent({
+            taskId,
+            contextId,
+            code: 'SETTLEMENT_FAILED',
+            reason: 'The terms this payment was offered under are no longer available.',
+          }),
+        };
+      }
+
       const verify = await this.x402.verify(ctx, classified);
       if (!verify.isValid) {
         const reason = verify.invalidReason ?? 'Payment verification failed.';
@@ -234,9 +304,9 @@ export class X402Gate {
       logEvent('x402_payment_verified', {
         agentId: this.agentId,
         taskId,
-        ...this.offeringFields(),
+        ...this.offeringFields(settlementPricing),
       });
-      return { kind: 'proceed', classified };
+      return { kind: 'proceed', classified, pricing: settlementPricing };
     } catch (err) {
       // Facilitator unreachable, DB down, malformed offering — fail closed.
       logEvent('x402_gate_error', {
@@ -273,26 +343,33 @@ export class X402Gate {
     taskId: string;
     contextId: string;
     classified: X402ValidClassification;
+    /** The offering's frozen terms, from `open`. Never the live pricing. */
+    pricing: X402Pricing;
     usage?: TaskUsage | undefined;
   }): Promise<
     | { kind: 'settled'; metadata: Record<string, unknown> }
     | { kind: 'failed'; event: TaskStatusUpdateEvent }
   > {
-    const { taskId, contextId, classified, usage } = params;
+    const { taskId, contextId, classified, pricing, usage } = params;
     const ctx = { taskId };
 
     // Metering an `exact` requirement throws in the SDK — the signature binds
     // it to one value — so the option is only ever passed for `upto`.
+    //
+    // Gated on the *requirement* the payer actually signed as well as on the
+    // snapshot: the two agree by construction, and requiring both means no
+    // single stale value can send a metered amount at an exact signature or
+    // vice versa.
     let settleOpts: { amountAtomic?: string } | undefined;
-    if (this.pricing.scheme === 'upto') {
-      const charge = meterUsage(this.pricing, usage);
+    if (pricing.scheme === 'upto' && requirementScheme(classified.requirement) === 'upto') {
+      const charge = meterUsage(pricing, usage);
       settleOpts = { amountAtomic: charge.amountAtomic };
       logEvent('x402_metered', {
         agentId: this.agentId,
         taskId,
         basis: charge.basis,
         amount: charge.amountAtomic,
-        ceiling: this.pricing.maxAmount,
+        ceiling: pricing.maxAmount,
         ...(usage !== undefined
           ? {
               promptTokens: usage.prompt_tokens,
