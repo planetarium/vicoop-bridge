@@ -6,8 +6,10 @@ import {
   TRACEABILITY_EXTENSION_URI,
   type AgentCard,
 } from '@vicoop-bridge/protocol';
+import { X402_FOUNDATION_EXTENSION_URI } from '@a2x/sdk/x402';
 import { buildAgentA2XServer } from './agent-card.js';
 import { Registry, type ClientConnection } from './registry.js';
+import { parseX402Pricing } from './x402/pricing.js';
 
 function fakeConn(card: AgentCard, overrides: Partial<ClientConnection> = {}): ClientConnection {
   return {
@@ -261,4 +263,92 @@ test('buildAgentA2XServer leaves a wire-declared SIWE extension alone when not r
   );
   assert.equal(siweEntries.length, 1);
   assert.equal(siweEntries[0]!.description, 'wire-declared');
+});
+
+// ---- x402 advertisement ------------------------------------------------
+
+const X402_PRICING = parseX402Pricing({
+  network: 'eip155:84532',
+  amount: '10000',
+  asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+  payTo: '0x1111111111111111111111111111111111111111',
+})!;
+
+function cardWithX402Wire(): AgentCard {
+  return {
+    name: 'claude',
+    description: 'Claude Code',
+    version: '0.0.1',
+    protocolVersion: '0.3.0',
+    capabilities: {
+      streaming: true,
+      extensions: [
+        { uri: TRACEABILITY_EXTENSION_URI, description: 'keep me' },
+        // A client declaring its own price. Must never reach the card.
+        {
+          uri: X402_FOUNDATION_EXTENSION_URI,
+          description: 'wire-declared x402',
+          params: { amount: '1', payTo: '0x9999999999999999999999999999999999999999' },
+        },
+      ],
+    },
+    skills: [],
+  };
+}
+
+function x402Entries(card: AgentCardV03) {
+  return (card.capabilities.extensions ?? []).filter(
+    (e) => e.uri === X402_FOUNDATION_EXTENSION_URI,
+  );
+}
+
+test('a wire-declared x402 advertisement is dropped from a free agent', () => {
+  // `addExtension` is append-only, so a passed-through entry would let an
+  // agent quote a price the bridge never asks for.
+  const agent = buildAgentA2XServer(
+    fakeConn(cardWithX402Wire()),
+    new InMemoryTaskStore(),
+    new Registry(),
+    { publicUrl: 'https://bridge.example', deviceFlowEnabled: false },
+  );
+
+  const card = agent.getAgentCard() as AgentCardV03;
+  assert.equal(x402Entries(card).length, 0, 'a free agent must advertise no price');
+  // Unrelated wire extensions still pass through.
+  assert.ok(
+    (card.capabilities.extensions ?? []).some((e) => e.uri === TRACEABILITY_EXTENSION_URI),
+  );
+});
+
+test('a paid agent advertises exactly one x402 entry, the DB-owned one', () => {
+  const agent = buildAgentA2XServer(
+    fakeConn(cardWithX402Wire(), { x402Pricing: X402_PRICING }),
+    new InMemoryTaskStore(),
+    new Registry(),
+    { publicUrl: 'https://bridge.example', deviceFlowEnabled: false, db: {} as never },
+  );
+
+  const card = agent.getAgentCard() as AgentCardV03;
+  const entries = x402Entries(card);
+  assert.equal(entries.length, 1, 'no duplicate URI at two different prices');
+  assert.equal(
+    (entries[0]!.params as { payTo: string }).payTo,
+    '0x1111111111111111111111111111111111111111',
+    'the DB price wins, not the wire-declared one',
+  );
+});
+
+test('a paid agent without PUBLIC_URL advertises no price', () => {
+  // x402 `resource` must be absolute; without one the offering could never
+  // verify or settle, so the gate is withheld and the card must not quote a
+  // price the gate is not installed to collect.
+  const agent = buildAgentA2XServer(
+    fakeConn(cardWithX402Wire(), { x402Pricing: X402_PRICING }),
+    new InMemoryTaskStore(),
+    new Registry(),
+    { publicUrl: undefined, deviceFlowEnabled: false, db: {} as never },
+  );
+
+  const card = agent.getAgentCard() as AgentCardV03;
+  assert.equal(x402Entries(card).length, 0);
 });

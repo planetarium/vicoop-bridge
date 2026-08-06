@@ -18,6 +18,7 @@ import { isReservedAgentId } from './reserved-agent-ids.js';
 import { resolveHelloAgentCard } from './card-resolver.js';
 import { terminalErrorMessageFields } from './terminal-error.js';
 import { resolveUsageResponse } from './usage-rpc.js';
+import { parseX402Pricing } from './x402/pricing.js';
 
 // Diagnostic (issue #414): is this `task.status` frame a tagged liveness
 // heartbeat (non-terminal working status carrying
@@ -35,6 +36,7 @@ interface ClientRow {
   owner_principal: string;
   owner_email: string | null;
   allowed_callers: string[];
+  x402_pricing: unknown;
 }
 
 async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | null> {
@@ -43,7 +45,7 @@ async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | nu
   // deleted simply matches nothing and the daemon sees the 4005 "bad token"
   // path.
   const rows = await sql<ClientRow[]>`
-    SELECT id, client_id, owner_principal, owner_email, allowed_callers
+    SELECT id, client_id, owner_principal, owner_email, allowed_callers, x402_pricing
     FROM agents
     WHERE token_hash = ${hash}
   `;
@@ -128,6 +130,21 @@ async function authenticateAndRegister(
     return { ok: false, code: resolvedCard.code, reason: resolvedCard.reason };
   }
 
+  // A malformed pricing row must not take the agent offline — it would turn
+  // an operator typo into an outage. Log it and connect the agent as free;
+  // the gate is then never installed, so nobody is charged against a config
+  // the server could not read.
+  let x402Pricing;
+  try {
+    x402Pricing = parseX402Pricing(client.x402_pricing);
+  } catch (err) {
+    logEvent('x402_pricing_invalid', {
+      agentId: frame.agentId,
+      clientId,
+      error: String(err),
+    });
+  }
+
   const result = opts.registry.registerAgent({
     agentId: frame.agentId,
     clientId,
@@ -136,6 +153,7 @@ async function authenticateAndRegister(
     backendKind: frame.backendKind,
     agentCard: resolvedCard.agentCard,
     allowedCallers: client.allowed_callers,
+    ...(x402Pricing !== undefined ? { x402Pricing } : {}),
     ws,
     connectedAt: Date.now(),
   });
@@ -319,6 +337,11 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           });
           return;
         }
+        // Stash the reported token usage before the terminal status reaches
+        // the sink: the executor prices the task off the binding when it
+        // consumes that event, and pushStatus only enqueues, so setting it
+        // first makes the ordering unconditional.
+        if (frame.usage !== undefined) b.usage = frame.usage;
         b.sink.pushStatus({
           taskId: frame.taskId,
           contextId: b.contextId,

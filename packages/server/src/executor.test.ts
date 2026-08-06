@@ -573,3 +573,62 @@ test('executor omits terminal error metadata when openai-compat extension was no
   assert.equal(statuses[0]?.status.message?.metadata, undefined);
   assert.equal(statuses[0]?.status.message?.extensions, undefined);
 });
+
+test('an agent with no pricing is forwarded normally even when the payment path is configured', async () => {
+  // The gate is keyed off the connection's pricing, not off whether the
+  // deployment has a DB. A free agent must reach the backend on turn 1 with
+  // no payment round-trip and — importantly — without the store being
+  // touched, which the exploding `sql` stub here enforces.
+  const { ws, sent } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'free',
+    clientId: 'c-free',
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+  const explodingSql = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error('x402 store must not be reached for a free agent');
+      },
+    },
+  ) as never;
+
+  const executor = new WSForwardingExecutor('free', registry, noopTaskStore(), undefined, {
+    sql: explodingSql,
+    resource: 'https://bridge.test/agents/free',
+  });
+  const task = {
+    id: 't-free',
+    contextId: 'ctx-free',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-free',
+  } as unknown as Message;
+
+  const gen = executor.executeStream(task, message);
+  const first = gen.next();
+  const binding = registry.getBinding('t-free');
+  assert.ok(binding, 'task should be bound and forwarded, not gated');
+
+  binding.sink.pushStatus({
+    taskId: 't-free',
+    contextId: 'ctx-free',
+    final: true,
+    status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
+  });
+  binding.sink.finish();
+  await first;
+  for await (const _event of gen) void _event;
+
+  const assign = sent.map((raw) => parseDownFrame(raw)).find((f) => f.type === 'task.assign');
+  assert.ok(assign, 'the message should have been forwarded to the connected agent');
+});

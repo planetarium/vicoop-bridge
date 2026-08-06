@@ -1,9 +1,10 @@
 import type { WebSocket } from 'ws';
-import type { AgentCard, DownFrame } from '@vicoop-bridge/protocol';
+import type { AgentCard, DownFrame, TaskUsage } from '@vicoop-bridge/protocol';
 import { encodeFrame } from '@vicoop-bridge/protocol';
 import type { TaskArtifactUpdateEvent, TaskStatusUpdateEvent } from '@a2x/sdk';
 import { logEvent, truncate } from './log.js';
 import { terminalErrorMessageFields } from './terminal-error.js';
+import type { X402Pricing } from './x402/pricing.js';
 
 export interface ClientConnection {
   agentId: string;
@@ -17,6 +18,11 @@ export interface ClientConnection {
   backendKind?: string;
   agentCard: AgentCard;
   allowedCallers: string[];
+  // x402 pricing from the agent's DB row, or undefined for a free agent (the
+  // default). DB-sourced, never read off the hello frame: `payTo` names the
+  // wallet that gets paid, so the same trust boundary applies as to
+  // `allowedCallers`.
+  x402Pricing?: X402Pricing;
   ws: WebSocket;
   connectedAt: number;
 }
@@ -52,6 +58,13 @@ export interface TaskBinding {
   // router), a ~0 count points upstream (client never emitted). Lazily
   // initialized; incremented in ws.ts's `task.status` handler.
   heartbeats?: number;
+  // Token consumption reported on the client's `task.complete` frame, stashed
+  // here by ws.ts so the executor can price the task without re-deriving it
+  // from wire metadata. Server-internal: it is billing input and is never
+  // published back onto the A2A event. Set before the terminal status is
+  // pushed to the sink, so it is always visible by the time the executor
+  // reads the terminal event off the queue.
+  usage?: TaskUsage;
 }
 
 export type CallerChangeListener = (agentId: string, callers: string[]) => void;
@@ -293,6 +306,27 @@ export class Registry {
     for (const listener of this.callerChangeListeners) {
       listener(agentId, callers);
     }
+  }
+
+  /**
+   * Apply a pricing change to the live connection.
+   *
+   * The executor re-reads `x402Pricing` off the connection on every turn, so
+   * this alone makes repricing take effect on the next call. It also fires
+   * the agent-change signal because the AgentCard advertises the price, and
+   * the card (plus the request handler built around it) is cached per agent —
+   * without the eviction a repriced agent would keep publishing the old
+   * figures until it reconnected.
+   *
+   * A no-op when the agent is not currently connected: the new pricing is
+   * already in the database and will be read at its next hello.
+   */
+  updateX402Pricing(agentId: string, pricing: X402Pricing | undefined): void {
+    const conn = this.agents.get(agentId);
+    if (!conn) return;
+    if (pricing === undefined) delete conn.x402Pricing;
+    else conn.x402Pricing = pricing;
+    this.notifyAgentChange(agentId);
   }
 
   private notifyAgentChange(agentId: string): void {

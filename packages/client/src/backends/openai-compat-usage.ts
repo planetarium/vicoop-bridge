@@ -1,4 +1,4 @@
-import { OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
+import { OPENAI_COMPAT_EXTENSION_URI, type TaskUsage } from '@vicoop-bridge/protocol';
 
 // Spec-compliant `usage` shape carried inside `chat_completion.usage`
 // (envelope contract, oai2a2a#80). Required: prompt_tokens,
@@ -79,6 +79,30 @@ export function buildOpenAICompatResponseMetadata(
     return { [OPENAI_COMPAT_EXTENSION_URI]: { usage } };
   }
   return undefined;
+}
+
+// Project the openai-compat usage onto the protocol's own `TaskUsage`, which
+// rides as a first-class field on `task.complete`.
+//
+// Both carry the same counts, but they answer to different owners: the
+// openai-compat payload exists for that extension's consumers, while the
+// frame field is what the bridge bills on (the x402 `upto` scheme settles the
+// metered charge from it). Deriving billing input from an unrelated
+// extension's namespace would tie revenue to that extension's URI staying
+// put — rename or version it and the counts silently read as "unreported",
+// which bills the floor. So both are emitted, from this one conversion.
+//
+// Returns `undefined` when there is nothing to report, which the server must
+// read as "the runtime did not report" rather than as zero.
+export function toProtocolTaskUsage(usage: OpenAICompatUsage | null): TaskUsage | undefined {
+  if (!usage) return undefined;
+  const cached = usage.prompt_tokens_details?.cached_tokens;
+  return {
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    ...(isCount(cached) ? { cachedInputTokens: cached } : {}),
+    ...(usage.model !== undefined && usage.model.length > 0 ? { model: usage.model } : {}),
+  };
 }
 
 function isCount(n: unknown): n is number {

@@ -43,6 +43,7 @@ import {
   removeCallerCmd, revokeClientCmd,
   runAddCaller, runAgentCallersAdd, runAgentCallersList, runAgentCallersRemove,
   runAgentCallersIssue,
+  runAgentX402Clear, runAgentX402Set, runAgentX402Show,
   runAgentDelete, runAgentList, runListAgents, runListCallers, runListClients,
   runRemoveCaller, runRevokeClient,
 } from './admin-cli.js';
@@ -1045,6 +1046,15 @@ async function main(): Promise<void> {
       break;
     case 'agent-callers-issue':
       process.exit(await runAgentCallersIssue(parsed));
+      break;
+    case 'agent-x402-show':
+      process.exit(await runAgentX402Show(parsed));
+      break;
+    case 'agent-x402-set':
+      process.exit(await runAgentX402Set(parsed));
+      break;
+    case 'agent-x402-clear':
+      process.exit(await runAgentX402Clear(parsed));
       break;
     case 'add-caller':
       process.exit(await runAddCaller(parsed));

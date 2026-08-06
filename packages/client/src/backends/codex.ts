@@ -21,6 +21,7 @@ import {
 } from './openai-compat.js';
 import {
   buildOpenAICompatResponseMetadata,
+  toProtocolTaskUsage,
   buildOpenAICompatUsage,
   type OpenAICompatUsage,
 } from './openai-compat-usage.js';
@@ -1940,12 +1941,21 @@ export function createCodexBackend(
             : undefined;
 
           const messageMetadata = buildOpenAICompatResponseMetadata(responseEnvelope, finalUsage);
+          // Deliberately built from `finalUsage`, not `finalUsageSnapshot`.
+          // The snapshot substitutes {0,0,0} when codex reported nothing,
+          // because the openai-compat envelope contract requires the field.
+          // The protocol's `usage` has no such contract, so it stays absent —
+          // and absent is the truth here. The bridge bills on this field, and
+          // a fabricated zero would be indistinguishable from a genuinely
+          // free call.
+          const protocolUsage = toProtocolTaskUsage(finalUsage);
           // When parts is empty but we have envelope/usage to convey, still
           // emit the message frame so the metadata reaches the gateway.
           const hasMessage = parts.length > 0 || messageMetadata !== undefined;
           emit({
             type: 'task.complete',
             taskId: task.taskId,
+            ...(protocolUsage !== undefined ? { usage: protocolUsage } : {}),
             status: {
               state: 'completed',
               timestamp: new Date().toISOString(),

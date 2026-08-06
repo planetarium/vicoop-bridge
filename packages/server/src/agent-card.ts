@@ -7,10 +7,17 @@ import {
 import { SIWE_BEARER_AUTH_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import type { ClientConnection, Registry } from './registry.js';
 import { WSForwardingExecutor } from './executor.js';
+import { isX402ExtensionUri } from '@a2x/sdk/x402';
+import { X402_FOUNDATION_EXTENSION_URI } from './x402/gate.js';
+import { logEvent } from './log.js';
+import type { Sql } from './db.js';
 
 export interface AgentA2XOptions {
   publicUrl: string | undefined;
   deviceFlowEnabled: boolean;
+  // DB handle for the x402 offering store. Absent on deployments assembled
+  // without a payment path; the executor then never installs the gate.
+  db?: Sql;
 }
 
 /**
@@ -36,7 +43,27 @@ export function buildAgentA2XServer(
     ? `${opts.publicUrl}/agents/${conn.agentId}`
     : `/agents/${conn.agentId}`;
 
-  const executor = new WSForwardingExecutor(conn.agentId, registry, taskStore);
+  // x402 `resource` must be an absolute URL — strict facilitators reject
+  // anything else, so without `publicUrl` a paid agent would publish offerings
+  // that can never verify or settle. Withhold the gate instead: the agent
+  // serves for free and says so in the log, which is a working deployment with
+  // a visible misconfiguration rather than a broken payment loop. Same posture
+  // as an unparseable pricing row.
+  const paymentsWired = Boolean(opts.db) && Boolean(opts.publicUrl);
+  if (opts.db && !opts.publicUrl && conn.x402Pricing) {
+    logEvent('x402_config_invalid', {
+      agentId: conn.agentId,
+      reason: 'pricing is configured but PUBLIC_URL is not, so no absolute resource URL exists',
+    });
+  }
+
+  const executor = new WSForwardingExecutor(
+    conn.agentId,
+    registry,
+    taskStore,
+    undefined,
+    paymentsWired ? { sql: opts.db!, resource: url } : undefined,
+  );
 
   const a2xServer = new A2XServer({
     taskStore,
@@ -94,6 +121,18 @@ export function buildAgentA2XServer(
       // publicUrl).
       continue;
     }
+    if (isX402ExtensionUri(extension.uri)) {
+      // Always dropped, paid or not. `addExtension` is append-only, so leaving
+      // a wire-declared x402 entry in would let a free agent advertise a price
+      // the bridge will never ask for, and would give a paid agent two entries
+      // for the same URI at different prices — with no rule saying which one a
+      // client reads. Pricing is DB-owned; so is saying so on the card.
+      logEvent('x402_wire_advertisement_dropped', {
+        agentId: conn.agentId,
+        uri: extension.uri,
+      });
+      continue;
+    }
     a2xServer.addExtension(extension);
   }
   if (bridgeWillEmitSiwe) {
@@ -116,6 +155,50 @@ export function buildAgentA2XServer(
           sendMessage: `a2a-wallet a2a send --bearer "$TOKEN" ${opts.publicUrl}/agents/${conn.agentId}/.well-known/agent-card.json "Hello"`,
         },
       },
+    });
+  }
+
+  // Advertise x402 when this agent charges. The bridge owns this
+  // advertisement for the same reason it owns the SIWE one: it is the only
+  // side that knows whether a payment gate is actually installed, and pricing
+  // is DB-owned rather than declared by the connecting client.
+  //
+  // `required: false` — a caller that cannot pay still gets a well-formed
+  // `input-required` response naming the price, which is more useful than
+  // being refused at extension activation. `params` mirrors the offering so a
+  // client can decide whether it is willing to pay before spending a turn.
+  // Gated on `paymentsWired`, not just on pricing being set: the card must not
+  // quote a price the gate is not installed to collect.
+  if (conn.x402Pricing && paymentsWired) {
+    const pricing = conn.x402Pricing;
+    a2xServer.addExtension({
+      uri: X402_FOUNDATION_EXTENSION_URI,
+      description:
+        pricing.scheme === 'upto'
+          ? 'x402 metered payments. Calls are answered with an input-required task carrying x402.payment.required; sign the payload (upto requires opting in on the client) and resubmit against the same taskId. You are charged for the tokens actually consumed, up to the authorized maximum.'
+          : 'x402 payments. Calls are answered with an input-required task carrying x402.payment.required; sign the payload and resubmit against the same taskId.',
+      required: false,
+      params:
+        pricing.scheme === 'upto'
+          ? {
+              scheme: 'upto',
+              network: pricing.network,
+              asset: pricing.asset,
+              payTo: pricing.payTo,
+              // The ceiling, not the charge — named to match, because a
+              // client that read it as the price would refuse offers it can
+              // comfortably afford.
+              maxAmount: pricing.maxAmount,
+              ratesPerMTok: pricing.rates,
+              ...(pricing.minAmount !== undefined ? { minAmount: pricing.minAmount } : {}),
+            }
+          : {
+              scheme: 'exact',
+              network: pricing.network,
+              amount: pricing.amount,
+              asset: pricing.asset,
+              payTo: pricing.payTo,
+            },
     });
   }
 

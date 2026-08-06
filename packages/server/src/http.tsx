@@ -19,12 +19,15 @@ import { requestUsage, UsageRpcError } from './usage-rpc.js';
 import {
   AdminApiError,
   addCaller,
+  clearX402Pricing,
   deleteClientForOwner,
+  getX402Pricing,
   issueAgentApiKey,
   listActiveAgents,
   listCallers,
   listClientsForOwner,
   removeCaller,
+  setX402Pricing,
 } from './admin-api.js';
 import {
   AGENT_UNAVAILABLE_RETRY_AFTER_SECONDS,
@@ -119,7 +122,10 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         A2A_EXTENSIONS_HEADER,
         A2A_EXTENSIONS_LEGACY_HEADER,
       ],
-      allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+      // PUT is here for /admin-api/agents/:id/x402. Without it a browser
+      // client (the Vite dev UI) fails preflight even though the CLI's Node
+      // fetch, which sends no preflight, gets through.
+      allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
       credentials: true,
       maxAge: 600,
     }),
@@ -150,6 +156,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   const agentCardOpts: AgentA2XOptions = {
     publicUrl: opts.publicUrl,
     deviceFlowEnabled,
+    db: opts.db,
   };
 
   function getAgentForConn(conn: ClientConnection): A2XServer {
@@ -419,6 +426,60 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     if (!auth.ok) return adminApiUnauthorized(c, auth);
     try {
       const result = await listCallers(opts.db, auth.principalId, c.req.param('id'));
+      return c.json(result);
+    } catch (err) {
+      return adminApiErrorResponse(c, err);
+    }
+  });
+
+  // x402 pricing. The only write path for `agents.x402_pricing` — it is
+  // DB-owned rather than declared by the connecting agent because `payTo`
+  // names the wallet that gets paid. Unlike the agent's own token, these
+  // routes take the owner-session bearer, so a stolen agent token cannot
+  // reprice or redirect payments.
+  app.get('/admin-api/agents/:id/x402', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    try {
+      return c.json(await getX402Pricing(opts.db, auth.principalId, c.req.param('id')));
+    } catch (err) {
+      return adminApiErrorResponse(c, err);
+    }
+  });
+
+  app.put('/admin-api/agents/:id/x402', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Body must be a JSON x402 pricing object.' }, 400);
+    }
+    try {
+      const result = await setX402Pricing(
+        opts.db,
+        opts.registry,
+        auth.principalId,
+        c.req.param('id'),
+        body,
+      );
+      return c.json(result);
+    } catch (err) {
+      return adminApiErrorResponse(c, err);
+    }
+  });
+
+  app.delete('/admin-api/agents/:id/x402', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    try {
+      const result = await clearX402Pricing(
+        opts.db,
+        opts.registry,
+        auth.principalId,
+        c.req.param('id'),
+      );
       return c.json(result);
     } catch (err) {
       return adminApiErrorResponse(c, err);

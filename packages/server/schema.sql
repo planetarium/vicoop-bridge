@@ -262,6 +262,28 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS owner_email TEXT;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS client_id TEXT UNIQUE DEFAULT gen_random_uuid()::text;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS allowed_callers TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+-- x402 pricing for this agent, or NULL for a free agent (the default).
+-- Shape is validated in the server by `X402PricingSchema`
+-- (src/x402/pricing.ts), a union discriminated on `scheme`:
+--
+--   exact (default when `scheme` is absent) — a flat fee per call:
+--     { network, amount, asset, payTo, description?, extra? }
+--
+--   upto — metered, billed on the tokens the call actually consumed:
+--     { scheme: 'upto', network, asset, payTo, maxAmount, facilitatorAddress,
+--       rates: { input, output, cachedInput? },   -- atomic units per MTok
+--       minAmount?, description?, extra? }
+--
+-- Every amount is a decimal string in the asset's smallest unit, never a
+-- number: 18-decimal assets exceed a double's exact integer range.
+--
+-- JSONB rather than columns because the offering follows the x402 spec, whose
+-- scheme-specific fields would otherwise be a column migration each time.
+--
+-- Writable only through the admin API, never through GraphQL: `payTo` decides
+-- who receives money, so it gets the same DB-owned trust boundary as
+-- allowed_callers.
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS x402_pricing JSONB;
 -- See clients.revoked drop note above. Agents was the shadow column.
 ALTER TABLE agents DROP COLUMN IF EXISTS revoked;
 UPDATE agents SET client_id = gen_random_uuid()::text WHERE client_id IS NULL;
@@ -297,6 +319,10 @@ CREATE POLICY agents_postgraphile ON agents
   WITH CHECK (true);
 
 COMMENT ON COLUMN agents.token_hash IS E'@omit';
+-- Readable (an owner should see what their agent charges) but never writable
+-- through GraphQL — the admin API is the only write path, mirroring
+-- agent_policies.allowed_callers.
+COMMENT ON COLUMN agents.x402_pricing IS E'@omit create,update';
 -- Mirrors `clients`: token_hash is server-managed (no create), and the
 -- semantic delete path is `delete_client(TEXT)` which removes both the
 -- agents row and the legacy clients row in one transaction. Letting
@@ -866,6 +892,93 @@ CREATE POLICY used_siwe_nonces_postgraphile ON used_siwe_nonces
   FOR ALL TO app_postgraphile USING (true) WITH CHECK (true);
 
 COMMENT ON TABLE used_siwe_nonces IS E'@omit';
+
+-- ============================================================
+-- 6c. x402 payment offerings
+-- ============================================================
+-- One row per x402 payment round-trip, keyed by the A2A task it gates.
+-- Backs `PostgresX402Store` (src/x402/store.ts), which implements the SDK's
+-- `BaseX402Store`.
+--
+-- Why this must be in Postgres and not in process memory: the round-trip
+-- spans two HTTP requests — turn 1 advertises the offering and answers
+-- `input-required`, turn 2 carries the signed payload — and the bridge runs
+-- several Fly instances behind a load balancer. Turn 2 regularly lands on an
+-- instance that never saw turn 1. With an in-memory store that reads as "no
+-- offering for this task" and the payment is refused (the payer is not
+-- charged, but the call fails). Restarts do the same to a single instance.
+--
+-- `entry` is the SDK's `X402StoreEntry` verbatim — the advertised offering,
+-- lifecycle status, and, once settled, the receipt (tx hash, payer, amount).
+-- It is the audit record of what was charged, so rows outlive the task only
+-- until it terminates, at which point `clearOffering` deletes them.
+--
+-- `expires_at` is duplicated out of `entry` so expiry is a WHERE clause: the
+-- store contract requires `get` to return nothing past the deadline, and a
+-- filtered read satisfies it lazily, with no background reaper.
+-- The key is `(agent_id, task_id)`, not `task_id` alone. Tasks are resolved by
+-- id from a store shared across every agent (see #453), so a task created at
+-- agent A can be resumed at agent B's endpoint. Keyed on task_id alone, B's
+-- gate would find A's offering and accept A's cheap signature as payment for
+-- B's work.
+--
+-- `pricing` is the agent's pricing captured when the offering was published.
+-- Settlement must price from this, never from the agent's live pricing: the
+-- two turns of a payment are separate requests, and a reprice in between would
+-- otherwise meter turn 2 against a requirement turn 1 signed under different
+-- terms — which settles the wrong amount.
+--
+-- `claimed_at` is a one-shot concurrency guard. The SDK's `classify()` does not
+-- inspect the entry's status, so replaying one signed submission before
+-- settlement would classify valid twice and run the backend work twice for a
+-- single authorization. Claiming is a conditional UPDATE; the loser is refused.
+CREATE TABLE IF NOT EXISTS x402_offerings (
+  task_id     TEXT NOT NULL,
+  agent_id    TEXT NOT NULL,
+  entry       JSONB NOT NULL,
+  pricing     JSONB,
+  claimed_at  TIMESTAMPTZ,
+  expires_at  TIMESTAMPTZ,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (agent_id, task_id)
+);
+
+-- Converge a dev DB created from the first cut of this table, which keyed on
+-- task_id alone and had neither column. Never deployed, so this is only here
+-- so re-applying schema.sql on such a database doesn't fail.
+ALTER TABLE x402_offerings ADD COLUMN IF NOT EXISTS pricing JSONB;
+ALTER TABLE x402_offerings ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE i.indrelid = 'x402_offerings'::regclass
+      AND i.indisprimary
+      AND array_length(i.indkey::int2[], 1) = 1
+  ) THEN
+    ALTER TABLE x402_offerings DROP CONSTRAINT x402_offerings_pkey;
+    ALTER TABLE x402_offerings ADD PRIMARY KEY (agent_id, task_id);
+  END IF;
+END $$;
+
+-- Supports the expiry sweep and per-agent operational queries.
+CREATE INDEX IF NOT EXISTS x402_offerings_expires_idx
+  ON x402_offerings(expires_at);
+CREATE INDEX IF NOT EXISTS x402_offerings_agent_idx
+  ON x402_offerings(agent_id);
+
+ALTER TABLE x402_offerings ENABLE ROW LEVEL SECURITY;
+
+-- Server-only, like `callers` and `device_sessions`: the row holds in-flight
+-- payment state that no GraphQL consumer should read or write, so it gets the
+-- app_postgraphile bypass alone and no app_authenticated policies.
+DROP POLICY IF EXISTS x402_offerings_postgraphile ON x402_offerings;
+CREATE POLICY x402_offerings_postgraphile ON x402_offerings
+  FOR ALL TO app_postgraphile USING (true) WITH CHECK (true);
+
+COMMENT ON TABLE x402_offerings IS E'@omit';
 
 -- ============================================================
 -- 7. Grants

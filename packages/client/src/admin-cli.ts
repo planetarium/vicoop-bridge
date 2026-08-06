@@ -14,6 +14,7 @@ import { argument, command, constant, flag, option } from '@optique/core/primiti
 import { message } from '@optique/core/message';
 import type { InferValue } from '@optique/core/parser';
 import { integer, string } from '@optique/core/valueparser';
+import { readFile } from 'node:fs/promises';
 import { resolveOwnerSession } from './owner-session.js';
 import { agentRegisterCmd } from './setup.js';
 
@@ -186,6 +187,100 @@ const agentCallersSubCmd = command(
   },
 );
 
+// ----- agent x402 (pricing) ---------------------------------------------------
+//
+// Pricing is server-side state, not client config: `payTo` names the wallet
+// that receives money, so it is stored on the agent's DB row and written only
+// with the owner-session bearer. A stolen agent token can therefore not
+// reprice an agent or redirect its payments. These commands are the operator's
+// interface to that state, mirroring `agent callers`.
+
+const agentX402ShowSubCmd = command(
+  'show',
+  object({
+    action: constant('agent-x402-show' as const),
+    ...sharedFlags,
+    agentId: argument(string({ metavar: 'AGENT_ID' })),
+  }),
+  {
+    brief: message`Show what this agent charges, or that it is free.`,
+    description: message`Calls GET /admin-api/agents/<AGENT_ID>/x402.`,
+  },
+);
+
+const agentX402SetSubCmd = command(
+  'set',
+  object({
+    action: constant('agent-x402-set' as const),
+    ...sharedFlags,
+    agentId: argument(string({ metavar: 'AGENT_ID' })),
+    file: optional(option('--file', string({ metavar: 'PATH' }), {
+      description: message`Read the pricing object as JSON from PATH, or from stdin when PATH is \`-\`. Mutually exclusive with the field flags below.`,
+    })),
+    scheme: optional(option('--scheme', string({ metavar: 'exact|upto' }), {
+      description: message`Pricing scheme. Defaults to \`exact\` (a flat fee per call).`,
+    })),
+    network: optional(option('--network', string({ metavar: 'CAIP2' }), {
+      description: message`Chain id, e.g. eip155:84532 for Base Sepolia.`,
+    })),
+    asset: optional(option('--asset', string({ metavar: 'ADDRESS' }), {
+      description: message`Token contract address.`,
+    })),
+    payTo: optional(option('--pay-to', string({ metavar: 'ADDRESS' }), {
+      description: message`Wallet that receives the payment.`,
+    })),
+    amount: optional(option('--amount', string({ metavar: 'ATOMIC' }), {
+      description: message`exact only: price per call, in the asset's smallest unit (USDC has 6 decimals, so 10000 = 0.01 USDC).`,
+    })),
+    maxAmount: optional(option('--max-amount', string({ metavar: 'ATOMIC' }), {
+      description: message`upto only: the ceiling the payer authorizes. The metered charge is clamped to it.`,
+    })),
+    minAmount: optional(option('--min-amount', string({ metavar: 'ATOMIC' }), {
+      description: message`upto only: floor for a completed call, and what is charged when the backend reported no token usage. Set this — without it such calls are free.`,
+    })),
+    rateInput: optional(option('--rate-input', string({ metavar: 'ATOMIC' }), {
+      description: message`upto only: price per MILLION input tokens, in atomic units.`,
+    })),
+    rateOutput: optional(option('--rate-output', string({ metavar: 'ATOMIC' }), {
+      description: message`upto only: price per MILLION output tokens, in atomic units.`,
+    })),
+    rateCachedInput: optional(option('--rate-cached-input', string({ metavar: 'ATOMIC' }), {
+      description: message`upto only: price per MILLION cache-read input tokens. Omitted means the same as --rate-input, NOT free.`,
+    })),
+    facilitator: optional(option('--facilitator', string({ metavar: 'ADDRESS' }), {
+      description: message`upto only: facilitator address the payer's Permit2 witness binds to. Read it from the facilitator's GET /supported.`,
+    })),
+    description: optional(option('--description', string({ metavar: 'TEXT' }), {
+      description: message`Shown in the payer's wallet consent prompt.`,
+    })),
+  }),
+  {
+    brief: message`Set what this agent charges.`,
+    description: message`Calls PUT /admin-api/agents/<AGENT_ID>/x402. Validated server-side against the same schema the payment gate uses, so a bad address or a non-atomic amount is rejected here rather than silently disabling payments at the agent's next connect. Hot-reloaded — no daemon restart needed. Amounts are always atomic units as decimal strings, never dollars.`,
+  },
+);
+
+const agentX402ClearSubCmd = command(
+  'clear',
+  object({
+    action: constant('agent-x402-clear' as const),
+    ...sharedFlags,
+    agentId: argument(string({ metavar: 'AGENT_ID' })),
+  }),
+  {
+    brief: message`Make this agent free again.`,
+    description: message`Calls DELETE /admin-api/agents/<AGENT_ID>/x402. The agent stops requesting payment on the next call.`,
+  },
+);
+
+const agentX402SubCmd = command(
+  'x402',
+  longestMatch(agentX402ShowSubCmd, agentX402SetSubCmd, agentX402ClearSubCmd),
+  {
+    brief: message`Manage the agent's x402 pricing.`,
+  },
+);
+
 export const agentCmd = command(
   'agent',
   // `agentCallersSubCmd` MUST come before `agentListSubCmd` / `agentRemoveSubCmd`.
@@ -198,12 +293,13 @@ export const agentCmd = command(
   longestMatch(
     agentRegisterCmd,
     agentCallersSubCmd,
+    agentX402SubCmd,
     agentListSubCmd,
     agentRemoveSubCmd,
   ),
   {
-    brief: message`Manage agent registrations and their callers.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, issue-api-key}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    brief: message`Manage agent registrations, their callers, and their pricing.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, issue-api-key}\`, \`x402 {show, set, clear}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
     hidden: 'usage',
   },
 );
@@ -215,6 +311,9 @@ export type AgentCallersListArgs = Extract<AgentCliArgs, { action: 'agent-caller
 export type AgentCallersAddArgs = Extract<AgentCliArgs, { action: 'agent-callers-add' }>;
 export type AgentCallersRemoveArgs = Extract<AgentCliArgs, { action: 'agent-callers-remove' }>;
 export type AgentCallersIssueArgs = Extract<AgentCliArgs, { action: 'agent-callers-issue' }>;
+export type AgentX402ShowArgs = Extract<AgentCliArgs, { action: 'agent-x402-show' }>;
+export type AgentX402SetArgs = Extract<AgentCliArgs, { action: 'agent-x402-set' }>;
+export type AgentX402ClearArgs = Extract<AgentCliArgs, { action: 'agent-x402-clear' }>;
 
 // ----- Legacy flat commands (deprecated, kept as aliases) --------------------
 //
@@ -349,7 +448,7 @@ function resolveSession(args: {
 
 interface RequestArgs {
   session: Session;
-  method: 'GET' | 'POST' | 'DELETE';
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE';
   path: string;
   body?: unknown;
 }
@@ -706,6 +805,155 @@ async function execRemoveCaller(args: CallerCommonArgs & { principal: string }):
     path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/callers?principal=${encodeURIComponent(args.principal)}`,
   });
   return emit(result, args.json, renderCallerMutation);
+}
+
+// ----- agent x402 (pricing) ---------------------------------------------------
+
+/**
+ * Assemble the pricing object from the field flags.
+ *
+ * Deliberately assembles rather than validates: the server checks the result
+ * against the same schema the payment gate uses, so validating here would
+ * mean two copies of the rules that could drift. The one thing done locally
+ * is rejecting a mix of `--file` and field flags, which is a CLI-shape error
+ * the server can't see.
+ */
+function buildPricingFromFlags(args: AgentX402SetArgs): Record<string, unknown> | null {
+  const out: Record<string, unknown> = {};
+  const put = (key: string, value: string | undefined): void => {
+    if (value !== undefined) out[key] = value;
+  };
+  put('scheme', args.scheme);
+  put('network', args.network);
+  put('asset', args.asset);
+  put('payTo', args.payTo);
+  put('amount', args.amount);
+  put('maxAmount', args.maxAmount);
+  put('minAmount', args.minAmount);
+  put('facilitatorAddress', args.facilitator);
+  put('description', args.description);
+
+  const rates: Record<string, unknown> = {};
+  if (args.rateInput !== undefined) rates.input = args.rateInput;
+  if (args.rateOutput !== undefined) rates.output = args.rateOutput;
+  if (args.rateCachedInput !== undefined) rates.cachedInput = args.rateCachedInput;
+  if (Object.keys(rates).length > 0) out.rates = rates;
+
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+async function readPricingFile(path: string): Promise<unknown> {
+  const raw =
+    path === '-'
+      ? await new Promise<string>((resolve, reject) => {
+          let buf = '';
+          process.stdin.setEncoding('utf-8');
+          process.stdin.on('data', (chunk) => {
+            buf += chunk;
+          });
+          process.stdin.on('end', () => resolve(buf));
+          process.stdin.on('error', reject);
+        })
+      : await readFile(path, 'utf-8');
+  return JSON.parse(raw);
+}
+
+function renderPricing(body: unknown): string {
+  const b = body as { agent_id?: string; x402_pricing?: Record<string, unknown> | null };
+  if (!b.x402_pricing) {
+    return `agent:   ${b.agent_id ?? '?'}\npricing: free (no x402 pricing configured)`;
+  }
+  const p = b.x402_pricing;
+  const lines = [`agent:   ${b.agent_id ?? '?'}`, `scheme:  ${String(p.scheme ?? 'exact')}`];
+  lines.push(`network: ${String(p.network ?? '')}`);
+  lines.push(`asset:   ${String(p.asset ?? '')}`);
+  lines.push(`payTo:   ${String(p.payTo ?? '')}`);
+  if (p.scheme === 'upto') {
+    const rates = (p.rates ?? {}) as Record<string, unknown>;
+    lines.push(`ceiling: ${String(p.maxAmount ?? '')} (authorized maximum, not the charge)`);
+    lines.push(
+      `rates:   in=${String(rates.input ?? '')} out=${String(rates.output ?? '')}` +
+        ` cached=${rates.cachedInput === undefined ? 'same as in' : String(rates.cachedInput)}` +
+        ' (per million tokens)',
+    );
+    lines.push(
+      `floor:   ${p.minAmount === undefined ? '0 — calls the backend cannot meter are FREE' : String(p.minAmount)}`,
+    );
+    lines.push(`facilitator: ${String(p.facilitatorAddress ?? '')}`);
+  } else {
+    lines.push(`amount:  ${String(p.amount ?? '')} (per call)`);
+  }
+  if (p.description !== undefined) lines.push(`description: ${String(p.description)}`);
+  return lines.join('\n');
+}
+
+export async function runAgentX402Show(args: AgentX402ShowArgs): Promise<number> {
+  const session = resolveSession(args);
+  if ('error' in session) {
+    process.stderr.write(`${session.error}\n`);
+    return 1;
+  }
+  const result = await callApi({
+    session,
+    method: 'GET',
+    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/x402`,
+  });
+  return emit(result, args.json, renderPricing);
+}
+
+export async function runAgentX402Set(args: AgentX402SetArgs): Promise<number> {
+  const session = resolveSession(args);
+  if ('error' in session) {
+    process.stderr.write(`${session.error}\n`);
+    return 1;
+  }
+
+  const fromFlags = buildPricingFromFlags(args);
+  if (args.file !== undefined && fromFlags !== null) {
+    process.stderr.write(
+      '--file cannot be combined with the pricing field flags; pass the whole object one way or the other.\n',
+    );
+    return 1;
+  }
+
+  let pricing: unknown;
+  if (args.file !== undefined) {
+    try {
+      pricing = await readPricingFile(args.file);
+    } catch (err) {
+      process.stderr.write(`could not read pricing JSON: ${(err as Error).message}\n`);
+      return 1;
+    }
+  } else if (fromFlags !== null) {
+    pricing = fromFlags;
+  } else {
+    process.stderr.write(
+      'Nothing to set. Pass --file <path|-> or the pricing field flags (see `vicoop-client agent x402 set --help`).\n',
+    );
+    return 1;
+  }
+
+  const result = await callApi({
+    session,
+    method: 'PUT',
+    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/x402`,
+    body: pricing,
+  });
+  return emit(result, args.json, renderPricing);
+}
+
+export async function runAgentX402Clear(args: AgentX402ClearArgs): Promise<number> {
+  const session = resolveSession(args);
+  if ('error' in session) {
+    process.stderr.write(`${session.error}\n`);
+    return 1;
+  }
+  const result = await callApi({
+    session,
+    method: 'DELETE',
+    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/x402`,
+  });
+  return emit(result, args.json, renderPricing);
 }
 
 export async function runAgentCallersList(args: AgentCallersListArgs): Promise<number> {
