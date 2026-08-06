@@ -194,6 +194,13 @@ export class X402Gate {
         // Turn 1. `requestPayment` persists the offering (status `offered`,
         // with the TTL) and yields the `request-input` event we translate.
         const accepts = pricingToAccepts(this.pricing, resource);
+        // Freeze the terms *before* the offering exists. The SDK owns the
+        // entry write, so the two cannot share one statement; ordering it this
+        // way means an entry never exists without a snapshot, and the failure
+        // mode of a crash in between is a snapshot with no offering — which
+        // reads as "no offering" and is refused, rather than an offering with
+        // no terms.
+        await this.sidecar.putPricing(taskId, this.pricing);
         let metadata: Record<string, unknown> | undefined;
         let text: string | undefined;
         for await (const event of this.x402.requestPayment(ctx, {
@@ -211,10 +218,6 @@ export class X402Gate {
           // silently serve the call for free.
           throw new Error('x402 requestPayment yielded no request-input event');
         }
-        // Freeze the terms alongside the offering. Turn 2 settles from this,
-        // so a reprice between the turns cannot change what the payer is
-        // charged for a requirement they already signed.
-        await this.sidecar.putPricing(taskId, this.pricing);
         logEvent('x402_payment_required', {
           agentId: this.agentId,
           taskId,
@@ -272,8 +275,9 @@ export class X402Gate {
       // agent charges right now.
       const settlementPricing = await this.sidecar.getPricing(taskId);
       if (settlementPricing === undefined) {
-        // Written in the same breath as the offering, so this is corruption
-        // rather than a normal state. Refuse instead of guessing a price.
+        // Written before the offering row carries an entry, so absence here
+        // is corruption rather than a normal state. Refuse instead of
+        // guessing a price.
         logEvent('x402_pricing_snapshot_missing', { agentId: this.agentId, taskId });
         return {
           kind: 'halt',
@@ -282,6 +286,32 @@ export class X402Gate {
             contextId,
             code: 'SETTLEMENT_FAILED',
             reason: 'The terms this payment was offered under are no longer available.',
+          }),
+        };
+      }
+
+      // The snapshot and the requirement the payer actually signed must name
+      // the same scheme. Concurrent turn-1s racing a reprice can leave the two
+      // disagreeing, and the disagreement is expensive in one specific
+      // direction: an `upto` requirement paired with an `exact` snapshot skips
+      // the metering branch, which hands the SDK no amount and settles the
+      // full authorized ceiling. Refuse rather than let a mismatch pick a
+      // price — merely skipping the metering is not a safe default here.
+      const signedScheme = requirementScheme(classified.requirement);
+      if (signedScheme !== settlementPricing.scheme) {
+        logEvent('x402_scheme_mismatch', {
+          agentId: this.agentId,
+          taskId,
+          signed: signedScheme,
+          snapshot: settlementPricing.scheme,
+        });
+        return {
+          kind: 'halt',
+          event: this.failedEvent({
+            taskId,
+            contextId,
+            code: 'SETTLEMENT_FAILED',
+            reason: 'The offered terms and the signed payment disagree; start a new task.',
           }),
         };
       }

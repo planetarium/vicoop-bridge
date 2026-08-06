@@ -763,6 +763,46 @@ test('a replayed submission is refused instead of running the work twice', async
   assert.equal(facilitator.verifyCalls, 1);
 });
 
+test('a snapshot that disagrees with the signed requirement is refused, not silently unmetered', async () => {
+  // Concurrent turn-1s racing a reprice can leave the offering and the
+  // snapshot describing different schemes. Merely skipping the metering
+  // branch is the expensive failure: an `upto` requirement with no amount
+  // settles the full authorized ceiling.
+  const facilitator = stubFacilitator();
+  const store = new InMemoryX402Store();
+  const sidecar = memorySidecar();
+
+  // Publish an `upto` offering, then corrupt the snapshot to `exact`.
+  const gate = new X402Gate(
+    'a1',
+    UPTO_PRICING,
+    new X402Context({ store, facilitator, x402Version: 2 }),
+    sidecar,
+  );
+  const first = await gate.open({
+    taskId: 'mismatch',
+    contextId: 'ctx-mismatch',
+    message: userMessage(),
+    resource: RESOURCE,
+  });
+  assert.equal(first.kind, 'halt');
+  if (first.kind !== 'halt') return;
+  await sidecar.putPricing('mismatch', PRICING);
+
+  const second = await gate.open({
+    taskId: 'mismatch',
+    contextId: 'ctx-mismatch',
+    message: uptoSubmissionMessage(offeredRequirement(first.event)),
+    resource: RESOURCE,
+  });
+
+  assert.equal(second.kind, 'halt');
+  if (second.kind !== 'halt') return;
+  assert.equal(second.event.status.state, TaskState.FAILED);
+  assert.equal(facilitator.verifyCalls, 0, 'refused before the facilitator is involved');
+  assert.equal(facilitator.settleCalls, 0);
+});
+
 test('a missing pricing snapshot refuses the call rather than guessing a price', async () => {
   // Written in the same breath as the offering, so absence means corruption.
   // Falling back to live pricing here is exactly the bug the snapshot exists

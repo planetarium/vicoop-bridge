@@ -113,12 +113,17 @@ export class PostgresX402Store extends BaseX402Store {
   }
 
   async get(taskId: string): Promise<X402StoreEntry | undefined> {
+    // `jsonb_exists(entry, 'accepts')` skips the placeholder row that
+    // `putPricing` inserts before the SDK writes the real entry: a row without
+    // `accepts` is terms with no offering, and handing it back would present
+    // an empty offering as a real one.
     const rows = await this.sql<OfferingRow[]>`
       SELECT task_id, entry
       FROM x402_offerings
       WHERE agent_id = ${this.agentId}
         AND task_id = ${taskId}
         AND (expires_at IS NULL OR expires_at > now())
+        AND jsonb_exists(entry, 'accepts')
     `;
     const row = rows[0];
     return row ? reviveEntry(row.entry) : undefined;
@@ -151,10 +156,27 @@ export class PostgresX402Store extends BaseX402Store {
    * would otherwise meter turn 2 against terms turn 1 never signed.
    */
   async putPricing(taskId: string, pricing: X402Pricing): Promise<void> {
+    // Upsert, because this runs *before* the SDK writes the offering entry —
+    // the row may not exist yet. Sequencing it first means an entry never
+    // exists without terms; the reverse order can leave an offering that
+    // settlement has no price for.
+    //
+    // `entry` gets a placeholder on insert and is immediately overwritten by
+    // the SDK's `put`. It is never read in that state: `get` goes through the
+    // SDK's shape and the gate only reaches settlement via `classify`, which
+    // requires a real entry.
     await this.sql`
-      UPDATE x402_offerings
-      SET pricing = ${this.sql.json(JSON.parse(JSON.stringify(pricing)))}
-      WHERE agent_id = ${this.agentId} AND task_id = ${taskId}
+      INSERT INTO x402_offerings (task_id, agent_id, entry, pricing, updated_at)
+      VALUES (
+        ${taskId},
+        ${this.agentId},
+        '{}'::jsonb,
+        ${this.sql.json(JSON.parse(JSON.stringify(pricing)))},
+        now()
+      )
+      ON CONFLICT (agent_id, task_id) DO UPDATE
+        SET pricing = EXCLUDED.pricing,
+            updated_at = now()
     `;
   }
 
@@ -193,6 +215,7 @@ export class PostgresX402Store extends BaseX402Store {
         AND task_id = ${taskId}
         AND claimed_at IS NULL
         AND (expires_at IS NULL OR expires_at > now())
+        AND jsonb_exists(entry, 'accepts')
       RETURNING task_id
     `;
     return rows.length > 0;

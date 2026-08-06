@@ -216,6 +216,20 @@ export class WSForwardingExecutor extends AgentExecutor {
    * For a metered (`upto`) agent the charge comes from the token counts the
    * connected agent reported on its `task.complete` frame, which `ws.ts`
    * stashes on the binding.
+   *
+   * **The output has already reached the caller by the time this runs.**
+   * Artifacts stream out as the agent produces them, and settlement cannot
+   * begin until the work is done — under `upto` there is nothing to meter
+   * before then. So a payer who invalidates their authorization between
+   * `verify` and here receives the full result and a `failed` status.
+   *
+   * That window is accepted rather than closed. The alternatives are worse:
+   * buffering output until settlement lands would remove streaming from
+   * exactly the agents people pay for, and settling before the work would
+   * charge for tasks that fail — which, on a bridge fronting coding agents
+   * that time out and error, is the far more common case. Undercharging on a
+   * rare adversarial payer beats overcharging on routine failure. The
+   * exposure is one task's work, and `x402_unpaid_delivery` measures it.
    */
   private async settleTerminal(
     gate: X402Gate,
@@ -251,7 +265,17 @@ export class WSForwardingExecutor extends AgentExecutor {
       pricing: settlement.pricing,
       ...metered,
     });
-    if (result.kind === 'failed') return result.event;
+    if (result.kind === 'failed') {
+      // The caller already has the output — see the note above. This is the
+      // event that quantifies the accepted window, so it is emitted here
+      // rather than left implicit in the settlement failure.
+      logEvent('x402_unpaid_delivery', {
+        agentId: this.agentId,
+        taskId,
+        artifacts: event.status.message !== undefined ? 1 : 0,
+      });
+      return result.event;
+    }
 
     // Attach the settlement receipt to the final status message, which is
     // where the x402 transport specifies clients read it from.

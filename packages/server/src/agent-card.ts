@@ -7,7 +7,9 @@ import {
 import { SIWE_BEARER_AUTH_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import type { ClientConnection, Registry } from './registry.js';
 import { WSForwardingExecutor } from './executor.js';
+import { isX402ExtensionUri } from '@a2x/sdk/x402';
 import { X402_FOUNDATION_EXTENSION_URI } from './x402/gate.js';
+import { logEvent } from './log.js';
 import type { Sql } from './db.js';
 
 export interface AgentA2XOptions {
@@ -41,12 +43,26 @@ export function buildAgentA2XServer(
     ? `${opts.publicUrl}/agents/${conn.agentId}`
     : `/agents/${conn.agentId}`;
 
+  // x402 `resource` must be an absolute URL — strict facilitators reject
+  // anything else, so without `publicUrl` a paid agent would publish offerings
+  // that can never verify or settle. Withhold the gate instead: the agent
+  // serves for free and says so in the log, which is a working deployment with
+  // a visible misconfiguration rather than a broken payment loop. Same posture
+  // as an unparseable pricing row.
+  const paymentsWired = Boolean(opts.db) && Boolean(opts.publicUrl);
+  if (opts.db && !opts.publicUrl && conn.x402Pricing) {
+    logEvent('x402_config_invalid', {
+      agentId: conn.agentId,
+      reason: 'pricing is configured but PUBLIC_URL is not, so no absolute resource URL exists',
+    });
+  }
+
   const executor = new WSForwardingExecutor(
     conn.agentId,
     registry,
     taskStore,
     undefined,
-    opts.db ? { sql: opts.db, resource: url } : undefined,
+    paymentsWired ? { sql: opts.db!, resource: url } : undefined,
   );
 
   const a2xServer = new A2XServer({
@@ -105,6 +121,18 @@ export function buildAgentA2XServer(
       // publicUrl).
       continue;
     }
+    if (isX402ExtensionUri(extension.uri)) {
+      // Always dropped, paid or not. `addExtension` is append-only, so leaving
+      // a wire-declared x402 entry in would let a free agent advertise a price
+      // the bridge will never ask for, and would give a paid agent two entries
+      // for the same URI at different prices — with no rule saying which one a
+      // client reads. Pricing is DB-owned; so is saying so on the card.
+      logEvent('x402_wire_advertisement_dropped', {
+        agentId: conn.agentId,
+        uri: extension.uri,
+      });
+      continue;
+    }
     a2xServer.addExtension(extension);
   }
   if (bridgeWillEmitSiwe) {
@@ -139,7 +167,9 @@ export function buildAgentA2XServer(
   // `input-required` response naming the price, which is more useful than
   // being refused at extension activation. `params` mirrors the offering so a
   // client can decide whether it is willing to pay before spending a turn.
-  if (conn.x402Pricing) {
+  // Gated on `paymentsWired`, not just on pricing being set: the card must not
+  // quote a price the gate is not installed to collect.
+  if (conn.x402Pricing && paymentsWired) {
     const pricing = conn.x402Pricing;
     a2xServer.addExtension({
       uri: X402_FOUNDATION_EXTENSION_URI,

@@ -52,6 +52,24 @@ If settlement itself fails, the task is reported `failed` rather than
 `completed`: the caller got the work but the merchant was not paid, and
 reporting success would hide that.
 
+### The accepted window: output ships before settlement
+
+Artifacts stream to the caller as the agent produces them, and settlement
+cannot start until the work is done — under `upto` there is nothing to meter
+before then. **A payer who invalidates their authorization between `verify` and
+settlement therefore receives the full result and a `failed` status.**
+
+This window is accepted rather than closed, because both ways of closing it are
+worse. Buffering output until settlement lands would remove streaming from
+exactly the agents people pay for. Settling before the work would charge for
+tasks that fail — and on a bridge fronting coding agents, timeouts and backend
+errors are far more common than an adversarial payer. Undercharging in a rare
+attack beats overcharging on routine failure.
+
+The exposure is one task's work per occurrence, and `x402_unpaid_delivery`
+counts it. A rising rate is worth investigating; a flat zero is the expected
+state.
+
 ## Configuring an agent's price
 
 From the operator's machine, with the same owner-session bearer `agent callers`
@@ -236,6 +254,13 @@ event is the only thing telling you so.
 | `BRIDGE_X402_FACILITATOR_URL` | SDK default (`https://x402.org/facilitator`) | Facilitator running verify + settle. |
 | `BRIDGE_X402_OFFER_TTL_SECONDS` | `600` | How long a payer has to sign and resubmit. Past it the offering lapses and the submission is refused; the payer is not charged, they just start over. |
 
+**`PUBLIC_URL` is required for paid agents.** The x402 `resource` must be an
+absolute URL — strict facilitators reject anything else — so without it an
+agent would publish offerings that can never verify or settle. The bridge
+withholds the payment gate in that case and logs `x402_config_invalid`: the
+agent serves for free with a visible misconfiguration, rather than running a
+payment loop that cannot complete. Its card advertises no price either.
+
 The AgentCard advertises `X402_FOUNDATION_EXTENSION_URI` with the price in
 `params` when — and only when — pricing is configured, so a caller can decide
 whether it is willing to pay before spending a turn. It is advertised
@@ -301,6 +326,9 @@ All events are structured JSON on stdout (see
 | `x402_gate_error` | the payment rail was unavailable; the call was refused rather than served free |
 | `x402_submission_replayed` | a payment already used for this task was submitted again; refused before the backend was reached |
 | `x402_pricing_snapshot_missing` | the offering's frozen terms were gone at settle time; the call was refused rather than priced from live pricing |
+| `x402_scheme_mismatch` | the frozen terms and the signed requirement named different schemes; refused rather than mispriced |
+| `x402_unpaid_delivery` | settlement failed after the caller already had the output — the accepted window above, made countable |
+| `x402_wire_advertisement_dropped` | a connecting agent tried to advertise its own x402 terms on its card; discarded |
 | `x402_pricing_invalid` | a malformed pricing row; the agent is treated as free |
 | `x402_config_invalid` | `upto` pricing on a V1 deployment; every call is refused until fixed |
 | `x402_pricing_refreshed` | this instance re-read an agent's pricing after another instance changed it |
