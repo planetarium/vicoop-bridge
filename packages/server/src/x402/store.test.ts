@@ -64,8 +64,7 @@ test(
       const a = new PostgresX402Store(sql, `${tag}-agent-a`);
       const b = new PostgresX402Store(sql, `${tag}-agent-b`);
 
-      await a.put(entry(taskId));
-      await a.putPricing(taskId, PRICING);
+      await a.publishing(taskId, PRICING, () => a.put(entry(taskId)));
 
       assert.ok(await a.get(taskId), 'the owning agent sees its own offering');
       assert.equal(await b.get(taskId), undefined, 'another agent must not');
@@ -134,8 +133,7 @@ test(
     await withDb(async (sql, tag) => {
       const taskId = `${tag}-patch`;
       const store = new PostgresX402Store(sql, `${tag}-agent`);
-      await store.put(entry(taskId));
-      await store.putPricing(taskId, PRICING);
+      await store.publishing(taskId, PRICING, () => store.put(entry(taskId)));
       assert.equal(await store.claim(taskId), true);
 
       await store.update(taskId, { status: 'verified', verifiedAt: new Date() });
@@ -197,9 +195,45 @@ test(
         rates: { input: '3000000', output: '15000000', cachedInput: '300000' },
       })!;
 
-      await store.put(entry(taskId));
-      await store.putPricing(taskId, upto);
+      await store.publishing(taskId, upto, () => store.put(entry(taskId)));
       assert.deepEqual(await store.getPricing(taskId), upto);
+    });
+  },
+);
+
+test(
+  'concurrent publishes never pair one offering with the other terms',
+  { skip: !hasDb },
+  async () => {
+    // The race this design exists for. Two turn-1s for the same task, racing a
+    // reprice: whichever offering ends up stored, the terms beside it must be
+    // the ones that produced it. Writing the two separately — in either order —
+    // can interleave into A's offering with B's rates, and since both are the
+    // same scheme no downstream shape check would notice.
+    await withDb(async (sql, tag) => {
+      const taskId = `${tag}-race`;
+      const store = new PostgresX402Store(sql, `${tag}-agent`);
+
+      const cheap = parseX402Pricing({ ...PRICING, amount: '10000' })!;
+      const dear = parseX402Pricing({ ...PRICING, amount: '990000' })!;
+      const offering = (amount: string) =>
+        entry(taskId, {
+          accepts: [{ ...entry(taskId).accepts[0]!, amount }],
+        });
+
+      await Promise.all([
+        store.publishing(taskId, cheap, () => store.put(offering('10000'))),
+        store.publishing(taskId, dear, () => store.put(offering('990000'))),
+      ]);
+
+      const stored = await store.get(taskId);
+      const terms = await store.getPricing(taskId);
+      assert.ok(stored && terms);
+      assert.equal(
+        terms.scheme === 'exact' ? terms.amount : undefined,
+        stored.accepts[0]!.amount,
+        'the stored terms must be the ones that produced the stored offering',
+      );
     });
   },
 );

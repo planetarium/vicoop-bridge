@@ -137,7 +137,12 @@ export interface X402GateParams {
  * without a database.
  */
 export interface X402OfferingSidecar {
-  putPricing(taskId: string, pricing: X402Pricing): Promise<void>;
+  /**
+   * Run `fn` with `pricing` bound to whatever offering it publishes, so the
+   * two are written together. Anything less leaves a window where concurrent
+   * turn-1s racing a reprice pair one offering with the other's terms.
+   */
+  publishing<T>(taskId: string, pricing: X402Pricing, fn: () => Promise<T>): Promise<T>;
   getPricing(taskId: string): Promise<X402Pricing | undefined>;
   /** `true` for the one caller that wins the right to act on a submission. */
   claim(taskId: string): Promise<boolean>;
@@ -211,24 +216,24 @@ export class X402Gate {
         // Turn 1. `requestPayment` persists the offering (status `offered`,
         // with the TTL) and yields the `request-input` event we translate.
         const accepts = pricingToAccepts(this.pricing, resource);
-        // Freeze the terms *before* the offering exists. The SDK owns the
-        // entry write, so the two cannot share one statement; ordering it this
-        // way means an entry never exists without a snapshot, and the failure
-        // mode of a crash in between is a snapshot with no offering — which
-        // reads as "no offering" and is refused, rather than an offering with
-        // no terms.
-        await this.sidecar.putPricing(taskId, this.pricing);
         let metadata: Record<string, unknown> | undefined;
         let text: string | undefined;
-        for await (const event of this.x402.requestPayment(ctx, {
-          accepts,
-          expiresInSeconds: OFFERING_TTL_SECONDS,
-        })) {
-          if (event.type === 'request-input') {
-            metadata = event.metadata;
-            text = event.message;
+        // The terms ride along with the offering write the SDK performs inside
+        // here, in one statement. Writing them separately — in either order —
+        // leaves a window where two concurrent turn-1s racing a reprice
+        // interleave into one agent's offering paired with the other's rates.
+        // Both would be the same scheme, so no shape check downstream can tell.
+        await this.sidecar.publishing(taskId, this.pricing, async () => {
+          for await (const event of this.x402.requestPayment(ctx, {
+            accepts,
+            expiresInSeconds: OFFERING_TTL_SECONDS,
+          })) {
+            if (event.type === 'request-input') {
+              metadata = event.metadata;
+              text = event.message;
+            }
           }
-        }
+        });
         if (metadata === undefined) {
           // `requestPayment` always yields a `request-input`; reaching here
           // means the SDK contract changed under us. Refuse rather than

@@ -422,12 +422,21 @@ export class WSForwardingExecutor extends AgentExecutor {
           },
         },
       };
-      task.status = failEvent.status;
-      history = appendHistoryMessage(history, failEvent.status.message);
+      // Route through the same terminal handling as any other failure. The
+      // agent can disconnect between verify and here, and under `exact` the
+      // payer has already been charged by that point — this is what attaches
+      // their receipt, records `x402_paid_task_failed`, and releases the
+      // offering. Skipping it also left `deferred` offerings uncleared.
+      const terminal =
+        gate && settlement
+          ? await this.settleTerminal(gate, settlement, failEvent, binding, taskId, contextId)
+          : failEvent;
+      task.status = terminal.status;
+      history = appendHistoryMessage(history, terminal.status.message);
       task.history = history;
       this.registry.unbindTask(taskId, binding);
       if (this.abortControllers.get(taskId) === ac) this.abortControllers.delete(taskId);
-      yield failEvent;
+      yield terminal;
       try {
         await this.taskStore.updateTask(taskId, {
           status: task.status,

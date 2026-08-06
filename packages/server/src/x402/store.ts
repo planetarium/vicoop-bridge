@@ -3,8 +3,23 @@ import {
   type X402StoreEntry,
   type X402StoreEntryPatch,
 } from '@a2x/sdk/x402';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Sql } from '../db.js';
 import { parseX402Pricing, type X402Pricing } from './pricing.js';
+
+// The pricing an in-flight `requestPayment` is publishing.
+//
+// The SDK owns the offering write, so the terms cannot be passed to it as an
+// argument — but they must land in the *same* statement. Storing them
+// separately leaves a window where two concurrent turn-1s racing a reprice
+// interleave into one offering paired with the other's terms: same scheme, so
+// no shape check catches it, and the caller is metered at rates they never
+// signed against.
+//
+// A module-level variable would have the same race. Async context is per-call,
+// so each `requestPayment` sees exactly the terms it is publishing no matter
+// how many run concurrently.
+const publishingPricing = new AsyncLocalStorage<{ taskId: string; pricing: X402Pricing }>();
 
 // Postgres-backed x402 offering store.
 //
@@ -87,43 +102,59 @@ export class PostgresX402Store extends BaseX402Store {
     super();
   }
 
+  /**
+   * Run `fn` with `pricing` attached to the offering it publishes.
+   *
+   * The write that `fn` triggers inside the SDK carries these terms in the
+   * same statement as the offering, which is what makes the pair atomic.
+   */
+  async publishing<T>(taskId: string, pricing: X402Pricing, fn: () => Promise<T>): Promise<T> {
+    return publishingPricing.run({ taskId, pricing }, fn);
+  }
+
   async put(entry: X402StoreEntry): Promise<void> {
     const expiresAt = entry.expiresAt ?? null;
+    // Terms are present only on the publishing write; the SDK's later
+    // lifecycle patches (verified, completed, failed) run outside that context
+    // and must leave the frozen snapshot alone. The taskId is checked rather
+    // than assumed: the context belongs to one offering, and applying its
+    // terms to a different task would be the very mix-up this exists to stop.
+    const ctx = publishingPricing.getStore();
+    const pricing = ctx?.taskId === entry.taskId ? ctx.pricing : undefined;
+
     // The entry is round-tripped through JSON — the repo's pattern for JSONB
     // writes — which also lowers every Date to an ISO string, exactly what
     // `reviveEntry` reverses on the way back out.
     //
-    // `pricing` and `claimed_at` are left alone on conflict: the SDK patches
-    // the entry repeatedly through the round-trip, and neither the pricing
-    // snapshot nor the claim may be reset by a lifecycle update.
+    // `claimed_at` is never touched here: the SDK patches the entry repeatedly
+    // through the round-trip, and under `exact` settlement happens before the
+    // work, so resetting the claim mid-task would let a resubmission be
+    // charged a second time.
     await this.sql`
-      INSERT INTO x402_offerings (task_id, agent_id, entry, expires_at, updated_at)
+      INSERT INTO x402_offerings (task_id, agent_id, entry, pricing, expires_at, updated_at)
       VALUES (
         ${entry.taskId},
         ${this.agentId},
         ${this.sql.json(JSON.parse(JSON.stringify(entry)))},
+        ${pricing === undefined ? null : this.sql.json(JSON.parse(JSON.stringify(pricing)))},
         ${expiresAt},
         now()
       )
       ON CONFLICT (agent_id, task_id) DO UPDATE
         SET entry = EXCLUDED.entry,
+            pricing = COALESCE(EXCLUDED.pricing, x402_offerings.pricing),
             expires_at = EXCLUDED.expires_at,
             updated_at = now()
     `;
   }
 
   async get(taskId: string): Promise<X402StoreEntry | undefined> {
-    // `jsonb_exists(entry, 'accepts')` skips the placeholder row that
-    // `putPricing` inserts before the SDK writes the real entry: a row without
-    // `accepts` is terms with no offering, and handing it back would present
-    // an empty offering as a real one.
     const rows = await this.sql<OfferingRow[]>`
       SELECT task_id, entry
       FROM x402_offerings
       WHERE agent_id = ${this.agentId}
         AND task_id = ${taskId}
         AND (expires_at IS NULL OR expires_at > now())
-        AND jsonb_exists(entry, 'accepts')
     `;
     const row = rows[0];
     return row ? reviveEntry(row.entry) : undefined;
@@ -148,39 +179,7 @@ export class PostgresX402Store extends BaseX402Store {
     `;
   }
 
-  /**
-   * Record the pricing an offering was published under.
-   *
-   * Settlement prices from this rather than from the agent's live pricing.
-   * The two turns of a payment are separate requests, so a reprice in between
-   * would otherwise meter turn 2 against terms turn 1 never signed.
-   */
-  async putPricing(taskId: string, pricing: X402Pricing): Promise<void> {
-    // Upsert, because this runs *before* the SDK writes the offering entry —
-    // the row may not exist yet. Sequencing it first means an entry never
-    // exists without terms; the reverse order can leave an offering that
-    // settlement has no price for.
-    //
-    // `entry` gets a placeholder on insert and is immediately overwritten by
-    // the SDK's `put`. It is never read in that state: `get` goes through the
-    // SDK's shape and the gate only reaches settlement via `classify`, which
-    // requires a real entry.
-    await this.sql`
-      INSERT INTO x402_offerings (task_id, agent_id, entry, pricing, updated_at)
-      VALUES (
-        ${taskId},
-        ${this.agentId},
-        '{}'::jsonb,
-        ${this.sql.json(JSON.parse(JSON.stringify(pricing)))},
-        now()
-      )
-      ON CONFLICT (agent_id, task_id) DO UPDATE
-        SET pricing = EXCLUDED.pricing,
-            updated_at = now()
-    `;
-  }
-
-  /** The pricing snapshot taken when the offering was published. */
+  /** The terms the offering was published under, written alongside it. */
   async getPricing(taskId: string): Promise<X402Pricing | undefined> {
     const rows = await this.sql<{ pricing: unknown }[]>`
       SELECT pricing
@@ -215,7 +214,6 @@ export class PostgresX402Store extends BaseX402Store {
         AND task_id = ${taskId}
         AND claimed_at IS NULL
         AND (expires_at IS NULL OR expires_at > now())
-        AND jsonb_exists(entry, 'accepts')
       RETURNING task_id
     `;
     return rows.length > 0;

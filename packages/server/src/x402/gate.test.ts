@@ -77,25 +77,33 @@ function stubFacilitator(
  * an offering is published, and the one-shot claim that stops a replayed
  * submission from running the work twice.
  */
-function memorySidecar(): X402OfferingSidecar & { claims: number } {
+interface MemorySidecar extends X402OfferingSidecar {
+  /** Test hook: force the stored terms out of step with the offering. */
+  overwritePricing(taskId: string, pricing: X402Pricing): void;
+}
+
+function memorySidecar(): MemorySidecar {
   const pricingByTask = new Map<string, X402Pricing>();
   const claimed = new Set<string>();
   return {
-    claims: 0,
-    async putPricing(taskId, pricing) {
+    // The real store records the terms in the same statement as the offering;
+    // recording them here on entry is the equivalent for a double.
+    async publishing<T>(taskId: string, pricing: X402Pricing, fn: () => Promise<T>): Promise<T> {
       pricingByTask.set(taskId, pricing);
+      return fn();
     },
     async getPricing(taskId) {
       return pricingByTask.get(taskId);
     },
     async claim(taskId) {
-      // eslint-disable-next-line @typescript-eslint/no-this-alias
-      (this as { claims: number }).claims += 1;
       if (claimed.has(taskId)) return false;
       claimed.add(taskId);
       return true;
     },
-  } as X402OfferingSidecar & { claims: number };
+    overwritePricing(taskId, pricing) {
+      pricingByTask.set(taskId, pricing);
+    },
+  };
 }
 
 function makeGate(
@@ -754,7 +762,7 @@ test('a snapshot that disagrees with the signed requirement is refused, not sile
   });
   assert.equal(first.kind, 'halt');
   if (first.kind !== 'halt') return;
-  await sidecar.putPricing('mismatch', PRICING);
+  sidecar.overwritePricing('mismatch', PRICING);
 
   const second = await gate.open({
     taskId: 'mismatch',
@@ -777,7 +785,7 @@ test('a missing pricing snapshot refuses the call rather than guessing a price',
   const facilitator = stubFacilitator();
   const sidecar = memorySidecar();
   const forgetful: X402OfferingSidecar = {
-    putPricing: async () => {},
+    publishing: (_t, _p, fn) => fn(),
     getPricing: async () => undefined,
     claim: (taskId) => sidecar.claim(taskId),
   };
