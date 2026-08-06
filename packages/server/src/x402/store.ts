@@ -4,7 +4,7 @@ import {
   type X402StoreEntryPatch,
 } from '@a2x/sdk/x402';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { Sql } from '../db.js';
+import type { Sql, SqlExecutor } from '../db.js';
 import { parseX402Pricing, type X402Pricing } from './pricing.js';
 
 // The pricing an in-flight `requestPayment` is publishing.
@@ -19,7 +19,15 @@ import { parseX402Pricing, type X402Pricing } from './pricing.js';
 // A module-level variable would have the same race. Async context is per-call,
 // so each `requestPayment` sees exactly the terms it is publishing no matter
 // how many run concurrently.
-const publishingPricing = new AsyncLocalStorage<{ taskId: string; pricing: X402Pricing }>();
+interface PublishingContext {
+  taskId: string;
+  pricing: X402Pricing;
+  sql: SqlExecutor;
+  /** A new offering may replace an expired row and must release its old claim. */
+  resetClaim: boolean;
+}
+
+const publishingPricing = new AsyncLocalStorage<PublishingContext>();
 
 // Postgres-backed x402 offering store.
 //
@@ -103,13 +111,58 @@ export class PostgresX402Store extends BaseX402Store {
   }
 
   /**
-   * Run `fn` with `pricing` attached to the offering it publishes.
+   * Serialize publishers for one task and run `fn` with its frozen terms.
    *
-   * The write that `fn` triggers inside the SDK carries these terms in the
-   * same statement as the offering, which is what makes the pair atomic.
+   * A live offering is immutable: an unpaid retry (including one racing a
+   * signed continuation) reuses its snapshot rather than replacing the rates
+   * underneath the signer. The advisory transaction lock also closes the
+   * no-row race between two initial publishers. `put` below detects this async
+   * context and uses the same transaction for the SDK-owned offering write.
    */
-  async publishing<T>(taskId: string, pricing: X402Pricing, fn: () => Promise<T>): Promise<T> {
-    return publishingPricing.run({ taskId, pricing }, fn);
+  async publishing<T>(
+    taskId: string,
+    pricing: X402Pricing,
+    fn: (frozenPricing: X402Pricing) => Promise<T>,
+  ): Promise<T> {
+    // postgres.js maps array-shaped transaction callback results specially;
+    // assign outside the callback so this method preserves an arbitrary T.
+    let published!: T;
+    await this.sql.begin(async (tx) => {
+      // A row lock cannot serialize the first insert because there is no row
+      // yet. This transaction-scoped lock covers both that case and retries.
+      // A hash collision only serializes unrelated tasks; it cannot mix data.
+      await tx`
+        SELECT pg_advisory_xact_lock(
+          hashtextextended(${`${this.agentId.length}:${this.agentId}:${taskId}`}, 0::bigint)
+        )
+      `;
+
+      const rows = await tx<{ pricing: unknown }[]>`
+        SELECT pricing
+        FROM x402_offerings
+        WHERE agent_id = ${this.agentId}
+          AND task_id = ${taskId}
+          AND (expires_at IS NULL OR expires_at > now())
+          AND jsonb_exists(entry, 'accepts')
+        FOR UPDATE
+      `;
+      const existing = rows[0];
+      const frozenPricing = existing ? parseX402Pricing(existing.pricing) : pricing;
+      if (frozenPricing === undefined) {
+        throw new Error(`live x402 offering ${taskId} has no pricing snapshot`);
+      }
+
+      published = await publishingPricing.run(
+        {
+          taskId,
+          pricing: frozenPricing,
+          sql: tx,
+          resetClaim: existing === undefined,
+        },
+        () => fn(frozenPricing),
+      );
+    });
+    return published;
   }
 
   async put(entry: X402StoreEntry): Promise<void> {
@@ -121,6 +174,8 @@ export class PostgresX402Store extends BaseX402Store {
     // terms to a different task would be the very mix-up this exists to stop.
     const ctx = publishingPricing.getStore();
     const pricing = ctx?.taskId === entry.taskId ? ctx.pricing : undefined;
+    const executor = ctx?.taskId === entry.taskId ? ctx.sql : this.sql;
+    const resetClaim = ctx?.taskId === entry.taskId && ctx.resetClaim === true;
 
     // The entry is round-tripped through JSON — the repo's pattern for JSONB
     // writes — which also lowers every Date to an ISO string, exactly what
@@ -130,7 +185,7 @@ export class PostgresX402Store extends BaseX402Store {
     // through the round-trip, and under `exact` settlement happens before the
     // work, so resetting the claim mid-task would let a resubmission be
     // charged a second time.
-    await this.sql`
+    await executor`
       INSERT INTO x402_offerings (task_id, agent_id, entry, pricing, expires_at, updated_at)
       VALUES (
         ${entry.taskId},
@@ -143,6 +198,10 @@ export class PostgresX402Store extends BaseX402Store {
       ON CONFLICT (agent_id, task_id) DO UPDATE
         SET entry = EXCLUDED.entry,
             pricing = COALESCE(EXCLUDED.pricing, x402_offerings.pricing),
+            claimed_at = CASE
+              WHEN ${resetClaim} THEN NULL
+              ELSE x402_offerings.claimed_at
+            END,
             expires_at = EXCLUDED.expires_at,
             updated_at = now()
     `;

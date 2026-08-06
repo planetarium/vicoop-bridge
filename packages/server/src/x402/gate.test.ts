@@ -86,11 +86,16 @@ function memorySidecar(): MemorySidecar {
   const pricingByTask = new Map<string, X402Pricing>();
   const claimed = new Set<string>();
   return {
-    // The real store records the terms in the same statement as the offering;
-    // recording them here on entry is the equivalent for a double.
-    async publishing<T>(taskId: string, pricing: X402Pricing, fn: () => Promise<T>): Promise<T> {
-      pricingByTask.set(taskId, pricing);
-      return fn();
+    // The real store serializes publishers and keeps the first live terms.
+    // This double has no expiry, so an existing entry is always live.
+    async publishing<T>(
+      taskId: string,
+      pricing: X402Pricing,
+      fn: (frozenPricing: X402Pricing) => Promise<T>,
+    ): Promise<T> {
+      const frozenPricing = pricingByTask.get(taskId) ?? pricing;
+      pricingByTask.set(taskId, frozenPricing);
+      return fn(frozenPricing);
     },
     async getPricing(taskId) {
       return pricingByTask.get(taskId);
@@ -703,6 +708,50 @@ test('settlement prices from the offering, not from a reprice that landed betwee
   assert.equal(facilitator.settledAmount, '450000');
 });
 
+test('a repeated unpaid turn reuses the live offering terms after a reprice', async () => {
+  // A continuation without payment metadata is classified as `no-submission`
+  // without consulting the store. It must not replace the snapshot that a
+  // concurrent signed continuation may already have classified.
+  const facilitator = stubFacilitator();
+  const store = new InMemoryX402Store();
+  const sidecar = memorySidecar();
+  const context = () => new X402Context({ store, facilitator, x402Version: 2 });
+
+  const original = new X402Gate('a1', UPTO_PRICING, context(), sidecar);
+  const first = await original.open({
+    taskId: 'unpaid-retry',
+    contextId: 'ctx-unpaid-retry',
+    message: userMessage(),
+    resource: RESOURCE,
+  });
+  assert.equal(first.kind, 'halt');
+
+  const repriced = parseX402Pricing({
+    ...UPTO_PRICING,
+    rates: { input: '9000000', output: '45000000', cachedInput: '900000' },
+  })!;
+  const afterReprice = new X402Gate('a1', repriced, context(), sidecar);
+
+  const repeated = await afterReprice.open({
+    taskId: 'unpaid-retry',
+    contextId: 'ctx-unpaid-retry',
+    message: userMessage(),
+    resource: RESOURCE,
+  });
+  assert.equal(repeated.kind, 'halt');
+  if (repeated.kind !== 'halt') return;
+
+  const submitted = await afterReprice.open({
+    taskId: 'unpaid-retry',
+    contextId: 'ctx-unpaid-retry',
+    message: uptoSubmissionMessage(offeredRequirement(repeated.event)),
+    resource: RESOURCE,
+  });
+  assert.equal(submitted.kind, 'proceed');
+  if (submitted.kind !== 'proceed' || submitted.settlement?.mode !== 'deferred') return;
+  assert.deepEqual(submitted.settlement.pricing, UPTO_PRICING);
+});
+
 test('a replayed submission is refused instead of running the work twice', async () => {
   // `classify()` does not inspect the entry's status, so the same signed
   // payload classifies valid every time it is sent. Without the claim the
@@ -785,7 +834,7 @@ test('a missing pricing snapshot refuses the call rather than guessing a price',
   const facilitator = stubFacilitator();
   const sidecar = memorySidecar();
   const forgetful: X402OfferingSidecar = {
-    publishing: (_t, _p, fn) => fn(),
+    publishing: (_t, pricing, fn) => fn(pricing),
     getPricing: async () => undefined,
     claim: (taskId) => sidecar.claim(taskId),
   };

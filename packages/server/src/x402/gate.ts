@@ -138,11 +138,17 @@ export interface X402GateParams {
  */
 export interface X402OfferingSidecar {
   /**
-   * Run `fn` with `pricing` bound to whatever offering it publishes, so the
-   * two are written together. Anything less leaves a window where concurrent
-   * turn-1s racing a reprice pair one offering with the other's terms.
+   * Serialize publishers for this task and run `fn` with the terms frozen for
+   * its live offering. The first live offering wins; later unpaid turns reuse
+   * it instead of replacing terms underneath an in-flight signed submission.
+   * The implementation also binds the returned pricing to the SDK's offering
+   * write so the two land in one statement.
    */
-  publishing<T>(taskId: string, pricing: X402Pricing, fn: () => Promise<T>): Promise<T>;
+  publishing<T>(
+    taskId: string,
+    pricing: X402Pricing,
+    fn: (frozenPricing: X402Pricing) => Promise<T>,
+  ): Promise<T>;
   getPricing(taskId: string): Promise<X402Pricing | undefined>;
   /** `true` for the one caller that wins the right to act on a submission. */
   claim(taskId: string): Promise<boolean>;
@@ -215,15 +221,16 @@ export class X402Gate {
       if (classified.kind === 'no-submission') {
         // Turn 1. `requestPayment` persists the offering (status `offered`,
         // with the TTL) and yields the `request-input` event we translate.
-        const accepts = pricingToAccepts(this.pricing, resource);
         let metadata: Record<string, unknown> | undefined;
         let text: string | undefined;
+        let offeredPricing = this.pricing;
         // The terms ride along with the offering write the SDK performs inside
-        // here, in one statement. Writing them separately — in either order —
-        // leaves a window where two concurrent turn-1s racing a reprice
-        // interleave into one agent's offering paired with the other's rates.
-        // Both would be the same scheme, so no shape check downstream can tell.
-        await this.sidecar.publishing(taskId, this.pricing, async () => {
+        // here, in one statement. Publishers for one task are serialized and
+        // reuse a still-live snapshot, so a new unpaid turn cannot replace the
+        // rates after a signed turn has classified but before it claims.
+        await this.sidecar.publishing(taskId, this.pricing, async (frozenPricing) => {
+          offeredPricing = frozenPricing;
+          const accepts = pricingToAccepts(frozenPricing, resource);
           for await (const event of this.x402.requestPayment(ctx, {
             accepts,
             expiresInSeconds: OFFERING_TTL_SECONDS,
@@ -243,7 +250,7 @@ export class X402Gate {
         logEvent('x402_payment_required', {
           agentId: this.agentId,
           taskId,
-          ...this.offeringFields(this.pricing),
+          ...this.offeringFields(offeredPricing),
         });
         return {
           kind: 'halt',

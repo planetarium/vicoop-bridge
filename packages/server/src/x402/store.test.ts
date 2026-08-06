@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import postgres from 'postgres';
 import type { X402StoreEntry } from '@a2x/sdk/x402';
 import { PostgresX402Store, sweepExpiredX402Offerings } from './store.js';
-import { parseX402Pricing } from './pricing.js';
+import { parseX402Pricing, type X402Pricing } from './pricing.js';
 
 const hasDb = !!process.env.DATABASE_URL;
 
@@ -202,7 +202,7 @@ test(
 );
 
 test(
-  'concurrent publishes never pair one offering with the other terms',
+  'concurrent publishes freeze one live offering and its terms',
   { skip: !hasDb },
   async () => {
     // The race this design exists for. Two turn-1s for the same task, racing a
@@ -221,14 +221,26 @@ test(
           accepts: [{ ...entry(taskId).accepts[0]!, amount }],
         });
 
-      await Promise.all([
-        store.publishing(taskId, cheap, () => store.put(offering('10000'))),
-        store.publishing(taskId, dear, () => store.put(offering('990000'))),
-      ]);
+      const publishedAmounts: string[] = [];
+      const publish = (requested: X402Pricing) =>
+        store.publishing(taskId, requested, async (frozen) => {
+          assert.equal(frozen.scheme, 'exact');
+          const amount = frozen.scheme === 'exact' ? frozen.amount : '';
+          publishedAmounts.push(amount);
+          await store.put(offering(amount));
+        });
+
+      await Promise.all([publish(cheap), publish(dear)]);
 
       const stored = await store.get(taskId);
       const terms = await store.getPricing(taskId);
       assert.ok(stored && terms);
+      assert.equal(publishedAmounts.length, 2);
+      assert.equal(
+        publishedAmounts[0],
+        publishedAmounts[1],
+        'the later publisher must reuse the first live terms',
+      );
       assert.equal(
         terms.scheme === 'exact' ? terms.amount : undefined,
         stored.accepts[0]!.amount,
