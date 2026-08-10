@@ -5591,7 +5591,8 @@ test('describeClaudeSessionInit: names the requested model alongside the served 
     requestedModel: 'claude-fable-5',
   });
   assert.match(line, /model=claude-opus-4-8/);
-  assert.match(line, /requested=claude-fable-5/);
+  // Quoted: caller-supplied, see the forgery test below.
+  assert.match(line, /requested="claude-fable-5"/);
 });
 
 test('describeClaudeSessionInit: omits `requested` on the agentic path', () => {
@@ -5622,19 +5623,63 @@ test('describeClaudeSessionInit: a dropped model is reported, not silently absen
     model: 'claude-opus-4-8',
   });
   assert.notEqual(dropped, nothingRequested);
-  assert.match(dropped, /requestedDropped=a2a\/https/);
+  assert.match(dropped, /requestedDropped="a2a\/https/);
   // `requested` must keep meaning "what rode to --model", so a dropped value
   // never appears under it — the line would otherwise lie about argv.
   assert.doesNotMatch(dropped, /(^| )requested=/);
 });
 
-test('describeClaudeSessionInit: a dropped routing key survives at full length', () => {
-  // Routing keys run past the 60-char cap the model fields use, and the tail is
-  // what identifies the sender.
+test('describeClaudeSessionInit: a dropped routing key survives the 60-char model cap', () => {
+  // Routing keys run well past the cap the model fields use, and 60 would cut
+  // one mid-host.
   const key = `a2a/https://example.com/agents/${'x'.repeat(60)}/.well-known/agent-card.json`;
+  assert.ok(key.length > 60 && key.length < 200);
   const line = describeClaudeSessionInit({ taskId: 't', model: 'm', droppedModel: key });
   assert.match(line, /well-known\/agent-card\.json/);
   assert.doesNotMatch(line, /…/);
+});
+
+test('describeClaudeSessionInit: a dropped value past the cap is truncated, not dumped', () => {
+  // The roomier cap raises the threshold; it does not promise the whole key.
+  // Guard the ceiling too — a caller must not be able to write an unbounded
+  // string into the journal.
+  const line = describeClaudeSessionInit({
+    taskId: 't',
+    model: 'm',
+    droppedModel: 'a2a/https://example.com/' + 'y'.repeat(5000),
+  });
+  assert.match(line, /…/);
+  assert.ok(line.length < 400, `line grew to ${line.length}`);
+});
+
+test('describeClaudeSessionInit: a caller cannot forge sibling fields on the line', () => {
+  // `requestedDropped` carries the caller's envelope.model verbatim, and by
+  // construction only values the gate REJECTED land there — i.e. arbitrary
+  // remote strings. `safeToken` stops a newline but not a space or an `=`, so
+  // rendering it bare would let a caller plant tokens that read exactly like
+  // real ones, including a `session=` pointing at somebody else's transcript.
+  const line = describeClaudeSessionInit({
+    taskId: 't',
+    model: 'claude-opus-4-8',
+    sessionId: 'real-session',
+    droppedModel: 'x model=trusted requested=trusted session=other-session',
+  });
+  assert.equal(line.includes('\n'), false);
+  // What quoting buys: the injected tokens are enclosed and attributable to the
+  // field that carried them, so an operator reading the line sees planted text
+  // rather than a second set of real-looking tokens.
+  assert.match(line, /requestedDropped="x model=trusted requested=trusted session=other-session"/);
+  // The genuine fields are intact and come first, so a reader (or a
+  // first-match grep) lands on the real session id.
+  assert.match(line, / session=real-session model=claude-opus-4-8 /);
+  assert.ok(
+    line.indexOf(' session=real-session') < line.indexOf('requestedDropped='),
+    'the real session field must precede any caller-supplied text',
+  );
+  // Deliberately NOT asserted: that ` session=` occurs once. Quoting makes an
+  // injection visible, it does not stop a naive whole-line grep from matching
+  // inside the quotes — same limitation the gate's own rejection warn has, and
+  // the reason nothing in this repo parses these lines positionally.
 });
 
 test('describeClaudeSessionInit: carries the session id as the transcript/OTEL join key', () => {

@@ -37,7 +37,7 @@ import {
   INPUT_IMAGE_MIME,
   type FetchUriPolicy,
 } from './fetch-uri-file.js';
-import { createLogger, safeToken } from '../logger.js';
+import { createLogger, safeForLog, safeToken } from '../logger.js';
 import { createTimingRecorder } from './timing.js';
 import {
   createClaudeUsageProvider,
@@ -410,19 +410,32 @@ export function describeClaudeSessionInit(opts: {
 }): string {
   const model =
     typeof opts.model === 'string' && opts.model.length > 0 ? opts.model : 'unknown';
-  const field = (label: string, value: unknown, max = 60): string =>
-    typeof value === 'string' && value.length > 0
-      ? ` ${label}=${safeToken(value, max)}`
-      : '';
+  const field = (label: string, value: unknown, render: (v: string) => string): string =>
+    typeof value === 'string' && value.length > 0 ? ` ${label}=${render(value)}` : '';
   return (
     `[claude] session init taskId=${opts.taskId}` +
-    field('session', opts.sessionId, 80) +
+    // Bridge/CLI-derived, so bare — `session=` is a join key people paste into
+    // a grep and quotes would be in the way.
+    field('session', opts.sessionId, (v) => safeToken(v, 80)) +
     ` model=${safeToken(model, 60)}` +
-    field('requested', opts.requestedModel) +
-    // Longer cap than the other model fields: an unadvertised value is often a
-    // whole routing key (`a2a/<card-url>`), and truncating it to 60 can strip
-    // the part that identifies who sent it.
-    field('requestedDropped', opts.droppedModel, 200)
+    // QUOTED, unlike the fields above, because these two are the only values on
+    // this line that arrive verbatim from the remote caller's envelope.
+    // `safeToken` blocks a newline but not a space or an `=`, so a bare render
+    // lets a caller name its model
+    // `x model=trusted requested=trusted session=<some-other-session>` and plant
+    // tokens that read exactly like real ones — including a fake join key
+    // pointing at somebody else's transcript. Quoting is what the gate's own
+    // rejection warn already does with the same value, and `safeForLog` exists
+    // for precisely this "what value was rejected" shape. It makes an injection
+    // visible and attributable, not impossible: a whole-line grep still matches
+    // inside the quotes. The real fields being emitted first is what keeps a
+    // first-match read honest.
+    field('requested', opts.requestedModel, (v) => safeForLog(v, 80)) +
+    // Roomier cap: a rejected value is typically a whole routing key
+    // (`a2a/<card-url>`) and 60 would cut it mid-host. Truncation still drops
+    // the tail, so this raises the threshold rather than guaranteeing the whole
+    // key survives.
+    field('requestedDropped', opts.droppedModel, (v) => safeForLog(v, 200))
   );
 }
 
@@ -2965,6 +2978,7 @@ export function createClaudeBackend(
             const normalised = normalizeClaudeModelId(evt.model);
             if (normalised.length > 0) initModel = normalised;
           }
+          const evtSessionId = (evt as { session_id?: unknown }).session_id;
           // …and say it out loud (#457) — on a normal task this is the only
           // record of what served it. Fires per SPAWN, not per task: the
           // narrated-tool-call retry re-spawns and re-attaches these handlers,
@@ -2975,13 +2989,20 @@ export function createClaudeBackend(
             describeClaudeSessionInit({
               taskId: task.taskId,
               model: evt.model,
-              // The event's own id, not the `sessionId` the bridge passed in.
-              // They are the same value by construction (`--session-id` /
-              // `--resume`), but this one is what the CLI is actually running
-              // under and therefore what its OTEL records and on-disk
-              // transcript are keyed by — if the two ever diverge, the join
-              // key is this one.
-              sessionId: (evt as { session_id?: unknown }).session_id ?? sessionId,
+              // Prefer the event's own id over the `sessionId` the bridge
+              // passed in: the bridge's is what it ASKED for via `--session-id`
+              // / `--resume`, the event's is what the CLI is actually running
+              // under, and the CLI's OTEL records and on-disk transcript are
+              // keyed by the latter. Observed equal, but nothing in the CLI's
+              // contract promises it (`--fork-session` exists precisely because
+              // a resume can go either way), so read it rather than assume it.
+              // Falls back on any unusable value — NOT `??`, which passes a
+              // number or an empty string straight through to a field that then
+              // renders nothing and loses an id the bridge knew all along.
+              sessionId:
+                typeof evtSessionId === 'string' && evtSessionId.length > 0
+                  ? evtSessionId
+                  : sessionId,
               requestedModel: envelopeModel,
               droppedModel: droppedEnvelopeModel,
             }),

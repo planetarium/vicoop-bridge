@@ -72,7 +72,7 @@ export function escapeLineSeparators(s: string): string {
 // where the surrounding quotes help operators see the exact string the
 // client received. Newlines and control chars are escaped; long inputs
 // are truncated with an ellipsis.
-function safeForLog(value: string, maxLen = 120): string {
+export function safeForLog(value: string, maxLen = 120): string {
   const escaped = escapeLineSeparators(JSON.stringify(value));
   if (escaped.length <= maxLen) return escaped;
   // Trim to maxLen and tack on an ellipsis. The result intentionally
