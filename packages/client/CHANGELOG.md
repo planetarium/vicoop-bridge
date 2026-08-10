@@ -1,5 +1,32 @@
 # @vicoop-bridge/client
 
+## 0.37.1
+
+### Patch Changes
+
+- 9057a51: claude backend: log the resolved model once per task at `info`. The
+  `system/init` event was the one `system` subtype that never reached a log, so a
+  task that went fine left no record of which model actually served it. The line
+  carries the model string verbatim (the normalised id is the openai-compat
+  envelope's need, not the log's) plus the requested `envelope.model` when there
+  was one, making "asked for X, served Y" — the `model_refusal_fallback` failure
+  mode — legible from a single log line.
+- 47b63bb: docs: add `docs/claude-telemetry.md` — observability for the `claude` backend.
+  Covers what the journal already reports without any setup (the served and
+  requested model per CLI spawn, silent model switches) and, just as usefully,
+  what it does not (token counts go to the openai-compat response envelope rather
+  than the journal; cost is never computed). Adds the OTLP recipe for collecting
+  the Claude Code CLI's own OpenTelemetry stream when per-request granularity,
+  `request_id`, or cost is needed. Notably: `OTEL_LOGS_EXPORTER=console` emits
+  nothing under the bridge, so operators running it today are collecting nothing
+  — use `otlp`.
+- df91218: claude backend: the `session init` log line now reports the claude session id
+  (`session=`), and the requested model that the advertised-models gate rejected
+  (`requestedDropped=`). The session id is the join key to the CLI's OTEL records
+  and its on-disk transcript, and previously appeared only in a `debug` line. The
+  dropped model previously left no trace on this line at all, making a task whose
+  model request was rejected indistinguishable from one that requested nothing.
+
 ## 0.37.0
 
 ### Minor Changes
