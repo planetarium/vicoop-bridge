@@ -58,10 +58,14 @@ OTEL_EXPORTER_OTLP_PROTOCOL=http/json
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
 ```
 
-Point the endpoint at any OTLP collector you already run. Short-lived tasks may
-finish before the default export interval elapses — cut
-`OTEL_LOGS_EXPORT_INTERVAL` / `OTEL_METRIC_EXPORT_INTERVAL` (milliseconds) if
-you are debugging a single run and want a prompt flush.
+Point the endpoint at any OTLP collector you already run.
+
+You do not need to tune the export intervals for short tasks: the CLI flushes
+on shutdown, so a run that exits well inside the default interval still
+delivers everything. Verified on a ~6s task with the block above verbatim —
+all log record types and all four metrics arrived, just batched into fewer
+HTTP posts. `OTEL_LOGS_EXPORT_INTERVAL` / `OTEL_METRIC_EXPORT_INTERVAL`
+(milliseconds) only change how promptly records show up *during* a long run.
 
 ## What arrives
 
