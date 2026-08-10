@@ -67,3 +67,4 @@ authoring or cleaning up changesets.**
 - [`docs/claude-e2e.md`](./docs/claude-e2e.md), [`docs/openclaw-e2e.md`](./docs/openclaw-e2e.md) — backend-specific E2E
 - [`docs/container.md`](./docs/container.md) — container runtime profiles (bundled-direct + external-runtime)
 - [`docs/x402-payments.md`](./docs/x402-payments.md) — per-agent x402 pricing, the payment round-trip, and settlement
+- [`docs/claude-telemetry.md`](./docs/claude-telemetry.md) — what the journal already reports about the claude backend, and how to collect the CLI's own OTEL stream
