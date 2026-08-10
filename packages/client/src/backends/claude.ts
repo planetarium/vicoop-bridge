@@ -381,10 +381,11 @@ export function normalizeClaudeModelId(raw: string): string {
 //     itself the finding, and "did this task init at all" must not depend on
 //     the field being well-formed.
 //
-// The caller logs it at `info`: it fires once per task, so it carries none of
-// the per-delta flood risk that puts `thinking_tokens` on debug (below), and a
-// post-hoc diagnosis is worthless if it required debug to have been on before
-// the incident.
+// The caller logs it at `info`: it fires once per CLI spawn — so once on a
+// normal task, twice on one the narrated-tool-call retry re-spawns, and never
+// per-delta. That carries none of the flood risk that puts `thinking_tokens`
+// on debug (below), and a post-hoc diagnosis is worthless if it required debug
+// to have been on before the incident.
 //
 // Exported for unit tests.
 export function describeClaudeSessionInit(opts: {
@@ -2935,9 +2936,12 @@ export function createClaudeBackend(
             const normalised = normalizeClaudeModelId(evt.model);
             if (normalised.length > 0) initModel = normalised;
           }
-          // …and say it out loud, once per task, with the tier suffix intact
-          // (#457). This is the only place the served model is knowable before
-          // something goes wrong.
+          // …and say it out loud (#457) — on a normal task this is the only
+          // record of what served it. Fires per SPAWN, not per task: the
+          // narrated-tool-call retry re-spawns and re-attaches these handlers,
+          // so a retried task emits a second line. That is wanted, not a leak
+          // — the retry is a fresh CLI invocation and can resolve a different
+          // model than the attempt it is correcting.
           timingLogger.info?.(
             describeClaudeSessionInit({
               taskId: task.taskId,
