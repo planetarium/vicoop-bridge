@@ -5607,6 +5607,47 @@ test('describeClaudeSessionInit: omits `requested` on the agentic path', () => {
   }
 });
 
+test('describeClaudeSessionInit: a dropped model is reported, not silently absent', () => {
+  // The gate drops a requested id this install does not advertise, so nothing
+  // rode to `--model`. Without `requestedDropped` this line is byte-identical
+  // to a task where nothing was requested at all — and this is the task an
+  // operator is hunting when they ask who requests models we do not serve.
+  const dropped = describeClaudeSessionInit({
+    taskId: 't',
+    model: 'claude-opus-4-8',
+    droppedModel: 'a2a/https://example.com/agents/x/.well-known/agent-card.json',
+  });
+  const nothingRequested = describeClaudeSessionInit({
+    taskId: 't',
+    model: 'claude-opus-4-8',
+  });
+  assert.notEqual(dropped, nothingRequested);
+  assert.match(dropped, /requestedDropped=a2a\/https/);
+  // `requested` must keep meaning "what rode to --model", so a dropped value
+  // never appears under it — the line would otherwise lie about argv.
+  assert.doesNotMatch(dropped, /(^| )requested=/);
+});
+
+test('describeClaudeSessionInit: a dropped routing key survives at full length', () => {
+  // Routing keys run past the 60-char cap the model fields use, and the tail is
+  // what identifies the sender.
+  const key = `a2a/https://example.com/agents/${'x'.repeat(60)}/.well-known/agent-card.json`;
+  const line = describeClaudeSessionInit({ taskId: 't', model: 'm', droppedModel: key });
+  assert.match(line, /well-known\/agent-card\.json/);
+  assert.doesNotMatch(line, /…/);
+});
+
+test('describeClaudeSessionInit: carries the session id as the transcript/OTEL join key', () => {
+  const line = describeClaudeSessionInit({
+    taskId: 't',
+    model: 'm',
+    sessionId: 'ce946054-eb5d-4820-b94d-f6af9f9cdca4',
+  });
+  assert.match(line, /session=ce946054-eb5d-4820-b94d-f6af9f9cdca4/);
+  // Absent rather than empty when the event carried none.
+  assert.doesNotMatch(describeClaudeSessionInit({ taskId: 't', model: 'm' }), /session=/);
+});
+
 test('describeClaudeSessionInit: still reports an init whose model is missing', () => {
   // `unknown` is itself the finding — it means the envelope fallback got
   // nothing — and "did this task init at all" must not hinge on the field
@@ -5622,6 +5663,8 @@ test('describeClaudeSessionInit: a hostile model string cannot forge a log line'
     taskId: 't',
     model: 'evil\n[client] FAKE ENTRY',
     requestedModel: 'also\nevil',
+    droppedModel: 'dropped\nevil',
+    sessionId: 'sid\nevil',
   });
   assert.equal(line.includes('\n'), false);
 });

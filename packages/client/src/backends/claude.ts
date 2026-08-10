@@ -364,7 +364,7 @@ export function normalizeClaudeModelId(raw: string): string {
 // router-side `requestedModel`, the `--model` argv, a prompt size only one
 // tier could have held. One line settles it directly.
 //
-// Three details:
+// The details that matter:
 //
 //   - The `model` string VERBATIM. A diagnostic line records what the CLI
 //     actually reported; normalising is the envelope's need — it has to match
@@ -377,6 +377,19 @@ export function normalizeClaudeModelId(raw: string): string {
 //     so "asked for X, served Y" is legible in a single line instead of a join
 //     against the router. Absent on the agentic path, which sends no
 //     `--model` and lets claude pick.
+//   - `requestedDropped` for the case `requested` cannot cover: the caller
+//     named a model this install does not advertise, so the gate dropped the
+//     override and claude fell back to its own default. `requested` has to
+//     keep meaning "what rode to `--model`" or the line lies about argv, but
+//     without a second field this task is indistinguishable from one where
+//     nothing was requested at all — and it is precisely the task an operator
+//     is hunting when they ask who is requesting models we do not serve. The
+//     gate's own `warn` records it too; this puts it on the line people grep.
+//   - `session`, the claude session id. It is the join key to both the CLI's
+//     OTEL `session.id` and the on-disk session transcript — the record #457
+//     was reduced to reading by hand — and the only other place it reaches a
+//     log is the `claude.spawn.start` argv dump, which is `debug`. A join key
+//     that requires debug to have been on ahead of time is no join key.
 //   - Always a line, even when `model` is missing or malformed — `unknown` is
 //     itself the finding, and "did this task init at all" must not depend on
 //     the field being well-formed.
@@ -391,15 +404,26 @@ export function normalizeClaudeModelId(raw: string): string {
 export function describeClaudeSessionInit(opts: {
   taskId: string;
   model: unknown;
+  sessionId?: unknown;
   requestedModel?: string | undefined;
+  droppedModel?: string | undefined;
 }): string {
   const model =
     typeof opts.model === 'string' && opts.model.length > 0 ? opts.model : 'unknown';
-  const requested =
-    typeof opts.requestedModel === 'string' && opts.requestedModel.length > 0
-      ? ` requested=${safeToken(opts.requestedModel, 60)}`
+  const field = (label: string, value: unknown, max = 60): string =>
+    typeof value === 'string' && value.length > 0
+      ? ` ${label}=${safeToken(value, max)}`
       : '';
-  return `[claude] session init taskId=${opts.taskId} model=${safeToken(model, 60)}${requested}`;
+  return (
+    `[claude] session init taskId=${opts.taskId}` +
+    field('session', opts.sessionId, 80) +
+    ` model=${safeToken(model, 60)}` +
+    field('requested', opts.requestedModel) +
+    // Longer cap than the other model fields: an unadvertised value is often a
+    // whole routing key (`a2a/<card-url>`), and truncating it to 60 can strip
+    // the part that identifies who sent it.
+    field('requestedDropped', opts.droppedModel, 200)
+  );
 }
 
 // Render a non-`init` SDK `system` event into one log line, and decide how
@@ -1988,6 +2012,10 @@ export function createClaudeBackend(
       // called yet) the validation is skipped and `envelope.model` rides
       // through unchanged.
       let envelopeModel: string | undefined = envelopeModelRaw;
+      // Set only by the drop below, so the `session init` line can report the
+      // rejected value without inferring it from `envelopeModel === undefined`
+      // (which is also true when nothing was requested at all).
+      let droppedEnvelopeModel: string | undefined;
       if (
         envelopeModelRaw !== undefined &&
         cachedAllowedModels instanceof Set &&
@@ -1997,6 +2025,7 @@ export function createClaudeBackend(
           `[claude] envelope.model=${JSON.stringify(envelopeModelRaw)} is not among this claude install's advertised models (${JSON.stringify([...cachedAllowedModels])}); falling back to claude default`,
         );
         envelopeModel = undefined;
+        droppedEnvelopeModel = envelopeModelRaw;
       }
 
       // Native MCP dispatch (#213): when the openai-compat extension is
@@ -2946,7 +2975,15 @@ export function createClaudeBackend(
             describeClaudeSessionInit({
               taskId: task.taskId,
               model: evt.model,
+              // The event's own id, not the `sessionId` the bridge passed in.
+              // They are the same value by construction (`--session-id` /
+              // `--resume`), but this one is what the CLI is actually running
+              // under and therefore what its OTEL records and on-disk
+              // transcript are keyed by — if the two ever diverge, the join
+              // key is this one.
+              sessionId: (evt as { session_id?: unknown }).session_id ?? sessionId,
               requestedModel: envelopeModel,
+              droppedModel: droppedEnvelopeModel,
             }),
           );
           return;
