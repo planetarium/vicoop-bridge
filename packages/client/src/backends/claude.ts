@@ -37,7 +37,7 @@ import {
   INPUT_IMAGE_MIME,
   type FetchUriPolicy,
 } from './fetch-uri-file.js';
-import { createLogger, safeToken } from '../logger.js';
+import { createLogger, safeForLog, safeToken } from '../logger.js';
 import { createTimingRecorder } from './timing.js';
 import {
   createClaudeUsageProvider,
@@ -364,7 +364,7 @@ export function normalizeClaudeModelId(raw: string): string {
 // router-side `requestedModel`, the `--model` argv, a prompt size only one
 // tier could have held. One line settles it directly.
 //
-// Three details:
+// The details that matter:
 //
 //   - The `model` string VERBATIM. A diagnostic line records what the CLI
 //     actually reported; normalising is the envelope's need — it has to match
@@ -377,6 +377,19 @@ export function normalizeClaudeModelId(raw: string): string {
 //     so "asked for X, served Y" is legible in a single line instead of a join
 //     against the router. Absent on the agentic path, which sends no
 //     `--model` and lets claude pick.
+//   - `requestedDropped` for the case `requested` cannot cover: the caller
+//     named a model this install does not advertise, so the gate dropped the
+//     override and claude fell back to its own default. `requested` has to
+//     keep meaning "what rode to `--model`" or the line lies about argv, but
+//     without a second field this task is indistinguishable from one where
+//     nothing was requested at all — and it is precisely the task an operator
+//     is hunting when they ask who is requesting models we do not serve. The
+//     gate's own `warn` records it too; this puts it on the line people grep.
+//   - `session`, the claude session id. It is the join key to both the CLI's
+//     OTEL `session.id` and the on-disk session transcript — the record #457
+//     was reduced to reading by hand — and the only other place it reaches a
+//     log is the `claude.spawn.start` argv dump, which is `debug`. A join key
+//     that requires debug to have been on ahead of time is no join key.
 //   - Always a line, even when `model` is missing or malformed — `unknown` is
 //     itself the finding, and "did this task init at all" must not depend on
 //     the field being well-formed.
@@ -391,15 +404,39 @@ export function normalizeClaudeModelId(raw: string): string {
 export function describeClaudeSessionInit(opts: {
   taskId: string;
   model: unknown;
+  sessionId?: unknown;
   requestedModel?: string | undefined;
+  droppedModel?: string | undefined;
 }): string {
   const model =
     typeof opts.model === 'string' && opts.model.length > 0 ? opts.model : 'unknown';
-  const requested =
-    typeof opts.requestedModel === 'string' && opts.requestedModel.length > 0
-      ? ` requested=${safeToken(opts.requestedModel, 60)}`
-      : '';
-  return `[claude] session init taskId=${opts.taskId} model=${safeToken(model, 60)}${requested}`;
+  const field = (label: string, value: unknown, render: (v: string) => string): string =>
+    typeof value === 'string' && value.length > 0 ? ` ${label}=${render(value)}` : '';
+  return (
+    `[claude] session init taskId=${opts.taskId}` +
+    // Bridge/CLI-derived, so bare — `session=` is a join key people paste into
+    // a grep and quotes would be in the way.
+    field('session', opts.sessionId, (v) => safeToken(v, 80)) +
+    ` model=${safeToken(model, 60)}` +
+    // QUOTED, unlike the fields above, because these two are the only values on
+    // this line that arrive verbatim from the remote caller's envelope.
+    // `safeToken` blocks a newline but not a space or an `=`, so a bare render
+    // lets a caller name its model
+    // `x model=trusted requested=trusted session=<some-other-session>` and plant
+    // tokens that read exactly like real ones — including a fake join key
+    // pointing at somebody else's transcript. Quoting is what the gate's own
+    // rejection warn already does with the same value, and `safeForLog` exists
+    // for precisely this "what value was rejected" shape. It makes an injection
+    // visible and attributable, not impossible: a whole-line grep still matches
+    // inside the quotes. The real fields being emitted first is what keeps a
+    // first-match read honest.
+    field('requested', opts.requestedModel, (v) => safeForLog(v, 80)) +
+    // Roomier cap: a rejected value is typically a whole routing key
+    // (`a2a/<card-url>`) and 60 would cut it mid-host. Truncation still drops
+    // the tail, so this raises the threshold rather than guaranteeing the whole
+    // key survives.
+    field('requestedDropped', opts.droppedModel, (v) => safeForLog(v, 200))
+  );
 }
 
 // Render a non-`init` SDK `system` event into one log line, and decide how
@@ -1988,6 +2025,10 @@ export function createClaudeBackend(
       // called yet) the validation is skipped and `envelope.model` rides
       // through unchanged.
       let envelopeModel: string | undefined = envelopeModelRaw;
+      // Set only by the drop below, so the `session init` line can report the
+      // rejected value without inferring it from `envelopeModel === undefined`
+      // (which is also true when nothing was requested at all).
+      let droppedEnvelopeModel: string | undefined;
       if (
         envelopeModelRaw !== undefined &&
         cachedAllowedModels instanceof Set &&
@@ -1997,6 +2038,7 @@ export function createClaudeBackend(
           `[claude] envelope.model=${JSON.stringify(envelopeModelRaw)} is not among this claude install's advertised models (${JSON.stringify([...cachedAllowedModels])}); falling back to claude default`,
         );
         envelopeModel = undefined;
+        droppedEnvelopeModel = envelopeModelRaw;
       }
 
       // Native MCP dispatch (#213): when the openai-compat extension is
@@ -2936,6 +2978,7 @@ export function createClaudeBackend(
             const normalised = normalizeClaudeModelId(evt.model);
             if (normalised.length > 0) initModel = normalised;
           }
+          const evtSessionId = (evt as { session_id?: unknown }).session_id;
           // …and say it out loud (#457) — on a normal task this is the only
           // record of what served it. Fires per SPAWN, not per task: the
           // narrated-tool-call retry re-spawns and re-attaches these handlers,
@@ -2946,7 +2989,22 @@ export function createClaudeBackend(
             describeClaudeSessionInit({
               taskId: task.taskId,
               model: evt.model,
+              // Prefer the event's own id over the `sessionId` the bridge
+              // passed in: the bridge's is what it ASKED for via `--session-id`
+              // / `--resume`, the event's is what the CLI is actually running
+              // under, and the CLI's OTEL records and on-disk transcript are
+              // keyed by the latter. Observed equal, but nothing in the CLI's
+              // contract promises it (`--fork-session` exists precisely because
+              // a resume can go either way), so read it rather than assume it.
+              // Falls back on any unusable value — NOT `??`, which passes a
+              // number or an empty string straight through to a field that then
+              // renders nothing and loses an id the bridge knew all along.
+              sessionId:
+                typeof evtSessionId === 'string' && evtSessionId.length > 0
+                  ? evtSessionId
+                  : sessionId,
               requestedModel: envelopeModel,
+              droppedModel: droppedEnvelopeModel,
             }),
           );
           return;
