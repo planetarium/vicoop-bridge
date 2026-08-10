@@ -13,14 +13,15 @@ journal at the default `info` level, with no collector and no configuration:
   event:
 
   ```text
-  [claude] session init taskId=<id> model=claude-opus-4-8[1m] requested=claude-opus-4-8
+  [claude] session init taskId=<id> session=<session-id> model=claude-opus-4-8[1m] requested=claude-opus-4-8
   ```
 
   `requested=` is the model the bridge put on `--model`, and it appears only
   when there was one: openai-compat tasks carrying `envelope.model`. It is
-  absent on the agentic path (which lets claude choose) and also when the
-  requested id was not among this install's advertised models — that case is
-  dropped and reported on its own `warn` line instead.
+  absent on the agentic path, which lets claude choose. When the requested id
+  was not among this install's advertised models the bridge drops it and lets
+  claude fall back — that shows up as `requestedDropped=<id>` instead, plus a
+  `warn` line from the gate.
 
 - **Silent model switches** — every non-`init` `system` event is logged, and a
   `model_refusal_fallback` (claude retrying your turn on a different model)
@@ -103,16 +104,21 @@ user.id, user.email, user.account_id,
 ### Joining a record back to a task
 
 The bridge mints the CLI session id itself and passes it as `--session-id`, so
-OTEL's `session.id` is a value the bridge knows. Two caveats before you rely on
-the join:
+OTEL's `session.id` is a value the bridge knows. The `session init` line prints
+it at `info`:
 
-- **The journal only prints it at `debug`.** The session id appears in the
-  `claude.spawn.start … argv=` line, which is `debug`-level, so at the default
-  `info` you will not find it. Raise `VICOOP_CLIENT_LOG_LEVEL=debug` on the
-  client if you need to correlate.
-- **It is not one-to-one with tasks.** Follow-up tasks sharing an A2A
-  `contextId` reuse the same claude session via `--resume`, so one `session.id`
-  can cover several `taskId`s.
+```text
+[claude] session init taskId=<id> session=<session-id> model=…
+```
+
+One caveat: **the join is not one-to-one.** Follow-up tasks sharing an A2A
+`contextId` reuse the same claude session via `--resume`, and a resumed run
+reports the *same* `session.id` (measured, not assumed). So one `session.id` can
+cover several `taskId`s, and you should join in that direction — session to
+tasks, not task to session.
+
+The same id also names the on-disk session transcript, which is what an
+incident investigation ends up reading when the logs run out.
 
 ### Operator-account attributes
 
