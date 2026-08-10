@@ -13,6 +13,7 @@ import {
   OPENAI_COMPAT_OPERATOR_PRIVACY_CLAUSE,
   createClaudeBackend,
   enrichEntriesWithModelLimits,
+  describeClaudeSessionInit,
   describeClaudeSystemEvent,
   describeEmptyDispatchTurn,
   resolveTurnText,
@@ -5560,6 +5561,69 @@ test('claude backend resolveCapabilities short-circuits when probeTimeoutMs is 0
   const caps = await backend.resolveCapabilities!();
   assert.deepEqual(caps, {});
   assert.equal(spawned, 0, 'probeTimeoutMs:0 must skip the spawn entirely');
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// describeClaudeSessionInit — the one `system` subtype that used to reach no
+// log at all (#457), so a task that went fine left no record of which model
+// served it.
+// ───────────────────────────────────────────────────────────────────────────
+
+test('describeClaudeSessionInit: reports the model verbatim, not the normalised id', () => {
+  // A diagnostic line records what the CLI reported. `normalizeClaudeModelId`
+  // exists for the envelope (it must match the advertised id), and running the
+  // value through it here would only discard detail — the `[1m]` tier suffix
+  // being the visible case.
+  const line = describeClaudeSessionInit({
+    taskId: 'task-1',
+    model: 'claude-fable-5[1m]',
+  });
+  assert.match(line, /taskId=task-1/);
+  assert.match(line, /model=claude-fable-5\[1m\]/);
+});
+
+test('describeClaudeSessionInit: names the requested model alongside the served one', () => {
+  // "asked for X, served Y" has to be legible from this line alone — the
+  // incident that motivated it was answered by joining three indirect signals.
+  const line = describeClaudeSessionInit({
+    taskId: 't',
+    model: 'claude-opus-4-8',
+    requestedModel: 'claude-fable-5',
+  });
+  assert.match(line, /model=claude-opus-4-8/);
+  assert.match(line, /requested=claude-fable-5/);
+});
+
+test('describeClaudeSessionInit: omits `requested` on the agentic path', () => {
+  // No `envelope.model` there, so nothing was requested and claude picked —
+  // an empty `requested=` would read as a model named "".
+  for (const requestedModel of [undefined, '']) {
+    const line = describeClaudeSessionInit({
+      taskId: 't',
+      model: 'claude-opus-4-8',
+      requestedModel,
+    });
+    assert.doesNotMatch(line, /requested=/);
+  }
+});
+
+test('describeClaudeSessionInit: still reports an init whose model is missing', () => {
+  // `unknown` is itself the finding — it means the envelope fallback got
+  // nothing — and "did this task init at all" must not hinge on the field
+  // being well-formed.
+  for (const model of [undefined, null, '', 42, {}]) {
+    const line = describeClaudeSessionInit({ taskId: 't', model });
+    assert.match(line, /\[claude\] session init taskId=t model=unknown/);
+  }
+});
+
+test('describeClaudeSessionInit: a hostile model string cannot forge a log line', () => {
+  const line = describeClaudeSessionInit({
+    taskId: 't',
+    model: 'evil\n[client] FAKE ENTRY',
+    requestedModel: 'also\nevil',
+  });
+  assert.equal(line.includes('\n'), false);
 });
 
 // ───────────────────────────────────────────────────────────────────────────
