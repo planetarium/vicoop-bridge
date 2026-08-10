@@ -355,6 +355,52 @@ export function normalizeClaudeModelId(raw: string): string {
   return raw.replace(/\[[^\]]+\]$/, '');
 }
 
+// Render the per-task `system/init` event into one log line.
+//
+// `init` was the one `system` subtype that never reached a log: the branch
+// captured `model` for the openai-compat envelope fallback and returned, so a
+// task that went fine left no record of which model actually served it (#457).
+// The answer had to be assembled from circumstantial signals instead —
+// router-side `requestedModel`, the `--model` argv, a prompt size only one
+// tier could have held. One line settles it directly.
+//
+// Three details:
+//
+//   - The `model` string VERBATIM. A diagnostic line records what the CLI
+//     actually reported; normalising is the envelope's need — it has to match
+//     the advertised id and `usage.model` — not the log's, and logging the
+//     normalised form would discard detail for nothing in return. The tier
+//     suffix `[1m]` surviving is a side benefit rather than the point;
+//     `ProbedClaudeModel` keeps `id` and `raw` side by side for the one case
+//     that does turn on it.
+//   - `requested` alongside it whenever the task carried an `envelope.model`,
+//     so "asked for X, served Y" is legible in a single line instead of a join
+//     against the router. Absent on the agentic path, which sends no
+//     `--model` and lets claude pick.
+//   - Always a line, even when `model` is missing or malformed — `unknown` is
+//     itself the finding, and "did this task init at all" must not depend on
+//     the field being well-formed.
+//
+// The caller logs it at `info`: it fires once per task, so it carries none of
+// the per-delta flood risk that puts `thinking_tokens` on debug (below), and a
+// post-hoc diagnosis is worthless if it required debug to have been on before
+// the incident.
+//
+// Exported for unit tests.
+export function describeClaudeSessionInit(opts: {
+  taskId: string;
+  model: unknown;
+  requestedModel?: string | undefined;
+}): string {
+  const model =
+    typeof opts.model === 'string' && opts.model.length > 0 ? opts.model : 'unknown';
+  const requested =
+    typeof opts.requestedModel === 'string' && opts.requestedModel.length > 0
+      ? ` requested=${safeToken(opts.requestedModel, 60)}`
+      : '';
+  return `[claude] session init taskId=${opts.taskId} model=${safeToken(model, 60)}${requested}`;
+}
+
 // Render a non-`init` SDK `system` event into one log line, and decide how
 // loudly to say it.
 //
@@ -2889,6 +2935,16 @@ export function createClaudeBackend(
             const normalised = normalizeClaudeModelId(evt.model);
             if (normalised.length > 0) initModel = normalised;
           }
+          // …and say it out loud, once per task, with the tier suffix intact
+          // (#457). This is the only place the served model is knowable before
+          // something goes wrong.
+          timingLogger.info?.(
+            describeClaudeSessionInit({
+              taskId: task.taskId,
+              model: evt.model,
+              requestedModel: envelopeModel,
+            }),
+          );
           return;
         }
         if (evt.type === 'system') {
