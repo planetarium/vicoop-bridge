@@ -1,17 +1,19 @@
 import {
+  MerchantGate,
   X402Context,
   X402_FOUNDATION_EXTENSION_URI,
-  requirementScheme,
   type BaseX402Context,
-  type X402ValidClassification,
+  type MerchantDeferredObligation,
+  type MerchantMeterableUsage,
+  type MerchantOfferStore,
+  type MerchantPricing,
   type X402SettleResponse,
 } from '@a2x/sdk/x402';
 import { TaskState, type Message, type TaskStatusUpdateEvent } from '@a2x/sdk';
 import type { Sql } from '../db.js';
 import { logEvent } from '../log.js';
 import { PostgresX402Store } from './store.js';
-import { meterUsage, pricingToAccepts, type X402Pricing } from './pricing.js';
-import type { TaskUsage } from './usage.js';
+import { pricingToOffer, type X402Pricing } from './pricing.js';
 
 export { X402_FOUNDATION_EXTENSION_URI };
 
@@ -43,7 +45,7 @@ const OFFERING_TTL_SECONDS = (() => {
 export function createPostgresX402Context(
   sql: Sql,
   agentId: string,
-): { context: X402Context; sidecar: X402OfferingSidecar } {
+): { context: X402Context; offerStore: MerchantOfferStore } {
   const url = process.env.BRIDGE_X402_FACILITATOR_URL;
   const store = new PostgresX402Store(sql, agentId);
   return {
@@ -52,21 +54,12 @@ export function createPostgresX402Context(
       x402Version: X402_VERSION,
       ...(url ? { facilitator: { url } } : {}),
     }),
-    // Same instance: the sidecar rows live on the offering row, so they share
-    // the store's agent scoping rather than re-deriving it.
-    sidecar: store,
+    // Same instance: the frozen offer lives on the offering row, so the offer
+    // store shares the SDK store's agent scoping rather than re-deriving it.
+    offerStore: store,
   };
 }
 
-/**
- * Outcome of running the payment gate on an inbound turn.
- *
- * - `proceed` — nothing to charge for, or the payment verified. Run the work.
- *   `classified` is present exactly when a settlement is owed afterwards.
- * - `halt` — emit `event` and end the turn. Either the payment was requested
- *   (`input-required`, awaiting the client's signed resubmission) or it was
- *   refused (`failed`).
- */
 /**
  * What the caller still owes, once the gate has cleared a turn to run.
  *
@@ -77,23 +70,27 @@ export function createPostgresX402Context(
  * - `settled` (`exact`): already charged, before the agent was contacted. The
  *   amount is fixed and known up front, so there is no reason to hand over the
  *   work first and hope the authorization is still good afterwards.
+ *   `metadata` is the receipt to merge onto the task's terminal message.
  * - `deferred` (`upto`): the charge comes from consumption, which does not
  *   exist until the work is done, so settlement can only follow it.
+ *   `obligation` carries the classified submission and the terms the offering
+ *   was published under, frozen by the SDK's offer store — settlement uses
+ *   these, never the agent's live pricing, because a reprice between the two
+ *   turns would otherwise meter against terms the payer never signed.
  */
 export type X402Settlement =
   | { mode: 'settled'; metadata: Record<string, unknown> }
-  | {
-      mode: 'deferred';
-      classified: X402ValidClassification;
-      /**
-       * The pricing the offering was published under, read back from the
-       * store. Settlement uses this, never the agent's live pricing — the two
-       * turns are separate requests and a reprice in between would otherwise
-       * meter against terms the payer never signed.
-       */
-      pricing: X402Pricing;
-    };
+  | { mode: 'deferred'; obligation: MerchantDeferredObligation };
 
+/**
+ * Outcome of running the payment gate on an inbound turn.
+ *
+ * - `proceed` — nothing to charge for, or the payment verified. Run the work.
+ *   `settlement` is present exactly when the payment round-trip is live.
+ * - `halt` — emit `event` and end the turn. Either the payment was requested
+ *   (`input-required`, awaiting the client's signed resubmission) or it was
+ *   refused (`failed`).
+ */
 export type X402GateOutcome =
   | { kind: 'proceed'; settlement?: X402Settlement }
   | { kind: 'halt'; event: TaskStatusUpdateEvent };
@@ -102,8 +99,6 @@ export interface X402GateParams {
   taskId: string;
   contextId: string;
   message: Message;
-  /** Public URL of the agent being paid for — shown in the payer's wallet. */
-  resource: string;
 }
 
 /**
@@ -115,62 +110,72 @@ export interface X402GateParams {
  *   turn 1  unpaid request      → `input-required` + `x402.payment.required`
  *   turn 2  signed resubmission → verify → forward to the agent → settle
  *
- * The bridge drives this through the SDK's `X402Context` rather than the
- * `BaseAgent.run()` path the SDK documents, because `WSForwardingExecutor`
- * overrides `execute`/`executeStream` outright — there is no in-process agent
- * to host the flow. `X402Context`'s methods take a structural
- * `{ taskId, message }`, so they compose with a custom executor unchanged;
- * only the events need translating, which `haltEvent` does.
+ * The orchestration — classify, freeze the offered terms, claim the one-shot
+ * right to a submission, verify, meter, clamp, settle — is the SDK's
+ * `MerchantGate`; this class is the bridge-side composition of it. What stays
+ * here is exactly what the SDK leaves to the host: rendering outcomes as the
+ * `TaskStatusUpdateEvent`s this executor emits, the telemetry stream, mapping
+ * the stored pricing row onto a `MerchantOffer`, and the deployment's policy
+ * choices (`exactTiming: 'before-work'`, `unreportedUsage: 'floor'`, the
+ * offering TTL, and the wire version).
  *
- * Settlement is deliberately deferred until the agent has finished
- * successfully: payment buys delivered work, so a task that fails or is
- * cancelled is never settled and the payer's signed authorization simply goes
- * unused. Under `upto` that deferral is also what makes metering possible —
- * the token counts only exist once the work is done.
+ * The SDK fails closed on its own: a facilitator or store error surfaces as a
+ * `refuse` outcome, never a `proceed`, so an unpaid call cannot fall through
+ * to the agent because the payment rail was unavailable. `onError` below is
+ * the operator's view of those errors.
  */
-/**
- * The per-offering state the bridge keeps alongside the SDK's entry: the
- * pricing an offering was published under, and a one-shot claim.
- *
- * Separate from `BaseX402Store` because the SDK owns that shape, and separate
- * from the gate's constructor argument so tests can drive the round-trip
- * without a database.
- */
-export interface X402OfferingSidecar {
-  /**
-   * Serialize publishers for this task and run `fn` with the terms frozen for
-   * its live offering. The first live offering wins; later unpaid turns reuse
-   * it instead of replacing terms underneath an in-flight signed submission.
-   * The implementation also binds the returned pricing to the SDK's offering
-   * write so the two land in one statement.
-   */
-  publishing<T>(
-    taskId: string,
-    pricing: X402Pricing,
-    fn: (frozenPricing: X402Pricing) => Promise<T>,
-  ): Promise<T>;
-  getPricing(taskId: string): Promise<X402Pricing | undefined>;
-  /** `true` for the one caller that wins the right to act on a submission. */
-  claim(taskId: string): Promise<boolean>;
-}
-
 export class X402Gate {
+  private readonly gate: MerchantGate;
+
   constructor(
     private readonly agentId: string,
     private readonly pricing: X402Pricing,
     private readonly x402: BaseX402Context,
-    private readonly sidecar: X402OfferingSidecar,
-  ) {}
+    offerStore: MerchantOfferStore,
+    /** Public URL of the agent being paid for — shown in the payer's wallet. */
+    resource: string,
+  ) {
+    this.gate = new MerchantGate({
+      x402,
+      // Resolved fresh on every turn 1 and then frozen by the offer store, so
+      // a signed turn 2 settles under the terms it was offered even when the
+      // agent has been repriced in between.
+      pricing: () => ({
+        ...pricingToOffer(this.pricing, resource),
+        expiresInSeconds: OFFERING_TTL_SECONDS,
+      }),
+      offerStore,
+      // Flat fees charge before the agent is contacted: the amount was fixed
+      // at offer time and the payer signed for exactly it, so there is nothing
+      // to learn by doing the work first — and doing it first means handing
+      // over the result and only then discovering the authorization has been
+      // drained. A failure costs nobody: no charge, no work.
+      exactTiming: 'before-work',
+      onError: (error, ctx) => {
+        // Facilitator unreachable, DB down, malformed offering. The payer sees
+        // a generic refusal; this is where the operator sees why.
+        logEvent('x402_gate_error', {
+          agentId: this.agentId,
+          taskId: ctx.taskId,
+          operation: ctx.operation,
+          error: String(error),
+        });
+      },
+    });
+  }
 
   /**
-   * Scheme-independent description of an offering, for logs. Under `upto` the
-   * amount is the authorized ceiling, so it is labelled as such rather than
-   * reported as a price that will be charged.
+   * Scheme-independent description of an offering's terms, for logs. Under a
+   * metered scheme the amount is the authorized ceiling, so it is labelled as
+   * such rather than reported as a price that will be charged. Takes either
+   * the stored row or the SDK's frozen pricing — the discriminants agree
+   * (`batch-settlement` exists only on the SDK side; the bridge never stores
+   * such a row, but frozen pricing is typed to admit it).
    */
-  private offeringFields(pricing: X402Pricing): Record<string, string> {
-    return pricing.scheme === 'upto'
+  private offeringFields(pricing: X402Pricing | MerchantPricing): Record<string, string> {
+    return pricing.scheme === 'upto' || pricing.scheme === 'batch-settlement'
       ? {
-          scheme: 'upto',
+          scheme: pricing.scheme,
           ceiling: pricing.maxAmount,
           network: pricing.network,
           asset: pricing.asset,
@@ -186,18 +191,13 @@ export class X402Gate {
   /**
    * Classify the inbound turn and either request payment, refuse it, or clear
    * the request to run.
-   *
-   * Facilitator or store failures resolve to a `halt` rather than throwing:
-   * an unpaid request must never fall through to the agent, so the safe
-   * direction on an unexpected error is to refuse the call.
    */
   async open(params: X402GateParams): Promise<X402GateOutcome> {
-    const { taskId, contextId, message, resource } = params;
-    const ctx = { taskId, message };
+    const { taskId, contextId, message } = params;
 
     // `upto` exists only in x402 V2. The SDK would throw from
-    // `requestPayment`, which the catch below would report as a transient
-    // outage — misleading for what is a permanent misconfiguration.
+    // `requestPayment`, which its fail-closed catch would report as a
+    // transient outage — misleading for what is a permanent misconfiguration.
     if (this.pricing.scheme === 'upto' && X402_VERSION === 1) {
       logEvent('x402_config_invalid', {
         agentId: this.agentId,
@@ -215,42 +215,16 @@ export class X402Gate {
       };
     }
 
-    try {
-      const classified = await this.x402.classify(ctx);
+    const outcome = await this.gate.open({ taskId, contextId, message });
 
-      if (classified.kind === 'no-submission') {
-        // Turn 1. `requestPayment` persists the offering (status `offered`,
-        // with the TTL) and yields the `request-input` event we translate.
-        let metadata: Record<string, unknown> | undefined;
-        let text: string | undefined;
-        let offeredPricing = this.pricing;
-        // The terms ride along with the offering write the SDK performs inside
-        // here, in one statement. Publishers for one task are serialized and
-        // reuse a still-live snapshot, so a new unpaid turn cannot replace the
-        // rates after a signed turn has classified but before it claims.
-        await this.sidecar.publishing(taskId, this.pricing, async (frozenPricing) => {
-          offeredPricing = frozenPricing;
-          const accepts = pricingToAccepts(frozenPricing, resource);
-          for await (const event of this.x402.requestPayment(ctx, {
-            accepts,
-            expiresInSeconds: OFFERING_TTL_SECONDS,
-          })) {
-            if (event.type === 'request-input') {
-              metadata = event.metadata;
-              text = event.message;
-            }
-          }
-        });
-        if (metadata === undefined) {
-          // `requestPayment` always yields a `request-input`; reaching here
-          // means the SDK contract changed under us. Refuse rather than
-          // silently serve the call for free.
-          throw new Error('x402 requestPayment yielded no request-input event');
-        }
+    switch (outcome.kind) {
+      case 'request-payment':
+        // Turn 1. The SDK persisted the offering (status `offered`, with the
+        // TTL) and froze its terms; only the event needs translating.
         logEvent('x402_payment_required', {
           agentId: this.agentId,
           taskId,
-          ...this.offeringFields(offeredPricing),
+          ...this.offeringFields(this.pricing),
         });
         return {
           kind: 'halt',
@@ -258,166 +232,113 @@ export class X402Gate {
             taskId,
             contextId,
             state: TaskState.INPUT_REQUIRED,
-            text: text ?? 'Payment required to invoke this agent.',
-            metadata,
+            text: outcome.text,
+            metadata: outcome.metadata,
           }),
         };
-      }
 
-      if (classified.kind !== 'valid') {
-        // `classify` has already recorded the failure on the store entry.
+      case 'refuse':
+        // Covers every refusal the SDK produces — a malformed or mismatched
+        // submission, a failed verify, a replayed claim, a lapsed offering, a
+        // flat fee that could not be collected, or an infra error failing
+        // closed. `code` is the spec §9.1 discriminator between them.
         logEvent('x402_payment_refused', {
           agentId: this.agentId,
           taskId,
-          reason: classified.kind,
-          code: classified.code,
+          code: outcome.code,
+          reason: outcome.reason,
         });
+        if (outcome.failureReceipt !== undefined) {
+          // Money was in motion when this refusal happened: a `before-work`
+          // exact settlement was attempted and the facilitator said no.
+          logEvent('x402_settle_failed', {
+            agentId: this.agentId,
+            taskId,
+            reason: outcome.failureReceipt.errorReason ?? 'unknown',
+          });
+        }
         return {
           kind: 'halt',
           event: this.failedEvent({
             taskId,
             contextId,
-            code: classified.code,
-            reason: classified.reason,
+            code: outcome.code,
+            reason: outcome.reason,
+            ...(outcome.failureReceipt !== undefined
+              ? { failureReceipt: outcome.failureReceipt }
+              : {}),
           }),
         };
-      }
 
-      // One submission, one execution. `classify` above does not inspect the
-      // entry's status, so a replayed `payment-submitted` classifies valid
-      // every time; without this the backend would run the work again for the
-      // same authorization. The claim is never released — see `claim`.
-      if (!(await this.sidecar.claim(taskId))) {
-        logEvent('x402_submission_replayed', { agentId: this.agentId, taskId });
-        return {
-          kind: 'halt',
-          event: this.failedEvent({
-            taskId,
-            contextId,
-            code: 'DUPLICATE_NONCE',
-            reason: 'This payment has already been submitted for this task.',
-          }),
-        };
-      }
-
-      // Terms are the ones the offering was published under, not whatever the
-      // agent charges right now.
-      const settlementPricing = await this.sidecar.getPricing(taskId);
-      if (settlementPricing === undefined) {
-        // Written before the offering row carries an entry, so absence here
-        // is corruption rather than a normal state. Refuse instead of
-        // guessing a price.
-        logEvent('x402_pricing_snapshot_missing', { agentId: this.agentId, taskId });
-        return {
-          kind: 'halt',
-          event: this.failedEvent({
-            taskId,
-            contextId,
-            code: 'SETTLEMENT_FAILED',
-            reason: 'The terms this payment was offered under are no longer available.',
-          }),
-        };
-      }
-
-      // The snapshot and the requirement the payer actually signed must name
-      // the same scheme. Concurrent turn-1s racing a reprice can leave the two
-      // disagreeing, and the disagreement is expensive in one specific
-      // direction: an `upto` requirement paired with an `exact` snapshot skips
-      // the metering branch, which hands the SDK no amount and settles the
-      // full authorized ceiling. Refuse rather than let a mismatch pick a
-      // price — merely skipping the metering is not a safe default here.
-      const signedScheme = requirementScheme(classified.requirement);
-      if (signedScheme !== settlementPricing.scheme) {
-        logEvent('x402_scheme_mismatch', {
+      case 'handled': {
+        // A batch-settlement refund the SDK settled without running any work.
+        // Unreachable today: the bridge never publishes batch-settlement
+        // pricing, so no frozen offer can select it — but the outcome union
+        // carries it, and the safe defensive mapping is a terminal halt. The
+        // money already moved (the SDK holds a successful refund receipt), so
+        // the receipt must reach the payer on a completed terminal status;
+        // running the work or reporting failure would both misstate what
+        // happened. The extra log is the operator's tripwire that a path this
+        // deployment cannot produce fired anyway.
+        logEvent('x402_unexpected_outcome', {
           agentId: this.agentId,
           taskId,
-          signed: signedScheme,
-          snapshot: settlementPricing.scheme,
+          outcome: 'handled',
+          operation: outcome.operation,
         });
+        this.logSettled(taskId, outcome.receipt);
         return {
           kind: 'halt',
-          event: this.failedEvent({
+          event: this.statusEvent({
             taskId,
             contextId,
-            code: 'SETTLEMENT_FAILED',
-            reason: 'The offered terms and the signed payment disagree; start a new task.',
+            state: TaskState.COMPLETED,
+            text: 'The payment operation completed; no agent work was performed.',
+            metadata: outcome.receiptMetadata,
           }),
         };
       }
 
-      const verify = await this.x402.verify(ctx, classified);
-      if (!verify.isValid) {
-        const reason = verify.invalidReason ?? 'Payment verification failed.';
-        logEvent('x402_verify_failed', { agentId: this.agentId, taskId, reason });
-        return {
-          kind: 'halt',
-          event: this.failedEvent({
-            taskId,
-            contextId,
-            code: 'VERIFY_FAILED',
-            reason,
-          }),
-        };
-      }
+      case 'proceed': {
+        const obligation = outcome.obligation;
+        if (obligation === undefined) {
+          // The resolver above never returns null for a priced agent, so a
+          // bare proceed cannot happen here; tolerate it as "free" anyway.
+          return { kind: 'proceed' };
+        }
 
-      logEvent('x402_payment_verified', {
-        agentId: this.agentId,
-        taskId,
-        ...this.offeringFields(settlementPricing),
-      });
-
-      if (settlementPricing.scheme === 'upto') {
-        // Metered: the charge does not exist until the work has been done, so
-        // settlement has to follow it. See the note on `settleTerminal`.
-        return {
-          kind: 'proceed',
-          settlement: { mode: 'deferred', classified, pricing: settlementPricing },
-        };
-      }
-
-      // Flat fee: charge now, before the agent is contacted. The amount was
-      // fixed at offer time and the payer has signed for exactly it, so there
-      // is nothing to learn by doing the work first — and doing it first means
-      // handing over the result and only then discovering the authorization
-      // has been drained. A failure here costs nobody: no charge, no work.
-      //
-      // Safe to do here only because `claim` above is a one-shot: without it a
-      // replayed submission would settle a second time.
-      const settled = await this.settle({
-        taskId,
-        contextId,
-        classified,
-        pricing: settlementPricing,
-      });
-      if (settled.kind === 'failed') return { kind: 'halt', event: settled.event };
-      return { kind: 'proceed', settlement: { mode: 'settled', metadata: settled.metadata } };
-    } catch (err) {
-      // Facilitator unreachable, DB down, malformed offering — fail closed.
-      logEvent('x402_gate_error', {
-        agentId: this.agentId,
-        taskId,
-        error: String(err),
-      });
-      return {
-        kind: 'halt',
-        event: this.failedEvent({
+        logEvent('x402_payment_verified', {
+          agentId: this.agentId,
           taskId,
-          contextId,
-          code: 'SETTLEMENT_FAILED',
-          reason: 'Payment processing is temporarily unavailable.',
-        }),
-      };
+          ...this.offeringFields(obligation.pricing),
+        });
+
+        if (obligation.kind === 'deferred') {
+          // Metered: the charge does not exist until the work has been done,
+          // so settlement has to follow it — see `settle`.
+          return { kind: 'proceed', settlement: { mode: 'deferred', obligation } };
+        }
+
+        // Flat fee, already settled by the SDK before the agent is contacted
+        // (`exactTiming: 'before-work'`). Safe because the claim inside the
+        // SDK is a one-shot: a replayed submission cannot settle twice.
+        this.logSettled(taskId, obligation.receipt);
+        const done = this.x402.completedEvent({ receipt: obligation.receipt });
+        const metadata = done.type === 'done' ? (done.metadata ?? {}) : {};
+        return { kind: 'proceed', settlement: { mode: 'settled', metadata } };
+      }
     }
   }
 
   /**
-   * Settle a verified payment after the agent completed the work.
+   * Settle a deferred (`upto`) payment after the agent completed the work.
    *
-   * Under `exact` the charge is the amount the payer already signed for and
-   * `usage` is ignored. Under `upto` the charge is metered from `usage` and
-   * the SDK clamps it down to the minimum of the metered value, the offered
-   * ceiling, and the payer's signed cap — so a pricing or metering mistake
-   * here can only ever undercharge.
+   * The charge is metered from `usage` under the obligation's frozen terms,
+   * and the SDK clamps it down to the minimum of the metered value, the
+   * offered ceiling, and the payer's signed cap — so a pricing or metering
+   * mistake here can only ever undercharge. An `unreported` usage bills the
+   * floor (`unreportedUsage: 'floor'`), a trusted reported zero settles zero
+   * (a2x#206).
    *
    * Returns metadata to merge onto the task's final status message on
    * success, or a replacement terminal event when settlement failed — the
@@ -426,44 +347,59 @@ export class X402Gate {
   async settle(params: {
     taskId: string;
     contextId: string;
-    classified: X402ValidClassification;
-    /** The offering's frozen terms, from `open`. Never the live pricing. */
-    pricing: X402Pricing;
-    usage?: TaskUsage | undefined;
+    /** The verified submission and its frozen terms, from `open`. */
+    obligation: MerchantDeferredObligation;
+    usage: MerchantMeterableUsage;
+    /** The model the backend reported, for the metering log only. */
+    model?: string | undefined;
   }): Promise<
     | { kind: 'settled'; metadata: Record<string, unknown> }
     | { kind: 'failed'; event: TaskStatusUpdateEvent }
   > {
-    const { taskId, contextId, classified, pricing, usage } = params;
-    const ctx = { taskId };
+    const { taskId, contextId, obligation, usage, model } = params;
 
-    // Metering an `exact` requirement throws in the SDK — the signature binds
-    // it to one value — so the option is only ever passed for `upto`.
-    //
-    // Gated on the *requirement* the payer actually signed as well as on the
-    // snapshot: the two agree by construction, and requiring both means no
-    // single stale value can send a metered amount at an exact signature or
-    // vice versa.
-    let settleOpts: { amountAtomic?: string } | undefined;
-    if (pricing.scheme === 'upto' && requirementScheme(classified.requirement) === 'upto') {
-      const charge = meterUsage(pricing, usage);
-      settleOpts = { amountAtomic: charge.amountAtomic };
+    const result = await this.gate.settle({ taskId, obligation, usage });
+
+    if (result.kind === 'failed') {
+      logEvent('x402_settle_failed', {
+        agentId: this.agentId,
+        taskId,
+        reason: result.reason,
+      });
+      return {
+        kind: 'failed',
+        event: this.failedEvent({
+          taskId,
+          contextId,
+          code: result.code,
+          reason: result.reason,
+          ...(result.failureReceipt !== undefined
+            ? { failureReceipt: result.failureReceipt }
+            : {}),
+        }),
+      };
+    }
+
+    if (obligation.scheme === 'upto' && result.charge !== undefined) {
+      const charge = result.charge;
       logEvent('x402_metered', {
         agentId: this.agentId,
         taskId,
         basis: charge.basis,
-        amount: charge.amountAtomic,
-        ceiling: pricing.maxAmount,
-        ...(usage !== undefined
+        amount: charge.requestedAtomic,
+        ceiling: obligation.pricing.maxAmount,
+        ...(usage.kind === 'detailed'
           ? {
-              promptTokens: usage.prompt_tokens,
-              completionTokens: usage.completion_tokens,
-              ...(usage.cached_tokens !== undefined ? { cachedTokens: usage.cached_tokens } : {}),
-              ...(usage.model !== undefined ? { model: usage.model } : {}),
+              promptTokens: usage.inputTokens,
+              completionTokens: usage.outputTokens,
+              ...(usage.cachedInputTokens !== undefined
+                ? { cachedTokens: usage.cachedInputTokens }
+                : {}),
             }
           : {}),
+        ...(model !== undefined ? { model } : {}),
       });
-      if (charge.basis === 'no-usage') {
+      if (charge.basis === 'unreported-floor') {
         // Loud on purpose: the backend delivered work the bridge could not
         // price. Either the runtime dropped its accounting (codex #351) or
         // the backend has none at all (openclaw), and both mean this agent
@@ -476,44 +412,20 @@ export class X402Gate {
       }
     }
 
-    let receipt: X402SettleResponse;
+    this.logSettled(taskId, result.receipt);
+    return { kind: 'settled', metadata: result.receiptMetadata };
+  }
+
+  /** Drop the lifecycle record once the task has terminated. Best-effort. */
+  async clear(taskId: string): Promise<void> {
     try {
-      receipt = await this.x402.settle(ctx, classified, settleOpts);
+      await this.x402.clearOffering({ taskId });
     } catch (err) {
-      logEvent('x402_settle_error', {
-        agentId: this.agentId,
-        taskId,
-        error: String(err),
-      });
-      return {
-        kind: 'failed',
-        event: this.failedEvent({
-          taskId,
-          contextId,
-          code: 'SETTLEMENT_FAILED',
-          reason: 'Payment settlement failed.',
-        }),
-      };
+      logEvent('x402_clear_error', { agentId: this.agentId, taskId, error: String(err) });
     }
+  }
 
-    if (!receipt.success) {
-      logEvent('x402_settle_failed', {
-        agentId: this.agentId,
-        taskId,
-        reason: receipt.errorReason ?? 'unknown',
-      });
-      return {
-        kind: 'failed',
-        event: this.failedEvent({
-          taskId,
-          contextId,
-          code: 'SETTLEMENT_FAILED',
-          reason: receipt.errorReason ?? 'Payment settlement failed.',
-          failureReceipt: receipt,
-        }),
-      };
-    }
-
+  private logSettled(taskId: string, receipt: X402SettleResponse): void {
     logEvent('x402_settled', {
       agentId: this.agentId,
       taskId,
@@ -526,23 +438,6 @@ export class X402Gate {
       // backfill it from what was requested.
       ...(receipt.amount !== undefined ? { amount: receipt.amount } : {}),
     });
-
-    const done = this.x402.completedEvent({ receipt });
-    const metadata = done.type === 'done' ? (done.metadata ?? {}) : {};
-    // Deliberately does not clear the offering. Under `exact` this runs before
-    // the work, and dropping the row would release the claim mid-task — a
-    // resubmission would then be treated as a fresh payment and charged again.
-    // The executor clears once the task reaches a terminal state.
-    return { kind: 'settled', metadata };
-  }
-
-  /** Drop the lifecycle record once the task has terminated. Best-effort. */
-  async clear(taskId: string): Promise<void> {
-    try {
-      await this.x402.clearOffering({ taskId });
-    } catch (err) {
-      logEvent('x402_clear_error', { agentId: this.agentId, taskId, error: String(err) });
-    }
   }
 
   private failedEvent(input: {
@@ -569,7 +464,7 @@ export class X402Gate {
   }
 
   /**
-   * Translate an x402 `AgentEvent` into the wire event this executor emits.
+   * Translate an x402 outcome into the wire event this executor emits.
    * `final: true` on both states: an `input-required` turn ends the stream
    * without terminating the task, which is exactly what the flag means here.
    */

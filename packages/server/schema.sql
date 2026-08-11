@@ -897,8 +897,8 @@ COMMENT ON TABLE used_siwe_nonces IS E'@omit';
 -- 6c. x402 payment offerings
 -- ============================================================
 -- One row per x402 payment round-trip, keyed by the A2A task it gates.
--- Backs `PostgresX402Store` (src/x402/store.ts), which implements the SDK's
--- `BaseX402Store`.
+-- Backs `PostgresX402Store` (src/x402/store.ts), which implements both the
+-- SDK's `BaseX402Store` and its `MerchantOfferingSidecar` on the same row.
 --
 -- Why this must be in Postgres and not in process memory: the round-trip
 -- spans two HTTP requests — turn 1 advertises the offering and answers
@@ -922,11 +922,13 @@ COMMENT ON TABLE used_siwe_nonces IS E'@omit';
 -- gate would find A's offering and accept A's cheap signature as payment for
 -- B's work.
 --
--- `pricing` is the agent's pricing captured when the offering was published.
+-- `offer` is the full `MerchantOffer` frozen when the offering was published.
 -- Settlement must price from this, never from the agent's live pricing: the
 -- two turns of a payment are separate requests, and a reprice in between would
 -- otherwise meter turn 2 against a requirement turn 1 signed under different
--- terms — which settles the wrong amount.
+-- terms — which settles the wrong amount. (Earlier builds froze the bridge's
+-- own pricing row in a `pricing` column; the SDK's sidecar contract freezes
+-- the complete published offer instead.)
 --
 -- `claimed_at` is a one-shot concurrency guard. The SDK's `classify()` does not
 -- inspect the entry's status, so replaying one signed submission before
@@ -936,7 +938,7 @@ CREATE TABLE IF NOT EXISTS x402_offerings (
   task_id     TEXT NOT NULL,
   agent_id    TEXT NOT NULL,
   entry       JSONB NOT NULL,
-  pricing     JSONB,
+  offer       JSONB,
   claimed_at  TIMESTAMPTZ,
   expires_at  TIMESTAMPTZ,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -947,8 +949,15 @@ CREATE TABLE IF NOT EXISTS x402_offerings (
 -- Converge a dev DB created from the first cut of this table, which keyed on
 -- task_id alone and had neither column. Never deployed, so this is only here
 -- so re-applying schema.sql on such a database doesn't fail.
-ALTER TABLE x402_offerings ADD COLUMN IF NOT EXISTS pricing JSONB;
 ALTER TABLE x402_offerings ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+-- Converge a deployed DB from the pre-MerchantGate builds. Their `pricing`
+-- column is deliberately NOT dropped here: instances of the previous build
+-- still write it during a rolling deploy, and a dropped column would fail
+-- their offering writes closed. Drop it in a follow-up once the fleet is on
+-- offer-based builds. An in-flight offering frozen only as `pricing` reads as
+-- "terms no longer available" under the new build — refused, never charged —
+-- and the window is bounded by the offering TTL.
+ALTER TABLE x402_offerings ADD COLUMN IF NOT EXISTS offer JSONB;
 DO $$
 BEGIN
   IF EXISTS (

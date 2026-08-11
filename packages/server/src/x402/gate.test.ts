@@ -1,20 +1,27 @@
+// The orchestration itself — classify, freeze, claim, verify, meter, clamp —
+// is the SDK's `MerchantGate` and is tested there. What these tests pin is the
+// bridge's side of the composition: outcomes rendered as the wire events this
+// executor emits, the pricing row mapped onto the published offer, and the
+// deployment's policy choices (settle-before-work for `exact`, floor for
+// unreported usage, zero for a trusted reported zero).
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { TaskState, type Message } from '@a2x/sdk';
 import {
-  X402Context,
+  InMemoryMerchantOfferStore,
   InMemoryX402Store,
+  X402Context,
   X402_METADATA_KEYS,
   X402_PAYMENT_STATUS,
+  type MerchantDeferredObligation,
   type X402Facilitator,
   type X402PaymentPayload,
-  type X402ValidClassification,
   type X402VerifyResponse,
   type X402FacilitatorSettleResponse,
 } from '@a2x/sdk/x402';
-import { X402Gate, type X402GateOutcome, type X402OfferingSidecar } from './gate.js';
+import { X402Gate, type X402GateOutcome } from './gate.js';
 import { parseX402Pricing, type X402Pricing } from './pricing.js';
-import type { TaskUsage } from './usage.js';
 
 const RESOURCE = 'https://bridge.test/agents/a1';
 const PAY_TO = '0x1111111111111111111111111111111111111111';
@@ -72,55 +79,17 @@ function stubFacilitator(
   return state as X402Facilitator & typeof state;
 }
 
-/**
- * In-memory stand-in for the Postgres sidecar: the pricing snapshot taken when
- * an offering is published, and the one-shot claim that stops a replayed
- * submission from running the work twice.
- */
-interface MemorySidecar extends X402OfferingSidecar {
-  /** Test hook: force the stored terms out of step with the offering. */
-  overwritePricing(taskId: string, pricing: X402Pricing): void;
-}
-
-function memorySidecar(): MemorySidecar {
-  const pricingByTask = new Map<string, X402Pricing>();
-  const claimed = new Set<string>();
-  return {
-    // The real store serializes publishers and keeps the first live terms.
-    // This double has no expiry, so an existing entry is always live.
-    async publishing<T>(
-      taskId: string,
-      pricing: X402Pricing,
-      fn: (frozenPricing: X402Pricing) => Promise<T>,
-    ): Promise<T> {
-      const frozenPricing = pricingByTask.get(taskId) ?? pricing;
-      pricingByTask.set(taskId, frozenPricing);
-      return fn(frozenPricing);
-    },
-    async getPricing(taskId) {
-      return pricingByTask.get(taskId);
-    },
-    async claim(taskId) {
-      if (claimed.has(taskId)) return false;
-      claimed.add(taskId);
-      return true;
-    },
-    overwritePricing(taskId, pricing) {
-      pricingByTask.set(taskId, pricing);
-    },
-  };
-}
-
 function makeGate(
   facilitator: X402Facilitator,
   pricing: X402Pricing = PRICING,
-  sidecar: X402OfferingSidecar = memorySidecar(),
+  offerStore: InMemoryMerchantOfferStore = new InMemoryMerchantOfferStore(),
 ): X402Gate {
   return new X402Gate(
     'a1',
     pricing,
     new X402Context({ store: new InMemoryX402Store(), facilitator, x402Version: 2 }),
-    sidecar,
+    offerStore,
+    RESOURCE,
   );
 }
 
@@ -181,7 +150,6 @@ test('turn 1 halts with input-required carrying the payment-required offering', 
     taskId: 't-1',
     contextId: 'ctx-1',
     message: userMessage(),
-    resource: RESOURCE,
   });
 
   assert.equal(outcome.kind, 'halt');
@@ -222,7 +190,6 @@ test('turn 2 with a valid signed payload verifies and proceeds', async () => {
     taskId: 't-2',
     contextId: 'ctx-2',
     message: userMessage(),
-    resource: RESOURCE,
   });
   assert.equal(first.kind, 'halt');
   if (first.kind !== 'halt') return;
@@ -231,7 +198,6 @@ test('turn 2 with a valid signed payload verifies and proceeds', async () => {
     taskId: 't-2',
     contextId: 'ctx-2',
     message: submissionMessage(offeredRequirement(first.event)),
-    resource: RESOURCE,
   });
 
   assert.equal(second.kind, 'proceed');
@@ -250,8 +216,9 @@ test('turn 2 with a valid signed payload verifies and proceeds', async () => {
 });
 
 test('a submission whose taskId was never offered is refused', async () => {
-  // The horizontally-scaled failure mode this store exists to prevent: if the
-  // offering is missing, the payload must be refused rather than trusted.
+  // The horizontally-scaled failure mode the Postgres offer store exists to
+  // prevent: if the offering is missing, the payload must be refused rather
+  // than trusted.
   const facilitator = stubFacilitator();
   const gate = makeGate(facilitator);
 
@@ -259,7 +226,6 @@ test('a submission whose taskId was never offered is refused', async () => {
     taskId: 't-known',
     contextId: 'ctx',
     message: userMessage(),
-    resource: RESOURCE,
   });
   assert.equal(offering.kind, 'halt');
   if (offering.kind !== 'halt') return;
@@ -268,7 +234,6 @@ test('a submission whose taskId was never offered is refused', async () => {
     taskId: 't-unknown',
     contextId: 'ctx',
     message: submissionMessage(offeredRequirement(offering.event)),
-    resource: RESOURCE,
   });
 
   assert.equal(outcome.kind, 'halt');
@@ -287,7 +252,6 @@ test('a payload paying the wrong recipient is refused before the facilitator', a
     taskId: 't-3',
     contextId: 'ctx-3',
     message: userMessage(),
-    resource: RESOURCE,
   });
   assert.equal(first.kind, 'halt');
   if (first.kind !== 'halt') return;
@@ -298,7 +262,6 @@ test('a payload paying the wrong recipient is refused before the facilitator', a
     message: submissionMessage(offeredRequirement(first.event), {
       to: '0x9999999999999999999999999999999999999999',
     }),
-    resource: RESOURCE,
   });
 
   assert.equal(outcome.kind, 'halt');
@@ -317,7 +280,6 @@ test('a failed facilitator verification halts without settling', async () => {
     taskId: 't-4',
     contextId: 'ctx-4',
     message: userMessage(),
-    resource: RESOURCE,
   });
   assert.equal(first.kind, 'halt');
   if (first.kind !== 'halt') return;
@@ -326,7 +288,6 @@ test('a failed facilitator verification halts without settling', async () => {
     taskId: 't-4',
     contextId: 'ctx-4',
     message: submissionMessage(offeredRequirement(first.event)),
-    resource: RESOURCE,
   });
 
   assert.equal(outcome.kind, 'halt');
@@ -354,7 +315,6 @@ test('a store or facilitator error fails closed instead of serving the call free
     taskId: 't-5',
     contextId: 'ctx-5',
     message: userMessage(),
-    resource: RESOURCE,
   });
   assert.equal(first.kind, 'halt');
   if (first.kind !== 'halt') return;
@@ -363,7 +323,6 @@ test('a store or facilitator error fails closed instead of serving the call free
     taskId: 't-5',
     contextId: 'ctx-5',
     message: submissionMessage(offeredRequirement(first.event)),
-    resource: RESOURCE,
   });
 
   // The important part is that it is NOT 'proceed' — an unpaid call must
@@ -383,7 +342,6 @@ async function exactTurnTwo(
     taskId,
     contextId: `ctx-${taskId}`,
     message: userMessage(),
-    resource: RESOURCE,
   });
   assert.equal(first.kind, 'halt');
   if (first.kind !== 'halt') throw new Error('unreachable');
@@ -391,7 +349,6 @@ async function exactTurnTwo(
     taskId,
     contextId: `ctx-${taskId}`,
     message: submissionMessage(offeredRequirement(first.event)),
-    resource: RESOURCE,
   });
 }
 
@@ -487,13 +444,12 @@ async function uptoVerified(
   facilitator: X402Facilitator,
   taskId: string,
   pricing: X402Pricing = UPTO_PRICING,
-): Promise<{ gate: X402Gate; classified: X402ValidClassification; pricing: X402Pricing }> {
+): Promise<{ gate: X402Gate; obligation: MerchantDeferredObligation }> {
   const gate = makeGate(facilitator, pricing);
   const first = await gate.open({
     taskId,
     contextId: `ctx-${taskId}`,
     message: userMessage(),
-    resource: RESOURCE,
   });
   assert.equal(first.kind, 'halt');
   if (first.kind !== 'halt') throw new Error('unreachable');
@@ -502,7 +458,6 @@ async function uptoVerified(
     taskId,
     contextId: `ctx-${taskId}`,
     message: uptoSubmissionMessage(offeredRequirement(first.event)),
-    resource: RESOURCE,
   });
   assert.equal(second.kind, 'proceed', 'upto submission should verify');
   if (second.kind !== 'proceed' || second.settlement?.mode !== 'deferred') {
@@ -511,11 +466,7 @@ async function uptoVerified(
   // Metered agents must not have moved money yet — the charge does not exist
   // until the work has been done.
   assert.equal((facilitator as { settleCalls?: number }).settleCalls, 0);
-  return {
-    gate,
-    classified: second.settlement.classified,
-    pricing: second.settlement.pricing,
-  };
+  return { gate, obligation: second.settlement.obligation };
 }
 
 test('an upto offering advertises the ceiling and the facilitator address', async () => {
@@ -526,62 +477,42 @@ test('an upto offering advertises the ceiling and the facilitator address', asyn
     taskId: 'u-1',
     contextId: 'ctx-u1',
     message: userMessage(),
-    resource: RESOURCE,
   });
   assert.equal(outcome.kind, 'halt');
   if (outcome.kind !== 'halt') return;
 
   const requirement = offeredRequirement(outcome.event);
   assert.equal(requirement.scheme, 'upto');
+  // What the payer authorizes, not what they will be charged — the SDK
+  // flattens the rate table back off the wire shape entirely.
   assert.equal(requirement.amount, '1000000');
+  assert.equal(requirement.rates, undefined);
   assert.deepEqual(requirement.extra, { facilitatorAddress: FACILITATOR });
 });
 
 test('upto settles the metered charge, not the authorized ceiling', async () => {
   const facilitator = stubFacilitator();
-  const { gate, classified, pricing } = await uptoVerified(facilitator, 'u-2');
+  const { gate, obligation } = await uptoVerified(facilitator, 'u-2');
 
   // 100k in @ $3/MTok + 10k out @ $15/MTok = 450000 atomic, well under the
   // 1000000 ceiling the payer authorized.
-  const usage: TaskUsage = {
-    prompt_tokens: 100_000,
-    completion_tokens: 10_000,
-    total_tokens: 110_000,
-  };
   const result = await gate.settle({
     taskId: 'u-2',
     contextId: 'ctx-u-2',
-    classified,
-    pricing,
-    usage,
+    obligation,
+    usage: { kind: 'detailed', inputTokens: 100_000, outputTokens: 10_000 },
   });
 
   assert.equal(result.kind, 'settled');
   assert.equal(facilitator.settledAmount, '450000');
 });
 
-test('a metered charge above the ceiling is clamped down to it', async () => {
-  const facilitator = stubFacilitator();
-  const { gate, classified, pricing } = await uptoVerified(facilitator, 'u-3');
-
-  // 10M input tokens prices to 30000000 — 30x the authorized ceiling. The
-  // SDK clamps, which is what makes a pricing mistake unable to overcharge.
-  const result = await gate.settle({
-    taskId: 'u-3',
-    contextId: 'ctx-u-3',
-    classified,
-    pricing,
-    usage: { prompt_tokens: 10_000_000, completion_tokens: 0, total_tokens: 10_000_000 },
-  });
-
-  assert.equal(result.kind, 'settled');
-  assert.equal(facilitator.settledAmount, '1000000');
-});
-
 test('upto settles the floor when the backend reported no usage', async () => {
-  // openclaw reports nothing; codex can emit {0,0,0} when its runtime drops
-  // accounting. Charging zero for delivered work is a real loss, so an
-  // operator who sets minAmount gets that instead.
+  // openclaw reports nothing at all — the `unreportedUsage: 'floor'` policy
+  // the bridge maps every row with. Charging zero for delivered work is a
+  // real loss, so an operator who sets minAmount gets that floor; charging
+  // the authorized ceiling would be worse, billing the payer the maximum for
+  // a gap in *our* instrumentation.
   const facilitator = stubFacilitator();
   const priced = parseX402Pricing({
     scheme: 'upto',
@@ -593,100 +524,129 @@ test('upto settles the floor when the backend reported no usage', async () => {
     minAmount: '25000',
     facilitatorAddress: FACILITATOR,
   })!;
-  const { gate, classified, pricing } = await uptoVerified(facilitator, 'u-4', priced);
+  const { gate, obligation } = await uptoVerified(facilitator, 'u-4', priced);
 
   const result = await gate.settle({
     taskId: 'u-4',
     contextId: 'ctx-u-4',
-    classified,
-    pricing,
-    usage: undefined,
+    obligation,
+    usage: { kind: 'unreported' },
   });
 
   assert.equal(result.kind, 'settled');
   assert.equal(facilitator.settledAmount, '25000');
 });
 
-test('upto with no usage and no floor settles zero rather than the ceiling', async () => {
-  // The default direction is payer-favourable on purpose: billing the
-  // maximum because *our* instrumentation lost the token count would be a
-  // user-visible wrong, where undercharging is our own loss to fix.
+test('upto with unreported usage and no floor settles zero rather than the ceiling', async () => {
   const facilitator = stubFacilitator();
-  const { gate, classified, pricing } = await uptoVerified(facilitator, 'u-5');
+  const { gate, obligation } = await uptoVerified(facilitator, 'u-5');
 
   const result = await gate.settle({
     taskId: 'u-5',
     contextId: 'ctx-u-5',
-    classified,
-    pricing,
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    obligation,
+    usage: { kind: 'unreported' },
   });
 
   assert.equal(result.kind, 'settled');
   assert.equal(facilitator.settledAmount, '0');
 });
 
-test('an exact agent ignores usage and settles the signed amount', async () => {
-  // Metering an `exact` requirement throws in the SDK, so the gate must not
-  // pass an amount through for a flat-fee agent even when usage is present.
+test('a trusted reported zero settles zero, not the floor', async () => {
+  // The a2x#206 semantic change this migration ships: a backend that
+  // *reported* zero consumption is believed, even when a floor is set. The
+  // floor exists for work the bridge could not price, not as a minimum bill
+  // for work the backend priced at nothing. Runtimes that emit {0,0} as an
+  // "accounting dropped" sentinel now surface as `unreported` in
+  // `readTaskUsage`'s callers only when they truly reported nothing.
   const facilitator = stubFacilitator();
-  const gate = makeGate(facilitator);
+  const priced = parseX402Pricing({
+    scheme: 'upto',
+    network: 'eip155:84532',
+    asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+    payTo: PAY_TO,
+    maxAmount: '1000000',
+    rates: { input: '3000000', output: '15000000' },
+    minAmount: '25000',
+    facilitatorAddress: FACILITATOR,
+  })!;
+  const { gate, obligation } = await uptoVerified(facilitator, 'u-zero', priced);
 
-  const first = await gate.open({
-    taskId: 'u-6',
-    contextId: 'ctx-u-6',
-    message: userMessage(),
-    resource: RESOURCE,
+  const result = await gate.settle({
+    taskId: 'u-zero',
+    contextId: 'ctx-u-zero',
+    obligation,
+    usage: { kind: 'detailed', inputTokens: 0, outputTokens: 0 },
   });
-  assert.equal(first.kind, 'halt');
-  if (first.kind !== 'halt') return;
 
-  const second = await gate.open({
-    taskId: 'u-6',
-    contextId: 'ctx-u-6',
-    message: submissionMessage(offeredRequirement(first.event)),
-    resource: RESOURCE,
+  assert.equal(result.kind, 'settled');
+  assert.equal(facilitator.settledAmount, '0');
+});
+
+test('a failed deferred settlement replaces the terminal event', async () => {
+  // The merchant was not paid, so the task must not report success — the
+  // caller already has the output (nothing can be done about that under
+  // `upto`), but the terminal state and receipt say what actually happened.
+  const facilitator = stubFacilitator({
+    settle: { success: false, errorReason: 'INSUFFICIENT_FUNDS' },
   });
+  const { gate, obligation } = await uptoVerified(facilitator, 'u-fail');
+
+  const result = await gate.settle({
+    taskId: 'u-fail',
+    contextId: 'ctx-u-fail',
+    obligation,
+    usage: { kind: 'detailed', inputTokens: 100, outputTokens: 100 },
+  });
+
+  assert.equal(result.kind, 'failed');
+  if (result.kind !== 'failed') return;
+  assert.equal(result.event.status.state, TaskState.FAILED);
+  assert.equal(
+    result.event.status.message?.metadata?.[X402_METADATA_KEYS.STATUS],
+    X402_PAYMENT_STATUS.FAILED,
+  );
+});
+
+test('an exact agent ignores usage and settles the signed amount', async () => {
   // Settled inside `open`, at the signed amount, with usage nowhere in play —
   // metering an `exact` requirement throws in the SDK.
-  assert.equal(second.kind, 'proceed');
-  if (second.kind !== 'proceed') return;
-  assert.equal(second.settlement?.mode, 'settled');
+  const facilitator = stubFacilitator();
+  const outcome = await exactTurnTwo(facilitator, 'u-6');
+  assert.equal(outcome.kind, 'proceed');
+  if (outcome.kind !== 'proceed') return;
+  assert.equal(outcome.settlement?.mode, 'settled');
   assert.equal(facilitator.settledAmount, '10000');
 });
 
-// ── the offering's terms are frozen, and usable once ──────────────────────
+// ── the offering's terms are frozen across a reprice ──────────────────────
 
 test('settlement prices from the offering, not from a reprice that landed between turns', async () => {
-  // The two turns are separate requests, so the agent can be repriced in
-  // between. Settling from live pricing would meter turn 2 against terms turn
-  // 1 never signed — and when an `upto` offering met `exact` pricing, the
-  // metering branch was skipped and the SDK settled the full authorized
-  // ceiling instead of the metered charge.
+  // The freezing itself is the SDK offer store's contract; what this pins is the
+  // bridge wiring around it — the executor rebuilds the gate when an admin
+  // reprices, so turn 2 runs on a *different* gate instance over the same
+  // store and offer store, and must still settle under turn 1's terms.
   const facilitator = stubFacilitator();
   const store = new InMemoryX402Store();
-  const sidecar = memorySidecar();
-  const context = () =>
-    new X402Context({ store, facilitator, x402Version: 2 });
+  const offerStore = new InMemoryMerchantOfferStore();
+  const context = () => new X402Context({ store, facilitator, x402Version: 2 });
 
-  const atOfferTime = new X402Gate('a1', UPTO_PRICING, context(), sidecar);
+  const atOfferTime = new X402Gate('a1', UPTO_PRICING, context(), offerStore, RESOURCE);
   const first = await atOfferTime.open({
     taskId: 'reprice',
     contextId: 'ctx-reprice',
     message: userMessage(),
-    resource: RESOURCE,
   });
   assert.equal(first.kind, 'halt');
   if (first.kind !== 'halt') return;
 
   // Admin reprices to a flat fee. The executor rebuilds the gate on the next
   // turn, so turn 2 runs with entirely different live pricing.
-  const afterReprice = new X402Gate('a1', PRICING, context(), sidecar);
+  const afterReprice = new X402Gate('a1', PRICING, context(), offerStore, RESOURCE);
   const second = await afterReprice.open({
     taskId: 'reprice',
     contextId: 'ctx-reprice',
     message: uptoSubmissionMessage(offeredRequirement(first.event)),
-    resource: RESOURCE,
   });
   assert.equal(second.kind, 'proceed');
   if (second.kind !== 'proceed' || second.settlement?.mode !== 'deferred') return;
@@ -694,171 +654,15 @@ test('settlement prices from the offering, not from a reprice that landed betwee
   // `open` hands back the frozen terms, not what the agent charges now — and
   // defers, because the offering was metered even though the agent is now
   // flat-fee. Settling here as `exact` would have charged the ceiling.
-  assert.equal(second.settlement.pricing.scheme, 'upto');
+  assert.equal(second.settlement.obligation.pricing.scheme, 'upto');
 
   await afterReprice.settle({
     taskId: 'reprice',
     contextId: 'ctx-reprice',
-    classified: second.settlement.classified,
-    pricing: second.settlement.pricing,
-    usage: { prompt_tokens: 100_000, completion_tokens: 10_000, total_tokens: 110_000 },
+    obligation: second.settlement.obligation,
+    usage: { kind: 'detailed', inputTokens: 100_000, outputTokens: 10_000 },
   });
 
-  // Metered, not the 1000000 ceiling the old code would have settled.
+  // Metered under the frozen rates, not the 1000000 ceiling.
   assert.equal(facilitator.settledAmount, '450000');
-});
-
-test('a repeated unpaid turn reuses the live offering terms after a reprice', async () => {
-  // A continuation without payment metadata is classified as `no-submission`
-  // without consulting the store. It must not replace the snapshot that a
-  // concurrent signed continuation may already have classified.
-  const facilitator = stubFacilitator();
-  const store = new InMemoryX402Store();
-  const sidecar = memorySidecar();
-  const context = () => new X402Context({ store, facilitator, x402Version: 2 });
-
-  const original = new X402Gate('a1', UPTO_PRICING, context(), sidecar);
-  const first = await original.open({
-    taskId: 'unpaid-retry',
-    contextId: 'ctx-unpaid-retry',
-    message: userMessage(),
-    resource: RESOURCE,
-  });
-  assert.equal(first.kind, 'halt');
-
-  const repriced = parseX402Pricing({
-    ...UPTO_PRICING,
-    rates: { input: '9000000', output: '45000000', cachedInput: '900000' },
-  })!;
-  const afterReprice = new X402Gate('a1', repriced, context(), sidecar);
-
-  const repeated = await afterReprice.open({
-    taskId: 'unpaid-retry',
-    contextId: 'ctx-unpaid-retry',
-    message: userMessage(),
-    resource: RESOURCE,
-  });
-  assert.equal(repeated.kind, 'halt');
-  if (repeated.kind !== 'halt') return;
-
-  const submitted = await afterReprice.open({
-    taskId: 'unpaid-retry',
-    contextId: 'ctx-unpaid-retry',
-    message: uptoSubmissionMessage(offeredRequirement(repeated.event)),
-    resource: RESOURCE,
-  });
-  assert.equal(submitted.kind, 'proceed');
-  if (submitted.kind !== 'proceed' || submitted.settlement?.mode !== 'deferred') return;
-  assert.deepEqual(submitted.settlement.pricing, UPTO_PRICING);
-});
-
-test('a replayed submission is refused instead of running the work twice', async () => {
-  // `classify()` does not inspect the entry's status, so the same signed
-  // payload classifies valid every time it is sent. Without the claim the
-  // backend would run again for one authorization.
-  const facilitator = stubFacilitator();
-  const gate = makeGate(facilitator);
-
-  const first = await gate.open({
-    taskId: 'replay',
-    contextId: 'ctx-replay',
-    message: userMessage(),
-    resource: RESOURCE,
-  });
-  assert.equal(first.kind, 'halt');
-  if (first.kind !== 'halt') return;
-
-  const submission = submissionMessage(offeredRequirement(first.event));
-  const attempt = () =>
-    gate.open({
-      taskId: 'replay',
-      contextId: 'ctx-replay',
-      message: submission,
-      resource: RESOURCE,
-    });
-
-  assert.equal((await attempt()).kind, 'proceed');
-
-  const replay = await attempt();
-  assert.equal(replay.kind, 'halt');
-  if (replay.kind !== 'halt') return;
-  assert.equal(replay.event.status.state, TaskState.FAILED);
-  // The claim is taken before verify, so the replay costs no facilitator call.
-  assert.equal(facilitator.verifyCalls, 1);
-});
-
-test('a snapshot that disagrees with the signed requirement is refused, not silently unmetered', async () => {
-  // Concurrent turn-1s racing a reprice can leave the offering and the
-  // snapshot describing different schemes. Merely skipping the metering
-  // branch is the expensive failure: an `upto` requirement with no amount
-  // settles the full authorized ceiling.
-  const facilitator = stubFacilitator();
-  const store = new InMemoryX402Store();
-  const sidecar = memorySidecar();
-
-  // Publish an `upto` offering, then corrupt the snapshot to `exact`.
-  const gate = new X402Gate(
-    'a1',
-    UPTO_PRICING,
-    new X402Context({ store, facilitator, x402Version: 2 }),
-    sidecar,
-  );
-  const first = await gate.open({
-    taskId: 'mismatch',
-    contextId: 'ctx-mismatch',
-    message: userMessage(),
-    resource: RESOURCE,
-  });
-  assert.equal(first.kind, 'halt');
-  if (first.kind !== 'halt') return;
-  sidecar.overwritePricing('mismatch', PRICING);
-
-  const second = await gate.open({
-    taskId: 'mismatch',
-    contextId: 'ctx-mismatch',
-    message: uptoSubmissionMessage(offeredRequirement(first.event)),
-    resource: RESOURCE,
-  });
-
-  assert.equal(second.kind, 'halt');
-  if (second.kind !== 'halt') return;
-  assert.equal(second.event.status.state, TaskState.FAILED);
-  assert.equal(facilitator.verifyCalls, 0, 'refused before the facilitator is involved');
-  assert.equal(facilitator.settleCalls, 0);
-});
-
-test('a missing pricing snapshot refuses the call rather than guessing a price', async () => {
-  // Written in the same breath as the offering, so absence means corruption.
-  // Falling back to live pricing here is exactly the bug the snapshot exists
-  // to prevent, so the safe direction is to refuse.
-  const facilitator = stubFacilitator();
-  const sidecar = memorySidecar();
-  const forgetful: X402OfferingSidecar = {
-    publishing: (_t, pricing, fn) => fn(pricing),
-    getPricing: async () => undefined,
-    claim: (taskId) => sidecar.claim(taskId),
-  };
-  const gate = makeGate(facilitator, PRICING, forgetful);
-
-  const first = await gate.open({
-    taskId: 'no-snapshot',
-    contextId: 'ctx-no-snapshot',
-    message: userMessage(),
-    resource: RESOURCE,
-  });
-  assert.equal(first.kind, 'halt');
-  if (first.kind !== 'halt') return;
-
-  const second = await gate.open({
-    taskId: 'no-snapshot',
-    contextId: 'ctx-no-snapshot',
-    message: submissionMessage(offeredRequirement(first.event)),
-    resource: RESOURCE,
-  });
-
-  assert.equal(second.kind, 'halt');
-  if (second.kind !== 'halt') return;
-  assert.equal(second.event.status.state, TaskState.FAILED);
-  assert.equal(facilitator.verifyCalls, 0);
-  assert.equal(facilitator.settleCalls, 0);
 });
