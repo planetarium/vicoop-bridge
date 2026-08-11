@@ -898,7 +898,7 @@ COMMENT ON TABLE used_siwe_nonces IS E'@omit';
 -- ============================================================
 -- One row per x402 payment round-trip, keyed by the A2A task it gates.
 -- Backs `PostgresX402Store` (src/x402/store.ts), which implements both the
--- SDK's `BaseX402Store` and its `MerchantOfferingSidecar` on the same row.
+-- SDK's `BaseX402Store` and its `MerchantOfferStore` on the same row.
 --
 -- Why this must be in Postgres and not in process memory: the round-trip
 -- spans two HTTP requests — turn 1 advertises the offering and answers
