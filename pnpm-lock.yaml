@@ -29,8 +29,8 @@ importers:
   packages/admin-ui:
     dependencies:
       '@a2x/sdk':
-        specifier: ^0.18.0
-        version: 0.18.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6))(zod@4.3.6)
+        specifier: ^0.21.0
+        version: 0.21.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6))(zod@4.3.6)
       '@rainbow-me/rainbowkit':
         specifier: ^2
         version: 2.2.10(@tanstack/react-query@5.99.0(react@19.2.5))(@types/react@19.2.14)(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(typescript@5.9.3)(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6))(wagmi@2.19.5(@tanstack/query-core@5.99.0)(@tanstack/react-query@5.99.0(react@19.2.5))(@types/react@19.2.14)(bufferutil@4.1.0)(react@19.2.5)(typescript@5.9.3)(utf-8-validate@5.0.10)(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6))(zod@4.3.6))
@@ -208,33 +208,6 @@ importers:
         version: 6.16.0(bufferutil@4.1.0)(utf-8-validate@5.0.10)
 
 packages:
-
-  '@a2x/sdk@0.18.0':
-    resolution: {integrity: sha512-Bgr29nAwfQMqe0zXG/c/9OcR9JZNzVAZ86/Un/VwMnPjLv2RGOdueBHR37y9vN2wHjED18ckLUFSIuUIF7367w==}
-    engines: {node: '>=20.0.0'}
-    peerDependencies:
-      '@anthropic-ai/sdk': '>=0.52.0'
-      '@google/genai': '>=1.0.0'
-      '@x402/core': '>=2.19.0 <3'
-      '@x402/evm': '>=2.19.0 <3'
-      openai: '>=4.0.0'
-      viem: '>=2.21.0'
-      zod: ^3.0.0
-    peerDependenciesMeta:
-      '@anthropic-ai/sdk':
-        optional: true
-      '@google/genai':
-        optional: true
-      '@x402/core':
-        optional: true
-      '@x402/evm':
-        optional: true
-      openai:
-        optional: true
-      viem:
-        optional: true
-      zod:
-        optional: true
 
   '@a2x/sdk@0.21.0':
     resolution: {integrity: sha512-o7R6//RQzCz96tO595Z68uhoeZJKIu1foqZjHPuk3sh/8ZpxQJVRJUnDc+/U6s8kz2ur5/k2gYwpKJHti61krw==}
@@ -4761,19 +4734,19 @@ packages:
 
 snapshots:
 
-  '@a2x/sdk@0.18.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6))(zod@4.3.6)':
-    optionalDependencies:
-      '@x402/core': 2.21.0
-      '@x402/evm': 2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)
-      viem: 2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6)
-      zod: 4.3.6
-
   '@a2x/sdk@0.21.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76)':
     optionalDependencies:
       '@x402/core': 2.21.0
       '@x402/evm': 2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)
       viem: 2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76)
       zod: 3.25.76
+
+  '@a2x/sdk@0.21.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6))(zod@4.3.6)':
+    optionalDependencies:
+      '@x402/core': 2.21.0
+      '@x402/evm': 2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)
+      viem: 2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6)
+      zod: 4.3.6
 
   '@adraffy/ens-normalize@1.10.1': {}
 
