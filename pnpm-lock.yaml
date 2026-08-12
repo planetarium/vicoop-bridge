@@ -134,8 +134,8 @@ importers:
   packages/server:
     dependencies:
       '@a2x/sdk':
-        specifier: ^0.20.0
-        version: 0.20.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76)
+        specifier: ^0.21.0
+        version: 0.21.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76)
       '@ai-sdk/anthropic':
         specifier: ^3.0.69
         version: 3.0.69(zod@3.25.76)
@@ -236,9 +236,9 @@ packages:
       zod:
         optional: true
 
-  '@a2x/sdk@0.20.0':
-    resolution: {integrity: sha512-Findvt0BaG4khsGW7ZDyqGgoljZoYBn9Zkhb8SsTRIoiS31kHAkDKxK5tVmi8rm1rEO0veSOBossuqPssazrBA==}
-    engines: {node: '>=20.0.0'}
+  '@a2x/sdk@0.21.0':
+    resolution: {integrity: sha512-o7R6//RQzCz96tO595Z68uhoeZJKIu1foqZjHPuk3sh/8ZpxQJVRJUnDc+/U6s8kz2ur5/k2gYwpKJHti61krw==}
+    engines: {node: '>=22.11.0'}
     peerDependencies:
       '@anthropic-ai/sdk': '>=0.52.0'
       '@google/genai': '>=1.0.0'
@@ -4768,7 +4768,7 @@ snapshots:
       viem: 2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@4.3.6)
       zod: 4.3.6
 
-  '@a2x/sdk@0.20.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76)':
+  '@a2x/sdk@0.21.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76)':
     optionalDependencies:
       '@x402/core': 2.21.0
       '@x402/evm': 2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)
