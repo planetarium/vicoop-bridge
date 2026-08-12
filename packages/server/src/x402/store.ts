@@ -1,13 +1,14 @@
 import {
   BaseX402Store,
+  type MerchantOffer,
+  type MerchantOfferStore,
   type X402StoreEntry,
   type X402StoreEntryPatch,
 } from '@a2x/sdk/x402';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Sql, SqlExecutor } from '../db.js';
-import { parseX402Pricing, type X402Pricing } from './pricing.js';
 
-// The pricing an in-flight `requestPayment` is publishing.
+// The offer an in-flight `requestPayment` is publishing.
 //
 // The SDK owns the offering write, so the terms cannot be passed to it as an
 // argument — but they must land in the *same* statement. Storing them
@@ -21,13 +22,13 @@ import { parseX402Pricing, type X402Pricing } from './pricing.js';
 // how many run concurrently.
 interface PublishingContext {
   taskId: string;
-  pricing: X402Pricing;
+  offer: MerchantOffer;
   sql: SqlExecutor;
   /** A new offering may replace an expired row and must release its old claim. */
   resetClaim: boolean;
 }
 
-const publishingPricing = new AsyncLocalStorage<PublishingContext>();
+const publishingOffer = new AsyncLocalStorage<PublishingContext>();
 
 // Postgres-backed x402 offering store.
 //
@@ -93,7 +94,17 @@ function reviveEntry(raw: unknown): X402StoreEntry {
   };
 }
 
-export class PostgresX402Store extends BaseX402Store {
+// The frozen offer is stored verbatim as JSONB. Reads are lenient on purpose,
+// mirroring `parseX402Pricing`: an offer written by a newer build must still
+// settle here, so only the one property everything downstream relies on is
+// checked. It carries no Dates, so no revival is needed.
+function reviveOffer(raw: unknown): MerchantOffer | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const offer = raw as MerchantOffer;
+  return Array.isArray(offer.accepts) && offer.accepts.length > 0 ? offer : undefined;
+}
+
+export class PostgresX402Store extends BaseX402Store implements MerchantOfferStore {
   constructor(
     private readonly sql: Sql,
     /**
@@ -111,7 +122,7 @@ export class PostgresX402Store extends BaseX402Store {
   }
 
   /**
-   * Serialize publishers for one task and run `fn` with its frozen terms.
+   * Serialize publishers for one task and run `publish` with its frozen terms.
    *
    * A live offering is immutable: an unpaid retry (including one racing a
    * signed continuation) reuses its snapshot rather than replacing the rates
@@ -121,8 +132,8 @@ export class PostgresX402Store extends BaseX402Store {
    */
   async publishing<T>(
     taskId: string,
-    pricing: X402Pricing,
-    fn: (frozenPricing: X402Pricing) => Promise<T>,
+    offer: MerchantOffer,
+    publish: (frozenOffer: MerchantOffer) => Promise<T>,
   ): Promise<T> {
     // postgres.js maps array-shaped transaction callback results specially;
     // assign outside the callback so this method preserves an arbitrary T.
@@ -137,8 +148,8 @@ export class PostgresX402Store extends BaseX402Store {
         )
       `;
 
-      const rows = await tx<{ pricing: unknown }[]>`
-        SELECT pricing
+      const rows = await tx<{ offer: unknown }[]>`
+        SELECT offer
         FROM x402_offerings
         WHERE agent_id = ${this.agentId}
           AND task_id = ${taskId}
@@ -147,19 +158,19 @@ export class PostgresX402Store extends BaseX402Store {
         FOR UPDATE
       `;
       const existing = rows[0];
-      const frozenPricing = existing ? parseX402Pricing(existing.pricing) : pricing;
-      if (frozenPricing === undefined) {
-        throw new Error(`live x402 offering ${taskId} has no pricing snapshot`);
+      const frozenOffer = existing ? reviveOffer(existing.offer) : offer;
+      if (frozenOffer === undefined) {
+        throw new Error(`live x402 offering ${taskId} has no frozen offer`);
       }
 
-      published = await publishingPricing.run(
+      published = await publishingOffer.run(
         {
           taskId,
-          pricing: frozenPricing,
+          offer: frozenOffer,
           sql: tx,
           resetClaim: existing === undefined,
         },
-        () => fn(frozenPricing),
+        () => publish(frozenOffer),
       );
     });
     return published;
@@ -172,8 +183,8 @@ export class PostgresX402Store extends BaseX402Store {
     // and must leave the frozen snapshot alone. The taskId is checked rather
     // than assumed: the context belongs to one offering, and applying its
     // terms to a different task would be the very mix-up this exists to stop.
-    const ctx = publishingPricing.getStore();
-    const pricing = ctx?.taskId === entry.taskId ? ctx.pricing : undefined;
+    const ctx = publishingOffer.getStore();
+    const offer = ctx?.taskId === entry.taskId ? ctx.offer : undefined;
     const executor = ctx?.taskId === entry.taskId ? ctx.sql : this.sql;
     const resetClaim = ctx?.taskId === entry.taskId && ctx.resetClaim === true;
 
@@ -186,18 +197,18 @@ export class PostgresX402Store extends BaseX402Store {
     // work, so resetting the claim mid-task would let a resubmission be
     // charged a second time.
     await executor`
-      INSERT INTO x402_offerings (task_id, agent_id, entry, pricing, expires_at, updated_at)
+      INSERT INTO x402_offerings (task_id, agent_id, entry, offer, expires_at, updated_at)
       VALUES (
         ${entry.taskId},
         ${this.agentId},
         ${this.sql.json(JSON.parse(JSON.stringify(entry)))},
-        ${pricing === undefined ? null : this.sql.json(JSON.parse(JSON.stringify(pricing)))},
+        ${offer === undefined ? null : this.sql.json(JSON.parse(JSON.stringify(offer)))},
         ${expiresAt},
         now()
       )
       ON CONFLICT (agent_id, task_id) DO UPDATE
         SET entry = EXCLUDED.entry,
-            pricing = COALESCE(EXCLUDED.pricing, x402_offerings.pricing),
+            offer = COALESCE(EXCLUDED.offer, x402_offerings.offer),
             claimed_at = CASE
               WHEN ${resetClaim} THEN NULL
               ELSE x402_offerings.claimed_at
@@ -231,6 +242,7 @@ export class PostgresX402Store extends BaseX402Store {
     await this.put({ ...current, ...patch, updatedAt: new Date() });
   }
 
+  /** One row backs both halves, so this serves the store and the offer store. */
   async delete(taskId: string): Promise<void> {
     await this.sql`
       DELETE FROM x402_offerings
@@ -239,17 +251,17 @@ export class PostgresX402Store extends BaseX402Store {
   }
 
   /** The terms the offering was published under, written alongside it. */
-  async getPricing(taskId: string): Promise<X402Pricing | undefined> {
-    const rows = await this.sql<{ pricing: unknown }[]>`
-      SELECT pricing
+  async getOffer(taskId: string): Promise<MerchantOffer | undefined> {
+    const rows = await this.sql<{ offer: unknown }[]>`
+      SELECT offer
       FROM x402_offerings
-      WHERE agent_id = ${this.agentId} AND task_id = ${taskId}
+      WHERE agent_id = ${this.agentId}
+        AND task_id = ${taskId}
+        AND (expires_at IS NULL OR expires_at > now())
     `;
-    const raw = rows[0]?.pricing;
+    const raw = rows[0]?.offer;
     if (raw === undefined || raw === null) return undefined;
-    // Read-side parsing is lenient about unknown keys on purpose (see
-    // pricing.ts) — a snapshot written by a newer build must still price here.
-    return parseX402Pricing(raw);
+    return reviveOffer(raw);
   }
 
   /**
@@ -260,10 +272,12 @@ export class PostgresX402Store extends BaseX402Store {
    * replayed submission classifies valid twice and the backend runs the work
    * twice against a single authorization.
    *
-   * Deliberately never released. A failed verify leaves the offering claimed
-   * and the payer starts a new task; re-opening the window on failure would
-   * restore the double-spend it exists to prevent, and nothing has been
-   * charged at that point.
+   * Deliberately not released on a failed verify: the offering stays claimed
+   * and the payer starts a new task, because re-opening the window on failure
+   * would restore the double-spend this exists to prevent — and nothing has
+   * been charged at that point. `release` below is the contract's one
+   * sanctioned exception, and the SDK only invokes it on paths this bridge
+   * does not offer.
    */
   async claim(taskId: string): Promise<boolean> {
     const rows = await this.sql`
@@ -276,6 +290,26 @@ export class PostgresX402Store extends BaseX402Store {
       RETURNING task_id
     `;
     return rows.length > 0;
+  }
+
+  /**
+   * Hand the one-shot right back so a later submission can claim it again.
+   *
+   * The SDK calls this only when a *retryable* scheme cancels verified work —
+   * batch-settlement rolling back the payment side, where keeping the claim
+   * would strand the payer with a cancelled payment and no way to retry. The
+   * bridge never publishes batch-settlement pricing, so today this is
+   * dormant; it exists because the `MerchantOfferStore` contract requires it
+   * and it must already be correct when the gate grows a caller. Unclaiming
+   * is unconditional within the agent scope: the row's expiry is irrelevant
+   * to giving the right back, and `claim` re-checks liveness anyway.
+   */
+  async release(taskId: string): Promise<void> {
+    await this.sql`
+      UPDATE x402_offerings
+      SET claimed_at = NULL, updated_at = now()
+      WHERE agent_id = ${this.agentId} AND task_id = ${taskId}
+    `;
   }
 }
 

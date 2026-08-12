@@ -1,6 +1,8 @@
+import type { MerchantMeterableUsage } from '@a2x/sdk/x402';
 import { OPENAI_COMPAT_EXTENSION_URI, type TaskUsage as WireTaskUsage } from '@vicoop-bridge/protocol';
 
-// Token counts for one completed task, in the shape the pricing math wants.
+// Token counts for one completed task, in the shape the SDK's `MerchantGate`
+// meters.
 //
 // The canonical source is the protocol's own `TaskCompleteFrame.usage`, which
 // the bridge owns end to end. The openai-compat metadata key is read only as a
@@ -9,19 +11,27 @@ import { OPENAI_COMPAT_EXTENSION_URI, type TaskUsage as WireTaskUsage } from '@v
 // otherwise become unpriceable — which bills the floor, silently, rather than
 // failing. `source` says which one answered so the fallback is visible in the
 // logs and can be retired once no old clients remain.
-export interface TaskUsage {
-  prompt_tokens: number;
-  completion_tokens: number;
-  total_tokens: number;
-  cached_tokens?: number;
-  model?: string;
-}
+//
+// A reported zero maps to detailed zero counts, which the SDK settles as a
+// genuine `'0'` charge (basis `zero`) — agreed in a2x#206. Only a task with
+// *no* usable report at all maps to `{ kind: 'unreported' }`, which under the
+// bridge's `unreportedUsage: 'floor'` policy bills `minAmount`.
 
 export type TaskUsageSource = 'protocol' | 'openai-compat';
 
 export interface ReadTaskUsageResult {
-  usage: TaskUsage | undefined;
+  usage: MerchantMeterableUsage;
   source?: TaskUsageSource;
+  /** The model the backend reported. Telemetry only — never priced on. */
+  model?: string;
+}
+
+/** One source's counts, validated but not yet in the SDK's shape. */
+interface ReportedCounts {
+  prompt: number;
+  completion: number;
+  cached?: number;
+  model?: string;
 }
 
 function count(v: unknown): number | undefined {
@@ -30,26 +40,23 @@ function count(v: unknown): number | undefined {
     : undefined;
 }
 
-// Recompute the total rather than trust a reported one, and drop a cache
-// figure larger than the prompt it claims to be a breakdown of — an incoherent
-// value would otherwise discount tokens that were never cached.
+// Drop a cache figure larger than the prompt it claims to be a breakdown of —
+// an incoherent value would otherwise discount tokens that were never cached.
+// (The SDK would refuse to price it at all, which downgrades a merely broken
+// cache count to the floor; charging the full input rate is the closer read.)
 function build(
   prompt: number,
   completion: number,
   cached: number | undefined,
   model: string | undefined,
-): TaskUsage {
-  const usage: TaskUsage = {
-    prompt_tokens: prompt,
-    completion_tokens: completion,
-    total_tokens: prompt + completion,
-  };
-  if (cached !== undefined && cached <= prompt) usage.cached_tokens = cached;
-  if (model !== undefined && model.length > 0) usage.model = model;
-  return usage;
+): ReportedCounts {
+  const counts: ReportedCounts = { prompt, completion };
+  if (cached !== undefined && cached <= prompt) counts.cached = cached;
+  if (model !== undefined && model.length > 0) counts.model = model;
+  return counts;
 }
 
-function fromProtocol(usage: WireTaskUsage | undefined): TaskUsage | undefined {
+function fromProtocol(usage: WireTaskUsage | undefined): ReportedCounts | undefined {
   if (usage === undefined) return undefined;
   const prompt = count(usage.promptTokens);
   const completion = count(usage.completionTokens);
@@ -57,7 +64,7 @@ function fromProtocol(usage: WireTaskUsage | undefined): TaskUsage | undefined {
   return build(prompt, completion, count(usage.cachedInputTokens), usage.model);
 }
 
-function fromOpenAICompatPayload(raw: unknown): TaskUsage | undefined {
+function fromOpenAICompatPayload(raw: unknown): ReportedCounts | undefined {
   if (typeof raw !== 'object' || raw === null) return undefined;
   const u = raw as Record<string, unknown>;
   const prompt = count(u.prompt_tokens);
@@ -79,7 +86,7 @@ function fromOpenAICompatPayload(raw: unknown): TaskUsage | undefined {
  *   { usage: {...} }                        plain A2A callers
  *   { chat_completion: { usage: {...} } }   openai-compat envelope
  */
-function fromOpenAICompat(metadata: Record<string, unknown> | undefined): TaskUsage | undefined {
+function fromOpenAICompat(metadata: Record<string, unknown> | undefined): ReportedCounts | undefined {
   const ext = metadata?.[OPENAI_COMPAT_EXTENSION_URI];
   if (typeof ext !== 'object' || ext === null) return undefined;
   const payload = ext as Record<string, unknown>;
@@ -94,21 +101,44 @@ function fromOpenAICompat(metadata: Record<string, unknown> | undefined): TaskUs
   return undefined;
 }
 
+function toMeterable(counts: ReportedCounts): MerchantMeterableUsage {
+  return {
+    kind: 'detailed',
+    inputTokens: counts.prompt,
+    outputTokens: counts.completion,
+    ...(counts.cached !== undefined ? { cachedInputTokens: counts.cached } : {}),
+  };
+}
+
 /**
  * Resolve the task's token usage, preferring the protocol field.
  *
- * A `usage` of `undefined` means the runtime reported nothing, which callers
- * must treat as "unpriceable" rather than "zero" — see `meterUsage`.
+ * `{ kind: 'unreported' }` means the runtime reported nothing, which the SDK
+ * treats as "unpriceable" — under the bridge's `floor` policy that bills
+ * `minAmount`, never the ceiling. A reported `{0,0}` is NOT unreported: it is
+ * a trusted zero and settles `'0'` (a2x#206).
  */
 export function readTaskUsage(
   reported: WireTaskUsage | undefined,
   metadata: Record<string, unknown> | undefined,
 ): ReadTaskUsageResult {
-  const protocolUsage = fromProtocol(reported);
-  if (protocolUsage) return { usage: protocolUsage, source: 'protocol' };
+  const protocolCounts = fromProtocol(reported);
+  if (protocolCounts) {
+    return {
+      usage: toMeterable(protocolCounts),
+      source: 'protocol',
+      ...(protocolCounts.model !== undefined ? { model: protocolCounts.model } : {}),
+    };
+  }
 
   const legacy = fromOpenAICompat(metadata);
-  if (legacy) return { usage: legacy, source: 'openai-compat' };
+  if (legacy) {
+    return {
+      usage: toMeterable(legacy),
+      source: 'openai-compat',
+      ...(legacy.model !== undefined ? { model: legacy.model } : {}),
+    };
+  }
 
-  return { usage: undefined };
+  return { usage: { kind: 'unreported' } };
 }

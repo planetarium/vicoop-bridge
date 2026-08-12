@@ -13,7 +13,6 @@ import {
   type TaskStatusUpdateEvent,
   type TaskStore,
 } from '@a2x/sdk';
-import type { X402ValidClassification } from '@a2x/sdk/x402';
 import type { Registry, TaskBinding, TaskSink } from './registry.js';
 import { AsyncEventQueue } from './event-queue.js';
 import { logEvent } from './log.js';
@@ -170,10 +169,10 @@ export class WSForwardingExecutor extends AgentExecutor {
     }
     const key = JSON.stringify(pricing);
     if (this.gateCache?.key !== key) {
-      const { context, sidecar } = createPostgresX402Context(this.x402.sql, this.agentId);
+      const { context, offerStore } = createPostgresX402Context(this.x402.sql, this.agentId);
       this.gateCache = {
         key,
-        gate: new X402Gate(this.agentId, pricing, context, sidecar),
+        gate: new X402Gate(this.agentId, pricing, context, offerStore, this.x402.resource),
       };
     }
     return this.gateCache.gate;
@@ -253,9 +252,9 @@ export class WSForwardingExecutor extends AgentExecutor {
     const result = await gate.settle({
       taskId,
       contextId,
-      classified: settlement.classified,
-      pricing: settlement.pricing,
+      obligation: settlement.obligation,
       usage: read.usage,
+      ...(read.model !== undefined ? { model: read.model } : {}),
     });
     if (result.kind === 'failed') {
       // The caller already has the output — see the note above. This is the
@@ -310,12 +309,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     const gate = this.currentGate();
     let settlement: X402Settlement | undefined;
     if (gate) {
-      const outcome = await gate.open({
-        taskId,
-        contextId,
-        message,
-        resource: this.x402!.resource,
-      });
+      const outcome = await gate.open({ taskId, contextId, message });
       if (outcome.kind === 'halt') {
         task.status = outcome.event.status;
         task.history = appendHistoryMessage(

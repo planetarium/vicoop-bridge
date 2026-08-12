@@ -1,6 +1,5 @@
 import { z } from 'zod';
-import type { X402Accept } from '@a2x/sdk/x402';
-import type { TaskUsage } from './usage.js';
+import type { MerchantOffer } from '@a2x/sdk/x402';
 
 // Per-agent x402 pricing, persisted on `agents.x402_pricing` and carried on
 // the live `ClientConnection`. Deliberately DB-owned rather than declared in
@@ -13,6 +12,9 @@ import type { TaskUsage } from './usage.js';
 //   exact — a fixed charge per call, agreed before the work happens.
 //   upto  — the payer authorizes up to a ceiling and the bridge settles the
 //           metered token consumption. x402 V2 only.
+//
+// The metering itself lives in the SDK's `MerchantGate` — this module only
+// owns the stored row shape and its mapping onto the SDK's `MerchantOffer`.
 
 // An EVM address. Stored as given (checksummed or not) — the x402 payload
 // checks compare case-insensitively.
@@ -69,8 +71,9 @@ const UptoPricingSchema = z.object({
   // the SDK, so it doubles as the blast radius of a metering bug.
   maxAmount: PositiveAtomicAmount,
   rates: RatesSchema,
-  // Floor for a completed call. Also what is charged when the backend
-  // reported no usage at all — see `meterUsage`. Absent means zero.
+  // Floor for a completed call that metered below it. Also what is charged
+  // when the backend reported no usage at all — the bridge maps this row with
+  // `unreportedUsage: 'floor'`, see `pricingToOffer`. Absent means zero.
   minAmount: AtomicAmount.optional(),
   // The payer's Permit2 witness binds to this address, so it must match the
   // facilitator that will settle. Read it from the facilitator's
@@ -156,12 +159,17 @@ export function formatPricingError(err: unknown): string {
 }
 
 /**
- * Build the offering advertised to the payer. `resource` must be the public
- * URL of what is being paid for — strict facilitators reject non-URL values,
- * and wallets show it in the consent prompt, so it is the agent's own
- * endpoint rather than an opaque id.
+ * Map a stored pricing row onto the offer the SDK's `MerchantGate` publishes.
+ *
+ * `resource` must be the public URL of what is being paid for — strict
+ * facilitators reject non-URL values, and wallets show it in the consent
+ * prompt, so it is the agent's own endpoint rather than an opaque id.
+ *
+ * The wire shape is unchanged from the pre-MerchantGate builds: the SDK
+ * flattens an `upto` entry back to `{ scheme: 'upto', amount: maxAmount }`
+ * when it advertises, and the rate table only ever drives settlement.
  */
-export function pricingToAccepts(pricing: X402Pricing, resource: string): X402Accept[] {
+export function pricingToOffer(pricing: X402Pricing, resource: string): MerchantOffer {
   const common = {
     network: pricing.network,
     asset: pricing.asset,
@@ -170,80 +178,41 @@ export function pricingToAccepts(pricing: X402Pricing, resource: string): X402Ac
   };
 
   if (pricing.scheme === 'upto') {
-    return [
+    return {
+      accepts: [
+        {
+          ...common,
+          scheme: 'upto',
+          maxAmount: pricing.maxAmount,
+          ...(pricing.minAmount !== undefined ? { minAmount: pricing.minAmount } : {}),
+          rates: {
+            inputPerMillion: pricing.rates.input,
+            outputPerMillion: pricing.rates.output,
+            ...(pricing.rates.cachedInput !== undefined
+              ? { cachedInputPerMillion: pricing.rates.cachedInput }
+              : {}),
+          },
+          // Bridge policy: a backend that reported no usage bills the floor,
+          // never the authorized ceiling — a gap in *our* instrumentation must
+          // not charge the payer the maximum. A trusted reported zero is
+          // different and settles zero (a2x#206); see `readTaskUsage`.
+          unreportedUsage: 'floor',
+          description: pricing.description ?? 'Metered agent invocation — billed per token',
+          extra: { ...(pricing.extra ?? {}), facilitatorAddress: pricing.facilitatorAddress },
+        },
+      ],
+    };
+  }
+
+  return {
+    accepts: [
       {
         ...common,
-        scheme: 'upto',
-        // What the payer authorizes, not what they will be charged.
-        amount: pricing.maxAmount,
-        description: pricing.description ?? 'Metered agent invocation — billed per token',
-        extra: { ...(pricing.extra ?? {}), facilitatorAddress: pricing.facilitatorAddress },
+        scheme: 'exact',
+        amount: pricing.amount,
+        description: pricing.description ?? 'Agent invocation',
+        ...(pricing.extra !== undefined ? { extra: pricing.extra } : {}),
       },
-    ];
-  }
-
-  return [
-    {
-      ...common,
-      scheme: 'exact',
-      amount: pricing.amount,
-      description: pricing.description ?? 'Agent invocation',
-      ...(pricing.extra !== undefined ? { extra: pricing.extra } : {}),
-    },
-  ];
-}
-
-/** What `meterUsage` decided to charge, and why — the `why` is logged. */
-export interface MeteredCharge {
-  amountAtomic: string;
-  /**
-   * - `metered`  — priced from reported token counts.
-   * - `floor`    — the metered value was below `minAmount`.
-   * - `no-usage` — the backend reported nothing; `minAmount` (or zero) applied.
-   */
-  basis: 'metered' | 'floor' | 'no-usage';
-}
-
-/**
- * Price a completed call from its reported token usage.
- *
- * Arithmetic is BigInt throughout: rates are per million tokens, so the
- * intermediate product overflows a double's exact range long before the
- * amounts do. The division rounds **up** — standard for billing, and it keeps
- * a genuinely tiny call from pricing to zero, which would be
- * indistinguishable from "the runtime told us nothing".
- *
- * That distinction is the reason `basis` exists. `total_tokens: 0` does not
- * mean the call was free: codex and vicoop-codex emit `{0,0,0}` as an honest
- * "the runtime did not report" placeholder, and openclaw reports no usage at
- * all. Charging zero for delivered work is a real loss, so an operator who
- * cares sets `minAmount` and gets that floor instead. Charging the authorized
- * ceiling in this case would be worse: it bills the payer the maximum for a
- * gap in *our* instrumentation.
- */
-export function meterUsage(pricing: X402UptoPricing, usage: TaskUsage | undefined): MeteredCharge {
-  const floor = BigInt(pricing.minAmount ?? '0');
-
-  if (usage === undefined || usage.total_tokens === 0) {
-    return { amountAtomic: floor.toString(), basis: 'no-usage' };
-  }
-
-  const cached = BigInt(usage.cached_tokens ?? 0);
-  // `cached_tokens` is a breakdown of `prompt_tokens`, never additive, so the
-  // full-price share is what remains after taking the cached part out.
-  const freshInput = BigInt(usage.prompt_tokens) - cached;
-  const cachedRate = BigInt(pricing.rates.cachedInput ?? pricing.rates.input);
-
-  const micros =
-    (freshInput > 0n ? freshInput : 0n) * BigInt(pricing.rates.input) +
-    cached * cachedRate +
-    // `reasoning_tokens` is likewise a breakdown of `completion_tokens`, so
-    // completion alone already covers it.
-    BigInt(usage.completion_tokens) * BigInt(pricing.rates.output);
-
-  const PER = 1_000_000n;
-  const metered = micros === 0n ? 0n : (micros + PER - 1n) / PER;
-
-  if (metered < floor) return { amountAtomic: floor.toString(), basis: 'floor' };
-  return { amountAtomic: metered.toString(), basis: 'metered' };
+    ],
+  };
 }

@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { merchantPricingToAccept } from '@a2x/sdk/x402';
 import {
   X402PricingSchema,
   X402PricingWriteSchema,
   formatPricingError,
-  meterUsage,
   parseX402Pricing,
-  pricingToAccepts,
+  pricingToOffer,
   type X402UptoPricing,
 } from './pricing.js';
 
@@ -16,6 +16,8 @@ const VALID = {
   asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
   payTo: '0x1111111111111111111111111111111111111111',
 };
+
+const RESOURCE = 'https://bridge.test/agents/a1';
 
 test('parseX402Pricing treats NULL and undefined as "free agent"', () => {
   assert.equal(parseX402Pricing(null), undefined);
@@ -64,28 +66,30 @@ test('parseX402Pricing keeps a large atomic amount exact', () => {
   assert.equal(parsed?.scheme === 'exact' ? parsed.amount : undefined, big);
 });
 
-test('pricingToAccepts builds a single exact offering bound to the resource URL', () => {
-  const accepts = pricingToAccepts(parseX402Pricing(VALID)!, 'https://bridge.test/agents/a1');
-  assert.equal(accepts.length, 1);
-  assert.deepEqual(accepts[0], {
+// ── row → MerchantOffer mapping ───────────────────────────────────────────
+
+test('pricingToOffer builds a single exact offering bound to the resource URL', () => {
+  const offer = pricingToOffer(parseX402Pricing(VALID)!, RESOURCE);
+  assert.equal(offer.accepts.length, 1);
+  assert.deepEqual(offer.accepts[0], {
     scheme: 'exact',
     network: 'eip155:84532',
     amount: '10000',
     asset: VALID.asset,
     payTo: VALID.payTo,
-    resource: 'https://bridge.test/agents/a1',
+    resource: RESOURCE,
     description: 'Agent invocation',
   });
 });
 
-test('pricingToAccepts forwards a custom description and EIP-712 extra', () => {
+test('pricingToOffer forwards a custom description and EIP-712 extra', () => {
   const extra = { name: 'USD Coin', version: '2' };
-  const accepts = pricingToAccepts(
+  const offer = pricingToOffer(
     parseX402Pricing({ ...VALID, description: 'Premium research', extra })!,
-    'https://bridge.test/agents/a1',
+    RESOURCE,
   );
-  assert.equal(accepts[0]!.description, 'Premium research');
-  assert.deepEqual(accepts[0]!.extra, extra);
+  assert.equal(offer.accepts[0]!.description, 'Premium research');
+  assert.deepEqual(offer.accepts[0]!.extra, extra);
 });
 
 // ── upto (metered) pricing ────────────────────────────────────────────────
@@ -125,85 +129,57 @@ test('parseX402Pricing requires atomic-unit rates for upto', () => {
   assert.throws(() => parseX402Pricing({ ...UPTO, rates: { input: 3000000, output: '15' } }));
 });
 
-test('pricingToAccepts offers the ceiling and the facilitator address for upto', () => {
-  const accepts = pricingToAccepts(upto(), 'https://bridge.test/agents/a1');
-  assert.equal(accepts.length, 1);
-  assert.equal(accepts[0]!.scheme, 'upto');
-  // `amount` on the wire is what the payer authorizes, not what is charged.
-  assert.equal(accepts[0]!.amount, '1000000');
-  assert.deepEqual(accepts[0]!.extra, { facilitatorAddress: UPTO.facilitatorAddress });
-});
-
-test('meterUsage prices input and output at their separate rates', () => {
-  // 100k in @ $3/MTok = 300000 atomic; 10k out @ $15/MTok = 150000 atomic.
-  const charge = meterUsage(upto(), {
-    prompt_tokens: 100_000,
-    completion_tokens: 10_000,
-    total_tokens: 110_000,
+test('pricingToOffer maps an upto row onto the SDK rate model with the floor policy', () => {
+  // The row stores rates as {input, output, cachedInput}; the SDK names them
+  // per-million explicitly. `unreportedUsage` is the bridge's standing risk
+  // allocation: an instrumentation gap bills the floor, never the cap.
+  const offer = pricingToOffer(
+    upto({ minAmount: '25000', rates: { ...UPTO.rates, cachedInput: '300000' } }),
+    RESOURCE,
+  );
+  assert.equal(offer.accepts.length, 1);
+  const pricing = offer.accepts[0]!;
+  assert.equal(pricing.scheme, 'upto');
+  if (pricing.scheme !== 'upto') return;
+  assert.equal(pricing.maxAmount, '1000000');
+  assert.equal(pricing.minAmount, '25000');
+  assert.deepEqual(pricing.rates, {
+    inputPerMillion: '3000000',
+    outputPerMillion: '15000000',
+    cachedInputPerMillion: '300000',
   });
-  assert.equal(charge.basis, 'metered');
-  assert.equal(charge.amountAtomic, '450000');
+  assert.equal(pricing.unreportedUsage, 'floor');
+  assert.deepEqual(pricing.extra, { facilitatorAddress: UPTO.facilitatorAddress });
 });
 
-test('meterUsage discounts cached input without double-counting it', () => {
-  // cached_tokens is a breakdown of prompt_tokens, never additive: 100k
-  // prompt of which 90k cached = 10k fresh @ $3 + 90k cached @ $0.30.
-  const charge = meterUsage(upto({ rates: { ...UPTO.rates, cachedInput: '300000' } }), {
-    prompt_tokens: 100_000,
-    completion_tokens: 0,
-    total_tokens: 100_000,
-    cached_tokens: 90_000,
+test('pricingToOffer leaves the optional upto fields absent, not defaulted', () => {
+  // Absent cachedInput means "same as input" — the SDK owns that default, so
+  // the mapping must not materialize one. Absent minAmount likewise.
+  const offer = pricingToOffer(upto(), RESOURCE);
+  const pricing = offer.accepts[0]!;
+  assert.equal(pricing.scheme, 'upto');
+  if (pricing.scheme !== 'upto') return;
+  assert.equal(pricing.minAmount, undefined);
+  assert.deepEqual(pricing.rates, {
+    inputPerMillion: '3000000',
+    outputPerMillion: '15000000',
   });
-  assert.equal(charge.amountAtomic, '57000');
 });
 
-test('meterUsage charges cached input at the full rate when no discount is set', () => {
-  // Absent cachedInput means "same as input", not "free" — treating an
-  // unstated discount as 100% would give away most of a cache-heavy call.
-  const charge = meterUsage(upto(), {
-    prompt_tokens: 100_000,
-    completion_tokens: 0,
-    total_tokens: 100_000,
-    cached_tokens: 90_000,
+test('the upto wire shape is unchanged: ceiling as amount, no rate table', () => {
+  // What the SDK advertises from this mapping must be what the old
+  // `pricingToAccepts` put on the wire — the payer-visible contract.
+  const accept = merchantPricingToAccept(pricingToOffer(upto(), RESOURCE).accepts[0]!);
+  assert.deepEqual(accept, {
+    scheme: 'upto',
+    network: 'eip155:84532',
+    amount: '1000000',
+    asset: UPTO.asset,
+    payTo: UPTO.payTo,
+    resource: RESOURCE,
+    description: 'Metered agent invocation — billed per token',
+    extra: { facilitatorAddress: UPTO.facilitatorAddress },
   });
-  assert.equal(charge.amountAtomic, '300000');
-});
-
-test('meterUsage rounds a sub-unit charge up rather than down to zero', () => {
-  // A fractional result must not floor to 0, which downstream is
-  // indistinguishable from "nothing was reported".
-  const charge = meterUsage(upto({ rates: { input: '1', output: '1' } }), {
-    prompt_tokens: 1,
-    completion_tokens: 0,
-    total_tokens: 1,
-  });
-  assert.equal(charge.amountAtomic, '1');
-  assert.equal(charge.basis, 'metered');
-});
-
-test('meterUsage applies the floor when the metered charge is below it', () => {
-  const charge = meterUsage(upto({ minAmount: '50000' }), {
-    prompt_tokens: 100,
-    completion_tokens: 0,
-    total_tokens: 100,
-  });
-  assert.equal(charge.basis, 'floor');
-  assert.equal(charge.amountAtomic, '50000');
-});
-
-test('meterUsage treats missing or zero usage as unpriceable, not free', () => {
-  // The distinction that matters for revenue: openclaw reports no usage at
-  // all, and codex/vicoop-codex emit {0,0,0} when their runtime dropped
-  // accounting. Neither means the call was free.
-  for (const usage of [undefined, { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }]) {
-    const withoutFloor = meterUsage(upto(), usage);
-    assert.equal(withoutFloor.basis, 'no-usage');
-    assert.equal(withoutFloor.amountAtomic, '0');
-
-    const withFloor = meterUsage(upto({ minAmount: '25000' }), usage);
-    assert.equal(withFloor.basis, 'no-usage');
-    assert.equal(withFloor.amountAtomic, '25000');
-  }
 });
 
 // ── write-time strictness ─────────────────────────────────────────────────
@@ -283,15 +259,4 @@ test('formatPricingError names the offending field on one line', () => {
     assert.match(message, /minamount/);
     assert.equal(message.includes('\n'), false, 'must stay a single line for the CLI');
   }
-});
-
-test('meterUsage stays exact on values that would break a double', () => {
-  // 1e9 tokens * 3e12 rate = 3e21 before division — far past 2^53, which is
-  // why the arithmetic is BigInt end to end.
-  const charge = meterUsage(upto({ rates: { input: '3000000000000', output: '0' } }), {
-    prompt_tokens: 1_000_000_000,
-    completion_tokens: 0,
-    total_tokens: 1_000_000_000,
-  });
-  assert.equal(charge.amountAtomic, '3000000000000000');
 });
