@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import WebSocket from 'ws';
 import type { TaskArtifactUpdateEvent, TaskStatusUpdateEvent } from '@a2x/sdk';
 import {
+  CALLER_CONTEXT_CAPABILITY,
   encodeFrame,
   OPENAI_COMPAT_EXTENSION_URI,
   PROTOCOL_VERSION,
@@ -100,6 +101,7 @@ test('task.fail preserves backend error code and message on status message metad
       version: PROTOCOL_VERSION,
       agentId: 'agent-1',
       token: 'token',
+      protocolCapabilities: [CALLER_CONTEXT_CAPABILITY],
       agentCard: {
         name: 'agent',
         version: '0.0.0',
@@ -107,6 +109,9 @@ test('task.fail preserves backend error code and message on status message metad
       },
     }));
     await waitForAgent(registry, 'agent-1');
+    assert.deepEqual(registry.getAgent('agent-1')?.protocolCapabilities, [
+      CALLER_CONTEXT_CAPABILITY,
+    ]);
 
     const sink = makeSink();
     registry.bindTask({

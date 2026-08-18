@@ -10,6 +10,7 @@ import {
   type TaskStore,
 } from '@a2x/sdk';
 import {
+  CALLER_CONTEXT_CAPABILITY,
   OPENAI_COMPAT_EXTENSION_URI,
   parseDownFrame,
   type AgentCard,
@@ -25,8 +26,8 @@ import {
 // principalId on `message.metadata._principalId`. The executor must (1)
 // thread that into the task binding so accept-path logs in ws.ts include
 // it, and (2) strip the `_`-prefixed keys before the WS frame leaves the
-// bridge so the connected client never sees server-internal caller
-// identity over the wire.
+// bridge. Only a capability-negotiated, transport-owned `caller` field may
+// carry that verified principal to an upgraded client.
 
 function makeAgentCard(): AgentCard {
   return {
@@ -92,6 +93,32 @@ test('stripInternalMetadata preserves a regular metadata object as-is', () => {
     keepMe: 1,
     nested: { x: 2 },
   });
+});
+
+test('stripInternalMetadata removes caller forgeries and raw Mentionable identity carriers', () => {
+  assert.deepEqual(
+    stripInternalMetadata({
+      caller: { authenticated: { principalId: 'forged' } },
+      callerContext: { principalId: 'also-forged' },
+      caller_context: { principalId: 'still-forged' },
+      mentionable: {
+        identity_evidence: { proof: 'raw-legacy' },
+        verifiable_credentials: [{ proof: 'raw-vc' }],
+        routing_hint: 'keep',
+      },
+      anotherNamespace: { value: 1 },
+    }),
+    {
+      mentionable: { routing_hint: 'keep' },
+      anotherNamespace: { value: 1 },
+    },
+  );
+  assert.equal(
+    stripInternalMetadata({
+      mentionable: { identity_evidence: {}, verifiable_credentials: [] },
+    }),
+    undefined,
+  );
 });
 
 test('appendHistoryMessage appends messages once by messageId', () => {
@@ -169,12 +196,68 @@ test('executor records principalId in binding and strips _principalId from outgo
       '_principalId must be stripped before the WS frame leaves the bridge',
     );
     assert.equal((md as Record<string, unknown>).userField, 'keep');
+    assert.equal(frame.caller, undefined, 'old clients receive no caller field fallback');
   }
 
   // Push a terminal status so the generator returns without hanging.
   binding.sink.pushStatus({
     taskId: 't-1',
     contextId: 'ctx-1',
+    final: true,
+    status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
+  });
+  binding.sink.finish();
+  await firstEvent;
+  for await (const _event of gen) void _event;
+});
+
+test('executor sends authenticated principal only to caller-context-capable clients', async () => {
+  const { ws, sent } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'caller-capable',
+    clientId: 'c-capable',
+    ownerPrincipal: 'eth:0x0',
+    protocolCapabilities: [CALLER_CONTEXT_CAPABILITY],
+    agentCard: makeAgentCard(),
+    allowedCallers: ['siwe:0xabc'],
+    ws,
+    connectedAt: 0,
+  });
+  const executor = new WSForwardingExecutor('caller-capable', registry, noopTaskStore());
+  const task = {
+    id: 't-caller',
+    contextId: 'ctx-caller',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-caller',
+    metadata: {
+      _principalId: 'siwe:0xabc',
+      caller: { authenticated: { principalId: 'forged' } },
+      mentionable: {
+        identity_evidence: { proof: 'legacy' },
+        verifiable_credentials: [{ proof: 'vc' }],
+      },
+    },
+  } as unknown as Message;
+
+  const gen = executor.executeStream(task, message);
+  const firstEvent = gen.next();
+  const frame = parseDownFrame(sent[0]!);
+  assert.equal(frame.type, 'task.assign');
+  if (frame.type === 'task.assign') {
+    assert.equal(frame.caller?.presented, undefined, 'PR #466 never creates presented identity');
+    assert.deepEqual(frame.caller, { authenticated: { principalId: 'siwe:0xabc' } });
+    assert.equal(frame.message.metadata, undefined, 'raw/forged identity is fully stripped');
+  }
+
+  const binding = registry.getBinding('t-caller')!;
+  binding.sink.pushStatus({
+    taskId: 't-caller',
+    contextId: 'ctx-caller',
     final: true,
     status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
   });
@@ -332,6 +415,7 @@ test('executor binding has no principalId when message metadata is absent', asyn
     agentId: 'a3',
     clientId: 'c3',
     ownerPrincipal: 'eth:0x0',
+    protocolCapabilities: [CALLER_CONTEXT_CAPABILITY],
     agentCard: makeAgentCard(),
     allowedCallers: [],
     ws,
@@ -361,6 +445,7 @@ test('executor binding has no principalId when message metadata is absent', asyn
   assert.equal(frame.type, 'task.assign');
   if (frame.type === 'task.assign') {
     assert.equal(frame.message.metadata, undefined);
+    assert.equal(frame.caller, undefined, 'public request has no authenticated caller');
   }
 
   binding.sink.pushStatus({

@@ -8,6 +8,7 @@ import {
   type UsageWindow,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { appendCallerContext } from '../caller-context.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { createLogger, type Logger } from '../logger.js';
@@ -1374,7 +1375,10 @@ export function createVicoopCodexBackend(
         );
       }
 
-      const system = envelope ? collectSystemFromMessages(envelope.messages) : undefined;
+      const system = appendCallerContext(
+        envelope ? collectSystemFromMessages(envelope.messages) : undefined,
+        task.caller,
+      );
       const chatHistory =
         envelope && Array.isArray(envelope.messages)
           ? chatHistoryFromMessages(envelope.messages)

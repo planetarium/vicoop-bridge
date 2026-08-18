@@ -8,6 +8,7 @@ import {
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { appendCallerContext, renderCallerContext } from '../caller-context.js';
 import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
@@ -121,6 +122,9 @@ interface SessionEntry {
   threadId: string;
   lastUsedAt: number;
   writeId: number;
+  // developerInstructions persist with a codex thread. Reuse is therefore
+  // safe only while the exact caller block is unchanged.
+  callerKey: string;
 }
 
 const DEFAULT_HEARTBEAT_MS = HEARTBEAT_INTERVAL_MS;
@@ -1119,9 +1123,13 @@ export function createCodexBackend(
         // compete with. Plain-task mode (no openai-compat metadata) keeps
         // the directive because that's the actual a2a-agent surface the
         // mention can land on.
-        const systemPrompt = envelope
-          ? composeNativeDevInstructions(envelopeSystem, envelopeToolChoice)
-          : identityDevInstructions;
+        const callerPrompt = renderCallerContext(task.caller);
+        const systemPrompt = appendCallerContext(
+          envelope
+            ? composeNativeDevInstructions(envelopeSystem, envelopeToolChoice)
+            : identityDevInstructions,
+          task.caller,
+        );
 
         const mappedRaw = await mapPartsToCodexInput(task.message.parts, {
           mkdtemp,
@@ -1221,7 +1229,9 @@ export function createCodexBackend(
           const sessionReuseEligible = envelope === null && sessionTtlMs > 0;
           const tNow = now();
           if (sessionReuseEligible) evictExpired(tNow - sessionTtlMs);
-          const existing = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
+          const callerKey = callerPrompt ?? '';
+          const stored = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
+          const existing = stored?.callerKey === callerKey ? stored : undefined;
           let writeId = 0;
           if (sessionReuseEligible) {
             writeId = ++writeCounter;
@@ -1230,6 +1240,7 @@ export function createCodexBackend(
                 threadId: existing.threadId,
                 lastUsedAt: tNow,
                 writeId,
+                callerKey,
               });
             }
           }
@@ -1244,6 +1255,7 @@ export function createCodexBackend(
                 threadId: existing.threadId,
                 lastUsedAt: existing.lastUsedAt,
                 writeId: ++writeCounter,
+                callerKey,
               });
             }
           };
@@ -1406,6 +1418,7 @@ export function createCodexBackend(
                   threadId,
                   lastUsedAt: now(),
                   writeId,
+                  callerKey,
                 });
               }
             }
@@ -1864,6 +1877,7 @@ export function createCodexBackend(
                 threadId: existing.threadId,
                 lastUsedAt: now(),
                 writeId,
+                callerKey,
               });
             }
           }

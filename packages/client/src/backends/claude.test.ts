@@ -1170,6 +1170,34 @@ test('omits --append-system-prompt when no identity is configured', async () => 
   );
 });
 
+test('caller context changes split resumed sessions and render only the current plain turn', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  const prompts: Array<string | undefined> = [];
+  const resumeFlags: boolean[] = [];
+
+  for (const principalId of ['principal-A', 'principal-B', undefined] as const) {
+    const task = assign('hi');
+    task.contextId = 'ctx-caller-switch';
+    if (principalId) task.caller = { authenticated: { principalId } };
+    await backend.handle(task, collect().emit, NEVER);
+    const child = fake.lastChild();
+    const idx = child!.args.indexOf('--append-system-prompt');
+    prompts.push(idx === -1 ? undefined : String(child!.args[idx + 1]));
+    resumeFlags.push(child!.args.includes('--resume'));
+  }
+
+  assert.match(prompts[0] ?? '', /principal-A/);
+  assert.doesNotMatch(prompts[0] ?? '', /principal-B/);
+  assert.match(prompts[1] ?? '', /principal-B/);
+  assert.doesNotMatch(prompts[1] ?? '', /principal-A/);
+  assert.equal(prompts[2], undefined);
+  assert.deepEqual(resumeFlags, [false, false, false]);
+});
+
 test('identity args precede extraArgs so operator extraArgs override', async () => {
   const fake = scriptedSpawn({
     lines: [JSON.stringify({ type: 'result', result: 'ok' })],
@@ -3428,15 +3456,13 @@ test('spawn stages --system-prompt-file with the native directive when metadata 
     onCallerToolsMcpReady: () => {},
   });
   const { emit } = collect();
-  await backend.handle(
-    assignWithOpenAICompat('what is the weather?', {
+  const task = assignWithOpenAICompat('what is the weather?', {
       system: 'You are concise.',
       tools: SAMPLE_TOOLS,
       tool_choice: 'auto',
-    }),
-    emit,
-    NEVER,
-  );
+    });
+  task.caller = { authenticated: { principalId: 'principal-oai' } };
+  await backend.handle(task, emit, NEVER);
 
   const child = fake.lastChild();
   const args = child?.args ?? [];
@@ -3452,6 +3478,8 @@ test('spawn stages --system-prompt-file with the native directive when metadata 
   assert.equal(args.includes('--system-prompt'), false, 'prompt must not ride argv (#437)');
   const prompt = child?.systemPromptFileContent ?? '';
   assert.ok(prompt.includes('You are concise.'), 'staged file carries the caller system text');
+  assert.match(prompt, /bridge-verified caller context/);
+  assert.match(prompt, /principal-oai/);
   // The slim native prompt teaches the model to use the native tool surface
   // and how to read the history block — nothing more.
   assert.match(prompt, /native tool list/);

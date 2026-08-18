@@ -7,6 +7,62 @@ export const SIWE_BEARER_AUTH_EXTENSION_URI =
   'https://github.com/planetarium/a2a-x402-wallet/tree/main/docs/siwe-bearer-auth/v0.1';
 export const OPENAI_COMPAT_EXTENSION_URI =
   'https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1';
+export const CALLER_CONTEXT_CAPABILITY = 'caller-context-v1';
+
+// Caller context is transport-owned security context, so these schemas are
+// intentionally strict rather than forward-passthrough. A client that does
+// not understand a future shape must fail closed instead of accidentally
+// rendering an unrecognised field as trusted attribution. Additive evolution
+// therefore requires a new negotiated capability. Bounds keep the complete
+// context small enough to render safely into a single model turn.
+const CallerIdentifier = z.string().min(1).max(512);
+const CallerSummaryField = z.string().min(1).max(256);
+
+export const AuthenticatedCallerV1 = z
+  .object({
+    principalId: CallerIdentifier,
+  })
+  .strict();
+export type AuthenticatedCallerV1 = z.infer<typeof AuthenticatedCallerV1>;
+
+export const PresentedCallerIdentityV1 = z
+  .object({
+    credentialId: CallerIdentifier,
+    issuer: CallerIdentifier,
+    subject: CallerIdentifier,
+    method: CallerSummaryField,
+    assurance: CallerSummaryField.optional(),
+    platform: z
+      .object({
+        provider: CallerSummaryField.optional(),
+        workspaceId: CallerSummaryField.optional(),
+      })
+      .strict()
+      .optional(),
+    observedInvocation: z
+      .object({
+        target: CallerIdentifier.optional(),
+      })
+      .strict()
+      .optional(),
+    profile: z
+      .object({
+        displayName: CallerSummaryField.optional(),
+        username: CallerSummaryField.optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+export type PresentedCallerIdentityV1 = z.infer<typeof PresentedCallerIdentityV1>;
+
+export const CallerContextV1 = z
+  .object({
+    authenticated: AuthenticatedCallerV1.optional(),
+    presented: z.array(PresentedCallerIdentityV1).max(8).optional(),
+  })
+  .strict();
+export type CallerContextV1 = z.infer<typeof CallerContextV1>;
 
 export const TextPart = z.object({
   kind: z.literal('text'),
@@ -205,6 +261,7 @@ export const HelloFrame = z.object({
   backendKind: BackendKind.optional(),
   version: z.literal(PROTOCOL_VERSION),
   token: z.string(),
+  protocolCapabilities: z.array(z.string().min(1).max(128)).max(32).optional(),
 });
 
 export const TaskStatusFrame = z.object({
@@ -394,6 +451,7 @@ export const TaskAssignFrame = z.object({
   contextId: z.string(),
   message: Message,
   requestedExtensions: z.array(z.string()).optional(),
+  caller: CallerContextV1.optional(),
 });
 
 export const TaskCancelFrame = z.object({

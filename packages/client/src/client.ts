@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
 import {
+  CALLER_CONTEXT_CAPABILITY,
   PROTOCOL_VERSION,
   OPENAI_COMPAT_EXTENSION_URI,
   encodeFrame,
@@ -306,6 +307,7 @@ export class Client {
             backendKind: this.opts.backendKind,
             version: PROTOCOL_VERSION,
             token: this.opts.token,
+            protocolCapabilities: [CALLER_CONTEXT_CAPABILITY],
           }),
         );
       };

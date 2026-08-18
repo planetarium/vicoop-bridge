@@ -3153,6 +3153,50 @@ test('absent metadata → chat.send.message is the raw user text (no XML wrapper
   }
 });
 
+test('caller A → caller B → absent uses current-turn payloads and isolated OpenClaw sessions', async () => {
+  const sent: Array<{ message: string; sessionKey: string }> = [];
+  const fake = await createFakeGateway({
+    onRequest: (sock, req) => {
+      if (req.method !== 'chat.send') return;
+      const params = req.params as { message: string; sessionKey: string; idempotencyKey: string };
+      sent.push({ message: params.message, sessionKey: params.sessionKey });
+      const runId = `run-${params.idempotencyKey}`;
+      fake.respond(sock, req.id, { runId, status: 'started' });
+      setImmediate(() => {
+        fake.emitChat(sock, {
+          runId,
+          sessionKey: params.sessionKey,
+          seq: 1,
+          state: 'final',
+          message: { text: 'ok' },
+        });
+      });
+    },
+  });
+  try {
+    const backend = createOpenclawBackend({ url: fake.url });
+    for (const principalId of ['principal-A', 'principal-B', undefined] as const) {
+      const task = makeTask(`caller-${principalId ?? 'absent'}`, `hello-${principalId ?? 'absent'}`);
+      task.contextId = 'ctx-caller-switch';
+      if (principalId) task.caller = { authenticated: { principalId } };
+      await backend.handle(task, () => {}, NEVER);
+    }
+
+    assert.equal(sent.length, 3);
+    assert.match(sent[0]!.message, /principal-A/);
+    assert.doesNotMatch(sent[0]!.message, /principal-B/);
+    assert.match(sent[1]!.message, /principal-B/);
+    assert.doesNotMatch(sent[1]!.message, /principal-A/);
+    assert.equal(sent[2]!.message, 'hello-absent');
+    assert.notEqual(sent[0]!.sessionKey, sent[1]!.sessionKey);
+    assert.notEqual(sent[1]!.sessionKey, sent[2]!.sessionKey);
+    assert.equal(sent[2]!.sessionKey, 'agent:main:ctx-caller-switch');
+    assert.doesNotMatch(sent[0]!.sessionKey, /principal-A/);
+  } finally {
+    await fake.close();
+  }
+});
+
 test('envelope JSON on session.message becomes a data-part artifact tagged with the extension URI', async () => {
   const frames: UpFrame[] = [];
   const envelope = {

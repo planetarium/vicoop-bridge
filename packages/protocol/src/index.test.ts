@@ -2,10 +2,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
+  CALLER_CONTEXT_CAPABILITY,
+  CallerContextV1,
+  HelloFrame,
   OpenAICompatModelAdvertise,
+  TaskAssignFrame,
   buildOpenAICompatExtensionParams,
   TaskStatusFrame,
   encodeFrame,
+  parseDownFrame,
   parseUpFrame,
 } from './index.js';
 
@@ -71,4 +76,67 @@ test('TaskStatusFrame.metadata is optional — frames without it parse and omit 
   const decoded = parseUpFrame(encodeFrame(frame));
   if (decoded.type !== 'task.status') throw new Error('unreachable');
   assert.equal(decoded.metadata, undefined);
+});
+
+test('hello round-trips caller-context capability', () => {
+  const frame = HelloFrame.parse({
+    type: 'hello',
+    agentId: 'agent-1',
+    version: '0.1',
+    token: 'secret',
+    protocolCapabilities: [CALLER_CONTEXT_CAPABILITY],
+  });
+  const decoded = parseUpFrame(encodeFrame(frame));
+  assert.equal(decoded.type, 'hello');
+  if (decoded.type !== 'hello') throw new Error('unreachable');
+  assert.deepEqual(decoded.protocolCapabilities, [CALLER_CONTEXT_CAPABILITY]);
+});
+
+test('task.assign caller context round-trips only when provided', () => {
+  const base = {
+    type: 'task.assign' as const,
+    taskId: 'task-1',
+    contextId: 'context-1',
+    message: { role: 'user' as const, parts: [], messageId: 'message-1' },
+  };
+  const caller = {
+    authenticated: { principalId: 'siwe:0xabc' },
+    presented: [
+      {
+        credentialId: 'urn:uuid:credential-1',
+        issuer: 'did:web:issuer.example',
+        subject: 'acct:alice@example.com',
+        method: 'platform-identity-v0.2',
+        platform: { provider: 'slack', workspaceId: 'T123' },
+      },
+    ],
+  };
+  const decoded = parseDownFrame(encodeFrame(TaskAssignFrame.parse({ ...base, caller })));
+  assert.equal(decoded.type, 'task.assign');
+  if (decoded.type !== 'task.assign') throw new Error('unreachable');
+  assert.deepEqual(decoded.caller, caller);
+
+  const withoutCaller = parseDownFrame(encodeFrame(TaskAssignFrame.parse(base)));
+  assert.equal(withoutCaller.type, 'task.assign');
+  if (withoutCaller.type !== 'task.assign') throw new Error('unreachable');
+  assert.equal(withoutCaller.caller, undefined);
+});
+
+test('caller context fails closed on unknown or oversized fields', () => {
+  assert.throws(() =>
+    CallerContextV1.parse({ authenticated: { principalId: 'siwe:0xabc', email: 'x@y.z' } }),
+  );
+  assert.throws(() =>
+    CallerContextV1.parse({ authenticated: { principalId: 'x'.repeat(513) } }),
+  );
+  assert.throws(() =>
+    CallerContextV1.parse({
+      presented: Array.from({ length: 9 }, (_, i) => ({
+        credentialId: `credential-${i}`,
+        issuer: 'did:web:issuer.example',
+        subject: 'acct:alice@example.com',
+        method: 'test',
+      })),
+    }),
+  );
 });

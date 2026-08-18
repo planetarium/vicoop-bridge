@@ -10,6 +10,7 @@ import {
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { appendCallerContext, renderCallerContext } from '../caller-context.js';
 import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
@@ -263,6 +264,10 @@ export interface ClaudeBackendOptions {
 interface SessionEntry {
   sessionId: string;
   lastUsedAt: number;
+  // Claude persists the initial system prompt in a resumed session. Split
+  // session reuse whenever transport-owned caller attribution changes so a
+  // prior turn cannot leak caller A into caller B or an absent-caller turn.
+  callerKey: string;
   // Monotonic per-write token. A rollback only deletes the entry when
   // this matches the writeId the rolling-back task itself stamped — so a
   // second concurrent task on the same contextId that has since refreshed
@@ -1988,6 +1993,7 @@ export function createClaudeBackend(
       // envelope. Absent or malformed metadata leaves the run on the
       // original non-extension code path with no envelope-detection cost.
       const envelope = parseOpenAICompatEnvelope(task.message.metadata);
+      const callerPrompt = renderCallerContext(task.caller);
       if (openaiCompatTrace) {
         dumpOpenAICompatTaskWire(
           'claude',
@@ -2187,7 +2193,9 @@ export function createClaudeBackend(
       const sessionReuseEligible = envelope === null && sessionTtlMs > 0;
       const tNow = now();
       if (sessionReuseEligible) evictExpired(tNow - sessionTtlMs);
-      const existing = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
+      const callerKey = callerPrompt ?? '';
+      const stored = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
+      const existing = stored?.callerKey === callerKey ? stored : undefined;
       const sessionId = existing?.sessionId ?? randomUUID();
       const isResume = existing !== undefined;
       let writeId = 0;
@@ -2196,7 +2204,7 @@ export function createClaudeBackend(
         // contextId arriving before this one finishes also resumes the same
         // session id (rather than racing to mint a new one).
         writeId = ++writeCounter;
-        sessions.set(task.contextId, { sessionId, lastUsedAt: tNow, writeId });
+        sessions.set(task.contextId, { sessionId, lastUsedAt: tNow, writeId, callerKey });
       }
 
       // Drop the freshly-minted (contextId → sessionId) binding when the
@@ -2411,11 +2419,14 @@ export function createClaudeBackend(
           const promptFile = join(openaiCompatSystemPromptDir, 'system-prompt.txt');
           writeFileSync(
             promptFile,
-            buildOpenAICompatNativeSystemPrompt(
-              envelopeSystem,
-              envelopeTools,
-              envelopeToolChoice,
-            ),
+            appendCallerContext(
+              buildOpenAICompatNativeSystemPrompt(
+                envelopeSystem,
+                envelopeTools,
+                envelopeToolChoice,
+              ),
+              task.caller,
+            ) ?? '',
             { mode: 0o600 },
           );
           openaiCompatArgs = ['--system-prompt-file', promptFile];
@@ -2478,6 +2489,12 @@ export function createClaudeBackend(
       // fresh (no session reuse — see the gate above).
       const modelArgs: readonly string[] = envelopeModel
         ? ['--model', envelopeModel]
+        : [];
+      // Plain A2A runs keep their normal system prompt and receive caller
+      // attribution through a per-spawn append. OpenAI-compat runs already
+      // carry the same block in their per-task staged replacement above.
+      const callerArgs: readonly string[] = !envelope && callerPrompt
+        ? ['--append-system-prompt', callerPrompt]
         : [];
       // Disable claude's built-in tools (Read / Glob / Bash / Edit / Write /
       // ...) on EVERY openai-compat task, tools or not. Two reasons:
@@ -2575,6 +2592,7 @@ export function createClaudeBackend(
         ...mcpConfigArgs,
         ...mcpAllowedToolsArgs,
         ...identityArgs,
+        ...callerArgs,
         ...modelArgs,
         ...openaiCompatArgs,
         ...leanContextArgs,

@@ -20,6 +20,7 @@ import { terminalErrorMessageFields } from './terminal-error.js';
 import { X402Gate, createPostgresX402Context, type X402Settlement } from './x402/gate.js';
 import { readTaskUsage } from './x402/usage.js';
 import type { Sql } from './db.js';
+import { CALLER_CONTEXT_CAPABILITY, CallerContextV1 } from '@vicoop-bridge/protocol';
 
 /**
  * What the executor needs to run the x402 payment gate: a DB handle for the
@@ -111,6 +112,29 @@ export function stripInternalMetadata(
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(metadata)) {
     if (key.startsWith('_')) continue;
+    // These names are transport-owned. Caller-supplied lookalikes must not
+    // cross the WS boundary where a backend might mistake them for verified
+    // context.
+    if (key === 'caller' || key === 'callerContext' || key === 'caller_context') continue;
+    if (
+      key === 'mentionable' &&
+      typeof value === 'object' &&
+      value !== null &&
+      !Array.isArray(value)
+    ) {
+      const mentionable: Record<string, unknown> = {};
+      for (const [mentionableKey, mentionableValue] of Object.entries(value)) {
+        if (
+          mentionableKey === 'identity_evidence' ||
+          mentionableKey === 'verifiable_credentials'
+        ) {
+          continue;
+        }
+        mentionable[mentionableKey] = mentionableValue;
+      }
+      if (Object.keys(mentionable).length > 0) out[key] = mentionable;
+      continue;
+    }
     out[key] = value;
   }
   return Object.keys(out).length > 0 ? out : undefined;
@@ -355,6 +379,25 @@ export class WSForwardingExecutor extends AgentExecutor {
       typeof rawMetadata?._principalId === 'string' ? rawMetadata._principalId : undefined;
     const forwardMetadata = stripInternalMetadata(rawMetadata);
     const requestedExtensions = message.extensions;
+    const clientSupportsCallerContext =
+      this.registry
+        .getAgent(this.agentId)
+        ?.protocolCapabilities?.includes(CALLER_CONTEXT_CAPABILITY) === true;
+    const callerResult =
+      clientSupportsCallerContext && principalId !== undefined
+        ? CallerContextV1.safeParse({ authenticated: { principalId } })
+        : undefined;
+    const caller = callerResult?.success ? callerResult.data : undefined;
+    if (callerResult && !callerResult.success) {
+      // Do not put the raw principal or schema details in logs. An invalid
+      // transport-owned value is omitted instead of emitting a task.assign
+      // frame that the upgraded client would reject wholesale.
+      logEvent('caller_context_omitted', {
+        agentId: this.agentId,
+        taskId,
+        reason: 'invalid_authenticated_principal',
+      });
+    }
 
     const binding: TaskBinding = {
       agentId: this.agentId,
@@ -384,6 +427,7 @@ export class WSForwardingExecutor extends AgentExecutor {
         ...(message.extensions !== undefined ? { extensions: message.extensions } : {}),
       },
       ...(message.extensions !== undefined ? { requestedExtensions: message.extensions } : {}),
+      ...(caller !== undefined ? { caller } : {}),
     });
 
     if (!sent) {

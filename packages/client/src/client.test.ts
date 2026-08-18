@@ -345,6 +345,7 @@ test('Client reconnects after WebSocket close and sends hello again', async () =
       if (frame.type === 'hello') {
         assert.equal(frame.agentId, 'agent-1');
         assert.equal(frame.token, 'client-token');
+        assert.deepEqual(frame.protocolCapabilities, ['caller-context-v1']);
       }
     }
   } finally {
