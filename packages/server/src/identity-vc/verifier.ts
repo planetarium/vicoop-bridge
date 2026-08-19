@@ -1,6 +1,7 @@
+import { DataIntegrityProof } from '@digitalbazaar/data-integrity';
 import { createVerifyCryptosuite } from '@digitalbazaar/eddsa-jcs-2022-cryptosuite';
+import { CredentialIssuancePurpose, verifyCredential } from '@digitalbazaar/vc';
 import { PresentedCallerIdentityV1 } from '@vicoop-bridge/protocol';
-import { base58btc } from 'multiformats/bases/base58';
 import { parseDateTimeStamp, parsePlatformIdentityCredential } from './parser.js';
 import {
   DEFAULT_IDENTITY_VC_LIMITS,
@@ -14,19 +15,6 @@ import {
   type UnverifiedPlatformIdentityCredential,
   type VerifiedPresentedIdentity,
 } from './types.js';
-
-type VerifyCryptosuite = {
-  name: string;
-  canonize(input: unknown): Promise<string>;
-  createVerifyData(input: {
-    cryptosuite: VerifyCryptosuite;
-    document: Record<string, unknown>;
-    proof: Record<string, unknown>;
-  }): Promise<Uint8Array>;
-  createVerifier(input: { verificationMethod: DidVerificationMethod }): Promise<{
-    verify(input: { data: Uint8Array; signature: Uint8Array }): Promise<boolean>;
-  }>;
-};
 
 export interface PlatformIdentityVerifierOptions {
   trustedIssuers: Iterable<string>;
@@ -117,7 +105,9 @@ export class PlatformIdentityVerifier {
   private readonly maxTtlMs: number;
   private readonly clockSkewMs: number;
   private readonly now: () => Date;
-  private readonly cryptosuite = createVerifyCryptosuite() as VerifyCryptosuite;
+  private readonly suite = new DataIntegrityProof({
+    cryptosuite: createVerifyCryptosuite(),
+  });
 
   constructor(private readonly options: PlatformIdentityVerifierOptions) {
     this.trustedIssuers = new Set(options.trustedIssuers);
@@ -185,20 +175,26 @@ export class PlatformIdentityVerifier {
       return reject('issuer_controller_mismatch');
     }
 
-    try {
-      const secured = structuredClone(credential) as unknown as Record<string, unknown>;
-      const proof = structuredClone(credential.proof) as unknown as Record<string, unknown>;
-      delete secured.proof;
-      delete proof.proofValue;
-      const data = await this.cryptosuite.createVerifyData({
-        cryptosuite: this.cryptosuite,
-        document: secured,
-        proof,
-      });
-      const signature = base58btc.decode(credential.proof.proofValue);
-      const verifier = await this.cryptosuite.createVerifier({ verificationMethod: method });
-      if (!(await verifier.verify({ data, signature }))) return reject('invalid_signature');
-    } catch {
+    const documentLoader = async (url: string) => {
+      if (url === method.id) {
+        return { contextUrl: null, documentUrl: url, document: method };
+      }
+      if (url === doc.id) {
+        return { contextUrl: null, documentUrl: url, document: doc };
+      }
+      throw new Error(`Blocked document URL: ${url}`);
+    };
+    const verification = await verifyCredential({
+      credential,
+      suite: this.suite,
+      purpose: new CredentialIssuancePurpose(),
+      documentLoader,
+      now: this.now(),
+      // Receiver-local checks above preserve the bridge's exact inclusive
+      // boundary semantics; the library remains responsible for VC syntax.
+      maxClockSkew: Number.POSITIVE_INFINITY,
+    });
+    if (!verification.verified) {
       return reject('invalid_signature');
     }
 

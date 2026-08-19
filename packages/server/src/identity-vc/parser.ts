@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
+import { z } from 'zod';
 import {
   MENTIONABLE_IDENTITY_CONTEXT_URI,
   VC_V2_CONTEXT_URI,
@@ -14,18 +15,46 @@ const MAX_PROOF_FIELD_LENGTH = 2_048;
 const MAX_CALLER_IDENTIFIER_LENGTH = 512;
 const MAX_CALLER_SUMMARY_LENGTH = 256;
 
-function nonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0;
-}
+const boundedString = (max: number) => z.string().min(1).max(max);
+const identifier = boundedString(MAX_CALLER_IDENTIFIER_LENGTH);
+const absoluteUri = identifier.url();
+const summary = boundedString(MAX_CALLER_SUMMARY_LENGTH);
 
-function validAbsoluteUri(value: unknown): value is string {
-  if (!nonEmptyString(value)) return false;
-  try {
-    return new URL(value).href.length > 0;
-  } catch {
-    return false;
-  }
-}
+const credentialSchema = z.object({
+  '@context': z.array(z.unknown()),
+  id: absoluteUri,
+  type: z.array(z.unknown()),
+  issuer: boundedString(MAX_CALLER_IDENTIFIER_LENGTH),
+  validFrom: boundedString(128),
+  validUntil: boundedString(128),
+  credentialSubject: z.object({
+    id: absoluteUri,
+    method: summary,
+    assurance: summary.optional(),
+    platform: z.object({
+      provider: summary.optional(),
+      workspaceId: summary.optional(),
+    }).passthrough().optional(),
+    observedInvocation: z.object({
+      target: identifier.optional(),
+    }).passthrough().optional(),
+    profile: z.object({
+      displayName: summary.optional(),
+      username: summary.optional(),
+    }).passthrough().optional(),
+  }).passthrough(),
+  proof: z.object({
+    '@context': z.array(z.unknown()),
+    type: z.literal('DataIntegrityProof'),
+    cryptosuite: z.literal('eddsa-jcs-2022'),
+    proofPurpose: z.literal('assertionMethod'),
+    verificationMethod: boundedString(MAX_PROOF_FIELD_LENGTH),
+    proofValue: boundedString(MAX_PROOF_FIELD_LENGTH),
+    domain: boundedString(MAX_PROOF_FIELD_LENGTH),
+    challenge: boundedString(MAX_PROOF_FIELD_LENGTH),
+    created: boundedString(128).optional(),
+  }).passthrough(),
+}).passthrough();
 
 const DATE_TIME_STAMP_RE =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|([+-])(\d{2}):(\d{2}))$/u;
@@ -63,23 +92,6 @@ export function parseDateTimeStamp(value: string): number | undefined {
   return Number.isFinite(timestamp) ? timestamp : undefined;
 }
 
-function validOptionalStringField(record: Record<string, unknown>, key: string): boolean {
-  return record[key] === undefined || nonEmptyString(record[key]);
-}
-
-function exceeds(value: string, maxLength: number): boolean {
-  return value.length > maxLength;
-}
-
-function optionalExceeds(
-  record: Record<string, unknown> | undefined,
-  key: string,
-  maxLength: number,
-): boolean {
-  const value = record?.[key];
-  return typeof value === 'string' && exceeds(value, maxLength);
-}
-
 export type ParseCredentialResult =
   | { ok: true; credential: UnverifiedPlatformIdentityCredential }
   | { ok: false; code: IdentityVcRejectionCode };
@@ -101,91 +113,24 @@ export function parsePlatformIdentityCredential(input: unknown): ParseCredential
     return { ok: false, code: 'unsupported_profile' };
   }
 
-  if (
-    !validAbsoluteUri(input.id) ||
-    !nonEmptyString(input.issuer) ||
-    !nonEmptyString(input.validFrom) ||
-    !nonEmptyString(input.validUntil) ||
-    !isRecord(input.credentialSubject) ||
-    !validAbsoluteUri(input.credentialSubject.id) ||
-    !nonEmptyString(input.credentialSubject.method) ||
-    (input.credentialSubject.assurance !== undefined &&
-      !nonEmptyString(input.credentialSubject.assurance)) ||
-    (input.credentialSubject.platform !== undefined &&
-      !isRecord(input.credentialSubject.platform)) ||
-    (input.credentialSubject.observedInvocation !== undefined &&
-      !isRecord(input.credentialSubject.observedInvocation)) ||
-    (input.credentialSubject.profile !== undefined &&
-      !isRecord(input.credentialSubject.profile)) ||
-    !isRecord(input.proof)
-  ) {
-    return { ok: false, code: 'malformed' };
-  }
-
-  if (
-    exceeds(input.id, MAX_CALLER_IDENTIFIER_LENGTH) ||
-    exceeds(input.issuer, MAX_CALLER_IDENTIFIER_LENGTH) ||
-    exceeds(input.credentialSubject.id, MAX_CALLER_IDENTIFIER_LENGTH) ||
-    exceeds(input.credentialSubject.method, MAX_CALLER_SUMMARY_LENGTH) ||
-    (typeof input.credentialSubject.assurance === 'string' &&
-      exceeds(input.credentialSubject.assurance, MAX_CALLER_SUMMARY_LENGTH)) ||
-    exceeds(input.validFrom, 128) ||
-    exceeds(input.validUntil, 128)
-  ) {
-    return { ok: false, code: 'limit_exceeded' };
-  }
-
-  const platform = input.credentialSubject.platform;
-  const observed = input.credentialSubject.observedInvocation;
-  const profile = input.credentialSubject.profile;
-  if (
-    (isRecord(platform) &&
-      (!validOptionalStringField(platform, 'provider') ||
-        !validOptionalStringField(platform, 'workspaceId'))) ||
-    (isRecord(observed) && !validOptionalStringField(observed, 'target')) ||
-    (isRecord(profile) &&
-      (!validOptionalStringField(profile, 'displayName') ||
-        !validOptionalStringField(profile, 'username')))
-  ) {
-    return { ok: false, code: 'malformed' };
-  }
-
-  if (
-    optionalExceeds(isRecord(platform) ? platform : undefined, 'provider', MAX_CALLER_SUMMARY_LENGTH) ||
-    optionalExceeds(isRecord(platform) ? platform : undefined, 'workspaceId', MAX_CALLER_SUMMARY_LENGTH) ||
-    optionalExceeds(isRecord(observed) ? observed : undefined, 'target', MAX_CALLER_IDENTIFIER_LENGTH) ||
-    optionalExceeds(isRecord(profile) ? profile : undefined, 'displayName', MAX_CALLER_SUMMARY_LENGTH) ||
-    optionalExceeds(isRecord(profile) ? profile : undefined, 'username', MAX_CALLER_SUMMARY_LENGTH)
-  ) {
-    return { ok: false, code: 'limit_exceeded' };
-  }
-
   const proof = input.proof;
+  if (!isRecord(proof)) return { ok: false, code: 'malformed' };
   if (proof.type !== 'DataIntegrityProof' || proof.cryptosuite !== 'eddsa-jcs-2022') {
     return { ok: false, code: 'unsupported_cryptosuite' };
   }
   if (!Array.isArray(proof['@context']) || !isDeepStrictEqual(proof['@context'], context)) {
     return { ok: false, code: 'unsupported_profile' };
   }
-  if (
-    proof.proofPurpose !== 'assertionMethod' ||
-    !nonEmptyString(proof.verificationMethod) ||
-    !nonEmptyString(proof.proofValue) ||
-    !nonEmptyString(proof.domain) ||
-    !nonEmptyString(proof.challenge) ||
-    (proof.created !== undefined && !nonEmptyString(proof.created))
-  ) {
-    return { ok: false, code: 'malformed' };
-  }
-  if (
-    exceeds(proof.verificationMethod, MAX_PROOF_FIELD_LENGTH) ||
-    exceeds(proof.proofValue, MAX_PROOF_FIELD_LENGTH) ||
-    exceeds(proof.domain, MAX_PROOF_FIELD_LENGTH) ||
-    exceeds(proof.challenge, MAX_PROOF_FIELD_LENGTH) ||
-    (typeof proof.created === 'string' && exceeds(proof.created, 128))
-  ) {
-    return { ok: false, code: 'limit_exceeded' };
+  const parsed = credentialSchema.safeParse(input);
+  if (!parsed.success) {
+    const code = parsed.error.issues.some((issue) => issue.code === 'too_big')
+      ? 'limit_exceeded'
+      : 'malformed';
+    return { ok: false, code };
   }
 
-  return { ok: true, credential: input as unknown as UnverifiedPlatformIdentityCredential };
+  return {
+    ok: true,
+    credential: parsed.data as unknown as UnverifiedPlatformIdentityCredential,
+  };
 }

@@ -13,6 +13,12 @@ returns an allowlisted presentation object. `extractAndStripIdentityCarrier`
 is the boundary adapter: its sanitized metadata result is the only metadata
 that may proceed toward task persistence or a backend.
 
+Generic VC 2.0 envelope, proof-purpose, controller authorization, and Data
+Integrity verification are delegated to pinned Digital Bazaar packages. The
+bridge retains only profile and receiver policy checks. Its closed document
+loader exposes only the already safety-resolved DID document and verification
+method; it cannot perform context, DID, or arbitrary URL fetches.
+
 ## Fixtures
 
 #613 has not published its promised conformance fixture bundle yet. Tests use
