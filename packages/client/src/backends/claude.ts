@@ -2695,12 +2695,18 @@ export function createClaudeBackend(
         return;
       }
 
-      // Reclaim the staged system-prompt file once the spawned process is
-      // done with it. `close` covers every post-spawn path (success, failure,
-      // kill, abort); `error` covers a child that never reaches close (e.g.
-      // ENOENT surfacing async). Idempotent, so double-firing is harmless.
-      child.on('close', cleanupStagedSystemPromptFile);
-      child.on('error', cleanupStagedSystemPromptFile);
+      // Most tasks can reclaim the staged prompt as soon as their only child
+      // settles. Native caller-tool dispatch may launch one corrective
+      // `--resume` child, however, and that retry reuses the same prompt-file
+      // argv. Retain the file through that decision; the post-retry cleanup
+      // below remains the single owner for this narrow path.
+      const retainStagedSystemPromptForPossibleRetry =
+        retryNarratedToolCall && nativeDispatchActive;
+      const cleanupAfterInitialChild = (): void => {
+        if (!retainStagedSystemPromptForPossibleRetry) cleanupStagedSystemPromptFile();
+      };
+      child.on('close', cleanupAfterInitialChild);
+      child.on('error', cleanupAfterInitialChild);
 
       // Write the user message envelope and close stdin so claude sees EOF
       // and proceeds. Errors here are recorded; the close listener still
@@ -3440,6 +3446,11 @@ export function createClaudeBackend(
           );
         }
       }
+
+      // Either no retry was needed, or the corrective child has now settled
+      // (including its caught spawn failure). The original file must remain
+      // readable until this point because retryArgs intentionally reuse it.
+      cleanupStagedSystemPromptFile();
 
       signal.removeEventListener('abort', onAbort);
 
