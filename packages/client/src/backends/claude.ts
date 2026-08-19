@@ -2401,24 +2401,39 @@ export function createClaudeBackend(
       // staged in a per-task mkdtemp dir (0700) as a 0600 file — caller
       // system prompts can carry secrets — and reclaimed on process close;
       // deleting any earlier would race claude's startup read of the file.
-      let openaiCompatSystemPromptDir: string | null = null;
-      const cleanupOpenAICompatSystemPromptFile = (): void => {
-        if (openaiCompatSystemPromptDir === null) return;
-        const dir = openaiCompatSystemPromptDir;
-        openaiCompatSystemPromptDir = null;
+      // Caller-dependent system prompts never ride in argv. Besides the OS
+      // per-argument limit, argv is observable through process inspection and
+      // is included in the opt-in spawn debug log below. That would disclose
+      // authenticated subjects and future presented profile fields. Both the
+      // openai-compat replacement and the plain-A2A caller append therefore
+      // share this owner-only, per-task staging lifecycle.
+      let stagedSystemPromptDir: string | null = null;
+      const cleanupStagedSystemPromptFile = (): void => {
+        if (stagedSystemPromptDir === null) return;
+        const dir = stagedSystemPromptDir;
+        stagedSystemPromptDir = null;
         try {
           rmSync(dir, { recursive: true, force: true });
         } catch {
           // Best effort — the OS tmpdir reaper is the backstop.
         }
       };
+      const stageSystemPrompt = (
+        flag: '--system-prompt-file' | '--append-system-prompt-file',
+        filename: string,
+        content: string,
+      ): readonly string[] => {
+        stagedSystemPromptDir = mkdtempSync(join(tmpdir(), 'vicoop-claude-sp-'));
+        const promptFile = join(stagedSystemPromptDir, filename);
+        writeFileSync(promptFile, content, { mode: 0o600 });
+        return [flag, promptFile];
+      };
       let openaiCompatArgs: readonly string[] = [];
       if (envelope) {
         try {
-          openaiCompatSystemPromptDir = mkdtempSync(join(tmpdir(), 'vicoop-claude-sp-'));
-          const promptFile = join(openaiCompatSystemPromptDir, 'system-prompt.txt');
-          writeFileSync(
-            promptFile,
+          openaiCompatArgs = stageSystemPrompt(
+            '--system-prompt-file',
+            'system-prompt.txt',
             appendCallerContext(
               buildOpenAICompatNativeSystemPrompt(
                 envelopeSystem,
@@ -2427,11 +2442,9 @@ export function createClaudeBackend(
               ),
               task.caller,
             ) ?? '',
-            { mode: 0o600 },
           );
-          openaiCompatArgs = ['--system-prompt-file', promptFile];
         } catch (err) {
-          cleanupOpenAICompatSystemPromptFile();
+          cleanupStagedSystemPromptFile();
           rollbackFreshSession();
           await closeCallerToolsMcp();
           emit({
@@ -2493,9 +2506,29 @@ export function createClaudeBackend(
       // Plain A2A runs keep their normal system prompt and receive caller
       // attribution through a per-spawn append. OpenAI-compat runs already
       // carry the same block in their per-task staged replacement above.
-      const callerArgs: readonly string[] = !envelope && callerPrompt
-        ? ['--append-system-prompt', callerPrompt]
-        : [];
+      let callerArgs: readonly string[] = [];
+      if (!envelope && callerPrompt) {
+        try {
+          callerArgs = stageSystemPrompt(
+            '--append-system-prompt-file',
+            'caller-context.txt',
+            callerPrompt,
+          );
+        } catch (err) {
+          cleanupStagedSystemPromptFile();
+          rollbackFreshSession();
+          await closeCallerToolsMcp();
+          emit({
+            type: 'task.fail',
+            taskId: task.taskId,
+            error: normalizeTaskFailError({
+              code: 'spawn_failed',
+              message: `failed to stage caller-context system prompt file: ${errorMessage(err)}`,
+            }),
+          });
+          return;
+        }
+      }
       // Disable claude's built-in tools (Read / Glob / Bash / Edit / Write /
       // ...) on EVERY openai-compat task, tools or not. Two reasons:
       //   - Caller-tools contract: without it claude silently uses its own
@@ -2648,7 +2681,7 @@ export function createClaudeBackend(
         child = spawnFn(command, args, { cwd: effectiveCwd, env: effectiveEnv });
         recorder.mark('spawn');
       } catch (err) {
-        cleanupOpenAICompatSystemPromptFile();
+        cleanupStagedSystemPromptFile();
         rollbackFreshSession();
         await closeCallerToolsMcp();
         timingLogger.debug(
@@ -2666,8 +2699,8 @@ export function createClaudeBackend(
       // done with it. `close` covers every post-spawn path (success, failure,
       // kill, abort); `error` covers a child that never reaches close (e.g.
       // ENOENT surfacing async). Idempotent, so double-firing is harmless.
-      child.on('close', cleanupOpenAICompatSystemPromptFile);
-      child.on('error', cleanupOpenAICompatSystemPromptFile);
+      child.on('close', cleanupStagedSystemPromptFile);
+      child.on('error', cleanupStagedSystemPromptFile);
 
       // Write the user message envelope and close stdin so claude sees EOF
       // and proceeds. Errors here are recorded; the close listener still
@@ -2686,7 +2719,7 @@ export function createClaudeBackend(
         // but this branch exists precisely because the custom spawn is
         // misbehaving — don't trust it to emit close either. Idempotent, so
         // a later close double-fire is harmless.
-        cleanupOpenAICompatSystemPromptFile();
+        cleanupStagedSystemPromptFile();
         // The freshly-minted sessionId never reached claude, so a follow-up
         // task on the same contextId must mint a new id rather than --resume.
         rollbackFreshSession();

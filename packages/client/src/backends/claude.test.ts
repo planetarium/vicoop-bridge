@@ -54,6 +54,11 @@ interface FakeChild extends ClaudeChildHandle {
   readonly systemPromptFilePath: string | null;
   readonly systemPromptFileContent: string | null;
   readonly systemPromptFileMode: number | null;
+  // Same snapshots for the plain-A2A caller-context append file. Caller
+  // attribution must not ride argv or spawn debug logs.
+  readonly appendSystemPromptFilePath: string | null;
+  readonly appendSystemPromptFileContent: string | null;
+  readonly appendSystemPromptFileMode: number | null;
   killed: boolean;
   killSignal: NodeJS.Signals | null;
   stdinPayload: string;
@@ -107,6 +112,9 @@ function makeFakeSpawn(configure: (child: FakeChild) => void): FakeSpawn {
 
       const spIdx = args.indexOf('--system-prompt-file');
       const systemPromptFilePath = spIdx !== -1 ? String(args[spIdx + 1]) : null;
+      const appendSpIdx = args.indexOf('--append-system-prompt-file');
+      const appendSystemPromptFilePath =
+        appendSpIdx !== -1 ? String(args[appendSpIdx + 1]) : null;
 
       const child: FakeChild = {
         command,
@@ -118,6 +126,15 @@ function makeFakeSpawn(configure: (child: FakeChild) => void): FakeSpawn {
           systemPromptFilePath !== null ? readFileSync(systemPromptFilePath, 'utf8') : null,
         systemPromptFileMode:
           systemPromptFilePath !== null ? statSync(systemPromptFilePath).mode & 0o777 : null,
+        appendSystemPromptFilePath,
+        appendSystemPromptFileContent:
+          appendSystemPromptFilePath !== null
+            ? readFileSync(appendSystemPromptFilePath, 'utf8')
+            : null,
+        appendSystemPromptFileMode:
+          appendSystemPromptFilePath !== null
+            ? statSync(appendSystemPromptFilePath).mode & 0o777
+            : null,
         stdin,
         stdout: mkReadable(stdoutEmitter),
         stderr: mkReadable(stderrEmitter),
@@ -1185,8 +1202,12 @@ test('caller context changes split resumed sessions and render only the current 
     if (principalId) task.caller = { authenticated: { principalId } };
     await backend.handle(task, collect().emit, NEVER);
     const child = fake.lastChild();
-    const idx = child!.args.indexOf('--append-system-prompt');
-    prompts.push(idx === -1 ? undefined : String(child!.args[idx + 1]));
+    prompts.push(child!.appendSystemPromptFileContent ?? undefined);
+    assert.equal(
+      child!.args.some((arg) => String(arg).includes(principalId ?? 'principal-absent')),
+      false,
+      'caller identifiers must never ride argv',
+    );
     resumeFlags.push(child!.args.includes('--resume'));
   }
 
@@ -1196,6 +1217,67 @@ test('caller context changes split resumed sessions and render only the current 
   assert.doesNotMatch(prompts[1] ?? '', /principal-A/);
   assert.equal(prompts[2], undefined);
   assert.deepEqual(resumeFlags, [false, false, false]);
+  const child = fake.lastChild();
+  assert.equal(child?.args.includes('--append-system-prompt-file'), false);
+});
+
+test('plain caller context is staged 0600, removed after close, and absent from debug logs', async () => {
+  const oldLevel = process.env.VICOOP_CLIENT_LOG_LEVEL;
+  const oldLog = console.log;
+  const logs: string[] = [];
+  process.env.VICOOP_CLIENT_LOG_LEVEL = 'debug';
+  console.log = (...args: unknown[]) => {
+    logs.push(args.map(String).join(' '));
+  };
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+  const principalId = 'principal-private-for-regression';
+  let child: FakeChild | null = null;
+  try {
+    const backend = createClaudeBackend({ spawn: fake.spawn });
+    const task = assign('hello');
+    task.caller = {
+      authenticated: { principalId },
+      presented: [
+        {
+          credentialId: 'urn:uuid:credential-private',
+          issuer: 'did:web:issuer.example',
+          subject: 'acct:private@example.com',
+          method: 'platform-identity-v0.2',
+          profile: { displayName: 'Private Display Name', username: 'private-user' },
+        },
+      ],
+    };
+    await backend.handle(task, collect().emit, NEVER);
+    child = fake.lastChild();
+  } finally {
+    console.log = oldLog;
+    if (oldLevel === undefined) delete process.env.VICOOP_CLIENT_LOG_LEVEL;
+    else process.env.VICOOP_CLIENT_LOG_LEVEL = oldLevel;
+  }
+
+  assert.ok(child);
+  assert.ok(child.args.includes('--append-system-prompt-file'));
+  assert.equal(child.args.includes('--append-system-prompt'), false);
+  assert.match(child.appendSystemPromptFileContent ?? '', new RegExp(principalId));
+  assert.match(child.appendSystemPromptFileContent ?? '', /Private Display Name/);
+  assert.equal(child.appendSystemPromptFileMode, 0o600);
+  assert.ok(child.appendSystemPromptFilePath);
+  await assert.rejects(
+    fs.stat(child.appendSystemPromptFilePath),
+    'caller-context prompt file must be deleted',
+  );
+  await assert.rejects(
+    fs.stat(path.dirname(child.appendSystemPromptFilePath)),
+    'caller-context prompt directory must be deleted',
+  );
+  const allLogs = logs.join('\n');
+  assert.doesNotMatch(allLogs, /principal-private-for-regression/);
+  assert.doesNotMatch(allLogs, /Private Display Name/);
+  assert.doesNotMatch(allLogs, /private-user/);
+  assert.match(allLogs, /claude\.spawn\.start/);
 });
 
 test('identity args precede extraArgs so operator extraArgs override', async () => {
@@ -1381,20 +1463,25 @@ test('debug log records claude spawn shape and spawn errors', async () => {
   const oldLevel = process.env.VICOOP_CLIENT_LOG_LEVEL;
   const oldLog = console.log;
   const logs: string[] = [];
+  let callerPromptPath: string | null = null;
   process.env.VICOOP_CLIENT_LOG_LEVEL = 'debug';
   console.log = (...args: unknown[]) => {
     logs.push(args.map(String).join(' '));
   };
   try {
     const backend = createClaudeBackend({
-      spawn: () => {
+      spawn: (_command, args) => {
+        const idx = args.indexOf('--append-system-prompt-file');
+        callerPromptPath = idx === -1 ? null : String(args[idx + 1]);
         throw new Error('ENOENT: claude missing');
       },
       settings: { sandbox: { enabled: true } },
       extraArgs: ['--append-system-prompt', 'operator secret-ish prompt'],
     });
 
-    await backend.handle(assign('one'), collect().emit, NEVER);
+    const task = assign('one');
+    task.caller = { authenticated: { principalId: 'caller-private-spawn-error' } };
+    await backend.handle(task, collect().emit, NEVER);
   } finally {
     console.log = oldLog;
     if (oldLevel === undefined) delete process.env.VICOOP_CLIENT_LOG_LEVEL;
@@ -1419,6 +1506,13 @@ test('debug log records claude spawn shape and spawn errors', async () => {
       /error=ENOENT: claude missing/.test(line)
     ),
     `expected spawn error debug log, got:\n${logs.join('\n')}`,
+  );
+  assert.doesNotMatch(logs.join('\n'), /caller-private-spawn-error/);
+  assert.ok(callerPromptPath);
+  await assert.rejects(fs.stat(callerPromptPath), 'spawn failure must delete caller prompt file');
+  await assert.rejects(
+    fs.stat(path.dirname(callerPromptPath)),
+    'spawn failure must delete caller prompt directory',
   );
 });
 
