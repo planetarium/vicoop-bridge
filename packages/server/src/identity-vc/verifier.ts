@@ -1,4 +1,5 @@
 import { createVerifyCryptosuite } from '@digitalbazaar/eddsa-jcs-2022-cryptosuite';
+import { PresentedCallerIdentityV1 } from '@vicoop-bridge/protocol';
 import { base58btc } from 'multiformats/bases/base58';
 import { parseDateTimeStamp, parsePlatformIdentityCredential } from './parser.js';
 import {
@@ -41,16 +42,26 @@ function reject(code: IdentityVcRejectionCode): IdentityVcVerificationResult {
 
 function stringField(record: Record<string, unknown> | undefined, key: string): string | undefined {
   const value = record?.[key];
-  return typeof value === 'string' && value.length > 0 && value.length <= 1_024
-    ? value
-    : undefined;
+  return typeof value === 'string' ? value : undefined;
+}
+
+function hasValidDidDocumentShape(value: unknown): value is ResolvedDidDocument {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const doc = value as Record<string, unknown>;
+  return (
+    typeof doc.id === 'string' &&
+    (doc.verificationMethod === undefined || Array.isArray(doc.verificationMethod)) &&
+    (doc.assertionMethod === undefined || Array.isArray(doc.assertionMethod))
+  );
 }
 
 function findVerificationMethod(
   doc: ResolvedDidDocument,
   id: string,
 ): DidVerificationMethod | undefined {
-  const embedded = [...(doc.verificationMethod ?? []), ...(doc.assertionMethod ?? [])].find(
+  const verificationMethods = Array.isArray(doc.verificationMethod) ? doc.verificationMethod : [];
+  const assertionMethods = Array.isArray(doc.assertionMethod) ? doc.assertionMethod : [];
+  const embedded = [...verificationMethods, ...assertionMethods].find(
     (entry) => typeof entry === 'object' && entry !== null && (entry as { id?: unknown }).id === id,
   );
   if (typeof embedded !== 'object' || embedded === null) return undefined;
@@ -67,7 +78,7 @@ function findVerificationMethod(
 }
 
 function assertionMethodApproves(doc: ResolvedDidDocument, id: string): boolean {
-  return (doc.assertionMethod ?? []).some(
+  return (Array.isArray(doc.assertionMethod) ? doc.assertionMethod : []).some(
     (entry) =>
       entry === id ||
       (typeof entry === 'object' && entry !== null && (entry as { id?: unknown }).id === id),
@@ -146,16 +157,20 @@ export class PlatformIdentityVerifier {
       return reject('malformed');
     }
 
-    let doc: ResolvedDidDocument;
+    let resolved: unknown;
     try {
-      doc = await this.options.resolver.resolve(credential.issuer);
+      resolved = await this.options.resolver.resolve(credential.issuer);
     } catch {
       return reject('key_fetch_failed');
     }
+    if (!hasValidDidDocumentShape(resolved)) return reject('key_fetch_failed');
+    let doc = resolved;
     let method = findVerificationMethod(doc, credential.proof.verificationMethod);
     if (method === undefined && doc.id === credential.issuer) {
       try {
-        doc = await this.options.resolver.resolve(credential.issuer, { refresh: true });
+        resolved = await this.options.resolver.resolve(credential.issuer, { refresh: true });
+        if (!hasValidDidDocumentShape(resolved)) return reject('key_fetch_failed');
+        doc = resolved;
         method = findVerificationMethod(doc, credential.proof.verificationMethod);
       } catch {
         return reject('key_fetch_failed');
@@ -187,6 +202,13 @@ export class PlatformIdentityVerifier {
       return reject('invalid_signature');
     }
 
+    // Resolution and cryptographic verification are untrusted-duration work.
+    // Re-evaluate expiration immediately before consuming the replay tuple.
+    if (this.now().getTime() - this.clockSkewMs > validUntil) return reject('expired');
+
+    const identity = normalize(credential);
+    if (!PresentedCallerIdentityV1.safeParse(identity).success) return reject('malformed');
+
     // Consume only after every stateless check, so invalid inputs cannot burn
     // a valid request's one-time tuple.
     let consumed: boolean;
@@ -205,6 +227,6 @@ export class PlatformIdentityVerifier {
     }
     if (!consumed) return reject('replayed');
 
-    return { ok: true, identity: normalize(credential) };
+    return { ok: true, identity };
   }
 }

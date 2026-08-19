@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import {
   MENTIONABLE_IDENTITY_CONTEXT_URI,
   VC_V2_CONTEXT_URI,
@@ -9,8 +10,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function nonEmptyString(value: unknown, maxLength = 2_048): value is string {
-  return typeof value === 'string' && value.length > 0 && value.length <= maxLength;
+const MAX_PROOF_FIELD_LENGTH = 2_048;
+const MAX_CALLER_IDENTIFIER_LENGTH = 512;
+const MAX_CALLER_SUMMARY_LENGTH = 256;
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
 }
 
 function validAbsoluteUri(value: unknown): value is string {
@@ -59,7 +64,20 @@ export function parseDateTimeStamp(value: string): number | undefined {
 }
 
 function validOptionalStringField(record: Record<string, unknown>, key: string): boolean {
-  return record[key] === undefined || nonEmptyString(record[key], 1_024);
+  return record[key] === undefined || nonEmptyString(record[key]);
+}
+
+function exceeds(value: string, maxLength: number): boolean {
+  return value.length > maxLength;
+}
+
+function optionalExceeds(
+  record: Record<string, unknown> | undefined,
+  key: string,
+  maxLength: number,
+): boolean {
+  const value = record?.[key];
+  return typeof value === 'string' && exceeds(value, maxLength);
 }
 
 export type ParseCredentialResult =
@@ -86,13 +104,13 @@ export function parsePlatformIdentityCredential(input: unknown): ParseCredential
   if (
     !validAbsoluteUri(input.id) ||
     !nonEmptyString(input.issuer) ||
-    !nonEmptyString(input.validFrom, 128) ||
-    !nonEmptyString(input.validUntil, 128) ||
+    !nonEmptyString(input.validFrom) ||
+    !nonEmptyString(input.validUntil) ||
     !isRecord(input.credentialSubject) ||
     !validAbsoluteUri(input.credentialSubject.id) ||
     !nonEmptyString(input.credentialSubject.method) ||
     (input.credentialSubject.assurance !== undefined &&
-      !nonEmptyString(input.credentialSubject.assurance, 256)) ||
+      !nonEmptyString(input.credentialSubject.assurance)) ||
     (input.credentialSubject.platform !== undefined &&
       !isRecord(input.credentialSubject.platform)) ||
     (input.credentialSubject.observedInvocation !== undefined &&
@@ -102,6 +120,19 @@ export function parsePlatformIdentityCredential(input: unknown): ParseCredential
     !isRecord(input.proof)
   ) {
     return { ok: false, code: 'malformed' };
+  }
+
+  if (
+    exceeds(input.id, MAX_CALLER_IDENTIFIER_LENGTH) ||
+    exceeds(input.issuer, MAX_CALLER_IDENTIFIER_LENGTH) ||
+    exceeds(input.credentialSubject.id, MAX_CALLER_IDENTIFIER_LENGTH) ||
+    exceeds(input.credentialSubject.method, MAX_CALLER_SUMMARY_LENGTH) ||
+    (typeof input.credentialSubject.assurance === 'string' &&
+      exceeds(input.credentialSubject.assurance, MAX_CALLER_SUMMARY_LENGTH)) ||
+    exceeds(input.validFrom, 128) ||
+    exceeds(input.validUntil, 128)
+  ) {
+    return { ok: false, code: 'limit_exceeded' };
   }
 
   const platform = input.credentialSubject.platform;
@@ -119,9 +150,22 @@ export function parsePlatformIdentityCredential(input: unknown): ParseCredential
     return { ok: false, code: 'malformed' };
   }
 
+  if (
+    optionalExceeds(isRecord(platform) ? platform : undefined, 'provider', MAX_CALLER_SUMMARY_LENGTH) ||
+    optionalExceeds(isRecord(platform) ? platform : undefined, 'workspaceId', MAX_CALLER_SUMMARY_LENGTH) ||
+    optionalExceeds(isRecord(observed) ? observed : undefined, 'target', MAX_CALLER_IDENTIFIER_LENGTH) ||
+    optionalExceeds(isRecord(profile) ? profile : undefined, 'displayName', MAX_CALLER_SUMMARY_LENGTH) ||
+    optionalExceeds(isRecord(profile) ? profile : undefined, 'username', MAX_CALLER_SUMMARY_LENGTH)
+  ) {
+    return { ok: false, code: 'limit_exceeded' };
+  }
+
   const proof = input.proof;
   if (proof.type !== 'DataIntegrityProof' || proof.cryptosuite !== 'eddsa-jcs-2022') {
     return { ok: false, code: 'unsupported_cryptosuite' };
+  }
+  if (!Array.isArray(proof['@context']) || !isDeepStrictEqual(proof['@context'], context)) {
+    return { ok: false, code: 'unsupported_profile' };
   }
   if (
     proof.proofPurpose !== 'assertionMethod' ||
@@ -129,9 +173,18 @@ export function parsePlatformIdentityCredential(input: unknown): ParseCredential
     !nonEmptyString(proof.proofValue) ||
     !nonEmptyString(proof.domain) ||
     !nonEmptyString(proof.challenge) ||
-    (proof.created !== undefined && !nonEmptyString(proof.created, 128))
+    (proof.created !== undefined && !nonEmptyString(proof.created))
   ) {
     return { ok: false, code: 'malformed' };
+  }
+  if (
+    exceeds(proof.verificationMethod, MAX_PROOF_FIELD_LENGTH) ||
+    exceeds(proof.proofValue, MAX_PROOF_FIELD_LENGTH) ||
+    exceeds(proof.domain, MAX_PROOF_FIELD_LENGTH) ||
+    exceeds(proof.challenge, MAX_PROOF_FIELD_LENGTH) ||
+    (typeof proof.created === 'string' && exceeds(proof.created, 128))
+  ) {
+    return { ok: false, code: 'limit_exceeded' };
   }
 
   return { ok: true, credential: input as unknown as UnverifiedPlatformIdentityCredential };

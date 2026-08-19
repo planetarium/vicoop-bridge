@@ -1,3 +1,5 @@
+import type { PresentedCallerIdentityV1 } from '@vicoop-bridge/protocol';
+
 export const MENTIONABLE_IDENTITY_PROFILE_URI =
   'https://mentionable.dev/ns/identity/v0.2' as const;
 export const MENTIONABLE_IDENTITY_CONTEXT_URI =
@@ -39,29 +41,8 @@ export type IdentityVcRejectionCode =
   | 'replay_store_failed'
   | 'replayed';
 
-/**
- * The verifier-owned counterpart of #466's `PresentedCallerIdentityV1`.
- * The integration PR should map this object directly into
- * `TaskAssignFrame.caller.presented`; no raw credential is retained here.
- */
-export interface VerifiedPresentedIdentity {
-  credentialId: string;
-  issuer: string;
-  subject: string;
-  method: string;
-  assurance?: string;
-  platform?: {
-    provider?: string;
-    workspaceId?: string;
-  };
-  observedInvocation?: {
-    target?: string;
-  };
-  profile?: {
-    displayName?: string;
-    username?: string;
-  };
-}
+/** The verified shape is exactly the protocol object consumed by #466. */
+export type VerifiedPresentedIdentity = PresentedCallerIdentityV1;
 
 export interface IdentityVcRejection {
   code: IdentityVcRejectionCode;
@@ -103,6 +84,11 @@ export interface UnverifiedPlatformIdentityCredential {
   proof: DataIntegrityProofV1;
   [key: string]: unknown;
 }
+
+export type UnsecuredPlatformIdentityCredential = Pick<
+  UnverifiedPlatformIdentityCredential,
+  '@context' | 'id' | 'type' | 'issuer' | 'validFrom' | 'validUntil' | 'credentialSubject'
+>;
 
 export interface DidVerificationMethod {
   id: string;

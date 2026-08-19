@@ -29,7 +29,12 @@ test('IP policy rejects private, loopback, link-local and documentation networks
     '169.254.169.254',
     '192.168.1.2',
     '192.0.2.1',
+    '240.0.0.1',
+    '255.255.255.255',
     '::1',
+    '::127.0.0.1',
+    '64:ff9b:1::a9fe:a9fe',
+    '2002:a9fe:a9fe::',
     'fe80::1',
     'fc00::1',
     '2001:db8::1',
@@ -55,7 +60,11 @@ test('resolver blocks unsafe DNS before issuing HTTPS', async () => {
 
 test('resolver single-flights and caches one safe request', async () => {
   let requests = 0;
+  let currentTime = 0;
   const resolver = new SafeDidWebResolver({
+    now: () => currentTime,
+    cacheTtlMs: 60_000,
+    refreshCooldownMs: 5_000,
     resolveAddresses: (async () => [{ address: '8.8.8.8', family: 4 }]) as never,
     requestDocument: async (_url, _ip, signal) => {
       requests += 1;
@@ -72,6 +81,42 @@ test('resolver single-flights and caches one safe request', async () => {
   assert.equal(requests, 1);
   await resolver.resolve('did:web:issuer.example');
   assert.equal(requests, 1);
-  await resolver.resolve('did:web:issuer.example', { refresh: true });
+  await Promise.all(
+    Array.from({ length: 20 }, () =>
+      resolver.resolve('did:web:issuer.example', { refresh: true }),
+    ),
+  );
   assert.equal(requests, 2);
+  await resolver.resolve('did:web:issuer.example', { refresh: true });
+  assert.equal(requests, 2, 'sequential refreshes are bounded during the cooldown');
+  currentTime += 5_001;
+  await resolver.resolve('did:web:issuer.example', { refresh: true });
+  assert.equal(requests, 3, 'rotation refresh resumes after the cooldown');
+});
+
+test('resolver deadline includes DNS resolution', async () => {
+  const resolver = new SafeDidWebResolver({
+    timeoutMs: 10,
+    resolveAddresses: (() => new Promise(() => {})) as never,
+  });
+  await assert.rejects(
+    () => resolver.resolve('did:web:issuer.example'),
+    /resolution timed out/u,
+  );
+});
+
+test('resolver rejects malformed DID relationship containers', async () => {
+  for (const malformed of [
+    { id: 'did:web:issuer.example', verificationMethod: {} },
+    { id: 'did:web:issuer.example', assertionMethod: 'key-1' },
+  ]) {
+    const resolver = new SafeDidWebResolver({
+      resolveAddresses: (async () => [{ address: '8.8.8.8', family: 4 }]) as never,
+      requestDocument: async () => malformed,
+    });
+    await assert.rejects(
+      () => resolver.resolve('did:web:issuer.example'),
+      /relationships are malformed/u,
+    );
+  }
 });

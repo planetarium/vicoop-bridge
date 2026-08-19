@@ -1,7 +1,11 @@
 import * as Ed25519Multikey from '@digitalbazaar/ed25519-multikey';
 import { createSignCryptosuite } from '@digitalbazaar/eddsa-jcs-2022-cryptosuite';
 import { base58btc } from 'multiformats/bases/base58';
-import type { ResolvedDidDocument, UnverifiedPlatformIdentityCredential } from './types.js';
+import type {
+  ResolvedDidDocument,
+  UnsecuredPlatformIdentityCredential,
+  UnverifiedPlatformIdentityCredential,
+} from './types.js';
 
 const ISSUER = 'did:web:issuer.example';
 const KEY_ID = `${ISSUER}#key-1`;
@@ -27,6 +31,7 @@ export async function createIdentityVcFixture(overrides: {
   challenge?: string;
   validFrom?: string;
   validUntil?: string;
+  mutateUnsecured?: (credential: UnsecuredPlatformIdentityCredential) => void;
 } = {}): Promise<{
   credential: UnverifiedPlatformIdentityCredential;
   didDocument: ResolvedDidDocument;
@@ -41,7 +46,7 @@ export async function createIdentityVcFixture(overrides: {
     verificationMethod: [publicKey],
     assertionMethod: [KEY_ID],
   };
-  const unsecured: Omit<UnverifiedPlatformIdentityCredential, 'proof'> = {
+  const unsecured: UnsecuredPlatformIdentityCredential = {
     '@context': [
       'https://www.w3.org/ns/credentials/v2',
       'https://mentionable.dev/ns/identity/v0.2/context.jsonld',
@@ -74,6 +79,7 @@ export async function createIdentityVcFixture(overrides: {
     domain: overrides.domain ?? '@agent@bridge.example',
     challenge: overrides.challenge ?? 'message-1',
   };
+  overrides.mutateUnsecured?.(unsecured);
   const suite = createSignCryptosuite() as SignCryptosuite;
   const data = await suite.createVerifyData({
     cryptosuite: suite,

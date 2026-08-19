@@ -1,10 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { PresentedCallerIdentityV1 } from '@vicoop-bridge/protocol';
 import type {
   DidDocumentResolver,
   IdentityReplayStore,
   ResolvedDidDocument,
+  UnsecuredPlatformIdentityCredential,
 } from './types.js';
+import { MENTIONABLE_IDENTITY_CONTEXT_URI, VC_V2_CONTEXT_URI } from './types.js';
 import { createIdentityVcFixture } from './test-fixtures.js';
 import { PlatformIdentityVerifier } from './verifier.js';
 
@@ -63,6 +66,28 @@ test('valid credential becomes a minimal allowlisted presented identity', async 
   assert.equal(serialized.includes('threadId'), false);
   assert.equal(serialized.includes('avatar'), false);
   assert.equal(serialized.includes('source'), false);
+  assert.equal(result.ok && PresentedCallerIdentityV1.safeParse(result.identity).success, true);
+});
+
+test('credential and proof contexts must be exactly the same signed profile', async () => {
+  const { credential } = await createIdentityVcFixture({
+    mutateUnsecured(unsecured) {
+      unsecured['@context'] = [VC_V2_CONTEXT_URI];
+    },
+  });
+  credential['@context'].push(MENTIONABLE_IDENTITY_CONTEXT_URI);
+  let resolutions = 0;
+  const verifier = new PlatformIdentityVerifier({
+    trustedIssuers: [credential.issuer],
+    resolver: { async resolve() { resolutions += 1; throw new Error('must not run'); } },
+    replayStore: new MemoryReplayStore(),
+    now,
+  });
+  assert.deepEqual(await verifier.verify(credential, binding), {
+    ok: false,
+    rejection: { code: 'unsupported_profile' },
+  });
+  assert.equal(resolutions, 0);
 });
 
 test('exact receiver trust is checked before any resolution', async () => {
@@ -168,6 +193,52 @@ test('known presentation fields with invalid shapes are not silently normalized'
   });
 });
 
+test('verified identity boundaries match PresentedCallerIdentityV1', async () => {
+  const boundarySubject = `urn:x:${'a'.repeat(506)}`;
+  const boundaryMethod = 'm'.repeat(256);
+  const boundaryDisplayName = 'd'.repeat(256);
+  const { credential, didDocument } = await createIdentityVcFixture({
+    mutateUnsecured(unsecured) {
+      unsecured.credentialSubject.id = boundarySubject;
+      unsecured.credentialSubject.method = boundaryMethod;
+      unsecured.credentialSubject.profile = { displayName: boundaryDisplayName };
+    },
+  });
+  const verifier = new PlatformIdentityVerifier({
+    trustedIssuers: [credential.issuer],
+    resolver: resolverFor(didDocument),
+    replayStore: new MemoryReplayStore(),
+    now,
+  });
+  const result = await verifier.verify(credential, binding);
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && PresentedCallerIdentityV1.safeParse(result.identity).success, true);
+
+  for (const mutateUnsecured of [
+    (unsecured: UnsecuredPlatformIdentityCredential) => {
+      unsecured.credentialSubject.id = `urn:x:${'a'.repeat(507)}`;
+    },
+    (unsecured: UnsecuredPlatformIdentityCredential) => {
+      unsecured.credentialSubject.method = 'm'.repeat(257);
+    },
+    (unsecured: UnsecuredPlatformIdentityCredential) => {
+      unsecured.credentialSubject.profile = { displayName: 'd'.repeat(257) };
+    },
+  ]) {
+    const oversized = await createIdentityVcFixture({ mutateUnsecured });
+    const oversizedVerifier = new PlatformIdentityVerifier({
+      trustedIssuers: [oversized.credential.issuer],
+      resolver: { async resolve() { throw new Error('must not run'); } },
+      replayStore: new MemoryReplayStore(),
+      now,
+    });
+    assert.deepEqual(await oversizedVerifier.verify(oversized.credential, binding), {
+      ok: false,
+      rejection: { code: 'limit_exceeded' },
+    });
+  }
+});
+
 test('modified payload fails signature verification', async () => {
   const { credential, didDocument } = await createIdentityVcFixture();
   credential.credentialSubject.id = 'slack:T123/ATTACKER';
@@ -213,6 +284,52 @@ test('controller and assertionMethod linkage are required, with one rotation ref
   });
   assert.equal((await refreshVerifier.verify(credential, binding)).ok, false);
   assert.equal(calls, 2, 'unknown key triggers exactly one refresh');
+});
+
+test('malformed DID relationship fields fail closed without throwing', async () => {
+  const { credential, didDocument } = await createIdentityVcFixture();
+  for (const [field, value] of [
+    ['verificationMethod', {}],
+    ['verificationMethod', 'not-an-array'],
+    ['assertionMethod', 1],
+  ] as const) {
+    const malformed = { ...didDocument, [field]: value } as unknown as ResolvedDidDocument;
+    const verifier = new PlatformIdentityVerifier({
+      trustedIssuers: [credential.issuer],
+      resolver: resolverFor(malformed),
+      replayStore: new MemoryReplayStore(),
+      now,
+    });
+    assert.deepEqual(await verifier.verify(credential, binding), {
+      ok: false,
+      rejection: { code: 'key_fetch_failed' },
+    });
+  }
+});
+
+test('expiration is rechecked after resolution and signature verification', async () => {
+  const { credential, didDocument } = await createIdentityVcFixture({
+    validUntil: '2026-08-18T14:00:01.000Z',
+  });
+  let current = new Date('2026-08-18T14:00:00.000Z');
+  const replayStore = new MemoryReplayStore();
+  const verifier = new PlatformIdentityVerifier({
+    trustedIssuers: [credential.issuer],
+    resolver: {
+      async resolve() {
+        current = new Date('2026-08-18T14:00:02.000Z');
+        return didDocument;
+      },
+    },
+    replayStore,
+    limits: { clockSkewMs: 0 },
+    now: () => current,
+  });
+  assert.deepEqual(await verifier.verify(credential, binding), {
+    ok: false,
+    rejection: { code: 'expired' },
+  });
+  assert.equal(replayStore.keys.size, 0);
 });
 
 test('concurrent replay accepts exactly one proof', async () => {
