@@ -16,6 +16,10 @@ export interface ClientConnection {
   // Canonical backend kind (e.g. "claude", "codex", "vicoop-codex"); undefined
   // when the client supplied an inline agent card. Used for logging the backend.
   backendKind?: string;
+  // Optional protocol features advertised on the authenticated hello. Kept
+  // connection-scoped so executor dispatch can preserve old-client wire
+  // compatibility without falling back to caller-controlled metadata.
+  protocolCapabilities?: string[];
   agentCard: AgentCard;
   allowedCallers: string[];
   // x402 pricing from the agent's DB row, or undefined for a free agent (the

@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import WebSocket from 'ws';
 import { OPENAI_COMPAT_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
+import { renderCallerContext, wrapOpenClawUserMessage } from '../caller-context.js';
 import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import {
@@ -1451,6 +1452,12 @@ export function createOpenclawBackend(
           mapped.input.message,
         );
       }
+      // OpenClaw exposes no system/developer channel. Wrap only this
+      // chat.send payload, with the user content JSON-escaped behind an
+      // explicit untrusted boundary so session reuse cannot retain caller A
+      // when the next turn belongs to caller B (or has no caller at all).
+      const callerPrompt = renderCallerContext(task.caller);
+      mapped.input.message = wrapOpenClawUserMessage(mapped.input.message, task.caller);
 
       let gw: GatewayClient;
       try {
@@ -1473,7 +1480,15 @@ export function createOpenclawBackend(
       // without the extension metadata always use the default `agent`,
       // so this split is invisible to non-compat callers.
       const effectiveAgent = envelope && openaiCompatAgent ? openaiCompatAgent : agent;
-      const sessionKey = `${sessionPrefix}:${effectiveAgent}:${task.contextId}`;
+      // OpenClaw retains user payloads in a session. Since our caller block
+      // travels in that payload, isolate sessions by a non-reversible digest
+      // whenever caller attribution is present. The historical no-caller key
+      // stays unchanged for wire compatibility, and returning to it after a
+      // caller-scoped turn cannot expose that turn's caller block.
+      const callerScope = callerPrompt
+        ? `:caller-${createHash('sha256').update(callerPrompt).digest('hex').slice(0, 16)}`
+        : '';
+      const sessionKey = `${sessionPrefix}:${effectiveAgent}:${task.contextId}${callerScope}`;
       const { message: text, attachments } = mapped.input;
 
       emit({
