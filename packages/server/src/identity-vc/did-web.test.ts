@@ -34,7 +34,12 @@ test('IP policy rejects private, loopback, link-local and documentation networks
     '::1',
     '::127.0.0.1',
     '64:ff9b:1::a9fe:a9fe',
+    '2001:0000:4136:e378:8000:63bf:5601:5601',
+    '2001:2::1',
+    '2001:10::1',
     '2002:a9fe:a9fe::',
+    '3ffe::1',
+    '3fff::1',
     'fe80::1',
     'fc00::1',
     '2001:db8::1',
@@ -43,6 +48,9 @@ test('IP policy rejects private, loopback, link-local and documentation networks
   }
   assert.equal(isDisallowedIpAddress('8.8.8.8'), false);
   assert.equal(isDisallowedIpAddress('2606:4700:4700::1111'), false);
+  assert.equal(isDisallowedIpAddress('2001:1::1'), false, 'PCP anycast is globally reachable');
+  assert.equal(isDisallowedIpAddress('2001:3::1'), false, 'AMT is globally reachable');
+  assert.equal(isDisallowedIpAddress('2001:4:112::1'), false, 'AS112-v6 is globally reachable');
 });
 
 test('resolver blocks unsafe DNS before issuing HTTPS', async () => {
@@ -119,4 +127,41 @@ test('resolver rejects malformed DID relationship containers', async () => {
       /relationships are malformed/u,
     );
   }
+});
+
+test('resolver bounds sequential failures and retries after a cooldown', async () => {
+  let currentTime = 0;
+  let resolutions = 0;
+  let requests = 0;
+  const resolver = new SafeDidWebResolver({
+    now: () => currentTime,
+    failureCooldownMs: 5_000,
+    resolveAddresses: (async () => {
+      resolutions += 1;
+      return [{ address: '8.8.8.8', family: 4 }];
+    }) as never,
+    requestDocument: async () => {
+      requests += 1;
+      throw new Error('upstream unavailable');
+    },
+  });
+
+  const issuer = 'did:web:issuer.example';
+  const firstWave = await Promise.allSettled(
+    Array.from({ length: 20 }, () => resolver.resolve(issuer)),
+  );
+  assert.equal(firstWave.every(({ status }) => status === 'rejected'), true);
+  assert.equal(resolutions, 1);
+  assert.equal(requests, 1);
+
+  for (let index = 0; index < 5; index += 1) {
+    await assert.rejects(() => resolver.resolve(issuer), /cooling down/u);
+  }
+  assert.equal(resolutions, 1);
+  assert.equal(requests, 1);
+
+  currentTime += 5_001;
+  await assert.rejects(() => resolver.resolve(issuer), /upstream unavailable/u);
+  assert.equal(resolutions, 2);
+  assert.equal(requests, 2);
 });

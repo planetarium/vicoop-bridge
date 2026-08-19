@@ -32,7 +32,12 @@ for (const [network, prefix] of [
   ['64:ff9b::', 96],
   ['64:ff9b:1::', 48],
   ['100::', 64],
+  ['2001::', 32],
+  ['2001:2::', 48],
+  ['2001:10::', 28],
   ['2002::', 16],
+  ['3ffe::', 16],
+  ['3fff::', 20],
   ['fc00::', 7],
   ['fec0::', 10],
   ['fe80::', 10],
@@ -92,6 +97,7 @@ export interface SafeDidWebResolverOptions {
   maxResponseBytes?: number;
   cacheTtlMs?: number;
   refreshCooldownMs?: number;
+  failureCooldownMs?: number;
   maxCacheEntries?: number;
   now?: () => number;
   resolveAddresses?: typeof lookup;
@@ -103,11 +109,16 @@ interface CacheEntry {
   document: ResolvedDidDocument;
 }
 
+interface FailureEntry {
+  retryAfter: number;
+}
+
 export class SafeDidWebResolver implements DidDocumentResolver {
   private readonly timeoutMs: number;
   private readonly maxResponseBytes: number;
   private readonly cacheTtlMs: number;
   private readonly refreshCooldownMs: number;
+  private readonly failureCooldownMs: number;
   private readonly maxCacheEntries: number;
   private readonly now: () => number;
   private readonly resolveAddresses: typeof lookup;
@@ -118,6 +129,7 @@ export class SafeDidWebResolver implements DidDocumentResolver {
   ) => Promise<unknown>;
   private readonly cache = new Map<string, CacheEntry>();
   private readonly lastRefreshAttempt = new Map<string, number>();
+  private readonly failures = new Map<string, FailureEntry>();
   private readonly inFlight = new Map<string, Promise<ResolvedDidDocument>>();
 
   constructor(options: SafeDidWebResolverOptions = {}) {
@@ -125,6 +137,7 @@ export class SafeDidWebResolver implements DidDocumentResolver {
     this.maxResponseBytes = options.maxResponseBytes ?? 64 * 1024;
     this.cacheTtlMs = options.cacheTtlMs ?? 5 * 60 * 1000;
     this.refreshCooldownMs = options.refreshCooldownMs ?? 5_000;
+    this.failureCooldownMs = options.failureCooldownMs ?? 5_000;
     this.maxCacheEntries = options.maxCacheEntries ?? 128;
     this.now = options.now ?? Date.now;
     this.resolveAddresses = options.resolveAddresses ?? lookup;
@@ -145,6 +158,14 @@ export class SafeDidWebResolver implements DidDocumentResolver {
     const pending = this.inFlight.get(issuer);
     if (pending) return pending;
 
+    const failure = this.failures.get(issuer);
+    if (failure !== undefined) {
+      if (failure.retryAfter > currentTime) {
+        throw new DidResolutionError('DID document resolution is cooling down');
+      }
+      this.failures.delete(issuer);
+    }
+
     if (options.refresh && cached && cached.expiresAt > currentTime) {
       const lastAttempt = this.lastRefreshAttempt.get(issuer);
       if (
@@ -159,9 +180,24 @@ export class SafeDidWebResolver implements DidDocumentResolver {
     const load = this.load(issuer);
     this.inFlight.set(issuer, load);
     try {
-      return await load;
+      const document = await load;
+      this.failures.delete(issuer);
+      return document;
+    } catch (error) {
+      this.rememberFailure(issuer);
+      throw error;
     } finally {
       if (this.inFlight.get(issuer) === load) this.inFlight.delete(issuer);
+    }
+  }
+
+  private rememberFailure(issuer: string): void {
+    this.failures.delete(issuer);
+    this.failures.set(issuer, { retryAfter: this.now() + this.failureCooldownMs });
+    while (this.failures.size > this.maxCacheEntries) {
+      const oldest = this.failures.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.failures.delete(oldest);
     }
   }
 
@@ -202,6 +238,7 @@ export class SafeDidWebResolver implements DidDocumentResolver {
         if (oldest === undefined) break;
         this.cache.delete(oldest);
         this.lastRefreshAttempt.delete(oldest);
+        this.failures.delete(oldest);
       }
       return doc;
     } catch (error) {

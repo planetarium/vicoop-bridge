@@ -47,3 +47,28 @@ test('malformed carrier is removed and never forwarded', () => {
     rejections: [{ code: 'malformed' }],
   });
 });
+
+test('malformed mentionable containers are removed with all nested secrets', () => {
+  const secret = {
+    verifiable_credentials: [
+      {
+        proof: { proofValue: 'zSECRET' },
+        credentialSubject: { profile: { email: 'victim@example.com' } },
+      },
+    ],
+    identity_evidence: [{ token: 'legacy-secret' }],
+  };
+
+  for (const mentionable of [[secret], JSON.stringify(secret), null]) {
+    const result = extractAndStripIdentityCarrier({ keep: true, mentionable });
+    assert.deepEqual(result, {
+      credentials: [],
+      metadata: { keep: true },
+      rejections: [{ code: 'malformed' }],
+    });
+    const serialized = JSON.stringify(result.metadata);
+    assert.equal(serialized.includes('zSECRET'), false);
+    assert.equal(serialized.includes('victim@example.com'), false);
+    assert.equal(serialized.includes('legacy-secret'), false);
+  }
+});

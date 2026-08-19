@@ -149,7 +149,7 @@ export class PlatformIdentityVerifier {
     }
     if (validUntil - validFrom > this.maxTtlMs) return reject('limit_exceeded');
     if (now + this.clockSkewMs < validFrom) return reject('not_yet_valid');
-    if (now - this.clockSkewMs > validUntil) return reject('expired');
+    if (now - this.clockSkewMs >= validUntil) return reject('expired');
     if (
       credential.proof.created !== undefined &&
       parseDateTimeStamp(credential.proof.created) === undefined
@@ -204,7 +204,7 @@ export class PlatformIdentityVerifier {
 
     // Resolution and cryptographic verification are untrusted-duration work.
     // Re-evaluate expiration immediately before consuming the replay tuple.
-    if (this.now().getTime() - this.clockSkewMs > validUntil) return reject('expired');
+    if (this.now().getTime() - this.clockSkewMs >= validUntil) return reject('expired');
 
     const identity = normalize(credential);
     if (!PresentedCallerIdentityV1.safeParse(identity).success) return reject('malformed');
@@ -225,6 +225,9 @@ export class PlatformIdentityVerifier {
       // optional-evidence request can continue without presented identity.
       return reject('replay_store_failed');
     }
+    // The replay store can wait on a pool or database lock. Do not promote a
+    // credential that expired while its one-time tuple was being consumed.
+    if (this.now().getTime() - this.clockSkewMs >= validUntil) return reject('expired');
     if (!consumed) return reject('replayed');
 
     return { ok: true, identity };

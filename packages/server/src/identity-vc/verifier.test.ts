@@ -145,6 +145,7 @@ test('time window and TTL policy reject before resolution', async () => {
   for (const [validFrom, validUntil, code] of [
     ['2026-08-18T14:01:00.000Z', '2026-08-18T14:05:00.000Z', 'not_yet_valid'],
     ['2026-08-18T13:50:00.000Z', '2026-08-18T13:59:00.000Z', 'expired'],
+    ['2026-08-18T13:55:00.000Z', '2026-08-18T14:00:00.000Z', 'expired'],
     ['2026-08-18T13:00:00.000Z', '2026-08-18T14:01:00.000Z', 'limit_exceeded'],
   ] as const) {
     const { credential } = await createIdentityVcFixture({ validFrom, validUntil });
@@ -330,6 +331,32 @@ test('expiration is rechecked after resolution and signature verification', asyn
     rejection: { code: 'expired' },
   });
   assert.equal(replayStore.keys.size, 0);
+});
+
+test('expiration is rechecked after replay consumption', async () => {
+  const { credential, didDocument } = await createIdentityVcFixture({
+    validUntil: '2026-08-18T14:00:01.000Z',
+  });
+  let current = new Date('2026-08-18T14:00:00.000Z');
+  let consumed = 0;
+  const verifier = new PlatformIdentityVerifier({
+    trustedIssuers: [credential.issuer],
+    resolver: resolverFor(didDocument),
+    replayStore: {
+      async consume() {
+        consumed += 1;
+        current = new Date('2026-08-18T14:00:02.000Z');
+        return true;
+      },
+    },
+    limits: { clockSkewMs: 0 },
+    now: () => current,
+  });
+  assert.deepEqual(await verifier.verify(credential, binding), {
+    ok: false,
+    rejection: { code: 'expired' },
+  });
+  assert.equal(consumed, 1);
 });
 
 test('concurrent replay accepts exactly one proof', async () => {

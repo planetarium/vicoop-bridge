@@ -40,8 +40,19 @@ export function extractAndStripIdentityCarrier(
 
   const sanitized: Record<string, unknown> = { ...metadata };
   const mentionable = metadata.mentionable;
-  if (!isRecord(mentionable)) {
+  if (mentionable === undefined) {
     return { credentials: [], metadata: sanitized, rejections: [] };
+  }
+  if (!isRecord(mentionable)) {
+    // A malformed namespace container is still secret-bearing input. Remove
+    // the whole namespace rather than allowing nested raw credentials to
+    // survive in metadata that may be persisted or forwarded.
+    delete sanitized.mentionable;
+    return {
+      credentials: [],
+      metadata: Object.keys(sanitized).length === 0 ? undefined : sanitized,
+      rejections: [{ code: 'malformed' }],
+    };
   }
 
   const cleanMentionable = { ...mentionable };
