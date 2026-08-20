@@ -1,5 +1,15 @@
 # @vicoop-bridge/client
 
+## 0.38.0
+
+### Minor Changes
+
+- 8afff92: Negotiate bridge-verified caller context and expose current-turn attribution to every production backend.
+
+### Patch Changes
+
+- 2bceba4: Preserve a completed Claude caller-tool result when the optional narrated-tool retry exits without capturing a tool call.
+
 ## 0.37.1
 
 ### Patch Changes
