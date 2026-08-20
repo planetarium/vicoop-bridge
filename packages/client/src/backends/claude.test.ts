@@ -6120,21 +6120,47 @@ function narratedToolCallTask(): TaskAssignFrame {
 
 // Scripts each spawn separately so attempt 1 can narrate and attempt 2 emit a
 // real tool call, and records the argv of every spawn.
-function twoAttemptSpawn(scripts: readonly (readonly string[])[]): FakeSpawn & {
-  argvs: string[][];
-  stdins: string[][];
+function twoAttemptSpawn(
+  scripts: readonly (readonly string[])[],
+  exitCodes: readonly number[] = [],
+  beforeAttempt?: (attempt: number, child: FakeChild) => void | Promise<void>,
+): FakeSpawn & {
+  readonly argvs: string[][];
+  readonly stdins: string[][];
 } {
   const argvs: string[][] = [];
   const stdins: string[][] = [];
+  let attemptError: Error | null = null;
   let n = 0;
   const base = makeFakeSpawn((child) => {
-    const lines = scripts[Math.min(n, scripts.length - 1)] ?? [];
-    n++;
+    const attempt = n++;
+    const lines = scripts[Math.min(attempt, scripts.length - 1)] ?? [];
+    const exitCode = exitCodes.length > 0
+      ? exitCodes[Math.min(attempt, exitCodes.length - 1)]!
+      : 0;
+    const failAttempt = (err: unknown): void => {
+      attemptError ??= err instanceof Error ? err : new Error(String(err));
+      child.finish(1, null);
+    };
     setImmediate(() => {
-      for (const l of lines) child.emitStdout(l.endsWith('\n') ? l : `${l}\n`);
-      setImmediate(() => child.finish(0, null));
+      void Promise.resolve()
+        .then(() => beforeAttempt?.(attempt, child))
+        .then(
+          () => {
+            try {
+              for (const l of lines) child.emitStdout(l.endsWith('\n') ? l : `${l}\n`);
+              setImmediate(() => child.finish(exitCode, null));
+            } catch (err) {
+              failAttempt(err);
+            }
+          },
+          failAttempt,
+        );
     });
   });
+  const throwAttemptError = (): void => {
+    if (attemptError) throw attemptError;
+  };
   const wrapped = {
     ...base,
     spawn(cmd: string, args: readonly string[], options: ClaudeSpawnOptions) {
@@ -6143,10 +6169,19 @@ function twoAttemptSpawn(scripts: readonly (readonly string[])[]): FakeSpawn & {
       stdins.push((base.lastChild() as unknown as { stdinChunks?: string[] })?.stdinChunks ?? []);
       return handle;
     },
-    argvs,
-    stdins,
+    get argvs() {
+      throwAttemptError();
+      return argvs;
+    },
+    get stdins() {
+      throwAttemptError();
+      return stdins;
+    },
   };
-  return wrapped as FakeSpawn & { argvs: string[][]; stdins: string[][] };
+  return wrapped as FakeSpawn & {
+    readonly argvs: string[][];
+    readonly stdins: string[][];
+  };
 }
 
 const NARRATED = JSON.stringify({
@@ -6175,11 +6210,32 @@ const REAL_CALL = JSON.stringify({
 const OK_RESULT = JSON.stringify({ type: 'result', subtype: 'success', terminal_reason: 'completed', result: '' });
 
 test('narrated tool call: opt-in resumes once with the staged prompt still readable', async () => {
-  const fake = twoAttemptSpawn([
-    [NARRATED, OK_RESULT],
-    [REAL_CALL, OK_RESULT],
-  ]);
-  const backend = createClaudeBackend({ spawn: fake.spawn, claudeRetryNarratedToolCall: true });
+  let invokeRetryTool: (() => Promise<void>) | null = null;
+  const fake = twoAttemptSpawn(
+    [
+      [NARRATED, OK_RESULT],
+      [REAL_CALL, OK_RESULT],
+    ],
+    [1, 1],
+    async (attempt) => {
+      if (attempt !== 1) return;
+      assert.ok(invokeRetryTool, 'caller-tools MCP must be ready before the retry');
+      await invokeRetryTool();
+    },
+  );
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    claudeRetryNarratedToolCall: true,
+    onCallerToolsMcpReady: (server) => {
+      invokeRetryTool = async () => {
+        await server.invokeForTest({
+          callId: 'toolu_1',
+          toolName: 'glob',
+          arguments: { pattern: '**/*' },
+        });
+      };
+    },
+  });
   const { emit, frames } = collect();
   await backend.handle(narratedToolCallTask(), emit, NEVER);
 
@@ -6203,6 +6259,196 @@ test('narrated tool call: opt-in resumes once with the staged prompt still reada
   assert.equal(frames.at(-1)?.type, 'task.complete');
   assert.equal(frames.some((frame) => frame.type === 'task.fail'), false);
   await assert.rejects(fs.stat(retryPromptPath), 'prompt file must be deleted after retry');
+});
+
+test('narrated tool call: a failed retry preserves the first completed result', async () => {
+  const finalReport = 'Final report: the registered `glob` tool rejected this request.';
+  const report = JSON.stringify({
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      model: 'claude-fable-5',
+      content: [{ type: 'text', text: finalReport }],
+    },
+  });
+  const completed = JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    terminal_reason: 'completed',
+    is_error: false,
+    result: finalReport,
+  });
+  const maxTurns = JSON.stringify({
+    type: 'result',
+    subtype: 'error_during_execution',
+    terminal_reason: 'max_turns',
+    is_error: true,
+    result: finalReport,
+    errors: ['Reached maximum number of turns (1)'],
+  });
+  const fake = twoAttemptSpawn([[report, completed], [maxTurns]], [1, 1]);
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeRetryNarratedToolCall: true });
+  const { emit, frames } = collect();
+
+  await backend.handle(narratedToolCallTask(), emit, NEVER);
+
+  assert.equal(fake.argvs.length, 2, 'expected exactly one corrective retry');
+  assert.equal(frames.some((frame) => frame.type === 'task.fail'), false);
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+  assert.equal(textOf(frames.at(-1)!), finalReport);
+});
+
+test('narrated tool call: discarded retry text stays off the wire and both attempts are metered', async () => {
+  const finalReport = 'Final report: the registered `glob` tool rejected this request.';
+  const retryText = 'RETRY TEXT that must not reach the caller.';
+  const result = (opts: { text: string; input: number; output: number; error: boolean }) =>
+    JSON.stringify({
+      type: 'result',
+      subtype: opts.error ? 'error_during_execution' : 'success',
+      terminal_reason: opts.error ? 'max_turns' : 'completed',
+      is_error: opts.error,
+      result: opts.text,
+      modelUsage: {
+        'claude-fable-5': {
+          inputTokens: opts.input,
+          outputTokens: opts.output,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
+    });
+  const assistant = (text: string) =>
+    JSON.stringify({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        model: 'claude-fable-5',
+        content: [{ type: 'text', text }],
+      },
+    });
+  const fake = twoAttemptSpawn(
+    [
+      [assistant(finalReport), result({ text: finalReport, input: 1000, output: 500, error: false })],
+      [assistant(retryText), result({ text: finalReport, input: 7, output: 3, error: true })],
+    ],
+    [1, 1],
+  );
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeRetryNarratedToolCall: true });
+  const { emit, frames } = collect();
+
+  await backend.handle(narratedToolCallTask(), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (frame): frame is Extract<UpFrame, { type: 'task.artifact' }> => frame.type === 'task.artifact',
+  );
+  assert.deepEqual(artifacts.map(textOf), [finalReport]);
+  assert.equal(artifacts.some((artifact) => textOf(artifact).includes('RETRY TEXT')), false);
+  const complete = frames.at(-1);
+  assert.ok(complete?.type === 'task.complete');
+  assert.equal(textOf(complete), finalReport);
+  assert.deepEqual(complete.usage, {
+    promptTokens: 1007,
+    completionTokens: 503,
+    model: 'claude-fable-5',
+  });
+  const payload = complete.status.message?.metadata?.[OPENAI_COMPAT_EXTENSION_URI] as {
+    chat_completion?: { choices?: Array<{ message?: { content?: string } }>; usage?: Record<string, unknown> };
+  };
+  assert.equal(payload.chat_completion?.choices?.[0]?.message?.content, finalReport);
+  assert.equal(payload.chat_completion?.usage?.prompt_tokens, 1007);
+  assert.equal(payload.chat_completion?.usage?.completion_tokens, 503);
+});
+
+test('narrated tool call: a result-only first attempt still emits its fallback artifact', async () => {
+  const finalReport = 'Final report: the registered `glob` tool rejected this request.';
+  const completed = JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    terminal_reason: 'completed',
+    is_error: false,
+    result: finalReport,
+  });
+  const retryText = JSON.stringify({
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      model: 'claude-fable-5',
+      content: [{ type: 'text', text: 'RETRY NOISE' }],
+    },
+  });
+  const maxTurns = JSON.stringify({
+    type: 'result',
+    subtype: 'error_during_execution',
+    terminal_reason: 'max_turns',
+    is_error: true,
+    result: finalReport,
+  });
+  const fake = twoAttemptSpawn([[completed], [retryText, maxTurns]], [1, 1]);
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeRetryNarratedToolCall: true });
+  const { emit, frames } = collect();
+
+  await backend.handle(narratedToolCallTask(), emit, NEVER);
+
+  const artifacts = frames.filter(
+    (frame): frame is Extract<UpFrame, { type: 'task.artifact' }> => frame.type === 'task.artifact',
+  );
+  assert.deepEqual(
+    artifacts.map((artifact) => [artifact.artifact.name, textOf(artifact)]),
+    [['claude-result', finalReport]],
+  );
+});
+
+test('narrated tool call: a better retry outcome still wins when the first attempt would fail', async () => {
+  const finalReport = 'Final report: the registered `glob` tool rejected this request.';
+  const retryAnswer = 'Retry completed cleanly without a caller tool.';
+  const assistant = (text: string) => JSON.stringify({
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      model: 'claude-fable-5',
+      content: [{ type: 'text', text }],
+    },
+  });
+  const result = (text: string) => JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    terminal_reason: 'completed',
+    is_error: false,
+    result: text,
+  });
+  const fake = twoAttemptSpawn(
+    [
+      [assistant(finalReport), result(finalReport)],
+      [assistant(retryAnswer), result(retryAnswer)],
+    ],
+    [1, 0],
+    (attempt, child) => {
+      if (attempt === 0) child.emitStderr('(node:1) ExperimentalWarning: something');
+    },
+  );
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeRetryNarratedToolCall: true });
+  const { emit, frames } = collect();
+
+  await backend.handle(narratedToolCallTask(), emit, NEVER);
+
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+  assert.equal(textOf(frames.at(-1)!), retryAnswer);
+  const artifacts = frames.filter(
+    (frame): frame is Extract<UpFrame, { type: 'task.artifact' }> => frame.type === 'task.artifact',
+  );
+  assert.deepEqual(artifacts.map(textOf), [finalReport, retryAnswer]);
+});
+
+test('twoAttemptSpawn: a rejected attempt hook cannot be silently ignored', async () => {
+  const fake = twoAttemptSpawn([[NARRATED, OK_RESULT]], [0], () => {
+    throw new Error('HOOK BOOM');
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeRetryNarratedToolCall: true });
+  const { emit } = collect();
+
+  await backend.handle(narratedToolCallTask(), emit, NEVER);
+
+  assert.throws(() => fake.argvs, /HOOK BOOM/);
 });
 
 test('narrated tool call: off by default — no retry, no extra spawn', async () => {
