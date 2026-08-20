@@ -6127,18 +6127,27 @@ function twoAttemptSpawn(
 ): FakeSpawn & {
   argvs: string[][];
   stdins: string[][];
+  assertAttemptHooksSucceeded: () => void;
 } {
   const argvs: string[][] = [];
   const stdins: string[][] = [];
+  let attemptHookError: Error | null = null;
   let n = 0;
   const base = makeFakeSpawn((child) => {
     const attempt = n++;
     const lines = scripts[Math.min(attempt, scripts.length - 1)] ?? [];
     const exitCode = exitCodes[Math.min(attempt, exitCodes.length - 1)] ?? 0;
-    setImmediate(async () => {
-      await beforeAttempt?.(attempt);
-      for (const l of lines) child.emitStdout(l.endsWith('\n') ? l : `${l}\n`);
-      setImmediate(() => child.finish(exitCode, null));
+    setImmediate(() => {
+      void Promise.resolve()
+        .then(() => beforeAttempt?.(attempt))
+        .then(() => {
+          for (const l of lines) child.emitStdout(l.endsWith('\n') ? l : `${l}\n`);
+          setImmediate(() => child.finish(exitCode, null));
+        })
+        .catch((err: unknown) => {
+          attemptHookError = err instanceof Error ? err : new Error(String(err));
+          child.finish(1, null);
+        });
     });
   });
   const wrapped = {
@@ -6151,8 +6160,15 @@ function twoAttemptSpawn(
     },
     argvs,
     stdins,
+    assertAttemptHooksSucceeded() {
+      if (attemptHookError) throw attemptHookError;
+    },
   };
-  return wrapped as FakeSpawn & { argvs: string[][]; stdins: string[][] };
+  return wrapped as FakeSpawn & {
+    argvs: string[][];
+    stdins: string[][];
+    assertAttemptHooksSucceeded: () => void;
+  };
 }
 
 const NARRATED = JSON.stringify({
@@ -6209,6 +6225,7 @@ test('narrated tool call: opt-in resumes once with the staged prompt still reada
   });
   const { emit, frames } = collect();
   await backend.handle(narratedToolCallTask(), emit, NEVER);
+  fake.assertAttemptHooksSucceeded();
 
   assert.equal(fake.argvs.length, 2, 'expected exactly one corrective retry');
   // Attempt 1 mints the session, attempt 2 continues it — same id either way.
