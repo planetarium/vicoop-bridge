@@ -6120,7 +6120,11 @@ function narratedToolCallTask(): TaskAssignFrame {
 
 // Scripts each spawn separately so attempt 1 can narrate and attempt 2 emit a
 // real tool call, and records the argv of every spawn.
-function twoAttemptSpawn(scripts: readonly (readonly string[])[]): FakeSpawn & {
+function twoAttemptSpawn(
+  scripts: readonly (readonly string[])[],
+  exitCodes: readonly (number | null)[] = [],
+  beforeAttempt?: (attempt: number) => void | Promise<void>,
+): FakeSpawn & {
   argvs: string[][];
   stdins: string[][];
 } {
@@ -6128,11 +6132,13 @@ function twoAttemptSpawn(scripts: readonly (readonly string[])[]): FakeSpawn & {
   const stdins: string[][] = [];
   let n = 0;
   const base = makeFakeSpawn((child) => {
-    const lines = scripts[Math.min(n, scripts.length - 1)] ?? [];
-    n++;
-    setImmediate(() => {
+    const attempt = n++;
+    const lines = scripts[Math.min(attempt, scripts.length - 1)] ?? [];
+    const exitCode = exitCodes[Math.min(attempt, exitCodes.length - 1)] ?? 0;
+    setImmediate(async () => {
+      await beforeAttempt?.(attempt);
       for (const l of lines) child.emitStdout(l.endsWith('\n') ? l : `${l}\n`);
-      setImmediate(() => child.finish(0, null));
+      setImmediate(() => child.finish(exitCode, null));
     });
   });
   const wrapped = {
@@ -6175,11 +6181,32 @@ const REAL_CALL = JSON.stringify({
 const OK_RESULT = JSON.stringify({ type: 'result', subtype: 'success', terminal_reason: 'completed', result: '' });
 
 test('narrated tool call: opt-in resumes once with the staged prompt still readable', async () => {
-  const fake = twoAttemptSpawn([
-    [NARRATED, OK_RESULT],
-    [REAL_CALL, OK_RESULT],
-  ]);
-  const backend = createClaudeBackend({ spawn: fake.spawn, claudeRetryNarratedToolCall: true });
+  let invokeRetryTool: (() => Promise<void>) | null = null;
+  const fake = twoAttemptSpawn(
+    [
+      [NARRATED, OK_RESULT],
+      [REAL_CALL, OK_RESULT],
+    ],
+    [1, 1],
+    async (attempt) => {
+      if (attempt !== 1) return;
+      assert.ok(invokeRetryTool, 'caller-tools MCP must be ready before the retry');
+      await invokeRetryTool();
+    },
+  );
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    claudeRetryNarratedToolCall: true,
+    onCallerToolsMcpReady: (server) => {
+      invokeRetryTool = async () => {
+        await server.invokeForTest({
+          callId: 'toolu_1',
+          toolName: 'glob',
+          arguments: { pattern: '**/*' },
+        });
+      };
+    },
+  });
   const { emit, frames } = collect();
   await backend.handle(narratedToolCallTask(), emit, NEVER);
 
@@ -6203,6 +6230,43 @@ test('narrated tool call: opt-in resumes once with the staged prompt still reada
   assert.equal(frames.at(-1)?.type, 'task.complete');
   assert.equal(frames.some((frame) => frame.type === 'task.fail'), false);
   await assert.rejects(fs.stat(retryPromptPath), 'prompt file must be deleted after retry');
+});
+
+test('narrated tool call: a failed retry preserves the first completed result', async () => {
+  const finalReport = 'Final report: the registered `glob` tool rejected this request.';
+  const report = JSON.stringify({
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      model: 'claude-fable-5',
+      content: [{ type: 'text', text: finalReport }],
+    },
+  });
+  const completed = JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    terminal_reason: 'completed',
+    is_error: false,
+    result: finalReport,
+  });
+  const maxTurns = JSON.stringify({
+    type: 'result',
+    subtype: 'error_during_execution',
+    terminal_reason: 'max_turns',
+    is_error: true,
+    result: finalReport,
+    errors: ['Reached maximum number of turns (1)'],
+  });
+  const fake = twoAttemptSpawn([[report, completed], [maxTurns]], [1, 1]);
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeRetryNarratedToolCall: true });
+  const { emit, frames } = collect();
+
+  await backend.handle(narratedToolCallTask(), emit, NEVER);
+
+  assert.equal(fake.argvs.length, 2, 'expected exactly one corrective retry');
+  assert.equal(frames.some((frame) => frame.type === 'task.fail'), false);
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+  assert.equal(textOf(frames.at(-1)!), finalReport);
 });
 
 test('narrated tool call: off by default — no retry, no extra spawn', async () => {

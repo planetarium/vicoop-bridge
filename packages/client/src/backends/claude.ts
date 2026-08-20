@@ -3411,6 +3411,27 @@ export function createClaudeBackend(
           registeredToolNames: [...callerToolNameSet],
         })
       ) {
+        // The first attempt is already a valid completed result. The retry is
+        // speculative: only a newly captured caller tool call is allowed to
+        // replace that outcome. Keep every field that participates in the
+        // terminal decision or response identity so an error/max_turns result
+        // from the corrective child cannot poison the completed turn (#471).
+        const firstAttempt = {
+          exit,
+          pendingInputRequest,
+          finalText,
+          sawBlockingLimit,
+          assistantModel,
+          initModel,
+          sawCompletedResult,
+          sawErrorResult,
+          sawUnknownToolError,
+          stdoutTail,
+          stderrTail,
+          stdinError,
+        };
+        const callerToolCallCountBeforeRetry = capturedToolCalls.length;
+        let retrySettled = false;
         // Only the session flag changes: `--session-id` mints, `--resume`
         // continues. Everything else — mcp config, model, turn cap, system
         // prompt — must stay byte-identical or the corrective turn lands in a
@@ -3437,6 +3458,7 @@ export function createClaudeBackend(
             }) + '\n',
           );
           exit = await awaitChild();
+          retrySettled = true;
         } catch (err) {
           // A failed retry must not fail the task: the first attempt already
           // produced a legitimate (if useless) completed result, and surfacing
@@ -3444,6 +3466,33 @@ export function createClaudeBackend(
           timingLogger.warn?.(
             `[claude] narrated-tool-call retry failed taskId=${task.taskId} error=${safeToken(errorMessage(err), 300)}`,
           );
+        }
+
+        if (capturedToolCalls.length === callerToolCallCountBeforeRetry) {
+          // The corrective attempt did not produce the only useful outcome it
+          // can add. Restore the authoritative first attempt, including stderr
+          // and stdin diagnostics: either one would otherwise make
+          // treatExitAsSuccess reject the original completed result even after
+          // restoring its exit/result flags.
+          ({
+            exit,
+            pendingInputRequest,
+            finalText,
+            sawBlockingLimit,
+            assistantModel,
+            initModel,
+            sawCompletedResult,
+            sawErrorResult,
+            sawUnknownToolError,
+            stdoutTail,
+            stderrTail,
+            stdinError,
+          } = firstAttempt);
+          if (retrySettled) {
+            timingLogger.warn?.(
+              `[claude] narrated-tool-call retry produced no caller tool call; preserving first completed result taskId=${task.taskId}`,
+            );
+          }
         }
       }
 
