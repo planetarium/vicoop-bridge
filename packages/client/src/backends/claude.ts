@@ -730,6 +730,35 @@ export function parseClaudeModelUsageForOpenAICompat(raw: unknown): OpenAICompat
   });
 }
 
+// A narrated-tool-call correction is a second paid Claude invocation even
+// when its response is discarded in favour of the first completed turn.
+// Keep response selection and accounting independent: callers should see one
+// coherent response, while billing receives the token cost of every attempt.
+function sumClaudeAttemptUsage(
+  first: OpenAICompatUsage | null,
+  second: OpenAICompatUsage | null,
+): OpenAICompatUsage | null {
+  if (!first) return second;
+  if (!second) return first;
+  const firstCached = first.prompt_tokens_details?.cached_tokens;
+  const secondCached = second.prompt_tokens_details?.cached_tokens;
+  const firstReasoning = first.completion_tokens_details?.reasoning_tokens;
+  const secondReasoning = second.completion_tokens_details?.reasoning_tokens;
+  return buildOpenAICompatUsage({
+    prompt_tokens: first.prompt_tokens + second.prompt_tokens,
+    completion_tokens: first.completion_tokens + second.completion_tokens,
+    model: second.model ?? first.model,
+    cached_tokens:
+      firstCached !== undefined || secondCached !== undefined
+        ? (firstCached ?? 0) + (secondCached ?? 0)
+        : undefined,
+    reasoning_tokens:
+      firstReasoning !== undefined || secondReasoning !== undefined
+        ? (firstReasoning ?? 0) + (secondReasoning ?? 0)
+        : undefined,
+  });
+}
+
 // Assemble a complete OpenAI ChatCompletion envelope for the openai-compat/v1
 // envelope contract (oai2a2a#80). The codec on the gateway unwraps this
 // verbatim, so we own every required field — id / object / created / model /
@@ -2831,6 +2860,19 @@ export function createClaudeBackend(
       const activeTaskRuns = new Map<string, string>();
       const seenAssistantToolUseIds = new Set<string>();
 
+      // The corrective narrated-tool-call retry is speculative. Its artifacts
+      // cannot go on the wire until we know whether that attempt replaces the
+      // first response; otherwise discarded retry prose leaks into streaming
+      // clients and suppresses the first result-only fallback artifact.
+      let speculativeRetryArtifacts: Parameters<typeof emit>[0][] | null = null;
+      const emitArtifactFrame = (frame: Parameters<typeof emit>[0]): void => {
+        if (speculativeRetryArtifacts) {
+          speculativeRetryArtifacts.push(frame);
+          return;
+        }
+        emit(frame);
+      };
+
       // Register this task with the send_file MCP server (if running) so
       // tool calls landing during this run resolve to this task's emit().
       // Released in the terminal block so a crashed/timed-out task doesn't
@@ -2841,7 +2883,7 @@ export function createClaudeBackend(
           taskId: task.taskId,
           contextId: task.contextId,
           emit: (artifact) => {
-            emit({
+            emitArtifactFrame({
               type: 'task.artifact',
               taskId: task.taskId,
               artifact,
@@ -2862,7 +2904,7 @@ export function createClaudeBackend(
         // (natural-language answers, or any turn from a task that didn't
         // request the extension) are emitted unchanged as a `text` part
         // artifact for A2A debuggability and non-OpenAI consumers.
-        emit({
+        emitArtifactFrame({
           type: 'task.artifact',
           taskId: task.taskId,
           artifact: {
@@ -2888,7 +2930,7 @@ export function createClaudeBackend(
       const emitReasoningArtifact = (text: string): void => {
         if (!text) return;
         reasoningArtifactId ??= randomUUID();
-        emit({
+        emitArtifactFrame({
           type: 'task.artifact',
           taskId: task.taskId,
           artifact: {
@@ -2925,7 +2967,7 @@ export function createClaudeBackend(
       const emitToolResultMedia = (parts: Part[]): void => {
         if (!emitTraceArtifacts) return;
         if (parts.length === 0) return;
-        emit({
+        emitArtifactFrame({
           type: 'task.artifact',
           taskId: task.taskId,
           artifact: {
@@ -2962,7 +3004,7 @@ export function createClaudeBackend(
               ? 'completed'
               : 'failed';
         const label = description || 'Task';
-        emit({
+        emitArtifactFrame({
           type: 'task.artifact',
           taskId: task.taskId,
           artifact: {
@@ -2982,7 +3024,7 @@ export function createClaudeBackend(
 
       const emitToolCallArtifact = (block: ToolUseBlock): void => {
         if (!emitTraceArtifacts) return;
-        emit({
+        emitArtifactFrame({
           type: 'task.artifact',
           taskId: task.taskId,
           artifact: {
@@ -3411,20 +3453,36 @@ export function createClaudeBackend(
           registeredToolNames: [...callerToolNameSet],
         })
       ) {
-        // The first attempt is already a valid completed result. The retry is
-        // speculative: only a newly captured caller tool call is allowed to
-        // replace that outcome. Keep every field that participates in the
-        // terminal decision or response identity so an error/max_turns result
-        // from the corrective child cannot poison the completed turn (#471).
+        // The retry is speculative whenever the first attempt would already
+        // pass the terminal decision below. Keep every response, streaming,
+        // and diagnostic field so a discarded retry cannot poison that turn.
+        // If the first attempt would fail (for example exit 1 plus stderr), the
+        // retry retains the pre-#471 behaviour and is allowed to improve it.
+        const firstAttemptWouldSucceed =
+          !exit.error &&
+          (exit.code === 0 ||
+            (exit.code !== 0 &&
+              sawCompletedResult &&
+              !sawErrorResult &&
+              stderrTail.trim() === '' &&
+              stdinError === null &&
+              !aborted));
         const firstAttempt = {
           exit,
+          emittedAnyArtifact,
+          emittedAskUserQuestion,
           pendingInputRequest,
           finalText,
+          finalUsage,
           sawBlockingLimit,
           assistantModel,
           initModel,
+          responseArtifactId,
+          reasoningArtifactId,
+          streamedResponseText,
           sawCompletedResult,
           sawErrorResult,
+          emittedToolUseCount,
           sawUnknownToolError,
           stdoutTail,
           stderrTail,
@@ -3432,6 +3490,10 @@ export function createClaudeBackend(
         };
         const callerToolCallCountBeforeRetry = capturedToolCalls.length;
         let retrySettled = false;
+        speculativeRetryArtifacts = [];
+        // `handleEvent` assigns the latest result usage. Isolate the second
+        // attempt so it can be summed with (rather than overwrite) attempt 1.
+        finalUsage = null;
         // Only the session flag changes: `--session-id` mints, `--resume`
         // continues. Everything else — mcp config, model, turn cap, system
         // prompt — must stay byte-identical or the corrective turn lands in a
@@ -3468,7 +3530,14 @@ export function createClaudeBackend(
           );
         }
 
-        if (capturedToolCalls.length === callerToolCallCountBeforeRetry) {
+        const retryArtifacts = speculativeRetryArtifacts;
+        speculativeRetryArtifacts = null;
+        const combinedUsage = sumClaudeAttemptUsage(firstAttempt.finalUsage, finalUsage);
+
+        if (
+          capturedToolCalls.length === callerToolCallCountBeforeRetry &&
+          firstAttemptWouldSucceed
+        ) {
           // The corrective attempt did not produce the only useful outcome it
           // can add. Restore the authoritative first attempt, including stderr
           // and stdin diagnostics: either one would otherwise make
@@ -3476,23 +3545,38 @@ export function createClaudeBackend(
           // restoring its exit/result flags.
           ({
             exit,
+            emittedAnyArtifact,
+            emittedAskUserQuestion,
             pendingInputRequest,
             finalText,
+            finalUsage,
             sawBlockingLimit,
             assistantModel,
             initModel,
+            responseArtifactId,
+            reasoningArtifactId,
+            streamedResponseText,
             sawCompletedResult,
             sawErrorResult,
+            emittedToolUseCount,
             sawUnknownToolError,
             stdoutTail,
             stderrTail,
             stdinError,
           } = firstAttempt);
+          finalUsage = combinedUsage;
           if (retrySettled) {
             timingLogger.warn?.(
               `[claude] narrated-tool-call retry produced no caller tool call; preserving first completed result taskId=${task.taskId}`,
             );
           }
+        } else {
+          // The retry produced a caller tool call, or the first attempt was not
+          // independently successful. Commit its previously buffered artifact
+          // stream in order and retain its outcome, while accounting for both
+          // invocations.
+          for (const frame of retryArtifacts) emit(frame);
+          finalUsage = combinedUsage;
         }
       }
 
