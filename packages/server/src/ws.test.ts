@@ -943,3 +943,72 @@ test('a live duplicate-token collision is held against real sockets, then expire
     await closeServer(server);
   }
 });
+test('a replay larger than the client default buffer survives the pre-auth queue', async () => {
+  const server = createServer();
+  const registry = new Registry(60 * 60_000);
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+
+  const REPLAY_FRAMES = 2_100;
+
+  try {
+    await once(ws, 'open');
+
+    const sink = makeSink();
+    registry.bindTask({ agentId: 'agent-1', taskId: 'task-replay', contextId: 'ctx-r', sink });
+
+    ws.send(helloFrame());
+    for (let i = 0; i < REPLAY_FRAMES; i++) {
+      ws.send(encodeFrame({
+        type: 'task.artifact',
+        taskId: 'task-replay',
+        artifact: { artifactId: 'a-1', parts: [{ kind: 'text', text: `chunk-${i}` }] },
+        append: true,
+        lastChunk: false,
+      }));
+    }
+    ws.send(encodeFrame({
+      type: 'task.complete',
+      taskId: 'task-replay',
+      status: {
+        state: 'completed',
+        timestamp: new Date().toISOString(),
+        message: { role: 'agent', messageId: 'm-r', parts: [{ kind: 'text', text: 'done' }] },
+      },
+    }));
+
+    await withTimeout(sink.finished, 5_000, 'the pipelined replay to complete');
+
+    assert.equal(ws.readyState, ws.OPEN, 'the connection must survive a normal-sized replay');
+    assert.equal(sink.artifacts.length, REPLAY_FRAMES, 'every replayed artifact must be delivered');
+    assert.deepEqual(sink.artifacts[0]?.artifact.parts, [{ kind: 'text', text: 'chunk-0' }]);
+    assert.deepEqual(sink.artifacts.at(-1)?.artifact.parts, [
+      { kind: 'text', text: `chunk-${REPLAY_FRAMES - 1}` },
+    ]);
+    const terminal = sink.statuses.at(-1)!;
+    assert.equal(terminal.status.state, 'completed');
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});
+
+test('an oversized unauthenticated message is refused before it is parsed', async () => {
+  const server = createServer();
+  const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+
+  try {
+    await once(ws, 'open');
+    ws.send('{"type":"task.status","garbage":"' + 'z'.repeat(9 * 1024 * 1024));
+    const [code, reason] = (await once(ws, 'close')) as [number, Buffer];
+    assert.equal(code, 4002);
+    assert.match(reason.toString('utf8'), /too much data before authentication/);
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});

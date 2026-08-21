@@ -261,7 +261,14 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
   // untouched if authentication fails.
   let preAuthQueue: UpFrame[] = [];
   let preAuthBytes = 0;
-  const MAX_PRE_AUTH_FRAMES = 256;
+  // Must exceed the client's own replay buffer cap (DEFAULT_MAX_PENDING_FRAMES,
+  // 2000, in packages/client/src/client.ts). The client flushes its whole
+  // buffer immediately behind `hello` and clears it as it goes, so a server cap
+  // BELOW that would close a perfectly normal replay with 4002 and destroy the
+  // very frames this feature exists to preserve — and the client would
+  // reconnect into a loop. Same relationship as the byte budget below; both
+  // caps are deliberately the larger side of that pair.
+  const MAX_PRE_AUTH_FRAMES = 4_096;
   // Byte budget alongside the frame count, measured on the RAW message rather
   // than the parsed object: the protocol puts no size limit on artifact or
   // status payloads, so a frame count alone bounds nothing. Without this an
@@ -271,6 +278,10 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
   // Sized above the client's own replay budget (DEFAULT_MAX_PENDING_BYTES in
   // packages/client/src/client.ts) so a legitimate replay always fits; a client
   // that overshoots is closed rather than silently truncated.
+  //
+  // Enforced BEFORE parsing (see below): checking after `parseUpFrame` would
+  // let a peer make us materialize an oversized payload through JSON and Zod
+  // and only then reject it, which is most of the cost the cap exists to deny.
   const MAX_PRE_AUTH_BYTES = 8 * 1024 * 1024;
 
   ws.on('message', (raw) => {
@@ -283,6 +294,27 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         : raw instanceof ArrayBuffer
           ? raw.byteLength
           : Buffer.byteLength(String(raw), 'utf8');
+
+    // Everything an unauthenticated peer sends — the hello itself included —
+    // counts against one budget, and it is charged here, before the bytes are
+    // handed to the parser. There is no separate allowance for the hello: a
+    // legitimate one is a few hundred bytes, so the shared budget is orders of
+    // magnitude more than it needs while still capping what a peer can make us
+    // allocate before it has proved anything.
+    if (!authed) {
+      if (preAuthBytes + rawBytes > MAX_PRE_AUTH_BYTES) {
+        logEvent('pre_auth_overflow', {
+          frames: preAuthQueue.length,
+          bytes: preAuthBytes,
+          frameBytes: rawBytes,
+        });
+        opts.registry.noteServerClose(ws);
+        ws.close(4002, 'too much data before authentication');
+        return;
+      }
+      preAuthBytes += rawBytes;
+    }
+
     let frame;
     try {
       frame = parseUpFrame(typeof raw === 'string' ? raw : raw.toString('utf8'));
@@ -305,21 +337,13 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           ws.close(4003, 'expected hello');
           return;
         }
-        if (
-          preAuthQueue.length >= MAX_PRE_AUTH_FRAMES ||
-          preAuthBytes + rawBytes > MAX_PRE_AUTH_BYTES
-        ) {
-          logEvent('pre_auth_overflow', {
-            frames: preAuthQueue.length,
-            bytes: preAuthBytes,
-            frameBytes: rawBytes,
-          });
+        if (preAuthQueue.length >= MAX_PRE_AUTH_FRAMES) {
+          logEvent('pre_auth_overflow', { frames: preAuthQueue.length, bytes: preAuthBytes });
           opts.registry.noteServerClose(ws);
-          ws.close(4002, 'too much data before authentication');
+          ws.close(4002, 'too many frames before authentication');
           return;
         }
         preAuthQueue.push(frame);
-        preAuthBytes += rawBytes;
         return;
       }
       if (frame.version !== PROTOCOL_VERSION) {
