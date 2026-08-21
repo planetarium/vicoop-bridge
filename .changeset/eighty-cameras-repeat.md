@@ -20,11 +20,13 @@ with `client_buffer_overflow` rather than replaying a partial stream — an hone
 failure the caller can retry beats a silently truncated answer.
 
 The buffer is bounded by frame count (`maxPendingFrames`, default 2000),
-encoded size (`maxPendingBytes`, default 4 MiB) and age (`maxPendingAgeMs`,
-default 45s). The age bound matters for correctness, not just memory: a taskId
-is reusable across A2A turns, so replaying output the bridge would no longer
-honour could inject a dead run's frames into a live one. Setting any of them to
-`0` disables buffering and restores the previous behavior.
+encoded size (`maxPendingBytes`, default 4 MiB) and outage duration
+(`maxPendingAgeMs`, default 25s). The last one matters for correctness, not just
+memory: a taskId is reusable across A2A turns, so replaying output the bridge
+would no longer honour could inject a dead run's frames into a live one. It is
+measured from the disconnect and must stay at or below the bridge's
+`BRIDGE_DISCONNECT_GRACE_MS`. Setting any of them to `0` disables buffering and
+restores the previous behavior.
 
 Requires a bridge with reconnect replay support. Against an older bridge the
 replay is rejected (close 4003); the client detects this, logs a warning naming

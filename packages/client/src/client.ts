@@ -49,7 +49,8 @@ export interface ClientOptions {
   // Companion byte budget for that buffer, over the encoded frames. Keep at or
   // below the server's pre-auth byte budget; see DEFAULT_MAX_PENDING_BYTES.
   maxPendingBytes?: number;
-  // How long a buffered frame stays replayable; see DEFAULT_MAX_PENDING_AGE_MS.
+  // How long an outage's buffered output stays replayable. Must not exceed the
+  // bridge's `BRIDGE_DISCONNECT_GRACE_MS`; see DEFAULT_MAX_PENDING_AGE_MS.
   maxPendingAgeMs?: number;
   // Minimum reconnect delay after a 4009 "another client with the same
   // token connected" close — i.e. two daemons authenticated with the
@@ -126,15 +127,24 @@ const DEFAULT_MAX_PENDING_FRAMES = 2_000;
 // authentication settles. A client allowed to buffer more than the server will
 // accept pre-auth would be closed mid-replay and reconnect into a loop.
 const DEFAULT_MAX_PENDING_BYTES = 4 * 1024 * 1024;
-// How long a buffered frame is worth replaying. Past the server's own reconnect
-// grace the binding it belonged to is gone, and — because A2A reuses a taskId
-// across turns — a NEW run may already hold that id. Replaying then would inject
-// a dead run's artifacts, or its terminal, into a live one. Anything older than
-// this is dropped and its task failed instead.
+// How long an outage may last before its buffered output stops being replayable,
+// measured from when buffering STARTED — not from each frame's own creation.
 //
-// Kept above the server's default grace (BRIDGE_DISCONNECT_GRACE_MS, 30s) so a
-// recovery the server would still have honored is never discarded here.
-const DEFAULT_MAX_PENDING_AGE_MS = 45_000;
+// The distinction is the whole safety argument. The bridge deletes a held
+// binding at its grace deadline, counted from the disconnect. A backend that
+// keeps running past that deadline keeps producing frames, and a per-frame age
+// would judge each of them young: a frame created 5s before a reconnect looks
+// fresh even though the binding it belongs to died 10s earlier. Because A2A
+// reuses a taskId across turns, replaying into that gap can hand a dead run's
+// artifacts — or its terminal — to a live one, and the bridge only checks agent
+// ownership, not which run.
+//
+// So the window is the outage's, and it must stay at or BELOW the bridge's
+// effective grace (`BRIDGE_DISCONNECT_GRACE_MS`, 30s by default). Erring short
+// costs a recovery the bridge might still have honoured — the task simply fails
+// as it did before this buffer existed. Erring long risks corrupting a
+// different run, which is not recoverable and not even visible.
+const DEFAULT_MAX_PENDING_AGE_MS = 25_000;
 // Bound on the truncated-task bookkeeping. It is not covered by the frame
 // budgets — one entry per distinct task, retained until reconnect — so a long
 // outage across many tasks could otherwise grow it without limit.
@@ -180,19 +190,25 @@ export class Client {
   // which is what would have happened anyway.
   // Entries hold the ENCODED frame, not the frame object: it is what replay
   // actually sends, and it is the only honest measure of what the buffer costs.
-  private pendingFrames: Array<{ taskId: string; encoded: string; bytes: number; at: number }> = [];
+  private pendingFrames: Array<{ taskId: string; encoded: string; bytes: number }> = [];
   private pendingBytes = 0;
   // Entries handed to a socket but not yet known to have been accepted. They
   // stay here until the connection proves itself, so a replay that dies
   // mid-flight — an old bridge rejecting it, a second drop — is retried rather
   // than lost. Kept separate from `pendingFrames` so frames produced after the
   // flush cannot be sent twice.
-  private replayInFlight: Array<{ taskId: string; encoded: string; bytes: number; at: number }> = [];
+  private replayInFlight: Array<{ taskId: string; encoded: string; bytes: number }> = [];
+  // When the current outage began, i.e. when the socket last went down with
+  // nothing yet confirmed. Reset only when the buffer is emptied — a requeued
+  // replay keeps the ORIGINAL start, because its frames are exactly as stale as
+  // the outage that produced them.
+  private bufferingSince: number | null = null;
   // Set when a bridge rejects pipelined replay (4003 "expected hello"), i.e. it
   // predates the pre-auth queueing this depends on. Replaying again would just
   // loop, so we fall back to the old drop-on-the-floor behavior for the rest of
   // the process and tell the operator why.
   private replaySupported = true;
+  private replayConfirmTimer: ReturnType<typeof setTimeout> | null = null;
   // Tasks that lost at least one frame to the cap. Their replay would be a
   // hole rather than a delay, so they are failed explicitly instead — a caller
   // is far better served by an honest failure it can retry than by a silently
@@ -219,6 +235,7 @@ export class Client {
     this.stopped = true;
     this.clearReconnectTimer();
     this.clearReconnectResetTimer();
+    this.clearReplayConfirmTimer();
     this.clearHeartbeat();
     // Abort all inflight tasks so backends can unwind cleanly instead of
     // running to completion after the WS is gone.
@@ -461,6 +478,13 @@ export class Client {
       this.logger.info(`disconnected: ${code} ${safeToken(reason.toString())}`);
       if (!current) return;
       this.ws = null;
+      this.clearReplayConfirmTimer();
+      // Start the outage clock here, not at the first buffered frame: the
+      // bridge's grace counts from the disconnect, and a backend whose first
+      // output lands late in the outage must not get a fresh window for it.
+      // `??=` keeps the earliest start when output from a previous attempt is
+      // still pending — those frames are that much staler, not fresher.
+      this.bufferingSince ??= Date.now();
       // The connection died without ever proving itself, so anything we
       // replayed onto it may never have been processed. Put it back.
       this.requeueReplay();
@@ -606,16 +630,12 @@ export class Client {
     const stableMs = this.opts.reconnectStableMs ?? DEFAULT_RECONNECT_STABLE_MS;
     if (stableMs <= 0) {
       this.reconnectAttempt = 0;
-      this.confirmReplay();
       return;
     }
     this.reconnectResetTimer = setTimeout(() => {
       this.reconnectResetTimer = null;
       if (!this.stopped && this.ws === ws && ws.readyState === WebSocket.OPEN) {
         this.reconnectAttempt = 0;
-        // The same signal that says this connection is real says the replay
-        // landed: a bridge that was going to reject it would have closed by now.
-        this.confirmReplay();
       }
     }, stableMs);
     this.reconnectResetTimer.unref?.();
@@ -688,7 +708,7 @@ export class Client {
       return;
     }
 
-    this.pendingFrames.push({ taskId: frame.taskId, encoded, bytes, at: Date.now() });
+    this.pendingFrames.push({ taskId: frame.taskId, encoded, bytes });
     this.pendingBytes += bytes;
     // Drop the OLDEST first, so what survives is the tail nearest the terminal
     // — but record each victim's task, because a partial replay of a text
@@ -736,18 +756,19 @@ export class Client {
       return;
     }
 
-    // Anything the server would no longer honour is not merely useless to send,
-    // it is dangerous: the binding is gone and a new run may already hold that
-    // taskId. Fail those tasks instead of injecting a dead run's output.
+    // Output the bridge would no longer honour is not merely useless to send, it
+    // is dangerous: the binding is gone and a new run may already hold that
+    // taskId. The whole outage is judged at once — every frame in the buffer is
+    // as stale as the outage that produced it, whatever its own age.
     const maxAge = this.opts.maxPendingAgeMs ?? DEFAULT_MAX_PENDING_AGE_MS;
-    const cutoff = Date.now() - maxAge;
+    const outageMs = this.bufferingSince === null ? 0 : Date.now() - this.bufferingSince;
     const fresh: typeof this.pendingFrames = [];
-    for (const entry of this.pendingFrames) {
-      if (entry.at < cutoff) {
-        this.markTruncated(entry.taskId, `buffered output is older than ${maxAge}ms`);
-        continue;
+    if (outageMs > maxAge) {
+      for (const entry of this.pendingFrames) {
+        this.markTruncated(entry.taskId, `the ${outageMs}ms outage exceeds the ${maxAge}ms replay window`);
       }
-      fresh.push(entry);
+    } else {
+      fresh.push(...this.pendingFrames);
     }
 
     const truncated = this.truncatedTasks;
@@ -781,12 +802,44 @@ export class Client {
       `replayed ${replayed} buffered frame(s) after reconnect` +
         (truncated.size > 0 ? `; failed ${truncated.size} truncated task(s)` : ''),
     );
+    this.scheduleReplayConfirm(ws);
+  }
+
+  // Release the retained replay once this connection has stayed up long enough
+  // to be believed. Armed HERE rather than at `open`, because the flush happens
+  // after an async card probe: a window started at `open` can elapse before
+  // there is anything to confirm, leaving the replay retained forever and every
+  // later close re-sending frames the bridge already has.
+  private scheduleReplayConfirm(ws: WebSocket): void {
+    this.clearReplayConfirmTimer();
+    if (this.replayInFlight.length === 0) return;
+    const stableMs = this.opts.reconnectStableMs ?? DEFAULT_RECONNECT_STABLE_MS;
+    if (stableMs <= 0) {
+      this.confirmReplay();
+      return;
+    }
+    this.replayConfirmTimer = setTimeout(() => {
+      this.replayConfirmTimer = null;
+      if (!this.stopped && this.ws === ws && ws.readyState === WebSocket.OPEN) {
+        this.confirmReplay();
+      }
+    }, stableMs);
+    this.replayConfirmTimer.unref?.();
+  }
+
+  private clearReplayConfirmTimer(): void {
+    if (this.replayConfirmTimer) {
+      clearTimeout(this.replayConfirmTimer);
+      this.replayConfirmTimer = null;
+    }
   }
 
   // The replay reached a connection that stayed up — let it go.
   private confirmReplay(): void {
     if (this.replayInFlight.length === 0) return;
     this.replayInFlight = [];
+    // Delivered. If nothing else is waiting, the outage is over.
+    if (this.pendingFrames.length === 0) this.bufferingSince = null;
   }
 
   // The connection died before proving itself. Put the replay back at the FRONT
@@ -800,9 +853,11 @@ export class Client {
   }
 
   private dropPendingFrames(): void {
+    this.clearReplayConfirmTimer();
     this.pendingFrames = [];
     this.replayInFlight = [];
     this.pendingBytes = 0;
+    this.bufferingSince = null;
     this.truncatedTasks.clear();
   }
 

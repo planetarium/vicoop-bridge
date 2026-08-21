@@ -1788,3 +1788,100 @@ test('a replay onto a connection that dies before proving itself is retried, not
     await closeServer(h.server, h.wss);
   }
 });
+test('a confirmed replay is never sent a second time on a later reconnect', async () => {
+  const h = replayHarness();
+  const serverUrl = await listen(h.server);
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => undefined),
+    reconnectDelayMs: 15,
+    reconnectMaxDelayMs: 15,
+    reconnectJitterRatio: 0,
+    reconnectStableMs: 0,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(() => h.received.some((f) => f.type === 'hello'), 'first hello');
+
+    h.sockets[0]!.close(1012, 'restarting');
+    await waitOffline(client);
+    sendOffline(client, {
+      type: 'task.complete',
+      taskId: 't-once',
+      status: { state: 'completed', timestamp: new Date().toISOString() },
+    });
+
+    await waitFor(
+      () => h.received.some((f) => f.taskId === 't-once'),
+      'the replay to be delivered',
+    );
+    assert.equal(h.connections, 2);
+
+    h.sockets[1]!.close(1012, 'restarting');
+    await waitOffline(client);
+    await waitFor(() => h.connections >= 3, 'a third connection');
+    await new Promise((r) => setTimeout(r, 80));
+
+    assert.equal(
+      h.received.filter((f) => f.taskId === 't-once').length,
+      1,
+      'a delivered replay must not be re-sent',
+    );
+  } finally {
+    client.stop();
+    await closeServer(h.server, h.wss);
+  }
+});
+
+test('replay eligibility is judged on the outage, not on each frame\'s own age', async () => {
+  const h = replayHarness();
+  const serverUrl = await listen(h.server);
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => undefined),
+    reconnectDelayMs: 400,
+    reconnectMaxDelayMs: 400,
+    reconnectJitterRatio: 0,
+    maxPendingAgeMs: 100,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(() => h.received.some((f) => f.type === 'hello'), 'first hello');
+    h.sockets[0]!.close(1012, 'restarting');
+    await waitOffline(client);
+
+    await new Promise((r) => setTimeout(r, 250));
+    sendOffline(client, {
+      type: 'task.complete',
+      taskId: 't-late',
+      status: { state: 'completed', timestamp: new Date().toISOString() },
+    });
+
+    await waitFor(() => h.connections >= 2, 'reconnect');
+    await waitFor(
+      () => h.received.some((f) => f.type === 'task.fail' && f.taskId === 't-late'),
+      'the late frame to be failed rather than replayed',
+    );
+
+    assert.deepEqual(
+      h.received.filter((f) => f.taskId === 't-late').map((f) => f.type),
+      ['task.fail'],
+      'output from an over-long outage must never be replayed',
+    );
+  } finally {
+    client.stop();
+    await closeServer(h.server, h.wss);
+  }
+});
