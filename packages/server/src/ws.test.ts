@@ -230,6 +230,69 @@ test('a socket closing during async auth does not leave a zombie registration', 
   }
 });
 
+test('hello timeout remains a server verdict when async auth completes after close', async () => {
+  const server = createServer();
+  const registry = new Registry(60_000);
+  let releaseAuth!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseAuth = resolve;
+  });
+  attachWsServer(server, { db: gatedSql(gate), registry, helloTimeoutMs: 20 });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+  const sink = makeSink();
+
+  try {
+    // Bind before the deliberately delayed registration so the late-auth
+    // reconciliation has a replay-capable task whose fate exposes whether the
+    // server's timeout intent survived the close event.
+    registry.bindTask({
+      agentId: 'agent-1',
+      taskId: 'late-auth-task',
+      contextId: 'late-auth-context',
+      sink,
+      executionId: 'late-auth-execution',
+      nextClientSeq: 0,
+    });
+
+    await once(ws, 'open');
+    ws.send(encodeFrame({
+      type: 'hello',
+      version: PROTOCOL_VERSION,
+      agentId: 'agent-1',
+      token: 'token',
+      protocolCapabilities: [TASK_REPLAY_CAPABILITY],
+      agentCard: {
+        name: 'agent',
+        version: '0.0.0',
+        protocolVersion: '0.3.0',
+      },
+    }));
+
+    const [code, reason] = (await once(ws, 'close')) as [number, Buffer];
+    assert.equal(code, 4001);
+    assert.equal(reason.toString('utf8'), 'hello timeout');
+
+    // registerAgent now briefly installs this already-closed socket, then the
+    // post-auth reconciliation unregisters it without a close code. That must
+    // retain the timeout verdict and fail the task rather than granting the
+    // replay grace period.
+    releaseAuth();
+    await withTimeout(sink.finished, 1_000, 'the late-auth task terminal');
+
+    assert.equal(registry.getAgent('agent-1'), undefined);
+    assert.equal(registry.getBinding('late-auth-task'), undefined);
+    assert.equal(sink.statuses.at(-1)?.status.state, 'failed');
+    assert.deepEqual(sink.statuses.at(-1)?.status.message?.parts, [
+      { text: 'client disconnected mid-task' },
+    ]);
+  } finally {
+    releaseAuth();
+    ws.close();
+    await closeServer(server);
+  }
+});
+
 test('task.status propagates frame metadata onto the top-level TaskStatusUpdateEvent.metadata (liveness heartbeat marker)', async () => {
   const server = createServer();
   const registry = new Registry();

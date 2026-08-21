@@ -63,6 +63,7 @@ async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | nu
 export interface ServerWsOptions {
   db: Sql;
   registry: Registry;
+  helloTimeoutMs?: number;
 }
 
 // Largest WebSocket message the bridge will assemble at all, authenticated or
@@ -271,8 +272,14 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
   };
 
   const helloTimeout = setTimeout(() => {
-    if (!authed) ws.close(4001, 'hello timeout');
-  }, 10_000);
+    if (!authed) {
+      // Authentication may still be awaiting the token lookup. Preserve this
+      // server verdict so the post-auth reconciliation below cannot mistake
+      // its code-less unregister for a graceable network disconnect.
+      opts.registry.noteServerClose(ws);
+      ws.close(4001, 'hello timeout');
+    }
+  }, opts.helloTimeoutMs ?? 10_000);
 
   ws.on('message', (raw) => {
     let frame;
