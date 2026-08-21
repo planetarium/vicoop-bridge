@@ -26,7 +26,7 @@ import { parseX402Pricing } from './x402/pricing.js';
 type TaskUpFrame = Extract<UpFrame, { taskId: string }>;
 type TaskFrameAcceptance =
   | { kind: 'binding'; binding: TaskBinding }
-  | { kind: 'duplicate' };
+  | { kind: 'handled' };
 
 // Diagnostic (issue #414): is this `task.status` frame a tagged liveness
 // heartbeat (non-terminal working status carrying
@@ -359,7 +359,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
     switch (frame.type) {
       case 'task.status': {
         const accepted = acceptTaskFrame(frame);
-        if (!accepted || accepted.kind === 'duplicate') return;
+        if (!accepted || accepted.kind === 'handled') return;
         const { binding: b } = accepted;
         // Diagnostic (issue #414): count liveness-heartbeat beats forwarded for
         // this task (hop 2). A heartbeat is a non-terminal working status tagged
@@ -385,7 +385,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       }
       case 'task.artifact': {
         const accepted = acceptTaskFrame(frame);
-        if (!accepted || accepted.kind === 'duplicate') return;
+        if (!accepted || accepted.kind === 'handled') return;
         const { binding: b } = accepted;
         b.sink.pushArtifact({
           taskId: frame.taskId,
@@ -406,7 +406,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       }
       case 'task.complete': {
         const accepted = acceptTaskFrame(frame);
-        if (accepted?.kind === 'duplicate') return;
+        if (accepted?.kind === 'handled') return;
         const b = accepted?.binding;
         if (!b) {
           // No live binding for this taskId — the terminal frame cannot be
@@ -451,7 +451,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       }
       case 'task.fail': {
         const accepted = acceptTaskFrame(frame);
-        if (accepted?.kind === 'duplicate') return;
+        if (accepted?.kind === 'handled') return;
         const b = accepted?.binding;
         if (!b) {
           logEvent('dropped_terminal_frame', {
@@ -545,20 +545,18 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
   ): TaskFrameAcceptance | undefined {
     const current = opts.registry.getBinding(frame.taskId);
     if (!current) {
-      return acknowledgeReceipt(frame) ? { kind: 'duplicate' } : undefined;
+      return acknowledgeReceipt(frame) ? { kind: 'handled' } : undefined;
     }
     const binding = ownedBinding(frame.taskId);
     // `current` proved the task exists, so undefined here means the ownership
     // guard already rejected and logged a foreign-agent frame. Treat that as
     // fully handled; terminal callers must not add a misleading
     // dropped_terminal_frame event for a binding that was never missing.
-    if (!binding) return { kind: 'duplicate' };
+    if (!binding) return { kind: 'handled' };
 
     if (binding.executionId !== undefined) {
-      if (frame.executionId !== binding.executionId || frame.seq === undefined) {
-        // A stale generation must never affect the current turn. Missing
-        // sequencing on a negotiated binding is likewise unusable, but it is a
-        // connection protocol error rather than a gap in the current run.
+      if (frame.executionId !== binding.executionId) {
+        // A stale generation must never affect the current turn.
         if (!acknowledgeReceipt(frame)) {
           logEvent('execution_id_mismatch', {
             agentId: agentId ?? undefined,
@@ -567,12 +565,30 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
             ownerExecutionId: binding.executionId,
           });
         }
-        return { kind: 'duplicate' };
+        return { kind: 'handled' };
+      }
+      if (frame.seq === undefined) {
+        logEvent('task_frame_sequence_missing', {
+          agentId: binding.agentId,
+          taskId: truncate(binding.taskId, 128),
+          executionId: binding.executionId,
+        });
+        opts.registry.failTaskBinding(
+          binding,
+          'client_frame_sequence_missing',
+          'client frame sequence is required for a replay-capable execution',
+        );
+        opts.registry.sendToAgent(binding.agentId, {
+          type: 'task.cancel',
+          taskId: binding.taskId,
+          executionId: binding.executionId,
+        });
+        return { kind: 'handled' };
       }
       const expected = binding.nextClientSeq ?? 0;
       if (frame.seq < expected) {
         acknowledge(binding);
-        return { kind: 'duplicate' };
+        return { kind: 'handled' };
       }
       if (frame.seq > expected) {
         logEvent('task_frame_gap', {
@@ -592,13 +608,13 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           taskId: binding.taskId,
           executionId: binding.executionId,
         });
-        return undefined;
+        return { kind: 'handled' };
       }
       binding.nextClientSeq = expected + 1;
     } else if (frame.executionId !== undefined || frame.seq !== undefined) {
       // A reliable frame cannot be attached to a legacy binding merely because
       // A2A reused the same taskId.
-      return acknowledgeReceipt(frame) ? { kind: 'duplicate' } : undefined;
+      return acknowledgeReceipt(frame) ? { kind: 'handled' } : undefined;
     }
 
     // Only an accepted, generation-correct, gap-free frame proves that this

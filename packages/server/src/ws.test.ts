@@ -1140,6 +1140,41 @@ test('a sequence gap fails closed without forwarding the suffix', async () => {
   }
 });
 
+test('a replay-capable frame without a sequence fails closed with a distinct error', async () => {
+  const server = createServer();
+  const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+  try {
+    await once(ws, 'open');
+    ws.send(encodeFrame({
+      type: 'hello', version: PROTOCOL_VERSION, agentId: 'agent-1', token: 'token',
+      protocolCapabilities: [TASK_REPLAY_CAPABILITY],
+      agentCard: { name: 'agent', version: '0.0.0', protocolVersion: '0.3.0' },
+    }));
+    await waitForAgent(registry, 'agent-1');
+    const sink = makeSink();
+    registry.bindTask({
+      agentId: 'agent-1', taskId: 'task-no-seq', contextId: 'ctx', sink,
+      executionId: 'execution-no-seq', nextClientSeq: 0,
+    });
+    ws.send(encodeFrame({
+      type: 'task.artifact', taskId: 'task-no-seq', executionId: 'execution-no-seq',
+      artifact: { artifactId: 'a', parts: [{ kind: 'text', text: 'unsequenced' }] },
+    }));
+    await withTimeout(sink.finished, 5_000, 'missing sequence failure');
+    assert.equal(sink.artifacts.length, 0);
+    assert.equal(sink.statuses.at(-1)?.status.state, 'failed');
+    assert.deepEqual(sink.statuses.at(-1)?.status.message?.parts, [
+      { text: 'client frame sequence is required for a replay-capable execution' },
+    ]);
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});
+
 test('a terminal replay from an old execution cannot complete a reused taskId', async () => {
   const server = createServer();
   const registry = new Registry();
