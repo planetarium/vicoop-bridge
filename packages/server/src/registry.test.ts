@@ -1266,6 +1266,17 @@ test('resolveDisconnectGraceMs covers default, env, clamp and rejection', () => 
     ms: FALLBACK_DISCONNECT_GRACE_MS,
     source: 'default',
   });
+  // `Number(' ')` is 0, so without a trim a whitespace-only value would read as
+  // a deliberate kill switch and silently disable recovery.
+  for (const blank of [' ', '\t', '  \n ']) {
+    assert.deepEqual(
+      resolveDisconnectGraceMs(blank),
+      { ms: FALLBACK_DISCONNECT_GRACE_MS, source: 'default' },
+      `blank value ${JSON.stringify(blank)} must not disable the grace`,
+    );
+  }
+  // A surrounding-whitespace value is still the number the operator meant.
+  assert.deepEqual(resolveDisconnectGraceMs(' 45000 '), { ms: 45_000, source: 'env' });
   assert.deepEqual(resolveDisconnectGraceMs('45000'), { ms: 45_000, source: 'env' });
   // 0 is the documented kill switch and must survive as a real 0, not be
   // mistaken for "unset".

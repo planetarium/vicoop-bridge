@@ -121,8 +121,14 @@ export function resolveDisconnectGraceMs(raw: string | undefined): {
   ms: number;
   source: 'default' | 'env' | 'clamped' | 'invalid';
 } {
-  if (raw === undefined || raw === '') return { ms: FALLBACK_DISCONNECT_GRACE_MS, source: 'default' };
-  const n = Number(raw);
+  // Trim first: `Number(' ')` is 0, so a whitespace-only value would otherwise
+  // read as a deliberate `0` and silently disable recovery, when only a literal
+  // `0` is documented as the kill switch.
+  const trimmed = raw?.trim();
+  if (trimmed === undefined || trimmed === '') {
+    return { ms: FALLBACK_DISCONNECT_GRACE_MS, source: 'default' };
+  }
+  const n = Number(trimmed);
   if (!Number.isFinite(n) || n < 0) {
     return { ms: FALLBACK_DISCONNECT_GRACE_MS, source: 'invalid' };
   }

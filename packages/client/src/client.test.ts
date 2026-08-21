@@ -1607,3 +1607,184 @@ test('a single frame larger than the whole budget is refused without evicting th
     await closeServer(server, wss);
   }
 });
+function replayHarness(onConnect?: (ws: WebSocket, n: number) => void) {
+  const received: Array<Record<string, unknown>> = [];
+  const sockets: WebSocket[] = [];
+  let connections = 0;
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  wss.on('connection', (ws) => {
+    connections++;
+    sockets.push(ws);
+    ws.on('message', (raw) => {
+      received.push(JSON.parse(raw.toString('utf8')) as Record<string, unknown>);
+    });
+    onConnect?.(ws, connections);
+  });
+  return {
+    server,
+    wss,
+    received,
+    sockets,
+    get connections() {
+      return connections;
+    },
+  };
+}
+
+function sendOffline(client: Client, frame: Record<string, unknown>): void {
+  (client as never as { send(f: unknown): void }).send.call(client, frame);
+}
+
+async function waitOffline(client: Client): Promise<void> {
+  await waitFor(
+    () => (client as never as { ws?: { readyState: number } }).ws?.readyState !== 1,
+    'socket down',
+  );
+}
+
+test('buffered output older than the replay window is failed, not replayed', async () => {
+  const h = replayHarness();
+  const serverUrl = await listen(h.server);
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => undefined),
+    reconnectDelayMs: 60,
+    reconnectMaxDelayMs: 60,
+    reconnectJitterRatio: 0,
+    maxPendingAgeMs: 1,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(() => h.received.some((f) => f.type === 'hello'), 'first hello');
+    h.sockets[0]!.close(1012, 'restarting');
+    await waitOffline(client);
+
+    sendOffline(client, {
+      type: 'task.complete',
+      taskId: 't-stale',
+      status: { state: 'completed', timestamp: new Date().toISOString() },
+    });
+
+    await waitFor(() => h.connections >= 2, 'reconnect');
+    await waitFor(
+      () => h.received.some((f) => f.type === 'task.fail' && f.taskId === 't-stale'),
+      'the stale entry to be failed instead',
+    );
+
+    assert.deepEqual(
+      h.received.filter((f) => f.taskId === 't-stale').map((f) => f.type),
+      ['task.fail'],
+      'a stale terminal must never be replayed',
+    );
+  } finally {
+    client.stop();
+    await closeServer(h.server, h.wss);
+  }
+});
+
+test('a bridge that rejects pipelined replay (4003) disables it instead of looping', async () => {
+  const captured = makeSink();
+  const h = replayHarness((ws, n) => {
+    if (n === 2) {
+      ws.on('message', (raw) => {
+        const f = JSON.parse(raw.toString('utf8')) as { type?: string };
+        if (f.type !== 'hello') ws.close(4003, 'expected hello');
+      });
+    }
+  });
+  const serverUrl = await listen(h.server);
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => undefined),
+    reconnectDelayMs: 20,
+    reconnectMaxDelayMs: 20,
+    reconnectJitterRatio: 0,
+    logLevel: 'warn',
+    logSink: captured.sink,
+  });
+
+  try {
+    client.start();
+    await waitFor(() => h.received.some((f) => f.type === 'hello'), 'first hello');
+    h.sockets[0]!.close(1012, 'restarting');
+    await waitOffline(client);
+
+    sendOffline(client, {
+      type: 'task.complete',
+      taskId: 't-old-bridge',
+      status: { state: 'completed', timestamp: new Date().toISOString() },
+    });
+
+    await waitFor(
+      () => captured.warn.some((l) => l.includes('predates reconnect replay support')),
+      'the incompatibility warning',
+    );
+
+    await waitFor(() => h.connections >= 3, 'a third connection');
+    await new Promise((r) => setTimeout(r, 150));
+    const settled = h.connections;
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(h.connections, settled, 'the client must stop reconnecting in a loop');
+  } finally {
+    client.stop();
+    await closeServer(h.server, h.wss);
+  }
+});
+
+test('a replay onto a connection that dies before proving itself is retried, not lost', async () => {
+  const h = replayHarness((ws, n) => {
+    if (n === 2) {
+      ws.on('message', (raw) => {
+        const f = JSON.parse(raw.toString('utf8')) as { type?: string };
+        if (f.type === 'hello') setTimeout(() => ws.close(1012, 'restarting'), 5);
+      });
+    }
+  });
+  const serverUrl = await listen(h.server);
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => undefined),
+    reconnectDelayMs: 20,
+    reconnectMaxDelayMs: 20,
+    reconnectJitterRatio: 0,
+    reconnectStableMs: 5_000,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(() => h.received.some((f) => f.type === 'hello'), 'first hello');
+    h.sockets[0]!.close(1012, 'restarting');
+    await waitOffline(client);
+
+    sendOffline(client, {
+      type: 'task.complete',
+      taskId: 't-retry',
+      status: { state: 'completed', timestamp: new Date().toISOString() },
+    });
+
+    await waitFor(() => h.connections >= 3, 'a third connection');
+    await waitFor(
+      () => h.received.filter((f) => f.taskId === 't-retry').length >= 2,
+      'the replay to be retried after the failed attempt',
+    );
+  } finally {
+    client.stop();
+    await closeServer(h.server, h.wss);
+  }
+});

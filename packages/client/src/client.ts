@@ -49,6 +49,8 @@ export interface ClientOptions {
   // Companion byte budget for that buffer, over the encoded frames. Keep at or
   // below the server's pre-auth byte budget; see DEFAULT_MAX_PENDING_BYTES.
   maxPendingBytes?: number;
+  // How long a buffered frame stays replayable; see DEFAULT_MAX_PENDING_AGE_MS.
+  maxPendingAgeMs?: number;
   // Minimum reconnect delay after a 4009 "another client with the same
   // token connected" close — i.e. two daemons authenticated with the
   // same CLIENT_TOKEN colliding at the registry's clientId check. The
@@ -124,6 +126,19 @@ const DEFAULT_MAX_PENDING_FRAMES = 2_000;
 // authentication settles. A client allowed to buffer more than the server will
 // accept pre-auth would be closed mid-replay and reconnect into a loop.
 const DEFAULT_MAX_PENDING_BYTES = 4 * 1024 * 1024;
+// How long a buffered frame is worth replaying. Past the server's own reconnect
+// grace the binding it belonged to is gone, and — because A2A reuses a taskId
+// across turns — a NEW run may already hold that id. Replaying then would inject
+// a dead run's artifacts, or its terminal, into a live one. Anything older than
+// this is dropped and its task failed instead.
+//
+// Kept above the server's default grace (BRIDGE_DISCONNECT_GRACE_MS, 30s) so a
+// recovery the server would still have honored is never discarded here.
+const DEFAULT_MAX_PENDING_AGE_MS = 45_000;
+// Bound on the truncated-task bookkeeping. It is not covered by the frame
+// budgets — one entry per distinct task, retained until reconnect — so a long
+// outage across many tasks could otherwise grow it without limit.
+const MAX_TRUNCATED_TASKS = 10_000;
 const DEFAULT_RECONNECT_STABLE_MS = 60_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
 const DEFAULT_COLLISION_BACKOFF_MS = 300_000;
@@ -165,8 +180,19 @@ export class Client {
   // which is what would have happened anyway.
   // Entries hold the ENCODED frame, not the frame object: it is what replay
   // actually sends, and it is the only honest measure of what the buffer costs.
-  private pendingFrames: Array<{ taskId: string; encoded: string; bytes: number }> = [];
+  private pendingFrames: Array<{ taskId: string; encoded: string; bytes: number; at: number }> = [];
   private pendingBytes = 0;
+  // Entries handed to a socket but not yet known to have been accepted. They
+  // stay here until the connection proves itself, so a replay that dies
+  // mid-flight — an old bridge rejecting it, a second drop — is retried rather
+  // than lost. Kept separate from `pendingFrames` so frames produced after the
+  // flush cannot be sent twice.
+  private replayInFlight: Array<{ taskId: string; encoded: string; bytes: number; at: number }> = [];
+  // Set when a bridge rejects pipelined replay (4003 "expected hello"), i.e. it
+  // predates the pre-auth queueing this depends on. Replaying again would just
+  // loop, so we fall back to the old drop-on-the-floor behavior for the rest of
+  // the process and tell the operator why.
+  private replaySupported = true;
   // Tasks that lost at least one frame to the cap. Their replay would be a
   // hole rather than a delay, so they are failed explicitly instead — a caller
   // is far better served by an honest failure it can retry than by a silently
@@ -198,9 +224,7 @@ export class Client {
     // running to completion after the WS is gone.
     for (const controller of this.inflight.values()) controller.abort();
     // Nothing will replay these — the process is going away.
-    this.pendingFrames = [];
-    this.pendingBytes = 0;
-    this.truncatedTasks.clear();
+    this.dropPendingFrames();
     this.ws?.close();
     // Tear down long-lived backend resources (e.g. codex app-server child).
     // Per-task abort above covers per-handle subprocesses; this hook is for
@@ -437,6 +461,22 @@ export class Client {
       this.logger.info(`disconnected: ${code} ${safeToken(reason.toString())}`);
       if (!current) return;
       this.ws = null;
+      // The connection died without ever proving itself, so anything we
+      // replayed onto it may never have been processed. Put it back.
+      this.requeueReplay();
+      // 4003 "expected hello" means this bridge predates the pre-auth queueing
+      // that pipelined replay depends on — it rejected our frames for arriving
+      // while it was still authenticating. Retrying would loop forever, so drop
+      // back to the pre-buffer behavior and say so loudly: a bridge upgrade is
+      // what restores it.
+      if (code === 4003) {
+        this.replaySupported = false;
+        this.logger.warn(
+          'bridge rejected buffered replay (4003); it predates reconnect replay support — ' +
+            'output produced during a disconnect will be dropped until the bridge is upgraded',
+        );
+        this.dropPendingFrames();
+      }
       // Terminal auth failures the daemon cannot recover from by waiting:
       //
       //   - **4014 "client deleted"** (issue #166). The DB row was just
@@ -468,6 +508,11 @@ export class Client {
         this.stopped = true;
         this.clearReconnectTimer();
         for (const controller of this.inflight.values()) controller.abort();
+        // Nothing will ever replay these — this daemon is not reconnecting. The
+        // host process may keep running (onFatal owns that decision), so
+        // release the buffer rather than hold it for a reconnect that is not
+        // coming.
+        this.dropPendingFrames();
         this.opts.onFatal?.({ code, reason: reason.toString() });
         return;
       }
@@ -561,12 +606,16 @@ export class Client {
     const stableMs = this.opts.reconnectStableMs ?? DEFAULT_RECONNECT_STABLE_MS;
     if (stableMs <= 0) {
       this.reconnectAttempt = 0;
+      this.confirmReplay();
       return;
     }
     this.reconnectResetTimer = setTimeout(() => {
       this.reconnectResetTimer = null;
       if (!this.stopped && this.ws === ws && ws.readyState === WebSocket.OPEN) {
         this.reconnectAttempt = 0;
+        // The same signal that says this connection is real says the replay
+        // landed: a bridge that was going to reject it would have closed by now.
+        this.confirmReplay();
       }
     }, stableMs);
     this.reconnectResetTimer.unref?.();
@@ -639,7 +688,7 @@ export class Client {
       return;
     }
 
-    this.pendingFrames.push({ taskId: frame.taskId, encoded, bytes });
+    this.pendingFrames.push({ taskId: frame.taskId, encoded, bytes, at: Date.now() });
     this.pendingBytes += bytes;
     // Drop the OLDEST first, so what survives is the tail nearest the terminal
     // — but record each victim's task, because a partial replay of a text
@@ -657,6 +706,15 @@ export class Client {
 
   private markTruncated(taskId: string, why: string): void {
     if (this.truncatedTasks.has(taskId)) return;
+    if (this.truncatedTasks.size >= MAX_TRUNCATED_TASKS) {
+      // Degrade to the pre-buffer behavior for further tasks rather than let
+      // the bookkeeping outgrow the buffer it describes: the server's own grace
+      // expiry still fails them, just without our explicit reason.
+      this.logger.warn(
+        `truncated-task list full (${MAX_TRUNCATED_TASKS}); task ${safeToken(taskId)} will be left to the bridge's grace expiry`,
+      );
+      return;
+    }
     this.truncatedTasks.add(taskId);
     this.logger.warn(
       `${why}; task ${safeToken(taskId)} will be failed instead of replayed`,
@@ -671,18 +729,39 @@ export class Client {
   // that arrive while its (async) authentication is still settling and
   // processes them once it completes, so no ack round-trip is needed.
   private flushPendingFrames(ws: WebSocket): void {
-    const queued = this.pendingFrames;
+    if (this.pendingFrames.length === 0 && this.truncatedTasks.size === 0) return;
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (!this.replaySupported) {
+      this.dropPendingFrames();
+      return;
+    }
+
+    // Anything the server would no longer honour is not merely useless to send,
+    // it is dangerous: the binding is gone and a new run may already hold that
+    // taskId. Fail those tasks instead of injecting a dead run's output.
+    const maxAge = this.opts.maxPendingAgeMs ?? DEFAULT_MAX_PENDING_AGE_MS;
+    const cutoff = Date.now() - maxAge;
+    const fresh: typeof this.pendingFrames = [];
+    for (const entry of this.pendingFrames) {
+      if (entry.at < cutoff) {
+        this.markTruncated(entry.taskId, `buffered output is older than ${maxAge}ms`);
+        continue;
+      }
+      fresh.push(entry);
+    }
+
     const truncated = this.truncatedTasks;
     this.pendingFrames = [];
     this.pendingBytes = 0;
     this.truncatedTasks = new Set();
-    if (queued.length === 0 && truncated.size === 0) return;
-    if (ws.readyState !== WebSocket.OPEN) return;
 
     let replayed = 0;
-    for (const entry of queued) {
+    for (const entry of fresh) {
       if (truncated.has(entry.taskId)) continue;
       ws.send(entry.encoded);
+      // Retained, not discarded: if this connection turns out to be unusable
+      // the frames go back on the queue instead of vanishing.
+      this.replayInFlight.push(entry);
       replayed++;
     }
     for (const taskId of truncated) {
@@ -702,6 +781,29 @@ export class Client {
       `replayed ${replayed} buffered frame(s) after reconnect` +
         (truncated.size > 0 ? `; failed ${truncated.size} truncated task(s)` : ''),
     );
+  }
+
+  // The replay reached a connection that stayed up — let it go.
+  private confirmReplay(): void {
+    if (this.replayInFlight.length === 0) return;
+    this.replayInFlight = [];
+  }
+
+  // The connection died before proving itself. Put the replay back at the FRONT
+  // of the queue so ordering against anything produced since is preserved.
+  private requeueReplay(): void {
+    if (this.replayInFlight.length === 0) return;
+    const back = this.replayInFlight;
+    this.replayInFlight = [];
+    this.pendingFrames = [...back, ...this.pendingFrames];
+    this.pendingBytes += back.reduce((n, e) => n + e.bytes, 0);
+  }
+
+  private dropPendingFrames(): void {
+    this.pendingFrames = [];
+    this.replayInFlight = [];
+    this.pendingBytes = 0;
+    this.truncatedTasks.clear();
   }
 
   // Answer a server-initiated usage.request by querying the backend's optional

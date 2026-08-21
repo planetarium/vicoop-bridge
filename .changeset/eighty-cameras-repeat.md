@@ -19,7 +19,14 @@ to receive them. A task that loses frames to the buffer cap fails explicitly
 with `client_buffer_overflow` rather than replaying a partial stream — an honest
 failure the caller can retry beats a silently truncated answer.
 
-The buffer is bounded by both frame count (`maxPendingFrames`, default 2000)
-and encoded size (`maxPendingBytes`, default 4 MiB) — a count alone bounds
-nothing, since the protocol puts no size limit on text, file or data parts.
-Setting either to `0` disables buffering and restores the previous behavior.
+The buffer is bounded by frame count (`maxPendingFrames`, default 2000),
+encoded size (`maxPendingBytes`, default 4 MiB) and age (`maxPendingAgeMs`,
+default 45s). The age bound matters for correctness, not just memory: a taskId
+is reusable across A2A turns, so replaying output the bridge would no longer
+honour could inject a dead run's frames into a live one. Setting any of them to
+`0` disables buffering and restores the previous behavior.
+
+Requires a bridge with reconnect replay support. Against an older bridge the
+replay is rejected (close 4003); the client detects this, logs a warning naming
+the bridge upgrade as the fix, and falls back to the previous behavior instead
+of reconnecting in a loop.

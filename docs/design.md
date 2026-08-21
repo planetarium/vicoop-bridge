@@ -82,11 +82,19 @@ The grace is therefore *how long to wait before declaring a client dead*, not a
 cap on task duration; a long task is governed by
 `BRIDGE_TASK_INACTIVITY_TIMEOUT_MS` as before.
 
-Two closes skip the hold, because they are this server's own verdict rather
-than a transport failure: any app-level close code it issues (`4000`–`4999`)
-and a clean `1000`. Since the code the server *observes* is not always the one
-it *sent* (a peer that never echoes the close frame surfaces as `1006`), the
-intent is recorded when the close is issued and takes precedence.
+Closes that are this server's own verdict rather than a transport failure skip
+the hold: the app-level codes it issues (`4000`–`4999`) and a clean `1000`.
+Since the code the server *observes* is not always the one it *sent* (a peer
+that never echoes the close frame surfaces as `1006`), the intent is recorded
+when the close is issued and takes precedence.
+
+One app-level close is deliberately excepted. `4009` — a second daemon
+authenticating with the same `CLIENT_TOKEN` — is *usually* the same client
+coming back rather than a rival, and the server cannot tell the two apart
+(`readyState` reports only what it has observed, and the client's own heartbeat
+normally detects a dead path first). So a `4009` collision holds like any other
+reconnect and expires as `superseded` if the task is never reclaimed. Operators
+reading a delayed collision failure should expect that delay.
 
 Setting `BRIDGE_DISCONNECT_GRACE_MS=0` disables the hold and restores the
 previous fail-immediately behavior exactly — the rollback lever if holds ever
