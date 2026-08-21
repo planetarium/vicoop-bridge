@@ -180,9 +180,9 @@ test('task.fail preserves backend error code and message on status message metad
   }
 });
 
-test('a socket closing during async auth does not leave a zombie registration', async () => {
+test('a clean close during async auth leaves no zombie registration or replay grace', async () => {
   const server = createServer();
-  const registry = new Registry();
+  const registry = new Registry(60_000);
   let releaseAuth!: () => void;
   const gate = new Promise<void>((resolve) => {
     releaseAuth = resolve;
@@ -190,14 +190,24 @@ test('a socket closing during async auth does not leave a zombie registration', 
   attachWsServer(server, { db: gatedSql(gate), registry });
   const port = await listen(server);
   const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+  const sink = makeSink();
 
   try {
+    registry.bindTask({
+      agentId: 'agent-1',
+      taskId: 'clean-close-task',
+      contextId: 'clean-close-context',
+      sink,
+      executionId: 'clean-close-execution',
+      nextClientSeq: 0,
+    });
     await once(ws, 'open');
     ws.send(encodeFrame({
       type: 'hello',
       version: PROTOCOL_VERSION,
       agentId: 'agent-1',
       token: 'token',
+      protocolCapabilities: [TASK_REPLAY_CAPABILITY],
       agentCard: {
         name: 'agent',
         version: '0.0.0',
@@ -208,7 +218,7 @@ test('a socket closing during async auth does not leave a zombie registration', 
     // Let the server enter authenticateAndRegister and block on the gated
     // token lookup, then close the socket while auth is still in flight.
     await new Promise((resolve) => setTimeout(resolve, 20));
-    ws.close();
+    ws.close(1000, 'client shutdown');
     await once(ws, 'close');
 
     // Wait for the *server-side* close handler to run — it fires shortly after
@@ -220,12 +230,17 @@ test('a socket closing during async auth does not leave a zombie registration', 
     await new Promise((resolve) => setTimeout(resolve, 40));
 
     // Release auth: registerAgent now runs against the already-dead socket.
-    // The post-auth reconciliation must tear that entry back out.
+    // The post-auth reconciliation must tear that entry back out and retain
+    // the observed clean-close policy rather than treating a missing code as a
+    // graceable network failure.
     releaseAuth();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await withTimeout(sink.finished, 1_000, 'the clean-close task terminal');
 
     assert.equal(registry.getAgent('agent-1'), undefined);
+    assert.equal(registry.getBinding('clean-close-task'), undefined);
+    assert.equal(sink.statuses.at(-1)?.status.state, 'failed');
   } finally {
+    releaseAuth();
     await closeServer(server);
   }
 });

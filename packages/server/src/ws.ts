@@ -237,6 +237,10 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
   let agentId: string | null = null;
   let authed = false;
   let helloProcessing = false;
+  // Authentication can finish after the close handler. Preserve the code even
+  // before `agentId` is known so the late-auth reconciliation applies the same
+  // grace policy as an ordinary authenticated disconnect.
+  let observedCloseCode: number | undefined;
 
   // Resolve the binding a task frame targets, but only if this connection's
   // authenticated agent is the one that owns it. `getBinding` keys on taskId
@@ -324,7 +328,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         // (no-ops unless the stored ws is this one), so racing a later close
         // event is safe. (#364)
         if (ws.readyState !== ws.OPEN) {
-          opts.registry.unregisterAgent(frame.agentId, ws);
+          opts.registry.unregisterAgent(frame.agentId, ws, observedCloseCode);
           return;
         }
         agentId = frame.agentId;
@@ -632,6 +636,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
 
   ws.on('close', (code: number, reason: Buffer) => {
     clearTimeout(helloTimeout);
+    observedCloseCode = code;
     if (agentId) {
       // Look up the live connection BEFORE unregistering so the disconnect log
       // carries the same identifying detail as client_connected.
