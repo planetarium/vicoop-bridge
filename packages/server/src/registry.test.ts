@@ -2,21 +2,34 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
 import { OPENAI_COMPAT_EXTENSION_URI, type AgentCard } from '@vicoop-bridge/protocol';
-import { Registry } from './registry.js';
+import { Registry, type TaskBinding } from './registry.js';
 
 // Mirrors the `ws` library's ReadyState constants; the stubs below are typed as
 // WebSocket, so these have to agree with the real values.
 const WS_OPEN = 1;
+const WS_CLOSING = 2;
 const WS_CLOSED = 3;
 
 // Minimal WebSocket stub — Registry uses `.close()` on replacement, equality
 // (`existing.ws !== ws`) on unregister, and `readyState` to tell a live
 // duplicate-token collision from a client that is merely reconnecting after its
 // socket already died (issue #474). Defaults to OPEN, which is what every
-// pre-#474 test implicitly assumed. Nothing else on the real ws interface is
-// exercised here.
+// pre-#474 test implicitly assumed.
+//
+// `close()` MUST move readyState to CLOSING, because the real `ws` library does
+// so synchronously inside close() — and a stub that froze readyState instead
+// would let `registry.ts` read it *after* closing the socket and still appear
+// to work, certifying a branch that real sockets can never take. That is not
+// hypothetical: it is exactly the bug this stub previously hid.
 function makeWs(readyState: number = WS_OPEN): WebSocket {
-  return { close: () => undefined, readyState, OPEN: WS_OPEN } as unknown as WebSocket;
+  const ws = {
+    readyState,
+    OPEN: WS_OPEN,
+    close: () => {
+      ws.readyState = WS_CLOSING;
+    },
+  };
+  return ws as unknown as WebSocket;
 }
 
 interface RecordingWs extends WebSocket {
@@ -31,8 +44,10 @@ function makeRecordingWs(): RecordingWs {
     OPEN: WS_OPEN,
     close(code: number, reason: string) {
       closeArgs.push({ code, reason });
+      // Same fidelity requirement as makeWs().
+      ws.readyState = WS_CLOSING;
     },
-  } as unknown as RecordingWs;
+  } as unknown as RecordingWs & { readyState: number };
   return ws;
 }
 
@@ -856,4 +871,210 @@ test('with the grace disabled, the reconnect race keeps its original superseded 
   assert.equal(registry.getBinding('t-nograce-race'), undefined);
   assert.equal(task.state.finished, true);
   assert.match(terminalText(task), /superseded/);
+});
+
+// ---------------------------------------------------------------------------
+// Guard coverage.
+//
+// The three `clearGraceHold` call sites and the "don't slide the deadline" skip
+// are individually invisible to a test that only checks the binding right after
+// the event: the timer's own identity guard independently suppresses a stale
+// fire, so deleting either half of that pair changes nothing observable at that
+// moment. What DOES expose a missing clear is the *next* hold for the same
+// taskId — `holdBindingsForAgent` skips a taskId that already has an entry, so
+// a hold left behind by a finished binding silently denies its successor a
+// hold, and that successor then never expires. Each test below drives exactly
+// that sequence through one of the clear sites.
+//
+// Not covered, deliberately: the identity guards inside `resumeBinding` and the
+// expiry timer. With every clear site intact, `graceHolds` can only ever hold
+// an entry for the binding currently occupying that taskId, so those guards are
+// unreachable defense-in-depth against a future missing clear — no behavioral
+// test can distinguish them. They are kept precisely because the tests here
+// cannot speak for them.
+// ---------------------------------------------------------------------------
+
+// Re-hold a taskId after its previous binding is gone, and prove the new
+// binding still gets a working hold of its own (i.e. that the old one's entry
+// was cleared). `settle` performs whatever terminated the previous binding.
+async function assertSuccessorIsHeld(
+  registry: Registry,
+  settle: (binding: TaskBinding) => void,
+  taskId: string,
+): Promise<void> {
+  const ws1 = makeWs();
+  registerFor(registry, ws1);
+  bindCapturing(registry, 'a1', taskId);
+  const first = registry.getBinding(taskId);
+  assert.ok(first);
+
+  registry.unregisterAgent('a1', ws1, 1012); // first binding is now held
+  settle(first);
+
+  // A new run claims the same taskId, then its client drops too.
+  const successor = bindCapturing(registry, 'a1', taskId);
+  const ws2 = makeWs();
+  registerFor(registry, ws2);
+  registry.unregisterAgent('a1', ws2, 1012);
+
+  await sleep(80);
+
+  // The successor must have been held and then expired. A stale entry from the
+  // first binding would have made `holdBindingsForAgent` skip it, leaving it
+  // bound and unfinished forever.
+  assert.equal(successor.state.finished, true, 'successor was never held, so it never expired');
+  assert.equal(registry.getBinding(taskId), undefined);
+  assert.match(terminalText(successor), /disconnected mid-task/);
+}
+
+test('unbindTask clears the hold, so the next binding for that taskId can be held', async () => {
+  const registry = new Registry(20);
+  await assertSuccessorIsHeld(
+    registry,
+    (binding) => registry.unbindTask(binding.taskId, binding),
+    't-clear-unbind',
+  );
+});
+
+test('a displacing bindTask clears the hold, so the displacing binding can be held', async () => {
+  const registry = new Registry(20);
+  // bindCapturing inside the helper is what displaces the held binding here.
+  await assertSuccessorIsHeld(registry, () => undefined, 't-clear-rebind');
+});
+
+test('failBindingsForAgent clears the hold, so the next binding for that taskId can be held', async () => {
+  const registry = new Registry(20);
+  await assertSuccessorIsHeld(
+    registry,
+    () => {
+      // Reconnect and take an app-level close: fails the held binding outright.
+      const ws = makeWs();
+      registerFor(registry, ws);
+      registry.unregisterAgent('a1', ws, 4009);
+    },
+    't-clear-fail',
+  );
+});
+
+test('a second disconnect leaves no extra expiry timer behind', async () => {
+  // `holdBindingsForAgent` skips a taskId that already has a hold rather than
+  // arming a second timer for it. Overwriting instead would look harmless — the
+  // newer timer replaces the map entry — but the ORIGINAL timer stays pending
+  // and unreferenced, and `resumeBinding` can only cancel the one it can see.
+  // The orphan then fires on the old deadline and fails a task that was already
+  // resumed and is happily running.
+  const registry = new Registry(60);
+  const ws1 = makeWs();
+  registerFor(registry, ws1);
+  const task = bindCapturing(registry, 'a1', 't-one-timer');
+
+  registry.unregisterAgent('a1', ws1, 1012);
+
+  // A second drop, comfortably inside the first hold's window.
+  await sleep(20);
+  const ws2 = makeWs();
+  registerFor(registry, ws2);
+  registry.unregisterAgent('a1', ws2, 1012);
+
+  // The client comes back for good and resumes the task.
+  registry.resumeBinding('t-one-timer', 'a1');
+
+  // Past the first hold's deadline. Nothing may fire.
+  await sleep(100);
+
+  assert.equal(task.state.finished, false, 'an orphaned expiry timer failed a resumed task');
+  assert.ok(registry.getBinding('t-one-timer'));
+});
+
+test('a foreign agent resuming a hold does not stop it from expiring', async () => {
+  // The agentId check in resumeBinding is the whole of its authorization. Held
+  // bindings stay in the map either way, so asserting presence proves nothing —
+  // only expiry does.
+  const registry = new Registry(20);
+  const ws = makeWs();
+  registerFor(registry, ws, 'a1', 'c1');
+  const task = bindCapturing(registry, 'a1', 't-foreign');
+
+  registry.unregisterAgent('a1', ws, 1012);
+  registry.resumeBinding('t-foreign', 'other-agent');
+
+  await sleep(80);
+
+  assert.equal(task.state.finished, true, 'a foreign agent cancelled the hold');
+  assert.equal(registry.getBinding('t-foreign'), undefined);
+});
+
+test('the owning agent resuming a hold does stop it from expiring', async () => {
+  // Companion to the above: same shape, correct agentId, opposite outcome — so
+  // the pair pins the check rather than just the expiry.
+  const registry = new Registry(20);
+  const ws = makeWs();
+  registerFor(registry, ws, 'a1', 'c1');
+  const task = bindCapturing(registry, 'a1', 't-owner');
+
+  registry.unregisterAgent('a1', ws, 1012);
+  registry.resumeBinding('t-owner', 'a1');
+
+  await sleep(80);
+
+  assert.equal(task.state.finished, false);
+  assert.ok(registry.getBinding('t-owner'));
+});
+
+test('a close code the bridge itself sent is terminal even when it comes back as 1006', () => {
+  // `disconnectClient` closes with 4014, but the code we OBSERVE is whatever
+  // our socket ends up with: a peer that never echoes the close frame leaves
+  // `ws` to time out and report 1006, which is graceable. The deleted client's
+  // tasks must still die immediately.
+  const registry = new Registry(10_000);
+  const ws = makeWs();
+  registerFor(registry, ws, 'a1', 'c1');
+  const task = bindCapturing(registry, 'a1', 't-deleted');
+
+  assert.equal(registry.disconnectClient('c1'), 1);
+  registry.unregisterAgent('a1', ws, 1006); // peer never acked; ws reports 1006
+
+  assert.equal(registry.getBinding('t-deleted'), undefined, 'a deleted client must not be graced');
+  assert.equal(task.state.finished, true);
+});
+
+test('close-code classification at the app-level boundaries', () => {
+  // 4000-4999 is the bridge's own range; 5000 and up is not ours and is treated
+  // like any other unexpected close.
+  const cases: Array<[number, boolean]> = [
+    [4000, false],
+    [4999, false],
+    [5000, true],
+    [3999, true],
+    [1001, true],
+    [1005, true],
+  ];
+  for (const [code, expectHold] of cases) {
+    const registry = new Registry(10_000);
+    const ws = makeWs();
+    registerFor(registry, ws);
+    bindCapturing(registry, 'a1', `t-code-${code}`);
+    registry.unregisterAgent('a1', ws, code);
+    assert.equal(
+      registry.getBinding(`t-code-${code}`) !== undefined,
+      expectHold,
+      `close code ${code} should ${expectHold ? 'hold' : 'fail immediately'}`,
+    );
+  }
+});
+
+test('unregisterAgent with no close code holds (the #364 reconcile path)', () => {
+  // ws.ts reconciles a socket that died during async auth by calling
+  // unregisterAgent with no code. Absence of a code is not evidence the client
+  // is gone for good, so it is graceable — and in that path there are no
+  // bindings anyway, since registration never completed.
+  const registry = new Registry(10_000);
+  const ws = makeWs();
+  registerFor(registry, ws);
+  const task = bindCapturing(registry, 'a1', 't-nocode');
+
+  registry.unregisterAgent('a1', ws);
+
+  assert.ok(registry.getBinding('t-nocode'));
+  assert.equal(task.state.finished, false);
 });

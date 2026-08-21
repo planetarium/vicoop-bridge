@@ -11,6 +11,7 @@ import {
   PROTOCOL_VERSION,
 } from '@vicoop-bridge/protocol';
 import { Registry, type TaskSink } from './registry.js';
+import { hashToken } from './token.js';
 import { attachWsServer } from './ws.js';
 import type { Sql } from './db.js';
 
@@ -669,6 +670,245 @@ test('an app-level close code fails in-flight tasks immediately, with no grace h
     assert.equal(registry.getBinding('task-2'), undefined);
   } finally {
     ws.close();
+    await closeServer(server);
+  }
+});
+
+const wsSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// Two distinct agents, each with its own token — needed to prove that one
+// agent cannot act on another's task.
+function twoAgentSql(): Sql {
+  const rows: Record<string, unknown> = {
+    [hashToken('token-1')]: {
+      id: 'agent-1',
+      client_id: 'client-1',
+      owner_principal: 'eth:0x1',
+      owner_email: null,
+      allowed_callers: [],
+    },
+    [hashToken('token-2')]: {
+      id: 'agent-2',
+      client_id: 'client-2',
+      owner_principal: 'eth:0x2',
+      owner_email: null,
+      allowed_callers: [],
+    },
+  };
+  const fn = async (_strings: TemplateStringsArray, hash: string) => {
+    const row = rows[hash];
+    return row ? [row] : [];
+  };
+  return fn as unknown as Sql;
+}
+
+function helloFrameFor(agentId: string, token: string): string {
+  return encodeFrame({
+    type: 'hello',
+    version: PROTOCOL_VERSION,
+    agentId,
+    token,
+    agentCard: { name: agentId, version: '0.0.0', protocolVersion: '0.3.0' },
+  });
+}
+
+test('a heartbeat on the reconnected socket keeps a task alive past the original grace deadline', async () => {
+  // The reason resume exists at all. Without it the hold would expire on its
+  // original deadline no matter how obviously alive the client is, which would
+  // cap every task at the grace window rather than merely deciding how long to
+  // wait for a client that may be dead. A short grace here stands in for a task
+  // that outruns whatever the deadline happens to be.
+  const server = createServer();
+  const registry = new Registry(60);
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const first = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+  let second: WebSocket | undefined;
+
+  try {
+    await once(first, 'open');
+    first.send(helloFrame());
+    await waitForAgent(registry, 'agent-1');
+
+    const sink = makeSink();
+    registry.bindTask({ agentId: 'agent-1', taskId: 'task-3', contextId: 'ctx-3', sink });
+
+    registry.getAgent('agent-1')!.ws.close(1012, 'restarting');
+    await waitForAgentGone(registry, 'agent-1');
+
+    second = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+    await once(second, 'open');
+    second.send(helloFrame());
+    await waitForAgent(registry, 'agent-1');
+
+    // One beat, well inside the window — this is what must cancel the hold.
+    second.send(encodeFrame({
+      type: 'task.status',
+      taskId: 'task-3',
+      status: { state: 'working', timestamp: new Date().toISOString() },
+      metadata: { [OPENAI_COMPAT_EXTENSION_URI]: { heartbeat: true } },
+    }));
+
+    // Now work well past the original deadline before answering.
+    await wsSleep(150);
+    assert.ok(registry.getBinding('task-3'), 'the resumed task expired anyway');
+
+    second.send(encodeFrame({
+      type: 'task.complete',
+      taskId: 'task-3',
+      status: {
+        state: 'completed',
+        timestamp: new Date().toISOString(),
+        message: { role: 'agent', messageId: 'm-3', parts: [{ kind: 'text', text: 'late answer' }] },
+      },
+    }));
+
+    await sink.finished;
+
+    const terminal = sink.statuses.at(-1)!;
+    assert.equal(terminal.status.state, 'completed');
+    assert.deepEqual(terminal.status.message?.parts, [{ kind: 'text', text: 'late answer' }]);
+  } finally {
+    first.close();
+    second?.close();
+    await closeServer(server);
+  }
+});
+
+test('an agent cannot push frames into another agent\'s task', async () => {
+  // `getBinding` keys on taskId alone, so the handlers must check ownership
+  // themselves. The grace hold makes this load-bearing: a held binding stays
+  // resolvable for the whole window while its owner is offline and cannot
+  // contradict a forged terminal written in its name.
+  const server = createServer();
+  const registry = new Registry(10_000);
+  attachWsServer(server, { db: twoAgentSql(), registry });
+  const port = await listen(server);
+  const victim = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+  // Connect one at a time. Opening both up front and awaiting them in sequence
+  // deadlocks: the second socket fires 'open' while we are awaiting the first,
+  // and `once()` then waits forever for a second 'open' that never comes.
+  let attacker: WebSocket | undefined;
+
+  try {
+    await once(victim, 'open');
+    victim.send(helloFrameFor('agent-1', 'token-1'));
+    await waitForAgent(registry, 'agent-1');
+
+    attacker = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+    await once(attacker, 'open');
+    attacker.send(helloFrameFor('agent-2', 'token-2'));
+    await waitForAgent(registry, 'agent-2');
+
+    const sink = makeSink();
+    registry.bindTask({ agentId: 'agent-1', taskId: 'victim-task', contextId: 'ctx-v', sink });
+
+    // The victim drops mid-task; its binding is now held and still resolvable.
+    registry.getAgent('agent-1')!.ws.close(1012, 'restarting');
+    await waitForAgentGone(registry, 'agent-1');
+
+    // agent-2 forges a terminal — and reported usage — for agent-1's task.
+    attacker.send(encodeFrame({
+      type: 'task.complete',
+      taskId: 'victim-task',
+      usage: { promptTokens: 999_999, completionTokens: 999_999 },
+      status: {
+        state: 'completed',
+        timestamp: new Date().toISOString(),
+        message: { role: 'agent', messageId: 'm-x', parts: [{ kind: 'text', text: 'forged' }] },
+      },
+    }));
+    attacker.send(encodeFrame({
+      type: 'task.fail',
+      taskId: 'victim-task',
+      error: { code: 'forged', message: 'forged' },
+    }));
+
+    // Give both frames time to be processed and rejected.
+    await wsSleep(60);
+
+    assert.deepEqual(sink.statuses, [], 'a foreign agent wrote into the victim task');
+    assert.deepEqual(sink.artifacts, []);
+    assert.ok(registry.getBinding('victim-task'), 'the victim task must still be held');
+
+    // The rightful owner comes back and completes it normally.
+    const recovered = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+    try {
+      await once(recovered, 'open');
+      recovered.send(helloFrameFor('agent-1', 'token-1'));
+      await waitForAgent(registry, 'agent-1');
+      recovered.send(encodeFrame({
+        type: 'task.complete',
+        taskId: 'victim-task',
+        status: {
+          state: 'completed',
+          timestamp: new Date().toISOString(),
+          message: { role: 'agent', messageId: 'm-ok', parts: [{ kind: 'text', text: 'real answer' }] },
+        },
+      }));
+      await sink.finished;
+      // Re-read through the typed alias: the `deepEqual(…, [])` above narrows
+      // `sink.statuses` to never[] for the rest of this block.
+      const delivered: TaskStatusUpdateEvent[] = sink.statuses;
+      const terminal = delivered.at(-1)!;
+      assert.equal(terminal.status.state, 'completed');
+      assert.deepEqual(terminal.status.message?.parts, [{ kind: 'text', text: 'real answer' }]);
+    } finally {
+      recovered.close();
+    }
+  } finally {
+    victim.close();
+    attacker?.close();
+    await closeServer(server);
+  }
+});
+
+test('a live duplicate-token collision supersedes immediately, against real sockets', async () => {
+  // This one deliberately uses real WebSockets rather than the registry stub.
+  // The branch it covers reads `readyState` around a `close()` call, and `ws`
+  // mutates readyState synchronously inside close() — a hand-rolled stub can
+  // model that wrongly and certify a branch production never takes, which is
+  // exactly what happened before this test existed.
+  const server = createServer();
+  const registry = new Registry(10_000);
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const first = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+  // Connect one at a time; see the note in the ownership test above.
+  let second: WebSocket | undefined;
+
+  try {
+    await once(first, 'open');
+    first.send(helloFrame());
+    await waitForAgent(registry, 'agent-1');
+    const firstConn = registry.getAgent('agent-1');
+
+    const sink = makeSink();
+    registry.bindTask({ agentId: 'agent-1', taskId: 'task-4', contextId: 'ctx-4', sink });
+
+    // A second live daemon with the same token registers while the first is
+    // still connected — a genuine collision, not a recovered drop.
+    second = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+    await once(second, 'open');
+    second.send(helloFrameFor('agent-1', 'token'));
+    const deadline = Date.now() + 1_000;
+    while (registry.getAgent('agent-1') === firstConn) {
+      assert.ok(Date.now() < deadline, 'timed out waiting for the collision swap');
+      await wsSleep(5);
+    }
+
+    await sink.finished;
+
+    const terminal = sink.statuses.at(-1)!;
+    assert.equal(terminal.final, true);
+    assert.equal(terminal.status.state, 'failed');
+    assert.deepEqual(terminal.status.message?.parts, [
+      { text: 'superseded by a reconnect from the same client token' },
+    ]);
+    assert.equal(registry.getBinding('task-4'), undefined, 'a live collision must not be graced');
+  } finally {
+    first.close();
+    second?.close();
     await closeServer(server);
   }
 });

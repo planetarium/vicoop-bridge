@@ -101,7 +101,12 @@ export type AgentChangeListener = (agentId: string) => void;
 const DEFAULT_DISCONNECT_GRACE_MS = (() => {
   const raw = process.env.BRIDGE_DISCONNECT_GRACE_MS;
   const n = raw ? Number(raw) : Number.NaN;
-  return Number.isFinite(n) && n >= 0 ? n : 30_000;
+  if (!Number.isFinite(n) || n < 0) return 30_000;
+  // Node's setTimeout silently clamps anything past the signed-32-bit ceiling
+  // to 1ms, so an operator who typed a very large number to mean "hold a long
+  // time" would get the opposite — holds that expire immediately. Cap instead,
+  // so the value can only ever mean what it says.
+  return Math.min(n, 2_147_483_647);
 })();
 
 /**
@@ -122,8 +127,12 @@ const DEFAULT_DISCONNECT_GRACE_MS = (() => {
  *   - 1000: a clean, intentional close. Nothing to wait for.
  *
  * Everything else — abnormal closure, proxy restart, no code at all — gets the
- * hold. This also makes `disconnectClient()`'s 4014 and the 4009 duplicate-token
- * close fail fast for free, with no special-casing.
+ * hold.
+ *
+ * This test alone is not sufficient for closes WE initiate, because the code we
+ * observe is the one our socket ends up with, not the one we sent: a peer that
+ * never echoes the close frame leaves `ws` to time out and report `1006`. The
+ * `serverClosed` WeakSet carries that intent separately; see its declaration.
  */
 function isGraceableCloseCode(code: number | undefined): boolean {
   if (code === undefined) return true;
@@ -163,6 +172,18 @@ export class Registry {
   // `bindings` and still fully serviceable; the entry only means "if nothing
   // arrives for this task before the timer fires, declare the client dead".
   private graceHolds = new Map<string, GraceHold>();
+  // Sockets this server closed with a terminal verdict of its own. The close
+  // CODE we later observe is not trustworthy for that decision: when we send
+  // `close(4014)` and the peer never echoes the close frame — dead TCP, wedged
+  // process, or a client that simply declines to — `ws` gives up after its
+  // close timeout and emits the default `1006`, which is graceable. Without
+  // this the deny-list would be advisory: a client could earn itself a grace
+  // hold just by refusing to acknowledge being kicked. Recording the intent at
+  // the moment we form it is the only reliable signal.
+  //
+  // A WeakSet so a socket that never reaches unregisterAgent (identity-guard
+  // no-op, connection dropped before registration) cannot pin an entry.
+  private serverClosed = new WeakSet<WebSocket>();
   private callerChangeListeners: CallerChangeListener[] = [];
   private agentChangeListeners: AgentChangeListener[] = [];
 
@@ -186,6 +207,13 @@ export class Registry {
           clientId: conn.clientId,
           previousConnectedAt: existing.connectedAt,
         });
+        // Read the liveness of the displaced socket BEFORE closing it. `ws`
+        // sets `_readyState = CLOSING` synchronously inside `close()`, so
+        // asking afterwards would report not-OPEN unconditionally and collapse
+        // the two cases below into one — the fail-fast branch would be
+        // unreachable in production while still passing against a stub whose
+        // `close()` leaves readyState alone.
+        const displacedWasLive = existing.ws.readyState === existing.ws.OPEN;
         // The close `reason` is what the client surfaces in its disconnect
         // log line. Spelling out the cause here means an operator reading
         // the foreground log can recognize the duplicate-token scenario
@@ -206,13 +234,13 @@ export class Registry {
         // reach the same verdict, otherwise the fix works only when the events
         // happen to arrive in the lucky order.
         //
-        // A NOT-OPEN old socket means the transport is already gone and this
-        // hello is the same client coming back: hold, exactly as the disconnect
-        // path would. There is no close code to consult (the close event hasn't
-        // been delivered yet), but a socket that died without one of our own
-        // 4xxx closes is by definition in the graceable category.
+        // An already-dead old socket means the transport is gone and this hello
+        // is the same client coming back: hold, exactly as the disconnect path
+        // would. There is no close code to consult (the close event hasn't been
+        // delivered yet), but a socket that died without one of our own 4xxx
+        // closes is by definition in the graceable category.
         //
-        // A still-OPEN old socket is the genuine collision this path was written
+        // A still-live old socket is the genuine collision this path was written
         // for: two live daemons sharing a CLIENT_TOKEN. That is not a recovered
         // drop and there is nothing to wait for, so it keeps failing instantly.
         const supersededError = {
@@ -220,7 +248,7 @@ export class Registry {
           message: 'superseded by a reconnect from the same client token',
           messageIdSuffix: 'superseded',
         };
-        if (existing.ws.readyState === existing.ws.OPEN) {
+        if (displacedWasLive) {
           this.failBindingsForAgent(conn.agentId, supersededError);
         } else {
           this.holdBindingsForAgent(conn.agentId, undefined, 'reconnect', supersededError);
@@ -265,6 +293,9 @@ export class Registry {
     let closed = 0;
     for (const conn of this.agents.values()) {
       if (conn.clientId !== clientId) continue;
+      // The owner deleted this client; its tasks are dead whatever close code
+      // comes back to us. See `serverClosed`.
+      this.serverClosed.add(conn.ws);
       conn.ws.close(4014, 'client deleted');
       closed++;
     }
@@ -282,7 +313,7 @@ export class Registry {
     if (!existing || existing.ws !== ws) return;
     this.agents.delete(agentId);
     this.notifyAgentChange(agentId);
-    if (isGraceableCloseCode(closeCode)) {
+    if (isGraceableCloseCode(closeCode) && !this.serverClosed.has(ws)) {
       // holdBindingsForAgent handles a disabled grace itself, falling back to
       // the same immediate failure, so there is one decision point rather than
       // two conditions that could drift apart.

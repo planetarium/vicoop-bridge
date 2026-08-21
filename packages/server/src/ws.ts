@@ -10,7 +10,7 @@ import {
 } from '@vicoop-bridge/protocol';
 import type { Message, TaskStatus } from '@a2x/sdk';
 import { TaskState } from '@a2x/sdk';
-import type { Registry } from './registry.js';
+import type { Registry, TaskBinding } from './registry.js';
 import type { Sql } from './db.js';
 import { hashToken } from './token.js';
 import { logEvent, truncate } from './log.js';
@@ -215,6 +215,32 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
   let authed = false;
   let helloProcessing = false;
 
+  // Resolve the binding a task frame targets, but only if this connection's
+  // authenticated agent is the one that owns it. `getBinding` keys on taskId
+  // alone, so without this check any authenticated client that learned another
+  // agent's taskId could push status, artifacts, reported `usage`, or a forged
+  // terminal into that agent's caller's stream.
+  //
+  // The reconnect grace hold (issue #474) is what makes the check load-bearing.
+  // Before it, a binding vanished the instant its agent dropped; now it stays
+  // resolvable for the whole grace window while its owner is offline and in no
+  // position to contradict anything written in its name. Closing the gap here
+  // rather than in the registry keeps `getBinding` a pure lookup and puts the
+  // authorization next to the authenticated identity it is checked against.
+  const ownedBinding = (taskId: string): TaskBinding | undefined => {
+    const b = opts.registry.getBinding(taskId);
+    if (!b) return undefined;
+    if (b.agentId !== agentId) {
+      logEvent('binding_owner_mismatch', {
+        agentId: agentId ?? undefined,
+        taskId,
+        ownerAgentId: b.agentId,
+      });
+      return undefined;
+    }
+    return b;
+  };
+
   const helloTimeout = setTimeout(() => {
     if (!authed) ws.close(4001, 'hello timeout');
   }, 10_000);
@@ -296,7 +322,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
 
     switch (frame.type) {
       case 'task.status': {
-        const b = opts.registry.getBinding(frame.taskId);
+        const b = ownedBinding(frame.taskId);
         if (!b) return;
         // Diagnostic (issue #414): count liveness-heartbeat beats forwarded for
         // this task (hop 2). A heartbeat is a non-terminal working status tagged
@@ -320,7 +346,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         break;
       }
       case 'task.artifact': {
-        const b = opts.registry.getBinding(frame.taskId);
+        const b = ownedBinding(frame.taskId);
         if (!b) return;
         b.sink.pushArtifact({
           taskId: frame.taskId,
@@ -339,7 +365,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         break;
       }
       case 'task.complete': {
-        const b = opts.registry.getBinding(frame.taskId);
+        const b = ownedBinding(frame.taskId);
         if (!b) {
           // No live binding for this taskId — the terminal frame cannot be
           // delivered and the corresponding stream (if any) will not close via
@@ -378,7 +404,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         break;
       }
       case 'task.fail': {
-        const b = opts.registry.getBinding(frame.taskId);
+        const b = ownedBinding(frame.taskId);
         if (!b) {
           logEvent('dropped_terminal_frame', {
             agentId: agentId ?? undefined,
