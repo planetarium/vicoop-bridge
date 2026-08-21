@@ -1459,6 +1459,90 @@ test('an unacknowledged frame is replayed with the same execution ID and sequenc
   }
 });
 
+test('replay replaces a frame above the newly negotiated size limit with a failure', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  const replayed: UpFrame[] = [];
+  let connections = 0;
+  let backendAborted = false;
+  wss.on('connection', (ws) => {
+    const connection = ++connections;
+    ws.on('message', (raw) => {
+      const frame = parseUpFrame(raw.toString('utf8'));
+      if (frame.type === 'hello') {
+        ws.send(encodeFrame({
+          type: 'hello.ack',
+          protocolCapabilities: [TASK_REPLAY_CAPABILITY],
+          disconnectGraceMs: 30_000,
+          maxFrameBytes: connection === 1 ? 16 * 1024 * 1024 : 512,
+        }));
+        if (connection === 1) {
+          ws.send(encodeFrame({
+            ...makeAssign('t-smaller-limit'), executionId: 'execution-smaller-limit',
+          }));
+        }
+        return;
+      }
+      if (connection === 1 && frame.type === 'task.artifact') {
+        ws.close(1012, 'reconnect with a smaller frame limit');
+      } else if (connection === 2) {
+        replayed.push(frame);
+      }
+    });
+  });
+  const client = new Client({
+    serverUrl,
+    token: 'token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('echo', async (task, emit, signal) => {
+      emit({
+        type: 'task.artifact', taskId: task.taskId,
+        artifact: { artifactId: 'large', parts: [{ kind: 'text', text: 'x'.repeat(2_000) }] },
+      });
+      await new Promise<void>((resolve) => {
+        signal.addEventListener('abort', () => {
+          backendAborted = true;
+          resolve();
+        }, { once: true });
+      });
+    }),
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    heartbeatIntervalMs: 0,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(
+      () => replayed.some((frame) => frame.type === 'task.fail'),
+      'bounded replay failure',
+    );
+    assert.equal(backendAborted, true);
+    assert.equal(
+      replayed.some((frame) => frame.type === 'task.artifact'),
+      false,
+      'the oversized retained artifact must not be replayed',
+    );
+    assert.deepEqual(replayed.find((frame) => frame.type === 'task.fail'), {
+      type: 'task.fail',
+      taskId: 't-smaller-limit',
+      executionId: 'execution-smaller-limit',
+      seq: 0,
+      error: {
+        code: 'client_buffer_overflow',
+        message: 'retained client frame exceeds the negotiated server limit',
+      },
+    });
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
 test('an unacknowledged frame expires even while the socket stays open', async () => {
   const server = createServer();
   const wss = new WebSocketServer({ server, path: '/connect' });

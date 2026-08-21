@@ -822,12 +822,13 @@ function helloFrameFor(agentId: string, token: string): string {
   });
 }
 
-test('a heartbeat on the reconnected socket keeps a task alive past the original grace deadline', async () => {
+test('a duplicate replay on the reconnected socket keeps a task alive past grace', async () => {
   // The reason resume exists at all. Without it the hold would expire on its
   // original deadline no matter how obviously alive the client is, which would
   // cap every task at the grace window rather than merely deciding how long to
-  // wait for a client that may be dead. A short grace here stands in for a task
-  // that outruns whatever the deadline happens to be.
+  // wait for a client that may be dead. An ack can be lost after the server
+  // accepts a frame, so the first replay on the new socket may be a duplicate;
+  // that still proves the execution recovered and must cancel the hold.
   const server = createServer();
   const registry = new Registry(60);
   attachWsServer(server, { db: mockSql(), registry });
@@ -843,7 +844,9 @@ test('a heartbeat on the reconnected socket keeps a task alive past the original
     const sink = makeSink();
     registry.bindTask({
       agentId: 'agent-1', taskId: 'task-3', contextId: 'ctx-3', sink,
-      executionId: 'execution-3', nextClientSeq: 0,
+      // Model seq=0 as already accepted on the lost socket, with only its ack
+      // lost. The reconnect therefore replays seq=0 while the server expects 1.
+      executionId: 'execution-3', nextClientSeq: 1,
     });
 
     registry.getAgent('agent-1')!.ws.close(1012, 'restarting');
@@ -854,7 +857,7 @@ test('a heartbeat on the reconnected socket keeps a task alive past the original
     second.send(helloFrame());
     await waitForAgent(registry, 'agent-1');
 
-    // One beat, well inside the window — this is what must cancel the hold.
+    // Duplicate seq=0, well inside the window — this must still cancel the hold.
     second.send(encodeFrame({
       type: 'task.status',
       taskId: 'task-3',

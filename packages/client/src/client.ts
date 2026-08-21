@@ -694,7 +694,7 @@ export class Client {
       // precise failure instead of making it wait for reconnect grace and then
       // report a generic disconnect. The send callback terminates only after
       // `ws` has flushed the best-effort terminal to the transport.
-      this.sendReliableFailureAndDisconnect(run, frame.taskId, seq, {
+      this.sendReliableFailureAndDisconnect(run.executionId, frame.taskId, seq, {
         code: 'client_buffer_overflow',
         message: 'client unacknowledged frame buffer limit exceeded',
       });
@@ -722,7 +722,32 @@ export class Client {
     if (!this.replayReady || ws.readyState !== WebSocket.OPEN) return;
     this.expirePendingFrames();
     if (!this.replayReady || ws.readyState !== WebSocket.OPEN) return;
-    for (const entry of this.pendingFrames) this.sendEncoded(ws, entry.encoded);
+    for (const entry of this.pendingFrames) {
+      if (
+        this.negotiatedMaxFrameBytes !== null &&
+        entry.bytes > this.negotiatedMaxFrameBytes
+      ) {
+        const why =
+          `retained frame exceeds the negotiated limit for task ${safeToken(entry.taskId)}`;
+        const run = [...this.inflight.values()].find(
+          (candidate) => candidate.executionId === entry.executionId,
+        );
+        if (run) this.failReliableRun(run, why, false);
+        else {
+          this.removePendingExecution(entry.executionId);
+          this.logger.error(`${why}; suppressing the execution so the bridge fails it closed`);
+        }
+        // Entries earlier in this loop have already been queued in sequence.
+        // Replace the first oversized one at its own sequence with a bounded
+        // terminal, then reconnect so other executions can replay cleanly.
+        this.sendReliableFailureAndDisconnect(entry.executionId, entry.taskId, entry.seq, {
+          code: 'client_buffer_overflow',
+          message: 'retained client frame exceeds the negotiated server limit',
+        });
+        return;
+      }
+      this.sendEncoded(ws, entry.encoded);
+    }
     if (this.pendingFrames.length > 0) {
       this.logger.info(`replayed ${this.pendingFrames.length} unacknowledged frame(s) after reconnect`);
     }
@@ -764,14 +789,13 @@ export class Client {
   }
 
   private sendReliableFailureAndDisconnect(
-    run: ClientRun,
+    executionId: string,
     taskId: string,
     seq: number,
     error: { code: string; message: string },
   ): void {
     const ws = this.ws;
-    const executionId = run.executionId;
-    if (!this.replayReady || !ws || ws.readyState !== WebSocket.OPEN || executionId === undefined) {
+    if (!this.replayReady || !ws || ws.readyState !== WebSocket.OPEN) {
       if (ws?.readyState === WebSocket.OPEN) ws.terminate();
       return;
     }

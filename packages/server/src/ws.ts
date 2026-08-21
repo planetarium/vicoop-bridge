@@ -625,6 +625,11 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       const expected = binding.nextClientSeq ?? 0;
       if (frame.seq < expected) {
         acknowledge(binding);
+        // A duplicate is the normal replay shape when the server accepted a
+        // frame but its ack was lost with the old socket. It proves this exact
+        // execution is alive just as strongly as a new frame does, so cancel
+        // the disconnect hold before its original deadline can fire.
+        opts.registry.resumeBinding(frame.taskId, binding.agentId);
         return { kind: 'handled' };
       }
       if (frame.seq > expected) {
