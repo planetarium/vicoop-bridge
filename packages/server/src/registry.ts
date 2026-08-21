@@ -256,7 +256,7 @@ export class Registry {
     return [...this.agents.values()];
   }
 
-  bindTask(binding: TaskBinding): void {
+  bindTask(binding: TaskBinding): boolean {
     // A taskId can be reused across turns (A2A keeps the same taskId for an
     // `input-required` continuation) or arrive on a duplicate/retried request
     // while the prior run is still in flight. If a DIFFERENT live binding
@@ -266,6 +266,19 @@ export class Registry {
     // binding). Terminating it emits a `failed` terminal so that stream closes
     // cleanly instead of orphaning.
     const existing = this.bindings.get(binding.taskId);
+    if (existing && existing.agentId !== binding.agentId) {
+      // A task id is owned by exactly one agent (issue #476). Never let a
+      // request routed through another agent fail or displace the legitimate
+      // caller's live stream, even if an upstream task-store scoping regression
+      // hands the wrong task to that executor.
+      logEvent('binding_owner_mismatch', {
+        agentId: binding.agentId,
+        ownerAgentId: existing.agentId,
+        taskId: binding.taskId,
+        ...(binding.principalId !== undefined ? { principalId: binding.principalId } : {}),
+      });
+      return false;
+    }
     if (existing && existing !== binding) {
       logEvent('binding_displaced', {
         agentId: binding.agentId,
@@ -279,6 +292,7 @@ export class Registry {
       });
     }
     this.bindings.set(binding.taskId, binding);
+    return true;
   }
 
   getBinding(taskId: string): TaskBinding | undefined {

@@ -574,6 +574,24 @@ test('bindTask leaves a self-rebind untouched (same object is not a displacement
   assert.equal(registry.getBinding('t-self'), only.binding);
 });
 
+test('bindTask rejects a different agent without displacing the owner binding', () => {
+  const registry = new Registry();
+  const victim = recordingBinding('victim', 't-owned');
+  const attacker = recordingBinding('attacker', 't-owned');
+
+  assert.equal(registry.bindTask(victim.binding), true);
+  assert.equal(registry.bindTask(attacker.binding), false);
+
+  assert.equal(
+    registry.getBinding('t-owned'),
+    victim.binding,
+    'the victim must retain ownership of the live task id',
+  );
+  assert.equal(victim.state.finished, false, 'the victim stream must remain open');
+  assert.equal(victim.statuses.length, 0, 'the victim must not receive a forged terminal status');
+  assert.equal(attacker.state.finished, false, 'the rejected binding was never installed');
+});
+
 test('bindTask displacing a live binding emits a superseded terminal on the old sink', () => {
   const registry = new Registry();
   const first = recordingBinding('a1', 't-sup');

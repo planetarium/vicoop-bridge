@@ -633,6 +633,14 @@ CREATE TABLE IF NOT EXISTS infra.a2a_tasks (
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Existing installations predate per-agent task ownership. Leave legacy rows
+-- unowned (and therefore invisible to every scoped A2A handler); their owning
+-- agent cannot be recovered reliably from task_json.
+ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS owner_agent TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_a2a_tasks_agent_context_principal
+  ON infra.a2a_tasks (owner_agent, context_id, owner_principal, created_at);
+
 CREATE INDEX IF NOT EXISTS idx_a2a_tasks_context_principal
   ON infra.a2a_tasks (context_id, owner_principal, created_at);
 

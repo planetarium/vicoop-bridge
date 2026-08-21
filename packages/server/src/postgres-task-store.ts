@@ -132,6 +132,12 @@ export interface PostgresTaskStoreOptions {
   // #408 growth for as long as it is on, so it is NOT meant to be left on.
   // (Reads still strip on the hot replay path regardless — see loadByContextId.)
   persistRequestEnvelope?: boolean;
+
+  // Restrict every task read and mutation to one owning A2A agent (issue #476).
+  // Runtime request handlers must always set this; leaving it undefined is
+  // reserved for maintenance jobs and low-level store tests that intentionally
+  // operate across all agents.
+  ownerAgent?: string;
 }
 
 // Parse the A2A_PERSIST_REQUEST_ENVELOPE env value into the store flag. Accepts
@@ -145,12 +151,14 @@ export function parsePersistRequestEnvelope(raw: string | undefined): boolean {
 
 export class PostgresTaskStore implements ContextAwareTaskStore {
   private readonly persistRequestEnvelope: boolean;
+  private readonly ownerAgent: string | undefined;
 
   constructor(
     private readonly sql: Sql,
     options?: PostgresTaskStoreOptions,
   ) {
     this.persistRequestEnvelope = options?.persistRequestEnvelope ?? false;
+    this.ownerAgent = options?.ownerAgent;
   }
 
   async createTask(params: CreateTaskParams): Promise<Task> {
@@ -167,9 +175,15 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   }
 
   async getTask(taskId: string): Promise<Task | null> {
-    const rows = await this.sql<{ task_json: Task }[]>`
-      SELECT task_json FROM infra.a2a_tasks WHERE task_id = ${taskId} LIMIT 1
-    `;
+    const rows = this.ownerAgent === undefined
+      ? await this.sql<{ task_json: Task }[]>`
+          SELECT task_json FROM infra.a2a_tasks WHERE task_id = ${taskId} LIMIT 1
+        `
+      : await this.sql<{ task_json: Task }[]>`
+          SELECT task_json FROM infra.a2a_tasks
+          WHERE task_id = ${taskId} AND owner_agent = ${this.ownerAgent}
+          LIMIT 1
+        `;
     // Returns the stored row verbatim — including the request envelope when
     // persistRequestEnvelope is on (issue #419); this is the forensic read path.
     // Unlike loadByContextId (hot per-turn replay), this is a single on-demand
@@ -207,9 +221,15 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     let retentionMs = 0;
     try {
       const merged = await this.sql.begin(async (sql) => {
-        const rows = await sql<{ task_json: Task }[]>`
-          SELECT task_json FROM infra.a2a_tasks WHERE task_id = ${taskId} FOR UPDATE
-        `;
+        const rows = this.ownerAgent === undefined
+          ? await sql<{ task_json: Task }[]>`
+              SELECT task_json FROM infra.a2a_tasks WHERE task_id = ${taskId} FOR UPDATE
+            `
+          : await sql<{ task_json: Task }[]>`
+              SELECT task_json FROM infra.a2a_tasks
+              WHERE task_id = ${taskId} AND owner_agent = ${this.ownerAgent}
+              FOR UPDATE
+            `;
         const existing = rows[0]?.task_json ?? null;
         if (!existing) {
           throw new Error(`Task not found: ${taskId}`);
@@ -271,7 +291,14 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   }
 
   async deleteTask(taskId: string): Promise<void> {
-    await this.sql`DELETE FROM infra.a2a_tasks WHERE task_id = ${taskId}`;
+    if (this.ownerAgent === undefined) {
+      await this.sql`DELETE FROM infra.a2a_tasks WHERE task_id = ${taskId}`;
+      return;
+    }
+    await this.sql`
+      DELETE FROM infra.a2a_tasks
+      WHERE task_id = ${taskId} AND owner_agent = ${this.ownerAgent}
+    `;
   }
 
   async loadByContextId(
@@ -279,22 +306,41 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     principalId: string,
     excludeTaskId?: string,
   ): Promise<Task[]> {
-    const rows = excludeTaskId
-      ? await this.sql<{ task_json: Task }[]>`
-          SELECT task_json FROM infra.a2a_tasks
-          WHERE context_id = ${contextId}
-            AND owner_principal = ${principalId}
-            AND task_id != ${excludeTaskId}
-          ORDER BY created_at DESC, task_id DESC
-          LIMIT ${MAX_CONTEXT_TASKS}
-        `
-      : await this.sql<{ task_json: Task }[]>`
-          SELECT task_json FROM infra.a2a_tasks
-          WHERE context_id = ${contextId}
-            AND owner_principal = ${principalId}
-          ORDER BY created_at DESC, task_id DESC
-          LIMIT ${MAX_CONTEXT_TASKS}
-        `;
+    const rows = this.ownerAgent === undefined
+      ? excludeTaskId
+        ? await this.sql<{ task_json: Task }[]>`
+            SELECT task_json FROM infra.a2a_tasks
+            WHERE context_id = ${contextId}
+              AND owner_principal = ${principalId}
+              AND task_id != ${excludeTaskId}
+            ORDER BY created_at DESC, task_id DESC
+            LIMIT ${MAX_CONTEXT_TASKS}
+          `
+        : await this.sql<{ task_json: Task }[]>`
+            SELECT task_json FROM infra.a2a_tasks
+            WHERE context_id = ${contextId}
+              AND owner_principal = ${principalId}
+            ORDER BY created_at DESC, task_id DESC
+            LIMIT ${MAX_CONTEXT_TASKS}
+          `
+      : excludeTaskId
+        ? await this.sql<{ task_json: Task }[]>`
+            SELECT task_json FROM infra.a2a_tasks
+            WHERE owner_agent = ${this.ownerAgent}
+              AND context_id = ${contextId}
+              AND owner_principal = ${principalId}
+              AND task_id != ${excludeTaskId}
+            ORDER BY created_at DESC, task_id DESC
+            LIMIT ${MAX_CONTEXT_TASKS}
+          `
+        : await this.sql<{ task_json: Task }[]>`
+            SELECT task_json FROM infra.a2a_tasks
+            WHERE owner_agent = ${this.ownerAgent}
+              AND context_id = ${contextId}
+              AND owner_principal = ${principalId}
+            ORDER BY created_at DESC, task_id DESC
+            LIMIT ${MAX_CONTEXT_TASKS}
+          `;
     // Strip the request envelope from replayed tasks unconditionally — even
     // when persistRequestEnvelope is on and the stored rows carry it (issue
     // #419). The per-turn context replay must stay lean: re-reading a large
@@ -306,19 +352,20 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   }
 
   /**
-   * Time-based retention. Deletes every task belonging to a context that has
-   * been idle (no task created or updated) for longer than `retentionDays`
-   * AND has no in-flight (non-terminal) task.
+   * Time-based retention. Deletes every task belonging to an agent/context
+   * pair that has been idle (no task created or updated) for longer than
+   * `retentionDays` AND has no in-flight (non-terminal) task.
    *
-   * Pruning is context-scoped rather than per-row on purpose: an actively-used
-   * long-running context keeps ALL its turns (its newest task's updated_at is
-   * recent, so the whole context is spared), and only contexts with no recent
-   * activity are reclaimed. This is the orthogonal axis to the count-based cap
-   * in enforceRetention() (which bounds a single context to MAX_CONTEXT_TASKS):
-   * the count cap stops one context from bloating, this stops the table from
-   * growing monotonically with the number of stale contexts over time (the root
-   * cause in #385). It also reclaims old terminal contexts whose rows have no
-   * owner_principal, which the count-based path skips.
+   * Pruning is agent/context-scoped rather than per-row on purpose: an
+   * actively-used long-running context keeps ALL its turns for that agent (its
+   * newest task's updated_at is recent, so the pair is spared), and only pairs
+   * with no recent activity are reclaimed. This is the orthogonal axis to the
+   * count-based cap in enforceRetention() (which bounds one agent/context pair
+   * to MAX_CONTEXT_TASKS): the count cap stops one context from bloating, this
+   * stops the table from growing monotonically with the number of stale
+   * contexts over time (the root cause in #385). It also reclaims old terminal
+   * contexts whose rows have no owner_principal, which the count-based path
+   * skips.
    *
    * Any context that still holds a non-terminal task is spared regardless of
    * age: the executor only persists a task at terminal/stream-end (no
@@ -334,15 +381,17 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
    */
   async pruneStaleContexts(retentionDays: number): Promise<number> {
     const res = await this.sql`
-      DELETE FROM infra.a2a_tasks
-      WHERE context_id IN (
-        SELECT context_id FROM infra.a2a_tasks
-        GROUP BY context_id
+      DELETE FROM infra.a2a_tasks AS task
+      USING (
+        SELECT owner_agent, context_id FROM infra.a2a_tasks
+        GROUP BY owner_agent, context_id
         HAVING max(updated_at) < now() - ${retentionDays} * interval '1 day'
            AND count(*) FILTER (
                  WHERE state NOT IN ('completed', 'failed', 'canceled', 'rejected')
                ) = 0
-      )
+      ) AS stale
+      WHERE task.context_id = stale.context_id
+        AND task.owner_agent IS NOT DISTINCT FROM stale.owner_agent
     `;
     return res.count;
   }
@@ -357,14 +406,30 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     });
     const contextId = task.contextId ?? task.id;
 
+    const persisted = sql.json(JSON.parse(JSON.stringify(sanitized)));
+    if (this.ownerAgent === undefined) {
+      await sql`
+        INSERT INTO infra.a2a_tasks
+          (task_id, context_id, state, task_json, owner_principal, owner_agent)
+        VALUES (
+          ${task.id}, ${contextId}, ${task.status.state}, ${persisted},
+          ${ownerPrincipal ?? null}, NULL
+        )
+        ON CONFLICT (task_id) DO UPDATE SET
+          context_id = EXCLUDED.context_id,
+          state = EXCLUDED.state,
+          task_json = EXCLUDED.task_json,
+          owner_principal = COALESCE(infra.a2a_tasks.owner_principal, EXCLUDED.owner_principal),
+          updated_at = now()
+      `;
+      return;
+    }
     await sql`
-      INSERT INTO infra.a2a_tasks (task_id, context_id, state, task_json, owner_principal)
+      INSERT INTO infra.a2a_tasks
+        (task_id, context_id, state, task_json, owner_principal, owner_agent)
       VALUES (
-        ${task.id},
-        ${contextId},
-        ${task.status.state},
-        ${sql.json(JSON.parse(JSON.stringify(sanitized)))},
-        ${ownerPrincipal ?? null}
+        ${task.id}, ${contextId}, ${task.status.state}, ${persisted},
+        ${ownerPrincipal ?? null}, ${this.ownerAgent}
       )
       ON CONFLICT (task_id) DO UPDATE SET
         context_id = EXCLUDED.context_id,
@@ -372,6 +437,7 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
         task_json = EXCLUDED.task_json,
         owner_principal = COALESCE(infra.a2a_tasks.owner_principal, EXCLUDED.owner_principal),
         updated_at = now()
+      WHERE infra.a2a_tasks.owner_agent = EXCLUDED.owner_agent
     `;
   }
 
@@ -393,11 +459,26 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     if (!ownerPrincipal || !TERMINAL_STATES.has(task.status.state)) return;
     const contextId = task.contextId ?? task.id;
 
+    if (this.ownerAgent === undefined) {
+      await this.sql`
+        DELETE FROM infra.a2a_tasks
+        WHERE task_id IN (
+          SELECT task_id FROM infra.a2a_tasks
+          WHERE context_id = ${contextId}
+            AND owner_principal = ${ownerPrincipal}
+            AND state IN ('completed', 'failed', 'canceled', 'rejected')
+          ORDER BY created_at DESC, task_id DESC
+          OFFSET ${MAX_CONTEXT_TASKS}
+        )
+      `;
+      return;
+    }
     await this.sql`
       DELETE FROM infra.a2a_tasks
       WHERE task_id IN (
         SELECT task_id FROM infra.a2a_tasks
-        WHERE context_id = ${contextId}
+        WHERE owner_agent = ${this.ownerAgent}
+          AND context_id = ${contextId}
           AND owner_principal = ${ownerPrincipal}
           AND state IN ('completed', 'failed', 'canceled', 'rejected')
         ORDER BY created_at DESC, task_id DESC

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
 import {
+  TaskNotCancelableError,
   TaskState,
   type Artifact,
   type Message,
@@ -352,6 +353,117 @@ test('cancel delivers a CANCELED terminal event through the stream before aborti
   assert.equal(ev.status.state, TaskState.CANCELED);
   for await (const _event of gen) void _event; // drain to completion
   assert.equal(registry.getBinding('t-cancel'), undefined, 'binding released');
+});
+
+test('cancel rejects a task bound to a different agent without touching its stream', async () => {
+  const { ws, sent } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'attacker',
+    clientId: 'c-attacker',
+    ownerPrincipal: 'eth:0xattacker',
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+
+  const victimStatuses: TaskStatusUpdateEvent[] = [];
+  let victimFinished = false;
+  registry.bindTask({
+    agentId: 'victim',
+    taskId: 't-cross-cancel',
+    contextId: 'ctx-cross-cancel',
+    sink: {
+      pushStatus: (event) => victimStatuses.push(event),
+      pushArtifact: () => undefined,
+      finish: () => {
+        victimFinished = true;
+      },
+    },
+  });
+
+  const executor = new WSForwardingExecutor('attacker', registry, noopTaskStore());
+  const task = {
+    id: 't-cross-cancel',
+    contextId: 'ctx-cross-cancel',
+    status: { state: TaskState.WORKING, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+
+  await assert.rejects(executor.cancel(task), (err: unknown) => {
+    assert.ok(err instanceof TaskNotCancelableError);
+    assert.equal(err.message, 'Task cannot be canceled');
+    return true;
+  });
+  assert.equal(task.status.state, TaskState.WORKING, 'the task must not be marked canceled');
+  assert.equal(victimFinished, false, 'the victim stream must remain open');
+  assert.equal(victimStatuses.length, 0, 'the victim must not receive a forged canceled event');
+  assert.equal(sent.length, 0, 'no cancel frame may be sent through the attacker agent');
+});
+
+test('executeStream cannot displace a live task binding owned by another agent', async () => {
+  const { ws, sent } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'attacker',
+    clientId: 'c-attacker',
+    ownerPrincipal: 'eth:0xattacker',
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+
+  const victimStatuses: TaskStatusUpdateEvent[] = [];
+  let victimFinished = false;
+  const victimBinding = {
+    agentId: 'victim',
+    taskId: 't-cross-bind',
+    contextId: 'ctx-cross-bind',
+    sink: {
+      pushStatus: (event: TaskStatusUpdateEvent) => victimStatuses.push(event),
+      pushArtifact: () => undefined,
+      finish: () => {
+        victimFinished = true;
+      },
+    },
+  };
+  registry.bindTask(victimBinding);
+
+  const executor = new WSForwardingExecutor('attacker', registry, noopTaskStore());
+  const task = {
+    id: 't-cross-bind',
+    contextId: 'ctx-cross-bind',
+    status: { state: TaskState.WORKING, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hijack' }],
+    messageId: 'm-cross-bind',
+    taskId: task.id,
+    contextId: task.contextId,
+  } as unknown as Message;
+
+  const events: TaskStatusUpdateEvent[] = [];
+  for await (const event of executor.executeStream(task, message)) {
+    events.push(event as TaskStatusUpdateEvent);
+  }
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.final, true);
+  assert.equal(events[0]?.status.state, TaskState.FAILED);
+  assert.equal(registry.getBinding(task.id), victimBinding, 'the victim binding must remain installed');
+  assert.equal(victimFinished, false, 'the victim stream must remain open');
+  assert.equal(victimStatuses.length, 0, 'the victim must not receive a forged failed event');
+  assert.equal(sent.length, 0, 'the attacker agent must not receive a task.assign frame');
+  const abortControllers = (
+    executor as unknown as { abortControllers: Map<string, AbortController> }
+  ).abortControllers;
+  assert.equal(
+    abortControllers.has(task.id),
+    false,
+    'a rejected binding must not leave a stale AbortController behind',
+  );
 });
 
 test('executor omits message.metadata entirely when the only entry was _principalId', async () => {
