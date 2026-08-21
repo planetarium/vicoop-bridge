@@ -390,7 +390,11 @@ test('cancel rejects a task bound to a different agent without touching its stre
     status: { state: TaskState.WORKING, timestamp: new Date().toISOString() },
   } as unknown as Task;
 
-  await assert.rejects(executor.cancel(task), TaskNotCancelableError);
+  await assert.rejects(executor.cancel(task), (err: unknown) => {
+    assert.ok(err instanceof TaskNotCancelableError);
+    assert.equal(err.message, 'Task cannot be canceled');
+    return true;
+  });
   assert.equal(task.status.state, TaskState.WORKING, 'the task must not be marked canceled');
   assert.equal(victimFinished, false, 'the victim stream must remain open');
   assert.equal(victimStatuses.length, 0, 'the victim must not receive a forged canceled event');

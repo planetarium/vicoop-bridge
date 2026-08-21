@@ -689,7 +689,7 @@ export class WSForwardingExecutor extends AgentExecutor {
         taskId,
         operation: 'cancel',
       });
-      throw new TaskNotCancelableError(`Task '${taskId}' is not owned by this agent`);
+      throw new TaskNotCancelableError('Task cannot be canceled');
     }
 
     // Notify the connected client so it can abort in-flight work and

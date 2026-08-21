@@ -629,7 +629,6 @@ CREATE TABLE IF NOT EXISTS infra.a2a_tasks (
   state           TEXT NOT NULL,
   task_json       JSONB NOT NULL,
   owner_principal TEXT,
-  owner_agent     TEXT,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
