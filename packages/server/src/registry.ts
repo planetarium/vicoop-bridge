@@ -500,7 +500,7 @@ export class Registry {
         // timestamp join back to binding_grace_held.
         logEvent('binding_grace_expired', {
           agentId: binding.agentId,
-          taskId: binding.taskId,
+          taskId: truncate(binding.taskId, 128),
           graceMs: this.disconnectGraceMs,
           via,
           ...(closeCode !== undefined ? { closeCode } : {}),
@@ -514,7 +514,7 @@ export class Registry {
       this.graceHolds.set(binding.taskId, { timer, binding, heldAt, via, closeCode });
       logEvent('binding_grace_held', {
         agentId: binding.agentId,
-        taskId: binding.taskId,
+        taskId: truncate(binding.taskId, 128),
         graceMs: this.disconnectGraceMs,
         via,
         ...(closeCode !== undefined ? { closeCode } : {}),
@@ -547,7 +547,7 @@ export class Registry {
     this.graceHolds.delete(taskId);
     logEvent('binding_grace_resumed', {
       agentId,
-      taskId,
+      taskId: truncate(taskId, 128),
       heldForMs: Date.now() - hold.heldAt,
       graceMs: this.disconnectGraceMs,
       via: hold.via,
