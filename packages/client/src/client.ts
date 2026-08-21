@@ -775,8 +775,23 @@ export class Client {
       if (!this.bufferPoisoned) {
         this.bufferPoisoned = true;
         this.logger.error(
-          `truncated-task list full (${MAX_TRUNCATED_TASKS}); discarding all buffered output for this outage rather than replay it partially`,
+          `truncated-task list full (${MAX_TRUNCATED_TASKS}); abandoning this outage's output rather than replay it partially`,
         );
+        // Dropping the buffer is not enough on its own: the identity of the
+        // affected runs goes with it, so their backends would carry on and
+        // their later frames would go out live on the next connection —
+        // resuming or completing a held binding with the prefix missing, which
+        // is the corruption this path exists to avoid.
+        //
+        // Every run alive during this outage is therefore silenced and aborted.
+        // They die on the bridge's grace deadline, which is exactly what would
+        // have happened before this buffer existed. Reaching this cap at all is
+        // pathological, so the bluntness is the point: it is the one outcome
+        // here that cannot corrupt a different run.
+        for (const run of this.inflight.values()) {
+          run.suppressed = true;
+          run.controller.abort();
+        }
       }
       this.dropPendingFrames();
       return;

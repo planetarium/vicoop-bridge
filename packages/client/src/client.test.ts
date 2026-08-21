@@ -2022,3 +2022,71 @@ test('overflowing the truncated-task bookkeeping discards the buffer rather than
     await closeServer(h.server, h.wss);
   }
 });
+test('poisoning the buffer silences the runs it abandoned, through the reconnect', async () => {
+  const h = replayHarness();
+  const serverUrl = await listen(h.server);
+
+  let release!: () => void;
+  const held = new Promise<void>((r) => {
+    release = r;
+  });
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('slow', async (task, emit) => {
+      await held;
+      emit({
+        type: 'task.complete',
+        taskId: task.taskId,
+        status: { state: 'completed', timestamp: new Date().toISOString() },
+      });
+    }),
+    reconnectDelayMs: 15,
+    reconnectMaxDelayMs: 15,
+    reconnectJitterRatio: 0,
+    maxPendingFrames: 1,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(() => h.received.some((f) => f.type === 'hello'), 'first hello');
+
+    h.sockets[0]!.send(JSON.stringify({
+      type: 'task.assign',
+      taskId: 't-poisoned-run',
+      contextId: 'ctx',
+      message: { role: 'user', parts: [{ kind: 'text', text: 'hi' }], messageId: 'm1' },
+    }));
+    await new Promise((r) => setTimeout(r, 20));
+    h.sockets[0]!.close(1012, 'restarting');
+    await waitOffline(client);
+
+    for (let i = 0; i <= 10_001; i++) {
+      sendOffline(client, {
+        type: 'task.artifact',
+        taskId: `t-flood-${i}`,
+        artifact: { artifactId: 'a', parts: [{ kind: 'text', text: 'x' }] },
+        append: true,
+        lastChunk: false,
+      });
+    }
+
+    await waitFor(() => h.connections >= 2, 'reconnect');
+    release();
+    await new Promise((r) => setTimeout(r, 100));
+
+    assert.deepEqual(
+      h.received.filter((f) => f.taskId === 't-poisoned-run'),
+      [],
+      'an abandoned run must stay silent, not emit into a rebound task id',
+    );
+  } finally {
+    release();
+    client.stop();
+    await closeServer(h.server, h.wss);
+  }
+});

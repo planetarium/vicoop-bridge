@@ -1012,3 +1012,26 @@ test('an oversized unauthenticated message is refused before it is parsed', asyn
     await closeServer(server);
   }
 });
+
+test('a message past the ingress cap is refused by the transport, never assembled', async () => {
+  // The pre-auth byte budget can only be charged once `ws` has already built
+  // the message, so without an ingress cap the library's 100 MiB default is
+  // what an unauthenticated peer can make each connection hold before we ever
+  // look. This asserts the transport itself refuses it: close 1009, the
+  // WebSocket "message too big" code, rather than our own 4002.
+  const server = createServer();
+  const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`, { maxPayload: 0 });
+
+  try {
+    await once(ws, 'open');
+    ws.send('{"pad":"' + 'z'.repeat(17 * 1024 * 1024) + '"}');
+    const [code] = (await once(ws, 'close')) as [number, Buffer];
+    assert.equal(code, 1009, 'the transport must reject an over-cap payload');
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});

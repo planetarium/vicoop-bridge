@@ -58,8 +58,22 @@ export interface ServerWsOptions {
   registry: Registry;
 }
 
+// Largest WebSocket message the bridge will assemble at all, authenticated or
+// not. See the `maxPayload` note in attachWsServer.
+const MAX_INGRESS_BYTES = 16 * 1024 * 1024;
+
 export function attachWsServer(server: Server, opts: ServerWsOptions): void {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({
+    noServer: true,
+    // Ingress cap, enforced by `ws` while it assembles the frame rather than by
+    // us once it already exists. Without it the library's 100 MiB default is
+    // what an unauthenticated peer can make each connection hold before our own
+    // pre-auth budget is ever consulted — several connections would be enough
+    // to exhaust the deployment. Set well above any legitimate frame (the
+    // client refuses to buffer one this large) and comfortably above the
+    // pre-auth budget, so it bounds abuse without truncating real traffic.
+    maxPayload: MAX_INGRESS_BYTES,
+  });
 
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
