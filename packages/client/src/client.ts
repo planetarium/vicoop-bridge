@@ -682,11 +682,22 @@ export class Client {
       (retentionEnabled && this.pendingFrames.length >= frameLimit) ||
       (retentionEnabled && this.pendingBytes + bytes > byteLimit)
     ) {
+      const why =
+        `unacknowledged frame buffer limit exceeded for task ${safeToken(frame.taskId)}`;
       this.failReliableRun(
         run,
-        `unacknowledged frame buffer limit exceeded for task ${safeToken(frame.taskId)}`,
-        true,
+        why,
+        false,
       );
+      // Replace the frame that could not be retained with a small terminal at
+      // the same sequence. On a healthy-looking socket this gives the bridge a
+      // precise failure instead of making it wait for reconnect grace and then
+      // report a generic disconnect. The send callback terminates only after
+      // `ws` has flushed the best-effort terminal to the transport.
+      this.sendReliableFailureAndDisconnect(run, frame.taskId, seq, {
+        code: 'client_buffer_overflow',
+        message: 'client unacknowledged frame buffer limit exceeded',
+      });
       return;
     }
 
@@ -750,6 +761,52 @@ export class Client {
     if (run.executionId !== undefined) this.removePendingExecution(run.executionId);
     this.logger.error(`${why}; suppressing the run so the bridge fails it closed`);
     if (disconnect && this.ws?.readyState === WebSocket.OPEN) this.ws.terminate();
+  }
+
+  private sendReliableFailureAndDisconnect(
+    run: ClientRun,
+    taskId: string,
+    seq: number,
+    error: { code: string; message: string },
+  ): void {
+    const ws = this.ws;
+    const executionId = run.executionId;
+    if (!this.replayReady || !ws || ws.readyState !== WebSocket.OPEN || executionId === undefined) {
+      if (ws?.readyState === WebSocket.OPEN) ws.terminate();
+      return;
+    }
+
+    const encoded = encodeFrame({
+      type: 'task.fail',
+      taskId,
+      executionId,
+      seq,
+      error,
+    });
+    if (
+      this.negotiatedMaxFrameBytes !== null &&
+      Buffer.byteLength(encoded, 'utf8') > this.negotiatedMaxFrameBytes
+    ) {
+      ws.terminate();
+      return;
+    }
+
+    try {
+      ws.send(encoded, (err) => {
+        if (err) {
+          this.logger.warn(
+            `best-effort task failure send failed (${safeToken(err.message)}); reconnecting`,
+          );
+        }
+        if (this.ws === ws) ws.terminate();
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn(
+        `best-effort task failure send threw (${safeToken(message)}); reconnecting`,
+      );
+      if (this.ws === ws) ws.terminate();
+    }
   }
 
   private removePendingExecution(executionId: string): void {

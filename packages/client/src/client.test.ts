@@ -1509,6 +1509,69 @@ test('an unacknowledged frame expires even while the socket stays open', async (
   }
 });
 
+test('a pending-frame overflow reports client_buffer_overflow before disconnecting', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  const taskFrames: UpFrame[] = [];
+  wss.on('connection', (ws) => {
+    ws.on('message', (raw) => {
+      const frame = parseUpFrame(raw.toString('utf8'));
+      if (frame.type === 'hello') {
+        ws.send(encodeFrame({
+          type: 'hello.ack',
+          protocolCapabilities: [TASK_REPLAY_CAPABILITY],
+          disconnectGraceMs: 30_000,
+          maxFrameBytes: 16 * 1024 * 1024,
+        }));
+        ws.send(encodeFrame({ ...makeAssign('t-overflow'), executionId: 'execution-overflow' }));
+        return;
+      }
+      taskFrames.push(frame);
+    });
+  });
+  const client = new Client({
+    serverUrl,
+    token: 'token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('echo', async (task, emit) => {
+      emit({
+        type: 'task.artifact', taskId: task.taskId,
+        artifact: { artifactId: 'a', parts: [{ kind: 'text', text: 'fills the buffer' }] },
+      });
+      emit({ type: 'task.complete', taskId: task.taskId, status: { state: 'completed' } });
+    }),
+    maxPendingFrames: 1,
+    reconnectDelayMs: 5_000,
+    heartbeatIntervalMs: 0,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(
+      () => taskFrames.some((frame) => frame.type === 'task.fail'),
+      'client_buffer_overflow terminal',
+    );
+    assert.equal(taskFrames[0]?.type, 'task.artifact');
+    const failure = taskFrames.find((frame) => frame.type === 'task.fail');
+    assert.deepEqual(failure, {
+      type: 'task.fail',
+      taskId: 't-overflow',
+      executionId: 'execution-overflow',
+      seq: 1,
+      error: {
+        code: 'client_buffer_overflow',
+        message: 'client unacknowledged frame buffer limit exceeded',
+      },
+    });
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
 for (const [bound, options] of [
   ['byte', { maxPendingBytes: 0 }],
   ['age', { maxPendingAgeMs: 0 }],
