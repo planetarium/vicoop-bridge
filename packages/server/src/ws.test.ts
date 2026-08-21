@@ -828,6 +828,17 @@ test('an agent cannot push frames into another agent\'s task', async () => {
   // deadlocks: the second socket fires 'open' while we are awaiting the first,
   // and `once()` then waits forever for a second 'open' that never comes.
   let attacker: WebSocket | undefined;
+  const eventNames: string[] = [];
+  const origLog = console.log;
+  console.log = (...args: unknown[]) => {
+    if (typeof args[0] !== 'string') return;
+    try {
+      const event = (JSON.parse(args[0]) as { event?: unknown }).event;
+      if (typeof event === 'string') eventNames.push(event);
+    } catch {
+      // Ignore non-JSON console output.
+    }
+  };
 
   try {
     await once(victim, 'open');
@@ -876,6 +887,8 @@ test('an agent cannot push frames into another agent\'s task', async () => {
     assert.deepEqual(sink.statuses, [], 'a foreign agent wrote into the victim task');
     assert.deepEqual(sink.artifacts, []);
     assert.ok(registry.getBinding('victim-task'), 'the victim task must still be held');
+    assert.equal(eventNames.filter((name) => name === 'binding_owner_mismatch').length, 2);
+    assert.equal(eventNames.filter((name) => name === 'dropped_terminal_frame').length, 0);
 
     // The rightful owner comes back and completes it normally.
     const recovered = new WebSocket(`ws://127.0.0.1:${port}/connect`);
@@ -905,6 +918,7 @@ test('an agent cannot push frames into another agent\'s task', async () => {
       recovered.close();
     }
   } finally {
+    console.log = origLog;
     victim.close();
     attacker?.close();
     await closeServer(server);

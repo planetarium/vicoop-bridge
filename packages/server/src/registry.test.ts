@@ -20,17 +20,11 @@ const WS_OPEN = 1;
 const WS_CLOSING = 2;
 const WS_CLOSED = 3;
 
-// Minimal WebSocket stub — Registry uses `.close()` on replacement, equality
-// (`existing.ws !== ws`) on unregister, and `readyState` to tell a live
-// duplicate-token collision from a client that is merely reconnecting after its
-// socket already died (issue #474). Defaults to OPEN, which is what every
-// pre-#474 test implicitly assumed.
-//
-// `close()` MUST move readyState to CLOSING, because the real `ws` library does
-// so synchronously inside close() — and a stub that froze readyState instead
-// would let `registry.ts` read it *after* closing the socket and still appear
-// to work, certifying a branch that real sockets can never take. That is not
-// hypothetical: it is exactly the bug this stub previously hid.
+// Minimal WebSocket stub — Registry uses `.close()` on replacement and socket
+// identity (`existing.ws !== ws`) on unregister. Tests can initialize distinct
+// readyState values to model race orderings, and `close()` mirrors the real
+// library by moving OPEN to CLOSING synchronously. Production deliberately does
+// not use readyState as a liveness signal for reconnect classification.
 function makeWs(readyState: number = WS_OPEN): WebSocket {
   const ws = {
     readyState,

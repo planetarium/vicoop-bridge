@@ -548,7 +548,11 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       return acknowledgeReceipt(frame) ? { kind: 'duplicate' } : undefined;
     }
     const binding = ownedBinding(frame.taskId);
-    if (!binding) return undefined;
+    // `current` proved the task exists, so undefined here means the ownership
+    // guard already rejected and logged a foreign-agent frame. Treat that as
+    // fully handled; terminal callers must not add a misleading
+    // dropped_terminal_frame event for a binding that was never missing.
+    if (!binding) return { kind: 'duplicate' };
 
     if (binding.executionId !== undefined) {
       if (frame.executionId !== binding.executionId || frame.seq === undefined) {
