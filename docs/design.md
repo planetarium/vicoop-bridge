@@ -65,6 +65,37 @@ vicoop-bridge/
 - `task.cancel`   — `{ taskId }`
 - `ping`
 
+### 4.1 Disconnect handling (reconnect grace hold)
+
+A `TaskBinding` is not tied to the connection that created it — it holds only
+`agentId`, and outbound sends re-resolve the live socket at send time. So a
+dropped WebSocket does not by itself invalidate an in-flight task.
+
+When a client's socket closes, the server therefore keeps the binding alive for
+`BRIDGE_DISCONNECT_GRACE_MS` (default 30s) instead of failing the task at once.
+Any frame for that task on the client's next connection — a liveness heartbeat
+is enough — resumes the binding and the task continues down the normal path.
+An unresumed hold expires into exactly the terminal that path always produced:
+`disconnected` for a drop, `superseded` for a same-token reconnect.
+
+The grace is therefore *how long to wait before declaring a client dead*, not a
+cap on task duration; a long task is governed by
+`BRIDGE_TASK_INACTIVITY_TIMEOUT_MS` as before.
+
+Two closes skip the hold, because they are this server's own verdict rather
+than a transport failure: any app-level close code it issues (`4000`–`4999`)
+and a clean `1000`. Since the code the server *observes* is not always the one
+it *sent* (a peer that never echoes the close frame surfaces as `1006`), the
+intent is recorded when the close is issued and takes precedence.
+
+Setting `BRIDGE_DISCONNECT_GRACE_MS=0` disables the hold and restores the
+previous fail-immediately behavior exactly — the rollback lever if holds ever
+delay failover more than they save.
+
+Background: issue #474. Frames a client emits *while* its socket is down are
+buffered by the client and replayed on reconnect, so a recovered drop loses no
+output; see `packages/client/src/client.ts`.
+
 ## 5. Client Backends
 
 ```bash

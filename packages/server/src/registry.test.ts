@@ -2,7 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
 import { OPENAI_COMPAT_EXTENSION_URI, type AgentCard } from '@vicoop-bridge/protocol';
-import { Registry, type TaskBinding } from './registry.js';
+import {
+  FALLBACK_DISCONNECT_GRACE_MS,
+  MAX_DISCONNECT_GRACE_MS,
+  Registry,
+  resolveDisconnectGraceMs,
+  type TaskBinding,
+} from './registry.js';
 
 // Mirrors the `ws` library's ReadyState constants; the stubs below are typed as
 // WebSocket, so these have to agree with the real values.
@@ -434,13 +440,19 @@ test('registerAgent emits client_collision and closes the prior ws with the desc
   assert.equal(parsed.previousConnectedAt, 1000);
 });
 
-test('same-token reconnect fails the displaced connection in-flight bindings (issue #365)', () => {
+test('same-token reconnect eventually fails the displaced connection in-flight bindings (issue #365)', () => {
   // A second daemon authenticating with the same CLIENT_TOKEN replaces the
   // incumbent. The old connection's in-flight task must receive a terminal
   // `failed` status and have its sink finished + binding dropped — otherwise
-  // the task's HTTP stream hangs forever (the new daemon is a separate process
-  // that never knew the old taskId, so it can't complete it either).
-  const registry = new Registry();
+  // the task's HTTP stream hangs forever (if the new daemon is a separate
+  // process that never knew the old taskId, it can't complete it either).
+  //
+  // Since #474 that outcome is delayed by the reconnect grace, which exists
+  // because the new daemon is USUALLY the same client coming back and can
+  // finish the task. Grace 0 keeps this test on its original subject — that a
+  // displaced binding is never orphaned, and that this path's terminal is
+  // `superseded` — while the graced variants are covered separately below.
+  const registry = new Registry(0);
   const oldWs = makeWs();
   const base = {
     agentId: 'a1',
@@ -819,20 +831,97 @@ test('reconnect arriving BEFORE the old socket close holds the task instead of s
   assert.equal(task.state.finished, false);
   assert.deepEqual(task.statuses, []);
 
-  registry.resumeBinding('t-race', 'a1');
-  assert.ok(registry.getBinding('t-race'));
 });
 
-test('a genuine duplicate-token collision (old socket still OPEN) still supersedes immediately', () => {
-  const registry = new Registry(10_000);
+test('a hold armed by the reconnect branch really is a hold: it resumes and it expires', async () => {
+  // Presence of the binding right after the reconnect proves nothing — a
+  // binding simply left alone, with no timer at all, looks identical at that
+  // instant and would then hang until the executor's 10-minute backstop. Drive
+  // both ends of the lifecycle instead.
+  const armed = new Registry(20);
+  registerFor(armed, makeWs(WS_CLOSED));
+  const abandoned = bindCapturing(armed, 'a1', 't-race-expire');
+  registerFor(armed, makeWs());
+  await sleep(80);
+  assert.equal(abandoned.state.finished, true, 'the reconnect branch armed no expiry');
+  assert.equal(armed.getBinding('t-race-expire'), undefined);
+
+  const resumed = new Registry(20);
+  registerFor(resumed, makeWs(WS_CLOSED));
+  const reclaimed = bindCapturing(resumed, 'a1', 't-race-resume');
+  registerFor(resumed, makeWs());
+  resumed.resumeBinding('t-race-resume', 'a1');
+  await sleep(80);
+  assert.equal(reclaimed.state.finished, false, 'a resumed hold must not expire');
+  assert.ok(resumed.getBinding('t-race-resume'));
+});
+
+test('a same-token reconnect is held whether or not the old socket looks live', async () => {
+  // `readyState === OPEN` is NOT a liveness test — it only means the server has
+  // not observed a close. The server runs no keepalive, and the client pings
+  // every 30s and terminates on a missed pong, so on a dead path the client
+  // notices first and its next hello arrives here with the old socket still
+  // nominally OPEN. Killing on "looks live" would kill the common recovered
+  // drop — the exact bug #474 exists to fix, relabeled `superseded`.
+  //
+  // So both socket states take the hold, and an unresumed hold expires into the
+  // `superseded` terminal this path has always produced.
+  for (const [label, state] of [
+    ['live-looking', WS_OPEN],
+    ['dead', WS_CLOSED],
+  ] as const) {
+    const registry = new Registry(20);
+    registerFor(registry, makeWs(state));
+    const task = bindCapturing(registry, 'a1', `t-collision-${label}`);
+
+    registerFor(registry, makeWs());
+
+    assert.ok(registry.getBinding(`t-collision-${label}`), `${label}: must be held, not killed`);
+    assert.equal(task.state.finished, false, `${label}: no premature terminal`);
+
+    await sleep(80);
+
+    assert.equal(task.state.finished, true, `${label}: an unresumed hold must expire`);
+    assert.equal(registry.getBinding(`t-collision-${label}`), undefined);
+    assert.match(terminalText(task), /superseded/, `${label}: expiry keeps this path's terminal`);
+  }
+});
+
+test('a reconnect reclaiming its task survives, even when the old socket still looked live', async () => {
+  // The payoff of the above: the client that reconnected is normally the SAME
+  // client, and one frame on the new connection rescues its in-flight work.
+  const registry = new Registry(20);
   registerFor(registry, makeWs(WS_OPEN));
-  const task = bindCapturing(registry, 'a1', 't-collision');
+  const task = bindCapturing(registry, 'a1', 't-collision-reclaim');
 
   registerFor(registry, makeWs());
+  registry.resumeBinding('t-collision-reclaim', 'a1');
 
-  assert.equal(registry.getBinding('t-collision'), undefined);
+  await sleep(80);
+
+  assert.equal(task.state.finished, false, 'a reclaimed task must not be failed');
+  assert.ok(registry.getBinding('t-collision-reclaim'));
+});
+
+test('a connection this server condemned is never rescued by a reconnect', () => {
+  // disconnectClient() closes with 4014 because the owner deleted the client.
+  // A hello arriving on that token before the close event lands must not
+  // resurrect its tasks through the reconnect branch.
+  const registry = new Registry(10_000);
+  const ws = makeWs();
+  registerFor(registry, ws, 'a1', 'c1');
+  const task = bindCapturing(registry, 'a1', 't-condemned');
+
+  assert.equal(registry.disconnectClient('c1'), 1);
+  registerFor(registry, makeWs(), 'a1', 'c1'); // the racing reconnect
+
+  assert.equal(
+    registry.getBinding('t-condemned'),
+    undefined,
+    'a deleted client must not be graced',
+  );
   assert.equal(task.state.finished, true);
-  assert.match(terminalText(task), /superseded/);
+  assert.match(terminalText(task), /disconnected mid-task/);
 });
 
 test('the late close of an already-replaced socket does not re-hold or double-fail', () => {
@@ -1077,4 +1166,151 @@ test('unregisterAgent with no close code holds (the #364 reconcile path)', () =>
 
   assert.ok(registry.getBinding('t-nocode'));
   assert.equal(task.state.finished, false);
+});
+
+// ---------------------------------------------------------------------------
+// Blast radius: a hold or a failure must touch ONE agent's tasks.
+//
+// The agent filters in failBindingsForAgent/holdBindingsForAgent were entirely
+// unconstrained — deleting either left the suite green, because no test had two
+// agents holding bindings at the same time. Without them a single client's
+// disconnect fails (or, 30s later, kills) every other client's in-flight work.
+// ---------------------------------------------------------------------------
+
+test('one agent disconnecting does not fail another agent\'s in-flight task', () => {
+  const registry = new Registry(0); // grace off: the immediate-fail path
+  const wsA = makeWs();
+  const wsB = makeWs();
+  registerFor(registry, wsA, 'a1', 'c1');
+  registerFor(registry, wsB, 'a2', 'c2');
+  const mine = bindCapturing(registry, 'a1', 't-mine');
+  const theirs = bindCapturing(registry, 'a2', 't-theirs');
+
+  registry.unregisterAgent('a1', wsA, 1012);
+
+  assert.equal(mine.state.finished, true);
+  assert.equal(theirs.state.finished, false, "another agent's task was failed");
+  assert.ok(registry.getBinding('t-theirs'));
+  assert.deepEqual(theirs.statuses, []);
+});
+
+test('one agent disconnecting does not hold — or later kill — another agent\'s task', async () => {
+  const registry = new Registry(20); // grace on: the hold path
+  const wsA = makeWs();
+  const wsB = makeWs();
+  registerFor(registry, wsA, 'a1', 'c1');
+  registerFor(registry, wsB, 'a2', 'c2');
+  bindCapturing(registry, 'a1', 't-a-task');
+  const theirs = bindCapturing(registry, 'a2', 't-b-task');
+
+  registry.unregisterAgent('a1', wsA, 1012);
+
+  // Past the deadline: a1's task expires, a2's — never held — must be untouched.
+  await sleep(80);
+
+  assert.equal(registry.getBinding('t-a-task'), undefined, "the disconnecting agent's task expired");
+  assert.equal(theirs.state.finished, false, "another agent's task was swept up in the hold");
+  assert.ok(registry.getBinding('t-b-task'));
+  assert.ok(registry.getAgent('a2'), 'the other agent is still connected');
+});
+
+// ---------------------------------------------------------------------------
+// The expiry timer's own cleanup is a FOURTH clear site.
+//
+// The guard-coverage note above lists three explicit clearGraceHold calls, but
+// the timer deletes its own map entry too. Leave that out and a naturally
+// expired hold's entry outlives it, and the `has()` skip then denies the next
+// binding for that taskId a hold of its own — the same successor failure the
+// three explicit sites are tested through.
+// ---------------------------------------------------------------------------
+
+test('a naturally expired hold clears its own entry, so the taskId can be held again', async () => {
+  const registry = new Registry(20);
+  const ws1 = makeWs();
+  registerFor(registry, ws1);
+  const first = bindCapturing(registry, 'a1', 't-reexpire');
+
+  registry.unregisterAgent('a1', ws1, 1012);
+  await sleep(80);
+  assert.equal(first.state.finished, true, 'precondition: the first hold expired');
+  assert.equal(registry.getBinding('t-reexpire'), undefined);
+
+  // The same taskId comes round again (A2A reuses a taskId across turns) and
+  // its client drops too.
+  const successor = bindCapturing(registry, 'a1', 't-reexpire');
+  const ws2 = makeWs();
+  registerFor(registry, ws2);
+  registry.unregisterAgent('a1', ws2, 1012);
+
+  await sleep(80);
+
+  assert.equal(successor.state.finished, true, 'a stale entry denied the successor its hold');
+  assert.equal(registry.getBinding('t-reexpire'), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// The production configuration path.
+//
+// `index.ts` constructs `new Registry()` with no argument, so the default, the
+// env parse and the clamp are exactly the code no other test reaches — every
+// grace test injects its value through the constructor. A typo'd default or a
+// broken parse would ship with a green suite.
+// ---------------------------------------------------------------------------
+
+test('resolveDisconnectGraceMs covers default, env, clamp and rejection', () => {
+  assert.deepEqual(resolveDisconnectGraceMs(undefined), {
+    ms: FALLBACK_DISCONNECT_GRACE_MS,
+    source: 'default',
+  });
+  assert.deepEqual(resolveDisconnectGraceMs(''), {
+    ms: FALLBACK_DISCONNECT_GRACE_MS,
+    source: 'default',
+  });
+  assert.deepEqual(resolveDisconnectGraceMs('45000'), { ms: 45_000, source: 'env' });
+  // 0 is the documented kill switch and must survive as a real 0, not be
+  // mistaken for "unset".
+  assert.deepEqual(resolveDisconnectGraceMs('0'), { ms: 0, source: 'env' });
+  assert.deepEqual(resolveDisconnectGraceMs(String(MAX_DISCONNECT_GRACE_MS)), {
+    ms: MAX_DISCONNECT_GRACE_MS,
+    source: 'env',
+  });
+  // Past setTimeout's ceiling the timer would collapse to 1ms — i.e. asking for
+  // a very long hold would silently give none at all.
+  assert.deepEqual(resolveDisconnectGraceMs(String(MAX_DISCONNECT_GRACE_MS + 1)), {
+    ms: MAX_DISCONNECT_GRACE_MS,
+    source: 'clamped',
+  });
+  // `-1` is a common "disable" idiom; silently restoring the 30s default would
+  // be the opposite of the operator's intent, so it is reported as invalid.
+  assert.deepEqual(resolveDisconnectGraceMs('-1'), {
+    ms: FALLBACK_DISCONNECT_GRACE_MS,
+    source: 'invalid',
+  });
+  assert.deepEqual(resolveDisconnectGraceMs('30s'), {
+    ms: FALLBACK_DISCONNECT_GRACE_MS,
+    source: 'invalid',
+  });
+});
+
+test('a default-constructed Registry actually grants a grace hold', async () => {
+  // The shape production runs (`new Registry()`, index.ts). Guards the default
+  // constant itself: at 0 the feature is off and this binding would be failed
+  // on the spot.
+  const registry = new Registry();
+  const ws = makeWs();
+  registerFor(registry, ws);
+  const task = bindCapturing(registry, 'a1', 't-default');
+
+  registry.unregisterAgent('a1', ws, 1012);
+
+  assert.ok(registry.getBinding('t-default'), 'the default grace is disabled');
+  assert.equal(task.state.finished, false);
+
+  // Long enough to prove it is not a near-zero timer, short enough to stay a
+  // unit test. The real deadline is minutes away in wall-clock terms.
+  await sleep(60);
+  assert.ok(registry.getBinding('t-default'), 'the default grace is far too short');
+
+  // Don't leave a live 30s hold behind for the runner to trip over.
+  registry.unbindTask('t-default', registry.getBinding('t-default')!);
 });

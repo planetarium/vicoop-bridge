@@ -38,6 +38,22 @@ primary_region = "nrt"
   # healthily-heartbeating long task is never reaped. "0" disables it. Must sit
   # above the longest legitimate silent gap for non-heartbeating backends.
   BRIDGE_TASK_INACTIVITY_TIMEOUT_MS = "600000"
+  # Reconnect grace hold (ms) for an in-flight task whose client's WebSocket
+  # drops (issue #474). Rather than failing the task the instant the socket
+  # goes, the bridge keeps its binding alive for this long so the client — which
+  # reconnects in ~3s and is usually still working — can land its result on it.
+  # ANY frame for that task on the new connection (a heartbeat is enough)
+  # resumes the binding, so this is "how long to wait before declaring a client
+  # dead", NOT a cap on task duration. An unresumed hold then fails exactly as
+  # an ungraced drop always did, just this much later.
+  #
+  # Sized off the 2026-08-20 fly-proxy incident, where the recovered clients'
+  # terminal frames arrived +9s/+10s/+15s after the drop — so it has to cover
+  # task completion, not the 3.2s reconnect.
+  #
+  # "0" disables it and restores the previous fail-immediately behavior exactly:
+  # this is the rollback lever if holds ever delay failover more than they save.
+  BRIDGE_DISCONNECT_GRACE_MS = "30000"
 
 [http_service]
   internal_port = 8787

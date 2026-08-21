@@ -1266,3 +1266,210 @@ test('usage.request: a throwing backend.usage() replies ok:false / usage_failed'
   assert.equal(resp.error?.code, 'usage_failed');
   assert.match(resp.error?.message ?? '', /serve down/);
 });
+
+// ---------------------------------------------------------------------------
+// Offline frame buffer (vicoop-bridge#474 follow-up).
+//
+// `send()` used to drop any frame produced while the socket was down. The
+// server-side reconnect grace keeps the task alive across the drop, but that
+// only helps if the client's output actually arrives — so frames produced
+// during the outage are buffered and replayed on the next connection.
+// ---------------------------------------------------------------------------
+
+test('frames produced while disconnected are replayed on the next connection', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+
+  // Every frame the server ever receives, across both connections.
+  const received: Array<Record<string, unknown>> = [];
+  let connections = 0;
+  let firstSocket: WebSocket | undefined;
+  wss.on('connection', (ws) => {
+    connections++;
+    if (connections === 1) firstSocket = ws;
+    ws.on('message', (raw) => {
+      received.push(JSON.parse(raw.toString('utf8')) as Record<string, unknown>);
+    });
+  });
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => undefined),
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(() => received.some((f) => f.type === 'hello'), 'first hello');
+
+    // Kill the connection from the server side and let the client notice.
+    firstSocket!.close(1012, 'restarting');
+    await waitFor(() => (client as never as { ws?: { readyState: number } }).ws?.readyState !== 1, 'socket down');
+
+    // The backend keeps working through the outage: a delta, then the terminal.
+    const send = (client as never as { send(f: unknown): void }).send.bind(client);
+    send({
+      type: 'task.artifact',
+      taskId: 't-1',
+      artifact: { artifactId: 'a-1', parts: [{ kind: 'text', text: 'lost text' }] },
+      append: true,
+      lastChunk: false,
+    });
+    send({
+      type: 'task.complete',
+      taskId: 't-1',
+      status: { state: 'completed', timestamp: new Date().toISOString() },
+    });
+
+    // Nothing reached the server yet — the socket was down.
+    assert.equal(received.filter((f) => f.taskId === 't-1').length, 0);
+
+    await waitFor(() => connections >= 2, 'reconnect');
+    await waitFor(
+      () => received.some((f) => f.type === 'task.complete' && f.taskId === 't-1'),
+      'the buffered terminal to be replayed',
+    );
+
+    const forTask = received.filter((f) => f.taskId === 't-1');
+    assert.deepEqual(
+      forTask.map((f) => f.type),
+      ['task.artifact', 'task.complete'],
+      'replay must preserve production order',
+    );
+    // The artifact must arrive intact — this is the text that used to vanish.
+    const artifact = forTask[0] as { artifact: { parts: Array<{ text: string }> } };
+    assert.equal(artifact.artifact.parts[0]?.text, 'lost text');
+
+    // And it lands behind the new hello, so the server has claimed the
+    // connection before the replay reaches it.
+    const helloIdx = received.findIndex((f, i) => f.type === 'hello' && i > 0);
+    const replayIdx = received.findIndex((f) => f.taskId === 't-1');
+    assert.ok(helloIdx >= 0 && helloIdx < replayIdx, 'replay must follow the reconnect hello');
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
+test('a task that overflows the buffer is failed rather than replayed with a hole', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+
+  const received: Array<Record<string, unknown>> = [];
+  let connections = 0;
+  let firstSocket: WebSocket | undefined;
+  wss.on('connection', (ws) => {
+    connections++;
+    if (connections === 1) firstSocket = ws;
+    ws.on('message', (raw) => {
+      received.push(JSON.parse(raw.toString('utf8')) as Record<string, unknown>);
+    });
+  });
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => undefined),
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    maxPendingFrames: 2,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(() => received.some((f) => f.type === 'hello'), 'first hello');
+    firstSocket!.close(1012, 'restarting');
+    await waitFor(() => (client as never as { ws?: { readyState: number } }).ws?.readyState !== 1, 'socket down');
+
+    const send = (client as never as { send(f: unknown): void }).send.bind(client);
+    for (const text of ['one', 'two', 'three', 'four']) {
+      send({
+        type: 'task.artifact',
+        taskId: 't-big',
+        artifact: { artifactId: 'a-1', parts: [{ kind: 'text', text }] },
+        append: true,
+        lastChunk: false,
+      });
+    }
+
+    await waitFor(() => connections >= 2, 'reconnect');
+    await waitFor(
+      () => received.some((f) => f.type === 'task.fail' && f.taskId === 't-big'),
+      'the truncated task to be failed',
+    );
+
+    const forTask = received.filter((f) => f.taskId === 't-big');
+    // A partial replay would be the silent hole this whole mechanism exists to
+    // prevent, so the surviving frames are discarded in favour of an honest
+    // failure the caller can retry.
+    assert.deepEqual(forTask.map((f) => f.type), ['task.fail']);
+    const failure = forTask[0] as { error: { code: string } };
+    assert.equal(failure.error.code, 'client_buffer_overflow');
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
+test('maxPendingFrames: 0 restores the previous drop-on-the-floor behavior', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+
+  const received: Array<Record<string, unknown>> = [];
+  let connections = 0;
+  let firstSocket: WebSocket | undefined;
+  wss.on('connection', (ws) => {
+    connections++;
+    if (connections === 1) firstSocket = ws;
+    ws.on('message', (raw) => {
+      received.push(JSON.parse(raw.toString('utf8')) as Record<string, unknown>);
+    });
+  });
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => undefined),
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    maxPendingFrames: 0,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(() => received.some((f) => f.type === 'hello'), 'first hello');
+    firstSocket!.close(1012, 'restarting');
+    await waitFor(() => (client as never as { ws?: { readyState: number } }).ws?.readyState !== 1, 'socket down');
+
+    (client as never as { send(f: unknown): void }).send.call(client, {
+      type: 'task.complete',
+      taskId: 't-off',
+      status: { state: 'completed', timestamp: new Date().toISOString() },
+    });
+
+    await waitFor(() => connections >= 2, 'reconnect');
+    // Give any replay a chance to arrive before asserting its absence.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(received.filter((f) => f.taskId === 't-off'), []);
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});

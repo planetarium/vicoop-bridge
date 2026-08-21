@@ -98,15 +98,51 @@ export type AgentChangeListener = (agentId: string) => void;
 // inactivity backstop is what governs.
 //
 // `0` disables the hold and restores the previous fail-immediately behavior.
+export const FALLBACK_DISCONNECT_GRACE_MS = 30_000;
+// Node's setTimeout silently clamps anything past the signed-32-bit ceiling to
+// 1ms, so an operator who typed a very large number to mean "hold a long time"
+// would get the opposite — holds that expire immediately. Cap instead, so the
+// value can only ever mean what it says.
+export const MAX_DISCONNECT_GRACE_MS = 2_147_483_647;
+
+/**
+ * Parse `BRIDGE_DISCONNECT_GRACE_MS`. Exported so the production configuration
+ * path — the one `new Registry()` actually takes — is reachable from tests;
+ * every grace test injects its value through the constructor, so without this
+ * a typo'd default or broken parse would ship green.
+ *
+ * Returns the effective grace plus why, so the caller can say so out loud
+ * rather than silently coercing. A negative value is rejected rather than
+ * treated as "off": `0` is the documented disable switch, and `-1` is a common
+ * enough idiom for it that silently re-enabling a 30s hold would be the exact
+ * opposite of what the operator asked for.
+ */
+export function resolveDisconnectGraceMs(raw: string | undefined): {
+  ms: number;
+  source: 'default' | 'env' | 'clamped' | 'invalid';
+} {
+  if (raw === undefined || raw === '') return { ms: FALLBACK_DISCONNECT_GRACE_MS, source: 'default' };
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    return { ms: FALLBACK_DISCONNECT_GRACE_MS, source: 'invalid' };
+  }
+  if (n > MAX_DISCONNECT_GRACE_MS) return { ms: MAX_DISCONNECT_GRACE_MS, source: 'clamped' };
+  return { ms: n, source: 'env' };
+}
+
 const DEFAULT_DISCONNECT_GRACE_MS = (() => {
-  const raw = process.env.BRIDGE_DISCONNECT_GRACE_MS;
-  const n = raw ? Number(raw) : Number.NaN;
-  if (!Number.isFinite(n) || n < 0) return 30_000;
-  // Node's setTimeout silently clamps anything past the signed-32-bit ceiling
-  // to 1ms, so an operator who typed a very large number to mean "hold a long
-  // time" would get the opposite — holds that expire immediately. Cap instead,
-  // so the value can only ever mean what it says.
-  return Math.min(n, 2_147_483_647);
+  const resolved = resolveDisconnectGraceMs(process.env.BRIDGE_DISCONNECT_GRACE_MS);
+  // Emitted once at module load. The grace decides whether a task survives a
+  // drop, and `0` is the rollback lever, so an operator must never have to read
+  // the source to find out which one is in effect.
+  logEvent('disconnect_grace_configured', {
+    graceMs: resolved.ms,
+    source: resolved.source,
+    ...(resolved.source === 'invalid' || resolved.source === 'clamped'
+      ? { requested: truncate(String(process.env.BRIDGE_DISCONNECT_GRACE_MS), 64) }
+      : {}),
+  });
+  return resolved.ms;
 })();
 
 /**
@@ -163,6 +199,12 @@ interface GraceHold {
   // held may be failed by its own timer. A rebind of the same taskId while the
   // hold is pending must never be collateral damage.
   binding: TaskBinding;
+  // Diagnostics carried from the hold to whichever event ends it. `heldForMs`
+  // on a resume is the one number that answers "is T long enough?" — the
+  // distribution of how long real recoveries actually take.
+  heldAt: number;
+  via: 'disconnect' | 'reconnect';
+  closeCode: number | undefined;
 }
 
 export class Registry {
@@ -207,13 +249,10 @@ export class Registry {
           clientId: conn.clientId,
           previousConnectedAt: existing.connectedAt,
         });
-        // Read the liveness of the displaced socket BEFORE closing it. `ws`
-        // sets `_readyState = CLOSING` synchronously inside `close()`, so
-        // asking afterwards would report not-OPEN unconditionally and collapse
-        // the two cases below into one — the fail-fast branch would be
-        // unreachable in production while still passing against a stub whose
-        // `close()` leaves readyState alone.
-        const displacedWasLive = existing.ws.readyState === existing.ws.OPEN;
+        // Whether this connection was already condemned has to be read BEFORE
+        // closing it: `ws` flips `_readyState` to CLOSING synchronously inside
+        // `close()`, so any liveness question asked afterwards answers itself.
+        const displacedWasCondemned = this.serverClosed.has(existing.ws);
         // The close `reason` is what the client surfaces in its disconnect
         // log line. Spelling out the cause here means an operator reading
         // the foreground log can recognize the duplicate-token scenario
@@ -227,29 +266,38 @@ export class Registry {
         // point that sees them. The new conn hasn't bound any tasks yet, so
         // this only touches the superseded ones.
         //
-        // Whether we kill or hold them turns on whether the old socket is still
-        // alive (issue #474). Which of the two paths a recovered drop takes is a
-        // pure race — the server may see the old socket's close first (→
-        // unregisterAgent) or the new hello first (→ here) — so both have to
-        // reach the same verdict, otherwise the fix works only when the events
-        // happen to arrive in the lucky order.
+        // These get the SAME grace hold the disconnect path gives them, and
+        // that uniformity is the point (issue #474). Which path a recovered drop
+        // takes is a pure race — the server may see the old socket's close first
+        // (→ unregisterAgent) or the new hello first (→ here) — so both must
+        // reach the same verdict, or the fix works only in the lucky ordering.
         //
-        // An already-dead old socket means the transport is gone and this hello
-        // is the same client coming back: hold, exactly as the disconnect path
-        // would. There is no close code to consult (the close event hasn't been
-        // delivered yet), but a socket that died without one of our own 4xxx
-        // closes is by definition in the graceable category.
+        // An earlier revision tried to keep the old fail-fast behavior for the
+        // "two live daemons share a CLIENT_TOKEN" case by testing
+        // `readyState === OPEN` here. That is not a liveness test: it only says
+        // the server has not OBSERVED a close. The server runs no keepalive of
+        // its own, and the client is built to notice first — it pings every 30s
+        // and terminates on a missed pong, which on a dead path never reaches
+        // us. So the common client-detected drop arrives here with the old
+        // socket still nominally OPEN and would be killed instantly: exactly the
+        // bug #474 exists to fix, relabeled `superseded`.
         //
-        // A still-live old socket is the genuine collision this path was written
-        // for: two live daemons sharing a CLIENT_TOKEN. That is not a recovered
-        // drop and there is nothing to wait for, so it keeps failing instantly.
+        // Holding a genuine collision instead is cheap: the second daemon does
+        // not know the first one's taskIds, so it never sends frames for them
+        // and the holds simply expire. We trade a more precise error code and T
+        // seconds of latency for not misclassifying the case that actually
+        // happens.
+        //
+        // The one exception is a connection this server already condemned (the
+        // owner deleted the client). Its tasks are dead regardless of who
+        // reconnects, so it keeps failing immediately.
         const supersededError = {
           code: 'superseded',
           message: 'superseded by a reconnect from the same client token',
           messageIdSuffix: 'superseded',
         };
-        if (displacedWasLive) {
-          this.failBindingsForAgent(conn.agentId, supersededError);
+        if (displacedWasCondemned) {
+          this.failBindingsForAgent(conn.agentId, DISCONNECTED_ERROR);
         } else {
           this.holdBindingsForAgent(conn.agentId, undefined, 'reconnect', supersededError);
         }
@@ -308,6 +356,17 @@ export class Registry {
   // whether the in-flight tasks die now or get a grace hold. The agent itself
   // leaves the `agents` map either way — it is offline until it says hello
   // again, so routing and agent-card consumers see no change from this.
+  /**
+   * Record that THIS server is closing `ws` with an app-level verdict, before
+   * calling `ws.close(4xxx)`. Callers outside the registry (ws.ts's handshake
+   * and protocol rejections) use this so their intent survives the round trip
+   * — see `serverClosed`, which explains why the observed close code cannot be
+   * trusted for that decision.
+   */
+  noteServerClose(ws: WebSocket): void {
+    this.serverClosed.add(ws);
+  }
+
   unregisterAgent(agentId: string, ws: WebSocket, closeCode?: number): void {
     const existing = this.agents.get(agentId);
     if (!existing || existing.ws !== ws) return;
@@ -329,21 +388,26 @@ export class Registry {
   // nothing about a TaskBinding is connection-scoped (no `ws` field; outbound
   // sends re-resolve the connection by agentId at send time), which is what
   // makes a hold this cheap.
-  // `disabledFallback` is the terminal to emit if the grace is switched off
-  // (`BRIDGE_DISCONNECT_GRACE_MS=0`). It differs per caller so that disabling
-  // the feature reproduces the pre-#474 behavior exactly — including the
-  // `superseded` wording the reconnect path has always used — rather than
-  // leaking this path's own error onto it. Expiry, by contrast, is always
-  // `disconnected`: a hold that runs out means the client never came back for
-  // the task, whichever path started the hold.
+  // `terminalError` is what this hold resolves to if it is never resumed —
+  // both when it expires and, immediately, when the grace is switched off
+  // (`BRIDGE_DISCONNECT_GRACE_MS=0`). It is the caller's own terminal, so each
+  // path's unresumed outcome is byte-identical to what it produced before the
+  // grace existed, just T later: `disconnected` for a drop, `superseded` for a
+  // same-token reconnect that never reclaimed the task.
+  //
+  // Keeping them distinct matters downstream: `disconnected` is the code the
+  // router's cooldown amplifier keys on, and a client that demonstrably came
+  // back (we saw its hello) but did not reclaim an old task is not a
+  // disconnected agent — reporting it as one would manufacture exactly the
+  // false failure signal issue #474 exists to remove.
   private holdBindingsForAgent(
     agentId: string,
     closeCode: number | undefined,
     via: 'disconnect' | 'reconnect',
-    disabledFallback: TerminalError,
+    terminalError: TerminalError,
   ): void {
     if (this.disconnectGraceMs <= 0) {
-      this.failBindingsForAgent(agentId, disabledFallback);
+      this.failBindingsForAgent(agentId, terminalError);
       return;
     }
     for (const binding of [...this.bindings.values()]) {
@@ -352,25 +416,31 @@ export class Registry {
       // binding whose hold is still pending). Leave the original deadline in
       // place rather than sliding it forward on every event.
       if (this.graceHolds.has(binding.taskId)) continue;
+      const heldAt = Date.now();
       const timer = setTimeout(() => {
         this.graceHolds.delete(binding.taskId);
-        // The client never came back for this task. Fail it exactly the way an
-        // ungraced disconnect always has — same code, same message, same
-        // messageId suffix — so nothing downstream has to learn a new shape.
-        // The only difference is that it happens `disconnectGraceMs` later.
+        // Never resumed. Fail it exactly the way this path always has — same
+        // code, same message, same messageId suffix — so nothing downstream has
+        // to learn a new shape. The only difference is that it happens
+        // `disconnectGraceMs` later.
         if (this.bindings.get(binding.taskId) !== binding) return;
+        // Carries the same `via`/`closeCode` as the hold that armed it, so the
+        // expiry line alone answers "which drop killed this task" without a
+        // timestamp join back to binding_grace_held.
         logEvent('binding_grace_expired', {
           agentId: binding.agentId,
           taskId: binding.taskId,
           graceMs: this.disconnectGraceMs,
+          via,
+          ...(closeCode !== undefined ? { closeCode } : {}),
           ...(binding.principalId !== undefined ? { principalId: binding.principalId } : {}),
         });
-        this.failBinding(binding, DISCONNECTED_ERROR);
+        this.failBinding(binding, terminalError);
         this.bindings.delete(binding.taskId);
       }, this.disconnectGraceMs);
       // Never let a pending hold keep the process alive on its own.
       timer.unref?.();
-      this.graceHolds.set(binding.taskId, { timer, binding });
+      this.graceHolds.set(binding.taskId, { timer, binding, heldAt, via, closeCode });
       logEvent('binding_grace_held', {
         agentId: binding.agentId,
         taskId: binding.taskId,
@@ -407,6 +477,10 @@ export class Registry {
     logEvent('binding_grace_resumed', {
       agentId,
       taskId,
+      heldForMs: Date.now() - hold.heldAt,
+      graceMs: this.disconnectGraceMs,
+      via: hold.via,
+      ...(hold.closeCode !== undefined ? { closeCode: hold.closeCode } : {}),
       ...(hold.binding.principalId !== undefined
         ? { principalId: hold.binding.principalId }
         : {}),

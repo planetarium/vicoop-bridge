@@ -7,6 +7,7 @@ import {
   type Part,
   type TaskStatus as WireTaskStatus,
   type Message as WireMessage,
+  type UpFrame,
 } from '@vicoop-bridge/protocol';
 import type { Message, TaskStatus } from '@a2x/sdk';
 import { TaskState } from '@a2x/sdk';
@@ -231,9 +232,12 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
     const b = opts.registry.getBinding(taskId);
     if (!b) return undefined;
     if (b.agentId !== agentId) {
+      // `taskId` comes straight off the frame, so a client can make this line
+      // as long as it likes — and it can emit one per frame. Truncate like
+      // every other client-controlled string we log.
       logEvent('binding_owner_mismatch', {
         agentId: agentId ?? undefined,
-        taskId,
+        taskId: truncate(taskId, 128),
         ownerAgentId: b.agentId,
       });
       return undefined;
@@ -245,18 +249,45 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
     if (!authed) ws.close(4001, 'hello timeout');
   }, 10_000);
 
+  // Frames that arrived after `hello` but before its async authentication
+  // settled. A client replaying buffered work on reconnect pipelines them
+  // immediately behind the hello, and the DB token lookup takes long enough
+  // that they nearly always win the race — rejecting them would turn every
+  // replay into a 4003 close and a reconnect loop. Bounded, and discarded
+  // untouched if authentication fails.
+  let preAuthQueue: UpFrame[] = [];
+  const MAX_PRE_AUTH_FRAMES = 256;
+
   ws.on('message', (raw) => {
     let frame;
     try {
       frame = parseUpFrame(typeof raw === 'string' ? raw : raw.toString('utf8'));
     } catch (err) {
+      // A protocol violation is our verdict on this connection, so its
+      // in-flight tasks must not earn a reconnect grace hold no matter what
+      // close code we end up observing (see Registry.noteServerClose).
+      opts.registry.noteServerClose(ws);
       ws.close(4002, `invalid frame: ${(err as Error).message}`);
       return;
     }
 
     if (!authed) {
       if (frame.type !== 'hello') {
-        ws.close(4003, 'expected hello');
+        // The first frame must still be a hello — that guard is what keeps
+        // unannounced peers out. Once a hello IS in flight, though, the
+        // connection is claimed and further frames are just early, not
+        // illegal.
+        if (!helloProcessing) {
+          ws.close(4003, 'expected hello');
+          return;
+        }
+        if (preAuthQueue.length >= MAX_PRE_AUTH_FRAMES) {
+          logEvent('pre_auth_overflow', { frames: preAuthQueue.length });
+          opts.registry.noteServerClose(ws);
+          ws.close(4002, 'too many frames before authentication');
+          return;
+        }
+        preAuthQueue.push(frame);
         return;
       }
       if (frame.version !== PROTOCOL_VERSION) {
@@ -298,6 +329,16 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           name: result.cardName,
           cardSource: result.cardSource,
         });
+        // Deliver anything the client pipelined behind its hello, in arrival
+        // order, before any later frame is processed. This is what makes a
+        // reconnecting client's replay land on the tasks its grace hold is
+        // keeping alive (issue #474).
+        const queued = preAuthQueue;
+        preAuthQueue = [];
+        if (queued.length > 0) {
+          logEvent('pre_auth_replayed', { agentId, frames: queued.length });
+          for (const queuedFrame of queued) processAuthedFrame(queuedFrame);
+        }
       }).catch((err) => {
         console.error('[server] auth error:', err);
         ws.close(1011, 'internal error');
@@ -305,6 +346,10 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       return;
     }
 
+    processAuthedFrame(frame);
+  });
+
+  function processAuthedFrame(frame: UpFrame): void {
     // Any task-scoped frame on an authenticated connection is proof that the
     // client is alive and still working this task, which is exactly the signal
     // that cancels a reconnect grace hold (issue #474). Doing it here rather
@@ -373,7 +418,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           // wedged SSE stream, and this path is otherwise silent.
           logEvent('dropped_terminal_frame', {
             agentId: agentId ?? undefined,
-            taskId: frame.taskId,
+            taskId: truncate(frame.taskId, 128),
             kind: 'task.complete',
             state: frame.status.state,
           });
@@ -408,7 +453,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         if (!b) {
           logEvent('dropped_terminal_frame', {
             agentId: agentId ?? undefined,
-            taskId: frame.taskId,
+            taskId: truncate(frame.taskId, 128),
             kind: 'task.fail',
             errorCode: frame.error.code,
           });
@@ -452,10 +497,11 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       case 'pong':
         break;
       case 'hello':
+        opts.registry.noteServerClose(ws);
         ws.close(4007, 'duplicate hello');
         break;
     }
-  });
+  }
 
   ws.on('close', (code: number, reason: Buffer) => {
     clearTimeout(helloTimeout);

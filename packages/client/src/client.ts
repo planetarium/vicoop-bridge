@@ -42,6 +42,10 @@ export interface ClientOptions {
   reconnectMaxDelayMs?: number;
   reconnectJitterRatio?: number;
   reconnectStableMs?: number;
+  // Maximum number of task frames held for replay while the bridge connection
+  // is down (see `pendingFrames`). `0` disables buffering and restores the
+  // previous drop-on-the-floor behavior.
+  maxPendingFrames?: number;
   // Minimum reconnect delay after a 4009 "another client with the same
   // token connected" close — i.e. two daemons authenticated with the
   // same CLIENT_TOKEN colliding at the registry's clientId check. The
@@ -101,6 +105,12 @@ const DEFAULT_PROBE_DEADLINE_MS = 12_000;
 const DEFAULT_RECONNECT_DELAY_MS = 3000;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 30_000;
 const DEFAULT_RECONNECT_JITTER_RATIO = 0.2;
+// Cap on frames held for replay across a reconnect. Sized for the realistic
+// worst case — a turn's streamed text is a few hundred small artifact frames —
+// with headroom, while still bounding a daemon that keeps producing into a long
+// outage. A task that loses frames to this cap is failed rather than replayed
+// with a hole; see bufferUnsent(). `0` disables buffering entirely.
+const DEFAULT_MAX_PENDING_FRAMES = 2_000;
 const DEFAULT_RECONNECT_STABLE_MS = 60_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
 const DEFAULT_COLLISION_BACKOFF_MS = 300_000;
@@ -124,6 +134,28 @@ export class Client {
   // don't re-probe on every bridge WS reconnect — the underlying upstream
   // doesn't change mid-process.
   private effectiveCardPromise: Promise<AgentCard | undefined> | null = null;
+  // Task frames `send()` could not put on the wire because the socket was
+  // down, held in arrival order for replay on the next connection.
+  //
+  // Without this, a reconnect silently loses whatever the backend produced
+  // during the outage: streamed deltas vanish mid-answer while the backend's
+  // own bookkeeping advances past them, so the end-of-turn catch-up never
+  // re-sends them and the task completes with a hole. Worse, a backend that
+  // FINISHES during the outage loses its terminal frame outright and never
+  // re-emits it, so a fully successful task is reported as failed once the
+  // server's reconnect grace expires (vicoop-bridge#474).
+  //
+  // Replaying is safe and needs no server support beyond that grace hold: a
+  // TaskBinding is not tied to a connection, so a frame arriving on the new
+  // socket lands on the original task untouched. Frames for a task whose hold
+  // already expired are dropped by the server as `dropped_terminal_frame`,
+  // which is what would have happened anyway.
+  private pendingFrames: Array<{ taskId: string; frame: UpFrame }> = [];
+  // Tasks that lost at least one frame to the cap. Their replay would be a
+  // hole rather than a delay, so they are failed explicitly instead — a caller
+  // is far better served by an honest failure it can retry than by a silently
+  // truncated answer.
+  private truncatedTasks = new Set<string>();
   private readonly logger: Logger;
 
   constructor(private readonly opts: ClientOptions) {
@@ -149,6 +181,9 @@ export class Client {
     // Abort all inflight tasks so backends can unwind cleanly instead of
     // running to completion after the WS is gone.
     for (const controller of this.inflight.values()) controller.abort();
+    // Nothing will replay these — the process is going away.
+    this.pendingFrames = [];
+    this.truncatedTasks.clear();
     this.ws?.close();
     // Tear down long-lived backend resources (e.g. codex app-server child).
     // Per-task abort above covers per-handle subprocesses; this hook is for
@@ -310,6 +345,10 @@ export class Client {
             protocolCapabilities: [CALLER_CONTEXT_CAPABILITY],
           }),
         );
+        // Immediately behind the hello, on this same socket, so the replay is
+        // the first thing the server sees for these tasks — before any frame
+        // the backend produces next.
+        this.flushPendingFrames(ws);
       };
       // The internal catch inside resolveEffectiveCard() already coerces
       // every failure into "return base", so this `.catch` is defense in
@@ -556,8 +595,75 @@ export class Client {
   }
 
   private send(frame: UpFrame): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(encodeFrame(frame));
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(encodeFrame(frame));
+      return;
+    }
+    this.bufferUnsent(frame);
+  }
+
+  // Queue a frame the socket could not take. Only task-scoped frames are worth
+  // keeping: `pong` answers a ping that has long since timed out, and
+  // `usage.response` answers a requestId the server forgot when the connection
+  // died. Replaying either would be noise at best.
+  private bufferUnsent(frame: UpFrame): void {
+    if (this.stopped) return;
+    if (!('taskId' in frame)) return;
+    const limit = this.opts.maxPendingFrames ?? DEFAULT_MAX_PENDING_FRAMES;
+    if (limit <= 0) return;
+    this.pendingFrames.push({ taskId: frame.taskId, frame });
+    while (this.pendingFrames.length > limit) {
+      // Drop the OLDEST, so what survives is the tail nearest the terminal —
+      // but record the victim's task, because a partial replay of a text
+      // stream is exactly the silent hole this buffer exists to prevent.
+      const dropped = this.pendingFrames.shift()!;
+      if (!this.truncatedTasks.has(dropped.taskId)) {
+        this.truncatedTasks.add(dropped.taskId);
+        this.logger.warn(
+          `offline frame buffer full (${limit}); task ${safeToken(dropped.taskId)} will be failed instead of replayed`,
+        );
+      }
+    }
+  }
+
+  // Replay buffered frames onto a freshly authenticated connection, in the
+  // order they were produced. Sent on the captured socket rather than through
+  // `send()` so a replay can never re-enter the buffer and loop.
+  //
+  // These are pipelined immediately behind `hello`: the server queues frames
+  // that arrive while its (async) authentication is still settling and
+  // processes them once it completes, so no ack round-trip is needed.
+  private flushPendingFrames(ws: WebSocket): void {
+    const queued = this.pendingFrames;
+    const truncated = this.truncatedTasks;
+    this.pendingFrames = [];
+    this.truncatedTasks = new Set();
+    if (queued.length === 0 && truncated.size === 0) return;
+    if (ws.readyState !== WebSocket.OPEN) return;
+
+    let replayed = 0;
+    for (const entry of queued) {
+      if (truncated.has(entry.taskId)) continue;
+      ws.send(encodeFrame(entry.frame));
+      replayed++;
+    }
+    for (const taskId of truncated) {
+      this.inflight.get(taskId)?.abort();
+      ws.send(
+        encodeFrame({
+          type: 'task.fail',
+          taskId,
+          error: {
+            code: 'client_buffer_overflow',
+            message: 'output was lost while the bridge connection was down',
+          },
+        }),
+      );
+    }
+    this.logger.info(
+      `replayed ${replayed} buffered frame(s) after reconnect` +
+        (truncated.size > 0 ? `; failed ${truncated.size} truncated task(s)` : ''),
+    );
   }
 
   // Answer a server-initiated usage.request by querying the backend's optional

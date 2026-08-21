@@ -80,6 +80,23 @@ function makeSink(): TaskSink & {
   };
 }
 
+// `await sink.finished` on its own turns any regression that stops producing a
+// terminal into an infinite hang: the runner reports nothing, and CI only goes
+// red on job timeout. Bound every such wait.
+async function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms waiting for ${what}`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function waitForAgent(registry: Registry, agentId: string): Promise<void> {
   const deadline = Date.now() + 1_000;
   while (!registry.getAgent(agentId)) {
@@ -132,7 +149,7 @@ test('task.fail preserves backend error code and message on status message metad
       },
     }));
 
-    await sink.finished;
+    await withTimeout(sink.finished, 5_000, 'the task terminal');
 
     assert.equal(sink.statuses.length, 1);
     const event = sink.statuses[0]!;
@@ -534,7 +551,7 @@ test('task.fail omits terminal error metadata when openai-compat extension was n
       },
     }));
 
-    await sink.finished;
+    await withTimeout(sink.finished, 5_000, 'the task terminal');
 
     const event = sink.statuses[0]!;
     assert.equal(event.status.state, 'failed');
@@ -621,7 +638,7 @@ test('a task survives a proxy-style disconnect and completes on the reconnected 
       },
     }));
 
-    await sink.finished;
+    await withTimeout(sink.finished, 5_000, 'the task terminal');
 
     const terminal = sink.statuses.at(-1)!;
     assert.equal(terminal.final, true);
@@ -641,7 +658,12 @@ test('a task survives a proxy-style disconnect and completes on the reconnected 
 
 test('an app-level close code fails in-flight tasks immediately, with no grace hold', async () => {
   const server = createServer();
-  const registry = new Registry(10_000);
+  // An hour, deliberately: the point of this test is that the close code
+  // reaches unregisterAgent at all. With a short grace the assertions below
+  // pass either way — a severed code argument just means the hold expires into
+  // a byte-identical terminal a few seconds later, and the only trace is the
+  // test's own duration. Nothing here may be rescued by expiry.
+  const registry = new Registry(60 * 60_000);
   attachWsServer(server, { db: mockSql(), registry });
   const port = await listen(server);
   const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
@@ -661,7 +683,7 @@ test('an app-level close code fails in-flight tasks immediately, with no grace h
 
     registry.getAgent('agent-1')!.ws.close(4014, 'client deleted');
 
-    await sink.finished;
+    await withTimeout(sink.finished, 5_000, 'the immediate app-level-close terminal');
 
     const terminal = sink.statuses.at(-1)!;
     assert.equal(terminal.final, true);
@@ -763,7 +785,7 @@ test('a heartbeat on the reconnected socket keeps a task alive past the original
       },
     }));
 
-    await sink.finished;
+    await withTimeout(sink.finished, 5_000, 'the task terminal');
 
     const terminal = sink.statuses.at(-1)!;
     assert.equal(terminal.status.state, 'completed');
@@ -846,7 +868,7 @@ test('an agent cannot push frames into another agent\'s task', async () => {
           message: { role: 'agent', messageId: 'm-ok', parts: [{ kind: 'text', text: 'real answer' }] },
         },
       }));
-      await sink.finished;
+      await withTimeout(sink.finished, 5_000, 'the task terminal');
       // Re-read through the typed alias: the `deepEqual(…, [])` above narrows
       // `sink.statuses` to never[] for the rest of this block.
       const delivered: TaskStatusUpdateEvent[] = sink.statuses;
@@ -863,14 +885,19 @@ test('an agent cannot push frames into another agent\'s task', async () => {
   }
 });
 
-test('a live duplicate-token collision supersedes immediately, against real sockets', async () => {
-  // This one deliberately uses real WebSockets rather than the registry stub.
-  // The branch it covers reads `readyState` around a `close()` call, and `ws`
+test('a live duplicate-token collision is held against real sockets, then expires as superseded', async () => {
+  // Deliberately real WebSockets rather than the registry stub. The collision
+  // branch used to read `readyState` around its own `close()` call, and `ws`
   // mutates readyState synchronously inside close() — a hand-rolled stub can
   // model that wrongly and certify a branch production never takes, which is
-  // exactly what happened before this test existed.
+  // exactly what happened once already.
+  //
+  // The contract now: a same-token reconnect is HELD even when the displaced
+  // socket is unmistakably live, because "looks live" cannot distinguish a
+  // rival daemon from the very client that is reconnecting. An unreclaimed hold
+  // then expires into this path's own `superseded` terminal.
   const server = createServer();
-  const registry = new Registry(10_000);
+  const registry = new Registry(60);
   attachWsServer(server, { db: mockSql(), registry });
   const port = await listen(server);
   const first = new WebSocket(`ws://127.0.0.1:${port}/connect`);
@@ -882,12 +909,11 @@ test('a live duplicate-token collision supersedes immediately, against real sock
     first.send(helloFrame());
     await waitForAgent(registry, 'agent-1');
     const firstConn = registry.getAgent('agent-1');
+    assert.equal(firstConn!.ws.readyState, firstConn!.ws.OPEN, 'precondition: displaced socket live');
 
     const sink = makeSink();
     registry.bindTask({ agentId: 'agent-1', taskId: 'task-4', contextId: 'ctx-4', sink });
 
-    // A second live daemon with the same token registers while the first is
-    // still connected — a genuine collision, not a recovered drop.
     second = new WebSocket(`ws://127.0.0.1:${port}/connect`);
     await once(second, 'open');
     second.send(helloFrameFor('agent-1', 'token'));
@@ -897,15 +923,20 @@ test('a live duplicate-token collision supersedes immediately, against real sock
       await wsSleep(5);
     }
 
-    await sink.finished;
+    // Not killed on the spot — this is the whole point.
+    assert.ok(registry.getBinding('task-4'), 'a live-looking collision must still be held');
+    assert.deepEqual(sink.statuses, [], 'no premature terminal');
 
-    const terminal = sink.statuses.at(-1)!;
-    assert.equal(terminal.final, true);
-    assert.equal(terminal.status.state, 'failed');
-    assert.deepEqual(terminal.status.message?.parts, [
+    await withTimeout(sink.finished, 5_000, 'the collision hold to expire');
+
+    const terminal: TaskStatusUpdateEvent[] = sink.statuses;
+    const last = terminal.at(-1)!;
+    assert.equal(last.final, true);
+    assert.equal(last.status.state, 'failed');
+    assert.deepEqual(last.status.message?.parts, [
       { text: 'superseded by a reconnect from the same client token' },
     ]);
-    assert.equal(registry.getBinding('task-4'), undefined, 'a live collision must not be graced');
+    assert.equal(registry.getBinding('task-4'), undefined);
   } finally {
     first.close();
     second?.close();
