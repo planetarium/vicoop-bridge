@@ -48,7 +48,7 @@ export interface TaskBinding {
   // Unique to one dispatch/turn. A2A deliberately reuses taskId for
   // continuations, so reconnect replay must never use taskId as its generation
   // identity. Present only for clients that negotiated task-replay-v1.
-  bindingId?: string;
+  executionId?: string;
   // Next client sequence accepted for this binding. Frames below this value
   // are duplicates; frames above it prove a gap and must fail closed.
   nextClientSeq?: number;
@@ -257,10 +257,10 @@ export class Registry {
   }
 
   rememberTerminalReceipt(binding: TaskBinding, acceptedSeq: number): void {
-    if (!binding.bindingId) return;
+    if (!binding.executionId) return;
     const now = Date.now();
     this.pruneTerminalReceipts(now);
-    this.terminalReceipts.set(binding.bindingId, {
+    this.terminalReceipts.set(binding.executionId, {
       agentId: binding.agentId,
       taskId: binding.taskId,
       acceptedSeq,
@@ -274,20 +274,20 @@ export class Registry {
   }
 
   getTerminalReceipt(
-    bindingId: string,
+    executionId: string,
     agentId: string,
     taskId: string,
   ): { acceptedSeq: number } | undefined {
     this.pruneTerminalReceipts(Date.now());
-    const receipt = this.terminalReceipts.get(bindingId);
+    const receipt = this.terminalReceipts.get(executionId);
     if (!receipt || receipt.agentId !== agentId || receipt.taskId !== taskId) return undefined;
     return { acceptedSeq: receipt.acceptedSeq };
   }
 
   private pruneTerminalReceipts(now: number): void {
-    for (const [bindingId, receipt] of this.terminalReceipts) {
+    for (const [executionId, receipt] of this.terminalReceipts) {
       if (receipt.expiresAt > now) continue;
-      this.terminalReceipts.delete(bindingId);
+      this.terminalReceipts.delete(executionId);
     }
   }
 

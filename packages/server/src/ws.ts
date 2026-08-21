@@ -433,7 +433,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           status: wireStatusToA2X(frame.status, frame.taskId, b.contextId),
         });
         b.sink.finish();
-        if (b.bindingId !== undefined && b.nextClientSeq !== undefined) {
+        if (b.executionId !== undefined && b.nextClientSeq !== undefined) {
           opts.registry.rememberTerminalReceipt(b, b.nextClientSeq - 1);
         }
         opts.registry.unbindTask(frame.taskId, b);
@@ -480,7 +480,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           },
         });
         b.sink.finish();
-        if (b.bindingId !== undefined && b.nextClientSeq !== undefined) {
+        if (b.executionId !== undefined && b.nextClientSeq !== undefined) {
           opts.registry.rememberTerminalReceipt(b, b.nextClientSeq - 1);
         }
         opts.registry.unbindTask(frame.taskId, b);
@@ -511,28 +511,28 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
   }
 
   function acknowledge(binding: TaskBinding): void {
-    if (binding.bindingId === undefined || binding.nextClientSeq === undefined) return;
+    if (binding.executionId === undefined || binding.nextClientSeq === undefined) return;
     if (ws.readyState !== ws.OPEN) return;
     ws.send(
       encodeFrame({
         type: 'task.ack',
         taskId: binding.taskId,
-        bindingId: binding.bindingId,
+        executionId: binding.executionId,
         acceptedSeq: binding.nextClientSeq - 1,
       }),
     );
   }
 
   function acknowledgeReceipt(frame: TaskUpFrame): boolean {
-    if (agentId === null || frame.bindingId === undefined || frame.seq === undefined) return false;
-    const receipt = opts.registry.getTerminalReceipt(frame.bindingId, agentId, frame.taskId);
+    if (agentId === null || frame.executionId === undefined || frame.seq === undefined) return false;
+    const receipt = opts.registry.getTerminalReceipt(frame.executionId, agentId, frame.taskId);
     if (!receipt || frame.seq > receipt.acceptedSeq) return false;
     if (ws.readyState === ws.OPEN) {
       ws.send(
         encodeFrame({
           type: 'task.ack',
           taskId: frame.taskId,
-          bindingId: frame.bindingId,
+          executionId: frame.executionId,
           acceptedSeq: receipt.acceptedSeq,
         }),
       );
@@ -550,17 +550,17 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
     const binding = ownedBinding(frame.taskId);
     if (!binding) return undefined;
 
-    if (binding.bindingId !== undefined) {
-      if (frame.bindingId !== binding.bindingId || frame.seq === undefined) {
+    if (binding.executionId !== undefined) {
+      if (frame.executionId !== binding.executionId || frame.seq === undefined) {
         // A stale generation must never affect the current turn. Missing
         // sequencing on a negotiated binding is likewise unusable, but it is a
         // connection protocol error rather than a gap in the current run.
         if (!acknowledgeReceipt(frame)) {
-          logEvent('binding_generation_mismatch', {
+          logEvent('execution_id_mismatch', {
             agentId: agentId ?? undefined,
             taskId: truncate(frame.taskId, 128),
-            bindingId: frame.bindingId ? truncate(frame.bindingId, 128) : undefined,
-            ownerBindingId: binding.bindingId,
+            executionId: frame.executionId ? truncate(frame.executionId, 128) : undefined,
+            ownerExecutionId: binding.executionId,
           });
         }
         return { kind: 'duplicate' };
@@ -574,7 +574,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         logEvent('task_frame_gap', {
           agentId: binding.agentId,
           taskId: truncate(binding.taskId, 128),
-          bindingId: binding.bindingId,
+          executionId: binding.executionId,
           expectedSeq: expected,
           receivedSeq: frame.seq,
         });
@@ -586,12 +586,12 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         opts.registry.sendToAgent(binding.agentId, {
           type: 'task.cancel',
           taskId: binding.taskId,
-          bindingId: binding.bindingId,
+          executionId: binding.executionId,
         });
         return undefined;
       }
       binding.nextClientSeq = expected + 1;
-    } else if (frame.bindingId !== undefined || frame.seq !== undefined) {
+    } else if (frame.executionId !== undefined || frame.seq !== undefined) {
       // A reliable frame cannot be attached to a legacy binding merely because
       // A2A reused the same taskId.
       return acknowledgeReceipt(frame) ? { kind: 'duplicate' } : undefined;

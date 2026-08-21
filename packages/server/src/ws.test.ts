@@ -607,7 +607,7 @@ test('a task survives a proxy-style disconnect and completes on the reconnected 
       taskId: 'task-1',
       contextId: 'ctx-1',
       sink,
-      bindingId: 'binding-1',
+      executionId: 'execution-1',
       nextClientSeq: 0,
     });
 
@@ -625,7 +625,7 @@ test('a task survives a proxy-style disconnect and completes on the reconnected 
     second.send(encodeFrame({
       type: 'task.status',
       taskId: 'task-1',
-      bindingId: 'binding-1',
+      executionId: 'execution-1',
       seq: 0,
       status: { state: 'working', timestamp: new Date().toISOString() },
       metadata: { [OPENAI_COMPAT_EXTENSION_URI]: { heartbeat: true } },
@@ -634,7 +634,7 @@ test('a task survives a proxy-style disconnect and completes on the reconnected 
     second.send(encodeFrame({
       type: 'task.complete',
       taskId: 'task-1',
-      bindingId: 'binding-1',
+      executionId: 'execution-1',
       seq: 1,
       status: {
         state: 'completed',
@@ -765,7 +765,7 @@ test('a heartbeat on the reconnected socket keeps a task alive past the original
     const sink = makeSink();
     registry.bindTask({
       agentId: 'agent-1', taskId: 'task-3', contextId: 'ctx-3', sink,
-      bindingId: 'binding-3', nextClientSeq: 0,
+      executionId: 'execution-3', nextClientSeq: 0,
     });
 
     registry.getAgent('agent-1')!.ws.close(1012, 'restarting');
@@ -780,7 +780,7 @@ test('a heartbeat on the reconnected socket keeps a task alive past the original
     second.send(encodeFrame({
       type: 'task.status',
       taskId: 'task-3',
-      bindingId: 'binding-3',
+      executionId: 'execution-3',
       seq: 0,
       status: { state: 'working', timestamp: new Date().toISOString() },
       metadata: { [OPENAI_COMPAT_EXTENSION_URI]: { heartbeat: true } },
@@ -793,7 +793,7 @@ test('a heartbeat on the reconnected socket keeps a task alive past the original
     second.send(encodeFrame({
       type: 'task.complete',
       taskId: 'task-3',
-      bindingId: 'binding-3',
+      executionId: 'execution-3',
       seq: 1,
       status: {
         state: 'completed',
@@ -842,7 +842,7 @@ test('an agent cannot push frames into another agent\'s task', async () => {
     const sink = makeSink();
     registry.bindTask({
       agentId: 'agent-1', taskId: 'victim-task', contextId: 'ctx-v', sink,
-      bindingId: 'binding-victim', nextClientSeq: 0,
+      executionId: 'execution-victim', nextClientSeq: 0,
     });
 
     // The victim drops mid-task; its binding is now held and still resolvable.
@@ -853,7 +853,7 @@ test('an agent cannot push frames into another agent\'s task', async () => {
     attacker.send(encodeFrame({
       type: 'task.complete',
       taskId: 'victim-task',
-      bindingId: 'binding-victim',
+      executionId: 'execution-victim',
       seq: 0,
       usage: { promptTokens: 999_999, completionTokens: 999_999 },
       status: {
@@ -865,7 +865,7 @@ test('an agent cannot push frames into another agent\'s task', async () => {
     attacker.send(encodeFrame({
       type: 'task.fail',
       taskId: 'victim-task',
-      bindingId: 'binding-victim',
+      executionId: 'execution-victim',
       seq: 0,
       error: { code: 'forged', message: 'forged' },
     }));
@@ -886,7 +886,7 @@ test('an agent cannot push frames into another agent\'s task', async () => {
       recovered.send(encodeFrame({
         type: 'task.complete',
         taskId: 'victim-task',
-        bindingId: 'binding-victim',
+        executionId: 'execution-victim',
         seq: 0,
         status: {
           state: 'completed',
@@ -940,7 +940,7 @@ test('a live duplicate-token collision is held against real sockets, then expire
     const sink = makeSink();
     registry.bindTask({
       agentId: 'agent-1', taskId: 'task-4', contextId: 'ctx-4', sink,
-      bindingId: 'binding-4', nextClientSeq: 0,
+      executionId: 'execution-4', nextClientSeq: 0,
     });
 
     second = new WebSocket(`ws://127.0.0.1:${port}/connect`);
@@ -1041,16 +1041,16 @@ test('sequenced task frames are acknowledged, deduplicated, and completed once',
     const sink = makeSink();
     registry.bindTask({
       agentId: 'agent-1', taskId: 'task-seq', contextId: 'ctx', sink,
-      bindingId: 'binding-seq', nextClientSeq: 0,
+      executionId: 'execution-seq', nextClientSeq: 0,
     });
     const artifact = encodeFrame({
-      type: 'task.artifact', taskId: 'task-seq', bindingId: 'binding-seq', seq: 0,
+      type: 'task.artifact', taskId: 'task-seq', executionId: 'execution-seq', seq: 0,
       artifact: { artifactId: 'a', parts: [{ kind: 'text', text: 'once' }] },
     });
     ws.send(artifact);
     ws.send(artifact);
     ws.send(encodeFrame({
-      type: 'task.complete', taskId: 'task-seq', bindingId: 'binding-seq', seq: 1,
+      type: 'task.complete', taskId: 'task-seq', executionId: 'execution-seq', seq: 1,
       status: { state: 'completed' },
     }));
     await withTimeout(sink.finished, 5_000, 'sequenced terminal');
@@ -1085,10 +1085,10 @@ test('a sequence gap fails closed without forwarding the suffix', async () => {
     const sink = makeSink();
     registry.bindTask({
       agentId: 'agent-1', taskId: 'task-gap', contextId: 'ctx', sink,
-      bindingId: 'binding-gap', nextClientSeq: 0,
+      executionId: 'execution-gap', nextClientSeq: 0,
     });
     ws.send(encodeFrame({
-      type: 'task.artifact', taskId: 'task-gap', bindingId: 'binding-gap', seq: 1,
+      type: 'task.artifact', taskId: 'task-gap', executionId: 'execution-gap', seq: 1,
       artifact: { artifactId: 'a', parts: [{ kind: 'text', text: 'suffix' }] },
     }));
     await withTimeout(sink.finished, 5_000, 'gap failure');
@@ -1103,7 +1103,7 @@ test('a sequence gap fails closed without forwarding the suffix', async () => {
   }
 });
 
-test('a terminal replay from an old binding generation cannot complete a reused taskId', async () => {
+test('a terminal replay from an old execution cannot complete a reused taskId', async () => {
   const server = createServer();
   const registry = new Registry();
   attachWsServer(server, { db: mockSql(), registry });
@@ -1120,10 +1120,10 @@ test('a terminal replay from an old binding generation cannot complete a reused 
     const first = makeSink();
     registry.bindTask({
       agentId: 'agent-1', taskId: 'task-reuse', contextId: 'ctx-1', sink: first,
-      bindingId: 'binding-old', nextClientSeq: 0,
+      executionId: 'execution-old', nextClientSeq: 0,
     });
     ws.send(encodeFrame({
-      type: 'task.complete', taskId: 'task-reuse', bindingId: 'binding-old', seq: 0,
+      type: 'task.complete', taskId: 'task-reuse', executionId: 'execution-old', seq: 0,
       status: { state: 'completed' },
     }));
     await withTimeout(first.finished, 5_000, 'first terminal');
@@ -1131,16 +1131,16 @@ test('a terminal replay from an old binding generation cannot complete a reused 
     const second = makeSink();
     registry.bindTask({
       agentId: 'agent-1', taskId: 'task-reuse', contextId: 'ctx-2', sink: second,
-      bindingId: 'binding-new', nextClientSeq: 0,
+      executionId: 'execution-new', nextClientSeq: 0,
     });
     ws.send(encodeFrame({
-      type: 'task.complete', taskId: 'task-reuse', bindingId: 'binding-old', seq: 0,
+      type: 'task.complete', taskId: 'task-reuse', executionId: 'execution-old', seq: 0,
       status: { state: 'completed' },
     }));
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(second.statuses.length, 0, 'old terminal must not touch the new binding');
     ws.send(encodeFrame({
-      type: 'task.complete', taskId: 'task-reuse', bindingId: 'binding-new', seq: 0,
+      type: 'task.complete', taskId: 'task-reuse', executionId: 'execution-new', seq: 0,
       status: { state: 'completed' },
     }));
     await withTimeout(second.finished, 5_000, 'new terminal');

@@ -73,7 +73,7 @@ dropped WebSocket does not by itself invalidate an in-flight task.
 
 Clients opt in by advertising `task-replay-v1` in `hello`. After authentication,
 the server answers with `hello.ack`, then gives every `task.assign` a unique
-`bindingId`. The client adds that ID and a consecutive `seq` to each task frame,
+`executionId`. The client adds that ID and a consecutive `seq` to each task frame,
 retains the encoded frame until `task.ack`, and resends the same ID and sequence
 after reconnecting. The server deduplicates acknowledged prefixes and fails the
 task on a sequence gap. This generation key is required because A2A can reuse a
@@ -86,7 +86,7 @@ connection resumes the binding. An unresumed hold expires into exactly the
 terminal that path always produced: `disconnected` for a drop, `superseded` for
 a same-token reconnect.
 
-Legacy clients do not receive `hello.ack`, binding IDs, or grace holds. They
+Legacy clients do not receive `hello.ack`, execution IDs, or grace holds. They
 retain the previous fail-immediately behavior, which keeps rolling server-first
 deploys safe. A new client connected to an older server recognizes a legacy
 `task.assign` and also uses the old fail-fast path.

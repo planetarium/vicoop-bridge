@@ -408,13 +408,13 @@ export class WSForwardingExecutor extends AgentExecutor {
       this.registry
         .getAgent(this.agentId)
         ?.protocolCapabilities?.includes(TASK_REPLAY_CAPABILITY) === true;
-    const bindingId = replayCapable ? randomUUID() : undefined;
+    const executionId = replayCapable ? randomUUID() : undefined;
     const binding: TaskBinding = {
       agentId: this.agentId,
       taskId,
       contextId,
       sink,
-      ...(bindingId !== undefined ? { bindingId, nextClientSeq: 0 } : {}),
+      ...(executionId !== undefined ? { executionId, nextClientSeq: 0 } : {}),
       ...(principalId !== undefined ? { principalId } : {}),
       ...(requestedExtensions !== undefined ? { requestedExtensions } : {}),
     };
@@ -473,7 +473,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     const sent = this.registry.sendToAgent(this.agentId, {
       type: 'task.assign',
       taskId,
-      ...(bindingId !== undefined ? { bindingId } : {}),
+      ...(executionId !== undefined ? { executionId } : {}),
       contextId,
       message: {
         role: message.role,
@@ -709,7 +709,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     this.registry.sendToAgent(this.agentId, {
       type: 'task.cancel',
       taskId,
-      ...(binding?.bindingId !== undefined ? { bindingId: binding.bindingId } : {}),
+      ...(binding?.executionId !== undefined ? { executionId: binding.executionId } : {}),
     });
 
     // Deliver the CANCELED terminal through the sink FIRST, then finish the

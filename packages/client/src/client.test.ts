@@ -1270,7 +1270,7 @@ test('usage.request: a throwing backend.usage() replies ok:false / usage_failed'
 
 // ── acknowledged reconnect replay ───────────────────────────────────────────
 
-test('reliable task frames carry one binding generation and consecutive sequences', async () => {
+test('reliable task frames carry one execution ID and consecutive sequences', async () => {
   const server = createServer();
   const wss = new WebSocketServer({ server, path: '/connect' });
   const serverUrl = await listen(server);
@@ -1285,15 +1285,15 @@ test('reliable task frames carry one binding generation and consecutive sequence
           disconnectGraceMs: 30_000,
           maxFrameBytes: 16 * 1024 * 1024,
         }));
-        ws.send(encodeFrame({ ...makeAssign('t-seq'), bindingId: 'binding-seq' }));
+        ws.send(encodeFrame({ ...makeAssign('t-seq'), executionId: 'execution-seq' }));
         return;
       }
       received.push(frame);
-      if ('bindingId' in frame && frame.bindingId && 'seq' in frame && frame.seq !== undefined) {
+      if ('executionId' in frame && frame.executionId && 'seq' in frame && frame.seq !== undefined) {
         ws.send(encodeFrame({
           type: 'task.ack',
           taskId: frame.taskId,
-          bindingId: frame.bindingId,
+          executionId: frame.executionId,
           acceptedSeq: frame.seq,
         }));
       }
@@ -1321,8 +1321,8 @@ test('reliable task frames carry one binding generation and consecutive sequence
     const taskFrames = received.filter((frame) => 'taskId' in frame);
     assert.deepEqual(taskFrames.map((frame) => frame.type), ['task.artifact', 'task.complete']);
     assert.deepEqual(
-      taskFrames.map((frame) => 'bindingId' in frame ? [frame.bindingId, frame.seq] : []),
-      [['binding-seq', 0], ['binding-seq', 1]],
+      taskFrames.map((frame) => 'executionId' in frame ? [frame.executionId, frame.seq] : []),
+      [['execution-seq', 0], ['execution-seq', 1]],
     );
   } finally {
     client.stop();
@@ -1330,11 +1330,11 @@ test('reliable task frames carry one binding generation and consecutive sequence
   }
 });
 
-test('an unacknowledged frame is replayed with the same binding id and sequence', async () => {
+test('an unacknowledged frame is replayed with the same execution ID and sequence', async () => {
   const server = createServer();
   const wss = new WebSocketServer({ server, path: '/connect' });
   const serverUrl = await listen(server);
-  const artifacts: Array<{ bindingId?: string; seq?: number }> = [];
+  const artifacts: Array<{ executionId?: string; seq?: number }> = [];
   let connections = 0;
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -1350,25 +1350,25 @@ test('an unacknowledged frame is replayed with the same binding id and sequence'
           maxFrameBytes: 16 * 1024 * 1024,
         }));
         if (connection === 1) {
-          ws.send(encodeFrame({ ...makeAssign('t-replay'), bindingId: 'binding-replay' }));
+          ws.send(encodeFrame({ ...makeAssign('t-replay'), executionId: 'execution-replay' }));
         }
         return;
       }
       if (frame.type === 'task.artifact') {
-        artifacts.push({ bindingId: frame.bindingId, seq: frame.seq });
+        artifacts.push({ executionId: frame.executionId, seq: frame.seq });
         if (connection === 1) ws.close(1012, 'restart before ack');
-        else if (frame.bindingId && frame.seq !== undefined) {
+        else if (frame.executionId && frame.seq !== undefined) {
           ws.send(encodeFrame({
             type: 'task.ack', taskId: frame.taskId,
-            bindingId: frame.bindingId, acceptedSeq: frame.seq,
+            executionId: frame.executionId, acceptedSeq: frame.seq,
           }));
           release();
         }
       }
-      if (frame.type === 'task.complete' && frame.bindingId && frame.seq !== undefined) {
+      if (frame.type === 'task.complete' && frame.executionId && frame.seq !== undefined) {
         ws.send(encodeFrame({
           type: 'task.ack', taskId: frame.taskId,
-          bindingId: frame.bindingId, acceptedSeq: frame.seq,
+          executionId: frame.executionId, acceptedSeq: frame.seq,
         }));
       }
     });
@@ -1396,8 +1396,8 @@ test('an unacknowledged frame is replayed with the same binding id and sequence'
     client.start();
     await waitFor(() => artifacts.length === 2, 'replayed artifact');
     assert.deepEqual(artifacts, [
-      { bindingId: 'binding-replay', seq: 0 },
-      { bindingId: 'binding-replay', seq: 0 },
+      { executionId: 'execution-replay', seq: 0 },
+      { executionId: 'execution-replay', seq: 0 },
     ]);
   } finally {
     release();
@@ -1421,7 +1421,7 @@ test('an unacknowledged frame expires even while the socket stays open', async (
         type: 'hello.ack', protocolCapabilities: [TASK_REPLAY_CAPABILITY],
         disconnectGraceMs: 30_000, maxFrameBytes: 16 * 1024 * 1024,
       }));
-      ws.send(encodeFrame({ ...makeAssign('t-expire'), bindingId: 'binding-expire' }));
+      ws.send(encodeFrame({ ...makeAssign('t-expire'), executionId: 'execution-expire' }));
     });
   });
   const client = new Client({
@@ -1460,7 +1460,7 @@ test('a replacement assignment suppresses the older run with the same taskId', a
   const server = createServer();
   const wss = new WebSocketServer({ server, path: '/connect' });
   const serverUrl = await listen(server);
-  const completes: Array<{ bindingId?: string; seq?: number }> = [];
+  const completes: Array<{ executionId?: string; seq?: number }> = [];
   let releaseOld!: () => void;
   const oldGate = new Promise<void>((resolve) => { releaseOld = resolve; });
   wss.on('connection', (ws) => {
@@ -1471,9 +1471,9 @@ test('a replacement assignment suppresses the older run with the same taskId', a
           type: 'hello.ack', protocolCapabilities: [TASK_REPLAY_CAPABILITY],
           disconnectGraceMs: 30_000, maxFrameBytes: 16 * 1024 * 1024,
         }));
-        ws.send(encodeFrame({ ...makeAssign('t-reuse'), bindingId: 'binding-old' }));
+        ws.send(encodeFrame({ ...makeAssign('t-reuse'), executionId: 'execution-old' }));
         setTimeout(() => {
-          ws.send(encodeFrame({ ...makeAssign('t-reuse'), bindingId: 'binding-new' }));
+          ws.send(encodeFrame({ ...makeAssign('t-reuse'), executionId: 'execution-new' }));
         }, 10);
         return;
       }
@@ -1486,7 +1486,7 @@ test('a replacement assignment suppresses the older run with the same taskId', a
     agentId: 'agent-1',
     backendKind: 'echo',
     backend: backendOf('echo', async (task, emit) => {
-      if (task.bindingId === 'binding-old') await oldGate;
+      if (task.executionId === 'execution-old') await oldGate;
       emit({ type: 'task.complete', taskId: task.taskId, status: { state: 'completed' } });
     }),
     heartbeatIntervalMs: 0,
@@ -1494,10 +1494,10 @@ test('a replacement assignment suppresses the older run with the same taskId', a
   });
   try {
     client.start();
-    await waitFor(() => completes.some((frame) => frame.bindingId === 'binding-new'), 'new run');
+    await waitFor(() => completes.some((frame) => frame.executionId === 'execution-new'), 'new run');
     releaseOld();
     await new Promise((resolve) => setTimeout(resolve, 30));
-    assert.deepEqual(completes.map((frame) => frame.bindingId), ['binding-new']);
+    assert.deepEqual(completes.map((frame) => frame.executionId), ['execution-new']);
   } finally {
     releaseOld();
     client.stop();

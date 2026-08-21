@@ -184,7 +184,7 @@ test('executor records principalId in binding and strips _principalId from outgo
   assert.ok(binding, 'expected binding to be registered before first yield');
   assert.equal(binding.principalId, 'eth:0xabc');
   assert.equal(binding.agentId, 'a1');
-  assert.match(binding.bindingId ?? '', /^[0-9a-f-]{36}$/);
+  assert.match(binding.executionId ?? '', /^[0-9a-f-]{36}$/);
   assert.equal(binding.nextClientSeq, 0);
 
   // The WS frame must NOT carry server-internal `_*` keys — the connected
@@ -202,7 +202,7 @@ test('executor records principalId in binding and strips _principalId from outgo
     );
     assert.equal((md as Record<string, unknown>).userField, 'keep');
     assert.equal(frame.caller, undefined, 'old clients receive no caller field fallback');
-    assert.equal(frame.bindingId, binding.bindingId);
+    assert.equal(frame.executionId, binding.executionId);
   }
 
   // Push a terminal status so the generator returns without hanging.

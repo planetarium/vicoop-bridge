@@ -48,7 +48,7 @@ export interface ClientOptions {
   maxPendingFrames?: number;
   // Companion byte budget for the encoded unacknowledged frames.
   maxPendingBytes?: number;
-  // Maximum age of an unacknowledged frame. Binding ids make stale frames safe
+  // Maximum age of an unacknowledged frame. Execution IDs make stale frames safe
   // to drop independently of the server's configured grace.
   maxPendingAgeMs?: number;
   // Minimum reconnect delay after a 4009 "another client with the same
@@ -124,12 +124,12 @@ type TaskUpFrame = Extract<UpFrame, { taskId: string }>;
 interface ClientRun {
   controller: AbortController;
   suppressed: boolean;
-  bindingId?: string;
+  executionId?: string;
   nextSeq: number;
 }
 interface PendingFrame {
   taskId: string;
-  bindingId: string;
+  executionId: string;
   seq: number;
   encoded: string;
   bytes: number;
@@ -156,7 +156,7 @@ export class Client {
   // doesn't change mid-process.
   private effectiveCardPromise: Promise<AgentCard | undefined> | null = null;
   // Reliable frames stay here until the bridge cumulatively acknowledges their
-  // binding-local sequence. Reconnect simply resends the same generations and
+  // execution-local sequence. Reconnect simply resends the same generations and
   // sequences; the bridge deduplicates them and detects gaps.
   private pendingFrames: PendingFrame[] = [];
   private pendingBytes = 0;
@@ -396,13 +396,13 @@ export class Client {
           this.flushPendingFrames(ws);
           break;
         case 'task.ack':
-          this.acknowledgeFrames(frame.bindingId, frame.acceptedSeq);
+          this.acknowledgeFrames(frame.executionId, frame.acceptedSeq);
           break;
         case 'task.assign':
-          // A task assignment without a binding id came from a legacy bridge.
+          // A task assignment without an execution ID came from a legacy bridge.
           // It is proof that authentication finished, but reconnect replay is
           // intentionally unavailable on that connection.
-          if (frame.bindingId === undefined) this.replayReady = false;
+          if (frame.executionId === undefined) this.replayReady = false;
           // `summarizeParts` already sanitizes each MIME via safeToken, so
           // the `parts=` token here intentionally does NOT wrap the whole
           // summary again — that would double-escape backslashes (a `\n`
@@ -420,14 +420,14 @@ export class Client {
           this.logger.info(`task.cancel taskId=${safeToken(frame.taskId)}`);
           {
             const run = this.inflight.get(frame.taskId);
-            if (run && (frame.bindingId === undefined || frame.bindingId === run.bindingId)) {
+            if (run && (frame.executionId === undefined || frame.executionId === run.executionId)) {
               // A generation-scoped cancel is also the server's fail-closed
               // signal (for example after detecting a sequence gap). No later
               // frame from this generation can be accepted, so release its
               // retained prefix and suppress the backend's abort terminal.
-              if (frame.bindingId !== undefined) {
+              if (frame.executionId !== undefined) {
                 run.suppressed = true;
-                this.removePendingBinding(frame.bindingId);
+                this.removePendingExecution(frame.executionId);
               }
               run.controller.abort();
             }
@@ -461,7 +461,7 @@ export class Client {
       // safe, so stop those runs. Reliable runs retain their unacknowledged
       // frames and resume after the next hello.ack.
       for (const run of this.inflight.values()) {
-        if (run.bindingId !== undefined) continue;
+        if (run.executionId !== undefined) continue;
         run.suppressed = true;
         run.controller.abort();
       }
@@ -654,13 +654,13 @@ export class Client {
 
   private sendTaskFrame(run: ClientRun, frame: TaskUpFrame): void {
     if (run.suppressed) return;
-    if (run.bindingId === undefined) {
+    if (run.executionId === undefined) {
       this.send(frame);
       return;
     }
 
     const seq = run.nextSeq++;
-    const reliableFrame = { ...frame, bindingId: run.bindingId, seq } as TaskUpFrame;
+    const reliableFrame = { ...frame, executionId: run.executionId, seq } as TaskUpFrame;
     const encoded = encodeFrame(reliableFrame);
     const bytes = Buffer.byteLength(encoded, 'utf8');
     const frameLimit = this.pendingFrameLimit();
@@ -685,7 +685,7 @@ export class Client {
     if (frameLimit > 0 && byteLimit > 0 && ageLimit > 0) {
       this.pendingFrames.push({
         taskId: frame.taskId,
-        bindingId: run.bindingId,
+        executionId: run.executionId,
         seq,
         encoded,
         bytes,
@@ -723,10 +723,10 @@ export class Client {
     }
   }
 
-  private acknowledgeFrames(bindingId: string, acceptedSeq: number): void {
+  private acknowledgeFrames(executionId: string, acceptedSeq: number): void {
     let removed = 0;
     this.pendingFrames = this.pendingFrames.filter((entry) => {
-      if (entry.bindingId !== bindingId || entry.seq > acceptedSeq) return true;
+      if (entry.executionId !== executionId || entry.seq > acceptedSeq) return true;
       this.pendingBytes -= entry.bytes;
       removed++;
       return false;
@@ -739,14 +739,14 @@ export class Client {
     if (run.suppressed) return;
     run.suppressed = true;
     run.controller.abort();
-    if (run.bindingId !== undefined) this.removePendingBinding(run.bindingId);
+    if (run.executionId !== undefined) this.removePendingExecution(run.executionId);
     this.logger.error(`${why}; suppressing the run so the bridge fails it closed`);
     if (disconnect && this.ws?.readyState === WebSocket.OPEN) this.ws.terminate();
   }
 
-  private removePendingBinding(bindingId: string): void {
+  private removePendingExecution(executionId: string): void {
     this.pendingFrames = this.pendingFrames.filter((entry) => {
-      if (entry.bindingId !== bindingId) return true;
+      if (entry.executionId !== executionId) return true;
       this.pendingBytes -= entry.bytes;
       return false;
     });
@@ -788,13 +788,13 @@ export class Client {
     const ageLimit = this.pendingAgeLimit();
     if (ageLimit <= 0 || this.pendingFrames.length === 0) return;
     const cutoff = Date.now() - ageLimit;
-    const expiredBindings = new Set(
+    const expiredExecutions = new Set(
       this.pendingFrames
         .filter((entry) => entry.createdAt <= cutoff)
-        .map((entry) => entry.bindingId),
+        .map((entry) => entry.executionId),
     );
-    for (const bindingId of expiredBindings) {
-      const run = [...this.inflight.values()].find((candidate) => candidate.bindingId === bindingId);
+    for (const executionId of expiredExecutions) {
+      const run = [...this.inflight.values()].find((candidate) => candidate.executionId === executionId);
       if (run) {
         this.failReliableRun(
           run,
@@ -802,7 +802,7 @@ export class Client {
           this.ws?.readyState === WebSocket.OPEN,
         );
       } else {
-        this.removePendingBinding(bindingId);
+        this.removePendingExecution(executionId);
       }
     }
     this.schedulePendingExpiry();
@@ -860,13 +860,13 @@ export class Client {
     if (previous) {
       previous.suppressed = true;
       previous.controller.abort();
-      if (previous.bindingId !== undefined) this.removePendingBinding(previous.bindingId);
+      if (previous.executionId !== undefined) this.removePendingExecution(previous.executionId);
     }
     const controller = new AbortController();
     const run: ClientRun = {
       controller,
       suppressed: false,
-      ...(frame.bindingId !== undefined ? { bindingId: frame.bindingId } : {}),
+      ...(frame.executionId !== undefined ? { executionId: frame.executionId } : {}),
       nextSeq: 0,
     };
     this.inflight.set(frame.taskId, run);
