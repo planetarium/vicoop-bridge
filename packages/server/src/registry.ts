@@ -587,6 +587,7 @@ export class Registry {
         agentId: binding.agentId,
         ownerAgentId: existing.agentId,
         taskId: binding.taskId,
+        operation: 'bind',
         ...(binding.principalId !== undefined ? { principalId: binding.principalId } : {}),
       });
       return false;

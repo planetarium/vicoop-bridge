@@ -239,6 +239,10 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         agentId: agentId ?? undefined,
         taskId: truncate(taskId, 128),
         ownerAgentId: b.agentId,
+        // Same event name as the executor's cancel guard and bindTask's
+        // (issue #476), so all cross-agent attempts aggregate together;
+        // `operation` is what tells an operator which door was tried.
+        operation: 'frame',
       });
       return undefined;
     }
