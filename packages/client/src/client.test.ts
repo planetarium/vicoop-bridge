@@ -1885,3 +1885,128 @@ test('replay eligibility is judged on the outage, not on each frame\'s own age',
     await closeServer(h.server, h.wss);
   }
 });
+test('a truncated run is silenced, so its late canceled terminal never reaches the bridge', async () => {
+  const h = replayHarness();
+  const serverUrl = await listen(h.server);
+
+  let release!: () => void;
+  const held = new Promise<void>((r) => {
+    release = r;
+  });
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('slow', async (task, emit) => {
+      await held;
+      emit({
+        type: 'task.complete',
+        taskId: task.taskId,
+        status: { state: 'completed', timestamp: new Date().toISOString() },
+      });
+    }),
+    reconnectDelayMs: 15,
+    reconnectMaxDelayMs: 15,
+    reconnectJitterRatio: 0,
+    maxPendingFrames: 1,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(() => h.received.some((f) => f.type === 'hello'), 'first hello');
+
+    h.sockets[0]!.send(JSON.stringify({
+      type: 'task.assign',
+      taskId: 't-late-cancel',
+      contextId: 'ctx',
+      message: { role: 'user', parts: [{ kind: 'text', text: 'hi' }], messageId: 'm1' },
+    }));
+    await new Promise((r) => setTimeout(r, 20));
+    h.sockets[0]!.close(1012, 'restarting');
+    await waitOffline(client);
+
+    for (const text of ['a', 'b']) {
+      sendOffline(client, {
+        type: 'task.artifact',
+        taskId: 't-late-cancel',
+        artifact: { artifactId: 'a-1', parts: [{ kind: 'text', text }] },
+        append: true,
+        lastChunk: false,
+      });
+    }
+
+    await waitFor(
+      () => h.received.some((f) => f.type === 'task.fail' && f.taskId === 't-late-cancel'),
+      'the truncation failure',
+    );
+
+    release();
+    await new Promise((r) => setTimeout(r, 80));
+
+    const terminals = h.received.filter(
+      (f) => f.taskId === 't-late-cancel' && (f.type === 'task.complete' || f.type === 'task.fail'),
+    );
+    assert.deepEqual(
+      terminals.map((f) => f.type),
+      ['task.fail'],
+      'a suppressed run must not emit a second terminal',
+    );
+  } finally {
+    release();
+    client.stop();
+    await closeServer(h.server, h.wss);
+  }
+});
+
+test('overflowing the truncated-task bookkeeping discards the buffer rather than replaying part of it', async () => {
+  const h = replayHarness();
+  const serverUrl = await listen(h.server);
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => undefined),
+    reconnectDelayMs: 20,
+    reconnectMaxDelayMs: 20,
+    reconnectJitterRatio: 0,
+    maxPendingFrames: 1,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(() => h.received.some((f) => f.type === 'hello'), 'first hello');
+    h.sockets[0]!.close(1012, 'restarting');
+    await waitOffline(client);
+
+    for (let i = 0; i < 40; i++) {
+      sendOffline(client, {
+        type: 'task.artifact',
+        taskId: `t-many-${i}`,
+        artifact: { artifactId: 'a', parts: [{ kind: 'text', text: `chunk-${i}` }] },
+        append: true,
+        lastChunk: false,
+      });
+    }
+
+    await waitFor(() => h.connections >= 2, 'reconnect');
+    await new Promise((r) => setTimeout(r, 80));
+
+    for (let i = 0; i < 40; i++) {
+      const forTask = h.received.filter((f) => f.taskId === `t-many-${i}`);
+      const kinds = new Set(forTask.map((f) => f.type));
+      assert.ok(
+        !kinds.has('task.artifact') || !kinds.has('task.fail'),
+        `task ${i} got both a replayed artifact and a failure`,
+      );
+    }
+  } finally {
+    client.stop();
+    await closeServer(h.server, h.wss);
+  }
+});

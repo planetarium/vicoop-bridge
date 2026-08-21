@@ -165,7 +165,16 @@ export class Client {
   // is logged exactly once on first successful connect — same data on every
   // reconnect would just be noise, and we don't want to wait for whoami.
   private identityLogged = false;
-  private inflight = new Map<string, AbortController>();
+  // Per-run state, keyed by taskId for the life of that run. `suppressed` is
+  // set when we have already reported the run's outcome ourselves (a truncated
+  // replay); nothing the backend emits afterwards may reach the wire, because
+  // aborting a backend does not silence it — `processTask` still sends a
+  // `canceled` terminal once the abort is observed, and by then the bridge may
+  // have rebound that taskId to a later turn which would accept it.
+  //
+  // Run-scoped rather than taskId-scoped: a genuinely new turn for the same
+  // taskId gets a fresh entry and is unaffected.
+  private inflight = new Map<string, { controller: AbortController; suppressed: boolean }>();
   // Resolved once per process via backend.resolveCapabilities(); the bridge
   // hello frame is held until this settles so the advertised card matches the
   // backend's actual upstream capability. Cached across reconnects so we
@@ -209,6 +218,10 @@ export class Client {
   // the process and tell the operator why.
   private replaySupported = true;
   private replayConfirmTimer: ReturnType<typeof setTimeout> | null = null;
+  // Set when truncation bookkeeping overflowed and the buffer had to be
+  // abandoned wholesale. Nothing further is buffered for this outage, so no
+  // partial suffix can survive to be replayed; cleared on the next flush.
+  private bufferPoisoned = false;
   // Tasks that lost at least one frame to the cap. Their replay would be a
   // hole rather than a delay, so they are failed explicitly instead — a caller
   // is far better served by an honest failure it can retry than by a silently
@@ -239,7 +252,7 @@ export class Client {
     this.clearHeartbeat();
     // Abort all inflight tasks so backends can unwind cleanly instead of
     // running to completion after the WS is gone.
-    for (const controller of this.inflight.values()) controller.abort();
+    for (const run of this.inflight.values()) run.controller.abort();
     // Nothing will replay these — the process is going away.
     this.dropPendingFrames();
     this.ws?.close();
@@ -453,7 +466,7 @@ export class Client {
           break;
         case 'task.cancel':
           this.logger.info(`task.cancel taskId=${safeToken(frame.taskId)}`);
-          this.inflight.get(frame.taskId)?.abort();
+          this.inflight.get(frame.taskId)?.controller.abort();
           break;
         case 'ping':
           this.send({ type: 'pong' });
@@ -531,7 +544,7 @@ export class Client {
         this.logger.error(`${label}; stopping (code=${code})`);
         this.stopped = true;
         this.clearReconnectTimer();
-        for (const controller of this.inflight.values()) controller.abort();
+        for (const run of this.inflight.values()) run.controller.abort();
         // Nothing will ever replay these — this daemon is not reconnecting. The
         // host process may keep running (onFatal owns that decision), so
         // release the buffer rather than hold it for a reconnect that is not
@@ -693,7 +706,7 @@ export class Client {
   // `usage.response` answers a requestId the server forgot when the connection
   // died. Replaying either would be noise at best.
   private bufferUnsent(frame: UpFrame): void {
-    if (this.stopped) return;
+    if (this.stopped || this.bufferPoisoned) return;
     if (!('taskId' in frame)) return;
     const limit = this.opts.maxPendingFrames ?? DEFAULT_MAX_PENDING_FRAMES;
     const byteLimit = this.opts.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES;
@@ -727,12 +740,20 @@ export class Client {
   private markTruncated(taskId: string, why: string): void {
     if (this.truncatedTasks.has(taskId)) return;
     if (this.truncatedTasks.size >= MAX_TRUNCATED_TASKS) {
-      // Degrade to the pre-buffer behavior for further tasks rather than let
-      // the bookkeeping outgrow the buffer it describes: the server's own grace
-      // expiry still fails them, just without our explicit reason.
-      this.logger.warn(
-        `truncated-task list full (${MAX_TRUNCATED_TASKS}); task ${safeToken(taskId)} will be left to the bridge's grace expiry`,
-      );
+      // Silently declining to record this would be the worst outcome: the
+      // task's SURVIVING frames would still be replayed, handing the bridge a
+      // partial answer to complete — the exact hole truncation exists to
+      // prevent — and those same frames would resume the hold, so the grace
+      // expiry would not catch it either. Fail closed for the whole buffer
+      // instead: replay nothing this outage and let every affected task die on
+      // the bridge's own deadline.
+      if (!this.bufferPoisoned) {
+        this.bufferPoisoned = true;
+        this.logger.error(
+          `truncated-task list full (${MAX_TRUNCATED_TASKS}); discarding all buffered output for this outage rather than replay it partially`,
+        );
+      }
+      this.dropPendingFrames();
       return;
     }
     this.truncatedTasks.add(taskId);
@@ -749,6 +770,11 @@ export class Client {
   // that arrive while its (async) authentication is still settling and
   // processes them once it completes, so no ack round-trip is needed.
   private flushPendingFrames(ws: WebSocket): void {
+    if (this.bufferPoisoned) {
+      this.dropPendingFrames();
+      this.bufferPoisoned = false;
+      return;
+    }
     if (this.pendingFrames.length === 0 && this.truncatedTasks.size === 0) return;
     if (ws.readyState !== WebSocket.OPEN) return;
     if (!this.replaySupported) {
@@ -786,7 +812,13 @@ export class Client {
       replayed++;
     }
     for (const taskId of truncated) {
-      this.inflight.get(taskId)?.abort();
+      const run = this.inflight.get(taskId);
+      if (run) {
+        // Order matters: suppress before aborting, so the `canceled` terminal
+        // the abort provokes is already barred when it arrives.
+        run.suppressed = true;
+        run.controller.abort();
+      }
       ws.send(
         encodeFrame({
           type: 'task.fail',
@@ -903,11 +935,18 @@ export class Client {
   private async runTask(frame: import('@vicoop-bridge/protocol').DownFrame): Promise<void> {
     if (frame.type !== 'task.assign') return;
     const controller = new AbortController();
-    this.inflight.set(frame.taskId, controller);
+    const run = { controller, suppressed: false };
+    this.inflight.set(frame.taskId, run);
     try {
       await processTask(frame, controller.signal, {
         backend: this.opts.backend,
-        send: (f) => this.send(f),
+        // A suppressed run is over as far as the bridge is concerned; anything
+        // still trickling out of the backend must not reach a taskId that may
+        // now belong to someone else.
+        send: (f) => {
+          if (run.suppressed) return;
+          this.send(f);
+        },
         logger: this.logger,
       });
     } finally {
