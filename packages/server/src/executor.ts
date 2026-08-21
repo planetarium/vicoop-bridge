@@ -3,6 +3,7 @@ import {
   BaseAgent,
   InMemoryRunner,
   StreamingMode,
+  TaskNotCancelableError,
   TaskState,
   TERMINAL_STATES,
   type Artifact,
@@ -407,7 +408,50 @@ export class WSForwardingExecutor extends AgentExecutor {
       ...(principalId !== undefined ? { principalId } : {}),
       ...(requestedExtensions !== undefined ? { requestedExtensions } : {}),
     };
-    this.registry.bindTask(binding);
+    if (!this.registry.bindTask(binding)) {
+      const failEvent: TaskStatusUpdateEvent = {
+        taskId,
+        contextId,
+        final: true,
+        status: {
+          state: TaskState.FAILED,
+          timestamp: new Date().toISOString(),
+          message: {
+            messageId: `${taskId}-owner-mismatch`,
+            role: 'agent',
+            parts: [{ text: 'task ownership validation failed' }],
+            ...terminalErrorMessageFields(
+              {
+                code: 'task_owner_mismatch',
+                message: 'task ownership validation failed',
+              },
+              requestedExtensions,
+            ),
+            taskId,
+            contextId,
+          },
+        },
+      };
+      const terminal =
+        gate && settlement
+          ? await this.settleTerminal(gate, settlement, failEvent, binding, taskId, contextId)
+          : failEvent;
+      task.status = terminal.status;
+      task.history = appendHistoryMessage(
+        appendHistoryMessage(task.history ?? [], message),
+        terminal.status.message,
+      );
+      yield terminal;
+      try {
+        await this.taskStore.updateTask(taskId, {
+          status: task.status,
+          history: task.history,
+        });
+      } catch (err) {
+        logEvent('task_persist_error', { taskId, error: String(err) });
+      }
+      return;
+    }
 
     let history = appendHistoryMessage(task.history ?? [], message);
     task.history = history;
@@ -633,6 +677,17 @@ export class WSForwardingExecutor extends AgentExecutor {
     const taskId = task.id;
     const contextId = task.contextId ?? taskId;
     const ac = this.abortControllers.get(taskId);
+    const binding = this.registry.getBinding(taskId);
+
+    if (binding && binding.agentId !== this.agentId) {
+      logEvent('binding_owner_mismatch', {
+        agentId: this.agentId,
+        ownerAgentId: binding.agentId,
+        taskId,
+        operation: 'cancel',
+      });
+      throw new TaskNotCancelableError(`Task '${taskId}' is not owned by this agent`);
+    }
 
     // Notify the connected client so it can abort in-flight work and
     // emit its own task.fail / task.complete frame.
@@ -645,7 +700,6 @@ export class WSForwardingExecutor extends AgentExecutor {
     // buffered-but-unyielded — the stream would close without ever delivering
     // the terminal frame. The ac.abort() below is then only a fallback to
     // unblock a parked executor when there was no binding to deliver through.
-    const binding = this.registry.getBinding(taskId);
     if (binding) {
       const cancelStatus: TaskStatusUpdateEvent = {
         taskId,

@@ -22,8 +22,8 @@ export interface AgentA2XOptions {
 
 /**
  * Build the A2XServer for a WS-connected client. Each per-agent A2XServer
- * owns a `WSForwardingExecutor` bound to that agent's id and the
- * shared task store.
+ * owns a `WSForwardingExecutor` bound to that agent's id and an
+ * agent-scoped task store.
  *
  * The card surface is derived from the wire `AgentCard` the client sent
  * in its hello frame, plus security schemes synthesised from the

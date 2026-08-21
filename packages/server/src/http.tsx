@@ -52,6 +52,10 @@ import { Landing } from './landing.js';
 import { logEvent } from './log.js';
 import { buildAgentA2XServer, type AgentA2XOptions } from './agent-card.js';
 import {
+  PostgresTaskStore,
+  parsePersistRequestEnvelope,
+} from './postgres-task-store.js';
+import {
   buildLandingDirectory,
   mountWellKnown,
   type ConnectionPair,
@@ -131,17 +135,18 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }),
   );
 
-  // Built-in admin agent at root. The admin agent owns its own taskStore
-  // (Postgres-backed) for context-aware history loading; client agents
-  // share a separate taskStore so their state isn't entangled with the
-  // admin's persistence model.
-  const { handler: adminHandler, a2xServer: adminA2X, taskStore: adminTaskStore } =
-    createAdminA2XServer({
-      db: opts.db,
-      registry: opts.registry,
-      publicUrl: opts.publicUrl,
-    });
+  // The built-in admin agent and every connected client agent get distinct
+  // owner-scoped views of the same Postgres table. A handler can therefore
+  // never resolve another agent's task by taskId.
+  const { handler: adminHandler, a2xServer: adminA2X } = createAdminA2XServer({
+    db: opts.db,
+    registry: opts.registry,
+    publicUrl: opts.publicUrl,
+  });
   const adminCard = adminA2X.getAgentCard() as AgentCardV03;
+  const persistRequestEnvelope = parsePersistRequestEnvelope(
+    process.env.A2A_PERSIST_REQUEST_ENVELOPE,
+  );
 
   // Per-agent A2XServer cache. Rebuilds on caller-/agent-change so the
   // card reflects the latest connection state.
@@ -162,7 +167,11 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   function getAgentForConn(conn: ClientConnection): A2XServer {
     const cached = agentCache.get(conn.agentId);
     if (cached) return cached;
-    const a2x = buildAgentA2XServer(conn, adminTaskStore, opts.registry, agentCardOpts);
+    const taskStore = new PostgresTaskStore(opts.db, {
+      persistRequestEnvelope,
+      ownerAgent: conn.agentId,
+    });
+    const a2x = buildAgentA2XServer(conn, taskStore, opts.registry, agentCardOpts);
     agentCache.set(conn.agentId, a2x);
     return a2x;
   }

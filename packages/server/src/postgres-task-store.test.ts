@@ -217,6 +217,42 @@ test('stripSensitiveMetadata with preserveEnvelope still scrubs bearer/principal
 // ── updateTask concurrency (issue #366) ─────────────────────────────────────
 
 test(
+  'owner-scoped stores cannot read, update, or delete another agent task',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    try {
+      await ensureSchema(sql);
+      const victimStore = new PostgresTaskStore(sql, { ownerAgent: 'scope-victim' });
+      const attackerStore = new PostgresTaskStore(sql, { ownerAgent: 'scope-attacker' });
+      const maintenanceStore = new PostgresTaskStore(sql);
+      const task = await victimStore.createTask({});
+
+      try {
+        const rows = await sql<{ owner_agent: string | null }[]>`
+          SELECT owner_agent FROM infra.a2a_tasks WHERE task_id = ${task.id}
+        `;
+        assert.equal(rows[0]?.owner_agent, 'scope-victim');
+        assert.equal(await attackerStore.getTask(task.id), null);
+        await assert.rejects(
+          attackerStore.updateTask(task.id, {
+            status: { state: TaskState.CANCELED, timestamp: new Date().toISOString() },
+          }),
+          /Task not found/,
+        );
+
+        await attackerStore.deleteTask(task.id);
+        assert.ok(await victimStore.getTask(task.id), 'cross-agent delete must be a no-op');
+      } finally {
+        await maintenanceStore.deleteTask(task.id);
+      }
+    } finally {
+      await sql.end();
+    }
+  },
+);
+
+test(
   'updateTask: concurrent updates touching different fields do not lose either write (issue #366)',
   { skip: !hasDb },
   async () => {
