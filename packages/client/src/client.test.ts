@@ -1473,3 +1473,137 @@ test('maxPendingFrames: 0 restores the previous drop-on-the-floor behavior', asy
     await closeServer(server, wss);
   }
 });
+test('the offline buffer is bounded by bytes, not just frame count', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+
+  const received: Array<Record<string, unknown>> = [];
+  let connections = 0;
+  let firstSocket: WebSocket | undefined;
+  wss.on('connection', (ws) => {
+    connections++;
+    if (connections === 1) firstSocket = ws;
+    ws.on('message', (raw) => {
+      received.push(JSON.parse(raw.toString('utf8')) as Record<string, unknown>);
+    });
+  });
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => undefined),
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    maxPendingFrames: 1_000,
+    maxPendingBytes: 4_000,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(() => received.some((f) => f.type === 'hello'), 'first hello');
+    firstSocket!.close(1012, 'restarting');
+    await waitFor(
+      () => (client as never as { ws?: { readyState: number } }).ws?.readyState !== 1,
+      'socket down',
+    );
+
+    const send = (client as never as { send(f: unknown): void }).send.bind(client);
+    const chunk = 'x'.repeat(1_500);
+    for (let i = 0; i < 6; i++) {
+      send({
+        type: 'task.artifact',
+        taskId: 't-bytes',
+        artifact: { artifactId: 'a-1', parts: [{ kind: 'text', text: chunk }] },
+        append: true,
+        lastChunk: false,
+      });
+    }
+
+    await waitFor(() => connections >= 2, 'reconnect');
+    await waitFor(
+      () => received.some((f) => f.type === 'task.fail' && f.taskId === 't-bytes'),
+      'the byte-budget eviction to fail the task',
+    );
+
+    const forTask = received.filter((f) => f.taskId === 't-bytes');
+    assert.deepEqual(forTask.map((f) => f.type), ['task.fail']);
+    const failure = forTask[0] as { error: { code: string } };
+    assert.equal(failure.error.code, 'client_buffer_overflow');
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
+test('a single frame larger than the whole budget is refused without evicting the queue', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+
+  const received: Array<Record<string, unknown>> = [];
+  let connections = 0;
+  let firstSocket: WebSocket | undefined;
+  wss.on('connection', (ws) => {
+    connections++;
+    if (connections === 1) firstSocket = ws;
+    ws.on('message', (raw) => {
+      received.push(JSON.parse(raw.toString('utf8')) as Record<string, unknown>);
+    });
+  });
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async () => undefined),
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    maxPendingBytes: 4_000,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(() => received.some((f) => f.type === 'hello'), 'first hello');
+    firstSocket!.close(1012, 'restarting');
+    await waitFor(
+      () => (client as never as { ws?: { readyState: number } }).ws?.readyState !== 1,
+      'socket down',
+    );
+
+    const send = (client as never as { send(f: unknown): void }).send.bind(client);
+    send({
+      type: 'task.complete',
+      taskId: 't-small',
+      status: { state: 'completed', timestamp: new Date().toISOString() },
+    });
+    send({
+      type: 'task.artifact',
+      taskId: 't-huge',
+      artifact: { artifactId: 'a-1', parts: [{ kind: 'text', text: 'y'.repeat(10_000) }] },
+      append: true,
+      lastChunk: false,
+    });
+
+    await waitFor(() => connections >= 2, 'reconnect');
+    await waitFor(
+      () => received.some((f) => f.type === 'task.fail' && f.taskId === 't-huge'),
+      'the oversized frame to fail its own task',
+    );
+
+    assert.deepEqual(
+      received.filter((f) => f.taskId === 't-small').map((f) => f.type),
+      ['task.complete'],
+    );
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});

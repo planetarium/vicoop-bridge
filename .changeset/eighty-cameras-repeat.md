@@ -19,5 +19,7 @@ to receive them. A task that loses frames to the buffer cap fails explicitly
 with `client_buffer_overflow` rather than replaying a partial stream — an honest
 failure the caller can retry beats a silently truncated answer.
 
-`maxPendingFrames` bounds the buffer (default 2000); `0` disables it and
-restores the previous behavior.
+The buffer is bounded by both frame count (`maxPendingFrames`, default 2000)
+and encoded size (`maxPendingBytes`, default 4 MiB) — a count alone bounds
+nothing, since the protocol puts no size limit on text, file or data parts.
+Setting either to `0` disables buffering and restores the previous behavior.

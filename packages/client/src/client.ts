@@ -46,6 +46,9 @@ export interface ClientOptions {
   // is down (see `pendingFrames`). `0` disables buffering and restores the
   // previous drop-on-the-floor behavior.
   maxPendingFrames?: number;
+  // Companion byte budget for that buffer, over the encoded frames. Keep at or
+  // below the server's pre-auth byte budget; see DEFAULT_MAX_PENDING_BYTES.
+  maxPendingBytes?: number;
   // Minimum reconnect delay after a 4009 "another client with the same
   // token connected" close — i.e. two daemons authenticated with the
   // same CLIENT_TOKEN colliding at the registry's clientId check. The
@@ -111,6 +114,16 @@ const DEFAULT_RECONNECT_JITTER_RATIO = 0.2;
 // outage. A task that loses frames to this cap is failed rather than replayed
 // with a hole; see bufferUnsent(). `0` disables buffering entirely.
 const DEFAULT_MAX_PENDING_FRAMES = 2_000;
+// Companion byte budget for the same buffer. A frame count alone bounds
+// nothing useful: the protocol puts no size limit on text, file or data parts,
+// so 2,000 frames can be any number of megabytes. Both limits apply.
+//
+// MUST stay at or below the server's pre-auth byte budget
+// (MAX_PRE_AUTH_BYTES in packages/server/src/ws.ts), because a replay is
+// pipelined behind `hello` and the server holds it in memory until its
+// authentication settles. A client allowed to buffer more than the server will
+// accept pre-auth would be closed mid-replay and reconnect into a loop.
+const DEFAULT_MAX_PENDING_BYTES = 4 * 1024 * 1024;
 const DEFAULT_RECONNECT_STABLE_MS = 60_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
 const DEFAULT_COLLISION_BACKOFF_MS = 300_000;
@@ -150,7 +163,10 @@ export class Client {
   // socket lands on the original task untouched. Frames for a task whose hold
   // already expired are dropped by the server as `dropped_terminal_frame`,
   // which is what would have happened anyway.
-  private pendingFrames: Array<{ taskId: string; frame: UpFrame }> = [];
+  // Entries hold the ENCODED frame, not the frame object: it is what replay
+  // actually sends, and it is the only honest measure of what the buffer costs.
+  private pendingFrames: Array<{ taskId: string; encoded: string; bytes: number }> = [];
+  private pendingBytes = 0;
   // Tasks that lost at least one frame to the cap. Their replay would be a
   // hole rather than a delay, so they are failed explicitly instead — a caller
   // is far better served by an honest failure it can retry than by a silently
@@ -183,6 +199,7 @@ export class Client {
     for (const controller of this.inflight.values()) controller.abort();
     // Nothing will replay these — the process is going away.
     this.pendingFrames = [];
+    this.pendingBytes = 0;
     this.truncatedTasks.clear();
     this.ws?.close();
     // Tear down long-lived backend resources (e.g. codex app-server child).
@@ -610,20 +627,40 @@ export class Client {
     if (this.stopped) return;
     if (!('taskId' in frame)) return;
     const limit = this.opts.maxPendingFrames ?? DEFAULT_MAX_PENDING_FRAMES;
-    if (limit <= 0) return;
-    this.pendingFrames.push({ taskId: frame.taskId, frame });
-    while (this.pendingFrames.length > limit) {
-      // Drop the OLDEST, so what survives is the tail nearest the terminal —
-      // but record the victim's task, because a partial replay of a text
-      // stream is exactly the silent hole this buffer exists to prevent.
-      const dropped = this.pendingFrames.shift()!;
-      if (!this.truncatedTasks.has(dropped.taskId)) {
-        this.truncatedTasks.add(dropped.taskId);
-        this.logger.warn(
-          `offline frame buffer full (${limit}); task ${safeToken(dropped.taskId)} will be failed instead of replayed`,
-        );
-      }
+    const byteLimit = this.opts.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES;
+    if (limit <= 0 || byteLimit <= 0) return;
+
+    const encoded = encodeFrame(frame);
+    const bytes = Buffer.byteLength(encoded, 'utf8');
+    if (bytes > byteLimit) {
+      // A single frame nobody could ever replay. Buffering it would evict the
+      // whole rest of the queue for nothing.
+      this.markTruncated(frame.taskId, `frame of ${bytes} bytes exceeds the ${byteLimit}-byte buffer`);
+      return;
     }
+
+    this.pendingFrames.push({ taskId: frame.taskId, encoded, bytes });
+    this.pendingBytes += bytes;
+    // Drop the OLDEST first, so what survives is the tail nearest the terminal
+    // — but record each victim's task, because a partial replay of a text
+    // stream is exactly the silent hole this buffer exists to prevent.
+    while (this.pendingFrames.length > limit || this.pendingBytes > byteLimit) {
+      const dropped = this.pendingFrames.shift();
+      if (!dropped) break;
+      this.pendingBytes -= dropped.bytes;
+      this.markTruncated(
+        dropped.taskId,
+        `offline frame buffer full (${this.pendingFrames.length + 1}/${limit} frames, ${this.pendingBytes + dropped.bytes}/${byteLimit} bytes)`,
+      );
+    }
+  }
+
+  private markTruncated(taskId: string, why: string): void {
+    if (this.truncatedTasks.has(taskId)) return;
+    this.truncatedTasks.add(taskId);
+    this.logger.warn(
+      `${why}; task ${safeToken(taskId)} will be failed instead of replayed`,
+    );
   }
 
   // Replay buffered frames onto a freshly authenticated connection, in the
@@ -637,6 +674,7 @@ export class Client {
     const queued = this.pendingFrames;
     const truncated = this.truncatedTasks;
     this.pendingFrames = [];
+    this.pendingBytes = 0;
     this.truncatedTasks = new Set();
     if (queued.length === 0 && truncated.size === 0) return;
     if (ws.readyState !== WebSocket.OPEN) return;
@@ -644,7 +682,7 @@ export class Client {
     let replayed = 0;
     for (const entry of queued) {
       if (truncated.has(entry.taskId)) continue;
-      ws.send(encodeFrame(entry.frame));
+      ws.send(entry.encoded);
       replayed++;
     }
     for (const taskId of truncated) {

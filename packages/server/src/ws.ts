@@ -260,9 +260,29 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
   // replay into a 4003 close and a reconnect loop. Bounded, and discarded
   // untouched if authentication fails.
   let preAuthQueue: UpFrame[] = [];
+  let preAuthBytes = 0;
   const MAX_PRE_AUTH_FRAMES = 256;
+  // Byte budget alongside the frame count, measured on the RAW message rather
+  // than the parsed object: the protocol puts no size limit on artifact or
+  // status payloads, so a frame count alone bounds nothing. Without this an
+  // unauthenticated peer could park hundreds of megabytes per connection for
+  // the duration of the token lookup, across as many connections as it likes.
+  //
+  // Sized above the client's own replay budget (DEFAULT_MAX_PENDING_BYTES in
+  // packages/client/src/client.ts) so a legitimate replay always fits; a client
+  // that overshoots is closed rather than silently truncated.
+  const MAX_PRE_AUTH_BYTES = 8 * 1024 * 1024;
 
   ws.on('message', (raw) => {
+    // `RawData` is Buffer | ArrayBuffer | Buffer[] depending on how the socket
+    // was configured; measure all three rather than assume one.
+    const rawBytes = Buffer.isBuffer(raw)
+      ? raw.length
+      : Array.isArray(raw)
+        ? raw.reduce((n, chunk) => n + chunk.length, 0)
+        : raw instanceof ArrayBuffer
+          ? raw.byteLength
+          : Buffer.byteLength(String(raw), 'utf8');
     let frame;
     try {
       frame = parseUpFrame(typeof raw === 'string' ? raw : raw.toString('utf8'));
@@ -285,13 +305,21 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           ws.close(4003, 'expected hello');
           return;
         }
-        if (preAuthQueue.length >= MAX_PRE_AUTH_FRAMES) {
-          logEvent('pre_auth_overflow', { frames: preAuthQueue.length });
+        if (
+          preAuthQueue.length >= MAX_PRE_AUTH_FRAMES ||
+          preAuthBytes + rawBytes > MAX_PRE_AUTH_BYTES
+        ) {
+          logEvent('pre_auth_overflow', {
+            frames: preAuthQueue.length,
+            bytes: preAuthBytes,
+            frameBytes: rawBytes,
+          });
           opts.registry.noteServerClose(ws);
-          ws.close(4002, 'too many frames before authentication');
+          ws.close(4002, 'too much data before authentication');
           return;
         }
         preAuthQueue.push(frame);
+        preAuthBytes += rawBytes;
         return;
       }
       if (frame.version !== PROTOCOL_VERSION) {
@@ -339,6 +367,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         // keeping alive (issue #474).
         const queued = preAuthQueue;
         preAuthQueue = [];
+        preAuthBytes = 0;
         if (queued.length > 0) {
           logEvent('pre_auth_replayed', { agentId, frames: queued.length });
           for (const queuedFrame of queued) processAuthedFrame(queuedFrame);
