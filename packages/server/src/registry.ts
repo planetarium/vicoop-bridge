@@ -309,9 +309,10 @@ export class Registry {
           clientId: conn.clientId,
           previousConnectedAt: existing.connectedAt,
         });
-        // Whether this connection was already condemned has to be read BEFORE
-        // closing it: `ws` flips `_readyState` to CLOSING synchronously inside
-        // `close()`, so any liveness question asked afterwards answers itself.
+        // Preserve a terminal verdict this server already made about the old
+        // socket. It is policy intent, independent of the close code the peer
+        // eventually echoes (or fails to echo), and a reconnect must not turn
+        // a condemned connection back into a recoverable one.
         const displacedWasCondemned = this.serverClosed.has(existing.ws);
         // The close `reason` is what the client surfaces in its disconnect
         // log line. Spelling out the cause here means an operator reading
@@ -358,10 +359,16 @@ export class Registry {
         };
         const displacedSupportsReplay =
           existing.protocolCapabilities?.includes(TASK_REPLAY_CAPABILITY) === true;
-        if (displacedWasCondemned || !displacedSupportsReplay) {
+        if (displacedWasCondemned) {
           this.failBindingsForAgent(conn.agentId, DISCONNECTED_ERROR);
-        } else {
+        } else if (displacedSupportsReplay) {
           this.holdBindingsForAgent(conn.agentId, undefined, 'reconnect', supersededError);
+        } else {
+          // Legacy clients cannot reclaim output safely, but this is still a
+          // same-token replacement rather than a transport disconnect. Keep
+          // the path's established terminal classification while failing it
+          // immediately.
+          this.failBindingsForAgent(conn.agentId, supersededError);
         }
         this.agents.set(conn.agentId, conn);
         this.notifyAgentChange(conn.agentId);

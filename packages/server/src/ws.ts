@@ -293,7 +293,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         // task output while authentication is pending is unnecessary and would
         // reopen an unauthenticated buffering surface.
         opts.registry.noteServerClose(ws);
-        ws.close(4003, 'expected hello acknowledgement before task frames');
+        ws.close(4003, 'expected hello before task frames');
         return;
       }
       if (frame.version !== PROTOCOL_VERSION) {

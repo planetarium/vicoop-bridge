@@ -444,19 +444,17 @@ test('registerAgent emits client_collision and closes the prior ws with the desc
   assert.equal(parsed.previousConnectedAt, 1000);
 });
 
-test('same-token reconnect eventually fails the displaced connection in-flight bindings (issue #365)', () => {
+test('same-token reconnect immediately supersedes legacy in-flight bindings (issue #365)', () => {
   // A second daemon authenticating with the same CLIENT_TOKEN replaces the
   // incumbent. The old connection's in-flight task must receive a terminal
   // `failed` status and have its sink finished + binding dropped — otherwise
   // the task's HTTP stream hangs forever (if the new daemon is a separate
   // process that never knew the old taskId, it can't complete it either).
   //
-  // Since #474 that outcome is delayed by the reconnect grace, which exists
-  // because the new daemon is USUALLY the same client coming back and can
-  // finish the task. Grace 0 keeps this test on its original subject — that a
-  // displaced binding is never orphaned, and that this path's terminal is
-  // `superseded` — while the graced variants are covered separately below.
-  const registry = new Registry(0);
+  // A legacy client cannot safely reclaim output, so it still fails
+  // immediately even when grace is configured. The terminal remains this
+  // path's established `superseded`, not the transport-drop `disconnected`.
+  const registry = new Registry(10_000);
   const oldWs = makeWs();
   const base = {
     agentId: 'a1',
@@ -464,7 +462,6 @@ test('same-token reconnect eventually fails the displaced connection in-flight b
     ownerPrincipal: 'eth:0x0',
     agentCard: makeCard(false),
     allowedCallers: [],
-    protocolCapabilities: [TASK_REPLAY_CAPABILITY],
     connectedAt: 0,
   };
   registry.registerAgent({ ...base, ws: oldWs });

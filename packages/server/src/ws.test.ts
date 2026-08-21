@@ -972,6 +972,29 @@ test('a live duplicate-token collision is held against real sockets, then expire
     await closeServer(server);
   }
 });
+
+test('a pre-auth task frame is rejected with an actionable hello-first reason', async () => {
+  const server = createServer();
+  const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+
+  try {
+    await once(ws, 'open');
+    ws.send(encodeFrame({
+      type: 'task.fail', taskId: 'pre-auth-task',
+      error: { code: 'too_early', message: 'too early' },
+    }));
+    const [code, reason] = (await once(ws, 'close')) as [number, Buffer];
+    assert.equal(code, 4003);
+    assert.equal(reason.toString('utf8'), 'expected hello before task frames');
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});
+
 test('a message past the ingress cap is refused by the transport, never assembled', async () => {
   // The pre-auth byte budget can only be charged once `ws` has already built
   // the message, so without an ingress cap the library's 100 MiB default is

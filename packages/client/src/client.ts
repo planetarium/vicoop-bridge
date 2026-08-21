@@ -44,12 +44,15 @@ export interface ClientOptions {
   reconnectJitterRatio?: number;
   reconnectStableMs?: number;
   // Maximum number of unacknowledged task frames retained across reconnects.
-  // `0` keeps sequencing/gap detection but disables retry retention.
+  // Setting any retention bound to `0` keeps sequencing/gap detection but
+  // disables retry retention and aborts reliable runs when their socket drops.
   maxPendingFrames?: number;
   // Companion byte budget for the encoded unacknowledged frames.
+  // `0` has the retention-disable behavior described above.
   maxPendingBytes?: number;
   // Maximum age of an unacknowledged frame. Execution IDs make stale frames safe
   // to drop independently of the server's configured grace.
+  // `0` has the retention-disable behavior described above.
   maxPendingAgeMs?: number;
   // Minimum reconnect delay after a 4009 "another client with the same
   // token connected" close — i.e. two daemons authenticated with the
@@ -456,12 +459,12 @@ export class Client {
       this.logger.info(`disconnected: ${code} ${safeToken(reason.toString())}`);
       if (!current) return;
       this.ws = null;
-      // Legacy task frames have no generation or sequence. Once their socket is
-      // gone, allowing a late backend terminal to target a reused taskId is not
-      // safe, so stop those runs. Reliable runs retain their unacknowledged
-      // frames and resume after the next hello.ack.
+      // Legacy frames, and reliable runs whose retention was explicitly
+      // disabled, cannot safely continue after losing their socket. Stop them
+      // so output produced during the outage is never silently discarded.
+      // Retained reliable runs resume after the next hello.ack.
       for (const run of this.inflight.values()) {
-        if (run.executionId !== undefined) continue;
+        if (run.executionId !== undefined && this.pendingRetentionEnabled()) continue;
         run.suppressed = true;
         run.controller.abort();
       }
@@ -666,13 +669,14 @@ export class Client {
     const frameLimit = this.pendingFrameLimit();
     const byteLimit = this.pendingByteLimit();
     const ageLimit = this.pendingAgeLimit();
+    const retentionEnabled = frameLimit > 0 && byteLimit > 0 && ageLimit > 0;
     const maxFrameBytes = this.negotiatedMaxFrameBytes;
 
     if (
       (maxFrameBytes !== null && bytes > maxFrameBytes) ||
-      (byteLimit > 0 && bytes > byteLimit) ||
-      (frameLimit > 0 && this.pendingFrames.length >= frameLimit) ||
-      (byteLimit > 0 && this.pendingBytes + bytes > byteLimit)
+      (retentionEnabled && bytes > byteLimit) ||
+      (retentionEnabled && this.pendingFrames.length >= frameLimit) ||
+      (retentionEnabled && this.pendingBytes + bytes > byteLimit)
     ) {
       this.failReliableRun(
         run,
@@ -682,7 +686,7 @@ export class Client {
       return;
     }
 
-    if (frameLimit > 0 && byteLimit > 0 && ageLimit > 0) {
+    if (retentionEnabled) {
       this.pendingFrames.push({
         taskId: frame.taskId,
         executionId: run.executionId,
@@ -766,6 +770,14 @@ export class Client {
   private pendingAgeLimit(): number {
     const value = this.opts.maxPendingAgeMs ?? DEFAULT_MAX_PENDING_AGE_MS;
     return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : DEFAULT_MAX_PENDING_AGE_MS;
+  }
+
+  private pendingRetentionEnabled(): boolean {
+    return (
+      this.pendingFrameLimit() > 0 &&
+      this.pendingByteLimit() > 0 &&
+      this.pendingAgeLimit() > 0
+    );
   }
 
   private schedulePendingExpiry(): void {

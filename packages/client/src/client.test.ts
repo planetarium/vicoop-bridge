@@ -1456,6 +1456,63 @@ test('an unacknowledged frame expires even while the socket stays open', async (
   }
 });
 
+for (const [bound, options] of [
+  ['byte', { maxPendingBytes: 0 }],
+  ['age', { maxPendingAgeMs: 0 }],
+] as const) {
+  test(`a zero ${bound} retention bound aborts a reliable run on disconnect`, async () => {
+    const server = createServer();
+    const wss = new WebSocketServer({ server, path: '/connect' });
+    const serverUrl = await listen(server);
+    let backendAborted = false;
+    wss.on('connection', (ws) => {
+      ws.on('message', (raw) => {
+        const frame = parseUpFrame(raw.toString('utf8'));
+        if (frame.type === 'hello') {
+          ws.send(encodeFrame({
+            type: 'hello.ack', protocolCapabilities: [TASK_REPLAY_CAPABILITY],
+            disconnectGraceMs: 30_000, maxFrameBytes: 16 * 1024 * 1024,
+          }));
+          ws.send(encodeFrame({
+            ...makeAssign(`t-zero-${bound}`), executionId: `execution-zero-${bound}`,
+          }));
+        } else if (frame.type === 'task.artifact') {
+          ws.close(1012, 'disconnect with retention disabled');
+        }
+      });
+    });
+    const client = new Client({
+      serverUrl,
+      token: 'token',
+      agentId: 'agent-1',
+      backendKind: 'echo',
+      backend: backendOf('echo', async (task, emit, signal) => {
+        emit({
+          type: 'task.artifact', taskId: task.taskId,
+          artifact: { artifactId: 'a', parts: [{ kind: 'text', text: 'one shot' }] },
+        });
+        await new Promise<void>((resolve) => {
+          signal.addEventListener('abort', () => {
+            backendAborted = true;
+            resolve();
+          }, { once: true });
+        });
+      }),
+      ...options,
+      reconnectDelayMs: 5_000,
+      heartbeatIntervalMs: 0,
+      logLevel: 'silent',
+    });
+    try {
+      client.start();
+      await waitFor(() => backendAborted, `zero ${bound} bound did not abort the run`);
+    } finally {
+      client.stop();
+      await closeServer(server, wss);
+    }
+  });
+}
+
 test('a replacement assignment suppresses the older run with the same taskId', async () => {
   const server = createServer();
   const wss = new WebSocketServer({ server, path: '/connect' });
