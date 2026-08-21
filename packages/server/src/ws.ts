@@ -328,7 +328,15 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         // (no-ops unless the stored ws is this one), so racing a later close
         // event is safe. (#364)
         if (ws.readyState !== ws.OPEN) {
-          opts.registry.unregisterAgent(frame.agentId, ws, observedCloseCode);
+          if (observedCloseCode === undefined) {
+            // `close()` has moved the socket to CLOSING, but its close event
+            // has not supplied the policy-bearing code yet. Hand the identity
+            // to that handler instead of converting "not observed yet" into
+            // Registry's deliberately graceable "no code available" case.
+            agentId = frame.agentId;
+          } else {
+            opts.registry.unregisterAgent(frame.agentId, ws, observedCloseCode);
+          }
           return;
         }
         agentId = frame.agentId;
@@ -566,6 +574,24 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
     if (!binding) return { kind: 'handled' };
 
     if (binding.executionId !== undefined) {
+      if (frame.executionId === undefined) {
+        logEvent('task_frame_execution_id_missing', {
+          agentId: binding.agentId,
+          taskId: truncate(binding.taskId, 128),
+          ownerExecutionId: binding.executionId,
+        });
+        opts.registry.failTaskBinding(
+          binding,
+          'client_frame_execution_id_missing',
+          'client frame execution id is required for a replay-capable execution',
+        );
+        opts.registry.sendToAgent(binding.agentId, {
+          type: 'task.cancel',
+          taskId: binding.taskId,
+          executionId: binding.executionId,
+        });
+        return { kind: 'handled' };
+      }
       if (frame.executionId !== binding.executionId) {
         // A stale generation must never affect the current turn.
         if (!acknowledgeReceipt(frame)) {

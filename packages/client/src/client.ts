@@ -876,6 +876,15 @@ export class Client {
         );
       } else {
         this.removePendingExecution(executionId);
+        // A backend may already have returned after emitting its terminal, so
+        // its run is no longer in `inflight` even though that terminal remains
+        // unacknowledged. Dropping it while keeping a half-dead socket open can
+        // strand the server binding forever: there is nothing left to replay
+        // or abort. Force the normal disconnect/grace path to settle it.
+        this.logger.error(
+          `unacknowledged replay expired after ${ageLimit}ms; disconnecting so the bridge fails it closed`,
+        );
+        if (this.ws?.readyState === WebSocket.OPEN) this.ws.terminate();
       }
     }
     this.schedulePendingExpiry();

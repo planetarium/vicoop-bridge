@@ -1509,6 +1509,56 @@ test('an unacknowledged frame expires even while the socket stays open', async (
   }
 });
 
+test('an unacknowledged terminal disconnects after its backend has returned', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  let terminalReceived = false;
+  let socketClosed = false;
+  wss.on('connection', (ws) => {
+    ws.on('close', () => { socketClosed = true; });
+    ws.on('message', (raw) => {
+      const frame = parseUpFrame(raw.toString('utf8'));
+      if (frame.type === 'hello') {
+        ws.send(encodeFrame({
+          type: 'hello.ack', protocolCapabilities: [TASK_REPLAY_CAPABILITY],
+          disconnectGraceMs: 30_000, maxFrameBytes: 16 * 1024 * 1024,
+        }));
+        ws.send(encodeFrame({
+          ...makeAssign('t-expired-terminal'), executionId: 'execution-expired-terminal',
+        }));
+      } else if (frame.type === 'task.complete') {
+        // Deliberately leave the terminal unacknowledged. The backend has
+        // already returned, so expiry must still disconnect and wake the
+        // server-side task lifecycle.
+        terminalReceived = true;
+      }
+    });
+  });
+  const client = new Client({
+    serverUrl,
+    token: 'token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('echo', async (task, emit) => {
+      emit({ type: 'task.complete', taskId: task.taskId, status: { state: 'completed' } });
+    }),
+    maxPendingAgeMs: 20,
+    reconnectDelayMs: 5_000,
+    heartbeatIntervalMs: 0,
+    logLevel: 'silent',
+  });
+
+  try {
+    client.start();
+    await waitFor(() => terminalReceived, 'unacknowledged terminal');
+    await waitFor(() => socketClosed, 'socket close after terminal acknowledgement timeout');
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
 test('a pending-frame overflow reports client_buffer_overflow before disconnecting', async () => {
   const server = createServer();
   const wss = new WebSocketServer({ server, path: '/connect' });
