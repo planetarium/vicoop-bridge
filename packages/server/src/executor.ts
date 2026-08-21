@@ -362,7 +362,6 @@ export class WSForwardingExecutor extends AgentExecutor {
 
     const queue = new AsyncEventQueue<TaskStatusUpdateEvent | TaskArtifactUpdateEvent>();
     const ac = new AbortController();
-    this.abortControllers.set(taskId, ac);
 
     const sink: TaskSink = {
       pushStatus: (event) => queue.push(event),
@@ -409,6 +408,9 @@ export class WSForwardingExecutor extends AgentExecutor {
       ...(requestedExtensions !== undefined ? { requestedExtensions } : {}),
     };
     if (!this.registry.bindTask(binding)) {
+      // This queue will never be consumed because the binding was rejected.
+      // Close it now, and do not publish the AbortController into the task map.
+      queue.end();
       const failEvent: TaskStatusUpdateEvent = {
         taskId,
         contextId,
@@ -452,6 +454,7 @@ export class WSForwardingExecutor extends AgentExecutor {
       }
       return;
     }
+    this.abortControllers.set(taskId, ac);
 
     let history = appendHistoryMessage(task.history ?? [], message);
     task.history = history;

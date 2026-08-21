@@ -452,6 +452,14 @@ test('executeStream cannot displace a live task binding owned by another agent',
   assert.equal(victimFinished, false, 'the victim stream must remain open');
   assert.equal(victimStatuses.length, 0, 'the victim must not receive a forged failed event');
   assert.equal(sent.length, 0, 'the attacker agent must not receive a task.assign frame');
+  const abortControllers = (
+    executor as unknown as { abortControllers: Map<string, AbortController> }
+  ).abortControllers;
+  assert.equal(
+    abortControllers.has(task.id),
+    false,
+    'a rejected binding must not leave a stale AbortController behind',
+  );
 });
 
 test('executor omits message.metadata entirely when the only entry was _principalId', async () => {
