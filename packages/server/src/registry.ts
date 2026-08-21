@@ -84,11 +84,89 @@ export type CallerChangeListener = (agentId: string, callers: string[]) => void;
 // before an unclean shutdown) is cleared unconditionally.
 export type AgentChangeListener = (agentId: string) => void;
 
+// Reconnect grace hold (issue #474). A WS drop that the client recovers from
+// used to fail every in-flight task instantly, and the results the client sent
+// after reconnecting were discarded as `dropped_terminal_frame` — a 3s infra
+// blip became a minute-long outage downstream. Instead we keep the binding
+// alive for this long and let the reconnected client's frames land on it.
+//
+// Sized off the incident: the terminal frames arrived +9s / +10s / +15s after
+// the drop, so the hold has to cover TASK COMPLETION, not just reconnect time
+// (3.2s). 30s gives 2x margin over the worst observed frame. It is not a cap on
+// task duration — a single frame (heartbeat included) on the new connection
+// resumes the binding outright, after which the executor's own 10-minute
+// inactivity backstop is what governs.
+//
+// `0` disables the hold and restores the previous fail-immediately behavior.
+const DEFAULT_DISCONNECT_GRACE_MS = (() => {
+  const raw = process.env.BRIDGE_DISCONNECT_GRACE_MS;
+  const n = raw ? Number(raw) : Number.NaN;
+  return Number.isFinite(n) && n >= 0 ? n : 30_000;
+})();
+
+/**
+ * Is this close code one we should wait out, rather than treat as proof the
+ * client is gone?
+ *
+ * Deliberately a DENY-list, not an allow-list of "transient" codes. The server
+ * has never recorded close codes (`client_disconnected` didn't carry one until
+ * this change), so we have no data on which code its socket actually observes
+ * when a proxy tears the connection down — the client saw `1012` in the
+ * incident, but the server end may well see `1006`/`1005`. Enumerating
+ * transient codes would be building on that guess. What we DO know exactly is
+ * the set of terminal closes, because the bridge itself sends them:
+ *
+ *   - 4000-4999: this server's own app-level rejections (bad token, duplicate
+ *     hello, client deleted, superseded, …). Every one is a decision that the
+ *     connection must not continue, so the task is genuinely dead.
+ *   - 1000: a clean, intentional close. Nothing to wait for.
+ *
+ * Everything else — abnormal closure, proxy restart, no code at all — gets the
+ * hold. This also makes `disconnectClient()`'s 4014 and the 4009 duplicate-token
+ * close fail fast for free, with no special-casing.
+ */
+function isGraceableCloseCode(code: number | undefined): boolean {
+  if (code === undefined) return true;
+  if (code === 1000) return false;
+  return code < 4000 || code > 4999;
+}
+
+// Shape of the terminal a binding is failed with. Named so the disconnect
+// terminal can be declared once and reused by every path that emits it.
+interface TerminalError {
+  code: string;
+  message: string;
+  messageIdSuffix: string;
+}
+
+// The mid-task disconnect terminal, unchanged since before the grace hold: a
+// task that outlives its hold must be indistinguishable downstream from one
+// that failed instantly, so the router needs no new case.
+const DISCONNECTED_ERROR: TerminalError = {
+  code: 'disconnected',
+  message: 'client disconnected mid-task',
+  messageIdSuffix: 'disc',
+};
+
+interface GraceHold {
+  timer: ReturnType<typeof setTimeout>;
+  // Identity guard, same discipline as unbindTask: only the binding that was
+  // held may be failed by its own timer. A rebind of the same taskId while the
+  // hold is pending must never be collateral damage.
+  binding: TaskBinding;
+}
+
 export class Registry {
   private agents = new Map<string, ClientConnection>();
   private bindings = new Map<string, TaskBinding>();
+  // taskId -> pending grace hold. A binding in here is still present in
+  // `bindings` and still fully serviceable; the entry only means "if nothing
+  // arrives for this task before the timer fires, declare the client dead".
+  private graceHolds = new Map<string, GraceHold>();
   private callerChangeListeners: CallerChangeListener[] = [];
   private agentChangeListeners: AgentChangeListener[] = [];
+
+  constructor(private readonly disconnectGraceMs: number = DEFAULT_DISCONNECT_GRACE_MS) {}
 
   registerAgent(conn: ClientConnection): { ok: true } | { ok: false; reason: string } {
     const existing = this.agents.get(conn.agentId);
@@ -113,18 +191,40 @@ export class Registry {
         // the foreground log can recognize the duplicate-token scenario
         // without cross-referencing close codes.
         existing.ws.close(4009, 'another client with the same token connected');
-        // Fail the displaced connection's in-flight tasks *before* swapping the
-        // map. The old socket's close fires asynchronously and, by the time its
-        // unregisterAgent runs, the map already points at `conn` — so the
+        // Deal with the displaced connection's in-flight tasks *before* swapping
+        // the map. The old socket's close fires asynchronously and, by the time
+        // its unregisterAgent runs, the map already points at `conn` — so the
         // ws-identity guard makes it a no-op and it can't clean these up. Doing
         // it here (while the bindings still belong to the old conn) is the only
         // point that sees them. The new conn hasn't bound any tasks yet, so
-        // this only terminates the superseded ones.
-        this.failBindingsForAgent(conn.agentId, {
+        // this only touches the superseded ones.
+        //
+        // Whether we kill or hold them turns on whether the old socket is still
+        // alive (issue #474). Which of the two paths a recovered drop takes is a
+        // pure race — the server may see the old socket's close first (→
+        // unregisterAgent) or the new hello first (→ here) — so both have to
+        // reach the same verdict, otherwise the fix works only when the events
+        // happen to arrive in the lucky order.
+        //
+        // A NOT-OPEN old socket means the transport is already gone and this
+        // hello is the same client coming back: hold, exactly as the disconnect
+        // path would. There is no close code to consult (the close event hasn't
+        // been delivered yet), but a socket that died without one of our own
+        // 4xxx closes is by definition in the graceable category.
+        //
+        // A still-OPEN old socket is the genuine collision this path was written
+        // for: two live daemons sharing a CLIENT_TOKEN. That is not a recovered
+        // drop and there is nothing to wait for, so it keeps failing instantly.
+        const supersededError = {
           code: 'superseded',
           message: 'superseded by a reconnect from the same client token',
           messageIdSuffix: 'superseded',
-        });
+        };
+        if (existing.ws.readyState === existing.ws.OPEN) {
+          this.failBindingsForAgent(conn.agentId, supersededError);
+        } else {
+          this.holdBindingsForAgent(conn.agentId, undefined, 'reconnect', supersededError);
+        }
         this.agents.set(conn.agentId, conn);
         this.notifyAgentChange(conn.agentId);
         return { ok: true };
@@ -171,16 +271,126 @@ export class Registry {
     return closed;
   }
 
-  unregisterAgent(agentId: string, ws: WebSocket): void {
+  // `closeCode` is the WS close code this socket reported, or undefined when
+  // the caller has none (the #364 reconcile path, which unregisters a socket
+  // that went away before registration finished). It decides only one thing:
+  // whether the in-flight tasks die now or get a grace hold. The agent itself
+  // leaves the `agents` map either way — it is offline until it says hello
+  // again, so routing and agent-card consumers see no change from this.
+  unregisterAgent(agentId: string, ws: WebSocket, closeCode?: number): void {
     const existing = this.agents.get(agentId);
     if (!existing || existing.ws !== ws) return;
     this.agents.delete(agentId);
     this.notifyAgentChange(agentId);
-    this.failBindingsForAgent(agentId, {
-      code: 'disconnected',
-      message: 'client disconnected mid-task',
-      messageIdSuffix: 'disc',
+    if (isGraceableCloseCode(closeCode)) {
+      // holdBindingsForAgent handles a disabled grace itself, falling back to
+      // the same immediate failure, so there is one decision point rather than
+      // two conditions that could drift apart.
+      this.holdBindingsForAgent(agentId, closeCode, 'disconnect', DISCONNECTED_ERROR);
+      return;
+    }
+    this.failBindingsForAgent(agentId, DISCONNECTED_ERROR);
+  }
+
+  // Start a grace hold on every in-flight task bound to this agent instead of
+  // failing it. The binding stays in `bindings` and its sink stays open, so a
+  // frame arriving on the client's next connection lands on it untouched —
+  // nothing about a TaskBinding is connection-scoped (no `ws` field; outbound
+  // sends re-resolve the connection by agentId at send time), which is what
+  // makes a hold this cheap.
+  // `disabledFallback` is the terminal to emit if the grace is switched off
+  // (`BRIDGE_DISCONNECT_GRACE_MS=0`). It differs per caller so that disabling
+  // the feature reproduces the pre-#474 behavior exactly — including the
+  // `superseded` wording the reconnect path has always used — rather than
+  // leaking this path's own error onto it. Expiry, by contrast, is always
+  // `disconnected`: a hold that runs out means the client never came back for
+  // the task, whichever path started the hold.
+  private holdBindingsForAgent(
+    agentId: string,
+    closeCode: number | undefined,
+    via: 'disconnect' | 'reconnect',
+    disabledFallback: TerminalError,
+  ): void {
+    if (this.disconnectGraceMs <= 0) {
+      this.failBindingsForAgent(agentId, disabledFallback);
+      return;
+    }
+    for (const binding of [...this.bindings.values()]) {
+      if (binding.agentId !== agentId) continue;
+      // Already holding this one (e.g. a second disconnect arriving for a
+      // binding whose hold is still pending). Leave the original deadline in
+      // place rather than sliding it forward on every event.
+      if (this.graceHolds.has(binding.taskId)) continue;
+      const timer = setTimeout(() => {
+        this.graceHolds.delete(binding.taskId);
+        // The client never came back for this task. Fail it exactly the way an
+        // ungraced disconnect always has — same code, same message, same
+        // messageId suffix — so nothing downstream has to learn a new shape.
+        // The only difference is that it happens `disconnectGraceMs` later.
+        if (this.bindings.get(binding.taskId) !== binding) return;
+        logEvent('binding_grace_expired', {
+          agentId: binding.agentId,
+          taskId: binding.taskId,
+          graceMs: this.disconnectGraceMs,
+          ...(binding.principalId !== undefined ? { principalId: binding.principalId } : {}),
+        });
+        this.failBinding(binding, DISCONNECTED_ERROR);
+        this.bindings.delete(binding.taskId);
+      }, this.disconnectGraceMs);
+      // Never let a pending hold keep the process alive on its own.
+      timer.unref?.();
+      this.graceHolds.set(binding.taskId, { timer, binding });
+      logEvent('binding_grace_held', {
+        agentId: binding.agentId,
+        taskId: binding.taskId,
+        graceMs: this.disconnectGraceMs,
+        via,
+        ...(closeCode !== undefined ? { closeCode } : {}),
+        ...(binding.principalId !== undefined ? { principalId: binding.principalId } : {}),
+      });
+    }
+  }
+
+  /**
+   * Cancel the grace hold on a task because the client just proved it is alive
+   * and still working on it.
+   *
+   * Called for every task-scoped frame from an authenticated connection — a
+   * heartbeat `task.status` is enough, and that matters: it means even a
+   * multi-minute task resumes the instant the reconnected client's next beat
+   * lands, long before the hold would have expired. No-op for the overwhelming
+   * majority of frames, where no hold is pending.
+   *
+   * `agentId` is checked so a frame cannot resume a hold belonging to some
+   * other agent's task, even if it somehow guessed the taskId.
+   */
+  resumeBinding(taskId: string, agentId: string): void {
+    const hold = this.graceHolds.get(taskId);
+    if (!hold) return;
+    if (hold.binding.agentId !== agentId) return;
+    // Identity guard: a hold whose binding has since been replaced belongs to
+    // the old binding. Leave it for the timer, which re-checks the same thing.
+    if (this.bindings.get(taskId) !== hold.binding) return;
+    clearTimeout(hold.timer);
+    this.graceHolds.delete(taskId);
+    logEvent('binding_grace_resumed', {
+      agentId,
+      taskId,
+      ...(hold.binding.principalId !== undefined
+        ? { principalId: hold.binding.principalId }
+        : {}),
     });
+  }
+
+  // Drop a pending hold without failing anything — used wherever a binding
+  // leaves the map through a path that has already decided its fate (normal
+  // terminal, rebind, explicit fail), so a stale timer can't fire against it.
+  private clearGraceHold(taskId: string, binding?: TaskBinding): void {
+    const hold = this.graceHolds.get(taskId);
+    if (!hold) return;
+    if (binding !== undefined && hold.binding !== binding) return;
+    clearTimeout(hold.timer);
+    this.graceHolds.delete(taskId);
   }
 
   // Push a terminal `failed` status to every in-flight task bound to this
@@ -193,12 +403,12 @@ export class Registry {
   // explicitly before swapping the agents map: once the map points at the new
   // conn, the old socket's late close handler hits the ws-identity guard in
   // unregisterAgent and early-returns, so it can no longer fail these bindings.
-  private failBindingsForAgent(
-    agentId: string,
-    error: { code: string; message: string; messageIdSuffix: string },
-  ): void {
+  private failBindingsForAgent(agentId: string, error: TerminalError): void {
     for (const binding of [...this.bindings.values()]) {
       if (binding.agentId !== agentId) continue;
+      // This binding's fate is being decided right now; a pending hold on it is
+      // moot and its timer must not outlive it.
+      this.clearGraceHold(binding.taskId, binding);
       this.failBinding(binding, error);
       // Identity-guarded: only drop the entry if it is still THIS binding, so a
       // concurrent rebind of the same taskId is never clobbered.
@@ -213,10 +423,7 @@ export class Registry {
   // executeStream() generator returns (closing the SSE stream) instead of
   // hanging forever on AsyncEventQueue.iterate(). Does NOT touch the bindings
   // map — callers decide whether to delete (disconnect) or overwrite (rebind).
-  private failBinding(
-    binding: TaskBinding,
-    error: { code: string; message: string; messageIdSuffix: string },
-  ): void {
+  private failBinding(binding: TaskBinding, error: TerminalError): void {
     binding.sink.pushStatus({
       taskId: binding.taskId,
       contextId: binding.contextId,
@@ -285,6 +492,11 @@ export class Registry {
         taskId: binding.taskId,
         ...(binding.principalId !== undefined ? { principalId: binding.principalId } : {}),
       });
+      // The displaced binding is being terminated here and now, so any hold it
+      // was under is decided — drop the timer before the new binding takes over
+      // the taskId. (The timer is identity-guarded too, so this is belt and
+      // braces, but leaving live timers around for dead bindings is a trap.)
+      this.clearGraceHold(binding.taskId, existing);
       this.failBinding(existing, {
         code: 'task_superseded',
         message: 'task superseded by a newer request for the same task id',
@@ -307,6 +519,12 @@ export class Registry {
   // guard already applied to the agents map in unregisterAgent (issue #365).
   unbindTask(taskId: string, binding: TaskBinding): void {
     if (this.bindings.get(taskId) !== binding) return;
+    // A task that reaches its terminal while a hold is pending — the exact case
+    // this feature exists to rescue, where the reconnected client's
+    // `task.complete` lands during the grace window — must take its timer with
+    // it. Otherwise the timer would fire later and try to fail an already
+    // completed task.
+    this.clearGraceHold(taskId, binding);
     this.bindings.delete(taskId);
   }
 

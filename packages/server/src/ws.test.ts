@@ -545,3 +545,130 @@ test('task.fail omits terminal error metadata when openai-compat extension was n
     await closeServer(server);
   }
 });
+async function waitForAgentGone(registry: Registry, agentId: string): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (registry.getAgent(agentId)) {
+    assert.ok(Date.now() < deadline, `timed out waiting for ${agentId} to unregister`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function helloFrame(): string {
+  return encodeFrame({
+    type: 'hello',
+    version: PROTOCOL_VERSION,
+    agentId: 'agent-1',
+    token: 'token',
+    agentCard: {
+      name: 'agent',
+      version: '0.0.0',
+      protocolVersion: '0.3.0',
+    },
+  });
+}
+
+test('a task survives a proxy-style disconnect and completes on the reconnected socket', async () => {
+  const server = createServer();
+  const registry = new Registry(10_000);
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const first = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+  let second: WebSocket | undefined;
+
+  try {
+    await once(first, 'open');
+    first.send(helloFrame());
+    await waitForAgent(registry, 'agent-1');
+
+    const sink = makeSink();
+    registry.bindTask({
+      agentId: 'agent-1',
+      taskId: 'task-1',
+      contextId: 'ctx-1',
+      sink,
+    });
+
+    registry.getAgent('agent-1')!.ws.close(1012, 'restarting');
+    await waitForAgentGone(registry, 'agent-1');
+
+    assert.ok(registry.getBinding('task-1'), 'task must be held across the disconnect');
+    assert.equal(sink.statuses.length, 0, 'no premature failure may be emitted');
+
+    second = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+    await once(second, 'open');
+    second.send(helloFrame());
+    await waitForAgent(registry, 'agent-1');
+
+    second.send(encodeFrame({
+      type: 'task.status',
+      taskId: 'task-1',
+      status: { state: 'working', timestamp: new Date().toISOString() },
+      metadata: { [OPENAI_COMPAT_EXTENSION_URI]: { heartbeat: true } },
+    }));
+
+    second.send(encodeFrame({
+      type: 'task.complete',
+      taskId: 'task-1',
+      status: {
+        state: 'completed',
+        timestamp: new Date().toISOString(),
+        message: {
+          role: 'agent',
+          messageId: 'm-1',
+          parts: [{ kind: 'text', text: 'the answer' }],
+        },
+      },
+    }));
+
+    await sink.finished;
+
+    const terminal = sink.statuses.at(-1)!;
+    assert.equal(terminal.final, true);
+    assert.equal(terminal.status.state, 'completed');
+    assert.deepEqual(terminal.status.message?.parts, [{ kind: 'text', text: 'the answer' }]);
+    assert.ok(
+      !sink.statuses.some((s) => s.status.state === 'failed'),
+      'the task must never have been marked failed',
+    );
+    assert.equal(registry.getBinding('task-1'), undefined, 'the completed task is unbound');
+  } finally {
+    first.close();
+    second?.close();
+    await closeServer(server);
+  }
+});
+
+test('an app-level close code fails in-flight tasks immediately, with no grace hold', async () => {
+  const server = createServer();
+  const registry = new Registry(10_000);
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+
+  try {
+    await once(ws, 'open');
+    ws.send(helloFrame());
+    await waitForAgent(registry, 'agent-1');
+
+    const sink = makeSink();
+    registry.bindTask({
+      agentId: 'agent-1',
+      taskId: 'task-2',
+      contextId: 'ctx-2',
+      sink,
+    });
+
+    registry.getAgent('agent-1')!.ws.close(4014, 'client deleted');
+
+    await sink.finished;
+
+    const terminal = sink.statuses.at(-1)!;
+    assert.equal(terminal.final, true);
+    assert.equal(terminal.status.state, 'failed');
+    assert.deepEqual(terminal.status.message?.parts, [{ text: 'client disconnected mid-task' }]);
+    assert.equal(registry.getBinding('task-2'), undefined);
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});

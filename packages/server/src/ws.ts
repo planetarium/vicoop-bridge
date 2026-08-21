@@ -279,6 +279,21 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       return;
     }
 
+    // Any task-scoped frame on an authenticated connection is proof that the
+    // client is alive and still working this task, which is exactly the signal
+    // that cancels a reconnect grace hold (issue #474). Doing it here rather
+    // than in each handler means every task frame counts — including a bare
+    // liveness heartbeat, and including any frame type added later — and that
+    // resumption happens before the frame is processed, so a `task.complete`
+    // arriving mid-hold resumes the binding and then completes it normally
+    // instead of being discarded as a `dropped_terminal_frame`.
+    //
+    // No-op unless a hold is actually pending, which is the case for
+    // essentially every frame the server ever sees.
+    if (agentId !== null && 'taskId' in frame) {
+      opts.registry.resumeBinding(frame.taskId, agentId);
+    }
+
     switch (frame.type) {
       case 'task.status': {
         const b = opts.registry.getBinding(frame.taskId);
@@ -416,7 +431,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code: number, reason: Buffer) => {
     clearTimeout(helloTimeout);
     if (agentId) {
       // Look up the live connection BEFORE unregistering so the disconnect log
@@ -424,6 +439,16 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
       const conn = opts.registry.getAgent(agentId);
       logEvent('client_disconnected', {
         agentId,
+        // The close code decides whether in-flight tasks get a reconnect grace
+        // hold (issue #474), so it belongs in the log the operator reads when
+        // asking why a task did or didn't survive a drop. It was previously
+        // discarded outright, which is why the 2026-08-20 incident left no
+        // record of what the SERVER's socket saw — the 1012 in that report is
+        // what the CLIENT observed, and the two ends need not agree.
+        // `reason` is remote-supplied, so truncate it like every other
+        // client-controlled string we log.
+        closeCode: code,
+        ...(reason.length > 0 ? { closeReason: truncate(reason.toString('utf8'), 128) } : {}),
         ...(conn
           ? {
               clientId: conn.clientId,
@@ -434,7 +459,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
             }
           : {}),
       });
-      opts.registry.unregisterAgent(agentId, ws);
+      opts.registry.unregisterAgent(agentId, ws, code);
     }
   });
 

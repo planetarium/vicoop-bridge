@@ -4,11 +4,19 @@ import type { WebSocket } from 'ws';
 import { OPENAI_COMPAT_EXTENSION_URI, type AgentCard } from '@vicoop-bridge/protocol';
 import { Registry } from './registry.js';
 
-// Minimal WebSocket stub — Registry only uses `.close()` on replacement and
-// equality (`existing.ws !== ws`) on unregister. Nothing else on the real ws
-// interface is exercised here.
-function makeWs(): WebSocket {
-  return { close: () => undefined } as unknown as WebSocket;
+// Mirrors the `ws` library's ReadyState constants; the stubs below are typed as
+// WebSocket, so these have to agree with the real values.
+const WS_OPEN = 1;
+const WS_CLOSED = 3;
+
+// Minimal WebSocket stub — Registry uses `.close()` on replacement, equality
+// (`existing.ws !== ws`) on unregister, and `readyState` to tell a live
+// duplicate-token collision from a client that is merely reconnecting after its
+// socket already died (issue #474). Defaults to OPEN, which is what every
+// pre-#474 test implicitly assumed. Nothing else on the real ws interface is
+// exercised here.
+function makeWs(readyState: number = WS_OPEN): WebSocket {
+  return { close: () => undefined, readyState, OPEN: WS_OPEN } as unknown as WebSocket;
 }
 
 interface RecordingWs extends WebSocket {
@@ -19,6 +27,8 @@ function makeRecordingWs(): RecordingWs {
   const closeArgs: Array<{ code: number; reason: string }> = [];
   const ws = {
     closeArgs,
+    readyState: WS_OPEN,
+    OPEN: WS_OPEN,
     close(code: number, reason: string) {
       closeArgs.push({ code, reason });
     },
@@ -126,6 +136,11 @@ test('onAgentChange fires on disconnect (unregister) so stale transports do not 
   assert.deepEqual(seen, ['a1']);
 });
 
+// 4009 (duplicate CLIENT_TOKEN) stands in for any app-level close: the bridge
+// only sends 4xxx when it has decided the connection must not continue, so
+// those skip the reconnect grace hold and fail in-flight tasks immediately
+// (issue #474). The terminal shape asserted here is the one a graced task also
+// ends up with once its hold expires — see the grace tests below.
 test('unregisterAgent reports mid-task disconnect with structured error metadata', () => {
   const registry = new Registry();
   const ws = makeWs();
@@ -155,7 +170,7 @@ test('unregisterAgent reports mid-task disconnect with structured error metadata
     },
   });
 
-  registry.unregisterAgent('a1', ws);
+  registry.unregisterAgent('a1', ws, 4009);
 
   assert.equal(finished, true);
   assert.equal(registry.getBinding('t-disc'), undefined);
@@ -199,8 +214,11 @@ test('unregisterAgent omits terminal error metadata when openai-compat extension
     },
   });
 
-  registry.unregisterAgent('a1', ws);
+  registry.unregisterAgent('a1', ws, 4009);
 
+  // Assert a terminal was actually pushed before asserting what it omits —
+  // without this the two checks below pass vacuously on an empty array.
+  assert.equal(statuses.length, 1);
   assert.equal(statuses[0]?.status.message?.metadata, undefined);
   assert.equal(statuses[0]?.status.message?.extensions, undefined);
 });
@@ -607,4 +625,235 @@ test('bindTask displacing a live binding emits a superseded terminal on the old 
   assert.equal(terminal?.final, true);
   assert.equal(terminal?.status?.state, 'failed');
   assert.match(terminal?.status?.message?.parts?.[0]?.text ?? '', /superseded/);
+});
+interface CapturedTask {
+  statuses: unknown[];
+  state: { finished: boolean };
+}
+
+// Terminal-status reader, matching recordingBinding's `unknown[]` idiom above:
+// the sink receives full TaskStatusUpdateEvents, and these tests only care
+// about the human-readable reason on the first one.
+function terminalText(task: CapturedTask): string {
+  const first = task.statuses[0] as
+    | { status?: { message?: { parts?: Array<{ text?: string }> } } }
+    | undefined;
+  return first?.status?.message?.parts?.[0]?.text ?? '';
+}
+
+function bindCapturing(registry: Registry, agentId: string, taskId: string): CapturedTask {
+  const statuses: unknown[] = [];
+  const state = { finished: false };
+  registry.bindTask({
+    agentId,
+    taskId,
+    contextId: `ctx-${taskId}`,
+    sink: {
+      pushStatus: (event) => statuses.push(event),
+      pushArtifact: () => undefined,
+      finish: () => {
+        state.finished = true;
+      },
+    },
+  });
+  return { statuses, state };
+}
+
+function registerFor(registry: Registry, ws: WebSocket, agentId = 'a1', clientId = 'c1'): void {
+  registry.registerAgent({
+    agentId,
+    clientId,
+    ownerPrincipal: 'eth:0x0',
+    agentCard: makeCard(false),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+test('grace hold keeps the binding alive across a recoverable disconnect instead of failing it', () => {
+  const registry = new Registry(10_000);
+  const ws = makeWs();
+  registerFor(registry, ws);
+  const task = bindCapturing(registry, 'a1', 't-grace');
+
+  registry.unregisterAgent('a1', ws, 1012);
+
+  assert.ok(registry.getBinding('t-grace'), 'binding must survive the disconnect');
+  assert.equal(task.state.finished, false);
+  assert.deepEqual(task.statuses, [], 'no terminal may be emitted during the hold');
+  assert.equal(registry.getAgent('a1'), undefined);
+});
+
+test('a frame from the reconnected client resumes a held binding and cancels its expiry', async () => {
+  const registry = new Registry(25);
+  const ws = makeWs();
+  registerFor(registry, ws);
+  const task = bindCapturing(registry, 'a1', 't-resume');
+
+  registry.unregisterAgent('a1', ws, 1012);
+  registry.resumeBinding('t-resume', 'a1');
+
+  await sleep(80);
+
+  assert.ok(registry.getBinding('t-resume'), 'resumed binding must not be reaped');
+  assert.equal(task.state.finished, false);
+  assert.deepEqual(task.statuses, []);
+});
+
+test('grace hold expires into the identical disconnected terminal it always produced', async () => {
+  const registry = new Registry(15);
+  const ws = makeWs();
+  registerFor(registry, ws);
+
+  const statuses: Array<{ status: { message?: { metadata?: unknown } } }> = [];
+  let finished = false;
+  registry.bindTask({
+    agentId: 'a1',
+    taskId: 't-expire',
+    contextId: 'ctx-expire',
+    requestedExtensions: [OPENAI_COMPAT_EXTENSION_URI],
+    sink: {
+      pushStatus: (event) => statuses.push(event),
+      pushArtifact: () => undefined,
+      finish: () => {
+        finished = true;
+      },
+    },
+  });
+
+  registry.unregisterAgent('a1', ws, 1012);
+  await sleep(80);
+
+  assert.equal(finished, true);
+  assert.equal(registry.getBinding('t-expire'), undefined);
+  assert.deepEqual(statuses[0]?.status.message?.metadata, {
+    [OPENAI_COMPAT_EXTENSION_URI]: {
+      terminal_error: {
+        code: 'disconnected',
+        message: 'client disconnected mid-task',
+      },
+    },
+    error: {
+      code: 'disconnected',
+      message: 'client disconnected mid-task',
+    },
+  });
+});
+
+test('a task completing during the hold is not failed by the expiry timer afterwards', async () => {
+  const registry = new Registry(20);
+  const ws = makeWs();
+  registerFor(registry, ws);
+  const task = bindCapturing(registry, 'a1', 't-late-complete');
+  const binding = registry.getBinding('t-late-complete');
+  assert.ok(binding);
+
+  registry.unregisterAgent('a1', ws, 1012);
+  registry.resumeBinding('t-late-complete', 'a1');
+  registry.unbindTask('t-late-complete', binding);
+
+  await sleep(80);
+
+  assert.equal(task.state.finished, false, 'a completed task must not be failed later');
+  assert.deepEqual(task.statuses, []);
+});
+
+test('app-level close codes skip the hold entirely and fail in-flight tasks at once', () => {
+  for (const code of [4014, 4009, 1000]) {
+    const registry = new Registry(10_000);
+    const ws = makeWs();
+    registerFor(registry, ws);
+    const task = bindCapturing(registry, 'a1', `t-terminal-${code}`);
+
+    registry.unregisterAgent('a1', ws, code);
+
+    assert.equal(
+      registry.getBinding(`t-terminal-${code}`),
+      undefined,
+      `close code ${code} must not be graced`,
+    );
+    assert.equal(task.state.finished, true);
+    assert.match(terminalText(task), /disconnected mid-task/);
+  }
+});
+
+test('a grace of 0 restores the pre-#474 fail-immediately behavior', () => {
+  const registry = new Registry(0);
+  const ws = makeWs();
+  registerFor(registry, ws);
+  const task = bindCapturing(registry, 'a1', 't-nograce');
+
+  registry.unregisterAgent('a1', ws, 1012);
+
+  assert.equal(registry.getBinding('t-nograce'), undefined);
+  assert.equal(task.state.finished, true);
+});
+
+test('reconnect arriving BEFORE the old socket close holds the task instead of superseding it', () => {
+  const registry = new Registry(10_000);
+  const deadWs = makeWs(WS_CLOSED);
+  registerFor(registry, deadWs);
+  const task = bindCapturing(registry, 'a1', 't-race');
+
+  registerFor(registry, makeWs());
+
+  assert.ok(registry.getBinding('t-race'), 'a reconnect must not supersede its own in-flight task');
+  assert.equal(task.state.finished, false);
+  assert.deepEqual(task.statuses, []);
+
+  registry.resumeBinding('t-race', 'a1');
+  assert.ok(registry.getBinding('t-race'));
+});
+
+test('a genuine duplicate-token collision (old socket still OPEN) still supersedes immediately', () => {
+  const registry = new Registry(10_000);
+  registerFor(registry, makeWs(WS_OPEN));
+  const task = bindCapturing(registry, 'a1', 't-collision');
+
+  registerFor(registry, makeWs());
+
+  assert.equal(registry.getBinding('t-collision'), undefined);
+  assert.equal(task.state.finished, true);
+  assert.match(terminalText(task), /superseded/);
+});
+
+test('the late close of an already-replaced socket does not re-hold or double-fail', () => {
+  const registry = new Registry(10_000);
+  const deadWs = makeWs(WS_CLOSED);
+  registerFor(registry, deadWs);
+  const task = bindCapturing(registry, 'a1', 't-late-close');
+
+  registerFor(registry, makeWs()); // holds t-late-close
+  registry.resumeBinding('t-late-close', 'a1'); // client's first frame resumes it
+
+  registry.unregisterAgent('a1', deadWs, 1006);
+
+  assert.ok(registry.getBinding('t-late-close'));
+  assert.equal(task.state.finished, false);
+});
+
+test("resumeBinding cannot be used by one agent to rescue another agent's held task", () => {
+  const registry = new Registry(10_000);
+  const ws = makeWs();
+  registerFor(registry, ws, 'a1', 'c1');
+  bindCapturing(registry, 'a1', 't-owned');
+
+  registry.unregisterAgent('a1', ws, 1012);
+  registry.resumeBinding('t-owned', 'other-agent');
+
+  assert.ok(registry.getBinding('t-owned'));
+});
+test('with the grace disabled, the reconnect race keeps its original superseded terminal', () => {
+  const registry = new Registry(0);
+  registerFor(registry, makeWs(WS_CLOSED));
+  const task = bindCapturing(registry, 'a1', 't-nograce-race');
+
+  registerFor(registry, makeWs());
+
+  assert.equal(registry.getBinding('t-nograce-race'), undefined);
+  assert.equal(task.state.finished, true);
+  assert.match(terminalText(task), /superseded/);
 });
