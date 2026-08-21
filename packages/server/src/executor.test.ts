@@ -14,6 +14,7 @@ import {
   CALLER_CONTEXT_CAPABILITY,
   OPENAI_COMPAT_EXTENSION_URI,
   parseDownFrame,
+  TASK_REPLAY_CAPABILITY,
   type AgentCard,
 } from '@vicoop-bridge/protocol';
 import { Registry, type ClientConnection } from './registry.js';
@@ -155,6 +156,7 @@ test('executor records principalId in binding and strips _principalId from outgo
     ownerPrincipal: 'eth:0x0',
     agentCard: makeAgentCard(),
     allowedCallers: [],
+    protocolCapabilities: [TASK_REPLAY_CAPABILITY],
     ws,
     connectedAt: 0,
   };
@@ -182,6 +184,8 @@ test('executor records principalId in binding and strips _principalId from outgo
   assert.ok(binding, 'expected binding to be registered before first yield');
   assert.equal(binding.principalId, 'eth:0xabc');
   assert.equal(binding.agentId, 'a1');
+  assert.match(binding.bindingId ?? '', /^[0-9a-f-]{36}$/);
+  assert.equal(binding.nextClientSeq, 0);
 
   // The WS frame must NOT carry server-internal `_*` keys — the connected
   // client should only see caller-supplied metadata.
@@ -198,6 +202,7 @@ test('executor records principalId in binding and strips _principalId from outgo
     );
     assert.equal((md as Record<string, unknown>).userField, 'keep');
     assert.equal(frame.caller, undefined, 'old clients receive no caller field fallback');
+    assert.equal(frame.bindingId, binding.bindingId);
   }
 
   // Push a terminal status so the generator returns without hanging.

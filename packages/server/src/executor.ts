@@ -14,6 +14,7 @@ import {
   type TaskStatusUpdateEvent,
   type TaskStore,
 } from '@a2x/sdk';
+import { randomUUID } from 'node:crypto';
 import type { Registry, TaskBinding, TaskSink } from './registry.js';
 import { AsyncEventQueue } from './event-queue.js';
 import { logEvent } from './log.js';
@@ -21,7 +22,11 @@ import { terminalErrorMessageFields } from './terminal-error.js';
 import { X402Gate, createPostgresX402Context, type X402Settlement } from './x402/gate.js';
 import { readTaskUsage } from './x402/usage.js';
 import type { Sql } from './db.js';
-import { CALLER_CONTEXT_CAPABILITY, CallerContextV1 } from '@vicoop-bridge/protocol';
+import {
+  CALLER_CONTEXT_CAPABILITY,
+  CallerContextV1,
+  TASK_REPLAY_CAPABILITY,
+} from '@vicoop-bridge/protocol';
 
 /**
  * What the executor needs to run the x402 payment gate: a DB handle for the
@@ -399,11 +404,17 @@ export class WSForwardingExecutor extends AgentExecutor {
       });
     }
 
+    const replayCapable =
+      this.registry
+        .getAgent(this.agentId)
+        ?.protocolCapabilities?.includes(TASK_REPLAY_CAPABILITY) === true;
+    const bindingId = replayCapable ? randomUUID() : undefined;
     const binding: TaskBinding = {
       agentId: this.agentId,
       taskId,
       contextId,
       sink,
+      ...(bindingId !== undefined ? { bindingId, nextClientSeq: 0 } : {}),
       ...(principalId !== undefined ? { principalId } : {}),
       ...(requestedExtensions !== undefined ? { requestedExtensions } : {}),
     };
@@ -462,6 +473,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     const sent = this.registry.sendToAgent(this.agentId, {
       type: 'task.assign',
       taskId,
+      ...(bindingId !== undefined ? { bindingId } : {}),
       contextId,
       message: {
         role: message.role,
@@ -694,7 +706,11 @@ export class WSForwardingExecutor extends AgentExecutor {
 
     // Notify the connected client so it can abort in-flight work and
     // emit its own task.fail / task.complete frame.
-    this.registry.sendToAgent(this.agentId, { type: 'task.cancel', taskId });
+    this.registry.sendToAgent(this.agentId, {
+      type: 'task.cancel',
+      taskId,
+      ...(binding?.bindingId !== undefined ? { bindingId: binding.bindingId } : {}),
+    });
 
     // Deliver the CANCELED terminal through the sink FIRST, then finish the
     // queue: the executor's iterate() consumes the terminal event (breaking on

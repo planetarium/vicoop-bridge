@@ -10,6 +10,7 @@ import {
   encodeFrame,
   parseUpFrame,
   OPENAI_COMPAT_EXTENSION_URI,
+  TASK_REPLAY_CAPABILITY,
   type Part,
   type TaskAssignFrame,
   type UpFrame,
@@ -345,7 +346,7 @@ test('Client reconnects after WebSocket close and sends hello again', async () =
       if (frame.type === 'hello') {
         assert.equal(frame.agentId, 'agent-1');
         assert.equal(frame.token, 'client-token');
-        assert.deepEqual(frame.protocolCapabilities, ['caller-context-v1']);
+        assert.deepEqual(frame.protocolCapabilities, ['caller-context-v1', TASK_REPLAY_CAPABILITY]);
       }
     }
   } finally {
@@ -1265,4 +1266,241 @@ test('usage.request: a throwing backend.usage() replies ok:false / usage_failed'
   assert.equal(resp.ok, false);
   assert.equal(resp.error?.code, 'usage_failed');
   assert.match(resp.error?.message ?? '', /serve down/);
+});
+
+// ── acknowledged reconnect replay ───────────────────────────────────────────
+
+test('reliable task frames carry one binding generation and consecutive sequences', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  const received: UpFrame[] = [];
+  wss.on('connection', (ws) => {
+    ws.on('message', (raw) => {
+      const frame = parseUpFrame(raw.toString('utf8'));
+      if (frame.type === 'hello') {
+        ws.send(encodeFrame({
+          type: 'hello.ack',
+          protocolCapabilities: [TASK_REPLAY_CAPABILITY],
+          disconnectGraceMs: 30_000,
+          maxFrameBytes: 16 * 1024 * 1024,
+        }));
+        ws.send(encodeFrame({ ...makeAssign('t-seq'), bindingId: 'binding-seq' }));
+        return;
+      }
+      received.push(frame);
+      if ('bindingId' in frame && frame.bindingId && 'seq' in frame && frame.seq !== undefined) {
+        ws.send(encodeFrame({
+          type: 'task.ack',
+          taskId: frame.taskId,
+          bindingId: frame.bindingId,
+          acceptedSeq: frame.seq,
+        }));
+      }
+    });
+  });
+  const client = new Client({
+    serverUrl,
+    token: 'token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('echo', async (task, emit) => {
+      emit({
+        type: 'task.artifact',
+        taskId: task.taskId,
+        artifact: { artifactId: 'a', parts: [{ kind: 'text', text: 'hello' }] },
+      });
+      emit({ type: 'task.complete', taskId: task.taskId, status: { state: 'completed' } });
+    }),
+    heartbeatIntervalMs: 0,
+    logLevel: 'silent',
+  });
+  try {
+    client.start();
+    await waitFor(() => received.filter((frame) => 'taskId' in frame).length === 2, 'task frames');
+    const taskFrames = received.filter((frame) => 'taskId' in frame);
+    assert.deepEqual(taskFrames.map((frame) => frame.type), ['task.artifact', 'task.complete']);
+    assert.deepEqual(
+      taskFrames.map((frame) => 'bindingId' in frame ? [frame.bindingId, frame.seq] : []),
+      [['binding-seq', 0], ['binding-seq', 1]],
+    );
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
+test('an unacknowledged frame is replayed with the same binding id and sequence', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  const artifacts: Array<{ bindingId?: string; seq?: number }> = [];
+  let connections = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  wss.on('connection', (ws) => {
+    const connection = ++connections;
+    ws.on('message', (raw) => {
+      const frame = parseUpFrame(raw.toString('utf8'));
+      if (frame.type === 'hello') {
+        ws.send(encodeFrame({
+          type: 'hello.ack',
+          protocolCapabilities: [TASK_REPLAY_CAPABILITY],
+          disconnectGraceMs: 30_000,
+          maxFrameBytes: 16 * 1024 * 1024,
+        }));
+        if (connection === 1) {
+          ws.send(encodeFrame({ ...makeAssign('t-replay'), bindingId: 'binding-replay' }));
+        }
+        return;
+      }
+      if (frame.type === 'task.artifact') {
+        artifacts.push({ bindingId: frame.bindingId, seq: frame.seq });
+        if (connection === 1) ws.close(1012, 'restart before ack');
+        else if (frame.bindingId && frame.seq !== undefined) {
+          ws.send(encodeFrame({
+            type: 'task.ack', taskId: frame.taskId,
+            bindingId: frame.bindingId, acceptedSeq: frame.seq,
+          }));
+          release();
+        }
+      }
+      if (frame.type === 'task.complete' && frame.bindingId && frame.seq !== undefined) {
+        ws.send(encodeFrame({
+          type: 'task.ack', taskId: frame.taskId,
+          bindingId: frame.bindingId, acceptedSeq: frame.seq,
+        }));
+      }
+    });
+  });
+  const client = new Client({
+    serverUrl,
+    token: 'token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('echo', async (task, emit) => {
+      emit({
+        type: 'task.artifact', taskId: task.taskId,
+        artifact: { artifactId: 'a', parts: [{ kind: 'text', text: 'once' }] },
+      });
+      await gate;
+      emit({ type: 'task.complete', taskId: task.taskId, status: { state: 'completed' } });
+    }),
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    heartbeatIntervalMs: 0,
+    logLevel: 'silent',
+  });
+  try {
+    client.start();
+    await waitFor(() => artifacts.length === 2, 'replayed artifact');
+    assert.deepEqual(artifacts, [
+      { bindingId: 'binding-replay', seq: 0 },
+      { bindingId: 'binding-replay', seq: 0 },
+    ]);
+  } finally {
+    release();
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
+test('an unacknowledged frame expires even while the socket stays open', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  let socketClosed = false;
+  let backendAborted = false;
+  wss.on('connection', (ws) => {
+    ws.on('close', () => { socketClosed = true; });
+    ws.on('message', (raw) => {
+      const frame = parseUpFrame(raw.toString('utf8'));
+      if (frame.type !== 'hello') return;
+      ws.send(encodeFrame({
+        type: 'hello.ack', protocolCapabilities: [TASK_REPLAY_CAPABILITY],
+        disconnectGraceMs: 30_000, maxFrameBytes: 16 * 1024 * 1024,
+      }));
+      ws.send(encodeFrame({ ...makeAssign('t-expire'), bindingId: 'binding-expire' }));
+    });
+  });
+  const client = new Client({
+    serverUrl,
+    token: 'token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('echo', async (task, emit, signal) => {
+      emit({
+        type: 'task.artifact', taskId: task.taskId,
+        artifact: { artifactId: 'a', parts: [{ kind: 'text', text: 'unacked' }] },
+      });
+      await new Promise<void>((resolve) => {
+        signal.addEventListener('abort', () => {
+          backendAborted = true;
+          resolve();
+        }, { once: true });
+      });
+    }),
+    maxPendingAgeMs: 20,
+    reconnectDelayMs: 1_000,
+    heartbeatIntervalMs: 0,
+    logLevel: 'silent',
+  });
+  try {
+    client.start();
+    await waitFor(() => socketClosed, 'socket closed after acknowledgement timeout');
+    assert.equal(backendAborted, true);
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
+test('a replacement assignment suppresses the older run with the same taskId', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  const completes: Array<{ bindingId?: string; seq?: number }> = [];
+  let releaseOld!: () => void;
+  const oldGate = new Promise<void>((resolve) => { releaseOld = resolve; });
+  wss.on('connection', (ws) => {
+    ws.on('message', (raw) => {
+      const frame = parseUpFrame(raw.toString('utf8'));
+      if (frame.type === 'hello') {
+        ws.send(encodeFrame({
+          type: 'hello.ack', protocolCapabilities: [TASK_REPLAY_CAPABILITY],
+          disconnectGraceMs: 30_000, maxFrameBytes: 16 * 1024 * 1024,
+        }));
+        ws.send(encodeFrame({ ...makeAssign('t-reuse'), bindingId: 'binding-old' }));
+        setTimeout(() => {
+          ws.send(encodeFrame({ ...makeAssign('t-reuse'), bindingId: 'binding-new' }));
+        }, 10);
+        return;
+      }
+      if (frame.type === 'task.complete') completes.push(frame);
+    });
+  });
+  const client = new Client({
+    serverUrl,
+    token: 'token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('echo', async (task, emit) => {
+      if (task.bindingId === 'binding-old') await oldGate;
+      emit({ type: 'task.complete', taskId: task.taskId, status: { state: 'completed' } });
+    }),
+    heartbeatIntervalMs: 0,
+    logLevel: 'silent',
+  });
+  try {
+    client.start();
+    await waitFor(() => completes.some((frame) => frame.bindingId === 'binding-new'), 'new run');
+    releaseOld();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(completes.map((frame) => frame.bindingId), ['binding-new']);
+  } finally {
+    releaseOld();
+    client.stop();
+    await closeServer(server, wss);
+  }
 });
