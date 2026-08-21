@@ -1270,6 +1270,59 @@ test('usage.request: a throwing backend.usage() replies ok:false / usage_failed'
 
 // ── acknowledged reconnect replay ───────────────────────────────────────────
 
+test('frames queued on a replaced socket cannot start or mutate current runs', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  const sockets: WebSocket[] = [];
+  let hellos = 0;
+  const handled: string[] = [];
+  wss.on('connection', (ws) => {
+    sockets.push(ws);
+    ws.on('message', (raw) => {
+      const frame = parseUpFrame(raw.toString('utf8'));
+      if (frame.type !== 'hello') return;
+      hellos++;
+      ws.send(encodeFrame({
+        type: 'hello.ack', protocolCapabilities: [TASK_REPLAY_CAPABILITY],
+        disconnectGraceMs: 30_000, maxFrameBytes: 16 * 1024 * 1024,
+      }));
+    });
+  });
+  const client = new Client({
+    serverUrl,
+    token: 'token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('echo', async (task, emit) => {
+      handled.push(task.taskId);
+      emit({ type: 'task.complete', taskId: task.taskId, status: { state: 'completed' } });
+    }),
+    heartbeatIntervalMs: 0,
+    logLevel: 'silent',
+  });
+  try {
+    client.start();
+    await waitFor(() => hellos === 1, 'first hello');
+    (client as unknown as { connect(): void }).connect();
+    await waitFor(() => hellos === 2, 'replacement hello');
+
+    sockets[0]!.send(encodeFrame({
+      ...makeAssign('stale-task'), executionId: 'stale-execution',
+    }));
+    sockets[1]!.send(encodeFrame({
+      ...makeAssign('current-task'), executionId: 'current-execution',
+    }));
+
+    await waitFor(() => handled.length === 1, 'current task dispatch');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(handled, ['current-task']);
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
 test('reliable task frames carry one execution ID and consecutive sequences', async () => {
   const server = createServer();
   const wss = new WebSocketServer({ server, path: '/connect' });

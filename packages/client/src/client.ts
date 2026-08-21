@@ -390,10 +390,14 @@ export class Client {
         return;
       }
 
+      // A replaced socket may still have already-queued message callbacks.
+      // Once another connection owns `this.ws`, no frame from this socket may
+      // mutate task generations, acknowledgements, or in-flight runs.
+      if (this.ws !== ws) return;
+
       switch (frame.type) {
         case 'hello.ack':
           if (!frame.protocolCapabilities.includes(TASK_REPLAY_CAPABILITY)) return;
-          if (this.ws !== ws) return;
           this.replayReady = true;
           this.negotiatedMaxFrameBytes = frame.maxFrameBytes;
           this.flushPendingFrames(ws);
