@@ -1742,8 +1742,17 @@ test('a bridge that rejects pipelined replay (4003) disables it instead of loopi
   }
 });
 
-test('a replay onto a connection that dies before proving itself is retried, not lost', async () => {
+test('a replay is never re-sent, even when the connection dies right after it', async () => {
+  // There is no acceptance signal in the protocol, so "not yet confirmed"
+  // cannot be told apart from "already processed". A replayed `task.complete`
+  // may already have unbound an `input-required` task, after which A2A reuses
+  // that taskId for the next turn — re-sending would hand the old terminal to
+  // the new binding, which the bridge matches by agent and task id.
+  //
+  // So a replay goes out exactly once. If it is lost, the bridge's grace
+  // deadline fails the task: visible and retryable, unlike a corrupted run.
   const h = replayHarness((ws, n) => {
+    // Kill the second connection immediately after its hello — mid-replay.
     if (n === 2) {
       ws.on('message', (raw) => {
         const f = JSON.parse(raw.toString('utf8')) as { type?: string };
@@ -1762,7 +1771,6 @@ test('a replay onto a connection that dies before proving itself is retried, not
     reconnectDelayMs: 20,
     reconnectMaxDelayMs: 20,
     reconnectJitterRatio: 0,
-    reconnectStableMs: 5_000,
     logLevel: 'silent',
   });
 
@@ -1774,14 +1782,18 @@ test('a replay onto a connection that dies before proving itself is retried, not
 
     sendOffline(client, {
       type: 'task.complete',
-      taskId: 't-retry',
+      taskId: 't-once-only',
       status: { state: 'completed', timestamp: new Date().toISOString() },
     });
 
     await waitFor(() => h.connections >= 3, 'a third connection');
-    await waitFor(
-      () => h.received.filter((f) => f.taskId === 't-retry').length >= 2,
-      'the replay to be retried after the failed attempt',
+    // Let any erroneous retry land before asserting it did not happen.
+    await new Promise((r) => setTimeout(r, 120));
+
+    assert.equal(
+      h.received.filter((f) => f.taskId === 't-once-only').length,
+      1,
+      'a replay must go out exactly once, never retried onto a later connection',
     );
   } finally {
     client.stop();

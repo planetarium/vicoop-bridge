@@ -28,6 +28,15 @@ measured from the disconnect and must stay at or below the bridge's
 `BRIDGE_DISCONNECT_GRACE_MS`. Setting any of them to `0` disables buffering and
 restores the previous behavior.
 
+A replay is sent exactly once and never retried: the protocol carries no
+acceptance signal, and re-sending could hand a stale terminal to a later turn
+that has since reused the same task id. A lost replay fails the task on the
+bridge's grace deadline instead — visible and retryable, unlike a corrupted run.
+
+`maxPendingFrames` and `maxPendingBytes` are clamped to what a bridge accepts in
+a single replay, so raising them past that degrades the buffer rather than
+breaking the connection it exists to survive.
+
 Requires a bridge with reconnect replay support. Against an older bridge the
 replay is rejected (close 4003); the client detects this, logs a warning naming
 the bridge upgrade as the fix, and falls back to the previous behavior instead
