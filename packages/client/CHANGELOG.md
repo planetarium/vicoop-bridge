@@ -1,5 +1,14 @@
 # @vicoop-bridge/client
 
+## 0.38.1
+
+### Patch Changes
+
+- d210dc8: Preserve in-flight task output across transient bridge reconnects with an
+  acknowledged, generation-scoped replay protocol. Unacknowledged frames retain
+  their original execution ID and sequence when resent, while bounded retention and
+  legacy-server fallback fail closed instead of risking partial or stale output.
+
 ## 0.38.0
 
 ### Minor Changes
