@@ -29,8 +29,8 @@ importers:
   packages/admin-ui:
     dependencies:
       '@a2x/sdk':
-        specifier: ^0.23.0
-        version: 0.23.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76)
+        specifier: ^0.24.0
+        version: 0.24.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76)
       '@rainbow-me/rainbowkit':
         specifier: ^2
         version: 2.2.10(@tanstack/react-query@5.99.0(react@19.2.5))(@types/react@19.2.14)(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(typescript@5.9.3)(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(wagmi@2.19.5(@tanstack/query-core@5.99.0)(@tanstack/react-query@5.99.0(react@19.2.5))(@types/react@19.2.14)(bufferutil@4.1.0)(react@19.2.5)(typescript@5.9.3)(utf-8-validate@5.0.10)(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76))
@@ -134,8 +134,8 @@ importers:
   packages/server:
     dependencies:
       '@a2x/sdk':
-        specifier: ^0.23.0
-        version: 0.23.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76)
+        specifier: ^0.24.0
+        version: 0.24.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76)
       '@ai-sdk/anthropic':
         specifier: ^3.0.69
         version: 3.0.69(zod@3.25.76)
@@ -209,8 +209,8 @@ importers:
 
 packages:
 
-  '@a2x/sdk@0.23.0':
-    resolution: {integrity: sha512-qsh4h/F4L4z0dghQ7nRhGsqMzDxvhzB9RjFZ3kVeUn0nMV9hKML6Q79/d1Fi8tTrqViQ278G9xOAEMM0F5ZFtQ==}
+  '@a2x/sdk@0.24.0':
+    resolution: {integrity: sha512-2F51pJNGU9fFVV/VFVcbIkAYyi1Ff4loPDPl5K1NjMFiPw3EknPJVAfQxBr7Lh7rrHrV0ElAFZnuylrTYyV13w==}
     engines: {node: '>=22.11.0'}
     peerDependencies:
       '@anthropic-ai/sdk': '>=0.52.0'
@@ -4734,7 +4734,7 @@ packages:
 
 snapshots:
 
-  '@a2x/sdk@0.23.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76)':
+  '@a2x/sdk@0.24.0(@x402/core@2.21.0)(@x402/evm@2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10))(viem@2.48.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)(zod@3.25.76))(zod@3.25.76)':
     optionalDependencies:
       '@x402/core': 2.21.0
       '@x402/evm': 2.21.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)
