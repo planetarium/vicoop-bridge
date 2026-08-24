@@ -64,44 +64,73 @@ pnpm --filter @vicoop-bridge/server dev
 
 ## Bring up an echo client
 
-Creates a `clients` row directly via SQL (bypasses SIWE admin UI), then runs
-`vicoop-client` with the `echo` backend so we have a real connected agent to
-route requests to.
+Creates the runtime `agents` row and its compatibility `clients` row directly
+via SQL (bypasses SIWE admin UI), then runs `vicoop-client` with the `echo`
+backend so we have a real connected agent to route requests to.
 
 ```bash
-# 1. Pick a raw token and insert the hashed form into clients.
+# 1. Pick a raw token and insert the hashed form into agents + clients.
 TOKEN=dev-client-token-raw-12345
 psql vicoop_bridge_dev <<SQL
-INSERT INTO clients (owner_principal, client_name, token_hash, allowed_agent_ids)
-VALUES (
-  'eth:0x0000000000000000000000000000000000000001',
-  'dev-echo-client',
-  encode(digest('$TOKEN', 'sha256'), 'hex'),
-  ARRAY['echo-agent']
-) ON CONFLICT (token_hash) DO NOTHING;
+WITH registered AS (
+  INSERT INTO agents (id, owner_principal, name, token_hash)
+  VALUES (
+    'echo-agent',
+    'eth:0x0000000000000000000000000000000000000001',
+    'dev-echo-client',
+    encode(digest('$TOKEN', 'sha256'), 'hex')
+  )
+  RETURNING client_id, owner_principal, name, token_hash
+)
+INSERT INTO clients (id, owner_principal, client_name, token_hash, allowed_agent_ids)
+SELECT client_id, owner_principal, name, token_hash, ARRAY['echo-agent']
+FROM registered;
 SQL
 
 # 2. Run the client. NOTE: --server is the base URL WITHOUT /connect — the
 # client appends /connect itself (client.ts:39). Pass ws:// not http://.
-cd packages/client
-../../node_modules/.bin/tsx src/cli.ts \
+pnpm -s cli:client start \
   --server ws://localhost:8787 \
   --token dev-client-token-raw-12345 \
-  --agentId echo-agent \
-  --backend echo
+  --agentId echo-agent --backend echo
 # logs: [client] connected, sending hello
 ```
 
-The WS registration auto-creates an `agent_policies` row with
-`allowed_callers = '{}'` (public). Two ways to populate it:
+The `agents.allowed_callers` default is `'{}'` (public). Two ways to populate
+it:
 
 - **`vicoop-client agent callers add`** (Paths B/C below) — hot-reloads via
   `registry.updateAllowedCallers`, no restart needed. Requires an
   owner-session bearer (issued via SIWE exchange or Google device flow).
-- **Raw SQL `UPDATE agent_policies SET allowed_callers = …`** (Path A
+- **Raw SQL `UPDATE agents SET allowed_callers = …`** (Path A
   below) — bypasses the registry, so the connected client must be killed
   and rerun to pick up the new list. Useful when you want to skip the
   auth flow entirely for the smoke test.
+
+## A2A v1 dual-transport smoke client
+
+With the local server and echo client running, execute the repository's
+dependency-free v1 client:
+
+```bash
+pnpm e2e:a2a-v1 \
+  http://localhost:8787/agents/echo-agent/v1/.well-known/agent-card.json
+```
+
+It discovers the v1 AgentCard, confirms that JSON-RPC and HTTP+JSON share the
+same base URL, then checks both directions across the transports:
+
+1. JSON-RPC `SendMessage` → HTTP+JSON `GET tasks/{id}`
+2. HTTP+JSON `POST message:send` → JSON-RPC `GetTask`
+3. HTTP+JSON `GET tasks` contains both completed echo tasks
+
+For an independent SDK-backed check with the installed `a2x` CLI:
+
+```bash
+CARD=http://localhost:8787/agents/echo-agent/v1/.well-known/agent-card.json
+a2x a2a agent-card "$CARD" --json
+a2x a2a send "$CARD" 'a2x v1 smoke' --no-x402 --json
+```
 
 ## Path A — opaque token via direct DB insert
 
@@ -114,19 +143,19 @@ psql vicoop_bridge_dev <<SQL
 INSERT INTO callers (token_hash, principal_id, provider, email, expires_at)
 VALUES (
   encode(digest('$CALLER_TOKEN', 'sha256'), 'hex'),
-  'google:1234567890',
+  'google:sub:1234567890',
   'google',
   'alice@example.com',
   now() + interval '1 day'
 );
-UPDATE agent_policies
+UPDATE agents
 SET allowed_callers = ARRAY['google:sub:1234567890']
-WHERE agent_id = 'echo-agent';
+WHERE id = 'echo-agent';
 SQL
 
 # 2. Restart the echo client so registry picks up the new allowed_callers
 pkill -f 'tsx.*cli.ts.*echo-agent'
-# ...rerun the client command from "Bring up an echo client" step 3...
+# ...rerun the client command from "Bring up an echo client" step 2...
 
 # 3. Auth matrix
 BODY='{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"m1","role":"user","kind":"message","parts":[{"kind":"text","text":"hello"}]}}}'

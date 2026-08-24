@@ -21,6 +21,7 @@ import { Registry, type ClientConnection } from './registry.js';
 import {
   WSForwardingExecutor,
   appendHistoryMessage,
+  partsToWire,
   stripInternalMetadata,
 } from './executor.js';
 
@@ -145,6 +146,48 @@ test('appendHistoryMessage appends messages once by messageId', () => {
   const withSecond = appendHistoryMessage(withDuplicate, second);
 
   assert.deepEqual(withSecond.map((m) => m.messageId), ['m-1', 'm-2']);
+});
+
+test('partsToWire converts discriminator-free A2A v1 parts for the client WS protocol', () => {
+  const parts = [
+    { text: 'hello' },
+    { data: { answer: 42 } },
+    {
+      raw: 'aGVsbG8=',
+      filename: 'hello.txt',
+      mediaType: 'text/plain',
+    },
+    { url: 'https://example.com/file.bin', mediaType: 'application/octet-stream' },
+  ] as unknown as Message['parts'];
+
+  assert.deepEqual(partsToWire(parts), [
+    { kind: 'text', text: 'hello' },
+    { kind: 'data', data: { answer: 42 } },
+    {
+      kind: 'file',
+      file: {
+        name: 'hello.txt',
+        mimeType: 'text/plain',
+        bytes: 'aGVsbG8=',
+      },
+    },
+    {
+      kind: 'file',
+      file: {
+        mimeType: 'application/octet-stream',
+        uri: 'https://example.com/file.bin',
+      },
+    },
+  ]);
+});
+
+test('partsToWire preserves already-discriminated v0.3 wire parts', () => {
+  const parts = [
+    { kind: 'text', text: 'legacy' },
+    { kind: 'file', file: { name: 'legacy.txt', bytes: 'eA==' } },
+  ] as unknown as Message['parts'];
+
+  assert.deepEqual(partsToWire(parts), parts);
 });
 
 test('executor records principalId in binding and strips _principalId from outgoing WS frame', async () => {

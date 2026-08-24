@@ -9,8 +9,15 @@ import { sentry } from '@sentry/hono/node';
 import * as Sentry from '@sentry/hono/node';
 import {
   A2XServer,
+  createSSEStream,
   DefaultRequestHandler,
+  HttpJsonRequestHandler,
+  JSONParseError,
+  toHttpJsonErrorResponse,
   type AgentCardV03,
+  type AgentCardV10,
+  type HttpJsonResponse,
+  type RequestContext,
 } from '@a2x/sdk';
 import type { ClientConnection, Registry } from './registry.js';
 import { createAdminA2XServer } from './admin.js';
@@ -123,6 +130,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       allowHeaders: [
         'Authorization',
         'Content-Type',
+        'A2A-Version',
         A2A_EXTENSIONS_HEADER,
         A2A_EXTENSIONS_LEGACY_HEADER,
       ],
@@ -152,6 +160,9 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // card reflects the latest connection state.
   const agentCache = new Map<string, A2XServer>();
   const handlerCache = new Map<string, DefaultRequestHandler>();
+  const agentV1Cache = new Map<string, A2XServer>();
+  const handlerV1Cache = new Map<string, DefaultRequestHandler>();
+  const httpJsonV1Cache = new Map<string, HttpJsonRequestHandler>();
 
   // Device flow endpoints (/oauth/device/code, /oauth/token) are only mounted
   // when Google OAuth is fully configured. Surface this to the agent card and
@@ -184,11 +195,47 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     return handler;
   }
 
+  function getAgentV1ForConn(conn: ClientConnection): A2XServer {
+    const cached = agentV1Cache.get(conn.agentId);
+    if (cached) return cached;
+    const taskStore = new PostgresTaskStore(opts.db, {
+      persistRequestEnvelope,
+      ownerAgent: conn.agentId,
+    });
+    const a2x = buildAgentA2XServer(conn, taskStore, opts.registry, {
+      ...agentCardOpts,
+      protocolVersion: '1.0',
+    });
+    agentV1Cache.set(conn.agentId, a2x);
+    return a2x;
+  }
+
+  function getHandlerV1ForConn(conn: ClientConnection): DefaultRequestHandler {
+    const cached = handlerV1Cache.get(conn.agentId);
+    if (cached) return cached;
+    const handler = new DefaultRequestHandler(getAgentV1ForConn(conn));
+    handlerV1Cache.set(conn.agentId, handler);
+    return handler;
+  }
+
+  function getHttpJsonV1ForConn(conn: ClientConnection): HttpJsonRequestHandler {
+    const cached = httpJsonV1Cache.get(conn.agentId);
+    if (cached) return cached;
+    const handler = new HttpJsonRequestHandler(getHandlerV1ForConn(conn), {
+      basePath: `/agents/${conn.agentId}/v1`,
+    });
+    httpJsonV1Cache.set(conn.agentId, handler);
+    return handler;
+  }
+
   // Invalidate cached A2XServer + handler when allowedCallers changes so
   // the rendered card reflects the updated security fields.
   opts.registry.onCallerChange((agentId) => {
     agentCache.delete(agentId);
     handlerCache.delete(agentId);
+    agentV1Cache.delete(agentId);
+    handlerV1Cache.delete(agentId);
+    httpJsonV1Cache.delete(agentId);
   });
   // Also invalidate on (re)registration or disconnect. The handler
   // captures the agent card at construction time — including
@@ -198,6 +245,9 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   opts.registry.onAgentChange((agentId) => {
     agentCache.delete(agentId);
     handlerCache.delete(agentId);
+    agentV1Cache.delete(agentId);
+    handlerV1Cache.delete(agentId);
+    httpJsonV1Cache.delete(agentId);
   });
 
   async function handleHandlerResult(result: unknown, c: Context) {
@@ -213,6 +263,95 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       });
     }
     return c.json(result as Record<string, unknown>);
+  }
+
+  function handleHttpJsonResponse(response: HttpJsonResponse): Response {
+    const headers = { ...response.headers, 'A2A-Version': '1.0' };
+    if (
+      response.body &&
+      typeof response.body === 'object' &&
+      Symbol.asyncIterator in response.body
+    ) {
+      return new Response(createSSEStream(response.body as AsyncGenerator<unknown>), {
+        status: response.status,
+        headers,
+      });
+    }
+    return new Response(JSON.stringify(response.body), {
+      status: response.status,
+      headers,
+    });
+  }
+
+  function getRequestContext(c: Context): RequestContext {
+    const url = new URL(c.req.url);
+    const headers = Object.fromEntries(c.req.raw.headers.entries());
+    const queryVersion = url.searchParams.get('A2A-Version');
+    if (queryVersion !== null && !('a2a-version' in headers)) {
+      headers['a2a-version'] = queryVersion;
+    }
+    return {
+      headers,
+      query: Object.fromEntries(url.searchParams.entries()),
+    };
+  }
+
+  function prepareAgentRequestBody(
+    body: unknown,
+    c: Context,
+    caller: ReturnType<typeof getCaller>,
+  ): void {
+    if (!isRecord(body)) return;
+    const params = isRecord(body.params) ? body.params : undefined;
+    const message = isRecord(params?.message)
+      ? params.message
+      : isRecord(body.message)
+        ? body.message
+        : undefined;
+    if (!message) return;
+
+    const requestedExtensions = [
+      ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_HEADER)),
+      ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_LEGACY_HEADER)),
+    ];
+    if (requestedExtensions.length > 0) {
+      const existing = Array.isArray(message.extensions)
+        ? message.extensions.filter((value: unknown): value is string => typeof value === 'string')
+        : [];
+      message.extensions = [...new Set([...existing, ...requestedExtensions])];
+    }
+
+    stripCallerSuppliedInternalKeys(message);
+    if (caller !== undefined) {
+      message.metadata = {
+        ...(isRecord(message.metadata) ? message.metadata : {}),
+        _principalId: caller.principalId,
+      };
+    }
+  }
+
+  function recordAgentRequest(
+    c: Context,
+    conn: ClientConnection,
+    caller: ReturnType<typeof getCaller>,
+  ): void {
+    logEvent('agent_request', {
+      agentId: conn.agentId,
+      backend: conn.backendKind ?? 'inline',
+      ownerEmail: conn.ownerEmail ?? undefined,
+      hasAuth: !!c.req.header('Authorization'),
+      ...(caller !== undefined
+        ? {
+            principalId: caller.principalId,
+            ...(caller.email ? { callerEmail: caller.email } : {}),
+          }
+        : {}),
+    });
+    Sentry.getActiveSpan()?.setAttributes({
+      'bridge.agent': conn.agentId,
+      'bridge.backend': conn.backendKind ?? 'inline',
+      'bridge.caller': caller?.principalId ?? 'public',
+    });
   }
 
   // Derive the public hostname once. Used both for SIWE domain verification
@@ -718,11 +857,33 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     return c.json(getAgentForConn(conn).getAgentCard() as AgentCardV03);
   });
 
+  // A2A v1 card. It deliberately lives below the versioned base URL so the
+  // existing v0.3 discovery and JSON-RPC endpoint remain byte-for-byte
+  // compatible for deployed clients.
+  app.get('/agents/:id/v1/.well-known/agent-card.json', async (c) => {
+    const id = c.req.param('id');
+    const conn = opts.registry.getAgent(id);
+    if (!conn) {
+      if ((await classifyMissingAgent(opts.db, id)) === 'offline') {
+        c.header('Retry-After', String(AGENT_UNAVAILABLE_RETRY_AFTER_SECONDS));
+        return c.json({ error: 'agent temporarily unavailable' }, 503);
+      }
+      return c.json({ error: 'agent not connected' }, 404);
+    }
+    return c.json(getAgentV1ForConn(conn).getAgentCard() as AgentCardV10);
+  });
+
   // Client agent A2A endpoints (auth middleware checks allowedCallers)
   const authMw = agentAuthMiddleware(opts.registry, {
     sql: opts.db,
     deviceFlowEnabled,
     siweDomain,
+  });
+  const httpJsonAuthMw = agentAuthMiddleware(opts.registry, {
+    sql: opts.db,
+    deviceFlowEnabled,
+    siweDomain,
+    responseFormat: 'http-json',
   });
   app.post('/agents/:id', authMw, async (c) => {
     const conn = getAgentConn(c);
@@ -731,64 +892,69 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     // For restricted agents it's always populated; otherwise the middleware
     // would have returned 401/403 before reaching this handler.
     const caller = getCaller(c);
-    logEvent('agent_request', {
-      agentId: conn.agentId,
-      backend: conn.backendKind ?? 'inline',
-      ownerEmail: conn.ownerEmail ?? undefined,
-      hasAuth: !!c.req.header('Authorization'),
-      ...(caller !== undefined
-        ? {
-            principalId: caller.principalId,
-            ...(caller.email ? { callerEmail: caller.email } : {}),
-          }
-        : {}),
-    });
-    // Tie this request session to its trace: the @sentry/hono transaction wraps
-    // the whole handler (the executor + the WS round-trip to the provider run
-    // within it), so these attributes make the session identifiable in the trace.
-    Sentry.getActiveSpan()?.setAttributes({
-      'bridge.agent': conn.agentId,
-      'bridge.backend': conn.backendKind ?? 'inline',
-      'bridge.caller': caller?.principalId ?? 'public',
-    });
-
+    recordAgentRequest(c, conn, caller);
     const rawBody = await c.req.text();
     const parsed = JSON.parse(rawBody);
-    const requestedExtensions = [
-      ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_HEADER)),
-      ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_LEGACY_HEADER)),
-    ];
-    const message = parsed.params?.message;
-    if (isRecord(message)) {
-      if (requestedExtensions.length > 0) {
-        const existing = Array.isArray(message.extensions)
-          ? message.extensions.filter((v: unknown): v is string => typeof v === 'string')
-          : [];
-        message.extensions = [...new Set([...existing, ...requestedExtensions])];
-      }
-      // Drop any caller-supplied `_*` metadata BEFORE injecting the verified
-      // `_principalId`. Without this scrub, a public-agent caller (where
-      // `caller` is undefined and the injection block below is a no-op)
-      // could put `_principalId: eth:victim` in their request body and have
-      // it stamped into the binding + downstream `task_*` logs as if it had
-      // been verified. The strip runs unconditionally so it also covers the
-      // restricted-agent case for any future `_*` consumer beyond
-      // `_principalId`.
-      stripCallerSuppliedInternalKeys(message);
-      // Stash caller identity under the `_principalId` convention so the
-      // WSForwardingExecutor can thread it into the task binding for
-      // accept-path log correlation (issue #128). Stripped before the WS
-      // frame leaves the bridge — the connected client never sees `_*` keys.
-      if (caller !== undefined) {
-        message.metadata = {
-          ...(isRecord(message.metadata) ? message.metadata : {}),
-          _principalId: caller.principalId,
-        };
-      }
-    }
+    prepareAgentRequestBody(parsed, c, caller);
     const handler = getHandlerForConn(conn);
     const result = await handler.handle(parsed);
     return handleHandlerResult(result, c);
+  });
+
+  // A2A v1 JSON-RPC binding. v1 method names and wire shapes are handled by a
+  // dedicated v1 A2XServer; sharing the Postgres owner scope keeps its tasks
+  // visible through the sibling HTTP+JSON binding.
+  app.post('/agents/:id/v1', authMw, async (c) => {
+    const conn = getAgentConn(c);
+    const caller = getCaller(c);
+    recordAgentRequest(c, conn, caller);
+    const rawBody = await c.req.text();
+    let body: unknown = rawBody;
+    try {
+      body = JSON.parse(rawBody);
+    } catch {
+      // DefaultRequestHandler accepts a string and returns the protocol's
+      // structured JSON parse error, so don't turn malformed JSON into a 500.
+    }
+    prepareAgentRequestBody(body, c, caller);
+    c.header('A2A-Version', '1.0');
+    const result = await getHandlerV1ForConn(conn).handle(body, getRequestContext(c));
+    return handleHandlerResult(result, c);
+  });
+
+  // A2A v1 HTTP+JSON binding. Operation paths are relative to the same base
+  // URL advertised for JSON-RPC, e.g. POST message:send and GET tasks/{id}.
+  app.all('/agents/:id/v1/*', httpJsonAuthMw, async (c) => {
+    const conn = getAgentConn(c);
+    const caller = getCaller(c);
+    recordAgentRequest(c, conn, caller);
+    const context = getRequestContext(c);
+    let body: unknown;
+    if (c.req.method === 'POST') {
+      const mediaType = c.req.header('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
+      // Let the SDK produce its canonical content-type error before attempting
+      // to parse an unsupported payload format.
+      if (mediaType === 'application/a2a+json' || mediaType === 'application/json') {
+        const rawBody = await c.req.text();
+        if (rawBody.length > 0) {
+          try {
+            body = JSON.parse(rawBody);
+          } catch {
+            return handleHttpJsonResponse(
+              toHttpJsonErrorResponse(new JSONParseError('Invalid JSON request body')),
+            );
+          }
+        }
+      }
+    }
+    prepareAgentRequestBody(body, c, caller);
+    const response = await getHttpJsonV1ForConn(conn).handle({
+      method: c.req.method,
+      url: c.req.url,
+      body,
+      context,
+    });
+    return handleHttpJsonResponse(response);
   });
 
   // Admin UI — serve static SPA from /admin

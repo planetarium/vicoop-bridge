@@ -163,13 +163,21 @@ interface Backend {
 
 ## 6. External A2A Surface
 
-Server는 `@a2aproject/a2a-js` v0.3.x 스펙을 따른다.
+Server는 기존 A2A v0.3 호출을 유지하면서 각 연결된 에이전트에 A2A v1을
+별도 base URL로 함께 노출한다.
 
-- `GET /.well-known/agent.json` — Server 메타
-- `GET /agents/{id}/agent.json` — 연결된 특정 에이전트의 AgentCard
-- `POST /agents/{id}/messages/send` — A2A task 생성
-- `POST /agents/{id}/messages/stream` — SSE 스트리밍
-- `POST /agents/{id}/tasks/{taskId}/cancel`
+- `GET /.well-known/agent-card.json` — bridge admin agent의 v0.3 AgentCard
+- `GET /agents/{id}/.well-known/agent-card.json` — 연결된 에이전트의 v0.3 AgentCard
+- `POST /agents/{id}` — v0.3 JSON-RPC
+- `GET /agents/{id}/v1/.well-known/agent-card.json` — 연결된 에이전트의 v1 AgentCard
+- `POST /agents/{id}/v1` — v1 JSON-RPC
+- `/agents/{id}/v1/*` — 같은 base URL을 쓰는 v1 HTTP+JSON operation
+  (`message:send`, `message:stream`, `tasks`, `tasks/{taskId}`, cancel,
+  subscribe, push-notification config, extended card)
+
+v1 AgentCard의 `supportedInterfaces`는 `/agents/{id}/v1`을 JSONRPC와
+HTTP+JSON 두 binding으로 광고한다. HTTP+JSON의 operation 이름은 고정된
+`/v1` prefix가 아니라 이 owner-defined base URL에 상대적으로 붙는다.
 
 ## 7. Auth (미결)
 
