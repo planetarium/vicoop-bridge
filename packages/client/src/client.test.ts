@@ -1383,6 +1383,94 @@ test('reliable task frames carry one execution ID and consecutive sequences', as
   }
 });
 
+test('acknowledged frames are removed and not replayed after reconnect', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  const framesByConnection: UpFrame[][] = [[], []];
+  const sockets: WebSocket[] = [];
+  let hellos = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  wss.on('connection', (ws) => {
+    const connection = sockets.push(ws) - 1;
+    ws.on('message', (raw) => {
+      const frame = parseUpFrame(raw.toString('utf8'));
+      if (frame.type === 'hello') {
+        hellos++;
+        ws.send(encodeFrame({
+          type: 'hello.ack',
+          protocolCapabilities: [TASK_REPLAY_CAPABILITY],
+          disconnectGraceMs: 30_000,
+          maxFrameBytes: 16 * 1024 * 1024,
+        }));
+        if (connection === 0) {
+          ws.send(encodeFrame({ ...makeAssign('t-acked'), executionId: 'execution-acked' }));
+        }
+        return;
+      }
+      framesByConnection[connection]!.push(frame);
+      if ('executionId' in frame && frame.executionId && 'seq' in frame && frame.seq !== undefined) {
+        ws.send(encodeFrame({
+          type: 'task.ack',
+          taskId: frame.taskId,
+          executionId: frame.executionId,
+          acceptedSeq: frame.seq,
+        }));
+      }
+    });
+  });
+  const client = new Client({
+    serverUrl,
+    token: 'token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('echo', async (task, emit) => {
+      emit({
+        type: 'task.artifact',
+        taskId: task.taskId,
+        artifact: { artifactId: 'a', parts: [{ kind: 'text', text: 'accepted' }] },
+      });
+      await gate;
+      emit({ type: 'task.complete', taskId: task.taskId, status: { state: 'completed' } });
+    }),
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    heartbeatIntervalMs: 0,
+    logLevel: 'silent',
+  });
+  const pendingCount = () =>
+    (client as unknown as { pendingFrames: unknown[] }).pendingFrames.length;
+  try {
+    client.start();
+    await waitFor(
+      () => framesByConnection[0]!.some((frame) => frame.type === 'task.artifact'),
+      'first artifact',
+    );
+    await waitFor(() => pendingCount() === 0, 'acknowledged artifact removal');
+
+    sockets[0]!.close(1012, 'restart after ack');
+    await waitFor(() => hellos === 2, 'reconnect hello');
+    release();
+    await waitFor(
+      () => framesByConnection[1]!.some((frame) => frame.type === 'task.complete'),
+      'completion after reconnect',
+    );
+
+    assert.deepEqual(
+      framesByConnection[1]!.filter((frame) => 'taskId' in frame).map((frame) => frame.type),
+      ['task.complete'],
+      'the acknowledged artifact must not be replayed on the new connection',
+    );
+    await waitFor(() => pendingCount() === 0, 'acknowledged completion removal');
+  } finally {
+    release();
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
 test('an unacknowledged frame is replayed with the same execution ID and sequence', async () => {
   const server = createServer();
   const wss = new WebSocketServer({ server, path: '/connect' });

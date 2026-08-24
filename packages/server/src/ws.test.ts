@@ -1299,32 +1299,52 @@ test('a terminal replay from an old execution cannot complete a reused taskId', 
   const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
   try {
     await once(ws, 'open');
+    const helloAck = once(ws, 'message');
     ws.send(encodeFrame({
       type: 'hello', version: PROTOCOL_VERSION, agentId: 'agent-1', token: 'token',
       protocolCapabilities: [TASK_REPLAY_CAPABILITY],
       agentCard: { name: 'agent', version: '0.0.0', protocolVersion: '0.3.0' },
     }));
+    await withTimeout(helloAck, 5_000, 'hello acknowledgement');
     await waitForAgent(registry, 'agent-1');
     const first = makeSink();
     registry.bindTask({
       agentId: 'agent-1', taskId: 'task-reuse', contextId: 'ctx-1', sink: first,
       executionId: 'execution-old', nextClientSeq: 0,
     });
+    const firstTerminalAck = once(ws, 'message');
     ws.send(encodeFrame({
       type: 'task.complete', taskId: 'task-reuse', executionId: 'execution-old', seq: 0,
       status: { state: 'completed' },
     }));
     await withTimeout(first.finished, 5_000, 'first terminal');
+    const [firstAckRaw] = await withTimeout(
+      firstTerminalAck,
+      5_000,
+      'first terminal acknowledgement',
+    ) as [Buffer];
+    assert.deepEqual(parseDownFrame(firstAckRaw.toString('utf8')), {
+      type: 'task.ack', taskId: 'task-reuse', executionId: 'execution-old', acceptedSeq: 0,
+    });
 
     const second = makeSink();
     registry.bindTask({
       agentId: 'agent-1', taskId: 'task-reuse', contextId: 'ctx-2', sink: second,
       executionId: 'execution-new', nextClientSeq: 0,
     });
+    const replayAck = once(ws, 'message');
     ws.send(encodeFrame({
       type: 'task.complete', taskId: 'task-reuse', executionId: 'execution-old', seq: 0,
       status: { state: 'completed' },
     }));
+    const [replayAckRaw] = await withTimeout(
+      replayAck,
+      5_000,
+      'terminal receipt acknowledgement',
+    ) as [Buffer];
+    assert.deepEqual(parseDownFrame(replayAckRaw.toString('utf8')), {
+      type: 'task.ack', taskId: 'task-reuse', executionId: 'execution-old', acceptedSeq: 0,
+    });
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(second.statuses.length, 0, 'old terminal must not touch the new binding');
     ws.send(encodeFrame({
