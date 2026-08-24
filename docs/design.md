@@ -65,6 +65,62 @@ vicoop-bridge/
 - `task.cancel`   — `{ taskId }`
 - `ping`
 
+### 4.1 Disconnect handling (acknowledged task replay)
+
+A `TaskBinding` is not tied to the connection that created it — it holds only
+`agentId`, and outbound sends re-resolve the live socket at send time. So a
+dropped WebSocket does not by itself invalidate an in-flight task.
+
+Clients opt in by advertising `task-replay-v1` in `hello`. After authentication,
+the server answers with `hello.ack`, then gives every `task.assign` a unique
+`executionId`. The client adds that ID and a consecutive `seq` to each task frame,
+retains the encoded frame until `task.ack`, and resends the same ID and sequence
+after reconnecting. The server deduplicates acknowledged prefixes and fails the
+task on a sequence gap. This generation key is required because A2A can reuse a
+`taskId` across turns; output from an old turn must never complete a newer one.
+
+When a negotiated client's socket closes, the server keeps the binding alive
+for `BRIDGE_DISCONNECT_GRACE_MS` (default 30s) instead of failing the task at
+once. Only a generation-correct, gap-free frame on the next authenticated
+connection resumes the binding. An unresumed hold expires into exactly the
+terminal that path always produced: `disconnected` for a drop, `superseded` for
+a same-token reconnect.
+
+Legacy clients do not receive `hello.ack`, execution IDs, or grace holds. They
+retain the previous fail-immediately behavior, which keeps rolling server-first
+deploys safe. A new client connected to an older server recognizes a legacy
+`task.assign` and also uses the old fail-fast path.
+
+The grace is therefore *how long to wait before declaring a client dead*, not a
+cap on task duration; a long task is governed by
+`BRIDGE_TASK_INACTIVITY_TIMEOUT_MS` as before.
+
+Closes that are this server's own verdict rather than a transport failure skip
+the hold: the app-level codes it issues (`4000`–`4999`) and a clean `1000`.
+Since the code the server *observes* is not always the one it *sent* (a peer
+that never echoes the close frame surfaces as `1006`), the intent is recorded
+when the close is issued and takes precedence.
+
+One app-level close is deliberately excepted. `4009` — a second daemon
+authenticating with the same `CLIENT_TOKEN` — is *usually* the same client
+coming back rather than a rival, and the server cannot tell the two apart
+(`readyState` reports only what it has observed, and the client's own heartbeat
+normally detects a dead path first). So a `4009` collision holds like any other
+reconnect and expires as `superseded` if the task is never reclaimed. Operators
+reading a delayed collision failure should expect that delay.
+
+Setting `BRIDGE_DISCONNECT_GRACE_MS=0` disables the hold and restores the
+previous fail-immediately behavior exactly — the rollback lever if holds ever
+delay failover more than they save.
+
+The client bounds unacknowledged output by frame count, encoded bytes, and age.
+Exceeding a bound aborts and suppresses that run so the server fails it closed;
+it never replays a suffix after dropping a prefix. The server keeps short-lived
+terminal receipts so a terminal whose acknowledgement was lost can be
+acknowledged again without reopening or completing a reused task ID.
+
+Background: issue #474.
+
 ## 5. Client Backends
 
 ```bash

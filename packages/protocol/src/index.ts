@@ -1,6 +1,12 @@
 import { z } from 'zod';
 
 export const PROTOCOL_VERSION = '0.1';
+// Additive capability layered onto protocol 0.1. Clients advertising this
+// capability wait for `hello.ack`, tag every task frame with the server-issued
+// execution ID and a per-execution sequence number, and retain frames until the
+// server acknowledges them. Legacy clients and servers continue to use the
+// original taskId-only frames.
+export const TASK_REPLAY_CAPABILITY = 'task-replay-v1';
 export const TRACEABILITY_EXTENSION_URI =
   'https://github.com/a2aproject/a2a-samples/extensions/traceability/v1';
 export const SIWE_BEARER_AUTH_EXTENSION_URI =
@@ -267,6 +273,8 @@ export const HelloFrame = z.object({
 export const TaskStatusFrame = z.object({
   type: z.literal('task.status'),
   taskId: z.string(),
+  executionId: z.string().min(1).max(128).optional(),
+  seq: z.number().int().nonnegative().optional(),
   status: TaskStatus,
   // Optional, passed through verbatim onto the A2A
   // `TaskStatusUpdateEvent.metadata` (top-level) by the server. Used by the
@@ -294,6 +302,8 @@ export const TaskStatusFrame = z.object({
 export const TaskArtifactFrame = z.object({
   type: z.literal('task.artifact'),
   taskId: z.string(),
+  executionId: z.string().min(1).max(128).optional(),
+  seq: z.number().int().nonnegative().optional(),
   artifact: Artifact,
   append: z.boolean().optional(),
   lastChunk: z.boolean().optional(),
@@ -332,6 +342,8 @@ export type TaskUsage = z.infer<typeof TaskUsage>;
 export const TaskCompleteFrame = z.object({
   type: z.literal('task.complete'),
   taskId: z.string(),
+  executionId: z.string().min(1).max(128).optional(),
+  seq: z.number().int().nonnegative().optional(),
   status: TaskStatus,
   usage: TaskUsage.optional(),
 });
@@ -339,6 +351,8 @@ export const TaskCompleteFrame = z.object({
 export const TaskFailFrame = z.object({
   type: z.literal('task.fail'),
   taskId: z.string(),
+  executionId: z.string().min(1).max(128).optional(),
+  seq: z.number().int().nonnegative().optional(),
   error: z.object({
     code: z.string(),
     message: z.string(),
@@ -448,6 +462,7 @@ export type UpFrame = z.infer<typeof UpFrame>;
 export const TaskAssignFrame = z.object({
   type: z.literal('task.assign'),
   taskId: z.string(),
+  executionId: z.string().min(1).max(128).optional(),
   contextId: z.string(),
   message: Message,
   requestedExtensions: z.array(z.string()).optional(),
@@ -457,6 +472,21 @@ export const TaskAssignFrame = z.object({
 export const TaskCancelFrame = z.object({
   type: z.literal('task.cancel'),
   taskId: z.string(),
+  executionId: z.string().min(1).max(128).optional(),
+});
+
+export const HelloAckFrame = z.object({
+  type: z.literal('hello.ack'),
+  protocolCapabilities: z.array(z.string().min(1).max(128)).max(32),
+  disconnectGraceMs: z.number().int().nonnegative(),
+  maxFrameBytes: z.number().int().positive(),
+});
+
+export const TaskAckFrame = z.object({
+  type: z.literal('task.ack'),
+  taskId: z.string(),
+  executionId: z.string().min(1).max(128),
+  acceptedSeq: z.number().int().nonnegative(),
 });
 
 export const PingFrame = z.object({ type: z.literal('ping') });
@@ -471,9 +501,13 @@ export const UsageRequestFrame = z.object({
 
 export type TaskAssignFrame = z.infer<typeof TaskAssignFrame>;
 export type TaskCancelFrame = z.infer<typeof TaskCancelFrame>;
+export type HelloAckFrame = z.infer<typeof HelloAckFrame>;
+export type TaskAckFrame = z.infer<typeof TaskAckFrame>;
 export type UsageRequestFrame = z.infer<typeof UsageRequestFrame>;
 
 export const DownFrame = z.discriminatedUnion('type', [
+  HelloAckFrame,
+  TaskAckFrame,
   TaskAssignFrame,
   TaskCancelFrame,
   PingFrame,

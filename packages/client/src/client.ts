@@ -3,6 +3,7 @@ import {
   CALLER_CONTEXT_CAPABILITY,
   PROTOCOL_VERSION,
   OPENAI_COMPAT_EXTENSION_URI,
+  TASK_REPLAY_CAPABILITY,
   encodeFrame,
   parseDownFrame,
   withOpenAICompatModelsAdvertise,
@@ -42,6 +43,17 @@ export interface ClientOptions {
   reconnectMaxDelayMs?: number;
   reconnectJitterRatio?: number;
   reconnectStableMs?: number;
+  // Maximum number of unacknowledged task frames retained across reconnects.
+  // Setting any retention bound to `0` keeps sequencing/gap detection but
+  // disables retry retention and aborts reliable runs when their socket drops.
+  maxPendingFrames?: number;
+  // Companion byte budget for the encoded unacknowledged frames.
+  // `0` has the retention-disable behavior described above.
+  maxPendingBytes?: number;
+  // Maximum age of an unacknowledged frame. Execution IDs make stale frames safe
+  // to drop independently of the server's configured grace.
+  // `0` has the retention-disable behavior described above.
+  maxPendingAgeMs?: number;
   // Minimum reconnect delay after a 4009 "another client with the same
   // token connected" close — i.e. two daemons authenticated with the
   // same CLIENT_TOKEN colliding at the registry's clientId check. The
@@ -101,9 +113,31 @@ const DEFAULT_PROBE_DEADLINE_MS = 12_000;
 const DEFAULT_RECONNECT_DELAY_MS = 3000;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 30_000;
 const DEFAULT_RECONNECT_JITTER_RATIO = 0.2;
+// Bounds apply to unacknowledged frames, not merely frames produced while the
+// socket is visibly down. WebSocket OPEN/send success is not proof of server
+// acceptance; task.ack is.
+const DEFAULT_MAX_PENDING_FRAMES = 2_000;
+const DEFAULT_MAX_PENDING_BYTES = 4 * 1024 * 1024;
+const DEFAULT_MAX_PENDING_AGE_MS = 60_000;
 const DEFAULT_RECONNECT_STABLE_MS = 60_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
 const DEFAULT_COLLISION_BACKOFF_MS = 300_000;
+
+type TaskUpFrame = Extract<UpFrame, { taskId: string }>;
+interface ClientRun {
+  controller: AbortController;
+  suppressed: boolean;
+  executionId?: string;
+  nextSeq: number;
+}
+interface PendingFrame {
+  taskId: string;
+  executionId: string;
+  seq: number;
+  encoded: string;
+  bytes: number;
+  createdAt: number;
+}
 
 export class Client {
   private ws: WebSocket | null = null;
@@ -117,13 +151,23 @@ export class Client {
   // is logged exactly once on first successful connect — same data on every
   // reconnect would just be noise, and we don't want to wait for whoami.
   private identityLogged = false;
-  private inflight = new Map<string, AbortController>();
+  private inflight = new Map<string, ClientRun>();
   // Resolved once per process via backend.resolveCapabilities(); the bridge
   // hello frame is held until this settles so the advertised card matches the
   // backend's actual upstream capability. Cached across reconnects so we
   // don't re-probe on every bridge WS reconnect — the underlying upstream
   // doesn't change mid-process.
   private effectiveCardPromise: Promise<AgentCard | undefined> | null = null;
+  // Reliable frames stay here until the bridge cumulatively acknowledges their
+  // execution-local sequence. Reconnect simply resends the same generations and
+  // sequences; the bridge deduplicates them and detects gaps.
+  private pendingFrames: PendingFrame[] = [];
+  private pendingBytes = 0;
+  private pendingExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+  // False until the authenticated server replies with hello.ack on each
+  // connection. This prevents replay from racing asynchronous authentication.
+  private replayReady = false;
+  private negotiatedMaxFrameBytes: number | null = null;
   private readonly logger: Logger;
 
   constructor(private readonly opts: ClientOptions) {
@@ -148,7 +192,12 @@ export class Client {
     this.clearHeartbeat();
     // Abort all inflight tasks so backends can unwind cleanly instead of
     // running to completion after the WS is gone.
-    for (const controller of this.inflight.values()) controller.abort();
+    for (const run of this.inflight.values()) {
+      run.suppressed = true;
+      run.controller.abort();
+    }
+    // Nothing will replay these — the process is going away.
+    this.dropPendingFrames();
     this.ws?.close();
     // Tear down long-lived backend resources (e.g. codex app-server child).
     // Per-task abort above covers per-handle subprocesses; this hook is for
@@ -276,6 +325,8 @@ export class Client {
 
   private connect(): void {
     if (this.stopped) return;
+    this.replayReady = false;
+    this.negotiatedMaxFrameBytes = null;
     const ws = new WebSocket(`${this.opts.serverUrl.replace(/\/$/, '')}/connect`);
     this.ws = ws;
 
@@ -307,7 +358,7 @@ export class Client {
             backendKind: this.opts.backendKind,
             version: PROTOCOL_VERSION,
             token: this.opts.token,
-            protocolCapabilities: [CALLER_CONTEXT_CAPABILITY],
+            protocolCapabilities: [CALLER_CONTEXT_CAPABILITY, TASK_REPLAY_CAPABILITY],
           }),
         );
       };
@@ -339,8 +390,26 @@ export class Client {
         return;
       }
 
+      // A replaced socket may still have already-queued message callbacks.
+      // Once another connection owns `this.ws`, no frame from this socket may
+      // mutate task generations, acknowledgements, or in-flight runs.
+      if (this.ws !== ws) return;
+
       switch (frame.type) {
+        case 'hello.ack':
+          if (!frame.protocolCapabilities.includes(TASK_REPLAY_CAPABILITY)) return;
+          this.replayReady = true;
+          this.negotiatedMaxFrameBytes = frame.maxFrameBytes;
+          this.flushPendingFrames(ws);
+          break;
+        case 'task.ack':
+          this.acknowledgeFrames(frame.executionId, frame.acceptedSeq);
+          break;
         case 'task.assign':
+          // A task assignment without an execution ID came from a legacy bridge.
+          // It is proof that authentication finished, but reconnect replay is
+          // intentionally unavailable on that connection.
+          if (frame.executionId === undefined) this.replayReady = false;
           // `summarizeParts` already sanitizes each MIME via safeToken, so
           // the `parts=` token here intentionally does NOT wrap the whole
           // summary again — that would double-escape backslashes (a `\n`
@@ -356,7 +425,20 @@ export class Client {
           break;
         case 'task.cancel':
           this.logger.info(`task.cancel taskId=${safeToken(frame.taskId)}`);
-          this.inflight.get(frame.taskId)?.abort();
+          {
+            const run = this.inflight.get(frame.taskId);
+            if (run && (frame.executionId === undefined || frame.executionId === run.executionId)) {
+              // A generation-scoped cancel is also the server's fail-closed
+              // signal (for example after detecting a sequence gap). No later
+              // frame from this generation can be accepted, so release its
+              // retained prefix and suppress the backend's abort terminal.
+              if (frame.executionId !== undefined) {
+                run.suppressed = true;
+                this.removePendingExecution(frame.executionId);
+              }
+              run.controller.abort();
+            }
+          }
           break;
         case 'ping':
           this.send({ type: 'pong' });
@@ -381,6 +463,15 @@ export class Client {
       this.logger.info(`disconnected: ${code} ${safeToken(reason.toString())}`);
       if (!current) return;
       this.ws = null;
+      // Legacy frames, and reliable runs whose retention was explicitly
+      // disabled, cannot safely continue after losing their socket. Stop them
+      // so output produced during the outage is never silently discarded.
+      // Retained reliable runs resume after the next hello.ack.
+      for (const run of this.inflight.values()) {
+        if (run.executionId !== undefined && this.pendingRetentionEnabled()) continue;
+        run.suppressed = true;
+        run.controller.abort();
+      }
       // Terminal auth failures the daemon cannot recover from by waiting:
       //
       //   - **4014 "client deleted"** (issue #166). The DB row was just
@@ -411,7 +502,15 @@ export class Client {
         this.logger.error(`${label}; stopping (code=${code})`);
         this.stopped = true;
         this.clearReconnectTimer();
-        for (const controller of this.inflight.values()) controller.abort();
+        for (const run of this.inflight.values()) {
+          run.suppressed = true;
+          run.controller.abort();
+        }
+        // Nothing will ever replay these — this daemon is not reconnecting. The
+        // host process may keep running (onFatal owns that decision), so
+        // release the buffer rather than hold it for a reconnect that is not
+        // coming.
+        this.dropPendingFrames();
         this.opts.onFatal?.({ code, reason: reason.toString() });
         return;
       }
@@ -560,6 +659,268 @@ export class Client {
     this.ws.send(encodeFrame(frame));
   }
 
+  private sendTaskFrame(run: ClientRun, frame: TaskUpFrame): void {
+    if (run.suppressed) return;
+    if (run.executionId === undefined) {
+      this.send(frame);
+      return;
+    }
+
+    const seq = run.nextSeq++;
+    const reliableFrame = { ...frame, executionId: run.executionId, seq } as TaskUpFrame;
+    const encoded = encodeFrame(reliableFrame);
+    const bytes = Buffer.byteLength(encoded, 'utf8');
+    const frameLimit = this.pendingFrameLimit();
+    const byteLimit = this.pendingByteLimit();
+    const ageLimit = this.pendingAgeLimit();
+    const retentionEnabled = frameLimit > 0 && byteLimit > 0 && ageLimit > 0;
+    const maxFrameBytes = this.negotiatedMaxFrameBytes;
+
+    if (
+      (maxFrameBytes !== null && bytes > maxFrameBytes) ||
+      (retentionEnabled && bytes > byteLimit) ||
+      (retentionEnabled && this.pendingFrames.length >= frameLimit) ||
+      (retentionEnabled && this.pendingBytes + bytes > byteLimit)
+    ) {
+      const why =
+        `unacknowledged frame buffer limit exceeded for task ${safeToken(frame.taskId)}`;
+      this.failReliableRun(
+        run,
+        why,
+        false,
+      );
+      // Replace the frame that could not be retained with a small terminal at
+      // the same sequence. On a healthy-looking socket this gives the bridge a
+      // precise failure instead of making it wait for reconnect grace and then
+      // report a generic disconnect. The send callback terminates only after
+      // `ws` has flushed the best-effort terminal to the transport.
+      this.sendReliableFailureAndDisconnect(run.executionId, frame.taskId, seq, {
+        code: 'client_buffer_overflow',
+        message: 'client unacknowledged frame buffer limit exceeded',
+      });
+      return;
+    }
+
+    if (retentionEnabled) {
+      this.pendingFrames.push({
+        taskId: frame.taskId,
+        executionId: run.executionId,
+        seq,
+        encoded,
+        bytes,
+        createdAt: Date.now(),
+      });
+      this.pendingBytes += bytes;
+      this.schedulePendingExpiry();
+    }
+    if (this.replayReady && this.ws?.readyState === WebSocket.OPEN) {
+      this.sendEncoded(this.ws, encoded);
+    }
+  }
+
+  private flushPendingFrames(ws: WebSocket): void {
+    if (!this.replayReady || ws.readyState !== WebSocket.OPEN) return;
+    this.expirePendingFrames();
+    if (!this.replayReady || ws.readyState !== WebSocket.OPEN) return;
+    for (const entry of this.pendingFrames) {
+      if (
+        this.negotiatedMaxFrameBytes !== null &&
+        entry.bytes > this.negotiatedMaxFrameBytes
+      ) {
+        const why =
+          `retained frame exceeds the negotiated limit for task ${safeToken(entry.taskId)}`;
+        const run = [...this.inflight.values()].find(
+          (candidate) => candidate.executionId === entry.executionId,
+        );
+        if (run) this.failReliableRun(run, why, false);
+        else {
+          this.removePendingExecution(entry.executionId);
+          this.logger.error(`${why}; suppressing the execution so the bridge fails it closed`);
+        }
+        // Entries earlier in this loop have already been queued in sequence.
+        // Replace the first oversized one at its own sequence with a bounded
+        // terminal, then reconnect so other executions can replay cleanly.
+        this.sendReliableFailureAndDisconnect(entry.executionId, entry.taskId, entry.seq, {
+          code: 'client_buffer_overflow',
+          message: 'retained client frame exceeds the negotiated server limit',
+        });
+        return;
+      }
+      this.sendEncoded(ws, entry.encoded);
+    }
+    if (this.pendingFrames.length > 0) {
+      this.logger.info(`replayed ${this.pendingFrames.length} unacknowledged frame(s) after reconnect`);
+    }
+  }
+
+  private sendEncoded(ws: WebSocket, encoded: string): void {
+    try {
+      ws.send(encoded, (err) => {
+        if (!err || this.ws !== ws) return;
+        this.logger.warn(`task frame send failed (${safeToken(err.message)}); reconnecting`);
+        ws.terminate();
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`task frame send threw (${safeToken(message)}); reconnecting`);
+      if (this.ws === ws) ws.terminate();
+    }
+  }
+
+  private acknowledgeFrames(executionId: string, acceptedSeq: number): void {
+    let removed = 0;
+    this.pendingFrames = this.pendingFrames.filter((entry) => {
+      if (entry.executionId !== executionId || entry.seq > acceptedSeq) return true;
+      this.pendingBytes -= entry.bytes;
+      removed++;
+      return false;
+    });
+    this.schedulePendingExpiry();
+    if (removed > 0) this.logger.debug(`acknowledged ${removed} task frame(s)`);
+  }
+
+  private failReliableRun(run: ClientRun, why: string, disconnect: boolean): void {
+    if (run.suppressed) return;
+    run.suppressed = true;
+    run.controller.abort();
+    if (run.executionId !== undefined) this.removePendingExecution(run.executionId);
+    this.logger.error(`${why}; suppressing the run so the bridge fails it closed`);
+    if (disconnect && this.ws?.readyState === WebSocket.OPEN) this.ws.terminate();
+  }
+
+  private sendReliableFailureAndDisconnect(
+    executionId: string,
+    taskId: string,
+    seq: number,
+    error: { code: string; message: string },
+  ): void {
+    const ws = this.ws;
+    if (!this.replayReady || !ws || ws.readyState !== WebSocket.OPEN) {
+      if (ws?.readyState === WebSocket.OPEN) ws.terminate();
+      return;
+    }
+
+    const encoded = encodeFrame({
+      type: 'task.fail',
+      taskId,
+      executionId,
+      seq,
+      error,
+    });
+    if (
+      this.negotiatedMaxFrameBytes !== null &&
+      Buffer.byteLength(encoded, 'utf8') > this.negotiatedMaxFrameBytes
+    ) {
+      ws.terminate();
+      return;
+    }
+
+    try {
+      ws.send(encoded, (err) => {
+        if (err) {
+          this.logger.warn(
+            `best-effort task failure send failed (${safeToken(err.message)}); reconnecting`,
+          );
+        }
+        if (this.ws === ws) ws.terminate();
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn(
+        `best-effort task failure send threw (${safeToken(message)}); reconnecting`,
+      );
+      if (this.ws === ws) ws.terminate();
+    }
+  }
+
+  private removePendingExecution(executionId: string): void {
+    this.pendingFrames = this.pendingFrames.filter((entry) => {
+      if (entry.executionId !== executionId) return true;
+      this.pendingBytes -= entry.bytes;
+      return false;
+    });
+    this.schedulePendingExpiry();
+  }
+
+  private pendingFrameLimit(): number {
+    const value = this.opts.maxPendingFrames ?? DEFAULT_MAX_PENDING_FRAMES;
+    return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : DEFAULT_MAX_PENDING_FRAMES;
+  }
+
+  private pendingByteLimit(): number {
+    const value = this.opts.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES;
+    return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : DEFAULT_MAX_PENDING_BYTES;
+  }
+
+  private pendingAgeLimit(): number {
+    const value = this.opts.maxPendingAgeMs ?? DEFAULT_MAX_PENDING_AGE_MS;
+    return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : DEFAULT_MAX_PENDING_AGE_MS;
+  }
+
+  private pendingRetentionEnabled(): boolean {
+    return (
+      this.pendingFrameLimit() > 0 &&
+      this.pendingByteLimit() > 0 &&
+      this.pendingAgeLimit() > 0
+    );
+  }
+
+  private schedulePendingExpiry(): void {
+    if (this.pendingExpiryTimer !== null) {
+      clearTimeout(this.pendingExpiryTimer);
+      this.pendingExpiryTimer = null;
+    }
+    const ageLimit = this.pendingAgeLimit();
+    const oldest = this.pendingFrames[0];
+    if (!oldest || ageLimit <= 0) return;
+    const delay = Math.max(0, oldest.createdAt + ageLimit - Date.now());
+    this.pendingExpiryTimer = setTimeout(() => {
+      this.pendingExpiryTimer = null;
+      this.expirePendingFrames();
+    }, delay);
+    this.pendingExpiryTimer.unref?.();
+  }
+
+  private expirePendingFrames(): void {
+    const ageLimit = this.pendingAgeLimit();
+    if (ageLimit <= 0 || this.pendingFrames.length === 0) return;
+    const cutoff = Date.now() - ageLimit;
+    const expiredExecutions = new Set(
+      this.pendingFrames
+        .filter((entry) => entry.createdAt <= cutoff)
+        .map((entry) => entry.executionId),
+    );
+    for (const executionId of expiredExecutions) {
+      const run = [...this.inflight.values()].find((candidate) => candidate.executionId === executionId);
+      if (run) {
+        this.failReliableRun(
+          run,
+          `unacknowledged replay expired after ${ageLimit}ms`,
+          this.ws?.readyState === WebSocket.OPEN,
+        );
+      } else {
+        this.removePendingExecution(executionId);
+        // A backend may already have returned after emitting its terminal, so
+        // its run is no longer in `inflight` even though that terminal remains
+        // unacknowledged. Dropping it while keeping a half-dead socket open can
+        // strand the server binding forever: there is nothing left to replay
+        // or abort. Force the normal disconnect/grace path to settle it.
+        this.logger.error(
+          `unacknowledged replay expired after ${ageLimit}ms; disconnecting so the bridge fails it closed`,
+        );
+        if (this.ws?.readyState === WebSocket.OPEN) this.ws.terminate();
+      }
+    }
+    this.schedulePendingExpiry();
+  }
+
+  private dropPendingFrames(): void {
+    if (this.pendingExpiryTimer !== null) clearTimeout(this.pendingExpiryTimer);
+    this.pendingExpiryTimer = null;
+    this.pendingFrames = [];
+    this.pendingBytes = 0;
+  }
+
   // Answer a server-initiated usage.request by querying the backend's optional
   // usage() capability. Fire-and-forget (errors surface as usage.response with
   // ok:false rather than throwing) so it never stalls the message loop.
@@ -601,16 +962,34 @@ export class Client {
 
   private async runTask(frame: import('@vicoop-bridge/protocol').DownFrame): Promise<void> {
     if (frame.type !== 'task.assign') return;
+    const previous = this.inflight.get(frame.taskId);
+    if (previous) {
+      previous.suppressed = true;
+      previous.controller.abort();
+      if (previous.executionId !== undefined) this.removePendingExecution(previous.executionId);
+    }
     const controller = new AbortController();
-    this.inflight.set(frame.taskId, controller);
+    const run: ClientRun = {
+      controller,
+      suppressed: false,
+      ...(frame.executionId !== undefined ? { executionId: frame.executionId } : {}),
+      nextSeq: 0,
+    };
+    this.inflight.set(frame.taskId, run);
     try {
       await processTask(frame, controller.signal, {
         backend: this.opts.backend,
-        send: (f) => this.send(f),
+        // A suppressed run is over as far as the bridge is concerned; anything
+        // still trickling out of the backend must not reach a taskId that may
+        // now belong to someone else.
+        send: (f) => {
+          if (run.suppressed) return;
+          this.sendTaskFrame(run, f as TaskUpFrame);
+        },
         logger: this.logger,
       });
     } finally {
-      this.inflight.delete(frame.taskId);
+      if (this.inflight.get(frame.taskId) === run) this.inflight.delete(frame.taskId);
     }
   }
 }
