@@ -133,6 +133,7 @@ function setWWWAuthenticate(
 export interface AgentAuthOptions {
   sql: Sql;
   deviceFlowEnabled?: boolean;
+  responseFormat?: 'jsonrpc' | 'http-json';
   // SIWE domain for the bridge — used to validate raw SIWE bearer tokens
   // (siwe-bearer-auth/v0.1). When undefined, the SIWE bearer fast-path is
   // disabled and only opaque vbc_caller_* tokens are accepted.
@@ -160,6 +161,43 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
     ? `Authentication required (Bearer ${CALLER_TOKEN_PREFIX}* or SIWE bearer)`
     : `Authentication required (Bearer ${CALLER_TOKEN_PREFIX}*)`;
 
+  function reject(
+    c: Context,
+    status: 401 | 403 | 404 | 503,
+    jsonRpcCode: number,
+    message: string,
+    rejectionId: string,
+  ) {
+    if (opts.responseFormat !== 'http-json') {
+      return c.json(rejectionErrorBody(jsonRpcCode, message, rejectionId), status);
+    }
+    const statusName = {
+      401: 'UNAUTHENTICATED',
+      403: 'PERMISSION_DENIED',
+      404: 'NOT_FOUND',
+      503: 'UNAVAILABLE',
+    }[status];
+    return c.body(
+      JSON.stringify({
+        error: {
+          code: status,
+          status: statusName,
+          message,
+          details: [
+            {
+              '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+              reason: statusName,
+              domain: 'vicoop-bridge',
+              metadata: { rejectionId },
+            },
+          ],
+        },
+      }),
+      status,
+      { 'Content-Type': 'application/a2a+json' },
+    );
+  }
+
   return async (c: Context, next: Next) => {
     const agentId = c.req.param('id')!;
     const conn = registry.getAgent(agentId);
@@ -172,13 +210,12 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
           rejectionId,
         });
         c.header('Retry-After', String(AGENT_UNAVAILABLE_RETRY_AFTER_SECONDS));
-        return c.json(
-          rejectionErrorBody(
-            -32000,
-            'Agent temporarily unavailable (registered but not connected)',
-            rejectionId,
-          ),
+        return reject(
+          c,
           503,
+          -32000,
+          'Agent temporarily unavailable (registered but not connected)',
+          rejectionId,
         );
       }
       logEvent('agent_request_rejected', {
@@ -186,7 +223,7 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
         reason: 'agent_not_connected',
         rejectionId,
       });
-      return c.json(rejectionErrorBody(-32000, 'Agent not connected', rejectionId), 404);
+      return reject(c, 404, -32000, 'Agent not connected', rejectionId);
     }
 
     c.set('agentConn', conn);
@@ -207,7 +244,7 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
       // Per RFC 6750 §3.1, no error code when the request lacks any
       // authentication information — only the challenge realm.
       setWWWAuthenticate(c);
-      return c.json(rejectionErrorBody(-32001, missingBearerMessage, rejectionId), 401);
+      return reject(c, 401, -32001, missingBearerMessage, rejectionId);
     }
 
     let caller: VerifiedCaller;
@@ -231,13 +268,12 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
           error: 'invalid_token',
           description: 'invalid bearer token',
         });
-        return c.json(
-          rejectionErrorBody(
-            -32001,
-            `Invalid bearer token. Acquire one via ${acquisitionHint}.`,
-            rejectionId,
-          ),
+        return reject(
+          c,
           401,
+          -32001,
+          `Invalid bearer token. Acquire one via ${acquisitionHint}.`,
+          rejectionId,
         );
       }
     } else if (bearerToken.startsWith(OWNER_SESSION_PREFIX)) {
@@ -257,13 +293,12 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
         error: 'invalid_token',
         description: `${OWNER_SESSION_PREFIX}* tokens are not accepted on /agents/:id`,
       });
-      return c.json(
-        rejectionErrorBody(
-          -32001,
-          `Invalid bearer token: ${OWNER_SESSION_PREFIX}* (owner-session) tokens are not accepted on /agents/:id. Acquire one via ${acquisitionHint}.`,
-          rejectionId,
-        ),
+      return reject(
+        c,
         401,
+        -32001,
+        `Invalid bearer token: ${OWNER_SESSION_PREFIX}* (owner-session) tokens are not accepted on /agents/:id. Acquire one via ${acquisitionHint}.`,
+        rejectionId,
       );
     } else if (opts.siweDomain) {
       // Stateless SIWE bearer per siwe-bearer-auth/v0.1. No callers row is
@@ -289,13 +324,12 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
           error: 'invalid_token',
           description: 'invalid SIWE bearer',
         });
-        return c.json(
-          rejectionErrorBody(
-            -32001,
-            `Invalid bearer token. Acquire one via ${acquisitionHint}.`,
-            rejectionId,
-          ),
+        return reject(
+          c,
           401,
+          -32001,
+          `Invalid bearer token. Acquire one via ${acquisitionHint}.`,
+          rejectionId,
         );
       }
     } else {
@@ -309,13 +343,12 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
         error: 'invalid_token',
         description: `expected ${CALLER_TOKEN_PREFIX}* prefix`,
       });
-      return c.json(
-        rejectionErrorBody(
-          -32001,
-          `Invalid bearer token: expected ${CALLER_TOKEN_PREFIX}* prefix. Acquire one via ${acquisitionHint}.`,
-          rejectionId,
-        ),
+      return reject(
+        c,
         401,
+        -32001,
+        `Invalid bearer token: expected ${CALLER_TOKEN_PREFIX}* prefix. Acquire one via ${acquisitionHint}.`,
+        rejectionId,
       );
     }
 
@@ -332,10 +365,7 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
         error: 'insufficient_scope',
         description: 'caller not in allowed list',
       });
-      return c.json(
-        rejectionErrorBody(-32001, 'Caller not authorized for this agent', rejectionId),
-        403,
-      );
+      return reject(c, 403, -32001, 'Caller not authorized for this agent', rejectionId);
     }
 
     c.set('caller', caller);

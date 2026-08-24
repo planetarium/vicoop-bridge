@@ -253,6 +253,55 @@ test(
 );
 
 test(
+  'listTasks paginates and remains scoped to the owning agent',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const suffix = crypto.randomUUID();
+    const ownerA = `list-owner-a-${suffix}`;
+    const ownerB = `list-owner-b-${suffix}`;
+    const contextA = `list-context-a-${suffix}`;
+    const maintenanceStore = new PostgresTaskStore(sql);
+    const createdIds: string[] = [];
+    try {
+      await ensureSchema(sql);
+      const storeA = new PostgresTaskStore(sql, { ownerAgent: ownerA });
+      const storeB = new PostgresTaskStore(sql, { ownerAgent: ownerB });
+      createdIds.push(
+        (await storeA.createTask({ contextId: contextA })).id,
+        (await storeA.createTask({ contextId: contextA })).id,
+        (await storeB.createTask({ contextId: contextA })).id,
+      );
+
+      const firstPage = await storeA.listTasks({ pageSize: 1, contextId: contextA });
+      assert.equal(firstPage.tasks.length, 1);
+      assert.equal(firstPage.totalSize, 2);
+      assert.equal(firstPage.pageSize, 1);
+      assert.equal(firstPage.nextPageToken, '1');
+      assert.equal(firstPage.tasks[0]!.artifacts, undefined);
+
+      const secondPage = await storeA.listTasks({
+        pageSize: 1,
+        pageToken: firstPage.nextPageToken,
+        contextId: contextA,
+      });
+      assert.equal(secondPage.tasks.length, 1);
+      assert.equal(secondPage.totalSize, 2);
+      assert.equal(secondPage.nextPageToken, '');
+      assert.notEqual(secondPage.tasks[0]!.id, firstPage.tasks[0]!.id);
+
+      const otherOwner = await storeB.listTasks({ contextId: contextA });
+      assert.equal(otherOwner.tasks.length, 1);
+      assert.equal(otherOwner.totalSize, 1);
+      assert.equal(createdIds.includes(otherOwner.tasks[0]!.id), true);
+    } finally {
+      await Promise.all(createdIds.map((taskId) => maintenanceStore.deleteTask(taskId)));
+      await sql.end();
+    }
+  },
+);
+
+test(
   'updateTask: concurrent updates touching different fields do not lose either write (issue #366)',
   { skip: !hasDb },
   async () => {

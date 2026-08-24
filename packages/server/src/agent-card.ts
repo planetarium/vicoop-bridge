@@ -1,7 +1,9 @@
 import {
+  A2A_TRANSPORTS,
   A2XServer,
   HttpBearerAuthorization,
   OAuth2DeviceCodeAuthorization,
+  type ProtocolVersion,
   type TaskStore,
 } from '@a2x/sdk';
 import { SIWE_BEARER_AUTH_EXTENSION_URI } from '@vicoop-bridge/protocol';
@@ -15,6 +17,7 @@ import type { Sql } from './db.js';
 export interface AgentA2XOptions {
   publicUrl: string | undefined;
   deviceFlowEnabled: boolean;
+  protocolVersion?: ProtocolVersion;
   // DB handle for the x402 offering store. Absent on deployments assembled
   // without a payment path; the executor then never installs the gate.
   db?: Sql;
@@ -39,9 +42,11 @@ export function buildAgentA2XServer(
   opts: AgentA2XOptions,
 ): A2XServer {
   const wire = conn.agentCard;
+  const protocolVersion = opts.protocolVersion ?? '0.3';
+  const versionPath = protocolVersion === '1.0' ? '/v1' : '';
   const url = opts.publicUrl
-    ? `${opts.publicUrl}/agents/${conn.agentId}`
-    : `/agents/${conn.agentId}`;
+    ? `${opts.publicUrl}/agents/${conn.agentId}${versionPath}`
+    : `/agents/${conn.agentId}${versionPath}`;
 
   // x402 `resource` must be an absolute URL — strict facilitators reject
   // anything else, so without `publicUrl` a paid agent would publish offerings
@@ -68,7 +73,7 @@ export function buildAgentA2XServer(
   const a2xServer = new A2XServer({
     taskStore,
     executor,
-    protocolVersion: '0.3',
+    protocolVersion,
   })
     .setName(wire.name)
     .setDescription(wire.description ?? '')
@@ -84,6 +89,20 @@ export function buildAgentA2XServer(
       streaming: wire.capabilities?.streaming ?? false,
       pushNotifications: wire.capabilities?.pushNotifications ?? false,
     });
+
+  // A2A v1 decouples the protocol version from the HTTP binding. Publish both
+  // bindings on the same owner-defined base URL: POSTing JSON-RPC to the base
+  // remains available, while the HTTP+JSON operation paths (message:send,
+  // tasks/{id}, etc.) are resolved relative to it.
+  if (protocolVersion === '1.0') {
+    a2xServer
+      .setDefaultTransport(A2A_TRANSPORTS.JSONRPC)
+      .addInterface({
+        url,
+        protocol: A2A_TRANSPORTS.HTTP_JSON,
+        protocolVersion: '1.0',
+      });
+  }
 
   // Advertise SIWE bearer-auth (siwe-bearer-auth/v0.1) when this agent is
   // restricted to a non-empty allowed_callers set. Mentionable / A2A clients
@@ -152,7 +171,7 @@ export function buildAgentA2XServer(
         domainBinding: true,
         usageHint: {
           mintToken: `a2a-wallet siwe auth --domain ${siweDomain} --uri ${opts.publicUrl} --ttl 1h --json | jq -r '.token'`,
-          sendMessage: `a2a-wallet a2a send --bearer "$TOKEN" ${opts.publicUrl}/agents/${conn.agentId}/.well-known/agent-card.json "Hello"`,
+          sendMessage: `a2a-wallet a2a send --bearer "$TOKEN" ${url}/.well-known/agent-card.json "Hello"`,
         },
       },
     });

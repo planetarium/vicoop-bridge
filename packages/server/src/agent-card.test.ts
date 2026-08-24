@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { InMemoryTaskStore, type AgentCardV03 } from '@a2x/sdk';
+import { InMemoryTaskStore, type AgentCardV03, type AgentCardV10 } from '@a2x/sdk';
 import {
   SIWE_BEARER_AUTH_EXTENSION_URI,
   TRACEABILITY_EXTENSION_URI,
@@ -23,6 +23,41 @@ function fakeConn(card: AgentCard, overrides: Partial<ClientConnection> = {}): C
     ...overrides,
   };
 }
+
+test('buildAgentA2XServer publishes v1 JSON-RPC and HTTP+JSON on one versioned base URL', () => {
+  const agent = buildAgentA2XServer(
+    fakeConn({
+      name: 'claude',
+      description: 'Claude Code',
+      version: '0.0.1',
+      protocolVersion: '0.3.0',
+      capabilities: { streaming: true },
+      skills: [],
+    }),
+    new InMemoryTaskStore(),
+    new Registry(),
+    {
+      publicUrl: 'https://bridge.example',
+      deviceFlowEnabled: false,
+      protocolVersion: '1.0',
+    },
+  );
+
+  const card = agent.getAgentCard() as AgentCardV10;
+  assert.deepEqual(card.supportedInterfaces, [
+    {
+      url: 'https://bridge.example/agents/claude/v1',
+      protocolBinding: 'JSONRPC',
+      protocolVersion: '1.0',
+    },
+    {
+      url: 'https://bridge.example/agents/claude/v1',
+      protocolBinding: 'HTTP+JSON',
+      protocolVersion: '1.0',
+    },
+  ]);
+  assert.equal((card as AgentCardV10 & { protocolVersion?: string }).protocolVersion, undefined);
+});
 
 test('buildAgentA2XServer preserves advertised optional extensions', () => {
   const agent = buildAgentA2XServer(

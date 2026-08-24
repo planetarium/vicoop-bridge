@@ -3,9 +3,10 @@
 Onboarding guide for connecting a local A2A backend (OpenClaw, Claude Code, or
 Codex CLI; `echo` is available for testing) to a deployed vicoop-bridge server. The
 first target is a verified foreground `vicoop-client` process on your host
-that bridges inbound A2A traffic at `POST <bridge>/agents/<your-agent-id>` to
-your local backend. Persistent service setup is optional once the foreground
-run works.
+that bridges inbound A2A traffic at the v0.3 base URL
+`<bridge>/agents/<your-agent-id>` or the v1 base URL
+`<bridge>/agents/<your-agent-id>/v1` to your local backend. Persistent service
+setup is optional once the foreground run works.
 
 Custom backends are described in `docs/design.md` §5. The released client
 currently registers `echo`, `openclaw`, `claude`, and `codex`.
@@ -488,6 +489,11 @@ server publishes the canonical card for that backend at
 metadata/capability fixes on the faster server deploy path instead of
 requiring every operator to upgrade their client bundle.
 
+The versioned A2A v1 card is available at
+`GET <bridge>/agents/<agent_id>/v1/.well-known/agent-card.json`. It advertises
+both JSON-RPC and HTTP+JSON on the same `<bridge>/agents/<agent_id>/v1` base
+URL. The unversioned card and endpoint remain A2A v0.3 for existing callers.
+
 Starter cards for the built-in backends (`openclaw.json`, `claude.json`,
 `codex.json`, `echo.json`) live in the source tree under
 [`packages/client/cards/`](https://github.com/planetarium/vicoop-bridge/tree/main/packages/client/cards) —
@@ -579,8 +585,15 @@ After that:
   place; otherwise `agent register` auto-minted an API key (printed once) and
   added its `apikey:<key-id>` principal to `allowed_callers`, so the agent is
   restricted to that key rather than being publicly callable.
-- `POST $BRIDGE_URL/agents/$AGENT_ID` with a JSON-RPC `message/send` payload
-  reaches your backend and the reply is returned inline.
+- A2A v0.3 remains available at `POST
+  $BRIDGE_URL/agents/$AGENT_ID` with JSON-RPC `message/send`.
+- A2A v1 JSON-RPC is available at `POST
+  $BRIDGE_URL/agents/$AGENT_ID/v1` with the v1 method names and wire shapes.
+- A2A v1 HTTP+JSON uses operation paths relative to that same base, including
+  `POST .../v1/message:send`, `POST .../v1/message:stream`, `GET
+  .../v1/tasks`, `GET .../v1/tasks/<task-id>`, and `POST
+  .../v1/tasks/<task-id>:cancel`. Send `A2A-Version: 1.0`; POST bodies use
+  `Content-Type: application/a2a+json` (or `application/json`).
 
 ## Step 6b — Run unattended (`--detach`)
 
@@ -776,6 +789,10 @@ vicoop-client auth whoami
 ```
 
 Typical follow-ups from this output:
+
+The current `whoami` output names the backwards-compatible v0.3 URLs. Derive
+the v1 equivalents by appending `/v1` to `a2a`, and
+`/v1/.well-known/agent-card.json` after the agent id for the card.
 
 1. **Hand the mention to another agent.** Copy the `mention:` line and paste
    it into the other agent's `allowed_callers` (via `agent callers add` or

@@ -3,6 +3,8 @@ import type {
   Task,
   Message,
   CreateTaskParams,
+  ListTasksParams,
+  ListTasksResult,
   TaskUpdate,
   TaskStore,
 } from '@a2x/sdk';
@@ -191,6 +193,75 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     // is never read back for request forwarding (the gateway re-sends it every
     // turn), so returning it here changes no execution behavior.
     return rows[0]?.task_json ?? null;
+  }
+
+  async listTasks(params: ListTasksParams): Promise<ListTasksResult> {
+    const pageSize = Math.min(Math.max(params.pageSize ?? 50, 1), 100);
+    const rawOffset = Number(params.pageToken ?? 0);
+    const offset = Number.isSafeInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+    const status = params.status === undefined
+      ? null
+      : String(params.status)
+          .toLowerCase()
+          .replace(/^task_state_/, '')
+          .replaceAll('_', '-');
+    const parsedAfter = params.statusTimestampAfter === undefined
+      ? null
+      : Date.parse(params.statusTimestampAfter);
+
+    // Match InMemoryTaskStore's behavior for an invalid timestamp filter: it
+    // selects no tasks rather than sending an invalid timestamptz to Postgres.
+    if (parsedAfter !== null && !Number.isFinite(parsedAfter)) {
+      return { tasks: [], nextPageToken: '', pageSize, totalSize: 0 };
+    }
+
+    const ownerAgent = this.ownerAgent ?? null;
+    const contextId = params.contextId ?? null;
+    const after = parsedAfter === null ? null : new Date(parsedAfter).toISOString();
+    const countRows = await this.sql<{ total_size: string | number }[]>`
+      SELECT count(*) AS total_size
+      FROM infra.a2a_tasks
+      WHERE (${ownerAgent}::text IS NULL OR owner_agent = ${ownerAgent})
+        AND (${contextId}::text IS NULL OR context_id = ${contextId})
+        AND (${status}::text IS NULL OR task_json->'status'->>'state' = ${status})
+        AND (
+          ${after}::timestamptz IS NULL
+          OR (task_json->'status'->>'timestamp')::timestamptz >= ${after}::timestamptz
+        )
+    `;
+    const totalSize = Number(countRows[0]?.total_size ?? 0);
+    const rows = await this.sql<{ task_json: Task }[]>`
+      SELECT task_json
+      FROM infra.a2a_tasks
+      WHERE (${ownerAgent}::text IS NULL OR owner_agent = ${ownerAgent})
+        AND (${contextId}::text IS NULL OR context_id = ${contextId})
+        AND (${status}::text IS NULL OR task_json->'status'->>'state' = ${status})
+        AND (
+          ${after}::timestamptz IS NULL
+          OR (task_json->'status'->>'timestamp')::timestamptz >= ${after}::timestamptz
+        )
+      ORDER BY updated_at DESC, task_id DESC
+      OFFSET ${offset}
+      LIMIT ${pageSize}
+    `;
+    const tasks = rows.map(({ task_json }) => ({
+      ...task_json,
+      ...(params.historyLength !== undefined
+        ? {
+            history: params.historyLength === 0
+              ? []
+              : (task_json.history ?? []).slice(-params.historyLength),
+          }
+        : {}),
+      ...(!params.includeArtifacts ? { artifacts: undefined } : {}),
+    }));
+    const nextOffset = offset + tasks.length;
+    return {
+      tasks,
+      nextPageToken: nextOffset < totalSize ? String(nextOffset) : '',
+      pageSize,
+      totalSize,
+    };
   }
 
   async updateTask(taskId: string, update: TaskUpdate): Promise<Task> {
