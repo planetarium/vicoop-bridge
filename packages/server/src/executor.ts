@@ -26,6 +26,7 @@ import {
   CALLER_CONTEXT_CAPABILITY,
   CallerContextV1,
   TASK_REPLAY_CAPABILITY,
+  type Part as WirePart,
 } from '@vicoop-bridge/protocol';
 
 /**
@@ -150,6 +151,47 @@ export function appendHistoryMessage(history: Message[], message: Message | unde
   if (message === undefined) return history;
   if (history.some((existing) => existing.messageId === message.messageId)) return history;
   return [...history, message];
+}
+
+/**
+ * Convert the SDK's discriminator-free v1 Part shape into the bridge WS
+ * protocol's v0.3-style discriminated union. v0.3 requests already carry a
+ * `kind` and pass through unchanged; v1 requests use field presence
+ * (`{text}`, `{data}`, `{raw|url}`), which the connected client would reject
+ * if forwarded verbatim.
+ */
+export function partsToWire(parts: Message['parts']): WirePart[] {
+  return parts.map((part) => {
+    const value = part as unknown as Record<string, unknown>;
+    if (value.kind === 'text' || value.kind === 'file' || value.kind === 'data') {
+      return value as unknown as WirePart;
+    }
+    if (typeof value.text === 'string') {
+      return { kind: 'text', text: value.text };
+    }
+    if ('data' in value) {
+      if (
+        typeof value.data !== 'object' ||
+        value.data === null ||
+        Array.isArray(value.data)
+      ) {
+        throw new Error('A2A DataPart.data must be an object');
+      }
+      return { kind: 'data', data: value.data as Record<string, unknown> };
+    }
+    if (typeof value.raw === 'string' || typeof value.url === 'string') {
+      return {
+        kind: 'file',
+        file: {
+          ...(typeof value.filename === 'string' ? { name: value.filename } : {}),
+          ...(typeof value.mediaType === 'string' ? { mimeType: value.mediaType } : {}),
+          ...(typeof value.raw === 'string' ? { bytes: value.raw } : {}),
+          ...(typeof value.url === 'string' ? { uri: value.url } : {}),
+        },
+      };
+    }
+    throw new Error('Unsupported A2A message part');
+  });
 }
 
 /**
@@ -477,10 +519,7 @@ export class WSForwardingExecutor extends AgentExecutor {
       contextId,
       message: {
         role: message.role,
-        // The WS protocol uses the v0.3 wire shape (`{kind, ...}`); the
-        // request-handler hands us `message` unmodified, so we forward
-        // the parts through as-is.
-        parts: message.parts as never,
+        parts: partsToWire(message.parts),
         messageId: message.messageId,
         ...(forwardMetadata !== undefined ? { metadata: forwardMetadata } : {}),
         ...(message.extensions !== undefined ? { extensions: message.extensions } : {}),

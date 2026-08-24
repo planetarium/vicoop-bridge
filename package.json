@@ -12,6 +12,7 @@
     "dev:client": "pnpm --filter @vicoop-bridge/client dev",
     "cli:client": "pnpm --filter @vicoop-bridge/client cli",
     "dev:admin-ui": "pnpm --filter @vicoop-bridge/admin-ui dev",
+    "e2e:a2a-v1": "node scripts/a2a-v1-smoke.mjs",
     "deploy:server": "fly deploy -c packages/server/fly.toml .",
     "changeset": "changeset"
   },
