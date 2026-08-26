@@ -36,6 +36,8 @@ export interface ClientOptions {
   agentCard?: AgentCard;
   backendKind: string;
   backend: Backend;
+  // Exact receiver-local VC issuer trust sent only on the authenticated hello.
+  trustedIdentityIssuers?: string[];
   maxConcurrency?: number;
   // Initial reconnect delay after an unintentional disconnect. Retries use
   // exponential backoff from this value up to `reconnectMaxDelayMs`.
@@ -359,6 +361,13 @@ export class Client {
             version: PROTOCOL_VERSION,
             token: this.opts.token,
             protocolCapabilities: [CALLER_CONTEXT_CAPABILITY, TASK_REPLAY_CAPABILITY],
+            ...(this.opts.trustedIdentityIssuers !== undefined
+              ? {
+                  identityTrust: {
+                    trustedIssuers: this.opts.trustedIdentityIssuers,
+                  },
+                }
+              : {}),
           }),
         );
       };

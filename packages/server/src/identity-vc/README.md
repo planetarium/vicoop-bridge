@@ -1,9 +1,12 @@
-# Mentionable identity VC verifier core
+# Mentionable identity VC verification
 
-This directory is the independently buildable part of vicoop-bridge issue
-#467. It deliberately does not modify `TaskAssignFrame`, `ClientConnection`,
-the executor, backend prompts, authorization, or Agent Card advertisement;
-those integration seams depend on #466.
+This directory implements the verifier and HTTP-boundary integration for
+vicoop-bridge issue #467. The client sends exact receiver-local issuer trust
+on its authenticated hello. When caller-context capability, non-empty trust,
+Postgres replay storage, and a configured public URL are all available, the
+bridge advertises the identity extension and maps successful verification into
+`TaskAssignFrame.caller.presented`. Authentication and authorization remain
+unchanged.
 
 The verifier accepts only the VC 2.0 `PlatformIdentityCredential` profile from
 planetarium/mentionable#613, checks exact receiver-local issuer trust before
@@ -30,5 +33,5 @@ fixture files pinned by revision and SHA-256 when #613 publishes them.
 
 #613 also has not fixed normative TTL and skew values yet. The defaults are a
 10-minute maximum TTL and 30-second skew, both receiver-overridable through
-`PlatformIdentityVerifier` options. The integration PR must align these
-defaults with the final published profile.
+`PlatformIdentityVerifier` options. These defaults must be aligned with the
+final published profile.

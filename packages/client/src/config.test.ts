@@ -163,6 +163,7 @@ test('writeConfig writes JSON at mode 0600 and readConfig round-trips', (t) => {
     agent_id: 'a1',
     backend: 'claude',
     card: '/path/card.json',
+    trusted_identity_issuers: ['did:web:issuer.example'],
     backends: {
       claude: {
         cwd: '/srv/work',
@@ -186,6 +187,7 @@ test('writeConfig writes JSON at mode 0600 and readConfig round-trips', (t) => {
     agent_id: 'a1',
     backend: 'claude',
     card: '/path/card.json',
+    trusted_identity_issuers: ['did:web:issuer.example'],
     backends: {
       claude: {
         cwd: '/srv/work',
@@ -481,6 +483,7 @@ test('overlayConfig: top fields win per key, missing keys fall through from base
     agent_id: 'canonical-agent',
     backend: 'claude',
     card: '/canonical/card.json',
+    trusted_identity_issuers: ['did:web:canonical.example'],
     backends: { claude: { settings: { sandbox: { enabled: true } } } },
   };
   const top = {
@@ -493,6 +496,7 @@ test('overlayConfig: top fields win per key, missing keys fall through from base
     agent_id: 'explicit-agent',
     backend: 'claude',
     card: '/canonical/card.json',
+    trusted_identity_issuers: ['did:web:canonical.example'],
     // Neither side set telemetry, so it falls through as undefined — the
     // fixed-shape overlay always carries the key (see the next test).
     telemetry: undefined,

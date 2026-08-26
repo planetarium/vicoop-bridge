@@ -122,6 +122,7 @@ test('task.fail preserves backend error code and message on status message metad
       agentId: 'agent-1',
       token: 'token',
       protocolCapabilities: [CALLER_CONTEXT_CAPABILITY],
+      identityTrust: { trustedIssuers: ['did:web:issuer.example'] },
       agentCard: {
         name: 'agent',
         version: '0.0.0',
@@ -132,6 +133,9 @@ test('task.fail preserves backend error code and message on status message metad
     assert.deepEqual(registry.getAgent('agent-1')?.protocolCapabilities, [
       CALLER_CONTEXT_CAPABILITY,
     ]);
+    assert.deepEqual(registry.getAgent('agent-1')?.identityTrust, {
+      trustedIssuers: ['did:web:issuer.example'],
+    });
 
     const sink = makeSink();
     registry.bindTask({

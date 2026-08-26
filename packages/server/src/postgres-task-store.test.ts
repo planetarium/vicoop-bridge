@@ -200,7 +200,12 @@ test('stripSensitiveMetadata with preserveEnvelope still scrubs bearer/principal
         messageId: 'm',
         role: 'agent',
         parts: [{ kind: 'text', text: 'x' }],
-        metadata: { _bearerToken: 'secret', _principalId: 'eth:0x1', keep: 1 },
+        metadata: {
+          _bearerToken: 'secret',
+          _principalId: 'eth:0x1',
+          _identityVcPresented: [{ profile: { displayName: 'private' } }],
+          keep: 1,
+        },
       },
     },
     metadata: { [OAI]: { chat_completions_request: { model: 'gpt-4', messages: [] } } },
@@ -211,6 +216,7 @@ test('stripSensitiveMetadata with preserveEnvelope still scrubs bearer/principal
   const sm = (persisted.status.message as { metadata: Record<string, unknown> }).metadata;
   assert.equal(sm._bearerToken, undefined, 'bearer token scrubbed even with preserveEnvelope');
   assert.equal(sm._principalId, undefined, 'principal scrubbed even with preserveEnvelope');
+  assert.equal(sm._identityVcPresented, undefined, 'normalized VC handoff is never persisted');
   assert.equal(sm.keep, 1, 'non-sensitive message metadata retained');
 });
 

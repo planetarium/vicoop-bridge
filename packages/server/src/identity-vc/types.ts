@@ -1,10 +1,14 @@
-import type { PresentedCallerIdentityV1 } from '@vicoop-bridge/protocol';
+import {
+  MENTIONABLE_IDENTITY_VC_EXTENSION_URI,
+  type PresentedCallerIdentityV1,
+} from '@vicoop-bridge/protocol';
 
 export const MENTIONABLE_IDENTITY_PROFILE_URI =
-  'https://mentionable.dev/ns/identity/v0.2' as const;
+  MENTIONABLE_IDENTITY_VC_EXTENSION_URI;
 export const MENTIONABLE_IDENTITY_CONTEXT_URI =
   'https://mentionable.dev/ns/identity/v0.2/context.jsonld' as const;
 export const VC_V2_CONTEXT_URI = 'https://www.w3.org/ns/credentials/v2' as const;
+export const IDENTITY_VC_PRESENTED_METADATA_KEY = '_identityVcPresented' as const;
 
 export const DEFAULT_IDENTITY_VC_LIMITS = {
   maxCarrierBytes: 64 * 1024,

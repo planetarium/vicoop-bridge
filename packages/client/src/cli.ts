@@ -652,6 +652,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     agentCard,
     backendKind: args.backend,
     backend,
+    trustedIdentityIssuers: args.trustedIdentityIssuers,
     logLevel: logger.level,
     // Daemon entrypoint: a fatal terminal close (currently 4014 "client
     // deleted") should drop the process with a non-zero exit so

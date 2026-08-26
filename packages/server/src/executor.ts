@@ -28,6 +28,7 @@ import {
   TASK_REPLAY_CAPABILITY,
   type Part as WirePart,
 } from '@vicoop-bridge/protocol';
+import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
 
 /**
  * What the executor needs to run the x402 payment gate: a DB handle for the
@@ -424,15 +425,22 @@ export class WSForwardingExecutor extends AgentExecutor {
     const rawMetadata = (message as { metadata?: Record<string, unknown> }).metadata;
     const principalId =
       typeof rawMetadata?._principalId === 'string' ? rawMetadata._principalId : undefined;
+    const presented = rawMetadata?.[IDENTITY_VC_PRESENTED_METADATA_KEY];
     const forwardMetadata = stripInternalMetadata(rawMetadata);
     const requestedExtensions = message.extensions;
     const clientSupportsCallerContext =
       this.registry
         .getAgent(this.agentId)
         ?.protocolCapabilities?.includes(CALLER_CONTEXT_CAPABILITY) === true;
+    const hasPresented = Array.isArray(presented) && presented.length > 0;
     const callerResult =
-      clientSupportsCallerContext && principalId !== undefined
-        ? CallerContextV1.safeParse({ authenticated: { principalId } })
+      clientSupportsCallerContext && (principalId !== undefined || hasPresented)
+        ? CallerContextV1.safeParse({
+            ...(principalId !== undefined
+              ? { authenticated: { principalId } }
+              : {}),
+            ...(hasPresented ? { presented } : {}),
+          })
         : undefined;
     const caller = callerResult?.success ? callerResult.data : undefined;
     if (callerResult && !callerResult.success) {
@@ -442,7 +450,7 @@ export class WSForwardingExecutor extends AgentExecutor {
       logEvent('caller_context_omitted', {
         agentId: this.agentId,
         taskId,
-        reason: 'invalid_authenticated_principal',
+        reason: 'invalid_transport_owned_context',
       });
     }
 

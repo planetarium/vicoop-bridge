@@ -175,6 +175,7 @@ async function authenticateAndRegister(
     ownerEmail: client.owner_email,
     backendKind: frame.backendKind,
     protocolCapabilities: frame.protocolCapabilities,
+    identityTrust: frame.identityTrust,
     agentCard: resolvedCard.agentCard,
     allowedCallers: client.allowed_callers,
     ...(x402Pricing !== undefined ? { x402Pricing } : {}),

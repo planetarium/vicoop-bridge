@@ -184,16 +184,24 @@ export class PlatformIdentityVerifier {
       }
       throw new Error(`Blocked document URL: ${url}`);
     };
-    const verification = await verifyCredential({
-      credential,
-      suite: this.suite,
-      purpose: new CredentialIssuancePurpose(),
-      documentLoader,
-      now: this.now(),
-      // Receiver-local checks above preserve the bridge's exact inclusive
-      // boundary semantics; the library remains responsible for VC syntax.
-      maxClockSkew: Number.POSITIVE_INFINITY,
-    });
+    let verification: Awaited<ReturnType<typeof verifyCredential>>;
+    try {
+      verification = await verifyCredential({
+        credential,
+        suite: this.suite,
+        purpose: new CredentialIssuancePurpose(),
+        documentLoader,
+        now: this.now(),
+        // Receiver-local checks above preserve the bridge's exact inclusive
+        // boundary semantics; the library remains responsible for VC syntax.
+        maxClockSkew: Number.POSITIVE_INFINITY,
+      });
+    } catch {
+      // Digital Bazaar rejects some malformed proof encodings by throwing
+      // rather than returning verified:false. Optional evidence must never
+      // turn that into a failed outer A2A request.
+      return reject('invalid_signature');
+    }
     if (!verification.verified) {
       return reject('invalid_signature');
     }
