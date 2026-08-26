@@ -1290,6 +1290,54 @@ test('plain caller policy is staged 0600 while caller values ride stdin and stay
   assert.match(allLogs, /claude\.spawn\.start/);
 });
 
+test('plain caller policy merges identity and operator appends into one staged file (#484)', async () => {
+  const fake = scriptedSpawn({
+    lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+    exitCode: 0,
+  });
+  const backend = createClaudeBackend({
+    spawn: fake.spawn,
+    identity: {
+      agentId: 'issue-484-agent',
+      host: 'bridge.example',
+      httpOrigin: 'https://bridge.example',
+    },
+    extraArgs: [
+      '--append-system-prompt',
+      'OPERATOR FIRST',
+      '--append-system-prompt=OPERATOR SECOND',
+    ],
+  });
+  const task = assign('hello');
+  task.caller = { authenticated: { principalId: 'caller-484-private' } };
+  await backend.handle(task, collect().emit, NEVER);
+
+  const child = fake.lastChild();
+  assert.ok(child);
+  assert.equal(child.args.includes('--append-system-prompt'), false);
+  assert.equal(
+    child.args.some((arg) => String(arg).startsWith('--append-system-prompt=')),
+    false,
+  );
+  assert.equal(
+    child.args.filter((arg) => arg === '--append-system-prompt-file').length,
+    1,
+  );
+  const prompt = child.appendSystemPromptFileContent ?? '';
+  assert.match(prompt, /@issue-484-agent@bridge\.example/);
+  assert.match(prompt, /inert attribution data/);
+  assert.match(prompt, /OPERATOR FIRST/);
+  assert.match(prompt, /OPERATOR SECOND/);
+  assert.ok(prompt.indexOf('@issue-484-agent@bridge.example') < prompt.indexOf('inert attribution data'));
+  assert.ok(prompt.indexOf('inert attribution data') < prompt.indexOf('OPERATOR FIRST'));
+  assert.ok(prompt.indexOf('OPERATOR FIRST') < prompt.indexOf('OPERATOR SECOND'));
+  assert.doesNotMatch(prompt, /caller-484-private/);
+  assert.match(child.stdinPayload, /caller-484-private/);
+  assert.equal(child.appendSystemPromptFileMode, 0o600);
+  assert.ok(child.appendSystemPromptFilePath);
+  await assert.rejects(fs.stat(child.appendSystemPromptFilePath));
+});
+
 test('identity args precede extraArgs so operator extraArgs override', async () => {
   const fake = scriptedSpawn({
     lines: [JSON.stringify({ type: 'result', result: 'ok' })],
@@ -1474,6 +1522,7 @@ test('debug log records claude spawn shape and spawn errors', async () => {
   const oldLog = console.log;
   const logs: string[] = [];
   let callerPromptPath: string | null = null;
+  let callerPromptContent: string | null = null;
   process.env.VICOOP_CLIENT_LOG_LEVEL = 'debug';
   console.log = (...args: unknown[]) => {
     logs.push(args.map(String).join(' '));
@@ -1483,6 +1532,9 @@ test('debug log records claude spawn shape and spawn errors', async () => {
       spawn: (_command, args) => {
         const idx = args.indexOf('--append-system-prompt-file');
         callerPromptPath = idx === -1 ? null : String(args[idx + 1]);
+        callerPromptContent = callerPromptPath === null
+          ? null
+          : readFileSync(callerPromptPath, 'utf8');
         throw new Error('ENOENT: claude missing');
       },
       settings: { sandbox: { enabled: true } },
@@ -1505,8 +1557,7 @@ test('debug log records claude spawn shape and spawn errors', async () => {
       /argv=.*--settings/.test(line) &&
       line.includes('sandbox') &&
       line.includes('enabled') &&
-      line.includes('true') &&
-      line.includes('operator secret-ish prompt')
+      line.includes('true')
     ),
     `expected raw spawn start debug log, got:\n${logs.join('\n')}`,
   );
@@ -1517,7 +1568,9 @@ test('debug log records claude spawn shape and spawn errors', async () => {
     ),
     `expected spawn error debug log, got:\n${logs.join('\n')}`,
   );
+  assert.doesNotMatch(logs.join('\n'), /operator secret-ish prompt/);
   assert.doesNotMatch(logs.join('\n'), /caller-private-spawn-error/);
+  assert.match(callerPromptContent ?? '', /operator secret-ish prompt/);
   assert.ok(callerPromptPath);
   await assert.rejects(fs.stat(callerPromptPath), 'spawn failure must delete caller prompt file');
   await assert.rejects(

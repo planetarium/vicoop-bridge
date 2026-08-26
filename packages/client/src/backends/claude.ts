@@ -133,10 +133,12 @@ export interface ClaudeBackendOptions {
   // Fetch uri-only inbound FileParts under the shared HTTPS/SSRF/size/MIME
   // policy. Enabled by default; set enabled:false to require inline bytes.
   fetchUriPolicy?: FetchUriPolicy;
-  // Agent's own A2A identity. When present, an `--append-system-prompt` is
+  // Agent's own A2A identity. When present, an appended system prompt is
   // injected on every spawned `claude` so the model can recognise its own
   // mention (`@<agentId>@<host>`) / acct in user messages and respond
   // directly instead of attempting an outbound A2A call to its own address.
+  // It normally rides `--append-system-prompt`; plain A2A tasks with caller
+  // context merge it into the caller-policy `--append-system-prompt-file`.
   // See issue #128 for the failure mode this prevents.
   identity?: AgentIdentity;
   // Inline Claude Code settings JSON forwarded to each spawned `claude` via
@@ -1265,9 +1267,9 @@ export function openaiToolsToCallerToolDefs(
   return out.length > 0 ? out : null;
 }
 
-// Build the system-prompt text injected via `--append-system-prompt` for the
-// openai-compat path on the claude backend (#213). The caller's tools are
-// exposed to the model through the native MCP tool surface
+// Build the system-prompt text injected through Claude's append-system-prompt
+// channel for the openai-compat path on the claude backend (#213). The
+// caller's tools are exposed to the model through the native MCP tool surface
 // (`caller-tools-mcp.ts`), so the prompt no longer teaches a JSON-emit
 // contract or duplicates the tool list — the model discovers tools via
 // `tools/list` and invokes them through its normal `tool_use` surface.
@@ -1715,12 +1717,33 @@ export function createClaudeBackend(
     opts.sendFileMcp && opts.sendFileMcp.allowedRoots.length > 0
       ? opts.sendFileMcp
       : null;
-  // Static per-backend args (placed before extraArgs so an operator-supplied
-  // `--append-system-prompt` in extraArgs concatenates AFTER ours rather than
-  // being ignored — claude appends each occurrence in order).
-  const identityArgs: readonly string[] = opts.identity
-    ? ['--append-system-prompt', buildSelfIdentitySystemPrompt(opts.identity)]
+  // Static per-backend identity prompt. It normally rides argv, before
+  // extraArgs, so an operator-supplied `--append-system-prompt` concatenates
+  // AFTER ours. Plain A2A tasks with caller context instead fold every inline
+  // append into the staged caller-policy file below: claude rejects mixing
+  // `--append-system-prompt` with `--append-system-prompt-file`.
+  const identityPrompt = opts.identity
+    ? buildSelfIdentitySystemPrompt(opts.identity)
+    : undefined;
+  const identityArgs: readonly string[] = identityPrompt
+    ? ['--append-system-prompt', identityPrompt]
     : [];
+  const extraInlineAppendPrompts: string[] = [];
+  const extraArgsWithoutInlineAppend: string[] = [];
+  for (let i = 0; i < extraArgs.length; i += 1) {
+    const arg = extraArgs[i];
+    if (arg === '--append-system-prompt' && i + 1 < extraArgs.length) {
+      extraInlineAppendPrompts.push(extraArgs[i + 1]);
+      i += 1;
+      continue;
+    }
+    const inlinePrefix = '--append-system-prompt=';
+    if (arg.startsWith(inlinePrefix)) {
+      extraInlineAppendPrompts.push(arg.slice(inlinePrefix.length));
+      continue;
+    }
+    extraArgsWithoutInlineAppend.push(arg);
+  }
   // Sandbox-on by default. Operators get the OS-level sandbox (Seatbelt on
   // macOS, bubblewrap on Linux) without having to opt in via
   // `CLAUDE_SETTINGS_JSON`, and `failIfUnavailable: true` makes the daemon
@@ -2546,17 +2569,25 @@ export function createClaudeBackend(
       const modelArgs: readonly string[] = envelopeModel
         ? ['--model', envelopeModel]
         : [];
-      // Plain A2A runs keep their normal system prompt and receive only the
-      // static caller-context handling rule through a per-spawn append.
-      // Dynamic caller values ride in the user content blocks above.
+      // Plain A2A runs keep their normal system prompt and receive the static
+      // caller-context handling rule through a per-spawn append. Dynamic
+      // caller values ride in the user content blocks above. When identity or
+      // operator append prompts are also present, merge them into this one
+      // staged file in their original order. Claude treats the inline and file
+      // append flags as mutually exclusive, so emitting both aborts at spawn.
       let callerArgs: readonly string[] = [];
+      let identityArgsForTask = identityArgs;
+      let extraArgsForTask = extraArgs;
       if (!envelope && callerPrompt) {
         try {
+          const bridgePrompt = appendCallerContextInstruction(identityPrompt, task.caller) ?? '';
           callerArgs = stageSystemPrompt(
             '--append-system-prompt-file',
-            'caller-context-policy.txt',
-            appendCallerContextInstruction(undefined, task.caller) ?? '',
+            'bridge-append-prompt.txt',
+            [bridgePrompt, ...extraInlineAppendPrompts].join('\n\n'),
           );
+          identityArgsForTask = [];
+          extraArgsForTask = extraArgsWithoutInlineAppend;
         } catch (err) {
           cleanupStagedSystemPromptFile();
           rollbackFreshSession();
@@ -2566,7 +2597,7 @@ export function createClaudeBackend(
             taskId: task.taskId,
             error: normalizeTaskFailError({
               code: 'spawn_failed',
-              message: `failed to stage caller-context system prompt file: ${errorMessage(err)}`,
+              message: `failed to stage plain A2A system prompt file: ${errorMessage(err)}`,
             }),
           });
           return;
@@ -2667,7 +2698,7 @@ export function createClaudeBackend(
         ...(isResume ? ['--resume', sessionId] : ['--session-id', sessionId]),
         ...mcpConfigArgs,
         ...mcpAllowedToolsArgs,
-        ...identityArgs,
+        ...identityArgsForTask,
         ...callerArgs,
         ...modelArgs,
         ...openaiCompatArgs,
@@ -2676,7 +2707,7 @@ export function createClaudeBackend(
         ...nativeTurnCapArgs,
         '--include-partial-messages',
         ...settingsArgs,
-        ...extraArgs,
+        ...extraArgsForTask,
       ];
 
       // openai-compat tasks spawn in the isolation cwd (no *project* CLAUDE.md /
