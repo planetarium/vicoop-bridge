@@ -87,6 +87,24 @@ test('trusted identity issuers resolve from flag, config, then compatibility env
   ]);
 });
 
+test('an explicitly empty identity trust flag or config disables the env fallback', () => {
+  const fromFlag = mergeClientArgs(
+    { token: 't', agentId: 'a', trustedIdentityIssuers: '  ' },
+    { trusted_identity_issuers: ['did:web:config.example'] },
+    'did:web:env.example',
+  );
+  assert.equal(fromFlag.ok, true);
+  if (fromFlag.ok) assert.deepEqual(fromFlag.args.trustedIdentityIssuers, []);
+
+  const fromConfig = mergeClientArgs(
+    { token: 't', agentId: 'a' },
+    { trusted_identity_issuers: [] },
+    'did:web:env.example',
+  );
+  assert.equal(fromConfig.ok, true);
+  if (fromConfig.ok) assert.deepEqual(fromConfig.args.trustedIdentityIssuers, []);
+});
+
 test('default backend is echo when neither flag nor config sets it', () => {
   const r = mergeClientArgs(
     { server: 'wss://x', token: 't', agentId: 'a' },

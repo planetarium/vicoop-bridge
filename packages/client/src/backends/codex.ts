@@ -8,7 +8,12 @@ import {
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
-import { appendCallerContext, renderCallerContext } from '../caller-context.js';
+import {
+  appendCallerContextInstruction,
+  neutralizeCallerContextMarkers,
+  renderCallerContext,
+  wrapUserMessageWithCallerContext,
+} from '../caller-context.js';
 import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
@@ -550,7 +555,7 @@ function chatHistoryContentToCodexParts(
     }
   }
   if (flat.length === 0) return [];
-  return [{ type: partType, text: flat.join('\n\n') }];
+  return [{ type: partType, text: neutralizeCallerContextMarkers(flat.join('\n\n')) }];
 }
 
 // Map an openai-compat `chat_history` to OpenAI Responses API items
@@ -620,7 +625,7 @@ export function historyToInjectItems(
             type: 'function_call',
             call_id: call.id,
             name: fn.name,
-            arguments: args,
+            arguments: neutralizeCallerContextMarkers(args),
           });
         }
         continue;
@@ -633,7 +638,7 @@ export function historyToInjectItems(
     out.push({
       type: 'function_call_output',
       call_id: entry.tool_call_id,
-      output: entry.content,
+      output: neutralizeCallerContextMarkers(entry.content),
     });
   }
   return out;
@@ -1124,7 +1129,7 @@ export function createCodexBackend(
         // the directive because that's the actual a2a-agent surface the
         // mention can land on.
         const callerPrompt = renderCallerContext(task.caller);
-        const systemPrompt = appendCallerContext(
+        const systemPrompt = appendCallerContextInstruction(
           envelope
             ? composeNativeDevInstructions(envelopeSystem, envelopeToolChoice)
             : identityDevInstructions,
@@ -1188,12 +1193,16 @@ export function createCodexBackend(
           : null;
 
         try {
-          const userInput = isToolContinuation
+          const callerUserPrompt = wrapUserMessageWithCallerContext(
+            isToolContinuation ? '' : mapped.prompt,
+            task.caller,
+          );
+          const userInput = isToolContinuation && callerUserPrompt.length === 0
             ? [
                 { type: 'text' as const, text: '', text_elements: [] as never[] },
                 ...buildUserInput('', mapped.imageFiles),
               ]
-            : buildUserInput(mapped.prompt, mapped.imageFiles);
+            : buildUserInput(callerUserPrompt, mapped.imageFiles);
 
           let client: AppServerRpcClient;
           try {

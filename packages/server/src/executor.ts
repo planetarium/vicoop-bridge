@@ -375,6 +375,19 @@ export class WSForwardingExecutor extends AgentExecutor {
     const taskId = task.id;
     const contextId = task.contextId ?? taskId;
 
+    // The HTTP boundary places normalized identity in request metadata only as
+    // an internal handoff to this executor. Snapshot it, then delete it before
+    // any payment-gate or early-return path can append the original Message to
+    // task history or return it through the SDK. `_principalId` remains until
+    // persistence derives the existing task-owner scope.
+    const rawMetadata = (message as { metadata?: Record<string, unknown> }).metadata;
+    const principalId =
+      typeof rawMetadata?._principalId === 'string' ? rawMetadata._principalId : undefined;
+    const presented = rawMetadata?.[IDENTITY_VC_PRESENTED_METADATA_KEY];
+    if (rawMetadata) delete rawMetadata[IDENTITY_VC_PRESENTED_METADATA_KEY];
+    const forwardMetadata = stripInternalMetadata(rawMetadata);
+    const requestedExtensions = message.extensions;
+
     // x402 payment gate. Runs before the task is bound or forwarded, so an
     // unpaid call never reaches the connected agent and never consumes its
     // capacity. `settlement` is set only when a payment was verified and is
@@ -422,12 +435,6 @@ export class WSForwardingExecutor extends AgentExecutor {
     // `_principalId` / `_bearerToken` convention). `_principalId` flows into
     // the binding so accept-path logs in ws.ts can correlate caller →
     // completed task without exposing it to the client agent over the wire.
-    const rawMetadata = (message as { metadata?: Record<string, unknown> }).metadata;
-    const principalId =
-      typeof rawMetadata?._principalId === 'string' ? rawMetadata._principalId : undefined;
-    const presented = rawMetadata?.[IDENTITY_VC_PRESENTED_METADATA_KEY];
-    const forwardMetadata = stripInternalMetadata(rawMetadata);
-    const requestedExtensions = message.extensions;
     const clientSupportsCallerContext =
       this.registry
         .getAgent(this.agentId)
@@ -453,7 +460,6 @@ export class WSForwardingExecutor extends AgentExecutor {
         reason: 'invalid_transport_owned_context',
       });
     }
-
     const replayCapable =
       this.registry
         .getAgent(this.agentId)

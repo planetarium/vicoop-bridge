@@ -14,10 +14,9 @@ export const DEFAULT_IDENTITY_VC_LIMITS = {
   maxCarrierBytes: 64 * 1024,
   maxCredentialBytes: 32 * 1024,
   maxCredentials: 4,
-  // #613 deliberately leaves the normative timing values to the published
-  // profile. Keep these receiver-local and overridable until that lands.
+  // Mentionable PlatformIdentityCredential v0.2 normative receiver limits.
   maxTtlMs: 10 * 60 * 1000,
-  clockSkewMs: 30 * 1000,
+  clockSkewMs: 60 * 1000,
 } as const;
 
 export interface IdentityVcLimits {

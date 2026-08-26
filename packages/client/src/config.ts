@@ -313,11 +313,9 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
   const card = asString(raw.card);
   if (card) c.card = card;
   const trustedIdentityIssuers = asStringArray(raw.trusted_identity_issuers);
-  if (trustedIdentityIssuers) {
-    const bounded = trustedIdentityIssuers.filter((issuer) => issuer.length <= 512);
-    if (bounded.length > 0) {
-      c.trusted_identity_issuers = [...new Set(bounded)].slice(0, 64);
-    }
+  if (Array.isArray(raw.trusted_identity_issuers)) {
+    const bounded = (trustedIdentityIssuers ?? []).filter((issuer) => issuer.length <= 512);
+    c.trusted_identity_issuers = [...new Set(bounded)].slice(0, 64);
   }
   // Telemetry is a closed enum: only the two known string literals are
   // honoured. Anything else (typo, bool, number) is dropped — and a dropped

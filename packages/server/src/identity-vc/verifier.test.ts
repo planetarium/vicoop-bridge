@@ -202,7 +202,7 @@ test('verified identity boundaries match PresentedCallerIdentityV1', async () =>
     mutateUnsecured(unsecured) {
       unsecured.credentialSubject.id = boundarySubject;
       unsecured.credentialSubject.method = boundaryMethod;
-      unsecured.credentialSubject.profile = { displayName: boundaryDisplayName };
+      unsecured.credentialSubject.profile = { display_name: boundaryDisplayName };
     },
   });
   const verifier = new PlatformIdentityVerifier({
@@ -223,7 +223,7 @@ test('verified identity boundaries match PresentedCallerIdentityV1', async () =>
       unsecured.credentialSubject.method = 'm'.repeat(257);
     },
     (unsecured: UnsecuredPlatformIdentityCredential) => {
-      unsecured.credentialSubject.profile = { displayName: 'd'.repeat(257) };
+      unsecured.credentialSubject.profile = { display_name: 'd'.repeat(257) };
     },
   ]) {
     const oversized = await createIdentityVcFixture({ mutateUnsecured });
@@ -253,6 +253,42 @@ test('modified payload fails signature verification', async () => {
     ok: false,
     rejection: { code: 'invalid_signature' },
   });
+});
+
+test('published 60-second clock skew accepts a credential 45 seconds early', async () => {
+  const { credential, didDocument } = await createIdentityVcFixture({
+    validFrom: '2026-08-18T14:00:45.000Z',
+    validUntil: '2026-08-18T14:05:45.000Z',
+  });
+  const verifier = new PlatformIdentityVerifier({
+    trustedIssuers: [credential.issuer],
+    resolver: resolverFor(didDocument),
+    replayStore: new MemoryReplayStore(),
+    now,
+  });
+  assert.equal((await verifier.verify(credential, binding)).ok, true);
+});
+
+test('signature failure refreshes once when rotation retains the method id', async () => {
+  const { credential, didDocument } = await createIdentityVcFixture();
+  const stale = structuredClone(didDocument);
+  const staleMethod = stale.verificationMethod?.[0] as Record<string, unknown>;
+  const oldKey = String(staleMethod.publicKeyMultibase);
+  staleMethod.publicKeyMultibase = `${oldKey.slice(0, -1)}${oldKey.endsWith('1') ? '2' : '1'}`;
+  let calls = 0;
+  const verifier = new PlatformIdentityVerifier({
+    trustedIssuers: [credential.issuer],
+    resolver: {
+      async resolve(_issuer, options) {
+        calls += 1;
+        return options?.refresh ? didDocument : stale;
+      },
+    },
+    replayStore: new MemoryReplayStore(),
+    now,
+  });
+  assert.equal((await verifier.verify(credential, binding)).ok, true);
+  assert.equal(calls, 2);
 });
 
 test('controller and assertionMethod linkage are required, with one rotation refresh', async () => {

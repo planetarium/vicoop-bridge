@@ -210,6 +210,16 @@ test('writeConfig writes JSON at mode 0600 and readConfig round-trips', (t) => {
   }
 });
 
+test('readConfig preserves an explicit empty trusted issuer list', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-empty-trust-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, 'config.json');
+  writeFileSync(file, JSON.stringify({ trusted_identity_issuers: [] }));
+  const config = readConfig(file);
+  assert.ok(config);
+  assert.deepEqual(config.trusted_identity_issuers, []);
+});
+
 test('readConfig returns null when file does not exist', () => {
   const path = join(tmpdir(), `vicoop-cfg-missing-${Date.now()}.json`);
   assert.equal(readConfig(path), null);

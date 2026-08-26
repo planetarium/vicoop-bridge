@@ -8,7 +8,11 @@ import {
   type UsageWindow,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
-import { appendCallerContext } from '../caller-context.js';
+import {
+  appendCallerContextInstruction,
+  neutralizeCallerContextMarkers,
+  renderCallerContext,
+} from '../caller-context.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { createLogger, type Logger } from '../logger.js';
@@ -303,6 +307,24 @@ export interface ChatCompletionResponse {
   };
 }
 
+function neutralizeToolCallArguments(toolCalls: unknown[]): unknown[] {
+  return toolCalls.map((call) => {
+    if (!call || typeof call !== 'object' || Array.isArray(call)) return call;
+    const raw = call as Record<string, unknown>;
+    const fn = raw.function;
+    if (!fn || typeof fn !== 'object' || Array.isArray(fn)) return call;
+    const rawFunction = fn as Record<string, unknown>;
+    if (typeof rawFunction.arguments !== 'string') return call;
+    return {
+      ...raw,
+      function: {
+        ...rawFunction,
+        arguments: neutralizeCallerContextMarkers(rawFunction.arguments),
+      },
+    };
+  });
+}
+
 function errorMessage(e: unknown): string {
   if (e instanceof Error) return e.message;
   if (typeof e === 'string') return e;
@@ -377,7 +399,7 @@ export function historyToChatCompletionMessages(
     if (entry.role === 'user') {
       out.push({
         role: 'user',
-        content: openAIMessageContentToString(entry.content),
+        content: neutralizeCallerContextMarkers(openAIMessageContentToString(entry.content)),
       });
       continue;
     }
@@ -388,21 +410,21 @@ export function historyToChatCompletionMessages(
           content:
             entry.content === null
               ? null
-              : openAIMessageContentToString(entry.content),
-          tool_calls: entry.tool_calls,
+              : neutralizeCallerContextMarkers(openAIMessageContentToString(entry.content)),
+          tool_calls: neutralizeToolCallArguments(entry.tool_calls),
         });
         continue;
       }
       out.push({
         role: 'assistant',
-        content: openAIMessageContentToString(entry.content),
+        content: neutralizeCallerContextMarkers(openAIMessageContentToString(entry.content)),
       });
       continue;
     }
     const tool: ChatCompletionMessage = {
       role: 'tool',
       tool_call_id: entry.tool_call_id,
-      content: entry.content,
+      content: neutralizeCallerContextMarkers(entry.content),
     };
     if (entry.name) tool.name = entry.name;
     out.push(tool);
@@ -435,10 +457,11 @@ function openAIMessageContentToString(
 // doc's "Per-role message JSON examples" section:
 //   1. system (concatenated from envelope's `messages[]` system/developer
 //      entries; one entry)
-//   2. chat_history entries (prior user / assistant text turns + tool
+//   2. optional bridge-verified caller attribution as an ordinary user message
+//   3. chat_history entries (prior user / assistant text turns + tool
 //      round-trips, derived from envelope's `messages[]` minus the
 //      trailing user) mapped 1:1 to OpenAI Chat Completions messages
-//   3. current user turn (flattened from A2A parts)
+//   4. current user turn (flattened from A2A parts)
 //
 // The user turn comes last so the model sees prior context before the
 // new instruction. When `userContent` is null (tool-continuation edge
@@ -449,10 +472,14 @@ export function buildMessages(
   system: string | undefined,
   chatHistory: OpenAICompatHistoryEntry[] | null,
   userContent: string | null,
+  callerContext?: string,
 ): ChatCompletionMessage[] {
   const messages: ChatCompletionMessage[] = [];
   if (system) {
     messages.push({ role: 'system', content: system });
+  }
+  if (callerContext) {
+    messages.push({ role: 'user', content: callerContext });
   }
   if (chatHistory) {
     for (const m of historyToChatCompletionMessages(chatHistory)) {
@@ -460,7 +487,7 @@ export function buildMessages(
     }
   }
   if (userContent !== null) {
-    messages.push({ role: 'user', content: userContent });
+    messages.push({ role: 'user', content: neutralizeCallerContextMarkers(userContent) });
   }
   return messages;
 }
@@ -469,8 +496,8 @@ export function buildMessages(
 //   - `model`: the gateway-resolved model id so the CLI dispatches to the
 //     caller's selection rather than the binary's DEFAULT_MODEL (#302).
 //   - `tools` / `tool_choice`: verbatim off the envelope.
-//   - `messages`: the pre-assembled array (system + chat_history + current
-//     user turn).
+//   - `messages`: the pre-assembled array (system policy + optional caller
+//     attribution user message + chat_history + current user turn).
 //
 // Besides those, a `prompt_cache_key` is attached for prompt-cache stickiness
 // (see below). `reasoning_effort`, `parallel_tool_calls`, and every Group B /
@@ -1375,10 +1402,11 @@ export function createVicoopCodexBackend(
         );
       }
 
-      const system = appendCallerContext(
+      const system = appendCallerContextInstruction(
         envelope ? collectSystemFromMessages(envelope.messages) : undefined,
         task.caller,
       );
+      const callerPrompt = renderCallerContext(task.caller);
       const chatHistory =
         envelope && Array.isArray(envelope.messages)
           ? chatHistoryFromMessages(envelope.messages)
@@ -1426,7 +1454,7 @@ export function createVicoopCodexBackend(
         effectiveEnvelope = rest as OpenAICompatRequestEnvelope;
       }
 
-      const messages = buildMessages(system, chatHistory, userContent);
+      const messages = buildMessages(system, chatHistory, userContent, callerPrompt);
       // Pass `task.contextId` as the prompt-cache fallback key so successive
       // turns of one A2A conversation stay sticky to the same upstream cache
       // shard (#11). A caller-supplied `envelope.prompt_cache_key` still wins.

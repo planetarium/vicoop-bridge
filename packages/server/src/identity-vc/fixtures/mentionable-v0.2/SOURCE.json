@@ -1,0 +1,23 @@
+{
+  "repository": "https://github.com/planetarium/mentionable",
+  "pullRequest": 614,
+  "commit": "988a0922cfd9a77211790aa387f543f180f33e5b",
+  "sha256": {
+    "invalid/challenge-mismatch.json": "2ab195c472d40130b79f127f8fe6f980269a39fb03d577e6a7086a15df335206",
+    "invalid/expired.json": "cc85a5ce72747846a278c61e20e61d91259b5e3eaa9bf1ce2069bf9fdc15f047",
+    "invalid/issuer-controller-mismatch.json": "dc4fc9998ef6cf54c71edc14d68b95f968cc547bce9a57165639adfb862b2345",
+    "invalid/malformed-context.json": "cad742813db9198e914798687cf1bf8bb947bf237fda50718da59c82c321c2a4",
+    "invalid/malformed-type.json": "c2178855b3361c119c2f286fdfcf9850c2edf93b62dc6896b4b2921405f81e34",
+    "invalid/not-yet-valid.json": "4266237fd5813dad1fd76f5af2aa1afbf04084e9fd5197961f755d54458ceefd",
+    "invalid/tampered-payload.json": "dc23c5974c74865166331d985dfff43001ebf54481e4c2e54fd40b92406084d2",
+    "invalid/tampered-signature.json": "416548bf429251c9ad0979240ddba712121a8c0ac9f4ff98b9757cd34286d76e",
+    "invalid/ttl-exceeded.json": "14dc826d6e9524172cfd758f4220ef5c15454cecd8d79ec67e0e62fce16fc62d",
+    "invalid/wrong-domain.json": "5409d9886d1884482ce26570f030cd27435d930bf35a640d8be27f07f3f0179e",
+    "issuer/did.json": "69fb0b7baf94bd293507b88bff2eb4846f2449f07a7cb7fbb0ed08029c5fa4f4",
+    "issuer/mismatch-did.json": "f41033190df7f60565ba37fbf2e9dfb9d4b5baeaa9dc33f6535f0e8306ee91e7",
+    "manifest.json": "38cbe937035cf628585c5ac4b1773e951baa658a10f003a7dde169a3fc5f354d",
+    "replay/replay-scenario.json": "0b70628130489c19f918c2130edeca1bacf7b841b95f2254a238815d935a654d",
+    "valid/direct-user.json": "e5787347872942bd3554f3836949f867071bb249732b09f296ab6b76c3b77f3a",
+    "valid/platform-mention.json": "b9ba3e73fe787e87d11a5762263ca92bcac30eb08c93166f78a5bd1c42d582d6"
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "description": "Replay contract scenario (spec §10). The embedded credential is valid and verifies on first presentation. A second presentation of the same (issuer, domain, challenge) tuple within the validity window (plus skew) MUST be rejected by verifiers that maintain a replay cache. Verifiers without a replay cache provide short-TTL request binding only and MUST NOT claim replay safety.",
+  "tuple": {
+    "issuer": "did:web:connector.fixtures.mentionable.dev",
+    "domain": "@fixture-agent@agents.example",
+    "challenge": "8c9d0e1f-2a3b-4ce4-95f6-7a8b9c0d1e2f"
+  },
+  "presentations": [
+    { "order": 1, "expect": "accept", "note": "First presentation within the validity window." },
+    {
+      "order": 2,
+      "expect": "reject",
+      "reason": "replay",
+      "note": "Same (issuer, domain, challenge) tuple presented again. Verifiers with a replay cache MUST reject; cache-less verifiers accept but MUST NOT be described as replay-safe."
+    }
+  ],
+  "credential": {
+    "@context": [
+      "https://www.w3.org/ns/credentials/v2",
+      "https://mentionable.dev/ns/identity/v0.2/context.jsonld"
+    ],
+    "id": "urn:uuid:aac9d1e3-0f1a-4be4-9352-7f8a9b0c1d2e",
+    "type": ["VerifiableCredential", "PlatformIdentityCredential"],
+    "issuer": "did:web:connector.fixtures.mentionable.dev",
+    "validFrom": "2026-08-19T00:00:00Z",
+    "validUntil": "2026-08-19T00:05:00Z",
+    "credentialSubject": {
+      "id": "slack:T0FIXTURE/U0FIXTURE",
+      "method": "urn:mentionable:auth:slack-workspace-member:v0.1",
+      "assurance": "platform",
+      "platform": { "provider": "slack", "workspace_id": "T0FIXTURE" },
+      "profile": {
+        "display_name": "Fixture User",
+        "username": "fixture-user",
+        "locale": "en-US",
+        "timezone": "UTC"
+      },
+      "source": { "connector": "connector.fixtures.mentionable.dev", "channel": "C0FIXTURE" }
+    },
+    "proof": {
+      "type": "DataIntegrityProof",
+      "created": "2026-08-19T00:00:00Z",
+      "verificationMethod": "did:web:connector.fixtures.mentionable.dev#fixture-2026-08",
+      "cryptosuite": "eddsa-jcs-2022",
+      "proofPurpose": "assertionMethod",
+      "domain": "@fixture-agent@agents.example",
+      "challenge": "8c9d0e1f-2a3b-4ce4-95f6-7a8b9c0d1e2f",
+      "@context": [
+        "https://www.w3.org/ns/credentials/v2",
+        "https://mentionable.dev/ns/identity/v0.2/context.jsonld"
+      ],
+      "proofValue": "z2XUULJ2RoH3ed9BvDAoZfXesj9Kw7TFxmAhgPbYMPAoGF5RAuMnaiXDxXGNeTnoT9c3vK9VZLyHrXJ743ekgjwry"
+    }
+  }
+}

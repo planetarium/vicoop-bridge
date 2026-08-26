@@ -320,6 +320,11 @@ test('executor sends authenticated principal only to caller-context-capable clie
     });
     assert.equal(frame.message.metadata, undefined, 'raw/forged identity is fully stripped');
   }
+  assert.equal(
+    (message.metadata as Record<string, unknown>)[IDENTITY_VC_PRESENTED_METADATA_KEY],
+    undefined,
+    'request-local normalized identity must not survive into SDK task history or responses',
+  );
 
   const binding = registry.getBinding('t-caller')!;
   binding.sink.pushStatus({

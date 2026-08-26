@@ -6,6 +6,7 @@ import { PostgresTaskStore } from './postgres-task-store.js';
 import { logEvent } from './log.js';
 import { sweepExpiredX402Offerings } from './x402/store.js';
 import { watchX402PricingChanges } from './x402/pricing-watch.js';
+import { sweepExpiredIdentityReplays } from './identity-vc/index.js';
 import type { Sql } from './db.js';
 import type { GoogleConfig } from './auth/google-oauth.js';
 
@@ -31,6 +32,12 @@ async function cleanupExpiredTransients(db: Sql): Promise<void> {
     await db`DELETE FROM used_siwe_nonces WHERE expires_at <= now()`;
   } catch (err) {
     console.error('[server] used_siwe_nonces cleanup failed:', err);
+  }
+  try {
+    const deleted = await sweepExpiredIdentityReplays(db);
+    if (deleted > 0) logEvent('identity_vc_replays_swept', { deleted });
+  } catch (err) {
+    console.error('[server] identity_vc_replays cleanup failed:', err);
   }
   try {
     // Lazy expiry hides a lapsed offering from `get` but never deletes it, so

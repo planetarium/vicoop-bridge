@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import WebSocket from 'ws';
 import { OPENAI_COMPAT_EXTENSION_URI, type Part } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
-import { renderCallerContext, wrapOpenClawUserMessage } from '../caller-context.js';
+import { renderCallerContext, wrapUserMessageWithCallerContext } from '../caller-context.js';
 import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import {
@@ -1457,7 +1457,7 @@ export function createOpenclawBackend(
       // explicit untrusted boundary so session reuse cannot retain caller A
       // when the next turn belongs to caller B (or has no caller at all).
       const callerPrompt = renderCallerContext(task.caller);
-      mapped.input.message = wrapOpenClawUserMessage(mapped.input.message, task.caller);
+      mapped.input.message = wrapUserMessageWithCallerContext(mapped.input.message, task.caller);
 
       let gw: GatewayClient;
       try {

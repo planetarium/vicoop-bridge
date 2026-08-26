@@ -1,0 +1,38 @@
+{
+  "@context": [
+    "https://mentionable.dev/ns/identity/v0.2/context.jsonld",
+    "https://www.w3.org/ns/credentials/v2"
+  ],
+  "id": "urn:uuid:55d4e6f8-5a6b-4c9d-8e0f-2a3b4c5d6e7f",
+  "type": ["VerifiableCredential", "PlatformIdentityCredential"],
+  "issuer": "did:web:connector.fixtures.mentionable.dev",
+  "validFrom": "2026-08-19T00:00:00Z",
+  "validUntil": "2026-08-19T00:05:00Z",
+  "credentialSubject": {
+    "id": "slack:T0FIXTURE/U0FIXTURE",
+    "method": "urn:mentionable:auth:slack-workspace-member:v0.1",
+    "assurance": "platform",
+    "platform": { "provider": "slack", "workspace_id": "T0FIXTURE" },
+    "profile": {
+      "display_name": "Fixture User",
+      "username": "fixture-user",
+      "locale": "en-US",
+      "timezone": "UTC"
+    },
+    "source": { "connector": "connector.fixtures.mentionable.dev", "channel": "C0FIXTURE" }
+  },
+  "proof": {
+    "type": "DataIntegrityProof",
+    "created": "2026-08-19T00:00:00Z",
+    "verificationMethod": "did:web:connector.fixtures.mentionable.dev#fixture-2026-08",
+    "cryptosuite": "eddsa-jcs-2022",
+    "proofPurpose": "assertionMethod",
+    "domain": "@fixture-agent@agents.example",
+    "challenge": "3d4e5f6a-7b8c-4d9e-a0f1-2b3c4d5e6f7a",
+    "@context": [
+      "https://www.w3.org/ns/credentials/v2",
+      "https://mentionable.dev/ns/identity/v0.2/context.jsonld"
+    ],
+    "proofValue": "z67qSCLHHLHKNzyLjqUMyuMfrYVUhSNHSpNQEB14k1THEAPVPsWbz6KQF71eCazJSMLGKAmvPirNRNyFx99iYiMAq"
+  }
+}

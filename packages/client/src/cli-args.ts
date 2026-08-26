@@ -241,12 +241,13 @@ function pickModelsList(v: string | undefined): string[] | undefined {
 }
 
 function pickExactIdentifierList(v: string | undefined): string[] | undefined {
-  const entries = (v ?? '')
+  if (v === undefined) return undefined;
+  const entries = v
     .split(',')
     .map((s) => s.trim())
     .filter((s) => s.length > 0 && s.length <= 512);
   const unique = [...new Set(entries)];
-  return unique.length > 0 ? unique.slice(0, 64) : undefined;
+  return unique.slice(0, 64);
 }
 
 function pickConfiguredExactIdentifiers(v: string[] | undefined): string[] | undefined {
@@ -254,7 +255,7 @@ function pickConfiguredExactIdentifiers(v: string[] | undefined): string[] | und
   const unique = [
     ...new Set(v.map((issuer) => issuer.trim()).filter((issuer) => issuer.length > 0 && issuer.length <= 512)),
   ];
-  return unique.length > 0 ? unique.slice(0, 64) : undefined;
+  return unique.slice(0, 64);
 }
 
 function pickSandbox(v: string | undefined): CodexSandboxMode | undefined {

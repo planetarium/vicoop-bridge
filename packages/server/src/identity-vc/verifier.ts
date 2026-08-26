@@ -79,9 +79,9 @@ function normalize(credential: UnverifiedPlatformIdentityCredential): VerifiedPr
   const observed = subject.observedInvocation;
   const profile = subject.profile;
   const provider = stringField(platform, 'provider');
-  const workspaceId = stringField(platform, 'workspaceId');
+  const workspaceId = stringField(platform, 'workspace_id');
   const target = stringField(observed, 'target');
-  const displayName = stringField(profile, 'displayName');
+  const displayName = stringField(profile, 'display_name');
   const username = stringField(profile, 'username');
 
   return {
@@ -155,10 +155,12 @@ export class PlatformIdentityVerifier {
     }
     if (!hasValidDidDocumentShape(resolved)) return reject('key_fetch_failed');
     let doc = resolved;
+    let refreshed = false;
     let method = findVerificationMethod(doc, credential.proof.verificationMethod);
     if (method === undefined && doc.id === credential.issuer) {
       try {
         resolved = await this.options.resolver.resolve(credential.issuer, { refresh: true });
+        refreshed = true;
         if (!hasValidDidDocumentShape(resolved)) return reject('key_fetch_failed');
         doc = resolved;
         method = findVerificationMethod(doc, credential.proof.verificationMethod);
@@ -175,36 +177,62 @@ export class PlatformIdentityVerifier {
       return reject('issuer_controller_mismatch');
     }
 
-    const documentLoader = async (url: string) => {
-      if (url === method.id) {
-        return { contextUrl: null, documentUrl: url, document: method };
+    const verifyWith = async (
+      candidateDoc: ResolvedDidDocument,
+      candidateMethod: DidVerificationMethod,
+    ): Promise<boolean> => {
+      const documentLoader = async (url: string) => {
+        if (url === candidateMethod.id) {
+          return { contextUrl: null, documentUrl: url, document: candidateMethod };
+        }
+        if (url === candidateDoc.id) {
+          return { contextUrl: null, documentUrl: url, document: candidateDoc };
+        }
+        throw new Error(`Blocked document URL: ${url}`);
+      };
+      try {
+        const verification = await verifyCredential({
+          credential,
+          suite: this.suite,
+          purpose: new CredentialIssuancePurpose(),
+          documentLoader,
+          now: this.now(),
+          // Receiver-local checks above preserve the bridge's exact inclusive
+          // boundary semantics; the library remains responsible for VC syntax.
+          maxClockSkew: Number.POSITIVE_INFINITY,
+        });
+        return verification.verified;
+      } catch {
+        // Digital Bazaar rejects some malformed proof encodings by throwing
+        // rather than returning verified:false. Optional evidence must never
+        // turn that into a failed outer A2A request.
+        return false;
       }
-      if (url === doc.id) {
-        return { contextUrl: null, documentUrl: url, document: doc };
-      }
-      throw new Error(`Blocked document URL: ${url}`);
     };
-    let verification: Awaited<ReturnType<typeof verifyCredential>>;
-    try {
-      verification = await verifyCredential({
-        credential,
-        suite: this.suite,
-        purpose: new CredentialIssuancePurpose(),
-        documentLoader,
-        now: this.now(),
-        // Receiver-local checks above preserve the bridge's exact inclusive
-        // boundary semantics; the library remains responsible for VC syntax.
-        maxClockSkew: Number.POSITIVE_INFINITY,
-      });
-    } catch {
-      // Digital Bazaar rejects some malformed proof encodings by throwing
-      // rather than returning verified:false. Optional evidence must never
-      // turn that into a failed outer A2A request.
-      return reject('invalid_signature');
+
+    let verified = await verifyWith(doc, method);
+    if (!verified && !refreshed) {
+      // Rotation may replace key material while retaining the verification
+      // method id. Retry once through the resolver's bounded refresh path.
+      try {
+        resolved = await this.options.resolver.resolve(credential.issuer, { refresh: true });
+      } catch {
+        return reject('key_fetch_failed');
+      }
+      if (!hasValidDidDocumentShape(resolved)) return reject('key_fetch_failed');
+      doc = resolved;
+      method = findVerificationMethod(doc, credential.proof.verificationMethod);
+      if (
+        doc.id !== credential.issuer ||
+        method === undefined ||
+        method.controller !== credential.issuer ||
+        !assertionMethodApproves(doc, credential.proof.verificationMethod)
+      ) {
+        return reject('issuer_controller_mismatch');
+      }
+      verified = await verifyWith(doc, method);
     }
-    if (!verification.verified) {
-      return reject('invalid_signature');
-    }
+    if (!verified) return reject('invalid_signature');
 
     // Resolution and cryptographic verification are untrusted-duration work.
     // Re-evaluate expiration immediately before consuming the replay tuple.

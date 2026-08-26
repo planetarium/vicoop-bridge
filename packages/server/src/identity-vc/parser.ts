@@ -33,13 +33,13 @@ const credentialSchema = z.object({
     assurance: summary.optional(),
     platform: z.object({
       provider: summary.optional(),
-      workspaceId: summary.optional(),
+      workspace_id: summary.optional(),
     }).passthrough().optional(),
     observedInvocation: z.object({
       target: identifier.optional(),
     }).passthrough().optional(),
     profile: z.object({
-      displayName: summary.optional(),
+      display_name: summary.optional(),
       username: summary.optional(),
     }).passthrough().optional(),
   }).passthrough(),

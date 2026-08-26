@@ -60,10 +60,10 @@ export async function createIdentityVcFixture(overrides: {
       id: 'slack:T123/U456',
       method: 'urn:mentionable:auth:slack-workspace-member:v0.1',
       assurance: 'platform',
-      platform: { provider: 'slack', workspaceId: 'T123', channelId: 'discard-me' },
+      platform: { provider: 'slack', workspace_id: 'T123', channelId: 'discard-me' },
       observedInvocation: { target: '@agent@bridge.example', threadId: 'discard-me' },
       profile: {
-        displayName: 'Alice',
+        display_name: 'Alice',
         username: 'alice',
         avatar: 'https://private.example/avatar',
       },
