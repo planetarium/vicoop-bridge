@@ -766,11 +766,14 @@ process. Set it when the released bundle lives outside the repository you
 want Claude to edit. (Same flag is shared with the Codex backend; it's
 scoped to whichever backend `--backend` selects.)
 
-The Claude backend also injects a small `--append-system-prompt` on every
+The Claude backend also injects a small appended system prompt on every
 spawned `claude` telling it its own A2A mention (`@<agentId>@<host>`) so
 the model recognises self-references in user messages and doesn't try to
-a2a-call its own address (see #128). No configuration required — it's
-derived from `--agentId` and the host part of `--server`.
+a2a-call its own address (see #128). It normally uses
+`--append-system-prompt`; plain A2A tasks carrying caller context merge it
+into the staged caller-policy `--append-system-prompt-file` instead. No
+configuration is required — the identity is derived from `--agentId` and
+the host part of `--server`.
 
 > **Note on host derivation.** The injected mention uses the server URL's
 > host (e.g. `wss://bridge.example.com/ws` → `bridge.example.com`). The
