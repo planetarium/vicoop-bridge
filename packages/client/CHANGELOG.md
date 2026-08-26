@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.39.0
+
+### Minor Changes
+
+- 5225390: Add receiver-local trusted VC issuer configuration and deliver verified presented caller identity to supported backends as isolated user-role attribution data.
+
 ## 0.38.1
 
 ### Patch Changes
