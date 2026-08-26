@@ -7,7 +7,6 @@ import {
   type TaskStore,
 } from '@a2x/sdk';
 import {
-  CALLER_CONTEXT_CAPABILITY,
   MENTIONABLE_IDENTITY_VC_EXTENSION_URI,
   SIWE_BEARER_AUTH_EXTENSION_URI,
 } from '@vicoop-bridge/protocol';
@@ -17,6 +16,7 @@ import { isX402ExtensionUri } from '@a2x/sdk/x402';
 import { X402_FOUNDATION_EXTENSION_URI } from './x402/gate.js';
 import { logEvent } from './log.js';
 import type { Sql } from './db.js';
+import { supportsCallerContext } from './caller-context.js';
 
 export interface AgentA2XOptions {
   publicUrl: string | undefined;
@@ -140,7 +140,7 @@ export function buildAgentA2XServer(
   const bridgeWillEmitIdentityVc =
     Boolean(opts.publicUrl) &&
     Boolean(opts.db) &&
-    conn.protocolCapabilities?.includes(CALLER_CONTEXT_CAPABILITY) === true &&
+    supportsCallerContext(conn.protocolCapabilities) &&
     (conn.identityTrust?.trustedIssuers.length ?? 0) > 0;
   for (const extension of wireExtensions) {
     if (restricted && extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI) {

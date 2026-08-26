@@ -12,6 +12,7 @@ import {
 } from '@a2x/sdk';
 import {
   CALLER_CONTEXT_CAPABILITY,
+  CALLER_CONTEXT_V2_CAPABILITY,
   OPENAI_COMPAT_EXTENSION_URI,
   parseDownFrame,
   TASK_REPLAY_CAPABILITY,
@@ -338,6 +339,116 @@ test('executor sends authenticated principal only to caller-context-capable clie
   for await (const _event of gen) void _event;
 });
 
+test('executor prefers the v2 principal and attestations shape for new clients', async () => {
+  const { ws, sent } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'caller-v2',
+    clientId: 'c-v2',
+    ownerPrincipal: 'eth:0x0',
+    protocolCapabilities: [CALLER_CONTEXT_CAPABILITY, CALLER_CONTEXT_V2_CAPABILITY],
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+  const executor = new WSForwardingExecutor('caller-v2', registry, noopTaskStore());
+  const task = {
+    id: 't-caller-v2',
+    contextId: 'ctx-caller-v2',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-caller-v2',
+    metadata: {
+      _principalId: 'siwe:0xabc',
+      [IDENTITY_VC_PRESENTED_METADATA_KEY]: [
+        {
+          credentialId: 'urn:uuid:credential-v2',
+          issuer: 'did:web:issuer.example',
+          subject: 'slack:T123/U456',
+          method: 'platform',
+        },
+      ],
+    },
+  } as unknown as Message;
+
+  const gen = executor.executeStream(task, message);
+  const firstEvent = gen.next();
+  const frame = parseDownFrame(sent[0]!);
+  assert.equal(frame.type, 'task.assign');
+  if (frame.type === 'task.assign') {
+    assert.deepEqual(frame.caller, {
+      principal: { id: 'siwe:0xabc' },
+      attestations: [
+        {
+          credentialId: 'urn:uuid:credential-v2',
+          issuer: 'did:web:issuer.example',
+          subject: 'slack:T123/U456',
+          method: 'platform',
+        },
+      ],
+    });
+  }
+
+  const binding = registry.getBinding(task.id)!;
+  binding.sink.pushStatus({
+    taskId: task.id,
+    contextId: task.contextId!,
+    final: true,
+    status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
+  });
+  binding.sink.finish();
+  await firstEvent;
+  for await (const _event of gen) void _event;
+});
+
+test('executor omits invalid canonical caller context without dropping task.assign', async () => {
+  const { ws, sent } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'caller-invalid',
+    clientId: 'c-invalid',
+    ownerPrincipal: 'eth:0x0',
+    protocolCapabilities: [CALLER_CONTEXT_V2_CAPABILITY],
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+  const executor = new WSForwardingExecutor('caller-invalid', registry, noopTaskStore());
+  const task = {
+    id: 't-caller-invalid',
+    contextId: 'ctx-caller-invalid',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-caller-invalid',
+    metadata: { _principalId: 'x'.repeat(513) },
+  } as unknown as Message;
+
+  const gen = executor.executeStream(task, message);
+  const firstEvent = gen.next();
+  const frame = parseDownFrame(sent[0]!);
+  assert.equal(frame.type, 'task.assign');
+  if (frame.type === 'task.assign') assert.equal(frame.caller, undefined);
+
+  const binding = registry.getBinding(task.id)!;
+  binding.sink.pushStatus({
+    taskId: task.id,
+    contextId: task.contextId!,
+    final: true,
+    status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
+  });
+  binding.sink.finish();
+  await firstEvent;
+  for await (const _event of gen) void _event;
+});
+
 test('executor can send verified presented identity on a public request without inventing authenticated context', async () => {
   const { ws, sent } = makeWsCapture();
   const registry = new Registry();
@@ -379,15 +490,16 @@ test('executor can send verified presented identity on a public request without 
   const frame = parseDownFrame(sent[0]!);
   assert.equal(frame.type, 'task.assign');
   if (frame.type === 'task.assign') {
-    assert.equal(frame.caller?.authenticated, undefined);
-    assert.deepEqual(frame.caller?.presented, [
-      {
-        credentialId: 'urn:uuid:credential-2',
-        issuer: 'did:web:issuer.example',
-        subject: 'slack:T123/U456',
-        method: 'platform',
-      },
-    ]);
+    assert.deepEqual(frame.caller, {
+      presented: [
+        {
+          credentialId: 'urn:uuid:credential-2',
+          issuer: 'did:web:issuer.example',
+          subject: 'slack:T123/U456',
+          method: 'platform',
+        },
+      ],
+    });
     assert.equal(frame.message.metadata, undefined);
   }
 

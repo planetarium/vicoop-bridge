@@ -1978,7 +1978,7 @@ test('openai-compat keeps caller values in user input and only a static rule in 
   const turn = findRequest(fake.lastChild().stdinFrames(), 'turn/start') as {
     params?: { input?: Array<{ type?: string; text?: string }> };
   };
-  assert.match(turn.params?.input?.[0]?.text ?? '', /Authenticated principal: "principal-real"/);
+  assert.match(turn.params?.input?.[0]?.text ?? '', /Principal: "principal-real"/);
 });
 
 // Default (no `identity` set): developerInstructions stays whatever it was

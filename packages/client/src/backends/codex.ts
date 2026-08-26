@@ -10,6 +10,7 @@ import {
 import type { Backend } from '../backend.js';
 import {
   appendCallerContextInstruction,
+  callerContextSessionKey,
   neutralizeCallerContextMarkers,
   renderCallerContext,
   wrapUserMessageWithCallerContext,
@@ -1238,7 +1239,7 @@ export function createCodexBackend(
           const sessionReuseEligible = envelope === null && sessionTtlMs > 0;
           const tNow = now();
           if (sessionReuseEligible) evictExpired(tNow - sessionTtlMs);
-          const callerKey = callerPrompt ?? '';
+          const callerKey = callerContextSessionKey(task.caller);
           const stored = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
           const existing = stored?.callerKey === callerKey ? stored : undefined;
           let writeId = 0;

@@ -347,7 +347,11 @@ test('Client reconnects after WebSocket close and sends hello again', async () =
       if (frame.type === 'hello') {
         assert.equal(frame.agentId, 'agent-1');
         assert.equal(frame.token, 'client-token');
-        assert.deepEqual(frame.protocolCapabilities, ['caller-context-v1', TASK_REPLAY_CAPABILITY]);
+        assert.deepEqual(frame.protocolCapabilities, [
+          'caller-context-v2',
+          'caller-context-v1',
+          TASK_REPLAY_CAPABILITY,
+        ]);
         assert.deepEqual(frame.identityTrust, {
           trustedIssuers: ['did:web:issuer.example'],
         });

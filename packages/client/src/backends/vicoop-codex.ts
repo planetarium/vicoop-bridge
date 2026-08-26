@@ -1,5 +1,5 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
   type BridgeUsage,
@@ -10,6 +10,7 @@ import {
 import type { Backend } from '../backend.js';
 import {
   appendCallerContextInstruction,
+  callerContextSessionKey,
   neutralizeCallerContextMarkers,
   renderCallerContext,
 } from '../caller-context.js';
@@ -1455,10 +1456,15 @@ export function createVicoopCodexBackend(
       }
 
       const messages = buildMessages(system, chatHistory, userContent, callerPrompt);
-      // Pass `task.contextId` as the prompt-cache fallback key so successive
-      // turns of one A2A conversation stay sticky to the same upstream cache
-      // shard (#11). A caller-supplied `envelope.prompt_cache_key` still wins.
-      const body = buildCallBody(effectiveEnvelope, messages, task.contextId);
+      // Keep the historical context-only key when caller context is absent.
+      // Otherwise scope the fallback by canonical structured identity so v1
+      // and v2 remain equivalent without coupling isolation to prompt wording.
+      // A caller-supplied `envelope.prompt_cache_key` still wins.
+      const callerKey = callerContextSessionKey(task.caller);
+      const fallbackCacheKey = callerKey
+        ? `${task.contextId}:caller-${createHash('sha256').update(callerKey).digest('hex').slice(0, 16)}`
+        : task.contextId;
+      const body = buildCallBody(effectiveEnvelope, messages, fallbackCacheKey);
       let serialized: string;
       try {
         // `stream:true` switches `vicoop-codex serve`'s `/v1/chat/completions`

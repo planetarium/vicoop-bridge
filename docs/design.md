@@ -121,6 +121,46 @@ acknowledged again without reopening or completing a reused task ID.
 
 Background: issue #474.
 
+### 4.2 Caller context versions and trust boundary
+
+Caller identity is an optional, bridge-owned field on `task.assign`. New
+clients advertise both `caller-context-v2` and `caller-context-v1`; the server
+chooses v2 first, falls back to the strict v1 shape for older clients, and
+omits `caller` for clients supporting neither version.
+
+The v2 wire shape is:
+
+```json
+{
+  "caller": {
+    "principal": { "id": "eth:0xabc" },
+    "actor": { "id": "service:gateway" },
+    "attestations": [
+      {
+        "credentialId": "urn:uuid:...",
+        "issuer": "did:web:identity.example.com",
+        "subject": "slack:T123/U456",
+        "method": "urn:mentionable:auth:slack-workspace-member:v0.1"
+      }
+    ]
+  }
+}
+```
+
+`principal` is the effective security principal established by the bridge.
+`actor` is present only for a distinct directly authenticated entity acting on
+its behalf. `attestations` are verified external claims and remain attribution
+data; verification alone does not make their subject a principal. The v1
+adapter maps principal to `authenticated.principalId` and attestations to
+`presented`; v1 cannot represent a distinct actor.
+
+Both wire versions normalize to one canonical structured representation before
+backend rendering or session scoping. Dynamic identity values are carried only
+at user priority, while privileged prompts contain a static rule saying that
+the values are inert data. Claude, Codex, and OpenClaw session isolation—and
+the vicoop-codex fallback prompt-cache key—derive from the canonical identity,
+so equivalent v1/v2 frames have identical scope even if prompt wording changes.
+
 ## 5. Client Backends
 
 ```bash

@@ -23,12 +23,16 @@ import { X402Gate, createPostgresX402Context, type X402Settlement } from './x402
 import { readTaskUsage } from './x402/usage.js';
 import type { Sql } from './db.js';
 import {
-  CALLER_CONTEXT_CAPABILITY,
-  CallerContextV1,
   TASK_REPLAY_CAPABILITY,
+  type CallerAttestationV2,
   type Part as WirePart,
 } from '@vicoop-bridge/protocol';
 import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
+import {
+  createCanonicalCallerContext,
+  selectCallerContextVersion,
+  serializeCallerContext,
+} from './caller-context.js';
 
 /**
  * What the executor needs to run the x402 payment gate: a DB handle for the
@@ -435,22 +439,22 @@ export class WSForwardingExecutor extends AgentExecutor {
     // `_principalId` / `_bearerToken` convention). `_principalId` flows into
     // the binding so accept-path logs in ws.ts can correlate caller →
     // completed task without exposing it to the client agent over the wire.
-    const clientSupportsCallerContext =
-      this.registry
-        .getAgent(this.agentId)
-        ?.protocolCapabilities?.includes(CALLER_CONTEXT_CAPABILITY) === true;
+    const callerContextVersion = selectCallerContextVersion(
+      this.registry.getAgent(this.agentId)?.protocolCapabilities,
+    );
     const hasPresented = Array.isArray(presented) && presented.length > 0;
-    const callerResult =
-      clientSupportsCallerContext && (principalId !== undefined || hasPresented)
-        ? CallerContextV1.safeParse({
-            ...(principalId !== undefined
-              ? { authenticated: { principalId } }
+    const hasCallerInput = principalId !== undefined || hasPresented;
+    const canonicalCaller =
+      callerContextVersion !== undefined && hasCallerInput
+        ? createCanonicalCallerContext({
+            ...(principalId !== undefined ? { principalId } : {}),
+            ...(hasPresented
+              ? { attestations: presented as CallerAttestationV2[] }
               : {}),
-            ...(hasPresented ? { presented } : {}),
           })
         : undefined;
-    const caller = callerResult?.success ? callerResult.data : undefined;
-    if (callerResult && !callerResult.success) {
+    const caller = serializeCallerContext(canonicalCaller, callerContextVersion);
+    if (callerContextVersion !== undefined && hasCallerInput && caller === undefined) {
       // Do not put the raw principal or schema details in logs. An invalid
       // transport-owned value is omitted instead of emitting a task.assign
       // frame that the upgraded client would reject wholesale.

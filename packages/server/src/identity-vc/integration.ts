@@ -1,6 +1,6 @@
 import type { Message } from '@a2x/sdk';
-import { CALLER_CONTEXT_CAPABILITY } from '@vicoop-bridge/protocol';
 import type { ClientConnection } from '../registry.js';
+import { supportsCallerContext } from '../caller-context.js';
 import { extractAndStripIdentityCarrier } from './carrier.js';
 import { PlatformIdentityVerifier } from './verifier.js';
 import type {
@@ -51,7 +51,7 @@ export async function prepareIdentityVcAtBoundary(
   const enabled =
     options.expectedDomain !== undefined &&
     trustedIssuers.length > 0 &&
-    options.conn.protocolCapabilities?.includes(CALLER_CONTEXT_CAPABILITY) === true;
+    supportsCallerContext(options.conn.protocolCapabilities);
   if (!enabled || extracted.credentials.length === 0) {
     return { accepted: 0, rejections };
   }

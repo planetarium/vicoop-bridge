@@ -342,6 +342,10 @@ Mentionable VC presented identity. Configure it with the JSON array above or
 compatibility env input `VICOOP_TRUSTED_IDENTITY_ISSUERS` accepts the same
 comma-separated form and is the sole daemon runtime env exception. Empty or
 absent trust disables VC verification and identity-extension advertisement.
+Verified claims arrive on new clients as `caller.attestations`; the legacy
+`caller.presented` name is used only when the connected client supports v1.
+These claims provide attribution and are not authorization principals. A
+bridge-authenticated caller appears separately as `caller.principal`.
 
 ### Telemetry (opt-in)
 
