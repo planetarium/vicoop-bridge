@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.39.1
+
+### Patch Changes
+
+- bddcb46: Merge Claude identity and caller-policy append prompts into one staged file so plain A2A tasks with caller context can spawn successfully.
+
 ## 0.39.0
 
 ### Minor Changes
