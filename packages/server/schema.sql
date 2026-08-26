@@ -901,6 +901,27 @@ CREATE POLICY used_siwe_nonces_postgraphile ON used_siwe_nonces
 
 COMMENT ON TABLE used_siwe_nonces IS E'@omit';
 
+-- One-time replay claims for verified Mentionable PlatformIdentityCredential
+-- proofs. Only a digest of (issuer, domain, challenge) is retained; the raw VC,
+-- proof and presentation fields never enter Postgres. The primary key makes
+-- consume atomic across bridge instances.
+CREATE TABLE IF NOT EXISTS identity_vc_replays (
+  digest       BYTEA PRIMARY KEY,
+  expires_at   TIMESTAMPTZ NOT NULL,
+  used_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS identity_vc_replays_expires_idx
+  ON identity_vc_replays(expires_at);
+
+ALTER TABLE identity_vc_replays ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS identity_vc_replays_postgraphile ON identity_vc_replays;
+CREATE POLICY identity_vc_replays_postgraphile ON identity_vc_replays
+  FOR ALL TO app_postgraphile USING (true) WITH CHECK (true);
+
+COMMENT ON TABLE identity_vc_replays IS E'@omit';
+
 -- ============================================================
 -- 6c. x402 payment offerings
 -- ============================================================

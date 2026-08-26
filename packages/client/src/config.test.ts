@@ -163,6 +163,7 @@ test('writeConfig writes JSON at mode 0600 and readConfig round-trips', (t) => {
     agent_id: 'a1',
     backend: 'claude',
     card: '/path/card.json',
+    trusted_identity_issuers: ['did:web:issuer.example'],
     backends: {
       claude: {
         cwd: '/srv/work',
@@ -186,6 +187,7 @@ test('writeConfig writes JSON at mode 0600 and readConfig round-trips', (t) => {
     agent_id: 'a1',
     backend: 'claude',
     card: '/path/card.json',
+    trusted_identity_issuers: ['did:web:issuer.example'],
     backends: {
       claude: {
         cwd: '/srv/work',
@@ -206,6 +208,16 @@ test('writeConfig writes JSON at mode 0600 and readConfig round-trips', (t) => {
     const mode = statSync(path).mode & 0o777;
     assert.equal(mode, 0o600, `expected 0o600, got 0o${mode.toString(8)}`);
   }
+});
+
+test('readConfig preserves an explicit empty trusted issuer list', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-empty-trust-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, 'config.json');
+  writeFileSync(file, JSON.stringify({ trusted_identity_issuers: [] }));
+  const config = readConfig(file);
+  assert.ok(config);
+  assert.deepEqual(config.trusted_identity_issuers, []);
 });
 
 test('readConfig returns null when file does not exist', () => {
@@ -481,6 +493,7 @@ test('overlayConfig: top fields win per key, missing keys fall through from base
     agent_id: 'canonical-agent',
     backend: 'claude',
     card: '/canonical/card.json',
+    trusted_identity_issuers: ['did:web:canonical.example'],
     backends: { claude: { settings: { sandbox: { enabled: true } } } },
   };
   const top = {
@@ -493,6 +506,7 @@ test('overlayConfig: top fields win per key, missing keys fall through from base
     agent_id: 'explicit-agent',
     backend: 'claude',
     card: '/canonical/card.json',
+    trusted_identity_issuers: ['did:web:canonical.example'],
     // Neither side set telemetry, so it falls through as undefined — the
     // fixed-shape overlay always carries the key (see the next test).
     telemetry: undefined,

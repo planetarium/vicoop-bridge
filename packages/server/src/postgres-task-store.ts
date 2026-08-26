@@ -12,6 +12,7 @@ import { TaskState, TERMINAL_STATES } from '@a2x/sdk';
 import { OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import type { Sql, SqlExecutor } from './db.js';
 import { logEvent, truncate } from './log.js';
+import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
 
 const MAX_CONTEXT_TASKS = 10;
 
@@ -45,10 +46,16 @@ function extractOwnerPrincipal(task: Task): string | undefined {
 }
 
 function stripMessageMetadata(msg: Message): Message {
-  const { _bearerToken, _principalId, ...rest } =
-    (msg as MessageWithMetadata).metadata ?? {};
+  const metadata = (msg as MessageWithMetadata).metadata ?? {};
+  const {
+    _bearerToken,
+    _principalId,
+    [IDENTITY_VC_PRESENTED_METADATA_KEY]: _presented,
+    ...rest
+  } = metadata;
   void _bearerToken;
   void _principalId;
+  void _presented;
   const clean = Object.keys(rest).length ? rest : undefined;
   if (clean) return { ...msg, metadata: clean };
   const { metadata: _meta, ...m } = msg as MessageWithMetadata;

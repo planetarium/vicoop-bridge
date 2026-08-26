@@ -10,7 +10,11 @@ import {
   type Part,
 } from '@vicoop-bridge/protocol';
 import type { Backend } from '../backend.js';
-import { appendCallerContext, renderCallerContext } from '../caller-context.js';
+import {
+  appendCallerContextInstruction,
+  neutralizeCallerContextMarkers,
+  renderCallerContext,
+} from '../caller-context.js';
 import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
@@ -2196,6 +2200,16 @@ export function createClaudeBackend(
         }
       }
 
+      // Dynamic caller values are ordinary user-role data, never privileged
+      // system text. Neutralize lookalike tags in every caller-controlled text
+      // block, then prepend the one transport-created attribution block.
+      for (const block of mapped.blocks) {
+        if (block.type === 'text') block.text = neutralizeCallerContextMarkers(block.text);
+      }
+      if (callerPrompt) {
+        mapped.blocks.unshift({ type: 'text', text: callerPrompt });
+      }
+
       // Final guard: a request with no text/files AND no history would
       // mint an envelope with zero content blocks. Claude rejects
       // those; surface the original empty_prompt to the caller.
@@ -2463,7 +2477,7 @@ export function createClaudeBackend(
           openaiCompatArgs = stageSystemPrompt(
             '--system-prompt-file',
             'system-prompt.txt',
-            appendCallerContext(
+            appendCallerContextInstruction(
               buildOpenAICompatNativeSystemPrompt(
                 envelopeSystem,
                 envelopeTools,
@@ -2532,16 +2546,16 @@ export function createClaudeBackend(
       const modelArgs: readonly string[] = envelopeModel
         ? ['--model', envelopeModel]
         : [];
-      // Plain A2A runs keep their normal system prompt and receive caller
-      // attribution through a per-spawn append. OpenAI-compat runs already
-      // carry the same block in their per-task staged replacement above.
+      // Plain A2A runs keep their normal system prompt and receive only the
+      // static caller-context handling rule through a per-spawn append.
+      // Dynamic caller values ride in the user content blocks above.
       let callerArgs: readonly string[] = [];
       if (!envelope && callerPrompt) {
         try {
           callerArgs = stageSystemPrompt(
             '--append-system-prompt-file',
-            'caller-context.txt',
-            callerPrompt,
+            'caller-context-policy.txt',
+            appendCallerContextInstruction(undefined, task.caller) ?? '',
           );
         } catch (err) {
           cleanupStagedSystemPromptFile();

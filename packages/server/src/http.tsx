@@ -59,6 +59,14 @@ import { Landing } from './landing.js';
 import { logEvent } from './log.js';
 import { buildAgentA2XServer, type AgentA2XOptions } from './agent-card.js';
 import {
+  PostgresIdentityReplayStore,
+  SafeDidWebResolver,
+  canonicalAgentMention,
+  prepareIdentityVcAtBoundary,
+  type DidDocumentResolver,
+  type IdentityReplayStore,
+} from './identity-vc/index.js';
+import {
   PostgresTaskStore,
   parsePersistRequestEnvelope,
 } from './postgres-task-store.js';
@@ -75,6 +83,13 @@ export interface ServerHttpOptions {
   db: Sql;
   google?: GoogleConfig;     // absent = device flow endpoints disabled
   deviceFlowStateSecret?: string;
+  // Test seams for deterministic identity VC verification. Production uses
+  // the SSRF-safe did:web resolver and Postgres replay store below.
+  identityVc?: {
+    resolver?: DidDocumentResolver;
+    replayStore?: IdentityReplayStore;
+    now?: () => Date;
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -112,6 +127,9 @@ export function stripCallerSuppliedInternalKeys(message: Record<string, unknown>
 
 export function createHttpApp(opts: ServerHttpOptions): Hono {
   const app = new Hono();
+  const identityVcResolver = opts.identityVc?.resolver ?? new SafeDidWebResolver();
+  const identityVcReplayStore =
+    opts.identityVc?.replayStore ?? new PostgresIdentityReplayStore(opts.db);
 
   // Sentry request tracing + error capture. Sentry.init() runs in instrument.ts
   // (imported first in cli.ts); register this before any other middleware so it
@@ -296,11 +314,12 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     };
   }
 
-  function prepareAgentRequestBody(
+  async function prepareAgentRequestBody(
     body: unknown,
     c: Context,
     caller: ReturnType<typeof getCaller>,
-  ): void {
+    conn: ClientConnection,
+  ): Promise<void> {
     if (!isRecord(body)) return;
     const params = isRecord(body.params) ? body.params : undefined;
     const message = isRecord(params?.message)
@@ -322,6 +341,25 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }
 
     stripCallerSuppliedInternalKeys(message);
+    const identityResult = await prepareIdentityVcAtBoundary(message, {
+      conn,
+      expectedDomain: canonicalAgentMention(conn.agentId, opts.publicUrl),
+      resolver: identityVcResolver,
+      replayStore: identityVcReplayStore,
+      ...(opts.identityVc?.now !== undefined ? { now: opts.identityVc.now } : {}),
+    });
+    for (const rejection of identityResult.rejections) {
+      logEvent('identity_vc_rejected', {
+        agentId: conn.agentId,
+        code: rejection.code,
+      });
+    }
+    if (identityResult.accepted > 0) {
+      logEvent('identity_vc_verified', {
+        agentId: conn.agentId,
+        count: identityResult.accepted,
+      });
+    }
     if (caller !== undefined) {
       message.metadata = {
         ...(isRecord(message.metadata) ? message.metadata : {}),
@@ -895,7 +933,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     recordAgentRequest(c, conn, caller);
     const rawBody = await c.req.text();
     const parsed = JSON.parse(rawBody);
-    prepareAgentRequestBody(parsed, c, caller);
+    await prepareAgentRequestBody(parsed, c, caller, conn);
     const handler = getHandlerForConn(conn);
     const result = await handler.handle(parsed);
     return handleHandlerResult(result, c);
@@ -916,7 +954,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       // DefaultRequestHandler accepts a string and returns the protocol's
       // structured JSON parse error, so don't turn malformed JSON into a 500.
     }
-    prepareAgentRequestBody(body, c, caller);
+    await prepareAgentRequestBody(body, c, caller, conn);
     c.header('A2A-Version', '1.0');
     const result = await getHandlerV1ForConn(conn).handle(body, getRequestContext(c));
     return handleHandlerResult(result, c);
@@ -947,7 +985,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         }
       }
     }
-    prepareAgentRequestBody(body, c, caller);
+    await prepareAgentRequestBody(body, c, caller, conn);
     const response = await getHttpJsonV1ForConn(conn).handle({
       method: c.req.method,
       url: c.req.url,

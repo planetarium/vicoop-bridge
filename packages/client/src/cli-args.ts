@@ -66,6 +66,11 @@ export const daemonFlagsFields = {
   config: optional(option('--config', '-c', string({ metavar: 'PATH' }), {
     description: message`Explicit config.json overlaid on the canonical file.`,
   })),
+  trustedIdentityIssuers: optional(
+    option('--trusted-identity-issuers', string({ metavar: 'ISSUERS' }), {
+      description: message`Comma-separated exact VC issuer identifiers trusted for presented caller identity. Mirrors config trusted_identity_issuers and VICOOP_TRUSTED_IDENTITY_ISSUERS.`,
+    }),
+  ),
 
   // Backend selection
   backend: optional(option('--backend', choice([...BACKEND_KINDS]), {
@@ -161,6 +166,7 @@ export interface DaemonArgs {
   card?: string;
   backend: string;
   backends?: BackendConfigs;
+  trustedIdentityIssuers?: string[];
   // Flag-derived overrides. These take precedence over the config layer
   // when set; merge logic in cli.ts threads them into backend factories.
   // cwd / runtime apply to the active backend (claude / codex); the merge
@@ -234,6 +240,24 @@ function pickModelsList(v: string | undefined): string[] | undefined {
   return entries.length > 0 ? entries : undefined;
 }
 
+function pickExactIdentifierList(v: string | undefined): string[] | undefined {
+  if (v === undefined) return undefined;
+  const entries = v
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && s.length <= 512);
+  const unique = [...new Set(entries)];
+  return unique.slice(0, 64);
+}
+
+function pickConfiguredExactIdentifiers(v: string[] | undefined): string[] | undefined {
+  if (!v) return undefined;
+  const unique = [
+    ...new Set(v.map((issuer) => issuer.trim()).filter((issuer) => issuer.length > 0 && issuer.length <= 512)),
+  ];
+  return unique.slice(0, 64);
+}
+
 function pickSandbox(v: string | undefined): CodexSandboxMode | undefined {
   const t = v?.trim();
   if (!t) return undefined;
@@ -248,7 +272,9 @@ function pickSandbox(v: string | undefined): CodexSandboxMode | undefined {
 //   3. canonical config.json      (caller pre-merged into `config`)
 //   4. built-in defaults (DEFAULT_BRIDGE_URL for server; 'echo' for backend)
 //
-// Env vars are NOT in this chain. Config-location env (VICOOP_HOME /
+// General runtime env vars are NOT in this chain. The sole compatibility
+// input is VICOOP_TRUSTED_IDENTITY_ISSUERS, used only when neither the flag nor
+// config supplies receiver trust. Config-location env (VICOOP_HOME /
 // XDG_CONFIG_HOME / HOME) is a separate category and resolved by
 // `defaultConfigPath()` before this function runs. Admin-bootstrap env
 // (VICOOP_BRIDGE / VICOOP_OWNER_TOKEN) is unrelated to the daemon runtime
@@ -274,6 +300,7 @@ export type MergeClientArgsResult =
 export function mergeClientArgs(
   flags: Partial<DaemonFlags>,
   config: ClientConfig,
+  trustedIssuerEnv: string | undefined = process.env.VICOOP_TRUSTED_IDENTITY_ISSUERS,
 ): MergeClientArgsResult {
   const card = pick(flags.card) || config.card;
   const backends = config.backends ?? {};
@@ -302,6 +329,10 @@ export function mergeClientArgs(
     card: card === '' ? undefined : card,
     backend,
     backends: config.backends,
+    trustedIdentityIssuers:
+      pickExactIdentifierList(flags.trustedIdentityIssuers) ??
+      pickConfiguredExactIdentifiers(config.trusted_identity_issuers) ??
+      pickExactIdentifierList(trustedIssuerEnv),
     cwd: pick(flags.cwd) || activeCwd || undefined,
     runtime: flags.runtime ?? activeRuntime,
     runtimeName: pick(flags.runtimeName) || activeRuntimeName || undefined,

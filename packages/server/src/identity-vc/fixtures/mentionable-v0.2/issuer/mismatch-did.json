@@ -1,0 +1,13 @@
+{
+  "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
+  "id": "did:web:mismatch.fixtures.mentionable.dev",
+  "verificationMethod": [
+    {
+      "id": "did:web:mismatch.fixtures.mentionable.dev#rogue-2026-08",
+      "type": "Multikey",
+      "controller": "did:web:mismatch.fixtures.mentionable.dev",
+      "publicKeyMultibase": "z6MkgVT6Uh8yMCppMN7DWJaNjEmeDt4nJy857fS1mFHMAXAV"
+    }
+  ],
+  "assertionMethod": ["did:web:mismatch.fixtures.mentionable.dev#rogue-2026-08"]
+}

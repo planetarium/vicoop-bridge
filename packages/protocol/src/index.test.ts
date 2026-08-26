@@ -5,6 +5,7 @@ import {
   CALLER_CONTEXT_CAPABILITY,
   CallerContextV1,
   HelloFrame,
+  IdentityTrustV1,
   OpenAICompatModelAdvertise,
   TaskAssignFrame,
   buildOpenAICompatExtensionParams,
@@ -78,18 +79,32 @@ test('TaskStatusFrame.metadata is optional — frames without it parse and omit 
   assert.equal(decoded.metadata, undefined);
 });
 
-test('hello round-trips caller-context capability', () => {
+test('hello round-trips caller-context capability and receiver-local identity trust', () => {
   const frame = HelloFrame.parse({
     type: 'hello',
     agentId: 'agent-1',
     version: '0.1',
     token: 'secret',
     protocolCapabilities: [CALLER_CONTEXT_CAPABILITY],
+    identityTrust: { trustedIssuers: ['did:web:issuer.example'] },
   });
   const decoded = parseUpFrame(encodeFrame(frame));
   assert.equal(decoded.type, 'hello');
   if (decoded.type !== 'hello') throw new Error('unreachable');
   assert.deepEqual(decoded.protocolCapabilities, [CALLER_CONTEXT_CAPABILITY]);
+  assert.deepEqual(decoded.identityTrust, {
+    trustedIssuers: ['did:web:issuer.example'],
+  });
+});
+
+test('identity trust is exact, bounded, and rejects unknown fields', () => {
+  assert.deepEqual(IdentityTrustV1.parse({ trustedIssuers: [] }), { trustedIssuers: [] });
+  assert.throws(() =>
+    IdentityTrustV1.parse({ trustedIssuers: ['did:web:issuer.example'], wildcard: true }),
+  );
+  assert.throws(() =>
+    IdentityTrustV1.parse({ trustedIssuers: Array.from({ length: 65 }, (_, i) => `did:web:i${i}.example`) }),
+  );
 });
 
 test('task.assign caller context round-trips only when provided', () => {

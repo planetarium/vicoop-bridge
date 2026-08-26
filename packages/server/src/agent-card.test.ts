@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { InMemoryTaskStore, type AgentCardV03, type AgentCardV10 } from '@a2x/sdk';
 import {
+  CALLER_CONTEXT_CAPABILITY,
+  MENTIONABLE_IDENTITY_VC_EXTENSION_URI,
   SIWE_BEARER_AUTH_EXTENSION_URI,
   TRACEABILITY_EXTENSION_URI,
   type AgentCard,
@@ -10,6 +12,7 @@ import { X402_FOUNDATION_EXTENSION_URI } from '@a2x/sdk/x402';
 import { buildAgentA2XServer } from './agent-card.js';
 import { Registry, type ClientConnection } from './registry.js';
 import { parseX402Pricing } from './x402/pricing.js';
+import type { Sql } from './db.js';
 
 function fakeConn(card: AgentCard, overrides: Partial<ClientConnection> = {}): ClientConnection {
   return {
@@ -23,6 +26,54 @@ function fakeConn(card: AgentCard, overrides: Partial<ClientConnection> = {}): C
     ...overrides,
   };
 }
+
+test('identity VC extension is advertised only when capability, private trust, and verifier dependencies are ready', () => {
+  const wireCard: AgentCard = {
+    name: 'claude',
+    description: 'Claude Code',
+    version: '0.0.1',
+    protocolVersion: '0.3.0',
+    capabilities: {
+      streaming: true,
+      // A wire client cannot self-advertise verification the bridge did not wire.
+      extensions: [{ uri: MENTIONABLE_IDENTITY_VC_EXTENSION_URI, required: true }],
+    },
+  };
+  const fakeSql = {} as Sql;
+  const ready = buildAgentA2XServer(
+    fakeConn(wireCard, {
+      protocolCapabilities: [CALLER_CONTEXT_CAPABILITY],
+      identityTrust: { trustedIssuers: ['did:web:issuer.example'] },
+    }),
+    new InMemoryTaskStore(),
+    new Registry(),
+    { publicUrl: 'https://bridge.example', deviceFlowEnabled: false, db: fakeSql },
+  ).getAgentCard() as AgentCardV03;
+  const entries = (ready.capabilities.extensions ?? []).filter(
+    (extension) => extension.uri === MENTIONABLE_IDENTITY_VC_EXTENSION_URI,
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0]!.required, false);
+  assert.equal(entries[0]!.params, undefined, 'private trust entries must not be exposed');
+
+  for (const overrides of [
+    { protocolCapabilities: [], identityTrust: { trustedIssuers: ['did:web:issuer.example'] } },
+    { protocolCapabilities: [CALLER_CONTEXT_CAPABILITY], identityTrust: { trustedIssuers: [] } },
+  ] satisfies Partial<ClientConnection>[]) {
+    const notReady = buildAgentA2XServer(
+      fakeConn(wireCard, overrides),
+      new InMemoryTaskStore(),
+      new Registry(),
+      { publicUrl: 'https://bridge.example', deviceFlowEnabled: false, db: fakeSql },
+    ).getAgentCard() as AgentCardV03;
+    assert.equal(
+      notReady.capabilities.extensions?.some(
+        (extension) => extension.uri === MENTIONABLE_IDENTITY_VC_EXTENSION_URI,
+      ) ?? false,
+      false,
+    );
+  }
+});
 
 test('buildAgentA2XServer publishes v1 JSON-RPC and HTTP+JSON on one versioned base URL', () => {
   const agent = buildAgentA2XServer(

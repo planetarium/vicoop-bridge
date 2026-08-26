@@ -24,6 +24,7 @@ import {
   partsToWire,
   stripInternalMetadata,
 } from './executor.js';
+import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
 
 // Issue #128 (B): the /agents/:id route stashes the verified caller's
 // principalId on `message.metadata._principalId`. The executor must (1)
@@ -285,6 +286,14 @@ test('executor sends authenticated principal only to caller-context-capable clie
     messageId: 'm-caller',
     metadata: {
       _principalId: 'siwe:0xabc',
+      [IDENTITY_VC_PRESENTED_METADATA_KEY]: [
+        {
+          credentialId: 'urn:uuid:credential-1',
+          issuer: 'did:web:issuer.example',
+          subject: 'slack:T123/U456',
+          method: 'urn:mentionable:auth:slack-workspace-member:v0.1',
+        },
+      ],
       caller: { authenticated: { principalId: 'forged' } },
       mentionable: {
         identity_evidence: { proof: 'legacy' },
@@ -298,15 +307,94 @@ test('executor sends authenticated principal only to caller-context-capable clie
   const frame = parseDownFrame(sent[0]!);
   assert.equal(frame.type, 'task.assign');
   if (frame.type === 'task.assign') {
-    assert.equal(frame.caller?.presented, undefined, 'PR #466 never creates presented identity');
-    assert.deepEqual(frame.caller, { authenticated: { principalId: 'siwe:0xabc' } });
+    assert.deepEqual(frame.caller, {
+      authenticated: { principalId: 'siwe:0xabc' },
+      presented: [
+        {
+          credentialId: 'urn:uuid:credential-1',
+          issuer: 'did:web:issuer.example',
+          subject: 'slack:T123/U456',
+          method: 'urn:mentionable:auth:slack-workspace-member:v0.1',
+        },
+      ],
+    });
     assert.equal(frame.message.metadata, undefined, 'raw/forged identity is fully stripped');
   }
+  assert.equal(
+    (message.metadata as Record<string, unknown>)[IDENTITY_VC_PRESENTED_METADATA_KEY],
+    undefined,
+    'request-local normalized identity must not survive into SDK task history or responses',
+  );
 
   const binding = registry.getBinding('t-caller')!;
   binding.sink.pushStatus({
     taskId: 't-caller',
     contextId: 'ctx-caller',
+    final: true,
+    status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
+  });
+  binding.sink.finish();
+  await firstEvent;
+  for await (const _event of gen) void _event;
+});
+
+test('executor can send verified presented identity on a public request without inventing authenticated context', async () => {
+  const { ws, sent } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({
+    agentId: 'public-presented',
+    clientId: 'c-public',
+    ownerPrincipal: 'eth:0x0',
+    protocolCapabilities: [CALLER_CONTEXT_CAPABILITY],
+    identityTrust: { trustedIssuers: ['did:web:issuer.example'] },
+    agentCard: makeAgentCard(),
+    allowedCallers: [],
+    ws,
+    connectedAt: 0,
+  });
+  const executor = new WSForwardingExecutor('public-presented', registry, noopTaskStore());
+  const task = {
+    id: 't-public-presented',
+    contextId: 'ctx-public-presented',
+    status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
+  } as unknown as Task;
+  const message = {
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hi' }],
+    messageId: 'm-public-presented',
+    metadata: {
+      [IDENTITY_VC_PRESENTED_METADATA_KEY]: [
+        {
+          credentialId: 'urn:uuid:credential-2',
+          issuer: 'did:web:issuer.example',
+          subject: 'slack:T123/U456',
+          method: 'platform',
+        },
+      ],
+    },
+  } as unknown as Message;
+
+  const gen = executor.executeStream(task, message);
+  const firstEvent = gen.next();
+  const frame = parseDownFrame(sent[0]!);
+  assert.equal(frame.type, 'task.assign');
+  if (frame.type === 'task.assign') {
+    assert.equal(frame.caller?.authenticated, undefined);
+    assert.deepEqual(frame.caller?.presented, [
+      {
+        credentialId: 'urn:uuid:credential-2',
+        issuer: 'did:web:issuer.example',
+        subject: 'slack:T123/U456',
+        method: 'platform',
+      },
+    ]);
+    assert.equal(frame.message.metadata, undefined);
+  }
+
+  const binding = registry.getBinding('t-public-presented')!;
+  binding.sink.pushStatus({
+    taskId: task.id,
+    contextId: task.contextId!,
     final: true,
     status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
   });

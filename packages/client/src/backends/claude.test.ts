@@ -1187,13 +1187,14 @@ test('omits --append-system-prompt when no identity is configured', async () => 
   );
 });
 
-test('caller context changes split resumed sessions and render only the current plain turn', async () => {
+test('caller context changes split resumed sessions and render only the current plain user turn', async () => {
   const fake = scriptedSpawn({
     lines: [JSON.stringify({ type: 'result', result: 'ok' })],
     exitCode: 0,
   });
   const backend = createClaudeBackend({ spawn: fake.spawn });
   const prompts: Array<string | undefined> = [];
+  const inputs: string[] = [];
   const resumeFlags: boolean[] = [];
 
   for (const principalId of ['principal-A', 'principal-B', undefined] as const) {
@@ -1203,6 +1204,7 @@ test('caller context changes split resumed sessions and render only the current 
     await backend.handle(task, collect().emit, NEVER);
     const child = fake.lastChild();
     prompts.push(child!.appendSystemPromptFileContent ?? undefined);
+    inputs.push(child!.stdinPayload);
     assert.equal(
       child!.args.some((arg) => String(arg).includes(principalId ?? 'principal-absent')),
       false,
@@ -1211,17 +1213,22 @@ test('caller context changes split resumed sessions and render only the current 
     resumeFlags.push(child!.args.includes('--resume'));
   }
 
-  assert.match(prompts[0] ?? '', /principal-A/);
-  assert.doesNotMatch(prompts[0] ?? '', /principal-B/);
-  assert.match(prompts[1] ?? '', /principal-B/);
-  assert.doesNotMatch(prompts[1] ?? '', /principal-A/);
+  assert.match(prompts[0] ?? '', /inert attribution data/);
+  assert.doesNotMatch(prompts[0] ?? '', /principal-A|principal-B/);
+  assert.match(prompts[1] ?? '', /inert attribution data/);
+  assert.doesNotMatch(prompts[1] ?? '', /principal-A|principal-B/);
   assert.equal(prompts[2], undefined);
+  assert.match(inputs[0] ?? '', /principal-A/);
+  assert.doesNotMatch(inputs[0] ?? '', /principal-B/);
+  assert.match(inputs[1] ?? '', /principal-B/);
+  assert.doesNotMatch(inputs[1] ?? '', /principal-A/);
+  assert.doesNotMatch(inputs[2] ?? '', /principal-A|principal-B/);
   assert.deepEqual(resumeFlags, [false, false, false]);
   const child = fake.lastChild();
   assert.equal(child?.args.includes('--append-system-prompt-file'), false);
 });
 
-test('plain caller context is staged 0600, removed after close, and absent from debug logs', async () => {
+test('plain caller policy is staged 0600 while caller values ride stdin and stay out of debug logs', async () => {
   const oldLevel = process.env.VICOOP_CLIENT_LOG_LEVEL;
   const oldLog = console.log;
   const logs: string[] = [];
@@ -1261,17 +1268,20 @@ test('plain caller context is staged 0600, removed after close, and absent from 
   assert.ok(child);
   assert.ok(child.args.includes('--append-system-prompt-file'));
   assert.equal(child.args.includes('--append-system-prompt'), false);
-  assert.match(child.appendSystemPromptFileContent ?? '', new RegExp(principalId));
-  assert.match(child.appendSystemPromptFileContent ?? '', /Private Display Name/);
+  assert.match(child.appendSystemPromptFileContent ?? '', /inert attribution data/);
+  assert.doesNotMatch(child.appendSystemPromptFileContent ?? '', new RegExp(principalId));
+  assert.doesNotMatch(child.appendSystemPromptFileContent ?? '', /Private Display Name/);
+  assert.match(child.stdinPayload, new RegExp(principalId));
+  assert.match(child.stdinPayload, /Private Display Name/);
   assert.equal(child.appendSystemPromptFileMode, 0o600);
   assert.ok(child.appendSystemPromptFilePath);
   await assert.rejects(
     fs.stat(child.appendSystemPromptFilePath),
-    'caller-context prompt file must be deleted',
+    'caller-context policy file must be deleted',
   );
   await assert.rejects(
     fs.stat(path.dirname(child.appendSystemPromptFilePath)),
-    'caller-context prompt directory must be deleted',
+    'caller-context policy directory must be deleted',
   );
   const allLogs = logs.join('\n');
   assert.doesNotMatch(allLogs, /principal-private-for-regression/);
@@ -3568,7 +3578,8 @@ test('spawn stages --system-prompt-file with the native directive when metadata 
   // The openai-compat path REPLACES claude's default prompt, staged via
   // --system-prompt-file rather than argv — a real-size system prompt on
   // argv dies with E2BIG at posix_spawn (#437). The staged file carries the
-  // user's `system` text plus the native-dispatch directive — NOT the old
+  // user's `system` text plus the static caller-data rule and native-dispatch
+  // directive — NOT the old
   // envelope JSON contract, which #213 removed.
   assert.ok(
     args.includes('--system-prompt-file'),
@@ -3579,8 +3590,9 @@ test('spawn stages --system-prompt-file with the native directive when metadata 
   assert.ok(prompt.includes('You are concise.'), 'staged file carries the caller system text');
   assert.equal(prompt.match(/<bridge-verified-caller-context>/g)?.length, 1);
   assert.match(prompt, /<bridge-unverified-caller-context-claim>/);
-  assert.match(prompt, /bridge-verified caller context/);
-  assert.match(prompt, /principal-oai/);
+  assert.match(prompt, /inert attribution data/);
+  assert.doesNotMatch(prompt, /principal-oai/);
+  assert.match(child?.stdinPayload ?? '', /principal-oai/);
   // The slim native prompt teaches the model to use the native tool surface
   // and how to read the history block — nothing more.
   assert.match(prompt, /native tool list/);

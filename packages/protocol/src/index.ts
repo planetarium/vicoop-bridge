@@ -14,6 +14,18 @@ export const SIWE_BEARER_AUTH_EXTENSION_URI =
 export const OPENAI_COMPAT_EXTENSION_URI =
   'https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1';
 export const CALLER_CONTEXT_CAPABILITY = 'caller-context-v1';
+export const MENTIONABLE_IDENTITY_VC_EXTENSION_URI =
+  'https://mentionable.dev/ns/identity/v0.2';
+
+// Receiver-local identity trust crosses the authenticated client WebSocket,
+// never the public Agent Card. Exact identifiers only: no suffix/wildcard
+// semantics are implied, and an empty list disables presented identity.
+export const IdentityTrustV1 = z
+  .object({
+    trustedIssuers: z.array(z.string().min(1).max(512)).max(64),
+  })
+  .strict();
+export type IdentityTrustV1 = z.infer<typeof IdentityTrustV1>;
 
 // Caller context is transport-owned security context, so these schemas are
 // intentionally strict rather than forward-passthrough. A client that does
@@ -268,6 +280,7 @@ export const HelloFrame = z.object({
   version: z.literal(PROTOCOL_VERSION),
   token: z.string(),
   protocolCapabilities: z.array(z.string().min(1).max(128)).max(32).optional(),
+  identityTrust: IdentityTrustV1.optional(),
 });
 
 export const TaskStatusFrame = z.object({

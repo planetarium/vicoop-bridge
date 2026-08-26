@@ -1,0 +1,13 @@
+{
+  "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
+  "id": "did:web:connector.fixtures.mentionable.dev",
+  "verificationMethod": [
+    {
+      "id": "did:web:connector.fixtures.mentionable.dev#fixture-2026-08",
+      "type": "Multikey",
+      "controller": "did:web:connector.fixtures.mentionable.dev",
+      "publicKeyMultibase": "z6MkmVFNVPJHDB9QCGSkgH5YiWiQ1XPkV12VqiWm7CHKgEfs"
+    }
+  ],
+  "assertionMethod": ["did:web:connector.fixtures.mentionable.dev#fixture-2026-08"]
+}

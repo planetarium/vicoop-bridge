@@ -6,7 +6,11 @@ import {
   type ProtocolVersion,
   type TaskStore,
 } from '@a2x/sdk';
-import { SIWE_BEARER_AUTH_EXTENSION_URI } from '@vicoop-bridge/protocol';
+import {
+  CALLER_CONTEXT_CAPABILITY,
+  MENTIONABLE_IDENTITY_VC_EXTENSION_URI,
+  SIWE_BEARER_AUTH_EXTENSION_URI,
+} from '@vicoop-bridge/protocol';
 import type { ClientConnection, Registry } from './registry.js';
 import { WSForwardingExecutor } from './executor.js';
 import { isX402ExtensionUri } from '@a2x/sdk/x402';
@@ -133,11 +137,22 @@ export function buildAgentA2XServer(
   const wireExtensions = wire.capabilities?.extensions ?? [];
   const restricted = conn.allowedCallers.length > 0;
   const bridgeWillEmitSiwe = restricted && Boolean(opts.publicUrl);
+  const bridgeWillEmitIdentityVc =
+    Boolean(opts.publicUrl) &&
+    Boolean(opts.db) &&
+    conn.protocolCapabilities?.includes(CALLER_CONTEXT_CAPABILITY) === true &&
+    (conn.identityTrust?.trustedIssuers.length ?? 0) > 0;
   for (const extension of wireExtensions) {
     if (restricted && extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI) {
       // Bridge owns this advertisement on restricted agents — drop wire
       // entry whether or not we re-emit our own (the latter is gated by
       // publicUrl).
+      continue;
+    }
+    if (extension.uri === MENTIONABLE_IDENTITY_VC_EXTENSION_URI) {
+      // The bridge owns this advertisement because only it knows whether
+      // trust, replay storage, recipient binding, and caller-context delivery
+      // are all active. Never echo private trust entries onto the public card.
       continue;
     }
     if (isX402ExtensionUri(extension.uri)) {
@@ -174,6 +189,14 @@ export function buildAgentA2XServer(
           sendMessage: `a2a-wallet a2a send --bearer "$TOKEN" ${url}/.well-known/agent-card.json "Hello"`,
         },
       },
+    });
+  }
+  if (bridgeWillEmitIdentityVc) {
+    a2xServer.addExtension({
+      uri: MENTIONABLE_IDENTITY_VC_EXTENSION_URI,
+      description:
+        'Optional Mentionable PlatformIdentityCredential presentation. The bridge verifies trusted VC 2.0 eddsa-jcs-2022 credentials and forwards only normalized caller identity.',
+      required: false,
     });
   }
 

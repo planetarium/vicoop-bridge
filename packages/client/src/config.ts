@@ -9,10 +9,11 @@
 //
 // Resolution precedence for daemon args at startup (highest wins):
 //   1. CLI flags (`--server`, `--token`, ...)
-//   2. Env vars (`SERVER_URL`, `SERVER_TOKEN`, ...; what systemd EnvironmentFile=
-//      keeps working unchanged)
-//   3. `--config <path>` (operator-specified)
-//   4. config.json at the canonical path
+//   2. `--config <path>` (operator-specified)
+//   3. config.json at the canonical path
+//   4. built-in defaults
+// VICOOP_TRUSTED_IDENTITY_ISSUERS is the sole runtime-env compatibility
+// fallback and applies only when flag/config receiver trust is absent.
 
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -210,6 +211,8 @@ export interface ClientConfig {
   agent_id?: string;
   backend?: string;
   card?: string;
+  /** Exact VC issuer identifiers trusted by this receiving agent. */
+  trusted_identity_issuers?: string[];
   backends?: BackendConfigs;
   // Opt-in crash telemetry. Absent / 'off' => the daemon never loads or
   // initializes the Sentry SDK. 'on' => crash reports (stack traces only — no
@@ -309,6 +312,11 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
   if (backend && KNOWN_BACKENDS.has(backend)) c.backend = backend;
   const card = asString(raw.card);
   if (card) c.card = card;
+  const trustedIdentityIssuers = asStringArray(raw.trusted_identity_issuers);
+  if (Array.isArray(raw.trusted_identity_issuers)) {
+    const bounded = (trustedIdentityIssuers ?? []).filter((issuer) => issuer.length <= 512);
+    c.trusted_identity_issuers = [...new Set(bounded)].slice(0, 64);
+  }
   // Telemetry is a closed enum: only the two known string literals are
   // honoured. Anything else (typo, bool, number) is dropped — and a dropped
   // value reads as "off" downstream, which is the safe, privacy-preserving
@@ -454,6 +462,8 @@ export function overlayConfig(base: ClientConfig, top: ClientConfig): ClientConf
     agent_id: top.agent_id ?? base.agent_id,
     backend: top.backend ?? base.backend,
     card: top.card ?? base.card,
+    trusted_identity_issuers:
+      top.trusted_identity_issuers ?? base.trusted_identity_issuers,
     telemetry: top.telemetry ?? base.telemetry,
     backends: mergedBackends,
   };

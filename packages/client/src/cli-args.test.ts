@@ -3,8 +3,8 @@ import test from 'node:test';
 import { DEFAULT_BRIDGE_URL, mergeClientArgs, parseFlags } from './cli-args.js';
 import type { ClientConfig } from './config.js';
 
-// mergeClientArgs is the pure precedence layer: CLI flags > config (env
-// is no longer part of the chain — issue #189 §5). The IO-heavy loader
+// mergeClientArgs is the pure precedence layer: CLI flags > config. The sole
+// compatibility env input is the receiver-local identity issuer list. The IO-heavy loader
 // (parseClientArgs) resolves the config file path on disk and is covered
 // indirectly by setup.test.ts + config.test.ts.
 
@@ -46,6 +46,63 @@ test('config fills in fields absent from CLI flags', () => {
   assert.equal(r.args.agentId, CONFIG.agent_id);
   assert.equal(r.args.backend, CONFIG.backend);
   assert.equal(r.args.card, CONFIG.card);
+});
+
+test('trusted identity issuers resolve from flag, config, then compatibility env', () => {
+  const fromFlag = mergeClientArgs(
+    {
+      token: 't',
+      agentId: 'a',
+      trustedIdentityIssuers: ' did:web:one.example, did:web:two.example, did:web:one.example ',
+    },
+    { trusted_identity_issuers: ['did:web:config.example'] },
+    'did:web:env.example',
+  );
+  assert.equal(fromFlag.ok, true);
+  if (!fromFlag.ok) return;
+  assert.deepEqual(fromFlag.args.trustedIdentityIssuers, [
+    'did:web:one.example',
+    'did:web:two.example',
+  ]);
+
+  const fromConfig = mergeClientArgs(
+    { token: 't', agentId: 'a' },
+    { trusted_identity_issuers: ['did:web:config.example'] },
+    'did:web:env.example',
+  );
+  assert.equal(fromConfig.ok, true);
+  if (!fromConfig.ok) return;
+  assert.deepEqual(fromConfig.args.trustedIdentityIssuers, ['did:web:config.example']);
+
+  const fromEnv = mergeClientArgs(
+    { token: 't', agentId: 'a' },
+    {},
+    ' did:web:env.example, did:web:other.example ',
+  );
+  assert.equal(fromEnv.ok, true);
+  if (!fromEnv.ok) return;
+  assert.deepEqual(fromEnv.args.trustedIdentityIssuers, [
+    'did:web:env.example',
+    'did:web:other.example',
+  ]);
+});
+
+test('an explicitly empty identity trust flag or config disables the env fallback', () => {
+  const fromFlag = mergeClientArgs(
+    { token: 't', agentId: 'a', trustedIdentityIssuers: '  ' },
+    { trusted_identity_issuers: ['did:web:config.example'] },
+    'did:web:env.example',
+  );
+  assert.equal(fromFlag.ok, true);
+  if (fromFlag.ok) assert.deepEqual(fromFlag.args.trustedIdentityIssuers, []);
+
+  const fromConfig = mergeClientArgs(
+    { token: 't', agentId: 'a' },
+    { trusted_identity_issuers: [] },
+    'did:web:env.example',
+  );
+  assert.equal(fromConfig.ok, true);
+  if (fromConfig.ok) assert.deepEqual(fromConfig.args.trustedIdentityIssuers, []);
 });
 
 test('default backend is echo when neither flag nor config sets it', () => {
@@ -413,6 +470,7 @@ test('parseFlags picks up known flags', () => {
     '--backend', 'claude',
     '--card', '/c.json',
     '--config', '/etc/vicoop/config.json',
+    '--trusted-identity-issuers', 'did:web:issuer.example',
     '--runtime-name', 'work',
     '--claude-model', 'claude-opus-4-8',
   ]);
@@ -426,6 +484,7 @@ test('parseFlags picks up known flags', () => {
   assert.equal(r.flags.backend, 'claude');
   assert.equal(r.flags.card, '/c.json');
   assert.equal(r.flags.config, '/etc/vicoop/config.json');
+  assert.equal(r.flags.trustedIdentityIssuers, 'did:web:issuer.example');
 });
 
 test('parseFlags accepts --flag=value form (issue #189 §2)', () => {
@@ -555,7 +614,7 @@ test('config backends.codex.cwd resolves when --backend codex is active', () => 
   assert.equal(r.args.cwd, '/codex-from-config');
 });
 
-test('env vars in the daemon-config chain are ignored entirely (issue #189 §5)', () => {
+test('legacy daemon env vars remain ignored (identity trust is the sole compatibility exception)', () => {
   // The old chain consulted SERVER_URL / SERVER_TOKEN / AGENT_ID / BACKEND
   // / AGENT_CARD between flag and config. With env removed, these vars
   // must have no effect on the resolved daemon args.

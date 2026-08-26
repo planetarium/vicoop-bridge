@@ -326,6 +326,7 @@ test('Client reconnects after WebSocket close and sends hello again', async () =
     token: 'client-token',
     agentId: 'agent-1',
     backendKind: 'echo',
+    trustedIdentityIssuers: ['did:web:issuer.example'],
     backend: backendOf('stub', async () => {
       /* no tasks in this test */
     }),
@@ -347,6 +348,9 @@ test('Client reconnects after WebSocket close and sends hello again', async () =
         assert.equal(frame.agentId, 'agent-1');
         assert.equal(frame.token, 'client-token');
         assert.deepEqual(frame.protocolCapabilities, ['caller-context-v1', TASK_REPLAY_CAPABILITY]);
+        assert.deepEqual(frame.identityTrust, {
+          trustedIssuers: ['did:web:issuer.example'],
+        });
       }
     }
   } finally {

@@ -300,6 +300,9 @@ omit what you don't need) is:
   "server_token": "<written by agent register>",
   "agent_id": "<written by agent register>",
   "backend": "claude",
+  "trusted_identity_issuers": [
+    "did:web:identity.example.com"
+  ],
   "backends": {
     "claude": {
       "cwd": "/srv/agent-work",
@@ -327,11 +330,18 @@ The schema also accepts a top-level `card` mirroring the `--card` flag
 — see Step 5).
 
 Daemon precedence is **CLI flag > `--config <path>` > canonical
-`config.json` > built-in default**. Env vars are not consulted for
-runtime config (#189 §5) — secrets and overrides live in `config.json`
+`config.json` > built-in default**. General runtime env vars are not consulted
+(#189 §5) — secrets and overrides live in `config.json`
 (mode 600) or in flags. `agent register` only ever touches `server_url`,
 `server_token`, and `agent_id` — hand-edits to the other fields survive
 re-runs.
+
+`trusted_identity_issuers` is an exact, receiver-local allowlist for optional
+Mentionable VC presented identity. Configure it with the JSON array above or
+`--trusted-identity-issuers did:web:one.example,did:web:two.example`. The
+compatibility env input `VICOOP_TRUSTED_IDENTITY_ISSUERS` accepts the same
+comma-separated form and is the sole daemon runtime env exception. Empty or
+absent trust disables VC verification and identity-extension advertisement.
 
 ### Telemetry (opt-in)
 
@@ -552,8 +562,9 @@ vicoop-client start --backend openclaw
 ```
 
 Precedence at startup is **CLI flag > `--config <path>` > canonical
-`config.json` > built-in default**. Env vars are not consulted for
-runtime config (#189 §5). With `"backend": "openclaw"` persisted in
+`config.json` > built-in default**. General runtime env vars are not consulted
+(#189 §5); `VICOOP_TRUSTED_IDENTITY_ISSUERS` is the identity-trust compatibility
+exception documented in Step 4. With `"backend": "openclaw"` persisted in
 `config.json`, the daemon needs no flags at all:
 `vicoop-client start`.
 

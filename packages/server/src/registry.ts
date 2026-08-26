@@ -1,5 +1,10 @@
 import type { WebSocket } from 'ws';
-import type { AgentCard, DownFrame, TaskUsage } from '@vicoop-bridge/protocol';
+import type {
+  AgentCard,
+  DownFrame,
+  IdentityTrustV1,
+  TaskUsage,
+} from '@vicoop-bridge/protocol';
 import { encodeFrame, TASK_REPLAY_CAPABILITY } from '@vicoop-bridge/protocol';
 import type { TaskArtifactUpdateEvent, TaskStatusUpdateEvent } from '@a2x/sdk';
 import { logEvent, truncate } from './log.js';
@@ -20,6 +25,9 @@ export interface ClientConnection {
   // connection-scoped so executor dispatch can preserve old-client wire
   // compatibility without falling back to caller-controlled metadata.
   protocolCapabilities?: string[];
+  // Receiver-local exact issuer trust received on the authenticated hello.
+  // Connection-scoped and never exposed on the public Agent Card.
+  identityTrust?: IdentityTrustV1;
   agentCard: AgentCard;
   allowedCallers: string[];
   // x402 pricing from the agent's DB row, or undefined for a free agent (the
