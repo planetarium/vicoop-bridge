@@ -13,7 +13,10 @@ export const SIWE_BEARER_AUTH_EXTENSION_URI =
   'https://github.com/planetarium/a2a-x402-wallet/tree/main/docs/siwe-bearer-auth/v0.1';
 export const OPENAI_COMPAT_EXTENSION_URI =
   'https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1';
-export const CALLER_CONTEXT_CAPABILITY = 'caller-context-v1';
+export const CALLER_CONTEXT_V1_CAPABILITY = 'caller-context-v1';
+export const CALLER_CONTEXT_V2_CAPABILITY = 'caller-context-v2';
+// Compatibility alias for callers compiled against the original v1 API.
+export const CALLER_CONTEXT_CAPABILITY = CALLER_CONTEXT_V1_CAPABILITY;
 export const MENTIONABLE_IDENTITY_VC_EXTENSION_URI =
   'https://mentionable.dev/ns/identity/v0.2';
 
@@ -81,6 +84,80 @@ export const CallerContextV1 = z
   })
   .strict();
 export type CallerContextV1 = z.infer<typeof CallerContextV1>;
+
+export const CallerPrincipalV2 = z
+  .object({
+    id: CallerIdentifier,
+  })
+  .strict();
+export type CallerPrincipalV2 = z.infer<typeof CallerPrincipalV2>;
+
+export const CallerActorV2 = z
+  .object({
+    id: CallerIdentifier,
+  })
+  .strict();
+export type CallerActorV2 = z.infer<typeof CallerActorV2>;
+
+export const CallerAttestationV2 = z
+  .object({
+    credentialId: CallerIdentifier,
+    issuer: CallerIdentifier,
+    subject: CallerIdentifier,
+    method: CallerSummaryField,
+    assurance: CallerSummaryField.optional(),
+    platform: z
+      .object({
+        provider: CallerSummaryField.optional(),
+        workspaceId: CallerSummaryField.optional(),
+      })
+      .strict()
+      .optional(),
+    observedInvocation: z
+      .object({
+        target: CallerIdentifier.optional(),
+      })
+      .strict()
+      .optional(),
+    profile: z
+      .object({
+        displayName: CallerSummaryField.optional(),
+        username: CallerSummaryField.optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+export type CallerAttestationV2 = z.infer<typeof CallerAttestationV2>;
+
+export const CallerContextV2 = z
+  .object({
+    principal: CallerPrincipalV2.optional(),
+    actor: CallerActorV2.optional(),
+    attestations: z.array(CallerAttestationV2).max(8).optional(),
+  })
+  .strict()
+  .superRefine((context, refinement) => {
+    if (context.actor !== undefined && context.principal === undefined) {
+      refinement.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['actor'],
+        message: 'actor requires a principal',
+      });
+    } else if (context.actor !== undefined && context.actor.id === context.principal?.id) {
+      refinement.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['actor', 'id'],
+        message: 'actor must be omitted when it is the principal',
+      });
+    }
+  });
+export type CallerContextV2 = z.infer<typeof CallerContextV2>;
+
+// A task frame contains one complete caller-context version. Because both
+// member schemas are strict, an object mixing v1 and v2 field names fails.
+export const CallerContext = z.union([CallerContextV2, CallerContextV1]);
+export type CallerContext = z.infer<typeof CallerContext>;
 
 export const TextPart = z.object({
   kind: z.literal('text'),
@@ -479,7 +556,7 @@ export const TaskAssignFrame = z.object({
   contextId: z.string(),
   message: Message,
   requestedExtensions: z.array(z.string()).optional(),
-  caller: CallerContextV1.optional(),
+  caller: CallerContext.optional(),
 });
 
 export const TaskCancelFrame = z.object({

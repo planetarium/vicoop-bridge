@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import {
   OPENAI_COMPAT_EXTENSION_URI,
   CALLER_CONTEXT_CAPABILITY,
+  CALLER_CONTEXT_V1_CAPABILITY,
+  CALLER_CONTEXT_V2_CAPABILITY,
+  CallerContext,
   CallerContextV1,
+  CallerContextV2,
   HelloFrame,
   IdentityTrustV1,
   OpenAICompatModelAdvertise,
@@ -97,6 +101,11 @@ test('hello round-trips caller-context capability and receiver-local identity tr
   });
 });
 
+test('caller-context compatibility alias remains v1', () => {
+  assert.equal(CALLER_CONTEXT_CAPABILITY, CALLER_CONTEXT_V1_CAPABILITY);
+  assert.notEqual(CALLER_CONTEXT_V1_CAPABILITY, CALLER_CONTEXT_V2_CAPABILITY);
+});
+
 test('identity trust is exact, bounded, and rejects unknown fields', () => {
   assert.deepEqual(IdentityTrustV1.parse({ trustedIssuers: [] }), { trustedIssuers: [] });
   assert.throws(() =>
@@ -135,6 +144,51 @@ test('task.assign caller context round-trips only when provided', () => {
   assert.equal(withoutCaller.type, 'task.assign');
   if (withoutCaller.type !== 'task.assign') throw new Error('unreachable');
   assert.equal(withoutCaller.caller, undefined);
+});
+
+test('task.assign accepts a complete v2 caller context', () => {
+  const caller = {
+    principal: { id: 'slack:T123/U456' },
+    actor: { id: 'service:mentionable-gateway' },
+    attestations: [
+      {
+        credentialId: 'urn:uuid:credential-v2',
+        issuer: 'did:web:issuer.example',
+        subject: 'slack:T123/U456',
+        method: 'urn:mentionable:auth:slack-workspace-member:v0.1',
+      },
+    ],
+  };
+  const decoded = parseDownFrame(
+    encodeFrame(
+      TaskAssignFrame.parse({
+        type: 'task.assign',
+        taskId: 'task-v2',
+        contextId: 'context-v2',
+        message: { role: 'user', parts: [], messageId: 'message-v2' },
+        caller,
+      }),
+    ),
+  );
+  assert.equal(decoded.type, 'task.assign');
+  if (decoded.type !== 'task.assign') throw new Error('unreachable');
+  assert.deepEqual(decoded.caller, caller);
+});
+
+test('caller context rejects mixed versions and invalid actor semantics', () => {
+  assert.throws(() =>
+    CallerContext.parse({
+      authenticated: { principalId: 'siwe:0xabc' },
+      principal: { id: 'siwe:0xabc' },
+    }),
+  );
+  assert.throws(() => CallerContextV2.parse({ actor: { id: 'service:gateway' } }));
+  assert.throws(() =>
+    CallerContextV2.parse({
+      principal: { id: 'service:gateway' },
+      actor: { id: 'service:gateway' },
+    }),
+  );
 });
 
 test('caller context fails closed on unknown or oversized fields', () => {

@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 import {
-  CALLER_CONTEXT_CAPABILITY,
+  CALLER_CONTEXT_V1_CAPABILITY,
+  CALLER_CONTEXT_V2_CAPABILITY,
   PROTOCOL_VERSION,
   OPENAI_COMPAT_EXTENSION_URI,
   TASK_REPLAY_CAPABILITY,
@@ -360,7 +361,11 @@ export class Client {
             backendKind: this.opts.backendKind,
             version: PROTOCOL_VERSION,
             token: this.opts.token,
-            protocolCapabilities: [CALLER_CONTEXT_CAPABILITY, TASK_REPLAY_CAPABILITY],
+            protocolCapabilities: [
+              CALLER_CONTEXT_V2_CAPABILITY,
+              CALLER_CONTEXT_V1_CAPABILITY,
+              TASK_REPLAY_CAPABILITY,
+            ],
             ...(this.opts.trustedIdentityIssuers !== undefined
               ? {
                   identityTrust: {

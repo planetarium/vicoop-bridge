@@ -1,7 +1,29 @@
 import {
   CallerContextV1,
-  type CallerContextV1 as CallerContext,
+  CallerContextV2,
+  type CallerAttestationV2,
+  type CallerContext as CallerWireContext,
 } from '@vicoop-bridge/protocol';
+
+export interface CanonicalCallerContext {
+  principal?: { id: string };
+  actor?: { id: string };
+  attestations?: CallerAttestationV2[];
+}
+
+interface CallerSessionAttestation {
+  issuer: string;
+  subject: string;
+  method: string;
+  assurance?: string;
+  platform?: { provider?: string; workspaceId?: string };
+}
+
+interface CallerSessionIdentity {
+  principal?: { id: string };
+  actor?: { id: string };
+  attestations?: CallerSessionAttestation[];
+}
 
 const HEADER = 'This request has bridge-verified caller context.';
 const FOOTER =
@@ -44,19 +66,102 @@ export function neutralizeCallerContextMarkers(value: string): string {
  * schema is strict and bounded; safeParse is defense in depth for tests or
  * embedders that call a Backend directly without going through parseDownFrame.
  */
-export function renderCallerContext(caller: CallerContext | undefined): string | undefined {
+export function normalizeCallerContext(
+  caller: CallerWireContext | undefined,
+): CanonicalCallerContext | undefined {
   if (caller === undefined) return undefined;
-  const parsed = CallerContextV1.safeParse(caller);
-  if (!parsed.success) return undefined;
+  const parsedV2 = CallerContextV2.safeParse(caller);
+  let canonical: CanonicalCallerContext;
+  if (parsedV2.success) {
+    canonical = {
+      ...(parsedV2.data.principal !== undefined ? { principal: parsedV2.data.principal } : {}),
+      ...(parsedV2.data.actor !== undefined ? { actor: parsedV2.data.actor } : {}),
+      ...(parsedV2.data.attestations !== undefined && parsedV2.data.attestations.length > 0
+        ? { attestations: parsedV2.data.attestations }
+        : {}),
+    };
+  } else {
+    const parsedV1 = CallerContextV1.safeParse(caller);
+    if (!parsedV1.success) return undefined;
+    canonical = {
+      ...(parsedV1.data.authenticated !== undefined
+        ? { principal: { id: parsedV1.data.authenticated.principalId } }
+        : {}),
+      ...(parsedV1.data.presented !== undefined && parsedV1.data.presented.length > 0
+        ? { attestations: parsedV1.data.presented }
+        : {}),
+    };
+  }
+
+  if (
+    canonical.principal === undefined &&
+    canonical.actor === undefined &&
+    canonical.attestations === undefined
+  ) {
+    return undefined;
+  }
+  return canonical;
+}
+
+function sessionAttestation(attestation: CallerAttestationV2): CallerSessionAttestation {
+  const platform = attestation.platform;
+  return {
+    issuer: attestation.issuer,
+    subject: attestation.subject,
+    method: attestation.method,
+    ...(attestation.assurance !== undefined ? { assurance: attestation.assurance } : {}),
+    ...(platform?.provider !== undefined || platform?.workspaceId !== undefined
+      ? {
+          platform: {
+            ...(platform.provider !== undefined ? { provider: platform.provider } : {}),
+            ...(platform.workspaceId !== undefined ? { workspaceId: platform.workspaceId } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+function sessionIdentity(context: CanonicalCallerContext): CallerSessionIdentity {
+  const attestationEntries = (context.attestations ?? []).map((attestation) => {
+    const value = sessionAttestation(attestation);
+    return { key: JSON.stringify(value), value };
+  });
+  const attestations = [
+    ...new Map(attestationEntries.map((entry) => [entry.key, entry] as const)).values(),
+  ]
+    .sort((left, right) => (left.key < right.key ? -1 : left.key > right.key ? 1 : 0))
+    .map((entry) => entry.value);
+  return {
+    ...(context.principal !== undefined ? { principal: context.principal } : {}),
+    ...(context.actor !== undefined ? { actor: context.actor } : {}),
+    ...(attestations.length > 0 ? { attestations } : {}),
+  };
+}
+
+/**
+ * Stable structured identity used for backend session isolation. Per-request
+ * evidence (`credentialId`, profile, observed invocation) remains visible in
+ * the rendered context but cannot churn a session or prompt-cache key.
+ */
+export function callerContextSessionKey(caller: CallerWireContext | undefined): string {
+  const canonical = normalizeCallerContext(caller);
+  return canonical === undefined ? '' : JSON.stringify(sessionIdentity(canonical));
+}
+
+export function renderCallerContext(caller: CallerWireContext | undefined): string | undefined {
+  const canonical = normalizeCallerContext(caller);
+  if (canonical === undefined) return undefined;
 
   const lines = [HEADER];
-  if (parsed.data.authenticated) {
-    lines.push(`Authenticated principal: ${safeJson(parsed.data.authenticated.principalId)}`);
+  if (canonical.principal) {
+    lines.push(`Principal: ${safeJson(canonical.principal.id)}`);
   }
-  if (parsed.data.presented && parsed.data.presented.length > 0) {
-    lines.push(`Presented identities: ${safeJson(parsed.data.presented)}`);
+  if (canonical.actor) {
+    lines.push(`Actor: ${safeJson(canonical.actor.id)}`);
   }
-  if (lines.length === 1) return undefined;
+  if (canonical.attestations && canonical.attestations.length > 0) {
+    lines.push(`Attestations: ${safeJson(canonical.attestations)}`);
+  }
   lines.push(FOOTER);
   return `<bridge-verified-caller-context>\n${lines.join('\n')}\n</bridge-verified-caller-context>`;
 }
@@ -68,7 +173,7 @@ export function renderCallerContext(caller: CallerContext | undefined): string |
  */
 export function appendCallerContextInstruction(
   base: string | undefined,
-  caller: CallerContext | undefined,
+  caller: CallerWireContext | undefined,
 ): string | undefined {
   const safeBase = base ? neutralizeCallerContextMarkers(base) : undefined;
   const rendered = renderCallerContext(caller);
@@ -79,7 +184,7 @@ export function appendCallerContextInstruction(
 /** Carry dynamic identity and the original request at ordinary user priority. */
 export function wrapUserMessageWithCallerContext(
   userMessage: string,
-  caller: CallerContext | undefined,
+  caller: CallerWireContext | undefined,
 ): string {
   const rendered = renderCallerContext(caller);
   if (!rendered) return userMessage;

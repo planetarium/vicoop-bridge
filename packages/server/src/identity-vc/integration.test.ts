@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { CALLER_CONTEXT_CAPABILITY, type AgentCard } from '@vicoop-bridge/protocol';
+import {
+  CALLER_CONTEXT_CAPABILITY,
+  CALLER_CONTEXT_V2_CAPABILITY,
+  type AgentCard,
+} from '@vicoop-bridge/protocol';
 import type { WebSocket } from 'ws';
 import type { ClientConnection } from '../registry.js';
 import { createIdentityVcFixture } from './test-fixtures.js';
@@ -39,7 +43,7 @@ function memoryReplayStore(): IdentityReplayStore {
 test('HTTP boundary strips the raw carrier and hands only normalized verified identity to the executor', async () => {
   const { credential, didDocument } = await createIdentityVcFixture();
   const conn = connection({
-    protocolCapabilities: [CALLER_CONTEXT_CAPABILITY],
+    protocolCapabilities: [CALLER_CONTEXT_V2_CAPABILITY],
     identityTrust: { trustedIssuers: [credential.issuer] },
   });
   const message: Record<string, unknown> = {

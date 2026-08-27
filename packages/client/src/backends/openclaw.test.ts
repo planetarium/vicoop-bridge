@@ -3178,14 +3178,21 @@ test('caller A → caller B → absent uses current-turn payloads and isolated O
     for (const principalId of ['principal-A', 'principal-B', undefined] as const) {
       const task = makeTask(`caller-${principalId ?? 'absent'}`, `hello-${principalId ?? 'absent'}`);
       task.contextId = 'ctx-caller-switch';
-      if (principalId) task.caller = { authenticated: { principalId } };
+      if (principalId) {
+        task.caller = {
+          principal: { id: principalId },
+          actor: { id: 'service:openclaw-gateway' },
+        };
+      }
       await backend.handle(task, () => {}, NEVER);
     }
 
     assert.equal(sent.length, 3);
     assert.match(sent[0]!.message, /principal-A/);
+    assert.match(sent[0]!.message, /service:openclaw-gateway/);
     assert.doesNotMatch(sent[0]!.message, /principal-B/);
     assert.match(sent[1]!.message, /principal-B/);
+    assert.match(sent[1]!.message, /service:openclaw-gateway/);
     assert.doesNotMatch(sent[1]!.message, /principal-A/);
     assert.equal(sent[2]!.message, 'hello-absent');
     assert.notEqual(sent[0]!.sessionKey, sent[1]!.sessionKey);

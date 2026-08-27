@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { InMemoryTaskStore, type AgentCardV03, type AgentCardV10 } from '@a2x/sdk';
 import {
   CALLER_CONTEXT_CAPABILITY,
+  CALLER_CONTEXT_V2_CAPABILITY,
   MENTIONABLE_IDENTITY_VC_EXTENSION_URI,
   SIWE_BEARER_AUTH_EXTENSION_URI,
   TRACEABILITY_EXTENSION_URI,
@@ -42,7 +43,7 @@ test('identity VC extension is advertised only when capability, private trust, a
   const fakeSql = {} as Sql;
   const ready = buildAgentA2XServer(
     fakeConn(wireCard, {
-      protocolCapabilities: [CALLER_CONTEXT_CAPABILITY],
+      protocolCapabilities: [CALLER_CONTEXT_V2_CAPABILITY],
       identityTrust: { trustedIssuers: ['did:web:issuer.example'] },
     }),
     new InMemoryTaskStore(),

@@ -1049,7 +1049,7 @@ test('handle: request body carries stream:true + envelope-derived model/messages
   assert.match(systemMessage.content ?? '', /inert attribution data/);
   assert.doesNotMatch(systemMessage.content ?? '', /principal-real/);
   const callerMessage = messages[1] as { role: string; content?: string };
-  assert.match(callerMessage.content ?? '', /Authenticated principal: "principal-real"/);
+  assert.match(callerMessage.content ?? '', /Principal: "principal-real"/);
   assert.equal(body.model, 'gpt-5.5');
   assert.deepEqual(body.tools, [
     { type: 'function', function: { name: 'get_weather' } },
@@ -1058,9 +1058,9 @@ test('handle: request body carries stream:true + envelope-derived model/messages
     type: 'function',
     function: { name: 'get_weather' },
   });
-  // prompt_cache_key carries the conversation's contextId so successive turns
-  // stay sticky to one upstream cache shard (#11 / vicoop-codex-cli#12).
-  assert.equal(body.prompt_cache_key, 'ctx-1');
+  // The fallback cache key remains conversation-sticky but is scoped by the
+  // canonical caller identity when attribution is present.
+  assert.match(String(body.prompt_cache_key), /^ctx-1:caller-[0-9a-f]{16}$/);
   // Group B / Group C fields stay off the wire — the binary applies defaults.
   assert.equal(body.reasoning_effort, undefined);
   assert.equal(body.temperature, undefined);

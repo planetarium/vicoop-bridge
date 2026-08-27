@@ -5,8 +5,17 @@ vicoop-bridge issue #467. The client sends exact receiver-local issuer trust
 on its authenticated hello. When caller-context capability, non-empty trust,
 Postgres replay storage, and a configured public URL are all available, the
 bridge advertises the identity extension and maps successful verification into
-`TaskAssignFrame.caller.presented`. Authentication and authorization remain
-unchanged.
+the canonical caller context. A `caller-context-v2` client receives those
+claims as `TaskAssignFrame.caller.attestations`; a v1-only client receives the
+same values under the legacy `caller.presented` field. Authentication and
+authorization remain unchanged: verification never promotes an attestation
+subject to `principal`.
+
+The server selects `caller-context-v2` before `caller-context-v1` from the
+authenticated hello. Both versions are serialized from one canonical
+`principal` / `actor` / `attestations` representation. The current verifier
+can add attestations but cannot create a federated principal or actor; that
+requires the explicit receiver-owned policy tracked in #487.
 
 The verifier accepts only the VC 2.0 `PlatformIdentityCredential` profile from
 planetarium/mentionable#613, checks exact receiver-local issuer trust before
