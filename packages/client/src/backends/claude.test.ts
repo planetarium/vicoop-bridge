@@ -1309,7 +1309,10 @@ test('plain caller policy merges identity and operator appends into one staged f
     ],
   });
   const task = assign('hello');
-  task.caller = { authenticated: { principalId: 'caller-484-private' } };
+  task.caller = {
+    principal: { id: 'caller-484-private' },
+    actor: { id: 'service:gateway-484' },
+  };
   await backend.handle(task, collect().emit, NEVER);
 
   const child = fake.lastChild();
@@ -1332,7 +1335,9 @@ test('plain caller policy merges identity and operator appends into one staged f
   assert.ok(prompt.indexOf('inert attribution data') < prompt.indexOf('OPERATOR FIRST'));
   assert.ok(prompt.indexOf('OPERATOR FIRST') < prompt.indexOf('OPERATOR SECOND'));
   assert.doesNotMatch(prompt, /caller-484-private/);
+  assert.doesNotMatch(prompt, /service:gateway-484/);
   assert.match(child.stdinPayload, /caller-484-private/);
+  assert.match(child.stdinPayload, /service:gateway-484/);
   assert.equal(child.appendSystemPromptFileMode, 0o600);
   assert.ok(child.appendSystemPromptFilePath);
   await assert.rejects(fs.stat(child.appendSystemPromptFilePath));
@@ -1381,7 +1386,7 @@ test('passes configured cwd through to the Claude subprocess', async () => {
   assert.equal(child.cwd, '/tmp/claude-worktree');
 });
 
-test('reuses session via --resume on a second task with the same contextId', async () => {
+test('reuses session when a fresh credential preserves the same caller identity', async () => {
   const fake = scriptedSpawn({
     lines: [JSON.stringify({ type: 'result', result: 'ok' })],
     exitCode: 0,
@@ -1391,6 +1396,18 @@ test('reuses session via --resume on a second task with the same contextId', asy
 
   const t1 = assign('first');
   t1.contextId = ctx;
+  t1.caller = {
+    principal: { id: 'slack:T123/U456' },
+    attestations: [
+      {
+        credentialId: 'urn:uuid:first',
+        issuer: 'did:web:issuer.example',
+        subject: 'slack:T123/U456',
+        method: 'platform-identity-v0.2',
+        profile: { displayName: 'Alice' },
+      },
+    ],
+  };
   const c1 = collect();
   await backend.handle(t1, c1.emit, NEVER);
   const child1 = fake.lastChild();
@@ -1403,6 +1420,18 @@ test('reuses session via --resume on a second task with the same contextId', asy
 
   const t2 = assign('second');
   t2.contextId = ctx;
+  t2.caller = {
+    principal: { id: 'slack:T123/U456' },
+    attestations: [
+      {
+        credentialId: 'urn:uuid:second',
+        issuer: 'did:web:issuer.example',
+        subject: 'slack:T123/U456',
+        method: 'platform-identity-v0.2',
+        profile: { displayName: 'Alice Updated' },
+      },
+    ],
+  };
   const c2 = collect();
   await backend.handle(t2, c2.emit, NEVER);
   const child2 = fake.lastChild();

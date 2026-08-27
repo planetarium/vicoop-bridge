@@ -48,6 +48,101 @@ test('equivalent v1 and v2 contexts render and scope sessions identically', () =
   assert.equal(callerContextSessionKey(v1), callerContextSessionKey(v2));
 });
 
+test('credential rotation and presentation metadata do not churn session identity', () => {
+  const first = {
+    principal: { id: 'slack:T123/U456' },
+    actor: { id: 'service:mentionable-gateway' },
+    attestations: [
+      {
+        credentialId: 'urn:uuid:first-a',
+        issuer: 'did:web:issuer.example',
+        subject: 'slack:T123/U456',
+        method: 'platform-identity-v0.2',
+        assurance: 'platform',
+        platform: { provider: 'slack', workspaceId: 'T123' },
+        observedInvocation: { target: '@agent@bridge.example' },
+        profile: { displayName: 'Alice', username: 'alice' },
+      },
+      {
+        credentialId: 'urn:uuid:first-b',
+        issuer: 'did:web:org.example',
+        subject: 'employee:alice',
+        method: 'employment-v1',
+      },
+    ],
+  };
+  const rotatedAndReordered = {
+    principal: { id: 'slack:T123/U456' },
+    actor: { id: 'service:mentionable-gateway' },
+    attestations: [
+      {
+        credentialId: 'urn:uuid:second-b',
+        issuer: 'did:web:org.example',
+        subject: 'employee:alice',
+        method: 'employment-v1',
+        profile: { displayName: 'Alice Updated' },
+      },
+      {
+        credentialId: 'urn:uuid:second-a',
+        issuer: 'did:web:issuer.example',
+        subject: 'slack:T123/U456',
+        method: 'platform-identity-v0.2',
+        assurance: 'platform',
+        platform: { provider: 'slack', workspaceId: 'T123' },
+        observedInvocation: { target: '@alias@bridge.example' },
+        profile: { displayName: 'Alice Updated', username: 'alice-2' },
+      },
+    ],
+  };
+
+  assert.notEqual(renderCallerContext(first), renderCallerContext(rotatedAndReordered));
+  assert.equal(callerContextSessionKey(first), callerContextSessionKey(rotatedAndReordered));
+});
+
+test('security-relevant caller identity changes split session scope', () => {
+  const key = (overrides: {
+    principal?: string;
+    actor?: string;
+    issuer?: string;
+    subject?: string;
+    method?: string;
+    assurance?: string;
+    provider?: string;
+    workspaceId?: string;
+  } = {}) =>
+    callerContextSessionKey({
+      principal: { id: overrides.principal ?? 'slack:T123/U456' },
+      actor: { id: overrides.actor ?? 'service:gateway' },
+      attestations: [
+        {
+          credentialId: 'urn:uuid:any',
+          issuer: overrides.issuer ?? 'did:web:issuer.example',
+          subject: overrides.subject ?? 'slack:T123/U456',
+          method: overrides.method ?? 'platform-identity-v0.2',
+          assurance: overrides.assurance ?? 'platform',
+          platform: {
+            provider: overrides.provider ?? 'slack',
+            workspaceId: overrides.workspaceId ?? 'T123',
+          },
+        },
+      ],
+    });
+
+  const baseline = key();
+  for (const changed of [
+    key({ principal: 'slack:T123/U999' }),
+    key({ actor: 'service:other-gateway' }),
+    key({ issuer: 'did:web:other.example' }),
+    key({ subject: 'slack:T123/U999' }),
+    key({ method: 'other-method' }),
+    key({ assurance: 'weak' }),
+    key({ provider: 'discord' }),
+    key({ workspaceId: 'T999' }),
+  ]) {
+    assert.notEqual(changed, baseline);
+  }
+});
+
 test('renders a distinct v2 principal and actor without elevating attestations', () => {
   const rendered = renderCallerContext({
     principal: { id: 'slack:T123/U456' },

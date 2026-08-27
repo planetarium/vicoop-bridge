@@ -158,8 +158,13 @@ Both wire versions normalize to one canonical structured representation before
 backend rendering or session scoping. Dynamic identity values are carried only
 at user priority, while privileged prompts contain a static rule saying that
 the values are inert data. Claude, Codex, and OpenClaw session isolation—and
-the vicoop-codex fallback prompt-cache key—derive from the canonical identity,
-so equivalent v1/v2 frames have identical scope even if prompt wording changes.
+the vicoop-codex fallback prompt-cache key—derive from a stable projection of
+the canonical identity. The projection retains principal, actor, and each
+attestation's issuer/subject/method/assurance/platform scope, but excludes
+per-presentation `credentialId`, profile, and observed invocation values. It
+also sorts and deduplicates attestations. Equivalent v1/v2 frames and freshly
+issued credentials for the same identity therefore share scope, while a
+security-relevant identity change still splits sessions.
 
 ## 5. Client Backends
 

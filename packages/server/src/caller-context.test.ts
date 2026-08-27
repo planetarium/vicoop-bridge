@@ -52,6 +52,22 @@ const LegacyCallerContextV1 = z
   })
   .strict();
 
+const LegacyTaskAssignFrameV1 = z.object({
+  type: z.literal('task.assign'),
+  taskId: z.string(),
+  executionId: z.string().min(1).max(128).optional(),
+  contextId: z.string(),
+  message: z.object({
+    role: z.enum(['user', 'agent']),
+    parts: z.array(z.unknown()),
+    messageId: z.string(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    extensions: z.array(z.string()).optional(),
+  }),
+  requestedExtensions: z.array(z.string()).optional(),
+  caller: LegacyCallerContextV1.optional(),
+});
+
 test('selects caller-context v2 before v1 and otherwise disables delivery', () => {
   assert.equal(
     selectCallerContextVersion([
@@ -85,7 +101,14 @@ test('serializes canonical context for frozen v1 and v2 clients', () => {
   assert.ok(canonical);
 
   const v1 = serializeCallerContext(canonical, 'v1');
-  assert.deepEqual(LegacyCallerContextV1.parse(v1), {
+  const legacyFrame = LegacyTaskAssignFrameV1.parse({
+    type: 'task.assign',
+    taskId: 'task-legacy',
+    contextId: 'context-legacy',
+    message: { role: 'user', parts: [], messageId: 'message-legacy' },
+    caller: v1,
+  });
+  assert.deepEqual(legacyFrame.caller, {
     authenticated: { principalId: 'siwe:0xabc' },
     presented: canonical.attestations,
   });
@@ -93,7 +116,13 @@ test('serializes canonical context for frozen v1 and v2 clients', () => {
     principal: { id: 'siwe:0xabc' },
     attestations: canonical.attestations,
   });
-  assert.deepEqual(canonicalizeCallerContextV1(LegacyCallerContextV1.parse(v1)), canonical);
+  assert.throws(() =>
+    LegacyTaskAssignFrameV1.parse({
+      ...legacyFrame,
+      caller: serializeCallerContext(canonical, 'v2'),
+    }),
+  );
+  assert.deepEqual(canonicalizeCallerContextV1(legacyFrame.caller!), canonical);
 });
 
 test('omits empty, invalid, unsupported, or v1-unrepresentable context', () => {

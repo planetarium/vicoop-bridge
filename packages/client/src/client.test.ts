@@ -16,6 +16,7 @@ import {
   type UpFrame,
 } from '@vicoop-bridge/protocol';
 import type { Backend, Emit } from './backend.js';
+import { normalizeCallerContext, type CanonicalCallerContext } from './caller-context.js';
 import { Client, processTask, summarizeParts } from './client.js';
 import { type ConsoleSink, createLogger } from './logger.js';
 
@@ -357,6 +358,72 @@ test('Client reconnects after WebSocket close and sends hello again', async () =
         });
       }
     }
+  } finally {
+    client.stop();
+    await closeServer(server, wss);
+  }
+});
+
+test('new client accepts v1 caller context from a legacy server without hello.ack', async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const serverUrl = await listen(server);
+  let normalized: CanonicalCallerContext | undefined;
+  wss.on('connection', (ws) => {
+    ws.once('message', () => {
+      ws.send(
+        encodeFrame({
+          ...makeAssign('legacy-v1-task'),
+          caller: {
+            authenticated: { principalId: 'siwe:0xabc' },
+            presented: [
+              {
+                credentialId: 'urn:uuid:legacy',
+                issuer: 'did:web:issuer.example',
+                subject: 'slack:T123/U456',
+                method: 'platform-identity-v0.2',
+              },
+            ],
+          },
+        }),
+      );
+    });
+  });
+
+  const client = new Client({
+    serverUrl,
+    token: 'client-token',
+    agentId: 'agent-1',
+    backendKind: 'echo',
+    backend: backendOf('stub', async (task, emit) => {
+      normalized = normalizeCallerContext(task.caller);
+      emit({
+        type: 'task.complete',
+        taskId: task.taskId,
+        status: { state: 'completed', timestamp: new Date().toISOString() },
+      });
+    }),
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 10,
+    reconnectJitterRatio: 0,
+    reconnectStableMs: 0,
+    heartbeatIntervalMs: 0,
+  });
+
+  try {
+    client.start();
+    await waitFor(() => normalized !== undefined, 'expected legacy v1 task to reach backend');
+    assert.deepEqual(normalized, {
+      principal: { id: 'siwe:0xabc' },
+      attestations: [
+        {
+          credentialId: 'urn:uuid:legacy',
+          issuer: 'did:web:issuer.example',
+          subject: 'slack:T123/U456',
+          method: 'platform-identity-v0.2',
+        },
+      ],
+    });
   } finally {
     client.stop();
     await closeServer(server, wss);

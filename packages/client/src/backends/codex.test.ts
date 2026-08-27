@@ -548,14 +548,40 @@ test('backend.stop() sends SIGTERM to the long-lived app-server child (#186)', a
   assert.doesNotThrow(() => backend.stop?.());
 });
 
-test('follow-up task with same contextId uses thread/resume not thread/start', async () => {
+test('fresh credential for the same caller uses thread/resume not thread/start', async () => {
   const fake = makeFakeSpawn(() => happyPath({ threadId: 'thr-1' }));
   const backend = createCodexBackend({ spawn: fake.spawn });
 
+  const first = assign('first', 'ctx-A');
+  first.caller = {
+    principal: { id: 'slack:T123/U456' },
+    attestations: [
+      {
+        credentialId: 'urn:uuid:first',
+        issuer: 'did:web:issuer.example',
+        subject: 'slack:T123/U456',
+        method: 'platform-identity-v0.2',
+        profile: { displayName: 'Alice' },
+      },
+    ],
+  };
+  const second = assign('second', 'ctx-A');
+  second.caller = {
+    principal: { id: 'slack:T123/U456' },
+    attestations: [
+      {
+        credentialId: 'urn:uuid:second',
+        issuer: 'did:web:issuer.example',
+        subject: 'slack:T123/U456',
+        method: 'platform-identity-v0.2',
+        profile: { displayName: 'Alice Updated' },
+      },
+    ],
+  };
   const a = collect();
-  await backend.handle(assign('first', 'ctx-A'), a.emit, NEVER);
+  await backend.handle(first, a.emit, NEVER);
   const b = collect();
-  await backend.handle(assign('second', 'ctx-A'), b.emit, NEVER);
+  await backend.handle(second, b.emit, NEVER);
 
   // Still one child.
   assert.equal(fake.children.length, 1);
@@ -1963,7 +1989,18 @@ test('openai-compat keeps caller values in user input and only a static rule in 
         },
       },
     },
-    caller: { authenticated: { principalId: 'principal-real' } },
+    caller: {
+      principal: { id: 'principal-real' },
+      actor: { id: 'service:gateway' },
+      attestations: [
+        {
+          credentialId: 'urn:uuid:codex-v2',
+          issuer: 'did:web:issuer.example',
+          subject: 'principal-real',
+          method: 'platform-identity-v0.2',
+        },
+      ],
+    },
   });
   await backend.handle(task, collect().emit, NEVER);
 
@@ -1975,10 +2012,13 @@ test('openai-compat keeps caller values in user input and only a static rule in 
   assert.equal(prompt.match(/<bridge-verified-caller-context>/g)?.length, 1);
   assert.match(prompt, /inert attribution data/);
   assert.doesNotMatch(prompt, /principal-real/);
+  assert.doesNotMatch(prompt, /service:gateway/);
   const turn = findRequest(fake.lastChild().stdinFrames(), 'turn/start') as {
     params?: { input?: Array<{ type?: string; text?: string }> };
   };
   assert.match(turn.params?.input?.[0]?.text ?? '', /Principal: "principal-real"/);
+  assert.match(turn.params?.input?.[0]?.text ?? '', /Actor: "service:gateway"/);
+  assert.match(turn.params?.input?.[0]?.text ?? '', /Attestations: \[/);
 });
 
 // Default (no `identity` set): developerInstructions stays whatever it was
