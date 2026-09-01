@@ -9,8 +9,8 @@ import {
 import { matchPrincipal, type VerifiedCaller } from './auth/principal.js';
 import { verifySiweBearerToken } from './auth/siwe-bearer.js';
 import { logEvent, truncate } from './log.js';
-import { OAUTH_FEDERATION_ACCESS_TOKEN_PREFIX } from './oauth-federation/profile.js';
-import { verifyFederatedAccessToken } from './oauth-federation/store.js';
+import { TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX } from './oauth/token-exchange/types.js';
+import { verifyTokenExchangeAccessToken } from './oauth/token-exchange/store.js';
 import { selectCallerContextVersion } from './caller-context.js';
 
 export function getAgentConn(c: Context): ClientConnection {
@@ -252,12 +252,12 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
     const authHeader = c.req.header('Authorization');
     const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
     // Empty allowed_callers keeps its historical public-agent meaning, but a
-    // presented federation token must still be validated. Otherwise removing
-    // the final exact tuple would turn an already-issued vbc_fed_* token into
+    // A presented token-exchange token must still be validated. Otherwise removing
+    // the final exact tuple would turn an already-issued vbc_oauth_* token into
     // an anonymous public request and bypass immediate revocation.
     if (
       conn.allowedCallers.length === 0 &&
-      !bearerToken?.startsWith(OAUTH_FEDERATION_ACCESS_TOKEN_PREFIX)
+      !bearerToken?.startsWith(TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX)
     ) {
       return next();
     }
@@ -276,19 +276,20 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
     }
 
     let caller: VerifiedCaller;
-    if (bearerToken.startsWith(OAUTH_FEDERATION_ACCESS_TOKEN_PREFIX)) {
+    if (bearerToken.startsWith(TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX)) {
       try {
         if (selectCallerContextVersion(conn.protocolCapabilities) !== 'v2') {
           throw new Error('connected agent does not support caller-context-v2');
         }
-        const token = await verifyFederatedAccessToken(opts.sql, bearerToken, agentId);
+        const token = await verifyTokenExchangeAccessToken(opts.sql, bearerToken, agentId);
         caller = {
           principalId: token.principalId,
           ...(token.actorId !== token.principalId
             ? { actorId: token.actorId }
             : {}),
-          federation: {
+          tokenExchange: {
             tokenId: token.tokenId,
+            profileId: token.profileId,
             agentId: token.agentId,
             resource: token.resource,
             actorId: token.actorId,
@@ -304,13 +305,13 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
         const rejectionId = newRejectionId();
         logEvent('agent_request_rejected', {
           agentId,
-          reason: 'invalid_federated_token',
+          reason: 'invalid_token_exchange_token',
           rejectionId,
           detail: truncate((err as Error).message, 256),
         });
         setWWWAuthenticate(c, {
           error: 'invalid_token',
-          description: 'invalid OAuth federation token',
+          description: 'invalid OAuth token-exchange token',
         });
         return reject(c, 401, -32001, 'Invalid bearer token.', rejectionId);
       }
@@ -418,13 +419,13 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
       );
     }
 
-    // Federation tokens were already bound to this exact resource and, for
+    // Token-exchange tokens were already bound to this exact resource and, for
     // message tokens, rechecked against the live exact tuple in Postgres.
     // Task-only tokens recover and recheck the exact tuple from the target
-    // task after the route operation is parsed. Non-federated tokens retain
+    // task after the route operation is parsed. Other tokens retain
     // the ordinary in-memory allowed-caller match.
     const allowed =
-      caller.federation !== undefined
+      caller.tokenExchange !== undefined
         ? true
         : conn.allowedCallers.some((entry) => matchPrincipal(entry, caller));
     if (!allowed) {

@@ -19,7 +19,7 @@ import { logEvent } from './log.js';
 import type { Sql } from './db.js';
 import { supportsCallerContext } from './caller-context.js';
 import { parseFederatedPrincipal } from './auth/principal.js';
-import { OAUTH_FEDERATION_EXTENSION_URI } from './oauth-federation/profile.js';
+import { OAUTH_FEDERATION_EXTENSION_URI } from './oauth/profiles/mentionable-v0.1.js';
 
 export interface AgentA2XOptions {
   publicUrl: string | undefined;

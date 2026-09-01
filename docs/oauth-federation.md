@@ -5,6 +5,24 @@ Mentionable issue #618 and its connector-kit reference implementation. It is
 an opt-in authorization path for restricted agents; the existing SIWE, Google,
 API-key, and context-only PlatformIdentityCredential paths are unchanged.
 
+## Implementation layers
+
+The bridge keeps RFC 8693 token exchange separate from the Mentionable wire
+profile:
+
+- `oauth/token-exchange` owns the shared `/oauth/token` route, RFC 8414
+  metadata aggregation, canonical resource selection, opaque access-token
+  issuance and revocation, profile-qualified replay storage, and the standard
+  token response;
+- `oauth/profiles/mentionable-v0.1` owns assertion `typ` and claims, EdDSA and
+  DID verification, trust-before-fetch, Mentionable scopes, direct-Connector
+  principal/actor derivation, and task-continuation policy.
+
+Installed profiles are selected explicitly and their identifier is persisted
+with every access token. Resource-server policy checks that identifier before
+applying Mentionable authorization semantics, so tokens from a future profile
+cannot be interpreted under this one.
+
 ## Trust and identity model
 
 One federated allowed caller is an exact tuple:
@@ -96,7 +114,7 @@ platform principal and whose `mentionable_task_id` binds one task. Bare
 Connector self-assertions are not accepted. Client assertions use
 `typ: mentionable-client-assertion+jwt`. Assertions have a maximum 10-minute
 lifetime and 60-second clock tolerance. Issued opaque
-`vbc_fed_*` bearer tokens live for five minutes and are bound to one exact
+`vbc_oauth_*` bearer tokens live for five minutes and are bound to one exact
 agent resource and scope set. Continuation-derived tokens are additionally
 bound to one task; renewal is re-exchange, not refresh.
 
@@ -106,6 +124,7 @@ When a message creates or continues a task, the server persists only:
 
 - the normalized platform principal;
 - the Connector actor DID;
+- the token-exchange profile identifier;
 - the exact federated allowed-caller key.
 
 Later get, cancel, resubscribe, and push-configuration operations require the

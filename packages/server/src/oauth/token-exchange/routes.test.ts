@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Hono } from 'hono';
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
-import type { Sql } from '../db.js';
-import { formatFederatedPrincipal } from '../auth/principal.js';
-import type { DidDocumentResolver, ResolvedDidDocument } from '../identity-vc/types.js';
+import type { Sql } from '../../db.js';
+import { formatFederatedPrincipal } from '../../auth/principal.js';
+import type { DidDocumentResolver, ResolvedDidDocument } from '../../identity-vc/types.js';
 import {
   OAUTH_CLIENT_ASSERTION_TYPE_JWT_BEARER,
   OAUTH_FEDERATION_CLAIM_METHOD,
@@ -18,8 +18,10 @@ import {
   OAUTH_GRANT_TYPE_TOKEN_EXCHANGE,
   OAUTH_TOKEN_TYPE_ACCESS_TOKEN,
   OAUTH_TOKEN_TYPE_JWT,
-} from './profile.js';
-import { mountOAuthFederationRoutes } from './routes.js';
+} from '../profiles/mentionable-v0.1.js';
+import { createMentionableOAuthProfile } from '../profiles/mentionable-v0.1.js';
+import { mountTokenExchangeRoutes, type TokenExchangeRouteOptions } from './routes.js';
+import { TOKEN_EXCHANGE_GRANT_TYPE, type TokenExchangeProfile } from './types.js';
 
 const publicUrl = 'https://bridge.example';
 const tokenEndpoint = `${publicUrl}/oauth/token`;
@@ -28,6 +30,19 @@ const kid = `${issuer}#key-1`;
 const method = 'urn:mentionable:auth:slack-member:v0.1';
 const subject = 'slack:T123/U456';
 const now = () => new Date('2026-08-31T00:00:00.000Z');
+
+function mountMentionableTokenExchangeRoutes(
+  app: Hono,
+  options: Omit<TokenExchangeRouteOptions, 'profiles'> & {
+    resolver: DidDocumentResolver;
+  },
+): void {
+  const { resolver, ...routeOptions } = options;
+  mountTokenExchangeRoutes(app, {
+    ...routeOptions,
+    profiles: [createMentionableOAuthProfile({ resolver })],
+  });
+}
 
 async function assertions() {
   const { privateKey, publicKey } = await generateKeyPair('EdDSA');
@@ -50,12 +65,9 @@ async function assertions() {
   };
   return {
     clientAssertion: await base(OAUTH_FEDERATION_TYP_CLIENT_ASSERTION, issuer, 'client-jti'),
-    subjectAssertion: await base(
-      OAUTH_FEDERATION_TYP_SUBJECT_ASSERTION,
-      subject,
-      'subject-jti',
-      { [OAUTH_FEDERATION_CLAIM_METHOD]: method },
-    ),
+    subjectAssertion: await base(OAUTH_FEDERATION_TYP_SUBJECT_ASSERTION, subject, 'subject-jti', {
+      [OAUTH_FEDERATION_CLAIM_METHOD]: method,
+    }),
     continuationAssertion: await base(
       OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION,
       subject,
@@ -91,21 +103,26 @@ function sqlWithPolicy(
     if (statement.includes('SELECT allowed_callers FROM agents')) {
       return [{ allowed_callers: allowedCallers }];
     }
-    if (statement.includes('INSERT INTO infra.oauth_federation_replays')) {
+    if (statement.includes('INSERT INTO infra.oauth_token_exchange_replays')) {
       return [{ digest: values[0] }];
     }
-    if (statement.includes('INSERT INTO infra.oauth_federation_access_tokens')) {
+    if (statement.includes('INSERT INTO infra.oauth_token_exchange_access_tokens')) {
       tokenRows.push(values);
-      inserted.push(String(values.find((value) => typeof value === 'string' && value.startsWith('{'))));
+      inserted.push(
+        String(values.find((value) => typeof value === 'string' && value.startsWith('{'))),
+      );
       return [{ id: 'token-row-1' }];
     }
     if (statement.includes('FROM infra.a2a_tasks')) {
       return task
-        ? [{
+        ? [
+            {
             owner_principal: task.principalId,
             owner_actor: task.actorId,
+            authorization_profile: 'https://mentionable.dev/ns/oauth-federation/v0.1',
             authorization_key: task.authorizationKey,
-          }]
+            },
+          ]
         : [];
     }
     throw new Error(`unexpected SQL in test: ${statement}`);
@@ -117,30 +134,96 @@ function sqlWithPolicy(
 
 test('RFC 8414 discovery points token exchange at the shared /oauth/token endpoint', async () => {
   const app = new Hono();
-  mountOAuthFederationRoutes(app, {
+  mountMentionableTokenExchangeRoutes(app, {
     sql: sqlWithPolicy([]),
     publicUrl,
-    resolver: { async resolve() { throw new Error('not reached'); } },
+    resolver: {
+      async resolve() {
+        throw new Error('not reached');
+      },
+    },
     now,
   });
   const response = await app.request('/.well-known/oauth-authorization-server');
   assert.equal(response.status, 200);
-  const metadata = await response.json() as {
+  const metadata = (await response.json()) as {
     token_endpoint: string;
     grant_types_supported: string[];
     token_endpoint_auth_methods_supported: string[];
+    token_exchange_profiles_supported: string[];
   };
   assert.equal(metadata.token_endpoint, tokenEndpoint);
   assert.deepEqual(metadata.grant_types_supported, [OAUTH_GRANT_TYPE_TOKEN_EXCHANGE]);
   assert.deepEqual(metadata.token_endpoint_auth_methods_supported, ['private_key_jwt']);
+  assert.deepEqual(metadata.token_exchange_profiles_supported, [
+    'https://mentionable.dev/ns/oauth-federation/v0.1',
+  ]);
+});
+
+test('the RFC 8693 core issues a token for a non-Mentionable profile adapter', async () => {
+  const profile: TokenExchangeProfile = {
+    id: 'urn:example:oauth-profile:v1',
+    clientAuthMethods: ['client_secret_basic'],
+    clientAuthSigningAlgorithms: [],
+    scopes: ['example:read'],
+    subjectTokenTypes: ['urn:example:token-type'],
+    recognizes: () => true,
+    async verify() {
+      return {
+        ok: true,
+        principalId: 'example:user-1',
+        actorId: 'example:client-1',
+        authorizationKey: 'example:allowed-caller',
+        scopes: ['example:read'],
+        replays: [
+          {
+            issuer: 'example:issuer',
+            jti: 'example-jti',
+            expiresAt: new Date(now().getTime() + 300_000),
+          },
+        ],
+        kind: 'example',
+      };
+    },
+  };
+  const app = new Hono();
+  const tokenRows: unknown[][] = [];
+  mountTokenExchangeRoutes(app, {
+    sql: sqlWithPolicy(['example:allowed-caller'], [], tokenRows),
+    publicUrl,
+    profiles: [profile],
+    now,
+  });
+  const response = await app.request('/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: TOKEN_EXCHANGE_GRANT_TYPE,
+      resource: `${publicUrl}/agents/agent-1`,
+      subject_token: 'profile-owned-format',
+      scope: 'example:read',
+    }),
+  });
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as {
+    access_token: string;
+    scope: string;
+  };
+  assert.match(body.access_token, /^vbc_oauth_/);
+  assert.equal(body.scope, 'example:read');
+  assert.equal(tokenRows[0]?.[1], profile.id);
 });
 
 test('the shared token route passes non-exchange grants to device flow', async () => {
   const app = new Hono();
-  mountOAuthFederationRoutes(app, {
+  mountMentionableTokenExchangeRoutes(app, {
     sql: sqlWithPolicy([]),
     publicUrl,
-    resolver: { async resolve() { throw new Error('not reached'); } },
+    resolver: {
+      async resolve() {
+        throw new Error('not reached');
+      },
+    },
     passThroughOtherGrants: true,
   });
   app.post('/oauth/token', (c) => c.json({ handled: 'device-flow' }));
@@ -166,7 +249,7 @@ test('token exchange checks exact receiver policy before resolving an untrusted 
     },
   };
   const app = new Hono();
-  mountOAuthFederationRoutes(app, {
+  mountMentionableTokenExchangeRoutes(app, {
     sql: sqlWithPolicy([]),
     publicUrl,
     resolver,
@@ -178,19 +261,27 @@ test('token exchange checks exact receiver policy before resolving an untrusted 
     body: requestBody(fixture.subjectAssertion, fixture.clientAssertion),
   });
   assert.equal(response.status, 400);
-  assert.equal((await response.json() as { error: string }).error, 'invalid_grant');
+  assert.equal(((await response.json()) as { error: string }).error, 'invalid_grant');
   assert.equal(resolutions, 0);
 });
 
 test('successful exchange stores only a normalized, non-secret attestation', async () => {
   const fixture = await assertions();
-  const authorizationKey = formatFederatedPrincipal({ issuer, method, subject });
+  const authorizationKey = formatFederatedPrincipal({
+    issuer,
+    method,
+    subject,
+  });
   assert.ok(authorizationKey);
   const inserted: string[] = [];
   const tokenRows: unknown[][] = [];
-  const resolver: DidDocumentResolver = { async resolve() { return fixture.didDocument; } };
+  const resolver: DidDocumentResolver = {
+    async resolve() {
+      return fixture.didDocument;
+    },
+  };
   const app = new Hono();
-  mountOAuthFederationRoutes(app, {
+  mountMentionableTokenExchangeRoutes(app, {
     sql: sqlWithPolicy([authorizationKey], inserted, tokenRows),
     publicUrl,
     resolver,
@@ -202,16 +293,23 @@ test('successful exchange stores only a normalized, non-secret attestation', asy
     body: requestBody(fixture.subjectAssertion, fixture.clientAssertion),
   });
   assert.equal(response.status, 200);
-  const body = await response.json() as { access_token: string; expires_in: number };
-  assert.match(body.access_token, /^vbc_fed_/);
+  const body = (await response.json()) as {
+    access_token: string;
+    expires_in: number;
+  };
+  assert.match(body.access_token, /^vbc_oauth_/);
   assert.equal(body.expires_in, 300);
   assert.equal(inserted.length, 1);
-  assert.equal(tokenRows[0]?.[2], subject, 'effective principal is the platform subject');
-  assert.equal(tokenRows[0]?.[3], issuer, 'actor is the authenticated Connector DID');
-  assert.equal(tokenRows[0]?.[4], authorizationKey, 'policy binding retains the exact tuple');
+  assert.equal(tokenRows[0]?.[3], subject, 'effective principal is the platform subject');
+  assert.equal(tokenRows[0]?.[4], issuer, 'actor is the authenticated Connector DID');
+  assert.equal(tokenRows[0]?.[5], authorizationKey, 'policy binding retains the exact tuple');
   const attestation = JSON.parse(inserted[0]!) as Record<string, string>;
   assert.deepEqual(
-    { issuer: attestation.issuer, subject: attestation.subject, method: attestation.method },
+    {
+      issuer: attestation.issuer,
+      subject: attestation.subject,
+      method: attestation.method,
+    },
     { issuer, subject, method },
   );
   assert.match(attestation.credentialId!, /^urn:mentionable:oauth-assertion:/);
@@ -221,16 +319,24 @@ test('successful exchange stores only a normalized, non-secret attestation', asy
 
 test('client assertion verification failures map to invalid_client', async () => {
   const fixture = await assertions();
-  const authorizationKey = formatFederatedPrincipal({ issuer, method, subject });
+  const authorizationKey = formatFederatedPrincipal({
+    issuer,
+    method,
+    subject,
+  });
   assert.ok(authorizationKey);
   const segments = fixture.clientAssertion.split('.');
   segments[2] = (segments[2]!.startsWith('A') ? 'B' : 'A') + segments[2]!.slice(1);
   const tamperedClient = segments.join('.');
   const app = new Hono();
-  mountOAuthFederationRoutes(app, {
+  mountMentionableTokenExchangeRoutes(app, {
     sql: sqlWithPolicy([authorizationKey]),
     publicUrl,
-    resolver: { async resolve() { return fixture.didDocument; } },
+    resolver: {
+      async resolve() {
+        return fixture.didDocument;
+      },
+    },
     now,
   });
   const response = await app.request('/oauth/token', {
@@ -239,23 +345,31 @@ test('client assertion verification failures map to invalid_client', async () =>
     body: requestBody(fixture.subjectAssertion, tamperedClient),
   });
   assert.equal(response.status, 401);
-  assert.equal((await response.json() as { error: string }).error, 'invalid_client');
+  assert.equal(((await response.json()) as { error: string }).error, 'invalid_client');
 });
 
 test('task continuation exchange keeps the originating tuple and task binding', async () => {
   const fixture = await assertions();
-  const authorizationKey = formatFederatedPrincipal({ issuer, method, subject });
+  const authorizationKey = formatFederatedPrincipal({
+    issuer,
+    method,
+    subject,
+  });
   assert.ok(authorizationKey);
   const tokenRows: unknown[][] = [];
   const app = new Hono();
-  mountOAuthFederationRoutes(app, {
+  mountMentionableTokenExchangeRoutes(app, {
     sql: sqlWithPolicy([authorizationKey], [], tokenRows, {
       principalId: subject,
       actorId: issuer,
       authorizationKey,
     }),
     publicUrl,
-    resolver: { async resolve() { return fixture.didDocument; } },
+    resolver: {
+      async resolve() {
+        return fixture.didDocument;
+      },
+    },
     now,
   });
   const body = requestBody(fixture.continuationAssertion, fixture.clientAssertion);
@@ -266,8 +380,8 @@ test('task continuation exchange keeps the originating tuple and task binding', 
     body,
   });
   assert.equal(response.status, 200);
-  assert.equal(tokenRows[0]?.[2], subject);
-  assert.equal(tokenRows[0]?.[3], issuer);
-  assert.equal(tokenRows[0]?.[4], authorizationKey);
-  assert.equal(tokenRows[0]?.[7], 'task-1');
+  assert.equal(tokenRows[0]?.[3], subject);
+  assert.equal(tokenRows[0]?.[4], issuer);
+  assert.equal(tokenRows[0]?.[5], authorizationKey);
+  assert.equal(tokenRows[0]?.[8], 'task-1');
 });

@@ -159,8 +159,9 @@ test('federated principal round-trips delimiters and unicode collision-safely', 
   assert.equal(matchPrincipal(encoded, {
     principalId: tuple.subject,
     actorId: tuple.issuer,
-    federation: {
+    tokenExchange: {
       tokenId: 'token-1',
+      profileId: 'https://mentionable.dev/ns/oauth-federation/v0.1',
       agentId: 'agent-1',
       resource: 'https://bridge.example/agents/agent-1',
       actorId: tuple.issuer,

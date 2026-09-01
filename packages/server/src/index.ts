@@ -7,7 +7,7 @@ import { logEvent } from './log.js';
 import { sweepExpiredX402Offerings } from './x402/store.js';
 import { watchX402PricingChanges } from './x402/pricing-watch.js';
 import { sweepExpiredIdentityReplays } from './identity-vc/index.js';
-import { sweepExpiredFederationState } from './oauth-federation/store.js';
+import { sweepExpiredTokenExchangeState } from './oauth/token-exchange/store.js';
 import type { Sql } from './db.js';
 import type { GoogleConfig } from './auth/google-oauth.js';
 import { watchCallerPolicyChanges } from './caller-policy-watch.js';
@@ -42,12 +42,12 @@ async function cleanupExpiredTransients(db: Sql): Promise<void> {
     console.error('[server] identity_vc_replays cleanup failed:', err);
   }
   try {
-    const deleted = await sweepExpiredFederationState(db);
+    const deleted = await sweepExpiredTokenExchangeState(db);
     if (deleted.tokens > 0 || deleted.replays > 0) {
-      logEvent('oauth_federation_state_swept', deleted);
+      logEvent('oauth_token_exchange_state_swept', deleted);
     }
   } catch (err) {
-    console.error('[server] oauth federation cleanup failed:', err);
+    console.error('[server] oauth token-exchange cleanup failed:', err);
   }
   try {
     // Lazy expiry hides a lapsed offering from `get` but never deletes it, so

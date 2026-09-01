@@ -11,7 +11,7 @@ import {
 } from '@mentionable/connector-kit/signing';
 
 const fixtureRoot = fileURLToPath(
-  new URL('../../../../vendor/mentionable-connector-kit/fixtures/', import.meta.url),
+  new URL('../../../../../vendor/mentionable-connector-kit/fixtures/', import.meta.url),
 );
 
 async function json(path: string): Promise<Record<string, any>> {
@@ -26,14 +26,14 @@ function paramsFromFixture(values: Record<string, string | string[]>): URLSearch
   return params;
 }
 
-test('connector-kit v0.1 conformance manifest stays green at the bridge verifier boundary', async () => {
-  const manifest = await json('manifest.json') as unknown as Array<{
+test('Mentionable profile keeps the connector-kit v0.1 conformance manifest green', async () => {
+  const manifest = (await json('manifest.json')) as unknown as Array<{
     file: string;
     kind: 'assertion' | 'exchange-request' | 'replay';
     expect: 'accept' | 'reject';
     reason?: string;
   }>;
-  const issuerDocument = await json('issuer/did.json') as IssuerDidDocument;
+  const issuerDocument = (await json('issuer/did.json')) as IssuerDidDocument;
   const trustedIssuers = new Set([issuerDocument.id]);
   const resolveIssuerDocument = (issuer: string) =>
     issuer === issuerDocument.id ? issuerDocument : undefined;
@@ -41,11 +41,10 @@ test('connector-kit v0.1 conformance manifest stays green at the bridge verifier
   for (const entry of manifest) {
     const fixture = await json(entry.file);
     if (entry.kind === 'assertion') {
-      const outcome = await verifyOAuthFederationAssertion(
-        fixture.jwt,
-        fixture.verification,
-        { trustedIssuers, resolveIssuerDocument },
-      );
+      const outcome = await verifyOAuthFederationAssertion(fixture.jwt, fixture.verification, {
+        trustedIssuers,
+        resolveIssuerDocument,
+      });
       assert.equal(outcome.ok, entry.expect === 'accept', entry.file);
       if (!outcome.ok) assert.equal(outcome.reason, entry.reason, entry.file);
       continue;
@@ -64,16 +63,16 @@ test('connector-kit v0.1 conformance manifest stays green at the bridge verifier
     }
 
     const replayCache = createInMemoryAssertionReplayCache();
-    const first = await verifyOAuthFederationAssertion(
-      fixture.jwt,
-      fixture.verification,
-      { trustedIssuers, resolveIssuerDocument, replayCache },
-    );
-    const second = await verifyOAuthFederationAssertion(
-      fixture.jwt,
-      fixture.verification,
-      { trustedIssuers, resolveIssuerDocument, replayCache },
-    );
+    const first = await verifyOAuthFederationAssertion(fixture.jwt, fixture.verification, {
+      trustedIssuers,
+      resolveIssuerDocument,
+      replayCache,
+    });
+    const second = await verifyOAuthFederationAssertion(fixture.jwt, fixture.verification, {
+      trustedIssuers,
+      resolveIssuerDocument,
+      replayCache,
+    });
     assert.equal(first.ok, true, `${entry.file} first presentation`);
     assert.equal(second.ok, false, `${entry.file} second presentation`);
     if (!second.ok) assert.equal(second.reason, 'replayed-jti', entry.file);

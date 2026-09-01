@@ -178,7 +178,7 @@ test('public agent (no allowedCallers) passes through without WWW-Authenticate',
 
 test('a presented federation token is still validated after its final policy tuple is removed', async () => {
   const sql = (async (strings: TemplateStringsArray) => {
-    if (strings.join('?').includes('FROM infra.oauth_federation_access_tokens')) return [];
+    if (strings.join('?').includes('FROM infra.oauth_token_exchange_access_tokens')) return [];
     throw new Error('unexpected SQL');
   }) as unknown as Sql;
   const { app, registry } = buildApp({ sql });
@@ -186,7 +186,7 @@ test('a presented federation token is still validated after its final policy tup
 
   const response = await app.request('/agents/public-after-removal', {
     method: 'POST',
-    headers: { Authorization: 'Bearer vbc_fed_revoked-token' },
+    headers: { Authorization: 'Bearer vbc_oauth_revoked-token' },
   });
   assert.equal(response.status, 401);
   assert.match(response.headers.get('WWW-Authenticate') ?? '', /invalid_token/);
@@ -265,9 +265,10 @@ test('caller not in allowedCallers responds 403 with WWW-Authenticate error="ins
 test('federated bearer restores platform principal, Connector actor, and normalized attestation', async () => {
   const sql = (async (strings: TemplateStringsArray) => {
     const statement = strings.join('?');
-    if (statement.includes('FROM infra.oauth_federation_access_tokens')) {
+    if (statement.includes('FROM infra.oauth_token_exchange_access_tokens')) {
       return [{
         id: 'token-row-1',
+        profile_id: 'https://mentionable.dev/ns/oauth-federation/v0.1',
         agent_id: 'restricted',
         resource: 'https://bridge.example/agents/restricted',
         principal_id: 'slack:T123/U456',
@@ -286,7 +287,7 @@ test('federated bearer restores platform principal, Connector actor, and normali
         policy_active: true,
       }];
     }
-    if (statement.includes('UPDATE infra.oauth_federation_access_tokens')) return [];
+    if (statement.includes('UPDATE infra.oauth_token_exchange_access_tokens')) return [];
     throw new Error(`unexpected SQL in test: ${statement}`);
   }) as unknown as Sql;
   const registry = new Registry();
@@ -304,17 +305,17 @@ test('federated bearer restores platform principal, Connector actor, and normali
 
   const response = await app.request('/agents/restricted', {
     method: 'POST',
-    headers: { Authorization: 'Bearer vbc_fed_test-token' },
+    headers: { Authorization: 'Bearer vbc_oauth_test-token' },
   });
   assert.equal(response.status, 200);
   const caller = await response.json() as {
     principalId: string;
     actorId: string;
-    federation: { attestations: Array<{ subject: string }> };
+    tokenExchange: { attestations: Array<{ subject: string }> };
   };
   assert.equal(caller.principalId, 'slack:T123/U456');
   assert.equal(caller.actorId, 'did:web:connector.example');
-  assert.equal(caller.federation.attestations[0]?.subject, 'slack:T123/U456');
+  assert.equal(caller.tokenExchange.attestations[0]?.subject, 'slack:T123/U456');
 });
 
 // Direct unit tests for sanitizeErrorDescription. All call sites in the

@@ -637,10 +637,11 @@ CREATE TABLE IF NOT EXISTS infra.a2a_tasks (
 -- unowned (and therefore invisible to every scoped A2A handler); their owning
 -- agent cannot be recovered reliably from task_json.
 ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS owner_agent TEXT;
--- Federated OAuth continuity. These are normalized authorization bindings,
+-- OAuth token-exchange continuity. These are normalized authorization bindings,
 -- never assertion/token bytes. Legacy tasks remain NULL and keep their
 -- existing bearer behavior.
 ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS owner_actor TEXT;
+ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS authorization_profile TEXT;
 ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS authorization_key TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_a2a_tasks_agent_context_principal
@@ -660,13 +661,13 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA infra TO app_postgr
 ALTER DEFAULT PRIVILEGES IN SCHEMA infra
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_postgraphile;
 
--- Mentionable OAuth federation v0.1. Access tokens are opaque, short-lived,
--- resource/scope constrained, and server-managed. `allowed_caller` is the
--- exact issuer+method+subject policy key that authorized the originating
--- message. Continuation tokens retain that same key and add task_id.
-CREATE TABLE IF NOT EXISTS infra.oauth_federation_access_tokens (
+-- RFC 8693 token-exchange access tokens. Profiles derive the authorization
+-- context; the bridge owns the opaque token lifecycle shared by all profiles.
+-- `allowed_caller` is the exact receiver policy key that authorized issuance.
+CREATE TABLE IF NOT EXISTS infra.oauth_token_exchange_access_tokens (
   id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
   token_hash      TEXT NOT NULL UNIQUE,
+  profile_id      TEXT NOT NULL,
   agent_id        TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   resource        TEXT NOT NULL,
   principal_id    TEXT NOT NULL,
@@ -681,30 +682,31 @@ CREATE TABLE IF NOT EXISTS infra.oauth_federation_access_tokens (
   last_used_at    TIMESTAMPTZ
 );
 
-ALTER TABLE infra.oauth_federation_access_tokens
+ALTER TABLE infra.oauth_token_exchange_access_tokens
   ADD COLUMN IF NOT EXISTS attestation JSONB;
-ALTER TABLE infra.oauth_federation_access_tokens
+ALTER TABLE infra.oauth_token_exchange_access_tokens
   ADD COLUMN IF NOT EXISTS resource TEXT;
-ALTER TABLE infra.oauth_federation_access_tokens
+ALTER TABLE infra.oauth_token_exchange_access_tokens
   ADD COLUMN IF NOT EXISTS task_id TEXT;
 
-CREATE INDEX IF NOT EXISTS oauth_federation_tokens_active_idx
-  ON infra.oauth_federation_access_tokens (agent_id, actor_id, expires_at)
+CREATE INDEX IF NOT EXISTS oauth_token_exchange_tokens_active_idx
+  ON infra.oauth_token_exchange_access_tokens (profile_id, agent_id, actor_id, expires_at)
   WHERE revoked = false;
 
--- Atomic replay protection over SHA-256(iss,jti). A single exchange consumes
+-- Atomic replay protection over SHA-256(profile_id,iss,jti). A single exchange consumes
 -- the subject and client assertion tuples in one transaction.
-CREATE TABLE IF NOT EXISTS infra.oauth_federation_replays (
+CREATE TABLE IF NOT EXISTS infra.oauth_token_exchange_replays (
   digest      BYTEA PRIMARY KEY,
+  profile_id  TEXT NOT NULL,
   expires_at  TIMESTAMPTZ NOT NULL,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS oauth_federation_replays_expiry_idx
-  ON infra.oauth_federation_replays (expires_at);
+CREATE INDEX IF NOT EXISTS oauth_token_exchange_replays_expiry_idx
+  ON infra.oauth_token_exchange_replays (expires_at);
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON
-  infra.oauth_federation_access_tokens,
-  infra.oauth_federation_replays
+  infra.oauth_token_exchange_access_tokens,
+  infra.oauth_token_exchange_replays
 TO app_postgraphile;
 
 -- ============================================================

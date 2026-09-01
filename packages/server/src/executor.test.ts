@@ -365,6 +365,7 @@ test('executor prefers the v2 principal and attestations shape for new clients',
     metadata: {
       _principalId: 'slack:T123/U456',
       _actorId: 'did:web:issuer.example',
+      _authorizationProfile: 'https://mentionable.dev/ns/oauth-federation/v0.1',
       _authorizationKey: 'federated:v1:task-policy-key',
       [IDENTITY_VC_PRESENTED_METADATA_KEY]: [
         {
@@ -400,6 +401,7 @@ test('executor prefers the v2 principal and attestations shape for new clients',
   const binding = registry.getBinding(task.id)!;
   assert.equal(binding.principalId, 'slack:T123/U456');
   assert.equal(binding.actorId, 'did:web:issuer.example');
+  assert.equal(binding.authorizationProfile, 'https://mentionable.dev/ns/oauth-federation/v0.1');
   assert.equal(binding.authorizationKey, 'federated:v1:task-policy-key');
   binding.sink.pushStatus({
     taskId: task.id,

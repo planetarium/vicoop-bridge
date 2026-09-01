@@ -18,8 +18,8 @@
 
 import type { Hono, Context } from 'hono';
 import type { Sql } from '../db.js';
-import { OAUTH_FEDERATION_ACCESS_TOKEN_PREFIX } from '../oauth-federation/profile.js';
-import { revokeFederatedAccessTokenByRaw } from '../oauth-federation/store.js';
+import { TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX } from '../oauth/token-exchange/types.js';
+import { revokeTokenExchangeAccessTokenByRaw } from '../oauth/token-exchange/store.js';
 import { revokeSessionTokenByRaw } from './caller-token.js';
 
 export interface RevocationOptions {
@@ -61,8 +61,8 @@ export function mountTokenRevocation(app: Hono, opts: RevocationOptions): void {
     }
     // token_type_hint is accepted but ignored — the prefix on the token
     // already identifies the audience.
-    if (token.startsWith(OAUTH_FEDERATION_ACCESS_TOKEN_PREFIX)) {
-      await revokeFederatedAccessTokenByRaw(opts.sql, token);
+    if (token.startsWith(TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX)) {
+      await revokeTokenExchangeAccessTokenByRaw(opts.sql, token);
     } else {
       await revokeSessionTokenByRaw(opts.sql, token);
     }

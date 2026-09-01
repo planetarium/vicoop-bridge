@@ -393,6 +393,10 @@ export class WSForwardingExecutor extends AgentExecutor {
       typeof rawMetadata?._authorizationKey === 'string'
         ? rawMetadata._authorizationKey
         : undefined;
+    const authorizationProfile =
+      typeof rawMetadata?._authorizationProfile === 'string'
+        ? rawMetadata._authorizationProfile
+        : undefined;
     const presented = rawMetadata?.[IDENTITY_VC_PRESENTED_METADATA_KEY];
     if (rawMetadata) delete rawMetadata[IDENTITY_VC_PRESENTED_METADATA_KEY];
     const forwardMetadata = stripInternalMetadata(rawMetadata);
@@ -484,6 +488,7 @@ export class WSForwardingExecutor extends AgentExecutor {
       ...(executionId !== undefined ? { executionId, nextClientSeq: 0 } : {}),
       ...(principalId !== undefined ? { principalId } : {}),
       ...(actorId !== undefined ? { actorId } : {}),
+      ...(authorizationProfile !== undefined ? { authorizationProfile } : {}),
       ...(authorizationKey !== undefined ? { authorizationKey } : {}),
       ...(requestedExtensions !== undefined ? { requestedExtensions } : {}),
     };

@@ -37,8 +37,9 @@ export interface VerifiedCaller {
   // effective principal and the independently authenticated Connector DID is
   // retained as actor.
   actorId?: string;
-  federation?: {
+  tokenExchange?: {
     tokenId: string;
+    profileId: string;
     agentId: string;
     resource: string;
     actorId: string;
@@ -243,7 +244,7 @@ export function matchPrincipal(entry: Principal, caller: VerifiedCaller): boolea
       return caller.principalId === 'apikey:' + parsed.keyId;
     }
     case 'federated': {
-      return caller.federation?.allowedCaller === entry;
+      return caller.tokenExchange?.allowedCaller === entry;
     }
   }
 }

@@ -72,6 +72,7 @@ export interface TaskBinding {
   // Connector DID; authorizationKey is the exact allowed-caller tuple that
   // promoted the platform subject to principal.
   actorId?: string;
+  authorizationProfile?: string;
   authorizationKey?: string;
   requestedExtensions?: string[];
   // Diagnostic counter (issue #414): number of liveness-heartbeat `task.status`

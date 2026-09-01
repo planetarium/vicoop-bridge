@@ -14,7 +14,7 @@ import { buildAgentA2XServer } from './agent-card.js';
 import { Registry, type ClientConnection } from './registry.js';
 import { parseX402Pricing } from './x402/pricing.js';
 import type { Sql } from './db.js';
-import { OAUTH_FEDERATION_EXTENSION_URI } from './oauth-federation/profile.js';
+import { OAUTH_FEDERATION_EXTENSION_URI } from './oauth/profiles/mentionable-v0.1.js';
 import { formatFederatedPrincipal } from './auth/principal.js';
 
 function fakeConn(card: AgentCard, overrides: Partial<ClientConnection> = {}): ClientConnection {

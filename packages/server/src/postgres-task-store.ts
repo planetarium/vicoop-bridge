@@ -45,7 +45,10 @@ function extractOwnerPrincipal(task: Task): string | undefined {
   return undefined;
 }
 
-function extractAuthorizationField(task: Task, key: '_actorId' | '_authorizationKey'): string | undefined {
+function extractAuthorizationField(
+  task: Task,
+  key: '_actorId' | '_authorizationProfile' | '_authorizationKey',
+): string | undefined {
   for (const msg of task.history ?? []) {
     const value = (msg as MessageWithMetadata).metadata?.[key];
     if (typeof value === 'string') return value;
@@ -60,6 +63,7 @@ function stripMessageMetadata(msg: Message): Message {
     _bearerToken,
     _principalId,
     _actorId,
+    _authorizationProfile,
     _authorizationKey,
     [IDENTITY_VC_PRESENTED_METADATA_KEY]: _presented,
     ...rest
@@ -67,6 +71,7 @@ function stripMessageMetadata(msg: Message): Message {
   void _bearerToken;
   void _principalId;
   void _actorId;
+  void _authorizationProfile;
   void _authorizationKey;
   void _presented;
   const clean = Object.keys(rest).length ? rest : undefined;
@@ -493,6 +498,7 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   private async writeTask(task: Task, sql: SqlExecutor = this.sql): Promise<void> {
     const ownerPrincipal = extractOwnerPrincipal(task);
     const ownerActor = extractAuthorizationField(task, '_actorId');
+    const authorizationProfile = extractAuthorizationField(task, '_authorizationProfile');
     const authorizationKey = extractAuthorizationField(task, '_authorizationKey');
     const sanitized = stripSensitiveMetadata(task, {
       preserveEnvelope: this.persistRequestEnvelope,
@@ -504,10 +510,11 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
       await sql`
         INSERT INTO infra.a2a_tasks
           (task_id, context_id, state, task_json, owner_principal, owner_agent,
-           owner_actor, authorization_key)
+           owner_actor, authorization_profile, authorization_key)
         VALUES (
           ${task.id}, ${contextId}, ${task.status.state}, ${persisted},
-          ${ownerPrincipal ?? null}, NULL, ${ownerActor ?? null}, ${authorizationKey ?? null}
+          ${ownerPrincipal ?? null}, NULL, ${ownerActor ?? null},
+          ${authorizationProfile ?? null}, ${authorizationKey ?? null}
         )
         ON CONFLICT (task_id) DO UPDATE SET
           context_id = EXCLUDED.context_id,
@@ -515,6 +522,10 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
           task_json = EXCLUDED.task_json,
           owner_principal = COALESCE(infra.a2a_tasks.owner_principal, EXCLUDED.owner_principal),
           owner_actor = COALESCE(infra.a2a_tasks.owner_actor, EXCLUDED.owner_actor),
+          authorization_profile = COALESCE(
+            infra.a2a_tasks.authorization_profile,
+            EXCLUDED.authorization_profile
+          ),
           authorization_key = COALESCE(infra.a2a_tasks.authorization_key, EXCLUDED.authorization_key),
           updated_at = now()
       `;
@@ -523,11 +534,11 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     await sql`
       INSERT INTO infra.a2a_tasks
         (task_id, context_id, state, task_json, owner_principal, owner_agent,
-         owner_actor, authorization_key)
+         owner_actor, authorization_profile, authorization_key)
       VALUES (
         ${task.id}, ${contextId}, ${task.status.state}, ${persisted},
         ${ownerPrincipal ?? null}, ${this.ownerAgent},
-        ${ownerActor ?? null}, ${authorizationKey ?? null}
+        ${ownerActor ?? null}, ${authorizationProfile ?? null}, ${authorizationKey ?? null}
       )
       ON CONFLICT (task_id) DO UPDATE SET
         context_id = EXCLUDED.context_id,
@@ -535,6 +546,10 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
         task_json = EXCLUDED.task_json,
         owner_principal = COALESCE(infra.a2a_tasks.owner_principal, EXCLUDED.owner_principal),
         owner_actor = COALESCE(infra.a2a_tasks.owner_actor, EXCLUDED.owner_actor),
+        authorization_profile = COALESCE(
+          infra.a2a_tasks.authorization_profile,
+          EXCLUDED.authorization_profile
+        ),
         authorization_key = COALESCE(infra.a2a_tasks.authorization_key, EXCLUDED.authorization_key),
         updated_at = now()
       WHERE infra.a2a_tasks.owner_agent = EXCLUDED.owner_agent

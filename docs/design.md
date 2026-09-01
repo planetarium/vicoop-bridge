@@ -166,13 +166,17 @@ also sorts and deduplicates attestations. Equivalent v1/v2 frames and freshly
 issued credentials for the same identity therefore share scope, while a
 security-relevant identity change still splits sessions.
 
-OAuth federation is the authorization-capable exception to the otherwise
-context-only attestation path. In the v0.1 direct-Connector topology, an exact
+OAuth token exchange is the authorization-capable exception to the otherwise
+context-only attestation path. The RFC 8693 route, opaque-token lifecycle, and
+replay store are profile-neutral; installed profiles derive the identity and
+authorization context. The first installed profile is Mentionable v0.1. In
+its direct-Connector topology, an exact
 `(issuer, method, subject)` tuple must already exist in the target agent's
 `allowed_callers`. After full assertion and client authentication, the bridge
 sets principal to the platform subject, actor to the Connector DID, and retains
 the collision-safe tuple key only as a server-side authorization binding.
-Tasks persist those three normalized values in dedicated columns. Follow-up
+Tasks persist those values plus the issuing profile identifier in dedicated
+columns. Follow-up
 operations require a resource/scope-constrained bearer, task-bound principal
 and actor matches, and a still-active exact tuple; neither task ids nor context
 ids are proof. Continuation-derived tokens are additionally restricted to the

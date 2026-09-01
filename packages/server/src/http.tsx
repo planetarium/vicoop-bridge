@@ -81,13 +81,14 @@ import {
   type ConnectionPair,
   type WellKnownDeps,
 } from './well-known.js';
-import { mountOAuthFederationRoutes } from './oauth-federation/routes.js';
+import { mountTokenExchangeRoutes } from './oauth/token-exchange/routes.js';
+import { createMentionableOAuthProfile } from './oauth/profiles/mentionable-v0.1.js';
 import {
   authorizeFederatedOperation,
   parseFederatedHttpJsonOperation,
   parseFederatedJsonRpcOperation,
   type FederatedOperation,
-} from './oauth-federation/authorization.js';
+} from './oauth/profiles/mentionable-authorization.js';
 
 export interface ServerHttpOptions {
   registry: Registry;
@@ -382,14 +383,17 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         ...(isRecord(message.metadata) ? message.metadata : {}),
         _principalId: caller.principalId,
         ...(caller.actorId !== undefined ? { _actorId: caller.actorId } : {}),
-        ...(caller.federation?.allowedCaller !== undefined
-          ? { _authorizationKey: caller.federation.allowedCaller }
+        ...(caller.tokenExchange?.allowedCaller !== undefined
+          ? { _authorizationKey: caller.tokenExchange.allowedCaller }
           : {}),
-        ...(caller.federation?.attestations !== undefined
+        ...(caller.tokenExchange?.profileId !== undefined
+          ? { _authorizationProfile: caller.tokenExchange.profileId }
+          : {}),
+        ...(caller.tokenExchange?.attestations !== undefined
           ? {
               [IDENTITY_VC_PRESENTED_METADATA_KEY]: [
                 ...existingAttestations,
-                ...caller.federation.attestations,
+                ...caller.tokenExchange.attestations,
               ],
             }
           : {}),
@@ -411,7 +415,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     );
     if (result.ok) return undefined;
     const rejectionId = newRejectionId();
-    logEvent('oauth_federation_request_rejected', {
+    logEvent('oauth_token_exchange_request_rejected', {
       agentId: c.req.param('id'),
       reason: result.reason,
       rejectionId,
@@ -465,10 +469,10 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   }
 
   if (opts.publicUrl) {
-    mountOAuthFederationRoutes(app, {
+    mountTokenExchangeRoutes(app, {
       sql: opts.db,
       publicUrl: opts.publicUrl,
-      resolver: identityVcResolver,
+      profiles: [createMentionableOAuthProfile({ resolver: identityVcResolver })],
       passThroughOtherGrants: deviceFlowEnabled,
       ...(opts.identityVc?.now !== undefined ? { now: opts.identityVc.now } : {}),
     });
