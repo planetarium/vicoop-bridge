@@ -85,6 +85,7 @@ function authorizationSql(input: {
   principalId: string;
   authorizationKey: string;
   active: boolean;
+  authorizationRevoked?: boolean;
 }): Sql {
   return (async (strings: TemplateStringsArray) => {
     const statement = strings.join('?');
@@ -96,6 +97,7 @@ function authorizationSql(input: {
           owner_actor: input.actorId,
           authorization_profile: 'https://mentionable.dev/ns/oauth-federation/v0.1',
           authorization_key: input.authorizationKey,
+          authorization_revoked: input.authorizationRevoked ?? false,
         },
       ];
     }
@@ -239,6 +241,26 @@ test('task continuity fails closed on actor mismatch or removed exact grant', as
     ),
     { ok: false, reason: 'task_grant_revoked' },
   );
+});
+
+test('re-adding a tuple does not restore authority over a permanently revoked task', async () => {
+  const result = await authorize(
+    authorizationSql({
+      actorId: 'did:web:connector.example',
+      principalId: 'slack:T123/U456',
+      authorizationKey: 'federated-key-1',
+      active: true,
+      authorizationRevoked: true,
+    }),
+    'agent-1',
+    federatedCaller(),
+    {
+      name: 'task.read',
+      kind: 'task',
+      taskId: 'task-1',
+    },
+  );
+  assert.deepEqual(result, { ok: false, reason: 'task_grant_revoked' });
 });
 
 test('a federated task remains protected after the agent becomes public', async () => {

@@ -109,10 +109,12 @@ DELETE /admin-api/agents/:id/federated-callers
 ```
 
 The ordinary callers response includes both the canonical `allowed_callers`
-array and a decoded `federated_callers` array. Mutations hot-reload the live
-agent card. Removing the tuple immediately makes message tokens fail their
-database policy check and makes follow-up task operations fail their persisted
-authorization-key check across server instances.
+array and a decoded `federated_callers` array. Mutations update the serving
+instance immediately and use PostgreSQL notifications for cross-instance
+Agent Card cache convergence. Removing the tuple atomically marks all access
+tokens issued under it as revoked and timestamps its historical task bindings.
+Re-adding the same tuple authorizes future exchanges but cannot reactivate
+those tokens or task bindings.
 
 As elsewhere in the bridge, an empty `allowed_callers` array means the agent
 is public for new messages. Add a replacement caller before removing the last
@@ -154,15 +156,16 @@ When a message creates or continues a task, the server persists only:
 - the normalized platform principal;
 - the Connector actor DID;
 - the token-exchange profile identifier;
-- the exact federated allowed-caller key.
+- the exact federated allowed-caller key;
+- a revocation timestamp when the receiver removes that authorization.
 
 Later get, cancel, resubscribe, and push-configuration operations require the
 corresponding scope, both the same task-bound principal and actor, and an
-authorization key still present in the agent's live database policy. This
-principal check also applies when a message-path token carries task scopes;
-one user of a Connector cannot operate another user's task. Federated task listing is closed
-in v0.1 because the current task-store interface has no request-scoped actor
-filter.
+authorization key still present in the agent's live database policy whose task
+binding has never been revoked. This principal check also applies when a
+message-path token carries task scopes; one user of a Connector cannot operate
+another user's task. Federated task listing is closed in v0.1 because the
+current task-store interface has no request-scoped actor filter.
 To avoid mixed-mode leakage, task listing is also rejected for ordinary or
 anonymous callers while the agent has any federated task binding.
 

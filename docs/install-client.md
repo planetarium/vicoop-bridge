@@ -965,8 +965,11 @@ curl -sX POST "$BRIDGE_URL/" \
   | jq -r '.result.status.message.parts[0].text'
 ```
 
-Either path hot-reloads via `registry.updateAllowedCallers` — no client
-restart needed.
+Either path updates the database and serving instance immediately. Other
+server instances converge through best-effort PostgreSQL notifications, so no
+client restart is normally needed; if an Agent Card remains stale, check the
+`caller_policy_*_failed` server events and reconnect the agent after restoring
+notifications.
 
 ### Static API keys (non-interactive callers)
 

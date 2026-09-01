@@ -10,7 +10,12 @@ import type { AgentCard } from '@vicoop-bridge/protocol';
 import { createHttpApp } from './http.js';
 import { Registry, type ClientConnection } from './registry.js';
 import { issueSessionToken, verifyCallerToken, CALLER_TOKEN_PREFIX } from './auth/caller-token.js';
-import { matchPrincipal } from './auth/principal.js';
+import { formatFederatedPrincipal, matchPrincipal } from './auth/principal.js';
+import {
+  issueTokenExchangeAccessToken,
+  loadTokenExchangeTaskAuthorization,
+  verifyTokenExchangeAccessToken,
+} from './oauth/token-exchange/store.js';
 
 const hasDb = !!process.env.DATABASE_URL;
 
@@ -280,6 +285,106 @@ test(
       assert.equal(rows[0]!.client_id, setup.clientId);
       assert.deepEqual(rows[0]!.allowed_callers, [target]);
     } finally {
+      if (setup) await teardown(sql, owner, setup.clientId);
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'removing a federated caller permanently revokes its tokens and historical tasks',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const owner = `eth:0x${'7'.repeat(40)}`;
+    let setup: SetupResult | null = null;
+    let intruderCallerId: string | null = null;
+    const taskId = `federated-revoke-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      setup = await setupOwner(sql, owner);
+      const registry = new Registry();
+      const app = createHttpApp({ db: sql, registry });
+      const tuple = {
+        issuer: 'did:web:connector.example',
+        method: 'urn:mentionable:auth:slack-workspace-member:v0.1',
+        subject: 'slack:T123/U456',
+      };
+      const authorizationKey = formatFederatedPrincipal(tuple);
+      assert.ok(authorizationKey);
+      const mutation = (method: 'POST' | 'DELETE') =>
+        app.request(`/admin-api/agents/${setup!.agentId}/federated-callers`, {
+          method,
+          headers: { ...authHeaders(setup!.ownerToken), 'content-type': 'application/json' },
+          body: JSON.stringify(tuple),
+        });
+
+      assert.equal((await mutation('POST')).status, 200);
+      const issued = await issueTokenExchangeAccessToken(sql, {
+        profileId: 'https://mentionable.dev/ns/oauth-federation/v0.1',
+        agentId: setup.agentId,
+        resource: `https://bridge.example/agents/${setup.agentId}`,
+        principalId: tuple.subject,
+        actorId: tuple.issuer,
+        allowedCaller: authorizationKey,
+        scopes: ['a2a:message.send'],
+        expiresAt: new Date(Date.now() + 5 * 60_000),
+      });
+      const taskJson = {
+        id: taskId,
+        contextId: taskId,
+        status: { state: 'working', timestamp: new Date().toISOString() },
+      };
+      await sql`
+        INSERT INTO infra.a2a_tasks
+          (task_id, context_id, state, task_json, owner_principal, owner_agent,
+           owner_actor, authorization_profile, authorization_key)
+        VALUES (
+          ${taskId}, ${taskId}, 'working', ${sql.json(taskJson)}, ${tuple.subject},
+          ${setup.agentId}, ${tuple.issuer},
+          'https://mentionable.dev/ns/oauth-federation/v0.1', ${authorizationKey}
+        )
+      `;
+
+      const intruder = await issueSessionToken(sql, {
+        principalId: `eth:0x${'8'.repeat(40)}`,
+        provider: 'siwe',
+        audience: 'owner_session',
+      });
+      intruderCallerId = intruder.callerId;
+      const unauthorized = await app.request(
+        `/admin-api/agents/${setup.agentId}/federated-callers`,
+        {
+          method: 'DELETE',
+          headers: { ...authHeaders(intruder.rawToken), 'content-type': 'application/json' },
+          body: JSON.stringify(tuple),
+        },
+      );
+      assert.equal(unauthorized.status, 404);
+      const beforeOwnerRemoval = await sql<{ revoked: boolean }[]>`
+        SELECT revoked FROM infra.oauth_token_exchange_access_tokens
+        WHERE id = ${issued.token.tokenId}
+      `;
+      assert.equal(beforeOwnerRemoval[0]?.revoked, false);
+
+      assert.equal((await mutation('DELETE')).status, 200);
+      // Re-adding the same policy permits future exchanges but must not
+      // resurrect credentials or task authority issued before revocation.
+      assert.equal((await mutation('POST')).status, 200);
+
+      const tokenRows = await sql<{ revoked: boolean }[]>`
+        SELECT revoked FROM infra.oauth_token_exchange_access_tokens
+        WHERE id = ${issued.token.tokenId}
+      `;
+      assert.equal(tokenRows[0]?.revoked, true);
+      await assert.rejects(
+        verifyTokenExchangeAccessToken(sql, issued.rawToken, setup.agentId),
+        /expired or revoked/,
+      );
+      const taskBinding = await loadTokenExchangeTaskAuthorization(sql, setup.agentId, taskId);
+      assert.equal(taskBinding?.authorizationRevoked, true);
+    } finally {
+      await sql`DELETE FROM infra.a2a_tasks WHERE task_id = ${taskId}`;
+      if (intruderCallerId) await sql`DELETE FROM callers WHERE id = ${intruderCallerId}`;
       if (setup) await teardown(sql, owner, setup.clientId);
       await sql.end();
     }

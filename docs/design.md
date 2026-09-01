@@ -178,11 +178,14 @@ its direct-Connector topology, an exact
 sets principal to the platform subject, actor to the Connector DID, and retains
 the collision-safe tuple key only as a server-side authorization binding.
 Tasks persist those values plus the issuing profile identifier atomically in
-dedicated columns during the initial task INSERT. Follow-up
-operations require a resource/scope-constrained bearer, task-bound principal
-and actor matches, and a still-active exact tuple; neither task ids nor context
-ids are proof. Continuation-derived tokens are additionally restricted to the
-verified `mentionable_task_id`.
+dedicated columns during the initial task INSERT. Removing the exact tuple
+atomically revokes its issued access tokens and timestamps every matching task
+binding, so re-adding the tuple cannot resurrect historical authority.
+Follow-up operations require a resource/scope-constrained bearer, task-bound
+principal and actor matches, a still-active exact tuple, and a task binding
+that has never been revoked; neither task ids nor context ids are proof.
+Continuation-derived tokens are additionally restricted to the verified
+`mentionable_task_id`.
 Federated delivery therefore requires caller-context-v2. See
 [`oauth-federation.md`](./oauth-federation.md) for the wire profile and
 operator flow, including why the separate connector-kit package boundary is

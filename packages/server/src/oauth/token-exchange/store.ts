@@ -25,6 +25,7 @@ export interface TokenExchangeTaskAuthorization {
   actorId?: string;
   profileId?: string;
   authorizationKey?: string;
+  authorizationRevoked: boolean;
 }
 
 export class TokenExchangeTokenError extends Error {
@@ -90,6 +91,10 @@ export async function issueTokenExchangeAccessToken(
   },
 ): Promise<{ rawToken: string; token: TokenExchangeAccessToken }> {
   const rawToken = TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX + randomBytes(32).toString('base64url');
+  // Share-lock the policy row through the INSERT. Federated removal takes a
+  // conflicting FOR UPDATE lock, so a concurrent exchange either commits
+  // first and is included in revocation, or observes the removed tuple and
+  // cannot issue a token that could revive after a later re-add.
   const rows = await sql<{ id: string }[]>`
     INSERT INTO infra.oauth_token_exchange_access_tokens
       (token_hash, profile_id, agent_id, resource, principal_id, actor_id, allowed_caller,
@@ -99,9 +104,13 @@ export async function issueTokenExchangeAccessToken(
       ${input.actorId}, ${input.allowedCaller},
       ${input.attestation ? JSON.stringify(input.attestation) : null}::jsonb,
       ${input.scopes}, ${input.taskId ?? null}, ${input.expiresAt}
-    FROM agents a
-    WHERE a.id = ${input.agentId}
-      AND ${input.allowedCaller} = ANY(a.allowed_callers)
+    FROM (
+      SELECT id
+      FROM agents
+      WHERE id = ${input.agentId}
+        AND ${input.allowedCaller} = ANY(allowed_callers)
+      FOR SHARE
+    ) AS a
     RETURNING id
   `;
   const id = rows[0]?.id;
@@ -223,9 +232,11 @@ export async function loadTokenExchangeTaskAuthorization(
       owner_actor: string | null;
       authorization_profile: string | null;
       authorization_key: string | null;
+      authorization_revoked: boolean;
     }[]
   >`
-    SELECT owner_principal, owner_actor, authorization_profile, authorization_key
+    SELECT owner_principal, owner_actor, authorization_profile, authorization_key,
+           (authorization_revoked_at IS NOT NULL) AS authorization_revoked
     FROM infra.a2a_tasks
     WHERE owner_agent = ${agentId} AND task_id = ${taskId}
     LIMIT 1
@@ -237,6 +248,7 @@ export async function loadTokenExchangeTaskAuthorization(
     ...(row.owner_actor !== null ? { actorId: row.owner_actor } : {}),
     ...(row.authorization_profile !== null ? { profileId: row.authorization_profile } : {}),
     ...(row.authorization_key !== null ? { authorizationKey: row.authorization_key } : {}),
+    authorizationRevoked: row.authorization_revoked === true,
   };
 }
 

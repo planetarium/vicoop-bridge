@@ -54,6 +54,9 @@ export async function authorizeMentionableOperation({
 
   const task = await loadTokenExchangeTaskAuthorization(sql, agentId, operation.taskId);
   if (!task) return { ok: true as const };
+  if (task.authorizationRevoked) {
+    return { ok: false as const, reason: 'task_grant_revoked' };
+  }
   if (task.profileId !== MENTIONABLE_OAUTH_PROFILE_ID) {
     return { ok: false as const, reason: 'task_profile_mismatch' };
   }

@@ -163,6 +163,28 @@ export async function removeCaller(
     throw new AdminApiError(INVALID_PRINCIPAL_MESSAGE, 400);
   }
 
+  if (normalized.startsWith('federated:v1:')) {
+    const rows = await db.begin(async (tx) => {
+      await setRlsContext(tx, principalId);
+      return tx<{ allowed_callers: string[]; removed: boolean }[]>`
+        SELECT allowed_callers, removed
+        FROM revoke_federated_caller_authorization(${agentId}, ${normalized})
+      `;
+    });
+    const outcome = rows[0];
+    if (!outcome) {
+      throw new AdminApiError('Agent not found or not authorized.', 404);
+    }
+    registry.updateAllowedCallers(agentId, outcome.allowed_callers);
+    if (outcome.removed) await notifyCallerPolicyChanged(db, agentId);
+    return {
+      agent_id: agentId,
+      principal: normalized,
+      allowed_callers: outcome.allowed_callers,
+      ...(!outcome.removed ? { message: 'Principal not in allowed callers' } : {}),
+    };
+  }
+
   const result = await db.begin(async (tx) => {
     await setRlsContext(tx, principalId);
     return tx`

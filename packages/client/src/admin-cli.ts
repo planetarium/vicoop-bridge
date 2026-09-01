@@ -154,8 +154,8 @@ function federatedCallerCommand<
 >(name: 'add-federated' | 'remove-federated', action: A) {
   const adding = action === 'agent-callers-add-federated';
   const description = adding
-    ? message`Adds one exact (issuer, method, subject) tuple to the agent's allowed callers. The values are case-sensitive and must exactly match the Connector's later subject assertion. This changes receiver policy only: it does not mint an access token, resolve the DID, or contact the Connector. The policy is hot-reloaded with no daemon restart. WARNING: when allowed_callers is empty, adding this first entry changes the agent from public to restricted.`
-    : message`Removes one exact (issuer, method, subject) tuple from the agent's allowed callers. The policy is hot-reloaded with no daemon restart. New exchanges are rejected immediately, existing message tokens fail their live policy check, and follow-up access to tasks bound to this tuple is revoked. WARNING: removing the final allowed caller makes the agent public for new messages; add a replacement first if it must remain restricted.`;
+    ? message`Adds one exact (issuer, method, subject) tuple to the agent's allowed callers. The values are case-sensitive and must exactly match the Connector's later subject assertion. This changes receiver policy only: it does not mint an access token, resolve the DID, or contact the Connector. The database and this server instance update immediately; cross-instance cache propagation uses best-effort database notifications, so no daemon restart is normally needed. WARNING: when allowed_callers is empty, adding this first entry changes the agent from public to restricted.`
+    : message`Removes one exact (issuer, method, subject) tuple from the agent's allowed callers. In the same transaction, every token issued under the tuple is permanently revoked and every historical task binding is tombstoned; re-adding the tuple authorizes only future exchanges and does not restore them. The database and this server instance update immediately; cross-instance cache propagation uses best-effort database notifications. WARNING: removing the final allowed caller makes the agent public for new messages; add a replacement first if it must remain restricted.`;
   const footer = adding
     ? message`Example: vicoop-client agent callers add-federated my-agent --issuer did:web:connector.example --method urn:mentionable:auth:slack-workspace-member:v0.1 --subject slack:T123/U456. Guide: https://github.com/planetarium/vicoop-bridge/blob/main/docs/manage-federated-callers.md`
     : message`Use agent callers list AGENT_ID --json to copy the exact tuple before removal. Guide: https://github.com/planetarium/vicoop-bridge/blob/main/docs/manage-federated-callers.md`;
@@ -487,6 +487,15 @@ function resolveSession(args: {
   server?: string;
   token?: string;
 }): Session | { error: string } {
+  // A token is scoped to the bridge that issued it. Never combine one
+  // explicit override with the other half from disk/env: `--server` alone
+  // could otherwise send a saved production bearer to an arbitrary host.
+  if ((args.server === undefined) !== (args.token === undefined)) {
+    return {
+      error:
+        'Pass --server and --token together. Owner-session credentials are tied to their bridge URL.',
+    };
+  }
   if (args.server && args.token) {
     return { bridge: args.server.replace(/\/$/, ''), token: args.token };
   }

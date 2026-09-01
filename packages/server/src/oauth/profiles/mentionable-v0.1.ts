@@ -262,6 +262,7 @@ export function createMentionableOAuthProfile(
         if (
           !task?.principalId ||
           !task.actorId ||
+          task.authorizationRevoked ||
           task.profileId !== MENTIONABLE_OAUTH_PROFILE_ID ||
           !task.authorizationKey ||
           task.principalId !== candidate.subject ||

@@ -100,7 +100,12 @@ function sqlWithPolicy(
   allowedCallers: string[],
   inserted: string[] = [],
   tokenRows: unknown[][] = [],
-  task?: { principalId: string; actorId: string; authorizationKey: string },
+  task?: {
+    principalId: string;
+    actorId: string;
+    authorizationKey: string;
+    authorizationRevoked?: boolean;
+  },
 ): Sql {
   const query = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
     const statement = strings.join('?');
@@ -125,7 +130,8 @@ function sqlWithPolicy(
             owner_actor: task.actorId,
             authorization_profile: 'https://mentionable.dev/ns/oauth-federation/v0.1',
             authorization_key: task.authorizationKey,
-            },
+            authorization_revoked: task.authorizationRevoked ?? false,
+          },
           ]
         : [];
     }
@@ -482,6 +488,39 @@ test('task continuation exchange keeps the originating tuple and task binding', 
   assert.equal(tokenRows[0]?.[4], issuer);
   assert.equal(tokenRows[0]?.[5], authorizationKey);
   assert.equal(tokenRows[0]?.[8], 'task-1');
+});
+
+test('task continuation exchange stays revoked after the exact tuple is re-added', async () => {
+  const fixture = await assertions();
+  const authorizationKey = formatFederatedPrincipal({ issuer, method, subject });
+  assert.ok(authorizationKey);
+  const app = new Hono();
+  mountMentionableTokenExchangeRoutes(app, {
+    sql: sqlWithPolicy([authorizationKey], [], [], {
+      principalId: subject,
+      actorId: issuer,
+      authorizationKey,
+      authorizationRevoked: true,
+    }),
+    publicUrl,
+    resolver: {
+      async resolve() {
+        return fixture.didDocument;
+      },
+    },
+    now,
+  });
+  const body = requestBody(fixture.continuationAssertion, fixture.clientAssertion);
+  body.set('scope', OAUTH_FEDERATION_SCOPE_TASK_READ);
+  const response = await app.request('/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  assert.equal(response.status, 400);
+  const responseBody = (await response.json()) as { error: string; error_description: string };
+  assert.equal(responseBody.error, 'invalid_grant');
+  assert.equal(responseBody.error_description, 'task continuation is not authorized');
 });
 
 test('chunked token requests are rejected while streaming once they cross the size limit', async () => {

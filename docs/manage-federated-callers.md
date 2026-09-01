@@ -46,7 +46,10 @@ You need:
 The target agent must be connected with `caller-context-v2`, and the server
 must have `PUBLIC_URL` configured, before its Agent Card advertises federation.
 The caller-policy mutation itself is hot-reloaded and does not require an agent
-daemon restart.
+daemon restart in the normal case. The database and the server instance that
+handles the mutation update immediately. Other server instances converge via
+best-effort PostgreSQL `LISTEN`/`NOTIFY`; recovery steps for a failed
+cross-instance notification are listed under troubleshooting.
 
 Check the installed CLI and find the agent id:
 
@@ -68,7 +71,8 @@ the bridge's `https://` URL.
 ## 1. Sign in as the agent owner
 
 The command requires an owner-session bearer (`vbc_owner_*`), not the
-per-agent server token used by the daemon:
+per-agent server token used by the daemon. When the bridge has Google OAuth
+device flow enabled, the CLI can obtain and save one directly:
 
 ```bash
 vicoop-client auth login --server "$BRIDGE_URL"
@@ -76,7 +80,26 @@ vicoop-client auth login --server "$BRIDGE_URL"
 
 The saved owner session is used automatically by later commands. For CI, set
 `VICOOP_BRIDGE` and `VICOOP_OWNER_TOKEN`, or pass `--server` and `--token`
-explicitly.
+explicitly. The CLI rejects either flag on its own and never combines an
+explicit server with a bearer loaded from disk or the environment.
+
+`auth login` calls `/oauth/device/code`, which is not mounted on a self-hosted
+bridge without Google OAuth. On a SIWE-only deployment, sign a fresh SIWE
+message and exchange it for an owner-session bearer instead. The complete
+signing example is in
+[`remote-testing.md`](./remote-testing.md#step-1--siwe-exchange); after it
+produces a JSON file containing `message` and `signature`, use:
+
+```bash
+VICOOP_OWNER_TOKEN=$(curl -fsS -X POST "$BRIDGE_URL/auth/siwe/exchange" \
+  -H 'Content-Type: application/json' \
+  --data "$(jq -c '. + {intent: "owner_session"}' /path/to/siwe.json)" \
+  | jq -er '.access_token')
+export VICOOP_BRIDGE="$BRIDGE_URL" VICOOP_OWNER_TOKEN
+```
+
+The SIWE domain must match the hostname derived from the bridge's
+`PUBLIC_URL`. SIWE nonces are single-use.
 
 ## 2. Inspect the current caller policy
 
@@ -114,7 +137,7 @@ The fields mean:
 
 | Input | Meaning | Must match at token exchange |
 |---|---|---|
-| `AGENT_ID` | The receiving vicoop agent | The resource `/agents/AGENT_ID` |
+| `AGENT_ID` | The receiving vicoop agent | The absolute URL in the Agent Card extension's `params.resource`, for example `https://bridge.example/agents/AGENT_ID` |
 | `--issuer` | Connector `did:web` identifier and OAuth client id | Subject assertion `iss` and authenticated client |
 | `--method` | How the Connector authenticated the subject | Mentionable authentication-method claim |
 | `--subject` | Canonical platform identity | Subject assertion `sub` |
@@ -185,9 +208,11 @@ vicoop-client agent callers remove-federated "$AGENT_ID" \
   --subject "$SUBJECT"
 ```
 
-Removal takes effect without reconnecting the agent. New exchanges for that
-tuple are rejected, existing message tokens fail their live policy check, and
-follow-up access to tasks bound to that authorization key is rejected.
+Removal is committed atomically with permanent credential and task revocation.
+New exchanges for that tuple are rejected, all access tokens issued under it
+are marked revoked, and historical task bindings receive a revocation
+timestamp. Re-adding the same tuple authorizes future exchanges only: it does
+not reactivate an old token or restore authority over an old task.
 
 Removing a tuple that is already absent is idempotent and reports `Principal
 not in allowed callers`.
@@ -236,8 +261,10 @@ integration's profile rather than inventing or normalizing them locally.
 
 ### `No owner-session bearer found`
 
-Run `vicoop-client auth login --server "$BRIDGE_URL"` again. A daemon
-`server_token` cannot authorize this command.
+On a bridge with Google device flow, run
+`vicoop-client auth login --server "$BRIDGE_URL"` again. On a SIWE-only
+bridge, repeat the SIWE exchange in Step 1 and export both `VICOOP_BRIDGE` and
+`VICOOP_OWNER_TOKEN`. A daemon `server_token` cannot authorize this command.
 
 ### `Invalid federated caller`
 
@@ -258,6 +285,14 @@ Confirm all of the following:
 - the bridge has a correct public `PUBLIC_URL`;
 - the persisted caller list contains the federated tuple;
 - you fetched the target agent's card, not the root admin Agent Card.
+
+On a multi-instance bridge, also check server logs for
+`caller_policy_notify_failed`, `caller_policy_watch_failed`, or
+`caller_policy_refresh_failed`. Authorization of federated tokens and tasks
+reads the database directly, but an Agent Card or another cached caller-policy
+view can remain stale on the instance holding the agent WebSocket when a
+notification fails. Retry the mutation after restoring PostgreSQL
+notifications, or reconnect the agent to rebuild that instance's cache.
 
 ### Token exchange returns `invalid_grant` for an unauthorized subject
 

@@ -409,6 +409,28 @@ test('subcommand exits 1 with hint when no token is available', async (t) => {
   assert.match(stderr.read(), /vicoop-client auth login --server/);
 });
 
+test('admin commands never mix an explicit server with a saved owner token', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stderr = captureStderr(t);
+  const { calls } = installFetch(t, { body: { agents: [] } });
+
+  const code = await runListAgents(listAgentsArgs({ server: 'https://untrusted.example' }));
+  assert.equal(code, 1);
+  assert.match(stderr.read(), /Pass --server and --token together/);
+  assert.equal(calls.length, 0, 'must not send the saved bearer to the explicit server');
+});
+
+test('admin commands never mix an explicit token with a saved bridge URL', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stderr = captureStderr(t);
+  const { calls } = installFetch(t, { body: { agents: [] } });
+
+  const code = await runListAgents(listAgentsArgs({ token: 'vbc_owner_override' }));
+  assert.equal(code, 1);
+  assert.match(stderr.read(), /Pass --server and --token together/);
+  assert.equal(calls.length, 0, 'must not send the explicit bearer to the saved server');
+});
+
 test('subcommand surfaces network errors as a clean exit-1 instead of crashing', async (t) => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
   const stderr = captureStderr(t);
@@ -821,8 +843,9 @@ test('add-federated --help explains exact matching, policy transition, and a com
 
 test('remove-federated --help explains revocation and the final-caller public transition', () => {
   const help = agentHelp(['agent', 'callers', 'remove-federated']);
-  assert.match(help, /existing message tokens fail/);
-  assert.match(help, /follow-up access to tasks.*revoked/);
+  assert.match(help, /every token.*permanently revoked/);
+  assert.match(help, /historical task binding.*tombstoned/);
+  assert.match(help, /re-adding the tuple.*does not restore/);
   assert.match(help, /final allowed caller makes the agent public/);
   assert.match(help, /add a replacement first/);
 });

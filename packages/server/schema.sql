@@ -643,6 +643,10 @@ ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS owner_agent TEXT;
 ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS owner_actor TEXT;
 ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS authorization_profile TEXT;
 ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS authorization_key TEXT;
+-- A removed federated grant is permanently revoked for tasks that were
+-- created under it. Re-adding the same receiver-policy tuple authorizes new
+-- exchanges but must not resurrect authority over historical tasks.
+ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS authorization_revoked_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_a2a_tasks_agent_context_principal
   ON infra.a2a_tasks (owner_agent, context_id, owner_principal, created_at);
@@ -708,6 +712,72 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
   infra.oauth_token_exchange_access_tokens,
   infra.oauth_token_exchange_replays
 TO app_postgraphile;
+
+-- Owner-scoped, atomic removal for a federated receiver grant. The caller runs
+-- as app_authenticated for agents RLS, which intentionally has no direct
+-- privilege on the private infra tables. A narrowly-scoped SECURITY DEFINER
+-- function performs the policy mutation and irreversible token/task
+-- revocation after re-checking owner/admin authority itself.
+CREATE OR REPLACE FUNCTION revoke_federated_caller_authorization(
+  p_agent_id TEXT,
+  p_authorization_key TEXT
+)
+RETURNS TABLE (allowed_callers TEXT[], removed BOOLEAN)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public, infra
+AS $$
+DECLARE
+  current_callers TEXT[];
+BEGIN
+  IF p_authorization_key NOT LIKE 'federated:v1:%' THEN
+    RAISE EXCEPTION 'authorization key is not a canonical federated caller'
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT a.allowed_callers
+  INTO current_callers
+  FROM public.agents AS a
+  WHERE a.id = p_agent_id
+    AND (
+      a.owner_principal = public.current_principal()
+      OR public.is_admin()
+    )
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  removed := p_authorization_key = ANY(current_callers);
+  IF removed THEN
+    UPDATE public.agents AS a
+    SET allowed_callers = array_remove(a.allowed_callers, p_authorization_key),
+        updated_at = now()
+    WHERE a.id = p_agent_id
+    RETURNING a.allowed_callers INTO current_callers;
+  END IF;
+
+  UPDATE infra.oauth_token_exchange_access_tokens AS token
+  SET revoked = true
+  WHERE token.agent_id = p_agent_id
+    AND token.allowed_caller = p_authorization_key
+    AND token.revoked = false;
+
+  UPDATE infra.a2a_tasks AS task
+  SET authorization_revoked_at = COALESCE(task.authorization_revoked_at, now()),
+      updated_at = now()
+  WHERE task.owner_agent = p_agent_id
+    AND task.authorization_key = p_authorization_key
+    AND task.authorization_revoked_at IS NULL;
+
+  allowed_callers := current_callers;
+  RETURN NEXT;
+END;
+$$;
+REVOKE ALL ON FUNCTION revoke_federated_caller_authorization(TEXT, TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION revoke_federated_caller_authorization(TEXT, TEXT)
+  TO app_authenticated, app_postgraphile;
 
 -- ============================================================
 -- 5. Agent Policies table
