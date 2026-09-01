@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { parse } from '@optique/core/parser';
+import { formatDocPage } from '@optique/core/doc';
+import { getDocPageSync, parse } from '@optique/core/parser';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -800,6 +801,30 @@ test('agent callers {list,remove,issue-api-key} parse through the real parser wi
   // The top-level siblings must keep working after the reorder.
   expectOk(['agent', 'list'], { action: 'agent-list', connected: false });
   expectOk(['agent', 'remove', 'foo', '--yes'], { action: 'agent-delete', target: 'foo', yes: true });
+});
+
+function agentHelp(args: string[]): string {
+  const page = getDocPageSync(agentCmd, args);
+  assert.ok(page, `expected a help page for ${args.join(' ')}`);
+  return formatDocPage('vicoop-client', page, { colors: false });
+}
+
+test('add-federated --help explains exact matching, policy transition, and a complete example', () => {
+  const help = agentHelp(['agent', 'callers', 'add-federated']);
+  assert.match(help, /exact \(issuer, method, subject\) tuple/);
+  assert.match(help, /does not mint an access token/);
+  assert.match(help, /public to restricted/);
+  assert.match(help, /--issuer did:web:connector\.example/);
+  assert.match(help, /slack:T123\/U456/);
+  assert.match(help, /docs\/manage-federated-callers\.md/);
+});
+
+test('remove-federated --help explains revocation and the final-caller public transition', () => {
+  const help = agentHelp(['agent', 'callers', 'remove-federated']);
+  assert.match(help, /existing message tokens fail/);
+  assert.match(help, /follow-up access to tasks.*revoked/);
+  assert.match(help, /final allowed caller makes the agent public/);
+  assert.match(help, /add a replacement first/);
 });
 
 // `agent x402 {show,clear}` are in the same tie-class as `callers {list,remove}`:

@@ -153,26 +153,36 @@ function federatedCallerCommand<
   const A extends 'agent-callers-add-federated' | 'agent-callers-remove-federated',
 >(name: 'add-federated' | 'remove-federated', action: A) {
   const adding = action === 'agent-callers-add-federated';
+  const description = adding
+    ? message`Adds one exact (issuer, method, subject) tuple to the agent's allowed callers. The values are case-sensitive and must exactly match the Connector's later subject assertion. This changes receiver policy only: it does not mint an access token, resolve the DID, or contact the Connector. The policy is hot-reloaded with no daemon restart. WARNING: when allowed_callers is empty, adding this first entry changes the agent from public to restricted.`
+    : message`Removes one exact (issuer, method, subject) tuple from the agent's allowed callers. The policy is hot-reloaded with no daemon restart. New exchanges are rejected immediately, existing message tokens fail their live policy check, and follow-up access to tasks bound to this tuple is revoked. WARNING: removing the final allowed caller makes the agent public for new messages; add a replacement first if it must remain restricted.`;
+  const footer = adding
+    ? message`Example: vicoop-client agent callers add-federated my-agent --issuer did:web:connector.example --method urn:mentionable:auth:slack-workspace-member:v0.1 --subject slack:T123/U456. Guide: https://github.com/planetarium/vicoop-bridge/blob/main/docs/manage-federated-callers.md`
+    : message`Use agent callers list AGENT_ID --json to copy the exact tuple before removal. Guide: https://github.com/planetarium/vicoop-bridge/blob/main/docs/manage-federated-callers.md`;
   return command(
     name,
     object({
       action: constant(action),
       ...sharedFlags,
-      agentId: argument(string({ metavar: 'AGENT_ID' })),
+      agentId: argument(string({ metavar: 'AGENT_ID' }), {
+        description: message`Target agent id. Find owned ids with vicoop-client agent list.`,
+      }),
       issuer: option('--issuer', string({ metavar: 'DID' }), {
-        description: message`Exact did:web Connector issuer and OAuth client id.`,
+        description: message`Exact, case-sensitive did:web Connector issuer. Must match both the subject assertion iss and OAuth client id.`,
       }),
       method: option('--method', string({ metavar: 'URN' }), {
-        description: message`Exact Mentionable authentication method URN.`,
+        description: message`Exact, case-sensitive Mentionable authentication method URN from the Connector profile. No wildcards.`,
       }),
       subject: option('--subject', string({ metavar: 'SUBJECT' }), {
-        description: message`Exact canonical platform subject, e.g. slack:T123/U456.`,
+        description: message`Exact, case-sensitive canonical platform subject from the assertion sub, e.g. slack:T123/U456.`,
       }),
     }),
     {
       brief: adding
         ? message`Allow one exact federated Connector/method/subject caller.`
         : message`Remove one exact federated caller and revoke its task/token authority.`,
+      description,
+      footer,
     },
   );
 }
