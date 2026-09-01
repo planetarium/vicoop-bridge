@@ -18,15 +18,20 @@ COPY packages/protocol/package.json packages/protocol/
 COPY packages/server/package.json packages/server/
 COPY packages/client/package.json packages/client/
 COPY packages/admin-ui/package.json packages/admin-ui/
+COPY vendor/mentionable-connector-kit/package.json vendor/mentionable-connector-kit/
 
 RUN pnpm install --frozen-lockfile --prod=false
 
 COPY packages/protocol/ packages/protocol/
 COPY packages/server/ packages/server/
 COPY packages/admin-ui/ packages/admin-ui/
+COPY vendor/mentionable-connector-kit/ vendor/mentionable-connector-kit/
 
 # Build protocol (server depends on its dist/)
 RUN pnpm --filter @vicoop-bridge/protocol build
+
+# Build the vendored federation verifier (server imports its dist/)
+RUN pnpm --filter @mentionable/connector-kit build
 
 # Build admin UI (server serves its dist/ as static files)
 ARG VITE_WALLETCONNECT_PROJECT_ID
