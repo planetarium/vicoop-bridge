@@ -76,6 +76,11 @@ A DID signature alone never grants access.
 
 ## Operator configuration
 
+For a production-oriented walkthrough of prerequisites, exact tuple inputs,
+public/restricted access transitions, verification, rotation, and
+troubleshooting, see
+[`manage-federated-callers.md`](./manage-federated-callers.md).
+
 The target agent must be connected with `caller-context-v2`, and the bridge
 must have `PUBLIC_URL` configured. Add or remove one exact caller with an owner
 session:
