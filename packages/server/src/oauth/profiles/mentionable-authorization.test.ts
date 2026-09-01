@@ -3,11 +3,12 @@ import { test } from 'node:test';
 import type { Sql } from '../../db.js';
 import type { VerifiedCaller } from '../../auth/principal.js';
 import {
-  authorizeFederatedOperation,
-  parseFederatedHttpJsonOperation,
-  parseFederatedJsonRpcOperation,
-  type FederatedOperation,
-} from './mentionable-authorization.js';
+  authorizeTokenExchangeOperation,
+  parseTokenExchangeHttpJsonOperation,
+  parseTokenExchangeJsonRpcOperation,
+  type TokenExchangeOperation,
+} from '../token-exchange/authorization.js';
+import { createMentionableResourceProfile } from './mentionable-authorization.js';
 import {
   OAUTH_FEDERATION_SCOPE_MESSAGE_SEND,
   OAUTH_FEDERATION_SCOPE_TASK_CANCEL,
@@ -15,32 +16,40 @@ import {
   OAUTH_FEDERATION_SCOPE_TASK_RESUBSCRIBE,
 } from './mentionable-v0.1.js';
 
-test('maps v0.3 and v1 JSON-RPC methods to the narrow federation scopes', () => {
+const profiles = [createMentionableResourceProfile()];
+const authorize = (
+  sql: Sql,
+  agentId: string,
+  caller: VerifiedCaller | undefined,
+  operation: TokenExchangeOperation | undefined,
+) => authorizeTokenExchangeOperation(sql, agentId, caller, operation, profiles);
+
+test('maps v0.3 and v1 JSON-RPC methods to profile-independent operations', () => {
   assert.deepEqual(
-    parseFederatedJsonRpcOperation({
+    parseTokenExchangeJsonRpcOperation({
       method: 'message/send',
       params: { message: { taskId: 't-1' } },
     }),
     {
-      scope: OAUTH_FEDERATION_SCOPE_MESSAGE_SEND,
+      name: 'message.send',
       kind: 'message',
       taskId: 't-1',
     },
   );
   assert.deepEqual(
-    parseFederatedJsonRpcOperation({
+    parseTokenExchangeJsonRpcOperation({
       method: 'GetTask',
       params: { id: 't-2' },
     }),
-    { scope: OAUTH_FEDERATION_SCOPE_TASK_READ, kind: 'task', taskId: 't-2' },
+    { name: 'task.read', kind: 'task', taskId: 't-2' },
   );
   assert.deepEqual(
-    parseFederatedJsonRpcOperation({
+    parseTokenExchangeJsonRpcOperation({
       method: 'SubscribeToTask',
       params: { taskId: 't-3' },
     }),
     {
-      scope: OAUTH_FEDERATION_SCOPE_TASK_RESUBSCRIBE,
+      name: 'task.resubscribe',
       kind: 'task',
       taskId: 't-3',
     },
@@ -48,25 +57,25 @@ test('maps v0.3 and v1 JSON-RPC methods to the narrow federation scopes', () => 
 });
 
 test('maps HTTP+JSON task paths without confusing task ids and actions', () => {
-  assert.deepEqual(parseFederatedHttpJsonOperation('GET', '/agents/a/v1/tasks/t%2F1', undefined), {
-    scope: OAUTH_FEDERATION_SCOPE_TASK_READ,
+  assert.deepEqual(parseTokenExchangeHttpJsonOperation('GET', '/agents/a/v1/tasks/t%2F1', undefined), {
+    name: 'task.read',
     kind: 'task',
     taskId: 't/1',
   });
   assert.deepEqual(
-    parseFederatedHttpJsonOperation('POST', '/agents/a/v1/tasks/t-2:cancel', undefined),
-    { scope: OAUTH_FEDERATION_SCOPE_TASK_CANCEL, kind: 'task', taskId: 't-2' },
+    parseTokenExchangeHttpJsonOperation('POST', '/agents/a/v1/tasks/t-2:cancel', undefined),
+    { name: 'task.cancel', kind: 'task', taskId: 't-2' },
   );
-  assert.deepEqual(parseFederatedHttpJsonOperation('GET', '/agents/a/v1/tasks', undefined), {
-    scope: OAUTH_FEDERATION_SCOPE_TASK_READ,
+  assert.deepEqual(parseTokenExchangeHttpJsonOperation('GET', '/agents/a/v1/tasks', undefined), {
+    name: 'task.read',
     kind: 'task-list',
   });
 });
 
 test('unknown methods stay closed for federated bearer enforcement', () => {
-  assert.equal(parseFederatedJsonRpcOperation({ method: 'custom/doThing' }), undefined);
+  assert.equal(parseTokenExchangeJsonRpcOperation({ method: 'custom/doThing' }), undefined);
   assert.equal(
-    parseFederatedHttpJsonOperation('PATCH', '/agents/a/v1/tasks/t-1', undefined),
+    parseTokenExchangeHttpJsonOperation('PATCH', '/agents/a/v1/tasks/t-1', undefined),
     undefined,
   );
 });
@@ -120,8 +129,8 @@ test('continuation tokens retain principal, actor, grant, and task binding', asy
     active: true,
   });
   assert.deepEqual(
-    await authorizeFederatedOperation(sql, 'agent-1', federatedCaller(), {
-      scope: OAUTH_FEDERATION_SCOPE_MESSAGE_SEND,
+    await authorize(sql, 'agent-1', federatedCaller(), {
+      name: 'message.send',
       kind: 'message',
     }),
     { ok: true },
@@ -140,16 +149,16 @@ test('continuation tokens retain principal, actor, grant, and task binding', asy
     },
   });
   assert.deepEqual(
-    await authorizeFederatedOperation(sql, 'agent-1', taskOnly, {
-      scope: OAUTH_FEDERATION_SCOPE_TASK_READ,
+    await authorize(sql, 'agent-1', taskOnly, {
+      name: 'task.read',
       kind: 'task',
       taskId: 'task-1',
     }),
     { ok: true },
   );
   assert.deepEqual(
-    await authorizeFederatedOperation(sql, 'agent-1', taskOnly, {
-      scope: OAUTH_FEDERATION_SCOPE_TASK_READ,
+    await authorize(sql, 'agent-1', taskOnly, {
+      name: 'task.read',
       kind: 'task',
       taskId: 'task-2',
     }),
@@ -161,7 +170,7 @@ test('Mentionable resource policy rejects tokens issued by another profile', asy
   const caller = federatedCaller();
   caller.tokenExchange!.profileId = 'urn:example:oauth-profile:v1';
   assert.deepEqual(
-    await authorizeFederatedOperation(
+    await authorize(
       authorizationSql({
         actorId: 'did:web:connector.example',
         principalId: 'slack:T123/U456',
@@ -170,14 +179,14 @@ test('Mentionable resource policy rejects tokens issued by another profile', asy
       }),
       'agent-1',
       caller,
-      { scope: OAUTH_FEDERATION_SCOPE_MESSAGE_SEND, kind: 'message' },
+      { name: 'message.send', kind: 'message' },
     ),
     { ok: false, reason: 'unsupported_token_profile' },
   );
 });
 
 test('message-path task scopes still require the task principal to match', async () => {
-  const result = await authorizeFederatedOperation(
+  const result = await authorize(
     authorizationSql({
       actorId: 'did:web:connector.example',
       principalId: 'slack:T123/OTHER',
@@ -187,7 +196,7 @@ test('message-path task scopes still require the task principal to match', async
     'agent-1',
     federatedCaller(),
     {
-      scope: OAUTH_FEDERATION_SCOPE_TASK_READ,
+      name: 'task.read',
       kind: 'task',
       taskId: 'task-1',
     },
@@ -197,13 +206,13 @@ test('message-path task scopes still require the task principal to match', async
 
 test('task continuity fails closed on actor mismatch or removed exact grant', async () => {
   const operation = {
-    scope: OAUTH_FEDERATION_SCOPE_TASK_READ,
+    name: 'task.read',
     kind: 'task' as const,
     taskId: 'task-1',
-  } satisfies FederatedOperation;
+  } satisfies TokenExchangeOperation;
   const caller = federatedCaller();
   assert.deepEqual(
-    await authorizeFederatedOperation(
+    await authorize(
       authorizationSql({
         actorId: 'did:web:other.example',
         principalId: caller.principalId,
@@ -217,7 +226,7 @@ test('task continuity fails closed on actor mismatch or removed exact grant', as
     { ok: false, reason: 'task_actor_mismatch' },
   );
   assert.deepEqual(
-    await authorizeFederatedOperation(
+    await authorize(
       authorizationSql({
         actorId: caller.tokenExchange!.actorId,
         principalId: caller.principalId,
@@ -233,7 +242,7 @@ test('task continuity fails closed on actor mismatch or removed exact grant', as
 });
 
 test('a federated task remains protected after the agent becomes public', async () => {
-  const result = await authorizeFederatedOperation(
+  const result = await authorize(
     authorizationSql({
       actorId: 'did:web:connector.example',
       principalId: 'slack:T123/U456',
@@ -243,7 +252,7 @@ test('a federated task remains protected after the agent becomes public', async 
     'agent-1',
     undefined,
     {
-      scope: OAUTH_FEDERATION_SCOPE_TASK_READ,
+      name: 'task.read',
       kind: 'task',
       taskId: 'task-1',
     },
@@ -253,7 +262,7 @@ test('a federated task remains protected after the agent becomes public', async 
     reason: 'federated_task_requires_token',
   });
   assert.deepEqual(
-    await authorizeFederatedOperation(
+    await authorize(
       authorizationSql({
         actorId: 'did:web:connector.example',
         principalId: 'slack:T123/U456',
@@ -263,10 +272,34 @@ test('a federated task remains protected after the agent becomes public', async 
       'agent-1',
       undefined,
       {
-        scope: OAUTH_FEDERATION_SCOPE_TASK_READ,
+        name: 'task.read',
         kind: 'task-list',
       },
     ),
     { ok: false, reason: 'federated_task_list_not_supported' },
   );
+});
+
+test('resource authorization dispatches a non-Mentionable token to its registered profile', async () => {
+  const caller = federatedCaller();
+  caller.tokenExchange!.profileId = 'urn:example:oauth-profile:v1';
+  caller.tokenExchange!.scopes = ['example:read'];
+  let received: TokenExchangeOperation | undefined;
+  const result = await authorizeTokenExchangeOperation(
+    (async () => { throw new Error('generic dispatch should not query task storage'); }) as unknown as Sql,
+    'agent-1',
+    caller,
+    { name: 'message.send', kind: 'message' },
+    [{
+      id: 'urn:example:oauth-profile:v1',
+      async authorize(context) {
+        received = context.operation;
+        return context.caller.tokenExchange?.scopes.includes('example:read') === true
+          ? { ok: true }
+          : { ok: false, reason: 'missing_example_scope' };
+      },
+    }],
+  );
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(received, { name: 'message.send', kind: 'message' });
 });

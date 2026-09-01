@@ -1,7 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
-import type { AgentCard } from '@vicoop-bridge/protocol';
+import {
+  CALLER_CONTEXT_V2_CAPABILITY,
+  SIWE_BEARER_AUTH_EXTENSION_URI,
+  type AgentCard,
+} from '@vicoop-bridge/protocol';
+import { TaskState } from '@a2x/sdk';
 import { createHttpApp } from './http.js';
 import { Registry, type ClientConnection } from './registry.js';
 import type { Sql } from './db.js';
@@ -156,4 +161,135 @@ test('CORS preflight allows the A2A-Version request header', async () => {
 
   assert.equal(response.status, 204);
   assert.match(response.headers.get('Access-Control-Allow-Headers') ?? '', /A2A-Version/i);
+});
+
+test('federated message tokens bind the initial task row on all three A2A ingress paths', async () => {
+  const authorizationKey = 'federated:v1:test';
+  const profileId = 'https://mentionable.dev/ns/oauth-federation/v0.1';
+  const principalId = 'slack:T123/U456';
+  const actorId = 'did:web:connector.example';
+  const tasks = new Map<string, Record<string, unknown>>();
+  const submittedBindings: unknown[][] = [];
+  const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    const statement = strings.join('?');
+    if (statement.includes('FROM infra.oauth_token_exchange_access_tokens')) {
+      return [{
+        id: 'token-row-1',
+        profile_id: profileId,
+        agent_id: 'v1-test-agent',
+        resource: 'https://bridge.example/agents/v1-test-agent',
+        principal_id: principalId,
+        actor_id: actorId,
+        allowed_caller: authorizationKey,
+        attestation: null,
+        scopes: ['a2a:message.send', 'a2a:message.stream'],
+        task_id: null,
+        expires_at: new Date(Date.now() + 60_000),
+        revoked: false,
+        policy_active: true,
+      }];
+    }
+    if (statement.includes('UPDATE infra.oauth_token_exchange_access_tokens')) return [];
+    if (statement.includes('INSERT INTO infra.a2a_tasks')) {
+      const task = structuredClone(values[3] as Record<string, unknown>);
+      tasks.set(String(values[0]), task);
+      if (values[2] === TaskState.SUBMITTED) submittedBindings.push(values);
+      return [];
+    }
+    if (statement.includes('SELECT task_json FROM infra.a2a_tasks')) {
+      const task = tasks.get(String(values[0]));
+      return task ? [{ task_json: structuredClone(task) }] : [];
+    }
+    return Object.assign([], { count: 0 });
+  }) as unknown as Sql;
+  sql.json = ((value: unknown) => value) as Sql['json'];
+  sql.begin = (async (callback: (tx: Sql) => unknown) => callback(sql)) as unknown as Sql['begin'];
+
+  const registry = new Registry();
+  const ws = {
+    close() {},
+    send(raw: string) {
+      const frame = JSON.parse(raw) as { type?: string; taskId?: string; contextId?: string };
+      if (frame.type !== 'task.assign' || !frame.taskId) return;
+      queueMicrotask(() => {
+        const binding = registry.getBinding(frame.taskId!);
+        binding?.sink.pushStatus({
+          taskId: frame.taskId!,
+          contextId: frame.contextId ?? frame.taskId!,
+          final: true,
+          status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() },
+        });
+        binding?.sink.finish();
+      });
+    },
+  } as unknown as WebSocket;
+  const agentCard: AgentCard = {
+    name: 'v1-test-agent',
+    description: 'federated ingress integration',
+    version: '0.0.1',
+    protocolVersion: '0.3.0',
+    capabilities: { streaming: true },
+    skills: [],
+  };
+  assert.deepEqual(registry.registerAgent({
+    agentId: 'v1-test-agent',
+    clientId: 'client-1',
+    ownerPrincipal: 'eth:0x0000000000000000000000000000000000000001',
+    agentCard,
+    allowedCallers: [authorizationKey],
+    protocolCapabilities: [CALLER_CONTEXT_V2_CAPABILITY],
+    ws,
+    connectedAt: Date.now(),
+  }), { ok: true });
+  const app = createHttpApp({ registry, db: sql, publicUrl: 'https://bridge.example' });
+  const message = (id: string) => ({
+    messageId: id,
+    role: 'user',
+    parts: [{ kind: 'text', text: 'hello' }],
+  });
+  const requests: Array<[string, RequestInit]> = [
+    ['/agents/v1-test-agent', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer vbc_oauth_test',
+        'A2A-Extensions': SIWE_BEARER_AUTH_EXTENSION_URI,
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'message/send', params: { message: message('m-v03') },
+      }),
+    }],
+    ['/agents/v1-test-agent/v1', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer vbc_oauth_test',
+        'A2A-Extensions': SIWE_BEARER_AUTH_EXTENSION_URI,
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 2, method: 'SendMessage', params: { message: message('m-v1-rpc') },
+      }),
+    }],
+    ['/agents/v1-test-agent/v1/message:send', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/a2a+json',
+        Authorization: 'Bearer vbc_oauth_test',
+        'A2A-Extensions': SIWE_BEARER_AUTH_EXTENSION_URI,
+      },
+      body: JSON.stringify({ message: message('m-v1-http') }),
+    }],
+  ];
+  for (const [path, init] of requests) {
+    const response = await app.request(path, init);
+    assert.ok(response.status >= 200 && response.status < 300, `${path}: ${await response.text()}`);
+  }
+  assert.equal(submittedBindings.length, 3);
+  for (const values of submittedBindings) {
+    assert.equal(values[4], principalId);
+    assert.equal(values[6], actorId);
+    assert.equal(values[7], profileId);
+    assert.equal(values[8], authorizationKey);
+    assert.equal(JSON.stringify(values[3]).includes('_authorizationKey'), false);
+  }
 });

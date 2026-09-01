@@ -16,7 +16,7 @@ import {
   stripSensitiveMetadata,
   parsePersistRequestEnvelope,
 } from './postgres-task-store.js';
-import { ensureSchema } from './db.js';
+import { ensureSchema, type Sql } from './db.js';
 
 const hasDb = !!process.env.DATABASE_URL;
 
@@ -226,6 +226,34 @@ test('stripSensitiveMetadata with preserveEnvelope still scrubs bearer/principal
   assert.equal(sm.keep, 1, 'non-sensitive message metadata retained');
 });
 
+test('createTask writes trusted authorization metadata in the initial INSERT without exposing it', async () => {
+  let inserted: unknown[] | undefined;
+  const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    if (strings.join('?').includes('INSERT INTO infra.a2a_tasks')) inserted = values;
+    return [];
+  }) as unknown as Sql;
+  sql.json = ((value: unknown) => value) as Sql['json'];
+  const store = new PostgresTaskStore(sql, { ownerAgent: 'agent-1' });
+  const task = await store.createTask({
+    metadata: {
+      visible: 'kept',
+      _principalId: 'slack:T123/U456',
+      _actorId: 'did:web:connector.example',
+      _authorizationProfile: 'urn:example:profile',
+      _authorizationKey: 'federated:v1:binding',
+    },
+  });
+
+  assert.ok(inserted);
+  assert.equal(inserted[4], 'slack:T123/U456');
+  assert.equal(inserted[5], 'agent-1');
+  assert.equal(inserted[6], 'did:web:connector.example');
+  assert.equal(inserted[7], 'urn:example:profile');
+  assert.equal(inserted[8], 'federated:v1:binding');
+  assert.deepEqual(task.metadata, { visible: 'kept' });
+  assert.equal(JSON.stringify(inserted[3]).includes('_authorizationKey'), false);
+});
+
 // ── updateTask concurrency (issue #366) ─────────────────────────────────────
 
 test(
@@ -239,8 +267,30 @@ test(
     let taskId: string | undefined;
     try {
       await ensureSchema(sql);
-      const task = await store.createTask({});
+      const task = await store.createTask({
+        metadata: {
+          _principalId: 'slack:T123/U456',
+          _actorId: 'did:web:connector.example',
+          _authorizationProfile: 'https://mentionable.dev/ns/oauth-federation/v0.1',
+          _authorizationKey: 'federated:v1:test-binding',
+        },
+      });
       taskId = task.id;
+      const initialRows = await sql<{
+        owner_principal: string | null;
+        owner_actor: string | null;
+        authorization_profile: string | null;
+        authorization_key: string | null;
+      }[]>`
+        SELECT owner_principal, owner_actor, authorization_profile, authorization_key
+        FROM infra.a2a_tasks WHERE task_id = ${task.id}
+      `;
+      assert.deepEqual(initialRows[0], {
+        owner_principal: 'slack:T123/U456',
+        owner_actor: 'did:web:connector.example',
+        authorization_profile: 'https://mentionable.dev/ns/oauth-federation/v0.1',
+        authorization_key: 'federated:v1:test-binding',
+      });
       const history = [{
         messageId: 'federated-message',
         role: 'user',

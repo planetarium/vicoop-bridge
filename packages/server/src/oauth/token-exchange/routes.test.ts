@@ -21,7 +21,11 @@ import {
 } from '../profiles/mentionable-v0.1.js';
 import { createMentionableOAuthProfile } from '../profiles/mentionable-v0.1.js';
 import { mountTokenExchangeRoutes, type TokenExchangeRouteOptions } from './routes.js';
-import { TOKEN_EXCHANGE_GRANT_TYPE, type TokenExchangeProfile } from './types.js';
+import {
+  TOKEN_EXCHANGE_GRANT_TYPE,
+  TOKEN_EXCHANGE_MAX_FORM_BYTES,
+  type TokenExchangeProfile,
+} from './types.js';
 
 const publicUrl = 'https://bridge.example';
 const tokenEndpoint = `${publicUrl}/oauth/token`;
@@ -143,6 +147,9 @@ test('RFC 8414 discovery points token exchange at the shared /oauth/token endpoi
       },
     },
     now,
+    additionalGrantTypes: ['urn:ietf:params:oauth:grant-type:device_code'],
+    additionalTokenEndpointAuthMethods: ['none'],
+    deviceAuthorizationEndpoint: `${publicUrl}/oauth/device/code`,
   });
   const response = await app.request('/.well-known/oauth-authorization-server');
   assert.equal(response.status, 200);
@@ -153,8 +160,15 @@ test('RFC 8414 discovery points token exchange at the shared /oauth/token endpoi
     token_exchange_profiles_supported: string[];
   };
   assert.equal(metadata.token_endpoint, tokenEndpoint);
-  assert.deepEqual(metadata.grant_types_supported, [OAUTH_GRANT_TYPE_TOKEN_EXCHANGE]);
-  assert.deepEqual(metadata.token_endpoint_auth_methods_supported, ['private_key_jwt']);
+  assert.deepEqual(metadata.grant_types_supported, [
+    OAUTH_GRANT_TYPE_TOKEN_EXCHANGE,
+    'urn:ietf:params:oauth:grant-type:device_code',
+  ]);
+  assert.deepEqual(metadata.token_endpoint_auth_methods_supported, ['private_key_jwt', 'none']);
+  assert.equal(
+    (metadata as { device_authorization_endpoint?: string }).device_authorization_endpoint,
+    `${publicUrl}/oauth/device/code`,
+  );
   assert.deepEqual(metadata.token_exchange_profiles_supported, [
     'https://mentionable.dev/ns/oauth-federation/v0.1',
   ]);
@@ -384,4 +398,95 @@ test('task continuation exchange keeps the originating tuple and task binding', 
   assert.equal(tokenRows[0]?.[4], issuer);
   assert.equal(tokenRows[0]?.[5], authorizationKey);
   assert.equal(tokenRows[0]?.[8], 'task-1');
+});
+
+test('chunked token requests are rejected while streaming once they cross the size limit', async () => {
+  const app = new Hono();
+  mountMentionableTokenExchangeRoutes(app, {
+    sql: sqlWithPolicy([]),
+    publicUrl,
+    resolver: { async resolve() { throw new Error('not reached'); } },
+  });
+  const prefix = new TextEncoder().encode(`grant_type=${encodeURIComponent(TOKEN_EXCHANGE_GRANT_TYPE)}&`);
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(prefix);
+      controller.enqueue(new Uint8Array(TOKEN_EXCHANGE_MAX_FORM_BYTES));
+      controller.close();
+    },
+  });
+  const request = new Request(`${publicUrl}/oauth/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+    duplex: 'half',
+  } as RequestInit & { duplex: 'half' });
+  assert.equal(request.headers.has('Content-Length'), false);
+  const response = await app.request(request);
+  assert.equal(response.status, 400);
+  assert.equal(((await response.json()) as { error: string }).error, 'invalid_request');
+  assert.equal(response.headers.get('Cache-Control'), 'no-store');
+});
+
+test('target lookup failures return an audited OAuth server_error response', async () => {
+  const sql = (async () => { throw new Error('database unavailable'); }) as unknown as Sql;
+  const profile: TokenExchangeProfile = {
+    id: 'urn:example:lookup-profile',
+    clientAuthMethods: [],
+    clientAuthSigningAlgorithms: [],
+    scopes: [],
+    subjectTokenTypes: [],
+    recognizes: () => true,
+    async verify() { throw new Error('not reached'); },
+  };
+  const app = new Hono();
+  mountTokenExchangeRoutes(app, {
+    sql,
+    publicUrl,
+    profiles: [profile],
+  });
+  const response = await app.request('/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: TOKEN_EXCHANGE_GRANT_TYPE,
+      resource: `${publicUrl}/agents/agent-1`,
+    }),
+  });
+  const body = (await response.json()) as { error: string; rejection_id?: string };
+  assert.equal(response.status, 500);
+  assert.equal(body.error, 'server_error');
+  assert.match(body.rejection_id!, /^rej_/);
+  assert.equal(response.headers.get('Cache-Control'), 'no-store');
+});
+
+test('unexpected profile failures return an audited OAuth server_error response', async () => {
+  const profile: TokenExchangeProfile = {
+    id: 'urn:example:throwing-profile',
+    clientAuthMethods: [],
+    clientAuthSigningAlgorithms: [],
+    scopes: [],
+    subjectTokenTypes: [],
+    recognizes: () => true,
+    async verify() { throw new Error('adapter failure'); },
+  };
+  const app = new Hono();
+  mountTokenExchangeRoutes(app, {
+    sql: sqlWithPolicy(['allowed']),
+    publicUrl,
+    profiles: [profile],
+  });
+  const response = await app.request('/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: TOKEN_EXCHANGE_GRANT_TYPE,
+      resource: `${publicUrl}/agents/agent-1`,
+    }),
+  });
+  const body = (await response.json()) as { error: string; rejection_id?: string };
+  assert.equal(response.status, 500);
+  assert.equal(body.error, 'server_error');
+  assert.match(body.rejection_id!, /^rej_/);
+  assert.equal(response.headers.get('Cache-Control'), 'no-store');
 });

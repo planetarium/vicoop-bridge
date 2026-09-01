@@ -34,6 +34,28 @@ function slowUpdateThresholdMs(): number {
 
 type MessageWithMetadata = Message & { metadata?: Record<string, unknown> };
 
+interface TaskAuthorizationBinding {
+  principalId?: string;
+  actorId?: string;
+  profileId?: string;
+  authorizationKey?: string;
+}
+
+function authorizationBindingFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): TaskAuthorizationBinding {
+  const stringValue = (key: string) => {
+    const value = metadata?.[key];
+    return typeof value === 'string' ? value : undefined;
+  };
+  return {
+    principalId: stringValue('_principalId'),
+    actorId: stringValue('_actorId'),
+    profileId: stringValue('_authorizationProfile'),
+    authorizationKey: stringValue('_authorizationKey'),
+  };
+}
+
 function extractOwnerPrincipal(task: Task): string | undefined {
   for (const msg of task.history ?? []) {
     const principal = (msg as MessageWithMetadata).metadata?._principalId;
@@ -79,6 +101,26 @@ function stripMessageMetadata(msg: Message): Message {
   const { metadata: _meta, ...m } = msg as MessageWithMetadata;
   void _meta;
   return m as Message;
+}
+
+function stripTaskMetadata(metadata: Record<string, unknown> | undefined) {
+  if (!metadata) return undefined;
+  const {
+    _bearerToken,
+    _principalId,
+    _actorId,
+    _authorizationProfile,
+    _authorizationKey,
+    [IDENTITY_VC_PRESENTED_METADATA_KEY]: _presented,
+    ...rest
+  } = metadata;
+  void _bearerToken;
+  void _principalId;
+  void _actorId;
+  void _authorizationProfile;
+  void _authorizationKey;
+  void _presented;
+  return Object.keys(rest).length > 0 ? rest : undefined;
 }
 
 // Drop the request-scoped `chat_completions_request` envelope from the
@@ -127,6 +169,7 @@ export function stripSensitiveMetadata(
   // regardless — those must never be persisted.
   const base = opts?.preserveEnvelope ? task : stripPersistedEnvelope(task);
   const result = { ...base };
+  result.metadata = stripTaskMetadata(result.metadata);
   if (result.history?.length) {
     result.history = result.history.map(stripMessageMetadata);
   }
@@ -189,13 +232,14 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   }
 
   async createTask(params: CreateTaskParams): Promise<Task> {
+    const authorizationBinding = authorizationBindingFromMetadata(params.metadata);
     const task: Task = {
       id: randomUUID(),
       contextId: params.contextId ?? randomUUID(),
       status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
-      metadata: params.metadata,
+      metadata: stripTaskMetadata(params.metadata),
     };
-    await this.writeTask(task);
+    await this.writeTask(task, this.sql, authorizationBinding);
     // A freshly-created task is SUBMITTED, never terminal, so retention is a
     // no-op here — skip it entirely.
     return task;
@@ -495,11 +539,17 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   // Write (insert-or-replace) the full task row. `sql` defaults to the pool
   // connection but updateTask passes its transaction-scoped connection so the
   // row write participates in the same FOR UPDATE transaction that read it.
-  private async writeTask(task: Task, sql: SqlExecutor = this.sql): Promise<void> {
-    const ownerPrincipal = extractOwnerPrincipal(task);
-    const ownerActor = extractAuthorizationField(task, '_actorId');
-    const authorizationProfile = extractAuthorizationField(task, '_authorizationProfile');
-    const authorizationKey = extractAuthorizationField(task, '_authorizationKey');
+  private async writeTask(
+    task: Task,
+    sql: SqlExecutor = this.sql,
+    initialBinding?: TaskAuthorizationBinding,
+  ): Promise<void> {
+    const ownerPrincipal = initialBinding?.principalId ?? extractOwnerPrincipal(task);
+    const ownerActor = initialBinding?.actorId ?? extractAuthorizationField(task, '_actorId');
+    const authorizationProfile =
+      initialBinding?.profileId ?? extractAuthorizationField(task, '_authorizationProfile');
+    const authorizationKey =
+      initialBinding?.authorizationKey ?? extractAuthorizationField(task, '_authorizationKey');
     const sanitized = stripSensitiveMetadata(task, {
       preserveEnvelope: this.persistRequestEnvelope,
     });

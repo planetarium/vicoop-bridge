@@ -24,6 +24,49 @@ export interface TokenExchangeRouteOptions {
   now?: () => Date;
   /** Whether another /oauth/token handler should receive non-exchange grants. */
   passThroughOtherGrants?: boolean;
+  /** Other grants served by the same authorization server and token endpoint. */
+  additionalGrantTypes?: readonly string[];
+  additionalTokenEndpointAuthMethods?: readonly string[];
+  deviceAuthorizationEndpoint?: string;
+}
+
+class TokenExchangeBodyTooLargeError extends Error {}
+
+async function readBoundedBody(request: Request, maxBytes: number): Promise<Uint8Array> {
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel('token request exceeds size limit');
+        throw new TokenExchangeBodyTooLargeError();
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+function replaceRequestBody(c: Context, original: Request, body: Uint8Array): void {
+  c.req.raw = new Request(original.url, {
+    method: original.method,
+    headers: original.headers,
+    body: body.byteLength > 0 ? body : undefined,
+    ...(body.byteLength > 0 ? { duplex: 'half' as const } : {}),
+  });
 }
 
 function oauthError(
@@ -101,9 +144,18 @@ export function mountTokenExchangeRoutes(app: Hono, options: TokenExchangeRouteO
       ...profileMetadata,
       issuer: publicUrl,
       token_endpoint: tokenEndpoint,
-      grant_types_supported: [TOKEN_EXCHANGE_GRANT_TYPE],
+      ...(options.deviceAuthorizationEndpoint !== undefined
+        ? { device_authorization_endpoint: options.deviceAuthorizationEndpoint }
+        : {}),
+      grant_types_supported: unique([
+        TOKEN_EXCHANGE_GRANT_TYPE,
+        ...(options.additionalGrantTypes ?? []),
+      ]),
       token_endpoint_auth_methods_supported: unique(
-        options.profiles.flatMap((profile) => [...profile.clientAuthMethods]),
+        [
+          ...options.profiles.flatMap((profile) => [...profile.clientAuthMethods]),
+          ...(options.additionalTokenEndpointAuthMethods ?? []),
+        ],
       ),
       token_endpoint_auth_signing_alg_values_supported: unique(
         options.profiles.flatMap((profile) => [...profile.clientAuthSigningAlgorithms]),
@@ -118,8 +170,12 @@ export function mountTokenExchangeRoutes(app: Hono, options: TokenExchangeRouteO
 
   app.post('/oauth/token', async (c: Context, next: Next) => {
     const contentType = c.req.header('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
-    const declaredLength = Number(c.req.header('Content-Length') ?? 0);
-    if (Number.isFinite(declaredLength) && declaredLength > TOKEN_EXCHANGE_MAX_FORM_BYTES) {
+    const originalRequest = c.req.raw;
+    let bodyBytes: Uint8Array;
+    try {
+      bodyBytes = await readBoundedBody(originalRequest, TOKEN_EXCHANGE_MAX_FORM_BYTES);
+    } catch (error) {
+      if (!(error instanceof TokenExchangeBodyTooLargeError)) throw error;
       const rejectionId = newRejectionId();
       logEvent('oauth_token_exchange_rejected', {
         rejectionId,
@@ -127,13 +183,15 @@ export function mountTokenExchangeRoutes(app: Hono, options: TokenExchangeRouteO
       });
       return oauthError(c, 400, 'invalid_request', 'token request exceeds size limit', rejectionId);
     }
-
-    const raw = await c.req.raw.clone().text();
+    const raw = new TextDecoder().decode(bodyBytes);
     const form =
       contentType === 'application/x-www-form-urlencoded' ? new URLSearchParams(raw) : null;
     const isExchange = form?.getAll('grant_type').includes(TOKEN_EXCHANGE_GRANT_TYPE) === true;
     if (!isExchange) {
-      if (options.passThroughOtherGrants) return next();
+      if (options.passThroughOtherGrants) {
+        replaceRequestBody(c, originalRequest, bodyBytes);
+        return next();
+      }
       return oauthError(c, 400, 'unsupported_grant_type', 'unsupported grant_type');
     }
 
@@ -196,9 +254,24 @@ export function mountTokenExchangeRoutes(app: Hono, options: TokenExchangeRouteO
     const shapeFailure = profile.validateRequest?.(form, expectedResource);
     if (shapeFailure) return reject(shapeFailure, { agentId, profileId: profile.id });
 
-    const rows = await options.sql<{ allowed_callers: string[] }[]>`
-      SELECT allowed_callers FROM agents WHERE id = ${agentId}
-    `;
+    let rows: { allowed_callers: string[] }[];
+    try {
+      rows = await options.sql<{ allowed_callers: string[] }[]>`
+        SELECT allowed_callers FROM agents WHERE id = ${agentId}
+      `;
+    } catch {
+      return reject(
+        {
+          ok: false,
+          status: 500,
+          error: 'server_error',
+          description: 'token exchange temporarily unavailable',
+          reason: 'target_lookup_failed',
+          stage: 'target_lookup',
+        },
+        { agentId, profileId: profile.id },
+      );
+    }
     const allowedCallers = rows[0]?.allowed_callers;
     if (!allowedCallers) {
       return reject(
@@ -214,15 +287,30 @@ export function mountTokenExchangeRoutes(app: Hono, options: TokenExchangeRouteO
     }
 
     const now = options.now?.() ?? new Date();
-    const result = await profile.verify({
-      sql: options.sql,
-      form,
-      tokenEndpoint,
-      expectedResource,
-      agentId,
-      allowedCallers,
-      now,
-    });
+    let result;
+    try {
+      result = await profile.verify({
+        sql: options.sql,
+        form,
+        tokenEndpoint,
+        expectedResource,
+        agentId,
+        allowedCallers,
+        now,
+      });
+    } catch {
+      return reject(
+        {
+          ok: false,
+          status: 500,
+          error: 'server_error',
+          description: 'token exchange temporarily unavailable',
+          reason: 'profile_verification_failed',
+          stage: 'profile_verification',
+        },
+        { agentId, profileId: profile.id },
+      );
+    }
     if (!result.ok) return reject(result, { agentId, profileId: profile.id });
 
     try {

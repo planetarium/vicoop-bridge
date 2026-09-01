@@ -12,16 +12,17 @@ profile:
 
 - `oauth/token-exchange` owns the shared `/oauth/token` route, RFC 8414
   metadata aggregation, canonical resource selection, opaque access-token
-  issuance and revocation, profile-qualified replay storage, and the standard
-  token response;
+  issuance and revocation, profile-qualified replay storage, profile-dispatched
+  A2A operation authorization, and the standard token response;
 - `oauth/profiles/mentionable-v0.1` owns assertion `typ` and claims, EdDSA and
   DID verification, trust-before-fetch, Mentionable scopes, direct-Connector
   principal/actor derivation, and task-continuation policy.
 
 Installed profiles are selected explicitly and their identifier is persisted
-with every access token. Resource-server policy checks that identifier before
-applying Mentionable authorization semantics, so tokens from a future profile
-cannot be interpreted under this one.
+with every access token and task. The resource server normalizes each ingress
+operation independently of any profile, then dispatches authorization by that
+identifier. A future profile therefore supplies both exchange verification and
+resource authorization without being interpreted under Mentionable semantics.
 
 ## Trust and identity model
 
@@ -106,8 +107,11 @@ An eligible Agent Card advertises
 ```
 
 The RFC 8414 document names the existing `/oauth/token` endpoint, RFC 8693 token exchange,
-`private_key_jwt`, EdDSA, and the supported A2A scopes. The token endpoint
-accepts form-encoded requests up to 64 KiB. Message scopes require a fresh
+`private_key_jwt`, EdDSA, and the supported A2A scopes. When RFC 8628 device flow
+is enabled, the same document also advertises its grant, public-client auth
+method, and device authorization endpoint. The token endpoint accepts
+form-encoded requests up to 64 KiB and enforces that bound while streaming,
+including requests without `Content-Length`. Message scopes require a fresh
 `mentionable-subject-assertion+jwt`; task-only scopes may use a
 `mentionable-task-continuation-assertion+jwt`, whose subject is the originating
 platform principal and whose `mentionable_task_id` binds one task. Bare

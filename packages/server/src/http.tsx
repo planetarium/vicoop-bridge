@@ -83,12 +83,13 @@ import {
 } from './well-known.js';
 import { mountTokenExchangeRoutes } from './oauth/token-exchange/routes.js';
 import { createMentionableOAuthProfile } from './oauth/profiles/mentionable-v0.1.js';
+import { createMentionableResourceProfile } from './oauth/profiles/mentionable-authorization.js';
 import {
-  authorizeFederatedOperation,
-  parseFederatedHttpJsonOperation,
-  parseFederatedJsonRpcOperation,
-  type FederatedOperation,
-} from './oauth/profiles/mentionable-authorization.js';
+  authorizeTokenExchangeOperation,
+  parseTokenExchangeHttpJsonOperation,
+  parseTokenExchangeJsonRpcOperation,
+  type TokenExchangeOperation,
+} from './oauth/token-exchange/authorization.js';
 
 export interface ServerHttpOptions {
   registry: Registry;
@@ -200,6 +201,8 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // the agent-auth error hint so SIWE-only deployments don't point callers at
   // non-existent endpoints.
   const deviceFlowEnabled = Boolean(opts.google && opts.publicUrl);
+  const tokenExchangeProfiles = [createMentionableOAuthProfile({ resolver: identityVcResolver })];
+  const tokenExchangeResourceProfiles = [createMentionableResourceProfile()];
   const agentCardOpts: AgentA2XOptions = {
     publicUrl: opts.publicUrl,
     deviceFlowEnabled,
@@ -335,12 +338,19 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   ): Promise<void> {
     if (!isRecord(body)) return;
     const params = isRecord(body.params) ? body.params : undefined;
+    const request = params ?? body;
     const message = isRecord(params?.message)
       ? params.message
       : isRecord(body.message)
         ? body.message
         : undefined;
     if (!message) return;
+
+    // `@a2x/sdk` creates a task from the request-level metadata before the
+    // executor sees the message. Scrub caller-owned internal lookalikes here,
+    // then stamp the same verified binding on both carriers so the TaskStore
+    // can persist it atomically in the initial INSERT.
+    stripCallerSuppliedInternalKeys(request);
 
     const requestedExtensions = [
       ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_HEADER)),
@@ -374,13 +384,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       });
     }
     if (caller !== undefined) {
-      const existingAttestations =
-        isRecord(message.metadata) &&
-        Array.isArray(message.metadata[IDENTITY_VC_PRESENTED_METADATA_KEY])
-          ? message.metadata[IDENTITY_VC_PRESENTED_METADATA_KEY]
-          : [];
-      message.metadata = {
-        ...(isRecord(message.metadata) ? message.metadata : {}),
+      const authorizationMetadata = {
         _principalId: caller.principalId,
         ...(caller.actorId !== undefined ? { _actorId: caller.actorId } : {}),
         ...(caller.tokenExchange?.allowedCaller !== undefined
@@ -389,6 +393,19 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         ...(caller.tokenExchange?.profileId !== undefined
           ? { _authorizationProfile: caller.tokenExchange.profileId }
           : {}),
+      };
+      request.metadata = {
+        ...(isRecord(request.metadata) ? request.metadata : {}),
+        ...authorizationMetadata,
+      };
+      const existingAttestations =
+        isRecord(message.metadata) &&
+        Array.isArray(message.metadata[IDENTITY_VC_PRESENTED_METADATA_KEY])
+          ? message.metadata[IDENTITY_VC_PRESENTED_METADATA_KEY]
+          : [];
+      message.metadata = {
+        ...(isRecord(message.metadata) ? message.metadata : {}),
+        ...authorizationMetadata,
         ...(caller.tokenExchange?.attestations !== undefined
           ? {
               [IDENTITY_VC_PRESENTED_METADATA_KEY]: [
@@ -404,14 +421,15 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   async function enforceFederatedOperation(
     c: Context,
     caller: ReturnType<typeof getCaller>,
-    operation: FederatedOperation | undefined,
+    operation: TokenExchangeOperation | undefined,
     responseFormat: 'jsonrpc' | 'http-json',
   ): Promise<Response | undefined> {
-    const result = await authorizeFederatedOperation(
+    const result = await authorizeTokenExchangeOperation(
       opts.db,
       c.req.param('id')!,
       caller,
       operation,
+      tokenExchangeResourceProfiles,
     );
     if (result.ok) return undefined;
     const rejectionId = newRejectionId();
@@ -472,8 +490,15 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     mountTokenExchangeRoutes(app, {
       sql: opts.db,
       publicUrl: opts.publicUrl,
-      profiles: [createMentionableOAuthProfile({ resolver: identityVcResolver })],
+      profiles: tokenExchangeProfiles,
       passThroughOtherGrants: deviceFlowEnabled,
+      ...(deviceFlowEnabled
+        ? {
+            additionalGrantTypes: ['urn:ietf:params:oauth:grant-type:device_code'],
+            additionalTokenEndpointAuthMethods: ['none'],
+            deviceAuthorizationEndpoint: `${opts.publicUrl.replace(/\/$/, '')}/oauth/device/code`,
+          }
+        : {}),
       ...(opts.identityVc?.now !== undefined ? { now: opts.identityVc.now } : {}),
     });
   }
@@ -1075,7 +1100,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const federatedRejection = await enforceFederatedOperation(
       c,
       caller,
-      parseFederatedJsonRpcOperation(parsed),
+      parseTokenExchangeJsonRpcOperation(parsed),
       'jsonrpc',
     );
     if (federatedRejection) return federatedRejection;
@@ -1104,7 +1129,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       const federatedRejection = await enforceFederatedOperation(
         c,
         caller,
-        parseFederatedJsonRpcOperation(body),
+        parseTokenExchangeJsonRpcOperation(body),
         'jsonrpc',
       );
       if (federatedRejection) return federatedRejection;
@@ -1143,7 +1168,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const federatedRejection = await enforceFederatedOperation(
       c,
       caller,
-      parseFederatedHttpJsonOperation(c.req.method, c.req.path, body),
+      parseTokenExchangeHttpJsonOperation(c.req.method, c.req.path, body),
       'http-json',
     );
     if (federatedRejection) return federatedRejection;
