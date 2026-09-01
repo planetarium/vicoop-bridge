@@ -363,7 +363,9 @@ test('executor prefers the v2 principal and attestations shape for new clients',
     parts: [{ kind: 'text', text: 'hi' }],
     messageId: 'm-caller-v2',
     metadata: {
-      _principalId: 'siwe:0xabc',
+      _principalId: 'slack:T123/U456',
+      _actorId: 'did:web:issuer.example',
+      _authorizationKey: 'federated:v1:task-policy-key',
       [IDENTITY_VC_PRESENTED_METADATA_KEY]: [
         {
           credentialId: 'urn:uuid:credential-v2',
@@ -381,7 +383,8 @@ test('executor prefers the v2 principal and attestations shape for new clients',
   assert.equal(frame.type, 'task.assign');
   if (frame.type === 'task.assign') {
     assert.deepEqual(frame.caller, {
-      principal: { id: 'siwe:0xabc' },
+      principal: { id: 'slack:T123/U456' },
+      actor: { id: 'did:web:issuer.example' },
       attestations: [
         {
           credentialId: 'urn:uuid:credential-v2',
@@ -391,9 +394,13 @@ test('executor prefers the v2 principal and attestations shape for new clients',
         },
       ],
     });
+    assert.equal(frame.message.metadata, undefined, 'federated handoff fields stay bridge-internal');
   }
 
   const binding = registry.getBinding(task.id)!;
+  assert.equal(binding.principalId, 'slack:T123/U456');
+  assert.equal(binding.actorId, 'did:web:issuer.example');
+  assert.equal(binding.authorizationKey, 'federated:v1:task-policy-key');
   binding.sink.pushStatus({
     taskId: task.id,
     contextId: task.contextId!,

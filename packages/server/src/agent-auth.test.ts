@@ -4,8 +4,13 @@ import { Hono } from 'hono';
 import { SiweMessage } from 'siwe';
 import { Wallet } from 'ethers';
 import type { WebSocket } from 'ws';
-import type { AgentCard } from '@vicoop-bridge/protocol';
-import { agentAuthMiddleware, newRejectionId, sanitizeErrorDescription } from './agent-auth.js';
+import { CALLER_CONTEXT_V2_CAPABILITY, type AgentCard } from '@vicoop-bridge/protocol';
+import {
+  agentAuthMiddleware,
+  getCaller,
+  newRejectionId,
+  sanitizeErrorDescription,
+} from './agent-auth.js';
 import { _resetSiweBearerCacheForTests } from './auth/siwe-bearer.js';
 import { Registry, type ClientConnection } from './registry.js';
 import type { Sql } from './db.js';
@@ -60,6 +65,7 @@ function registerAgent(
   registry: Registry,
   agentId: string,
   allowedCallers: string[],
+  protocolCapabilities?: string[],
 ): void {
   const conn: ClientConnection = {
     agentId,
@@ -69,6 +75,7 @@ function registerAgent(
     allowedCallers,
     ws: { close() {} } as unknown as WebSocket,
     connectedAt: Date.now(),
+    ...(protocolCapabilities !== undefined ? { protocolCapabilities } : {}),
   };
   registry.registerAgent(conn);
 }
@@ -169,6 +176,22 @@ test('public agent (no allowedCallers) passes through without WWW-Authenticate',
   assert.equal(res.headers.get('WWW-Authenticate'), null);
 });
 
+test('a presented federation token is still validated after its final policy tuple is removed', async () => {
+  const sql = (async (strings: TemplateStringsArray) => {
+    if (strings.join('?').includes('FROM infra.oauth_federation_access_tokens')) return [];
+    throw new Error('unexpected SQL');
+  }) as unknown as Sql;
+  const { app, registry } = buildApp({ sql });
+  registerAgent(registry, 'public-after-removal', [], [CALLER_CONTEXT_V2_CAPABILITY]);
+
+  const response = await app.request('/agents/public-after-removal', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer vbc_fed_revoked-token' },
+  });
+  assert.equal(response.status, 401);
+  assert.match(response.headers.get('WWW-Authenticate') ?? '', /invalid_token/);
+});
+
 test('unknown agent returns 404 without auth challenge', async () => {
   const { app } = buildApp();
 
@@ -237,6 +260,61 @@ test('caller not in allowedCallers responds 403 with WWW-Authenticate error="ins
   assert.match(challenge, /^Bearer realm="vicoop-bridge"/);
   assert.match(challenge, /error="insufficient_scope"/);
   assert.match(challenge, /error_description="caller not in allowed list"/);
+});
+
+test('federated bearer restores platform principal, Connector actor, and normalized attestation', async () => {
+  const sql = (async (strings: TemplateStringsArray) => {
+    const statement = strings.join('?');
+    if (statement.includes('FROM infra.oauth_federation_access_tokens')) {
+      return [{
+        id: 'token-row-1',
+        agent_id: 'restricted',
+        resource: 'https://bridge.example/agents/restricted',
+        principal_id: 'slack:T123/U456',
+        actor_id: 'did:web:connector.example',
+        allowed_caller: 'federated:v1:test',
+        attestation: {
+          credentialId: 'urn:mentionable:oauth-assertion:test',
+          issuer: 'did:web:connector.example',
+          subject: 'slack:T123/U456',
+          method: 'urn:mentionable:auth:slack-member:v0.1',
+        },
+        scopes: ['a2a:message.send'],
+        task_id: null,
+        expires_at: new Date(Date.now() + 60_000),
+        revoked: false,
+        policy_active: true,
+      }];
+    }
+    if (statement.includes('UPDATE infra.oauth_federation_access_tokens')) return [];
+    throw new Error(`unexpected SQL in test: ${statement}`);
+  }) as unknown as Sql;
+  const registry = new Registry();
+  registerAgent(
+    registry,
+    'restricted',
+    ['federated:v1:test'],
+    [CALLER_CONTEXT_V2_CAPABILITY],
+  );
+  const app = new Hono();
+  app.post('/agents/:id', agentAuthMiddleware(registry, {
+    sql,
+    deviceFlowEnabled: false,
+  }), (c) => c.json(getCaller(c)!));
+
+  const response = await app.request('/agents/restricted', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer vbc_fed_test-token' },
+  });
+  assert.equal(response.status, 200);
+  const caller = await response.json() as {
+    principalId: string;
+    actorId: string;
+    federation: { attestations: Array<{ subject: string }> };
+  };
+  assert.equal(caller.principalId, 'slack:T123/U456');
+  assert.equal(caller.actorId, 'did:web:connector.example');
+  assert.equal(caller.federation.attestations[0]?.subject, 'slack:T123/U456');
 });
 
 // Direct unit tests for sanitizeErrorDescription. All call sites in the

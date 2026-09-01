@@ -26,6 +26,7 @@ import { requestUsage, UsageRpcError } from './usage-rpc.js';
 import {
   AdminApiError,
   addCaller,
+  addFederatedCaller,
   clearX402Pricing,
   deleteClientForOwner,
   getX402Pricing,
@@ -34,6 +35,7 @@ import {
   listCallers,
   listClientsForOwner,
   removeCaller,
+  removeFederatedCaller,
   setX402Pricing,
 } from './admin-api.js';
 import {
@@ -42,6 +44,8 @@ import {
   classifyMissingAgent,
   getAgentConn,
   getCaller,
+  newRejectionId,
+  rejectAgentRequest,
 } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
@@ -66,6 +70,7 @@ import {
   type DidDocumentResolver,
   type IdentityReplayStore,
 } from './identity-vc/index.js';
+import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
 import {
   PostgresTaskStore,
   parsePersistRequestEnvelope,
@@ -76,6 +81,13 @@ import {
   type ConnectionPair,
   type WellKnownDeps,
 } from './well-known.js';
+import { mountOAuthFederationRoutes } from './oauth-federation/routes.js';
+import {
+  authorizeFederatedOperation,
+  parseFederatedHttpJsonOperation,
+  parseFederatedJsonRpcOperation,
+  type FederatedOperation,
+} from './oauth-federation/authorization.js';
 
 export interface ServerHttpOptions {
   registry: Registry;
@@ -361,11 +373,57 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       });
     }
     if (caller !== undefined) {
+      const existingAttestations =
+        isRecord(message.metadata) &&
+        Array.isArray(message.metadata[IDENTITY_VC_PRESENTED_METADATA_KEY])
+          ? message.metadata[IDENTITY_VC_PRESENTED_METADATA_KEY]
+          : [];
       message.metadata = {
         ...(isRecord(message.metadata) ? message.metadata : {}),
         _principalId: caller.principalId,
+        ...(caller.actorId !== undefined ? { _actorId: caller.actorId } : {}),
+        ...(caller.federation?.allowedCaller !== undefined
+          ? { _authorizationKey: caller.federation.allowedCaller }
+          : {}),
+        ...(caller.federation?.attestations !== undefined
+          ? {
+              [IDENTITY_VC_PRESENTED_METADATA_KEY]: [
+                ...existingAttestations,
+                ...caller.federation.attestations,
+              ],
+            }
+          : {}),
       };
     }
+  }
+
+  async function enforceFederatedOperation(
+    c: Context,
+    caller: ReturnType<typeof getCaller>,
+    operation: FederatedOperation | undefined,
+    responseFormat: 'jsonrpc' | 'http-json',
+  ): Promise<Response | undefined> {
+    const result = await authorizeFederatedOperation(
+      opts.db,
+      c.req.param('id')!,
+      caller,
+      operation,
+    );
+    if (result.ok) return undefined;
+    const rejectionId = newRejectionId();
+    logEvent('oauth_federation_request_rejected', {
+      agentId: c.req.param('id'),
+      reason: result.reason,
+      rejectionId,
+    });
+    return rejectAgentRequest(
+      c,
+      responseFormat,
+      403,
+      -32001,
+      'Federated token is not authorized for this operation',
+      rejectionId,
+    );
   }
 
   function recordAgentRequest(
@@ -404,6 +462,16 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         `PUBLIC_URL "${opts.publicUrl}" is not a valid URL — cannot configure SIWE domain verification or well-known Mentionable routes`,
       );
     }
+  }
+
+  if (opts.publicUrl) {
+    mountOAuthFederationRoutes(app, {
+      sql: opts.db,
+      publicUrl: opts.publicUrl,
+      resolver: identityVcResolver,
+      passThroughOtherGrants: deviceFlowEnabled,
+      ...(opts.identityVc?.now !== undefined ? { now: opts.identityVc.now } : {}),
+    });
   }
 
   app.get('/healthz', (c) => c.json({ ok: true }));
@@ -736,6 +804,73 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }
   });
 
+  async function federatedCallerBody(c: Context): Promise<
+    | { ok: true; value: { issuer: string; method: string; subject: string } }
+    | { ok: false; response: Response }
+  > {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return {
+        ok: false,
+        response: c.json({ error: 'Body must be JSON: { issuer, method, subject }' }, 400),
+      };
+    }
+    if (
+      !isRecord(body) ||
+      typeof body.issuer !== 'string' ||
+      typeof body.method !== 'string' ||
+      typeof body.subject !== 'string' ||
+      Object.keys(body).some((key) => !['issuer', 'method', 'subject'].includes(key))
+    ) {
+      return {
+        ok: false,
+        response: c.json({ error: 'Body must be JSON: { issuer, method, subject }' }, 400),
+      };
+    }
+    return {
+      ok: true,
+      value: { issuer: body.issuer, method: body.method, subject: body.subject },
+    };
+  }
+
+  app.post('/admin-api/agents/:id/federated-callers', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    const parsed = await federatedCallerBody(c);
+    if (!parsed.ok) return parsed.response;
+    try {
+      return c.json(await addFederatedCaller(
+        opts.db,
+        opts.registry,
+        auth.principalId,
+        c.req.param('id'),
+        parsed.value,
+      ));
+    } catch (err) {
+      return adminApiErrorResponse(c, err);
+    }
+  });
+
+  app.delete('/admin-api/agents/:id/federated-callers', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    const parsed = await federatedCallerBody(c);
+    if (!parsed.ok) return parsed.response;
+    try {
+      return c.json(await removeFederatedCaller(
+        opts.db,
+        opts.registry,
+        auth.principalId,
+        c.req.param('id'),
+        parsed.value,
+      ));
+    } catch (err) {
+      return adminApiErrorResponse(c, err);
+    }
+  });
+
   // List the owner's `clients` rows so operators can see persisted state
   // (including orphans from aborted setup / exited daemons) without
   // dropping to admin GraphQL or psql. RLS filters to the principal's own
@@ -933,6 +1068,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     recordAgentRequest(c, conn, caller);
     const rawBody = await c.req.text();
     const parsed = JSON.parse(rawBody);
+    const federatedRejection = await enforceFederatedOperation(
+      c,
+      caller,
+      parseFederatedJsonRpcOperation(parsed),
+      'jsonrpc',
+    );
+    if (federatedRejection) return federatedRejection;
     await prepareAgentRequestBody(parsed, c, caller, conn);
     const handler = getHandlerForConn(conn);
     const result = await handler.handle(parsed);
@@ -953,6 +1095,15 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     } catch {
       // DefaultRequestHandler accepts a string and returns the protocol's
       // structured JSON parse error, so don't turn malformed JSON into a 500.
+    }
+    if (isRecord(body)) {
+      const federatedRejection = await enforceFederatedOperation(
+        c,
+        caller,
+        parseFederatedJsonRpcOperation(body),
+        'jsonrpc',
+      );
+      if (federatedRejection) return federatedRejection;
     }
     await prepareAgentRequestBody(body, c, caller, conn);
     c.header('A2A-Version', '1.0');
@@ -985,6 +1136,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         }
       }
     }
+    const federatedRejection = await enforceFederatedOperation(
+      c,
+      caller,
+      parseFederatedHttpJsonOperation(c.req.method, c.req.path, body),
+      'http-json',
+    );
+    if (federatedRejection) return federatedRejection;
     await prepareAgentRequestBody(body, c, caller, conn);
     const response = await getHttpJsonV1ForConn(conn).handle({
       method: c.req.method,

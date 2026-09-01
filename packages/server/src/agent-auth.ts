@@ -9,6 +9,9 @@ import {
 import { matchPrincipal, type VerifiedCaller } from './auth/principal.js';
 import { verifySiweBearerToken } from './auth/siwe-bearer.js';
 import { logEvent, truncate } from './log.js';
+import { OAUTH_FEDERATION_ACCESS_TOKEN_PREFIX } from './oauth-federation/profile.js';
+import { verifyFederatedAccessToken } from './oauth-federation/store.js';
+import { selectCallerContextVersion } from './caller-context.js';
 
 export function getAgentConn(c: Context): ClientConnection {
   return c.get('agentConn') as ClientConnection;
@@ -140,6 +143,44 @@ export interface AgentAuthOptions {
   siweDomain?: string;
 }
 
+export function rejectAgentRequest(
+  c: Context,
+  responseFormat: 'jsonrpc' | 'http-json',
+  status: 401 | 403 | 404 | 503,
+  jsonRpcCode: number,
+  message: string,
+  rejectionId: string,
+) {
+  if (responseFormat !== 'http-json') {
+    return c.json(rejectionErrorBody(jsonRpcCode, message, rejectionId), status);
+  }
+  const statusName = {
+    401: 'UNAUTHENTICATED',
+    403: 'PERMISSION_DENIED',
+    404: 'NOT_FOUND',
+    503: 'UNAVAILABLE',
+  }[status];
+  return c.body(
+    JSON.stringify({
+      error: {
+        code: status,
+        status: statusName,
+        message,
+        details: [
+          {
+            '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+            reason: statusName,
+            domain: 'vicoop-bridge',
+            metadata: { rejectionId },
+          },
+        ],
+      },
+    }),
+    status,
+    { 'Content-Type': 'application/a2a+json' },
+  );
+}
+
 export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) {
   // /agents/:id accepts two bearer shapes (issue #31 + siwe-bearer-auth/v0.1):
   //   1. Opaque vbc_caller_* (issued by /auth/siwe/exchange or /oauth/token)
@@ -168,33 +209,13 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
     message: string,
     rejectionId: string,
   ) {
-    if (opts.responseFormat !== 'http-json') {
-      return c.json(rejectionErrorBody(jsonRpcCode, message, rejectionId), status);
-    }
-    const statusName = {
-      401: 'UNAUTHENTICATED',
-      403: 'PERMISSION_DENIED',
-      404: 'NOT_FOUND',
-      503: 'UNAVAILABLE',
-    }[status];
-    return c.body(
-      JSON.stringify({
-        error: {
-          code: status,
-          status: statusName,
-          message,
-          details: [
-            {
-              '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
-              reason: statusName,
-              domain: 'vicoop-bridge',
-              metadata: { rejectionId },
-            },
-          ],
-        },
-      }),
+    return rejectAgentRequest(
+      c,
+      opts.responseFormat ?? 'jsonrpc',
       status,
-      { 'Content-Type': 'application/a2a+json' },
+      jsonRpcCode,
+      message,
+      rejectionId,
     );
   }
 
@@ -228,12 +249,19 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
 
     c.set('agentConn', conn);
 
-    if (conn.allowedCallers.length === 0) {
+    const authHeader = c.req.header('Authorization');
+    const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
+    // Empty allowed_callers keeps its historical public-agent meaning, but a
+    // presented federation token must still be validated. Otherwise removing
+    // the final exact tuple would turn an already-issued vbc_fed_* token into
+    // an anonymous public request and bypass immediate revocation.
+    if (
+      conn.allowedCallers.length === 0 &&
+      !bearerToken?.startsWith(OAUTH_FEDERATION_ACCESS_TOKEN_PREFIX)
+    ) {
       return next();
     }
 
-    const authHeader = c.req.header('Authorization');
-    const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
     if (!bearerToken) {
       const rejectionId = newRejectionId();
       logEvent('agent_request_rejected', {
@@ -248,7 +276,45 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
     }
 
     let caller: VerifiedCaller;
-    if (bearerToken.startsWith(CALLER_TOKEN_PREFIX)) {
+    if (bearerToken.startsWith(OAUTH_FEDERATION_ACCESS_TOKEN_PREFIX)) {
+      try {
+        if (selectCallerContextVersion(conn.protocolCapabilities) !== 'v2') {
+          throw new Error('connected agent does not support caller-context-v2');
+        }
+        const token = await verifyFederatedAccessToken(opts.sql, bearerToken, agentId);
+        caller = {
+          principalId: token.principalId,
+          ...(token.actorId !== token.principalId
+            ? { actorId: token.actorId }
+            : {}),
+          federation: {
+            tokenId: token.tokenId,
+            agentId: token.agentId,
+            resource: token.resource,
+            actorId: token.actorId,
+            scopes: token.scopes,
+            allowedCaller: token.allowedCaller,
+            ...(token.taskId !== undefined ? { taskId: token.taskId } : {}),
+            ...(token.attestation !== undefined
+              ? { attestations: [token.attestation] }
+              : {}),
+          },
+        };
+      } catch (err) {
+        const rejectionId = newRejectionId();
+        logEvent('agent_request_rejected', {
+          agentId,
+          reason: 'invalid_federated_token',
+          rejectionId,
+          detail: truncate((err as Error).message, 256),
+        });
+        setWWWAuthenticate(c, {
+          error: 'invalid_token',
+          description: 'invalid OAuth federation token',
+        });
+        return reject(c, 401, -32001, 'Invalid bearer token.', rejectionId);
+      }
+    } else if (bearerToken.startsWith(CALLER_TOKEN_PREFIX)) {
       try {
         caller = await verifyCallerToken(opts.sql, bearerToken);
       } catch (err) {
@@ -352,7 +418,15 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
       );
     }
 
-    const allowed = conn.allowedCallers.some((entry) => matchPrincipal(entry, caller));
+    // Federation tokens were already bound to this exact resource and, for
+    // message tokens, rechecked against the live exact tuple in Postgres.
+    // Task-only tokens recover and recheck the exact tuple from the target
+    // task after the route operation is parsed. Non-federated tokens retain
+    // the ordinary in-memory allowed-caller match.
+    const allowed =
+      caller.federation !== undefined
+        ? true
+        : conn.allowedCallers.some((entry) => matchPrincipal(entry, caller));
     if (!allowed) {
       const rejectionId = newRejectionId();
       logEvent('agent_request_rejected', {

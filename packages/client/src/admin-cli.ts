@@ -149,6 +149,43 @@ const agentCallersRemoveSubCmd = longestMatch(
   agentCallersRemoveCommand('rm', true),
 );
 
+function federatedCallerCommand<
+  const A extends 'agent-callers-add-federated' | 'agent-callers-remove-federated',
+>(name: 'add-federated' | 'remove-federated', action: A) {
+  const adding = action === 'agent-callers-add-federated';
+  return command(
+    name,
+    object({
+      action: constant(action),
+      ...sharedFlags,
+      agentId: argument(string({ metavar: 'AGENT_ID' })),
+      issuer: option('--issuer', string({ metavar: 'DID' }), {
+        description: message`Exact did:web Connector issuer and OAuth client id.`,
+      }),
+      method: option('--method', string({ metavar: 'URN' }), {
+        description: message`Exact Mentionable authentication method URN.`,
+      }),
+      subject: option('--subject', string({ metavar: 'SUBJECT' }), {
+        description: message`Exact canonical platform subject, e.g. slack:T123/U456.`,
+      }),
+    }),
+    {
+      brief: adding
+        ? message`Allow one exact federated Connector/method/subject caller.`
+        : message`Remove one exact federated caller and revoke its task/token authority.`,
+    },
+  );
+}
+
+const agentCallersAddFederatedSubCmd = federatedCallerCommand(
+  'add-federated',
+  'agent-callers-add-federated',
+);
+const agentCallersRemoveFederatedSubCmd = federatedCallerCommand(
+  'remove-federated',
+  'agent-callers-remove-federated',
+);
+
 // `issue-api-key` mints a static API key — a caller the bridge creates a
 // secret for, for non-interactive callers (CI, backend services) that can't
 // run the Google/SIWE login flow. It lives under `callers` alongside
@@ -180,6 +217,8 @@ const agentCallersSubCmd = command(
     agentCallersListSubCmd,
     agentCallersAddSubCmd,
     agentCallersRemoveSubCmd,
+    agentCallersAddFederatedSubCmd,
+    agentCallersRemoveFederatedSubCmd,
     agentCallersIssueSubCmd,
   ),
   {
@@ -299,7 +338,7 @@ export const agentCmd = command(
   ),
   {
     brief: message`Manage agent registrations, their callers, and their pricing.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, issue-api-key}\`, \`x402 {show, set, clear}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, add-federated, remove-federated, issue-api-key}\`, \`x402 {show, set, clear}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
     hidden: 'usage',
   },
 );
@@ -310,6 +349,14 @@ export type AgentDeleteArgs = Extract<AgentCliArgs, { action: 'agent-delete' }>;
 export type AgentCallersListArgs = Extract<AgentCliArgs, { action: 'agent-callers-list' }>;
 export type AgentCallersAddArgs = Extract<AgentCliArgs, { action: 'agent-callers-add' }>;
 export type AgentCallersRemoveArgs = Extract<AgentCliArgs, { action: 'agent-callers-remove' }>;
+export type AgentCallersAddFederatedArgs = Extract<
+  AgentCliArgs,
+  { action: 'agent-callers-add-federated' }
+>;
+export type AgentCallersRemoveFederatedArgs = Extract<
+  AgentCliArgs,
+  { action: 'agent-callers-remove-federated' }
+>;
 export type AgentCallersIssueArgs = Extract<AgentCliArgs, { action: 'agent-callers-issue' }>;
 export type AgentX402ShowArgs = Extract<AgentCliArgs, { action: 'agent-x402-show' }>;
 export type AgentX402SetArgs = Extract<AgentCliArgs, { action: 'agent-x402-set' }>;
@@ -574,7 +621,10 @@ function principalType(principal: string): string {
 
 function renderCallerList(body: unknown): string {
   if (!body || typeof body !== 'object') return String(body);
-  const b = body as { allowed_callers?: string[] };
+  const b = body as {
+    allowed_callers?: string[];
+    federated_callers?: Array<{ issuer: string; method: string; subject: string }>;
+  };
   const callers = b.allowed_callers ?? [];
   // Empty allowed_callers means the dispatcher treats the agent as public.
   // Surface that as the table's empty-state, matching the other `list`
@@ -583,10 +633,21 @@ function renderCallerList(body: unknown): string {
   if (callers.length === 0) {
     return '(no callers — agent is public)';
   }
-  return renderTable(
+  const callerTable = renderTable(
     ['TYPE', 'PRINCIPAL'],
     callers.map((p) => [principalType(p), p]),
   );
+  const federated = b.federated_callers ?? [];
+  if (federated.length === 0) return callerTable;
+  return [
+    callerTable,
+    '',
+    'FEDERATED CALLERS',
+    renderTable(
+      ['ISSUER', 'METHOD', 'SUBJECT'],
+      federated.map((entry) => [entry.issuer, entry.method, entry.subject]),
+    ),
+  ].join('\n');
 }
 
 // Agent-centric renderer for `agent list`. The /admin-api/clients response
@@ -805,6 +866,42 @@ async function execRemoveCaller(args: CallerCommonArgs & { principal: string }):
     path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/callers?principal=${encodeURIComponent(args.principal)}`,
   });
   return emit(result, args.json, renderCallerMutation);
+}
+
+interface FederatedCallerArgs extends CallerCommonArgs {
+  issuer: string;
+  method: string;
+  subject: string;
+}
+
+async function execFederatedCaller(
+  args: FederatedCallerArgs,
+  method: 'POST' | 'DELETE',
+): Promise<number> {
+  const session = resolveSession(args);
+  if ('error' in session) {
+    process.stderr.write(`${session.error}\n`);
+    return 1;
+  }
+  const result = await callApi({
+    session,
+    method,
+    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/federated-callers`,
+    body: { issuer: args.issuer, method: args.method, subject: args.subject },
+  });
+  return emit(result, args.json, renderCallerMutation);
+}
+
+export async function runAgentCallersAddFederated(
+  args: AgentCallersAddFederatedArgs,
+): Promise<number> {
+  return execFederatedCaller(args, 'POST');
+}
+
+export async function runAgentCallersRemoveFederated(
+  args: AgentCallersRemoveFederatedArgs,
+): Promise<number> {
+  return execFederatedCaller(args, 'DELETE');
 }
 
 // ----- agent x402 (pricing) ---------------------------------------------------
@@ -1057,4 +1154,3 @@ export async function runListAgents(args: ListAgentsArgs): Promise<number> {
   });
   return emit(result, args.json, renderAgentList);
 }
-

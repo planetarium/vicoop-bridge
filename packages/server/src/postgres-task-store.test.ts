@@ -203,6 +203,8 @@ test('stripSensitiveMetadata with preserveEnvelope still scrubs bearer/principal
         metadata: {
           _bearerToken: 'secret',
           _principalId: 'eth:0x1',
+          _actorId: 'did:web:connector.example',
+          _authorizationKey: 'federated:v1:private-policy-binding',
           _identityVcPresented: [{ profile: { displayName: 'private' } }],
           keep: 1,
         },
@@ -216,11 +218,60 @@ test('stripSensitiveMetadata with preserveEnvelope still scrubs bearer/principal
   const sm = (persisted.status.message as { metadata: Record<string, unknown> }).metadata;
   assert.equal(sm._bearerToken, undefined, 'bearer token scrubbed even with preserveEnvelope');
   assert.equal(sm._principalId, undefined, 'principal scrubbed even with preserveEnvelope');
+  assert.equal(sm._actorId, undefined, 'federated actor handoff is never persisted in task JSON');
+  assert.equal(sm._authorizationKey, undefined, 'federated policy handoff is never persisted in task JSON');
   assert.equal(sm._identityVcPresented, undefined, 'normalized VC handoff is never persisted');
   assert.equal(sm.keep, 1, 'non-sensitive message metadata retained');
 });
 
 // ── updateTask concurrency (issue #366) ─────────────────────────────────────
+
+test(
+  'federated task identity is persisted in dedicated columns, not task JSON',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const ownerAgent = `federated-owner-${crypto.randomUUID()}`;
+    const store = new PostgresTaskStore(sql, { ownerAgent });
+    const maintenanceStore = new PostgresTaskStore(sql);
+    let taskId: string | undefined;
+    try {
+      await ensureSchema(sql);
+      const task = await store.createTask({});
+      taskId = task.id;
+      const history = [{
+        messageId: 'federated-message',
+        role: 'user',
+        parts: [{ kind: 'text', text: 'hello' }],
+        metadata: {
+          _principalId: 'slack:T123/U456',
+          _actorId: 'did:web:connector.example',
+          _authorizationKey: 'federated:v1:test-binding',
+        },
+      }] as unknown as Message[];
+      await store.updateTask(task.id, { history });
+      const rows = await sql<{
+        owner_principal: string | null;
+        owner_actor: string | null;
+        authorization_key: string | null;
+        task_json: Record<string, unknown>;
+      }[]>`
+        SELECT owner_principal, owner_actor, authorization_key, task_json
+        FROM infra.a2a_tasks WHERE task_id = ${task.id}
+      `;
+      assert.equal(rows[0]?.owner_principal, 'slack:T123/U456');
+      assert.equal(rows[0]?.owner_actor, 'did:web:connector.example');
+      assert.equal(rows[0]?.authorization_key, 'federated:v1:test-binding');
+      const serialized = JSON.stringify(rows[0]?.task_json);
+      assert.equal(serialized.includes('_principalId'), false);
+      assert.equal(serialized.includes('_actorId'), false);
+      assert.equal(serialized.includes('_authorizationKey'), false);
+    } finally {
+      if (taskId) await maintenanceStore.deleteTask(taskId);
+      await sql.end();
+    }
+  },
+);
 
 test(
   'owner-scoped stores cannot read, update, or delete another agent task',

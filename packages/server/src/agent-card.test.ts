@@ -14,6 +14,8 @@ import { buildAgentA2XServer } from './agent-card.js';
 import { Registry, type ClientConnection } from './registry.js';
 import { parseX402Pricing } from './x402/pricing.js';
 import type { Sql } from './db.js';
+import { OAUTH_FEDERATION_EXTENSION_URI } from './oauth-federation/profile.js';
+import { formatFederatedPrincipal } from './auth/principal.js';
 
 function fakeConn(card: AgentCard, overrides: Partial<ClientConnection> = {}): ClientConnection {
   return {
@@ -109,6 +111,49 @@ test('buildAgentA2XServer publishes v1 JSON-RPC and HTTP+JSON on one versioned b
     },
   ]);
   assert.equal((card as AgentCardV10 & { protocolVersion?: string }).protocolVersion, undefined);
+});
+
+test('OAuth federation is advertised only for an exact persisted federated caller', () => {
+  const federated = formatFederatedPrincipal({
+    issuer: 'did:web:connector.example',
+    method: 'urn:mentionable:auth:slack-member:v0.1',
+    subject: 'slack:T123/U456',
+  });
+  assert.ok(federated);
+  const cardFor = (
+    allowedCallers: string[],
+    protocolCapabilities: string[] = [CALLER_CONTEXT_V2_CAPABILITY],
+  ) => buildAgentA2XServer(
+    fakeConn({
+      name: 'claude',
+      description: 'Claude Code',
+      version: '0.0.1',
+      protocolVersion: '0.3.0',
+      capabilities: { streaming: true },
+      skills: [],
+    }, { allowedCallers, protocolCapabilities }),
+    new InMemoryTaskStore(),
+    new Registry(),
+    { publicUrl: 'https://bridge.example', deviceFlowEnabled: false },
+  ).getAgentCard() as AgentCardV03;
+
+  const extension = cardFor([federated]).capabilities.extensions?.find(
+    (entry) => entry.uri === OAUTH_FEDERATION_EXTENSION_URI,
+  );
+  assert.deepEqual(extension?.params, {
+    authorization_server: 'https://bridge.example/.well-known/oauth-authorization-server',
+    resource: 'https://bridge.example/agents/claude',
+  });
+  assert.equal(
+    cardFor(['eth:0x0000000000000000000000000000000000000002'])
+      .capabilities.extensions?.some((entry) => entry.uri === OAUTH_FEDERATION_EXTENSION_URI) ?? false,
+    false,
+  );
+  assert.equal(
+    cardFor([federated], [CALLER_CONTEXT_CAPABILITY])
+      .capabilities.extensions?.some((entry) => entry.uri === OAUTH_FEDERATION_EXTENSION_URI) ?? false,
+    false,
+  );
 });
 
 test('buildAgentA2XServer preserves advertised optional extensions', () => {

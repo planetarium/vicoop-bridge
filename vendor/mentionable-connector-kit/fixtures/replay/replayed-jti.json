@@ -1,0 +1,16 @@
+{
+  "jwt": "eyJhbGciOiJFZERTQSIsInR5cCI6Im1lbnRpb25hYmxlLXN1YmplY3QtYXNzZXJ0aW9uK2p3dCIsImtpZCI6ImRpZDp3ZWI6Y29ubmVjdG9yLm9hdXRoLWZpeHR1cmVzLm1lbnRpb25hYmxlLmRldiNvYXV0aC1maXh0dXJlLTIwMjYtMDgifQ.eyJtZW50aW9uYWJsZV9tZXRob2QiOiJ1cm46bWVudGlvbmFibGU6YXV0aDpzbGFjay13b3Jrc3BhY2UtbWVtYmVyOnYwLjEiLCJpc3MiOiJkaWQ6d2ViOmNvbm5lY3Rvci5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYiLCJzdWIiOiJzbGFjazpUMDEyMzQ1Ni9VMDQ1Njc4OSIsImF1ZCI6Imh0dHBzOi8vc3RzLm9hdXRoLWZpeHR1cmVzLm1lbnRpb25hYmxlLmRldi9vYXV0aC90b2tlbiIsImlhdCI6MTc4NzA5NzYwMCwiZXhwIjoxNzg3MDk3OTAwLCJqdGkiOiJmM2U0YTViNi1jN2Q4LTRlOWYtOGExYi0yYzNkNGU1ZjZhN2IifQ.qNoQfrIrr0aTju6JHnvhQ_LeXgjPFvK79DJCxzOmGhREkLQU0IEJAkO3WacQbcXsN8o45nxUbR38ck2c3qYjAg",
+  "tuple": {
+    "issuer": "did:web:connector.oauth-fixtures.mentionable.dev",
+    "jti": "f3e4a5b6-c7d8-4e9f-8a1b-2c3d4e5f6a7b"
+  },
+  "presentations": [
+    { "order": 1, "expect": "accept" },
+    { "order": 2, "expect": "reject" }
+  ],
+  "verification": {
+    "typ": "mentionable-subject-assertion+jwt",
+    "tokenEndpoint": "https://sts.oauth-fixtures.mentionable.dev/oauth/token",
+    "verifiedAt": "2026-08-19T00:01:00Z"
+  }
+}

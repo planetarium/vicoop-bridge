@@ -1,0 +1,26 @@
+{
+  "params": {
+    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+    "subject_token": "eyJhbGciOiJFZERTQSIsInR5cCI6Im1lbnRpb25hYmxlLXRhc2stY29udGludWF0aW9uLWFzc2VydGlvbitqd3QiLCJraWQiOiJkaWQ6d2ViOmNvbm5lY3Rvci5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYjb2F1dGgtZml4dHVyZS0yMDI2LTA4In0.eyJtZW50aW9uYWJsZV90YXNrX2lkIjoiM2YyNTA0ZTAtNGY4OS00MWQzLTlhMGMtMDMwNWU4MmMzMzAxIiwiaXNzIjoiZGlkOndlYjpjb25uZWN0b3Iub2F1dGgtZml4dHVyZXMubWVudGlvbmFibGUuZGV2Iiwic3ViIjoic2xhY2s6VDAxMjM0NTYvVTA0NTY3ODkiLCJhdWQiOiJodHRwczovL3N0cy5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYvb2F1dGgvdG9rZW4iLCJpYXQiOjE3ODcwOTc2MDAsImV4cCI6MTc4NzA5NzkwMCwianRpIjoiYzhiOWQwZTEtZjJhMy00YjRjLTlkNmUtN2Y4YTliMGMxZDJlIn0.y0Q0X2iHMbSKiEyzfX2akZ2cu74Rtdez_o7fOsuYoo-s4I2uDlkBaUDjK3x1tYUC_kQBlBH-aQPgMcXyLIDkCQ",
+    "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+    "resource": "https://agents.oauth-fixtures.mentionable.dev/fixture-agent/a2a",
+    "scope": "a2a:task.read a2a:task.cancel",
+    "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+    "client_id": "did:web:connector.oauth-fixtures.mentionable.dev",
+    "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+    "client_assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6Im1lbnRpb25hYmxlLWNsaWVudC1hc3NlcnRpb24rand0Iiwia2lkIjoiZGlkOndlYjpjb25uZWN0b3Iub2F1dGgtZml4dHVyZXMubWVudGlvbmFibGUuZGV2I29hdXRoLWZpeHR1cmUtMjAyNi0wOCJ9.eyJpc3MiOiJkaWQ6d2ViOmNvbm5lY3Rvci5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYiLCJzdWIiOiJkaWQ6d2ViOmNvbm5lY3Rvci5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYiLCJhdWQiOiJodHRwczovL3N0cy5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYvb2F1dGgvdG9rZW4iLCJpYXQiOjE3ODcwOTc2MDAsImV4cCI6MTc4NzA5NzkwMCwianRpIjoiZDljMGUxZjItYTNiNC00YzVkLThlN2YtOGE5YjBjMWQyZTNmIn0.EPoUlHa2rXIkge6GPRyzOLOAcNsDUeQdC_T5TOgwwboePTWm4m807e2Gi8K4YhdZQhIs6BgbUJE_yl-pX5fSAQ"
+  },
+  "evaluation": {
+    "expectedResource": "https://agents.oauth-fixtures.mentionable.dev/fixture-agent/a2a",
+    "tokenEndpoint": "https://sts.oauth-fixtures.mentionable.dev/oauth/token",
+    "verifiedAt": "2026-08-19T00:01:00Z"
+  },
+  "expected": {
+    "authorization": {
+      "purpose": "delegation",
+      "principal": "slack:T0123456/U0456789",
+      "actor": "did:web:connector.oauth-fixtures.mentionable.dev",
+      "task_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+    }
+  }
+}

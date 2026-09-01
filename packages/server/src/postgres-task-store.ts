@@ -45,16 +45,29 @@ function extractOwnerPrincipal(task: Task): string | undefined {
   return undefined;
 }
 
+function extractAuthorizationField(task: Task, key: '_actorId' | '_authorizationKey'): string | undefined {
+  for (const msg of task.history ?? []) {
+    const value = (msg as MessageWithMetadata).metadata?.[key];
+    if (typeof value === 'string') return value;
+  }
+  const statusValue = (task.status?.message as MessageWithMetadata | undefined)?.metadata?.[key];
+  return typeof statusValue === 'string' ? statusValue : undefined;
+}
+
 function stripMessageMetadata(msg: Message): Message {
   const metadata = (msg as MessageWithMetadata).metadata ?? {};
   const {
     _bearerToken,
     _principalId,
+    _actorId,
+    _authorizationKey,
     [IDENTITY_VC_PRESENTED_METADATA_KEY]: _presented,
     ...rest
   } = metadata;
   void _bearerToken;
   void _principalId;
+  void _actorId;
+  void _authorizationKey;
   void _presented;
   const clean = Object.keys(rest).length ? rest : undefined;
   if (clean) return { ...msg, metadata: clean };
@@ -479,6 +492,8 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   // row write participates in the same FOR UPDATE transaction that read it.
   private async writeTask(task: Task, sql: SqlExecutor = this.sql): Promise<void> {
     const ownerPrincipal = extractOwnerPrincipal(task);
+    const ownerActor = extractAuthorizationField(task, '_actorId');
+    const authorizationKey = extractAuthorizationField(task, '_authorizationKey');
     const sanitized = stripSensitiveMetadata(task, {
       preserveEnvelope: this.persistRequestEnvelope,
     });
@@ -488,32 +503,39 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     if (this.ownerAgent === undefined) {
       await sql`
         INSERT INTO infra.a2a_tasks
-          (task_id, context_id, state, task_json, owner_principal, owner_agent)
+          (task_id, context_id, state, task_json, owner_principal, owner_agent,
+           owner_actor, authorization_key)
         VALUES (
           ${task.id}, ${contextId}, ${task.status.state}, ${persisted},
-          ${ownerPrincipal ?? null}, NULL
+          ${ownerPrincipal ?? null}, NULL, ${ownerActor ?? null}, ${authorizationKey ?? null}
         )
         ON CONFLICT (task_id) DO UPDATE SET
           context_id = EXCLUDED.context_id,
           state = EXCLUDED.state,
           task_json = EXCLUDED.task_json,
           owner_principal = COALESCE(infra.a2a_tasks.owner_principal, EXCLUDED.owner_principal),
+          owner_actor = COALESCE(infra.a2a_tasks.owner_actor, EXCLUDED.owner_actor),
+          authorization_key = COALESCE(infra.a2a_tasks.authorization_key, EXCLUDED.authorization_key),
           updated_at = now()
       `;
       return;
     }
     await sql`
       INSERT INTO infra.a2a_tasks
-        (task_id, context_id, state, task_json, owner_principal, owner_agent)
+        (task_id, context_id, state, task_json, owner_principal, owner_agent,
+         owner_actor, authorization_key)
       VALUES (
         ${task.id}, ${contextId}, ${task.status.state}, ${persisted},
-        ${ownerPrincipal ?? null}, ${this.ownerAgent}
+        ${ownerPrincipal ?? null}, ${this.ownerAgent},
+        ${ownerActor ?? null}, ${authorizationKey ?? null}
       )
       ON CONFLICT (task_id) DO UPDATE SET
         context_id = EXCLUDED.context_id,
         state = EXCLUDED.state,
         task_json = EXCLUDED.task_json,
         owner_principal = COALESCE(infra.a2a_tasks.owner_principal, EXCLUDED.owner_principal),
+        owner_actor = COALESCE(infra.a2a_tasks.owner_actor, EXCLUDED.owner_actor),
+        authorization_key = COALESCE(infra.a2a_tasks.authorization_key, EXCLUDED.authorization_key),
         updated_at = now()
       WHERE infra.a2a_tasks.owner_agent = EXCLUDED.owner_agent
     `;

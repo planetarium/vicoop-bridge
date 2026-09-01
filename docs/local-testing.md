@@ -107,6 +107,11 @@ it:
   and rerun to pick up the new list. Useful when you want to skip the
   auth flow entirely for the smoke test.
 
+For the structured Mentionable OAuth federation caller and its three-ingress
+smoke matrix, follow [`oauth-federation.md`](./oauth-federation.md). Use the
+`agent callers add-federated` command there; do not hand-build the internal
+length-prefixed principal string.
+
 ## A2A v1 dual-transport smoke client
 
 With the local server and echo client running, execute the repository's

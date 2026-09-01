@@ -8,8 +8,10 @@ import {
   runAddCaller,
   runAgentCallersIssue,
   runAgentCallersAdd,
+  runAgentCallersAddFederated,
   runAgentCallersList,
   runAgentCallersRemove,
+  runAgentCallersRemoveFederated,
   runAgentDelete,
   runAgentList,
   runListAgents,
@@ -25,8 +27,10 @@ import {
   type AddCallerArgs,
   type AgentCallersIssueArgs,
   type AgentCallersAddArgs,
+  type AgentCallersAddFederatedArgs,
   type AgentCallersListArgs,
   type AgentCallersRemoveArgs,
+  type AgentCallersRemoveFederatedArgs,
   type AgentDeleteArgs,
   type AgentListArgs,
   type ListAgentsArgs,
@@ -85,6 +89,21 @@ const agentCallersRemoveArgsFn = (
   p: Partial<AgentCallersRemoveArgs> = {},
 ): AgentCallersRemoveArgs =>
   ({ action: 'agent-callers-remove', agentId, principal, ...SHARED, ...p });
+const federatedArgs = {
+  issuer: 'did:web:connector.example',
+  method: 'urn:mentionable:auth:slack-member:v0.1',
+  subject: 'slack:T123/U456',
+} as const;
+const agentCallersAddFederatedArgsFn = (
+  agentId: string,
+  p: Partial<AgentCallersAddFederatedArgs> = {},
+): AgentCallersAddFederatedArgs =>
+  ({ action: 'agent-callers-add-federated', agentId, ...federatedArgs, ...SHARED, ...p });
+const agentCallersRemoveFederatedArgsFn = (
+  agentId: string,
+  p: Partial<AgentCallersRemoveFederatedArgs> = {},
+): AgentCallersRemoveFederatedArgs =>
+  ({ action: 'agent-callers-remove-federated', agentId, ...federatedArgs, ...SHARED, ...p });
 const agentCallersIssueArgsFn = (
   agentId: string,
   p: Partial<AgentCallersIssueArgs> = {},
@@ -332,6 +351,30 @@ test('callers list shows the public empty-state when there are no allowed_caller
   const out = stdout.read();
   assert.match(out, /\(no callers — agent is public\)/);
   assert.doesNotMatch(out, /TYPE\s+PRINCIPAL/);
+});
+
+test('callers list decodes federated tuples for human inspection', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  installFetch(t, {
+    body: {
+      agent_id: 'foo',
+      owner_principal: 'eth:0xabc',
+      is_public: false,
+      allowed_callers: ['federated:v1:opaque-canonical-value'],
+      federated_callers: [{
+        principal: 'federated:v1:opaque-canonical-value',
+        ...federatedArgs,
+      }],
+    },
+  });
+
+  assert.equal(await runAgentCallersList(agentCallersListArgsFn('foo')), 0);
+  const out = stdout.read();
+  assert.match(out, /FEDERATED CALLERS/);
+  assert.match(out, /did:web:connector\.example/);
+  assert.match(out, /urn:mentionable:auth:slack-member:v0\.1/);
+  assert.match(out, /slack:T123\/U456/);
 });
 
 test('subcommand exits 1 with hint when no token is available', async (t) => {
@@ -619,6 +662,23 @@ test('agent callers list/add/remove hit the existing /admin-api/agents/:id/calle
   );
 });
 
+test('agent callers add-federated/remove-federated use the structured policy API', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, {
+    body: { agent_id: 'foo', allowed_callers: [], federated_callers: [] },
+  });
+
+  assert.equal(await runAgentCallersAddFederated(agentCallersAddFederatedArgsFn('foo')), 0);
+  assert.equal(await runAgentCallersRemoveFederated(agentCallersRemoveFederatedArgsFn('foo')), 0);
+  assert.deepEqual(calls.map((call) => [call.method, call.url]), [
+    ['POST', `${BRIDGE}/admin-api/agents/foo/federated-callers`],
+    ['DELETE', `${BRIDGE}/admin-api/agents/foo/federated-callers`],
+  ]);
+  assert.deepEqual(JSON.parse(calls[0].body!), federatedArgs);
+  assert.deepEqual(JSON.parse(calls[1].body!), federatedArgs);
+});
+
 // ---- `agent callers issue-api-key` — API key minting (#308) ------------------------
 
 test('agent callers issue-api-key POSTs to /apikeys and prints the secret once', async (t) => {
@@ -718,6 +778,17 @@ test('agent callers {list,remove,issue-api-key} parse through the real parser wi
     agentId: 'foo',
     principal,
   });
+  for (const [subcommand, action] of [
+    ['add-federated', 'agent-callers-add-federated'],
+    ['remove-federated', 'agent-callers-remove-federated'],
+  ] as const) {
+    expectOk([
+      'agent', 'callers', subcommand, 'foo',
+      '--issuer', federatedArgs.issuer,
+      '--method', federatedArgs.method,
+      '--subject', federatedArgs.subject,
+    ], { action, agentId: 'foo', ...federatedArgs });
+  }
   // `issue` is in the same tie-class (AGENT_ID positional vs the all-optional
   // top-level `list`/`remove`) — it must keep its AGENT_ID through the parser.
   expectOk(['agent', 'callers', 'issue-api-key', 'foo'], {

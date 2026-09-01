@@ -6,9 +6,15 @@
 import type postgres from 'postgres';
 import type { Sql } from './db.js';
 import type { Registry } from './registry.js';
-import { validatePrincipal } from './auth/principal.js';
+import {
+  formatFederatedPrincipal,
+  parseFederatedPrincipal,
+  validatePrincipal,
+  type FederatedPrincipalInput,
+} from './auth/principal.js';
 import { generateApiKeyId, issueSessionToken } from './auth/caller-token.js';
 import { isAdmin } from './admin-scope.js';
+import { notifyCallerPolicyChanged } from './caller-policy-watch.js';
 import {
   X402PricingWriteSchema,
   formatPricingError,
@@ -33,12 +39,22 @@ export class AdminApiError extends Error {
 // input form.
 const INVALID_PRINCIPAL_MESSAGE =
   'Invalid principal format. Expected eth:0x<40 hex>, 0x<40 hex>, ' +
-  'google:sub:<sub>, google:email:<addr>, or google:domain:<d>.';
+  'google:sub:<sub>, google:email:<addr>, google:domain:<d>, apikey:<id>, ' +
+  'or a canonical federated:v1 principal.';
+
+const INVALID_FEDERATED_CALLER_MESSAGE =
+  'Invalid federated caller. Expected an exact did:web issuer, method, and subject ' +
+  'whose canonical encoding is at most 512 bytes.';
+
+export interface FederatedCallerResult extends FederatedPrincipalInput {
+  principal: string;
+}
 
 export interface CallerListResult {
   agent_id: string;
   owner_principal: string;
   allowed_callers: string[];
+  federated_callers: FederatedCallerResult[];
   is_public: boolean;
   created_at?: string;
   updated_at?: string;
@@ -102,6 +118,7 @@ export async function addCaller(
     if (result.length > 0) {
       const callers = result[0].allowed_callers as string[];
       registry.updateAllowedCallers(agentId, callers);
+      await notifyCallerPolicyChanged(db, agentId);
       return { agent_id: agentId, principal: normalized, allowed_callers: callers };
     }
 
@@ -196,7 +213,32 @@ export async function removeCaller(
   }
 
   registry.updateAllowedCallers(agentId, callers);
+  await notifyCallerPolicyChanged(db, agentId);
   return { agent_id: agentId, principal: normalized, allowed_callers: callers };
+}
+
+export async function addFederatedCaller(
+  db: Sql,
+  registry: Registry,
+  principalId: string,
+  agentId: string,
+  input: FederatedPrincipalInput,
+): Promise<CallerMutationResult> {
+  const principal = formatFederatedPrincipal(input);
+  if (!principal) throw new AdminApiError(INVALID_FEDERATED_CALLER_MESSAGE, 400);
+  return addCaller(db, registry, principalId, agentId, principal);
+}
+
+export async function removeFederatedCaller(
+  db: Sql,
+  registry: Registry,
+  principalId: string,
+  agentId: string,
+  input: FederatedPrincipalInput,
+): Promise<CallerMutationResult> {
+  const principal = formatFederatedPrincipal(input);
+  if (!principal) throw new AdminApiError(INVALID_FEDERATED_CALLER_MESSAGE, 400);
+  return removeCaller(db, registry, principalId, agentId, principal);
 }
 
 export async function listCallers(
@@ -220,6 +262,10 @@ export async function listCallers(
     agent_id: policy.agent_id as string,
     owner_principal: policy.owner_principal as string,
     allowed_callers: callers,
+    federated_callers: callers.flatMap((principal) => {
+      const parsed = parseFederatedPrincipal(principal);
+      return parsed ? [{ principal, ...parsed }] : [];
+    }),
     is_public: callers.length === 0,
     created_at: policy.created_at instanceof Date ? policy.created_at.toISOString() : policy.created_at as string | undefined,
     updated_at: policy.updated_at instanceof Date ? policy.updated_at.toISOString() : policy.updated_at as string | undefined,
@@ -448,6 +494,7 @@ export async function issueAgentApiKey(
   }
 
   registry.updateAllowedCallers(agentId, allowedCallers);
+  await notifyCallerPolicyChanged(db, agentId);
 
   return {
     agent_id: agentId,

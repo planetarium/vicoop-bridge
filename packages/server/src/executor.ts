@@ -387,6 +387,12 @@ export class WSForwardingExecutor extends AgentExecutor {
     const rawMetadata = (message as { metadata?: Record<string, unknown> }).metadata;
     const principalId =
       typeof rawMetadata?._principalId === 'string' ? rawMetadata._principalId : undefined;
+    const actorId =
+      typeof rawMetadata?._actorId === 'string' ? rawMetadata._actorId : undefined;
+    const authorizationKey =
+      typeof rawMetadata?._authorizationKey === 'string'
+        ? rawMetadata._authorizationKey
+        : undefined;
     const presented = rawMetadata?.[IDENTITY_VC_PRESENTED_METADATA_KEY];
     if (rawMetadata) delete rawMetadata[IDENTITY_VC_PRESENTED_METADATA_KEY];
     const forwardMetadata = stripInternalMetadata(rawMetadata);
@@ -443,11 +449,12 @@ export class WSForwardingExecutor extends AgentExecutor {
       this.registry.getAgent(this.agentId)?.protocolCapabilities,
     );
     const hasPresented = Array.isArray(presented) && presented.length > 0;
-    const hasCallerInput = principalId !== undefined || hasPresented;
+    const hasCallerInput = principalId !== undefined || actorId !== undefined || hasPresented;
     const canonicalCaller =
       callerContextVersion !== undefined && hasCallerInput
         ? createCanonicalCallerContext({
             ...(principalId !== undefined ? { principalId } : {}),
+            ...(actorId !== undefined ? { actorId } : {}),
             ...(hasPresented
               ? { attestations: presented as CallerAttestationV2[] }
               : {}),
@@ -476,6 +483,8 @@ export class WSForwardingExecutor extends AgentExecutor {
       sink,
       ...(executionId !== undefined ? { executionId, nextClientSeq: 0 } : {}),
       ...(principalId !== undefined ? { principalId } : {}),
+      ...(actorId !== undefined ? { actorId } : {}),
+      ...(authorizationKey !== undefined ? { authorizationKey } : {}),
       ...(requestedExtensions !== undefined ? { requestedExtensions } : {}),
     };
     if (!this.registry.bindTask(binding)) {

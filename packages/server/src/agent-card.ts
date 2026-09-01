@@ -7,6 +7,7 @@ import {
   type TaskStore,
 } from '@a2x/sdk';
 import {
+  CALLER_CONTEXT_V2_CAPABILITY,
   MENTIONABLE_IDENTITY_VC_EXTENSION_URI,
   SIWE_BEARER_AUTH_EXTENSION_URI,
 } from '@vicoop-bridge/protocol';
@@ -17,6 +18,8 @@ import { X402_FOUNDATION_EXTENSION_URI } from './x402/gate.js';
 import { logEvent } from './log.js';
 import type { Sql } from './db.js';
 import { supportsCallerContext } from './caller-context.js';
+import { parseFederatedPrincipal } from './auth/principal.js';
+import { OAUTH_FEDERATION_EXTENSION_URI } from './oauth-federation/profile.js';
 
 export interface AgentA2XOptions {
   publicUrl: string | undefined;
@@ -142,6 +145,11 @@ export function buildAgentA2XServer(
     Boolean(opts.db) &&
     supportsCallerContext(conn.protocolCapabilities) &&
     (conn.identityTrust?.trustedIssuers.length ?? 0) > 0;
+  const bridgeWillEmitOAuthFederation =
+    restricted &&
+    Boolean(opts.publicUrl) &&
+    conn.protocolCapabilities?.includes(CALLER_CONTEXT_V2_CAPABILITY) === true &&
+    conn.allowedCallers.some((entry) => parseFederatedPrincipal(entry) !== null);
   for (const extension of wireExtensions) {
     if (restricted && extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI) {
       // Bridge owns this advertisement on restricted agents — drop wire
@@ -153,6 +161,12 @@ export function buildAgentA2XServer(
       // The bridge owns this advertisement because only it knows whether
       // trust, replay storage, recipient binding, and caller-context delivery
       // are all active. Never echo private trust entries onto the public card.
+      continue;
+    }
+    if (extension.uri === OAUTH_FEDERATION_EXTENSION_URI) {
+      // Federation authorization is server-owned and only exists when an
+      // exact persisted federated caller is active. Never trust the WS hello
+      // to advertise an STS or resource on the bridge's behalf.
       continue;
     }
     if (isX402ExtensionUri(extension.uri)) {
@@ -188,6 +202,18 @@ export function buildAgentA2XServer(
           mintToken: `a2a-wallet siwe auth --domain ${siweDomain} --uri ${opts.publicUrl} --ttl 1h --json | jq -r '.token'`,
           sendMessage: `a2a-wallet a2a send --bearer "$TOKEN" ${url}/.well-known/agent-card.json "Hello"`,
         },
+      },
+    });
+  }
+  if (bridgeWillEmitOAuthFederation) {
+    a2xServer.addExtension({
+      uri: OAUTH_FEDERATION_EXTENSION_URI,
+      description:
+        'DID-backed OAuth 2.0 Token Exchange for exact Mentionable federated callers.',
+      required: true,
+      params: {
+        authorization_server: `${opts.publicUrl}/.well-known/oauth-authorization-server`,
+        resource: `${opts.publicUrl}/agents/${conn.agentId}`,
       },
     });
   }

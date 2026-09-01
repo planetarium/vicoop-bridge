@@ -42,6 +42,7 @@ import {
   addCallerCmd, agentCmd, listAgentsCmd, listCallersCmd, listClientsCmd,
   removeCallerCmd, revokeClientCmd,
   runAddCaller, runAgentCallersAdd, runAgentCallersList, runAgentCallersRemove,
+  runAgentCallersAddFederated, runAgentCallersRemoveFederated,
   runAgentCallersIssue,
   runAgentX402Clear, runAgentX402Set, runAgentX402Show,
   runAgentDelete, runAgentList, runListAgents, runListCallers, runListClients,
@@ -1044,6 +1045,12 @@ async function main(): Promise<void> {
       break;
     case 'agent-callers-remove':
       process.exit(await runAgentCallersRemove(parsed));
+      break;
+    case 'agent-callers-add-federated':
+      process.exit(await runAgentCallersAddFederated(parsed));
+      break;
+    case 'agent-callers-remove-federated':
+      process.exit(await runAgentCallersRemoveFederated(parsed));
       break;
     case 'agent-callers-issue':
       process.exit(await runAgentCallersIssue(parsed));

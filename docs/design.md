@@ -166,6 +166,21 @@ also sorts and deduplicates attestations. Equivalent v1/v2 frames and freshly
 issued credentials for the same identity therefore share scope, while a
 security-relevant identity change still splits sessions.
 
+OAuth federation is the authorization-capable exception to the otherwise
+context-only attestation path. In the v0.1 direct-Connector topology, an exact
+`(issuer, method, subject)` tuple must already exist in the target agent's
+`allowed_callers`. After full assertion and client authentication, the bridge
+sets principal to the platform subject, actor to the Connector DID, and retains
+the collision-safe tuple key only as a server-side authorization binding.
+Tasks persist those three normalized values in dedicated columns. Follow-up
+operations require a resource/scope-constrained bearer, task-bound principal
+and actor matches, and a still-active exact tuple; neither task ids nor context
+ids are proof. Continuation-derived tokens are additionally restricted to the
+verified `mentionable_task_id`.
+Federated delivery therefore requires caller-context-v2. See
+[`oauth-federation.md`](./oauth-federation.md) for the wire profile and
+operator flow.
+
 ## 5. Client Backends
 
 ```bash

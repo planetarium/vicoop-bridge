@@ -15,6 +15,22 @@ function buildApp(sql: postgres.Sql) {
 
 const FORM_HEADERS = { 'content-type': 'application/x-www-form-urlencoded' };
 
+test('POST /oauth/revoke dispatches vbc_fed tokens to the federation store', async () => {
+  let statement = '';
+  const sql = (async (strings: TemplateStringsArray) => {
+    statement = strings.join('?');
+    return [];
+  }) as unknown as postgres.Sql;
+  const app = buildApp(sql);
+  const response = await app.request('/oauth/revoke', {
+    method: 'POST',
+    headers: FORM_HEADERS,
+    body: new URLSearchParams({ token: 'vbc_fed_test-token' }),
+  });
+  assert.equal(response.status, 200);
+  assert.match(statement, /UPDATE infra\.oauth_federation_access_tokens/);
+});
+
 test(
   'POST /oauth/revoke without token returns invalid_request',
   { skip: !hasDb },
