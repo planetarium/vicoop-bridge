@@ -185,7 +185,8 @@ ids are proof. Continuation-derived tokens are additionally restricted to the
 verified `mentionable_task_id`.
 Federated delivery therefore requires caller-context-v2. See
 [`oauth-federation.md`](./oauth-federation.md) for the wire profile and
-operator flow.
+operator flow, including why the separate connector-kit package boundary is
+intentional while its current vendored copy is temporary.
 
 ## 5. Client Backends
 

@@ -27,6 +27,23 @@ Each profile must also declare whether replay protection is required or not
 applicable; the core refuses issuance when a replay-required profile returns no
 single-use replay evidence.
 
+## Connector-kit dependency status
+
+The package boundary is intentional, but the copy under
+`vendor/mentionable-connector-kit` is temporary. The authoritative source is
+`packages/connector-kit` in the `planetarium/mentionable` repository. This
+bridge currently pins commit `f32c8898c7d81b254ec9a562ea2892525db14de6`
+because the upstream package is still an unpublished `0.0.0` workspace package
+whose `workspace:*` dependencies cannot be installed by a consumer repository.
+
+Only the dependency-free OAuth contract, reference verifier, and conformance
+fixtures needed by the bridge STS are vendored byte-for-byte; the local entry
+points are minimal export facades. Once an installable upstream artifact is
+published, replace the workspace/vendored dependency with that artifact and
+remove the vendored copy. See the
+[`vendor/mentionable-connector-kit` README](../vendor/mentionable-connector-kit/README.md)
+for the pinned-source details.
+
 ## Trust and identity model
 
 One federated allowed caller is an exact tuple:
