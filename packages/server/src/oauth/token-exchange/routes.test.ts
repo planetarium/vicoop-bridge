@@ -177,6 +177,7 @@ test('RFC 8414 discovery points token exchange at the shared /oauth/token endpoi
 test('the RFC 8693 core issues a token for a non-Mentionable profile adapter', async () => {
   const profile: TokenExchangeProfile = {
     id: 'urn:example:oauth-profile:v1',
+    replayProtection: 'required',
     clientAuthMethods: ['client_secret_basic'],
     clientAuthSigningAlgorithms: [],
     scopes: ['example:read'],
@@ -226,6 +227,89 @@ test('the RFC 8693 core issues a token for a non-Mentionable profile adapter', a
   assert.match(body.access_token, /^vbc_oauth_/);
   assert.equal(body.scope, 'example:read');
   assert.equal(tokenRows[0]?.[1], profile.id);
+});
+
+test('a replay-required profile cannot issue a token without replay evidence', async () => {
+  const tokenRows: unknown[][] = [];
+  const profile: TokenExchangeProfile = {
+    id: 'urn:example:replay-required',
+    replayProtection: 'required',
+    clientAuthMethods: [],
+    clientAuthSigningAlgorithms: [],
+    scopes: ['example:read'],
+    subjectTokenTypes: ['urn:example:token-type'],
+    recognizes: () => true,
+    async verify() {
+      return {
+        ok: true,
+        principalId: 'example:user-1',
+        actorId: 'example:client-1',
+        authorizationKey: 'example:allowed-caller',
+        scopes: ['example:read'],
+        replays: [],
+        kind: 'broken-example',
+      };
+    },
+  };
+  const app = new Hono();
+  mountTokenExchangeRoutes(app, {
+    sql: sqlWithPolicy(['example:allowed-caller'], [], tokenRows),
+    publicUrl,
+    profiles: [profile],
+  });
+  const response = await app.request('/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: TOKEN_EXCHANGE_GRANT_TYPE,
+      resource: `${publicUrl}/agents/agent-1`,
+    }),
+  });
+  const body = (await response.json()) as { error: string; rejection_id?: string };
+  assert.equal(response.status, 500);
+  assert.equal(body.error, 'server_error');
+  assert.match(body.rejection_id!, /^rej_/);
+  assert.equal(tokenRows.length, 0);
+});
+
+test('a profile can explicitly declare replay protection not applicable', async () => {
+  const tokenRows: unknown[][] = [];
+  const profile: TokenExchangeProfile = {
+    id: 'urn:example:non-replayable-credentials',
+    replayProtection: 'not-applicable',
+    clientAuthMethods: [],
+    clientAuthSigningAlgorithms: [],
+    scopes: ['example:read'],
+    subjectTokenTypes: ['urn:example:opaque-token'],
+    recognizes: () => true,
+    async verify() {
+      return {
+        ok: true,
+        principalId: 'example:user-1',
+        actorId: 'example:client-1',
+        authorizationKey: 'example:allowed-caller',
+        scopes: ['example:read'],
+        replays: [],
+        kind: 'non-replayable-example',
+      };
+    },
+  };
+  const app = new Hono();
+  mountTokenExchangeRoutes(app, {
+    sql: sqlWithPolicy(['example:allowed-caller'], [], tokenRows),
+    publicUrl,
+    profiles: [profile],
+  });
+  const response = await app.request('/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: TOKEN_EXCHANGE_GRANT_TYPE,
+      resource: `${publicUrl}/agents/agent-1`,
+    }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(tokenRows.length, 1);
 });
 
 test('the shared token route passes non-exchange grants to device flow', async () => {
@@ -432,6 +516,7 @@ test('target lookup failures return an audited OAuth server_error response', asy
   const sql = (async () => { throw new Error('database unavailable'); }) as unknown as Sql;
   const profile: TokenExchangeProfile = {
     id: 'urn:example:lookup-profile',
+    replayProtection: 'required',
     clientAuthMethods: [],
     clientAuthSigningAlgorithms: [],
     scopes: [],
@@ -463,6 +548,7 @@ test('target lookup failures return an audited OAuth server_error response', asy
 test('unexpected profile failures return an audited OAuth server_error response', async () => {
   const profile: TokenExchangeProfile = {
     id: 'urn:example:throwing-profile',
+    replayProtection: 'required',
     clientAuthMethods: [],
     clientAuthSigningAlgorithms: [],
     scopes: [],

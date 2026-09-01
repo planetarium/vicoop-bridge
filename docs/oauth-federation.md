@@ -23,6 +23,9 @@ with every access token and task. The resource server normalizes each ingress
 operation independently of any profile, then dispatches authorization by that
 identifier. A future profile therefore supplies both exchange verification and
 resource authorization without being interpreted under Mentionable semantics.
+Each profile must also declare whether replay protection is required or not
+applicable; the core refuses issuance when a replay-required profile returns no
+single-use replay evidence.
 
 ## Trust and identity model
 

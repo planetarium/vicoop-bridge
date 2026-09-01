@@ -312,6 +312,19 @@ export function mountTokenExchangeRoutes(app: Hono, options: TokenExchangeRouteO
       );
     }
     if (!result.ok) return reject(result, { agentId, profileId: profile.id });
+    if (profile.replayProtection === 'required' && result.replays.length === 0) {
+      return reject(
+        {
+          ok: false,
+          status: 500,
+          error: 'server_error',
+          description: 'token exchange temporarily unavailable',
+          reason: 'replay_evidence_missing',
+          stage: 'profile_contract',
+        },
+        { agentId, profileId: profile.id },
+      );
+    }
 
     try {
       await consumeTokenExchangeReplays(options.sql, profile.id, result.replays);

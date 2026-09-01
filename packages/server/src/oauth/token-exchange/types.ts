@@ -69,6 +69,13 @@ export interface TokenExchangeProfileContext {
  */
 export interface TokenExchangeProfile {
   id: string;
+  /**
+   * Profiles must explicitly declare whether successful exchanges produce
+   * single-use replay evidence. `required` is enforced by the core before any
+   * token is issued; `not-applicable` is for exchanges whose subject/client
+   * credentials are not replayable assertions.
+   */
+  replayProtection: 'required' | 'not-applicable';
   clientAuthMethods: readonly string[];
   clientAuthSigningAlgorithms: readonly string[];
   scopes: readonly string[];

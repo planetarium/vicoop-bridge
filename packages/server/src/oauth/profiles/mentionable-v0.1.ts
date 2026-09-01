@@ -10,6 +10,7 @@ import {
   OAUTH_FEDERATION_SCOPES,
   OAUTH_FEDERATION_TYP_SUBJECT_ASSERTION,
   OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION,
+  OAUTH_TOKEN_TYPE_JWT,
 } from '@mentionable/connector-kit';
 import {
   verifyTokenExchange,
@@ -162,10 +163,11 @@ export function createMentionableOAuthProfile(
 ): TokenExchangeProfile {
   return {
     id: MENTIONABLE_OAUTH_PROFILE_ID,
+    replayProtection: 'required',
     clientAuthMethods: ['private_key_jwt'],
     clientAuthSigningAlgorithms: ['EdDSA'],
     scopes: OAUTH_FEDERATION_SCOPES,
-    subjectTokenTypes: ['urn:ietf:params:oauth:token-type:jwt'],
+    subjectTokenTypes: [OAUTH_TOKEN_TYPE_JWT],
     authorizationServerMetadata: {
       mentionable_profile: OAUTH_FEDERATION_EXTENSION_URI,
     },
