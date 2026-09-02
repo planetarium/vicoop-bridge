@@ -1,5 +1,12 @@
 # @vicoop-bridge/client
 
+## 0.40.0
+
+### Minor Changes
+
+- 30cb3a9: Add structured commands for allowing and removing exact Mentionable OAuth federation callers.
+- 44de824: Negotiate caller-context v2 and normalize principal, actor, and attestations while remaining compatible with v1 bridge servers.
+
 ## 0.39.1
 
 ### Patch Changes
