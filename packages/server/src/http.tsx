@@ -26,6 +26,7 @@ import { requestUsage, UsageRpcError } from './usage-rpc.js';
 import {
   AdminApiError,
   addCaller,
+  addFederatedCaller,
   clearX402Pricing,
   deleteClientForOwner,
   getX402Pricing,
@@ -34,6 +35,7 @@ import {
   listCallers,
   listClientsForOwner,
   removeCaller,
+  removeFederatedCaller,
   setX402Pricing,
 } from './admin-api.js';
 import {
@@ -42,6 +44,8 @@ import {
   classifyMissingAgent,
   getAgentConn,
   getCaller,
+  newRejectionId,
+  rejectAgentRequest,
 } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
@@ -66,6 +70,7 @@ import {
   type DidDocumentResolver,
   type IdentityReplayStore,
 } from './identity-vc/index.js';
+import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
 import {
   PostgresTaskStore,
   parsePersistRequestEnvelope,
@@ -76,6 +81,15 @@ import {
   type ConnectionPair,
   type WellKnownDeps,
 } from './well-known.js';
+import { mountTokenExchangeRoutes } from './oauth/token-exchange/routes.js';
+import { createMentionableOAuthProfile } from './oauth/profiles/mentionable-v0.1.js';
+import { createMentionableResourceProfile } from './oauth/profiles/mentionable-authorization.js';
+import {
+  authorizeTokenExchangeOperation,
+  parseTokenExchangeHttpJsonOperation,
+  parseTokenExchangeJsonRpcOperation,
+  type TokenExchangeOperation,
+} from './oauth/token-exchange/authorization.js';
 
 export interface ServerHttpOptions {
   registry: Registry;
@@ -187,6 +201,8 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // the agent-auth error hint so SIWE-only deployments don't point callers at
   // non-existent endpoints.
   const deviceFlowEnabled = Boolean(opts.google && opts.publicUrl);
+  const tokenExchangeProfiles = [createMentionableOAuthProfile({ resolver: identityVcResolver })];
+  const tokenExchangeResourceProfiles = [createMentionableResourceProfile()];
   const agentCardOpts: AgentA2XOptions = {
     publicUrl: opts.publicUrl,
     deviceFlowEnabled,
@@ -322,12 +338,19 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   ): Promise<void> {
     if (!isRecord(body)) return;
     const params = isRecord(body.params) ? body.params : undefined;
+    const request = params ?? body;
     const message = isRecord(params?.message)
       ? params.message
       : isRecord(body.message)
         ? body.message
         : undefined;
     if (!message) return;
+
+    // `@a2x/sdk` creates a task from the request-level metadata before the
+    // executor sees the message. Scrub caller-owned internal lookalikes here,
+    // then stamp the same verified binding on both carriers so the TaskStore
+    // can persist it atomically in the initial INSERT.
+    stripCallerSuppliedInternalKeys(request);
 
     const requestedExtensions = [
       ...parseA2AExtensionsHeader(c.req.header(A2A_EXTENSIONS_HEADER)),
@@ -361,11 +384,68 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       });
     }
     if (caller !== undefined) {
+      const authorizationMetadata = {
+        _principalId: caller.principalId,
+        ...(caller.actorId !== undefined ? { _actorId: caller.actorId } : {}),
+        ...(caller.tokenExchange?.allowedCaller !== undefined
+          ? { _authorizationKey: caller.tokenExchange.allowedCaller }
+          : {}),
+        ...(caller.tokenExchange?.profileId !== undefined
+          ? { _authorizationProfile: caller.tokenExchange.profileId }
+          : {}),
+      };
+      request.metadata = {
+        ...(isRecord(request.metadata) ? request.metadata : {}),
+        ...authorizationMetadata,
+      };
+      const existingAttestations =
+        isRecord(message.metadata) &&
+        Array.isArray(message.metadata[IDENTITY_VC_PRESENTED_METADATA_KEY])
+          ? message.metadata[IDENTITY_VC_PRESENTED_METADATA_KEY]
+          : [];
       message.metadata = {
         ...(isRecord(message.metadata) ? message.metadata : {}),
-        _principalId: caller.principalId,
+        ...authorizationMetadata,
+        ...(caller.tokenExchange?.attestations !== undefined
+          ? {
+              [IDENTITY_VC_PRESENTED_METADATA_KEY]: [
+                ...existingAttestations,
+                ...caller.tokenExchange.attestations,
+              ],
+            }
+          : {}),
       };
     }
+  }
+
+  async function enforceFederatedOperation(
+    c: Context,
+    caller: ReturnType<typeof getCaller>,
+    operation: TokenExchangeOperation | undefined,
+    responseFormat: 'jsonrpc' | 'http-json',
+  ): Promise<Response | undefined> {
+    const result = await authorizeTokenExchangeOperation(
+      opts.db,
+      c.req.param('id')!,
+      caller,
+      operation,
+      tokenExchangeResourceProfiles,
+    );
+    if (result.ok) return undefined;
+    const rejectionId = newRejectionId();
+    logEvent('oauth_token_exchange_request_rejected', {
+      agentId: c.req.param('id'),
+      reason: result.reason,
+      rejectionId,
+    });
+    return rejectAgentRequest(
+      c,
+      responseFormat,
+      403,
+      -32001,
+      'Federated token is not authorized for this operation',
+      rejectionId,
+    );
   }
 
   function recordAgentRequest(
@@ -404,6 +484,23 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         `PUBLIC_URL "${opts.publicUrl}" is not a valid URL — cannot configure SIWE domain verification or well-known Mentionable routes`,
       );
     }
+  }
+
+  if (opts.publicUrl) {
+    mountTokenExchangeRoutes(app, {
+      sql: opts.db,
+      publicUrl: opts.publicUrl,
+      profiles: tokenExchangeProfiles,
+      passThroughOtherGrants: deviceFlowEnabled,
+      ...(deviceFlowEnabled
+        ? {
+            additionalGrantTypes: ['urn:ietf:params:oauth:grant-type:device_code'],
+            additionalTokenEndpointAuthMethods: ['none'],
+            deviceAuthorizationEndpoint: `${opts.publicUrl.replace(/\/$/, '')}/oauth/device/code`,
+          }
+        : {}),
+      ...(opts.identityVc?.now !== undefined ? { now: opts.identityVc.now } : {}),
+    });
   }
 
   app.get('/healthz', (c) => c.json({ ok: true }));
@@ -736,6 +833,73 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }
   });
 
+  async function federatedCallerBody(c: Context): Promise<
+    | { ok: true; value: { issuer: string; method: string; subject: string } }
+    | { ok: false; response: Response }
+  > {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return {
+        ok: false,
+        response: c.json({ error: 'Body must be JSON: { issuer, method, subject }' }, 400),
+      };
+    }
+    if (
+      !isRecord(body) ||
+      typeof body.issuer !== 'string' ||
+      typeof body.method !== 'string' ||
+      typeof body.subject !== 'string' ||
+      Object.keys(body).some((key) => !['issuer', 'method', 'subject'].includes(key))
+    ) {
+      return {
+        ok: false,
+        response: c.json({ error: 'Body must be JSON: { issuer, method, subject }' }, 400),
+      };
+    }
+    return {
+      ok: true,
+      value: { issuer: body.issuer, method: body.method, subject: body.subject },
+    };
+  }
+
+  app.post('/admin-api/agents/:id/federated-callers', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    const parsed = await federatedCallerBody(c);
+    if (!parsed.ok) return parsed.response;
+    try {
+      return c.json(await addFederatedCaller(
+        opts.db,
+        opts.registry,
+        auth.principalId,
+        c.req.param('id'),
+        parsed.value,
+      ));
+    } catch (err) {
+      return adminApiErrorResponse(c, err);
+    }
+  });
+
+  app.delete('/admin-api/agents/:id/federated-callers', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    const parsed = await federatedCallerBody(c);
+    if (!parsed.ok) return parsed.response;
+    try {
+      return c.json(await removeFederatedCaller(
+        opts.db,
+        opts.registry,
+        auth.principalId,
+        c.req.param('id'),
+        parsed.value,
+      ));
+    } catch (err) {
+      return adminApiErrorResponse(c, err);
+    }
+  });
+
   // List the owner's `clients` rows so operators can see persisted state
   // (including orphans from aborted setup / exited daemons) without
   // dropping to admin GraphQL or psql. RLS filters to the principal's own
@@ -933,6 +1097,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     recordAgentRequest(c, conn, caller);
     const rawBody = await c.req.text();
     const parsed = JSON.parse(rawBody);
+    const federatedRejection = await enforceFederatedOperation(
+      c,
+      caller,
+      parseTokenExchangeJsonRpcOperation(parsed),
+      'jsonrpc',
+    );
+    if (federatedRejection) return federatedRejection;
     await prepareAgentRequestBody(parsed, c, caller, conn);
     const handler = getHandlerForConn(conn);
     const result = await handler.handle(parsed);
@@ -953,6 +1124,15 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     } catch {
       // DefaultRequestHandler accepts a string and returns the protocol's
       // structured JSON parse error, so don't turn malformed JSON into a 500.
+    }
+    if (isRecord(body)) {
+      const federatedRejection = await enforceFederatedOperation(
+        c,
+        caller,
+        parseTokenExchangeJsonRpcOperation(body),
+        'jsonrpc',
+      );
+      if (federatedRejection) return federatedRejection;
     }
     await prepareAgentRequestBody(body, c, caller, conn);
     c.header('A2A-Version', '1.0');
@@ -985,6 +1165,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         }
       }
     }
+    const federatedRejection = await enforceFederatedOperation(
+      c,
+      caller,
+      parseTokenExchangeHttpJsonOperation(c.req.method, c.req.path, body),
+      'http-json',
+    );
+    if (federatedRejection) return federatedRejection;
     await prepareAgentRequestBody(body, c, caller, conn);
     const response = await getHttpJsonV1ForConn(conn).handle({
       method: c.req.method,

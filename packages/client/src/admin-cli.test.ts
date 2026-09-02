@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { parse } from '@optique/core/parser';
+import { formatDocPage } from '@optique/core/doc';
+import { getDocPageSync, parse } from '@optique/core/parser';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,8 +9,10 @@ import {
   runAddCaller,
   runAgentCallersIssue,
   runAgentCallersAdd,
+  runAgentCallersAddFederated,
   runAgentCallersList,
   runAgentCallersRemove,
+  runAgentCallersRemoveFederated,
   runAgentDelete,
   runAgentList,
   runListAgents,
@@ -25,8 +28,10 @@ import {
   type AddCallerArgs,
   type AgentCallersIssueArgs,
   type AgentCallersAddArgs,
+  type AgentCallersAddFederatedArgs,
   type AgentCallersListArgs,
   type AgentCallersRemoveArgs,
+  type AgentCallersRemoveFederatedArgs,
   type AgentDeleteArgs,
   type AgentListArgs,
   type ListAgentsArgs,
@@ -85,6 +90,21 @@ const agentCallersRemoveArgsFn = (
   p: Partial<AgentCallersRemoveArgs> = {},
 ): AgentCallersRemoveArgs =>
   ({ action: 'agent-callers-remove', agentId, principal, ...SHARED, ...p });
+const federatedArgs = {
+  issuer: 'did:web:connector.example',
+  method: 'urn:mentionable:auth:slack-member:v0.1',
+  subject: 'slack:T123/U456',
+} as const;
+const agentCallersAddFederatedArgsFn = (
+  agentId: string,
+  p: Partial<AgentCallersAddFederatedArgs> = {},
+): AgentCallersAddFederatedArgs =>
+  ({ action: 'agent-callers-add-federated', agentId, ...federatedArgs, ...SHARED, ...p });
+const agentCallersRemoveFederatedArgsFn = (
+  agentId: string,
+  p: Partial<AgentCallersRemoveFederatedArgs> = {},
+): AgentCallersRemoveFederatedArgs =>
+  ({ action: 'agent-callers-remove-federated', agentId, ...federatedArgs, ...SHARED, ...p });
 const agentCallersIssueArgsFn = (
   agentId: string,
   p: Partial<AgentCallersIssueArgs> = {},
@@ -334,6 +354,30 @@ test('callers list shows the public empty-state when there are no allowed_caller
   assert.doesNotMatch(out, /TYPE\s+PRINCIPAL/);
 });
 
+test('callers list decodes federated tuples for human inspection', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  installFetch(t, {
+    body: {
+      agent_id: 'foo',
+      owner_principal: 'eth:0xabc',
+      is_public: false,
+      allowed_callers: ['federated:v1:opaque-canonical-value'],
+      federated_callers: [{
+        principal: 'federated:v1:opaque-canonical-value',
+        ...federatedArgs,
+      }],
+    },
+  });
+
+  assert.equal(await runAgentCallersList(agentCallersListArgsFn('foo')), 0);
+  const out = stdout.read();
+  assert.match(out, /FEDERATED CALLERS/);
+  assert.match(out, /did:web:connector\.example/);
+  assert.match(out, /urn:mentionable:auth:slack-member:v0\.1/);
+  assert.match(out, /slack:T123\/U456/);
+});
+
 test('subcommand exits 1 with hint when no token is available', async (t) => {
   // Hermetic missing-auth: redirect HOME (and USERPROFILE on Windows) to an
   // empty temp dir so os.homedir() resolves into a location without an
@@ -363,6 +407,28 @@ test('subcommand exits 1 with hint when no token is available', async (t) => {
   const code = await runListAgents(listAgentsArgs());
   assert.equal(code, 1);
   assert.match(stderr.read(), /vicoop-client auth login --server/);
+});
+
+test('admin commands never mix an explicit server with a saved owner token', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stderr = captureStderr(t);
+  const { calls } = installFetch(t, { body: { agents: [] } });
+
+  const code = await runListAgents(listAgentsArgs({ server: 'https://untrusted.example' }));
+  assert.equal(code, 1);
+  assert.match(stderr.read(), /Pass --server and --token together/);
+  assert.equal(calls.length, 0, 'must not send the saved bearer to the explicit server');
+});
+
+test('admin commands never mix an explicit token with a saved bridge URL', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stderr = captureStderr(t);
+  const { calls } = installFetch(t, { body: { agents: [] } });
+
+  const code = await runListAgents(listAgentsArgs({ token: 'vbc_owner_override' }));
+  assert.equal(code, 1);
+  assert.match(stderr.read(), /Pass --server and --token together/);
+  assert.equal(calls.length, 0, 'must not send the explicit bearer to the saved server');
 });
 
 test('subcommand surfaces network errors as a clean exit-1 instead of crashing', async (t) => {
@@ -619,6 +685,23 @@ test('agent callers list/add/remove hit the existing /admin-api/agents/:id/calle
   );
 });
 
+test('agent callers add-federated/remove-federated use the structured policy API', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, {
+    body: { agent_id: 'foo', allowed_callers: [], federated_callers: [] },
+  });
+
+  assert.equal(await runAgentCallersAddFederated(agentCallersAddFederatedArgsFn('foo')), 0);
+  assert.equal(await runAgentCallersRemoveFederated(agentCallersRemoveFederatedArgsFn('foo')), 0);
+  assert.deepEqual(calls.map((call) => [call.method, call.url]), [
+    ['POST', `${BRIDGE}/admin-api/agents/foo/federated-callers`],
+    ['DELETE', `${BRIDGE}/admin-api/agents/foo/federated-callers`],
+  ]);
+  assert.deepEqual(JSON.parse(calls[0].body!), federatedArgs);
+  assert.deepEqual(JSON.parse(calls[1].body!), federatedArgs);
+});
+
 // ---- `agent callers issue-api-key` — API key minting (#308) ------------------------
 
 test('agent callers issue-api-key POSTs to /apikeys and prints the secret once', async (t) => {
@@ -718,6 +801,17 @@ test('agent callers {list,remove,issue-api-key} parse through the real parser wi
     agentId: 'foo',
     principal,
   });
+  for (const [subcommand, action] of [
+    ['add-federated', 'agent-callers-add-federated'],
+    ['remove-federated', 'agent-callers-remove-federated'],
+  ] as const) {
+    expectOk([
+      'agent', 'callers', subcommand, 'foo',
+      '--issuer', federatedArgs.issuer,
+      '--method', federatedArgs.method,
+      '--subject', federatedArgs.subject,
+    ], { action, agentId: 'foo', ...federatedArgs });
+  }
   // `issue` is in the same tie-class (AGENT_ID positional vs the all-optional
   // top-level `list`/`remove`) — it must keep its AGENT_ID through the parser.
   expectOk(['agent', 'callers', 'issue-api-key', 'foo'], {
@@ -729,6 +823,31 @@ test('agent callers {list,remove,issue-api-key} parse through the real parser wi
   // The top-level siblings must keep working after the reorder.
   expectOk(['agent', 'list'], { action: 'agent-list', connected: false });
   expectOk(['agent', 'remove', 'foo', '--yes'], { action: 'agent-delete', target: 'foo', yes: true });
+});
+
+function agentHelp(args: string[]): string {
+  const page = getDocPageSync(agentCmd, args);
+  assert.ok(page, `expected a help page for ${args.join(' ')}`);
+  return formatDocPage('vicoop-client', page, { colors: false });
+}
+
+test('add-federated --help explains exact matching, policy transition, and a complete example', () => {
+  const help = agentHelp(['agent', 'callers', 'add-federated']);
+  assert.match(help, /exact \(issuer, method, subject\) tuple/);
+  assert.match(help, /does not mint an access token/);
+  assert.match(help, /public to restricted/);
+  assert.match(help, /--issuer did:web:connector\.example/);
+  assert.match(help, /slack:T123\/U456/);
+  assert.match(help, /docs\/manage-federated-callers\.md/);
+});
+
+test('remove-federated --help explains revocation and the final-caller public transition', () => {
+  const help = agentHelp(['agent', 'callers', 'remove-federated']);
+  assert.match(help, /every token.*permanently revoked/);
+  assert.match(help, /historical task binding.*tombstoned/);
+  assert.match(help, /re-adding the tuple.*does not restore/);
+  assert.match(help, /final allowed caller makes the agent public/);
+  assert.match(help, /add a replacement first/);
 });
 
 // `agent x402 {show,clear}` are in the same tie-class as `callers {list,remove}`:

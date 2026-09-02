@@ -1,0 +1,18 @@
+{
+  "params": {
+    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+    "subject_token": "eyJhbGciOiJFZERTQSIsInR5cCI6Im1lbnRpb25hYmxlLXN1YmplY3QtYXNzZXJ0aW9uK2p3dCIsImtpZCI6ImRpZDp3ZWI6Y29ubmVjdG9yLm9hdXRoLWZpeHR1cmVzLm1lbnRpb25hYmxlLmRldiNvYXV0aC1maXh0dXJlLTIwMjYtMDgifQ.eyJtZW50aW9uYWJsZV9tZXRob2QiOiJ1cm46bWVudGlvbmFibGU6YXV0aDpzbGFjay13b3Jrc3BhY2UtbWVtYmVyOnYwLjEiLCJzdWIiOiJzbGFjazpUMDEyMzQ1Ni9VMDQ1Njc4OSIsImF1ZCI6Imh0dHBzOi8vc3RzLm9hdXRoLWZpeHR1cmVzLm1lbnRpb25hYmxlLmRldi9vYXV0aC90b2tlbiIsImlhdCI6MTc4NzA5NzYwMCwiZXhwIjoxNzg3MDk3OTAwLCJqdGkiOiJhMGYxYjJjMy1kNGU1LTRmNmEtOWI4Yy05ZDBlMWYyYTNiNGMifQ.3ah_nIblKAq7ps-BW6PJ7xAA3P2nCkMybBQ9zZDf1z_yNEKJUbI3Yi6_QjTdni99l2IHySx32u6yIjqagmKZDw",
+    "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+    "resource": "https://agents.oauth-fixtures.mentionable.dev/fixture-agent/a2a",
+    "scope": "a2a:message.send",
+    "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+    "client_id": "did:web:connector.oauth-fixtures.mentionable.dev",
+    "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+    "client_assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6Im1lbnRpb25hYmxlLWNsaWVudC1hc3NlcnRpb24rand0Iiwia2lkIjoiZGlkOndlYjpjb25uZWN0b3Iub2F1dGgtZml4dHVyZXMubWVudGlvbmFibGUuZGV2I29hdXRoLWZpeHR1cmUtMjAyNi0wOCJ9.eyJpc3MiOiJkaWQ6d2ViOmNvbm5lY3Rvci5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYiLCJzdWIiOiJkaWQ6d2ViOmNvbm5lY3Rvci5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYiLCJhdWQiOiJodHRwczovL3N0cy5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYvb2F1dGgvdG9rZW4iLCJpYXQiOjE3ODcwOTc2MDAsImV4cCI6MTc4NzA5NzkwMCwianRpIjoiYjFhMmMzZDQtZTVmNi00YTdiLThjOWQtMGUxZjJhM2I0YzVlIn0.J7mhYplVpDklcy6xntoXHbLbJadD4qgAdK2TmocRRw80w5PK_kkQMYqctaB9A7JSoHVK7_-GxNt9G2_Q2wW7Dw"
+  },
+  "evaluation": {
+    "expectedResource": "https://agents.oauth-fixtures.mentionable.dev/fixture-agent/a2a",
+    "tokenEndpoint": "https://sts.oauth-fixtures.mentionable.dev/oauth/token",
+    "verifiedAt": "2026-08-19T00:01:00Z"
+  }
+}

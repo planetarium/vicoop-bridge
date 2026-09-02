@@ -1,0 +1,117 @@
+[
+  { "file": "valid/subject-assertion.json", "kind": "assertion", "expect": "accept" },
+  { "file": "valid/continuation-assertion.json", "kind": "assertion", "expect": "accept" },
+  { "file": "valid/client-assertion.json", "kind": "assertion", "expect": "accept" },
+  {
+    "file": "valid/exchange-request-delegation.json",
+    "kind": "exchange-request",
+    "expect": "accept"
+  },
+  {
+    "file": "valid/exchange-request-task-scopes.json",
+    "kind": "exchange-request",
+    "expect": "accept"
+  },
+  {
+    "file": "invalid/expired-subject-assertion.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "expired"
+  },
+  {
+    "file": "invalid/wrong-audience.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "wrong-audience"
+  },
+  {
+    "file": "invalid/wrong-typ.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "wrong-typ"
+  },
+  {
+    "file": "invalid/kid-not-authorized.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "kid-not-authorized"
+  },
+  {
+    "file": "invalid/not-yet-valid.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "not-yet-valid"
+  },
+  {
+    "file": "invalid/ttl-exceeded.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "ttl-exceeded"
+  },
+  {
+    "file": "invalid/tampered-signature.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "invalid-signature"
+  },
+  {
+    "file": "invalid/wrong-alg.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "wrong-alg"
+  },
+  {
+    "file": "invalid/continuation-missing-task-id.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "missing-claim"
+  },
+  {
+    "file": "invalid/exchange-issuer-client-mismatch.json",
+    "kind": "exchange-request",
+    "expect": "reject",
+    "reason": "issuer-client-mismatch"
+  },
+  {
+    "file": "invalid/exchange-undecodable-subject-token.json",
+    "kind": "exchange-request",
+    "expect": "reject",
+    "reason": "undecodable-subject-token"
+  },
+  {
+    "file": "invalid/exchange-subject-missing-iss.json",
+    "kind": "exchange-request",
+    "expect": "reject",
+    "reason": "issuer-client-mismatch"
+  },
+  {
+    "file": "invalid/exchange-resource-substitution.json",
+    "kind": "exchange-request",
+    "expect": "reject",
+    "reason": "resource-substitution"
+  },
+  {
+    "file": "invalid/exchange-duplicate-resource.json",
+    "kind": "exchange-request",
+    "expect": "reject",
+    "reason": "duplicate-parameter"
+  },
+  {
+    "file": "invalid/exchange-message-scope-continuation.json",
+    "kind": "exchange-request",
+    "expect": "reject",
+    "reason": "message-scope-requires-subject-assertion"
+  },
+  {
+    "file": "invalid/exchange-unknown-scope.json",
+    "kind": "exchange-request",
+    "expect": "reject",
+    "reason": "unknown-scope"
+  },
+  {
+    "file": "replay/replayed-jti.json",
+    "kind": "replay",
+    "expect": "accept",
+    "replay": { "secondPresentation": "reject", "tuple": ["issuer", "jti"] }
+  }
+]

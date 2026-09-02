@@ -191,6 +191,11 @@ There are two ways to mutate `allowed_callers`:
   `list_active_agents`, `list_caller_tokens`, `revoke_caller_token`).
   Useful for interactive operator chat.
 
+Federated Connector callers use the same authorization source of truth but a
+structured mutation endpoint and CLI. See
+[`oauth-federation.md`](./oauth-federation.md) for exact tuple configuration,
+discovery, token exchange, task continuity, and revocation checks.
+
 Both paths require an **owner-session bearer** (`vbc_owner_*`). Tool
 execution runs under RLS with your principal as the authenticated
 subject, so mutations on agents you own are authorized. Admin scope

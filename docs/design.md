@@ -166,6 +166,31 @@ also sorts and deduplicates attestations. Equivalent v1/v2 frames and freshly
 issued credentials for the same identity therefore share scope, while a
 security-relevant identity change still splits sessions.
 
+OAuth token exchange is the authorization-capable exception to the otherwise
+context-only attestation path. The RFC 8693 route, opaque-token lifecycle, and
+replay store are profile-neutral; installed profiles derive the identity and
+authorization context, while a profile-ID registry dispatches resource-server
+authorization after ingress operations are normalized. The first installed
+profile is Mentionable v0.1. In
+its direct-Connector topology, an exact
+`(issuer, method, subject)` tuple must already exist in the target agent's
+`allowed_callers`. After full assertion and client authentication, the bridge
+sets principal to the platform subject, actor to the Connector DID, and retains
+the collision-safe tuple key only as a server-side authorization binding.
+Tasks persist those values plus the issuing profile identifier atomically in
+dedicated columns during the initial task INSERT. Removing the exact tuple
+atomically revokes its issued access tokens and timestamps every matching task
+binding, so re-adding the tuple cannot resurrect historical authority.
+Follow-up operations require a resource/scope-constrained bearer, task-bound
+principal and actor matches, a still-active exact tuple, and a task binding
+that has never been revoked; neither task ids nor context ids are proof.
+Continuation-derived tokens are additionally restricted to the verified
+`mentionable_task_id`.
+Federated delivery therefore requires caller-context-v2. See
+[`oauth-federation.md`](./oauth-federation.md) for the wire profile and
+operator flow, including why the separate connector-kit package boundary is
+intentional while its current vendored copy is temporary.
+
 ## 5. Client Backends
 
 ```bash

@@ -1,0 +1,18 @@
+{
+  "params": {
+    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+    "subject_token": "opaque-platform-token-bytes-not-a-jwt",
+    "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+    "resource": "https://agents.oauth-fixtures.mentionable.dev/fixture-agent/a2a",
+    "scope": "a2a:message.send",
+    "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+    "client_id": "did:web:connector.oauth-fixtures.mentionable.dev",
+    "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+    "client_assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6Im1lbnRpb25hYmxlLWNsaWVudC1hc3NlcnRpb24rand0Iiwia2lkIjoiZGlkOndlYjpjb25uZWN0b3Iub2F1dGgtZml4dHVyZXMubWVudGlvbmFibGUuZGV2I29hdXRoLWZpeHR1cmUtMjAyNi0wOCJ9.eyJpc3MiOiJkaWQ6d2ViOmNvbm5lY3Rvci5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYiLCJzdWIiOiJkaWQ6d2ViOmNvbm5lY3Rvci5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYiLCJhdWQiOiJodHRwczovL3N0cy5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYvb2F1dGgvdG9rZW4iLCJpYXQiOjE3ODcwOTc2MDAsImV4cCI6MTc4NzA5NzkwMCwianRpIjoiZjllMGExYjItYzNkNC00ZTVmLThhN2ItOGM5ZDBlMWYyYTNiIn0.oy1BRRDuoJNhlBHMAlFWE_-_Q7SVYkqWmQc7o40Ti3Fse8CBx5zakN9-SPL79wFJfJ_EmlJm6tjWkJO0lNxxAQ"
+  },
+  "evaluation": {
+    "expectedResource": "https://agents.oauth-fixtures.mentionable.dev/fixture-agent/a2a",
+    "tokenEndpoint": "https://sts.oauth-fixtures.mentionable.dev/oauth/token",
+    "verifiedAt": "2026-08-19T00:01:00Z"
+  }
+}

@@ -16,7 +16,7 @@ import {
   stripSensitiveMetadata,
   parsePersistRequestEnvelope,
 } from './postgres-task-store.js';
-import { ensureSchema } from './db.js';
+import { ensureSchema, type Sql } from './db.js';
 
 const hasDb = !!process.env.DATABASE_URL;
 
@@ -203,6 +203,9 @@ test('stripSensitiveMetadata with preserveEnvelope still scrubs bearer/principal
         metadata: {
           _bearerToken: 'secret',
           _principalId: 'eth:0x1',
+          _actorId: 'did:web:connector.example',
+          _authorizationProfile: 'https://mentionable.dev/ns/oauth-federation/v0.1',
+          _authorizationKey: 'federated:v1:private-policy-binding',
           _identityVcPresented: [{ profile: { displayName: 'private' } }],
           keep: 1,
         },
@@ -216,11 +219,115 @@ test('stripSensitiveMetadata with preserveEnvelope still scrubs bearer/principal
   const sm = (persisted.status.message as { metadata: Record<string, unknown> }).metadata;
   assert.equal(sm._bearerToken, undefined, 'bearer token scrubbed even with preserveEnvelope');
   assert.equal(sm._principalId, undefined, 'principal scrubbed even with preserveEnvelope');
+  assert.equal(sm._actorId, undefined, 'federated actor handoff is never persisted in task JSON');
+  assert.equal(sm._authorizationProfile, undefined, 'OAuth profile handoff is never persisted in task JSON');
+  assert.equal(sm._authorizationKey, undefined, 'federated policy handoff is never persisted in task JSON');
   assert.equal(sm._identityVcPresented, undefined, 'normalized VC handoff is never persisted');
   assert.equal(sm.keep, 1, 'non-sensitive message metadata retained');
 });
 
+test('createTask writes trusted authorization metadata in the initial INSERT without exposing it', async () => {
+  let inserted: unknown[] | undefined;
+  const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    if (strings.join('?').includes('INSERT INTO infra.a2a_tasks')) inserted = values;
+    return [];
+  }) as unknown as Sql;
+  sql.json = ((value: unknown) => value) as Sql['json'];
+  const store = new PostgresTaskStore(sql, { ownerAgent: 'agent-1' });
+  const task = await store.createTask({
+    metadata: {
+      visible: 'kept',
+      _principalId: 'slack:T123/U456',
+      _actorId: 'did:web:connector.example',
+      _authorizationProfile: 'urn:example:profile',
+      _authorizationKey: 'federated:v1:binding',
+    },
+  });
+
+  assert.ok(inserted);
+  assert.equal(inserted[4], 'slack:T123/U456');
+  assert.equal(inserted[5], 'agent-1');
+  assert.equal(inserted[6], 'did:web:connector.example');
+  assert.equal(inserted[7], 'urn:example:profile');
+  assert.equal(inserted[8], 'federated:v1:binding');
+  assert.deepEqual(task.metadata, { visible: 'kept' });
+  assert.equal(JSON.stringify(inserted[3]).includes('_authorizationKey'), false);
+});
+
 // ── updateTask concurrency (issue #366) ─────────────────────────────────────
+
+test(
+  'federated task identity is persisted in dedicated columns, not task JSON',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    const ownerAgent = `federated-owner-${crypto.randomUUID()}`;
+    const store = new PostgresTaskStore(sql, { ownerAgent });
+    const maintenanceStore = new PostgresTaskStore(sql);
+    let taskId: string | undefined;
+    try {
+      await ensureSchema(sql);
+      const task = await store.createTask({
+        metadata: {
+          _principalId: 'slack:T123/U456',
+          _actorId: 'did:web:connector.example',
+          _authorizationProfile: 'https://mentionable.dev/ns/oauth-federation/v0.1',
+          _authorizationKey: 'federated:v1:test-binding',
+        },
+      });
+      taskId = task.id;
+      const initialRows = await sql<{
+        owner_principal: string | null;
+        owner_actor: string | null;
+        authorization_profile: string | null;
+        authorization_key: string | null;
+      }[]>`
+        SELECT owner_principal, owner_actor, authorization_profile, authorization_key
+        FROM infra.a2a_tasks WHERE task_id = ${task.id}
+      `;
+      assert.deepEqual(initialRows[0], {
+        owner_principal: 'slack:T123/U456',
+        owner_actor: 'did:web:connector.example',
+        authorization_profile: 'https://mentionable.dev/ns/oauth-federation/v0.1',
+        authorization_key: 'federated:v1:test-binding',
+      });
+      const history = [{
+        messageId: 'federated-message',
+        role: 'user',
+        parts: [{ kind: 'text', text: 'hello' }],
+        metadata: {
+          _principalId: 'slack:T123/U456',
+          _actorId: 'did:web:connector.example',
+          _authorizationProfile: 'https://mentionable.dev/ns/oauth-federation/v0.1',
+          _authorizationKey: 'federated:v1:test-binding',
+        },
+      }] as unknown as Message[];
+      await store.updateTask(task.id, { history });
+      const rows = await sql<{
+        owner_principal: string | null;
+        owner_actor: string | null;
+        authorization_profile: string | null;
+        authorization_key: string | null;
+        task_json: Record<string, unknown>;
+      }[]>`
+        SELECT owner_principal, owner_actor, authorization_profile, authorization_key, task_json
+        FROM infra.a2a_tasks WHERE task_id = ${task.id}
+      `;
+      assert.equal(rows[0]?.owner_principal, 'slack:T123/U456');
+      assert.equal(rows[0]?.owner_actor, 'did:web:connector.example');
+      assert.equal(rows[0]?.authorization_profile, 'https://mentionable.dev/ns/oauth-federation/v0.1');
+      assert.equal(rows[0]?.authorization_key, 'federated:v1:test-binding');
+      const serialized = JSON.stringify(rows[0]?.task_json);
+      assert.equal(serialized.includes('_principalId'), false);
+      assert.equal(serialized.includes('_actorId'), false);
+      assert.equal(serialized.includes('_authorizationProfile'), false);
+      assert.equal(serialized.includes('_authorizationKey'), false);
+    } finally {
+      if (taskId) await maintenanceStore.deleteTask(taskId);
+      await sql.end();
+    }
+  },
+);
 
 test(
   'owner-scoped stores cannot read, update, or delete another agent task',

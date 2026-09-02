@@ -1,0 +1,18 @@
+{
+  "params": {
+    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+    "subject_token": "eyJhbGciOiJFZERTQSIsInR5cCI6Im1lbnRpb25hYmxlLXN1YmplY3QtYXNzZXJ0aW9uK2p3dCIsImtpZCI6ImRpZDp3ZWI6Y29ubmVjdG9yLm9hdXRoLWZpeHR1cmVzLm1lbnRpb25hYmxlLmRldiNvYXV0aC1maXh0dXJlLTIwMjYtMDgifQ.eyJtZW50aW9uYWJsZV9tZXRob2QiOiJ1cm46bWVudGlvbmFibGU6YXV0aDpzbGFjay13b3Jrc3BhY2UtbWVtYmVyOnYwLjEiLCJpc3MiOiJkaWQ6d2ViOmNvbm5lY3Rvci5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYiLCJzdWIiOiJzbGFjazpUMDEyMzQ1Ni9VMDQ1Njc4OSIsImF1ZCI6Imh0dHBzOi8vc3RzLm9hdXRoLWZpeHR1cmVzLm1lbnRpb25hYmxlLmRldi9vYXV0aC90b2tlbiIsImlhdCI6MTc4NzA5NzYwMCwiZXhwIjoxNzg3MDk3OTAwLCJqdGkiOiJkM2M0ZTVmNi1hN2I4LTRjOWQtOGUwZi0yYTNiNGM1ZDZlN2YifQ.AxmYCXLvuO1AF3FhyI7qbjXqSfMoSAFgmB5IRi2Zy9-3KU18rL2JE0P5TsdAxNBaW_H2ILtWmVlX04Jaw4OpBQ",
+    "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+    "resource": "https://agents.oauth-fixtures.mentionable.dev/fixture-agent/a2a",
+    "scope": "a2a:message.send\ta2a:task.read",
+    "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+    "client_id": "did:web:connector.oauth-fixtures.mentionable.dev",
+    "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+    "client_assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6Im1lbnRpb25hYmxlLWNsaWVudC1hc3NlcnRpb24rand0Iiwia2lkIjoiZGlkOndlYjpjb25uZWN0b3Iub2F1dGgtZml4dHVyZXMubWVudGlvbmFibGUuZGV2I29hdXRoLWZpeHR1cmUtMjAyNi0wOCJ9.eyJpc3MiOiJkaWQ6d2ViOmNvbm5lY3Rvci5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYiLCJzdWIiOiJkaWQ6d2ViOmNvbm5lY3Rvci5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYiLCJhdWQiOiJodHRwczovL3N0cy5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYvb2F1dGgvdG9rZW4iLCJpYXQiOjE3ODcwOTc2MDAsImV4cCI6MTc4NzA5NzkwMCwianRpIjoiZTRkNWY2YTctYjhjOS00ZDBlLTlmMWEtM2I0YzVkNmU3ZjhiIn0.wSsTtK2Gnf86SJUo26PjVZWiZutows39gCpQC2WRozYzXdiGJh4luBKq4beOAcs8dixGvsQ31HIKdpCjLqasAA"
+  },
+  "evaluation": {
+    "expectedResource": "https://agents.oauth-fixtures.mentionable.dev/fixture-agent/a2a",
+    "tokenEndpoint": "https://sts.oauth-fixtures.mentionable.dev/oauth/token",
+    "verifiedAt": "2026-08-19T00:01:00Z"
+  }
+}

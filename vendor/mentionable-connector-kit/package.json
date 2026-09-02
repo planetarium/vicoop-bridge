@@ -1,0 +1,32 @@
+{
+  "name": "@mentionable/connector-kit",
+  "version": "0.0.0-vendored.f32c8898",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./signing": {
+      "types": "./dist/signing.d.ts",
+      "import": "./dist/signing.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "fixtures",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "jose": "6.2.10"
+  }
+}

@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parsePrincipal, validatePrincipal, matchPrincipal } from './principal.js';
+import {
+  formatFederatedPrincipal,
+  matchPrincipal,
+  parseFederatedPrincipal,
+  parsePrincipal,
+  validatePrincipal,
+} from './principal.js';
 
 // ---------- parsePrincipal ----------
 
@@ -137,6 +143,44 @@ test('parsePrincipal: empty string', () => {
 
 test('parsePrincipal: plain 0x address (no prefix) is not valid', () => {
   assert.equal(parsePrincipal('0xaabbccddeeff00112233445566778899aabbccdd'), null);
+});
+
+test('federated principal round-trips delimiters and unicode collision-safely', () => {
+  const tuple = {
+    issuer: 'did:web:connector.example:path',
+    method: 'urn:mentionable:auth:slack:workspace:v0.1',
+    subject: 'slack:T123/사용자:U456',
+  };
+  const encoded = formatFederatedPrincipal(tuple);
+  assert.ok(encoded);
+  assert.deepEqual(parseFederatedPrincipal(encoded), tuple);
+  assert.deepEqual(parsePrincipal(encoded), { kind: 'federated', ...tuple });
+  assert.equal(validatePrincipal(encoded), encoded);
+  assert.equal(matchPrincipal(encoded, {
+    principalId: tuple.subject,
+    actorId: tuple.issuer,
+    tokenExchange: {
+      tokenId: 'token-1',
+      profileId: 'https://mentionable.dev/ns/oauth-federation/v0.1',
+      agentId: 'agent-1',
+      resource: 'https://bridge.example/agents/agent-1',
+      actorId: tuple.issuer,
+      scopes: ['a2a:message.send'],
+      allowedCaller: encoded,
+    },
+  }), true);
+});
+
+test('federated principal rejects malformed, non-canonical, and oversized values', () => {
+  assert.equal(formatFederatedPrincipal({ issuer: 'https://issuer', method: 'm', subject: 's' }), null);
+  assert.equal(formatFederatedPrincipal({ issuer: 'did:web:issuer', method: '', subject: 's' }), null);
+  assert.equal(formatFederatedPrincipal({ issuer: 'did:web:issuer', method: 'm', subject: ' s' }), null);
+  assert.equal(formatFederatedPrincipal({ issuer: 'did:web:issuer', method: 'm'.repeat(257), subject: 's' }), null);
+  assert.equal(parseFederatedPrincipal('federated:v1:3:abc1:m1:sjunk'), null);
+  assert.equal(
+    formatFederatedPrincipal({ issuer: 'did:web:issuer', method: 'm', subject: 's'.repeat(600) }),
+    null,
+  );
 });
 
 // ---------- validatePrincipal ----------

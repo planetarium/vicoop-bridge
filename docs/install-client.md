@@ -944,6 +944,11 @@ vicoop-client auth login
 These talk to the bridge's `/admin-api/*` routes — same logic the admin
 agent's tools run, but without an LLM round-trip per call.
 
+To authorize a Mentionable Connector for one exact platform subject, follow
+[`manage-federated-callers.md`](./manage-federated-callers.md). It covers the
+structured `agent callers add-federated` command, public/restricted policy
+transitions, verification, rotation, and revocation.
+
 ### Option B: natural-language admin agent
 
 ```sh
@@ -960,8 +965,11 @@ curl -sX POST "$BRIDGE_URL/" \
   | jq -r '.result.status.message.parts[0].text'
 ```
 
-Either path hot-reloads via `registry.updateAllowedCallers` — no client
-restart needed.
+Either path updates the database and serving instance immediately. Other
+server instances converge through best-effort PostgreSQL notifications, so no
+client restart is normally needed; if an Agent Card remains stale, check the
+`caller_policy_*_failed` server events and reconnect the agent after restoring
+notifications.
 
 ### Static API keys (non-interactive callers)
 

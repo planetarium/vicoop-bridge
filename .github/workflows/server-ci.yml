@@ -7,7 +7,9 @@ on:
       - 'packages/server/**'
       - 'packages/protocol/**'
       - 'packages/admin-ui/**'
+      - 'vendor/mentionable-connector-kit/**'
       - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
       - 'package.json'
   push:
     branches: [main]
@@ -16,7 +18,9 @@ on:
       - 'packages/server/**'
       - 'packages/protocol/**'
       - 'packages/admin-ui/**'
+      - 'vendor/mentionable-connector-kit/**'
       - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
       - 'package.json'
 
 jobs:
@@ -43,6 +47,9 @@ jobs:
 
       - name: Build protocol
         run: pnpm --filter @vicoop-bridge/protocol build
+
+      - name: Build Mentionable connector kit
+        run: pnpm --filter @mentionable/connector-kit build
 
       - name: Typecheck server
         run: pnpm --filter @vicoop-bridge/server typecheck

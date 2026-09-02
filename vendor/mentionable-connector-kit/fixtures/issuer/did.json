@@ -1,0 +1,27 @@
+{
+  "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/jwk/v1"],
+  "id": "did:web:connector.oauth-fixtures.mentionable.dev",
+  "verificationMethod": [
+    {
+      "id": "did:web:connector.oauth-fixtures.mentionable.dev#oauth-fixture-2026-08",
+      "type": "JsonWebKey",
+      "controller": "did:web:connector.oauth-fixtures.mentionable.dev",
+      "publicKeyJwk": {
+        "crv": "Ed25519",
+        "x": "UGfideXk63XnzqYdisiTAZ64iAHklpZox4h4kECItXU",
+        "kty": "OKP"
+      }
+    },
+    {
+      "id": "did:web:connector.oauth-fixtures.mentionable.dev#rogue-2026-08",
+      "type": "JsonWebKey",
+      "controller": "did:web:connector.oauth-fixtures.mentionable.dev",
+      "publicKeyJwk": {
+        "crv": "Ed25519",
+        "x": "-mAURKBKNzvdmpNqNvPQXsUjTVirKcoLgYwKRXtL4Wg",
+        "kty": "OKP"
+      }
+    }
+  ],
+  "assertionMethod": ["did:web:connector.oauth-fixtures.mentionable.dev#oauth-fixture-2026-08"]
+}

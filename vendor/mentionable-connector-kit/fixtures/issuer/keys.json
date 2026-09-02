@@ -1,0 +1,26 @@
+{
+  "warning": "TEST KEYS ONLY. This keypair is published so external implementations can regenerate and re-verify the OAuth federation v0.1 conformance fixtures offline. It carries no authority anywhere. Never sign real assertions with it and never add its DID to a production issuer trust policy.",
+  "issuerDid": "did:web:connector.oauth-fixtures.mentionable.dev",
+  "keys": [
+    {
+      "kid": "oauth-fixture-2026-08",
+      "privateKeyPkcs8B64u": "MC4CAQAwBQYDK2VwBCIEICEntx5uBYhOhtkRoPtSZlKFb_PTYKvPEaJdvJNOdIEi",
+      "publicKeySpkiB64u": "MCowBQYDK2VwAyEAUGfideXk63XnzqYdisiTAZ64iAHklpZox4h4kECItXU",
+      "publicKeyJwk": {
+        "crv": "Ed25519",
+        "x": "UGfideXk63XnzqYdisiTAZ64iAHklpZox4h4kECItXU",
+        "kty": "OKP"
+      }
+    },
+    {
+      "kid": "rogue-2026-08",
+      "privateKeyPkcs8B64u": "MC4CAQAwBQYDK2VwBCIEIEER-ltl8HaEcZrJMQqdaISztlUhamqzx7yg11ZJokwf",
+      "publicKeySpkiB64u": "MCowBQYDK2VwAyEA-mAURKBKNzvdmpNqNvPQXsUjTVirKcoLgYwKRXtL4Wg",
+      "publicKeyJwk": {
+        "crv": "Ed25519",
+        "x": "-mAURKBKNzvdmpNqNvPQXsUjTVirKcoLgYwKRXtL4Wg",
+        "kty": "OKP"
+      }
+    }
+  ]
+}

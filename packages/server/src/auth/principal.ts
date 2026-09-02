@@ -1,3 +1,5 @@
+import type { CallerAttestationV2 } from '@vicoop-bridge/protocol';
+
 // Principal string parsing and matching for agents.allowed_callers.
 //
 // Format:
@@ -8,6 +10,10 @@
 //   apikey:<key-id>             Static API key (provider='apikey' callers row);
 //                               the <key-id> is the public identifier, the bearer
 //                               secret is the vbc_caller_* token itself
+//   federated:v1:<length-prefixed issuer/method/subject tuple>
+//                               Exact Mentionable OAuth federation grant. The
+//                               tuple is receiver-owned policy; a verified DID
+//                               signature alone never creates this entry.
 
 export type Principal = string;
 
@@ -16,10 +22,32 @@ export type ParsedPrincipal =
   | { kind: 'google-sub'; sub: string }
   | { kind: 'google-email'; email: string }
   | { kind: 'google-domain'; domain: string }
-  | { kind: 'apikey'; keyId: string };
+  | { kind: 'apikey'; keyId: string }
+  | { kind: 'federated'; issuer: string; method: string; subject: string };
+
+export interface FederatedPrincipalInput {
+  issuer: string;
+  method: string;
+  subject: string;
+}
 
 export interface VerifiedCaller {
   principalId: string;       // e.g. 'google:<sub>' | 'eth:0x...'
+  // Present only for federated delegation, where the platform subject is the
+  // effective principal and the independently authenticated Connector DID is
+  // retained as actor.
+  actorId?: string;
+  tokenExchange?: {
+    tokenId: string;
+    profileId: string;
+    agentId: string;
+    resource: string;
+    actorId: string;
+    scopes: string[];
+    allowedCaller: string;
+    taskId?: string;
+    attestations?: CallerAttestationV2[];
+  };
   email?: string;
   emailVerified?: boolean;
   hostedDomain?: string;
@@ -31,6 +59,68 @@ const DOMAIN_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/;
 // alphabet is url-safe base64. Case-sensitive — a key id is an opaque token,
 // not a human-typed identifier.
 const API_KEY_ID_RE = /^[A-Za-z0-9_-]+$/;
+const FEDERATED_PREFIX = 'federated:v1:';
+const MAX_FEDERATED_PRINCIPAL_BYTES = 512;
+
+function takeLengthPrefixed(input: string): { value: string; rest: string } | null {
+  const colon = input.indexOf(':');
+  if (colon <= 0) return null;
+  const rawLength = input.slice(0, colon);
+  if (!/^(?:0|[1-9][0-9]*)$/.test(rawLength)) return null;
+  const byteLength = Number(rawLength);
+  if (!Number.isSafeInteger(byteLength) || byteLength <= 0) return null;
+
+  const body = input.slice(colon + 1);
+  let consumedBytes = 0;
+  let end = 0;
+  for (const ch of body) {
+    consumedBytes += Buffer.byteLength(ch);
+    if (consumedBytes > byteLength) return null;
+    end += ch.length;
+    if (consumedBytes === byteLength) break;
+  }
+  if (consumedBytes !== byteLength) return null;
+  return { value: body.slice(0, end), rest: body.slice(end) };
+}
+
+/**
+ * Collision-safe, reversible encoding for an exact federated caller tuple.
+ * Lengths are UTF-8 byte lengths, so delimiters inside DIDs, URNs, and
+ * platform subjects remain ordinary data rather than parser syntax.
+ */
+export function formatFederatedPrincipal(input: FederatedPrincipalInput): string | null {
+  const issuer = input.issuer.trim();
+  const method = input.method.trim();
+  const subject = input.subject.trim();
+  if (issuer !== input.issuer || method !== input.method || subject !== input.subject) return null;
+  if (!issuer.startsWith('did:web:') || !method || !subject) return null;
+  if (/\s/.test(issuer)) return null;
+  if (issuer.length > 512 || method.length > 256 || subject.length > 512) return null;
+  const component = (value: string): string => `${Buffer.byteLength(value)}:${value}`;
+  const encoded = FEDERATED_PREFIX + component(issuer) + component(method) + component(subject);
+  return Buffer.byteLength(encoded) <= MAX_FEDERATED_PRINCIPAL_BYTES ? encoded : null;
+}
+
+export function parseFederatedPrincipal(value: string): FederatedPrincipalInput | null {
+  if (!value.startsWith(FEDERATED_PREFIX)) return null;
+  let rest = value.slice(FEDERATED_PREFIX.length);
+  const issuer = takeLengthPrefixed(rest);
+  if (!issuer) return null;
+  rest = issuer.rest;
+  const method = takeLengthPrefixed(rest);
+  if (!method) return null;
+  rest = method.rest;
+  const subject = takeLengthPrefixed(rest);
+  if (!subject || subject.rest !== '') return null;
+  const canonical = formatFederatedPrincipal({
+    issuer: issuer.value,
+    method: method.value,
+    subject: subject.value,
+  });
+  return canonical === value
+    ? { issuer: issuer.value, method: method.value, subject: subject.value }
+    : null;
+}
 
 // Parse a stored principal string. Returns null for invalid input.
 export function parsePrincipal(s: string): ParsedPrincipal | null {
@@ -75,6 +165,9 @@ export function parsePrincipal(s: string): ParsedPrincipal | null {
     return { kind: 'apikey', keyId };
   }
 
+  const federated = parseFederatedPrincipal(s);
+  if (federated) return { kind: 'federated', ...federated };
+
   return null;
 }
 
@@ -105,6 +198,8 @@ export function validatePrincipal(raw: string): Principal | null {
       return 'google:domain:' + parsed.domain;
     case 'apikey':
       return 'apikey:' + parsed.keyId;
+    case 'federated':
+      return formatFederatedPrincipal(parsed);
   }
 }
 
@@ -147,6 +242,9 @@ export function matchPrincipal(entry: Principal, caller: VerifiedCaller): boolea
       // 'apikey:<key-id>'; matching is exact identity on the key id. No
       // email/domain semantics — possession of the bearer token is the proof.
       return caller.principalId === 'apikey:' + parsed.keyId;
+    }
+    case 'federated': {
+      return caller.tokenExchange?.allowedCaller === entry;
     }
   }
 }

@@ -34,6 +34,28 @@ function slowUpdateThresholdMs(): number {
 
 type MessageWithMetadata = Message & { metadata?: Record<string, unknown> };
 
+interface TaskAuthorizationBinding {
+  principalId?: string;
+  actorId?: string;
+  profileId?: string;
+  authorizationKey?: string;
+}
+
+function authorizationBindingFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): TaskAuthorizationBinding {
+  const stringValue = (key: string) => {
+    const value = metadata?.[key];
+    return typeof value === 'string' ? value : undefined;
+  };
+  return {
+    principalId: stringValue('_principalId'),
+    actorId: stringValue('_actorId'),
+    profileId: stringValue('_authorizationProfile'),
+    authorizationKey: stringValue('_authorizationKey'),
+  };
+}
+
 function extractOwnerPrincipal(task: Task): string | undefined {
   for (const msg of task.history ?? []) {
     const principal = (msg as MessageWithMetadata).metadata?._principalId;
@@ -45,22 +67,60 @@ function extractOwnerPrincipal(task: Task): string | undefined {
   return undefined;
 }
 
+function extractAuthorizationField(
+  task: Task,
+  key: '_actorId' | '_authorizationProfile' | '_authorizationKey',
+): string | undefined {
+  for (const msg of task.history ?? []) {
+    const value = (msg as MessageWithMetadata).metadata?.[key];
+    if (typeof value === 'string') return value;
+  }
+  const statusValue = (task.status?.message as MessageWithMetadata | undefined)?.metadata?.[key];
+  return typeof statusValue === 'string' ? statusValue : undefined;
+}
+
 function stripMessageMetadata(msg: Message): Message {
   const metadata = (msg as MessageWithMetadata).metadata ?? {};
   const {
     _bearerToken,
     _principalId,
+    _actorId,
+    _authorizationProfile,
+    _authorizationKey,
     [IDENTITY_VC_PRESENTED_METADATA_KEY]: _presented,
     ...rest
   } = metadata;
   void _bearerToken;
   void _principalId;
+  void _actorId;
+  void _authorizationProfile;
+  void _authorizationKey;
   void _presented;
   const clean = Object.keys(rest).length ? rest : undefined;
   if (clean) return { ...msg, metadata: clean };
   const { metadata: _meta, ...m } = msg as MessageWithMetadata;
   void _meta;
   return m as Message;
+}
+
+function stripTaskMetadata(metadata: Record<string, unknown> | undefined) {
+  if (!metadata) return undefined;
+  const {
+    _bearerToken,
+    _principalId,
+    _actorId,
+    _authorizationProfile,
+    _authorizationKey,
+    [IDENTITY_VC_PRESENTED_METADATA_KEY]: _presented,
+    ...rest
+  } = metadata;
+  void _bearerToken;
+  void _principalId;
+  void _actorId;
+  void _authorizationProfile;
+  void _authorizationKey;
+  void _presented;
+  return Object.keys(rest).length > 0 ? rest : undefined;
 }
 
 // Drop the request-scoped `chat_completions_request` envelope from the
@@ -109,6 +169,7 @@ export function stripSensitiveMetadata(
   // regardless — those must never be persisted.
   const base = opts?.preserveEnvelope ? task : stripPersistedEnvelope(task);
   const result = { ...base };
+  result.metadata = stripTaskMetadata(result.metadata);
   if (result.history?.length) {
     result.history = result.history.map(stripMessageMetadata);
   }
@@ -171,13 +232,14 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   }
 
   async createTask(params: CreateTaskParams): Promise<Task> {
+    const authorizationBinding = authorizationBindingFromMetadata(params.metadata);
     const task: Task = {
       id: randomUUID(),
       contextId: params.contextId ?? randomUUID(),
       status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
-      metadata: params.metadata,
+      metadata: stripTaskMetadata(params.metadata),
     };
-    await this.writeTask(task);
+    await this.writeTask(task, this.sql, authorizationBinding);
     // A freshly-created task is SUBMITTED, never terminal, so retention is a
     // no-op here — skip it entirely.
     return task;
@@ -477,8 +539,17 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   // Write (insert-or-replace) the full task row. `sql` defaults to the pool
   // connection but updateTask passes its transaction-scoped connection so the
   // row write participates in the same FOR UPDATE transaction that read it.
-  private async writeTask(task: Task, sql: SqlExecutor = this.sql): Promise<void> {
-    const ownerPrincipal = extractOwnerPrincipal(task);
+  private async writeTask(
+    task: Task,
+    sql: SqlExecutor = this.sql,
+    initialBinding?: TaskAuthorizationBinding,
+  ): Promise<void> {
+    const ownerPrincipal = initialBinding?.principalId ?? extractOwnerPrincipal(task);
+    const ownerActor = initialBinding?.actorId ?? extractAuthorizationField(task, '_actorId');
+    const authorizationProfile =
+      initialBinding?.profileId ?? extractAuthorizationField(task, '_authorizationProfile');
+    const authorizationKey =
+      initialBinding?.authorizationKey ?? extractAuthorizationField(task, '_authorizationKey');
     const sanitized = stripSensitiveMetadata(task, {
       preserveEnvelope: this.persistRequestEnvelope,
     });
@@ -488,32 +559,48 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     if (this.ownerAgent === undefined) {
       await sql`
         INSERT INTO infra.a2a_tasks
-          (task_id, context_id, state, task_json, owner_principal, owner_agent)
+          (task_id, context_id, state, task_json, owner_principal, owner_agent,
+           owner_actor, authorization_profile, authorization_key)
         VALUES (
           ${task.id}, ${contextId}, ${task.status.state}, ${persisted},
-          ${ownerPrincipal ?? null}, NULL
+          ${ownerPrincipal ?? null}, NULL, ${ownerActor ?? null},
+          ${authorizationProfile ?? null}, ${authorizationKey ?? null}
         )
         ON CONFLICT (task_id) DO UPDATE SET
           context_id = EXCLUDED.context_id,
           state = EXCLUDED.state,
           task_json = EXCLUDED.task_json,
           owner_principal = COALESCE(infra.a2a_tasks.owner_principal, EXCLUDED.owner_principal),
+          owner_actor = COALESCE(infra.a2a_tasks.owner_actor, EXCLUDED.owner_actor),
+          authorization_profile = COALESCE(
+            infra.a2a_tasks.authorization_profile,
+            EXCLUDED.authorization_profile
+          ),
+          authorization_key = COALESCE(infra.a2a_tasks.authorization_key, EXCLUDED.authorization_key),
           updated_at = now()
       `;
       return;
     }
     await sql`
       INSERT INTO infra.a2a_tasks
-        (task_id, context_id, state, task_json, owner_principal, owner_agent)
+        (task_id, context_id, state, task_json, owner_principal, owner_agent,
+         owner_actor, authorization_profile, authorization_key)
       VALUES (
         ${task.id}, ${contextId}, ${task.status.state}, ${persisted},
-        ${ownerPrincipal ?? null}, ${this.ownerAgent}
+        ${ownerPrincipal ?? null}, ${this.ownerAgent},
+        ${ownerActor ?? null}, ${authorizationProfile ?? null}, ${authorizationKey ?? null}
       )
       ON CONFLICT (task_id) DO UPDATE SET
         context_id = EXCLUDED.context_id,
         state = EXCLUDED.state,
         task_json = EXCLUDED.task_json,
         owner_principal = COALESCE(infra.a2a_tasks.owner_principal, EXCLUDED.owner_principal),
+        owner_actor = COALESCE(infra.a2a_tasks.owner_actor, EXCLUDED.owner_actor),
+        authorization_profile = COALESCE(
+          infra.a2a_tasks.authorization_profile,
+          EXCLUDED.authorization_profile
+        ),
+        authorization_key = COALESCE(infra.a2a_tasks.authorization_key, EXCLUDED.authorization_key),
         updated_at = now()
       WHERE infra.a2a_tasks.owner_agent = EXCLUDED.owner_agent
     `;

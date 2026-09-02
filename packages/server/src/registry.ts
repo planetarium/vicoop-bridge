@@ -68,6 +68,12 @@ export interface TaskBinding {
   // route does not create TaskBindings — it has its own executor
   // (AdminA2XExecutor) that never calls registry.bindTask().
   principalId?: string;
+  // Federated delegation continuity. The actor is the directly authenticated
+  // Connector DID; authorizationKey is the exact allowed-caller tuple that
+  // promoted the platform subject to principal.
+  actorId?: string;
+  authorizationProfile?: string;
+  authorizationKey?: string;
   requestedExtensions?: string[];
   // Diagnostic counter (issue #414): number of liveness-heartbeat `task.status`
   // frames the server has received from the client and pushed to the sink for

@@ -10,6 +10,8 @@ Docs:
 - [`docs/install-client.md`](./docs/install-client.md) — onboarding a new client against a deployed bridge
 - [`docs/remote-testing.md`](./docs/remote-testing.md) — end-to-end testing against a deployed bridge
 - [`docs/local-testing.md`](./docs/local-testing.md) — running both bridge and client from source
+- [`docs/oauth-federation.md`](./docs/oauth-federation.md) — direct-Connector OAuth federation, policy, and task continuity
+- [`docs/manage-federated-callers.md`](./docs/manage-federated-callers.md) — operator guide for allowing, verifying, rotating, and removing exact federated callers
 - [`docs/openclaw-e2e.md`](./docs/openclaw-e2e.md) — exercising the `openclaw` backend directly against the gateway Docker image
 - [`docs/claude-telemetry.md`](./docs/claude-telemetry.md) — observability for the `claude` backend: what the journal already reports, and collecting the CLI's OTEL stream
 
