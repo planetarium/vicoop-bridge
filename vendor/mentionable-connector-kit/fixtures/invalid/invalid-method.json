@@ -1,0 +1,8 @@
+{
+  "jwt": "eyJhbGciOiJFZERTQSIsInR5cCI6Im1lbnRpb25hYmxlLXN1YmplY3QtYXNzZXJ0aW9uK2p3dCIsImtpZCI6ImRpZDp3ZWI6Y29ubmVjdG9yLm9hdXRoLWZpeHR1cmVzLm1lbnRpb25hYmxlLmRldiNvYXV0aC1maXh0dXJlLTIwMjYtMDgifQ.eyJtZW50aW9uYWJsZV9tZXRob2QiOiJzbGFjay13b3Jrc3BhY2UtbWVtYmVyIiwiaXNzIjoiZGlkOndlYjpjb25uZWN0b3Iub2F1dGgtZml4dHVyZXMubWVudGlvbmFibGUuZGV2Iiwic3ViIjoic2xhY2s6VDAxMjM0NTYvVTA0NTY3ODkiLCJhdWQiOiJodHRwczovL3N0cy5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYvb2F1dGgvdG9rZW4iLCJpYXQiOjE3ODcwOTc2MDAsImV4cCI6MTc4NzA5NzkwMCwianRpIjoiZjhlOWEwYjEtYzJkMy00ZTRmLThhNWItNmM3ZDhlOWYwYTFjIn0.0CT0dCYp_IwFr2hQVQMHO19k6RG345LSf9FWiAKSSWtPRRDmVqpZeIjHP9_5qlX8wM6pqxr1vU4VkZssfzFtDQ",
+  "verification": {
+    "typ": "mentionable-subject-assertion+jwt",
+    "tokenEndpoint": "https://sts.oauth-fixtures.mentionable.dev/oauth/token",
+    "verifiedAt": "2026-08-19T00:01:00Z"
+  }
+}

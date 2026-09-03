@@ -62,10 +62,11 @@ export interface TokenExchangeProfileContext {
 /**
  * One authorization profile layered on RFC 8693.
  *
- * The core owns HTTP parsing, resource selection, opaque token issuance,
- * replay persistence, and the RFC response. A profile owns assertion syntax,
- * trust establishment, cryptographic verification, scopes, and the derived
- * principal/actor authorization context.
+ * The core owns HTTP parsing, resource selection, opaque token issuance, and
+ * the RFC response. It persists replay evidence by default; a profile may do
+ * so inside its verifier when that ordering is part of the profile contract.
+ * A profile owns assertion syntax, trust establishment, cryptographic
+ * verification, scopes, and the derived principal/actor authorization context.
  */
 export interface TokenExchangeProfile {
   id: string;
@@ -76,6 +77,12 @@ export interface TokenExchangeProfile {
    * credentials are not replayable assertions.
    */
   replayProtection: 'required' | 'not-applicable';
+  /**
+   * Where required assertion replays are atomically registered. The generic
+   * core consumes `result.replays` by default; profiles whose reference
+   * verifier requires an in-verifier replay cache set this to `profile`.
+   */
+  replayPersistence?: 'core' | 'profile';
   clientAuthMethods: readonly string[];
   clientAuthSigningAlgorithms: readonly string[];
   scopes: readonly string[];

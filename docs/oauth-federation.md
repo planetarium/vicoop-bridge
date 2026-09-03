@@ -24,15 +24,19 @@ operation independently of any profile, then dispatches authorization by that
 identifier. A future profile therefore supplies both exchange verification and
 resource authorization without being interpreted under Mentionable semantics.
 Each profile must also declare whether replay protection is required or not
-applicable; the core refuses issuance when a replay-required profile returns no
-single-use replay evidence.
+applicable. Replay-required profiles either return single-use evidence for the
+core to persist or register it atomically inside the verifier when the profile
+contract requires replay rejection before verification returns. The
+Mentionable profile stages the client and subject tuples during cryptographic
+verification and commits both in one transaction only after every profile
+check succeeds.
 
 ## Connector-kit dependency status
 
 The package boundary is intentional, but the copy under
 `vendor/mentionable-connector-kit` is temporary. The authoritative source is
 `packages/connector-kit` in the `planetarium/mentionable` repository. This
-bridge currently pins commit `f32c8898c7d81b254ec9a562ea2892525db14de6`
+bridge currently pins commit `61d86728e841b0ca796c86364b2fa881ef66c87d`
 because the upstream package is still an unpublished `0.0.0` workspace package
 whose `workspace:*` dependencies cannot be installed by a consumer repository.
 
@@ -72,7 +76,9 @@ The bridge parses unverified assertion claims only to select one exact
 receiver-owned allowed-caller entry. A miss is rejected before DID resolution.
 On a hit, it verifies EdDSA, explicit `typ`, the DID `assertionMethod`
 relationship, `iss`/`sub`/`aud`/`iat`/`exp`/`jti`, method, lifetime, and replay.
-A DID signature alone never grants access.
+A DID signature alone never grants access. A missing key or signature mismatch
+triggers one bounded cache-bypassing DID refresh to accommodate key rotation;
+resolution and refresh transport failures return a retryable `server_error`.
 
 ## Operator configuration
 

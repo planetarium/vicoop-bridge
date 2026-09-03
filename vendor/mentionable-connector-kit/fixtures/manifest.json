@@ -49,6 +49,66 @@
     "reason": "ttl-exceeded"
   },
   {
+    "file": "invalid/zero-lifetime.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "invalid-lifetime"
+  },
+  {
+    "file": "invalid/negative-lifetime.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "invalid-lifetime"
+  },
+  {
+    "file": "invalid/invalid-method.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "invalid-method"
+  },
+  {
+    "file": "invalid/kid-not-issuer-fragment.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "kid-not-authorized"
+  },
+  {
+    "file": "invalid/kid-invalid-fragment-syntax.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "kid-not-authorized"
+  },
+  {
+    "file": "invalid/vm-controller-mismatch.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "kid-not-authorized"
+  },
+  {
+    "file": "invalid/vm-wrong-type.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "kid-not-authorized"
+  },
+  {
+    "file": "invalid/vm-invalid-public-jwk.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "kid-not-authorized"
+  },
+  {
+    "file": "invalid/vm-private-jwk.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "kid-not-authorized"
+  },
+  {
+    "file": "invalid/vm-mixed-key-material.json",
+    "kind": "assertion",
+    "expect": "reject",
+    "reason": "kid-not-authorized"
+  },
+  {
     "file": "invalid/tampered-signature.json",
     "kind": "assertion",
     "expect": "reject",
@@ -107,6 +167,30 @@
     "kind": "exchange-request",
     "expect": "reject",
     "reason": "unknown-scope"
+  },
+  {
+    "file": "invalid/exchange-missing-scope.json",
+    "kind": "exchange-request",
+    "expect": "reject",
+    "reason": "missing-scope"
+  },
+  {
+    "file": "invalid/exchange-empty-scope.json",
+    "kind": "exchange-request",
+    "expect": "reject",
+    "reason": "missing-scope"
+  },
+  {
+    "file": "invalid/exchange-missing-requested-token-type.json",
+    "kind": "exchange-request",
+    "expect": "reject",
+    "reason": "missing-requested-token-type"
+  },
+  {
+    "file": "invalid/exchange-wrong-requested-token-type.json",
+    "kind": "exchange-request",
+    "expect": "reject",
+    "reason": "unsupported-requested-token-type"
   },
   {
     "file": "replay/replayed-jti.json",

@@ -1,6 +1,6 @@
 {
   "name": "@mentionable/connector-kit",
-  "version": "0.0.0-vendored.f32c8898",
+  "version": "0.0.0-vendored.61d86728",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",

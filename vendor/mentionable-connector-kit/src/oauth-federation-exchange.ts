@@ -18,7 +18,7 @@
 // `client_id` — the stolen / forwarded-assertion case — is rejected.
 //
 // Retry semantics: this client NEVER retries. Every recognized OAuth error
-// code is a client fault (`retryable: false`) — in particular
+// code except a 5xx `server_error` is a client fault (`retryable: false`) — in particular
 // `invalid_request` (e.g. issuer/client inequality) and `invalid_grant`
 // (expired/replayed assertion) mean the request itself must change;
 // re-sending the same bytes cannot succeed. Only transport-level failures
@@ -44,8 +44,12 @@ import {
   OAUTH_TOKEN_TYPE_JWT,
   isTokenExchangeErrorCode,
   scopesRequireSubjectAssertion,
+  type OAuthFederationScope,
   type TokenExchangeErrorCode,
 } from './oauth-federation.js'
+
+/** The v0.1 scope registry as a set — unknown scopes fail closed. */
+const KNOWN_SCOPES: ReadonlySet<string> = new Set(OAUTH_FEDERATION_SCOPES)
 
 // ---------------------------------------------------------------------------
 // Request building
@@ -60,13 +64,16 @@ export type TokenExchangeRequest = {
    */
   subjectToken: string
   /** Defaults to `urn:ietf:params:oauth:token-type:jwt` — the only v0.1 type. */
-  subjectTokenType?: string
+  subjectTokenType?: typeof OAUTH_TOKEN_TYPE_JWT
   /** Exactly one canonical resource (RFC 8707) — the agent's advertised A2A endpoint URL. */
   resource: string
-  /** Requested scopes (space-joined on the wire). */
-  scope?: readonly string[]
+  /**
+   * Requested scopes (space-joined on the wire). v0.1 requires at least one
+   * member of the closed profile registry.
+   */
+  scope: readonly OAuthFederationScope[]
   /** Defaults to `urn:ietf:params:oauth:token-type:access_token`. */
-  requestedTokenType?: string
+  requestedTokenType?: typeof OAUTH_TOKEN_TYPE_ACCESS_TOKEN
   /** OAuth client id — the Connector DID. */
   clientId: string
   /** RFC 7523 client assertion JWT (`private_key_jwt`). */
@@ -79,14 +86,32 @@ export type TokenExchangeRequest = {
  * fixtures and consuming tests can pin the exact wire shape.
  */
 export function buildTokenExchangeBody(request: TokenExchangeRequest): URLSearchParams {
+  if (
+    request.scope === undefined ||
+    request.scope.length === 0 ||
+    request.scope.some((scope) => !KNOWN_SCOPES.has(scope))
+  ) {
+    throw new TypeError(
+      'buildTokenExchangeBody: scope must contain at least one known OAuth federation v0.1 scope',
+    )
+  }
+  if (request.subjectTokenType !== undefined && request.subjectTokenType !== OAUTH_TOKEN_TYPE_JWT) {
+    throw new TypeError(`buildTokenExchangeBody: subjectTokenType must be ${OAUTH_TOKEN_TYPE_JWT}`)
+  }
+  if (
+    request.requestedTokenType !== undefined &&
+    request.requestedTokenType !== OAUTH_TOKEN_TYPE_ACCESS_TOKEN
+  ) {
+    throw new TypeError(
+      `buildTokenExchangeBody: requestedTokenType must be ${OAUTH_TOKEN_TYPE_ACCESS_TOKEN}`,
+    )
+  }
   const body = new URLSearchParams()
   body.set('grant_type', OAUTH_GRANT_TYPE_TOKEN_EXCHANGE)
   body.set('subject_token', request.subjectToken)
   body.set('subject_token_type', request.subjectTokenType ?? OAUTH_TOKEN_TYPE_JWT)
   body.set('resource', request.resource)
-  if (request.scope !== undefined && request.scope.length > 0) {
-    body.set('scope', request.scope.join(' '))
-  }
+  body.set('scope', request.scope.join(' '))
   body.set('requested_token_type', request.requestedTokenType ?? OAUTH_TOKEN_TYPE_ACCESS_TOKEN)
   body.set('client_id', request.clientId)
   body.set('client_assertion_type', OAUTH_CLIENT_ASSERTION_TYPE_JWT_BEARER)
@@ -102,9 +127,9 @@ export type TokenExchangeSuccess = {
   ok: true
   accessToken: string
   /** RFC 8693 `issued_token_type` — `urn:ietf:params:oauth:token-type:access_token` in v0.1. */
-  issuedTokenType: string
+  issuedTokenType: typeof OAUTH_TOKEN_TYPE_ACCESS_TOKEN
   /** RFC 6749 `token_type` — `Bearer` in v0.1 (DPoP is reserved). */
-  tokenType: string
+  tokenType: 'Bearer'
   /** Lifetime in seconds, when the STS provided `expires_in`. */
   expiresIn?: number
   /** Granted scopes (split from the space-delimited `scope`), when returned. */
@@ -125,9 +150,9 @@ export type TokenExchangeFailure = {
   errorDescription?: string
   errorUri?: string
   /**
-   * `false` for every recognized OAuth error code (client faults — never
-   * re-send the same request; see module header). `true` only for
-   * transport-level failures (5xx / unparseable) the caller may back off on.
+   * `false` for client-fault OAuth errors. `true` for a 5xx `server_error`
+   * or an unparseable 5xx response the caller may back off on. This client
+   * does not perform the retry itself.
    */
   retryable: boolean
   /** The parsed response body when there was one. */
@@ -158,15 +183,14 @@ function parseSuccess(status: number, body: Record<string, unknown>): TokenExcha
   if (
     typeof accessToken !== 'string' ||
     accessToken.length === 0 ||
-    typeof issuedTokenType !== 'string' ||
-    typeof tokenType !== 'string'
+    issuedTokenType !== OAUTH_TOKEN_TYPE_ACCESS_TOKEN ||
+    tokenType !== 'Bearer'
   ) {
     return {
       ok: false,
       status,
       error: 'invalid_response',
-      errorDescription:
-        'token endpoint returned 2xx without access_token/issued_token_type/token_type',
+      errorDescription: 'token endpoint returned a malformed or unsupported access-token response',
       retryable: false,
       raw: body,
     }
@@ -179,9 +203,44 @@ function parseSuccess(status: number, body: Record<string, unknown>): TokenExcha
     raw: body,
   }
   const expiresIn = body['expires_in']
-  if (typeof expiresIn === 'number' && Number.isFinite(expiresIn)) out.expiresIn = expiresIn
+  if (expiresIn !== undefined) {
+    if (typeof expiresIn !== 'number' || !Number.isInteger(expiresIn) || expiresIn <= 0) {
+      return {
+        ok: false,
+        status,
+        error: 'invalid_response',
+        errorDescription: 'token endpoint returned malformed expires_in',
+        retryable: false,
+        raw: body,
+      }
+    }
+    out.expiresIn = expiresIn
+  }
   const scope = body['scope']
-  if (typeof scope === 'string' && scope.length > 0) out.scope = scope.split(' ')
+  if (scope !== undefined) {
+    if (typeof scope !== 'string' || scope.length === 0) {
+      return {
+        ok: false,
+        status,
+        error: 'invalid_response',
+        errorDescription: 'token endpoint returned malformed scope',
+        retryable: false,
+        raw: body,
+      }
+    }
+    const scopes = scope.split(' ')
+    if (scopes.some((token) => token.length === 0 || !KNOWN_SCOPES.has(token))) {
+      return {
+        ok: false,
+        status,
+        error: 'invalid_response',
+        errorDescription: 'token endpoint returned malformed or unknown scope',
+        retryable: false,
+        raw: body,
+      }
+    }
+    out.scope = scopes
+  }
   return out
 }
 
@@ -191,7 +250,7 @@ function parseFailure(status: number, body: unknown): TokenExchangeFailure {
       ok: false,
       status,
       error: body['error'],
-      retryable: false,
+      retryable: body['error'] === 'server_error' && status >= 500,
       raw: body,
     }
     if (typeof body['error_description'] === 'string') {
@@ -279,6 +338,8 @@ export type ExchangeRequestRejectReason =
   | 'missing-subject-token'
   | 'undecodable-subject-token'
   | 'unsupported-subject-token-type'
+  | 'missing-requested-token-type'
+  | 'unsupported-requested-token-type'
   | 'missing-resource'
   | 'resource-substitution'
   | 'missing-client-id'
@@ -289,6 +350,7 @@ export type ExchangeRequestRejectReason =
   | 'unexpected-actor-token'
   | 'issuer-client-mismatch'
   | 'message-scope-requires-subject-assertion'
+  | 'missing-scope'
   | 'unknown-scope'
 
 /**
@@ -338,9 +400,6 @@ const SINGLE_VALUED_PARAMS = [
   'client_assertion',
   'client_assertion_type',
 ] as const
-
-/** The v0.1 scope registry as a set — requested scopes outside it are rejected. */
-const KNOWN_SCOPES: ReadonlySet<string> = new Set(OAUTH_FEDERATION_SCOPES)
 
 /** Decode a JWT's protected header without verifying anything; null when undecodable. */
 function tryDecodeHeader(jwt: string): { typ?: string } | null {
@@ -404,6 +463,17 @@ export function evaluateTokenExchangeRequest(
   if (params.get('subject_token_type') !== OAUTH_TOKEN_TYPE_JWT) {
     return { ok: false, error: 'invalid_request', reason: 'unsupported-subject-token-type' }
   }
+  const subjectHeader = tryDecodeHeader(subjectToken)
+  if (subjectHeader === null) {
+    return { ok: false, error: 'invalid_request', reason: 'undecodable-subject-token' }
+  }
+  const requestedTokenType = params.get('requested_token_type')
+  if (requestedTokenType === null || requestedTokenType.length === 0) {
+    return { ok: false, error: 'invalid_request', reason: 'missing-requested-token-type' }
+  }
+  if (requestedTokenType !== OAUTH_TOKEN_TYPE_ACCESS_TOKEN) {
+    return { ok: false, error: 'invalid_request', reason: 'unsupported-requested-token-type' }
+  }
   // v0.1 sends NO actor token — the actor is derived from the authenticated
   // client. Any actor_token/actor_token_type present is a deferred-feature
   // request and fails closed rather than being silently ignored.
@@ -429,6 +499,9 @@ export function evaluateTokenExchangeRequest(
   }
   if (params.get('client_assertion_type') !== OAUTH_CLIENT_ASSERTION_TYPE_JWT_BEARER) {
     return { ok: false, error: 'invalid_client', reason: 'unsupported-client-assertion-type' }
+  }
+  if (tryDecodeHeader(clientAssertion) === null) {
+    return { ok: false, error: 'invalid_client', reason: 'undecodable-client-assertion' }
   }
   // RFC 7523 §3: the client assertion's `iss` and `sub` are the client_id.
   // A decodable assertion naming a DIFFERENT party than the request's
@@ -471,7 +544,10 @@ export function evaluateTokenExchangeRequest(
     return { ok: false, error: 'invalid_request', reason: 'undecodable-subject-token' }
   }
   const scope = params.get('scope')
-  const scopes = scope === null || scope.length === 0 ? [] : scope.split(' ')
+  if (scope === null || scope.length === 0) {
+    return { ok: false, error: 'invalid_scope', reason: 'missing-scope' }
+  }
+  const scopes = scope.split(' ')
   // Requested scopes are restricted to the known v0.1 registry. This kills a
   // smuggling class: e.g. "a2a:message.send\ta2a:task.read" splits (on the
   // RFC 6749 space delimiter) into ONE unknown token that would otherwise
@@ -488,8 +564,7 @@ export function evaluateTokenExchangeRequest(
   // UNVERIFIED typ header; verifyTokenExchange re-checks on the VERIFIED
   // typ.
   if (scopesRequireSubjectAssertion(scopes)) {
-    const header = tryDecodeHeader(subjectToken)
-    if (header !== null && header.typ === OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION) {
+    if (subjectHeader.typ === OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION) {
       return {
         ok: false,
         error: 'invalid_request',

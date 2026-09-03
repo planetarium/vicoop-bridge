@@ -7,8 +7,9 @@
 // issuer and verifier pin the exact same constants.
 //
 // THE documented STS entry point is `verifyTokenExchange(params, options)`:
-// it runs the fetch-only shape gate, cryptographically verifies BOTH the
-// subject assertion and the `private_key_jwt` client assertion, enforces
+// it runs the fetch-only shape gate, requires receiver-owned policy approval
+// before any DID resolution, cryptographically verifies BOTH the subject
+// assertion and the `private_key_jwt` client assertion, enforces
 // `subject_token.iss == client_id` on the VERIFIED claims, and only then
 // returns a `DerivedAuthorizationContext`. It is the ONLY function here that
 // yields an authorization decision. `evaluateTokenExchangeRequest` (fetch-only
@@ -51,7 +52,10 @@ import {
   OAUTH_FEDERATION_TYP_CLIENT_ASSERTION,
   OAUTH_FEDERATION_TYP_SUBJECT_ASSERTION,
   OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION,
+  isOAuthFederationAbsoluteUri,
+  isOAuthFederationMethodUri,
   scopesRequireSubjectAssertion,
+  type OAuthFederationScope,
   type TokenExchangeErrorCode,
 } from './oauth-federation.js'
 
@@ -64,10 +68,12 @@ export type AssertionRejectReason =
   | 'missing-claim'
   | 'wrong-audience'
   | 'subject-mismatch'
+  | 'invalid-lifetime'
   | 'ttl-exceeded'
   | 'not-yet-valid'
   | 'expired'
   | 'invalid-signature'
+  | 'invalid-method'
   | 'replayed-jti'
 
 export type AssertionVerifyOutcome =
@@ -77,18 +83,24 @@ export type AssertionVerifyOutcome =
 /**
  * Minimal DID-document shape the verifier consumes: `verificationMethod`
  * entries carrying an Ed25519 `publicKeyJwk` (`{ kty: "OKP", crv: "Ed25519",
- * x }`), and an `assertionMethod` relation listing the AUTHORIZED method ids.
- * A key present in `verificationMethod` but absent from `assertionMethod` is
- * NOT authorized to sign assertions.
+ * x }`), and an `assertionMethod` relation listing AUTHORIZED string/id-only
+ * references or full embedded methods. A referenced key present in
+ * `verificationMethod` but absent from `assertionMethod` is NOT authorized to
+ * sign assertions; embedded methods receive the same strict key checks.
  */
+export type IssuerVerificationMethod = {
+  id: string
+  type?: string
+  controller?: string
+  publicKeyJwk?: Record<string, unknown>
+  publicKeyMultibase?: unknown
+  [key: string]: unknown
+}
+
 export type IssuerDidDocument = {
   id: string
-  verificationMethod?: {
-    id: string
-    publicKeyJwk?: Record<string, unknown>
-    [key: string]: unknown
-  }[]
-  assertionMethod?: (string | { id: string })[]
+  verificationMethod?: IssuerVerificationMethod[]
+  assertionMethod?: (string | IssuerVerificationMethod)[]
   [key: string]: unknown
 }
 
@@ -98,8 +110,11 @@ export type IssuerDidDocument = {
  * 600 s + 60 s); an unbounded set is acceptable only for fixture runs.
  */
 export type AssertionReplayCache = {
-  /** Returns true when the tuple was newly recorded, false on replay. */
-  register(tuple: { issuer: string; jti: string }): boolean
+  /**
+   * Atomically register a tuple: true when newly recorded, false on replay.
+   * Async results support shared database/Redis adapters.
+   */
+  register(tuple: { issuer: string; jti: string }): boolean | Promise<boolean>
 }
 
 /** Test-scale replay cache — never evicts; see {@link AssertionReplayCache}. */
@@ -125,7 +140,11 @@ export type VerifyAssertionExpectations = {
 }
 
 export type VerifyAssertionOptions = {
-  /** Exact issuer DIDs the receiver trusts. Checked before any resolution. */
+  /**
+   * Issuer DIDs eligible for resolution. This SSRF allowlist is checked
+   * before any DID fetch, but is not caller authorization by itself; the
+   * combined exchange path separately requires candidate policy approval.
+   */
   trustedIssuers: ReadonlySet<string>
   /**
    * Resolve a TRUSTED issuer's DID document (offline in fixture runs;
@@ -146,11 +165,21 @@ const KNOWN_TYPS: ReadonlySet<string> = new Set([
   OAUTH_FEDERATION_TYP_CLIENT_ASSERTION,
 ])
 
-const assertionMethodIds = (doc: IssuerDidDocument): string[] => {
-  if (!Array.isArray(doc.assertionMethod)) return []
-  return doc.assertionMethod
-    .map((entry) => (typeof entry === 'string' ? entry : entry.id))
-    .filter((id) => typeof id === 'string' && id.length > 0)
+const authorizedAssertionMethod = (
+  doc: IssuerDidDocument,
+  kid: string,
+): IssuerVerificationMethod | undefined => {
+  if (!Array.isArray(doc.assertionMethod)) return undefined
+  const relationship = doc.assertionMethod.find((entry) =>
+    typeof entry === 'string'
+      ? entry === kid
+      : typeof entry === 'object' && entry !== null && entry.id === kid,
+  )
+  if (relationship === undefined) return undefined
+  if (typeof relationship === 'object' && Object.keys(relationship).some((key) => key !== 'id')) {
+    return relationship
+  }
+  return doc.verificationMethod?.find((method) => method.id === kid)
 }
 
 const audienceMatches = (aud: JWTPayload['aud'], expected: string): boolean => {
@@ -158,6 +187,27 @@ const audienceMatches = (aud: JWTPayload['aud'], expected: string): boolean => {
   if (Array.isArray(aud)) return aud.length === 1 && aud[0] === expected
   return false
 }
+
+const isIssuerFragmentDidUrl = (kid: string, issuer: string): boolean => {
+  const delimiter = kid.indexOf('#')
+  if (
+    delimiter !== issuer.length ||
+    kid.slice(0, delimiter) !== issuer ||
+    delimiter === kid.length - 1 ||
+    kid.indexOf('#', delimiter + 1) !== -1 ||
+    !isOAuthFederationAbsoluteUri(kid)
+  ) {
+    return false
+  }
+  return kid.startsWith('did:')
+}
+
+const isPublicEd25519Jwk = (jwk: Record<string, unknown>): boolean =>
+  jwk['kty'] === 'OKP' &&
+  jwk['crv'] === 'Ed25519' &&
+  typeof jwk['x'] === 'string' &&
+  jwk['x'].length > 0 &&
+  !Object.hasOwn(jwk, 'd')
 
 /**
  * Verify one profile assertion JWT against the expectations of a
@@ -212,18 +262,34 @@ export async function verifyOAuthFederationAssertion(
     return { ok: false, reason: 'untrusted-issuer', detail: issuer }
   }
 
+  if (!isIssuerFragmentDidUrl(header.kid, issuer)) {
+    return {
+      ok: false,
+      reason: 'kid-not-authorized',
+      detail: `kid is not an absolute fragment DID URL under issuer: ${header.kid}`,
+    }
+  }
+
   // 4. kid must be a verification method the issuer DID document authorizes
   //    under `assertionMethod`.
   const doc = options.resolveIssuerDocument(issuer)
   if (doc === undefined || doc.id !== issuer) {
     return { ok: false, reason: 'untrusted-issuer', detail: `no issuer document: ${issuer}` }
   }
-  if (!assertionMethodIds(doc).includes(header.kid)) {
-    return { ok: false, reason: 'kid-not-authorized', detail: header.kid }
-  }
-  const method = doc.verificationMethod?.find((vm) => vm.id === header.kid)
-  if (method?.publicKeyJwk === undefined) {
-    return { ok: false, reason: 'kid-not-authorized', detail: `no publicKeyJwk: ${header.kid}` }
+  const method = authorizedAssertionMethod(doc, header.kid)
+  if (
+    method === undefined ||
+    method.controller !== issuer ||
+    method.type !== 'JsonWebKey' ||
+    method.publicKeyJwk === undefined ||
+    !isPublicEd25519Jwk(method.publicKeyJwk) ||
+    Object.hasOwn(method, 'publicKeyMultibase')
+  ) {
+    return {
+      ok: false,
+      reason: 'kid-not-authorized',
+      detail: `verification method is not a public issuer-controlled JsonWebKey Ed25519 method: ${header.kid}`,
+    }
   }
 
   // 5. Claim profile. Presence checks enforce the claim's TYPE, not just
@@ -247,6 +313,9 @@ export async function verifyOAuthFederationAssertion(
   const iat = payload.iat as number
   const exp = payload.exp as number
   const verifiedAt = Math.floor(verifiedAtMs / 1000)
+  if (exp <= iat) {
+    return { ok: false, reason: 'invalid-lifetime', detail: 'exp must be greater than iat' }
+  }
   if (exp - iat > MAX_TTL_SECONDS) {
     return { ok: false, reason: 'ttl-exceeded' }
   }
@@ -284,8 +353,12 @@ export async function verifyOAuthFederationAssertion(
   } else {
     // Platform-subject assertion: requires the method claim; the subject is
     // a platform principal, never the issuer itself.
-    if (typeof payload[OAUTH_FEDERATION_CLAIM_METHOD] !== 'string') {
+    const methodClaim = payload[OAUTH_FEDERATION_CLAIM_METHOD]
+    if (typeof methodClaim !== 'string' || methodClaim.length === 0) {
       return { ok: false, reason: 'missing-claim', detail: OAUTH_FEDERATION_CLAIM_METHOD }
+    }
+    if (!isOAuthFederationMethodUri(methodClaim)) {
+      return { ok: false, reason: 'invalid-method', detail: methodClaim }
     }
     if (payload.sub === issuer) {
       return { ok: false, reason: 'subject-mismatch', detail: 'sub equals iss' }
@@ -311,7 +384,7 @@ export async function verifyOAuthFederationAssertion(
   // 7. Replay posture: only a caching verifier gets one-time semantics.
   //    (`jti` is guaranteed a non-empty string by the layer-5 claim checks.)
   if (options.replayCache !== undefined) {
-    if (!options.replayCache.register({ issuer, jti: payload.jti as string })) {
+    if (!(await options.replayCache.register({ issuer, jti: payload.jti as string }))) {
       return { ok: false, reason: 'replayed-jti' }
     }
   }
@@ -379,7 +452,8 @@ export async function verifyClientAssertion(
  * platform subject, for both the message path (subject assertion) and the
  * task path (task-continuation assertion, whose `sub` is the ORIGINATING
  * platform subject) — and `actor` is the authenticated `client_id`. Produced
- * ONLY by {@link verifyTokenExchange}, never by the fetch-only shape gate.
+ * ONLY by {@link verifyTokenExchange} after its required policy gate and
+ * cryptographic checks, never by the fetch-only shape gate.
  *
  * `task_id` is present IFF the subject token was a task-continuation
  * assertion (taken from its VERIFIED `mentionable_task_id` claim). When it
@@ -403,7 +477,36 @@ export type DerivedAuthorizationContext = {
   task_id?: string
 }
 
-export type VerifyTokenExchangeOptions = VerifyAssertionOptions & {
+/**
+ * Unverified, exact-string policy lookup key decoded before any issuer-owned
+ * network fetch. It is safe only as input to receiver-owned allowlist/task
+ * state lookup; cryptographic verification remains mandatory afterward.
+ */
+export type TokenExchangePolicyCandidate =
+  | {
+      readonly kind: 'platform'
+      readonly issuer: string
+      readonly subject: string
+      readonly method: string
+      readonly resource: string
+      readonly scopes: readonly OAuthFederationScope[]
+    }
+  | {
+      readonly kind: 'continuation'
+      readonly issuer: string
+      readonly subject: string
+      readonly taskId: string
+      readonly resource: string
+      readonly scopes: readonly OAuthFederationScope[]
+    }
+
+export type VerifyTokenExchangeOptions = Omit<VerifyAssertionOptions, 'replayCache'> & {
+  /**
+   * REQUIRED replay cache for both assertion slots. Production adapters must
+   * be atomic across instances. Unlike the standalone assertion verifier,
+   * the combined STS path never permits a cache-less successful exchange.
+   */
+  replayCache: AssertionReplayCache
   /** The STS's own token endpoint — the `aud` both assertions must bind to. */
   tokenEndpoint: string
   /** Receiver clock at verification time (ISO 8601). */
@@ -415,15 +518,37 @@ export type VerifyTokenExchangeOptions = VerifyAssertionOptions & {
    * path. Throws when absent or empty.
    */
   expectedResource: string
+  /**
+   * REQUIRED pre-network receiver policy gate. It receives exact raw strings
+   * decoded from the unverified subject assertion and request after shape and
+   * type-specific claim checks. The candidate object and its scope array are
+   * frozen before the callback and before either assertion can trigger DID
+   * resolution. Return false for a policy miss. Throws propagate so callers
+   * can map policy-store/programming failures to `server_error`.
+   *
+   * A successful callback must also preserve its receiver-owned policy key
+   * outside this verifier and bind that key to the issued access token/task;
+   * the boolean result intentionally does not turn unverified data into an
+   * authorization context.
+   */
+  authorizeCandidateBeforeFetch: (
+    candidate: TokenExchangePolicyCandidate,
+  ) => boolean | Promise<boolean>
 }
 
 export type TokenExchangeVerifyResult =
-  | { ok: true; scopes: string[]; authorization: DerivedAuthorizationContext }
+  | { ok: true; scopes: OAuthFederationScope[]; authorization: DerivedAuthorizationContext }
   | {
       ok: false
       stage: 'shape'
       error: TokenExchangeErrorCode
       reason: ExchangeRequestRejectReason
+    }
+  | {
+      ok: false
+      stage: 'policy'
+      error: 'invalid_grant'
+      reason: 'candidate-not-authorized'
     }
   | {
       ok: false
@@ -441,19 +566,22 @@ export type TokenExchangeVerifyResult =
  * THE required STS entry point for authorizing an RFC 8693 token exchange
  * under this profile. It (1) runs the fetch-only shape gate
  * ({@link evaluateTokenExchangeRequest}) with the mandatory `expectedResource`
- * binding, (2) cryptographically verifies the `private_key_jwt` client
- * assertion ({@link verifyClientAssertion}), (3) cryptographically verifies
+ * binding, (2) decodes the exact platform tuple or continuation task key and
+ * requires the receiver-owned `authorizeCandidateBeforeFetch` policy gate,
+ * (3) cryptographically verifies the `private_key_jwt` client assertion
+ * ({@link verifyClientAssertion}), (4) cryptographically verifies
  * the subject assertion ({@link verifyOAuthFederationAssertion}) — a
  * task-continuation assertion when the subject token declares that `typ`
  * (task-scope re-exchange, #618 v0.1 amendment 2), a platform-subject
- * assertion otherwise — (4) re-checks `subject_token.iss == client_id` AND
+ * assertion otherwise — (5) re-checks `subject_token.iss == client_id` AND
  * the typ/scope rule (a continuation subject covers task scopes ONLY) on the
- * VERIFIED claims, and only then (5) returns the
+ * VERIFIED claims, and only then (6) returns the
  * {@link DerivedAuthorizationContext} — including the verified
  * `mentionable_task_id` as `task_id` for a continuation exchange. Both
- * assertions bind to `tokenEndpoint` as `aud`; both are single-use when a
- * `replayCache` is supplied. Nothing short of an `ok: true` from THIS
- * function authorizes an exchange.
+ * assertions bind to `tokenEndpoint` as `aud`; the REQUIRED `replayCache`
+ * makes both single-use. Nothing short of an `ok: true` from THIS
+ * function plus the receiver-owned policy key retained by the callback may
+ * authorize token issuance.
  *
  * `expectedResource` is required — an absent/empty value throws, because the
  * resource-substitution defense must not be skippable on the authenticated
@@ -468,11 +596,15 @@ export async function verifyTokenExchange(
       'verifyTokenExchange: options.expectedResource is required — the resource-substitution defense must not be skippable',
     )
   }
-
-  const assertionOptions: VerifyAssertionOptions = {
-    trustedIssuers: options.trustedIssuers,
-    resolveIssuerDocument: options.resolveIssuerDocument,
-    ...(options.replayCache !== undefined ? { replayCache: options.replayCache } : {}),
+  if (typeof options.authorizeCandidateBeforeFetch !== 'function') {
+    throw new TypeError(
+      'verifyTokenExchange: options.authorizeCandidateBeforeFetch is required — receiver policy must run before DID resolution',
+    )
+  }
+  if (options.replayCache === undefined || typeof options.replayCache.register !== 'function') {
+    throw new TypeError(
+      'verifyTokenExchange: options.replayCache is required — the combined STS path must reject assertion replay',
+    )
   }
 
   // 1. Shape gate (unverified) — a required precondition, not authorization.
@@ -488,7 +620,76 @@ export async function verifyTokenExchange(
   const clientAssertion = params.get('client_assertion') as string
   const subjectToken = params.get('subject_token') as string
 
-  // 2. Verify the client assertion (this authenticates client_id).
+  // 2. Receiver-owned policy before network. Decode only enough unverified
+  //    subject data to build the exact lookup key. Type-specific claims are
+  //    validated before invoking the callback, so it never receives a
+  //    partial candidate and malformed input never reaches a resolver.
+  let subjectHeader
+  let subjectPayload: JWTPayload
+  try {
+    subjectHeader = decodeProtectedHeader(subjectToken)
+    subjectPayload = decodeJwt(subjectToken)
+  } catch (error) {
+    return { ok: false, stage: 'subject-assertion', reason: 'malformed', detail: String(error) }
+  }
+  const issuer = shape.unverifiedSubjectClaims.iss
+  const subject = shape.unverifiedSubjectClaims.sub
+  const resource = params.get('resource') as string
+  const scopes = Object.freeze([...shape.scopes]) as readonly OAuthFederationScope[]
+  let candidate: TokenExchangePolicyCandidate
+  if (
+    subjectHeader.typ !== OAUTH_FEDERATION_TYP_SUBJECT_ASSERTION &&
+    subjectHeader.typ !== OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION
+  ) {
+    return {
+      ok: false,
+      stage: 'subject-assertion',
+      reason: 'wrong-typ',
+      detail: String(subjectHeader.typ),
+    }
+  }
+  if (subjectHeader.typ === OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION) {
+    const taskId = subjectPayload[OAUTH_FEDERATION_CLAIM_TASK_ID]
+    if (typeof taskId !== 'string' || taskId.length === 0) {
+      return {
+        ok: false,
+        stage: 'subject-assertion',
+        reason: 'missing-claim',
+        detail: OAUTH_FEDERATION_CLAIM_TASK_ID,
+      }
+    }
+    candidate = Object.freeze({ kind: 'continuation', issuer, subject, taskId, resource, scopes })
+  } else {
+    const method = subjectPayload[OAUTH_FEDERATION_CLAIM_METHOD]
+    if (typeof method !== 'string' || method.length === 0) {
+      return {
+        ok: false,
+        stage: 'subject-assertion',
+        reason: 'missing-claim',
+        detail: OAUTH_FEDERATION_CLAIM_METHOD,
+      }
+    }
+    if (!isOAuthFederationMethodUri(method)) {
+      return { ok: false, stage: 'subject-assertion', reason: 'invalid-method', detail: method }
+    }
+    candidate = Object.freeze({ kind: 'platform', issuer, subject, method, resource, scopes })
+  }
+  if (!(await options.authorizeCandidateBeforeFetch(candidate))) {
+    return {
+      ok: false,
+      stage: 'policy',
+      error: 'invalid_grant',
+      reason: 'candidate-not-authorized',
+    }
+  }
+
+  const assertionOptions: VerifyAssertionOptions = {
+    trustedIssuers: options.trustedIssuers,
+    resolveIssuerDocument: options.resolveIssuerDocument,
+    replayCache: options.replayCache,
+  }
+
+  // 3. Verify the client assertion (this authenticates client_id).
   const clientOutcome = await verifyClientAssertion(
     clientAssertion,
     { clientId, tokenEndpoint: options.tokenEndpoint, verifiedAt: options.verifiedAt },
@@ -503,20 +704,14 @@ export async function verifyTokenExchange(
     }
   }
 
-  // 3. Verify the subject assertion. The expected `typ` comes from the
+  // 4. Verify the subject assertion. The expected `typ` comes from the
   //    UNVERIFIED header — the verifier enforces an exact `typ` match, and the
   //    shape gate already rejected a continuation subject carrying message
   //    scopes, so a lie here can only produce a `wrong-typ` rejection.
-  let subjectTyp: string = OAUTH_FEDERATION_TYP_SUBJECT_ASSERTION
-  try {
-    if (
-      decodeProtectedHeader(subjectToken).typ === OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION
-    ) {
-      subjectTyp = OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION
-    }
-  } catch {
-    // Leave as subject-assertion; verification rejects a malformed token.
-  }
+  const subjectTyp =
+    subjectHeader.typ === OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION
+      ? OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION
+      : OAUTH_FEDERATION_TYP_SUBJECT_ASSERTION
   const subjectOutcome = await verifyOAuthFederationAssertion(
     subjectToken,
     { typ: subjectTyp, tokenEndpoint: options.tokenEndpoint, verifiedAt: options.verifiedAt },
@@ -532,13 +727,13 @@ export async function verifyTokenExchange(
   }
   const isContinuation = subjectTyp === OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION
 
-  // 4. Bindings on VERIFIED claims. The shape gate checked these on
+  // 5. Bindings on VERIFIED claims. The shape gate checked these on
   //    unverified bytes; these are the enforced, authenticated checks.
-  //    4a. The subject assertion's issuer must be the authenticated client.
+  //    5a. The subject assertion's issuer must be the authenticated client.
   if (subjectOutcome.payload.iss !== clientId) {
     return { ok: false, stage: 'binding', reason: 'issuer-client-mismatch' }
   }
-  //    4b. Typ/scope rule (#618 v0.1 amendment 2): a continuation subject
+  //    5b. Typ/scope rule (#618 v0.1 amendment 2): a continuation subject
   //    covers task-operation scopes ONLY — the verified typ is authoritative,
   //    so re-check here even though the shape gate screened the unverified
   //    header.
@@ -546,13 +741,13 @@ export async function verifyTokenExchange(
     return { ok: false, stage: 'binding', reason: 'message-scope-requires-subject-assertion' }
   }
 
-  // 5. Derived authorization — fixed delegation semantics from VERIFIED
+  // 6. Derived authorization — fixed delegation semantics from VERIFIED
   //    claims. `sub` is a non-empty string (verifier's required-claim check);
   //    for a continuation exchange the VERIFIED `mentionable_task_id`
   //    (guaranteed a non-empty string by the claims profile) binds the task.
   return {
     ok: true,
-    scopes: shape.scopes,
+    scopes: [...scopes],
     authorization: {
       purpose: 'delegation',
       principal: subjectOutcome.payload.sub as string,
