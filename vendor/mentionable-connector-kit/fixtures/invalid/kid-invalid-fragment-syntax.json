@@ -1,0 +1,25 @@
+{
+  "jwt": "eyJhbGciOiJFZERTQSIsInR5cCI6Im1lbnRpb25hYmxlLXN1YmplY3QtYXNzZXJ0aW9uK2p3dCIsImtpZCI6ImRpZDp3ZWI6Y29ubmVjdG9yLm9hdXRoLWZpeHR1cmVzLm1lbnRpb25hYmxlLmRldiMlenoifQ.eyJtZW50aW9uYWJsZV9tZXRob2QiOiJ1cm46bWVudGlvbmFibGU6YXV0aDpzbGFjay13b3Jrc3BhY2UtbWVtYmVyOnYwLjEiLCJpc3MiOiJkaWQ6d2ViOmNvbm5lY3Rvci5vYXV0aC1maXh0dXJlcy5tZW50aW9uYWJsZS5kZXYiLCJzdWIiOiJzbGFjazpUMDEyMzQ1Ni9VMDQ1Njc4OSIsImF1ZCI6Imh0dHBzOi8vc3RzLm9hdXRoLWZpeHR1cmVzLm1lbnRpb25hYmxlLmRldi9vYXV0aC90b2tlbiIsImlhdCI6MTc4NzA5NzYwMCwiZXhwIjoxNzg3MDk3OTAwLCJqdGkiOiJiMGExYzJkMy1lNGY1LTRhNmItOGM3ZC04ZTlmMGExYjJjM2UifQ.wvU50twzeZo0U5Y3q3Ie5yoF3fAZ4A7f_hhhHNMF7IZYpsr7CJrUrfGWY_Xme86-NsML0ac0lXMUaYGX5xjoBQ",
+  "verification": {
+    "typ": "mentionable-subject-assertion+jwt",
+    "tokenEndpoint": "https://sts.oauth-fixtures.mentionable.dev/oauth/token",
+    "verifiedAt": "2026-08-19T00:01:00Z"
+  },
+  "issuerDocument": {
+    "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/jwk/v1"],
+    "id": "did:web:connector.oauth-fixtures.mentionable.dev",
+    "verificationMethod": [
+      {
+        "id": "did:web:connector.oauth-fixtures.mentionable.dev#%zz",
+        "type": "JsonWebKey",
+        "controller": "did:web:connector.oauth-fixtures.mentionable.dev",
+        "publicKeyJwk": {
+          "crv": "Ed25519",
+          "x": "UGfideXk63XnzqYdisiTAZ64iAHklpZox4h4kECItXU",
+          "kty": "OKP"
+        }
+      }
+    ],
+    "assertionMethod": ["did:web:connector.oauth-fixtures.mentionable.dev#%zz"]
+  }
+}

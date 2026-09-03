@@ -2,7 +2,7 @@
 
 This directory contains the OAuth federation wire registry, request evaluator,
 and reference verifier from `planetarium/mentionable` commit
-`f32c8898c7d81b254ec9a562ea2892525db14de6` (`packages/connector-kit`).
+`61d86728e841b0ca796c86364b2fa881ef66c87d` (`packages/connector-kit`).
 
 The upstream package is a `0.0.0` unpublished workspace package whose
 `workspace:*` dependencies cannot currently be installed from a consumer

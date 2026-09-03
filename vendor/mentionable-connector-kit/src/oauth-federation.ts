@@ -1,13 +1,12 @@
 // DID-backed OAuth federation profile v0.1 — wire constants (#618, #619).
 //
-// This module IS the profile's wire registry until the docs/spec document is
-// extracted (implementation-first decision recorded on #618): the typed
-// constants below are the contract both the Connector issuer/client half
-// (this package) and consuming STS / resource-server implementations
-// (planetarium/vicoop-bridge#487) import. Keep it dependency-free and
-// runtime-neutral — no node:crypto, no fetch; issuance lives under the
-// `@mentionable/connector-kit/signing` subpath, the exchange client and
-// discovery helpers next door in this package's main entry.
+// The normative profile is docs/spec/oauth-federation-v0.1.md. The typed
+// constants below pin its byte-level wire registry for both the Connector
+// issuer/client half (this package) and consuming STS / resource-server
+// implementations (planetarium/vicoop-bridge#487) import. Keep it
+// dependency-free and runtime-neutral — no node:crypto, no fetch; issuance
+// lives under the `@mentionable/connector-kit/signing` subpath, the exchange
+// client and discovery helpers next door in this package's main entry.
 //
 // Profile summary (settled in #618: two decision comments + the v0.1 scope
 // amendment "direct Connector delegation only", which supersedes the earlier
@@ -95,6 +94,9 @@ export const OAUTH_TOKEN_TYPE_ACCESS_TOKEN = 'urn:ietf:params:oauth:token-type:a
 export const OAUTH_CLIENT_ASSERTION_TYPE_JWT_BEARER =
   'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
 
+/** RFC 8414 metadata value for RFC 7523 JWT client authentication. */
+export const OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_PRIVATE_KEY_JWT = 'private_key_jwt'
+
 // ---------------------------------------------------------------------------
 // JWT typing (RFC 8725 §3.11 explicit typing)
 // ---------------------------------------------------------------------------
@@ -152,6 +154,114 @@ export const OAUTH_FEDERATION_TYP_CLIENT_ASSERTION = 'mentionable-client-asserti
  * `credentialSubject.method`.
  */
 export const OAUTH_FEDERATION_CLAIM_METHOD = 'mentionable_method'
+
+const isIpv4Address = (value: string): boolean => {
+  const pieces = value.split('.')
+  return (
+    pieces.length === 4 &&
+    pieces.every(
+      (piece) =>
+        /^(?:0|[1-9][0-9]{0,2})$/.test(piece) && Number(piece) >= 0 && Number(piece) <= 255,
+    )
+  )
+}
+
+const isIpv6Address = (value: string): boolean => {
+  let address = value
+  const lastColon = address.lastIndexOf(':')
+  const ipv4Tail = address.slice(lastColon + 1)
+  if (ipv4Tail.includes('.')) {
+    if (!isIpv4Address(ipv4Tail) || lastColon < 0) return false
+    address = `${address.slice(0, lastColon)}:0:0`
+  }
+  if (!/^[0-9A-Fa-f:]+$/.test(address)) return false
+  const compression = address.indexOf('::')
+  if (compression !== -1 && address.indexOf('::', compression + 2) !== -1) return false
+  const groups = address.split(':').filter((piece) => piece.length > 0)
+  if (groups.some((piece) => piece.length > 4)) return false
+  const groupCount = groups.length
+  return compression === -1 ? groupCount === 8 : groupCount < 8
+}
+
+const isValidAuthorityPort = (value: string): boolean =>
+  /^[0-9]+$/.test(value) && Number(value) <= 65_535
+
+const hasValidAuthoritySyntax = (remainder: string): boolean => {
+  if (!remainder.startsWith('//')) {
+    return !remainder.includes('[') && !remainder.includes(']')
+  }
+  const authorityEndOffset = remainder.slice(2).search(/[/?#]/)
+  const authorityEnd = authorityEndOffset === -1 ? remainder.length : authorityEndOffset + 2
+  const authority = remainder.slice(2, authorityEnd)
+  if (/[[\]]/.test(remainder.slice(authorityEnd))) return false
+
+  const firstAt = authority.indexOf('@')
+  if (firstAt !== authority.lastIndexOf('@')) return false
+  if (firstAt !== -1) {
+    const userInfo = authority.slice(0, firstAt)
+    if (!/^(?:[A-Za-z0-9._~!$&'()*+,;=:]|%[0-9A-Fa-f]{2})*$/.test(userInfo)) return false
+  }
+  const hostAndPort = authority.slice(firstAt + 1)
+  if (!hostAndPort.includes('[') && !hostAndPort.includes(']')) {
+    const firstColon = hostAndPort.indexOf(':')
+    if (firstColon !== hostAndPort.lastIndexOf(':')) return false
+    const host = firstColon === -1 ? hostAndPort : hostAndPort.slice(0, firstColon)
+    const port = firstColon === -1 ? undefined : hostAndPort.slice(firstColon + 1)
+    if (!/^(?:[A-Za-z0-9._~!$&'()*+,;=-]|%[0-9A-Fa-f]{2})+$/.test(host)) return false
+    return port === undefined || isValidAuthorityPort(port)
+  }
+
+  const closingBracket = hostAndPort.indexOf(']')
+  if (
+    !hostAndPort.startsWith('[') ||
+    closingBracket <= 1 ||
+    hostAndPort.indexOf('[', 1) !== -1 ||
+    hostAndPort.indexOf(']', closingBracket + 1) !== -1
+  ) {
+    return false
+  }
+  const port = hostAndPort.slice(closingBracket + 1)
+  if (port.length > 0 && (!port.startsWith(':') || !isValidAuthorityPort(port.slice(1)))) {
+    return false
+  }
+
+  const literal = hostAndPort.slice(1, closingBracket)
+  return isIpv6Address(literal)
+}
+
+/**
+ * True when `value` is in the conservative absolute-URI lexical subset used
+ * by this profile. It accepts RFC 3986 ASCII URI characters and valid `%HH`
+ * escapes without WHATWG normalization, permits at most one fragment
+ * delimiter, and permits brackets only around an IPv6 host in an authority.
+ * Raw authority userinfo/host/port syntax is checked before parsing. A
+ * non-empty scheme-specific part is required. URL parsing is used only as a
+ * final structure check after the raw lexical checks have passed.
+ */
+export function isOAuthFederationAbsoluteUri(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  const schemeMatch = /^([A-Za-z][A-Za-z0-9+.-]*):(.*)$/.exec(value)
+  if (schemeMatch === null) return false
+  const remainder = schemeMatch[2]!
+  const schemeSpecificPart = remainder.split(/[?#]/, 1)[0]!
+  if (schemeSpecificPart.length === 0) return false
+  if ((remainder.match(/#/g)?.length ?? 0) > 1) return false
+  if (!/^(?:[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=-]|%[0-9A-Fa-f]{2})+$/.test(remainder)) {
+    return false
+  }
+  if (!hasValidAuthoritySyntax(remainder)) return false
+  try {
+    const parsed = new URL(value)
+    return !remainder.startsWith('//') || parsed.host.length > 0
+  } catch {
+    return false
+  }
+}
+
+/** Profile-specific alias documenting where the shared URI syntax is used. */
+export function isOAuthFederationMethodUri(value: unknown): value is string {
+  return isOAuthFederationAbsoluteUri(value)
+}
 
 /**
  * Profile-specific claim on a task-continuation assertion naming the bound
@@ -255,8 +365,9 @@ export function scopesRequireSubjectAssertion(scopes: Iterable<string>): boolean
 // ---------------------------------------------------------------------------
 
 /**
- * Token-endpoint error codes a conforming STS returns. All of them are
- * client faults: a Connector MUST NOT retry the same request — in particular
+ * Token-endpoint error codes a conforming STS returns. All except
+ * `server_error` are client faults: a Connector MUST NOT retry the same
+ * request — in particular
  * never on `invalid_request` (e.g. a subject-token issuer that is not the
  * authenticated client, per the #618 v0.1 amendment) or `invalid_grant`
  * (e.g. an expired or replayed assertion); it must surface the failure and
@@ -271,6 +382,8 @@ export const TOKEN_EXCHANGE_ERROR_CODES = [
   'invalid_scope',
   /** RFC 8693 §2.2.2 — unknown/unacceptable `resource` or `audience`. */
   'invalid_target',
+  /** Profile error used for transient STS-side failures. */
+  'server_error',
 ] as const
 
 export type TokenExchangeErrorCode = (typeof TOKEN_EXCHANGE_ERROR_CODES)[number]

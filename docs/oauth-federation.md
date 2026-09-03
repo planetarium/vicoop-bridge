@@ -24,15 +24,16 @@ operation independently of any profile, then dispatches authorization by that
 identifier. A future profile therefore supplies both exchange verification and
 resource authorization without being interpreted under Mentionable semantics.
 Each profile must also declare whether replay protection is required or not
-applicable; the core refuses issuance when a replay-required profile returns no
-single-use replay evidence.
+applicable. Replay-required profiles either return single-use evidence for the
+core to persist or register it atomically inside the verifier when the profile
+contract requires replay rejection before verification returns.
 
 ## Connector-kit dependency status
 
 The package boundary is intentional, but the copy under
 `vendor/mentionable-connector-kit` is temporary. The authoritative source is
 `packages/connector-kit` in the `planetarium/mentionable` repository. This
-bridge currently pins commit `f32c8898c7d81b254ec9a562ea2892525db14de6`
+bridge currently pins commit `61d86728e841b0ca796c86364b2fa881ef66c87d`
 because the upstream package is still an unpublished `0.0.0` workspace package
 whose `workspace:*` dependencies cannot be installed by a consumer repository.
 

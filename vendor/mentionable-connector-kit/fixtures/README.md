@@ -23,12 +23,12 @@ Connector self-assertion is REMOVED. Gateways/brokers, independent actors,
 arbitrary `actor_token` support, and actor-less authentication of relay
 subjects are deferred to a later profile version.
 
-**The spec document is deliberately deferred** (implementation-first decision
-on #618): until it lands, the typed constants in
-`packages/connector-kit/src/oauth-federation.ts` plus these fixtures ARE the
-wire contract. STS implementations (e.g. planetarium/vicoop-bridge#487) test
-against this directory offline; the fixture JSON files are standalone
-artifacts consumable without any Mentionable package.
+The normative profile is
+[`docs/spec/oauth-federation-v0.1.md`](../../../docs/spec/oauth-federation-v0.1.md).
+The typed constants in `packages/connector-kit/src/oauth-federation.ts` plus
+these fixtures pin its byte-level wire contract. STS implementations (e.g.
+planetarium/vicoop-bridge#487) test against this directory offline; the fixture
+JSON files are standalone artifacts consumable without any Mentionable package.
 
 ## Layout
 
@@ -50,10 +50,14 @@ artifacts consumable without any Mentionable package.
   principal = platform subject, actor = Connector DID) and a task-scope-only
   exchange whose `subject_token` is a task-continuation assertion
   (`expected.authorization` additionally pins `task_id`).
-- `invalid/` — security-failure cases: expired assertion, wrong `aud`, wrong
+- `invalid/` — security-failure cases: expired assertion, zero/negative or
+  excessive lifetime, wrong `aud`, wrong
   `typ`, wrong `alg` (an unsigned `alg: "none"` token — RFC 8725
-  alg-stripping), `kid` not authorized by the issuer DID, not-yet-valid, TTL
-  over the 600 s cap, tampered signature, a subject assertion issued by a
+  alg-stripping), invalid `mentionable_method`, a `kid` outside the issuer
+  fragment namespace or with malformed fragment-URI syntax, malformed issuer
+  controller/type/public Ed25519 JWK
+  (including private `d` or mixed multibase material), `kid` not authorized
+  by the issuer DID, not-yet-valid, tampered signature, a subject assertion issued by a
   DIFFERENT Connector than the authenticated `client_id` (the
   stolen/forwarded-assertion case — `issuer-client-mismatch`; the same
   reason also covers a decodable subject token with NO `iss` claim, since
@@ -66,7 +70,8 @@ artifacts consumable without any Mentionable package.
   exchange using a task-continuation `subject_token` (#618 decision 8 as
   amended — a continuation can never send new messages as the subject), a
   continuation assertion missing its mandatory `mentionable_task_id` claim
-  (`missing-claim`), and a scope token outside the v0.1 registry
+  (`missing-claim`), a missing/empty scope, a missing/wrong
+  `requested_token_type`, and a scope token outside the v0.1 registry
   (`invalid_scope` — the fixture's tab-embedded scope string is ONE unknown
   token after RFC 6749 space-splitting, closing a whitespace re-split
   smuggle).
@@ -78,6 +83,9 @@ artifacts consumable without any Mentionable package.
 Assertion fixtures carry `{ jwt, verification }`, where `verification` is
 the receiver-side binding (`typ` expected in that presentation slot, the
 token endpoint the `aud` must equal, and the receiver clock `verifiedAt`).
+Verification-method policy fixtures additionally carry an `issuerDocument`
+override whose deliberately malformed method must be used in place of the
+shared `issuer/did.json`.
 Exchange-request fixtures carry `{ params, evaluation }` — the exact
 form-encoded request parameters plus the target's canonical resource —
 and accept fixtures additionally pin `expected.authorization`, the context an
@@ -85,11 +93,15 @@ STS derives via the verified path. Two verification layers apply: the
 fetch-only shape gate (`evaluateTokenExchangeRequest`) is UNVERIFIED and
 returns only `{ scopes, unverifiedSubjectClaims }`, never an authorization
 decision; the authenticated `verifyTokenExchange` — the required STS entry
-point — verifies both the subject and the client assertion (each binding to
-the token endpoint as `aud`, with `expectedResource` mandatory) and only then
-produces `expected.authorization` (`{ purpose: "delegation", principal,
-actor }`). The reject reasons in `manifest.json` for `exchange-request`
-fixtures are shape-gate reasons.
+point — requires its receiver-owned `authorizeCandidateBeforeFetch` callback
+to approve the exact unverified platform tuple or continuation task key before
+any DID resolution, verifies both subject and client assertions (each binding
+to the token endpoint as `aud`, with `expectedResource` and a replay cache
+mandatory), and only after policy plus verification produces `expected.authorization`
+(`{ purpose: "delegation", principal, actor }`). The callback's caller must
+separately retain the matched local policy key for access-token/task binding.
+The reject reasons in `manifest.json` for `exchange-request` fixtures are
+shape-gate reasons.
 
 ## Regenerating
 

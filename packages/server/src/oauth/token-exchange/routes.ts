@@ -151,12 +151,10 @@ export function mountTokenExchangeRoutes(app: Hono, options: TokenExchangeRouteO
         TOKEN_EXCHANGE_GRANT_TYPE,
         ...(options.additionalGrantTypes ?? []),
       ]),
-      token_endpoint_auth_methods_supported: unique(
-        [
-          ...options.profiles.flatMap((profile) => [...profile.clientAuthMethods]),
-          ...(options.additionalTokenEndpointAuthMethods ?? []),
-        ],
-      ),
+      token_endpoint_auth_methods_supported: unique([
+        ...options.profiles.flatMap((profile) => [...profile.clientAuthMethods]),
+        ...(options.additionalTokenEndpointAuthMethods ?? []),
+      ]),
       token_endpoint_auth_signing_alg_values_supported: unique(
         options.profiles.flatMap((profile) => [...profile.clientAuthSigningAlgorithms]),
       ),
@@ -312,7 +310,12 @@ export function mountTokenExchangeRoutes(app: Hono, options: TokenExchangeRouteO
       );
     }
     if (!result.ok) return reject(result, { agentId, profileId: profile.id });
-    if (profile.replayProtection === 'required' && result.replays.length === 0) {
+    const profileManagedReplay = profile.replayPersistence === 'profile';
+    if (
+      profile.replayProtection === 'required' &&
+      !profileManagedReplay &&
+      result.replays.length === 0
+    ) {
       return reject(
         {
           ok: false,
@@ -326,26 +329,28 @@ export function mountTokenExchangeRoutes(app: Hono, options: TokenExchangeRouteO
       );
     }
 
-    try {
-      await consumeTokenExchangeReplays(options.sql, profile.id, result.replays);
-    } catch (error) {
-      const failure: TokenExchangeFailure =
-        error instanceof TokenExchangeReplayError
-          ? profile.replayFailure ?? {
-              ok: false,
-              status: 400,
-              error: 'invalid_request',
-              description: 'assertion replayed',
-              reason: 'replayed_jti',
-            }
-          : {
-              ok: false,
-              status: 500,
-              error: 'server_error',
-              description: 'token exchange temporarily unavailable',
-              reason: 'replay_store_failed',
-            };
-      return reject(failure, { agentId, profileId: profile.id });
+    if (!profileManagedReplay) {
+      try {
+        await consumeTokenExchangeReplays(options.sql, profile.id, result.replays);
+      } catch (error) {
+        const failure: TokenExchangeFailure =
+          error instanceof TokenExchangeReplayError
+            ? profile.replayFailure ?? {
+                ok: false,
+                status: 400,
+                error: 'invalid_request',
+                description: 'assertion replayed',
+                reason: 'replayed_jti',
+              }
+            : {
+                ok: false,
+                status: 500,
+                error: 'server_error',
+                description: 'token exchange temporarily unavailable',
+                reason: 'replay_store_failed',
+              };
+        return reject(failure, { agentId, profileId: profile.id });
+      }
     }
 
     const expiresAt = new Date(now.getTime() + TOKEN_EXCHANGE_ACCESS_TOKEN_TTL_SECONDS * 1000);

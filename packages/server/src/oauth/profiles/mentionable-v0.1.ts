@@ -5,22 +5,29 @@ import {
   evaluateTokenExchangeRequest,
   OAUTH_FEDERATION_CLAIM_METHOD,
   OAUTH_FEDERATION_CLAIM_TASK_ID,
+  OAUTH_FEDERATION_ASSERTION_MAX_TTL_SECONDS,
   OAUTH_FEDERATION_CLOCK_SKEW_SECONDS,
   OAUTH_FEDERATION_EXTENSION_URI,
   OAUTH_FEDERATION_SCOPES,
   OAUTH_FEDERATION_TYP_SUBJECT_ASSERTION,
   OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION,
+  OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_PRIVATE_KEY_JWT,
   OAUTH_TOKEN_TYPE_JWT,
 } from '@mentionable/connector-kit';
 import {
   verifyTokenExchange,
   type IssuerDidDocument,
+  type TokenExchangePolicyCandidate,
   type TokenExchangeVerifyResult,
 } from '@mentionable/connector-kit/signing';
-import { decodeJwt, decodeProtectedHeader, type JWTPayload } from 'jose';
+import { decodeJwt, decodeProtectedHeader } from 'jose';
 import { formatFederatedPrincipal, parseFederatedPrincipal } from '../../auth/principal.js';
 import type { DidDocumentResolver, ResolvedDidDocument } from '../../identity-vc/types.js';
-import { loadTokenExchangeTaskAuthorization } from '../token-exchange/store.js';
+import {
+  consumeTokenExchangeReplays,
+  loadTokenExchangeTaskAuthorization,
+  TokenExchangeReplayError,
+} from '../token-exchange/store.js';
 import type {
   TokenExchangeErrorCode,
   TokenExchangeFailure,
@@ -61,13 +68,13 @@ function decodeCandidate(token: string): CandidateAssertion | null {
 }
 
 function asConnectorKitDidDocument(doc: ResolvedDidDocument): IssuerDidDocument {
-  const assertionMethod: (string | { id: string })[] = [];
+  const assertionMethod: IssuerDidDocument['assertionMethod'] = [];
   for (const entry of Array.isArray(doc.assertionMethod) ? doc.assertionMethod : []) {
     if (typeof entry === 'string') {
       assertionMethod.push(entry);
     } else if (typeof entry === 'object' && entry !== null) {
-      const id = (entry as { id?: unknown }).id;
-      if (typeof id === 'string') assertionMethod.push({ id });
+      const value = entry as Record<string, unknown>;
+      if (typeof value.id === 'string') assertionMethod.push({ ...value, id: value.id });
     }
   }
   return {
@@ -77,23 +84,11 @@ function asConnectorKitDidDocument(doc: ResolvedDidDocument): IssuerDidDocument 
       ? doc.verificationMethod.flatMap((entry) => {
           if (typeof entry !== 'object' || entry === null) return [];
           const value = entry as Record<string, unknown>;
-          if (typeof value.id !== 'string' || value.controller !== doc.id) return [];
+          if (typeof value.id !== 'string') return [];
           return [{ ...value, id: value.id }];
         })
       : undefined,
     assertionMethod,
-  };
-}
-
-function verifiedReplayTuple(payload: JWTPayload): {
-  issuer: string;
-  jti: string;
-  expiresAt: Date;
-} {
-  return {
-    issuer: payload.iss as string,
-    jti: payload.jti as string,
-    expiresAt: new Date(((payload.exp as number) + OAUTH_FEDERATION_CLOCK_SKEW_SECONDS) * 1000),
   };
 }
 
@@ -127,6 +122,14 @@ function verificationError(result: Exclude<TokenExchangeVerifyResult, { ok: true
       reason: result.reason,
     };
   }
+  if (result.stage === 'policy') {
+    return {
+      status: 400,
+      error: result.error,
+      stage: result.stage,
+      reason: result.reason,
+    };
+  }
   return {
     status: 400,
     error: 'invalid_request',
@@ -140,6 +143,9 @@ export interface MentionableOAuthProfileOptions {
 }
 
 export const MENTIONABLE_OAUTH_PROFILE_ID = OAUTH_FEDERATION_EXTENSION_URI;
+
+class MentionablePolicyStoreError extends Error {}
+class MentionableReplayStoreError extends Error {}
 
 function failure(
   status: 400 | 401 | 500,
@@ -164,15 +170,14 @@ export function createMentionableOAuthProfile(
   return {
     id: MENTIONABLE_OAUTH_PROFILE_ID,
     replayProtection: 'required',
-    clientAuthMethods: ['private_key_jwt'],
+    replayPersistence: 'profile',
+    clientAuthMethods: [OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_PRIVATE_KEY_JWT],
     clientAuthSigningAlgorithms: ['EdDSA'],
     scopes: OAUTH_FEDERATION_SCOPES,
     subjectTokenTypes: [OAUTH_TOKEN_TYPE_JWT],
     authorizationServerMetadata: {
       mentionable_profile: OAUTH_FEDERATION_EXTENSION_URI,
     },
-    // Mentionable v0.1 pins replayed subject assertions to invalid_grant.
-    replayFailure: failure(400, 'invalid_grant', 'assertion replayed', 'replayed_jti'),
     recognizes(form) {
       const token = form.get('subject_token');
       if (!token) return false;
@@ -193,31 +198,13 @@ export function createMentionableOAuthProfile(
           'shape',
         );
       }
-      if (shape.scopes.length === 0) {
-        return failure(
-          400,
-          'invalid_scope',
-          'at least one scope is required',
-          'empty_scope',
-          'shape',
-        );
-      }
       return undefined;
     },
     async verify({ sql, form, tokenEndpoint, expectedResource, agentId, allowedCallers, now }) {
       const subjectToken = form.get('subject_token')!;
-      const candidate = decodeCandidate(subjectToken);
-      if (!candidate) {
-        return failure(
-          400,
-          'invalid_request',
-          'malformed subject assertion',
-          'malformed_subject',
-          'shape',
-        );
-      }
-
       let authorizationKey: string | undefined;
+      let policyCandidate: TokenExchangePolicyCandidate | undefined;
+      let issuerDocument: IssuerDidDocument | undefined;
       let trustedTask:
         | {
             principalId: string;
@@ -226,95 +213,125 @@ export function createMentionableOAuthProfile(
             taskId: string;
           }
         | undefined;
-      if (candidate.typ === OAUTH_FEDERATION_TYP_SUBJECT_ASSERTION) {
-        if (!candidate.method) {
-          return failure(
-            400,
-            'invalid_grant',
-            'subject assertion has no authentication method',
-            'missing_method',
-          );
-        }
-        authorizationKey =
-          formatFederatedPrincipal({
-            issuer: candidate.issuer,
-            method: candidate.method,
-            subject: candidate.subject,
-          }) ?? undefined;
-        if (!authorizationKey || !allowedCallers.includes(authorizationKey)) {
-          return failure(
-            400,
-            'invalid_grant',
-            'subject is not authorized for this resource',
-            'caller_not_allowed',
-          );
-        }
-      } else if (candidate.typ === OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION) {
-        if (!candidate.taskId) {
-          return failure(
-            400,
-            'invalid_grant',
-            'continuation assertion has no task binding',
-            'missing_task_id',
-          );
-        }
-        const task = await loadTokenExchangeTaskAuthorization(sql, agentId, candidate.taskId);
-        if (
-          !task?.principalId ||
-          !task.actorId ||
-          task.authorizationRevoked ||
-          task.profileId !== MENTIONABLE_OAUTH_PROFILE_ID ||
-          !task.authorizationKey ||
-          task.principalId !== candidate.subject ||
-          task.actorId !== candidate.issuer ||
-          !allowedCallers.includes(task.authorizationKey)
-        ) {
-          return failure(
-            400,
-            'invalid_grant',
-            'task continuation is not authorized',
-            'task_binding_mismatch',
-          );
-        }
-        authorizationKey = task.authorizationKey;
-        trustedTask = {
-          principalId: task.principalId,
-          actorId: task.actorId,
-          authorizationKey: task.authorizationKey,
-          taskId: candidate.taskId,
-        };
-      } else {
-        return failure(400, 'invalid_grant', 'unsupported subject assertion type', 'wrong_typ');
-      }
-
-      // Exact receiver policy has matched. Only now may an issuer-controlled
-      // did:web URL be resolved.
-      let issuerDocument: IssuerDidDocument;
-      try {
-        issuerDocument = asConnectorKitDidDocument(
-          await options.resolver.resolve(candidate.issuer),
-        );
-      } catch {
-        return failure(
-          400,
-          'invalid_grant',
-          'subject assertion verification failed',
-          'did_resolution_failed',
-          'subject-assertion',
-        );
-      }
-
       let verification: TokenExchangeVerifyResult;
       try {
         verification = await verifyTokenExchange(form, {
           tokenEndpoint,
           verifiedAt: now.toISOString(),
           expectedResource,
-          trustedIssuers: new Set([candidate.issuer]),
+          trustedIssuers: new Set([form.get('client_id')!]),
           resolveIssuerDocument: (issuer) =>
-            issuer === candidate.issuer ? issuerDocument : undefined,
+            issuer === policyCandidate?.issuer ? issuerDocument : undefined,
+          authorizeCandidateBeforeFetch: async (candidate) => {
+            if (candidate.resource !== expectedResource) return false;
+            if (
+              candidate.scopes.length === 0 ||
+              candidate.scopes.some(
+                (scope) => !(OAUTH_FEDERATION_SCOPES as readonly string[]).includes(scope),
+              )
+            ) {
+              return false;
+            }
+
+            let matchedAuthorizationKey: string | undefined;
+            if (candidate.kind === 'platform') {
+              matchedAuthorizationKey =
+                formatFederatedPrincipal({
+                  issuer: candidate.issuer,
+                  method: candidate.method,
+                  subject: candidate.subject,
+                }) ?? undefined;
+              if (
+                matchedAuthorizationKey === undefined ||
+                !allowedCallers.includes(matchedAuthorizationKey)
+              ) {
+                return false;
+              }
+            } else {
+              let task;
+              try {
+                task = await loadTokenExchangeTaskAuthorization(sql, agentId, candidate.taskId);
+              } catch (error) {
+                throw new MentionablePolicyStoreError('task policy lookup failed', {
+                  cause: error,
+                });
+              }
+              if (
+                !task?.principalId ||
+                !task.actorId ||
+                task.authorizationRevoked ||
+                task.profileId !== MENTIONABLE_OAUTH_PROFILE_ID ||
+                !task.authorizationKey ||
+                task.principalId !== candidate.subject ||
+                task.actorId !== candidate.issuer ||
+                !allowedCallers.includes(task.authorizationKey)
+              ) {
+                return false;
+              }
+              matchedAuthorizationKey = task.authorizationKey;
+              trustedTask = {
+                principalId: task.principalId,
+                actorId: task.actorId,
+                authorizationKey: task.authorizationKey,
+                taskId: candidate.taskId,
+              };
+            }
+
+            // Preserve the receiver-owned key independently from the
+            // verifier's boolean callback result. The DID fetch happens only
+            // after this exact candidate has matched local policy.
+            authorizationKey = matchedAuthorizationKey;
+            policyCandidate = candidate;
+            try {
+              issuerDocument = asConnectorKitDidDocument(
+                await options.resolver.resolve(candidate.issuer),
+              );
+            } catch {
+              issuerDocument = undefined;
+            }
+            return true;
+          },
+          replayCache: {
+            async register(tuple) {
+              const expiresAt = new Date(
+                now.getTime() +
+                  (OAUTH_FEDERATION_ASSERTION_MAX_TTL_SECONDS +
+                    OAUTH_FEDERATION_CLOCK_SKEW_SECONDS) *
+                    1000,
+              );
+              try {
+                await consumeTokenExchangeReplays(sql, MENTIONABLE_OAUTH_PROFILE_ID, [
+                  { ...tuple, expiresAt },
+                ]);
+                return true;
+              } catch (error) {
+                if (error instanceof TokenExchangeReplayError) return false;
+                throw new MentionableReplayStoreError('assertion replay registration failed', {
+                  cause: error,
+                });
+              }
+            },
+          },
         });
-      } catch {
+      } catch (error) {
+        if (error instanceof MentionablePolicyStoreError) {
+          return failure(
+            500,
+            'server_error',
+            'token exchange temporarily unavailable',
+            'policy_store_failed',
+            'policy',
+          );
+        }
+        if (error instanceof MentionableReplayStoreError) {
+          return failure(
+            500,
+            'server_error',
+            'token exchange temporarily unavailable',
+            'replay_store_failed',
+            'replay',
+          );
+        }
         return failure(
           500,
           'server_error',
@@ -324,10 +341,17 @@ export function createMentionableOAuthProfile(
       }
       if (!verification.ok) {
         const mapped = verificationError(verification);
+        const policyDescription =
+          mapped.stage === 'policy'
+            ? decodeCandidate(subjectToken)?.typ ===
+              OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION
+              ? 'task continuation is not authorized'
+              : 'subject is not authorized for this resource'
+            : undefined;
         return failure(
           mapped.status,
           mapped.error,
-          `${mapped.stage} verification failed`,
+          policyDescription ?? `${mapped.stage} verification failed`,
           mapped.reason,
           mapped.stage,
         );
@@ -335,8 +359,9 @@ export function createMentionableOAuthProfile(
 
       const context = verification.authorization;
       if (
-        context.actor !== candidate.issuer ||
-        context.principal !== candidate.subject ||
+        policyCandidate === undefined ||
+        context.actor !== policyCandidate.issuer ||
+        context.principal !== policyCandidate.subject ||
         (trustedTask !== undefined && context.task_id !== trustedTask.taskId) ||
         (trustedTask === undefined && context.task_id !== undefined)
       ) {
@@ -379,7 +404,6 @@ export function createMentionableOAuthProfile(
         );
       }
 
-      const verifiedClientPayload = decodeJwt(form.get('client_assertion')!);
       return {
         ok: true,
         principalId: context.principal,
@@ -388,10 +412,7 @@ export function createMentionableOAuthProfile(
         attestation: attestationResult.data,
         scopes: verification.scopes,
         ...(context.task_id !== undefined ? { taskId: context.task_id } : {}),
-        replays: [
-          verifiedReplayTuple(verifiedClientPayload),
-          verifiedReplayTuple(verifiedSubjectPayload),
-        ],
+        replays: [],
         kind: context.task_id === undefined ? 'platform_subject' : 'task_continuation',
       };
     },
