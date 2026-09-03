@@ -102,7 +102,7 @@ export async function issueTokenExchangeAccessToken(
     SELECT
       ${hashToken(rawToken)}, ${input.profileId}, a.id, ${input.resource}, ${input.principalId},
       ${input.actorId}, ${input.allowedCaller},
-      ${input.attestation ? JSON.stringify(input.attestation) : null}::jsonb,
+      ${input.attestation ? sql.json(input.attestation) : null},
       ${input.scopes}, ${input.taskId ?? null}, ${input.expiresAt}
     FROM (
       SELECT id

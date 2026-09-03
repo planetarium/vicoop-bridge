@@ -148,6 +148,7 @@ test('bridge STS route accepts and rejects the connector-kit exchange fixtures',
       throw new Error(`unexpected SQL in conformance route test: ${statement}`);
     }) as unknown as Sql;
     sql.begin = (async (callback: (tx: Sql) => unknown) => callback(sql)) as unknown as Sql['begin'];
+    sql.json = ((value: unknown) => value) as Sql['json'];
     const app = new Hono();
     mountTokenExchangeRoutes(app, {
       sql,

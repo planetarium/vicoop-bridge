@@ -98,7 +98,7 @@ function requestBody(subjectAssertion: string, clientAssertion: string): URLSear
 
 function sqlWithPolicy(
   allowedCallers: string[],
-  inserted: string[] = [],
+  inserted: unknown[] = [],
   tokenRows: unknown[][] = [],
   task?: {
     principalId: string;
@@ -117,9 +117,7 @@ function sqlWithPolicy(
     }
     if (statement.includes('INSERT INTO infra.oauth_token_exchange_access_tokens')) {
       tokenRows.push(values);
-      inserted.push(
-        String(values.find((value) => typeof value === 'string' && value.startsWith('{'))),
-      );
+      inserted.push(values[6]);
       return [{ id: 'token-row-1' }];
     }
     if (statement.includes('FROM infra.a2a_tasks')) {
@@ -139,6 +137,7 @@ function sqlWithPolicy(
   }) as unknown as Sql;
   (query as Sql & { begin: Sql['begin'] }).begin = (async (callback: (tx: Sql) => unknown) =>
     callback(query)) as unknown as Sql['begin'];
+  query.json = ((value: unknown) => value) as Sql['json'];
   return query;
 }
 
@@ -377,7 +376,7 @@ test('successful exchange stores only a normalized, non-secret attestation', asy
     subject,
   });
   assert.ok(authorizationKey);
-  const inserted: string[] = [];
+  const inserted: unknown[] = [];
   const tokenRows: unknown[][] = [];
   const resolver: DidDocumentResolver = {
     async resolve() {
@@ -407,7 +406,7 @@ test('successful exchange stores only a normalized, non-secret attestation', asy
   assert.equal(tokenRows[0]?.[3], subject, 'effective principal is the platform subject');
   assert.equal(tokenRows[0]?.[4], issuer, 'actor is the authenticated Connector DID');
   assert.equal(tokenRows[0]?.[5], authorizationKey, 'policy binding retains the exact tuple');
-  const attestation = JSON.parse(inserted[0]!) as Record<string, string>;
+  const attestation = inserted[0] as Record<string, string>;
   assert.deepEqual(
     {
       issuer: attestation.issuer,
@@ -417,8 +416,9 @@ test('successful exchange stores only a normalized, non-secret attestation', asy
     { issuer, subject, method },
   );
   assert.match(attestation.credentialId!, /^urn:mentionable:oauth-assertion:/);
-  assert.equal(inserted[0]!.includes(fixture.subjectAssertion), false);
-  assert.equal(inserted[0]!.includes(fixture.clientAssertion), false);
+  const serializedAttestation = JSON.stringify(attestation);
+  assert.equal(serializedAttestation.includes(fixture.subjectAssertion), false);
+  assert.equal(serializedAttestation.includes(fixture.clientAssertion), false);
 });
 
 test('client assertion verification failures map to invalid_client', async () => {
