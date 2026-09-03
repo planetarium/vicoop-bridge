@@ -207,6 +207,7 @@ test('every assertion fixture also reaches the bridge STS route', async () => {
     file: string;
     kind: 'assertion' | 'exchange-request' | 'replay';
     expect: 'accept' | 'reject';
+    reason?: string;
   }>;
   const defaultIssuerDocument = (await json('issuer/did.json')) as unknown as IssuerDidDocument;
   const issuer = defaultIssuerDocument.id;
@@ -220,6 +221,15 @@ test('every assertion fixture also reaches the bridge STS route', async () => {
   assert.ok(authorizationKey);
   const publicUrl = 'https://sts.oauth-fixtures.mentionable.dev';
   const resource = `${publicUrl}/agents/fixture-agent`;
+  const invalidClientFixtures = new Set([
+    'invalid/kid-not-issuer-fragment.json',
+    'invalid/kid-invalid-fragment-syntax.json',
+    'invalid/vm-controller-mismatch.json',
+    'invalid/vm-wrong-type.json',
+    'invalid/vm-invalid-public-jwk.json',
+    'invalid/vm-private-jwk.json',
+    'invalid/vm-mixed-key-material.json',
+  ]);
 
   for (const entry of manifest.filter((candidate) => candidate.kind === 'assertion')) {
     const fixture = (await json(entry.file)) as {
@@ -272,17 +282,26 @@ test('every assertion fixture also reaches the bridge STS route', async () => {
 
     const issuerDocument = fixture.issuerDocument ?? defaultIssuerDocument;
     const app = new Hono();
+    const profile = createMentionableOAuthProfile({
+      resolver: {
+        async resolve() {
+          return issuerDocument as never;
+        },
+      },
+    });
+    let profileFailureReason: string | undefined;
     mountTokenExchangeRoutes(app, {
       sql,
       publicUrl,
       profiles: [
-        createMentionableOAuthProfile({
-          resolver: {
-            async resolve() {
-              return issuerDocument as never;
-            },
+        {
+          ...profile,
+          async verify(context) {
+            const result = await profile.verify(context);
+            if (!result.ok) profileFailureReason = result.reason;
+            return result;
           },
-        }),
+        },
       ],
       now: () => new Date(fixture.verification.verifiedAt),
     });
@@ -292,5 +311,19 @@ test('every assertion fixture also reaches the bridge STS route', async () => {
       body: params,
     });
     assert.equal(response.ok, entry.expect === 'accept', entry.file);
+    if (!response.ok) {
+      const body = (await response.json()) as { error: string; rejection_id?: string };
+      const expectedOAuthError =
+        entry.file === 'invalid/wrong-typ.json'
+          ? 'invalid_request'
+          : invalidClientFixtures.has(entry.file)
+          ? 'invalid_client'
+          : 'invalid_grant';
+      assert.equal(body.error, expectedOAuthError, entry.file);
+      assert.match(body.rejection_id!, /^rej_/, entry.file);
+      if (entry.file !== 'invalid/wrong-typ.json') {
+        assert.equal(profileFailureReason, entry.reason, entry.file);
+      }
+    }
   }
 });

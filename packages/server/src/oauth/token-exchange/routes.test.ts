@@ -7,8 +7,10 @@ import { formatFederatedPrincipal } from '../../auth/principal.js';
 import type { DidDocumentResolver, ResolvedDidDocument } from '../../identity-vc/types.js';
 import {
   OAUTH_CLIENT_ASSERTION_TYPE_JWT_BEARER,
+  OAUTH_FEDERATION_ASSERTION_MAX_TTL_SECONDS,
   OAUTH_FEDERATION_CLAIM_METHOD,
   OAUTH_FEDERATION_CLAIM_TASK_ID,
+  OAUTH_FEDERATION_CLOCK_SKEW_SECONDS,
   OAUTH_FEDERATION_SCOPES,
   OAUTH_FEDERATION_SCOPE_MESSAGE_SEND,
   OAUTH_FEDERATION_SCOPE_TASK_CANCEL,
@@ -49,10 +51,11 @@ function mountMentionableTokenExchangeRoutes(
   });
 }
 
-async function assertions() {
+async function assertions(options: { issuedAt?: number; lifetimeSeconds?: number } = {}) {
   const { privateKey, publicKey } = await generateKeyPair('EdDSA');
   const publicKeyJwk = await exportJWK(publicKey);
-  const issuedAt = Math.floor(now().getTime() / 1000);
+  const issuedAt = options.issuedAt ?? Math.floor(now().getTime() / 1000);
+  const lifetimeSeconds = options.lifetimeSeconds ?? 300;
   const base = (typ: string, sub: string, jti: string, claims: Record<string, unknown> = {}) =>
     new SignJWT(claims)
       .setProtectedHeader({ alg: 'EdDSA', typ, kid })
@@ -60,7 +63,7 @@ async function assertions() {
       .setSubject(sub)
       .setAudience(tokenEndpoint)
       .setIssuedAt(issuedAt)
-      .setExpirationTime(issuedAt + 300)
+      .setExpirationTime(issuedAt + lifetimeSeconds)
       .setJti(jti)
       .sign(privateKey);
   const didDocument: ResolvedDidDocument = {
@@ -108,6 +111,7 @@ function sqlWithPolicy(
     authorizationRevoked?: boolean;
   },
   taskLookupError?: Error,
+  replayExpirations: Date[] = [],
 ): Sql {
   const replayDigests = new Set<string>();
   const query = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
@@ -119,6 +123,7 @@ function sqlWithPolicy(
       const digest = (values[0] as Buffer).toString('hex');
       if (replayDigests.has(digest)) return [];
       replayDigests.add(digest);
+      replayExpirations.push(values[2] as Date);
       return [{ digest: values[0] }];
     }
     if (statement.includes('INSERT INTO infra.oauth_token_exchange_access_tokens')) {
@@ -566,6 +571,42 @@ test('the profile-managed replay cache rejects a repeated exchange', async () =>
   const replay = await request();
   assert.equal(replay.status, 401);
   assert.equal(((await replay.json()) as { error: string }).error, 'invalid_client');
+});
+
+test('replay retention covers the maximum future-skew assertion lifetime', async () => {
+  const verifiedAtSeconds = Math.floor(now().getTime() / 1000);
+  const issuedAt = verifiedAtSeconds + OAUTH_FEDERATION_CLOCK_SKEW_SECONDS;
+  const fixture = await assertions({
+    issuedAt,
+    lifetimeSeconds: OAUTH_FEDERATION_ASSERTION_MAX_TTL_SECONDS,
+  });
+  const authorizationKey = formatFederatedPrincipal({ issuer, method, subject });
+  assert.ok(authorizationKey);
+  const replayExpirations: Date[] = [];
+  const app = new Hono();
+  mountMentionableTokenExchangeRoutes(app, {
+    sql: sqlWithPolicy([authorizationKey], [], [], undefined, undefined, replayExpirations),
+    publicUrl,
+    resolver: {
+      async resolve() {
+        return fixture.didDocument;
+      },
+    },
+    now,
+  });
+  const response = await app.request('/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: requestBody(fixture.subjectAssertion, fixture.clientAssertion),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(replayExpirations.length, 2);
+
+  const assertionExpiresAt = (issuedAt + OAUTH_FEDERATION_ASSERTION_MAX_TTL_SECONDS) * 1000;
+  const requiredRetention = assertionExpiresAt + OAUTH_FEDERATION_CLOCK_SKEW_SECONDS * 1000;
+  for (const expiresAt of replayExpirations) {
+    assert.ok(expiresAt.getTime() >= requiredRetention);
+  }
 });
 
 test('client assertion verification failures map to invalid_client', async () => {

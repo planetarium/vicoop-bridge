@@ -296,7 +296,7 @@ export function createMentionableOAuthProfile(
               const expiresAt = new Date(
                 now.getTime() +
                   (OAUTH_FEDERATION_ASSERTION_MAX_TTL_SECONDS +
-                    OAUTH_FEDERATION_CLOCK_SKEW_SECONDS) *
+                    2 * OAUTH_FEDERATION_CLOCK_SKEW_SECONDS) *
                     1000,
               );
               try {
