@@ -309,3 +309,7 @@ Tuple authorization is only the first gate. Check DID reachability and its
 `assertionMethod`, EdDSA keys, assertion audience, type, timestamps, `jti`,
 requested resource, and scopes. See the protocol checks in
 [`oauth-federation.md`](./oauth-federation.md#discovery-and-exchange).
+The bridge retries a key miss or signature mismatch once with a bounded forced
+DID refresh. DNS, timeout, and upstream failures during either lookup return a
+retryable OAuth `server_error`; restore DID endpoint reachability before
+retrying with freshly minted assertions.

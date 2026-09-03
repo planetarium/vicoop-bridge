@@ -36,7 +36,7 @@ export class TokenExchangeTokenError extends Error {
 }
 
 export class TokenExchangeReplayError extends Error {
-  constructor() {
+  constructor(readonly tupleIndex?: number) {
     super('OAuth token-exchange assertion replayed');
     this.name = 'TokenExchangeReplayError';
   }
@@ -60,7 +60,7 @@ export async function consumeTokenExchangeReplays(
   tuples: Array<{ issuer: string; jti: string; expiresAt: Date }>,
 ): Promise<void> {
   await sql.begin(async (tx) => {
-    for (const tuple of tuples) {
+    for (const [tupleIndex, tuple] of tuples.entries()) {
       const digest = tokenExchangeReplayDigest(profileId, tuple.issuer, tuple.jti);
       const rows = await tx<{ digest: Buffer }[]>`
         INSERT INTO infra.oauth_token_exchange_replays (digest, profile_id, expires_at)
@@ -70,7 +70,7 @@ export async function consumeTokenExchangeReplays(
       `;
       // Throwing rolls the transaction back, so a replay in either assertion
       // cannot partially consume the other assertion's fresh jti.
-      if (rows.length !== 1) throw new TokenExchangeReplayError();
+      if (rows.length !== 1) throw new TokenExchangeReplayError(tupleIndex);
     }
   });
 }

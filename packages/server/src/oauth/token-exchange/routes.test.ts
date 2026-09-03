@@ -449,6 +449,121 @@ test('continuation policy-store failures are typed server_error and do not resol
   assert.equal(resolutions, 0);
 });
 
+test('transient DID resolution failures are retryable server errors', async () => {
+  const fixture = await assertions();
+  const authorizationKey = formatFederatedPrincipal({ issuer, method, subject });
+  assert.ok(authorizationKey);
+  let resolutions = 0;
+  const app = new Hono();
+  mountMentionableTokenExchangeRoutes(app, {
+    sql: sqlWithPolicy([authorizationKey]),
+    publicUrl,
+    resolver: {
+      async resolve() {
+        resolutions += 1;
+        throw new Error('DNS timeout');
+      },
+    },
+    now,
+  });
+  const response = await app.request('/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: requestBody(fixture.subjectAssertion, fixture.clientAssertion),
+  });
+  assert.equal(response.status, 500);
+  assert.equal(((await response.json()) as { error: string }).error, 'server_error');
+  assert.equal(resolutions, 1);
+});
+
+test('an unknown cached kid triggers one bounded DID refresh before replay consumption', async () => {
+  const fixture = await assertions();
+  const authorizationKey = formatFederatedPrincipal({ issuer, method, subject });
+  assert.ok(authorizationKey);
+  const refreshes: boolean[] = [];
+  const replayExpirations: Date[] = [];
+  const app = new Hono();
+  mountMentionableTokenExchangeRoutes(app, {
+    sql: sqlWithPolicy([authorizationKey], [], [], undefined, undefined, replayExpirations),
+    publicUrl,
+    resolver: {
+      async resolve(_issuer, options) {
+        const refresh = options?.refresh === true;
+        refreshes.push(refresh);
+        return refresh
+          ? fixture.didDocument
+          : { id: issuer, verificationMethod: [], assertionMethod: [] };
+      },
+    },
+    now,
+  });
+  const response = await app.request('/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: requestBody(fixture.subjectAssertion, fixture.clientAssertion),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(refreshes, [false, true]);
+  assert.equal(replayExpirations.length, 2);
+});
+
+test('same-kid key-material rotation triggers one bounded DID refresh', async () => {
+  const staleFixture = await assertions();
+  const currentFixture = await assertions();
+  const authorizationKey = formatFederatedPrincipal({ issuer, method, subject });
+  assert.ok(authorizationKey);
+  const refreshes: boolean[] = [];
+  const app = new Hono();
+  mountMentionableTokenExchangeRoutes(app, {
+    sql: sqlWithPolicy([authorizationKey]),
+    publicUrl,
+    resolver: {
+      async resolve(_issuer, options) {
+        const refresh = options?.refresh === true;
+        refreshes.push(refresh);
+        return refresh ? currentFixture.didDocument : staleFixture.didDocument;
+      },
+    },
+    now,
+  });
+  const response = await app.request('/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: requestBody(currentFixture.subjectAssertion, currentFixture.clientAssertion),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(refreshes, [false, true]);
+});
+
+test('a failed DID refresh remains a retryable server error', async () => {
+  const fixture = await assertions();
+  const authorizationKey = formatFederatedPrincipal({ issuer, method, subject });
+  assert.ok(authorizationKey);
+  const refreshes: boolean[] = [];
+  const app = new Hono();
+  mountMentionableTokenExchangeRoutes(app, {
+    sql: sqlWithPolicy([authorizationKey]),
+    publicUrl,
+    resolver: {
+      async resolve(_issuer, options) {
+        const refresh = options?.refresh === true;
+        refreshes.push(refresh);
+        if (refresh) throw new Error('DID endpoint unavailable');
+        return { id: issuer, verificationMethod: [], assertionMethod: [] };
+      },
+    },
+    now,
+  });
+  const response = await app.request('/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: requestBody(fixture.subjectAssertion, fixture.clientAssertion),
+  });
+  assert.equal(response.status, 500);
+  assert.equal(((await response.json()) as { error: string }).error, 'server_error');
+  assert.deepEqual(refreshes, [false, true]);
+});
+
 test('embedded assertionMethod verification objects are preserved and accepted', async () => {
   const fixture = await assertions();
   const authorizationKey = formatFederatedPrincipal({
@@ -571,6 +686,43 @@ test('the profile-managed replay cache rejects a repeated exchange', async () =>
   const replay = await request();
   assert.equal(replay.status, 401);
   assert.equal(((await replay.json()) as { error: string }).error, 'invalid_client');
+});
+
+test('failed subject verification does not consume the valid client replay tuple', async () => {
+  const fixture = await assertions();
+  const authorizationKey = formatFederatedPrincipal({ issuer, method, subject });
+  assert.ok(authorizationKey);
+  const replayExpirations: Date[] = [];
+  const app = new Hono();
+  mountMentionableTokenExchangeRoutes(app, {
+    sql: sqlWithPolicy([authorizationKey], [], [], undefined, undefined, replayExpirations),
+    publicUrl,
+    resolver: {
+      async resolve() {
+        return fixture.didDocument;
+      },
+    },
+    now,
+  });
+  const tamperedSegments = fixture.subjectAssertion.split('.');
+  tamperedSegments[2] =
+    (tamperedSegments[2]!.startsWith('A') ? 'B' : 'A') + tamperedSegments[2]!.slice(1);
+  const rejected = await app.request('/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: requestBody(tamperedSegments.join('.'), fixture.clientAssertion),
+  });
+  assert.equal(rejected.status, 400);
+  assert.equal(((await rejected.json()) as { error: string }).error, 'invalid_grant');
+  assert.equal(replayExpirations.length, 0);
+
+  const accepted = await app.request('/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: requestBody(fixture.subjectAssertion, fixture.clientAssertion),
+  });
+  assert.equal(accepted.status, 200);
+  assert.equal(replayExpirations.length, 2);
 });
 
 test('replay retention covers the maximum future-skew assertion lifetime', async () => {

@@ -26,7 +26,10 @@ resource authorization without being interpreted under Mentionable semantics.
 Each profile must also declare whether replay protection is required or not
 applicable. Replay-required profiles either return single-use evidence for the
 core to persist or register it atomically inside the verifier when the profile
-contract requires replay rejection before verification returns.
+contract requires replay rejection before verification returns. The
+Mentionable profile stages the client and subject tuples during cryptographic
+verification and commits both in one transaction only after every profile
+check succeeds.
 
 ## Connector-kit dependency status
 
@@ -73,7 +76,9 @@ The bridge parses unverified assertion claims only to select one exact
 receiver-owned allowed-caller entry. A miss is rejected before DID resolution.
 On a hit, it verifies EdDSA, explicit `typ`, the DID `assertionMethod`
 relationship, `iss`/`sub`/`aud`/`iat`/`exp`/`jti`, method, lifetime, and replay.
-A DID signature alone never grants access.
+A DID signature alone never grants access. A missing key or signature mismatch
+triggers one bounded cache-bypassing DID refresh to accommodate key rotation;
+resolution and refresh transport failures return a retryable `server_error`.
 
 ## Operator configuration
 

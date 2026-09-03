@@ -145,7 +145,25 @@ export interface MentionableOAuthProfileOptions {
 export const MENTIONABLE_OAUTH_PROFILE_ID = OAUTH_FEDERATION_EXTENSION_URI;
 
 class MentionablePolicyStoreError extends Error {}
-class MentionableReplayStoreError extends Error {}
+class MentionableDidResolutionError extends Error {}
+
+function shouldRefreshIssuerDocument(
+  result: TokenExchangeVerifyResult,
+): result is Exclude<TokenExchangeVerifyResult, { ok: true }> {
+  if (result.ok || (result.stage !== 'client-assertion' && result.stage !== 'subject-assertion')) {
+    return false;
+  }
+  if (result.reason === 'invalid-signature') return true;
+  // The pinned reference verifier uses this detail only after a syntactically
+  // valid issuer-fragment kid fails lookup or key-material validation. Do not
+  // turn malformed kid syntax into an issuer-controlled refresh request.
+  return (
+    result.reason === 'kid-not-authorized' &&
+    result.detail?.startsWith(
+      'verification method is not a public issuer-controlled JsonWebKey Ed25519 method:',
+    ) === true
+  );
+}
 
 function failure(
   status: 400 | 401 | 500,
@@ -205,6 +223,7 @@ export function createMentionableOAuthProfile(
       let authorizationKey: string | undefined;
       let policyCandidate: TokenExchangePolicyCandidate | undefined;
       let issuerDocument: IssuerDidDocument | undefined;
+      let issuerDocumentFor: string | undefined;
       let trustedTask:
         | {
             principalId: string;
@@ -214,105 +233,126 @@ export function createMentionableOAuthProfile(
           }
         | undefined;
       let verification: TokenExchangeVerifyResult;
+      let pendingReplays: Array<{ issuer: string; jti: string }> = [];
       try {
-        verification = await verifyTokenExchange(form, {
-          tokenEndpoint,
-          verifiedAt: now.toISOString(),
-          expectedResource,
-          trustedIssuers: new Set([form.get('client_id')!]),
-          resolveIssuerDocument: (issuer) =>
-            issuer === policyCandidate?.issuer ? issuerDocument : undefined,
-          authorizeCandidateBeforeFetch: async (candidate) => {
-            if (candidate.resource !== expectedResource) return false;
-            if (
-              candidate.scopes.length === 0 ||
-              candidate.scopes.some(
-                (scope) => !(OAUTH_FEDERATION_SCOPES as readonly string[]).includes(scope),
-              )
-            ) {
-              return false;
-            }
-
-            let matchedAuthorizationKey: string | undefined;
-            if (candidate.kind === 'platform') {
-              matchedAuthorizationKey =
-                formatFederatedPrincipal({
-                  issuer: candidate.issuer,
-                  method: candidate.method,
-                  subject: candidate.subject,
-                }) ?? undefined;
+        const verifyOnce = async () => {
+          authorizationKey = undefined;
+          policyCandidate = undefined;
+          trustedTask = undefined;
+          const attemptReplays: Array<{ issuer: string; jti: string }> = [];
+          const attemptReplayKeys = new Set<string>();
+          const result = await verifyTokenExchange(form, {
+            tokenEndpoint,
+            verifiedAt: now.toISOString(),
+            expectedResource,
+            trustedIssuers: new Set([form.get('client_id')!]),
+            resolveIssuerDocument: (issuer) =>
+              issuer === policyCandidate?.issuer ? issuerDocument : undefined,
+            authorizeCandidateBeforeFetch: async (candidate) => {
+              if (candidate.resource !== expectedResource) return false;
               if (
-                matchedAuthorizationKey === undefined ||
-                !allowedCallers.includes(matchedAuthorizationKey)
+                candidate.scopes.length === 0 ||
+                candidate.scopes.some(
+                  (scope) => !(OAUTH_FEDERATION_SCOPES as readonly string[]).includes(scope),
+                )
               ) {
                 return false;
               }
-            } else {
-              let task;
-              try {
-                task = await loadTokenExchangeTaskAuthorization(sql, agentId, candidate.taskId);
-              } catch (error) {
-                throw new MentionablePolicyStoreError('task policy lookup failed', {
-                  cause: error,
-                });
-              }
-              if (
-                !task?.principalId ||
-                !task.actorId ||
-                task.authorizationRevoked ||
-                task.profileId !== MENTIONABLE_OAUTH_PROFILE_ID ||
-                !task.authorizationKey ||
-                task.principalId !== candidate.subject ||
-                task.actorId !== candidate.issuer ||
-                !allowedCallers.includes(task.authorizationKey)
-              ) {
-                return false;
-              }
-              matchedAuthorizationKey = task.authorizationKey;
-              trustedTask = {
-                principalId: task.principalId,
-                actorId: task.actorId,
-                authorizationKey: task.authorizationKey,
-                taskId: candidate.taskId,
-              };
-            }
 
-            // Preserve the receiver-owned key independently from the
-            // verifier's boolean callback result. The DID fetch happens only
-            // after this exact candidate has matched local policy.
-            authorizationKey = matchedAuthorizationKey;
-            policyCandidate = candidate;
-            try {
-              issuerDocument = asConnectorKitDidDocument(
-                await options.resolver.resolve(candidate.issuer),
-              );
-            } catch {
-              issuerDocument = undefined;
-            }
-            return true;
-          },
-          replayCache: {
-            async register(tuple) {
-              const expiresAt = new Date(
-                now.getTime() +
-                  (OAUTH_FEDERATION_ASSERTION_MAX_TTL_SECONDS +
-                    2 * OAUTH_FEDERATION_CLOCK_SKEW_SECONDS) *
-                    1000,
-              );
-              try {
-                await consumeTokenExchangeReplays(sql, MENTIONABLE_OAUTH_PROFILE_ID, [
-                  { ...tuple, expiresAt },
-                ]);
-                return true;
-              } catch (error) {
-                if (error instanceof TokenExchangeReplayError) return false;
-                throw new MentionableReplayStoreError('assertion replay registration failed', {
-                  cause: error,
-                });
+              let matchedAuthorizationKey: string | undefined;
+              if (candidate.kind === 'platform') {
+                matchedAuthorizationKey =
+                  formatFederatedPrincipal({
+                    issuer: candidate.issuer,
+                    method: candidate.method,
+                    subject: candidate.subject,
+                  }) ?? undefined;
+                if (
+                  matchedAuthorizationKey === undefined ||
+                  !allowedCallers.includes(matchedAuthorizationKey)
+                ) {
+                  return false;
+                }
+              } else {
+                let task;
+                try {
+                  task = await loadTokenExchangeTaskAuthorization(sql, agentId, candidate.taskId);
+                } catch (error) {
+                  throw new MentionablePolicyStoreError('task policy lookup failed', {
+                    cause: error,
+                  });
+                }
+                if (
+                  !task?.principalId ||
+                  !task.actorId ||
+                  task.authorizationRevoked ||
+                  task.profileId !== MENTIONABLE_OAUTH_PROFILE_ID ||
+                  !task.authorizationKey ||
+                  task.principalId !== candidate.subject ||
+                  task.actorId !== candidate.issuer ||
+                  !allowedCallers.includes(task.authorizationKey)
+                ) {
+                  return false;
+                }
+                matchedAuthorizationKey = task.authorizationKey;
+                trustedTask = {
+                  principalId: task.principalId,
+                  actorId: task.actorId,
+                  authorizationKey: task.authorizationKey,
+                  taskId: candidate.taskId,
+                };
               }
+
+              // Preserve the receiver-owned key independently from the
+              // verifier's boolean callback result. The DID fetch happens only
+              // after this exact candidate has matched local policy.
+              authorizationKey = matchedAuthorizationKey;
+              policyCandidate = candidate;
+              if (issuerDocumentFor !== candidate.issuer) {
+                try {
+                  issuerDocument = asConnectorKitDidDocument(
+                    await options.resolver.resolve(candidate.issuer),
+                  );
+                  issuerDocumentFor = candidate.issuer;
+                } catch (error) {
+                  throw new MentionableDidResolutionError('issuer DID resolution failed', {
+                    cause: error,
+                  });
+                }
+              }
+              return true;
             },
-          },
-        });
+            replayCache: {
+              register(tuple) {
+                const key = `${tuple.issuer}\0${tuple.jti}`;
+                if (attemptReplayKeys.has(key)) return false;
+                attemptReplayKeys.add(key);
+                attemptReplays.push(tuple);
+                return true;
+              },
+            },
+          });
+          return { result, replays: attemptReplays };
+        };
+
+        let attempt = await verifyOnce();
+        if (shouldRefreshIssuerDocument(attempt.result)) {
+          const issuer = policyCandidate?.issuer;
+          if (issuer === undefined) {
+            throw new Error('verification requested DID refresh without a policy candidate');
+          }
+          try {
+            issuerDocument = asConnectorKitDidDocument(
+              await options.resolver.resolve(issuer, { refresh: true }),
+            );
+            issuerDocumentFor = issuer;
+          } catch (error) {
+            throw new MentionableDidResolutionError('issuer DID refresh failed', { cause: error });
+          }
+          attempt = await verifyOnce();
+        }
+        verification = attempt.result;
+        pendingReplays = attempt.replays;
       } catch (error) {
         if (error instanceof MentionablePolicyStoreError) {
           return failure(
@@ -323,13 +363,13 @@ export function createMentionableOAuthProfile(
             'policy',
           );
         }
-        if (error instanceof MentionableReplayStoreError) {
+        if (error instanceof MentionableDidResolutionError) {
           return failure(
             500,
             'server_error',
             'token exchange temporarily unavailable',
-            'replay_store_failed',
-            'replay',
+            'did_resolution_failed',
+            'did_resolution',
           );
         }
         return failure(
@@ -401,6 +441,51 @@ export function createMentionableOAuthProfile(
           'invalid_grant',
           'subject assertion exceeds caller context limits',
           'context_limits',
+        );
+      }
+
+      if (pendingReplays.length !== 2) {
+        return failure(
+          500,
+          'server_error',
+          'token exchange temporarily unavailable',
+          'replay_evidence_missing',
+          'profile_contract',
+        );
+      }
+
+      // The reference verifier calls the cache once per assertion. Stage the
+      // tuples until every profile check succeeds, then persist both in one
+      // transaction so a failed subject assertion cannot burn a valid client
+      // assertion (and a conflict on either tuple rolls both inserts back).
+      const replayExpiresAt = new Date(
+        now.getTime() +
+          (OAUTH_FEDERATION_ASSERTION_MAX_TTL_SECONDS + 2 * OAUTH_FEDERATION_CLOCK_SKEW_SECONDS) *
+            1000,
+      );
+      try {
+        await consumeTokenExchangeReplays(
+          sql,
+          MENTIONABLE_OAUTH_PROFILE_ID,
+          pendingReplays.map((tuple) => ({ ...tuple, expiresAt: replayExpiresAt })),
+        );
+      } catch (error) {
+        if (error instanceof TokenExchangeReplayError) {
+          const clientAssertionReplay = error.tupleIndex === 0;
+          return failure(
+            clientAssertionReplay ? 401 : 400,
+            clientAssertionReplay ? 'invalid_client' : 'invalid_grant',
+            `${clientAssertionReplay ? 'client' : 'subject'}-assertion verification failed`,
+            'replayed-jti',
+            clientAssertionReplay ? 'client-assertion' : 'subject-assertion',
+          );
+        }
+        return failure(
+          500,
+          'server_error',
+          'token exchange temporarily unavailable',
+          'replay_store_failed',
+          'replay',
         );
       }
 
