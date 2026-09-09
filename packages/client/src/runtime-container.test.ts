@@ -377,3 +377,31 @@ test('reuse rejects a missing or different workspace before starting or executin
     assert.ok(!fixture.calls.some(args => ['start', 'stop', 'exec'].includes(args[0])));
   }
 });
+
+test('start awaits asynchronous Docker results including bounded streamed image pull', async () => {
+  const calls: Array<{ args: readonly string[]; options: unknown }> = [];
+  const responses = happyCreateResponses();
+  responses.splice(2, 1, fail('image missing'), ok());
+  const fixture = makeDockerFixture(responses);
+  const runtime = new RuntimeContainer({
+    backendKind: 'claude', createIfMissing: true,
+    dockerRun: async (args, options) => {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      calls.push({ args, options });
+      return fixture.run(args);
+    },
+  });
+  await runtime.start();
+  assert.deepEqual(calls.find((call) => call.args[0] === 'pull')?.options, {
+    inheritOutput: true, timeoutMs: 600_000,
+  });
+  await runtime.stop();
+  assert.equal(calls.at(-1)?.args[0], 'stop');
+});
+
+test('failed image pull aborts creation before touching volumes', async () => {
+  const fixture = makeDockerFixture([ok('27'), ok(), fail('missing image'), fail('pull failed')]);
+  const runtime = new RuntimeContainer({ backendKind: 'claude', createIfMissing: true, dockerRun: fixture.run });
+  await assert.rejects(runtime.start(), /docker pull/);
+  assert.equal(fixture.calls.some((args) => args[0] === 'volume' || args[0] === 'create'), false);
+});

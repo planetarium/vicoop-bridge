@@ -31,7 +31,7 @@ export type CodexSandboxMode = (typeof SANDBOX_MODES)[number];
 export const BACKEND_KINDS = ['echo', 'openclaw', 'claude', 'codex', 'vicoop-codex'] as const;
 export type BackendKind = (typeof BACKEND_KINDS)[number];
 
-const BACKEND_RUNTIMES = ['host', 'container'] as const;
+const BACKEND_RUNTIMES = ['host', 'container', 'caller-container'] as const;
 
 // Optique daemon-mode grammar. Every operator-tunable knob is a flag here,
 // including the ones that used to be env-only (CLAUDE_CWD, CODEX_SANDBOX_MODE,
@@ -82,7 +82,7 @@ export const daemonFlagsFields = {
     description: message`Working directory for the spawned backend process. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
   })),
   runtime: optional(option('--runtime', choice([...BACKEND_RUNTIMES]), {
-    description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside an existing vicoop-runtime container created by \`vicoop-client container init <kind>\`. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
+    description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside an existing vicoop-runtime container created by \`vicoop-client container init <kind>\`. \`caller-container\` is reserved and unavailable in this release. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
   })),
   runtimeName: optional(option('--runtime-name', string({ metavar: 'NAME' }), {
     description: message`Runtime container instance name to use with \`--runtime container\`. Omit to use the active backend kind as the generated name.`,
@@ -393,6 +393,9 @@ export function mergeClientArgs(
   // overlay are silently dropped above by the active-backend-scoped
   // lookup, which is the correct behaviour for that source.
   const errors: string[] = [];
+  if (resolved.runtime === 'caller-container') {
+    errors.push('caller-container isolation is not available in this release (#497 R2); no backend will be started');
+  }
   if (flags.runtime !== undefined && !RUNTIME_BACKENDS.has(backend)) {
     errors.push(
       `--runtime is not supported by --backend ${backend}; only claude / codex have a runtime container profile`,

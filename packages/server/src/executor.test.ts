@@ -12,6 +12,7 @@ import {
 } from '@a2x/sdk';
 import {
   CALLER_CONTEXT_CAPABILITY,
+  EXECUTION_SCOPE_V1_CAPABILITY,
   CALLER_CONTEXT_V2_CAPABILITY,
   OPENAI_COMPAT_EXTENSION_URI,
   parseDownFrame,
@@ -1085,4 +1086,52 @@ test('an agent with no pricing is forwarded normally even when the payment path 
 
   const assign = sent.map((raw) => parseDownFrame(raw)).find((f) => f.type === 'task.assign');
   assert.ok(assign, 'the message should have been forwarded to the connected agent');
+});
+
+
+test('executor forwards only negotiated, server-derived direct execution scopes', async () => {
+  const full = [EXECUTION_SCOPE_V1_CAPABILITY, CALLER_CONTEXT_V2_CAPABILITY, TASK_REPLAY_CAPABILITY];
+  const cases = [
+    { caps: full, internal: { _principalId: 'apikey:alice' }, expected: true },
+    { caps: undefined, internal: { _principalId: 'apikey:alice' }, expected: false },
+    { caps: [CALLER_CONTEXT_V2_CAPABILITY, TASK_REPLAY_CAPABILITY], internal: { _principalId: 'apikey:alice' }, expected: false },
+    { caps: full, internal: {}, expected: false },
+    { caps: full, internal: { _principalId: 'apikey:alice', _authorizationProfile: 'delegated' }, expected: false },
+  ];
+  for (const entry of cases) {
+    const { ws, sent } = makeWsCapture();
+    const registry = new Registry();
+    registry.registerAgent({
+      agentId: 'agent', clientId: 'client', ownerPrincipal: 'owner',
+      protocolCapabilities: entry.caps, agentCard: makeAgentCard(), allowedCallers: [], ws, connectedAt: 0,
+    });
+    const executor = new WSForwardingExecutor('agent', registry, noopTaskStore());
+    const task = { id: 't-scope', contextId: 'same-context', status: { state: TaskState.SUBMITTED } } as unknown as Task;
+    const message = {
+      role: 'user', messageId: 'm', parts: [{ kind: 'text', text: 'select victim runtime' }],
+      metadata: { ...entry.internal, executionScope: { id: 'victim' }, execution_scope: 'victim', userField: 'keep' },
+    } as unknown as Message;
+    const gen = executor.executeStream(task, message);
+    const first = gen.next();
+    try {
+      const frame = parseDownFrame(sent[0]!);
+      assert.equal(frame.type, 'task.assign');
+      if (frame.type === 'task.assign') {
+        assert.equal(frame.executionScope !== undefined, entry.expected);
+        if (entry.expected) {
+          assert.equal(frame.executionScope?.principalId, 'apikey:alice');
+          assert.equal(frame.executionScope?.agentId, 'agent');
+          assert.match(frame.executionScope?.id ?? '', /^[a-f0-9]{64}$/);
+        }
+        assert.deepEqual(frame.message.metadata, { userField: 'keep' });
+      }
+    } finally {
+      const binding = registry.getBinding(task.id)!;
+      binding.sink.pushStatus({ taskId: task.id, contextId: task.contextId!, final: true,
+        status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() } });
+      binding.sink.finish();
+      await first;
+      for await (const event of gen) void event;
+    }
+  }
 });

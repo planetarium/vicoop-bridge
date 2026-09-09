@@ -105,7 +105,8 @@ export function defaultOwnerSessionPath(): string {
 //                   (today's behavior; default).
 //   - 'container' : `docker exec` into a long-lived vicoop-runtime
 //                   container the bridge client orchestrates (#249).
-export type BackendRuntime = 'host' | 'container';
+// caller-container is reserved configuration, explicitly rejected until R2.
+export type BackendRuntime = 'host' | 'container' | 'caller-container';
 
 export interface ClaudeBackendConfig {
   cwd?: string;
@@ -284,7 +285,7 @@ const KNOWN_CODEX_SANDBOX_MODES = new Set([
   'workspace-write',
   'danger-full-access',
 ]);
-const KNOWN_BACKEND_RUNTIMES = new Set<BackendRuntime>(['host', 'container']);
+const KNOWN_BACKEND_RUNTIMES = new Set<BackendRuntime>(['host', 'container', 'caller-container']);
 
 function pickBackendRuntime(v: unknown): BackendRuntime | undefined {
   if (typeof v !== 'string') return undefined;

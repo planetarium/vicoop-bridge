@@ -28,6 +28,7 @@ import {
   type Part as WirePart,
 } from '@vicoop-bridge/protocol';
 import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
+import { resolveDirectExecutionScope } from './execution-scope.js';
 import {
   createCanonicalCallerContext,
   selectCallerContextVersion,
@@ -128,6 +129,7 @@ export function stripInternalMetadata(
     // cross the WS boundary where a backend might mistake them for verified
     // context.
     if (key === 'caller' || key === 'callerContext' || key === 'caller_context') continue;
+    if (key === 'executionScope' || key === 'execution_scope') continue;
     if (
       key === 'mentionable' &&
       typeof value === 'object' &&
@@ -465,6 +467,10 @@ export class WSForwardingExecutor extends AgentExecutor {
           })
         : undefined;
     const caller = serializeCallerContext(canonicalCaller, callerContextVersion);
+    const executionScope = caller === undefined ? undefined : resolveDirectExecutionScope({
+      agentId: this.agentId, principalId, actorId, authorizationKey, authorizationProfile,
+      capabilities: this.registry.getAgent(this.agentId)?.protocolCapabilities,
+    });
     if (callerContextVersion !== undefined && hasCallerInput && caller === undefined) {
       // Do not put the raw principal or schema details in logs. An invalid
       // transport-owned value is omitted instead of emitting a task.assign
@@ -558,6 +564,7 @@ export class WSForwardingExecutor extends AgentExecutor {
       },
       ...(message.extensions !== undefined ? { requestedExtensions: message.extensions } : {}),
       ...(caller !== undefined ? { caller } : {}),
+      ...(executionScope !== undefined ? { executionScope } : {}),
     });
 
     if (!sent) {

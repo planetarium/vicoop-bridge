@@ -6,6 +6,8 @@ import WebSocket from 'ws';
 import type { TaskArtifactUpdateEvent, TaskStatusUpdateEvent } from '@a2x/sdk';
 import {
   CALLER_CONTEXT_CAPABILITY,
+  CALLER_CONTEXT_V2_CAPABILITY,
+  EXECUTION_SCOPE_V1_CAPABILITY,
   encodeFrame,
   OPENAI_COMPAT_EXTENSION_URI,
   parseDownFrame,
@@ -1360,5 +1362,33 @@ test('a terminal replay from an old execution cannot complete a reused taskId', 
   } finally {
     ws.close();
     await closeServer(server);
+  }
+});
+
+
+test('execution scope acknowledgement requires the full capability set', async () => {
+  for (const callerV2 of [false, true]) {
+    const server = createServer();
+    const registry = new Registry();
+    attachWsServer(server, { db: mockSql(), registry });
+    const port = await listen(server);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+    try {
+      await once(ws, 'open');
+      const ack = once(ws, 'message');
+      ws.send(encodeFrame({
+        type: 'hello', version: PROTOCOL_VERSION, agentId: 'agent-1', token: 'token',
+        protocolCapabilities: [TASK_REPLAY_CAPABILITY, EXECUTION_SCOPE_V1_CAPABILITY,
+          ...(callerV2 ? [CALLER_CONTEXT_V2_CAPABILITY] : [])],
+        agentCard: { name: 'agent', version: '0.0.0', protocolVersion: '0.3.0' },
+      }));
+      const [raw] = await withTimeout(ack, 5_000, 'scope acknowledgement');
+      const frame = parseDownFrame(raw.toString());
+      assert.equal(frame.type, 'hello.ack');
+      if (frame.type === 'hello.ack') assert.equal(frame.protocolCapabilities.includes(EXECUTION_SCOPE_V1_CAPABILITY), callerV2);
+    } finally {
+      ws.close();
+      await closeServer(server);
+    }
   }
 });

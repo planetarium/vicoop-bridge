@@ -15,6 +15,22 @@ export const OPENAI_COMPAT_EXTENSION_URI =
   'https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1';
 export const CALLER_CONTEXT_V1_CAPABILITY = 'caller-context-v1';
 export const CALLER_CONTEXT_V2_CAPABILITY = 'caller-context-v2';
+// Wire support only; never evidence that a client isolates execution. R1
+// clients do not advertise this capability. Requires caller-context-v2 and
+// task-replay-v1 so a future isolated client can validate identity/generation.
+export const EXECUTION_SCOPE_V1_CAPABILITY = 'execution-scope-v1';
+export const ExecutionScopeV1 = z.object({
+  policy: z.literal('direct-principal-v1'),
+  id: z.string().regex(/^[a-f0-9]{64}$/),
+  agentId: z.string().min(1).max(512),
+  principalId: z.string().min(1).max(512),
+}).strict();
+export type ExecutionScopeV1 = z.infer<typeof ExecutionScopeV1>;
+
+export function supportsExecutionScopeV1(capabilities: readonly string[] | undefined): boolean {
+  return [EXECUTION_SCOPE_V1_CAPABILITY, CALLER_CONTEXT_V2_CAPABILITY, TASK_REPLAY_CAPABILITY]
+    .every((capability) => capabilities?.includes(capability));
+}
 // Compatibility alias for callers compiled against the original v1 API.
 export const CALLER_CONTEXT_CAPABILITY = CALLER_CONTEXT_V1_CAPABILITY;
 export const MENTIONABLE_IDENTITY_VC_EXTENSION_URI =
@@ -557,6 +573,7 @@ export const TaskAssignFrame = z.object({
   message: Message,
   requestedExtensions: z.array(z.string()).optional(),
   caller: CallerContext.optional(),
+  executionScope: ExecutionScopeV1.optional(),
 });
 
 export const TaskCancelFrame = z.object({
