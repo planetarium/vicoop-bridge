@@ -50,6 +50,7 @@ export interface ChildHandle {
 
 export interface SpawnOptions {
   cwd?: string;
+  env?: NodeJS.ProcessEnv;
 }
 
 export type SpawnFn = (
@@ -66,6 +67,7 @@ export function createHostSpawn(): SpawnFn {
     nodeSpawn(command, Array.from(args), {
       stdio: ['pipe', 'pipe', 'pipe'],
       ...(options.cwd ? { cwd: options.cwd } : {}),
+      ...(options.env ? { env: { ...process.env, ...options.env } } : {}),
     }) as unknown as ChildHandle;
 }
 
@@ -74,8 +76,8 @@ export function createHostSpawn(): SpawnFn {
 // child process; the returned ChildHandle is just that subprocess
 // (already structurally satisfies ChildHandle). stdin / stdout /
 // stderr forward bidirectionally, close fires when the in-container
-// process exits, and signals propagate via the docker CLI's own
-// handling.
+// process exits. kill() targets the host Docker CLI, not a supervised
+// in-container process group; caller-isolated execution must add supervision.
 //
 // `spawnImpl` is a test seam — production passes through to
 // node:child_process.spawn unchanged.
@@ -88,6 +90,11 @@ export function createDockerExecSpawn(
   return (command, args, options) => {
     const dockerArgs = ['exec', '-i'];
     if (options.cwd) dockerArgs.push('-w', options.cwd);
+    for (const [key, value] of Object.entries(options.env ?? {})) {
+      if (value === undefined) continue;
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error('invalid runtime environment variable name');
+      dockerArgs.push('-e', `${key}=${value}`);
+    }
     dockerArgs.push(containerName, command, ...args);
     return spawnImpl('docker', dockerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],

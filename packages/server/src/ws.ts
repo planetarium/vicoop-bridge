@@ -6,6 +6,8 @@ import {
   PROTOCOL_VERSION,
   OPENAI_COMPAT_EXTENSION_URI,
   TASK_REPLAY_CAPABILITY,
+  EXECUTION_SCOPE_V1_CAPABILITY,
+  supportsExecutionScopeV1,
   type Part,
   type TaskStatus as WireTaskStatus,
   type Message as WireMessage,
@@ -347,7 +349,10 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           ws.send(
             encodeFrame({
               type: 'hello.ack',
-              protocolCapabilities: [TASK_REPLAY_CAPABILITY],
+              protocolCapabilities: [
+                TASK_REPLAY_CAPABILITY,
+                ...(supportsExecutionScopeV1(frame.protocolCapabilities) ? [EXECUTION_SCOPE_V1_CAPABILITY] : []),
+              ],
               disconnectGraceMs: opts.registry.getDisconnectGraceMs(),
               maxFrameBytes: MAX_INGRESS_BYTES,
             }),

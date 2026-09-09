@@ -17,6 +17,7 @@
 // survives across daemon restarts; this command is what makes it
 // usable in the first place.
 
+import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -299,11 +300,11 @@ export function expectedCredsPath(kind: InstallableBackendKind): string {
 export async function assertContainerCredsPresent(
   containerName: string,
   kind: InstallableBackendKind,
-  opts: { dockerRun?: DockerRun } = {},
+  opts: { dockerRun?: AsyncDockerRun } = {},
 ): Promise<void> {
-  const dockerRun = opts.dockerRun ?? defaultDockerRun;
+  const dockerRun = opts.dockerRun ?? runDockerCommand;
   const path = expectedCredsPath(kind);
-  const r = dockerRun(['exec', containerName, 'test', '-f', path]);
+  const r = await dockerRun(['exec', containerName, 'test', '-f', path]);
   if (r.exitCode === 0) return;
   throw new Error(
     `runtime container '${containerName}' has no ${kind} creds at ${path}. ` +
