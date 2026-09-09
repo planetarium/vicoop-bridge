@@ -27,6 +27,7 @@ async function docker(args: string[]) {
   return result;
 }
 
+const failures: unknown[] = [];
 try {
   await runtime.start();
   let ticks = 0;
@@ -65,15 +66,33 @@ try {
   await docker(['cp', `${container}:${remotePath}`, output]);
   assert.equal(await readFile(output, 'utf8'), 'persistent smoke data\n');
   await reopened.stop();
-  console.log('PASS: lifecycle, responsive event loop, stdio/EOF, cwd/env, file round trip, stop/start persistence');
+} catch (error) {
+  failures.push(error);
 } finally {
   // Always attempt every cleanup, including partial-start failure. Names are
   // unique to this invocation; no pre-existing user runtime is adopted.
-  const cleanup = await runDockerCommand(['rm', '-f', container]);
-  if (cleanup.exitCode !== 0 && !/No such container/i.test(cleanup.stderr)) console.error(cleanup.stderr);
+  const cleanup = async (label: string, action: () => Promise<void>) => {
+    try {
+      await action();
+    } catch (cause) {
+      failures.push(new Error(`cleanup failed: ${label}`, { cause }));
+    }
+  };
+  await cleanup(container, async () => {
+    const result = await runDockerCommand(['rm', '-f', container]);
+    if (result.exitCode !== 0 && !/No such container/i.test(result.stderr)) {
+      throw new Error(`docker rm exited ${result.exitCode}: ${result.stderr}`);
+    }
+  });
   for (const volume of [agentsVolumeName(kind, name), credsVolumeName(kind, name), sessionsVolumeName(kind, name)]) {
-    const result = await runDockerCommand(['volume', 'rm', volume]);
-    if (result.exitCode !== 0 && !/no such volume/i.test(result.stderr)) console.error(result.stderr);
+    await cleanup(volume, async () => {
+      const result = await runDockerCommand(['volume', 'rm', volume]);
+      if (result.exitCode !== 0 && !/no such volume/i.test(result.stderr)) {
+        throw new Error(`docker volume rm exited ${result.exitCode}: ${result.stderr}`);
+      }
+    });
   }
-  await rm(directory, { recursive: true, force: true });
+  await cleanup(directory, () => rm(directory, { recursive: true, force: true }));
 }
+if (failures.length > 0) throw new AggregateError(failures, 'runtime smoke failed (including cleanup)');
+console.log('PASS: lifecycle, responsive event loop, stdio/EOF, cwd/env, file round trip, stop/start persistence, cleanup');
