@@ -647,3 +647,17 @@ test('legacy daemon env vars remain ignored (identity trust is the sole compatib
     }
   }
 });
+
+
+test('reserved caller isolation is rejected from flags and configuration before backend startup', () => {
+  for (const backend of ['claude', 'codex'] as const) {
+    for (const source of ['flag', 'config']) {
+      const result = mergeClientArgs(
+        { token: 't', agentId: 'a', backend, ...(source === 'flag' ? { runtime: 'caller-container' as const } : {}) },
+        source === 'config' ? { backends: { [backend]: { runtime: 'caller-container' } } } : {},
+      );
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.ok(result.errors.some((error) => error.includes('not available')));
+    }
+  }
+});

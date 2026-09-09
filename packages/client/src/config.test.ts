@@ -542,3 +542,12 @@ test('readConfig/writeConfig default to resolveConfigDir() when no path passed',
   // Side check: file lives under VICOOP_HOME, not under homedir().
   assert.notEqual(defaultConfigPath(), join(homedir(), '.vicoop', 'config.json'));
 });
+
+
+test('reserved caller-container runtime survives normalization so startup can reject it', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-isolation-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  writeFileSync(path, JSON.stringify({ backends: { claude: { runtime: 'caller-container' } } }));
+  assert.equal(readConfig(path)?.backends?.claude?.runtime, 'caller-container');
+});

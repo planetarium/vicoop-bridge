@@ -491,11 +491,14 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
 //   the bind-mount source from container init.
 async function resolveRuntime(args: {
   kind: 'claude' | 'codex';
-  runtime: 'host' | 'container' | undefined;
+  runtime: 'host' | 'container' | 'caller-container' | undefined;
   runtimeName: string | undefined;
   cwd: string | undefined;
   bridgeUrl: string;
 }): Promise<{ spawn?: SpawnFn; cwd?: string; runtime?: RuntimeContainer }> {
+  if (args.runtime === 'caller-container') {
+    throw new Error('caller-container isolation is not available in this release (#497 R2)');
+  }
   if ((args.runtime ?? 'host') !== 'container') {
     return { cwd: args.cwd };
   }

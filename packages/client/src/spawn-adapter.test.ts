@@ -69,3 +69,14 @@ test('createDockerExecSpawn: handle exposes stdin/stdout/stderr + kill', () => {
   assert.ok(child.stderr, 'stderr available');
   assert.equal(child.kill('SIGTERM'), true);
 });
+
+
+test('Docker env overrides are argv values; host secrets are not implicitly forwarded', () => {
+  const { calls, spawnImpl } = makeSpawnStub();
+  const spawn = createDockerExecSpawn(runtimeStub, { spawnImpl });
+  const value = 'spaces; $(echo unsafe) `literal`';
+  spawn('claude', [], { env: { BRIDGE_TEST: value, OMIT: undefined } });
+  assert.deepEqual(calls[0].args, ['exec', '-i', '-e', `BRIDGE_TEST=${value}`, 'vicoop-runtime-test', 'claude']);
+  assert.throws(() => spawn('claude', [], { env: { 'BAD=KEY': 'value' } }), /invalid runtime environment/);
+  assert.equal(calls.length, 1);
+});
