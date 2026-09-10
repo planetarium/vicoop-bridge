@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from 'node:child_process';
+import { readFileSync, statSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { Duplex, PassThrough, Writable } from 'node:stream';
 import { createClaudeAuthBroker, type BrokerOptions } from './claude-auth-broker.js';
@@ -21,6 +22,17 @@ export function createClaudeBrokerSpawn(container: string, opts: BrokerOptions &
       if (!['ENABLE_PROMPT_CACHING_1H', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS', 'MAX_THINKING_TOKENS', 'CLAUDE_CODE_EFFORT_LEVEL', 'CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING'].includes(key)) {
         throw new Error(`Unsupported Claude container spawn environment: ${key}`);
       }
+    }
+    const promptFiles: Array<{argIndex:number; content:Buffer}> = [];
+    let stagedBytes = 0;
+    for (let i = 0; i < args.length; i++) {
+      if (!['--append-system-prompt-file', '--system-prompt-file'].includes(args[i])) continue;
+      const path = args[++i];
+      if (!path || promptFiles.length >= 2) throw new Error('Invalid Claude prompt-file arguments');
+      const stat = statSync(path);
+      stagedBytes += stat.size;
+      if (!stat.isFile() || stagedBytes > 16 * 1024 * 1024) throw new Error('Claude prompt files exceed the staging limit');
+      promptFiles.push({argIndex:i,content:readFileSync(path)});
     }
     const broker = createClaudeAuthBroker(opts);
     const relay = (opts.spawnImpl ?? nodeSpawn)('docker', ['exec', '-i', container, 'node', '-e', CLAUDE_BROKER_RELAY], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -118,7 +130,20 @@ export function createClaudeBrokerSpawn(container: string, opts: BrokerOptions &
       }
       if (pending.length > 256 * 1024) fail();
     });
-    send({ t: 'start', command, args, cwd: options.cwd, env, token: broker.token, authentication: opts.authentication ?? 'oauth' });
+    // Only host-generated CLI prompt-file arguments are read here. Workload
+    // frames cannot request host files. Transfer in bounded chunks before ready.
+    void (async () => {
+      for (let id = 0; id < promptFiles.length; id++) {
+        const content = promptFiles[id].content;
+        for (let offset = 0; offset < content.length; offset += 48 * 1024) {
+          if (ended || !relay.stdin || relay.stdin.destroyed) return;
+          const frame = {t:'file',id,data:content.subarray(offset,offset + 48 * 1024).toString('base64')};
+          await new Promise<void>((resolve,reject) => relay.stdin!.write(JSON.stringify(frame) + '\n', err => err ? reject(err) : resolve()));
+        }
+      }
+      send({ t: 'start', command, args, cwd: options.cwd, env, token: broker.token,
+        authentication: opts.authentication ?? 'oauth', files:promptFiles.map((file,id)=>({id,argIndex:file.argIndex})) });
+    })().catch(fail);
     return Object.assign(events, {
       stdin, stdout, stderr,
       kill(signal: NodeJS.Signals = 'SIGTERM') {

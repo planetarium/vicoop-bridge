@@ -83,3 +83,27 @@ test('cancellation closes an active upstream transport, observed by an independe
     await waitFor(/disconnected/); await done;
   } finally { adapter.close(); upstream.kill('SIGKILL'); }
 });
+
+test('host prompt files are staged for the workload and removed after execution', async () => {
+  const {mkdtempSync,writeFileSync,existsSync,rmSync} = await import('node:fs');
+  const {tmpdir} = await import('node:os'); const {join} = await import('node:path');
+  const hostDir=mkdtempSync(join(tmpdir(),'host-prompt-'));
+  const hostFile=join(hostDir,'prompt.txt');
+  // Larger than one frame, including Unicode and newlines.
+  const content='system instruction 한글\n'.repeat(20000);
+  writeFileSync(hostFile,content);
+  const adapter=createClaudeBrokerSpawn('fixture',{spawnImpl:localSpawn,credential:()=>({kind:'oauth',secret:'host-secret'})});
+  try {
+    const child=adapter.spawn('node',['-e',`const fs=require('fs'); const path=process.argv[2]; console.log(JSON.stringify({path,bytes:fs.statSync(path).size,tail:fs.readFileSync(path,'utf8').slice(-22)}));`,'--','--append-system-prompt-file',hostFile],{});
+    let output='';child.stdout!.on('data',c=>output+=c);child.stderr!.resume();
+    const done=new Promise<number|null>(r=>child.on('close',r));child.stdin!.end();
+    assert.equal(await done,0);
+    const result=JSON.parse(output);
+    assert.notEqual(result.path,hostFile);
+    assert.equal(result.bytes,Buffer.byteLength(content));
+    assert.equal(result.tail,content.slice(-22));
+    // The relay flushes its exit frame before its own cleanup completes.
+    for(let n=0;n<30 && existsSync(result.path);n++) await new Promise(r=>setTimeout(r,10));
+    assert.ok(!existsSync(result.path));assert.ok(existsSync(hostFile));
+  } finally {adapter.close();rmSync(hostDir,{recursive:true,force:true});}
+});

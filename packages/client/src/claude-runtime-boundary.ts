@@ -37,6 +37,14 @@ export function claudeBrokerFirewallScript(): string {
 iptables -w -N VICOOP_BROKER 2>/dev/null || true
 iptables -w -F VICOOP_BROKER
 iptables -w -A VICOOP_BROKER -o lo -j ACCEPT
+# The default Docker bridge can use a private host DNS resolver rather than
+# 127.0.0.11. Permit DNS only to those configured IPv4 resolvers, not their
+# other services. Validate addresses before passing them to iptables.
+for resolver in $(awk '/^nameserver / {print $2}' /etc/resolv.conf); do
+  case "$resolver" in *[!0-9.]*|'') continue ;; esac
+  iptables -w -A VICOOP_BROKER -d "$resolver" -p udp --dport 53 -j ACCEPT
+  iptables -w -A VICOOP_BROKER -d "$resolver" -p tcp --dport 53 -j ACCEPT
+done
 ${blocked.map(ip => `iptables -w -A VICOOP_BROKER -d ${ip} -j REJECT`).join('\n')}
 # Docker Desktop's host alias can resolve outside the ordinary gateway subnet.
 for ip in $(getent ahostsv4 host.docker.internal 2>/dev/null | awk '{print $1}' | sort -u); do

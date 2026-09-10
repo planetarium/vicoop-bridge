@@ -41,6 +41,9 @@ test('new Claude runtime mounts only agent/session volumes and applies firewall 
   const firewall = calls.at(-1)!;
   assert.deepEqual(firewall.slice(0,4), ['exec','--user','0','vicoop-runtime-work']);
   assert.match(firewall.at(-1)!, /ip6tables -w -P OUTPUT DROP/);
+  const script = firewall.at(-1)!;
+  assert.ok(script.indexOf('--dport 53 -j ACCEPT') < script.indexOf('-d 192.168.0.0/16 -j REJECT'));
+  assert.match(script, /-p tcp --dport 53 -j ACCEPT/);
 });
 
 test('legacy runtime is rejected before start or any credential probe', async () => {

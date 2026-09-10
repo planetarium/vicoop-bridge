@@ -5,6 +5,9 @@ export const CLAUDE_BROKER_RELAY = String.raw`
 'use strict';
 const net = require('node:net');
 const {spawn} = require('node:child_process');
+const fs = require('node:fs');
+const promptFiles = new Map();
+let promptDirectory, stagedBytes = 0;
 let child, server, next = 0, pending = '', started = false, closing = false;
 const sockets = new Map();
 function send(frame) {
@@ -20,6 +23,7 @@ function shutdown(code) {
   killGroup('SIGKILL');
   for (const socket of sockets.values()) socket.destroy();
   if (server) server.close();
+  if (promptDirectory) fs.rmSync(promptDirectory,{recursive:true,force:true});
   process.exit(code);
 }
 process.stdin.on('end', () => shutdown(1));
@@ -38,8 +42,27 @@ process.stdin.on('data', chunk => {
   if (pending.length > 256 * 1024) shutdown(1);
 });
 function receive(m) {
+  if (m.t === 'file' && !started) {
+    if (![0,1].includes(m.id)) return shutdown(1);
+    const data = Buffer.from(m.data,'base64');
+    stagedBytes += data.length;
+    if (stagedBytes > 16 * 1024 * 1024) return shutdown(1);
+    if (!promptFiles.has(m.id)) promptFiles.set(m.id,[]);
+    promptFiles.get(m.id).push(data);
+    return;
+  }
   if (m.t === 'start' && !started) {
     started = true;
+    if (m.files && m.files.length) {
+      promptDirectory = fs.mkdtempSync('/tmp/vicoop-prompt-');
+      for (const file of m.files) {
+        if (![0,1].includes(file.id) || !Number.isInteger(file.argIndex) || file.argIndex < 1 || file.argIndex >= m.args.length) return shutdown(1);
+        const path = promptDirectory + '/prompt-' + file.id + '.txt';
+        fs.writeFileSync(path,Buffer.concat(promptFiles.get(file.id) || []),{mode:0o600});
+        m.args[file.argIndex] = path;
+      }
+      promptFiles.clear();
+    }
     server = net.createServer(socket => {
       if (sockets.size >= 16) return socket.destroy();
       const id = ++next;

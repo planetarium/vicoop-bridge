@@ -125,7 +125,8 @@ caller scope, lease and generation before caller-isolation claims are made.
 The runtime runs as `node` with `no-new-privileges`. Before agent use, the host
 installs firewall rules through a privileged Docker control-plane exec. Private,
 link-local and host interface/gateway destinations are rejected, and IPv6 egress
-is blocked except loopback. Public internet tool traffic remains subject to the
+is blocked except loopback. DNS (UDP/TCP port 53) is allowed only to the
+configured IPv4 resolvers, including Docker default-bridge private resolvers. Public internet tool traffic remains subject to the
 image's existing egress policy. Failure to apply this boundary stops startup;
 `VICOOP_SKIP_FIREWALL` cannot disable these broker-specific rules. Workloads can
 no longer reach private repositories, LAN services or host-local MCP servers;
@@ -133,6 +134,11 @@ move required services to an appropriately authenticated public endpoint or keep
 using host mode for that workload. A workload cannot alter these rules using
 its unprivileged exec user. Host administrative APIs and credential stores are
 not exposed by the relay.
+
+Host-generated `--system-prompt-file` and `--append-system-prompt-file` inputs
+are transferred in bounded chunks over the same Docker channel (16 MiB total).
+The relay rewrites their arguments to private execution-owned temporary files
+and removes those files on exit. Workload frames cannot request host files.
 
 Completion, cancellation, transport loss and shutdown revoke the grant and close
 active upstream connections. The relay owns an agent process group and terminates
@@ -210,3 +216,12 @@ files. **Actual API-key inference (`--real-api`) and native Linux-host operation
 validation**; no host API key was available during implementation. R2's real A/B/A,
 lease/generation, replay/checkpoint and full A2A acceptance tests remain follow-up
 work and this change must not close #500 or #497.
+
+
+A main-first production-server smoke on 2026-09-10 also exercised the compiled
+client with a newly installed Claude 2.1.267 runtime: an authenticated A2A request
+created and read back a workspace file, and a separate task lookup confirmed
+`completed`. Fresh installation exposed a Docker private-DNS exception missing
+from the firewall, while the first A2A request exposed host prompt-file paths;
+both paths now have fixes and regression coverage. This is single-runtime A2A
+evidence, not R2 caller-isolation acceptance evidence.
