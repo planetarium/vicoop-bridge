@@ -3,7 +3,14 @@ import assert from 'node:assert/strict';
 import { promisify } from 'node:util';
 import { spawn, execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, writeFile, realpath, rm } from 'node:fs/promises';
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  writeFile,
+  realpath,
+  rm,
+} from 'node:fs/promises';
 import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
@@ -15,6 +22,9 @@ if (!binary || !image)
     'set VICOOP_CLIENT_BIN (absolute compiled CLI path), VICOOP_SMOKE_IMAGE (pinned fixture image)',
   );
 const directory = await mkdtemp(join(tmpdir(), 'vicoop-caller-client-'));
+const clientHome = join(directory, 'client-home');
+await mkdir(clientHome, { mode: 0o700 });
+const clientEnv = { ...process.env, VICOOP_HOME: clientHome };
 const key = join(directory, 'key');
 const configPath = join(directory, 'config.json');
 await writeFile(key, 'fixture-no-api-call', { mode: 0o600 });
@@ -92,6 +102,7 @@ async function start() {
   const previous = hellos;
   child = spawn(binary, ['start', '--config', configPath], {
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: clientEnv,
   });
   child.stdout.on('data', (x) => {
     logs += x;
@@ -254,11 +265,107 @@ try {
     ),
   );
   await stop();
+
+  // Exercise the public detached start/stop commands, not just direct SIGTERM.
+  // Delay only this test daemon's Docker removals beyond the old 10-second grace.
+  const shimDir = join(directory, 'docker-bin');
+  await mkdir(shimDir, { mode: 0o700 });
+  const realDocker = (await exec('which', ['docker'])).stdout.trim();
+  const marker = join(directory, 'removal-started');
+  await writeFile(
+    join(shimDir, 'docker'),
+    `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+const run = () => {
+  const result = spawnSync(${JSON.stringify(realDocker)}, args, { stdio: 'inherit' });
+  process.exit(result.status === 0 ? 0 : 1);
+};
+if (args[0] === 'rm' && args[1] === '-f') {
+  require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'removing');
+  setTimeout(run, 12000);
+} else run();
+`,
+    { mode: 0o700 },
+  );
+  const detachedEnv = { ...clientEnv, PATH: `${shimDir}:${process.env.PATH}` };
+  const previous = hellos;
+  await exec(binary, ['start', '--detach', '--config', configPath], {
+    env: detachedEnv,
+    timeout: 30_000,
+  });
+  await waitFor(() => hellos > previous, 'detached hello');
+  const pidPath = join(clientHome, 'vicoop.pid');
+  const record = JSON.parse(await readFile(pidPath, 'utf8'));
+  assert.equal(
+    record.shutdownTimeoutMs,
+    120_000,
+    'record the config-selected caller mode at launch',
+  );
+  assign('apikey:a', 'detached-stop', 'hold-task');
+  let active = false;
+  for (let attempt = 0; attempt < 50 && !active; attempt++) {
+    const { stdout } = await exec(realDocker, [
+      'ps',
+      '--format',
+      '{{.Names}}',
+      '--filter',
+      `label=vicoop.caller-namespace=${namespace}`,
+    ]);
+    active = Boolean(stdout.trim());
+    if (!active) await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(active, 'stop while a real caller container exists');
+  // Later config edits must not shorten the already-running daemon's cleanup.
+  await writeFile(
+    configPath,
+    JSON.stringify({ ...config, backends: { claude: { runtime: 'host' } } }),
+    { mode: 0o600 },
+  );
+  const [stopped] = await Promise.all([
+    exec(binary, ['stop'], { env: clientEnv, timeout: 30_000 }),
+    (async () => {
+      await new Promise((r) => setTimeout(r, 11_000));
+      process.kill(record.pid, 0);
+      assert.equal(await readFile(marker, 'utf8'), 'removing');
+      assert.equal(
+        JSON.parse(await readFile(pidPath, 'utf8')).pid,
+        record.pid,
+        'retain ownership during cleanup',
+      );
+    })(),
+  ]);
+  assert.doesNotMatch(stopped.stdout, /force|kill/i);
+  await assert.rejects(readFile(pidPath), { code: 'ENOENT' });
+  await assert.rejects(
+    readFile(join(config.caller_runtime.stateDirectory, 'owner.json')),
+    { code: 'ENOENT' },
+  );
+  const remaining = await exec(realDocker, [
+    'ps',
+    '-aq',
+    '--filter',
+    `label=vicoop.caller-namespace=${namespace}`,
+  ]);
+  assert.equal(remaining.stdout.trim(), '');
+  const remainingNetworks = await exec(realDocker, [
+    'network',
+    'ls',
+    '-q',
+    '--filter',
+    `label=vicoop.caller-namespace=${namespace}`,
+  ]);
+  assert.equal(remainingNetworks.stdout.trim(), '');
+  console.log(
+    'detached stop smoke passed: config-only caller mode, delayed Docker cleanup >10s, retained ownership, no SIGKILL/orphans',
+  );
   console.log(
     'compiled caller client smoke passed: Claude argv/prompt staging, A/B/A sessions+files, disconnect/replay, forced restart+reset, orderly shutdown',
   );
 } finally {
   await stop();
+  // This VICOOP_HOME is unique to the test; never signal the operator's daemon.
+  await exec(binary, ['stop'], { env: clientEnv, timeout: 130_000 });
   for (const ws of server.clients) ws.terminate();
   await new Promise((r) => server.close(r));
   // Reconcile any remaining generation after test failure before deleting state.

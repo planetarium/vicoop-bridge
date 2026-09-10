@@ -325,3 +325,45 @@ test('cancellation after checkpoint commit reports retained state instead of rol
   assert.equal(committed, true);
   await backend.close();
 });
+
+test('queued context capacity rejection preserves existing sessions and the full limit', async () => {
+  const f = fixture();
+  await f.backend.initialize();
+  const context = (id: number) => ({ ...task(), contextId: `context-${id}` });
+  try {
+    for (let id = 1; id <= 255; id++) await f.run(context(id));
+    // Both pass initial admission before the first acquires its queue lease.
+    const [accepted, rejected] = await Promise.all([
+      f.run(context(256)),
+      f.run(context(257)),
+    ]);
+    assert.equal(accepted.at(-1)?.type, 'task.complete');
+    const denied = rejected.at(-1);
+    assert.equal(denied?.type, 'task.fail');
+    if (denied?.type === 'task.fail')
+      assert.equal(denied.error.code, 'runtime_capacity');
+    assert.equal(f.stats().starts, 256);
+    const existing = await f.run(context(1));
+    assert.equal(existing.at(-1)?.type, 'task.complete');
+    assert.equal(
+      existing.find((frame) => frame.type === 'task.status')?.metadata
+        ?.instance,
+      1,
+    );
+    assert.equal(
+      existing.some(
+        (frame) => 'metadata' in frame && frame.metadata?.['vicoop.runtime'],
+      ),
+      false,
+    );
+    assert.equal(f.stats().factories, 1);
+    assert.equal((await f.run(context(257))).at(-1)?.type, 'task.fail');
+    assert.equal(
+      f.stats().starts,
+      257,
+      'capacity rejection allocates nothing and retains the existing context count',
+    );
+  } finally {
+    await f.backend.close();
+  }
+});

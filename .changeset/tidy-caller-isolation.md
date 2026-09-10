@@ -3,3 +3,5 @@
 ---
 
 Add opt-in Claude caller-isolated Docker execution with bounded transactional workspaces, direct-principal negotiation, cancellation cleanup, crash reconciliation, and offline state inspection/deletion. Requires an upgraded bridge server and a pinned backend image; existing host and single-container modes remain supported.
+
+Preserve existing conversations when queued requests exceed the context limit, and let detached caller daemons finish their cleanup before `stop` escalates to SIGKILL.

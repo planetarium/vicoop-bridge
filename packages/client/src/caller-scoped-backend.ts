@@ -154,11 +154,20 @@ export class CallerScopedBackend implements Backend {
     let backendOpen = false;
     try {
       await abortable(waiting, controller.signal);
-      acquired = true;
       if (entry.quarantined || this.stopped)
         throw new Error('caller runtime is quarantined or stopping');
-      if (!entry.contexts.has(task.contextId) && entry.contexts.size >= 256)
-        throw new Error('caller conversation capacity reached');
+      if (!entry.contexts.has(task.contextId) && entry.contexts.size >= 256) {
+        // Capacity can change while queued. Reject admission without invalidating
+        // the scope's existing backend/session bindings. finally releases the queue.
+        this.fail(
+          task,
+          emit,
+          'runtime_capacity',
+          'caller conversation capacity reached (256)',
+        );
+        return;
+      }
+      acquired = true;
       allocationAttempted = true;
       runtime = await this.pool.start(scopeId, controller.signal);
       if (!entry.backend) {

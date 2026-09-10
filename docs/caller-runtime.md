@@ -160,7 +160,9 @@ A crash during the short owner-file critical section may leave `.guard`; inspect
 owner PID, Docker resources and directory ownership before manually removing this
 lock directory. A wedged Docker engine can leave a quarantine/owner record and
 resources; restore Docker access and restart for reconciliation. Orderly shutdown
-awaits tasks/cleanup for up to 120 seconds, then process exit leaves recovery to the
+awaits tasks/cleanup for up to 120 seconds. Detached `stop` honors the launch-time
+cleanup budget plus a 5-second exit margin, even if configuration changes later;
+its pidfile remains owned until cleanup ends. After the deadline, process exit leaves recovery to the
 watchdog and next startup. The watchdog terminates processes but does not delete
 Docker metadata/networks. Do not manually remove resources belonging to a live
 owner. Rich live inspection, idle eviction and retention automation belong to R3.

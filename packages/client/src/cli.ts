@@ -68,6 +68,7 @@ import {
 } from './cli-args.js';
 import { createLogger, type Logger } from './logger.js';
 import {
+  CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS,
   claimPidFile,
   defaultLogPath,
   detachChildArgv,
@@ -691,7 +692,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     // Client class deliberately does not call process.exit itself —
     // tests and future in-process embedders pass a non-exiting callback.
     onFatal: () => {
-      if (backendShutdown) void runWithShutdownTimeout(backendShutdown, logger, 120_000).finally(() => process.exit(1));
+      if (backendShutdown) void runWithShutdownTimeout(backendShutdown, logger, CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS).finally(() => process.exit(1));
       else process.exit(1);
     },
   });
@@ -720,14 +721,14 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     void (async () => {
       logger.info(`shutting down (${signal})`);
       client.stop();
-      if (ownsPidFile) removePidFile();
       if (backendShutdown) {
         try {
-          await runWithShutdownTimeout(backendShutdown, logger, backend.requiresCallerScope ? 120_000 : SHUTDOWN_TIMEOUT_MS);
+          await runWithShutdownTimeout(backendShutdown, logger, backend.requiresCallerScope ? CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS : SHUTDOWN_TIMEOUT_MS);
         } catch (err) {
           logger.error('shutdown error:', (err as Error).message);
         }
       }
+      if (ownsPidFile) removePidFile();
       process.exit(0);
     })();
   };
@@ -826,6 +827,9 @@ async function startDetached(
     process.exit(1);
   }
 
+  const args = resolveDaemonArgs(parsed);
+  const shutdownBudget = args.runtime === 'caller-container'
+    ? { shutdownTimeoutMs: CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS } : {};
   const path = pidFilePath();
   const logPath = parsed.logFile?.trim() || defaultLogPath();
 
@@ -835,6 +839,7 @@ async function startDetached(
   // sees a coherent "running" record and backs off instead of double-spawning.
   // From here on, every failure path must release the claim via removePidFile.
   const claim = claimPidFile({
+    ...shutdownBudget,
     pid: process.pid,
     startedAt: Date.now(),
     argv: process.argv,
@@ -894,6 +899,7 @@ async function startDetached(
   // identity so `stop`/`status` can later tell it apart from a recycled PID.
   writePidRecord(
     {
+      ...shutdownBudget,
       pid: child.pid,
       startedAt: Date.now(),
       argv: [process.execPath, ...childArgv],
