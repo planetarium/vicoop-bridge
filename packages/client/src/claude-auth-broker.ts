@@ -74,7 +74,8 @@ export function createClaudeAuthBroker(opts: BrokerOptions) {
       !(origin.origin === 'https://api.anthropic.com' || (origin.protocol === 'http:' && origin.hostname === '127.0.0.1'))) {
     throw new Error('Invalid broker upstream');
   }
-  const token = `sk-ant-${opts.authentication === 'api-key' ? 'api03' : 'oat01'}-bridge-${randomBytes(32).toString('hex')}`;
+  // A bridge execution grant, deliberately distinct from provider credentials.
+  const token = `vbc_exec_${randomBytes(32).toString('hex')}`;
   const active = new Set<() => void>();
   const sockets = new Set<Duplex>();
   const stats = { forwarded: 0, rejected: 0 };

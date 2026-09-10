@@ -105,7 +105,10 @@ there is no automatic downgrade or silent direct-auth fallback.
 
 ## Transport and lifecycle
 
-Each agent spawn owns a random grant, an HTTP broker on a Unix socket in a
+Each agent spawn owns a random `vbc_exec_<64 hex characters>` grant. This
+provider-independent prefix distinguishes it from real Anthropic credentials;
+the environment variable still matches the selected OAuth/API-key mode. The
+spawn also owns an HTTP broker on a Unix socket in a
 host-private temporary directory (mode 0700), and a Docker exec relay. No host
 TCP port is opened and no Unix socket/path is mounted into Docker. The relay
 listens only on `127.0.0.1` inside its runtime and multiplexes HTTP and agent

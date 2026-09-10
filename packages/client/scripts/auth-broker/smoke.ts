@@ -83,7 +83,7 @@ try {
     (async () => {
       const assert = require('assert/strict'), fs = require('fs');
       assert.ok(!JSON.stringify(process.env).includes(['fixture','host','only'].join('-')));
-      assert.ok(!process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY.startsWith('sk-ant-api03-bridge-'));
+      assert.ok((process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.ANTHROPIC_API_KEY || '').startsWith('vbc_exec_'));
       assert.ok(!fs.existsSync('/data/creds/claude/.credentials.json'));
       assert.ok(!fs.existsSync('/data/sessions/claude/config/.credentials.json'));
       assert.ok(!fs.readFileSync('/proc/self/cmdline','utf8').includes(['fixture','host','only'].join('-')));
