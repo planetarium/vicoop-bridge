@@ -60,8 +60,9 @@ export function createClaudeBrokerSpawn(container: string, opts: BrokerOptions &
     };
     const stop = () => {
       broker.revoke();
-      send({ t: 'kill', signal: 'SIGKILL' });
-      relay.stdin?.end();
+      // Close the trusted supervisor input, discarding queued workload frames.
+      // A stopped relay cannot process a kill frame or drain its input queue.
+      relay.stdin?.destroy();
     };
     const finish = (code: number | null, signal: NodeJS.Signals | null) => {
       if (ended) return;
@@ -177,10 +178,10 @@ export function createClaudeBrokerSpawn(container: string, opts: BrokerOptions &
     })().catch(fail);
     return Object.assign(events, {
       stdin, stdout, stderr,
-      kill(signal: NodeJS.Signals = 'SIGTERM') {
-        broker.revoke();
-        send({ t: 'kill', signal });
-        return !ended;
+      kill(_signal: NodeJS.Signals = 'SIGTERM') {
+        if (ended) return false;
+        fail();
+        return true;
       },
     }) as ChildHandle;
   };

@@ -16,7 +16,13 @@ const relay = spawn('/usr/local/bin/node', ['-e', process.argv[2]], {
 });
 const relayClosed = new Promise(resolve=>relay.once('close',resolve));
 // No frame interpretation here: this process only supervises pipes/lifetime.
-process.stdin.pipe(relay.stdin);
+// Keep consuming the trusted input even when a workload has stopped the relay.
+// pipe() backpressure would pause stdin and hide EOF/cancellation indefinitely.
+process.stdin.on('data',chunk=>{
+  if (closing) return;
+  if (relay.stdin.writableLength > 8*1024*1024) { shutdown(); return; }
+  relay.stdin.write(chunk);
+});
 relay.stdout.pipe(process.stdout, {end:false});
 relay.stderr.pipe(process.stderr, {end:false});
 function descendants() {
@@ -54,7 +60,6 @@ async function shutdown() {
   if (closing) return;
   closing = true;
   clearTimeout(timer);
-  process.stdin.unpipe(relay.stdin);
   relay.stdin.destroy();
   try {
     // Freeze before killing so an adversarial process cannot keep forking.

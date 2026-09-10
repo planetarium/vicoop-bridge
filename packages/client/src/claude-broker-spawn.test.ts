@@ -6,8 +6,41 @@ import { once } from 'node:events';
 import { createClaudeBrokerSpawn } from './claude-broker-spawn.js';
 
 // Exercise the real relay/HTTP parser through OS pipes, with no Docker needed.
+// The wrapper mirrors successful supervisor cleanup (transport exit 0) even
+// when the relay exits on EOF. Actual root supervision is tested in Docker.
 const localSpawn: typeof spawn = ((_cmd: string, args: string[], opts: object) =>
-  spawn(process.execPath, ['-e', args[args.length - 1]], { ...opts, env: { PATH: process.env.PATH } })) as typeof spawn;
+  spawn('/bin/sh', ['-c', '"$@"; exit 0', 'supervisor-stand-in', process.execPath, '-e', args[args.length - 1]],
+    { ...opts, env: { PATH: process.env.PATH } })) as typeof spawn;
+
+test('cancellation closes trusted input even when kill frames are ignored', async () => {
+  for (const signal of ['SIGTERM','SIGKILL'] as const) {
+    let ready!: () => void;
+    const started=new Promise<void>(resolve=>{ready=resolve;});
+    const ignoringRelay: typeof spawn = ((_cmd: string, _args: string[], opts: object) => {
+      const processChild=spawn(process.execPath,['-e',`
+        process.stdin.on('data',()=>{});
+        process.stdin.on('end',()=>process.exit(0));
+        console.log(JSON.stringify({t:'ready'}));
+      `],{...opts,env:{PATH:process.env.PATH}});
+      processChild.stdout!.once('data',ready);
+      return processChild;
+    }) as typeof spawn;
+    const adapter=createClaudeBrokerSpawn('fixture',{spawnImpl:ignoringRelay,
+      credential:()=>({kind:'oauth',secret:'mock-only'})});
+    const child=adapter.spawn('unused',[],{});
+    child.stdout!.resume();child.stderr!.resume();
+    const closed=new Promise<number|null>(resolve=>child.on('close',resolve));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await started;
+      child.kill(signal);
+      const code=await Promise.race([closed,new Promise<never>((_,reject)=>{
+        timer=setTimeout(()=>reject(new Error('cancellation did not close supervisor input')),1000);
+      })]);
+      assert.equal(code,1);
+    } finally {clearTimeout(timer);adapter.close();await closed;}
+  }
+});
 
 test('an exit frame cannot report completion before the supervisor transport exits', async () => {
   let transportClosed = false;

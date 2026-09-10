@@ -38,12 +38,13 @@ const docker = (args: string[]) => {
   if (r.status !== 0) throw new Error(`Docker ${args[0]} failed (exit ${r.status}); output withheld`);
   return r.stdout;
 };
-function capture(child: ChildHandle, input = '') {
+function capture(child: ChildHandle, input = '', endInput = true) {
   let stdout = ''; let stderr = '';
   child.stdout!.on('data', c => stdout += c);
   child.stderr!.on('data', c => stderr += c);
   const closed = new Promise<{ code: number | null; stdout: string; stderr: string }>(resolve => child.on('close', code => resolve({ code, stdout, stderr })));
-  child.stdin!.end(input);
+  if (endInput) child.stdin!.end(input);
+  else if (input) child.stdin!.write(input);
   return closed;
 }
 let forwarded = 0;
@@ -176,7 +177,7 @@ try {
   const survivorDone=capture(survivor);
   try {
     await survivorReady;
-    for (const mode of ['relay-death','cancel-detached']) {
+    for (const mode of ['relay-death','cancel-detached','stopped-relay-term','stopped-relay-kill','stopped-relay-blocked-input']) {
       const attack=adapter.spawn('node',['-e',`
         const {spawn}=require('child_process');
         const stat=require('fs').readFileSync('/proc/'+process.ppid+'/stat','utf8');
@@ -186,18 +187,37 @@ try {
         require('assert/strict').ok(protectedSupervisor,'workload can kill its supervisor');
         const detached=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});
         detached.unref();
-        console.log(JSON.stringify({pid:process.pid,detached:detached.pid}));
+        console.log(JSON.stringify({pid:process.pid,detached:detached.pid,relay:process.ppid}));
         ${mode==='relay-death' ? "setTimeout(()=>process.kill(process.ppid,'SIGKILL'),50);" : ''}
+        ${mode.startsWith('stopped-relay') ? "setTimeout(()=>process.kill(process.ppid,'SIGSTOP'),50);" : ''}
         setInterval(()=>{},1000);
       `],{});
       let attackText='';
       const attackReady=new Promise<void>(resolve=>attack.stdout!.on('data',c=>{attackText+=c;if(attackText.includes('\n'))resolve();}));
-      const attackDone=capture(attack);
+      const attackDone=capture(attack,'',mode!=='stopped-relay-blocked-input');
       await attackReady;
-      if(mode==='cancel-detached') attack.kill('SIGTERM');
-      const outcome=await attackDone;
-      assert.notEqual(outcome.code,0,'attack must not report success');
       const pids=JSON.parse(attackText);
+      if (mode.startsWith('stopped-relay')) {
+        let stopped=false;
+        for(let n=0;n<30;n++) {
+          const stat=docker(['exec',container,'/bin/cat',`/proc/${pids.relay}/stat`]);
+          stopped=stat.slice(stat.lastIndexOf(')')+2).startsWith('T ');
+          if(stopped) break;
+          await new Promise(r=>setTimeout(r,25));
+        }
+        assert.ok(stopped,'attack did not stop the relay');
+        if(mode==='stopped-relay-blocked-input') {
+          attack.stdin!.write(Buffer.alloc(2*1024*1024,120));
+          await new Promise(r=>setTimeout(r,100));
+        }
+        attack.kill(mode==='stopped-relay-kill' ? 'SIGKILL' : 'SIGTERM');
+      }
+      if(mode==='cancel-detached') attack.kill('SIGTERM');
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const outcome=await Promise.race([attackDone,new Promise<never>((_,reject)=>{
+        timeout=setTimeout(()=>reject(new Error(`${mode}: cancellation exceeded 5 seconds`)),5000);
+      })]).finally(()=>clearTimeout(timeout));
+      assert.notEqual(outcome.code,0,'attack must not report success');
       for(const pid of [pids.pid,pids.detached]) {
         assert.notEqual(spawnSync('docker',['exec',container,'/usr/bin/test','-e',`/proc/${pid}`]).status,0,
           `${mode}: workload survived completed cleanup`);
@@ -262,7 +282,7 @@ try {
     }
     assert.ok(!exists,'workload survived abrupt bridge death');
   } finally { worker.kill('SIGKILL'); rmSync(workerTemp,{recursive:true,force:true}); }
-  console.log(JSON.stringify({mode:real?`real-${authentication}`:'mock-oauth-and-api-key', success:true, mockRequests:real?undefined:forwarded, cancellation:true, hostCrash:true, stolenGrantRejected:true, privilegedPathIsolated:true, relayDeathCleanup:true, detachedCleanup:true, concurrentExecutionPreserved:true}));
+  console.log(JSON.stringify({mode:real?`real-${authentication}`:'mock-oauth-and-api-key', success:true, mockRequests:real?undefined:forwarded, cancellation:true, hostCrash:true, stolenGrantRejected:true, privilegedPathIsolated:true, relayDeathCleanup:true, detachedCleanup:true, stoppedRelayCancellation:true, blockedInputCancellation:true, concurrentExecutionPreserved:true}));
 } finally {
   adapter.close(); upstream.closeAllConnections(); await new Promise<void>(r => upstream.close(() => r()));
   spawnSync('docker', ['rm', '-f', container], { stdio: 'ignore' });

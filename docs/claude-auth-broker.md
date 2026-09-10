@@ -154,6 +154,11 @@ or runs workload commands as root. It drops the relay to UID/GID 1000 before
 execution. Workload code cannot signal the supervisor. On relay exit, stdin loss
 or TTL expiry, it stops and kills all descendants of that execution's subreaper,
 including detached/double-forked children, while preserving other executions.
+Cancellation revokes the grant and destroys the host's supervisor-input pipe,
+discarding queued frames; it does not depend on the relay processing a signal.
+The supervisor drains input with a bounded queue rather than pausing input on
+relay backpressure, so a SIGSTOP'd relay cannot hide cancellation EOF. Both
+SIGTERM and SIGKILL cancellation requests use this forced cleanup path.
 The host waits for supervisor exit and pipe drainage before reporting task close.
 If supervisor/Docker exit leaves cleanup uncertain, the adapter stops accepting
 work and attempts to stop the entire shared runtime through Docker; this also
@@ -226,7 +231,8 @@ and Bun-compiled Docker mock requests, OAuth inference and continuation, workloa
 credential probes, process cancellation, abrupt bridge death, stolen-grant rejection across two
 runtimes, a listening host-service access probe, Docker migration and cleanup.
 Adversarial Docker regressions additionally cover privileged PATH shadowing on
-restart, relay SIGKILL, detached descendants, supervisor signal protection, and
+restart, relay SIGKILL, detached descendants, supervisor signal protection,
+SIGSTOP'd relay cancellation (including blocked input), and
 preservation of concurrent executions. Node and Bun unit tests also
 cover API-key substitution, token-counting policy, SSE/cache usage, grant rejection,
 rotation/source pinning, errors/redirects and active upstream disconnection observed
