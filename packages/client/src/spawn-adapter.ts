@@ -50,6 +50,7 @@ export interface ChildHandle {
 
 export interface SpawnOptions {
   cwd?: string;
+  env?: Record<string, string>;
 }
 
 export type SpawnFn = (

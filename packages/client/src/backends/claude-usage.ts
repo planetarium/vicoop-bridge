@@ -161,6 +161,37 @@ export function readClaudeOAuthCreds(
   return null;
 }
 
+// Broker credentials must keep reading the same store after rotation/removal.
+// Unlike the usage UI's best-effort reader, a missing selected Keychain entry
+// must not silently switch to a possibly different credentials-file account.
+function brokerKeychainLookup(service: string): string | null {
+  try {
+    return execFileSync('security', ['find-generic-password', '-s', service, '-w'],
+      { stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).toString().trim() || null;
+  } catch (error) {
+    // security maps errSecItemNotFound (-25300) to exit status 44. Other
+    // failures (locked store, permissions, timeout) must not select a file.
+    if ((error as { status?: number }).status === 44) return null;
+    throw new Error('Cannot read host Claude Keychain login');
+  }
+}
+
+export function createPinnedClaudeOAuthReader(env: ClaudeCredEnv = {}): () => ClaudeOAuthCreds | null {
+  const platform = env.platform ?? process.platform;
+  const configDir = env.configDir ?? process.env.CLAUDE_CONFIG_DIR;
+  const path = join(configDir || join((env.homedir ?? homedir)(), '.claude'), '.credentials.json');
+  const lookup = env.keychainLookup ?? brokerKeychainLookup;
+  const read = env.readFileSync ?? readFileSync;
+  if (platform === 'darwin' && !configDir) {
+    let initial: string | null;
+    try { initial = lookup(CLAUDE_KEYCHAIN_SERVICE); } catch { throw new Error('Cannot read host Claude Keychain login'); }
+    if (initial) return () => {
+      try { const raw = lookup(CLAUDE_KEYCHAIN_SERVICE); return raw ? parseCreds(raw) : null; } catch { return null; }
+    };
+  }
+  return () => { try { return parseCreds(read(path).toString()); } catch { return null; } };
+}
+
 // Discover the installed Claude Code CLI version for the User-Agent (mirrors the
 // official client). Returns null on any failure; the caller substitutes the
 // fallback version.

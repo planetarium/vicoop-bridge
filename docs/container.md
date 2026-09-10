@@ -12,6 +12,10 @@ agent runtime containers via `docker exec`. The two profiles coexist;
 choose whichever fits your deployment. This doc is the bundled-direct
 side ([#244][244]).
 
+For Claude **external-runtime** authentication and migration, see
+[Claude host authentication broker](./claude-auth-broker.md). The credential
+environment examples below apply only to bundled-direct.
+
 [244]: https://github.com/planetarium/vicoop-bridge/issues/244
 [249]: https://github.com/planetarium/vicoop-bridge/issues/249
 
