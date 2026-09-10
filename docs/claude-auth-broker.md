@@ -57,7 +57,7 @@ vicoop-client --backend claude --runtime container
 
 `container init claude --from-host` is accepted for compatibility but does not
 copy secrets. Both forms validate host authentication. The runtime image must
-contain Node, `iptables`, `ip6tables` and the normal install recipe (the existing
+contain Node at `/usr/local/bin/node`, `/usr/bin/tini`, `iptables`, `ip6tables` and the normal install recipe (the existing
 `vicoop-runtime` image includes them).
 
 ## Existing runtime migration
@@ -125,8 +125,10 @@ code in the **same** runtime can read/use an active grant: main's single runtime
 is not a caller boundary. R2 must bind relay/runtime ownership to the authorized
 caller scope, lease and generation before caller-isolation claims are made.
 
-The runtime runs as `node` with `no-new-privileges`. Before agent use, the host
-installs firewall rules through a privileged Docker control-plane exec. Private,
+The workload runs as `node` with `no-new-privileges`. Before agent use, the host
+installs firewall rules through a privileged Docker control-plane exec using an
+absolute shell path and a fixed system-only PATH. Writable agent binaries cannot
+replace these privileged commands on restart. Private,
 link-local and host interface/gateway destinations are rejected, and IPv6 egress
 is blocked except loopback. DNS (UDP/TCP port 53) is allowed only to the
 configured IPv4 resolvers, including Docker default-bridge private resolvers. Public internet tool traffic remains subject to the
@@ -144,9 +146,20 @@ The relay rewrites their arguments to private execution-owned temporary files
 and removes those files on exit. Workload frames cannot request host files.
 
 Completion, cancellation, transport loss and shutdown revoke the grant and close
-active upstream connections. The relay owns an agent process group and terminates
-it on cancellation or Docker stdin loss; killing only the host `docker exec`
-process is not used as proof of agent termination. Startup failure, malformed
+active upstream connections. Each execution runs under its own root-owned tini
+subreaper and supervisor, started using absolute image-owned binaries with Node
+and dynamic-loader injection variables cleared. The supervisor only forwards
+opaque stdio and manages process lifetime; it never interprets workload frames
+or runs workload commands as root. It drops the relay to UID/GID 1000 before
+execution. Workload code cannot signal the supervisor. On relay exit, stdin loss
+or TTL expiry, it stops and kills all descendants of that execution's subreaper,
+including detached/double-forked children, while preserving other executions.
+The host waits for supervisor exit and pipe drainage before reporting task close.
+If supervisor/Docker exit leaves cleanup uncertain, the adapter stops accepting
+work and attempts to stop the entire shared runtime through Docker; this also
+interrupts other tasks. Docker control-plane availability remains required for
+that fallback. Killing only the host `docker exec` process is not used as proof
+of agent termination. Startup failure, malformed
 frames and transport limits fail the child execution. A new daemon/spawn creates
 new random grants; old grants have no surviving broker and cannot be resumed.
 A hard host crash can leave an inert Unix socket file in its private temporary
@@ -211,7 +224,10 @@ spike was replaced by the reviewable modules and smoke script in this change.
 Validated on 2026-09-10 with macOS Docker Desktop (Linux Docker engine): Node/tsx
 and Bun-compiled Docker mock requests, OAuth inference and continuation, workload
 credential probes, process cancellation, abrupt bridge death, stolen-grant rejection across two
-runtimes, a listening host-service access probe, Docker migration and cleanup. Node and Bun unit tests also
+runtimes, a listening host-service access probe, Docker migration and cleanup.
+Adversarial Docker regressions additionally cover privileged PATH shadowing on
+restart, relay SIGKILL, detached descendants, supervisor signal protection, and
+preservation of concurrent executions. Node and Bun unit tests also
 cover API-key substitution, token-counting policy, SSE/cache usage, grant rejection,
 rotation/source pinning, errors/redirects and active upstream disconnection observed
 by an independent Node process. Migration tests cover preservation and excluded

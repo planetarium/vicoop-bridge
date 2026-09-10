@@ -140,7 +140,7 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
     // state takes over at mount time. This is the documented
     // workaround.
     await dockerExecStream(containerName, {
-      cmd: ['chown', '-R', 'node:node', `/data/agents/${opts.kind}`, `/data/creds/${opts.kind}`, `/data/sessions/${opts.kind}`],
+      cmd: ['/bin/chown', '-R', 'node:node', `/data/agents/${opts.kind}`, `/data/creds/${opts.kind}`, `/data/sessions/${opts.kind}`],
       user: '0',
       label: 'chown',
       log,

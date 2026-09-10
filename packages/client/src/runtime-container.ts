@@ -185,7 +185,7 @@ export class RuntimeContainer {
     if (this.opts.backendKind === 'claude') {
       try {
         this.verifyClaudeBoundary(name);
-        this.runDocker(['exec', '--user', '0', name, 'sh', '-c', claudeBrokerFirewallScript()]);
+        this.runDocker(['exec', '--user', '0', name, '/bin/sh', '-c', claudeBrokerFirewallScript()]);
       } catch (err) { await this.stop(); throw err; }
     }
     this.started = true;

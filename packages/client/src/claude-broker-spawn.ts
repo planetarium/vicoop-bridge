@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import { Duplex, PassThrough, Writable } from 'node:stream';
 import { createClaudeAuthBroker, type BrokerOptions } from './claude-auth-broker.js';
 import { CLAUDE_BROKER_RELAY } from './claude-broker-relay.js';
+import { CLAUDE_BROKER_SUPERVISOR } from './claude-broker-supervisor.js';
 import type { ChildHandle, SpawnFn } from './spawn-adapter.js';
 
 // The Docker channel itself binds a grant to this execution and runtime.
@@ -35,7 +36,12 @@ export function createClaudeBrokerSpawn(container: string, opts: BrokerOptions &
       promptFiles.push({argIndex:i,content:readFileSync(path)});
     }
     const broker = createClaudeAuthBroker(opts);
-    const relay = (opts.spawnImpl ?? nodeSpawn)('docker', ['exec', '-i', container, 'node', '-e', CLAUDE_BROKER_RELAY], { stdio: ['pipe', 'pipe', 'pipe'] });
+    // Absolute trusted binaries; disable runtime injection into the privileged
+    // supervisor. The last argument is opaque relay source, run only as node.
+    const relay = (opts.spawnImpl ?? nodeSpawn)('docker', ['exec', '-i', '--user', '0',
+      '-e', 'NODE_OPTIONS=', '-e', 'NODE_PATH=', '-e', 'LD_PRELOAD=', '-e', 'LD_LIBRARY_PATH=',
+      container, '/usr/bin/tini', '-s', '--', '/usr/local/bin/node', '-e',
+      CLAUDE_BROKER_SUPERVISOR, String(opts.ttlMs ?? 60 * 60_000), CLAUDE_BROKER_RELAY], { stdio: ['pipe', 'pipe', 'pipe'] });
     const events = new EventEmitter();
     const stdout = new PassThrough();
     const stderr = new PassThrough();
@@ -43,6 +49,8 @@ export function createClaudeBrokerSpawn(container: string, opts: BrokerOptions &
     let pending = '';
     let ready = false;
     let ended = false;
+    let terminating = false;
+    let resultCode: number | undefined;
     let readyWrite: (() => void) | undefined;
     let readyEnd: (() => void) | undefined;
     const send = (frame: object) => {
@@ -67,7 +75,12 @@ export function createClaudeBrokerSpawn(container: string, opts: BrokerOptions &
       stdout.end(); stderr.end();
       events.emit('close', code, signal);
     };
-    const fail = () => finish(1, null);
+    const fail = () => {
+      if (ended || terminating) return;
+      terminating = true;
+      resultCode = 1;
+      stop();
+    };
     const startup = setTimeout(fail, 15_000);
     const lifetime = setTimeout(fail, opts.ttlMs ?? 60 * 60_000);
     running.add(stop);
@@ -86,7 +99,25 @@ export function createClaudeBrokerSpawn(container: string, opts: BrokerOptions &
     });
     relay.stdin?.on('error', fail);
     relay.on('error', fail);
-    relay.on('close', () => fail());
+    relay.on('close', (code) => {
+      // A successful supervisor exit proves descendant cleanup, irrespective
+      // of the untrusted relay's claimed exit frame. Never finish on that frame.
+      if (code === 0) { finish(resultCode ?? 1, null); return; }
+      // Supervisor/Docker failure leaves cleanup uncertain. Fail closed for the
+      // shared runtime through the independent Docker control plane.
+      stopped = true;
+      for (const stop of running) stop();
+      const cleanup = nodeSpawn('docker', ['stop', '-t', '0', container], {stdio:'ignore'});
+      let cleanupReported = false;
+      const cleanupFinished = (confirmed: boolean) => {
+        if (cleanupReported) return;
+        cleanupReported = true;
+        if (!confirmed) console.error('Claude runtime cleanup could not be confirmed; new executions are disabled. Restore Docker access and stop the runtime before restarting.');
+        finish(1, null);
+      };
+      cleanup.on('error', () => cleanupFinished(false));
+      cleanup.on('close', (code) => cleanupFinished(code === 0));
+    });
     // Docker diagnostics can include command lines; keep them off task output.
     relay.stderr?.resume();
     relay.stdout?.on('data', (chunk: Buffer) => {
@@ -99,7 +130,7 @@ export function createClaudeBrokerSpawn(container: string, opts: BrokerOptions &
         try {
           const m = JSON.parse(line);
           if (m.t === 'ready') { ready = true; clearTimeout(startup); readyWrite?.(); readyWrite = undefined; readyEnd?.(); readyEnd = undefined; }
-          else if (m.t === 'exit') { finish(Number.isInteger(m.code) ? m.code : 1, null); return; }
+          else if (m.t === 'exit') { resultCode ??= Number.isInteger(m.code) ? m.code : 1; return; }
           else if (m.t === 'error') { fail(); return; }
           else if (m.t === 'stdout' || m.t === 'stderr') {
             const stream = m.t === 'stdout' ? stdout : stderr;

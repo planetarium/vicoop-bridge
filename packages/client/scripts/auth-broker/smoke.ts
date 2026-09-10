@@ -74,6 +74,20 @@ try {
     '--entrypoint','sh',process.env.VICOOP_SMOKE_IMAGE ?? 'ghcr.io/planetarium/vicoop-runtime:latest',
     '-c','mkdir -p /legacy/projects; echo legacy-secret > /legacy/.credentials.json; echo conversation > /legacy/projects/history.jsonl; chmod -R a+rX /legacy']);
   await runtime.start();
+  // A previous task can write to the agent PATH. Restart must never run its
+  // shell or firewall commands as root. Poison only this disposable runtime.
+  docker(['exec','--user','0',container,'/bin/chown','node:node','/data/agents/claude']);
+  docker(['exec',container,'/usr/local/bin/node','-e',String.raw`
+    const fs=require('fs'); fs.mkdirSync('/data/agents/claude/bin',{recursive:true});
+    for (const [name,target] of [['sh','/bin/sh'],['iptables','/usr/sbin/iptables'],['awk','/usr/bin/awk']]) {
+      fs.writeFileSync('/data/agents/claude/bin/'+name,
+        '#!/bin/sh\n/usr/bin/touch /tmp/root-path-poisoned\nexec '+target+' "$@"\n',{mode:0o755});
+    }
+  `]);
+  await new RuntimeContainer({backendKind:'claude',runtimeName:id}).start();
+  assert.notEqual(spawnSync('docker',['exec',container,'/usr/bin/test','-e','/tmp/root-path-poisoned']).status,0,
+    'workload-controlled PATH ran during privileged startup');
+  docker(['exec',container,'/bin/rm','/data/agents/claude/bin/sh','/data/agents/claude/bin/iptables','/data/agents/claude/bin/awk']);
   docker(['exec', '--user', '0', container, 'chown', '-R', 'node:node', '/data/sessions/claude']);
   await migrateClaudeSessions(id, process.env.VICOOP_SMOKE_IMAGE ?? 'ghcr.io/planetarium/vicoop-runtime:latest', createLogger());
   assert.equal(docker(['exec',container,'cat','/data/sessions/claude/config/projects/history.jsonl']).trim(),'conversation');
@@ -154,6 +168,44 @@ try {
   const pid = Number(pidText.trim()); assert.ok(Number.isInteger(pid));
   const alive = spawnSync('docker', ['exec', container, 'test', '-e', `/proc/${pid}`]);
   assert.notEqual(alive.status, 0, 'cancelled process survived');
+  // Cleanup is independent of the unprivileged relay, includes setsid children,
+  // and must not kill another execution in the same shared runtime.
+  const survivor=adapter.spawn('node',['-e','console.log(process.pid);setInterval(()=>{},1000)'],{});
+  let survivorText='';
+  const survivorReady=new Promise<void>(resolve=>survivor.stdout!.on('data',c=>{survivorText+=c;if(survivorText.includes('\n'))resolve();}));
+  const survivorDone=capture(survivor);
+  try {
+    await survivorReady;
+    for (const mode of ['relay-death','cancel-detached']) {
+      const attack=adapter.spawn('node',['-e',`
+        const {spawn}=require('child_process');
+        const stat=require('fs').readFileSync('/proc/'+process.ppid+'/stat','utf8');
+        const supervisor=Number(stat.slice(stat.lastIndexOf(')')+2).split(' ')[1]);
+        let protectedSupervisor=false;
+        try {process.kill(supervisor,'SIGKILL');} catch(e) {protectedSupervisor=e.code==='EPERM';}
+        require('assert/strict').ok(protectedSupervisor,'workload can kill its supervisor');
+        const detached=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});
+        detached.unref();
+        console.log(JSON.stringify({pid:process.pid,detached:detached.pid}));
+        ${mode==='relay-death' ? "setTimeout(()=>process.kill(process.ppid,'SIGKILL'),50);" : ''}
+        setInterval(()=>{},1000);
+      `],{});
+      let attackText='';
+      const attackReady=new Promise<void>(resolve=>attack.stdout!.on('data',c=>{attackText+=c;if(attackText.includes('\n'))resolve();}));
+      const attackDone=capture(attack);
+      await attackReady;
+      if(mode==='cancel-detached') attack.kill('SIGTERM');
+      const outcome=await attackDone;
+      assert.notEqual(outcome.code,0,'attack must not report success');
+      const pids=JSON.parse(attackText);
+      for(const pid of [pids.pid,pids.detached]) {
+        assert.notEqual(spawnSync('docker',['exec',container,'/usr/bin/test','-e',`/proc/${pid}`]).status,0,
+          `${mode}: workload survived completed cleanup`);
+      }
+      assert.equal(spawnSync('docker',['exec',container,'/usr/bin/test','-e',`/proc/${Number(survivorText.trim())}`]).status,0,
+        'cleanup killed an unrelated execution');
+    }
+  } finally {survivor.kill('SIGKILL');await survivorDone;}
   // A stolen grant must fail in a second runtime, not just a second request.
   const peerId = `${id}-peer`;
   const peer = new RuntimeContainer({backendKind:'claude',runtimeName:peerId,
@@ -210,7 +262,7 @@ try {
     }
     assert.ok(!exists,'workload survived abrupt bridge death');
   } finally { worker.kill('SIGKILL'); rmSync(workerTemp,{recursive:true,force:true}); }
-  console.log(JSON.stringify({mode:real?`real-${authentication}`:'mock-oauth-and-api-key', success:true, mockRequests:real?undefined:forwarded, cancellation:true, hostCrash:true, stolenGrantRejected:true}));
+  console.log(JSON.stringify({mode:real?`real-${authentication}`:'mock-oauth-and-api-key', success:true, mockRequests:real?undefined:forwarded, cancellation:true, hostCrash:true, stolenGrantRejected:true, privilegedPathIsolated:true, relayDeathCleanup:true, detachedCleanup:true, concurrentExecutionPreserved:true}));
 } finally {
   adapter.close(); upstream.closeAllConnections(); await new Promise<void>(r => upstream.close(() => r()));
   spawnSync('docker', ['rm', '-f', container], { stdio: 'ignore' });

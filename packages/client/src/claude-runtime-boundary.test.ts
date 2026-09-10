@@ -40,8 +40,10 @@ test('new Claude runtime mounts only agent/session volumes and applies firewall 
   assert.ok(create.includes('no-new-privileges'));
   const firewall = calls.at(-1)!;
   assert.deepEqual(firewall.slice(0,4), ['exec','--user','0','vicoop-runtime-work']);
+  assert.equal(firewall[4], '/bin/sh');
   assert.match(firewall.at(-1)!, /ip6tables -w -P OUTPUT DROP/);
   const script = firewall.at(-1)!;
+  assert.ok(script.indexOf('PATH=/usr/sbin:/usr/bin:/sbin:/bin') < script.indexOf('iptables -w -N'));
   assert.ok(script.indexOf('--dport 53 -j ACCEPT') < script.indexOf('-d 192.168.0.0/16 -j REJECT'));
   assert.match(script, /-p tcp --dport 53 -j ACCEPT/);
 });

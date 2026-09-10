@@ -34,6 +34,9 @@ export function claudeBrokerFirewallScript(): string {
     .filter(v => /^\d+\.\d+\.\d+\.\d+$/.test(v));
   const blocked = [...new Set(['0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '169.254.0.0/16', '172.16.0.0/12', '192.168.0.0/16', '224.0.0.0/4', '240.0.0.0/4', ...hostIPs.filter(v => !v.startsWith('127.'))])];
   return `set -eu
+# Never resolve privileged commands from workload-writable agent volumes.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 iptables -w -N VICOOP_BROKER 2>/dev/null || true
 iptables -w -F VICOOP_BROKER
 iptables -w -A VICOOP_BROKER -o lo -j ACCEPT

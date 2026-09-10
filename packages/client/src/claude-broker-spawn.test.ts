@@ -9,6 +9,26 @@ import { createClaudeBrokerSpawn } from './claude-broker-spawn.js';
 const localSpawn: typeof spawn = ((_cmd: string, args: string[], opts: object) =>
   spawn(process.execPath, ['-e', args[args.length - 1]], { ...opts, env: { PATH: process.env.PATH } })) as typeof spawn;
 
+test('an exit frame cannot report completion before the supervisor transport exits', async () => {
+  let transportClosed = false;
+  const earlyExit: typeof spawn = ((_cmd: string, _args: string[], opts: object) => {
+    const child = spawn(process.execPath, ['-e', `
+      console.log(JSON.stringify({t:'exit',code:0}));
+      setTimeout(()=>process.exit(0),100);
+    `], opts);
+    child.on('close',()=>{transportClosed=true;});
+    return child;
+  }) as typeof spawn;
+  const adapter = createClaudeBrokerSpawn('fixture', {spawnImpl:earlyExit,
+    credential:()=>({kind:'oauth',secret:'mock-only'})});
+  try {
+    const child=adapter.spawn('unused',[],{});
+    child.stdout!.resume();child.stderr!.resume();
+    await new Promise<void>(resolve=>child.on('close',()=>resolve()));
+    assert.ok(transportClosed, 'untrusted exit frame bypassed supervisor cleanup');
+  } finally {adapter.close();}
+});
+
 test('stdio broker substitutes host OAuth, preserves SSE and per-spawn env, strips headers', async () => {
   const upstream = createServer(async (req, res) => {
     assert.equal(req.headers.authorization, 'Bearer host-secret');
