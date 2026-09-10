@@ -27,6 +27,7 @@
 // `docker context` is resolved by the CLI itself — no custom socket
 // path lookup needed.
 
+import { assertClaudeBrokerContainer, claudeBrokerFirewallScript, CLAUDE_BROKER_LABEL } from './claude-runtime-boundary.js';
 import { spawnSync, spawn } from 'node:child_process';
 import { createLogger, type Logger } from './logger.js';
 
@@ -64,6 +65,8 @@ export interface RuntimeContainerOptions {
   // fresh-create command instead of silently reinstalling into an
   // existing runtime.
   failIfExists?: boolean;
+  // Explicit migration: reuse agent/session volumes after removing only the old container.
+  reuseState?: boolean;
   logger?: Logger;
   // Test seam — inject a custom docker CLI runner so tests can
   // capture argv + script responses without shelling out.
@@ -153,6 +156,7 @@ export class RuntimeContainer {
             `Remove it first with \`${this.removeHint()}\`, then rerun init.`,
         );
       }
+      if (this.opts.backendKind === 'claude') this.verifyClaudeBoundary(name);
       if (this.inspectRunning(name)) {
         this.log.info(`runtime container '${name}' already running — reusing`);
       } else {
@@ -167,7 +171,7 @@ export class RuntimeContainer {
             `then retry \`vicoop-client --backend ${this.opts.backendKind} --runtime container --runtime-name ${this.opts.runtimeName}\`.`,
         );
       }
-      if (this.opts.failIfExists) {
+      if (this.opts.failIfExists && !this.opts.reuseState) {
         this.ensureFreshVolumes();
       }
       await this.ensureImage();
@@ -178,6 +182,12 @@ export class RuntimeContainer {
     }
 
     await this.waitUntilRunning(name);
+    if (this.opts.backendKind === 'claude') {
+      try {
+        this.verifyClaudeBoundary(name);
+        this.runDocker(['exec', '--user', '0', name, 'sh', '-c', claudeBrokerFirewallScript()]);
+      } catch (err) { await this.stop(); throw err; }
+    }
     this.started = true;
   }
 
@@ -203,6 +213,12 @@ export class RuntimeContainer {
   // `docker exec` argv for each per-task spawn.
   getContainerName(): string {
     return containerName(this.opts.backendKind, this.opts.runtimeName);
+  }
+
+  private verifyClaudeBoundary(name: string): void {
+    const result = this.run(['inspect', '--format', '{{json .}}', name]);
+    if (result.exitCode !== 0) throw new Error('Cannot inspect Claude runtime authentication boundary');
+    assertClaudeBrokerContainer(result.stdout);
   }
 
   // ──────────────────────────────────────────────────────────────────
@@ -286,7 +302,7 @@ export class RuntimeContainer {
     const runtimeName = this.opts.runtimeName;
     return [
       agentsVolumeName(kind, runtimeName),
-      credsVolumeName(kind, runtimeName),
+      ...(kind === 'claude' ? [] : [credsVolumeName(kind, runtimeName)]),
       sessionsVolumeName(kind, runtimeName),
     ];
   }
@@ -350,11 +366,16 @@ export class RuntimeContainer {
     args.push(
       '--mount',
       `type=volume,source=${agentsVolumeName(kind, runtimeName)},target=/data/agents/${kind}`,
-      '--mount',
-      `type=volume,source=${credsVolumeName(kind, runtimeName)},target=/data/creds/${kind}`,
+      ...(kind === 'claude' ? [] : ['--mount', `type=volume,source=${credsVolumeName(kind, runtimeName)},target=/data/creds/${kind}`]),
       '--mount',
       `type=volume,source=${sessionsVolumeName(kind, runtimeName)},target=/data/sessions/${kind}`,
     );
+    if (kind === 'claude') {
+      args.push('--label', CLAUDE_BROKER_LABEL, '--user', 'node',
+        '--security-opt', 'no-new-privileges',
+        '--tmpfs', '/data/creds/claude:rw,nosuid,nodev,size=16777216,uid=1000,gid=1000,mode=0700',
+        '-e', 'CLAUDE_CONFIG_DIR=/data/sessions/claude/config');
+    }
     if (this.opts.workspaceDir) {
       // Workspace as a host bind-mount. Per-context branching
       // (a different workspace per task) is intentionally out of
