@@ -4,14 +4,14 @@ import { EventEmitter } from 'node:events';
 import { PassThrough, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { stat, readFile, rename, unlink } from 'node:fs/promises';
+import { stat, rename, unlink } from 'node:fs/promises';
 import type { ClaudeSpawnFn, ClaudeChildHandle } from './backends/claude.js';
 import { runDockerCommand } from './docker-command.js';
 import { CallerRuntimeStore } from './caller-runtime-store.js';
+import { callerCredentialEnvironment, type CallerCredentialsOptions } from './caller-runtime-credentials.js';
 
-export interface CallerDockerOptions {
+export interface CallerDockerOptions extends CallerCredentialsOptions {
   image: string;
-  credentialFile: string;
   stateDirectory: string;
   agentId: string;
   maxScopes?: number;
@@ -125,17 +125,7 @@ export class DockerCallerRuntimePool implements CallerRuntimePool {
     }
   }
   private async credential(): Promise<string> {
-    const info = await stat(this.options.credentialFile);
-    if (!info.isFile() || info.size > 8192 || info.mode & 0o077)
-      throw new Error(
-        'caller credential file must be a private regular file (chmod 600, at most 8 KiB)',
-      );
-    const key = (await readFile(this.options.credentialFile, 'utf8')).trim();
-    if (!key || /\s|\0/.test(key))
-      throw new Error(
-        'caller credential file must contain one Anthropic API key',
-      );
-    return key;
+    return callerCredentialEnvironment(this.options);
   }
   async start(
     scopeId: string,
@@ -214,7 +204,7 @@ export class DockerCallerRuntimePool implements CallerRuntimePool {
         '--env',
         'DISABLE_TELEMETRY=1',
         '--env',
-        `ANTHROPIC_API_KEY=${key}`,
+        key,
         '--entrypoint',
         '/bin/sleep',
         this.options.image,

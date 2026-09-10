@@ -64,12 +64,35 @@ configuration (merge with normal registration/token fields):
 }
 ```
 
+This existing configuration defaults to `"credentialSource": "api-key-file"`.
 The key is read afresh for every execution and injected as `ANTHROPIC_API_KEY`.
 Replace the file to rotate it; active work keeps its existing key. The workload
 can read and use this credential, including copying it into its own files; this
 profile does not provide credential secrecy from the agent. Docker administrators
 can inspect it in the container environment. Supply a credential appropriate for
 all callers admitted by this agent. Host OAuth/login directories are never copied.
+
+To reuse the operator's existing Claude.ai login instead, omit `credentialFile`
+and set `"credentialSource": "host-claude"` in `caller_runtime`. No separate API
+key is required. The daemon reads the default macOS `Claude Code-credentials`
+Keychain entry or Linux `~/.claude/.credentials.json` at startup and before each
+execution. Linux credentials must be a private regular file. Custom
+`CLAUDE_CONFIG_DIR` is currently unsupported; this mode fails rather than choosing
+another account. The macOS credential lookup is asynchronous with a 10-second
+timeout and bounded output.
+
+Only the current access token is injected as `CLAUDE_CODE_OAUTH_TOKEN`; refresh
+tokens, host settings and host conversations are not copied. This is explicit
+operator opt-in to sharing that account's model access with admitted callers.
+As with API keys, the workload and Docker administrators can read the supplied
+access token. The bridge does not refresh tokens or modify the host login.
+Missing, invalid, expired or less-than-one-minute-remaining tokens fail closed;
+refresh the login using host Claude and retry. Later executions reread updated
+credentials, while active work keeps its original token and may fail if it
+expires. No API-key fallback or transparent retry is performed. Automatic refresh
+coordination is not supported in this release. Secrets are supplied via container
+environment, not deliberately included in snapshots; a workload can still copy
+them into its own retained files.
 
 ## Execution, persistence and limits
 
@@ -200,3 +223,15 @@ VICOOP_CLIENT_BIN=/tmp/vicoop-client \
 Both smoke scripts create unique state and clean up only their own namespace.
 Real Claude image installation/version checks are separate evidence from fixture
 execution; fixture success does not claim a paid model end-to-end run.
+
+For an explicit real model request using the host Claude.ai login, run the OAuth
+smoke against a pinned image containing Claude. It uses the actual caller runtime
+pool, validates token-only provisioning, calls Haiku, commits a checkpoint and
+checks resource cleanup. It consumes the operator's model allowance and does not
+test token refresh or the full A2A transport:
+
+```sh
+VICOOP_SMOKE_IMAGE=sha256:YOUR_CLAUDE_IMAGE_ID pnpm exec tsx packages/client/scripts/caller-auth-smoke.ts
+bun build --compile packages/client/scripts/caller-auth-smoke.ts --outfile /tmp/caller-auth-smoke
+VICOOP_SMOKE_IMAGE=sha256:YOUR_CLAUDE_IMAGE_ID /tmp/caller-auth-smoke
+```
