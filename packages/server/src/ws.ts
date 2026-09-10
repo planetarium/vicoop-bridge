@@ -7,6 +7,7 @@ import {
   OPENAI_COMPAT_EXTENSION_URI,
   TASK_REPLAY_CAPABILITY,
   EXECUTION_SCOPE_V1_CAPABILITY,
+  CALLER_RUNTIME_V1_CAPABILITY,
   supportsExecutionScopeV1,
   type Part,
   type TaskStatus as WireTaskStatus,
@@ -351,7 +352,8 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
               type: 'hello.ack',
               protocolCapabilities: [
                 TASK_REPLAY_CAPABILITY,
-                ...(supportsExecutionScopeV1(frame.protocolCapabilities) ? [EXECUTION_SCOPE_V1_CAPABILITY] : []),
+                ...(supportsExecutionScopeV1(frame.protocolCapabilities) ? [EXECUTION_SCOPE_V1_CAPABILITY,
+                  ...(frame.protocolCapabilities.includes(CALLER_RUNTIME_V1_CAPABILITY) ? [CALLER_RUNTIME_V1_CAPABILITY] : [])] : []),
               ],
               disconnectGraceMs: opts.registry.getDisconnectGraceMs(),
               maxFrameBytes: MAX_INGRESS_BYTES,

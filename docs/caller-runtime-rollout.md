@@ -3,6 +3,9 @@
 Tracking: [#497](https://github.com/planetarium/vicoop-bridge/issues/497).
 Design background: [#496](https://github.com/planetarium/vicoop-bridge/issues/496).
 
+R2 implementation and operating contract: [Claude caller runtime](caller-runtime.md).
+The R1 section below describes the earlier release boundary.
+
 ## R1: compatible foundations
 
 R1 supports the existing `host` and `container` modes. Their install,

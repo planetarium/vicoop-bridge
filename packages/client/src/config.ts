@@ -105,7 +105,7 @@ export function defaultOwnerSessionPath(): string {
 //                   (today's behavior; default).
 //   - 'container' : `docker exec` into a long-lived vicoop-runtime
 //                   container the bridge client orchestrates (#249).
-// caller-container is reserved configuration, explicitly rejected until R2.
+// caller-container is the opt-in Claude direct-principal isolation profile.
 export type BackendRuntime = 'host' | 'container' | 'caller-container';
 
 export interface ClaudeBackendConfig {
@@ -207,6 +207,7 @@ export interface BackendConfigs {
 // also has a place to live in config.json — no "this knob is only configurable
 // via env" surprises.
 export interface ClientConfig {
+  caller_runtime?: unknown;
   server_url?: string;
   server_token?: string;
   agent_id?: string;
@@ -303,6 +304,7 @@ function pickBackendRuntime(v: unknown): BackendRuntime | undefined {
 // an unknown `backend` / `sandbox_mode` later.
 function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
   const c: ClientConfig = {};
+  if (raw.caller_runtime !== undefined) c.caller_runtime = raw.caller_runtime;
   const serverUrl = asString(raw.server_url);
   if (serverUrl) c.server_url = serverUrl;
   const serverToken = asString(raw.server_token);
@@ -326,6 +328,11 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
   const telemetry = asString(raw.telemetry);
   if (telemetry === 'on' || telemetry === 'off') c.telemetry = telemetry;
   const backends = asRecord(raw.backends);
+  for (const [kind, value] of Object.entries(backends ?? {})) {
+    if (kind !== 'claude' && kind !== 'codex' && asString(asRecord(value)?.runtime) === 'caller-container') {
+      throw new Error(`caller-container is unsupported for ${kind}; refusing to drop isolation configuration`);
+    }
+  }
   if (backends) {
     const out: BackendConfigs = {};
     const claudeRaw = asRecord(backends.claude);
@@ -466,6 +473,7 @@ export function overlayConfig(base: ClientConfig, top: ClientConfig): ClientConf
     trusted_identity_issuers:
       top.trusted_identity_issuers ?? base.trusted_identity_issuers,
     telemetry: top.telemetry ?? base.telemetry,
+    ...((top.caller_runtime ?? base.caller_runtime) !== undefined ? { caller_runtime: top.caller_runtime ?? base.caller_runtime } : {}),
     backends: mergedBackends,
   };
 }

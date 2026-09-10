@@ -544,10 +544,21 @@ test('readConfig/writeConfig default to resolveConfigDir() when no path passed',
 });
 
 
-test('reserved caller-container runtime survives normalization so startup can reject it', (t) => {
+test('caller-container runtime survives normalization for explicit startup validation', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-isolation-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const path = join(dir, 'config.json');
   writeFileSync(path, JSON.stringify({ backends: { claude: { runtime: 'caller-container' } } }));
   assert.equal(readConfig(path)?.backends?.claude?.runtime, 'caller-container');
+});
+
+
+test('unsupported isolated backend config cannot silently fall back to shared execution', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-isolation-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  for (const kind of ['openclaw', 'vicoop-codex', 'echo']) {
+    writeFileSync(path, JSON.stringify({ backend: kind, backends: { [kind]: { runtime: 'caller-container' } } }));
+    assert.throws(() => readConfig(path), /refusing to drop isolation configuration/);
+  }
 });

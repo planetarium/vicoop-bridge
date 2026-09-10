@@ -21,6 +21,7 @@ export interface DetectedCapabilities {
 
 export interface Backend {
   name: string;
+  readonly requiresCallerScope?: boolean;
   // `signal` is aborted when the task is canceled (A2A `tasks/cancel` or
   // client shutdown). Backends observe it to propagate cancellation to their
   // upstream (abort RPC, kill subprocess, cancel fetch, etc.) and to settle
