@@ -82,7 +82,7 @@ export const daemonFlagsFields = {
     description: message`Working directory for the spawned backend process. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
   })),
   runtime: optional(option('--runtime', choice([...BACKEND_RUNTIMES]), {
-    description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside an existing vicoop-runtime container created by \`vicoop-client container init <kind>\`. \`caller-container\` is reserved and unavailable in this release. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
+    description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside an existing vicoop-runtime container created by \`vicoop-client container init <kind>\`. \`caller-container\` isolates direct callers for Claude and requires caller_runtime configuration. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
   })),
   runtimeName: optional(option('--runtime-name', string({ metavar: 'NAME' }), {
     description: message`Runtime container instance name to use with \`--runtime container\`. Omit to use the active backend kind as the generated name.`,
@@ -174,6 +174,7 @@ export interface DaemonArgs {
   cwd?: string;
   runtime?: BackendRuntime;
   runtimeName?: string;
+  callerRuntime?: unknown;
   claudeSettingsFile?: string;
   claudeModel?: string;
   claudeSupportedModels?: string[];
@@ -329,6 +330,7 @@ export function mergeClientArgs(
     card: card === '' ? undefined : card,
     backend,
     backends: config.backends,
+    callerRuntime: config.caller_runtime,
     trustedIdentityIssuers:
       pickExactIdentifierList(flags.trustedIdentityIssuers) ??
       pickConfiguredExactIdentifiers(config.trusted_identity_issuers) ??
@@ -394,7 +396,11 @@ export function mergeClientArgs(
   // lookup, which is the correct behaviour for that source.
   const errors: string[] = [];
   if (resolved.runtime === 'caller-container') {
-    errors.push('caller-container isolation is not available in this release (#497 R2); no backend will be started');
+    if (backend !== 'claude') errors.push('caller-container supports only Claude');
+    if (!resolved.callerRuntime) errors.push('caller-container requires caller_runtime configuration');
+    if (resolved.cwd || resolved.runtimeName || resolved.claudeSettingsFile || backends.claude?.settings) {
+      errors.push('caller-container does not accept cwd, runtime-name, or operator Claude settings');
+    }
   }
   if (flags.runtime !== undefined && !RUNTIME_BACKENDS.has(backend)) {
     errors.push(

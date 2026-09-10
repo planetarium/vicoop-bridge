@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { closeSync, existsSync, openSync, readFileSync } from 'node:fs';
 import { spawn as spawnProcess, type ChildProcess } from 'node:child_process';
-import { AgentCard } from '@vicoop-bridge/protocol';
+import { AgentCard, OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import { resolveBundledCard } from './bundled-cards.js';
 import { group, longestMatch, object } from '@optique/core/constructs';
 import { optional, withDefault } from '@optique/core/modifiers';
@@ -11,6 +11,10 @@ import type { InferValue } from '@optique/core/parser';
 import { string } from '@optique/core/valueparser';
 import { run } from '@optique/run';
 import { Client } from './client.js';
+import { callerStateCmd, runCallerState } from './caller-runtime-admin.js';
+import { CallerRuntimeConfig } from './caller-runtime-config.js';
+import { DockerCallerRuntimePool } from './caller-runtime-docker.js';
+import { CallerScopedBackend } from './caller-scoped-backend.js';
 import { echoBackend } from './backends/echo.js';
 import { createOpenclawBackend } from './backends/openclaw.js';
 import { createClaudeBackend, type ClaudeSpawnFn } from './backends/claude.js';
@@ -228,6 +232,7 @@ const cli = longestMatch(
   group('Identity', authCmd),
   group('Agents', agentCmd),
   group('Runtime containers', containerCmd),
+  callerStateCmd,
   group('Maintenance', longestMatch(upgradeCmd, infoCmd)),
   // Hidden by `hidden: 'help'` on each command; kept in the parser tree
   // for back-compat and "did you mean?" suggestions. Sit outside the
@@ -395,6 +400,23 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       };
     }
     case 'claude': {
+      if (args.runtime === 'caller-container') {
+        const config = CallerRuntimeConfig.parse(args.callerRuntime);
+        const pool = new DockerCallerRuntimePool({ ...config, agentId: args.agentId });
+        const backend = new CallerScopedBackend(args.agentId, pool, (spawn) => createClaudeBackend({
+          cwd: '/state/workspace', spawn,
+          identity: deriveIdentity(args.agentId, args.server) ?? undefined,
+          model: args.claudeModel,
+          claudeReasoning: args.claudeReasoning,
+          claudeThinkingBudget: args.claudeThinkingBudget,
+          claudeRetryNarratedToolCall: args.claudeRetryNarratedToolCall,
+          settings: disableClaudeSandboxGuard(undefined),
+          fetchUriPolicy: { enabled: false },
+          extraArgs: ['--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--setting-sources', '', '--dangerously-skip-permissions'],
+        }));
+        await backend.initialize();
+        return { backend, shutdown: () => backend.close() };
+      }
       // settings precedence: --claude-settings-file (flag, path on disk) >
       // backends.claude.settings (config). No env layer (#189 §5).
       const baseSettings = args.claudeSettingsFile
@@ -561,6 +583,7 @@ const SHUTDOWN_TIMEOUT_MS = 15_000;
 async function runWithShutdownTimeout(
   shutdown: () => Promise<void>,
   logger: Logger,
+  timeoutMs = SHUTDOWN_TIMEOUT_MS,
 ): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
   try {
@@ -568,9 +591,9 @@ async function runWithShutdownTimeout(
       shutdown(),
       new Promise<void>((resolve) => {
         timer = setTimeout(() => {
-          logger.warn(`runtime shutdown exceeded ${SHUTDOWN_TIMEOUT_MS}ms; exiting anyway`);
+          logger.warn(`runtime shutdown exceeded ${timeoutMs}ms; exiting anyway`);
           resolve();
-        }, SHUTDOWN_TIMEOUT_MS);
+        }, timeoutMs);
       }),
     ]);
   } finally {
@@ -637,6 +660,9 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     ? JSON.parse(readFileSync(args.card, 'utf8'))
     : resolveBundledCard(args.backend);
   const agentCard = raw ? AgentCard.parse(raw) : undefined;
+  if (args.runtime === 'caller-container' && agentCard?.capabilities?.extensions) {
+    agentCard.capabilities.extensions = agentCard.capabilities.extensions.filter((extension) => extension.uri !== OPENAI_COMPAT_EXTENSION_URI);
+  }
 
   // Emit the resolved backend at startup so operators can verify which
   // backend the precedence chain picked (flag vs. config vs. default
@@ -664,7 +690,10 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     // failure instead of masking it as a transient disconnect. The
     // Client class deliberately does not call process.exit itself —
     // tests and future in-process embedders pass a non-exiting callback.
-    onFatal: () => process.exit(1),
+    onFatal: () => {
+      if (backendShutdown) void runWithShutdownTimeout(backendShutdown, logger, 120_000).finally(() => process.exit(1));
+      else process.exit(1);
+    },
   });
 
   client.start();
@@ -694,7 +723,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
       if (ownsPidFile) removePidFile();
       if (backendShutdown) {
         try {
-          await runWithShutdownTimeout(backendShutdown, logger);
+          await runWithShutdownTimeout(backendShutdown, logger, backend.requiresCallerScope ? 120_000 : SHUTDOWN_TIMEOUT_MS);
         } catch (err) {
           logger.error('shutdown error:', (err as Error).message);
         }
@@ -1087,6 +1116,10 @@ async function main(): Promise<void> {
       break;
     case 'whoami':
       process.exit(await runWhoami(parsed));
+      break;
+    case 'caller-state':
+      await runCallerState(parsed);
+      process.exit(0);
       break;
     case 'container-init':
       process.exit(await runContainerInitCli(parsed));

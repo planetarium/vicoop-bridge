@@ -649,7 +649,7 @@ test('legacy daemon env vars remain ignored (identity trust is the sole compatib
 });
 
 
-test('reserved caller isolation is rejected from flags and configuration before backend startup', () => {
+test('incomplete or unsupported caller isolation is rejected before backend startup', () => {
   for (const backend of ['claude', 'codex'] as const) {
     for (const source of ['flag', 'config']) {
       const result = mergeClientArgs(
@@ -657,7 +657,16 @@ test('reserved caller isolation is rejected from flags and configuration before 
         source === 'config' ? { backends: { [backend]: { runtime: 'caller-container' } } } : {},
       );
       assert.equal(result.ok, false);
-      if (!result.ok) assert.ok(result.errors.some((error) => error.includes('not available')));
+      if (!result.ok) assert.ok(result.errors.some((error) => error.includes('caller-container')));
     }
   }
+});
+
+test('Claude caller isolation accepts dedicated config but rejects operator workspace/settings', () => {
+  const config = { caller_runtime: { image: `sha256:${'a'.repeat(64)}`, credentialFile: '/key', stateDirectory: '/state' } };
+  const flags = { token: 't', agentId: 'a', backend: 'claude' as const, runtime: 'caller-container' as const };
+  const result = mergeClientArgs(flags, config);
+  assert.equal(result.ok, true);
+  assert.equal(mergeClientArgs({ ...flags, cwd: '/operator' }, config).ok, false);
+  assert.equal(mergeClientArgs({ ...flags, backend: 'codex' }, config).ok, false);
 });
