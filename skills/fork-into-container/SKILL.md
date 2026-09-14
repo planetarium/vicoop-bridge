@@ -7,10 +7,9 @@ allowed-tools: Bash
 # Fork-into-Container
 
 This skill is a thin layer on top of `vicoop-client container init`.
-Upstream already handles **auth, image, and volume lifecycle** — it pulls
-the operator's host creds (macOS Keychain or `~/.claude/.credentials.json`
-or `~/.codex/auth.json`) straight into the runtime container's named
-volume. What upstream intentionally does **not** carry is the operator's
+Upstream already handles **auth, image, and volume lifecycle**. It validates
+the operator's credentials on the host and uses the authentication broker
+without copying provider credentials into the runtime. What upstream intentionally does **not** carry is the operator's
 *harness* — `skills/`, sub-agents, slash-commands, the project memory
 file. That gap is what this skill fills.
 

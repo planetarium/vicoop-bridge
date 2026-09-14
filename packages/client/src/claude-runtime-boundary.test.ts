@@ -4,7 +4,7 @@ import { assertBrokerContainer } from './execution-runtime-boundary.js';
 import { RuntimeContainer } from './runtime-container.js';
 const container = () => ({ Config: { User: 'node', Labels: { 'vicoop.claude-auth': 'stdio-v1', 'vicoop.name': 'work' },
   Env: ['CLAUDE_CONFIG_DIR=/data/sessions/claude/config'] },
-  HostConfig: { NetworkMode: 'default', SecurityOpt: ['no-new-privileges'] },
+  HostConfig: { NetworkMode: 'default', CapAdd: ['NET_ADMIN', 'NET_RAW'], SecurityOpt: ['no-new-privileges'] },
   Mounts: [{ Type: 'volume', Name: 'vicoop-sessions-work', Destination: '/data/sessions/claude' }] });
 
 test('reject legacy/unsafe runtime inspect without leaking credentials in diagnostics', () => {
@@ -18,6 +18,8 @@ test('reject legacy/unsafe runtime inspect without leaking credentials in diagno
     (c: any) => c.Config.User = '0',
     (c: any) => c.HostConfig.NetworkMode = 'container:other',
     (c: any) => c.HostConfig.CapAdd = ['SYS_ADMIN'],
+    (c: any) => c.HostConfig.CapAdd = [],
+    (c: any) => delete c.HostConfig.CapAdd,
     (c: any) => c.HostConfig.SecurityOpt = [],
   ]) {
     const c = container(); mutate(c);

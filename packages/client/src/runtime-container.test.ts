@@ -19,7 +19,7 @@ function makeDockerFixture(responses: RunResponse[]) {
     calls.push(args);
     if(args.includes('{{json .}}')) {
       const name=args.at(-1)!.replace('vicoop-runtime-','');
-      return ok(JSON.stringify({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1','vicoop.name':name},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',SecurityOpt:['no-new-privileges']},Mounts:[]}));
+      return ok(JSON.stringify({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1','vicoop.name':name},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN','NET_RAW'],SecurityOpt:['no-new-privileges']},Mounts:[]}));
     }
     if(args[0]==='exec' && args.includes('/bin/sh')) return ok();
     const r = responses[i++] ?? ok();
@@ -249,15 +249,18 @@ test('start: docker daemon unreachable surfaces an actionable error', async () =
 });
 
 test('stop: tolerates already-stopped containers', async () => {
-  const { run } = makeDockerFixture([
+  const { run, calls } = makeDockerFixture([...happyCreateResponses(),
     fail('Error: No such container: vicoop-runtime-codex', 1),
   ]);
   const rc = new RuntimeContainer({
     backendKind: 'codex',
+    createIfMissing: true,
     dockerRun: run,
   });
+  await rc.start();
   // Should not throw despite docker stop's non-zero exit.
   await rc.stop();
+  assert.ok(calls.some(args => args[0] === 'stop'));
 });
 
 test('Env carries VICOOP_BRIDGE_URL and optional skip-firewall toggle', async () => {
@@ -311,4 +314,32 @@ test('runtimeName selects container and volume names', async () => {
   assert.ok(
     createCmd.includes('CODEX_HOME=/data/sessions/codex/config'),
   );
+});
+
+for (const reason of ['never-started', 'exists', 'unsafe-boundary']) {
+  test(`cleanup does not stop a runtime that was not acquired: ${reason}`, async () => {
+    const calls: string[][] = [];
+    const runtime = new RuntimeContainer({backendKind: 'codex', failIfExists: reason === 'exists',
+      dockerRun(args) {
+        calls.push([...args]);
+        return ok(args[0] === 'version' ? '28' : args[0] === 'ps' ? 'existing-container' : '{}');
+      },
+    });
+    if (reason !== 'never-started') await assert.rejects(runtime.start());
+    await runtime.stop();
+    assert.ok(!calls.some(args => args[0] === 'stop' || args[0] === 'start' || args[0] === 'exec'));
+  });
+}
+
+test('cleanup stops an acquired runtime if firewall installation fails', async () => {
+  const calls: string[][] = [];
+  const runtime = new RuntimeContainer({backendKind: 'codex', dockerRun(args) {
+    calls.push([...args]);
+    if (args[0] === 'exec') return fail('firewall failed');
+    if (args.includes('{{json .}}')) return ok(JSON.stringify({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1'},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN'],SecurityOpt:['no-new-privileges']},Mounts:[]}));
+    return ok(args[0] === 'version' ? '28' : args[0] === 'ps' ? 'existing-container' : 'running');
+  }});
+  await assert.rejects(runtime.start(), /firewall failed/);
+  await runtime.stop();
+  assert.equal(calls.filter(args => args[0] === 'stop').length, 1);
 });

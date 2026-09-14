@@ -9,6 +9,7 @@ export function assertBrokerContainer(raw: string, kind: string): void {
   if (c.Config?.Labels?.[`vicoop.${kind}-auth`] !== 'stdio-v1' || !['node', '1000:1000', '1000'].includes(c.Config?.User) ||
       c.HostConfig?.Privileged || !['default', 'bridge'].includes(c.HostConfig?.NetworkMode) || c.HostConfig?.PidMode || c.HostConfig?.IpcMode === 'host' ||
       c.HostConfig?.Devices?.length || c.HostConfig?.VolumesFrom?.length ||
+      !c.HostConfig?.CapAdd?.some((v: string) => v.replace(/^CAP_/, '') === 'NET_ADMIN') ||
       c.HostConfig?.CapAdd?.some((v: string) => !['NET_ADMIN', 'NET_RAW'].includes(v.replace(/^CAP_/, ''))) ||
       !c.HostConfig?.SecurityOpt?.some((v: string) => v === 'no-new-privileges' || v === 'no-new-privileges=true')) invalid();
   const env: string[] = c.Config?.Env ?? [];

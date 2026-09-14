@@ -21,7 +21,9 @@ security domain: this does not isolate different callers within that runtime.
 ## Authentication and compatibility
 
 Codex **0.153.4 or newer** is required for this runtime profile. The tested
-version is 0.153.4. Supported host sources, selected in order:
+version is 0.153.4. `vicoop-client info` advertises this floor as
+`backends.codex.externalRuntimeSupportedRange`; `supportedRange` retains the
+existing host/bundled-direct range. Supported host sources, selected in order:
 
 1. Explicit `OPENAI_API_KEY` in the bridge environment.
 2. An API key or ChatGPT OAuth login in `$CODEX_HOME/auth.json` (default

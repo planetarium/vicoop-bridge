@@ -26,11 +26,12 @@ export type InstallableBackendKind = 'claude' | 'codex';
 
 export interface BackendManifestEntry {
   readonly supportedRange: string;
+  readonly externalRuntimeSupportedRange?: string;
 }
 
 export const BACKENDS_MANIFEST: Record<InstallableBackendKind, BackendManifestEntry> = {
   claude: { supportedRange: '>=2.0.0' },
-  codex: { supportedRange: '>=0.100.0' },
+  codex: { supportedRange: '>=0.100.0', externalRuntimeSupportedRange: '>=0.153.4' },
 };
 
 // Backends the client knows how to drive but the container image does NOT

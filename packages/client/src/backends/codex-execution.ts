@@ -29,7 +29,19 @@ export function createCodexExecutionBackend(opts:CodexBackendOptions):Backend {
       const prev=worker.tail;
       let release!:()=>void;
       worker.tail=new Promise<void>(r=>{release=r;});worker.pending++;
-      await prev;
+      let queuedAbort!:()=>void;
+      const canceled=new Promise<void>(resolve=>{queuedAbort=resolve;});
+      signal.addEventListener('abort',queuedAbort,{once:true});
+      if(signal.aborted) queuedAbort();
+      await Promise.race([prev,canceled]);
+      signal.removeEventListener('abort',queuedAbort);
+      if(signal.aborted) {
+        // Settle the canceled task now, but retain its queue barrier until
+        // its predecessor closes so a following task cannot overtake it.
+        void prev.then(()=>{worker.pending--;worker.used=Date.now();release();});
+        emit({type:'task.complete',taskId:task.taskId,status:{state:'canceled',timestamp:new Date().toISOString()}});
+        return;
+      }
       const terminal:Parameters<Emit>[0][]=[];
       const cancel=()=>worker.backend.stop?.();
       try {

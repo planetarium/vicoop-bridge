@@ -3048,3 +3048,33 @@ test('container Codex allows independent contexts to execute concurrently', asyn
   assert.equal(fake.children.length,2);assert.ok(fake.children.every(c=>c.killed));
   backend.stop?.();
 });
+
+test('queued cancellation settles before predecessor closes without letting a successor overtake', async () => {
+  let killed!: () => void;
+  const killRequested = new Promise<void>(resolve => {killed = resolve;});
+  const fake = makeFakeSpawn((child, index) => {
+    if (index !== 0) return happyPath();
+    child.kill = () => {child.killed = true; killed(); return true;};
+    return {onLine(frame, c) {
+      if (frame.method === 'initialize') c.emitStdout({id: frame.id, error: {code: -32600, message: 'fixture rejection'}});
+    }};
+  });
+  const backend = createCodexExecutionBackend({spawn: fake.spawn, heartbeatMs: 0});
+  const first = backend.handle(assign('first'), () => {}, new AbortController().signal);
+  await killRequested;
+  const controller = new AbortController(), frames: UpFrame[] = [];
+  const second = backend.handle(assign('second'), f => frames.push(f), controller.signal);
+  const third = backend.handle(assign('third'), () => {}, new AbortController().signal);
+  controller.abort();
+  try {
+    await Promise.race([second, new Promise((_, reject) => setTimeout(() => reject(new Error('queued cancellation blocked')), 1000).unref())]);
+    assert.equal((frames.at(-1) as any).status.state, 'canceled');
+    assert.equal(frames.length, 1);
+    assert.equal(fake.children.length, 1);
+  } finally {
+    fake.children[0].finish(1);
+    await Promise.all([first, second, third]);
+    backend.stop?.();
+  }
+  assert.equal(fake.children.length, 2);
+});

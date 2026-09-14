@@ -74,7 +74,7 @@ test('Codex credentials pin file account/type, reread rotation, and fail closed 
 
 test('Codex runtime rejects credential mounts and provider environment before use',async()=>{
  const {assertBrokerContainer}=await import('./execution-runtime-boundary.js');
- const fresh=()=>({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1','vicoop.name':'work'},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',SecurityOpt:['no-new-privileges']},Mounts:[] as any[]});
+ const fresh=()=>({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1','vicoop.name':'work'},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN','NET_RAW'],SecurityOpt:['no-new-privileges']},Mounts:[] as any[]});
  assert.doesNotThrow(()=>assertBrokerContainer(JSON.stringify(fresh()),'codex'));
  for(const mutate of [(c:any)=>c.Config.Env.push('OPENAI_API_KEY=SECRET'),(c:any)=>c.Mounts.push({Type:'volume',Destination:'/data/creds/codex'}),(c:any)=>delete c.Config.Labels['vicoop.codex-auth']]) {
   const c=fresh();mutate(c);assert.throws(()=>assertBrokerContainer(JSON.stringify(c),'codex'),e=>e instanceof Error && /migration/.test(e.message) && !e.message.includes('SECRET'));

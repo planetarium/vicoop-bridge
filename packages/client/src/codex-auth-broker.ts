@@ -1,9 +1,10 @@
+import {BACKENDS_MANIFEST} from './backends-manifest.js';
 import {readFileSync,existsSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {join} from 'node:path';
 import {createExecutionAuthBroker, BrokerRejection} from './execution-auth-broker.js';
 
-export const CODEX_BROKER_VERSION_RANGE='>=0.153.4';
+export const CODEX_BROKER_VERSION_RANGE=BACKENDS_MANIFEST.codex.externalRuntimeSupportedRange!;
 
 export type CodexCredential = {kind:'api-key'|'oauth'; secret:string; accountId?:string};
 export type CodexCredentialReader = () => CodexCredential | Promise<CodexCredential>;
