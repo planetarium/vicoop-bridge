@@ -5,6 +5,7 @@ import {tmpdir} from 'node:os';
 import {join, delimiter} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawnSync} from 'node:child_process';
+import {createRequire} from 'node:module';
 
 // Execute the shipped script against a fake Docker filesystem: stopping the
 // runtime discards creds tmpfs while preserving its sessions volume.
@@ -43,9 +44,10 @@ if(args[0]==='exec') {
   process.exit(r.status??1);
 }
 `, {mode: 0o700});
-      const cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
+      const cli = fileURLToPath(new URL('./cli.ts', import.meta.url));
+      const tsx = createRequire(import.meta.url).resolve('tsx/cli');
       writeFileSync(join(bin, 'vicoop-client'), `#!/usr/bin/env node
-const r=require('node:child_process').spawnSync(process.execPath,[${JSON.stringify(cli)},...process.argv.slice(2)],{stdio:'inherit'});
+const r=require('node:child_process').spawnSync(process.execPath,[${JSON.stringify(tsx)},${JSON.stringify(cli)},...process.argv.slice(2)],{stdio:'inherit'});
 process.exit(r.status??1);
 `, {mode: 0o700});
       const script = fileURLToPath(new URL('../../../skills/fork-into-container/fork.sh', import.meta.url));
@@ -56,6 +58,7 @@ process.exit(r.status??1);
       const calls = readFileSync(join(root, 'calls.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
       if (mode !== 'safe') {
         assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /runtime requires host-broker migration/);
         assert.match(result.stderr, /--preserve-volumes/);
         assert.match(result.stderr, /--reuse-state/);
         assert.ok(!result.stderr.includes('fixture-secret'));
