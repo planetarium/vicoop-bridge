@@ -33,9 +33,8 @@ import type { AppServerSpawnFn } from './backends/codex-rpc.js';
 import { createVicoopCodexBackend } from './backends/vicoop-codex.js';
 import type { Backend } from './backend.js';
 import { RuntimeContainer, DEFAULT_RUNTIME_IMAGE } from './runtime-container.js';
-import { createDockerExecSpawn, type SpawnFn } from './spawn-adapter.js';
+import type { SpawnFn } from './spawn-adapter.js';
 import {
-  assertContainerCredsPresent,
   containerCmd,
   runContainerInitCli,
   runContainerListCli,
@@ -67,7 +66,6 @@ import {
   readConfig,
 } from './config.js';
 import {
-  DEFAULT_BRIDGE_URL,
   daemonFlagsFields,
   mergeClientArgs,
   type DaemonArgs as Args,
@@ -525,10 +523,8 @@ async function resolveRuntime(args: {
     bridgeUrl: args.bridgeUrl,
   });
   await runtime.start();
-  // Fail fast if the operator started the daemon against a runtime that
-  // was initialised without --from-host and has not been authenticated
-  // yet. Without this check the daemon would happily accept tasks until
-  // the first spawn, then surface a backend-specific auth error.
+  // Validate host authentication before accepting tasks. Both supported
+  // container backends use a broker; there is no credential-mounted fallback.
   try {
     if (args.kind === 'claude') {
       const credential = createClaudeCredentialReader();
@@ -538,8 +534,7 @@ async function resolveRuntime(args: {
       });
       return { runtime: { stop: async () => { broker.close(); await runtime.stop(); } },
         spawn: broker.spawn, cwd: args.cwd ? '/workspace' : undefined };
-    }
-    if(args.kind==='codex') {
+    } else {
       const installed=await probeBackendVersion(runtime.getContainerName(),'codex');
       if(!installed || !semver.satisfies(installed,CODEX_BROKER_VERSION_RANGE)) throw new Error(`Codex container authentication requires Codex ${CODEX_BROKER_VERSION_RANGE}; update the runtime agent`);
       const credential=createCodexCredentialReader();
@@ -550,20 +545,10 @@ async function resolveRuntime(args: {
       });
       return {runtime:{stop:async()=>{broker.close();await runtime.stop();}},spawn:broker.spawn,cwd:args.cwd ? '/workspace' : undefined};
     }
-    await assertContainerCredsPresent(runtime.getContainerName(), args.kind);
   } catch (err) {
     await runtime.stop();
     throw err;
   }
-  return {
-    runtime,
-    spawn: createDockerExecSpawn(runtime),
-    // Inside the container the workspace is always /workspace (when
-    // bind-mounted) — backends pass this through to claude/codex as
-    // their --cwd, so the host path the operator typed must not leak
-    // into the container's argv.
-    cwd: args.cwd ? '/workspace' : undefined,
-  };
 }
 
 // Container-mode override for claude's sandbox guard. Returns a new

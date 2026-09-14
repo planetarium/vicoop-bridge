@@ -28,7 +28,7 @@
 // path lookup needed.
 
 import { assertBrokerContainer, brokerFirewallScript } from './execution-runtime-boundary.js';
-import { spawnSync, spawn } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { createLogger, type Logger } from './logger.js';
 
 export const DEFAULT_RUNTIME_IMAGE = 'ghcr.io/planetarium/vicoop-runtime:latest';
@@ -129,7 +129,6 @@ export class RuntimeContainer {
     RuntimeContainerOptions;
   private readonly log: Logger;
   private readonly run: DockerRun;
-  private started = false;
 
   constructor(opts: RuntimeContainerOptions) {
     this.opts = {
@@ -188,7 +187,6 @@ export class RuntimeContainer {
         this.runDocker(['exec', '--user', '0', name, '/bin/sh', '-c', brokerFirewallScript()]);
       } catch (err) { await this.stop(); throw err; }
     }
-    this.started = true;
   }
 
   // Best-effort container stop. Awaited from the daemon's signal

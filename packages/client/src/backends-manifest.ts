@@ -7,7 +7,7 @@
 // Membership in BACKENDS_MANIFEST is the authoritative answer to "does the
 // container runtime install AND drive this backend?" — it's the set keyed by
 // `InstallableBackendKind`, which the whole container-runtime creds/auth path
-// (expectedCredsPath, copyHostCreds, resolveRuntime, …) is typed against.
+// (runContainerInit, migrateBrokerSessions, resolveRuntime, …) is typed against.
 // Backends absent from here (echo, openclaw, vicoop-codex today) are still
 // valid `VICOOP_BACKEND` choices — they just don't run under `--runtime
 // container`; the operator handles any setup on the host. To add a new

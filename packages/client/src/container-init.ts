@@ -14,9 +14,7 @@ import { createClaudeCredentialReader } from './claude-auth-broker.js';
 // survives across daemon restarts; this command is what makes it
 // usable in the first place.
 
-import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { execSync, spawn } from 'node:child_process';
 import semver from 'semver';
 import { longestMatch, object } from '@optique/core/constructs';
@@ -45,8 +43,7 @@ import { createLogger, type Logger } from './logger.js';
 export interface ContainerInitOptions {
   kind: InstallableBackendKind;
   runtimeName?: string;
-  // Codex: opt into host credential copying. Claude always uses the broker;
-  // this flag is accepted for compatibility and never copies Claude secrets.
+  // Accepted for CLI compatibility; both backends keep credentials on the host.
   fromHost: boolean;
   reuseState?: boolean;
   workspaceDir?: string;
@@ -59,17 +56,7 @@ export interface ContainerInitOptions {
   // init-firewall.sh. The CLI defaults this to whatever the daemon
   // would use; included as a parameter so tests can override.
   bridgeUrl?: string;
-  // Test seam — inject a stub TTY probe + interactive runner so the
-  // auto-login branch can be exercised without a real terminal /
-  // docker daemon. Production passes nothing; defaults fall through
-  // to process.stdin.isTTY + spawn('docker', argv, {stdio:'inherit'}).
-  authRunner?: Partial<AuthRunner>;
   logger?: Logger;
-}
-
-export interface AuthRunner {
-  isTTY: () => boolean;
-  runDockerInteractive: (argv: readonly string[]) => Promise<number>;
 }
 
 type RuntimeContainerState = 'running' | 'stopped' | 'missing';
@@ -199,7 +186,6 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
 
 // Credentials remain in their original volume. A restricted, networkless
 // maintenance helper copies selected session records into the new config dir.
-export const migrateClaudeSessions = (runtimeName:string,image:string,log:Logger) => migrateBrokerSessions('claude',runtimeName,image,log);
 export async function migrateBrokerSessions(kind:InstallableBackendKind, runtimeName: string, image: string, log: Logger): Promise<void> {
   const legacy = credsVolumeName(kind, runtimeName);
   if (defaultDockerRun(['volume', 'inspect', legacy]).exitCode !== 0) return;
@@ -210,100 +196,6 @@ export async function migrateBrokerSessions(kind:InstallableBackendKind, runtime
     '--entrypoint', '/usr/local/bin/node', image, '-e', kind==='claude' ? CLAUDE_SESSION_MIGRATION : CODEX_SESSION_MIGRATION]);
   if (result.exitCode !== 0) throw new Error('Session migration failed; legacy volume is unchanged. Inspect the destination for incompatible files or permissions.');
   log.info('Legacy conversation records copied where absent; credentials and settings remain detached.');
-}
-
-function authCommandFor(containerName: string, kind: InstallableBackendKind): string {
-  return (
-    `docker start ${containerName} >/dev/null && ` +
-    `docker exec -it ${containerName} ${authHintFor(kind)} && ` +
-    `docker stop ${containerName} >/dev/null`
-  );
-}
-
-// Decides whether to run the agent CLI's interactive auth flow in
-// the freshly-installed runtime container, and runs it inline when
-// the operator is on an interactive terminal. Non-TTY callers
-// (CI, piped input, automation) fall back to the hint-only path so
-// init stays scriptable. Caller in runContainerInit treats a
-// non-zero exitCode as a fatal init failure but leaves the runtime
-// container in place so the operator can retry the auth without
-// re-running install-backend.sh.
-export async function maybeAutoLoginAfterInit(
-  containerName: string,
-  kind: InstallableBackendKind,
-  log: Logger,
-  runner: Partial<AuthRunner> = {},
-): Promise<{ attempted: boolean; exitCode: number }> {
-  const isTTY = (runner.isTTY ?? defaultIsTTY)();
-  if (!isTTY) {
-    log.info(
-      `--from-host not set and stdin is not a TTY: leaving creds empty. To auth inside the container run\n` +
-        `    ${authCommandFor(containerName, kind)}`,
-    );
-    return { attempted: false, exitCode: 0 };
-  }
-  log.info(
-    `--from-host not set; starting interactive auth (${authHintFor(kind)}) inside ${containerName}...`,
-  );
-  const run = runner.runDockerInteractive ?? defaultRunDockerInteractive;
-  const code = await run(['exec', '-it', containerName, ...authHintFor(kind).split(' ')]);
-  if (code === 0) {
-    log.info(`auth complete for ${kind}.`);
-    return { attempted: true, exitCode: 0 };
-  }
-  log.error(
-    `interactive auth exited with code ${code}. Runtime container '${containerName}' was left in place; ` +
-      `retry with:\n    ${authCommandFor(containerName, kind)}`,
-  );
-  return { attempted: true, exitCode: 1 };
-}
-
-function defaultIsTTY(): boolean {
-  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
-}
-
-function defaultRunDockerInteractive(argv: readonly string[]): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('docker', Array.from(argv), { stdio: 'inherit' });
-    child.on('error', reject);
-    child.on('close', (code) => resolve(code ?? -1));
-  });
-}
-
-// Canonical in-container path of the file the backend will read on
-// first task. Probed by the daemon at startup (assertContainerCredsPresent)
-// so a missing-creds runtime container fails before any task is
-// accepted, instead of failing at first spawn with whatever
-// backend-specific "not authenticated" error the CLI emits.
-export function expectedCredsPath(kind: InstallableBackendKind): string {
-  switch (kind) {
-    case 'claude':
-      return '/data/creds/claude/.credentials.json';
-    case 'codex':
-      return '/data/creds/codex/auth.json';
-  }
-}
-
-// Daemon-startup fail-fast probe. Run after RuntimeContainer.start()
-// has the container running; checks that the per-kind creds file the
-// agent CLI will read actually exists in the creds volume. Throws
-// with the same auth-hint container-init prints when --from-host was
-// omitted, so the operator's recovery path is identical regardless of
-// where they hit the missing-creds case.
-export async function assertContainerCredsPresent(
-  containerName: string,
-  kind: InstallableBackendKind,
-  opts: { dockerRun?: DockerRun } = {},
-): Promise<void> {
-  const dockerRun = opts.dockerRun ?? defaultDockerRun;
-  const path = expectedCredsPath(kind);
-  const r = dockerRun(['exec', containerName, 'test', '-f', path]);
-  if (r.exitCode === 0) return;
-  throw new Error(
-    `runtime container '${containerName}' has no ${kind} creds at ${path}. ` +
-      `Authenticate inside the container, then restart the daemon:\n` +
-      `    ${authCommandFor(containerName, kind)}`,
-  );
 }
 
 // Run `docker exec [--user U] <container> <cmd...>` with stdio
@@ -335,19 +227,16 @@ async function dockerExecStream(
   await runDockerCli(args);
 }
 
-function runDockerCli(args: string[], stdin?: Buffer): Promise<void> {
+function runDockerCli(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn('docker', args, {
-      stdio: [stdin !== undefined ? 'pipe' : 'ignore', 'inherit', 'inherit'],
+      stdio: ['ignore', 'inherit', 'inherit'],
     });
     child.on('error', reject);
     child.on('close', (code) => {
       if (code === 0) resolve();
       else reject(new Error(`docker ${args[0]} exited with code ${code}`));
     });
-    if (stdin !== undefined && child.stdin) {
-      child.stdin.end(stdin);
-    }
   });
 }
 
@@ -374,148 +263,6 @@ export async function probeBackendVersion(
   } catch {
     return null;
   }
-}
-
-// Test seam for the host-creds collectors. Tests provide stub
-// platform / homedir / fs reads / keychain lookups so the missing-
-// creds and found-creds branches can be exercised without touching
-// the real $HOME or macOS Keychain. Production passes nothing and
-// each field defaults to the real node:fs / node:os / `security`
-// CLI call.
-export interface HostCredsEnv {
-  platform?: NodeJS.Platform;
-  homedir?: () => string;
-  existsSync?: (path: string) => boolean;
-  readFileSync?: (path: string) => Buffer;
-  // null => not found (keychain entry absent), throw => lookup failed
-  keychainLookup?: (service: string) => string | null;
-}
-
-// Per-kind host creds discovery + copy into the container creds
-// volume. Throws with a kind-specific hint when --from-host was
-// requested but the host has no usable creds — the caller surfaces
-// that as a non-zero exit so the operator doesn't end up with a
-// runtime container that will fail auth on the first task.
-async function copyHostCreds(
-  containerName: string,
-  kind: InstallableBackendKind,
-  log: Logger,
-  env: HostCredsEnv = {},
-): Promise<void> {
-  if (kind === 'claude') throw new Error('Claude credentials must remain on the host; use the authentication broker');
-  const files = collectCodexHostCreds(env);
-  if (files.length === 0) {
-    throw new Error(
-      `no host creds found for ${kind}. Expected ${expectedHostCredsHint(kind)}.`,
-    );
-  }
-  for (const f of files) {
-    await writeContainerFile(containerName, f.target, f.data);
-    log.info(`copied ${kind} creds → ${f.target}`);
-  }
-}
-
-export function collectClaudeHostCreds(
-  env: HostCredsEnv = {},
-): Array<{ target: string; data: Buffer }> {
-  // macOS: token lives in the Keychain under "Claude Code-credentials";
-  // pull it out via `security` (read-only, no mutation). On linux the
-  // CLI persists ~/.claude/.credentials.json — read it directly.
-  const platform = env.platform ?? process.platform;
-  if (platform === 'darwin') {
-    const lookup = env.keychainLookup ?? defaultClaudeKeychainLookup;
-    let token: string | null;
-    try {
-      token = lookup('Claude Code-credentials');
-    } catch {
-      return [];
-    }
-    if (!token || token.length === 0) return [];
-    return [{ target: expectedCredsPath('claude'), data: Buffer.from(`${token}\n`) }];
-  }
-  const home = (env.homedir ?? homedir)();
-  const existsFn = env.existsSync ?? existsSync;
-  const readFn = env.readFileSync ?? readFileSync;
-  const linuxPath = join(home, '.claude', '.credentials.json');
-  if (existsFn(linuxPath)) {
-    return [{ target: expectedCredsPath('claude'), data: readFn(linuxPath) }];
-  }
-  return [];
-}
-
-export function collectCodexHostCreds(
-  env: HostCredsEnv = {},
-): Array<{ target: string; data: Buffer }> {
-  // codex stores its OAuth token + config in ~/.codex. We pick up
-  // auth.json (token) and config.toml (model/provider config) when
-  // present — anything else (sessions, cache) is intentionally
-  // left behind so the named volume doesn't fill up with stale
-  // local state.
-  const home = (env.homedir ?? homedir)();
-  const existsFn = env.existsSync ?? existsSync;
-  const readFn = env.readFileSync ?? readFileSync;
-  const out: Array<{ target: string; data: Buffer }> = [];
-  const authPath = join(home, '.codex', 'auth.json');
-  if (existsFn(authPath)) {
-    out.push({ target: expectedCredsPath('codex'), data: readFn(authPath) });
-  }
-  const configPath = join(home, '.codex', 'config.toml');
-  if (existsFn(configPath)) {
-    out.push({ target: '/data/creds/codex/config.toml', data: readFn(configPath) });
-  }
-  return out;
-}
-
-function defaultClaudeKeychainLookup(service: string): string | null {
-  try {
-    const out = execSync(`security find-generic-password -s '${service}' -w`, {
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-      .toString()
-      .trim();
-    return out.length > 0 ? out : null;
-  } catch {
-    return null;
-  }
-}
-
-function expectedHostCredsHint(kind: InstallableBackendKind): string {
-  if (kind === 'claude') {
-    return process.platform === 'darwin'
-      ? `a populated macOS Keychain entry named "Claude Code-credentials" ` +
-          `(login first with \`claude setup-token\`), ` +
-          `or ~/.claude/.credentials.json on linux`
-      : `~/.claude/.credentials.json (login first with \`claude setup-token\`)`;
-  }
-  return `~/.codex/auth.json (login first with \`codex login --device-auth\`)`;
-}
-
-// Pipe a small Buffer into `docker exec ... bash -c 'cat > path && chmod 600'`.
-// Uses the docker CLI for the same bun-compatibility reason as
-// dockerExecStream — dockerode's hijacked-stream stdin pipe is the
-// one part of dockerode that doesn't survive bun compilation.
-async function writeContainerFile(
-  containerName: string,
-  targetPath: string,
-  data: Buffer,
-): Promise<void> {
-  await runDockerCli(
-    [
-      'exec',
-      '-i',
-      containerName,
-      'bash',
-      '-c',
-      `cat > ${targetPath} && chmod 600 ${targetPath}`,
-    ],
-    data,
-  );
-}
-
-function authHintFor(kind: InstallableBackendKind): string {
-  if (kind === 'claude') return 'claude setup-token';
-  if (kind === 'codex') return 'codex login --device-auth';
-  return `<kind>-specific auth command`;
 }
 
 export function listRuntimeContainers(opts: ContainerListOptions = {}): RuntimeListRow[] {
@@ -591,7 +338,7 @@ export function removeRuntimeContainer(opts: ContainerRemoveOptions): RuntimeRem
     name: runtimeName,
     container: {
       name: containerResourceName,
-      removed: removeDockerResource(dockerRun, ['rm', '-f', containerResourceName], 'container'),
+      removed: removeDockerResource(dockerRun, ['rm', '-f', containerResourceName]),
     },
     volumes: [],
   };
@@ -601,7 +348,7 @@ export function removeRuntimeContainer(opts: ContainerRemoveOptions): RuntimeRem
       name: volumeName,
       removed: opts.preserveVolumes
         ? false
-        : removeDockerResource(dockerRun, ['volume', 'rm', volumeName], 'volume'),
+        : removeDockerResource(dockerRun, ['volume', 'rm', volumeName]),
       skipped: opts.preserveVolumes,
     });
   }
@@ -650,7 +397,6 @@ export function formatRuntimeRemoveJson(result: RuntimeRemoveResult): string {
 function removeDockerResource(
   dockerRun: DockerRun,
   args: readonly string[],
-  resource: 'container' | 'volume',
 ): boolean {
   const r = dockerRun(args);
   const output = `${r.stdout}\n${r.stderr}`;

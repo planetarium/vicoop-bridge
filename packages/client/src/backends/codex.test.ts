@@ -3036,7 +3036,7 @@ test('container Codex cancels a pending execution login', async()=>{
 });
 
 test('container Codex allows independent contexts to execute concurrently', async()=>{
-  const fake=makeFakeSpawn((child,index)=>{
+  const fake=makeFakeSpawn((_child,index)=>{
     const scenario=happyPath({threadId:`thread-${index}`});
     return {onLine(frame,c,i){
       if(frame.method==='turn/start' && index===0)setTimeout(()=>scenario.onLine!(frame,c,i),25);

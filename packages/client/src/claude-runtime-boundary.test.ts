@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assertClaudeBrokerContainer } from './claude-runtime-boundary.js';
+import { assertBrokerContainer } from './execution-runtime-boundary.js';
 import { RuntimeContainer } from './runtime-container.js';
 const container = () => ({ Config: { User: 'node', Labels: { 'vicoop.claude-auth': 'stdio-v1', 'vicoop.name': 'work' },
   Env: ['CLAUDE_CONFIG_DIR=/data/sessions/claude/config'] },
@@ -8,7 +8,7 @@ const container = () => ({ Config: { User: 'node', Labels: { 'vicoop.claude-auth
   Mounts: [{ Type: 'volume', Name: 'vicoop-sessions-work', Destination: '/data/sessions/claude' }] });
 
 test('reject legacy/unsafe runtime inspect without leaking credentials in diagnostics', () => {
-  assert.doesNotThrow(() => assertClaudeBrokerContainer(JSON.stringify(container())));
+  assert.doesNotThrow(() => assertBrokerContainer(JSON.stringify(container()), 'claude'));
   for (const mutate of [
     (c: any) => c.Config.Labels = {},
     (c: any) => c.Config.Env.push('ANTHROPIC_API_KEY=SECRET_VALUE'),
@@ -21,7 +21,7 @@ test('reject legacy/unsafe runtime inspect without leaking credentials in diagno
     (c: any) => c.HostConfig.SecurityOpt = [],
   ]) {
     const c = container(); mutate(c);
-    assert.throws(() => assertClaudeBrokerContainer(JSON.stringify(c)), e => e instanceof Error && /migration/.test(e.message) && !e.message.includes('SECRET_VALUE'));
+    assert.throws(() => assertBrokerContainer(JSON.stringify(c), 'claude'), e => e instanceof Error && /migration/.test(e.message) && !e.message.includes('SECRET_VALUE'));
   }
 });
 

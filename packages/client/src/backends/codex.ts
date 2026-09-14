@@ -12,7 +12,6 @@ import {
   appendCallerContextInstruction,
   callerContextSessionKey,
   neutralizeCallerContextMarkers,
-  renderCallerContext,
   wrapUserMessageWithCallerContext,
 } from '../caller-context.js';
 import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
@@ -441,12 +440,6 @@ function commandExecutionSummary(item: Extract<ThreadItem, { type: 'commandExecu
   return clipTo(output ? `${head}\n${output}` : head, COMMAND_TRACE_MAX_CHARS);
 }
 
-interface PreparedInput {
-  input: UserInputItem[];
-  tempDir: string | null;
-  instructions: string | null;
-}
-
 // Convert mapped prompt + image files to the app-server `UserInput[]` shape.
 // Order: user text → images appended. Tool-call history is no longer
 // folded into the user text — see `historyToInjectItems`, which puts it
@@ -760,7 +753,6 @@ export function createCodexBackend(
   // Retain every live client until close so execution teardown can await it.
   const liveClients = new Set<AppServerRpcClient>();
   let initInFlight: Promise<AppServerRpcClient> | null = null;
-  let serverInfo: InitializeResult | null = null;
 
   // Per-thread handlers for `item/tool/call` (codex's native-function-call
   // server request). Registered by the active `handle()` after thread/start
@@ -840,7 +832,6 @@ export function createCodexBackend(
         liveClients.delete(c);
         if (rpcClient === c) {
           rpcClient = null;
-          serverInfo = null;
         }
       });
       try {
@@ -860,14 +851,13 @@ export function createCodexBackend(
           // independently so this opt-in remains safe across upgrades.
           capabilities: { experimentalApi: true },
         };
-        const result = await withTimeout(
+        await withTimeout(
           c.request<InitializeResult>('initialize', initParams),
           initializeTimeoutMs,
           'initialize timed out',
         );
         c.notify('initialized');
         await withTimeout(c.authenticateExecution(), initializeTimeoutMs, 'execution authentication timed out');
-        serverInfo = result;
         rpcClient = c;
         return c;
       } catch (err) {
@@ -1140,7 +1130,6 @@ export function createCodexBackend(
         // compete with. Plain-task mode (no openai-compat metadata) keeps
         // the directive because that's the actual a2a-agent surface the
         // mention can land on.
-        const callerPrompt = renderCallerContext(task.caller);
         const systemPrompt = appendCallerContextInstruction(
           envelope
             ? composeNativeDevInstructions(envelopeSystem, envelopeToolChoice)

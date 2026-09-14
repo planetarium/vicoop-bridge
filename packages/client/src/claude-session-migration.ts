@@ -1,7 +1,7 @@
 // Trusted one-shot maintenance code, run in a networkless helper, never in the
 // workload. Only conversations and todos cross from the detached legacy volume.
 // No settings, login JSON, caches, environment snapshots or symlinks are copied.
-export function sessionMigrationScript(trees: readonly (readonly [string,string])[]): string { return String.raw`
+function sessionMigrationScript(trees: readonly (readonly [string,string])[]): string { return String.raw`
 const fs = require('node:fs'), path = require('node:path');
 const source = process.argv[1] || '/legacy';
 const target = process.argv[2] || '/sessions/config';
