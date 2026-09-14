@@ -2947,6 +2947,42 @@ test('container Codex fails closed when execution login is rejected', async()=>{
   assert.equal(findRequest(fake.lastChild().stdinFrames(),'thread/start'),null);
 });
 
+for (const rejectedMethod of ['initialize', 'account/login/start']) {
+  test(`container Codex waits for actual close after ${rejectedMethod} rejection`, async () => {
+    let killed!: () => void;
+    const killRequested = new Promise<void>(resolve => { killed = resolve; });
+    const fake = makeFakeSpawn((child, index) => {
+      const scenario = happyPath();
+      if (index !== 0) return scenario;
+      Object.defineProperty(child, 'executionToken', {value: 'vbc_exec_fixture'});
+      child.kill = () => { child.killed = true; killed(); return true; };
+      return {onLine(frame, c, i) {
+        if (frame.method === rejectedMethod) c.emitStdout({id: frame.id, error: {code: -32600, message: 'rejected'}});
+        else scenario.onLine!(frame, c, i);
+      }};
+    });
+    const backend = createCodexExecutionBackend({spawn: fake.spawn, heartbeatMs: 0});
+    const frames: UpFrame[] = [];
+    let returned = false;
+    const first = backend.handle(assign('first'), frame => frames.push(frame), new AbortController().signal)
+      .then(() => { returned = true; });
+    await killRequested;
+    const second = backend.handle(assign('second'), () => {}, new AbortController().signal);
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(returned, false, 'handle returned before supervisor close');
+      assert.ok(!frames.some(frame => frame.type === 'task.fail' || frame.type === 'task.complete'));
+      assert.equal(fake.children.length, 1, 'next execution started before supervisor close');
+    } finally {
+      fake.children[0].finish(1);
+      await Promise.all([first, second]);
+      backend.stop?.();
+    }
+    assert.equal(frames.at(-1)?.type, 'task.fail');
+    assert.equal(fake.children.length, 2);
+  });
+}
+
 test('container Codex cancels a process still initializing', async()=>{
   const controller=new AbortController();
   const fake=makeFakeSpawn(()=>({onLine(frame){if(frame.method==='initialize')queueMicrotask(()=>controller.abort());}}));
@@ -2956,6 +2992,29 @@ test('container Codex cancels a process still initializing', async()=>{
   assert.ok(fake.lastChild().killed);
   assert.equal((frames.at(-1) as any).status.state,'canceled');
   backend.stop?.();
+});
+
+test('container Codex capability failure waits for actual close', async () => {
+  let killed!: () => void;
+  const killRequested = new Promise<void>(resolve => { killed = resolve; });
+  const fake = makeFakeSpawn(child => {
+    child.kill = () => { child.killed = true; killed(); return true; };
+    return {onLine(frame, c) {
+      if (frame.method === 'initialize') c.emitStdout({id: frame.id, error: {code: -32600, message: 'rejected'}});
+    }};
+  });
+  const backend = createCodexExecutionBackend({spawn: fake.spawn});
+  let returned = false;
+  const probe = backend.resolveCapabilities!().then(() => { returned = true; });
+  await killRequested;
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(returned, false, 'capability probe returned before supervisor close');
+  } finally {
+    fake.lastChild().finish(1);
+    await probe;
+    backend.stop?.();
+  }
 });
 
 test('container Codex cancels a pending execution login', async()=>{

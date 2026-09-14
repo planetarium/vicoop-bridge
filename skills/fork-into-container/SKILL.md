@@ -94,8 +94,9 @@ Optional env overrides:
 
 1. Detect parent kind from env / `~/.claude` vs `~/.codex` presence.
 2. If `vicoop-runtime-<kind>` is **not** present at all, invoke
-   `vicoop-client container init <kind> --from-host`. Upstream pulls
-   creds, installs the agent CLI, compat-checks the version, and (per
+   `vicoop-client container init <kind> --from-host`. Upstream
+   validates host credentials without copying them, installs the agent CLI,
+   compat-checks the version, and (per
    #271) leaves the container stopped.
 3. Capture the container's running state. If stopped, `docker start`
    it for the inject window; restore it to its original state on exit
@@ -106,11 +107,14 @@ Optional env overrides:
      `AGENTS.md` has no equivalent directive) or `AGENTS.md`
    - Defensive `find -delete` for credential-shaped names and macOS
      AppleDouble `._*` sidecars.
-5. `tar -C $STAGE --no-xattrs -cf - . | docker exec -i -u node $CONTAINER bash -c "tar -C /data/creds/<kind> -xf -"`.
+5. Create `/data/sessions/<kind>/config` as `node` if absent, then tar-pipe
+   the staged harness into that directory. This is the runtime's
+   `CODEX_HOME` / `CLAUDE_CONFIG_DIR` on its persistent sessions volume;
+   `/data/creds/<kind>` is temporary and must not hold the harness.
    Tar-pipe (not `docker cp`) so the extract runs as the `node` user
    and the agent CLI can traverse the files immediately.
 6. Print the daemon-start command:
-   `vicoop-client --backend <kind> --runtime container --runtime-name <kind>`
+   `vicoop-client start --backend <kind> --runtime container --runtime-name <kind>`
 7. Emit `{container, runtime_name, kind, injected_into}` JSON for the
    parent agent to chain off of.
 

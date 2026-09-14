@@ -756,7 +756,9 @@ export function createCodexBackend(
   }
 
   let rpcClient: AppServerRpcClient | null = null;
-  let startingClient: AppServerRpcClient | null = null;
+  // Failed initialization can reject before the Docker supervisor closes.
+  // Retain every live client until close so execution teardown can await it.
+  const liveClients = new Set<AppServerRpcClient>();
   let initInFlight: Promise<AppServerRpcClient> | null = null;
   let serverInfo: InitializeResult | null = null;
 
@@ -788,7 +790,6 @@ export function createCodexBackend(
         logger,
         stderrCaptureBytes: stderrCap,
       });
-      startingClient=c;
       c.setServerRequestHandler(async (_id, method, params) => {
         // Native function-call dispatch: route to the per-thread handler the
         // active task registered after `thread/start`. The dispatch table is
@@ -829,13 +830,14 @@ export function createCodexBackend(
       });
       try {
         c.start();
+        liveClients.add(c);
       } catch (err) {
-        startingClient = null;
         initInFlight = null;
         throw err;
       }
       // Clear singleton on crash so the next task respawns.
       void c.waitForClose().then(() => {
+        liveClients.delete(c);
         if (rpcClient === c) {
           rpcClient = null;
           serverInfo = null;
@@ -877,7 +879,6 @@ export function createCodexBackend(
         throw err;
       } finally {
         initInFlight = null;
-        if(startingClient===c) startingClient=null;
       }
     })().finally(()=>{initInFlight=null;});
     return initInFlight;
@@ -997,15 +998,13 @@ export function createCodexBackend(
     // daemon exits (issue #186). Best-effort SIGTERM; the OS delivers it
     // before `process.exit` runs even though we don't await the close.
     async close() {
-      const c=rpcClient ?? startingClient;
-      if(c) {c.kill();await c.waitForClose();}
+      const clients = [...liveClients];
+      for (const c of clients) c.kill();
+      await Promise.all(clients.map(c => c.waitForClose()));
     },
 
     stop(): void {
-      startingClient?.kill();
-      if (rpcClient && !rpcClient.isClosed()) {
-        rpcClient.kill('SIGTERM');
-      }
+      for (const c of liveClients) c.kill('SIGTERM');
     },
 
     async handle(task, rawEmit, signal) {
