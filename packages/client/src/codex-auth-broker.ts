@@ -35,6 +35,7 @@ export function createCodexCredentialReader(env: NodeJS.ProcessEnv = process.env
         if(typeof data.OPENAI_API_KEY!=='string' || /\s/.test(data.OPENAI_API_KEY)) throw Error();
         return {kind:'api-key',secret:data.OPENAI_API_KEY};
       }
+      if(data.auth_mode!=='chatgpt') throw Error();
       const secret=data.tokens?.access_token, accountId=data.tokens?.account_id;
       if(typeof secret!=='string' || !secret || /\s/.test(secret) || typeof accountId!=='string' || !accountId || /\s/.test(accountId)) throw Error();
       const payload=JSON.parse(Buffer.from(secret.split('.')[1],'base64url').toString());

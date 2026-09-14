@@ -10,7 +10,7 @@ import {createRequire} from 'node:module';
 // Execute the shipped script against a fake Docker filesystem: stopping the
 // runtime discards creds tmpfs while preserving its sessions volume.
 for (const kind of ['codex', 'claude']) {
- for (const mode of ['safe', 'legacy', 'credential-mount', 'credential-env', 'missing-firewall-capability']) {
+ for (const mode of ['safe', 'legacy', 'credential-mount', 'credential-env', 'missing-firewall-capability', 'unconfined-seccomp', 'unconfined-apparmor']) {
   test(`fork harness ${kind}: ${mode} boundary and persistence`, {skip: process.platform === 'win32'}, () => {
     const root = mkdtempSync(join(tmpdir(), 'fork-harness-'));
     try {
@@ -30,6 +30,8 @@ if(args[0]==='inspect' && args.includes('--format')) {
     const kind=process.env.VICOOP_FORK_KIND,mode=process.env.FORK_TEST_MODE;
     const c={Config:{User:'node',Labels:{['vicoop.'+kind+'-auth']:'stdio-v1','vicoop.name':kind},Env:[(kind==='codex'?'CODEX_HOME':'CLAUDE_CONFIG_DIR')+'=/data/sessions/'+kind+'/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN','NET_RAW'],SecurityOpt:['no-new-privileges']},Mounts:[{Type:'volume',Name:'vicoop-sessions-'+kind,Destination:'/data/sessions/'+kind}]};
     if(mode==='missing-firewall-capability') c.HostConfig.CapAdd=[];
+    if(mode==='unconfined-seccomp') c.HostConfig.SecurityOpt.push('seccomp=unconfined');
+    if(mode==='unconfined-apparmor') c.HostConfig.SecurityOpt.push('apparmor=unconfined');
     if(mode==='legacy') c.Config.Labels={};
     if(mode==='credential-mount') c.Mounts.push({Type:'volume',Name:'vicoop-creds-'+kind,Destination:'/data/creds/'+kind});
     if(mode==='credential-env') c.Config.Env.push('OPENAI_API_KEY=fixture-secret');

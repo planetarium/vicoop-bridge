@@ -21,6 +21,8 @@ test('reject legacy/unsafe runtime inspect without leaking credentials in diagno
     (c: any) => c.HostConfig.CapAdd = [],
     (c: any) => delete c.HostConfig.CapAdd,
     (c: any) => c.HostConfig.SecurityOpt = [],
+    ...['seccomp=unconfined', 'apparmor=unconfined', 'seccomp:unconfined', 'apparmor:unconfined'].map(option =>
+      (c: any) => c.HostConfig.SecurityOpt.push(option)),
   ]) {
     const c = container(); mutate(c);
     assert.throws(() => assertBrokerContainer(JSON.stringify(c), 'claude'), e => e instanceof Error && /migration/.test(e.message) && !e.message.includes('SECRET_VALUE'));
@@ -58,4 +60,10 @@ test('legacy runtime is rejected before start or any credential probe', async ()
   }});
   await assert.rejects(runtime.start(), /migration/);
   assert.ok(!calls.some(c => c[0] === 'start' || c[0] === 'exec'));
+});
+
+test('broker boundary allows custom seccomp and AppArmor profiles', () => {
+  const c = container();
+  c.HostConfig.SecurityOpt.push('seccomp=/etc/docker/restricted.json', 'apparmor=vicoop-restricted');
+  assert.doesNotThrow(() => assertBrokerContainer(JSON.stringify(c), 'claude'));
 });

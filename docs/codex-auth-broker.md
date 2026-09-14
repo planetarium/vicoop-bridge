@@ -27,7 +27,8 @@ existing host/bundled-direct range. Supported host sources, selected in order:
 
 1. Explicit `OPENAI_API_KEY` in the bridge environment.
 2. An API key or ChatGPT OAuth login in `$CODEX_HOME/auth.json` (default
-   `~/.codex/auth.json`). Files containing both are rejected.
+   `~/.codex/auth.json`). OAuth requires `auth_mode="chatgpt"`; unsupported
+   login modes and files containing both credential types are rejected.
 
 The selected source and login kind stay pinned. OAuth also pins the account ID.
 Credentials are reread for each request; an expired token, removed file, or
@@ -43,8 +44,8 @@ authenticated model catalog at startup and stages non-secret model metadata
 per execution. Startup fails if that catalog cannot be loaded. Restart to
 refresh the catalog. API-key mode uses Codex's embedded catalog.
 
-The provider uses HTTP/SSE Responses with request compression and
-Responses-lite disabled. The built-in provider's initial WebSocket handshake
+The provider uses HTTP/SSE Responses. Both request compression and
+Responses-lite are disabled. The built-in provider's initial WebSocket handshake
 receives HTTP 426 from the authenticated broker, selecting HTTP fallback
 without repeated connection attempts; no WebSocket request reaches upstream.
 The broker permits only POST `/responses` and

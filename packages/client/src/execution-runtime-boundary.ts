@@ -11,6 +11,7 @@ export function assertBrokerContainer(raw: string, kind: string): void {
       c.HostConfig?.Devices?.length || c.HostConfig?.VolumesFrom?.length ||
       !c.HostConfig?.CapAdd?.some((v: string) => v.replace(/^CAP_/, '') === 'NET_ADMIN') ||
       c.HostConfig?.CapAdd?.some((v: string) => !['NET_ADMIN', 'NET_RAW'].includes(v.replace(/^CAP_/, ''))) ||
+      c.HostConfig?.SecurityOpt?.some((v: string) => /^(seccomp|apparmor)[=:]unconfined$/.test(v)) ||
       !c.HostConfig?.SecurityOpt?.some((v: string) => v === 'no-new-privileges' || v === 'no-new-privileges=true')) invalid();
   const env: string[] = c.Config?.Env ?? [];
   if (env.some(v => /^(ANTHROPIC_|CLAUDE_CODE_OAUTH|CLAUDE_CODE_USE_|OPENAI_|CODEX_API_KEY=|AWS_|AZURE_|GOOGLE_APPLICATION_CREDENTIALS=)/.test(v))) invalid();

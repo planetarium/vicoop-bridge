@@ -94,3 +94,20 @@ test('Codex migration copies rollouts without credentials, settings or symlinks'
   for(const path of ['auth.json','config.toml','sessions/linked.jsonl']) assert.ok(!existsSync(join(target,path)));
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
+
+test('Codex rejects unsupported OAuth modes at selection and after rotation', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'codex-auth-mode-'));
+  const write = (mode?: string) => writeFileSync(join(dir, 'auth.json'), JSON.stringify({
+    auth_mode: mode,
+    tokens: {access_token: `fixture.${Buffer.from(JSON.stringify({exp: Date.now()/1000+3600})).toString('base64url')}.signature`, account_id: 'account'},
+  }));
+  try {
+    write('chatgpt');
+    const reader = createCodexCredentialReader({CODEX_HOME: dir});
+    for (const mode of [undefined, 'api_key', 'future-mode', 'chatgptAuthTokens']) {
+      write(mode);
+      assert.throws(() => createCodexCredentialReader({CODEX_HOME: dir}), /Host Codex login/);
+      assert.throws(reader, /Host Codex login/);
+    }
+  } finally {rmSync(dir, {recursive: true, force: true});}
+});
