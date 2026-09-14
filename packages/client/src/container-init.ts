@@ -1,16 +1,13 @@
+import { CLAUDE_SESSION_MIGRATION } from './claude-session-migration.js';
+import { createClaudeCredentialReader } from './claude-auth-broker.js';
 // `vicoop-client container init <kind>` — operator one-shot
 // bootstrap for the external-runtime profile (#249 PR C).
 //
 // Boots the per-backend runtime container, runs the shared
 // install-backend.sh recipe inside it, sanity-checks the resulting
 // binary against this client's supportedRange manifest, and
-// (with --from-host) copies the operator's existing agent CLI
-// creds into the container-scoped named volume so the operator can
-// immediately go daemon. Without --from-host: if stdin is a TTY,
-// runs the agent CLI's interactive auth (claude setup-token /
-// codex login --device-auth) in the running container right then;
-// otherwise falls back to printing the docker-exec incantation
-// the operator can run themselves.
+// uses host-broker authentication for Claude. Codex can copy host credentials
+// with --from-host or log in interactively inside its runtime.
 //
 // Companion to RuntimeContainer (lifecycle) + SpawnAdapter
 // (per-task spawn). RuntimeContainer is the unit of state that
@@ -19,7 +16,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { execSync, spawn } from 'node:child_process';
 import semver from 'semver';
 import { longestMatch, object } from '@optique/core/constructs';
@@ -48,10 +45,11 @@ import { createLogger, type Logger } from './logger.js';
 export interface ContainerInitOptions {
   kind: InstallableBackendKind;
   runtimeName?: string;
-  // When true, copy the operator's existing host creds into the
-  // container creds volume. When false, leave creds empty and let
-  // the operator run an interactive auth flow themselves.
+  // Codex: opt into host credential copying. Claude always uses the broker;
+  // this flag is accepted for compatibility and never copies Claude secrets.
   fromHost: boolean;
+  reuseState?: boolean;
+  workspaceDir?: string;
   // Image override mirrors the daemon path (cli.ts:resolveRuntime).
   // Precedence is applied inside runContainerInit:
   //   opts.image > VICOOP_RUNTIME_IMAGE env > DEFAULT_RUNTIME_IMAGE.
@@ -123,10 +121,13 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
     bridgeUrl: opts.bridgeUrl,
     createIfMissing: true,
     failIfExists: true,
+    reuseState: opts.reuseState,
+    workspaceDir: opts.workspaceDir ? resolve(opts.workspaceDir) : undefined,
     logger: opts.logger,
   });
 
   try {
+    if (opts.kind === 'claude') await createClaudeCredentialReader()();
     await runtime.start();
 
     const runtimeName = runtimeInstanceName(opts.kind, opts.runtimeName);
@@ -139,11 +140,15 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
     // state takes over at mount time. This is the documented
     // workaround.
     await dockerExecStream(containerName, {
-      cmd: ['chown', '-R', 'node:node', `/data/agents/${opts.kind}`, `/data/creds/${opts.kind}`],
+      cmd: ['/bin/chown', '-R', 'node:node', `/data/agents/${opts.kind}`, `/data/creds/${opts.kind}`, `/data/sessions/${opts.kind}`],
       user: '0',
       label: 'chown',
       log,
     });
+
+    if (opts.kind === 'claude' && opts.reuseState) {
+      await migrateClaudeSessions(runtimeName, opts.image ?? process.env.VICOOP_RUNTIME_IMAGE ?? DEFAULT_RUNTIME_IMAGE, log);
+    }
 
     // (2) install the agent CLI into /data/agents/<kind>/ via the
     // shared shell recipe baked into the runtime image. node user;
@@ -181,7 +186,9 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
 
     // (4) creds. Either copy from host or leave empty for an
     // operator-driven OAuth flow.
-    if (opts.fromHost) {
+    if (opts.kind === 'claude') {
+      log.info('Claude uses host authentication through the built-in broker; no credentials were copied into the runtime.');
+    } else if (opts.fromHost) {
       try {
         await copyHostCreds(containerName, opts.kind, log);
       } catch (err) {
@@ -216,6 +223,20 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
   } finally {
     await runtime.stop();
   }
+}
+
+// Credentials remain in their original volume. A restricted, networkless
+// maintenance helper copies selected session records into the new config dir.
+export async function migrateClaudeSessions(runtimeName: string, image: string, log: Logger): Promise<void> {
+  const legacy = credsVolumeName('claude', runtimeName);
+  if (defaultDockerRun(['volume', 'inspect', legacy]).exitCode !== 0) return;
+  const result = defaultDockerRun(['run', '--rm', '--network', 'none', '--read-only',
+    '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '1000:1000',
+    '--mount', `type=volume,source=${legacy},target=/legacy,readonly`,
+    '--mount', `type=volume,source=${sessionsVolumeName('claude', runtimeName)},target=/sessions`,
+    '--entrypoint', 'node', image, '-e', CLAUDE_SESSION_MIGRATION]);
+  if (result.exitCode !== 0) throw new Error('Claude session migration failed; legacy volume is unchanged. Inspect the destination for incompatible files or permissions.');
+  log.info('Legacy Claude conversations/todos copied where absent; credentials and settings remain detached.');
 }
 
 function authCommandFor(containerName: string, kind: InstallableBackendKind): string {
@@ -408,8 +429,8 @@ async function copyHostCreds(
   log: Logger,
   env: HostCredsEnv = {},
 ): Promise<void> {
-  const files =
-    kind === 'claude' ? collectClaudeHostCreds(env) : collectCodexHostCreds(env);
+  if (kind === 'claude') throw new Error('Claude credentials must remain on the host; use the authentication broker');
+  const files = collectCodexHostCreds(env);
   if (files.length === 0) {
     throw new Error(
       `no host creds found for ${kind}. Expected ${expectedHostCredsHint(kind)}.`,
@@ -903,9 +924,15 @@ const containerInitSubCmd = command(
         description: message`Runtime instance name. Omit to use the backend kind as the generated name.`,
       }),
     ),
+    workspaceDir: optional(option('--workspace', string({ metavar: 'PATH' }), {
+      description: message`Host directory to bind at /workspace. Supply the original path when migrating a runtime with a workspace mount.`,
+    })),
+    reuseState: withDefault(flag('--reuse-state', {
+      description: message`Reuse existing agent/session volumes after removing the old container with --preserve-volumes. Claude credentials volumes remain detached.`,
+    }), false),
     fromHost: withDefault(
       flag('--from-host', {
-        description: message`Copy the operator's existing host creds into the container's per-backend creds volume (macOS keychain for claude, ~/.codex for codex). Off by default — explicit opt-in for the runtime-isolation tradeoff.`,
+        description: message`Claude always uses host authentication without copying credentials. For Codex, copy ~/.codex into its credentials volume.`,
       }),
       false,
     ),
@@ -922,7 +949,7 @@ const containerInitSubCmd = command(
   }),
   {
     brief: message`Bootstrap a per-backend runtime container.`,
-    description: message`One-shot setup for the container-runtime profile: creates \`vicoop-runtime-<name>\`, where --name defaults to the backend kind, fails if that runtime already exists, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and (with --from-host) copies the operator's existing host creds into the container creds volume. After this, launch the daemon with \`vicoop-client --backend <kind> --runtime container --runtime-name <name>\`.`,
+    description: message`One-shot setup for the container-runtime profile: creates \`vicoop-runtime-<name>\`, where --name defaults to the backend kind, fails if that runtime already exists, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and uses the host authentication broker for Claude. Codex --from-host copies host credentials into its credentials volume. After this, launch the daemon with \`vicoop-client --backend <kind> --runtime container --runtime-name <name>\`.`,
   },
 );
 
@@ -1004,6 +1031,8 @@ export async function runContainerInitCli(args: ContainerInitArgs): Promise<numb
       kind: args.kind,
       runtimeName: args.name,
       fromHost: args.fromHost,
+      reuseState: args.reuseState,
+      workspaceDir: args.workspaceDir,
       ...(args.image ? { image: args.image } : {}),
       ...(args.bridgeUrl ? { bridgeUrl: args.bridgeUrl } : {}),
     });

@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { createClaudeCredentialReader, assertClaudeBrokerSettings } from './claude-auth-broker.js';
+import { createClaudeBrokerSpawn } from './claude-broker-spawn.js';
 import { closeSync, existsSync, openSync, readFileSync } from 'node:fs';
 import { spawn as spawnProcess, type ChildProcess } from 'node:child_process';
 import { AgentCard } from '@vicoop-bridge/protocol';
@@ -400,6 +402,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       const baseSettings = args.claudeSettingsFile
         ? readClaudeSettingsFile(args.claudeSettingsFile)
         : backends.claude?.settings;
+      if (args.runtime === 'container') assertClaudeBrokerSettings(baseSettings);
       const { spawn, cwd, runtime } = await resolveRuntime({
         kind: 'claude',
         runtime: args.runtime,
@@ -495,7 +498,7 @@ async function resolveRuntime(args: {
   runtimeName: string | undefined;
   cwd: string | undefined;
   bridgeUrl: string;
-}): Promise<{ spawn?: SpawnFn; cwd?: string; runtime?: RuntimeContainer }> {
+}): Promise<{ spawn?: SpawnFn; cwd?: string; runtime?: Pick<RuntimeContainer, 'stop'> }> {
   if ((args.runtime ?? 'host') !== 'container') {
     return { cwd: args.cwd };
   }
@@ -512,6 +515,15 @@ async function resolveRuntime(args: {
   // yet. Without this check the daemon would happily accept tasks until
   // the first spawn, then surface a backend-specific auth error.
   try {
+    if (args.kind === 'claude') {
+      const credential = createClaudeCredentialReader();
+      const selectedCredential = await credential();
+      const broker = createClaudeBrokerSpawn(runtime.getContainerName(), {
+        credential, authentication: selectedCredential.kind, onCredentialFailure: () => console.error('Claude host authentication unavailable; renew the selected host login or key. No fallback was attempted.'),
+      });
+      return { runtime: { stop: async () => { broker.close(); await runtime.stop(); } },
+        spawn: broker.spawn, cwd: args.cwd ? '/workspace' : undefined };
+    }
     await assertContainerCredsPresent(runtime.getContainerName(), args.kind);
   } catch (err) {
     await runtime.stop();

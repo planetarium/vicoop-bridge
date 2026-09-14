@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { RuntimeContainer, type DockerResult } from './runtime-container.js';
 
+// Generic volume lifecycle tests use Codex; Claude authentication boundaries
+// have dedicated coverage in claude-runtime-boundary.test.ts.
 // Test seam fixture. Each `dockerRun` call is matched against the
 // next response in the queue and pushed onto `calls` for assertion.
 // Missing fixtures fall back to a successful zero-output result so
@@ -54,7 +56,7 @@ function happyCreateResponses(): RunResponse[] {
 test('start: with createIfMissing pulls nothing when image is cached, creates+starts a fresh container', async () => {
   const { run, calls } = makeDockerFixture(happyCreateResponses());
   const rc = new RuntimeContainer({
-    backendKind: 'claude',
+    backendKind: 'codex',
     image: 'test/runtime:latest',
     workspaceDir: '/host/workspace',
     bridgeUrl: 'wss://bridge.example',
@@ -73,13 +75,13 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
   const volumeCreates = calls.filter((c) => c[0] === 'volume' && c[1] === 'create');
   assert.deepEqual(
     volumeCreates.map((c) => c[c.length - 1]).sort(),
-    ['vicoop-agents-claude', 'vicoop-creds-claude', 'vicoop-sessions-claude'].sort(),
+    ['vicoop-agents-codex', 'vicoop-creds-codex', 'vicoop-sessions-codex'].sort(),
   );
   for (const v of volumeCreates) {
-    assert.ok(v.includes('vicoop.kind=claude'), `label on ${v.join(' ')}`);
+    assert.ok(v.includes('vicoop.kind=codex'), `label on ${v.join(' ')}`);
     assert.ok(v.includes('vicoop.managed-by=vicoop-bridge'), `managed label on ${v.join(' ')}`);
     assert.ok(v.includes('vicoop.component=runtime'), `component label on ${v.join(' ')}`);
-    assert.ok(v.includes('vicoop.name=claude'), `instance label on ${v.join(' ')}`);
+    assert.ok(v.includes('vicoop.name=codex'), `instance label on ${v.join(' ')}`);
   }
 
   // Container create argv: --name, --restart unless-stopped, NET_ADMIN+RAW,
@@ -87,7 +89,7 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
   const createCmd = calls.find((c) => c[0] === 'create');
   assert.ok(createCmd, 'create call present');
   const argv = createCmd as readonly string[];
-  assert.ok(argv.includes('vicoop-runtime-claude'), 'container name');
+  assert.ok(argv.includes('vicoop-runtime-codex'), 'container name');
   assert.equal(argv[argv.length - 1], 'test/runtime:latest', 'image last');
   const restartIdx = argv.indexOf('--restart');
   assert.equal(argv[restartIdx + 1], 'unless-stopped');
@@ -95,14 +97,14 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
   assert.ok(argv.includes('NET_RAW'));
   assert.ok(argv.includes('vicoop.managed-by=vicoop-bridge'));
   assert.ok(argv.includes('vicoop.component=runtime'));
-  assert.ok(argv.includes('vicoop.kind=claude'));
-  assert.ok(argv.includes('vicoop.name=claude'));
+  assert.ok(argv.includes('vicoop.kind=codex'));
+  assert.ok(argv.includes('vicoop.name=codex'));
   assert.ok(
     argv.some((a) => a === 'type=bind,source=/host/workspace,target=/workspace'),
     'host workspace mounted',
   );
   assert.ok(
-    argv.some((a) => a === 'type=volume,source=vicoop-creds-claude,target=/data/creds/claude'),
+    argv.some((a) => a === 'type=volume,source=vicoop-creds-codex,target=/data/creds/codex'),
     'creds volume mounted',
   );
   assert.ok(
@@ -111,12 +113,12 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
   );
 
   // Start sequence
-  assert.deepEqual(calls[calls.length - 2], ['start', 'vicoop-runtime-claude']);
+  assert.deepEqual(calls[calls.length - 2], ['start', 'vicoop-runtime-codex']);
   assert.deepEqual(calls[calls.length - 1], [
     'inspect',
     '--format',
     '{{.State.Status}}',
-    'vicoop-runtime-claude',
+    'vicoop-runtime-codex',
   ]);
 });
 
@@ -128,7 +130,7 @@ test('start: reuses an existing running container (no create, no start)', async 
     ok('running'), // wait poll
   ]);
   const rc = new RuntimeContainer({
-    backendKind: 'claude',
+    backendKind: 'codex',
     image: 'test/runtime:latest',
     dockerRun: run,
   });
@@ -177,7 +179,7 @@ test('start: failIfExists rejects existing volumes before creating a container',
     fail('volume not found', 1), // sessions absent
   ]);
   const rc = new RuntimeContainer({
-    backendKind: 'claude',
+    backendKind: 'codex',
     image: 'test/runtime:latest',
     createIfMissing: true,
     failIfExists: true,
@@ -186,7 +188,7 @@ test('start: failIfExists rejects existing volumes before creating a container',
 
   await assert.rejects(
     rc.start(),
-    /runtime volumes already exist: vicoop-creds-claude.*container rm claude/s,
+    /runtime volumes already exist: vicoop-creds-codex.*container rm codex/s,
   );
   assert.equal(calls.filter((c) => c[0] === 'image').length, 0);
   assert.equal(calls.filter((c) => c[0] === 'create').length, 0);
@@ -238,7 +240,7 @@ test('start: docker daemon unreachable surfaces an actionable error', async () =
     fail('Cannot connect to the Docker daemon at unix:///var/run/docker.sock', 1),
   ]);
   const rc = new RuntimeContainer({
-    backendKind: 'claude',
+    backendKind: 'codex',
     image: 'test/runtime:latest',
     dockerRun: run,
   });
@@ -247,10 +249,10 @@ test('start: docker daemon unreachable surfaces an actionable error', async () =
 
 test('stop: tolerates already-stopped containers', async () => {
   const { run } = makeDockerFixture([
-    fail('Error: No such container: vicoop-runtime-claude', 1),
+    fail('Error: No such container: vicoop-runtime-codex', 1),
   ]);
   const rc = new RuntimeContainer({
-    backendKind: 'claude',
+    backendKind: 'codex',
     dockerRun: run,
   });
   // Should not throw despite docker stop's non-zero exit.
@@ -260,7 +262,7 @@ test('stop: tolerates already-stopped containers', async () => {
 test('Env carries VICOOP_BRIDGE_URL and optional skip-firewall toggle', async () => {
   const { run, calls } = makeDockerFixture(happyCreateResponses());
   const rc = new RuntimeContainer({
-    backendKind: 'claude',
+    backendKind: 'codex',
     image: 'test/runtime:latest',
     bridgeUrl: 'wss://bridge.example',
     skipFirewall: true,
