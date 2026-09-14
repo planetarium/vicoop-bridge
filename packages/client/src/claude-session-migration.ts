@@ -1,7 +1,7 @@
 // Trusted one-shot maintenance code, run in a networkless helper, never in the
 // workload. Only conversations and todos cross from the detached legacy volume.
 // No settings, login JSON, caches, environment snapshots or symlinks are copied.
-export const CLAUDE_SESSION_MIGRATION = String.raw`
+export function sessionMigrationScript(trees: readonly (readonly [string,string])[]): string { return String.raw`
 const fs = require('node:fs'), path = require('node:path');
 const source = process.argv[1] || '/legacy';
 const target = process.argv[2] || '/sessions/config';
@@ -25,9 +25,13 @@ function copy(src, dst, extension) {
   }
 }
 directory(target);
-for (const [name,extension] of [['projects','.jsonl'],['todos','.json']]) {
+for (const [name,extension] of ${JSON.stringify(trees)}) {
   const src = path.join(source,name);
   if (fs.existsSync(src)) copy(src,path.join(target,name),extension);
 }
 console.log(JSON.stringify({copied}));
 `;
+
+}
+export const CLAUDE_SESSION_MIGRATION=sessionMigrationScript([['projects','.jsonl'],['todos','.json']]);
+export const CODEX_SESSION_MIGRATION=sessionMigrationScript([['sessions','.jsonl'],['archived_sessions','.jsonl']]);

@@ -2,8 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { RuntimeContainer, type DockerResult } from './runtime-container.js';
 
-// Generic volume lifecycle tests use Codex; Claude authentication boundaries
-// have dedicated coverage in claude-runtime-boundary.test.ts.
+// Runtime lifecycle fixtures include the Codex broker boundary.
 // Test seam fixture. Each `dockerRun` call is matched against the
 // next response in the queue and pushed onto `calls` for assertion.
 // Missing fixtures fall back to a successful zero-output result so
@@ -18,6 +17,11 @@ function makeDockerFixture(responses: RunResponse[]) {
   let i = 0;
   const run = (args: readonly string[]): DockerResult => {
     calls.push(args);
+    if(args.includes('{{json .}}')) {
+      const name=args.at(-1)!.replace('vicoop-runtime-','');
+      return ok(JSON.stringify({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1','vicoop.name':name},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',SecurityOpt:['no-new-privileges']},Mounts:[]}));
+    }
+    if(args[0]==='exec' && args.includes('/bin/sh')) return ok();
     const r = responses[i++] ?? ok();
     return typeof r === 'function' ? r(args) : r;
   };
@@ -43,8 +47,6 @@ function happyCreateResponses(): RunResponse[] {
     ok(), // image inspect — found
     fail('volume not found', 1), // volume inspect agents
     ok(), // volume create agents
-    fail('volume not found', 1), // volume inspect creds
-    ok(), // volume create creds
     fail('volume not found', 1), // volume inspect sessions
     ok(), // volume create sessions
     ok(), // create container
@@ -75,7 +77,7 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
   const volumeCreates = calls.filter((c) => c[0] === 'volume' && c[1] === 'create');
   assert.deepEqual(
     volumeCreates.map((c) => c[c.length - 1]).sort(),
-    ['vicoop-agents-codex', 'vicoop-creds-codex', 'vicoop-sessions-codex'].sort(),
+    ['vicoop-agents-codex', 'vicoop-sessions-codex'].sort(),
   );
   for (const v of volumeCreates) {
     assert.ok(v.includes('vicoop.kind=codex'), `label on ${v.join(' ')}`);
@@ -104,8 +106,8 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
     'host workspace mounted',
   );
   assert.ok(
-    argv.some((a) => a === 'type=volume,source=vicoop-creds-codex,target=/data/creds/codex'),
-    'creds volume mounted',
+    !argv.some((a) => a.includes('source=vicoop-creds-')),
+    'creds volume must not be mounted',
   );
   assert.ok(
     argv.some((a) => a === 'VICOOP_BRIDGE_URL=wss://bridge.example'),
@@ -113,8 +115,8 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
   );
 
   // Start sequence
-  assert.deepEqual(calls[calls.length - 2], ['start', 'vicoop-runtime-codex']);
-  assert.deepEqual(calls[calls.length - 1], [
+  assert.deepEqual(calls[calls.length - 4], ['start', 'vicoop-runtime-codex']);
+  assert.deepEqual(calls[calls.length - 3], [
     'inspect',
     '--format',
     '{{.State.Status}}',
@@ -175,8 +177,7 @@ test('start: failIfExists rejects existing volumes before creating a container',
     ok('28.0.0'),
     ok(''), // ps -a — no container
     fail('volume not found', 1), // agents absent
-    ok(), // creds exists
-    fail('volume not found', 1), // sessions absent
+    ok(), // sessions exists
   ]);
   const rc = new RuntimeContainer({
     backendKind: 'codex',
@@ -188,7 +189,7 @@ test('start: failIfExists rejects existing volumes before creating a container',
 
   await assert.rejects(
     rc.start(),
-    /runtime volumes already exist: vicoop-creds-codex.*container rm codex/s,
+    /runtime volumes already exist: vicoop-sessions-codex.*container rm codex/s,
   );
   assert.equal(calls.filter((c) => c[0] === 'image').length, 0);
   assert.equal(calls.filter((c) => c[0] === 'create').length, 0);
@@ -300,7 +301,6 @@ test('runtimeName selects container and volume names', async () => {
     volumeCreates.map((c) => c[c.length - 1]).sort(),
     [
       'vicoop-agents-work',
-      'vicoop-creds-work',
       'vicoop-sessions-work',
     ].sort(),
   );
@@ -309,6 +309,6 @@ test('runtimeName selects container and volume names', async () => {
   assert.ok(createCmd.includes('vicoop-runtime-work'));
   assert.ok(createCmd.includes('vicoop.name=work'));
   assert.ok(
-    createCmd.some((a) => a === 'type=volume,source=vicoop-creds-work,target=/data/creds/codex'),
+    createCmd.includes('CODEX_HOME=/data/sessions/codex/config'),
   );
 });

@@ -60,6 +60,7 @@ export type CodexSandboxMode = SandboxMode;
 export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline';
 
 export interface CodexBackendOptions {
+  supportedModelIds?: readonly string[];
   command?: string;
   appServerArgs?: readonly string[];
   cwd?: string;
@@ -669,7 +670,7 @@ function extractAgentMessageDelta(params: unknown): string {
 
 export function createCodexBackend(
   opts: CodexBackendOptions = {},
-): Backend {
+): Backend & {close():Promise<void>} {
   const command = opts.command ?? 'codex';
   const appServerArgs = opts.appServerArgs ?? ['app-server'];
   const cwd = opts.cwd;
@@ -709,7 +710,7 @@ export function createCodexBackend(
   // codex builds, app-server transport failure, advertise dropped — so
   // validation is again skipped. Non-empty Set = the visible model ids
   // (plus any operator-pinned override the agent card surfaces).
-  let cachedSupportedModelIds: Set<string> | null | undefined = undefined;
+  let cachedSupportedModelIds: Set<string> | null | undefined = opts.supportedModelIds ? new Set(opts.supportedModelIds) : undefined;
 
   // contextId → (threadId, lastUsedAt). writeId-protected rollback so a
   // concurrent task on the same contextId doesn't get its session entry
@@ -755,6 +756,7 @@ export function createCodexBackend(
   }
 
   let rpcClient: AppServerRpcClient | null = null;
+  let startingClient: AppServerRpcClient | null = null;
   let initInFlight: Promise<AppServerRpcClient> | null = null;
   let serverInfo: InitializeResult | null = null;
 
@@ -786,6 +788,7 @@ export function createCodexBackend(
         logger,
         stderrCaptureBytes: stderrCap,
       });
+      startingClient=c;
       c.setServerRequestHandler(async (_id, method, params) => {
         // Native function-call dispatch: route to the per-thread handler the
         // active task registered after `thread/start`. The dispatch table is
@@ -827,6 +830,7 @@ export function createCodexBackend(
       try {
         c.start();
       } catch (err) {
+        startingClient = null;
         initInFlight = null;
         throw err;
       }
@@ -872,8 +876,9 @@ export function createCodexBackend(
         throw err;
       } finally {
         initInFlight = null;
+        if(startingClient===c) startingClient=null;
       }
-    })();
+    })().finally(()=>{initInFlight=null;});
     return initInFlight;
   }
 
@@ -990,7 +995,13 @@ export function createCodexBackend(
     // SIGINT/SIGTERM it would be re-parented to init and linger after the
     // daemon exits (issue #186). Best-effort SIGTERM; the OS delivers it
     // before `process.exit` runs even though we don't await the close.
+    async close() {
+      const c=rpcClient ?? startingClient;
+      if(c) {c.kill();await c.waitForClose();}
+    },
+
     stop(): void {
+      startingClient?.kill();
       if (rpcClient && !rpcClient.isClosed()) {
         rpcClient.kill('SIGTERM');
       }

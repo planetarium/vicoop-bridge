@@ -27,7 +27,7 @@
 // `docker context` is resolved by the CLI itself — no custom socket
 // path lookup needed.
 
-import { assertClaudeBrokerContainer, claudeBrokerFirewallScript, CLAUDE_BROKER_LABEL } from './claude-runtime-boundary.js';
+import { assertBrokerContainer, brokerFirewallScript } from './execution-runtime-boundary.js';
 import { spawnSync, spawn } from 'node:child_process';
 import { createLogger, type Logger } from './logger.js';
 
@@ -156,7 +156,7 @@ export class RuntimeContainer {
             `Remove it first with \`${this.removeHint()}\`, then rerun init.`,
         );
       }
-      if (this.opts.backendKind === 'claude') this.verifyClaudeBoundary(name);
+      if (['claude','codex'].includes(this.opts.backendKind)) this.verifyBrokerBoundary(name);
       if (this.inspectRunning(name)) {
         this.log.info(`runtime container '${name}' already running — reusing`);
       } else {
@@ -182,10 +182,10 @@ export class RuntimeContainer {
     }
 
     await this.waitUntilRunning(name);
-    if (this.opts.backendKind === 'claude') {
+    if (['claude','codex'].includes(this.opts.backendKind)) {
       try {
-        this.verifyClaudeBoundary(name);
-        this.runDocker(['exec', '--user', '0', name, '/bin/sh', '-c', claudeBrokerFirewallScript()]);
+        this.verifyBrokerBoundary(name);
+        this.runDocker(['exec', '--user', '0', name, '/bin/sh', '-c', brokerFirewallScript()]);
       } catch (err) { await this.stop(); throw err; }
     }
     this.started = true;
@@ -215,10 +215,10 @@ export class RuntimeContainer {
     return containerName(this.opts.backendKind, this.opts.runtimeName);
   }
 
-  private verifyClaudeBoundary(name: string): void {
+  private verifyBrokerBoundary(name: string): void {
     const result = this.run(['inspect', '--format', '{{json .}}', name]);
-    if (result.exitCode !== 0) throw new Error('Cannot inspect Claude runtime authentication boundary');
-    assertClaudeBrokerContainer(result.stdout);
+    if (result.exitCode !== 0) throw new Error('Cannot inspect runtime authentication boundary');
+    assertBrokerContainer(result.stdout, this.opts.backendKind);
   }
 
   // ──────────────────────────────────────────────────────────────────
@@ -302,7 +302,7 @@ export class RuntimeContainer {
     const runtimeName = this.opts.runtimeName;
     return [
       agentsVolumeName(kind, runtimeName),
-      ...(kind === 'claude' ? [] : [credsVolumeName(kind, runtimeName)]),
+      ...(['claude','codex'].includes(kind) ? [] : [credsVolumeName(kind, runtimeName)]),
       sessionsVolumeName(kind, runtimeName),
     ];
   }
@@ -366,15 +366,15 @@ export class RuntimeContainer {
     args.push(
       '--mount',
       `type=volume,source=${agentsVolumeName(kind, runtimeName)},target=/data/agents/${kind}`,
-      ...(kind === 'claude' ? [] : ['--mount', `type=volume,source=${credsVolumeName(kind, runtimeName)},target=/data/creds/${kind}`]),
+      ...(['claude','codex'].includes(kind) ? [] : ['--mount', `type=volume,source=${credsVolumeName(kind, runtimeName)},target=/data/creds/${kind}`]),
       '--mount',
       `type=volume,source=${sessionsVolumeName(kind, runtimeName)},target=/data/sessions/${kind}`,
     );
-    if (kind === 'claude') {
-      args.push('--label', CLAUDE_BROKER_LABEL, '--user', 'node',
+    if (['claude','codex'].includes(kind)) {
+      args.push('--label', `vicoop.${kind}-auth=stdio-v1`, '--user', 'node',
         '--security-opt', 'no-new-privileges',
-        '--tmpfs', '/data/creds/claude:rw,nosuid,nodev,size=16777216,uid=1000,gid=1000,mode=0700',
-        '-e', 'CLAUDE_CONFIG_DIR=/data/sessions/claude/config');
+        '--tmpfs', `/data/creds/${kind}:rw,nosuid,nodev,size=16777216,uid=1000,gid=1000,mode=0700`,
+        '-e', `${kind==='claude' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME'}=/data/sessions/${kind}/config`);
     }
     if (this.opts.workspaceDir) {
       // Workspace as a host bind-mount. Per-context branching

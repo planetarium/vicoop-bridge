@@ -1,3 +1,4 @@
+import {createCodexExecutionBackend} from './codex-execution.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -2885,5 +2886,49 @@ test('codex backend resolveCapabilities tolerates a config.toml reader that thro
   assert.deepEqual(caps, {
     openaiCompatModels: [{ id: 'gpt-5.5', default: true }],
   });
+  backend.stop?.();
+});
+
+
+test('container Codex uses a fresh process per execution and resumes only after cleanup', async()=>{
+  const fake=makeFakeSpawn((_child,index)=>happyPath({threadId:`thread-${index}`}));
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0});
+  const frames:UpFrame[]=[];
+  const emit=(frame:UpFrame)=>{
+    if(frame.type==='task.complete') assert.ok(fake.lastChild().killed,'terminal emitted before cleanup');
+    frames.push(frame);
+  };
+  await backend.handle(assign('first'),emit,new AbortController().signal);
+  await backend.handle(assign('second'),emit,new AbortController().signal);
+  await backend.handle(assign('other','other-context'),emit,new AbortController().signal);
+  assert.equal(fake.children.length,3);
+  assert.equal((findRequest(fake.children[1].stdinFrames(),'thread/resume')?.params as any).threadId,'thread-0');
+  assert.ok(findRequest(fake.children[2].stdinFrames(),'thread/start'));
+  assert.ok(fake.children.every(c=>c.killed));
+  backend.stop?.();
+});
+
+test('container Codex cancels a process still initializing', async()=>{
+  const controller=new AbortController();
+  const fake=makeFakeSpawn(()=>({onLine(frame){if(frame.method==='initialize')queueMicrotask(()=>controller.abort());}}));
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0});
+  const frames:UpFrame[]=[];
+  await backend.handle(assign('cancel'),f=>frames.push(f),controller.signal);
+  assert.ok(fake.lastChild().killed);
+  assert.equal((frames.at(-1) as any).status.state,'canceled');
+  backend.stop?.();
+});
+
+test('container Codex allows independent contexts to execute concurrently', async()=>{
+  const fake=makeFakeSpawn((child,index)=>{
+    const scenario=happyPath({threadId:`thread-${index}`});
+    return {onLine(frame,c,i){
+      if(frame.method==='turn/start' && index===0)setTimeout(()=>scenario.onLine!(frame,c,i),25);
+      else scenario.onLine!(frame,c,i);
+    }};
+  });
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0});
+  await Promise.all(['one','two'].map(context=>backend.handle(assign('hello',context),()=>{},new AbortController().signal)));
+  assert.equal(fake.children.length,2);assert.ok(fake.children.every(c=>c.killed));
   backend.stop?.();
 });

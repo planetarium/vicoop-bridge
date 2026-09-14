@@ -41,9 +41,10 @@ Claude itself may retry a request; each attempt counts against the grant limit.
 Bedrock, Vertex, Foundry, custom Anthropic origins, `ANTHROPIC_AUTH_TOKEN`,
 container-local login and `apiKeyHelper` authentication are not supported by this
 mode. Do not pass authentication settings or secrets through agent settings,
-workspace files, prompts or mounted state. Host mode, Codex authentication and
+workspace files, prompts or mounted state. Host mode and
 the bundled-direct image keep their existing behavior; this broker does not
 make their provider credentials inaccessible to their agent processes.
+Codex external-runtime uses its own [host authentication broker](./codex-auth-broker.md).
 
 ## Fresh setup
 

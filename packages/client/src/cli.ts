@@ -1,4 +1,12 @@
 #!/usr/bin/env node
+import { createCodexCredentialReader, createCodexAuthBroker, CODEX_BROKER_VERSION_RANGE, loadCodexModelCatalog } from './codex-auth-broker.js';
+import { createExecutionBrokerSpawn } from './execution-broker-spawn.js';
+import { createCodexExecutionBackend } from './backends/codex-execution.js';
+import { parseCodexConfigTomlForModel } from './backends/codex.js';
+import semver from 'semver';
+import { probeBackendVersion } from './container-init.js';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { createClaudeCredentialReader, assertClaudeBrokerSettings } from './claude-auth-broker.js';
 import { createClaudeBrokerSpawn } from './claude-broker-spawn.js';
 import { closeSync, existsSync, openSync, readFileSync } from 'node:fs';
@@ -459,7 +467,14 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       const sandboxMode = isolated
         ? (explicitSandbox ?? 'danger-full-access')
         : explicitSandbox;
-      const backend = createCodexBackend({
+      let appServerArgs: string[] | undefined;
+      if(runtime) {
+        let model: string | null = null;
+        try {model=parseCodexConfigTomlForModel(readFileSync(join(process.env.CODEX_HOME || join(homedir(),'.codex'),'config.toml'),'utf8')).model;} catch {}
+        appServerArgs=['app-server',...(model ? ['-c',`model=${JSON.stringify(model)}`] : [])];
+      }
+      const backend = (runtime ? createCodexExecutionBackend : createCodexBackend)({
+        appServerArgs,
         cwd,
         sandboxMode,
         approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
@@ -523,6 +538,17 @@ async function resolveRuntime(args: {
       });
       return { runtime: { stop: async () => { broker.close(); await runtime.stop(); } },
         spawn: broker.spawn, cwd: args.cwd ? '/workspace' : undefined };
+    }
+    if(args.kind==='codex') {
+      const installed=await probeBackendVersion(runtime.getContainerName(),'codex');
+      if(!installed || !semver.satisfies(installed,CODEX_BROKER_VERSION_RANGE)) throw new Error(`Codex container authentication requires Codex ${CODEX_BROKER_VERSION_RANGE}; update the runtime agent`);
+      const credential=createCodexCredentialReader();
+      const selected=await credential();
+      const codexCatalog=await loadCodexModelCatalog(credential,installed);
+      const broker=createExecutionBrokerSpawn(runtime.getContainerName(), {
+        backend:'codex',codexCatalog,createBroker:()=>createCodexAuthBroker({credential,authentication:selected.kind}),
+      });
+      return {runtime:{stop:async()=>{broker.close();await runtime.stop();}},spawn:broker.spawn,cwd:args.cwd ? '/workspace' : undefined};
     }
     await assertContainerCredsPresent(runtime.getContainerName(), args.kind);
   } catch (err) {
