@@ -1,3 +1,4 @@
+import { assertBrokerContainer } from './execution-runtime-boundary.js';
 import { createCodexCredentialReader, CODEX_BROKER_VERSION_RANGE } from './codex-auth-broker.js';
 import { CLAUDE_SESSION_MIGRATION, CODEX_SESSION_MIGRATION } from './claude-session-migration.js';
 import { createClaudeCredentialReader } from './claude-auth-broker.js';
@@ -176,7 +177,7 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
 
     log.info(`runtime container for ${opts.kind} initialized. start daemon with:`);
     log.info(
-      `    vicoop-client --backend ${opts.kind} --runtime container --runtime-name ${runtimeName}`,
+      `    vicoop-client start --backend ${opts.kind} --runtime container --runtime-name ${runtimeName}`,
     );
     return 0;
   } finally {
@@ -631,6 +632,20 @@ function parseRuntimeNameFromResourceName(
 
 const BACKEND_KINDS = ['claude', 'codex'] as const;
 
+// Read-only validation also protects harness injection before docker start/exec.
+export function validateRuntimeBoundary(kind: InstallableBackendKind, name?: string, run: DockerRun = defaultDockerRun): void {
+  const runtime = runtimeInstanceName(kind, name);
+  const result = run(['inspect', '--format', '{{json .}}', containerName(kind, runtime)]);
+  if (result.exitCode !== 0) throw new Error('Cannot inspect runtime authentication boundary');
+  assertBrokerContainer(result.stdout, kind);
+}
+
+const containerValidateSubCmd = command('validate', object({
+  action: constant('container-validate' as const),
+  kind: argument(choice([...BACKEND_KINDS], {metavar: 'KIND'})),
+  name: optional(option('--name', string({metavar: 'NAME'}))),
+}), {brief: message`Check the host-broker authentication boundary without starting the runtime.`});
+
 const containerInitSubCmd = command(
   'init',
   object({
@@ -668,7 +683,7 @@ const containerInitSubCmd = command(
   }),
   {
     brief: message`Bootstrap a per-backend runtime container.`,
-    description: message`One-shot setup for the container-runtime profile: creates \`vicoop-runtime-<name>\`, where --name defaults to the backend kind, fails if that runtime already exists, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and uses the host authentication broker for Claude and Codex. --from-host is accepted without copying credentials. After this, launch the daemon with \`vicoop-client --backend <kind> --runtime container --runtime-name <name>\`.`,
+    description: message`One-shot setup for the container-runtime profile: creates \`vicoop-runtime-<name>\`, where --name defaults to the backend kind, fails if that runtime already exists, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and uses the host authentication broker for Claude and Codex. --from-host is accepted without copying credentials. After this, launch the daemon with \`vicoop-client start --backend <kind> --runtime container --runtime-name <name>\`.`,
   },
 );
 
@@ -728,10 +743,10 @@ const containerRemoveSubCmd = longestMatch(
 
 export const containerCmd = command(
   'container',
-  longestMatch(containerInitSubCmd, containerListSubCmd, containerRemoveSubCmd),
+  longestMatch(containerInitSubCmd, containerListSubCmd, containerRemoveSubCmd, containerValidateSubCmd),
   {
     brief: message`Manage per-backend runtime containers.`,
-    description: message`Subcommands: \`init\` (boot \`vicoop-runtime-<name>\`, install the agent CLI, optionally copy host creds), \`list\` (show managed runtime container and volume state), \`remove\` (remove a runtime container and volumes by name). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
+    description: message`Subcommands: \`validate\` (check authentication isolation without starting), \`init\` (boot \`vicoop-runtime-<name>\`, install the agent CLI, validate host authentication), \`list\` (show managed runtime container and volume state), \`remove\` (remove a runtime container and volumes by name). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
     hidden: 'usage',
   },
 );
@@ -784,6 +799,16 @@ export async function runContainerRemoveCli(args: ContainerRemoveArgs): Promise<
     return 0;
   } catch (err) {
     console.error(`container rm failed: ${(err as Error).message}`);
+    return 1;
+  }
+}
+
+export async function runContainerValidateCli(args: Extract<ContainerCliArgs, {action: 'container-validate'}>): Promise<number> {
+  try {
+    validateRuntimeBoundary(args.kind, args.name);
+    return 0;
+  } catch (err) {
+    console.error(`container validate failed: ${(err as Error).message}`);
     return 1;
   }
 }

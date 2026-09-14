@@ -9,7 +9,8 @@ import {spawnSync} from 'node:child_process';
 // Execute the shipped script against a fake Docker filesystem: stopping the
 // runtime discards creds tmpfs while preserving its sessions volume.
 for (const kind of ['codex', 'claude']) {
-  test(`fork harness remains discoverable after ${kind} runtime stops`, {skip: process.platform === 'win32'}, () => {
+ for (const mode of ['safe', 'legacy', 'credential-mount', 'credential-env']) {
+  test(`fork harness ${kind}: ${mode} boundary and persistence`, {skip: process.platform === 'win32'}, () => {
     const root = mkdtempSync(join(tmpdir(), 'fork-harness-'));
     try {
       const bin = join(root, 'bin'), source = join(root, 'source');
@@ -23,7 +24,16 @@ for (const kind of ['codex', 'claude']) {
 const fs=require('node:fs'),p=require('node:path'),cp=require('node:child_process');
 const args=process.argv.slice(2),root=process.env.FORK_TEST_ROOT;
 fs.appendFileSync(p.join(root,'calls.jsonl'),JSON.stringify(args)+'\\n');
-if(args[0]==='inspect' && args.includes('--format')) console.log('false');
+if(args[0]==='inspect' && args.includes('--format')) {
+  if(args.includes('{{json .}}')) {
+    const kind=process.env.VICOOP_FORK_KIND,mode=process.env.FORK_TEST_MODE;
+    const c={Config:{User:'node',Labels:{['vicoop.'+kind+'-auth']:'stdio-v1','vicoop.name':kind},Env:[(kind==='codex'?'CODEX_HOME':'CLAUDE_CONFIG_DIR')+'=/data/sessions/'+kind+'/config']},HostConfig:{NetworkMode:'default',SecurityOpt:['no-new-privileges']},Mounts:[{Type:'volume',Name:'vicoop-sessions-'+kind,Destination:'/data/sessions/'+kind}]};
+    if(mode==='legacy') c.Config.Labels={};
+    if(mode==='credential-mount') c.Mounts.push({Type:'volume',Name:'vicoop-creds-'+kind,Destination:'/data/creds/'+kind});
+    if(mode==='credential-env') c.Config.Env.push('OPENAI_API_KEY=fixture-secret');
+    console.log(JSON.stringify(c));
+  } else console.log('false');
+}
 if(args[0]==='stop') fs.rmSync(p.join(root,'data','creds'),{recursive:true,force:true});
 if(args[0]==='exec') {
   const target=args.at(-1);
@@ -33,12 +43,25 @@ if(args[0]==='exec') {
   process.exit(r.status??1);
 }
 `, {mode: 0o700});
-      writeFileSync(join(bin, 'vicoop-client'), '#!/bin/sh\nexit 99\n', {mode: 0o700});
+      const cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
+      writeFileSync(join(bin, 'vicoop-client'), `#!/usr/bin/env node
+const r=require('node:child_process').spawnSync(process.execPath,[${JSON.stringify(cli)},...process.argv.slice(2)],{stdio:'inherit'});
+process.exit(r.status??1);
+`, {mode: 0o700});
       const script = fileURLToPath(new URL('../../../skills/fork-into-container/fork.sh', import.meta.url));
       const result = spawnSync('bash', [script], {encoding: 'utf8', timeout: 15000, env: {
         ...process.env, PATH: bin + delimiter + process.env.PATH,
-        VICOOP_FORK_KIND: kind, CODEX_HOME: source, CLAUDE_CONFIG_DIR: source, FORK_TEST_ROOT: root,
+        VICOOP_FORK_KIND: kind, CODEX_HOME: source, CLAUDE_CONFIG_DIR: source, FORK_TEST_ROOT: root, FORK_TEST_MODE: mode,
       }});
+      const calls = readFileSync(join(root, 'calls.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      if (mode !== 'safe') {
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /--preserve-volumes/);
+        assert.match(result.stderr, /--reuse-state/);
+        assert.ok(!result.stderr.includes('fixture-secret'));
+        assert.ok(!calls.some(args => ['start', 'exec', 'stop'].includes(args[0])));
+        return;
+      }
       assert.equal(result.status, 0, result.stderr);
       assert.equal(JSON.parse(result.stdout).injected_into, `/data/sessions/${kind}/config`);
       const config = join(root, 'data', 'sessions', kind, 'config');
@@ -46,8 +69,8 @@ if(args[0]==='exec') {
       assert.equal(readFileSync(join(config, 'skills', 'fixture', 'SKILL.md'), 'utf8'), 'Fixture skill');
       assert.ok(!existsSync(join(config, 'auth.json')));
       assert.ok(!existsSync(join(config, 'skills', 'fixture', 'auth.json')));
-      const calls = readFileSync(join(root, 'calls.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
       assert.deepEqual(calls.at(-1), ['stop', `vicoop-runtime-${kind}`]);
     } finally { rmSync(root, {recursive: true, force: true}); }
   });
+}
 }

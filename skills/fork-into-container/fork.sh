@@ -76,6 +76,12 @@ else
     vicoop-client container init "$KIND" --from-host
 fi
 
+# Validate both reused and freshly initialized runtimes through the same
+# host-side boundary check as the daemon. Older clients fail closed here.
+if ! vicoop-client container validate "$KIND"; then
+    die "runtime boundary validation failed; update vicoop-client if validate is unavailable. For a legacy runtime, explicitly run: vicoop-client container remove $KIND --preserve-volumes; vicoop-client container init $KIND --reuse-state (include the original --workspace path if mounted). Harness injection has not started."
+fi
+
 # ── bring container up only for the inject window ────────────────────────
 # Upstream `container init` (post-#271) leaves the runtime stopped; the
 # bridge daemon's RuntimeContainer.start() will bring it up at launch.

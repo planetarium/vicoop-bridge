@@ -141,3 +141,5 @@ external-runtime profile + `container init --from-host` removed every
 one of those — bridge auth lives in the host bridge client (it never
 enters the container at all), and backend auth is auto-pulled. This
 skill now just plugs the one remaining gap.
+
+The script runs `vicoop-client container validate <kind>` before starting or injecting into a runtime. Legacy credential-mounted runtimes are rejected; follow the explicit `--preserve-volumes` / `--reuse-state` migration instructions, including the original workspace mount when present. Update the client if the `validate` command is unavailable.

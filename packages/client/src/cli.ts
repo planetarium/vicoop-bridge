@@ -37,6 +37,7 @@ import type { SpawnFn } from './spawn-adapter.js';
 import {
   containerCmd,
   runContainerInitCli,
+  runContainerValidateCli,
   runContainerListCli,
   runContainerRemoveCli,
 } from './container-init.js';
@@ -1107,6 +1108,9 @@ async function main(): Promise<void> {
       break;
     case 'whoami':
       process.exit(await runWhoami(parsed));
+      break;
+    case 'container-validate':
+      process.exit(await runContainerValidateCli(parsed));
       break;
     case 'container-init':
       process.exit(await runContainerInitCli(parsed));

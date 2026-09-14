@@ -53,7 +53,7 @@ the host bridge process. Then run:
 
 ```sh
 vicoop-client container init claude
-vicoop-client --backend claude --runtime container
+vicoop-client start --backend claude --runtime container
 ```
 
 `container init claude --from-host` is accepted for compatibility but does not
@@ -70,7 +70,7 @@ any workspace bind-mount path in your operational records. Then, replacing
 ```sh
 vicoop-client container remove claude --preserve-volumes
 vicoop-client container init claude --name claude --reuse-state --from-host
-vicoop-client --backend claude --runtime container --runtime-name claude
+vicoop-client start --backend claude --runtime container --runtime-name claude
 ```
 
 The explicit removal discards the old container's writable layer. Back up any

@@ -57,7 +57,7 @@ Log into Codex on the host or set `OPENAI_API_KEY` for the host bridge, then:
 
 ```sh
 vicoop-client container init codex
-vicoop-client --backend codex --runtime container
+vicoop-client start --backend codex --runtime container
 ```
 
 `--from-host` is accepted for compatibility but does not copy credentials.
@@ -67,7 +67,7 @@ back up needed state, then explicitly recreate the runtime:
 ```sh
 vicoop-client container remove codex --preserve-volumes
 vicoop-client container init codex --name codex --reuse-state --from-host
-vicoop-client --backend codex --runtime container --runtime-name codex
+vicoop-client start --backend codex --runtime container --runtime-name codex
 ```
 
 Adjust the runtime name and restore any workspace/image options used before.
