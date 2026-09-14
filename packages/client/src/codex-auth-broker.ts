@@ -59,7 +59,12 @@ export function createCodexAuthBroker(opts: {
     upstream:opts.upstream ?? (oauth ? 'https://chatgpt.com' : 'https://api.openai.com'),
     origins:[oauth ? 'https://chatgpt.com' : 'https://api.openai.com'],
     pathPrefix:opts.upstream ? '' : oauth ? '/backend-api/codex' : '/v1',
-    allow:req=>req.method==='POST' && ['/responses','/responses/compact'].includes(req.url ?? '') && !req.headers['content-encoding'],
+    allow(req) {
+      // Built-in OpenAI tries WebSockets first. 426 selects its HTTP fallback
+      // immediately; 403 causes repeated handshakes before falling back.
+      if(req.method==='GET' && req.url==='/responses' && req.headers.upgrade?.toLowerCase()==='websocket') return 426;
+      return req.method==='POST' && ['/responses','/responses/compact'].includes(req.url ?? '') && !req.headers['content-encoding'];
+    },
     async prepare(req,data) {
       if(!data || typeof data!=='object' || typeof data.model!=='string' || !/^(gpt-|o[134](?:-|$))[a-zA-Z0-9._-]*$/.test(data.model) || data.background===true) throw new BrokerRejection(403);
       if(data.max_output_tokens!==undefined && (!Number.isInteger(data.max_output_tokens) || data.max_output_tokens<1 || data.max_output_tokens>128000)) throw new BrokerRejection(403);

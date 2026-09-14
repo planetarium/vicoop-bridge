@@ -2,7 +2,15 @@
 
 Codex `--runtime container` runs the agent and its tools in Docker while the
 host bridge holds provider credentials. The workload receives a temporary
-`vbc_exec_` grant in `VICOOP_EXECUTION_TOKEN`, with a loopback Responses provider.
+`vbc_exec_` grant through the app-server's `account/login/start` API-key login.
+The built-in `openai` provider is pointed at the loopback relay with a
+per-execution `openai_base_url` override; no custom provider is defined.
+`cli_auth_credentials_store="ephemeral"` keeps the temporary login in memory,
+without writing `auth.json` or injecting a token environment variable. Codex
+sees an API-key login even when the host authenticates upstream with ChatGPT
+OAuth. Codex 0.153.4 app-server does not pick up `OPENAI_API_KEY` or
+`CODEX_API_KEY` for this login, so changing the URL and environment alone is
+insufficient.
 The host replaces the grant with the selected credential over a private Docker
 stdio channel. No host TCP listener or separate proxy deployment is needed.
 
@@ -33,8 +41,11 @@ authenticated model catalog at startup and stages non-secret model metadata
 per execution. Startup fails if that catalog cannot be loaded. Restart to
 refresh the catalog. API-key mode uses Codex's embedded catalog.
 
-The provider uses HTTP/SSE Responses with WebSockets, request compression and
-Responses-lite disabled. The broker permits only POST `/responses` and
+The provider uses HTTP/SSE Responses with request compression and
+Responses-lite disabled. The built-in provider's initial WebSocket handshake
+receives HTTP 426 from the authenticated broker, selecting HTTP fallback
+without repeated connection attempts; no WebSocket request reaches upstream.
+The broker permits only POST `/responses` and
 `/responses/compact`, routed to the fixed OpenAI API or ChatGPT Codex endpoint.
 Other routes, query parameters, background requests and unsupported model
 names are rejected. Credentials, account headers and upstream error bodies

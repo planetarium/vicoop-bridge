@@ -67,12 +67,16 @@ try {
    await new Promise(r=>setTimeout(r,300));
   }
   assert.match(pid,/^\d+$/,'cancel probe never reached its shell tool');
+  const exposed=docker(['exec',container,'/usr/local/bin/node','-e',
+   `const fs=require('node:fs');const names=fs.readFileSync('/proc/${pid}/environ','utf8').split('\\0').map(v=>v.split('=')[0]);console.log(JSON.stringify(names.filter(n=>['OPENAI_API_KEY','CODEX_API_KEY','VICOOP_EXECUTION_TOKEN'].includes(n))));`]);
+  assert.deepEqual(JSON.parse(exposed),[],'execution credentials were injected into tool environment');
  } finally {cancel.abort();await pending;}
  assert.equal((canceledFrames.at(-1) as any)?.status?.state,'canceled');
  assert.equal(docker(['exec',container,'/bin/sh','-c',`test ! -e /proc/${pid} && echo clean`]).trim(),'clean','tool process survived terminal cancellation');
  const clean=docker(['exec',container,'/bin/sh','-c','test ! -f /data/creds/codex/auth.json && test ! -f /data/sessions/codex/config/auth.json && echo clean']);
  assert.match(clean,/clean/);
- console.log(JSON.stringify({success:true,mode:selected.kind,executions,inference:true,resume:true,tools:true,cancellationCleanup:true,credentialFilesAbsent:true}));
+ assert.ok(brokers.every(b=>b.stats.rejected<=1 && (!b.stats.rejected || b.stats.lastRejectedStatus===426)),'HTTP fallback retried or another broker policy rejected a request');
+ console.log(JSON.stringify({success:true,mode:selected.kind,executions,inference:true,resume:true,tools:true,cancellationCleanup:true,credentialFilesAbsent:true,credentialEnvironmentAbsent:true,httpFallback:true}));
 } finally {
  backend.stop?.();adapter.close();
  spawnSync('docker',['rm','-f',container],{stdio:'ignore'});

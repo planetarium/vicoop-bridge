@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
-import {createServer as tcpServer} from 'node:net';
+import {createServer as tcpServer,connect} from 'node:net';
 import {once} from 'node:events';
 import {mkdtempSync,writeFileSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
@@ -35,7 +35,15 @@ test('Codex broker substitutes API key/OAuth, restricts routes and sanitizes err
   const broker=createCodexAuthBroker({authentication:kind,credential:()=>({kind,secret:'host-secret',accountId:'host-account'}),upstream:`http://127.0.0.1:${(upstream.address() as any).port}`});
   const tcp=tcpServer(socket=>broker.attach(socket));tcp.listen(0,'127.0.0.1');await once(tcp,'listening');
   const request=(path='/responses',token=broker.token)=>fetch(`http://127.0.0.1:${(tcp.address() as any).port}${path}`,{method:'POST',headers:{authorization:`Bearer ${token}`,'chatgpt-account-id':'forged',cookie:'cookie'},body:JSON.stringify({model:'gpt-5.4',input:[],stream:true})});
+  const upgrade=(token:string)=>new Promise<number>((resolve,reject)=>{
+   const socket=connect((tcp.address() as any).port,'127.0.0.1');let response='';
+   socket.on('connect',()=>socket.write(`GET /responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer ${token}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n`));
+   socket.on('data',chunk=>{response+=chunk.toString();if(response.includes('\r\n')){socket.destroy();resolve(Number(response.split(' ')[1]));}});
+   socket.on('error',reject);socket.setTimeout(3000,()=>socket.destroy(new Error('upgrade response timed out')));
+  });
   try {
+   assert.equal(await upgrade('forged'),401);
+   assert.equal(await upgrade(broker.token),426,'built-in provider needs immediate HTTP fallback');
    assert.equal((await request('/responses','forged')).status,401);
    assert.equal((await request('/files')).status,403);
    assert.equal((await request('/responses?upstream=other')).status,403);

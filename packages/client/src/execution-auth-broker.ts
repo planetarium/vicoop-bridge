@@ -2,7 +2,7 @@
 // owning Docker stdio transport can attach sockets; no host path is mounted.
 // A real socket (rather than Server.emit(connection, Duplex)) is necessary
 // for the native HTTP parser in Bun-compiled clients.
-import { createServer, request as httpRequest, type IncomingMessage, type ClientRequest } from 'node:http';
+import { createServer, ServerResponse, request as httpRequest, type IncomingMessage, type ClientRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { once } from 'node:events';
@@ -18,7 +18,8 @@ export interface ExecutionBrokerOptions {
   upstream: string;
   origins: readonly string[];
   pathPrefix?: string;
-  allow(req: IncomingMessage): boolean;
+  /** True permits a route; false rejects with 403, or return a protocol status. */
+  allow(req: IncomingMessage): boolean | number;
   prepare(req: IncomingMessage, body: any): Promise<Record<string,string>>;
   ttlMs?: number;
   timeoutMs?: number;
@@ -42,17 +43,32 @@ export function createExecutionAuthBroker(opts: ExecutionBrokerOptions) {
   let admitted = 0;
   const timeoutMs = opts.timeoutMs ?? 300_000;
   const deadline = Date.now() + (opts.ttlMs ?? 60 * 60_000);
-  const server = createServer({ maxHeaderSize: 16 * 1024 }, async (req, res) => {
+  const authorized = (req: IncomingMessage) => {
+    const supplied = Buffer.from(req.headers.authorization?.replace(/^Bearer /, '') ?? String(req.headers['x-api-key'] ?? ''));
+    const expected = Buffer.from(token);
+    return !revoked && Date.now() < deadline && supplied.length === expected.length && timingSafeEqual(supplied, expected);
+  };
+  // Bun creates a ServerResponse even for upgrades, and its upgrade socket
+  // cannot write raw HTTP. Capture that response through the public hook.
+  const upgradeResponses = new WeakMap<IncomingMessage, ServerResponse>();
+  // Preserve Bun's constructor options, which Node's typings do not declare.
+  const ResponseWithOptions = ServerResponse as typeof ServerResponse & (new (req: IncomingMessage, options?: unknown) => ServerResponse);
+  class BrokerResponse extends ResponseWithOptions {
+    constructor(req: IncomingMessage, options?: unknown) {
+      super(req, options);
+      upgradeResponses.set(req, this);
+    }
+  }
+  const server = createServer({ maxHeaderSize: 16 * 1024, ServerResponse: BrokerResponse }, async (req, res) => {
     const deny = (status: number) => {
       stats.rejected++;
       stats.lastRejectedStatus=status;
       res.writeHead(status, { 'content-type': 'application/json', connection: 'close', 'cache-control': 'no-store' });
       res.end('{"error":{"type":"authentication_broker_error","message":"Request rejected by host authentication broker"}}');
     };
-    const supplied = Buffer.from(req.headers.authorization?.replace(/^Bearer /, '') ?? String(req.headers['x-api-key'] ?? ''));
-    const expected = Buffer.from(token);
-    if (revoked || Date.now() >= deadline || supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return deny(401);
-    if (!opts.allow(req)) return deny(403);
+    if (!authorized(req)) return deny(401);
+    const allowed = opts.allow(req);
+    if (allowed !== true) return deny(typeof allowed === 'number' ? allowed : 403);
     if (active.size >= (opts.maxConcurrent ?? 4) || admitted >= (opts.maxRequests ?? 256)) return deny(429);
     admitted++;
     const controller = new AbortController();
@@ -123,6 +139,22 @@ export function createExecutionAuthBroker(opts: ExecutionBrokerOptions) {
   server.requestTimeout = timeoutMs;
   server.headersTimeout = Math.min(timeoutMs, 10_000);
   server.maxHeadersCount = 32;
+  // Handle upgrade explicitly: Bun does not deliver an unsupported handshake
+  // to the normal request handler. Never tunnel or accept an upgraded socket.
+  server.on('upgrade', (req, socket) => {
+    const allowed = authorized(req) ? opts.allow(req) : 401;
+    const status = typeof allowed === 'number' ? allowed : 403;
+    stats.rejected++;
+    stats.lastRejectedStatus = status;
+    const response = upgradeResponses.get(req);
+    if (response) {
+      response.writeHead(status, {connection: 'close', 'content-length': '0'});
+      response.end();
+      return;
+    }
+    socket.write(`HTTP/1.1 ${status} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+    socket.end();
+  });
   server.on('clientError', (_err, socket) => socket.destroy());
   const directory = mkdtempSync(join(tmpdir(), 'vab-'));
   const socketPath = join(directory, 'http.sock');

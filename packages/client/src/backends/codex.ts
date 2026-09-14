@@ -864,6 +864,7 @@ export function createCodexBackend(
           'initialize timed out',
         );
         c.notify('initialized');
+        await withTimeout(c.authenticateExecution(), initializeTimeoutMs, 'execution authentication timed out');
         serverInfo = result;
         rpcClient = c;
         return c;

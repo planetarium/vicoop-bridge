@@ -84,16 +84,11 @@ function receive(m) {
       if(m.backend==='codex') {
         env.CODEX_HOME='/data/sessions/codex/config';
         fs.mkdirSync(env.CODEX_HOME,{recursive:true,mode:0o700});
-        env.VICOOP_EXECUTION_TOKEN=m.token;
         const base='http://127.0.0.1:'+server.address().port;
-        // CLI overrides dominate container config; only a limited grant exists
-        // even if workload code chooses to modify its own provider settings.
-        m.args.push('-c','model_provider="vicoop_bridge"');
+        // Authentication is initialized in memory through account/login/start.
+        // No provider token is placed in the workload environment or on disk.
+        m.args.push('-c','model_provider="openai"','-c','openai_base_url='+JSON.stringify(base));
         if(catalogPath)m.args.push('-c','model_catalog_json='+JSON.stringify(catalogPath));
-        for(const [key,value] of Object.entries({name:'vicoop_bridge',base_url:base,
-          env_key:'VICOOP_EXECUTION_TOKEN',wire_api:'responses',requires_openai_auth:false,supports_websockets:false})) {
-          m.args.push('-c','model_providers.vicoop_bridge.'+key+'='+JSON.stringify(value));
-        }
         m.args.push('-c','features.enable_request_compression=false','-c','cli_auth_credentials_store="ephemeral"');
       } else {
         Object.assign(env, {

@@ -2908,6 +2908,45 @@ test('container Codex uses a fresh process per execution and resumes only after 
   backend.stop?.();
 });
 
+test('container Codex authenticates the built-in provider before opening each thread', async()=>{
+  const fake=makeFakeSpawn((child,index)=>{
+    Object.defineProperty(child,'executionToken',{value:`vbc_exec_fixture_${index}`});
+    const scenario=happyPath();
+    let authenticated=false;
+    return {onLine(frame,c,i){
+      if(frame.method==='account/login/start') {
+        assert.deepEqual(frame.params,{type:'apiKey',apiKey:`vbc_exec_fixture_${index}`});
+        authenticated=true;
+        c.emitStdout({id:frame.id,result:{type:'apiKey'}});
+      } else {
+        if(frame.method==='thread/start'||frame.method==='thread/resume') assert.ok(authenticated);
+        scenario.onLine!(frame,c,i);
+      }
+    }};
+  });
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0});
+  for(const prompt of ['one','two']) await backend.handle(assign(prompt),()=>{},new AbortController().signal);
+  assert.equal(fake.children.length,2);
+  assert.ok(fake.children.every(c=>c.killed && findRequest(c.stdinFrames(),'account/login/start')));
+});
+
+test('container Codex fails closed when execution login is rejected', async()=>{
+  const fake=makeFakeSpawn(child=>{
+    Object.defineProperty(child,'executionToken',{value:'vbc_exec_fixture'});
+    const scenario=happyPath();
+    return {onLine(frame,c,i){
+      if(frame.method==='account/login/start') c.emitStdout({id:frame.id,error:{code:-32600,message:'login rejected'}});
+      else scenario.onLine!(frame,c,i);
+    }};
+  });
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0});
+  const frames:UpFrame[]=[];
+  await backend.handle(assign('one'),f=>frames.push(f),new AbortController().signal);
+  assert.equal(frames.at(-1)?.type,'task.fail');
+  assert.ok(fake.lastChild().killed);
+  assert.equal(findRequest(fake.lastChild().stdinFrames(),'thread/start'),null);
+});
+
 test('container Codex cancels a process still initializing', async()=>{
   const controller=new AbortController();
   const fake=makeFakeSpawn(()=>({onLine(frame){if(frame.method==='initialize')queueMicrotask(()=>controller.abort());}}));
@@ -2917,6 +2956,24 @@ test('container Codex cancels a process still initializing', async()=>{
   assert.ok(fake.lastChild().killed);
   assert.equal((frames.at(-1) as any).status.state,'canceled');
   backend.stop?.();
+});
+
+test('container Codex cancels a pending execution login', async()=>{
+  const controller=new AbortController();
+  const fake=makeFakeSpawn(child=>{
+    Object.defineProperty(child,'executionToken',{value:'vbc_exec_fixture'});
+    const scenario=happyPath();
+    return {onLine(frame,c,i){
+      if(frame.method==='account/login/start') queueMicrotask(()=>controller.abort());
+      else scenario.onLine!(frame,c,i);
+    }};
+  });
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0});
+  const frames:UpFrame[]=[];
+  await backend.handle(assign('cancel'),f=>frames.push(f),controller.signal);
+  assert.ok(fake.lastChild().killed);
+  assert.equal((frames.at(-1) as any).status.state,'canceled');
+  assert.equal(findRequest(fake.lastChild().stdinFrames(),'thread/start'),null);
 });
 
 test('container Codex allows independent contexts to execute concurrently', async()=>{

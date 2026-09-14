@@ -187,6 +187,7 @@ export function createExecutionBrokerSpawn(container: string, opts: {
         authentication: opts.authentication ?? 'oauth', files:promptFiles.map((file,id)=>({id,argIndex:file.argIndex})) });
     })().catch(fail);
     return Object.assign(events, {
+      ...(opts.backend === 'codex' ? {executionToken: broker.token} : {}),
       stdin, stdout, stderr,
       kill(_signal: NodeJS.Signals = 'SIGTERM') {
         if (ended) return false;
