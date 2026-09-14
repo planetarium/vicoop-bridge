@@ -8,9 +8,15 @@ const container = () => ({ Config: { User: 'node', Labels: { 'vicoop.claude-auth
   Mounts: [{ Type: 'volume', Name: 'vicoop-sessions-work', Destination: '/data/sessions/claude' }] });
 
 test('reject legacy/unsafe runtime inspect without leaking credentials in diagnostics', () => {
-  assert.doesNotThrow(() => assertBrokerContainer(JSON.stringify(container()), 'claude'));
+  assert.doesNotThrow(() => assertBrokerContainer(JSON.stringify(container()), 'claude', 'work'));
   for (const mutate of [
     (c: any) => c.Config.Labels = {},
+    (c: any) => c.Config.Labels['vicoop.name'] = 'other',
+    (c: any) => c.Config.Env.push('GOOGLE_API_KEY=SECRET_VALUE'),
+    (c: any) => c.Config.Env.push('GEMINI_API_KEY=SECRET_VALUE'),
+    (c: any) => c.HostConfig.UsernsMode = 'host',
+    (c: any) => c.HostConfig.IpcMode = 'container:other',
+    (c: any) => c.HostConfig.DeviceRequests = [{Count: -1}],
     (c: any) => c.Config.Env.push('ANTHROPIC_API_KEY=SECRET_VALUE'),
     (c: any) => c.Mounts.push({Type:'volume',Destination:'/data/creds/claude'}),
     (c: any) => c.Mounts[0].Name = 'vicoop-creds-work',
@@ -25,7 +31,7 @@ test('reject legacy/unsafe runtime inspect without leaking credentials in diagno
       (c: any) => c.HostConfig.SecurityOpt.push(option)),
   ]) {
     const c = container(); mutate(c);
-    assert.throws(() => assertBrokerContainer(JSON.stringify(c), 'claude'), e => e instanceof Error && /migration/.test(e.message) && !e.message.includes('SECRET_VALUE'));
+    assert.throws(() => assertBrokerContainer(JSON.stringify(c), 'claude', 'work'), e => e instanceof Error && /migration/.test(e.message) && !e.message.includes('SECRET_VALUE'));
   }
 });
 
@@ -65,5 +71,5 @@ test('legacy runtime is rejected before start or any credential probe', async ()
 test('broker boundary allows custom seccomp and AppArmor profiles', () => {
   const c = container();
   c.HostConfig.SecurityOpt.push('seccomp=/etc/docker/restricted.json', 'apparmor=vicoop-restricted');
-  assert.doesNotThrow(() => assertBrokerContainer(JSON.stringify(c), 'claude'));
+  assert.doesNotThrow(() => assertBrokerContainer(JSON.stringify(c), 'claude', 'work'));
 });

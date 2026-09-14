@@ -1,5 +1,5 @@
 import { assertBrokerContainer } from './execution-runtime-boundary.js';
-import { createCodexCredentialReader, CODEX_BROKER_VERSION_RANGE } from './codex-auth-broker.js';
+import { createCodexCredentialReader, CODEX_BROKER_VERSION_RANGE, isSupportedCodexBrokerVersion } from './codex-auth-broker.js';
 import { CLAUDE_SESSION_MIGRATION, CODEX_SESSION_MIGRATION } from './claude-session-migration.js';
 import { createClaudeCredentialReader } from './claude-auth-broker.js';
 // `vicoop-client container init <kind>` — operator one-shot
@@ -165,7 +165,7 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
       return 1;
     }
     const supportedRange = opts.kind==='codex' ? CODEX_BROKER_VERSION_RANGE : BACKENDS_MANIFEST[opts.kind].supportedRange;
-    if (!semver.satisfies(installed, supportedRange, { includePrerelease: true })) {
+    if (!(opts.kind === 'codex' ? isSupportedCodexBrokerVersion(installed) : semver.satisfies(installed, supportedRange, {includePrerelease: true}))) {
       log.error(
         `installed ${opts.kind} ${installed} is outside this client's supportedRange ${supportedRange}`,
       );
@@ -637,7 +637,7 @@ export function validateRuntimeBoundary(kind: InstallableBackendKind, name?: str
   const runtime = runtimeInstanceName(kind, name);
   const result = run(['inspect', '--format', '{{json .}}', containerName(kind, runtime)]);
   if (result.exitCode !== 0) throw new Error('Cannot inspect runtime authentication boundary');
-  assertBrokerContainer(result.stdout, kind);
+  assertBrokerContainer(result.stdout, kind, runtime);
 }
 
 const containerValidateSubCmd = command('validate', object({

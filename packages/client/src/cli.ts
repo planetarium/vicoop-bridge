@@ -1,9 +1,8 @@
 #!/usr/bin/env node
-import { createCodexCredentialReader, createCodexAuthBroker, CODEX_BROKER_VERSION_RANGE, loadCodexModelCatalog } from './codex-auth-broker.js';
+import { createCodexCredentialReader, createCodexAuthBroker, CODEX_BROKER_VERSION_RANGE, isSupportedCodexBrokerVersion, loadCodexModelCatalog } from './codex-auth-broker.js';
 import { createExecutionBrokerSpawn } from './execution-broker-spawn.js';
 import { createCodexExecutionBackend } from './backends/codex-execution.js';
 import { parseCodexConfigTomlForModel } from './backends/codex.js';
-import semver from 'semver';
 import { probeBackendVersion } from './container-init.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -537,7 +536,7 @@ async function resolveRuntime(args: {
         spawn: broker.spawn, cwd: args.cwd ? '/workspace' : undefined };
     } else {
       const installed=await probeBackendVersion(runtime.getContainerName(),'codex');
-      if(!installed || !semver.satisfies(installed,CODEX_BROKER_VERSION_RANGE)) throw new Error(`Codex container authentication requires Codex ${CODEX_BROKER_VERSION_RANGE}; update the runtime agent`);
+      if(!installed || !isSupportedCodexBrokerVersion(installed)) throw new Error(`Codex container authentication requires Codex ${CODEX_BROKER_VERSION_RANGE}; update the runtime agent`);
       const credential=createCodexCredentialReader();
       const selected=await credential();
       const codexCatalog=await loadCodexModelCatalog(credential,installed);

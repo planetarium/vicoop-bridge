@@ -27,7 +27,7 @@
 // `docker context` is resolved by the CLI itself — no custom socket
 // path lookup needed.
 
-import { assertBrokerContainer, brokerFirewallScript } from './execution-runtime-boundary.js';
+import { assertBrokerContainer, assertBrokerWorkspace, brokerFirewallScript } from './execution-runtime-boundary.js';
 import { spawnSync } from 'node:child_process';
 import { createLogger, type Logger } from './logger.js';
 
@@ -146,6 +146,7 @@ export class RuntimeContainer {
   // exception propagate so the daemon exits with a clear error rather
   // than degrade silently.
   async start(): Promise<void> {
+    if (this.opts.workspaceDir && ['claude','codex'].includes(this.opts.backendKind)) assertBrokerWorkspace(this.opts.workspaceDir);
     this.ensureDaemonReachable();
 
     const name = containerName(this.opts.backendKind, this.opts.runtimeName);
@@ -222,7 +223,7 @@ export class RuntimeContainer {
   private verifyBrokerBoundary(name: string): void {
     const result = this.run(['inspect', '--format', '{{json .}}', name]);
     if (result.exitCode !== 0) throw new Error('Cannot inspect runtime authentication boundary');
-    assertBrokerContainer(result.stdout, this.opts.backendKind);
+    assertBrokerContainer(result.stdout, this.opts.backendKind, this.opts.runtimeName);
   }
 
   // ──────────────────────────────────────────────────────────────────

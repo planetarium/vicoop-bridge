@@ -336,7 +336,7 @@ test('cleanup stops an acquired runtime if firewall installation fails', async (
   const runtime = new RuntimeContainer({backendKind: 'codex', dockerRun(args) {
     calls.push([...args]);
     if (args[0] === 'exec') return fail('firewall failed');
-    if (args.includes('{{json .}}')) return ok(JSON.stringify({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1'},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN'],SecurityOpt:['no-new-privileges']},Mounts:[]}));
+    if (args.includes('{{json .}}')) return ok(JSON.stringify({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1','vicoop.name':'codex'},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN'],SecurityOpt:['no-new-privileges']},Mounts:[]}));
     return ok(args[0] === 'version' ? '28' : args[0] === 'ps' ? 'existing-container' : 'running');
   }});
   await assert.rejects(runtime.start(), /firewall failed/);

@@ -1,3 +1,4 @@
+import {PROVIDER_ENV_PATTERN} from './provider-environment.js';
 // Runs INSIDE the workload. Contains no host credential or host destination.
 // JSON-lines multiplex raw HTTP sockets and the agent's stdio over docker exec.
 // Keep as source text so Bun-compiled clients need no extra runtime asset.
@@ -78,7 +79,7 @@ function receive(m) {
       // provider overrides so a custom image cannot redirect the selected API.
       const env = {...process.env};
       for (const k of Object.keys(env)) {
-        if (/^(ANTHROPIC_|CLAUDE_CODE_OAUTH|CLAUDE_CODE_USE_|OPENAI_|CODEX_|VICOOP_EXECUTION_TOKEN$)/.test(k)) delete env[k];
+        if (${PROVIDER_ENV_PATTERN}.test(k) || /^(CODEX_|VICOOP_EXECUTION_TOKEN$)/.test(k)) delete env[k];
       }
       Object.assign(env, m.env);
       if(m.backend==='codex') {

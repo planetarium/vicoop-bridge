@@ -1,3 +1,4 @@
+import semver from 'semver';
 import {BACKENDS_MANIFEST} from './backends-manifest.js';
 import {readFileSync,existsSync} from 'node:fs';
 import {homedir} from 'node:os';
@@ -5,6 +6,11 @@ import {join} from 'node:path';
 import {createExecutionAuthBroker, BrokerRejection} from './execution-auth-broker.js';
 
 export const CODEX_BROKER_VERSION_RANGE=BACKENDS_MANIFEST.codex.externalRuntimeSupportedRange!;
+export function isSupportedCodexBrokerVersion(version: string): boolean {
+  return semver.satisfies(version, CODEX_BROKER_VERSION_RANGE);
+}
+
+class InvalidCodexLogin extends Error {}
 
 export type CodexCredential = {kind:'api-key'|'oauth'; secret:string; accountId?:string};
 export type CodexCredentialReader = () => CodexCredential | Promise<CodexCredential>;
@@ -30,18 +36,18 @@ export function createCodexCredentialReader(env: NodeJS.ProcessEnv = process.env
   const read=():CodexCredential=>{
     try {
       const data=JSON.parse(readFileSync(file,'utf8'));
-      if(data.OPENAI_API_KEY && data.tokens?.access_token) throw Error();
+      if(data.OPENAI_API_KEY && data.tokens?.access_token) throw new InvalidCodexLogin('Host Codex login has conflicting API-key and OAuth credentials; select one login type');
       if (data.OPENAI_API_KEY) {
         if(typeof data.OPENAI_API_KEY!=='string' || /\s/.test(data.OPENAI_API_KEY)) throw Error();
         return {kind:'api-key',secret:data.OPENAI_API_KEY};
       }
-      if(data.auth_mode!=='chatgpt') throw Error();
+      if(data.auth_mode!=='chatgpt') throw new InvalidCodexLogin('Host Codex login mode is unsupported; use an API key or a chatgpt login');
       const secret=data.tokens?.access_token, accountId=data.tokens?.account_id;
       if(typeof secret!=='string' || !secret || /\s/.test(secret) || typeof accountId!=='string' || !accountId || /\s/.test(accountId)) throw Error();
       const payload=JSON.parse(Buffer.from(secret.split('.')[1],'base64url').toString());
       if(typeof payload.exp!=='number' || payload.exp*1000<=Date.now()+30000) throw Error();
       return {kind:'oauth',secret,accountId};
-    } catch { throw new Error('Host Codex login is missing or expired; log in on the host and retry. The bridge does not refresh OAuth.'); }
+    } catch (error) { if(error instanceof InvalidCodexLogin) throw error; throw new Error('Host Codex login is missing or expired; log in on the host and retry. The bridge does not refresh OAuth.'); }
   };
   const initial=read();
   return ()=>{

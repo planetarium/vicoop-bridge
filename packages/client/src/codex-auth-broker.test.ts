@@ -6,7 +6,7 @@ import {once} from 'node:events';
 import {mkdtempSync,writeFileSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {createCodexAuthBroker,createCodexCredentialReader,loadCodexModelCatalog} from './codex-auth-broker.js';
+import {createCodexAuthBroker,createCodexCredentialReader,loadCodexModelCatalog,isSupportedCodexBrokerVersion} from './codex-auth-broker.js';
 
 test('OAuth catalog uses host authentication and disables unsupported transports',async()=>{
  const credential=()=>({kind:'oauth' as const,secret:'host-secret',accountId:'account'});
@@ -75,9 +75,9 @@ test('Codex credentials pin file account/type, reread rotation, and fail closed 
 test('Codex runtime rejects credential mounts and provider environment before use',async()=>{
  const {assertBrokerContainer}=await import('./execution-runtime-boundary.js');
  const fresh=()=>({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1','vicoop.name':'work'},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN','NET_RAW'],SecurityOpt:['no-new-privileges']},Mounts:[] as any[]});
- assert.doesNotThrow(()=>assertBrokerContainer(JSON.stringify(fresh()),'codex'));
+ assert.doesNotThrow(()=>assertBrokerContainer(JSON.stringify(fresh()),'codex','work'));
  for(const mutate of [(c:any)=>c.Config.Env.push('OPENAI_API_KEY=SECRET'),(c:any)=>c.Mounts.push({Type:'volume',Destination:'/data/creds/codex'}),(c:any)=>delete c.Config.Labels['vicoop.codex-auth']]) {
-  const c=fresh();mutate(c);assert.throws(()=>assertBrokerContainer(JSON.stringify(c),'codex'),e=>e instanceof Error && /migration/.test(e.message) && !e.message.includes('SECRET'));
+  const c=fresh();mutate(c);assert.throws(()=>assertBrokerContainer(JSON.stringify(c),'codex','work'),e=>e instanceof Error && /migration/.test(e.message) && !e.message.includes('SECRET'));
  }
 });
 
@@ -104,10 +104,17 @@ test('Codex rejects unsupported OAuth modes at selection and after rotation', ()
   try {
     write('chatgpt');
     const reader = createCodexCredentialReader({CODEX_HOME: dir});
+    writeFileSync(join(dir, 'auth.json'), JSON.stringify({OPENAI_API_KEY: 'fixture-secret', tokens:{access_token:'fixture-secret'}}));
+    assert.throws(reader, /conflicting API-key and OAuth/);
     for (const mode of [undefined, 'api_key', 'future-mode', 'chatgptAuthTokens']) {
       write(mode);
       assert.throws(() => createCodexCredentialReader({CODEX_HOME: dir}), /Host Codex login/);
-      assert.throws(reader, /Host Codex login/);
+      assert.throws(reader, /mode is unsupported/);
     }
   } finally {rmSync(dir, {recursive: true, force: true});}
+});
+
+test('Codex init and launch share a stable-release compatibility policy', () => {
+  for(const version of ['0.153.4','0.153.5','0.154.0']) assert.ok(isSupportedCodexBrokerVersion(version));
+  for(const version of ['0.153.3','0.153.5-alpha','0.154.0-beta.1','invalid']) assert.ok(!isSupportedCodexBrokerVersion(version));
 });

@@ -20,7 +20,7 @@ security domain: this does not isolate different callers within that runtime.
 
 ## Authentication and compatibility
 
-Codex **0.153.4 or newer** is required for this runtime profile. The tested
+A stable Codex release **0.153.4 or newer** is required for this runtime profile. The tested
 version is 0.153.4. `vicoop-client info` advertises this floor as
 `backends.codex.externalRuntimeSupportedRange`; `supportedRange` retains the
 existing host/bundled-direct range. Supported host sources, selected in order:
@@ -118,3 +118,5 @@ tools, concurrency, cancellation cleanup and absent workload login files.
 The same script can be compiled with `bun build --compile`. Actual OAuth was
 tested on macOS with Docker Desktop. Actual API-key inference and native Linux
 host validation remain unverified; mock API-key tests do not replace them.
+
+Workspace binds must use a separate project directory: paths overlapping the host Claude/Codex credential directories (including configured homes and symlink aliases) are rejected before startup. This check protects known credential locations; operators must still keep unrelated secrets out of shared project files. Runtime labels and volume names must match the requested runtime identity, and shared host/user/IPC namespaces and device requests are rejected.

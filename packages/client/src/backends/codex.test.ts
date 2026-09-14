@@ -3078,3 +3078,18 @@ test('queued cancellation settles before predecessor closes without letting a su
   }
   assert.equal(fake.children.length, 2);
 });
+
+test('container cancellation during input mapping prevents subsequent app-server startup', async () => {
+  const controller=new AbortController();
+  const fake=makeFakeSpawn(()=>happyPath());
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0,
+    mkdtemp:async()=>{controller.abort();return '/tmp/fixture-mapped-image';},
+    writeFile:async()=>{},rm:async()=>{},
+  });
+  const task=assign('image');
+  task.message.parts.push({kind:'file',file:{mimeType:'image/png',bytes:'aGVsbG8='}});
+  const frames:UpFrame[]=[];
+  await backend.handle(task,f=>frames.push(f),controller.signal);
+  assert.equal(fake.children.length,0);
+  assert.equal((frames.at(-1) as any).status.state,'canceled');
+});

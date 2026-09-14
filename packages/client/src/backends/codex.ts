@@ -1205,6 +1205,10 @@ export function createCodexBackend(
               ]
             : buildUserInput(callerUserPrompt, mapped.imageFiles);
 
+          if (signal.aborted) {
+            emit({type:'task.complete',taskId:task.taskId,status:{state:'canceled',timestamp:new Date().toISOString()}});
+            return;
+          }
           let client: AppServerRpcClient;
           try {
             client = await ensureClient();
@@ -1775,6 +1779,7 @@ export function createCodexBackend(
               }, 2_000);
             };
             signal.addEventListener('abort', onAbort);
+            if (signal.aborted) onAbort();
 
             // Shared liveness heartbeat — see heartbeat.ts. Routes through the
             // wrapped `emit` so a heartbeat refreshes the silence window;
