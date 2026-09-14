@@ -10,7 +10,7 @@ import {createRequire} from 'node:module';
 // Execute the shipped script against a fake Docker filesystem: stopping the
 // runtime discards creds tmpfs while preserving its sessions volume.
 for (const kind of ['codex', 'claude']) {
- for (const mode of ['safe', 'legacy', 'credential-mount', 'credential-env', 'missing-firewall-capability', 'unconfined-seccomp', 'unconfined-apparmor', 'unsupported-client']) {
+ for (const mode of ['safe', 'legacy', 'credential-mount', 'credential-env', 'missing-firewall-capability', 'unconfined-seccomp', 'unconfined-apparmor']) {
   test(`fork harness ${kind}: ${mode} boundary and persistence`, {skip: process.platform === 'win32'}, () => {
     const root = mkdtempSync(join(tmpdir(), 'fork-harness-'));
     try {
@@ -50,7 +50,6 @@ if(args[0]==='exec') {
       const cli = fileURLToPath(new URL('./cli.ts', import.meta.url));
       const tsx = createRequire(import.meta.url).resolve('tsx/cli');
       writeFileSync(join(bin, 'vicoop-client'), `#!/usr/bin/env node
-if(process.env.FORK_TEST_MODE==='unsupported-client') process.exit(1);
 const r=require('node:child_process').spawnSync(process.execPath,[${JSON.stringify(tsx)},${JSON.stringify(cli)},...process.argv.slice(2)],{stdio:'inherit'});
 process.exit(r.status??1);
 `, {mode: 0o700});
@@ -59,12 +58,6 @@ process.exit(r.status??1);
         ...process.env, PATH: bin + delimiter + process.env.PATH,
         VICOOP_FORK_KIND: kind, CODEX_HOME: source, CLAUDE_CONFIG_DIR: source, FORK_TEST_ROOT: root, FORK_TEST_MODE: mode,
       }});
-      if (mode === 'unsupported-client') {
-        assert.notEqual(result.status, 0);
-        assert.match(result.stderr, /update vicoop-client/);
-        assert.ok(!existsSync(join(root, 'calls.jsonl')));
-        return;
-      }
       const calls = readFileSync(join(root, 'calls.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
       if (mode !== 'safe') {
         assert.notEqual(result.status, 0);

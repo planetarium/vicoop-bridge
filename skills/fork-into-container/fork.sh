@@ -63,8 +63,6 @@ log "source: $SRC_DIR"
 # ── preflight ─────────────────────────────────────────────────────────────
 command -v docker         >/dev/null 2>&1 || die "docker not found in PATH"
 command -v vicoop-client  >/dev/null 2>&1 || die "vicoop-client not found in PATH (install: https://github.com/planetarium/vicoop-bridge)"
-VALIDATE_HELP="$(vicoop-client container validate --help 2>&1)" || die "update vicoop-client: host-broker validation support is required before initialization"
-[[ "$VALIDATE_HELP" == *"container validate"* ]] || die "update vicoop-client: host-broker validation support is required before initialization"
 docker info >/dev/null 2>&1 || die "docker daemon not reachable"
 
 CONTAINER="vicoop-runtime-$KIND"
@@ -79,9 +77,9 @@ else
 fi
 
 # Validate both reused and freshly initialized runtimes through the same
-# host-side boundary check as the daemon. Older clients fail closed here.
+# host-side boundary check as the daemon.
 if ! vicoop-client container validate "$KIND"; then
-    die "runtime boundary validation failed; update vicoop-client if validate is unavailable. For a legacy runtime, explicitly run: vicoop-client container remove $KIND --preserve-volumes; vicoop-client container init $KIND --reuse-state (include the original --workspace path if mounted). Harness injection has not started."
+    die "runtime boundary validation failed. For a legacy runtime, explicitly run: vicoop-client container remove $KIND --preserve-volumes; vicoop-client container init $KIND --reuse-state (include the original --workspace path if mounted). Harness injection has not started."
 fi
 
 # ── bring container up only for the inject window ────────────────────────
