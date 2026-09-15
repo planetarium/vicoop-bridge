@@ -7,6 +7,7 @@ import {
   formatRuntimeRemoveResult,
   listRuntimeContainers,
   removeRuntimeContainer,
+  runContainerValidateCli,
 } from './container-init.js';
 import type { DockerResult } from './runtime-container.js';
 
@@ -365,3 +366,32 @@ function ok(stdout = ''): DockerResult {
 function fail(stderr: string, exitCode = 1): DockerResult {
   return { stdout: '', stderr, exitCode };
 }
+
+test('container validate CLI reports success, inspect failure and unsafe boundary', async (t) => {
+  const errors: string[] = [];
+  t.mock.method(console, 'error', (message: string) => errors.push(message));
+  const args = {action: 'container-validate' as const, kind: 'codex' as const, name: 'work'};
+  const safe = {
+    Config: {User: 'node', Labels: {'vicoop.name': 'work', 'vicoop.codex-auth': 'stdio-v1'},
+      Env: ['CODEX_HOME=/data/sessions/codex/config']},
+    HostConfig: {NetworkMode: 'default', CapAdd: ['NET_ADMIN'], SecurityOpt: ['no-new-privileges']},
+    Mounts: [
+      {Type: 'volume', Name: 'vicoop-agents-work', Destination: '/data/agents/codex'},
+      {Type: 'volume', Name: 'vicoop-sessions-work', Destination: '/data/sessions/codex'},
+      {Type: 'tmpfs', Destination: '/data/creds/codex'},
+    ],
+  };
+  assert.equal(await runContainerValidateCli(args, command => {
+    assert.deepEqual(command, ['inspect', '--format', '{{json .}}', 'vicoop-runtime-work']);
+    return ok(JSON.stringify(safe));
+  }), 0);
+  assert.equal(errors.length, 0);
+
+  assert.equal(await runContainerValidateCli(args, () => fail('sensitive inspect detail')), 1);
+  assert.match(errors.pop()!, /^container validate failed: Cannot inspect runtime authentication boundary$/);
+  safe.Config.Env.push('OPENAI_API_KEY=sensitive-provider-key');
+  assert.equal(await runContainerValidateCli(args, () => ok(JSON.stringify(safe))), 1);
+  const message = errors.pop()!;
+  assert.match(message, /^container validate failed: codex runtime requires host-broker migration/);
+  assert.ok(!message.includes('sensitive-provider-key'));
+});

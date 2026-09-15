@@ -214,7 +214,10 @@ export class RuntimeContainer {
     }
     // Docker CLI emits "is not running" / "No such container" as
     // non-zero — both are no-ops for us.
-    if (/is not running|No such container/i.test(r.stderr)) {this.acquired = false; return;}
+    if (/is not running|No such container/i.test(r.stderr)) {
+      this.acquired = false;
+      return;
+    }
     this.log.warn(
       `runtime container stop failed: ${r.stderr.trim() || `exit ${r.exitCode}`}`,
     );

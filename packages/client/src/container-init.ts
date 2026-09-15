@@ -803,9 +803,12 @@ export async function runContainerRemoveCli(args: ContainerRemoveArgs): Promise<
   }
 }
 
-export async function runContainerValidateCli(args: Extract<ContainerCliArgs, {action: 'container-validate'}>): Promise<number> {
+export async function runContainerValidateCli(
+  args: Extract<ContainerCliArgs, {action: 'container-validate'}>,
+  run: DockerRun = defaultDockerRun,
+): Promise<number> {
   try {
-    validateRuntimeBoundary(args.kind, args.name);
+    validateRuntimeBoundary(args.kind, args.name, run);
     return 0;
   } catch (err) {
     console.error(`container validate failed: ${(err as Error).message}`);
