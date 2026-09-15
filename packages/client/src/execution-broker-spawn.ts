@@ -48,10 +48,16 @@ export function createExecutionBrokerSpawn(container: string, opts: {
     const broker = opts.createBroker();
     // Absolute trusted binaries; disable runtime injection into the privileged
     // supervisor. The last argument is opaque relay source, run only as node.
-    const relay = (opts.spawnImpl ?? nodeSpawn)('docker', ['exec', '-i', '--user', '0',
-      '-e', 'NODE_OPTIONS=', '-e', 'NODE_PATH=', '-e', 'LD_PRELOAD=', '-e', 'LD_LIBRARY_PATH=',
-      container, '/usr/bin/tini', '-s', '--', '/usr/local/bin/node', '-e',
-      EXECUTION_BROKER_SUPERVISOR, String(opts.ttlMs ?? 60 * 60_000), EXECUTION_BROKER_RELAY], { stdio: ['pipe', 'pipe', 'pipe'] });
+    let relay: ReturnType<typeof nodeSpawn>;
+    try {
+      relay = (opts.spawnImpl ?? nodeSpawn)('docker', ['exec', '-i', '--user', '0',
+        '-e', 'NODE_OPTIONS=', '-e', 'NODE_PATH=', '-e', 'LD_PRELOAD=', '-e', 'LD_LIBRARY_PATH=',
+        container, '/usr/bin/tini', '-s', '--', '/usr/local/bin/node', '-e',
+        EXECUTION_BROKER_SUPERVISOR, String(opts.ttlMs ?? 60 * 60_000), EXECUTION_BROKER_RELAY], { stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (error) {
+      broker.revoke();
+      throw error;
+    }
     const events = new EventEmitter();
     const stdout = new PassThrough();
     const stderr = new PassThrough();

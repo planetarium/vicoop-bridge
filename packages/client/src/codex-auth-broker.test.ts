@@ -74,7 +74,7 @@ test('Codex credentials pin file account/type, reread rotation, and fail closed 
 
 test('Codex runtime rejects credential mounts and provider environment before use',async()=>{
  const {assertBrokerContainer}=await import('./execution-runtime-boundary.js');
- const fresh=()=>({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1','vicoop.name':'work'},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN','NET_RAW'],SecurityOpt:['no-new-privileges']},Mounts:[] as any[]});
+ const fresh=()=>({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1','vicoop.name':'work'},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN','NET_RAW'],SecurityOpt:['no-new-privileges']},Mounts:[{Type:'volume',Name:'vicoop-agents-'+('work'),Destination:'/data/agents/codex'},{Type:'volume',Name:'vicoop-sessions-'+('work'),Destination:'/data/sessions/codex'},{Type:'tmpfs',Destination:'/data/creds/codex'}] as any[]});
  assert.doesNotThrow(()=>assertBrokerContainer(JSON.stringify(fresh()),'codex','work'));
  for(const mutate of [(c:any)=>c.Config.Env.push('OPENAI_API_KEY=SECRET'),(c:any)=>c.Mounts.push({Type:'volume',Destination:'/data/creds/codex'}),(c:any)=>delete c.Config.Labels['vicoop.codex-auth']]) {
   const c=fresh();mutate(c);assert.throws(()=>assertBrokerContainer(JSON.stringify(c),'codex','work'),e=>e instanceof Error && /migration/.test(e.message) && !e.message.includes('SECRET'));
@@ -117,4 +117,29 @@ test('Codex rejects unsupported OAuth modes at selection and after rotation', ()
 test('Codex init and launch share a stable-release compatibility policy', () => {
   for(const version of ['0.153.4','0.153.5','0.154.0']) assert.ok(isSupportedCodexBrokerVersion(version));
   for(const version of ['0.153.3','0.153.5-alpha','0.154.0-beta.1','invalid']) assert.ok(!isSupportedCodexBrokerVersion(version));
+});
+
+test('explicit API key wins over host profiles and is pinned for the reader lifetime', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'codex-key-pin-'));
+  try {
+    writeFileSync(join(dir, 'config.toml'), 'profile = "custom"\nmodel_provider = "custom"\n');
+    const env = {CODEX_HOME: dir, OPENAI_API_KEY: 'original-key'};
+    const reader = createCodexCredentialReader(env);
+    assert.deepEqual(reader(), {kind: 'api-key', secret: 'original-key'});
+    env.OPENAI_API_KEY = 'replacement-key';
+    assert.throws(reader, /key changed; restart/);
+    assert.throws(() => createCodexCredentialReader({CODEX_HOME: dir}), /default OpenAI provider/);
+  } finally { rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('auth.json API key rotation fails closed', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'codex-file-key-pin-'));
+  try {
+    const file = join(dir, 'auth.json');
+    writeFileSync(file, JSON.stringify({OPENAI_API_KEY: 'original-key'}));
+    const reader = createCodexCredentialReader({CODEX_HOME: dir});
+    assert.deepEqual(reader(), {kind: 'api-key', secret: 'original-key'});
+    writeFileSync(file, JSON.stringify({OPENAI_API_KEY: 'replacement-key'}));
+    assert.throws(reader, /changed; restart/);
+  } finally { rmSync(dir, {recursive: true, force: true}); }
 });

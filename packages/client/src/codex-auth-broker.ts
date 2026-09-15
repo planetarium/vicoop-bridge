@@ -18,6 +18,16 @@ export type CodexCredentialReader = () => CodexCredential | Promise<CodexCredent
 // Select once, reread only that source, and never copy/refresh a login in Docker.
 export function createCodexCredentialReader(env: NodeJS.ProcessEnv = process.env): CodexCredentialReader {
   if (env.OPENAI_BASE_URL) throw new Error('Codex container authentication requires the direct OpenAI service');
+  if (env.OPENAI_API_KEY) {
+    const initialKey = env.OPENAI_API_KEY;
+    if (/\s/.test(initialKey)) throw new Error('Host OpenAI API key is unavailable');
+    return () => {
+      const secret = env.OPENAI_API_KEY;
+      if (!secret || /\s/.test(secret)) throw new Error('Host OpenAI API key is unavailable');
+      if (secret !== initialKey) throw new Error('Host OpenAI API key changed; restart the bridge');
+      return {kind: 'api-key', secret};
+    };
+  }
   const config=join(env.CODEX_HOME || join(homedir(),'.codex'),'config.toml');
   if(existsSync(config)) {
     for(const raw of readFileSync(config,'utf8').split(/\r?\n/)) {
@@ -27,11 +37,6 @@ export function createCodexCredentialReader(env: NodeJS.ProcessEnv = process.env
       }
     }
   }
-  if (env.OPENAI_API_KEY) return () => {
-    const secret=env.OPENAI_API_KEY;
-    if (!secret || /\s/.test(secret)) throw new Error('Host OpenAI API key is unavailable');
-    return {kind:'api-key',secret};
-  };
   const file=join(env.CODEX_HOME || join(homedir(),'.codex'),'auth.json');
   const read=():CodexCredential=>{
     try {
@@ -52,7 +57,7 @@ export function createCodexCredentialReader(env: NodeJS.ProcessEnv = process.env
   const initial=read();
   return ()=>{
     const next=read();
-    if(next.kind!==initial.kind || next.accountId!==initial.accountId) throw new Error('Host Codex account changed; restart the bridge');
+    if(next.kind!==initial.kind || next.accountId!==initial.accountId || (initial.kind==='api-key' && next.secret!==initial.secret)) throw new Error('Host Codex account changed; restart the bridge');
     return next;
   };
 }

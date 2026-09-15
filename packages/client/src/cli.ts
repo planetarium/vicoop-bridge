@@ -522,10 +522,10 @@ async function resolveRuntime(args: {
     workspaceDir: args.cwd,
     bridgeUrl: args.bridgeUrl,
   });
-  await runtime.start();
   // Validate host authentication before accepting tasks. Both supported
   // container backends use a broker; there is no credential-mounted fallback.
   try {
+    await runtime.start();
     if (args.kind === 'claude') {
       const credential = createClaudeCredentialReader();
       const selectedCredential = await credential();

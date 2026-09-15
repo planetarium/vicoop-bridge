@@ -146,6 +146,15 @@ export class RuntimeContainer {
   // exception propagate so the daemon exits with a clear error rather
   // than degrade silently.
   async start(): Promise<void> {
+    try {
+      await this.startRuntime();
+    } catch (error) {
+      await this.stop();
+      throw error;
+    }
+  }
+
+  private async startRuntime(): Promise<void> {
     if (this.opts.workspaceDir && ['claude','codex'].includes(this.opts.backendKind)) assertBrokerWorkspace(this.opts.workspaceDir);
     this.ensureDaemonReachable();
 
@@ -159,12 +168,11 @@ export class RuntimeContainer {
       }
       if (['claude','codex'].includes(this.opts.backendKind)) this.verifyBrokerBoundary(name);
       if (this.inspectRunning(name)) {
-        this.acquired = true;
         this.log.info(`runtime container '${name}' already running — reusing`);
       } else {
         this.log.info(`runtime container '${name}' exists but stopped — starting`);
-        this.acquired = true;
         this.runDocker(['start', name]);
+        this.acquired = true;
       }
     } else {
       if (!this.opts.createIfMissing) {
@@ -187,10 +195,8 @@ export class RuntimeContainer {
 
     await this.waitUntilRunning(name);
     if (['claude','codex'].includes(this.opts.backendKind)) {
-      try {
-        this.verifyBrokerBoundary(name);
-        this.runDocker(['exec', '--user', '0', name, '/bin/sh', '-c', brokerFirewallScript()]);
-      } catch (err) { await this.stop(); throw err; }
+      this.verifyBrokerBoundary(name);
+      this.runDocker(['exec', '--user', '0', name, '/bin/sh', '-c', brokerFirewallScript()]);
     }
   }
 
@@ -223,7 +229,7 @@ export class RuntimeContainer {
   private verifyBrokerBoundary(name: string): void {
     const result = this.run(['inspect', '--format', '{{json .}}', name]);
     if (result.exitCode !== 0) throw new Error('Cannot inspect runtime authentication boundary');
-    assertBrokerContainer(result.stdout, this.opts.backendKind, this.opts.runtimeName);
+    assertBrokerContainer(result.stdout, this.opts.backendKind, this.opts.runtimeName, this.opts.workspaceDir);
   }
 
   // ──────────────────────────────────────────────────────────────────

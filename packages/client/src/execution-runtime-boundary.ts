@@ -5,7 +5,7 @@ import { PROVIDER_ENV_PATTERN } from './provider-environment.js';
 
 // Inspect output stays host-side: never include it in an exception/log because
 // rejected legacy containers can contain actual credentials in Config.Env.
-export function assertBrokerContainer(raw: string, kind: string, expectedName: string): void {
+export function assertBrokerContainer(raw: string, kind: string, expectedName: string, expectedWorkspace?: string): void {
   let c;
   try { c = JSON.parse(raw); } catch { throw new Error('Cannot inspect runtime authentication boundary'); }
   const invalid = () => { throw new Error(`${kind} runtime requires host-broker migration; see docs/${kind}-auth-broker.md. Existing credentials and volumes have not been deleted.`); };
@@ -19,13 +19,25 @@ export function assertBrokerContainer(raw: string, kind: string, expectedName: s
   const env: string[] = c.Config?.Env ?? [];
   if (env.some(v => PROVIDER_ENV_PATTERN.test(v.split('=', 1)[0]))) invalid();
   if (!env.includes(`${kind==='claude' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME'}=/data/sessions/${kind}/config`)) invalid();
+  const required = new Set([`/data/agents/${kind}`, `/data/sessions/${kind}`, `/data/creds/${kind}`]);
+  let workspaceFound = false;
   for (const mount of c.Mounts ?? []) {
+    required.delete(mount.Destination);
     if (mount.Type === 'tmpfs' && ['/tmp', `/data/creds/${kind}`].includes(mount.Destination)) continue;
     if (mount.Type === 'volume' && mount.Destination === `/data/agents/${kind}` && mount.Name === `vicoop-agents-${expectedName}`) continue;
     if (mount.Type === 'volume' && mount.Destination === `/data/sessions/${kind}` && mount.Name === `vicoop-sessions-${expectedName}`) continue;
-    if (mount.Type === 'bind' && mount.Destination === '/workspace') {assertBrokerWorkspace(mount.Source); continue;}
+    if (mount.Type === 'bind' && mount.Destination === '/workspace') {
+      assertBrokerWorkspace(mount.Source);
+      if (expectedWorkspace !== undefined && canonicalPath(mount.Source) !== canonicalPath(expectedWorkspace)) {
+        throw new Error('Runtime workspace differs from the requested working directory; use the original workspace or initialize another runtime');
+      }
+      workspaceFound = true;
+      continue;
+    }
     invalid();
   }
+  if (required.size) invalid();
+  if (expectedWorkspace !== undefined && !workspaceFound) throw new Error('Runtime has no workspace mount for the requested working directory');
 }
 
 // Install before any workload spawn, as root via the trusted Docker control

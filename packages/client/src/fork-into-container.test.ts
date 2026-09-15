@@ -28,7 +28,7 @@ fs.appendFileSync(p.join(root,'calls.jsonl'),JSON.stringify(args)+'\\n');
 if(args[0]==='inspect' && args.includes('--format')) {
   if(args.includes('{{json .}}')) {
     const kind=process.env.VICOOP_FORK_KIND,mode=process.env.FORK_TEST_MODE;
-    const c={Config:{User:'node',Labels:{['vicoop.'+kind+'-auth']:'stdio-v1','vicoop.name':kind},Env:[(kind==='codex'?'CODEX_HOME':'CLAUDE_CONFIG_DIR')+'=/data/sessions/'+kind+'/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN','NET_RAW'],SecurityOpt:['no-new-privileges']},Mounts:[{Type:'volume',Name:'vicoop-sessions-'+kind,Destination:'/data/sessions/'+kind}]};
+    const c={Config:{User:'node',Labels:{['vicoop.'+kind+'-auth']:'stdio-v1','vicoop.name':kind},Env:[(kind==='codex'?'CODEX_HOME':'CLAUDE_CONFIG_DIR')+'=/data/sessions/'+kind+'/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN','NET_RAW'],SecurityOpt:['no-new-privileges']},Mounts:[{Type:'volume',Name:'vicoop-sessions-'+kind,Destination:'/data/sessions/'+kind},{Type:'volume',Name:'vicoop-agents-'+kind,Destination:'/data/agents/'+kind},{Type:'tmpfs',Destination:'/data/creds/'+kind}]};
     if(mode==='missing-firewall-capability') c.HostConfig.CapAdd=[];
     if(mode==='unconfined-seccomp') c.HostConfig.SecurityOpt.push('seccomp=unconfined');
     if(mode==='unconfined-apparmor') c.HostConfig.SecurityOpt.push('apparmor=unconfined');
