@@ -27,8 +27,8 @@
 // `docker context` is resolved by the CLI itself — no custom socket
 // path lookup needed.
 
-import { assertClaudeBrokerContainer, claudeBrokerFirewallScript, CLAUDE_BROKER_LABEL } from './claude-runtime-boundary.js';
-import { spawnSync, spawn } from 'node:child_process';
+import { assertBrokerContainer, assertBrokerWorkspace, brokerFirewallScript } from './execution-runtime-boundary.js';
+import { spawnSync } from 'node:child_process';
 import { createLogger, type Logger } from './logger.js';
 
 export const DEFAULT_RUNTIME_IMAGE = 'ghcr.io/planetarium/vicoop-runtime:latest';
@@ -127,9 +127,9 @@ export function sessionsVolumeName(kind: string, runtimeName?: string): string {
 export class RuntimeContainer {
   private readonly opts: Required<Pick<RuntimeContainerOptions, 'backendKind' | 'image' | 'runtimeName'>> &
     RuntimeContainerOptions;
+  private acquired = false;
   private readonly log: Logger;
   private readonly run: DockerRun;
-  private started = false;
 
   constructor(opts: RuntimeContainerOptions) {
     this.opts = {
@@ -146,6 +146,16 @@ export class RuntimeContainer {
   // exception propagate so the daemon exits with a clear error rather
   // than degrade silently.
   async start(): Promise<void> {
+    try {
+      await this.startRuntime();
+    } catch (error) {
+      await this.stop();
+      throw error;
+    }
+  }
+
+  private async startRuntime(): Promise<void> {
+    if (this.opts.workspaceDir && ['claude','codex'].includes(this.opts.backendKind)) assertBrokerWorkspace(this.opts.workspaceDir);
     this.ensureDaemonReachable();
 
     const name = containerName(this.opts.backendKind, this.opts.runtimeName);
@@ -156,19 +166,20 @@ export class RuntimeContainer {
             `Remove it first with \`${this.removeHint()}\`, then rerun init.`,
         );
       }
-      if (this.opts.backendKind === 'claude') this.verifyClaudeBoundary(name);
+      if (['claude','codex'].includes(this.opts.backendKind)) this.verifyBrokerBoundary(name);
       if (this.inspectRunning(name)) {
         this.log.info(`runtime container '${name}' already running — reusing`);
       } else {
         this.log.info(`runtime container '${name}' exists but stopped — starting`);
         this.runDocker(['start', name]);
+        this.acquired = true;
       }
     } else {
       if (!this.opts.createIfMissing) {
         throw new Error(
           `runtime container '${name}' does not exist. ` +
             `Create it first with \`vicoop-client container init ${this.opts.backendKind} --name ${this.opts.runtimeName}\`, ` +
-            `then retry \`vicoop-client --backend ${this.opts.backendKind} --runtime container --runtime-name ${this.opts.runtimeName}\`.`,
+            `then retry \`vicoop-client start --backend ${this.opts.backendKind} --runtime container --runtime-name ${this.opts.runtimeName}\`.`,
         );
       }
       if (this.opts.failIfExists && !this.opts.reuseState) {
@@ -177,33 +188,36 @@ export class RuntimeContainer {
       await this.ensureImage();
       this.ensureVolumes();
       this.createContainer(name);
+      this.acquired = true;
       this.runDocker(['start', name]);
       this.log.info(`runtime container '${name}' created and started`);
     }
 
     await this.waitUntilRunning(name);
-    if (this.opts.backendKind === 'claude') {
-      try {
-        this.verifyClaudeBoundary(name);
-        this.runDocker(['exec', '--user', '0', name, '/bin/sh', '-c', claudeBrokerFirewallScript()]);
-      } catch (err) { await this.stop(); throw err; }
+    if (['claude','codex'].includes(this.opts.backendKind)) {
+      this.verifyBrokerBoundary(name);
+      this.runDocker(['exec', '--user', '0', name, '/bin/sh', '-c', brokerFirewallScript()]);
     }
-    this.started = true;
   }
 
   // Best-effort container stop. Awaited from the daemon's signal
   // handler so an orderly shutdown actually ends with the container
   // stopped. Already-stopped / missing containers are tolerated.
   async stop(): Promise<void> {
+    if (!this.acquired) return;
     const name = containerName(this.opts.backendKind, this.opts.runtimeName);
     const r = this.run(['stop', '-t', '10', name]);
     if (r.exitCode === 0) {
+      this.acquired = false;
       this.log.info(`runtime container '${name}' stopped`);
       return;
     }
     // Docker CLI emits "is not running" / "No such container" as
     // non-zero — both are no-ops for us.
-    if (/is not running|No such container/i.test(r.stderr)) return;
+    if (/is not running|No such container/i.test(r.stderr)) {
+      this.acquired = false;
+      return;
+    }
     this.log.warn(
       `runtime container stop failed: ${r.stderr.trim() || `exit ${r.exitCode}`}`,
     );
@@ -215,10 +229,10 @@ export class RuntimeContainer {
     return containerName(this.opts.backendKind, this.opts.runtimeName);
   }
 
-  private verifyClaudeBoundary(name: string): void {
+  private verifyBrokerBoundary(name: string): void {
     const result = this.run(['inspect', '--format', '{{json .}}', name]);
-    if (result.exitCode !== 0) throw new Error('Cannot inspect Claude runtime authentication boundary');
-    assertClaudeBrokerContainer(result.stdout);
+    if (result.exitCode !== 0) throw new Error('Cannot inspect runtime authentication boundary');
+    assertBrokerContainer(result.stdout, this.opts.backendKind, this.opts.runtimeName, this.opts.workspaceDir);
   }
 
   // ──────────────────────────────────────────────────────────────────
@@ -302,7 +316,7 @@ export class RuntimeContainer {
     const runtimeName = this.opts.runtimeName;
     return [
       agentsVolumeName(kind, runtimeName),
-      ...(kind === 'claude' ? [] : [credsVolumeName(kind, runtimeName)]),
+      ...(['claude','codex'].includes(kind) ? [] : [credsVolumeName(kind, runtimeName)]),
       sessionsVolumeName(kind, runtimeName),
     ];
   }
@@ -360,21 +374,21 @@ export class RuntimeContainer {
     if (this.opts.skipFirewall) {
       args.push('-e', 'VICOOP_SKIP_FIREWALL=1');
     }
-    // Per-kind named volumes — keeps the bridge-client-driven
-    // /data/agents/<kind>, /data/creds/<kind>, /data/sessions/<kind>
-    // persistent across container re-creation. Decisions §4, §5.
+    // Agent and session volumes persist across recreation. Broker-backed
+    // runtimes keep provider credentials on the host and use a creds tmpfs;
+    // only non-broker kinds retain a persistent credential volume.
     args.push(
       '--mount',
       `type=volume,source=${agentsVolumeName(kind, runtimeName)},target=/data/agents/${kind}`,
-      ...(kind === 'claude' ? [] : ['--mount', `type=volume,source=${credsVolumeName(kind, runtimeName)},target=/data/creds/${kind}`]),
+      ...(['claude','codex'].includes(kind) ? [] : ['--mount', `type=volume,source=${credsVolumeName(kind, runtimeName)},target=/data/creds/${kind}`]),
       '--mount',
       `type=volume,source=${sessionsVolumeName(kind, runtimeName)},target=/data/sessions/${kind}`,
     );
-    if (kind === 'claude') {
-      args.push('--label', CLAUDE_BROKER_LABEL, '--user', 'node',
+    if (['claude','codex'].includes(kind)) {
+      args.push('--label', `vicoop.${kind}-auth=stdio-v1`, '--user', 'node',
         '--security-opt', 'no-new-privileges',
-        '--tmpfs', '/data/creds/claude:rw,nosuid,nodev,size=16777216,uid=1000,gid=1000,mode=0700',
-        '-e', 'CLAUDE_CONFIG_DIR=/data/sessions/claude/config');
+        '--tmpfs', `/data/creds/${kind}:rw,nosuid,nodev,size=16777216,uid=1000,gid=1000,mode=0700`,
+        '-e', `${kind==='claude' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME'}=/data/sessions/${kind}/config`);
     }
     if (this.opts.workspaceDir) {
       // Workspace as a host bind-mount. Per-context branching

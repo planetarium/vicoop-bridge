@@ -11,7 +11,7 @@ import { spawnSync, spawn } from 'node:child_process';
 import { createClaudeBrokerSpawn } from '../../src/claude-broker-spawn.js';
 import { createClaudeCredentialReader } from '../../src/claude-auth-broker.js';
 import { RuntimeContainer } from '../../src/runtime-container.js';
-import { migrateClaudeSessions } from '../../src/container-init.js';
+import { migrateBrokerSessions } from '../../src/container-init.js';
 import { createLogger } from '../../src/logger.js';
 import type { ChildHandle } from '../../src/spawn-adapter.js';
 
@@ -90,7 +90,7 @@ try {
     'workload-controlled PATH ran during privileged startup');
   docker(['exec',container,'/bin/rm','/data/agents/claude/bin/sh','/data/agents/claude/bin/iptables','/data/agents/claude/bin/awk']);
   docker(['exec', '--user', '0', container, 'chown', '-R', 'node:node', '/data/sessions/claude']);
-  await migrateClaudeSessions(id, process.env.VICOOP_SMOKE_IMAGE ?? 'ghcr.io/planetarium/vicoop-runtime:latest', createLogger());
+  await migrateBrokerSessions('claude', id, process.env.VICOOP_SMOKE_IMAGE ?? 'ghcr.io/planetarium/vicoop-runtime:latest', createLogger());
   assert.equal(docker(['exec',container,'cat','/data/sessions/claude/config/projects/history.jsonl']).trim(),'conversation');
   const inspect = JSON.parse(docker(['inspect', '--format', '{{json .}}', container]));
   assert.ok(!inspect.Mounts.some((m: {Destination:string}) => m.Destination === '/data/creds/claude' && m.Type !== 'tmpfs'));

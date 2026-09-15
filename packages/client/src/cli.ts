@@ -1,4 +1,11 @@
 #!/usr/bin/env node
+import { createCodexCredentialReader, createCodexAuthBroker, CODEX_BROKER_VERSION_RANGE, isSupportedCodexBrokerVersion, loadCodexModelCatalog } from './codex-auth-broker.js';
+import { createExecutionBrokerSpawn } from './execution-broker-spawn.js';
+import { createCodexExecutionBackend } from './backends/codex-execution.js';
+import { parseCodexConfigTomlForModel } from './backends/codex.js';
+import { probeBackendVersion } from './container-init.js';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { createClaudeCredentialReader, assertClaudeBrokerSettings } from './claude-auth-broker.js';
 import { createClaudeBrokerSpawn } from './claude-broker-spawn.js';
 import { closeSync, existsSync, openSync, readFileSync } from 'node:fs';
@@ -25,11 +32,11 @@ import type { AppServerSpawnFn } from './backends/codex-rpc.js';
 import { createVicoopCodexBackend } from './backends/vicoop-codex.js';
 import type { Backend } from './backend.js';
 import { RuntimeContainer, DEFAULT_RUNTIME_IMAGE } from './runtime-container.js';
-import { createDockerExecSpawn, type SpawnFn } from './spawn-adapter.js';
+import type { SpawnFn } from './spawn-adapter.js';
 import {
-  assertContainerCredsPresent,
   containerCmd,
   runContainerInitCli,
+  runContainerValidateCli,
   runContainerListCli,
   runContainerRemoveCli,
 } from './container-init.js';
@@ -59,7 +66,6 @@ import {
   readConfig,
 } from './config.js';
 import {
-  DEFAULT_BRIDGE_URL,
   daemonFlagsFields,
   mergeClientArgs,
   type DaemonArgs as Args,
@@ -459,7 +465,14 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       const sandboxMode = isolated
         ? (explicitSandbox ?? 'danger-full-access')
         : explicitSandbox;
-      const backend = createCodexBackend({
+      let appServerArgs: string[] | undefined;
+      if(runtime) {
+        let model: string | null = null;
+        try {model=parseCodexConfigTomlForModel(readFileSync(join(process.env.CODEX_HOME || join(homedir(),'.codex'),'config.toml'),'utf8')).model;} catch {}
+        appServerArgs=['app-server',...(model ? ['-c',`model=${JSON.stringify(model)}`] : [])];
+      }
+      const backend = (runtime ? createCodexExecutionBackend : createCodexBackend)({
+        appServerArgs,
         cwd,
         sandboxMode,
         approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
@@ -509,12 +522,10 @@ async function resolveRuntime(args: {
     workspaceDir: args.cwd,
     bridgeUrl: args.bridgeUrl,
   });
-  await runtime.start();
-  // Fail fast if the operator started the daemon against a runtime that
-  // was initialised without --from-host and has not been authenticated
-  // yet. Without this check the daemon would happily accept tasks until
-  // the first spawn, then surface a backend-specific auth error.
+  // Validate host authentication before accepting tasks. Both supported
+  // container backends use a broker; there is no credential-mounted fallback.
   try {
+    await runtime.start();
     if (args.kind === 'claude') {
       const credential = createClaudeCredentialReader();
       const selectedCredential = await credential();
@@ -523,21 +534,21 @@ async function resolveRuntime(args: {
       });
       return { runtime: { stop: async () => { broker.close(); await runtime.stop(); } },
         spawn: broker.spawn, cwd: args.cwd ? '/workspace' : undefined };
+    } else {
+      const installed=await probeBackendVersion(runtime.getContainerName(),'codex');
+      if(!installed || !isSupportedCodexBrokerVersion(installed)) throw new Error(`Codex container authentication requires Codex ${CODEX_BROKER_VERSION_RANGE}; update the runtime agent`);
+      const credential=createCodexCredentialReader();
+      const selected=await credential();
+      const codexCatalog=await loadCodexModelCatalog(credential,installed);
+      const broker=createExecutionBrokerSpawn(runtime.getContainerName(), {
+        backend:'codex',codexCatalog,createBroker:()=>createCodexAuthBroker({credential,authentication:selected.kind}),
+      });
+      return {runtime:{stop:async()=>{broker.close();await runtime.stop();}},spawn:broker.spawn,cwd:args.cwd ? '/workspace' : undefined};
     }
-    await assertContainerCredsPresent(runtime.getContainerName(), args.kind);
   } catch (err) {
     await runtime.stop();
     throw err;
   }
-  return {
-    runtime,
-    spawn: createDockerExecSpawn(runtime),
-    // Inside the container the workspace is always /workspace (when
-    // bind-mounted) — backends pass this through to claude/codex as
-    // their --cwd, so the host path the operator typed must not leak
-    // into the container's argv.
-    cwd: args.cwd ? '/workspace' : undefined,
-  };
 }
 
 // Container-mode override for claude's sandbox guard. Returns a new
@@ -1096,6 +1107,9 @@ async function main(): Promise<void> {
       break;
     case 'whoami':
       process.exit(await runWhoami(parsed));
+      break;
+    case 'container-validate':
+      process.exit(await runContainerValidateCli(parsed));
       break;
     case 'container-init':
       process.exit(await runContainerInitCli(parsed));

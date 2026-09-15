@@ -160,3 +160,26 @@ test('host prompt files are staged for the workload and removed after execution'
     assert.ok(!existsSync(result.path));assert.ok(existsSync(hostFile));
   } finally {adapter.close();rmSync(hostDir,{recursive:true,force:true});}
 });
+
+test('synchronous Docker spawn failure revokes the execution broker', async () => {
+  const {createExecutionBrokerSpawn} = await import('./execution-broker-spawn.js');
+  const {createExecutionAuthBroker} = await import('./execution-auth-broker.js');
+  let broker: ReturnType<typeof createExecutionAuthBroker> | undefined;
+  let revoked = false;
+  const failure = new Error('spawn failed');
+  const adapter = createExecutionBrokerSpawn('fixture', {
+    backend: 'codex',
+    createBroker() {
+      broker = createExecutionAuthBroker({upstream: 'https://api.openai.com', origins: ['https://api.openai.com'],
+        pathPrefix: '/v1', allow: () => true, prepare: async () => ({})});
+      const revoke = broker.revoke;
+      broker.revoke = () => { revoked = true; revoke(); };
+      return broker;
+    },
+    spawnImpl: () => { throw failure; },
+  });
+  try {
+    assert.throws(() => adapter.spawn('codex', [], {}), error => error === failure);
+    assert.equal(revoked, true);
+  } finally { broker?.revoke(); adapter.close(); }
+});

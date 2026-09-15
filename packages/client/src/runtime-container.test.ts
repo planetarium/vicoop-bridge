@@ -2,8 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { RuntimeContainer, type DockerResult } from './runtime-container.js';
 
-// Generic volume lifecycle tests use Codex; Claude authentication boundaries
-// have dedicated coverage in claude-runtime-boundary.test.ts.
+// Runtime lifecycle fixtures include the Codex broker boundary.
 // Test seam fixture. Each `dockerRun` call is matched against the
 // next response in the queue and pushed onto `calls` for assertion.
 // Missing fixtures fall back to a successful zero-output result so
@@ -18,6 +17,11 @@ function makeDockerFixture(responses: RunResponse[]) {
   let i = 0;
   const run = (args: readonly string[]): DockerResult => {
     calls.push(args);
+    if(args.includes('{{json .}}')) {
+      const name=args.at(-1)!.replace('vicoop-runtime-','');
+      return ok(JSON.stringify({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1','vicoop.name':name},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN','NET_RAW'],SecurityOpt:['no-new-privileges']},Mounts:[...[{Type:'volume',Name:'vicoop-agents-'+(name),Destination:'/data/agents/codex'},{Type:'volume',Name:'vicoop-sessions-'+(name),Destination:'/data/sessions/codex'},{Type:'tmpfs',Destination:'/data/creds/codex'}], ...calls.filter(c=>c[0]==='create').flatMap(c=>c.filter(a=>a.startsWith('type=bind,source=')).map(a=>({Type:'bind',Source:a.slice('type=bind,source='.length).split(',target=')[0],Destination:'/workspace'})))]}));
+    }
+    if(args[0]==='exec' && args.includes('/bin/sh')) return ok();
     const r = responses[i++] ?? ok();
     return typeof r === 'function' ? r(args) : r;
   };
@@ -43,8 +47,6 @@ function happyCreateResponses(): RunResponse[] {
     ok(), // image inspect — found
     fail('volume not found', 1), // volume inspect agents
     ok(), // volume create agents
-    fail('volume not found', 1), // volume inspect creds
-    ok(), // volume create creds
     fail('volume not found', 1), // volume inspect sessions
     ok(), // volume create sessions
     ok(), // create container
@@ -75,7 +77,7 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
   const volumeCreates = calls.filter((c) => c[0] === 'volume' && c[1] === 'create');
   assert.deepEqual(
     volumeCreates.map((c) => c[c.length - 1]).sort(),
-    ['vicoop-agents-codex', 'vicoop-creds-codex', 'vicoop-sessions-codex'].sort(),
+    ['vicoop-agents-codex', 'vicoop-sessions-codex'].sort(),
   );
   for (const v of volumeCreates) {
     assert.ok(v.includes('vicoop.kind=codex'), `label on ${v.join(' ')}`);
@@ -104,8 +106,8 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
     'host workspace mounted',
   );
   assert.ok(
-    argv.some((a) => a === 'type=volume,source=vicoop-creds-codex,target=/data/creds/codex'),
-    'creds volume mounted',
+    !argv.some((a) => a.includes('source=vicoop-creds-')),
+    'creds volume must not be mounted',
   );
   assert.ok(
     argv.some((a) => a === 'VICOOP_BRIDGE_URL=wss://bridge.example'),
@@ -113,8 +115,8 @@ test('start: with createIfMissing pulls nothing when image is cached, creates+st
   );
 
   // Start sequence
-  assert.deepEqual(calls[calls.length - 2], ['start', 'vicoop-runtime-codex']);
-  assert.deepEqual(calls[calls.length - 1], [
+  assert.deepEqual(calls[calls.length - 4], ['start', 'vicoop-runtime-codex']);
+  assert.deepEqual(calls[calls.length - 3], [
     'inspect',
     '--format',
     '{{.State.Status}}',
@@ -175,8 +177,7 @@ test('start: failIfExists rejects existing volumes before creating a container',
     ok('28.0.0'),
     ok(''), // ps -a — no container
     fail('volume not found', 1), // agents absent
-    ok(), // creds exists
-    fail('volume not found', 1), // sessions absent
+    ok(), // sessions exists
   ]);
   const rc = new RuntimeContainer({
     backendKind: 'codex',
@@ -188,7 +189,7 @@ test('start: failIfExists rejects existing volumes before creating a container',
 
   await assert.rejects(
     rc.start(),
-    /runtime volumes already exist: vicoop-creds-codex.*container rm codex/s,
+    /runtime volumes already exist: vicoop-sessions-codex.*container rm codex/s,
   );
   assert.equal(calls.filter((c) => c[0] === 'image').length, 0);
   assert.equal(calls.filter((c) => c[0] === 'create').length, 0);
@@ -248,15 +249,18 @@ test('start: docker daemon unreachable surfaces an actionable error', async () =
 });
 
 test('stop: tolerates already-stopped containers', async () => {
-  const { run } = makeDockerFixture([
+  const { run, calls } = makeDockerFixture([...happyCreateResponses(),
     fail('Error: No such container: vicoop-runtime-codex', 1),
   ]);
   const rc = new RuntimeContainer({
     backendKind: 'codex',
+    createIfMissing: true,
     dockerRun: run,
   });
+  await rc.start();
   // Should not throw despite docker stop's non-zero exit.
   await rc.stop();
+  assert.ok(calls.some(args => args[0] === 'stop'));
 });
 
 test('Env carries VICOOP_BRIDGE_URL and optional skip-firewall toggle', async () => {
@@ -300,7 +304,6 @@ test('runtimeName selects container and volume names', async () => {
     volumeCreates.map((c) => c[c.length - 1]).sort(),
     [
       'vicoop-agents-work',
-      'vicoop-creds-work',
       'vicoop-sessions-work',
     ].sort(),
   );
@@ -309,6 +312,68 @@ test('runtimeName selects container and volume names', async () => {
   assert.ok(createCmd.includes('vicoop-runtime-work'));
   assert.ok(createCmd.includes('vicoop.name=work'));
   assert.ok(
-    createCmd.some((a) => a === 'type=volume,source=vicoop-creds-work,target=/data/creds/codex'),
+    createCmd.includes('CODEX_HOME=/data/sessions/codex/config'),
   );
+});
+
+for (const reason of ['never-started', 'exists', 'unsafe-boundary']) {
+  test(`cleanup does not stop a runtime that was not acquired: ${reason}`, async () => {
+    const calls: string[][] = [];
+    const runtime = new RuntimeContainer({backendKind: 'codex', failIfExists: reason === 'exists',
+      dockerRun(args) {
+        calls.push([...args]);
+        return ok(args[0] === 'version' ? '28' : args[0] === 'ps' ? 'existing-container' : '{}');
+      },
+    });
+    if (reason !== 'never-started') await assert.rejects(runtime.start());
+    await runtime.stop();
+    assert.ok(!calls.some(args => args[0] === 'stop' || args[0] === 'start' || args[0] === 'exec'));
+  });
+}
+
+test('cleanup stops an acquired runtime if firewall installation fails', async () => {
+  const calls: string[][] = [];
+  const runtime = new RuntimeContainer({backendKind: 'codex', dockerRun(args) {
+    calls.push([...args]);
+    if (args[0] === 'exec') return fail('firewall failed');
+    if (args.includes('{{json .}}')) return ok(JSON.stringify({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1','vicoop.name':'codex'},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN'],SecurityOpt:['no-new-privileges']},Mounts:[{Type:'volume',Name:'vicoop-agents-'+('codex'),Destination:'/data/agents/codex'},{Type:'volume',Name:'vicoop-sessions-'+('codex'),Destination:'/data/sessions/codex'},{Type:'tmpfs',Destination:'/data/creds/codex'}]}));
+    return ok(args[0] === 'version' ? '28' : args[0] === 'ps' ? 'existing-container' : 'running');
+  }});
+  await assert.rejects(runtime.start(), /firewall failed/);
+  await runtime.stop();
+  assert.equal(calls.filter(args => args[0] === 'stop').length, 1);
+});
+
+test('shutdown leaves an already-running reused runtime running', async () => {
+  const {run, calls} = makeDockerFixture([ok('28'), ok('existing'), ok('true'), ok('running')]);
+  const runtime = new RuntimeContainer({backendKind: 'codex', dockerRun: run});
+  await runtime.start();
+  await runtime.stop();
+  assert.ok(!calls.some(args => args[0] === 'start' || args[0] === 'stop'));
+});
+
+test('startup readiness failure releases the runtime started by this lifecycle', async () => {
+  const {run, calls} = makeDockerFixture([ok('28'), ok('existing'), ok('false'), ok(), ok('exited'), ok()]);
+  const runtime = new RuntimeContainer({backendKind: 'codex', dockerRun: run});
+  await assert.rejects(runtime.start(), /exited/);
+  assert.equal(calls.filter(args => args[0] === 'stop').length, 1);
+  await runtime.stop();
+  assert.equal(calls.filter(args => args[0] === 'stop').length, 1);
+});
+
+test('reuse rejects a missing or different workspace before starting or executing', async () => {
+  for (const source of [undefined, '/projectA']) {
+    const fixture = makeDockerFixture([ok('28'), ok('existing')]);
+    const runtime = new RuntimeContainer({backendKind: 'codex', workspaceDir: '/projectB',
+      dockerRun(args) {
+        const result = fixture.run(args);
+        if (!args.includes('{{json .}}')) return result;
+        const c = JSON.parse(result.stdout);
+        if (source) c.Mounts.push({Type: 'bind', Source: source, Destination: '/workspace'});
+        return ok(JSON.stringify(c));
+      },
+    });
+    await assert.rejects(runtime.start(), /workspace/);
+    assert.ok(!fixture.calls.some(args => ['start', 'stop', 'exec'].includes(args[0])));
+  }
 });
