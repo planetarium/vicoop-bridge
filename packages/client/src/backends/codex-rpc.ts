@@ -9,6 +9,8 @@ import type { Logger } from '../logger.js';
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface AppServerChildHandle {
+  /** Host-owned execution grant, supplied only by the container broker. */
+  readonly executionToken?: string;
   readonly stdin: NodeJS.WritableStream | null;
   readonly stdout: NodeJS.ReadableStream | null;
   readonly stderr: NodeJS.ReadableStream | null;
@@ -323,6 +325,12 @@ export class AppServerRpcError extends Error {
 // in `codex.ts` and consume `request` / `notify` /
 // `onNotification` / `onServerRequest` here.
 export class AppServerRpcClient {
+  async authenticateExecution(): Promise<void> {
+    const token = this.child?.executionToken;
+    if (token !== undefined) {
+      await this.request('account/login/start', {type: 'apiKey', apiKey: token});
+    }
+  }
   private readonly command: string;
   private readonly args: readonly string[];
   private readonly cwd?: string;

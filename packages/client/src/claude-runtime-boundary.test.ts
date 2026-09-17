@@ -1,16 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assertClaudeBrokerContainer } from './claude-runtime-boundary.js';
+import { assertBrokerContainer } from './execution-runtime-boundary.js';
 import { RuntimeContainer } from './runtime-container.js';
-const container = () => ({ Config: { User: 'node', Labels: { 'vicoop.claude-auth': 'stdio-v1', 'vicoop.name': 'work' },
+const container = () => ({ Config: { User: 'node', Labels: { 'vicoop.kind': 'claude', 'vicoop.claude-auth': 'stdio-v1', 'vicoop.name': 'work' },
   Env: ['CLAUDE_CONFIG_DIR=/data/sessions/claude/config'] },
-  HostConfig: { NetworkMode: 'default', SecurityOpt: ['no-new-privileges'] },
-  Mounts: [{ Type: 'volume', Name: 'vicoop-sessions-work', Destination: '/data/sessions/claude' }] });
+  HostConfig: { NetworkMode: 'default', CapAdd: ['NET_ADMIN', 'NET_RAW'], SecurityOpt: ['no-new-privileges'] },
+  Mounts: [{Type:'volume',Name:'vicoop-agents-'+('work'),Destination:'/data/agents/claude'},{Type:'volume',Name:'vicoop-sessions-'+('work'),Destination:'/data/sessions/claude'},{Type:'tmpfs',Destination:'/data/creds/claude'}] });
 
 test('reject legacy/unsafe runtime inspect without leaking credentials in diagnostics', () => {
-  assert.doesNotThrow(() => assertClaudeBrokerContainer(JSON.stringify(container())));
+  assert.doesNotThrow(() => assertBrokerContainer(JSON.stringify(container()), 'claude', 'work'));
   for (const mutate of [
     (c: any) => c.Config.Labels = {},
+    (c: any) => c.Mounts = [],
+    ...[0, 1, 2].map(index => (c: any) => c.Mounts.splice(index, 1)),
+    (c: any) => c.Config.Labels['vicoop.name'] = 'other',
+    (c: any) => c.Config.Env.push('GOOGLE_API_KEY=SECRET_VALUE'),
+    (c: any) => c.Config.Env.push('GEMINI_API_KEY=SECRET_VALUE'),
+    (c: any) => c.HostConfig.UsernsMode = 'host',
+    (c: any) => c.HostConfig.IpcMode = 'container:other',
+    (c: any) => c.HostConfig.DeviceRequests = [{Count: -1}],
     (c: any) => c.Config.Env.push('ANTHROPIC_API_KEY=SECRET_VALUE'),
     (c: any) => c.Mounts.push({Type:'volume',Destination:'/data/creds/claude'}),
     (c: any) => c.Mounts[0].Name = 'vicoop-creds-work',
@@ -18,10 +26,14 @@ test('reject legacy/unsafe runtime inspect without leaking credentials in diagno
     (c: any) => c.Config.User = '0',
     (c: any) => c.HostConfig.NetworkMode = 'container:other',
     (c: any) => c.HostConfig.CapAdd = ['SYS_ADMIN'],
+    (c: any) => c.HostConfig.CapAdd = [],
+    (c: any) => delete c.HostConfig.CapAdd,
     (c: any) => c.HostConfig.SecurityOpt = [],
+    ...['seccomp=unconfined', 'apparmor=unconfined', 'seccomp:unconfined', 'apparmor:unconfined'].map(option =>
+      (c: any) => c.HostConfig.SecurityOpt.push(option)),
   ]) {
     const c = container(); mutate(c);
-    assert.throws(() => assertClaudeBrokerContainer(JSON.stringify(c)), e => e instanceof Error && /migration/.test(e.message) && !e.message.includes('SECRET_VALUE'));
+    assert.throws(() => assertBrokerContainer(JSON.stringify(c), 'claude', 'work'), e => e instanceof Error && /migration/.test(e.message) && !e.message.includes('SECRET_VALUE'));
   }
 });
 
@@ -57,3 +69,69 @@ test('legacy runtime is rejected before start or any credential probe', async ()
   await assert.rejects(runtime.start(), /migration/);
   assert.ok(!calls.some(c => c[0] === 'start' || c[0] === 'exec'));
 });
+
+test('broker boundary allows custom seccomp and AppArmor profiles', () => {
+  const c = container();
+  c.HostConfig.SecurityOpt.push('seccomp=/etc/docker/restricted.json', 'apparmor=vicoop-restricted');
+  assert.doesNotThrow(() => assertBrokerContainer(JSON.stringify(c), 'claude', 'work'));
+});
+
+test('workspace comparison accepts canonical equivalents including symlinks', async () => {
+  const {mkdtempSync, mkdirSync, symlinkSync, rmSync} = await import('node:fs');
+  const {tmpdir} = await import('node:os');
+  const {join} = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'runtime-workspace-'));
+  try {
+    const source = join(dir, 'project');
+    const alias = join(dir, 'alias');
+    mkdirSync(source);
+    symlinkSync(source, alias);
+    const c = {...container(), Mounts: [...container().Mounts, {Type: 'bind', Source: source, Destination: '/workspace'}]};
+    assert.doesNotThrow(() => assertBrokerContainer(JSON.stringify(c), 'claude', 'work', alias));
+    assert.throws(() => assertBrokerContainer(JSON.stringify(c), 'claude', 'work', join(dir, 'other')), /workspace differs/);
+  } finally { rmSync(dir, {recursive: true, force: true}); }
+});
+
+for (const kind of ['claude', 'codex']) {
+  test(`broker runtime requires the matching backend label for ${kind}`, () => {
+    const raw = JSON.stringify(container())
+      .replaceAll('claude', kind)
+      .replace('CLAUDE_CONFIG_DIR', kind === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR');
+    assert.doesNotThrow(() => assertBrokerContainer(raw, kind, 'work'));
+
+    for (const label of [undefined, '', kind === 'claude' ? 'codex' : 'claude']) {
+      const c = JSON.parse(raw);
+      if (label === undefined) delete c.Config.Labels['vicoop.kind'];
+      else c.Config.Labels['vicoop.kind'] = label;
+      assert.throws(
+        () => assertBrokerContainer(JSON.stringify(c), kind, 'work'),
+        /runtime identity or broker authentication label mismatch/,
+      );
+    }
+  });
+}
+
+for (const kind of ['claude', 'codex']) {
+  test(`broker boundary validates Docker --tmpfs inspect entries for ${kind}`, () => {
+    const c = JSON.parse(
+      JSON.stringify(container())
+        .replaceAll('claude', kind)
+        .replace('CLAUDE_CONFIG_DIR', kind === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR'),
+    );
+    const credentialsPath = `/data/creds/${kind}`;
+    c.HostConfig.Tmpfs = { [credentialsPath]: 'rw,nosuid,nodev,mode=0700' };
+    c.Mounts = c.Mounts.filter((mount: { Type: string }) => mount.Type !== 'tmpfs');
+    const validate = () => assertBrokerContainer(JSON.stringify(c), kind, 'work');
+
+    assert.doesNotThrow(validate);
+    c.HostConfig.Tmpfs['/tmp'] = 'rw';
+    assert.doesNotThrow(validate);
+
+    delete c.HostConfig.Tmpfs[credentialsPath];
+    assert.throws(validate, /migration/);
+    c.HostConfig.Tmpfs[credentialsPath] = 'rw,nosuid,nodev,mode=0700';
+
+    c.HostConfig.Tmpfs[`/data/agents/${kind}`] = 'rw';
+    assert.throws(validate, /migration/);
+  });
+}

@@ -1,3 +1,4 @@
+import {createCodexExecutionBackend} from './codex-execution.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -2886,4 +2887,209 @@ test('codex backend resolveCapabilities tolerates a config.toml reader that thro
     openaiCompatModels: [{ id: 'gpt-5.5', default: true }],
   });
   backend.stop?.();
+});
+
+
+test('container Codex uses a fresh process per execution and resumes only after cleanup', async()=>{
+  const fake=makeFakeSpawn((_child,index)=>happyPath({threadId:`thread-${index}`}));
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0});
+  const frames:UpFrame[]=[];
+  const emit=(frame:UpFrame)=>{
+    if(frame.type==='task.complete') assert.ok(fake.lastChild().killed,'terminal emitted before cleanup');
+    frames.push(frame);
+  };
+  await backend.handle(assign('first'),emit,new AbortController().signal);
+  await backend.handle(assign('second'),emit,new AbortController().signal);
+  await backend.handle(assign('other','other-context'),emit,new AbortController().signal);
+  assert.equal(fake.children.length,3);
+  assert.equal((findRequest(fake.children[1].stdinFrames(),'thread/resume')?.params as any).threadId,'thread-0');
+  assert.ok(findRequest(fake.children[2].stdinFrames(),'thread/start'));
+  assert.ok(fake.children.every(c=>c.killed));
+  backend.stop?.();
+});
+
+test('container Codex authenticates the built-in provider before opening each thread', async()=>{
+  const fake=makeFakeSpawn((child,index)=>{
+    Object.defineProperty(child,'executionToken',{value:`vbc_exec_fixture_${index}`});
+    const scenario=happyPath();
+    let authenticated=false;
+    return {onLine(frame,c,i){
+      if(frame.method==='account/login/start') {
+        assert.deepEqual(frame.params,{type:'apiKey',apiKey:`vbc_exec_fixture_${index}`});
+        authenticated=true;
+        c.emitStdout({id:frame.id,result:{type:'apiKey'}});
+      } else {
+        if(frame.method==='thread/start'||frame.method==='thread/resume') assert.ok(authenticated);
+        scenario.onLine!(frame,c,i);
+      }
+    }};
+  });
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0});
+  for(const prompt of ['one','two']) await backend.handle(assign(prompt),()=>{},new AbortController().signal);
+  assert.equal(fake.children.length,2);
+  assert.ok(fake.children.every(c=>c.killed && findRequest(c.stdinFrames(),'account/login/start')));
+});
+
+test('container Codex fails closed when execution login is rejected', async()=>{
+  const fake=makeFakeSpawn(child=>{
+    Object.defineProperty(child,'executionToken',{value:'vbc_exec_fixture'});
+    const scenario=happyPath();
+    return {onLine(frame,c,i){
+      if(frame.method==='account/login/start') c.emitStdout({id:frame.id,error:{code:-32600,message:'login rejected'}});
+      else scenario.onLine!(frame,c,i);
+    }};
+  });
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0});
+  const frames:UpFrame[]=[];
+  await backend.handle(assign('one'),f=>frames.push(f),new AbortController().signal);
+  assert.equal(frames.at(-1)?.type,'task.fail');
+  assert.ok(fake.lastChild().killed);
+  assert.equal(findRequest(fake.lastChild().stdinFrames(),'thread/start'),null);
+});
+
+for (const rejectedMethod of ['initialize', 'account/login/start']) {
+  test(`container Codex waits for actual close after ${rejectedMethod} rejection`, async () => {
+    let killed!: () => void;
+    const killRequested = new Promise<void>(resolve => { killed = resolve; });
+    const fake = makeFakeSpawn((child, index) => {
+      const scenario = happyPath();
+      if (index !== 0) return scenario;
+      Object.defineProperty(child, 'executionToken', {value: 'vbc_exec_fixture'});
+      child.kill = () => { child.killed = true; killed(); return true; };
+      return {onLine(frame, c, i) {
+        if (frame.method === rejectedMethod) c.emitStdout({id: frame.id, error: {code: -32600, message: 'rejected'}});
+        else scenario.onLine!(frame, c, i);
+      }};
+    });
+    const backend = createCodexExecutionBackend({spawn: fake.spawn, heartbeatMs: 0});
+    const frames: UpFrame[] = [];
+    let returned = false;
+    const first = backend.handle(assign('first'), frame => frames.push(frame), new AbortController().signal)
+      .then(() => { returned = true; });
+    await killRequested;
+    const second = backend.handle(assign('second'), () => {}, new AbortController().signal);
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(returned, false, 'handle returned before supervisor close');
+      assert.ok(!frames.some(frame => frame.type === 'task.fail' || frame.type === 'task.complete'));
+      assert.equal(fake.children.length, 1, 'next execution started before supervisor close');
+    } finally {
+      fake.children[0].finish(1);
+      await Promise.all([first, second]);
+      backend.stop?.();
+    }
+    assert.equal(frames.at(-1)?.type, 'task.fail');
+    assert.equal(fake.children.length, 2);
+  });
+}
+
+test('container Codex cancels a process still initializing', async()=>{
+  const controller=new AbortController();
+  const fake=makeFakeSpawn(()=>({onLine(frame){if(frame.method==='initialize')queueMicrotask(()=>controller.abort());}}));
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0});
+  const frames:UpFrame[]=[];
+  await backend.handle(assign('cancel'),f=>frames.push(f),controller.signal);
+  assert.ok(fake.lastChild().killed);
+  assert.equal((frames.at(-1) as any).status.state,'canceled');
+  backend.stop?.();
+});
+
+test('container Codex capability failure waits for actual close', async () => {
+  let killed!: () => void;
+  const killRequested = new Promise<void>(resolve => { killed = resolve; });
+  const fake = makeFakeSpawn(child => {
+    child.kill = () => { child.killed = true; killed(); return true; };
+    return {onLine(frame, c) {
+      if (frame.method === 'initialize') c.emitStdout({id: frame.id, error: {code: -32600, message: 'rejected'}});
+    }};
+  });
+  const backend = createCodexExecutionBackend({spawn: fake.spawn});
+  let returned = false;
+  const probe = backend.resolveCapabilities!().then(() => { returned = true; });
+  await killRequested;
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(returned, false, 'capability probe returned before supervisor close');
+  } finally {
+    fake.lastChild().finish(1);
+    await probe;
+    backend.stop?.();
+  }
+});
+
+test('container Codex cancels a pending execution login', async()=>{
+  const controller=new AbortController();
+  const fake=makeFakeSpawn(child=>{
+    Object.defineProperty(child,'executionToken',{value:'vbc_exec_fixture'});
+    const scenario=happyPath();
+    return {onLine(frame,c,i){
+      if(frame.method==='account/login/start') queueMicrotask(()=>controller.abort());
+      else scenario.onLine!(frame,c,i);
+    }};
+  });
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0});
+  const frames:UpFrame[]=[];
+  await backend.handle(assign('cancel'),f=>frames.push(f),controller.signal);
+  assert.ok(fake.lastChild().killed);
+  assert.equal((frames.at(-1) as any).status.state,'canceled');
+  assert.equal(findRequest(fake.lastChild().stdinFrames(),'thread/start'),null);
+});
+
+test('container Codex allows independent contexts to execute concurrently', async()=>{
+  const fake=makeFakeSpawn((_child,index)=>{
+    const scenario=happyPath({threadId:`thread-${index}`});
+    return {onLine(frame,c,i){
+      if(frame.method==='turn/start' && index===0)setTimeout(()=>scenario.onLine!(frame,c,i),25);
+      else scenario.onLine!(frame,c,i);
+    }};
+  });
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0});
+  await Promise.all(['one','two'].map(context=>backend.handle(assign('hello',context),()=>{},new AbortController().signal)));
+  assert.equal(fake.children.length,2);assert.ok(fake.children.every(c=>c.killed));
+  backend.stop?.();
+});
+
+test('queued cancellation settles before predecessor closes without letting a successor overtake', async () => {
+  let killed!: () => void;
+  const killRequested = new Promise<void>(resolve => {killed = resolve;});
+  const fake = makeFakeSpawn((child, index) => {
+    if (index !== 0) return happyPath();
+    child.kill = () => {child.killed = true; killed(); return true;};
+    return {onLine(frame, c) {
+      if (frame.method === 'initialize') c.emitStdout({id: frame.id, error: {code: -32600, message: 'fixture rejection'}});
+    }};
+  });
+  const backend = createCodexExecutionBackend({spawn: fake.spawn, heartbeatMs: 0});
+  const first = backend.handle(assign('first'), () => {}, new AbortController().signal);
+  await killRequested;
+  const controller = new AbortController(), frames: UpFrame[] = [];
+  const second = backend.handle(assign('second'), f => frames.push(f), controller.signal);
+  const third = backend.handle(assign('third'), () => {}, new AbortController().signal);
+  controller.abort();
+  try {
+    await Promise.race([second, new Promise((_, reject) => setTimeout(() => reject(new Error('queued cancellation blocked')), 1000).unref())]);
+    assert.equal((frames.at(-1) as any).status.state, 'canceled');
+    assert.equal(frames.length, 1);
+    assert.equal(fake.children.length, 1);
+  } finally {
+    fake.children[0].finish(1);
+    await Promise.all([first, second, third]);
+    backend.stop?.();
+  }
+  assert.equal(fake.children.length, 2);
+});
+
+test('container cancellation during input mapping prevents subsequent app-server startup', async () => {
+  const controller=new AbortController();
+  const fake=makeFakeSpawn(()=>happyPath());
+  const backend=createCodexExecutionBackend({spawn:fake.spawn,heartbeatMs:0,
+    mkdtemp:async()=>{controller.abort();return '/tmp/fixture-mapped-image';},
+    writeFile:async()=>{},rm:async()=>{},
+  });
+  const task=assign('image');
+  task.message.parts.push({kind:'file',file:{mimeType:'image/png',bytes:'aGVsbG8='}});
+  const frames:UpFrame[]=[];
+  await backend.handle(task,f=>frames.push(f),controller.signal);
+  assert.equal(fake.children.length,0);
+  assert.equal((frames.at(-1) as any).status.state,'canceled');
 });

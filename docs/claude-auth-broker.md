@@ -41,9 +41,10 @@ Claude itself may retry a request; each attempt counts against the grant limit.
 Bedrock, Vertex, Foundry, custom Anthropic origins, `ANTHROPIC_AUTH_TOKEN`,
 container-local login and `apiKeyHelper` authentication are not supported by this
 mode. Do not pass authentication settings or secrets through agent settings,
-workspace files, prompts or mounted state. Host mode, Codex authentication and
+workspace files, prompts or mounted state. Host mode and
 the bundled-direct image keep their existing behavior; this broker does not
 make their provider credentials inaccessible to their agent processes.
+Codex external-runtime uses its own [host authentication broker](./codex-auth-broker.md).
 
 ## Fresh setup
 
@@ -52,7 +53,7 @@ the host bridge process. Then run:
 
 ```sh
 vicoop-client container init claude
-vicoop-client --backend claude --runtime container
+vicoop-client start --backend claude --runtime container
 ```
 
 `container init claude --from-host` is accepted for compatibility but does not
@@ -69,7 +70,7 @@ any workspace bind-mount path in your operational records. Then, replacing
 ```sh
 vicoop-client container remove claude --preserve-volumes
 vicoop-client container init claude --name claude --reuse-state --from-host
-vicoop-client --backend claude --runtime container --runtime-name claude
+vicoop-client start --backend claude --runtime container --runtime-name claude
 ```
 
 The explicit removal discards the old container's writable layer. Back up any

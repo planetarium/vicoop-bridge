@@ -1,13 +1,14 @@
+import {PROVIDER_ENV_PATTERN} from './provider-environment.js';
 // Runs INSIDE the workload. Contains no host credential or host destination.
 // JSON-lines multiplex raw HTTP sockets and the agent's stdio over docker exec.
 // Keep as source text so Bun-compiled clients need no extra runtime asset.
-export const CLAUDE_BROKER_RELAY = String.raw`
+export const EXECUTION_BROKER_RELAY = String.raw`
 'use strict';
 const net = require('node:net');
 const {spawn} = require('node:child_process');
 const fs = require('node:fs');
 const promptFiles = new Map();
-let promptDirectory, stagedBytes = 0;
+let promptDirectory, catalogPath, stagedBytes = 0;
 let child, server, next = 0, pending = '', started = false, closing = false;
 const sockets = new Map();
 function send(frame) {
@@ -56,10 +57,10 @@ function receive(m) {
     if (m.files && m.files.length) {
       promptDirectory = fs.mkdtempSync('/tmp/vicoop-prompt-');
       for (const file of m.files) {
-        if (![0,1].includes(file.id) || !Number.isInteger(file.argIndex) || file.argIndex < 1 || file.argIndex >= m.args.length) return shutdown(1);
+        if (![0,1].includes(file.id) || !Number.isInteger(file.argIndex) || (file.argIndex < 1 && !(m.backend==='codex' && file.argIndex===-1)) || file.argIndex >= m.args.length) return shutdown(1);
         const path = promptDirectory + '/prompt-' + file.id + '.txt';
         fs.writeFileSync(path,Buffer.concat(promptFiles.get(file.id) || []),{mode:0o600});
-        m.args[file.argIndex] = path;
+        if(file.argIndex===-1)catalogPath=path;else m.args[file.argIndex] = path;
       }
       promptFiles.clear();
     }
@@ -78,13 +79,25 @@ function receive(m) {
       // provider overrides so a custom image cannot redirect the selected API.
       const env = {...process.env};
       for (const k of Object.keys(env)) {
-        if (/^(ANTHROPIC_|CLAUDE_CODE_OAUTH|CLAUDE_CODE_USE_)/.test(k)) delete env[k];
+        if (${PROVIDER_ENV_PATTERN}.test(k) || /^(CODEX_|VICOOP_EXECUTION_TOKEN$)/.test(k)) delete env[k];
       }
-      Object.assign(env, m.env, {
-        ANTHROPIC_BASE_URL:'http://127.0.0.1:' + server.address().port,
-        ...(m.authentication === 'api-key' ? {ANTHROPIC_API_KEY:m.token} : {CLAUDE_CODE_OAUTH_TOKEN:m.token}),
-        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',
-      });
+      Object.assign(env, m.env);
+      if(m.backend==='codex') {
+        env.CODEX_HOME='/data/sessions/codex/config';
+        fs.mkdirSync(env.CODEX_HOME,{recursive:true,mode:0o700});
+        const base='http://127.0.0.1:'+server.address().port;
+        // Authentication is initialized in memory through account/login/start.
+        // No provider token is placed in the workload environment or on disk.
+        m.args.push('-c','model_provider="openai"','-c','openai_base_url='+JSON.stringify(base));
+        if(catalogPath)m.args.push('-c','model_catalog_json='+JSON.stringify(catalogPath));
+        m.args.push('-c','features.enable_request_compression=false','-c','cli_auth_credentials_store="ephemeral"');
+      } else {
+        Object.assign(env, {
+          ANTHROPIC_BASE_URL:'http://127.0.0.1:' + server.address().port,
+          ...(m.authentication === 'api-key' ? {ANTHROPIC_API_KEY:m.token} : {CLAUDE_CODE_OAUTH_TOKEN:m.token}),
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',
+        });
+      }
       child = spawn(m.command, m.args, {cwd:m.cwd, env, detached:true, stdio:['pipe','pipe','pipe']});
       child.stdout.on('data', data => send({t:'stdout', data:data.toString('base64')}));
       child.stderr.on('data', data => send({t:'stderr', data:data.toString('base64')}));

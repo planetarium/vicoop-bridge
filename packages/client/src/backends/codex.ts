@@ -12,7 +12,6 @@ import {
   appendCallerContextInstruction,
   callerContextSessionKey,
   neutralizeCallerContextMarkers,
-  renderCallerContext,
   wrapUserMessageWithCallerContext,
 } from '../caller-context.js';
 import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
@@ -60,6 +59,7 @@ export type CodexSandboxMode = SandboxMode;
 export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline';
 
 export interface CodexBackendOptions {
+  supportedModelIds?: readonly string[];
   command?: string;
   appServerArgs?: readonly string[];
   cwd?: string;
@@ -440,12 +440,6 @@ function commandExecutionSummary(item: Extract<ThreadItem, { type: 'commandExecu
   return clipTo(output ? `${head}\n${output}` : head, COMMAND_TRACE_MAX_CHARS);
 }
 
-interface PreparedInput {
-  input: UserInputItem[];
-  tempDir: string | null;
-  instructions: string | null;
-}
-
 // Convert mapped prompt + image files to the app-server `UserInput[]` shape.
 // Order: user text → images appended. Tool-call history is no longer
 // folded into the user text — see `historyToInjectItems`, which puts it
@@ -669,7 +663,7 @@ function extractAgentMessageDelta(params: unknown): string {
 
 export function createCodexBackend(
   opts: CodexBackendOptions = {},
-): Backend {
+): Backend & {close():Promise<void>} {
   const command = opts.command ?? 'codex';
   const appServerArgs = opts.appServerArgs ?? ['app-server'];
   const cwd = opts.cwd;
@@ -709,7 +703,7 @@ export function createCodexBackend(
   // codex builds, app-server transport failure, advertise dropped — so
   // validation is again skipped. Non-empty Set = the visible model ids
   // (plus any operator-pinned override the agent card surfaces).
-  let cachedSupportedModelIds: Set<string> | null | undefined = undefined;
+  let cachedSupportedModelIds: Set<string> | null | undefined = opts.supportedModelIds ? new Set(opts.supportedModelIds) : undefined;
 
   // contextId → (threadId, lastUsedAt). writeId-protected rollback so a
   // concurrent task on the same contextId doesn't get its session entry
@@ -755,8 +749,10 @@ export function createCodexBackend(
   }
 
   let rpcClient: AppServerRpcClient | null = null;
+  // Failed initialization can reject before the Docker supervisor closes.
+  // Retain every live client until close so execution teardown can await it.
+  const liveClients = new Set<AppServerRpcClient>();
   let initInFlight: Promise<AppServerRpcClient> | null = null;
-  let serverInfo: InitializeResult | null = null;
 
   // Per-thread handlers for `item/tool/call` (codex's native-function-call
   // server request). Registered by the active `handle()` after thread/start
@@ -826,15 +822,16 @@ export function createCodexBackend(
       });
       try {
         c.start();
+        liveClients.add(c);
       } catch (err) {
         initInFlight = null;
         throw err;
       }
       // Clear singleton on crash so the next task respawns.
       void c.waitForClose().then(() => {
+        liveClients.delete(c);
         if (rpcClient === c) {
           rpcClient = null;
-          serverInfo = null;
         }
       });
       try {
@@ -854,13 +851,13 @@ export function createCodexBackend(
           // independently so this opt-in remains safe across upgrades.
           capabilities: { experimentalApi: true },
         };
-        const result = await withTimeout(
+        await withTimeout(
           c.request<InitializeResult>('initialize', initParams),
           initializeTimeoutMs,
           'initialize timed out',
         );
         c.notify('initialized');
-        serverInfo = result;
+        await withTimeout(c.authenticateExecution(), initializeTimeoutMs, 'execution authentication timed out');
         rpcClient = c;
         return c;
       } catch (err) {
@@ -873,7 +870,7 @@ export function createCodexBackend(
       } finally {
         initInFlight = null;
       }
-    })();
+    })().finally(()=>{initInFlight=null;});
     return initInFlight;
   }
 
@@ -990,10 +987,14 @@ export function createCodexBackend(
     // SIGINT/SIGTERM it would be re-parented to init and linger after the
     // daemon exits (issue #186). Best-effort SIGTERM; the OS delivers it
     // before `process.exit` runs even though we don't await the close.
+    async close() {
+      const clients = [...liveClients];
+      for (const c of clients) c.kill();
+      await Promise.all(clients.map(c => c.waitForClose()));
+    },
+
     stop(): void {
-      if (rpcClient && !rpcClient.isClosed()) {
-        rpcClient.kill('SIGTERM');
-      }
+      for (const c of liveClients) c.kill('SIGTERM');
     },
 
     async handle(task, rawEmit, signal) {
@@ -1129,7 +1130,6 @@ export function createCodexBackend(
         // compete with. Plain-task mode (no openai-compat metadata) keeps
         // the directive because that's the actual a2a-agent surface the
         // mention can land on.
-        const callerPrompt = renderCallerContext(task.caller);
         const systemPrompt = appendCallerContextInstruction(
           envelope
             ? composeNativeDevInstructions(envelopeSystem, envelopeToolChoice)
@@ -1205,6 +1205,10 @@ export function createCodexBackend(
               ]
             : buildUserInput(callerUserPrompt, mapped.imageFiles);
 
+          if (signal.aborted) {
+            emit({type:'task.complete',taskId:task.taskId,status:{state:'canceled',timestamp:new Date().toISOString()}});
+            return;
+          }
           let client: AppServerRpcClient;
           try {
             client = await ensureClient();
@@ -1775,6 +1779,7 @@ export function createCodexBackend(
               }, 2_000);
             };
             signal.addEventListener('abort', onAbort);
+            if (signal.aborted) onAbort();
 
             // Shared liveness heartbeat — see heartbeat.ts. Routes through the
             // wrapped `emit` so a heartbeat refreshes the silence window;

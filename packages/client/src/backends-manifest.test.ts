@@ -36,3 +36,8 @@ test('every compat entry has a non-empty supportedRange', () => {
     assert.notEqual(entry.supportedRange.trim(), '', `${kind}: range must be non-empty`);
   }
 });
+
+test('Codex advertises the stricter external-runtime range without changing host compatibility', () => {
+  assert.equal(BACKEND_COMPAT.codex.supportedRange, '>=0.100.0');
+  assert.equal(BACKEND_COMPAT.codex.externalRuntimeSupportedRange, '>=0.153.4');
+});

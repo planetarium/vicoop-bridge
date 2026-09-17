@@ -7,10 +7,9 @@ allowed-tools: Bash
 # Fork-into-Container
 
 This skill is a thin layer on top of `vicoop-client container init`.
-Upstream already handles **auth, image, and volume lifecycle** — it pulls
-the operator's host creds (macOS Keychain or `~/.claude/.credentials.json`
-or `~/.codex/auth.json`) straight into the runtime container's named
-volume. What upstream intentionally does **not** carry is the operator's
+Upstream already handles **auth, image, and volume lifecycle**. It validates
+the operator's credentials on the host and uses the authentication broker
+without copying provider credentials into the runtime. What upstream intentionally does **not** carry is the operator's
 *harness* — `skills/`, sub-agents, slash-commands, the project memory
 file. That gap is what this skill fills.
 
@@ -94,8 +93,9 @@ Optional env overrides:
 
 1. Detect parent kind from env / `~/.claude` vs `~/.codex` presence.
 2. If `vicoop-runtime-<kind>` is **not** present at all, invoke
-   `vicoop-client container init <kind> --from-host`. Upstream pulls
-   creds, installs the agent CLI, compat-checks the version, and (per
+   `vicoop-client container init <kind> --from-host`. Upstream
+   validates host credentials without copying them, installs the agent CLI,
+   compat-checks the version, and (per
    #271) leaves the container stopped.
 3. Capture the container's running state. If stopped, `docker start`
    it for the inject window; restore it to its original state on exit
@@ -106,11 +106,14 @@ Optional env overrides:
      `AGENTS.md` has no equivalent directive) or `AGENTS.md`
    - Defensive `find -delete` for credential-shaped names and macOS
      AppleDouble `._*` sidecars.
-5. `tar -C $STAGE --no-xattrs -cf - . | docker exec -i -u node $CONTAINER bash -c "tar -C /data/creds/<kind> -xf -"`.
+5. Create `/data/sessions/<kind>/config` as `node` if absent, then tar-pipe
+   the staged harness into that directory. This is the runtime's
+   `CODEX_HOME` / `CLAUDE_CONFIG_DIR` on its persistent sessions volume;
+   `/data/creds/<kind>` is temporary and must not hold the harness.
    Tar-pipe (not `docker cp`) so the extract runs as the `node` user
    and the agent CLI can traverse the files immediately.
 6. Print the daemon-start command:
-   `vicoop-client --backend <kind> --runtime container --runtime-name <kind>`
+   `vicoop-client start --backend <kind> --runtime container --runtime-name <kind>`
 7. Emit `{container, runtime_name, kind, injected_into}` JSON for the
    parent agent to chain off of.
 
@@ -137,3 +140,5 @@ external-runtime profile + `container init --from-host` removed every
 one of those — bridge auth lives in the host bridge client (it never
 enters the container at all), and backend auth is auto-pulled. This
 skill now just plugs the one remaining gap.
+
+The script runs `vicoop-client container validate <kind>` before starting or injecting into a runtime. Legacy credential-mounted runtimes are rejected; follow the explicit `--preserve-volumes` / `--reuse-state` migration instructions, including the original workspace mount when present.

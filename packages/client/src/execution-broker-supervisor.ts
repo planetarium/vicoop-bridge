@@ -2,7 +2,7 @@
 // workload frames or executes workload-supplied commands as root. The relay
 // and all agent tools run as uid/gid 1000. Even setsid/double-fork descendants
 // are adopted by this execution's tini, not container PID 1.
-export const CLAUDE_BROKER_SUPERVISOR = String.raw`
+export const EXECUTION_BROKER_SUPERVISOR = String.raw`
 'use strict';
 const fs = require('node:fs');
 const {spawn} = require('node:child_process');

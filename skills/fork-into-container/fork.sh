@@ -5,8 +5,8 @@
 #
 # Auth, image, volume lifecycle are all delegated to upstream:
 #   `vicoop-client container init <kind> --from-host`
-# already reads creds from the host Keychain / disk and copies them
-# into the runtime container's creds volume. This script's only job is
+# validates credentials on the host; the authentication broker keeps them
+# outside the runtime. This script's only job is
 # to top-up the *harness* pieces that upstream intentionally doesn't
 # carry.
 #
@@ -66,7 +66,7 @@ command -v vicoop-client  >/dev/null 2>&1 || die "vicoop-client not found in PAT
 docker info >/dev/null 2>&1 || die "docker daemon not reachable"
 
 CONTAINER="vicoop-runtime-$KIND"
-TARGET="/data/creds/$KIND"
+TARGET="/data/sessions/$KIND/config"
 
 # ── ensure runtime container exists (delegates auth + image + volume) ──────
 if docker inspect "$CONTAINER" >/dev/null 2>&1; then
@@ -74,6 +74,17 @@ if docker inspect "$CONTAINER" >/dev/null 2>&1; then
 else
     log "runtime container absent — bootstrapping via vicoop-client container init"
     vicoop-client container init "$KIND" --from-host
+fi
+
+# Validate both reused and freshly initialized runtimes through the same
+# host-side boundary check as the daemon.
+if ! vicoop-client container validate "$KIND"; then
+    log "ERROR: runtime boundary validation failed. Harness injection has not started."
+    log "For a legacy runtime, explicitly run:"
+    log "  vicoop-client container remove \"$KIND\" --preserve-volumes"
+    log "  vicoop-client container init \"$KIND\" --reuse-state"
+    log "Include the original --workspace path in container init if mounted."
+    exit 1
 fi
 
 # ── bring container up only for the inject window ────────────────────────
@@ -101,7 +112,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ── stage curated harness ─────────────────────────────────────────────────
-# Allowlist only — credentials live in upstream's --from-host path,
+# Allowlist only — credentials stay with the host authentication broker,
 # session/project state stays host-side on purpose.
 STAGE="$(mktemp -d -t vicoop-fork.XXXXXX)"
 log "staging at: $STAGE"
@@ -187,7 +198,7 @@ fi
 # inline; cheap insurance on top of the allowlist. The `._*` entries
 # are macOS AppleDouble sidecars that BSD tar emits for extended
 # attributes; GNU tar inside the container treats them as ordinary
-# files and would pollute the creds dir.
+# files and would pollute the agent config dir.
 find "$STAGE" \( \
     -iname 'credentials*' -o \
     -iname '.credentials*' -o \
@@ -210,14 +221,14 @@ if [[ -n "$(ls -A "$STAGE" 2>/dev/null || true)" ]]; then
     # would otherwise warn about for every file). No-op on Linux hosts.
     COPYFILE_DISABLE=1 tar --no-xattrs -C "$STAGE" -cf - . \
         | docker exec -i -u node "$CONTAINER" \
-              bash -c "tar -C '$TARGET' -xf -"
+              /bin/sh -c 'mkdir -p "$1" && tar -C "$1" -xf -' sh "$TARGET"
 else
     log "nothing to inject (source has no skills/agents/commands/$MEMORY_FILE)"
 fi
 
 log ""
 log "done. start the bridge daemon (in another shell) with:"
-log "    vicoop-client --backend $KIND --runtime container --runtime-name $KIND"
+log "    vicoop-client start --backend $KIND --runtime container --runtime-name $KIND"
 
 printf '{"container":"%s","runtime_name":"%s","kind":"%s","injected_into":"%s"}\n' \
     "$CONTAINER" "$KIND" "$KIND" "$TARGET"
