@@ -116,8 +116,11 @@ and preserving workspace data through restart/recreation with explicit reset.
 The real-provider image used Claude 2.1.265 and Codex 0.153.4 with immutable ID
 `sha256:ab348b2048480c3f3f4e3bd3ab7e61c8a57b06d507800589bed48b56752ed55e`.
 It reused locally installed native binaries because the Docker VM was nearly
-full. The committed production recipe pins Claude 2.1.267; its complete clean
-build is still unverified. Actual-provider validation used host OAuth on macOS
+full. After authorized unused build-cache cleanup, the committed production
+recipe also built successfully with `--no-cache` (Claude 2.1.267 / Codex 0.153.4),
+producing `sha256:4d2cef92d3fbb25c5b1af7c71ea7d8b814eb5048731e09282ad53582b0507ed1`.
+Both backend lifecycle checks and the Bun-compiled real-provider tests
+(including observed-tool cancellation) passed on this image. Actual-provider validation used host OAuth on macOS
 Docker; native Linux and provider API-key calls are not established by these runs.
 The full CLI transport tests use deterministic providers; real model tests call
 the runtime directly. Strict disk quotas and the remaining unchecked combined
