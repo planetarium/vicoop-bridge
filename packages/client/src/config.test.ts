@@ -544,10 +544,24 @@ test('readConfig/writeConfig default to resolveConfigDir() when no path passed',
 });
 
 
-test('reserved caller-container runtime survives normalization so startup can reject it', (t) => {
+test('caller-container runtime survives normalization', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-isolation-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const path = join(dir, 'config.json');
   writeFileSync(path, JSON.stringify({ backends: { claude: { runtime: 'caller-container' } } }));
   assert.equal(readConfig(path)?.backends?.claude?.runtime, 'caller-container');
+});
+
+
+test('caller runtime configuration is retained and invalid limits fail closed', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'caller-config-'));
+  t.after(() => rmSync(dir, {recursive:true,force:true}));
+  const path = join(dir, 'config.json');
+  const caller_runtime = {image:`sha256:${'a'.repeat(64)}`,stateDirectory:join(dir,'state')};
+  for (const kind of ['claude','codex']) {
+    writeFileSync(path,JSON.stringify({backends:{[kind]:{runtime:'caller-container',caller_runtime}}}));
+    assert.equal((readConfig(path)?.backends as any)[kind].caller_runtime.image,caller_runtime.image);
+    writeFileSync(path,JSON.stringify({backends:{[kind]:{runtime:'caller-container',caller_runtime:{...caller_runtime,maxScopes:0}}}}));
+    assert.throws(() => readConfig(path));
+  }
 });

@@ -1974,3 +1974,28 @@ test('a replacement assignment suppresses the older run with the same taskId', a
     await closeServer(server, wss);
   }
 });
+
+test('isolated backend refuses legacy and R1-only servers before dispatch', async () => {
+  for (const r1 of [false, true]) {
+    const server = createServer(); const wss = new WebSocketServer({ server });
+    const url = await listen(server); let calls = 0; let fatal = false; let advertised: string[] = [];
+    wss.on('connection', (ws) => {
+      ws.on('message', (raw) => {
+        const frame = parseUpFrame(raw.toString());
+        if (frame.type !== 'hello') return;
+        advertised = frame.protocolCapabilities ?? [];
+        if (r1) ws.send(encodeFrame({ type: 'hello.ack', protocolCapabilities: [TASK_REPLAY_CAPABILITY, 'execution-scope-v1'], disconnectGraceMs: 1000, maxFrameBytes: 1024 * 1024 }));
+        else ws.send(encodeFrame(makeAssign('legacy')));
+      });
+    });
+    const client = new Client({ serverUrl: url, token: 't', agentId: 'a', backendKind: 'claude', heartbeatIntervalMs: 0,
+      backend: { name: 'isolated', requiresCallerScope: true, handle: async () => { calls++; } },
+      onFatal: () => { fatal = true; },
+    });
+    try {
+      client.start(); await waitFor(() => fatal, 'expected fail-closed negotiation');
+      assert.ok(advertised.includes('caller-runtime-v1')); assert.ok(advertised.includes('execution-scope-v1'));
+      assert.equal(calls, 0);
+    } finally { client.stop(); await closeServer(server, wss); }
+  }
+});

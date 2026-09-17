@@ -215,3 +215,9 @@ Agents SDK, Daytona ships Kata/Sysbox as the upgrade tier. Configure the
 runtime per your orchestrator's documentation (Docker daemon
 `runtimes`, k8s RuntimeClass, etc.) — the bridge client image works
 unchanged.
+
+## Dedicated caller runtimes
+
+For opt-in Claude/Codex per-user containers and persistent workspace/session
+volumes, see [caller runtime configuration and limits](caller-runtime.md).
+This mode requires server-verified caller scope and uses the shared host brokers.

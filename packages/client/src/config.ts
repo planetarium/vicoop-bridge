@@ -1,3 +1,5 @@
+import { CallerRuntimeConfig } from './caller-runtime-config.js';
+import type { z } from 'zod';
 // Single source of truth for the `vicoop-client` daemon: a JSON config file
 // living under the client's canonical home directory (see resolveConfigDir).
 //
@@ -156,6 +158,7 @@ export interface ClaudeBackendConfig {
   retry_narrated_tool_call?: boolean;
   runtime?: BackendRuntime;
   runtime_name?: string;
+  caller_runtime?: z.input<typeof CallerRuntimeConfig>;
 }
 
 export interface CodexBackendConfig {
@@ -165,6 +168,7 @@ export interface CodexBackendConfig {
   approval_decision?: 'accept' | 'acceptForSession' | 'decline';
   runtime?: BackendRuntime;
   runtime_name?: string;
+  caller_runtime?: z.input<typeof CallerRuntimeConfig>;
 }
 
 export interface OpenclawBackendConfig {
@@ -335,6 +339,7 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const model = asString(claudeRaw.model);
       const models = asStringArray(claudeRaw.supported_models);
       const runtime = pickBackendRuntime(claudeRaw.runtime);
+      const callerRuntime = claudeRaw.caller_runtime === undefined ? undefined : CallerRuntimeConfig.parse(claudeRaw.caller_runtime);
       const runtimeName = asString(claudeRaw.runtime_name);
       if (cwd || settings || model || models || runtime || runtimeName) {
         out.claude = {};
@@ -344,6 +349,7 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
         if (models) out.claude.supported_models = models;
         if (runtime) out.claude.runtime = runtime;
         if (runtimeName) out.claude.runtime_name = runtimeName;
+        if (callerRuntime) out.claude.caller_runtime = callerRuntime;
       }
     }
     const codexRaw = asRecord(backends.codex);
@@ -358,6 +364,7 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
           ? (approvalRaw as 'accept' | 'acceptForSession' | 'decline')
           : undefined;
       const runtime = pickBackendRuntime(codexRaw.runtime);
+      const callerRuntime = codexRaw.caller_runtime === undefined ? undefined : CallerRuntimeConfig.parse(codexRaw.caller_runtime);
       const runtimeName = asString(codexRaw.runtime_name);
       if (cwd || validSandbox || validApproval || runtime || runtimeName) {
         out.codex = {};
@@ -366,6 +373,7 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
         if (validApproval) out.codex.approval_decision = validApproval;
         if (runtime) out.codex.runtime = runtime;
         if (runtimeName) out.codex.runtime_name = runtimeName;
+        if (callerRuntime) out.codex.caller_runtime = callerRuntime;
       }
     }
     const vcRaw = asRecord(backends['vicoop-codex']);

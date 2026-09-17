@@ -35,11 +35,16 @@ import { atomicWriteFile } from './fs-util.js';
 const PID_FILENAME = 'vicoop.pid';
 const LOG_FILENAME = 'vicoop.log';
 
+export const CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS = 120_000;
+const STOP_EXIT_MARGIN_MS = 5_000;
+
 // On-disk pidfile shape. Written by the *parent* immediately after fork
 // (it already holds the child pid), which sidesteps the classic
 // Type=forking race where a supervisor reads the pidfile before the child
 // has written it.
 export interface PidRecord {
+  // Launch-time cleanup budget; optional for compatibility with older daemons.
+  shutdownTimeoutMs?: number;
   pid: number;
   // ms-epoch wall clock at spawn. Used for the `status` uptime readout and
   // as a diagnostic — deliberately NOT the PID-reuse guard (wall clock is
@@ -94,6 +99,9 @@ export function readPidRecord(path: string = pidFilePath()): PidRecord | null {
   }
   return {
     pid: o.pid,
+    ...(typeof o.shutdownTimeoutMs === 'number' && Number.isSafeInteger(o.shutdownTimeoutMs) &&
+      o.shutdownTimeoutMs > 0 && o.shutdownTimeoutMs <= CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS
+      ? { shutdownTimeoutMs: o.shutdownTimeoutMs } : {}),
     startedAt: typeof o.startedAt === 'number' ? o.startedAt : 0,
     argv: Array.isArray(o.argv)
       ? o.argv.filter((x): x is string => typeof x === 'string')
@@ -322,7 +330,6 @@ export async function stopDaemon(
   } = {},
 ): Promise<StopResult> {
   const path = opts.path ?? pidFilePath();
-  const termGraceMs = opts.termGraceMs ?? 10_000;
   const pollMs = opts.pollMs ?? 200;
   const probe = opts.probe ?? defaultProbe;
   const wait = opts.wait ?? sleep;
@@ -339,6 +346,11 @@ export async function stopDaemon(
     return { outcome: 'already-gone', pid: state.record.pid };
   }
 
+  // Read the recorded budget, not today's config: stop must honor the mode
+  // actually launched even if configuration was edited in the meantime.
+  const termGraceMs = opts.termGraceMs ??
+    (state.record.shutdownTimeoutMs !== undefined
+      ? state.record.shutdownTimeoutMs + STOP_EXIT_MARGIN_MS : 10_000);
   const pid = state.record.pid;
   try {
     kill(pid, 'SIGTERM');

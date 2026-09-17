@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { callerStateCmd, runCallerState } from './caller-runtime-admin.js';
+import { createCallerRuntime } from './caller-runtime.js';
 import { createCodexCredentialReader, createCodexAuthBroker, CODEX_BROKER_VERSION_RANGE, isSupportedCodexBrokerVersion, loadCodexModelCatalog } from './codex-auth-broker.js';
 import { createExecutionBrokerSpawn } from './execution-broker-spawn.js';
 import { createCodexExecutionBackend } from './backends/codex-execution.js';
@@ -10,7 +12,7 @@ import { createClaudeCredentialReader, assertClaudeBrokerSettings } from './clau
 import { createClaudeBrokerSpawn } from './claude-broker-spawn.js';
 import { closeSync, existsSync, openSync, readFileSync } from 'node:fs';
 import { spawn as spawnProcess, type ChildProcess } from 'node:child_process';
-import { AgentCard } from '@vicoop-bridge/protocol';
+import { AgentCard, OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import { resolveBundledCard } from './bundled-cards.js';
 import { group, longestMatch, object } from '@optique/core/constructs';
 import { optional, withDefault } from '@optique/core/modifiers';
@@ -72,6 +74,7 @@ import {
 } from './cli-args.js';
 import { createLogger, type Logger } from './logger.js';
 import {
+  CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS,
   claimPidFile,
   defaultLogPath,
   detachChildArgv,
@@ -235,7 +238,7 @@ const cli = longestMatch(
   group('Run the daemon', longestMatch(startCmd, stopCmd, statusCmd)),
   group('Identity', authCmd),
   group('Agents', agentCmd),
-  group('Runtime containers', containerCmd),
+  group('Runtime containers', longestMatch(containerCmd, callerStateCmd)),
   group('Maintenance', longestMatch(upgradeCmd, infoCmd)),
   // Hidden by `hidden: 'help'` on each command; kept in the parser tree
   // for back-compat and "did you mean?" suggestions. Sit outside the
@@ -408,6 +411,16 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       const baseSettings = args.claudeSettingsFile
         ? readClaudeSettingsFile(args.claudeSettingsFile)
         : backends.claude?.settings;
+      if (args.runtime === 'caller-container') {
+        if (args.cwd || args.runtimeName) throw new Error('caller-container owns its workspace and runtime names');
+        const backend = await createCallerRuntime({kind:'claude',agentId:args.agentId,
+          config:backends.claude?.caller_runtime,claude:{
+            identity:deriveIdentity(args.agentId,args.server) ?? undefined,
+            settings:disableClaudeSandboxGuard(baseSettings),model:args.claudeModel,
+            claudeReasoning:args.claudeReasoning,claudeThinkingBudget:args.claudeThinkingBudget,
+          }});
+        return {backend,shutdown:()=>backend.close()};
+      }
       if (args.runtime === 'container') assertClaudeBrokerSettings(baseSettings);
       const { spawn, cwd, runtime } = await resolveRuntime({
         kind: 'claude',
@@ -445,6 +458,16 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };
     }
     case 'codex': {
+      if (args.runtime === 'caller-container') {
+        if (args.cwd || args.runtimeName) throw new Error('caller-container owns its workspace and runtime names');
+        const backend = await createCallerRuntime({kind:'codex',agentId:args.agentId,
+          config:backends.codex?.caller_runtime,codex:{
+            appServerArgs:callerCodexArgs(),
+            identity:deriveIdentity(args.agentId,args.server) ?? undefined,
+            approvalDecision:backends.codex?.approval_decision as ApprovalDecision | undefined,
+          }});
+        return {backend,shutdown:()=>backend.close()};
+      }
       const { spawn, cwd, runtime } = await resolveRuntime({
         kind: 'codex',
         runtime: args.runtime,
@@ -494,6 +517,12 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         `unknown backend: ${name} (supported: echo, openclaw, claude, codex, vicoop-codex)`,
       );
   }
+}
+
+function callerCodexArgs(): string[] {
+  let model: string | null = null;
+  try { model=parseCodexConfigTomlForModel(readFileSync(join(process.env.CODEX_HOME || join(homedir(),'.codex'),'config.toml'),'utf8')).model; } catch {}
+  return ['app-server',...(model ? ['-c',`model=${JSON.stringify(model)}`] : [])];
 }
 
 // Resolves the runtime mode for a claude/codex backend.
@@ -584,6 +613,7 @@ const SHUTDOWN_TIMEOUT_MS = 15_000;
 async function runWithShutdownTimeout(
   shutdown: () => Promise<void>,
   logger: Logger,
+  timeoutMs = SHUTDOWN_TIMEOUT_MS,
 ): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
   try {
@@ -591,9 +621,9 @@ async function runWithShutdownTimeout(
       shutdown(),
       new Promise<void>((resolve) => {
         timer = setTimeout(() => {
-          logger.warn(`runtime shutdown exceeded ${SHUTDOWN_TIMEOUT_MS}ms; exiting anyway`);
+          logger.warn(`runtime shutdown exceeded ${timeoutMs}ms; exiting anyway`);
           resolve();
-        }, SHUTDOWN_TIMEOUT_MS);
+        }, timeoutMs);
       }),
     ]);
   } finally {
@@ -660,6 +690,9 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     ? JSON.parse(readFileSync(args.card, 'utf8'))
     : resolveBundledCard(args.backend);
   const agentCard = raw ? AgentCard.parse(raw) : undefined;
+  if (args.runtime === 'caller-container' && agentCard?.capabilities?.extensions) {
+    agentCard.capabilities.extensions = agentCard.capabilities.extensions.filter(e=>e.uri!==OPENAI_COMPAT_EXTENSION_URI);
+  }
 
   // Emit the resolved backend at startup so operators can verify which
   // backend the precedence chain picked (flag vs. config vs. default
@@ -687,7 +720,11 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     // failure instead of masking it as a transient disconnect. The
     // Client class deliberately does not call process.exit itself —
     // tests and future in-process embedders pass a non-exiting callback.
-    onFatal: () => process.exit(1),
+    onFatal: () => {
+      if (backendShutdown) void runWithShutdownTimeout(backendShutdown, logger,
+        backend.requiresCallerScope ? CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS : SHUTDOWN_TIMEOUT_MS).finally(()=>process.exit(1));
+      else process.exit(1);
+    },
   });
 
   client.start();
@@ -714,14 +751,14 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     void (async () => {
       logger.info(`shutting down (${signal})`);
       client.stop();
-      if (ownsPidFile) removePidFile();
       if (backendShutdown) {
         try {
-          await runWithShutdownTimeout(backendShutdown, logger);
+          await runWithShutdownTimeout(backendShutdown, logger, backend.requiresCallerScope ? CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS : SHUTDOWN_TIMEOUT_MS);
         } catch (err) {
           logger.error('shutdown error:', (err as Error).message);
         }
       }
+      if (ownsPidFile) removePidFile();
       process.exit(0);
     })();
   };
@@ -820,6 +857,8 @@ async function startDetached(
     process.exit(1);
   }
 
+  const shutdownBudget = resolveDaemonArgs(parsed).runtime === 'caller-container'
+    ? {shutdownTimeoutMs: CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS} : {};
   const path = pidFilePath();
   const logPath = parsed.logFile?.trim() || defaultLogPath();
 
@@ -829,6 +868,7 @@ async function startDetached(
   // sees a coherent "running" record and backs off instead of double-spawning.
   // From here on, every failure path must release the claim via removePidFile.
   const claim = claimPidFile({
+    ...shutdownBudget,
     pid: process.pid,
     startedAt: Date.now(),
     argv: process.argv,
@@ -888,6 +928,7 @@ async function startDetached(
   // identity so `stop`/`status` can later tell it apart from a recycled PID.
   writePidRecord(
     {
+      ...shutdownBudget,
       pid: child.pid,
       startedAt: Date.now(),
       argv: [process.execPath, ...childArgv],
@@ -1110,6 +1151,10 @@ async function main(): Promise<void> {
       break;
     case 'whoami':
       process.exit(await runWhoami(parsed));
+      break;
+    case 'caller-state':
+      await runCallerState(parsed);
+      process.exit(0);
       break;
     case 'container-validate':
       process.exit(await runContainerValidateCli(parsed));

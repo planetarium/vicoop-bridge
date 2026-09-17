@@ -649,7 +649,7 @@ test('legacy daemon env vars remain ignored (identity trust is the sole compatib
 });
 
 
-test('reserved caller isolation is rejected from flags and configuration before backend startup', () => {
+test('caller isolation without required configuration is rejected before backend startup', () => {
   for (const backend of ['claude', 'codex'] as const) {
     for (const source of ['flag', 'config']) {
       const result = mergeClientArgs(
@@ -657,7 +657,16 @@ test('reserved caller isolation is rejected from flags and configuration before 
         source === 'config' ? { backends: { [backend]: { runtime: 'caller-container' } } } : {},
       );
       assert.equal(result.ok, false);
-      if (!result.ok) assert.ok(result.errors.some((error) => error.includes('not available')));
+      if (!result.ok) assert.ok(result.errors.some((error) => error.includes('caller_runtime')));
     }
+  }
+});
+
+
+test('Claude and Codex caller runtimes accept complete isolated configuration', () => {
+  for (const backend of ['claude', 'codex'] as const) {
+    const config = {backends:{[backend]:{runtime:'caller-container' as const,caller_runtime:{image:`sha256:${'a'.repeat(64)}`,stateDirectory:'/private/caller-state'}}}};
+    assert.equal(mergeClientArgs({token:'t',agentId:'a',backend},config).ok,true);
+    assert.equal(mergeClientArgs({token:'t',agentId:'a',backend,cwd:'/host-workspace'},config).ok,false);
   }
 });

@@ -5,6 +5,8 @@ import {
   PROTOCOL_VERSION,
   OPENAI_COMPAT_EXTENSION_URI,
   TASK_REPLAY_CAPABILITY,
+  EXECUTION_SCOPE_V1_CAPABILITY,
+  CALLER_RUNTIME_V1_CAPABILITY,
   encodeFrame,
   parseDownFrame,
   withOpenAICompatModelsAdvertise,
@@ -170,6 +172,7 @@ export class Client {
   // False until the authenticated server replies with hello.ack on each
   // connection. This prevents replay from racing asynchronous authentication.
   private replayReady = false;
+  private callerScopeReady = false;
   private negotiatedMaxFrameBytes: number | null = null;
   private readonly logger: Logger;
 
@@ -329,6 +332,7 @@ export class Client {
   private connect(): void {
     if (this.stopped) return;
     this.replayReady = false;
+    this.callerScopeReady = false;
     this.negotiatedMaxFrameBytes = null;
     const ws = new WebSocket(`${this.opts.serverUrl.replace(/\/$/, '')}/connect`);
     this.ws = ws;
@@ -365,6 +369,7 @@ export class Client {
               CALLER_CONTEXT_V2_CAPABILITY,
               CALLER_CONTEXT_V1_CAPABILITY,
               TASK_REPLAY_CAPABILITY,
+              ...(this.opts.backend.requiresCallerScope ? [EXECUTION_SCOPE_V1_CAPABILITY, CALLER_RUNTIME_V1_CAPABILITY] : []),
             ],
             ...(this.opts.trustedIdentityIssuers !== undefined
               ? {
@@ -411,6 +416,14 @@ export class Client {
 
       switch (frame.type) {
         case 'hello.ack':
+          this.callerScopeReady = [TASK_REPLAY_CAPABILITY, EXECUTION_SCOPE_V1_CAPABILITY, CALLER_RUNTIME_V1_CAPABILITY]
+            .every((cap) => frame.protocolCapabilities.includes(cap));
+          if (this.opts.backend.requiresCallerScope && !this.callerScopeReady) {
+            this.logger.error('server does not support caller-runtime-v1; isolation cannot start');
+            this.stop();
+            this.opts.onFatal?.({ code: 1008, reason: 'caller-runtime negotiation required' });
+            return;
+          }
           if (!frame.protocolCapabilities.includes(TASK_REPLAY_CAPABILITY)) return;
           this.replayReady = true;
           this.negotiatedMaxFrameBytes = frame.maxFrameBytes;
@@ -420,6 +433,12 @@ export class Client {
           this.acknowledgeFrames(frame.executionId, frame.acceptedSeq);
           break;
         case 'task.assign':
+          if (this.opts.backend.requiresCallerScope && !this.callerScopeReady) {
+            this.logger.error('task received without caller-runtime negotiation');
+            this.stop();
+            this.opts.onFatal?.({ code: 1008, reason: 'caller-runtime negotiation required' });
+            return;
+          }
           // A task assignment without an execution ID came from a legacy bridge.
           // It is proof that authentication finished, but reconnect replay is
           // intentionally unavailable on that connection.

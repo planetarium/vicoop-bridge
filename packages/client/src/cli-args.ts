@@ -1,3 +1,4 @@
+import { CallerRuntimeConfig } from './caller-runtime-config.js';
 // Pure argv/config merging for the daemon entrypoint. Lives in its own
 // module so tests can import it without triggering the side-effectful
 // `main()` at the bottom of cli.ts.
@@ -82,7 +83,7 @@ export const daemonFlagsFields = {
     description: message`Working directory for the spawned backend process. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
   })),
   runtime: optional(option('--runtime', choice([...BACKEND_RUNTIMES]), {
-    description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside an existing vicoop-runtime container created by \`vicoop-client container init <kind>\`. \`caller-container\` is reserved and unavailable in this release. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
+    description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside an existing vicoop-runtime container created by \`vicoop-client container init <kind>\`. \`caller-container\` allocates dedicated user containers and requires caller_runtime configuration. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
   })),
   runtimeName: optional(option('--runtime-name', string({ metavar: 'NAME' }), {
     description: message`Runtime container instance name to use with \`--runtime container\`. Omit to use the active backend kind as the generated name.`,
@@ -394,7 +395,9 @@ export function mergeClientArgs(
   // lookup, which is the correct behaviour for that source.
   const errors: string[] = [];
   if (resolved.runtime === 'caller-container') {
-    errors.push('caller-container isolation is not available in this release (#497 R2); no backend will be started');
+    const callerConfig = backend === 'claude' || backend === 'codex' ? resolved.backends?.[backend]?.caller_runtime : undefined;
+    if (!CallerRuntimeConfig.safeParse(callerConfig).success) errors.push('caller-container requires valid caller_runtime image and stateDirectory configuration');
+    if (resolved.cwd || resolved.runtimeName) errors.push('caller-container owns its workspace and runtime names');
   }
   if (flags.runtime !== undefined && !RUNTIME_BACKENDS.has(backend)) {
     errors.push(
