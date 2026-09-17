@@ -12,7 +12,8 @@ import { runDockerCommand } from '../src/docker-command.js';
 import { spawn } from 'node:child_process';
 
 const name = `r1-smoke-${randomUUID().slice(0, 12)}`;
-const kind = 'claude';
+// Generic lifecycle fixture: backend authentication has separate broker smokes.
+const kind = 'r1-smoke';
 const image = process.env.VICOOP_SMOKE_IMAGE ?? 'ghcr.io/planetarium/vicoop-runtime:latest';
 const runtime = new RuntimeContainer({
   backendKind: kind, runtimeName: name, image, createIfMissing: true,
@@ -59,7 +60,7 @@ try {
   const input = join(directory, 'input.txt');
   const output = join(directory, 'output.txt');
   await writeFile(input, 'persistent smoke data\n');
-  const remotePath = '/data/sessions/claude/r1-smoke.txt';
+  const remotePath = `/data/sessions/${kind}/r1-smoke.txt`;
   await docker(['cp', input, `${container}:${remotePath}`]);
   await runtime.stop();
   const reopened = new RuntimeContainer({ backendKind: kind, runtimeName: name, image });

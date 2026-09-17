@@ -384,7 +384,7 @@ test('start awaits asynchronous Docker results including bounded streamed image 
   responses.splice(2, 1, fail('image missing'), ok());
   const fixture = makeDockerFixture(responses);
   const runtime = new RuntimeContainer({
-    backendKind: 'claude', createIfMissing: true,
+    backendKind: 'codex', createIfMissing: true,
     dockerRun: async (args, options) => {
       await new Promise((resolve) => setTimeout(resolve, 1));
       calls.push({ args, options });

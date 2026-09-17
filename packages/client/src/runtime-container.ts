@@ -83,7 +83,7 @@ export interface DockerResult {
 export type DockerRun = (args: readonly string[]) => DockerResult;
 
 export function defaultDockerRun(args: readonly string[]): DockerResult {
-  const r = spawnSync('docker', Array.from(args), { encoding: 'utf8' });
+  const r = spawnSync('docker', Array.from(args), { encoding: 'utf8', timeout: 30_000 });
   return {
     stdout: r.stdout ?? '',
     stderr: r.stderr ?? '',
@@ -407,7 +407,9 @@ export class RuntimeContainer {
     const start = Date.now();
     const timeoutMs = 10_000;
     while (Date.now() - start < timeoutMs) {
-      const r = await this.run(['inspect', '--format', '{{.State.Status}}', name]);
+      const r = await this.run(['inspect', '--format', '{{.State.Status}}', name], {
+        timeoutMs: Math.max(1, timeoutMs - (Date.now() - start)),
+      });
       if (r.exitCode === 0) {
         const status = r.stdout.trim();
         if (status === 'running') return;

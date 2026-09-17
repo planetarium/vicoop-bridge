@@ -15,8 +15,8 @@ error before backend startup. Configuration normalization preserves this value
 so it cannot silently become host execution. R1 clients do not advertise
 `execution-scope-v1` and do not allocate caller runtimes.
 
-Docker lifecycle operations in `RuntimeContainer` and the startup credential
-probe run asynchronously. Ordinary commands have a 30-second timeout and a
+Docker lifecycle operations in `RuntimeContainer`, including broker boundary
+inspection and firewall installation, run asynchronously. Ordinary commands have a 30-second timeout and a
 1 MiB aggregate captured-output limit. Image pulls retain visible progress and
 have a 10-minute timeout; readiness polling uses its remaining 10-second budget.
 One-shot `container list`/remove helpers still use the synchronous compatibility
@@ -24,13 +24,12 @@ runner (bounded to 30 seconds per command); they are not request-path APIs.
 
 Timeout/abort stops the local Docker CLI. The Docker daemon may already have
 accepted the operation: inspect the named runtime before retrying. These errors
-do not certify cancellation of in-container processes. The existing spawn
-adapter remains a stdio transport, not a process-group supervisor.
+do not certify cancellation of in-container processes. Claude/Codex external execution uses the host broker and supervisor introduced
+in #501/#505. Raw Docker stdio alone does not certify process-group termination.
 
-Explicit per-spawn environment overrides are passed to `docker exec -e` without
-a shell. Unspecified variables keep the container environment; the bridge's
-entire host environment is not forwarded. Do not supply secrets as arbitrary
-overrides unless their visibility inside the runtime is intended.
+Execution environment overrides remain subject to the broker's provider-secret
+filtering. Real provider credentials stay on the host; workloads receive
+execution-scoped grants. See `claude-auth-broker.md` and `codex-auth-broker.md`.
 
 ## Execution scope wire contract
 
@@ -88,9 +87,9 @@ future enabled isolated client/server using R1 compatibility claims.
 ## Provider boundary and R2 activation gate
 
 `runtime-provider.ts` specifies the future isolated provider's lifecycle,
-file transfer and supervised-process contract. The legacy Docker spawn adapter
-does not implement that supervisor. No type cast or scope capability should be
-used to claim otherwise.
+file transfer and supervised-process contract. The shared broker supervisor
+provides execution cleanup; scope routing, lifecycle ownership and caller
+isolation still require R2 integration.
 
 Before activation R2 must implement authorized scope routing, separate volumes,
 credential provisioning, allocation deduplication, capacity limits, input-file
@@ -111,7 +110,8 @@ bun build packages/client/scripts/runtime-foundations-smoke.ts --compile --outfi
 ```
 
 Set `VICOOP_SMOKE_IMAGE` to select a compatible runtime image. The script creates
-unique `r1-smoke-*` resources, skips firewall setup for its disposable test,
+unique `r1-smoke-*` resources with a generic non-provider backend kind, skips
+firewall setup for its disposable test,
 checks lifecycle/stdio/EOF/cwd/env/file transfer/volume persistence and removes
 its own container and volumes. It does not authenticate or invoke paid models,
 and it does not validate caller isolation or supervised cancellation.
