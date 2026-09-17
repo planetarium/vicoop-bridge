@@ -101,6 +101,11 @@ export function assertBrokerContainer(
     `/data/sessions/${kind}`,
     `/data/creds/${kind}`,
   ]);
+  // Docker reports --tmpfs entries in HostConfig.Tmpfs, not Mounts.
+  for (const destination of Object.keys(host?.Tmpfs ?? {})) {
+    if (!['/tmp', `/data/creds/${kind}`].includes(destination)) invalid();
+    required.delete(destination);
+  }
   let workspaceFound = false;
   for (const mount of c.Mounts ?? []) {
     required.delete(mount.Destination);

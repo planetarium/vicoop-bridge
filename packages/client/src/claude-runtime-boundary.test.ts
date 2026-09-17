@@ -110,3 +110,28 @@ for (const kind of ['claude', 'codex']) {
     }
   });
 }
+
+for (const kind of ['claude', 'codex']) {
+  test(`broker boundary validates Docker --tmpfs inspect entries for ${kind}`, () => {
+    const c = JSON.parse(
+      JSON.stringify(container())
+        .replaceAll('claude', kind)
+        .replace('CLAUDE_CONFIG_DIR', kind === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR'),
+    );
+    const credentialsPath = `/data/creds/${kind}`;
+    c.HostConfig.Tmpfs = { [credentialsPath]: 'rw,nosuid,nodev,mode=0700' };
+    c.Mounts = c.Mounts.filter((mount: { Type: string }) => mount.Type !== 'tmpfs');
+    const validate = () => assertBrokerContainer(JSON.stringify(c), kind, 'work');
+
+    assert.doesNotThrow(validate);
+    c.HostConfig.Tmpfs['/tmp'] = 'rw';
+    assert.doesNotThrow(validate);
+
+    delete c.HostConfig.Tmpfs[credentialsPath];
+    assert.throws(validate, /migration/);
+    c.HostConfig.Tmpfs[credentialsPath] = 'rw,nosuid,nodev,mode=0700';
+
+    c.HostConfig.Tmpfs[`/data/agents/${kind}`] = 'rw';
+    assert.throws(validate, /migration/);
+  });
+}
