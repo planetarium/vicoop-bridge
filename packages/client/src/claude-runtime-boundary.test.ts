@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { assertBrokerContainer } from './execution-runtime-boundary.js';
 import { RuntimeContainer } from './runtime-container.js';
-const container = () => ({ Config: { User: 'node', Labels: { 'vicoop.claude-auth': 'stdio-v1', 'vicoop.name': 'work' },
+const container = () => ({ Config: { User: 'node', Labels: { 'vicoop.kind': 'claude', 'vicoop.claude-auth': 'stdio-v1', 'vicoop.name': 'work' },
   Env: ['CLAUDE_CONFIG_DIR=/data/sessions/claude/config'] },
   HostConfig: { NetworkMode: 'default', CapAdd: ['NET_ADMIN', 'NET_RAW'], SecurityOpt: ['no-new-privileges'] },
   Mounts: [{Type:'volume',Name:'vicoop-agents-'+('work'),Destination:'/data/agents/claude'},{Type:'volume',Name:'vicoop-sessions-'+('work'),Destination:'/data/sessions/claude'},{Type:'tmpfs',Destination:'/data/creds/claude'}] });
@@ -91,3 +91,22 @@ test('workspace comparison accepts canonical equivalents including symlinks', as
     assert.throws(() => assertBrokerContainer(JSON.stringify(c), 'claude', 'work', join(dir, 'other')), /workspace differs/);
   } finally { rmSync(dir, {recursive: true, force: true}); }
 });
+
+for (const kind of ['claude', 'codex']) {
+  test(`broker runtime requires the matching backend label for ${kind}`, () => {
+    const raw = JSON.stringify(container())
+      .replaceAll('claude', kind)
+      .replace('CLAUDE_CONFIG_DIR', kind === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR');
+    assert.doesNotThrow(() => assertBrokerContainer(raw, kind, 'work'));
+
+    for (const label of [undefined, '', kind === 'claude' ? 'codex' : 'claude']) {
+      const c = JSON.parse(raw);
+      if (label === undefined) delete c.Config.Labels['vicoop.kind'];
+      else c.Config.Labels['vicoop.kind'] = label;
+      assert.throws(
+        () => assertBrokerContainer(JSON.stringify(c), kind, 'work'),
+        /runtime identity or broker authentication label mismatch/,
+      );
+    }
+  });
+}

@@ -372,7 +372,7 @@ test('container validate CLI reports success, inspect failure and unsafe boundar
   t.mock.method(console, 'error', (message: string) => errors.push(message));
   const args = {action: 'container-validate' as const, kind: 'codex' as const, name: 'work'};
   const safe = {
-    Config: {User: 'node', Labels: {'vicoop.name': 'work', 'vicoop.codex-auth': 'stdio-v1'},
+    Config: {User: 'node', Labels: {'vicoop.name': 'work', 'vicoop.kind':'codex','vicoop.codex-auth': 'stdio-v1'},
       Env: ['CODEX_HOME=/data/sessions/codex/config']},
     HostConfig: {NetworkMode: 'default', CapAdd: ['NET_ADMIN'], SecurityOpt: ['no-new-privileges']},
     Mounts: [

@@ -19,7 +19,7 @@ function makeDockerFixture(responses: RunResponse[]) {
     calls.push(args);
     if(args.includes('{{json .}}')) {
       const name=args.at(-1)!.replace('vicoop-runtime-','');
-      return ok(JSON.stringify({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1','vicoop.name':name},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN','NET_RAW'],SecurityOpt:['no-new-privileges']},Mounts:[...[{Type:'volume',Name:'vicoop-agents-'+(name),Destination:'/data/agents/codex'},{Type:'volume',Name:'vicoop-sessions-'+(name),Destination:'/data/sessions/codex'},{Type:'tmpfs',Destination:'/data/creds/codex'}], ...calls.filter(c=>c[0]==='create').flatMap(c=>c.filter(a=>a.startsWith('type=bind,source=')).map(a=>({Type:'bind',Source:a.slice('type=bind,source='.length).split(',target=')[0],Destination:'/workspace'})))]}));
+      return ok(JSON.stringify({Config:{User:'node',Labels:{'vicoop.kind':'codex','vicoop.codex-auth':'stdio-v1','vicoop.name':name},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN','NET_RAW'],SecurityOpt:['no-new-privileges']},Mounts:[...[{Type:'volume',Name:'vicoop-agents-'+(name),Destination:'/data/agents/codex'},{Type:'volume',Name:'vicoop-sessions-'+(name),Destination:'/data/sessions/codex'},{Type:'tmpfs',Destination:'/data/creds/codex'}], ...calls.filter(c=>c[0]==='create').flatMap(c=>c.filter(a=>a.startsWith('type=bind,source=')).map(a=>({Type:'bind',Source:a.slice('type=bind,source='.length).split(',target=')[0],Destination:'/workspace'})))]}));
     }
     if(args[0]==='exec' && args.includes('/bin/sh')) return ok();
     const r = responses[i++] ?? ok();
@@ -336,7 +336,7 @@ test('cleanup stops an acquired runtime if firewall installation fails', async (
   const runtime = new RuntimeContainer({backendKind: 'codex', dockerRun(args) {
     calls.push([...args]);
     if (args[0] === 'exec') return fail('firewall failed');
-    if (args.includes('{{json .}}')) return ok(JSON.stringify({Config:{User:'node',Labels:{'vicoop.codex-auth':'stdio-v1','vicoop.name':'codex'},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN'],SecurityOpt:['no-new-privileges']},Mounts:[{Type:'volume',Name:'vicoop-agents-'+('codex'),Destination:'/data/agents/codex'},{Type:'volume',Name:'vicoop-sessions-'+('codex'),Destination:'/data/sessions/codex'},{Type:'tmpfs',Destination:'/data/creds/codex'}]}));
+    if (args.includes('{{json .}}')) return ok(JSON.stringify({Config:{User:'node',Labels:{'vicoop.kind':'codex','vicoop.codex-auth':'stdio-v1','vicoop.name':'codex'},Env:['CODEX_HOME=/data/sessions/codex/config']},HostConfig:{NetworkMode:'default',CapAdd:['NET_ADMIN'],SecurityOpt:['no-new-privileges']},Mounts:[{Type:'volume',Name:'vicoop-agents-'+('codex'),Destination:'/data/agents/codex'},{Type:'volume',Name:'vicoop-sessions-'+('codex'),Destination:'/data/sessions/codex'},{Type:'tmpfs',Destination:'/data/creds/codex'}]}));
     return ok(args[0] === 'version' ? '28' : args[0] === 'ps' ? 'existing-container' : 'running');
   }});
   await assert.rejects(runtime.start(), /firewall failed/);

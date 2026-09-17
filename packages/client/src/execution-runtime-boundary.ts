@@ -36,7 +36,8 @@ export function assertBrokerContainer(
   const config = c.Config;
   const host = c.HostConfig;
   requireBoundary(
-    config?.Labels?.['vicoop.name'] === expectedName &&
+    config?.Labels?.['vicoop.kind'] === kind &&
+      config?.Labels?.['vicoop.name'] === expectedName &&
       config?.Labels?.[`vicoop.${kind}-auth`] === 'stdio-v1',
     'runtime identity or broker authentication label mismatch',
   );
