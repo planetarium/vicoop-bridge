@@ -212,7 +212,11 @@ export class DockerCallerRuntimePool {
       throw new Error('caller volume ownership or storage boundary mismatch');
     return true;
   }
-  async acquire(id: string, signal?: AbortSignal): Promise<CallerContainer> {
+  async acquire(
+    id: string,
+    signal?: AbortSignal,
+    principalId?: string,
+  ): Promise<CallerContainer> {
     if (!this.locked) throw new Error('caller pool is not initialized');
     signal?.throwIfAborted();
     const command = (args: string[]) => {
@@ -220,7 +224,7 @@ export class DockerCallerRuntimePool {
       return this.command(args);
     };
     const name = this.name(id);
-    await this.store.reserve(id, this.kind); // reserve before the first Docker mutation
+    await this.store.reserve(id, this.kind, principalId); // reserve before the first Docker mutation
     let info = await this.inspect(name);
     const recovered = !!info;
     if (!info) {

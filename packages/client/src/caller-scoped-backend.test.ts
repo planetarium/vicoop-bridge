@@ -50,7 +50,16 @@ function fixture(handle?: Backend['handle'], opts = {}) {
     kind: 'claude',
     options: { ...options, ...opts },
     initialize: async () => [],
-    acquire: async (id: string) => {
+    acquire: async (
+      id: string,
+      _signal?: AbortSignal,
+      principalId?: string,
+    ) => {
+      assert.ok(
+        principalId,
+        'validated identity must reach storage allocation',
+      );
+      assert.equal(scopeDigest('agent', principalId), id);
       if (!existing.has(id)) {
         allocations.push(id);
         existing.add(id);

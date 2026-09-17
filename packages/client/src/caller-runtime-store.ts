@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { z } from 'zod';
 import { hostname } from 'node:os';
 import {
   mkdir,
@@ -24,6 +25,20 @@ export const scopeDigest = (agentId: string, principalId: string): string =>
       ]),
     )
     .digest('hex');
+
+const LegacyScopeRecord = z
+  .object({
+    id: z.string(),
+    kind: z.enum(['claude', 'codex']),
+    namespace: z.string(),
+  })
+  .strict();
+const ScopeRecord = LegacyScopeRecord.extend({
+  version: z.literal(3),
+  agentId: z.string().min(1),
+  // null means identity has not yet been observed on a validated request.
+  principalId: z.string().min(1).nullable(),
+}).strict();
 
 /** Exclusive host ownership record; workload storage lives only in Docker volumes. */
 export class CallerRuntimeStore {
@@ -83,11 +98,11 @@ export class CallerRuntimeStore {
         }
       }
       const manifestPath = join(this.directory, 'manifest.json');
-      const expected = { version: 2, agentId: this.agentId, host: hostname() };
+      const expected = { version: 3, agentId: this.agentId, host: hostname() };
       try {
         const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
         if (
-          manifest.version !== 2 ||
+          ![2, 3].includes(manifest.version) ||
           manifest.agentId !== this.agentId ||
           manifest.host !== hostname()
         ) {
@@ -102,6 +117,9 @@ export class CallerRuntimeStore {
           flag: 'wx',
         });
       }
+      // Upgrade the manifest first: old readers must reject identity-bearing records.
+      // Record migration is lazy and restart-safe; v3 readers also accept legacy records.
+      await this.atomicWrite(manifestPath, expected);
       const next = join(this.directory, `.owner-${this.token}`);
       await writeFile(
         next,
@@ -140,21 +158,68 @@ export class CallerRuntimeStore {
       .filter((name) => /^[a-f0-9]{64}\.json$/.test(name))
       .map((name) => name.slice(0, -5));
   }
-  async reserve(id: string, kind: string): Promise<void> {
-    if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('invalid scope ID');
-    const path = join(this.directory, `${id}.json`);
-    const record = { id, kind, namespace: this.namespace };
+  private async atomicWrite(path: string, value: unknown): Promise<void> {
+    const next = join(this.directory, `.record-${randomUUID()}`);
     try {
-      const previous = JSON.parse(await readFile(path, 'utf8'));
-      if (JSON.stringify(previous) !== JSON.stringify(record))
-        throw new Error('caller state identity mismatch');
+      await writeFile(next, JSON.stringify(value), { mode: 0o600, flag: 'wx' });
+      await rename(next, path);
+    } finally {
+      await rm(next, { force: true });
+    }
+  }
+  async reserve(id: string, kind: string, principalId?: string): Promise<void> {
+    if (!this.locked)
+      throw new Error('caller state requires exclusive ownership');
+    if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('invalid scope ID');
+    if (
+      principalId !== undefined &&
+      (!principalId || scopeDigest(this.agentId, principalId) !== id)
+    )
+      throw new Error('caller state identity mismatch');
+    const path = join(this.directory, `${id}.json`);
+    let record = ScopeRecord.parse({
+      version: 3,
+      id,
+      kind,
+      namespace: this.namespace,
+      agentId: this.agentId,
+      principalId: principalId ?? null,
+    });
+    let previous: unknown;
+    try {
+      previous = JSON.parse(await readFile(path, 'utf8'));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      await writeFile(path, JSON.stringify(record), {
-        mode: 0o600,
-        flag: 'wx',
-      });
     }
+    if (previous !== undefined) {
+      const legacy = LegacyScopeRecord.safeParse(previous);
+      const stored = legacy.success ? legacy.data : ScopeRecord.parse(previous);
+      if (
+        stored.id !== id ||
+        stored.kind !== kind ||
+        stored.namespace !== this.namespace
+      )
+        throw new Error('caller state identity mismatch');
+      if (!legacy.success) {
+        const stored = ScopeRecord.parse(previous);
+        if (
+          stored.agentId !== this.agentId ||
+          (stored.principalId !== null &&
+            scopeDigest(stored.agentId, stored.principalId) !== id) ||
+          (stored.principalId !== null &&
+            principalId !== undefined &&
+            stored.principalId !== principalId)
+        )
+          throw new Error('caller state identity mismatch');
+        // Administrative/startup calls must never erase an established mapping.
+        record = {
+          ...record,
+          principalId: stored.principalId ?? principalId ?? null,
+        };
+        if (stored.principalId === record.principalId) return;
+      }
+    }
+    await this.atomicWrite(path, record);
   }
   async forget(id: string): Promise<void> {
     if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('invalid scope ID');

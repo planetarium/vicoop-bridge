@@ -251,6 +251,13 @@ try {
   assign('apikey:b', 'b1');
   const b1 = await completed('b1');
   const b = await container('apikey:b');
+  for (const principal of ['apikey:a', 'apikey:b']) {
+    const id = createHash('sha256').update(JSON.stringify([
+      'vicoop-execution-scope', 'direct-principal-v1', 'smoke', principal,
+    ])).digest('hex');
+    const record = JSON.parse(await readFile(join(directory, 'state', `${id}.json`), 'utf8'));
+    assert.deepEqual(record, { version: 3, id, kind, namespace, agentId: 'smoke', principalId: principal });
+  }
   assign('apikey:a', 'a2');
   const a2 = await completed('a2');
   assert.equal(a1.turn, 1);

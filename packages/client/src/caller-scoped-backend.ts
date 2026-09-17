@@ -198,7 +198,11 @@ export class CallerScopedBackend implements Backend {
       }
       acquired = true;
       phase = 'allocation';
-      const container = await this.pool.acquire(id, controller.signal);
+      const container = await this.pool.acquire(
+        id,
+        controller.signal,
+        task.executionScope!.principalId,
+      );
       controller.signal.throwIfAborted();
       phase = 'backend-initialization';
       if (!entry.worker) entry.worker = await this.factory(container);

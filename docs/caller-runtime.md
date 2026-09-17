@@ -170,3 +170,25 @@ The source includes three separate acceptance entrypoints:
 
 See the PR for exact completed runs and remaining validation. Unit tests and
 fixture smokes are not a substitute for real-provider acceptance.
+
+## Identity storage format (foundation for #507)
+
+The private state directory uses manifest version 3. Each scope record contains
+`version: 3`, `id` (scope digest), `kind` (backend), `namespace`, `agentId` and
+`principalId`. Only the principal from an already validated direct execution
+scope is recorded; the store independently checks its digest against the scope.
+No credentials, tokens, caller display names or request metadata are stored.
+The directory remains 0700 and records are written atomically with mode 0600.
+Principal IDs are not added to Docker names/labels or `caller-state` output.
+
+Version 2 manifests upgrade under the exclusive owner lock. Legacy hash-only
+records migrate lazily to version 3 with `principalId: null` (unknown); a later
+validated request for that exact scope fills the mapping. Startup/offline
+reconciliation never guesses an identity or clears a known mapping. Corrupt,
+mismatched and unsupported records fail closed. Container names and volumes do
+not change. An interrupted migration can resume with mixed legacy/v3 records.
+
+After upgrade, old version-2-only clients refuse the manifest. Do not manually
+lower the version to downgrade; retain a stopped-state backup before upgrading.
+User lookup, live inspection and environment initialization/reapplication remain
+in #507; this change only establishes the persisted identity mapping.
