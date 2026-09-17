@@ -1,5 +1,12 @@
 # @vicoop-bridge/client
 
+## 0.41.0
+
+### Minor Changes
+
+- 6425dca: Keep Codex external-runtime OpenAI API keys and ChatGPT credentials on the host, authenticating each execution through the built-in OpenAI provider with an ephemeral login instead of credential files or token environment variables. Require Codex 0.153.4 or newer and explicit migration of existing credential-mounted runtimes; remove the obsolete container credential-copy and login paths. Wait for execution cleanup before completing or resuming tasks, and preserve forked harness files in persistent runtime storage. Reject unsupported OAuth login modes and explicitly unconfined seccomp/AppArmor profiles. Validate reused runtimes and required firewall capabilities before harness injection, advertise external-runtime compatibility separately, and correct daemon startup instructions. Settle queued task cancellation promptly without allowing subsequent work to overtake active cleanup, and avoid stopping unacquired runtimes after failed initialization. Bind runtime identity to its volumes, reject shared namespaces/devices and known credential-store workspace mounts, and use a shared provider-secret environment filter. Align prerelease checks and prevent startup after input-mapping cancellation. Reject mismatched workspace reuse and missing persistent mounts, pin selected API keys, and release owned runtime and broker resources after startup failures without stopping already-running reused containers. Host authentication and bundled-direct behavior are unchanged.
+- c23c56c: Move Claude external-container authentication to a built-in host broker so real OAuth/API credentials stay outside the workload. Existing runtimes require migration: preserve volumes, recreate with `container init claude --reuse-state`, and authenticate on the host. The old credentials volume remains detached; selected conversations and todos are preserved. Private/host-network services are now blocked for Claude runtimes. See `docs/claude-auth-broker.md` for supported modes, migration and rollback limits. Codex, host mode and bundled-direct authentication are unchanged.
+
 ## 0.40.0
 
 ### Minor Changes
