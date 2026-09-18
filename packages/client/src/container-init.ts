@@ -175,9 +175,9 @@ export async function runContainerInit(opts: ContainerInitOptions): Promise<numb
 
     log.info(`${opts.kind} uses host authentication through the built-in broker; no credentials were copied into the runtime.`);
 
-    log.info(`runtime container for ${opts.kind} initialized. start daemon with:`);
+    log.info(`legacy runtime container for ${opts.kind} initialized.`);
     log.info(
-      `    vicoop-client start --backend ${opts.kind} --runtime container --runtime-name ${runtimeName}`,
+      'Daemon container mode now allocates per-caller containers from a pinned image; see docs/caller-runtime.md for configuration. This legacy container is not adopted.',
     );
     return 0;
   } finally {
@@ -683,7 +683,7 @@ const containerInitSubCmd = command(
   }),
   {
     brief: message`Bootstrap a per-backend runtime container.`,
-    description: message`One-shot setup for the container-runtime profile: creates \`vicoop-runtime-<name>\`, where --name defaults to the backend kind, fails if that runtime already exists, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and uses the host authentication broker for Claude and Codex. --from-host is accepted without copying credentials. After this, launch the daemon with \`vicoop-client start --backend <kind> --runtime container --runtime-name <name>\`.`,
+    description: message`One-shot setup for the container-runtime profile: creates \`vicoop-runtime-<name>\`, where --name defaults to the backend kind, fails if that runtime already exists, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and uses the host authentication broker for Claude and Codex. --from-host is accepted without copying credentials. This legacy container is not used by daemon container mode, which allocates per-caller containers from caller_runtime configuration; see docs/caller-runtime.md.`,
   },
 );
 
@@ -746,7 +746,7 @@ export const containerCmd = command(
   longestMatch(containerInitSubCmd, containerListSubCmd, containerRemoveSubCmd, containerValidateSubCmd),
   {
     brief: message`Manage per-backend runtime containers.`,
-    description: message`Subcommands: \`validate\` (check authentication isolation without starting), \`init\` (boot \`vicoop-runtime-<name>\`, install the agent CLI, validate host authentication), \`list\` (show managed runtime container and volume state), \`remove\` (remove a runtime container and volumes by name). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
+    description: message`Subcommands: \`validate\` (check authentication isolation without starting), \`init\` (boot \`vicoop-runtime-<name>\`, install the agent CLI, validate host authentication), \`list\` (show managed runtime container and volume state), \`remove\` (remove a runtime container and volumes by name). These commands manage legacy per-backend resources; daemon \`--runtime container\` uses dedicated caller resources managed by \`caller-state\`.`,
     hidden: 'usage',
   },
 );

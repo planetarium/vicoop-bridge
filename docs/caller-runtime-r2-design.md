@@ -1,11 +1,16 @@
 # R2: dedicated caller containers
 
-Status: implemented in Draft #506; see [operator documentation](caller-runtime.md)
+Status: implemented in #506; see [operator documentation](caller-runtime.md)
 for the implemented behavior and remaining limits. This replaces the execution-container/snapshot design in
 [PR #499](https://github.com/planetarium/vicoop-bridge/pull/499), following the
 [requirement clarification](https://github.com/planetarium/vicoop-bridge/pull/499#issuecomment-5710929289).
 The scope now combines R2 with the Claude/Codex caller-isolation portion of R4 in
 [issue #497](https://github.com/planetarium/vicoop-bridge/issues/497).
+
+The daemon exposes `host` and `container` modes. `container` always allocates
+per-caller runtimes; it replaces both the legacy shared-container execution
+path and the draft `caller-container` spelling. See the operator migration
+section before upgrading a shared-container configuration.
 
 ## Foundation and scope
 

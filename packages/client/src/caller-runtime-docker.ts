@@ -57,7 +57,7 @@ export class DockerCallerRuntimePool {
   }
   async initialize(reconcile = true): Promise<string[]> {
     if (process.platform === 'win32')
-      throw new Error('caller-container requires Linux or macOS Docker');
+      throw new Error('container requires Linux or macOS Docker');
     await this.store.lock();
     this.locked = true;
     try {

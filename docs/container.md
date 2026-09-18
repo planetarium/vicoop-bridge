@@ -7,8 +7,9 @@ path is described below; an interactive setup wizard for first-time
 operators is on a separate branch and not yet merged.
 
 An alternative deployment profile — **external-runtime** ([#249][249]) —
-keeps the bridge client bare-metal on the host and spawns per-backend
-agent runtime containers via `docker exec`. The two profiles coexist;
+keeps the bridge client on the host and runs agents in Docker. Daemon
+`--runtime container` now allocates a dedicated container per authenticated
+caller; see [configuration and legacy migration](caller-runtime.md). The two profiles coexist;
 choose whichever fits your deployment. This doc is the bundled-direct
 side ([#244][244]).
 

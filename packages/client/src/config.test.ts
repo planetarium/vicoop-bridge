@@ -544,12 +544,12 @@ test('readConfig/writeConfig default to resolveConfigDir() when no path passed',
 });
 
 
-test('caller-container runtime survives normalization', (t) => {
+test('container runtime survives normalization', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-isolation-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const path = join(dir, 'config.json');
-  writeFileSync(path, JSON.stringify({ backends: { claude: { runtime: 'caller-container' } } }));
-  assert.equal(readConfig(path)?.backends?.claude?.runtime, 'caller-container');
+  writeFileSync(path, JSON.stringify({ backends: { claude: { runtime: 'container' } } }));
+  assert.equal(readConfig(path)?.backends?.claude?.runtime, 'container');
 });
 
 
@@ -559,9 +559,20 @@ test('caller runtime configuration is retained and invalid limits fail closed', 
   const path = join(dir, 'config.json');
   const caller_runtime = {image:`sha256:${'a'.repeat(64)}`,stateDirectory:join(dir,'state')};
   for (const kind of ['claude','codex']) {
-    writeFileSync(path,JSON.stringify({backends:{[kind]:{runtime:'caller-container',caller_runtime}}}));
+    writeFileSync(path,JSON.stringify({backends:{[kind]:{runtime:'container',caller_runtime}}}));
     assert.equal((readConfig(path)?.backends as any)[kind].caller_runtime.image,caller_runtime.image);
-    writeFileSync(path,JSON.stringify({backends:{[kind]:{runtime:'caller-container',caller_runtime:{...caller_runtime,maxScopes:0}}}}));
+    writeFileSync(path,JSON.stringify({backends:{[kind]:{runtime:'container',caller_runtime:{...caller_runtime,maxScopes:0}}}}));
     assert.throws(() => readConfig(path));
+  }
+});
+
+
+test('retired caller-container config fails with a migration hint instead of selecting host', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'retired-runtime-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  for (const kind of ['claude', 'codex']) {
+    writeFileSync(path, JSON.stringify({ backends: { [kind]: { runtime: 'caller-container' } } }));
+    assert.throws(() => readConfig(path), /renamed to container/);
   }
 });

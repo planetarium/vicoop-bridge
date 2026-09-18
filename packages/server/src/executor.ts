@@ -413,7 +413,7 @@ export class WSForwardingExecutor extends AgentExecutor {
         state: TaskState.FAILED,
         timestamp: new Date().toISOString(),
         message: { messageId: randomUUID(), role: 'agent' as const,
-          parts: [{ text: 'caller-container requires a directly authenticated principal; delegation is unsupported' }], taskId, contextId },
+          parts: [{ text: 'container runtime requires a directly authenticated principal; delegation is unsupported' }], taskId, contextId },
       };
       task.status = status;
       task.history = appendHistoryMessage(appendHistoryMessage(task.history ?? [], message), status.message);

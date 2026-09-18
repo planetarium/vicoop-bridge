@@ -46,15 +46,19 @@ the bundled-direct image keep their existing behavior; this broker does not
 make their provider credentials inaccessible to their agent processes.
 Codex external-runtime uses its own [host authentication broker](./codex-auth-broker.md).
 
-## Fresh setup
+## Current per-caller setup
 
-Log into Claude on the **host**, or supply one supported credential variable to
-the host bridge process. Then run:
+Daemon `--runtime container` now allocates dedicated caller containers. Log into
+Claude on the host, then follow [caller runtime setup](caller-runtime.md) to
+build a pinned image and configure `caller_runtime.image` and `stateDirectory`.
+Start with `vicoop-client start --config /path/to/config.json`. Shared runtime
+names and workspace bind mounts are no longer accepted by the daemon.
 
-```sh
-vicoop-client container init claude
-vicoop-client start --backend claude --runtime container
-```
+### Legacy per-backend resources
+
+The migration details below describe older shared runtimes and their retained
+administrative commands. They do not configure the current per-caller daemon.
+
 
 `container init claude --from-host` is accepted for compatibility but does not
 copy secrets. Both forms validate host authentication. The runtime image must
@@ -70,7 +74,7 @@ any workspace bind-mount path in your operational records. Then, replacing
 ```sh
 vicoop-client container remove claude --preserve-volumes
 vicoop-client container init claude --name claude --reuse-state --from-host
-vicoop-client start --backend claude --runtime container --runtime-name claude
+# Configure per-caller execution separately; see caller-runtime.md.
 ```
 
 The explicit removal discards the old container's writable layer. Back up any

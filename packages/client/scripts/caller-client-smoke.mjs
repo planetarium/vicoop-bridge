@@ -52,7 +52,7 @@ const config = {
   backend: kind,
   backends: {
     [kind]: {
-      runtime: 'caller-container',
+      runtime: 'container',
       caller_runtime: {
         image,
         stateDirectory: join(directory, 'state'),

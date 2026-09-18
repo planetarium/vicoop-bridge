@@ -54,14 +54,19 @@ Other routes, query parameters, background requests and unsupported model
 names are rejected. Credentials, account headers and upstream error bodies
 are never accepted from or echoed back to the workload.
 
-## Setup and migration
+## Current per-caller setup
 
-Log into Codex on the host or set `OPENAI_API_KEY` for the host bridge, then:
+Daemon `--runtime container` now allocates dedicated caller containers. Log into
+Codex on the host, then follow [caller runtime setup](caller-runtime.md) to
+build a pinned image and configure `caller_runtime.image` and `stateDirectory`.
+Start with `vicoop-client start --config /path/to/config.json`. Shared runtime
+names and workspace bind mounts are no longer accepted by the daemon.
 
-```sh
-vicoop-client container init codex
-vicoop-client start --backend codex --runtime container
-```
+### Legacy per-backend resources
+
+The migration details below describe older shared runtimes and their retained
+administrative commands. They do not configure the current per-caller daemon.
+
 
 `--from-host` is accepted for compatibility but does not copy credentials.
 Existing credential-mounted runtimes are rejected. Stop their bridge daemon,
@@ -70,7 +75,7 @@ back up needed state, then explicitly recreate the runtime:
 ```sh
 vicoop-client container remove codex --preserve-volumes
 vicoop-client container init codex --name codex --reuse-state --from-host
-vicoop-client start --backend codex --runtime container --runtime-name codex
+# Configure per-caller execution separately; see caller-runtime.md.
 ```
 
 Adjust the runtime name and restore any workspace/image options used before.

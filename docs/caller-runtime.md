@@ -8,7 +8,9 @@ principal uses the same container and workspace, with a separate conversation.
 
 This is opt-in. OpenClaw, delegated scopes, OpenAI compatibility, caller tools,
 MCP integration, outgoing file delivery and automatic idle reclamation are not
-supported in this mode. Host and single-container modes remain available.
+supported in this mode. The two execution modes are `host` (default) and
+`container` (dedicated per caller); shared-container execution is no longer
+available through the daemon.
 
 ## Prepare an image and configuration
 
@@ -32,7 +34,7 @@ installer. Codex requires version 0.153.4 or later. Use the resulting immutable
   "backend": "claude",
   "backends": {
     "claude": {
-      "runtime": "caller-container",
+      "runtime": "container",
       "caller_runtime": {
         "image": "sha256:REPLACE_WITH_64_HEX_DIGEST",
         "stateDirectory": "/absolute/private/path/claude-callers",
@@ -70,13 +72,34 @@ and [Codex broker](codex-auth-broker.md) rules. Refresh remains operator-managed
 The default host Codex model selection is forwarded without copying its config,
 credentials, operator conversations or harness into caller storage.
 
+## Migrating runtime selection
+
+`runtime: "container"` now always means per-caller isolation. The earlier
+`caller-container` name is rejected with a migration hint; change it to
+`container` and retain the existing `caller_runtime` configuration/state path.
+There is no shared-container option or automatic host fallback.
+
+For a legacy shared `container` configuration, stop the daemon, preserve its
+existing volumes, and configure a pinned backend-installed image plus private
+`caller_runtime.stateDirectory` as shown above. Remove `cwd`, `runtime_name`
+and `--runtime-name`: the manager allocates workspace volumes and container
+names from the verified caller scope. The daemon rejects incomplete legacy
+configuration before accepting tasks. Legacy shared workspaces/sessions are not
+automatically assigned or copied to any caller.
+
+`container init/list/remove/validate` remain available for managing legacy
+per-backend resources; they do not prepare or select the daemon's per-caller
+containers. Use the image recipe above and `caller-state` for the new mode.
+Host execution (including a client already inside a bundled-direct container)
+keeps its existing behavior.
+
 ## Scope, lifetime and persistence
 
 The server derives scope from agent identity and authenticated principal. The
 client checks that scope against caller identity and execution generation before
 allocation. Missing identity, forged scope, missing capability negotiation and
 delegation never fall back to a shared runtime. Public agents still require
-caller authentication when they advertise caller-container execution. Shared
+caller authentication when they advertise container execution. Shared
 API keys identify the same principal and therefore share the same environment.
 
 Each scope owns a private Docker network and two named volumes: `/workspace`
@@ -152,7 +175,7 @@ clear another caller's storage to recover an unrelated scope.
 Deploy the compatible server before enabling the client. The client requires
 `caller-runtime-v1`, `execution-scope-v1` and replay acknowledgement; an older
 server makes it refuse work. Rollback: stop caller mode, keep its volumes/state,
-and choose host or single-container mode explicitly. Old #499 snapshot archives
+and choose host mode explicitly. Old #499 snapshot archives
 are incompatible with this storage schema and are not automatically imported.
 
 The source includes three separate acceptance entrypoints:

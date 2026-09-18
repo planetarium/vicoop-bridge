@@ -105,10 +105,8 @@ export function defaultOwnerSessionPath(): string {
 // Where the agent CLI actually runs.
 //   - 'host'      : node:child_process.spawn on the bridge-client host
 //                   (today's behavior; default).
-//   - 'container' : `docker exec` into a long-lived vicoop-runtime
-//                   container the bridge client orchestrates (#249).
-// caller-container is reserved configuration, explicitly rejected until R2.
-export type BackendRuntime = 'host' | 'container' | 'caller-container';
+//   - 'container' : dedicated Docker container and volumes per authenticated caller.
+export type BackendRuntime = 'host' | 'container';
 
 export interface ClaudeBackendConfig {
   cwd?: string;
@@ -157,6 +155,7 @@ export interface ClaudeBackendConfig {
    */
   retry_narrated_tool_call?: boolean;
   runtime?: BackendRuntime;
+  /** Legacy shared-container selector, retained to report migration errors. */
   runtime_name?: string;
   caller_runtime?: z.input<typeof CallerRuntimeConfig>;
 }
@@ -167,6 +166,7 @@ export interface CodexBackendConfig {
   /** What to answer when codex requests user approval. Default `decline`. */
   approval_decision?: 'accept' | 'acceptForSession' | 'decline';
   runtime?: BackendRuntime;
+  /** Legacy shared-container selector, retained to report migration errors. */
   runtime_name?: string;
   caller_runtime?: z.input<typeof CallerRuntimeConfig>;
 }
@@ -289,11 +289,13 @@ const KNOWN_CODEX_SANDBOX_MODES = new Set([
   'workspace-write',
   'danger-full-access',
 ]);
-const KNOWN_BACKEND_RUNTIMES = new Set<BackendRuntime>(['host', 'container', 'caller-container']);
+const KNOWN_BACKEND_RUNTIMES = new Set<BackendRuntime>(['host', 'container']);
 
 function pickBackendRuntime(v: unknown): BackendRuntime | undefined {
   if (typeof v !== 'string') return undefined;
   const trimmed = v.trim();
+  if (trimmed === 'caller-container')
+    throw new Error('runtime caller-container was renamed to container; update runtime and retain caller_runtime configuration');
   return KNOWN_BACKEND_RUNTIMES.has(trimmed as BackendRuntime)
     ? (trimmed as BackendRuntime)
     : undefined;

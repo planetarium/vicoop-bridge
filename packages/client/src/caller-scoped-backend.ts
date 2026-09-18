@@ -88,7 +88,7 @@ export class CallerScopedBackend implements Backend {
       )
     )
       throw new Error(
-        'caller-container requires plain A2A text or inline files; caller tools and URI inputs are unsupported',
+        'container requires plain A2A text or inline files; caller tools and URI inputs are unsupported',
       );
     return scope.id;
   }
@@ -113,7 +113,7 @@ export class CallerScopedBackend implements Backend {
         task,
         emit,
         'caller_scope_required',
-        'Invalid scope or unsupported caller-container request',
+        'Invalid scope or unsupported container request',
       );
       return;
     }
