@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { SHUTDOWN_TIMEOUT_MS, runWithShutdownTimeout, shutdownAndReleasePidFile } from './daemon-shutdown.js';
 import { callerStateCmd, runCallerState } from './caller-runtime-admin.js';
 import { createCallerRuntime } from './caller-runtime.js';
 import { parseCodexConfigTomlForModel } from './backends/codex.js';
@@ -497,34 +498,6 @@ export function disableClaudeSandboxGuard(
   return out;
 }
 
-// Race a shutdown promise against a timeout. Container stop normally
-// completes within docker's grace period (RuntimeContainer.stop()
-// passes t: 10s) but we don't want a wedged daemon socket to hold
-// SIGINT hostage indefinitely — operators expect ctrl-c to actually
-// exit. Resolves either way; the caller decides whether to surface
-// the timeout in logs.
-const SHUTDOWN_TIMEOUT_MS = 15_000;
-async function runWithShutdownTimeout(
-  shutdown: () => Promise<void>,
-  logger: Logger,
-  timeoutMs = SHUTDOWN_TIMEOUT_MS,
-): Promise<void> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    await Promise.race([
-      shutdown(),
-      new Promise<void>((resolve) => {
-        timer = setTimeout(() => {
-          logger.warn(`runtime shutdown exceeded ${timeoutMs}ms; exiting anyway`);
-          resolve();
-        }, timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
 // Resolve the agent card the daemon should send inline on `hello`. Order:
 //   1. operator-supplied `--card` path (highest priority — full override)
 //   2. embedded `BUNDLED_CARDS[backend]` shipped with this package (default)
@@ -645,15 +618,11 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     void (async () => {
       logger.info(`shutting down (${signal})`);
       client.stop();
-      if (backendShutdown) {
-        try {
-          await runWithShutdownTimeout(backendShutdown, logger, backend.requiresCallerScope ? CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS : SHUTDOWN_TIMEOUT_MS);
-        } catch (err) {
-          logger.error('shutdown error:', (err as Error).message);
-        }
-      }
-      if (ownsPidFile) removePidFile();
-      process.exit(0);
+      const completed = await shutdownAndReleasePidFile(backendShutdown, logger, {
+        timeoutMs: backend.requiresCallerScope ? CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS : SHUTDOWN_TIMEOUT_MS,
+        removePidFile: ownsPidFile ? removePidFile : undefined,
+      });
+      process.exit(completed ? 0 : 1);
     })();
   };
   process.on('SIGINT', onSignal);

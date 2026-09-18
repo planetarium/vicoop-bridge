@@ -25,6 +25,7 @@ export interface CallerContainer {
   name: string;
   recovered: boolean;
   restarted?: boolean;
+  recreated?: boolean;
 }
 
 // This pool owns containers, not executions. Callers hold a per-scope lease
@@ -319,6 +320,7 @@ export class DockerCallerRuntimePool {
     }
     const recovered = !!info;
     const restarted = !!info && !info.State.Running;
+    const recreated = !fresh && !info;
     if (!info) {
       for (const suffix of ['workspace', 'sessions']) {
         const volume = `${name}-${suffix}`;
@@ -404,7 +406,7 @@ export class DockerCallerRuntimePool {
     ]);
     await this.checkStorage(id, signal);
     signal?.throwIfAborted();
-    const container = { id, name, recovered, restarted };
+    const container = { id, name, recovered, restarted, recreated };
     this.containers.set(id, container);
     return container;
   }
@@ -476,16 +478,25 @@ export class DockerCallerRuntimePool {
     if (!this.locked) throw new Error('caller pool is not initialized');
     await this.stop(id);
     const name = this.name(id);
-    if (await this.inspect(name)) await this.command(['rm', name]);
-    if (await this.networkExists(id))
-      await this.command(['network', 'rm', `${name}-net`]);
+    const container = await this.inspect(name);
+    if (container) {
+      await this.validate(container, id);
+      if (container.State.Running) throw new Error('stop managed containers before offline administration');
+    }
+    // Validate every retained resource before dismantling any of them. Missing
+    // resources are recoverable, but foreign ownership must leave the rest intact.
+    const network = await this.networkExists(id);
+    const volumes: string[] = [];
+    for (const suffix of ['workspace', 'sessions'])
+      if (await this.volumeExists(id, suffix)) volumes.push(`${name}-${suffix}`);
+    if (container) await this.command(['rm', name]);
+    if (network) await this.command(['network', 'rm', `${name}-net`]);
     if (deleteData) {
-      for (const suffix of ['workspace', 'sessions'])
-        if (await this.volumeExists(id, suffix))
-          await this.command(['volume', 'rm', `${name}-${suffix}`]);
+      for (const volume of volumes) await this.command(['volume', 'rm', volume]);
       await this.store.forget(id);
     }
   }
+
   async inputDirectory(id: string, signal?: AbortSignal): Promise<string> {
     const path = `/tmp/vicoop-input-${randomUUID()}`;
     await this.command([

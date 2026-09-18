@@ -296,6 +296,13 @@ try {
   assert.notEqual(restarted.session, a1.session);
   assert.ok(frames.some(f => f.taskId === 'after-docker-stop' && f.metadata?.['vicoop.runtime']?.conversationReset));
   assert.equal(await inspect(b, '{{.State.Running}}'), 'true');
+  await exec('docker', ['rm', '-f', a]);
+  assign('apikey:a', 'after-docker-remove');
+  const recreated = await completed('after-docker-remove');
+  assert.equal(recreated.resumed, false);
+  assert.notEqual(recreated.session, restarted.session);
+  assert.notEqual(await inspect(a, '{{.Id}}'), aid);
+  assert.ok(frames.some(f => f.taskId === 'after-docker-remove' && f.metadata?.['vicoop.runtime']?.conversationReset));
   assign('apikey:a', 'cancel', 'hold-task');
   let pid = '';
   for (let i = 0; i < 100 && !pid; i++) {

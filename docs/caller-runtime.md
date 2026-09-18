@@ -186,7 +186,7 @@ waiter does not stop its predecessor or another caller. Cancellation during
 read-only acquisition, before any Docker mutation or execution, also preserves
 the existing container and conversation. The next request after
 a stopped/failed execution restarts that user's container and reports an explicit
-conversation reset. If Docker stops a container while the daemon remains alive,
+conversation reset. If Docker stops or removes a container while the daemon remains alive,
 the next request restarts it with a fresh worker and an explicit conversation
 reset. Generation-scoped server cancellation may suppress terminal
 frames according to the existing replay protocol.
@@ -359,3 +359,9 @@ sonnet/opus/haiku), `effortLevel` (low/medium/high/max), `alwaysThinkingEnabled`
 hooks and authentication helpers fail initialization and daemon startup. Allowed
 settings are copied before constructing caller workers; host-only settings must
 be removed from the container-mode backend configuration.
+
+On shutdown timeout or cleanup failure, the daemon exits nonzero and retains its
+pidfile instead of reporting a clean shutdown. Inspect the retained runtime
+resources before restart; the next owner must still reconcile Docker state.
+Offline removal preflights the container, network and both volumes before any
+Docker removal, so ownership rejection leaves the remaining resources intact.

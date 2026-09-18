@@ -222,7 +222,7 @@ export class CallerScopedBackend implements Backend {
       acquired = true;
       controller.signal.throwIfAborted();
       phase = 'backend-initialization';
-      if (container.restarted && entry.worker) {
+      if ((container.restarted || container.recreated) && entry.worker) {
         entry.worker.backend.stop?.();
         entry.worker.close();
         await within(entry.worker.settle(), 15000);

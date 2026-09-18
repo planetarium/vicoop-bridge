@@ -30,7 +30,7 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   };
   const network = { Id: 'caller-network-id', Name: `${name}-net`, Driver: 'bridge', Scope: 'local', Labels: labels, Containers: {} as Record<string, { Name: string }>, Options: {} as Record<string, string> };
   const calls: string[][] = [];
-  let removed = false, networkMissing = false;
+  let removed = false, networkMissing = false, badSessionVolume = false;
   const run: AsyncDockerRun = async (args) => {
     calls.push([...args]);
     let value: unknown;
@@ -39,7 +39,7 @@ test('offline recovery accepts changed limits but rejects running or unowned res
     else if (args[0] === 'container') {
       if (args[2] !== name || removed) return { exitCode: 1, stdout: '', stderr: 'No such container' };
       value = [info];
-    } else if (args[0] === 'volume' && args[1] === 'inspect') value = [{ Driver: 'local', Options: {}, Labels: { ...labels, 'vicoop.scope': args[2].includes(id) ? id : scopeDigest('agent', 'bob') } }];
+    } else if (args[0] === 'volume' && args[1] === 'inspect') value = [{ Driver: 'local', Options: {}, Labels: { ...labels, 'vicoop.scope': badSessionVolume && args[2].endsWith('-sessions') ? 'foreign' : args[2].includes(id) ? id : scopeDigest('agent', 'bob') } }];
     else if (args[0] === 'rm') removed = true;
     else if (args[0] === 'network' && args[1] === 'inspect') {
       if (networkMissing) return { exitCode: 1, stdout: '', stderr: 'No such network' };
@@ -106,11 +106,19 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   await assert.rejects(admin.acquire(id), /offline administration/);
   network.Containers.foreign = { Name: 'another-caller' };
   await assert.rejects(admin.remove(id, false), /network.*boundary mismatch/);
+  assert.equal(removed, false, 'foreign network endpoints must not dismantle the container');
   assert.ok(!calls.some(args => args[0] === 'network' && args[1] === 'rm'));
   delete network.Containers.foreign;
   network.Labels = { ...labels, 'vicoop.scope': 'foreign' };
   await assert.rejects(admin.remove(id, false), /network.*boundary mismatch/);
+  assert.equal(removed, false);
   network.Labels = labels;
+  badSessionVolume = true;
+  const before = calls.length;
+  for (const deleteData of [false, true]) await assert.rejects(admin.remove(id, deleteData), /volume ownership/);
+  assert.equal(removed, false);
+  assert.ok(!calls.slice(before).some(args => args.includes('rm')));
+  badSessionVolume = false;
   await admin.remove(id, false);
   assert.deepEqual(await admin.store.scopes(), [id, scopeDigest('agent', 'bob')].sort());
   await admin.close();

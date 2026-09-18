@@ -27,3 +27,5 @@ Reject retained containers with automatic port publishing and validate backend-s
 Reject orphan Docker resources for newly reserved callers without adopting them on restart. Allowlist and copy Claude caller settings so arbitrary operator environment, hooks and helpers never enter caller workloads.
 
 Validate all administration scope selectors, permit ownership-checked offline cleanup of missing/drifted networks, and rebuild workers with explicit conversation reset after externally stopped containers restart.
+
+Preflight all retained resource ownership before removal, reset workers after retained-container recreation, and retain the daemon pidfile with a nonzero exit on unconfirmed shutdown.
