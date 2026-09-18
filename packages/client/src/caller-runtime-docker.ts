@@ -42,8 +42,10 @@ export class DockerCallerRuntimePool {
     this.store = new CallerRuntimeStore(options.stateDirectory, agentId);
     this.run = (args, options) => run(args, { timeoutMs: 10000, ...options });
   }
-  private async command(args: string[]): Promise<string> {
-    const result = await this.run(args);
+  private async command(args: string[], signal?: AbortSignal): Promise<string> {
+    signal?.throwIfAborted();
+    const result = await this.run(args, { signal });
+    signal?.throwIfAborted();
     if (result.exitCode !== 0)
       throw new Error(
         `caller Docker ${args[0]} failed; inspect managed runtime resources`,
@@ -132,13 +134,15 @@ export class DockerCallerRuntimePool {
       throw error;
     }
   }
-  private async inspect(name: string): Promise<any | undefined> {
-    const result = await this.run(['container', 'inspect', name]);
+  private async inspect(name: string, signal?: AbortSignal): Promise<any | undefined> {
+    signal?.throwIfAborted();
+    const result = await this.run(['container', 'inspect', name], { signal });
+    signal?.throwIfAborted();
     if (result.exitCode === 0) return JSON.parse(result.stdout)[0];
     if (/No such (object|container)/i.test(result.stderr)) return undefined;
     throw new Error('cannot inspect caller container');
   }
-  private async validate(c: any, id: string): Promise<void> {
+  private async validate(c: any, id: string, signal?: AbortSignal): Promise<void> {
     const fail = () => {
       throw new Error(
         'caller container ownership or isolation boundary mismatch',
@@ -213,12 +217,14 @@ export class DockerCallerRuntimePool {
       )
     )
       fail();
-    if (!(await this.networkExists(id, c)))
+    if (!(await this.networkExists(id, c, signal)))
       throw new Error('caller network missing');
   }
-  private async networkExists(id: string, container?: any): Promise<boolean> {
+  private async networkExists(id: string, container?: any, signal?: AbortSignal): Promise<boolean> {
     const name = `${this.name(id)}-net`;
-    const found = await this.run(['network', 'inspect', name]);
+    signal?.throwIfAborted();
+    const found = await this.run(['network', 'inspect', name], { signal });
+    signal?.throwIfAborted();
     if (found.exitCode !== 0) {
       if (/No such network|not found/i.test(found.stderr)) return false;
       throw new Error('cannot inspect caller network');
@@ -240,12 +246,14 @@ export class DockerCallerRuntimePool {
     ) throw new Error('caller network ownership or isolation boundary mismatch');
     return true;
   }
-  private async volumeExists(id: string, suffix: string): Promise<boolean> {
+  private async volumeExists(id: string, suffix: string, signal?: AbortSignal): Promise<boolean> {
+    signal?.throwIfAborted();
     const found = await this.run([
       'volume',
       'inspect',
       `${this.name(id)}-${suffix}`,
-    ]);
+    ], { signal });
+    signal?.throwIfAborted();
     if (found.exitCode !== 0) {
       if (/no such volume/i.test(found.stderr)) return false;
       throw new Error('cannot inspect caller volume');
@@ -271,21 +279,21 @@ export class DockerCallerRuntimePool {
     signal?.throwIfAborted();
     const command = (args: string[]) => {
       signal?.throwIfAborted();
-      return this.command(args);
+      return this.command(args, signal);
     };
     const name = this.name(id);
     const fresh = await this.store.reserve(id, this.kind, principalId); // reserve before the first Docker mutation
-    let info = await this.inspect(name);
+    let info = await this.inspect(name, signal);
     const recovered = !!info;
     if (!info) {
       for (const suffix of ['workspace', 'sessions']) {
         const volume = `${name}-${suffix}`;
-        if (!(await this.volumeExists(id, suffix))) {
+        if (!(await this.volumeExists(id, suffix, signal))) {
           if (!fresh) throw new CallerStorageMissingError();
           await command(['volume', 'create', ...this.labelArgs(id), volume]);
         }
       }
-      if (!(await this.networkExists(id))) {
+      if (!(await this.networkExists(id, undefined, signal))) {
         await command([
           'network',
           'create',
@@ -342,15 +350,15 @@ export class DockerCallerRuntimePool {
         '/bin/sleep',
         'infinity',
       ]);
-      info = await this.inspect(name);
+      info = await this.inspect(name, signal);
     }
     signal?.throwIfAborted();
-    await this.validate(info, id);
+    await this.validate(info, id, signal);
     for (const suffix of ['workspace', 'sessions'])
-      if (!(await this.volumeExists(id, suffix)))
+      if (!(await this.volumeExists(id, suffix, signal)))
         throw new CallerStorageMissingError();
     if (!info.State.Running) await command(['start', name]);
-    await this.validate(await this.inspect(name), id);
+    await this.validate(await this.inspect(name, signal), id, signal);
     await command([
       'exec',
       '--user',
@@ -360,13 +368,13 @@ export class DockerCallerRuntimePool {
       '-c',
       brokerFirewallScript(),
     ]);
-    await this.checkStorage(id);
+    await this.checkStorage(id, signal);
     signal?.throwIfAborted();
     const container = { id, name, recovered };
     this.containers.set(id, container);
     return container;
   }
-  async checkStorage(id: string): Promise<void> {
+  async checkStorage(id: string, signal?: AbortSignal): Promise<void> {
     const output = await this.command([
       'exec',
       '--user',
@@ -376,7 +384,7 @@ export class DockerCallerRuntimePool {
       '-skx',
       '/workspace',
       `/data/sessions/${this.kind}`,
-    ]);
+    ], signal);
     const sizes = output
       .trim()
       .split('\n')

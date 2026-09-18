@@ -408,3 +408,13 @@ test('relative and empty state paths fail before authentication or Docker, inclu
     }
   }
 });
+
+test('explicit empty or malformed image references cannot fall back to building', async (t) => {
+  for (const image of ['', ' ', '-bad', 'bad image']) {
+    const f = await fixture(t);
+    await assert.rejects(runCallerContainerInit({ ...f.options, image }), /invalid image/);
+    assert.deepEqual(await f.read(), f.original);
+    assert.equal(f.auth(), 0);
+    assert.deepEqual(f.calls, []);
+  }
+});

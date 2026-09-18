@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { z } from 'zod';
-import semver from 'semver';
+import { assertCallerRuntimeVersion } from './caller-runtime-version.js';
 import { CALLER_IMAGE_FILES } from './caller-image-assets.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { CallerRuntimeStore } from './caller-runtime-store.js';
@@ -13,10 +13,8 @@ import {
 } from './claude-auth-broker.js';
 import {
   createCodexCredentialReader,
-  isSupportedCodexBrokerVersion,
 } from './codex-auth-broker.js';
 import {
-  BACKENDS_MANIFEST,
   type InstallableBackendKind,
 } from './backends-manifest.js';
 import { defaultConfigPath, writeConfig } from './config.js';
@@ -75,7 +73,9 @@ export async function runCallerContainerInit(
         ? undefined
         : object.parse(backend.settings),
     );
-  if (opts.rebuild && opts.image)
+  if (opts.image !== undefined && (!opts.image || opts.image.startsWith('-') || /\s/.test(opts.image)))
+    throw new Error('invalid image reference');
+  if (opts.rebuild && opts.image !== undefined)
     throw new Error('choose --rebuild or --image, not both');
   for (const value of [opts.stateDirectory, previous.stateDirectory]) {
     if (value !== undefined && (typeof value !== 'string' || !isAbsolute(value)))
@@ -138,7 +138,7 @@ export async function runCallerContainerInit(
     let reference =
       opts.image ??
       (opts.rebuild ? undefined : z.string().optional().parse(previous.image));
-    if (!reference) {
+    if (reference === undefined) {
       const context = await mkdtemp(join(tmpdir(), 'vicoop-caller-build-'));
       try {
         for (const [name, content] of Object.entries(CALLER_IMAGE_FILES)) {
@@ -255,18 +255,7 @@ export async function runCallerContainerInit(
         '-ec',
         `/usr/local/bin/node --version >/dev/null; for executable in /usr/bin/tini /usr/bin/du /bin/sleep /bin/mkdir /bin/rm; do test -x "$executable" || { echo "caller image is missing required executable $executable" >&2; exit 1; }; done; for executable in iptables ip6tables awk getent sort mktemp rmdir; do command -v "$executable" >/dev/null || { echo "caller image is missing required helper $executable" >&2; exit 1; }; done; for dir in /workspace /data/sessions/${opts.kind}/config; do probe=$(mktemp -d "$dir/.vicoop-init.XXXXXX") || { echo "caller image must provide writable $dir for UID 1000" >&2; exit 1; }; rmdir "$probe"; done; ${opts.kind} --version`,
       ]);
-      const version = output.match(/\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/)?.[0];
-      if (
-        !version ||
-        !(opts.kind === 'codex'
-          ? isSupportedCodexBrokerVersion(version)
-          : semver.satisfies(version, BACKENDS_MANIFEST.claude.supportedRange, {
-              includePrerelease: true,
-            }))
-      )
-        throw new Error(
-          `caller image has an unsupported or missing ${opts.kind} version`,
-        );
+      const version = assertCallerRuntimeVersion(opts.kind, output);
       log.info(`Validated ${opts.kind} ${version} in ${image.Id}.`);
     } finally {
       const removed = await run(['rm', '-f', '-v', name]);

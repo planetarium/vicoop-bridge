@@ -326,3 +326,9 @@ SCOPE_DIGEST` to discard the retained scope and its remaining data before starti
 over. `container recreate` preserves state and does not repair missing volumes.
 This also applies when initial allocation was interrupted after reserving the
 scope but before creating both volumes; inspect retained data before removing it.
+
+The daemon applies the same backend-version compatibility checks as initialization.
+Codex model catalogs are shared across scopes within one daemon, revalidated
+against the host login on access, and refreshed when credentials or the installed
+version change. Concurrent callers share a lookup; canceling one does not cancel
+the others, and canceling the last waiter aborts the lookup.

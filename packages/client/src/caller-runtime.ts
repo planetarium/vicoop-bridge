@@ -1,3 +1,5 @@
+import { createCodexModelCatalogCache } from './codex-model-catalog-cache.js';
+import { assertCallerRuntimeVersion } from './caller-runtime-version.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import {
   DockerCallerRuntimePool,
@@ -12,8 +14,6 @@ import { createClaudeBrokerSpawn } from './claude-broker-spawn.js';
 import {
   createCodexCredentialReader,
   createCodexAuthBroker,
-  loadCodexModelCatalog,
-  isSupportedCodexBrokerVersion,
 } from './codex-auth-broker.js';
 import { createExecutionBrokerSpawn } from './execution-broker-spawn.js';
 import {
@@ -41,6 +41,7 @@ export async function createCallerRuntime(args: {
     args.kind === 'codex' ? createCodexCredentialReader() : undefined;
   const selected = await (claudeCredential ?? codexCredential)!();
   if (args.kind === 'claude') assertClaudeBrokerSettings(args.claude?.settings);
+  const catalog = codexCredential ? createCodexModelCatalogCache(codexCredential) : undefined;
   const pool = new DockerCallerRuntimePool(args.kind, config, args.agentId);
   const backend = new CallerScopedBackend(
     args.agentId,
@@ -58,19 +59,14 @@ export async function createCallerRuntime(args: {
       signal.throwIfAborted();
       if (version.exitCode !== 0)
         throw new Error('caller image must contain installed backend');
-      const installed = version.stdout.match(/\d+\.\d+\.\d+/)?.[0];
-      if (
-        args.kind === 'codex' &&
-        (!installed || !isSupportedCodexBrokerVersion(installed))
-      )
-        throw new Error('caller image Codex version is unsupported');
+      const installed = assertCallerRuntimeVersion(args.kind, version.stdout);
       const brokerStats: Array<{
         forwarded: number;
         rejected: number;
         lastRejectedStatus?: number;
       }> = [];
       const codexCatalog = args.kind === 'codex'
-        ? await loadCodexModelCatalog(codexCredential!, installed!, undefined, signal)
+        ? await catalog!(installed, signal)
         : undefined;
       signal.throwIfAborted();
       const broker =

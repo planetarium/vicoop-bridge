@@ -172,3 +172,39 @@ test('retained scopes never recreate missing workspace or session volumes after 
     } finally { await pool.close(); }
   }
 });
+
+test('allocation forwards cancellation to inspections and mutations, then stops issuing commands', async (t) => {
+  for (const phase of ['container', 'volume', 'network', 'create']) {
+    const directory = await mkdtemp(join(tmpdir(), 'caller-abort-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const config = CallerRuntimeConfig.parse({ image: `sha256:${'a'.repeat(64)}`, stateDirectory: directory });
+    const controller = new AbortController();
+    let allocating = false, reached!: () => void;
+    const started = new Promise<void>(resolve => { reached = resolve; });
+    const calls: string[][] = [];
+    const pool = new DockerCallerRuntimePool('claude', config, 'agent', async (args, opts) => {
+      calls.push([...args]);
+      if (allocating) {
+        assert.equal(opts?.signal, controller.signal);
+        if (args[0] === phase) {
+          reached();
+          await new Promise<void>((_resolve, reject) => opts.signal!.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+        }
+      }
+      if (args[0] === 'image') return { exitCode: 0, stdout: JSON.stringify([{ Config: {} }]), stderr: '' };
+      if (args[1] === 'inspect') return { exitCode: 1, stdout: '', stderr: `No such ${args[0]}` };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+    await pool.initialize();
+    allocating = true;
+    const acquisition = pool.acquire(scopeDigest('agent', 'alice'), controller.signal, 'alice');
+    const rejected = assert.rejects(acquisition, /aborted/);
+    await started;
+    const before = calls.length;
+    controller.abort();
+    await rejected;
+    assert.equal(calls.length, before);
+    allocating = false; // Cleanup must use an independent, uncanceled operation.
+    await pool.close();
+  }
+});
