@@ -206,6 +206,9 @@ disk boundary. The initial implementation does not claim that acceptance gate.
 
 Stop the daemon first. Administration takes the same exclusive ownership lock
 and refuses to operate while a live owner or running managed container exists.
+Stopped containers can be recreated or deleted after changing CPU, memory, PID
+or scope-count limits. Ownership and isolation checks still apply; execution
+requires the container to match the new limits.
 
 ```sh
 vicoop-client caller-state --config /path/to/config.json

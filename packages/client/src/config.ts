@@ -343,7 +343,7 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const runtime = pickBackendRuntime(claudeRaw.runtime);
       const callerRuntime = claudeRaw.caller_runtime === undefined ? undefined : CallerRuntimeConfig.parse(claudeRaw.caller_runtime);
       const runtimeName = asString(claudeRaw.runtime_name);
-      if (cwd || settings || model || models || runtime || runtimeName) {
+      if (cwd || settings || model || models || runtime || runtimeName || callerRuntime) {
         out.claude = {};
         if (cwd) out.claude.cwd = cwd;
         if (settings) out.claude.settings = settings;
@@ -368,7 +368,7 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const runtime = pickBackendRuntime(codexRaw.runtime);
       const callerRuntime = codexRaw.caller_runtime === undefined ? undefined : CallerRuntimeConfig.parse(codexRaw.caller_runtime);
       const runtimeName = asString(codexRaw.runtime_name);
-      if (cwd || validSandbox || validApproval || runtime || runtimeName) {
+      if (cwd || validSandbox || validApproval || runtime || runtimeName || callerRuntime) {
         out.codex = {};
         if (cwd) out.codex.cwd = cwd;
         if (validSandbox) out.codex.sandbox_mode = validSandbox;

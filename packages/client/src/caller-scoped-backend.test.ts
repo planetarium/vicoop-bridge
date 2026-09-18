@@ -284,3 +284,26 @@ test('configuration rejects mutable images, unknown options and unbounded limits
   ])
     assert.throws(() => CallerRuntimeConfig.parse({ ...options, ...change }));
 });
+
+
+test('canceling before allocation releases capacity for another principal', async () => {
+  const f = fixture(undefined, { maxScopes: 1 });
+  const controller = new AbortController();
+  const work = f.run(task(), controller.signal);
+  controller.abort();
+  assert.match(JSON.stringify(await work), /runtime_canceled/);
+  assert.equal(f.allocations.length, 0);
+  assert.equal((await f.run(task('bob'))).at(-1)?.type, 'task.complete');
+});
+
+test('canceling a first request preserves the same-scope successor barrier and slot', async () => {
+  const f = fixture(undefined, { maxScopes: 1 });
+  const controller = new AbortController();
+  const first = f.run(task(), controller.signal);
+  const successor = f.run(task('alice', 'next'));
+  controller.abort();
+  await first;
+  assert.match(JSON.stringify(await f.run(task('bob'))), /runtime_capacity/);
+  assert.equal((await successor).at(-1)?.type, 'task.complete');
+  assert.equal(f.allocations.length, 1);
+});

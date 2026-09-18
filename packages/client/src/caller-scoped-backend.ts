@@ -18,6 +18,8 @@ export interface CallerWorker {
   healthy(): boolean;
 }
 interface Entry {
+  users: number;
+  retained: boolean;
   tail: Promise<void>;
   worker?: CallerWorker;
   contexts: Set<string>;
@@ -45,6 +47,8 @@ export class CallerScopedBackend implements Backend {
   }
   private entry(recovered = false): Entry {
     return {
+      users: 0,
+      retained: recovered,
       tail: Promise.resolve(),
       contexts: new Set(),
       recovered,
@@ -156,6 +160,7 @@ export class CallerScopedBackend implements Backend {
     const controller = new AbortController();
     this.controllers.add(controller);
     this.pending++;
+    entry.users++;
     const abort = () => controller.abort();
     signal.addEventListener('abort', abort, { once: true });
     if (signal.aborted) abort();
@@ -198,6 +203,8 @@ export class CallerScopedBackend implements Backend {
       }
       acquired = true;
       phase = 'allocation';
+      // acquire may persist a reservation even when Docker allocation fails.
+      entry.retained = true;
       const container = await this.pool.acquire(
         id,
         controller.signal,
@@ -318,6 +325,8 @@ export class CallerScopedBackend implements Backend {
       signal.removeEventListener('abort', abort);
       this.controllers.delete(controller);
       this.pending--;
+      entry.users--;
+      if (!entry.retained && entry.users === 0) this.entries.delete(id);
     }
   }
   stop() {

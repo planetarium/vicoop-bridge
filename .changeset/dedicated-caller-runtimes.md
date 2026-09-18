@@ -7,3 +7,5 @@ Make container execution caller-isolated for Claude and Codex with reusable per-
 Persist validated principal-to-scope mappings in a private SQLite database with transactional migration from version-2/3 JSON stores. Legacy hash-only records remain unknown until a matching validated request arrives; the version-4 manifest blocks older JSON state readers. User lookup and environment initialization remain follow-up work.
 
 Make `container init claude|codex` prepare per-caller execution end to end: check host authentication, build an embedded backend image without a repository checkout or validate `--image`, initialize private SQLite state and save the immutable image/configuration. Preserve registration and unrelated settings, reject active state and unsafe image replacement, and leave config unchanged on failure. Legacy shared-container init flags now report migration guidance.
+
+Allow offline recreation/deletion after resource-limit changes, release unused caller capacity when requests cancel before allocation, and preserve caller runtime configuration when execution mode is selected via CLI.

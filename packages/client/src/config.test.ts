@@ -576,3 +576,16 @@ test('retired caller-container config fails with a migration hint instead of sel
     assert.throws(() => readConfig(path), /renamed to container/);
   }
 });
+
+
+test('caller_runtime survives without a config runtime selector for CLI overrides', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'caller-config-override-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  const caller_runtime = { image: `sha256:${'a'.repeat(64)}`, stateDirectory: join(dir, 'state') };
+  for (const kind of ['claude', 'codex'] as const) {
+    writeFileSync(path, JSON.stringify({ backends: { [kind]: { caller_runtime } } }));
+    assert.equal(readConfig(path)?.backends?.[kind]?.caller_runtime?.image, caller_runtime.image);
+    assert.equal(readConfig(path)?.backends?.[kind]?.runtime, undefined);
+  }
+});

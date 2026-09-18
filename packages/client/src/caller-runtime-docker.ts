@@ -20,6 +20,7 @@ export class DockerCallerRuntimePool {
   private readonly containers = new Map<string, CallerContainer>();
   private readonly run: AsyncDockerRun;
   private locked = false;
+  private offline = false;
   constructor(
     readonly kind: CallerKind,
     readonly options: CallerRuntimeOptions,
@@ -60,6 +61,7 @@ export class DockerCallerRuntimePool {
       throw new Error('container requires Linux or macOS Docker');
     await this.store.lock();
     this.locked = true;
+    this.offline = !reconcile;
     try {
       const [image] = JSON.parse(
         await this.command(['image', 'inspect', this.options.image]),
@@ -74,7 +76,7 @@ export class DockerCallerRuntimePool {
           'caller image must not declare volumes or provider environment',
         );
       const ids = await this.store.scopes();
-      if (ids.length > this.options.maxScopes)
+      if (!this.offline && ids.length > this.options.maxScopes)
         throw new Error('retained scopes exceed maxScopes');
       const resources = await this.command([
         'ps',
@@ -157,10 +159,13 @@ export class DockerCallerRuntimePool {
         (v: string) => !['NET_ADMIN'].includes(v.replace(/^CAP_/, '')),
       ) ||
       !h.CapAdd?.some((v: string) => v.replace(/^CAP_/, '') === 'NET_ADMIN') ||
-      h.Memory !== this.options.memoryMiB * 1048576 ||
-      h.MemorySwap !== h.Memory ||
-      h.PidsLimit !== this.options.pids ||
-      h.NanoCpus !== this.options.cpus * 1e9 ||
+      // Offline recovery must allow replacement after operator limit changes.
+      // Ownership, mounts and isolation remain mandatory in both modes.
+      (!this.offline &&
+        (h.Memory !== this.options.memoryMiB * 1048576 ||
+          h.MemorySwap !== h.Memory ||
+          h.PidsLimit !== this.options.pids ||
+          h.NanoCpus !== this.options.cpus * 1e9)) ||
       config.Env?.some((v: string) =>
         PROVIDER_ENV_PATTERN.test(v.split('=', 1)[0]),
       )
@@ -218,6 +223,7 @@ export class DockerCallerRuntimePool {
     principalId?: string,
   ): Promise<CallerContainer> {
     if (!this.locked) throw new Error('caller pool is not initialized');
+    if (this.offline) throw new Error('offline administration cannot acquire callers');
     signal?.throwIfAborted();
     const command = (args: string[]) => {
       signal?.throwIfAborted();
@@ -356,6 +362,12 @@ export class DockerCallerRuntimePool {
       return;
     }
     this.validate(info, id);
+    if (this.offline) {
+      if (info.State.Running)
+        throw new Error('stop managed containers before offline administration');
+      this.containers.delete(id);
+      return;
+    }
     await this.command(['stop', '-t', '0', name]);
     const stopped = await this.inspect(name);
     if (stopped?.State.Running)
