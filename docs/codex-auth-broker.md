@@ -56,16 +56,24 @@ are never accepted from or echoed back to the workload.
 
 ## Current per-caller setup
 
-Daemon `--runtime container` now allocates dedicated caller containers. Log into
-Codex on the host, then follow [caller runtime setup](caller-runtime.md) to
-build a pinned image and configure `caller_runtime.image` and `stateDirectory`.
-Start with `vicoop-client start --config /path/to/config.json`. Shared runtime
-names and workspace bind mounts are no longer accepted by the daemon.
+After registering the bridge agent and preparing Codex authentication on
+the host, run:
 
-### Legacy per-backend resources
+```sh
+vicoop-client container init codex
+vicoop-client start --detach
+```
+
+Initialization builds or validates an image, creates private caller state and
+saves the agent config. See [caller runtime setup](caller-runtime.md) for custom
+images, alternate configs and migration behavior.
+
+### Legacy per-backend resources (historical)
 
 The migration details below describe older shared runtimes and their retained
-administrative commands. They do not configure the current per-caller daemon.
+administrative commands. The old init flags shown below apply only to earlier
+client versions; current init rejects them. They do not configure the current
+per-caller daemon.
 
 
 `--from-host` is accepted for compatibility but does not copy credentials.

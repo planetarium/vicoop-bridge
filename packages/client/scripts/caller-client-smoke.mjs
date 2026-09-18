@@ -235,6 +235,13 @@ async function inspect(name, format) {
   ).stdout.trim();
 }
 try {
+  await exec(binary, ['container', 'init', kind, '--config', configPath, '--image', image], {
+    env: clientEnv, cwd: directory, timeout: 120000,
+  });
+  const initialized = JSON.parse(await readFile(configPath, 'utf8'));
+  assert.equal(initialized.server_token, config.server_token);
+  assert.equal(initialized.backends[kind].runtime, 'container');
+  assert.match(initialized.backends[kind].caller_runtime.image, /^sha256:[a-f0-9]{64}$/);
   await start();
   namespace = createHash('sha256')
     .update(
@@ -373,7 +380,7 @@ try {
   assert.ok(!/SIGKILL|force.kill/i.test(stopped.stdout + stopped.stderr));
   assert.equal(await inspect(b, '{{.State.Running}}'), 'false');
   console.log(
-    `PASS ${kind}: compiled CLI A/B/A conversations, new-context container reuse, reconnect, isolated cancellation, forced restart, offline administration, recreate persistence and detached stop`,
+    `PASS ${kind}: compiled CLI init, SQLite mappings, A/B/A conversations, new-context container reuse, reconnect, isolated cancellation, forced restart, offline administration, recreate persistence and detached stop`,
   );
 } finally {
   await stop();

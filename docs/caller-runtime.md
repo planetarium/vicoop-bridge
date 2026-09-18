@@ -12,7 +12,56 @@ supported in this mode. The two execution modes are `host` (default) and
 `container` (dedicated per caller); shared-container execution is no longer
 available through the daemon.
 
-## Prepare an image and configuration
+## Initial setup
+
+Use Linux or macOS with a running Docker engine. Register the agent with
+`vicoop-client auth login` and `vicoop-client agent register` first, and prepare
+Claude/Codex authentication on the host. Then run:
+
+```sh
+vicoop-client container init claude
+vicoop-client start --detach
+```
+
+Use `codex` instead of `claude` for Codex. `container init` selects that backend
+in the canonical config, checks that host credentials are available, builds the
+bundled Claude/Codex image and checks the selected CLI version in a temporary,
+networkless container. It writes the immutable image ID and a private
+agent/backend-specific `caller_runtime.stateDirectory` beside config.json,
+initializes SQLite state, and sets `runtime: "container"`. No repository checkout
+or manual config editing is required. Provider credentials are not copied or
+passed into the image build/probe; availability checks do not make model calls.
+Caller containers are allocated only when their first authenticated task arrives.
+
+The first build downloads packages and backend binaries. Later initialization
+reuses the configured image and preserves state paths, resource limits, other
+backend settings and agent credentials. Legacy `cwd`/`runtime_name` settings are
+removed only after validation succeeds. Build/authentication/probe failures leave
+the config unchanged; concurrent config edits abort the save. Stop the daemon and
+caller containers before reinitializing. A different image requires removing
+retained containers via `caller-state --recreate-scope` first (volumes and mappings
+are retained). Initialization never changes an existing state-directory path.
+
+```sh
+# A separate registered-agent config and an existing/custom image:
+vicoop-client container init codex --config /path/to/config.json --image my-caller:tag
+vicoop-client start --detach --config /path/to/config.json
+# Choose a state path on first initialization:
+vicoop-client container init claude --state-directory /private/claude-callers
+# Rebuild the bundled recipe rather than reuse the configured image:
+vicoop-client container init claude --rebuild
+```
+
+`--image` accepts a tag or digest, pulls it if missing, and persists its immutable
+local image ID. Images must include the backend, Node, tini and firewall tools,
+and must not declare anonymous volumes or provider credential environment.
+`--from-host` remains a compatibility flag; authentication always stays on the
+host. Shared-container `--name`, `--workspace`, `--reuse-state` and `--bridge`
+options are rejected with a migration hint.
+
+## Advanced image and configuration control
+
+The bundled recipe is also available in the repository for custom builds:
 
 On Linux or macOS with Docker, build the backend-installed image from the repo:
 
@@ -87,9 +136,10 @@ names from the verified caller scope. The daemon rejects incomplete legacy
 configuration before accepting tasks. Legacy shared workspaces/sessions are not
 automatically assigned or copied to any caller.
 
-`container init/list/remove/validate` remain available for managing legacy
-per-backend resources; they do not prepare or select the daemon's per-caller
-containers. Use the image recipe above and `caller-state` for the new mode.
+`container init` now prepares per-caller execution and can migrate the selected
+backend configuration automatically. `container list/remove/validate` remain
+available for managing legacy per-backend resources; they do not select caller
+containers. Use `caller-state` for per-caller resource administration.
 Host execution (including a client already inside a bundled-direct container)
 keeps its existing behavior.
 
@@ -178,8 +228,11 @@ server makes it refuse work. Rollback: stop caller mode, keep its volumes/state,
 and choose host mode explicitly. Old #499 snapshot archives
 are incompatible with this storage schema and are not automatically imported.
 
-The source includes three separate acceptance entrypoints:
+The source includes these acceptance entrypoints:
 
+- `scripts/caller-init-smoke.mjs`: standalone compiled CLI initialization outside
+  the repository, embedded image build, backend probes, private state creation,
+  config preservation and repeat initialization; no provider calls.
 - `scripts/caller-runtime-smoke.ts`: real Docker lifecycle, A/B/A storage,
   stop/recreate/restart, owner lock, input transfer and threshold admission.
 - `scripts/caller-client-smoke.mjs`: the Bun-compiled CLI, a local WebSocket
@@ -233,3 +286,9 @@ pre-upgrade backup instead.
 
 User lookup, live inspection and environment initialization/reapplication remain
 in #507; this change only establishes the persisted identity mapping.
+
+
+The standalone image assets are generated by
+`node packages/client/scripts/generate-caller-image.mjs` from the reviewed
+Dockerfile and Claude installer. Regenerate them after changing either source;
+CI verifies their contents match.

@@ -179,7 +179,7 @@ export class RuntimeContainer {
       if (!this.opts.createIfMissing) {
         throw new Error(
           `runtime container '${name}' does not exist. ` +
-            `Create it first with \`vicoop-client container init ${this.opts.backendKind} --name ${this.opts.runtimeName}\`, ` +
+            `This is a legacy per-backend resource. For per-caller execution use \`vicoop-client container init ${this.opts.backendKind}\`. ` +
             'For daemon execution, configure per-caller container mode as documented in docs/caller-runtime.md.',
         );
       }

@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/client-ci.yml'
       - 'packages/client/**'
+      - 'container/backends/claude.sh'
       - 'packages/protocol/**'
       - 'scripts/**'
       - 'install.sh'
@@ -15,6 +16,7 @@ on:
     paths:
       - '.github/workflows/client-ci.yml'
       - 'packages/client/**'
+      - 'container/backends/claude.sh'
       - 'packages/protocol/**'
       - 'scripts/**'
       - 'install.sh'
@@ -63,7 +65,7 @@ jobs:
 
       - name: Test Bun caller storage and standalone SQLite
         run: |
-          bun test packages/client/src/caller-runtime-store.test.ts
+          bun test packages/client/src/caller-runtime-store.test.ts packages/client/src/caller-container-init.test.ts
           bun build --compile packages/client/scripts/caller-store-smoke.ts --outfile /tmp/caller-store-smoke
           /tmp/caller-store-smoke
 
