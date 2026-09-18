@@ -11,3 +11,5 @@ Make `container init claude|codex` prepare per-caller execution end to end: chec
 Allow offline recreation/deletion after resource-limit changes, release unused caller capacity when requests cancel before allocation, and preserve caller runtime configuration when execution mode is selected via CLI.
 
 Reject invalid runtime selectors and relative state paths. Unify caller administration under container list/validate/recreate/remove (canonical config by default), move old shared-container tools under container legacy, and retain caller-state as a compatibility alias. Offline cleanup no longer requires the execution image. Initialization verifies writable workspace/session volumes as the workload user; update migration guidance and legacy harness tooling accordingly.
+
+Validate actual per-caller network membership, network ownership/options and exact tmpfs bounds on reuse. Propagate initialization cancellation, distinguish storage inspection failures from quota violations, emit recovery status once, reject retired runtime-name flags, check required image helpers, and serialize CLI configuration writes with snapshot checks.

@@ -9,6 +9,7 @@ import type {
   DockerCallerRuntimePool,
   CallerContainer,
 } from './caller-runtime-docker.js';
+import { CallerStorageLimitError } from './caller-runtime-docker.js';
 import { scopeDigest } from './caller-runtime-store.js';
 import { createHash } from 'node:crypto';
 export interface CallerWorker {
@@ -37,7 +38,7 @@ export class CallerScopedBackend implements Backend {
   constructor(
     private agentId: string,
     readonly pool: DockerCallerRuntimePool,
-    private factory: (container: CallerContainer) => Promise<CallerWorker>,
+    private factory: (container: CallerContainer, signal: AbortSignal) => Promise<CallerWorker>,
   ) {
     this.name = pool.kind;
   }
@@ -177,6 +178,7 @@ export class CallerScopedBackend implements Backend {
     let monitor: NodeJS.Timeout | undefined;
     let storageCheck: Promise<void> | undefined;
     let storageFailure = false;
+    let storageCheckFailed = false;
     const heartbeat = setInterval(() => {
       if (!controller.signal.aborted)
         emit({
@@ -212,9 +214,9 @@ export class CallerScopedBackend implements Backend {
       );
       controller.signal.throwIfAborted();
       phase = 'backend-initialization';
-      if (!entry.worker) entry.worker = await this.factory(container);
+      if (!entry.worker) entry.worker = await this.factory(container, controller.signal);
       controller.signal.throwIfAborted();
-      if (entry.recovered && !entry.contexts.has(context))
+      if (entry.recovered && !entry.contexts.has(context)) {
         emit({
           type: 'task.status',
           taskId: task.taskId,
@@ -226,14 +228,17 @@ export class CallerScopedBackend implements Backend {
             },
           },
         });
+        entry.recovered = false;
+      }
       entry.contexts.add(context);
       let terminal: UpFrame | undefined;
       monitor = setInterval(() => {
         if (storageCheck) return;
         storageCheck = this.pool
           .checkStorage(id)
-          .catch(() => {
-            storageFailure = true;
+          .catch((error) => {
+            storageCheckFailed = true;
+            storageFailure = error instanceof CallerStorageLimitError;
             abort();
           })
           .finally(() => {
@@ -267,10 +272,7 @@ export class CallerScopedBackend implements Backend {
       emit(terminal);
     } catch (error) {
       clearInterval(monitor);
-      if (
-        error instanceof Error &&
-        error.message === 'caller storage limit exceeded'
-      )
+      if (error instanceof CallerStorageLimitError)
         storageFailure = true;
       console.error(
         'Caller runtime failure phase:',
@@ -305,9 +307,11 @@ export class CallerScopedBackend implements Backend {
           ? 'runtime_quarantined'
           : storageFailure
             ? 'runtime_storage_limit'
-            : controller.signal.aborted
-              ? 'runtime_canceled'
-              : 'runtime_failed',
+            : storageCheckFailed
+              ? 'runtime_failed'
+              : controller.signal.aborted
+                ? 'runtime_canceled'
+                : 'runtime_failed',
         entry.quarantined
           ? 'Caller cleanup could not be confirmed; scope quarantined'
           : acquired

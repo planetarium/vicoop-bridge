@@ -29,19 +29,19 @@ try {
   const original = await readFile(configPath, 'utf8');
   await docker(['tag', image!, parentTag]);
   const dockerfile = join(directory, 'Dockerfile');
-  await writeFile(dockerfile, `FROM ${parentTag}\nUSER root\nARG BLOCKED_PATH\nRUN chown root:root "$BLOCKED_PATH" && chmod 755 "$BLOCKED_PATH"\nLABEL vicoop.init-smoke="${randomUUID()}"\nUSER node\n`);
-  for (const path of ['/workspace', '/data/sessions/claude/config']) {
+  await writeFile(dockerfile, `FROM ${parentTag}\nUSER root\nARG BLOCKED_PATH\nARG REMOVE_PATH\nRUN if [ -n "$REMOVE_PATH" ]; then rm "$REMOVE_PATH"; else chown root:root "$BLOCKED_PATH" && chmod 755 "$BLOCKED_PATH"; fi\nLABEL vicoop.init-smoke="${randomUUID()}"\nUSER node\n`);
+  for (const path of ['/workspace', '/data/sessions/claude/config', '/bin/sleep', '/usr/bin/du', '/usr/bin/awk']) {
     const iid = join(directory, 'image-id');
-    await docker(['build', '--iidfile', iid, '--build-arg', `BLOCKED_PATH=${path}`, directory]);
+    await docker(['build', '--iidfile', iid, '--build-arg', `${path.includes('/bin/') ? 'REMOVE_PATH' : 'BLOCKED_PATH'}=${path}`, directory]);
     const invalid = (await readFile(iid, 'utf8')).trim();
     images.push(invalid);
     await assert.rejects(runCallerContainerInit({
       kind: 'claude', configPath, image: invalid,
       validateCredentials: async () => {}, logger: createLogger('silent'),
-    }), /caller image must provide writable/);
+    }), path.includes('/bin/') ? /caller image is missing required/ : /caller image must provide writable/);
     assert.equal(await readFile(configPath, 'utf8'), original);
   }
-  console.log('PASS both init backends, offline validation, rejected root-owned workspace/session volumes, unchanged config on failure');
+  console.log('PASS both init backends, offline validation, rejected root-owned workspace/session volumes, missing runtime helper rejection, unchanged config on failure');
 } finally {
   for (const id of images) await docker(['image', 'rm', id]);
   await runDockerCommand(['image', 'rm', parentTag]);

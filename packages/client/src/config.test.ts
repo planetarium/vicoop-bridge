@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -600,4 +600,23 @@ test('explicit invalid runtime values never fall back to host execution', (t) =>
       assert.throws(() => readConfig(path), /runtime must be host or container/);
     }
   }
+});
+
+
+test('config writers respect exclusive ownership and compare snapshots before committing', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'config-writer-lock-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  writeConfig(path, { backend: 'claude' });
+  const original = readFileSync(path, 'utf8');
+  mkdirSync(`${path}.lock`);
+  assert.throws(() => writeConfig(path, { backend: 'codex' }), /config write is locked/);
+  assert.equal(readFileSync(path, 'utf8'), original);
+  rmSync(`${path}.lock`, { recursive: true });
+  writeConfig(path, { backend: 'codex' });
+  assert.throws(() => writeConfig(path, { backend: 'claude' }, original), /config changed/);
+  assert.equal(readConfig(path)?.backend, 'codex');
+  assert.equal(existsSync(`${path}.lock`), false);
+  writeConfig(path, { backend: 'claude' }, readFileSync(path, 'utf8'));
+  assert.equal(readConfig(path)?.backend, 'claude');
 });

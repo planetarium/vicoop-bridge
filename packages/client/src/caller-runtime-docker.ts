@@ -6,6 +6,14 @@ import { brokerFirewallScript } from './execution-runtime-boundary.js';
 import { PROVIDER_ENV_PATTERN } from './provider-environment.js';
 import type { CallerRuntimeOptions } from './caller-runtime-config.js';
 
+export class CallerStorageLimitError extends Error {
+  constructor() { super('caller storage limit exceeded'); }
+}
+export const CALLER_TMPFS = {
+  '/tmp': 'rw,nosuid,nodev,size=67108864,mode=1777',
+  '/home/node': 'rw,nosuid,nodev,size=16777216,uid=1000,gid=1000,mode=0700',
+};
+
 export type CallerKind = 'claude' | 'codex';
 export interface CallerContainer {
   id: string;
@@ -106,7 +114,7 @@ export class DockerCallerRuntimePool {
         await this.store.reserve(id, this.kind);
         const info = await this.inspect(this.name(id));
         if (info) {
-          this.validate(info, id);
+          await this.validate(info, id);
           if (!reconcile && info.State.Running)
             throw new Error(
               'stop the daemon and managed containers before offline administration',
@@ -127,7 +135,7 @@ export class DockerCallerRuntimePool {
     if (/No such (object|container)/i.test(result.stderr)) return undefined;
     throw new Error('cannot inspect caller container');
   }
-  private validate(c: any, id: string): void {
+  private async validate(c: any, id: string): Promise<void> {
     const fail = () => {
       throw new Error(
         'caller container ownership or isolation boundary mismatch',
@@ -148,6 +156,8 @@ export class DockerCallerRuntimePool {
       !h?.ReadonlyRootfs ||
       h.Privileged ||
       h.NetworkMode !== `${this.name(id)}-net` ||
+      Object.keys(c.NetworkSettings?.Networks ?? {}).length !== 1 ||
+      !Object.hasOwn(c.NetworkSettings?.Networks ?? {}, `${this.name(id)}-net`) ||
       h.PidMode ||
       h.UsernsMode ||
       !['', 'private', undefined].includes(h.IpcMode) ||
@@ -187,8 +197,10 @@ export class DockerCallerRuntimePool {
     }
     if (
       mounts.size ||
-      Object.keys(h.Tmpfs ?? {}).some(
-        (p) => !['/tmp', '/home/node'].includes(p),
+      Object.keys(h.Tmpfs ?? {}).length !== Object.keys(CALLER_TMPFS).length ||
+      Object.entries(CALLER_TMPFS).some(([path, options]) =>
+        typeof h.Tmpfs?.[path] !== 'string' ||
+        h.Tmpfs[path].split(',').sort().join(',') !== options.split(',').sort().join(','),
       )
     )
       fail();
@@ -198,6 +210,32 @@ export class DockerCallerRuntimePool {
       )
     )
       fail();
+    if (!(await this.networkExists(id, c)))
+      throw new Error('caller network missing');
+  }
+  private async networkExists(id: string, container?: any): Promise<boolean> {
+    const name = `${this.name(id)}-net`;
+    const found = await this.run(['network', 'inspect', name]);
+    if (found.exitCode !== 0) {
+      if (/No such network|not found/i.test(found.stderr)) return false;
+      throw new Error('cannot inspect caller network');
+    }
+    const [network] = JSON.parse(found.stdout);
+    const endpoint = container?.NetworkSettings?.Networks?.[name];
+    if (
+      network.Name !== name || !network.Id ||
+      network.Driver !== 'bridge' || network.Scope !== 'local' ||
+      network.Internal || network.Ingress || network.Attachable || network.EnableIPv6 ||
+      Object.keys(network.Options ?? {}).length ||
+      Object.entries(this.labels(id)).some(([k, v]) => network.Labels?.[k] !== v) ||
+      Object.entries(network.Containers ?? {}).some(([key, value]: [string, any]) =>
+        !container || key !== container.Id || value.Name !== this.name(id),
+      ) ||
+      (container && (!endpoint ||
+        (endpoint.NetworkID && endpoint.NetworkID !== network.Id) ||
+        (container.State.Running && endpoint.NetworkID !== network.Id)))
+    ) throw new Error('caller network ownership or isolation boundary mismatch');
+    return true;
   }
   private async volumeExists(id: string, suffix: string): Promise<boolean> {
     const found = await this.run([
@@ -243,19 +281,7 @@ export class DockerCallerRuntimePool {
           await command(['volume', 'create', ...this.labelArgs(id), volume]);
         }
       }
-      const network = await this.run(['network', 'inspect', `${name}-net`]);
-      if (network.exitCode === 0) {
-        const [n] = JSON.parse(network.stdout);
-        if (
-          Object.entries(this.labels(id)).some(
-            ([k, v]) => n.Labels?.[k] !== v,
-          ) ||
-          Object.keys(n.Containers ?? {}).length
-        )
-          throw new Error('caller network ownership mismatch');
-      } else {
-        if (!/No such network|not found/i.test(network.stderr))
-          throw new Error('cannot inspect caller network');
+      if (!(await this.networkExists(id))) {
         await command([
           'network',
           'create',
@@ -294,9 +320,9 @@ export class DockerCallerRuntimePool {
         '--mount',
         `type=volume,source=${name}-sessions,target=/data/sessions/${this.kind}`,
         '--tmpfs',
-        '/tmp:rw,nosuid,nodev,size=67108864,mode=1777',
+        `/tmp:${CALLER_TMPFS['/tmp']}`,
         '--tmpfs',
-        '/home/node:rw,nosuid,nodev,size=16777216,uid=1000,gid=1000,mode=0700',
+        `/home/node:${CALLER_TMPFS['/home/node']}`,
         '--env',
         `${this.kind === 'claude' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME'}=/data/sessions/${this.kind}/config`,
         '--env',
@@ -315,11 +341,12 @@ export class DockerCallerRuntimePool {
       info = await this.inspect(name);
     }
     signal?.throwIfAborted();
-    this.validate(info, id);
+    await this.validate(info, id);
     for (const suffix of ['workspace', 'sessions'])
       if (!(await this.volumeExists(id, suffix)))
         throw new Error('caller volume missing');
     if (!info.State.Running) await command(['start', name]);
+    await this.validate(await this.inspect(name), id);
     await command([
       'exec',
       '--user',
@@ -352,10 +379,10 @@ export class DockerCallerRuntimePool {
       .map((line) => Number(line.split(/\s+/)[0]));
     if (
       sizes.length !== 2 ||
-      sizes.some((n) => !Number.isFinite(n)) ||
-      sizes.reduce((a, b) => a + b, 0) > this.options.storageMiB * 1024
-    )
-      throw new Error('caller storage limit exceeded');
+      sizes.some((n) => !Number.isFinite(n) || n < 0)
+    ) throw new Error('cannot read caller storage usage');
+    if (sizes.reduce((a, b) => a + b, 0) > this.options.storageMiB * 1024)
+      throw new CallerStorageLimitError();
   }
   async stop(id: string): Promise<void> {
     const name = this.name(id),
@@ -364,7 +391,7 @@ export class DockerCallerRuntimePool {
       this.containers.delete(id);
       return;
     }
-    this.validate(info, id);
+    await this.validate(info, id);
     if (this.offline) {
       if (info.State.Running)
         throw new Error('stop managed containers before offline administration');
@@ -404,17 +431,8 @@ export class DockerCallerRuntimePool {
     await this.stop(id);
     const name = this.name(id);
     if (await this.inspect(name)) await this.command(['rm', name]);
-    const network = await this.run(['network', 'inspect', `${name}-net`]);
-    if (network.exitCode === 0) {
-      const [n] = JSON.parse(network.stdout);
-      if (
-        Object.entries(this.labels(id)).some(([k, v]) => n.Labels?.[k] !== v) ||
-        Object.keys(n.Containers ?? {}).length
-      )
-        throw new Error('caller network ownership mismatch');
+    if (await this.networkExists(id))
       await this.command(['network', 'rm', `${name}-net`]);
-    } else if (!/No such network|not found/i.test(network.stderr))
-      throw new Error('cannot inspect caller network');
     if (deleteData) {
       for (const suffix of ['workspace', 'sessions'])
         if (await this.volumeExists(id, suffix))

@@ -36,6 +36,21 @@ try {
       const a = await pool.acquire(alice),
         b = await pool.acquire(bob);
       assert.notEqual(a.name, b.name);
+      // Verify the actual workload and root-supervisor UID-drop capability sets.
+      const capabilityProbe = `const fs=require('fs'),cp=require('child_process'); const status=fs.readFileSync('/proc/self/status','utf8'); const caps=status.split('\\n').filter(line=>/^Cap(Inh|Prm|Eff|Amb):/.test(line)); if(caps.length!==4||caps.some(line=>!/0+$/.test(line)))process.exit(10); if(!/NoNewPrivs:\\s+1/.test(status))process.exit(11); const result=cp.spawnSync('/usr/sbin/iptables',['-S']); if(result.status===null||result.status===0)process.exit(12); console.log('unprivileged');`;
+      assert.equal(await docker(['exec', '--user', '1000:1000', a.name, '/usr/local/bin/node', '-e', capabilityProbe]), 'unprivileged');
+      const dropProbe = `const cp=require('child_process');const result=cp.spawnSync('/usr/local/bin/node',['-e',${JSON.stringify(capabilityProbe)}],{uid:1000,gid:1000,stdio:'inherit'});process.exit(result.status??1);`;
+      assert.equal(await docker(['exec', '--user', '0', a.name, '/usr/local/bin/node', '-e', dropProbe]), 'unprivileged');
+      const extraNetwork = `caller-smoke-extra-${randomUUID()}`;
+      await docker(['network', 'create', extraNetwork]);
+      try {
+        await docker(['network', 'connect', extraNetwork, a.name]);
+        try { await assert.rejects(pool.acquire(alice), /boundary mismatch/); }
+        finally { await docker(['network', 'disconnect', extraNetwork, a.name]); }
+      } finally { await docker(['network', 'rm', extraNetwork]); }
+      await docker(['network', 'connect', `${a.name}-net`, b.name]);
+      try { await assert.rejects(pool.acquire(alice), /network.*boundary mismatch/); }
+      finally { await docker(['network', 'disconnect', `${a.name}-net`, b.name]); }
       const containerId = await docker([
         'inspect',
         '--format',
@@ -145,7 +160,7 @@ try {
       assert.equal(await docker(['exec', restored.name, 'cat', '/workspace/owner']), 'ALICE');
       assert.equal(await docker(['inspect', '--format', '{{.HostConfig.Memory}}', restored.name]), String(1024 * 1048576));
       console.log(
-        `PASS ${kind}: A/B/A, container reuse, stop/recreate/restart persistence, independent volumes, exclusive owner, input transfer, storage admission, offline resize recovery`,
+        `PASS ${kind}: A/B/A, container reuse, stop/recreate/restart persistence, independent volumes, exclusive owner, input transfer, storage admission, offline resize recovery, network drift rejection, unprivileged workloads`,
       );
     } finally {
       for (const id of await pool.store.scopes()) await pool.remove(id, true);

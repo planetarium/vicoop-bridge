@@ -95,7 +95,7 @@ export const agentRegisterCmd = command(
       description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` creates a dedicated container per authenticated caller; run vicoop-client container init claude|codex after registration before starting. Only valid with --backend claude or --backend codex.`,
     })),
     runtimeName: optional(option('--runtime-name', string({ metavar: 'NAME' }), {
-      description: message`Legacy shared-container option; container mode now assigns names per caller and rejects this flag.`,
+      description: message`Retired shared-container option; rejected in every execution mode. Container names are assigned per caller.`,
     })),
     claudeSettingsFile: optional(option('--claude-settings-file', string({ metavar: 'PATH' }), {
       description: message`Path to a JSON file used as Claude \`--settings\`. The file is read at register time and its parsed contents are embedded into config.backends.claude.settings. Only valid with --backend claude.`,
@@ -306,7 +306,9 @@ function buildBackendDefaults(
     }
   }
 
-  if (flags.runtime === 'container' && (flags.cwd || flags.runtimeName)) {
+  if (flags.runtimeName !== undefined)
+    return { ok: false, error: '--runtime-name is retired; container mode assigns names per caller' };
+  if (flags.runtime === 'container' && flags.cwd) {
     return { ok: false, error: 'container now assigns workspaces and names per caller; remove --cwd/--runtime-name and run container init claude|codex after registration (docs/caller-runtime.md)' };
   }
 

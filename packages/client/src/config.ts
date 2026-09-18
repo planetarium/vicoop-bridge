@@ -17,9 +17,9 @@ import type { z } from 'zod';
 // VICOOP_TRUSTED_IDENTITY_ISSUERS is the sole runtime-env compatibility
 // fallback and applies only when flag/config receiver trust is absent.
 
-import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, realpathSync, rmdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { atomicWriteFile } from './fs-util.js';
 
 const CONFIG_FILENAME = 'config.json';
@@ -445,10 +445,26 @@ export function readConfigRaw(
 export function writeConfig(
   path: string,
   config: ClientConfig | Record<string, unknown>,
+  expectedContents?: string,
 ): void {
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  atomicWriteFile(path, `${JSON.stringify(config, null, 2)}\n`, 0o600);
+  const target = join(realpathSync(dir), basename(path));
+  const lock = `${target}.lock`;
+  try {
+    mkdirSync(lock, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST')
+      throw new Error('config write is locked; retry after the other writer exits, or inspect the .lock directory after a crash');
+    throw error;
+  }
+  try {
+    if (expectedContents !== undefined && readFileSync(target, 'utf8') !== expectedContents)
+      throw new Error('config changed during initialization; retry without overwriting the new settings');
+    atomicWriteFile(target, `${JSON.stringify(config, null, 2)}\n`, 0o600);
+  } finally {
+    rmdirSync(lock);
+  }
 }
 
 // Per-field overlay used to layer an explicit `--config <path>` file on top

@@ -6,7 +6,7 @@ import {
 } from './caller-scoped-backend.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { scopeDigest } from './caller-runtime-store.js';
-import type { DockerCallerRuntimePool } from './caller-runtime-docker.js';
+import { CallerStorageLimitError, type DockerCallerRuntimePool } from './caller-runtime-docker.js';
 import type { Backend } from './backend.js';
 import type { TaskAssignFrame, UpFrame } from '@vicoop-bridge/protocol';
 
@@ -67,7 +67,7 @@ function fixture(handle?: Backend['handle'], opts = {}) {
       return { id, name: id, recovered: false };
     },
     checkStorage: async () => {
-      if (storageFails) throw Error('full');
+      if (storageFails) throw new CallerStorageLimitError();
     },
     stop: async (id: string) => {
       stops.push(id);
@@ -240,6 +240,7 @@ test('active cancellation stops only that scope before terminal delivery and rep
   assert.match(JSON.stringify(frames), /partial writes/);
   const next = await f.run(task('alice'));
   assert.match(JSON.stringify(next), /conversationReset/);
+  assert.doesNotMatch(JSON.stringify(await f.run(task('alice', 'fresh'))), /conversationReset/);
 });
 test('failed cleanup quarantines only the affected scope', async () => {
   const f = fixture(async (t, e) => {
@@ -311,4 +312,48 @@ test('canceling a first request preserves the same-scope successor barrier and s
 test('caller state paths must be absolute regardless of launch directory', () => {
   for (const stateDirectory of ['state', './state', '../state', '~/state'])
     assert.throws(() => CallerRuntimeConfig.parse({ ...options, stateDirectory }), /absolute path/);
+});
+
+
+test('factory initialization receives cancellation and stops the container before failure', async () => {
+  const f = fixture();
+  let entered!: () => void;
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  const backend = new CallerScopedBackend('agent', f.pool, async (_container, signal) => {
+    entered();
+    await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    throw Error('unreachable');
+  });
+  const controller = new AbortController();
+  const frames: UpFrame[] = [];
+  const work = backend.handle(task(), (frame) => frames.push(frame), controller.signal);
+  await ready;
+  controller.abort();
+  await work;
+  assert.match(JSON.stringify(frames), /runtime_canceled/);
+  assert.deepEqual(f.stops, [scopeDigest('agent', 'alice')]);
+  assert.equal(f.workers.length, 0);
+});
+
+test('periodic Docker storage-check failure is not reported as quota or caller cancellation', async () => {
+  const f = fixture(async () => new Promise<void>(() => {}));
+  f.pool.checkStorage = async () => { throw Error('Docker unavailable'); };
+  const frames = await f.run();
+  assert.match(JSON.stringify(frames), /runtime_failed/);
+  assert.doesNotMatch(JSON.stringify(frames), /runtime_storage_limit|runtime_canceled/);
+  assert.equal(f.stops.length, 1);
+});
+
+
+test('task deadline also aborts worker initialization before any backend work', async () => {
+  const f = fixture(undefined, { taskTimeoutMs: 20 });
+  const backend = new CallerScopedBackend('agent', f.pool, async (_container, signal) => {
+    await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    throw Error('unreachable');
+  });
+  const frames: UpFrame[] = [];
+  await backend.handle(task(), (frame) => frames.push(frame), new AbortController().signal);
+  assert.match(JSON.stringify(frames), /runtime_canceled/);
+  assert.equal(f.stops.length, 1);
+  assert.equal(f.workers.length, 0);
 });

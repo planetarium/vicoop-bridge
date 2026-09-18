@@ -677,3 +677,12 @@ test('CLI exposes only host and container, rejecting the retired caller-containe
   assert.equal(parseFlags(['--runtime', 'container']).ok, true);
   assert.equal(parseFlags(['--runtime', 'caller-container']).ok, false);
 });
+
+
+test('retired runtime-name CLI flag is rejected in host mode while stale config remains harmless', () => {
+  const rejected = mergeClientArgs({ token: 't', agentId: 'a', backend: 'claude', runtime: 'host', runtimeName: 'old' }, {});
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) assert.ok(rejected.errors.some(error => error.includes('--runtime-name is retired')));
+  const host = mergeClientArgs({ token: 't', agentId: 'a', backend: 'claude', runtime: 'host' }, { backends: { claude: { runtime_name: 'old' } } });
+  assert.equal(host.ok, true);
+});

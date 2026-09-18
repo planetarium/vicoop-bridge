@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -250,7 +249,7 @@ export async function runCallerContainerInit(
         '/bin/sh',
         image.Id,
         '-ec',
-        `/usr/local/bin/node --version >/dev/null; test -x /usr/bin/tini; command -v iptables >/dev/null; command -v ip6tables >/dev/null; for dir in /workspace /data/sessions/${opts.kind}/config; do probe=$(mktemp -d "$dir/.vicoop-init.XXXXXX") || { echo "caller image must provide writable $dir for UID 1000" >&2; exit 1; }; rmdir "$probe"; done; ${opts.kind} --version`,
+        `/usr/local/bin/node --version >/dev/null; for executable in /usr/bin/tini /usr/bin/du /bin/sleep /bin/mkdir /bin/rm; do test -x "$executable" || { echo "caller image is missing required executable $executable" >&2; exit 1; }; done; for executable in iptables ip6tables awk getent sort mktemp rmdir; do command -v "$executable" >/dev/null || { echo "caller image is missing required helper $executable" >&2; exit 1; }; done; for dir in /workspace /data/sessions/${opts.kind}/config; do probe=$(mktemp -d "$dir/.vicoop-init.XXXXXX") || { echo "caller image must provide writable $dir for UID 1000" >&2; exit 1; }; rmdir "$probe"; done; ${opts.kind} --version`,
       ]);
       const version = output.match(/\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/)?.[0];
       if (
@@ -289,12 +288,8 @@ export async function runCallerContainerInit(
         [opts.kind]: { ...preserved, runtime: 'container', caller_runtime },
       },
     };
-    // Build/pull can take minutes. Never overwrite an intervening operator edit.
-    if (readFileSync(path, 'utf8') !== original)
-      throw new Error(
-        'config changed during initialization; retry without overwriting the new settings',
-      );
-    writeConfig(path, next);
+    // All CLI writers share a lock; compare the snapshot inside the write lock.
+    writeConfig(path, next, original);
     log.info(
       `Saved container configuration to ${path}. Caller state: ${stateDirectory}`,
     );

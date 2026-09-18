@@ -45,7 +45,8 @@ export async function createCallerRuntime(args: {
   const backend = new CallerScopedBackend(
     args.agentId,
     pool,
-    async (container) => {
+    async (container, signal) => {
+      signal.throwIfAborted();
       const version = await runDockerCommand([
         'exec',
         '--user',
@@ -53,7 +54,8 @@ export async function createCallerRuntime(args: {
         container.name,
         args.kind,
         '--version',
-      ]);
+      ], { signal });
+      signal.throwIfAborted();
       if (version.exitCode !== 0)
         throw new Error('caller image must contain installed backend');
       const installed = version.stdout.match(/\d+\.\d+\.\d+/)?.[0];
@@ -67,6 +69,10 @@ export async function createCallerRuntime(args: {
         rejected: number;
         lastRejectedStatus?: number;
       }> = [];
+      const codexCatalog = args.kind === 'codex'
+        ? await loadCodexModelCatalog(codexCredential!, installed!, undefined, signal)
+        : undefined;
+      signal.throwIfAborted();
       const broker =
         args.kind === 'claude'
           ? createClaudeBrokerSpawn(container.name, {
@@ -77,10 +83,7 @@ export async function createCallerRuntime(args: {
           : createExecutionBrokerSpawn(container.name, {
               backend: 'codex',
               ttlMs: config.taskTimeoutMs,
-              codexCatalog: await loadCodexModelCatalog(
-                codexCredential!,
-                installed!,
-              ),
+              codexCatalog,
               createBroker: () => {
                 const providerBroker = createCodexAuthBroker({
                   credential: codexCredential!,

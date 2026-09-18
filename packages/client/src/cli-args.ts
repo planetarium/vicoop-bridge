@@ -399,6 +399,8 @@ export function mergeClientArgs(
     if (!CallerRuntimeConfig.safeParse(callerConfig).success) errors.push('container now uses per-caller isolation; run vicoop-client container init claude|codex --config PATH to configure caller_runtime with a pinned image and private stateDirectory (see docs/caller-runtime.md)');
     if (resolved.cwd || resolved.runtimeName) errors.push('container owns its workspace and runtime names');
   }
+  if (flags.runtimeName !== undefined)
+    errors.push('--runtime-name is retired; container mode assigns names per caller');
   if (flags.runtime !== undefined && !RUNTIME_BACKENDS.has(backend)) {
     errors.push(
       `--runtime is not supported by --backend ${backend}; only claude / codex have a runtime container profile`,

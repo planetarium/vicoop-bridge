@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DockerCallerRuntimePool } from './caller-runtime-docker.js';
+import { DockerCallerRuntimePool, CALLER_TMPFS, CallerStorageLimitError } from './caller-runtime-docker.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { CallerRuntimeStore, scopeDigest } from './caller-runtime-store.js';
 import type { AsyncDockerRun } from './docker-command.js';
@@ -21,11 +21,14 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   const name = `vb-caller-${store.namespace.slice(0, 16)}-${id}`;
   const labels = { 'vicoop.component': 'caller-runtime', 'vicoop.caller-namespace': store.namespace, 'vicoop.scope': id, 'vicoop.kind': 'claude' };
   const info = {
+    Id: 'caller-container-id',
+    NetworkSettings: { Networks: { [`${name}-net`]: { NetworkID: 'caller-network-id' } } },
     Image: options.image, State: { Running: false },
     Config: { Labels: labels, User: '1000:1000', Entrypoint: ['/usr/bin/tini'], Cmd: ['--', '/bin/sleep', 'infinity'], Env: ['CLAUDE_CONFIG_DIR=/data/sessions/claude/config'] },
-    HostConfig: { ReadonlyRootfs: true, NetworkMode: `${name}-net`, RestartPolicy: { Name: 'no' }, SecurityOpt: ['no-new-privileges'], CapAdd: ['NET_ADMIN'], Memory: 512 * 1048576, MemorySwap: 512 * 1048576, PidsLimit: 256, NanoCpus: 1e9 },
+    HostConfig: { Tmpfs: { ...CALLER_TMPFS }, ReadonlyRootfs: true, NetworkMode: `${name}-net`, RestartPolicy: { Name: 'no' }, SecurityOpt: ['no-new-privileges'], CapAdd: ['NET_ADMIN'], Memory: 512 * 1048576, MemorySwap: 512 * 1048576, PidsLimit: 256, NanoCpus: 1e9 },
     Mounts: [{ Type: 'volume', Destination: '/workspace', Name: `${name}-workspace`, RW: true }, { Type: 'volume', Destination: '/data/sessions/claude', Name: `${name}-sessions`, RW: true }],
   };
+  const network = { Id: 'caller-network-id', Name: `${name}-net`, Driver: 'bridge', Scope: 'local', Labels: labels, Containers: {} as Record<string, { Name: string }>, Options: {} as Record<string, string> };
   const calls: string[][] = [];
   let removed = false;
   const run: AsyncDockerRun = async (args) => {
@@ -37,7 +40,7 @@ test('offline recovery accepts changed limits but rejects running or unowned res
       if (args[2] !== name || removed) return { exitCode: 1, stdout: '', stderr: 'No such container' };
       value = [info];
     } else if (args[0] === 'rm') removed = true;
-    else if (args[0] === 'network' && args[1] === 'inspect') value = [{ Labels: labels, Containers: {} }];
+    else if (args[0] === 'network' && args[1] === 'inspect') value = [network];
     else if (args[0] !== 'network' || args[1] !== 'rm') throw Error(`Unexpected Docker command ${args[0]}`);
     return { exitCode: 0, stdout: JSON.stringify(value) ?? '', stderr: '' };
   };
@@ -55,6 +58,29 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   info.Mounts[0].Name = 'unowned-volume';
   await assert.rejects(pool().initialize(false), /boundary mismatch/);
   info.Mounts[0].Name = `${name}-workspace`;
+  (info.NetworkSettings.Networks as any).foreign = { NetworkID: 'foreign' };
+  await assert.rejects(pool().initialize(false), /boundary mismatch/);
+  delete (info.NetworkSettings.Networks as any).foreign;
+  info.NetworkSettings.Networks[`${name}-net`].NetworkID = 'wrong-network-id';
+  await assert.rejects(pool().initialize(false), /network.*boundary mismatch/);
+  info.NetworkSettings.Networks[`${name}-net`].NetworkID = network.Id;
+  network.Containers.foreign = { Name: 'another-caller' };
+  await assert.rejects(pool().initialize(false), /network.*boundary mismatch/);
+  delete network.Containers.foreign;
+  network.Labels = { ...labels, 'vicoop.scope': 'foreign' };
+  await assert.rejects(pool().initialize(false), /network.*boundary mismatch/);
+  network.Labels = labels;
+  network.Driver = 'macvlan';
+  await assert.rejects(pool().initialize(false), /network.*boundary mismatch/);
+  network.Driver = 'bridge';
+  network.Options['com.docker.network.bridge.name'] = 'foreign-bridge';
+  await assert.rejects(pool().initialize(false), /network.*boundary mismatch/);
+  delete network.Options['com.docker.network.bridge.name'];
+  for (const tmp of ['rw,nosuid,nodev', CALLER_TMPFS['/tmp'].replace('nosuid,', ''), CALLER_TMPFS['/tmp'].replace('67108864', '134217728')]) {
+    info.HostConfig.Tmpfs['/tmp'] = tmp;
+    await assert.rejects(pool().initialize(false), /boundary mismatch/);
+  }
+  info.HostConfig.Tmpfs['/tmp'] = CALLER_TMPFS['/tmp'];
   const admin = pool();
   await admin.initialize(false);
   await assert.rejects(admin.acquire(id), /offline administration/);
@@ -92,4 +118,22 @@ test('offline data deletion works without the image while validation reports the
   await assert.rejects(validator.initialize(false, true), /image is missing.*container init/);
   const daemon = new DockerCallerRuntimePool('claude', options, 'agent', run);
   await assert.rejects(daemon.initialize(), /image is missing.*container init/);
+});
+
+
+test('storage quota, malformed usage and Docker failures have distinct errors', async () => {
+  const options = CallerRuntimeConfig.parse({ image: `sha256:${'a'.repeat(64)}`, stateDirectory: '/fixture', storageMiB: 64 });
+  for (const [stdout, exitCode, expected] of [
+    ['65537 /workspace\n0 /data/sessions/claude', 0, 'limit'],
+    ['invalid', 0, 'usage'],
+    ['', 1, 'Docker'],
+  ] as const) {
+    const pool = new DockerCallerRuntimePool('claude', options, 'agent', async () => ({ stdout, stderr: 'failure', exitCode }));
+    await assert.rejects(pool.checkStorage('a'.repeat(64)), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error instanceof CallerStorageLimitError, expected === 'limit');
+      assert.match(error.message, new RegExp(expected));
+      return true;
+    });
+  }
 });

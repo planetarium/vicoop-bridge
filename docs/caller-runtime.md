@@ -37,7 +37,11 @@ The first build downloads packages and backend binaries. Later initialization
 reuses the configured image and preserves state paths, resource limits, other
 backend settings and agent credentials. Legacy `cwd`/`runtime_name` settings are
 removed only after validation succeeds. Build/authentication/probe failures leave
-the config unchanged; concurrent config edits abort the save. Stop the daemon and
+the config unchanged. CLI config writes use an exclusive lock; initialization
+checks its original snapshot under that lock and aborts if preparation-time
+edits are detected. External editors do not participate in this lock, so finish
+manual edits before initialization. A crashed writer can leave `config.json.lock`;
+inspect the writer/process before removing that lock directory. Stop the daemon and
 caller containers before reinitializing. A different image requires removing
 retained containers via `container recreate SCOPE` first (volumes and mappings
 are retained). Initialization never changes an existing state-directory path.
@@ -187,8 +191,9 @@ Cancellation/failure retains partial filesystem writes; there is no transactiona
 rollback or exactly-once execution guarantee after a lost response.
 
 Startup takes an exclusive host owner lock and reconciles previously managed
-containers before accepting requests. Labels, image, mounts, resource settings
-and runtime boundaries are checked before reuse. An unknown or mismatched
+containers before accepting requests. Labels, image, mounts, exact tmpfs bounds and resource settings are checked
+before reuse. The actual network attachment must be the one owned per-scope
+bridge network, with no foreign container endpoints or custom network options. An unknown or mismatched
 resource fails closed. Do not manually edit scope records or share a state
 directory between daemons. A crash during owner-record mutation can leave
 `.guard`; inspect owner/process state before manually removing that guard.
