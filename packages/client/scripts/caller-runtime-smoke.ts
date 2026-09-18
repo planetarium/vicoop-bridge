@@ -148,6 +148,9 @@ try {
       const resized = { ...config, memoryMiB: 1024, cpus: 0.5, pids: 128, maxScopes: 1 };
       const rejected = new DockerCallerRuntimePool(kind, resized, agent);
       await assert.rejects(rejected.initialize(), /exceed maxScopes/);
+      await docker(['network', 'rm', `${a.name}-net`]);
+      const strictNetwork = new DockerCallerRuntimePool(kind, config, agent);
+      await assert.rejects(strictNetwork.initialize(false, true), /network missing|boundary mismatch/);
       pool = new DockerCallerRuntimePool(kind, resized, agent);
       await pool.initialize(false);
       await assert.rejects(pool.acquire(alice), /offline administration/);

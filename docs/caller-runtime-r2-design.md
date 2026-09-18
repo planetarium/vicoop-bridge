@@ -80,17 +80,17 @@ and runtime-boundary components from #501/#505 with scope-specific runtime bindi
 - [x] Integrate strict caller authentication and client scope/generation validation.
 - [x] Implement scope-owned container/volume allocation, reuse and reconciliation.
 - [x] Bind shared broker/supervisor infrastructure to each scope and execution.
-- [ ] Adapt queueing, leases, resource accounting and quarantine to persistent runtimes.
+- [x] Adapt queueing, leases, resource accounting and quarantine to persistent runtimes.
 - [x] Implement explicit conversation resume/reset policy and idle-only administration.
 - [x] Demonstrate real Docker A/B/A: distinct Alice/Bob container IDs, Alice's later
       requests reuse her ID, and a new Alice context also reuses her container.
 - [x] Demonstrate isolated files and conversations even with identical context IDs.
 - [x] Demonstrate stop/start and recreation preserve only the owner's files and
       conversation state, with verified resume or explicit reset behavior.
-- [ ] Test concurrent allocation, canceled waiters, active cancellation, failed
+- [x] Test concurrent allocation, canceled waiters, active cancellation, failed
       cleanup, shutdown, daemon crash/restart and disconnect/replay; verify another
       caller's active work and storage remain unaffected.
-- [ ] Test forged scope, rejected authentication/negotiation, resource exhaustion
+- [x] Test forged scope, rejected authentication/negotiation, resource exhaustion
       and provider-secret isolation; rejected requests allocate no resources.
 - [x] Run build/typecheck, affected suites, existing-mode regressions and real Docker
       acceptance through the Bun-compiled client. Record fresh evidence separately
@@ -128,5 +128,17 @@ Both backend lifecycle checks and the Bun-compiled real-provider tests
 (including observed-tool cancellation) passed on this image. Actual-provider validation used host OAuth on macOS
 Docker; native Linux and provider API-key calls are not established by these runs.
 The full CLI transport tests use deterministic providers; real model tests call
-the runtime directly. Strict disk quotas and the remaining unchecked combined
-acceptance gates are not claimed complete. No release or deployment occurred.
+the runtime directly. Strict disk quotas are not claimed complete. No release or deployment occurred.
+
+
+## Follow-up validation on 2026-09-18
+
+The concurrency, canceled-waiter, cleanup-failure/quarantine and admission gates
+above are covered by the client regression suite. Bun 1.2.20 compiled CLI
+fixtures for both backends cover conversation/file isolation, active cancellation,
+disconnect/reconnect, forced daemon restart, recreation and detached shutdown.
+Real Docker lifecycle checks cover ownership/network drift, volumes, workload
+privileges, storage admission, missing storage and orphan-resource rejection.
+The updated checkboxes describe this combined unit/fixture/Docker evidence;
+they do not establish native Linux behavior, real-provider API-key execution,
+or strict filesystem disk quotas. Those remain unverified release limits.

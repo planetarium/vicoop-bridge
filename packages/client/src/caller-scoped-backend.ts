@@ -222,6 +222,14 @@ export class CallerScopedBackend implements Backend {
       acquired = true;
       controller.signal.throwIfAborted();
       phase = 'backend-initialization';
+      if (container.restarted && entry.worker) {
+        entry.worker.backend.stop?.();
+        entry.worker.close();
+        await within(entry.worker.settle(), 15000);
+        entry.worker = undefined;
+        entry.contexts.clear();
+        entry.recovered = true;
+      }
       if (!entry.worker) entry.worker = await this.factory(container, controller.signal);
       controller.signal.throwIfAborted();
       if (entry.recovered && !entry.contexts.has(context)) {

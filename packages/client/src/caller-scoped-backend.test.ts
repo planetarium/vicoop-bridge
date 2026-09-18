@@ -478,3 +478,25 @@ test('orphan resources quarantine their caller without stopping or adopting Dock
   assert.equal(f.stops.length, 0);
   await f.backend.close();
 });
+
+
+test('externally stopped retained containers get a fresh worker and explicit reset without affecting another caller', async () => {
+  const f = fixture();
+  await f.run(task());
+  await f.run(task('bob'));
+  const acquire = f.pool.acquire.bind(f.pool);
+  let restart = true;
+  f.pool.acquire = async (...args) => {
+    const container = await acquire(...args);
+    const restarted = restart && args[0] === scopeDigest('agent', 'alice');
+    if (restarted) restart = false;
+    return { ...container, restarted };
+  };
+  const frames = await f.run();
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+  assert.match(JSON.stringify(frames), /conversationReset/);
+  assert.equal(f.workers.length, 3);
+  assert.doesNotMatch(JSON.stringify(await f.run(task('bob'))), /conversationReset/);
+  assert.equal(f.workers.length, 3);
+  await f.backend.close();
+});

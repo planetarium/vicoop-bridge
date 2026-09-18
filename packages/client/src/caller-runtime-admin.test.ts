@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parse } from '@optique/core/parser';
 import { containerCmd } from './container-init.js';
-import { callerStateCmd } from './caller-runtime-admin.js';
+import { callerStateCmd, runCallerState } from './caller-runtime-admin.js';
 
 test('container commands default config and select caller scopes rather than legacy names', () => {
   for (const verb of ['list', 'validate']) {
@@ -43,4 +43,21 @@ test('legacy tools require the explicit legacy namespace and caller-state remain
   assert.equal(parse(containerCmd, ['container', 'remove', 'old-name', '--preserve-volumes']).success, false);
   const compatibility = parse(callerStateCmd, ['caller-state', '--config', '/agent.json', '--recreate-scope', 'a'.repeat(64)]);
   assert.equal(compatibility.success, true);
+});
+
+
+test('empty and malformed scope selectors fail before config or Docker access', async () => {
+  for (const value of ['', 'old-name', 'a'.repeat(63), 'A'.repeat(64)]) {
+    for (const operation of ['remove', 'recreate']) {
+      const parsed = parse(containerCmd, ['container', operation, value]);
+      assert.ok(parsed.success);
+      if (parsed.value.action === 'caller-state') await assert.rejects(runCallerState({ ...parsed.value, config: '/nonexistent-config' }), /scope must be/);
+    }
+    for (const flag of ['--delete-scope', '--recreate-scope']) {
+      const parsed = parse(callerStateCmd, ['caller-state', flag, value]);
+      assert.ok(parsed.success);
+      await assert.rejects(runCallerState({ ...parsed.value, config: '/nonexistent-config' }), /scope must be/);
+    }
+  }
+  await assert.rejects(runCallerState({ config: '/nonexistent-config', deleteScope: 'a'.repeat(64), recreateScope: 'b'.repeat(64) }), /select either/);
 });

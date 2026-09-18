@@ -289,6 +289,13 @@ try {
   await waitFor(() => hellos > before, 'reconnect');
   assign('apikey:b', 'b2');
   assert.equal((await completed('b2')).session, b1.session);
+  await exec('docker', ['stop', '-t', '0', a]);
+  assign('apikey:a', 'after-docker-stop');
+  const restarted = await completed('after-docker-stop');
+  assert.equal(restarted.resumed, false);
+  assert.notEqual(restarted.session, a1.session);
+  assert.ok(frames.some(f => f.taskId === 'after-docker-stop' && f.metadata?.['vicoop.runtime']?.conversationReset));
+  assert.equal(await inspect(b, '{{.State.Running}}'), 'true');
   assign('apikey:a', 'cancel', 'hold-task');
   let pid = '';
   for (let i = 0; i < 100 && !pid; i++) {

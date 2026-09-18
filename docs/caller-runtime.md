@@ -186,7 +186,9 @@ waiter does not stop its predecessor or another caller. Cancellation during
 read-only acquisition, before any Docker mutation or execution, also preserves
 the existing container and conversation. The next request after
 a stopped/failed execution restarts that user's container and reports an explicit
-conversation reset. Generation-scoped server cancellation may suppress terminal
+conversation reset. If Docker stops a container while the daemon remains alive,
+the next request restarts it with a fresh worker and an explicit conversation
+reset. Generation-scoped server cancellation may suppress terminal
 frames according to the existing replay protocol.
 
 Workspace and backend conversation **files** survive container stop/recreation
@@ -224,8 +226,10 @@ disk boundary. The initial implementation does not claim that acceptance gate.
 Stop the daemon first. Administration takes the same exclusive ownership lock
 and refuses to operate while a live owner or running managed container exists.
 Stopped containers can be recreated or deleted after changing CPU, memory, PID
-or scope-count limits. Ownership and isolation checks still apply; execution
-requires the container to match the new limits.
+or scope-count limits. Ownership checks still apply. Offline cleanup can remove an owned, stopped
+container with a missing or drifted network; it never removes a network with
+foreign ownership or endpoints. Execution and explicit validation still require
+the full network boundary and configured limits.
 
 ```sh
 vicoop-client container list --config /path/to/config.json

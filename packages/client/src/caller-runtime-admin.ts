@@ -57,13 +57,16 @@ export async function runCallerState(args: {
   deleteScope?: string;
   recreateScope?: string;
 }) {
+  for (const value of [args.deleteScope, args.recreateScope])
+    if (value !== undefined && !/^[a-f0-9]{64}$/.test(value))
+      throw new Error('scope must be a non-empty 64-character lowercase hexadecimal digest');
+  if (args.deleteScope !== undefined && args.recreateScope !== undefined)
+    throw new Error('select either deletion or recreation');
   const configPath = args.config ?? defaultConfigPath();
   const config = readConfig(configPath),
     kind = args.backend ?? config?.backend;
   if (!config?.agent_id || (kind !== 'claude' && kind !== 'codex'))
     throw new Error('config must select agent_id and claude/codex backend');
-  if (args.deleteScope && args.recreateScope)
-    throw new Error('select either deletion or recreation');
   const options = CallerRuntimeConfig.parse(
     config.backends?.[kind]?.caller_runtime,
   );
@@ -71,9 +74,9 @@ export async function runCallerState(args: {
   const ids = await pool.initialize(false, args.validate ?? false);
   try {
     const target = args.deleteScope ?? args.recreateScope;
-    if (target) {
+    if (target !== undefined) {
       if (!ids.includes(target)) throw new Error('unknown caller scope');
-      await pool.remove(target, !!args.deleteScope);
+      await pool.remove(target, args.deleteScope !== undefined);
     }
     console.log(
       JSON.stringify(

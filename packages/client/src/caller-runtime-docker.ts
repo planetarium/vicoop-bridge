@@ -24,6 +24,7 @@ export interface CallerContainer {
   id: string;
   name: string;
   recovered: boolean;
+  restarted?: boolean;
 }
 
 // This pool owns containers, not executions. Callers hold a per-scope lease
@@ -170,9 +171,10 @@ export class DockerCallerRuntimePool {
         JSON.stringify(['--', '/bin/sleep', 'infinity']) ||
       !h?.ReadonlyRootfs ||
       h.Privileged ||
-      h.NetworkMode !== `${this.name(id)}-net` ||
-      Object.keys(c.NetworkSettings?.Networks ?? {}).length !== 1 ||
-      !Object.hasOwn(c.NetworkSettings?.Networks ?? {}, `${this.name(id)}-net`) ||
+      (this.validateExecution && (
+        h.NetworkMode !== `${this.name(id)}-net` ||
+        Object.keys(c.NetworkSettings?.Networks ?? {}).length !== 1 ||
+        !Object.hasOwn(c.NetworkSettings?.Networks ?? {}, `${this.name(id)}-net`))) ||
       h.PidMode ||
       h.UsernsMode ||
       !['', 'private', undefined].includes(h.IpcMode) ||
@@ -226,7 +228,7 @@ export class DockerCallerRuntimePool {
       )
     )
       fail();
-    if (!(await this.networkExists(id, c, signal)))
+    if (this.validateExecution && !(await this.networkExists(id, c, signal)))
       throw new Error('caller network missing');
   }
   private async networkExists(id: string, container?: any, signal?: AbortSignal): Promise<boolean> {
@@ -242,9 +244,10 @@ export class DockerCallerRuntimePool {
     const endpoint = container?.NetworkSettings?.Networks?.[name];
     if (
       network.Name !== name || !network.Id ||
-      network.Driver !== 'bridge' || network.Scope !== 'local' ||
-      network.Internal || network.Ingress || network.Attachable || network.EnableIPv6 ||
-      Object.keys(network.Options ?? {}).length ||
+      (this.validateExecution && (
+        network.Driver !== 'bridge' || network.Scope !== 'local' ||
+        network.Internal || network.Ingress || network.Attachable || network.EnableIPv6 ||
+        Object.keys(network.Options ?? {}).length)) ||
       Object.entries(this.labels(id)).some(([k, v]) => network.Labels?.[k] !== v) ||
       Object.entries(network.Containers ?? {}).some(([key, value]: [string, any]) =>
         !container || key !== container.Id || value.Name !== this.name(id),
@@ -315,6 +318,7 @@ export class DockerCallerRuntimePool {
       info = await this.inspect(name, signal);
     }
     const recovered = !!info;
+    const restarted = !!info && !info.State.Running;
     if (!info) {
       for (const suffix of ['workspace', 'sessions']) {
         const volume = `${name}-${suffix}`;
@@ -400,7 +404,7 @@ export class DockerCallerRuntimePool {
     ]);
     await this.checkStorage(id, signal);
     signal?.throwIfAborted();
-    const container = { id, name, recovered };
+    const container = { id, name, recovered, restarted };
     this.containers.set(id, container);
     return container;
   }

@@ -30,7 +30,7 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   };
   const network = { Id: 'caller-network-id', Name: `${name}-net`, Driver: 'bridge', Scope: 'local', Labels: labels, Containers: {} as Record<string, { Name: string }>, Options: {} as Record<string, string> };
   const calls: string[][] = [];
-  let removed = false;
+  let removed = false, networkMissing = false;
   const run: AsyncDockerRun = async (args) => {
     calls.push([...args]);
     let value: unknown;
@@ -41,7 +41,10 @@ test('offline recovery accepts changed limits but rejects running or unowned res
       value = [info];
     } else if (args[0] === 'volume' && args[1] === 'inspect') value = [{ Driver: 'local', Options: {}, Labels: { ...labels, 'vicoop.scope': args[2].includes(id) ? id : scopeDigest('agent', 'bob') } }];
     else if (args[0] === 'rm') removed = true;
-    else if (args[0] === 'network' && args[1] === 'inspect') value = [network];
+    else if (args[0] === 'network' && args[1] === 'inspect') {
+      if (networkMissing) return { exitCode: 1, stdout: '', stderr: 'No such network' };
+      value = [network];
+    }
     else if (args[0] !== 'network' || args[1] !== 'rm') throw Error(`Unexpected Docker command ${args[0]}`);
     return { exitCode: 0, stdout: JSON.stringify(value) ?? '', stderr: '' };
   };
@@ -62,32 +65,52 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   info.Mounts[0].Name = 'unowned-volume';
   await assert.rejects(pool().initialize(false), /boundary mismatch/);
   info.Mounts[0].Name = `${name}-workspace`;
+  const boundary = () => new DockerCallerRuntimePool('claude', { ...options, maxScopes: 2, memoryMiB: 512, cpus: 1, pids: 256 }, 'agent', run);
   (info.NetworkSettings.Networks as any).foreign = { NetworkID: 'foreign' };
-  await assert.rejects(pool().initialize(false), /boundary mismatch/);
+  await assert.rejects(boundary().initialize(false, true), /boundary mismatch/);
   delete (info.NetworkSettings.Networks as any).foreign;
   info.NetworkSettings.Networks[`${name}-net`].NetworkID = 'wrong-network-id';
-  await assert.rejects(pool().initialize(false), /network.*boundary mismatch/);
+  await assert.rejects(boundary().initialize(false, true), /network.*boundary mismatch/);
   info.NetworkSettings.Networks[`${name}-net`].NetworkID = network.Id;
   network.Containers.foreign = { Name: 'another-caller' };
-  await assert.rejects(pool().initialize(false), /network.*boundary mismatch/);
+  await assert.rejects(boundary().initialize(false, true), /network.*boundary mismatch/);
   delete network.Containers.foreign;
   network.Labels = { ...labels, 'vicoop.scope': 'foreign' };
-  await assert.rejects(pool().initialize(false), /network.*boundary mismatch/);
+  await assert.rejects(boundary().initialize(false, true), /network.*boundary mismatch/);
   network.Labels = labels;
   network.Driver = 'macvlan';
-  await assert.rejects(pool().initialize(false), /network.*boundary mismatch/);
+  await assert.rejects(boundary().initialize(false, true), /network.*boundary mismatch/);
   network.Driver = 'bridge';
   network.Options['com.docker.network.bridge.name'] = 'foreign-bridge';
-  await assert.rejects(pool().initialize(false), /network.*boundary mismatch/);
+  await assert.rejects(boundary().initialize(false, true), /network.*boundary mismatch/);
   delete network.Options['com.docker.network.bridge.name'];
   for (const tmp of ['rw,nosuid,nodev', CALLER_TMPFS['/tmp'].replace('nosuid,', ''), CALLER_TMPFS['/tmp'].replace('67108864', '134217728')]) {
     info.HostConfig.Tmpfs['/tmp'] = tmp;
     await assert.rejects(pool().initialize(false), /boundary mismatch/);
   }
   info.HostConfig.Tmpfs['/tmp'] = CALLER_TMPFS['/tmp'];
+  networkMissing = true;
+  const missing = pool();
+  await missing.initialize(false);
+  await missing.remove(id, false);
+  assert.equal(removed, true);
+  await missing.close();
+  // A separate retained fixture with network drift remains safely removable.
+  removed = false;
+  networkMissing = false;
+  network.Driver = 'macvlan';
+  network.Options['com.docker.network.bridge.name'] = 'drifted';
+  info.HostConfig.NetworkMode = 'foreign-network';
   const admin = pool();
   await admin.initialize(false);
   await assert.rejects(admin.acquire(id), /offline administration/);
+  network.Containers.foreign = { Name: 'another-caller' };
+  await assert.rejects(admin.remove(id, false), /network.*boundary mismatch/);
+  assert.ok(!calls.some(args => args[0] === 'network' && args[1] === 'rm'));
+  delete network.Containers.foreign;
+  network.Labels = { ...labels, 'vicoop.scope': 'foreign' };
+  await assert.rejects(admin.remove(id, false), /network.*boundary mismatch/);
+  network.Labels = labels;
   await admin.remove(id, false);
   assert.deepEqual(await admin.store.scopes(), [id, scopeDigest('agent', 'bob')].sort());
   await admin.close();
