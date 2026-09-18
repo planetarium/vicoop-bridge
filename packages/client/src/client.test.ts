@@ -1975,8 +1975,9 @@ test('a replacement assignment suppresses the older run with the same taskId', a
   }
 });
 
-test('isolated backend refuses legacy and R1-only servers before dispatch', async () => {
-  for (const r1 of [false, true]) {
+test('isolated backend refuses legacy and incomplete capability negotiation before dispatch', async () => {
+  const required = [TASK_REPLAY_CAPABILITY, 'caller-context-v2', 'execution-scope-v1', 'caller-runtime-v1'];
+  for (const capabilities of [undefined, ...required.map(missing => required.filter(cap => cap !== missing))]) {
     const server = createServer(); const wss = new WebSocketServer({ server });
     const url = await listen(server); let calls = 0; let fatal = false; let advertised: string[] = [];
     wss.on('connection', (ws) => {
@@ -1984,7 +1985,10 @@ test('isolated backend refuses legacy and R1-only servers before dispatch', asyn
         const frame = parseUpFrame(raw.toString());
         if (frame.type !== 'hello') return;
         advertised = frame.protocolCapabilities ?? [];
-        if (r1) ws.send(encodeFrame({ type: 'hello.ack', protocolCapabilities: [TASK_REPLAY_CAPABILITY, 'execution-scope-v1'], disconnectGraceMs: 1000, maxFrameBytes: 1024 * 1024 }));
+        if (capabilities) {
+          ws.send(encodeFrame({ type: 'hello.ack', protocolCapabilities: capabilities, disconnectGraceMs: 1000, maxFrameBytes: 1024 * 1024 }));
+          ws.send(encodeFrame(makeAssign('incomplete')));
+        }
         else ws.send(encodeFrame(makeAssign('legacy')));
       });
     });

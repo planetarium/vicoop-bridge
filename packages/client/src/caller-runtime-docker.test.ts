@@ -39,7 +39,8 @@ test('offline recovery accepts changed limits but rejects running or unowned res
     else if (args[0] === 'container') {
       if (args[2] !== name || removed) return { exitCode: 1, stdout: '', stderr: 'No such container' };
       value = [info];
-    } else if (args[0] === 'rm') removed = true;
+    } else if (args[0] === 'volume' && args[1] === 'inspect') value = [{ Driver: 'local', Options: {}, Labels: { ...labels, 'vicoop.scope': args[2].includes(id) ? id : scopeDigest('agent', 'bob') } }];
+    else if (args[0] === 'rm') removed = true;
     else if (args[0] === 'network' && args[1] === 'inspect') value = [network];
     else if (args[0] !== 'network' || args[1] !== 'rm') throw Error(`Unexpected Docker command ${args[0]}`);
     return { exitCode: 0, stdout: JSON.stringify(value) ?? '', stderr: '' };
@@ -163,6 +164,11 @@ test('retained scopes never recreate missing workspace or session volumes after 
         'vicoop.scope': id, 'vicoop.kind': 'claude',
       } }]), stderr: '' };
     };
+    const validator = new DockerCallerRuntimePool('claude', options, 'agent', run);
+    await assert.rejects(validator.initialize(false, true), CallerStorageMissingError);
+    // Listing/removal and daemon startup remain possible for unaffected callers.
+    await validator.initialize(false);
+    await validator.close();
     const pool = new DockerCallerRuntimePool('claude', options, 'agent', run);
     await pool.initialize();
     try {

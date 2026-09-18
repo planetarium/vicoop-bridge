@@ -54,6 +54,7 @@ function fixture(handle?: Backend['handle'], opts = {}) {
       id: string,
       _signal?: AbortSignal,
       principalId?: string,
+      onReserved?: () => void,
     ) => {
       assert.ok(
         principalId,
@@ -64,6 +65,7 @@ function fixture(handle?: Backend['handle'], opts = {}) {
         allocations.push(id);
         existing.add(id);
       }
+      onReserved?.();
       return { id, name: id, recovered: false };
     },
     checkStorage: async () => {
@@ -363,7 +365,7 @@ test('missing retained storage quarantines only its caller without starting a wo
   const f = fixture();
   const acquire = f.pool.acquire.bind(f.pool);
   f.pool.acquire = async (...args) => {
-    if (args[0] === scopeDigest('agent', 'alice')) throw new CallerStorageMissingError();
+    if (args[0] === scopeDigest('agent', 'alice')) { args[3]?.(); throw new CallerStorageMissingError(); }
     return acquire(...args);
   };
   assert.match(JSON.stringify(await f.run()), /runtime_storage_missing/);
@@ -371,4 +373,23 @@ test('missing retained storage quarantines only its caller without starting a wo
   assert.match(JSON.stringify(await f.run()), /runtime_quarantined/);
   assert.match(JSON.stringify(await f.run(task('bob'))), /completed/);
   await f.backend.close();
+});
+
+
+test('cancellation at acquire entry frees unreserved capacity, but post-reservation failure retains it', async () => {
+  for (const reserved of [false, true]) {
+    const f = fixture(undefined, { maxScopes: 1 });
+    const acquire = f.pool.acquire.bind(f.pool);
+    const controller = new AbortController();
+    f.pool.acquire = async (...args) => {
+      if (args[0] !== scopeDigest('agent', 'alice')) return acquire(...args);
+      if (reserved) args[3]?.();
+      controller.abort();
+      args[1]!.throwIfAborted();
+      throw new Error('unreachable');
+    };
+    assert.match(JSON.stringify(await f.run(task(), controller.signal)), /runtime_canceled/);
+    assert.match(JSON.stringify(await f.run(task('bob'))), reserved ? /runtime_capacity/ : /task.complete/);
+    await f.backend.close();
+  }
 });

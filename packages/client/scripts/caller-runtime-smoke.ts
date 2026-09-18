@@ -164,6 +164,9 @@ try {
       await pool.close();
       pool = new DockerCallerRuntimePool(kind, resized, agent);
       await pool.initialize();
+      await pool.close();
+      await assert.rejects(pool.initialize(false, true), /retained caller volume missing/);
+      await pool.initialize();
       await assert.rejects(pool.acquire(alice), /retained caller volume missing/);
       await assert.rejects(docker(['volume', 'inspect', `${restored.name}-workspace`]));
       console.log(

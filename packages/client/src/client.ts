@@ -416,7 +416,7 @@ export class Client {
 
       switch (frame.type) {
         case 'hello.ack':
-          this.callerScopeReady = [TASK_REPLAY_CAPABILITY, EXECUTION_SCOPE_V1_CAPABILITY, CALLER_RUNTIME_V1_CAPABILITY]
+          this.callerScopeReady = [TASK_REPLAY_CAPABILITY, CALLER_CONTEXT_V2_CAPABILITY, EXECUTION_SCOPE_V1_CAPABILITY, CALLER_RUNTIME_V1_CAPABILITY]
             .every((cap) => frame.protocolCapabilities.includes(cap));
           if (this.opts.backend.requiresCallerScope && !this.callerScopeReady) {
             this.logger.error('server does not support caller-runtime-v1; isolation cannot start');

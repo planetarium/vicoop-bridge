@@ -205,12 +205,11 @@ export class CallerScopedBackend implements Backend {
       }
       acquired = true;
       phase = 'allocation';
-      // acquire may persist a reservation even when Docker allocation fails.
-      entry.retained = true;
       const container = await this.pool.acquire(
         id,
         controller.signal,
         task.executionScope!.principalId,
+        () => { entry.retained = true; }, // Only a committed reservation consumes retained capacity.
       );
       controller.signal.throwIfAborted();
       phase = 'backend-initialization';

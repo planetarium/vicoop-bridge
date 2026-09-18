@@ -230,7 +230,7 @@ vicoop-client container remove SCOPE_DIGEST --config /path/to/config.json
 
 Omit `--config` to use the canonical config.json. Use `--backend claude|codex`
 to manage a backend other than the one currently selected in that config.
-`container list` prints JSON scope digests and container names. `container validate` checks the configured image and retained container limits without
+`container list` prints JSON scope digests and container names. `container validate` checks the configured image, retained container limits, and both retained volumes even when a container has been removed, without
 starting workloads; it also requires a stopped daemon. A fresh configuration
 can validate with no caller containers because allocation is lazy. Listing,
 recreation and deletion remain available even if the configured image has been

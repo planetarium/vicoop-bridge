@@ -126,6 +126,12 @@ export class DockerCallerRuntimePool {
             );
           if (reconcile) await this.stop(id);
         }
+        // Explicit offline validation checks retained data even after recreation.
+        // Daemon startup leaves missing storage to per-caller quarantine on acquire.
+        if (validateExecution) {
+          for (const suffix of ['workspace', 'sessions'])
+            if (!(await this.volumeExists(id, suffix))) throw new CallerStorageMissingError();
+        }
       }
       return ids;
     } catch (error) {
@@ -273,6 +279,7 @@ export class DockerCallerRuntimePool {
     id: string,
     signal?: AbortSignal,
     principalId?: string,
+    onReserved?: () => void,
   ): Promise<CallerContainer> {
     if (!this.locked) throw new Error('caller pool is not initialized');
     if (this.offline) throw new Error('offline administration cannot acquire callers');
@@ -283,6 +290,7 @@ export class DockerCallerRuntimePool {
     };
     const name = this.name(id);
     const fresh = await this.store.reserve(id, this.kind, principalId); // reserve before the first Docker mutation
+    onReserved?.();
     let info = await this.inspect(name, signal);
     const recovered = !!info;
     if (!info) {

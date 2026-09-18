@@ -17,3 +17,5 @@ Validate actual per-caller network membership, network ownership/options and exa
 Fail closed and quarantine retained callers when persistent volumes disappear. Validate init state paths before normalization, reject empty retired options, and make legacy harness output explicitly non-executable by the current daemon.
 
 Reject explicit empty image references, propagate task cancellation through Docker allocation, share supported-version checks between init and daemon, and coalesce Codex catalog requests across scopes with credential/version invalidation and independent caller cancellation.
+
+Report missing retained volumes during explicit offline validation, release caller capacity when allocation ends before SQLite reservation, and require caller-context-v2 in isolated capability negotiation.
