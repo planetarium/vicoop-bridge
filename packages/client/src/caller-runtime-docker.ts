@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { spawn as nodeSpawn } from 'node:child_process';
 import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
 import { CallerRuntimeStore } from './caller-runtime-store.js';
 import { brokerFirewallScript } from './execution-runtime-boundary.js';
@@ -280,12 +279,14 @@ export class DockerCallerRuntimePool {
     signal?: AbortSignal,
     principalId?: string,
     onReserved?: () => void,
+    onMutation?: () => void,
   ): Promise<CallerContainer> {
     if (!this.locked) throw new Error('caller pool is not initialized');
     if (this.offline) throw new Error('offline administration cannot acquire callers');
     signal?.throwIfAborted();
     const command = (args: string[]) => {
       signal?.throwIfAborted();
+      onMutation?.();
       return this.command(args, signal);
     };
     const name = this.name(id);
@@ -460,7 +461,7 @@ export class DockerCallerRuntimePool {
       await this.store.forget(id);
     }
   }
-  async inputDirectory(id: string): Promise<string> {
+  async inputDirectory(id: string, signal?: AbortSignal): Promise<string> {
     const path = `/tmp/vicoop-input-${randomUUID()}`;
     await this.command([
       'exec',
@@ -471,47 +472,25 @@ export class DockerCallerRuntimePool {
       '-m',
       '700',
       path,
-    ]);
+    ], signal);
     return path;
   }
-  async inputWrite(id: string, path: string, data: Buffer): Promise<void> {
+  async inputWrite(id: string, path: string, data: Buffer, signal?: AbortSignal): Promise<void> {
     if (
       !/^\/tmp\/vicoop-input-[a-f0-9-]+\/image-\d+\.[a-z]+$/.test(path) ||
       data.length > 20 * 1048576
     )
       throw new Error('invalid caller input');
-    await new Promise<void>((resolve, reject) => {
-      const child = nodeSpawn(
-        'docker',
-        [
-          'exec',
-          '-i',
-          '--user',
-          '1000:1000',
-          this.name(id),
-          '/usr/local/bin/node',
-          '-e',
-          'const fs=require("fs");const s=fs.createWriteStream(process.argv[1],{flags:"wx",mode:384});s.on("error",()=>process.exit(1));process.stdin.pipe(s);',
-          path,
-        ],
-        { stdio: ['pipe', 'ignore', 'ignore'] },
-      );
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL');
-        reject(new Error('input transfer timed out'));
-      }, 30000);
-      child.once('error', (e) => {
-        clearTimeout(timer);
-        reject(e);
-      });
-      child.once('close', (c) => {
-        clearTimeout(timer);
-        c === 0 ? resolve() : reject(new Error('input transfer failed'));
-      });
-      child.stdin.on('error', () => {});
-      child.stdin.end(data);
-    });
+    signal?.throwIfAborted();
+    const result = await this.run([
+      'exec', '-i', '--user', '1000:1000', this.name(id), '/usr/local/bin/node', '-e',
+      'const fs=require("fs");const s=fs.createWriteStream(process.argv[1],{flags:"wx",mode:384});s.on("error",()=>process.exit(1));process.stdin.pipe(s);',
+      path,
+    ], { input: data, signal, timeoutMs: 30000 });
+    signal?.throwIfAborted();
+    if (result.exitCode !== 0) throw new Error('input transfer failed');
   }
+
   async inputRemove(id: string, path: string): Promise<void> {
     if (!/^\/tmp\/vicoop-input-[a-f0-9-]+$/.test(path))
       throw new Error('invalid caller input directory');

@@ -87,6 +87,7 @@ server.on('connection', (ws) => {
           type: 'hello.ack',
           protocolCapabilities: [
             'task-replay-v1',
+            'caller-context-v2',
             'execution-scope-v1',
             'caller-runtime-v1',
           ],

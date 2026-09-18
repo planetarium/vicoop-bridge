@@ -1388,6 +1388,7 @@ test('execution scope acknowledgement requires the full capability set', async (
       if (frame.type === 'hello.ack') {
         assert.equal(frame.protocolCapabilities.includes(EXECUTION_SCOPE_V1_CAPABILITY), callerV2);
         assert.equal(frame.protocolCapabilities.includes('caller-runtime-v1'), callerV2);
+        assert.equal(frame.protocolCapabilities.includes(CALLER_CONTEXT_V2_CAPABILITY), callerV2);
       }
     } finally {
       ws.close();

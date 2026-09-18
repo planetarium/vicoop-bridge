@@ -120,9 +120,9 @@ export async function createCallerRuntime(args: {
               cwd: '/workspace',
               sandboxMode: 'danger-full-access',
               spawn: spawn as AppServerSpawnFn,
-              mkdtemp: () => pool.inputDirectory(container.id),
-              writeFile: (path, data) =>
-                pool.inputWrite(container.id, path, data),
+              mkdtemp: (_prefix, signal) => pool.inputDirectory(container.id, signal),
+              writeFile: (path, data, signal) =>
+                pool.inputWrite(container.id, path, data, signal),
               rm: (path) => pool.inputRemove(container.id, path),
             });
       return {

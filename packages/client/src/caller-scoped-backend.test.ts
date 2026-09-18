@@ -55,6 +55,7 @@ function fixture(handle?: Backend['handle'], opts = {}) {
       _signal?: AbortSignal,
       principalId?: string,
       onReserved?: () => void,
+      onMutation?: () => void,
     ) => {
       assert.ok(
         principalId,
@@ -66,6 +67,7 @@ function fixture(handle?: Backend['handle'], opts = {}) {
         existing.add(id);
       }
       onReserved?.();
+      onMutation?.();
       return { id, name: id, recovered: false };
     },
     checkStorage: async () => {
@@ -392,4 +394,46 @@ test('cancellation at acquire entry frees unreserved capacity, but post-reservat
     assert.match(JSON.stringify(await f.run(task('bob'))), reserved ? /runtime_capacity/ : /task.complete/);
     await f.backend.close();
   }
+});
+
+
+test('cancellation during read-only acquisition preserves the existing worker and conversation', async () => {
+  const f = fixture();
+  await f.run();
+  const acquire = f.pool.acquire.bind(f.pool);
+  const controller = new AbortController();
+  f.pool.acquire = async (...args) => {
+    args[3]?.(); // Retained SQLite reservation, but no Docker mutations yet.
+    controller.abort();
+    args[1]!.throwIfAborted();
+    throw new Error('unreachable');
+  };
+  assert.match(JSON.stringify(await f.run(task(), controller.signal)), /runtime_canceled/);
+  assert.equal(f.stops.length, 0);
+  f.pool.acquire = acquire;
+  assert.equal((await f.run()).at(-1)?.type, 'task.complete');
+  assert.equal(f.workers.length, 1);
+  assert.equal(f.contexts[0], f.contexts[1]);
+  await f.backend.close();
+});
+
+test('canceling an in-flight periodic storage check aborts it without reporting an infrastructure failure', async () => {
+  const f = fixture(async () => new Promise<void>(() => {}));
+  let ready!: () => void;
+  const started = new Promise<void>(resolve => { ready = resolve; });
+  let checkSignal: AbortSignal | undefined;
+  f.pool.checkStorage = async (_id, signal) => {
+    checkSignal = signal;
+    ready();
+    await new Promise<void>((_resolve, reject) => signal!.addEventListener('abort', () => reject(signal!.reason), { once: true }));
+  };
+  const controller = new AbortController();
+  const pending = f.run(task(), controller.signal);
+  await started;
+  controller.abort();
+  const frames = JSON.stringify(await pending);
+  assert.equal(checkSignal?.aborted, true);
+  assert.match(frames, /runtime_canceled/);
+  assert.doesNotMatch(frames, /runtime_failed|runtime_storage_limit/);
+  await f.backend.close();
 });

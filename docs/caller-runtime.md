@@ -177,7 +177,9 @@ execution and resumes its scope/context-specific thread on the next request.
 Cancellation revokes the execution grant, terminates the execution, and stops
 only the affected scope's container before returning a failure. Unconfirmed
 cleanup quarantines that scope until offline recovery. Canceling a queued
-waiter does not stop its predecessor or another caller. The next request after
+waiter does not stop its predecessor or another caller. Cancellation during
+read-only acquisition, before any Docker mutation or execution, also preserves
+the existing container and conversation. The next request after
 a stopped/failed execution restarts that user's container and reports an explicit
 conversation reset. Generation-scoped server cancellation may suppress terminal
 frames according to the existing replay protocol.
@@ -245,7 +247,7 @@ clear another caller's storage to recover an unrelated scope.
 ## Rollout and validation
 
 Deploy the compatible server before enabling the client. The client requires
-`caller-runtime-v1`, `execution-scope-v1` and replay acknowledgement; an older
+`caller-runtime-v1`, `execution-scope-v1`, `caller-context-v2` and replay acknowledgement; an older
 server makes it refuse work. Rollback: stop caller mode, keep its volumes/state,
 and choose host mode explicitly. Old #499 snapshot archives
 are incompatible with this storage schema and are not automatically imported.

@@ -29,3 +29,16 @@ test('spawn errors and excessive output settle with errors', async () => {
     'process.stdout.write(Buffer.alloc(2 * 1024 * 1024)); setInterval(() => {}, 1000)',
   ]), /exceeded/);
 });
+
+
+test('binary input preserves bytes and an aborted blocked stdin transfer settles promptly', async () => {
+  const data = Buffer.from([0, 255, 1, 128]);
+  const result = await runBoundedCommand(process.execPath, ['-e', 'const chunks=[];process.stdin.on("data",c=>chunks.push(c));process.stdin.on("end",()=>process.stdout.write(Buffer.concat(chunks).toString("hex")))'], { input: data });
+  assert.equal(result.stdout, data.toString('hex'));
+  assert.equal(result.exitCode, 0);
+  const controller = new AbortController();
+  const writing = runBoundedCommand(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { input: Buffer.alloc(8 * 1024 * 1024), signal: controller.signal });
+  const rejected = assert.rejects(writing, /aborted/);
+  controller.abort();
+  await rejected;
+});

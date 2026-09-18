@@ -214,3 +214,26 @@ test('allocation forwards cancellation to inspections and mutations, then stops 
     await pool.close();
   }
 });
+
+
+test('input staging forwards binary stdin and cancellation to Docker', async () => {
+  const controller = new AbortController();
+  const id = 'a'.repeat(64), path = '/tmp/vicoop-input-abcd/image-1.png';
+  const data = Buffer.from('image');
+  const config = CallerRuntimeConfig.parse({ image: `sha256:${'a'.repeat(64)}`, stateDirectory: '/fixture' });
+  let ready!: () => void;
+  const started = new Promise<void>(resolve => { ready = resolve; });
+  const pool = new DockerCallerRuntimePool('codex', config, 'agent', async (args, opts) => {
+    assert.equal(opts?.signal, controller.signal);
+    assert.equal(args.at(-1), path);
+    assert.equal(opts.input, data);
+    ready();
+    await new Promise<void>((_resolve, reject) => opts.signal!.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+    throw new Error('unreachable');
+  });
+  const writing = pool.inputWrite(id, path, data, controller.signal);
+  const rejected = assert.rejects(writing, /aborted/);
+  await started;
+  controller.abort();
+  await rejected;
+});

@@ -203,14 +203,15 @@ export class CallerScopedBackend implements Backend {
         );
         return;
       }
-      acquired = true;
       phase = 'allocation';
       const container = await this.pool.acquire(
         id,
         controller.signal,
         task.executionScope!.principalId,
         () => { entry.retained = true; }, // Only a committed reservation consumes retained capacity.
+        () => { acquired = true; }, // Mutations require cleanup even if acquisition fails.
       );
+      acquired = true;
       controller.signal.throwIfAborted();
       phase = 'backend-initialization';
       if (!entry.worker) entry.worker = await this.factory(container, controller.signal);
@@ -234,8 +235,9 @@ export class CallerScopedBackend implements Backend {
       monitor = setInterval(() => {
         if (storageCheck) return;
         storageCheck = this.pool
-          .checkStorage(id)
+          .checkStorage(id, controller.signal)
           .catch((error) => {
+            if (controller.signal.aborted) return;
             storageCheckFailed = true;
             storageFailure = error instanceof CallerStorageLimitError;
             abort();
@@ -265,7 +267,7 @@ export class CallerScopedBackend implements Backend {
       if (!worker.healthy()) throw new Error('execution cleanup uncertain');
       clearInterval(monitor);
       await storageCheck;
-      await this.pool.checkStorage(id);
+      await this.pool.checkStorage(id, controller.signal);
       controller.signal.throwIfAborted();
       if (!terminal) throw new Error('backend missing terminal');
       emit(terminal);
