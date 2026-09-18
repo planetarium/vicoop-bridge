@@ -339,3 +339,19 @@ Codex model catalogs are shared across scopes within one daemon, revalidated
 against the host login on access, and refreshed when credentials or the installed
 version change. Concurrent callers share a lookup; canceling one does not cancel
 the others, and canceling the last waiter aborts the lookup.
+
+
+A newly reserved caller cannot adopt an existing container, network, or volume.
+Orphan detection performs no Docker mutations and rolls back that reservation;
+restarting the daemon does not make the orphan data eligible for reuse. Stop the
+daemon and inspect the Docker resources, then restore their original state
+database or explicitly remove the orphan resources. Orphans are not managed by
+`container remove` because they have no committed scope record.
+
+Claude caller settings use an allowlist: `model` (Claude model IDs or
+sonnet/opus/haiku), `effortLevel` (low/medium/high/max), `alwaysThinkingEnabled`
+(boolean), `sandbox.enabled`/`sandbox.failIfUnavailable` (booleans), and
+`env.ENABLE_PROMPT_CACHING_1H` ("0"/"1"). Other settings, environment variables,
+hooks and authentication helpers fail initialization and daemon startup. Allowed
+settings are copied before constructing caller workers; host-only settings must
+be removed from the container-mode backend configuration.

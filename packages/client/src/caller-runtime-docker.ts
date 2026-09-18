@@ -5,6 +5,9 @@ import { brokerFirewallScript } from './execution-runtime-boundary.js';
 import { PROVIDER_ENV_PATTERN } from './provider-environment.js';
 import type { CallerRuntimeOptions } from './caller-runtime-config.js';
 
+export class CallerOrphanedResourcesError extends Error {
+  constructor() { super('unrecorded caller resources exist; stop the daemon and restore the original state database or inspect and remove the orphan Docker resources explicitly'); }
+}
 export class CallerStorageMissingError extends Error {
   constructor() { super('retained caller volume missing; restore its original volumes or explicitly remove the scope before starting over'); }
 }
@@ -292,8 +295,25 @@ export class DockerCallerRuntimePool {
     };
     const name = this.name(id);
     const fresh = await this.store.reserve(id, this.kind, principalId); // reserve before the first Docker mutation
-    onReserved?.();
-    let info = await this.inspect(name, signal);
+    let info;
+    if (fresh) {
+      // Inspect every resource before the first mutation. A rejected reservation
+      // must not turn orphan resources into a valid retained scope on restart.
+      try {
+        info = await this.inspect(name, signal);
+        if (info || await this.volumeExists(id, 'workspace', signal) ||
+            await this.volumeExists(id, 'sessions', signal) ||
+            await this.networkExists(id, undefined, signal))
+          throw new CallerOrphanedResourcesError();
+      } catch (error) {
+        await this.store.forget(id);
+        throw error;
+      }
+      onReserved?.();
+    } else {
+      onReserved?.();
+      info = await this.inspect(name, signal);
+    }
     const recovered = !!info;
     if (!info) {
       for (const suffix of ['workspace', 'sessions']) {

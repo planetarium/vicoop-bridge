@@ -418,3 +418,13 @@ test('explicit empty or malformed image references cannot fall back to building'
     assert.deepEqual(f.calls, []);
   }
 });
+
+test('unsafe operator Claude settings fail init before authentication or Docker', async (t) => {
+  const f = await fixture(t);
+  const original = { ...f.original, backends: { claude: { settings: { env: { FOO_SECRET: 'OPERATOR_SECRET' } } } } };
+  await writeFile(f.path, JSON.stringify(original));
+  await assert.rejects(runCallerContainerInit(f.options), error => error instanceof Error && /settings/.test(error.message) && !error.message.includes('OPERATOR_SECRET'));
+  assert.deepEqual(await f.read(), original);
+  assert.equal(f.auth(), 0);
+  assert.deepEqual(f.calls, []);
+});

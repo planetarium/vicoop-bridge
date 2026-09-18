@@ -8,7 +8,7 @@ import {
 import { CallerScopedBackend } from './caller-scoped-backend.js';
 import {
   createClaudeCredentialReader,
-  assertClaudeBrokerSettings,
+  selectClaudeCallerSettings,
 } from './claude-auth-broker.js';
 import { createClaudeBrokerSpawn } from './claude-broker-spawn.js';
 import {
@@ -40,7 +40,7 @@ export async function createCallerRuntime(args: {
   const codexCredential =
     args.kind === 'codex' ? createCodexCredentialReader() : undefined;
   const selected = await (claudeCredential ?? codexCredential)!();
-  if (args.kind === 'claude') assertClaudeBrokerSettings(args.claude?.settings);
+  const claudeSettings = args.kind === 'claude' ? selectClaudeCallerSettings(args.claude?.settings) : undefined;
   const catalog = codexCredential ? createCodexModelCatalogCache(codexCredential) : undefined;
   const pool = new DockerCallerRuntimePool(args.kind, config, args.agentId);
   const backend = new CallerScopedBackend(
@@ -103,6 +103,7 @@ export async function createCallerRuntime(args: {
         args.kind === 'claude'
           ? createClaudeBackend({
               ...args.claude,
+              settings: claudeSettings,
               cwd: '/workspace',
               spawn: spawn as ClaudeSpawnFn,
               fetchUriPolicy: { enabled: false },

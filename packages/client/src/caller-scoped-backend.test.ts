@@ -6,7 +6,7 @@ import {
 } from './caller-scoped-backend.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { scopeDigest } from './caller-runtime-store.js';
-import { CallerStorageMissingError, CallerStorageLimitError, type DockerCallerRuntimePool } from './caller-runtime-docker.js';
+import { CallerOrphanedResourcesError, CallerStorageMissingError, CallerStorageLimitError, type DockerCallerRuntimePool } from './caller-runtime-docker.js';
 import type { Backend } from './backend.js';
 import type { TaskAssignFrame, UpFrame } from '@vicoop-bridge/protocol';
 
@@ -466,4 +466,15 @@ test('backend-specific MIME and size admission rejects inline files before consu
     }
     await f.backend.close();
   }
+});
+
+
+test('orphan resources quarantine their caller without stopping or adopting Docker resources', async () => {
+  const f = fixture();
+  f.pool.acquire = async () => { throw new CallerOrphanedResourcesError(); };
+  assert.match(JSON.stringify(await f.run()), /runtime_orphaned_resources/);
+  assert.match(JSON.stringify(await f.run()), /runtime_quarantined/);
+  assert.equal(f.workers.length, 0);
+  assert.equal(f.stops.length, 0);
+  await f.backend.close();
 });

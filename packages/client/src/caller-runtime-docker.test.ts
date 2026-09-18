@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DockerCallerRuntimePool, CALLER_TMPFS, CallerStorageMissingError, CallerStorageLimitError } from './caller-runtime-docker.js';
+import { DockerCallerRuntimePool, CALLER_TMPFS, CallerOrphanedResourcesError, CallerStorageMissingError, CallerStorageLimitError } from './caller-runtime-docker.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { CallerRuntimeStore, scopeDigest } from './caller-runtime-store.js';
 import type { AsyncDockerRun } from './docker-command.js';
@@ -239,4 +239,39 @@ test('input staging forwards binary stdin and cancellation to Docker', async () 
   await started;
   controller.abort();
   await rejected;
+});
+
+
+test('fresh scopes reject orphan resources without mutations or restart adoption', async (t) => {
+  for (const orphan of ['container', 'workspace', 'sessions', 'network']) {
+    const directory = await mkdtemp(join(tmpdir(), 'caller-orphan-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const options = CallerRuntimeConfig.parse({ image: `sha256:${'a'.repeat(64)}`, stateDirectory: directory });
+    const id = scopeDigest('agent', 'alice');
+    const namespace = new CallerRuntimeStore(await realpath(directory), 'agent').namespace;
+    const name = `vb-caller-${namespace.slice(0, 16)}-${id}`;
+    const labels = { 'vicoop.component': 'caller-runtime', 'vicoop.caller-namespace': namespace, 'vicoop.scope': id, 'vicoop.kind': 'claude' };
+    const calls: string[][] = [];
+    const run: AsyncDockerRun = async (args) => {
+      calls.push([...args]);
+      if (args[0] === 'image') return { exitCode: 0, stdout: JSON.stringify([{ Config: {} }]), stderr: '' };
+      if (args[0] === 'ps') return { exitCode: 0, stdout: '', stderr: '' };
+      assert.equal(args[1], 'inspect', 'orphan detection must not mutate Docker');
+      let resource;
+      if (args[0] === 'container' && orphan === 'container') resource = {};
+      if (args[0] === 'volume' && args[2].endsWith(`-${orphan}`)) resource = { Driver: 'local', Labels: labels };
+      if (args[0] === 'network' && orphan === 'network') resource = { Name: `${name}-net`, Id: 'network', Driver: 'bridge', Scope: 'local', Labels: labels };
+      return resource ? { exitCode: 0, stdout: JSON.stringify([resource]), stderr: '' } : { exitCode: 1, stdout: '', stderr: `No such ${args[0]}` };
+    };
+    for (let restart = 0; restart < 2; restart++) {
+      const pool = new DockerCallerRuntimePool('claude', options, 'agent', run);
+      await pool.initialize();
+      let reserved = false;
+      await assert.rejects(pool.acquire(id, undefined, 'alice', () => { reserved = true; }), CallerOrphanedResourcesError);
+      assert.equal(reserved, false);
+      assert.deepEqual(await pool.store.scopes(), []);
+      await pool.close();
+    }
+    assert.ok(!calls.some(args => ['create', 'start', 'stop', 'rm', 'exec'].some(command => args.includes(command))));
+  }
 });

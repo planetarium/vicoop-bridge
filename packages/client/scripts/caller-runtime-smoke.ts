@@ -169,11 +169,14 @@ try {
       await pool.initialize();
       await assert.rejects(pool.acquire(alice), /retained caller volume missing/);
       await assert.rejects(docker(['volume', 'inspect', `${restored.name}-workspace`]));
+      await pool.store.forget(alice);
+      await assert.rejects(pool.acquire(alice), /unrecorded caller resources/);
+      assert.deepEqual(await pool.store.scopes(), []);
       console.log(
         `PASS ${kind}: A/B/A, container reuse, stop/recreate/restart persistence, independent volumes, exclusive owner, input transfer, storage admission, offline resize recovery, network drift rejection, unprivileged workloads`,
       );
     } finally {
-      for (const id of await pool.store.scopes()) await pool.remove(id, true);
+      for (const id of new Set([...ids, ...await pool.store.scopes()])) await pool.remove(id, true);
       await pool.close();
     }
   }

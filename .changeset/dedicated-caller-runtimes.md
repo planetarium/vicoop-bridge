@@ -23,3 +23,5 @@ Report missing retained volumes during explicit offline validation, release call
 Cancel inline-image transfers and in-flight storage inspections promptly, preserve conversations when acquisition is canceled before Docker mutation, and align caller-context-v2 acknowledgement across client/server negotiation and lifecycle fixtures.
 
 Reject retained containers with automatic port publishing and validate backend-specific inline-file MIME/size before reserving caller capacity.
+
+Reject orphan Docker resources for newly reserved callers without adopting them on restart. Allowlist and copy Claude caller settings so arbitrary operator environment, hooks and helpers never enter caller workloads.
