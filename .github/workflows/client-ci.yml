@@ -61,6 +61,12 @@ jobs:
       - name: Test client
         run: pnpm --filter @vicoop-bridge/client test
 
+      - name: Test Bun caller storage and standalone SQLite
+        run: |
+          bun test packages/client/src/caller-runtime-store.test.ts
+          bun build --compile packages/client/scripts/caller-store-smoke.ts --outfile /tmp/caller-store-smoke
+          /tmp/caller-store-smoke
+
       - name: Build client
         run: pnpm --filter @vicoop-bridge/client build
 

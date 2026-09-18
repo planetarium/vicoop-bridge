@@ -1,5 +1,6 @@
 // Full compiled CLI + real Docker + deterministic Claude/Codex fixtures. No provider calls.
 import assert from 'node:assert/strict';
+import Database from 'better-sqlite3';
 import { promisify } from 'node:util';
 import { spawn, execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -255,8 +256,11 @@ try {
     const id = createHash('sha256').update(JSON.stringify([
       'vicoop-execution-scope', 'direct-principal-v1', 'smoke', principal,
     ])).digest('hex');
-    const record = JSON.parse(await readFile(join(directory, 'state', `${id}.json`), 'utf8'));
-    assert.deepEqual(record, { version: 3, id, kind, namespace, agentId: 'smoke', principalId: principal });
+    const db = new Database(join(directory, 'state', 'state.sqlite'), { readonly: true });
+    try {
+      const record = db.prepare('SELECT * FROM scopes WHERE id = ?').get(id);
+      assert.deepEqual(record, { id, kind, namespace, agentId: 'smoke', principalId: principal });
+    } finally { db.close(); }
   }
   assign('apikey:a', 'a2');
   const a2 = await completed('a2');

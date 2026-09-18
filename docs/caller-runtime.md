@@ -173,22 +173,40 @@ fixture smokes are not a substitute for real-provider acceptance.
 
 ## Identity storage format (foundation for #507)
 
-The private state directory uses manifest version 3. Each scope record contains
-`version: 3`, `id` (scope digest), `kind` (backend), `namespace`, `agentId` and
-`principalId`. Only the principal from an already validated direct execution
-scope is recorded; the store independently checks its digest against the scope.
-No credentials, tokens, caller display names or request metadata are stored.
-The directory remains 0700 and records are written atomically with mode 0600.
-Principal IDs are not added to Docker names/labels or `caller-state` output.
+The private state directory stores scope mappings in `state.sqlite` (SQLite
+schema version 4, exposed as `PRAGMA user_version`). The `scopes` table contains
+`id` (scope digest), `kind` (backend), `namespace`, `agentId` and nullable
+`principalId`, with an index on `(agentId, principalId, kind)`. The `metadata`
+table binds the database to its agent, host and namespace. Only a principal from
+an already validated direct execution scope is recorded; the store independently
+checks its digest against the scope. No credentials, tokens, caller display names
+or request metadata are stored. The directory remains 0700 and the database is
+0600. Principal IDs are not added to Docker names/labels or `caller-state` output.
 
-Version 2 manifests upgrade under the exclusive owner lock. Legacy hash-only
-records migrate lazily to version 3 with `principalId: null` (unknown); a later
-validated request for that exact scope fills the mapping. Startup/offline
-reconciliation never guesses an identity or clears a known mapping. Corrupt,
-mismatched and unsupported records fail closed. Container names and volumes do
-not change. An interrupted migration can resume with mixed legacy/v3 records.
+Mapping writes and migration use SQLite transactions. The standalone Bun client
+uses built-in SQLite; Node/tsx development uses `better-sqlite3` (Node 20 or later
+supported by the pinned dependency). Docker ownership still uses the exclusive
+host lock: a database transaction cannot make Docker resource changes atomic.
+The small `manifest.json` compatibility marker and `owner.json` process lock
+remain JSON; scope mappings are stored only in SQLite after migration.
 
-After upgrade, old version-2-only clients refuse the manifest. Do not manually
-lower the version to downgrade; retain a stopped-state backup before upgrading.
+Version 2/3 JSON stores migrate on startup under the exclusive owner lock. All
+records are validated and imported in one transaction. Hash-only records retain
+`principalId: null` (unknown); a later validated request for that exact scope
+fills the mapping. Startup/offline reconciliation never guesses an identity or
+clears a known mapping. Corrupt, mismatched and unsupported records fail closed.
+Container names and volumes do not change.
+
+The manifest advances to version 4 with a pending migration marker before import,
+so old JSON readers refuse the store. An interrupted import can be retried; an
+already committed import is never replayed. Original scope JSON files remain as
+inert migration backups and are not read after migration, including after scope
+deletion. Deleting a scope also removes its matching JSON backup. Other backups
+can be removed after verifying the migration; they may contain principal IDs.
+A missing committed database is an error, not an invitation to rebuild it from
+stale backups. Stop the daemon before copying the state directory
+for backup. Do not lower the manifest version to downgrade; restore a complete
+pre-upgrade backup instead.
+
 User lookup, live inspection and environment initialization/reapplication remain
 in #507; this change only establishes the persisted identity mapping.
