@@ -31,7 +31,7 @@ import {
   buildOpenAICompatUsage,
   type OpenAICompatUsage,
 } from './openai-compat-usage.js';
-import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME } from './fetch-uri-file.js';
+import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME, decodedBase64Size } from './fetch-uri-file.js';
 import { createTimingRecorder } from './timing.js';
 import {
   AppServerRpcClient,
@@ -225,13 +225,6 @@ function clipTo(text: string, max: number): string {
   return `${text.slice(0, Math.max(0, max - 1))}…`;
 }
 
-function decodedBase64Size(b64: string): number {
-  if (b64.length === 0) return 0;
-  let pad = 0;
-  if (b64.endsWith('==')) pad = 2;
-  else if (b64.endsWith('=')) pad = 1;
-  return Math.max(0, Math.floor((b64.length * 3) / 4) - pad);
-}
 
 function imageExtForMime(mime: string): string {
   switch (mime) {

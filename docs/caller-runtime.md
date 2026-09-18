@@ -161,6 +161,11 @@ delegation never fall back to a shared runtime. Public agents still require
 caller authentication when they advertise container execution. Shared
 API keys identify the same principal and therefore share the same environment.
 
+Input admission runs before allocating caller storage: Claude accepts inline
+PNG/JPEG/WebP/GIF images and PDF documents, while Codex accepts those images only.
+Each file is limited to 5 MiB decoded; unsupported MIME types, oversized files,
+URI inputs and data parts are rejected before reserving a caller scope.
+
 Each scope owns a private Docker network and two named volumes: `/workspace`
 and `/data/sessions/<backend>`. The root filesystem is read-only; writable HOME
 and temporary directories are bounded tmpfs. There are no host filesystem or

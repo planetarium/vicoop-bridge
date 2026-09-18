@@ -177,6 +177,7 @@ export class DockerCallerRuntimePool {
       h.DeviceRequests?.length ||
       h.VolumesFrom?.length ||
       Object.keys(h.PortBindings ?? {}).length ||
+      h.PublishAllPorts ||
       h.RestartPolicy?.Name !== 'no' ||
       !h.SecurityOpt?.includes('no-new-privileges') ||
       h.SecurityOpt?.some((v: string) => /unconfined/.test(v)) ||

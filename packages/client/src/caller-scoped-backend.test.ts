@@ -437,3 +437,33 @@ test('canceling an in-flight periodic storage check aborts it without reporting 
   assert.doesNotMatch(frames, /runtime_failed|runtime_storage_limit/);
   await f.backend.close();
 });
+
+
+test('backend-specific MIME and size admission rejects inline files before consuming caller capacity', async () => {
+  const tooLarge = Buffer.alloc(5 * 1024 * 1024 + 1).toString('base64');
+  const atLimit = Buffer.alloc(5 * 1024 * 1024).toString('base64');
+  for (const kind of ['claude', 'codex']) {
+    for (const [mimeType, bytes] of [
+      [kind === 'claude' ? 'text/plain' : 'application/pdf', 'aGVsbG8='],
+      ['', 'aGVsbG8='], ['image/png', tooLarge],
+    ]) {
+      const f = fixture(undefined, { maxScopes: 1 });
+      Object.assign(f.pool, { kind });
+      const input = task();
+      input.message.parts = [{ kind: 'file', file: { mimeType, bytes } }];
+      assert.match(JSON.stringify(await f.run(input)), /caller_scope_required/);
+      assert.equal(f.allocations.length, 0);
+      assert.equal(f.workers.length, 0);
+      assert.equal((await f.run(task('bob'))).at(-1)?.type, 'task.complete');
+      await f.backend.close();
+    }
+    const f = fixture();
+    Object.assign(f.pool, { kind });
+    for (const mimeType of ['image/png', 'image/jpeg', 'image/webp', 'image/gif', ...(kind === 'claude' ? ['application/pdf'] : [])]) {
+      const input = task();
+      input.message.parts = [{ kind: 'file', file: { mimeType, bytes: atLimit } }];
+      assert.equal((await f.run(input)).at(-1)?.type, 'task.complete');
+    }
+    await f.backend.close();
+  }
+});

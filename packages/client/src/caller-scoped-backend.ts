@@ -1,3 +1,4 @@
+import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME, decodedBase64Size } from './backends/fetch-uri-file.js';
 import {
   ExecutionScopeV1,
   OPENAI_COMPAT_EXTENSION_URI,
@@ -95,6 +96,13 @@ export class CallerScopedBackend implements Backend {
       throw new Error(
         'container requires plain A2A text or inline files; caller tools and URI inputs are unsupported',
       );
+    for (const part of task.message.parts) {
+      if (part.kind !== 'file') continue;
+      const mime = part.file.mimeType ?? '';
+      if ((!INPUT_IMAGE_MIME.has(mime) && !(this.pool.kind === 'claude' && mime === 'application/pdf')) ||
+          decodedBase64Size(part.file.bytes!) > INPUT_FILE_MAX_BYTES)
+        throw new Error('unsupported caller-runtime file MIME or size');
+    }
     return scope.id;
   }
   private fail(

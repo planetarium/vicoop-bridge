@@ -417,7 +417,11 @@ export class WSForwardingExecutor extends AgentExecutor {
       };
       task.status = status;
       task.history = appendHistoryMessage(appendHistoryMessage(task.history ?? [], message), status.message);
-      await this.taskStore.updateTask(taskId, { status, history: task.history });
+      try {
+        await this.taskStore.updateTask(taskId, { status, history: task.history });
+      } catch (err) {
+        logEvent('task_persist_error', { taskId, error: String(err) });
+      }
       yield { taskId, contextId, final: true, status };
       return;
     }

@@ -1137,13 +1137,15 @@ test('executor forwards only negotiated, server-derived direct execution scopes'
 });
 
 test('caller runtime rejects anonymous/delegated identity before binding or payment work', async () => {
-  for (const metadata of [{}, { _principalId: 'apikey:a', _actorId: 'actor' }, { _principalId: 'apikey:a', _authorizationKey: 'grant' }]) {
+  for (const persistenceFails of [false, true]) for (const metadata of [{}, { _principalId: 'apikey:a', _actorId: 'actor' }, { _principalId: 'apikey:a', _authorizationKey: 'grant' }]) {
     const { ws, sent } = makeWsCapture();
     const registry = new Registry();
     registry.registerAgent({ agentId: 'agent', clientId: 'client', ownerPrincipal: 'owner',
       protocolCapabilities: ['caller-runtime-v1', EXECUTION_SCOPE_V1_CAPABILITY, CALLER_CONTEXT_V2_CAPABILITY, TASK_REPLAY_CAPABILITY],
       agentCard: makeAgentCard(), allowedCallers: [], ws, connectedAt: 0 });
-    const executor = new WSForwardingExecutor('agent', registry, noopTaskStore());
+    const store = noopTaskStore();
+    if (persistenceFails) store.updateTask = async () => { throw new Error('temporary task store outage'); };
+    const executor = new WSForwardingExecutor('agent', registry, store);
     // If currentGate is reached this fixture fails; rejection must precede charging.
     Object.assign(executor, { currentGate: () => { throw new Error('payment gate must not run'); } });
     const task = { id: 't-rejected', contextId: 'ctx', status: { state: TaskState.SUBMITTED } } as unknown as Task;

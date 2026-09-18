@@ -21,3 +21,5 @@ Reject explicit empty image references, propagate task cancellation through Dock
 Report missing retained volumes during explicit offline validation, release caller capacity when allocation ends before SQLite reservation, and require caller-context-v2 in isolated capability negotiation.
 
 Cancel inline-image transfers and in-flight storage inspections promptly, preserve conversations when acquisition is canceled before Docker mutation, and align caller-context-v2 acknowledgement across client/server negotiation and lifecycle fixtures.
+
+Reject retained containers with automatic port publishing and validate backend-specific inline-file MIME/size before reserving caller capacity.

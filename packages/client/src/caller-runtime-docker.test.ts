@@ -25,7 +25,7 @@ test('offline recovery accepts changed limits but rejects running or unowned res
     NetworkSettings: { Networks: { [`${name}-net`]: { NetworkID: 'caller-network-id' } } },
     Image: options.image, State: { Running: false },
     Config: { Labels: labels, User: '1000:1000', Entrypoint: ['/usr/bin/tini'], Cmd: ['--', '/bin/sleep', 'infinity'], Env: ['CLAUDE_CONFIG_DIR=/data/sessions/claude/config'] },
-    HostConfig: { Tmpfs: { ...CALLER_TMPFS }, ReadonlyRootfs: true, NetworkMode: `${name}-net`, RestartPolicy: { Name: 'no' }, SecurityOpt: ['no-new-privileges'], CapAdd: ['NET_ADMIN'], Memory: 512 * 1048576, MemorySwap: 512 * 1048576, PidsLimit: 256, NanoCpus: 1e9 },
+    HostConfig: { PublishAllPorts: false, Tmpfs: { ...CALLER_TMPFS }, ReadonlyRootfs: true, NetworkMode: `${name}-net`, RestartPolicy: { Name: 'no' }, SecurityOpt: ['no-new-privileges'], CapAdd: ['NET_ADMIN'], Memory: 512 * 1048576, MemorySwap: 512 * 1048576, PidsLimit: 256, NanoCpus: 1e9 },
     Mounts: [{ Type: 'volume', Destination: '/workspace', Name: `${name}-workspace`, RW: true }, { Type: 'volume', Destination: '/data/sessions/claude', Name: `${name}-sessions`, RW: true }],
   };
   const network = { Id: 'caller-network-id', Name: `${name}-net`, Driver: 'bridge', Scope: 'local', Labels: labels, Containers: {} as Record<string, { Name: string }>, Options: {} as Record<string, string> };
@@ -53,6 +53,9 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   info.State.Running = true;
   await assert.rejects(pool().initialize(false), /stop the daemon/);
   info.State.Running = false;
+  info.HostConfig.PublishAllPorts = true;
+  await assert.rejects(pool().initialize(false), /boundary mismatch/);
+  info.HostConfig.PublishAllPorts = false;
   info.Config.Labels['vicoop.scope'] = 'wrong';
   await assert.rejects(pool().initialize(false), /boundary mismatch/);
   info.Config.Labels['vicoop.scope'] = id;
