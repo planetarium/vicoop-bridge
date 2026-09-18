@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { SHUTDOWN_TIMEOUT_MS, runWithShutdownTimeout, shutdownAndReleasePidFile } from './daemon-shutdown.js';
+import { SHUTDOWN_TIMEOUT_MS, createDaemonShutdown } from './daemon-shutdown.js';
 import { callerStateCmd, runCallerState } from './caller-runtime-admin.js';
 import { createCallerRuntime } from './caller-runtime.js';
 import { parseCodexConfigTomlForModel } from './backends/codex.js';
@@ -572,6 +572,15 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   // long-lived runtime container before construction (#249).
   const { backend, shutdown: backendShutdown } = await pickBackend(args.backend, args);
 
+  const shutdown = createDaemonShutdown({
+    stop: () => client.stop(),
+    shutdown: backendShutdown,
+    logger,
+    timeoutMs: backend.requiresCallerScope ? CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS : SHUTDOWN_TIMEOUT_MS,
+    removePidFile: process.env.VICOOP_DETACHED === '1' ? removePidFile : undefined,
+    exit: (code) => process.exit(code),
+  });
+
   const client = new Client({
     serverUrl: args.server,
     token: args.token,
@@ -587,43 +596,14 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     // failure instead of masking it as a transient disconnect. The
     // Client class deliberately does not call process.exit itself —
     // tests and future in-process embedders pass a non-exiting callback.
-    onFatal: () => {
-      if (backendShutdown) void runWithShutdownTimeout(backendShutdown, logger,
-        backend.requiresCallerScope ? CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS : SHUTDOWN_TIMEOUT_MS).finally(()=>process.exit(1));
-      else process.exit(1);
-    },
+    onFatal: () => { void shutdown(true); },
   });
 
-  client.start();
-
-  // Async shutdown so the container-mode `runtime.stop()` actually
-  // completes before process.exit. Re-entry guarded: a second
-  // signal (e.g. impatient operator pressing ctrl-c twice) drops to
-  // an immediate exit so the daemon can't get pinned by a wedged
-  // docker socket.
-  // When we are the detached child (spawned by `start --detach`, marked via
-  // VICOOP_DETACHED), we own the pidfile the parent wrote on our behalf.
-  // Remove it on a graceful exit so a daemon that's asked to stop — whether
-  // by `vicoop-client stop` or a direct SIGTERM from a supervisor — doesn't
-  // leave a corpse pidfile behind. A crash exit still leaves a stale file,
-  // but `stop`/`status` detect and clean that.
-  const ownsPidFile = process.env.VICOOP_DETACHED === '1';
-  let shuttingDown = false;
+  // Signals and fatal closes share one cleanup promise and deadline. Only
+  // confirmed cleanup releases an owned pidfile, including fatal exits.
   const onSignal = (signal: NodeJS.Signals) => {
-    if (shuttingDown) {
-      logger.info(`received second ${signal}; forcing exit`);
-      process.exit(130);
-    }
-    shuttingDown = true;
-    void (async () => {
-      logger.info(`shutting down (${signal})`);
-      client.stop();
-      const completed = await shutdownAndReleasePidFile(backendShutdown, logger, {
-        timeoutMs: backend.requiresCallerScope ? CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS : SHUTDOWN_TIMEOUT_MS,
-        removePidFile: ownsPidFile ? removePidFile : undefined,
-      });
-      process.exit(completed ? 0 : 1);
-    })();
+    logger.info(`shutting down (${signal})`);
+    void shutdown();
   };
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
@@ -658,6 +638,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
       // best-effort — never throw out of an exit handler
     }
   });
+  client.start();
 }
 
 // Race the spawned child's early exit against a short grace timer. A daemon

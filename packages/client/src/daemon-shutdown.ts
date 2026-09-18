@@ -38,3 +38,34 @@ export async function shutdownAndReleasePidFile(
     return false;
   }
 }
+
+/** All exit triggers share one bounded cleanup; fatal status cannot be downgraded. */
+export function createDaemonShutdown(options: {
+  stop: () => void;
+  shutdown?: () => Promise<void>;
+  logger: Logger;
+  timeoutMs: number;
+  removePidFile?: () => void;
+  exit: (code: number) => void;
+}): (fatal?: boolean) => Promise<void> {
+  let pending: Promise<void> | undefined;
+  let failed = false;
+  return (fatal = false) => {
+    failed ||= fatal;
+    // Defer callbacks until pending is assigned, including synchronous re-entry
+    // from stop(). Repeated signals join the same timeout-bounded operation.
+    pending ??= Promise.resolve().then(async () => {
+      try { options.stop(); }
+      catch (error) {
+        failed = true;
+        options.logger.error('client stop error:', error instanceof Error ? error.message : String(error));
+      }
+      const completed = await shutdownAndReleasePidFile(options.shutdown, options.logger, {
+        timeoutMs: options.timeoutMs,
+        removePidFile: options.removePidFile,
+      });
+      options.exit(failed || !completed ? 1 : 0);
+    });
+    return pending;
+  };
+}
