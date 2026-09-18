@@ -3,7 +3,12 @@
 Tracking: [#497](https://github.com/planetarium/vicoop-bridge/issues/497).
 Design background: [#496](https://github.com/planetarium/vicoop-bridge/issues/496).
 
-## R1: compatible foundations
+Current R2 behavior: daemon `container` means dedicated per-caller execution;
+`host` remains the default. The shared-container path and draft
+`caller-container` spelling are retired. See [current setup and migration](caller-runtime.md).
+The R1 behavior and rollback notes below describe the earlier integration stage.
+
+## R1: compatible foundations (historical)
 
 R1 supports the existing `host` and `container` modes. Their install,
 credential locations, runtime/volume names and persistence behavior stay the
@@ -19,7 +24,7 @@ Docker lifecycle operations in `RuntimeContainer`, including broker boundary
 inspection and firewall installation, run asynchronously. Ordinary commands have a 30-second timeout and a
 1 MiB aggregate captured-output limit. Image pulls retain visible progress and
 have a 10-minute timeout; readiness polling uses its remaining 10-second budget.
-One-shot `container list`/remove helpers still use the synchronous compatibility
+One-shot `container legacy list`/remove helpers still use the synchronous compatibility
 runner (bounded to 30 seconds per command); they are not request-path APIs.
 
 Timeout/abort stops the local Docker CLI. The Docker daemon may already have

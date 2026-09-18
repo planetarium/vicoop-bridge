@@ -143,3 +143,19 @@ test('auth.json API key rotation fails closed', () => {
     assert.throws(reader, /changed; restart/);
   } finally { rmSync(dir, {recursive: true, force: true}); }
 });
+
+
+test('catalog initialization forwards caller cancellation to the provider request', async () => {
+  const controller = new AbortController();
+  let entered!: () => void;
+  const ready = new Promise<void>(resolve => { entered = resolve; });
+  const request = loadCodexModelCatalog(() => ({ kind: 'oauth', secret: 'fixture', accountId: 'account' }), '0.153.4',
+    (async (_url, options) => {
+      const signal = options!.signal!;
+      entered();
+      return new Promise<Response>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    }) as typeof fetch, controller.signal);
+  await ready;
+  controller.abort();
+  await assert.rejects(request, { name: 'AbortError' });
+});

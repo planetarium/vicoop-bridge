@@ -15,9 +15,12 @@ export const OPENAI_COMPAT_EXTENSION_URI =
   'https://github.com/planetarium/oai2a2a/extensions/openai-compat/v1';
 export const CALLER_CONTEXT_V1_CAPABILITY = 'caller-context-v1';
 export const CALLER_CONTEXT_V2_CAPABILITY = 'caller-context-v2';
-// Wire support only; never evidence that a client isolates execution. R1
-// clients do not advertise this capability. Requires caller-context-v2 and
-// task-replay-v1 so a future isolated client can validate identity/generation.
+// Declares support for caller-isolated execution. Valid only with negotiated
+// caller-context-v2, execution-scope-v1 and task-replay-v1, so the client can
+// validate caller identity and execution generation. R1-only clients must not
+// advertise this capability; servers use it to enforce direct caller admission.
+export const CALLER_RUNTIME_V1_CAPABILITY = 'caller-runtime-v1';
+
 export const EXECUTION_SCOPE_V1_CAPABILITY = 'execution-scope-v1';
 export const ExecutionScopeV1 = z.object({
   policy: z.literal('direct-principal-v1'),

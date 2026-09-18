@@ -11,6 +11,8 @@ export interface DockerCommandOptions {
   /** Preserve progress output for operator-initiated image pulls. */
   inheritOutput?: boolean;
   signal?: AbortSignal;
+  /** Optional binary stdin, used for bounded caller input staging. */
+  input?: Buffer;
 }
 
 export type AsyncDockerRun = (
@@ -42,7 +44,7 @@ export function runBoundedCommand(
   if (options.signal?.aborted) return Promise.reject(new Error('command aborted before start'));
   return new Promise((resolve, reject) => {
     const child = spawn(command, Array.from(args), {
-      stdio: ['ignore', options.inheritOutput ? 'inherit' : 'pipe', options.inheritOutput ? 'inherit' : 'pipe'],
+      stdio: [options.input === undefined ? 'ignore' : 'pipe', options.inheritOutput ? 'inherit' : 'pipe', options.inheritOutput ? 'inherit' : 'pipe'],
     });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -65,6 +67,7 @@ export function runBoundedCommand(
       if (failure || settled) return;
       failure = error;
       child.kill('SIGKILL');
+      child.stdin?.destroy();
       child.stdout?.destroy();
       child.stderr?.destroy();
       // Do not wait indefinitely for close (e.g. inherited descendant pipes).
@@ -85,5 +88,7 @@ export function runBoundedCommand(
     child.stderr?.on('data', (chunk: Buffer) => collect(stderr, chunk));
     child.once('error', (error) => finish(error));
     child.once('close', (code) => finish(failure, code));
+    child.stdin?.on('error', (error) => stop(error));
+    child.stdin?.end(options.input);
   });
 }

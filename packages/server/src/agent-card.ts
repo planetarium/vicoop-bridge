@@ -8,6 +8,8 @@ import {
 } from '@a2x/sdk';
 import {
   CALLER_CONTEXT_V2_CAPABILITY,
+  CALLER_RUNTIME_V1_CAPABILITY,
+  OPENAI_COMPAT_EXTENSION_URI,
   MENTIONABLE_IDENTITY_VC_EXTENSION_URI,
   SIWE_BEARER_AUTH_EXTENSION_URI,
 } from '@vicoop-bridge/protocol';
@@ -138,7 +140,8 @@ export function buildAgentA2XServer(
   // the URI can still authenticate via the opaque vbc_caller_* path on
   // the bridge.
   const wireExtensions = wire.capabilities?.extensions ?? [];
-  const restricted = conn.allowedCallers.length > 0;
+  const callerRuntime = conn.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) === true;
+  const restricted = conn.allowedCallers.length > 0 || callerRuntime;
   const bridgeWillEmitSiwe = restricted && Boolean(opts.publicUrl);
   const bridgeWillEmitIdentityVc =
     Boolean(opts.publicUrl) &&
@@ -146,11 +149,12 @@ export function buildAgentA2XServer(
     supportsCallerContext(conn.protocolCapabilities) &&
     (conn.identityTrust?.trustedIssuers.length ?? 0) > 0;
   const bridgeWillEmitOAuthFederation =
-    restricted &&
+    !callerRuntime && restricted &&
     Boolean(opts.publicUrl) &&
     conn.protocolCapabilities?.includes(CALLER_CONTEXT_V2_CAPABILITY) === true &&
     conn.allowedCallers.some((entry) => parseFederatedPrincipal(entry) !== null);
   for (const extension of wireExtensions) {
+    if (callerRuntime && extension.uri === OPENAI_COMPAT_EXTENSION_URI) continue;
     if (restricted && extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI) {
       // Bridge owns this advertisement on restricted agents — drop wire
       // entry whether or not we re-emit our own (the latter is gated by

@@ -40,9 +40,16 @@ profiles and `OPENAI_BASE_URL` overrides are unsupported in this profile.
 
 Only the host config's root `model` setting is inherited. Other host settings,
 MCP servers and credential files are not copied. For OAuth, the host loads the
-authenticated model catalog at startup and stages non-secret model metadata
-per execution. Startup fails if that catalog cannot be loaded. Restart to
-refresh the catalog. API-key mode uses Codex's embedded catalog.
+authenticated model catalog and stages non-secret model metadata per execution.
+In per-caller container mode, loading is lazy: the first request for a backend
+version and credential fetches the catalog. Concurrent requests share that fetch;
+successful results are cached until the version or credentials change. A failed
+fetch fails the request with `runtime_failed`, stops its container, and retains
+its files; other callers remain unaffected. Restore host login/provider
+connectivity and retry (failures are not cached). A running daemon is therefore
+not proof that catalog access works. The legacy runtime profile loads the catalog
+at startup and requires a restart to refresh it. API-key mode uses Codex's
+embedded catalog.
 
 The provider uses HTTP/SSE Responses. Both request compression and
 Responses-lite are disabled. The built-in provider's initial WebSocket handshake
@@ -54,31 +61,49 @@ Other routes, query parameters, background requests and unsupported model
 names are rejected. Credentials, account headers and upstream error bodies
 are never accepted from or echoed back to the workload.
 
-## Setup and migration
+## Current per-caller setup
 
-Log into Codex on the host or set `OPENAI_API_KEY` for the host bridge, then:
+After registering the bridge agent and preparing Codex authentication on
+the host, run:
 
 ```sh
 vicoop-client container init codex
-vicoop-client start --backend codex --runtime container
+vicoop-client start --detach
 ```
+
+Initialization builds or validates an image, creates private caller state and
+saves the agent config. See [caller runtime setup](caller-runtime.md) for custom
+images, alternate configs and migration behavior.
+
+### Legacy per-backend resources (historical)
+
+The migration details below describe older shared runtimes and their retained
+administrative commands. The old init flags shown below apply only to earlier
+client versions; current init rejects them. They do not configure the current
+per-caller daemon.
+
 
 `--from-host` is accepted for compatibility but does not copy credentials.
-Existing credential-mounted runtimes are rejected. Stop their bridge daemon,
-back up needed state, then explicitly recreate the runtime:
+Existing credential-mounted runtimes are rejected. Stop the bridge daemon,
+back up the old container's writable layer and record its image/mounts before
+optional cleanup:
 
 ```sh
-vicoop-client container remove codex --preserve-volumes
-vicoop-client container init codex --name codex --reuse-state --from-host
-vicoop-client start --backend codex --runtime container --runtime-name codex
+vicoop-client container legacy list
+vicoop-client container legacy remove codex --preserve-volumes
+vicoop-client container init codex
+vicoop-client container validate
+vicoop-client start --detach
 ```
 
-Adjust the runtime name and restore any workspace/image options used before.
-Removal discards the old writable container layer. Migration copies regular
-`.jsonl` rollout files from `sessions/` and `archived_sessions/` in the old
-credential volume into `/data/sessions/codex/config`. It excludes symlinks,
-auth files, settings and databases. Old volumes are retained for operator
-cleanup; historical secrets inside conversation text are not scrubbed.
+Replace `codex` in the legacy remove command with the old runtime instance name.
+Legacy named volumes and host workspace files are retained but are not copied
+or assigned to any caller. There is no automatic rollout/session migration into
+per-caller execution. `--name`, `--workspace` and `--reuse-state` are retired.
+Initialization removes legacy `cwd`/`runtime_name` configuration after successful
+validation. Old transcripts may still contain historical secrets; preserving
+volumes does not scrub them. See [caller runtime configuration](caller-runtime.md)
+for custom images and separate agent configurations.
 
 ## Execution boundary
 

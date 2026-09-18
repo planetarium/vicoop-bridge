@@ -7,8 +7,9 @@ path is described below; an interactive setup wizard for first-time
 operators is on a separate branch and not yet merged.
 
 An alternative deployment profile — **external-runtime** ([#249][249]) —
-keeps the bridge client bare-metal on the host and spawns per-backend
-agent runtime containers via `docker exec`. The two profiles coexist;
+keeps the bridge client on the host and runs agents in Docker. Daemon
+`--runtime container` now allocates a dedicated container per authenticated
+caller; see [configuration and legacy migration](caller-runtime.md). The two profiles coexist;
 choose whichever fits your deployment. This doc is the bundled-direct
 side ([#244][244]).
 
@@ -215,3 +216,19 @@ Agents SDK, Daytona ships Kata/Sysbox as the upgrade tier. Configure the
 runtime per your orchestrator's documentation (Docker daemon
 `runtimes`, k8s RuntimeClass, etc.) — the bridge client image works
 unchanged.
+
+## Dedicated caller runtimes
+
+For opt-in Claude/Codex per-user containers and persistent workspace/session
+volumes, see [caller runtime configuration and limits](caller-runtime.md).
+This mode requires server-verified caller scope and uses the shared host brokers.
+
+### Unconfirmed daemon shutdown
+
+`stop` exits nonzero and preserves the caller daemon's pidfile if the process
+exits without confirming container cleanup, or must be forcibly terminated.
+`status` reports the retained record as stale once the process is gone. Inspect
+the daemon log and managed containers before restarting. Restart reclaims a stale
+pidfile and reconciles retained caller resources; it does not prove the previous
+shutdown succeeded. Give Claude and Codex separate `stateDirectory` paths:
+`container init` rejects aliases of a path already configured for the other backend.

@@ -189,7 +189,7 @@ test('stripSensitiveMetadata with preserveEnvelope keeps the request envelope in
   assert.deepEqual(ext.chat_completions_request, original);
 });
 
-test('stripSensitiveMetadata with preserveEnvelope still scrubs bearer/principal from message metadata', () => {
+test('stripSensitiveMetadata scrubs authorization handoff from rejection history and status', () => {
   const task = {
     id: 't5',
     contextId: 'c5',
@@ -213,7 +213,9 @@ test('stripSensitiveMetadata with preserveEnvelope still scrubs bearer/principal
     },
     metadata: { [OAI]: { chat_completions_request: { model: 'gpt-4', messages: [] } } },
   } as unknown as Task;
+  task.history = [task.status.message!];
   const persisted = stripSensitiveMetadata(task, { preserveEnvelope: true });
+  assert.deepEqual(persisted.history?.[0]?.metadata, { keep: 1 });
   const ext = (persisted.metadata as Record<string, Record<string, unknown>>)[OAI];
   assert.ok(ext && 'chat_completions_request' in ext, 'envelope retained');
   const sm = (persisted.status.message as { metadata: Record<string, unknown> }).metadata;

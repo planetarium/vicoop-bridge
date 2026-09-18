@@ -3093,3 +3093,30 @@ test('container cancellation during input mapping prevents subsequent app-server
   assert.equal(fake.children.length,0);
   assert.equal((frames.at(-1) as any).status.state,'canceled');
 });
+
+
+test('canceling an inline image transfer reaches IO hooks and cleans input before app-server startup', async () => {
+  const controller = new AbortController();
+  const fake = makeFakeSpawn(() => happyPath());
+  let ready!: () => void, removed = false;
+  const started = new Promise<void>(resolve => { ready = resolve; });
+  const backend = createCodexExecutionBackend({ spawn: fake.spawn, heartbeatMs: 0,
+    mkdtemp: async (_prefix, signal) => { assert.equal(signal, controller.signal); return '/tmp/fixture-image'; },
+    writeFile: async (_path, _data, signal) => {
+      assert.equal(signal, controller.signal);
+      ready();
+      await new Promise<void>((_resolve, reject) => signal!.addEventListener('abort', () => reject(signal!.reason), { once: true }));
+    },
+    rm: async () => { removed = true; },
+  });
+  const task = assign('image-transfer');
+  task.message.parts.push({ kind: 'file', file: { mimeType: 'image/png', bytes: 'aGVsbG8=' } });
+  const frames: UpFrame[] = [];
+  const running = backend.handle(task, frame => frames.push(frame), controller.signal);
+  await started;
+  controller.abort();
+  await running;
+  assert.equal(removed, true);
+  assert.equal(fake.children.length, 0);
+  assert.equal((frames.at(-1) as any).status.state, 'canceled');
+});

@@ -108,6 +108,11 @@ keeps `curl | sh` a true one-liner.
 > it. Until then `--detach` is the no-supervisor-available option and the
 > foreground run in Step 6 is the supervised one.
 
+For per-caller Docker execution, complete agent registration and host backend
+authentication below, then run `vicoop-client container init claude` (or `codex`)
+and `vicoop-client start --detach`. Initialization prepares the image and saves
+configuration automatically; see [container setup](caller-runtime.md).
+
 ## Step 1b — Add `vicoop-client` to PATH
 
 `install.sh` detects your login shell from `$SHELL` and appends one line to
