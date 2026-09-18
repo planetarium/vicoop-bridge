@@ -244,7 +244,6 @@ export class CallerScopedBackend implements Backend {
             },
           },
         });
-        entry.recovered = false;
       }
       entry.contexts.add(context);
       let terminal: UpFrame | undefined;
@@ -354,7 +353,7 @@ export class CallerScopedBackend implements Backend {
       clearTimeout(timer);
       await storageCheck;
       // A canceled waiter must retain the predecessor's barrier until it settles.
-      release();
+      void previous.then(release, release);
       signal.removeEventListener('abort', abort);
       this.controllers.delete(controller);
       this.pending--;

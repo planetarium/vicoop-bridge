@@ -31,3 +31,5 @@ Validate all administration scope selectors, permit ownership-checked offline cl
 Preflight all retained resource ownership before removal, reset workers after retained-container recreation, and retain the daemon pidfile with a nonzero exit on unconfirmed shutdown.
 
 Validate complete network membership during removal while accepting a stopped container’s own endpoint. Align container cards with inline-input admission, accept Claude [1m] model tiers, and verify generated embedded images in CI.
+
+Reject cross-backend state-directory aliases during initialization, report conversation recovery per context, preserve failed caller-daemon shutdown records in `stop`, and document lazy Codex catalog loading.

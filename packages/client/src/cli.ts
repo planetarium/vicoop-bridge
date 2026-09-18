@@ -827,6 +827,9 @@ async function runStop(): Promise<number> {
   }
   const r = await stopDaemon();
   switch (r.outcome) {
+    case 'cleanup-unconfirmed':
+      console.error(`daemon (pid ${r.pid}) cleanup could not be confirmed; pidfile retained. Inspect the daemon log and managed caller containers before restarting.`);
+      return 1;
     case 'not-running':
       console.log('no detached daemon is running.');
       return 0;
@@ -842,7 +845,7 @@ async function runStop(): Promise<number> {
       console.log(
         `daemon (pid ${r.pid}) ignored SIGTERM within the grace period; sent SIGKILL.`,
       );
-      return 0;
+      return 1;
   }
 }
 

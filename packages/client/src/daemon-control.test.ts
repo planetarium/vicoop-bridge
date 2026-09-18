@@ -425,10 +425,13 @@ test('stopDaemon honors recorded caller cleanup budget and remains bounded', asy
         wait: async (ms) => { elapsed += ms; },
         kill: (_pid, signal) => { signals.push(signal); },
       });
-      assert.equal(result.outcome, exitAt === Infinity ? 'killed' : 'stopped');
+      assert.equal(result.outcome, 'cleanup-unconfirmed');
       assert.deepEqual(signals, exitAt === Infinity ? ['SIGTERM', 'SIGKILL'] : ['SIGTERM']);
       assert.ok(elapsed <= 125_200, 'even an unresponsive caller daemon has a bounded stop');
-      assert.equal(readPidRecord(path), null);
+      assert.ok(readPidRecord(path));
+      const again = await stopDaemon({ path, probe: { alive: () => false, matches: () => true } });
+      assert.equal(again.outcome, 'cleanup-unconfirmed');
+      assert.ok(readPidRecord(path));
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -449,5 +452,20 @@ test('legacy or invalid recorded cleanup budgets retain the default stop behavio
       assert.equal(elapsed, 10_200);
       assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
     }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('caller stop succeeds when daemon acknowledges cleanup by removing its record', async () => {
+  const dir = tmpDir();
+  try {
+    const path = join(dir, 'vicoop.pid');
+    writePidRecord({ ...sampleRecord, shutdownTimeoutMs: 120_000 }, path);
+    let alive = true;
+    const result = await stopDaemon({ path,
+      probe: { alive: () => alive, matches: () => true },
+      kill: () => {}, wait: async () => { removePidFile(path); alive = false; },
+    });
+    assert.equal(result.outcome, 'stopped');
+    assert.equal(readPidRecord(path), null);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -40,9 +40,16 @@ profiles and `OPENAI_BASE_URL` overrides are unsupported in this profile.
 
 Only the host config's root `model` setting is inherited. Other host settings,
 MCP servers and credential files are not copied. For OAuth, the host loads the
-authenticated model catalog at startup and stages non-secret model metadata
-per execution. Startup fails if that catalog cannot be loaded. Restart to
-refresh the catalog. API-key mode uses Codex's embedded catalog.
+authenticated model catalog and stages non-secret model metadata per execution.
+In per-caller container mode, loading is lazy: the first request for a backend
+version and credential fetches the catalog. Concurrent requests share that fetch;
+successful results are cached until the version or credentials change. A failed
+fetch fails the request with `runtime_failed`, stops its container, and retains
+its files; other callers remain unaffected. Restore host login/provider
+connectivity and retry (failures are not cached). A running daemon is therefore
+not proof that catalog access works. The legacy runtime profile loads the catalog
+at startup and requires a restart to refresh it. API-key mode uses Codex's
+embedded catalog.
 
 The provider uses HTTP/SSE Responses. Both request compression and
 Responses-lite are disabled. The built-in provider's initial WebSocket handshake

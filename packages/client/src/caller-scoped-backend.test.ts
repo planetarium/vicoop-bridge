@@ -244,6 +244,7 @@ test('active cancellation stops only that scope before terminal delivery and rep
   assert.match(JSON.stringify(frames), /partial writes/);
   const next = await f.run(task('alice'));
   assert.match(JSON.stringify(next), /conversationReset/);
+  assert.match(JSON.stringify(await f.run(task('alice', 'fresh'))), /conversationReset/);
   assert.doesNotMatch(JSON.stringify(await f.run(task('alice', 'fresh'))), /conversationReset/);
 });
 test('failed cleanup quarantines only the affected scope', async () => {

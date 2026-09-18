@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve, isAbsolute } from 'node:path';
+import { basename, dirname, join, resolve, isAbsolute } from 'node:path';
 import { z } from 'zod';
 import { assertCallerRuntimeVersion } from './caller-runtime-version.js';
 import { CALLER_IMAGE_FILES } from './caller-image-assets.js';
@@ -35,6 +35,18 @@ export interface CallerContainerInitOptions {
 
 const object = z.record(z.unknown());
 const imageId = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+
+// Resolve existing ancestors too: a not-yet-created child under a symlink
+// must not accidentally share another backend's SQLite namespace.
+async function canonicalStatePath(path: string): Promise<string> {
+  try { return await realpath(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    const parent = dirname(path);
+    if (parent === path) throw error;
+    return join(await canonicalStatePath(parent), basename(path));
+  }
+}
 
 /** Prepare a per-caller image/state and save configuration only after validation. */
 export async function runCallerContainerInit(
@@ -98,6 +110,11 @@ export async function runCallerContainerInit(
     throw new Error(
       'container init preserves the existing stateDirectory; moving caller state requires a separate migration',
     );
+  const otherKind = opts.kind === 'claude' ? 'codex' : 'claude';
+  const other = object.parse(object.parse(backends[otherKind] ?? {}).caller_runtime ?? {});
+  if (typeof other.stateDirectory === 'string' && isAbsolute(other.stateDirectory) &&
+      await canonicalStatePath(other.stateDirectory) === await canonicalStatePath(stateDirectory))
+    throw new Error(`stateDirectory is already configured for ${otherKind}; each backend requires a distinct state directory`);
   // Validate limits before Docker/build work; the real immutable ID is filled below.
   CallerRuntimeConfig.parse({
     ...previous,

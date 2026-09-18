@@ -1,6 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm, stat, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import {
@@ -428,3 +428,23 @@ test('unsafe operator Claude settings fail init before authentication or Docker'
   assert.equal(f.auth(), 0);
   assert.deepEqual(f.calls, []);
 });
+
+for (const alias of [false, true]) {
+  test(`init rejects another backend's state directory before side effects (symlink=${alias})`, async (t) => {
+    const f = await fixture(t);
+    const aliasPath = `${f.dir}-alias`;
+    if (alias) {
+      await symlink(f.dir, aliasPath);
+      t.after(() => rm(aliasPath, { force: true }));
+    }
+    const config = await f.read();
+    config.backends.codex.caller_runtime = { stateDirectory: join(f.dir, 'missing', 'state') };
+    await writeFile(f.path, JSON.stringify(config));
+    await assert.rejects(runCallerContainerInit({ ...f.options,
+      stateDirectory: join(alias ? aliasPath : f.dir, 'missing', 'state'),
+    }), /each backend requires a distinct/);
+    assert.equal(f.auth(), 0);
+    assert.equal(f.calls.length, 0);
+    assert.deepEqual(await f.read(), config);
+  });
+}

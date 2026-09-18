@@ -222,3 +222,13 @@ unchanged.
 For opt-in Claude/Codex per-user containers and persistent workspace/session
 volumes, see [caller runtime configuration and limits](caller-runtime.md).
 This mode requires server-verified caller scope and uses the shared host brokers.
+
+### Unconfirmed daemon shutdown
+
+`stop` exits nonzero and preserves the caller daemon's pidfile if the process
+exits without confirming container cleanup, or must be forcibly terminated.
+`status` reports the retained record as stale once the process is gone. Inspect
+the daemon log and managed containers before restarting. Restart reclaims a stale
+pidfile and reconciles retained caller resources; it does not prove the previous
+shutdown succeeded. Give Claude and Codex separate `stateDirectory` paths:
+`container init` rejects aliases of a path already configured for the other backend.
