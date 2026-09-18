@@ -1,5 +1,6 @@
 // Exercise embedded image builds outside the repository, using a compiled CLI.
-// Only --version probes run; no provider/model calls or agent registration.
+// Version and writable-volume probes only; no provider/model calls or agent registration.
+// VICOOP_SMOKE_IMAGE optionally skips the bundled build with an existing image.
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -19,7 +20,7 @@ const run = (args) => new Promise((resolve, reject) => {
 try {
   await writeFile(path, JSON.stringify({ agent_id: 'init-smoke', server_token: 'fixture', server_url: 'ws://127.0.0.1:1',
     retained: 'operator-setting', backends: { claude: { cwd: '/old', runtime_name: 'legacy' } } }));
-  await run(['container', 'init', 'claude', '--config', path]);
+  await run(['container', 'init', 'claude', '--config', path, ...(process.env.VICOOP_SMOKE_IMAGE ? ['--image', process.env.VICOOP_SMOKE_IMAGE] : [])]);
   const claude = JSON.parse(await readFile(path, 'utf8'));
   assert.equal(claude.server_token, 'fixture');
   assert.equal(claude.retained, 'operator-setting');
@@ -31,9 +32,13 @@ try {
   await run(['container', 'init', 'claude', '--config', path]);
   assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), claude);
   await run(['container', 'init', 'codex', '--config', path, '--image', image]);
+  await run(['container', 'list']);
+  await run(['container', 'validate']);
+  await run(['container', 'validate', '--backend', 'claude', '--config', path]);
+  await run(['caller-state', '--config', path]);
   const codex = JSON.parse(await readFile(path, 'utf8'));
   assert.deepEqual(codex.backends.claude, claude.backends.claude);
   assert.equal(codex.backend, 'codex');
   assert.notEqual(codex.backends.codex.caller_runtime.stateDirectory, claude.backends.claude.caller_runtime.stateDirectory);
-  console.log(`PASS standalone init: bundled image build, immutable ID, both backends, private SQLite state, preserved config, repeat initialization (${image})`);
+  console.log(`PASS standalone init: image preparation, immutable ID, both backends, private SQLite state, preserved config, repeat initialization, default-config list/validate and compatibility alias (${image})`);
 } finally { await rm(directory, { recursive: true, force: true }); }

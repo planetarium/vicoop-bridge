@@ -1,3 +1,4 @@
+import { callerContainerCommands } from './caller-runtime-admin.js';
 import { assertBrokerContainer } from './execution-runtime-boundary.js';
 import { CLAUDE_SESSION_MIGRATION, CODEX_SESSION_MIGRATION } from './claude-session-migration.js';
 import { execSync } from 'node:child_process';
@@ -565,11 +566,16 @@ const containerRemoveSubCmd = longestMatch(
 
 export const containerCmd = command(
   'container',
-  longestMatch(containerInitSubCmd, containerListSubCmd, containerRemoveSubCmd, containerValidateSubCmd),
+  longestMatch(
+    containerInitSubCmd,
+    command('legacy', longestMatch(containerListSubCmd, containerRemoveSubCmd, containerValidateSubCmd), {
+      brief: message`Manage legacy shared per-backend containers only.`,
+    }),
+    callerContainerCommands,
+  ),
   {
-    brief: message`Manage per-backend runtime containers.`,
-    description: message`Subcommands: init prepares per-caller images/state and saves daemon configuration. list, remove and validate manage legacy per-backend resources. Use caller-state for dedicated caller resources.`,
-    hidden: 'usage',
+    brief: message`Initialize, inspect and manage per-caller containers.`,
+    description: message`init prepares the image and configuration; list/validate/recreate/remove manage caller resources while the daemon is stopped. --config defaults to the canonical config.json. Legacy shared-container tools are under container legacy.`,
   },
 );
 

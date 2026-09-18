@@ -110,7 +110,11 @@ test('standalone init builds embedded recipe, validates and preserves registrati
   }
   assert.equal(f.auth(), 1);
   const check = f.calls.find((args) => args[0] === 'run')!;
-  assert.equal(check.includes('--mount'), false);
+  assert.equal(check.filter((arg) => arg === '--mount').length, 2);
+  assert.ok(check.includes('type=volume,target=/workspace'));
+  assert.ok(check.includes('type=volume,target=/data/sessions/claude'));
+  assert.match(check.at(-1)!, /mktemp -d/);
+  assert.ok(f.calls.at(-1)?.includes('-v'));
   assert.equal(check.includes('--env'), false);
   assert.equal(check[check.indexOf('--network') + 1], 'none');
   assert.equal(f.calls.at(-1)?.[0], 'rm');
@@ -344,7 +348,7 @@ test('retained containers prevent changing their image, but recreated scopes kee
   };
   await assert.rejects(
     runCallerContainerInit({ ...f.options, image: nextImage, dockerRun }),
-    /recreate-scope/,
+    /container recreate/,
   );
   assert.deepEqual(await f.read(), before);
   retained = false;
@@ -374,4 +378,16 @@ test('invalid or missing registration cannot overwrite config or trigger Docker'
     runCallerContainerInit(f.options),
     /register an agent first/,
   );
+});
+
+test('unwritable image storage fails initialization without saving config and removes probe volumes', async (t) => {
+  const f = await fixture(t);
+  await assert.rejects(runCallerContainerInit({
+    ...f.options, image,
+    dockerRun: async (args, opts) => args[0] === 'run'
+      ? { exitCode: 1, stdout: '', stderr: 'caller image must provide writable /workspace for UID 1000' }
+      : f.dockerRun(args, opts),
+  }), /writable \/workspace/);
+  assert.deepEqual(await f.read(), f.original);
+  assert.deepEqual(f.calls.at(-1)?.slice(0, 3), ['rm', '-f', '-v']);
 });

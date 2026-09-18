@@ -292,13 +292,15 @@ const KNOWN_CODEX_SANDBOX_MODES = new Set([
 const KNOWN_BACKEND_RUNTIMES = new Set<BackendRuntime>(['host', 'container']);
 
 function pickBackendRuntime(v: unknown): BackendRuntime | undefined {
-  if (typeof v !== 'string') return undefined;
+  if (v === undefined) return undefined;
+  if (typeof v !== 'string')
+    throw new Error('runtime must be host or container');
   const trimmed = v.trim();
   if (trimmed === 'caller-container')
     throw new Error('runtime caller-container was renamed to container; update runtime and retain caller_runtime configuration');
-  return KNOWN_BACKEND_RUNTIMES.has(trimmed as BackendRuntime)
-    ? (trimmed as BackendRuntime)
-    : undefined;
+  if (!KNOWN_BACKEND_RUNTIMES.has(trimmed as BackendRuntime))
+    throw new Error('runtime must be host or container');
+  return trimmed as BackendRuntime;
 }
 
 // Hand-edited config files reliably ship malformed entries (typos, wrong

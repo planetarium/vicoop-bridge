@@ -307,3 +307,8 @@ test('canceling a first request preserves the same-scope successor barrier and s
   assert.equal((await successor).at(-1)?.type, 'task.complete');
   assert.equal(f.allocations.length, 1);
 });
+
+test('caller state paths must be absolute regardless of launch directory', () => {
+  for (const stateDirectory of ['state', './state', '../state', '~/state'])
+    assert.throws(() => CallerRuntimeConfig.parse({ ...options, stateDirectory }), /absolute path/);
+});

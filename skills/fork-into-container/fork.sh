@@ -3,12 +3,8 @@
 # (skills/, agents/, commands/, CLAUDE.md or AGENTS.md) into the
 # per-backend runtime container managed by `vicoop-client container`.
 #
-# Auth, image, volume lifecycle are all delegated to upstream:
-#   `vicoop-client container init <kind> --from-host`
-# validates credentials on the host; the authentication broker keeps them
-# outside the runtime. This script's only job is
-# to top-up the *harness* pieces that upstream intentionally doesn't
-# carry.
+# Compatibility helper for existing legacy per-backend runtimes only.
+# Per-caller container init does not create a shared runtime or inject a harness.
 #
 # See SKILL.md for the user-facing contract.
 
@@ -72,24 +68,20 @@ TARGET="/data/sessions/$KIND/config"
 if docker inspect "$CONTAINER" >/dev/null 2>&1; then
     log "runtime container present: $CONTAINER (reusing)"
 else
-    log "runtime container absent — bootstrapping via vicoop-client container init"
-    vicoop-client container init "$KIND" --from-host
+    die "legacy runtime absent; per-caller container init does not create shared runtimes. Per-caller harness setup is not supported by this helper."
 fi
 
-# Validate both reused and freshly initialized runtimes through the same
-# host-side boundary check as the daemon.
-if ! vicoop-client container validate "$KIND"; then
+# Validate the existing legacy runtime before any harness writes.
+if ! vicoop-client container legacy validate "$KIND"; then
     log "ERROR: runtime boundary validation failed. Harness injection has not started."
-    log "For a legacy runtime, explicitly run:"
-    log "  vicoop-client container remove \"$KIND\" --preserve-volumes"
-    log "  vicoop-client container init \"$KIND\" --reuse-state"
-    log "Include the original --workspace path in container init if mounted."
+    log "Back up the old runtime and inspect it with: vicoop-client container legacy list"
+    log "Optional removal after backup: vicoop-client container legacy remove \"$KIND\" --preserve-volumes"
+    log "For new per-caller execution, run container init; legacy harness/session migration is not automatic."
     exit 1
 fi
 
 # ── bring container up only for the inject window ────────────────────────
-# Upstream `container init` (post-#271) leaves the runtime stopped; the
-# bridge daemon's RuntimeContainer.start() will bring it up at launch.
+# Legacy runtimes may be stopped.
 # `docker exec` for inject needs it running *now* though — so start it
 # if we found it stopped, and put it back the way we found it on exit
 # (matches the state convention upstream introduced).

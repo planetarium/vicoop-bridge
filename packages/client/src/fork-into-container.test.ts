@@ -10,7 +10,7 @@ import {createRequire} from 'node:module';
 // Execute the shipped script against a fake Docker filesystem: stopping the
 // runtime discards creds tmpfs while preserving its sessions volume.
 for (const kind of ['codex', 'claude']) {
- for (const mode of ['safe', 'legacy', 'credential-mount', 'credential-env', 'missing-firewall-capability', 'unconfined-seccomp', 'unconfined-apparmor']) {
+ for (const mode of ['safe', 'absent', 'legacy', 'credential-mount', 'credential-env', 'missing-firewall-capability', 'unconfined-seccomp', 'unconfined-apparmor']) {
   test(`fork harness ${kind}: ${mode} boundary and persistence`, {skip: process.platform === 'win32'}, () => {
     const root = mkdtempSync(join(tmpdir(), 'fork-harness-'));
     try {
@@ -25,6 +25,7 @@ for (const kind of ['codex', 'claude']) {
 const fs=require('node:fs'),p=require('node:path'),cp=require('node:child_process');
 const args=process.argv.slice(2),root=process.env.FORK_TEST_ROOT;
 fs.appendFileSync(p.join(root,'calls.jsonl'),JSON.stringify(args)+'\\n');
+if(args[0]==='inspect' && process.env.FORK_TEST_MODE==='absent') process.exit(1);
 if(args[0]==='inspect' && args.includes('--format')) {
   if(args.includes('{{json .}}')) {
     const kind=process.env.VICOOP_FORK_KIND,mode=process.env.FORK_TEST_MODE;
@@ -59,11 +60,17 @@ process.exit(r.status??1);
         VICOOP_FORK_KIND: kind, CODEX_HOME: source, CLAUDE_CONFIG_DIR: source, FORK_TEST_ROOT: root, FORK_TEST_MODE: mode,
       }});
       const calls = readFileSync(join(root, 'calls.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      if (mode === 'absent') {
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /legacy runtime absent/);
+        assert.ok(!calls.some(args => ['start', 'exec', 'stop', 'build', 'create'].includes(args[0])));
+        return;
+      }
       if (mode !== 'safe') {
         assert.notEqual(result.status, 0);
         assert.match(result.stderr, /runtime requires host-broker migration/);
         assert.match(result.stderr, /--preserve-volumes/);
-        assert.match(result.stderr, /--reuse-state/);
+        assert.match(result.stderr, /migration is not automatic/);
         assert.ok(!result.stderr.includes('fixture-secret'));
         assert.ok(!calls.some(args => ['start', 'exec', 'stop'].includes(args[0])));
         return;

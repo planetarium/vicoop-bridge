@@ -589,3 +589,15 @@ test('caller_runtime survives without a config runtime selector for CLI override
     assert.equal(readConfig(path)?.backends?.[kind]?.runtime, undefined);
   }
 });
+
+test('explicit invalid runtime values never fall back to host execution', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'caller-invalid-mode-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  for (const kind of ['claude', 'codex']) {
+    for (const runtime of ['contianer', '', null, 1, false, {}]) {
+      writeFileSync(path, JSON.stringify({ backends: { [kind]: { runtime } } }));
+      assert.throws(() => readConfig(path), /runtime must be host or container/);
+    }
+  }
+});

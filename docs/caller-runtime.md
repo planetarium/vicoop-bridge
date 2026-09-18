@@ -39,7 +39,7 @@ backend settings and agent credentials. Legacy `cwd`/`runtime_name` settings are
 removed only after validation succeeds. Build/authentication/probe failures leave
 the config unchanged; concurrent config edits abort the save. Stop the daemon and
 caller containers before reinitializing. A different image requires removing
-retained containers via `caller-state --recreate-scope` first (volumes and mappings
+retained containers via `container recreate SCOPE` first (volumes and mappings
 are retained). Initialization never changes an existing state-directory path.
 
 ```sh
@@ -55,6 +55,9 @@ vicoop-client container init claude --rebuild
 `--image` accepts a tag or digest, pulls it if missing, and persists its immutable
 local image ID. Images must include the backend, Node, tini and firewall tools,
 and must not declare anonymous volumes or provider credential environment.
+The image must provide `/workspace` and `/data/sessions/<kind>/config` writable
+by UID/GID 1000:1000. Initialization tests writes as that user in disposable
+anonymous volumes; they are removed along with the networkless probe.
 `--from-host` remains a compatibility flag; authentication always stays on the
 host. Shared-container `--name`, `--workspace`, `--reuse-state` and `--bridge`
 options are rejected with a migration hint.
@@ -103,7 +106,9 @@ installer. Codex requires version 0.153.4 or later. Use the resulting immutable
 
 For Codex, set `backend` to `codex` and place the same runtime configuration
 under `backends.codex`. Use a separate state directory per agent/backend.
-`stateDirectory` must be private (0700); it is created automatically if absent.
+`stateDirectory` must be an absolute path and private (0700); it is created
+automatically if absent. Relative paths are rejected to keep state independent
+of the directory from which the CLI is launched.
 Do not configure `cwd` or `runtime_name`: the manager owns workspace and runtime
 selection. Invalid runtime configuration fails closed.
 
@@ -137,9 +142,9 @@ configuration before accepting tasks. Legacy shared workspaces/sessions are not
 automatically assigned or copied to any caller.
 
 `container init` now prepares per-caller execution and can migrate the selected
-backend configuration automatically. `container list/remove/validate` remain
-available for managing legacy per-backend resources; they do not select caller
-containers. Use `caller-state` for per-caller resource administration.
+backend configuration automatically. `container list/validate/recreate/remove`
+manage per-caller resources. Old shared-container tools are explicitly under
+`container legacy list/remove/validate`.
 Host execution (including a client already inside a bundled-direct container)
 keeps its existing behavior.
 
@@ -211,12 +216,21 @@ or scope-count limits. Ownership and isolation checks still apply; execution
 requires the container to match the new limits.
 
 ```sh
-vicoop-client caller-state --config /path/to/config.json
+vicoop-client container list --config /path/to/config.json
 # Remove one stopped container/network; keep its volumes for next allocation:
-vicoop-client caller-state --config /path/to/config.json --recreate-scope SCOPE_DIGEST
+vicoop-client container recreate SCOPE_DIGEST --config /path/to/config.json
 # Explicitly delete that user's container, network, volumes and scope record:
-vicoop-client caller-state --config /path/to/config.json --delete-scope SCOPE_DIGEST
+vicoop-client container remove SCOPE_DIGEST --config /path/to/config.json
 ```
+
+Omit `--config` to use the canonical config.json. Use `--backend claude|codex`
+to manage a backend other than the one currently selected in that config.
+`container list` prints JSON scope digests and container names. `container validate` checks the configured image and retained container limits without
+starting workloads; it also requires a stopped daemon. A fresh configuration
+can validate with no caller containers because allocation is lazy. Listing,
+recreation and deletion remain available even if the configured image has been
+removed. The old `caller-state --delete-scope/--recreate-scope` commands remain
+compatibility aliases.
 
 Scope digests and Docker names are opaque; callers cannot select them. Stop,
 restart and recreation do not implicitly delete user data. If Docker access or
@@ -236,6 +250,8 @@ The source includes these acceptance entrypoints:
 - `scripts/caller-init-smoke.mjs`: standalone compiled CLI initialization outside
   the repository, embedded image build, backend probes, private state creation,
   config preservation and repeat initialization; no provider calls.
+- `scripts/caller-init-image-smoke.ts`: real Docker image write probes for both
+  backends; rejects root-owned workspace/session directories without saving config.
 - `scripts/caller-runtime-smoke.ts`: real Docker lifecycle, A/B/A storage,
   stop/recreate/restart, owner lock, input transfer and threshold admission.
 - `scripts/caller-client-smoke.mjs`: the Bun-compiled CLI, a local WebSocket

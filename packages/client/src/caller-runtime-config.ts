@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isAbsolute } from 'node:path';
 
 export const CallerRuntimeConfig = z
   .object({
@@ -8,7 +9,7 @@ export const CallerRuntimeConfig = z
         /^(?:sha256:[a-f0-9]{64}|\S+@sha256:[a-f0-9]{64})$/,
         'caller image must be pinned by digest',
       ),
-    stateDirectory: z.string().min(1),
+    stateDirectory: z.string().min(1).refine(isAbsolute, 'stateDirectory must be an absolute path; for existing state, use its original absolute location'),
     maxScopes: z.number().int().min(1).max(32).default(8),
     queueLimit: z.number().int().min(0).max(128).default(16),
     maxContexts: z.number().int().min(1).max(4096).default(256),

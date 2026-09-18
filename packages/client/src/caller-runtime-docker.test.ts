@@ -45,6 +45,7 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   await assert.rejects(pool().initialize(), /exceed maxScopes/);
   const strict = new DockerCallerRuntimePool('claude', { ...options, maxScopes: 2 }, 'agent', run);
   await assert.rejects(strict.initialize(), /boundary mismatch/);
+  await assert.rejects(strict.initialize(false, true), /boundary mismatch/);
   info.State.Running = true;
   await assert.rejects(pool().initialize(false), /stop the daemon/);
   info.State.Running = false;
@@ -62,4 +63,33 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   await admin.close();
   assert.ok(calls.some((args) => args[0] === 'rm' && args[1] === name));
   assert.ok(!calls.some((args) => ['start', 'stop', 'exec'].includes(args[0])));
+});
+
+test('offline data deletion works without the image while validation reports the missing image', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'caller-missing-image-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const options = CallerRuntimeConfig.parse({ image: `sha256:${'a'.repeat(64)}`, stateDirectory: directory });
+  const store = new CallerRuntimeStore(directory, 'agent');
+  const id = scopeDigest('agent', 'alice');
+  await store.lock();
+  await store.reserve(id, 'claude', 'alice');
+  await store.unlock();
+  const calls: string[][] = [];
+  const run: AsyncDockerRun = async (args) => {
+    calls.push([...args]);
+    if (args[0] === 'ps') return { exitCode: 0, stdout: '', stderr: '' };
+    const kind = args[0];
+    assert.ok(['image', 'container', 'volume', 'network'].includes(kind));
+    return { exitCode: 1, stdout: '', stderr: `No such ${kind}` };
+  };
+  const admin = new DockerCallerRuntimePool('claude', options, 'agent', run);
+  assert.deepEqual(await admin.initialize(false), [id]);
+  await admin.remove(id, true);
+  assert.deepEqual(await admin.store.scopes(), []);
+  await admin.close();
+  assert.ok(!calls.some((args) => args[0] === 'image'));
+  const validator = new DockerCallerRuntimePool('claude', options, 'agent', run);
+  await assert.rejects(validator.initialize(false, true), /image is missing.*container init/);
+  const daemon = new DockerCallerRuntimePool('claude', options, 'agent', run);
+  await assert.rejects(daemon.initialize(), /image is missing.*container init/);
 });

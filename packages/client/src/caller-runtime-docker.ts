@@ -21,6 +21,7 @@ export class DockerCallerRuntimePool {
   private readonly run: AsyncDockerRun;
   private locked = false;
   private offline = false;
+  private validateExecution = true;
   constructor(
     readonly kind: CallerKind,
     readonly options: CallerRuntimeOptions,
@@ -56,27 +57,29 @@ export class DockerCallerRuntimePool {
       `${k}=${v}`,
     ]);
   }
-  async initialize(reconcile = true): Promise<string[]> {
+  async initialize(reconcile = true, validateExecution = false): Promise<string[]> {
     if (process.platform === 'win32')
       throw new Error('container requires Linux or macOS Docker');
     await this.store.lock();
     this.locked = true;
     this.offline = !reconcile;
+    this.validateExecution = reconcile || validateExecution;
     try {
-      const [image] = JSON.parse(
-        await this.command(['image', 'inspect', this.options.image]),
-      );
-      if (
-        Object.keys(image.Config?.Volumes ?? {}).length ||
-        image.Config?.Env?.some((v: string) =>
-          PROVIDER_ENV_PATTERN.test(v.split('=', 1)[0]),
+      if (this.validateExecution) {
+        const inspected = await this.run(['image', 'inspect', this.options.image]);
+        if (inspected.exitCode !== 0)
+          throw new Error(`caller image is missing or cannot be inspected; run container init ${this.kind} --image IMAGE (or --rebuild) with the same --config before starting`);
+        const [image] = JSON.parse(inspected.stdout);
+        if (
+          Object.keys(image.Config?.Volumes ?? {}).length ||
+          image.Config?.Env?.some((v: string) =>
+            PROVIDER_ENV_PATTERN.test(v.split('=', 1)[0]),
+          )
         )
-      )
-        throw new Error(
-          'caller image must not declare volumes or provider environment',
-        );
+          throw new Error('caller image must not declare volumes or provider environment');
+      }
       const ids = await this.store.scopes();
-      if (!this.offline && ids.length > this.options.maxScopes)
+      if (this.validateExecution && ids.length > this.options.maxScopes)
         throw new Error('retained scopes exceed maxScopes');
       const resources = await this.command([
         'ps',
@@ -161,7 +164,7 @@ export class DockerCallerRuntimePool {
       !h.CapAdd?.some((v: string) => v.replace(/^CAP_/, '') === 'NET_ADMIN') ||
       // Offline recovery must allow replacement after operator limit changes.
       // Ownership, mounts and isolation remain mandatory in both modes.
-      (!this.offline &&
+      (this.validateExecution &&
         (h.Memory !== this.options.memoryMiB * 1048576 ||
           h.MemorySwap !== h.Memory ||
           h.PidsLimit !== this.options.pids ||

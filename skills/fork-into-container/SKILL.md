@@ -1,17 +1,16 @@
 ---
 name: vicoop-fork-into-container
-description: Top up the per-backend vicoop-bridge runtime container with the parent agent's curated harness — its `skills/`, sub-agents, slash-commands, and project memory file (`CLAUDE.md` / `AGENTS.md`). Bootstraps the runtime container itself via `vicoop-client container init <kind> --from-host` if it's not already present, so the operator only needs to be logged in once. Use when the user says "fork into a container", "spawn an isolated copy with my skills", "컨테이너로 분기", "내 하네스까지 가져가서 격리된 에이전트로 띄워줘", "샌드박스에서 돌려".
+description: Top up the per-backend vicoop-bridge runtime container with the parent agent's curated harness — its `skills/`, sub-agents, slash-commands, and project memory file (`CLAUDE.md` / `AGENTS.md`). Compatibility helper for an existing legacy shared runtime only; it does not bootstrap or inject into per-caller containers. Use when the user says "fork into a container", "spawn an isolated copy with my skills", "컨테이너로 분기", "내 하네스까지 가져가서 격리된 에이전트로 띄워줘", "샌드박스에서 돌려".
 allowed-tools: Bash
 ---
 
 # Fork-into-Container
 
-This skill is a thin layer on top of `vicoop-client container init`.
-Upstream already handles **auth, image, and volume lifecycle**. It validates
-the operator's credentials on the host and uses the authentication broker
-without copying provider credentials into the runtime. What upstream intentionally does **not** carry is the operator's
-*harness* — `skills/`, sub-agents, slash-commands, the project memory
-file. That gap is what this skill fills.
+This compatibility skill injects a curated harness only into an **existing legacy
+shared runtime** (`vicoop-runtime-<kind>`). It does not support the new per-caller
+mode. Current `container init` prepares per-caller configuration and does not
+create a shared runtime, so the helper fails explicitly if the legacy target is
+absent. Per-caller environment/harness setup remains separate follow-up work.
 
 ## Install
 
@@ -92,11 +91,9 @@ Optional env overrides:
 ## What the script does
 
 1. Detect parent kind from env / `~/.claude` vs `~/.codex` presence.
-2. If `vicoop-runtime-<kind>` is **not** present at all, invoke
-   `vicoop-client container init <kind> --from-host`. Upstream
-   validates host credentials without copying them, installs the agent CLI,
-   compat-checks the version, and (per
-   #271) leaves the container stopped.
+2. Require an existing `vicoop-runtime-<kind>` and validate its broker boundary
+   through `vicoop-client container legacy validate <kind>`. If absent or unsafe,
+   stop without starting a container or copying files.
 3. Capture the container's running state. If stopped, `docker start`
    it for the inject window; restore it to its original state on exit
    so the upstream "stopped after init" convention isn't broken.
@@ -131,14 +128,11 @@ Optional env overrides:
   container boundary without rewriting; left out of the allowlist on
   purpose.
 
-## Why this is much smaller than v1
+## Legacy compatibility
 
-The v1 prototype tried to spawn the bundled-direct container with a
-half-dozen env vars (`VICOOP_BRIDGE_TOKEN`, `VICOOP_AGENT_ID`,
-`CLAUDE_CODE_OAUTH_TOKEN`, …) hand-rolled by the operator. Upstream's
-external-runtime profile + `container init --from-host` removed every
-one of those — bridge auth lives in the host bridge client (it never
-enters the container at all), and backend auth is auto-pulled. This
-skill now just plugs the one remaining gap.
-
-The script runs `vicoop-client container validate <kind>` before starting or injecting into a runtime. Legacy credential-mounted runtimes are rejected; follow the explicit `--preserve-volumes` / `--reuse-state` migration instructions, including the original workspace mount when present.
+Host authentication remains outside the runtime. The script checks the existing
+runtime through `vicoop-client container legacy validate <kind>` before starting
+or injecting. Credential-mounted or otherwise unsafe runtimes are rejected.
+Back up old state before optional `container legacy remove NAME
+--preserve-volumes`; there is no automatic migration into per-caller environments.
+The current daemon no longer executes tasks in these legacy shared runtimes.

@@ -213,7 +213,7 @@ export async function runCallerContainerInit(
         (await command(['ps', '-aq', '--filter', namespaceFilter])).trim()
       )
         throw new Error(
-          'retained caller containers use another image; remove them with caller-state --recreate-scope before changing the image',
+          'retained caller containers use another image; remove them with container recreate SCOPE before changing the image',
         );
     }
     const name = `vicoop-caller-check-${randomUUID()}`;
@@ -242,11 +242,15 @@ export async function runCallerContainerInit(
         '/tmp:rw,nosuid,nodev,size=64m',
         '--tmpfs',
         '/home/node:rw,nosuid,nodev,size=64m,uid=1000,gid=1000',
+        '--mount',
+        'type=volume,target=/workspace',
+        '--mount',
+        `type=volume,target=/data/sessions/${opts.kind}`,
         '--entrypoint',
         '/bin/sh',
         image.Id,
         '-ec',
-        `/usr/local/bin/node --version >/dev/null; test -x /usr/bin/tini; command -v iptables >/dev/null; command -v ip6tables >/dev/null; ${opts.kind} --version`,
+        `/usr/local/bin/node --version >/dev/null; test -x /usr/bin/tini; command -v iptables >/dev/null; command -v ip6tables >/dev/null; for dir in /workspace /data/sessions/${opts.kind}/config; do probe=$(mktemp -d "$dir/.vicoop-init.XXXXXX") || { echo "caller image must provide writable $dir for UID 1000" >&2; exit 1; }; rmdir "$probe"; done; ${opts.kind} --version`,
       ]);
       const version = output.match(/\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/)?.[0];
       if (
@@ -262,7 +266,7 @@ export async function runCallerContainerInit(
         );
       log.info(`Validated ${opts.kind} ${version} in ${image.Id}.`);
     } finally {
-      const removed = await run(['rm', '-f', name]);
+      const removed = await run(['rm', '-f', '-v', name]);
       if (
         removed.exitCode !== 0 &&
         !/No such (container|object)/i.test(removed.stderr)

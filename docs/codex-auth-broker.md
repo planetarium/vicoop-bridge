@@ -77,21 +77,26 @@ per-caller daemon.
 
 
 `--from-host` is accepted for compatibility but does not copy credentials.
-Existing credential-mounted runtimes are rejected. Stop their bridge daemon,
-back up needed state, then explicitly recreate the runtime:
+Existing credential-mounted runtimes are rejected. Stop the bridge daemon,
+back up the old container's writable layer and record its image/mounts before
+optional cleanup:
 
 ```sh
-vicoop-client container remove codex --preserve-volumes
-vicoop-client container init codex --name codex --reuse-state --from-host
-# Configure per-caller execution separately; see caller-runtime.md.
+vicoop-client container legacy list
+vicoop-client container legacy remove codex --preserve-volumes
+vicoop-client container init codex
+vicoop-client container validate
+vicoop-client start --detach
 ```
 
-Adjust the runtime name and restore any workspace/image options used before.
-Removal discards the old writable container layer. Migration copies regular
-`.jsonl` rollout files from `sessions/` and `archived_sessions/` in the old
-credential volume into `/data/sessions/codex/config`. It excludes symlinks,
-auth files, settings and databases. Old volumes are retained for operator
-cleanup; historical secrets inside conversation text are not scrubbed.
+Replace `codex` in the legacy remove command with the old runtime instance name.
+Legacy named volumes and host workspace files are retained but are not copied
+or assigned to any caller. There is no automatic rollout/session migration into
+per-caller execution. `--name`, `--workspace` and `--reuse-state` are retired.
+Initialization removes legacy `cwd`/`runtime_name` configuration after successful
+validation. Old transcripts may still contain historical secrets; preserving
+volumes does not scrub them. See [caller runtime configuration](caller-runtime.md)
+for custom images and separate agent configurations.
 
 ## Execution boundary
 

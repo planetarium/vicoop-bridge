@@ -24,7 +24,7 @@ Docker lifecycle operations in `RuntimeContainer`, including broker boundary
 inspection and firewall installation, run asynchronously. Ordinary commands have a 30-second timeout and a
 1 MiB aggregate captured-output limit. Image pulls retain visible progress and
 have a 10-minute timeout; readiness polling uses its remaining 10-second budget.
-One-shot `container list`/remove helpers still use the synchronous compatibility
+One-shot `container legacy list`/remove helpers still use the synchronous compatibility
 runner (bounded to 30 seconds per command); they are not request-path APIs.
 
 Timeout/abort stops the local Docker CLI. The Docker daemon may already have

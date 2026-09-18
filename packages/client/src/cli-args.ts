@@ -83,7 +83,7 @@ export const daemonFlagsFields = {
     description: message`Working directory for the spawned backend process. Only valid with \`--backend claude\` or \`--backend codex\`; pairing with another backend exits non-zero.`,
   })),
   runtime: optional(option('--runtime', choice([...BACKEND_RUNTIMES]), {
-    description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` allocates a dedicated Docker container and persistent volumes per authenticated caller. Requires caller_runtime image and stateDirectory configuration. Only valid with \`--backend claude\` or \`--backend codex\`.`,
+    description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` allocates a dedicated Docker container and persistent volumes per authenticated caller. Prepare it with vicoop-client container init claude|codex. Only valid with \`--backend claude\` or \`--backend codex\`.`,
   })),
   runtimeName: optional(option('--runtime-name', string({ metavar: 'NAME' }), {
     description: message`Legacy shared-container option; rejected by container mode, which assigns names per caller.`,
@@ -396,7 +396,7 @@ export function mergeClientArgs(
   const errors: string[] = [];
   if (resolved.runtime === 'container') {
     const callerConfig = backend === 'claude' || backend === 'codex' ? resolved.backends?.[backend]?.caller_runtime : undefined;
-    if (!CallerRuntimeConfig.safeParse(callerConfig).success) errors.push('container now uses per-caller isolation; configure backends.<backend>.caller_runtime with a pinned image and private stateDirectory (see docs/caller-runtime.md)');
+    if (!CallerRuntimeConfig.safeParse(callerConfig).success) errors.push('container now uses per-caller isolation; run vicoop-client container init claude|codex --config PATH to configure caller_runtime with a pinned image and private stateDirectory (see docs/caller-runtime.md)');
     if (resolved.cwd || resolved.runtimeName) errors.push('container owns its workspace and runtime names');
   }
   if (flags.runtime !== undefined && !RUNTIME_BACKENDS.has(backend)) {

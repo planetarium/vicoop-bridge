@@ -400,7 +400,7 @@ export class RuntimeContainer {
   }
 
   private removeHint(): string {
-    return `vicoop-client container rm ${this.opts.runtimeName}`;
+    return `vicoop-client container legacy rm ${this.opts.runtimeName}`;
   }
 
   private async waitUntilRunning(name: string): Promise<void> {
