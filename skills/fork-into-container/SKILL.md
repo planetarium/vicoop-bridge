@@ -109,20 +109,20 @@ Optional env overrides:
    `/data/creds/<kind>` is temporary and must not hold the harness.
    Tar-pipe (not `docker cp`) so the extract runs as the `node` user
    and the agent CLI can traverse the files immediately.
-6. Print the daemon-start command:
-   `vicoop-client start --backend <kind> --runtime container --runtime-name <kind>`
-7. Emit `{container, runtime_name, kind, injected_into}` JSON for the
-   parent agent to chain off of.
+6. Report that injection affected only the existing legacy runtime. Point to
+   `vicoop-client container legacy list` for inspection. New per-caller execution
+   uses `container init <kind>` and does not import this legacy harness/session.
+7. Emit `{container, kind, injected_into, legacy_only: true}` JSON describing
+   the operation. It is not a daemon configuration or launch instruction.
 
 ## What this skill does NOT do
 
-- **Start the daemon.** The bridge client is a long-running process;
-  the operator launches it in their own shell after this skill
-  finishes. (Auto-starting from inside a skill is awkward and racy.)
+- **Start the daemon.** The current daemon does not execute these legacy
+  runtimes. This helper does not produce a daemon launch command.
 - **Re-inject on every call.** Tar-extract overlays existing files;
   re-running the skill refreshes the harness in place. Removed files
   on the host stay in the container until the operator wipes the
-  creds volume.
+  sessions volume.
 - **Carry MCP servers, `settings.json`, or hooks.** Those are commonly
   bound to host-absolute paths or sockets and don't survive the
   container boundary without rewriting; left out of the allowlist on

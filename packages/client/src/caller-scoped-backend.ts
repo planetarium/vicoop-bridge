@@ -9,7 +9,7 @@ import type {
   DockerCallerRuntimePool,
   CallerContainer,
 } from './caller-runtime-docker.js';
-import { CallerStorageLimitError } from './caller-runtime-docker.js';
+import { CallerStorageLimitError, CallerStorageMissingError } from './caller-runtime-docker.js';
 import { scopeDigest } from './caller-runtime-store.js';
 import { createHash } from 'node:crypto';
 export interface CallerWorker {
@@ -299,6 +299,12 @@ export class CallerScopedBackend implements Backend {
         entry.worker = undefined;
         entry.contexts.clear();
         entry.recovered = true;
+      }
+      if (error instanceof CallerStorageMissingError) {
+        entry.quarantined = true;
+        this.fail(task, emit, 'runtime_storage_missing',
+          'Retained caller storage is missing; no replacement was created. Stop the daemon and restore the original volumes, or explicitly remove the scope to start over.');
+        return;
       }
       this.fail(
         task,

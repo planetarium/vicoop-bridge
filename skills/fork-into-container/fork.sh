@@ -219,8 +219,10 @@ else
 fi
 
 log ""
-log "done. start the bridge daemon (in another shell) with:"
-log "    vicoop-client start --backend $KIND --runtime container --runtime-name $KIND"
+log "done. The harness was injected into an existing legacy runtime only."
+log "The current daemon does not execute this legacy runtime. Inspect it with:"
+log "    vicoop-client container legacy list"
+log "For new per-caller execution, use container init $KIND; legacy harness/session migration is not automatic."
 
-printf '{"container":"%s","runtime_name":"%s","kind":"%s","injected_into":"%s"}\n' \
-    "$CONTAINER" "$KIND" "$KIND" "$TARGET"
+printf '{"container":"%s","kind":"%s","injected_into":"%s","legacy_only":true}\n' \
+    "$CONTAINER" "$KIND" "$TARGET"

@@ -76,6 +76,10 @@ process.exit(r.status??1);
         return;
       }
       assert.equal(result.status, 0, result.stderr);
+      assert.equal(JSON.parse(result.stdout).legacy_only, true);
+      assert.equal(JSON.parse(result.stdout).runtime_name, undefined);
+      assert.doesNotMatch(result.stderr, /start --backend|--runtime-name/);
+      assert.match(result.stderr, /container legacy list/);
       assert.equal(JSON.parse(result.stdout).injected_into, `/data/sessions/${kind}/config`);
       const config = join(root, 'data', 'sessions', kind, 'config');
       assert.equal(readFileSync(join(config, memory), 'utf8'), 'Fixture project instructions');

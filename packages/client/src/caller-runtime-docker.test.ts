@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DockerCallerRuntimePool, CALLER_TMPFS, CallerStorageLimitError } from './caller-runtime-docker.js';
+import { DockerCallerRuntimePool, CALLER_TMPFS, CallerStorageMissingError, CallerStorageLimitError } from './caller-runtime-docker.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { CallerRuntimeStore, scopeDigest } from './caller-runtime-store.js';
 import type { AsyncDockerRun } from './docker-command.js';
@@ -135,5 +135,40 @@ test('storage quota, malformed usage and Docker failures have distinct errors', 
       assert.match(error.message, new RegExp(expected));
       return true;
     });
+  }
+});
+
+
+test('retained scopes never recreate missing workspace or session volumes after restart', async (t) => {
+  for (const missing of ['workspace', 'sessions']) {
+    const directory = await mkdtemp(join(tmpdir(), 'caller-volume-loss-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const options = CallerRuntimeConfig.parse({ image: `sha256:${'a'.repeat(64)}`, stateDirectory: directory });
+    const store = new CallerRuntimeStore(directory, 'agent');
+    const id = scopeDigest('agent', 'alice');
+    await store.lock();
+    await store.reserve(id, 'claude', 'alice');
+    await store.unlock();
+    const calls: string[][] = [];
+    const run: AsyncDockerRun = async (args) => {
+      calls.push([...args]);
+      if (args[0] === 'image') return { exitCode: 0, stdout: JSON.stringify([{ Config: {} }]), stderr: '' };
+      if (args[0] === 'ps') return { exitCode: 0, stdout: '', stderr: '' };
+      if (args[0] === 'container') return { exitCode: 1, stdout: '', stderr: 'No such container' };
+      assert.equal(args[0], 'volume');
+      assert.equal(args[1], 'inspect');
+      if (args[2].endsWith(`-${missing}`)) return { exitCode: 1, stdout: '', stderr: 'No such volume' };
+      return { exitCode: 0, stdout: JSON.stringify([{ Driver: 'local', Options: {}, Labels: {
+        'vicoop.component': 'caller-runtime', 'vicoop.caller-namespace': store.namespace,
+        'vicoop.scope': id, 'vicoop.kind': 'claude',
+      } }]), stderr: '' };
+    };
+    const pool = new DockerCallerRuntimePool('claude', options, 'agent', run);
+    await pool.initialize();
+    try {
+      await assert.rejects(pool.acquire(id, undefined, 'alice'), CallerStorageMissingError);
+      assert.deepEqual(await pool.store.scopes(), [id]);
+      assert.ok(!calls.some(args => args.includes('create')));
+    } finally { await pool.close(); }
   }
 });

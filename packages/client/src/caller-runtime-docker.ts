@@ -6,6 +6,9 @@ import { brokerFirewallScript } from './execution-runtime-boundary.js';
 import { PROVIDER_ENV_PATTERN } from './provider-environment.js';
 import type { CallerRuntimeOptions } from './caller-runtime-config.js';
 
+export class CallerStorageMissingError extends Error {
+  constructor() { super('retained caller volume missing; restore its original volumes or explicitly remove the scope before starting over'); }
+}
 export class CallerStorageLimitError extends Error {
   constructor() { super('caller storage limit exceeded'); }
 }
@@ -271,13 +274,14 @@ export class DockerCallerRuntimePool {
       return this.command(args);
     };
     const name = this.name(id);
-    await this.store.reserve(id, this.kind, principalId); // reserve before the first Docker mutation
+    const fresh = await this.store.reserve(id, this.kind, principalId); // reserve before the first Docker mutation
     let info = await this.inspect(name);
     const recovered = !!info;
     if (!info) {
       for (const suffix of ['workspace', 'sessions']) {
         const volume = `${name}-${suffix}`;
         if (!(await this.volumeExists(id, suffix))) {
+          if (!fresh) throw new CallerStorageMissingError();
           await command(['volume', 'create', ...this.labelArgs(id), volume]);
         }
       }
@@ -344,7 +348,7 @@ export class DockerCallerRuntimePool {
     await this.validate(info, id);
     for (const suffix of ['workspace', 'sessions'])
       if (!(await this.volumeExists(id, suffix)))
-        throw new Error('caller volume missing');
+        throw new CallerStorageMissingError();
     if (!info.State.Running) await command(['start', name]);
     await this.validate(await this.inspect(name), id);
     await command([

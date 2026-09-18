@@ -589,7 +589,7 @@ export type ContainerRemoveArgs = Extract<ContainerCliArgs, { action: 'container
 // its dispatcher are obviously co-located.
 export async function runContainerInitCli(args: ContainerInitArgs): Promise<number> {
   try {
-    if (args.name || args.workspaceDir || args.reuseState || args.bridgeUrl)
+    if (args.name !== undefined || args.workspaceDir !== undefined || args.reuseState || args.bridgeUrl !== undefined)
       throw new Error('container init now prepares per-caller execution; --name/--workspace/--reuse-state/--bridge are retired. Use --config, --image and --state-directory instead.');
     return await runCallerContainerInit({
       kind: args.kind,

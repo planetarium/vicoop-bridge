@@ -6,7 +6,7 @@ import {
 } from './caller-scoped-backend.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { scopeDigest } from './caller-runtime-store.js';
-import { CallerStorageLimitError, type DockerCallerRuntimePool } from './caller-runtime-docker.js';
+import { CallerStorageMissingError, CallerStorageLimitError, type DockerCallerRuntimePool } from './caller-runtime-docker.js';
 import type { Backend } from './backend.js';
 import type { TaskAssignFrame, UpFrame } from '@vicoop-bridge/protocol';
 
@@ -356,4 +356,19 @@ test('task deadline also aborts worker initialization before any backend work', 
   assert.match(JSON.stringify(frames), /runtime_canceled/);
   assert.equal(f.stops.length, 1);
   assert.equal(f.workers.length, 0);
+});
+
+
+test('missing retained storage quarantines only its caller without starting a worker', async () => {
+  const f = fixture();
+  const acquire = f.pool.acquire.bind(f.pool);
+  f.pool.acquire = async (...args) => {
+    if (args[0] === scopeDigest('agent', 'alice')) throw new CallerStorageMissingError();
+    return acquire(...args);
+  };
+  assert.match(JSON.stringify(await f.run()), /runtime_storage_missing/);
+  assert.equal(f.workers.length, 0);
+  assert.match(JSON.stringify(await f.run()), /runtime_quarantined/);
+  assert.match(JSON.stringify(await f.run(task('bob'))), /completed/);
+  await f.backend.close();
 });

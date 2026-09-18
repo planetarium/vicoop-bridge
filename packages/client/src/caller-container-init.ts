@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { z } from 'zod';
 import semver from 'semver';
 import { CALLER_IMAGE_FILES } from './caller-image-assets.js';
@@ -77,6 +77,10 @@ export async function runCallerContainerInit(
     );
   if (opts.rebuild && opts.image)
     throw new Error('choose --rebuild or --image, not both');
+  for (const value of [opts.stateDirectory, previous.stateDirectory]) {
+    if (value !== undefined && (typeof value !== 'string' || !isAbsolute(value)))
+      throw new Error('stateDirectory must be an absolute path; use the original absolute location for existing state');
+  }
   const stateDirectory = resolve(
     opts.stateDirectory ??
       z.string().optional().parse(previous.stateDirectory) ??

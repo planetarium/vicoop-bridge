@@ -84,7 +84,7 @@ async function fixture(t: TestContext) {
 test('SQLite identity persists privately across restart and identity-free reconciliation', async (t) => {
   const f = await fixture(t);
   await f.store.lock();
-  await f.store.reserve(f.id, 'claude', 'alice');
+  assert.equal(await f.store.reserve(f.id, 'claude', 'alice'), true);
   assert.deepEqual(await f.read(), f.record);
   assert.equal((await stat(f.path)).mode & 0o777, 0o600);
   assert.equal((await stat(f.directory)).mode & 0o777, 0o700);
@@ -96,7 +96,7 @@ test('SQLite identity persists privately across restart and identity-free reconc
   await assert.rejects(readFile(f.jsonPath), { code: 'ENOENT' });
   await f.store.unlock();
   await f.store.lock();
-  await f.store.reserve(f.id, 'claude');
+  assert.equal(await f.store.reserve(f.id, 'claude'), false);
   assert.deepEqual(await f.read(), f.record);
   await assert.rejects(
     f.store.reserve(f.id, 'claude', 'bob'),

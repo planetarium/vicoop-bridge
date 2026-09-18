@@ -304,7 +304,7 @@ export class CallerRuntimeStore {
       await rm(next, { force: true });
     }
   }
-  async reserve(id: string, kind: string, principalId?: string): Promise<void> {
+  async reserve(id: string, kind: string, principalId?: string): Promise<boolean> {
     if (!this.locked)
       throw new Error('caller state requires exclusive ownership');
     if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('invalid scope ID');
@@ -350,6 +350,7 @@ export class CallerRuntimeStore {
         );
       }
       db.exec('COMMIT');
+      return !previous;
     } catch (error) {
       db.exec('ROLLBACK');
       throw error;

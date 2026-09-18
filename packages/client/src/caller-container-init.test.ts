@@ -391,3 +391,20 @@ test('unwritable image storage fails initialization without saving config and re
   assert.deepEqual(await f.read(), f.original);
   assert.deepEqual(f.calls.at(-1)?.slice(0, 3), ['rm', '-f', '-v']);
 });
+
+
+test('relative and empty state paths fail before authentication or Docker, including retained paths', async (t) => {
+  for (const value of ['', './state', '../state', '~/state']) {
+    for (const retained of [false, true]) {
+      const f = await fixture(t);
+      const original = retained ? { ...f.original, backends: { claude: { caller_runtime: { image, stateDirectory: value } } } } : f.original;
+      await writeFile(f.path, JSON.stringify(original));
+      await assert.rejects(runCallerContainerInit({ ...f.options,
+        stateDirectory: retained ? join(f.dir, 'absolute') : value,
+      }), /absolute path/);
+      assert.deepEqual(await f.read(), original);
+      assert.equal(f.auth(), 0);
+      assert.deepEqual(f.calls, []);
+    }
+  }
+});

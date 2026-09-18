@@ -159,6 +159,13 @@ try {
       const restored = await pool.acquire(alice);
       assert.equal(await docker(['exec', restored.name, 'cat', '/workspace/owner']), 'ALICE');
       assert.equal(await docker(['inspect', '--format', '{{.HostConfig.Memory}}', restored.name]), String(1024 * 1048576));
+      await pool.remove(alice, false);
+      await docker(['volume', 'rm', `${restored.name}-workspace`]);
+      await pool.close();
+      pool = new DockerCallerRuntimePool(kind, resized, agent);
+      await pool.initialize();
+      await assert.rejects(pool.acquire(alice), /retained caller volume missing/);
+      await assert.rejects(docker(['volume', 'inspect', `${restored.name}-workspace`]));
       console.log(
         `PASS ${kind}: A/B/A, container reuse, stop/recreate/restart persistence, independent volumes, exclusive owner, input transfer, storage admission, offline resize recovery, network drift rejection, unprivileged workloads`,
       );
