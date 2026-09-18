@@ -7,7 +7,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { closeSync, existsSync, openSync, readFileSync } from 'node:fs';
 import { spawn as spawnProcess, type ChildProcess } from 'node:child_process';
-import { AgentCard, OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
+import { AgentCard } from '@vicoop-bridge/protocol';
+import { callerRuntimeCard } from './caller-runtime-card.js';
 import { resolveBundledCard } from './bundled-cards.js';
 import { group, longestMatch, object } from '@optique/core/constructs';
 import { optional, withDefault } from '@optique/core/modifiers';
@@ -556,10 +557,9 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   const raw = args.card
     ? JSON.parse(readFileSync(args.card, 'utf8'))
     : resolveBundledCard(args.backend);
-  const agentCard = raw ? AgentCard.parse(raw) : undefined;
-  if (args.runtime === 'container' && agentCard?.capabilities?.extensions) {
-    agentCard.capabilities.extensions = agentCard.capabilities.extensions.filter(e=>e.uri!==OPENAI_COMPAT_EXTENSION_URI);
-  }
+  const parsedCard = raw ? AgentCard.parse(raw) : undefined;
+  const agentCard = parsedCard && args.runtime === 'container'
+    ? callerRuntimeCard(parsedCard, args.backend, Boolean(args.card)) : parsedCard;
 
   // Emit the resolved backend at startup so operators can verify which
   // backend the precedence chain picked (flag vs. config vs. default

@@ -253,9 +253,9 @@ export class DockerCallerRuntimePool {
       Object.entries(network.Containers ?? {}).some(([key, value]: [string, any]) =>
         !container || key !== container.Id || value.Name !== this.name(id),
       ) ||
-      (container && (!endpoint ||
-        (endpoint.NetworkID && endpoint.NetworkID !== network.Id) ||
-        (container.State.Running && endpoint.NetworkID !== network.Id)))
+      (container && ((this.validateExecution && !endpoint) ||
+        (endpoint?.NetworkID && endpoint.NetworkID !== network.Id) ||
+        (container.State.Running && endpoint?.NetworkID !== network.Id)))
     ) throw new Error('caller network ownership or isolation boundary mismatch');
     return true;
   }
@@ -485,7 +485,10 @@ export class DockerCallerRuntimePool {
     }
     // Validate every retained resource before dismantling any of them. Missing
     // resources are recoverable, but foreign ownership must leave the rest intact.
-    const network = await this.networkExists(id);
+    if (container && Object.keys(container.NetworkSettings?.Networks ?? {}).some(
+      network => network !== `${name}-net`,
+    )) throw new Error('caller container network membership boundary mismatch');
+    const network = await this.networkExists(id, container);
     const volumes: string[] = [];
     for (const suffix of ['workspace', 'sessions'])
       if (await this.volumeExists(id, suffix)) volumes.push(`${name}-${suffix}`);

@@ -151,3 +151,11 @@ test('caller settings allowlist rejects arbitrary environment and hooks and retu
   original.env.ENABLE_PROMPT_CACHING_1H = 'OPERATOR_SECRET';
   assert.doesNotMatch(JSON.stringify(selected), /OPERATOR_SECRET|FOO_SECRET/);
 });
+
+
+test('caller settings accept supported Claude 1m context-tier model IDs', async () => {
+  const { selectClaudeCallerSettings } = await import('./claude-auth-broker.js');
+  for (const model of ['claude-sonnet-4-5[1m]', 'claude-opus-4-6[1m]', 'sonnet[1m]'])
+    assert.deepEqual(selectClaudeCallerSettings({ model }), { model });
+  assert.throws(() => selectClaudeCallerSettings({ model: 'claude-sonnet-4-5[SECRET]' }));
+});

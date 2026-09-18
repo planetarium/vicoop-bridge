@@ -55,9 +55,10 @@ and runtime-boundary components from #501/#505 with scope-specific runtime bindi
 - Confirm execution termination before reporting cancellation or allowing reuse.
   Uncertain cleanup quarantines that scope. If containment requires stopping a
   container, stop only the affected scope and retain its storage.
-- Bound containers, retained storage, queues, contexts, allocation/cleanup time,
-  CPU, memory, PIDs and task duration. Define an enforceable volume storage limit;
-  switching from tmpfs to named volumes must not silently remove the storage bound.
+- Bound container count, queues, contexts, allocation/cleanup time, CPU, memory,
+  PIDs and task duration. Retained volume storage currently uses monitored
+  admission and shutdown at the configured threshold, not a filesystem hard
+  quota. Enforceable disk containment remains an unmet acceptance requirement.
 - Stop/restart/recreation must attach only the same scope's storage. Validate
   ownership labels, image, mounts and runtime boundary before reuse; reconcile
   unknown or unfinished executions before accepting work after a daemon restart.
@@ -81,6 +82,8 @@ and runtime-boundary components from #501/#505 with scope-specific runtime bindi
 - [x] Implement scope-owned container/volume allocation, reuse and reconciliation.
 - [x] Bind shared broker/supervisor infrastructure to each scope and execution.
 - [x] Adapt queueing, leases, resource accounting and quarantine to persistent runtimes.
+- [ ] Enforce a hard volume-storage limit that prevents fast writes and Docker
+      disk exhaustion; monitored storage admission does not satisfy this gate.
 - [x] Implement explicit conversation resume/reset policy and idle-only administration.
 - [x] Demonstrate real Docker A/B/A: distinct Alice/Bob container IDs, Alice's later
       requests reuse her ID, and a new Alice context also reuses her container.

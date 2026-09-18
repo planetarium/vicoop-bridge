@@ -80,6 +80,10 @@ server.on('connection', (ws) => {
         ),
         false,
       );
+      assert.ok(!frame.agentCard.defaultInputModes.includes('application/json'));
+      assert.ok(frame.agentCard.defaultInputModes.includes('text/plain'));
+      assert.equal(frame.agentCard.defaultInputModes.includes('application/pdf'), kind === 'claude');
+      assert.ok(!/data.part.*inputs|serialized into the prompt/.test(JSON.stringify(frame.agentCard)));
       socket = ws;
       hellos++;
       ws.send(

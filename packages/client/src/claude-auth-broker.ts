@@ -35,7 +35,7 @@ export function createClaudeCredentialReader(env: NodeJS.ProcessEnv = process.en
 // Only deliberately shared, bounded settings may reach an untrusted caller's argv.
 // strict() rejects hooks/helpers, arbitrary environment, and future unknown keys.
 const callerSettings = z.object({
-  model: z.string().regex(/^(?:sonnet|opus|haiku|claude-[a-z0-9.-]+)$/).optional(),
+  model: z.string().regex(/^(?:sonnet|opus|haiku|claude-[a-z0-9.-]+)(?:\[1m\])?$/).optional(),
   effortLevel: z.enum(['low', 'medium', 'high', 'max']).optional(),
   alwaysThinkingEnabled: z.boolean().optional(),
   sandbox: z.object({ enabled: z.boolean().optional(), failIfUnavailable: z.boolean().optional() }).strict().optional(),

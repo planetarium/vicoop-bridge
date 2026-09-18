@@ -353,7 +353,7 @@ database or explicitly remove the orphan resources. Orphans are not managed by
 `container remove` because they have no committed scope record.
 
 Claude caller settings use an allowlist: `model` (Claude model IDs or
-sonnet/opus/haiku), `effortLevel` (low/medium/high/max), `alwaysThinkingEnabled`
+sonnet/opus/haiku, optionally suffixed with `[1m]`), `effortLevel` (low/medium/high/max), `alwaysThinkingEnabled`
 (boolean), `sandbox.enabled`/`sandbox.failIfUnavailable` (booleans), and
 `env.ENABLE_PROMPT_CACHING_1H` ("0"/"1"). Other settings, environment variables,
 hooks and authentication helpers fail initialization and daemon startup. Allowed
@@ -365,3 +365,8 @@ pidfile instead of reporting a clean shutdown. Inspect the retained runtime
 resources before restart; the next owner must still reconcile Docker state.
 Offline removal preflights the container, network and both volumes before any
 Docker removal, so ownership rejection leaves the remaining resources intact.
+
+Container agent cards advertise only the supported text/inline-file input modes;
+bundled descriptions omit host JSON-data support. Custom card descriptions are
+preserved with the container input contract appended, and a custom card with no
+supported input mode is rejected before daemon startup.

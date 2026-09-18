@@ -92,6 +92,10 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   networkMissing = true;
   const missing = pool();
   await missing.initialize(false);
+  (info.NetworkSettings.Networks as any).foreign = { NetworkID: 'foreign' };
+  await assert.rejects(missing.remove(id, false), /network membership boundary mismatch/);
+  assert.equal(removed, false);
+  delete (info.NetworkSettings.Networks as any).foreign;
   await missing.remove(id, false);
   assert.equal(removed, true);
   await missing.close();
@@ -119,6 +123,7 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   assert.equal(removed, false);
   assert.ok(!calls.slice(before).some(args => args.includes('rm')));
   badSessionVolume = false;
+  network.Containers[info.Id] = { Name: name }; // A stopped container's own endpoint is legitimate.
   await admin.remove(id, false);
   assert.deepEqual(await admin.store.scopes(), [id, scopeDigest('agent', 'bob')].sort());
   await admin.close();
