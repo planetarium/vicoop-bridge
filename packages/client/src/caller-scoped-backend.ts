@@ -11,7 +11,7 @@ import type {
   DockerCallerRuntimePool,
   CallerContainer,
 } from './caller-runtime-docker.js';
-import { CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageLimitError, CallerStorageMissingError } from './caller-runtime-docker.js';
+import { CallerReservationUnconfirmedError, CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageLimitError, CallerStorageMissingError } from './caller-runtime-docker.js';
 import { scopeDigest } from './caller-runtime-store.js';
 import { createHash } from 'node:crypto';
 export interface CallerWorker {
@@ -328,6 +328,12 @@ export class CallerScopedBackend implements Backend {
         entry.quarantined = true;
         this.fail(task, emit, 'runtime_orphaned_resources',
           'Unrecorded caller resources were not adopted. Stop the daemon and inspect the orphan Docker resources or restore their original state database.');
+        return;
+      }
+      if (error instanceof CallerReservationUnconfirmedError) {
+        entry.quarantined = true;
+        this.fail(task, emit, 'runtime_reservation_unconfirmed',
+          'Caller reservation rollback could not be confirmed; stop the daemon and inspect/remove the scope before retrying.');
         return;
       }
       if (error instanceof CallerAllocationIncompleteError) {

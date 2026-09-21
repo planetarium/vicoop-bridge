@@ -8,6 +8,11 @@ import type { CallerRuntimeOptions } from './caller-runtime-config.js';
 export class CallerOrphanedResourcesError extends Error {
   constructor() { super('unrecorded caller resources exist; stop the daemon and restore the original state database or inspect and remove the orphan Docker resources explicitly'); }
 }
+export class CallerReservationUnconfirmedError extends Error {
+  constructor(cause?: unknown) {
+    super('caller reservation rollback unconfirmed; stop the daemon and inspect/remove the scope before retrying', { cause });
+  }
+}
 export class CallerAllocationIncompleteError extends Error {
   constructor() { super('caller initial allocation is incomplete; restore the original state/resources or explicitly remove the scope'); }
 }
@@ -125,6 +130,7 @@ export class DockerCallerRuntimePool {
       // Validate before stopping. Never delete or adopt mismatched resources.
       for (const id of ids) {
         await this.store.reserve(id, this.kind);
+        if (reconcile && await this.store.reservationPending(id)) continue;
         const info = await this.inspect(this.name(id));
         if (info) {
           await this.validate(info, id);
@@ -132,7 +138,10 @@ export class DockerCallerRuntimePool {
             throw new Error(
               'stop the daemon and managed containers before offline administration',
             );
-          if (reconcile) await this.stop(id);
+          if (reconcile) {
+            await this.store.markAllocationComplete(id);
+            await this.stop(id);
+          }
         }
         // Explicit offline validation checks retained data even after recreation.
         // Daemon startup leaves missing storage to per-caller quarantine on acquire.
@@ -302,7 +311,9 @@ export class DockerCallerRuntimePool {
       return this.command(args, signal);
     };
     const name = this.name(id);
-    const fresh = await this.store.reserve(id, this.kind, principalId); // reserve before the first Docker mutation
+    const fresh = await this.store.reserve(id, this.kind, principalId, true); // reserve before the first Docker mutation
+    if (!fresh && await this.store.reservationPending(id))
+      throw new CallerReservationUnconfirmedError();
     let info;
     if (fresh) {
       // Inspect every resource before the first mutation. A rejected reservation
@@ -313,8 +324,10 @@ export class DockerCallerRuntimePool {
             await this.volumeExists(id, 'sessions', signal) ||
             await this.networkExists(id, undefined, signal))
           throw new CallerOrphanedResourcesError();
+        await this.store.confirmReservation(id);
       } catch (error) {
-        await this.store.forget(id);
+        try { await this.store.forget(id); }
+        catch { throw new CallerReservationUnconfirmedError(error); }
         throw error;
       }
       onReserved?.();
@@ -441,6 +454,9 @@ export class DockerCallerRuntimePool {
       throw new CallerStorageLimitError();
   }
   async stop(id: string): Promise<void> {
+    // Unconfirmed reservations may refer to orphan resources; normal cleanup
+    // must not touch them. Explicit offline removal still validates ownership.
+    if (!this.offline && await this.store.reservationPending(id)) return;
     const name = this.name(id),
       info = await this.inspect(name);
     if (!info) {

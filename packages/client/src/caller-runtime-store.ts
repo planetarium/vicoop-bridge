@@ -295,6 +295,7 @@ export class CallerRuntimeStore {
     // Additive v4 state: absence is deliberately not evidence of a completed
     // allocation. Older records can establish it from a validated container.
     db.exec('CREATE TABLE IF NOT EXISTS completed_allocations (id TEXT PRIMARY KEY NOT NULL)');
+    db.exec('CREATE TABLE IF NOT EXISTS pending_reservations (id TEXT PRIMARY KEY NOT NULL)');
     if (migrating) await this.atomicWrite(manifestPath, expected);
     // Legacy JSON files remain as an inert migration backup, never read again.
   }
@@ -307,7 +308,7 @@ export class CallerRuntimeStore {
       await rm(next, { force: true });
     }
   }
-  async reserve(id: string, kind: string, principalId?: string): Promise<boolean> {
+  async reserve(id: string, kind: string, principalId?: string, requirePreflight = false): Promise<boolean> {
     if (!this.locked)
       throw new Error('caller state requires exclusive ownership');
     if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('invalid scope ID');
@@ -351,6 +352,7 @@ export class CallerRuntimeStore {
           record.agentId,
           record.principalId,
         );
+        if (requirePreflight) db.prepare('INSERT INTO pending_reservations (id) VALUES (?)').run(id);
       }
       db.exec('COMMIT');
       return !previous;
@@ -358,6 +360,12 @@ export class CallerRuntimeStore {
       db.exec('ROLLBACK');
       throw error;
     }
+  }
+  async reservationPending(id: string): Promise<boolean> {
+    return !!this.db().prepare('SELECT id FROM pending_reservations WHERE id = ?').get(id);
+  }
+  async confirmReservation(id: string): Promise<void> {
+    this.db().prepare('DELETE FROM pending_reservations WHERE id = ?').run(id);
   }
   async allocationComplete(id: string): Promise<boolean> {
     return !!this.db().prepare('SELECT id FROM completed_allocations WHERE id = ?').get(id);
@@ -372,6 +380,7 @@ export class CallerRuntimeStore {
     db.exec('BEGIN IMMEDIATE');
     try {
       db.prepare('DELETE FROM completed_allocations WHERE id = ?').run(id);
+      db.prepare('DELETE FROM pending_reservations WHERE id = ?').run(id);
       db.prepare('DELETE FROM scopes WHERE id = ?').run(id);
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }

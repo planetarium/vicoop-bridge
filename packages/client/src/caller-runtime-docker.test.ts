@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DockerCallerRuntimePool, CALLER_TMPFS, CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageMissingError, CallerStorageLimitError } from './caller-runtime-docker.js';
+import { DockerCallerRuntimePool, CALLER_TMPFS, CallerReservationUnconfirmedError, CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageMissingError, CallerStorageLimitError } from './caller-runtime-docker.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { CallerRuntimeStore, scopeDigest } from './caller-runtime-store.js';
 import type { AsyncDockerRun } from './docker-command.js';
@@ -356,4 +356,35 @@ test('interrupted initial allocation with both volumes cannot silently create a 
     assert.ok(!calls.some(args => ['create', 'start', 'exec'].includes(args[0])));
     assert.equal(await pool.store.allocationComplete(id), false);
   } finally { await pool.close(); }
+});
+
+test('failed reservation rollback blocks retries and restart without touching orphan resources', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'caller-rollback-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const config = CallerRuntimeConfig.parse({ image: `sha256:${'a'.repeat(64)}`, stateDirectory: directory });
+  const id = scopeDigest('agent', 'alice');
+  let inspections = 0;
+  const run: AsyncDockerRun = async args => {
+    if (args[0] === 'image') return { exitCode: 0, stdout: '[{"Config":{}}]', stderr: '' };
+    if (args[0] === 'ps') return { exitCode: 0, stdout: '', stderr: '' };
+    assert.deepEqual(args.slice(0, 2), ['container', 'inspect']);
+    inspections++;
+    return { exitCode: 0, stdout: '[{}]', stderr: '' }; // Orphan; must never be adopted or stopped.
+  };
+  const pool = new DockerCallerRuntimePool('claude', config, 'agent', run);
+  await pool.initialize();
+  pool.store.forget = async () => { throw Error('SQLite rollback failed'); };
+  await assert.rejects(pool.acquire(id, undefined, 'alice'), error => {
+    assert.ok(error instanceof CallerReservationUnconfirmedError);
+    assert.ok(error.cause instanceof CallerOrphanedResourcesError);
+    return true;
+  });
+  assert.equal(await pool.store.reservationPending(id), true);
+  await assert.rejects(pool.acquire(id, undefined, 'alice'), CallerReservationUnconfirmedError);
+  await pool.close();
+  const restarted = new DockerCallerRuntimePool('claude', config, 'agent', run);
+  await restarted.initialize();
+  try { await assert.rejects(restarted.acquire(id, undefined, 'alice'), CallerReservationUnconfirmedError); }
+  finally { await restarted.close(); }
+  assert.equal(inspections, 1);
 });

@@ -9,6 +9,7 @@ import {
   type CallerKind,
 } from '../src/caller-runtime-docker.js';
 import { CallerRuntimeConfig } from '../src/caller-runtime-config.js';
+import { openCallerDatabase } from '../src/caller-runtime-sqlite.js';
 import { scopeDigest } from '../src/caller-runtime-store.js';
 import { runDockerCommand } from '../src/docker-command.js';
 const image = process.env.VICOOP_SMOKE_IMAGE;
@@ -139,8 +140,12 @@ try {
       );
       await pool.inputRemove(alice, input);
       await pool.close();
+      const older = await openCallerDatabase(join(config.stateDirectory, 'state.sqlite'));
+      try { older.exec('DELETE FROM completed_allocations'); } finally { older.close(); }
       pool = new DockerCallerRuntimePool(kind, config, agent);
       assert.equal((await pool.initialize()).length, 2);
+      assert.equal(await pool.store.allocationComplete(alice), true);
+      assert.equal(await pool.store.allocationComplete(bob), true);
       await pool.acquire(alice);
       assert.equal(
         await docker(['exec', a.name, 'cat', '/workspace/owner']),

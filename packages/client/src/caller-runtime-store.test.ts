@@ -299,3 +299,18 @@ test('allocation completion survives restart and is forgotten with scope identit
   await f.store.reserve(f.id, 'claude', 'alice');
   assert.equal(await f.store.allocationComplete(f.id), false);
 });
+
+test('reservation preflight evidence is durable and cleared only on confirmation or removal', async (t) => {
+  const f = await fixture(t);
+  await f.store.lock();
+  await f.store.reserve(f.id, 'claude', 'alice', true);
+  await f.store.unlock();
+  await f.store.lock();
+  assert.equal(await f.store.reservationPending(f.id), true);
+  await f.store.confirmReservation(f.id);
+  assert.equal(await f.store.reservationPending(f.id), false);
+  await f.store.forget(f.id);
+  await f.store.reserve(f.id, 'claude', 'alice', true);
+  await f.store.forget(f.id);
+  assert.equal(await f.store.reservationPending(f.id), false);
+});
