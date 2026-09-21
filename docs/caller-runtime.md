@@ -372,3 +372,5 @@ preserved with the container input contract appended, and a custom card with no
 supported input mode is rejected before daemon startup.
 
 Caller cards advertise text-only output. Traceability extensions are not advertised, and requests opting into traceability are rejected before allocation because trace artifacts may contain files or structured data. Offline removal/recreation also rejects volumes mounted by another container (including stopped containers) before deleting any resources; detach those consumers before retrying.
+
+Canceled queued requests return promptly, but their queue slots remain occupied until the preceding request settles. Repeated cancellation cannot bypass the queue bound; new requests may receive `runtime_capacity` while those barriers remain.

@@ -225,7 +225,9 @@ test('retained scopes never recreate missing workspace or session volumes after 
     await validator.initialize(false);
     await validator.close();
     const pool = new DockerCallerRuntimePool('claude', options, 'agent', run);
+    const beforeStartup = calls.length;
     await pool.initialize();
+    assert.ok(!calls.slice(beforeStartup).some(args => args[0] === 'volume'), 'startup defers retained-volume checks to each caller');
     try {
       await assert.rejects(pool.acquire(id, undefined, 'alice'), CallerStorageMissingError);
       assert.deepEqual(await pool.store.scopes(), [id]);

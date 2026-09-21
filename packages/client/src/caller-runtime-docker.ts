@@ -74,13 +74,13 @@ export class DockerCallerRuntimePool {
       `${k}=${v}`,
     ]);
   }
-  async initialize(reconcile = true, validateExecution = false): Promise<string[]> {
+  async initialize(reconcile = true, validateOffline = false): Promise<string[]> {
     if (process.platform === 'win32')
       throw new Error('container requires Linux or macOS Docker');
     await this.store.lock();
     this.locked = true;
     this.offline = !reconcile;
-    this.validateExecution = reconcile || validateExecution;
+    this.validateExecution = reconcile || validateOffline;
     try {
       if (this.validateExecution) {
         const inspected = await this.run(['image', 'inspect', this.options.image]);
@@ -132,7 +132,7 @@ export class DockerCallerRuntimePool {
         }
         // Explicit offline validation checks retained data even after recreation.
         // Daemon startup leaves missing storage to per-caller quarantine on acquire.
-        if (validateExecution) {
+        if (!reconcile && validateOffline) {
           for (const suffix of ['workspace', 'sessions'])
             if (!(await this.volumeExists(id, suffix))) throw new CallerStorageMissingError();
         }

@@ -517,3 +517,30 @@ test('traceability requested through either negotiation surface is rejected befo
     assert.equal(f.workers.length, 0);
   }
 });
+
+test('canceled waiters retain queue slots until the active predecessor settles', async () => {
+  let finish!: () => void, enter!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const ready = new Promise<void>(resolve => { enter = resolve; });
+  const f = fixture(async (request, emit) => {
+    if (request.taskId === 'active') { enter(); await gate; }
+    emit({ type: 'task.complete', taskId: request.taskId, status: { state: 'completed', timestamp: '' } });
+  }, { maxScopes: 1, queueLimit: 1 });
+  const active = f.run(task('alice', 'active', 'active'));
+  await ready;
+  const controller = new AbortController();
+  const canceled = f.run(task('alice', 'queued', 'queued'), controller.signal);
+  controller.abort();
+  assert.match(JSON.stringify(await canceled), /runtime_canceled/);
+  for (let i = 0; i < 100; i++) {
+    const attempt = new AbortController();
+    const work = f.run(task('alice', `attempt-${i}`, `attempt-${i}`), attempt.signal);
+    attempt.abort();
+    assert.match(JSON.stringify(await work), /runtime_capacity/);
+  }
+  assert.equal(f.contexts.length, 1);
+  assert.equal(f.stops.length, 0);
+  finish();
+  await active;
+  assert.equal((await f.run(task('alice', 'after', 'after'))).at(-1)?.type, 'task.complete');
+});

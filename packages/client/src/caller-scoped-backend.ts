@@ -356,13 +356,17 @@ export class CallerScopedBackend implements Backend {
       clearInterval(heartbeat);
       clearTimeout(timer);
       await storageCheck;
-      // A canceled waiter must retain the predecessor's barrier until it settles.
-      void previous.then(release, release);
+      // Canceled tasks return promptly, but their chained barriers still consume
+      // queue capacity until the predecessor settles. This bounds retained closures.
+      const releaseSlot = () => {
+        release();
+        this.pending--;
+        entry.users--;
+        if (!entry.retained && !entry.quarantined && entry.users === 0) this.entries.delete(id);
+      };
+      void previous.then(releaseSlot, releaseSlot);
       signal.removeEventListener('abort', abort);
       this.controllers.delete(controller);
-      this.pending--;
-      entry.users--;
-      if (!entry.retained && !entry.quarantined && entry.users === 0) this.entries.delete(id);
     }
   }
   stop() {
