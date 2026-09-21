@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AgentCard, OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
+import { AgentCard, OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import { resolveBundledCard } from './bundled-cards.js';
 import { callerRuntimeCard } from './caller-runtime-card.js';
 
@@ -15,7 +15,7 @@ test('container cards advertise supported inline inputs without changing host ca
     assert.equal(isolated.defaultInputModes?.includes('application/pdf'), kind === 'claude');
     assert.ok(isolated.defaultInputModes?.includes('text/plain'));
     assert.deepEqual(isolated.defaultOutputModes, ['text/plain']);
-    assert.equal(isolated.capabilities?.extensions?.some(e => e.uri === OPENAI_COMPAT_EXTENSION_URI), false);
+    assert.equal(isolated.capabilities?.extensions?.some(e => e.uri === OPENAI_COMPAT_EXTENSION_URI || e.uri === TRACEABILITY_EXTENSION_URI), false);
     assert.doesNotMatch(isolated.description!, /persistent stdio|JSON data/);
     for (const skill of isolated.skills!) assert.doesNotMatch(skill.description!, /data.*parts|serialized/);
     assert.doesNotThrow(() => AgentCard.parse(isolated));
@@ -30,4 +30,12 @@ test('custom cards retain service descriptions but cannot advertise only unsuppo
   assert.deepEqual(card.defaultInputModes, ['text/plain']);
   assert.deepEqual(card.defaultOutputModes, ['text/plain']);
   assert.throws(() => callerRuntimeCard({ ...custom, defaultInputModes: ['application/json'] }, 'codex', true), /must advertise supported/);
+});
+
+test('custom caller cards remove traceability without changing the original extension list', () => {
+  const host = AgentCard.parse({ name: 'custom', version: '1',
+    capabilities: { extensions: [{ uri: TRACEABILITY_EXTENSION_URI }] },
+  });
+  assert.deepEqual(callerRuntimeCard(host, 'claude', true).capabilities?.extensions, []);
+  assert.equal(host.capabilities?.extensions?.length, 1);
 });

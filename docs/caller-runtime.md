@@ -370,3 +370,5 @@ Container agent cards advertise only the supported text/inline-file input modes;
 bundled descriptions omit host JSON-data support. Custom card descriptions are
 preserved with the container input contract appended, and a custom card with no
 supported input mode is rejected before daemon startup.
+
+Caller cards advertise text-only output. Traceability extensions are not advertised, and requests opting into traceability are rejected before allocation because trace artifacts may contain files or structured data. Offline removal/recreation also rejects volumes mounted by another container (including stopped containers) before deleting any resources; detach those consumers before retrying.

@@ -2,6 +2,7 @@ import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME, decodedBase64Size } from './bac
 import {
   ExecutionScopeV1,
   OPENAI_COMPAT_EXTENSION_URI,
+  TRACEABILITY_EXTENSION_URI,
   type TaskAssignFrame,
   type UpFrame,
 } from '@vicoop-bridge/protocol';
@@ -96,6 +97,9 @@ export class CallerScopedBackend implements Backend {
       throw new Error(
         'container requires plain A2A text or inline files; caller tools and URI inputs are unsupported',
       );
+    if (task.requestedExtensions?.includes(TRACEABILITY_EXTENSION_URI) ||
+        task.message.extensions?.includes(TRACEABILITY_EXTENSION_URI))
+      throw new Error('traceability output is unsupported in caller containers');
     for (const part of task.message.parts) {
       if (part.kind !== 'file') continue;
       const mime = part.file.mimeType ?? '';

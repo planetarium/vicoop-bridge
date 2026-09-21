@@ -37,3 +37,5 @@ Reject cross-backend state-directory aliases during initialization, report conve
 Share one bounded shutdown operation across fatal disconnects and signals, removing the detached pidfile only after confirmed cleanup and retaining fatal exit status.
 
 Reject invalid sibling-backend state paths before initialization side effects and advertise text-only caller outputs.
+
+Reject removal/recreation when another container mounts caller volumes before dismantling resources, and disable traceability negotiation in text-output-only caller runtimes.

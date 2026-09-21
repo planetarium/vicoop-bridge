@@ -1,4 +1,4 @@
-import { OPENAI_COMPAT_EXTENSION_URI, type AgentCard } from '@vicoop-bridge/protocol';
+import { OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI, type AgentCard } from '@vicoop-bridge/protocol';
 
 /** Match advertised input modes to the caller admission gate, without mutating host cards. */
 export function callerRuntimeCard(card: AgentCard, kind: string, custom = false): AgentCard {
@@ -17,7 +17,7 @@ export function callerRuntimeCard(card: AgentCard, kind: string, custom = false)
     defaultOutputModes: ['text/plain'],
     capabilities: {
       ...card.capabilities,
-      extensions: card.capabilities?.extensions?.filter(extension => extension.uri !== OPENAI_COMPAT_EXTENSION_URI),
+      extensions: card.capabilities?.extensions?.filter(extension => extension.uri !== OPENAI_COMPAT_EXTENSION_URI && extension.uri !== TRACEABILITY_EXTENSION_URI),
     },
     skills: card.skills?.map(skill => ({
       ...skill,

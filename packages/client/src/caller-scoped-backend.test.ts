@@ -8,7 +8,7 @@ import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { scopeDigest } from './caller-runtime-store.js';
 import { CallerOrphanedResourcesError, CallerStorageMissingError, CallerStorageLimitError, type DockerCallerRuntimePool } from './caller-runtime-docker.js';
 import type { Backend } from './backend.js';
-import type { TaskAssignFrame, UpFrame } from '@vicoop-bridge/protocol';
+import { TRACEABILITY_EXTENSION_URI, type TaskAssignFrame, type UpFrame } from '@vicoop-bridge/protocol';
 
 const options = CallerRuntimeConfig.parse({
   image: `sha256:${'a'.repeat(64)}`,
@@ -501,5 +501,19 @@ test('externally stopped or removed retained containers get a fresh worker and e
     assert.doesNotMatch(JSON.stringify(await f.run(task('bob'))), /conversationReset/);
     assert.equal(f.workers.length, 3);
     await f.backend.close();
+  }
+});
+
+test('traceability requested through either negotiation surface is rejected before allocation', async () => {
+  for (const surface of ['request', 'message']) {
+    const f = fixture();
+    const request = task();
+    if (surface === 'request') request.requestedExtensions = [TRACEABILITY_EXTENSION_URI];
+    else request.message.extensions = [TRACEABILITY_EXTENSION_URI];
+    const frames = await f.run(request);
+    assert.equal(frames.length, 1);
+    assert.equal(frames[0]?.type, 'task.fail');
+    assert.equal(f.allocations.length, 0);
+    assert.equal(f.workers.length, 0);
   }
 });

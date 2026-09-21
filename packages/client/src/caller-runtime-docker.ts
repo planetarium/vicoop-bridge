@@ -492,6 +492,12 @@ export class DockerCallerRuntimePool {
     const volumes: string[] = [];
     for (const suffix of ['workspace', 'sessions'])
       if (await this.volumeExists(id, suffix)) volumes.push(`${name}-${suffix}`);
+    for (const volume of volumes) {
+      const consumers = (await this.command(['ps', '--all', '--no-trunc',
+        '--filter', `volume=${volume}`, '--format', '{{.ID}}'])).trim().split(/\s+/).filter(Boolean);
+      if (consumers.some(consumer => consumer !== container?.Id))
+        throw new Error('caller volume is mounted by another container; detach it before removal');
+    }
     if (container) await this.command(['rm', name]);
     if (network) await this.command(['network', 'rm', `${name}-net`]);
     if (deleteData) {

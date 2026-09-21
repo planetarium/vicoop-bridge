@@ -90,6 +90,20 @@ try {
         await docker(['inspect', '--format', '{{.Id}}', a.name]),
         containerId,
       );
+      for (const suffix of ['workspace', 'sessions']) {
+        const consumer = `caller-smoke-consumer-${randomUUID()}`;
+        await docker(['create', '--name', consumer, '--network', 'none',
+          '--mount', `type=volume,src=${a.name}-${suffix},dst=/borrowed,readonly`,
+          image, '/bin/sleep', 'infinity']);
+        try {
+          // Even a stopped foreign consumer prevents Docker from deleting a volume.
+          for (const deleteData of [false, true])
+            await assert.rejects(pool.remove(alice, deleteData), /mounted by another container/);
+          assert.equal(await docker(['inspect', '--format', '{{.Id}}', a.name]), containerId);
+          await docker(['network', 'inspect', `${a.name}-net`]);
+          assert.ok((await pool.store.scopes()).includes(alice));
+        } finally { await docker(['rm', consumer]); }
+      }
       await pool.remove(alice, false);
       await pool.acquire(alice);
       assert.notEqual(

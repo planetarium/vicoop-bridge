@@ -31,11 +31,17 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   const network = { Id: 'caller-network-id', Name: `${name}-net`, Driver: 'bridge', Scope: 'local', Labels: labels, Containers: {} as Record<string, { Name: string }>, Options: {} as Record<string, string> };
   const calls: string[][] = [];
   let removed = false, networkMissing = false, badSessionVolume = false;
+  let foreignVolume: string | undefined;
   const run: AsyncDockerRun = async (args) => {
     calls.push([...args]);
     let value: unknown;
     if (args[0] === 'image') value = [{ Config: {} }];
-    else if (args[0] === 'ps') return { exitCode: 0, stdout: removed ? '' : name, stderr: '' };
+    else if (args[0] === 'ps') {
+      const volume = args.find(arg => arg.startsWith('volume='));
+      return { exitCode: 0, stdout: volume
+        ? [removed ? '' : info.Id, volume.endsWith(foreignVolume ?? '!') ? 'foreign-container-id' : ''].filter(Boolean).join('\n')
+        : removed ? '' : name, stderr: '' };
+    }
     else if (args[0] === 'container') {
       if (args[2] !== name || removed) return { exitCode: 1, stdout: '', stderr: 'No such container' };
       value = [info];
@@ -123,6 +129,16 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   assert.equal(removed, false);
   assert.ok(!calls.slice(before).some(args => args.includes('rm')));
   badSessionVolume = false;
+  for (const suffix of ['workspace', 'sessions']) {
+    foreignVolume = suffix;
+    const beforeRemoval = calls.length;
+    for (const deleteData of [false, true])
+      await assert.rejects(admin.remove(id, deleteData), /mounted by another container/);
+    assert.equal(removed, false);
+    assert.ok(!calls.slice(beforeRemoval).some(args => args.includes('rm')));
+    assert.ok((await admin.store.scopes()).includes(id));
+  }
+  foreignVolume = undefined;
   network.Containers[info.Id] = { Name: name }; // A stopped container's own endpoint is legitimate.
   await admin.remove(id, false);
   assert.deepEqual(await admin.store.scopes(), [id, scopeDigest('agent', 'bob')].sort());
