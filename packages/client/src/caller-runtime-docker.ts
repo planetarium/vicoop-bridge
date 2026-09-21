@@ -8,6 +8,9 @@ import type { CallerRuntimeOptions } from './caller-runtime-config.js';
 export class CallerOrphanedResourcesError extends Error {
   constructor() { super('unrecorded caller resources exist; stop the daemon and restore the original state database or inspect and remove the orphan Docker resources explicitly'); }
 }
+export class CallerAllocationIncompleteError extends Error {
+  constructor() { super('caller initial allocation is incomplete; restore the original state/resources or explicitly remove the scope'); }
+}
 export class CallerStorageMissingError extends Error {
   constructor() { super('retained caller volume missing; restore its original volumes or explicitly remove the scope before starting over'); }
 }
@@ -26,6 +29,7 @@ export interface CallerContainer {
   recovered: boolean;
   restarted?: boolean;
   recreated?: boolean;
+  dockerId?: string;
 }
 
 // This pool owns containers, not executions. Callers hold a per-scope lease
@@ -329,6 +333,8 @@ export class DockerCallerRuntimePool {
           await command(['volume', 'create', ...this.labelArgs(id), volume]);
         }
       }
+      if (!fresh && !(await this.store.allocationComplete(id)))
+        throw new CallerAllocationIncompleteError();
       if (!(await this.networkExists(id, undefined, signal))) {
         await command([
           'network',
@@ -394,7 +400,8 @@ export class DockerCallerRuntimePool {
       if (!(await this.volumeExists(id, suffix, signal)))
         throw new CallerStorageMissingError();
     if (!info.State.Running) await command(['start', name]);
-    await this.validate(await this.inspect(name, signal), id, signal);
+    info = await this.inspect(name, signal);
+    await this.validate(info, id, signal);
     await command([
       'exec',
       '--user',
@@ -406,7 +413,8 @@ export class DockerCallerRuntimePool {
     ]);
     await this.checkStorage(id, signal);
     signal?.throwIfAborted();
-    const container = { id, name, recovered, restarted, recreated };
+    await this.store.markAllocationComplete(id);
+    const container = { id, name, recovered, restarted, recreated, dockerId: info.Id };
     this.containers.set(id, container);
     return container;
   }
@@ -498,6 +506,9 @@ export class DockerCallerRuntimePool {
       if (consumers.some(consumer => consumer !== container?.Id))
         throw new Error('caller volume is mounted by another container; detach it before removal');
     }
+    // A validated existing container proves this is deliberate recreation,
+    // including records created before allocation markers were introduced.
+    if (container && !deleteData) await this.store.markAllocationComplete(id);
     if (container) await this.command(['rm', name]);
     if (network) await this.command(['network', 'rm', `${name}-net`]);
     if (deleteData) {

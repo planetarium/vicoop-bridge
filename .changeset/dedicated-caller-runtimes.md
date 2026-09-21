@@ -41,3 +41,5 @@ Reject invalid sibling-backend state paths before initialization side effects an
 Reject removal/recreation when another container mounts caller volumes before dismantling resources, and disable traceability negotiation in text-output-only caller runtimes.
 
 Keep canceled waiter barriers counted against queue capacity until predecessors settle, and make offline-only retained-volume validation explicit.
+
+Persist completed caller allocations in SQLite so interrupted initial allocation cannot become automatic recreation, rebuild workers on Docker ID changes, and filter traceability from server-synthesized caller cards.

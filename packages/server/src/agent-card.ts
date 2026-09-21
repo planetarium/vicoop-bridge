@@ -10,6 +10,7 @@ import {
   CALLER_CONTEXT_V2_CAPABILITY,
   CALLER_RUNTIME_V1_CAPABILITY,
   OPENAI_COMPAT_EXTENSION_URI,
+  TRACEABILITY_EXTENSION_URI,
   MENTIONABLE_IDENTITY_VC_EXTENSION_URI,
   SIWE_BEARER_AUTH_EXTENSION_URI,
 } from '@vicoop-bridge/protocol';
@@ -154,7 +155,7 @@ export function buildAgentA2XServer(
     conn.protocolCapabilities?.includes(CALLER_CONTEXT_V2_CAPABILITY) === true &&
     conn.allowedCallers.some((entry) => parseFederatedPrincipal(entry) !== null);
   for (const extension of wireExtensions) {
-    if (callerRuntime && extension.uri === OPENAI_COMPAT_EXTENSION_URI) continue;
+    if (callerRuntime && [OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI].includes(extension.uri)) continue;
     if (restricted && extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI) {
       // Bridge owns this advertisement on restricted agents — drop wire
       // entry whether or not we re-emit our own (the latter is gated by

@@ -11,7 +11,7 @@ import type {
   DockerCallerRuntimePool,
   CallerContainer,
 } from './caller-runtime-docker.js';
-import { CallerOrphanedResourcesError, CallerStorageLimitError, CallerStorageMissingError } from './caller-runtime-docker.js';
+import { CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageLimitError, CallerStorageMissingError } from './caller-runtime-docker.js';
 import { scopeDigest } from './caller-runtime-store.js';
 import { createHash } from 'node:crypto';
 export interface CallerWorker {
@@ -25,6 +25,7 @@ interface Entry {
   retained: boolean;
   tail: Promise<void>;
   worker?: CallerWorker;
+  dockerId?: string;
   contexts: Set<string>;
   recovered: boolean;
   quarantined: boolean;
@@ -226,7 +227,7 @@ export class CallerScopedBackend implements Backend {
       acquired = true;
       controller.signal.throwIfAborted();
       phase = 'backend-initialization';
-      if ((container.restarted || container.recreated) && entry.worker) {
+      if ((container.restarted || container.recreated || container.dockerId !== entry.dockerId) && entry.worker) {
         entry.worker.backend.stop?.();
         entry.worker.close();
         await within(entry.worker.settle(), 15000);
@@ -234,7 +235,10 @@ export class CallerScopedBackend implements Backend {
         entry.contexts.clear();
         entry.recovered = true;
       }
-      if (!entry.worker) entry.worker = await this.factory(container, controller.signal);
+      if (!entry.worker) {
+        entry.worker = await this.factory(container, controller.signal);
+        entry.dockerId = container.dockerId;
+      }
       controller.signal.throwIfAborted();
       if (entry.recovered && !entry.contexts.has(context)) {
         emit({
@@ -324,6 +328,12 @@ export class CallerScopedBackend implements Backend {
         entry.quarantined = true;
         this.fail(task, emit, 'runtime_orphaned_resources',
           'Unrecorded caller resources were not adopted. Stop the daemon and inspect the orphan Docker resources or restore their original state database.');
+        return;
+      }
+      if (error instanceof CallerAllocationIncompleteError) {
+        entry.quarantined = true;
+        this.fail(task, emit, 'runtime_allocation_incomplete',
+          'Initial caller allocation was interrupted; restore the original state/resources or explicitly remove the scope before retrying.');
         return;
       }
       if (error instanceof CallerStorageMissingError) {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DockerCallerRuntimePool, CALLER_TMPFS, CallerOrphanedResourcesError, CallerStorageMissingError, CallerStorageLimitError } from './caller-runtime-docker.js';
+import { DockerCallerRuntimePool, CALLER_TMPFS, CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageMissingError, CallerStorageLimitError } from './caller-runtime-docker.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { CallerRuntimeStore, scopeDigest } from './caller-runtime-store.js';
 import type { AsyncDockerRun } from './docker-command.js';
@@ -328,4 +328,32 @@ test('fresh scopes reject orphan resources without mutations or restart adoption
     }
     assert.ok(!calls.some(args => ['create', 'start', 'stop', 'rm', 'exec'].some(command => args.includes(command))));
   }
+});
+
+test('interrupted initial allocation with both volumes cannot silently create a container', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'caller-incomplete-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const config = CallerRuntimeConfig.parse({ image: `sha256:${'a'.repeat(64)}`, stateDirectory: directory });
+  const id = scopeDigest('agent', 'alice');
+  const calls: string[][] = [];
+  const pool: DockerCallerRuntimePool = new DockerCallerRuntimePool('claude', config, 'agent', async args => {
+    calls.push([...args]);
+    if (args[0] === 'image') return { exitCode: 0, stdout: '[{"Config":{}}]', stderr: '' };
+    if (args[0] === 'ps') return { exitCode: 0, stdout: '', stderr: '' };
+    if (args[0] === 'container') return { exitCode: 1, stdout: '', stderr: 'No such container' };
+    assert.deepEqual(args.slice(0, 2), ['volume', 'inspect']);
+    return { exitCode: 0, stderr: '', stdout: JSON.stringify([{ Driver: 'local', Options: {}, Labels: {
+      'vicoop.component': 'caller-runtime', 'vicoop.caller-namespace': pool.store.namespace,
+      'vicoop.scope': id, 'vicoop.kind': 'claude',
+    } }]) };
+  });
+  await pool.initialize();
+  await pool.store.reserve(id, 'claude', 'alice');
+  await pool.close();
+  await pool.initialize();
+  try {
+    await assert.rejects(pool.acquire(id, undefined, 'alice'), CallerAllocationIncompleteError);
+    assert.ok(!calls.some(args => ['create', 'start', 'exec'].includes(args[0])));
+    assert.equal(await pool.store.allocationComplete(id), false);
+  } finally { await pool.close(); }
 });

@@ -6,7 +6,7 @@ import {
 } from './caller-scoped-backend.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { scopeDigest } from './caller-runtime-store.js';
-import { CallerOrphanedResourcesError, CallerStorageMissingError, CallerStorageLimitError, type DockerCallerRuntimePool } from './caller-runtime-docker.js';
+import { CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageMissingError, CallerStorageLimitError, type DockerCallerRuntimePool } from './caller-runtime-docker.js';
 import type { Backend } from './backend.js';
 import { TRACEABILITY_EXTENSION_URI, type TaskAssignFrame, type UpFrame } from '@vicoop-bridge/protocol';
 
@@ -543,4 +543,31 @@ test('canceled waiters retain queue slots until the active predecessor settles',
   finish();
   await active;
   assert.equal((await f.run(task('alice', 'after', 'after'))).at(-1)?.type, 'task.complete');
+});
+
+test('same-name running replacement rebuilds worker and resets the conversation', async () => {
+  const f = fixture();
+  const acquire = f.pool.acquire.bind(f.pool);
+  let generation = 'original-container-id';
+  f.pool.acquire = async (...args) => ({ ...await acquire(...args), dockerId: generation });
+  await f.run();
+  generation = 'replacement-container-id';
+  const frames = await f.run();
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+  assert.match(JSON.stringify(frames), /conversationReset/);
+  assert.equal(f.workers.length, 2);
+  assert.doesNotMatch(JSON.stringify(await f.run()), /conversationReset/);
+  assert.equal(f.workers.length, 2);
+});
+
+test('incomplete allocation quarantines only its caller', async () => {
+  const f = fixture();
+  const acquire = f.pool.acquire.bind(f.pool);
+  f.pool.acquire = async (...args) => {
+    if (args[0] === scopeDigest('agent', 'alice')) { args[3]?.(); throw new CallerAllocationIncompleteError(); }
+    return acquire(...args);
+  };
+  assert.match(JSON.stringify(await f.run()), /runtime_allocation_incomplete/);
+  assert.match(JSON.stringify(await f.run()), /runtime_quarantined/);
+  assert.equal((await f.run(task('bob'))).at(-1)?.type, 'task.complete');
 });

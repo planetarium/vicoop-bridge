@@ -487,7 +487,7 @@ test('a paid agent without PUBLIC_URL advertises no price', () => {
 
 test('public caller runtime advertises required direct authentication', () => {
   const agent = buildAgentA2XServer(
-    fakeConn({ name: 'isolated', description: 'isolated fixture', version: '1', protocolVersion: '0.3.0' },
+    fakeConn({ name: 'isolated', description: 'isolated fixture', version: '1', protocolVersion: '0.3.0', capabilities: { extensions: [{ uri: TRACEABILITY_EXTENSION_URI }] } },
       { allowedCallers: [], protocolCapabilities: ['caller-runtime-v1', CALLER_CONTEXT_V2_CAPABILITY] }),
     new InMemoryTaskStore(), new Registry(),
     { publicUrl: 'https://bridge.example', deviceFlowEnabled: true },
@@ -497,4 +497,5 @@ test('public caller runtime advertises required direct authentication', () => {
   assert.deepEqual(card.security, [{ bearerAuth: [] }, { deviceFlow: [] }]);
   assert.ok(card.capabilities.extensions?.some((e) => e.uri === SIWE_BEARER_AUTH_EXTENSION_URI));
   assert.equal(card.capabilities.extensions?.some((e) => e.uri === OAUTH_FEDERATION_EXTENSION_URI), false);
+  assert.equal(card.capabilities.extensions?.some((e) => e.uri === TRACEABILITY_EXTENSION_URI), false);
 });

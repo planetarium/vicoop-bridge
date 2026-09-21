@@ -285,3 +285,17 @@ test('ownership conflict cannot close or modify the active store', async (t) => 
   await f.store.reserve(f.id, 'claude', 'alice');
   assert.deepEqual(await f.read(), f.record);
 });
+
+test('allocation completion survives restart and is forgotten with scope identity', async (t) => {
+  const f = await fixture(t);
+  await f.store.lock();
+  await f.store.reserve(f.id, 'claude', 'alice');
+  assert.equal(await f.store.allocationComplete(f.id), false);
+  await f.store.markAllocationComplete(f.id);
+  await f.store.unlock();
+  await f.store.lock();
+  assert.equal(await f.store.allocationComplete(f.id), true);
+  await f.store.forget(f.id);
+  await f.store.reserve(f.id, 'claude', 'alice');
+  assert.equal(await f.store.allocationComplete(f.id), false);
+});

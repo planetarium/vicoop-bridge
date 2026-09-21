@@ -292,6 +292,9 @@ export class CallerRuntimeStore {
     );
     for (const row of db.prepare('SELECT * FROM scopes').all())
       this.validateRecord(row);
+    // Additive v4 state: absence is deliberately not evidence of a completed
+    // allocation. Older records can establish it from a validated container.
+    db.exec('CREATE TABLE IF NOT EXISTS completed_allocations (id TEXT PRIMARY KEY NOT NULL)');
     if (migrating) await this.atomicWrite(manifestPath, expected);
     // Legacy JSON files remain as an inert migration backup, never read again.
   }
@@ -356,9 +359,22 @@ export class CallerRuntimeStore {
       throw error;
     }
   }
+  async allocationComplete(id: string): Promise<boolean> {
+    return !!this.db().prepare('SELECT id FROM completed_allocations WHERE id = ?').get(id);
+  }
+  async markAllocationComplete(id: string): Promise<void> {
+    this.validateRecord(this.db().prepare('SELECT * FROM scopes WHERE id = ?').get(id), id);
+    this.db().prepare('INSERT OR IGNORE INTO completed_allocations (id) VALUES (?)').run(id);
+  }
   async forget(id: string): Promise<void> {
     if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('invalid scope ID');
-    this.db().prepare('DELETE FROM scopes WHERE id = ?').run(id);
+    const db = this.db();
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.prepare('DELETE FROM completed_allocations WHERE id = ?').run(id);
+      db.prepare('DELETE FROM scopes WHERE id = ?').run(id);
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
     // A migrated JSON backup also contains user identity; delete it with the scope.
     await rm(join(this.directory, `${id}.json`), { force: true });
   }
