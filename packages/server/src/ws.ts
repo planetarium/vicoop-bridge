@@ -353,9 +353,9 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
               type: 'hello.ack',
               protocolCapabilities: [
                 TASK_REPLAY_CAPABILITY,
-                ...(frame.protocolCapabilities.includes(CALLER_CONTEXT_V2_CAPABILITY) ? [CALLER_CONTEXT_V2_CAPABILITY] : []),
+                ...(frame.protocolCapabilities?.includes(CALLER_CONTEXT_V2_CAPABILITY) ? [CALLER_CONTEXT_V2_CAPABILITY] : []),
                 ...(supportsExecutionScopeV1(frame.protocolCapabilities) ? [EXECUTION_SCOPE_V1_CAPABILITY,
-                  ...(frame.protocolCapabilities.includes(CALLER_RUNTIME_V1_CAPABILITY) ? [CALLER_RUNTIME_V1_CAPABILITY] : [])] : []),
+                  ...(frame.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) ? [CALLER_RUNTIME_V1_CAPABILITY] : [])] : []),
               ],
               disconnectGraceMs: opts.registry.getDisconnectGraceMs(),
               maxFrameBytes: MAX_INGRESS_BYTES,

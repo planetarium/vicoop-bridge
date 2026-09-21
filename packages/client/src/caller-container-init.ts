@@ -111,8 +111,12 @@ export async function runCallerContainerInit(
       'container init preserves the existing stateDirectory; moving caller state requires a separate migration',
     );
   const otherKind = opts.kind === 'claude' ? 'codex' : 'claude';
-  const other = object.parse(object.parse(backends[otherKind] ?? {}).caller_runtime ?? {});
-  if (typeof other.stateDirectory === 'string' && isAbsolute(other.stateDirectory) &&
+  const otherBackend = object.parse(backends[otherKind] ?? {});
+  const other = object.parse(otherBackend.caller_runtime ?? {});
+  if (otherBackend.caller_runtime !== undefined &&
+      (typeof other.stateDirectory !== 'string' || !isAbsolute(other.stateDirectory)))
+    throw new Error(`${otherKind} caller_runtime.stateDirectory must be an absolute path; restore its original absolute location before initializing another backend`);
+  if (typeof other.stateDirectory === 'string' &&
       await canonicalStatePath(other.stateDirectory) === await canonicalStatePath(stateDirectory))
     throw new Error(`stateDirectory is already configured for ${otherKind}; each backend requires a distinct state directory`);
   // Validate limits before Docker/build work; the real immutable ID is filled below.

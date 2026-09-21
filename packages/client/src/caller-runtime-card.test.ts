@@ -14,6 +14,7 @@ test('container cards advertise supported inline inputs without changing host ca
     assert.ok(!isolated.defaultInputModes?.includes('application/json'));
     assert.equal(isolated.defaultInputModes?.includes('application/pdf'), kind === 'claude');
     assert.ok(isolated.defaultInputModes?.includes('text/plain'));
+    assert.deepEqual(isolated.defaultOutputModes, ['text/plain']);
     assert.equal(isolated.capabilities?.extensions?.some(e => e.uri === OPENAI_COMPAT_EXTENSION_URI), false);
     assert.doesNotMatch(isolated.description!, /persistent stdio|JSON data/);
     for (const skill of isolated.skills!) assert.doesNotMatch(skill.description!, /data.*parts|serialized/);
@@ -22,10 +23,11 @@ test('container cards advertise supported inline inputs without changing host ca
 });
 
 test('custom cards retain service descriptions but cannot advertise only unsupported input modes', () => {
-  const custom = AgentCard.parse({ name: 'service', version: '1', description: 'Weather service', defaultInputModes: ['text/plain', 'application/json'] });
+  const custom = AgentCard.parse({ name: 'service', version: '1', description: 'Weather service', defaultInputModes: ['text/plain', 'application/json'], defaultOutputModes: ['image/png'], skills: [{ id: 'files', name: 'files', description: 'service', tags: [], outputModes: ['application/pdf'] }] });
   const card = callerRuntimeCard(custom, 'codex', true);
   assert.match(card.description!, /Weather service/);
   assert.match(card.description!, /JSON data parts and URI files are unsupported/);
   assert.deepEqual(card.defaultInputModes, ['text/plain']);
+  assert.deepEqual(card.defaultOutputModes, ['text/plain']);
   assert.throws(() => callerRuntimeCard({ ...custom, defaultInputModes: ['application/json'] }, 'codex', true), /must advertise supported/);
 });

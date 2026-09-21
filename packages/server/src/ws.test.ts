@@ -1396,3 +1396,31 @@ test('execution scope acknowledgement requires the full capability set', async (
     }
   }
 });
+
+
+test('legacy hello without protocol capabilities registers and processes task frames', async () => {
+  const server = createServer();
+  const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+  try {
+    await once(ws, 'open');
+    ws.send(encodeFrame({ type: 'hello', version: PROTOCOL_VERSION,
+      agentId: 'agent-1', token: 'token',
+      agentCard: { name: 'legacy', version: '0.0.0', protocolVersion: '0.3.0' },
+    }));
+    await waitForAgent(registry, 'agent-1');
+    assert.equal(ws.readyState, WebSocket.OPEN);
+    const sink = makeSink();
+    registry.bindTask({ agentId: 'agent-1', taskId: 'legacy-task', contextId: 'legacy-context', sink });
+    ws.send(encodeFrame({ type: 'task.fail', taskId: 'legacy-task',
+      error: { code: 'test', message: 'legacy transport works' },
+    }));
+    await withTimeout(sink.finished, 5000, 'legacy task terminal');
+    assert.equal(sink.statuses[0]?.status.state, 'failed');
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});

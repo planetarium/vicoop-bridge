@@ -448,3 +448,17 @@ for (const alias of [false, true]) {
     assert.deepEqual(await f.read(), config);
   });
 }
+
+for (const value of ['relative/state', '', 42, null, undefined]) {
+  test(`init rejects invalid sibling state path ${JSON.stringify(value)} before side effects`, async (t) => {
+    const f = await fixture(t);
+    const config = await f.read();
+    config.backends.codex.caller_runtime = { image, stateDirectory: value };
+    await writeFile(f.path, JSON.stringify(config));
+    const before = await readFile(f.path, 'utf8');
+    await assert.rejects(runCallerContainerInit(f.options), /codex caller_runtime.stateDirectory must be an absolute path/);
+    assert.equal(f.auth(), 0);
+    assert.equal(f.calls.length, 0);
+    assert.equal(await readFile(f.path, 'utf8'), before);
+  });
+}

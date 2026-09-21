@@ -35,3 +35,5 @@ Validate complete network membership during removal while accepting a stopped co
 Reject cross-backend state-directory aliases during initialization, report conversation recovery per context, preserve failed caller-daemon shutdown records in `stop`, and document lazy Codex catalog loading.
 
 Share one bounded shutdown operation across fatal disconnects and signals, removing the detached pidfile only after confirmed cleanup and retaining fatal exit status.
+
+Reject invalid sibling-backend state paths before initialization side effects and advertise text-only caller outputs.
