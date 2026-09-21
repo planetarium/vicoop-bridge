@@ -166,7 +166,7 @@ test('start: failIfExists rejects an existing container during init', async () =
 
   await assert.rejects(
     rc.start(),
-    /runtime container 'vicoop-runtime-work' already exists.*container rm work/s,
+    /runtime container 'vicoop-runtime-work' already exists.*container legacy rm work/s,
   );
   assert.equal(calls.filter((c) => c[0] === 'start').length, 0);
   assert.equal(calls.filter((c) => c[0] === 'create').length, 0);
@@ -189,7 +189,7 @@ test('start: failIfExists rejects existing volumes before creating a container',
 
   await assert.rejects(
     rc.start(),
-    /runtime volumes already exist: vicoop-sessions-codex.*container rm codex/s,
+    /runtime volumes already exist: vicoop-sessions-codex.*container legacy rm codex/s,
   );
   assert.equal(calls.filter((c) => c[0] === 'image').length, 0);
   assert.equal(calls.filter((c) => c[0] === 'create').length, 0);

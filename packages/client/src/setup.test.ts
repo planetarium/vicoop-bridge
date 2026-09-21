@@ -1269,8 +1269,7 @@ test('agent register --backend codex with --cwd/--codex-sandbox/--runtime writes
     backend: 'codex',
     cwd: '/tmp/wks',
     codexSandbox: 'workspace-write',
-    runtime: 'container',
-    runtimeName: 'codex-1',
+    runtime: 'host',
   }));
 
   assert.equal(code, 0);
@@ -1279,8 +1278,7 @@ test('agent register --backend codex with --cwd/--codex-sandbox/--runtime writes
   assert.deepEqual(config?.backends?.codex, {
     cwd: '/tmp/wks',
     sandbox_mode: 'workspace-write',
-    runtime: 'container',
-    runtime_name: 'codex-1',
+    runtime: 'host',
   });
 });
 
@@ -1462,4 +1460,13 @@ test('legacy setup prints a stderr deprecation warning pointing at agent registe
   // that parse stderr) — only the new path uses agent-first labels.
   assert.match(fix.stderr(), /client_id\s+reg-uuid-1/);
   assert.match(fix.stderr(), /The CLIENT_TOKEN is one-time/);
+});
+
+
+test('agent register rejects shared-container cwd/name configuration', async (t) => {
+  installAgentRegisterFixture(t);
+  const code = await runAgentRegister(agentRegisterArgs({
+    agentId: 'isolated', backend: 'codex', runtime: 'container', runtimeName: 'shared',
+  }));
+  assert.equal(code, 1);
 });

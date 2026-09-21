@@ -26,6 +26,7 @@
     "@optique/run": "1.0.2",
     "@sentry/bun": "^10.57.0",
     "@vicoop-bridge/protocol": "workspace:*",
+    "better-sqlite3": "12.8.0",
     "is-inside-container": "^1.0.0",
     "semver": "^7.8.0",
     "ws": "^8.18.0",

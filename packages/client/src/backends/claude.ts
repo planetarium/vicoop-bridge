@@ -40,6 +40,7 @@ import {
   FetchUriError,
   fetchUriToBytes,
   INPUT_FILE_MAX_BYTES,
+  decodedBase64Size,
   INPUT_IMAGE_MIME,
   type FetchUriPolicy,
 } from './fetch-uri-file.js';
@@ -881,17 +882,6 @@ function errorMessage(e: unknown): string {
   }
 }
 
-function decodedBase64Size(b64: string): number {
-  if (b64.length === 0) return 0;
-  let pad = 0;
-  if (b64.endsWith('==')) pad = 2;
-  else if (b64.endsWith('=')) pad = 1;
-  // Clamp to >= 0 so a malformed input like a bare "=" or "==" (which
-  // would otherwise compute to -1) reports zero, not a negative size.
-  // The size-cap callers only need a non-negative upper bound; any deeper
-  // base64 validation belongs to whoever decodes the bytes.
-  return Math.max(0, Math.floor((b64.length * 3) / 4) - pad);
-}
 
 function sha256OfBase64(b64: string): string {
   return createHash('sha256').update(Buffer.from(b64, 'base64')).digest('hex');

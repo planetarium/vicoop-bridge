@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -544,10 +544,79 @@ test('readConfig/writeConfig default to resolveConfigDir() when no path passed',
 });
 
 
-test('reserved caller-container runtime survives normalization so startup can reject it', (t) => {
+test('container runtime survives normalization', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-isolation-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const path = join(dir, 'config.json');
-  writeFileSync(path, JSON.stringify({ backends: { claude: { runtime: 'caller-container' } } }));
-  assert.equal(readConfig(path)?.backends?.claude?.runtime, 'caller-container');
+  writeFileSync(path, JSON.stringify({ backends: { claude: { runtime: 'container' } } }));
+  assert.equal(readConfig(path)?.backends?.claude?.runtime, 'container');
+});
+
+
+test('caller runtime configuration is retained and invalid limits fail closed', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'caller-config-'));
+  t.after(() => rmSync(dir, {recursive:true,force:true}));
+  const path = join(dir, 'config.json');
+  const caller_runtime = {image:`sha256:${'a'.repeat(64)}`,stateDirectory:join(dir,'state')};
+  for (const kind of ['claude','codex']) {
+    writeFileSync(path,JSON.stringify({backends:{[kind]:{runtime:'container',caller_runtime}}}));
+    assert.equal((readConfig(path)?.backends as any)[kind].caller_runtime.image,caller_runtime.image);
+    writeFileSync(path,JSON.stringify({backends:{[kind]:{runtime:'container',caller_runtime:{...caller_runtime,maxScopes:0}}}}));
+    assert.throws(() => readConfig(path));
+  }
+});
+
+
+test('retired caller-container config fails with a migration hint instead of selecting host', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'retired-runtime-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  for (const kind of ['claude', 'codex']) {
+    writeFileSync(path, JSON.stringify({ backends: { [kind]: { runtime: 'caller-container' } } }));
+    assert.throws(() => readConfig(path), /renamed to container/);
+  }
+});
+
+
+test('caller_runtime survives without a config runtime selector for CLI overrides', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'caller-config-override-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  const caller_runtime = { image: `sha256:${'a'.repeat(64)}`, stateDirectory: join(dir, 'state') };
+  for (const kind of ['claude', 'codex'] as const) {
+    writeFileSync(path, JSON.stringify({ backends: { [kind]: { caller_runtime } } }));
+    assert.equal(readConfig(path)?.backends?.[kind]?.caller_runtime?.image, caller_runtime.image);
+    assert.equal(readConfig(path)?.backends?.[kind]?.runtime, undefined);
+  }
+});
+
+test('explicit invalid runtime values never fall back to host execution', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'caller-invalid-mode-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  for (const kind of ['claude', 'codex']) {
+    for (const runtime of ['contianer', '', null, 1, false, {}]) {
+      writeFileSync(path, JSON.stringify({ backends: { [kind]: { runtime } } }));
+      assert.throws(() => readConfig(path), /runtime must be host or container/);
+    }
+  }
+});
+
+
+test('config writers respect exclusive ownership and compare snapshots before committing', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'config-writer-lock-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  writeConfig(path, { backend: 'claude' });
+  const original = readFileSync(path, 'utf8');
+  mkdirSync(`${path}.lock`);
+  assert.throws(() => writeConfig(path, { backend: 'codex' }), /config write is locked/);
+  assert.equal(readFileSync(path, 'utf8'), original);
+  rmSync(`${path}.lock`, { recursive: true });
+  writeConfig(path, { backend: 'codex' });
+  assert.throws(() => writeConfig(path, { backend: 'claude' }, original), /config changed/);
+  assert.equal(readConfig(path)?.backend, 'codex');
+  assert.equal(existsSync(`${path}.lock`), false);
+  writeConfig(path, { backend: 'claude' }, readFileSync(path, 'utf8'));
+  assert.equal(readConfig(path)?.backend, 'claude');
 });

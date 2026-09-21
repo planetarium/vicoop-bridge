@@ -24,6 +24,7 @@ import { readTaskUsage } from './x402/usage.js';
 import type { Sql } from './db.js';
 import {
   TASK_REPLAY_CAPABILITY,
+  CALLER_RUNTIME_V1_CAPABILITY,
   type CallerAttestationV2,
   type Part as WirePart,
 } from '@vicoop-bridge/protocol';
@@ -403,6 +404,27 @@ export class WSForwardingExecutor extends AgentExecutor {
     if (rawMetadata) delete rawMetadata[IDENTITY_VC_PRESENTED_METADATA_KEY];
     const forwardMetadata = stripInternalMetadata(rawMetadata);
     const requestedExtensions = message.extensions;
+
+    const capabilities = this.registry.getAgent(this.agentId)?.protocolCapabilities;
+    if (capabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) && !resolveDirectExecutionScope({
+      agentId: this.agentId, principalId, actorId, authorizationKey, authorizationProfile, capabilities,
+    })) {
+      const status = {
+        state: TaskState.FAILED,
+        timestamp: new Date().toISOString(),
+        message: { messageId: randomUUID(), role: 'agent' as const,
+          parts: [{ text: 'container runtime requires a directly authenticated principal; delegation is unsupported' }], taskId, contextId },
+      };
+      task.status = status;
+      task.history = appendHistoryMessage(appendHistoryMessage(task.history ?? [], message), status.message);
+      try {
+        await this.taskStore.updateTask(taskId, { status, history: task.history });
+      } catch (err) {
+        logEvent('task_persist_error', { taskId, error: String(err) });
+      }
+      yield { taskId, contextId, final: true, status };
+      return;
+    }
 
     // x402 payment gate. Runs before the task is bound or forwarded, so an
     // unpaid call never reaches the connected agent and never consumes its
