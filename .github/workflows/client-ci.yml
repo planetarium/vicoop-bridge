@@ -63,9 +63,6 @@ jobs:
       - name: Test client
         run: pnpm --filter @vicoop-bridge/client test
 
-      - name: Test storage manager recovery
-        run: python3 -B -m unittest discover -s packages/client/container/storage -p 'test_*.py'
-
       - name: Verify embedded caller image recipe is current
         run: |
           node packages/client/scripts/generate-caller-image.mjs
@@ -73,7 +70,7 @@ jobs:
 
       - name: Test Bun caller storage and standalone SQLite
         run: |
-          bun test packages/client/src/caller-runtime-store.test.ts packages/client/src/caller-container-init.test.ts
+          bun test packages/client/src/caller-runtime-store.test.ts packages/client/src/caller-container-init.test.ts packages/client/src/caller-storage-manager.test.ts
           bun build --compile packages/client/scripts/caller-store-smoke.ts --outfile /tmp/caller-store-smoke
           /tmp/caller-store-smoke
 

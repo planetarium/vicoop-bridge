@@ -28,13 +28,15 @@ Images, logs, other pools, and unrelated host processes remain outside this budg
 
 ## Set up a new state directory
 
-Build the trusted helper from the repository, using the same Docker context as
+The helper is TypeScript compiled into a standalone Linux executable with Bun.
+Its final image contains the executable and standard Linux storage tools.
+Build it from the repository root, using the same Docker context as
 the client. The helper requires a rootful Linux Docker engine, loop devices,
 ext4, privileged containers, and volume subpath support. This path was exercised
 on macOS Docker Desktop; native Linux and Colima still need release validation.
 
 ```sh
-docker build -t vicoop-caller-storage packages/client/container/storage
+docker build -t vicoop-caller-storage -f packages/client/container/storage/Dockerfile .
 docker image inspect --format '{{.Id}}' vicoop-caller-storage
 docker volume create --label vicoop.component=caller-storage-pool vicoop-caller-storage
 ```
