@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/client-ci.yml'
       - 'packages/client/**'
+      - 'container/backends/claude.sh'
       - 'packages/protocol/**'
       - 'scripts/**'
       - 'install.sh'
@@ -15,6 +16,7 @@ on:
     paths:
       - '.github/workflows/client-ci.yml'
       - 'packages/client/**'
+      - 'container/backends/claude.sh'
       - 'packages/protocol/**'
       - 'scripts/**'
       - 'install.sh'
@@ -60,6 +62,17 @@ jobs:
 
       - name: Test client
         run: pnpm --filter @vicoop-bridge/client test
+
+      - name: Verify embedded caller image recipe is current
+        run: |
+          node packages/client/scripts/generate-caller-image.mjs
+          git diff --exit-code -- packages/client/src/caller-image-assets.ts
+
+      - name: Test Bun caller storage and standalone SQLite
+        run: |
+          bun test packages/client/src/caller-runtime-store.test.ts packages/client/src/caller-container-init.test.ts packages/client/src/caller-storage-manager.test.ts
+          bun build --compile packages/client/scripts/caller-store-smoke.ts --outfile /tmp/caller-store-smoke
+          /tmp/caller-store-smoke
 
       - name: Build client
         run: pnpm --filter @vicoop-bridge/client build

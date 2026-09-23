@@ -1,23 +1,10 @@
+import { callerContainerCommands } from './caller-runtime-admin.js';
 import { assertBrokerContainer } from './execution-runtime-boundary.js';
-import { createCodexCredentialReader, CODEX_BROKER_VERSION_RANGE, isSupportedCodexBrokerVersion } from './codex-auth-broker.js';
 import { CLAUDE_SESSION_MIGRATION, CODEX_SESSION_MIGRATION } from './claude-session-migration.js';
-import { createClaudeCredentialReader } from './claude-auth-broker.js';
-// `vicoop-client container init <kind>` — operator one-shot
-// bootstrap for the external-runtime profile (#249 PR C).
-//
-// Boots the per-backend runtime container, runs the shared
-// install-backend.sh recipe inside it, sanity-checks the resulting
-// binary against this client's supportedRange manifest, and
-// uses host-broker authentication for Claude and Codex without copying logins.
-//
-// Companion to RuntimeContainer (lifecycle) + SpawnAdapter
-// (per-task spawn). RuntimeContainer is the unit of state that
-// survives across daemon restarts; this command is what makes it
-// usable in the first place.
-
-import { resolve } from 'node:path';
-import { execSync, spawn } from 'node:child_process';
-import semver from 'semver';
+import { execSync } from 'node:child_process';
+import { runCallerContainerInit } from './caller-container-init.js';
+export { runCallerContainerInit as runContainerInit } from './caller-container-init.js';
+export type { CallerContainerInitOptions as ContainerInitOptions } from './caller-container-init.js';
 import { longestMatch, object } from '@optique/core/constructs';
 import { optional, withDefault } from '@optique/core/modifiers';
 import { argument, command, constant, flag, option } from '@optique/core/primitives';
@@ -29,8 +16,6 @@ import {
   containerName,
   credsVolumeName,
   defaultDockerRun,
-  RuntimeContainer,
-  DEFAULT_RUNTIME_IMAGE,
   RUNTIME_COMPONENT_LABEL,
   RUNTIME_MANAGED_BY_LABEL,
   runtimeInstanceName,
@@ -38,27 +23,8 @@ import {
   validateRuntimeName,
   type DockerRun,
 } from './runtime-container.js';
-import { BACKENDS_MANIFEST, type InstallableBackendKind } from './backends-manifest.js';
-import { createLogger, type Logger } from './logger.js';
-
-export interface ContainerInitOptions {
-  kind: InstallableBackendKind;
-  runtimeName?: string;
-  // Accepted for CLI compatibility; both backends keep credentials on the host.
-  fromHost: boolean;
-  reuseState?: boolean;
-  workspaceDir?: string;
-  // Image override mirrors the daemon path (cli.ts:resolveRuntime).
-  // Precedence is applied inside runContainerInit:
-  //   opts.image > VICOOP_RUNTIME_IMAGE env > DEFAULT_RUNTIME_IMAGE.
-  // Tests pass an explicit value here to bypass env entirely.
-  image?: string;
-  // Override the bridge URL forwarded into the container's
-  // init-firewall.sh. The CLI defaults this to whatever the daemon
-  // would use; included as a parameter so tests can override.
-  bridgeUrl?: string;
-  logger?: Logger;
-}
+import { type InstallableBackendKind } from './backends-manifest.js';
+import { type Logger } from './logger.js';
 
 type RuntimeContainerState = 'running' | 'stopped' | 'missing';
 
@@ -94,97 +60,6 @@ export interface RuntimeRemoveResult {
   volumes: Array<{ name: string; removed: boolean; skipped: boolean }>;
 }
 
-// Returns the process exit code the CLI should use. Throws only on
-// programmer-error (e.g. unsupported kind reaching this function).
-// Operational failures (docker unreachable, install recipe non-zero,
-// compat mismatch) are logged and surface as a non-zero return so
-// the CLI can `process.exit(code)` uniformly.
-export async function runContainerInit(opts: ContainerInitOptions): Promise<number> {
-  const log = opts.logger ?? createLogger();
-
-  const runtime = new RuntimeContainer({
-    backendKind: opts.kind,
-    runtimeName: opts.runtimeName,
-    image: opts.image ?? process.env.VICOOP_RUNTIME_IMAGE ?? DEFAULT_RUNTIME_IMAGE,
-    bridgeUrl: opts.bridgeUrl,
-    createIfMissing: true,
-    failIfExists: true,
-    reuseState: opts.reuseState,
-    workspaceDir: opts.workspaceDir ? resolve(opts.workspaceDir) : undefined,
-    logger: opts.logger,
-  });
-
-  try {
-    if (opts.kind === 'claude') await createClaudeCredentialReader()();
-    if (opts.kind === 'codex') await createCodexCredentialReader()();
-    await runtime.start();
-
-    const runtimeName = runtimeInstanceName(opts.kind, opts.runtimeName);
-    const containerName = containerNameFor(opts.kind, runtimeName);
-
-    // (1) chown the per-kind sub-trees so subsequent install-backend
-    // (running as the image's `node` user) can mkdir into them.
-    // Docker creates named-volume mount points root-owned even when
-    // the image pre-creates them with chown — the volume's empty
-    // state takes over at mount time. This is the documented
-    // workaround.
-    await dockerExecStream(containerName, {
-      cmd: ['/bin/chown', '-R', 'node:node', `/data/agents/${opts.kind}`, `/data/creds/${opts.kind}`, `/data/sessions/${opts.kind}`],
-      user: '0',
-      label: 'chown',
-      log,
-    });
-
-    if (opts.reuseState) {
-      await migrateBrokerSessions(opts.kind, runtimeName, opts.image ?? process.env.VICOOP_RUNTIME_IMAGE ?? DEFAULT_RUNTIME_IMAGE, log);
-    }
-
-    // (2) install the agent CLI into /data/agents/<kind>/ via the
-    // shared shell recipe baked into the runtime image. node user;
-    // the binary lands in /data/agents/<kind>/bin/<kind>.
-    await dockerExecStream(containerName, {
-      cmd: ['/usr/local/lib/vicoop-bridge/install-backend.sh', opts.kind],
-      label: 'install',
-      log,
-    });
-
-    // (3) compat check — probe the installed binary's version and
-    // compare it against the manifest. We fail loudly here rather
-    // than at first-task-time so the operator sees the mismatch
-    // (or the broken install) before pointing a real bridge at it.
-    // A null probe means install-backend.sh "succeeded" but didn't
-    // leave a runnable binary at the expected path, or the binary
-    // doesn't honor --version — both are install failures, not
-    // skippable warnings.
-    const installed = await probeBackendVersion(containerName, opts.kind);
-    if (!installed) {
-      log.error(
-        `installed ${opts.kind} did not produce a parseable --version at /data/agents/${opts.kind}/bin/${opts.kind}. ` +
-          `The install recipe likely failed silently; rerun \`vicoop-client container init ${opts.kind} --name ${runtimeName}\` and inspect the [install] output.`,
-      );
-      return 1;
-    }
-    const supportedRange = opts.kind==='codex' ? CODEX_BROKER_VERSION_RANGE : BACKENDS_MANIFEST[opts.kind].supportedRange;
-    if (!(opts.kind === 'codex' ? isSupportedCodexBrokerVersion(installed) : semver.satisfies(installed, supportedRange, {includePrerelease: true}))) {
-      log.error(
-        `installed ${opts.kind} ${installed} is outside this client's supportedRange ${supportedRange}`,
-      );
-      return 1;
-    }
-    log.info(`compat check: ${opts.kind} ${installed} satisfies ${supportedRange}`);
-
-    log.info(`${opts.kind} uses host authentication through the built-in broker; no credentials were copied into the runtime.`);
-
-    log.info(`runtime container for ${opts.kind} initialized. start daemon with:`);
-    log.info(
-      `    vicoop-client start --backend ${opts.kind} --runtime container --runtime-name ${runtimeName}`,
-    );
-    return 0;
-  } finally {
-    await runtime.stop();
-  }
-}
-
 // Credentials remain in their original volume. A restricted, networkless
 // maintenance helper copies selected session records into the new config dir.
 export async function migrateBrokerSessions(kind:InstallableBackendKind, runtimeName: string, image: string, log: Logger): Promise<void> {
@@ -199,48 +74,6 @@ export async function migrateBrokerSessions(kind:InstallableBackendKind, runtime
   log.info('Legacy conversation records copied where absent; credentials and settings remain detached.');
 }
 
-// Run `docker exec [--user U] <container> <cmd...>` with stdio
-// inherited so the operator sees install-backend's npm/native-binary
-// download chatter in real time. Throws on non-zero exit.
-//
-// History: an earlier draft used `runtime.exec()` + dockerode's
-// hijacked stream + an end/close event wait. That worked under tsx
-// but the bun-compiled binary never observed stream 'end' on
-// docker's hijacked socket — the await hung forever and bun
-// exited 0 with no diagnostic when the microtask queue drained.
-// Shelling out to the docker CLI keeps the boot-strap path
-// portable across runtimes; the dockerode-driven lifecycle
-// (start/stop/pull/volume) stays on the programmatic path because
-// those calls *do* work cleanly under bun.
-async function dockerExecStream(
-  containerName: string,
-  opts: {
-    cmd: readonly string[];
-    user?: string;
-    label: string;
-    log: Logger;
-  },
-): Promise<void> {
-  opts.log.info(`[${opts.label}] ${opts.cmd.join(' ')}`);
-  const args = ['exec'];
-  if (opts.user) args.push('--user', opts.user);
-  args.push(containerName, ...opts.cmd);
-  await runDockerCli(args);
-}
-
-function runDockerCli(args: string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('docker', args, {
-      stdio: ['ignore', 'inherit', 'inherit'],
-    });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`docker ${args[0]} exited with code ${code}`));
-    });
-  });
-}
-
 // Quietly run `<kind> --version` and extract a semver-shaped token.
 // claude prints `2.1.146 (Claude Code)` (semver leads), codex prints
 // `codex-cli 0.132.0` (semver is the second token). A naive first-
@@ -249,8 +82,7 @@ function runDockerCli(args: string[]): Promise<void> {
 // anywhere in the line. Same convention container/backends/*.sh
 // uses for its own backend_version function.
 //
-// Uses docker CLI (not dockerode) for the same bun-compatibility
-// reason as dockerExecStream — see its history comment.
+// Retained for legacy runtime inspection.
 export async function probeBackendVersion(
   containerName: string,
   kind: InstallableBackendKind,
@@ -650,40 +482,31 @@ const containerInitSubCmd = command(
   'init',
   object({
     action: constant('container-init' as const),
-    kind: argument(choice([...BACKEND_KINDS], { metavar: 'KIND' }), {
-      description: message`Backend agent CLI to install into the runtime container. One of: \`claude\`, \`codex\`.`,
-    }),
-    name: optional(
-      option('--name', string({ metavar: 'NAME' }), {
-        description: message`Runtime instance name. Omit to use the backend kind as the generated name.`,
-      }),
-    ),
-    workspaceDir: optional(option('--workspace', string({ metavar: 'PATH' }), {
-      description: message`Host directory to bind at /workspace. Supply the original path when migrating a runtime with a workspace mount.`,
+    kind: argument(choice([...BACKEND_KINDS], { metavar: 'KIND' })),
+    config: optional(option('--config', string({ metavar: 'PATH' }), {
+      description: message`Registered agent config to update; defaults to the canonical config.json.`,
     })),
-    reuseState: withDefault(flag('--reuse-state', {
-      description: message`Reuse existing agent/session volumes after removing the old container with --preserve-volumes. Credential volumes remain detached.`,
+    image: optional(option('--image', string({ metavar: 'IMAGE' }), {
+      description: message`Backend-installed image tag or digest. Pull if missing, validate and save its immutable image ID. Omit to build the bundled image or reuse the configured image.`,
+    })),
+    stateDirectory: optional(option('--state-directory', string({ metavar: 'PATH' }), {
+      description: message`Private caller state directory. Defaults to an agent/backend-specific path beside config.json; existing paths are preserved.`,
+    })),
+    rebuild: withDefault(flag('--rebuild', {
+      description: message`Build the bundled image again instead of reusing the configured image.`,
     }), false),
-    fromHost: withDefault(
-      flag('--from-host', {
-        description: message`Claude and Codex use host authentication without copying credentials. Accepted for compatibility.`,
-      }),
-      false,
-    ),
-    bridgeUrl: optional(
-      option('--bridge', string({ metavar: 'WS_URL' }), {
-        description: message`Bridge WS URL forwarded into the runtime container's init-firewall.sh allowlist. Defaults to the daemon's default.`,
-      }),
-    ),
-    image: optional(
-      option('--image', string({ metavar: 'IMAGE' }), {
-        description: message`Override the runtime image. Same precedence as VICOOP_RUNTIME_IMAGE.`,
-      }),
-    ),
+    fromHost: withDefault(flag('--from-host', {
+      description: message`Accepted for compatibility. Authentication always stays on the host.`,
+    }), false),
+    // Parse retired options to report a useful migration error rather than silently ignore them.
+    name: optional(option('--name', string(), { hidden: 'help' })),
+    workspaceDir: optional(option('--workspace', string(), { hidden: 'help' })),
+    reuseState: withDefault(flag('--reuse-state', { hidden: 'help' }), false),
+    bridgeUrl: optional(option('--bridge', string(), { hidden: 'help' })),
   }),
   {
-    brief: message`Bootstrap a per-backend runtime container.`,
-    description: message`One-shot setup for the container-runtime profile: creates \`vicoop-runtime-<name>\`, where --name defaults to the backend kind, fails if that runtime already exists, runs install-backend.sh inside it, verifies the installed CLI version against this client's supportedRange, and uses the host authentication broker for Claude and Codex. --from-host is accepted without copying credentials. After this, launch the daemon with \`vicoop-client start --backend <kind> --runtime container --runtime-name <name>\`.`,
+    brief: message`Prepare per-caller container execution and save agent configuration.`,
+    description: message`Checks host authentication, builds the bundled backend image (no repository checkout needed) or validates --image, initializes private SQLite state and saves runtime settings in the registered agent config. Existing settings and credentials are preserved; legacy cwd/runtime_name are removed after successful validation. Caller containers are allocated on their first request.`,
   },
 );
 
@@ -743,11 +566,16 @@ const containerRemoveSubCmd = longestMatch(
 
 export const containerCmd = command(
   'container',
-  longestMatch(containerInitSubCmd, containerListSubCmd, containerRemoveSubCmd, containerValidateSubCmd),
+  longestMatch(
+    containerInitSubCmd,
+    command('legacy', longestMatch(containerListSubCmd, containerRemoveSubCmd, containerValidateSubCmd), {
+      brief: message`Manage legacy shared per-backend containers only.`,
+    }),
+    callerContainerCommands,
+  ),
   {
-    brief: message`Manage per-backend runtime containers.`,
-    description: message`Subcommands: \`validate\` (check authentication isolation without starting), \`init\` (boot \`vicoop-runtime-<name>\`, install the agent CLI, validate host authentication), \`list\` (show managed runtime container and volume state), \`remove\` (remove a runtime container and volumes by name). Pairs with the daemon flag \`--runtime container\` (active backend selected via \`--backend\`).`,
-    hidden: 'usage',
+    brief: message`Initialize, inspect and manage per-caller containers.`,
+    description: message`init prepares the image and configuration; list/validate/recreate/remove manage caller resources while the daemon is stopped. --config defaults to the canonical config.json. Legacy shared-container tools are under container legacy.`,
   },
 );
 
@@ -761,14 +589,14 @@ export type ContainerRemoveArgs = Extract<ContainerCliArgs, { action: 'container
 // its dispatcher are obviously co-located.
 export async function runContainerInitCli(args: ContainerInitArgs): Promise<number> {
   try {
-    return await runContainerInit({
+    if (args.name !== undefined || args.workspaceDir !== undefined || args.reuseState || args.bridgeUrl !== undefined)
+      throw new Error('container init now prepares per-caller execution; --name/--workspace/--reuse-state/--bridge are retired. Use --config, --image and --state-directory instead.');
+    return await runCallerContainerInit({
       kind: args.kind,
-      runtimeName: args.name,
-      fromHost: args.fromHost,
-      reuseState: args.reuseState,
-      workspaceDir: args.workspaceDir,
-      ...(args.image ? { image: args.image } : {}),
-      ...(args.bridgeUrl ? { bridgeUrl: args.bridgeUrl } : {}),
+      configPath: args.config,
+      stateDirectory: args.stateDirectory,
+      image: args.image,
+      rebuild: args.rebuild,
     });
   } catch (err) {
     console.error(`container init failed: ${(err as Error).message}`);

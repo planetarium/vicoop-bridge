@@ -92,10 +92,10 @@ export const agentRegisterCmd = command(
       description: message`Working directory for the spawned backend process. Only valid with --backend claude or --backend codex.`,
     })),
     runtime: optional(option('--runtime', choice(['host', 'container']), {
-      description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` runs inside a vicoop-runtime container. Only valid with --backend claude or --backend codex.`,
+      description: message`Where to run the active backend. \`host\` (default) spawns on the bridge-client host; \`container\` creates a dedicated container per authenticated caller; run vicoop-client container init claude|codex after registration before starting. Only valid with --backend claude or --backend codex.`,
     })),
     runtimeName: optional(option('--runtime-name', string({ metavar: 'NAME' }), {
-      description: message`Runtime container instance name. Only valid with --backend claude or --backend codex.`,
+      description: message`Retired shared-container option; rejected in every execution mode. Container names are assigned per caller.`,
     })),
     claudeSettingsFile: optional(option('--claude-settings-file', string({ metavar: 'PATH' }), {
       description: message`Path to a JSON file used as Claude \`--settings\`. The file is read at register time and its parsed contents are embedded into config.backends.claude.settings. Only valid with --backend claude.`,
@@ -304,6 +304,12 @@ function buildBackendDefaults(
         error: `${label} is not supported by --backend ${backend}; only ${allowedList} accept this flag`,
       };
     }
+  }
+
+  if (flags.runtimeName !== undefined)
+    return { ok: false, error: '--runtime-name is retired; container mode assigns names per caller' };
+  if (flags.runtime === 'container' && flags.cwd) {
+    return { ok: false, error: 'container now assigns workspaces and names per caller; remove --cwd/--runtime-name and run container init claude|codex after registration (docs/caller-runtime.md)' };
   }
 
   if (!backend) return { ok: true, defaults: null };

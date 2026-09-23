@@ -17,7 +17,7 @@
 //     → backend.stop() → runtime.stop() awaited
 //
 // Implementation note: everything in here goes through the `docker`
-// CLI (spawnSync), not the dockerode programmatic API. The hijack
+// CLI (asynchronous for lifecycle operations), not the dockerode API. The hijack
 // stream parts already shelled out to the CLI because of
 // oven-sh/bun#22412; once the hijack path was off the table the
 // remaining dockerode lifecycle calls were carrying ssh2 /
@@ -28,6 +28,7 @@
 // path lookup needed.
 
 import { assertBrokerContainer, assertBrokerWorkspace, brokerFirewallScript } from './execution-runtime-boundary.js';
+import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
 import { spawnSync } from 'node:child_process';
 import { createLogger, type Logger } from './logger.js';
 
@@ -70,7 +71,7 @@ export interface RuntimeContainerOptions {
   logger?: Logger;
   // Test seam — inject a custom docker CLI runner so tests can
   // capture argv + script responses without shelling out.
-  dockerRun?: DockerRun;
+  dockerRun?: AsyncDockerRun;
 }
 
 export interface DockerResult {
@@ -82,7 +83,7 @@ export interface DockerResult {
 export type DockerRun = (args: readonly string[]) => DockerResult;
 
 export function defaultDockerRun(args: readonly string[]): DockerResult {
-  const r = spawnSync('docker', Array.from(args), { encoding: 'utf8' });
+  const r = spawnSync('docker', Array.from(args), { encoding: 'utf8', timeout: 30_000 });
   return {
     stdout: r.stdout ?? '',
     stderr: r.stderr ?? '',
@@ -129,7 +130,7 @@ export class RuntimeContainer {
     RuntimeContainerOptions;
   private acquired = false;
   private readonly log: Logger;
-  private readonly run: DockerRun;
+  private readonly run: AsyncDockerRun;
 
   constructor(opts: RuntimeContainerOptions) {
     this.opts = {
@@ -138,7 +139,7 @@ export class RuntimeContainer {
       image: opts.image ?? DEFAULT_RUNTIME_IMAGE,
     };
     this.log = opts.logger ?? createLogger();
-    this.run = opts.dockerRun ?? defaultDockerRun;
+    this.run = opts.dockerRun ?? runDockerCommand;
   }
 
   // Boots the runtime container, blocking until it's running. Resolves
@@ -156,47 +157,47 @@ export class RuntimeContainer {
 
   private async startRuntime(): Promise<void> {
     if (this.opts.workspaceDir && ['claude','codex'].includes(this.opts.backendKind)) assertBrokerWorkspace(this.opts.workspaceDir);
-    this.ensureDaemonReachable();
+    await this.ensureDaemonReachable();
 
     const name = containerName(this.opts.backendKind, this.opts.runtimeName);
-    if (this.findContainer(name)) {
+    if (await this.findContainer(name)) {
       if (this.opts.failIfExists) {
         throw new Error(
           `runtime container '${name}' already exists. ` +
             `Remove it first with \`${this.removeHint()}\`, then rerun init.`,
         );
       }
-      if (['claude','codex'].includes(this.opts.backendKind)) this.verifyBrokerBoundary(name);
-      if (this.inspectRunning(name)) {
+      if (['claude','codex'].includes(this.opts.backendKind)) await this.verifyBrokerBoundary(name);
+      if (await this.inspectRunning(name)) {
         this.log.info(`runtime container '${name}' already running — reusing`);
       } else {
         this.log.info(`runtime container '${name}' exists but stopped — starting`);
-        this.runDocker(['start', name]);
+        await this.runDocker(['start', name]);
         this.acquired = true;
       }
     } else {
       if (!this.opts.createIfMissing) {
         throw new Error(
           `runtime container '${name}' does not exist. ` +
-            `Create it first with \`vicoop-client container init ${this.opts.backendKind} --name ${this.opts.runtimeName}\`, ` +
-            `then retry \`vicoop-client start --backend ${this.opts.backendKind} --runtime container --runtime-name ${this.opts.runtimeName}\`.`,
+            `This is a legacy per-backend resource. For per-caller execution use \`vicoop-client container init ${this.opts.backendKind}\`. ` +
+            'For daemon execution, configure per-caller container mode as documented in docs/caller-runtime.md.',
         );
       }
       if (this.opts.failIfExists && !this.opts.reuseState) {
-        this.ensureFreshVolumes();
+        await this.ensureFreshVolumes();
       }
       await this.ensureImage();
-      this.ensureVolumes();
-      this.createContainer(name);
+      await this.ensureVolumes();
+      await this.createContainer(name);
       this.acquired = true;
-      this.runDocker(['start', name]);
+      await this.runDocker(['start', name]);
       this.log.info(`runtime container '${name}' created and started`);
     }
 
     await this.waitUntilRunning(name);
     if (['claude','codex'].includes(this.opts.backendKind)) {
-      this.verifyBrokerBoundary(name);
-      this.runDocker(['exec', '--user', '0', name, '/bin/sh', '-c', brokerFirewallScript()]);
+      await this.verifyBrokerBoundary(name);
+      await this.runDocker(['exec', '--user', '0', name, '/bin/sh', '-c', brokerFirewallScript()]);
     }
   }
 
@@ -206,7 +207,7 @@ export class RuntimeContainer {
   async stop(): Promise<void> {
     if (!this.acquired) return;
     const name = containerName(this.opts.backendKind, this.opts.runtimeName);
-    const r = this.run(['stop', '-t', '10', name]);
+    const r = await this.run(['stop', '-t', '10', name]);
     if (r.exitCode === 0) {
       this.acquired = false;
       this.log.info(`runtime container '${name}' stopped`);
@@ -229,15 +230,15 @@ export class RuntimeContainer {
     return containerName(this.opts.backendKind, this.opts.runtimeName);
   }
 
-  private verifyBrokerBoundary(name: string): void {
-    const result = this.run(['inspect', '--format', '{{json .}}', name]);
+  private async verifyBrokerBoundary(name: string): Promise<void> {
+    const result = await this.run(['inspect', '--format', '{{json .}}', name]);
     if (result.exitCode !== 0) throw new Error('Cannot inspect runtime authentication boundary');
     assertBrokerContainer(result.stdout, this.opts.backendKind, this.opts.runtimeName, this.opts.workspaceDir);
   }
 
   // ──────────────────────────────────────────────────────────────────
-  private runDocker(args: readonly string[]): DockerResult {
-    const r = this.run(args);
+  private async runDocker(args: readonly string[]): Promise<DockerResult> {
+    const r = await this.run(args);
     if (r.exitCode !== 0) {
       throw new Error(
         `docker ${args[0]} failed (exit ${r.exitCode}): ${r.stderr.trim()}`,
@@ -246,11 +247,11 @@ export class RuntimeContainer {
     return r;
   }
 
-  private ensureDaemonReachable(): void {
+  private async ensureDaemonReachable(): Promise<void> {
     // `docker version --format '{{.Server.Version}}'` exits non-zero
     // when the daemon is unreachable and prints a stderr line we
     // forward verbatim into the operator-facing message.
-    const r = this.run(['version', '--format', '{{.Server.Version}}']);
+    const r = await this.run(['version', '--format', '{{.Server.Version}}']);
     if (r.exitCode !== 0 || r.stdout.trim().length === 0) {
       throw new Error(
         `docker daemon is not reachable (${r.stderr.trim() || `exit ${r.exitCode}`}). ` +
@@ -262,28 +263,22 @@ export class RuntimeContainer {
 
   private async ensureImage(): Promise<void> {
     const image = this.opts.image;
-    const inspect = this.run(['image', 'inspect', image]);
+    const inspect = await this.run(['image', 'inspect', image]);
     if (inspect.exitCode === 0) return;
     this.log.info(`pulling runtime image ${image}`);
-    // Streamed pull instead of captured: a cold pull of the runtime
-    // image is ~200MB and takes long enough that swallowing layer
-    // progress looks like a hang to an operator watching the
-    // terminal. The test seam (dockerRun) is bypassed for this one
-    // call by design — pull is operator-visible side-effect, not
-    // a unit-testable step.
-    const r = spawnSync('docker', ['pull', image], { stdio: 'inherit' });
-    if (r.status !== 0) {
-      throw new Error(`docker pull ${image} failed (exit ${r.status ?? -1})`);
+    const r = await this.run(['pull', image], { inheritOutput: true, timeoutMs: 600_000 });
+    if (r.exitCode !== 0) {
+      throw new Error(`docker pull ${image} failed (exit ${r.exitCode})`);
     }
   }
 
-  private ensureVolumes(): void {
+  private async ensureVolumes(): Promise<void> {
     const kind = this.opts.backendKind;
     const runtimeName = this.opts.runtimeName;
     for (const name of this.volumeNames()) {
-      const inspect = this.run(['volume', 'inspect', name]);
+      const inspect = await this.run(['volume', 'inspect', name]);
       if (inspect.exitCode === 0) continue;
-      this.runDocker([
+      await this.runDocker([
         'volume',
         'create',
         '--label',
@@ -300,10 +295,11 @@ export class RuntimeContainer {
     }
   }
 
-  private ensureFreshVolumes(): void {
-    const existing = this.volumeNames().filter(
-      (name) => this.run(['volume', 'inspect', name]).exitCode === 0,
-    );
+  private async ensureFreshVolumes(): Promise<void> {
+    const existing: string[] = [];
+    for (const name of this.volumeNames()) {
+      if ((await this.run(['volume', 'inspect', name])).exitCode === 0) existing.push(name);
+    }
     if (existing.length === 0) return;
     throw new Error(
       `runtime volumes already exist: ${existing.join(', ')}. ` +
@@ -321,10 +317,10 @@ export class RuntimeContainer {
     ];
   }
 
-  private findContainer(name: string): boolean {
+  private async findContainer(name: string): Promise<boolean> {
     // Anchored regex (`^…$`) so `vicoop-runtime-codex` doesn't false-
     // positive on a hypothetical `vicoop-runtime-codex-2`.
-    const r = this.run([
+    const r = await this.run([
       'ps',
       '-a',
       '--filter',
@@ -335,12 +331,12 @@ export class RuntimeContainer {
     return r.exitCode === 0 && r.stdout.trim().length > 0;
   }
 
-  private inspectRunning(name: string): boolean {
-    const r = this.run(['inspect', '--format', '{{.State.Running}}', name]);
+  private async inspectRunning(name: string): Promise<boolean> {
+    const r = await this.run(['inspect', '--format', '{{.State.Running}}', name]);
     return r.exitCode === 0 && r.stdout.trim() === 'true';
   }
 
-  private createContainer(name: string): void {
+  private async createContainer(name: string): Promise<void> {
     const kind = this.opts.backendKind;
     const runtimeName = this.opts.runtimeName;
     const args: string[] = [
@@ -400,18 +396,20 @@ export class RuntimeContainer {
       );
     }
     args.push(this.opts.image);
-    this.runDocker(args);
+    await this.runDocker(args);
   }
 
   private removeHint(): string {
-    return `vicoop-client container rm ${this.opts.runtimeName}`;
+    return `vicoop-client container legacy rm ${this.opts.runtimeName}`;
   }
 
   private async waitUntilRunning(name: string): Promise<void> {
     const start = Date.now();
     const timeoutMs = 10_000;
     while (Date.now() - start < timeoutMs) {
-      const r = this.run(['inspect', '--format', '{{.State.Status}}', name]);
+      const r = await this.run(['inspect', '--format', '{{.State.Status}}', name], {
+        timeoutMs: Math.max(1, timeoutMs - (Date.now() - start)),
+      });
       if (r.exitCode === 0) {
         const status = r.stdout.trim();
         if (status === 'running') return;

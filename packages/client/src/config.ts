@@ -1,3 +1,5 @@
+import { CallerRuntimeConfig } from './caller-runtime-config.js';
+import type { z } from 'zod';
 // Single source of truth for the `vicoop-client` daemon: a JSON config file
 // living under the client's canonical home directory (see resolveConfigDir).
 //
@@ -15,9 +17,9 @@
 // VICOOP_TRUSTED_IDENTITY_ISSUERS is the sole runtime-env compatibility
 // fallback and applies only when flag/config receiver trust is absent.
 
-import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, realpathSync, rmdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { atomicWriteFile } from './fs-util.js';
 
 const CONFIG_FILENAME = 'config.json';
@@ -103,8 +105,7 @@ export function defaultOwnerSessionPath(): string {
 // Where the agent CLI actually runs.
 //   - 'host'      : node:child_process.spawn on the bridge-client host
 //                   (today's behavior; default).
-//   - 'container' : `docker exec` into a long-lived vicoop-runtime
-//                   container the bridge client orchestrates (#249).
+//   - 'container' : dedicated Docker container and volumes per authenticated caller.
 export type BackendRuntime = 'host' | 'container';
 
 export interface ClaudeBackendConfig {
@@ -154,7 +155,9 @@ export interface ClaudeBackendConfig {
    */
   retry_narrated_tool_call?: boolean;
   runtime?: BackendRuntime;
+  /** Legacy shared-container selector, retained to report migration errors. */
   runtime_name?: string;
+  caller_runtime?: z.input<typeof CallerRuntimeConfig>;
 }
 
 export interface CodexBackendConfig {
@@ -163,7 +166,9 @@ export interface CodexBackendConfig {
   /** What to answer when codex requests user approval. Default `decline`. */
   approval_decision?: 'accept' | 'acceptForSession' | 'decline';
   runtime?: BackendRuntime;
+  /** Legacy shared-container selector, retained to report migration errors. */
   runtime_name?: string;
+  caller_runtime?: z.input<typeof CallerRuntimeConfig>;
 }
 
 export interface OpenclawBackendConfig {
@@ -287,11 +292,15 @@ const KNOWN_CODEX_SANDBOX_MODES = new Set([
 const KNOWN_BACKEND_RUNTIMES = new Set<BackendRuntime>(['host', 'container']);
 
 function pickBackendRuntime(v: unknown): BackendRuntime | undefined {
-  if (typeof v !== 'string') return undefined;
+  if (v === undefined) return undefined;
+  if (typeof v !== 'string')
+    throw new Error('runtime must be host or container');
   const trimmed = v.trim();
-  return KNOWN_BACKEND_RUNTIMES.has(trimmed as BackendRuntime)
-    ? (trimmed as BackendRuntime)
-    : undefined;
+  if (trimmed === 'caller-container')
+    throw new Error('runtime caller-container was renamed to container; update runtime and retain caller_runtime configuration');
+  if (!KNOWN_BACKEND_RUNTIMES.has(trimmed as BackendRuntime))
+    throw new Error('runtime must be host or container');
+  return trimmed as BackendRuntime;
 }
 
 // Hand-edited config files reliably ship malformed entries (typos, wrong
@@ -334,8 +343,9 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const model = asString(claudeRaw.model);
       const models = asStringArray(claudeRaw.supported_models);
       const runtime = pickBackendRuntime(claudeRaw.runtime);
+      const callerRuntime = claudeRaw.caller_runtime === undefined ? undefined : CallerRuntimeConfig.parse(claudeRaw.caller_runtime);
       const runtimeName = asString(claudeRaw.runtime_name);
-      if (cwd || settings || model || models || runtime || runtimeName) {
+      if (cwd || settings || model || models || runtime || runtimeName || callerRuntime) {
         out.claude = {};
         if (cwd) out.claude.cwd = cwd;
         if (settings) out.claude.settings = settings;
@@ -343,6 +353,7 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
         if (models) out.claude.supported_models = models;
         if (runtime) out.claude.runtime = runtime;
         if (runtimeName) out.claude.runtime_name = runtimeName;
+        if (callerRuntime) out.claude.caller_runtime = callerRuntime;
       }
     }
     const codexRaw = asRecord(backends.codex);
@@ -357,14 +368,16 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
           ? (approvalRaw as 'accept' | 'acceptForSession' | 'decline')
           : undefined;
       const runtime = pickBackendRuntime(codexRaw.runtime);
+      const callerRuntime = codexRaw.caller_runtime === undefined ? undefined : CallerRuntimeConfig.parse(codexRaw.caller_runtime);
       const runtimeName = asString(codexRaw.runtime_name);
-      if (cwd || validSandbox || validApproval || runtime || runtimeName) {
+      if (cwd || validSandbox || validApproval || runtime || runtimeName || callerRuntime) {
         out.codex = {};
         if (cwd) out.codex.cwd = cwd;
         if (validSandbox) out.codex.sandbox_mode = validSandbox;
         if (validApproval) out.codex.approval_decision = validApproval;
         if (runtime) out.codex.runtime = runtime;
         if (runtimeName) out.codex.runtime_name = runtimeName;
+        if (callerRuntime) out.codex.caller_runtime = callerRuntime;
       }
     }
     const vcRaw = asRecord(backends['vicoop-codex']);
@@ -432,10 +445,26 @@ export function readConfigRaw(
 export function writeConfig(
   path: string,
   config: ClientConfig | Record<string, unknown>,
+  expectedContents?: string,
 ): void {
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  atomicWriteFile(path, `${JSON.stringify(config, null, 2)}\n`, 0o600);
+  const target = join(realpathSync(dir), basename(path));
+  const lock = `${target}.lock`;
+  try {
+    mkdirSync(lock, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST')
+      throw new Error('config write is locked; retry after the other writer exits, or inspect the .lock directory after a crash');
+    throw error;
+  }
+  try {
+    if (expectedContents !== undefined && readFileSync(target, 'utf8') !== expectedContents)
+      throw new Error('config changed during initialization; retry without overwriting the new settings');
+    atomicWriteFile(target, `${JSON.stringify(config, null, 2)}\n`, 0o600);
+  } finally {
+    rmdirSync(lock);
+  }
 }
 
 // Per-field overlay used to layer an explicit `--config <path>` file on top

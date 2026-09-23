@@ -166,7 +166,7 @@ test('start: failIfExists rejects an existing container during init', async () =
 
   await assert.rejects(
     rc.start(),
-    /runtime container 'vicoop-runtime-work' already exists.*container rm work/s,
+    /runtime container 'vicoop-runtime-work' already exists.*container legacy rm work/s,
   );
   assert.equal(calls.filter((c) => c[0] === 'start').length, 0);
   assert.equal(calls.filter((c) => c[0] === 'create').length, 0);
@@ -189,7 +189,7 @@ test('start: failIfExists rejects existing volumes before creating a container',
 
   await assert.rejects(
     rc.start(),
-    /runtime volumes already exist: vicoop-sessions-codex.*container rm codex/s,
+    /runtime volumes already exist: vicoop-sessions-codex.*container legacy rm codex/s,
   );
   assert.equal(calls.filter((c) => c[0] === 'image').length, 0);
   assert.equal(calls.filter((c) => c[0] === 'create').length, 0);
@@ -376,4 +376,32 @@ test('reuse rejects a missing or different workspace before starting or executin
     await assert.rejects(runtime.start(), /workspace/);
     assert.ok(!fixture.calls.some(args => ['start', 'stop', 'exec'].includes(args[0])));
   }
+});
+
+test('start awaits asynchronous Docker results including bounded streamed image pull', async () => {
+  const calls: Array<{ args: readonly string[]; options: unknown }> = [];
+  const responses = happyCreateResponses();
+  responses.splice(2, 1, fail('image missing'), ok());
+  const fixture = makeDockerFixture(responses);
+  const runtime = new RuntimeContainer({
+    backendKind: 'codex', createIfMissing: true,
+    dockerRun: async (args, options) => {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      calls.push({ args, options });
+      return fixture.run(args);
+    },
+  });
+  await runtime.start();
+  assert.deepEqual(calls.find((call) => call.args[0] === 'pull')?.options, {
+    inheritOutput: true, timeoutMs: 600_000,
+  });
+  await runtime.stop();
+  assert.equal(calls.at(-1)?.args[0], 'stop');
+});
+
+test('failed image pull aborts creation before touching volumes', async () => {
+  const fixture = makeDockerFixture([ok('27'), ok(), fail('missing image'), fail('pull failed')]);
+  const runtime = new RuntimeContainer({ backendKind: 'claude', createIfMissing: true, dockerRun: fixture.run });
+  await assert.rejects(runtime.start(), /docker pull/);
+  assert.equal(fixture.calls.some((args) => args[0] === 'volume' || args[0] === 'create'), false);
 });

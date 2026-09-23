@@ -46,15 +46,27 @@ the bundled-direct image keep their existing behavior; this broker does not
 make their provider credentials inaccessible to their agent processes.
 Codex external-runtime uses its own [host authentication broker](./codex-auth-broker.md).
 
-## Fresh setup
+## Current per-caller setup
 
-Log into Claude on the **host**, or supply one supported credential variable to
-the host bridge process. Then run:
+After registering the bridge agent and preparing Claude authentication on
+the host, run:
 
 ```sh
 vicoop-client container init claude
-vicoop-client start --backend claude --runtime container
+vicoop-client start --detach
 ```
+
+Initialization builds or validates an image, creates private caller state and
+saves the agent config. See [caller runtime setup](caller-runtime.md) for custom
+images, alternate configs and migration behavior.
+
+### Legacy per-backend resources (historical)
+
+The migration details below describe older shared runtimes and their retained
+administrative commands. The old init flags shown below apply only to earlier
+client versions; current init rejects them. They do not configure the current
+per-caller daemon.
+
 
 `container init claude --from-host` is accepted for compatibility but does not
 copy secrets. Both forms validate host authentication. The runtime image must
@@ -63,46 +75,33 @@ contain Node at `/usr/local/bin/node`, `/usr/bin/tini`, `iptables`, `ip6tables` 
 
 ## Existing runtime migration
 
-Stop the bridge daemon first. Preserve the original runtime image reference and
-any workspace bind-mount path in your operational records. Then, replacing
-`claude` with your runtime instance name:
+Stop the bridge daemon and back up any files in the old container's writable
+layer before removing it. Record its image, volume names and workspace bind
+mounts for manual recovery. Inspect legacy resources with:
 
 ```sh
-vicoop-client container remove claude --preserve-volumes
-vicoop-client container init claude --name claude --reuse-state --from-host
-vicoop-client start --backend claude --runtime container --runtime-name claude
+vicoop-client container legacy list
+# Optional cleanup after backing up the writable layer; retains named volumes:
+vicoop-client container legacy remove claude --preserve-volumes
+# Prepare a fresh per-caller environment using host authentication:
+vicoop-client container init claude
+vicoop-client container validate
+vicoop-client start --detach
 ```
 
-The explicit removal discards the old container's writable layer. Back up any
-files kept there before running it. Named agent/session volumes remain and are
-reused; the legacy credentials volume is retained **without being mounted into
-the new workload**. `--reuse-state` also runs a short-lived, networkless helper
-which mounts that legacy volume read-only and copies only `projects/**/*.jsonl`
-and `todos/**/*.json` into the new session config directory. Existing destination
-files are kept; symlinks, settings, login files and environment snapshots are
-excluded. The helper exits and is removed before normal agent use. No host login
-is overwritten, imported from the container or deleted.
+Replace `claude` in the legacy remove command with the old runtime instance
+name. Initialization removes legacy `cwd`/`runtime_name` from the selected
+backend configuration only after validation succeeds. Existing host workspace
+files and retained legacy volumes are not copied or assigned to any caller.
+There is no automatic transcript/session migration into the per-caller mode.
+The retired `--name`, `--workspace` and `--reuse-state` init options are rejected.
+See [caller runtime configuration](caller-runtime.md) for custom images and
+separate agent configurations.
 
-For a custom `/workspace` bind mount, add `--workspace /original/host/path`
-to the replacement `container init` command, and keep the original daemon
-`--cwd /original/host/path` setting. The data on the host is retained by
-container removal. Do not mount the operator's home, credential stores or Docker
-socket into the workload. The runtime refuses mounts outside the agent/session
-volumes, `/workspace`, and designated temporary directories. Legacy runtimes or
-containers with provider environment variables fail before any new agent spawn.
-
-The new `CLAUDE_CONFIG_DIR` is `/data/sessions/claude/config`. The old credential
-path is an empty tmpfs. The guarantee starts with the new broker runtime: this
-migration does **not** sanitize tokens that previous tools copied into code,
-conversation transcripts, todos, backups or snapshots. If old work may contain
-secrets, rotate them on the host and use a fresh runtime name without reusing
-state. Operator-supplied images and workspace contents remain trusted inputs.
-
-Rollback to an older bridge can restore direct credential exposure if the old
-credentials volume is mounted again. Do not use the old `container remove`
-without `--preserve-volumes` if the retained data is needed. Recover a legacy
-installation from your saved image/mount configuration and retained volumes;
-there is no automatic downgrade or silent direct-auth fallback.
+Old transcripts or workspaces may contain secrets from previous execution;
+retaining them does not sanitize those secrets. Provider authentication for new
+caller environments stays on the host. There is no automatic downgrade; recover
+an old deployment manually from its recorded image/mounts and retained data.
 
 ## Transport and lifecycle
 
