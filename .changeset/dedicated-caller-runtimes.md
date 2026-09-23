@@ -4,6 +4,42 @@
 
 Make container execution caller-isolated for Claude and Codex with reusable per-user Docker containers, dedicated persistent workspace/session volumes, host authentication brokers, execution cleanup, restart recovery and offline state administration. This replaces shared-container daemon execution: configure caller_runtime image/stateDirectory and remove cwd/runtime_name. The draft caller-container spelling is retired; host remains the default. Requires a compatible bridge server, an immutable backend-installed image and explicit caller runtime configuration. Conversation bindings reset after daemon restart; persistent partial writes are retained on cancellation. Storage thresholds are monitored admission limits, not filesystem hard quotas.
 
+
+For users upgrading from a released client:
+
+- **Host execution:** no runtime configuration change is required. Host remains
+  the default, including bundled-direct deployments that run the client itself
+  inside a container. Caller isolation is an explicit opt-in.
+- **Existing shared Docker execution:** `runtime: "container"` now selects
+  caller-isolated execution. Stop the old daemon before upgrading with
+  `vicoop-client stop --config /path/to/config.json` and keep a backup of its configuration and existing volumes. Prepare Claude/Codex
+  authentication on the host, then initialize the selected backend with the same
+  agent configuration:
+
+  ```sh
+  vicoop-client container init claude --config /path/to/config.json
+  vicoop-client start --detach --config /path/to/config.json
+  ```
+
+  Use `codex` instead of `claude` for Codex; omit `--config` for the canonical
+  configuration. Initialization preserves agent registration and unrelated
+  settings, and replaces the selected backend's legacy `cwd`/`runtime_name`
+  configuration only after validation succeeds. Remove `--runtime-name` and
+  legacy `--cwd` overrides from your container launch scripts too.
+- **Existing files and sessions:** initialization does not delete or automatically
+  copy shared Docker workspaces, credentials or sessions into caller storage.
+  Each authenticated caller starts with a new environment on its first request;
+  retain the old volumes separately if their contents are needed. Legacy resource
+  inspection is available through `container legacy list`.
+- **Server compatibility:** caller isolation requires a compatible bridge server
+  advertising execution-scope support; update the server before activating it.
+  An incompatible server is rejected rather than falling back to shared execution.
+
+Caller-scoped runtime storage has not appeared in a released client, so upgrading
+released versions does not require migration of an earlier caller-scoped volume
+format. See the [caller runtime setup and transition guide](https://github.com/planetarium/vicoop-bridge/blob/main/docs/caller-runtime.md)
+for initialization requirements and supported features.
+
 Persist validated principal-to-scope mappings in a private SQLite database with transactional migration from version-2/3 JSON stores. Legacy hash-only records remain unknown until a matching validated request arrives; the version-4 manifest blocks older JSON state readers. User lookup and environment initialization remain follow-up work.
 
 Make `container init claude|codex` prepare per-caller execution end to end: check host authentication, build an embedded backend image without a repository checkout or validate `--image`, initialize private SQLite state and save the immutable image/configuration. Preserve registration and unrelated settings, reject active state and unsafe image replacement, and leave config unchanged on failure. Legacy shared-container init flags now report migration guidance.
