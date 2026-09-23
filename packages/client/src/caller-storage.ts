@@ -12,7 +12,7 @@ const Record = z.object({
 }).strict();
 
 /** Only the operator helper sees the backing pool and daemon devices. */
-export class CallerFixedStorage {
+export class CallerStorage {
   constructor(private readonly options: CallerRuntimeOptions,
     private readonly store: CallerRuntimeStore, private readonly run: AsyncDockerRun) {}
 

@@ -97,7 +97,7 @@ images and uses privileged helper containers; select a disposable/test engine:
 ```sh
 cd packages/client
 DOCKER_CONTEXT=desktop-linux VICOOP_FIXED_STORAGE_TEST=1 \
-  pnpm exec tsx --test src/caller-fixed-storage.integration.test.ts
+  pnpm exec tsx --test src/caller-storage.integration.test.ts
 ```
 
 It covers actual runtime creation, block/inode exhaustion, independent callers,
