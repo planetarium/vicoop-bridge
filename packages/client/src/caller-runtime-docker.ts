@@ -1,3 +1,4 @@
+import { CallerStorage, CallerStorageHelperUnconfirmedError } from './caller-storage.js';
 import { randomUUID } from 'node:crypto';
 import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
 import { CallerRuntimeStore } from './caller-runtime-store.js';
@@ -43,6 +44,7 @@ export class DockerCallerRuntimePool {
   readonly store: CallerRuntimeStore;
   private readonly containers = new Map<string, CallerContainer>();
   private readonly run: AsyncDockerRun;
+  private readonly storage: CallerStorage;
   private locked = false;
   private offline = false;
   private validateExecution = true;
@@ -54,6 +56,7 @@ export class DockerCallerRuntimePool {
   ) {
     this.store = new CallerRuntimeStore(options.stateDirectory, agentId);
     this.run = (args, options) => run(args, { timeoutMs: 10000, ...options });
+    this.storage = new CallerStorage(options, this.store, this.run);
   }
   private async command(args: string[], signal?: AbortSignal): Promise<string> {
     signal?.throwIfAborted();
@@ -105,6 +108,15 @@ export class DockerCallerRuntimePool {
           throw new Error('caller image must not declare volumes or provider environment');
       }
       const ids = await this.store.scopes();
+      for (const id of ids) await this.storage.reconcile(id);
+      if (this.options.fixedImageStorage) await this.storage.initialize();
+      for (const id of ids) {
+        const record = await this.store.fixedStorage(id);
+        if (this.options.fixedImageStorage) {
+          if (record || !(await this.store.reservationPending(id))) await this.storage.record(id);
+        }
+        else if (record) throw new Error('fixed-image caller storage requires its original fixedImageStorage configuration');
+      }
       if (this.validateExecution && ids.length > this.options.maxScopes)
         throw new Error('retained scopes exceed maxScopes');
       const resources = await this.command([
@@ -130,7 +142,11 @@ export class DockerCallerRuntimePool {
       // Validate before stopping. Never delete or adopt mismatched resources.
       for (const id of ids) {
         await this.store.reserve(id, this.kind);
-        if (reconcile && await this.store.reservationPending(id)) continue;
+        if (await this.store.reservationPending(id) &&
+            (reconcile || (this.options.fixedImageStorage && !(await this.store.fixedStorage(id))))) {
+          if (validateOffline) throw new CallerAllocationIncompleteError();
+          continue;
+        }
         const info = await this.inspect(this.name(id));
         if (info) {
           await this.validate(info, id);
@@ -146,12 +162,14 @@ export class DockerCallerRuntimePool {
         // Explicit offline validation checks retained data even after recreation.
         // Daemon startup leaves missing storage to per-caller quarantine on acquire.
         if (!reconcile && validateOffline) {
-          for (const suffix of ['workspace', 'sessions'])
+          for (const suffix of this.storageSuffixes())
             if (!(await this.volumeExists(id, suffix))) throw new CallerStorageMissingError();
+          if (this.options.fixedImageStorage) await this.storage.manage('check', id);
         }
       }
       return ids;
     } catch (error) {
+      if (error instanceof CallerStorageHelperUnconfirmedError) throw error;
       await this.store.unlock();
       this.locked = false;
       throw error;
@@ -217,9 +235,18 @@ export class DockerCallerRuntimePool {
     )
       fail();
     const mounts = new Map<string, string>([
-      ['/workspace', `${this.name(id)}-workspace`],
-      [`/data/sessions/${this.kind}`, `${this.name(id)}-sessions`],
+      ['/workspace', `${this.name(id)}-${this.options.fixedImageStorage ? 'storage' : 'workspace'}`],
+      [`/data/sessions/${this.kind}`, `${this.name(id)}-${this.options.fixedImageStorage ? 'storage' : 'sessions'}`],
     ]);
+    if (this.options.fixedImageStorage) {
+      const declared = h.Mounts ?? [];
+      if (declared.length !== 2) fail();
+      for (const [target, subpath] of [['/workspace', 'workspace'], [`/data/sessions/${this.kind}`, 'sessions']]) {
+        const mount = declared.find((m: any) => m.Target === target);
+        if (!mount || mount.Type !== 'volume' || mount.Source !== `${this.name(id)}-storage` ||
+            mount.ReadOnly || mount.VolumeOptions?.NoCopy !== true || mount.VolumeOptions?.Subpath !== subpath) fail();
+      }
+    }
     for (const m of c.Mounts ?? []) {
       if (m.Type === 'tmpfs' && ['/tmp', '/home/node'].includes(m.Destination))
         continue;
@@ -261,7 +288,9 @@ export class DockerCallerRuntimePool {
       (this.validateExecution && (
         network.Driver !== 'bridge' || network.Scope !== 'local' ||
         network.Internal || network.Ingress || network.Attachable || network.EnableIPv6 ||
-        Object.keys(network.Options ?? {}).length)) ||
+        Object.entries(network.Options ?? {}).some(([key, value]) =>
+          !((key === 'com.docker.network.enable_ipv4' && value === 'true') ||
+            (key === 'com.docker.network.enable_ipv6' && value === 'false'))))) ||
       Object.entries(this.labels(id)).some(([k, v]) => network.Labels?.[k] !== v) ||
       Object.entries(network.Containers ?? {}).some(([key, value]: [string, any]) =>
         !container || key !== container.Id || value.Name !== this.name(id),
@@ -271,6 +300,9 @@ export class DockerCallerRuntimePool {
         (container.State.Running && endpoint?.NetworkID !== network.Id)))
     ) throw new Error('caller network ownership or isolation boundary mismatch');
     return true;
+  }
+  private storageSuffixes(): string[] {
+    return this.options.fixedImageStorage ? ['storage'] : ['workspace', 'sessions'];
   }
   private async volumeExists(id: string, suffix: string, signal?: AbortSignal): Promise<boolean> {
     signal?.throwIfAborted();
@@ -290,7 +322,10 @@ export class DockerCallerRuntimePool {
         ([k, v]) => volume.Labels?.[k] !== v,
       ) ||
       volume.Driver !== 'local' ||
-      Object.keys(volume.Options ?? {}).length
+      (this.options.fixedImageStorage && suffix === 'storage'
+        ? Object.keys(volume.Options ?? {}).length !== 3 || volume.Options.type !== 'ext4' ||
+          volume.Options.device !== await this.storage.device(id) || volume.Options.o !== 'rw,nodev,nosuid,nodiscard'
+        : Object.keys(volume.Options ?? {}).length !== 0)
     )
       throw new Error('caller volume ownership or storage boundary mismatch');
     return true;
@@ -322,8 +357,10 @@ export class DockerCallerRuntimePool {
         info = await this.inspect(name, signal);
         if (info || await this.volumeExists(id, 'workspace', signal) ||
             await this.volumeExists(id, 'sessions', signal) ||
+            (this.options.fixedImageStorage && await this.volumeExists(id, 'storage', signal)) ||
             await this.networkExists(id, undefined, signal))
           throw new CallerOrphanedResourcesError();
+        if (this.options.fixedImageStorage) await this.storage.reserve(id);
         await this.store.confirmReservation(id);
       } catch (error) {
         try { await this.store.forget(id); }
@@ -338,12 +375,18 @@ export class DockerCallerRuntimePool {
     const recovered = !!info;
     const restarted = !!info && !info.State.Running;
     const recreated = !fresh && !info;
+    if (this.options.fixedImageStorage) {
+      if (info) await this.validate(info, id, signal);
+      onMutation?.();
+      await this.storage.manage(fresh ? 'create' : 'attach', id, signal);
+    }
     if (!info) {
-      for (const suffix of ['workspace', 'sessions']) {
+      for (const suffix of this.storageSuffixes()) {
         const volume = `${name}-${suffix}`;
         if (!(await this.volumeExists(id, suffix, signal))) {
           if (!fresh) throw new CallerStorageMissingError();
-          await command(['volume', 'create', ...this.labelArgs(id), volume]);
+          await command(['volume', 'create', ...this.labelArgs(id),
+            ...(this.options.fixedImageStorage ? ['--opt', 'type=ext4', '--opt', `device=${await this.storage.device(id)}`, '--opt', 'o=rw,nodev,nosuid,nodiscard'] : []), volume]);
         }
       }
       if (!fresh && !(await this.store.allocationComplete(id)))
@@ -383,9 +426,9 @@ export class DockerCallerRuntimePool {
         '--log-driver',
         'none',
         '--mount',
-        `type=volume,source=${name}-workspace,target=/workspace`,
+        this.options.fixedImageStorage ? `type=volume,source=${name}-storage,target=/workspace,volume-subpath=workspace,volume-nocopy` : `type=volume,source=${name}-workspace,target=/workspace`,
         '--mount',
-        `type=volume,source=${name}-sessions,target=/data/sessions/${this.kind}`,
+        this.options.fixedImageStorage ? `type=volume,source=${name}-storage,target=/data/sessions/${this.kind},volume-subpath=sessions,volume-nocopy` : `type=volume,source=${name}-sessions,target=/data/sessions/${this.kind}`,
         '--tmpfs',
         `/tmp:${CALLER_TMPFS['/tmp']}`,
         '--tmpfs',
@@ -409,7 +452,7 @@ export class DockerCallerRuntimePool {
     }
     signal?.throwIfAborted();
     await this.validate(info, id, signal);
-    for (const suffix of ['workspace', 'sessions'])
+    for (const suffix of this.storageSuffixes())
       if (!(await this.volumeExists(id, suffix, signal)))
         throw new CallerStorageMissingError();
     if (!info.State.Running) await command(['start', name]);
@@ -432,6 +475,9 @@ export class DockerCallerRuntimePool {
     return container;
   }
   async checkStorage(id: string, signal?: AbortSignal): Promise<void> {
+    // ext4 enforces both block and inode exhaustion synchronously. A full
+    // filesystem must remain accessible so callers can delete files to recover.
+    if (this.options.fixedImageStorage) { signal?.throwIfAborted(); return; }
     const output = await this.command([
       'exec',
       '--user',
@@ -454,6 +500,12 @@ export class DockerCallerRuntimePool {
       throw new CallerStorageLimitError();
   }
   async stop(id: string): Promise<void> {
+    let helperFailure: unknown;
+    try { await this.storage.reconcile(id); } catch (error) { helperFailure = error; }
+    try { await this.stopContainer(id); }
+    finally { if (helperFailure) throw helperFailure; }
+  }
+  private async stopContainer(id: string): Promise<void> {
     // Unconfirmed reservations may refer to orphan resources; normal cleanup
     // must not touch them. Explicit offline removal still validates ownership.
     if (!this.offline && await this.store.reservationPending(id)) return;
@@ -502,6 +554,21 @@ export class DockerCallerRuntimePool {
     if (!this.locked) throw new Error('caller pool is not initialized');
     await this.stop(id);
     const name = this.name(id);
+    // A process can die between scope reservation and image identity creation.
+    // No helper can have started then. Forget only after proving there are no
+    // Docker resources to adopt or delete under the incomplete identity.
+    if (this.options.fixedImageStorage && !(await this.store.fixedStorage(id)) &&
+        await this.store.reservationPending(id)) {
+      if (!deleteData) throw new CallerAllocationIncompleteError();
+      if (await this.inspect(name) || await this.networkExists(id)) throw new CallerOrphanedResourcesError();
+      for (const suffix of ['workspace', 'sessions', 'storage']) {
+        const found = await this.run(['volume', 'inspect', `${name}-${suffix}`]);
+        if (found.exitCode === 0) throw new CallerOrphanedResourcesError();
+        if (!/no such volume/i.test(found.stderr)) throw new Error('cannot inspect caller volume');
+      }
+      await this.store.forget(id);
+      return;
+    }
     const container = await this.inspect(name);
     if (container) {
       await this.validate(container, id);
@@ -514,7 +581,7 @@ export class DockerCallerRuntimePool {
     )) throw new Error('caller container network membership boundary mismatch');
     const network = await this.networkExists(id, container);
     const volumes: string[] = [];
-    for (const suffix of ['workspace', 'sessions'])
+    for (const suffix of this.storageSuffixes())
       if (await this.volumeExists(id, suffix)) volumes.push(`${name}-${suffix}`);
     for (const volume of volumes) {
       const consumers = (await this.command(['ps', '--all', '--no-trunc',
@@ -529,6 +596,7 @@ export class DockerCallerRuntimePool {
     if (network) await this.command(['network', 'rm', `${name}-net`]);
     if (deleteData) {
       for (const volume of volumes) await this.command(['volume', 'rm', volume]);
+      if (this.options.fixedImageStorage) await this.storage.manage('delete', id);
       await this.store.forget(id);
     }
   }

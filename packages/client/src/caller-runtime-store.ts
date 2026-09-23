@@ -177,7 +177,7 @@ export class CallerRuntimeStore {
     const databasePath = join(this.directory, 'state.sqlite');
     const Manifest = z
       .object({
-        version: z.union([z.literal(2), z.literal(3), z.literal(4)]),
+        version: z.union([z.literal(2), z.literal(3), z.literal(4), z.literal(5)]),
         agentId: z.literal(this.agentId),
         host: z.literal(hostname()),
         migration: z.literal('json').optional(),
@@ -197,7 +197,7 @@ export class CallerRuntimeStore {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
     const migrating =
-      !manifest || manifest.version !== 4 || manifest.migration === 'json';
+      !manifest || manifest.version < 4 || manifest.migration === 'json';
     const names = (await readdir(this.directory)).filter((name) =>
       /^[a-f0-9]{64}\.json$/.test(name),
     );
@@ -210,13 +210,13 @@ export class CallerRuntimeStore {
     );
     if (
       (!manifest && (exists || names.length)) ||
-      (manifest?.version === 4 && !migrating && !exists) ||
-      (manifest && manifest.version !== 4 && exists)
+      (manifest && manifest.version >= 4 && !migrating && !exists) ||
+      (manifest && manifest.version < 4 && exists)
     )
       throw new Error(
         'caller state storage is incomplete or incompatible; inspect before recovery',
       );
-    const expected = { version: 4, agentId: this.agentId, host: hostname() };
+    const expected = { version: manifest?.version === 5 ? 5 : 4, agentId: this.agentId, host: hostname() };
     // Block JSON-only clients before any SQLite mutation. This marker survives
     // interruption; the committed DB version tells retries whether import finished.
     if (migrating)
@@ -296,6 +296,8 @@ export class CallerRuntimeStore {
     // allocation. Older records can establish it from a validated container.
     db.exec('CREATE TABLE IF NOT EXISTS completed_allocations (id TEXT PRIMARY KEY NOT NULL)');
     db.exec('CREATE TABLE IF NOT EXISTS pending_reservations (id TEXT PRIMARY KEY NOT NULL)');
+    db.exec('CREATE TABLE IF NOT EXISTS fixed_storage (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL)');
+    db.exec('CREATE TABLE IF NOT EXISTS storage_helpers (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL)');
     if (migrating) await this.atomicWrite(manifestPath, expected);
     // Legacy JSON files remain as an inert migration backup, never read again.
   }
@@ -374,11 +376,34 @@ export class CallerRuntimeStore {
     this.validateRecord(this.db().prepare('SELECT * FROM scopes WHERE id = ?').get(id), id);
     this.db().prepare('INSERT OR IGNORE INTO completed_allocations (id) VALUES (?)').run(id);
   }
+  async fixedStorage(id: string): Promise<string | undefined> {
+    const row = this.db().prepare('SELECT record FROM fixed_storage WHERE id = ?').get(id);
+    return row ? z.object({ record: z.string() }).parse(row).record : undefined;
+  }
+  async recordFixedStorage(id: string, record: string): Promise<void> {
+    this.validateRecord(this.db().prepare('SELECT * FROM scopes WHERE id = ?').get(id), id);
+    // Block pre-image clients before persisting references they cannot clean up.
+    await this.atomicWrite(join(this.directory, 'manifest.json'), { version: 5, agentId: this.agentId, host: hostname() });
+    this.db().prepare('INSERT INTO fixed_storage (id, record) VALUES (?, ?)').run(id, record);
+  }
+  async storageHelper(id: string): Promise<string | undefined> {
+    const row = this.db().prepare('SELECT record FROM storage_helpers WHERE id = ?').get(id);
+    return row ? z.object({ record: z.string() }).parse(row).record : undefined;
+  }
+  async recordStorageHelper(id: string, record: string): Promise<void> {
+    this.validateRecord(this.db().prepare('SELECT * FROM scopes WHERE id = ?').get(id), id);
+    this.db().prepare('INSERT INTO storage_helpers (id, record) VALUES (?, ?)').run(id, record);
+  }
+  async clearStorageHelper(id: string): Promise<void> {
+    this.db().prepare('DELETE FROM storage_helpers WHERE id = ?').run(id);
+  }
   async forget(id: string): Promise<void> {
     if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('invalid scope ID');
+    if (await this.storageHelper(id)) throw new Error('storage helper termination must be confirmed before forgetting scope');
     const db = this.db();
     db.exec('BEGIN IMMEDIATE');
     try {
+      db.prepare('DELETE FROM fixed_storage WHERE id = ?').run(id);
       db.prepare('DELETE FROM completed_allocations WHERE id = ?').run(id);
       db.prepare('DELETE FROM pending_reservations WHERE id = ?').run(id);
       db.prepare('DELETE FROM scopes WHERE id = ?').run(id);

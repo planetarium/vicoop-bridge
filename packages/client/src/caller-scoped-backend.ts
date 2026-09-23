@@ -1,3 +1,4 @@
+import { CallerStorageHelperUnconfirmedError } from './caller-storage.js';
 import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME, decodedBase64Size } from './backends/fetch-uri-file.js';
 import {
   ExecutionScopeV1,
@@ -323,6 +324,12 @@ export class CallerScopedBackend implements Backend {
         entry.worker = undefined;
         entry.contexts.clear();
         entry.recovered = true;
+      }
+      if (error instanceof CallerStorageHelperUnconfirmedError) {
+        entry.quarantined = true;
+        this.fail(task, emit, 'runtime_quarantined',
+          'Storage helper cleanup could not be confirmed; scope quarantined until Docker reconciliation succeeds.');
+        return;
       }
       if (error instanceof CallerOrphanedResourcesError) {
         entry.quarantined = true;

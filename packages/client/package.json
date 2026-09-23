@@ -10,7 +10,8 @@
   },
   "files": [
     "dist",
-    "cards"
+    "cards",
+    "container/storage"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
