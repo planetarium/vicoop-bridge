@@ -87,6 +87,8 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   network.Driver = 'macvlan';
   await assert.rejects(boundary().initialize(false, true), /network.*boundary mismatch/);
   network.Driver = 'bridge';
+  network.Options['com.docker.network.enable_ipv4'] = 'true';
+  network.Options['com.docker.network.enable_ipv6'] = 'false';
   network.Options['com.docker.network.bridge.name'] = 'foreign-bridge';
   await assert.rejects(boundary().initialize(false, true), /network.*boundary mismatch/);
   delete network.Options['com.docker.network.bridge.name'];
