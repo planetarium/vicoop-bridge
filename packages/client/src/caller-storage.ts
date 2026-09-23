@@ -11,8 +11,20 @@ const Record = z.object({
   size: z.number().int().positive(),
 }).strict();
 
+const HelperRecord = z.object({
+  name: z.string().regex(/^vb-storage-[a-f0-9-]{36}$/),
+  image: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+}).strict();
+
+export class CallerStorageHelperUnconfirmedError extends Error {
+  constructor(cause?: unknown) {
+    super('storage helper termination unconfirmed; scope quarantined until Docker reconciliation succeeds', { cause });
+  }
+}
+
 /** Only the operator helper sees the backing pool and daemon devices. */
 export class CallerStorage {
+  private readonly active = new Set<string>();
   constructor(private readonly options: CallerRuntimeOptions,
     private readonly store: CallerRuntimeStore, private readonly run: AsyncDockerRun) {}
 
@@ -47,28 +59,81 @@ export class CallerStorage {
     if (policy.capacityMiB < this.options.storageMiB) throw new Error('storage pool capacity is smaller than a scope');
   }
   async device(id: string) { return `/dev/disk/by-uuid/${(await this.record(id)).uuid}`; }
+  private labels(id: string, name: string) {
+    return {
+      'vicoop.component': 'caller-storage-helper',
+      'vicoop.caller-namespace': this.store.namespace,
+      'vicoop.scope': id,
+      'vicoop.helper': name,
+    };
+  }
+  async reconcile(id: string): Promise<void> {
+    if (this.active.has(id)) throw new CallerStorageHelperUnconfirmedError();
+    await this.cleanup(id);
+  }
+  private async cleanup(id: string): Promise<void> {
+    const raw = await this.store.storageHelper(id);
+    if (!raw) return;
+    try {
+      const helper = HelperRecord.parse(JSON.parse(raw));
+      const inspected = await this.run(['container', 'inspect', helper.name], { timeoutMs: 30_000 });
+      if (inspected.exitCode !== 0) {
+        if (!/No such (container|object)/i.test(inspected.stderr)) throw new Error('cannot inspect storage helper');
+        // Creation and starting are separate requests. An unacknowledged create
+        // may leave a late STOPPED container, but cannot run privileged work.
+        await this.store.clearStorageHelper(id);
+        return;
+      }
+      const [container] = JSON.parse(inspected.stdout);
+      if (!/^[a-f0-9]{64}$/.test(container.Id) || container.Name !== `/${helper.name}` ||
+          container.Config?.Image !== helper.image ||
+          Object.entries(this.labels(id, helper.name)).some(([key, value]) => container.Config?.Labels?.[key] !== value))
+        throw new Error('storage helper ownership mismatch');
+      // Remove by immutable ID. A delayed start request cannot start a
+      // replacement container after this ID is deleted.
+      const removed = await this.run(['rm', '-f', container.Id], { timeoutMs: 30_000 });
+      if (removed.exitCode !== 0 && !/No such (container|object)/i.test(removed.stderr))
+        throw new Error('cannot remove storage helper');
+      const checked = await this.run(['container', 'inspect', container.Id], { timeoutMs: 30_000 });
+      if (checked.exitCode === 0 || !/No such (container|object)/i.test(checked.stderr))
+        throw new Error('storage helper removal not confirmed');
+      await this.store.clearStorageHelper(id);
+    } catch (error) {
+      throw new CallerStorageHelperUnconfirmedError(error);
+    }
+  }
   async manage(action: 'create' | 'attach' | 'check' | 'delete', id: string, signal?: AbortSignal) {
     const policy = this.options.fixedImageStorage!;
     const record = await this.record(id);
+    if (await this.store.storageHelper(id)) throw new CallerStorageHelperUnconfirmedError();
     const name = `vb-storage-${randomUUID()}`;
     signal?.throwIfAborted();
+    if (this.active.has(id)) throw new CallerStorageHelperUnconfirmedError();
+    this.active.add(id);
     try {
-      const result = await this.run(['run', '--name', name, '--rm', '--privileged',
-        '--network', 'none', '--read-only', '--log-driver', 'none',
-        '--tmpfs', '/mnt:rw,nosuid,nodev', '--tmpfs', '/tmp:rw,nosuid,nodev',
-        '--mount', 'type=bind,src=/dev,dst=/dev',
-        '--mount', `type=volume,src=${policy.poolVolume},dst=/pool`,
-        policy.image, action, record.key, record.uuid, String(record.size),
-        String(policy.capacityMiB * 1048576), String(policy.reserveMiB * 1048576)],
-      { signal, timeoutMs: 300_000 });
-      if (result.exitCode !== 0) throw new Error(`caller storage ${action} failed: ${result.stderr.trim()}`);
-      signal?.throwIfAborted();
-    } finally {
-      // Killing the local docker CLI does not stop a remote privileged helper.
-      // Do not release the caller lease until daemon-side termination is confirmed.
-      const removed = await this.run(['rm', '-f', name], { timeoutMs: 30_000 });
-      if (removed.exitCode !== 0 && !/No such (container|object)/i.test(removed.stderr))
-        throw new Error('storage helper termination unconfirmed; inspect Docker before retrying');
-    }
+      await this.store.recordStorageHelper(id, JSON.stringify({ name, image: policy.image }));
+      try {
+        const created = await this.run(['create', '--name', name, '--privileged',
+          ...Object.entries(this.labels(id, name)).flatMap(([key, value]) => ['--label', `${key}=${value}`]),
+          '--network', 'none', '--read-only', '--log-driver', 'none',
+          '--tmpfs', '/mnt:rw,nosuid,nodev', '--tmpfs', '/tmp:rw,nosuid,nodev',
+          '--mount', 'type=bind,src=/dev,dst=/dev',
+          '--mount', `type=volume,src=${policy.poolVolume},dst=/pool`,
+          policy.image, action, record.key, record.uuid, String(record.size),
+          String(policy.capacityMiB * 1048576), String(policy.reserveMiB * 1048576)],
+        { signal, timeoutMs: 30_000 });
+        if (created.exitCode !== 0) throw new Error(`cannot create caller storage helper: ${created.stderr.trim()}`);
+        const containerId = created.stdout.trim();
+        if (!/^[a-f0-9]{64}$/.test(containerId)) throw new Error('invalid storage helper container ID');
+        signal?.throwIfAborted();
+        const result = await this.run(['start', '--attach', containerId], { signal, timeoutMs: 300_000 });
+        if (result.exitCode !== 0) throw new Error(`caller storage ${action} failed: ${result.stderr.trim()}`);
+        signal?.throwIfAborted();
+      } finally {
+        // Persisted intent survives process death. Do not clear it unless Docker
+        // confirms removal; stop/close/startup retry the same reconciliation.
+        await this.cleanup(id);
+      }
+    } finally { this.active.delete(id); }
   }
 }

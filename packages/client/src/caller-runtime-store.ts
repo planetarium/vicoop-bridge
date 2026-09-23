@@ -297,6 +297,7 @@ export class CallerRuntimeStore {
     db.exec('CREATE TABLE IF NOT EXISTS completed_allocations (id TEXT PRIMARY KEY NOT NULL)');
     db.exec('CREATE TABLE IF NOT EXISTS pending_reservations (id TEXT PRIMARY KEY NOT NULL)');
     db.exec('CREATE TABLE IF NOT EXISTS fixed_storage (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL)');
+    db.exec('CREATE TABLE IF NOT EXISTS storage_helpers (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL)');
     if (migrating) await this.atomicWrite(manifestPath, expected);
     // Legacy JSON files remain as an inert migration backup, never read again.
   }
@@ -385,8 +386,20 @@ export class CallerRuntimeStore {
     await this.atomicWrite(join(this.directory, 'manifest.json'), { version: 5, agentId: this.agentId, host: hostname() });
     this.db().prepare('INSERT INTO fixed_storage (id, record) VALUES (?, ?)').run(id, record);
   }
+  async storageHelper(id: string): Promise<string | undefined> {
+    const row = this.db().prepare('SELECT record FROM storage_helpers WHERE id = ?').get(id);
+    return row ? z.object({ record: z.string() }).parse(row).record : undefined;
+  }
+  async recordStorageHelper(id: string, record: string): Promise<void> {
+    this.validateRecord(this.db().prepare('SELECT * FROM scopes WHERE id = ?').get(id), id);
+    this.db().prepare('INSERT INTO storage_helpers (id, record) VALUES (?, ?)').run(id, record);
+  }
+  async clearStorageHelper(id: string): Promise<void> {
+    this.db().prepare('DELETE FROM storage_helpers WHERE id = ?').run(id);
+  }
   async forget(id: string): Promise<void> {
     if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('invalid scope ID');
+    if (await this.storageHelper(id)) throw new Error('storage helper termination must be confirmed before forgetting scope');
     const db = this.db();
     db.exec('BEGIN IMMEDIATE');
     try {

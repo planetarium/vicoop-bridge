@@ -94,7 +94,17 @@ assert os.statvfs('/workspace').f_favail==0`);
   await pool.initialize(); pools.push(pool);
   await pool.acquire(bob); await pool.acquire(alice);
   await exec(alice, "assert open('/workspace/marker').read()=='retained'");
+  // Interrupt deletion after volume removal/loop detach, then let B occupy
+  // the stale alias target. Retrying A must not detach B or strand A's budget.
+  await pool.remove(alice, false);
+  await command(['volume', 'rm', `${pool.name(alice)}-storage`]);
+  const aliceRecord = JSON.parse((await pool.store.fixedStorage(alice))!);
+  const bobRecord = JSON.parse((await pool.store.fixedStorage(bob))!);
+  await command(['run', '--rm', '--privileged', '--network', 'none',
+    '--mount', 'type=bind,src=/dev,dst=/dev', '--entrypoint', 'python3', helperImage, '-c',
+    "import os,sys,subprocess; a='/dev/disk/by-uuid/'+sys.argv[1]; b='/dev/disk/by-uuid/'+sys.argv[2]; subprocess.check_call(['losetup','-d',os.readlink(a)]); os.unlink(a); os.symlink(os.readlink(b),a)", aliceRecord.uuid, bobRecord.uuid]);
   await pool.remove(alice, true);
+  await exec(bob, "assert open('/workspace/healthy').read()=='ok';open('/workspace/after-delete','w').write('still healthy')");
   await pool.acquire(charlie, undefined, 'charlie');
   const inspection = JSON.parse(await command(['container', 'inspect', pool.name(charlie)]))[0];
   assert.equal(inspection.HostConfig.Privileged, false);

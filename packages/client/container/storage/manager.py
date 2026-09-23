@@ -106,11 +106,11 @@ def main():
         if action == 'delete':
             # The client first removes all validated Docker consumers and volume.
             if image.exists():
+                if alias.is_symlink():
+                    require(re.fullmatch(r'/dev/loop[0-9]+', os.readlink(alias)), 'unexpected UUID alias target')
                 loops = run('losetup', '-j', str(image)).splitlines()
                 for line in loops:
                     loop = line.split(':', 1)[0]
-                    if alias.is_symlink():
-                        require(os.readlink(alias) == loop, 'UUID alias ownership mismatch')
                     run('losetup', '-d', loop)
                     for _ in range(50):
                         if not run('losetup', '-j', str(image)):
@@ -118,9 +118,9 @@ def main():
                         time.sleep(0.1)
                     require(not run('losetup', '-j', str(image)), 'image still attached; deletion refused')
                 if alias.is_symlink():
-                    # Never remove an alias now pointing to another attached device.
-                    require(subprocess.run(['losetup', os.readlink(alias)], capture_output=True).returncode != 0,
-                            'UUID alias still attached; inspect devices')
+                    # After a crash this alias may point to a recycled loop
+                    # belonging to another image. Remove only our UUID alias;
+                    # detach only devices found by this image's backing inode.
                     alias.unlink()
                 image.unlink()
                 syncdir(root)

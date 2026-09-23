@@ -63,6 +63,9 @@ jobs:
       - name: Test client
         run: pnpm --filter @vicoop-bridge/client test
 
+      - name: Test storage manager recovery
+        run: python3 -B -m unittest discover -s packages/client/container/storage -p 'test_*.py'
+
       - name: Verify embedded caller image recipe is current
         run: |
           node packages/client/scripts/generate-caller-image.mjs

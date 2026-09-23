@@ -571,3 +571,19 @@ test('incomplete allocation quarantines only its caller', async () => {
   assert.match(JSON.stringify(await f.run()), /runtime_quarantined/);
   assert.equal((await f.run(task('bob'))).at(-1)?.type, 'task.complete');
 });
+
+test('unconfirmed storage helper cleanup quarantines caller even if workload stop succeeds', async () => {
+  const { CallerStorageHelperUnconfirmedError } = await import('./caller-storage.js');
+  const f = fixture();
+  let acquisitions = 0;
+  f.pool.acquire = async (_id, _signal, _principal, onReserved, onMutation) => {
+    acquisitions++;
+    onReserved?.(); onMutation?.();
+    throw new CallerStorageHelperUnconfirmedError();
+  };
+  assert.match(JSON.stringify(await f.run()), /runtime_quarantined/);
+  assert.match(JSON.stringify(await f.run()), /runtime_quarantined/);
+  assert.equal(acquisitions, 1);
+  assert.equal(f.stops.length, 1);
+  await f.backend.close();
+});

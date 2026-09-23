@@ -1,4 +1,4 @@
-import { CallerStorage } from './caller-storage.js';
+import { CallerStorage, CallerStorageHelperUnconfirmedError } from './caller-storage.js';
 import { randomUUID } from 'node:crypto';
 import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
 import { CallerRuntimeStore } from './caller-runtime-store.js';
@@ -108,10 +108,13 @@ export class DockerCallerRuntimePool {
           throw new Error('caller image must not declare volumes or provider environment');
       }
       const ids = await this.store.scopes();
+      for (const id of ids) await this.storage.reconcile(id);
       if (this.options.fixedImageStorage) await this.storage.initialize();
       for (const id of ids) {
         const record = await this.store.fixedStorage(id);
-        if (this.options.fixedImageStorage) await this.storage.record(id);
+        if (this.options.fixedImageStorage) {
+          if (record || !(await this.store.reservationPending(id))) await this.storage.record(id);
+        }
         else if (record) throw new Error('fixed-image caller storage requires its original fixedImageStorage configuration');
       }
       if (this.validateExecution && ids.length > this.options.maxScopes)
@@ -139,7 +142,11 @@ export class DockerCallerRuntimePool {
       // Validate before stopping. Never delete or adopt mismatched resources.
       for (const id of ids) {
         await this.store.reserve(id, this.kind);
-        if (reconcile && await this.store.reservationPending(id)) continue;
+        if (await this.store.reservationPending(id) &&
+            (reconcile || (this.options.fixedImageStorage && !(await this.store.fixedStorage(id))))) {
+          if (validateOffline) throw new CallerAllocationIncompleteError();
+          continue;
+        }
         const info = await this.inspect(this.name(id));
         if (info) {
           await this.validate(info, id);
@@ -162,6 +169,7 @@ export class DockerCallerRuntimePool {
       }
       return ids;
     } catch (error) {
+      if (error instanceof CallerStorageHelperUnconfirmedError) throw error;
       await this.store.unlock();
       this.locked = false;
       throw error;
@@ -492,6 +500,12 @@ export class DockerCallerRuntimePool {
       throw new CallerStorageLimitError();
   }
   async stop(id: string): Promise<void> {
+    let helperFailure: unknown;
+    try { await this.storage.reconcile(id); } catch (error) { helperFailure = error; }
+    try { await this.stopContainer(id); }
+    finally { if (helperFailure) throw helperFailure; }
+  }
+  private async stopContainer(id: string): Promise<void> {
     // Unconfirmed reservations may refer to orphan resources; normal cleanup
     // must not touch them. Explicit offline removal still validates ownership.
     if (!this.offline && await this.store.reservationPending(id)) return;
@@ -540,6 +554,21 @@ export class DockerCallerRuntimePool {
     if (!this.locked) throw new Error('caller pool is not initialized');
     await this.stop(id);
     const name = this.name(id);
+    // A process can die between scope reservation and image identity creation.
+    // No helper can have started then. Forget only after proving there are no
+    // Docker resources to adopt or delete under the incomplete identity.
+    if (this.options.fixedImageStorage && !(await this.store.fixedStorage(id)) &&
+        await this.store.reservationPending(id)) {
+      if (!deleteData) throw new CallerAllocationIncompleteError();
+      if (await this.inspect(name) || await this.networkExists(id)) throw new CallerOrphanedResourcesError();
+      for (const suffix of ['workspace', 'sessions', 'storage']) {
+        const found = await this.run(['volume', 'inspect', `${name}-${suffix}`]);
+        if (found.exitCode === 0) throw new CallerOrphanedResourcesError();
+        if (!/no such volume/i.test(found.stderr)) throw new Error('cannot inspect caller volume');
+      }
+      await this.store.forget(id);
+      return;
+    }
     const container = await this.inspect(name);
     if (container) {
       await this.validate(container, id);

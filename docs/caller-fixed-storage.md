@@ -72,6 +72,12 @@ interrupted allocation is quarantined, never automatically reformatted.
 On acquisition, the helper validates UUID, type, size and allocated blocks, then
 reattaches the image and restores its UUID device alias before Docker starts it.
 A missing image/catalog entry fails closed. Back up both client state and pool.
+Helper identities are journaled in client SQLite before Docker creation. Helpers
+are created stopped, then started by immutable container ID. Startup, shutdown
+and failed requests reconcile that journal; unconfirmed termination quarantines
+the caller and prevents releasing runtime ownership. An interrupted scope
+reservation before image identity creation remains safely removable after a
+check that no Docker resources exist for it.
 
 `container recreate SCOPE` retains the filesystem and its files.
 `container remove SCOPE` checks resource ownership and foreign consumers, removes

@@ -390,3 +390,85 @@ test('failed reservation rollback blocks retries and restart without touching or
   finally { await restarted.close(); }
   assert.equal(inspections, 1);
 });
+
+test('reservation interrupted before image identity does not block startup or safe offline removal', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'caller-storage-reservation-'));
+  const image = `sha256:${'a'.repeat(64)}`;
+  const options = CallerRuntimeConfig.parse({ image, stateDirectory: directory, storageMiB: 64,
+    fixedImageStorage: { image, poolVolume: 'pool', capacityMiB: 128, reserveMiB: 64, reservationBoundary: 'docker-filesystem' } });
+  const store = new CallerRuntimeStore(directory, 'agent');
+  await store.lock();
+  const id = scopeDigest('agent', 'alice');
+  await store.reserve(id, 'claude', 'alice', true);
+  await store.unlock();
+  let orphan = false;
+  const calls: string[][] = [];
+  const run: AsyncDockerRun = async args => {
+    calls.push([...args]);
+    if (args[0] === 'image') return { exitCode: 0, stdout: '[{"Config":{}}]', stderr: '' };
+    if (args[0] === 'ps') return { exitCode: 0, stdout: '', stderr: '' };
+    if (args[0] === 'volume' && args[2] === 'pool') return { exitCode: 0, stdout: JSON.stringify([{ Name: 'pool', Driver: 'local', Options: {}, Labels: { 'vicoop.component': 'caller-storage-pool' } }]), stderr: '' };
+    if (args[0] === 'volume' && orphan) return { exitCode: 0, stdout: '[{}]', stderr: '' };
+    if (args[0] === 'volume') return { exitCode: 1, stdout: '', stderr: 'No such volume' };
+    if (args[0] === 'network') return { exitCode: 1, stdout: '', stderr: 'No such network' };
+    if (args[0] === 'container') return { exitCode: 1, stdout: '', stderr: 'No such container' };
+    throw new Error(`unexpected mutation: ${args}`);
+  };
+  const pool = new DockerCallerRuntimePool('claude', options, 'agent', run);
+  t.after(async () => { await pool.close(); await rm(directory, { recursive: true, force: true }); });
+  assert.deepEqual(await pool.initialize(), [id]);
+  await assert.rejects(pool.acquire(id), CallerReservationUnconfirmedError);
+  await pool.close();
+  assert.deepEqual(await pool.initialize(false), [id]);
+  orphan = true;
+  await assert.rejects(pool.remove(id, true), CallerOrphanedResourcesError);
+  assert.deepEqual(await pool.store.scopes(), [id]);
+  orphan = false;
+  await pool.remove(id, true);
+  assert.deepEqual(await pool.store.scopes(), []);
+  assert(!calls.some(args => args[0] === 'rm' || args[0] === 'create' || args[0] === 'start'));
+});
+
+test('unconfirmed helper on restart retains owner until close confirms daemon-side removal', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'caller-helper-recovery-'));
+  const image = `sha256:${'a'.repeat(64)}`, helperId = 'b'.repeat(64);
+  const helperName = 'vb-storage-12345678-1234-1234-1234-123456789abc';
+  const options = CallerRuntimeConfig.parse({ image, stateDirectory: directory, storageMiB: 64,
+    fixedImageStorage: { image, poolVolume: 'pool', capacityMiB: 128, reserveMiB: 64, reservationBoundary: 'docker-filesystem' } });
+  const store = new CallerRuntimeStore(directory, 'agent');
+  const id = scopeDigest('agent', 'alice');
+  await store.lock(); await store.reserve(id, 'claude', 'alice', true);
+  await store.recordStorageHelper(id, JSON.stringify({ name: helperName, image }));
+  await store.unlock();
+  let failRemoval = true, present = true, closed = false;
+  const helper = { Id: helperId, Name: '/' + helperName, Config: { Image: image, Labels: {
+    'vicoop.component': 'caller-storage-helper', 'vicoop.caller-namespace': store.namespace,
+    'vicoop.scope': id, 'vicoop.helper': helperName,
+  } } };
+  const run: AsyncDockerRun = async args => {
+    if (args[0] === 'image') return { exitCode: 0, stdout: '[{"Config":{}}]', stderr: '' };
+    if (args[0] === 'container') return present && [helperName, helperId].includes(args[2])
+      ? { exitCode: 0, stdout: JSON.stringify([helper]), stderr: '' }
+      : { exitCode: 1, stdout: '', stderr: 'No such container' };
+    if (args[0] === 'rm') {
+      assert.equal(args[2], helperId);
+      if (failRemoval) return { exitCode: 1, stdout: '', stderr: 'Docker unavailable' };
+      present = false;
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
+    throw new Error(`unexpected command: ${args}`);
+  };
+  const pool = new DockerCallerRuntimePool('claude', options, 'agent', run);
+  t.after(async () => { failRemoval = false; if (!closed) await pool.close(); await rm(directory, { recursive: true, force: true }); });
+  await assert.rejects(pool.initialize(), /helper termination unconfirmed/);
+  await assert.rejects(pool.close(), /ownership retained/);
+  await assert.rejects(new CallerRuntimeStore(directory, 'agent').lock(), /live owner/);
+  assert(await pool.store.storageHelper(id));
+  failRemoval = false;
+  await pool.close();
+  closed = true;
+  assert.equal(present, false);
+  await store.lock();
+  assert.equal(await store.storageHelper(id), undefined);
+  await store.unlock();
+});
