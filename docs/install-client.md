@@ -1008,6 +1008,22 @@ both de-authorizes it and revokes the underlying token; it takes effect within
 `/admin-api/agents/:id/callers` — all owner-authenticated like the commands
 above.
 
+## Recovering a macOS ARM64 binary killed at startup
+
+The 0.41.0 and 0.40.0 ARM64 release binaries have invalid code signatures
+([#512](https://github.com/planetarium/vicoop-bridge/issues/512)). On macOS 27,
+even `--version` can be killed before startup, so `upgrade` cannot run.
+The release compiler is now pinned to Bun 1.4.2, which fixes the ARM64 signer;
+this does not repair already downloaded binaries.
+
+Once a corrected client release is published, download its macOS ARM64 binary
+and `.sha256` file into a separate directory. Verify the checksum with
+`shasum -a 256 -c <binary>.sha256`, make it executable, and check
+`codesign --verify --strict <binary>` and `./<binary> --version` before
+replacing only the installed `vicoop-client` executable. Retain the install
+directory and its state, and restart the client afterward. Do not use
+`FORCE=1 install.sh` for this recovery: it deletes the entire install directory.
+
 ## Updating the client
 
 Once installed, the client updates itself — do not re-run `install.sh`. The

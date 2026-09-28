@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/client-ci.yml'
+      - '.github/workflows/release.yml'
       - 'packages/client/**'
       - 'container/backends/claude.sh'
       - 'packages/protocol/**'
@@ -15,6 +16,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/client-ci.yml'
+      - '.github/workflows/release.yml'
       - 'packages/client/**'
       - 'container/backends/claude.sh'
       - 'packages/protocol/**'
@@ -49,7 +51,7 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.2.20
+          bun-version: 1.4.2
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -104,6 +106,14 @@ jobs:
           echo "linux-x64 binary --version: $GOT"
           VICOOP_CLIENT_BIN="$(realpath "$BIN")" node packages/client/scripts/storage-init-packaging-smoke.mjs
 
+      - name: Upload macOS ARM64 binary for native validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-macos-arm64
+          path: dist-release/*-macos-arm64*
+          if-no-files-found: error
+          retention-days: 1
+
   storage-init:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -122,3 +132,34 @@ jobs:
         env:
           VICOOP_FIXED_STORAGE_TEST: '1'
         run: pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-storage-init.integration.test.ts
+
+  validate-macos-arm64:
+    needs: validate
+    runs-on: macos-15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      # Test the Linux-built bytes without rebuilding or re-signing them.
+      - name: Download cross-compiled macOS ARM64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: client-macos-arm64
+          path: dist-release
+
+      - name: Verify checksum, signature, and CLI startup
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          CLIENT_VERSION="$(node -p "require('./packages/client/package.json').version")"
+          cd dist-release
+          BIN="vicoop-client-${CLIENT_VERSION}-macos-arm64"
+          shasum -a 256 -c "$BIN.sha256"
+          chmod +x "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          GOT="$("./$BIN" --version)"
+          if [[ "$GOT" != "$CLIENT_VERSION" ]]; then
+            echo "::error::compiled binary reported '$GOT', expected '$CLIENT_VERSION'"
+            exit 1
+          fi
+          "./$BIN" --help
