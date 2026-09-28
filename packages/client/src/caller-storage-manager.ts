@@ -33,6 +33,33 @@ function isSymlink(path: string): boolean {
   try { return lstatSync(path).isSymbolicLink(); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
 }
+/** udev can publish/remove UUID links independently of our pool flock.
+ * Create first, then inspect EEXIST with readlink (no lstat/exists TOCTOU).
+ * Keep an already-correct link, including udev's relative spelling.
+ */
+export async function ensureStorageAlias(alias: string, loop: string, fs: {
+  symlinkSync(target: string, path: string): void;
+  readlinkSync(path: string): string;
+  unlinkSync(path: string): void;
+} = {
+  symlinkSync, readlinkSync, unlinkSync,
+}): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    try { fs.symlinkSync(loop, alias); return; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+    try {
+      const target = fs.readlinkSync(alias);
+      requireState(/^(?:\/dev\/|\.\.\/\.\.\/)loop[0-9]+$/.test(target), 'unexpected UUID alias target');
+      if (target.replace('../../', '/dev/') === loop) return;
+      // A stale link is not authority to detach a device. Only replace the link.
+      fs.unlinkSync(alias);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    await setTimeout(10);
+  }
+  throw new Error('UUID alias did not stabilize; retry attachment');
+}
 function syncPath(path: string, directory = false) {
   const fd = openSync(path, constants.O_RDONLY | (directory ? constants.O_DIRECTORY : 0));
   try { fsyncSync(fd); } finally { closeSync(fd); }
@@ -133,7 +160,11 @@ export async function runStorageManager(request: StorageRequest, options: {
     if (action === 'delete') {
       // The client first removes validated Docker consumers and their volume.
       if (existsSync(image)) {
-        if (isSymlink(alias)) requireState(/^(?:\/dev\/|\.\.\/\.\.\/)loop[0-9]+$/.test(readlinkSync(alias)), 'unexpected UUID alias target');
+        try {
+          requireState(/^(?:\/dev\/|\.\.\/\.\.\/)loop[0-9]+$/.test(readlinkSync(alias)), 'unexpected UUID alias target');
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
         const loops = run('losetup', '-j', image).split('\n').filter(Boolean);
         for (const line of loops) {
           const loop = line.split(':', 1)[0];
@@ -146,7 +177,8 @@ export async function runStorageManager(request: StorageRequest, options: {
         }
         // A stale alias can point to a loop recycled by another scope. Remove
         // only our alias; detach only devices identified by this image's inode.
-        if (isSymlink(alias)) unlinkSync(alias);
+        try { unlinkSync(alias); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
         unlinkSync(image);
         syncPath(root, true);
       }
@@ -165,11 +197,7 @@ export async function runStorageManager(request: StorageRequest, options: {
     const loop = run('losetup', '--find', '--show', '--nooverlap', image);
     requireState(run('blkid', '-p', '-s', 'UUID', '-o', 'value', loop) === uuid, 'attached device UUID mismatch');
     mkdirSync(aliases, { recursive: true, mode: 0o700 });
-    if (isSymlink(alias)) {
-      requireState(/^(?:\/dev\/|\.\.\/\.\.\/)loop[0-9]+$/.test(readlinkSync(alias)), 'unexpected UUID alias target');
-      unlinkSync(alias);
-    } else requireState(!existsSync(alias), 'UUID alias is not a symlink');
-    symlinkSync(loop, alias);
+    await ensureStorageAlias(alias, loop);
     return { uuid, bytes: size };
   } finally { db.close(); }
 }

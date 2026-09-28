@@ -99,7 +99,7 @@ test('fixed image runtime: ENOSPC, independent callers, recreation, admission an
   const bobRecord = JSON.parse((await pool.store.fixedStorage(bob))!);
   await command(['run', '--rm', '--privileged', '--network', 'none',
     '--mount', 'type=bind,src=/dev,dst=/dev', '--entrypoint', 'node', image, '-e',
-    "const fs=require('node:fs'),cp=require('node:child_process'); const a='/dev/disk/by-uuid/'+process.argv[1],b='/dev/disk/by-uuid/'+process.argv[2];cp.execFileSync('losetup',['-d',fs.readlinkSync(a)]);fs.unlinkSync(a);fs.symlinkSync(fs.readlinkSync(b),a);", aliceRecord.uuid, bobRecord.uuid]);
+    "const fs=require('node:fs'),cp=require('node:child_process'); const a='/dev/disk/by-uuid/'+process.argv[1],b='/dev/disk/by-uuid/'+process.argv[2];cp.execFileSync('losetup',['-d',fs.realpathSync(a)]);fs.rmSync(a,{force:true});fs.symlinkSync(fs.readlinkSync(b),a);", aliceRecord.uuid, bobRecord.uuid]);
   await pool.remove(alice, true);
   await exec(bob, "assert.equal(fs.readFileSync('/workspace/healthy','utf8'),'ok');fs.writeFileSync('/workspace/after-delete','still healthy')");
   await pool.acquire(charlie, undefined, 'charlie');
