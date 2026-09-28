@@ -6,6 +6,8 @@ import WebSocket from 'ws';
 import type { TaskArtifactUpdateEvent, TaskStatusUpdateEvent } from '@a2x/sdk';
 import {
   CALLER_CONTEXT_CAPABILITY,
+  CALLER_CONTEXT_V2_CAPABILITY,
+  EXECUTION_SCOPE_V1_CAPABILITY,
   encodeFrame,
   OPENAI_COMPAT_EXTENSION_URI,
   parseDownFrame,
@@ -1357,6 +1359,66 @@ test('a terminal replay from an old execution cannot complete a reused taskId', 
     }));
     await withTimeout(second.finished, 5_000, 'new terminal');
     assert.equal(second.statuses.at(-1)?.status.state, 'completed');
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});
+
+
+test('execution scope acknowledgement requires the full capability set', async () => {
+  for (const callerV2 of [false, true]) {
+    const server = createServer();
+    const registry = new Registry();
+    attachWsServer(server, { db: mockSql(), registry });
+    const port = await listen(server);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+    try {
+      await once(ws, 'open');
+      const ack = once(ws, 'message');
+      ws.send(encodeFrame({
+        type: 'hello', version: PROTOCOL_VERSION, agentId: 'agent-1', token: 'token',
+        protocolCapabilities: [TASK_REPLAY_CAPABILITY, EXECUTION_SCOPE_V1_CAPABILITY, 'caller-runtime-v1',
+          ...(callerV2 ? [CALLER_CONTEXT_V2_CAPABILITY] : [])],
+        agentCard: { name: 'agent', version: '0.0.0', protocolVersion: '0.3.0' },
+      }));
+      const [raw] = await withTimeout(ack, 5_000, 'scope acknowledgement');
+      const frame = parseDownFrame(raw.toString());
+      assert.equal(frame.type, 'hello.ack');
+      if (frame.type === 'hello.ack') {
+        assert.equal(frame.protocolCapabilities.includes(EXECUTION_SCOPE_V1_CAPABILITY), callerV2);
+        assert.equal(frame.protocolCapabilities.includes('caller-runtime-v1'), callerV2);
+        assert.equal(frame.protocolCapabilities.includes(CALLER_CONTEXT_V2_CAPABILITY), callerV2);
+      }
+    } finally {
+      ws.close();
+      await closeServer(server);
+    }
+  }
+});
+
+
+test('legacy hello without protocol capabilities registers and processes task frames', async () => {
+  const server = createServer();
+  const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+  try {
+    await once(ws, 'open');
+    ws.send(encodeFrame({ type: 'hello', version: PROTOCOL_VERSION,
+      agentId: 'agent-1', token: 'token',
+      agentCard: { name: 'legacy', version: '0.0.0', protocolVersion: '0.3.0' },
+    }));
+    await waitForAgent(registry, 'agent-1');
+    assert.equal(ws.readyState, WebSocket.OPEN);
+    const sink = makeSink();
+    registry.bindTask({ agentId: 'agent-1', taskId: 'legacy-task', contextId: 'legacy-context', sink });
+    ws.send(encodeFrame({ type: 'task.fail', taskId: 'legacy-task',
+      error: { code: 'test', message: 'legacy transport works' },
+    }));
+    await withTimeout(sink.finished, 5000, 'legacy task terminal');
+    assert.equal(sink.statuses[0]?.status.state, 'failed');
   } finally {
     ws.close();
     await closeServer(server);

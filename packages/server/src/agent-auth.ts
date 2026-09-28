@@ -1,3 +1,4 @@
+import { CALLER_RUNTIME_V1_CAPABILITY } from '@vicoop-bridge/protocol';
 import type { Context, Next } from 'hono';
 import type { ClientConnection, Registry } from './registry.js';
 import type { Sql } from './db.js';
@@ -257,6 +258,7 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
     // an anonymous public request and bypass immediate revocation.
     if (
       conn.allowedCallers.length === 0 &&
+      !conn.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) &&
       !bearerToken?.startsWith(TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX)
     ) {
       return next();
@@ -427,7 +429,8 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
     const allowed =
       caller.tokenExchange !== undefined
         ? true
-        : conn.allowedCallers.some((entry) => matchPrincipal(entry, caller));
+        : (conn.allowedCallers.length === 0 && conn.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY)) ||
+          conn.allowedCallers.some((entry) => matchPrincipal(entry, caller));
     if (!allowed) {
       const rejectionId = newRejectionId();
       logEvent('agent_request_rejected', {

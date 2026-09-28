@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { createExecutionAuthBroker, BrokerRejection } from './execution-auth-broker.js';
 import { createPinnedClaudeOAuthReader } from './backends/claude-usage.js';
 export type ClaudeProviderCredential = { kind: 'oauth' | 'api-key'; secret: string };
@@ -31,15 +32,26 @@ export function createClaudeCredentialReader(env: NodeJS.ProcessEnv = process.en
   };
 }
 
+// Only deliberately shared, bounded settings may reach an untrusted caller's argv.
+// strict() rejects hooks/helpers, arbitrary environment, and future unknown keys.
+const callerSettings = z.object({
+  model: z.string().regex(/^(?:sonnet|opus|haiku|claude-[a-z0-9.-]+)(?:\[1m\])?$/).optional(),
+  effortLevel: z.enum(['low', 'medium', 'high', 'max']).optional(),
+  alwaysThinkingEnabled: z.boolean().optional(),
+  sandbox: z.object({ enabled: z.boolean().optional(), failIfUnavailable: z.boolean().optional() }).strict().optional(),
+  env: z.object({ ENABLE_PROMPT_CACHING_1H: z.enum(['0', '1']).optional() }).strict().optional(),
+}).strict();
+
+export function selectClaudeCallerSettings(settings: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (settings === undefined) return undefined;
+  const result = callerSettings.safeParse(settings);
+  if (!result.success)
+    throw new Error('Claude container settings support only model, effortLevel, alwaysThinkingEnabled, sandbox enabled/failIfUnavailable, and env.ENABLE_PROMPT_CACHING_1H (0 or 1); host hooks, helpers and other environment/settings are unsupported');
+  return result.data; // Parsed copy, never the operator's mutable settings object.
+}
+
 export function assertClaudeBrokerSettings(settings: Record<string, unknown> | undefined): void {
-  if (!settings) return;
-  if (['apiKeyHelper', 'awsAuthRefresh', 'awsCredentialExport'].some(k => k in settings)) {
-    throw new Error('Claude container authentication helpers are unsupported; use host login or a host API key');
-  }
-  if (settings.env && typeof settings.env === 'object' && Object.keys(settings.env).some(k =>
-    /^(ANTHROPIC_|CLAUDE_CODE_OAUTH|CLAUDE_CODE_USE_|AWS_|AZURE_|GOOGLE_APPLICATION_CREDENTIALS$)/.test(k))) {
-    throw new Error('Claude container provider environment must be configured on the host, not in agent settings');
-  }
+  selectClaudeCallerSettings(settings);
 }
 
 export interface BrokerOptions {

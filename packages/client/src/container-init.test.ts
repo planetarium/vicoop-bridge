@@ -1,6 +1,9 @@
 import test from 'node:test';
+import { parse } from '@optique/core/parser';
 import assert from 'node:assert/strict';
 import {
+  containerCmd,
+  runContainerInitCli,
   formatRuntimeList,
   formatRuntimeListJson,
   formatRuntimeRemoveJson,
@@ -394,4 +397,18 @@ test('container validate CLI reports success, inspect failure and unsafe boundar
   const message = errors.pop()!;
   assert.match(message, /^container validate failed: codex runtime requires host-broker migration/);
   assert.ok(!message.includes('sensitive-provider-key'));
+});
+
+
+test('empty retired init options still report migration guidance', async (t) => {
+  const errors: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => errors.push(args.join(' ')));
+  for (const flag of ['--name', '--workspace', '--bridge']) {
+    const result = parse(containerCmd, ['container', 'init', 'claude', flag, '']);
+    assert.ok(result.success);
+    assert.equal(result.value.action, 'container-init');
+    if (result.value.action === 'container-init') assert.equal(await runContainerInitCli(result.value), 1);
+  }
+  assert.equal(errors.length, 3);
+  for (const error of errors) assert.match(error, /shared-container|retired/);
 });

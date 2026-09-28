@@ -211,8 +211,11 @@ export async function loadCodexModelCatalog(
   credential: CodexCredentialReader,
   version: string,
   fetchImpl: typeof fetch = fetch,
+  signal?: AbortSignal,
 ): Promise<string | undefined> {
+  signal?.throwIfAborted();
   const auth = await credential();
+  signal?.throwIfAborted();
   if (auth.kind !== 'oauth') return undefined;
   if (!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(version))
     throw new Error('Invalid Codex version');
@@ -227,7 +230,7 @@ export async function loadCodexModelCatalog(
         originator: 'codex_cli_rs',
       },
       redirect: 'error',
-      signal: AbortSignal.timeout(10000),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000),
     },
   );
   if (!response.ok || !response.body) {
@@ -242,6 +245,7 @@ export async function loadCodexModelCatalog(
       throw new Error('Codex model catalog exceeds limit');
     chunks.push(chunk);
   }
+  signal?.throwIfAborted();
   const text = Buffer.concat(chunks).toString();
   if (text.includes(auth.secret))
     throw new Error('Invalid Codex model catalog');

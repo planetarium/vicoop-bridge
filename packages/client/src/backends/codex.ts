@@ -31,7 +31,7 @@ import {
   buildOpenAICompatUsage,
   type OpenAICompatUsage,
 } from './openai-compat-usage.js';
-import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME } from './fetch-uri-file.js';
+import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME, decodedBase64Size } from './fetch-uri-file.js';
 import { createTimingRecorder } from './timing.js';
 import {
   AppServerRpcClient,
@@ -81,8 +81,8 @@ export interface CodexBackendOptions {
   heartbeatMs?: number;
   setIntervalFn?: (fn: () => void, ms: number) => unknown;
   clearIntervalFn?: (handle: unknown) => void;
-  mkdtemp?: (prefix: string) => Promise<string>;
-  writeFile?: (file: string, data: Buffer) => Promise<void>;
+  mkdtemp?: (prefix: string, signal?: AbortSignal) => Promise<string>;
+  writeFile?: (file: string, data: Buffer, signal?: AbortSignal) => Promise<void>;
   rm?: (file: string, options: { recursive: boolean; force: boolean }) => Promise<void>;
   logger?: Logger;
   // Wait this long for `initialize` to complete on the first task before
@@ -225,13 +225,6 @@ function clipTo(text: string, max: number): string {
   return `${text.slice(0, Math.max(0, max - 1))}…`;
 }
 
-function decodedBase64Size(b64: string): number {
-  if (b64.length === 0) return 0;
-  let pad = 0;
-  if (b64.endsWith('==')) pad = 2;
-  else if (b64.endsWith('=')) pad = 1;
-  return Math.max(0, Math.floor((b64.length * 3) / 4) - pad);
-}
 
 function imageExtForMime(mime: string): string {
   switch (mime) {
@@ -268,10 +261,11 @@ export type MappedInput =
 export async function mapPartsToCodexInput(
   parts: readonly Part[],
   io: {
-    mkdtemp: (prefix: string) => Promise<string>;
-    writeFile: (file: string, data: Buffer) => Promise<void>;
+    mkdtemp: (prefix: string, signal?: AbortSignal) => Promise<string>;
+    writeFile: (file: string, data: Buffer, signal?: AbortSignal) => Promise<void>;
     rm: (file: string, options: { recursive: boolean; force: boolean }) => Promise<void>;
   },
+  signal?: AbortSignal,
 ): Promise<MappedInput> {
   const textParts: string[] = [];
   const dataParts: string[] = [];
@@ -326,11 +320,14 @@ export async function mapPartsToCodexInput(
   const imageFiles: string[] = [];
   if (pendingImages.length > 0) {
     try {
-      tempDir = await io.mkdtemp(path.join(os.tmpdir(), 'vicoop-codex-'));
+      signal?.throwIfAborted();
+      tempDir = await io.mkdtemp(path.join(os.tmpdir(), 'vicoop-codex-'), signal);
+      signal?.throwIfAborted();
       for (let i = 0; i < pendingImages.length; i++) {
         const image = pendingImages[i];
         const filePath = path.join(tempDir, `image-${i + 1}${imageExtForMime(image.mime)}`);
-        await io.writeFile(filePath, Buffer.from(image.bytes, 'base64'));
+        await io.writeFile(filePath, Buffer.from(image.bytes, 'base64'), signal);
+        signal?.throwIfAborted();
         imageFiles.push(filePath);
       }
     } catch (err) {
@@ -680,8 +677,8 @@ export function createCodexBackend(
   const clearIntervalImpl =
     opts.clearIntervalFn ??
     ((h) => clearInterval(h as ReturnType<typeof setInterval>));
-  const mkdtemp = opts.mkdtemp ?? fs.mkdtemp;
-  const writeFile = opts.writeFile ?? fs.writeFile;
+  const mkdtemp: NonNullable<CodexBackendOptions['mkdtemp']> = opts.mkdtemp ?? ((prefix) => fs.mkdtemp(prefix));
+  const writeFile: NonNullable<CodexBackendOptions['writeFile']> = opts.writeFile ?? ((file, data, signal) => fs.writeFile(file, data, { signal }));
   const rm = opts.rm ?? fs.rm;
   const logger = opts.logger ?? createLogger();
   const initializeTimeoutMs = opts.initializeTimeoutMs ?? 10_000;
@@ -1141,7 +1138,7 @@ export function createCodexBackend(
           mkdtemp,
           writeFile,
           rm,
-        });
+        }, signal);
         recorder.mark('map');
 
         // Tool-continuation edge case (openai-compat spec): the inbound
@@ -1156,6 +1153,10 @@ export function createCodexBackend(
           mappedRaw.code === 'empty_prompt' &&
           (envelopeChatHistory?.length ?? 0) > 0;
         if (!mappedRaw.ok && !isToolContinuation) {
+          if (signal.aborted) {
+            emit({ type: 'task.complete', taskId: task.taskId, status: { state: 'canceled', timestamp: new Date().toISOString() } });
+            return;
+          }
           emit({
             type: 'task.fail',
             taskId: task.taskId,

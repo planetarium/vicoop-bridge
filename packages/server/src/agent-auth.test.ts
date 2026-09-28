@@ -433,3 +433,13 @@ test('each rejection gets its own id (no shared / cached id across requests)', a
   const body2 = (await res2.json()) as { error: { data: { rejectionId: string } } };
   assert.notEqual(body1.error.data.rejectionId, body2.error.data.rejectionId);
 });
+
+test('caller runtime public agent requires authentication and accepts verified direct callers', async () => {
+  const { app, registry } = buildApp({ siweDomain: 'bridge.example' });
+  registerAgent(registry, 'isolated-public', [], ['caller-runtime-v1', CALLER_CONTEXT_V2_CAPABILITY]);
+  const url = '/agents/isolated-public';
+  assert.equal((await app.request(url, { method: 'POST' })).status, 401);
+  assert.equal((await app.request(url, { method: 'POST', headers: { Authorization: 'Bearer invalid' } })).status, 401);
+  const bearer = await mintBearer({ domain: 'bridge.example', uri: 'https://bridge.example' });
+  assert.equal((await app.request(url, { method: 'POST', headers: { Authorization: `Bearer ${bearer}` } })).status, 200);
+});

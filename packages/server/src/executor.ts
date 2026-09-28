@@ -24,10 +24,12 @@ import { readTaskUsage } from './x402/usage.js';
 import type { Sql } from './db.js';
 import {
   TASK_REPLAY_CAPABILITY,
+  CALLER_RUNTIME_V1_CAPABILITY,
   type CallerAttestationV2,
   type Part as WirePart,
 } from '@vicoop-bridge/protocol';
 import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
+import { resolveDirectExecutionScope } from './execution-scope.js';
 import {
   createCanonicalCallerContext,
   selectCallerContextVersion,
@@ -128,6 +130,7 @@ export function stripInternalMetadata(
     // cross the WS boundary where a backend might mistake them for verified
     // context.
     if (key === 'caller' || key === 'callerContext' || key === 'caller_context') continue;
+    if (key === 'executionScope' || key === 'execution_scope') continue;
     if (
       key === 'mentionable' &&
       typeof value === 'object' &&
@@ -402,6 +405,27 @@ export class WSForwardingExecutor extends AgentExecutor {
     const forwardMetadata = stripInternalMetadata(rawMetadata);
     const requestedExtensions = message.extensions;
 
+    const capabilities = this.registry.getAgent(this.agentId)?.protocolCapabilities;
+    if (capabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) && !resolveDirectExecutionScope({
+      agentId: this.agentId, principalId, actorId, authorizationKey, authorizationProfile, capabilities,
+    })) {
+      const status = {
+        state: TaskState.FAILED,
+        timestamp: new Date().toISOString(),
+        message: { messageId: randomUUID(), role: 'agent' as const,
+          parts: [{ text: 'container runtime requires a directly authenticated principal; delegation is unsupported' }], taskId, contextId },
+      };
+      task.status = status;
+      task.history = appendHistoryMessage(appendHistoryMessage(task.history ?? [], message), status.message);
+      try {
+        await this.taskStore.updateTask(taskId, { status, history: task.history });
+      } catch (err) {
+        logEvent('task_persist_error', { taskId, error: String(err) });
+      }
+      yield { taskId, contextId, final: true, status };
+      return;
+    }
+
     // x402 payment gate. Runs before the task is bound or forwarded, so an
     // unpaid call never reaches the connected agent and never consumes its
     // capacity. `settlement` is set only when a payment was verified and is
@@ -465,6 +489,10 @@ export class WSForwardingExecutor extends AgentExecutor {
           })
         : undefined;
     const caller = serializeCallerContext(canonicalCaller, callerContextVersion);
+    const executionScope = caller === undefined ? undefined : resolveDirectExecutionScope({
+      agentId: this.agentId, principalId, actorId, authorizationKey, authorizationProfile,
+      capabilities: this.registry.getAgent(this.agentId)?.protocolCapabilities,
+    });
     if (callerContextVersion !== undefined && hasCallerInput && caller === undefined) {
       // Do not put the raw principal or schema details in logs. An invalid
       // transport-owned value is omitted instead of emitting a task.assign
@@ -558,6 +586,7 @@ export class WSForwardingExecutor extends AgentExecutor {
       },
       ...(message.extensions !== undefined ? { requestedExtensions: message.extensions } : {}),
       ...(caller !== undefined ? { caller } : {}),
+      ...(executionScope !== undefined ? { executionScope } : {}),
     });
 
     if (!sent) {

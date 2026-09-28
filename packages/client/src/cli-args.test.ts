@@ -165,19 +165,19 @@ test('--cwd with a non-process-spawning backend is a hard error', () => {
   );
 });
 
-test('--runtime + --cwd with --backend claude is accepted', () => {
+test('host runtime accepts a working directory', () => {
   // Positive control: the supported pairing must still parse cleanly.
   const r = mergeClientArgs(
-    { token: 't', agentId: 'a', backend: 'claude', runtime: 'container', cwd: '/repo' },
+    { token: 't', agentId: 'a', backend: 'claude', runtime: 'host', cwd: '/repo' },
     {},
   );
   assert.equal(r.ok, true);
   if (!r.ok) return;
-  assert.equal(r.args.runtime, 'container');
+  assert.equal(r.args.runtime, 'host');
   assert.equal(r.args.cwd, '/repo');
 });
 
-test('--runtime-name is accepted for container-capable backends', () => {
+test('container runtime rejects legacy shared runtime names', () => {
   const r = mergeClientArgs(
     {
       token: 't',
@@ -188,9 +188,9 @@ test('--runtime-name is accepted for container-capable backends', () => {
     },
     {},
   );
-  assert.equal(r.ok, true);
-  if (!r.ok) return;
-  assert.equal(r.args.runtimeName, 'work');
+  assert.equal(r.ok, false);
+  if (r.ok) return;
+  assert.ok(r.errors.some((error) => error.includes('owns its workspace and runtime names')));
 });
 
 test('--runtime-name with a non-runtime-capable backend is a hard error', () => {
@@ -646,4 +646,43 @@ test('legacy daemon env vars remain ignored (identity trust is the sole compatib
       else process.env[k] = v;
     }
   }
+});
+
+
+test('caller isolation without required configuration is rejected before backend startup', () => {
+  for (const backend of ['claude', 'codex'] as const) {
+    for (const source of ['flag', 'config']) {
+      const result = mergeClientArgs(
+        { token: 't', agentId: 'a', backend, ...(source === 'flag' ? { runtime: 'container' as const } : {}) },
+        source === 'config' ? { backends: { [backend]: { runtime: 'container' } } } : {},
+      );
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.ok(result.errors.some((error) => error.includes('caller_runtime')));
+    }
+  }
+});
+
+
+test('Claude and Codex caller runtimes accept complete isolated configuration', () => {
+  for (const backend of ['claude', 'codex'] as const) {
+    const config = {backends:{[backend]:{runtime:'container' as const,caller_runtime:{image:`sha256:${'a'.repeat(64)}`,stateDirectory:'/private/caller-state'}}}};
+    assert.equal(mergeClientArgs({token:'t',agentId:'a',backend},config).ok,true);
+    assert.equal(mergeClientArgs({token:'t',agentId:'a',backend,cwd:'/host-workspace'},config).ok,false);
+  }
+});
+
+
+test('CLI exposes only host and container, rejecting the retired caller-container name', () => {
+  assert.equal(parseFlags(['--runtime', 'host']).ok, true);
+  assert.equal(parseFlags(['--runtime', 'container']).ok, true);
+  assert.equal(parseFlags(['--runtime', 'caller-container']).ok, false);
+});
+
+
+test('retired runtime-name CLI flag is rejected in host mode while stale config remains harmless', () => {
+  const rejected = mergeClientArgs({ token: 't', agentId: 'a', backend: 'claude', runtime: 'host', runtimeName: 'old' }, {});
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) assert.ok(rejected.errors.some(error => error.includes('--runtime-name is retired')));
+  const host = mergeClientArgs({ token: 't', agentId: 'a', backend: 'claude', runtime: 'host' }, { backends: { claude: { runtime_name: 'old' } } });
+  assert.equal(host.ok, true);
 });

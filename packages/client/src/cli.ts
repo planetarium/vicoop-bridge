@@ -1,16 +1,14 @@
 #!/usr/bin/env node
-import { createCodexCredentialReader, createCodexAuthBroker, CODEX_BROKER_VERSION_RANGE, isSupportedCodexBrokerVersion, loadCodexModelCatalog } from './codex-auth-broker.js';
-import { createExecutionBrokerSpawn } from './execution-broker-spawn.js';
-import { createCodexExecutionBackend } from './backends/codex-execution.js';
+import { SHUTDOWN_TIMEOUT_MS, createDaemonShutdown } from './daemon-shutdown.js';
+import { callerStateCmd, runCallerState } from './caller-runtime-admin.js';
+import { createCallerRuntime } from './caller-runtime.js';
 import { parseCodexConfigTomlForModel } from './backends/codex.js';
-import { probeBackendVersion } from './container-init.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { createClaudeCredentialReader, assertClaudeBrokerSettings } from './claude-auth-broker.js';
-import { createClaudeBrokerSpawn } from './claude-broker-spawn.js';
 import { closeSync, existsSync, openSync, readFileSync } from 'node:fs';
 import { spawn as spawnProcess, type ChildProcess } from 'node:child_process';
 import { AgentCard } from '@vicoop-bridge/protocol';
+import { callerRuntimeCard } from './caller-runtime-card.js';
 import { resolveBundledCard } from './bundled-cards.js';
 import { group, longestMatch, object } from '@optique/core/constructs';
 import { optional, withDefault } from '@optique/core/modifiers';
@@ -22,17 +20,14 @@ import { run } from '@optique/run';
 import { Client } from './client.js';
 import { echoBackend } from './backends/echo.js';
 import { createOpenclawBackend } from './backends/openclaw.js';
-import { createClaudeBackend, type ClaudeSpawnFn } from './backends/claude.js';
+import { createClaudeBackend } from './backends/claude.js';
 import { loadClaudeModelCatalog } from './backends/claude-models.js';
 import {
   createCodexBackend,
   type ApprovalDecision,
 } from './backends/codex.js';
-import type { AppServerSpawnFn } from './backends/codex-rpc.js';
 import { createVicoopCodexBackend } from './backends/vicoop-codex.js';
 import type { Backend } from './backend.js';
-import { RuntimeContainer, DEFAULT_RUNTIME_IMAGE } from './runtime-container.js';
-import type { SpawnFn } from './spawn-adapter.js';
 import {
   containerCmd,
   runContainerInitCli,
@@ -72,6 +67,7 @@ import {
 } from './cli-args.js';
 import { createLogger, type Logger } from './logger.js';
 import {
+  CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS,
   claimPidFile,
   defaultLogPath,
   detachChildArgv,
@@ -235,7 +231,7 @@ const cli = longestMatch(
   group('Run the daemon', longestMatch(startCmd, stopCmd, statusCmd)),
   group('Identity', authCmd),
   group('Agents', agentCmd),
-  group('Runtime containers', containerCmd),
+  group('Runtime containers', longestMatch(containerCmd, callerStateCmd)),
   group('Maintenance', longestMatch(upgradeCmd, infoCmd)),
   // Hidden by `hidden: 'help'` on each command; kept in the parser tree
   // for back-compat and "did you mean?" suggestions. Sit outside the
@@ -408,26 +404,21 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       const baseSettings = args.claudeSettingsFile
         ? readClaudeSettingsFile(args.claudeSettingsFile)
         : backends.claude?.settings;
-      if (args.runtime === 'container') assertClaudeBrokerSettings(baseSettings);
-      const { spawn, cwd, runtime } = await resolveRuntime({
-        kind: 'claude',
-        runtime: args.runtime,
-        runtimeName: args.runtimeName,
-        cwd: args.cwd,
-        bridgeUrl: args.server,
-      });
-      // claude's bwrap sandbox is redundant when *we* are already
-      // isolated — either because the daemon spawned an external
-      // runtime container (`runtime` set) or because the daemon
-      // itself is running inside a container (bundled-direct #244).
-      // Either way the outer container is the real isolation
-      // boundary; layering bwrap inside it just makes the runtime
-      // image carry deps it doesn't need and trips
-      // `sandbox.failIfUnavailable` on first task.
-      const isolated = runtime !== undefined || isInsideContainer();
+      if (args.runtime === 'container') {
+        if (args.cwd || args.runtimeName) throw new Error('container owns its workspace and runtime names');
+        const backend = await createCallerRuntime({kind:'claude',agentId:args.agentId,
+          config:backends.claude?.caller_runtime,claude:{
+            identity:deriveIdentity(args.agentId,args.server) ?? undefined,
+            settings:disableClaudeSandboxGuard(baseSettings),model:args.claudeModel,
+            claudeReasoning:args.claudeReasoning,claudeThinkingBudget:args.claudeThinkingBudget,
+          }});
+        return {backend,shutdown:()=>backend.close()};
+      }
+      // A bundled-direct deployment still supplies its own outer isolation.
+      const isolated = isInsideContainer();
       const settings = isolated ? disableClaudeSandboxGuard(baseSettings) : baseSettings;
       const backend = createClaudeBackend({
-        cwd,
+        cwd: args.cwd,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
         settings,
         model: args.claudeModel,
@@ -440,47 +431,33 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         // maxOutputTokens from the Models API (authenticated with the host's
         // subscription OAuth token — same cred the usage path reads).
         resolveModelLimits: () => loadClaudeModelCatalog(),
-        ...(spawn ? { spawn: spawn as ClaudeSpawnFn } : {}),
       });
-      return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };
+      return { backend };
     }
     case 'codex': {
-      const { spawn, cwd, runtime } = await resolveRuntime({
-        kind: 'codex',
-        runtime: args.runtime,
-        runtimeName: args.runtimeName,
-        cwd: args.cwd,
-        bridgeUrl: args.server,
-      });
-      // Same reasoning as the claude branch: codex's host-process
-      // sandbox doubles up with the outer container's isolation.
-      // In a true host context (no runtime container, daemon
-      // running directly on the host) codex's own 'read-only'
-      // default is the right safety floor; in isolated contexts
-      // we lift it to 'danger-full-access' so codex can write to
-      // /workspace and run bash. Operator override
-      // (--codex-sandbox / config) still wins.
-      const isolated = runtime !== undefined || isInsideContainer();
+      if (args.runtime === 'container') {
+        if (args.cwd || args.runtimeName) throw new Error('container owns its workspace and runtime names');
+        const backend = await createCallerRuntime({kind:'codex',agentId:args.agentId,
+          config:backends.codex?.caller_runtime,codex:{
+            appServerArgs:callerCodexArgs(),
+            identity:deriveIdentity(args.agentId,args.server) ?? undefined,
+            approvalDecision:backends.codex?.approval_decision as ApprovalDecision | undefined,
+          }});
+        return {backend,shutdown:()=>backend.close()};
+      }
+      const isolated = isInsideContainer();
       const explicitSandbox = coerceCodexSandbox(args, backends.codex?.sandbox_mode);
       const sandboxMode = isolated
         ? (explicitSandbox ?? 'danger-full-access')
         : explicitSandbox;
-      let appServerArgs: string[] | undefined;
-      if(runtime) {
-        let model: string | null = null;
-        try {model=parseCodexConfigTomlForModel(readFileSync(join(process.env.CODEX_HOME || join(homedir(),'.codex'),'config.toml'),'utf8')).model;} catch {}
-        appServerArgs=['app-server',...(model ? ['-c',`model=${JSON.stringify(model)}`] : [])];
-      }
-      const backend = (runtime ? createCodexExecutionBackend : createCodexBackend)({
-        appServerArgs,
-        cwd,
+      const backend = createCodexBackend({
+        cwd: args.cwd,
         sandboxMode,
         approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
         openaiCompatTrace: args.openaiCompatTrace,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
-        ...(spawn ? { spawn: spawn as AppServerSpawnFn } : {}),
       });
-      return runtime ? { backend, shutdown: () => runtime.stop() } : { backend };
+      return { backend };
     }
     case 'vicoop-codex':
       return {
@@ -496,59 +473,10 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
   }
 }
 
-// Resolves the runtime mode for a claude/codex backend.
-//
-// - 'host' (default): nothing to do. The backend factory's built-in
-//   defaultSpawn handles host child_process.spawn unchanged.
-// - 'container': reuses or starts an existing long-lived vicoop-runtime
-//   container for this kind and returns a docker-exec SpawnFn the
-//   backend factory plugs into its spawn slot. cwd, if any, is
-//   rewritten to /workspace; the original host path is expected to be
-//   the bind-mount source from container init.
-async function resolveRuntime(args: {
-  kind: 'claude' | 'codex';
-  runtime: 'host' | 'container' | undefined;
-  runtimeName: string | undefined;
-  cwd: string | undefined;
-  bridgeUrl: string;
-}): Promise<{ spawn?: SpawnFn; cwd?: string; runtime?: Pick<RuntimeContainer, 'stop'> }> {
-  if ((args.runtime ?? 'host') !== 'container') {
-    return { cwd: args.cwd };
-  }
-  const runtime = new RuntimeContainer({
-    backendKind: args.kind,
-    runtimeName: args.runtimeName,
-    image: process.env.VICOOP_RUNTIME_IMAGE || DEFAULT_RUNTIME_IMAGE,
-    workspaceDir: args.cwd,
-    bridgeUrl: args.bridgeUrl,
-  });
-  // Validate host authentication before accepting tasks. Both supported
-  // container backends use a broker; there is no credential-mounted fallback.
-  try {
-    await runtime.start();
-    if (args.kind === 'claude') {
-      const credential = createClaudeCredentialReader();
-      const selectedCredential = await credential();
-      const broker = createClaudeBrokerSpawn(runtime.getContainerName(), {
-        credential, authentication: selectedCredential.kind, onCredentialFailure: () => console.error('Claude host authentication unavailable; renew the selected host login or key. No fallback was attempted.'),
-      });
-      return { runtime: { stop: async () => { broker.close(); await runtime.stop(); } },
-        spawn: broker.spawn, cwd: args.cwd ? '/workspace' : undefined };
-    } else {
-      const installed=await probeBackendVersion(runtime.getContainerName(),'codex');
-      if(!installed || !isSupportedCodexBrokerVersion(installed)) throw new Error(`Codex container authentication requires Codex ${CODEX_BROKER_VERSION_RANGE}; update the runtime agent`);
-      const credential=createCodexCredentialReader();
-      const selected=await credential();
-      const codexCatalog=await loadCodexModelCatalog(credential,installed);
-      const broker=createExecutionBrokerSpawn(runtime.getContainerName(), {
-        backend:'codex',codexCatalog,createBroker:()=>createCodexAuthBroker({credential,authentication:selected.kind}),
-      });
-      return {runtime:{stop:async()=>{broker.close();await runtime.stop();}},spawn:broker.spawn,cwd:args.cwd ? '/workspace' : undefined};
-    }
-  } catch (err) {
-    await runtime.stop();
-    throw err;
-  }
+function callerCodexArgs(): string[] {
+  let model: string | null = null;
+  try { model=parseCodexConfigTomlForModel(readFileSync(join(process.env.CODEX_HOME || join(homedir(),'.codex'),'config.toml'),'utf8')).model; } catch {}
+  return ['app-server',...(model ? ['-c',`model=${JSON.stringify(model)}`] : [])];
 }
 
 // Container-mode override for claude's sandbox guard. Returns a new
@@ -569,33 +497,6 @@ export function disableClaudeSandboxGuard(
   sandbox.failIfUnavailable = false;
   out.sandbox = sandbox;
   return out;
-}
-
-// Race a shutdown promise against a timeout. Container stop normally
-// completes within docker's grace period (RuntimeContainer.stop()
-// passes t: 10s) but we don't want a wedged daemon socket to hold
-// SIGINT hostage indefinitely — operators expect ctrl-c to actually
-// exit. Resolves either way; the caller decides whether to surface
-// the timeout in logs.
-const SHUTDOWN_TIMEOUT_MS = 15_000;
-async function runWithShutdownTimeout(
-  shutdown: () => Promise<void>,
-  logger: Logger,
-): Promise<void> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    await Promise.race([
-      shutdown(),
-      new Promise<void>((resolve) => {
-        timer = setTimeout(() => {
-          logger.warn(`runtime shutdown exceeded ${SHUTDOWN_TIMEOUT_MS}ms; exiting anyway`);
-          resolve();
-        }, SHUTDOWN_TIMEOUT_MS);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
 }
 
 // Resolve the agent card the daemon should send inline on `hello`. Order:
@@ -656,7 +557,9 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   const raw = args.card
     ? JSON.parse(readFileSync(args.card, 'utf8'))
     : resolveBundledCard(args.backend);
-  const agentCard = raw ? AgentCard.parse(raw) : undefined;
+  const parsedCard = raw ? AgentCard.parse(raw) : undefined;
+  const agentCard = parsedCard && args.runtime === 'container'
+    ? callerRuntimeCard(parsedCard, args.backend, Boolean(args.card)) : parsedCard;
 
   // Emit the resolved backend at startup so operators can verify which
   // backend the precedence chain picked (flag vs. config vs. default
@@ -668,6 +571,15 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   // pickBackend is async because container-mode backends boot a
   // long-lived runtime container before construction (#249).
   const { backend, shutdown: backendShutdown } = await pickBackend(args.backend, args);
+
+  const shutdown = createDaemonShutdown({
+    stop: () => client.stop(),
+    shutdown: backendShutdown,
+    logger,
+    timeoutMs: backend.requiresCallerScope ? CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS : SHUTDOWN_TIMEOUT_MS,
+    removePidFile: process.env.VICOOP_DETACHED === '1' ? removePidFile : undefined,
+    exit: (code) => process.exit(code),
+  });
 
   const client = new Client({
     serverUrl: args.server,
@@ -684,43 +596,14 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     // failure instead of masking it as a transient disconnect. The
     // Client class deliberately does not call process.exit itself —
     // tests and future in-process embedders pass a non-exiting callback.
-    onFatal: () => process.exit(1),
+    onFatal: () => { void shutdown(true); },
   });
 
-  client.start();
-
-  // Async shutdown so the container-mode `runtime.stop()` actually
-  // completes before process.exit. Re-entry guarded: a second
-  // signal (e.g. impatient operator pressing ctrl-c twice) drops to
-  // an immediate exit so the daemon can't get pinned by a wedged
-  // docker socket.
-  // When we are the detached child (spawned by `start --detach`, marked via
-  // VICOOP_DETACHED), we own the pidfile the parent wrote on our behalf.
-  // Remove it on a graceful exit so a daemon that's asked to stop — whether
-  // by `vicoop-client stop` or a direct SIGTERM from a supervisor — doesn't
-  // leave a corpse pidfile behind. A crash exit still leaves a stale file,
-  // but `stop`/`status` detect and clean that.
-  const ownsPidFile = process.env.VICOOP_DETACHED === '1';
-  let shuttingDown = false;
+  // Signals and fatal closes share one cleanup promise and deadline. Only
+  // confirmed cleanup releases an owned pidfile, including fatal exits.
   const onSignal = (signal: NodeJS.Signals) => {
-    if (shuttingDown) {
-      logger.info(`received second ${signal}; forcing exit`);
-      process.exit(130);
-    }
-    shuttingDown = true;
-    void (async () => {
-      logger.info(`shutting down (${signal})`);
-      client.stop();
-      if (ownsPidFile) removePidFile();
-      if (backendShutdown) {
-        try {
-          await runWithShutdownTimeout(backendShutdown, logger);
-        } catch (err) {
-          logger.error('shutdown error:', (err as Error).message);
-        }
-      }
-      process.exit(0);
-    })();
+    logger.info(`shutting down (${signal})`);
+    void shutdown();
   };
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
@@ -755,6 +638,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
       // best-effort — never throw out of an exit handler
     }
   });
+  client.start();
 }
 
 // Race the spawned child's early exit against a short grace timer. A daemon
@@ -817,6 +701,8 @@ async function startDetached(
     process.exit(1);
   }
 
+  const shutdownBudget = resolveDaemonArgs(parsed).runtime === 'container'
+    ? {shutdownTimeoutMs: CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS} : {};
   const path = pidFilePath();
   const logPath = parsed.logFile?.trim() || defaultLogPath();
 
@@ -826,6 +712,7 @@ async function startDetached(
   // sees a coherent "running" record and backs off instead of double-spawning.
   // From here on, every failure path must release the claim via removePidFile.
   const claim = claimPidFile({
+    ...shutdownBudget,
     pid: process.pid,
     startedAt: Date.now(),
     argv: process.argv,
@@ -885,6 +772,7 @@ async function startDetached(
   // identity so `stop`/`status` can later tell it apart from a recycled PID.
   writePidRecord(
     {
+      ...shutdownBudget,
       pid: child.pid,
       startedAt: Date.now(),
       argv: [process.execPath, ...childArgv],
@@ -920,6 +808,9 @@ async function runStop(): Promise<number> {
   }
   const r = await stopDaemon();
   switch (r.outcome) {
+    case 'cleanup-unconfirmed':
+      console.error(`daemon (pid ${r.pid}) cleanup could not be confirmed; pidfile retained. Inspect the daemon log and managed caller containers before restarting.`);
+      return 1;
     case 'not-running':
       console.log('no detached daemon is running.');
       return 0;
@@ -935,7 +826,7 @@ async function runStop(): Promise<number> {
       console.log(
         `daemon (pid ${r.pid}) ignored SIGTERM within the grace period; sent SIGKILL.`,
       );
-      return 0;
+      return 1;
   }
 }
 
@@ -1107,6 +998,10 @@ async function main(): Promise<void> {
       break;
     case 'whoami':
       process.exit(await runWhoami(parsed));
+      break;
+    case 'caller-state':
+      await runCallerState(parsed);
+      process.exit(0);
       break;
     case 'container-validate':
       process.exit(await runContainerValidateCli(parsed));

@@ -202,5 +202,5 @@ export function createExecutionBrokerSpawn(container: string, opts: {
       },
     }) as ChildHandle;
   };
-  return { spawn, close() { stopped = true; for (const stop of running) stop(); } };
+  return { spawn, healthy: () => !stopped, close() { stopped = true; for (const stop of running) stop(); } };
 }

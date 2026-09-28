@@ -1,0 +1,191 @@
+import test from 'node:test';
+import { symlinkSync, readlinkSync, unlinkSync } from 'node:fs';
+const aliasFs = { symlinkSync, readlinkSync, unlinkSync };
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, writeFile, symlink, lstat, rm, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { openCallerDatabase } from './caller-runtime-sqlite.js';
+import { ensureStorageAlias, parseStorageRequest, runStorageManager, type StorageRequest } from './caller-storage-manager.js';
+
+const request: StorageRequest = {
+  action: 'delete', key: 'a'.repeat(64), uuid: '12345678-1234-1234-1234-123456789abc',
+  size: 64 * 1048576, budget: 128 * 1048576, reserve: 64 * 1048576,
+};
+
+for (const aliasTarget of ['/dev/loop7', '../../loop7']) {
+test(`deletion retry preserves recycled device with UUID alias ${aliasTarget}`, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'storage-manager-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const root = join(directory, 'managed'), aliases = join(directory, 'by-uuid');
+  await mkdir(root); await mkdir(aliases);
+  const image = join(root, `${request.key}.img`), alias = join(aliases, request.uuid);
+  await writeFile(image, 'retained'); await symlink(aliasTarget, alias);
+  const db = await openCallerDatabase(join(root, 'catalog.sqlite'));
+  db.exec('CREATE TABLE policy (budget INTEGER, reserve INTEGER); CREATE TABLE images (key TEXT PRIMARY KEY, uuid TEXT UNIQUE, size INTEGER, state TEXT)');
+  db.prepare('INSERT INTO policy VALUES (?,?)').run(request.budget, request.reserve);
+  db.prepare('INSERT INTO images VALUES (?,?,?,?)').run(request.key, request.uuid, request.size, 'ready');
+  db.close();
+  let attached = true;
+  const detached: string[] = [];
+  const run = (...args: string[]) => {
+    if (args[0] === 'losetup' && args[1] === '-j' && args[2] === image)
+      return attached ? `/dev/loop7: []: (${image})` : '';
+    if (args[0] === 'losetup' && args[1] === '-d' && args[2] === '/dev/loop7') {
+      assert(attached, 'must not detach recycled loop belonging to B');
+      attached = false; detached.push(args[2]);
+      throw new Error('injected crash after detach');
+    }
+    throw new Error(`unexpected Linux mutation: ${args}`);
+  };
+  await assert.rejects(runStorageManager(request, { root, aliases, run }), /injected crash/);
+  assert.equal(await readFile(image, 'utf8'), 'retained');
+  assert((await lstat(alias)).isSymbolicLink());
+  // loop7 now belongs to B; querying/detaching it by the stale alias is wrong.
+  await runStorageManager(request, { root, aliases, run });
+  assert.deepEqual(detached, ['/dev/loop7']);
+  await assert.rejects(lstat(image), { code: 'ENOENT' });
+  await assert.rejects(lstat(alias), { code: 'ENOENT' });
+  const reopened = await openCallerDatabase(join(root, 'catalog.sqlite'));
+  assert.deepEqual(reopened.prepare('SELECT * FROM images').all(), []);
+  reopened.close();
+});
+
+}
+
+test('failed allocation stays charged and cannot be reformatted on retry', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'storage-admission-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const root = join(directory, 'managed'), aliases = join(directory, 'by-uuid');
+  const allocation = { ...request, action: 'create' as const, budget: request.size };
+  const calls: string[][] = [];
+  const run = (...args: string[]) => {
+    calls.push(args);
+    if (args[0] === 'fallocate') throw new Error('injected allocation failure');
+    if (args[0] === 'losetup' && args[1] === '-j') return '';
+    throw new Error(`unexpected Linux mutation: ${args}`);
+  };
+  await assert.rejects(runStorageManager(allocation, { root, aliases, run }), /injected allocation failure/);
+  await assert.rejects(runStorageManager(allocation, { root, aliases, run }), /incomplete allocation/);
+  await assert.rejects(runStorageManager({ ...allocation, key: 'b'.repeat(64), uuid: '23456789-1234-1234-1234-123456789abc' }, { root, aliases, run }), /pool capacity exhausted/);
+  assert.equal(calls.length, 1, 'no repeated allocation or formatting');
+  await runStorageManager({ ...allocation, action: 'delete' }, { root, aliases, run });
+  const db = await openCallerDatabase(join(root, 'catalog.sqlite'));
+  assert.deepEqual(db.prepare('SELECT * FROM images').all(), []);
+  db.close();
+});
+
+test('storage helper validates CLI identity and capacity before filesystem operations', () => {
+  const args = ['create', request.key, request.uuid, String(request.size), String(request.budget), String(request.reserve)];
+  assert.deepEqual(parseStorageRequest(args), { ...request, action: 'create' });
+  for (const [index, value] of [[0, 'format'], [1, '../escape'], [2, 'bad-uuid'], [3, '-1'], [4, 'Infinity'], [5, '1.5']] as const) {
+    const invalid = [...args]; invalid[index] = value;
+    assert.throws(() => parseStorageRequest(invalid));
+  }
+  assert.throws(() => parseStorageRequest([...args, 'unexpected']));
+});
+
+test('absent-image cleanup ignores rejected admission policy without changing the pool or retained data', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'storage-rejected-policy-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const run = (...args: string[]): string => { throw new Error(`unexpected Linux mutation: ${args}`); };
+  // Cleanup alone must not establish a new pool policy.
+  await runStorageManager(request, { root, run });
+  const db = await openCallerDatabase(join(root, 'catalog.sqlite'));
+  try {
+    assert.deepEqual(db.prepare('SELECT * FROM policy').all(), []);
+    const policy = { budget: request.budget * 2, reserve: request.reserve * 2 };
+    db.prepare('INSERT INTO policy VALUES (?,?)').run(policy.budget, policy.reserve);
+    // The probe was rejected before allocation; deletion is a confirmed no-op.
+    await assert.rejects(runStorageManager({ ...request, action: 'probe' }, { root, run }), /pool policy differs/);
+    await runStorageManager(request, { root, run });
+    assert.deepEqual(db.prepare('SELECT * FROM policy').all(), [policy]);
+    assert.deepEqual(db.prepare('SELECT * FROM images').all(), []);
+    // A missing row never authorizes deleting an unrecorded file or symlink.
+    const imagePath = join(root, `${request.key}.img`);
+    await symlink(join(root, 'missing-target'), imagePath);
+    await assert.rejects(runStorageManager(request, { root, run }), /symlink image/);
+    await rm(imagePath);
+    await writeFile(imagePath, 'retained');
+    await assert.rejects(runStorageManager(request, { root, run }), /unrecorded image/);
+    db.prepare('INSERT INTO images VALUES (?,?,?,?)').run(request.key, request.uuid, request.size, 'allocating');
+    await assert.rejects(runStorageManager(request, { root, run }), /pool policy differs/);
+    assert.equal(await readFile(imagePath, 'utf8'), 'retained');
+    assert.equal(db.prepare('SELECT * FROM images').all().length, 1);
+    assert.deepEqual(db.prepare('SELECT * FROM policy').all(), [policy]);
+  } finally { db.close(); }
+});
+
+for (const target of ['/dev/loop7', '../../loop7']) {
+  test(`attachment accepts udev winning alias creation with ${target}`, async t => {
+    const dir = await mkdtemp(join(tmpdir(), 'storage-udev-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const alias = join(dir, 'uuid');
+    let creates = 0;
+    await ensureStorageAlias(alias, '/dev/loop7', {
+      ...aliasFs,
+      symlinkSync: (...args) => {
+        creates++;
+        aliasFs.symlinkSync(target, alias); // udev wins immediately before creation
+        aliasFs.symlinkSync(...args);
+      },
+      unlinkSync: () => { throw new Error('must preserve correct udev link'); },
+    });
+    assert.equal(creates, 1);
+    assert.equal(aliasFs.readlinkSync(alias), target);
+  });
+}
+
+test('attachment retries disappearing aliases and replaces stale links without touching devices', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'storage-udev-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const alias = join(dir, 'uuid');
+  await symlink('../../loop8', alias);
+  let reads = 0;
+  await ensureStorageAlias(alias, '/dev/loop7', {
+    ...aliasFs,
+    readlinkSync: (...args) => {
+      if (++reads === 1) aliasFs.unlinkSync(alias); // udev removes after EEXIST
+      return aliasFs.readlinkSync(...args);
+    },
+  });
+  assert.equal(aliasFs.readlinkSync(alias), '/dev/loop7');
+  await rm(alias); await symlink('../../loop8', alias);
+  await ensureStorageAlias(alias, '/dev/loop7');
+  assert.equal(aliasFs.readlinkSync(alias), '/dev/loop7');
+});
+
+test('attachment refuses non-links and unexpected targets without deleting them', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'storage-udev-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const alias = join(dir, 'uuid');
+  await writeFile(alias, 'foreign');
+  await assert.rejects(ensureStorageAlias(alias, '/dev/loop7'), { code: 'EINVAL' });
+  assert.equal(await readFile(alias, 'utf8'), 'foreign');
+  await rm(alias); await symlink('/foreign', alias);
+  await assert.rejects(ensureStorageAlias(alias, '/dev/loop7'), /unexpected UUID alias target/);
+  assert.equal(aliasFs.readlinkSync(alias), '/foreign');
+});
+
+test('deletion succeeds when udev removes the UUID alias during loop detach', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'storage-udev-delete-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const root = join(directory, 'managed'), aliases = join(directory, 'by-uuid');
+  await mkdir(root); await mkdir(aliases);
+  const image = join(root, `${request.key}.img`), alias = join(aliases, request.uuid);
+  await writeFile(image, 'retained'); await symlink('../../loop7', alias);
+  const db = await openCallerDatabase(join(root, 'catalog.sqlite'));
+  db.exec('CREATE TABLE policy (budget INTEGER, reserve INTEGER); CREATE TABLE images (key TEXT PRIMARY KEY, uuid TEXT UNIQUE, size INTEGER, state TEXT)');
+  db.prepare('INSERT INTO policy VALUES (?,?)').run(request.budget, request.reserve);
+  db.prepare('INSERT INTO images VALUES (?,?,?,?)').run(request.key, request.uuid, request.size, 'ready');
+  db.close();
+  let attached = true;
+  await runStorageManager(request, { root, aliases, run: (...args) => {
+    if (args[0] === 'losetup' && args[1] === '-j') return attached ? `/dev/loop7: []: (${image})` : '';
+    assert.deepEqual(args, ['losetup', '-d', '/dev/loop7']);
+    attached = false; aliasFs.unlinkSync(alias);
+    return '';
+  } });
+  await assert.rejects(lstat(image), { code: 'ENOENT' });
+  await assert.rejects(lstat(alias), { code: 'ENOENT' });
+});

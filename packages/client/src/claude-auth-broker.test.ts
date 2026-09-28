@@ -135,3 +135,27 @@ test('provider secrets/helpers in agent settings are rejected without echoing va
   }
   assert.doesNotThrow(()=>assertClaudeBrokerSettings({env:{ENABLE_PROMPT_CACHING_1H:'1'}}));
 });
+
+test('caller settings allowlist rejects arbitrary environment and hooks and returns a detached copy', async () => {
+  const { selectClaudeCallerSettings } = await import('./claude-auth-broker.js');
+  for (const settings of [
+    { env: { FOO_SECRET: 'OPERATOR_SECRET' } }, { hooks: { Stop: 'OPERATOR_SECRET' } },
+    { statusLine: { command: 'OPERATOR_SECRET' } }, { otelHeadersHelper: 'OPERATOR_SECRET' },
+    { env: { ENABLE_PROMPT_CACHING_1H: 'OPERATOR_SECRET' } },
+    { sandbox: { excludedCommands: ['OPERATOR_SECRET'] } }, { unknownFutureSetting: 'OPERATOR_SECRET' },
+  ]) assert.throws(() => selectClaudeCallerSettings(settings), e => e instanceof Error && !e.message.includes('OPERATOR_SECRET'));
+  const original = { model: 'sonnet', env: { ENABLE_PROMPT_CACHING_1H: '1' }, sandbox: { enabled: false } };
+  const selected = selectClaudeCallerSettings(original);
+  assert.deepEqual(selected, original);
+  Object.assign(original.env, { FOO_SECRET: 'OPERATOR_SECRET' });
+  original.env.ENABLE_PROMPT_CACHING_1H = 'OPERATOR_SECRET';
+  assert.doesNotMatch(JSON.stringify(selected), /OPERATOR_SECRET|FOO_SECRET/);
+});
+
+
+test('caller settings accept supported Claude 1m context-tier model IDs', async () => {
+  const { selectClaudeCallerSettings } = await import('./claude-auth-broker.js');
+  for (const model of ['claude-sonnet-4-5[1m]', 'claude-opus-4-6[1m]', 'sonnet[1m]'])
+    assert.deepEqual(selectClaudeCallerSettings({ model }), { model });
+  assert.throws(() => selectClaudeCallerSettings({ model: 'claude-sonnet-4-5[SECRET]' }));
+});
