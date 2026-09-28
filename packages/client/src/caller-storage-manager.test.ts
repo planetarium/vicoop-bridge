@@ -11,13 +11,14 @@ const request: StorageRequest = {
   size: 64 * 1048576, budget: 128 * 1048576, reserve: 64 * 1048576,
 };
 
-test('deletion retry after detach removes stale alias without detaching recycled device', async t => {
+for (const aliasTarget of ['/dev/loop7', '../../loop7']) {
+test(`deletion retry preserves recycled device with UUID alias ${aliasTarget}`, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'storage-manager-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const root = join(directory, 'managed'), aliases = join(directory, 'by-uuid');
   await mkdir(root); await mkdir(aliases);
   const image = join(root, `${request.key}.img`), alias = join(aliases, request.uuid);
-  await writeFile(image, 'retained'); await symlink('/dev/loop7', alias);
+  await writeFile(image, 'retained'); await symlink(aliasTarget, alias);
   const db = await openCallerDatabase(join(root, 'catalog.sqlite'));
   db.exec('CREATE TABLE policy (budget INTEGER, reserve INTEGER); CREATE TABLE images (key TEXT PRIMARY KEY, uuid TEXT UNIQUE, size INTEGER, state TEXT)');
   db.prepare('INSERT INTO policy VALUES (?,?)').run(request.budget, request.reserve);
@@ -47,6 +48,8 @@ test('deletion retry after detach removes stale alias without detaching recycled
   assert.deepEqual(reopened.prepare('SELECT * FROM images').all(), []);
   reopened.close();
 });
+
+}
 
 test('failed allocation stays charged and cannot be reformatted on retry', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'storage-admission-'));
@@ -78,4 +81,35 @@ test('storage helper validates CLI identity and capacity before filesystem opera
     assert.throws(() => parseStorageRequest(invalid));
   }
   assert.throws(() => parseStorageRequest([...args, 'unexpected']));
+});
+
+test('absent-image cleanup ignores rejected admission policy without changing the pool or retained data', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'storage-rejected-policy-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const run = (...args: string[]): string => { throw new Error(`unexpected Linux mutation: ${args}`); };
+  // Cleanup alone must not establish a new pool policy.
+  await runStorageManager(request, { root, run });
+  const db = await openCallerDatabase(join(root, 'catalog.sqlite'));
+  try {
+    assert.deepEqual(db.prepare('SELECT * FROM policy').all(), []);
+    const policy = { budget: request.budget * 2, reserve: request.reserve * 2 };
+    db.prepare('INSERT INTO policy VALUES (?,?)').run(policy.budget, policy.reserve);
+    // The probe was rejected before allocation; deletion is a confirmed no-op.
+    await assert.rejects(runStorageManager({ ...request, action: 'probe' }, { root, run }), /pool policy differs/);
+    await runStorageManager(request, { root, run });
+    assert.deepEqual(db.prepare('SELECT * FROM policy').all(), [policy]);
+    assert.deepEqual(db.prepare('SELECT * FROM images').all(), []);
+    // A missing row never authorizes deleting an unrecorded file or symlink.
+    const imagePath = join(root, `${request.key}.img`);
+    await symlink(join(root, 'missing-target'), imagePath);
+    await assert.rejects(runStorageManager(request, { root, run }), /symlink image/);
+    await rm(imagePath);
+    await writeFile(imagePath, 'retained');
+    await assert.rejects(runStorageManager(request, { root, run }), /unrecorded image/);
+    db.prepare('INSERT INTO images VALUES (?,?,?,?)').run(request.key, request.uuid, request.size, 'allocating');
+    await assert.rejects(runStorageManager(request, { root, run }), /pool policy differs/);
+    assert.equal(await readFile(imagePath, 'utf8'), 'retained');
+    assert.equal(db.prepare('SELECT * FROM images').all().length, 1);
+    assert.deepEqual(db.prepare('SELECT * FROM policy').all(), [policy]);
+  } finally { db.close(); }
 });

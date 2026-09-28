@@ -1,6 +1,6 @@
 import {
   chownSync, closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync,
-  openSync, readlinkSync, statfsSync, statSync, symlinkSync, unlinkSync,
+  openSync, readFileSync, writeFileSync, readlinkSync, statfsSync, statSync, symlinkSync, unlinkSync,
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -8,7 +8,7 @@ import { setTimeout } from 'node:timers/promises';
 import { openCallerDatabase } from './caller-runtime-sqlite.js';
 
 export interface StorageRequest {
-  action: 'create' | 'attach' | 'check' | 'delete';
+  action: 'create' | 'probe' | 'attach' | 'check' | 'delete';
   key: string;
   uuid: string;
   size: number;
@@ -20,7 +20,7 @@ function requireState(condition: unknown, message: string): asserts condition {
 }
 export function parseStorageRequest(args: readonly string[]): StorageRequest {
   const [action, key, uuid, sizeText, budgetText, reserveText] = args;
-  requireState(args.length === 6 && ['create', 'attach', 'check', 'delete'].includes(action), 'invalid action');
+  requireState(args.length === 6 && ['create', 'probe', 'attach', 'check', 'delete'].includes(action), 'invalid action');
   requireState(/^[a-f0-9]{64}$/.test(key), 'invalid storage key');
   requireState(/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(uuid), 'invalid UUID');
   requireState([sizeText, budgetText, reserveText].every(v => /^[0-9]+$/.test(v)), 'invalid capacity');
@@ -66,19 +66,25 @@ export async function runStorageManager(request: StorageRequest, options: {
       CREATE TABLE IF NOT EXISTS policy (budget INTEGER, reserve INTEGER);
       CREATE TABLE IF NOT EXISTS images (key TEXT PRIMARY KEY, uuid TEXT UNIQUE, size INTEGER, state TEXT);`);
     const policy = db.prepare('SELECT budget,reserve FROM policy').get() as { budget: number; reserve: number } | undefined;
-    if (!policy) db.prepare('INSERT INTO policy VALUES (?,?)').run(budget, reserve);
-    else requireState(policy.budget === budget && policy.reserve === reserve, 'pool policy differs from existing catalog');
-    syncPath(root, true);
     let row = db.prepare('SELECT uuid,size,state FROM images WHERE key=?').get(key) as
       { uuid: string; size: number; state: string } | undefined;
     const image = join(root, `${key}.img`);
     requireState(!isSymlink(image), 'symlink image');
-    if (row) {
-      requireState(row.uuid === uuid && row.size === size, 'retained storage identity/capacity mismatch');
-    } else if (action === 'delete') {
+    // A rejected admission may have journaled client intent without ever creating
+    // a catalog row or image. Confirm that absence before checking its rejected
+    // policy, so cleanup cannot trap init on stale policy values. This is a no-op:
+    // it neither establishes/changes pool policy nor detaches devices. Any retained
+    // allocation or unrecorded file must still fail closed on a policy mismatch.
+    if (action === 'delete' && !row) {
       requireState(!existsSync(image), 'unrecorded image; inspect pool');
       return;
-    } else if (action === 'create') {
+    }
+    if (!policy) db.prepare('INSERT INTO policy VALUES (?,?)').run(budget, reserve);
+    else requireState(policy.budget === budget && policy.reserve === reserve, 'pool policy differs from existing catalog');
+    syncPath(root, true);
+    if (row) {
+      requireState(row.uuid === uuid && row.size === size, 'retained storage identity/capacity mismatch');
+    } else if (action === 'create' || action === 'probe') {
       requireState(!existsSync(image), 'unrecorded image; inspect pool');
       const { used } = db.prepare('SELECT coalesce(sum(size),0) AS used FROM images').get() as { used: number };
       const space = statfsSync(root);
@@ -103,6 +109,13 @@ export async function runStorageManager(request: StorageRequest, options: {
             mkdirSync(target, { mode: 0o700 });
             chownSync(target, 1000, 1000);
           }
+          if (action === 'probe') {
+            const probe = join(mount, 'workspace', '.init-probe');
+            writeFileSync(probe, 'vicoop-storage-probe', { flag: 'wx' });
+            syncPath(probe);
+            requireState(readFileSync(probe, 'utf8') === 'vicoop-storage-probe', 'storage probe readback failed');
+            unlinkSync(probe);
+          }
           run('sync', '-f', mount);
         } finally { run('umount', mount); }
       } finally { run('losetup', '-d', loop); }
@@ -115,10 +128,12 @@ export async function runStorageManager(request: StorageRequest, options: {
     }
 
     const alias = join(aliases, uuid);
+    // Native Linux udev may replace our absolute link with ../../loopN.
+    // Accept only these two loop-device spellings; identify detach targets by image inode.
     if (action === 'delete') {
       // The client first removes validated Docker consumers and their volume.
       if (existsSync(image)) {
-        if (isSymlink(alias)) requireState(/^\/dev\/loop[0-9]+$/.test(readlinkSync(alias)), 'unexpected UUID alias target');
+        if (isSymlink(alias)) requireState(/^(?:\/dev\/|\.\.\/\.\.\/)loop[0-9]+$/.test(readlinkSync(alias)), 'unexpected UUID alias target');
         const loops = run('losetup', '-j', image).split('\n').filter(Boolean);
         for (const line of loops) {
           const loop = line.split(':', 1)[0];
@@ -151,7 +166,7 @@ export async function runStorageManager(request: StorageRequest, options: {
     requireState(run('blkid', '-p', '-s', 'UUID', '-o', 'value', loop) === uuid, 'attached device UUID mismatch');
     mkdirSync(aliases, { recursive: true, mode: 0o700 });
     if (isSymlink(alias)) {
-      requireState(/^\/dev\/loop[0-9]+$/.test(readlinkSync(alias)), 'unexpected UUID alias target');
+      requireState(/^(?:\/dev\/|\.\.\/\.\.\/)loop[0-9]+$/.test(readlinkSync(alias)), 'unexpected UUID alias target');
       unlinkSync(alias);
     } else requireState(!existsSync(alias), 'UUID alias is not a symlink');
     symlinkSync(loop, alias);
