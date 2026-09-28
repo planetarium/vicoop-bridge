@@ -1,5 +1,77 @@
 # @vicoop-bridge/client
 
+## 0.41.0
+
+### Minor Changes
+
+- 6425dca: Keep Codex OpenAI API keys and ChatGPT credentials on the host. Authenticate each caller execution through the host broker with an ephemeral login instead of mounting provider credentials or passing them in token environment variables. Require Codex 0.153.4 or newer and reject unsupported OAuth login modes.
+
+  For an existing shared Docker runtime, stop the daemon, preserve its configuration and volumes, prepare Codex authentication on the host, then run `container init codex --config /path/to/config.json` before restarting. Shared workspaces and sessions are not automatically copied into caller storage. See the [caller runtime transition guide](https://github.com/planetarium/vicoop-bridge/blob/main/docs/caller-runtime.md). Host execution and bundled-direct authentication behavior are unchanged.
+
+  Wait for execution cleanup before completing or resuming tasks, settle queued cancellation without overtaking active cleanup, and validate workload ownership, persistent mounts, firewall capabilities and confinement. Provider-secret filtering prevents credential environment variables from entering workloads.
+
+- 4761ef2: Make Claude and Codex container execution caller-isolated, with reusable containers, private networks and persistent workspace/session storage per authenticated principal. `container init claude|codex` validates host authentication, builds or validates the backend image, prepares the bundled fixed-storage helper and shared pool, initializes private SQLite state and saves the configuration. Initialization requires no repository checkout or manual JSON editing; failures preserve the previous configuration.
+
+  Normal initialization enables fixed ext4 storage with synchronous block/inode limits. Workspace and sessions share the configured filesystem capacity, including filesystem overhead. Pool admission preserves a free-space reserve within the Docker backing filesystem; it does not reserve physical space outside thin VM/block devices. Retained storage identities and data survive recreation, and incompatible capacity/pool changes are rejected.
+
+  For users upgrading from a released client:
+
+  - **Host execution:** no runtime configuration change is required. Host remains
+    the default, including bundled-direct deployments that run the client itself
+    inside a container. Caller isolation is an explicit opt-in.
+  - **Existing shared Docker execution:** `runtime: "container"` now selects
+    caller-isolated execution. Stop the old daemon before upgrading with
+    `vicoop-client stop --config /path/to/config.json` and keep a backup of its configuration and existing volumes. Prepare Claude/Codex
+    authentication on the host, then initialize the selected backend with the same
+    agent configuration:
+
+    ```sh
+    vicoop-client container init claude --config /path/to/config.json
+    vicoop-client start --detach --config /path/to/config.json
+    ```
+
+    Use `codex` instead of `claude` for Codex; omit `--config` for the canonical
+    configuration. Initialization preserves agent registration and unrelated
+    settings, and replaces the selected backend's legacy `cwd`/`runtime_name`
+    configuration only after validation succeeds. Remove `--runtime-name` and
+    legacy `--cwd` overrides from your container launch scripts too.
+
+  - **Existing files and sessions:** initialization does not delete or automatically
+    copy shared Docker workspaces, credentials or sessions into caller storage.
+    Each authenticated caller starts with a new environment on its first request;
+    retain the old volumes separately if their contents are needed. Legacy resource
+    inspection is available through `container legacy list`.
+  - **Server compatibility:** caller isolation requires a compatible bridge server
+    advertising execution-scope support; update the server before activating it.
+    An incompatible server is rejected rather than falling back to shared execution.
+
+  Caller-scoped runtime storage has not appeared in a released client, so upgrading
+  released versions does not require migration of an earlier caller-scoped volume
+  format. See the [caller runtime setup and transition guide](https://github.com/planetarium/vicoop-bridge/blob/main/docs/caller-runtime.md)
+  for initialization requirements and supported features.
+
+  Manage caller environments through `container list`, `validate`, `recreate` and `remove`; old shared-runtime administration is under `container legacy`. Ownership and mount validation reject foreign, missing or incompatible resources. Interrupted allocations and uncertain cleanup retain recovery records rather than silently adopting or deleting data.
+
+  Execution leases serialize same-caller work. Cancellation waits for process cleanup while preserving partial file writes. Workspace/session files survive daemon restarts and container recreation, but live conversation bindings reset with an explicit conversation-reset signal. Provider credentials remain on the host, and caller workloads do not receive the Docker socket, backing storage pool or host devices.
+
+  This release supports directly authenticated Claude/Codex callers with text outputs. Delegated scopes, isolated OpenClaw, unsupported MCP/caller-tool combinations, and automatic conversation restoration remain unavailable. Host execution remains the default.
+
+- 4761ef2: Add fixed-size caller filesystems, enabled by normal caller-runtime initialization, with synchronous block/inode limits, daemon-side pool admission, retained image reattachment, and explicit cleanup. Reservation covers the Docker backing filesystem, not physical capacity outside thin VM disks. Existing shared-runtime volumes are preserved separately and are not automatically copied into caller environments. Caller-scoped storage has never shipped, so no migration of the intermediate development format is required or provided.
+
+  Recover interrupted initial reservations and deletion retries without blocking unrelated callers; persist helper identities and quarantine scopes until privileged helper termination is confirmed.
+
+  Build the storage helper from TypeScript into a standalone Bun executable and run its recovery tests in the existing Node/Bun test suite; no Python runtime is required.
+
+- 4761ef2: Enable fixed ext4 caller storage during container init using a bundled Docker-built helper, a shared managed pool, immutable capacity policy, and a recoverable filesystem probe. Reject undersized pools before creation and allow safe retries after a rejected policy without altering retained data. Add MiB sizing and pool-selection options, preserve retained state on reinitialization, and report the Docker-filesystem reservation boundary explicitly.
+- c23c56c: Keep Claude OAuth/API credentials on the host through a built-in authentication broker; caller workloads receive execution-scoped access instead of credential files. Private/host-network services are blocked from caller workloads.
+
+  For an existing shared Docker runtime, stop the daemon, preserve its configuration and volumes, prepare Claude authentication on the host, then run `container init claude --config /path/to/config.json` before restarting. Shared workspaces and sessions are not automatically copied into caller storage. The retired `--reuse-state` init flag is rejected. See the [caller runtime transition guide](https://github.com/planetarium/vicoop-bridge/blob/main/docs/caller-runtime.md). Host execution and bundled-direct authentication behavior are unchanged.
+
+### Patch Changes
+
+- 4761ef2: Keep Docker runtime lifecycle commands responsive with bounded asynchronous execution and pass validated backend environment overrides into containers. Negotiate authenticated execution scopes with compatible bridge servers and reject unsupported isolation configurations explicitly.
+- 4761ef2: Fix intermittent fixed-storage initialization and attachment failures when Linux udev creates UUID device links concurrently with the storage helper.
+
 ## 0.40.0
 
 ### Minor Changes
