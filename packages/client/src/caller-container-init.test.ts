@@ -7,6 +7,8 @@ import {
   runCallerContainerInit,
   type CallerContainerInitOptions,
 } from './caller-container-init.js';
+import { STORAGE_IMAGE_FILES } from './caller-storage-assets.js';
+import { CallerStorage } from './caller-storage.js';
 import { CALLER_IMAGE_FILES } from './caller-image-assets.js';
 import { CallerRuntimeStore, scopeDigest } from './caller-runtime-store.js';
 import { openCallerDatabase } from './caller-runtime-sqlite.js';
@@ -32,8 +34,36 @@ async function fixture(t: TestContext) {
   await writeFile(path, JSON.stringify(original));
   const calls: string[][] = [];
   let auth = 0;
+  const volumes = new Map<string, unknown>();
+  const helpers = new Map<string, any>();
+  let helperSequence = 0;
   const dockerRun: AsyncDockerRun = async (args) => {
     calls.push([...args]);
+    if (args[0] === 'volume') {
+      const name = args.at(-1)!;
+      if (args[1] === 'create') {
+        const labels: Record<string, string> = {};
+        args.forEach((arg, i) => { if (arg === '--label') { const [k,v] = args[i+1].split('='); labels[k] = v; } });
+        if (!volumes.has(name)) volumes.set(name, { Name: name, Driver: 'local', Options: {}, Labels: labels });
+        return success(name);
+      }
+      return volumes.has(name) ? success(JSON.stringify([volumes.get(name)])) : { exitCode: 1, stdout: '', stderr: 'No such volume' };
+    }
+    if (args[0] === 'create') {
+      const labels: Record<string, string> = {};
+      args.forEach((arg, i) => { if (arg === '--label') { const [k,v] = args[i+1].split('='); labels[k] = v; } });
+      const helperId = (++helperSequence).toString(16).padStart(64, 'c');
+      const helper = { Id: helperId, Name: '/' + args[args.indexOf('--name')+1], Config: { Image: image, Labels: labels } };
+      helpers.set(helperId, helper);
+      return success(helperId);
+    }
+    if (args[0] === 'start') return success();
+    if (args[0] === 'container') {
+      const helper = [...helpers.values()].find(h => h.Id === args[2] || h.Name === '/' + args[2]);
+      return helper ? success(JSON.stringify([helper])) : { exitCode: 1, stdout: '', stderr: 'No such container' };
+    }
+    if (args[0] === 'rm' && helpers.has(args[2])) { helpers.delete(args[2]); return success(); }
+    if (args[0] === 'version') return success('1.45 1.45');
     if (args[0] === 'info') return success('linux\n');
     if (args[0] === 'ps') return success();
     if (args[0] === 'image')
@@ -44,7 +74,7 @@ async function fixture(t: TestContext) {
       );
     if (args[0] === 'build') {
       const context = args.at(-1)!;
-      for (const [name, content] of Object.entries(CALLER_IMAGE_FILES))
+      for (const [name, content] of Object.entries(args.includes(join(context, 'Dockerfile')) ? CALLER_IMAGE_FILES : STORAGE_IMAGE_FILES))
         assert.equal(await readFile(join(context, name), 'utf8'), content);
       await writeFile(args[args.indexOf('--iidfile') + 1], image);
       return success();
@@ -114,10 +144,13 @@ test('standalone init builds embedded recipe, validates and preserves registrati
   assert.ok(check.includes('type=volume,target=/workspace'));
   assert.ok(check.includes('type=volume,target=/data/sessions/claude'));
   assert.match(check.at(-1)!, /mktemp -d/);
-  assert.ok(f.calls.at(-1)?.includes('-v'));
+  assert.ok(f.calls.some(args => args[0] === 'rm' && args.includes('-v')));
   assert.equal(check.includes('--env'), false);
   assert.equal(check[check.indexOf('--network') + 1], 'none');
-  assert.equal(f.calls.at(-1)?.[0], 'rm');
+  assert.ok(runtime.fixedImageStorage);
+  assert.equal(runtime.fixedImageStorage.capacityMiB, 8192);
+  assert.equal(runtime.fixedImageStorage.reserveMiB, 1024);
+  assert.equal(runtime.fixedImageStorage.reservationBoundary, 'docker-filesystem');
   await assert.rejects(
     stat(dirname(f.calls.find((args) => args[0] === 'build')![2])),
     { code: 'ENOENT' },
@@ -336,6 +369,7 @@ test('retained containers prevent changing their image, but recreated scopes kee
   const id = scopeDigest(f.original.agent_id, 'alice');
   await store.lock();
   await store.reserve(id, 'claude', 'alice');
+  await new CallerStorage(before.backends.claude.caller_runtime, store, f.dockerRun).reserve(id);
   await store.unlock();
   const nextImage = `sha256:${'b'.repeat(64)}`;
   let retained = true;
@@ -462,3 +496,124 @@ for (const value of ['relative/state', '', 42, null, undefined]) {
     assert.equal(await readFile(f.path, 'utf8'), before);
   });
 }
+
+test('embedded helper is the reviewed source, including SQLite and Docker build inputs', async () => {
+  for (const [name, content] of Object.entries(STORAGE_IMAGE_FILES))
+    assert.equal(content, await readFile(new URL(`../../../${name}`, import.meta.url), 'utf8'));
+});
+
+test('shared pool inherits the winning policy; explicit conflicts and foreign volumes fail without saving', async t => {
+  const f = await fixture(t);
+  await runCallerContainerInit({ ...f.options, storageMiB: 128, storageCapacityMiB: 2048, storageReserveMiB: 64 });
+  const first = await f.read();
+  await runCallerContainerInit({ ...f.options, kind: 'codex', image });
+  assert.deepEqual((await f.read()).backends.codex.caller_runtime.fixedImageStorage,
+    first.backends.claude.caller_runtime.fixedImageStorage);
+  const before = await f.read();
+  await assert.rejects(runCallerContainerInit({ ...f.options, storageCapacityMiB: 1024 }), /immutable/);
+  await assert.rejects(runCallerContainerInit({ ...f.options, storagePool: 'different' }), /cannot be changed/);
+  await assert.rejects(runCallerContainerInit({ ...f.options, dockerRun: async (args, opts) => {
+    if (args[0] === 'volume' && args[1] === 'inspect') return success(JSON.stringify([
+      { Name: args[2], Driver: 'local', Labels: {}, Options: {} },
+    ]));
+    return f.dockerRun(args, opts);
+  } }), /ownership/);
+  assert.deepEqual(await f.read(), before);
+  assert.equal(f.calls.some(args => args[0] === 'volume' && args[1] === 'rm'), false);
+});
+
+test('probe failure preserves configuration, cleans its image, and can be retried', async t => {
+  const f = await fixture(t);
+  let fail = true;
+  const dockerRun: AsyncDockerRun = async (args, opts) => {
+    if (fail && args[0] === 'start') { fail = false; return { exitCode: 1, stdout: '', stderr: 'pool free-space reserve would be exhausted' }; }
+    return f.dockerRun(args, opts);
+  };
+  await assert.rejects(runCallerContainerInit({ ...f.options, dockerRun }), /free-space reserve.*Prior config is unchanged/s);
+  assert.deepEqual(await f.read(), f.original);
+  assert.ok(f.calls.some(args => args[0] === 'create' && args.includes('delete')));
+  await runCallerContainerInit({ ...f.options, dockerRun });
+  assert.ok((await f.read()).backends.claude.caller_runtime.fixedImageStorage);
+});
+
+test('unconfirmed helper cleanup remains journaled and rerun reconciles before provisioning', async t => {
+  const f = await fixture(t);
+  const stateDirectory = join(f.dir, 'private');
+  let fail = true;
+  const dockerRun: AsyncDockerRun = async (args, opts) => {
+    if (fail && args[0] === 'rm' && /^[a-f0-9]{64}$/.test(args[2]))
+      return { exitCode: 1, stdout: '', stderr: 'Docker unavailable' };
+    return f.dockerRun(args, opts);
+  };
+  await assert.rejects(runCallerContainerInit({ ...f.options, stateDirectory, dockerRun }), /termination unconfirmed.*Recovery state/s);
+  assert.deepEqual(await f.read(), f.original);
+  const probe = new CallerRuntimeStore(join(stateDirectory, 'storage-init'), f.original.agent_id);
+  await probe.lock();
+  const [id] = await probe.scopes();
+  assert.ok(await probe.storageHelper(id));
+  assert.ok(await probe.fixedStorage(id));
+  await probe.unlock();
+  fail = false;
+  await runCallerContainerInit({ ...f.options, stateDirectory, dockerRun });
+  await probe.lock();
+  assert.deepEqual(await probe.scopes(), []);
+  await probe.unlock();
+});
+
+test('unpublished ordinary-volume scopes and resized fixed scopes are never adopted', async t => {
+  const f = await fixture(t);
+  await runCallerContainerInit(f.options);
+  const before = await f.read();
+  const runtime = before.backends.claude.caller_runtime;
+  const store = new CallerRuntimeStore(runtime.stateDirectory, f.original.agent_id);
+  const id = scopeDigest(f.original.agent_id, 'alice');
+  await store.lock();
+  await store.reserve(id, 'claude', 'alice');
+  await store.unlock();
+  await assert.rejects(runCallerContainerInit(f.options), /legacy or incomplete/);
+  await store.lock();
+  await new CallerStorage(runtime, store, f.dockerRun).reserve(id);
+  const identity = await store.fixedStorage(id);
+  await store.unlock();
+  await assert.rejects(runCallerContainerInit({ ...f.options, storageMiB: 2048 }), /configuration changed/);
+  assert.deepEqual(await f.read(), before);
+  await store.lock();
+  assert.equal(await store.fixedStorage(id), identity);
+  await store.unlock();
+});
+
+for (const api of ['1.44 1.45', '1.45 1.44', 'unknown']) {
+  test(`unsupported Docker API ${api} fails before builds or pool creation`, async t => {
+    const f = await fixture(t);
+    await assert.rejects(runCallerContainerInit({ ...f.options, dockerRun: async (args, opts) =>
+      args[0] === 'version' ? success(api) : f.dockerRun(args, opts) }), /API 1.45/);
+    assert.deepEqual(await f.read(), f.original);
+    assert.equal(f.calls.some(args => ['build', 'volume', 'create'].includes(args[0])), false);
+  });
+}
+
+test('aborted helper start cleans the disposable image without saving config', async t => {
+  const f = await fixture(t);
+  let aborted = false;
+  await assert.rejects(runCallerContainerInit({ ...f.options, dockerRun: async (args, opts) => {
+    if (args[0] === 'start' && !aborted) { aborted = true; throw new Error('command aborted'); }
+    return f.dockerRun(args, opts);
+  } }), /command aborted/);
+  assert.deepEqual(await f.read(), f.original);
+  assert.ok(f.calls.some(args => args[0] === 'create' && args.includes('delete')));
+});
+
+test('concurrent agents on one daemon inherit one policy without deleting the shared pool', async t => {
+  const a = await fixture(t), b = await fixture(t);
+  // Both use one Docker fixture while keeping separate private config/state.
+  await Promise.all([
+    runCallerContainerInit({ ...a.options, storageCapacityMiB: 4096, storageReserveMiB: 64 }),
+    runCallerContainerInit({ ...b.options, kind: 'codex', storageCapacityMiB: 4096, storageReserveMiB: 64, dockerRun: a.dockerRun }),
+  ]);
+  const first = (await a.read()).backends.claude.caller_runtime.fixedImageStorage;
+  const second = (await b.read()).backends.codex.caller_runtime.fixedImageStorage;
+  assert.deepEqual(first, second);
+  assert.equal(first.capacityMiB, 4096);
+  assert.equal(first.reserveMiB, 64);
+  assert.equal(a.calls.some(args => args[0] === 'volume' && args[1] === 'rm'), false);
+});

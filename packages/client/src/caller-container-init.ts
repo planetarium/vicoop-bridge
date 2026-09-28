@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve, isAbsolute } from 'node:path';
 import { z } from 'zod';
 import { assertCallerRuntimeVersion } from './caller-runtime-version.js';
 import { CALLER_IMAGE_FILES } from './caller-image-assets.js';
+import { prepareCallerStorage, type StorageInitOptions } from './caller-storage-init.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { CallerRuntimeStore } from './caller-runtime-store.js';
 import {
@@ -22,7 +23,7 @@ import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
 import { createLogger, type Logger } from './logger.js';
 import { PROVIDER_ENV_PATTERN } from './provider-environment.js';
 
-export interface CallerContainerInitOptions {
+export interface CallerContainerInitOptions extends StorageInitOptions {
   kind: InstallableBackendKind;
   configPath?: string;
   image?: string;
@@ -120,8 +121,9 @@ export async function runCallerContainerInit(
       await canonicalStatePath(other.stateDirectory) === await canonicalStatePath(stateDirectory))
     throw new Error(`stateDirectory is already configured for ${otherKind}; each backend requires a distinct state directory`);
   // Validate limits before Docker/build work; the real immutable ID is filled below.
-  CallerRuntimeConfig.parse({
+  const limits = CallerRuntimeConfig.parse({
     ...previous,
+    ...(opts.storageMiB === undefined ? {} : { storageMiB: opts.storageMiB }),
     image: `sha256:${'0'.repeat(64)}`,
     stateDirectory,
   });
@@ -150,6 +152,11 @@ export async function runCallerContainerInit(
     if (out.trim() !== 'linux')
       throw new Error('container requires a Linux Docker engine');
   });
+  const api = (await command(['version', '--format', '{{.Client.APIVersion}} {{.Server.APIVersion}}'])).trim().split(/\s+/);
+  if (api.length !== 2 || api.some(value => {
+    const match = /^(\d+)\.(\d+)$/.exec(value);
+    return !match || Number(match[1]) < 1 || (Number(match[1]) === 1 && Number(match[2]) < 45);
+  })) throw new Error('fixed storage requires Docker CLI and Engine API 1.45+ (Docker 26+) for volume subpaths; upgrade Docker and remove older DOCKER_API_VERSION overrides');
   const store = new CallerRuntimeStore(stateDirectory, agentId);
   await store.lock();
   try {
@@ -288,8 +295,10 @@ export async function runCallerContainerInit(
           `cannot remove validation container ${name}: ${removed.stderr.trim()}`,
         );
     }
+    const fixedImageStorage = await prepareCallerStorage({ ...limits, image: image.Id }, opts, store, opts.kind, run, log);
     const caller_runtime = CallerRuntimeConfig.parse({
-      ...previous,
+      ...limits,
+      fixedImageStorage,
       image: image.Id,
       stateDirectory,
     });

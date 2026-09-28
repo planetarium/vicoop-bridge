@@ -18,8 +18,14 @@ try {
     if (child.error) throw child.error;
     process.exitCode = child.status ?? 1;
   } else {
-    const result = await runStorageManager(request);
-    if (result) console.log(JSON.stringify(result));
+    try {
+      const result = await runStorageManager(request);
+      if (result) console.log(JSON.stringify(result));
+    } finally {
+      // Keep the complete disposable probe under the same pool-wide flock.
+      // Client-side intent still recovers SIGKILL/daemon disconnects.
+      if (request.action === 'probe') await runStorageManager({ ...request, action: 'delete' });
+    }
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));

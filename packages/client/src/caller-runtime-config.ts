@@ -17,7 +17,7 @@ export const CallerRuntimeConfig = z
     memoryMiB: z.number().int().min(512).max(16384).default(2048),
     cpus: z.number().min(0.25).max(16).default(1),
     pids: z.number().int().min(64).max(1024).default(256),
-    // Opt-in filesystem enforcement. Reservation is within the Docker daemon's
+    // container init enables filesystem enforcement. Reservation is within the Docker daemon's
     // backing filesystem; a thin VM disk does not reserve outer host capacity.
     fixedImageStorage: z.object({
       image: z.string().regex(/^sha256:[a-f0-9]{64}$/, 'storage manager image must be pinned by local image ID'),

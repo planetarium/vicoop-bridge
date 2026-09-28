@@ -102,7 +102,7 @@ export class CallerStorage {
       throw new CallerStorageHelperUnconfirmedError(error);
     }
   }
-  async manage(action: 'create' | 'attach' | 'check' | 'delete', id: string, signal?: AbortSignal) {
+  async manage(action: 'create' | 'probe' | 'attach' | 'check' | 'delete', id: string, signal?: AbortSignal) {
     const policy = this.options.fixedImageStorage!;
     const record = await this.record(id);
     if (await this.store.storageHelper(id)) throw new CallerStorageHelperUnconfirmedError();

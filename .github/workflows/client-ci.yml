@@ -66,7 +66,8 @@ jobs:
       - name: Verify embedded caller image recipe is current
         run: |
           node packages/client/scripts/generate-caller-image.mjs
-          git diff --exit-code -- packages/client/src/caller-image-assets.ts
+          node packages/client/scripts/generate-storage-image.mjs
+          git diff --exit-code -- packages/client/src/caller-image-assets.ts packages/client/src/caller-storage-assets.ts
 
       - name: Test Bun caller storage and standalone SQLite
         run: |
@@ -101,3 +102,23 @@ jobs:
             exit 1
           fi
           echo "linux-x64 binary --version: $GOT"
+          VICOOP_CLIENT_BIN="$(realpath "$BIN")" node packages/client/scripts/storage-init-packaging-smoke.mjs
+
+  storage-init:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 9.12.0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @vicoop-bridge/protocol build
+      - name: Real Docker storage initialization and retained caller data
+        env:
+          VICOOP_FIXED_STORAGE_TEST: '1'
+        run: pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-storage-init.integration.test.ts

@@ -28,7 +28,9 @@ in the canonical config, checks that host credentials are available, builds the
 bundled Claude/Codex image and checks the selected CLI version in a temporary,
 networkless container. It writes the immutable image ID and a private
 agent/backend-specific `caller_runtime.stateDirectory` beside config.json,
-initializes SQLite state, and sets `runtime: "container"`. No repository checkout
+builds the bundled storage helper, provisions and probes fixed ext4 storage,
+initializes SQLite state, and sets `runtime: "container"`. See the
+[storage guide](caller-fixed-storage.md) for pool sharing, capacity flags and recovery. No repository checkout
 or manual config editing is required. Provider credentials are not copied or
 passed into the image build/probe; availability checks do not make model calls.
 Caller containers are allocated only when their first authenticated task arrives.
@@ -80,7 +82,9 @@ docker image inspect vicoop-caller:local --format '{{.Id}}'
 The recipe pins Claude 2.1.267 and Codex 0.153.4; build arguments can select
 compatible versions. Claude uses the repository's checksum-verified native
 installer. Codex requires version 0.153.4 or later. Use the resulting immutable
-`sha256:...` image ID (or a registry digest), not a mutable tag, in config.json:
+`sha256:...` image ID (or a registry digest) with `container init --image IMAGE`.
+Init fills in both pinned images and the validated pool policy; the resulting config
+with the standard defaults looks like this (digests are placeholders):
 
 ```json
 {
@@ -101,7 +105,14 @@ installer. Codex requires version 0.153.4 or later. Use the resulting immutable
         "memoryMiB": 2048,
         "cpus": 1,
         "pids": 256,
-        "storageMiB": 1024
+        "storageMiB": 1024,
+        "fixedImageStorage": {
+          "image": "sha256:REPLACE_WITH_STORAGE_HELPER_64_HEX_DIGEST",
+          "poolVolume": "vicoop-caller-storage",
+          "capacityMiB": 8192,
+          "reserveMiB": 1024,
+          "reservationBoundary": "docker-filesystem"
+        }
       }
     }
   }
@@ -213,13 +224,17 @@ Scope count includes retained stopped scopes; it does not automatically evict
 users. Queue length, conversations per scope, task duration, container CPU,
 memory and PIDs are bounded. Full-capacity requests fail explicitly.
 
-`storageMiB` is the combined workspace/session **monitored threshold**. Usage is
-checked on acquisition, once per second during execution, and before successful
-completion. A violation stops the affected scope; its files remain for offline
-inspection/deletion. This is **not a filesystem hard quota**: a fast writer can
-overshoot between checks, and a full Docker disk can affect all containers. Use
-host/Docker storage capacity controls for hostile workloads requiring a strict
-disk boundary. The initial implementation does not claim that acceptance gate.
+Normal `container init` enables fixed ext4 storage: `storageMiB` is the total
+filesystem size shared by workspace/sessions, including metadata. Blocks and
+inodes are limited synchronously; full scopes remain accessible for deleting files.
+The daemon-wide pool shares an immutable budget/reserve across agents/backends.
+See [fixed storage initialization](caller-fixed-storage.md) for defaults and options.
+
+The reservation boundary is the Docker backing filesystem, not physical capacity
+outside thin VM/block devices. Physical reservation and the complete release gate
+remain open. Intermediate development configs without `fixedImageStorage` still
+use monitored volumes; retained ordinary-volume scopes cannot be adopted by init.
+No migration of that unpublished format is provided.
 
 ## Offline administration
 

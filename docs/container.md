@@ -233,5 +233,5 @@ pidfile and reconciles retained caller resources; it does not prove the previous
 shutdown succeeded. Give Claude and Codex separate `stateDirectory` paths:
 `container init` rejects aliases of a path already configured for the other backend.
 
-For opt-in caller filesystem limits, pool setup, and the reservation boundary on
+For default fixed caller filesystem limits, automatic pool setup, and the reservation boundary on
 Docker Desktop/Colima, see [fixed caller storage](caller-fixed-storage.md).

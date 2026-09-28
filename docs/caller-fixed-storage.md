@@ -6,9 +6,9 @@ of that filesystem. Both allocated blocks and inodes are limited by ext4; writes
 fail with `ENOSPC` immediately. `storageMiB` is the **filesystem size**, including
 journal and metadata, rather than a promise of that many usable data bytes.
 
-This is an opt-in implementation on the Docker runtimes feature branch. Existing
-configurations retain their existing monitored-volume behavior. Selecting fixed
-images never falls back to ordinary volumes if provisioning fails.
+`container init claude|codex` enables this storage by default. Initialization
+never falls back to monitored volumes when fixed storage preparation fails.
+Existing development configurations are not rewritten until initialization succeeds.
 
 ## Reservation boundary
 
@@ -26,44 +26,81 @@ required by #508 and is not sufficient to close that issue or its #497 gate.
 The explicit `reservationBoundary` setting acknowledges this narrower contract.
 Images, logs, other pools, and unrelated host processes remain outside this budget.
 
-## Set up a new state directory
+## Initialize
 
-The helper is TypeScript compiled into a standalone Linux executable with Bun.
-Its final image contains the executable and standard Linux storage tools.
-Build it from the repository root, using the same Docker context as
-the client. The helper requires a rootful Linux Docker engine, loop devices,
-ext4, privileged containers, and volume subpath support. This path was exercised
-on macOS Docker Desktop; native Linux and Colima still need release validation.
+Register the agent and prepare host authentication as described in
+[caller runtime setup](caller-runtime.md), then run:
 
 ```sh
-docker build -t vicoop-caller-storage -f packages/client/container/storage/Dockerfile .
-docker image inspect --format '{{.Id}}' vicoop-caller-storage
-docker volume create --label vicoop.component=caller-storage-pool vicoop-caller-storage
+vicoop-client container init claude
+# Or: vicoop-client container init codex
 ```
 
-Initialize the ordinary caller runtime with `container init claude` or
-`container init codex`. Before its first caller is created, add this object to
-that backend's `caller_runtime` configuration, replacing the helper image ID:
+The standalone CLI embeds the reviewed helper Dockerfile, TypeScript sources and
+SQLite adapter. Docker builds the executable with Bun **inside the build image**;
+no checkout, host Bun/Python, manual Docker commands or JSON edits are required.
+The CLI pins both images by immutable local image ID. Subsequent initialization
+reuses those images; `--rebuild` rebuilds both bundled images. `--image IMAGE`
+selects only the workload image, keeping the helper build trusted and bundled.
 
-```json
-{
-  "storageMiB": 1024,
-  "fixedImageStorage": {
-    "image": "sha256:<64-character-local-image-ID>",
-    "poolVolume": "vicoop-caller-storage",
-    "capacityMiB": 8192,
-    "reserveMiB": 1024,
-    "reservationBoundary": "docker-filesystem"
-  }
-}
+The default `vicoop-caller-storage` local volume is shared by all agents and both
+backends on the selected Docker daemon/context. `--storage-pool VOLUME` selects a
+separate pool or an existing managed pool. Foreign labels, non-local drivers and
+driver options are rejected. Existing pool data is never reformatted or adopted.
+
+| Option (integer MiB) | New pool/default behavior |
+| --- | --- |
+| `--storage-mib` | Per-caller filesystem size; 1024, or the existing backend setting |
+| `--storage-capacity-mib` | Pool admission budget; `storageMiB × maxScopes` (normally 8192) |
+| `--storage-reserve-mib` | Free-space floor; `max(1024, ceil(capacityMiB / 10))` |
+
+The budget follows the existing scope defaults, rather than treating the previous
+8192/1024 example as a universal sizing requirement. It is an **aggregate pool
+budget**, not capacity promised to every agent: sharing more agents/backends does
+not multiply it. `maxScopes` continues to limit each backend independently.
+Choose a larger budget on first initialization when sharing across many agents.
+Ext4 metadata/journal are included in each scope's size. Reserve applies to free
+space on the backing filesystem, including unrelated consumption at admission.
+
+Unspecified capacity/reserve inherit an existing labeled pool's policy. Explicit
+conflicts are rejected. A #509 manually created pool without policy labels still
+validates the supplied/default policy against its existing SQLite catalog; use
+`--rebuild` if its pinned development helper predates probe support, and supply
+its original values if they differ from the defaults. Policy remains immutable,
+even when empty. Init does not resize pools or retained scope filesystems, or move
+an already-configured backend to another pool. Rebuilding the helper does not
+change image UUIDs, pool policy, caller state, registration or unrelated settings.
+
+```sh
+# Example for a NEW pool, not a universal capacity recommendation:
+vicoop-client container init codex --storage-pool team-callers \
+  --storage-mib 2048 --storage-capacity-mib 32768 --storage-reserve-mib 4096
 ```
 
-The pool must be an existing local Docker volume with the label shown above and
-no driver options. Do not share it with workloads, delete it with volume-prune,
-modify its catalog/images manually, or change its capacity policy in place.
-The helper image ID is trusted operator code: it runs privileged with the pool
-and daemon `/dev`, with no network or Docker socket. Workload containers retain
-the existing isolation boundary and receive only the two filesystem subpaths.
+Initialization requires Linux Docker (rootful), privileged helpers, loop devices,
+ext4 and Docker CLI/Engine API 1.45+ for volume subpaths. The API requirement follows
+[Docker's Subpath API addition](https://docs.docker.com/reference/api/engine/version-history/#v145-api-changes).
+It performs a disposable full-size filesystem allocation, mount, write, fsync,
+readback and deletion before saving config. This requires room for one scope plus
+the reserve, including on reinitialization. A full pool can therefore reject init;
+existing config/data remain usable. The helper executes the entire probe under
+#509's pool-wide flock; concurrent initializers agree on immutable volume labels
+and the SQLite policy. No physical allocation beyond the Docker filesystem is
+claimed; initialization prints that boundary explicitly.
+
+Build, capability, capacity and config-write failures preserve the previous config.
+The shared pool and build-cache images remain reusable after failed initialization;
+init never prunes either. Only the recorded disposable probe image/helper is
+removed. Cleanup uncertainty fails initialization and retains a private recovery
+journal under `<stateDirectory>/storage-init` (including `probe.json` and SQLite).
+Restore Docker access and rerun init with the same options to reconcile the helper
+by immutable ID and remove the interrupted probe before trying again. Do not delete
+that journal or the pool to bypass a failure. An abrupt kill likewise leaves the
+journal for the next run; incomplete allocation is deleted, never reformatted.
+
+The pool must not be exposed to workloads, pruned, or manually modified. Only the
+trusted helper receives privileged pool/device access; it has no network or Docker
+socket. Workloads receive workspace/session subpaths, not the backing pool.
 
 ## Lifecycle and recovery
 
@@ -93,9 +130,11 @@ legacy `du` threshold is not used for fixed filesystems. Increasing or decreasin
 rejected; restore the original configuration to administer them.
 
 Existing ordinary-volume scopes cannot be adopted automatically. Keep their
-original configuration/state and data. A verified offline copy/migration workflow
-with rollback, in-place resizing, and end-to-end physical pool provisioning are
-not implemented in this change.
+original configuration/state and data. The intermediate per-caller ordinary-volume format was never released; no migration
+subsystem is provided. Older released shared runtimes retain their volumes: follow
+the [configuration transition guide](caller-runtime.md), prepare host authentication,
+and do not assign shared workspaces/sessions to an authenticated caller. In-place
+resizing and end-to-end physical pool provisioning remain separate work.
 
 ## Tests
 
@@ -105,9 +144,19 @@ images and uses privileged helper containers; select a disposable/test engine:
 ```sh
 cd packages/client
 DOCKER_CONTEXT=desktop-linux VICOOP_FIXED_STORAGE_TEST=1 \
-  pnpm exec tsx --test src/caller-storage.integration.test.ts
+  pnpm exec tsx --test src/caller-storage.integration.test.ts src/caller-storage-init.integration.test.ts
 ```
 
 It covers actual runtime creation, block/inode exhaustion, independent callers,
 shared-pool admission across client states, recreation, loss of loop attachments,
 capacity-change rejection, retained data, and explicit deletion/capacity reuse.
+
+The init integration test exercises concurrent Claude/Codex initialization against
+one pool, first-caller fixed storage, retained files/UUIDs after reinitialization,
+policy-change rejection and returned probe capacity. On test failure it retains
+recovery state rather than deleting uncertain resources. The compiled packaging
+smoke (`scripts/storage-init-packaging-smoke.mjs`) runs the CLI outside a checkout
+against a deterministic Docker fixture and verifies exact embedded build inputs;
+it is not a substitute for the opt-in real-Docker tests. Docker Desktop lifecycle
+results from #509 do not establish native Linux/Colima or integrated restart release
+validation; those, physical backing reservation and provider checks remain open.

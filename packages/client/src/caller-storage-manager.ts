@@ -1,6 +1,6 @@
 import {
   chownSync, closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync,
-  openSync, readlinkSync, statfsSync, statSync, symlinkSync, unlinkSync,
+  openSync, readFileSync, writeFileSync, readlinkSync, statfsSync, statSync, symlinkSync, unlinkSync,
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -8,7 +8,7 @@ import { setTimeout } from 'node:timers/promises';
 import { openCallerDatabase } from './caller-runtime-sqlite.js';
 
 export interface StorageRequest {
-  action: 'create' | 'attach' | 'check' | 'delete';
+  action: 'create' | 'probe' | 'attach' | 'check' | 'delete';
   key: string;
   uuid: string;
   size: number;
@@ -20,7 +20,7 @@ function requireState(condition: unknown, message: string): asserts condition {
 }
 export function parseStorageRequest(args: readonly string[]): StorageRequest {
   const [action, key, uuid, sizeText, budgetText, reserveText] = args;
-  requireState(args.length === 6 && ['create', 'attach', 'check', 'delete'].includes(action), 'invalid action');
+  requireState(args.length === 6 && ['create', 'probe', 'attach', 'check', 'delete'].includes(action), 'invalid action');
   requireState(/^[a-f0-9]{64}$/.test(key), 'invalid storage key');
   requireState(/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(uuid), 'invalid UUID');
   requireState([sizeText, budgetText, reserveText].every(v => /^[0-9]+$/.test(v)), 'invalid capacity');
@@ -78,7 +78,7 @@ export async function runStorageManager(request: StorageRequest, options: {
     } else if (action === 'delete') {
       requireState(!existsSync(image), 'unrecorded image; inspect pool');
       return;
-    } else if (action === 'create') {
+    } else if (action === 'create' || action === 'probe') {
       requireState(!existsSync(image), 'unrecorded image; inspect pool');
       const { used } = db.prepare('SELECT coalesce(sum(size),0) AS used FROM images').get() as { used: number };
       const space = statfsSync(root);
@@ -102,6 +102,13 @@ export async function runStorageManager(request: StorageRequest, options: {
             const target = join(mount, directory);
             mkdirSync(target, { mode: 0o700 });
             chownSync(target, 1000, 1000);
+          }
+          if (action === 'probe') {
+            const probe = join(mount, 'workspace', '.init-probe');
+            writeFileSync(probe, 'vicoop-storage-probe', { flag: 'wx' });
+            syncPath(probe);
+            requireState(readFileSync(probe, 'utf8') === 'vicoop-storage-probe', 'storage probe readback failed');
+            unlinkSync(probe);
           }
           run('sync', '-f', mount);
         } finally { run('umount', mount); }

@@ -492,8 +492,20 @@ const containerInitSubCmd = command(
     stateDirectory: optional(option('--state-directory', string({ metavar: 'PATH' }), {
       description: message`Private caller state directory. Defaults to an agent/backend-specific path beside config.json; existing paths are preserved.`,
     })),
+    storagePool: optional(option('--storage-pool', string({ metavar: 'VOLUME' }), {
+      description: message`Managed pool shared on this Docker daemon (default: vicoop-caller-storage). Existing pool policy is preserved.`,
+    })),
+    storageMiB: optional(option('--storage-mib', string({ metavar: 'MiB' }), {
+      description: message`Per-caller filesystem size including metadata (default: 1024 MiB). Retained scope sizes cannot change.`,
+    })),
+    storageCapacityMiB: optional(option('--storage-capacity-mib', string({ metavar: 'MiB' }), {
+      description: message`New pool admission budget (default: storageMiB × maxScopes). Existing pool policy is inherited.`,
+    })),
+    storageReserveMiB: optional(option('--storage-reserve-mib', string({ metavar: 'MiB' }), {
+      description: message`New pool free-space floor (default: max(1024 MiB, 10% of pool capacity)). Existing pool policy is inherited.`,
+    })),
     rebuild: withDefault(flag('--rebuild', {
-      description: message`Build the bundled image again instead of reusing the configured image.`,
+      description: message`Build the bundled backend and storage helper images again instead of reusing configured images.`,
     }), false),
     fromHost: withDefault(flag('--from-host', {
       description: message`Accepted for compatibility. Authentication always stays on the host.`,
@@ -506,7 +518,7 @@ const containerInitSubCmd = command(
   }),
   {
     brief: message`Prepare per-caller container execution and save agent configuration.`,
-    description: message`Checks host authentication, builds the bundled backend image (no repository checkout needed) or validates --image, initializes private SQLite state and saves runtime settings in the registered agent config. Existing settings and credentials are preserved; legacy cwd/runtime_name are removed after successful validation. Caller containers are allocated on their first request.`,
+    description: message`Checks host authentication, builds the bundled backend image (no repository checkout needed) or validates --image, builds and probes fixed ext4 storage, initializes private SQLite state and saves runtime settings in the registered agent config. Existing settings and credentials are preserved; legacy cwd/runtime_name are removed after successful validation. Caller containers are allocated on their first request.`,
   },
 );
 
@@ -597,6 +609,10 @@ export async function runContainerInitCli(args: ContainerInitArgs): Promise<numb
       stateDirectory: args.stateDirectory,
       image: args.image,
       rebuild: args.rebuild,
+      storagePool: args.storagePool,
+      storageMiB: parseStorageMiB(args.storageMiB),
+      storageCapacityMiB: parseStorageMiB(args.storageCapacityMiB),
+      storageReserveMiB: parseStorageMiB(args.storageReserveMiB),
     });
   } catch (err) {
     console.error(`container init failed: ${(err as Error).message}`);
@@ -642,4 +658,11 @@ export async function runContainerValidateCli(
     console.error(`container validate failed: ${(err as Error).message}`);
     return 1;
   }
+}
+
+function parseStorageMiB(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (!/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value)))
+    throw new Error('storage sizes must be positive integer MiB values');
+  return Number(value);
 }
