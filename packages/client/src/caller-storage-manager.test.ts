@@ -82,3 +82,34 @@ test('storage helper validates CLI identity and capacity before filesystem opera
   }
   assert.throws(() => parseStorageRequest([...args, 'unexpected']));
 });
+
+test('absent-image cleanup ignores rejected admission policy without changing the pool or retained data', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'storage-rejected-policy-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const run = (...args: string[]): string => { throw new Error(`unexpected Linux mutation: ${args}`); };
+  // Cleanup alone must not establish a new pool policy.
+  await runStorageManager(request, { root, run });
+  const db = await openCallerDatabase(join(root, 'catalog.sqlite'));
+  try {
+    assert.deepEqual(db.prepare('SELECT * FROM policy').all(), []);
+    const policy = { budget: request.budget * 2, reserve: request.reserve * 2 };
+    db.prepare('INSERT INTO policy VALUES (?,?)').run(policy.budget, policy.reserve);
+    // The probe was rejected before allocation; deletion is a confirmed no-op.
+    await assert.rejects(runStorageManager({ ...request, action: 'probe' }, { root, run }), /pool policy differs/);
+    await runStorageManager(request, { root, run });
+    assert.deepEqual(db.prepare('SELECT * FROM policy').all(), [policy]);
+    assert.deepEqual(db.prepare('SELECT * FROM images').all(), []);
+    // A missing row never authorizes deleting an unrecorded file or symlink.
+    const imagePath = join(root, `${request.key}.img`);
+    await symlink(join(root, 'missing-target'), imagePath);
+    await assert.rejects(runStorageManager(request, { root, run }), /symlink image/);
+    await rm(imagePath);
+    await writeFile(imagePath, 'retained');
+    await assert.rejects(runStorageManager(request, { root, run }), /unrecorded image/);
+    db.prepare('INSERT INTO images VALUES (?,?,?,?)').run(request.key, request.uuid, request.size, 'allocating');
+    await assert.rejects(runStorageManager(request, { root, run }), /pool policy differs/);
+    assert.equal(await readFile(imagePath, 'utf8'), 'retained');
+    assert.equal(db.prepare('SELECT * FROM images').all().length, 1);
+    assert.deepEqual(db.prepare('SELECT * FROM policy').all(), [policy]);
+  } finally { db.close(); }
+});

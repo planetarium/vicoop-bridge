@@ -67,7 +67,8 @@ conflicts are rejected. A #509 manually created pool without policy labels still
 validates the supplied/default policy against its existing SQLite catalog; use
 `--rebuild` if its pinned development helper predates probe support, and supply
 its original values if they differ from the defaults. Policy remains immutable,
-even when empty. Init does not resize pools or retained scope filesystems, or move
+even when empty. New pools smaller than a single scope are rejected before
+creation. Init does not resize pools or retained scope filesystems, or move
 an already-configured backend to another pool. Rebuilding the helper does not
 change image UUIDs, pool policy, caller state, registration or unrelated settings.
 
@@ -93,8 +94,12 @@ The shared pool and build-cache images remain reusable after failed initializati
 init never prunes either. Only the recorded disposable probe image/helper is
 removed. Cleanup uncertainty fails initialization and retains a private recovery
 journal under `<stateDirectory>/storage-init` (including `probe.json` and SQLite).
-Restore Docker access and rerun init with the same options to reconcile the helper
-by immutable ID and remove the interrupted probe before trying again. Do not delete
+Restore Docker access and rerun init with the pool's original capacity/reserve to
+reconcile the helper by immutable ID and remove the interrupted probe before trying
+again. `--rebuild` also uses the newly validated helper for recovery, preserving the
+recorded pool and filesystem identity. A rejected probe with neither a catalog
+allocation nor an image can be cleared without adopting its rejected policy;
+retained allocations and unrecorded files still fail closed. Do not delete
 that journal or the pool to bypass a failure. An abrupt kill likewise leaves the
 journal for the next run; incomplete allocation is deleted, never reformatted.
 

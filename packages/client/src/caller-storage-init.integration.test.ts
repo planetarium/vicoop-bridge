@@ -17,6 +17,7 @@ test('init provisions shared fixed storage, concurrent backends agree, and reini
   const dir = await mkdtemp(join(tmpdir(), 'storage-init-integration-'));
   const storagePool = `vb-init-test-${randomUUID()}`;
   const tag = `${storagePool}:fixture`;
+  const legacyPool = `${storagePool}-unlabeled`;
   const command = async (args: string[]) => {
     const result = await runDockerCommand(args, { timeoutMs: 300_000 });
     assert.equal(result.exitCode, 0, result.stderr);
@@ -73,6 +74,30 @@ USER node
     await pool.remove(id, true); await pool.close(); pool = undefined;
     // Probe space is returned; a subsequent initializer can still allocate it.
     await runCallerContainerInit({ ...options, kind: 'codex', configPath: paths[1] });
+    // Rejected new policy must not publish an unusable immutable pool.
+    const legacyPath = join(dir, 'legacy-pool.json');
+    const original = JSON.stringify({ agent_id: 'legacy-pool-agent', server_token: 'fixture' });
+    await writeFile(legacyPath, original);
+    const legacyOptions = { ...options, kind: 'claude' as const, configPath: legacyPath, storagePool: legacyPool };
+    await assert.rejects(runCallerContainerInit({ ...legacyOptions, storageMiB: 1024, storageCapacityMiB: 64 }), /smaller than a scope/);
+    const missing = await runDockerCommand(['volume', 'inspect', legacyPool]);
+    assert.notEqual(missing.exitCode, 0);
+    assert.match(missing.stderr, /No such volume/i);
+    // A #509-style pool has an existing catalog but no policy labels. Seed it
+    // with a real disposable helper probe, then try incorrect/default policy.
+    await command(['volume', 'create', '--label', 'vicoop.component=caller-storage-pool', legacyPool]);
+    await command(['run', '--rm', '--name', `${legacyPool}-seed`, '--privileged', '--network', 'none', '--read-only',
+      '--tmpfs', '/mnt:rw,nosuid,nodev', '--tmpfs', '/tmp:rw,nosuid,nodev',
+      '--mount', 'type=bind,src=/dev,dst=/dev', '--mount', `type=volume,src=${legacyPool},dst=/pool`,
+      runtime.fixedImageStorage.image, 'probe', 'f'.repeat(64), randomUUID(),
+      String(64 * 1048576), String(128 * 1048576), String(64 * 1048576)]);
+    await assert.rejects(runCallerContainerInit({ ...legacyOptions,
+      storageMiB: undefined, storageCapacityMiB: undefined, storageReserveMiB: undefined }), /pool policy differs/);
+    assert.equal(await readFile(legacyPath, 'utf8'), original);
+    await runCallerContainerInit(legacyOptions);
+    const recovered = JSON.parse(await readFile(legacyPath, 'utf8')).backends.claude.caller_runtime;
+    assert.equal(recovered.fixedImageStorage.capacityMiB, 128);
+    assert.equal(recovered.fixedImageStorage.reserveMiB, 64);
     complete = true;
   } catch (error) {
     console.error('Initialization/lifecycle failure before cleanup:', error);
@@ -84,9 +109,9 @@ USER node
     }
     // On uncertainty preserve the durable recovery journal and dedicated test pool.
     if (complete) {
-      await command(['volume', 'rm', storagePool]);
+      await command(['volume', 'rm', storagePool, legacyPool]);
       await command(['image', 'rm', tag]);
       await rm(dir, { recursive: true, force: true });
-    } else console.error(`Initialization test recovery state retained: ${dir}; pool: ${storagePool}`);
+    } else console.error(`Initialization test recovery state retained: ${dir}; pools: ${storagePool}, ${legacyPool}`);
   }
 });

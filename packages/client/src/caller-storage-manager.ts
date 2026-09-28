@@ -66,18 +66,24 @@ export async function runStorageManager(request: StorageRequest, options: {
       CREATE TABLE IF NOT EXISTS policy (budget INTEGER, reserve INTEGER);
       CREATE TABLE IF NOT EXISTS images (key TEXT PRIMARY KEY, uuid TEXT UNIQUE, size INTEGER, state TEXT);`);
     const policy = db.prepare('SELECT budget,reserve FROM policy').get() as { budget: number; reserve: number } | undefined;
-    if (!policy) db.prepare('INSERT INTO policy VALUES (?,?)').run(budget, reserve);
-    else requireState(policy.budget === budget && policy.reserve === reserve, 'pool policy differs from existing catalog');
-    syncPath(root, true);
     let row = db.prepare('SELECT uuid,size,state FROM images WHERE key=?').get(key) as
       { uuid: string; size: number; state: string } | undefined;
     const image = join(root, `${key}.img`);
     requireState(!isSymlink(image), 'symlink image');
-    if (row) {
-      requireState(row.uuid === uuid && row.size === size, 'retained storage identity/capacity mismatch');
-    } else if (action === 'delete') {
+    // A rejected admission may have journaled client intent without ever creating
+    // a catalog row or image. Confirm that absence before checking its rejected
+    // policy, so cleanup cannot trap init on stale policy values. This is a no-op:
+    // it neither establishes/changes pool policy nor detaches devices. Any retained
+    // allocation or unrecorded file must still fail closed on a policy mismatch.
+    if (action === 'delete' && !row) {
       requireState(!existsSync(image), 'unrecorded image; inspect pool');
       return;
+    }
+    if (!policy) db.prepare('INSERT INTO policy VALUES (?,?)').run(budget, reserve);
+    else requireState(policy.budget === budget && policy.reserve === reserve, 'pool policy differs from existing catalog');
+    syncPath(root, true);
+    if (row) {
+      requireState(row.uuid === uuid && row.size === size, 'retained storage identity/capacity mismatch');
     } else if (action === 'create' || action === 'probe') {
       requireState(!existsSync(image), 'unrecorded image; inspect pool');
       const { used } = db.prepare('SELECT coalesce(sum(size),0) AS used FROM images').get() as { used: number };

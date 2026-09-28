@@ -72,6 +72,9 @@ export async function prepareCallerStorage(
   let inspected = await run(['volume', 'inspect', poolVolume]);
   if (inspected.exitCode !== 0) {
     if (!/No such volume/i.test(inspected.stderr)) throw new Error(`cannot inspect storage pool: ${inspected.stderr.trim()}`);
+    // Reject impossible new policies before publishing immutable volume labels.
+    // Keep the post-inspection check too: existing pools inherit their own policy.
+    if (desired.capacityMiB < runtime.storageMiB) throw new Error('storage pool capacity is smaller than a scope');
     log.info(`Creating shared storage pool ${poolVolume}; it is retained for reuse if initialization fails.`);
     await command(['volume', 'create', '--driver', 'local', '--label', 'vicoop.component=caller-storage-pool',
       '--label', `${capacityLabel}=${desired.capacityMiB}`, '--label', `${reserveLabel}=${desired.reserveMiB}`, poolVolume]);
@@ -117,7 +120,13 @@ async function probeStorage(runtime: CallerRuntimeOptions, agentId: string, kind
     if ((await store.scopes()).length) {
       if (!original) throw new Error('probe recovery policy missing');
       const old = CallerRuntimeConfig.parse(JSON.parse(original));
-      const recovery = new CallerStorage(old, store, run);
+      if (!old.fixedImageStorage) throw new Error('probe recovery storage policy missing');
+      // Preserve the recorded pool/size/policy and filesystem identity, but use
+      // this init's validated helper so --rebuild can repair older helper bugs.
+      // reconcile still validates a pending helper against its journaled image ID.
+      const recovery = new CallerStorage({ ...old, fixedImageStorage: {
+        ...old.fixedImageStorage, image: runtime.fixedImageStorage!.image,
+      } }, store, run);
       await recovery.initialize();
       for (const scope of await store.scopes()) {
         if (scope !== id) throw new Error('unexpected storage probe identity');
@@ -139,6 +148,6 @@ async function probeStorage(runtime: CallerRuntimeOptions, agentId: string, kind
       await store.forget(id);
     }
   } catch (error) {
-    throw new Error(`Fixed storage probe failed: ${error instanceof Error ? error.message : error}. Requires rootful Linux Docker, privileged helpers, loop devices and ext4, plus room for one ${runtime.storageMiB} MiB scope and the pool reserve. Prior config is unchanged. Recovery state: ${directory}; restore Docker access and rerun init with the same policy (use --rebuild if a development helper predates probe support). Never remove the shared pool.`, { cause: error });
+    throw new Error(`Fixed storage probe failed: ${error instanceof Error ? error.message : error}. Requires rootful Linux Docker, privileged helpers, loop devices and ext4, plus room for one ${runtime.storageMiB} MiB scope and the pool reserve. Prior config is unchanged. Recovery state: ${directory}; restore Docker access and rerun init with the pool's original capacity/reserve (use --rebuild to replace an outdated helper). Never remove the shared pool.`, { cause: error });
   } finally { await store.unlock(); }
 }

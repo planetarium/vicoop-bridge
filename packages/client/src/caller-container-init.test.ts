@@ -9,6 +9,7 @@ import {
 } from './caller-container-init.js';
 import { STORAGE_IMAGE_FILES } from './caller-storage-assets.js';
 import { CallerStorage } from './caller-storage.js';
+import { parseStorageRequest, runStorageManager, type StorageRequest } from './caller-storage-manager.js';
 import { CALLER_IMAGE_FILES } from './caller-image-assets.js';
 import { CallerRuntimeStore, scopeDigest } from './caller-runtime-store.js';
 import { openCallerDatabase } from './caller-runtime-sqlite.js';
@@ -53,7 +54,7 @@ async function fixture(t: TestContext) {
       const labels: Record<string, string> = {};
       args.forEach((arg, i) => { if (arg === '--label') { const [k,v] = args[i+1].split('='); labels[k] = v; } });
       const helperId = (++helperSequence).toString(16).padStart(64, 'c');
-      const helper = { Id: helperId, Name: '/' + args[args.indexOf('--name')+1], Config: { Image: image, Labels: labels } };
+      const helper = { Id: helperId, Name: '/' + args[args.indexOf('--name')+1], Config: { Image: args.at(-7), Labels: labels } };
       helpers.set(helperId, helper);
       return success(helperId);
     }
@@ -617,3 +618,96 @@ test('concurrent agents on one daemon inherit one policy without deleting the sh
   assert.equal(first.reserveMiB, 64);
   assert.equal(a.calls.some(args => args[0] === 'volume' && args[1] === 'rm'), false);
 });
+
+
+test('an undersized first policy creates no pool and does not poison a normal retry', async t => {
+  const f = await fixture(t);
+  await assert.rejects(runCallerContainerInit({ ...f.options, storageCapacityMiB: 64 }), /smaller than a scope/);
+  assert.deepEqual(await f.read(), f.original);
+  assert.equal(f.calls.some(args => args[0] === 'volume' && args[1] === 'create'), false);
+  await runCallerContainerInit(f.options);
+  assert.equal((await f.read()).backends.claude.caller_runtime.fixedImageStorage.capacityMiB, 8192);
+});
+
+for (const { interruptCleanup, outdatedHelper } of [
+  { interruptCleanup: false, outdatedHelper: false },
+  { interruptCleanup: true, outdatedHelper: false },
+  { interruptCleanup: false, outdatedHelper: true },
+  { interruptCleanup: true, outdatedHelper: true },
+]) {
+  test(`unlabeled pool accepts corrected policy (interrupted=${interruptCleanup}, outdated helper=${outdatedHelper})`, async t => {
+    const f = await fixture(t);
+    const root = await mkdtemp(join(f.dir, 'catalog-'));
+    const db = await openCallerDatabase(join(root, 'catalog.sqlite'));
+    const policy = { budget: 2048 * 1048576, reserve: 64 * 1048576 };
+    db.exec('CREATE TABLE policy (budget INTEGER, reserve INTEGER); CREATE TABLE images (key TEXT PRIMARY KEY, uuid TEXT UNIQUE, size INTEGER, state TEXT)');
+    db.prepare('INSERT INTO policy VALUES (?,?)').run(policy.budget, policy.reserve);
+    const stateDirectory = join(f.dir, 'private');
+    let failCleanup = interruptCleanup;
+    const operations: StorageRequest[] = [];
+    const helpers = new Map<string, { request: StorageRequest; helperImage: string }>();
+    const rebuiltImage = `sha256:${'b'.repeat(64)}`;
+    let rebuild = false;
+    const recoveryImages: string[] = [];
+    const dockerRun: AsyncDockerRun = async (args, opts) => {
+      if (args[0] === 'image' && args[2] === rebuiltImage)
+        return success(JSON.stringify([{ Id: rebuiltImage, Config: {} }]));
+      if (rebuild && args[0] === 'build' && args[args.indexOf('-f') + 1].endsWith('/storage/Dockerfile')) {
+        await f.dockerRun(args, opts);
+        await writeFile(args[args.indexOf('--iidfile') + 1], rebuiltImage);
+        return success();
+      }
+      if (args[0] === 'volume' && args[1] === 'inspect') return success(JSON.stringify([
+        { Name: args[2], Driver: 'local', Options: {}, Labels: { 'vicoop.component': 'caller-storage-pool' } },
+      ]));
+      if (args[0] === 'create') {
+        const result = await f.dockerRun(args, opts);
+        helpers.set(result.stdout, { request: parseStorageRequest(args.slice(-6)), helperImage: args.at(-7)! });
+        return result;
+      }
+      if (args[0] === 'start') {
+        const { request, helperImage } = helpers.get(args[2])!;
+        operations.push(request);
+        if (rebuild && request.action === 'delete') recoveryImages.push(helperImage);
+        // Emulate the pre-fix helper: even an absent-image delete rejects policy.
+        if (outdatedHelper && helperImage === image &&
+            (request.budget !== policy.budget || request.reserve !== policy.reserve))
+          return { exitCode: 1, stdout: '', stderr: 'pool policy differs from existing catalog' };
+        // Execute real policy validation and cleanup against the pool SQLite.
+        // Only successful filesystem creation is a Docker fixture in this test.
+        if (request.action === 'delete' || request.budget !== policy.budget || request.reserve !== policy.reserve) {
+          try {
+            await runStorageManager(request, { root, run: () => { throw new Error('unexpected Linux mutation'); } });
+          } catch (error) { return { exitCode: 1, stdout: '', stderr: (error as Error).message }; }
+        }
+        return success();
+      }
+      if (failCleanup && args[0] === 'rm' && /^[a-f0-9]{64}$/.test(args[2]))
+        return { exitCode: 1, stdout: '', stderr: 'Docker unavailable' };
+      return f.dockerRun(args, opts);
+    };
+    try {
+      await assert.rejects(runCallerContainerInit({ ...f.options, stateDirectory, dockerRun }),
+        interruptCleanup ? /termination unconfirmed/ : /pool policy differs/);
+      assert.deepEqual(await f.read(), f.original);
+      failCleanup = false;
+      rebuild = outdatedHelper;
+      await runCallerContainerInit({ ...f.options, stateDirectory, dockerRun, rebuild, storageCapacityMiB: 2048, storageReserveMiB: 64 });
+      if (outdatedHelper) {
+        assert.ok(recoveryImages.length);
+        assert.ok(recoveryImages.every(value => value === rebuiltImage));
+      }
+      const saved = (await f.read()).backends.claude.caller_runtime.fixedImageStorage;
+      assert.equal(saved.capacityMiB, 2048);
+      assert.equal(saved.reserveMiB, 64);
+      assert.deepEqual(db.prepare('SELECT * FROM policy').all(), [policy]);
+      assert.deepEqual(db.prepare('SELECT * FROM images').all(), []);
+      assert.ok(operations.some(op => op.action === 'delete' && op.budget === 8192 * 1048576));
+      assert.ok(operations.some(op => op.action === 'probe' && op.budget === policy.budget));
+      const store = new CallerRuntimeStore(join(stateDirectory, 'storage-init'), f.original.agent_id);
+      await store.lock();
+      try { assert.deepEqual(await store.scopes(), []); }
+      finally { await store.unlock(); }
+    } finally { db.close(); }
+  });
+}
