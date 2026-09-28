@@ -41,10 +41,12 @@ jobs:
       # single Linux runner via `bun build --compile --target=…`. The
       # asset-upload step (scripts/package-client-release.sh) invokes it;
       # changesets/action above only needs Node.
+      # 1.4.2 includes the ARM64 code-signature fix (oven-sh/bun#39837).
+      # Older compilers can emit binaries that macOS kills before startup (#512).
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.2.20
+          bun-version: 1.4.2
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
