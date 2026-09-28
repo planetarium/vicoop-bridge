@@ -122,10 +122,12 @@ export async function runStorageManager(request: StorageRequest, options: {
     }
 
     const alias = join(aliases, uuid);
+    // Native Linux udev may replace our absolute link with ../../loopN.
+    // Accept only these two loop-device spellings; identify detach targets by image inode.
     if (action === 'delete') {
       // The client first removes validated Docker consumers and their volume.
       if (existsSync(image)) {
-        if (isSymlink(alias)) requireState(/^\/dev\/loop[0-9]+$/.test(readlinkSync(alias)), 'unexpected UUID alias target');
+        if (isSymlink(alias)) requireState(/^(?:\/dev\/|\.\.\/\.\.\/)loop[0-9]+$/.test(readlinkSync(alias)), 'unexpected UUID alias target');
         const loops = run('losetup', '-j', image).split('\n').filter(Boolean);
         for (const line of loops) {
           const loop = line.split(':', 1)[0];
@@ -158,7 +160,7 @@ export async function runStorageManager(request: StorageRequest, options: {
     requireState(run('blkid', '-p', '-s', 'UUID', '-o', 'value', loop) === uuid, 'attached device UUID mismatch');
     mkdirSync(aliases, { recursive: true, mode: 0o700 });
     if (isSymlink(alias)) {
-      requireState(/^\/dev\/loop[0-9]+$/.test(readlinkSync(alias)), 'unexpected UUID alias target');
+      requireState(/^(?:\/dev\/|\.\.\/\.\.\/)loop[0-9]+$/.test(readlinkSync(alias)), 'unexpected UUID alias target');
       unlinkSync(alias);
     } else requireState(!existsSync(alias), 'UUID alias is not a symlink');
     symlinkSync(loop, alias);

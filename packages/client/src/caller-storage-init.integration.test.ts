@@ -74,6 +74,9 @@ USER node
     // Probe space is returned; a subsequent initializer can still allocate it.
     await runCallerContainerInit({ ...options, kind: 'codex', configPath: paths[1] });
     complete = true;
+  } catch (error) {
+    console.error('Initialization/lifecycle failure before cleanup:', error);
+    throw error;
   } finally {
     if (pool) {
       for (const id of await pool.store.scopes()) await pool.remove(id, true);

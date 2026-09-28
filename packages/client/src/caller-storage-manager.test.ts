@@ -11,13 +11,14 @@ const request: StorageRequest = {
   size: 64 * 1048576, budget: 128 * 1048576, reserve: 64 * 1048576,
 };
 
-test('deletion retry after detach removes stale alias without detaching recycled device', async t => {
+for (const aliasTarget of ['/dev/loop7', '../../loop7']) {
+test(`deletion retry preserves recycled device with UUID alias ${aliasTarget}`, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'storage-manager-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const root = join(directory, 'managed'), aliases = join(directory, 'by-uuid');
   await mkdir(root); await mkdir(aliases);
   const image = join(root, `${request.key}.img`), alias = join(aliases, request.uuid);
-  await writeFile(image, 'retained'); await symlink('/dev/loop7', alias);
+  await writeFile(image, 'retained'); await symlink(aliasTarget, alias);
   const db = await openCallerDatabase(join(root, 'catalog.sqlite'));
   db.exec('CREATE TABLE policy (budget INTEGER, reserve INTEGER); CREATE TABLE images (key TEXT PRIMARY KEY, uuid TEXT UNIQUE, size INTEGER, state TEXT)');
   db.prepare('INSERT INTO policy VALUES (?,?)').run(request.budget, request.reserve);
@@ -47,6 +48,8 @@ test('deletion retry after detach removes stale alias without detaching recycled
   assert.deepEqual(reopened.prepare('SELECT * FROM images').all(), []);
   reopened.close();
 });
+
+}
 
 test('failed allocation stays charged and cannot be reformatted on retry', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'storage-admission-'));
