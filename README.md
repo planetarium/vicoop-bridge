@@ -27,6 +27,14 @@ cross-compiles per-platform native binaries (macOS/Linux/Windows) with Bun
 and publishes them as assets on the `@vicoop-bridge/client@<version>`
 GitHub release.
 
+The Linux build signs the macOS x64 executable with `rcodesign` before
+writing its checksum; Bun signs ARM64 itself. Both macOS artifacts are
+verified and executed on native macOS CI runners. Local release packaging
+also requires `rcodesign` on `PATH`. On Linux x64, install the CI-pinned tool
+with `scripts/install-rcodesign.sh <directory>` and add that directory to
+`PATH`; other hosts can install `apple-codesign` 0.29.0 for their platform.
+These are ad-hoc signatures, not Developer ID signing or notarization.
+
 Day-to-day flow for contributors:
 
 ```bash

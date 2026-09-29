@@ -5,6 +5,7 @@ set -euo pipefail
 # dist-release/. Idempotent: re-running rebuilds everything.
 #
 # Usage: scripts/package-client-release.sh <tag>
+# Requires rcodesign on PATH (CI installs the pinned version via install-rcodesign.sh).
 #
 # The asset filename convention must stay in lock-step with
 # packages/client/src/upgrade.ts (resolvePlatformAsset + assetName) and
@@ -37,6 +38,12 @@ esac
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="$ROOT_DIR/dist-release"
+
+# Fail before deleting existing output if the x64 macOS signer is missing.
+if ! command -v rcodesign >/dev/null 2>&1; then
+  echo "error: rcodesign is required to sign macOS x64 release binaries" >&2
+  exit 1
+fi
 
 # Bun resolves `@vicoop-bridge/protocol` via the workspace package's
 # `exports.import` (dist/index.js), so the protocol package must be built
@@ -106,6 +113,12 @@ for entry in "${TARGETS[@]}"; do
   ( cd "$CLIENT_DIR" && bun build --compile --target="$target" \
       ${BUILD_DEFINES[@]+"${BUILD_DEFINES[@]}"} \
       src/cli.ts --outfile "$OUT_DIR/$asset" )
+  # Bun re-signs ARM64 itself, but leaves the x64 template signature stale.
+  # rcodesign preserves the existing entitlements and signs on Linux without
+  # certificates. Sign before generating the checksum used by installers.
+  if [[ "$target" == "bun-darwin-x64" ]]; then
+    rcodesign sign "$OUT_DIR/$asset"
+  fi
   chmod +x "$OUT_DIR/$asset"
 
   # Write the checksum file with a *bare filename*, not the absolute build
