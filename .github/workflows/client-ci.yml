@@ -53,6 +53,11 @@ jobs:
         with:
           bun-version: 1.4.2
 
+      - name: Set up macOS cross-platform signer
+        run: |
+          ./scripts/install-rcodesign.sh "$RUNNER_TEMP/rcodesign"
+          echo "$RUNNER_TEMP/rcodesign" >> "$GITHUB_PATH"
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -106,11 +111,11 @@ jobs:
           echo "linux-x64 binary --version: $GOT"
           VICOOP_CLIENT_BIN="$(realpath "$BIN")" node packages/client/scripts/storage-init-packaging-smoke.mjs
 
-      - name: Upload macOS ARM64 binary for native validation
+      - name: Upload macOS binaries for native validation
         uses: actions/upload-artifact@v4
         with:
-          name: client-macos-arm64
-          path: dist-release/*-macos-arm64*
+          name: client-macos
+          path: dist-release/*-macos-*
           if-no-files-found: error
           retention-days: 1
 
@@ -133,27 +138,40 @@ jobs:
           VICOOP_FIXED_STORAGE_TEST: '1'
         run: pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-storage-init.integration.test.ts
 
-  validate-macos-arm64:
+  validate-macos:
     needs: validate
-    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            machine: arm64
+          - runner: macos-15-intel
+            arch: x64
+            machine: x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
 
       # Test the Linux-built bytes without rebuilding or re-signing them.
-      - name: Download cross-compiled macOS ARM64 binary
+      - name: Download cross-compiled macOS binaries
         uses: actions/download-artifact@v4
         with:
-          name: client-macos-arm64
+          name: client-macos
           path: dist-release
 
       - name: Verify checksum, signature, and CLI startup
         shell: bash
+        env:
+          ASSET_ARCH: ${{ matrix.arch }}
+          EXPECTED_MACHINE: ${{ matrix.machine }}
         run: |
-          test "$(uname -m)" = arm64
+          test "$(uname -m)" = "$EXPECTED_MACHINE"
           CLIENT_VERSION="$(node -p "require('./packages/client/package.json').version")"
           cd dist-release
-          BIN="vicoop-client-${CLIENT_VERSION}-macos-arm64"
+          BIN="vicoop-client-${CLIENT_VERSION}-macos-${ASSET_ARCH}"
           shasum -a 256 -c "$BIN.sha256"
           chmod +x "$BIN"
           codesign --verify --strict --verbose=2 "$BIN"
