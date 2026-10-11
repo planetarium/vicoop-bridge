@@ -1,3 +1,4 @@
+import { PUBLIC_TASK_PROFILE } from '../../task-access.js';
 import type { VerifiedCaller } from '../../auth/principal.js';
 import type { Sql } from '../../db.js';
 import {
@@ -78,6 +79,7 @@ const JSON_RPC_OPERATIONS: Record<string, Omit<TokenExchangeOperation, 'taskId'>
 
 export function parseTokenExchangeJsonRpcOperation(
   body: unknown,
+  version: '0.3' | '1.0' = '0.3',
 ): TokenExchangeOperation | undefined {
   const request = record(body);
   const method = stringField(request?.method);
@@ -85,7 +87,15 @@ export function parseTokenExchangeJsonRpcOperation(
   const base = JSON_RPC_OPERATIONS[method];
   if (!base) return undefined;
   const params = record(request?.params);
-  const taskId = base.kind === 'message' ? taskIdFromMessage(params) : taskIdFromParams(params);
+  // v1 push config `id` identifies the CONFIG, not the task. The SDK also
+  // accepts canonical v0.3 method names at the v1 endpoint, so use the binding
+  // version rather than inferring the parameter shape from the method name.
+  const taskId = base.kind === 'message'
+    ? taskIdFromMessage(params)
+    : base.name === 'task.push-config'
+      ? stringField(params?.[version === '1.0' || method === 'tasks/pushNotificationConfig/set'
+        ? 'taskId' : 'id'])
+      : taskIdFromParams(params);
   return { ...base, ...(taskId !== undefined ? { taskId } : {}) };
 }
 
@@ -105,18 +115,19 @@ export function parseTokenExchangeHttpJsonOperation(
   if (method === 'GET' && /\/tasks$/.test(path)) {
     return { name: 'task.read', kind: 'task-list' };
   }
-  const taskMatch = path.match(
-    /\/tasks\/([^/:]+)(?::(cancel|subscribe))?(?:\/pushNotificationConfigs(?:\/[^/]+)?)?$/,
-  );
-  if (!taskMatch) return undefined;
-  const taskId = decodeURIComponent(taskMatch[1]!);
-  const action = taskMatch[2];
-  if (action === 'cancel') return { name: 'task.cancel', kind: 'task', taskId };
-  if (action === 'subscribe') return { name: 'task.resubscribe', kind: 'task', taskId };
-  if (path.includes('/pushNotificationConfigs')) {
-    return { name: 'task.push-config', kind: 'task', taskId };
+  // SDK 0.24 resolves GET /tasks/:id before action routes, including IDs
+  // containing literal colons. Authorize exactly the ID it will read.
+  const getTask = method === 'GET' ? path.match(/\/tasks\/([^/]+)$/) : null;
+  if (getTask) return { name: 'task.read', kind: 'task', taskId: decodeURIComponent(getTask[1]!) };
+  const action = method === 'POST' ? path.match(/\/tasks\/([^/]+):(cancel|subscribe)$/) : null;
+  if (action) {
+    return { name: action[2] === 'cancel' ? 'task.cancel' : 'task.resubscribe',
+      kind: 'task', taskId: decodeURIComponent(action[1]!) };
   }
-  if (method === 'GET') return { name: 'task.read', kind: 'task', taskId };
+  const pushConfig = path.match(/\/tasks\/([^/]+)\/pushNotificationConfigs(?:\/[^/]+)?$/);
+  if (pushConfig) {
+    return { name: 'task.push-config', kind: 'task', taskId: decodeURIComponent(pushConfig[1]!) };
+  }
   return undefined;
 }
 
@@ -138,6 +149,12 @@ export async function authorizeTokenExchangeOperation(
       if (task?.authorizationKey) {
         return { ok: false, reason: 'federated_task_requires_token' };
       }
+      const accessible = task && !task.authorizationRevoked && !task.actorId && (
+        caller
+          ? task.principalId === caller.principalId && task.profileId === undefined
+          : task.principalId === undefined && task.profileId === PUBLIC_TASK_PROFILE
+      );
+      if (!accessible) return { ok: false, reason: 'task_not_accessible' };
     }
     return { ok: true };
   }

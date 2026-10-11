@@ -11,6 +11,7 @@ import type {
 import { TaskState, TERMINAL_STATES } from '@a2x/sdk';
 import { OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import type { Sql, SqlExecutor } from './db.js';
+import { PUBLIC_TASK_PROFILE, type TaskListAccess } from './task-access.js';
 import { logEvent, truncate } from './log.js';
 import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
 
@@ -208,6 +209,10 @@ export interface PostgresTaskStoreOptions {
   // reserved for maintenance jobs and low-level store tests that intentionally
   // operate across all agents.
   ownerAgent?: string;
+
+  // Runtime listings require a request-local authenticated scope. Undefined
+  // results fail closed; omitting the callback is for internal store consumers.
+  listAccess?: () => TaskListAccess | undefined;
 }
 
 // Parse the A2A_PERSIST_REQUEST_ENVELOPE env value into the store flag. Accepts
@@ -222,6 +227,7 @@ export function parsePersistRequestEnvelope(raw: string | undefined): boolean {
 export class PostgresTaskStore implements ContextAwareTaskStore {
   private readonly persistRequestEnvelope: boolean;
   private readonly ownerAgent: string | undefined;
+  private readonly listAccess: PostgresTaskStoreOptions['listAccess'];
 
   constructor(
     private readonly sql: Sql,
@@ -229,6 +235,7 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
   ) {
     this.persistRequestEnvelope = options?.persistRequestEnvelope ?? false;
     this.ownerAgent = options?.ownerAgent;
+    this.listAccess = options?.listAccess;
   }
 
   async createTask(params: CreateTaskParams): Promise<Task> {
@@ -284,6 +291,13 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
       return { tasks: [], nextPageToken: '', pageSize, totalSize: 0 };
     }
 
+    const access = this.listAccess?.();
+    if (this.listAccess && (!access || access.agentId !== this.ownerAgent)) {
+      return { tasks: [], nextPageToken: '', pageSize, totalSize: 0 };
+    }
+    const restrictCaller = this.listAccess !== undefined;
+    const principal = access?.principalId ?? null;
+    const profile = principal === null ? PUBLIC_TASK_PROFILE : null;
     const ownerAgent = this.ownerAgent ?? null;
     const contextId = params.contextId ?? null;
     const after = parsedAfter === null ? null : new Date(parsedAfter).toISOString();
@@ -291,6 +305,12 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
       SELECT count(*) AS total_size
       FROM infra.a2a_tasks
       WHERE (${ownerAgent}::text IS NULL OR owner_agent = ${ownerAgent})
+        AND (NOT ${restrictCaller} OR (
+          owner_principal IS NOT DISTINCT FROM ${principal}::text
+          AND authorization_profile IS NOT DISTINCT FROM ${profile}::text
+          AND owner_actor IS NULL AND authorization_key IS NULL
+          AND authorization_revoked_at IS NULL
+        ))
         AND (${contextId}::text IS NULL OR context_id = ${contextId})
         AND (${status}::text IS NULL OR task_json->'status'->>'state' = ${status})
         AND (
@@ -303,6 +323,12 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
       SELECT task_json
       FROM infra.a2a_tasks
       WHERE (${ownerAgent}::text IS NULL OR owner_agent = ${ownerAgent})
+        AND (NOT ${restrictCaller} OR (
+          owner_principal IS NOT DISTINCT FROM ${principal}::text
+          AND authorization_profile IS NOT DISTINCT FROM ${profile}::text
+          AND owner_actor IS NULL AND authorization_key IS NULL
+          AND authorization_revoked_at IS NULL
+        ))
         AND (${contextId}::text IS NULL OR context_id = ${contextId})
         AND (${status}::text IS NULL OR task_json->'status'->>'state' = ${status})
         AND (

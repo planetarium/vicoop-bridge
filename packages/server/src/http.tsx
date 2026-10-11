@@ -1,6 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { Hono, type Context } from 'hono';
+import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { stream } from 'hono/streaming';
 import { html } from 'hono/html';
@@ -19,6 +19,7 @@ import {
   type HttpJsonResponse,
   type RequestContext,
 } from '@a2x/sdk';
+import { PUBLIC_TASK_PROFILE, taskListAccess } from './task-access.js';
 import type { ClientConnection, Registry } from './registry.js';
 import { createAdminA2XServer } from './admin.js';
 import { getAdminWallets, isAdmin } from './admin-scope.js';
@@ -215,6 +216,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const taskStore = new PostgresTaskStore(opts.db, {
       persistRequestEnvelope,
       ownerAgent: conn.agentId,
+      listAccess: () => taskListAccess.getStore(),
     });
     const a2x = buildAgentA2XServer(conn, taskStore, opts.registry, agentCardOpts);
     agentCache.set(conn.agentId, a2x);
@@ -235,6 +237,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const taskStore = new PostgresTaskStore(opts.db, {
       persistRequestEnvelope,
       ownerAgent: conn.agentId,
+      listAccess: () => taskListAccess.getStore(),
     });
     const a2x = buildAgentA2XServer(conn, taskStore, opts.registry, {
       ...agentCardOpts,
@@ -383,6 +386,18 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         count: identityResult.accepted,
       });
     }
+    if (caller === undefined) {
+      // Public access is an explicit creation-time policy, never a fallback
+      // for historical rows that happen to have no recorded principal.
+      request.metadata = {
+        ...(isRecord(request.metadata) ? request.metadata : {}),
+        _authorizationProfile: PUBLIC_TASK_PROFILE,
+      };
+      message.metadata = {
+        ...(isRecord(message.metadata) ? message.metadata : {}),
+        _authorizationProfile: PUBLIC_TASK_PROFILE,
+      };
+    }
     if (caller !== undefined) {
       const authorizationMetadata = {
         _principalId: caller.principalId,
@@ -418,7 +433,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }
   }
 
-  async function enforceFederatedOperation(
+  async function enforceTaskOperation(
     c: Context,
     caller: ReturnType<typeof getCaller>,
     operation: TokenExchangeOperation | undefined,
@@ -433,6 +448,9 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     );
     if (result.ok) return undefined;
     const rejectionId = newRejectionId();
+    if (result.reason === 'task_not_accessible') {
+      return rejectAgentRequest(c, responseFormat, 404, -32001, 'Task not found', rejectionId);
+    }
     logEvent('oauth_token_exchange_request_rejected', {
       agentId: c.req.param('id'),
       reason: result.reason,
@@ -1087,7 +1105,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     siweDomain,
     responseFormat: 'http-json',
   });
-  app.post('/agents/:id', authMw, async (c) => {
+  const listAccessMw: MiddlewareHandler = async (c, next) => {
+    await taskListAccess.run({
+      agentId: getAgentConn(c).agentId,
+      principalId: getCaller(c)?.principalId,
+    }, next);
+  };
+  app.post('/agents/:id', authMw, listAccessMw, async (c) => {
     const conn = getAgentConn(c);
     // caller is undefined for public agents (allowedCallers.length === 0) —
     // the middleware short-circuits before parsing the bearer in that case.
@@ -1097,13 +1121,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     recordAgentRequest(c, conn, caller);
     const rawBody = await c.req.text();
     const parsed = JSON.parse(rawBody);
-    const federatedRejection = await enforceFederatedOperation(
+    const taskRejection = await enforceTaskOperation(
       c,
       caller,
       parseTokenExchangeJsonRpcOperation(parsed),
       'jsonrpc',
     );
-    if (federatedRejection) return federatedRejection;
+    if (taskRejection) return taskRejection;
     await prepareAgentRequestBody(parsed, c, caller, conn);
     const handler = getHandlerForConn(conn);
     const result = await handler.handle(parsed);
@@ -1113,7 +1137,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // A2A v1 JSON-RPC binding. v1 method names and wire shapes are handled by a
   // dedicated v1 A2XServer; sharing the Postgres owner scope keeps its tasks
   // visible through the sibling HTTP+JSON binding.
-  app.post('/agents/:id/v1', authMw, async (c) => {
+  app.post('/agents/:id/v1', authMw, listAccessMw, async (c) => {
     const conn = getAgentConn(c);
     const caller = getCaller(c);
     recordAgentRequest(c, conn, caller);
@@ -1126,13 +1150,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       // structured JSON parse error, so don't turn malformed JSON into a 500.
     }
     if (isRecord(body)) {
-      const federatedRejection = await enforceFederatedOperation(
+      const taskRejection = await enforceTaskOperation(
         c,
         caller,
-        parseTokenExchangeJsonRpcOperation(body),
+        parseTokenExchangeJsonRpcOperation(body, '1.0'),
         'jsonrpc',
       );
-      if (federatedRejection) return federatedRejection;
+      if (taskRejection) return taskRejection;
     }
     await prepareAgentRequestBody(body, c, caller, conn);
     c.header('A2A-Version', '1.0');
@@ -1142,7 +1166,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
 
   // A2A v1 HTTP+JSON binding. Operation paths are relative to the same base
   // URL advertised for JSON-RPC, e.g. POST message:send and GET tasks/{id}.
-  app.all('/agents/:id/v1/*', httpJsonAuthMw, async (c) => {
+  app.all('/agents/:id/v1/*', httpJsonAuthMw, listAccessMw, async (c) => {
     const conn = getAgentConn(c);
     const caller = getCaller(c);
     recordAgentRequest(c, conn, caller);
@@ -1165,17 +1189,24 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         }
       }
     }
-    const federatedRejection = await enforceFederatedOperation(
+    const taskRejection = await enforceTaskOperation(
       c,
       caller,
       parseTokenExchangeHttpJsonOperation(c.req.method, c.req.path, body),
       'http-json',
     );
-    if (federatedRejection) return federatedRejection;
+    if (taskRejection) return taskRejection;
     await prepareAgentRequestBody(body, c, caller, conn);
+    // SDK 0.24 merges query fields after path IDs on some GET routes. Keep
+    // authorization and execution on the same path-selected task.
+    const requestUrl = new URL(c.req.url);
+    requestUrl.searchParams.delete('id');
+    requestUrl.searchParams.delete('taskId');
+    delete context.query?.id;
+    delete context.query?.taskId;
     const response = await getHttpJsonV1ForConn(conn).handle({
       method: c.req.method,
-      url: c.req.url,
+      url: requestUrl.toString(),
       body,
       context,
     });
