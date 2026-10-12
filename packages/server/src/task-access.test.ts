@@ -128,6 +128,31 @@ test('task access is bound to the authenticated caller across transports (issue 
       assert.equal((await rpc(2, 'tasks/get', { id: a.id })).status, 403);
     });
 
+    await t.test('string-encoded JSON-RPC requests are rejected before reads or execution', async () => {
+      const before = await sql`SELECT * FROM infra.a2a_tasks WHERE owner_agent=${agentId} ORDER BY task_id`;
+      const count = assignments.length;
+      for (const v1 of [false, true]) {
+        const requests = [
+          { method: v1 ? 'GetTask' : 'tasks/get', params: { id: a.id } },
+          { method: v1 ? 'SendMessage' : 'message/send', params: {
+            message: { messageId: randomUUID(), role: 'user', parts: [{ text: 'invalid envelope' }] },
+          } },
+        ];
+        for (const request of requests) {
+          const response = await app.request(`/agents/${agentId}${v1 ? '/v1' : ''}`, {
+            method: 'POST', headers: headers(1),
+            body: JSON.stringify(JSON.stringify({ jsonrpc: '2.0', id: 1, ...request })),
+          });
+          assert.equal(response.status, 200);
+          const body = await response.json() as { result?: unknown; error?: { code: number } };
+          assert.equal(body.result, undefined);
+          assert.equal(body.error?.code, -32600);
+        }
+      }
+      assert.equal(assignments.length, count);
+      assert.deepEqual(await sql`SELECT * FROM infra.a2a_tasks WHERE owner_agent=${agentId} ORDER BY task_id`, before);
+    });
+
     await t.test('list count/pagination and concurrent requests only contain own tasks', async () => {
       const lists = await Promise.all([0, 1, 0, 1].map(async caller => {
         const r = await rpc(caller, 'ListTasks', { pageSize: 1, includeArtifacts: true }, true);

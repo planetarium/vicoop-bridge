@@ -13,6 +13,7 @@ import {
   DefaultRequestHandler,
   HttpJsonRequestHandler,
   JSONParseError,
+  InvalidRequestError,
   toHttpJsonErrorResponse,
   type AgentCardV03,
   type AgentCardV10,
@@ -331,6 +332,24 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       headers,
       query: Object.fromEntries(url.searchParams.entries()),
     };
+  }
+
+  async function readAgentJsonRpcBody(c: Context): Promise<Record<string, unknown> | Response> {
+    let body: unknown;
+    try {
+      body = JSON.parse(await c.req.text());
+    } catch {
+      return c.json({ jsonrpc: '2.0', id: null, error: new JSONParseError().toJSONRPCError() });
+    }
+    // The SDK reparses strings. Only pass the object inspected by our
+    // authorization and metadata preparation to the SDK, never another JSON text.
+    if (!isRecord(body)) {
+      return c.json({
+        jsonrpc: '2.0', id: null,
+        error: new InvalidRequestError('Invalid JSON-RPC 2.0 request').toJSONRPCError(),
+      });
+    }
+    return body;
   }
 
   async function prepareAgentRequestBody(
@@ -1117,8 +1136,8 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     // would have returned 401/403 before reaching this handler.
     const caller = getCaller(c);
     recordAgentRequest(c, conn, caller);
-    const rawBody = await c.req.text();
-    const parsed = JSON.parse(rawBody);
+    const parsed = await readAgentJsonRpcBody(c);
+    if (parsed instanceof Response) return parsed;
     const taskRejection = await enforceTaskOperation(
       c,
       caller,
@@ -1139,25 +1158,17 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const conn = getAgentConn(c);
     const caller = getCaller(c);
     recordAgentRequest(c, conn, caller);
-    const rawBody = await c.req.text();
-    let body: unknown = rawBody;
-    try {
-      body = JSON.parse(rawBody);
-    } catch {
-      // DefaultRequestHandler accepts a string and returns the protocol's
-      // structured JSON parse error, so don't turn malformed JSON into a 500.
-    }
-    if (isRecord(body)) {
-      const taskRejection = await enforceTaskOperation(
-        c,
-        caller,
-        parseTokenExchangeJsonRpcOperation(body, '1.0'),
-        'jsonrpc',
-      );
-      if (taskRejection) return taskRejection;
-    }
-    await prepareAgentRequestBody(body, c, caller, conn, 'jsonrpc');
     c.header('A2A-Version', '1.0');
+    const body = await readAgentJsonRpcBody(c);
+    if (body instanceof Response) return body;
+    const taskRejection = await enforceTaskOperation(
+      c,
+      caller,
+      parseTokenExchangeJsonRpcOperation(body, '1.0'),
+      'jsonrpc',
+    );
+    if (taskRejection) return taskRejection;
+    await prepareAgentRequestBody(body, c, caller, conn, 'jsonrpc');
     const result = await getHandlerV1ForConn(conn).handle(body, getRequestContext(c));
     return handleHandlerResult(result, c);
   });

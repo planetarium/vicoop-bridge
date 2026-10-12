@@ -97,6 +97,28 @@ test('v1 JSON-RPC route returns protocol parse errors with an A2A-Version header
   assert.equal(body.error.code, -32700);
 });
 
+test('JSON-RPC ingress rejects non-object bodies without asking the SDK to parse again', async () => {
+  const app = buildApp();
+  const request = { jsonrpc: '2.0', id: 1, method: 'tasks/get', params: { id: 'missing-task' } };
+  for (const suffix of ['', '/v1']) {
+    for (const value of [JSON.stringify(request), '{', null, [], true, 1]) {
+      const response = await app.request(`/agents/v1-test-agent${suffix}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value),
+      });
+      assert.equal(response.status, 200);
+      const body = await response.json() as { id: unknown; error: { code: number } };
+      assert.equal(body.id, null);
+      assert.equal(body.error.code, -32600);
+      if (suffix) assert.equal(response.headers.get('A2A-Version'), '1.0');
+    }
+    const malformed = await app.request(`/agents/v1-test-agent${suffix}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{',
+    });
+    assert.equal(malformed.status, 200);
+    assert.equal((await malformed.json() as { error: { code: number } }).error.code, -32700);
+  }
+});
+
 test('v1 HTTP+JSON routes use structured errors and expose task listing', async () => {
   const app = buildApp();
   const malformed = await app.request('/agents/v1-test-agent/v1/message:send', {
