@@ -1,6 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { Hono, type Context } from 'hono';
+import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { stream } from 'hono/streaming';
 import { html } from 'hono/html';
@@ -13,12 +13,17 @@ import {
   DefaultRequestHandler,
   HttpJsonRequestHandler,
   JSONParseError,
+  InvalidRequestError,
+  InvalidParamsError,
+  MethodNotFoundError,
+  TaskNotFoundError,
   toHttpJsonErrorResponse,
   type AgentCardV03,
   type AgentCardV10,
   type HttpJsonResponse,
   type RequestContext,
 } from '@a2x/sdk';
+import { PUBLIC_TASK_PROFILE, taskListAccess } from './task-access.js';
 import type { ClientConnection, Registry } from './registry.js';
 import { createAdminA2XServer } from './admin.js';
 import { getAdminWallets, isAdmin } from './admin-scope.js';
@@ -215,6 +220,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const taskStore = new PostgresTaskStore(opts.db, {
       persistRequestEnvelope,
       ownerAgent: conn.agentId,
+      listAccess: () => taskListAccess.getStore(),
     });
     const a2x = buildAgentA2XServer(conn, taskStore, opts.registry, agentCardOpts);
     agentCache.set(conn.agentId, a2x);
@@ -235,6 +241,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const taskStore = new PostgresTaskStore(opts.db, {
       persistRequestEnvelope,
       ownerAgent: conn.agentId,
+      listAccess: () => taskListAccess.getStore(),
     });
     const a2x = buildAgentA2XServer(conn, taskStore, opts.registry, {
       ...agentCardOpts,
@@ -330,20 +337,37 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     };
   }
 
+  async function readAgentJsonRpcBody(c: Context): Promise<Record<string, unknown> | Response> {
+    let body: unknown;
+    try {
+      body = JSON.parse(await c.req.text());
+    } catch {
+      return c.json({ jsonrpc: '2.0', id: null, error: new JSONParseError().toJSONRPCError() });
+    }
+    // The SDK reparses strings. Only pass the object inspected by our
+    // authorization and metadata preparation to the SDK, never another JSON text.
+    if (!isRecord(body) || body.jsonrpc !== '2.0' || typeof body.method !== 'string'
+      || !body.method || body.id === undefined) {
+      return c.json({
+        jsonrpc: '2.0', id: null,
+        error: new InvalidRequestError('Invalid JSON-RPC 2.0 request').toJSONRPCError(),
+      });
+    }
+    return body;
+  }
+
   async function prepareAgentRequestBody(
     body: unknown,
     c: Context,
     caller: ReturnType<typeof getCaller>,
     conn: ClientConnection,
+    transport: 'jsonrpc' | 'http-json',
   ): Promise<void> {
     if (!isRecord(body)) return;
-    const params = isRecord(body.params) ? body.params : undefined;
-    const request = params ?? body;
-    const message = isRecord(params?.message)
-      ? params.message
-      : isRecord(body.message)
-        ? body.message
-        : undefined;
+    // Select the SDK's carrier by transport, never by caller-supplied fields.
+    const request = transport === 'jsonrpc' ? body.params : body;
+    if (!isRecord(request)) return;
+    const message = isRecord(request.message) ? request.message : undefined;
     if (!message) return;
 
     // `@a2x/sdk` creates a task from the request-level metadata before the
@@ -383,6 +407,18 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         count: identityResult.accepted,
       });
     }
+    if (caller === undefined) {
+      // Public access is an explicit creation-time policy, never a fallback
+      // for historical rows that happen to have no recorded principal.
+      request.metadata = {
+        ...(isRecord(request.metadata) ? request.metadata : {}),
+        _authorizationProfile: PUBLIC_TASK_PROFILE,
+      };
+      message.metadata = {
+        ...(isRecord(message.metadata) ? message.metadata : {}),
+        _authorizationProfile: PUBLIC_TASK_PROFILE,
+      };
+    }
     if (caller !== undefined) {
       const authorizationMetadata = {
         _principalId: caller.principalId,
@@ -418,26 +454,51 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }
   }
 
-  async function enforceFederatedOperation(
+  async function enforceTaskOperation(
     c: Context,
     caller: ReturnType<typeof getCaller>,
     operation: TokenExchangeOperation | undefined,
     responseFormat: 'jsonrpc' | 'http-json',
+    requestId: unknown = null,
   ): Promise<Response | undefined> {
     const result = await authorizeTokenExchangeOperation(
       opts.db,
-      c.req.param('id')!,
+      getAgentConn(c).agentId,
       caller,
       operation,
       tokenExchangeResourceProfiles,
     );
     if (result.ok) return undefined;
     const rejectionId = newRejectionId();
-    logEvent('oauth_token_exchange_request_rejected', {
-      agentId: c.req.param('id'),
+    logEvent(caller?.tokenExchange ? 'oauth_token_exchange_request_rejected' : 'task_operation_rejected', {
+      agentId: getAgentConn(c).agentId,
+      operation: operation?.name,
       reason: result.reason,
       rejectionId,
     });
+    if (result.reason === 'task_not_accessible') {
+      if (responseFormat === 'jsonrpc') {
+        return c.json({ jsonrpc: '2.0', id: requestId,
+          error: { code: -32001, message: 'Task not found', data: { rejectionId } } });
+      }
+      return handleHttpJsonResponse(toHttpJsonErrorResponse(
+        new TaskNotFoundError('Task not found', { rejectionId }),
+      ));
+    }
+    if (result.reason === 'anonymous_task_list_not_allowed') {
+      return rejectAgentRequest(c, responseFormat, 403, -32001,
+        'Anonymous task listing is not allowed', rejectionId);
+    }
+    if (!caller?.tokenExchange && (result.reason === 'unknown_operation' || result.reason === 'missing_task_id')) {
+      const error = result.reason === 'unknown_operation'
+        ? new MethodNotFoundError('Operation not supported')
+        : new InvalidParamsError('Task method requires a task ID');
+      if (responseFormat === 'jsonrpc') {
+        return c.json({ jsonrpc: '2.0', id: requestId,
+          error: { ...error.toJSONRPCError(), data: { rejectionId } } });
+      }
+      return handleHttpJsonResponse(toHttpJsonErrorResponse(error));
+    }
     return rejectAgentRequest(
       c,
       responseFormat,
@@ -1087,7 +1148,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     siweDomain,
     responseFormat: 'http-json',
   });
-  app.post('/agents/:id', authMw, async (c) => {
+  const listAccessMw: MiddlewareHandler = async (c, next) => {
+    await taskListAccess.run({
+      agentId: getAgentConn(c).agentId,
+      principalId: getCaller(c)?.principalId,
+    }, next);
+  };
+  app.post('/agents/:id', authMw, listAccessMw, async (c) => {
     const conn = getAgentConn(c);
     // caller is undefined for public agents (allowedCallers.length === 0) —
     // the middleware short-circuits before parsing the bearer in that case.
@@ -1095,16 +1162,17 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     // would have returned 401/403 before reaching this handler.
     const caller = getCaller(c);
     recordAgentRequest(c, conn, caller);
-    const rawBody = await c.req.text();
-    const parsed = JSON.parse(rawBody);
-    const federatedRejection = await enforceFederatedOperation(
+    const parsed = await readAgentJsonRpcBody(c);
+    if (parsed instanceof Response) return parsed;
+    const taskRejection = await enforceTaskOperation(
       c,
       caller,
       parseTokenExchangeJsonRpcOperation(parsed),
       'jsonrpc',
+      parsed.id,
     );
-    if (federatedRejection) return federatedRejection;
-    await prepareAgentRequestBody(parsed, c, caller, conn);
+    if (taskRejection) return taskRejection;
+    await prepareAgentRequestBody(parsed, c, caller, conn, 'jsonrpc');
     const handler = getHandlerForConn(conn);
     const result = await handler.handle(parsed);
     return handleHandlerResult(result, c);
@@ -1113,36 +1181,29 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // A2A v1 JSON-RPC binding. v1 method names and wire shapes are handled by a
   // dedicated v1 A2XServer; sharing the Postgres owner scope keeps its tasks
   // visible through the sibling HTTP+JSON binding.
-  app.post('/agents/:id/v1', authMw, async (c) => {
+  app.post('/agents/:id/v1', authMw, listAccessMw, async (c) => {
     const conn = getAgentConn(c);
     const caller = getCaller(c);
     recordAgentRequest(c, conn, caller);
-    const rawBody = await c.req.text();
-    let body: unknown = rawBody;
-    try {
-      body = JSON.parse(rawBody);
-    } catch {
-      // DefaultRequestHandler accepts a string and returns the protocol's
-      // structured JSON parse error, so don't turn malformed JSON into a 500.
-    }
-    if (isRecord(body)) {
-      const federatedRejection = await enforceFederatedOperation(
-        c,
-        caller,
-        parseTokenExchangeJsonRpcOperation(body),
-        'jsonrpc',
-      );
-      if (federatedRejection) return federatedRejection;
-    }
-    await prepareAgentRequestBody(body, c, caller, conn);
     c.header('A2A-Version', '1.0');
+    const body = await readAgentJsonRpcBody(c);
+    if (body instanceof Response) return body;
+    const taskRejection = await enforceTaskOperation(
+      c,
+      caller,
+      parseTokenExchangeJsonRpcOperation(body, '1.0'),
+      'jsonrpc',
+      body.id,
+    );
+    if (taskRejection) return taskRejection;
+    await prepareAgentRequestBody(body, c, caller, conn, 'jsonrpc');
     const result = await getHandlerV1ForConn(conn).handle(body, getRequestContext(c));
     return handleHandlerResult(result, c);
   });
 
   // A2A v1 HTTP+JSON binding. Operation paths are relative to the same base
   // URL advertised for JSON-RPC, e.g. POST message:send and GET tasks/{id}.
-  app.all('/agents/:id/v1/*', httpJsonAuthMw, async (c) => {
+  app.all('/agents/:id/v1/*', httpJsonAuthMw, listAccessMw, async (c) => {
     const conn = getAgentConn(c);
     const caller = getCaller(c);
     recordAgentRequest(c, conn, caller);
@@ -1165,17 +1226,27 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         }
       }
     }
-    const federatedRejection = await enforceFederatedOperation(
-      c,
-      caller,
-      parseTokenExchangeHttpJsonOperation(c.req.method, c.req.path, body),
-      'http-json',
-    );
-    if (federatedRejection) return federatedRejection;
-    await prepareAgentRequestBody(body, c, caller, conn);
+    const requestUrl = new URL(c.req.url);
+    let operation: TokenExchangeOperation | undefined;
+    try {
+      operation = parseTokenExchangeHttpJsonOperation(
+        c.req.method, requestUrl.pathname.slice(`/agents/${conn.agentId}/v1`.length), body,
+      );
+    } catch (error) {
+      return handleHttpJsonResponse(toHttpJsonErrorResponse(error));
+    }
+    const taskRejection = await enforceTaskOperation(c, caller, operation, 'http-json');
+    if (taskRejection) return taskRejection;
+    await prepareAgentRequestBody(body, c, caller, conn, 'http-json');
+    // SDK 0.24 merges query fields after path IDs on some GET routes. Keep
+    // authorization and execution on the same path-selected task.
+    requestUrl.searchParams.delete('id');
+    requestUrl.searchParams.delete('taskId');
+    delete context.query?.id;
+    delete context.query?.taskId;
     const response = await getHttpJsonV1ForConn(conn).handle({
       method: c.req.method,
-      url: c.req.url,
+      url: requestUrl.toString(),
       body,
       context,
     });

@@ -26,6 +26,20 @@ on:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: vicoop_bridge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - name: Check out repository
@@ -56,6 +70,11 @@ jobs:
 
       - name: Test server
         run: pnpm --filter @vicoop-bridge/server test
+
+      - name: Test task access with PostgreSQL
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/vicoop_bridge_test
+        run: pnpm --filter @vicoop-bridge/server exec tsx --test src/task-access.test.ts
 
       - name: Build server
         run: pnpm --filter @vicoop-bridge/server build

@@ -6,7 +6,7 @@ import {
   SIWE_BEARER_AUTH_EXTENSION_URI,
   type AgentCard,
 } from '@vicoop-bridge/protocol';
-import { TaskState } from '@a2x/sdk';
+import { DefaultRequestHandler, HttpJsonRequestHandler, TaskState } from '@a2x/sdk';
 import { createHttpApp } from './http.js';
 import { Registry, type ClientConnection } from './registry.js';
 import type { Sql } from './db.js';
@@ -97,7 +97,53 @@ test('v1 JSON-RPC route returns protocol parse errors with an A2A-Version header
   assert.equal(body.error.code, -32700);
 });
 
-test('v1 HTTP+JSON routes use structured errors and expose task listing', async () => {
+test('JSON-RPC ingress rejects non-object bodies without asking the SDK to parse again', async () => {
+  const app = buildApp();
+  const request = { jsonrpc: '2.0', id: 1, method: 'tasks/get', params: { id: 'missing-task' } };
+  for (const suffix of ['', '/v1']) {
+    for (const value of [JSON.stringify(request), '{', null, [], true, 1, {}, { jsonrpc: '2.0', method: 'tasks/get' }]) {
+      const response = await app.request(`/agents/v1-test-agent${suffix}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value),
+      });
+      assert.equal(response.status, 200);
+      const body = await response.json() as { id: unknown; error: { code: number } };
+      assert.equal(body.id, null);
+      assert.equal(body.error.code, -32600);
+      if (suffix) assert.equal(response.headers.get('A2A-Version'), '1.0');
+    }
+    const malformed = await app.request(`/agents/v1-test-agent${suffix}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{',
+    });
+    assert.equal(malformed.status, 200);
+    assert.equal((await malformed.json() as { error: { code: number } }).error.code, -32700);
+  }
+});
+
+test('unrecognized operations never reach an SDK handler', async (t) => {
+  const app = buildApp();
+  const rpcHandler = t.mock.method(DefaultRequestHandler.prototype, 'handle', async () => {
+    throw new Error('unrecognized JSON-RPC operation reached SDK');
+  });
+  const httpHandler = t.mock.method(HttpJsonRequestHandler.prototype, 'handle', async () => {
+    throw new Error('unrecognized HTTP+JSON operation reached SDK');
+  });
+  for (const suffix of ['', '/v1']) {
+    const r = await app.request(`/agents/v1-test-agent${suffix}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'unknown', method: 'FutureTaskOperation', params: { id: 'task' } }),
+    });
+    assert.equal(r.status, 200);
+    const body = await r.json() as { id: string; error: { code: number } };
+    assert.equal(body.id, 'unknown');
+    assert.equal(body.error.code, -32601);
+  }
+  const r = await app.request('/agents/v1-test-agent/v1/futureTasks/task');
+  assert.equal(r.status, 404);
+  assert.equal(rpcHandler.mock.callCount(), 0);
+  assert.equal(httpHandler.mock.callCount(), 0);
+});
+
+test('v1 HTTP+JSON routes use structured errors and reject anonymous task listing', async () => {
   const app = buildApp();
   const malformed = await app.request('/agents/v1-test-agent/v1/message:send', {
     method: 'POST',
@@ -115,19 +161,11 @@ test('v1 HTTP+JSON routes use structured errors and expose task listing', async 
   assert.equal(missingTaskBody.error.status, 'NOT_FOUND');
 
   const list = await app.request('/agents/v1-test-agent/v1/tasks?pageSize=10');
-  assert.equal(list.status, 200);
-  assert.equal(list.headers.get('A2A-Version'), '1.0');
-  const listBody = await list.json() as {
-    tasks: unknown[];
-    pageSize: number;
-    totalSize: number;
-  };
-  assert.deepEqual(listBody.tasks, []);
-  assert.equal(listBody.pageSize, 10);
-  assert.equal(listBody.totalSize, 0);
+  assert.equal(list.status, 403);
+  assert.equal((await list.json() as { error: { status: string } }).error.status, 'PERMISSION_DENIED');
 
   const wrongVersion = await app.request(
-    '/agents/v1-test-agent/v1/tasks?A2A-Version=99.0',
+    '/agents/v1-test-agent/v1/extendedAgentCard?A2A-Version=99.0',
   );
   assert.equal(wrongVersion.status, 400);
   const wrongVersionBody = await wrongVersion.json() as { error: { message: string } };

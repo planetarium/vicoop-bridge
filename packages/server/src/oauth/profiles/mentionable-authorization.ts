@@ -18,7 +18,7 @@ import {
   type OAuthFederationScope,
 } from './mentionable-v0.1.js';
 
-const REQUIRED_SCOPE: Record<TokenExchangeOperationName, OAuthFederationScope> = {
+const REQUIRED_SCOPE: Record<Exclude<TokenExchangeOperationName, 'agent.card'>, OAuthFederationScope> = {
   'message.send': OAUTH_FEDERATION_SCOPE_MESSAGE_SEND,
   'message.stream': OAUTH_FEDERATION_SCOPE_MESSAGE_STREAM,
   'task.read': OAUTH_FEDERATION_SCOPE_TASK_READ,
@@ -34,7 +34,7 @@ export async function authorizeMentionableOperation({
   operation,
 }: TokenExchangeResourceAuthorizationContext) {
   const tokenExchange = caller.tokenExchange!;
-  if (!operation) return { ok: false as const, reason: 'unknown_operation' };
+  if (!operation || operation.name === 'agent.card') return { ok: false as const, reason: 'unknown_operation' };
   if (!tokenExchange.scopes.includes(REQUIRED_SCOPE[operation.name])) {
     return { ok: false as const, reason: 'insufficient_scope' };
   }
