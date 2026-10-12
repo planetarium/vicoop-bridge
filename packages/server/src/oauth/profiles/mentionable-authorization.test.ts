@@ -82,6 +82,8 @@ test('unknown methods stay closed for federated bearer enforcement', () => {
 
 test('direct and public authorization fail closed for unknown operations and missing task IDs', async () => {
   const noSql = (async () => { throw new Error('unexpected query'); }) as unknown as Sql;
+  assert.deepEqual(await authorize(noSql, 'agent', undefined, { name: 'task.read', kind: 'task-list' }),
+    { ok: false, reason: 'anonymous_task_list_not_allowed' });
   for (const caller of [undefined, { principalId: 'eth:caller' }]) {
     assert.deepEqual(await authorize(noSql, 'agent', caller, undefined), { ok: false, reason: 'unknown_operation' });
     assert.deepEqual(await authorize(noSql, 'agent', caller, { name: 'task.read', kind: 'task' }),
@@ -305,7 +307,7 @@ test('a federated task remains protected after the agent becomes public', async 
         active: false,
       }),
       'agent-1',
-      undefined,
+      { principalId: 'eth:caller' },
       {
         name: 'task.read',
         kind: 'task-list',

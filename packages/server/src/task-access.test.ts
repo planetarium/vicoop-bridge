@@ -237,6 +237,28 @@ test('task access is bound to the authenticated caller across transports (issue 
       }
     });
 
+    await t.test('SDK HTTP+JSON clients receive TaskNotFoundError for hidden and missing tasks', async () => {
+      const card = await (await app.request(`/agents/${agentId}/v1/.well-known/agent-card.json`)).json() as AgentCardV10;
+      const client = new A2XClient(card, {
+        fetch: async (input, init) => app.request(new Request(input, init)),
+        headers: headers(1), extensions: [SIWE_BEARER_AUTH_EXTENSION_URI],
+        preferredTransports: ['HTTP+JSON'],
+      });
+      for (const id of [a.id, randomUUID()]) {
+        await assert.rejects(client.getTask(id), TaskNotFoundError);
+        await assert.rejects(client.cancelTask(id), TaskNotFoundError);
+        await assert.rejects(client.getTaskPushNotificationConfig(id, 'config'), TaskNotFoundError);
+        await assert.rejects(async () => {
+          for await (const event of client.subscribeTask(id)) assert.fail(JSON.stringify(event));
+        }, TaskNotFoundError);
+        const response = await app.request(`/agents/${agentId}/v1/tasks/${id}`, { headers: headers(1) });
+        assert.equal(response.status, 404);
+        const body = await response.json() as { error: { details: { reason: string; metadata: { data: string } }[] } };
+        assert.equal(body.error.details[0]!.reason, 'TASK_NOT_FOUND');
+        assert.ok(JSON.parse(body.error.details[0]!.metadata.data).rejectionId);
+      }
+    });
+
     await t.test('missing or pruned continuation IDs create new tasks in every message binding', async () => {
       const pruned = await store.createTask({ contextId: 'pruned', metadata: { _principalId: principals[0] } });
       await sql`DELETE FROM infra.a2a_tasks WHERE task_id=${pruned.id}`;
@@ -339,8 +361,18 @@ test('task access is bound to the authenticated caller across transports (issue 
       await denied(await rpc(undefined, 'tasks/get', { id: legacy.id }));
       const publicTask = await send(undefined, 'public-context');
       assert.equal((await rpc(undefined, 'tasks/get', { id: publicTask.id })).status, 200);
-      const list = await rpc(undefined, 'ListTasks', {}, true);
-      assert.deepEqual((await list.json() as { result: { tasks: Task[] } }).result.tasks.map(task => task.id), [publicTask.id]);
+      for (const caller of [undefined, 0]) {
+        for (const list of [
+          await rpc(caller, 'ListTasks', { contextId: 'public-context', historyLength: 10 }, true),
+          await rpc(caller, 'tasks/list', {}, true),
+          await app.request(`/agents/${agentId}/v1/tasks?contextId=public-context&historyLength=10`, { headers: headers(caller) }),
+        ]) {
+          assert.equal(list.status, 403);
+          const body = await list.text();
+          assert.match(body, /Anonymous task listing is not allowed/);
+          assert.ok(!body.includes(publicTask.id));
+        }
+      }
       publicAgent = false;
       app = buildApp();
       await denied(await rpc(0, 'tasks/get', { id: publicTask.id }));

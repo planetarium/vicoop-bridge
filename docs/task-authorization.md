@@ -12,7 +12,8 @@ This applies to get, continuation through `message.taskId`, cancel, resubscribe
 (including terminal replay), and push notification configuration operations.
 Missing and inaccessible direct task reads/mutations return task-not-found
 without task content. JSON-RPC uses HTTP 200, echoes the request ID, and returns
-code `-32001`, so SDK clients receive `TaskNotFoundError`. HTTP+JSON uses HTTP 404.
+code `-32001`, so SDK clients receive `TaskNotFoundError`. HTTP+JSON uses HTTP 404 with the canonical `TASK_NOT_FOUND` reason, so SDK
+clients receive the same error class and rejection ID through either binding.
 Every denied operation is logged with its response rejection ID. Denied requests do not reach the executor or mutate task
 state. The agent owner and platform administrators have no implicit override
 on these A2A routes. Host execution and caller-isolated execution use the same
@@ -41,7 +42,10 @@ profile, actor, principal, and active grant.
 
 ## Public agents and existing tasks
 
-Public agents still admit anonymous calls and share **new public tasks**.
+Public agents still admit anonymous calls and share **new public tasks by known ID**.
+Anonymous task listing is rejected with HTTP 403 in both bindings, including
+requests carrying a bearer token on a public agent. Public tasks cannot be
+enumerated through the listing API.
 These tasks are explicitly stamped at creation with authorization profile
 `vicoop:public-task:v1` and no principal. A bearer sent to a public agent is
 not treated as an authenticated identity by the existing admission middleware.
@@ -59,6 +63,15 @@ backfill: absence of an owner is not proof of intended sharing. Operators must
 start a new task, or separately review reliable creation-time evidence before
 repairing ownership. This change requires no schema migration; it uses the
 existing authorization columns.
+
+## Deployment
+
+Before rollout, drain existing public tasks and retrieve their results. Ownerless
+legacy tasks become inaccessible immediately after deployment, including active
+polling, resubscription, and input-required continuations such as x402 payment
+handoffs. Finish these flows before rollout, or perform a separately reviewed
+ownership migration supported by creation-time evidence. Do not blanket-backfill
+legacy rows as public.
 
 ## Verification
 

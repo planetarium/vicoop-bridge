@@ -167,6 +167,7 @@ export async function authorizeTokenExchangeOperation(
       return { ok: false, reason: 'missing_task_id' };
     }
     if (operation?.kind === 'task-list') {
+      if (!caller) return { ok: false, reason: 'anonymous_task_list_not_allowed' };
       if (await agentHasTokenExchangeTaskBindings(sql, agentId)) {
         return { ok: false, reason: 'federated_task_list_not_supported' };
       }

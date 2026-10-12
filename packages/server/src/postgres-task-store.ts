@@ -292,7 +292,7 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     }
 
     const access = this.listAccess?.();
-    if (this.listAccess && (!access || access.agentId !== this.ownerAgent)) {
+    if (this.listAccess && (!access || !access.principalId || access.agentId !== this.ownerAgent)) {
       return { tasks: [], nextPageToken: '', pageSize, totalSize: 0 };
     }
     const restrictCaller = this.listAccess !== undefined;

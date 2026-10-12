@@ -143,7 +143,7 @@ test('unrecognized operations never reach an SDK handler', async (t) => {
   assert.equal(httpHandler.mock.callCount(), 0);
 });
 
-test('v1 HTTP+JSON routes use structured errors and expose task listing', async () => {
+test('v1 HTTP+JSON routes use structured errors and reject anonymous task listing', async () => {
   const app = buildApp();
   const malformed = await app.request('/agents/v1-test-agent/v1/message:send', {
     method: 'POST',
@@ -161,19 +161,11 @@ test('v1 HTTP+JSON routes use structured errors and expose task listing', async 
   assert.equal(missingTaskBody.error.status, 'NOT_FOUND');
 
   const list = await app.request('/agents/v1-test-agent/v1/tasks?pageSize=10');
-  assert.equal(list.status, 200);
-  assert.equal(list.headers.get('A2A-Version'), '1.0');
-  const listBody = await list.json() as {
-    tasks: unknown[];
-    pageSize: number;
-    totalSize: number;
-  };
-  assert.deepEqual(listBody.tasks, []);
-  assert.equal(listBody.pageSize, 10);
-  assert.equal(listBody.totalSize, 0);
+  assert.equal(list.status, 403);
+  assert.equal((await list.json() as { error: { status: string } }).error.status, 'PERMISSION_DENIED');
 
   const wrongVersion = await app.request(
-    '/agents/v1-test-agent/v1/tasks?A2A-Version=99.0',
+    '/agents/v1-test-agent/v1/extendedAgentCard?A2A-Version=99.0',
   );
   assert.equal(wrongVersion.status, 400);
   const wrongVersionBody = await wrongVersion.json() as { error: { message: string } };

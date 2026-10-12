@@ -16,6 +16,7 @@ import {
   InvalidRequestError,
   InvalidParamsError,
   MethodNotFoundError,
+  TaskNotFoundError,
   toHttpJsonErrorResponse,
   type AgentCardV03,
   type AgentCardV10,
@@ -480,7 +481,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         return c.json({ jsonrpc: '2.0', id: requestId,
           error: { code: -32001, message: 'Task not found', data: { rejectionId } } });
       }
-      return rejectAgentRequest(c, responseFormat, 404, -32001, 'Task not found', rejectionId);
+      return handleHttpJsonResponse(toHttpJsonErrorResponse(
+        new TaskNotFoundError('Task not found', { rejectionId }),
+      ));
+    }
+    if (result.reason === 'anonymous_task_list_not_allowed') {
+      return rejectAgentRequest(c, responseFormat, 403, -32001,
+        'Anonymous task listing is not allowed', rejectionId);
     }
     if (!caller?.tokenExchange && (result.reason === 'unknown_operation' || result.reason === 'missing_task_id')) {
       const error = result.reason === 'unknown_operation'
