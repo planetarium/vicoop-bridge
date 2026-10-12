@@ -338,15 +338,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     c: Context,
     caller: ReturnType<typeof getCaller>,
     conn: ClientConnection,
+    transport: 'jsonrpc' | 'http-json',
   ): Promise<void> {
     if (!isRecord(body)) return;
-    const params = isRecord(body.params) ? body.params : undefined;
-    const request = params ?? body;
-    const message = isRecord(params?.message)
-      ? params.message
-      : isRecord(body.message)
-        ? body.message
-        : undefined;
+    // Select the SDK's carrier by transport, never by caller-supplied fields.
+    const request = transport === 'jsonrpc' ? body.params : body;
+    if (!isRecord(request)) return;
+    const message = isRecord(request.message) ? request.message : undefined;
     if (!message) return;
 
     // `@a2x/sdk` creates a task from the request-level metadata before the
@@ -1128,7 +1126,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       'jsonrpc',
     );
     if (taskRejection) return taskRejection;
-    await prepareAgentRequestBody(parsed, c, caller, conn);
+    await prepareAgentRequestBody(parsed, c, caller, conn, 'jsonrpc');
     const handler = getHandlerForConn(conn);
     const result = await handler.handle(parsed);
     return handleHandlerResult(result, c);
@@ -1158,7 +1156,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       );
       if (taskRejection) return taskRejection;
     }
-    await prepareAgentRequestBody(body, c, caller, conn);
+    await prepareAgentRequestBody(body, c, caller, conn, 'jsonrpc');
     c.header('A2A-Version', '1.0');
     const result = await getHandlerV1ForConn(conn).handle(body, getRequestContext(c));
     return handleHandlerResult(result, c);
@@ -1192,11 +1190,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const taskRejection = await enforceTaskOperation(
       c,
       caller,
-      parseTokenExchangeHttpJsonOperation(c.req.method, c.req.path, body),
+      parseTokenExchangeHttpJsonOperation(
+        c.req.method, c.req.path.slice(`/agents/${conn.agentId}/v1`.length), body,
+      ),
       'http-json',
     );
     if (taskRejection) return taskRejection;
-    await prepareAgentRequestBody(body, c, caller, conn);
+    await prepareAgentRequestBody(body, c, caller, conn, 'http-json');
     // SDK 0.24 merges query fields after path IDs on some GET routes. Keep
     // authorization and execution on the same path-selected task.
     const requestUrl = new URL(c.req.url);

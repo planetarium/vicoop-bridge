@@ -23,8 +23,17 @@ test('push config authorization selects the SDK task field, not a config id', ()
     params: { id: 'decoy', taskId: 'victim' } })?.taskId, 'victim');
   assert.equal(parseTokenExchangeJsonRpcOperation({ method: 'tasks/pushNotificationConfig/get',
     params: { id: 'victim', taskId: 'decoy' } })?.taskId, 'victim');
-  assert.equal(parseTokenExchangeHttpJsonOperation('GET', '/agents/a/v1/tasks/id:cancel', undefined)?.taskId, 'id:cancel');
-  assert.equal(parseTokenExchangeHttpJsonOperation('DELETE', '/agents/a/v1/tasks/id:cancel/pushNotificationConfigs/config', undefined)?.taskId, 'id:cancel');
+  assert.equal(parseTokenExchangeHttpJsonOperation('GET', '/tasks/id:cancel', undefined)?.taskId, 'id:cancel');
+  assert.equal(parseTokenExchangeHttpJsonOperation('DELETE', '/tasks/id:cancel/pushNotificationConfigs/config', undefined)?.taskId, 'id:cancel');
+});
+
+test('HTTP operation parsing does not interpret resource names as route suffixes', () => {
+  for (const id of ['tasks', 'message:send', 'message:stream']) {
+    assert.deepEqual(parseTokenExchangeHttpJsonOperation('GET', `/tasks/victim/pushNotificationConfigs/${id}`, undefined),
+      { name: 'task.push-config', kind: 'task', taskId: 'victim' });
+  }
+  assert.deepEqual(parseTokenExchangeHttpJsonOperation('GET', '/tenant/tasks/task-id', undefined),
+    { name: 'task.read', kind: 'task', taskId: 'task-id' });
 });
 
 test('task access is bound to the authenticated caller across transports (issue #517)',
@@ -182,6 +191,28 @@ test('task access is bound to the authenticated caller across transports (issue 
       const r = await app.request(`/agents/${agentId}/v1/tasks/${b.id}?id=${a.id}`, { headers: headers(1) });
       assert.equal(r.status, 200);
       assert.equal((await r.json() as Task).id, b.id);
+    });
+
+    await t.test('HTTP message binding uses the transport carrier despite extra params', async () => {
+      for (const action of ['send', 'stream']) {
+        const count = assignments.length;
+        const response = await app.request(`/agents/${agentId}/v1/message:${action}`, {
+          method: 'POST', headers: headers(1), body: JSON.stringify({
+            params: { message: { messageId: randomUUID(), role: 'user', parts: [{ text: 'unused wrapper' }] } },
+            message: { messageId: randomUUID(), role: 'user', parts: [{ text: 'binding regression' }],
+              metadata: { _principalId: principals[0] } },
+            metadata: { _principalId: principals[0] },
+            configuration: { returnImmediately: false },
+          }),
+        });
+        assert.equal(response.status, 200, await response.clone().text());
+        await response.text();
+        assert.equal(assignments.length, count + 1);
+        const assignment = assignments.at(-1)!;
+        assert.equal(assignment.executionScope?.principalId, principals[1]);
+        const rows = await sql`SELECT owner_principal FROM infra.a2a_tasks WHERE task_id=${assignment.taskId}`;
+        assert.equal(rows[0]!.owner_principal, principals[1]);
+      }
     });
 
     await t.test('fresh handler caches and host mode keep the ownership boundary', async () => {

@@ -57,16 +57,16 @@ test('maps v0.3 and v1 JSON-RPC methods to profile-independent operations', () =
 });
 
 test('maps HTTP+JSON task paths without confusing task ids and actions', () => {
-  assert.deepEqual(parseTokenExchangeHttpJsonOperation('GET', '/agents/a/v1/tasks/t%2F1', undefined), {
+  assert.deepEqual(parseTokenExchangeHttpJsonOperation('GET', '/tasks/t%2F1', undefined), {
     name: 'task.read',
     kind: 'task',
     taskId: 't/1',
   });
   assert.deepEqual(
-    parseTokenExchangeHttpJsonOperation('POST', '/agents/a/v1/tasks/t-2:cancel', undefined),
+    parseTokenExchangeHttpJsonOperation('POST', '/tasks/t-2:cancel', undefined),
     { name: 'task.cancel', kind: 'task', taskId: 't-2' },
   );
-  assert.deepEqual(parseTokenExchangeHttpJsonOperation('GET', '/agents/a/v1/tasks', undefined), {
+  assert.deepEqual(parseTokenExchangeHttpJsonOperation('GET', '/tasks', undefined), {
     name: 'task.read',
     kind: 'task-list',
   });
@@ -75,7 +75,7 @@ test('maps HTTP+JSON task paths without confusing task ids and actions', () => {
 test('unknown methods stay closed for federated bearer enforcement', () => {
   assert.equal(parseTokenExchangeJsonRpcOperation({ method: 'custom/doThing' }), undefined);
   assert.equal(
-    parseTokenExchangeHttpJsonOperation('PATCH', '/agents/a/v1/tasks/t-1', undefined),
+    parseTokenExchangeHttpJsonOperation('PATCH', '/tasks/t-1', undefined),
     undefined,
   );
 });

@@ -104,27 +104,34 @@ export function parseTokenExchangeHttpJsonOperation(
   path: string,
   body: unknown,
 ): TokenExchangeOperation | undefined {
-  if (method === 'POST' && path.endsWith('/message:send')) {
+  // Path is relative to the v1 endpoint. Mirror the SDK's optional tenant
+  // prefix, then match whole routes so resource IDs cannot become operations.
+  if (path !== '/message:send' && path !== '/message:stream' && path !== '/tasks'
+    && !path.startsWith('/tasks/') && path !== '/extendedAgentCard') {
+    const tenant = path.match(/^\/[^/]+(\/(?:message:(?:send|stream)|tasks(?:\/.*)?|extendedAgentCard))$/);
+    if (tenant) path = tenant[1]!;
+  }
+  if (method === 'POST' && path === '/message:send') {
     const taskId = taskIdFromMessage(record(body));
     return { name: 'message.send', kind: 'message', ...(taskId ? { taskId } : {}) };
   }
-  if (method === 'POST' && path.endsWith('/message:stream')) {
+  if (method === 'POST' && path === '/message:stream') {
     const taskId = taskIdFromMessage(record(body));
     return { name: 'message.stream', kind: 'message', ...(taskId ? { taskId } : {}) };
   }
-  if (method === 'GET' && /\/tasks$/.test(path)) {
+  if (method === 'GET' && path === '/tasks') {
     return { name: 'task.read', kind: 'task-list' };
   }
   // SDK 0.24 resolves GET /tasks/:id before action routes, including IDs
   // containing literal colons. Authorize exactly the ID it will read.
-  const getTask = method === 'GET' ? path.match(/\/tasks\/([^/]+)$/) : null;
+  const getTask = method === 'GET' ? path.match(/^\/tasks\/([^/]+)$/) : null;
   if (getTask) return { name: 'task.read', kind: 'task', taskId: decodeURIComponent(getTask[1]!) };
-  const action = method === 'POST' ? path.match(/\/tasks\/([^/]+):(cancel|subscribe)$/) : null;
+  const action = method === 'POST' ? path.match(/^\/tasks\/([^/]+):(cancel|subscribe)$/) : null;
   if (action) {
     return { name: action[2] === 'cancel' ? 'task.cancel' : 'task.resubscribe',
       kind: 'task', taskId: decodeURIComponent(action[1]!) };
   }
-  const pushConfig = path.match(/\/tasks\/([^/]+)\/pushNotificationConfigs(?:\/[^/]+)?$/);
+  const pushConfig = path.match(/^\/tasks\/([^/]+)\/pushNotificationConfigs(?:\/[^/]+)?$/);
   if (pushConfig) {
     return { name: 'task.push-config', kind: 'task', taskId: decodeURIComponent(pushConfig[1]!) };
   }
