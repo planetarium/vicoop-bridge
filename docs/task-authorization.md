@@ -10,11 +10,27 @@ Context IDs and caller-provided metadata do not grant access.
 
 This applies to get, continuation through `message.taskId`, cancel, resubscribe
 (including terminal replay), and push notification configuration operations.
-Missing and inaccessible direct tasks return HTTP 404 / task-not-found without
-returning task content. Denied requests do not reach the executor or mutate task
+Missing and inaccessible direct task reads/mutations return task-not-found
+without task content. JSON-RPC uses HTTP 200, echoes the request ID, and returns
+code `-32001`, so SDK clients receive `TaskNotFoundError`. HTTP+JSON uses HTTP 404.
+Every denied operation is logged with its response rejection ID. Denied requests do not reach the executor or mutate task
 state. The agent owner and platform administrators have no implicit override
 on these A2A routes. Host execution and caller-isolated execution use the same
 server policy.
+
+For message operations, a nonexistent task ID (including one removed by retention)
+keeps the SDK's existing behavior: create a new server-generated task under the
+current caller. An existing inaccessible task remains denied without mutation.
+This deliberately allows a caller who already knows a UUID to distinguish missing
+from inaccessible tasks; it preserves continuation after retention without
+resuming another caller's task. Caller-provided IDs are never adopted for new rows.
+
+Unknown operations and task operations without a task ID are rejected before SDK
+dispatch. Authenticated extended-card retrieval is explicitly recognized; existing
+federated restrictions on this operation remain unchanged. SDK upgrades that add
+operations must add authorization mappings before the operations are exposed.
+HTTP route matching uses the raw URL pathname and decodes IDs exactly once;
+malformed encoding returns the SDK-compatible invalid-params response.
 
 A2A v1 listing filters both rows and totals before pagination by the verified
 principal. Concurrent callers share SDK handlers, but the listing scope is

@@ -6,7 +6,7 @@ import {
   SIWE_BEARER_AUTH_EXTENSION_URI,
   type AgentCard,
 } from '@vicoop-bridge/protocol';
-import { TaskState } from '@a2x/sdk';
+import { DefaultRequestHandler, HttpJsonRequestHandler, TaskState } from '@a2x/sdk';
 import { createHttpApp } from './http.js';
 import { Registry, type ClientConnection } from './registry.js';
 import type { Sql } from './db.js';
@@ -101,7 +101,7 @@ test('JSON-RPC ingress rejects non-object bodies without asking the SDK to parse
   const app = buildApp();
   const request = { jsonrpc: '2.0', id: 1, method: 'tasks/get', params: { id: 'missing-task' } };
   for (const suffix of ['', '/v1']) {
-    for (const value of [JSON.stringify(request), '{', null, [], true, 1]) {
+    for (const value of [JSON.stringify(request), '{', null, [], true, 1, {}, { jsonrpc: '2.0', method: 'tasks/get' }]) {
       const response = await app.request(`/agents/v1-test-agent${suffix}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value),
       });
@@ -117,6 +117,30 @@ test('JSON-RPC ingress rejects non-object bodies without asking the SDK to parse
     assert.equal(malformed.status, 200);
     assert.equal((await malformed.json() as { error: { code: number } }).error.code, -32700);
   }
+});
+
+test('unrecognized operations never reach an SDK handler', async (t) => {
+  const app = buildApp();
+  const rpcHandler = t.mock.method(DefaultRequestHandler.prototype, 'handle', async () => {
+    throw new Error('unrecognized JSON-RPC operation reached SDK');
+  });
+  const httpHandler = t.mock.method(HttpJsonRequestHandler.prototype, 'handle', async () => {
+    throw new Error('unrecognized HTTP+JSON operation reached SDK');
+  });
+  for (const suffix of ['', '/v1']) {
+    const r = await app.request(`/agents/v1-test-agent${suffix}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'unknown', method: 'FutureTaskOperation', params: { id: 'task' } }),
+    });
+    assert.equal(r.status, 200);
+    const body = await r.json() as { id: string; error: { code: number } };
+    assert.equal(body.id, 'unknown');
+    assert.equal(body.error.code, -32601);
+  }
+  const r = await app.request('/agents/v1-test-agent/v1/futureTasks/task');
+  assert.equal(r.status, 404);
+  assert.equal(rpcHandler.mock.callCount(), 0);
+  assert.equal(httpHandler.mock.callCount(), 0);
 });
 
 test('v1 HTTP+JSON routes use structured errors and expose task listing', async () => {

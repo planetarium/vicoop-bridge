@@ -80,6 +80,19 @@ test('unknown methods stay closed for federated bearer enforcement', () => {
   );
 });
 
+test('direct and public authorization fail closed for unknown operations and missing task IDs', async () => {
+  const noSql = (async () => { throw new Error('unexpected query'); }) as unknown as Sql;
+  for (const caller of [undefined, { principalId: 'eth:caller' }]) {
+    assert.deepEqual(await authorize(noSql, 'agent', caller, undefined), { ok: false, reason: 'unknown_operation' });
+    assert.deepEqual(await authorize(noSql, 'agent', caller, { name: 'task.read', kind: 'task' }),
+      { ok: false, reason: 'missing_task_id' });
+    assert.deepEqual(await authorize(noSql, 'agent', caller, { name: 'agent.card', kind: 'agent' }), { ok: true });
+  }
+  assert.equal(parseTokenExchangeJsonRpcOperation({ method: 'toString' }), undefined);
+  assert.deepEqual(await authorize(noSql, 'agent', federatedCaller(), { name: 'agent.card', kind: 'agent' }),
+    { ok: false, reason: 'unknown_operation' });
+});
+
 function authorizationSql(input: {
   actorId: string;
   principalId: string;

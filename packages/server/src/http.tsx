@@ -14,6 +14,8 @@ import {
   HttpJsonRequestHandler,
   JSONParseError,
   InvalidRequestError,
+  InvalidParamsError,
+  MethodNotFoundError,
   toHttpJsonErrorResponse,
   type AgentCardV03,
   type AgentCardV10,
@@ -343,7 +345,8 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }
     // The SDK reparses strings. Only pass the object inspected by our
     // authorization and metadata preparation to the SDK, never another JSON text.
-    if (!isRecord(body)) {
+    if (!isRecord(body) || body.jsonrpc !== '2.0' || typeof body.method !== 'string'
+      || !body.method || body.id === undefined) {
       return c.json({
         jsonrpc: '2.0', id: null,
         error: new InvalidRequestError('Invalid JSON-RPC 2.0 request').toJSONRPCError(),
@@ -455,24 +458,40 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     caller: ReturnType<typeof getCaller>,
     operation: TokenExchangeOperation | undefined,
     responseFormat: 'jsonrpc' | 'http-json',
+    requestId: unknown = null,
   ): Promise<Response | undefined> {
     const result = await authorizeTokenExchangeOperation(
       opts.db,
-      c.req.param('id')!,
+      getAgentConn(c).agentId,
       caller,
       operation,
       tokenExchangeResourceProfiles,
     );
     if (result.ok) return undefined;
     const rejectionId = newRejectionId();
-    if (result.reason === 'task_not_accessible') {
-      return rejectAgentRequest(c, responseFormat, 404, -32001, 'Task not found', rejectionId);
-    }
-    logEvent('oauth_token_exchange_request_rejected', {
-      agentId: c.req.param('id'),
+    logEvent(caller?.tokenExchange ? 'oauth_token_exchange_request_rejected' : 'task_operation_rejected', {
+      agentId: getAgentConn(c).agentId,
+      operation: operation?.name,
       reason: result.reason,
       rejectionId,
     });
+    if (result.reason === 'task_not_accessible') {
+      if (responseFormat === 'jsonrpc') {
+        return c.json({ jsonrpc: '2.0', id: requestId,
+          error: { code: -32001, message: 'Task not found', data: { rejectionId } } });
+      }
+      return rejectAgentRequest(c, responseFormat, 404, -32001, 'Task not found', rejectionId);
+    }
+    if (!caller?.tokenExchange && (result.reason === 'unknown_operation' || result.reason === 'missing_task_id')) {
+      const error = result.reason === 'unknown_operation'
+        ? new MethodNotFoundError('Operation not supported')
+        : new InvalidParamsError('Task method requires a task ID');
+      if (responseFormat === 'jsonrpc') {
+        return c.json({ jsonrpc: '2.0', id: requestId,
+          error: { ...error.toJSONRPCError(), data: { rejectionId } } });
+      }
+      return handleHttpJsonResponse(toHttpJsonErrorResponse(error));
+    }
     return rejectAgentRequest(
       c,
       responseFormat,
@@ -1143,6 +1162,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       caller,
       parseTokenExchangeJsonRpcOperation(parsed),
       'jsonrpc',
+      parsed.id,
     );
     if (taskRejection) return taskRejection;
     await prepareAgentRequestBody(parsed, c, caller, conn, 'jsonrpc');
@@ -1166,6 +1186,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       caller,
       parseTokenExchangeJsonRpcOperation(body, '1.0'),
       'jsonrpc',
+      body.id,
     );
     if (taskRejection) return taskRejection;
     await prepareAgentRequestBody(body, c, caller, conn, 'jsonrpc');
@@ -1198,19 +1219,20 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         }
       }
     }
-    const taskRejection = await enforceTaskOperation(
-      c,
-      caller,
-      parseTokenExchangeHttpJsonOperation(
-        c.req.method, c.req.path.slice(`/agents/${conn.agentId}/v1`.length), body,
-      ),
-      'http-json',
-    );
+    const requestUrl = new URL(c.req.url);
+    let operation: TokenExchangeOperation | undefined;
+    try {
+      operation = parseTokenExchangeHttpJsonOperation(
+        c.req.method, requestUrl.pathname.slice(`/agents/${conn.agentId}/v1`.length), body,
+      );
+    } catch (error) {
+      return handleHttpJsonResponse(toHttpJsonErrorResponse(error));
+    }
+    const taskRejection = await enforceTaskOperation(c, caller, operation, 'http-json');
     if (taskRejection) return taskRejection;
     await prepareAgentRequestBody(body, c, caller, conn, 'http-json');
     // SDK 0.24 merges query fields after path IDs on some GET routes. Keep
     // authorization and execution on the same path-selected task.
-    const requestUrl = new URL(c.req.url);
     requestUrl.searchParams.delete('id');
     requestUrl.searchParams.delete('taskId');
     delete context.query?.id;

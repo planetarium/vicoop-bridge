@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import postgres from 'postgres';
 import type { WebSocket } from 'ws';
-import { TaskState, type Task } from '@a2x/sdk';
+import { A2XClient, TaskNotFoundError, TaskState, type AgentCardV03, type AgentCardV10, type Task } from '@a2x/sdk';
 import { SIWE_BEARER_AUTH_EXTENSION_URI, type TaskAssignFrame } from '@vicoop-bridge/protocol';
 import { createHttpApp } from './http.js';
 import { ensureSchema } from './db.js';
@@ -93,9 +93,16 @@ test('task access is bound to the authenticated caller across transports (issue 
     return body.result;
   }
   async function denied(response: Response) {
-    assert.equal(response.status, 404, await response.clone().text());
+    const httpJson = response.headers.get('Content-Type')?.startsWith('application/a2a+json');
+    assert.equal(response.status, httpJson ? 404 : 200, await response.clone().text());
     const text = await response.text();
     assert.ok(!text.includes('private-'), text);
+    if (!httpJson) {
+      const body = JSON.parse(text);
+      assert.equal(body.id, 1);
+      assert.equal(body.error.code, -32001);
+      assert.equal(body.result, undefined);
+    }
   }
   try {
     await ensureSchema(sql);
@@ -210,6 +217,82 @@ test('task access is bound to the authenticated caller across transports (issue 
       const replay = await rpc(0, 'tasks/resubscribe', { id: a.id });
       assert.equal(replay.status, 200);
       assert.match(await replay.text(), /private-response/);
+    });
+
+    await t.test('SDK JSON-RPC clients receive TaskNotFoundError and matching request IDs', async () => {
+      for (const v1 of [false, true]) {
+        const path = `/agents/${agentId}${v1 ? '/v1' : ''}`;
+        const card = await (await app.request(`${path}/.well-known/agent-card.json`)).json() as AgentCardV03 | AgentCardV10;
+        const client = new A2XClient(card, {
+          fetch: async (input, init) => app.request(new Request(input, init)),
+          headers: headers(1), extensions: [SIWE_BEARER_AUTH_EXTENSION_URI],
+        });
+        await assert.rejects(client.getTask(a.id), TaskNotFoundError);
+        await assert.rejects(client.getTask(randomUUID()), TaskNotFoundError);
+        const response = await app.request(path, { method: 'POST', headers: headers(1),
+          body: JSON.stringify({ jsonrpc: '2.0', id: 'read-correlation',
+            method: v1 ? 'GetTask' : 'tasks/get', params: { id: a.id } }) });
+        assert.equal(response.status, 200);
+        assert.equal((await response.json() as { id: string }).id, 'read-correlation');
+      }
+    });
+
+    await t.test('missing or pruned continuation IDs create new tasks in every message binding', async () => {
+      const pruned = await store.createTask({ contextId: 'pruned', metadata: { _principalId: principals[0] } });
+      await sql`DELETE FROM infra.a2a_tasks WHERE task_id=${pruned.id}`;
+      for (const v1 of [false, true]) {
+        for (const streaming of [false, true]) {
+          const count = assignments.length;
+          const response = await rpc(0,
+            v1 ? (streaming ? 'SendStreamingMessage' : 'SendMessage') : (streaming ? 'message/stream' : 'message/send'),
+            { message: { taskId: pruned.id, messageId: randomUUID(), role: 'user', parts: [{ text: 'new task' }] },
+              configuration: { blocking: true, returnImmediately: false } }, v1);
+          assert.equal(response.status, 200);
+          await response.text();
+          assert.equal(assignments.length, count + 1);
+          assert.notEqual(assignments.at(-1)!.taskId, pruned.id);
+        }
+      }
+      for (const action of ['send', 'stream']) {
+        const count = assignments.length;
+        const missingId = randomUUID();
+        const response = await app.request(`/agents/${agentId}/v1/message:${action}`, {
+          method: 'POST', headers: headers(0), body: JSON.stringify({
+            message: { taskId: missingId, messageId: randomUUID(), role: 'user', parts: [{ text: 'new task' }] },
+            configuration: { returnImmediately: false },
+          }),
+        });
+        assert.equal(response.status, 200);
+        await response.text();
+        assert.equal(assignments.length, count + 1);
+        assert.notEqual(assignments.at(-1)!.taskId, missingId);
+      }
+    });
+
+    await t.test('rejection IDs correlate with a task access log event', async () => {
+      const logs: string[] = [];
+      const mock = t.mock.method(console, 'log', (line: string) => { logs.push(line); });
+      try {
+        const response = await rpc(1, 'tasks/get', { id: a.id });
+        const body = await response.json() as { error: { data: { rejectionId: string } } };
+        const entry = logs.map(line => JSON.parse(line)).find(entry => entry.rejectionId === body.error.data.rejectionId);
+        assert.equal(entry.event, 'task_operation_rejected');
+        assert.equal(entry.agentId, agentId);
+        assert.equal(entry.reason, 'task_not_accessible');
+      } finally { mock.mock.restore(); }
+    });
+
+    await t.test('HTTP IDs are decoded once and invalid encoding is a protocol error', async () => {
+      const literalId = `literal%41-${randomUUID()}`;
+      await sql`UPDATE infra.a2a_tasks SET task_id=${literalId}, task_json=jsonb_set(task_json, '{id}', to_jsonb(${literalId}::text))
+        WHERE task_id=${different.id}`;
+      const response = await app.request(`/agents/${agentId}/v1/tasks/${encodeURIComponent(literalId)}`, { headers: headers(0) });
+      assert.equal(response.status, 200, await response.clone().text());
+      assert.equal((await response.json() as Task).id, literalId);
+      await denied(await app.request(`/agents/${agentId}/v1/tasks/${encodeURIComponent(literalId)}`, { headers: headers(1) }));
+      const malformed = await app.request(`/agents/${agentId}/v1/tasks/bad%ZZ`, { headers: headers(0) });
+      assert.equal(malformed.status, 400);
+      assert.equal((await malformed.json() as { error: { status: string } }).error.status, 'INVALID_ARGUMENT');
     });
 
     await t.test('HTTP query cannot replace the authorized path task', async () => {

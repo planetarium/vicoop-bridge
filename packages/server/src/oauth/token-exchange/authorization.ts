@@ -1,3 +1,4 @@
+import { InvalidParamsError } from '@a2x/sdk';
 import { PUBLIC_TASK_PROFILE } from '../../task-access.js';
 import type { VerifiedCaller } from '../../auth/principal.js';
 import type { Sql } from '../../db.js';
@@ -7,6 +8,7 @@ import {
 } from './store.js';
 
 export type TokenExchangeOperationName =
+  | 'agent.card'
   | 'message.send'
   | 'message.stream'
   | 'task.read'
@@ -16,7 +18,7 @@ export type TokenExchangeOperationName =
 
 export interface TokenExchangeOperation {
   name: TokenExchangeOperationName;
-  kind: 'message' | 'task' | 'task-list';
+  kind: 'message' | 'task' | 'task-list' | 'agent';
   taskId?: string;
 }
 
@@ -55,6 +57,8 @@ function taskIdFromParams(params: Record<string, unknown> | undefined): string |
 }
 
 const JSON_RPC_OPERATIONS: Record<string, Omit<TokenExchangeOperation, 'taskId'>> = {
+  'agent/getAuthenticatedExtendedCard': { name: 'agent.card', kind: 'agent' },
+  GetExtendedAgentCard: { name: 'agent.card', kind: 'agent' },
   'message/send': { name: 'message.send', kind: 'message' },
   SendMessage: { name: 'message.send', kind: 'message' },
   'message/stream': { name: 'message.stream', kind: 'message' },
@@ -84,8 +88,9 @@ export function parseTokenExchangeJsonRpcOperation(
   const request = record(body);
   const method = stringField(request?.method);
   if (!method) return undefined;
-  const base = JSON_RPC_OPERATIONS[method];
+  const base = Object.hasOwn(JSON_RPC_OPERATIONS, method) ? JSON_RPC_OPERATIONS[method] : undefined;
   if (!base) return undefined;
+  if (base.kind === 'agent' || base.kind === 'task-list') return { ...base };
   const params = record(request?.params);
   // v1 push config `id` identifies the CONFIG, not the task. The SDK also
   // accepts canonical v0.3 method names at the v1 endpoint, so use the binding
@@ -99,6 +104,13 @@ export function parseTokenExchangeJsonRpcOperation(
   return { ...base, ...(taskId !== undefined ? { taskId } : {}) };
 }
 
+// Match the installed SDK decoder, including its protocol error on malformed IDs.
+function decodePathId(value: string): string {
+  try { return decodeURIComponent(value); } catch {
+    throw new InvalidParamsError('Invalid percent-encoding in resource ID');
+  }
+}
+
 export function parseTokenExchangeHttpJsonOperation(
   method: string,
   path: string,
@@ -110,6 +122,9 @@ export function parseTokenExchangeHttpJsonOperation(
     && !path.startsWith('/tasks/') && path !== '/extendedAgentCard') {
     const tenant = path.match(/^\/[^/]+(\/(?:message:(?:send|stream)|tasks(?:\/.*)?|extendedAgentCard))$/);
     if (tenant) path = tenant[1]!;
+  }
+  if (method === 'GET' && path === '/extendedAgentCard') {
+    return { name: 'agent.card', kind: 'agent' };
   }
   if (method === 'POST' && path === '/message:send') {
     const taskId = taskIdFromMessage(record(body));
@@ -125,15 +140,15 @@ export function parseTokenExchangeHttpJsonOperation(
   // SDK 0.24 resolves GET /tasks/:id before action routes, including IDs
   // containing literal colons. Authorize exactly the ID it will read.
   const getTask = method === 'GET' ? path.match(/^\/tasks\/([^/]+)$/) : null;
-  if (getTask) return { name: 'task.read', kind: 'task', taskId: decodeURIComponent(getTask[1]!) };
+  if (getTask) return { name: 'task.read', kind: 'task', taskId: decodePathId(getTask[1]!) };
   const action = method === 'POST' ? path.match(/^\/tasks\/([^/]+):(cancel|subscribe)$/) : null;
   if (action) {
     return { name: action[2] === 'cancel' ? 'task.cancel' : 'task.resubscribe',
-      kind: 'task', taskId: decodeURIComponent(action[1]!) };
+      kind: 'task', taskId: decodePathId(action[1]!) };
   }
   const pushConfig = path.match(/^\/tasks\/([^/]+)\/pushNotificationConfigs(?:\/[^/]+)?$/);
   if (pushConfig) {
-    return { name: 'task.push-config', kind: 'task', taskId: decodeURIComponent(pushConfig[1]!) };
+    return { name: 'task.push-config', kind: 'task', taskId: decodePathId(pushConfig[1]!) };
   }
   return undefined;
 }
@@ -147,12 +162,19 @@ export async function authorizeTokenExchangeOperation(
 ): Promise<TokenExchangeAuthorizationResult> {
   const tokenExchange = caller?.tokenExchange;
   if (!tokenExchange) {
+    if (!operation) return { ok: false, reason: 'unknown_operation' };
+    if (operation.kind === 'task' && !operation.taskId) {
+      return { ok: false, reason: 'missing_task_id' };
+    }
     if (operation?.kind === 'task-list') {
       if (await agentHasTokenExchangeTaskBindings(sql, agentId)) {
         return { ok: false, reason: 'federated_task_list_not_supported' };
       }
     } else if (operation?.taskId) {
       const task = await loadTokenExchangeTaskAuthorization(sql, agentId, operation.taskId);
+      // Preserve SDK continuation semantics for pruned/nonexistent tasks.
+      // Existing inaccessible tasks are still denied, never resumed or replaced.
+      if (!task && operation.kind === 'message') return { ok: true };
       if (task?.authorizationKey) {
         return { ok: false, reason: 'federated_task_requires_token' };
       }
