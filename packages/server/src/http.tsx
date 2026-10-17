@@ -730,8 +730,21 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const rejection = await enforceAdminTaskOperation(c, auth.principalId, parsed);
     if (rejection) return rejection;
 
-    const message = isRecord(parsed.params) ? parsed.params.message : undefined;
-    if (isRecord(message)) {
+    const params = isRecord(parsed.params) ? parsed.params : undefined;
+    const message = params && isRecord(params.message) ? params.message : undefined;
+    if (params && message) {
+      // The SDK creates the task from the request-level metadata, and the
+      // TaskStore records owner_principal from it in the initial INSERT. Drop
+      // every caller-supplied internal key on both carriers, then stamp the
+      // verified principal on both — otherwise a caller could file a task
+      // under another operator's principal, and a blocking message/send would
+      // stay ownerless (unreachable even to its owner) until the turn ends.
+      stripCallerSuppliedInternalKeys(params);
+      stripCallerSuppliedInternalKeys(message);
+      params.metadata = {
+        ...(isRecord(params.metadata) ? params.metadata : {}),
+        _principalId: auth.principalId,
+      };
       message.metadata = {
         ...(isRecord(message.metadata) ? message.metadata : {}),
         _principalId: auth.principalId,
