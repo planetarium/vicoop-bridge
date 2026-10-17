@@ -68,6 +68,16 @@ jobs:
       - name: Typecheck server
         run: pnpm --filter @vicoop-bridge/server typecheck
 
+      # Most DB test files expect the schema to exist already, as it does on
+      # a server that has booted once.
+      - name: Apply server schema
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/vicoop_bridge_test
+        working-directory: packages/server
+        run: >-
+          pnpm exec tsx -e "import('./src/db.ts').then(async ({ createDb, ensureSchema }) => {
+          const sql = createDb(process.env.DATABASE_URL); await ensureSchema(sql); await sql.end(); })"
+
       # DB-backed tests skip themselves without DATABASE_URL, so the suite
       # runs against the service container to keep them from rotting (#521).
       # Files run one at a time: they share one database, and one file's
