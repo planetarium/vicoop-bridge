@@ -32,6 +32,7 @@ import {
 import { listCallerTokens, revokeCallerToken } from './auth/caller-token.js';
 import { logEvent } from './log.js';
 import { isAdmin } from './admin-scope.js';
+import { taskListAccess } from './task-access.js';
 import {
   AdminApiError,
   addCaller,
@@ -499,6 +500,10 @@ export function createAdminA2XServer(opts: AdminAgentOptions): {
     // "admin" is reserved by the bridge and cannot be registered by an
     // operator, so it is also a collision-free task-owner scope.
     ownerAgent: 'admin',
+    // Every operator's admin chat shares this scope, so listing must be
+    // narrowed to the requesting operator (issue #519). The 0.3 handler does
+    // not route tasks/list today; this keeps an SDK upgrade from opening it.
+    listAccess: () => taskListAccess.getStore(),
   });
   const executor = new AdminA2XExecutor(opts.db, opts.registry, taskStore);
 
