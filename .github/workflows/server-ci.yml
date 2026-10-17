@@ -74,7 +74,9 @@ jobs:
       - name: Test task access with PostgreSQL
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/vicoop_bridge_test
-        run: pnpm --filter @vicoop-bridge/server exec tsx --test src/task-access.test.ts
+        # Serial: each file runs ensureSchema against the same database, and
+        # concurrent runs collide on catalog updates (#521).
+        run: pnpm --filter @vicoop-bridge/server exec tsx --test --test-concurrency=1 src/task-access.test.ts src/admin-task-access.test.ts
 
       - name: Build server
         run: pnpm --filter @vicoop-bridge/server build

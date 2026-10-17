@@ -718,11 +718,32 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       );
     }
 
-    const rawBody = await c.req.text();
-    const parsed = JSON.parse(rawBody);
+    // Parse once and hand the SDK the same object we authorized (issue #519).
+    const parsed = await readAgentJsonRpcBody(c);
+    if (parsed instanceof Response) return parsed;
 
-    const message = parsed.params?.message;
-    if (isRecord(message)) {
+    // Every operator's admin chat shares the 'admin' task scope, so a task
+    // ID alone must not reach another operator's task. Apply the same
+    // owner_principal check #518 added for /agents/:id; inaccessible tasks
+    // answer as not-found so their existence is not revealed.
+    const rejection = await enforceAdminTaskOperation(c, auth.principalId, parsed);
+    if (rejection) return rejection;
+
+    const params = isRecord(parsed.params) ? parsed.params : undefined;
+    const message = params && isRecord(params.message) ? params.message : undefined;
+    if (params && message) {
+      // The SDK creates the task from the request-level metadata, and the
+      // TaskStore records owner_principal from it in the initial INSERT. Drop
+      // every caller-supplied internal key on both carriers, then stamp the
+      // verified principal on both — otherwise a caller could file a task
+      // under another operator's principal, and a blocking message/send would
+      // stay ownerless (unreachable even to its owner) until the turn ends.
+      stripCallerSuppliedInternalKeys(params);
+      stripCallerSuppliedInternalKeys(message);
+      params.metadata = {
+        ...(isRecord(params.metadata) ? params.metadata : {}),
+        _principalId: auth.principalId,
+      };
       message.metadata = {
         ...(isRecord(message.metadata) ? message.metadata : {}),
         _principalId: auth.principalId,
@@ -731,9 +752,41 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       };
     }
 
-    const result = await adminHandler.handle(parsed);
+    const result = await taskListAccess.run(
+      { agentId: 'admin', principalId: auth.principalId },
+      () => adminHandler.handle(parsed),
+    );
     return handleHandlerResult(result, c);
   });
+
+  async function enforceAdminTaskOperation(
+    c: Context,
+    principalId: string,
+    body: Record<string, unknown>,
+  ): Promise<Response | undefined> {
+    const operation = parseTokenExchangeJsonRpcOperation(body);
+    // Methods outside the A2A task/message surface carry no task ID; let the
+    // SDK answer them (it returns method-not-found) exactly as before.
+    if (!operation) return undefined;
+    const result = await authorizeTokenExchangeOperation(
+      opts.db, 'admin', { principalId }, operation, [],
+    );
+    if (result.ok) return undefined;
+    const rejectionId = newRejectionId();
+    logEvent('task_operation_rejected', {
+      agentId: 'admin',
+      operation: operation.name,
+      reason: result.reason,
+      rejectionId,
+    });
+    if (result.reason === 'missing_task_id') {
+      return c.json({ jsonrpc: '2.0', id: body.id ?? null, error: {
+        ...new InvalidParamsError('Task method requires a task ID').toJSONRPCError(),
+        data: { rejectionId } } });
+    }
+    return c.json({ jsonrpc: '2.0', id: body.id ?? null,
+      error: { code: -32001, message: 'Task not found', data: { rejectionId } } });
+  }
 
   // Deterministic admin RPC at /admin-api/*. Same owner_session bearer
   // requirement as the admin agent at POST '/', but the request never
