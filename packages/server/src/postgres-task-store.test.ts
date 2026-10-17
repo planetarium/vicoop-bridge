@@ -735,8 +735,10 @@ test(
       await seed(sql, { taskId: `${tag}-b1`, contextId: `${tag}-ctxB`, state: 'completed', age: '40 days' });
       await seed(sql, { taskId: `${tag}-b2`, contextId: `${tag}-ctxB`, state: 'completed', age: '1 hour' });
 
+      // The prune is table-wide, so other rows in a shared database may be
+      // reaped too: assert on this test's rows only (#521).
       const deleted = await store.pruneStaleContexts(30);
-      assert.equal(deleted, 1, 'exactly the one idle context A row is deleted');
+      assert.ok(deleted >= 1, 'at least the idle context A row is deleted');
 
       const surviving = await sql<{ task_id: string }[]>`
         SELECT task_id FROM infra.a2a_tasks WHERE task_id LIKE ${tag + '-%'} ORDER BY task_id
@@ -766,12 +768,11 @@ test(
       // updated_at is frozen at creation. Must NOT be reaped out from under the
       // live executor even though the context looks idle by timestamp.
       await seed(sql, { taskId: `${tag}-1`, contextId: `${tag}-ctx`, state: 'working', age: '40 days' });
-      const deleted = await store.pruneStaleContexts(30);
-      assert.equal(deleted, 0, 'context with an in-flight task is spared');
+      await store.pruneStaleContexts(30);
       const after = await sql<{ c: number }[]>`
         SELECT count(*)::int c FROM infra.a2a_tasks WHERE task_id = ${tag + '-1'}
       `;
-      assert.equal(after[0]!.c, 1);
+      assert.equal(after[0]!.c, 1, 'context with an in-flight task is spared');
     } finally {
       await sql`DELETE FROM infra.a2a_tasks WHERE task_id LIKE ${tag + '-%'}`;
       await sql.end();

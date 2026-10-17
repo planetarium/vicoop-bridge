@@ -35,5 +35,12 @@ export function createDb(databaseUrl: string): Sql {
 export async function ensureSchema(sql: Sql): Promise<void> {
   const schemaPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'schema.sql');
   const schemaSql = readFileSync(schemaPath, 'utf-8');
-  await sql.unsafe(schemaSql);
+  // Concurrent runs (machines booting together during a deploy, or parallel
+  // test files) otherwise race on the catalog and fail with "tuple
+  // concurrently updated" (#521). The transaction-scoped advisory lock makes
+  // them apply the schema one at a time.
+  await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(hashtext('vicoop-bridge:ensureSchema'))`;
+    await tx.unsafe(schemaSql);
+  });
 }
