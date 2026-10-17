@@ -14,7 +14,11 @@ import { invalidateToolCache } from './schema-tools.js';
 test('admin agent task access is bound to the requesting operator (issue #519)',
   { skip: !process.env.DATABASE_URL }, async (t) => {
   const sql = postgres(process.env.DATABASE_URL!, { onnotice() {} });
-  const principals = [0, 1].map(() => `eth:0x${randomUUID().replaceAll('-', '')}00000000`);
+  // B is a Google principal with no email on its session: that is the one
+  // case where the admin system prompt would print a caller-supplied _email
+  // (describePrincipal in admin.ts), so a forged one would be observable.
+  const principals = [`eth:0x${randomUUID().replaceAll('-', '')}00000000`, `google:${randomUUID()}`];
+  const providers = ['siwe', 'google'] as const;
   const [A, B] = [0, 1];
   const issued: Awaited<ReturnType<typeof issueSessionToken>>[] = [];
   const contexts: string[] = [];
@@ -100,8 +104,8 @@ test('admin agent task access is bound to the requesting operator (issue #519)',
   try {
     await ensureSchema(sql);
     invalidateToolCache();
-    for (const principalId of principals) {
-      issued.push(await issueSessionToken(sql, { principalId, provider: 'siwe', audience: 'owner_session' }));
+    for (const [i, principalId] of principals.entries()) {
+      issued.push(await issueSessionToken(sql, { principalId, provider: providers[i]!, audience: 'owner_session' }));
     }
     const victimContext = newContext();
     const completed = await result(await send(A, victimContext, 'private-admin-prompt'));
@@ -123,10 +127,13 @@ test('admin agent task access is bound to the requesting operator (issue #519)',
       assert.equal((await result(await rpc(B, 'tasks/get', { id: planted.id }))).id, planted.id);
       // B's prompt must not reach A's next turn in the shared context.
       await result(await send(A, victimContext, 'follow-up'));
+      const attackerTurn = modelRequests[before]!;
       const victimTurn = modelRequests.slice(before + 1).join('\n');
+      // B's own prompt identifies B by principal, never by the forged email.
+      assert.ok(attackerTurn.includes(principals[B]!), attackerTurn);
+      assert.ok(!attackerTurn.includes('forged@example.com'), attackerTurn);
       assert.ok(victimTurn.includes('follow-up'), victimTurn);
       assert.ok(!victimTurn.includes('INJECTED-by-B'), victimTurn);
-      assert.ok(!victimTurn.includes('forged@example.com'), victimTurn);
     });
 
     await t.test('the owner can read and cancel a blocking message/send while it runs', async () => {
