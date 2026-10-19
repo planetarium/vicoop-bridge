@@ -15,7 +15,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx watch src/cli.ts",
     "start": "tsx src/cli.ts",
-    "test": "tsx --test \"src/**/*.test.ts\""
+    "test": "tsx --test --test-concurrency=1 \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@a2x/sdk": "^0.24.0",

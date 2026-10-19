@@ -80,12 +80,12 @@ jobs:
 
       # DB-backed tests skip themselves without DATABASE_URL, so the suite
       # runs against the service container to keep them from rotting (#521).
-      # Files run one at a time: they share one database, and one file's
-      # ensureSchema DDL can deadlock against another file's queries.
+      # The test script runs files one at a time: they share one database,
+      # and one file's ensureSchema DDL can deadlock against another's queries.
       - name: Test server
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/vicoop_bridge_test
-        run: pnpm --filter @vicoop-bridge/server exec tsx --test --test-concurrency=1 "src/**/*.test.ts"
+        run: pnpm --filter @vicoop-bridge/server test
 
       - name: Build server
         run: pnpm --filter @vicoop-bridge/server build
