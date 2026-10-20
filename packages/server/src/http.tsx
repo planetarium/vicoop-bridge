@@ -1,3 +1,4 @@
+import { transferAgent } from './agent-transfer.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { Hono, type Context, type MiddlewareHandler } from 'hono';
@@ -762,7 +763,20 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   app.get('/admin-api/agents', async (c) => {
     const auth = await authOwnerSession(c);
     if (!auth.ok) return adminApiUnauthorized(c, auth);
-    return c.json({ agents: listActiveAgents(opts.registry, auth.principalId) });
+    return c.json({ agents: await listActiveAgents(opts.db, opts.registry, auth.principalId) });
+  });
+
+  app.post('/admin-api/agents/:id/transfer', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    try {
+      const body = await c.req.json().catch(() => null);
+      if (!body || typeof body !== 'object' || Array.isArray(body) ||
+          (body.preview !== undefined && typeof body.preview !== 'boolean')) {
+        throw new AdminApiError('Invalid transfer request', 400);
+      }
+      return c.json(await transferAgent(opts.db, opts.registry, auth.principalId, c.req.param('id'), body));
+    } catch (err) { return adminApiErrorResponse(c, err); }
   });
 
   app.get('/admin-api/agents/:id/callers', async (c) => {
@@ -841,7 +855,8 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const conn = opts.registry.getAgent(agentId);
     // Collapse "not connected" and "not authorized" into one 404 so a
     // non-owner can't probe which agent ids exist / are online.
-    if (!conn || !(isAdmin(auth.principalId) || conn.ownerPrincipal === auth.principalId)) {
+    const owners = await opts.db`SELECT owner_principal FROM agents WHERE id = ${agentId}`;
+    if (!conn || !owners[0] || !(isAdmin(auth.principalId) || owners[0].owner_principal === auth.principalId)) {
       return c.json({ error: 'Agent not found, not connected, or not authorized.' }, 404);
     }
     const USAGE_SUPPORTED_BACKENDS = ['vicoop-codex', 'claude'];

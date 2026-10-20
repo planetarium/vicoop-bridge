@@ -13,6 +13,7 @@ import {
   runAgentCallersList,
   runAgentCallersRemove,
   runAgentCallersRemoveFederated,
+  runAgentTransfer,
   runAgentDelete,
   runAgentList,
   runListAgents,
@@ -1152,4 +1153,36 @@ test('legacy {add,remove,list}-caller all emit the agent-callers deprecation hin
   assert.match(out, /list-callers.*agent callers list/s);
   assert.match(out, /add-caller.*agent callers add/s);
   assert.match(out, /remove-caller.*agent callers remove/s);
+});
+
+test('agent transfer pins the preview identity and revision and emits clean JSON', async (t) => {
+  const stdout = captureStdout(t);
+  const stderr = captureStderr(t);
+  const plan = { agent_id: 'foo', previous_owner: 'eth:old', owner_principal: 'google:123', expected_revision: '7' };
+  const { calls } = installFetch(t, { body: plan });
+  const args = { action: 'agent-transfer' as const, server: BRIDGE, token: TOKEN, agentId: 'foo', to: 'user@example.com', yes: true, json: true };
+  assert.equal(await runAgentTransfer(args), 0);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(JSON.parse(calls[0].body!), { to: 'user@example.com', preview: true });
+  assert.deepEqual(JSON.parse(calls[1].body!), { to: 'google:123', expectedOwner: 'eth:old', expectedRevision: '7' });
+  assert.deepEqual(JSON.parse(stdout.read()), plan);
+  assert.match(stderr.read(), /Previous owner: eth:old/);
+  assert.match(stderr.read(), /New owner: google:123/);
+  const parsed = parse(agentCmd, ['agent', 'transfer', 'foo', '--to', 'user@example.com', '--yes', '--json']);
+  assert.equal(parsed.success, true);
+  if (parsed.success) assert.equal(parsed.value.action, 'agent-transfer');
+});
+
+test('agent transfer refuses noninteractive confirmation without --yes', async (t) => {
+  captureStderr(t);
+  const { calls } = installFetch(t, { body: { agent_id: 'foo', previous_owner: 'old', owner_principal: 'new', expected_revision: '0' } });
+  assert.equal(await runAgentTransfer({ action: 'agent-transfer', server: BRIDGE, token: TOKEN, agentId: 'foo', to: 'new', yes: false, json: true }), 1);
+  assert.equal(calls.length, 1);
+});
+
+test('agent transfer stops on a rejected preview', async (t) => {
+  captureStderr(t);
+  const { calls } = installFetch(t, { status: 403, body: { error: 'admin only' } });
+  assert.equal(await runAgentTransfer({ action: 'agent-transfer', server: BRIDGE, token: TOKEN, agentId: 'foo', to: 'new', yes: true, json: true }), 1);
+  assert.equal(calls.length, 1);
 });

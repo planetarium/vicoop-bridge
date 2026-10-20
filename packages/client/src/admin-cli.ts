@@ -63,6 +63,14 @@ function agentListCommand(name: 'list' | 'ls', alias: boolean) {
   );
 }
 
+const agentTransferSubCmd = command('transfer', object({
+  action: constant('agent-transfer' as const),
+  ...sharedFlags,
+  agentId: argument(string({ metavar: 'AGENT_ID' })),
+  to: option('--to', string({ metavar: 'EMAIL_OR_PRINCIPAL' })),
+  yes: withDefault(flag('--yes'), false),
+}), { brief: message`Transfer an agent to a verified owner (bridge administrators only).` });
+
 const agentListSubCmd = longestMatch(
   agentListCommand('list', false),
   agentListCommand('ls', true),
@@ -341,6 +349,7 @@ export const agentCmd = command(
   // See admin-cli.test.ts.
   longestMatch(
     agentRegisterCmd,
+    agentTransferSubCmd,
     agentCallersSubCmd,
     agentX402SubCmd,
     agentListSubCmd,
@@ -348,7 +357,7 @@ export const agentCmd = command(
   ),
   {
     brief: message`Manage agent registrations, their callers, and their pricing.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, add-federated, remove-federated, issue-api-key}\`, \`x402 {show, set, clear}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`transfer\`, \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, add-federated, remove-federated, issue-api-key}\`, \`x402 {show, set, clear}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
     hidden: 'usage',
   },
 );
@@ -784,9 +793,9 @@ export async function runAgentList(args: AgentListArgs): Promise<number> {
 // EOF, just-pressing-enter, or stdin not being a TTY — returns false so a
 // non-interactive invocation does not silently delete. Operators in scripts
 // must pass --yes / -y to bypass.
-async function confirmYN(promptText: string): Promise<boolean> {
+async function confirmYN(promptText: string, output: NodeJS.WriteStream = process.stdout): Promise<boolean> {
   if (!process.stdin.isTTY) return false;
-  process.stdout.write(`${promptText} [y/N] `);
+  output.write(`${promptText} [y/N] `);
   return new Promise((resolve) => {
     let buf = '';
     const onData = (chunk: Buffer): void => {
@@ -1172,4 +1181,24 @@ export async function runListAgents(args: ListAgentsArgs): Promise<number> {
     path: '/admin-api/agents',
   });
   return emit(result, args.json, renderAgentList);
+}
+
+export async function runAgentTransfer(args: Extract<AgentCliArgs, { action: 'agent-transfer' }>): Promise<number> {
+  const session = resolveSession(args);
+  if ('error' in session) { process.stderr.write(`${session.error}\n`); return 1; }
+  const path = `/admin-api/agents/${encodeURIComponent(args.agentId)}/transfer`;
+  const preview = await callApi({ session, method: 'POST', path, body: { to: args.to, preview: true } });
+  if (preview.status === 0 || preview.status >= 400) return emit(preview, args.json, String);
+  const plan = preview.body as { agent_id: string; previous_owner: string; owner_principal: string; expected_revision: string };
+  process.stderr.write(`Agent: ${plan.agent_id}\nPrevious owner: ${plan.previous_owner}\nNew owner: ${plan.owner_principal}\n`);
+  if (!args.yes && !await confirmYN('Transfer ownership?', process.stderr)) {
+    process.stderr.write('aborted (use --yes for automation)\n'); return 1;
+  }
+  const result = await callApi({ session, method: 'POST', path, body: {
+    to: plan.owner_principal, expectedOwner: plan.previous_owner, expectedRevision: plan.expected_revision,
+  } });
+  return emit(result, args.json, (body) => {
+    const final = body as { agent_id: string; owner_principal: string; outcome: string; session_sync: string };
+    return `${final.agent_id}: ${final.outcome}; owner ${final.owner_principal}; sessions ${final.session_sync}`;
+  });
 }

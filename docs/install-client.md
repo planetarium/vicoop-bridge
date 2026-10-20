@@ -1179,3 +1179,63 @@ Both subcommands use the same owner-session bearer as `agent callers add`
 - **Audit/revoke access**: the admin agent exposes `list_caller_tokens`,
   `list_callers`, and `revoke_caller_token` tools; see the tool list in
   `packages/server/src/admin.ts`.
+
+### Transfer an agent to another owner (administrators)
+
+Log in using a wallet listed in the server's `ADMIN_WALLET_ADDRESSES`, then run:
+
+```sh
+vicoop-client agent transfer my-agent --to new-owner@example.com
+# Automation:
+vicoop-client agent transfer my-agent --to google:123456789 --yes --json
+```
+
+The command displays the agent ID and previous/new canonical owners before
+confirmation. Without `--yes`, a noninteractive invocation aborts. Preview and
+prompts go to stderr, leaving stdout as a single JSON result with `--json`.
+The command uses the same saved owner session, `--server`, and `--token` options
+as other `agent` commands.
+
+The target must have logged in to this bridge. Email resolution uses only
+Google-authenticated session records, issued after verification of Google's
+subject and `email_verified` claim. Unknown emails return 404; emails associated
+with multiple Google subjects return 409, including historical sessions. Use an
+explicit known `google:<numeric-sub>` (also accepts `google:sub:<numeric-sub>`)
+or `eth:0x<40 hex>` principal to disambiguate. Emails are never stored as owner
+principals; caller allowlist patterns such as `google:email:` and
+`google:domain:` are not supported transfer targets. An owner who only registered
+a daemon should perform `auth login` first to establish a session identity.
+
+The API is `POST /admin-api/agents/:id/transfer`, authenticated with an admin
+owner-session bearer. First send `{"to":"new-owner@example.com","preview":true}`.
+Then send the returned `owner_principal` as `to`, `previous_owner` as
+`expectedOwner`, and `expected_revision` as `expectedRevision`. A concurrent
+ownership change returns 409, even if ownership changed away and back. A
+same-owner transfer returns `outcome: "unchanged"`. Missing agents return 404;
+non-admins receive 403. The agent, compatible `clients` rows, and legacy
+`agent_policies` owner are updated in one transaction. A legacy client covering
+other agents is rejected with 409 rather than transferring unrelated agents.
+
+Agent ID, caller allowlist/public status, pricing, and daemon token remain
+unchanged. This transfers bridge management ownership, not custody of the
+machine or its daemon credential; anyone retaining that credential can still
+connect the daemon. Owner-session credentials remain identity-scoped and are
+not rotated. No reconnect or server-wide restart is required. In-flight tasks
+continue, and existing task history and caller authorization remain unchanged;
+agent ownership does not grant access to another caller's A2A task history.
+Requests authorized before the transfer may finish.
+
+Management checks read authoritative ownership from Postgres on every request,
+including connected-agent listing and usage access. Live connection metadata
+refreshes across instances through transactional PostgreSQL NOTIFY, with a
+five-second reconciliation interval for missed notifications and reconnect
+races. `session_sync: "local_refreshed_remote_eventual"` means the serving
+instance refreshed its metadata and remote instances converge asynchronously;
+`"refresh_pending"` means the transfer committed but local metadata refresh
+failed and will be retried. Neither result grants cached management access to
+the previous owner. During a DB outage management checks fail closed. Roll out
+the updated server to all instances before using transfers.
+
+Structured `agent_transfer` audit events include the acting admin, agent ID,
+previous/new owner, timestamp, outcome, and session synchronization status.
+They never contain bearer credentials.

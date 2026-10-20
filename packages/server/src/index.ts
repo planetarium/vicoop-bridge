@@ -1,3 +1,4 @@
+import { watchAgentOwners } from './agent-transfer.js';
 import { serve } from '@hono/node-server';
 import { Registry } from './registry.js';
 import { createHttpApp } from './http.js';
@@ -120,6 +121,7 @@ export async function startServer(opts: ServerOptions) {
   // reconnect-scoped behavior rather than blocking startup.
   void watchX402PricingChanges(opts.db, registry);
   void watchCallerPolicyChanges(opts.db, registry);
+  void watchAgentOwners(opts.db, registry);
 
   console.log(`[server] listening on :${opts.port}`);
   return { registry, server };

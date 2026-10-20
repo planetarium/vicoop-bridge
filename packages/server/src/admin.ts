@@ -210,7 +210,7 @@ function buildCustomTools(db: Sql, registry: Registry, principalId: string) {
     list_active_agents: tool({
       description: 'List currently connected agents with their client identity and connection time. Non-admin users only see their own agents.',
       inputSchema: z.object({}),
-      execute: async () => listActiveAgents(registry, principalId),
+      execute: async () => listActiveAgents(db, registry, principalId),
     }),
 
     add_caller: tool({

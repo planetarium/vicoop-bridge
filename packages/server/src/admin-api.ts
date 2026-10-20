@@ -529,13 +529,16 @@ export async function issueAgentApiKey(
   };
 }
 
-export function listActiveAgents(
+export async function listActiveAgents(
+  db: Sql,
   registry: Registry,
   principalId: string,
-): ActiveAgentInfo[] {
+): Promise<ActiveAgentInfo[]> {
   const admin = isAdmin(principalId);
+  const owned = await db`SELECT id FROM agents WHERE owner_principal = ${principalId}`;
+  const ids = new Set(owned.map((row) => row.id));
   return registry.listAgents()
-    .filter((a) => admin || a.ownerPrincipal === principalId)
+    .filter((a) => admin || ids.has(a.agentId))
     .map((a) => ({
       agent_id: a.agentId,
       client_id: a.clientId,

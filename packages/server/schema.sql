@@ -1176,3 +1176,19 @@ GRANT EXECUTE ON FUNCTION update_client_allowed_agents(TEXT, TEXT[])
 -- excluded so probing requires a valid vbc_caller_* token.
 GRANT EXECUTE ON FUNCTION agent_id_available(TEXT)
   TO app_authenticated, app_postgraphile;
+
+-- Ownership generation also catches direct SQL/GraphQL changes and ABA races.
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS owner_revision BIGINT NOT NULL DEFAULT 0;
+CREATE OR REPLACE FUNCTION bump_agent_owner_revision() RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.owner_principal IS DISTINCT FROM OLD.owner_principal THEN
+    NEW.owner_revision := OLD.owner_revision + 1;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS agents_owner_revision ON agents;
+CREATE TRIGGER agents_owner_revision BEFORE UPDATE ON agents
+  FOR EACH ROW EXECUTE FUNCTION bump_agent_owner_revision();
+
+COMMENT ON COLUMN agents.owner_revision IS E'@omit create,update';
