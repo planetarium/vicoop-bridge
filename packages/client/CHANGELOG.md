@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.42.0
+
+### Minor Changes
+
+- eb5acec: Add administrator-only `agent transfer <AGENT_ID> --to <EMAIL_OR_PRINCIPAL>` with an ownership preview, confirmation, `--yes`, and JSON results.
+
 ## 0.41.2
 
 ### Patch Changes
