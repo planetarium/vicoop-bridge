@@ -49,7 +49,7 @@ import {
   runAgentCallersAddFederated, runAgentCallersRemoveFederated,
   runAgentCallersIssue,
   runAgentX402Clear, runAgentX402Set, runAgentX402Show,
-  runAgentDelete, runAgentList, runListAgents, runListCallers, runListClients,
+  runAgentTransfer, runAgentDelete, runAgentList, runListAgents, runListCallers, runListClients,
   runRemoveCaller, runRevokeClient,
 } from './admin-cli.js';
 import { authWhoamiCmd, whoamiCmd, runAuthWhoami, runWhoami } from './whoami.js';
@@ -950,6 +950,9 @@ async function main(): Promise<void> {
       break;
     case 'agent-delete':
       process.exit(await runAgentDelete(parsed));
+      break;
+    case 'agent-transfer':
+      process.exit(await runAgentTransfer(parsed));
       break;
     case 'agent-callers-list':
       process.exit(await runAgentCallersList(parsed));
