@@ -5,7 +5,12 @@ import postgres from 'postgres';
 import { SiweMessage } from 'siwe';
 import { Wallet } from 'ethers';
 import { mountSiweExchange } from './siwe-exchange.js';
-import { CALLER_TOKEN_PREFIX, verifyCallerToken } from './caller-token.js';
+import {
+  CALLER_TOKEN_PREFIX,
+  OWNER_SESSION_PREFIX,
+  verifyCallerToken,
+  verifySessionToken,
+} from './caller-token.js';
 
 const TEST_DOMAIN = 'example.test';
 
@@ -57,7 +62,7 @@ test(
       const res = await app.request('/auth/siwe/exchange', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ message, signature }),
+        body: JSON.stringify({ message, signature, intent: 'caller' }),
       });
       assert.equal(res.status, 200);
       const body = (await res.json()) as Record<string, unknown>;
@@ -77,6 +82,38 @@ test(
       >`SELECT provider, principal_id FROM callers WHERE principal_id = ${principalId}`;
       assert.equal(rows.length, 1);
       assert.equal(rows[0]!.provider, 'siwe');
+
+      await sql`DELETE FROM callers WHERE principal_id = ${principalId}`;
+      await sql`DELETE FROM used_siwe_nonces WHERE principal_id = ${principalId}`;
+    } finally {
+      await sql.end();
+    }
+  },
+);
+
+test(
+  'omitting intent mints an owner session token, not a caller token',
+  { skip: !hasDb },
+  async () => {
+    const sql = postgres(process.env.DATABASE_URL!);
+    try {
+      const app = buildApp(sql);
+      const { message, signature, address } = await buildSignedSiwe();
+      const principalId = `eth:${address.toLowerCase()}`;
+
+      const res = await app.request('/auth/siwe/exchange', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ message, signature }),
+      });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as { access_token: string };
+      assert.ok(body.access_token.startsWith(OWNER_SESSION_PREFIX), body.access_token);
+      const session = await verifySessionToken(sql, body.access_token, {
+        expectedAudience: 'owner_session',
+      });
+      assert.equal(session.principalId, principalId);
+      await assert.rejects(verifyCallerToken(sql, body.access_token), /audience mismatch/);
 
       await sql`DELETE FROM callers WHERE principal_id = ${principalId}`;
       await sql`DELETE FROM used_siwe_nonces WHERE principal_id = ${principalId}`;
@@ -228,7 +265,7 @@ test(
       const resA = await app.request('/auth/siwe/exchange', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ message, signature }),
+        body: JSON.stringify({ message, signature, intent: 'caller' }),
       });
       assert.equal(resA.status, 200);
       const bodyA = (await resA.json()) as { access_token: string };
@@ -240,7 +277,7 @@ test(
       const resB = await app.request('/auth/siwe/exchange', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ message, signature }),
+        body: JSON.stringify({ message, signature, intent: 'caller' }),
       });
       assert.equal(resB.status, 401);
       const bodyB = (await resB.json()) as Record<string, unknown>;

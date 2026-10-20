@@ -68,13 +68,24 @@ jobs:
       - name: Typecheck server
         run: pnpm --filter @vicoop-bridge/server typecheck
 
-      - name: Test server
-        run: pnpm --filter @vicoop-bridge/server test
-
-      - name: Test task access with PostgreSQL
+      # Most DB test files expect the schema to exist already, as it does on
+      # a server that has booted once.
+      - name: Apply server schema
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/vicoop_bridge_test
-        run: pnpm --filter @vicoop-bridge/server exec tsx --test src/task-access.test.ts
+        working-directory: packages/server
+        run: >-
+          pnpm exec tsx -e "import('./src/db.ts').then(async ({ createDb, ensureSchema }) => {
+          const sql = createDb(process.env.DATABASE_URL); await ensureSchema(sql); await sql.end(); })"
+
+      # DB-backed tests skip themselves without DATABASE_URL, so the suite
+      # runs against the service container to keep them from rotting (#521).
+      # The test script runs files one at a time: they share one database,
+      # and one file's ensureSchema DDL can deadlock against another's queries.
+      - name: Test server
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/vicoop_bridge_test
+        run: pnpm --filter @vicoop-bridge/server test
 
       - name: Build server
         run: pnpm --filter @vicoop-bridge/server build

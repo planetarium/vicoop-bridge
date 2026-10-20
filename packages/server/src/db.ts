@@ -35,5 +35,15 @@ export function createDb(databaseUrl: string): Sql {
 export async function ensureSchema(sql: Sql): Promise<void> {
   const schemaPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'schema.sql');
   const schemaSql = readFileSync(schemaPath, 'utf-8');
-  await sql.unsafe(schemaSql);
+  // Concurrent runs against one database (parallel test files, or several
+  // machines booting together if the app ever scales past one) otherwise race
+  // on the catalog and fail with "tuple concurrently updated" or a duplicate
+  // CREATE EXTENSION (#521). The transaction-scoped advisory lock makes them
+  // apply the schema one at a time. Advisory locks are per database, so runs
+  // against different databases in one cluster can still race on the
+  // cluster-wide CREATE ROLE at the top of schema.sql.
+  await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(hashtext('vicoop-bridge:ensureSchema'))`;
+    await tx.unsafe(schemaSql);
+  });
 }
