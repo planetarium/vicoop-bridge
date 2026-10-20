@@ -61,12 +61,12 @@ test('admin agent task access is bound to the requesting operator (issue #519)',
   // `forged` puts another principal in every internal-metadata slot a caller
   // can reach, on both carriers the SDK and the TaskStore read.
   const send = (caller: number, contextId: string, text: string,
-    opts: { taskId?: string; forgedPrincipal?: string } = {}) => {
+    opts: { taskId?: string; forgedPrincipal?: string; stream?: boolean } = {}) => {
     const forged = opts.forgedPrincipal === undefined ? undefined : {
       _principalId: opts.forgedPrincipal, _email: 'forged@example.com',
       _authorizationProfile: 'forged', _actorId: 'forged',
     };
-    return rpc(caller, 'message/send', {
+    return rpc(caller, opts.stream ? 'message/stream' : 'message/send', {
       message: { kind: 'message', messageId: randomUUID(), role: 'user', contextId,
         ...(opts.taskId !== undefined ? { taskId: opts.taskId } : {}),
         parts: [{ kind: 'text', text }], ...(forged ? { metadata: forged } : {}) },
@@ -90,6 +90,20 @@ test('admin agent task access is bound to the requesting operator (issue #519)',
     assert.equal(body.id, 1);
     assert.equal(body.error?.code, -32001, text);
     assert.equal(body.result, undefined);
+  }
+  async function streamResults(response: Response) {
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('content-type') ?? '', /^text\/event-stream/);
+    const events = (await response.text()).split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => JSON.parse(line.slice(6)));
+    assert.ok(events.length > 0);
+    for (const event of events) {
+      assert.equal(event.id, 1);
+      assert.equal(event.error, undefined, JSON.stringify(event));
+      assert.ok(event.result);
+    }
+    return events.map((event) => event.result);
   }
   async function waitForWorkingTask(contextId: string): Promise<string> {
     for (let i = 0; i < 200; i++) {
@@ -116,6 +130,32 @@ test('admin agent task access is bound to the requesting operator (issue #519)',
       await denied(await rpc(B, 'tasks/get', { id: completed.id }));
       await denied(await rpc(B, 'tasks/cancel', { id: completed.id }));
       await denied(await send(B, newContext(), 'hijack', { taskId: completed.id }));
+    });
+
+    await t.test('another operator cannot stream or resubscribe to a completed task', async () => {
+      const before = modelRequests.length;
+      await denied(await send(B, victimContext, 'hijack-stream', {
+        taskId: completed.id, stream: true, forgedPrincipal: principals[A],
+      }));
+      await denied(await rpc(B, 'tasks/resubscribe', { id: completed.id }));
+      assert.equal(modelRequests.length, before);
+    });
+
+    await t.test('the owner can stream a new task and resubscribe to its final status', async () => {
+      const events = await streamResults(await send(A, newContext(), 'private-admin-stream', {
+        stream: true, forgedPrincipal: principals[B],
+      }));
+      const final = events.find((event) => event.final === true);
+      assert.ok(final, JSON.stringify(events));
+      assert.equal(final.status.state, TaskState.COMPLETED);
+      assert.equal(await ownerOf(final.taskId), principals[A]);
+      assert.equal((await result(await rpc(A, 'tasks/get', { id: final.taskId }))).id, final.taskId);
+      await denied(await rpc(B, 'tasks/resubscribe', { id: final.taskId }));
+      const replay = await streamResults(await rpc(A, 'tasks/resubscribe', { id: final.taskId }));
+      assert.equal(replay.length, 1);
+      assert.equal(replay[0].taskId, final.taskId);
+      assert.equal(replay[0].status.state, TaskState.COMPLETED);
+      assert.equal(replay[0].final, true);
     });
 
     await t.test('forged internal metadata cannot file a task under another operator', async () => {
@@ -147,6 +187,14 @@ test('admin agent task access is bound to the requesting operator (issue #519)',
         assert.equal((await result(await rpc(A, 'tasks/get', { id: taskId }))).id, taskId);
         await denied(await rpc(B, 'tasks/get', { id: taskId }));
         await denied(await rpc(B, 'tasks/cancel', { id: taskId }));
+        const before = modelRequests.length;
+        await denied(await send(B, context, 'hijack-running-stream', {
+          taskId, stream: true, forgedPrincipal: principals[A],
+        }));
+        await denied(await rpc(B, 'tasks/resubscribe', { id: taskId }));
+        assert.equal(modelRequests.length, before);
+        assert.equal((await result(await rpc(A, 'tasks/get', { id: taskId }))).status.state,
+          TaskState.WORKING);
         const canceled = await result(await rpc(A, 'tasks/cancel', { id: taskId }));
         assert.equal(canceled.status.state, TaskState.CANCELED);
       } finally {
