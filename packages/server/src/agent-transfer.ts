@@ -36,7 +36,7 @@ export async function resolveTransferOwner(db: SqlExecutor, target: string) {
 
 export async function transferAgent(
   db: Sql, registry: Registry, actor: string, agentId: string,
-  input: { to: string; expectedOwner?: string; expectedRevision?: string; preview?: boolean },
+  input: { to: string; expectedOwner?: string; expectedRevision?: string; expectedClientId?: string; preview?: boolean },
 ) {
   let previousOwner: string | null = null;
   let newOwner: string | null = null;
@@ -44,8 +44,9 @@ export async function transferAgent(
     if (!isAdmin(actor)) throw new AdminApiError('Agent transfer requires a bridge administrator', 403);
     if (typeof input.to !== 'string' || !input.to.trim()) throw new AdminApiError('to is required', 400);
     if (!input.preview && (typeof input.expectedOwner !== 'string' ||
+        typeof input.expectedClientId !== 'string' || !input.expectedClientId ||
         typeof input.expectedRevision !== 'string' || !/^\d+$/.test(input.expectedRevision))) {
-      throw new AdminApiError('expectedOwner and expectedRevision from a preview are required', 400);
+      throw new AdminApiError('expectedOwner, expectedRevision and expectedClientId from a preview are required', 400);
     }
     const result = await db.begin(async (tx) => {
       const rows = await tx`SELECT owner_principal, owner_revision::text, client_id FROM agents WHERE id = ${agentId} FOR UPDATE`;
@@ -54,8 +55,9 @@ export async function transferAgent(
       previousOwner = agent.owner_principal;
       const owner = await resolveTransferOwner(tx, input.to);
       newOwner = owner.principal;
-      if (!input.preview && (input.expectedOwner !== previousOwner || input.expectedRevision !== agent.owner_revision)) {
-        throw new AdminApiError('Ownership changed since preview; preview again', 409);
+      if (!input.preview && (input.expectedOwner !== previousOwner || input.expectedRevision !== agent.owner_revision ||
+          input.expectedClientId !== agent.client_id)) {
+        throw new AdminApiError('Ownership or registration changed since preview; preview again', 409);
       }
       const unchanged = previousOwner === newOwner;
       if (!input.preview && !unchanged) {
@@ -71,7 +73,7 @@ export async function transferAgent(
         // Transactional NOTIFY: never broadcast a rolled-back transfer.
         await tx`SELECT pg_notify(${OWNER_CHANNEL}, ${agentId})`;
       }
-      return { agent_id: agentId, previous_owner: previousOwner!, owner_principal: owner.principal,
+      return { agent_id: agentId, client_id: agent.client_id as string, previous_owner: previousOwner!, owner_principal: owner.principal,
         owner_email: owner.email, expected_revision: (!input.preview && !unchanged ? (BigInt(agent.owner_revision) + 1n).toString() : agent.owner_revision) as string,
         outcome: input.preview ? 'preview' : unchanged ? 'unchanged' : 'transferred',
         token_handling: 'preserved' };

@@ -1209,8 +1209,10 @@ a daemon should perform `auth login` first to establish a session identity.
 The API is `POST /admin-api/agents/:id/transfer`, authenticated with an admin
 owner-session bearer. First send `{"to":"new-owner@example.com","preview":true}`.
 Then send the returned `owner_principal` as `to`, `previous_owner` as
-`expectedOwner`, and `expected_revision` as `expectedRevision`. A concurrent
-ownership change returns 409, even if ownership changed away and back. A
+`expectedOwner`, `expected_revision` as `expectedRevision`, and `client_id` as
+`expectedClientId`. A concurrent ownership change returns 409, even if ownership
+changed away and back. Deleting and re-registering the same agent ID also
+invalidates the preview, even when the replacement has the same owner. A
 same-owner transfer returns `outcome: "unchanged"`. Missing agents return 404;
 non-admins receive 403. The agent, compatible `clients` rows, and legacy
 `agent_policies` owner are updated in one transaction. A legacy client covering

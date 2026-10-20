@@ -1155,16 +1155,16 @@ test('legacy {add,remove,list}-caller all emit the agent-callers deprecation hin
   assert.match(out, /remove-caller.*agent callers remove/s);
 });
 
-test('agent transfer pins the preview identity and revision and emits clean JSON', async (t) => {
+test('agent transfer pins the preview identity, registration and revision and emits clean JSON', async (t) => {
   const stdout = captureStdout(t);
   const stderr = captureStderr(t);
-  const plan = { agent_id: 'foo', previous_owner: 'eth:old', owner_principal: 'google:123', expected_revision: '7' };
+  const plan = { agent_id: 'foo', previous_owner: 'eth:old', owner_principal: 'google:123', expected_revision: '7', client_id: 'registration-123' };
   const { calls } = installFetch(t, { body: plan });
   const args = { action: 'agent-transfer' as const, server: BRIDGE, token: TOKEN, agentId: 'foo', to: 'user@example.com', yes: true, json: true };
   assert.equal(await runAgentTransfer(args), 0);
   assert.equal(calls.length, 2);
   assert.deepEqual(JSON.parse(calls[0].body!), { to: 'user@example.com', preview: true });
-  assert.deepEqual(JSON.parse(calls[1].body!), { to: 'google:123', expectedOwner: 'eth:old', expectedRevision: '7' });
+  assert.deepEqual(JSON.parse(calls[1].body!), { to: 'google:123', expectedOwner: 'eth:old', expectedRevision: '7', expectedClientId: 'registration-123' });
   assert.deepEqual(JSON.parse(stdout.read()), plan);
   assert.match(stderr.read(), /Previous owner: eth:old/);
   assert.match(stderr.read(), /New owner: google:123/);

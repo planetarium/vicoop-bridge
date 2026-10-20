@@ -61,8 +61,8 @@ test('ownership transfer: identity, authorization, atomicity, concurrency and re
       sink: { pushStatus() { assert.fail('transfer must not interrupt tasks'); }, pushArtifact() {}, finish() { assert.fail('transfer must not finish tasks'); } } });
     const previewResponse = await request(admin, { to: email, preview: true });
     assert.equal(previewResponse.status, 200);
-    const preview = await previewResponse.json() as { expected_revision: string };
-    const input = { to: email, expectedOwner: old, expectedRevision: preview.expected_revision };
+    const preview = await previewResponse.json() as { expected_revision: string; client_id: string };
+    const input = { to: email, expectedOwner: old, expectedRevision: preview.expected_revision, expectedClientId: preview.client_id };
     // Force a compatibility write failure and verify the authoritative update rolls back.
     await db`ALTER TABLE clients ADD CONSTRAINT transfer_test_guard CHECK (client_name <> 'transfer-test' OR owner_principal = 'eth:0x1111111111111111111111111111111111111111')`;
     await assert.rejects(transferAgent(db, registry, admin, agentId, input));
@@ -96,7 +96,7 @@ test('ownership transfer: identity, authorization, atomicity, concurrency and re
     // Polling repairs a missed notification / stale hello snapshot as well.
     for (let i = 0; i < 120 && conn.ownerPrincipal !== google; i++) await new Promise((r) => setTimeout(r, 50));
     assert.equal(conn.ownerPrincipal, google);
-    const same = await transferAgent(db, registry, admin, agentId, { to: google, expectedOwner: google, expectedRevision: '1' });
+    const same = await transferAgent(db, registry, admin, agentId, { to: google, expectedOwner: google, expectedRevision: '1', expectedClientId: agent!.client_id });
     assert.equal(same.outcome, 'unchanged');
     // ABA still invalidates the original preview.
     await db`UPDATE agents SET owner_principal = ${old} WHERE id = ${agentId}`;
@@ -108,6 +108,56 @@ test('ownership transfer: identity, authorization, atomicity, concurrency and re
     await db`DELETE FROM clients WHERE ${agentId} = ANY(allowed_agent_ids)`;
     await db`DELETE FROM agents WHERE id = ${agentId}`;
     await db`DELETE FROM callers WHERE id = ANY(${issued})`;
+    await db.end();
+  }
+});
+
+test('transfer rejects a preview of a deleted registration even when ID, owner and revision match', { skip: !process.env.DATABASE_URL }, async () => {
+  const db = postgres(process.env.DATABASE_URL!);
+  const agentId = `transfer-recreate-${crypto.randomUUID()}`;
+  const target = `google:${Date.now()}526`;
+  const registry = new Registry();
+  let callerId: string | undefined;
+  const register = () => db.begin(async (tx) => {
+    await tx`SELECT set_config('jwt.claims.principal_id', ${admin}, true)`;
+    return (await tx`SELECT id FROM register_client(${agentId}, ARRAY[${agentId}])`)[0]!.id as string;
+  });
+  try {
+    callerId = (await issueSessionToken(db, {
+      principalId: target, provider: 'google', audience: 'owner_session',
+    })).callerId;
+    const originalId = await register();
+    const preview = await transferAgent(db, registry, admin, agentId, { to: target, preview: true });
+    assert.equal(preview.client_id, originalId);
+    const input = { to: target, expectedOwner: preview.previous_owner,
+      expectedRevision: preview.expected_revision, expectedClientId: preview.client_id };
+    await db.begin(async (tx) => {
+      await tx`SELECT set_config('jwt.claims.principal_id', ${admin}, true)`;
+      await tx`SELECT delete_client(${originalId})`;
+    });
+    const replacementId = await register();
+    assert.notEqual(replacementId, originalId);
+    const [before] = await db`SELECT owner_principal, owner_revision::text, token_hash FROM agents WHERE id = ${agentId}`;
+    assert.equal(before!.owner_principal, input.expectedOwner);
+    assert.equal(before!.owner_revision, input.expectedRevision);
+    await assert.rejects(transferAgent(db, registry, admin, agentId, input), { status: 409 });
+    // Omitting the registration guard must not bypass it.
+    await assert.rejects(transferAgent(db, registry, admin, agentId, { ...input, expectedClientId: undefined }), { status: 400 });
+    const [after] = await db`SELECT owner_principal, owner_revision::text, token_hash FROM agents WHERE id = ${agentId}`;
+    assert.deepEqual(after, before);
+    assert.equal((await db`SELECT owner_principal FROM clients WHERE id = ${replacementId}`)[0]!.owner_principal, admin);
+    // A fresh preview of the replacement still allows the intended operation.
+    const fresh = await transferAgent(db, registry, admin, agentId, { to: target, preview: true });
+    const result = await transferAgent(db, registry, admin, agentId, {
+      to: target, expectedOwner: fresh.previous_owner, expectedRevision: fresh.expected_revision,
+      expectedClientId: fresh.client_id,
+    });
+    assert.equal(result.outcome, 'transferred');
+    assert.equal(result.client_id, replacementId);
+  } finally {
+    await db`DELETE FROM agents WHERE id = ${agentId}`;
+    await db`DELETE FROM clients WHERE ${agentId} = ANY(allowed_agent_ids)`;
+    if (callerId) await db`DELETE FROM callers WHERE id = ${callerId}`;
     await db.end();
   }
 });

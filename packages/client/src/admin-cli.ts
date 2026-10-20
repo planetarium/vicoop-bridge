@@ -1189,13 +1189,13 @@ export async function runAgentTransfer(args: Extract<AgentCliArgs, { action: 'ag
   const path = `/admin-api/agents/${encodeURIComponent(args.agentId)}/transfer`;
   const preview = await callApi({ session, method: 'POST', path, body: { to: args.to, preview: true } });
   if (preview.status === 0 || preview.status >= 400) return emit(preview, args.json, String);
-  const plan = preview.body as { agent_id: string; previous_owner: string; owner_principal: string; expected_revision: string };
+  const plan = preview.body as { agent_id: string; previous_owner: string; owner_principal: string; expected_revision: string; client_id: string };
   process.stderr.write(`Agent: ${plan.agent_id}\nPrevious owner: ${plan.previous_owner}\nNew owner: ${plan.owner_principal}\n`);
   if (!args.yes && !await confirmYN('Transfer ownership?', process.stderr)) {
     process.stderr.write('aborted (use --yes for automation)\n'); return 1;
   }
   const result = await callApi({ session, method: 'POST', path, body: {
-    to: plan.owner_principal, expectedOwner: plan.previous_owner, expectedRevision: plan.expected_revision,
+    to: plan.owner_principal, expectedOwner: plan.previous_owner, expectedRevision: plan.expected_revision, expectedClientId: plan.client_id,
   } });
   return emit(result, args.json, (body) => {
     const final = body as { agent_id: string; owner_principal: string; outcome: string; session_sync: string };
