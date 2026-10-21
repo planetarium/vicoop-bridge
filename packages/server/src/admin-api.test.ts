@@ -8,6 +8,7 @@ import postgres from 'postgres';
 import type { WebSocket } from 'ws';
 import type { AgentCard } from '@vicoop-bridge/protocol';
 import { createHttpApp } from './http.js';
+import { buildCustomTools } from './admin.js';
 import { Registry, type ClientConnection } from './registry.js';
 import { issueSessionToken, verifyCallerToken, CALLER_TOKEN_PREFIX } from './auth/caller-token.js';
 import { formatFederatedPrincipal, matchPrincipal } from './auth/principal.js';
@@ -1200,3 +1201,62 @@ test(
     }
   },
 );
+
+
+test('structured admin tools enforce owner/admin scope and preserve existing callers',
+  { skip: !hasDb }, async () => {
+  const sql = postgres(process.env.DATABASE_URL!);
+  const owner = `eth:0x${'a'.repeat(40)}`;
+  const stranger = `eth:0x${'b'.repeat(40)}`;
+  const adminWallet = `0x${'c'.repeat(40)}`;
+  const previousAdmins = process.env.ADMIN_WALLET_ADDRESSES;
+  let setup: SetupResult | undefined;
+  try {
+    process.env.ADMIN_WALLET_ADDRESSES = adminWallet;
+    setup = await setupOwner(sql, owner);
+    const registry = new Registry();
+    const ownerTools = buildCustomTools(sql, registry, owner);
+    const strangerTools = buildCustomTools(sql, registry, stranger);
+    const adminTools = buildCustomTools(sql, registry, `eth:${adminWallet}`);
+    const options = { toolCallId: 'test', messages: [] };
+    const input = {
+      agent_id: setup.agentId,
+      issuer: 'did:web:connector.example',
+      method: 'urn:mentionable:auth:slack-workspace-member:v0.1',
+      subject: 'slack:T123/U456',
+    };
+    const existing = 'google:domain:example.com';
+    await ownerTools.add_caller.execute!({ agent_id: setup.agentId, principal: existing }, options);
+    const deniedAdd = await strangerTools.add_federated_caller.execute!(input, options);
+    assert.deepEqual(deniedAdd, { error: 'Agent not found or not authorized.' });
+    const invalid = await ownerTools.add_federated_caller.execute!({ ...input, issuer: 'https://invalid' }, options);
+    assert.ok(invalid && 'error' in invalid);
+    const principal = formatFederatedPrincipal(input)!;
+    for (let i = 0; i < 2; i++) {
+      const added = await ownerTools.add_federated_caller.execute!(input, options);
+      assert.ok(added && 'allowed_callers' in added);
+      assert.deepEqual(added.allowed_callers, [existing, principal]);
+    }
+    const listed = await ownerTools.list_callers.execute!({ agent_id: setup.agentId }, options);
+    assert.ok(listed && 'federated_callers' in listed);
+    assert.deepEqual(listed.federated_callers, [{
+      principal, issuer: input.issuer, method: input.method, subject: input.subject,
+    }]);
+    assert.deepEqual(await strangerTools.remove_federated_caller.execute!(input, options),
+      { error: 'Agent not found or not authorized.' });
+    const removed = await adminTools.remove_federated_caller.execute!(input, options);
+    assert.ok(removed && 'allowed_callers' in removed);
+    assert.deepEqual(removed.allowed_callers, [existing]);
+    const adminAdded = await adminTools.add_federated_caller.execute!(input, options);
+    assert.ok(adminAdded && 'allowed_callers' in adminAdded);
+    assert.deepEqual(adminAdded.allowed_callers, [existing, principal]);
+    const ownerRemoved = await ownerTools.remove_federated_caller.execute!(input, options);
+    assert.ok(ownerRemoved && 'allowed_callers' in ownerRemoved);
+    assert.deepEqual(ownerRemoved.allowed_callers, [existing]);
+  } finally {
+    if (previousAdmins === undefined) delete process.env.ADMIN_WALLET_ADDRESSES;
+    else process.env.ADMIN_WALLET_ADDRESSES = previousAdmins;
+    if (setup) await teardown(sql, owner, setup.clientId);
+    await sql.end();
+  }
+});

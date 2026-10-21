@@ -131,7 +131,7 @@ const agentCallersAddSubCmd = command(
   }),
   {
     brief: message`Add a principal to the agent's allowed-callers list.`,
-    description: message`Calls POST /admin-api/agents/<AGENT_ID>/callers. Hot-reloaded — no daemon restart needed.`,
+    description: message`Calls POST /admin-api/agents/<AGENT_ID>/callers. Hot-reloaded — no daemon restart needed. For Slack or other federated callers, use agent callers add-federated --help with structured issuer, method, and subject fields.`,
   },
 );
 
@@ -146,7 +146,7 @@ function agentCallersRemoveCommand(name: 'remove' | 'rm', alias: boolean) {
     }),
     {
       brief: message`Remove a principal from the agent's allowed-callers list. (alias: \`rm\`)`,
-      description: message`Calls DELETE /admin-api/agents/<AGENT_ID>/callers?principal=<PRINCIPAL>. Hot-reloaded.`,
+      description: message`Calls DELETE /admin-api/agents/<AGENT_ID>/callers?principal=<PRINCIPAL>. Hot-reloaded. For Slack or other federated callers, use agent callers remove-federated --help for structured fields and revocation guidance.`,
       ...(alias ? { hidden: 'help' as const } : {}),
     },
   );

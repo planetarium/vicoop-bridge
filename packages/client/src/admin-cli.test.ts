@@ -832,6 +832,11 @@ function agentHelp(args: string[]): string {
   return formatDocPage('vicoop-client', page, { colors: false });
 }
 
+test('generic caller help points Slack operators to structured federation commands', () => {
+  assert.match(agentHelp(['agent', 'callers', 'add']), /agent callers add-federated --help/);
+  assert.match(agentHelp(['agent', 'callers', 'remove']), /agent callers remove-federated --help/);
+});
+
 test('add-federated --help explains exact matching, policy transition, and a complete example', () => {
   const help = agentHelp(['agent', 'callers', 'add-federated']);
   assert.match(help, /exact \(issuer, method, subject\) tuple/);

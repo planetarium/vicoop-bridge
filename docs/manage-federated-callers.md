@@ -118,6 +118,68 @@ Plan the complete caller list before changing a production agent. Adding the
 first tuple can immediately stop callers that previously relied on public
 access.
 
+## Slack setup: obtain and verify the identifiers
+
+A `google:domain:example.com` grant authorizes verified Google callers from
+that domain. It does not authorize those people through Slack federation,
+even if their Slack email addresses match. Each Slack grant matches one exact
+Connector/workspace/user/method combination, not the whole workspace.
+
+Collect the following before Step 3:
+
+1. **Connector issuer and method:** ask the operator of the Connector serving
+   your Slack integration for its configured OAuth client/issuer `did:web`
+   and the exact authentication-method value from its deployed assertion
+   profile. Request the non-secret `iss`, `sub`, and authentication-method
+   claim values from a subject assertion for the intended Slack user and
+   workspace. Compare `iss` with the configured client DID. The receiving
+   bridge's Agent Card identifies the receiver, not the Connector issuer;
+   do not derive the issuer from the bridge URL or Slack workspace name.
+   Method names are deployment-specific: the URN in this guide is an example,
+   not a default. If the operator cannot provide these values, resolve that
+   before registering a grant. Do not share bearer tokens, signed assertions,
+   or private keys in support messages.
+2. **Slack workspace ID:** open the target workspace in a browser. In a URL
+   such as `https://app.slack.com/client/T123/C456`, the `T123` component is the
+   workspace ID. An Enterprise organization ID beginning with `E` is not a
+   substitute for the workspace ID in a workspace-scoped subject. If your URL
+   shows an organization, obtain the target workspace ID from the Connector
+   operator and verify it against that integration's Slack installation.
+   See [Slack's workspace ID instructions](https://slack.com/help/articles/221769328-Locate-your-Slack-URL-or-ID).
+3. **Slack user ID:** open the intended person's Slack profile, choose
+   **More → Copy member ID**, and retain the exact value, including case.
+   See [Slack's member ID instructions](https://slack.com/help/articles/360003827751-Create-a-link-to-a-members-profile).
+   Confirm it is the person being authorized, not the integration's bot user.
+4. **Canonical subject:** for a Connector using the `slack:WORKSPACE/USER`
+   contract, combine the verified workspace and member IDs, then compare the
+   result byte-for-byte with the Connector's assertion `sub`. Confirm this
+   mapping with the Connector operator for Enterprise or shared-channel
+   integrations; do not substitute an organization ID, channel ID, email,
+   or display name.
+
+If the Connector operator uses Slack's
+[`auth.test`](https://docs.slack.dev/reference/methods/auth.test/) to check an
+installation, `team_id` and `user_id` identify the token's workspace and user.
+A bot token's user is not the human caller; it must not be used as that
+person's member ID.
+
+For example, **only if your deployment confirms these exact values**:
+
+```bash
+ISSUER=did:web:connector.example
+METHOD=urn:mentionable:auth:slack-workspace-member:v0.1
+SLACK_WORKSPACE_ID=T123
+SLACK_USER_ID=U456
+SUBJECT="slack:$SLACK_WORKSPACE_ID/$SLACK_USER_ID"
+```
+
+Use the [owner session from Step 1](#1-sign-in-as-the-agent-owner) and inspect
+existing callers as in Step 2. Add the tuple with Step 3, then use Step 4 to
+compare the decoded tuple and check the Agent Card. Finally, make a test call
+through the actual Slack integration as that user in that workspace; a listed
+tuple alone does not verify the Connector's token exchange. If it fails,
+compare all three assertion fields with the saved tuple before changing policy.
+
 ## 3. Add one exact federated caller
 
 Use values copied from the Connector's configuration or assertion contract:
