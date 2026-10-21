@@ -2,6 +2,7 @@ import { constants } from 'node:fs';
 import { lstat, open, readdir } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
+import { scopeDigest } from './caller-runtime-store.js';
 import type { DockerCallerRuntimePool } from './caller-runtime-docker.js';
 
 export interface SetupEntry { path: string; data?: string; executable?: boolean }
@@ -83,15 +84,16 @@ export async function setupCallerEnvironment(
   if (!args.version || args.version.length > 128) throw new Error('setup version must contain 1–128 characters');
   if (args.pending ? args.from !== undefined || args.replace : !args.from)
     throw new Error('select --pending or --from DIRECTORY (optionally --replace)');
-  const entries = args.from ? await readSetupDirectory(args.from) : undefined;
-  const container = await pool.prepare(args.principalId);
-  const previous = await pool.store.preparation(container.id);
+  const id = scopeDigest(pool.store.agentId, args.principalId);
+  const previous = await pool.store.preparation(id);
   if (!args.pending && previous?.ready && previous.version === args.version)
-    return { id: container.id, ...previous, unchanged: true };
-  await pool.store.setPreparation(container.id, args.version, false);
-  if (args.pending) return { id: container.id, version: args.version, ready: false };
+    return { id, ...previous, unchanged: true };
+  await pool.store.setPrincipalPreparation(args.principalId, args.version);
+  if (args.pending) return { id, version: args.version, ready: false };
   try {
-    const result = await run(['exec', '-i', '--user', '1000:1000', container.name, 'node', '-e', SETUP_SCRIPT, '/workspace'], {
+    const entries = await readSetupDirectory(args.from!);
+    const container = await pool.prepare(args.principalId);
+    const result = await run(['exec', '-i', '--user', '1000:1000', '-e', 'NODE_OPTIONS=', '-e', 'NODE_PATH=', '-e', 'LD_PRELOAD=', '-e', 'LD_LIBRARY_PATH=', container.name, '/usr/local/bin/node', '-e', SETUP_SCRIPT, '/workspace'], {
       timeoutMs: 120000,
       input: Buffer.from(JSON.stringify({ entries, replace: args.replace ?? false })),
     });

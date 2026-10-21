@@ -6,7 +6,7 @@ import {
 } from './caller-scoped-backend.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { scopeDigest } from './caller-runtime-store.js';
-import { CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageMissingError, CallerStorageLimitError, type DockerCallerRuntimePool } from './caller-runtime-docker.js';
+import { CallerEnvironmentPendingError, CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageMissingError, CallerStorageLimitError, type DockerCallerRuntimePool } from './caller-runtime-docker.js';
 import type { Backend } from './backend.js';
 import { TRACEABILITY_EXTENSION_URI, type TaskAssignFrame, type UpFrame } from '@vicoop-bridge/protocol';
 
@@ -585,5 +585,18 @@ test('unconfirmed storage helper cleanup quarantines caller even if workload sto
   assert.match(JSON.stringify(await f.run()), /runtime_quarantined/);
   assert.equal(acquisitions, 1);
   assert.equal(f.stops.length, 1);
+  await f.backend.close();
+});
+
+
+test('pending setup reports an actionable error without creating a worker or quarantining the scope', async () => {
+  const f = fixture();
+  const acquire = f.pool.acquire.bind(f.pool);
+  f.pool.acquire = async () => { throw new CallerEnvironmentPendingError(); };
+  assert.match(JSON.stringify(await f.run()), /runtime_setup_pending/);
+  assert.equal(f.workers.length, 0);
+  assert.equal(f.stops.length, 0);
+  f.pool.acquire = acquire;
+  assert.equal((await f.run()).at(-1)?.type, 'task.complete');
   await f.backend.close();
 });

@@ -348,3 +348,15 @@ test('preparation state persists across reopen and is deleted with scope', async
   await f.store.forget(f.id);
   assert.equal(await f.store.preparation(f.id), undefined);
 });
+
+test('unallocated pending preparation is visible and explicitly cancellable', async t => {
+  const f = await fixture(t);
+  await f.store.lock();
+  await f.store.setPrincipalPreparation('alice', 'v1');
+  assert.deepEqual(await f.store.preparations(), [{ id: f.id, version: 'v1', ready: false }]);
+  await f.store.cancelUnallocatedPreparation(f.id);
+  assert.deepEqual(await f.store.preparations(), []);
+  await f.store.setPrincipalPreparation('alice', 'v1');
+  await f.store.reserve(f.id, 'claude', 'alice');
+  await assert.rejects(f.store.cancelUnallocatedPreparation(f.id), /allocated scope/);
+});

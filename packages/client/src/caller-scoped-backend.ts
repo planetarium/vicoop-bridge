@@ -12,7 +12,7 @@ import type {
   DockerCallerRuntimePool,
   CallerContainer,
 } from './caller-runtime-docker.js';
-import { CallerReservationUnconfirmedError, CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageLimitError, CallerStorageMissingError } from './caller-runtime-docker.js';
+import { CallerEnvironmentPendingError, CallerReservationUnconfirmedError, CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageLimitError, CallerStorageMissingError } from './caller-runtime-docker.js';
 import { scopeDigest } from './caller-runtime-store.js';
 import { createHash } from 'node:crypto';
 export interface CallerWorker {
@@ -324,6 +324,10 @@ export class CallerScopedBackend implements Backend {
         entry.worker = undefined;
         entry.contexts.clear();
         entry.recovered = true;
+      }
+      if (error instanceof CallerEnvironmentPendingError) {
+        this.fail(task, emit, 'runtime_setup_pending', 'Your environment is awaiting setup. Ask the operator to complete container setup before retrying.');
+        return;
       }
       if (error instanceof CallerStorageHelperUnconfirmedError) {
         entry.quarantined = true;

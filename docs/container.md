@@ -290,7 +290,7 @@ lock as task execution. Use the exact verified principal ID shown by
 `container list`, not a display name or email guessed from it.
 
 ```sh
-# Optional: reserve the environment and block model tasks until setup succeeds.
+# Optional: block model tasks before any container allocation or setup.
 vicoop-client container setup --principal 'PRINCIPAL_ID' --version initial --pending
 # Copy a directory containing repositories, scripts, and task credentials.
 vicoop-client container setup --principal 'PRINCIPAL_ID' --version initial --from ./alice-workspace
@@ -305,10 +305,11 @@ at most 10,000 entries and 16 MiB total file bytes. Large repositories should be
 prepared as an image or fetched separately; setup is intentionally a bounded file
 transfer interface, not a package installer or arbitrary hook runner. Files are
 owned by runtime UID 1000, mode 0600 (0700 for executables); new directories are
-0700. Existing destination symlinks and incompatible file types are rejected.
+0700. The runtime image must provide a workspace writable by UID 1000 (as the
+bundled image does). Existing destination symlinks and incompatible file types are rejected.
 
-The first setup attempt records a host-owned pending state before any workspace
-writes. A failed or interrupted copy leaves tasks blocked; inspect partial changes
+The first setup attempt records a host-owned pending state before reading source
+files or allocating a container. `--pending` needs no container or image allocation. A failed or interrupted copy leaves tasks blocked; inspect partial changes
 and retry with `--replace` if necessary. Individual files are replaced atomically,
 but a whole tree update is not a transaction. A successful version is not applied
 again, even if the source changes: use a new version for updates. `--pending`
@@ -326,3 +327,8 @@ are not exported as environment variables automatically: configure your scripts
 to read the intended files. Removing a file does not revoke a copied credential;
 revoke it at the issuing service. Home/tmpfs state, system packages, Claude
 settings/MCP loading, and network permissions are unchanged by workspace setup.
+
+`container list` includes preparation records even before a scope is allocated.
+`container inspect --principal ID` shows such pending records; `container remove
+SCOPE` can cancel an unallocated pending record (for example, after a mistyped ID).
+For allocated scopes, removal retains its existing destructive meaning.

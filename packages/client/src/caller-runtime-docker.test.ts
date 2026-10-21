@@ -493,3 +493,20 @@ test('preparation requires validated offline ownership and enforces maxScopes be
   assert.equal(await pool.store.findPrincipal('alice'), undefined);
   await pool.close();
 });
+
+test('pending setup blocks acquisition before first allocation and survives reservation rollback', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'caller-pending-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const options = CallerRuntimeConfig.parse({ image: `sha256:${'a'.repeat(64)}`, stateDirectory: directory });
+  let mutations = 0;
+  const pool = new DockerCallerRuntimePool('claude', options, 'agent', async () => { mutations++; throw Error('Docker must not run'); });
+  await pool.store.lock();
+  const id = await pool.store.setPrincipalPreparation('alice', 'v1');
+  assert.deepEqual(await pool.store.scopes(), []);
+  await assert.rejects(pool.acquire(id, undefined, 'alice'), /setup is pending/);
+  assert.equal(mutations, 0);
+  await pool.store.reserve(id, 'claude', 'alice');
+  await pool.store.forget(id, true);
+  assert.deepEqual(await pool.store.preparation(id), { version: 'v1', ready: false });
+  await pool.store.unlock();
+});

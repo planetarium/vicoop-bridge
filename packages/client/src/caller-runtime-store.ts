@@ -415,27 +415,49 @@ export class CallerRuntimeStore {
   async clearStorageHelper(id: string): Promise<void> {
     this.db().prepare('DELETE FROM storage_helpers WHERE id = ?').run(id);
   }
+  async preparations(): Promise<Array<{ id: string; version: string; ready: boolean }>> {
+    const rows = this.db().prepare('SELECT id FROM preparations ORDER BY id').all();
+    return Promise.all(rows.map(async row => {
+      const { id } = z.object({ id: z.string().regex(/^[a-f0-9]{64}$/) }).parse(row);
+      return { id, ...(await this.preparation(id))! };
+    }));
+  }
+  async cancelUnallocatedPreparation(id: string): Promise<void> {
+    if (this.db().prepare('SELECT id FROM scopes WHERE id = ?').get(id)) throw new Error('allocated scope requires container remove');
+    if (!(await this.preparation(id))) throw new Error('unknown caller preparation');
+    this.db().prepare('DELETE FROM preparations WHERE id = ?').run(id);
+  }
   async preparation(id: string): Promise<{ version: string; ready: boolean } | undefined> {
     const row = this.db().prepare('SELECT version, ready FROM preparations WHERE id = ?').get(id);
     if (!row) return undefined;
     const value = z.object({ version: z.string().min(1).max(128), ready: z.union([z.literal(0), z.literal(1)]) }).parse(row);
     return { version: value.version, ready: value.ready === 1 };
   }
+  async setPrincipalPreparation(principalId: string, version: string): Promise<string> {
+    if (!principalId.trim() || principalId.length > 512) throw new Error('invalid principal ID');
+    const id = scopeDigest(this.agentId, principalId);
+    await this.writePreparation(id, version, false);
+    return id;
+  }
   async setPreparation(id: string, version: string, ready: boolean): Promise<void> {
-    z.string().min(1).max(128).parse(version);
     this.validateRecord(this.db().prepare('SELECT * FROM scopes WHERE id = ?').get(id), id);
+    await this.writePreparation(id, version, ready);
+  }
+  private async writePreparation(id: string, version: string, ready: boolean): Promise<void> {
+    z.string().min(1).max(128).parse(version);
+    this.db();
     this.manifestVersion = 6;
     // Older binaries must not bypass the readiness gate on restart.
     await this.atomicWrite(join(this.directory, 'manifest.json'), { version: 6, agentId: this.agentId, host: hostname() });
     this.db().prepare('INSERT INTO preparations (id, version, ready) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET version = excluded.version, ready = excluded.ready').run(id, version, ready ? 1 : 0);
   }
-  async forget(id: string): Promise<void> {
+  async forget(id: string, preservePreparation = false): Promise<void> {
     if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('invalid scope ID');
     if (await this.storageHelper(id)) throw new Error('storage helper termination must be confirmed before forgetting scope');
     const db = this.db();
     db.exec('BEGIN IMMEDIATE');
     try {
-      db.prepare('DELETE FROM preparations WHERE id = ?').run(id);
+      if (!preservePreparation) db.prepare('DELETE FROM preparations WHERE id = ?').run(id);
       db.prepare('DELETE FROM fixed_storage WHERE id = ?').run(id);
       db.prepare('DELETE FROM completed_allocations WHERE id = ?').run(id);
       db.prepare('DELETE FROM pending_reservations WHERE id = ?').run(id);

@@ -39,6 +39,8 @@ test('pending and failed setup gate persist; retry only publishes ready after co
   const pool = {
     prepare: async () => ({ id: 'scope', name: 'container' }),
     store: {
+      agentId: 'agent',
+      setPrincipalPreparation: async (_principal: string, version: string) => { events.push('pending'); state = { version, ready: false }; },
       preparation: async () => state,
       setPreparation: async (_id: string, version: string, ready: boolean) => { events.push(ready ? 'ready' : 'pending'); state = { version, ready }; },
     },
