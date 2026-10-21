@@ -167,6 +167,7 @@ test('reinitialization preserves paths/limits, reuses image and supports the oth
   });
   const config = await f.read();
   config.backends.claude.caller_runtime.maxScopes = 3;
+  config.backends.claude.caller_runtime.sharedVolumes = [{ name: 'docs', volume: 'company-docs-v1' }];
   await writeFile(f.path, JSON.stringify(config));
   f.calls.length = 0;
   await runCallerContainerInit(f.options);
@@ -175,6 +176,7 @@ test('reinitialization preserves paths/limits, reuses image and supports the oth
     false,
   );
   assert.equal((await f.read()).backends.claude.caller_runtime.maxScopes, 3);
+  assert.deepEqual((await f.read()).backends.claude.caller_runtime.sharedVolumes, [{ name: 'docs', volume: 'company-docs-v1' }]);
   const existing = (await f.read()).backends.claude;
   await runCallerContainerInit({ ...f.options, kind: 'codex', image });
   assert.deepEqual((await f.read()).backends.claude, existing);

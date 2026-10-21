@@ -10,6 +10,14 @@ export const CallerRuntimeConfig = z
         'caller image must be pinned by digest',
       ),
     stateDirectory: z.string().min(1).refine(isAbsolute, 'stateDirectory must be an absolute path; for existing state, use its original absolute location'),
+    // Operator-owned plain Docker volumes, shared by all callers of this agent.
+    sharedVolumes: z.array(z.object({
+      name: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/),
+      volume: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/)
+        .refine(name => !name.startsWith('vb-') && !name.startsWith('vicoop-'), 'bridge-managed volumes cannot be shared'),
+    }).strict()).max(16).default([])
+      .refine(entries => new Set(entries.map(entry => entry.name)).size === entries.length, 'shared volume names must be unique')
+      .refine(entries => new Set(entries.map(entry => entry.volume)).size === entries.length, 'shared volumes must be unique'),
     maxScopes: z.number().int().min(1).max(32).default(8),
     queueLimit: z.number().int().min(0).max(128).default(16),
     maxContexts: z.number().int().min(1).max(4096).default(256),
