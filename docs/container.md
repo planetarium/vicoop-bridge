@@ -270,3 +270,14 @@ volume. `/home/node` and `/tmp` are temporary, and the image root filesystem is
 read-only. Runtime-wide image, network, and backend settings still apply to all
 callers. Existing `container recreate SCOPE` retains files; `container remove
 SCOPE` deletes them and their identity record.
+
+The opt-in Docker integration test exercises preparation, writes to workspace and
+session storage as UID 1000, repeats preparation, then verifies daemon reuse and
+cleanup with the fixed ext4 storage used by `container init`:
+
+```bash
+VICOOP_FIXED_STORAGE_TEST=1 pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-storage-init.integration.test.ts
+```
+
+It builds disposable fixture/helper images and uses a unique storage pool; no
+provider calls or credentials are required.

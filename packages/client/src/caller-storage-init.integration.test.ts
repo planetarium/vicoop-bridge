@@ -11,7 +11,7 @@ import { runDockerCommand } from './docker-command.js';
 import { createLogger } from './logger.js';
 
 // Actual Docker builds/probes and retained files; fixtures make no provider calls.
-test('init provisions shared fixed storage, concurrent backends agree, and reinit preserves caller data', {
+test('init and offline preparation provision fixed storage, preserve caller data, and support daemon reuse', {
   skip: process.env.VICOOP_FIXED_STORAGE_TEST !== '1', timeout: 600_000,
 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'storage-init-integration-'));
@@ -55,12 +55,24 @@ USER node
     assert.deepEqual(runtime.fixedImageStorage, other.backends.codex.caller_runtime.fixedImageStorage);
     assert.match(runtime.fixedImageStorage.image, /^sha256:[a-f0-9]{64}$/);
     pool = new DockerCallerRuntimePool('claude', runtime, config.agent_id);
-    await pool.initialize();
+    await pool.initialize(false, true);
     const id = scopeDigest(config.agent_id, 'alice');
-    await pool.acquire(id, undefined, 'alice');
+    const prepared = await pool.prepare('alice');
+    assert.equal(prepared.id, id);
+    assert.equal((await pool.store.findPrincipal('alice'))?.id, id);
+    assert.equal(await pool.store.allocationComplete(id), true);
     const identity = await pool.store.fixedStorage(id);
     await command(['exec', '--user', '1000:1000', pool.name(id), 'node', '-e',
       "const fs=require('fs');fs.writeFileSync('/workspace/retained','workspace');fs.writeFileSync('/data/sessions/claude/config/retained','session')"]);
+    await pool.close(); pool = undefined;
+    // Preparing an existing principal must retain its identity and both files.
+    pool = new DockerCallerRuntimePool('claude', runtime, config.agent_id);
+    await pool.initialize(false, true);
+    assert.equal((await pool.describe(id)).state, 'stopped');
+    await pool.prepare('alice');
+    assert.equal(await pool.store.fixedStorage(id), identity);
+    assert.equal(await command(['exec', '--user', '1000:1000', pool.name(id), 'node', '-e',
+      "const fs=require('fs');console.log(fs.readFileSync('/workspace/retained','utf8')+':'+fs.readFileSync('/data/sessions/claude/config/retained','utf8'))"]), 'workspace:session');
     await pool.close(); pool = undefined;
     await runCallerContainerInit({ ...options, kind: 'claude', configPath: paths[0] });
     assert.deepEqual(JSON.parse(await readFile(paths[0], 'utf8')), config);
