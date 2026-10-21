@@ -21,9 +21,18 @@ function commonOptions() {
 const scope = () => argument(string({ metavar: 'SCOPE' }), {
   description: message`Scope digest from container list.`,
 });
+const principal = () => option('--principal', string({ metavar: 'ID' }), {
+  description: message`Exact verified principal ID (not an email alias or display name).`,
+});
 export const callerContainerCommands = longestMatch(
   command('list', object(commonOptions()), {
     brief: message`List retained caller scopes as JSON (daemon must be stopped).`,
+  }),
+  command('inspect', object({ ...commonOptions(), inspectPrincipal: principal() }), {
+    brief: message`Look up a retained environment by exact principal ID (daemon must be stopped).`,
+  }),
+  command('prepare', object({ ...commonOptions(), preparePrincipal: principal() }), {
+    brief: message`Create a user's environment before their first request, retaining existing files (daemon must be stopped).`,
   }),
   command('validate', object({ ...commonOptions(), validate: constant(true) }), {
     brief: message`Validate the configured image and retained container limits without starting workloads (daemon must be stopped).`,
@@ -54,9 +63,15 @@ export async function runCallerState(args: {
   config?: string;
   backend?: 'claude' | 'codex';
   validate?: boolean;
+  inspectPrincipal?: string;
+  preparePrincipal?: string;
   deleteScope?: string;
   recreateScope?: string;
 }) {
+  for (const value of [args.inspectPrincipal, args.preparePrincipal])
+    if (value !== undefined && (!value.trim() || value.length > 512)) throw new Error('principal ID must contain 1 to 512 characters');
+  if ([args.inspectPrincipal, args.preparePrincipal, args.deleteScope, args.recreateScope].filter((v) => v !== undefined).length > 1)
+    throw new Error('select either one principal operation, deletion or recreation');
   for (const value of [args.deleteScope, args.recreateScope])
     if (value !== undefined && !/^[a-f0-9]{64}$/.test(value))
       throw new Error('scope must be a non-empty 64-character lowercase hexadecimal digest');
@@ -71,13 +86,17 @@ export async function runCallerState(args: {
     config.backends?.[kind]?.caller_runtime,
   );
   const pool = new DockerCallerRuntimePool(kind, options, config.agent_id);
-  const ids = await pool.initialize(false, args.validate ?? false);
+  const ids = await pool.initialize(false, (args.validate ?? false) || args.preparePrincipal !== undefined);
   try {
+    if (args.preparePrincipal !== undefined) await pool.prepare(args.preparePrincipal);
+    const selected = args.inspectPrincipal === undefined ? undefined : await pool.store.findPrincipal(args.inspectPrincipal);
+    if (args.inspectPrincipal !== undefined && !selected) throw new Error('unknown principal; legacy scopes without an observed identity cannot be looked up by principal');
     const target = args.deleteScope ?? args.recreateScope;
     if (target !== undefined) {
       if (!ids.includes(target)) throw new Error('unknown caller scope');
       await pool.remove(target, args.deleteScope !== undefined);
     }
+    if (args.preparePrincipal !== undefined) await pool.stop((await pool.store.findPrincipal(args.preparePrincipal))!.id);
     console.log(
       JSON.stringify(
         {
@@ -85,10 +104,10 @@ export async function runCallerState(args: {
           backend: kind,
           ...(args.validate ? { validated: true } : {}),
           namespace: pool.store.namespace,
-          scopes: (await pool.store.scopes()).map((id) => ({
-            id,
-            container: pool.name(id),
-          })),
+          scopes: await Promise.all((selected ? [selected] : await pool.store.records()).map(async (record) => ({
+            ...record,
+            ...await pool.describe(record.id),
+          }))),
         },
         null,
         2,

@@ -61,3 +61,19 @@ test('empty and malformed scope selectors fail before config or Docker access', 
   }
   await assert.rejects(runCallerState({ config: '/nonexistent-config', deleteScope: 'a'.repeat(64), recreateScope: 'b'.repeat(64) }), /select either/);
 });
+
+test('principal administration requires an exact nonempty selector', async () => {
+  for (const verb of ['inspect', 'prepare']) {
+    assert.equal(parse(containerCmd, ['container', verb]).success, false);
+    const parsed = parse(containerCmd, ['container', verb, '--principal', 'google:subject-123']);
+    assert.ok(parsed.success);
+    if (parsed.value.action === 'caller-state') {
+      assert.equal(verb === 'inspect' ? 'inspectPrincipal' in parsed.value && parsed.value.inspectPrincipal : 'preparePrincipal' in parsed.value && parsed.value.preparePrincipal, 'google:subject-123');
+    }
+  }
+  for (const value of ['', '  ']) {
+    await assert.rejects(runCallerState({ config: '/nonexistent', inspectPrincipal: value }), /principal ID/);
+    await assert.rejects(runCallerState({ config: '/nonexistent', preparePrincipal: value }), /principal ID/);
+  }
+  await assert.rejects(runCallerState({ config: '/nonexistent', inspectPrincipal: 'alice', preparePrincipal: 'bob' }), /select either/);
+});

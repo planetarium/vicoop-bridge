@@ -1,7 +1,7 @@
 import { CallerStorage, CallerStorageHelperUnconfirmedError } from './caller-storage.js';
 import { randomUUID } from 'node:crypto';
 import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
-import { CallerRuntimeStore } from './caller-runtime-store.js';
+import { CallerRuntimeStore, scopeDigest } from './caller-runtime-store.js';
 import { brokerFirewallScript } from './execution-runtime-boundary.js';
 import { PROVIDER_ENV_PATTERN } from './provider-environment.js';
 import type { CallerRuntimeOptions } from './caller-runtime-config.js';
@@ -330,7 +330,46 @@ export class DockerCallerRuntimePool {
       throw new Error('caller volume ownership or storage boundary mismatch');
     return true;
   }
+  async describe(id: string) {
+    if (!this.locked) throw new Error('caller pool is not initialized');
+    if (!(await this.store.scopes()).includes(id)) throw new Error('unknown caller scope');
+    const name = this.name(id);
+    const info = await this.inspect(name);
+    if (info) await this.validate(info, id);
+    return {
+      container: name,
+      state: info ? (info.State.Running ? 'running' : 'stopped') : 'absent',
+      workspace: { volume: `${name}-${this.options.fixedImageStorage ? 'storage' : 'workspace'}`, path: '/workspace', ...(this.options.fixedImageStorage ? { subpath: 'workspace' } : {}) },
+      sessions: { volume: `${name}-${this.options.fixedImageStorage ? 'storage' : 'sessions'}`, path: `/data/sessions/${this.kind}`, ...(this.options.fixedImageStorage ? { subpath: 'sessions' } : {}) },
+    };
+  }
+  /** Prepare a caller under the same exclusive owner lock as the daemon.
+   * initialize(false, true) first validates that retained containers are stopped.
+   * One preparation per pool instance; close() must be called even after failure
+   * to stop any started resources.
+   */
+  async prepare(principalId: string, signal?: AbortSignal): Promise<CallerContainer> {
+    if (!principalId.trim() || principalId.length > 512) throw new Error('principal ID must contain 1 to 512 characters');
+    if (!this.locked || !this.offline || !this.validateExecution)
+      throw new Error('preparation requires validated offline initialization');
+    const id = scopeDigest(this.store.agentId, principalId);
+    const ids = await this.store.scopes();
+    if (!ids.includes(id) && ids.length >= this.options.maxScopes)
+      throw new Error('caller scopes exceed maxScopes');
+    // From here cleanup owns newly started containers, including failed starts.
+    this.offline = false;
+    return this.acquireContainer(id, signal, principalId);
+  }
   async acquire(
+    id: string,
+    signal?: AbortSignal,
+    principalId?: string,
+    onReserved?: () => void,
+    onMutation?: () => void,
+  ): Promise<CallerContainer> {
+    return this.acquireContainer(id, signal, principalId, onReserved, onMutation);
+  }
+  private async acquireContainer(
     id: string,
     signal?: AbortSignal,
     principalId?: string,

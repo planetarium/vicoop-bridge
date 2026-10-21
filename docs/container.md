@@ -235,3 +235,38 @@ shutdown succeeded. Give Claude and Codex separate `stateDirectory` paths:
 
 For default fixed caller filesystem limits, automatic pool setup, and the reservation boundary on
 Docker Desktop/Colima, see [fixed caller storage](caller-fixed-storage.md).
+
+## Prepare a user's environment before their first request
+
+Caller environments are selected by the exact verified principal ID and the
+configured agent ID. Operators can inspect or precreate that environment without
+adding a role or permission profile:
+
+```bash
+vicoop-client stop
+vicoop-client container list --config /path/to/config.json
+vicoop-client container inspect --principal 'EXACT_PRINCIPAL_ID' --config /path/to/config.json
+vicoop-client container prepare --principal 'EXACT_PRINCIPAL_ID' --config /path/to/config.json
+```
+
+These commands require the daemon and managed containers to be stopped and hold
+its exclusive state owner lock. `list` includes each scope's `principalId` (null
+for legacy records whose identity has not been observed). `inspect` selects an
+existing identity; it neither guesses email aliases nor binds unknown legacy
+records. Obtain the exact authenticated principal ID from the caller identity;
+preparing an environment does not grant access or change `allowed_callers`.
+
+`prepare` validates the configured image and isolation settings, allocates the
+same workspace/session volumes and container the caller's first request would
+use, then stops the container. Repeating it preserves existing files. It enforces
+`maxScopes` and refuses missing or mismatched retained storage rather than silently
+resetting a user. It starts no coding-agent process and supplies no provider
+credential. A failed allocation can require explicit inspection/removal before a
+retry, just like a failed first request.
+
+Preparation here creates the environment only; it does not install scripts or
+credentials. Persistent user files belong in `/workspace` or the backend session
+volume. `/home/node` and `/tmp` are temporary, and the image root filesystem is
+read-only. Runtime-wide image, network, and backend settings still apply to all
+callers. Existing `container recreate SCOPE` retains files; `container remove
+SCOPE` deletes them and their identity record.

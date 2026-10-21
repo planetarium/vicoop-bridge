@@ -314,3 +314,19 @@ test('reservation preflight evidence is durable and cleared only on confirmation
   await f.store.forget(f.id);
   assert.equal(await f.store.reservationPending(f.id), false);
 });
+
+test('principal lookup exposes exact identities without adopting legacy records', async (t) => {
+  const f = await fixture(t);
+  await assert.rejects(f.store.records(), /exclusive ownership/);
+  await f.store.lock();
+  await f.store.reserve(f.id, 'claude');
+  assert.equal(await f.store.findPrincipal('alice'), undefined);
+  assert.equal((await f.store.records())[0].principalId, null);
+  await f.store.reserve(f.id, 'claude', 'alice');
+  assert.equal((await f.store.findPrincipal('alice'))?.id, f.id);
+  assert.equal(await f.store.findPrincipal('Alice'), undefined);
+  assert.equal(await f.store.findPrincipal('bob'), undefined);
+  await assert.rejects(f.store.findPrincipal(''), /principal ID/);
+  await f.store.forget(f.id);
+  assert.equal(await f.store.findPrincipal('alice'), undefined);
+});
