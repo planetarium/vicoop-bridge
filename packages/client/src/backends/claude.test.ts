@@ -6641,3 +6641,24 @@ test('narrated tool call: a tool-less turn that names no tool is left alone', as
 
   assert.equal(fake.argvs.length, 1, 'a legitimate final answer must not be retried');
 });
+
+
+test('container-selected deny rules reach Claude argv alongside bypass and source restrictions', async () => {
+  const { selectClaudeCallerSettings } = await import('../claude-auth-broker.js');
+  const fake = scriptedSpawn({ lines: [JSON.stringify({ type: 'result', result: 'ok' })], exitCode: 0 });
+  const deny = ['Read(./secret.txt)', 'Read(**/secret.txt)', 'Bash(cat:*)'];
+  const settings = selectClaudeCallerSettings({ permissions: { deny } });
+  const extraArgs = ['--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--setting-sources', '', '--dangerously-skip-permissions'];
+  const backend = createClaudeBackend({ spawn: fake.spawn, cwd: '/workspace', settings, extraArgs });
+  await backend.handle(assign('hi'), collect().emit, NEVER);
+  const child = fake.lastChild();
+  assert.ok(child);
+  const settingsIndex = child.args.indexOf('--settings');
+  assert.ok(settingsIndex >= 0);
+  assert.deepEqual(JSON.parse(String(child.args[settingsIndex + 1])).permissions, { deny });
+  assert.equal(child.cwd, '/workspace');
+  assert.equal(child.args[child.args.indexOf('--setting-sources') + 1], '');
+  assert.equal(child.args[child.args.indexOf('--mcp-config') + 1], '{"mcpServers":{}}');
+  assert.ok(child.args.includes('--strict-mcp-config'));
+  assert.ok(child.args.includes('--dangerously-skip-permissions'));
+});

@@ -32,8 +32,10 @@ process.stdin.on('error', () => shutdown(1));
 process.stdout.on('error', () => shutdown(1));
 process.on('SIGTERM', () => shutdown(1));
 process.on('SIGINT', () => shutdown(1));
+// Preserve multi-byte settings/path characters across arbitrary pipe chunks.
+process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => {
-  pending += chunk.toString('utf8');
+  pending += chunk;
   let end;
   while ((end = pending.indexOf('\n')) !== -1) {
     if (end > 256 * 1024) return shutdown(1);

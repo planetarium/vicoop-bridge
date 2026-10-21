@@ -183,3 +183,59 @@ test('synchronous Docker spawn failure revokes the execution broker', async () =
     assert.equal(revoked, true);
   } finally { broker?.revoke(); adapter.close(); }
 });
+
+
+for (const character of ['한', '🔒']) {
+  for (let split = 1; split < Buffer.byteLength(character); split++) {
+    test(`relay preserves ${character} split after UTF-8 byte ${split}`, { timeout: 5000 }, async t => {
+      const { EXECUTION_BROKER_RELAY } = await import('./execution-broker-relay.js');
+      // IPC acknowledges the first actual pipe read so the second write cannot
+      // coalesce with it. The production relay itself handles both chunks.
+      const relay = spawn(process.execPath, ['-e', EXECUTION_BROKER_RELAY +
+        "\nprocess.stdin.on('data', () => process.send('read'));"],
+        { stdio: ['pipe', 'pipe', 'pipe', 'ipc'] });
+      t.after(() => { if (relay.exitCode === null) relay.kill('SIGKILL'); });
+      let output = '';
+      relay.stdout!.setEncoding('utf8').on('data', chunk => { output += chunk; });
+      relay.stderr!.resume();
+      const closed = once(relay, 'close');
+      const settings = JSON.stringify({ permissions: { deny: [`Read(./${character}-secret.txt)`] } });
+      const frame = Buffer.from(JSON.stringify({ t: 'start', backend: 'claude',
+        command: process.execPath, args: ['-e', 'process.stdout.write(process.argv[1])', settings],
+        token: 'synthetic', env: {} }) + '\n');
+      const boundary = frame.indexOf(Buffer.from(character)) + split;
+      const read = once(relay, 'message');
+      relay.stdin!.write(frame.subarray(0, boundary));
+      await read;
+      relay.stdin!.write(frame.subarray(boundary));
+      const [code] = await closed;
+      assert.equal(code, 0);
+      const received = output.trim().split('\n').map(line => JSON.parse(line))
+        .filter(frame => frame.t === 'stdout').map(frame => Buffer.from(frame.data, 'base64'));
+      assert.equal(Buffer.concat(received).toString('utf8'), settings);
+    });
+  }
+}
+
+test('broker preserves a large accepted Unicode deny list through the real relay', { timeout: 5000 }, async () => {
+  const { createHash } = await import('node:crypto');
+  const { selectClaudeCallerSettings } = await import('./claude-auth-broker.js');
+  const settings = JSON.stringify(selectClaudeCallerSettings({ permissions: { deny:
+    Array.from({ length: 32 }, (_, i) => `Read(./${i}/${Array(14).fill('한'.repeat(70)).join('/')}/secret.txt)`),
+  } }));
+  assert.ok(Buffer.byteLength(settings) < 96 * 1024);
+  const expected = createHash('sha256').update(settings).digest('hex');
+  const adapter = createClaudeBrokerSpawn('fixture', { spawnImpl: localSpawn,
+    credential: () => ({ kind: 'oauth', secret: 'synthetic' }) });
+  try {
+    const child = adapter.spawn(process.execPath, ['-e',
+      "process.stdout.write(require('node:crypto').createHash('sha256').update(process.argv[1]).digest('hex'))", settings], {});
+    let output = '';
+    child.stdout!.on('data', chunk => { output += chunk; });
+    child.stderr!.resume();
+    const closed = new Promise<number | null>(resolve => child.on('close', resolve));
+    child.stdin!.end();
+    assert.equal(await closed, 0);
+    assert.equal(output, expected);
+  } finally { adapter.close(); }
+});
