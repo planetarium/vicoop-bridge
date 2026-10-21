@@ -1735,25 +1735,20 @@ export function createClaudeBackend(
     }
     extraArgsWithoutInlineAppend.push(arg);
   }
-  // Sandbox-on by default. Operators get the OS-level sandbox (Seatbelt on
-  // macOS, bubblewrap on Linux) without having to opt in via
-  // `CLAUDE_SETTINGS_JSON`, and `failIfUnavailable: true` makes the daemon
-  // exit at startup on a host where the sandbox can't be enabled — failing
-  // open here would silently run unsandboxed, which the agent's filesystem
-  // and shell access make actively unsafe. An operator who explicitly passes
-  // `settings` (via env or config.json) overrides this default entirely; to
-  // turn the sandbox off they pass `{ "sandbox": { "enabled": false } }`.
-  const DEFAULT_SETTINGS: Record<string, unknown> = {
-    sandbox: { enabled: true, failIfUnavailable: true },
+  // Keep omitted sandbox defaults even when the operator supplies unrelated
+  // settings or only part of the sandbox policy. Explicit values (including
+  // false) win. Invalid non-object sandbox values remain Claude's to reject.
+  const sandbox = opts.settings?.sandbox;
+  const resolvedSettings = {
+    ...opts.settings,
+    sandbox:
+      sandbox === undefined ||
+      (sandbox !== null && typeof sandbox === 'object' && !Array.isArray(sandbox))
+        ? { enabled: true, failIfUnavailable: true, ...sandbox }
+        : sandbox,
+    // The CLI model flag wins over a model in operator settings.
+    ...(opts.model ? { model: opts.model } : {}),
   };
-  // Fold `--claude-model` into the resolved settings as its `model` field.
-  // Merging here (rather than at the cli.ts layer) means an operator who
-  // passes only `--claude-model` still keeps the DEFAULT_SETTINGS sandbox
-  // guard above — a naive `{ model }` at the call site would have replaced
-  // it. The flag wins over a `model` already present in operator settings.
-  const resolvedSettings = opts.model
-    ? { ...(opts.settings ?? DEFAULT_SETTINGS), model: opts.model }
-    : (opts.settings ?? DEFAULT_SETTINGS);
   // Serialize once at backend construction so per-task spawn stays cheap and
   // a malformed settings object (circular reference, BigInt value, etc.)
   // fails loud at setup time rather than producing a corrupted argv on the
@@ -1761,10 +1756,6 @@ export function createClaudeBackend(
   // underlying `JSON.stringify` message so a misconfiguration is actionable
   // without the operator having to read a raw stack trace.
   //
-  // `resolvedSettings` is unconditionally an object now (DEFAULT_SETTINGS
-  // fallback above), so there's no `if (!resolvedSettings) return []` path —
-  // operators that want to omit --settings entirely must pass an explicit
-  // override that disables the sandbox (e.g. `{ sandbox: { enabled: false } }`).
   const settingsArgs: readonly string[] = ((): readonly string[] => {
     let serialized: string | undefined;
     try {

@@ -760,14 +760,15 @@ the daemon-level precedence (Step 6 intro).
 > only declare models you've confirmed work in your local `claude`. The
 > flag is claude-only, same as `--claude-model`.
 
-> **Sandbox-on by default.** When neither `--claude-settings-file` nor
-> `backends.claude.settings` is set, the backend forwards
+> **Sandbox-on by default.** The backend defaults to forwarding
 > `--settings '{"sandbox":{"enabled":true,"failIfUnavailable":true}}'` to every
 > spawned `claude`. The OS-level sandbox (Seatbelt on macOS, bubblewrap on
 > Linux) is on; `failIfUnavailable: true` means a host that can't enable it
 > exits at startup instead of silently running with full host access. To
-> widen the policy (extra `allowedDomains`, `allowWrite`, etc.) supply a
-> complete `settings` object — it replaces the default entirely. To run
+> widen the policy (extra `allowedDomains`, `allowWrite`, etc.) supply those fields in
+> `--claude-settings-file` or `backends.claude.settings`. Omitted sandbox
+> fields keep their defaults, including when you configure only permissions
+> or a model; explicit values override them. To run
 > without a sandbox, pass `{ "sandbox": { "enabled": false } }`.
 
 `--cwd` defaults to the current working directory of the client

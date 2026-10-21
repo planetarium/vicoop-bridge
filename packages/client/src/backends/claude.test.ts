@@ -1045,6 +1045,52 @@ test('injects default sandbox-on --settings when settings option is not provided
   });
 });
 
+for (const [name, settings, expectedSandbox] of [
+  ['empty settings', {}, { enabled: true, failIfUnavailable: true }],
+  [
+    'permissions only',
+    { permissions: { deny: ['Read(./secret)'] } },
+    { enabled: true, failIfUnavailable: true },
+  ],
+  [
+    'partial sandbox policy',
+    { sandbox: { allowUnsandboxedCommands: false } },
+    { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false },
+  ],
+  [
+    'explicit disabled sandbox',
+    { sandbox: { enabled: false } },
+    { enabled: false, failIfUnavailable: true },
+  ],
+  [
+    'explicit fallback',
+    { sandbox: { failIfUnavailable: false } },
+    { enabled: true, failIfUnavailable: false },
+  ],
+] as const) {
+  test(`preserves sandbox defaults with ${name} without mutating operator settings`, async () => {
+    const fake = scriptedSpawn({
+      lines: [JSON.stringify({ type: 'result', result: 'ok' })],
+      exitCode: 0,
+    });
+    const before = structuredClone(settings);
+    Object.freeze(settings);
+    if ('sandbox' in settings) Object.freeze(settings.sandbox);
+    const backend = createClaudeBackend({ spawn: fake.spawn, settings });
+    await backend.handle(assign('hi'), collect().emit, NEVER);
+
+    const child = fake.lastChild();
+    assert.ok(child);
+    const idx = child.args.indexOf('--settings');
+    assert.notEqual(idx, -1);
+    assert.deepEqual(JSON.parse(String(child.args[idx + 1])), {
+      ...settings,
+      sandbox: expectedSandbox,
+    });
+    assert.deepEqual(settings, before);
+  });
+}
+
 test('model option folds into --settings as `model`, keeping the default sandbox', async () => {
   // `--claude-model` with no explicit settings must NOT wipe the
   // sandbox-on-by-default guard: the model is merged onto DEFAULT_SETTINGS,
@@ -1085,7 +1131,7 @@ test('model option wins over a `model` already present in operator settings', as
   const idx = child.args.indexOf('--settings');
   assert.ok(idx !== -1, 'expected --settings flag');
   assert.deepEqual(JSON.parse(String(child.args[idx + 1])), {
-    sandbox: { enabled: false },
+    sandbox: { enabled: false, failIfUnavailable: true },
     model: 'claude-opus-4-8',
   });
 });
