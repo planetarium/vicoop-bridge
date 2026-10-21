@@ -23,12 +23,13 @@
 import { execFileSync } from 'node:child_process';
 import {
   closeSync,
+  mkdirSync,
   openSync,
   readFileSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { resolveConfigDir } from './config.js';
 import { atomicWriteFile } from './fs-util.js';
 
@@ -264,6 +265,10 @@ export function claimPidFile(
 ): ClaimResult {
   const path = opts.path ?? pidFilePath();
   const probe = opts.probe ?? defaultProbe;
+
+  // An external --config can be used before VICOOP_HOME exists. Create only
+  // the directory here; the exclusive pidfile creation remains the lock.
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 
   for (let attempt = 0; attempt < 2; attempt++) {
     let fd: number;
