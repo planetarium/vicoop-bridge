@@ -36,9 +36,11 @@ import { taskListAccess } from './task-access.js';
 import {
   AdminApiError,
   addCaller,
+  addFederatedCaller,
   listActiveAgents,
   listCallers,
   removeCaller,
+  removeFederatedCaller,
 } from './admin-api.js';
 import { appendHistoryMessage } from './executor.js';
 
@@ -144,7 +146,7 @@ Agents are local services that connect to the server via WebSocket and expose an
   - \`mutate_updateClientAllowedAgents(clientId, allowedAgentIds)\` — compatibility wrapper for changing the single agent id; \`allowedAgentIds\` must contain exactly one id.
 - Do NOT use the auto-generated \`mutate_updateClientById\` or \`mutate_deleteClientById\` for delete/token rotation — always prefer the semantic mutations above.
 - Use \`list_active_agents\` to see currently connected agents.
-- Use \`add_caller\` / \`remove_caller\` / \`list_callers\` to manage per-agent access control. Do not use GraphQL mutations to manage \`allowed_callers\`.
+- Use \`add_caller\` / \`remove_caller\` for ordinary callers and \`add_federated_caller\` / \`remove_federated_caller\` for federated callers. Use \`list_callers\` to inspect and verify per-agent access control. Do not use GraphQL mutations to manage \`allowed_callers\`.
 - Use \`list_caller_tokens\` / \`revoke_caller_token\` (admin only) to manage opaque caller tokens. Issued via either Google OAuth device flow (provider=google) or SIWE exchange (provider=siwe).
 - Use \`execute_graphql\` for complex queries and inspection not covered by auto-generated tools.
 
@@ -162,6 +164,15 @@ Supported principal formats in \`allowed_callers\` (and as \`owner_principal\`):
 
 New agents are public until callers are configured. Use \`add_caller\` to restrict access. The agent card automatically advertises \`securitySchemes\` when callers are configured.
 
+## Federated callers (including Slack)
+
+- Use the structured federation tools with \`agent_id\`, \`issuer\`, \`method\`, and \`subject\`. Never construct or edit the internal \`federated:v1:\` encoding.
+- A grant matches one exact, case-sensitive (Connector issuer DID, authentication method, platform subject) tuple. There are no workspace or subject wildcards. These grants are allowed callers, not owner principals.
+- Google domain authorization does not authorize the same person through Slack federation. A Slack subject includes both workspace and user IDs, e.g. \`slack:T123/U456\`.
+- Obtain the issuer DID and method from the actual Connector configuration/profile and the subject from its assertion contract. Do not guess identifiers, infer them from email, or assume an example method applies to a deployment. Ask for missing fields. Setup guide: https://github.com/planetarium/vicoop-bridge/blob/main/docs/manage-federated-callers.md#slack-setup-obtain-and-verify-the-identifiers
+- Call \`list_callers\` before a change and after it to verify the decoded \`federated_callers\` and preserve other callers. Adding the first caller makes a public agent restricted. Adding a tuple changes policy only; it does not issue a token or prove token exchange works.
+- Before removing a federated caller, copy its exact tuple from \`list_callers\` and explain that removal permanently revokes its existing tokens and historical task authority. Re-adding the tuple does not restore them. Removing the last allowed caller makes the agent public for new messages; add and verify a replacement first if it must remain restricted.
+
 ## Conversation memory
 
 Your conversation history is persisted in PostgreSQL. You remember all previous messages in this context, even across server restarts. The messages above this one are real history — treat them as your own memory. Do not claim you have forgotten or cannot recall earlier parts of the conversation.
@@ -170,7 +181,7 @@ Your conversation history is persisted in PostgreSQL. You remember all previous 
 
 - When registering a client or rotating a token, always warn the user that the raw token is shown only once.
 - When registering on behalf of another principal (admin only), echo back the chosen \`ownerPrincipal\` so the user can confirm.
-- When adding a caller, explain that the agent will require an authenticated bearer token from that point on (either SIWE-exchanged or Google-device-flow-issued, depending on the principal format).
+- When adding a caller, explain that the agent will require an authenticated bearer token from that point on (SIWE-exchanged, Google-device-flow-issued, or federation token-exchange-issued, depending on the principal format).
 - Present data clearly in tables or lists.
 - If asked about something outside agent management, politely explain your scope.
 
@@ -191,7 +202,7 @@ Your conversation history is persisted in PostgreSQL. You remember all previous 
 
 // ── Custom Tools (token generation, active agents) ───────────────
 
-function buildCustomTools(db: Sql, registry: Registry, principalId: string) {
+export function buildCustomTools(db: Sql, registry: Registry, principalId: string) {
   // Caller-side admin tools that hit the DB pass jwt.claims.principal_id
   // through so RLS predicates (owner_principal = current_principal()) match
   // the operator's own rows. The principalId arrives already canonicalized
@@ -217,6 +228,7 @@ function buildCustomTools(db: Sql, registry: Registry, principalId: string) {
     add_caller: tool({
       description:
         'Add a principal to an agent\'s allowed callers. Once any caller is added, the agent requires authenticated Bearer token.\n' +
+        'For Slack/federated callers use add_federated_caller with structured fields; never construct the encoded principal.\n' +
         'Supported principal formats:\n' +
         '  eth:0x<40 hex>         Ethereum address (SIWE)\n' +
         '  0x<40 hex>             Plain wallet, auto-prefixed with eth:\n' +
@@ -234,7 +246,7 @@ function buildCustomTools(db: Sql, registry: Registry, principalId: string) {
     remove_caller: tool({
       description:
         'Remove a principal from an agent\'s allowed callers. If the list becomes empty, the agent becomes public again. ' +
-        'Accepts the same principal formats as add_caller.',
+        'Accepts the same principal formats as add_caller. For federated callers use remove_federated_caller and its revocation guidance.',
       inputSchema: z.object({
         agent_id: z.string().describe('The agent ID to remove the caller from'),
         principal: z.string().describe('Principal string to remove'),
@@ -243,8 +255,42 @@ function buildCustomTools(db: Sql, registry: Registry, principalId: string) {
         wrap(() => removeCaller(db, registry, principalId, agent_id, principal)),
     }),
 
+    add_federated_caller: tool({
+      description:
+        'Allow one exact, case-sensitive (issuer, method, subject) tuple on an owned agent (admins may manage any agent). ' +
+        'For Slack, subject includes workspace/user IDs; Google domain grants do not apply. No wildcards. ' +
+        'Use values from the Connector configuration/profile, never guessed identifiers. ' +
+        'Preserves existing callers. The first caller makes a public agent restricted. ' +
+        'Changes policy only; does not mint a token. Inspect and verify with list_callers.',
+      inputSchema: z.object({
+        agent_id: z.string().describe('The target agent ID'),
+        issuer: z.string().describe('Exact Connector did:web issuer and OAuth client id'),
+        method: z.string().describe('Exact authentication method from the Connector profile'),
+        subject: z.string().describe('Exact assertion subject, e.g. slack:T123/U456'),
+      }),
+      execute: async ({ agent_id, ...input }) =>
+        wrap(() => addFederatedCaller(db, registry, principalId, agent_id, input)),
+    }),
+
+    remove_federated_caller: tool({
+      description:
+        'Remove one exact federated tuple from an owned agent (admins may manage any agent). ' +
+        'Copy issuer, method, and subject from list_callers before removal; verify with list_callers afterward. ' +
+        'Permanently revokes existing tokens and historical task authority; re-adding does not restore them. ' +
+        'Preserves other callers. Removing the final caller makes the agent public for new messages; ' +
+        'add and verify a replacement first if it must remain restricted.',
+      inputSchema: z.object({
+        agent_id: z.string().describe('The target agent ID'),
+        issuer: z.string().describe('Exact Connector issuer copied from list_callers'),
+        method: z.string().describe('Exact authentication method copied from list_callers'),
+        subject: z.string().describe('Exact platform subject copied from list_callers'),
+      }),
+      execute: async ({ agent_id, ...input }) =>
+        wrap(() => removeFederatedCaller(db, registry, principalId, agent_id, input)),
+    }),
+
     list_callers: tool({
-      description: 'List the allowed callers for an agent. Empty list means the agent is public.',
+      description: 'List the allowed callers for an agent, including decoded federated_callers (issuer, method, subject). Empty list means the agent is public.',
       inputSchema: z.object({
         agent_id: z.string().describe('The agent ID to list callers for'),
       }),

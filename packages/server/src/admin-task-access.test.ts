@@ -126,6 +126,19 @@ test('admin agent task access is bound to the requesting operator (issue #519)',
     assert.equal(completed.status.state, TaskState.COMPLETED, JSON.stringify(completed.status) + ' modelCalls=' + modelRequests.length);
     assert.equal(await ownerOf(completed.id), principals[A]);
 
+    await t.test('the model receives structured federation tools and setup guidance', () => {
+      const request = JSON.parse(modelRequests[0]!);
+      for (const name of ['add_federated_caller', 'remove_federated_caller']) {
+        const tool = request.tools.find((candidate: { name: string }) => candidate.name === name);
+        assert.ok(tool, `missing model tool ${name}`);
+        assert.deepEqual([...tool.input_schema.required].sort(), ['agent_id', 'issuer', 'method', 'subject']);
+      }
+      const system = JSON.stringify(request.system);
+      assert.match(system, /Google domain authorization does not authorize/);
+      assert.match(system, /Never construct or edit the internal/);
+      assert.match(system, /Re-adding the tuple does not restore/);
+    });
+
     await t.test('another operator cannot read, cancel, or continue the task', async () => {
       await denied(await rpc(B, 'tasks/get', { id: completed.id }));
       await denied(await rpc(B, 'tasks/cancel', { id: completed.id }));
