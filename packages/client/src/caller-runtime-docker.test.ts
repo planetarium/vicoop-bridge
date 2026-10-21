@@ -472,3 +472,24 @@ test('unconfirmed helper on restart retains owner until close confirms daemon-si
   assert.equal(await store.storageHelper(id), undefined);
   await store.unlock();
 });
+
+test('preparation requires validated offline ownership and enforces maxScopes before reservation', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'caller-prepare-limits-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const options = CallerRuntimeConfig.parse({ image: `sha256:${'a'.repeat(64)}`, stateDirectory: directory, maxScopes: 1 });
+  const run: AsyncDockerRun = async (args) => {
+    if (args[0] === 'image') return { exitCode: 0, stdout: '[{"Config":{}}]', stderr: '' };
+    if (args[0] === 'ps') return { exitCode: 0, stdout: '', stderr: '' };
+    return { exitCode: 1, stdout: '', stderr: `No such ${args[0]}` };
+  };
+  const pool = new DockerCallerRuntimePool('claude', options, 'agent', run);
+  await assert.rejects(pool.prepare('alice'), /validated offline/);
+  await pool.initialize(false);
+  await assert.rejects(pool.prepare('alice'), /validated offline/);
+  await pool.close();
+  await pool.initialize(false, true);
+  await pool.store.reserve(scopeDigest('agent', 'bob'), 'claude', 'bob');
+  await assert.rejects(pool.prepare('alice'), /maxScopes/);
+  assert.equal(await pool.store.findPrincipal('alice'), undefined);
+  await pool.close();
+});

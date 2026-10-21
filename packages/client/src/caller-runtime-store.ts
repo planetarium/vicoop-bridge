@@ -159,6 +159,20 @@ export class CallerRuntimeStore {
           z.object({ id: z.string().regex(/^[a-f0-9]{64}$/) }).parse(row).id,
       );
   }
+  /** Identities are host-owned; legacy scopes retain an unknown principal. */
+  async records() {
+    return this.db().prepare('SELECT * FROM scopes ORDER BY id').all()
+      .map((row) => this.validateRecord(row));
+  }
+  async findPrincipal(principalId: string) {
+    if (!principalId.trim()) throw new Error('principal ID must not be empty');
+    const row = this.db().prepare('SELECT * FROM scopes WHERE id = ?')
+      .get(scopeDigest(this.agentId, principalId));
+    // Do not guess or bind the principal of legacy records during a lookup.
+    if (!row) return undefined;
+    const record = this.validateRecord(row);
+    return record.principalId === principalId ? record : undefined;
+  }
   private validateRecord(value: unknown, id?: string) {
     const record = ScopeRecord.parse(value);
     if (
