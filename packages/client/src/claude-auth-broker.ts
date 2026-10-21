@@ -50,6 +50,10 @@ export function selectClaudeCallerSettings(settings: Record<string, unknown> | u
   const result = callerSettings.safeParse(settings);
   if (!result.success)
     throw new Error('Claude container settings support only model, effortLevel, alwaysThinkingEnabled, sandbox enabled/failIfUnavailable, permissions.deny (up to 64 nonblank rules of 1024 characters without control characters), and env.ENABLE_PROMPT_CACHING_1H (0 or 1); host hooks, helpers and other environment/settings are unsupported');
+  // Linux limits each argv string to 128 KiB on 4 KiB-page systems. Leave
+  // room for backend-added settings and count serialized UTF-8, not characters.
+  if (Buffer.byteLength(JSON.stringify(result.data), 'utf8') > 96 * 1024)
+    throw new Error('Claude container settings must serialize to at most 96 KiB of UTF-8 JSON');
   return result.data; // Parsed copy, never the operator's mutable settings object.
 }
 

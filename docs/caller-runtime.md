@@ -372,7 +372,9 @@ sonnet/opus/haiku, optionally suffixed with `[1m]`), `effortLevel` (low/medium/h
 (boolean), `sandbox.enabled`/`sandbox.failIfUnavailable` (booleans), and
 `env.ENABLE_PROMPT_CACHING_1H` ("0"/"1"). `permissions.deny` is also accepted as
 a list of up to 64 nonblank rules, each at most 1,024 characters with no control
-characters. Other settings, environment variables,
+characters. The entire settings object must serialize to at most 96 KiB of UTF-8
+JSON, leaving room below Linux's per-argument limit for backend-added settings.
+Oversized settings fail validation before tasks start. Other settings, environment variables,
 hooks and authentication helpers fail initialization and daemon startup. Allowed
 settings are copied before constructing caller workers; host-only settings must
 be removed from the container-mode backend configuration.

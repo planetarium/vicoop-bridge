@@ -185,3 +185,33 @@ test('caller deny settings are bounded, copied, and cannot enable other permissi
       error instanceof Error && !error.message.includes('OPERATOR_SECRET'));
   }
 });
+
+
+test('caller settings reject oversized UTF-8 argv without exposing rules', async () => {
+  const { selectClaudeCallerSettings } = await import('./claude-auth-broker.js');
+  const deny = Array.from({ length: 64 }, (_, index) =>
+    `Read(./${index}/${Array(14).fill('한'.repeat(70)).join('/')})`);
+  assert.ok(deny.every(rule => rule.length <= 1024));
+  const settings = { permissions: { deny } };
+  assert.ok(Buffer.byteLength(JSON.stringify(settings), 'utf8') > 128 * 1024);
+  assert.throws(() => selectClaudeCallerSettings(settings), error =>
+    error instanceof Error && /96 KiB/.test(error.message) && !error.message.includes('한'));
+});
+
+test('caller settings enforce the aggregate serialized UTF-8 boundary', async () => {
+  const { selectClaudeCallerSettings } = await import('./claude-auth-broker.js');
+  const settings = {
+    permissions: { deny: Array(32).fill(`Read(${'한'.repeat(1000)})`) as string[] },
+    sandbox: { enabled: true, failIfUnavailable: true },
+  };
+  const bytes = () => Buffer.byteLength(JSON.stringify(settings), 'utf8');
+  // Each additional JSON array element costs three bytes for quotes/comma.
+  while (bytes() < 96 * 1024) {
+    settings.permissions.deny.push('x'.repeat(Math.min(1024, 96 * 1024 - bytes() - 3)));
+  }
+  assert.equal(bytes(), 96 * 1024);
+  assert.doesNotThrow(() => selectClaudeCallerSettings(settings));
+  settings.permissions.deny[settings.permissions.deny.length - 1] += 'x';
+  assert.equal(bytes(), 96 * 1024 + 1);
+  assert.throws(() => selectClaudeCallerSettings(settings), /96 KiB/);
+});
