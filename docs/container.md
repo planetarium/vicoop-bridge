@@ -281,3 +281,62 @@ VICOOP_FIXED_STORAGE_TEST=1 pnpm --filter @vicoop-bridge/client exec tsx --test 
 
 It builds disposable fixture/helper images and uses a unique storage pool; no
 provider calls or credentials are required.
+### Prepare one user's workspace (offline)
+
+`container setup` installs operator-selected files into one principal's persistent
+`/workspace`. It does not introduce roles, caller profiles, or request-controlled
+initializers. Stop the daemon first; setup holds the same exclusive state owner
+lock as task execution. Use the exact verified principal ID shown by
+`container list`, not a display name or email guessed from it.
+
+```sh
+# Optional: block model tasks before any container allocation or setup.
+vicoop-client container setup --principal 'PRINCIPAL_ID' --version initial --pending
+# Copy a directory containing repositories, scripts, and task credentials.
+vicoop-client container setup --principal 'PRINCIPAL_ID' --version initial --from ./alice-workspace
+# Explicit update: replace colliding files, retaining unrelated user files.
+vicoop-client container setup --principal 'PRINCIPAL_ID' --version update-2 --from ./alice-update --replace
+```
+
+All commands accept `--config PATH` and `--backend claude|codex`. Setup requires
+the configured runtime image to be available. The source directory is a stable,
+operator-controlled snapshot: directories and regular files only (no symlinks),
+at most 10,000 entries and 16 MiB total file bytes. Large repositories should be
+prepared as an image or fetched separately; setup is intentionally a bounded file
+transfer interface, not a package installer or arbitrary hook runner. Files are
+owned by runtime UID 1000, mode 0600 (0700 for executables); new directories are
+0700. The runtime image must provide a workspace writable by UID 1000 (as the
+bundled image does). Existing destination symlinks and incompatible file types are rejected.
+
+The first setup attempt records a host-owned pending state before reading source
+files or allocating a container. `--pending` needs no container or image allocation. A failed or interrupted copy leaves tasks blocked; inspect partial changes
+and retry with `--replace` if necessary. Individual files are replaced atomically,
+but a whole tree update is not a transaction. A successful version is not applied
+again, even if the source changes: use a new version for updates. `--pending`
+explicitly blocks an already prepared environment too. Setup confirms storage
+limits and stops the container before marking it ready. Readiness survives
+container recreation; deleting the scope removes it. Existing scopes that have
+never opted into setup continue working normally. Once setup state is recorded,
+older clients are rejected by the state manifest rather than bypassing readiness.
+
+Only place **task credentials intended for this user** here. The user and their
+agent can read, copy, modify, and remove these files. Provider authentication
+(Claude/OpenAI login state) must remain on the host and use the existing broker;
+do not copy provider home directories or authentication files. Credential paths
+are not exported as environment variables automatically: configure your scripts
+to read the intended files. Removing a file does not revoke a copied credential;
+revoke it at the issuing service. Home/tmpfs state, system packages, Claude
+settings/MCP loading, and network permissions are unchanged by workspace setup.
+
+`container list` includes preparation records even before a scope is allocated.
+`container inspect --principal ID` shows such pending records; `container remove
+SCOPE` can cancel an unallocated pending record (for example, after a mistyped ID).
+For allocated scopes, removal retains its existing destructive meaning.
+
+The opt-in setup integration test exercises the real CLI pending/inspect/list/remove
+flow, file modes, recreation, and failed-update recovery against a disposable
+scope. Supply a local pinned bundled runtime image; no provider calls occur:
+
+```sh
+VICOOP_SETUP_TEST_IMAGE=sha256:YOUR_IMAGE_ID pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-environment-setup.integration.test.ts
+```

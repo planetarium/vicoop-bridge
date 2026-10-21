@@ -6,6 +6,9 @@ import { brokerFirewallScript } from './execution-runtime-boundary.js';
 import { PROVIDER_ENV_PATTERN } from './provider-environment.js';
 import type { CallerRuntimeOptions } from './caller-runtime-config.js';
 
+export class CallerEnvironmentPendingError extends Error {
+  constructor() { super('caller environment setup is pending; ask the operator to complete container setup'); }
+}
 export class CallerOrphanedResourcesError extends Error {
   constructor() { super('unrecorded caller resources exist; stop the daemon and restore the original state database or inspect and remove the orphan Docker resources explicitly'); }
 }
@@ -367,6 +370,8 @@ export class DockerCallerRuntimePool {
     onReserved?: () => void,
     onMutation?: () => void,
   ): Promise<CallerContainer> {
+    if ((await this.store.preparation(id))?.ready === false)
+      throw new CallerEnvironmentPendingError();
     return this.acquireContainer(id, signal, principalId, onReserved, onMutation);
   }
   private async acquireContainer(
@@ -402,7 +407,7 @@ export class DockerCallerRuntimePool {
         if (this.options.fixedImageStorage) await this.storage.reserve(id);
         await this.store.confirmReservation(id);
       } catch (error) {
-        try { await this.store.forget(id); }
+        try { await this.store.forget(id, true); }
         catch { throw new CallerReservationUnconfirmedError(error); }
         throw error;
       }

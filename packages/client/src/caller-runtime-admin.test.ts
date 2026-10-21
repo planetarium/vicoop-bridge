@@ -77,3 +77,16 @@ test('principal administration requires an exact nonempty selector', async () =>
   }
   await assert.rejects(runCallerState({ config: '/nonexistent', inspectPrincipal: 'alice', preparePrincipal: 'bob' }), /select either/);
 });
+
+test('setup parser routes version, source, replace and pending to caller administration', () => {
+  for (const flags of [['--from', '/source', '--replace'], ['--pending']]) {
+    const parsed = parse(containerCmd, ['container', 'setup', '--principal', 'alice', '--version', 'v1', ...flags]);
+    assert.ok(parsed.success);
+    assert.equal(parsed.value.action, 'caller-state');
+    assert.ok('setupPrincipal' in parsed.value);
+    assert.equal(parsed.value.setupPrincipal, 'alice');
+    assert.equal(parsed.value.setupVersion, 'v1');
+    assert.equal(parsed.value.setupPending, flags[0] === '--pending');
+    assert.equal(parsed.value.setupFrom, flags[0] === '--from' ? '/source' : undefined);
+  }
+});

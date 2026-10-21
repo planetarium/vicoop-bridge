@@ -5,6 +5,8 @@ import { choice, string } from '@optique/core/valueparser';
 import { message } from '@optique/core/message';
 import { defaultConfigPath, readConfig } from './config.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
+import { scopeDigest } from './caller-runtime-store.js';
+import { setupCallerEnvironment } from './caller-environment-setup.js';
 import { DockerCallerRuntimePool } from './caller-runtime-docker.js';
 
 function commonOptions() {
@@ -34,6 +36,13 @@ export const callerContainerCommands = longestMatch(
   command('prepare', object({ ...commonOptions(), preparePrincipal: principal() }), {
     brief: message`Create a user's environment before their first request, retaining existing files (daemon must be stopped).`,
   }),
+  command('setup', object({
+    ...commonOptions(), setupPrincipal: principal(),
+    setupVersion: option('--version', string({ metavar: 'VERSION' })),
+    setupFrom: optional(option('--from', string({ metavar: 'DIRECTORY' }))),
+    setupReplace: option('--replace'),
+    setupPending: option('--pending'),
+  }), { brief: message`Prepare a user's persistent workspace; pending or failed setup blocks tasks (daemon must be stopped).` }),
   command('validate', object({ ...commonOptions(), validate: constant(true) }), {
     brief: message`Validate the configured image and retained container limits without starting workloads (daemon must be stopped).`,
   }),
@@ -65,12 +74,17 @@ export async function runCallerState(args: {
   validate?: boolean;
   inspectPrincipal?: string;
   preparePrincipal?: string;
+  setupPrincipal?: string;
+  setupVersion?: string;
+  setupFrom?: string;
+  setupReplace?: boolean;
+  setupPending?: boolean;
   deleteScope?: string;
   recreateScope?: string;
 }) {
-  for (const value of [args.inspectPrincipal, args.preparePrincipal])
+  for (const value of [args.inspectPrincipal, args.preparePrincipal, args.setupPrincipal])
     if (value !== undefined && (!value.trim() || value.length > 512)) throw new Error('principal ID must contain 1 to 512 characters');
-  if ([args.inspectPrincipal, args.preparePrincipal, args.deleteScope, args.recreateScope].filter((v) => v !== undefined).length > 1)
+  if ([args.inspectPrincipal, args.preparePrincipal, args.setupPrincipal, args.deleteScope, args.recreateScope].filter((v) => v !== undefined).length > 1)
     throw new Error('select either one principal operation, deletion or recreation');
   for (const value of [args.deleteScope, args.recreateScope])
     if (value !== undefined && !/^[a-f0-9]{64}$/.test(value))
@@ -86,15 +100,20 @@ export async function runCallerState(args: {
     config.backends?.[kind]?.caller_runtime,
   );
   const pool = new DockerCallerRuntimePool(kind, options, config.agent_id);
-  const ids = await pool.initialize(false, (args.validate ?? false) || args.preparePrincipal !== undefined);
+  const ids = await pool.initialize(false, (args.validate ?? false) || args.preparePrincipal !== undefined || (args.setupPrincipal !== undefined && !args.setupPending));
   try {
+    const setup = args.setupPrincipal === undefined ? undefined : await setupCallerEnvironment(pool, { principalId: args.setupPrincipal, version: args.setupVersion ?? '', from: args.setupFrom, replace: args.setupReplace, pending: args.setupPending });
     if (args.preparePrincipal !== undefined) await pool.prepare(args.preparePrincipal);
     const selected = args.inspectPrincipal === undefined ? undefined : await pool.store.findPrincipal(args.inspectPrincipal);
-    if (args.inspectPrincipal !== undefined && !selected) throw new Error('unknown principal; legacy scopes without an observed identity cannot be looked up by principal');
+    const selectedPreparation = args.inspectPrincipal === undefined ? undefined : await pool.store.preparation(scopeDigest(config.agent_id, args.inspectPrincipal));
+    if (args.inspectPrincipal !== undefined && !selected && !selectedPreparation) throw new Error('unknown principal; legacy scopes without an observed identity cannot be looked up by principal');
     const target = args.deleteScope ?? args.recreateScope;
     if (target !== undefined) {
-      if (!ids.includes(target)) throw new Error('unknown caller scope');
-      await pool.remove(target, args.deleteScope !== undefined);
+      if (!ids.includes(target) && args.deleteScope !== undefined) await pool.store.cancelUnallocatedPreparation(target);
+      else {
+        if (!ids.includes(target)) throw new Error('unknown caller scope');
+        await pool.remove(target, args.deleteScope !== undefined);
+      }
     }
     if (args.preparePrincipal !== undefined) await pool.stop((await pool.store.findPrincipal(args.preparePrincipal))!.id);
     console.log(
@@ -104,8 +123,11 @@ export async function runCallerState(args: {
           backend: kind,
           ...(args.validate ? { validated: true } : {}),
           namespace: pool.store.namespace,
-          scopes: await Promise.all((selected ? [selected] : await pool.store.records()).map(async (record) => ({
+          ...(setup ? { setup } : {}),
+          preparations: args.inspectPrincipal === undefined ? await pool.store.preparations() : selectedPreparation ? [{ id: scopeDigest(config.agent_id, args.inspectPrincipal), ...selectedPreparation }] : [],
+          scopes: await Promise.all((args.inspectPrincipal !== undefined ? selected ? [selected] : [] : await pool.store.records()).map(async (record) => ({
             ...record,
+            preparation: await pool.store.preparation(record.id),
             ...await pool.describe(record.id),
           }))),
         },
