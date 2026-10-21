@@ -330,3 +330,21 @@ test('principal lookup exposes exact identities without adopting legacy records'
   await f.store.forget(f.id);
   assert.equal(await f.store.findPrincipal('alice'), undefined);
 });
+
+test('preparation state persists across reopen and is deleted with scope', async t => {
+  const f = await fixture(t);
+  await f.store.lock();
+  await f.store.reserve(f.id, 'claude', 'alice');
+  assert.equal(await f.store.preparation(f.id), undefined);
+  await f.store.setPreparation(f.id, 'v1', false);
+  await f.store.unlock();
+  await f.store.lock();
+  assert.deepEqual(await f.store.preparation(f.id), { version: 'v1', ready: false });
+  assert.equal(JSON.parse(await readFile(f.manifestPath, 'utf8')).version, 6);
+  await f.store.setPreparation(f.id, 'v1', true);
+  await f.store.unlock();
+  await f.store.lock();
+  assert.deepEqual(await f.store.preparation(f.id), { version: 'v1', ready: true });
+  await f.store.forget(f.id);
+  assert.equal(await f.store.preparation(f.id), undefined);
+});

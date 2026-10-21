@@ -51,6 +51,7 @@ export class CallerRuntimeStore {
   namespace: string;
   private readonly token = randomUUID();
   private locked = false;
+  private manifestVersion = 4;
   private database?: CallerDatabase;
   constructor(
     directory: string,
@@ -191,7 +192,7 @@ export class CallerRuntimeStore {
     const databasePath = join(this.directory, 'state.sqlite');
     const Manifest = z
       .object({
-        version: z.union([z.literal(2), z.literal(3), z.literal(4), z.literal(5)]),
+        version: z.union([z.literal(2), z.literal(3), z.literal(4), z.literal(5), z.literal(6)]),
         agentId: z.literal(this.agentId),
         host: z.literal(hostname()),
         migration: z.literal('json').optional(),
@@ -230,7 +231,8 @@ export class CallerRuntimeStore {
       throw new Error(
         'caller state storage is incomplete or incompatible; inspect before recovery',
       );
-    const expected = { version: manifest?.version === 5 ? 5 : 4, agentId: this.agentId, host: hostname() };
+    const expected = { version: manifest?.version === 6 ? 6 : manifest?.version === 5 ? 5 : 4, agentId: this.agentId, host: hostname() };
+    this.manifestVersion = expected.version;
     // Block JSON-only clients before any SQLite mutation. This marker survives
     // interruption; the committed DB version tells retries whether import finished.
     if (migrating)
@@ -311,6 +313,7 @@ export class CallerRuntimeStore {
     db.exec('CREATE TABLE IF NOT EXISTS completed_allocations (id TEXT PRIMARY KEY NOT NULL)');
     db.exec('CREATE TABLE IF NOT EXISTS pending_reservations (id TEXT PRIMARY KEY NOT NULL)');
     db.exec('CREATE TABLE IF NOT EXISTS fixed_storage (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL)');
+    db.exec('CREATE TABLE IF NOT EXISTS preparations (id TEXT PRIMARY KEY NOT NULL, version TEXT NOT NULL, ready INTEGER NOT NULL CHECK (ready IN (0,1)))');
     db.exec('CREATE TABLE IF NOT EXISTS storage_helpers (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL)');
     if (migrating) await this.atomicWrite(manifestPath, expected);
     // Legacy JSON files remain as an inert migration backup, never read again.
@@ -397,7 +400,8 @@ export class CallerRuntimeStore {
   async recordFixedStorage(id: string, record: string): Promise<void> {
     this.validateRecord(this.db().prepare('SELECT * FROM scopes WHERE id = ?').get(id), id);
     // Block pre-image clients before persisting references they cannot clean up.
-    await this.atomicWrite(join(this.directory, 'manifest.json'), { version: 5, agentId: this.agentId, host: hostname() });
+    this.manifestVersion = Math.max(5, this.manifestVersion);
+    await this.atomicWrite(join(this.directory, 'manifest.json'), { version: this.manifestVersion, agentId: this.agentId, host: hostname() });
     this.db().prepare('INSERT INTO fixed_storage (id, record) VALUES (?, ?)').run(id, record);
   }
   async storageHelper(id: string): Promise<string | undefined> {
@@ -411,12 +415,27 @@ export class CallerRuntimeStore {
   async clearStorageHelper(id: string): Promise<void> {
     this.db().prepare('DELETE FROM storage_helpers WHERE id = ?').run(id);
   }
+  async preparation(id: string): Promise<{ version: string; ready: boolean } | undefined> {
+    const row = this.db().prepare('SELECT version, ready FROM preparations WHERE id = ?').get(id);
+    if (!row) return undefined;
+    const value = z.object({ version: z.string().min(1).max(128), ready: z.union([z.literal(0), z.literal(1)]) }).parse(row);
+    return { version: value.version, ready: value.ready === 1 };
+  }
+  async setPreparation(id: string, version: string, ready: boolean): Promise<void> {
+    z.string().min(1).max(128).parse(version);
+    this.validateRecord(this.db().prepare('SELECT * FROM scopes WHERE id = ?').get(id), id);
+    this.manifestVersion = 6;
+    // Older binaries must not bypass the readiness gate on restart.
+    await this.atomicWrite(join(this.directory, 'manifest.json'), { version: 6, agentId: this.agentId, host: hostname() });
+    this.db().prepare('INSERT INTO preparations (id, version, ready) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET version = excluded.version, ready = excluded.ready').run(id, version, ready ? 1 : 0);
+  }
   async forget(id: string): Promise<void> {
     if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('invalid scope ID');
     if (await this.storageHelper(id)) throw new Error('storage helper termination must be confirmed before forgetting scope');
     const db = this.db();
     db.exec('BEGIN IMMEDIATE');
     try {
+      db.prepare('DELETE FROM preparations WHERE id = ?').run(id);
       db.prepare('DELETE FROM fixed_storage WHERE id = ?').run(id);
       db.prepare('DELETE FROM completed_allocations WHERE id = ?').run(id);
       db.prepare('DELETE FROM pending_reservations WHERE id = ?').run(id);
