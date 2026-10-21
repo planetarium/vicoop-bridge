@@ -1,5 +1,20 @@
 # @vicoop-bridge/client
 
+## 0.43.0
+
+### Minor Changes
+
+- 8162060: Expose retained caller identities and add offline principal lookup and environment precreation before a user's first request.
+- 2485df2: Allow bounded agent-wide Claude permissions.deny rules in caller container settings while retaining the existing settings and MCP restrictions.
+- 91496ea: Support isolated environments for verified Mentionable federated callers, including Slack users, with existing principal-based preparation commands and negotiated server support.
+- 1b2202c: Support operator-owned read-only Docker volumes for shared reference materials across caller containers, with mount validation and preserved private caller storage.
+- 29789b5: Add offline per-user workspace setup with private file transfer, explicit updates, and persistent readiness gating after failed preparation.
+
+### Patch Changes
+
+- 802c048: Create the private daemon state directory when starting detached with a fresh VICOOP_HOME and an external config file.
+- dc3373b: Preserve Claude sandbox defaults when operator settings omit them, while honoring explicit sandbox overrides.
+
 ## 0.42.0
 
 ### Minor Changes
