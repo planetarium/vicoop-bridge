@@ -8,7 +8,7 @@ import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { scopeDigest } from './caller-runtime-store.js';
 import { CallerEnvironmentPendingError, CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageMissingError, CallerStorageLimitError, type DockerCallerRuntimePool } from './caller-runtime-docker.js';
 import type { Backend } from './backend.js';
-import { TRACEABILITY_EXTENSION_URI, type TaskAssignFrame, type UpFrame } from '@vicoop-bridge/protocol';
+import { formatFederatedPrincipal, TRACEABILITY_EXTENSION_URI, type TaskAssignFrame, type UpFrame } from '@vicoop-bridge/protocol';
 
 const options = CallerRuntimeConfig.parse({
   image: `sha256:${'a'.repeat(64)}`,
@@ -599,4 +599,38 @@ test('pending setup reports an actionable error without creating a worker or qua
   f.pool.acquire = acquire;
   assert.equal((await f.run()).at(-1)?.type, 'task.complete');
   await f.backend.close();
+});
+
+function federatedTask(issuer = 'did:web:connector.example', subject = 'slack:T/U', method = 'urn:mentionable:auth:slack:workspace:v0.1') {
+  const key = formatFederatedPrincipal({ issuer, subject, method })!;
+  const input = task(key);
+  input.caller = { principal: { id: subject }, actor: { id: issuer } };
+  input.executionScope!.policy = 'federated-principal-v1';
+  return input;
+}
+test('federated A/B/A reuses a user environment, separates issuers and methods, and never uses the actor workspace', async () => {
+  const f = fixture();
+  try {
+    for (const input of [federatedTask(), federatedTask(undefined, 'slack:T/B'), federatedTask(), federatedTask('did:web:other.example'), federatedTask(undefined, undefined, 'another-method')]) {
+      assert.ok((await f.run(input)).some(frame => frame.type === 'task.complete'));
+    }
+    assert.equal(f.workers.length, 4);
+    assert.equal(new Set(f.workers).size, 4);
+    assert.ok(!f.workers.includes(scopeDigest('agent', 'did:web:connector.example')));
+  } finally { await f.backend.close(); }
+});
+test('federated caller mismatch or policy downgrade rejects before allocation', async () => {
+  const f = fixture();
+  try {
+    for (const modify of [
+      (t: TaskAssignFrame) => { t.caller = { principal: { id: 'slack:T/other' }, actor: { id: 'did:web:connector.example' } }; },
+      (t: TaskAssignFrame) => { t.caller = { principal: { id: 'slack:T/U' }, actor: { id: 'did:web:other.example' } }; },
+      (t: TaskAssignFrame) => { t.caller = { principal: { id: 'slack:T/U' } }; },
+      (t: TaskAssignFrame) => { t.executionScope!.policy = 'direct-principal-v1'; },
+    ]) {
+      const input = federatedTask(); modify(input);
+      assert.match(JSON.stringify(await f.run(input)), /caller_scope_required/);
+    }
+    assert.equal(f.allocations.length, 0);
+  } finally { await f.backend.close(); }
 });

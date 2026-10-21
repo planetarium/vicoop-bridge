@@ -1,3 +1,4 @@
+import { formatFederatedPrincipal } from '@vicoop-bridge/protocol';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -11,7 +12,10 @@ import { runDockerCommand } from './docker-command.js';
 import { createLogger } from './logger.js';
 
 // Actual Docker builds/probes and retained files; fixtures make no provider calls.
-test('init and offline preparation provision fixed storage, preserve caller data, and support daemon reuse', {
+for (const principal of [
+  'alice',
+  formatFederatedPrincipal({ issuer: 'did:web:connector.example', method: 'urn:mentionable:auth:slack:workspace:v0.1', subject: 'slack:T/U' })!,
+]) test(`init and offline preparation (${principal === 'alice' ? 'direct' : 'federated'}) preserve caller data and support daemon reuse`, {
   skip: process.env.VICOOP_FIXED_STORAGE_TEST !== '1', timeout: 600_000,
 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'storage-init-integration-'));
@@ -56,10 +60,10 @@ USER node
     assert.match(runtime.fixedImageStorage.image, /^sha256:[a-f0-9]{64}$/);
     pool = new DockerCallerRuntimePool('claude', runtime, config.agent_id);
     await pool.initialize(false, true);
-    const id = scopeDigest(config.agent_id, 'alice');
-    const prepared = await pool.prepare('alice');
+    const id = scopeDigest(config.agent_id, principal);
+    const prepared = await pool.prepare(principal);
     assert.equal(prepared.id, id);
-    assert.equal((await pool.store.findPrincipal('alice'))?.id, id);
+    assert.equal((await pool.store.findPrincipal(principal))?.id, id);
     assert.equal(await pool.store.allocationComplete(id), true);
     const identity = await pool.store.fixedStorage(id);
     await command(['exec', '--user', '1000:1000', pool.name(id), 'node', '-e',
@@ -69,7 +73,7 @@ USER node
     pool = new DockerCallerRuntimePool('claude', runtime, config.agent_id);
     await pool.initialize(false, true);
     assert.equal((await pool.describe(id)).state, 'stopped');
-    await pool.prepare('alice');
+    await pool.prepare(principal);
     assert.equal(await pool.store.fixedStorage(id), identity);
     assert.equal(await command(['exec', '--user', '1000:1000', pool.name(id), 'node', '-e',
       "const fs=require('fs');console.log(fs.readFileSync('/workspace/retained','utf8')+':'+fs.readFileSync('/data/sessions/claude/config/retained','utf8'))"]), 'workspace:session');

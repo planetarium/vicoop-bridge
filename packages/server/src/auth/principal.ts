@@ -25,11 +25,8 @@ export type ParsedPrincipal =
   | { kind: 'apikey'; keyId: string }
   | { kind: 'federated'; issuer: string; method: string; subject: string };
 
-export interface FederatedPrincipalInput {
-  issuer: string;
-  method: string;
-  subject: string;
-}
+export { formatFederatedPrincipal, parseFederatedPrincipal, type FederatedPrincipalInput } from '@vicoop-bridge/protocol';
+import { formatFederatedPrincipal, parseFederatedPrincipal } from '@vicoop-bridge/protocol';
 
 export interface VerifiedCaller {
   principalId: string;       // e.g. 'google:<sub>' | 'eth:0x...'
@@ -59,69 +56,6 @@ const DOMAIN_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/;
 // alphabet is url-safe base64. Case-sensitive — a key id is an opaque token,
 // not a human-typed identifier.
 const API_KEY_ID_RE = /^[A-Za-z0-9_-]+$/;
-const FEDERATED_PREFIX = 'federated:v1:';
-const MAX_FEDERATED_PRINCIPAL_BYTES = 512;
-
-function takeLengthPrefixed(input: string): { value: string; rest: string } | null {
-  const colon = input.indexOf(':');
-  if (colon <= 0) return null;
-  const rawLength = input.slice(0, colon);
-  if (!/^(?:0|[1-9][0-9]*)$/.test(rawLength)) return null;
-  const byteLength = Number(rawLength);
-  if (!Number.isSafeInteger(byteLength) || byteLength <= 0) return null;
-
-  const body = input.slice(colon + 1);
-  let consumedBytes = 0;
-  let end = 0;
-  for (const ch of body) {
-    consumedBytes += Buffer.byteLength(ch);
-    if (consumedBytes > byteLength) return null;
-    end += ch.length;
-    if (consumedBytes === byteLength) break;
-  }
-  if (consumedBytes !== byteLength) return null;
-  return { value: body.slice(0, end), rest: body.slice(end) };
-}
-
-/**
- * Collision-safe, reversible encoding for an exact federated caller tuple.
- * Lengths are UTF-8 byte lengths, so delimiters inside DIDs, URNs, and
- * platform subjects remain ordinary data rather than parser syntax.
- */
-export function formatFederatedPrincipal(input: FederatedPrincipalInput): string | null {
-  const issuer = input.issuer.trim();
-  const method = input.method.trim();
-  const subject = input.subject.trim();
-  if (issuer !== input.issuer || method !== input.method || subject !== input.subject) return null;
-  if (!issuer.startsWith('did:web:') || !method || !subject) return null;
-  if (/\s/.test(issuer)) return null;
-  if (issuer.length > 512 || method.length > 256 || subject.length > 512) return null;
-  const component = (value: string): string => `${Buffer.byteLength(value)}:${value}`;
-  const encoded = FEDERATED_PREFIX + component(issuer) + component(method) + component(subject);
-  return Buffer.byteLength(encoded) <= MAX_FEDERATED_PRINCIPAL_BYTES ? encoded : null;
-}
-
-export function parseFederatedPrincipal(value: string): FederatedPrincipalInput | null {
-  if (!value.startsWith(FEDERATED_PREFIX)) return null;
-  let rest = value.slice(FEDERATED_PREFIX.length);
-  const issuer = takeLengthPrefixed(rest);
-  if (!issuer) return null;
-  rest = issuer.rest;
-  const method = takeLengthPrefixed(rest);
-  if (!method) return null;
-  rest = method.rest;
-  const subject = takeLengthPrefixed(rest);
-  if (!subject || subject.rest !== '') return null;
-  const canonical = formatFederatedPrincipal({
-    issuer: issuer.value,
-    method: method.value,
-    subject: subject.value,
-  });
-  return canonical === value
-    ? { issuer: issuer.value, method: method.value, subject: subject.value }
-    : null;
-}
-
 // Parse a stored principal string. Returns null for invalid input.
 export function parsePrincipal(s: string): ParsedPrincipal | null {
   if (typeof s !== 'string' || s.length === 0) return null;

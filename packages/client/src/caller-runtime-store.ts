@@ -1,3 +1,4 @@
+import { executionScopePreimage, parseFederatedPrincipal } from '@vicoop-bridge/protocol';
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { hostname } from 'node:os';
@@ -21,14 +22,7 @@ import {
 
 export const scopeDigest = (agentId: string, principalId: string): string =>
   createHash('sha256')
-    .update(
-      JSON.stringify([
-        'vicoop-execution-scope',
-        'direct-principal-v1',
-        agentId,
-        principalId,
-      ]),
-    )
+    .update(executionScopePreimage(agentId, principalId))
     .digest('hex');
 
 const LegacyScopeRecord = z
@@ -52,6 +46,7 @@ export class CallerRuntimeStore {
   private readonly token = randomUUID();
   private locked = false;
   private manifestVersion = 4;
+  private manifestWriteTail: Promise<void> = Promise.resolve();
   private database?: CallerDatabase;
   constructor(
     directory: string,
@@ -192,7 +187,7 @@ export class CallerRuntimeStore {
     const databasePath = join(this.directory, 'state.sqlite');
     const Manifest = z
       .object({
-        version: z.union([z.literal(2), z.literal(3), z.literal(4), z.literal(5), z.literal(6)]),
+        version: z.union([z.literal(2), z.literal(3), z.literal(4), z.literal(5), z.literal(6), z.literal(7)]),
         agentId: z.literal(this.agentId),
         host: z.literal(hostname()),
         migration: z.literal('json').optional(),
@@ -231,7 +226,7 @@ export class CallerRuntimeStore {
       throw new Error(
         'caller state storage is incomplete or incompatible; inspect before recovery',
       );
-    const expected = { version: manifest?.version === 6 ? 6 : manifest?.version === 5 ? 5 : 4, agentId: this.agentId, host: hostname() };
+    const expected = { version: Math.max(4, manifest?.version ?? 4), agentId: this.agentId, host: hostname() };
     this.manifestVersion = expected.version;
     // Block JSON-only clients before any SQLite mutation. This marker survives
     // interruption; the committed DB version tells retries whether import finished.
@@ -327,6 +322,23 @@ export class CallerRuntimeStore {
       await rm(next, { force: true });
     }
   }
+  private advanceManifest(version: number): Promise<void> {
+    this.manifestVersion = Math.max(version, this.manifestVersion);
+    // Live allocations can overlap. Serialize markers so an older storage
+    // write cannot finish after a federated marker and downgrade the file.
+    const write = this.manifestWriteTail.then(() => this.atomicWrite(
+      join(this.directory, 'manifest.json'),
+      { version: this.manifestVersion, agentId: this.agentId, host: hostname() },
+    ));
+    this.manifestWriteTail = write.catch(() => {});
+    return write;
+  }
+  private async markFederated(principalId?: string): Promise<void> {
+    if (!principalId || !parseFederatedPrincipal(principalId)) return;
+    this.db();
+    // Always persist before mutation, including retry after a failed write.
+    await this.advanceManifest(7);
+  }
   async reserve(id: string, kind: string, principalId?: string, requirePreflight = false): Promise<boolean> {
     if (!this.locked)
       throw new Error('caller state requires exclusive ownership');
@@ -336,6 +348,7 @@ export class CallerRuntimeStore {
       (!principalId || scopeDigest(this.agentId, principalId) !== id)
     )
       throw new Error('caller state identity mismatch');
+    await this.markFederated(principalId);
     const db = this.db();
     const record = this.validateRecord({
       id,
@@ -400,8 +413,7 @@ export class CallerRuntimeStore {
   async recordFixedStorage(id: string, record: string): Promise<void> {
     this.validateRecord(this.db().prepare('SELECT * FROM scopes WHERE id = ?').get(id), id);
     // Block pre-image clients before persisting references they cannot clean up.
-    this.manifestVersion = Math.max(5, this.manifestVersion);
-    await this.atomicWrite(join(this.directory, 'manifest.json'), { version: this.manifestVersion, agentId: this.agentId, host: hostname() });
+    await this.advanceManifest(5);
     this.db().prepare('INSERT INTO fixed_storage (id, record) VALUES (?, ?)').run(id, record);
   }
   async storageHelper(id: string): Promise<string | undefined> {
@@ -435,6 +447,7 @@ export class CallerRuntimeStore {
   }
   async setPrincipalPreparation(principalId: string, version: string): Promise<string> {
     if (!principalId.trim() || principalId.length > 512) throw new Error('invalid principal ID');
+    await this.markFederated(principalId);
     const id = scopeDigest(this.agentId, principalId);
     await this.writePreparation(id, version, false);
     return id;
@@ -446,9 +459,8 @@ export class CallerRuntimeStore {
   private async writePreparation(id: string, version: string, ready: boolean): Promise<void> {
     z.string().min(1).max(128).parse(version);
     this.db();
-    this.manifestVersion = 6;
     // Older binaries must not bypass the readiness gate on restart.
-    await this.atomicWrite(join(this.directory, 'manifest.json'), { version: 6, agentId: this.agentId, host: hostname() });
+    await this.advanceManifest(6);
     this.db().prepare('INSERT INTO preparations (id, version, ready) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET version = excluded.version, ready = excluded.ready').run(id, version, ready ? 1 : 0);
   }
   async forget(id: string, preservePreparation = false): Promise<void> {

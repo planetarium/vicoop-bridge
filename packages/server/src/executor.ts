@@ -29,7 +29,7 @@ import {
   type Part as WirePart,
 } from '@vicoop-bridge/protocol';
 import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
-import { resolveDirectExecutionScope } from './execution-scope.js';
+import { resolveExecutionScope } from './execution-scope.js';
 import {
   createCanonicalCallerContext,
   selectCallerContextVersion,
@@ -406,14 +406,14 @@ export class WSForwardingExecutor extends AgentExecutor {
     const requestedExtensions = message.extensions;
 
     const capabilities = this.registry.getAgent(this.agentId)?.protocolCapabilities;
-    if (capabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) && !resolveDirectExecutionScope({
+    if (capabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) && !resolveExecutionScope({
       agentId: this.agentId, principalId, actorId, authorizationKey, authorizationProfile, capabilities,
     })) {
       const status = {
         state: TaskState.FAILED,
         timestamp: new Date().toISOString(),
         message: { messageId: randomUUID(), role: 'agent' as const,
-          parts: [{ text: 'container runtime requires a directly authenticated principal; delegation is unsupported' }], taskId, contextId },
+          parts: [{ text: 'container runtime requires a supported authenticated caller scope' }], taskId, contextId },
       };
       task.status = status;
       task.history = appendHistoryMessage(appendHistoryMessage(task.history ?? [], message), status.message);
@@ -489,7 +489,7 @@ export class WSForwardingExecutor extends AgentExecutor {
           })
         : undefined;
     const caller = serializeCallerContext(canonicalCaller, callerContextVersion);
-    const executionScope = caller === undefined ? undefined : resolveDirectExecutionScope({
+    const executionScope = caller === undefined ? undefined : resolveExecutionScope({
       agentId: this.agentId, principalId, actorId, authorizationKey, authorizationProfile,
       capabilities: this.registry.getAgent(this.agentId)?.protocolCapabilities,
     });

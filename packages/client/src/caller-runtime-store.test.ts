@@ -1,3 +1,4 @@
+import { formatFederatedPrincipal } from '@vicoop-bridge/protocol';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -359,4 +360,52 @@ test('unallocated pending preparation is visible and explicitly cancellable', as
   await f.store.setPrincipalPreparation('alice', 'v1');
   await f.store.reserve(f.id, 'claude', 'alice');
   await assert.rejects(f.store.cancelUnallocatedPreparation(f.id), /allocated scope/);
+});
+
+test('federated preparation and reservation survive reopening with stable canonical identity and block old manifests', async (t) => {
+  const f = await fixture(t);
+  const key = formatFederatedPrincipal({ issuer: 'did:web:connector.example', method: 'slack', subject: 'slack:T/U' })!;
+  await f.store.lock();
+  const id = await f.store.setPrincipalPreparation(key, 'v1');
+  assert.equal(JSON.parse(await readFile(f.manifestPath, 'utf8')).version, 7);
+  await f.store.reserve(id, 'claude', key);
+  await f.store.setPreparation(id, 'v1', true);
+  await f.store.setPrincipalPreparation('apikey:direct', 'v1');
+  assert.equal(JSON.parse(await readFile(f.manifestPath, 'utf8')).version, 7, 'direct writes must not downgrade the manifest');
+  await f.store.unlock();
+  await f.store.lock();
+  assert.equal((await f.store.findPrincipal(key))?.id, id);
+  assert.deepEqual(await f.store.preparation(id), { version: 'v1', ready: true });
+  assert.equal(await f.store.findPrincipal('slack:T/U'), undefined);
+});
+
+test('failed federated marker write cannot be bypassed by retry in the same process', async t => {
+  const f = await fixture(t); await f.store.lock();
+  const key = formatFederatedPrincipal({ issuer: 'did:web:example', method: 'slack', subject: 'slack:T/U' })!;
+  const store = f.store as unknown as { atomicWrite(path: string, value: unknown): Promise<void> };
+  const write = store.atomicWrite.bind(store); let attempts = 0;
+  store.atomicWrite = async (path, value) => { if (path === f.manifestPath && attempts++ === 0) throw new Error('injected manifest failure'); await write(path, value); };
+  await assert.rejects(f.store.reserve(scopeDigest('agent', key), 'claude', key), /injected/);
+  assert.equal(await f.store.findPrincipal(key), undefined);
+  await f.store.reserve(scopeDigest('agent', key), 'claude', key);
+  assert.equal(JSON.parse(await readFile(f.manifestPath, 'utf8')).version, 7);
+});
+
+test('overlapping storage and federated markers cannot downgrade the manifest', async t => {
+  const f = await fixture(t); await f.store.lock();
+  await f.store.reserve(f.id, 'claude', 'alice');
+  const key = formatFederatedPrincipal({ issuer: 'did:web:example', method: 'slack', subject: 'slack:T/U' })!;
+  const store = f.store as unknown as { atomicWrite(path: string, value: unknown): Promise<void> };
+  const write = store.atomicWrite.bind(store);
+  let release!: () => void; let started!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const entered = new Promise<void>(resolve => { started = resolve; });
+  store.atomicWrite = async (path, value) => {
+    if (path === f.manifestPath && (value as { version: number }).version === 5) { started(); await blocked; }
+    await write(path, value);
+  };
+  const direct = f.store.recordFixedStorage(f.id, 'fixture'); await entered;
+  const federated = f.store.reserve(scopeDigest('agent', key), 'claude', key);
+  release(); await Promise.all([direct, federated]);
+  assert.equal(JSON.parse(await readFile(f.manifestPath, 'utf8')).version, 7);
 });

@@ -24,7 +24,7 @@ const scope = () => argument(string({ metavar: 'SCOPE' }), {
   description: message`Scope digest from container list.`,
 });
 const principal = () => option('--principal', string({ metavar: 'ID' }), {
-  description: message`Exact verified principal ID (not an email alias or display name).`,
+  description: message`Exact verified principal ID or full federated:v1: grant (not an email alias or bare federated subject).`,
 });
 export const callerContainerCommands = longestMatch(
   command('list', object(commonOptions()), {

@@ -1,12 +1,12 @@
 # Dedicated caller containers (Claude and Codex)
 
 PR #506 implements the caller-isolation portion of #497 R2 and R4 on
-`codex/497-docker-runtimes`. Each directly authenticated principal gets a
+`codex/497-docker-runtimes`. Each directly authenticated principal or verified federated user gets a
 reusable Docker container and dedicated workspace/session volumes under one
 public agent identity and bridge connection. A new `contextId` from the same
 principal uses the same container and workspace, with a separate conversation.
 
-This is opt-in. OpenClaw, delegated scopes, OpenAI compatibility, caller tools,
+This is opt-in. OpenClaw, unsupported delegation profiles, OpenAI compatibility, caller tools,
 MCP integration, outgoing file delivery and automatic idle reclamation are not
 supported in this mode. The two execution modes are `host` (default) and
 `container` (dedicated per caller); shared-container execution is no longer
@@ -168,9 +168,29 @@ keeps its existing behavior.
 The server derives scope from agent identity and authenticated principal. The
 client checks that scope against caller identity and execution generation before
 allocation. Missing identity, forged scope, missing capability negotiation and
-delegation never fall back to a shared runtime. Public agents still require
+unsupported delegation never falls back to a shared runtime. Public agents still require
 caller authentication when they advertise container execution. Shared
 API keys identify the same principal and therefore share the same environment.
+
+Mentionable OAuth federation (including Slack callers) uses the existing exact
+`federated:v1:...` issuer/method/subject grant as the environment principal. The
+connector actor alone and a bare `slack:WORKSPACE/USER` subject are **not** the
+environment key. Different issuers, methods or subjects get different volumes;
+new tokens and task continuations for the same tuple reuse the same environment.
+Only authenticated token-exchange identity selects this scope; presented identity
+attestations and request metadata cannot select or override it. Other delegation
+profiles remain unsupported.
+
+Both server and client must support `federated-execution-scope-v1`, in addition to
+the existing caller-runtime capabilities. Old clients are rejected before task
+binding/allocation; new clients connected to old servers can still run direct
+callers but cannot run federated callers. Direct scope hashes do not change.
+
+Existing grant/token expiry, revocation, task ownership and continuation checks
+remain at the HTTP authorization boundary. Revoking a grant does not erase its
+workspace or create a new identity. Restore access only intentionally: re-granting
+the same tuple reuses its retained files, while revoked old tasks stay revoked.
+Use `container remove` separately when retained data must be deleted.
 
 Input admission runs before allocating caller storage: Claude accepts inline
 PNG/JPEG/WebP/GIF images and PDF documents, while Codex accepts those images only.
@@ -304,7 +324,7 @@ schema version 4, exposed as `PRAGMA user_version`). The `scopes` table contains
 `id` (scope digest), `kind` (backend), `namespace`, `agentId` and nullable
 `principalId`, with an index on `(agentId, principalId, kind)`. The `metadata`
 table binds the database to its agent, host and namespace. Only a principal from
-an already validated direct execution scope is recorded; the store independently
+an already validated execution scope is recorded; the store independently
 checks its digest against the scope. No credentials, tokens, caller display names
 or request metadata are stored. The directory remains 0700 and the database is
 0600. Principal IDs are not added to Docker names/labels or `caller-state` output.

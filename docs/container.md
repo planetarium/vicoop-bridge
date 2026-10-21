@@ -340,3 +340,29 @@ scope. Supply a local pinned bundled runtime image; no provider calls occur:
 ```sh
 VICOOP_SETUP_TEST_IMAGE=sha256:YOUR_IMAGE_ID pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-environment-setup.integration.test.ts
 ```
+
+### Preparing a federated (for example Slack) user's environment
+
+Use the exact `federated:v1:...` entry from
+`vicoop-client agent callers list "$AGENT_ID" --json` as `--principal`; see
+[managing federated callers](./manage-federated-callers.md). Copy the full entry,
+including issuer and method, rather than using just `slack:WORKSPACE/USER`.
+With the daemon stopped, the existing commands work without profiles or a
+separate administrator list:
+
+```sh
+vicoop-client container inspect --backend claude --principal "$FEDERATED_PRINCIPAL"
+vicoop-client container prepare --backend claude --principal "$FEDERATED_PRINCIPAL"
+vicoop-client container setup --backend claude --principal "$FEDERATED_PRINCIPAL" --version v1 --from ./user-files
+```
+
+Use `codex` instead of `claude` for that backend. A pending preparation blocks
+only this exact issuer/method/subject environment. Repeated requests and renewed
+tokens reuse it; another issuer or subject gets a separate environment. Creating
+an environment does not itself grant caller access.
+
+The first federated preparation or reservation advances the host state manifest
+to version 7. Older clients refuse that state directory; do not edit the marker
+to downgrade. Existing direct-user containers keep their original identity and
+volumes. Both bridge server and client must support the additive federated scope
+capability; see [scope and lifetime](./caller-runtime.md#scope-lifetime-and-persistence).
