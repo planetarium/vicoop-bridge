@@ -713,3 +713,16 @@ for (const { interruptCleanup, outdatedHelper } of [
     } finally { db.close(); }
   });
 }
+
+
+test('container init accepts and preserves agent-wide Claude deny settings', async (t) => {
+  const f = await fixture(t);
+  const settings = { permissions: { deny: ['Read(./secret.txt)', 'Bash(cat:*)'] } };
+  const original = { ...f.original, backends: { ...f.original.backends, claude: { ...f.original.backends.claude, settings } } };
+  await writeFile(f.path, JSON.stringify(original));
+  assert.equal(await runCallerContainerInit(f.options), 0);
+  const config = await f.read();
+  assert.deepEqual(config.backends.claude.settings, settings);
+  assert.equal(config.backends.claude.runtime, 'container');
+  assert.equal(f.auth(), 1);
+});

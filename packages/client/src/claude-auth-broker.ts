@@ -39,6 +39,9 @@ const callerSettings = z.object({
   effortLevel: z.enum(['low', 'medium', 'high', 'max']).optional(),
   alwaysThinkingEnabled: z.boolean().optional(),
   sandbox: z.object({ enabled: z.boolean().optional(), failIfUnavailable: z.boolean().optional() }).strict().optional(),
+  permissions: z.object({
+    deny: z.array(z.string().min(1).max(1024).regex(/\S/).regex(/^[^\u0000-\u001f\u007f]*$/)).max(64),
+  }).strict().optional(),
   env: z.object({ ENABLE_PROMPT_CACHING_1H: z.enum(['0', '1']).optional() }).strict().optional(),
 }).strict();
 
@@ -46,7 +49,7 @@ export function selectClaudeCallerSettings(settings: Record<string, unknown> | u
   if (settings === undefined) return undefined;
   const result = callerSettings.safeParse(settings);
   if (!result.success)
-    throw new Error('Claude container settings support only model, effortLevel, alwaysThinkingEnabled, sandbox enabled/failIfUnavailable, and env.ENABLE_PROMPT_CACHING_1H (0 or 1); host hooks, helpers and other environment/settings are unsupported');
+    throw new Error('Claude container settings support only model, effortLevel, alwaysThinkingEnabled, sandbox enabled/failIfUnavailable, permissions.deny (up to 64 nonblank rules of 1024 characters without control characters), and env.ENABLE_PROMPT_CACHING_1H (0 or 1); host hooks, helpers and other environment/settings are unsupported');
   return result.data; // Parsed copy, never the operator's mutable settings object.
 }
 

@@ -159,3 +159,29 @@ test('caller settings accept supported Claude 1m context-tier model IDs', async 
     assert.deepEqual(selectClaudeCallerSettings({ model }), { model });
   assert.throws(() => selectClaudeCallerSettings({ model: 'claude-sonnet-4-5[SECRET]' }));
 });
+
+
+test('caller deny settings are bounded, copied, and cannot enable other permissions', async () => {
+  const { selectClaudeCallerSettings } = await import('./claude-auth-broker.js');
+  const original = { permissions: { deny: ['Read(./secret.txt)', 'Read(**/secret.txt)', 'Bash(cat:*)'] } };
+  const selected = selectClaudeCallerSettings(original);
+  assert.deepEqual(selected, original);
+  original.permissions.deny.push('Bash(OPERATOR_SECRET:*)');
+  original.permissions.deny[0] = 'Read(OPERATOR_SECRET)';
+  assert.doesNotMatch(JSON.stringify(selected), /OPERATOR_SECRET/);
+  assert.deepEqual(selectClaudeCallerSettings({ permissions: { deny: [] } }), { permissions: { deny: [] } });
+  assert.doesNotThrow(() => selectClaudeCallerSettings({ permissions: { deny: Array(64).fill('x'.repeat(1024)) } }));
+  for (const permissions of [
+    { deny: ['Read(*)'], allow: ['OPERATOR_SECRET'] },
+    { deny: [], ask: ['OPERATOR_SECRET'] },
+    { deny: [], defaultMode: 'bypassPermissions' },
+    { deny: [], additionalDirectories: ['/OPERATOR_SECRET'] },
+    { deny: [], disableBypassPermissionsMode: 'disable' },
+    {}, { deny: 'OPERATOR_SECRET' }, { deny: [42] },
+    { deny: [''] }, { deny: ['   '] }, { deny: ['Read(OPERATOR_SECRET)\n'] },
+    { deny: ['x'.repeat(1025)] }, { deny: Array(65).fill('Read(*)') },
+  ]) {
+    assert.throws(() => selectClaudeCallerSettings({ permissions }), error =>
+      error instanceof Error && !error.message.includes('OPERATOR_SECRET'));
+  }
+});

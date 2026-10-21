@@ -370,10 +370,43 @@ database or explicitly remove the orphan resources. Orphans are not managed by
 Claude caller settings use an allowlist: `model` (Claude model IDs or
 sonnet/opus/haiku, optionally suffixed with `[1m]`), `effortLevel` (low/medium/high/max), `alwaysThinkingEnabled`
 (boolean), `sandbox.enabled`/`sandbox.failIfUnavailable` (booleans), and
-`env.ENABLE_PROMPT_CACHING_1H` ("0"/"1"). Other settings, environment variables,
+`env.ENABLE_PROMPT_CACHING_1H` ("0"/"1"). `permissions.deny` is also accepted as
+a list of up to 64 nonblank rules, each at most 1,024 characters with no control
+characters. Other settings, environment variables,
 hooks and authentication helpers fail initialization and daemon startup. Allowed
 settings are copied before constructing caller workers; host-only settings must
 be removed from the container-mode backend configuration.
+
+Deny rules belong in the operator's `backends.claude.settings` and apply to every
+caller environment for that agent. For example, this configuration fragment
+blocks the tested `Read` paths and `Bash(cat:*)` command pattern:
+
+```json
+{
+  "backends": {
+    "claude": {
+      "settings": {
+        "sandbox": { "enabled": true, "failIfUnavailable": true },
+        "permissions": {
+          "deny": ["Read(./secret.txt)", "Read(**/secret.txt)", "Bash(cat:*)"]
+        }
+      }
+    }
+  }
+}
+```
+
+The runtime starts in `/workspace`. Claude interprets the rule syntax; bridge
+validation only checks the list's shape and size. Check your rules with the
+installed Claude version and the actual paths and tools you use. This example
+was verified with Claude 2.1.304; it is not a general credential-exfiltration
+policy (other commands or tools may still read a file). Rules remain effective
+with the runtime's `--dangerously-skip-permissions` flag. `permissions.allow`,
+`ask`, `defaultMode`, and other permission keys remain unsupported. Workspace
+setup does not load caller-provided Claude settings: `--setting-sources ''` and
+the empty strict MCP configuration remain in effect. Deny rules supplement the
+existing environment isolation; task credentials must still be scoped to the
+intended user's authority.
 
 On shutdown timeout or cleanup failure, the daemon exits nonzero and retains its
 pidfile instead of reporting a clean shutdown. Inspect the retained runtime
