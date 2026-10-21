@@ -320,6 +320,17 @@ export class DockerCallerRuntimePool {
   private storageSuffixes(): string[] {
     return this.options.fixedImageStorage ? ['storage'] : ['workspace', 'sessions'];
   }
+  private async validateSharedVolumes(signal?: AbortSignal): Promise<void> {
+    for (const { volume } of this.options.sharedVolumes) {
+      const result = await this.command(['volume', 'inspect', volume], signal);
+      const [info] = JSON.parse(result);
+      if (info?.Name !== volume || info.Driver !== 'local' ||
+          Object.keys(info.Options ?? {}).length ||
+          Object.keys(info.Labels ?? {}).some(key => key.startsWith('vicoop.')) ||
+          volume === this.options.fixedImageStorage?.poolVolume)
+        throw new Error('shared volume must be an existing operator-owned plain local volume');
+    }
+  }
   private async volumeExists(id: string, suffix: string, signal?: AbortSignal): Promise<boolean> {
     signal?.throwIfAborted();
     const found = await this.run([
@@ -375,17 +386,6 @@ export class DockerCallerRuntimePool {
     // From here cleanup owns newly started containers, including failed starts.
     this.offline = false;
     return this.acquireContainer(id, signal, principalId);
-  }
-  private async validateSharedVolumes(signal?: AbortSignal): Promise<void> {
-    for (const { volume } of this.options.sharedVolumes) {
-      const result = await this.command(['volume', 'inspect', volume], signal);
-      const [info] = JSON.parse(result);
-      if (info?.Name !== volume || info.Driver !== 'local' ||
-          Object.keys(info.Options ?? {}).length ||
-          Object.keys(info.Labels ?? {}).some(key => key.startsWith('vicoop.')) ||
-          volume === this.options.fixedImageStorage?.poolVolume)
-        throw new Error('shared volume must be an existing operator-owned plain local volume');
-    }
   }
   async acquire(
     id: string,
