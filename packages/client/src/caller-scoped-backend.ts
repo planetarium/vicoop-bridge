@@ -2,6 +2,8 @@ import { CallerStorageHelperUnconfirmedError } from './caller-storage.js';
 import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME, decodedBase64Size } from './backends/fetch-uri-file.js';
 import {
   ExecutionScopeV1,
+  parseFederatedPrincipal,
+  executionScopePolicy,
   OPENAI_COMPAT_EXTENSION_URI,
   TRACEABILITY_EXTENSION_URI,
   type TaskAssignFrame,
@@ -76,17 +78,21 @@ export class CallerScopedBackend implements Backend {
   private validate(task: TaskAssignFrame): string {
     const scope = ExecutionScopeV1.parse(task.executionScope),
       caller = task.caller;
+    const tuple = parseFederatedPrincipal(scope.principalId);
+    const identityMatches = caller && 'principal' in caller && (
+      tuple
+        ? caller.actor?.id === tuple.issuer && caller.principal?.id === tuple.subject
+        : !caller.actor && caller.principal?.id === scope.principalId
+    );
     if (
       !task.executionId ||
-      !caller ||
-      !('principal' in caller) ||
-      caller.actor ||
-      caller.principal?.id !== scope.principalId ||
+      !identityMatches ||
+      scope.policy !== executionScopePolicy(scope.principalId) ||
       scope.agentId !== this.agentId ||
       scope.id !== scopeDigest(this.agentId, scope.principalId)
     )
       throw new Error(
-        'scope does not match directly authenticated caller, agent and execution',
+        'scope does not match authenticated caller, agent and execution',
       );
     if (
       (task.requestedExtensions ?? []).includes(OPENAI_COMPAT_EXTENSION_URI) ||

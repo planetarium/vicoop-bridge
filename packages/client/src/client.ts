@@ -6,6 +6,7 @@ import {
   OPENAI_COMPAT_EXTENSION_URI,
   TASK_REPLAY_CAPABILITY,
   EXECUTION_SCOPE_V1_CAPABILITY,
+  FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
   CALLER_RUNTIME_V1_CAPABILITY,
   encodeFrame,
   parseDownFrame,
@@ -173,6 +174,7 @@ export class Client {
   // connection. This prevents replay from racing asynchronous authentication.
   private replayReady = false;
   private callerScopeReady = false;
+  private federatedScopeReady = false;
   private negotiatedMaxFrameBytes: number | null = null;
   private readonly logger: Logger;
 
@@ -333,6 +335,7 @@ export class Client {
     if (this.stopped) return;
     this.replayReady = false;
     this.callerScopeReady = false;
+    this.federatedScopeReady = false;
     this.negotiatedMaxFrameBytes = null;
     const ws = new WebSocket(`${this.opts.serverUrl.replace(/\/$/, '')}/connect`);
     this.ws = ws;
@@ -369,7 +372,7 @@ export class Client {
               CALLER_CONTEXT_V2_CAPABILITY,
               CALLER_CONTEXT_V1_CAPABILITY,
               TASK_REPLAY_CAPABILITY,
-              ...(this.opts.backend.requiresCallerScope ? [EXECUTION_SCOPE_V1_CAPABILITY, CALLER_RUNTIME_V1_CAPABILITY] : []),
+              ...(this.opts.backend.requiresCallerScope ? [EXECUTION_SCOPE_V1_CAPABILITY, CALLER_RUNTIME_V1_CAPABILITY, FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY] : []),
             ],
             ...(this.opts.trustedIdentityIssuers !== undefined
               ? {
@@ -416,6 +419,7 @@ export class Client {
 
       switch (frame.type) {
         case 'hello.ack':
+          this.federatedScopeReady = frame.protocolCapabilities.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY);
           this.callerScopeReady = [TASK_REPLAY_CAPABILITY, CALLER_CONTEXT_V2_CAPABILITY, EXECUTION_SCOPE_V1_CAPABILITY, CALLER_RUNTIME_V1_CAPABILITY]
             .every((cap) => frame.protocolCapabilities.includes(cap));
           if (this.opts.backend.requiresCallerScope && !this.callerScopeReady) {
@@ -433,7 +437,8 @@ export class Client {
           this.acknowledgeFrames(frame.executionId, frame.acceptedSeq);
           break;
         case 'task.assign':
-          if (this.opts.backend.requiresCallerScope && !this.callerScopeReady) {
+          if (this.opts.backend.requiresCallerScope && (!this.callerScopeReady ||
+              (frame.executionScope?.policy === 'federated-principal-v1' && !this.federatedScopeReady))) {
             this.logger.error('task received without caller-runtime negotiation');
             this.stop();
             this.opts.onFatal?.({ code: 1008, reason: 'caller-runtime negotiation required' });

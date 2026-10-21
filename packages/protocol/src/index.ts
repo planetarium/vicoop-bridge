@@ -1,4 +1,5 @@
 import { z } from 'zod';
+export * from './federated-principal.js';
 
 export const PROTOCOL_VERSION = '0.1';
 // Additive capability layered onto protocol 0.1. Clients advertising this
@@ -18,12 +19,14 @@ export const CALLER_CONTEXT_V2_CAPABILITY = 'caller-context-v2';
 // Declares support for caller-isolated execution. Valid only with negotiated
 // caller-context-v2, execution-scope-v1 and task-replay-v1, so the client can
 // validate caller identity and execution generation. R1-only clients must not
-// advertise this capability; servers use it to enforce direct caller admission.
+// advertise this capability. Federated admission additionally requires the
+// separately negotiated FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY.
 export const CALLER_RUNTIME_V1_CAPABILITY = 'caller-runtime-v1';
 
 export const EXECUTION_SCOPE_V1_CAPABILITY = 'execution-scope-v1';
+export const FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY = 'federated-execution-scope-v1';
 export const ExecutionScopeV1 = z.object({
-  policy: z.literal('direct-principal-v1'),
+  policy: z.enum(['direct-principal-v1', 'federated-principal-v1']),
   id: z.string().regex(/^[a-f0-9]{64}$/),
   agentId: z.string().min(1).max(512),
   principalId: z.string().min(1).max(512),

@@ -2003,3 +2003,23 @@ test('isolated backend refuses legacy and incomplete capability negotiation befo
     } finally { client.stop(); await closeServer(server, wss); }
   }
 });
+
+test('federated assignments require their additive capability', async () => {
+  for (const negotiated of [false, true]) {
+    const server = createServer(); const wss = new WebSocketServer({ server });
+    const url = await listen(server); let calls = 0; let fatal = false;
+    wss.on('connection', ws => ws.on('message', raw => {
+      const frame = parseUpFrame(raw.toString());
+      if (frame.type !== 'hello') return;
+      assert.ok(frame.protocolCapabilities?.includes('federated-execution-scope-v1'));
+      ws.send(encodeFrame({ type: 'hello.ack', protocolCapabilities: [TASK_REPLAY_CAPABILITY, 'caller-context-v2', 'execution-scope-v1', 'caller-runtime-v1', ...(negotiated ? ['federated-execution-scope-v1'] : [])], disconnectGraceMs: 1000, maxFrameBytes: 1024 * 1024 }));
+      ws.send(encodeFrame({ ...makeAssign('federated'), executionId: 'exec-federated', executionScope: { policy: 'federated-principal-v1', agentId: 'a', principalId: 'fixture', id: 'a'.repeat(64) } }));
+    }));
+    const client = new Client({ serverUrl: url, token: 't', agentId: 'a', backendKind: 'claude', heartbeatIntervalMs: 0,
+      backend: { name: 'isolated', requiresCallerScope: true, handle: async () => { calls++; } }, onFatal: () => { fatal = true; } });
+    try {
+      client.start(); await waitFor(() => fatal || calls > 0, 'federated negotiation');
+      assert.equal(calls, negotiated ? 1 : 0); assert.equal(fatal, !negotiated);
+    } finally { client.stop(); await closeServer(server, wss); }
+  }
+});

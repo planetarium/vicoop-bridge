@@ -1367,7 +1367,7 @@ test('a terminal replay from an old execution cannot complete a reused taskId', 
 
 
 test('execution scope acknowledgement requires the full capability set', async () => {
-  for (const callerV2 of [false, true]) {
+  for (const callerV2 of [false, true]) for (const federated of [false, true]) {
     const server = createServer();
     const registry = new Registry();
     attachWsServer(server, { db: mockSql(), registry });
@@ -1379,7 +1379,8 @@ test('execution scope acknowledgement requires the full capability set', async (
       ws.send(encodeFrame({
         type: 'hello', version: PROTOCOL_VERSION, agentId: 'agent-1', token: 'token',
         protocolCapabilities: [TASK_REPLAY_CAPABILITY, EXECUTION_SCOPE_V1_CAPABILITY, 'caller-runtime-v1',
-          ...(callerV2 ? [CALLER_CONTEXT_V2_CAPABILITY] : [])],
+          ...(callerV2 ? [CALLER_CONTEXT_V2_CAPABILITY] : []),
+          ...(federated ? ['federated-execution-scope-v1'] : [])],
         agentCard: { name: 'agent', version: '0.0.0', protocolVersion: '0.3.0' },
       }));
       const [raw] = await withTimeout(ack, 5_000, 'scope acknowledgement');
@@ -1388,6 +1389,7 @@ test('execution scope acknowledgement requires the full capability set', async (
       if (frame.type === 'hello.ack') {
         assert.equal(frame.protocolCapabilities.includes(EXECUTION_SCOPE_V1_CAPABILITY), callerV2);
         assert.equal(frame.protocolCapabilities.includes('caller-runtime-v1'), callerV2);
+        assert.equal(frame.protocolCapabilities.includes('federated-execution-scope-v1'), callerV2 && federated);
         assert.equal(frame.protocolCapabilities.includes(CALLER_CONTEXT_V2_CAPABILITY), callerV2);
       }
     } finally {

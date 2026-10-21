@@ -12,6 +12,7 @@ import {
 } from '@a2x/sdk';
 import {
   CALLER_CONTEXT_CAPABILITY,
+  formatFederatedPrincipal,
   EXECUTION_SCOPE_V1_CAPABILITY,
   CALLER_CONTEXT_V2_CAPABILITY,
   OPENAI_COMPAT_EXTENSION_URI,
@@ -1155,5 +1156,31 @@ test('caller runtime rejects anonymous/delegated identity before binding or paym
     assert.equal(events.length, 1); assert.ok(events[0] && 'status' in events[0]);
     assert.equal(events[0].status.state, TaskState.FAILED);
     assert.equal(sent.length, 0); assert.equal(registry.getBinding(task.id), undefined);
+  }
+});
+
+test('executor binds federated grant identity and derives canonical scope only for upgraded runtimes', async () => {
+  const issuer = 'did:web:connector.example', subject = 'slack:T/U';
+  const key = formatFederatedPrincipal({ issuer, subject, method: 'urn:mentionable:auth:slack:workspace:v0.1' })!;
+  for (const upgraded of [false, true]) {
+    const { ws, sent } = makeWsCapture(); const registry = new Registry();
+    registry.registerAgent({ agentId: 'agent', clientId: 'client', ownerPrincipal: 'owner',
+      protocolCapabilities: ['caller-runtime-v1', EXECUTION_SCOPE_V1_CAPABILITY, CALLER_CONTEXT_V2_CAPABILITY, TASK_REPLAY_CAPABILITY, ...(upgraded ? ['federated-execution-scope-v1'] : [])],
+      agentCard: makeAgentCard(), allowedCallers: [key], ws, connectedAt: 0 });
+    const executor = new WSForwardingExecutor('agent', registry, noopTaskStore());
+    const task = { id: 'federated', contextId: 'ctx', status: { state: TaskState.SUBMITTED } } as unknown as Task;
+    const message = { role: 'user', messageId: 'm', parts: [{ kind: 'text', text: 'hello' }], metadata: { _principalId: subject, _actorId: issuer, _authorizationKey: key, _authorizationProfile: 'https://mentionable.dev/ns/oauth-federation/v0.1' } } as unknown as Message;
+    const gen = executor.executeStream(task, message); const first = gen.next();
+    if (!upgraded) { assert.equal((await first).value?.status.state, TaskState.FAILED); assert.equal(sent.length, 0); await gen.return(undefined); continue; }
+    const frame = parseDownFrame(sent[0]!); assert.equal(frame.type, 'task.assign');
+    if (frame.type === 'task.assign') {
+      assert.equal(frame.executionScope?.policy, 'federated-principal-v1');
+      assert.equal(frame.executionScope?.principalId, key);
+      assert.deepEqual(frame.caller, { principal: { id: subject }, actor: { id: issuer } });
+    }
+    const binding = registry.getBinding(task.id)!;
+    assert.equal(binding.authorizationKey, key); assert.equal(binding.actorId, issuer);
+    binding.sink.pushStatus({ taskId: task.id, contextId: 'ctx', final: true, status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() } });
+    binding.sink.finish(); await first; for await (const event of gen) void event;
   }
 });
