@@ -7,7 +7,8 @@ import { DockerCallerRuntimePool } from './caller-runtime-docker.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { scopeDigest } from './caller-runtime-store.js';
 import { setupCallerEnvironment } from './caller-environment-setup.js';
-import { runDockerCommand } from './docker-command.js';
+import { fileURLToPath } from 'node:url';
+import { runBoundedCommand, runDockerCommand } from './docker-command.js';
 
 // Supply a pinned bundled runtime image with /workspace owned by UID 1000.
 // No provider credentials or model requests are needed.
@@ -23,6 +24,21 @@ test('real Docker setup gates first request, persists across recreation and reco
   const make = () => new DockerCallerRuntimePool('claude', options, 'setup-test');
   let pool = make();
   try {
+    const config = join(root, 'config.json');
+    await writeFile(config, JSON.stringify({ agent_id: 'setup-test', backend: 'claude', backends: { claude: { caller_runtime: options } } }));
+    const cli = async (...args: string[]) => {
+      const result = await runBoundedCommand(process.execPath, ['--import', 'tsx', fileURLToPath(new URL('./cli.ts', import.meta.url)), 'container', ...args, '--config', config]);
+      assert.equal(result.exitCode, 0, result.stderr);
+      return JSON.parse(result.stdout);
+    };
+    const pending = await cli('setup', '--principal', 'typo', '--version', 'v1', '--pending');
+    assert.equal(pending.setup.ready, false);
+    const inspected = await cli('inspect', '--principal', 'typo');
+    assert.equal(inspected.preparations[0].version, 'v1');
+    assert.deepEqual(inspected.scopes, []);
+    assert.equal((await cli('list')).preparations.length, 1);
+    assert.deepEqual((await cli('remove', pending.setup.id)).preparations, []);
+
     await pool.initialize(false);
     await setupCallerEnvironment(pool, { principalId: 'alice', version: 'v1', pending: true });
     await pool.close(); pool = make(); await pool.initialize();

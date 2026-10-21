@@ -332,3 +332,11 @@ settings/MCP loading, and network permissions are unchanged by workspace setup.
 `container inspect --principal ID` shows such pending records; `container remove
 SCOPE` can cancel an unallocated pending record (for example, after a mistyped ID).
 For allocated scopes, removal retains its existing destructive meaning.
+
+The opt-in setup integration test exercises the real CLI pending/inspect/list/remove
+flow, file modes, recreation, and failed-update recovery against a disposable
+scope. Supply a local pinned bundled runtime image; no provider calls occur:
+
+```sh
+VICOOP_SETUP_TEST_IMAGE=sha256:YOUR_IMAGE_ID pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-environment-setup.integration.test.ts
+```

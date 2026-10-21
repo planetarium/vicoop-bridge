@@ -55,4 +55,6 @@ test('pending and failed setup gate persist; retry only publishes ready after co
   assert.deepEqual(events.slice(-3), ['check', 'stop', 'ready']);
   const unchanged = await setupCallerEnvironment(pool, { principalId: 'alice', version: 'v1', from: source }, () => { throw new Error('must not run twice'); });
   assert.equal(unchanged.unchanged, true);
+  await assert.rejects(setupCallerEnvironment(pool, { principalId: 'alice', version: 'v2', from: join(source, 'missing') }), /remains pending/);
+  assert.deepEqual(state, { version: 'v2', ready: false });
 });
