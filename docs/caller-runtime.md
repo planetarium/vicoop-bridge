@@ -393,3 +393,70 @@ Canceled queued requests return promptly, but their queue slots remain occupied 
 SQLite also records completed allocations. If both data volumes remain but the container is absent and no completion record exists, execution reports `runtime_allocation_incomplete` and quarantines that caller. Restore the original state/resources or explicitly remove the scope before retrying. Older records can establish completion from a validated existing container; offline recreation records that evidence before removing it. A same-name replacement container has a different Docker ID and causes a fresh worker and conversation reset.
 
 New reservations carry a SQLite pending-preflight marker until all orphan checks succeed. If rollback fails, the original error is retained and requests fail with `runtime_reservation_unconfirmed`; restart does not adopt or stop those unconfirmed resources. Stop the daemon and inspect/remove the affected scope through offline administration before retrying.
+
+## Shared read-only materials
+
+To give every caller the same reference documents or repository snapshot, add
+`sharedVolumes` to the selected backend's `caller_runtime` configuration:
+
+```json
+"sharedVolumes": [
+  { "name": "docs", "volume": "company-docs-v1" }
+]
+```
+
+This exposes the existing Docker named volume at `/shared/docs` in every caller
+container. Names are simple identifiers (letters, digits, `_`, `-`); destinations
+are always under `/shared`, separate from private workspace/session storage and
+broker control paths. Up to 16 volumes are supported. The default is no shared
+volumes. This does not add user roles or change caller access control.
+
+Create and populate the volume before starting the bridge. For example, using
+your already trusted caller image ID as `CALLER_IMAGE` and a local `materials`
+directory containing only documents intended for every caller:
+
+```sh
+CALLER_IMAGE=sha256:REPLACE_WITH_YOUR_CALLER_IMAGE_ID
+docker volume create company-docs-v1
+tar -C ./materials -cf - . | docker run --rm -i --network none --user 0 \
+  --mount type=volume,source=company-docs-v1,target=/materials,volume-nocopy \
+  --entrypoint /bin/sh "$CALLER_IMAGE" -c \
+  'tar -xf - -C /materials && chmod -R a+rX /materials'
+```
+
+The bridge accepts only existing plain local Docker volumes, without driver
+options or `vicoop.*` ownership labels. Bridge-managed names starting with `vb-` or `vicoop-`
+and the configured fixed-storage pool are rejected. Host bind mounts, NFS/local
+driver bind options, and caller/provider credential volumes are not supported.
+Shared volumes must contain no secrets or private caller data: all callers can
+read and copy their contents. Read-only mounts prevent callers from modifying
+the shared copy; they do not make documents trusted instructions.
+
+Mounts use `readonly` and `volume-nocopy`. The bridge checks the volume before
+startup/acquisition and checks mount identity, destination and read-only mode on
+container creation, recovery and reuse. Shared data does not count toward each
+caller's writable storage limit. Scope recreation and removal never delete these
+operator-owned volumes, even when another caller is using them.
+
+For initial configuration or a refresh, stop the daemon and use `container list`
+and `container recreate SCOPE_DIGEST` for **every retained scope, with the old
+configuration still in place**. Recreation removes containers but preserves
+private workspace/session data. Then edit `sharedVolumes` and restart; containers
+are created with the new mounts on acquisition. Changing mounts on retained
+containers fails validation rather than silently using stale configuration.
+
+Prefer a new versioned volume (for example `company-docs-v2`) for every refresh.
+Read-only applies to caller mounts, not to other Docker clients: an external
+writer can change a volume while callers read it. If updating in place, stop
+**all** consumers, including other agents sharing that volume, before writing.
+Keep old versions until no containers use them, then remove them explicitly with
+`docker volume rm company-docs-v1`. Offline scope removal remains available even
+if a shared volume is missing; restore or replace it before resuming execution.
+
+Maintainers can repeat the Docker isolation/lifecycle smoke with an installed
+caller image (no provider credentials or model invocation required):
+
+```sh
+VICOOP_SHARED_TEST_IMAGE=sha256:YOUR_CALLER_IMAGE_ID \
+  pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-shared-volumes.integration.test.ts
+```

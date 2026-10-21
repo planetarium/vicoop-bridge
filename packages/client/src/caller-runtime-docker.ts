@@ -110,6 +110,7 @@ export class DockerCallerRuntimePool {
         )
           throw new Error('caller image must not declare volumes or provider environment');
       }
+      if (this.validateExecution) await this.validateSharedVolumes();
       const ids = await this.store.scopes();
       for (const id of ids) await this.storage.reconcile(id);
       if (this.options.fixedImageStorage) await this.storage.initialize();
@@ -241,9 +242,16 @@ export class DockerCallerRuntimePool {
       ['/workspace', `${this.name(id)}-${this.options.fixedImageStorage ? 'storage' : 'workspace'}`],
       [`/data/sessions/${this.kind}`, `${this.name(id)}-${this.options.fixedImageStorage ? 'storage' : 'sessions'}`],
     ]);
+    const shared = new Map(this.options.sharedVolumes.map(entry => [`/shared/${entry.name}`, entry.volume]));
+    const declared = h.Mounts ?? [];
+    for (const [target, volume] of shared) {
+      const mount = declared.find((m: any) => m.Target === target);
+      if (!mount || mount.Type !== 'volume' || mount.Source !== volume ||
+          mount.ReadOnly !== true || mount.VolumeOptions?.NoCopy !== true ||
+          mount.VolumeOptions?.Subpath) fail();
+    }
     if (this.options.fixedImageStorage) {
-      const declared = h.Mounts ?? [];
-      if (declared.length !== 2) fail();
+      if (declared.length !== 2 + shared.size) fail();
       for (const [target, subpath] of [['/workspace', 'workspace'], [`/data/sessions/${this.kind}`, 'sessions']]) {
         const mount = declared.find((m: any) => m.Target === target);
         if (!mount || mount.Type !== 'volume' || mount.Source !== `${this.name(id)}-storage` ||
@@ -253,12 +261,17 @@ export class DockerCallerRuntimePool {
     for (const m of c.Mounts ?? []) {
       if (m.Type === 'tmpfs' && ['/tmp', '/home/node'].includes(m.Destination))
         continue;
+      if (shared.has(m.Destination)) {
+        if (m.Type !== 'volume' || shared.get(m.Destination) !== m.Name || m.RW !== false) fail();
+        shared.delete(m.Destination);
+        continue;
+      }
       if (m.Type !== 'volume' || mounts.get(m.Destination) !== m.Name || !m.RW)
         fail();
       mounts.delete(m.Destination);
     }
     if (
-      mounts.size ||
+      mounts.size || shared.size ||
       Object.keys(h.Tmpfs ?? {}).length !== Object.keys(CALLER_TMPFS).length ||
       Object.entries(CALLER_TMPFS).some(([path, options]) =>
         typeof h.Tmpfs?.[path] !== 'string' ||
@@ -306,6 +319,17 @@ export class DockerCallerRuntimePool {
   }
   private storageSuffixes(): string[] {
     return this.options.fixedImageStorage ? ['storage'] : ['workspace', 'sessions'];
+  }
+  private async validateSharedVolumes(signal?: AbortSignal): Promise<void> {
+    for (const { volume } of this.options.sharedVolumes) {
+      const result = await this.command(['volume', 'inspect', volume], signal);
+      const [info] = JSON.parse(result);
+      if (info?.Name !== volume || info.Driver !== 'local' ||
+          Object.keys(info.Options ?? {}).length ||
+          Object.keys(info.Labels ?? {}).some(key => key.startsWith('vicoop.')) ||
+          volume === this.options.fixedImageStorage?.poolVolume)
+        throw new Error('shared volume must be an existing operator-owned plain local volume');
+    }
   }
   private async volumeExists(id: string, suffix: string, signal?: AbortSignal): Promise<boolean> {
     signal?.throwIfAborted();
@@ -389,6 +413,7 @@ export class DockerCallerRuntimePool {
       onMutation?.();
       return this.command(args, signal);
     };
+    await this.validateSharedVolumes(signal);
     const name = this.name(id);
     const fresh = await this.store.reserve(id, this.kind, principalId, true); // reserve before the first Docker mutation
     if (!fresh && await this.store.reservationPending(id))
@@ -473,6 +498,9 @@ export class DockerCallerRuntimePool {
         this.options.fixedImageStorage ? `type=volume,source=${name}-storage,target=/workspace,volume-subpath=workspace,volume-nocopy` : `type=volume,source=${name}-workspace,target=/workspace`,
         '--mount',
         this.options.fixedImageStorage ? `type=volume,source=${name}-storage,target=/data/sessions/${this.kind},volume-subpath=sessions,volume-nocopy` : `type=volume,source=${name}-sessions,target=/data/sessions/${this.kind}`,
+        ...this.options.sharedVolumes.flatMap(({ name: sharedName, volume }) => [
+          '--mount', `type=volume,source=${volume},target=/shared/${sharedName},readonly,volume-nocopy`,
+        ]),
         '--tmpfs',
         `/tmp:${CALLER_TMPFS['/tmp']}`,
         '--tmpfs',
