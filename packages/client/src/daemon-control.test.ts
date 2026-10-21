@@ -321,6 +321,35 @@ test('claimPidFile: claims an unheld pidfile and writes the placeholder', () => 
   }
 });
 
+test('claimPidFile: creates missing private parent directories before claiming', () => {
+  const dir = tmpDir();
+  try {
+    const home = join(dir, 'new', 'home');
+    const path = join(home, 'vicoop.pid');
+    assert.deepEqual(claimPidFile(sampleRecord, { path }), { ok: true });
+    assert.deepEqual(readPidRecord(path), sampleRecord);
+    if (process.platform !== 'win32') {
+      assert.equal(statSync(home).mode & 0o777, 0o700);
+      assert.equal(statSync(path).mode & 0o777, 0o600);
+    }
+    assert.equal(claimPidFile(sampleRecord, { path, probe: aliveProbe }).ok, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('claimPidFile: propagates an invalid parent path without replacing it', () => {
+  const dir = tmpDir();
+  try {
+    const parent = join(dir, 'file');
+    writeFileSync(parent, 'keep');
+    assert.throws(() => claimPidFile(sampleRecord, { path: join(parent, 'vicoop.pid') }));
+    assert.equal(statSync(parent).isFile(), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('claimPidFile: refuses when a live+ours daemon already holds it', () => {
   const dir = tmpDir();
   try {
