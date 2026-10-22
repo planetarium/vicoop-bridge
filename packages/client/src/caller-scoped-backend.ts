@@ -34,6 +34,7 @@ interface Entry {
   quarantined: boolean;
 }
 export class CallerScopedBackend implements Backend {
+  remoteApprovals?: boolean;
   readonly requiresCallerScope = true;
   readonly name: string;
   private entries = new Map<string, Entry>();

@@ -6662,3 +6662,37 @@ test('container-selected deny rules reach Claude argv alongside bypass and sourc
   assert.ok(child.args.includes('--strict-mcp-config'));
   assert.ok(child.args.includes('--dangerously-skip-permissions'));
 });
+
+for (const decision of ['allow_once', 'deny'] as const) {
+  test(`remote approval: Claude control request waits for ${decision} and returns fixed arguments`, async () => {
+    const { RemoteApprovalBroker } = await import('../remote-approval.js');
+    const broker = new RemoteApprovalBroker();
+    const fake = makeFakeSpawn(() => {});
+    const backend = createClaudeBackend({ spawn: fake.spawn, remoteApprovals: true });
+    const task = { ...assign('run command'), executionId: 'execution-approval' };
+    const collected = collect();
+    let request!: Extract<UpFrame, { type: 'approval.request' }>;
+    const running = broker.run(task, NEVER, true, f => { collected.emit(f); if (f.type === 'approval.request') request = f; },
+      () => backend.handle(task, collected.emit, NEVER));
+    while (!fake.lastChild()) await new Promise(r => setImmediate(r));
+    const child = fake.lastChild()!;
+    // Wait until the backend has attached stdout listeners.
+    await new Promise(r => setImmediate(r));
+    assert.ok(child.args.includes('--permission-prompt-tool'));
+    child.emitStdout(JSON.stringify({ type: 'control_request', request_id: 'cc-1', request: {
+      subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'echo approval-test' },
+    } }) + '\n');
+    assert.ok(request);
+    assert.equal(child.stdinPayload.includes('control_response'), false);
+    broker.resolve({ type: 'approval.resolve', taskId: task.taskId, executionId: task.executionId,
+      requestId: request.request.requestId, decision });
+    await new Promise(r => setImmediate(r));
+    const reply = child.stdinPayload.trim().split('\n').map(l => JSON.parse(l)).find(f => f.type === 'control_response');
+    assert.equal(reply.response.request_id, 'cc-1');
+    assert.equal(reply.response.response.behavior, decision === 'allow_once' ? 'allow' : 'deny');
+    if (decision === 'allow_once') assert.deepEqual(reply.response.response.updatedInput, { command: 'echo approval-test' });
+    child.emitStdout(JSON.stringify({ type: 'result', result: 'done' }) + '\n');
+    child.finish(0);
+    await running;
+  });
+}

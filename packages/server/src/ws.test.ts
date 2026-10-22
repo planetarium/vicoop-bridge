@@ -1426,3 +1426,44 @@ test('legacy hello without protocol capabilities registers and processes task fr
     await closeServer(server);
   }
 });
+
+test('remote approval frames negotiate, preserve auth-required through heartbeats, and acknowledge consumption', async () => {
+  const { REMOTE_APPROVAL_CAPABILITY, APPROVAL_EXTENSION_URI } = await import('@vicoop-bridge/protocol');
+  const { randomUUID } = await import('node:crypto');
+  const server = createServer(); const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server); const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+  const received: ReturnType<typeof parseDownFrame>[] = [];
+  ws.on('message', raw => received.push(parseDownFrame(raw.toString())));
+  const until = async (f: () => boolean) => {
+    for (let i = 0; i < 100 && !f(); i++) await new Promise(r => setTimeout(r, 5));
+    assert.ok(f());
+  };
+  const sink = makeSink();
+  const b = { agentId: 'agent-1', taskId: 'approval-task', executionId: 'approval-execution', nextClientSeq: 0, contextId: 'ctx', sink };
+  try {
+    await once(ws, 'open');
+    ws.send(encodeFrame({ type: 'hello', version: PROTOCOL_VERSION, agentId: 'agent-1', token: 'token',
+      protocolCapabilities: [TASK_REPLAY_CAPABILITY, REMOTE_APPROVAL_CAPABILITY],
+      agentCard: { name: 'agent', version: '1', protocolVersion: '0.3.0' } }));
+    await until(() => received.some(f => f.type === 'hello.ack'));
+    assert.ok(received.some(f => f.type === 'hello.ack' && f.protocolCapabilities.includes(REMOTE_APPROVAL_CAPABILITY)));
+    registry.bindTask(b);
+    const requestId = randomUUID();
+    ws.send(encodeFrame({ type: 'approval.request', taskId: b.taskId, executionId: b.executionId, seq: 0,
+      request: { requestId, toolName: 'Bash', input: { command: 'echo hi' }, expiresAt: new Date(Date.now() + 60_000).toISOString() } }));
+    await until(() => sink.statuses.length === 1);
+    assert.equal(sink.statuses[0].status.state, 'auth-required');
+    assert.ok(sink.statuses[0].status.message?.metadata?.[APPROVAL_EXTENSION_URI]);
+    ws.send(encodeFrame({ type: 'task.status', taskId: b.taskId, executionId: b.executionId, seq: 1,
+      status: { state: 'working' }, metadata: { [OPENAI_COMPAT_EXTENSION_URI]: { heartbeat: true } } }));
+    await until(() => sink.statuses.length === 2);
+    assert.equal(sink.statuses[1].status.state, 'auth-required');
+    registry.approvals.decide(requestId, 'allow_once', 'eth:0x0');
+    await until(() => received.some(f => f.type === 'approval.resolve'));
+    ws.send(encodeFrame({ type: 'approval.received', taskId: b.taskId, executionId: b.executionId, seq: 2, requestId, decision: 'allow_once' }));
+    await until(() => sink.statuses.length === 3);
+    assert.equal(sink.statuses[2].status.state, 'working');
+    assert.equal(registry.approvals.list().length, 0);
+  } finally { registry.unbindTask(b.taskId, b); ws.close(); await once(ws, 'close'); await closeServer(server); }
+});

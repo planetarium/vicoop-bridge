@@ -662,6 +662,7 @@ export class WSForwardingExecutor extends AgentExecutor {
       if (this.inactivityTimeoutMs <= 0) return;
       clearWatchdog();
       watchdog = setTimeout(() => {
+        if (this.registry.approvals.waiting(binding)) { armWatchdog(); return; }
         queue.push({
           taskId,
           contextId,
@@ -740,8 +741,15 @@ export class WSForwardingExecutor extends AgentExecutor {
           yield terminal;
           break;
         }
+        const wasAuthRequired = task.status.state === TaskState.AUTH_REQUIRED;
         history = appendHistoryMessage(history, event.status.message);
         task.history = history;
+        task.status = event.status;
+        // Polling/subscribing clients must see the suspended state while the
+        // original streaming call remains open, and its subsequent resumption.
+        if (wasAuthRequired !== (event.status.state === TaskState.AUTH_REQUIRED)) {
+          await this.taskStore.updateTask(taskId, { status: task.status, history });
+        }
         yield event;
       }
       // Stop the watchdog before the awaited persist below — the stream is done

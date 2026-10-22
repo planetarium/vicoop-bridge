@@ -408,6 +408,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         if (args.cwd || args.runtimeName) throw new Error('container owns its workspace and runtime names');
         const backend = await createCallerRuntime({kind:'claude',agentId:args.agentId,
           config:backends.claude?.caller_runtime,claude:{
+            remoteApprovals: backends.claude?.remote_approvals,
             identity:deriveIdentity(args.agentId,args.server) ?? undefined,
             settings:disableClaudeSandboxGuard(baseSettings),model:args.claudeModel,
             claudeReasoning:args.claudeReasoning,claudeThinkingBudget:args.claudeThinkingBudget,
@@ -418,6 +419,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       const isolated = isInsideContainer();
       const settings = isolated ? disableClaudeSandboxGuard(baseSettings) : baseSettings;
       const backend = createClaudeBackend({
+        remoteApprovals: backends.claude?.remote_approvals,
         cwd: args.cwd,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
         settings,

@@ -113,7 +113,7 @@ export async function createCallerRuntime(args: {
                 '{"mcpServers":{}}',
                 '--setting-sources',
                 '',
-                '--dangerously-skip-permissions',
+                ...(args.claude?.remoteApprovals ? [] : ['--dangerously-skip-permissions']),
               ],
             })
           : createCodexExecutionBackend({
@@ -146,6 +146,7 @@ export async function createCallerRuntime(args: {
       };
     },
   );
+  backend.remoteApprovals = args.kind === 'claude' ? args.claude?.remoteApprovals === true : args.codex?.approvalDecision === 'remote';
   await backend.initialize();
   return backend;
 }

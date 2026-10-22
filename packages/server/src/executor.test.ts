@@ -1184,3 +1184,37 @@ test('executor binds federated grant identity and derives canonical scope only f
     binding.sink.finish(); await first; for await (const event of gen) void event;
   }
 });
+
+
+test('remote approval persists auth-required and resumption without firing the inactivity watchdog', async () => {
+  const { ws } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({ agentId: 'approval-agent', clientId: 'client', ownerPrincipal: 'owner',
+    protocolCapabilities: [TASK_REPLAY_CAPABILITY], agentCard: makeAgentCard(), allowedCallers: [], ws, connectedAt: 0 });
+  const store = captureTaskStore();
+  const executor = new WSForwardingExecutor('approval-agent', registry, store, 20);
+  const task = { id: 'approval-task', contextId: 'ctx', status: { state: TaskState.SUBMITTED } } as Task;
+  const message = { role: 'user', messageId: 'm', parts: [{ text: 'work' }] } as Message;
+  const gen = executor.executeStream(task, message);
+  const first = gen.next();
+  const binding = registry.getBinding(task.id)!;
+  const approval = registry.approvals.request(binding, { requestId: '12345678-1234-4234-8234-123456789012', toolName: 'Bash', input: {}, expiresAt: new Date(Date.now() + 60000).toISOString() });
+  const status = (state: TaskState, final = false) => ({ taskId: task.id, contextId: 'ctx', final, status: { state, timestamp: new Date().toISOString() } });
+  binding.sink.pushStatus(status(TaskState.AUTH_REQUIRED));
+  assert.equal((await first).value?.status.state, TaskState.AUTH_REQUIRED);
+  assert.equal((store.updates.at(-1) as { status: { state: string } }).status.state, TaskState.AUTH_REQUIRED);
+  const next = gen.next();
+  await new Promise(r => setTimeout(r, 65));
+  assert.equal(registry.getBinding(task.id), binding);
+  registry.approvals.received(binding, approval.requestId, 'deny');
+  binding.sink.pushStatus(status(TaskState.WORKING));
+  assert.equal((await next).value?.status.state, TaskState.WORKING);
+  assert.equal((store.updates.at(-1) as { status: { state: string } }).status.state, TaskState.WORKING);
+  binding.sink.pushStatus(status(TaskState.COMPLETED, true));
+  binding.sink.finish();
+  for await (const event of gen) {
+    assert.ok('status' in event);
+    assert.equal(event.status.state, TaskState.COMPLETED);
+  }
+  assert.equal(registry.approvals.get(approval.requestId), undefined);
+});

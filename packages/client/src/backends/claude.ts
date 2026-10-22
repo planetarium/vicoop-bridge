@@ -1,3 +1,4 @@
+import { currentApprovalRequester } from '../remote-approval.js';
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -89,6 +90,7 @@ export type ClaudeSpawnFn = (
 ) => ClaudeChildHandle;
 
 export interface ClaudeBackendOptions {
+  remoteApprovals?: boolean;
   command?: string;
   cwd?: string;
   // Working directory for stateless openai-compat spawns, overriding `cwd` for
@@ -307,6 +309,8 @@ interface SessionEntry {
 // tool name + tool_use_id ride along on a `data` part so consumers can
 // filter/count tool calls reliably even after the text was clipped.
 interface StreamEvent {
+  request_id?: string;
+  request?: { subtype?: string; tool_name?: string; input?: Record<string, unknown> };
   type?: unknown;
   // `subtype` + top-level `model` ride on the `system/init` event — the
   // session metadata claude emits first, before any turn. `model` is the
@@ -1658,6 +1662,7 @@ export function createClaudeBackend(
   const spawnFn = opts.spawn ?? defaultSpawn;
   const stderrCap = opts.stderrCaptureBytes ?? 8192;
   const sessionTtlMs = opts.sessionTtlMs ?? 60 * 60 * 1000;
+  if (opts.remoteApprovals && opts.extraArgs?.some(a => a === '--dangerously-skip-permissions' || a === '--permission-mode' || a.startsWith('--permission-mode='))) throw new Error('Remote approvals conflict with extra permission flags');
   const now = opts.now ?? Date.now;
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const openaiCompatTrace = opts.openaiCompatTrace === true;
@@ -1885,6 +1890,7 @@ export function createClaudeBackend(
 
   return {
     name: 'claude',
+    remoteApprovals: opts.remoteApprovals === true,
 
     getSendFileMcpServer: () => sendFileMcp,
 
@@ -2670,6 +2676,7 @@ export function createClaudeBackend(
 
       const args: string[] = [
         '-p',
+        ...(opts.remoteApprovals ? ['--permission-prompt-tool', 'stdio', '--permission-mode', 'default'] : []),
         '--input-format',
         'stream-json',
         '--output-format',
@@ -3072,8 +3079,44 @@ export function createClaudeBackend(
         emittedAnyArtifact = true;
       };
 
+      const requestApproval = currentApprovalRequester();
+      let approvalLifetime = new AbortController();
+      child.on('close', () => approvalLifetime.abort());
+      const controlRequests = new Map<string, AbortController>();
       const handleEvent = (evt: StreamEvent): void => {
         if (settled) return;
+        if (evt.type === 'control_cancel_request' && typeof evt.request_id === 'string') {
+          controlRequests.get(evt.request_id)?.abort();
+          return;
+        }
+        if (evt.type === 'control_request' && opts.remoteApprovals && typeof evt.request_id === 'string') {
+          const requestId = evt.request_id;
+          if (controlRequests.has(requestId)) return;
+          const requestLifetime = new AbortController();
+          controlRequests.set(requestId, requestLifetime);
+          const lifetime = approvalLifetime;
+          const abortRequest = () => requestLifetime.abort();
+          lifetime.signal.addEventListener('abort', abortRequest, { once: true });
+          const target = child;
+          const request = evt.request;
+          const valid = request?.subtype === 'can_use_tool' && typeof request.tool_name === 'string' &&
+            request.input !== null && typeof request.input === 'object' && !Array.isArray(request.input);
+          const input = valid ? structuredClone(request!.input!) : {};
+          const decision = valid && request!.tool_name !== 'AskUserQuestion'
+            ? requestApproval(request!.tool_name!, input, requestLifetime.signal)
+            : Promise.resolve('deny');
+          void decision.catch(() => 'deny' as const).then(value => {
+            lifetime.signal.removeEventListener('abort', abortRequest);
+            if (settled || signal.aborted || lifetime.signal.aborted || requestLifetime.signal.aborted) return;
+            const response = value === 'allow_once'
+              ? { behavior: 'allow', updatedInput: input }
+              : { behavior: 'deny', message: 'Remote tool permission denied or expired' };
+            try { target.stdin?.write(JSON.stringify({ type: 'control_response', response: {
+              subtype: 'success', request_id: requestId, response,
+            } }) + '\n'); } catch { /* process exit fails the task closed */ }
+          });
+          return;
+        }
         if (openaiCompatTrace) {
           const textLen =
             evt.type === 'assistant'
@@ -3532,6 +3575,9 @@ export function createClaudeBackend(
         );
         try {
           child = spawnFn(command, retryArgs, { cwd: effectiveCwd, env: effectiveEnv });
+          approvalLifetime = new AbortController();
+          child.on('close', () => approvalLifetime.abort());
+          controlRequests.clear();
           recorder.mark('spawn');
           attachStreams(child);
           child.stdin?.on('error', (err: unknown) => {

@@ -3120,3 +3120,40 @@ test('canceling an inline image transfer reaches IO hooks and cleans input befor
   assert.equal(fake.children.length, 0);
   assert.equal((frames.at(-1) as any).status.state, 'canceled');
 });
+
+for (const decision of ['allow_once', 'deny'] as const) {
+  test(`remote approval: Codex pending RPC receives ${decision} on the original request`, async () => {
+    const { RemoteApprovalBroker } = await import('../remote-approval.js');
+    const broker = new RemoteApprovalBroker();
+    let reply: Record<string, unknown> | undefined;
+    const fake = makeFakeSpawn(() => {
+      const happy = happyPath({ threadId: 'thread-1' });
+      return { onLine(frame, child, index) {
+        if (frame.method === 'turn/start') {
+          child.emitStdout({ id: frame.id, result: { turn: { id: 'turn-approval' } } });
+          queueMicrotask(() => child.emitStdout({ id: 'permission-1', method: 'item/commandExecution/requestApproval',
+            params: { threadId: 'thread-1', turnId: 'turn-approval', itemId: 'cmd-1', command: 'echo approved' } }));
+          return;
+        }
+        if (frame.id === 'permission-1') {
+          reply = frame;
+          child.emitStdout({ method: 'turn/completed', params: { turn: { id: 'turn-approval', status: 'completed', items: [], error: null } } });
+          return;
+        }
+        happy.onLine?.(frame, child, index);
+      } };
+    });
+    const backend = createCodexBackend({ spawn: fake.spawn, approvalDecision: 'remote' });
+    const task = assign('run', 'ctx-approval', { executionId: 'run-approval' });
+    const collected = collect();
+    let request!: Extract<UpFrame, { type: 'approval.request' }>;
+    const running = broker.run(task, NEVER, true, f => { if (f.type === 'approval.request') request = f; },
+      () => backend.handle(task, collected.emit, NEVER));
+    for (let i = 0; i < 100 && !request; i++) await new Promise(r => setTimeout(r, 5));
+    assert.ok(request); assert.equal(reply, undefined);
+    broker.resolve({ type: 'approval.resolve', taskId: task.taskId, executionId: task.executionId!, requestId: request.request.requestId, decision });
+    await running;
+    assert.deepEqual((reply as Record<string, unknown> | undefined)?.result, { decision: decision === 'allow_once' ? 'accept' : 'decline' });
+    backend.stop?.();
+  });
+}

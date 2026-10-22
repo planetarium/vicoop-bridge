@@ -109,6 +109,7 @@ export function defaultOwnerSessionPath(): string {
 export type BackendRuntime = 'host' | 'container';
 
 export interface ClaudeBackendConfig {
+  remote_approvals?: boolean;
   cwd?: string;
   settings?: Record<string, unknown>;
   /**
@@ -164,7 +165,7 @@ export interface CodexBackendConfig {
   cwd?: string;
   sandbox_mode?: string;
   /** What to answer when codex requests user approval. Default `decline`. */
-  approval_decision?: 'accept' | 'acceptForSession' | 'decline';
+  approval_decision?: 'accept' | 'acceptForSession' | 'decline' | 'remote';
   runtime?: BackendRuntime;
   /** Legacy shared-container selector, retained to report migration errors. */
   runtime_name?: string;
@@ -280,6 +281,7 @@ const KNOWN_BACKENDS = new Set([
   'vicoop-codex',
 ]);
 const KNOWN_APPROVAL_DECISIONS = new Set([
+  'remote',
   'accept',
   'acceptForSession',
   'decline',
@@ -345,8 +347,9 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const runtime = pickBackendRuntime(claudeRaw.runtime);
       const callerRuntime = claudeRaw.caller_runtime === undefined ? undefined : CallerRuntimeConfig.parse(claudeRaw.caller_runtime);
       const runtimeName = asString(claudeRaw.runtime_name);
-      if (cwd || settings || model || models || runtime || runtimeName || callerRuntime) {
+      if (cwd || settings || model || models || runtime || runtimeName || callerRuntime || claudeRaw.remote_approvals === true) {
         out.claude = {};
+        if (claudeRaw.remote_approvals === true) out.claude.remote_approvals = true;
         if (cwd) out.claude.cwd = cwd;
         if (settings) out.claude.settings = settings;
         if (model) out.claude.model = model;
@@ -365,7 +368,7 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const approvalRaw = asString(codexRaw.approval_decision);
       const validApproval =
         approvalRaw && KNOWN_APPROVAL_DECISIONS.has(approvalRaw)
-          ? (approvalRaw as 'accept' | 'acceptForSession' | 'decline')
+          ? (approvalRaw as 'accept' | 'acceptForSession' | 'decline' | 'remote')
           : undefined;
       const runtime = pickBackendRuntime(codexRaw.runtime);
       const callerRuntime = codexRaw.caller_runtime === undefined ? undefined : CallerRuntimeConfig.parse(codexRaw.caller_runtime);

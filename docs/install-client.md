@@ -1242,3 +1242,11 @@ the updated server to all instances before using transfers.
 Structured `agent_transfer` audit events include the acting admin, agent ID,
 previous/new owner, timestamp, outcome, and session synchronization status.
 They never contain bearer credentials.
+
+### Remote tool approvals
+
+To forward native Claude/Codex permission requests to the bridge owner's admin
+UI, opt in with `backends.claude.remote_approvals: true` or
+`backends.codex.approval_decision: "remote"`. Both server and client must support
+this capability. See [remote tool approval](./tool-approval-v1.md) for native
+permission behavior, A2A states, the decision API and integration limitations.
