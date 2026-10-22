@@ -37,11 +37,13 @@ AskUserQuestion remains a separate `input-required` flow.
 ## A2A mapping
 
 The task enters the standard `auth-required` state (`TASK_STATE_AUTH_REQUIRED`
-on the A2A 1.0 binding), with `final: false`: the stream stays open and carries
-the resumption and the terminal event. (The bridge patches `@a2x/sdk` 0.24.0,
-which would otherwise flag every `auth-required` event as final.) `tasks/get` sees the state while the
-stream stays open; the existing subscription/stream carries the return to
-`working`. The native execution is retained; clients must not submit a new
+on the A2A 1.0 binding). The underlying SDK (`@a2x/sdk` 0.24.0) marks every
+`auth-required` status update `final: true`, but the bridge keeps the physical
+stream open: the same stream then carries `working`, any artifacts and the
+terminal event (`final: true`). Clients should treat a `final: true`
+`auth-required` event carrying this extension's metadata as a suspension, not
+as the end of the execution. `tasks/get` sees the state while the stream stays
+open. The native execution is retained; clients must not submit a new
 message to approve. `contextId` is conversation scope, not approval authority.
 
 The Agent Card advertises this optional extension only while an opted-in client
@@ -92,12 +94,14 @@ dispatch marker into the public task metadata, keyed by the extension URI:
   after the native execution has finished and its approval records are gone.
 - Every dispatch that reuses the task ID replaces it, including continuations
   by the same caller. A dispatch to a client without execution replay removes
-  it. In the same write the task's status is reset to `working` and its
-  artifacts are cleared, so nothing from an earlier execution is shown under
-  the new marker; conversation `history` is kept.
+  it. In the same write the task's status is reset to `working`; for a
+  replay-capable dispatch (one that gets a marker) its artifacts are also
+  cleared, so nothing from an earlier execution is shown under the new marker.
+  Conversation `history` is kept.
 - While a marker is current, the task's `artifacts` are exactly that
   execution's output (empty if it produced none), even when it reuses an
-  artifact ID from an earlier execution.
+  artifact ID from an earlier execution. Dispatches without replay support
+  (no marker) keep the previous behavior of accumulating artifacts per task.
 - Only the server writes it. A value supplied by the caller in request metadata
   is discarded; other metadata keys are preserved.
 - Writes from any other message request are not persisted while a marker is
@@ -109,6 +113,17 @@ dispatch marker into the public task metadata, keyed by the extension URI:
   cancellation is unaffected.
 - Status update events on the stream carry the same `{ "executionId" }` entry
   in their top-level `metadata`, identifying the execution they came from.
+
+A `message/stream` response (v0.3 JSON-RPC, v1 JSON-RPC and v1 HTTP+JSON) does
+not own the execution's lifetime. If the client disconnects — for example a
+connector hitting a serverless time limit while an approval's ten-minute
+deadline is still running — the bridge detaches the response and keeps draining
+the execution's events, so the approval stays decidable and the state and
+output keep being persisted until the native terminal state, approval expiry or
+the inactivity watchdog ends it. While attached, the response follows the
+client's reads with at most one event buffered ahead. To stop an execution,
+use `tasks/cancel`; disconnecting does not cancel. Other streams
+(`tasks/resubscribe`) still end with their connection.
 
 A client that lost the stream after an `auth-required` approval recovers its
 result by calling `tasks/get` and comparing the marker with the approval's
@@ -277,8 +292,12 @@ principal/workspace/actor/scope/task, revoked grant, execution replacement),
 argument privacy and concurrent/idempotent decisions; the dispatch marker on
 initial and terminal `tasks/get`, its replacement on same-task re-dispatch, and
 skipped writes from superseded (replay and legacy) executions and from
-requests that fail before dispatch, exclusive per-execution artifacts, and the
-v0.3 SSE approval event (`final: false`, `executionId`); WebSocket negotiation, replay receipts and heartbeat
+requests that fail before dispatch, exclusive per-execution artifacts for
+replay-capable dispatches (legacy accumulation preserved), the v0.3 SSE
+approval event as emitted by the SDK (`final: true`, `executionId`, followed by
+`working`/artifact/`completed` on the same stream), and client disconnect on
+all three streaming bindings (approval still decidable, result recovered
+through `tasks/get`); WebSocket negotiation, replay receipts and heartbeat
 state preservation; and persisted A2A suspension/resumption without inactivity
 expiry. A local Claude CLI smoke test additionally verified `can_use_tool` and
 its denial response without a Claude/Codex update.

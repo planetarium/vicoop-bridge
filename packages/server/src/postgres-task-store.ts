@@ -402,9 +402,10 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
         if (update.artifacts !== undefined) next.artifacts = update.artifacts;
         if (update.history !== undefined) next.history = update.history;
         if (update.metadata !== undefined) next.metadata = update.metadata;
-        // A dispatching request's output is its own execution's artifacts,
-        // never the SDK's merge with earlier turns of a reused task ID.
-        if (writer?.marked) next.artifacts = writer.artifacts?.length ? writer.artifacts : undefined;
+        // A replay-capable dispatch's output is its own execution's artifacts,
+        // never the SDK's merge with earlier turns of a reused task ID. Legacy
+        // dispatches carry no snapshot and keep the accumulated artifacts.
+        if (writer?.marked && writer.artifacts) next.artifacts = writer.artifacts.length ? writer.artifacts : undefined;
         // See ExecutionWriter (execution-marker.ts) for the write rules.
         const reason = !writer?.message ? undefined
           : !writer.marked ? (dispatchId !== null ? 'not_dispatched' : undefined)
@@ -486,17 +487,20 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     await this.sql.begin(async (sql) => {
       const locked = await this.lockTask(sql, taskId);
       if (!locked) throw new Error(`Task not found: ${taskId}`);
-      const { artifacts: _prior, ...rest } = locked.task;
-      void _prior;
+      // Only a replay-capable dispatch (one with a public marker) starts with
+      // clean artifacts; a legacy dispatch keeps the task's accumulated ones.
+      const { artifacts: prior, ...rest } = locked.task;
       await this.writeTask({
         ...rest,
+        ...(executionId === undefined && prior !== undefined ? { artifacts: prior } : {}),
         status: { state: TaskState.WORKING, timestamp: new Date().toISOString() },
         metadata: withExecutionMarker(locked.task.metadata as Record<string, unknown> | undefined, executionId),
       }, sql);
       await sql`UPDATE infra.a2a_tasks SET dispatch_id = ${dispatchId} WHERE task_id = ${taskId}`;
     });
     const writer = executionWriter.getStore();
-    if (writer) Object.assign(writer, { message: true, marked: true, dispatchId, executionId, artifacts });
+    if (writer) Object.assign(writer, { message: true, marked: true, dispatchId, executionId,
+      artifacts: executionId === undefined ? undefined : artifacts });
   }
 
   private async lockTask(sql: SqlExecutor, taskId: string): Promise<{ task: Task; dispatchId: string | null } | null> {
@@ -510,7 +514,7 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
           FOR UPDATE
         `;
     const row = rows[0];
-    return row ? { task: row.task_json, dispatchId: row.dispatch_id } : null;
+    return row ? { task: row.task_json, dispatchId: row.dispatch_id ?? null } : null;
   }
 
   async deleteTask(taskId: string): Promise<void> {

@@ -44,8 +44,9 @@ export function withExecutionMarker(
 // - after markExecution (`marked` true) it may write only while its
 //   `dispatchId` is still the row's latest dispatch, so a superseded
 //   execution (replay-capable or not) cannot overwrite the newer one.
-// - its writes persist `artifacts` — the executor's own per-execution
-//   accumulation — instead of whatever the SDK merged from earlier turns.
+// - for a replay-capable dispatch, its writes persist `artifacts` — the
+//   executor's own per-execution accumulation — instead of whatever the SDK
+//   merged from earlier turns. Legacy dispatches keep the accumulated ones.
 // A skipped write returns the request's own view of the update without
 // persisting it, so a superseded caller still sees its own outcome.
 export interface ExecutionWriter {
@@ -64,9 +65,10 @@ export function markMessageRequest(): void {
 
 export interface ExecutionMarkingStore {
   // Atomically record a new dispatch for `taskId`: replace the public marker
-  // (or clear it when `executionId` is undefined), reset status to working and
-  // drop prior artifacts (history is kept), and bind the current request's
-  // writes to it with `artifacts` as the execution's output snapshot.
+  // (or clear it when `executionId` is undefined), reset status to working,
+  // and bind the current request's writes to it. With an `executionId` it also
+  // drops prior artifacts (history is kept) and uses `artifacts` as the
+  // execution's output snapshot; a legacy dispatch keeps accumulated artifacts.
   markExecution(taskId: string, executionId: string | undefined, artifacts: Artifact[]): Promise<void>;
 }
 

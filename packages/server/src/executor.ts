@@ -553,7 +553,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     }
     if (!rejection) {
       task.metadata = withExecutionMarker(task.metadata as Record<string, unknown> | undefined, executionId);
-      delete task.artifacts;
+      if (executionId !== undefined) delete task.artifacts;
     }
     if (rejection) {
       // This queue will never be consumed because the binding was rejected.

@@ -207,6 +207,7 @@ test('federated message tokens bind the initial task row on all three A2A ingres
   const principalId = 'slack:T123/U456';
   const actorId = 'did:web:connector.example';
   const tasks = new Map<string, Record<string, unknown>>();
+  const dispatchIds = new Map<string, string>();
   const submittedBindings: unknown[][] = [];
   const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
     const statement = strings.join('?');
@@ -234,9 +235,13 @@ test('federated message tokens bind the initial task row on all three A2A ingres
       if (values[2] === TaskState.SUBMITTED) submittedBindings.push(values);
       return [];
     }
-    if (statement.includes('SELECT task_json FROM infra.a2a_tasks')) {
+    if (statement.includes('UPDATE infra.a2a_tasks SET dispatch_id')) {
+      dispatchIds.set(String(values[1]), String(values[0]));
+      return Object.assign([], { count: 1 });
+    }
+    if (statement.includes('SELECT task_json') && statement.includes('FROM infra.a2a_tasks')) {
       const task = tasks.get(String(values[0]));
-      return task ? [{ task_json: structuredClone(task) }] : [];
+      return task ? [{ task_json: structuredClone(task), dispatch_id: dispatchIds.get(String(values[0])) ?? null }] : [];
     }
     return Object.assign([], { count: 0 });
   }) as unknown as Sql;

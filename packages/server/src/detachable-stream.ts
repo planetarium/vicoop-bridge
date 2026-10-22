@@ -12,9 +12,12 @@ import { logEvent } from './log.js';
 // A connector that times out (e.g. a 300s serverless limit) must not cancel
 // the native execution.
 //
-// While attached, events are pulled as the downstream reads them (one event
-// buffered ahead, which also starts the execution without waiting for the
-// first read), so the response respects backpressure and stays bounded. On cancel the stream detaches:
+// While attached, events are pulled as the downstream reads them, with at
+// most one event buffered ahead (highWaterMark 1), so the response respects
+// backpressure and stays bounded. A client that stops reading without
+// disconnecting therefore pauses its stream; e.g. HTTP+JSON's initial task
+// envelope fills that buffer before dispatch, so dispatch follows the first
+// read. On cancel the stream detaches:
 // the upstream generator is never returned; the remaining events are drained
 // and discarded, which keeps the SDK and executor persisting state and output
 // until the native terminal, approval expiry or inactivity watchdog ends it.
