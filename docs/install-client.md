@@ -771,6 +771,25 @@ the daemon-level precedence (Step 6 intro).
 > or a model; explicit values override them. To run
 > without a sandbox, pass `{ "sandbox": { "enabled": false } }`.
 
+For ordinary A2A tasks, the bridge passes `--permission-mode default` unless
+`permissions.defaultMode` is explicitly set in `--claude-settings-file` or
+`backends.claude.settings`. This prevents a user's global Claude permission
+mode from silently enabling bypass for a shared agent. To retain an intentional
+mode, set it in the agent's settings, for example:
+
+```json
+{ "permissions": { "defaultMode": "acceptEdits" } }
+```
+
+This fixes the initial mode, not the entire permission policy: user/project
+allow and deny rules still load, and sandboxed Bash may still run without
+approval. Callers cannot answer interactive approval prompts in headless mode.
+Caller-isolated `runtime: container` continues to use explicit bypass within
+its container; OpenAI-compatible requests keep their existing tool policy.
+Each Claude session-init log records the CLI-reported `permissionMode`,
+`claudeVersion`, and whether its reported tool list contains built-in tools
+(`builtinTools=on/off`). Missing metadata is logged as `unknown`.
+
 `--cwd` defaults to the current working directory of the client
 process. Set it when the released bundle lives outside the repository you
 want Claude to edit. (Same flag is shared with the Codex backend; it's
