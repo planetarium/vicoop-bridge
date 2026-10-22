@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type {
+  Artifact,
   Task,
   Message,
   CreateTaskParams,
@@ -14,6 +15,7 @@ import type { Sql, SqlExecutor } from './db.js';
 import { PUBLIC_TASK_PROFILE, type TaskListAccess } from './task-access.js';
 import { logEvent, truncate } from './log.js';
 import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
+import { executionMarker, executionWriter, withExecutionMarker } from './execution-marker.js';
 
 const MAX_CONTEXT_TASKS = 10;
 
@@ -244,7 +246,8 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
       id: randomUUID(),
       contextId: params.contextId ?? randomUUID(),
       status: { state: TaskState.SUBMITTED, timestamp: new Date().toISOString() },
-      metadata: stripTaskMetadata(params.metadata),
+      // A caller cannot pre-seed the server-owned dispatch marker.
+      metadata: withExecutionMarker(stripTaskMetadata(params.metadata), undefined),
     };
     await this.writeTask(task, this.sql, authorizationBinding);
     // A freshly-created task is SUBMITTED, never terminal, so retention is a
@@ -385,30 +388,50 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     let txnMs = 0;
     let retentionStart = 0;
     let retentionMs = 0;
+    const writer = executionWriter.getStore();
+    let skipped: { reason: string; current: string | null } | undefined;
     try {
       const merged = await this.sql.begin(async (sql) => {
-        const rows = this.ownerAgent === undefined
-          ? await sql<{ task_json: Task }[]>`
-              SELECT task_json FROM infra.a2a_tasks WHERE task_id = ${taskId} FOR UPDATE
-            `
-          : await sql<{ task_json: Task }[]>`
-              SELECT task_json FROM infra.a2a_tasks
-              WHERE task_id = ${taskId} AND owner_agent = ${this.ownerAgent}
-              FOR UPDATE
-            `;
-        const existing = rows[0]?.task_json ?? null;
-        if (!existing) {
+        const locked = await this.lockTask(sql, taskId);
+        if (!locked) {
           throw new Error(`Task not found: ${taskId}`);
         }
+        const { task: existing, dispatchId } = locked;
         const next: Task = { ...existing };
         if (update.status !== undefined) next.status = update.status;
         if (update.artifacts !== undefined) next.artifacts = update.artifacts;
         if (update.history !== undefined) next.history = update.history;
         if (update.metadata !== undefined) next.metadata = update.metadata;
+        // A dispatching request's output is its own execution's artifacts,
+        // never the SDK's merge with earlier turns of a reused task ID.
+        if (writer?.marked) next.artifacts = writer.artifacts?.length ? writer.artifacts : undefined;
+        // See ExecutionWriter (execution-marker.ts) for the write rules.
+        const reason = !writer?.message ? undefined
+          : !writer.marked ? (dispatchId !== null ? 'not_dispatched' : undefined)
+            : writer.dispatchId !== dispatchId ? 'superseded' : undefined;
+        if (reason) {
+          // Not persisted: the caller sees its own outcome, labelled with its
+          // own execution (if any), and the stored row stays the newer one's.
+          skipped = { reason, current: dispatchId };
+          next.metadata = withExecutionMarker(next.metadata as Record<string, unknown> | undefined,
+            writer?.marked ? writer.executionId : undefined);
+          return next;
+        }
+        // The marker is store-owned: keep the stored one whatever the update carries.
+        next.metadata = withExecutionMarker(next.metadata as Record<string, unknown> | undefined,
+          executionMarker(existing.metadata as Record<string, unknown> | undefined));
         await this.writeTask(next, sql);
         return next;
       });
       txnMs = Date.now() - startedAt;
+      if (skipped) {
+        logEvent('task_store_stale_execution_write', {
+          taskId, reason: skipped.reason, dispatchId: writer?.dispatchId ?? null,
+          executionId: writer?.executionId ?? null, currentDispatchId: skipped.current,
+          state: update.status?.state ?? null,
+        });
+        return merged;
+      }
       // Retention runs AFTER the transaction commits, on the pool connection —
       // deliberately NOT inside the FOR UPDATE transaction. Two same-context
       // tasks reaching a terminal state at once would otherwise each hold the
@@ -454,6 +477,40 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
       });
       throw err;
     }
+  }
+
+  // See ExecutionMarkingStore. Called before the execution is bound, so the
+  // execution it supersedes is already stale when bindTask fails it.
+  async markExecution(taskId: string, executionId: string | undefined, artifacts: Artifact[]): Promise<void> {
+    const dispatchId = executionId ?? randomUUID();
+    await this.sql.begin(async (sql) => {
+      const locked = await this.lockTask(sql, taskId);
+      if (!locked) throw new Error(`Task not found: ${taskId}`);
+      const { artifacts: _prior, ...rest } = locked.task;
+      void _prior;
+      await this.writeTask({
+        ...rest,
+        status: { state: TaskState.WORKING, timestamp: new Date().toISOString() },
+        metadata: withExecutionMarker(locked.task.metadata as Record<string, unknown> | undefined, executionId),
+      }, sql);
+      await sql`UPDATE infra.a2a_tasks SET dispatch_id = ${dispatchId} WHERE task_id = ${taskId}`;
+    });
+    const writer = executionWriter.getStore();
+    if (writer) Object.assign(writer, { message: true, marked: true, dispatchId, executionId, artifacts });
+  }
+
+  private async lockTask(sql: SqlExecutor, taskId: string): Promise<{ task: Task; dispatchId: string | null } | null> {
+    const rows = this.ownerAgent === undefined
+      ? await sql<{ task_json: Task; dispatch_id: string | null }[]>`
+          SELECT task_json, dispatch_id FROM infra.a2a_tasks WHERE task_id = ${taskId} FOR UPDATE
+        `
+      : await sql<{ task_json: Task; dispatch_id: string | null }[]>`
+          SELECT task_json, dispatch_id FROM infra.a2a_tasks
+          WHERE task_id = ${taskId} AND owner_agent = ${this.ownerAgent}
+          FOR UPDATE
+        `;
+    const row = rows[0];
+    return row ? { task: row.task_json, dispatchId: row.dispatch_id } : null;
   }
 
   async deleteTask(taskId: string): Promise<void> {

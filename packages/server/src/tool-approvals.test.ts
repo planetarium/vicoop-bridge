@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import type { WebSocket } from 'ws';
 import { Registry, type TaskBinding } from './registry.js';
-import { approvalStatus } from './tool-approvals.js';
+import { approvalStatus, approvalView } from './tool-approvals.js';
 import { APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY, TASK_REPLAY_CAPABILITY } from '@vicoop-bridge/protocol';
 function fixture() {
   const registry = new Registry(); const sent: string[] = [];
@@ -56,4 +56,20 @@ test('unacknowledged decision is delivered again to the same execution after rec
     assert.equal(sent[0], sent[1]);
     registry.approvals.received(b, a.requestId, 'allow_once');
   } finally { registry.unbindTask(b.taskId, b); }
+});
+test('status metadata carries both owner and requester URLs; origin snapshot is immutable and private', () => {
+  const { registry, b, a } = fixture();
+  try {
+    const meta = approvalStatus(a).message.metadata[APPROVAL_EXTENSION_URI];
+    assert.equal(meta.decisionUrl, `/admin-api/agents/agent/approvals/${a.requestId}`);
+    assert.equal(meta.requesterApprovalUrl, `/agents/agent/approvals/${a.requestId}`);
+    b.principalId = 'later-principal';
+    assert.equal(registry.approvals.origin(a.requestId)?.principalId, undefined);
+    assert.ok(Object.isFrozen(registry.approvals.origin(a.requestId)));
+    assert.equal('origin' in approvalView(a), false);
+    assert.equal(registry.approvals.decide(a.requestId, 'deny', 'owner', 'requester')?.decidedVia, 'requester');
+    // Same principal string through the other authority is not an idempotent retry.
+    assert.equal(registry.approvals.decide(a.requestId, 'deny', 'owner', 'owner'), undefined);
+  } finally { registry.unbindTask(b.taskId, b); }
+  assert.equal(registry.approvals.origin(a.requestId), undefined);
 });

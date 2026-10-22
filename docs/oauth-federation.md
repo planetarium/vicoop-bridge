@@ -181,6 +181,18 @@ backend receives `caller-context-v2` with the platform subject as `principal`,
 the Connector DID as `actor`, and a normalized attestation whose credential id
 is a one-way digest of the assertion identity.
 
+### Requester tool approvals (optional extension)
+
+The bridge's optional requester tool-approval route
+([`tool-approval-v1.md`](./tool-approval-v1.md#requester-decisions-optional))
+accepts an `a2a:task.read` token as proof of *who* the requester is. It does
+not change what `a2a:task.read` means: the scope still authorizes reading the
+task, and it never confers approval authority on its own. Deciding a pending
+tool approval additionally requires the agent owner's explicit, persisted
+`requester_approvals_enabled` grant and an exact match against the identity of
+the execution that raised the request. With the default (`false`) the route
+denies every federated token.
+
 ## Smoke-test checklist
 
 1. Connect an agent that advertises `caller-context-v2` and add one exact

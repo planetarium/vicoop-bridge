@@ -239,6 +239,7 @@ export class Registry {
   readonly approvals = new ToolApprovals(this);
   private agents = new Map<string, ClientConnection>();
   private bindings = new Map<string, TaskBinding>();
+  private dispatchChains = new Map<string, Promise<void>>();
   // taskId -> pending grace hold. A binding in here is still present in
   // `bindings` and still fully serviceable; the entry only means "if nothing
   // arrives for this task before the timer fires, declare the client dead".
@@ -699,6 +700,21 @@ export class Registry {
     }
     this.bindings.set(binding.taskId, binding);
     return true;
+  }
+
+  // Run `fn` after any earlier dispatch for the same task ID has finished its
+  // own `fn`. The executor marks the task's latest execution in the store and
+  // then binds it; without ordering, two concurrent dispatches could leave the
+  // stored marker naming one execution while the other holds the binding.
+  async serializeDispatch<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.dispatchChains.get(taskId) ?? Promise.resolve();
+    const run = previous.then(fn, fn);
+    const settled = run.then(() => undefined, () => undefined);
+    this.dispatchChains.set(taskId, settled);
+    void settled.then(() => {
+      if (this.dispatchChains.get(taskId) === settled) this.dispatchChains.delete(taskId);
+    });
+    return run;
   }
 
   getBinding(taskId: string): TaskBinding | undefined {
