@@ -1668,6 +1668,15 @@ export function createClaudeBackend(
   // operator cwd / undefined on a creation failure).
   let openaiCompatCwdResolved: string | undefined | null = null;
   const extraArgs = opts.extraArgs ?? [];
+  const permissions = opts.settings?.permissions;
+  const configuredMode = permissions !== null && typeof permissions === 'object'
+    ? (permissions as Record<string, unknown>).defaultMode
+    : undefined;
+  if (configuredMode !== undefined &&
+      (typeof configuredMode !== 'string' || configuredMode.trim().length === 0)) {
+    throw new Error('createClaudeBackend: settings.permissions.defaultMode must be a non-empty string');
+  }
+
   const spawnFn = opts.spawn ?? defaultSpawn;
   const stderrCap = opts.stderrCaptureBytes ?? 8192;
   const sessionTtlMs = opts.sessionTtlMs ?? 60 * 60 * 1000;
@@ -2685,17 +2694,16 @@ export function createClaudeBackend(
       // settings may otherwise silently opt a shared agent into bypass mode.
       // Keep explicit operator settings and runtime flags authoritative; caller
       // containers deliberately pass --dangerously-skip-permissions (#542).
-      const permissions = opts.settings?.permissions;
-      const configuredMode = permissions !== null && typeof permissions === 'object'
-        ? (permissions as Record<string, unknown>).defaultMode
-        : undefined;
       const explicitPermissionFlag = extraArgs.some((arg) =>
         arg === '--dangerously-skip-permissions' ||
         arg === '--permission-mode' || arg.startsWith('--permission-mode='),
       );
       const permissionModeArgs: readonly string[] =
-        !envelope && configuredMode === undefined && !explicitPermissionFlag
-          ? ['--permission-mode', 'default']
+        !envelope && !explicitPermissionFlag
+          // Forward explicit modes too: Claude silently ignores invalid modes
+          // in --settings, but rejects them in --permission-mode. An operator
+          // typo must not fall back to a user-global bypass policy.
+          ? ['--permission-mode', configuredMode ?? 'default']
           : [];
 
       const args: string[] = [

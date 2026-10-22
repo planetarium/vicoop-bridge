@@ -771,9 +771,10 @@ the daemon-level precedence (Step 6 intro).
 > or a model; explicit values override them. To run
 > without a sandbox, pass `{ "sandbox": { "enabled": false } }`.
 
-For ordinary A2A tasks, the bridge passes `--permission-mode default` unless
-`permissions.defaultMode` is explicitly set in `--claude-settings-file` or
-`backends.claude.settings`. This prevents a user's global Claude permission
+For ordinary A2A tasks, the bridge passes `--permission-mode default`, or the
+explicit `permissions.defaultMode` from `--claude-settings-file` or
+`backends.claude.settings`. Non-string or blank modes fail at startup; other
+invalid mode names are rejected by the CLI. This prevents a user's global Claude permission
 mode from silently enabling bypass for a shared agent. To retain an intentional
 mode, set it in the agent's settings, for example:
 

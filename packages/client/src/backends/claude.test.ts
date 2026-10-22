@@ -6685,7 +6685,7 @@ for (const mode of ['default', 'acceptEdits', 'bypassPermissions']) {
     const backend = createClaudeBackend({ spawn: fake.spawn, settings });
     await backend.handle(assign('hi'), collect().emit, NEVER);
     const args = fake.lastChild()!.args;
-    assert.equal(args.includes('--permission-mode'), false);
+    assert.equal(args[args.indexOf('--permission-mode') + 1], mode);
     assert.deepEqual(JSON.parse(String(args[args.indexOf('--settings') + 1])).permissions, settings.permissions);
   });
 }
@@ -6755,4 +6755,19 @@ test('session init logs the CLI-reported mode rather than the requested default'
     if (oldLevel === undefined) delete process.env.VICOOP_CLIENT_LOG_LEVEL;
     else process.env.VICOOP_CLIENT_LOG_LEVEL = oldLevel;
   }
+});
+
+
+for (const mode of [null, '', '   ', 0, false, {}, []]) {
+  test(`rejects malformed defaultMode ${JSON.stringify(mode)} before spawning`, () => {
+    assert.throws(() => createClaudeBackend({ settings: { permissions: { defaultMode: mode } } }), /defaultMode must be a non-empty string/);
+  });
+}
+
+test('explicit mode strings reach CLI validation instead of silently falling back to user settings', async () => {
+  const fake = scriptedSpawn({ lines: [], exitCode: 1 });
+  const backend = createClaudeBackend({ spawn: fake.spawn, settings: { permissions: { defaultMode: 'nonsense' } } });
+  await backend.handle(assign('hi'), collect().emit, NEVER);
+  const args = fake.lastChild()!.args;
+  assert.equal(args[args.indexOf('--permission-mode') + 1], 'nonsense');
 });
