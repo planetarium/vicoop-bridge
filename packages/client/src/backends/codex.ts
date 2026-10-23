@@ -427,11 +427,17 @@ export function buildCodexChatCompletionEnvelope(args: {
   return envelope;
 }
 
-// app-server `commandExecution` item summary.
-function commandExecutionSummary(item: Extract<ThreadItem, { type: 'commandExecution' }>): string {
-  const command = typeof item.command === 'string' ? item.command : '<unknown command>';
+// app-server `commandExecution` item summary. With remote approvals the
+// command (and its output, which routinely echoes arguments) is private to the
+// approval request, so the public trace carries only status and exit code.
+function commandExecutionSummary(
+  item: Extract<ThreadItem, { type: 'commandExecution' }>,
+  redact = false,
+): string {
   const status = typeof item.status === 'string' ? item.status : 'unknown';
   const exit = typeof item.exitCode === 'number' ? item.exitCode : null;
+  if (redact) return exit === null ? `command execution (${status})` : `command execution (${status}, exit ${exit})`;
+  const command = typeof item.command === 'string' ? item.command : '<unknown command>';
   const rawOutput = (item as { aggregatedOutput?: unknown }).aggregatedOutput;
   const output = typeof rawOutput === 'string' ? rawOutput.trim() : '';
   const head = exit === null ? `${command} (${status})` : `${command} (${status}, exit ${exit})`;
@@ -1652,11 +1658,11 @@ export function createCodexBackend(
                 artifactId: randomUUID(),
                 name: 'codex-command-execution',
                 parts: [
-                  { kind: 'text', text: commandExecutionSummary(item) },
+                  { kind: 'text', text: commandExecutionSummary(item, approvalDecision === 'remote') },
                   {
                     kind: 'data',
                     data: {
-                      command: typeof item.command === 'string' ? item.command : undefined,
+                      command: approvalDecision !== 'remote' && typeof item.command === 'string' ? item.command : undefined,
                       status: typeof item.status === 'string' ? item.status : undefined,
                       exitCode: typeof item.exitCode === 'number' ? item.exitCode : undefined,
                     },

@@ -3157,3 +3157,62 @@ for (const decision of ['allow_once', 'deny'] as const) {
     backend.stop?.();
   });
 }
+
+for (const approvalDecision of ['remote', 'decline'] as const) {
+  test(`command trace ${approvalDecision === 'remote' ? 'omits' : 'keeps'} command and output with approval_decision ${approvalDecision}`, async () => {
+    const { RemoteApprovalBroker } = await import('../remote-approval.js');
+    const SECRET = 'sentinel-secret-codex';
+    const command = `psql postgres://admin:${SECRET}@db/prod -c 'select 1'`;
+    const broker = new RemoteApprovalBroker();
+    const fake = makeFakeSpawn(() => {
+      const happy = happyPath({ threadId: 'thread-1' });
+      const complete = (child: Parameters<NonNullable<typeof happy.onLine>>[1]) => {
+        child.emitStdout({ method: 'item/completed', params: { turnId: 'turn-redact', threadId: 'thread-1', item: {
+          type: 'commandExecution', id: 'cmd-1', command, status: 'completed', exitCode: 0,
+          aggregatedOutput: `connected with ${SECRET}\n` } } });
+        child.emitStdout({ method: 'item/completed', params: { turnId: 'turn-redact', threadId: 'thread-1',
+          item: { type: 'agentMessage', id: 'msg-1', text: 'Query finished.' } } });
+        child.emitStdout({ method: 'turn/completed', params: { turn: { id: 'turn-redact', status: 'completed', items: [], error: null } } });
+      };
+      return { onLine(frame, child, index) {
+        if (frame.method === 'turn/start') {
+          child.emitStdout({ id: frame.id, result: { turn: { id: 'turn-redact' } } });
+          queueMicrotask(() => approvalDecision === 'remote'
+            ? child.emitStdout({ id: 'permission-1', method: 'item/commandExecution/requestApproval',
+              params: { threadId: 'thread-1', turnId: 'turn-redact', itemId: 'cmd-1', command } })
+            : complete(child));
+          return;
+        }
+        if (frame.id === 'permission-1') { complete(child); return; }
+        happy.onLine?.(frame, child, index);
+      } };
+    });
+    const backend = createCodexBackend({ spawn: fake.spawn, approvalDecision });
+    const task = assign('run the query', 'ctx-redact', { executionId: 'run-redact', requestedExtensions: [TRACEABILITY_EXTENSION_URI] });
+    const backendFrames: UpFrame[] = [];
+    let request: Extract<UpFrame, { type: 'approval.request' }> | undefined;
+    const running = broker.run(task, NEVER, true, f => { if (f.type === 'approval.request') request = f; },
+      () => backend.handle(task, f => backendFrames.push(f), NEVER));
+    if (approvalDecision === 'remote') {
+      for (let i = 0; i < 100 && !request; i++) await new Promise(r => setTimeout(r, 5));
+      assert.ok(request);
+      assert.equal(request.request.input.command, command, 'private approval request keeps the command');
+      broker.resolve({ type: 'approval.resolve', taskId: task.taskId, executionId: task.executionId!,
+        requestId: request.request.requestId, decision: 'allow_once' });
+    }
+    await running;
+    backend.stop?.();
+    const all = JSON.stringify(backendFrames);
+    const trace = backendFrames.find((f): f is Extract<UpFrame, { type: 'task.artifact' }> =>
+      f.type === 'task.artifact' && f.artifact.name === 'codex-command-execution');
+    assert.ok(trace, 'command trace still emitted');
+    assert.ok(all.includes('Query finished.'));
+    if (approvalDecision === 'remote') {
+      assert.ok(!all.includes(SECRET), all);
+      assert.deepEqual(trace.artifact.parts[0], { kind: 'text', text: 'command execution (completed, exit 0)' });
+      assert.equal((trace.artifact.parts[1] as { data: Record<string, unknown> }).data.command, undefined);
+    } else {
+      assert.ok(JSON.stringify(trace).includes(SECRET), 'non-approval trace unchanged');
+    }
+  });
+}

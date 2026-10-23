@@ -257,6 +257,43 @@ Structured logs record `tool_approval_decided` with `decidedVia`
 Native arguments are visible to the authorized requester, so they should not
 contain secrets that requester is not allowed to see.
 
+## Privacy boundary for native arguments
+
+Native tool arguments (commands, paths, request bodies, MCP inputs) are meant
+to reach only whoever inspects the approval: the `approval.request` frame, the
+`auth-required` status metadata and the approval APIs above. A task reader that
+can call `tasks/get` can read that status metadata; consumers such as Mentionable
+are expected to show it only to the approver (e.g. in a private modal).
+
+When remote approvals are enabled on the client (Claude `remote_approvals`,
+Codex `approval_decision: "remote"`), every execution of that backend keeps
+structured native arguments out of the rest of the task, whether or not a
+given call ends up gated. The native trace is emitted before the permission
+callback, so filtering only around the approval event would not be enough:
+
+- Claude `claude-tool-call` traceability artifacts carry the tool name only
+  (text part and `data.toolName`/`toolUseId`); `claude-subagent-event` omits the
+  subagent description.
+- Codex `codex-command-execution` traceability artifacts carry status and exit
+  code only, without the command, its output or `data.command`.
+- Claude non-zero exit failures no longer include the stdout/stderr tails
+  (stdout is the raw stream-json, including tool inputs); they go to the
+  client's local log instead.
+
+Unchanged: the assistant's own text (`claude-message`/`codex-message`), the
+final result, tool-result media (images/PDFs) and `AskUserQuestion`
+(`input-required`) content, which is meant for the user. The boundary covers
+structured native request details only: if the model writes an argument
+into its own prose ("I'll run `curl … token`"), that text is part of the answer
+and is not redacted. Tool-result text is never published as an artifact. Without
+remote approvals, traces keep their existing argument summaries.
+
+This is enforced by the client, so deployments must upgrade the client (not
+only the bridge server) to get it; an older client with remote approvals
+enabled still publishes argument summaries in traceability artifacts. Tasks
+that do not request the traceability extension never received these
+artifacts.
+
 ## Binding and lifecycle
 
 The negotiated internal capability is `remote-tool-approval-v1`. The sequenced
