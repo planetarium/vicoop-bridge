@@ -35,6 +35,7 @@ import {
   selectCallerContextVersion,
   serializeCallerContext,
 } from './caller-context.js';
+import { EXECUTION_MARKER_KEY, markMessageRequest, supportsExecutionMarking, withExecutionMarker } from './execution-marker.js';
 
 /**
  * What the executor needs to run the x402 payment gate: a DB handle for the
@@ -381,6 +382,9 @@ export class WSForwardingExecutor extends AgentExecutor {
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     const taskId = task.id;
     const contextId = task.contextId ?? taskId;
+    // Guard this request's task-store writes as a message request (see
+    // ExecutionWriter) from the first one, including rejections below.
+    markMessageRequest();
 
     // The HTTP boundary places normalized identity in request metadata only as
     // an internal handoff to this executor. Snapshot it, then delete it before
@@ -520,7 +524,38 @@ export class WSForwardingExecutor extends AgentExecutor {
       ...(authorizationKey !== undefined ? { authorizationKey } : {}),
       ...(requestedExtensions !== undefined ? { requestedExtensions } : {}),
     };
-    if (!this.registry.bindTask(binding)) {
+    // Publish this dispatch as the task's latest execution (docs/tool-approval-v1.md
+    // dispatch marker) BEFORE binding: bindTask fails any execution it
+    // supersedes, and that execution's writes must already be stale by then.
+    // A dispatch without replay clears a stale marker. Failing to persist the
+    // marker fails this dispatch closed rather than leaving the guard unset.
+    // The ownership check runs first so a rejected dispatch never takes over
+    // the marker from the legitimate live binding. Starting from an empty
+    // artifact list keeps this execution's persisted output its own.
+    const accumulatedArtifacts: Artifact[] = [];
+    let rejection: { code: string; message: string; suffix: string } | undefined;
+    try {
+      const store = this.taskStore;
+      const bound = supportsExecutionMarking(store)
+        ? await this.registry.serializeDispatch(taskId, async () => {
+          const holder = this.registry.getBinding(taskId);
+          if (holder && holder.agentId !== this.agentId) return this.registry.bindTask(binding);
+          await store.markExecution(taskId, executionId, accumulatedArtifacts);
+          return this.registry.bindTask(binding);
+        })
+        : this.registry.bindTask(binding);
+      if (!bound) {
+        rejection = { code: 'task_owner_mismatch', message: 'task ownership validation failed', suffix: 'owner-mismatch' };
+      }
+    } catch (err) {
+      logEvent('task_persist_error', { taskId, phase: 'execution_marker', error: String(err) });
+      rejection = { code: 'task_persist_failed', message: 'task dispatch could not be recorded', suffix: 'persist-failed' };
+    }
+    if (!rejection) {
+      task.metadata = withExecutionMarker(task.metadata as Record<string, unknown> | undefined, executionId);
+      if (executionId !== undefined) delete task.artifacts;
+    }
+    if (rejection) {
       // This queue will never be consumed because the binding was rejected.
       // Close it now, and do not publish the AbortController into the task map.
       queue.end();
@@ -532,13 +567,13 @@ export class WSForwardingExecutor extends AgentExecutor {
           state: TaskState.FAILED,
           timestamp: new Date().toISOString(),
           message: {
-            messageId: `${taskId}-owner-mismatch`,
+            messageId: `${taskId}-${rejection.suffix}`,
             role: 'agent',
-            parts: [{ text: 'task ownership validation failed' }],
+            parts: [{ text: rejection.message }],
             ...terminalErrorMessageFields(
               {
-                code: 'task_owner_mismatch',
-                message: 'task ownership validation failed',
+                code: rejection.code,
+                message: rejection.message,
               },
               requestedExtensions,
             ),
@@ -645,7 +680,12 @@ export class WSForwardingExecutor extends AgentExecutor {
       return;
     }
 
-    const accumulatedArtifacts: Artifact[] = [];
+    // Status events carry the execution they came from (same key and shape as
+    // the task's dispatch marker), so a subscriber on a reused task ID can tell
+    // a superseded execution's final event from the current one's.
+    const withOrigin = (event: TaskStatusUpdateEvent): TaskStatusUpdateEvent => executionId === undefined
+      ? event
+      : { ...event, metadata: { ...(event.metadata ?? {}), [EXECUTION_MARKER_KEY]: { executionId } } };
 
     // Inactivity backstop: reset on every inbound frame; on expiry, fabricate a
     // terminal `failed` status and close the queue so this generator returns
@@ -738,7 +778,7 @@ export class WSForwardingExecutor extends AgentExecutor {
           if (accumulatedArtifacts.length > 0) {
             task.artifacts = accumulatedArtifacts;
           }
-          yield terminal;
+          yield withOrigin(terminal);
           break;
         }
         const wasAuthRequired = task.status.state === TaskState.AUTH_REQUIRED;
@@ -750,7 +790,7 @@ export class WSForwardingExecutor extends AgentExecutor {
         if (wasAuthRequired !== (event.status.state === TaskState.AUTH_REQUIRED)) {
           await this.taskStore.updateTask(taskId, { status: task.status, history });
         }
-        yield event;
+        yield withOrigin(event);
       }
       // Stop the watchdog before the awaited persist below — the stream is done
       // producing, so a timer firing during the DB write would be spurious.

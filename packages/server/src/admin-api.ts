@@ -22,6 +22,7 @@ import {
   type X402Pricing,
 } from './x402/pricing.js';
 import { notifyX402PricingChanged } from './x402/pricing-watch.js';
+import { logEvent } from './log.js';
 
 type Tx = postgres.TransactionSql;
 
@@ -682,4 +683,57 @@ export async function deleteClientForOwner(
     deleted: true,
     closed_connections: closedConnections,
   };
+}
+
+// ----- requester tool-approval policy ---------------------------------------
+//
+// `agents.requester_approvals_enabled` decides whether a federated requester's
+// task.read token may also decide that requester's own pending tool approvals
+// (docs/tool-approval-v1.md). The token authenticates identity only; this
+// owner-controlled flag is the separate grant. RLS scopes reads and writes to
+// the owner or a bridge administrator, and the requester route rereads the
+// column on every access, so no cache or registry patch is needed.
+
+export interface RequesterApprovalPolicyResult {
+  agent_id: string;
+  enabled: boolean;
+}
+
+export async function getRequesterApprovalPolicy(
+  db: Sql,
+  principalId: string,
+  agentId: string,
+): Promise<RequesterApprovalPolicyResult> {
+  const rows = await db.begin(async (tx) => {
+    await setRlsContext(tx, principalId);
+    return tx`SELECT requester_approvals_enabled FROM agents WHERE id = ${agentId}`;
+  });
+  if (rows.length === 0) throw new AdminApiError('Agent not found.', 404);
+  return { agent_id: agentId, enabled: rows[0].requester_approvals_enabled === true };
+}
+
+export async function setRequesterApprovalPolicy(
+  db: Sql,
+  principalId: string,
+  agentId: string,
+  body: unknown,
+): Promise<RequesterApprovalPolicyResult> {
+  const record = typeof body === 'object' && body !== null && !Array.isArray(body)
+    ? body as Record<string, unknown> : undefined;
+  if (!record || Object.keys(record).some((k) => k !== 'enabled') || typeof record.enabled !== 'boolean') {
+    throw new AdminApiError('Body must be {"enabled": boolean}.', 400);
+  }
+  const enabled = record.enabled;
+  const rows = await db.begin(async (tx) => {
+    await setRlsContext(tx, principalId);
+    return tx`
+      UPDATE agents
+      SET requester_approvals_enabled = ${enabled}, updated_at = now()
+      WHERE id = ${agentId}
+      RETURNING id
+    `;
+  });
+  if (rows.length === 0) throw new AdminApiError('Agent not found or not authorized.', 404);
+  logEvent('requester_approval_policy_changed', { agentId, enabled, changedBy: principalId });
+  return { agent_id: agentId, enabled };
 }

@@ -1270,3 +1270,7 @@ UI, opt in with `backends.claude.remote_approvals: true` or
 `backends.codex.approval_decision: "remote"`. Both server and client must support
 this capability. See [remote tool approval](./tool-approval-v1.md) for native
 permission behavior, A2A states, the decision API and integration limitations.
+In this mode the client also keeps native tool arguments out of traceability
+artifacts and failure messages (see its
+[privacy boundary](./tool-approval-v1.md#privacy-boundary-for-native-arguments));
+upgrade the client to get that protection.

@@ -1440,7 +1440,12 @@ export const DEFAULT_OPENAI_COMPAT_SYSTEM_PROMPT =
 // array. Each one becomes one `claude-tool-call` artifact upstream, with
 // a head-truncated `<tool>: <input>` summary plus a `data` part carrying
 // the structured tool name + tool_use_id for consumer-side filtering.
-function extractAssistantToolUses(content: unknown): ToolUseBlock[] {
+//
+// With remote approvals, native tool arguments are private to the approval
+// request (shown only to an authorized approver), so the public summary is the
+// tool name alone. The trace precedes the permission callback, so this applies
+// to every tool call of an approval-enabled backend, not just gated ones.
+function extractAssistantToolUses(content: unknown, redactInput = false): ToolUseBlock[] {
   if (!Array.isArray(content)) return [];
   const out: ToolUseBlock[] = [];
   for (const block of content) {
@@ -1449,7 +1454,7 @@ function extractAssistantToolUses(content: unknown): ToolUseBlock[] {
     if (b.type !== 'tool_use') continue;
     const toolName = typeof b.name === 'string' ? b.name : '<unknown>';
     const toolUseId = typeof b.id === 'string' ? b.id : '';
-    const summary = clipTo(
+    const summary = redactInput ? clipTo(toolName, TOOL_CALL_SUMMARY_MAX_CHARS) : clipTo(
       `${toolName}: ${summarizeToolInput(b.input, TOOL_CALL_SUMMARY_MAX_CHARS)}`,
       TOOL_CALL_SUMMARY_MAX_CHARS,
     );
@@ -3264,7 +3269,7 @@ export function createClaudeBackend(
             emitAssistantTextUpdate(extractAssistantText(evt.message.content));
           }
           if (emittedAskUserQuestion) return;
-          for (const tu of extractAssistantToolUses(evt.message.content)) {
+          for (const tu of extractAssistantToolUses(evt.message.content, opts.remoteApprovals === true)) {
             if (tu.toolUseId) {
               if (seenAssistantToolUseIds.has(tu.toolUseId)) continue;
               seenAssistantToolUseIds.add(tu.toolUseId);
@@ -3311,7 +3316,8 @@ export function createClaudeBackend(
                 SUBAGENT_TOOL_NAMES.has(tu.toolName) &&
                 tu.toolUseId
               ) {
-                const description = extractTaskDescription(tu.input);
+                // The subagent description is a tool argument too.
+                const description = opts.remoteApprovals ? '' : extractTaskDescription(tu.input);
                 activeTaskRuns.set(tu.toolUseId, description);
                 emitSubagentEventArtifact('subagent-started', tu.toolUseId, description);
               }
@@ -3768,8 +3774,16 @@ export function createClaudeBackend(
 
       if (exit.code !== 0 && !treatExitAsSuccess) {
         rollbackFreshSession();
-        const detail = stderrTail.trim();
-        const stdoutDetail = stdoutTail.trim();
+        // stdout is the raw stream-json (tool_use and can_use_tool inputs) and
+        // stderr can echo commands or paths: with remote approvals keep both in
+        // the operator's local log, never in the public failure message.
+        const privateDiagnostics = opts.remoteApprovals === true;
+        if (privateDiagnostics && (stderrTail.trim() || stdoutTail.trim())) {
+          console.error(`[claude] exit diagnostics taskId=${safeToken(task.taskId)} ` +
+            `stderr=${JSON.stringify(stderrTail.trim().slice(-500))} stdout=${JSON.stringify(stdoutTail.trim().slice(-500))}`);
+        }
+        const detail = privateDiagnostics ? '' : stderrTail.trim();
+        const stdoutDetail = privateDiagnostics ? '' : stdoutTail.trim();
         const sigPart = exit.signal ? ` (signal ${exit.signal})` : '';
         const detailPart = detail ? `: ${detail.slice(-500)}` : '';
         const stdoutPart = stdoutDetail ? ` [stdout: ${stdoutDetail.slice(-500)}]` : '';

@@ -143,9 +143,10 @@ export function buildAgentA2XServer(
   // the bridge.
   if (conn.protocolCapabilities?.includes(REMOTE_APPROVAL_CAPABILITY)) {
     a2xServer.addExtension({ uri: APPROVAL_EXTENSION_URI, required: false,
-      description: 'Remote tool approval via auth-required. Decisions require an authenticated agent owner or administrator.',
+      description: 'Remote tool approval via auth-required. Decisions require an authenticated agent owner or administrator, or the originating federated requester when the owner has enabled requester approvals.',
       params: { decisions: ['allow_once', 'deny'], delivery: 'https',
-        decisionUrlTemplate: `${opts.publicUrl ?? ''}/admin-api/agents/${encodeURIComponent(conn.agentId)}/approvals/{requestId}` },
+        decisionUrlTemplate: `${opts.publicUrl ?? ''}/admin-api/agents/${encodeURIComponent(conn.agentId)}/approvals/{requestId}`,
+        requesterApprovalUrlTemplate: `${opts.publicUrl ?? ''}/agents/${encodeURIComponent(conn.agentId)}/approvals/{requestId}` },
     });
   }
   const wireExtensions = (wire.capabilities?.extensions ?? []).filter(e => e.uri !== APPROVAL_EXTENSION_URI);

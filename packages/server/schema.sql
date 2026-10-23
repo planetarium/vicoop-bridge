@@ -284,6 +284,12 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFA
 -- who receives money, so it gets the same DB-owned trust boundary as
 -- allowed_callers.
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS x402_pricing JSONB;
+-- Opt-in for requester tool approvals (docs/tool-approval-v1.md). When true,
+-- the federated requester whose exact grant originated a live execution may
+-- decide that execution's pending native tool approvals at
+-- /agents/:id/approvals/:requestId. Default false: only the owner or a bridge
+-- administrator decides. Writable only through the owner admin API.
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS requester_approvals_enabled BOOLEAN NOT NULL DEFAULT false;
 -- See clients.revoked drop note above. Agents was the shadow column.
 ALTER TABLE agents DROP COLUMN IF EXISTS revoked;
 UPDATE agents SET client_id = gen_random_uuid()::text WHERE client_id IS NULL;
@@ -323,6 +329,7 @@ COMMENT ON COLUMN agents.token_hash IS E'@omit';
 -- through GraphQL — the admin API is the only write path, mirroring
 -- agent_policies.allowed_callers.
 COMMENT ON COLUMN agents.x402_pricing IS E'@omit create,update';
+COMMENT ON COLUMN agents.requester_approvals_enabled IS E'@omit create,update';
 -- Mirrors `clients`: token_hash is server-managed (no create), and the
 -- semantic delete path is `delete_client(TEXT)` which removes both the
 -- agents row and the legacy clients row in one transaction. Letting
@@ -647,6 +654,10 @@ ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS authorization_key TEXT;
 -- created under it. Re-adding the same receiver-policy tuple authorizes new
 -- exchanges but must not resurrect authority over historical tasks.
 ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS authorization_revoked_at TIMESTAMPTZ;
+-- Server-private identity of the task's latest dispatch (execution-marker.ts):
+-- the executionId for replay-capable clients, a random nonce otherwise. Task
+-- writes from a request whose dispatch is no longer this value are skipped.
+ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS dispatch_id TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_a2a_tasks_agent_context_principal
   ON infra.a2a_tasks (owner_agent, context_id, owner_principal, created_at);

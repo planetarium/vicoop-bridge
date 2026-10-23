@@ -1,5 +1,6 @@
 import { ApprovalDecision } from '@vicoop-bridge/protocol';
 import { transferAgent } from './agent-transfer.js';
+import { authorizeRequesterApproval, RequesterDecisionBody, requesterApprovalResponse } from './requester-approvals.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { Hono, type Context, type MiddlewareHandler } from 'hono';
@@ -26,6 +27,8 @@ import {
   type RequestContext,
 } from '@a2x/sdk';
 import { PUBLIC_TASK_PROFILE, taskListAccess } from './task-access.js';
+import { executionWriter, markMessageRequest } from './execution-marker.js';
+import { detachableSseStream } from './detachable-stream.js';
 import type { ClientConnection, Registry } from './registry.js';
 import { createAdminA2XServer } from './admin.js';
 import { getAdminWallets, isAdmin } from './admin-scope.js';
@@ -37,6 +40,8 @@ import {
   clearX402Pricing,
   deleteClientForOwner,
   getX402Pricing,
+  getRequesterApprovalPolicy,
+  setRequesterApprovalPolicy,
   issueAgentApiKey,
   listActiveAgents,
   listCallers,
@@ -293,12 +298,25 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     httpJsonV1Cache.delete(agentId);
   });
 
-  async function handleHandlerResult(result: unknown, c: Context) {
+  // Log label for a message/stream response, which outlives its connection;
+  // undefined for every other operation.
+  function streamDetach(conn: ClientConnection, operation: TokenExchangeOperation | undefined,
+    transport: string): Record<string, unknown> | undefined {
+    return operation?.name === 'message.stream'
+      ? { agentId: conn.agentId, transport, ...(operation.taskId !== undefined ? { taskId: operation.taskId } : {}) }
+      : undefined;
+  }
+
+  // `detach` (message/stream only): keep the execution running if the client
+  // disconnects — see detachable-stream.ts. Other streams (resubscribe) keep
+  // ending with their connection.
+  async function handleHandlerResult(result: unknown, c: Context, detach?: Record<string, unknown>) {
     if (result && typeof result === 'object' && Symbol.asyncIterator in (result as object)) {
       const iter = result as AsyncGenerator<unknown>;
       c.header('Content-Type', 'text/event-stream');
       c.header('Cache-Control', 'no-cache');
       c.header('Connection', 'keep-alive');
+      if (detach) return c.body(detachableSseStream(iter, { label: detach }));
       return stream(c, async (s) => {
         for await (const chunk of iter) {
           await s.write(`data: ${JSON.stringify(chunk)}\n\n`);
@@ -308,14 +326,19 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     return c.json(result as Record<string, unknown>);
   }
 
-  function handleHttpJsonResponse(response: HttpJsonResponse): Response {
+  function handleHttpJsonResponse(response: HttpJsonResponse, detach?: Record<string, unknown>): Response {
     const headers = { ...response.headers, 'A2A-Version': '1.0' };
     if (
       response.body &&
       typeof response.body === 'object' &&
       Symbol.asyncIterator in response.body
     ) {
-      return new Response(createSSEStream(response.body as AsyncGenerator<unknown>), {
+      const events = response.body as AsyncGenerator<unknown>;
+      // Same error event shape as the SDK's createSSEStream.
+      return new Response(detach
+        ? detachableSseStream(events, { label: detach,
+          errorEvent: (err) => ({ error: err instanceof Error ? err.message : 'Unknown error' }) })
+        : createSSEStream(events), {
         status: response.status,
         headers,
       });
@@ -842,6 +865,49 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     return c.json({ approval: result });
   });
 
+  // Owner-controlled opt-in for requester decisions on the route below.
+  app.get('/admin-api/agents/:id/requester-approval-policy', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    try {
+      return c.json(await getRequesterApprovalPolicy(opts.db, auth.principalId, c.req.param('id')));
+    } catch (err) { return adminApiErrorResponse(c, err); }
+  });
+  app.put('/admin-api/agents/:id/requester-approval-policy', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    const body = await c.req.json().catch(() => undefined);
+    try {
+      return c.json(await setRequesterApprovalPolicy(opts.db, auth.principalId, c.req.param('id'), body));
+    } catch (err) { return adminApiErrorResponse(c, err); }
+  });
+
+  // Requester decisions: a federated task.read token for the exact grant that
+  // originated the live execution, plus the owner's persisted opt-in. See
+  // requester-approvals.ts. Never accepts owner-session or caller tokens, and
+  // the body cannot name a principal.
+  app.get('/agents/:id/approvals/:requestId', async (c) => {
+    const auth = await authorizeRequesterApproval(opts.db, opts.registry, c.req.param('id'),
+      c.req.param('requestId'), c.req.header('Authorization'));
+    if (!auth.ok) return c.json({ error: auth.error }, auth.status);
+    return c.json(requesterApprovalResponse(auth.approval));
+  });
+  app.post('/agents/:id/approvals/:requestId', async (c) => {
+    const agentId = c.req.param('id');
+    const requestId = c.req.param('requestId');
+    const body = RequesterDecisionBody.safeParse(await c.req.json().catch(() => null));
+    const auth = await authorizeRequesterApproval(opts.db, opts.registry, agentId, requestId,
+      c.req.header('Authorization'));
+    if (!auth.ok) return c.json({ error: auth.error }, auth.status);
+    if (!body.success) return c.json({ error: 'Body must be {"decision":"allow_once"|"deny"}' }, 400);
+    const result = opts.registry.approvals.decide(requestId, body.data.decision, auth.token.principalId, 'requester');
+    if (!result) {
+      logEvent('requester_approval_rejected', { agentId, requestId, reason: 'decision_conflict', status: 409 });
+      return c.json({ error: 'Approval expired, consumed, or already decided differently' }, 409);
+    }
+    return c.json(requesterApprovalResponse(result));
+  });
+
   app.get('/admin-api/agents', async (c) => {
     const auth = await authOwnerSession(c);
     if (!auth.ok) return adminApiUnauthorized(c, auth);
@@ -1245,11 +1311,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     siweDomain,
     responseFormat: 'http-json',
   });
+  // Also opens this request's execution-writer scope (execution-marker.ts):
+  // task-store writes are tied to the execution the request dispatches.
   const listAccessMw: MiddlewareHandler = async (c, next) => {
-    await taskListAccess.run({
+    await executionWriter.run({}, () => taskListAccess.run({
       agentId: getAgentConn(c).agentId,
       principalId: getCaller(c)?.principalId,
-    }, next);
+    }, next));
   };
   app.post('/agents/:id', authMw, listAccessMw, async (c) => {
     const conn = getAgentConn(c);
@@ -1261,10 +1329,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     recordAgentRequest(c, conn, caller);
     const parsed = await readAgentJsonRpcBody(c);
     if (parsed instanceof Response) return parsed;
+    const operation = parseTokenExchangeJsonRpcOperation(parsed);
+    // Before the SDK's own pre-execute save (see ExecutionWriter).
+    if (operation?.kind === 'message') markMessageRequest();
     const taskRejection = await enforceTaskOperation(
       c,
       caller,
-      parseTokenExchangeJsonRpcOperation(parsed),
+      operation,
       'jsonrpc',
       parsed.id,
     );
@@ -1272,7 +1343,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     await prepareAgentRequestBody(parsed, c, caller, conn, 'jsonrpc');
     const handler = getHandlerForConn(conn);
     const result = await handler.handle(parsed);
-    return handleHandlerResult(result, c);
+    return handleHandlerResult(result, c, streamDetach(conn, operation, 'jsonrpc-v0.3'));
   });
 
   // A2A v1 JSON-RPC binding. v1 method names and wire shapes are handled by a
@@ -1285,17 +1356,19 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     c.header('A2A-Version', '1.0');
     const body = await readAgentJsonRpcBody(c);
     if (body instanceof Response) return body;
+    const operation = parseTokenExchangeJsonRpcOperation(body, '1.0');
+    if (operation?.kind === 'message') markMessageRequest();
     const taskRejection = await enforceTaskOperation(
       c,
       caller,
-      parseTokenExchangeJsonRpcOperation(body, '1.0'),
+      operation,
       'jsonrpc',
       body.id,
     );
     if (taskRejection) return taskRejection;
     await prepareAgentRequestBody(body, c, caller, conn, 'jsonrpc');
     const result = await getHandlerV1ForConn(conn).handle(body, getRequestContext(c));
-    return handleHandlerResult(result, c);
+    return handleHandlerResult(result, c, streamDetach(conn, operation, 'jsonrpc-v1'));
   });
 
   // A2A v1 HTTP+JSON binding. Operation paths are relative to the same base
@@ -1332,6 +1405,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     } catch (error) {
       return handleHttpJsonResponse(toHttpJsonErrorResponse(error));
     }
+    if (operation?.kind === 'message') markMessageRequest();
     const taskRejection = await enforceTaskOperation(c, caller, operation, 'http-json');
     if (taskRejection) return taskRejection;
     await prepareAgentRequestBody(body, c, caller, conn, 'http-json');
@@ -1347,7 +1421,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       body,
       context,
     });
-    return handleHttpJsonResponse(response);
+    return handleHttpJsonResponse(response, streamDetach(conn, operation, 'http-json-v1'));
   });
 
   // Admin UI — serve static SPA from /admin

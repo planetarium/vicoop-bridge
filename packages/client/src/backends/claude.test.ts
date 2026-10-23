@@ -6805,3 +6805,82 @@ for (const decision of ['allow_once', 'deny'] as const) {
     await running;
   });
 }
+
+test('remote approvals keep native tool arguments out of trace, text, media and terminal frames', async () => {
+  const { RemoteApprovalBroker } = await import('../remote-approval.js');
+  const SECRET = 'sentinel-secret-7f3a';
+  const broker = new RemoteApprovalBroker();
+  const fake = makeFakeSpawn(() => {});
+  const backend = createClaudeBackend({ spawn: fake.spawn, remoteApprovals: true, heartbeatMs: 0 });
+  const task = { ...assignWithTraceability('deploy it'), executionId: 'execution-redact' };
+  const backendFrames: UpFrame[] = [];
+  const approvalFrames: UpFrame[] = [];
+  const running = broker.run(task, NEVER, true, f => approvalFrames.push(f),
+    () => backend.handle(task, f => backendFrames.push(f), NEVER));
+  while (!fake.lastChild()) await new Promise(r => setImmediate(r));
+  const child = fake.lastChild()!;
+  await new Promise(r => setImmediate(r));
+  const bashInput = { command: `curl -H 'Authorization: ${SECRET}' https://example.test`, description: `uses ${SECRET}` };
+  // The native trace (tool_use) arrives BEFORE the permission callback.
+  child.emitStdout(JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [
+    { type: 'text', text: 'I will call the API.' },
+    { type: 'tool_use', id: 'tu_bash', name: 'Bash', input: bashInput },
+    { type: 'tool_use', id: 'tu_agent', name: 'Agent', input: { description: `audit ${SECRET}`, prompt: SECRET } },
+  ] } }) + '\n');
+  await new Promise(r => setImmediate(r));
+  const traceBeforeApproval = JSON.stringify(backendFrames);
+  assert.ok(traceBeforeApproval.includes('claude-tool-call'), 'trace still emitted');
+  assert.ok(!traceBeforeApproval.includes(SECRET), traceBeforeApproval);
+  child.emitStdout(JSON.stringify({ type: 'control_request', request_id: 'cc-1', request: {
+    subtype: 'can_use_tool', tool_name: 'Bash', input: bashInput } }) + '\n');
+  const request = approvalFrames.find((f): f is Extract<UpFrame, { type: 'approval.request' }> => f.type === 'approval.request');
+  assert.ok(request);
+  // The private approval request keeps the full, unchanged arguments.
+  assert.deepEqual(request.request.input, bashInput);
+  broker.resolve({ type: 'approval.resolve', taskId: task.taskId, executionId: task.executionId,
+    requestId: request.request.requestId, decision: 'allow_once' });
+  await new Promise(r => setImmediate(r));
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64');
+  child.emitStdout(JSON.stringify({ type: 'user', message: { role: 'user', content: [
+    { type: 'tool_result', tool_use_id: 'tu_bash', content: [{ type: 'text', text: `echoed ${SECRET}` },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } }] },
+    { type: 'tool_result', tool_use_id: 'tu_agent', content: `report ${SECRET}` },
+  ] } }) + '\n');
+  child.emitStdout(JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [
+    { type: 'text', text: 'Deployment finished.' }] } }) + '\n');
+  child.emitStdout(JSON.stringify({ type: 'result', subtype: 'success', result: 'Deployment finished.' }) + '\n');
+  child.finish(0);
+  await running;
+
+  const all = JSON.stringify(backendFrames);
+  assert.ok(!all.includes(SECRET), all);
+  const artifacts = backendFrames.filter((f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact');
+  const call = artifacts.find(a => a.artifact.name === 'claude-tool-call' && JSON.stringify(a).includes('tu_bash'))!;
+  assert.deepEqual(call.artifact.parts[0], { kind: 'text', text: 'Bash' });
+  assert.deepEqual(call.artifact.parts[1], { kind: 'data', data: { toolName: 'Bash', toolUseId: 'tu_bash' } });
+  assert.ok(artifacts.some(a => a.artifact.name === 'claude-subagent-event' && JSON.stringify(a).includes('Task started: Task')));
+  // Normal result text and tool-result media are unaffected.
+  assert.ok(all.includes('I will call the API.') && all.includes('Deployment finished.'));
+  assert.ok(artifacts.some(a => a.artifact.name === 'claude-tool-result' && a.artifact.parts.some(p => p.kind === 'file')));
+  assert.equal(backendFrames.at(-1)?.type, 'task.complete');
+});
+
+for (const remoteApprovals of [true, false]) {
+  test(`exit diagnostics ${remoteApprovals ? 'stay local with' : 'are public without'} remote approvals`, async () => {
+    const SECRET = 'sentinel-secret-diag';
+    const fake = scriptedSpawn({ lines: [JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [
+      { type: 'tool_use', id: 'tu_1', name: 'Bash', input: { command: `cat /home/${SECRET}` } }] } })],
+      stderr: `hook failed for /home/${SECRET}`, exitCode: 1 });
+    const backend = createClaudeBackend({ spawn: fake.spawn, remoteApprovals, heartbeatMs: 0 });
+    const { emit, frames } = collect();
+    const local: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { local.push(args.map(String).join(' ')); };
+    try { await backend.handle(assign('read it'), emit, NEVER); } finally { console.error = original; }
+    const fail = frames.at(-1) as Extract<UpFrame, { type: 'task.fail' }>;
+    assert.equal(fail.type, 'task.fail');
+    assert.match(fail.error.message, /claude exited with code 1/);
+    assert.equal(fail.error.message.includes(SECRET), !remoteApprovals, fail.error.message);
+    if (remoteApprovals) assert.ok(local.some(l => l.includes(SECRET)), 'operator-local log keeps the diagnostics');
+  });
+}

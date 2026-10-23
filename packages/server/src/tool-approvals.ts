@@ -6,6 +6,22 @@ export interface ToolApproval extends ApprovalRequest {
   agentId: string; taskId: string; executionId: string;
   state: 'pending' | 'decided' | 'received' | 'expired' | 'invalidated';
   decision?: ApprovalDecision; decidedBy?: string;
+  decidedVia?: ApprovalAuthority;
+}
+export type ApprovalAuthority = 'owner' | 'requester';
+// Caller identity of the TaskBinding that raised the request, captured once at
+// creation. Requester decisions compare against this snapshot rather than the
+// task row, which a continuation of the same task ID may rewrite.
+export interface ApprovalOrigin {
+  readonly principalId?: string; readonly actorId?: string;
+  readonly authorizationProfile?: string; readonly authorizationKey?: string;
+}
+// Requester-facing projection. Never includes the origin snapshot.
+export function approvalView(a: ToolApproval) {
+  return { requestId: a.requestId, agentId: a.agentId, taskId: a.taskId, executionId: a.executionId,
+    toolName: a.toolName, input: a.input, expiresAt: a.expiresAt, state: a.state,
+    ...(a.decision !== undefined ? { decision: a.decision } : {}),
+    ...(a.decidedBy !== undefined ? { decidedBy: a.decidedBy } : {}) };
 }
 // Execution-scoped state: grants are invalid after a server restart, even
 // if a client process is still alive. Audit events go to structured logs and
@@ -14,6 +30,7 @@ export interface ToolApproval extends ApprovalRequest {
 export class ToolApprovals {
   private entries = new Map<string, ToolApproval>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private origins = new Map<string, ApprovalOrigin>();
   constructor(private registry: Registry) {}
   private live(a: ToolApproval): boolean {
     const b = this.registry.getBinding(a.taskId);
@@ -28,6 +45,12 @@ export class ToolApprovals {
     const a: ToolApproval = { ...structuredClone(request), agentId: binding.agentId, taskId: binding.taskId,
       executionId: binding.executionId, state: 'pending' };
     this.entries.set(a.requestId, a);
+    this.origins.set(a.requestId, Object.freeze({
+      ...(binding.principalId !== undefined ? { principalId: binding.principalId } : {}),
+      ...(binding.actorId !== undefined ? { actorId: binding.actorId } : {}),
+      ...(binding.authorizationProfile !== undefined ? { authorizationProfile: binding.authorizationProfile } : {}),
+      ...(binding.authorizationKey !== undefined ? { authorizationKey: binding.authorizationKey } : {}),
+    }));
     this.audit(a, 'requested');
     this.tick(a);
     return a;
@@ -40,13 +63,21 @@ export class ToolApprovals {
     return [...this.entries.values()].filter(a => this.live(a) && (a.state === 'pending' || a.state === 'decided'));
   }
   get(id: string): ToolApproval | undefined { return this.entries.get(id); }
-  decide(id: string, decision: ApprovalDecision, principal: string): ToolApproval | undefined {
+  origin(id: string): ApprovalOrigin | undefined { return this.origins.get(id); }
+  // The live binding that raised `a`, if its execution is still current.
+  liveBinding(a: ToolApproval): TaskBinding | undefined {
+    const b = this.registry.getBinding(a.taskId);
+    return b?.agentId === a.agentId && b.executionId === a.executionId ? b : undefined;
+  }
+  decide(id: string, decision: ApprovalDecision, principal: string,
+    via: ApprovalAuthority = 'owner'): ToolApproval | undefined {
     const a = this.entries.get(id);
     if (!a || !this.live(a) || Date.parse(a.expiresAt) <= Date.now()) return undefined;
     if (a.state !== 'pending') {
-      return (a.state === 'decided' || a.state === 'received') && a.decision === decision && a.decidedBy === principal ? a : undefined;
+      return (a.state === 'decided' || a.state === 'received') && a.decision === decision &&
+        a.decidedBy === principal && (a.decidedVia ?? 'owner') === via ? a : undefined;
     }
-    a.state = 'decided'; a.decision = decision; a.decidedBy = principal;
+    a.state = 'decided'; a.decision = decision; a.decidedBy = principal; a.decidedVia = via;
     this.audit(a, 'decided');
     this.deliver(a);
     return a;
@@ -66,7 +97,7 @@ export class ToolApprovals {
     for (const a of this.entries.values()) if (a.executionId === binding.executionId && a.taskId === binding.taskId) {
       this.clear(a);
       if (a.state === 'pending' || a.state === 'decided') { a.state = 'invalidated'; this.audit(a, 'invalidated'); }
-      this.entries.delete(a.requestId);
+      this.entries.delete(a.requestId); this.origins.delete(a.requestId);
     }
   }
   private deliver(a: ToolApproval): void {
@@ -77,7 +108,7 @@ export class ToolApprovals {
   private tick(a: ToolApproval): void {
     this.clear(a);
     const timer = setTimeout(() => {
-      if (!this.live(a)) { this.entries.delete(a.requestId); this.clear(a); return; }
+      if (!this.live(a)) { this.entries.delete(a.requestId); this.origins.delete(a.requestId); this.clear(a); return; }
       if (a.state !== 'pending' && a.state !== 'decided') return;
       if (Date.now() >= Date.parse(a.expiresAt)) {
         a.state = 'expired'; a.decision = 'deny'; this.deliver(a); this.audit(a, 'expired');
@@ -96,18 +127,24 @@ export class ToolApprovals {
     timer.unref(); this.timers.set(a.requestId, timer);
   }
   private clear(a: ToolApproval): void { clearTimeout(this.timers.get(a.requestId)); this.timers.delete(a.requestId); }
+  // Records the principal binding, never the tool input.
   private audit(a: ToolApproval, event: string): void {
+    const origin = this.origins.get(a.requestId);
     logEvent(`tool_approval_${event}`, { agentId: a.agentId, taskId: a.taskId, executionId: a.executionId,
-      requestId: a.requestId, toolName: a.toolName, decision: a.decision, decidedBy: a.decidedBy });
+      requestId: a.requestId, toolName: a.toolName, decision: a.decision, decidedBy: a.decidedBy,
+      decidedVia: a.decidedVia, originPrincipal: origin?.principalId, originActor: origin?.actorId,
+      originProfile: origin?.authorizationProfile });
   }
 }
 export function approvalStatus(a: ToolApproval) {
   return { state: 'auth-required' as const, timestamp: new Date().toISOString(), message: {
     role: 'agent' as const, messageId: a.requestId,
     parts: [{ kind: 'text' as const, text: `Owner approval required for ${a.toolName}` }],
-    metadata: { [APPROVAL_EXTENSION_URI]: { requestId: a.requestId, toolName: a.toolName, input: a.input,
+    metadata: { [APPROVAL_EXTENSION_URI]: { requestId: a.requestId, executionId: a.executionId,
+      toolName: a.toolName, input: a.input,
       expiresAt: a.expiresAt, decisions: ['allow_once', 'deny'],
-      decisionUrl: `/admin-api/agents/${encodeURIComponent(a.agentId)}/approvals/${a.requestId}` } },
+      decisionUrl: `/admin-api/agents/${encodeURIComponent(a.agentId)}/approvals/${a.requestId}`,
+      requesterApprovalUrl: `/agents/${encodeURIComponent(a.agentId)}/approvals/${a.requestId}` } },
     extensions: [APPROVAL_EXTENSION_URI],
   } };
 }
