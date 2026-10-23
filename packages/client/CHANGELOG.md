@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.43.1
+
+### Patch Changes
+
+- 292cb63: Default ordinary Claude tasks to an explicit permission mode instead of inheriting the user's mode, while preserving explicit agent settings and container bypass. Log the actual session permission mode, CLI version, and built-in tool availability.
+
 ## 0.43.0
 
 ### Minor Changes
