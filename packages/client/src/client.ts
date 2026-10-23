@@ -1,3 +1,4 @@
+import { RemoteApprovalBroker } from './remote-approval.js';
 import WebSocket from 'ws';
 import {
   CALLER_CONTEXT_V1_CAPABILITY,
@@ -5,6 +6,7 @@ import {
   PROTOCOL_VERSION,
   OPENAI_COMPAT_EXTENSION_URI,
   TASK_REPLAY_CAPABILITY,
+  REMOTE_APPROVAL_CAPABILITY,
   EXECUTION_SCOPE_V1_CAPABILITY,
   FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
   CALLER_RUNTIME_V1_CAPABILITY,
@@ -372,6 +374,7 @@ export class Client {
               CALLER_CONTEXT_V2_CAPABILITY,
               CALLER_CONTEXT_V1_CAPABILITY,
               TASK_REPLAY_CAPABILITY,
+              ...(this.opts.backend.remoteApprovals ? [REMOTE_APPROVAL_CAPABILITY] : []),
               ...(this.opts.backend.requiresCallerScope ? [EXECUTION_SCOPE_V1_CAPABILITY, CALLER_RUNTIME_V1_CAPABILITY, FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY] : []),
             ],
             ...(this.opts.trustedIdentityIssuers !== undefined
@@ -418,7 +421,11 @@ export class Client {
       if (this.ws !== ws) return;
 
       switch (frame.type) {
+        case 'approval.resolve':
+          if (this.approvalsReady) this.approvals.resolve(frame);
+          break;
         case 'hello.ack':
+          this.approvalsReady = frame.protocolCapabilities.includes(REMOTE_APPROVAL_CAPABILITY);
           this.federatedScopeReady = frame.protocolCapabilities.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY);
           this.callerScopeReady = [TASK_REPLAY_CAPABILITY, CALLER_CONTEXT_V2_CAPABILITY, EXECUTION_SCOPE_V1_CAPABILITY, CALLER_RUNTIME_V1_CAPABILITY]
             .every((cap) => frame.protocolCapabilities.includes(cap));
@@ -501,6 +508,7 @@ export class Client {
       this.logger.info(`disconnected: ${code} ${safeToken(reason.toString())}`);
       if (!current) return;
       this.ws = null;
+      this.approvalsReady = false;
       // Legacy frames, and reliable runs whose retention was explicitly
       // disabled, cannot safely continue after losing their socket. Stop them
       // so output produced during the outage is never silently discarded.
@@ -998,6 +1006,9 @@ export class Client {
     );
   }
 
+  private approvals = new RemoteApprovalBroker();
+  private approvalsReady = false;
+
   private async runTask(frame: import('@vicoop-bridge/protocol').DownFrame): Promise<void> {
     if (frame.type !== 'task.assign') return;
     const previous = this.inflight.get(frame.taskId);
@@ -1015,7 +1026,8 @@ export class Client {
     };
     this.inflight.set(frame.taskId, run);
     try {
-      await processTask(frame, controller.signal, {
+      const approvalEmit = (f: UpFrame) => { if (!run.suppressed) this.sendTaskFrame(run, f as TaskUpFrame); };
+      await this.approvals.run(frame, controller.signal, this.approvalsReady, approvalEmit, () => processTask(frame, controller.signal, {
         backend: this.opts.backend,
         // A suppressed run is over as far as the bridge is concerned; anything
         // still trickling out of the backend must not reach a taskId that may
@@ -1025,7 +1037,7 @@ export class Client {
           this.sendTaskFrame(run, f as TaskUpFrame);
         },
         logger: this.logger,
-      });
+      }));
     } finally {
       if (this.inflight.get(frame.taskId) === run) this.inflight.delete(frame.taskId);
     }

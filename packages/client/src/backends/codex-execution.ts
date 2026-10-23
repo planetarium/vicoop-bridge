@@ -12,6 +12,7 @@ export function createCodexExecutionBackend(opts:CodexBackendOptions):Backend {
   const create=()=>createCodexBackend({...opts,supportedModelIds:capabilities.openaiCompatModels?.map(m=>m.id)});
   return {
     name:'codex',
+    remoteApprovals: opts.approvalDecision === 'remote',
     async resolveCapabilities() {
       if(stopped) throw new Error('Codex execution backend is stopped');
       probe=create();

@@ -1,3 +1,4 @@
+import { Approvals } from './components/approvals';
 import { WalletAuth } from './components/wallet-auth';
 import { GoogleAuth } from './components/google-auth';
 import { Chat } from './components/chat';
@@ -37,7 +38,10 @@ export default function App() {
 
       {/* Chat area */}
       {session ? (
-        <Chat />
+        <>
+          <Approvals />
+          <Chat />
+        </>
       ) : (
         <div className="flex flex-1 items-center justify-center">
           <p className="text-zinc-400">

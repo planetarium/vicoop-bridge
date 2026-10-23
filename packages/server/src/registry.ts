@@ -1,3 +1,4 @@
+import { ToolApprovals } from './tool-approvals.js';
 import type { WebSocket } from 'ws';
 import type {
   AgentCard,
@@ -235,6 +236,7 @@ interface GraceHold {
 }
 
 export class Registry {
+  readonly approvals = new ToolApprovals(this);
   private agents = new Map<string, ClientConnection>();
   private bindings = new Map<string, TaskBinding>();
   // taskId -> pending grace hold. A binding in here is still present in
@@ -614,6 +616,7 @@ export class Registry {
   // hanging forever on AsyncEventQueue.iterate(). Does NOT touch the bindings
   // map — callers decide whether to delete (disconnect) or overwrite (rebind).
   private failBinding(binding: TaskBinding, error: TerminalError): void {
+    this.approvals.invalidate(binding);
     binding.sink.pushStatus({
       taskId: binding.taskId,
       contextId: binding.contextId,
@@ -720,6 +723,7 @@ export class Registry {
   // turn's terminal frame and wedges its stream open. Mirrors the ws-identity
   // guard already applied to the agents map in unregisterAgent (issue #365).
   unbindTask(taskId: string, binding: TaskBinding): void {
+    this.approvals.invalidate(binding);
     if (this.bindings.get(taskId) !== binding) return;
     // A task that reaches its terminal while a hold is pending — the exact case
     // this feature exists to rescue, where the reconnected client's

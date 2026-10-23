@@ -8,6 +8,8 @@ export const PROTOCOL_VERSION = '0.1';
 // server acknowledges them. Legacy clients and servers continue to use the
 // original taskId-only frames.
 export const TASK_REPLAY_CAPABILITY = 'task-replay-v1';
+export const REMOTE_APPROVAL_CAPABILITY = 'remote-tool-approval-v1';
+export const APPROVAL_EXTENSION_URI = 'https://github.com/planetarium/vicoop-bridge/blob/main/docs/tool-approval-v1.md';
 export const TRACEABILITY_EXTENSION_URI =
   'https://github.com/a2aproject/a2a-samples/extensions/traceability/v1';
 export const SIWE_BEARER_AUTH_EXTENSION_URI =
@@ -217,6 +219,7 @@ export const TaskStatusState = z.enum([
   'submitted',
   'working',
   'input-required',
+  'auth-required',
   'completed',
   'canceled',
   'failed',
@@ -560,8 +563,37 @@ export type TaskCompleteFrame = z.infer<typeof TaskCompleteFrame>;
 export type TaskFailFrame = z.infer<typeof TaskFailFrame>;
 export type UsageResponseFrame = z.infer<typeof UsageResponseFrame>;
 
+// Approval frames participate in task replay and are scoped to one execution.
+export const ApprovalDecision = z.enum(['allow_once', 'deny']);
+export type ApprovalDecision = z.infer<typeof ApprovalDecision>;
+export const ApprovalRequest = z.object({
+  requestId: z.string().uuid(),
+  toolName: z.string().min(1).max(256),
+  input: z.record(z.string(), z.unknown()),
+  expiresAt: z.string().datetime(),
+});
+export type ApprovalRequest = z.infer<typeof ApprovalRequest>;
+export const ApprovalRequestFrame = z.object({
+  type: z.literal('approval.request'), taskId: z.string(),
+  executionId: z.string().min(1).max(128),
+  seq: z.number().int().nonnegative().optional(), request: ApprovalRequest,
+});
+export const ApprovalReceivedFrame = z.object({
+  type: z.literal('approval.received'), taskId: z.string(),
+  executionId: z.string().min(1).max(128),
+  seq: z.number().int().nonnegative().optional(), requestId: z.string().uuid(),
+  decision: ApprovalDecision,
+});
+export const ApprovalResolveFrame = z.object({
+  type: z.literal('approval.resolve'), taskId: z.string(),
+  executionId: z.string().min(1).max(128), requestId: z.string().uuid(),
+  decision: ApprovalDecision,
+});
+
 export const UpFrame = z.discriminatedUnion('type', [
   HelloFrame,
+  ApprovalRequestFrame,
+  ApprovalReceivedFrame,
   TaskStatusFrame,
   TaskArtifactFrame,
   TaskCompleteFrame,
@@ -620,6 +652,7 @@ export type UsageRequestFrame = z.infer<typeof UsageRequestFrame>;
 
 export const DownFrame = z.discriminatedUnion('type', [
   HelloAckFrame,
+  ApprovalResolveFrame,
   TaskAckFrame,
   TaskAssignFrame,
   TaskCancelFrame,

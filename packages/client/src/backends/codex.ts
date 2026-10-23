@@ -1,3 +1,4 @@
+import { currentApprovalRequester, type RequestApproval } from '../remote-approval.js';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -56,7 +57,7 @@ import type {
 } from './openai-compat.js';
 
 export type CodexSandboxMode = SandboxMode;
-export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline';
+export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'remote';
 
 export interface CodexBackendOptions {
   supportedModelIds?: readonly string[];
@@ -759,6 +760,7 @@ export function createCodexBackend(
   // method, routing `item/tool/call` here keyed on `threadId` so each task
   // sees only its own tool calls. Other server requests (approvals, MCP
   // elicitation) fall through to the default `approvalDecision`.
+  const approvalHandlers = new Map<string, { request: RequestApproval; signal: AbortSignal }>();
   const toolCallHandlers = new Map<
     string,
     (params: DynamicToolCallParams) => Promise<DynamicToolCallResponse> | DynamicToolCallResponse
@@ -815,6 +817,14 @@ export function createCodexBackend(
         // Default: approval prompts and friends. We surface a single decision
         // for every approval-flavored request; the bridge's daemon mode has
         // no interactive operator to ask.
+        if (approvalDecision === 'remote') {
+          const p = params as Record<string, unknown> | undefined;
+          const supported = method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval';
+          const handler = typeof p?.threadId === 'string' ? approvalHandlers.get(p.threadId) : undefined;
+          if (!supported || !p || !handler) return { decision: 'decline' };
+          const decision = await handler.request(method, p, handler.signal);
+          return { decision: decision === 'allow_once' ? 'accept' : 'decline' };
+        }
         return { decision: approvalDecision };
       });
       try {
@@ -875,6 +885,7 @@ export function createCodexBackend(
 
   return {
     name: 'codex',
+    remoteApprovals: approvalDecision === 'remote',
 
     // Advertise the underlying model(s) on the openai-compat/v1 extension's
     // `params.models[]` slot (planetarium/oai2a2a#63) using codex's own
@@ -1039,6 +1050,9 @@ export function createCodexBackend(
       // `existing` / `observedThreadId` are block-scoped to the inner try
       // and not visible in its finally.
       let registeredThreadId: string | null = null;
+      let approvalThreadId: string | undefined;
+      const requestApproval = currentApprovalRequester();
+      const approvalLifetime = new AbortController();
       try {
         if (signal.aborted) {
           emit({
@@ -1406,6 +1420,7 @@ export function createCodexBackend(
                   threadId: existing.threadId,
                   cwd,
                   sandbox: sandboxMode,
+                  ...(approvalDecision === 'remote' ? { approvalPolicy: 'untrusted' } : {}),
                   ...(threadConfig ? { config: threadConfig } : {}),
                 },
               );
@@ -1416,6 +1431,7 @@ export function createCodexBackend(
                 {
                   cwd,
                   sandbox: sandboxMode,
+                  ...(approvalDecision === 'remote' ? { approvalPolicy: 'untrusted' } : {}),
                   ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),
                   ...(threadConfig ? { config: threadConfig } : {}),
                   ...(sendEmptyEnvironments ? { environments: [] } : {}),
@@ -1436,6 +1452,10 @@ export function createCodexBackend(
                   callerKey,
                 });
               }
+            }
+            if (approvalDecision === 'remote') {
+              approvalThreadId = threadId;
+              approvalHandlers.set(threadId, { request: requestApproval, signal: approvalLifetime.signal });
             }
             // Append prior conversation (if any) as native Responses API
             // items so codex's session builder includes them in the model
@@ -2011,6 +2031,8 @@ export function createCodexBackend(
           // one. Map.delete on a missing key is a no-op, so paths that
           // failed before registration (failed start/resume, aborted-before-
           // turn) cost nothing here.
+          approvalLifetime.abort();
+          if (approvalThreadId) approvalHandlers.delete(approvalThreadId);
           if (registeredThreadId) toolCallHandlers.delete(registeredThreadId);
           if (mapped.tempDir) {
             try {

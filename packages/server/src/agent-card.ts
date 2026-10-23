@@ -1,3 +1,4 @@
+import { APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
 import {
   A2A_TRANSPORTS,
   A2XServer,
@@ -140,7 +141,14 @@ export function buildAgentA2XServer(
   // behave identically across both hosts. Clients that don't understand
   // the URI can still authenticate via the opaque vbc_caller_* path on
   // the bridge.
-  const wireExtensions = wire.capabilities?.extensions ?? [];
+  if (conn.protocolCapabilities?.includes(REMOTE_APPROVAL_CAPABILITY)) {
+    a2xServer.addExtension({ uri: APPROVAL_EXTENSION_URI, required: false,
+      description: 'Remote tool approval via auth-required. Decisions require an authenticated agent owner or administrator.',
+      params: { decisions: ['allow_once', 'deny'], delivery: 'https',
+        decisionUrlTemplate: `${opts.publicUrl ?? ''}/admin-api/agents/${encodeURIComponent(conn.agentId)}/approvals/{requestId}` },
+    });
+  }
+  const wireExtensions = (wire.capabilities?.extensions ?? []).filter(e => e.uri !== APPROVAL_EXTENSION_URI);
   const callerRuntime = conn.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) === true;
   const restricted = conn.allowedCallers.length > 0 || callerRuntime;
   const bridgeWillEmitSiwe = restricted && Boolean(opts.publicUrl);

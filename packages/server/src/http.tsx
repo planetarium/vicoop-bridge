@@ -1,3 +1,4 @@
+import { ApprovalDecision } from '@vicoop-bridge/protocol';
 import { transferAgent } from './agent-transfer.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -812,6 +813,34 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     logEvent('admin_api_error', { error: String(err) });
     return c.json({ error: 'Internal error' }, 500);
   }
+
+  // Decisions use owner-session authority, never agent-call tokens or a
+  // principal supplied in the body. Recheck DB ownership on every request.
+  app.get('/admin-api/approvals', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    const rows = isAdmin(auth.principalId)
+      ? await opts.db`SELECT id FROM agents`
+      : await opts.db`SELECT id FROM agents WHERE owner_principal = ${auth.principalId}`;
+    const allowed = new Set(rows.map(r => r.id));
+    return c.json({ approvals: opts.registry.approvals.list().filter(a => allowed.has(a.agentId)) });
+  });
+  app.post('/admin-api/agents/:id/approvals/:requestId', async (c) => {
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    const agentId = c.req.param('id');
+    const rows = await opts.db`SELECT owner_principal FROM agents WHERE id = ${agentId}`;
+    if (!rows[0] || !(isAdmin(auth.principalId) || rows[0].owner_principal === auth.principalId))
+      return c.json({ error: 'Not found' }, 404);
+    const approval = opts.registry.approvals.get(c.req.param('requestId'));
+    if (!approval || approval.agentId !== agentId) return c.json({ error: 'Not found' }, 404);
+    const body = await c.req.json().catch(() => null);
+    const decision = ApprovalDecision.safeParse(body?.decision);
+    if (!decision.success) return c.json({ error: 'Expected allow_once or deny' }, 400);
+    const result = opts.registry.approvals.decide(approval.requestId, decision.data, auth.principalId);
+    if (!result) return c.json({ error: 'Approval expired, consumed, or execution no longer active' }, 409);
+    return c.json({ approval: result });
+  });
 
   app.get('/admin-api/agents', async (c) => {
     const auth = await authOwnerSession(c);

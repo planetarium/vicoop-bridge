@@ -1,3 +1,5 @@
+import { approvalStatus } from './tool-approvals.js';
+import { APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { IncomingMessage, Server } from 'node:http';
 import {
@@ -354,6 +356,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
               type: 'hello.ack',
               protocolCapabilities: [
                 TASK_REPLAY_CAPABILITY,
+                ...(frame.protocolCapabilities?.includes(REMOTE_APPROVAL_CAPABILITY) ? [REMOTE_APPROVAL_CAPABILITY] : []),
                 ...(frame.protocolCapabilities?.includes(CALLER_CONTEXT_V2_CAPABILITY) ? [CALLER_CONTEXT_V2_CAPABILITY] : []),
                 ...(supportsExecutionScopeV1(frame.protocolCapabilities) ? [EXECUTION_SCOPE_V1_CAPABILITY,
                   ...(frame.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) ? [CALLER_RUNTIME_V1_CAPABILITY, ...(frame.protocolCapabilities.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY) ? [FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY] : [])] : [])] : []),
@@ -387,6 +390,37 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
 
   function processAuthedFrame(frame: UpFrame): void {
     switch (frame.type) {
+      case 'approval.request': {
+        const accepted = acceptTaskFrame(frame);
+        if (!accepted || accepted.kind === 'handled') return;
+        const b = accepted.binding;
+        try {
+          if (!opts.registry.getAgent(b.agentId)?.protocolCapabilities?.includes(REMOTE_APPROVAL_CAPABILITY))
+            throw new Error('Remote approval capability required');
+          const a = opts.registry.approvals.request(b, frame.request);
+          b.sink.pushStatus({ taskId: b.taskId, contextId: b.contextId, final: false,
+            status: wireStatusToA2X(approvalStatus(a), b.taskId, b.contextId) });
+          acknowledge(b);
+        } catch {
+          opts.registry.sendToAgent(b.agentId, { type: 'task.cancel', taskId: b.taskId, executionId: b.executionId });
+          opts.registry.failTaskBinding(b, 'invalid_approval_request', 'Invalid remote approval request');
+        }
+        break;
+      }
+      case 'approval.received': {
+        const accepted = acceptTaskFrame(frame);
+        if (!accepted || accepted.kind === 'handled') return;
+        const b = accepted.binding;
+        const received = opts.registry.approvals.received(b, frame.requestId, frame.decision);
+        if (!received) { acknowledge(b); break; }
+        b.sink.pushStatus({ taskId: b.taskId, contextId: b.contextId, final: false,
+          status: wireStatusToA2X({ state: 'working', timestamp: new Date().toISOString(), message: {
+            role: 'agent', messageId: `${frame.requestId}-decision`, parts: [{ kind: 'text', text: `Tool approval: ${frame.decision}` }],
+            metadata: { [APPROVAL_EXTENSION_URI]: { requestId: frame.requestId, decision: frame.decision, decidedBy: received.decidedBy } },
+          } }, b.taskId, b.contextId) });
+        acknowledge(b);
+        break;
+      }
       case 'task.status': {
         const accepted = acceptTaskFrame(frame);
         if (!accepted || accepted.kind === 'handled') return;
@@ -398,11 +432,12 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         if (isHeartbeatStatusFrame(frame.metadata)) {
           b.heartbeats = (b.heartbeats ?? 0) + 1;
         }
+        const waiting = opts.registry.approvals.waiting(b);
         b.sink.pushStatus({
           taskId: frame.taskId,
           contextId: b.contextId,
           final: false,
-          status: wireStatusToA2X(frame.status, frame.taskId, b.contextId),
+          status: wireStatusToA2X(waiting ? approvalStatus(waiting) : frame.status, frame.taskId, b.contextId),
           // Pass the frame's metadata through verbatim onto the A2A
           // `TaskStatusUpdateEvent.metadata` (top-level — NOT
           // status.message.metadata). The oai2a2a codec reads the liveness

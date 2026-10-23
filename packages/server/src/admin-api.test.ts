@@ -1200,3 +1200,44 @@ test(
     }
   },
 );
+
+test('tool approval API requires current owner authority, rejects caller tokens and duplicate conflicting decisions', { skip: !hasDb }, async () => {
+  const { randomUUID } = await import('node:crypto');
+  const sql = postgres(process.env.DATABASE_URL!);
+  const owner = `google:approval-owner-${randomUUID()}`;
+  const other = `google:approval-other-${randomUUID()}`;
+  const state = await setupOwner(sql, owner);
+  const otherToken = await issueSessionToken(sql, { principalId: other, provider: 'google', audience: 'owner_session' });
+  const callerToken = await issueSessionToken(sql, { principalId: owner, provider: 'google', audience: 'caller' });
+  const registry = new Registry();
+  const conn = fakeConnection(state);
+  conn.ws = { readyState: 1, OPEN: 1, close() {}, send() {} } as unknown as WebSocket;
+  registry.registerAgent(conn);
+  const binding = { agentId: state.agentId, taskId: randomUUID(), executionId: randomUUID(), contextId: 'ctx',
+    sink: { pushStatus() {}, pushArtifact() {}, finish() {} } };
+  registry.bindTask(binding);
+  const a = registry.approvals.request(binding, { requestId: randomUUID(), toolName: 'Bash', input: { command: 'echo hi' }, expiresAt: new Date(Date.now() + 60_000).toISOString() });
+  const app = createHttpApp({ db: sql, registry });
+  const url = `/admin-api/agents/${state.agentId}/approvals/${a.requestId}`;
+  const decide = (token: string, decision = 'allow_once') => app.request(url, { method: 'POST',
+    headers: { ...authHeaders(token), 'Content-Type': 'application/json' }, body: JSON.stringify({ decision, principalId: owner }) });
+  try {
+    assert.equal((await decide(callerToken.rawToken)).status, 401);
+    assert.equal((await decide(otherToken.rawToken)).status, 404);
+    const hidden = await app.request('/admin-api/approvals', { headers: authHeaders(otherToken.rawToken) });
+    assert.deepEqual((await hidden.json() as { approvals: unknown[] }).approvals, []);
+    const visible = await app.request('/admin-api/approvals', { headers: authHeaders(state.ownerToken) });
+    assert.equal((await visible.json() as { approvals: unknown[] }).approvals.length, 1);
+    assert.equal((await decide(state.ownerToken, 'acceptForSession')).status, 400);
+    assert.equal((await decide(state.ownerToken)).status, 200);
+    assert.equal((await decide(state.ownerToken)).status, 200);
+    assert.equal((await decide(state.ownerToken, 'deny')).status, 409);
+    registry.unbindTask(binding.taskId, binding);
+    assert.equal((await decide(state.ownerToken)).status, 404);
+  } finally {
+    registry.unbindTask(binding.taskId, binding);
+    await teardown(sql, owner, state.clientId);
+    await sql`DELETE FROM callers WHERE principal_id = ${other}`;
+    await sql.end();
+  }
+});
