@@ -6661,4 +6661,113 @@ test('container-selected deny rules reach Claude argv alongside bypass and sourc
   assert.equal(child.args[child.args.indexOf('--mcp-config') + 1], '{"mcpServers":{}}');
   assert.ok(child.args.includes('--strict-mcp-config'));
   assert.ok(child.args.includes('--dangerously-skip-permissions'));
+  assert.equal(child.args.includes('--permission-mode'), false);
+});
+
+
+for (const settings of [undefined, { permissions: { deny: ['Bash(rm *)'] } }]) {
+  test(`plain tasks pin default permission mode with ${settings ? 'deny rules' : 'no settings'}`, async () => {
+    const fake = scriptedSpawn({ lines: [JSON.stringify({ type: 'result', result: 'ok' })], exitCode: 0 });
+    const backend = createClaudeBackend({ spawn: fake.spawn, settings });
+    await backend.handle(assign('hi'), collect().emit, NEVER);
+    const args = fake.lastChild()!.args;
+    assert.equal(args[args.indexOf('--permission-mode') + 1], 'default');
+    assert.equal(args.filter((arg) => arg === '--permission-mode').length, 1);
+    const sentSettings = JSON.parse(String(args[args.indexOf('--settings') + 1]));
+    assert.deepEqual(sentSettings.permissions, settings?.permissions);
+  });
+}
+
+for (const mode of ['default', 'acceptEdits', 'bypassPermissions']) {
+  test(`plain tasks preserve explicit permission mode ${mode}`, async () => {
+    const settings = { permissions: { defaultMode: mode, deny: ['Bash(rm *)'] } };
+    const fake = scriptedSpawn({ lines: [JSON.stringify({ type: 'result', result: 'ok' })], exitCode: 0 });
+    const backend = createClaudeBackend({ spawn: fake.spawn, settings });
+    await backend.handle(assign('hi'), collect().emit, NEVER);
+    const args = fake.lastChild()!.args;
+    assert.equal(args[args.indexOf('--permission-mode') + 1], mode);
+    assert.deepEqual(JSON.parse(String(args[args.indexOf('--settings') + 1])).permissions, settings.permissions);
+  });
+}
+
+for (const extraArgs of [
+  ['--dangerously-skip-permissions'],
+  ['--permission-mode', 'acceptEdits'],
+  ['--permission-mode=plan'],
+]) {
+  test(`plain tasks preserve explicit permission arguments ${extraArgs.join(' ')}`, async () => {
+    const fake = scriptedSpawn({ lines: [JSON.stringify({ type: 'result', result: 'ok' })], exitCode: 0 });
+    const backend = createClaudeBackend({ spawn: fake.spawn, extraArgs });
+    await backend.handle(assign('hi'), collect().emit, NEVER);
+    const args = fake.lastChild()!.args;
+    assert.deepEqual(args.slice(-extraArgs.length), extraArgs);
+    assert.equal(args.filter((arg) => arg === '--permission-mode').length, extraArgs.includes('--permission-mode') ? 1 : 0);
+  });
+}
+
+test('openai-compat does not acquire a default permission-mode flag', async () => {
+  const fake = scriptedSpawn({ lines: [JSON.stringify({ type: 'result', result: 'ok' })], exitCode: 0 });
+  const backend = createClaudeBackend({ spawn: fake.spawn });
+  await backend.handle(assignWithOpenAICompat('hi', {}), collect().emit, NEVER);
+  assert.equal(fake.lastChild()!.args.includes('--permission-mode'), false);
+});
+
+test('session diagnostics report actual mode, CLI version and built-in tool availability', () => {
+  const line = describeClaudeSessionInit({ taskId: 't', model: 'm', permissionMode: 'bypassPermissions', claudeVersion: '2.1.308', tools: ['Bash', 'mcp__server__tool'] });
+  assert.match(line, /permissionMode=.*bypassPermissions/);
+  assert.match(line, /claudeVersion=.*2\.1\.308/);
+  assert.match(line, /builtinTools=on/);
+  for (const tools of [[], ['mcp__server__tool']]) {
+    assert.match(describeClaudeSessionInit({ taskId: 't', model: 'm', tools }), /builtinTools=off/);
+  }
+  for (const tools of [undefined, null, ['Bash', 42]]) {
+    assert.match(describeClaudeSessionInit({ taskId: 't', model: 'm', tools }), /permissionMode=unknown claudeVersion=unknown builtinTools=unknown/);
+  }
+  const hostile = describeClaudeSessionInit({ taskId: 't', model: 'm', permissionMode: 'default\nbuiltinTools=off', claudeVersion: 'x\ny' });
+  assert.equal(hostile.includes('\n'), false);
+});
+
+
+test('session init logs the CLI-reported mode rather than the requested default', async () => {
+  const oldLevel = process.env.VICOOP_CLIENT_LOG_LEVEL;
+  const oldLog = console.log;
+  const logs: string[] = [];
+  process.env.VICOOP_CLIENT_LOG_LEVEL = 'info';
+  console.log = (...args: unknown[]) => { logs.push(args.map(String).join(' ')); };
+  try {
+    const fake = scriptedSpawn({
+      lines: [
+        JSON.stringify({ type: 'system', subtype: 'init', model: 'm', permissionMode: 'bypassPermissions', claude_code_version: '2.1.308', tools: ['Bash'] }),
+        JSON.stringify({ type: 'result', result: 'ok' }),
+      ],
+      exitCode: 0,
+    });
+    const backend = createClaudeBackend({ spawn: fake.spawn });
+    await backend.handle(assign('hi'), collect().emit, NEVER);
+    const args = fake.lastChild()!.args;
+    assert.equal(args[args.indexOf('--permission-mode') + 1], 'default');
+    const init = logs.find((line) => line.includes('[claude] session init'));
+    assert.ok(init);
+    assert.match(init, /permissionMode="bypassPermissions"/);
+    assert.match(init, /claudeVersion="2\.1\.308" builtinTools=on/);
+  } finally {
+    console.log = oldLog;
+    if (oldLevel === undefined) delete process.env.VICOOP_CLIENT_LOG_LEVEL;
+    else process.env.VICOOP_CLIENT_LOG_LEVEL = oldLevel;
+  }
+});
+
+
+for (const mode of [null, '', '   ', 0, false, {}, []]) {
+  test(`rejects malformed defaultMode ${JSON.stringify(mode)} before spawning`, () => {
+    assert.throws(() => createClaudeBackend({ settings: { permissions: { defaultMode: mode } } }), /defaultMode must be a non-empty string/);
+  });
+}
+
+test('explicit mode strings reach CLI validation instead of silently falling back to user settings', async () => {
+  const fake = scriptedSpawn({ lines: [], exitCode: 1 });
+  const backend = createClaudeBackend({ spawn: fake.spawn, settings: { permissions: { defaultMode: 'nonsense' } } });
+  await backend.handle(assign('hi'), collect().emit, NEVER);
+  const args = fake.lastChild()!.args;
+  assert.equal(args[args.indexOf('--permission-mode') + 1], 'nonsense');
 });

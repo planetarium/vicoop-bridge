@@ -317,6 +317,9 @@ interface StreamEvent {
   // (e.g. a result-only turn) (#348).
   subtype?: unknown;
   model?: unknown;
+  permissionMode?: unknown;
+  claude_code_version?: unknown;
+  tools?: unknown;
   message?: {
     role?: unknown;
     content?: unknown;
@@ -418,11 +421,19 @@ export function describeClaudeSessionInit(opts: {
   taskId: string;
   model: unknown;
   sessionId?: unknown;
+  permissionMode?: unknown;
+  claudeVersion?: unknown;
+  tools?: unknown;
   requestedModel?: string | undefined;
   droppedModel?: string | undefined;
 }): string {
   const model =
     typeof opts.model === 'string' && opts.model.length > 0 ? opts.model : 'unknown';
+  const builtinTools = Array.isArray(opts.tools) && opts.tools.every((tool) => typeof tool === 'string')
+    ? (opts.tools.some((tool: string) => !tool.startsWith('mcp__')) ? 'on' : 'off')
+    : 'unknown';
+  const diagnostic = (value: unknown): string =>
+    typeof value === 'string' && value.length > 0 ? safeForLog(value, 80) : 'unknown';
   const field = (label: string, value: unknown, render: (v: string) => string): string =>
     typeof value === 'string' && value.length > 0 ? ` ${label}=${render(value)}` : '';
   return (
@@ -431,6 +442,8 @@ export function describeClaudeSessionInit(opts: {
     // a grep and quotes would be in the way.
     field('session', opts.sessionId, (v) => safeToken(v, 80)) +
     ` model=${safeToken(model, 60)}` +
+    ` permissionMode=${diagnostic(opts.permissionMode)}` +
+    ` claudeVersion=${diagnostic(opts.claudeVersion)} builtinTools=${builtinTools}` +
     // QUOTED, unlike the fields above, because these two are the only values on
     // this line that arrive verbatim from the remote caller's envelope.
     // `safeToken` blocks a newline but not a space or an `=`, so a bare render
@@ -1655,6 +1668,15 @@ export function createClaudeBackend(
   // operator cwd / undefined on a creation failure).
   let openaiCompatCwdResolved: string | undefined | null = null;
   const extraArgs = opts.extraArgs ?? [];
+  const permissions = opts.settings?.permissions;
+  const configuredMode = permissions !== null && typeof permissions === 'object'
+    ? (permissions as Record<string, unknown>).defaultMode
+    : undefined;
+  if (configuredMode !== undefined &&
+      (typeof configuredMode !== 'string' || configuredMode.trim().length === 0)) {
+    throw new Error('createClaudeBackend: settings.permissions.defaultMode must be a non-empty string');
+  }
+
   const spawnFn = opts.spawn ?? defaultSpawn;
   const stderrCap = opts.stderrCaptureBytes ?? 8192;
   const sessionTtlMs = opts.sessionTtlMs ?? 60 * 60 * 1000;
@@ -2668,6 +2690,22 @@ export function createClaudeBackend(
           ? []
           : ['--allowedTools', mcpServerNames.map((s) => `mcp__${s}`).join(' ')];
 
+      // Pin only the implicit permission mode on ordinary agent tasks. User
+      // settings may otherwise silently opt a shared agent into bypass mode.
+      // Keep explicit operator settings and runtime flags authoritative; caller
+      // containers deliberately pass --dangerously-skip-permissions (#542).
+      const explicitPermissionFlag = extraArgs.some((arg) =>
+        arg === '--dangerously-skip-permissions' ||
+        arg === '--permission-mode' || arg.startsWith('--permission-mode='),
+      );
+      const permissionModeArgs: readonly string[] =
+        !envelope && !explicitPermissionFlag
+          // Forward explicit modes too: Claude silently ignores invalid modes
+          // in --settings, but rejects them in --permission-mode. An operator
+          // typo must not fall back to a user-global bypass policy.
+          ? ['--permission-mode', configuredMode ?? 'default']
+          : [];
+
       const args: string[] = [
         '-p',
         '--input-format',
@@ -2689,6 +2727,7 @@ export function createClaudeBackend(
         ...nativeTurnCapArgs,
         '--include-partial-messages',
         ...settingsArgs,
+        ...permissionModeArgs,
         ...extraArgsForTask,
       ];
 
@@ -3115,6 +3154,9 @@ export function createClaudeBackend(
             describeClaudeSessionInit({
               taskId: task.taskId,
               model: evt.model,
+              permissionMode: evt.permissionMode,
+              claudeVersion: evt.claude_code_version,
+              tools: evt.tools,
               // Prefer the event's own id over the `sessionId` the bridge
               // passed in: the bridge's is what it ASKED for via `--session-id`
               // / `--resume`, the event's is what the CLI is actually running
