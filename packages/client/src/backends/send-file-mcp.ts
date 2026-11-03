@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
+import { createServer as createHttpServer, type Server as HttpServer, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -263,7 +263,8 @@ export async function startSendFileMcpServer(
   // Claude starts a fresh MCP client on every turn, including resumed contexts.
   // Each HTTP request gets a fresh stateless transport/server. Reusing one
   // initialized stateful transport rejects the next process's initialize.
-  const requests = new Set<McpServer>();
+  const requests = new Map<McpServer, ServerResponse>();
+  let closing: Promise<void> | undefined;
 
   let httpServer: HttpServer | null = null;
   let actualPort = 0;
@@ -283,6 +284,11 @@ export async function startSendFileMcpServer(
 
   if (!opts.skipHttp) {
     httpServer = createHttpServer(async (req, res) => {
+      if (closing) {
+        res.statusCode = 503;
+        res.end('shutting down');
+        return;
+      }
       // Single MCP endpoint. Reject anything else fast so we don't expose
       // unintended surfaces. Strict pathname match (`/mcp` exactly, with
       // an optional querystring) — the previous `startsWith('/mcp')` also
@@ -298,7 +304,7 @@ export async function startSendFileMcpServer(
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
       });
-      requests.add(mcp);
+      requests.set(mcp, res);
       res.on('close', () => {
         requests.delete(mcp);
         void mcp.close().catch(() => {});
@@ -308,7 +314,6 @@ export async function startSendFileMcpServer(
         await transport.handleRequest(req, res);
       } catch (err) {
         console.error('[send-file-mcp] handleRequest threw:', errorMessage(err));
-        requests.delete(mcp);
         await mcp.close().catch(() => {});
         if (!res.headersSent) {
           res.statusCode = 500;
@@ -361,11 +366,21 @@ export async function startSendFileMcpServer(
     activeTaskCount: () => activeTasks.size,
     invokeSendFileForTest: performSendFile,
     async close() {
-      await Promise.all([...requests].map(mcp => mcp.close().catch(() => {})));
-      requests.clear();
-      if (httpServer) {
-        await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
-      }
+      closing ??= (async () => {
+        // Stop accepting connections before awaiting transport cleanup.
+        const httpClosed = httpServer
+          ? new Promise<void>(resolve => httpServer!.close(() => resolve()))
+          : Promise.resolve();
+        const pending = [...requests];
+        // Closing a JSON-response transport clears its pending response mapping
+        // without ending the Node response. Explicitly interrupt those responses
+        // so HTTP shutdown cannot wait forever on an in-flight file read.
+        for (const [, res] of pending) res.destroy();
+        await Promise.all(pending.map(([mcp]) => mcp.close().catch(() => {})));
+        requests.clear();
+        await httpClosed;
+      })();
+      await closing;
     },
   };
 }
