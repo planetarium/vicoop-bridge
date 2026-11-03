@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { sendFilePendingBytes } from './send-file-config.js';
 import { SHUTDOWN_TIMEOUT_MS, createDaemonShutdown } from './daemon-shutdown.js';
 import { callerStateCmd, runCallerState } from './caller-runtime-admin.js';
 import { createCallerRuntime } from './caller-runtime.js';
@@ -425,6 +426,10 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         settings,
         model: args.claudeModel,
         supportedModels: args.claudeSupportedModels,
+        sendFileMcp: args.claudeSendFile ? {
+          allowedRoots: args.claudeSendFile.allowed_roots,
+          maxBytes: args.claudeSendFile.max_bytes,
+        } : undefined,
         openaiCompatTrace: args.openaiCompatTrace,
         claudeReasoning: args.claudeReasoning,
         claudeThinkingBudget: args.claudeThinkingBudget,
@@ -591,6 +596,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     backendKind: args.backend,
     backend,
     trustedIdentityIssuers: args.trustedIdentityIssuers,
+    maxPendingBytes: sendFilePendingBytes(args.claudeSendFile),
     logLevel: logger.level,
     // Daemon entrypoint: a fatal terminal close (currently 4014 "client
     // deleted") should drop the process with a non-zero exit so

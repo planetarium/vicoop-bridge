@@ -1,3 +1,4 @@
+import { ClaudeSendFileConfig } from './send-file-config.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 // Pure argv/config merging for the daemon entrypoint. Lives in its own
 // module so tests can import it without triggering the side-effectful
@@ -90,6 +91,12 @@ export const daemonFlagsFields = {
   })),
 
   // Backend-specific (Claude)
+  claudeSendFileRoot: optional(option('--claude-send-file-root', string({ metavar: 'PATH' }), {
+    description: message`Enable native A2A send_file from this absolute directory. Host Claude only. Replaces config backends.claude.send_file.allowed_roots.`,
+  })),
+  claudeSendFileMaxBytes: optional(option('--claude-send-file-max-bytes', integer({ min: 1, max: 8388608 }), {
+    description: message`Maximum bytes per native attachment (default 6291456, maximum 8388608). Requires a send-file root.`,
+  })),
   claudeSettingsFile: optional(option('--claude-settings-file', string({ metavar: 'PATH' }), {
     description: message`Path to a JSON file used as Claude \`--settings\`.`,
   })),
@@ -175,6 +182,7 @@ export interface DaemonArgs {
   cwd?: string;
   runtime?: BackendRuntime;
   runtimeName?: string;
+  claudeSendFile?: ClaudeSendFileConfig;
   claudeSettingsFile?: string;
   claudeModel?: string;
   claudeSupportedModels?: string[];
@@ -445,6 +453,20 @@ export function mergeClientArgs(
     errors.push(
       `--no-vicoop-codex-reasoning is not supported by --backend ${backend}; only the vicoop-codex backend forwards a reasoning channel`,
     );
+  }
+
+  const fileFlags = flags.claudeSendFileRoot !== undefined || flags.claudeSendFileMaxBytes !== undefined;
+  if (fileFlags && backend !== 'claude') errors.push('send-file flags require --backend claude');
+  if (backend === 'claude' && (fileFlags || backends.claude?.send_file !== undefined)) {
+    const raw = {
+      allowed_roots: flags.claudeSendFileRoot !== undefined
+        ? [flags.claudeSendFileRoot] : backends.claude?.send_file?.allowed_roots,
+      max_bytes: flags.claudeSendFileMaxBytes ?? backends.claude?.send_file?.max_bytes,
+    };
+    const parsed = ClaudeSendFileConfig.safeParse(raw);
+    if (!parsed.success) errors.push(`Invalid Claude send_file configuration: ${parsed.error.message}`);
+    else resolved.claudeSendFile = parsed.data;
+    if (resolved.runtime === 'container') errors.push('send_file requires Claude host runtime; caller containers do not support outgoing files');
   }
 
   if (missing.length || errors.length) return { ok: false, missing, errors };
