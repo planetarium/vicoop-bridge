@@ -27,6 +27,7 @@ import {
   type RequestContext,
 } from '@a2x/sdk';
 import { PUBLIC_TASK_PROFILE, taskListAccess } from './task-access.js';
+import { partToA2X } from './parts.js';
 import { executionWriter, markMessageRequest } from './execution-marker.js';
 import { detachableSseStream } from './detachable-stream.js';
 import type { ClientConnection, Registry } from './registry.js';
@@ -431,6 +432,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         agentId: conn.agentId,
         count: identityResult.accepted,
       });
+    }
+    // Normalize after identity verification, before the SDK can echo the input
+    // in an immediate/initial response or persist it in task history. Preserve
+    // malformed non-object values for the existing request-validation path.
+    if (Array.isArray(message.parts)) {
+      message.parts = message.parts.map((part) =>
+        part !== null && typeof part === 'object' && !Array.isArray(part) ? partToA2X(part) : part);
     }
     if (caller === undefined) {
       // Public access is an explicit creation-time policy, never a fallback

@@ -736,7 +736,7 @@ test('a task survives a proxy-style disconnect and completes on the reconnected 
     const terminal = sink.statuses.at(-1)!;
     assert.equal(terminal.final, true);
     assert.equal(terminal.status.state, 'completed');
-    assert.deepEqual(terminal.status.message?.parts, [{ kind: 'text', text: 'the answer' }]);
+    assert.deepEqual(terminal.status.message?.parts, [{ text: 'the answer' }]);
     assert.ok(
       !sink.statuses.some((s) => s.status.state === 'failed'),
       'the task must never have been marked failed',
@@ -893,7 +893,7 @@ test('a duplicate replay on the reconnected socket keeps a task alive past grace
 
     const terminal = sink.statuses.at(-1)!;
     assert.equal(terminal.status.state, 'completed');
-    assert.deepEqual(terminal.status.message?.parts, [{ kind: 'text', text: 'late answer' }]);
+    assert.deepEqual(terminal.status.message?.parts, [{ text: 'late answer' }]);
   } finally {
     first.close();
     second?.close();
@@ -1000,7 +1000,7 @@ test('an agent cannot push frames into another agent\'s task', async () => {
       const delivered: TaskStatusUpdateEvent[] = sink.statuses;
       const terminal = delivered.at(-1)!;
       assert.equal(terminal.status.state, 'completed');
-      assert.deepEqual(terminal.status.message?.parts, [{ kind: 'text', text: 'real answer' }]);
+      assert.deepEqual(terminal.status.message?.parts, [{ text: 'real answer' }]);
     } finally {
       recovered.close();
     }

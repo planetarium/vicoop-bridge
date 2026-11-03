@@ -13,13 +13,13 @@ import {
   CALLER_RUNTIME_V1_CAPABILITY,
   CALLER_CONTEXT_V2_CAPABILITY,
   supportsExecutionScopeV1,
-  type Part,
   type TaskStatus as WireTaskStatus,
   type Message as WireMessage,
   type UpFrame,
 } from '@vicoop-bridge/protocol';
 import type { Message, TaskStatus } from '@a2x/sdk';
 import { TaskState } from '@a2x/sdk';
+import { partToA2X } from './parts.js';
 import type { Registry, TaskBinding } from './registry.js';
 import type { Sql } from './db.js';
 import { hashToken } from './token.js';
@@ -217,11 +217,7 @@ function wireMessageToA2X(
   return {
     messageId: m.messageId,
     role: m.role,
-    // Wire parts use `{kind, ...}` shape; a2x's internal Part type uses
-    // discriminator-by-field-presence. The v0.3 response mapper accepts
-    // either (text-part guard hits on `'text' in part`; file/data fall
-    // through to fallback that spreads). Cast keeps type-checker happy.
-    parts: m.parts as unknown as Message['parts'],
+    parts: m.parts.map(partToA2X),
     ...(m.metadata !== undefined ? { metadata: m.metadata } : {}),
     ...(m.extensions !== undefined ? { extensions: m.extensions } : {}),
     taskId,
@@ -460,8 +456,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
             ...(frame.artifact.name !== undefined ? { name: frame.artifact.name } : {}),
             ...(frame.artifact.metadata !== undefined ? { metadata: frame.artifact.metadata } : {}),
             ...(frame.artifact.extensions !== undefined ? { extensions: frame.artifact.extensions } : {}),
-            // Wire-shape parts; see wireMessageToA2X for the shape note.
-            parts: frame.artifact.parts as unknown as Part[] as never,
+            parts: frame.artifact.parts.map(partToA2X),
           },
           append: frame.append,
           lastChunk: frame.lastChunk,
