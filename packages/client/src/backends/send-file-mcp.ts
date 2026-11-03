@@ -202,71 +202,68 @@ export async function startSendFileMcpServer(
     }
   }
 
-  const mcp = new McpServer({
-    name: 'vicoop-bridge-send-file',
-    version: clientVersion,
-  });
+  function createMcp(): McpServer {
+    const mcp = new McpServer({
+      name: 'vicoop-bridge-send-file',
+      version: clientVersion,
+    });
 
-  mcp.registerTool(
-    'send_file',
-    {
-      description:
-        'Deliver a local file to the A2A caller as an attachment. Use this when you want to send a file (PDF, image, csv, etc.) you produced or read earlier alongside your text response. The file is delivered via the bridge as an A2A FilePart artifact. Returns once the file has been queued for transfer.',
-      inputSchema: {
-        path: z
-          .string()
-          .min(1)
-          .describe(
-            'Path to the file on the local filesystem. Absolute paths are preferred; a relative path resolves against the first operator-configured allowed root. After resolution the file must canonicalize (realpath) into one of the allowed roots, otherwise the call is rejected.',
-          ),
-        name: z
-          .string()
-          .optional()
-          .describe(
-            'Optional display name shown to the caller. Defaults to the file basename.',
-          ),
+    mcp.registerTool(
+      'send_file',
+      {
+        description:
+          'Deliver a local file to the A2A caller as an attachment. Use this when you want to send a file (PDF, image, csv, etc.) you produced or read earlier alongside your text response. The file is delivered via the bridge as an A2A FilePart artifact. Returns once the file has been queued for transfer.',
+        inputSchema: {
+          path: z
+            .string()
+            .min(1)
+            .describe(
+              'Path to the file on the local filesystem. Absolute paths are preferred; a relative path resolves against the first operator-configured allowed root. After resolution the file must canonicalize (realpath) into one of the allowed roots, otherwise the call is rejected.',
+            ),
+          name: z
+            .string()
+            .optional()
+            .describe(
+              'Optional display name shown to the caller. Defaults to the file basename.',
+            ),
+        },
       },
-    },
-    async ({ path: filePath, name }) => {
-      const result = await performSendFile({ path: filePath, name });
-      if (result.ok) {
+      async ({ path: filePath, name }) => {
+        const result = await performSendFile({ path: filePath, name });
+        if (result.ok) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `File queued for transfer (artifactId=${result.artifactId}, size=${result.size} bytes, path=${result.realPath}).`,
+              },
+            ],
+            structuredContent: result,
+          };
+        }
+        // Surface as an error result so the model sees it failed and can
+        // adjust (try a different path, ask the user, etc.) instead of
+        // silently moving on.
         return {
+          isError: true,
           content: [
             {
               type: 'text',
-              text: `File queued for transfer (artifactId=${result.artifactId}, size=${result.size} bytes, path=${result.realPath}).`,
+              text: `send_file failed (${result.code}): ${result.message}`,
             },
           ],
           structuredContent: result,
         };
-      }
-      // Surface as an error result so the model sees it failed and can
-      // adjust (try a different path, ask the user, etc.) instead of
-      // silently moving on.
-      return {
-        isError: true,
-        content: [
-          {
-            type: 'text',
-            text: `send_file failed (${result.code}): ${result.message}`,
-          },
-        ],
-        structuredContent: result,
-      };
-    },
-  );
+      },
+    );
 
-  // Stateful transport: the MCP client (OpenClaw bundle-mcp runtime) sends
-  // initialize -> tools/list -> tools/call as a sequence and expects the
-  // server to remember the negotiated session. The SDK's stateless mode
-  // accepts initialize but rejects subsequent calls because the McpServer's
-  // tool registrations are bound to the post-initialize session state. We
-  // generate a fresh session ID per initialize and route subsequent
-  // requests via the `mcp-session-id` header.
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-  });
-  await mcp.connect(transport);
+    return mcp;
+  }
+
+  // Claude starts a fresh MCP client on every turn, including resumed contexts.
+  // Each HTTP request gets a fresh stateless transport/server. Reusing one
+  // initialized stateful transport rejects the next process's initialize.
+  const requests = new Set<McpServer>();
 
   let httpServer: HttpServer | null = null;
   let actualPort = 0;
@@ -285,7 +282,7 @@ export async function startSendFileMcpServer(
   let url = `http://${urlHost}:0/mcp`;
 
   if (!opts.skipHttp) {
-    httpServer = createHttpServer((req, res) => {
+    httpServer = createHttpServer(async (req, res) => {
       // Single MCP endpoint. Reject anything else fast so we don't expose
       // unintended surfaces. Strict pathname match (`/mcp` exactly, with
       // an optional querystring) — the previous `startsWith('/mcp')` also
@@ -296,13 +293,28 @@ export async function startSendFileMcpServer(
         res.end('not found');
         return;
       }
-      transport.handleRequest(req, res).catch((err) => {
+      const mcp = createMcp();
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+        enableJsonResponse: true,
+      });
+      requests.add(mcp);
+      res.on('close', () => {
+        requests.delete(mcp);
+        void mcp.close().catch(() => {});
+      });
+      try {
+        await mcp.connect(transport);
+        await transport.handleRequest(req, res);
+      } catch (err) {
         console.error('[send-file-mcp] handleRequest threw:', errorMessage(err));
+        requests.delete(mcp);
+        await mcp.close().catch(() => {});
         if (!res.headersSent) {
           res.statusCode = 500;
           res.end('internal error');
-        }
-      });
+        } else res.end();
+      }
     });
 
     try {
@@ -329,15 +341,8 @@ export async function startSendFileMcpServer(
         });
       });
     } catch (err) {
-      // Bind failed (port in use, permission denied, host unresolvable).
-      // The McpServer + transport were already wired up before the bind
-      // attempt; close them so a retry doesn't leak handles. httpServer
-      // itself never finished listening so closing is best-effort.
-      try {
-        await mcp.close();
-      } catch {
-        /* ignore secondary failure */
-      }
+      // No MCP transports exist until a request arrives. Bind failure only
+      // requires closing the HTTP server.
       try {
         httpServer.close();
       } catch {
@@ -356,11 +361,8 @@ export async function startSendFileMcpServer(
     activeTaskCount: () => activeTasks.size,
     invokeSendFileForTest: performSendFile,
     async close() {
-      try {
-        await mcp.close();
-      } catch {
-        /* ignore */
-      }
+      await Promise.all([...requests].map(mcp => mcp.close().catch(() => {})));
+      requests.clear();
       if (httpServer) {
         await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
       }

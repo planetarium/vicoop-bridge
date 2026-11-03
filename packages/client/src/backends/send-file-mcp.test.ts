@@ -310,3 +310,28 @@ test('::-bound listener advertises [::1] (IPv6 loopback) in url, not 127.0.0.1',
     await server.close();
   }
 });
+
+test('HTTP MCP supports repeated fresh clients and multiple calls on the same client', async t => {
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const root = await tmpDir();
+  t.after(() => fs.rm(root, {recursive:true,force:true}));
+  await fs.writeFile(path.join(root, 'result.txt'), 'native file');
+  const server = await startSendFileMcpServer({allowedRoots:[root]});
+  try {
+    for (let turn = 0; turn < 2; turn++) {
+      const captured = {artifacts:[] as unknown[]};
+      const task = server.registerActiveTask(makeTaskHandle(`turn-${turn}`,captured));
+      const client = new Client({name:'claude-reconnect-regression',version:'1'});
+      try {
+        await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+        assert.equal((await client.listTools()).tools[0].name,'send_file');
+        for (let call = 0; call < 2; call++) {
+          const result = await client.callTool({name:'send_file',arguments:{path:path.join(root,'result.txt')}});
+          assert.notEqual(result.isError,true);
+        }
+        assert.equal(captured.artifacts.length,2);
+      } finally { await client.close(); task.release(); }
+    }
+  } finally { await server.close(); }
+});
