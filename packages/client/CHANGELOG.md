@@ -1,5 +1,12 @@
 # @vicoop-bridge/client
 
+## 0.44.1
+
+### Patch Changes
+
+- 0813c0e: Allow the send-file MCP server to accept fresh clients on subsequent Claude turns instead of failing with "Server already initialized".
+- ca31af9: Expose Claude host-runtime native A2A file delivery through send-file CLI flags and configuration, with explicit allowed roots and bounded attachment sizes.
+
 ## 0.44.0
 
 ### Minor Changes
