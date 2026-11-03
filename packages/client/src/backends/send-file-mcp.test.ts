@@ -310,3 +310,91 @@ test('::-bound listener advertises [::1] (IPv6 loopback) in url, not 127.0.0.1',
     await server.close();
   }
 });
+
+test('HTTP MCP supports repeated fresh clients and multiple calls on the same client', async t => {
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const root = await tmpDir();
+  t.after(() => fs.rm(root, {recursive:true,force:true}));
+  await fs.writeFile(path.join(root, 'result.txt'), 'native file');
+  const server = await startSendFileMcpServer({allowedRoots:[root]});
+  try {
+    for (let turn = 0; turn < 2; turn++) {
+      const captured = {artifacts:[] as unknown[]};
+      const task = server.registerActiveTask(makeTaskHandle(`turn-${turn}`,captured));
+      const client = new Client({name:'claude-reconnect-regression',version:'1'});
+      try {
+        await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+        assert.equal((await client.listTools()).tools[0].name,'send_file');
+        for (let call = 0; call < 2; call++) {
+          const result = await client.callTool({name:'send_file',arguments:{path:path.join(root,'result.txt')}});
+          assert.notEqual(result.isError,true);
+        }
+        assert.equal(captured.artifacts.length,2);
+      } finally { await client.close(); task.release(); }
+    }
+  } finally { await server.close(); }
+});
+
+test('HTTP MCP shutdown closes an in-flight tool response without waiting for the client', async t => {
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const root = await tmpDir();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const filePath = path.join(root, 'pending.txt');
+  await fs.writeFile(filePath, 'pending read');
+
+  let signalRead!: () => void;
+  let releaseRead!: () => void;
+  const readStarted = new Promise<void>(resolve => { signalRead = resolve; });
+  const readReleased = new Promise<void>(resolve => { releaseRead = resolve; });
+  const open = fs.open;
+  t.mock.method(fs, 'open', async (...args: Parameters<typeof fs.open>) => {
+    const handle = await open(...args);
+    if (args[0] === filePath) {
+      const read = handle.read.bind(handle);
+      t.mock.method(handle, 'read', async (...readArgs: Parameters<typeof handle.read>) => {
+        signalRead();
+        await readReleased;
+        return read(...readArgs);
+      });
+    }
+    return handle;
+  });
+
+  async function withinDeadline(promise: Promise<unknown>): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('shutdown regression deadline exceeded')), 2000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  const server = await startSendFileMcpServer({ allowedRoots: [root] });
+  const task = server.registerActiveTask(makeTaskHandle('shutdown', { artifacts: [] }));
+  const client = new Client({ name: 'shutdown-regression', version: '1' });
+  let closing: Promise<void> | undefined;
+  try {
+    await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+    // Attach a rejection handler before shutdown interrupts the HTTP response.
+    const call = client.callTool({ name: 'send_file', arguments: { path: filePath } })
+      .then(() => 'completed', () => 'interrupted');
+    await withinDeadline(readStarted);
+    closing = server.close();
+    // Keep the read paused and the client open: shutdown must close the response itself.
+    await withinDeadline(closing);
+    await withinDeadline(call);
+    assert.equal(await call, 'interrupted');
+  } finally {
+    releaseRead();
+    await client.close();
+    await (closing ?? server.close());
+    task.release();
+  }
+});
