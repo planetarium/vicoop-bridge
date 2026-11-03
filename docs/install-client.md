@@ -1274,3 +1274,54 @@ In this mode the client also keeps native tool arguments out of traceability
 artifacts and failure messages (see its
 [privacy boundary](./tool-approval-v1.md#privacy-boundary-for-native-arguments));
 upgrade the client to get that protection.
+
+### Native file attachments from Claude
+
+Opt in to the built-in `send_file(path, name?)` MCP tool on a trusted Claude
+**host** runtime. The CLI returns the file bytes as a standard A2A FilePart;
+remote callers do not need access to the local path. No custom agent or output
+encoding is required. The gateway must include PR #550 for A2A 0.3/1.0 file
+normalization.
+
+```sh
+mkdir -p /absolute/workspace/output
+vicoop-client start --backend claude --cwd /absolute/workspace \
+  --claude-send-file-root /absolute/workspace/output
+```
+
+The equivalent agent config (merged with your existing registration) is:
+
+```json
+{
+  "backend": "claude",
+  "backends": {
+    "claude": {
+      "runtime": "host",
+      "cwd": "/absolute/workspace",
+      "send_file": {
+        "allowed_roots": ["/absolute/workspace/output"],
+        "max_bytes": 6291456
+      }
+    }
+  }
+}
+```
+
+Only files inside explicitly configured absolute roots can be sent. The bounded
+reader rejects symlinks, hardlinks, traversal, non-files, and oversized files.
+The default is 6 MiB per file; `--claude-send-file-max-bytes` (or `max_bytes`)
+accepts 1 byte–8 MiB, keeping base64 frames under gateway ingress limits.
+The pending frame queue is sized to retain two maximum file frames. A root
+flag replaces the config roots; a size flag overrides only the size.
+
+Tell Claude to use `send_file` for deliverables, rather than returning a local
+path. The daemon injects and preapproves the tool; Bash sandbox/network settings
+are left unchanged. If your Claude setup also restricts MCP connections, allow
+the tool's loopback HTTP endpoint. The MCP listener binds to loopback, has no
+HTTP authentication, and is for a trusted local host. Do not configure roots
+containing credentials. Overlapping active tasks cause file sends to fail
+closed as ambiguous; send attachment-producing requests sequentially.
+
+Caller-container runtimes do not yet support this tool; enabling it with
+`--runtime container` fails at startup rather than silently dropping attachments.
+It is disabled by default and does not enable file delivery for other backends.

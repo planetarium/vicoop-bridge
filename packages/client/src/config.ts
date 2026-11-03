@@ -1,3 +1,4 @@
+import { ClaudeSendFileConfig } from './send-file-config.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import type { z } from 'zod';
 // Single source of truth for the `vicoop-client` daemon: a JSON config file
@@ -109,6 +110,8 @@ export function defaultOwnerSessionPath(): string {
 export type BackendRuntime = 'host' | 'container';
 
 export interface ClaudeBackendConfig {
+  /** Opt-in native file delivery for host Claude execution. */
+  send_file?: ClaudeSendFileConfig;
   remote_approvals?: boolean;
   cwd?: string;
   settings?: Record<string, unknown>;
@@ -340,6 +343,7 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
     const out: BackendConfigs = {};
     const claudeRaw = asRecord(backends.claude);
     if (claudeRaw) {
+      const sendFile = claudeRaw.send_file === undefined ? undefined : ClaudeSendFileConfig.parse(claudeRaw.send_file);
       const cwd = asString(claudeRaw.cwd);
       const settings = asRecord(claudeRaw.settings);
       const model = asString(claudeRaw.model);
@@ -347,8 +351,9 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const runtime = pickBackendRuntime(claudeRaw.runtime);
       const callerRuntime = claudeRaw.caller_runtime === undefined ? undefined : CallerRuntimeConfig.parse(claudeRaw.caller_runtime);
       const runtimeName = asString(claudeRaw.runtime_name);
-      if (cwd || settings || model || models || runtime || runtimeName || callerRuntime || claudeRaw.remote_approvals === true) {
+      if (sendFile || cwd || settings || model || models || runtime || runtimeName || callerRuntime || claudeRaw.remote_approvals === true) {
         out.claude = {};
+        if (sendFile) out.claude.send_file = sendFile;
         if (claudeRaw.remote_approvals === true) out.claude.remote_approvals = true;
         if (cwd) out.claude.cwd = cwd;
         if (settings) out.claude.settings = settings;
