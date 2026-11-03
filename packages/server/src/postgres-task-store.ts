@@ -10,6 +10,7 @@ import type {
   TaskStore,
 } from '@a2x/sdk';
 import { TaskState, TERMINAL_STATES } from '@a2x/sdk';
+import { normalizeTaskParts } from './parts.js';
 import { OPENAI_COMPAT_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import type { Sql, SqlExecutor } from './db.js';
 import { PUBLIC_TASK_PROFILE, type TaskListAccess } from './task-access.js';
@@ -265,13 +266,13 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
           WHERE task_id = ${taskId} AND owner_agent = ${this.ownerAgent}
           LIMIT 1
         `;
-    // Returns the stored row verbatim — including the request envelope when
-    // persistRequestEnvelope is on (issue #419); this is the forensic read path.
+    // Retain the request envelope when persistRequestEnvelope is on (#419),
+    // while normalizing legacy parts for the SDK response mappers.
     // Unlike loadByContextId (hot per-turn replay), this is a single on-demand
     // fetch, so carrying the envelope here is not a bloat concern. The envelope
     // is never read back for request forwarding (the gateway re-sends it every
     // turn), so returning it here changes no execution behavior.
-    return rows[0]?.task_json ?? null;
+    return rows[0] ? normalizeTaskParts(rows[0].task_json) : null;
   }
 
   async listTasks(params: ListTasksParams): Promise<ListTasksResult> {
@@ -342,7 +343,7 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
       OFFSET ${offset}
       LIMIT ${pageSize}
     `;
-    const tasks = rows.map(({ task_json }) => ({
+    const tasks = rows.map(({ task_json }) => normalizeTaskParts({
       ...task_json,
       ...(params.historyLength !== undefined
         ? {
@@ -514,7 +515,7 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
           FOR UPDATE
         `;
     const row = rows[0];
-    return row ? { task: row.task_json, dispatchId: row.dispatch_id ?? null } : null;
+    return row ? { task: normalizeTaskParts(row.task_json), dispatchId: row.dispatch_id ?? null } : null;
   }
 
   async deleteTask(taskId: string): Promise<void> {
@@ -575,7 +576,7 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     // the read amplification #409 removed, and replay never needs it (the
     // gateway re-sends the envelope every turn). Forensic access to the retained
     // envelope is via getTask / SQL instead.
-    return rows.map((r) => stripPersistedEnvelope(r.task_json)).reverse();
+    return rows.map((r) => normalizeTaskParts(stripPersistedEnvelope(r.task_json))).reverse();
   }
 
   /**
