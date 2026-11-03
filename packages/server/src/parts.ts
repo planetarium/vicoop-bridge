@@ -4,14 +4,19 @@ import type { Part as WirePart } from '@vicoop-bridge/protocol';
 // WS parts (and tasks persisted before #549) use the v0.3 nested file
 // shape. SDK response mappers require flat fields, even for v0.3 output.
 export function partToA2X(part: Part | (WirePart & PartBase)): Part {
-  if ('file' in part) {
+  // Caller history is not parsed by the WS schema. Match the SDK's field
+  // precedence: an extra `file` property must not turn text/data or an
+  // already-flat file into a nested file (and may be null or a primitive).
+  const sdkPart = 'text' in part || 'data' in part || 'raw' in part || 'url' in part;
+  if (!sdkPart && 'file' in part && typeof part.file === 'object'
+    && part.file !== null && !Array.isArray(part.file)) {
     const { kind: _kind, file, ...rest } = part;
     return {
       ...rest,
-      ...(file.bytes !== undefined ? { raw: file.bytes } : {}),
-      ...(file.uri !== undefined ? { url: file.uri } : {}),
-      ...(file.name !== undefined ? { filename: file.name } : {}),
-      ...(file.mimeType !== undefined ? { mediaType: file.mimeType } : {}),
+      ...(typeof file.bytes === 'string' ? { raw: file.bytes } : {}),
+      ...(typeof file.uri === 'string' ? { url: file.uri } : {}),
+      ...(typeof file.name === 'string' ? { filename: file.name } : {}),
+      ...(typeof file.mimeType === 'string' ? { mediaType: file.mimeType } : {}),
     };
   }
   if ('kind' in part) {

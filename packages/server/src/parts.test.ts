@@ -47,3 +47,22 @@ test('legacy task normalization is immutable and idempotent through both SDK res
     assert.deepEqual(result.metadata, legacy.metadata);
   }
 });
+
+test('extra file fields never override SDK part discriminators or crash legacy reads', () => {
+  for (const file of [null, undefined, false, 42, 'legacy', [], { bytes: 'wrong' }]) {
+    for (const base of [{ text: 'kept' }, { data: { value: 'kept' } }, { raw: 'AAE=' }, { url: 'https://example.test/file' }]) {
+      const part = { ...base, file, metadata: { keep: true } };
+      assert.equal(partToA2X(part), part);
+      const legacy = { id: 'legacy', status: { state: TaskState.COMPLETED },
+        history: [{ messageId: 'm', role: 'user', parts: [part] }] } as Task;
+      for (const mapper of [new V03ResponseMapper(), new V10ResponseMapper()]) {
+        assert.doesNotThrow(() => mapper.mapTask(normalizeTaskParts(legacy)));
+      }
+    }
+  }
+  const text = { kind: 'text' as const, text: 'kept', file: null };
+  const data = { kind: 'data' as const, data: { kept: true }, file: { bytes: 'wrong' } };
+  assert.deepEqual(partToA2X(text), { text: 'kept', file: null });
+  assert.deepEqual(partToA2X(data),
+    { data: { kept: true }, file: { bytes: 'wrong' } });
+});
