@@ -356,7 +356,7 @@ test('shared bind preflight rejects symlinks, files, missing directories and uns
   };
   const options = CallerRuntimeConfig.parse({...base, stateDirectory:join(directory,'state'), sharedBinds:[{name:'assets',source}]});
   const pool = () => new DockerCallerRuntimePool('claude', options, 'test', run);
-  // Explicit context takes precedence over a possibly inherited DOCKER_HOST.
+  // Delegate endpoint resolution to the mocked Docker context inspection.
   const previous = process.env.DOCKER_CONTEXT;
   process.env.DOCKER_CONTEXT = 'fixture';
   t.after(() => { if(previous === undefined) delete process.env.DOCKER_CONTEXT; else process.env.DOCKER_CONTEXT = previous; });
@@ -372,7 +372,8 @@ test('shared bind preflight rejects symlinks, files, missing directories and uns
   delete process.env.DOCKER_CONTEXT;
   process.env.DOCKER_HOST = 'tcp://remote:2376';
   await assert.rejects(pool().initialize(), /local Docker Unix socket/);
-  // An explicit local context overrides the remote DOCKER_HOST.
+  // With a context selected, validate the endpoint Docker reports instead of
+  // assuming that DOCKER_HOST identifies the effective endpoint.
   process.env.DOCKER_CONTEXT = 'fixture';
   endpoint = 'unix:///docker.sock'; os = 'windows';
   await assert.rejects(pool().initialize(), /Linux Docker daemon/);

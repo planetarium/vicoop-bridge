@@ -360,7 +360,8 @@ export class DockerCallerRuntimePool {
   private async validateSharedBinds(signal?: AbortSignal): Promise<void> {
     if (!this.options.sharedBinds.length) return;
     // A remote daemon's filesystem cannot be canonicalized on this host.
-    // DOCKER_CONTEXT takes precedence over DOCKER_HOST, as in Docker's CLI.
+    // When a context is selected, let Docker resolve the effective endpoint;
+    // environment-variable precedence can differ between CLI versions.
     const endpoint = !process.env.DOCKER_CONTEXT && process.env.DOCKER_HOST
       ? process.env.DOCKER_HOST
       : JSON.parse(await this.command(['context', 'inspect', '--format', '{{json .Endpoints.docker.Host}}'], signal));
