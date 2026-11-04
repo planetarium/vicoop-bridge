@@ -4,6 +4,10 @@ import { InMemoryTaskStore, type AgentCardV03, type AgentCardV10 } from '@a2x/sd
 import {
   CALLER_CONTEXT_CAPABILITY,
   CALLER_CONTEXT_V2_CAPABILITY,
+  CALLER_RUNTIME_V1_CAPABILITY,
+  EXECUTION_SCOPE_V1_CAPABILITY,
+  FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
+  TASK_REPLAY_CAPABILITY,
   MENTIONABLE_IDENTITY_VC_EXTENSION_URI,
   SIWE_BEARER_AUTH_EXTENSION_URI,
   TRACEABILITY_EXTENSION_URI,
@@ -154,6 +158,55 @@ test('OAuth federation is advertised only for an exact persisted federated calle
       .capabilities.extensions?.some((entry) => entry.uri === OAUTH_FEDERATION_EXTENSION_URI) ?? false,
     false,
   );
+});
+
+test('caller-runtime OAuth federation advertisement requires the full execution-scope capability set', () => {
+  const federated = formatFederatedPrincipal({
+    issuer: 'did:web:connector.example',
+    method: 'urn:mentionable:auth:slack-workspace-member:v0.1',
+    subject: 'slack:T123/U456',
+  })!;
+  const capabilities = [
+    CALLER_RUNTIME_V1_CAPABILITY,
+    CALLER_CONTEXT_V2_CAPABILITY,
+    EXECUTION_SCOPE_V1_CAPABILITY,
+    TASK_REPLAY_CAPABILITY,
+    FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
+  ];
+  const cases = [
+    { name: 'ready', capabilities, allowedCallers: [federated], publicUrl: 'https://bridge.example', advertised: true },
+    ...capabilities.filter((capability) => capability !== CALLER_RUNTIME_V1_CAPABILITY).map((missing) => ({
+      name: `missing ${missing}`,
+      capabilities: capabilities.filter((capability) => capability !== missing),
+      allowedCallers: [federated], publicUrl: 'https://bridge.example', advertised: false,
+    })),
+    { name: 'no public URL', capabilities, allowedCallers: [federated], publicUrl: undefined, advertised: false },
+    { name: 'no callers', capabilities, allowedCallers: [], publicUrl: 'https://bridge.example', advertised: false },
+    { name: 'direct caller', capabilities, allowedCallers: ['apikey:alice'], publicUrl: 'https://bridge.example', advertised: false },
+    { name: 'malformed caller', capabilities, allowedCallers: ['federated:v1:bad'], publicUrl: 'https://bridge.example', advertised: false },
+  ];
+  for (const entry of cases) {
+    const card = buildAgentA2XServer(
+      fakeConn({
+        name: 'claude', description: 'Claude Code', version: '0.0.1', protocolVersion: '0.3.0',
+        capabilities: { extensions: [{
+          uri: OAUTH_FEDERATION_EXTENSION_URI, required: false,
+          params: { authorization_server: 'https://untrusted.example', resource: 'untrusted' },
+        }] },
+      }, { allowedCallers: entry.allowedCallers, protocolCapabilities: entry.capabilities }),
+      new InMemoryTaskStore(), new Registry(),
+      { publicUrl: entry.publicUrl, deviceFlowEnabled: false },
+    ).getAgentCard() as AgentCardV03;
+    const extensions = card.capabilities.extensions?.filter((extension) => extension.uri === OAUTH_FEDERATION_EXTENSION_URI) ?? [];
+    assert.equal(extensions.length, entry.advertised ? 1 : 0, entry.name);
+    if (entry.advertised) {
+      assert.equal(extensions[0]!.required, true);
+      assert.deepEqual(extensions[0]!.params, {
+        authorization_server: 'https://bridge.example/.well-known/oauth-authorization-server',
+        resource: 'https://bridge.example/agents/claude',
+      });
+    }
+  }
 });
 
 test('buildAgentA2XServer preserves advertised optional extensions', () => {

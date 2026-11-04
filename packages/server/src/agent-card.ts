@@ -10,6 +10,8 @@ import {
 import {
   CALLER_CONTEXT_V2_CAPABILITY,
   CALLER_RUNTIME_V1_CAPABILITY,
+  FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
+  supportsExecutionScopeV1,
   OPENAI_COMPAT_EXTENSION_URI,
   TRACEABILITY_EXTENSION_URI,
   MENTIONABLE_IDENTITY_VC_EXTENSION_URI,
@@ -159,9 +161,15 @@ export function buildAgentA2XServer(
     supportsCallerContext(conn.protocolCapabilities) &&
     (conn.identityTrust?.trustedIssuers.length ?? 0) > 0;
   const bridgeWillEmitOAuthFederation =
-    !callerRuntime && restricted &&
+    restricted &&
     Boolean(opts.publicUrl) &&
     conn.protocolCapabilities?.includes(CALLER_CONTEXT_V2_CAPABILITY) === true &&
+    // The registry retains hello capabilities, so require the full set that
+    // the server can acknowledge and the executor needs for a federated scope.
+    (!callerRuntime || (
+      supportsExecutionScopeV1(conn.protocolCapabilities) &&
+      conn.protocolCapabilities.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY)
+    )) &&
     conn.allowedCallers.some((entry) => parseFederatedPrincipal(entry) !== null);
   for (const extension of wireExtensions) {
     if (callerRuntime && [OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI].includes(extension.uri)) continue;
