@@ -63,6 +63,7 @@ interface FakeChild extends ClaudeChildHandle {
   killSignal: NodeJS.Signals | null;
   stdinPayload: string;
   stdinClosed: boolean;
+  emitExit(code: number): void;
   emitStdout(text: string): void;
   emitStderr(text: string): void;
   finish(code: number | null, sig?: NodeJS.Signals | null): void;
@@ -80,6 +81,7 @@ function makeFakeSpawn(configure: (child: FakeChild) => void): FakeSpawn {
       const stdoutEmitter = new EventEmitter();
       const stderrEmitter = new EventEmitter();
       const closeListeners: Array<(code: number | null, sig: NodeJS.Signals | null) => void> = [];
+      const exitListeners: Array<(code: number | null, sig: NodeJS.Signals | null) => void> = [];
       let closed = false;
 
       const mkReadable = (em: EventEmitter) =>
@@ -155,17 +157,19 @@ function makeFakeSpawn(configure: (child: FakeChild) => void): FakeSpawn {
           return true;
         },
         on(
-          event: 'close' | 'error',
+          event: 'close' | 'exit' | 'error',
           listener:
             | ((code: number | null, signal: NodeJS.Signals | null) => void)
             | ((err: Error) => void),
         ) {
+          if (event === 'exit') exitListeners.push(listener as (c: number | null, s: NodeJS.Signals | null) => void);
           if (event === 'close') {
             closeListeners.push(listener as (c: number | null, s: NodeJS.Signals | null) => void);
           }
           // 'error' not exercised by fakes; real spawn errors are covered in
           // the spawn_failed path separately.
         },
+        emitExit(code) { for (const listener of exitListeners) listener(code, null); },
         emitStdout(text) {
           stdoutEmitter.emit('data', Buffer.from(text, 'utf8'));
         },
@@ -2871,7 +2875,7 @@ test('send_file MCP: server is registered on first task and a registered handle 
   try {
     const result = await server.invokeSendFileForTest({
       path: path.join(realRoot, 'note.txt'),
-    });
+    }, release.token);
     assert.equal(result.ok, true);
     assert.equal(captured.length, 1);
     assert.equal(captured[0].name, 'send-file');
@@ -2919,7 +2923,7 @@ test('send_file MCP: tool call landing during an in-flight task emits a task.art
 
   const result = await server.invokeSendFileForTest({
     path: path.join(realRoot, 'doc.txt'),
-  });
+  }, JSON.parse(String(fake.lastChild()!.args[fake.lastChild()!.args.indexOf('--mcp-config') + 1])).mcpServers['_vb-send-file'].headers.Authorization.slice(7));
   assert.equal(result.ok, true);
 
   // Now let the child exit so handle() resolves.
@@ -6884,3 +6888,88 @@ for (const remoteApprovals of [true, false]) {
     if (remoteApprovals) assert.ok(local.some(l => l.includes(SECRET)), 'operator-local log keeps the diagnostics');
   });
 }
+
+test('send_file execution capabilities expire at process exit and abort while overlapping tasks remain active', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-file-lifetime-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const file = path.join(root, 'fixture.txt');
+  await fs.writeFile(file, 'deliverable');
+  const children: FakeChild[] = [];
+  const fake = makeFakeSpawn(child => { children.push(child); });
+  const backend = createClaudeBackend({ spawn: fake.spawn, sendFileMcp: { allowedRoots: [root], skipHttp: true } });
+  t.after(async () => { await backend.getSendFileMcpServer()?.close(); });
+  const a = collect(), b = collect();
+  const abort = new AbortController();
+  const first = backend.handle({ ...assign('first'), taskId: 'a', contextId: 'a' }, a.emit, NEVER);
+  const second = backend.handle({ ...assign('second'), taskId: 'b', contextId: 'b' }, b.emit, abort.signal);
+  while (children.length !== 2 || backend.getSendFileMcpServer()?.activeTaskCount() !== 2) await new Promise(r => setImmediate(r));
+  const token = (child: FakeChild) => JSON.parse(String(child.args[child.args.indexOf('--mcp-config') + 1])).mcpServers['_vb-send-file'].headers.Authorization.slice(7);
+  const server = backend.getSendFileMcpServer()!;
+  const tokenA = token(children[0]), tokenB = token(children[1]);
+  assert.notEqual(tokenA, tokenB);
+  assert.ok((await server.invokeSendFileForTest({ path: file }, tokenA)).ok);
+  assert.ok((await server.invokeSendFileForTest({ path: file }, tokenB)).ok);
+  // Descendant helper may hold stdio open after the Claude process exits.
+  children[0].emitExit(0);
+  assert.equal(server.activeTaskCount(), 1);
+  assert.equal((await server.invokeSendFileForTest({ path: file }, tokenA)).ok, false);
+  assert.ok((await server.invokeSendFileForTest({ path: file }, tokenB)).ok);
+  abort.abort();
+  assert.equal((await server.invokeSendFileForTest({ path: file }, tokenB)).ok, false);
+  children[0].finish(0);
+  await Promise.all([first, second]);
+  assert.equal(server.activeTaskCount(), 0);
+  assert.equal(a.frames.filter(f => f.type === 'task.artifact').length, 1);
+  assert.equal(b.frames.filter(f => f.type === 'task.artifact').length, 2);
+});
+
+test('send_file corrective retry rotates capability without reactivating the prior helper', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-file-retry-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const file = path.join(root, 'fixture.txt');
+  await fs.writeFile(file, 'retry');
+  let firstToken = '';
+  const fake = twoAttemptSpawn([[NARRATED, OK_RESULT], [REAL_CALL, OK_RESULT]], [1, 1], async attempt => {
+    const args = fake.lastChild()!.args;
+    const token = JSON.parse(String(args[args.indexOf('--mcp-config') + 1])).mcpServers['_vb-send-file'].headers.Authorization.slice(7);
+    const server = backend.getSendFileMcpServer()!;
+    if (attempt === 0) firstToken = token;
+    else {
+      assert.notEqual(token, firstToken);
+      assert.equal((await server.invokeSendFileForTest({ path: file }, firstToken)).ok, false);
+      assert.ok((await server.invokeSendFileForTest({ path: file }, token)).ok);
+    }
+  });
+  const backend = createClaudeBackend({ spawn: fake.spawn, claudeRetryNarratedToolCall: true, sendFileMcp: { allowedRoots: [root], skipHttp: true } });
+  t.after(async () => { await backend.getSendFileMcpServer()?.close(); });
+  await backend.handle(narratedToolCallTask(), collect().emit, NEVER);
+  assert.equal(fake.argvs.length, 2);
+  assert.equal(backend.getSendFileMcpServer()!.activeTaskCount(), 0);
+});
+
+test('send_file capability is redacted from debug argv and spawn failure messages', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-file-secret-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const previous = process.env.VICOOP_CLIENT_LOG_LEVEL;
+  process.env.VICOOP_CLIENT_LOG_LEVEL = 'debug';
+  t.after(() => { if (previous === undefined) delete process.env.VICOOP_CLIENT_LOG_LEVEL; else process.env.VICOOP_CLIENT_LOG_LEVEL = previous; });
+  const logs: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => logs.push(args.join(' ')));
+  let token = '';
+  const backend = createClaudeBackend({
+    sendFileMcp: { allowedRoots: [root], skipHttp: true },
+    spawn: (_command, args) => {
+      token = JSON.parse(String(args[args.indexOf('--mcp-config') + 1])).mcpServers['_vb-send-file'].headers.Authorization.slice(7);
+      throw new Error(`spawn failed with arguments ${JSON.stringify(args)}`);
+    },
+  });
+  t.after(async () => { await backend.getSendFileMcpServer()?.close(); });
+  const { frames, emit } = collect();
+  await backend.handle(assign('failed'), emit, NEVER);
+  assert.ok(token);
+  assert.equal(backend.getSendFileMcpServer()!.activeTaskCount(), 0);
+  assert.ok(logs.some(line => line.includes('[REDACTED]')));
+  assert.ok(!logs.some(line => line.includes(token)));
+  assert.ok(!JSON.stringify(frames).includes(token));
+  assert.equal(frames.at(-1)?.type, 'task.fail');
+});

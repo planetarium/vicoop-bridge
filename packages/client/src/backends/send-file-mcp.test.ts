@@ -398,3 +398,93 @@ test('HTTP MCP shutdown closes an in-flight tool response without waiting for th
     task.release();
   }
 });
+
+test('execution-bound HTTP MCP routes overlapping clients and rejects missing/stale capabilities', async t => {
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const root = await tmpDir();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await fs.writeFile(path.join(root, 'a.txt'), 'caller A');
+  await fs.writeFile(path.join(root, 'b.txt'), 'caller B');
+  const server = await startSendFileMcpServer({ allowedRoots: [root], requireExecutionBinding: true });
+  t.after(() => server.close());
+  const artifactsA: unknown[] = [], artifactsB: unknown[] = [];
+  const a = server.registerActiveTask(makeTaskHandle('a', { artifacts: artifactsA }));
+  const b = server.registerActiveTask(makeTaskHandle('b', { artifacts: artifactsB }));
+  const connect = async (token: string) => {
+    const client = new Client({ name: 'bound-client', version: '1' });
+    t.after(() => client.close());
+    await client.connect(new StreamableHTTPClientTransport(new URL(server.url), {
+      requestInit: { headers: { Authorization: `Bearer ${token}` } },
+    }));
+    return client;
+  };
+  const [clientA, clientB] = await Promise.all([connect(a.token), connect(b.token)]);
+  const tools = await clientA.listTools();
+  assert.deepEqual(Object.keys(tools.tools[0].inputSchema.properties!), ['path', 'name']);
+  const results = await Promise.all([
+    clientA.callTool({ name: 'send_file', arguments: { path: path.join(root, 'a.txt'), taskId: 'b' } }),
+    clientB.callTool({ name: 'send_file', arguments: { path: path.join(root, 'b.txt'), contextId: 'ctx-a' } }),
+  ]);
+  assert.ok(results.every(r => !r.isError));
+  const decoded = (artifacts: unknown[]) => Buffer.from((artifacts[0] as { parts: Array<{ file: { bytes: string } }> }).parts[0].file.bytes, 'base64').toString();
+  assert.equal(decoded(artifactsA), 'caller A');
+  assert.equal(decoded(artifactsB), 'caller B');
+  assert.equal((await fetch(server.url, { method: 'POST' })).status, 401);
+  assert.equal((await fetch(server.url, { method: 'POST', headers: { Authorization: 'Bearer unknown' } })).status, 401);
+  // Fresh helpers can reconnect only to their original still-active execution.
+  const reconnected = await connect(b.token);
+  assert.ok(!(await reconnected.callTool({ name: 'send_file', arguments: { path: path.join(root, 'b.txt') } })).isError);
+  a.release();
+  await assert.rejects(clientA.callTool({ name: 'send_file', arguments: { path: path.join(root, 'a.txt') } }));
+  await assert.rejects(connect(a.token));
+  assert.equal(artifactsA.length, 1);
+  assert.equal(artifactsB.length, 2);
+  // Re-registering the same A2A task still needs a new execution capability.
+  const retry = server.registerActiveTask(makeTaskHandle('a', { artifacts: artifactsA }));
+  assert.notEqual(retry.token, a.token);
+  await assert.rejects(clientA.callTool({ name: 'send_file', arguments: { path: path.join(root, 'a.txt') } }));
+  retry.release(); b.release();
+});
+
+test('execution release and shutdown prevent pending reads from emitting into any task', async t => {
+  const root = await tmpDir();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const file = path.join(root, 'pending.txt');
+  await fs.writeFile(file, 'private');
+  const originalOpen = fs.open;
+  let releaseRead!: () => void;
+  let signalRead!: () => void;
+  let started: Promise<void>;
+  let paused: Promise<void>;
+  t.mock.method(fs, 'open', async (...args: Parameters<typeof fs.open>) => {
+    const handle = await originalOpen(...args);
+    const read = handle.read.bind(handle);
+    t.mock.method(handle, 'read', async (...params: Parameters<typeof handle.read>) => {
+      signalRead(); await paused; return read(...params);
+    });
+    return handle;
+  });
+  for (const shutdown of [false, true]) {
+    started = new Promise<void>(resolve => { signalRead = resolve; });
+    paused = new Promise<void>(resolve => { releaseRead = resolve; });
+    const server = await startSendFileMcpServer({ allowedRoots: [root], requireExecutionBinding: true, skipHttp: true });
+    const cap = { artifacts: [] as unknown[] };
+    const task = server.registerActiveTask(makeTaskHandle('old', cap));
+    const pending = server.invokeSendFileForTest({ path: file }, task.token);
+    await started;
+    if (shutdown) await server.close();
+    else {
+      task.release();
+      server.registerActiveTask(makeTaskHandle('new', cap));
+    }
+    releaseRead();
+    const result = await pending;
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'inactive-execution');
+    assert.deepEqual(cap.artifacts, []);
+    await server.close();
+    assert.equal(server.activeTaskCount(), 0);
+    assert.throws(() => server.registerActiveTask(makeTaskHandle('after-close', cap)), /closed/);
+  }
+});
