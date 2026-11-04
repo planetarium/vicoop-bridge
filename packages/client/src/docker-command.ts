@@ -8,6 +8,7 @@ export interface DockerCommandResult {
 
 export interface DockerCommandOptions {
   timeoutMs?: number;
+  maxOutputBytes?: number;
   /** Preserve progress output for operator-initiated image pulls. */
   inheritOutput?: boolean;
   signal?: AbortSignal;
@@ -38,6 +39,8 @@ export function runBoundedCommand(
   options: DockerCommandOptions = {},
 ): Promise<DockerCommandResult> {
   const timeoutMs = options.timeoutMs ?? 30_000;
+  const maxOutputBytes = options.maxOutputBytes ?? 1024 * 1024;
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1 || maxOutputBytes > 16 * 1024 * 1024) return Promise.reject(new Error('invalid command output limit'));
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     return Promise.reject(new Error('command timeout must be finite and positive'));
   }
@@ -81,7 +84,7 @@ export function runBoundedCommand(
     const collect = (target: Buffer[], chunk: Buffer) => {
       if (settled) return;
       bytes += chunk.length;
-      if (bytes > 1024 * 1024) stop(new Error('command output exceeded 1 MiB'));
+      if (bytes > maxOutputBytes) stop(new Error('command output exceeded configured limit'));
       else target.push(chunk);
     };
     child.stdout?.on('data', (chunk: Buffer) => collect(stdout, chunk));

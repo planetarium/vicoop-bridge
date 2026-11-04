@@ -7,8 +7,9 @@ public agent identity and bridge connection. A new `contextId` from the same
 principal uses the same container and workspace, with a separate conversation.
 
 This is opt-in. OpenClaw, unsupported delegation profiles, OpenAI compatibility, caller tools,
-MCP integration, outgoing file delivery and automatic idle reclamation are not
-supported in this mode. The two execution modes are `host` (default) and
+general MCP integration and automatic idle reclamation are not supported in
+this mode. Claude supports opt-in outgoing file delivery through the bridge-owned
+`send_file` helper described below; Codex output remains text-only. The two execution modes are `host` (default) and
 `container` (dedicated per caller); shared-container execution is no longer
 available through the daemon.
 
@@ -426,7 +427,7 @@ policy (other commands or tools may still read a file). Rules remain effective
 with the runtime's `--dangerously-skip-permissions` flag. `permissions.allow`,
 `ask`, `defaultMode`, and other permission keys remain unsupported. Workspace
 setup does not load caller-provided Claude settings: `--setting-sources ''` and
-the empty strict MCP configuration remain in effect. Deny rules supplement the
+the strict MCP configuration remain in effect (only the bridge-owned `send_file` helper is added when configured). Deny rules supplement the
 existing environment isolation; task credentials must still be scoped to the
 intended user's authority.
 
@@ -441,7 +442,7 @@ bundled descriptions omit host JSON-data support. Custom card descriptions are
 preserved with the container input contract appended, and a custom card with no
 supported input mode is rejected before daemon startup.
 
-Caller cards advertise text-only output. Traceability extensions are not advertised, and requests opting into traceability are rejected before allocation because trace artifacts may contain files or structured data. Offline removal/recreation also rejects volumes mounted by another container (including stopped containers) before deleting any resources; detach those consumers before retrying.
+Caller cards advertise text-only output unless Claude file delivery is explicitly enabled. Traceability extensions are not advertised, and requests opting into traceability are rejected before allocation because trace artifacts may contain files or structured data. Offline removal/recreation also rejects volumes mounted by another container (including stopped containers) before deleting any resources; detach those consumers before retrying.
 
 Canceled queued requests return promptly, but their queue slots remain occupied until the preceding request settles. Repeated cancellation cannot bypass the queue bound; new requests may receive `runtime_capacity` while those barriers remain.
 
@@ -515,3 +516,100 @@ caller image (no provider credentials or model invocation required):
 VICOOP_SHARED_TEST_IMAGE=sha256:YOUR_CALLER_IMAGE_ID \
   pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-shared-volumes.integration.test.ts
 ```
+
+
+## Outgoing files from Claude caller containers
+
+Enable `fileDelivery` under `backends.claude.caller_runtime`:
+
+```json
+"fileDelivery": {
+  "allowedRoots": ["/workspace/output"],
+  "maxBytes": 6291456,
+  "maxTotalBytes": 25165824,
+  "maxFiles": 8
+}
+```
+
+Restart the daemon after changing this configuration. Existing Node-equipped
+caller images work without rebuilding. The model creates the output directory
+and files, then invokes the bridge-owned `send_file` MCP tool with `path` and an
+optional plain `name`. The caller receives an inline A2A FilePart with the actual
+bytes, including in completed-task lookups. A local path in prose is not a file
+delivery. This feature does not enable arbitrary operator or caller MCP servers.
+
+Roots must be normalized absolute directories strictly below `/workspace`, with
+no trailing slash. Relative tool paths resolve beneath the first root. The reader
+rejects symbolic links in **any** path component, hard links, non-regular files,
+and paths outside the configured roots. It runs as the workload user in the
+originating container, never against host paths. Configure directories that the
+workload user can read. These are export-path limits: the agent can still copy a
+file it is otherwise authorized to read into an allowed output directory.
+
+The defaults shown above permit 6 MiB per file, 24 MiB total decoded bytes, and
+8 files per task. Maximum configurable limits are 8 MiB per file, 48 MiB total,
+and 16 files. Retries share the task budget. Files are snapshotted when the tool
+runs and delivered immediately; successful delivery does not prove the remote
+user downloaded the file, and later cancellation does not retract an already
+accepted artifact.
+
+The daemon sizes its global replay retention for one full attachment batch per
+`maxScopes` concurrently active scopes, including base64 expansion, 64 KiB of
+JSON metadata allowance per file, and 1 MiB for other frames per scope. With the
+defaults (`maxScopes: 8`) the ceiling is approximately **268 MiB of encoded
+retained frames**, allocated only as frames await acknowledgement. This is not a
+total process memory limit: encoding, socket buffers, and other work also use
+memory. Startup rejects combinations requiring more than 512 MiB; lower
+`maxScopes` or the file limits to fit. The individual maxima above must be used
+with a compatible scope count. Disabling file delivery keeps the normal replay
+budget unchanged.
+
+Retention remains bounded by the existing frame-count and age limits as well as
+this byte ceiling. Unlimited ACK delay, multiple completed batches awaiting ACK
+per scope, or unusually large text output can still exhaust retention and fail
+the task with `client_buffer_overflow` before disconnecting. This sizing supports
+the configured concurrent attachment batches; it does not promise unlimited
+offline buffering.
+
+The bridge binds each helper transport to one active process, task, and caller
+container. The helper cannot select a recipient or task. It uses a short-lived
+container-loopback endpoint over that execution's Docker channel, without a
+host TCP listener, shared output queue, or host credentials. Bindings and pending
+reads are revoked on process exit, cancellation, timeout, or shutdown. If a reader
+transport fails or times out without confirmed remote process exit, the task fails
+and the scope is stopped before reuse; the next task restarts it. An unconfirmed
+container stop quarantines the scope for offline recovery. Ordinary path or size
+rejections remain recoverable tool errors. A retry gets a new binding; the existing trusted supervisor cleans up descendants before
+another execution uses the scope. Reconnection uses the existing execution replay
+protocol; a previous execution's helper cannot attach to a later task. Workspace
+files themselves persist and may be explicitly sent again in a later request.
+
+File-enabled Claude cards advertise file output; disabled Claude cards and Codex
+cards remain text-only. Setting `fileDelivery` on Codex fails startup explicitly.
+Traceability output and unsupported inputs remain rejected. To migrate from host
+`backends.claude.send_file`, move the export configuration to
+`caller_runtime.fileDelivery`, use container paths, and remove the host-only
+setting. The host setting does not configure container delivery.
+
+For deployments of the unpublished local asset-container variant, replace
+`outgoingFiles` with `fileDelivery` and use the execution-bound `send_file` tool
+instead of its completion-time queue. This migration does **not** replace that
+variant's read-only host-directory `sharedBinds` or operator `systemPrompt`
+customizations; those are not supported by this change. Review the 24 MiB default
+aggregate budget explicitly: it is lower than eight 6 MiB files. Files are now
+delivered immediately and remain visible if the task subsequently fails or is
+canceled.
+
+Validation entrypoints:
+
+- `pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-file-retention.test.ts`
+  checks real Client/WebSocket delayed ACKs, full aggregate and file-count limits,
+  concurrent scopes, reconnect replay, and reuse after acknowledgement.
+- `VICOOP_FILE_TEST_IMAGE=sha256:... pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-file-delivery.integration.test.ts`
+  checks real Docker path/link rejection, task budgets, and isolated bytes.
+- `packages/server/scripts/e2e-caller-file-delivery.mjs` runs a Bun-compiled client,
+  real Claude containers, and a disposable HTTP/WebSocket/Postgres server. It
+  verifies concurrent callers, same-scope sequential tasks, observed-file-tool
+  cancellation, reconnect, PNG/WAV bytes and hashes, and completed-task lookup
+  with A2A 0.3 and 1.0. See the script header
+  for required environment variables; this test makes real provider calls.

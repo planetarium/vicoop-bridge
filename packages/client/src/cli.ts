@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { sendFilePendingBytes } from './send-file-config.js';
+import { callerFilePendingBytes } from './caller-file-delivery.js';
 import { SHUTDOWN_TIMEOUT_MS, createDaemonShutdown } from './daemon-shutdown.js';
 import { callerStateCmd, runCallerState } from './caller-runtime-admin.js';
 import { createCallerRuntime } from './caller-runtime.js';
@@ -566,7 +567,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     : resolveBundledCard(args.backend);
   const parsedCard = raw ? AgentCard.parse(raw) : undefined;
   const agentCard = parsedCard && args.runtime === 'container'
-    ? callerRuntimeCard(parsedCard, args.backend, Boolean(args.card)) : parsedCard;
+    ? callerRuntimeCard(parsedCard, args.backend, Boolean(args.card), Boolean(args.backends?.[args.backend as 'claude' | 'codex']?.caller_runtime?.fileDelivery)) : parsedCard;
 
   // Emit the resolved backend at startup so operators can verify which
   // backend the precedence chain picked (flag vs. config vs. default
@@ -596,7 +597,9 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     backendKind: args.backend,
     backend,
     trustedIdentityIssuers: args.trustedIdentityIssuers,
-    maxPendingBytes: sendFilePendingBytes(args.claudeSendFile),
+    maxPendingBytes: args.runtime === 'container' && args.backends?.claude?.caller_runtime?.fileDelivery
+      ? callerFilePendingBytes(args.backends.claude.caller_runtime.fileDelivery, args.backends.claude.caller_runtime.maxScopes)
+      : sendFilePendingBytes(args.claudeSendFile),
     logLevel: logger.level,
     // Daemon entrypoint: a fatal terminal close (currently 4014 "client
     // deleted") should drop the process with a non-zero exit so

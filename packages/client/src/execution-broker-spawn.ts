@@ -1,5 +1,7 @@
 import { spawn as nodeSpawn } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { CALLER_FILE_MCP } from './caller-file-delivery.js';
 import { EventEmitter } from 'node:events';
 import { Duplex, PassThrough, Writable } from 'node:stream';
 import type { createExecutionAuthBroker } from './execution-auth-broker.js';
@@ -17,6 +19,7 @@ export function createExecutionBrokerSpawn(container: string, opts: {
   authentication?: 'oauth' | 'api-key';
   codexCatalog?: string;
   spawnImpl?: typeof nodeSpawn;
+  fileDelivery?: { description: string; bind(): (input: unknown, signal: AbortSignal) => Promise<object> };
 }) {
   const running = new Set<() => void>();
   let stopped = false;
@@ -45,6 +48,10 @@ export function createExecutionBrokerSpawn(container: string, opts: {
       if (!stat.isFile() || stagedBytes > 16 * 1024 * 1024) throw new Error('Claude prompt files exceed the staging limit');
       promptFiles.push({argIndex:i,content:readFileSync(path)});
     }
+    const deliverFile = opts.fileDelivery?.bind();
+    const fileToken = deliverFile ? randomBytes(32).toString('hex') : undefined;
+    const fileController = new AbortController();
+    let fileRequests = 0;
     const broker = opts.createBroker();
     // Absolute trusted binaries; disable runtime injection into the privileged
     // supervisor. The last argument is opaque relay source, run only as node.
@@ -56,6 +63,7 @@ export function createExecutionBrokerSpawn(container: string, opts: {
         EXECUTION_BROKER_SUPERVISOR, String(opts.ttlMs ?? 60 * 60_000), EXECUTION_BROKER_RELAY], { stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (error) {
       broker.revoke();
+      fileController.abort();
       throw error;
     }
     const events = new EventEmitter();
@@ -75,6 +83,7 @@ export function createExecutionBrokerSpawn(container: string, opts: {
       relay.stdin.write(JSON.stringify(frame) + '\n');
     };
     const stop = () => {
+      fileController.abort();
       broker.revoke();
       // Close the trusted supervisor input, discarding queued workload frames.
       // A stopped relay cannot process a kill frame or drain its input queue.
@@ -137,9 +146,10 @@ export function createExecutionBrokerSpawn(container: string, opts: {
     });
     // Docker diagnostics can include command lines; keep them off task output.
     relay.stderr?.resume();
-    relay.stdout?.on('data', (chunk: Buffer) => {
+    relay.stdout?.setEncoding('utf8');
+    relay.stdout?.on('data', (chunk: string) => {
       if (ended) return;
-      pending += chunk.toString('utf8');
+      pending += chunk;
       let end: number;
       while ((end = pending.indexOf('\n')) !== -1) {
         if (end > 256 * 1024) { fail(); return; }
@@ -147,12 +157,19 @@ export function createExecutionBrokerSpawn(container: string, opts: {
         try {
           const m = JSON.parse(line);
           if (m.t === 'ready') { ready = true; clearTimeout(startup); readyWrite?.(); readyWrite = undefined; readyEnd?.(); readyEnd = undefined; }
-          else if (m.t === 'exit') { resultCode ??= Number.isInteger(m.code) ? m.code : 1; return; }
+          else if (m.t === 'exit') { fileController.abort(); resultCode ??= Number.isInteger(m.code) ? m.code : 1; return; }
           else if (m.t === 'error') { fail(); return; }
           else if (m.t === 'stdout' || m.t === 'stderr') {
             const stream = m.t === 'stdout' ? stdout : stderr;
             if (stream.readableLength > 8 * 1024 * 1024) { fail(); return; }
             stream.write(Buffer.from(m.data, 'base64'));
+          } else if (m.t === 'send-file') {
+            if (!deliverFile || fileController.signal.aborted || m.token !== fileToken ||
+                !Number.isSafeInteger(m.id) || m.id < 1 || ++fileRequests > 64) { fail(); return; }
+            void deliverFile(m.input, fileController.signal).then(
+              result => { if (!fileController.signal.aborted) send({t:'file-result',id:m.id,result}); },
+              () => { if (!fileController.signal.aborted) send({t:'file-result',id:m.id,result:{error:'File rejected: check allowed paths, regular-file requirement, and file/count/aggregate limits'}}); },
+            );
           } else if (m.t === 'open') {
             if (!Number.isSafeInteger(m.id) || m.id < 1 || sockets.has(m.id) || sockets.size >= 16) { fail(); return; }
             const socket = new Duplex({
@@ -190,7 +207,8 @@ export function createExecutionBrokerSpawn(container: string, opts: {
         }
       }
       send({ t: 'start', backend: opts.backend, command, args, cwd: options.cwd, env, token: broker.token,
-        authentication: opts.authentication ?? 'oauth', files:promptFiles.map((file,id)=>({id,argIndex:file.argIndex})) });
+        authentication: opts.authentication ?? 'oauth',
+        ...(deliverFile ? {fileDelivery:{token:fileToken,helper:CALLER_FILE_MCP,description:opts.fileDelivery!.description}} : {}), files:promptFiles.map((file,id)=>({id,argIndex:file.argIndex})) });
     })().catch(fail);
     return Object.assign(events, {
       ...(opts.backend === 'codex' ? {executionToken: broker.token} : {}),

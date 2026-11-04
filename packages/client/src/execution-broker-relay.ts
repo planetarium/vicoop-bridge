@@ -5,12 +5,15 @@ import {PROVIDER_ENV_PATTERN} from './provider-environment.js';
 export const EXECUTION_BROKER_RELAY = String.raw`
 'use strict';
 const net = require('node:net');
+const http = require('node:http');
 const {spawn} = require('node:child_process');
 const fs = require('node:fs');
 const promptFiles = new Map();
 let promptDirectory, catalogPath, stagedBytes = 0;
 let child, server, next = 0, pending = '', started = false, closing = false;
 const sockets = new Map();
+const fileResponses = new Map();
+let fileServer, fileNext = 0;
 function send(frame) {
   if (process.stdout.writableLength > 8 * 1024 * 1024) return shutdown(1);
   process.stdout.write(JSON.stringify(frame) + '\n');
@@ -24,6 +27,8 @@ function shutdown(code) {
   killGroup('SIGKILL');
   for (const socket of sockets.values()) socket.destroy();
   if (server) server.close();
+  if (fileServer) fileServer.close();
+  for (const res of fileResponses.values()) res.destroy();
   if (promptDirectory) fs.rmSync(promptDirectory,{recursive:true,force:true});
   process.exit(code);
 }
@@ -76,7 +81,7 @@ function receive(m) {
       socket.on('close', () => { sockets.delete(id); send({t:'close', id}); });
     });
     server.on('error', () => shutdown(1));
-    server.listen(0, '127.0.0.1', () => {
+    server.listen(0, '127.0.0.1', async () => {
       // Container creation rejects provider credentials; also strip inherited
       // provider overrides so a custom image cannot redirect the selected API.
       const env = {...process.env};
@@ -100,6 +105,31 @@ function receive(m) {
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',
         });
       }
+      if (m.fileDelivery && m.backend === 'claude') {
+        fileServer = http.createServer({maxHeaderSize:4096}, async (req,res) => {
+          if(req.method!=='POST'||req.url!=='/send-file'||req.headers.authorization!=='Bearer '+m.fileDelivery.token||fileResponses.size>=4){res.writeHead(403);res.end();return;}
+          req.setEncoding('utf8');
+          req.setTimeout(15000,()=>req.destroy());
+          let body='';
+          try {
+            for await(const chunk of req){body+=chunk.toString('utf8');if(Buffer.byteLength(body)>8192)throw Error('too large');}
+            const input=JSON.parse(body),id=++fileNext;
+            fileResponses.set(id,res);
+            const timer=setTimeout(()=>res.destroy(),20000);
+            res.on('close',()=>{clearTimeout(timer);fileResponses.delete(id);});
+            send({t:'send-file',id,token:m.fileDelivery.token,input});
+          }catch{res.writeHead(400);res.end();}
+        });
+        fileServer.on('error',()=>shutdown(1));
+        await new Promise(resolve=>fileServer.listen(0,'127.0.0.1',resolve));
+        if(closing)return;
+        const url='http://127.0.0.1:'+fileServer.address().port+'/send-file';
+        // Replace only the bridge-owned empty strict MCP configuration.
+        const index=m.args.indexOf('--mcp-config');
+        if(index<0||m.args[index+1]!==JSON.stringify({mcpServers:{}}))return shutdown(1);
+        m.args[index+1]=JSON.stringify({mcpServers:{'_vb-send-file':{command:'/usr/local/bin/node',args:['-e',m.fileDelivery.helper,url,m.fileDelivery.token,m.fileDelivery.description]}}});
+        m.args.push('--allowedTools','mcp___vb-send-file__send_file');
+      }
       child = spawn(m.command, m.args, {cwd:m.cwd, env, detached:true, stdio:['pipe','pipe','pipe']});
       child.stdout.on('data', data => send({t:'stdout', data:data.toString('base64')}));
       child.stderr.on('data', data => send({t:'stderr', data:data.toString('base64')}));
@@ -114,6 +144,8 @@ function receive(m) {
       });
       send({t:'ready'});
     });
+  } else if(m.t==='file-result') {
+    const res=fileResponses.get(m.id);if(res){fileResponses.delete(m.id);res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify(m.result));}
   } else if (m.t === 'stdin' && child) {
     if (child.stdin.writableLength > 8 * 1024 * 1024) return shutdown(1);
     child.stdin.write(Buffer.from(m.data, 'base64'));
