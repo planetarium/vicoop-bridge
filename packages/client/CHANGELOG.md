@@ -1,5 +1,16 @@
 # @vicoop-bridge/client
 
+## 0.45.0
+
+### Minor Changes
+
+- fa43c84: Add opt-in execution-bound file delivery for Claude caller containers, with operator-controlled workspace roots and per-file, per-task, and file-count limits.
+- 40a1dde: Support operator-selected read-only, non-recursive host asset directories in caller runtimes and persistent Claude operator instructions composed with bridge prompts. Validate canonical local sources, mount isolation and reuse drift; preserve source directories and private data during recreation.
+
+### Patch Changes
+
+- 2c2a0bf: Bind host Claude file delivery to each process execution so overlapping tasks receive their own attachments and stale helpers cannot send files into later tasks.
+
 ## 0.44.1
 
 ### Patch Changes
