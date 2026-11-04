@@ -47,6 +47,10 @@ export type MentionableAuth =
     };
 
 export interface MentionableCard {
+  // Preserve the A2A security alternatives: Mentionable v0.1's legacy auth
+  // union cannot express opaque bearer tokens or multiple alternatives.
+  securitySchemes?: AgentCardV03['securitySchemes'];
+  security?: AgentCardV03['security'];
   address: string;
   name: string;
   description?: string;
@@ -116,6 +120,8 @@ export function buildMentionableCard(
 ): MentionableCard {
   const streaming = card.capabilities?.streaming ?? false;
   const deviceFlow = opts.deviceFlowEnabled ? findDeviceFlow(card) : undefined;
+  // This legacy field cannot represent opaque bearer auth. Consumers use
+  // the preserved A2A security fields for the full authentication policy.
   const auth: MentionableAuth = deviceFlow
     ? {
         scheme: 'oauth2',
@@ -127,6 +133,8 @@ export function buildMentionableCard(
     : { scheme: 'none' };
 
   return {
+    ...(card.securitySchemes ? { securitySchemes: card.securitySchemes } : {}),
+    ...(card.security ? { security: card.security } : {}),
     address: `@${opts.local}@${opts.domain}`,
     name: card.name,
     description: card.description,
