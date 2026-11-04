@@ -24,7 +24,7 @@ import { X402_FOUNDATION_EXTENSION_URI } from './x402/gate.js';
 import { logEvent } from './log.js';
 import type { Sql } from './db.js';
 import { supportsCallerContext } from './caller-context.js';
-import { parseFederatedPrincipal } from './auth/principal.js';
+import { parsePrincipal } from './auth/principal.js';
 import { OAUTH_FEDERATION_EXTENSION_URI } from './oauth/profiles/mentionable-v0.1.js';
 
 export interface AgentA2XOptions {
@@ -43,10 +43,9 @@ export interface AgentA2XOptions {
  *
  * The card surface is derived from the wire `AgentCard` the client sent
  * in its hello frame, plus security schemes synthesised from the
- * connection's `allowedCallers` policy: when callers are configured,
- * the agent advertises a Bearer scheme (and a device-flow scheme too
- * when Google OAuth is configured on this deployment, so the AgentCard
- * stays consistent with the actually-mounted endpoints).
+ * connection's `allowedCallers` policy. Advertise only credential types
+ * permitted by that policy and backed by the deployed authentication paths.
+ * Empty-policy caller runtimes still require a verified direct identity.
  */
 export function buildAgentA2XServer(
   conn: ClientConnection,
@@ -117,32 +116,9 @@ export function buildAgentA2XServer(
       });
   }
 
-  // Advertise SIWE bearer-auth (siwe-bearer-auth/v0.1) when this agent is
-  // restricted to a non-empty allowed_callers set. Mentionable / A2A clients
-  // discover this URI to know they can mint a base64url SIWE bearer locally
-  // (no exchange step) and present it directly.
-  //
-  // For restricted agents the bridge owns the SIWE bearer-auth
-  // advertisement: it is authoritative for the bridge-side facts in `params`
-  // (domain / exchange URL / usage hints) and for the `required` flag, and
-  // — critically — is the only side that knows whether the SIWE-bearer
-  // fast-path is actually wired. The middleware accepts SIWE bearers iff a
-  // siweDomain is configured, which on this layer maps to opts.publicUrl
-  // being set (http.tsx derives one from the other). So for restricted
-  // agents we always strip a wire-declared SIWE entry and re-emit our own
-  // only when publicUrl is set; without publicUrl we drop it entirely so a
-  // wire client can't advertise auth that the server won't accept.
-  //
-  // Public agents pass wire SIWE entries through unchanged: auth isn't
-  // enforced there, so the advertisement is informational and the wire
-  // client's intent (e.g. "I'd like SIWE if you ever restrict me") is
-  // preserved.
-  //
-  // `required: true` matches vicoop-db-agent-builder's advertisement so
-  // Mentionable clients that fail-closed on unknown required extensions
-  // behave identically across both hosts. Clients that don't understand
-  // the URI can still authenticate via the opaque vbc_caller_* path on
-  // the bridge.
+  // Authentication discovery is server-owned. Restriction alone says nothing
+  // about which credentials can authorize a caller; derive those alternatives
+  // from the same parsed principals the authorization middleware matches.
   if (conn.protocolCapabilities?.includes(REMOTE_APPROVAL_CAPABILITY)) {
     a2xServer.addExtension({ uri: APPROVAL_EXTENSION_URI, required: false,
       description: 'Remote tool approval via auth-required. Decisions require an authenticated agent owner or administrator, or the originating federated requester when the owner has enabled requester approvals.',
@@ -154,7 +130,15 @@ export function buildAgentA2XServer(
   const wireExtensions = (wire.capabilities?.extensions ?? []).filter(e => e.uri !== APPROVAL_EXTENSION_URI);
   const callerRuntime = conn.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) === true;
   const restricted = conn.allowedCallers.length > 0 || callerRuntime;
-  const bridgeWillEmitSiwe = restricted && Boolean(opts.publicUrl);
+  const principals = conn.allowedCallers.map(parsePrincipal);
+  // Empty-policy caller runtimes still require a verified direct caller, but
+  // accept any direct principal. Federation always needs an exact grant.
+  const anyDirectCaller = callerRuntime && conn.allowedCallers.length === 0;
+  const allowsEthereum = anyDirectCaller || principals.some((p) => p?.kind === 'eth');
+  const allowsGoogle = anyDirectCaller || principals.some((p) => p?.kind.startsWith('google-'));
+  const allowsApiKey = anyDirectCaller || principals.some((p) => p?.kind === 'apikey');
+  const allowsOpaque = allowsEthereum || allowsGoogle || allowsApiKey;
+  const bridgeWillEmitSiwe = allowsEthereum && Boolean(opts.publicUrl);
   const bridgeWillEmitIdentityVc =
     Boolean(opts.publicUrl) &&
     Boolean(opts.db) &&
@@ -170,13 +154,12 @@ export function buildAgentA2XServer(
       supportsExecutionScopeV1(conn.protocolCapabilities) &&
       conn.protocolCapabilities.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY)
     )) &&
-    conn.allowedCallers.some((entry) => parseFederatedPrincipal(entry) !== null);
+    principals.some((p) => p?.kind === 'federated');
   for (const extension of wireExtensions) {
     if (callerRuntime && [OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI].includes(extension.uri)) continue;
-    if (restricted && extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI) {
-      // Bridge owns this advertisement on restricted agents — drop wire
-      // entry whether or not we re-emit our own (the latter is gated by
-      // publicUrl).
+    if (extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI) {
+      // Never let a hello advertise SIWE independently of bridge policy and
+      // verifier availability, including after the final grant is removed.
       continue;
     }
     if (extension.uri === MENTIONABLE_IDENTITY_VC_EXTENSION_URI) {
@@ -213,8 +196,8 @@ export function buildAgentA2XServer(
     a2xServer.addExtension({
       uri: SIWE_BEARER_AUTH_EXTENSION_URI,
       description:
-        'Sign-In with Ethereum (EIP-4361) bearer auth. Clients sign a SIWE message locally and present it as a base64url-encoded Bearer token; no exchange step needed.',
-      required: true,
+        'Sign-In with Ethereum (EIP-4361) bearer authentication alternative. Clients may sign a SIWE message locally and present it as a base64url-encoded Bearer token; no exchange step needed. Extension activation is not required when using another advertised authentication method.',
+      required: false,
       params: {
         domain: siweDomain,
         uri: opts.publicUrl,
@@ -231,11 +214,8 @@ export function buildAgentA2XServer(
     a2xServer.addExtension({
       uri: OAUTH_FEDERATION_EXTENSION_URI,
       description:
-        'DID-backed OAuth 2.0 Token Exchange for exact Mentionable federated callers.',
-      // Existing caller-runtime clients may use direct SIWE/API-key auth.
-      // Do not require them to activate federation just because it is now
-      // discoverable. Preserve the existing host-runtime advertisement.
-      required: !callerRuntime,
+        'DID-backed OAuth 2.0 Token Exchange for exact Mentionable federated callers. This is an authentication alternative; extension activation is not required when using another advertised method.',
+      required: false,
       params: {
         authorization_server: `${opts.publicUrl}/.well-known/oauth-authorization-server`,
         resource: `${opts.publicUrl}/agents/${conn.agentId}`,
@@ -304,61 +284,58 @@ export function buildAgentA2XServer(
     });
   }
 
-  if (restricted) {
-    // Auth is enforced upstream at the route layer (agentAuthMiddleware);
-    // the schemes here are advertised on the AgentCard for spec-compliant
-    // card consumers but their `validator` callbacks are never reached at
-    // runtime.
-    //
-    // Schema mirrors vicoop-db-agent-builder so Mentionable clients that
-    // key off `securitySchemes.{bearerAuth,deviceFlow}` find the same
-    // shape on both hosts:
-    //   bearerAuth — http+bearer+bearerFormat:SIWE; the client signs a
-    //                SIWE message locally and presents it directly.
-    //   deviceFlow — oauth2+deviceCode (Google); only advertised when the
-    //                deployment actually mounts the device-flow endpoints.
-    // `security` lists the schemes as alternatives (OR), so a caller may
-    // satisfy either.
-    if (opts.publicUrl) {
-      a2xServer.addSecurityScheme(
-        'bearerAuth',
-        new HttpBearerAuthorization({
-          scheme: 'bearer',
-          bearerFormat: 'SIWE',
-          description:
-            'Sign-In with Ethereum (EIP-4361) bearer auth. Sign a SIWE message and present it as a base64url-encoded Bearer token, or exchange it at POST /auth/siwe/exchange for an opaque vbc_caller_* token first.',
-        }),
-      );
-      a2xServer.addSecurityRequirement({ bearerAuth: [] });
-
-      if (opts.deviceFlowEnabled) {
-        a2xServer.addSecurityScheme(
-          'deviceFlow',
-          new OAuth2DeviceCodeAuthorization({
-            deviceAuthorizationUrl: `${opts.publicUrl}/oauth/device/code`,
-            tokenUrl: `${opts.publicUrl}/oauth/token`,
-            scopes: {},
-            description:
-              'Bridge-issued opaque bearer token (vbc_caller_*) via Google OAuth device flow.',
-          }),
-        );
-        a2xServer.addSecurityRequirement({ deviceFlow: [] });
-      }
-    } else {
-      // No publicUrl configured (typically local dev with custom hostname):
-      // SIWE bearer fast-path can't run without a stable domain, so fall
-      // back to advertising opaque-only bearer auth.
-      a2xServer.addSecurityScheme(
-        'bearerAuth',
-        new HttpBearerAuthorization({
-          scheme: 'bearer',
-          bearerFormat: 'Opaque',
-          description:
-            'Bridge-issued opaque bearer token (vbc_caller_*). Acquire via POST /auth/siwe/exchange by signing a SIWE message.',
-        }),
-      );
-      a2xServer.addSecurityRequirement({ bearerAuth: [] });
-    }
+  // Authentication remains enforced by agentAuthMiddleware. Each requirement
+  // object is an OR alternative; optional extension negotiation neither grants
+  // access nor requires clients using an API key to activate SIWE/federation.
+  if (allowsOpaque) {
+    const acquisition = [
+      ...(allowsApiKey ? ['Ask the agent operator for an API key; no wallet signing is needed.'] : []),
+      ...(allowsEthereum && opts.publicUrl ? ['Ethereum callers may exchange SIWE at POST /auth/siwe/exchange.'] : []),
+      ...(allowsGoogle && opts.deviceFlowEnabled && opts.publicUrl ? ['Google callers may use the advertised device flow.'] : []),
+    ].join(' ');
+    a2xServer.addSecurityScheme(
+      'bearerAuth',
+      new HttpBearerAuthorization({
+        scheme: 'bearer',
+        bearerFormat: 'Opaque',
+        description: `Bridge-issued opaque bearer token (vbc_caller_*) for an authorized caller. ${acquisition}`.trim(),
+      }),
+    );
+    a2xServer.addSecurityRequirement({ bearerAuth: [] });
+  }
+  if (bridgeWillEmitSiwe) {
+    a2xServer.addSecurityScheme(
+      'siweBearer',
+      new HttpBearerAuthorization({
+        scheme: 'bearer',
+        bearerFormat: 'SIWE',
+        description: 'Sign a SIWE message for the advertised domain and present it as a base64url-encoded Bearer token. An alternative to an opaque caller token.',
+      }),
+    );
+    a2xServer.addSecurityRequirement({ siweBearer: [] });
+  }
+  if (bridgeWillEmitOAuthFederation) {
+    a2xServer.addSecurityScheme(
+      'oauthFederation',
+      new HttpBearerAuthorization({
+        scheme: 'bearer',
+        bearerFormat: 'vbc_oauth_*',
+        description: 'Opaque access token from the OAuth federation token-exchange service advertised by the federation extension. Requires an exact federated caller grant; no wallet signing is needed.',
+      }),
+    );
+    a2xServer.addSecurityRequirement({ oauthFederation: [] });
+  }
+  if (allowsGoogle && opts.deviceFlowEnabled && opts.publicUrl) {
+    a2xServer.addSecurityScheme(
+      'deviceFlow',
+      new OAuth2DeviceCodeAuthorization({
+        deviceAuthorizationUrl: `${opts.publicUrl}/oauth/device/code`,
+        tokenUrl: `${opts.publicUrl}/oauth/token`,
+        scopes: {},
+        description: 'Bridge-issued opaque bearer token (vbc_caller_*) via Google OAuth device flow for an authorized Google caller.',
+      }),
+    );
+    a2xServer.addSecurityRequirement({ deviceFlow: [] });
   }
 
   return a2xServer;

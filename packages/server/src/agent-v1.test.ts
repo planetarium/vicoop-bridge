@@ -251,12 +251,15 @@ test('CORS preflight allows the A2A-Version request header', async () => {
   assert.match(response.headers.get('Access-Control-Allow-Headers') ?? '', /A2A-Version/i);
 });
 
-for (const { callerRuntime, federated } of [
+for (const { callerRuntime, federated, apiKeyOnly = false } of [
   { callerRuntime: false, federated: true },
+  { callerRuntime: false, federated: false },
   { callerRuntime: true, federated: true },
   { callerRuntime: true, federated: false },
+  { callerRuntime: false, federated: false, apiKeyOnly: true },
+  { callerRuntime: true, federated: false, apiKeyOnly: true },
 ]) {
-test(`${federated ? 'federated' : 'direct API-key'} message tokens bind tasks on all three A2A ingress paths (${callerRuntime ? 'caller runtime' : 'host runtime'})`, async () => {
+test(`${federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy API-key'} message tokens bind tasks on all three A2A ingress paths (${callerRuntime ? 'caller runtime' : 'host runtime'})`, async () => {
   const profileId = 'https://mentionable.dev/ns/oauth-federation/v0.1';
   const principalId = federated ? 'slack:T123/U456' : 'apikey:direct-caller-554';
   const actorId = 'did:web:connector.example';
@@ -345,18 +348,15 @@ test(`${federated ? 'federated' : 'direct API-key'} message tokens bind tasks on
     clientId: 'client-1',
     ownerPrincipal: 'eth:0x0000000000000000000000000000000000000001',
     agentCard,
-    allowedCallers: [authorizationKey, ...(!federated ? [principalId] : [])],
+    allowedCallers: apiKeyOnly ? [principalId] : [authorizationKey, ...(!federated ? [principalId] : [])],
     protocolCapabilities: callerRuntime ? callerRuntimeCapabilities : [CALLER_CONTEXT_V2_CAPABILITY],
     ws,
     connectedAt: Date.now(),
   }), { ok: true });
   const app = createHttpApp({ registry, db: sql, publicUrl: 'https://bridge.example' });
   const authorization = `Bearer ${federated ? 'vbc_oauth_test' : 'vbc_caller_direct-554'}`;
-  // Existing direct clients activate SIWE only, even when the same agent
-  // also accepts federated callers. Discovery must not break those clients.
-  const extensions = federated
-    ? `${SIWE_BEARER_AUTH_EXTENSION_URI}, ${OAUTH_FEDERATION_EXTENSION_URI}`
-    : SIWE_BEARER_AUTH_EXTENSION_URI;
+  // Authentication succeeds without opting into unrelated extensions, even
+  // when a mixed policy also advertises federation.
   const message = (id: string) => ({
     messageId: id,
     role: 'user',
@@ -368,7 +368,6 @@ test(`${federated ? 'federated' : 'direct API-key'} message tokens bind tasks on
       headers: {
         'Content-Type': 'application/json',
         Authorization: authorization,
-        'A2A-Extensions': extensions,
       },
       body: JSON.stringify({
         jsonrpc: '2.0', id: 1, method: 'message/send', params: { message: message('m-v03') },
@@ -379,7 +378,6 @@ test(`${federated ? 'federated' : 'direct API-key'} message tokens bind tasks on
       headers: {
         'Content-Type': 'application/json',
         Authorization: authorization,
-        'A2A-Extensions': extensions,
       },
       body: JSON.stringify({
         jsonrpc: '2.0', id: 2, method: 'SendMessage', params: { message: message('m-v1-rpc') },
@@ -390,7 +388,6 @@ test(`${federated ? 'federated' : 'direct API-key'} message tokens bind tasks on
       headers: {
         'Content-Type': 'application/a2a+json',
         Authorization: authorization,
-        'A2A-Extensions': extensions,
       },
       body: JSON.stringify({ message: message('m-v1-http') }),
     }],
@@ -424,3 +421,81 @@ test(`${federated ? 'federated' : 'direct API-key'} message tokens bind tasks on
   }
 });
 }
+
+// One live registry/app per runtime exercises cache invalidation as each grant
+// is added/removed. Both A2A versions and the Mentionable projection must agree.
+test('authentication discovery follows live caller policy on every public card surface', async () => {
+  const eth = 'eth:0x0000000000000000000000000000000000000002';
+  const federated = formatFederatedPrincipal({
+    issuer: 'did:web:connector.example',
+    method: 'urn:mentionable:auth:slack-workspace-member:v0.1',
+    subject: 'slack:T123/U456',
+  })!;
+  for (const callerRuntime of [false, true]) {
+    const registry = new Registry();
+    registerAgent(registry);
+    const conn = registry.getAgent('v1-test-agent')!;
+    conn.protocolCapabilities = callerRuntime ? callerRuntimeCapabilities : [CALLER_CONTEXT_V2_CAPABILITY];
+    // Untrusted hello entries must not resurrect methods after grant removal.
+    conn.agentCard.capabilities!.extensions = [
+      { uri: SIWE_BEARER_AUTH_EXTENSION_URI, required: true },
+      { uri: OAUTH_FEDERATION_EXTENSION_URI, required: true },
+    ];
+    const app = createHttpApp({
+      registry, db: fakeSql(), publicUrl: 'https://bridge.example',
+      google: { clientId: 'test', clientSecret: 'test', redirectUri: 'https://bridge.example/oauth/callback' },
+      deviceFlowStateSecret: 'test-secret-for-auth-discovery-558',
+    });
+    for (const policy of [
+      { name: 'API key only', callers: ['apikey:alice'], schemes: ['bearerAuth'] },
+      { name: 'federation only', callers: [federated], schemes: ['oauthFederation'] },
+      { name: 'SIWE only', callers: [eth], schemes: ['bearerAuth', 'siweBearer'] },
+      { name: 'Google only', callers: ['google:sub:123'], schemes: ['bearerAuth', 'deviceFlow'] },
+      { name: 'mixed', callers: [eth, 'apikey:alice', federated, 'google:sub:123'], schemes: ['bearerAuth', 'siweBearer', 'oauthFederation', 'deviceFlow'] },
+      { name: 'removed Ethereum', callers: ['apikey:alice', federated], schemes: ['bearerAuth', 'oauthFederation'] },
+      { name: 'removed federation', callers: ['apikey:alice'], schemes: ['bearerAuth'] },
+      { name: 'empty policy', callers: [], schemes: callerRuntime ? ['bearerAuth', 'siweBearer', 'deviceFlow'] : [] },
+    ]) {
+      registry.updateAllowedCallers('v1-test-agent', policy.callers);
+      for (const path of [
+        '/agents/v1-test-agent/.well-known/agent-card.json',
+        '/agents/v1-test-agent/v1/.well-known/agent-card.json',
+        '/.well-known/agent-card/v1-test-agent',
+      ]) {
+        const label = `${callerRuntime ? 'isolated' : 'host'} ${policy.name} ${path}`;
+        const response = await app.request(path);
+        assert.equal(response.status, 200, label);
+        const card = await response.json() as {
+          capabilities?: AgentCard['capabilities'];
+          a2a?: { capabilities: AgentCard['capabilities']; auth: { scheme: string } };
+          securitySchemes?: Record<string, { bearerFormat?: string; httpAuthSecurityScheme?: { bearerFormat?: string } }>;
+          security?: Array<Record<string, string[]>>;
+          securityRequirements?: Array<{ schemes: Record<string, { list: string[] }> }>;
+        };
+        assert.deepEqual(Object.keys(card.securitySchemes ?? {}).sort(), [...policy.schemes].sort(), label);
+        const alternatives = card.security ?? card.securityRequirements?.map((requirement) =>
+          Object.fromEntries(Object.keys(requirement.schemes).map((name) => [name, []])),
+        ) ?? [];
+        assert.deepEqual(alternatives, policy.schemes.map((name) => ({ [name]: [] })), label);
+        const extensions = (card.a2a?.capabilities ?? card.capabilities)?.extensions ?? [];
+        const siwe = extensions.find((extension) => extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI);
+        const federation = extensions.find((extension) => extension.uri === OAUTH_FEDERATION_EXTENSION_URI);
+        assert.equal(Boolean(siwe), policy.schemes.includes('siweBearer'), label);
+        assert.equal(Boolean(federation), policy.schemes.includes('oauthFederation'), label);
+        for (const extension of [siwe, federation]) {
+          if (extension) assert.equal(extension.required, false, label);
+        }
+        if (policy.schemes.includes('bearerAuth')) {
+          const bearer = card.securitySchemes!.bearerAuth!;
+          assert.equal(bearer.bearerFormat ?? bearer.httpAuthSecurityScheme?.bearerFormat, 'Opaque', label);
+        }
+        if (!policy.schemes.includes('siweBearer')) {
+          assert.doesNotMatch(JSON.stringify(card), /mintToken|a2a-wallet|bearerFormat":"SIWE"/, label);
+        }
+        if (card.a2a) {
+          assert.equal(card.a2a.auth.scheme, policy.schemes.includes('deviceFlow') ? 'oauth2' : 'none', label);
+        }
+      }
+    }
+  }
+});

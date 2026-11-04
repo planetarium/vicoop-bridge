@@ -148,7 +148,7 @@ test('OAuth federation is advertised only for an exact persisted federated calle
     authorization_server: 'https://bridge.example/.well-known/oauth-authorization-server',
     resource: 'https://bridge.example/agents/claude',
   });
-  assert.equal(extension?.required, true);
+  assert.equal(extension?.required, false);
   assert.equal(
     cardFor(['eth:0x0000000000000000000000000000000000000002'])
       .capabilities.extensions?.some((entry) => entry.uri === OAUTH_FEDERATION_EXTENSION_URI) ?? false,
@@ -257,14 +257,13 @@ test('buildAgentA2XServer advertises SIWE bearer-auth extension when restricted'
     (e) => e.uri === SIWE_BEARER_AUTH_EXTENSION_URI,
   );
   assert.ok(siwe, 'expected SIWE bearer-auth extension to be advertised');
-  // Mirror vicoop-db-agent-builder — fail-closed for clients that don't
-  // understand the URI.
-  assert.equal(siwe.required, true);
+  // Authentication is enforced independently of extension negotiation.
+  assert.equal(siwe.required, false);
   assert.equal((siwe.params as { domain: string }).domain, 'bridge.example');
   assert.equal((siwe.params as { uri: string }).uri, 'https://bridge.example');
 });
 
-test('buildAgentA2XServer exposes bearerAuth + deviceFlow security schemes when restricted (mirrors dba)', () => {
+test('buildAgentA2XServer exposes only policy-authorized security alternatives', () => {
   const agent = buildAgentA2XServer(
     fakeConn(
       {
@@ -275,7 +274,7 @@ test('buildAgentA2XServer exposes bearerAuth + deviceFlow security schemes when 
         capabilities: { streaming: true },
         skills: [],
       },
-      { allowedCallers: ['eth:0x0000000000000000000000000000000000000002'] },
+      { allowedCallers: ['eth:0x0000000000000000000000000000000000000002', 'google:sub:123'] },
     ),
     new InMemoryTaskStore(),
     new Registry(),
@@ -287,11 +286,11 @@ test('buildAgentA2XServer exposes bearerAuth + deviceFlow security schemes when 
   assert.ok(schemes.bearerAuth, 'expected bearerAuth scheme');
   assert.equal((schemes.bearerAuth as { type: string }).type, 'http');
   assert.equal((schemes.bearerAuth as { scheme: string }).scheme, 'bearer');
-  assert.equal((schemes.bearerAuth as { bearerFormat: string }).bearerFormat, 'SIWE');
+  assert.equal((schemes.bearerAuth as { bearerFormat: string }).bearerFormat, 'Opaque');
   assert.ok(schemes.deviceFlow, 'expected deviceFlow scheme');
   assert.equal((schemes.deviceFlow as { type: string }).type, 'oauth2');
   // Both should appear as alternatives in security[].
-  assert.deepEqual(card.security, [{ bearerAuth: [] }, { deviceFlow: [] }]);
+  assert.deepEqual(card.security, [{ bearerAuth: [] }, { siweBearer: [] }, { deviceFlow: [] }]);
   // Old `bridge` key from before the dba-parity refactor must not survive.
   assert.equal((schemes as Record<string, unknown>).bridge, undefined);
 });
@@ -318,7 +317,7 @@ test('buildAgentA2XServer omits deviceFlow when device flow is not enabled', () 
   const schemes = card.securitySchemes ?? {};
   assert.ok(schemes.bearerAuth, 'expected bearerAuth scheme');
   assert.equal((schemes as Record<string, unknown>).deviceFlow, undefined);
-  assert.deepEqual(card.security, [{ bearerAuth: [] }]);
+  assert.deepEqual(card.security, [{ bearerAuth: [] }, { siweBearer: [] }]);
 });
 
 test('buildAgentA2XServer omits SIWE extension for public agents', () => {
@@ -345,7 +344,7 @@ test('buildAgentA2XServer omits SIWE extension for public agents', () => {
 
 test('buildAgentA2XServer overrides a wire-declared SIWE extension with the bridge version', () => {
   // The bridge is authoritative for params (domain / endpoint / hints) and
-  // for `required: true`; a client cannot weaken either via the wire card.
+  // for optional negotiation; a client cannot override either via the wire card.
   const agent = buildAgentA2XServer(
     fakeConn(
       {
@@ -378,7 +377,7 @@ test('buildAgentA2XServer overrides a wire-declared SIWE extension with the brid
   );
   assert.equal(siweEntries.length, 1, 'expected exactly one SIWE extension entry');
   // Bridge-emitted, not wire-declared.
-  assert.equal(siweEntries[0]!.required, true);
+  assert.equal(siweEntries[0]!.required, false);
   assert.notEqual(siweEntries[0]!.description, 'wire-declared (downgraded)');
   assert.equal(
     (siweEntries[0]!.params as { domain: string }).domain,
@@ -421,9 +420,8 @@ test('buildAgentA2XServer drops a wire-declared SIWE extension on restricted age
   assert.equal(siweEntries.length, 0);
 });
 
-test('buildAgentA2XServer leaves a wire-declared SIWE extension alone when not restricted', () => {
-  // Public agent: the bridge does not enforce SIWE auth, so a wire card that
-  // happens to declare the URI passes through unchanged.
+test('buildAgentA2XServer drops a wire-declared SIWE requirement on public agents', () => {
+  // Removing the final grant must not leave a wire-declared requirement.
   const agent = buildAgentA2XServer(
     fakeConn({
       name: 'claude',
@@ -447,8 +445,7 @@ test('buildAgentA2XServer leaves a wire-declared SIWE extension alone when not r
   const siweEntries = (card.capabilities.extensions ?? []).filter(
     (e) => e.uri === SIWE_BEARER_AUTH_EXTENSION_URI,
   );
-  assert.equal(siweEntries.length, 1);
-  assert.equal(siweEntries[0]!.description, 'wire-declared');
+  assert.equal(siweEntries.length, 0);
 });
 
 // ---- x402 advertisement ------------------------------------------------
@@ -548,7 +545,7 @@ test('public caller runtime advertises required direct authentication', () => {
   );
   const card = agent.getAgentCard() as AgentCardV03;
   assert.ok(card.securitySchemes?.bearerAuth); assert.ok(card.securitySchemes?.deviceFlow);
-  assert.deepEqual(card.security, [{ bearerAuth: [] }, { deviceFlow: [] }]);
+  assert.deepEqual(card.security, [{ bearerAuth: [] }, { siweBearer: [] }, { deviceFlow: [] }]);
   assert.ok(card.capabilities.extensions?.some((e) => e.uri === SIWE_BEARER_AUTH_EXTENSION_URI));
   assert.equal(card.capabilities.extensions?.some((e) => e.uri === OAUTH_FEDERATION_EXTENSION_URI), false);
   assert.equal(card.capabilities.extensions?.some((e) => e.uri === TRACEABILITY_EXTENSION_URI), false);

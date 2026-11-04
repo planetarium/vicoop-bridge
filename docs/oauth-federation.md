@@ -129,6 +129,10 @@ federated tasks remain token-protected even when the agent becomes public.
 
 ## Discovery and exchange
 
+Authentication alternatives follow the live caller policy; see
+[authentication discovery](authentication-discovery.md) for SIWE, API-key, Google,
+and mixed-policy behavior.
+
 An eligible Agent Card advertises
 `https://mentionable.dev/ns/oauth-federation/v0.1` with:
 
