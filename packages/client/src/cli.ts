@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { sendFilePendingBytes } from './send-file-config.js';
+import { callerFilePendingBytes } from './caller-file-delivery.js';
 import { SHUTDOWN_TIMEOUT_MS, createDaemonShutdown } from './daemon-shutdown.js';
 import { callerStateCmd, runCallerState } from './caller-runtime-admin.js';
 import { createCallerRuntime } from './caller-runtime.js';
@@ -597,7 +598,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     backend,
     trustedIdentityIssuers: args.trustedIdentityIssuers,
     maxPendingBytes: args.runtime === 'container' && args.backends?.claude?.caller_runtime?.fileDelivery
-      ? Math.max(4 * 1024 * 1024, 2 * (4 * Math.ceil((args.backends.claude.caller_runtime.fileDelivery.maxBytes ?? 6 * 1024 * 1024) / 3) + 1024 * 1024))
+      ? callerFilePendingBytes(args.backends.claude.caller_runtime.fileDelivery, args.backends.claude.caller_runtime.maxScopes)
       : sendFilePendingBytes(args.claudeSendFile),
     logLevel: logger.level,
     // Daemon entrypoint: a fatal terminal close (currently 4014 "client

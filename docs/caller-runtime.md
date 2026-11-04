@@ -553,6 +553,24 @@ runs and delivered immediately; successful delivery does not prove the remote
 user downloaded the file, and later cancellation does not retract an already
 accepted artifact.
 
+The daemon sizes its global replay retention for one full attachment batch per
+`maxScopes` concurrently active scopes, including base64 expansion, 64 KiB of
+JSON metadata allowance per file, and 1 MiB for other frames per scope. With the
+defaults (`maxScopes: 8`) the ceiling is approximately **268 MiB of encoded
+retained frames**, allocated only as frames await acknowledgement. This is not a
+total process memory limit: encoding, socket buffers, and other work also use
+memory. Startup rejects combinations requiring more than 512 MiB; lower
+`maxScopes` or the file limits to fit. The individual maxima above must be used
+with a compatible scope count. Disabling file delivery keeps the normal replay
+budget unchanged.
+
+Retention remains bounded by the existing frame-count and age limits as well as
+this byte ceiling. Unlimited ACK delay, multiple completed batches awaiting ACK
+per scope, or unusually large text output can still exhaust retention and fail
+the task with `client_buffer_overflow` before disconnecting. This sizing supports
+the configured concurrent attachment batches; it does not promise unlimited
+offline buffering.
+
 The bridge binds each helper transport to one active process, task, and caller
 container. The helper cannot select a recipient or task. It uses a short-lived
 container-loopback endpoint over that execution's Docker channel, without a
@@ -573,8 +591,20 @@ Traceability output and unsupported inputs remain rejected. To migrate from host
 `caller_runtime.fileDelivery`, use container paths, and remove the host-only
 setting. The host setting does not configure container delivery.
 
+For deployments of the unpublished local asset-container variant, replace
+`outgoingFiles` with `fileDelivery` and use the execution-bound `send_file` tool
+instead of its completion-time queue. This migration does **not** replace that
+variant's read-only host-directory `sharedBinds` or operator `systemPrompt`
+customizations; those are not supported by this change. Review the 24 MiB default
+aggregate budget explicitly: it is lower than eight 6 MiB files. Files are now
+delivered immediately and remain visible if the task subsequently fails or is
+canceled.
+
 Validation entrypoints:
 
+- `pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-file-retention.test.ts`
+  checks real Client/WebSocket delayed ACKs, full aggregate and file-count limits,
+  concurrent scopes, reconnect replay, and reuse after acknowledgement.
 - `VICOOP_FILE_TEST_IMAGE=sha256:... pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-file-delivery.integration.test.ts`
   checks real Docker path/link rejection, task budgets, and isolated bytes.
 - `packages/server/scripts/e2e-caller-file-delivery.mjs` runs a Bun-compiled client,

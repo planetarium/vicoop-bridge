@@ -1,4 +1,4 @@
-import { CallerFileDeliveryConfig } from './caller-file-delivery.js';
+import { CallerFileDeliveryConfig, callerFilePendingBytes } from './caller-file-delivery.js';
 import { z } from 'zod';
 import { isAbsolute } from 'node:path';
 
@@ -38,5 +38,12 @@ export const CallerRuntimeConfig = z
     }).strict().optional(),
     storageMiB: z.number().int().min(64).max(65536).default(1024),
   })
-  .strict();
+  .strict()
+  .superRefine((config, context) => {
+    try { callerFilePendingBytes(config.fileDelivery, config.maxScopes); }
+    catch (error) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['fileDelivery'],
+        message: error instanceof Error ? error.message : String(error) });
+    }
+  });
 export type CallerRuntimeOptions = z.infer<typeof CallerRuntimeConfig>;
