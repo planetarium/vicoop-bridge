@@ -239,3 +239,33 @@ test('broker preserves a large accepted Unicode deny list through the real relay
     assert.equal(output, expected);
   } finally { adapter.close(); }
 });
+
+test('hook context is execution-bound, inherited by children, and state is removed on close', async () => {
+  const { existsSync } = await import('node:fs');
+  const contexts = [{taskId:'first',requestId:'request-a'}, {taskId:'second',requestId:'request-b'}];
+  let context = contexts[0];
+  const adapter=createClaudeBrokerSpawn('fixture',{spawnImpl:localSpawn,
+    credential:()=>({kind:'oauth',secret:'host-secret'}),hookContext:()=>context});
+  const paths:string[]=[];
+  try {
+    for (const current of contexts) {
+      context=current;
+      const child=adapter.spawn(process.execPath,['-e',`
+        const fs=require('fs'),cp=require('child_process');
+        const state=process.env.VICOOP_HOOK_STATE_DIR;
+        if(fs.readdirSync(state).length)process.exit(7);
+        fs.writeFileSync(state+'/marker','state');
+        const inherited=JSON.parse(cp.execFileSync(process.execPath,['-e','console.log(JSON.stringify({taskId:process.env.VICOOP_TASK_ID,requestId:process.env.VICOOP_HOOK_REQUEST_ID,state:process.env.VICOOP_HOOK_STATE_DIR}))'],{encoding:'utf8'}));
+        console.log(JSON.stringify(inherited));
+      `],{});
+      let output='';child.stdout!.on('data',data=>output+=data);child.stderr!.resume();
+      const done=new Promise<number|null>(resolve=>child.on('close',resolve));child.stdin!.end();
+      assert.equal(await done,0);
+      const result=JSON.parse(output);
+      assert.equal(result.taskId,current.taskId);assert.equal(result.requestId,current.requestId);
+      assert.equal(existsSync(result.state),false);paths.push(result.state);
+    }
+    assert.notEqual(paths[0],paths[1]);
+    assert.throws(()=>adapter.spawn('unused',[],{env:{VICOOP_TASK_ID:'forged'}}),/Unsupported/);
+  } finally {adapter.close();}
+});

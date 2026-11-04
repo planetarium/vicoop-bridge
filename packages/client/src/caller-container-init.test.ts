@@ -730,3 +730,16 @@ test('container init accepts and preserves agent-wide Claude deny settings', asy
   assert.equal(config.backends.claude.runtime, 'container');
   assert.equal(f.auth(), 1);
 });
+
+test('hook-enabled init rejects old Claude without rewriting configuration and preserves hooks on supported images', async t => {
+  const f=await fixture(t);
+  const hooks=[{command:'/opt/vicoop/hooks/check',matcher:'Bash',timeoutSeconds:5}];
+  const original={...f.original,backends:{...f.original.backends,claude:{...f.original.backends.claude,caller_runtime:{preToolUseHooks:hooks}}}};
+  await writeFile(f.path,JSON.stringify(original));
+  await assert.rejects(runCallerContainerInit(f.options),/2.1.295/);
+  assert.deepEqual(await f.read(),original);
+  assert.ok(f.calls.some(args=>args[0]==='rm'&&args.includes('-v')));
+  assert.equal(await runCallerContainerInit({...f.options,dockerRun:async args=>
+    args[0]==='run'&&args.at(-1)!.includes('claude --version')?success('2.1.295 (Claude Code)'):f.dockerRun(args)}),0);
+  assert.deepEqual((await f.read()).backends.claude.caller_runtime.preToolUseHooks,hooks);
+});

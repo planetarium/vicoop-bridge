@@ -1,4 +1,5 @@
 import { CallerFileDeliveryConfig, callerFilePendingBytes } from './caller-file-delivery.js';
+import { CallerPreToolUseHooks } from './caller-hooks.js';
 import { z } from 'zod';
 import { isAbsolute, posix } from 'node:path';
 
@@ -33,6 +34,7 @@ export const CallerRuntimeConfig = z
       .refine(entries => new Set(entries.map(entry => entry.name)).size === entries.length, 'shared volume names must be unique')
       .refine(entries => new Set(entries.map(entry => entry.volume)).size === entries.length, 'shared volumes must be unique'),
     fileDelivery: CallerFileDeliveryConfig.optional(),
+    preToolUseHooks: CallerPreToolUseHooks.optional(),
     maxScopes: z.number().int().min(1).max(32).default(8),
     queueLimit: z.number().int().min(0).max(128).default(16),
     maxContexts: z.number().int().min(1).max(4096).default(256),
@@ -53,6 +55,11 @@ export const CallerRuntimeConfig = z
   })
   .strict()
   .superRefine((config, context) => {
+    for (const hook of config.preToolUseHooks ?? []) {
+      const shared = hook.command.match(/^\/shared\/([^/]+)\//)?.[1];
+      if (shared && ![...config.sharedVolumes, ...config.sharedBinds].some(entry => entry.name === shared))
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ['preToolUseHooks'], message: 'hook shared path must reference a configured shared mount' });
+    }
     try { callerFilePendingBytes(config.fileDelivery, config.maxScopes); }
     catch (error) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ['fileDelivery'],
@@ -63,7 +70,9 @@ export const CallerRuntimeConfig = z
     config.sharedVolumes.length + config.sharedBinds.length, 'shared mount targets must be unique across volumes and binds');
 export type CallerRuntimeOptions = z.infer<typeof CallerRuntimeConfig>;
 
-export function assertCallerRuntimeBackend(kind: string, config: { systemPrompt?: unknown }): void {
+export function assertCallerRuntimeBackend(kind: string, config: { systemPrompt?: unknown; preToolUseHooks?: unknown }): void {
   if (kind !== 'claude' && config.systemPrompt !== undefined)
     throw new Error('caller_runtime.systemPrompt is supported only for Claude');
+  if (kind !== 'claude' && config.preToolUseHooks !== undefined)
+    throw new Error('caller_runtime.preToolUseHooks is supported only for Claude');
 }
