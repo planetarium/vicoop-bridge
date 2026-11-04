@@ -566,7 +566,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     : resolveBundledCard(args.backend);
   const parsedCard = raw ? AgentCard.parse(raw) : undefined;
   const agentCard = parsedCard && args.runtime === 'container'
-    ? callerRuntimeCard(parsedCard, args.backend, Boolean(args.card)) : parsedCard;
+    ? callerRuntimeCard(parsedCard, args.backend, Boolean(args.card), Boolean(args.backends?.[args.backend as 'claude' | 'codex']?.caller_runtime?.fileDelivery)) : parsedCard;
 
   // Emit the resolved backend at startup so operators can verify which
   // backend the precedence chain picked (flag vs. config vs. default
@@ -596,7 +596,9 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     backendKind: args.backend,
     backend,
     trustedIdentityIssuers: args.trustedIdentityIssuers,
-    maxPendingBytes: sendFilePendingBytes(args.claudeSendFile),
+    maxPendingBytes: args.runtime === 'container' && args.backends?.claude?.caller_runtime?.fileDelivery
+      ? Math.max(4 * 1024 * 1024, 2 * (4 * Math.ceil((args.backends.claude.caller_runtime.fileDelivery.maxBytes ?? 6 * 1024 * 1024) / 3) + 1024 * 1024))
+      : sendFilePendingBytes(args.claudeSendFile),
     logLevel: logger.level,
     // Daemon entrypoint: a fatal terminal close (currently 4014 "client
     // deleted") should drop the process with a non-zero exit so

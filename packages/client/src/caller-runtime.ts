@@ -1,3 +1,4 @@
+import { createCallerFileDelivery } from './caller-file-delivery.js';
 import { createCodexModelCatalogCache } from './codex-model-catalog-cache.js';
 import { assertCallerRuntimeVersion } from './caller-runtime-version.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
@@ -35,6 +36,7 @@ export async function createCallerRuntime(args: {
   codex?: CodexBackendOptions;
 }): Promise<CallerScopedBackend> {
   const config = CallerRuntimeConfig.parse(args.config);
+  if (config.fileDelivery && args.kind !== 'claude') throw new Error('caller fileDelivery currently supports Claude only');
   const claudeCredential =
     args.kind === 'claude' ? createClaudeCredentialReader() : undefined;
   const codexCredential =
@@ -69,12 +71,21 @@ export async function createCallerRuntime(args: {
         ? await catalog!(installed, signal)
         : undefined;
       signal.throwIfAborted();
+      let taskFiles: ReturnType<typeof createCallerFileDelivery> | undefined;
       const broker =
         args.kind === 'claude'
           ? createClaudeBrokerSpawn(container.name, {
               credential: claudeCredential!,
               authentication: selected.kind,
               ttlMs: config.taskTimeoutMs,
+              ...(config.fileDelivery ? {fileDelivery: {
+                description: `Deliver a file as an A2A attachment. Allowed roots: ${config.fileDelivery.allowedRoots.join(', ')}. Limit ${config.fileDelivery.maxBytes} bytes per file, ${config.fileDelivery.maxTotalBytes} total bytes and ${config.fileDelivery.maxFiles} files per task.`,
+                bind: () => {
+                  const bound = taskFiles;
+                  if (!bound) throw new Error('Missing file delivery execution');
+                  return (input: unknown, signal: AbortSignal) => bound.send(input, signal);
+                },
+              }} : {}),
             })
           : createExecutionBrokerSpawn(container.name, {
               backend: 'codex',
@@ -127,7 +138,14 @@ export async function createCallerRuntime(args: {
               rm: (path) => pool.inputRemove(container.id, path),
             });
       return {
-        backend: worker,
+        backend: config.fileDelivery ? {
+          ...worker,
+          async handle(task, emit, signal) {
+            if (taskFiles) throw new Error('Concurrent file delivery within one caller scope');
+            taskFiles = createCallerFileDelivery(container.name, task.taskId, emit, signal, config.fileDelivery!);
+            try { await worker.handle(task, emit, signal); } finally { taskFiles = undefined; }
+          },
+        } : worker,
         close: () => broker.close(),
         healthy: () => broker.healthy(),
         settle: async () => {
