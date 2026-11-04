@@ -3,13 +3,28 @@ import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
 import {
   CALLER_CONTEXT_V2_CAPABILITY,
+  CALLER_RUNTIME_V1_CAPABILITY,
+  EXECUTION_SCOPE_V1_CAPABILITY,
+  FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
+  TASK_REPLAY_CAPABILITY,
   SIWE_BEARER_AUTH_EXTENSION_URI,
+  formatFederatedPrincipal,
+  TaskAssignFrame,
   type AgentCard,
 } from '@vicoop-bridge/protocol';
 import { DefaultRequestHandler, HttpJsonRequestHandler, TaskState } from '@a2x/sdk';
 import { createHttpApp } from './http.js';
 import { Registry, type ClientConnection } from './registry.js';
 import type { Sql } from './db.js';
+import { OAUTH_FEDERATION_EXTENSION_URI } from './oauth/profiles/mentionable-v0.1.js';
+
+const callerRuntimeCapabilities = [
+  CALLER_RUNTIME_V1_CAPABILITY,
+  CALLER_CONTEXT_V2_CAPABILITY,
+  EXECUTION_SCOPE_V1_CAPABILITY,
+  TASK_REPLAY_CAPABILITY,
+  FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
+];
 
 function fakeSql(): Sql {
   return (async () => []) as unknown as Sql;
@@ -82,6 +97,41 @@ test('versioned discovery exposes a v1 dual-transport card without changing v0.3
   const v03Card = await v03Response.json() as { protocolVersion: string; url: string };
   assert.equal(v03Card.protocolVersion, '0.3.0');
   assert.equal(v03Card.url, 'https://bridge.example/agents/v1-test-agent');
+});
+
+test('all public card surfaces advertise OAuth federation only for capable caller runtimes', async () => {
+  const federated = formatFederatedPrincipal({
+    issuer: 'did:web:connector.example',
+    method: 'urn:mentionable:auth:slack-workspace-member:v0.1',
+    subject: 'slack:T123/U456',
+  })!;
+  for (const upgraded of [false, true]) {
+    const registry = new Registry();
+    registerAgent(registry, [federated]);
+    registry.getAgent('v1-test-agent')!.protocolCapabilities = callerRuntimeCapabilities.filter(
+      (capability) => upgraded || capability !== FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
+    );
+    const app = createHttpApp({ registry, db: fakeSql(), publicUrl: 'https://bridge.example' });
+    for (const path of [
+      '/agents/v1-test-agent/.well-known/agent-card.json',
+      '/.well-known/agent-card/v1-test-agent',
+      '/agents/v1-test-agent/v1/.well-known/agent-card.json',
+    ]) {
+      const response = await app.request(path);
+      assert.equal(response.status, 200, path);
+      const card = await response.json() as AgentCard & { a2a?: Pick<AgentCard, 'capabilities'> };
+      const capabilities = path.startsWith('/.well-known/') ? card.a2a!.capabilities : card.capabilities;
+      const extensions = capabilities?.extensions?.filter((extension) => extension.uri === OAUTH_FEDERATION_EXTENSION_URI) ?? [];
+      assert.equal(extensions.length, upgraded ? 1 : 0, path);
+      if (upgraded) {
+        assert.equal(extensions[0]!.required, false);
+        assert.deepEqual(extensions[0]!.params, {
+          authorization_server: 'https://bridge.example/.well-known/oauth-authorization-server',
+          resource: 'https://bridge.example/agents/v1-test-agent',
+        });
+      }
+    }
+  }
 });
 
 test('v1 JSON-RPC route returns protocol parse errors with an A2A-Version header', async () => {
@@ -201,16 +251,30 @@ test('CORS preflight allows the A2A-Version request header', async () => {
   assert.match(response.headers.get('Access-Control-Allow-Headers') ?? '', /A2A-Version/i);
 });
 
-test('federated message tokens bind the initial task row on all three A2A ingress paths', async () => {
-  const authorizationKey = 'federated:v1:test';
+for (const { callerRuntime, federated } of [
+  { callerRuntime: false, federated: true },
+  { callerRuntime: true, federated: true },
+  { callerRuntime: true, federated: false },
+]) {
+test(`${federated ? 'federated' : 'direct API-key'} message tokens bind tasks on all three A2A ingress paths (${callerRuntime ? 'caller runtime' : 'host runtime'})`, async () => {
   const profileId = 'https://mentionable.dev/ns/oauth-federation/v0.1';
-  const principalId = 'slack:T123/U456';
+  const principalId = federated ? 'slack:T123/U456' : 'apikey:direct-caller-554';
   const actorId = 'did:web:connector.example';
+  const authorizationKey = formatFederatedPrincipal({
+    issuer: actorId, subject: 'slack:T123/U456',
+    method: 'urn:mentionable:auth:slack-workspace-member:v0.1',
+  })!;
   const tasks = new Map<string, Record<string, unknown>>();
   const dispatchIds = new Map<string, string>();
   const submittedBindings: unknown[][] = [];
   const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
     const statement = strings.join('?');
+    if (statement.includes('FROM callers')) {
+      return [{
+        id: 'direct-caller-554', principal_id: principalId, audience: 'caller', email: null,
+        expires_at: new Date(Date.now() + 60_000), revoked: false,
+      }];
+    }
     if (statement.includes('FROM infra.oauth_token_exchange_access_tokens')) {
       return [{
         id: 'token-row-1',
@@ -249,11 +313,13 @@ test('federated message tokens bind the initial task row on all three A2A ingres
   sql.begin = (async (callback: (tx: Sql) => unknown) => callback(sql)) as unknown as Sql['begin'];
 
   const registry = new Registry();
+  const assignments: TaskAssignFrame[] = [];
   const ws = {
     close() {},
     send(raw: string) {
       const frame = JSON.parse(raw) as { type?: string; taskId?: string; contextId?: string };
       if (frame.type !== 'task.assign' || !frame.taskId) return;
+      assignments.push(TaskAssignFrame.parse(JSON.parse(raw)));
       queueMicrotask(() => {
         const binding = registry.getBinding(frame.taskId!);
         binding?.sink.pushStatus({
@@ -279,12 +345,18 @@ test('federated message tokens bind the initial task row on all three A2A ingres
     clientId: 'client-1',
     ownerPrincipal: 'eth:0x0000000000000000000000000000000000000001',
     agentCard,
-    allowedCallers: [authorizationKey],
-    protocolCapabilities: [CALLER_CONTEXT_V2_CAPABILITY],
+    allowedCallers: [authorizationKey, ...(!federated ? [principalId] : [])],
+    protocolCapabilities: callerRuntime ? callerRuntimeCapabilities : [CALLER_CONTEXT_V2_CAPABILITY],
     ws,
     connectedAt: Date.now(),
   }), { ok: true });
   const app = createHttpApp({ registry, db: sql, publicUrl: 'https://bridge.example' });
+  const authorization = `Bearer ${federated ? 'vbc_oauth_test' : 'vbc_caller_direct-554'}`;
+  // Existing direct clients activate SIWE only, even when the same agent
+  // also accepts federated callers. Discovery must not break those clients.
+  const extensions = federated
+    ? `${SIWE_BEARER_AUTH_EXTENSION_URI}, ${OAUTH_FEDERATION_EXTENSION_URI}`
+    : SIWE_BEARER_AUTH_EXTENSION_URI;
   const message = (id: string) => ({
     messageId: id,
     role: 'user',
@@ -295,8 +367,8 @@ test('federated message tokens bind the initial task row on all three A2A ingres
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: 'Bearer vbc_oauth_test',
-        'A2A-Extensions': SIWE_BEARER_AUTH_EXTENSION_URI,
+        Authorization: authorization,
+        'A2A-Extensions': extensions,
       },
       body: JSON.stringify({
         jsonrpc: '2.0', id: 1, method: 'message/send', params: { message: message('m-v03') },
@@ -306,8 +378,8 @@ test('federated message tokens bind the initial task row on all three A2A ingres
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: 'Bearer vbc_oauth_test',
-        'A2A-Extensions': SIWE_BEARER_AUTH_EXTENSION_URI,
+        Authorization: authorization,
+        'A2A-Extensions': extensions,
       },
       body: JSON.stringify({
         jsonrpc: '2.0', id: 2, method: 'SendMessage', params: { message: message('m-v1-rpc') },
@@ -317,8 +389,8 @@ test('federated message tokens bind the initial task row on all three A2A ingres
       method: 'POST',
       headers: {
         'Content-Type': 'application/a2a+json',
-        Authorization: 'Bearer vbc_oauth_test',
-        'A2A-Extensions': SIWE_BEARER_AUTH_EXTENSION_URI,
+        Authorization: authorization,
+        'A2A-Extensions': extensions,
       },
       body: JSON.stringify({ message: message('m-v1-http') }),
     }],
@@ -328,11 +400,27 @@ test('federated message tokens bind the initial task row on all three A2A ingres
     assert.ok(response.status >= 200 && response.status < 300, `${path}: ${await response.text()}`);
   }
   assert.equal(submittedBindings.length, 3);
+  assert.equal(assignments.length, 3);
+  for (const assignment of assignments) {
+    assert.deepEqual(assignment.caller, {
+      principal: { id: principalId }, ...(federated ? { actor: { id: actorId } } : {}),
+    });
+    if (callerRuntime) {
+      assert.equal(assignment.executionScope?.policy, federated ? 'federated-principal-v1' : 'direct-principal-v1');
+      assert.equal(assignment.executionScope?.principalId, federated ? authorizationKey : principalId);
+      assert.equal(assignment.executionScope?.agentId, 'v1-test-agent');
+      assert.match(assignment.executionScope?.id ?? '', /^[a-f0-9]{64}$/);
+      assert.deepEqual(assignment.executionScope, assignments[0]!.executionScope);
+    } else {
+      assert.equal(assignment.executionScope, undefined);
+    }
+  }
   for (const values of submittedBindings) {
     assert.equal(values[4], principalId);
-    assert.equal(values[6], actorId);
-    assert.equal(values[7], profileId);
-    assert.equal(values[8], authorizationKey);
+    assert.equal(values[6], federated ? actorId : null);
+    assert.equal(values[7], federated ? profileId : null);
+    assert.equal(values[8], federated ? authorizationKey : null);
     assert.equal(JSON.stringify(values[3]).includes('_authorizationKey'), false);
   }
 });
+}
