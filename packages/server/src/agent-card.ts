@@ -232,7 +232,10 @@ export function buildAgentA2XServer(
       uri: OAUTH_FEDERATION_EXTENSION_URI,
       description:
         'DID-backed OAuth 2.0 Token Exchange for exact Mentionable federated callers.',
-      required: true,
+      // Existing caller-runtime clients may use direct SIWE/API-key auth.
+      // Do not require them to activate federation just because it is now
+      // discoverable. Preserve the existing host-runtime advertisement.
+      required: !callerRuntime,
       params: {
         authorization_server: `${opts.publicUrl}/.well-known/oauth-authorization-server`,
         resource: `${opts.publicUrl}/agents/${conn.agentId}`,

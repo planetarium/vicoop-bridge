@@ -148,6 +148,7 @@ test('OAuth federation is advertised only for an exact persisted federated calle
     authorization_server: 'https://bridge.example/.well-known/oauth-authorization-server',
     resource: 'https://bridge.example/agents/claude',
   });
+  assert.equal(extension?.required, true);
   assert.equal(
     cardFor(['eth:0x0000000000000000000000000000000000000002'])
       .capabilities.extensions?.some((entry) => entry.uri === OAUTH_FEDERATION_EXTENSION_URI) ?? false,
@@ -200,7 +201,7 @@ test('caller-runtime OAuth federation advertisement requires the full execution-
     const extensions = card.capabilities.extensions?.filter((extension) => extension.uri === OAUTH_FEDERATION_EXTENSION_URI) ?? [];
     assert.equal(extensions.length, entry.advertised ? 1 : 0, entry.name);
     if (entry.advertised) {
-      assert.equal(extensions[0]!.required, true);
+      assert.equal(extensions[0]!.required, false);
       assert.deepEqual(extensions[0]!.params, {
         authorization_server: 'https://bridge.example/.well-known/oauth-authorization-server',
         resource: 'https://bridge.example/agents/claude',
