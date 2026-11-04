@@ -295,7 +295,10 @@ export async function startSendFileMcpServer(
         return;
       }
       const authorization = req.headers.authorization;
-      const token = authorization?.startsWith('Bearer ') ? authorization.slice(7) : undefined;
+      // Legacy MCP clients may already attach unrelated credentials. Only
+      // execution-bound mode interprets this header as a routing capability.
+      const token = opts.requireExecutionBinding && authorization?.startsWith('Bearer ')
+        ? authorization.slice(7) : undefined;
       if (opts.requireExecutionBinding && (!token || !activeTasks.has(token))) {
         res.statusCode = 401;
         res.end('inactive execution');

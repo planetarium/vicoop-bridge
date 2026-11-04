@@ -488,3 +488,48 @@ test('execution release and shutdown prevent pending reads from emitting into an
     assert.throws(() => server.registerActiveTask(makeTaskHandle('after-close', cap)), /closed/);
   }
 });
+
+test('legacy HTTP MCP ignores unrelated bearer credentials while execution-bound MCP rejects them', async t => {
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const root = await tmpDir();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const file = path.join(root, 'legacy.txt');
+  await fs.writeFile(file, 'legacy attachment');
+  for (const requireExecutionBinding of [false, true]) {
+    const server = await startSendFileMcpServer({ allowedRoots: [root], requireExecutionBinding });
+    const captured = { artifacts: [] as unknown[] };
+    const task = server.registerActiveTask(makeTaskHandle('legacy', captured));
+    const client = new Client({ name: 'configured-credentials-client', version: '1' });
+    try {
+      const connect = () => client.connect(new StreamableHTTPClientTransport(new URL(server.url), {
+        requestInit: { headers: { Authorization: 'Bearer existing-client-token' } },
+      }));
+      if (requireExecutionBinding) {
+        await assert.rejects(connect());
+        assert.deepEqual(captured.artifacts, []);
+      } else {
+        await connect();
+        const result = await client.callTool({ name: 'send_file', arguments: { path: file } });
+        assert.equal(result.isError, undefined);
+        assert.equal(captured.artifacts.length, 1);
+        const artifact = captured.artifacts[0] as { parts: Array<{ file: { bytes: string } }> };
+        assert.equal(Buffer.from(artifact.parts[0].file.bytes, 'base64').toString(), 'legacy attachment');
+        // Ignoring the header must preserve the legacy ambiguity safeguard.
+        const overlapping = server.registerActiveTask(makeTaskHandle('other', { artifacts: [] }));
+        try {
+          const ambiguous = await client.callTool({ name: 'send_file', arguments: { path: file } });
+          assert.equal(ambiguous.isError, true);
+          assert.equal((ambiguous.structuredContent as { code: string }).code, 'ambiguous-task');
+          assert.equal(captured.artifacts.length, 1);
+        } finally {
+          overlapping.release();
+        }
+      }
+    } finally {
+      await client.close();
+      task.release();
+      await server.close();
+    }
+  }
+});

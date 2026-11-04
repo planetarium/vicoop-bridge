@@ -66,6 +66,7 @@ try {
     return body.result;
   };
   for (const v1 of [false, true]) {
+    maxActive = 0;
     const tasks = await Promise.all(['a', 'b'].map(async caller => {
       const filename = `${v1 ? 'v1' : 'v03'}-${caller}.txt`;
       const content = `private fixture for ${filename}: ${randomUUID()}`;
@@ -88,10 +89,10 @@ try {
       return sent.id;
     }));
     assert.notEqual(tasks[0], tasks[1]);
+    assert.equal(maxActive, 2, `Both real Claude executions must overlap for A2A ${v1 ? '1.0' : '0.3'}`);
     console.log(`PASS A2A ${v1 ? '1.0' : '0.3'} overlapping tasks and completed-task lookup preserve each file`);
   }
   await Promise.all(runs);
-  assert.equal(maxActive, 2, 'Both real Claude executions must overlap');
   assert.equal(backend.getSendFileMcpServer().activeTaskCount(), 0);
   console.log('PASS real concurrent Claude file routing, both A2A versions, persistent lookup');
 } finally {
