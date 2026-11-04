@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, isAbsolute } from 'node:path';
 import { z } from 'zod';
 import { assertCallerRuntimeVersion } from './caller-runtime-version.js';
+import { assertCallerHookVersion } from './caller-hooks.js';
 import { CALLER_IMAGE_FILES } from './caller-image-assets.js';
 import { prepareCallerStorage, type StorageInitOptions } from './caller-storage-init.js';
 import { CallerRuntimeConfig, assertCallerRuntimeBackend } from './caller-runtime-config.js';
@@ -285,6 +286,7 @@ export async function runCallerContainerInit(
         `/usr/local/bin/node --version >/dev/null; for executable in /usr/bin/tini /usr/bin/du /bin/sleep /bin/mkdir /bin/rm; do test -x "$executable" || { echo "caller image is missing required executable $executable" >&2; exit 1; }; done; for executable in iptables ip6tables awk getent sort mktemp rmdir; do command -v "$executable" >/dev/null || { echo "caller image is missing required helper $executable" >&2; exit 1; }; done; for dir in /workspace /data/sessions/${opts.kind}/config; do probe=$(mktemp -d "$dir/.vicoop-init.XXXXXX") || { echo "caller image must provide writable $dir for UID 1000" >&2; exit 1; }; rmdir "$probe"; done; ${opts.kind} --version`,
       ]);
       const version = assertCallerRuntimeVersion(opts.kind, output);
+      assertCallerHookVersion(version, limits.preToolUseHooks);
       log.info(`Validated ${opts.kind} ${version} in ${image.Id}.`);
     } finally {
       const removed = await run(['rm', '-f', '-v', name]);

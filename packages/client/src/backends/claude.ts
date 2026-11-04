@@ -507,7 +507,27 @@ export function describeClaudeSystemEvent(
     originalModel?: unknown;
     fallbackModel?: unknown;
     apiRefusalCategory?: unknown;
+    stdout?: unknown;
+    outcome?: unknown;
+    exit_code?: unknown;
+    hook_id?: unknown;
   };
+  if (sys.subtype === 'hook_response') {
+    // Hook stdout/stderr/reasons may contain tool inputs or credentials. Only
+    // record a bounded decision and CLI metadata; never log the payload itself.
+    let denied = sys.exit_code === 2;
+    if (typeof sys.stdout === 'string' && sys.stdout.length <= 64 * 1024) {
+      try { denied ||= JSON.parse(sys.stdout)?.hookSpecificOutput?.permissionDecision === 'deny'; } catch { /* CLI reports invalid output as an error. */ }
+    }
+    const failed = sys.outcome === 'error' || (typeof sys.exit_code === 'number' && sys.exit_code !== 0 && sys.exit_code !== 2);
+    const outcome = failed ? 'error' : denied ? 'deny' : sys.outcome === 'success' ? 'success' : 'unknown';
+    return {
+      level: failed || denied || outcome === 'unknown' ? 'warn' : 'debug',
+      line: `[claude] hook taskId=${safeToken(taskId, 128)} outcome=${outcome}` +
+        (typeof sys.hook_id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(sys.hook_id) ? ` hookId=${sys.hook_id}` : '') +
+        (Number.isSafeInteger(sys.exit_code) ? ` exitCode=${sys.exit_code}` : ''),
+    };
+  }
   const field = (label: string, value: unknown, max = 60): string[] =>
     typeof value === 'string' && value.length > 0 ? [`${label}=${safeToken(value, max)}`] : [];
   const line =
@@ -522,6 +542,23 @@ export function describeClaudeSystemEvent(
     ].join(' ');
   const level = sys.level === 'warning' || sys.level === 'error' ? 'warn' : 'debug';
   return { level, line };
+}
+
+// Hook denials and fail-closed errors arrive on user tool-result events.
+export function describeClaudeHookBlocks(taskId: string, event: unknown): string[] {
+  const evt = event as { type?: unknown; tool_result_meta?: unknown; message?: { content?: unknown } } | null;
+  if (evt?.type !== 'user' || !Array.isArray(evt.tool_result_meta)) return [];
+  const content = Array.isArray(evt.message?.content) ? evt.message.content : [];
+  return evt.tool_result_meta.flatMap(meta => {
+    if (!meta || meta.permission_decision?.source !== 'hook' || meta.permission_decision?.decision !== 'reject' || typeof meta.id !== 'string') return [];
+    const result = content.find(block => block?.type === 'tool_result' && block.tool_use_id === meta.id);
+    const text = typeof result?.content === 'string' ? result.content : '';
+    // Native onFailure messages distinguish failures from intentional denials.
+    // Classify only; reasons, command paths and tool output never enter logs.
+    const failure = text.includes('blocking because onFailure is "block"');
+    const outcome = failure ? text.includes('timed out; blocking') ? 'timeout' : 'error' : 'deny';
+    return [`[claude] hook taskId=${safeToken(taskId, 128)} toolUseId=${safeToken(meta.id, 128)} outcome=${outcome}`];
+  });
 }
 
 // The text a finished turn actually produced.
@@ -3138,6 +3175,7 @@ export function createClaudeBackend(
       const controlRequests = new Map<string, AbortController>();
       const handleEvent = (evt: StreamEvent): void => {
         if (settled) return;
+        for (const line of describeClaudeHookBlocks(task.taskId, evt)) timingLogger.warn?.(line);
         if (evt.type === 'control_cancel_request' && typeof evt.request_id === 'string') {
           controlRequests.get(evt.request_id)?.abort();
           return;

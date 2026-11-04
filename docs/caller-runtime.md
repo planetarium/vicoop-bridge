@@ -396,7 +396,8 @@ a list of up to 64 nonblank rules, each at most 1,024 characters with no control
 characters. The entire settings object must serialize to at most 96 KiB of UTF-8
 JSON, leaving room below Linux's per-argument limit for backend-added settings.
 Oversized settings fail validation before tasks start. Other settings, environment variables,
-hooks and authentication helpers fail initialization and daemon startup. Allowed
+host hooks and authentication helpers fail initialization and daemon startup.
+Operator container hooks use the separate `preToolUseHooks` configuration below. Allowed
 settings are copied before constructing caller workers; host-only settings must
 be removed from the container-mode backend configuration.
 
@@ -430,6 +431,129 @@ setup does not load caller-provided Claude settings: `--setting-sources ''` and
 the strict MCP configuration remain in effect (only the bridge-owned `send_file` helper is added when configured). Deny rules supplement the
 existing environment isolation; task credentials must still be scoped to the
 intended user's authority.
+
+### Operator-managed Claude PreToolUse hooks
+
+`caller_runtime.preToolUseHooks` is an optional Claude-only list of synchronous
+command hooks. Omit it to leave operator hooks disabled. This is separate from
+`backends.claude.settings`: forwarding host hooks, helpers, arbitrary environment
+variables, or caller-owned settings remains unsupported.
+
+```json
+{
+  "caller_runtime": {
+    "sharedBinds": [{ "name": "policy", "source": "/srv/bridge-policy" }],
+    "preToolUseHooks": [
+      {
+        "command": "/shared/policy/index-first",
+        "matcher": "Bash",
+        "timeoutSeconds": 5
+      }
+    ]
+  }
+}
+```
+
+Merge this fragment into the existing runtime configuration, retaining `image`,
+`stateDirectory`, and other settings. Up to eight hooks are supported. `matcher`
+is Claude's case-sensitive tool-name regex (for example `Bash|Read`); `*` matches
+all tools and is the default. `timeoutSeconds` defaults to 5 and accepts 1–30.
+Only `PreToolUse` command hooks are supported: no shell expressions, arguments,
+asynchronous hooks, HTTP/LLM hooks, or `PostToolUse` hooks.
+
+The executable must live under `/opt/vicoop/hooks/` in the pinned image, or a
+configured `/shared/<name>/` read-only mount. Paths use letters, digits, `_`, `-`,
+`.` and `/`, with no traversal, empty components, or symlinks. Before each request,
+bridge checks that the executable is a readable, executable regular file and
+that every path component is on a read-only mount. Missing or invalid scripts
+prevent the request from starting. The script's interpreter, imported code and
+other dependencies must also be operator-reviewed and immutable; do not source
+caller-controlled files. Read-only binds remain writable by the host operator,
+so update policy files only while affected tasks are stopped.
+
+Hooks receive Claude's normal JSON on stdin. They run as UID 1000 inside the
+caller container and receive no host provider credentials. Return exit 0 with
+no output to allow the normal permission flow, or return structured JSON to deny
+with an actionable explanation. For example, an executable script with a pinned
+Node interpreter can reject one known overbroad command:
+
+```javascript
+#!/usr/local/bin/node
+let input = '';
+process.stdin.on('data', chunk => { input += chunk; });
+process.stdin.on('end', () => {
+  const event = JSON.parse(input);
+  if (event.tool_name === 'Bash' && event.tool_input.command === 'find /shared/assets -type f') {
+    console.log(JSON.stringify({ hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: 'Look up candidates in /shared/assets/inventory.txt first, then search only the selected files.'
+    } }));
+  }
+});
+```
+
+This exact-command example is intentionally limited. Hooks supplement the
+container boundary; command matching does not sandbox arbitrary shell/Python
+execution, prevent equivalent commands, or protect mutable state from code
+running under the same UID. An allowed hook result does not grant permissions
+that other rules deny. Use `deny`, not `ask`, for unattended enforcement.
+
+Hook-enabled workers require **Claude Code >=2.1.295** and reject older versions
+before execution. Bridge always supplies `onFailure: "block"`: a crash, missing
+executable, invalid JSON object, or hook timeout denies the tool. Native Claude
+also accepts plain-text stdout on exit 0 as a successful hook, so policy scripts
+must emit well-formed JSON for decisions and exit nonzero on internal failures.
+The hook deadline is distinct from the guarded tool's deadline; the whole request
+is still bounded by `caller_runtime.taskTimeoutMs`, including hook time.
+Denials remain effective under the normal `--dangerously-skip-permissions`
+launch. Caller workspace settings cannot replace or disable these operator hooks.
+
+Each hook inherits these bridge-supplied environment variables:
+
+- `VICOOP_TASK_ID`: the current bridge task ID.
+- `VICOOP_HOOK_REQUEST_ID`: a fresh opaque identifier for each request execution,
+  including a redelivery of the same task ID.
+- `VICOOP_HOOK_STATE_DIR`: a fresh private temporary directory per Claude process.
+  Hooks and its subagents share it. Use atomic operations or locking when multiple
+  tool calls update state concurrently.
+
+These variables are for attribution and policy coordination, not credentials or
+proof against hostile code in the same container. A resumed conversation receives
+new request state even when Claude's session ID is unchanged. A bridge corrective
+retry within a request retains the request ID but starts with a new empty state
+directory. State is removed when the relay exits; cancellation also uses the
+existing container/supervisor cleanup. Do not persist request policy state under
+`/workspace`, `/data/sessions`, or a key based only on Claude's `session_id`.
+Subagent tool calls inherit the hooks and process environment; independently
+launched nested Claude processes are outside this configuration contract.
+
+Hook-block logs contain `taskId`, tool-use ID, and denial/error/timeout
+classification from the native tool-result metadata. Denials and failures are
+warnings, including subagent tool calls. Separate CLI hook-response events, when
+emitted, also log bounded outcome metadata; successful responses are debug logs. Hook stdout, stderr, command arguments and reasons are excluded from these
+log records. Denial reasons still reach the model: keep credentials out of all
+hook output.
+
+Restart the bridge daemon to apply hook configuration changes, including for
+resumed conversations. Changing only hooks does not require container recreation.
+For image-bundled scripts, follow the image rebuild/recreation procedure. Changes
+to shared mount topology also require recreation; changing file contents in an
+existing read-only bind is live, so stop affected work first.
+
+The tests separate bridge plumbing from native CLI behavior. Run the opt-in Docker
+tests with a compatible pinned caller image containing Claude >=2.1.295:
+
+```sh
+VICOOP_HOOK_TEST_IMAGE=sha256:<image-id> pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-hooks.integration.test.ts
+```
+
+The native test uses a local deterministic provider inside a network-disabled
+throwaway container. It checks denial side effects, allowed execution, crashes,
+timeouts, malformed JSON, caller settings, conversation resume and subagents
+without real credentials or model billing. The native fixture disables Claude's
+optional inner OS sandbox so it does not require bubblewrap/socat; it retains
+Docker isolation and the normal `bypassPermissions` launch.
 
 On shutdown timeout or cleanup failure, the daemon exits nonzero and retains its
 pidfile instead of reporting a clean shutdown. Inspect the retained runtime

@@ -1,4 +1,6 @@
 import { createCallerFileDelivery } from './caller-file-delivery.js';
+import { randomUUID } from 'node:crypto';
+import { assertCallerHookVersion, callerHookSettings, validateCallerHookPaths, type CallerHookContext } from './caller-hooks.js';
 import { createCodexModelCatalogCache } from './codex-model-catalog-cache.js';
 import { assertCallerRuntimeVersion } from './caller-runtime-version.js';
 import { CallerRuntimeConfig, assertCallerRuntimeBackend } from './caller-runtime-config.js';
@@ -63,6 +65,7 @@ export async function createCallerRuntime(args: {
       if (version.exitCode !== 0)
         throw new Error('caller image must contain installed backend');
       const installed = assertCallerRuntimeVersion(args.kind, version.stdout);
+      assertCallerHookVersion(installed, config.preToolUseHooks);
       const brokerStats: Array<{
         forwarded: number;
         rejected: number;
@@ -73,6 +76,7 @@ export async function createCallerRuntime(args: {
         : undefined;
       signal.throwIfAborted();
       let taskFiles: ReturnType<typeof createCallerFileDelivery> | undefined;
+      let hookContext: CallerHookContext | undefined;
       let filesHealthy = true;
       const broker =
         args.kind === 'claude'
@@ -80,6 +84,10 @@ export async function createCallerRuntime(args: {
               credential: claudeCredential!,
               authentication: selected.kind,
               ttlMs: config.taskTimeoutMs,
+              ...(config.preToolUseHooks ? { hookContext: () => {
+                if (!hookContext) throw new Error('Missing caller hook execution');
+                return hookContext;
+              } } : {}),
               ...(config.fileDelivery ? {fileDelivery: {
                 description: `Deliver a file as an A2A attachment. Allowed roots: ${config.fileDelivery.allowedRoots.join(', ')}. Limit ${config.fileDelivery.maxBytes} bytes per file, ${config.fileDelivery.maxTotalBytes} total bytes and ${config.fileDelivery.maxFiles} files per task.`,
                 bind: () => {
@@ -116,7 +124,7 @@ export async function createCallerRuntime(args: {
         args.kind === 'claude'
           ? createClaudeBackend({
               ...args.claude,
-              settings: claudeSettings,
+              settings: { ...claudeSettings, ...callerHookSettings(config.preToolUseHooks) },
               cwd: '/workspace',
               spawn: spawn as ClaudeSpawnFn,
               fetchUriPolicy: { enabled: false },
@@ -141,19 +149,28 @@ export async function createCallerRuntime(args: {
               rm: (path) => pool.inputRemove(container.id, path),
             });
       return {
-        backend: config.fileDelivery ? {
+        backend: config.fileDelivery || config.preToolUseHooks ? {
           ...worker,
           async handle(task, emit, signal) {
-            if (taskFiles) throw new Error('Concurrent file delivery within one caller scope');
-            const files = createCallerFileDelivery(container.name, task.taskId, emit, signal,
-              config.fileDelivery!, runDockerCommand, () => broker.close());
+            if (taskFiles || hookContext) throw new Error('Concurrent execution within one caller scope');
+            if (config.preToolUseHooks) {
+              try { await validateCallerHookPaths(container.name, config.preToolUseHooks, signal); }
+              catch (error) {
+                console.warn('[claude] hook preflight rejected', JSON.stringify({ taskId: task.taskId, outcome: 'error' }));
+                throw error;
+              }
+              hookContext = { taskId: task.taskId, requestId: randomUUID() };
+            }
+            const files = config.fileDelivery ? createCallerFileDelivery(container.name, task.taskId, emit, signal,
+              config.fileDelivery, runDockerCommand, () => broker.close()) : undefined;
             taskFiles = files;
             try { await worker.handle(task, emit, signal); } finally {
               // Broker exit aborts active reads. Drain their rejection handlers
               // before scope cleanup decides whether this worker is reusable.
-              await files.settle();
-              filesHealthy &&= files.healthy();
+              await files?.settle();
+              filesHealthy &&= files?.healthy() ?? true;
               taskFiles = undefined;
+              hookContext = undefined;
             }
           },
         } : worker,

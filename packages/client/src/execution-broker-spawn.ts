@@ -2,6 +2,7 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { CALLER_FILE_MCP } from './caller-file-delivery.js';
+import type { CallerHookContext } from './caller-hooks.js';
 import { EventEmitter } from 'node:events';
 import { Duplex, PassThrough, Writable } from 'node:stream';
 import type { createExecutionAuthBroker } from './execution-auth-broker.js';
@@ -20,6 +21,7 @@ export function createExecutionBrokerSpawn(container: string, opts: {
   codexCatalog?: string;
   spawnImpl?: typeof nodeSpawn;
   fileDelivery?: { description: string; bind(): (input: unknown, signal: AbortSignal) => Promise<object> };
+  hookContext?: () => CallerHookContext;
 }) {
   const running = new Set<() => void>();
   let stopped = false;
@@ -48,6 +50,7 @@ export function createExecutionBrokerSpawn(container: string, opts: {
       if (!stat.isFile() || stagedBytes > 16 * 1024 * 1024) throw new Error('Claude prompt files exceed the staging limit');
       promptFiles.push({argIndex:i,content:readFileSync(path)});
     }
+    const hookContext = opts.hookContext?.();
     const deliverFile = opts.fileDelivery?.bind();
     const fileToken = deliverFile ? randomBytes(32).toString('hex') : undefined;
     const fileController = new AbortController();
@@ -208,6 +211,7 @@ export function createExecutionBrokerSpawn(container: string, opts: {
       }
       send({ t: 'start', backend: opts.backend, command, args, cwd: options.cwd, env, token: broker.token,
         authentication: opts.authentication ?? 'oauth',
+        ...(hookContext ? {hookContext} : {}),
         ...(deliverFile ? {fileDelivery:{token:fileToken,helper:CALLER_FILE_MCP,description:opts.fileDelivery!.description}} : {}), files:promptFiles.map((file,id)=>({id,argIndex:file.argIndex})) });
     })().catch(fail);
     return Object.assign(events, {

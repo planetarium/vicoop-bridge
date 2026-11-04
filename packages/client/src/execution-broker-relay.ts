@@ -9,7 +9,7 @@ const http = require('node:http');
 const {spawn} = require('node:child_process');
 const fs = require('node:fs');
 const promptFiles = new Map();
-let promptDirectory, catalogPath, stagedBytes = 0;
+let promptDirectory, hookStateDirectory, catalogPath, stagedBytes = 0;
 let child, server, next = 0, pending = '', started = false, closing = false;
 const sockets = new Map();
 const fileResponses = new Map();
@@ -30,6 +30,7 @@ function shutdown(code) {
   if (fileServer) fileServer.close();
   for (const res of fileResponses.values()) res.destroy();
   if (promptDirectory) fs.rmSync(promptDirectory,{recursive:true,force:true});
+  if (hookStateDirectory) fs.rmSync(hookStateDirectory,{recursive:true,force:true});
   process.exit(code);
 }
 process.stdin.on('end', () => shutdown(1));
@@ -86,9 +87,17 @@ function receive(m) {
       // provider overrides so a custom image cannot redirect the selected API.
       const env = {...process.env};
       for (const k of Object.keys(env)) {
-        if (${PROVIDER_ENV_PATTERN}.test(k) || /^(CODEX_|VICOOP_EXECUTION_TOKEN$)/.test(k)) delete env[k];
+        if (${PROVIDER_ENV_PATTERN}.test(k) || /^(CODEX_|VICOOP_EXECUTION_TOKEN$|VICOOP_HOOK_|VICOOP_TASK_ID$)/.test(k)) delete env[k];
       }
       Object.assign(env, m.env);
+      if (m.hookContext && m.backend === 'claude') {
+        hookStateDirectory = fs.mkdtempSync('/tmp/vicoop-hooks-');
+        Object.assign(env, {
+          VICOOP_TASK_ID: m.hookContext.taskId,
+          VICOOP_HOOK_REQUEST_ID: m.hookContext.requestId,
+          VICOOP_HOOK_STATE_DIR: hookStateDirectory,
+        });
+      }
       if(m.backend==='codex') {
         env.CODEX_HOME='/data/sessions/codex/config';
         fs.mkdirSync(env.CODEX_HOME,{recursive:true,mode:0o700});
