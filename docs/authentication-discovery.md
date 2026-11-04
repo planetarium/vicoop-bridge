@@ -53,5 +53,19 @@ A2A security requirements and extensions to determine authentication; the
 legacy field alone does not indicate that a restricted endpoint allows
 anonymous requests. No new Mentionable auth enum is introduced.
 
+### Existing SIWE connector deployments
+
+The Mentionable Slack connector at commit
+[`f4c208cd5483a31e6d4d605616db36a437aa8f70`](https://github.com/planetarium/mentionable/blob/f4c208cd5483a31e6d4d605616db36a437aa8f70/examples/slack-connector/src/siwe-auth.ts#L46-L56)
+only discovers SIWE when the extension has `required: true`. It therefore ignores
+the optional SIWE advertisement emitted here, including on Ethereum-only and
+mixed policies. Existing deployments relying on that connector's wallet signing
+must update the consumer to recognize advertised optional SIWE alternatives
+before rolling out this change, or preconfigure an authorized opaque caller token
+for the same agent. Without either step, the legacy connector can omit the SIWE
+Bearer header and receive HTTP 401. The bridge continues to accept authorized
+SIWE credentials; making extension negotiation mandatory again would incorrectly
+require it of callers using another advertised authentication method.
+
 References: [Mentionable card schema](https://github.com/planetarium/mentionable/blob/main/docs/spec/agent-card.md),
 [Mentionable connector authentication discovery](https://github.com/planetarium/mentionable/blob/main/examples/slack-connector/src/a2a-auth-requirements.ts).
