@@ -700,12 +700,18 @@ volumes rather than deleting caller data.
 File delivery is a separate capability introduced by
 [PR #561](https://github.com/planetarium/vicoop-bridge/pull/561); it is not present
 on the main revision this change builds upon. When using a release with that PR,
-also configure `caller_runtime.fileDelivery.allowedRoots`, for example
-`["/workspace/output"]`. Shared asset paths are inputs, not export roots: copy or
+remove the local `caller_runtime.outgoingFiles` field and replace it with
+`caller_runtime.fileDelivery`, setting `allowedRoots` to, for example,
+`["/workspace/output"]`. The strict schema rejects `outgoingFiles`; only the local
+`sharedBinds` and `systemPrompt` fields carry over under the same names.
+Shared asset paths are inputs, not export roots: copy or
 process results into an allowed private output directory and invoke `send_file`.
 That feature enforces its own per-file, aggregate byte and file-count limits
 (defaults: 6 MiB/file, 24 MiB/task, 8 files/task); a prompt does not override them.
-Files already delivered remain visible if a later step fails or is canceled.
+Delivery occurs when `send_file` runs, rather than from a queue at task completion.
+Update operator prompts and consumer instructions that describe completion-time
+queued delivery. Files already delivered remain visible if a later step fails or
+is canceled.
 Without that feature, paths in prose do not become attachments. This mount/prompt
 configuration does not replace or weaken the execution-bound file-delivery design.
 
@@ -723,3 +729,10 @@ CLI fixture through the real caller worker and broker; it makes no model calls.
 On a revision containing #561, also set `VICOOP_SHARED_TEST_FILE_DELIVERY=1`
 to check actual attachments and the configured file-tool instructions on all
 three executions alongside the operator prompt.
+
+When integrating with #561, preserve both the shared volume/bind target-uniqueness
+refinement and the file replay-budget `superRefine`, along with the Claude-only
+guards for `systemPrompt` and `fileDelivery`. Reconcile both documentation sections:
+once the features ship together, remove statements that `sharedBinds` and
+`systemPrompt` still require a local patch or are unsupported, and update the
+revision-specific file-delivery availability note above.
