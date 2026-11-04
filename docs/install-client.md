@@ -1317,10 +1317,13 @@ flag replaces the config roots; a size flag overrides only the size.
 Tell Claude to use `send_file` for deliverables, rather than returning a local
 path. The daemon injects and preapproves the tool; Bash sandbox/network settings
 are left unchanged. If your Claude setup also restricts MCP connections, allow
-the tool's loopback HTTP endpoint. The MCP listener binds to loopback, has no
-HTTP authentication, and is for a trusted local host. Do not configure roots
-containing credentials. Overlapping active tasks cause file sends to fail
-closed as ambiguous; send attachment-producing requests sequentially.
+the tool's loopback HTTP endpoint. Each Claude process receives a bridge-issued
+bearer capability in its MCP configuration, binding file delivery to that
+execution. Overlapping tasks can send attachments to their own callers. Process
+exit and cancellation revoke the capability; retries receive a fresh one, and
+stale helpers cannot attach files to a later task. No task or recipient IDs are
+accepted as tool arguments. This is still a trusted host runtime, not filesystem
+isolation between local processes; do not configure roots containing credentials.
 
 Caller-container runtimes do not yet support this tool; enabling it with
 `--runtime container` fails at startup rather than silently dropping attachments.

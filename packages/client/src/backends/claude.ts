@@ -70,7 +70,7 @@ export interface ClaudeChildHandle {
   readonly stdout: NodeJS.ReadableStream | null;
   readonly stderr: NodeJS.ReadableStream | null;
   kill(signal?: NodeJS.Signals): boolean;
-  on(event: 'close', listener: (code: number | null, signal: NodeJS.Signals | null) => void): void;
+  on(event: 'close' | 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): void;
   on(event: 'error', listener: (err: Error) => void): void;
 }
 
@@ -1822,7 +1822,7 @@ export function createClaudeBackend(
     if (sendFileMcp) return sendFileMcp;
     if (sendFileMcpStarting) return sendFileMcpStarting;
     sendFileMcpStarting = (async () => {
-      const server = await startSendFileMcpServer(sendFileMcpOpts);
+      const server = await startSendFileMcpServer({ ...sendFileMcpOpts, requireExecutionBinding: true });
       sendFileMcp = server;
       console.log(`[claude] send_file MCP server listening at ${server.url}`);
       return server;
@@ -2665,7 +2665,11 @@ export function createClaudeBackend(
       // pattern in the model's view). Either or both can be absent
       // depending on opts; an entirely empty `mcpServers` map skips
       // both `--mcp-config` and the matching `--allowedTools` below.
-      const mcpServers: Record<string, { type: string; url: string }> = {};
+      let sendFileToken = randomUUID();
+      const sendFileTokens = [sendFileToken];
+      const redactFileCapability = (value: string): string =>
+        sendFileTokens.reduce((text, token) => text.replaceAll(token, '[REDACTED]'), value);
+      const mcpServers: Record<string, { type: string; url: string; headers?: Record<string, string> }> = {};
       // Registration keys use a `_vb-` ("vicoop-bridge") prefix so they
       // can't collide with operator-supplied MCP server names under the
       // same `--mcp-config` map. The previous keys (`vicoop-bridge`,
@@ -2676,7 +2680,7 @@ export function createClaudeBackend(
       // (`mcp___vb-<server>__<tool>`) readable. A future merge of these
       // two servers under #216 would naturally land at a single `_vb`.
       if (mcpServerForTask) {
-        mcpServers['_vb-send-file'] = { type: 'http', url: mcpServerForTask.url };
+        mcpServers['_vb-send-file'] = { type: 'http', url: mcpServerForTask.url, headers: { Authorization: `Bearer ${sendFileToken}` } };
       }
       if (callerToolsMcp) {
         mcpServers[CALLER_TOOLS_MCP_SERVER] = { type: 'http', url: callerToolsMcp.url };
@@ -2783,7 +2787,7 @@ export function createClaudeBackend(
       let child: ClaudeChildHandle;
       try {
         timingLogger.debug(
-          `claude.spawn.start taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${effectiveCwd ? safeToken(effectiveCwd) : '<default>'} argv=${safeToken(JSON.stringify(args), 8000)}`,
+          `claude.spawn.start taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${effectiveCwd ? safeToken(effectiveCwd) : '<default>'} argv=${safeToken(redactFileCapability(JSON.stringify(args)), 8000)}`,
         );
         child = spawnFn(command, args, { cwd: effectiveCwd, env: effectiveEnv });
         recorder.mark('spawn');
@@ -2792,12 +2796,12 @@ export function createClaudeBackend(
         rollbackFreshSession();
         await closeCallerToolsMcp();
         timingLogger.debug(
-          `claude.spawn.error taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${effectiveCwd ? safeToken(effectiveCwd) : '<default>'} argv=${safeToken(JSON.stringify(args), 8000)} error=${safeToken(errorMessage(err), 1000)}`,
+          `claude.spawn.error taskId=${safeToken(task.taskId)} command=${safeToken(command)} cwd=${effectiveCwd ? safeToken(effectiveCwd) : '<default>'} argv=${safeToken(redactFileCapability(JSON.stringify(args)), 8000)} error=${safeToken(redactFileCapability(errorMessage(err)), 1000)}`,
         );
         emit({
           type: 'task.fail',
           taskId: task.taskId,
-          error: normalizeTaskFailError({ code: 'spawn_failed', message: errorMessage(err) }),
+          error: normalizeTaskFailError({ code: 'spawn_failed', message: redactFileCapability(errorMessage(err)) }),
         });
         return;
       }
@@ -2955,8 +2959,9 @@ export function createClaudeBackend(
       // tool calls landing during this run resolve to this task's emit().
       // Released in the terminal block so a crashed/timed-out task doesn't
       // keep the slot occupied indefinitely.
-      let sendFileRelease: (() => void) | null = null;
-      if (mcpServerForTask) {
+      let sendFileRelease = (): void => {};
+      const registerSendFileExecution = (): void => {
+        if (!mcpServerForTask) return;
         const handle = mcpServerForTask.registerActiveTask({
           taskId: task.taskId,
           contextId: task.contextId,
@@ -2969,9 +2974,13 @@ export function createClaudeBackend(
             });
             emittedAnyArtifact = true;
           },
-        });
+        }, sendFileToken);
         sendFileRelease = handle.release;
-      }
+        child.on('close', handle.release);
+        child.on('exit', handle.release);
+        child.on('error', handle.release);
+      };
+      registerSendFileExecution();
 
       const emitAssistantArtifact = (text: string, append = false, lastChunk = true): void => {
         if (!text) return;
@@ -3447,6 +3456,7 @@ export function createClaudeBackend(
       const onAbort = (): void => {
         if (aborted) return;
         aborted = true;
+        sendFileRelease?.();
         try {
           child.kill('SIGTERM');
         } catch {
@@ -3455,6 +3465,7 @@ export function createClaudeBackend(
         }
       };
       signal.addEventListener('abort', onAbort);
+      if (signal.aborted) onAbort();
 
       let stdoutBuf = '';
       // Extracted so the corrective-retry child (#441) reuses the identical
@@ -3541,7 +3552,7 @@ export function createClaudeBackend(
       let exit = await awaitChild();
       recorder.mark('closed');
       timingLogger.debug(
-        `claude.spawn.close taskId=${safeToken(task.taskId)} command=${safeToken(command)} code=${exit.code === null ? 'null' : String(exit.code)} signal=${exit.signal ? safeToken(exit.signal) : 'null'} stdoutTailChars=${stdoutTail.length} stderrTailChars=${stderrTail.length}${exit.error ? ` error=${safeToken(errorMessage(exit.error), 1000)}` : ''}`,
+        `claude.spawn.close taskId=${safeToken(task.taskId)} command=${safeToken(command)} code=${exit.code === null ? 'null' : String(exit.code)} signal=${exit.signal ? safeToken(exit.signal) : 'null'} stdoutTailChars=${stdoutTail.length} stderrTailChars=${stderrTail.length}${exit.error ? ` error=${safeToken(redactFileCapability(errorMessage(exit.error)), 1000)}` : ''}`,
       );
 
       // #441 — the turn ended having described a tool call instead of making
@@ -3612,17 +3623,19 @@ export function createClaudeBackend(
         // `handleEvent` assigns the latest result usage. Isolate the second
         // attempt so it can be summed with (rather than overwrite) attempt 1.
         finalUsage = null;
-        // Only the session flag changes: `--session-id` mints, `--resume`
-        // continues. Everything else — mcp config, model, turn cap, system
-        // prompt — must stay byte-identical or the corrective turn lands in a
-        // different context than the one it is correcting.
-        const retryArgs = args.map((a) => (a === '--session-id' ? '--resume' : a));
+        // Keep the same Claude session/configuration but rotate the file
+        // capability: a helper from the exited child must not reach the retry.
+        const previousToken = sendFileToken;
+        sendFileToken = randomUUID();
+        sendFileTokens.push(sendFileToken);
+        const retryArgs = args.map((a) => a === '--session-id' ? '--resume' : a.replaceAll(previousToken, sendFileToken));
         timingLogger.info?.(
           `[claude] retrying narrated tool call taskId=${task.taskId} ` +
             `model=${safeToken(assistantModel ?? initModel ?? 'unknown', 60)}`,
         );
         try {
           child = spawnFn(command, retryArgs, { cwd: effectiveCwd, env: effectiveEnv });
+          registerSendFileExecution();
           approvalLifetime = new AbortController();
           child.on('close', () => approvalLifetime.abort());
           controlRequests.clear();
@@ -3647,7 +3660,7 @@ export function createClaudeBackend(
           // produced a legitimate (if useless) completed result, and surfacing
           // a spawn error here would turn a degraded turn into a hard failure.
           timingLogger.warn?.(
-            `[claude] narrated-tool-call retry failed taskId=${task.taskId} error=${safeToken(errorMessage(err), 300)}`,
+            `[claude] narrated-tool-call retry failed taskId=${task.taskId} error=${safeToken(redactFileCapability(errorMessage(err)), 300)}`,
           );
         }
 
@@ -3738,7 +3751,7 @@ export function createClaudeBackend(
           // exit.error is typed Error from the child `error` event but a
           // custom spawn / fake child could emit a non-Error here. Route
           // through errorMessage so .message access can't crash the frame.
-          error: normalizeTaskFailError({ code: 'spawn_failed', message: errorMessage(exit.error) }),
+          error: normalizeTaskFailError({ code: 'spawn_failed', message: redactFileCapability(errorMessage(exit.error)) }),
         });
         return;
       }
@@ -3780,10 +3793,10 @@ export function createClaudeBackend(
         const privateDiagnostics = opts.remoteApprovals === true;
         if (privateDiagnostics && (stderrTail.trim() || stdoutTail.trim())) {
           console.error(`[claude] exit diagnostics taskId=${safeToken(task.taskId)} ` +
-            `stderr=${JSON.stringify(stderrTail.trim().slice(-500))} stdout=${JSON.stringify(stdoutTail.trim().slice(-500))}`);
+            `stderr=${JSON.stringify(redactFileCapability(stderrTail.trim()).slice(-500))} stdout=${JSON.stringify(redactFileCapability(stdoutTail.trim()).slice(-500))}`);
         }
-        const detail = privateDiagnostics ? '' : stderrTail.trim();
-        const stdoutDetail = privateDiagnostics ? '' : stdoutTail.trim();
+        const detail = privateDiagnostics ? '' : redactFileCapability(stderrTail.trim());
+        const stdoutDetail = privateDiagnostics ? '' : redactFileCapability(stdoutTail.trim());
         const sigPart = exit.signal ? ` (signal ${exit.signal})` : '';
         const detailPart = detail ? `: ${detail.slice(-500)}` : '';
         const stdoutPart = stdoutDetail ? ` [stdout: ${stdoutDetail.slice(-500)}]` : '';

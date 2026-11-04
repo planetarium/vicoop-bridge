@@ -123,6 +123,21 @@ Expected (≈ 16 s):
 The harness uses `--permission-mode bypassPermissions` so the model
 isn't blocked on a permission prompt for the new MCP tool.
 
+### Concurrent file delivery over A2A — `e2e-claude-file-routing.mjs`
+
+Run against a disposable PostgreSQL database after `pnpm -r build`:
+
+```sh
+DATABASE_URL=postgres://... node packages/server/scripts/e2e-claude-file-routing.mjs
+```
+
+This starts a local HTTP/WS gateway and two real Claude processes concurrently
+for each A2A version (0.3 and 1.0). Each sends a distinct file via its own MCP
+capability. The harness checks exact filenames and bytes in both the blocking
+send response and a separate persisted task lookup, and asserts the executions
+overlap. It removes its agent, task rows, and temporary files afterward.
+Claude uses its default permission mode with the bridge-injected MCP allowlist.
+
 ## Troubleshooting
 
 ### `claude` exits with `auth required`
@@ -189,7 +204,7 @@ present in argv) or is blocked on the first model call. Re-run with
 | Image FilePart → model | input-image | image content block reaches vision |
 | URI image FilePart → model | input-image-uri | client-side file URI fetch, image content block reaches vision |
 | PDF FilePart → model | input-pdf | document content block reaches doc parser |
-| Model → file artifact | send-file | `--mcp-config` injection, R1 routing, MCP `send_file` tool, bounded read, `task.artifact` round-trip |
+| Model → file artifact | send-file | `--mcp-config` injection, execution-bound routing, MCP `send_file` tool, bounded read, `task.artifact` round-trip |
 
 The `tool_result` image passthrough (issue #86 task 2a) is covered by
 the unit test `emits FilePart artifact when tool_result contains an

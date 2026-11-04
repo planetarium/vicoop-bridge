@@ -26,6 +26,8 @@ export interface SendFileTaskHandle {
 export interface SendFileMcpOptions {
   /** Roots within which the agent may reference files. */
   allowedRoots: string[];
+  /** Require a bridge-issued per-execution bearer token (host Claude). */
+  requireExecutionBinding?: boolean;
   /** Per-attachment size cap. Default 20 MiB. */
   maxBytes?: number;
   /** TCP port; default 0 (OS-picked). */
@@ -35,13 +37,13 @@ export interface SendFileMcpOptions {
   /**
    * Allow binding to a non-loopback host (any wildcard like `0.0.0.0`/`::`,
    * or a concrete external interface). The send_file tool exposes file
-   * reads from `allowedRoots` to anything that can reach the listener and
-   * has no transport-level auth, so binding off loopback exposes the tool
-   * to other machines on the network. Default: refuse and throw.
+   * reads from `allowedRoots`. Legacy mode has no transport-level auth;
+   * execution-bound mode uses bearer capabilities over plain HTTP. Neither
+   * mode is intended for untrusted networks. Default: refuse and throw.
    *
    * Operators that need a non-loopback bind (sidecar in another container's
    * network namespace, etc.) opt in with this flag and accept that
-   * `allowedRoots` is the only access control.
+   * legacy mode has only `allowedRoots` as access control.
    */
   dangerouslyAllowNonLoopback?: boolean;
   /**
@@ -58,15 +60,17 @@ export interface SendFileMcpServer {
    * URL the agent's MCP runtime should connect to. Backends register it
    * however their host CLI / config expects: OpenClaw via
    * `openclaw mcp set send-file`, claude via `--mcp-config` inline JSON,
-   * other backends via their own equivalents.
+   * other backends via their own equivalents. Execution-bound callers must
+   * also supply the registration token in the Authorization: Bearer header.
    */
   url: string;
   /** Bind host as it was passed to `httpServer.listen()` (lowercased). */
   host: string;
   /** Bind port (after OS allocation when port:0). */
   port: number;
-  /** Register the task that should receive emitted artifacts. */
-  registerActiveTask(handle: SendFileTaskHandle): { release: () => void };
+  /** Register an execution. A token supplied by the backend must be fresh
+   * and randomly generated, never selected from model-controlled input. */
+  registerActiveTask(handle: SendFileTaskHandle, token?: string): { token: string; release: () => void };
   /** How many tasks are currently registered (for diagnostics/tests). */
   activeTaskCount(): number;
   /**
@@ -74,7 +78,7 @@ export interface SendFileMcpServer {
    * MCP transport. Performs the same routing + read + emit logic the real
    * tool handler uses.
    */
-  invokeSendFileForTest(input: { path: string; name?: string }): Promise<{
+  invokeSendFileForTest(input: { path: string; name?: string }, token?: string): Promise<{
     ok: true;
     artifactId: string;
     size: number;
@@ -131,46 +135,37 @@ export async function startSendFileMcpServer(
   // every send_file tool invocation reuses the same canonical roots.
   const readBounded = createBoundedFileReader({ allowedRoots, maxBytes });
 
-  // Routing strategy R1: a single in-flight task at a time. Bridge's
-  // typical caller-per-context pattern keeps this true; the alternative
-  // (carrying sessionKey through the tool args) would push the routing
-  // problem onto the model and reintroduce the prompt-fragility we are
-  // moving away from. Concurrent registrations are detected and the tool
-  // call is rejected with a structured error so the model doesn't silently
-  // emit a file to the wrong caller.
-  const activeTasks = new Set<SendFileTaskHandle>();
+  // Legacy backends retain single-task routing. Claude instead supplies a
+  // random capability per child execution, outside model-controlled tool args.
+  const activeTasks = new Map<string, SendFileTaskHandle>();
 
-  function registerActiveTask(handle: SendFileTaskHandle): { release: () => void } {
-    activeTasks.add(handle);
-    return {
-      release: () => {
-        activeTasks.delete(handle);
-      },
-    };
+  function registerActiveTask(handle: SendFileTaskHandle, token = randomUUID()) {
+    if (closing) throw new Error('send_file MCP server is closed');
+    if (activeTasks.has(token)) throw new Error('duplicate send_file execution binding');
+    activeTasks.set(token, handle);
+    return { token, release: () => { activeTasks.delete(token); } };
   }
 
-  async function performSendFile(input: { path: string; name?: string }): Promise<
+  async function performSendFile(input: { path: string; name?: string }, token?: string): Promise<
     | { ok: true; artifactId: string; size: number; realPath: string }
     | { ok: false; code: string; message: string }
   > {
-    if (activeTasks.size === 0) {
-      return {
-        ok: false,
-        code: 'no-active-task',
-        message:
-          'send_file was invoked while no A2A task is in flight on this backend. The model should only call this tool while responding to a caller.',
-      };
+    const stale = { ok: false as const, code: 'inactive-execution', message: 'The file-delivery execution binding is missing or no longer active.' };
+    if (closing) return stale;
+    if (opts.requireExecutionBinding && (!token || !activeTasks.has(token))) return stale;
+    if (!token && activeTasks.size === 0) {
+      return { ok: false, code: 'no-active-task', message: 'No A2A task is active on this backend.' };
     }
-    if (activeTasks.size > 1) {
-      return {
-        ok: false,
-        code: 'ambiguous-task',
-        message: `send_file was invoked while ${activeTasks.size} tasks are in flight; bridge-client cannot route the artifact unambiguously. Concurrent send_file is not supported.`,
-      };
+    if (!token && activeTasks.size > 1) {
+      return { ok: false, code: 'ambiguous-task', message: 'Multiple tasks are active without an execution binding.' };
     }
-    const [task] = activeTasks;
+    const binding = token ?? activeTasks.keys().next().value!;
+    const task = activeTasks.get(binding);
+    if (!task) return stale;
     try {
       const read = await readBounded(input.path);
+      // Cancellation/exit/shutdown can revoke a binding while the read awaits.
+      if (closing || activeTasks.get(binding) !== task) return stale;
       // Treat empty / whitespace-only `name` as missing — falling back to
       // the basename gives the caller a useful filename instead of the
       // empty string the model accidentally passed in.
@@ -202,7 +197,7 @@ export async function startSendFileMcpServer(
     }
   }
 
-  function createMcp(): McpServer {
+  function createMcp(token?: string): McpServer {
     const mcp = new McpServer({
       name: 'vicoop-bridge-send-file',
       version: clientVersion,
@@ -229,7 +224,7 @@ export async function startSendFileMcpServer(
         },
       },
       async ({ path: filePath, name }) => {
-        const result = await performSendFile({ path: filePath, name });
+        const result = await performSendFile({ path: filePath, name }, token);
         if (result.ok) {
           return {
             content: [
@@ -299,7 +294,17 @@ export async function startSendFileMcpServer(
         res.end('not found');
         return;
       }
-      const mcp = createMcp();
+      const authorization = req.headers.authorization;
+      // Legacy MCP clients may already attach unrelated credentials. Only
+      // execution-bound mode interprets this header as a routing capability.
+      const token = opts.requireExecutionBinding && authorization?.startsWith('Bearer ')
+        ? authorization.slice(7) : undefined;
+      if (opts.requireExecutionBinding && (!token || !activeTasks.has(token))) {
+        res.statusCode = 401;
+        res.end('inactive execution');
+        return;
+      }
+      const mcp = createMcp(token);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
@@ -366,6 +371,7 @@ export async function startSendFileMcpServer(
     activeTaskCount: () => activeTasks.size,
     invokeSendFileForTest: performSendFile,
     async close() {
+      activeTasks.clear();
       closing ??= (async () => {
         // Stop accepting connections before awaiting transport cleanup.
         const httpClosed = httpServer
