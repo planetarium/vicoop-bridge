@@ -482,8 +482,9 @@ tar -C ./materials -cf - . | docker run --rm -i --network none --user 0 \
 
 The bridge accepts only existing plain local Docker volumes, without driver
 options or `vicoop.*` ownership labels. Bridge-managed names starting with `vb-` or `vicoop-`
-and the configured fixed-storage pool are rejected. Host bind mounts, NFS/local
-driver bind options, and caller/provider credential volumes are not supported.
+and the configured fixed-storage pool are rejected. `sharedVolumes` does not
+accept host paths, NFS/local driver bind options, or caller/provider credential
+volumes. Use `sharedBinds` below for supported read-only host directories.
 Shared volumes must contain no secrets or private caller data: all callers can
 read and copy their contents. Read-only mounts prevent callers from modifying
 the shared copy; they do not make documents trusted instructions.
@@ -593,9 +594,9 @@ setting. The host setting does not configure container delivery.
 
 For deployments of the unpublished local asset-container variant, replace
 `outgoingFiles` with `fileDelivery` and use the execution-bound `send_file` tool
-instead of its completion-time queue. This migration does **not** replace that
-variant's read-only host-directory `sharedBinds` or operator `systemPrompt`
-customizations; those are not supported by this change. Review the 24 MiB default
+instead of its completion-time queue. Retain `sharedBinds` and `systemPrompt`
+under the same names, following the host-directory validation and recreation
+procedure below. Review the 24 MiB default
 aggregate budget explicitly: it is lower than eight 6 MiB files. Files are now
 delivered immediately and remain visible if the task subsequently fails or is
 canceled.
@@ -613,6 +614,7 @@ Validation entrypoints:
   cancellation, reconnect, PNG/WAV bytes and hashes, and completed-task lookup
   with A2A 0.3 and 1.0. See the script header
   for required environment variables; this test makes real provider calls.
+
 ## Host asset directories and operator instructions
 
 Existing host directories can be exposed without copying them into Docker volumes
@@ -697,10 +699,8 @@ before starting the stock client. An older local container may lack the required
 non-recursion/propagation declarations. Preserve its state directory and private
 volumes rather than deleting caller data.
 
-File delivery is a separate capability introduced by
-[PR #561](https://github.com/planetarium/vicoop-bridge/pull/561); it is not present
-on the main revision this change builds upon. When using a release with that PR,
-remove the local `caller_runtime.outgoingFiles` field and replace it with
+The stock client supports execution-bound file delivery together with these
+mounts and operator instructions. Remove the local `caller_runtime.outgoingFiles` field and replace it with
 `caller_runtime.fileDelivery`, setting `allowedRoots` to, for example,
 `["/workspace/output"]`. The strict schema rejects `outgoingFiles`; only the local
 `sharedBinds` and `systemPrompt` fields carry over under the same names.
@@ -726,13 +726,6 @@ VICOOP_SHARED_TEST_IMAGE=sha256:YOUR_CALLER_IMAGE_ID \
 Run from a directory shared into the Docker VM. The prompt test uses a deterministic
 CLI fixture through the real caller worker and broker; it makes no model calls.
 
-On a revision containing #561, also set `VICOOP_SHARED_TEST_FILE_DELIVERY=1`
+Also set `VICOOP_SHARED_TEST_FILE_DELIVERY=1`
 to check actual attachments and the configured file-tool instructions on all
 three executions alongside the operator prompt.
-
-When integrating with #561, preserve both the shared volume/bind target-uniqueness
-refinement and the file replay-budget `superRefine`, along with the Claude-only
-guards for `systemPrompt` and `fileDelivery`. Reconcile both documentation sections:
-once the features ship together, remove statements that `sharedBinds` and
-`systemPrompt` still require a local patch or are unsupported, and update the
-revision-specific file-delivery availability note above.
