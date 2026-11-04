@@ -482,8 +482,9 @@ tar -C ./materials -cf - . | docker run --rm -i --network none --user 0 \
 
 The bridge accepts only existing plain local Docker volumes, without driver
 options or `vicoop.*` ownership labels. Bridge-managed names starting with `vb-` or `vicoop-`
-and the configured fixed-storage pool are rejected. Host bind mounts, NFS/local
-driver bind options, and caller/provider credential volumes are not supported.
+and the configured fixed-storage pool are rejected. `sharedVolumes` does not
+accept host paths, NFS/local driver bind options, or caller/provider credential
+volumes. Use `sharedBinds` below for supported read-only host directories.
 Shared volumes must contain no secrets or private caller data: all callers can
 read and copy their contents. Read-only mounts prevent callers from modifying
 the shared copy; they do not make documents trusted instructions.
@@ -593,9 +594,9 @@ setting. The host setting does not configure container delivery.
 
 For deployments of the unpublished local asset-container variant, replace
 `outgoingFiles` with `fileDelivery` and use the execution-bound `send_file` tool
-instead of its completion-time queue. This migration does **not** replace that
-variant's read-only host-directory `sharedBinds` or operator `systemPrompt`
-customizations; those are not supported by this change. Review the 24 MiB default
+instead of its completion-time queue. Retain `sharedBinds` and `systemPrompt`
+under the same names, following the host-directory validation and recreation
+procedure below. Review the 24 MiB default
 aggregate budget explicitly: it is lower than eight 6 MiB files. Files are now
 delivered immediately and remain visible if the task subsequently fails or is
 canceled.
@@ -613,3 +614,118 @@ Validation entrypoints:
   cancellation, reconnect, PNG/WAV bytes and hashes, and completed-task lookup
   with A2A 0.3 and 1.0. See the script header
   for required environment variables; this test makes real provider calls.
+
+## Host asset directories and operator instructions
+
+Existing host directories can be exposed without copying them into Docker volumes
+or rebuilding the caller image. Add these fields to
+`backends.claude.caller_runtime` (the same names as the local asset-agent patch):
+
+```json
+"sharedBinds": [
+  { "name": "assets", "source": "/srv/ip-assets" }
+],
+"systemPrompt": "Search the corpus under /shared/assets. Keep source files unchanged. Write deliverables under /workspace/output. When file delivery is configured, return actual attachments through send_file."
+```
+
+`sharedBinds` works for Claude and Codex; `systemPrompt` is Claude-only and is
+rejected for Codex, including during `container init`. Both fields require the
+effective runtime to be `container`; host execution rejects them. The default is no binds
+and no operator prompt. Each bind has exactly `name` and `source`; arbitrary
+mount options, writable binds, custom destinations and remote caller-selected
+paths are unsupported. Up to 16 directories are supported. Names use the same
+identifier syntax as `sharedVolumes`, and must be unique across both lists.
+Sources must be existing absolute canonical directories: resolve symlinks first
+with `realpath`, omit trailing slashes, and avoid commas, quotes, backslashes and
+control characters. Files, symlink components, duplicate sources and ambiguous
+paths are rejected. Spaces and Unicode names are supported.
+
+The bridge requests `readonly,bind-recursive=disabled,bind-propagation=rprivate`
+using Docker's `--mount`. Host submounts are excluded and mount events do not
+propagate. A Docker CLI/Engine that cannot implement these options fails rather
+than falling back to weaker mounts. Before creation or reuse, sources are checked
+again. Retained containers must match both Docker's mount declarations (including
+non-recursion) and actual source, destination, read-only and propagation fields.
+Changed, missing, duplicate or unexpected mounts fail validation. Private writable
+workspace/session volumes remain per-caller. Cleanup only manages those owned
+volumes and containers; it never removes an operator source directory.
+
+This feature requires a Linux Docker daemon reached through a local Unix socket.
+The client and daemon must see the **same canonical source path and contents**.
+On Linux, run the client on the Docker host. On macOS, Docker Desktop/Colima must
+share the selected host directory into their Linux VM at that path; a path that
+exists only on macOS is insufficient. Docker's workload UID/GID `1000:1000` must
+have read/traverse permission. SSH/TCP remote Docker endpoints are explicitly
+rejected: run the client on that Docker host and configure its paths instead.
+Do not use a forwarded Unix socket to disguise a remote filesystem. See
+[Docker's bind-mount requirements](https://docs.docker.com/engine/storage/bind-mounts/).
+
+Host file changes appear through existing mounts without a copy/sync step. Keep
+the mounted directory itself stable: replacing or renaming its root requires
+recreation. For consistent multi-file updates, stop all consumers first. These
+mounts expose their contents to **every** caller of this agent; select only
+public-to-those-callers asset directories, not the host home, credentials, Docker
+socket or caller state. Read-only mounts protect originals from modification;
+they do not prevent callers from reading/copying assets into private outputs.
+Non-recursive mounts exclude mounted descendants, but ordinary subdirectories
+remain visible.
+
+To change names, source paths or the mount list:
+
+1. Stop the daemon and its caller containers.
+2. With the **old mount configuration still in place**, run `container list` and
+   `container recreate SCOPE_DIGEST --config /path/to/config.json` for every
+   retained scope. This removes containers while preserving private workspaces,
+   sessions and scope mappings. Offline recreation/removal also works when a
+   source directory is missing, because it validates recorded mount ownership
+   without accessing source contents.
+3. Edit the configuration, validate canonical source paths and restart. New
+   containers receive the new mounts on acquisition. Existing data is retained;
+   the existing recreation/conversation-reset behavior still applies.
+
+Changing only `systemPrompt` requires a daemon restart, without image rebuild or
+container recreation. It is nonblank text, limited to 64 KiB of UTF-8 and cannot
+contain NUL. The bridge merges it into one staged append-prompt file alongside
+agent identity, caller-context rules and other bridge-generated instructions on
+**every execution**, including resumed sessions and retries. It does not mix
+`--append-system-prompt` with `--append-system-prompt-file`. Operator instructions
+are visible to callers through model behavior; do not put secrets in them.
+
+### Migrating the asset-agent patch
+
+Retain the local `sharedBinds`/`systemPrompt` fields, check them against the stricter
+validation above, and recreate old containers using the old client/configuration
+before starting the stock client. An older local container may lack the required
+non-recursion/propagation declarations. Preserve its state directory and private
+volumes rather than deleting caller data.
+
+The stock client supports execution-bound file delivery together with these
+mounts and operator instructions. Remove the local `caller_runtime.outgoingFiles` field and replace it with
+`caller_runtime.fileDelivery`, setting `allowedRoots` to, for example,
+`["/workspace/output"]`. The strict schema rejects `outgoingFiles`; only the local
+`sharedBinds` and `systemPrompt` fields carry over under the same names.
+Shared asset paths are inputs, not export roots: copy or
+process results into an allowed private output directory and invoke `send_file`.
+That feature enforces its own per-file, aggregate byte and file-count limits
+(defaults: 6 MiB/file, 24 MiB/task, 8 files/task); a prompt does not override them.
+Delivery occurs when `send_file` runs, rather than from a queue at task completion.
+Update operator prompts and consumer instructions that describe completion-time
+queued delivery. Files already delivered remain visible if a later step fails or
+is canceled.
+Without that feature, paths in prose do not become attachments. This mount/prompt
+configuration does not replace or weaken the execution-bound file-delivery design.
+
+Maintainers can verify live host updates, write rejection, private workspaces and
+sessions, recreation, source preservation, and per-execution prompt staging with:
+
+```sh
+VICOOP_SHARED_TEST_IMAGE=sha256:YOUR_CALLER_IMAGE_ID \
+  pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-shared-binds.integration.test.ts
+```
+
+Run from a directory shared into the Docker VM. The prompt test uses a deterministic
+CLI fixture through the real caller worker and broker; it makes no model calls.
+
+Also set `VICOOP_SHARED_TEST_FILE_DELIVERY=1`
+to check actual attachments and the configured file-tool instructions on all
+three executions alongside the operator prompt.

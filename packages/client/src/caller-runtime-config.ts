@@ -1,6 +1,6 @@
 import { CallerFileDeliveryConfig, callerFilePendingBytes } from './caller-file-delivery.js';
 import { z } from 'zod';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, posix } from 'node:path';
 
 export const CallerRuntimeConfig = z
   .object({
@@ -11,6 +11,19 @@ export const CallerRuntimeConfig = z
         'caller image must be pinned by digest',
       ),
     stateDirectory: z.string().min(1).refine(isAbsolute, 'stateDirectory must be an absolute path; for existing state, use its original absolute location'),
+    // Only operators choose sources; destinations cannot overlap private storage.
+    sharedBinds: z.array(z.object({
+      name: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/),
+      source: z.string().refine(source =>
+        source.startsWith('/') && source !== '/' && posix.normalize(source) === source &&
+        !source.endsWith('/') && !/[,"\\\x00-\x1f\x7f]/.test(source),
+      'shared bind source must be a normalized absolute directory path without mount-option delimiters'),
+    }).strict()).max(16).default([])
+      .refine(entries => new Set(entries.map(entry => entry.name)).size === entries.length, 'shared bind names must be unique')
+      .refine(entries => new Set(entries.map(entry => entry.source)).size === entries.length, 'shared bind sources must be unique'),
+    systemPrompt: z.string().refine(value => value.trim().length > 0 &&
+      !value.includes('\0') && Buffer.byteLength(value, 'utf8') <= 64 * 1024,
+    'systemPrompt must be nonblank, NUL-free and at most 64 KiB').optional(),
     // Operator-owned plain Docker volumes, shared by all callers of this agent.
     sharedVolumes: z.array(z.object({
       name: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/),
@@ -45,5 +58,12 @@ export const CallerRuntimeConfig = z
       context.addIssue({ code: z.ZodIssueCode.custom, path: ['fileDelivery'],
         message: error instanceof Error ? error.message : String(error) });
     }
-  });
+  })
+  .refine(config => new Set([...config.sharedVolumes, ...config.sharedBinds].map(entry => entry.name)).size ===
+    config.sharedVolumes.length + config.sharedBinds.length, 'shared mount targets must be unique across volumes and binds');
 export type CallerRuntimeOptions = z.infer<typeof CallerRuntimeConfig>;
+
+export function assertCallerRuntimeBackend(kind: string, config: { systemPrompt?: unknown }): void {
+  if (kind !== 'claude' && config.systemPrompt !== undefined)
+    throw new Error('caller_runtime.systemPrompt is supported only for Claude');
+}

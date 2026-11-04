@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, realpath, writeFile, symlink, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CallerRuntimeConfig } from "./caller-runtime-config.js";
@@ -46,11 +46,18 @@ test("shared volume configuration rejects path injection, reserved names and amb
     );
 });
 
-test("shared mounts survive acquisition and recreation, reject drift, and are never deleted", async (t) => {
+for (const withBinds of [false, true]) test(`shared mounts (binds=${withBinds}) survive acquisition and recreation, reject drift, and are never deleted`, async (t) => {
+  const previousContext = process.env.DOCKER_CONTEXT;
+  process.env.DOCKER_CONTEXT = 'unit-test';
+  t.after(() => { if (previousContext === undefined) delete process.env.DOCKER_CONTEXT; else process.env.DOCKER_CONTEXT = previousContext; });
   const directory = await mkdtemp(join(tmpdir(), "caller-shared-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(await realpath(directory), 'assets');
+  await mkdir(source);
+  await writeFile(join(source, 'corpus'), 'original');
   const options = CallerRuntimeConfig.parse({
     ...base,
+    sharedBinds: withBinds ? [{ name: 'assets', source }] : [],
     stateDirectory: directory,
     sharedVolumes: [shared],
   });
@@ -81,6 +88,8 @@ test("shared mounts survive acquisition and recreation, reject drift, and are ne
       args.flatMap((v, i) => (v === flag ? [args[i + 1]] : []));
     const labels = () =>
       Object.fromEntries(flags("--label").map((v) => v.split("=")));
+    if (args[0] === "context") return success(JSON.stringify('unix:///local-docker.sock'));
+    if (args[0] === "info") return success('linux');
     if (args[0] === "image") return success([{ Config: {} }]);
     if (args[0] === "ps") {
       const filter = flags("--filter")[0];
@@ -162,12 +171,16 @@ test("shared mounts survive acquisition and recreation, reject drift, and are ne
             Source: m.source,
             Target: m.target,
             ReadOnly: !!m.readonly,
-            VolumeOptions: { NoCopy: !!m["volume-nocopy"] },
+            ...(m.type === 'volume' ? { VolumeOptions: { NoCopy: !!m["volume-nocopy"] } } : {
+              BindOptions: { NonRecursive: m['bind-recursive'] === 'disabled', Propagation: m['bind-propagation'] },
+            }),
           })),
         },
         Mounts: mounts.map((m) => ({
           Type: m.type,
-          Name: m.source,
+          Name: m.type === 'volume' ? m.source : undefined,
+          Source: m.source,
+          Propagation: m['bind-propagation'],
           Destination: m.target,
           RW: !m.readonly,
         })),
@@ -253,6 +266,32 @@ test("shared mounts survive acquisition and recreation, reject drift, and are ne
     await assert.rejects(pool.acquire(alice), /boundary mismatch/);
     object[key] = previous;
   }
+  if (withBinds) {
+    const actual = aliceInfo.Mounts.find((m: any) => m.Type === 'bind');
+    const declared = aliceInfo.HostConfig.Mounts.find((m: any) => m.Type === 'bind');
+    for (const [object, key, value] of [
+      [actual, 'RW', true], [actual, 'Source', '/foreign'], [actual, 'Type', 'volume'],
+      [actual, 'Destination', '/workspace'], [actual, 'Propagation', 'rslave'],
+      [declared, 'Source', '/foreign'], [declared, 'Target', '/shared/other'],
+      [declared, 'ReadOnly', false], [declared, 'Type', 'volume'],
+      [declared.BindOptions, 'NonRecursive', false], [declared.BindOptions, 'NonRecursive', undefined],
+      [declared.BindOptions, 'Propagation', 'rshared'], [declared.BindOptions, 'CreateMountpoint', true],
+      [declared.BindOptions, 'ReadOnlyNonRecursive', true], [declared.BindOptions, 'ReadOnlyForceRecursive', true],
+    ] as Array<[any, string, unknown]>) {
+      const previous = object[key]; object[key] = value;
+      for (const action of [() => pool.acquire(alice), () => pool.remove(alice, false)])
+        await assert.rejects(action(), /boundary mismatch/);
+      object[key] = previous;
+    }
+    for (const mounts of [aliceInfo.Mounts, aliceInfo.HostConfig.Mounts]) {
+      mounts.push(structuredClone(mounts.at(-1)));
+      await assert.rejects(pool.acquire(alice), /boundary mismatch/);
+      mounts.pop();
+    }
+    options.sharedBinds[0].source = join(source, 'missing');
+    await assert.rejects(pool.acquire(alice), /canonical directory/);
+    options.sharedBinds[0].source = source;
+  }
   for (const drift of [
     { Driver: "nfs" },
     { Options: { type: "none", o: "bind", device: "/host" } },
@@ -283,4 +322,60 @@ test("shared mounts survive acquisition and recreation, reject drift, and are ne
     )
   );
   await pool.close();
+  assert.equal(await readFile(join(source, 'corpus'), 'utf8'), 'original');
+});
+
+
+test('shared bind schema rejects ambiguous paths, mount options and target collisions', () => {
+  const bind = { name: 'assets', source: '/srv/assets' };
+  assert.deepEqual(CallerRuntimeConfig.parse(base).sharedBinds, []);
+  for (const source of ['relative', '/', '/srv/../assets', '/srv//assets', '/srv/assets/',
+    '/srv/assets,readonly=false', '/srv/"assets', '/srv/assets\\nested', '/srv/assets\n', '/srv/assets\0'])
+    assert.equal(CallerRuntimeConfig.safeParse({ ...base, sharedBinds: [{ ...bind, source }] }).success, false, source);
+  for (const entry of [{...bind, name:'../workspace'}, {...bind, name:'a/b'}, {...bind, target:'/workspace'}, {...bind, readonly:false}])
+    assert.equal(CallerRuntimeConfig.safeParse({...base, sharedBinds:[entry]}).success, false);
+  for (const entries of [[bind, bind], [bind, {...bind, name:'other'}], [bind, {...bind, source:'/srv/other'}]])
+    assert.equal(CallerRuntimeConfig.safeParse({...base, sharedBinds:entries}).success, false);
+  assert.equal(CallerRuntimeConfig.safeParse({...base, sharedBinds:[bind], sharedVolumes:[{...shared, name:'assets'}]}).success, false);
+  assert.ok(CallerRuntimeConfig.parse({...base, sharedBinds:[{...bind, source:'/srv/한글 assets=one'}]}));
+});
+
+test('shared bind preflight rejects symlinks, files, missing directories and unsupported Docker hosts before allocation', async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'bind-preflight-')));
+  t.after(() => rm(directory, {recursive:true, force:true}));
+  const source = join(directory, 'assets');
+  await mkdir(source);
+  await symlink(source, join(directory, 'link'));
+  await writeFile(join(directory, 'file'), 'not a directory');
+  let endpoint = 'unix:///docker.sock', os = 'linux';
+  const calls: string[][] = [];
+  const run: AsyncDockerRun = async args => {
+    calls.push([...args]);
+    const stdout = args[0] === 'context' ? JSON.stringify(endpoint) : args[0] === 'info' ? os : '[{"Config":{}}]';
+    return {exitCode:0, stdout, stderr:''};
+  };
+  const options = CallerRuntimeConfig.parse({...base, stateDirectory:join(directory,'state'), sharedBinds:[{name:'assets',source}]});
+  const pool = () => new DockerCallerRuntimePool('claude', options, 'test', run);
+  // Delegate endpoint resolution to the mocked Docker context inspection.
+  const previous = process.env.DOCKER_CONTEXT;
+  process.env.DOCKER_CONTEXT = 'fixture';
+  t.after(() => { if(previous === undefined) delete process.env.DOCKER_CONTEXT; else process.env.DOCKER_CONTEXT = previous; });
+  for (const invalid of ['link', 'file', 'missing']) {
+    options.sharedBinds[0].source = join(directory, invalid);
+    await assert.rejects(pool().initialize(), /canonical directory/);
+  }
+  options.sharedBinds[0].source = source;
+  for (endpoint of ['ssh://remote', 'tcp://remote:2376'])
+    await assert.rejects(pool().initialize(), /local Docker Unix socket/);
+  const previousHost = process.env.DOCKER_HOST;
+  t.after(() => { if(previousHost === undefined)delete process.env.DOCKER_HOST;else process.env.DOCKER_HOST = previousHost; });
+  delete process.env.DOCKER_CONTEXT;
+  process.env.DOCKER_HOST = 'tcp://remote:2376';
+  await assert.rejects(pool().initialize(), /local Docker Unix socket/);
+  // With a context selected, validate the endpoint Docker reports instead of
+  // assuming that DOCKER_HOST identifies the effective endpoint.
+  process.env.DOCKER_CONTEXT = 'fixture';
+  endpoint = 'unix:///docker.sock'; os = 'windows';
+  await assert.rejects(pool().initialize(), /Linux Docker daemon/);
+  assert.ok(!calls.some(args => ['create','start','volume','network'].includes(args[0])));
 });

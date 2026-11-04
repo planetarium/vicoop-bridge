@@ -1,10 +1,11 @@
 import { CallerStorage, CallerStorageHelperUnconfirmedError } from './caller-storage.js';
 import { randomUUID } from 'node:crypto';
+import { realpath, stat } from 'node:fs/promises';
 import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
 import { CallerRuntimeStore, scopeDigest } from './caller-runtime-store.js';
 import { brokerFirewallScript } from './execution-runtime-boundary.js';
 import { PROVIDER_ENV_PATTERN } from './provider-environment.js';
-import type { CallerRuntimeOptions } from './caller-runtime-config.js';
+import { assertCallerRuntimeBackend, type CallerRuntimeOptions } from './caller-runtime-config.js';
 
 export class CallerEnvironmentPendingError extends Error {
   constructor() { super('caller environment setup is pending; ask the operator to complete container setup'); }
@@ -57,6 +58,7 @@ export class DockerCallerRuntimePool {
     agentId: string,
     run: AsyncDockerRun = runDockerCommand,
   ) {
+    assertCallerRuntimeBackend(kind, options);
     this.store = new CallerRuntimeStore(options.stateDirectory, agentId);
     this.run = (args, options) => run(args, { timeoutMs: 10000, ...options });
     this.storage = new CallerStorage(options, this.store, this.run);
@@ -110,7 +112,10 @@ export class DockerCallerRuntimePool {
         )
           throw new Error('caller image must not declare volumes or provider environment');
       }
-      if (this.validateExecution) await this.validateSharedVolumes();
+      if (this.validateExecution) {
+        await this.validateSharedVolumes();
+        await this.validateSharedBinds();
+      }
       const ids = await this.store.scopes();
       for (const id of ids) await this.storage.reconcile(id);
       if (this.options.fixedImageStorage) await this.storage.initialize();
@@ -243,7 +248,22 @@ export class DockerCallerRuntimePool {
       [`/data/sessions/${this.kind}`, `${this.name(id)}-${this.options.fixedImageStorage ? 'storage' : 'sessions'}`],
     ]);
     const shared = new Map(this.options.sharedVolumes.map(entry => [`/shared/${entry.name}`, entry.volume]));
+    const binds = new Map(this.options.sharedBinds.map(entry => [`/shared/${entry.name}`, entry.source]));
     const declared = h.Mounts ?? [];
+    // Legacy private volumes can use Binds; shared host paths must always use
+    // structured --mount declarations so non-recursion is inspectable.
+    if (binds.size) {
+      if (declared.length !== 2 + shared.size + binds.size || h.Binds?.length) fail();
+      if (new Set(declared.map((m: any) => m.Target)).size !== declared.length) fail();
+    }
+    for (const [target, source] of binds) {
+      const mount = declared.find((m: any) => m.Target === target);
+      if (!mount || mount.Type !== 'bind' || mount.Source !== source ||
+          mount.ReadOnly !== true || mount.BindOptions?.NonRecursive !== true ||
+          mount.BindOptions?.Propagation !== 'rprivate' || mount.BindOptions?.CreateMountpoint ||
+          mount.BindOptions?.ReadOnlyNonRecursive || mount.BindOptions?.ReadOnlyForceRecursive ||
+          mount.VolumeOptions || mount.TmpfsOptions) fail();
+    }
     for (const [target, volume] of shared) {
       const mount = declared.find((m: any) => m.Target === target);
       if (!mount || mount.Type !== 'volume' || mount.Source !== volume ||
@@ -251,7 +271,7 @@ export class DockerCallerRuntimePool {
           mount.VolumeOptions?.Subpath) fail();
     }
     if (this.options.fixedImageStorage) {
-      if (declared.length !== 2 + shared.size) fail();
+      if (declared.length !== 2 + shared.size + binds.size) fail();
       for (const [target, subpath] of [['/workspace', 'workspace'], [`/data/sessions/${this.kind}`, 'sessions']]) {
         const mount = declared.find((m: any) => m.Target === target);
         if (!mount || mount.Type !== 'volume' || mount.Source !== `${this.name(id)}-storage` ||
@@ -261,6 +281,12 @@ export class DockerCallerRuntimePool {
     for (const m of c.Mounts ?? []) {
       if (m.Type === 'tmpfs' && ['/tmp', '/home/node'].includes(m.Destination))
         continue;
+      if (binds.has(m.Destination)) {
+        if (m.Type !== 'bind' || binds.get(m.Destination) !== m.Source ||
+            m.RW !== false || m.Propagation !== 'rprivate') fail();
+        binds.delete(m.Destination);
+        continue;
+      }
       if (shared.has(m.Destination)) {
         if (m.Type !== 'volume' || shared.get(m.Destination) !== m.Name || m.RW !== false) fail();
         shared.delete(m.Destination);
@@ -271,7 +297,7 @@ export class DockerCallerRuntimePool {
       mounts.delete(m.Destination);
     }
     if (
-      mounts.size || shared.size ||
+      mounts.size || shared.size || binds.size ||
       Object.keys(h.Tmpfs ?? {}).length !== Object.keys(CALLER_TMPFS).length ||
       Object.entries(CALLER_TMPFS).some(([path, options]) =>
         typeof h.Tmpfs?.[path] !== 'string' ||
@@ -330,6 +356,29 @@ export class DockerCallerRuntimePool {
           volume === this.options.fixedImageStorage?.poolVolume)
         throw new Error('shared volume must be an existing operator-owned plain local volume');
     }
+  }
+  private async validateSharedBinds(signal?: AbortSignal): Promise<void> {
+    if (!this.options.sharedBinds.length) return;
+    // A remote daemon's filesystem cannot be canonicalized on this host.
+    // When a context is selected, let Docker resolve the effective endpoint;
+    // environment-variable precedence can differ between CLI versions.
+    const endpoint = !process.env.DOCKER_CONTEXT && process.env.DOCKER_HOST
+      ? process.env.DOCKER_HOST
+      : JSON.parse(await this.command(['context', 'inspect', '--format', '{{json .Endpoints.docker.Host}}'], signal));
+    if (typeof endpoint !== 'string' || !endpoint.startsWith('unix://'))
+      throw new Error('sharedBinds requires a local Docker Unix socket; run the client on the Docker host instead of using a remote daemon');
+    if ((await this.command(['info', '--format', '{{.OSType}}'], signal)).trim() !== 'linux')
+      throw new Error('sharedBinds requires a Linux Docker daemon');
+    for (const { source } of this.options.sharedBinds) {
+      signal?.throwIfAborted();
+      try {
+        if (await realpath(source) !== source || !(await stat(source)).isDirectory())
+          throw new Error('noncanonical source');
+      } catch (cause) {
+        throw new Error(`shared bind source must be an existing canonical directory (no symlink components): ${source}`, { cause });
+      }
+    }
+    signal?.throwIfAborted();
   }
   private async volumeExists(id: string, suffix: string, signal?: AbortSignal): Promise<boolean> {
     signal?.throwIfAborted();
@@ -414,6 +463,7 @@ export class DockerCallerRuntimePool {
       return this.command(args, signal);
     };
     await this.validateSharedVolumes(signal);
+    await this.validateSharedBinds(signal);
     const name = this.name(id);
     const fresh = await this.store.reserve(id, this.kind, principalId, true); // reserve before the first Docker mutation
     if (!fresh && await this.store.reservationPending(id))
@@ -500,6 +550,9 @@ export class DockerCallerRuntimePool {
         this.options.fixedImageStorage ? `type=volume,source=${name}-storage,target=/data/sessions/${this.kind},volume-subpath=sessions,volume-nocopy` : `type=volume,source=${name}-sessions,target=/data/sessions/${this.kind}`,
         ...this.options.sharedVolumes.flatMap(({ name: sharedName, volume }) => [
           '--mount', `type=volume,source=${volume},target=/shared/${sharedName},readonly,volume-nocopy`,
+        ]),
+        ...this.options.sharedBinds.flatMap(({ name: sharedName, source }) => [
+          '--mount', `type=bind,source=${source},target=/shared/${sharedName},readonly,bind-recursive=disabled,bind-propagation=rprivate`,
         ]),
         '--tmpfs',
         `/tmp:${CALLER_TMPFS['/tmp']}`,

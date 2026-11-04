@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { assertCallerRuntimeVersion } from './caller-runtime-version.js';
 import { CALLER_IMAGE_FILES } from './caller-image-assets.js';
 import { prepareCallerStorage, type StorageInitOptions } from './caller-storage-init.js';
-import { CallerRuntimeConfig } from './caller-runtime-config.js';
+import { CallerRuntimeConfig, assertCallerRuntimeBackend } from './caller-runtime-config.js';
 import { CallerRuntimeStore } from './caller-runtime-store.js';
 import {
   createClaudeCredentialReader,
@@ -80,6 +80,7 @@ export async function runCallerContainerInit(
   const backends = object.parse(config.backends ?? {});
   const backend = object.parse(backends[opts.kind] ?? {});
   const previous = object.parse(backend.caller_runtime ?? {});
+  assertCallerRuntimeBackend(opts.kind, previous);
   if (opts.kind === 'claude')
     assertClaudeBrokerSettings(
       backend.settings === undefined
