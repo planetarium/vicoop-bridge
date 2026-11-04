@@ -168,6 +168,8 @@ test('reinitialization preserves paths/limits, reuses image and supports the oth
   const config = await f.read();
   config.backends.claude.caller_runtime.maxScopes = 3;
   config.backends.claude.caller_runtime.sharedVolumes = [{ name: 'docs', volume: 'company-docs-v1' }];
+  config.backends.claude.caller_runtime.sharedBinds = [{ name: 'assets', source: '/srv/assets' }];
+  config.backends.claude.caller_runtime.systemPrompt = 'Search /shared/assets.';
   await writeFile(f.path, JSON.stringify(config));
   f.calls.length = 0;
   await runCallerContainerInit(f.options);
@@ -177,6 +179,8 @@ test('reinitialization preserves paths/limits, reuses image and supports the oth
   );
   assert.equal((await f.read()).backends.claude.caller_runtime.maxScopes, 3);
   assert.deepEqual((await f.read()).backends.claude.caller_runtime.sharedVolumes, [{ name: 'docs', volume: 'company-docs-v1' }]);
+  assert.deepEqual((await f.read()).backends.claude.caller_runtime.sharedBinds, [{name:'assets',source:'/srv/assets'}]);
+  assert.equal((await f.read()).backends.claude.caller_runtime.systemPrompt, 'Search /shared/assets.');
   const existing = (await f.read()).backends.claude;
   await runCallerContainerInit({ ...f.options, kind: 'codex', image });
   assert.deepEqual((await f.read()).backends.claude, existing);

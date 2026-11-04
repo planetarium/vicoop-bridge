@@ -1,7 +1,7 @@
 import { createCallerFileDelivery } from './caller-file-delivery.js';
 import { createCodexModelCatalogCache } from './codex-model-catalog-cache.js';
 import { assertCallerRuntimeVersion } from './caller-runtime-version.js';
-import { CallerRuntimeConfig } from './caller-runtime-config.js';
+import { CallerRuntimeConfig, assertCallerRuntimeBackend } from './caller-runtime-config.js';
 import {
   DockerCallerRuntimePool,
   type CallerKind,
@@ -37,6 +37,7 @@ export async function createCallerRuntime(args: {
 }): Promise<CallerScopedBackend> {
   const config = CallerRuntimeConfig.parse(args.config);
   if (config.fileDelivery && args.kind !== 'claude') throw new Error('caller fileDelivery currently supports Claude only');
+  assertCallerRuntimeBackend(args.kind, config);
   const claudeCredential =
     args.kind === 'claude' ? createClaudeCredentialReader() : undefined;
   const codexCredential =
@@ -120,6 +121,7 @@ export async function createCallerRuntime(args: {
               spawn: spawn as ClaudeSpawnFn,
               fetchUriPolicy: { enabled: false },
               extraArgs: [
+                ...(config.systemPrompt === undefined ? [] : ['--append-system-prompt', config.systemPrompt]),
                 '--strict-mcp-config',
                 '--mcp-config',
                 '{"mcpServers":{}}',

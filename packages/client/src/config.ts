@@ -1,5 +1,5 @@
 import { ClaudeSendFileConfig } from './send-file-config.js';
-import { CallerRuntimeConfig } from './caller-runtime-config.js';
+import { CallerRuntimeConfig, assertCallerRuntimeBackend } from './caller-runtime-config.js';
 import type { z } from 'zod';
 // Single source of truth for the `vicoop-client` daemon: a JSON config file
 // living under the client's canonical home directory (see resolveConfigDir).
@@ -377,6 +377,7 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
           : undefined;
       const runtime = pickBackendRuntime(codexRaw.runtime);
       const callerRuntime = codexRaw.caller_runtime === undefined ? undefined : CallerRuntimeConfig.parse(codexRaw.caller_runtime);
+      if (callerRuntime) assertCallerRuntimeBackend('codex', callerRuntime);
       const runtimeName = asString(codexRaw.runtime_name);
       if (cwd || validSandbox || validApproval || runtime || runtimeName || callerRuntime) {
         out.codex = {};
