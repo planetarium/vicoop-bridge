@@ -72,6 +72,7 @@ export async function createCallerRuntime(args: {
         : undefined;
       signal.throwIfAborted();
       let taskFiles: ReturnType<typeof createCallerFileDelivery> | undefined;
+      let filesHealthy = true;
       const broker =
         args.kind === 'claude'
           ? createClaudeBrokerSpawn(container.name, {
@@ -142,14 +143,23 @@ export async function createCallerRuntime(args: {
           ...worker,
           async handle(task, emit, signal) {
             if (taskFiles) throw new Error('Concurrent file delivery within one caller scope');
-            taskFiles = createCallerFileDelivery(container.name, task.taskId, emit, signal, config.fileDelivery!);
-            try { await worker.handle(task, emit, signal); } finally { taskFiles = undefined; }
+            const files = createCallerFileDelivery(container.name, task.taskId, emit, signal,
+              config.fileDelivery!, runDockerCommand, () => broker.close());
+            taskFiles = files;
+            try { await worker.handle(task, emit, signal); } finally {
+              // Broker exit aborts active reads. Drain their rejection handlers
+              // before scope cleanup decides whether this worker is reusable.
+              await files.settle();
+              filesHealthy &&= files.healthy();
+              taskFiles = undefined;
+            }
           },
         } : worker,
         close: () => broker.close(),
-        healthy: () => broker.healthy(),
+        healthy: () => broker.healthy() && filesHealthy && (taskFiles?.healthy() ?? true),
         settle: async () => {
           await Promise.all([...processes]);
+          await taskFiles?.settle();
           for (const stats of brokerStats.splice(0)) {
             if (
               stats.rejected &&

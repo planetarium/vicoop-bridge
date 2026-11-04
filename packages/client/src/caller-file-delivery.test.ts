@@ -145,3 +145,35 @@ test('overlapping execution relays reject wrong-scope and stale tokens and close
     await Promise.all(children.map(({closed})=>closed));a.close();b.close();
   }
 });
+
+for (const failure of ['throw','nonzero'] as const) test(`uncertain Docker read (${failure}) poisons delivery and closes execution before reuse`, async () => {
+  let calls=0,closed=0,entered!:()=>void,release!:()=>void;
+  const started=new Promise<void>(resolve=>{entered=resolve;});
+  const pending=new Promise<void>(resolve=>{release=resolve;});
+  const signal=new AbortController().signal;
+  const delivery=createCallerFileDelivery('caller','task',()=>assert.fail('no artifact expected'),signal,
+    CallerFileDeliveryConfig.parse({allowedRoots:['/workspace/output']}),async()=>{
+      calls++;entered();await pending;
+      if(failure==='throw')throw Error('local Docker CLI timed out');
+      return {exitCode:137,stdout:'',stderr:''};
+    },()=>{closed++;});
+  const request=delivery.send({path:'/workspace/output/x'},signal);
+  await started;
+  let settled=false;const draining=delivery.settle().then(()=>{settled=true;});
+  await Promise.resolve();assert.equal(settled,false);
+  release();await assert.rejects(request);await draining;
+  assert.equal(delivery.healthy(),false);assert.equal(closed,1);
+  await assert.rejects(delivery.send({path:'/workspace/output/x'},signal),/cleanup is unconfirmed/);
+  assert.equal(calls,1);assert.equal(closed,1);
+});
+
+test('clean reader policy rejection keeps execution reusable', async () => {
+  const signal=new AbortController().signal;
+  let calls=0;
+  const delivery=createCallerFileDelivery('caller','task',()=>{},signal,
+    CallerFileDeliveryConfig.parse({allowedRoots:['/workspace/output']}),async()=>({exitCode:0,stderr:'',
+      stdout:++calls===1?'{"error":"outside-roots"}':'{"bytes":"eA=="}'}),()=>assert.fail('clean rejection must not stop caller'));
+  await assert.rejects(delivery.send({path:'/workspace/private'},signal),/outside-roots/);
+  await delivery.send({path:'/workspace/output/x'},signal);await delivery.settle();
+  assert.equal(delivery.healthy(),true);
+});

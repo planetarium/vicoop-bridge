@@ -50,24 +50,43 @@ const requestSchema = z.object({
 
 /** A task budget is shared by retries; each transport captures this task only. */
 export function createCallerFileDelivery(container: string, taskId: string, emit: Emit,
-  signal: AbortSignal, config: CallerFileDeliveryOptions, run: AsyncDockerRun = runDockerCommand) {
+  signal: AbortSignal, config: CallerFileDeliveryOptions, run: AsyncDockerRun = runDockerCommand,
+  onCleanupUnconfirmed?: () => void) {
   let total = 0, files = 0;
   let tail = Promise.resolve();
+  let cleanupConfirmed = true;
+  const unconfirmed = () => {
+    if (!cleanupConfirmed) return;
+    cleanupConfirmed = false;
+    // Killing the local Docker CLI does not certify that its remote exec
+    // ended. Stop the owning execution immediately; the caller runtime must
+    // confirm container.stop before another task can acquire this scope.
+    onCleanupUnconfirmed?.();
+  };
   return {
+    healthy: () => cleanupConfirmed,
+    settle: () => tail,
     send(input: unknown, executionSignal: AbortSignal): Promise<object> {
       const work = tail.then(async () => {
         signal.throwIfAborted(); executionSignal.throwIfAborted();
+        if (!cleanupConfirmed) throw new Error('Attachment reader cleanup is unconfirmed');
         const request = requestSchema.parse(input);
         if (files >= config.maxFiles) throw new Error('Attachment count limit exceeded');
         const remaining = Math.min(config.maxBytes, config.maxTotalBytes - total);
         if (remaining <= 0) throw new Error('Attachment aggregate size limit exceeded');
         const combined = AbortSignal.any([signal, executionSignal]);
-        const result = await run(['exec', '--user', '1000:1000', '-e', 'NODE_OPTIONS=', '-e', 'NODE_PATH=',
+        let result;
+        try {
+          result = await run(['exec', '--user', '1000:1000', '-e', 'NODE_OPTIONS=', '-e', 'NODE_PATH=',
           '-e', 'LD_PRELOAD=', '-e', 'LD_LIBRARY_PATH=', container, '/usr/local/bin/node', '-e', CALLER_FILE_READ,
           JSON.stringify({ file: request.path, roots: config.allowedRoots, maxBytes: remaining })],
-        { signal: combined, timeoutMs: 15000, maxOutputBytes: 4 * Math.ceil(remaining / 3) + 4096 });
+          { signal: combined, timeoutMs: 15000, maxOutputBytes: 4 * Math.ceil(remaining / 3) + 4096 });
+          if (result.exitCode !== 0) throw new Error('Container attachment read failed');
+        } catch (error) {
+          unconfirmed();
+          throw error;
+        }
         combined.throwIfAborted();
-        if (result.exitCode !== 0) throw new Error('Container attachment read failed');
         const resultData = z.object({bytes: z.string().optional(), error: z.string().optional()}).strict().parse(JSON.parse(result.stdout));
         if (resultData.error || resultData.bytes === undefined) throw new Error(`Attachment rejected: ${resultData.error ?? 'invalid read'}`);
         const buffer = Buffer.from(resultData.bytes, 'base64');

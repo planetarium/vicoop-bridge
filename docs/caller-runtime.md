@@ -557,8 +557,11 @@ The bridge binds each helper transport to one active process, task, and caller
 container. The helper cannot select a recipient or task. It uses a short-lived
 container-loopback endpoint over that execution's Docker channel, without a
 host TCP listener, shared output queue, or host credentials. Bindings and pending
-reads are revoked on process exit, cancellation, timeout, or shutdown. A retry
-gets a new binding; the existing trusted supervisor cleans up descendants before
+reads are revoked on process exit, cancellation, timeout, or shutdown. If a reader
+transport fails or times out without confirmed remote process exit, the task fails
+and the scope is stopped before reuse; the next task restarts it. An unconfirmed
+container stop quarantines the scope for offline recovery. Ordinary path or size
+rejections remain recoverable tool errors. A retry gets a new binding; the existing trusted supervisor cleans up descendants before
 another execution uses the scope. Reconnection uses the existing execution replay
 protocol; a previous execution's helper cannot attach to a later task. Workspace
 files themselves persist and may be explicitly sent again in a later request.
