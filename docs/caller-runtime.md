@@ -103,6 +103,7 @@ with the standard defaults looks like this (digests are placeholders):
         "queueLimit": 16,
         "maxContexts": 256,
         "taskTimeoutMs": 600000,
+        "idleTimeoutMs": 0,
         "memoryMiB": 2048,
         "cpus": 1,
         "pids": 256,
@@ -207,7 +208,7 @@ private/host services; its provider relay is bound to container loopback.
 
 Container lifetime is distinct from execution lifetime. Requests are serialized
 within a scope, including allocation and confirmed cleanup. Different scopes
-can execute concurrently. Successful tasks keep the container running. Claude
+can execute concurrently. By default, successful tasks keep the container running. Claude
 reuses its live session binding; Codex launches a supervised app-server per
 execution and resumes its scope/context-specific thread on the next request.
 
@@ -238,6 +239,84 @@ bridge network, with no foreign container endpoints or custom network options. A
 resource fails closed. Do not manually edit scope records or share a state
 directory between daemons. A crash during owner-record mutation can leave
 `.guard`; inspect owner/process state before manually removing that guard.
+
+## Idle stop and resume
+
+Set `caller_runtime.idleTimeoutMs` to a positive integer to stop unused caller
+containers automatically (for example, `300000` for five minutes). The default
+and explicit disabled value is `0`; the maximum is `2147483647` milliseconds.
+The idle interval starts after the last admitted request and all of its cleanup
+have settled, including backend processes, file delivery and storage checks.
+Model/tool calls, approval waits and queued requests are busy even when they
+produce no output. A new admitted request cancels the timer. If idle cleanup
+has already begun, the request waits for confirmed stop before acquiring a
+fresh worker. Idle cleanup uses the same per-scope queue as execution.
+
+Idle stop closes the worker/broker, reconciles storage helpers and confirms
+container termination. It retains the scope and caller identity, workspace and
+session volumes, fixed-storage reservation, preparation version/readiness and
+shared mounts. The next authorized request validates the retained container's
+boundary and starts it again. Both Claude and Codex currently lose their
+in-memory conversation bindings when the worker is released: **session files
+remain, but conversation continuity is not restored**. The first request for
+each context after recovery emits `metadata["vicoop.runtime"]` with
+`workspaceRestored: true` and `conversationReset: true` before backend output.
+Subsequent requests in that worker can reuse their new conversations normally.
+
+Shorter timeouts reclaim runtime memory and processes sooner, at the cost of
+more container/worker startup latency and more frequent conversation resets.
+This does not reclaim disk space or admit additional retained callers:
+`maxScopes` still counts stopped scopes, and storage reservations remain charged.
+There is no LRU eviction or automatic scope deletion.
+
+Lifecycle logs use `Caller runtime lifecycle:` and an opaque scope digest,
+without principal IDs, prompts, credentials or backend error text. Offline
+`container list` / `container inspect --principal ID` include `lifecycle`:
+
+- `lastIdleStop`: timestamp, `reason: "idle-timeout"`, and `outcome: "stopped"`
+  or `"quarantined"`. A stop is reported only after Docker confirms termination
+  and worker/helper cleanup completes.
+- `lastResume`: timestamp and `outcome: "conversation-reset"` after a fresh
+  worker is initialized, or `"failed"` if recovery cannot initialize it. This
+  describes runtime recovery, not the eventual task/model result.
+
+These last-event records survive daemon restart; the ordinary `state` field
+still reflects Docker's current state. Failed or unconfirmed cleanup quarantines
+only the affected scope under the existing offline recovery rules. Daemon
+shutdown invalidates pending timers and waits for idle cleanup already in
+progress before pool shutdown can release ownership. Startup reconciles retained
+resources normally and never reuses a previous daemon's timers.
+
+### Docker verification
+
+`caller-idle.integration.test.ts` runs the production workers, brokers,
+supervisors and Claude file reader against deterministic CLI protocol fixtures
+inside real Docker containers. It verifies warm conversation reuse, idle reset,
+repeated restart, file routing, preparation/identity persistence, independent
+callers and daemon ownership transfer without making provider calls.
+
+```sh
+VICOOP_IDLE_TEST_IMAGE=your-local-caller-image \
+  pnpm --filter @vicoop-bridge/client exec tsx --test src/caller-idle.integration.test.ts
+```
+
+The image must contain supported Claude/Codex versions, Node, tini and firewall
+tools, with UID 1000 writable workspace/session directories. Optionally set
+`VICOOP_IDLE_TEST_STORAGE_IMAGE=sha256:...` to an installed storage-helper image
+to verify retained fixed-storage reservations as well (uses privileged storage
+helpers with a disposable test pool). The test reports warm/stopped Docker
+memory and PID observations and elapsed request time after idle stop. These are
+local lifecycle observations with synthetic CLI replies, not model latency or
+a throughput benchmark.
+
+A local run on 2026-11-05 with Docker 27.4.0, the fixed-storage helper and a
+caller image containing Claude 2.1.267 / Codex 0.153.4 passed both backend
+fixtures, including two idle resumes and a daemon restart. Claude's two resume
+requests took 676/678 ms; Codex's took 668/661 ms. After warm task cleanup,
+Docker reported 22.01 MiB / 2 PIDs for Claude and 16.77 MiB / 2 PIDs for Codex;
+stopped containers reported 0 B / 0 PIDs. Persistent disk reservations remained
+unchanged. Memory figures are Docker container accounting, not whole-daemon or
+host memory savings, and the replies used the synthetic protocols above.
 
 ## Capacity and storage limits
 

@@ -409,3 +409,26 @@ test('overlapping storage and federated markers cannot downgrade the manifest', 
   release(); await Promise.all([direct, federated]);
   assert.equal(JSON.parse(await readFile(f.manifestPath, 'utf8')).version, 7);
 });
+
+test('idle lifecycle inspection survives ownership transfer without changing retained resources', async t => {
+  const f = await fixture(t);
+  await f.store.lock();
+  await f.store.reserve(f.id, 'claude', 'alice');
+  await f.store.markAllocationComplete(f.id);
+  await f.store.recordFixedStorage(f.id, '{"reservation":"unchanged"}');
+  await f.store.setPreparation(f.id, 'v1', true);
+  const lastIdleStop = { at: new Date().toISOString(), reason: 'idle-timeout' as const, outcome: 'stopped' as const };
+  await f.store.recordLifecycle(f.id, { lastIdleStop });
+  await f.store.unlock();
+  await f.store.lock();
+  const lastResume = { at: new Date().toISOString(), outcome: 'conversation-reset' as const };
+  await f.store.recordLifecycle(f.id, { lastResume });
+  assert.deepEqual(await f.store.lifecycle(f.id), { lastIdleStop, lastResume });
+  assert.deepEqual(await f.store.scopes(), [f.id]);
+  assert.equal((await f.store.findPrincipal('alice'))?.id, f.id);
+  assert.equal(await f.store.fixedStorage(f.id), '{"reservation":"unchanged"}');
+  assert.deepEqual(await f.store.preparation(f.id), { version: 'v1', ready: true });
+  assert.equal(await f.store.allocationComplete(f.id), true);
+  await f.store.forget(f.id);
+  assert.deepEqual(await f.store.lifecycle(f.id), {});
+});

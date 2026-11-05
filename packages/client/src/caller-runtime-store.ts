@@ -39,6 +39,19 @@ const ScopeRecord = LegacyScopeRecord.extend({
 }).strict();
 const JsonScopeRecord = ScopeRecord.extend({ version: z.literal(3) }).strict();
 
+const RuntimeLifecycle = z.object({
+  lastIdleStop: z.object({
+    at: z.string().datetime(),
+    reason: z.literal('idle-timeout'),
+    outcome: z.enum(['stopped', 'quarantined']),
+  }).strict().optional(),
+  lastResume: z.object({
+    at: z.string().datetime(),
+    outcome: z.enum(['conversation-reset', 'failed']),
+  }).strict().optional(),
+}).strict();
+export type CallerRuntimeLifecycle = z.infer<typeof RuntimeLifecycle>;
+
 /** Exclusive host ownership record; workload storage lives only in Docker volumes. */
 export class CallerRuntimeStore {
   directory: string;
@@ -310,6 +323,7 @@ export class CallerRuntimeStore {
     db.exec('CREATE TABLE IF NOT EXISTS fixed_storage (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL)');
     db.exec('CREATE TABLE IF NOT EXISTS preparations (id TEXT PRIMARY KEY NOT NULL, version TEXT NOT NULL, ready INTEGER NOT NULL CHECK (ready IN (0,1)))');
     db.exec('CREATE TABLE IF NOT EXISTS storage_helpers (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL)');
+    db.exec('CREATE TABLE IF NOT EXISTS runtime_lifecycle (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL)');
     if (migrating) await this.atomicWrite(manifestPath, expected);
     // Legacy JSON files remain as an inert migration backup, never read again.
   }
@@ -420,6 +434,16 @@ export class CallerRuntimeStore {
     const row = this.db().prepare('SELECT record FROM storage_helpers WHERE id = ?').get(id);
     return row ? z.object({ record: z.string() }).parse(row).record : undefined;
   }
+  async lifecycle(id: string): Promise<CallerRuntimeLifecycle> {
+    const row = this.db().prepare('SELECT record FROM runtime_lifecycle WHERE id = ?').get(id);
+    return row ? RuntimeLifecycle.parse(JSON.parse(z.object({ record: z.string() }).parse(row).record)) : {};
+  }
+  async recordLifecycle(id: string, update: CallerRuntimeLifecycle): Promise<void> {
+    this.validateRecord(this.db().prepare('SELECT * FROM scopes WHERE id = ?').get(id), id);
+    const record = RuntimeLifecycle.parse({ ...await this.lifecycle(id), ...update });
+    this.db().prepare('INSERT INTO runtime_lifecycle (id, record) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET record = excluded.record')
+      .run(id, JSON.stringify(record));
+  }
   async recordStorageHelper(id: string, record: string): Promise<void> {
     this.validateRecord(this.db().prepare('SELECT * FROM scopes WHERE id = ?').get(id), id);
     this.db().prepare('INSERT INTO storage_helpers (id, record) VALUES (?, ?)').run(id, record);
@@ -473,6 +497,7 @@ export class CallerRuntimeStore {
       db.prepare('DELETE FROM fixed_storage WHERE id = ?').run(id);
       db.prepare('DELETE FROM completed_allocations WHERE id = ?').run(id);
       db.prepare('DELETE FROM pending_reservations WHERE id = ?').run(id);
+      db.prepare('DELETE FROM runtime_lifecycle WHERE id = ?').run(id);
       db.prepare('DELETE FROM scopes WHERE id = ?').run(id);
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
