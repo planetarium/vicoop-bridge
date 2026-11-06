@@ -123,6 +123,8 @@ export interface CodexBackendOptions {
   // endpoint, not an A2A agent, there). Carries through `thread/resume`
   // because codex persists `developerInstructions` server-side per thread.
   identity?: AgentIdentity;
+  /** Bridge-owned runtime workspace contract, applied to plain A2A threads. */
+  runtimeInstructions?: string;
 }
 
 interface SessionEntry {
@@ -694,9 +696,7 @@ export function createCodexBackend(
   // Precomputed once at construction (identity is per-daemon, not per-task).
   // Prepended to `developerInstructions` on every `thread/start` so the model
   // recognises its own mention / acct in user messages. See PR #129.
-  const identityDevInstructions: string = opts.identity
-    ? buildSelfIdentitySystemPrompt(opts.identity)
-    : '';
+  const identityDevInstructions = [opts.identity ? buildSelfIdentitySystemPrompt(opts.identity) : '', opts.runtimeInstructions ?? ''].filter(Boolean).join('\n\n');
 
   // Supported-models cache, populated by `resolveCapabilities` at daemon
   // startup and read sync from `handle()` to gate `envelope.model`

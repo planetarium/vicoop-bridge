@@ -17,14 +17,14 @@ export type CallerFileDeliveryOptions = z.infer<typeof CallerFileDeliveryConfig>
 
 export const MAX_CALLER_FILE_PENDING_BYTES = 512 * 1024 * 1024;
 
-/** One complete unacknowledged attachment batch per live scope, plus normal frames.
+/** One complete unacknowledged attachment batch per concurrent execution, plus normal frames.
  * This is a lazy retention ceiling, not an allocation or a process RSS limit.
  */
 export function callerFilePendingBytes(config: z.input<typeof CallerFileDeliveryConfig> | undefined,
-  maxScopes = 8): number | undefined {
+  maxExecutions = 8): number | undefined {
   if (!config) return undefined;
   const files = CallerFileDeliveryConfig.parse(config);
-  const scopes = z.number().int().min(1).max(32).parse(maxScopes);
+  const scopes = z.number().int().min(1).max(32).parse(maxExecutions);
   const payload = Math.min(files.maxTotalBytes, files.maxBytes * files.maxFiles);
   // Each file may independently add two padding bytes before base64 encoding.
   const encoded = 4 * Math.floor((payload + 2 * files.maxFiles) / 3);
@@ -32,7 +32,7 @@ export function callerFilePendingBytes(config: z.input<typeof CallerFileDelivery
   const perScope = encoded + files.maxFiles * 64 * 1024 + 1024 * 1024;
   const budget = Math.max(4 * 1024 * 1024, scopes * perScope);
   if (budget > MAX_CALLER_FILE_PENDING_BYTES) {
-    throw new Error('fileDelivery replay retention exceeds 512 MiB; reduce maxScopes, maxTotalBytes, maxBytes, or maxFiles');
+    throw new Error('fileDelivery replay retention exceeds 512 MiB; reduce the execution limit (maxScopes or concurrency.global), maxTotalBytes, maxBytes, or maxFiles');
   }
   return budget;
 }

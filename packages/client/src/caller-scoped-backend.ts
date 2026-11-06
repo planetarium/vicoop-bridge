@@ -1,3 +1,4 @@
+import { CallerExecutionScheduler, CallerQueueFullError } from './caller-execution-scheduler.js';
 import { CallerStorageHelperUnconfirmedError } from './caller-storage.js';
 import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME, decodedBase64Size } from './backends/fetch-uri-file.js';
 import {
@@ -14,14 +15,15 @@ import type {
   DockerCallerRuntimePool,
   CallerContainer,
 } from './caller-runtime-docker.js';
-import { CallerEnvironmentPendingError, CallerReservationUnconfirmedError, CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageLimitError, CallerStorageMissingError } from './caller-runtime-docker.js';
-import { scopeDigest } from './caller-runtime-store.js';
+import { CallerScopeCleanupUnconfirmedError, CallerEnvironmentPendingError, CallerReservationUnconfirmedError, CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageLimitError, CallerStorageMissingError } from './caller-runtime-docker.js';
+import { scopeDigest, CallerContextCapacityError } from './caller-runtime-store.js';
 import { createHash } from 'node:crypto';
 export interface CallerWorker {
   backend: Backend;
   settle(): Promise<void>;
   close(): void;
   healthy(): boolean;
+  bindContainer?(container: CallerContainer): void;
 }
 interface Entry {
   users: number;
@@ -34,6 +36,8 @@ interface Entry {
   quarantined: boolean;
   idleTimer?: NodeJS.Timeout;
   idleGeneration: number;
+  contextWorkers: Map<string, CallerWorker>;
+  failedContexts: Set<string>;
 }
 export class CallerScopedBackend implements Backend {
   remoteApprovals?: boolean;
@@ -44,12 +48,16 @@ export class CallerScopedBackend implements Backend {
   private controllers = new Set<AbortController>();
   private pending = 0;
   private stopped = false;
+  private readonly scheduler?: CallerExecutionScheduler;
   constructor(
     private agentId: string,
     readonly pool: DockerCallerRuntimePool,
     private factory: (container: CallerContainer, signal: AbortSignal) => Promise<CallerWorker>,
   ) {
     this.name = pool.kind;
+    if (pool.options.concurrency) this.scheduler = new CallerExecutionScheduler({
+      ...pool.options.concurrency, queueLimit: pool.options.queueLimit,
+    });
   }
   async initialize(): Promise<void> {
     for (const id of await this.pool.initialize())
@@ -64,6 +72,8 @@ export class CallerScopedBackend implements Backend {
       recovered,
       quarantined: false,
       idleGeneration: 0,
+      contextWorkers: new Map(),
+      failedContexts: new Set(),
     };
   }
   private cancelIdle(entry: Entry): void {
@@ -73,6 +83,9 @@ export class CallerScopedBackend implements Backend {
   }
   private armIdle(id: string, entry: Entry): void {
     this.cancelIdle(entry);
+    // Context containers are removed before their execution leases are released.
+    // The legacy scope timer must never stop independent context executions.
+    if (this.scheduler) return;
     const timeout = this.pool.options.idleTimeoutMs;
     if (!timeout || this.stopped || entry.users || entry.quarantined || !entry.worker) return;
     const generation = entry.idleGeneration;
@@ -203,6 +216,7 @@ export class CallerScopedBackend implements Backend {
       this.fail(task, emit, 'runtime_stopped', 'Caller runtime stopped');
       return;
     }
+    if (this.scheduler) return this.executeConcurrent(id, task, emit, signal);
     const opts = this.pool.options;
     if (this.pending >= opts.maxScopes + opts.queueLimit) {
       this.fail(task, emit, 'runtime_capacity', 'Caller queue full');
@@ -477,6 +491,130 @@ export class CallerScopedBackend implements Backend {
       this.controllers.delete(controller);
     }
   }
+  private async executeConcurrent(id: string, task: TaskAssignFrame, emit: Emit, signal: AbortSignal): Promise<void> {
+    const opts = this.pool.options;
+    let entry = this.entries.get(id);
+    if (!entry) {
+      if (this.entries.size >= opts.maxScopes) {
+        this.fail(task, emit, 'runtime_capacity', 'Retained caller capacity reached');
+        return;
+      }
+      entry = this.entry();
+      this.entries.set(id, entry);
+    }
+    const context = createHash('sha256').update(JSON.stringify([id, task.contextId])).digest('hex');
+    if (entry.quarantined || entry.failedContexts.has(context)) {
+      this.fail(task, emit, 'runtime_quarantined', 'Caller context requires offline recovery');
+      return;
+    }
+    entry.users++;
+    const controller = new AbortController();
+    this.controllers.add(controller);
+    const abort = () => controller.abort();
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    let phase = 'queue';
+    let timedOut = false;
+    const timeout = () => { timedOut = true; abort(); };
+    let timer = setTimeout(timeout, opts.concurrency!.queueTimeoutMs);
+    let release: (() => void) | undefined;
+    let acquired = false;
+    let forwarding = true;
+    let worker: CallerWorker | undefined;
+    let terminal: UpFrame | undefined;
+    const heartbeat = setInterval(() => {
+      if (!controller.signal.aborted) emit({ type: 'task.status', taskId: task.taskId,
+        status: { state: 'working', timestamp: new Date().toISOString() },
+        metadata: { 'vicoop.runtime': { phase } } });
+    }, 5000);
+    try {
+      release = await this.scheduler!.acquire(id, context, controller.signal);
+      clearTimeout(timer);
+      timer = setTimeout(timeout, opts.taskTimeoutMs);
+      controller.signal.throwIfAborted();
+      if (entry.quarantined || entry.failedContexts.has(context)) throw new Error('context unavailable');
+      if (!entry.contexts.has(context) && entry.contexts.size >= opts.maxContexts) {
+        this.fail(task, emit, 'runtime_capacity', 'Caller conversation capacity reached');
+        return;
+      }
+      phase = 'allocation';
+      acquired = true; // Persisted context intent determines what cleanup may touch.
+      const container = await this.pool.acquireContext(id, context, controller.signal,
+        task.executionScope!.principalId, () => { entry.retained = true; });
+      controller.signal.throwIfAborted();
+      phase = 'backend-initialization';
+      worker = entry.contextWorkers.get(context);
+      if (!worker) {
+        worker = await this.factory(container, controller.signal);
+        entry.contextWorkers.set(context, worker);
+        emit({ type: 'task.status', taskId: task.taskId,
+          status: { state: 'working', timestamp: new Date().toISOString() },
+          metadata: { 'vicoop.runtime': { workspaceMode: 'context', workspaceRestored: container.recovered,
+            conversationReset: entry.recovered || entry.contexts.has(context), legacyWorkspace: '/caller-workspace' } } });
+      }
+      worker.bindContainer?.(container);
+      entry.contexts.add(context);
+      phase = 'execution';
+      const work = worker.backend.handle({ ...task, contextId: context }, frame => {
+        if (!forwarding || controller.signal.aborted) return;
+        if (frame.type === 'task.complete' || frame.type === 'task.fail') terminal = frame;
+        else emit(frame);
+      }, controller.signal);
+      void work.catch(() => {});
+      await abortable(work, controller.signal);
+      forwarding = false;
+      phase = 'cleanup';
+      await within(worker.settle(), 15000);
+      if (!worker.healthy()) throw new Error('execution cleanup uncertain');
+      await this.pool.stopContext(id, context);
+      acquired = false;
+      controller.signal.throwIfAborted();
+      if (!terminal) throw new Error('backend missing terminal');
+      emit(terminal);
+    } catch (error) {
+      forwarding = false;
+      console.error('Caller context runtime failure phase:', phase, error instanceof Error ? error.name : 'unknown');
+      // Only this context owns this worker/broker/container. A sibling's grant,
+      // approval handler and output snapshots are never closed here.
+      if (acquired || worker) {
+        worker ??= entry.contextWorkers.get(context);
+        worker?.backend.stop?.();
+        worker?.close();
+        try { await within(worker?.settle() ?? Promise.resolve(), 15000); } catch { /* Docker removal is authoritative. */ }
+        try { if (acquired) await this.pool.stopContext(id, context); }
+        catch { entry.failedContexts.add(context); }
+        entry.contextWorkers.delete(context);
+      }
+      if (error instanceof CallerStorageHelperUnconfirmedError || error instanceof CallerScopeCleanupUnconfirmedError) {
+        entry.quarantined = true;
+        entry.failedContexts.add(context); // Unconfirmed shared work continues to consume capacity.
+      }
+      if (error instanceof CallerStorageHelperUnconfirmedError || error instanceof CallerScopeCleanupUnconfirmedError ||
+          error instanceof CallerReservationUnconfirmedError || error instanceof CallerOrphanedResourcesError ||
+          error instanceof CallerAllocationIncompleteError || error instanceof CallerStorageMissingError)
+        entry.quarantined = true;
+      const quarantined = entry.quarantined || entry.failedContexts.has(context);
+      this.fail(task, emit,
+        quarantined ? 'runtime_quarantined' : (error instanceof CallerQueueFullError || error instanceof CallerContextCapacityError) ? 'runtime_capacity' :
+          error instanceof CallerEnvironmentPendingError ? 'runtime_setup_pending' :
+          timedOut ? (phase === 'queue' ? 'runtime_queue_timeout' : 'runtime_timeout') :
+          controller.signal.aborted ? 'runtime_canceled' : 'runtime_failed',
+        quarantined ? 'Runtime cleanup or storage is uncertain; offline recovery required' :
+          phase === 'queue' ? 'Caller request left the queue; running executions are unchanged' :
+            'Caller context execution ended; persistent context files, including partial writes, are retained');
+    } finally {
+      forwarding = false;
+      clearTimeout(timer);
+      clearInterval(heartbeat);
+      signal.removeEventListener('abort', abort);
+      this.controllers.delete(controller);
+      entry.users--;
+      if (!entry.retained && !entry.quarantined && entry.users === 0) this.entries.delete(id);
+      // A failed/unconfirmed container still consumes its slot until restart.
+      // This prevents capacity from being exceeded by potentially live work.
+      if (!entry.failedContexts.has(context)) release?.();
+    }
+  }
   stop() {
     this.stopped = true;
     for (const entry of this.entries.values()) this.cancelIdle(entry);
@@ -486,6 +624,10 @@ export class CallerScopedBackend implements Backend {
     this.stop();
     await Promise.allSettled([...this.active]);
     for (const entry of this.entries.values()) {
+      for (const worker of entry.contextWorkers.values()) {
+        worker.backend.stop?.();
+        worker.close();
+      }
       entry.worker?.backend.stop?.();
       entry.worker?.close();
     }

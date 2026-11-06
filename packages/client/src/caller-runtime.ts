@@ -5,6 +5,7 @@ import { CallerRuntimeConfig, assertCallerRuntimeBackend } from './caller-runtim
 import {
   DockerCallerRuntimePool,
   type CallerKind,
+  type CallerContainer,
 } from './caller-runtime-docker.js';
 import { CallerScopedBackend } from './caller-scoped-backend.js';
 import {
@@ -51,11 +52,17 @@ export async function createCallerRuntime(args: {
     pool,
     async (container, signal) => {
       signal.throwIfAborted();
+      let boundContainer = container;
+      const containerId = () => {
+        const id = boundContainer.dockerId;
+        if (!id || !/^[a-f0-9]{64}$/.test(id)) throw new Error('Missing immutable caller container identity');
+        return id;
+      };
       const version = await runDockerCommand([
         'exec',
         '--user',
         '1000:1000',
-        container.name,
+        containerId(),
         args.kind,
         '--version',
       ], { signal });
@@ -76,7 +83,7 @@ export async function createCallerRuntime(args: {
       let filesHealthy = true;
       const broker =
         args.kind === 'claude'
-          ? createClaudeBrokerSpawn(container.name, {
+          ? createClaudeBrokerSpawn(containerId, {
               credential: claudeCredential!,
               authentication: selected.kind,
               ttlMs: config.taskTimeoutMs,
@@ -89,7 +96,7 @@ export async function createCallerRuntime(args: {
                 },
               }} : {}),
             })
-          : createExecutionBrokerSpawn(container.name, {
+          : createExecutionBrokerSpawn(containerId, {
               backend: 'codex',
               ttlMs: config.taskTimeoutMs,
               codexCatalog,
@@ -112,6 +119,10 @@ export async function createCallerRuntime(args: {
         void closed.then(() => processes.delete(closed));
         return child;
       };
+      const workspaceInstructions = container.context
+        ? 'This conversation has its own persistent /workspace and backend session storage. Other conversations have separate writable workspaces. The caller’s previous shared workspace is available read-only at /caller-workspace; copy required files into /workspace before modifying them. Shared source assets under /shared are read-only. Write deliverables in /workspace/output.'
+        : undefined;
+      const appendPrompt = [config.systemPrompt, workspaceInstructions].filter(Boolean).join('\n\n');
       const worker =
         args.kind === 'claude'
           ? createClaudeBackend({
@@ -121,7 +132,7 @@ export async function createCallerRuntime(args: {
               spawn: spawn as ClaudeSpawnFn,
               fetchUriPolicy: { enabled: false },
               extraArgs: [
-                ...(config.systemPrompt === undefined ? [] : ['--append-system-prompt', config.systemPrompt]),
+                ...(appendPrompt ? ['--append-system-prompt', appendPrompt] : []),
                 '--strict-mcp-config',
                 '--mcp-config',
                 '{"mcpServers":{}}',
@@ -132,20 +143,28 @@ export async function createCallerRuntime(args: {
             })
           : createCodexExecutionBackend({
               ...args.codex,
+              runtimeInstructions: workspaceInstructions,
               cwd: '/workspace',
               sandboxMode: 'danger-full-access',
               spawn: spawn as AppServerSpawnFn,
-              mkdtemp: (_prefix, signal) => pool.inputDirectory(container.id, signal),
+              mkdtemp: (_prefix, signal) => pool.inputDirectory(container.id, signal, container.context, containerId()),
               writeFile: (path, data, signal) =>
-                pool.inputWrite(container.id, path, data, signal),
-              rm: (path) => pool.inputRemove(container.id, path),
+                pool.inputWrite(container.id, path, data, signal, container.context, containerId()),
+              rm: (path) => pool.inputRemove(container.id, path, container.context, containerId()),
             });
       return {
+        bindContainer(next: CallerContainer) {
+          if (next.id !== container.id || next.context !== container.context || processes.size || taskFiles)
+            throw new Error('Cannot rebind an active or unrelated caller worker');
+          if (!next.dockerId || !/^[a-f0-9]{64}$/.test(next.dockerId))
+            throw new Error('Missing immutable caller container identity');
+          boundContainer = next;
+        },
         backend: config.fileDelivery ? {
           ...worker,
           async handle(task, emit, signal) {
             if (taskFiles) throw new Error('Concurrent file delivery within one caller scope');
-            const files = createCallerFileDelivery(container.name, task.taskId, emit, signal,
+            const files = createCallerFileDelivery(containerId(), task.taskId, emit, signal,
               config.fileDelivery!, runDockerCommand, () => broker.close());
             taskFiles = files;
             try { await worker.handle(task, emit, signal); } finally {

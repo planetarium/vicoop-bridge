@@ -7,6 +7,9 @@ import { brokerFirewallScript } from './execution-runtime-boundary.js';
 import { PROVIDER_ENV_PATTERN } from './provider-environment.js';
 import { assertCallerRuntimeBackend, type CallerRuntimeOptions } from './caller-runtime-config.js';
 
+export class CallerScopeCleanupUnconfirmedError extends Error {
+  constructor(cause?: unknown) { super('shared caller allocation cleanup unconfirmed', { cause }); }
+}
 export class CallerEnvironmentPendingError extends Error {
   constructor() { super('caller environment setup is pending; ask the operator to complete container setup'); }
 }
@@ -40,6 +43,7 @@ export interface CallerContainer {
   restarted?: boolean;
   recreated?: boolean;
   dockerId?: string;
+  context?: string;
 }
 
 // This pool owns containers, not executions. Callers hold a per-scope lease
@@ -52,6 +56,9 @@ export class DockerCallerRuntimePool {
   private locked = false;
   private offline = false;
   private validateExecution = true;
+  private readonly allocationTails = new Map<string, Promise<void>>();
+  private readonly preparedScopes = new Set<string>();
+  private readonly quarantinedScopes = new Set<string>();
   constructor(
     readonly kind: CallerKind,
     readonly options: CallerRuntimeOptions,
@@ -73,20 +80,22 @@ export class DockerCallerRuntimePool {
       );
     return result.stdout;
   }
-  name(id: string): string {
+  name(id: string, context?: string): string {
     if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('invalid scope ID');
-    return `vb-caller-${this.store.namespace.slice(0, 16)}-${id}`;
+    if (context !== undefined && !/^[a-f0-9]{64}$/.test(context)) throw new Error('invalid context key');
+    return `vb-caller-${this.store.namespace.slice(0, 16)}-${id}${context ? `-ctx-${context}` : ''}`;
   }
-  private labels(id: string): Record<string, string> {
+  private labels(id: string, context?: string): Record<string, string> {
     return {
       'vicoop.component': 'caller-runtime',
       'vicoop.caller-namespace': this.store.namespace,
       'vicoop.scope': id,
       'vicoop.kind': this.kind,
+      ...(context ? { 'vicoop.context': context } : {}),
     };
   }
-  private labelArgs(id: string): string[] {
-    return Object.entries(this.labels(id)).flatMap(([k, v]) => [
+  private labelArgs(id: string, context?: string): string[] {
+    return Object.entries(this.labels(id, context)).flatMap(([k, v]) => [
       '--label',
       `${k}=${v}`,
     ]);
@@ -137,6 +146,14 @@ export class DockerCallerRuntimePool {
         `label=vicoop.caller-namespace=${this.store.namespace}`,
       ]);
       const known = new Set(ids.map((id) => this.name(id)));
+      for (const id of ids) {
+        const contexts = await this.store.contexts(id);
+        if (reconcile && contexts.length && !this.options.concurrency)
+          throw new Error('Retained context workspaces require concurrency configuration; set perCaller: 1 to serialize without changing storage layout');
+        if (reconcile && contexts.length > this.options.maxContexts)
+          throw new Error('retained caller contexts exceed maxContexts');
+        for (const context of contexts) known.add(this.name(id, context));
+      }
       if (
         resources
           .trim()
@@ -150,6 +167,7 @@ export class DockerCallerRuntimePool {
       // Only a dead previous owner may be reconciled (store.lock enforces this).
       // Validate before stopping. Never delete or adopt mismatched resources.
       for (const id of ids) {
+        for (const context of await this.store.contexts(id)) await this.stopContext(id, context);
         await this.store.reserve(id, this.kind);
         if (await this.store.reservationPending(id) &&
             (reconcile || (this.options.fixedImageStorage && !(await this.store.fixedStorage(id))))) {
@@ -192,7 +210,7 @@ export class DockerCallerRuntimePool {
     if (/No such (object|container)/i.test(result.stderr)) return undefined;
     throw new Error('cannot inspect caller container');
   }
-  private async validate(c: any, id: string, signal?: AbortSignal): Promise<void> {
+  private async validate(c: any, id: string, signal?: AbortSignal, context?: string): Promise<void> {
     const fail = () => {
       throw new Error(
         'caller container ownership or isolation boundary mismatch',
@@ -201,7 +219,7 @@ export class DockerCallerRuntimePool {
     const h = c.HostConfig,
       config = c.Config;
     if (
-      Object.entries(this.labels(id)).some(
+      Object.entries(this.labels(id, context)).some(
         ([k, v]) => config?.Labels?.[k] !== v,
       ) ||
       (c.Image !== this.options.image.replace(/^.*@/, '') &&
@@ -213,9 +231,9 @@ export class DockerCallerRuntimePool {
       !h?.ReadonlyRootfs ||
       h.Privileged ||
       (this.validateExecution && (
-        h.NetworkMode !== `${this.name(id)}-net` ||
+        h.NetworkMode !== `${this.name(id, context)}-net` ||
         Object.keys(c.NetworkSettings?.Networks ?? {}).length !== 1 ||
-        !Object.hasOwn(c.NetworkSettings?.Networks ?? {}, `${this.name(id)}-net`))) ||
+        !Object.hasOwn(c.NetworkSettings?.Networks ?? {}, `${this.name(id, context)}-net`))) ||
       h.PidMode ||
       h.UsernsMode ||
       !['', 'private', undefined].includes(h.IpcMode) ||
@@ -250,10 +268,15 @@ export class DockerCallerRuntimePool {
     const shared = new Map(this.options.sharedVolumes.map(entry => [`/shared/${entry.name}`, entry.volume]));
     const binds = new Map(this.options.sharedBinds.map(entry => [`/shared/${entry.name}`, entry.source]));
     const declared = h.Mounts ?? [];
+    if (context) {
+      const legacy = declared.find((m: any) => m.Target === '/caller-workspace');
+      if (!legacy || legacy.Type !== 'volume' || legacy.Source !== `${this.name(id)}-storage` ||
+          legacy.ReadOnly !== true || legacy.VolumeOptions?.NoCopy !== true || legacy.VolumeOptions?.Subpath !== 'workspace') fail();
+    }
     // Legacy private volumes can use Binds; shared host paths must always use
     // structured --mount declarations so non-recursion is inspectable.
     if (binds.size) {
-      if (declared.length !== 2 + shared.size + binds.size || h.Binds?.length) fail();
+      if (declared.length !== 2 + shared.size + binds.size + (context ? 1 : 0) || h.Binds?.length) fail();
       if (new Set(declared.map((m: any) => m.Target)).size !== declared.length) fail();
     }
     for (const [target, source] of binds) {
@@ -271,14 +294,20 @@ export class DockerCallerRuntimePool {
           mount.VolumeOptions?.Subpath) fail();
     }
     if (this.options.fixedImageStorage) {
-      if (declared.length !== 2 + shared.size + binds.size) fail();
+      if (declared.length !== 2 + shared.size + binds.size + (context ? 1 : 0)) fail();
       for (const [target, subpath] of [['/workspace', 'workspace'], [`/data/sessions/${this.kind}`, 'sessions']]) {
         const mount = declared.find((m: any) => m.Target === target);
         if (!mount || mount.Type !== 'volume' || mount.Source !== `${this.name(id)}-storage` ||
-            mount.ReadOnly || mount.VolumeOptions?.NoCopy !== true || mount.VolumeOptions?.Subpath !== subpath) fail();
+            mount.ReadOnly || mount.VolumeOptions?.NoCopy !== true || mount.VolumeOptions?.Subpath !== (context ? `contexts/${context}/${subpath}` : subpath)) fail();
       }
     }
+    let legacyMounts = 0;
     for (const m of c.Mounts ?? []) {
+      if (context && m.Destination === '/caller-workspace') {
+        if (m.Type !== 'volume' || m.Name !== `${this.name(id)}-storage` || m.RW !== false) fail();
+        legacyMounts++;
+        continue;
+      }
       if (m.Type === 'tmpfs' && ['/tmp', '/home/node'].includes(m.Destination))
         continue;
       if (binds.has(m.Destination)) {
@@ -297,7 +326,7 @@ export class DockerCallerRuntimePool {
       mounts.delete(m.Destination);
     }
     if (
-      mounts.size || shared.size || binds.size ||
+      legacyMounts !== (context ? 1 : 0) || mounts.size || shared.size || binds.size ||
       Object.keys(h.Tmpfs ?? {}).length !== Object.keys(CALLER_TMPFS).length ||
       Object.entries(CALLER_TMPFS).some(([path, options]) =>
         typeof h.Tmpfs?.[path] !== 'string' ||
@@ -311,11 +340,11 @@ export class DockerCallerRuntimePool {
       )
     )
       fail();
-    if (this.validateExecution && !(await this.networkExists(id, c, signal)))
+    if (this.validateExecution && !(await this.networkExists(id, c, signal, context)))
       throw new Error('caller network missing');
   }
-  private async networkExists(id: string, container?: any, signal?: AbortSignal): Promise<boolean> {
-    const name = `${this.name(id)}-net`;
+  private async networkExists(id: string, container?: any, signal?: AbortSignal, context?: string): Promise<boolean> {
+    const name = `${this.name(id, context)}-net`;
     signal?.throwIfAborted();
     const found = await this.run(['network', 'inspect', name], { signal });
     signal?.throwIfAborted();
@@ -333,9 +362,9 @@ export class DockerCallerRuntimePool {
         Object.entries(network.Options ?? {}).some(([key, value]) =>
           !((key === 'com.docker.network.enable_ipv4' && value === 'true') ||
             (key === 'com.docker.network.enable_ipv6' && value === 'false'))))) ||
-      Object.entries(this.labels(id)).some(([k, v]) => network.Labels?.[k] !== v) ||
+      Object.entries(this.labels(id, context)).some(([k, v]) => network.Labels?.[k] !== v) ||
       Object.entries(network.Containers ?? {}).some(([key, value]: [string, any]) =>
-        !container || key !== container.Id || value.Name !== this.name(id),
+        !container || key !== container.Id || value.Name !== this.name(id, context),
       ) ||
       (container && ((this.validateExecution && !endpoint) ||
         (endpoint?.NetworkID && endpoint.NetworkID !== network.Id) ||
@@ -413,6 +442,7 @@ export class DockerCallerRuntimePool {
     const info = await this.inspect(name);
     if (info) await this.validate(info, id);
     return {
+      contexts: await this.store.contexts(id),
       container: name,
       state: info ? (info.State.Running ? 'running' : 'stopped') : 'absent',
       lifecycle: await this.store.lifecycle(id),
@@ -524,61 +554,7 @@ export class DockerCallerRuntimePool {
           `${name}-net`,
         ]);
       }
-      await command([
-        'create',
-        '--name',
-        name,
-        ...this.labelArgs(id),
-        '--network',
-        `${name}-net`,
-        '--restart',
-        'no',
-        '--read-only',
-        '--user',
-        '1000:1000',
-        '--security-opt',
-        'no-new-privileges',
-        '--cap-add',
-        'NET_ADMIN',
-        '--memory',
-        String(this.options.memoryMiB * 1048576),
-        '--memory-swap',
-        String(this.options.memoryMiB * 1048576),
-        '--cpus',
-        String(this.options.cpus),
-        '--pids-limit',
-        String(this.options.pids),
-        '--log-driver',
-        'none',
-        '--mount',
-        this.options.fixedImageStorage ? `type=volume,source=${name}-storage,target=/workspace,volume-subpath=workspace,volume-nocopy` : `type=volume,source=${name}-workspace,target=/workspace`,
-        '--mount',
-        this.options.fixedImageStorage ? `type=volume,source=${name}-storage,target=/data/sessions/${this.kind},volume-subpath=sessions,volume-nocopy` : `type=volume,source=${name}-sessions,target=/data/sessions/${this.kind}`,
-        ...this.options.sharedVolumes.flatMap(({ name: sharedName, volume }) => [
-          '--mount', `type=volume,source=${volume},target=/shared/${sharedName},readonly,volume-nocopy`,
-        ]),
-        ...this.options.sharedBinds.flatMap(({ name: sharedName, source }) => [
-          '--mount', `type=bind,source=${source},target=/shared/${sharedName},readonly,bind-recursive=disabled,bind-propagation=rprivate`,
-        ]),
-        '--tmpfs',
-        `/tmp:${CALLER_TMPFS['/tmp']}`,
-        '--tmpfs',
-        `/home/node:${CALLER_TMPFS['/home/node']}`,
-        '--env',
-        `${this.kind === 'claude' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME'}=/data/sessions/${this.kind}/config`,
-        '--env',
-        'HOME=/home/node',
-        '--env',
-        'DISABLE_AUTOUPDATER=1',
-        '--workdir',
-        '/workspace',
-        '--entrypoint',
-        '/usr/bin/tini',
-        this.options.image,
-        '--',
-        '/bin/sleep',
-        'infinity',
-      ]);
+      await command(this.createArgs(id));
       info = await this.inspect(name, signal);
     }
     signal?.throwIfAborted();
@@ -604,6 +580,155 @@ export class DockerCallerRuntimePool {
     const container = { id, name, recovered, restarted, recreated, dockerId: info.Id };
     this.containers.set(id, container);
     return container;
+  }
+  private createArgs(id: string, context?: string): string[] {
+    const name = this.name(id, context);
+    return [
+      'create',
+      '--name',
+      name,
+      ...this.labelArgs(id, context),
+      '--network',
+      `${name}-net`,
+      '--restart',
+      'no',
+      '--read-only',
+      '--user',
+      '1000:1000',
+      '--security-opt',
+      'no-new-privileges',
+      '--cap-add',
+      'NET_ADMIN',
+      '--memory',
+      String(this.options.memoryMiB * 1048576),
+      '--memory-swap',
+      String(this.options.memoryMiB * 1048576),
+      '--cpus',
+      String(this.options.cpus),
+      '--pids-limit',
+      String(this.options.pids),
+      '--log-driver',
+      'none',
+      '--mount',
+      this.options.fixedImageStorage ? `type=volume,source=${this.name(id)}-storage,target=/workspace,volume-subpath=${context ? `contexts/${context}/workspace` : 'workspace'},volume-nocopy` : `type=volume,source=${name}-workspace,target=/workspace`,
+      '--mount',
+      this.options.fixedImageStorage ? `type=volume,source=${this.name(id)}-storage,target=/data/sessions/${this.kind},volume-subpath=${context ? `contexts/${context}/sessions` : 'sessions'},volume-nocopy` : `type=volume,source=${name}-sessions,target=/data/sessions/${this.kind}`,
+      ...(context ? ['--mount', `type=volume,source=${this.name(id)}-storage,target=/caller-workspace,readonly,volume-subpath=workspace,volume-nocopy`] : []),
+      ...this.options.sharedVolumes.flatMap(({ name: sharedName, volume }) => [
+        '--mount', `type=volume,source=${volume},target=/shared/${sharedName},readonly,volume-nocopy`,
+      ]),
+      ...this.options.sharedBinds.flatMap(({ name: sharedName, source }) => [
+        '--mount', `type=bind,source=${source},target=/shared/${sharedName},readonly,bind-recursive=disabled,bind-propagation=rprivate`,
+      ]),
+      '--tmpfs',
+      `/tmp:${CALLER_TMPFS['/tmp']}`,
+      '--tmpfs',
+      `/home/node:${CALLER_TMPFS['/home/node']}`,
+      '--env',
+      `${this.kind === 'claude' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME'}=/data/sessions/${this.kind}/config`,
+      '--env',
+      'HOME=/home/node',
+      '--env',
+      'DISABLE_AUTOUPDATER=1',
+      '--workdir',
+      '/workspace',
+      '--entrypoint',
+      '/usr/bin/tini',
+      this.options.image,
+      '--',
+      '/bin/sleep',
+      'infinity',
+    ];
+  }
+
+  /** Scope allocation is serialized, but independent context execution is not. */
+  async acquireContext(id: string, context: string, signal: AbortSignal, principalId: string,
+    onReserved: () => void): Promise<CallerContainer> {
+    const previous = this.allocationTails.get(id) ?? Promise.resolve();
+    let release!: () => void;
+    const lease = new Promise<void>(resolve => { release = resolve; });
+    const tail = previous.then(() => lease);
+    this.allocationTails.set(id, tail);
+    await previous;
+    let recovered = false;
+    try {
+      signal.throwIfAborted();
+      if (this.quarantinedScopes.has(id)) throw new CallerScopeCleanupUnconfirmedError();
+      if (!this.options.concurrency || !this.options.fixedImageStorage) throw new Error('context runtime is disabled');
+      if (!this.preparedScopes.has(id)) {
+        let mutated = false;
+        try {
+          await this.acquire(id, signal, principalId, onReserved, () => { mutated = true; });
+          await this.stop(id);
+          this.preparedScopes.add(id);
+        } catch (error) {
+          // Do not stop unrecorded resources or a read-only rejected acquisition.
+          // Once a mutation starts, Docker cleanup is mandatory even on abort.
+          try { if (mutated) await this.stop(id); }
+          catch (cause) { this.quarantinedScopes.add(id); throw new CallerScopeCleanupUnconfirmedError(cause); }
+          if (error instanceof CallerOrphanedResourcesError || error instanceof CallerReservationUnconfirmedError ||
+              error instanceof CallerAllocationIncompleteError || error instanceof CallerStorageMissingError)
+            this.quarantinedScopes.add(id);
+          throw error;
+        }
+      } else onReserved();
+      if ((await this.store.preparation(id))?.ready === false) throw new CallerEnvironmentPendingError();
+      await this.validateSharedVolumes(signal);
+      await this.validateSharedBinds(signal);
+      if (!(await this.volumeExists(id, 'storage', signal))) throw new CallerStorageMissingError();
+      const contexts = await this.store.contexts(id);
+      if (!contexts.includes(context)) {
+        if (await this.inspect(this.name(id, context), signal) || await this.networkExists(id, undefined, signal, context))
+          throw new CallerOrphanedResourcesError();
+        await this.store.reserveContext(id, context, this.options.maxContexts);
+      }
+      recovered = await this.store.contextReady(id, context);
+      try {
+        await this.storage.prepareContext(id, context, `${this.name(id)}-storage`, recovered, signal);
+        await this.store.markContextReady(id, context);
+      } catch (error) {
+        if (error instanceof CallerStorageHelperUnconfirmedError) this.quarantinedScopes.add(id);
+        throw error;
+      }
+    } finally {
+      release();
+      if (this.allocationTails.get(id) === tail) this.allocationTails.delete(id);
+    }
+    signal.throwIfAborted();
+    const name = this.name(id, context);
+    let info = await this.inspect(name, signal);
+    if (!info) {
+      if (!(await this.networkExists(id, undefined, signal, context)))
+        await this.command(['network', 'create', ...this.labelArgs(id, context), `${name}-net`], signal);
+      await this.command(this.createArgs(id, context), signal);
+      info = await this.inspect(name, signal);
+    }
+    await this.validate(info, id, signal, context);
+    // Start by immutable ID so a delayed Docker start cannot target a later execution.
+    if (!info.State.Running) await this.command(['start', info.Id], signal);
+    info = await this.inspect(name, signal);
+    await this.validate(info, id, signal, context);
+    await this.command(['exec', '--user', '0', name, '/bin/sh', '-c', brokerFirewallScript()], signal);
+    return { id, context, name, dockerId: info.Id, recovered };
+  }
+
+  /** Called only after this context's backend/helper work has settled. */
+  async stopContext(id: string, context: string, removeOffline = false): Promise<void> {
+    if (!(await this.store.contexts(id)).includes(context)) return;
+    const name = this.name(id, context);
+    const info = await this.inspect(name);
+    if (info) {
+      await this.validate(info, id, undefined, context);
+      if (this.offline && info.State.Running) throw new Error('stop the daemon and managed containers before offline administration');
+      if (this.offline && !removeOffline) return;
+      // Remove the immutable container, not just its processes. No stale start
+      // can revive it after the execution slot has been released.
+      await this.command(['rm', '-f', info.Id]);
+      if (await this.inspect(info.Id)) throw new Error('context container removal unconfirmed');
+    }
+    if (this.offline && !removeOffline) return;
+    if (await this.networkExists(id, undefined, undefined, context))
+      await this.command(['network', 'rm', `${name}-net`]);
   }
   async checkStorage(id: string, signal?: AbortSignal): Promise<void> {
     // ext4 enforces both block and inode exhaustion synchronously. A full
@@ -664,6 +789,7 @@ export class DockerCallerRuntimePool {
     await Promise.all(
       (await this.store.scopes()).map(async (id) => {
         try {
+          for (const context of await this.store.contexts(id)) await this.stopContext(id, context);
           await this.stop(id);
         } catch (e) {
           errors.push(e);
@@ -683,6 +809,7 @@ export class DockerCallerRuntimePool {
   // Offline administration must hold the same owner lock as the daemon.
   async remove(id: string, deleteData: boolean): Promise<void> {
     if (!this.locked) throw new Error('caller pool is not initialized');
+    for (const context of await this.store.contexts(id)) await this.stopContext(id, context, true);
     await this.stop(id);
     const name = this.name(id);
     // A process can die between scope reservation and image identity creation.
@@ -732,13 +859,18 @@ export class DockerCallerRuntimePool {
     }
   }
 
-  async inputDirectory(id: string, signal?: AbortSignal): Promise<string> {
+  private inputTarget(id: string, context?: string, dockerId?: string): string {
+    if (dockerId === undefined) return this.name(id, context);
+    if (!/^[a-f0-9]{64}$/.test(dockerId)) throw new Error('invalid caller container identity');
+    return dockerId;
+  }
+  async inputDirectory(id: string, signal?: AbortSignal, context?: string, dockerId?: string): Promise<string> {
     const path = `/tmp/vicoop-input-${randomUUID()}`;
     await this.command([
       'exec',
       '--user',
       '1000:1000',
-      this.name(id),
+      this.inputTarget(id, context, dockerId),
       '/bin/mkdir',
       '-m',
       '700',
@@ -746,7 +878,7 @@ export class DockerCallerRuntimePool {
     ], signal);
     return path;
   }
-  async inputWrite(id: string, path: string, data: Buffer, signal?: AbortSignal): Promise<void> {
+  async inputWrite(id: string, path: string, data: Buffer, signal?: AbortSignal, context?: string, dockerId?: string): Promise<void> {
     if (
       !/^\/tmp\/vicoop-input-[a-f0-9-]+\/image-\d+\.[a-z]+$/.test(path) ||
       data.length > 20 * 1048576
@@ -754,7 +886,7 @@ export class DockerCallerRuntimePool {
       throw new Error('invalid caller input');
     signal?.throwIfAborted();
     const result = await this.run([
-      'exec', '-i', '--user', '1000:1000', this.name(id), '/usr/local/bin/node', '-e',
+      'exec', '-i', '--user', '1000:1000', this.inputTarget(id, context, dockerId), '/usr/local/bin/node', '-e',
       'const fs=require("fs");const s=fs.createWriteStream(process.argv[1],{flags:"wx",mode:384});s.on("error",()=>process.exit(1));process.stdin.pipe(s);',
       path,
     ], { input: data, signal, timeoutMs: 30000 });
@@ -762,14 +894,14 @@ export class DockerCallerRuntimePool {
     if (result.exitCode !== 0) throw new Error('input transfer failed');
   }
 
-  async inputRemove(id: string, path: string): Promise<void> {
+  async inputRemove(id: string, path: string, context?: string, dockerId?: string): Promise<void> {
     if (!/^\/tmp\/vicoop-input-[a-f0-9-]+$/.test(path))
       throw new Error('invalid caller input directory');
     await this.command([
       'exec',
       '--user',
       '1000:1000',
-      this.name(id),
+      this.inputTarget(id, context, dockerId),
       '/bin/rm',
       '-rf',
       '--',

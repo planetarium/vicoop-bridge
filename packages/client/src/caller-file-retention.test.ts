@@ -27,7 +27,7 @@ test('retention uses effective aggregate, independently padded files, and scope 
   const runtime = { image: `sha256:${'a'.repeat(64)}`, stateDirectory: '/tmp/file-retention' };
   assert.ok(CallerRuntimeConfig.parse({ ...runtime, maxScopes: 32 }));
   assert.ok(CallerRuntimeConfig.parse({ ...runtime, fileDelivery: roots }));
-  assert.throws(() => CallerRuntimeConfig.parse({ ...runtime, maxScopes: 32, fileDelivery: roots }), /reduce maxScopes/);
+  assert.throws(() => CallerRuntimeConfig.parse({ ...runtime, maxScopes: 32, fileDelivery: roots }), /reduce .*maxScopes/);
   assert.throws(() => CallerRuntimeConfig.parse({ ...runtime, maxScopes: 8,
     fileDelivery: { ...roots, maxTotalBytes: 48 * MiB, maxFiles: 16 } }), /512 MiB/);
 });

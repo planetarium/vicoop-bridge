@@ -20,6 +20,10 @@ import {
   type CallerDatabase,
 } from './caller-runtime-sqlite.js';
 
+export class CallerContextCapacityError extends Error {
+  constructor() { super('Retained caller context capacity reached'); }
+}
+
 export const scopeDigest = (agentId: string, principalId: string): string =>
   createHash('sha256')
     .update(executionScopePreimage(agentId, principalId))
@@ -200,7 +204,7 @@ export class CallerRuntimeStore {
     const databasePath = join(this.directory, 'state.sqlite');
     const Manifest = z
       .object({
-        version: z.union([z.literal(2), z.literal(3), z.literal(4), z.literal(5), z.literal(6), z.literal(7)]),
+        version: z.union([z.literal(2), z.literal(3), z.literal(4), z.literal(5), z.literal(6), z.literal(7), z.literal(8)]),
         agentId: z.literal(this.agentId),
         host: z.literal(hostname()),
         migration: z.literal('json').optional(),
@@ -324,6 +328,11 @@ export class CallerRuntimeStore {
     db.exec('CREATE TABLE IF NOT EXISTS preparations (id TEXT PRIMARY KEY NOT NULL, version TEXT NOT NULL, ready INTEGER NOT NULL CHECK (ready IN (0,1)))');
     db.exec('CREATE TABLE IF NOT EXISTS storage_helpers (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL)');
     db.exec('CREATE TABLE IF NOT EXISTS runtime_lifecycle (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL)');
+    db.exec('CREATE TABLE IF NOT EXISTS caller_contexts (scope TEXT NOT NULL, context TEXT NOT NULL, ready INTEGER NOT NULL DEFAULT 0 CHECK (ready IN (0,1)), PRIMARY KEY (scope, context))');
+    for (const row of db.prepare('SELECT scope, context FROM caller_contexts').all()) {
+      const value = z.object({ scope: z.string().regex(/^[a-f0-9]{64}$/), context: z.string().regex(/^[a-f0-9]{64}$/) }).parse(row);
+      this.validateRecord(db.prepare('SELECT * FROM scopes WHERE id = ?').get(value.scope), value.scope);
+    }
     if (migrating) await this.atomicWrite(manifestPath, expected);
     // Legacy JSON files remain as an inert migration backup, never read again.
   }
@@ -430,6 +439,27 @@ export class CallerRuntimeStore {
     await this.advanceManifest(5);
     this.db().prepare('INSERT INTO fixed_storage (id, record) VALUES (?, ?)').run(id, record);
   }
+  async contexts(id: string): Promise<string[]> {
+    return this.db().prepare('SELECT context FROM caller_contexts WHERE scope = ? ORDER BY context').all(id)
+      .map(row => z.object({ context: z.string().regex(/^[a-f0-9]{64}$/) }).parse(row).context);
+  }
+  async contextReady(id: string, context: string): Promise<boolean> {
+    const row = this.db().prepare('SELECT ready FROM caller_contexts WHERE scope = ? AND context = ?').get(id, context);
+    return row ? z.object({ ready: z.union([z.literal(0), z.literal(1)]) }).parse(row).ready === 1 : false;
+  }
+  async markContextReady(id: string, context: string): Promise<void> {
+    this.db().prepare('UPDATE caller_contexts SET ready = 1 WHERE scope = ? AND context = ?').run(id, context);
+  }
+  async reserveContext(id: string, context: string, limit: number): Promise<void> {
+    this.validateRecord(this.db().prepare('SELECT * FROM scopes WHERE id = ?').get(id), id);
+    z.string().regex(/^[a-f0-9]{64}$/).parse(context);
+    // Old clients cannot safely administer these additional containers/mounts.
+    await this.advanceManifest(8);
+    const contexts = this.db().prepare('SELECT context FROM caller_contexts WHERE scope = ?').all(id) as { context: string }[];
+    if (contexts.some(row => row.context === context)) return;
+    if (contexts.length >= limit) throw new CallerContextCapacityError();
+    this.db().prepare('INSERT INTO caller_contexts (scope, context) VALUES (?, ?)').run(id, context);
+  }
   async storageHelper(id: string): Promise<string | undefined> {
     const row = this.db().prepare('SELECT record FROM storage_helpers WHERE id = ?').get(id);
     return row ? z.object({ record: z.string() }).parse(row).record : undefined;
@@ -494,6 +524,7 @@ export class CallerRuntimeStore {
     db.exec('BEGIN IMMEDIATE');
     try {
       if (!preservePreparation) db.prepare('DELETE FROM preparations WHERE id = ?').run(id);
+      db.prepare('DELETE FROM caller_contexts WHERE scope = ?').run(id);
       db.prepare('DELETE FROM fixed_storage WHERE id = ?').run(id);
       db.prepare('DELETE FROM completed_allocations WHERE id = ?').run(id);
       db.prepare('DELETE FROM pending_reservations WHERE id = ?').run(id);

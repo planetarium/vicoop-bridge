@@ -33,6 +33,12 @@ export const CallerRuntimeConfig = z
       .refine(entries => new Set(entries.map(entry => entry.name)).size === entries.length, 'shared volume names must be unique')
       .refine(entries => new Set(entries.map(entry => entry.volume)).size === entries.length, 'shared volumes must be unique'),
     fileDelivery: CallerFileDeliveryConfig.optional(),
+    concurrency: z.object({
+      perCaller: z.number().int().min(1).max(8).default(2),
+      global: z.number().int().min(1).max(32).default(8),
+      queuePerCaller: z.number().int().min(0).max(128).default(16),
+      queueTimeoutMs: z.number().int().min(1000).max(3600000).default(600000),
+    }).strict().optional(),
     maxScopes: z.number().int().min(1).max(32).default(8),
     queueLimit: z.number().int().min(0).max(128).default(16),
     maxContexts: z.number().int().min(1).max(4096).default(256),
@@ -55,7 +61,10 @@ export const CallerRuntimeConfig = z
   })
   .strict()
   .superRefine((config, context) => {
-    try { callerFilePendingBytes(config.fileDelivery, config.maxScopes); }
+    if (config.concurrency && !config.fixedImageStorage)
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['concurrency'],
+        message: 'concurrency requires fixedImageStorage for a shared enforced caller storage budget' });
+    try { callerFilePendingBytes(config.fileDelivery, config.concurrency?.global ?? config.maxScopes); }
     catch (error) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ['fileDelivery'],
         message: error instanceof Error ? error.message : String(error) });
