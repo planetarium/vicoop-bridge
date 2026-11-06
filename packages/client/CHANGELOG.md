@@ -1,5 +1,12 @@
 # @vicoop-bridge/client
 
+## 0.46.0
+
+### Minor Changes
+
+- 3fd47a7: Add opt-in bounded same-caller concurrency for Claude and Codex containers, with context-private persistent workspaces, fair execution admission, isolated cancellation and file routing, and explicit queue timeouts. Existing serial mode remains the default; parallel mode requires fixed storage and records a new manifest version for safe recovery. Execution transports and cleanup are pinned to immutable container IDs so delayed callbacks cannot stop a replacement execution.
+- f8fdccd: Add opt-in caller_runtime.idleTimeoutMs to stop idle caller containers and release workers after execution cleanup, then restart on demand with retained files and an explicit conversation reset. Preserve retained-scope and storage capacity accounting, quarantine unconfirmed cleanup, and expose idle-stop/recovery outcomes in lifecycle logs and runtime inspection.
+
 ## 0.45.0
 
 ### Minor Changes
