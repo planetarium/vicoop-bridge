@@ -102,6 +102,35 @@ export class CallerStorage {
       throw new CallerStorageHelperUnconfirmedError(error);
     }
   }
+  /** Create only bridge-owned context roots in the already attached scope filesystem.
+   * Serialized with scope allocation; the helper's persisted intent also covers crash recovery.
+   * The legacy workspace is never modified or copied.
+   */
+  async prepareContext(id: string, context: string, volume: string, retained: boolean, signal?: AbortSignal) {
+    if (!/^[a-f0-9]{64}$/.test(context)) throw new Error('invalid context key');
+    await this.record(id);
+    if (this.active.has(id) || await this.store.storageHelper(id)) throw new CallerStorageHelperUnconfirmedError();
+    const name = `vb-storage-${randomUUID()}`;
+    this.active.add(id);
+    try {
+      await this.store.recordStorageHelper(id, JSON.stringify({ name, image: this.options.image }));
+      try {
+        const created = await this.run(['create', '--name', name,
+          ...Object.entries(this.labels(id, name)).flatMap(([key, value]) => ['--label', `${key}=${value}`]),
+          '--network', 'none', '--read-only', '--user', '0', '--log-driver', 'none',
+          '--security-opt', 'no-new-privileges', '--memory', '134217728', '--pids-limit', '64',
+          '--mount', `type=volume,source=${volume},target=/storage,volume-nocopy`,
+          '--env', 'NODE_OPTIONS=', '--env', 'NODE_PATH=', '--env', 'LD_PRELOAD=', '--env', 'LD_LIBRARY_PATH=',
+          '--entrypoint', '/usr/local/bin/node', this.options.image, '-e', PREPARE_CONTEXT, context, retained ? 'retained' : 'new'],
+        { signal, timeoutMs: 30000 });
+        if (created.exitCode !== 0 || !/^[a-f0-9]{64}$/.test(created.stdout.trim()))
+          throw new Error('cannot create context storage helper');
+        const result = await this.run(['start', '--attach', created.stdout.trim()], { signal, timeoutMs: 30000 });
+        if (result.exitCode !== 0) throw new Error('cannot prepare context storage');
+        signal?.throwIfAborted();
+      } finally { await this.cleanup(id); }
+    } finally { this.active.delete(id); }
+  }
   async manage(action: 'create' | 'probe' | 'attach' | 'check' | 'delete', id: string, signal?: AbortSignal) {
     const policy = this.options.fixedImageStorage!;
     const record = await this.record(id);
@@ -137,3 +166,28 @@ export class CallerStorage {
     } finally { this.active.delete(id); }
   }
 }
+
+// The filesystem root and context parent are inaccessible to workload writers.
+// Never traverse a workload-controlled symlink during privileged setup.
+export const PREPARE_CONTEXT = String.raw`
+const fs = require('node:fs');
+const context = process.argv[1];
+if (!/^[a-f0-9]{64}$/.test(context)) process.exit(1);
+const retained = process.argv[2] === 'retained';
+function directory(path, uid) {
+  if (retained && !fs.existsSync(path)) throw Error('retained context storage missing');
+  try { fs.mkdirSync(path, {mode: uid === 0 ? 493 : 448}); fs.chownSync(path,uid,uid); }
+  catch(e) { if(e.code !== 'EEXIST') throw e; }
+  const stat=fs.lstatSync(path);
+  if(!stat.isDirectory() || stat.uid !== uid || (uid === 0 && (stat.mode & 18))) throw Error('unsafe context root');
+}
+directory('/storage',0);
+directory('/storage/contexts',0);
+const root='/storage/contexts/'+context;
+directory(root,0);
+directory(root+'/workspace',1000);
+directory(root+'/sessions',1000);
+// Create config as the workload user; never write through a user-owned directory as root.
+process.setgid(1000); process.setuid(1000);
+fs.mkdirSync(root+'/sessions/config',{recursive:true,mode:448});
+`;

@@ -432,3 +432,26 @@ test('idle lifecycle inspection survives ownership transfer without changing ret
   await f.store.forget(f.id);
   assert.deepEqual(await f.store.lifecycle(f.id), {});
 });
+
+test('retained context keys and limits survive restart, block older clients, and delete with their scope', async t => {
+  const f = await fixture(t);
+  await f.store.lock();
+  await f.store.reserve(f.id, 'claude', 'alice');
+  const a = 'a'.repeat(64), b = 'b'.repeat(64);
+  await f.store.reserveContext(f.id, a, 1);
+  assert.equal(await f.store.contextReady(f.id, a), false);
+  await f.store.markContextReady(f.id, a);
+  await f.store.reserveContext(f.id, a, 1);
+  await assert.rejects(f.store.reserveContext(f.id, b, 1), /context capacity/);
+  await assert.rejects(f.store.reserveContext(f.id, '../escape', 2));
+  assert.equal(JSON.parse(await readFile(f.manifestPath, 'utf8')).version, 8);
+  await f.store.unlock();
+  await f.store.lock();
+  assert.deepEqual(await f.store.contexts(f.id), [a]);
+  assert.equal(await f.store.contextReady(f.id, a), true);
+  await assert.rejects(f.store.reserveContext(f.id, b, 1), /context capacity/);
+  await f.store.reserveContext(f.id, b, 2);
+  assert.deepEqual(await f.store.contexts(f.id), [a, b]);
+  await f.store.forget(f.id);
+  assert.deepEqual(await f.store.contexts(f.id), []);
+});

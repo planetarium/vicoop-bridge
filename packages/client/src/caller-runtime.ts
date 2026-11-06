@@ -112,6 +112,10 @@ export async function createCallerRuntime(args: {
         void closed.then(() => processes.delete(closed));
         return child;
       };
+      const workspaceInstructions = container.context
+        ? 'This conversation has its own persistent /workspace and backend session storage. Other conversations have separate writable workspaces. The caller’s previous shared workspace is available read-only at /caller-workspace; copy required files into /workspace before modifying them. Shared source assets under /shared are read-only. Write deliverables in /workspace/output.'
+        : undefined;
+      const appendPrompt = [config.systemPrompt, workspaceInstructions].filter(Boolean).join('\n\n');
       const worker =
         args.kind === 'claude'
           ? createClaudeBackend({
@@ -121,7 +125,7 @@ export async function createCallerRuntime(args: {
               spawn: spawn as ClaudeSpawnFn,
               fetchUriPolicy: { enabled: false },
               extraArgs: [
-                ...(config.systemPrompt === undefined ? [] : ['--append-system-prompt', config.systemPrompt]),
+                ...(appendPrompt ? ['--append-system-prompt', appendPrompt] : []),
                 '--strict-mcp-config',
                 '--mcp-config',
                 '{"mcpServers":{}}',
@@ -132,13 +136,14 @@ export async function createCallerRuntime(args: {
             })
           : createCodexExecutionBackend({
               ...args.codex,
+              runtimeInstructions: workspaceInstructions,
               cwd: '/workspace',
               sandboxMode: 'danger-full-access',
               spawn: spawn as AppServerSpawnFn,
-              mkdtemp: (_prefix, signal) => pool.inputDirectory(container.id, signal),
+              mkdtemp: (_prefix, signal) => pool.inputDirectory(container.id, signal, container.context),
               writeFile: (path, data, signal) =>
-                pool.inputWrite(container.id, path, data, signal),
-              rm: (path) => pool.inputRemove(container.id, path),
+                pool.inputWrite(container.id, path, data, signal, container.context),
+              rm: (path) => pool.inputRemove(container.id, path, container.context),
             });
       return {
         backend: config.fileDelivery ? {

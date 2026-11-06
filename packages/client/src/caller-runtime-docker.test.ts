@@ -510,3 +510,29 @@ test('pending setup blocks acquisition before first allocation and survives rese
   assert.deepEqual(await pool.store.preparation(id), { version: 'v1', ready: false });
   await pool.store.unlock();
 });
+
+test('parallel allocation does not stop orphan resources after read-only rejection', async () => {
+  const options = CallerRuntimeConfig.parse({ image: `sha256:${'a'.repeat(64)}`, stateDirectory: '/fixture', concurrency: {},
+    fixedImageStorage: { image: `sha256:${'b'.repeat(64)}`, poolVolume: 'pool', capacityMiB: 2048, reserveMiB: 64, reservationBoundary: 'docker-filesystem' } });
+  const pool = new DockerCallerRuntimePool('claude', options, 'agent');
+  pool.acquire = async () => { throw new CallerOrphanedResourcesError(); };
+  let stops = 0;
+  pool.stop = async () => { stops++; };
+  await assert.rejects(pool.acquireContext(scopeDigest('agent', 'alice'), 'a'.repeat(64), new AbortController().signal, 'alice', () => {}), CallerOrphanedResourcesError);
+  assert.equal(stops, 0);
+  await assert.rejects(pool.acquireContext(scopeDigest('agent', 'alice'), 'b'.repeat(64), new AbortController().signal, 'alice', () => {}), /shared caller allocation cleanup unconfirmed/);
+  assert.equal(stops, 0);
+});
+
+test('parallel allocation holds the scope closed when a mutated base runtime cannot be stopped', async () => {
+  const options = CallerRuntimeConfig.parse({ image: `sha256:${'a'.repeat(64)}`, stateDirectory: '/fixture', concurrency: {},
+    fixedImageStorage: { image: `sha256:${'b'.repeat(64)}`, poolVolume: 'pool', capacityMiB: 2048, reserveMiB: 64, reservationBoundary: 'docker-filesystem' } });
+  const pool = new DockerCallerRuntimePool('codex', options, 'agent');
+  pool.acquire = async (_id, _signal, _principal, _reserved, mutation) => { mutation?.(); throw Error('start interrupted'); };
+  let stops = 0;
+  pool.stop = async () => { stops++; throw Error('Docker unavailable'); };
+  const acquire = () => pool.acquireContext(scopeDigest('agent', 'alice'), 'a'.repeat(64), new AbortController().signal, 'alice', () => {});
+  await assert.rejects(acquire(), /shared caller allocation cleanup unconfirmed/);
+  await assert.rejects(acquire(), /shared caller allocation cleanup unconfirmed/);
+  assert.equal(stops, 1);
+});

@@ -598,7 +598,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     backend,
     trustedIdentityIssuers: args.trustedIdentityIssuers,
     maxPendingBytes: args.runtime === 'container' && args.backends?.claude?.caller_runtime?.fileDelivery
-      ? callerFilePendingBytes(args.backends.claude.caller_runtime.fileDelivery, args.backends.claude.caller_runtime.maxScopes)
+      ? callerFilePendingBytes(args.backends.claude.caller_runtime.fileDelivery, (args.backends.claude.caller_runtime.concurrency ? (args.backends.claude.caller_runtime.concurrency.global ?? 8) : args.backends.claude.caller_runtime.maxScopes))
       : sendFilePendingBytes(args.claudeSendFile),
     logLevel: logger.level,
     // Daemon entrypoint: a fatal terminal close (currently 4014 "client

@@ -808,3 +808,154 @@ CLI fixture through the real caller worker and broker; it makes no model calls.
 Also set `VICOOP_SHARED_TEST_FILE_DELIVERY=1`
 to check actual attachments and the configured file-tool instructions on all
 three executions alongside the operator prompt.
+
+## Bounded concurrency across one caller's contexts
+
+Claude and Codex support opt-in concurrent execution of independent A2A contexts.
+Without `concurrency`, the existing single-container, shared-workspace, per-caller
+serialization contract above is unchanged, including its end-to-end task timeout.
+With fixed image storage initialized, add this under `caller_runtime` and restart:
+
+```json
+"concurrency": {
+  "perCaller": 2,
+  "global": 8,
+  "queuePerCaller": 16,
+  "queueTimeoutMs": 600000
+}
+```
+
+These are the defaults when `concurrency` is present. `perCaller` accepts 1–8;
+`global` accepts 1–32. `global` is per configured caller runtime in this daemon,
+not a distributed limit across hosts. `queueLimit` remains the total waiting
+request limit; `queuePerCaller` additionally bounds a single caller's waiters.
+Both queue limits may be zero. A full queue fails with `runtime_capacity`.
+`maxScopes` continues to count retained callers, including stopped callers;
+`maxContexts` bounds retained contexts **per caller across restarts** in this mode.
+Lowering that limit below retained context count fails startup.
+
+Admission rotates among callers with eligible work. One context always executes
+in order, and an earlier waiter for a busy context does not occupy an extra slot
+or block another context. Running work is not preempted to admit a new caller.
+An execution slot covers allocation, backend initialization, tool/approval waits,
+file delivery and confirmed cleanup. Queue timeout starts on admission to the
+queue; `taskTimeoutMs` starts when an execution slot is granted. They fail as
+`runtime_queue_timeout` and `runtime_timeout`, respectively. Canceling a queued
+request removes its queue entry without touching an active execution.
+Heartbeat metadata exposes the current `vicoop.runtime.phase`; silence from a
+backend is not evidence that an execution is idle.
+
+### Workspace and resource boundaries
+
+Each context gets its own container, private network, persistent `/workspace`
+and backend session directory. Context keys are bridge-generated hashes of the
+validated caller scope and A2A context; caller input never becomes a Docker name
+or filesystem path directly. Claude and Codex use the same scheduling and Docker
+lifecycle. Codex's app-server, input staging and thread mapping belong to that
+context. Claude's file helper and broker binding belong to that execution.
+
+The caller's original workspace remains available **read-only** at
+`/caller-workspace`. Existing files and environment preparation are retained;
+files are not copied or merged automatically. For example, copy a prepared
+script or project from `/caller-workspace` into `/workspace` when it needs writes.
+Absolute paths or dependencies in a prepared environment that assumed the old
+writable workspace may need adjustment. Backend configuration/session files from
+the legacy environment are not automatically imported. Switching modes starts
+new conversations. Shared operator asset mounts remain read-only at `/shared/*`.
+Different contexts may safely write the same `/workspace/output/result.png` name;
+there is no shared writable output directory between them.
+
+Context data lives under `contexts/<opaque-context-key>/{workspace,sessions}` in
+the caller's **existing fixed ext4 allocation**. The legacy workspace and every
+context share the caller's `storageMiB` block/inode limit; no extra storage
+reservation is made for each context. A full shared filesystem can affect all
+contexts of that caller. This is not per-context disk quota or transactional
+rollback; partial writes survive failures. Legacy monitored-volume storage is
+rejected for concurrency because it cannot provide this enforced aggregate bound.
+Context files are retained until explicit caller data removal. There is no
+automatic context eviction or background data deletion.
+
+CPU, memory, PIDs and tmpfs limits apply **per execution container**. Budget host
+resources for up to `global` containers, plus bounded allocation/storage helpers
+and daemon overhead. A context container/network is removed after each execution
+and confirmed cleanup, so completed contexts do not accumulate idle containers.
+In this mode `idleTimeoutMs` does not schedule an additional scope-wide stop;
+that timer applies only to the legacy single-container mode. Context conversation
+mappings remain retained until failure, daemon restart or backend session expiry.
+In-memory conversation mappings are retained within `maxContexts`; successful
+follow-ups resume the same Claude session or Codex thread from persistent files.
+Daemon restart resets conversation mappings and reports `conversationReset`,
+while preserving workspace/session files. This mode does not claim cross-restart
+conversation restoration. The legacy caller container used for initial allocation
+and offline environment preparation remains retained and stopped.
+
+Cancellation, backend failure or uncertain execution cleanup closes only the
+affected context's broker/worker and removes its container. Cleanup failure
+quarantines that context and keeps its execution slot charged until daemon
+recovery. Uncertain shared allocation/storage-helper failures block new work for
+that caller; already running siblings are not deliberately stopped by that
+request's cleanup. Docker daemon loss, physical disk failures or shared storage
+exhaustion can affect multiple executions and cannot be isolated by scheduling.
+Recovery validates persisted ownership and resource boundaries before removing
+old context containers; it never silently adopts a foreign resource. Offline
+`container list` includes retained context keys; `container recreate/remove`
+handles their owned containers/networks as well as the original caller resources.
+
+Claude keeps its existing optional `fileDelivery` support. Concurrent executions
+use separate bindings, budgets and output snapshots; cancellation cannot rebind
+one execution's helper to a sibling. Codex remains text-output-only; this feature
+does not add Codex outgoing FileParts. Replay retention is sized for `global`
+concurrent attachment batches instead of `maxScopes`. The 512 MiB ceiling still
+applies: the default 24 MiB/file-batch configuration fits 8 slots (about 268 MiB),
+but not 16. Lower `global` or file limits when startup rejects the byte budget.
+Retention still has frame/age limits and is not unlimited buffering after an
+execution ends.
+
+### Migration, rollback and verification
+
+1. Stop the daemon, preserve the original state directory/configuration, and make
+   an offline backup of caller storage before changing workspace semantics.
+2. Keep the existing image, storage pool, reservations and caller identities.
+   Enable `concurrency`, then restart. No storage-helper image rebuild is needed;
+   the caller image must provide the existing Node/tini runtime contract.
+3. To disable parallel execution while retaining the new workspace layout, set
+   `concurrency.perCaller` to `1`. Set `global` to `1` as well if all callers must
+   execute serially. Do not remove the `concurrency` object while context data is
+   retained: startup rejects that change rather than switching back to a different
+   writable workspace without notice.
+4. The first context allocation advances the manifest to version 8; older client
+   binaries reject it. Binary downgrade requires the pre-migration offline backup
+   or an explicit export/reprovision plan. Never lower the manifest version by
+   hand. Explicit `container remove` deletes that caller's legacy and context data
+   together; it is not a routine rollback step.
+
+Deterministic scheduler/backend tests cover overlap, context FIFO, fair admission,
+queue limits, queue cancellation/timeout, cleanup barriers and quarantine capacity.
+`packages/client/scripts/caller-concurrency-smoke.mjs` runs the compiled CLI with
+real Docker, fixed ext4 storage and deterministic Claude/Codex protocol fixtures.
+It checks actual simultaneously running backend processes, same-name file
+isolation (including Claude FilePart bytes), sibling cancellation and injected
+supervisor failure, other-caller
+progress, remote approval isolation, inline-image routing, session resume, crash
+recovery and `perCaller: 1` rollback. Run it separately for each backend:
+
+```sh
+docker build -t caller-concurrency-fixture -f packages/client/scripts/fixtures/caller-backends/Dockerfile .
+VICOOP_CLIENT_BIN=/absolute/path/to/compiled/vicoop-client \
+VICOOP_SMOKE_IMAGE=$(docker image inspect --format '{{.Id}}' caller-concurrency-fixture) \
+VICOOP_SMOKE_KIND=claude node packages/client/scripts/caller-concurrency-smoke.mjs
+# Repeat with VICOOP_SMOKE_KIND=codex.
+```
+
+The smoke reports an overlap timestamp after observing both backend processes
+inside their independent containers. These are lifecycle tests, not provider
+throughput measurements or evidence from real model calls.
+
+Validation on 2026-11-06 used the Bun-compiled client and real Docker with these
+protocol fixtures. Observed simultaneous same-caller execution at
+`2026-11-06T02:59:15.690Z` (Claude) and `2026-11-06T02:59:15.861Z` (Codex).
+Both runs passed cancellation/supervisor-failure sibling survival, approval and
+input routing, persistence/recovery, and serialization rollback. Claude also
+passed execution-bound FilePart byte attribution for identical output paths.
+No real provider/model calls or production deployment were performed in this
+validation.

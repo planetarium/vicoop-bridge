@@ -19,12 +19,47 @@ function execute(session,resumed,prompt) {
  }
  return JSON.stringify({session,resumed,turn,cwd:process.cwd()});
 }
+// Deterministic overlap barrier for the compiled concurrency smoke.
+let approvalDone;
+async function deliver(result,prompt,done) {
+ if(!result)return;
+ const configIndex=args.indexOf('--mcp-config');
+ const helper=configIndex<0?undefined:JSON.parse(args[configIndex+1]).mcpServers?.['_vb-send-file'];
+ if(helper) {
+  fs.mkdirSync('/workspace/output',{recursive:true});
+  fs.writeFileSync('/workspace/output/result.bin',result);
+  const response=await fetch(helper.args[2],{method:'POST',headers:{authorization:'Bearer '+helper.args[3],'content-type':'application/json'},body:JSON.stringify({path:'/workspace/output/result.bin'})});
+  const delivered=await response.json();
+  if(!response.ok || delivered.isError)throw Error('fixture file delivery failed');
+ }
+ if(prompt.includes('approval-task')) {
+  await new Promise(resolve=>{
+   approvalDone=resolve;
+   if(kind==='claude') send({type:'control_request',request_id:'fixture-approval',request:{subtype:'can_use_tool',tool_name:'Bash',input:{command:prompt}}});
+   else send({id:'fixture-approval',method:'item/commandExecution/requestApproval',params:{threadId:session,command:prompt}});
+  });
+ }
+ if(!prompt.includes('wait-task')) { done(result); return; }
+ try { fs.unlinkSync('/workspace/release'); } catch(e) { if(e.code!=='ENOENT')throw e; }
+ fs.writeFileSync('/workspace/running',JSON.stringify({pid:process.pid,prompt}));
+ const timer=setInterval(()=>{
+  if(fs.existsSync('/workspace/release')) { clearInterval(timer); done(result); }
+ },25);
+}
 let pending='',session,resumed=false;
 process.stdin.on('data',chunk=>{
  pending+=chunk.toString();let end;
  while((end=pending.indexOf('\n'))!==-1) {
   const line=pending.slice(0,end);pending=pending.slice(end+1);
   const m=JSON.parse(line);
+  if(m.type==='control_response' && m.response.request_id==='fixture-approval') {
+   if(m.response.response.behavior!=='allow')throw Error('fixture expected approval');
+   approvalDone?.();continue;
+  }
+  if(m.id==='fixture-approval' && m.result) {
+   if(m.result.decision!=='accept')throw Error('fixture expected approval');
+   approvalDone?.();continue;
+  }
   if(kind==='claude') {
    if(!args.includes('--strict-mcp-config'))throw Error('MCP not restricted');
    const file=args[args.indexOf('--append-system-prompt-file')+1];
@@ -32,7 +67,7 @@ process.stdin.on('data',chunk=>{
    resumed=args.includes('--resume');session=args[args.indexOf(resumed?'--resume':'--session-id')+1];
    const result=execute(session,resumed,line);
    send({type:'system',subtype:'init',session_id:session});
-   if(result) {send({type:'result',subtype:'success',result});process.stdin.destroy();}
+   deliver(result,line,result=>{send({type:'result',subtype:'success',result});process.stdin.destroy();});
    continue;
   }
   const reply=result=>send({id:m.id,result});
@@ -44,9 +79,12 @@ process.stdin.on('data',chunk=>{
    case 'thread/resume':session=m.params.threadId;resumed=true;reply({thread:{id:session}});break;
    case 'thread/inject_items':reply({});break;
    case 'turn/start': {
+    for(const item of m.params.input??[]) if(item.type==='localImage') {
+     if(!item.path.startsWith('/tmp/vicoop-input-') || fs.readFileSync(item.path)[0]!==137)throw Error('input routed to wrong container');
+    }
     const turnId=randomUUID();reply({turn:{id:turnId,status:'inProgress'}});
     const result=execute(session,resumed,JSON.stringify(m.params));
-    if(result)setTimeout(()=>{send({method:'item/agentMessage/delta',params:{itemId:'message',delta:result,turnId}});send({method:'turn/completed',params:{threadId:session,turn:{id:turnId,status:'completed',items:[]}}});},10);
+    deliver(result,JSON.stringify(m.params),result=>setTimeout(()=>{send({method:'item/agentMessage/delta',params:{itemId:'message',delta:result,turnId}});send({method:'turn/completed',params:{threadId:session,turn:{id:turnId,status:'completed',items:[]}}});},10));
     break;
    }
    case 'turn/interrupt':reply({});break;
