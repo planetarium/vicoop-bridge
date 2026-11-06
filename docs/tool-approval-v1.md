@@ -37,14 +37,16 @@ AskUserQuestion remains a separate `input-required` flow.
 ## A2A mapping
 
 The task enters the standard `auth-required` state (`TASK_STATE_AUTH_REQUIRED`
-on the A2A 1.0 binding). The underlying SDK (`@a2x/sdk` 0.24.0) marks every
-`auth-required` status update `final: true`, but the bridge keeps the physical
-stream open: the same stream then carries `working`, any artifacts and the
-terminal event (`final: true`). Clients should treat a `final: true`
-`auth-required` event carrying this extension's metadata as a suspension, not
-as the end of the execution. `tasks/get` sees the state while the stream stays
-open. The native execution is retained; clients must not submit a new
-message to approve. `contextId` is conversation scope, not approval authority.
+on the A2A 1.0 binding). With SDK 0.25.1, the executor's explicit
+`final: false` suspension keeps the same stream open for `working`, artifacts,
+and the terminal event (`final: true`). `tasks/get` sees the suspended state.
+The native execution is retained; clients must not submit a new message to
+approve. `contextId` is conversation scope, not approval authority.
+
+Older SDK 0.24 emitted `final: true` on this suspension despite keeping the
+physical stream open; SDK 0.25.0 stops forwarding later events. Clients serving
+older bridges should recognize an approval event as a suspended execution
+and recover its outcome through task lookup if their stream ends.
 
 The Agent Card advertises this optional extension only while an opted-in client
 is connected:

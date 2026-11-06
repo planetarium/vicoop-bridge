@@ -75,6 +75,8 @@ test(
       assert.ok(await a.get(taskId), 'the owning agent sees its own offering');
       assert.equal(await b.get(taskId), undefined, 'another agent must not');
       assert.equal(await b.getOffer(taskId), undefined);
+      assert.equal(await a.getClaimStatus(taskId), 'available');
+      assert.equal(await b.getClaimStatus(taskId), undefined);
       assert.equal(await b.claim(taskId), false, 'and must not be able to claim it');
 
       // B's delete must not reach A's row either.
@@ -195,9 +197,10 @@ test(
       const taskId = `${tag}-patch`;
       const store = new PostgresX402Store(sql, `${tag}-agent`);
       await store.publishing(taskId, OFFER, () => store.put(entry(taskId)));
+      await store.update(taskId, { status: 'verified', verifiedAt: new Date() });
       assert.equal(await store.claim(taskId), true);
 
-      await store.update(taskId, { status: 'verified', verifiedAt: new Date() });
+      await store.update(taskId, { merchantDelivery: { timing: 'after-verification' } });
 
       assert.equal((await store.get(taskId))?.status, 'verified');
       assert.equal(await store.claim(taskId), false, 'the claim survives the patch');
@@ -205,6 +208,107 @@ test(
     });
   },
 );
+
+test('accepted lifecycle retention is bounded and a released claim restores signing expiry', { skip: !hasDb }, async () => {
+  await withDb(async (sql, tag) => {
+    const taskId = `${tag}-retention`;
+    const store = new PostgresX402Store(sql, `${tag}-agent`);
+    const signingDeadline = new Date(Date.now() + 60_000);
+    await store.publishing(taskId, OFFER, () => store.put(entry(taskId, { expiresAt: signingDeadline })));
+    assert.equal(await store.claim(taskId), true);
+    assert.equal(await store.getClaimStatus(taskId), 'claimed');
+    const claimed = (await store.get(taskId))!;
+    assert.ok(claimed.expiresAt!.getTime() > signingDeadline.getTime());
+    assert.equal(claimed.merchantDelivery?.publicationStartedAt, undefined);
+    assert.equal(await store.claim(taskId), false);
+    assert.deepEqual((await store.get(taskId))?.expiresAt, claimed.expiresAt, 'duplicate claim cannot renew retention');
+    await store.updateIfStatus(taskId, ['offered'], { status: 'completed' });
+    await store.release(taskId);
+    assert.equal(await store.getClaimStatus(taskId), 'available');
+    assert.deepEqual((await store.get(taskId))?.expiresAt, signingDeadline);
+    assert.equal((await store.get(taskId))?.status, 'completed', 'release preserves concurrent lifecycle changes');
+
+    // No original deadline remains absent after release rather than becoming
+    // the accepted-work retention deadline.
+    const unlimited = `${tag}-no-signing-deadline`;
+    await store.put(entry(unlimited));
+    assert.equal(await store.claim(unlimited), true);
+    assert.ok((await store.get(unlimited))?.expiresAt);
+    await store.release(unlimited);
+    assert.equal((await store.get(unlimited))?.expiresAt, undefined);
+
+    const expired = `${tag}-expired`;
+    await store.put(entry(expired, { expiresAt: new Date(0) }));
+    assert.equal(await store.claim(expired), false, 'an unsigned expired offer cannot acquire lifecycle retention');
+    assert.equal(await store.getClaimStatus(expired), undefined);
+
+    // Sweeping still reclaims accepted records once their own deadline passes.
+    await sql`UPDATE x402_offerings SET expires_at = clock_timestamp() - interval '1 second'
+      WHERE agent_id = ${`${tag}-agent`} AND task_id = ${taskId}`;
+    assert.equal(await store.get(taskId), undefined);
+    await sweepExpiredX402Offerings(sql);
+    assert.equal(await store.claim(taskId), false);
+  });
+});
+
+test('conditional lifecycle and delivery writes are atomic and agent-scoped', { skip: !hasDb }, async () => {
+  await withDb(async (sql, tag) => {
+    const taskId = `${tag}-delivery`;
+    const store = new PostgresX402Store(sql, `${tag}-agent`);
+    const other = new PostgresX402Store(sql, `${tag}-other`);
+    await store.publishing(taskId, OFFER, () => store.put(entry(taskId, { status: 'verified' })));
+    assert.equal(await store.claim(taskId), true);
+    assert.equal(await other.updateIfStatus(taskId, ['verified'], { status: 'failed' }), false);
+    assert.equal(await other.updateMerchantDeliveryIfStatus(taskId, ['verified'], { timing: 'after-verification' }), undefined);
+    assert.equal(await store.updateIfStatus(taskId, ['offered'], { status: 'failed' }), false);
+    assert.equal(await store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { timing: 'after-verification' }), 'verified');
+
+    const startedAt = new Date();
+    const [publication, status] = await Promise.all([
+      store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { publicationStartedAt: startedAt }, { publicationClosed: false }),
+      store.updateIfStatus(taskId, ['verified'], { verifiedAt: new Date() }),
+    ]);
+    assert.equal(publication, 'verified');
+    assert.equal(status, true);
+    assert.deepEqual((await store.get(taskId))?.merchantDelivery?.publicationStartedAt, startedAt);
+    assert.equal(await store.claim(taskId), false);
+    assert.deepEqual(await store.getOffer(taskId), OFFER);
+
+    await store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { publicationStartedAt: new Date(0) });
+    assert.deepEqual((await store.get(taskId))?.merchantDelivery?.publicationStartedAt, startedAt, 'publication is write-once');
+    assert.equal(await store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { publicationClosedAt: new Date() }), undefined);
+    assert.equal(await store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { workCompletedAt: new Date() }, { notAfter: new Date(0) }), undefined);
+
+    await store.updateIfStatus(taskId, ['verified'], { status: 'completed' });
+    assert.equal(await store.updateIfStatus(taskId, ['verified'], { status: 'failed' }), false);
+    assert.equal(await store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { workFailedAt: new Date() }), undefined);
+    await store.deleteOffer(taskId);
+    assert.equal(await store.getOffer(taskId), undefined);
+    assert.equal((await store.get(taskId))?.status, 'completed', 'offer cleanup retains lifecycle');
+    assert.deepEqual((await store.get(taskId))?.merchantDelivery?.publicationStartedAt, startedAt);
+  });
+});
+
+test('publication and closure have exactly one winner; expiry rejects conditional writes', { skip: !hasDb }, async () => {
+  await withDb(async (sql, tag) => {
+    const store = new PostgresX402Store(sql, `${tag}-agent`);
+    for (let i = 0; i < 8; i++) {
+      const taskId = `${tag}-${i}`;
+      await store.put(entry(taskId, { status: 'verified', merchantDelivery: { timing: 'after-verification' } }));
+      const outcomes = await Promise.all([
+        store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { publicationStartedAt: new Date() }, { publicationClosed: false }),
+        store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { publicationClosedAt: new Date() }, { publicationStarted: false }),
+      ]);
+      assert.equal(outcomes.filter(value => value !== undefined).length, 1);
+      const audit = (await store.get(taskId))!.merchantDelivery!;
+      assert.notEqual(audit.publicationStartedAt !== undefined, audit.publicationClosedAt !== undefined);
+    }
+    const expired = `${tag}-expired`;
+    await store.put(entry(expired, { status: 'verified', expiresAt: new Date(0) }));
+    assert.equal(await store.updateIfStatus(expired, ['verified'], { status: 'completed' }), false);
+    assert.equal(await store.updateMerchantDeliveryIfStatus(expired, ['verified'], { timing: 'after-verification' }), undefined);
+  });
+});
 
 test(
   'an expired offering reads as absent and is swept',
@@ -332,3 +436,28 @@ test(
     });
   },
 );
+
+
+test('claimed payment rejects stale pre-acceptance writes but records settlement failures', { skip: !hasDb }, async () => {
+  await withDb(async (sql, tag) => {
+    const taskId = `${tag}-stale-verification`;
+    const store = new PostgresX402Store(sql, `${tag}-agent`);
+    const failure = { point: 'verify' as const, code: 'VERIFY_FAILED' as const, reason: 'invalid signature', failedAt: new Date() };
+    await store.publishing(taskId, OFFER, () => store.put(entry(taskId)));
+    assert.equal(await store.updateIfStatus(taskId, ['offered'], { status: 'failed', failure }), true);
+    assert.equal((await store.get(taskId))?.failure?.point, 'verify', 'unclaimed failures remain recorded');
+    assert.equal(await store.updateIfStatus(taskId, ['failed'], { status: 'verified', verifiedAt: new Date() }), true);
+    assert.equal(await store.claim(taskId), true);
+    const accepted = await store.get(taskId);
+    for (const point of ['verify', 'classify', 'rejected-by-client'] as const) {
+      assert.equal(await store.updateIfStatus(taskId, ['verified'], { status: 'failed', failure: { ...failure, point } }), false);
+    }
+    assert.equal(await store.updateIfStatus(taskId, ['verified'], { status: 'verified', verifiedAt: new Date() }), false);
+    assert.deepEqual(await store.get(taskId), accepted);
+    assert.equal(await store.updateIfStatus(taskId, ['verified'], {
+      status: 'failed', failure: { ...failure, point: 'settle', indeterminate: true },
+    }), true);
+    assert.equal((await store.get(taskId))?.failure?.indeterminate, true);
+    assert.equal((await store.get(taskId))?.failure?.point, 'settle');
+  });
+});

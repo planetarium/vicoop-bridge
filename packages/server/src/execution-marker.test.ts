@@ -411,13 +411,13 @@ test('dispatch marker: persisted before dispatch, survives unbind, replaced per 
     assert.equal(registry.getBinding(taskId), undefined);
   }
 
-  await t.test('v0.3 SSE (unpatched SDK): auth-required arrives final:true yet the same stream carries working and completed', async () => {
+  await t.test('v0.3 SSE: non-final auth-required keeps the same stream for working and completed', async () => {
     const detachedBefore = logs.filter(l => l.includes('"event":"stream_detached"')).length;
     const { sse, assign, binding, approval, authEvent } = await startStream('jsonrpc-v0.3');
     assert.equal((sse.events.find(e => wireState(e) === 'auth-required') as { kind?: string }).kind, 'status-update');
-    // The SDK marks every auth-required status final; the bridge keeps the
-    // physical stream open regardless (documented in tool-approval-v1.md).
-    assert.equal(authEvent.final, true);
+    // The fixed SDK honors the executor's explicit non-final suspension.
+    // This regression intentionally fails with published SDK 0.25.0.
+    assert.equal(authEvent.final, false);
     assert.equal(registry.approvals.decide(approval.requestId, 'allow_once', 'owner')?.state, 'decided');
     resume(binding, approval, 'stream-out');
     await sse.rest();

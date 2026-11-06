@@ -7,6 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import postgres from 'postgres';
 import { TaskState, type Message } from '@a2x/sdk';
 import {
   InMemoryMerchantOfferStore,
@@ -21,6 +22,7 @@ import {
   type X402FacilitatorSettleResponse,
 } from '@a2x/sdk/x402';
 import { X402Gate, type X402GateOutcome } from './gate.js';
+import { PostgresX402Store } from './store.js';
 import { parseX402Pricing, type X402Pricing } from './pricing.js';
 
 const RESOURCE = 'https://bridge.test/agents/a1';
@@ -665,4 +667,184 @@ test('settlement prices from the offering, not from a reprice that landed betwee
 
   // Metered under the frozen rates, not the 1000000 ceiling.
   assert.equal(facilitator.settledAmount, '450000');
+});
+
+test('publication is authorized against durable payment state and uncertain settlements survive cleanup', async () => {
+  const store = new InMemoryX402Store();
+  const facilitator = stubFacilitator({ settleThrows: true });
+  const context = new X402Context({ store, facilitator, x402Version: 2 });
+  const gate = new X402Gate('a1', PRICING, context, new InMemoryMerchantOfferStore(), RESOURCE);
+  const first = await gate.open({ taskId: 'uncertain', contextId: 'ctx', message: userMessage() });
+  assert.equal(first.kind, 'halt');
+  if (first.kind !== 'halt') return;
+  const second = await gate.open({ taskId: 'uncertain', contextId: 'ctx',
+    message: submissionMessage(offeredRequirement(first.event)) });
+  assert.equal(second.kind, 'halt');
+  assert.equal((await store.get('uncertain'))?.failure?.indeterminate, true);
+  await gate.clear('uncertain');
+  assert.ok(await store.get('uncertain'), 'indeterminate on-chain outcome must remain available for reconciliation');
+  assert.equal((await gate.authorizeDelivery('uncertain', 'ctx'))?.status.state, TaskState.FAILED);
+});
+
+test('exact and upto authorize publication only after their payment round-trip', async () => {
+  for (const pricing of [PRICING, UPTO_PRICING]) {
+    const store = new InMemoryX402Store();
+    const facilitator = stubFacilitator();
+    const context = new X402Context({ store, facilitator, x402Version: 2 });
+    const gate = new X402Gate('a1', pricing, context, new InMemoryMerchantOfferStore(), RESOURCE);
+    const taskId = `delivery-${pricing.scheme}`;
+    const first = await gate.open({ taskId, contextId: 'ctx', message: userMessage() });
+    assert.equal(first.kind, 'halt');
+    if (first.kind !== 'halt') return;
+    assert.equal((await gate.authorizeDelivery(taskId, 'ctx'))?.status.state, TaskState.FAILED);
+    const requirement = offeredRequirement(first.event);
+    const second = await gate.open({ taskId, contextId: 'ctx', message: pricing.scheme === 'upto'
+      ? uptoSubmissionMessage(requirement) : submissionMessage(requirement) });
+    assert.equal(second.kind, 'proceed');
+    assert.equal((await store.get(taskId))?.merchantDelivery?.publicationStartedAt, undefined);
+    assert.equal(await gate.authorizeDelivery(taskId, 'ctx'), undefined);
+    assert.ok((await store.get(taskId))?.merchantDelivery?.publicationStartedAt instanceof Date);
+    assert.equal(facilitator.settleCalls, pricing.scheme === 'upto' ? 0 : 1);
+    await gate.clear(taskId);
+    assert.equal(await store.get(taskId), undefined);
+    assert.equal(facilitator.settleCalls, pricing.scheme === 'upto' ? 0 : 1, 'cleanup does not adopt SDK partial-failure billing');
+  }
+});
+
+test('accepted exact and upto tasks can deliver after the original offer signing deadline', {
+  skip: !process.env.DATABASE_URL,
+}, async () => {
+  const sql = postgres(process.env.DATABASE_URL!, { onnotice() {} });
+  const agentId = `x402-late-output-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    for (const pricing of [PRICING, UPTO_PRICING]) {
+      const store = new PostgresX402Store(sql, agentId);
+      const facilitator = stubFacilitator();
+      const context = new X402Context({ store, facilitator, x402Version: 2 });
+      const gate = new X402Gate(agentId, pricing, context, store, RESOURCE);
+      const taskId = `late-${pricing.scheme}`;
+      const first = await gate.open({ taskId, contextId: 'ctx', message: userMessage() });
+      assert.equal(first.kind, 'halt');
+      if (first.kind !== 'halt') continue;
+      const signingDeadline = new Date(Date.now() + 1_000);
+      await store.put({ ...(await store.get(taskId))!, expiresAt: signingDeadline });
+      const requirement = offeredRequirement(first.event);
+      const second = await gate.open({ taskId, contextId: 'ctx', message: pricing.scheme === 'upto'
+        ? uptoSubmissionMessage(requirement) : submissionMessage(requirement) });
+      assert.equal(second.kind, 'proceed');
+      if (second.kind !== 'proceed') continue;
+      assert.ok((await store.get(taskId))!.expiresAt!.getTime() > signingDeadline.getTime());
+      assert.equal((await store.get(taskId))?.merchantDelivery?.publicationStartedAt, undefined);
+      await new Promise(resolve => setTimeout(resolve, Math.max(0, signingDeadline.getTime() - Date.now()) + 20));
+      assert.equal(await gate.authorizeDelivery(taskId, 'ctx'), undefined, 'the first output remains deliverable after offer expiry');
+      assert.ok((await store.get(taskId))?.merchantDelivery?.publicationStartedAt);
+      if (second.settlement?.mode === 'deferred') {
+        assert.ok(await store.getOffer(taskId), 'accepted metered terms remain available');
+        const result = await gate.settle({ taskId, contextId: 'ctx', obligation: second.settlement.obligation,
+          usage: { kind: 'unreported' } });
+        assert.equal(result.kind, 'settled');
+      }
+      assert.equal(facilitator.settleCalls, 1);
+      await gate.clear(taskId);
+      assert.equal(await store.get(taskId), undefined);
+    }
+  } finally {
+    await sql`DELETE FROM x402_offerings WHERE agent_id = ${agentId}`;
+    await sql.end();
+  }
+});
+
+test('unpaid retries cannot replace an accepted metered payment before its first output', {
+  skip: !process.env.DATABASE_URL,
+}, async () => {
+  const sql = postgres(process.env.DATABASE_URL!, { onnotice() {} });
+  const agentId = `x402-retry-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    const store = new PostgresX402Store(sql, agentId);
+    const facilitator = stubFacilitator();
+    const context = new X402Context({ store, facilitator, x402Version: 2 });
+    const gate = new X402Gate(agentId, UPTO_PRICING, context, store, RESOURCE);
+    const taskId = 'accepted';
+    const first = await gate.open({ taskId, contextId: 'ctx', message: userMessage() });
+    assert.equal(first.kind, 'halt');
+    if (first.kind !== 'halt') return;
+    const accepted = await gate.open({ taskId, contextId: 'ctx',
+      message: uptoSubmissionMessage(offeredRequirement(first.event)) });
+    assert.equal(accepted.kind, 'proceed');
+    const before = await store.get(taskId);
+    assert.equal(before?.status, 'verified');
+    for (const staleHint of [false, true]) {
+      // Model a retry that read the replay hint just before the first claim.
+      if (staleHint) store.getClaimStatus = async () => 'available';
+      const retry = await gate.open({ taskId, contextId: 'ctx', message: userMessage() });
+      assert.equal(retry.kind, 'halt');
+      if (retry.kind === 'halt') assert.equal(retry.event.status.state, TaskState.FAILED);
+      assert.deepEqual(await store.get(taskId), before, 'retry retains lifecycle and retention');
+    }
+    assert.equal(await gate.authorizeDelivery(taskId, 'ctx'), undefined);
+    assert.equal(facilitator.verifyCalls, 1);
+    if (accepted.kind === 'proceed' && accepted.settlement?.mode === 'deferred') {
+      const settled = await gate.settle({ taskId, contextId: 'ctx', obligation: accepted.settlement.obligation,
+        usage: { kind: 'unreported' } });
+      assert.equal(settled.kind, 'settled');
+    }
+    assert.equal(facilitator.settleCalls, 1);
+  } finally {
+    await sql`DELETE FROM x402_offerings WHERE agent_id = ${agentId}`;
+    await sql.end();
+  }
+});
+
+
+test('a losing verification cannot invalidate accepted metered work', {
+  skip: !process.env.DATABASE_URL,
+}, async () => {
+  const sql = postgres(process.env.DATABASE_URL!, { onnotice() {} });
+  const agentId = `x402-verify-race-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const store = new PostgresX402Store(sql, agentId);
+  let release!: () => void, entered!: () => void;
+  const verifying = new Promise<void>(resolve => { entered = resolve; });
+  const ready = new Promise<void>(resolve => { release = resolve; });
+  const losingFacilitator = stubFacilitator();
+  losingFacilitator.verify = async () => {
+    entered();
+    await ready;
+    return { isValid: false, invalidReason: 'invalid signature' };
+  };
+  const facilitator = stubFacilitator();
+  const gate = new X402Gate(agentId, UPTO_PRICING,
+    new X402Context({ store, facilitator, x402Version: 2 }), store, RESOURCE);
+  const losingGate = new X402Gate(agentId, UPTO_PRICING,
+    new X402Context({ store, facilitator: losingFacilitator, x402Version: 2 }), store, RESOURCE);
+  let losing: Promise<X402GateOutcome> | undefined;
+  try {
+    const taskId = 'verification-race';
+    const first = await gate.open({ taskId, contextId: 'ctx', message: userMessage() });
+    assert.equal(first.kind, 'halt');
+    if (first.kind !== 'halt') return;
+    const message = uptoSubmissionMessage(offeredRequirement(first.event));
+    losing = losingGate.open({ taskId, contextId: 'ctx', message });
+    await verifying;
+    const accepted = await gate.open({ taskId, contextId: 'ctx', message });
+    assert.equal(accepted.kind, 'proceed');
+    const before = await store.get(taskId);
+    release();
+    const refused = await losing;
+    assert.equal(refused.kind, 'halt');
+    if (refused.kind === 'halt') assert.equal(refused.event.status.state, TaskState.FAILED);
+    assert.deepEqual(await store.get(taskId), before, 'losing verification cannot overwrite accepted state');
+    assert.equal(await gate.authorizeDelivery(taskId, 'ctx'), undefined);
+    if (accepted.kind === 'proceed' && accepted.settlement?.mode === 'deferred') {
+      const result = await gate.settle({ taskId, contextId: 'ctx', obligation: accepted.settlement.obligation,
+        usage: { kind: 'unreported' } });
+      assert.equal(result.kind, 'settled');
+    }
+    assert.equal(facilitator.settleCalls, 1);
+    assert.equal(losingFacilitator.settleCalls, 0);
+  } finally {
+    release();
+    await losing;
+    await sql`DELETE FROM x402_offerings WHERE agent_id = ${agentId}`;
+    await sql.end();
+  }
 });

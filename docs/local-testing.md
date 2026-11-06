@@ -394,3 +394,47 @@ pkill -f 'tsx.*watch.*src/cli.ts'    # server
 pkill -f 'tsx.*cli.ts.*echo-agent'   # client
 dropdb vicoop_bridge_dev             # optional, full reset
 ```
+
+## Nonblocking task acknowledgement (issue #572)
+
+The server and admin UI use `@a2x/sdk` 0.25.1 or later in the 0.25 series.
+The release includes immediate unary acknowledgement and keeps approval SSE
+streams open across intermediate `auth-required` events with `final: false`.
+
+For v0.3, send `configuration: { blocking: false }` with `message/send`.
+For v1, send `configuration: { returnImmediately: true }` with `SendMessage`
+or HTTP+JSON `message:send`. The response contains the accepted task's actual
+ID, context ID, and current status; it does not mean execution is complete.
+Omitted flags, `blocking: true`, and `returnImmediately: false` retain the
+blocking behavior and wait for execution to finish.
+
+After reading the acknowledgement, callers can close the request and later use
+`tasks/get` with the same authenticated identity to retrieve progress and file
+bytes without dispatching another execution. The bridge persists intermediate
+status and artifact snapshots. Caller ownership comes from server-authenticated
+request metadata in the initial task insert, before execution starts.
+
+To verify the flow against the published SDK:
+
+1. Run build, typecheck, and the server suite with `DATABASE_URL` pointing to a
+   disposable local database. The x402 store tests exercise real PostgreSQL
+   conditional writes and publication/closure races.
+2. Run `pnpm --filter @vicoop-bridge/server exec tsx --test src/nonblocking-send.test.ts`.
+   This test also runs in the regular server CI suite. It gates backend
+   completion and checks v0.3, v1 JSON-RPC, and v1 HTTP+JSON acknowledgement;
+   same-caller lookup and denied cross-caller lookup; partial file bytes;
+   terminal success, failure, and cancellation; and exactly one dispatch.
+   Explicit and default blocking requests are checked on all three routes.
+3. Retest `execution-marker.test.ts`, `task-access.test.ts`, and paid calls.
+   The bridge's detachable SSE wrapper preserves request-local ownership and
+   execution-writer context; SDK background execution does not replace
+   those access controls or the bridge's failed-upto no-charge billing policy.
+
+Acceptance is not durable job scheduling. Task snapshots live in PostgreSQL,
+but the execution queue and WebSocket binding live in the server process. A
+server restart can interrupt accepted work. Persisted snapshots alone do not
+restart execution, and acknowledgement does not guarantee automatic replay
+after restart.
+The caller's HTTP deadline remains an acknowledgement/lookup deadline, not the
+native agent's execution budget. Consumers must explicitly select nonblocking
+mode and retain the returned task and context IDs for later lookup.
