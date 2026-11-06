@@ -10,11 +10,8 @@ import { ensureSchema } from './db.js';
 import { Registry } from './registry.js';
 import { issueSessionToken } from './auth/caller-token.js';
 
-// The published 0.25.0 SDK intentionally does not pass this acceptance test.
-// Enable against a local fixed SDK or its eventual release; remove the opt-in
-// when the dependency is bumped to the published nonblocking-send fix.
 test('nonblocking send retains ownership, partial files, and a single execution across lookups', {
-  skip: !process.env.DATABASE_URL || process.env.A2A_TEST_NONBLOCKING !== '1',
+  skip: !process.env.DATABASE_URL,
 }, async (t) => {
   const sql = postgres(process.env.DATABASE_URL!, { onnotice() {} });
   await ensureSchema(sql);
@@ -108,5 +105,41 @@ test('nonblocking send retains ownership, partial files, and a single execution 
       assert.equal(frames.filter(frame => frame.type === 'task.assign').length, before + 1);
       assert.equal((await get(id)).artifacts?.length, 1);
     });
+  }
+
+  for (const transport of ['v03', 'v1-rpc', 'v1-http'] as const) {
+    for (const explicit of [false, true]) {
+      await t.test(`${transport}: ${explicit ? 'explicit' : 'default'} blocking send waits for completion`, async () => {
+        const before = frames.filter(frame => frame.type === 'task.assign').length;
+        const params = {
+          message: { messageId: randomUUID(), role: transport === 'v03' ? 'user' : 'ROLE_USER',
+            parts: [{ text: 'wait for completion' }] },
+          ...(explicit ? { configuration: transport === 'v03' ? { blocking: true } : { returnImmediately: false } } : {}),
+        };
+        let acknowledged = false;
+        const sending = Promise.resolve(transport === 'v1-http'
+          ? app.request(`/agents/${agentId}/v1/message:send`, { method: 'POST', headers: headers(), body: JSON.stringify(params) })
+          : rpc(transport === 'v03' ? 'message/send' : 'SendMessage', params, 0, transport !== 'v03'))
+          .then(response => { acknowledged = true; return response; });
+        await waitFor(async () => frames.filter(frame => frame.type === 'task.assign').length === before + 1);
+        const frame = frames.filter(frame => frame.type === 'task.assign').at(-1)!;
+        assert.equal(frame.type, 'task.assign');
+        const binding = registry.getBinding(frame.taskId)!;
+        binding.sink.pushStatus({ taskId: frame.taskId, contextId: frame.contextId, final: false,
+          status: { state: TaskState.WORKING, message: { role: 'agent', messageId: 'progress', parts: [{ text: 'preparing' }] } } });
+        await waitFor(async () => (await get(frame.taskId)).status.message?.messageId === 'progress');
+        // Let an incorrectly detached response resolve before checking the latch.
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(acknowledged, false);
+        binding.sink.pushStatus({ taskId: frame.taskId, contextId: frame.contextId, final: true,
+          status: { state: TaskState.COMPLETED } });
+        binding.sink.finish();
+        const body = await (await sending).json() as { result?: Task; task?: Task };
+        const task = transport === 'v1-http' ? body.task : body.result;
+        assert.equal(task?.id, frame.taskId);
+        assert.equal((await get(frame.taskId)).status.state, TaskState.COMPLETED);
+        assert.equal(frames.filter(frame => frame.type === 'task.assign').length, before + 1);
+      });
+    }
   }
 });
