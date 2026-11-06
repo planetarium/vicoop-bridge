@@ -28,7 +28,6 @@ const fs = require('fs'), crypto = require('crypto');
  const resume = process.argv.indexOf('--resume');
  const session = process.argv[(resume < 0 ? process.argv.indexOf('--session-id') : resume) + 1];
  fs.appendFileSync('/workspace/conversations', (resume < 0 ? 'start ' : 'resume ') + session + '\n');
- fs.writeFileSync('/data/sessions/claude/marker', 'session-files');
  console.log(JSON.stringify({type:'system',subtype:'init',session_id:session}));
  const config = JSON.parse(process.argv[process.argv.indexOf('--mcp-config')+1]);
  const args = config.mcpServers['_vb-send-file'].args;
@@ -49,7 +48,6 @@ require('readline').createInterface({input:process.stdin}).on('line', line => {
  else if (method === 'thread/start' || method === 'thread/resume') {
   thread = method === 'thread/start' ? crypto.randomUUID() : params.threadId;
   fs.appendFileSync('/workspace/conversations', (method === 'thread/start' ? 'start ' : 'resume ') + thread + '\n');
-  fs.writeFileSync('/data/sessions/codex/marker', 'session-files');
   send({id,result:{thread:{id:thread}}});
  } else if (method === 'turn/start') {
   const turn = crypto.randomUUID();
@@ -70,6 +68,7 @@ for (const kind of ['claude', 'codex'] as const) {
     const directory = await mkdtemp(join(tmpdir(), 'caller-idle-'));
     const agentId = `idle-${randomUUID()}`, principal = 'alice';
     const id = scopeDigest(agentId, principal), bob = scopeDigest(agentId, 'bob');
+    const sessionMarker = `/data/sessions/${kind}/marker`, sessionSentinel = randomUUID();
     const shared = `idle-shared-${randomUUID()}`, storagePool = `idle-storage-${randomUUID()}`;
     const image = await docker(['image', 'inspect', '--format', '{{.Id}}', imageRef!]);
     const options = CallerRuntimeConfig.parse({
@@ -94,9 +93,11 @@ for (const kind of ['claude', 'codex'] as const) {
       backend = await startBackend();
       const container = await backend.pool.acquire(id, undefined, principal);
       const other = await backend.pool.acquire(bob, undefined, 'bob');
+      // Seed once outside the CLI fixtures: a later task must not repair lost
+      // session contents before the persistence assertion can observe them.
       await docker(['exec', container.name, 'node', '-e',
-        "const fs=require('fs');fs.writeFileSync('/workspace/fixture-cli',process.argv[1],{mode:0o755});fs.mkdirSync('/workspace/output');fs.writeFileSync('/workspace/output/retained.txt','retained-file');",
-        kind === 'claude' ? claudeFixture : codexFixture]);
+        "const fs=require('fs');fs.writeFileSync('/workspace/fixture-cli',process.argv[1],{mode:0o755});fs.mkdirSync('/workspace/output');fs.writeFileSync('/workspace/output/retained.txt','retained-file');fs.writeFileSync(process.argv[2],process.argv[3],{flag:'wx'});",
+        kind === 'claude' ? claudeFixture : codexFixture, sessionMarker, sessionSentinel]);
       await backend.pool.store.setPreparation(id, 'fixture-v1', true);
       const reservation = await backend.pool.store.fixedStorage(id);
       const records = await backend.pool.store.records();
@@ -110,6 +111,8 @@ for (const kind of ['claude', 'codex'] as const) {
         assert.equal(frames.at(-1)?.type, 'task.complete', JSON.stringify(frames));
         assert.ok(frames.every(frame => !('taskId' in frame) || frame.taskId === taskId));
         assert.match(JSON.stringify(frames), /idle fixture reply/);
+        // Includes both idle resumes and the request after daemon restart.
+        assert.equal(await docker(['exec', container.name, 'cat', sessionMarker]), sessionSentinel);
         if (kind === 'claude') {
           const files = frames.filter(frame => frame.type === 'task.artifact').flatMap(frame => frame.artifact.parts).filter(part => part.kind === 'file');
           assert.equal(files.length, 1);
@@ -147,7 +150,6 @@ for (const kind of ['claude', 'codex'] as const) {
         measurements.push(Math.round(performance.now() - started));
         assert.match(JSON.stringify(frames), /conversationReset/);
         assert.equal(await docker(['inspect', '--format', '{{.Id}}', container.name]), container.dockerId);
-        assert.equal(await docker(['exec', container.name, 'cat', `/data/sessions/${kind}/marker`]), 'session-files');
         assert.equal((await backend.pool.describe(id)).lifecycle.lastResume?.outcome, 'conversation-reset');
         await waitIdle();
       }
