@@ -32,6 +32,8 @@ interface Entry {
   contexts: Set<string>;
   recovered: boolean;
   quarantined: boolean;
+  idleTimer?: NodeJS.Timeout;
+  idleGeneration: number;
 }
 export class CallerScopedBackend implements Backend {
   remoteApprovals?: boolean;
@@ -61,7 +63,61 @@ export class CallerScopedBackend implements Backend {
       contexts: new Set(),
       recovered,
       quarantined: false,
+      idleGeneration: 0,
     };
+  }
+  private cancelIdle(entry: Entry): void {
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = undefined;
+    entry.idleGeneration++;
+  }
+  private armIdle(id: string, entry: Entry): void {
+    this.cancelIdle(entry);
+    const timeout = this.pool.options.idleTimeoutMs;
+    if (!timeout || this.stopped || entry.users || entry.quarantined || !entry.worker) return;
+    const generation = entry.idleGeneration;
+    const eligible = () => !this.stopped && entry.idleGeneration === generation &&
+      this.entries.get(id) === entry && entry.users === 0 && !entry.quarantined && !!entry.worker;
+    entry.idleTimer = setTimeout(() => {
+      if (!eligible()) return;
+      entry.idleTimer = undefined;
+      // Install the barrier synchronously. Admission either invalidates this
+      // decision before cleanup starts, or waits for its confirmed completion.
+      const work = entry.tail.then(async () => {
+        if (!eligible()) return;
+        await this.reclaimIdle(id, entry);
+      });
+      entry.tail = work;
+      this.active.add(work);
+      void work.finally(() => this.active.delete(work)).catch(() => {});
+    }, timeout);
+    entry.idleTimer.unref();
+  }
+  private async reclaimIdle(id: string, entry: Entry): Promise<void> {
+    const worker = entry.worker!;
+    let failed = false;
+    // Attempt every cleanup step, even if a worker/helper fails to close.
+    try { if (!worker.healthy()) failed = true; } catch { failed = true; }
+    try { worker.backend.stop?.(); } catch { failed = true; }
+    try { worker.close(); } catch { failed = true; }
+    try {
+      await within(worker.settle(), 15000);
+    } catch { failed = true; }
+    try { await this.pool.stop(id); } catch { failed = true; }
+    entry.worker = undefined;
+    entry.dockerId = undefined;
+    entry.contexts.clear();
+    entry.recovered = true;
+    entry.quarantined = failed;
+    try {
+      await this.pool.recordLifecycle(id, { lastIdleStop: {
+        at: new Date().toISOString(), reason: 'idle-timeout',
+        outcome: failed ? 'quarantined' : 'stopped',
+      } });
+    } catch {
+      entry.quarantined = true;
+      console.error('Caller runtime idle lifecycle recording failed; scope quarantined');
+    }
   }
   async resolveCapabilities() {
     return { streaming: true };
@@ -183,6 +239,7 @@ export class CallerScopedBackend implements Backend {
     this.controllers.add(controller);
     this.pending++;
     entry.users++;
+    this.cancelIdle(entry);
     const abort = () => controller.abort();
     signal.addEventListener('abort', abort, { once: true });
     if (signal.aborted) abort();
@@ -200,6 +257,7 @@ export class CallerScopedBackend implements Backend {
     let storageCheck: Promise<void> | undefined;
     let storageFailure = false;
     let storageCheckFailed = false;
+    let resuming = false;
     const heartbeat = setInterval(() => {
       if (!controller.signal.aborted)
         emit({
@@ -225,6 +283,7 @@ export class CallerScopedBackend implements Backend {
         return;
       }
       phase = 'allocation';
+      resuming = entry.recovered && !entry.worker;
       const container = await this.pool.acquire(
         id,
         controller.signal,
@@ -242,12 +301,19 @@ export class CallerScopedBackend implements Backend {
         entry.worker = undefined;
         entry.contexts.clear();
         entry.recovered = true;
+        resuming = true;
       }
       if (!entry.worker) {
         entry.worker = await this.factory(container, controller.signal);
         entry.dockerId = container.dockerId;
       }
       controller.signal.throwIfAborted();
+      if (resuming) {
+        await this.pool.recordLifecycle(id, { lastResume: {
+          at: new Date().toISOString(), outcome: 'conversation-reset',
+        } });
+        resuming = false;
+      }
       if (entry.recovered && !entry.contexts.has(context)) {
         emit({
           type: 'task.status',
@@ -304,6 +370,13 @@ export class CallerScopedBackend implements Backend {
       emit(terminal);
     } catch (error) {
       clearInterval(monitor);
+      if (resuming) {
+        try {
+          await this.pool.recordLifecycle(id, { lastResume: {
+            at: new Date().toISOString(), outcome: 'failed',
+          } });
+        } catch { entry.quarantined = true; }
+      }
       if (error instanceof CallerStorageLimitError)
         storageFailure = true;
       console.error(
@@ -397,6 +470,7 @@ export class CallerScopedBackend implements Backend {
         this.pending--;
         entry.users--;
         if (!entry.retained && !entry.quarantined && entry.users === 0) this.entries.delete(id);
+        else if (entry.users === 0) this.armIdle(id, entry);
       };
       void previous.then(releaseSlot, releaseSlot);
       signal.removeEventListener('abort', abort);
@@ -405,6 +479,7 @@ export class CallerScopedBackend implements Backend {
   }
   stop() {
     this.stopped = true;
+    for (const entry of this.entries.values()) this.cancelIdle(entry);
     for (const controller of this.controllers) controller.abort();
   }
   async close(): Promise<void> {

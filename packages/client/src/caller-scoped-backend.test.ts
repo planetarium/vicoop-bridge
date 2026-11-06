@@ -6,6 +6,8 @@ import {
 } from './caller-scoped-backend.js';
 import { CallerRuntimeConfig } from './caller-runtime-config.js';
 import { scopeDigest } from './caller-runtime-store.js';
+import type { CallerRuntimeLifecycle } from './caller-runtime-store.js';
+import { setImmediate as flush } from 'node:timers/promises';
 import { CallerEnvironmentPendingError, CallerAllocationIncompleteError, CallerOrphanedResourcesError, CallerStorageMissingError, CallerStorageLimitError, type DockerCallerRuntimePool } from './caller-runtime-docker.js';
 import type { Backend } from './backend.js';
 import { formatFederatedPrincipal, TRACEABILITY_EXTENSION_URI, type TaskAssignFrame, type UpFrame } from '@vicoop-bridge/protocol';
@@ -44,6 +46,8 @@ function fixture(handle?: Backend['handle'], opts = {}) {
     workers: string[] = [],
     contexts: string[] = [];
   const existing = new Set<string>();
+  const workerInstances: CallerWorker[] = [];
+  const lifecycle: Array<{ id: string; update: CallerRuntimeLifecycle }> = [];
   let storageFails = false,
     stopFails = false;
   const pool = {
@@ -79,6 +83,7 @@ function fixture(handle?: Backend['handle'], opts = {}) {
       existing.delete(id);
     },
     close: async () => {},
+    recordLifecycle: async (id: string, update: CallerRuntimeLifecycle) => { lifecycle.push({ id, update }); },
   } as unknown as DockerCallerRuntimePool;
   const backend = new CallerScopedBackend('agent', pool, async (c) => {
     workers.push(c.id);
@@ -103,6 +108,7 @@ function fixture(handle?: Backend['handle'], opts = {}) {
       settle: async () => {},
       close: () => {},
     };
+    workerInstances.push(worker);
     return worker;
   });
   const run = async (t = task(), signal = new AbortController().signal) => {
@@ -118,6 +124,8 @@ function fixture(handle?: Backend['handle'], opts = {}) {
     stops,
     workers,
     contexts,
+    workerInstances,
+    lifecycle,
     failStorage: () => {
       storageFails = true;
     },
@@ -633,4 +641,225 @@ test('federated caller mismatch or policy downgrade rejects before allocation', 
     }
     assert.equal(f.allocations.length, 0);
   } finally { await f.backend.close(); }
+});
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(r => { resolve = r; });
+  return { promise, resolve };
+}
+
+test('idle timeout defaults to disabled, accepts zero and rejects unsafe timer values', () => {
+  assert.equal(options.idleTimeoutMs, 0);
+  assert.equal(CallerRuntimeConfig.parse({ ...options, idleTimeoutMs: 0 }).idleTimeoutMs, 0);
+  for (const idleTimeoutMs of [-1, 0.5, Infinity, 2147483648])
+    assert.throws(() => CallerRuntimeConfig.parse({ ...options, idleTimeoutMs }));
+});
+
+test('disabled idle reclamation retains the live worker', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture();
+  await f.run();
+  t.mock.timers.tick(2147483647);
+  await flush();
+  await f.run();
+  assert.equal(f.stops.length, 0);
+  assert.equal(f.workers.length, 1);
+  await f.backend.close();
+});
+
+test('idle stop releases the worker, resets conversation routing and retains scope capacity', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture(undefined, { idleTimeoutMs: 100, maxScopes: 1 });
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const frames = await f.run(task('alice', 'same-context', `task-${cycle}`));
+    assert.equal(frames.at(-1)?.type, 'task.complete');
+    assert.equal(JSON.stringify(frames).includes('conversationReset'), cycle > 0);
+    assert.equal(f.workers.length, cycle + 1);
+    let closed = 0, stopped = 0;
+    const worker = f.workerInstances[cycle];
+    // The production broker becomes unhealthy when intentionally closed.
+    worker.healthy = () => closed === 0;
+    worker.close = () => { closed++; };
+    worker.backend.stop = () => { stopped++; };
+    t.mock.timers.tick(99);
+    await flush();
+    assert.equal(f.stops.length, cycle);
+    t.mock.timers.tick(1);
+    await flush();
+    assert.equal(f.stops.length, cycle + 1);
+    assert.equal(closed, 1);
+    assert.equal(stopped, 1);
+    assert.equal(f.lifecycle.at(-1)?.update.lastIdleStop?.outcome, 'stopped');
+    assert.match(JSON.stringify(await f.run(task('bob'))), /runtime_capacity/);
+  }
+  assert.equal(new Set(f.contexts).size, 1);
+  assert.equal(f.lifecycle.filter(e => e.update.lastResume?.outcome === 'conversation-reset').length, 2);
+  await f.backend.close();
+});
+
+test('active approval waits, queued work, file settling and storage checks never become idle', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const approval = deferred(), entered = deferred(), files = deferred(), storage = deferred();
+  const seen: string[] = [];
+  const f = fixture(async (task, emit) => {
+    seen.push(task.taskId);
+    if (task.taskId === 'approval') { entered.resolve(); await approval.promise; }
+    emit({ type: 'task.complete', taskId: task.taskId, status: { state: 'completed', timestamp: '' } });
+  }, { idleTimeoutMs: 100 });
+  const first = f.run(task('alice', 'a', 'approval'));
+  await entered.promise;
+  f.workerInstances[0].settle = () => files.promise;
+  f.pool.checkStorage = () => storage.promise;
+  const queued = f.run(task('alice', 'b', 'queued'));
+  t.mock.timers.tick(1000);
+  await flush();
+  assert.equal(f.stops.length, 0);
+  assert.deepEqual(seen, ['approval']);
+  approval.resolve();
+  await flush();
+  t.mock.timers.tick(1000);
+  await flush();
+  assert.equal(f.stops.length, 0);
+  files.resolve();
+  await flush();
+  t.mock.timers.tick(1000);
+  await flush();
+  assert.equal(f.stops.length, 0);
+  storage.resolve();
+  await Promise.all([first, queued]);
+  assert.deepEqual(seen, ['approval', 'queued']);
+  t.mock.timers.tick(99);
+  await flush();
+  assert.equal(f.stops.length, 0);
+  t.mock.timers.tick(1);
+  await flush();
+  assert.equal(f.stops.length, 1);
+  await f.backend.close();
+});
+
+test('admission at the timer boundary invalidates a queued idle decision', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture(undefined, { idleTimeoutMs: 100 });
+  await f.run();
+  t.mock.timers.tick(100); // Callback installed its barrier; cleanup has not started.
+  const frames = await f.run();
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+  assert.equal(f.stops.length, 0);
+  assert.equal(f.workers.length, 1);
+  t.mock.timers.tick(100);
+  await flush();
+  assert.equal(f.stops.length, 1);
+  await f.backend.close();
+});
+
+test('request arriving during idle stop waits for confirmation; canceled waiters cannot overtake it', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture(undefined, { idleTimeoutMs: 100 });
+  await f.run();
+  const entered = deferred(), confirmed = deferred();
+  const stop = f.pool.stop.bind(f.pool);
+  f.pool.stop = async id => { entered.resolve(); await confirmed.promise; await stop(id); };
+  t.mock.timers.tick(100);
+  await entered.promise;
+  const controller = new AbortController();
+  const canceled = f.run(task('alice', 'b', 'canceled'), controller.signal);
+  const next = f.run(task('alice', 'c', 'next'));
+  controller.abort();
+  assert.match(JSON.stringify(await canceled), /runtime_canceled/);
+  await flush();
+  assert.equal(f.workers.length, 1);
+  assert.equal(f.lifecycle.length, 0);
+  confirmed.resolve();
+  const frames = await next;
+  assert.match(JSON.stringify(frames), /conversationReset/);
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+  assert.equal(f.workers.length, 2);
+  assert.equal(f.stops.length, 1);
+  await f.backend.close();
+});
+
+for (const failure of ['stop', 'settle', 'close'] as const) {
+  test(`idle ${failure} failure quarantines that caller and still attempts container stop`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const f = fixture(undefined, { idleTimeoutMs: 100 });
+    await f.run();
+    if (failure === 'stop') f.failStop();
+    if (failure === 'settle') f.workerInstances[0].settle = async () => { throw Error('unconfirmed'); };
+    if (failure === 'close') f.workerInstances[0].close = () => { throw Error('unconfirmed'); };
+    t.mock.timers.tick(100);
+    await flush();
+    assert.equal(f.stops.length, 1);
+    assert.equal(f.lifecycle.at(-1)?.update.lastIdleStop?.outcome, 'quarantined');
+    assert.match(JSON.stringify(await f.run()), /runtime_quarantined/);
+    assert.equal((await f.run(task('bob'))).at(-1)?.type, 'task.complete');
+    assert.equal(f.workers.length, 2);
+    await f.backend.close();
+  });
+}
+
+test('shutdown invalidates timer callbacks before releasing pool ownership', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture(undefined, { idleTimeoutMs: 100 });
+  await f.run();
+  t.mock.timers.tick(100);
+  await f.backend.close();
+  t.mock.timers.tick(1000);
+  await flush();
+  assert.equal(f.stops.length, 0);
+  assert.equal(f.lifecycle.length, 0);
+});
+
+test('shutdown waits for an idle stop already in progress before pool close', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture(undefined, { idleTimeoutMs: 100 });
+  await f.run();
+  const entered = deferred(), confirmed = deferred();
+  f.pool.stop = async () => { entered.resolve(); await confirmed.promise; };
+  let poolClosed = false;
+  f.pool.close = async () => { poolClosed = true; };
+  t.mock.timers.tick(100);
+  await entered.promise;
+  const closing = f.backend.close();
+  await flush();
+  assert.equal(poolClosed, false);
+  confirmed.resolve();
+  await closing;
+  assert.equal(poolClosed, true);
+  t.mock.timers.tick(1000);
+  await flush();
+  assert.equal(f.lifecycle.length, 1);
+});
+
+test('failed reacquisition reports a failed resume without inventing conversation restoration', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture(undefined, { idleTimeoutMs: 100 });
+  await f.run();
+  t.mock.timers.tick(100);
+  await flush();
+  f.pool.acquire = async () => { throw Error('boundary invalid'); };
+  const frames = await f.run();
+  assert.equal(frames.at(-1)?.type, 'task.fail');
+  assert.doesNotMatch(JSON.stringify(frames), /conversationReset/);
+  assert.equal(f.lifecycle.at(-1)?.update.lastResume?.outcome, 'failed');
+  await f.backend.close();
+});
+
+test('idle cleanup timeout still stops the container and rejects a waiting request as quarantined', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture(undefined, { idleTimeoutMs: 100 });
+  await f.run();
+  f.workerInstances[0].settle = () => new Promise(() => {});
+  t.mock.timers.tick(100);
+  await flush();
+  const waiting = f.run();
+  t.mock.timers.tick(14999);
+  await flush();
+  assert.equal(f.stops.length, 0);
+  assert.equal(f.workers.length, 1);
+  t.mock.timers.tick(1);
+  assert.match(JSON.stringify(await waiting), /runtime_quarantined/);
+  assert.equal(f.stops.length, 1);
+  assert.equal(f.lifecycle.at(-1)?.update.lastIdleStop?.outcome, 'quarantined');
+  await f.backend.close();
 });

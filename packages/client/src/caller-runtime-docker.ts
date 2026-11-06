@@ -2,7 +2,7 @@ import { CallerStorage, CallerStorageHelperUnconfirmedError } from './caller-sto
 import { randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
 import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
-import { CallerRuntimeStore, scopeDigest } from './caller-runtime-store.js';
+import { CallerRuntimeStore, scopeDigest, type CallerRuntimeLifecycle } from './caller-runtime-store.js';
 import { brokerFirewallScript } from './execution-runtime-boundary.js';
 import { PROVIDER_ENV_PATTERN } from './provider-environment.js';
 import { assertCallerRuntimeBackend, type CallerRuntimeOptions } from './caller-runtime-config.js';
@@ -415,9 +415,15 @@ export class DockerCallerRuntimePool {
     return {
       container: name,
       state: info ? (info.State.Running ? 'running' : 'stopped') : 'absent',
+      lifecycle: await this.store.lifecycle(id),
       workspace: { volume: `${name}-${this.options.fixedImageStorage ? 'storage' : 'workspace'}`, path: '/workspace', ...(this.options.fixedImageStorage ? { subpath: 'workspace' } : {}) },
       sessions: { volume: `${name}-${this.options.fixedImageStorage ? 'storage' : 'sessions'}`, path: `/data/sessions/${this.kind}`, ...(this.options.fixedImageStorage ? { subpath: 'sessions' } : {}) },
     };
+  }
+  async recordLifecycle(id: string, update: CallerRuntimeLifecycle): Promise<void> {
+    await this.store.recordLifecycle(id, update);
+    // Only the opaque scope digest and fixed outcome vocabulary are logged.
+    console.info('Caller runtime lifecycle:', JSON.stringify({ scope: id, ...update }));
   }
   /** Prepare a caller under the same exclusive owner lock as the daemon.
    * initialize(false, true) first validates that retained containers are stopped.

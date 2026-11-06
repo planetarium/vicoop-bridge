@@ -167,6 +167,7 @@ test('reinitialization preserves paths/limits, reuses image and supports the oth
   });
   const config = await f.read();
   config.backends.claude.caller_runtime.maxScopes = 3;
+  config.backends.claude.caller_runtime.idleTimeoutMs = 300000;
   config.backends.claude.caller_runtime.sharedVolumes = [{ name: 'docs', volume: 'company-docs-v1' }];
   config.backends.claude.caller_runtime.sharedBinds = [{ name: 'assets', source: '/srv/assets' }];
   config.backends.claude.caller_runtime.systemPrompt = 'Search /shared/assets.';
@@ -178,6 +179,7 @@ test('reinitialization preserves paths/limits, reuses image and supports the oth
     false,
   );
   assert.equal((await f.read()).backends.claude.caller_runtime.maxScopes, 3);
+  assert.equal((await f.read()).backends.claude.caller_runtime.idleTimeoutMs, 300000);
   assert.deepEqual((await f.read()).backends.claude.caller_runtime.sharedVolumes, [{ name: 'docs', volume: 'company-docs-v1' }]);
   assert.deepEqual((await f.read()).backends.claude.caller_runtime.sharedBinds, [{name:'assets',source:'/srv/assets'}]);
   assert.equal((await f.read()).backends.claude.caller_runtime.systemPrompt, 'Search /shared/assets.');
