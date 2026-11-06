@@ -1306,3 +1306,79 @@ test('paid output is authorized before publication and failed upto work remains 
     assert.equal(sent.map(parseDownFrame).some(frame => frame.type === 'task.cancel'), blocked);
   }
 });
+
+test('cancel during payment verification prevents a detached native dispatch', async () => {
+  const { ws, sent } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({ agentId: 'pending-payment', clientId: 'client', ownerPrincipal: 'owner',
+    agentCard: makeAgentCard(), allowedCallers: [], ws, connectedAt: 0 });
+  const store = new InMemoryTaskStore();
+  const executor = new WSForwardingExecutor('pending-payment', registry, store);
+  let release!: () => void;
+  const ready = new Promise<void>(resolve => { release = resolve; });
+  let cleared!: () => void;
+  const cleanup = new Promise<void>(resolve => { cleared = resolve; });
+  Object.assign(executor, { currentGate: () => ({
+    open: async () => { await ready; return { kind: 'proceed', settlement: { mode: 'deferred', obligation: {} } }; },
+    clear: async () => { cleared(); },
+  }) });
+  const handler = new DefaultRequestHandler(new A2XServer({ taskStore: store, executor, protocolVersion: '0.3' }));
+  const accepted = await handler.handle({ jsonrpc: '2.0', id: 1, method: 'message/send', params: {
+    message: { role: 'user', messageId: 'pending', parts: [{ text: 'work' }] }, configuration: { blocking: false },
+  } }) as { result: Task };
+  const canceled = await handler.handle({ jsonrpc: '2.0', id: 2, method: 'tasks/cancel', params: { id: accepted.result.id } }) as { result: Task };
+  assert.equal(canceled.result.status.state, TaskState.CANCELED);
+  release();
+  await cleanup;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await store.getTask(accepted.result.id))?.status.state, TaskState.CANCELED);
+  assert.equal(sent.map(parseDownFrame).filter(frame => frame.type === 'task.assign').length, 0);
+  assert.equal(registry.getBinding(accepted.result.id), undefined);
+});
+
+test('transient unary progress persistence failures do not orphan native work', async () => {
+  for (const failing of ['status', 'artifact'] as const) {
+    const { ws, sent } = makeWsCapture();
+    const registry = new Registry();
+    registry.registerAgent({ agentId: 'progress-retry', clientId: 'client', ownerPrincipal: 'owner',
+      agentCard: makeAgentCard(), allowedCallers: [], ws, connectedAt: 0 });
+    const store = new InMemoryTaskStore();
+    const originalUpdate = store.updateTask.bind(store);
+    let failures = 0;
+    store.updateTask = async (id, update) => {
+      if (failures === 0 && (failing === 'artifact' ? update.artifacts !== undefined : update.status?.message?.messageId === 'progress')) {
+        failures++;
+        throw new Error('temporary progress persistence outage');
+      }
+      return originalUpdate(id, update);
+    };
+    const executor = new WSForwardingExecutor('progress-retry', registry, store);
+    const handler = new DefaultRequestHandler(new A2XServer({ taskStore: store, executor, protocolVersion: '0.3' }));
+    const accepted = await handler.handle({ jsonrpc: '2.0', id: 1, method: 'message/send', params: {
+      message: { role: 'user', messageId: 'progress-input', parts: [{ text: 'work' }] }, configuration: { blocking: false },
+    } }) as { result: Task };
+    const id = accepted.result.id;
+    const waitFor = async (predicate: () => boolean | Promise<boolean>) => {
+      for (let i = 0; i < 100; i++) {
+        if (await predicate()) return;
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      assert.fail('expected execution transition');
+    };
+    await waitFor(() => !!registry.getBinding(id));
+    const binding = registry.getBinding(id)!;
+    binding.sink.pushStatus({ taskId: id, contextId: accepted.result.contextId!, final: false,
+      status: { state: TaskState.WORKING, message: { role: 'agent', messageId: 'progress', parts: [{ text: 'preparing' }] } } });
+    binding.sink.pushArtifact({ taskId: id, contextId: accepted.result.contextId!,
+      artifact: { artifactId: 'partial', parts: [{ text: 'partial output' }] } });
+    await waitFor(() => failures === 1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(registry.getBinding(id), binding);
+    assert.equal((await store.getTask(id))?.status.state, TaskState.WORKING);
+    binding.sink.pushStatus({ taskId: id, contextId: accepted.result.contextId!, final: true, status: { state: TaskState.COMPLETED } });
+    binding.sink.finish();
+    await waitFor(async () => (await store.getTask(id))?.status.state === TaskState.COMPLETED);
+    assert.equal((await store.getTask(id))?.artifacts?.[0]?.artifactId, 'partial');
+    assert.equal(sent.map(parseDownFrame).filter(frame => frame.type === 'task.assign').length, 1);
+  }
+});

@@ -76,7 +76,16 @@ payment lifecycle. A failed publication check withholds the output and sends
 `task.cancel` to the backend. Atomic lifecycle and delivery writes prevent a
 concurrent status update from erasing the publication marker. If settlement's
 outcome is indeterminate, the lifecycle and claim remain for reconciliation
-until their existing expiry; task cleanup does not immediately erase them.
+until their retention deadline; task cleanup does not immediately erase them.
+The successful payment claim extends lifecycle retention to at least 24 hours
+by default, independently of the unsigned offer's signing window. This allows
+already accepted work to produce its first output after that window closes.
+Duplicate claims do not renew retention, and releasing a retryable claim restores
+the original signing deadline. This records acceptance, not publication: the
+publication marker is still written only when output is about to be exposed.
+While a claim is live, unpaid retries and late classification or verification
+results cannot replace its accepted lifecycle. Settlement failures, including
+indeterminate outcomes, are still recorded.
 
 If settlement fails on the `upto` path the task is reported `failed` rather
 than `completed` — the caller got the work but the merchant was not paid, and
@@ -265,6 +274,7 @@ event is the only thing telling you so.
 | `BRIDGE_X402_VERSION` | `2` | Wire version this deployment emits. Set to `1` only to serve clients built against the older reference lineage. A server speaks exactly one version — there is no per-request negotiation, because the activation URI is version-neutral. |
 | `BRIDGE_X402_FACILITATOR_URL` | SDK default (`https://x402.org/facilitator`) | Facilitator running verify + settle. |
 | `BRIDGE_X402_OFFER_TTL_SECONDS` | `600` | How long a payer has to sign and resubmit. Past it the offering lapses and the submission is refused; the payer is not charged, they just start over. |
+| `BRIDGE_X402_LIFECYCLE_TTL_SECONDS` | `86400` | Minimum retention after a successful claim for accepted work and settlement reconciliation. Set longer than the longest supported execution; this never renews on duplicate claims and does not extend an unsigned offer's signing deadline. |
 
 **`PUBLIC_URL` is required for paid agents.** The x402 `resource` must be an
 absolute URL — strict facilitators reject anything else — so without it an

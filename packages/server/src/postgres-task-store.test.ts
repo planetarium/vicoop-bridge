@@ -17,6 +17,7 @@ import {
   parsePersistRequestEnvelope,
 } from './postgres-task-store.js';
 import { ensureSchema, type Sql } from './db.js';
+import { executionWriter, type ExecutionWriter } from './execution-marker.js';
 
 const hasDb = !!process.env.DATABASE_URL;
 
@@ -912,3 +913,36 @@ test(
     }
   },
 );
+
+
+test('cancellation wins late message writes while superseded executions retain their own view', { skip: !hasDb }, async () => {
+  const sql = postgres(process.env.DATABASE_URL!, { onnotice() {} });
+  const store = new PostgresTaskStore(sql);
+  const ids: string[] = [];
+  try {
+    await ensureSchema(sql);
+    for (const dispatched of [false, true]) {
+      const task = await store.createTask({});
+      ids.push(task.id);
+      const writer: ExecutionWriter = { message: true };
+      if (dispatched) await executionWriter.run(writer, () => store.markExecution(task.id, 'execution', []));
+      await store.updateTask(task.id, { status: { state: TaskState.CANCELED } });
+      for (const state of [TaskState.WORKING, TaskState.INPUT_REQUIRED, TaskState.COMPLETED, TaskState.FAILED]) {
+        const result = await executionWriter.run(writer, () => store.updateTask(task.id, {
+          status: { state }, artifacts: [{ artifactId: 'late', parts: [{ text: 'too late' }] }],
+        }));
+        assert.equal(result.status.state, TaskState.CANCELED);
+        const stored = await store.getTask(task.id);
+        assert.equal(stored?.status.state, TaskState.CANCELED);
+        assert.equal(stored?.artifacts, undefined);
+      }
+      const superseded = { message: true, marked: true, dispatchId: 'old-dispatch', executionId: 'old-execution' };
+      const old = await executionWriter.run(superseded, () => store.updateTask(task.id, { status: { state: TaskState.FAILED } }));
+      assert.equal(old.status.state, TaskState.FAILED);
+      assert.equal((await store.getTask(task.id))?.status.state, TaskState.CANCELED);
+    }
+  } finally {
+    await Promise.all(ids.map(id => store.deleteTask(id)));
+    await sql.end();
+  }
+});

@@ -273,12 +273,16 @@ export class WSForwardingExecutor extends AgentExecutor {
       // Nonblocking message/send detaches this drain from its response.
       // Unlike the SDK's SSE pump, the unary runner only saves on completion,
       // so publish intermediate snapshots here for subsequent tasks/get.
-      if ('artifact' in event) {
-        await this.taskStore.updateTask(task.id, {
-          artifacts: task.artifacts,
-        });
-      } else if (!TERMINAL_STATES.has(event.status.state)) {
-        await this.taskStore.updateTask(task.id, { status: task.status, history: task.history });
+      try {
+        if ('artifact' in event) {
+          await this.taskStore.updateTask(task.id, { artifacts: task.artifacts });
+        } else if (!TERMINAL_STATES.has(event.status.state)) {
+          await this.taskStore.updateTask(task.id, { status: task.status, history: task.history });
+        }
+      } catch (err) {
+        // A failed progress snapshot must not close the generator and orphan
+        // native work. Later snapshots and the terminal save can recover it.
+        logEvent('task_persist_error', { taskId: task.id, phase: 'unary_progress', error: String(err) });
       }
     }
     return task;
@@ -556,26 +560,66 @@ export class WSForwardingExecutor extends AgentExecutor {
     // Replay-capable tasks intentionally expose only this execution's output.
     const priorArtifacts = executionId === undefined ? task.artifacts ?? [] : [];
     let rejection: { code: string; message: string; suffix: string } | undefined;
+    let interrupted: Task | undefined;
+    let sent = false;
+    let history = appendHistoryMessage(task.history ?? [], message);
+    const dispatch = (): boolean => {
+      if (!this.registry.bindTask(binding)) return false;
+      task.metadata = withExecutionMarker(task.metadata as Record<string, unknown> | undefined, executionId);
+      if (executionId !== undefined) delete task.artifacts;
+      this.abortControllers.set(taskId, ac);
+      task.history = history;
+      sent = this.registry.sendToAgent(this.agentId, {
+        type: 'task.assign', taskId,
+        ...(executionId !== undefined ? { executionId } : {}), contextId,
+        message: {
+          role: message.role, parts: partsToWire(message.parts), messageId: message.messageId,
+          ...(forwardMetadata !== undefined ? { metadata: forwardMetadata } : {}),
+          ...(message.extensions !== undefined ? { extensions: message.extensions } : {}),
+        },
+        ...(message.extensions !== undefined ? { requestedExtensions: message.extensions } : {}),
+        ...(caller !== undefined ? { caller } : {}),
+        ...(executionScope !== undefined ? { executionScope } : {}),
+      });
+      return true;
+    };
     try {
       const store = this.taskStore;
-      const bound = supportsExecutionMarking(store)
+      // Acceptance can precede payment checks or marker persistence. Serialize
+      // the entire dispatch (including task.assign) with cancellation so a
+      // canceled task cannot be revived, nor can cancel arrive before assign.
+      const bound = typeof store.getTask === 'function'
         ? await this.registry.serializeDispatch(taskId, async () => {
+          const current = await store.getTask(taskId);
+          if (current && TERMINAL_STATES.has(current.status.state)) {
+            interrupted = current;
+            return false;
+          }
           const holder = this.registry.getBinding(taskId);
-          if (holder && holder.agentId !== this.agentId) return this.registry.bindTask(binding);
-          await store.markExecution(taskId, executionId, accumulatedArtifacts);
-          return this.registry.bindTask(binding);
+          if (holder && holder.agentId !== this.agentId) return false;
+          if (supportsExecutionMarking(store)) await store.markExecution(taskId, executionId, accumulatedArtifacts);
+          return dispatch();
         })
-        : this.registry.bindTask(binding);
-      if (!bound) {
+        : dispatch();
+      if (!bound && !interrupted) {
         rejection = { code: 'task_owner_mismatch', message: 'task ownership validation failed', suffix: 'owner-mismatch' };
       }
     } catch (err) {
       logEvent('task_persist_error', { taskId, phase: 'execution_marker', error: String(err) });
       rejection = { code: 'task_persist_failed', message: 'task dispatch could not be recorded', suffix: 'persist-failed' };
     }
-    if (!rejection) {
-      task.metadata = withExecutionMarker(task.metadata as Record<string, unknown> | undefined, executionId);
-      if (executionId !== undefined) delete task.artifacts;
+    if (interrupted) {
+      queue.end();
+      const event = { taskId, contextId, final: true, status: interrupted.status };
+      const terminal = gate && settlement
+        ? await this.settleTerminal(gate, settlement, event, binding, taskId, contextId)
+        : event;
+      task.status = terminal.status;
+      task.history = interrupted.history;
+      task.artifacts = interrupted.artifacts;
+      task.metadata = interrupted.metadata;
+      yield terminal;
+      return;
     }
     if (rejection) {
       // This queue will never be consumed because the binding was rejected.
@@ -624,28 +668,6 @@ export class WSForwardingExecutor extends AgentExecutor {
       }
       return;
     }
-    this.abortControllers.set(taskId, ac);
-
-    let history = appendHistoryMessage(task.history ?? [], message);
-    task.history = history;
-
-    const sent = this.registry.sendToAgent(this.agentId, {
-      type: 'task.assign',
-      taskId,
-      ...(executionId !== undefined ? { executionId } : {}),
-      contextId,
-      message: {
-        role: message.role,
-        parts: partsToWire(message.parts),
-        messageId: message.messageId,
-        ...(forwardMetadata !== undefined ? { metadata: forwardMetadata } : {}),
-        ...(message.extensions !== undefined ? { extensions: message.extensions } : {}),
-      },
-      ...(message.extensions !== undefined ? { requestedExtensions: message.extensions } : {}),
-      ...(caller !== undefined ? { caller } : {}),
-      ...(executionScope !== undefined ? { executionScope } : {}),
-    });
-
     if (!sent) {
       logEvent('task_unreachable', {
         agentId: this.agentId,
@@ -876,6 +898,13 @@ export class WSForwardingExecutor extends AgentExecutor {
   }
 
   override async cancel(task: Task): Promise<Task> {
+    return this.registry.serializeDispatch(task.id, () => this.cancelCurrent(task));
+  }
+
+  private async cancelCurrent(task: Task): Promise<Task> {
+    const latest = await this.taskStore.getTask?.(task.id);
+    if (latest) task = latest;
+    if (TERMINAL_STATES.has(task.status.state)) throw new TaskNotCancelableError('Task cannot be canceled');
     const taskId = task.id;
     const contextId = task.contextId ?? taskId;
     const ac = this.abortControllers.get(taskId);

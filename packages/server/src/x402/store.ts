@@ -2,6 +2,7 @@ import {
   BaseX402Store,
   type MerchantOffer,
   type MerchantOfferStore,
+  type MerchantOfferClaimStatus,
   type X402StoreEntry,
   type X402StoreEntryPatch,
   type X402EntryStatus,
@@ -32,6 +33,14 @@ interface PublishingContext {
 }
 
 const publishingOffer = new AsyncLocalStorage<PublishingContext>();
+
+// Accepted work and settlement reconciliation outlive the payer's signing
+// window. Keep that lifecycle bounded, without turning offer expiry into a
+// deadline for the first backend output. A duplicate claim never renews it.
+const LIFECYCLE_TTL_SECONDS = (() => {
+  const value = Number(process.env.BRIDGE_X402_LIFECYCLE_TTL_SECONDS);
+  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : 86_400;
+})();
 
 // Postgres-backed x402 offering store.
 //
@@ -160,8 +169,8 @@ export class PostgresX402Store extends BaseX402Store implements MerchantOfferSto
         )
       `;
 
-      const rows = await tx<{ offer: unknown }[]>`
-        SELECT offer
+      const rows = await tx<{ offer: unknown; claimed_at: Date | null }[]>`
+        SELECT offer, claimed_at
         FROM x402_offerings
         WHERE agent_id = ${this.agentId}
           AND task_id = ${taskId}
@@ -170,6 +179,12 @@ export class PostgresX402Store extends BaseX402Store implements MerchantOfferSto
         FOR UPDATE
       `;
       const existing = rows[0];
+      // The SDK's replay hint is a read before this transaction. Recheck the
+      // claim under the row lock so a racing unpaid retry cannot replace an
+      // accepted payment's lifecycle, publication audit, or retention.
+      if (existing?.claimed_at !== null && existing?.claimed_at !== undefined) {
+        throw new Error(`x402 offering ${taskId} is already claimed`);
+      }
       const frozenOffer = existing ? reviveOffer(existing.offer) : offer;
       if (frozenOffer === undefined) {
         throw new Error(`live x402 offering ${taskId} has no frozen offer`);
@@ -253,6 +268,11 @@ export class PostgresX402Store extends BaseX402Store implements MerchantOfferSto
   ): Promise<boolean> {
     // A single row update serializes lifecycle patches with publication
     // decisions. A stale get/put cycle can erase the publication marker.
+    // Verification/classification started by a competing request may finish
+    // after the winner claims payment. It no longer owns that lifecycle;
+    // settlement failures from the accepted execution must still be recorded.
+    const preAcceptance = patch.status === 'verified' ||
+      (patch.failure !== undefined && patch.failure.point !== 'settle');
     const rows = await this.sql`
       UPDATE x402_offerings
       SET entry = entry || ${this.sql.json(JSON.parse(JSON.stringify(patch)))}::jsonb
@@ -260,6 +280,7 @@ export class PostgresX402Store extends BaseX402Store implements MerchantOfferSto
           updated_at = clock_timestamp()
       WHERE agent_id = ${this.agentId} AND task_id = ${taskId}
         AND entry->>'status' = ANY(${[...expected]}::text[])
+        AND (${!preAcceptance} OR claimed_at IS NULL)
         AND (expires_at IS NULL OR expires_at > clock_timestamp())
       RETURNING task_id
     `;
@@ -351,7 +372,13 @@ export class PostgresX402Store extends BaseX402Store implements MerchantOfferSto
   async claim(taskId: string): Promise<boolean> {
     const rows = await this.sql`
       UPDATE x402_offerings
-      SET claimed_at = now(), updated_at = now()
+      SET claimed_at = clock_timestamp(), updated_at = clock_timestamp(),
+          entry = entry || jsonb_build_object(
+            '_bridgeOfferExpiresAt', expires_at,
+            'expiresAt', GREATEST(expires_at, clock_timestamp() + ${LIFECYCLE_TTL_SECONDS} * interval '1 second'),
+            'updatedAt', clock_timestamp()
+          ),
+          expires_at = GREATEST(expires_at, clock_timestamp() + ${LIFECYCLE_TTL_SECONDS} * interval '1 second')
       WHERE agent_id = ${this.agentId}
         AND task_id = ${taskId}
         AND claimed_at IS NULL
@@ -359,6 +386,16 @@ export class PostgresX402Store extends BaseX402Store implements MerchantOfferSto
       RETURNING task_id
     `;
     return rows.length > 0;
+  }
+
+  async getClaimStatus(taskId: string): Promise<MerchantOfferClaimStatus | undefined> {
+    const rows = await this.sql<{ claimed: boolean }[]>`
+      SELECT claimed_at IS NOT NULL AS claimed
+      FROM x402_offerings
+      WHERE agent_id = ${this.agentId} AND task_id = ${taskId}
+        AND (expires_at IS NULL OR expires_at > clock_timestamp())
+    `;
+    return rows[0] ? (rows[0].claimed ? 'claimed' : 'available') : undefined;
   }
 
   /**
@@ -369,14 +406,21 @@ export class PostgresX402Store extends BaseX402Store implements MerchantOfferSto
    * would strand the payer with a cancelled payment and no way to retry. The
    * bridge never publishes batch-settlement pricing, so today this is
    * dormant; it exists because the `MerchantOfferStore` contract requires it
-   * and it must already be correct when the gate grows a caller. Unclaiming
-   * is unconditional within the agent scope: the row's expiry is irrelevant
-   * to giving the right back, and `claim` re-checks liveness anyway.
+   * and it must already be correct when the gate grows a caller. Releasing
+   * restores the original signing deadline atomically, so a retry cannot use
+   * the accepted-work retention window to submit an expired offer.
    */
   async release(taskId: string): Promise<void> {
     await this.sql`
       UPDATE x402_offerings
-      SET claimed_at = NULL, updated_at = now()
+      SET claimed_at = NULL, updated_at = clock_timestamp(),
+          expires_at = CASE WHEN jsonb_exists(entry, '_bridgeOfferExpiresAt')
+            THEN (entry->>'_bridgeOfferExpiresAt')::timestamptz ELSE expires_at END,
+          entry = CASE WHEN jsonb_exists(entry, '_bridgeOfferExpiresAt')
+            THEN (entry - '_bridgeOfferExpiresAt' - 'expiresAt') ||
+              jsonb_strip_nulls(jsonb_build_object('expiresAt', entry->'_bridgeOfferExpiresAt'))
+              || jsonb_build_object('updatedAt', clock_timestamp())
+            ELSE entry END
       WHERE agent_id = ${this.agentId} AND task_id = ${taskId}
     `;
   }

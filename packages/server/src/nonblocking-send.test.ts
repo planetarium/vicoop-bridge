@@ -8,6 +8,8 @@ import { SIWE_BEARER_AUTH_EXTENSION_URI, type DownFrame } from '@vicoop-bridge/p
 import { createHttpApp } from './http.js';
 import { ensureSchema } from './db.js';
 import { Registry } from './registry.js';
+import { PostgresTaskStore } from './postgres-task-store.js';
+import { WSForwardingExecutor } from './executor.js';
 import { issueSessionToken } from './auth/caller-token.js';
 
 test('nonblocking send retains ownership, partial files, and a single execution across lookups', {
@@ -106,6 +108,83 @@ test('nonblocking send retains ownership, partial files, and a single execution 
       assert.equal((await get(id)).artifacts?.length, 1);
     });
   }
+
+  await t.test('cancel during a delayed payment challenge is not overwritten by the halted send', async () => {
+    const prototype = WSForwardingExecutor.prototype;
+    const originalGate = Object.getOwnPropertyDescriptor(prototype, 'currentGate')!;
+    const originalUpdate = PostgresTaskStore.prototype.updateTask;
+    let release!: () => void;
+    const ready = new Promise<void>(resolve => { release = resolve; });
+    let haltedWrites = 0;
+    Object.defineProperty(prototype, 'currentGate', { configurable: true, value: () => ({
+      open: async ({ taskId, contextId }: { taskId: string; contextId: string }) => {
+        await ready;
+        return { kind: 'halt', event: { taskId, contextId, final: true, status: { state: TaskState.INPUT_REQUIRED } } };
+      },
+    }) });
+    PostgresTaskStore.prototype.updateTask = async function(id, update) {
+      const result = await originalUpdate.call(this, id, update);
+      if (update.status?.state === TaskState.INPUT_REQUIRED) haltedWrites++;
+      return result;
+    };
+    try {
+      const accepted = await (await rpc('message/send', {
+        message: { role: 'user', messageId: randomUUID(), parts: [{ text: 'cancel before payment challenge' }] },
+        configuration: { blocking: false },
+      })).json() as { result: Task };
+      const id = accepted.result.id;
+      const canceled = await (await rpc('tasks/cancel', { id })).json() as { result: Task };
+      assert.equal(canceled.result.status.state, TaskState.CANCELED);
+      release();
+      // Unary progress, gate-halt persistence, and SDK final persistence.
+      await waitFor(async () => haltedWrites === 3);
+      assert.equal((await get(id)).status.state, TaskState.CANCELED);
+      assert.equal(frames.some(frame => frame.type === 'task.assign' && frame.taskId === id), false);
+    } finally {
+      release();
+      Object.defineProperty(prototype, 'currentGate', originalGate);
+      PostgresTaskStore.prototype.updateTask = originalUpdate;
+    }
+  });
+
+  await t.test('cancel during marker persistence is delivered after dispatch and remains terminal', async () => {
+    const originalMark = PostgresTaskStore.prototype.markExecution;
+    const originalCancel = WSForwardingExecutor.prototype.cancel;
+    let markEntered!: () => void, cancelEntered!: () => void, release!: () => void;
+    const marking = new Promise<void>(resolve => { markEntered = resolve; });
+    const canceling = new Promise<void>(resolve => { cancelEntered = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    PostgresTaskStore.prototype.markExecution = async function(...args) {
+      markEntered();
+      await released;
+      return originalMark.apply(this, args);
+    };
+    WSForwardingExecutor.prototype.cancel = function(task) {
+      cancelEntered();
+      return originalCancel.call(this, task);
+    };
+    try {
+      const accepted = await (await rpc('message/send', {
+        message: { role: 'user', messageId: randomUUID(), parts: [{ text: 'cancel before dispatch completes' }] },
+        configuration: { blocking: false },
+      })).json() as { result: Task };
+      const id = accepted.result.id;
+      await marking;
+      const cancel = rpc('tasks/cancel', { id });
+      await canceling;
+      release();
+      const canceled = await (await cancel).json() as { result: Task };
+      assert.equal(canceled.result.status.state, TaskState.CANCELED);
+      await waitFor(async () => !registry.getBinding(id));
+      assert.equal((await get(id)).status.state, TaskState.CANCELED);
+      assert.deepEqual(frames.filter(frame => 'taskId' in frame && frame.taskId === id).map(frame => frame.type),
+        ['task.assign', 'task.cancel']);
+    } finally {
+      release();
+      PostgresTaskStore.prototype.markExecution = originalMark;
+      WSForwardingExecutor.prototype.cancel = originalCancel;
+    }
+  });
 
   for (const transport of ['v03', 'v1-rpc', 'v1-http'] as const) {
     for (const explicit of [false, true]) {

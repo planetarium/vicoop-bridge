@@ -398,6 +398,14 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
           throw new Error(`Task not found: ${taskId}`);
         }
         const { task: existing, dispatchId } = locked;
+        // Detached message work may finish payment checks or a progress write
+        // after tasks/cancel has committed. Preserve that cancellation, while
+        // still letting superseded writers return their own execution view.
+        if (writer?.message && existing.status.state === TaskState.CANCELED &&
+          (!writer.marked || writer.dispatchId === dispatchId)) {
+          skipped = { reason: 'canceled', current: dispatchId };
+          return existing;
+        }
         const next: Task = { ...existing };
         if (update.status !== undefined) next.status = update.status;
         if (update.artifacts !== undefined) next.artifacts = update.artifacts;
