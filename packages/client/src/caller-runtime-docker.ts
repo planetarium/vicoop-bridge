@@ -859,13 +859,18 @@ export class DockerCallerRuntimePool {
     }
   }
 
-  async inputDirectory(id: string, signal?: AbortSignal, context?: string): Promise<string> {
+  private inputTarget(id: string, context?: string, dockerId?: string): string {
+    if (dockerId === undefined) return this.name(id, context);
+    if (!/^[a-f0-9]{64}$/.test(dockerId)) throw new Error('invalid caller container identity');
+    return dockerId;
+  }
+  async inputDirectory(id: string, signal?: AbortSignal, context?: string, dockerId?: string): Promise<string> {
     const path = `/tmp/vicoop-input-${randomUUID()}`;
     await this.command([
       'exec',
       '--user',
       '1000:1000',
-      this.name(id, context),
+      this.inputTarget(id, context, dockerId),
       '/bin/mkdir',
       '-m',
       '700',
@@ -873,7 +878,7 @@ export class DockerCallerRuntimePool {
     ], signal);
     return path;
   }
-  async inputWrite(id: string, path: string, data: Buffer, signal?: AbortSignal, context?: string): Promise<void> {
+  async inputWrite(id: string, path: string, data: Buffer, signal?: AbortSignal, context?: string, dockerId?: string): Promise<void> {
     if (
       !/^\/tmp\/vicoop-input-[a-f0-9-]+\/image-\d+\.[a-z]+$/.test(path) ||
       data.length > 20 * 1048576
@@ -881,7 +886,7 @@ export class DockerCallerRuntimePool {
       throw new Error('invalid caller input');
     signal?.throwIfAborted();
     const result = await this.run([
-      'exec', '-i', '--user', '1000:1000', this.name(id, context), '/usr/local/bin/node', '-e',
+      'exec', '-i', '--user', '1000:1000', this.inputTarget(id, context, dockerId), '/usr/local/bin/node', '-e',
       'const fs=require("fs");const s=fs.createWriteStream(process.argv[1],{flags:"wx",mode:384});s.on("error",()=>process.exit(1));process.stdin.pipe(s);',
       path,
     ], { input: data, signal, timeoutMs: 30000 });
@@ -889,14 +894,14 @@ export class DockerCallerRuntimePool {
     if (result.exitCode !== 0) throw new Error('input transfer failed');
   }
 
-  async inputRemove(id: string, path: string, context?: string): Promise<void> {
+  async inputRemove(id: string, path: string, context?: string, dockerId?: string): Promise<void> {
     if (!/^\/tmp\/vicoop-input-[a-f0-9-]+$/.test(path))
       throw new Error('invalid caller input directory');
     await this.command([
       'exec',
       '--user',
       '1000:1000',
-      this.name(id, context),
+      this.inputTarget(id, context, dockerId),
       '/bin/rm',
       '-rf',
       '--',

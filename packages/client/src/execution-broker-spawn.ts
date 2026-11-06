@@ -12,19 +12,23 @@ import type { ChildHandle, SpawnFn } from './spawn-adapter.js';
 // The Docker channel itself binds a grant to this execution and runtime.
 // A grant stolen by runtime B is useless on B's separate HTTP parser; there
 // is no host TCP listener to address and A listens on container loopback only.
-export function createExecutionBrokerSpawn(container: string, opts: {
+export function createExecutionBrokerSpawn(container: string | (() => string), opts: {
   backend: 'claude' | 'codex';
   createBroker: () => ReturnType<typeof createExecutionAuthBroker>;
   ttlMs?: number;
   authentication?: 'oauth' | 'api-key';
   codexCatalog?: string;
   spawnImpl?: typeof nodeSpawn;
+  cleanupSpawnImpl?: typeof nodeSpawn;
   fileDelivery?: { description: string; bind(): (input: unknown, signal: AbortSignal) => Promise<object> };
 }) {
   const running = new Set<() => void>();
   let stopped = false;
   const spawn: SpawnFn = (command, args, options) => {
     if (stopped) throw new Error('Execution authentication transport is stopped');
+    // A cached context worker may bind a new container between executions.
+    // Capture once: delayed close/cleanup must never target its replacement.
+    const executionContainer = typeof container === 'function' ? container() : container;
     const env = options.env ?? {};
     // Per-spawn backend knobs only. Never carry arbitrary host environment.
     for (const key of Object.keys(env)) {
@@ -59,7 +63,7 @@ export function createExecutionBrokerSpawn(container: string, opts: {
     try {
       relay = (opts.spawnImpl ?? nodeSpawn)('docker', ['exec', '-i', '--user', '0',
         '-e', 'NODE_OPTIONS=', '-e', 'NODE_PATH=', '-e', 'LD_PRELOAD=', '-e', 'LD_LIBRARY_PATH=',
-        container, '/usr/bin/tini', '-s', '--', '/usr/local/bin/node', '-e',
+        executionContainer, '/usr/bin/tini', '-s', '--', '/usr/local/bin/node', '-e',
         EXECUTION_BROKER_SUPERVISOR, String(opts.ttlMs ?? 60 * 60_000), EXECUTION_BROKER_RELAY], { stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (error) {
       broker.revoke();
@@ -133,7 +137,7 @@ export function createExecutionBrokerSpawn(container: string, opts: {
       // shared runtime through the independent Docker control plane.
       stopped = true;
       for (const stop of running) stop();
-      const cleanup = nodeSpawn('docker', ['stop', '-t', '0', container], {stdio:'ignore'});
+      const cleanup = (opts.cleanupSpawnImpl ?? nodeSpawn)('docker', ['stop', '-t', '0', executionContainer], {stdio:'ignore'});
       let cleanupReported = false;
       const cleanupFinished = (confirmed: boolean) => {
         if (cleanupReported) return;

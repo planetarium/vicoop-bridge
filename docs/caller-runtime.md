@@ -890,7 +890,11 @@ conversation restoration. The legacy caller container used for initial allocatio
 and offline environment preparation remains retained and stopped.
 
 Cancellation, backend failure or uncertain execution cleanup closes only the
-affected context's broker/worker and removes its container. Cleanup failure
+affected context's broker/worker and removes its container. Each process captures
+its immutable Docker ID for exec and delayed cleanup; a late callback from a
+removed container cannot stop a subsequent execution that reuses its name.
+Cached conversation workers rebind to the new ID before each execution. File
+reads and Codex input staging also use the bound immutable ID. Cleanup failure
 quarantines that context and keeps its execution slot charged until daemon
 recovery. Uncertain shared allocation/storage-helper failures block new work for
 that caller; already running siblings are not deliberately stopped by that

@@ -23,6 +23,7 @@ export interface CallerWorker {
   settle(): Promise<void>;
   close(): void;
   healthy(): boolean;
+  bindContainer?(container: CallerContainer): void;
 }
 interface Entry {
   users: number;
@@ -551,6 +552,7 @@ export class CallerScopedBackend implements Backend {
           metadata: { 'vicoop.runtime': { workspaceMode: 'context', workspaceRestored: container.recovered,
             conversationReset: entry.recovered || entry.contexts.has(context), legacyWorkspace: '/caller-workspace' } } });
       }
+      worker.bindContainer?.(container);
       entry.contexts.add(context);
       phase = 'execution';
       const work = worker.backend.handle({ ...task, contextId: context }, frame => {
