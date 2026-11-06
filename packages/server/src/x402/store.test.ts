@@ -206,6 +206,65 @@ test(
   },
 );
 
+test('conditional lifecycle and delivery writes are atomic and agent-scoped', { skip: !hasDb }, async () => {
+  await withDb(async (sql, tag) => {
+    const taskId = `${tag}-delivery`;
+    const store = new PostgresX402Store(sql, `${tag}-agent`);
+    const other = new PostgresX402Store(sql, `${tag}-other`);
+    await store.publishing(taskId, OFFER, () => store.put(entry(taskId, { status: 'verified' })));
+    assert.equal(await store.claim(taskId), true);
+    assert.equal(await other.updateIfStatus(taskId, ['verified'], { status: 'failed' }), false);
+    assert.equal(await other.updateMerchantDeliveryIfStatus(taskId, ['verified'], { timing: 'after-verification' }), undefined);
+    assert.equal(await store.updateIfStatus(taskId, ['offered'], { status: 'failed' }), false);
+    assert.equal(await store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { timing: 'after-verification' }), 'verified');
+
+    const startedAt = new Date();
+    const [publication, status] = await Promise.all([
+      store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { publicationStartedAt: startedAt }, { publicationClosed: false }),
+      store.updateIfStatus(taskId, ['verified'], { verifiedAt: new Date() }),
+    ]);
+    assert.equal(publication, 'verified');
+    assert.equal(status, true);
+    assert.deepEqual((await store.get(taskId))?.merchantDelivery?.publicationStartedAt, startedAt);
+    assert.equal(await store.claim(taskId), false);
+    assert.deepEqual(await store.getOffer(taskId), OFFER);
+
+    await store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { publicationStartedAt: new Date(0) });
+    assert.deepEqual((await store.get(taskId))?.merchantDelivery?.publicationStartedAt, startedAt, 'publication is write-once');
+    assert.equal(await store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { publicationClosedAt: new Date() }), undefined);
+    assert.equal(await store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { workCompletedAt: new Date() }, { notAfter: new Date(0) }), undefined);
+
+    await store.updateIfStatus(taskId, ['verified'], { status: 'completed' });
+    assert.equal(await store.updateIfStatus(taskId, ['verified'], { status: 'failed' }), false);
+    assert.equal(await store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { workFailedAt: new Date() }), undefined);
+    await store.deleteOffer(taskId);
+    assert.equal(await store.getOffer(taskId), undefined);
+    assert.equal((await store.get(taskId))?.status, 'completed', 'offer cleanup retains lifecycle');
+    assert.deepEqual((await store.get(taskId))?.merchantDelivery?.publicationStartedAt, startedAt);
+  });
+});
+
+test('publication and closure have exactly one winner; expiry rejects conditional writes', { skip: !hasDb }, async () => {
+  await withDb(async (sql, tag) => {
+    const store = new PostgresX402Store(sql, `${tag}-agent`);
+    for (let i = 0; i < 8; i++) {
+      const taskId = `${tag}-${i}`;
+      await store.put(entry(taskId, { status: 'verified', merchantDelivery: { timing: 'after-verification' } }));
+      const outcomes = await Promise.all([
+        store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { publicationStartedAt: new Date() }, { publicationClosed: false }),
+        store.updateMerchantDeliveryIfStatus(taskId, ['verified'], { publicationClosedAt: new Date() }, { publicationStarted: false }),
+      ]);
+      assert.equal(outcomes.filter(value => value !== undefined).length, 1);
+      const audit = (await store.get(taskId))!.merchantDelivery!;
+      assert.notEqual(audit.publicationStartedAt !== undefined, audit.publicationClosedAt !== undefined);
+    }
+    const expired = `${tag}-expired`;
+    await store.put(entry(expired, { status: 'verified', expiresAt: new Date(0) }));
+    assert.equal(await store.updateIfStatus(expired, ['verified'], { status: 'completed' }), false);
+    assert.equal(await store.updateMerchantDeliveryIfStatus(expired, ['verified'], { timing: 'after-verification' }), undefined);
+  });
+});
+
 test(
   'an expired offering reads as absent and is swept',
   { skip: !hasDb },

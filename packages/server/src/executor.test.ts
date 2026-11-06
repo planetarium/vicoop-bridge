@@ -2,6 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
 import {
+  InMemoryTaskStore,
+  A2XServer,
+  DefaultRequestHandler,
   TaskNotCancelableError,
   TaskState,
   type Artifact,
@@ -1217,4 +1220,89 @@ test('remote approval persists auth-required and resumption without firing the i
     assert.equal(event.status.state, TaskState.COMPLETED);
   }
   assert.equal(registry.approvals.get(approval.requestId), undefined);
+});
+
+test('unary execution persists progress and file bytes before backend completion', async () => {
+  const { ws, sent } = makeWsCapture();
+  const registry = new Registry();
+  registry.registerAgent({ agentId: 'polling', clientId: 'client', ownerPrincipal: 'owner',
+    agentCard: makeAgentCard(), allowedCallers: [], ws, connectedAt: 0 });
+  const store = new InMemoryTaskStore();
+  const task = await store.createTask({});
+  await store.updateTask(task.id, { status: { state: TaskState.INPUT_REQUIRED },
+    artifacts: [{ artifactId: 'previous', parts: [{ text: 'earlier turn' }] }] });
+  const executor = new WSForwardingExecutor('polling', registry, store);
+  const handler = new DefaultRequestHandler(new A2XServer({ taskStore: store, executor, protocolVersion: '0.3' }));
+  let finished = false;
+  const run = handler.handle({ jsonrpc: '2.0', id: 1, method: 'message/send', params: {
+    message: { role: 'user', messageId: 'poll', taskId: task.id, parts: [{ text: 'work' }] },
+    configuration: { blocking: true },
+  } }).then(result => { finished = true; assert.equal('error' in result, false); return result; });
+  for (let i = 0; i < 100 && !registry.getBinding(task.id); i++) await new Promise(resolve => setTimeout(resolve, 1));
+  const binding = registry.getBinding(task.id)!;
+  assert.ok(binding);
+  const waitFor = async (predicate: () => Promise<boolean>) => {
+    for (let i = 0; i < 100; i++) {
+      if (await predicate()) return;
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.fail('progress was not persisted');
+  };
+  try {
+    binding.sink.pushStatus({ taskId: task.id, contextId: task.contextId!, final: false,
+      status: { state: TaskState.WORKING, message: { role: 'agent', messageId: 'progress', parts: [{ text: 'preparing' }] } } });
+    await waitFor(async () => (await store.getTask(task.id))?.status.message?.messageId === 'progress');
+    const raw = Buffer.from('first file bytes').toString('base64');
+    binding.sink.pushArtifact({ taskId: task.id, contextId: task.contextId!,
+      artifact: { artifactId: 'partial', parts: [{ raw, filename: 'partial.txt', mediaType: 'text/plain' }] } });
+    await waitFor(async () => (await store.getTask(task.id))?.artifacts?.length === 2);
+    const snapshot = (await store.getTask(task.id))!;
+    assert.equal(snapshot.status.state, TaskState.WORKING);
+    assert.equal((snapshot.artifacts!.find(artifact => artifact.artifactId === 'partial')!.parts[0] as { raw: string }).raw, raw);
+    assert.equal(finished, false, 'polling must not wait for the backend latch');
+  } finally {
+    binding.sink.pushStatus({ taskId: task.id, contextId: task.contextId!, final: true, status: { state: TaskState.COMPLETED } });
+    binding.sink.finish();
+    await run;
+  }
+  assert.equal(sent.map(parseDownFrame).filter(frame => frame.type === 'task.assign').length, 1);
+  assert.equal((await store.getTask(task.id))?.status.state, TaskState.COMPLETED);
+  assert.deepEqual((await store.getTask(task.id))?.artifacts?.map(artifact => artifact.artifactId), ['previous', 'partial']);
+});
+
+test('paid output is authorized before publication and failed upto work remains uncharged', async () => {
+  for (const blocked of [false, true]) {
+    const { ws, sent } = makeWsCapture();
+    const registry = new Registry();
+    registry.registerAgent({ agentId: 'paid', clientId: 'client', ownerPrincipal: 'owner',
+      agentCard: makeAgentCard(), allowedCallers: [], ws, connectedAt: 0 });
+    const store = new InMemoryTaskStore();
+    const task = await store.createTask({});
+    const executor = new WSForwardingExecutor('paid', registry, store);
+    let authorizations = 0, settlements = 0, clears = 0;
+    Object.assign(executor, { currentGate: () => ({
+      open: async () => ({ kind: 'proceed', settlement: { mode: 'deferred', obligation: {} } }),
+      authorizeDelivery: async () => {
+        authorizations++;
+        assert.equal((await store.getTask(task.id))?.artifacts, undefined);
+        return blocked ? { taskId: task.id, contextId: task.contextId!, final: true,
+          status: { state: TaskState.FAILED } } : undefined;
+      },
+      settle: async () => { settlements++; throw new Error('failed upto work must not settle'); },
+      clear: async () => { clears++; },
+    }) });
+    const run = executor.execute(task, { role: 'user', messageId: 'paid', parts: [{ text: 'work' }] });
+    for (let i = 0; i < 100 && !registry.getBinding(task.id); i++) await new Promise(resolve => setTimeout(resolve, 1));
+    const binding = registry.getBinding(task.id)!;
+    assert.ok(binding);
+    binding.sink.pushArtifact({ taskId: task.id, contextId: task.contextId!, artifact: { artifactId: 'paid', parts: [{ text: 'partial' }] } });
+    binding.sink.pushStatus({ taskId: task.id, contextId: task.contextId!, final: true, status: { state: TaskState.FAILED } });
+    binding.sink.finish();
+    await run;
+    assert.equal(authorizations, 1);
+    assert.equal(settlements, 0);
+    assert.equal(clears, 1);
+    assert.equal((await store.getTask(task.id))?.artifacts?.length ?? 0, blocked ? 0 : 1);
+    assert.equal(sent.map(parseDownFrame).some(frame => frame.type === 'task.cancel'), blocked);
+  }
 });

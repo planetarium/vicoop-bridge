@@ -99,6 +99,12 @@ function appendArtifactChunk(accumulated: Artifact[], event: TaskArtifactUpdateE
   existing.extensions = event.artifact.extensions ?? existing.extensions;
 }
 
+function taskArtifacts(prior: Artifact[], current: Artifact[]): Artifact[] {
+  const merged = new Map(prior.map(artifact => [artifact.artifactId, artifact]));
+  for (const artifact of current) merged.set(artifact.artifactId, artifact);
+  return [...merged.values()];
+}
+
 function mergeArtifactParts(existing: Artifact['parts'], chunk: Artifact['parts']): Artifact['parts'] {
   if (existing.length === 1 && chunk.length === 1) {
     const current = existing[0] as Record<string, unknown>;
@@ -263,8 +269,17 @@ export class WSForwardingExecutor extends AgentExecutor {
     // Drain the streaming variant so callers that use message/send
     // (non-streaming) still get the full final task with accumulated
     // artifacts. The terminal events mutate `task` in place.
-    for await (const _event of this.executeStream(task, message)) {
-      void _event;
+    for await (const event of this.executeStream(task, message)) {
+      // Nonblocking message/send detaches this drain from its response.
+      // Unlike the SDK's SSE pump, the unary runner only saves on completion,
+      // so publish intermediate snapshots here for subsequent tasks/get.
+      if ('artifact' in event) {
+        await this.taskStore.updateTask(task.id, {
+          artifacts: task.artifacts,
+        });
+      } else if (!TERMINAL_STATES.has(event.status.state)) {
+        await this.taskStore.updateTask(task.id, { status: task.status, history: task.history });
+      }
     }
     return task;
   }
@@ -320,6 +335,9 @@ export class WSForwardingExecutor extends AgentExecutor {
       return done(this.withReceipt(event, settlement.metadata, taskId, contextId));
     }
 
+    // Deliberately retain the bridge's failed-upto no-charge policy. SDK
+    // MerchantGate.abort() charges partial published work; adopting that
+    // billing policy is separate from this compatibility upgrade.
     if (event.status.state !== TaskState.COMPLETED) return done(event);
 
     const read = readTaskUsage(binding.usage, event.status.message?.metadata);
@@ -533,6 +551,10 @@ export class WSForwardingExecutor extends AgentExecutor {
     // the marker from the legitimate live binding. Starting from an empty
     // artifact list keeps this execution's persisted output its own.
     const accumulatedArtifacts: Artifact[] = [];
+    // Legacy tasks accumulate across turns. Persist that union ourselves:
+    // strict stores reject the SDK's later merge once our final save wins.
+    // Replay-capable tasks intentionally expose only this execution's output.
+    const priorArtifacts = executionId === undefined ? task.artifacts ?? [] : [];
     let rejection: { code: string; message: string; suffix: string } | undefined;
     try {
       const store = this.taskStore;
@@ -746,17 +768,34 @@ export class WSForwardingExecutor extends AgentExecutor {
     // terminals are already covered by ws.ts task_completed/task_failed).
     const streamStartedAt = Date.now();
     let sawFinalEvent = false;
+    let deliveryAuthorized = false;
 
     try {
       armWatchdog();
-      for await (const event of queue.iterate(ac.signal)) {
+      for await (let event of queue.iterate(ac.signal)) {
         armWatchdog();
+        if (gate && settlement && !deliveryAuthorized &&
+          ('artifact' in event || (event.status.message?.parts.length ?? 0) > 0)) {
+          const refusal = await gate.authorizeDelivery(taskId, contextId);
+          if (refusal) {
+            // No output may cross the publication boundary after the payment
+            // lifecycle has expired or failed. Stop native work as well.
+            this.registry.sendToAgent(this.agentId, {
+              type: 'task.cancel', taskId,
+              ...(binding.executionId !== undefined ? { executionId: binding.executionId } : {}),
+            });
+            event = refusal;
+          } else {
+            deliveryAuthorized = true;
+          }
+        }
         if ('artifact' in event) {
           // Mirror the streamed artifact onto the task object so the
           // post-stream `getTask()` path (push notifications, sync
           // `message/send`) sees the same artifacts the streaming
           // consumers received.
           appendArtifactChunk(accumulatedArtifacts, event);
+          task.artifacts = taskArtifacts(priorArtifacts, accumulatedArtifacts);
           yield event;
           continue;
         }
@@ -776,7 +815,7 @@ export class WSForwardingExecutor extends AgentExecutor {
           task.history = history;
           task.status = terminal.status;
           if (accumulatedArtifacts.length > 0) {
-            task.artifacts = accumulatedArtifacts;
+            task.artifacts = taskArtifacts(priorArtifacts, accumulatedArtifacts);
           }
           yield withOrigin(terminal);
           break;
@@ -812,7 +851,7 @@ export class WSForwardingExecutor extends AgentExecutor {
         await this.taskStore.updateTask(taskId, {
           status: task.status,
           history: task.history,
-          ...(accumulatedArtifacts.length > 0 ? { artifacts: accumulatedArtifacts } : {}),
+          ...(accumulatedArtifacts.length > 0 ? { artifacts: task.artifacts } : {}),
         });
       } catch (err) {
         logEvent('task_persist_error', { taskId, error: String(err) });

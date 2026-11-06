@@ -666,3 +666,45 @@ test('settlement prices from the offering, not from a reprice that landed betwee
   // Metered under the frozen rates, not the 1000000 ceiling.
   assert.equal(facilitator.settledAmount, '450000');
 });
+
+test('publication is authorized against durable payment state and uncertain settlements survive cleanup', async () => {
+  const store = new InMemoryX402Store();
+  const facilitator = stubFacilitator({ settleThrows: true });
+  const context = new X402Context({ store, facilitator, x402Version: 2 });
+  const gate = new X402Gate('a1', PRICING, context, new InMemoryMerchantOfferStore(), RESOURCE);
+  const first = await gate.open({ taskId: 'uncertain', contextId: 'ctx', message: userMessage() });
+  assert.equal(first.kind, 'halt');
+  if (first.kind !== 'halt') return;
+  const second = await gate.open({ taskId: 'uncertain', contextId: 'ctx',
+    message: submissionMessage(offeredRequirement(first.event)) });
+  assert.equal(second.kind, 'halt');
+  assert.equal((await store.get('uncertain'))?.failure?.indeterminate, true);
+  await gate.clear('uncertain');
+  assert.ok(await store.get('uncertain'), 'indeterminate on-chain outcome must remain available for reconciliation');
+  assert.equal((await gate.authorizeDelivery('uncertain', 'ctx'))?.status.state, TaskState.FAILED);
+});
+
+test('exact and upto authorize publication only after their payment round-trip', async () => {
+  for (const pricing of [PRICING, UPTO_PRICING]) {
+    const store = new InMemoryX402Store();
+    const facilitator = stubFacilitator();
+    const context = new X402Context({ store, facilitator, x402Version: 2 });
+    const gate = new X402Gate('a1', pricing, context, new InMemoryMerchantOfferStore(), RESOURCE);
+    const taskId = `delivery-${pricing.scheme}`;
+    const first = await gate.open({ taskId, contextId: 'ctx', message: userMessage() });
+    assert.equal(first.kind, 'halt');
+    if (first.kind !== 'halt') return;
+    assert.equal((await gate.authorizeDelivery(taskId, 'ctx'))?.status.state, TaskState.FAILED);
+    const requirement = offeredRequirement(first.event);
+    const second = await gate.open({ taskId, contextId: 'ctx', message: pricing.scheme === 'upto'
+      ? uptoSubmissionMessage(requirement) : submissionMessage(requirement) });
+    assert.equal(second.kind, 'proceed');
+    assert.equal((await store.get(taskId))?.merchantDelivery?.publicationStartedAt, undefined);
+    assert.equal(await gate.authorizeDelivery(taskId, 'ctx'), undefined);
+    assert.ok((await store.get(taskId))?.merchantDelivery?.publicationStartedAt instanceof Date);
+    assert.equal(facilitator.settleCalls, pricing.scheme === 'upto' ? 0 : 1);
+    await gate.clear(taskId);
+    assert.equal(await store.get(taskId), undefined);
+    assert.equal(facilitator.settleCalls, pricing.scheme === 'upto' ? 0 : 1, 'cleanup does not adopt SDK partial-failure billing');
+  }
+});

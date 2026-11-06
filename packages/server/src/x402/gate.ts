@@ -151,6 +151,10 @@ export class X402Gate {
       // over the result and only then discovering the authorization has been
       // drained. A failure costs nobody: no charge, no work.
       exactTiming: 'before-work',
+      // The bridge exposes metered output as it arrives, before final usage
+      // is known. Publication is explicitly authorized before each turn's
+      // first output; failed upto work keeps the bridge's no-charge policy.
+      deliveryTiming: 'after-verification',
       onError: (error, ctx) => {
         // Facilitator unreachable, DB down, malformed offering. The payer sees
         // a generic refusal; this is where the operator sees why.
@@ -161,6 +165,17 @@ export class X402Gate {
           error: String(error),
         });
       },
+    });
+  }
+
+  /** Record publication before output becomes visible through SSE or polling. */
+  async authorizeDelivery(taskId: string, contextId: string): Promise<TaskStatusUpdateEvent | undefined> {
+    const outcome = await this.gate.authorizeDelivery({ taskId });
+    if (outcome.kind === 'authorized') return undefined;
+    logEvent('x402_delivery_blocked', { agentId: this.agentId, taskId, reason: outcome.reason });
+    return this.failedEvent({
+      taskId, contextId, code: 'SETTLEMENT_FAILED',
+      reason: 'Payment authorization is no longer available for delivery.',
     });
   }
 
@@ -419,6 +434,10 @@ export class X402Gate {
   /** Drop the lifecycle record once the task has terminated. Best-effort. */
   async clear(taskId: string): Promise<void> {
     try {
+      // A transport failure may have settled on-chain. Retain its evidence
+      // and claim for reconciliation instead of permitting a blind retry.
+      const entry = await this.x402.store.get(taskId);
+      if (entry?.failure?.indeterminate) return;
       await this.x402.clearOffering({ taskId });
     } catch (err) {
       logEvent('x402_clear_error', { agentId: this.agentId, taskId, error: String(err) });

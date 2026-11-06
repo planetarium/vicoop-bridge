@@ -394,3 +394,49 @@ pkill -f 'tsx.*watch.*src/cli.ts'    # server
 pkill -f 'tsx.*cli.ts.*echo-agent'   # client
 dropdb vicoop_bridge_dev             # optional, full reset
 ```
+
+## SDK 0.25 compatibility preparation for issue #572
+
+The server and admin UI use the published `@a2x/sdk` 0.25.0 dependency. This
+version supplies independent SSE execution and the explicit x402 delivery
+lifecycle; it does **not** yet implement immediate unary task acknowledgement.
+Its approval stream also stops forwarding after an intermediate `auth-required`
+event even when native execution continues. The release containing
+[a2x#267](https://github.com/planetarium/a2x/pull/267) must include both
+nonblocking send and the explicit `final: false` interruption fix;
+the existing execution-marker SSE regression detects the latter on 0.25.0.
+The bridge's unary executor now saves intermediate status and artifact snapshots
+so a detached send can be followed by `tasks/get` while native work continues.
+Caller ownership is already saved from server-authenticated request metadata in
+the initial task insert, before execution starts.
+
+Before enabling the asynchronous flow tracked by issue #572:
+
+1. Wait for the SDK nonblocking-send fix to be published, then update both
+   `packages/server/package.json` and `packages/admin-ui/package.json` plus the
+   lockfile to that actual release. Do not substitute a guessed version or a
+   local SDK link in a deployable commit.
+2. Run build, typecheck, and the server suite with `DATABASE_URL` pointing to a
+   disposable local database. The x402 store tests exercise real PostgreSQL
+   conditional writes and publication/closure races.
+3. Exercise v0.3 `blocking: false` and v1 `returnImmediately: true` through the
+   HTTP routes with a gated backend. The send must return a stored task before
+   backend completion. Verify same-caller lookup, denied cross-caller lookup,
+   partial file bytes, terminal success/failure/cancellation, and one dispatch.
+   Retest explicit blocking sends and the SDK's documented omitted-flag default.
+   With the fixed SDK installed, enable the prepared bridge acceptance test:
+   `A2A_TEST_NONBLOCKING=1 pnpm --filter @vicoop-bridge/server exec tsx --test src/nonblocking-send.test.ts`.
+   It also requires `DATABASE_URL`; the opt-in keeps this test from claiming
+   the currently published dependency already supports the new behavior.
+4. Retest `execution-marker.test.ts`, `task-access.test.ts`, and paid calls.
+   The bridge's detachable SSE wrapper still preserves request-local ownership
+   and execution-writer context; SDK background execution does not replace
+   those access controls or the bridge's failed-upto no-charge billing policy.
+
+Acceptance is not durable job scheduling. Task snapshots live in PostgreSQL,
+but the execution queue and WebSocket binding live in the server process. A
+server restart can interrupt accepted work. Persisted snapshots alone do not
+restart execution, and acknowledgement does not guarantee automatic replay
+after restart.
+The caller's HTTP deadline remains an acknowledgement/lookup deadline, not the
+native agent's execution budget.

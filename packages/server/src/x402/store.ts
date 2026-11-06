@@ -4,6 +4,9 @@ import {
   type MerchantOfferStore,
   type X402StoreEntry,
   type X402StoreEntryPatch,
+  type X402EntryStatus,
+  type X402MerchantDeliveryAuditPatch,
+  type X402MerchantDeliveryWriteCondition,
 } from '@a2x/sdk/x402';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Sql, SqlExecutor } from '../db.js';
@@ -65,6 +68,7 @@ function reviveEntry(raw: unknown): X402StoreEntry {
   const verifiedAt = date(e.verifiedAt);
   const receipt = e.receipt as Record<string, unknown> | undefined;
   const failure = e.failure as Record<string, unknown> | undefined;
+  const delivery = e.merchantDelivery as Record<string, unknown> | undefined;
 
   return {
     ...(e as unknown as X402StoreEntry),
@@ -90,6 +94,14 @@ function reviveEntry(raw: unknown): X402StoreEntry {
             failedAt: date(failure.failedAt) ?? new Date(0),
           },
         }
+      : {}),
+    ...(delivery !== undefined
+      ? { merchantDelivery: {
+          ...(delivery as unknown as NonNullable<X402StoreEntry['merchantDelivery']>),
+          ...Object.fromEntries(Object.entries(delivery)
+            .filter(([key, value]) => key.endsWith('At') && typeof value === 'string')
+            .map(([key, value]) => [key, new Date(value as string)])),
+        } }
       : {}),
   };
 }
@@ -153,7 +165,7 @@ export class PostgresX402Store extends BaseX402Store implements MerchantOfferSto
         FROM x402_offerings
         WHERE agent_id = ${this.agentId}
           AND task_id = ${taskId}
-          AND (expires_at IS NULL OR expires_at > now())
+          AND (expires_at IS NULL OR expires_at > clock_timestamp())
           AND jsonb_exists(entry, 'accepts')
         FOR UPDATE
       `;
@@ -224,22 +236,79 @@ export class PostgresX402Store extends BaseX402Store implements MerchantOfferSto
       FROM x402_offerings
       WHERE agent_id = ${this.agentId}
         AND task_id = ${taskId}
-        AND (expires_at IS NULL OR expires_at > now())
+        AND (expires_at IS NULL OR expires_at > clock_timestamp())
     `;
     const row = rows[0];
     return row ? reviveEntry(row.entry) : undefined;
   }
 
   async update(taskId: string, patch: X402StoreEntryPatch): Promise<void> {
-    // Read-modify-write rather than a JSONB merge: the patch carries nested
-    // Date values that would have to be hand-serialized into a jsonb_set
-    // chain anyway, and the round-trip stays inside one statement's worth of
-    // latency. Racing writers are not a correctness problem here because the
-    // one operation that must not run twice — accepting a submission — is
-    // gated by `claim()` below rather than by the entry's status.
-    const current = await this.get(taskId);
-    if (!current) return;
-    await this.put({ ...current, ...patch, updatedAt: new Date() });
+    await this.updateIfStatus(taskId, ['offered', 'verified', 'completed', 'failed', 'rejected'], patch);
+  }
+
+  async updateIfStatus(
+    taskId: string,
+    expected: readonly X402EntryStatus[],
+    patch: X402StoreEntryPatch,
+  ): Promise<boolean> {
+    // A single row update serializes lifecycle patches with publication
+    // decisions. A stale get/put cycle can erase the publication marker.
+    const rows = await this.sql`
+      UPDATE x402_offerings
+      SET entry = entry || ${this.sql.json(JSON.parse(JSON.stringify(patch)))}::jsonb
+                    || jsonb_build_object('updatedAt', clock_timestamp()),
+          updated_at = clock_timestamp()
+      WHERE agent_id = ${this.agentId} AND task_id = ${taskId}
+        AND entry->>'status' = ANY(${[...expected]}::text[])
+        AND (expires_at IS NULL OR expires_at > clock_timestamp())
+      RETURNING task_id
+    `;
+    return rows.length > 0;
+  }
+
+  async updateMerchantDeliveryIfStatus(
+    taskId: string,
+    expected: readonly X402EntryStatus[],
+    patch: X402MerchantDeliveryAuditPatch,
+    condition: X402MerchantDeliveryWriteCondition = {},
+  ): Promise<X402EntryStatus | undefined> {
+    // The backend clock and the row lock decide whether publication or
+    // closure wins. Existing markers remain write-once under retries.
+    const rows = await this.sql<{ status: X402EntryStatus }[]>`
+      UPDATE x402_offerings
+      SET entry = jsonb_set(entry, '{merchantDelivery}',
+            COALESCE(entry->'merchantDelivery', '{}'::jsonb)
+              || ${this.sql.json(JSON.parse(JSON.stringify(patch)))}::jsonb
+              || jsonb_strip_nulls(jsonb_build_object(
+                'publicationStartedAt', entry->'merchantDelivery'->'publicationStartedAt',
+                'publicationClosedAt', entry->'merchantDelivery'->'publicationClosedAt'
+              ))) || jsonb_build_object('updatedAt', clock_timestamp()),
+          updated_at = clock_timestamp()
+      WHERE agent_id = ${this.agentId} AND task_id = ${taskId}
+        AND entry->>'status' = ANY(${[...expected]}::text[])
+        AND (expires_at IS NULL OR expires_at > clock_timestamp())
+        AND (${condition.notAfter ?? null}::timestamptz IS NULL
+          OR clock_timestamp() < ${condition.notAfter ?? null}::timestamptz)
+        AND (${condition.publicationStarted ?? null}::boolean IS NULL OR
+          (entry->'merchantDelivery'->>'publicationStartedAt' IS NOT NULL) = ${condition.publicationStarted ?? null})
+        AND (${condition.publicationClosed ?? null}::boolean IS NULL OR
+          (entry->'merchantDelivery'->>'publicationClosedAt' IS NOT NULL) = ${condition.publicationClosed ?? null})
+        AND COALESCE(${patch.timing ?? null}::text, entry->'merchantDelivery'->>'timing') IS NOT NULL
+        AND NOT (
+          (entry->'merchantDelivery'->>'publicationStartedAt' IS NOT NULL OR ${patch.publicationStartedAt !== undefined})
+          AND (entry->'merchantDelivery'->>'publicationClosedAt' IS NOT NULL OR ${patch.publicationClosedAt !== undefined})
+        )
+      RETURNING entry->>'status' AS status
+    `;
+    return rows[0]?.status;
+  }
+
+  /** SDK settlement drops frozen terms while retaining the delivery audit. */
+  async deleteOffer(taskId: string): Promise<void> {
+    await this.sql`
+      UPDATE x402_offerings SET offer = NULL, updated_at = clock_timestamp()
+      WHERE agent_id = ${this.agentId} AND task_id = ${taskId}
+    `;
   }
 
   /** One row backs both halves, so this serves the store and the offer store. */
@@ -257,7 +326,7 @@ export class PostgresX402Store extends BaseX402Store implements MerchantOfferSto
       FROM x402_offerings
       WHERE agent_id = ${this.agentId}
         AND task_id = ${taskId}
-        AND (expires_at IS NULL OR expires_at > now())
+        AND (expires_at IS NULL OR expires_at > clock_timestamp())
     `;
     const raw = rows[0]?.offer;
     if (raw === undefined || raw === null) return undefined;
@@ -286,7 +355,7 @@ export class PostgresX402Store extends BaseX402Store implements MerchantOfferSto
       WHERE agent_id = ${this.agentId}
         AND task_id = ${taskId}
         AND claimed_at IS NULL
-        AND (expires_at IS NULL OR expires_at > now())
+        AND (expires_at IS NULL OR expires_at > clock_timestamp())
       RETURNING task_id
     `;
     return rows.length > 0;
@@ -324,7 +393,7 @@ export class PostgresX402Store extends BaseX402Store implements MerchantOfferSto
 export async function sweepExpiredX402Offerings(sql: Sql): Promise<number> {
   const rows = await sql`
     DELETE FROM x402_offerings
-    WHERE expires_at IS NOT NULL AND expires_at <= now()
+    WHERE expires_at IS NOT NULL AND expires_at <= clock_timestamp()
     RETURNING task_id
   `;
   return rows.length;

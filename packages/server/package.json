@@ -18,7 +18,7 @@
     "test": "tsx --test --test-concurrency=1 \"src/**/*.test.ts\""
   },
   "dependencies": {
-    "@a2x/sdk": "^0.24.0",
+    "@a2x/sdk": "^0.25.0",
     "@ai-sdk/anthropic": "^3.0.69",
     "@mentionable/connector-kit": "workspace:*",
     "@digitalbazaar/data-integrity": "2.5.0",

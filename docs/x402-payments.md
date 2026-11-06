@@ -65,7 +65,18 @@ a `failed` status. That window is inherent to metered billing rather than a
 choice, and `x402_unpaid_delivery` counts it.
 
 Under `upto`, a task that fails is not charged at all: the authorization simply
-goes unused.
+goes unused. This remains a bridge policy with SDK 0.25: the bridge does not
+call `MerchantGate.abort()` for failed work, because that SDK operation would
+settle partial output that was already published.
+
+The gate explicitly uses `deliveryTiming: 'after-verification'`. Before the
+first paid artifact or status message becomes visible through streaming or
+task lookup, the bridge records publication authorization in the durable
+payment lifecycle. A failed publication check withholds the output and sends
+`task.cancel` to the backend. Atomic lifecycle and delivery writes prevent a
+concurrent status update from erasing the publication marker. If settlement's
+outcome is indeterminate, the lifecycle and claim remain for reconciliation
+until their existing expiry; task cleanup does not immediately erase them.
 
 If settlement fails on the `upto` path the task is reported `failed` rather
 than `completed` — the caller got the work but the merchant was not paid, and
