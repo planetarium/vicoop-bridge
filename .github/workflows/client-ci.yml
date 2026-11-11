@@ -79,6 +79,7 @@ jobs:
       - name: Test Bun caller storage and standalone SQLite
         run: |
           bun test packages/client/src/caller-runtime-store.test.ts packages/client/src/caller-container-init.test.ts packages/client/src/caller-storage-manager.test.ts
+          bun test packages/client/src/credential-proxy.test.ts packages/client/src/credential-proxy-runtime.test.ts
           bun build --compile packages/client/scripts/caller-store-smoke.ts --outfile /tmp/caller-store-smoke
           /tmp/caller-store-smoke
 
