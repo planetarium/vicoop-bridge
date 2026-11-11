@@ -1203,3 +1203,38 @@ CREATE TRIGGER agents_owner_revision BEFORE UPDATE ON agents
   FOR EACH ROW EXECUTE FUNCTION bump_agent_owner_revision();
 
 COMMENT ON COLUMN agents.owner_revision IS E'@omit create,update';
+
+-- Consumer business consent is durable and independent of a live backend.
+CREATE TABLE IF NOT EXISTS infra.consumer_consent (
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  operation_id UUID NOT NULL,
+  document JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (agent_id, operation_id)
+);
+CREATE TABLE IF NOT EXISTS infra.consumer_consent_audit (
+  agent_id TEXT NOT NULL,
+  operation_id UUID NOT NULL,
+  sequence BIGINT GENERATED ALWAYS AS IDENTITY,
+  event JSONB NOT NULL,
+  recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (agent_id, operation_id, sequence),
+  FOREIGN KEY (agent_id, operation_id) REFERENCES infra.consumer_consent(agent_id, operation_id) ON DELETE CASCADE
+);
+-- These are server-owned control records, never a GraphQL mutation surface.
+REVOKE ALL ON infra.consumer_consent, infra.consumer_consent_audit FROM PUBLIC, app_authenticated, app_anonymous, app_postgraphile;
+-- A removed and re-added caller grant must not resurrect an old proposal.
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS consent_policy_revision BIGINT NOT NULL DEFAULT 0;
+CREATE OR REPLACE FUNCTION bump_consent_policy_revision() RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.allowed_callers IS DISTINCT FROM OLD.allowed_callers THEN
+    NEW.consent_policy_revision := OLD.consent_policy_revision + 1;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS agents_consent_policy_revision ON agents;
+CREATE TRIGGER agents_consent_policy_revision BEFORE UPDATE ON agents
+  FOR EACH ROW EXECUTE FUNCTION bump_consent_policy_revision();
+COMMENT ON COLUMN agents.consent_policy_revision IS E'@omit create,update';
