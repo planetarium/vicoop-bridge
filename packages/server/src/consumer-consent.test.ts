@@ -7,7 +7,7 @@ import { APPROVAL_EXTENSION_URI, ConsentRegistration, type ConsentRegistration a
   type ConsentDecision, CONSUMER_CONSENT_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import { ensureSchema } from './db.js';
 import { issueSessionToken } from './auth/caller-token.js';
-import { issueTokenExchangeAccessToken } from './oauth/token-exchange/store.js';
+import { issueTokenExchangeAccessToken, sweepExpiredTokenExchangeState } from './oauth/token-exchange/store.js';
 import { formatFederatedPrincipal } from './auth/principal.js';
 import { mountConsumerConsent } from './consumer-consent-http.js';
 import { consentDigest, type ConsentProposal } from './consumer-consent.js';
@@ -64,18 +64,13 @@ test('durable consumer consent HTTP contract', { skip: !process.env.DATABASE_URL
     const actor = 'did:web:connector.example', profile = 'mentionable-v0.1';
     const key = federated ? formatFederatedPrincipal({ issuer: actor, method: 'urn:mentionable:auth:slack-workspace-member:v0.1', subject: principal })! : principal;
     const ownerToken = await session(owner, 'owner_session');
-    const consumerToken = federated ? await issueTokenExchangeAccessToken(sql, {
-      profileId: profile, agentId, resource: `http://localhost/agents/${agentId}`, principalId: principal,
-      actorId: actor, allowedCaller: key, scopes: ['a2a:task.read'], expiresAt: new Date(Date.now() + 300_000),
-    }).catch(() => null) : await session(principal, 'caller');
-    // Federation token issuance requires its agent row, handled below.
     agents.push(agentId);
     await sql`INSERT INTO agents (id, owner_principal, name, token_hash, allowed_callers)
       VALUES (${agentId}, ${owner}, 'consent', ${randomUUID()}, ${[key]})`;
-    const effectiveConsumer = consumerToken ?? await issueTokenExchangeAccessToken(sql, {
+    const effectiveConsumer = federated ? await issueTokenExchangeAccessToken(sql, {
       profileId: profile, agentId, resource: `http://localhost/agents/${agentId}`, principalId: principal,
       actorId: actor, allowedCaller: key, scopes: ['a2a:task.read'], expiresAt: new Date(Date.now() + 300_000),
-    });
+    }) : await session(principal, 'caller');
     const taskId = randomUUID(), executionId = randomUUID(), contextId = randomUUID(); tasks.push(taskId);
     await sql`INSERT INTO infra.a2a_tasks (task_id, context_id, state, task_json, owner_agent,
       owner_principal, owner_actor, authorization_profile, authorization_key)
@@ -200,10 +195,11 @@ test('durable consumer consent HTTP contract', { skip: !process.env.DATABASE_URL
     }
   });
   await t.test('grant removal and re-add cannot resurrect an approval', async () => {
-    const f = await fixture(), { proposal } = await f.create(); await f.decide(proposal);
+    const f = await fixture(), { proposal, input } = await f.create(); await f.decide(proposal);
     await sql`UPDATE agents SET allowed_callers = '{}' WHERE id = ${f.agentId}`;
     await sql`UPDATE agents SET allowed_callers = ${[f.principal]} WHERE id = ${f.agentId}`;
     assert.equal((await f.claim(proposal)).status, 409);
+    assert.equal((await f.req(f.host, f.ownerToken.rawToken, input)).body.proposal.state, 'invalidated');
   });
   await t.test('token revocation is immediate despite existing verifier cache', async () => {
     const f = await fixture(), { proposal } = await f.create(); await f.decide(proposal);
@@ -218,6 +214,20 @@ test('durable consumer consent HTTP contract', { skip: !process.env.DATABASE_URL
     await sql`UPDATE agents SET owner_principal = ${f.owner} WHERE id = ${f.agentId}`;
     assert.equal((await f.claim(proposal)).status, 404);
   });
+  await t.test('approved federation consent outlives token expiry and cleanup without losing revocation linkage', async () => {
+    const f = await fixture(true), { proposal } = await f.create();
+    await f.decide(proposal);
+    await sql`UPDATE infra.oauth_token_exchange_access_tokens SET expires_at = now() - interval '1 second'
+      WHERE agent_id = ${f.agentId}`;
+    await sweepExpiredTokenExchangeState(sql);
+    const retained = await sql`SELECT id FROM infra.oauth_token_exchange_access_tokens WHERE agent_id = ${f.agentId}`;
+    assert.equal(retained.length, 1);
+    f.restart();
+    assert.equal((await f.claim(proposal)).body.execute, true);
+    await sweepExpiredTokenExchangeState(sql);
+    const removed = await sql`SELECT id FROM infra.oauth_token_exchange_access_tokens WHERE agent_id = ${f.agentId}`;
+    assert.equal(removed.length, 0);
+  });
   await t.test('federated consumers require exact actor, grant, profile and task scope', async () => {
     const f = await fixture(true), { proposal } = await f.create();
     const wrong = await issueTokenExchangeAccessToken(sql, { profileId: 'other-profile', agentId: f.agentId,
@@ -228,6 +238,12 @@ test('durable consumer consent HTTP contract', { skip: !process.env.DATABASE_URL
       resource: `http://localhost/agents/${f.agentId}`, principalId: f.principal, actorId: f.actor,
       allowedCaller: f.key, taskId: randomUUID(), scopes: ['a2a:task.read'], expiresAt: new Date(Date.now() + 300_000) });
     assert.equal((await f.req(`${f.consumer}/${proposal.operationId}`, scoped.rawToken)).status, 404);
+    for (const override of [{ actorId: 'did:web:other.example' }, { principalId: 'slack:T1/U2' }]) {
+      const mismatch = await issueTokenExchangeAccessToken(sql, { profileId: 'mentionable-v0.1', agentId: f.agentId,
+        resource: `http://localhost/agents/${f.agentId}`, principalId: f.principal, actorId: f.actor,
+        allowedCaller: f.key, scopes: ['a2a:task.read'], expiresAt: new Date(Date.now() + 300_000), ...override });
+      assert.equal((await f.req(`${f.consumer}/${proposal.operationId}`, mismatch.rawToken)).status, 404);
+    }
     assert.equal((await f.decide(proposal)).status, 200);
     assert.equal((await f.claim(proposal)).body.execute, true);
   });
