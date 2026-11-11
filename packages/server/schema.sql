@@ -1241,3 +1241,30 @@ COMMENT ON COLUMN agents.caller_policy_revision IS E'@omit create,update';
 CREATE INDEX IF NOT EXISTS consumer_consent_pending_credential
   ON infra.consumer_consent ((document->'decisionCredential'->>'hash'))
   WHERE document->>'state' = 'approved';
+
+-- Durable external completion and one continuation intent, independent of a
+-- backend process. No provider credentials or consumer bearer tokens persist.
+CREATE TABLE IF NOT EXISTS infra.deferred_jobs (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  executor_principal TEXT NOT NULL,
+  source_task_id TEXT NOT NULL,
+  source_execution_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version > 0),
+  payload_digest TEXT NOT NULL,
+  origin JSONB NOT NULL,
+  state TEXT NOT NULL DEFAULT 'waiting' CHECK (state IN ('waiting','queued','dispatching','delivered','failed','canceled','awaiting_input','reconciliation_required')),
+  expires_at TIMESTAMPTZ NOT NULL,
+  completion JSONB,
+  completion_digest TEXT,
+  continuation_task_id TEXT,
+  lease_until TIMESTAMPTZ,
+  failure_code TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (agent_id, operation_id)
+);
+CREATE INDEX IF NOT EXISTS deferred_jobs_pending ON infra.deferred_jobs(state, id)
+  WHERE state IN ('waiting','queued','dispatching','awaiting_input','reconciliation_required');
+REVOKE ALL ON infra.deferred_jobs FROM PUBLIC, app_anonymous, app_authenticated, app_postgraphile;
