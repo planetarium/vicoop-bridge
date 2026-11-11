@@ -124,7 +124,7 @@ used by ordinary tasks.
 | `queued` | Completion is durable; waiting for dispatch, including while the agent is offline. |
 | `dispatching` | A linked successor has been durably allocated; its model execution is running or its dispatch outcome needs recovery. |
 | `delivered` | The successor task completed and its task output was persisted. This is not consumer receipt. |
-| `awaiting_input` | The successor ended its turn with an input/authorization wait. Inspect the successor using ordinary A2A. |
+| `awaiting_input` | The successor ended its turn with an input/authorization wait. Inspect/resume it using ordinary A2A; the worker tracks its eventual terminal result without redispatch. |
 | `failed` | The successor failed/rejected. |
 | `canceled` | Explicit cancellation, expiry, revoked authority, changed ownership or unavailable origin prevents further work. `failureCode` gives the reason. |
 | `reconciliation_required` | A previous dispatch may have occurred, but its terminal outcome cannot be established. It is never automatically repeated. |
@@ -159,6 +159,8 @@ later completions. No application scans Docker names or runs Docker exec.
 Queued work survives server/client restart. Active dispatches renew a one-minute
 lease. After a stale lease, a persisted terminal successor establishes success
 or failure; absent/nonterminal results become `reconciliation_required`.
+A later persisted terminal successor also resolves `awaiting_input` or
+`reconciliation_required` without starting another execution.
 The bridge deliberately cannot promise exactly-once effects across a crash
 between persisting intent and sending/finishing a task. Inspect the successor,
 client execution journal and delivery evidence before arranging any explicit

@@ -240,6 +240,25 @@ test('durable external jobs authorize, recover and continue in the original A2A 
     await json(await call(`${path}/${job.jobId}/cancel`, {}));
   });
 
+  await t.test('input-required successor settles after ordinary follow-up and cancels on revocation', async () => {
+    for (const outcome of ['completed','canceled','revoked'] as const) {
+      const { job } = await register();
+      await json(await call(`${path}/${job.jobId}/complete`, completion));
+      const before = assigned.length; await service.tick(); await waitFor(async () => assigned.length > before);
+      const frame = assigned.at(-1)!;
+      const binding = registry.getBinding(frame.taskId)!;
+      binding.sink.pushStatus({ taskId: frame.taskId, contextId: frame.contextId, final: true, status: { state: TaskState.INPUT_REQUIRED } });
+      binding.sink.finish();
+      await waitFor(async () => (await service.inspect(agentId, job.jobId, owner)).state === 'awaiting_input');
+      if (outcome === 'revoked') await sql`UPDATE agents SET allowed_callers=${[stranger]} WHERE id=${agentId}`;
+      else await sql`UPDATE infra.a2a_tasks SET state=${outcome}, task_json=jsonb_set(task_json,'{status,state}',to_jsonb(${outcome}::text)) WHERE task_id=${frame.taskId}`;
+      await service.tick();
+      assert.equal((await service.inspect(agentId, job.jobId, owner)).state, outcome === 'completed' ? 'delivered' : 'canceled');
+      assert.equal(assigned.length, before + 1);
+      if (outcome === 'revoked') await sql`UPDATE agents SET allowed_callers=${[caller,stranger]} WHERE id=${agentId}`;
+    }
+  });
+
   await t.test('ambiguous dispatch after restart is reconciled, never automatically redispatched', async () => {
     const { job } = await register();
     await json(await call(`${path}/${job.jobId}/complete`, completion));
@@ -250,5 +269,13 @@ test('durable external jobs authorize, recover and continue in the original A2A 
     assert.equal((await service.inspect(agentId, job.jobId, owner)).state, 'reconciliation_required');
     await json(await call(`${path}/${job.jobId}/complete`, completion));
     await service.tick(); assert.equal(assigned.length, before);
+    // A late persisted result resolves the uncertainty without resubmission.
+    const origin = await sql`SELECT origin FROM infra.deferred_jobs WHERE id=${job.jobId}`;
+    const task = { id: taskId, contextId: origin[0]!.origin.contextId, status: { state: 'completed' } };
+    await sql`INSERT INTO infra.a2a_tasks(task_id,context_id,state,task_json,owner_agent,owner_principal)
+      VALUES(${taskId},${task.contextId},'completed',${sql.json(task)},${agentId},${caller})`;
+    await service.tick();
+    assert.equal((await service.inspect(agentId, job.jobId, owner)).state, 'delivered');
+    assert.equal(assigned.length, before);
   });
 });

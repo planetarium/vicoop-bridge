@@ -228,12 +228,24 @@ export class DeferredJobsService {
       // Every running execution maintains its lease. A second instance cannot
       // infer a crash merely from not holding the WebSocket for this agent.
       for (const id of this.running.keys()) await this.opts.db`UPDATE infra.deferred_jobs SET lease_until=now() + interval '60 seconds' WHERE id=${id} AND state='dispatching'`;
-      const jobs = await this.opts.db<Job[]>`SELECT * FROM infra.deferred_jobs WHERE state IN ('waiting','queued','dispatching') AND id > ${this.cursor} ORDER BY id LIMIT 100`;
+      const jobs = await this.opts.db<Job[]>`SELECT * FROM infra.deferred_jobs WHERE state IN ('waiting','queued','dispatching','awaiting_input','reconciliation_required') AND id > ${this.cursor} ORDER BY id LIMIT 100`;
       this.cursor = jobs.length === 100 ? jobs.at(-1)!.id : '';
       for (const job of jobs) {
+        // A resumed consumer turn or a late persisted terminal receipt can
+        // establish the outcome without ever replaying an uncertain dispatch.
+        if (job.state === 'awaiting_input' || job.state === 'reconciliation_required') {
+          const task = job.continuation_task_id ? await new PostgresTaskStore(this.opts.db, { ownerAgent: job.agent_id }).getTask(job.continuation_task_id) : null;
+          if (task && TERMINAL.has(task.status.state)) {
+            const state = task.status.state === 'completed' ? 'delivered' : task.status.state === 'canceled' ? 'canceled' : 'failed';
+            await this.opts.db`UPDATE infra.deferred_jobs SET state=${state}, failure_code=NULL, updated_at=now() WHERE id=${job.id} AND state=${job.state}`;
+            continue;
+          }
+          // Unknown effects stay explicit even if the old authority expires.
+          if (job.state === 'reconciliation_required') continue;
+        }
         const invalid = await this.invalidReason(job);
         if (invalid) {
-          await this.opts.db`UPDATE infra.deferred_jobs SET state='canceled', failure_code=${invalid}, updated_at=now() WHERE id=${job.id} AND state IN ('waiting','queued','dispatching')`;
+          await this.opts.db`UPDATE infra.deferred_jobs SET state='canceled', failure_code=${invalid}, updated_at=now() WHERE id=${job.id} AND state IN ('waiting','queued','dispatching','awaiting_input')`;
           if (job.continuation_task_id) await this.cancel(job.agent_id, job.id, job.origin.principalId, true).catch(() => {});
           continue;
         }
