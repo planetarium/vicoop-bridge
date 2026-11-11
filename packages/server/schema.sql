@@ -1268,4 +1268,3 @@ CREATE TABLE IF NOT EXISTS infra.deferred_jobs (
 CREATE INDEX IF NOT EXISTS deferred_jobs_pending ON infra.deferred_jobs(state, id)
   WHERE state IN ('waiting','queued','dispatching','awaiting_input','reconciliation_required');
 REVOKE ALL ON infra.deferred_jobs FROM PUBLIC, app_anonymous, app_authenticated, app_postgraphile;
-
