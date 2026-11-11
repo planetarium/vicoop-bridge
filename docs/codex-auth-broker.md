@@ -185,7 +185,13 @@ It creates and removes a disposable Docker runtime, uses the selected host
 credential for real requests, and checks inference, model discovery, resume,
 tools, concurrency, cancellation cleanup and absent workload login files.
 The same script can be compiled with `bun build --compile`. Actual OAuth was
-tested on macOS with Docker Desktop. Actual API-key inference and native Linux
-host validation remain unverified; mock API-key tests do not replace them.
+tested on macOS with Docker Desktop. Azure API-key inference on native Linux was verified with Codex 0.153.4 and an
+Azure `gpt-5.4` deployment: an A2A task prepared and delivered a PNG and a
+three-second PCM WAV as separate ZIP attachments; the consumer decoded both,
+verified manifest/source hashes, and matched the WAV PCM to the source segment.
+Resuming the same context after daemon restart preserved the workspace. The
+check encountered an Azure TPM limit and resumed prepared work after recovery;
+it is not a sustained-load or throughput benchmark. Direct OpenAI API-key
+inference remains unverified by this check; mock tests do not replace it.
 
 Workspace binds must use a separate project directory: paths overlapping the host Claude/Codex credential directories (including configured homes and symlink aliases) are rejected before startup. This check protects known credential locations; operators must still keep unrelated secrets out of shared project files. Runtime labels and volume names must match the requested runtime identity, and shared host/user/IPC namespaces and device requests are rejected.
