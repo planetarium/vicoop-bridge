@@ -5,7 +5,7 @@ import { TaskState, type Message, type Task } from '@a2x/sdk';
 import type { Hono, Context } from 'hono';
 import type { Sql, SqlExecutor } from './db.js';
 import type { Registry } from './registry.js';
-import { OWNER_SESSION_PREFIX, CALLER_TOKEN_PREFIX, verifySessionToken, verifyCallerToken } from './auth/caller-token.js';
+import { OWNER_SESSION_PREFIX, CALLER_TOKEN_PREFIX, verifySessionToken } from './auth/caller-token.js';
 import { TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX } from './oauth/token-exchange/types.js';
 import { verifyTokenExchangeAccessToken } from './oauth/token-exchange/store.js';
 import { matchPrincipal, type VerifiedCaller } from './auth/principal.js';
@@ -30,7 +30,7 @@ export type DeferredJobRegistration = z.infer<typeof Registration>;
 export type DeferredJobCompletion = z.infer<typeof Completion>;
 interface Origin {
   principalId: string; contextId: string; actorId: string | null; authorizationProfile: string | null;
-  authorizationKey: string | null; allowedCaller: string | null;
+  authorizationKey: string | null; allowedCaller: string | null; ownerRevision: string; policyRevision: string;
 }
 interface Job {
   id: string; agent_id: string; executor_principal: string; source_task_id: string; source_execution_id: string;
@@ -60,6 +60,7 @@ function view(job: Job) {
 export class DeferredJobsService {
   private timer?: ReturnType<typeof setInterval>;
   private polling = false;
+  private cursor = '';
   private readonly running = new Map<string, Promise<void>>();
   constructor(private readonly opts: { db: Sql; registry: Registry }) {}
   start(intervalMs = 1000): void {
@@ -68,9 +69,12 @@ export class DeferredJobsService {
     this.timer.unref();
     void this.tick().catch(error => logEvent('deferred_jobs_poll_failed', { error: String(error) }));
   }
+  // Stop admitting new continuations; in-flight drains finish normally. A
+  // process crash instead leaves a persisted lease for fail-closed recovery.
   stop(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
+  async drain(): Promise<void> { await Promise.allSettled([...this.running.values()]); }
   async owner(agentId: string, principal: string, sql: SqlExecutor = this.opts.db): Promise<void> {
-    const rows = await sql`SELECT owner_principal FROM agents WHERE id=${agentId}`;
+    const rows = await sql`SELECT owner_principal FROM agents WHERE id=${agentId} FOR SHARE`;
     if (rows[0]?.owner_principal !== principal) throw new JobError(404, 'Not found');
   }
   private async get(agentId: string, jobId: string, sql: SqlExecutor = this.opts.db, lock = false): Promise<Job> {
@@ -82,9 +86,9 @@ export class DeferredJobsService {
   }
   private async directGrant(sql: SqlExecutor, principalId: string, allowed: string[]): Promise<string | null | undefined> {
     if (allowed.length === 0) return null;
-    const rows = await sql`SELECT email FROM callers WHERE principal_id=${principalId} AND revoked = false AND expires_at > now() ORDER BY created_at DESC LIMIT 1`;
-    const email = rows[0]?.email as string | undefined;
-    return allowed.find(entry => matchPrincipal(entry, { principalId, ...(email ? { email, emailVerified: true } : {}) }));
+    // A task persists the authenticated principal, not a verified email claim.
+    // Do not manufacture that claim from another caller token's stored email.
+    return allowed.find(entry => matchPrincipal(entry, { principalId }));
   }
   async register(agentId: string, executorPrincipal: string, input: DeferredJobRegistration) {
     const parsed = Registration.parse(input);
@@ -106,7 +110,7 @@ export class DeferredJobsService {
       const source = rows[0];
       if (!source?.owner_principal || source.authorization_revoked_at || ['canceled', 'rejected', 'failed'].includes(source.state)) throw new JobError(409, 'Origin is unavailable');
       if (executionMarker((source.task_json as Task).metadata) !== parsed.sourceExecutionId) throw new JobError(409, 'Stale source execution');
-      const agents = await sql`SELECT allowed_callers FROM agents WHERE id=${agentId}`;
+      const agents = await sql`SELECT allowed_callers, owner_revision::text, caller_policy_revision::text FROM agents WHERE id=${agentId}`;
       const allowed = agents[0]!.allowed_callers as string[];
       const grant = source.authorization_key
         ? (allowed.includes(source.authorization_key) ? source.authorization_key as string : undefined)
@@ -114,7 +118,8 @@ export class DeferredJobsService {
       if (grant === undefined) throw new JobError(409, 'Origin authority revoked');
       const origin: Origin = { principalId: source.owner_principal, contextId: source.context_id,
         actorId: source.owner_actor, authorizationProfile: source.authorization_profile,
-        authorizationKey: source.authorization_key, allowedCaller: grant };
+        authorizationKey: source.authorization_key, allowedCaller: grant,
+        ownerRevision: agents[0]!.owner_revision, policyRevision: agents[0]!.caller_policy_revision };
       const created = await sql<Job[]>`INSERT INTO infra.deferred_jobs
         (id, agent_id, executor_principal, source_task_id, source_execution_id, operation_id, version, payload_digest, origin, expires_at)
         VALUES (${randomUUID()}, ${agentId}, ${executorPrincipal}, ${parsed.sourceTaskId}, ${parsed.sourceExecutionId},
@@ -124,8 +129,9 @@ export class DeferredJobsService {
   }
   private async invalidReason(job: Job, sql: SqlExecutor = this.opts.db): Promise<string | undefined> {
     if (job.expires_at.getTime() <= Date.now()) return 'expired';
-    const agents = await sql`SELECT owner_principal, allowed_callers FROM agents WHERE id=${job.agent_id}`;
-    if (agents[0]?.owner_principal !== job.executor_principal) return 'executor_revoked';
+    const agents = await sql`SELECT owner_principal, allowed_callers, owner_revision::text, caller_policy_revision::text FROM agents WHERE id=${job.agent_id}`;
+    if (agents[0]?.owner_principal !== job.executor_principal || agents[0]?.owner_revision !== job.origin.ownerRevision) return 'executor_revoked';
+    if (agents[0]?.caller_policy_revision !== job.origin.policyRevision) return 'authority_revoked';
     const rows = await sql`SELECT * FROM infra.a2a_tasks WHERE task_id=${job.source_task_id} AND owner_agent=${job.agent_id}`;
     const source = rows[0];
     if (!source) return 'origin_unavailable';
@@ -196,7 +202,7 @@ export class DeferredJobsService {
     let caller: VerifiedCaller;
     let tokenTask: string | undefined;
     try {
-      if (raw.startsWith(CALLER_TOKEN_PREFIX)) caller = await verifyCallerToken(this.opts.db, raw);
+      if (raw.startsWith(CALLER_TOKEN_PREFIX)) caller = await verifySessionToken(this.opts.db, raw, { expectedAudience: 'caller', bypassCache: true });
       else if (raw.startsWith(TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX)) {
         const token = await verifyTokenExchangeAccessToken(this.opts.db, raw, agentId);
         if (!token.scopes.includes(cancel ? 'a2a:task.cancel' : 'a2a:task.read')) throw new Error('Scope');
@@ -222,7 +228,8 @@ export class DeferredJobsService {
       // Every running execution maintains its lease. A second instance cannot
       // infer a crash merely from not holding the WebSocket for this agent.
       for (const id of this.running.keys()) await this.opts.db`UPDATE infra.deferred_jobs SET lease_until=now() + interval '60 seconds' WHERE id=${id} AND state='dispatching'`;
-      const jobs = await this.opts.db<Job[]>`SELECT * FROM infra.deferred_jobs WHERE state IN ('waiting','queued','dispatching') ORDER BY updated_at LIMIT 100`;
+      const jobs = await this.opts.db<Job[]>`SELECT * FROM infra.deferred_jobs WHERE state IN ('waiting','queued','dispatching') AND id > ${this.cursor} ORDER BY id LIMIT 100`;
+      this.cursor = jobs.length === 100 ? jobs.at(-1)!.id : '';
       for (const job of jobs) {
         const invalid = await this.invalidReason(job);
         if (invalid) {
@@ -233,15 +240,12 @@ export class DeferredJobsService {
         if (job.state === 'dispatching') {
           if (this.running.has(job.id) || (job.lease_until && job.lease_until.getTime() > Date.now())) continue;
           const task = job.continuation_task_id ? await new PostgresTaskStore(this.opts.db, { ownerAgent: job.agent_id }).getTask(job.continuation_task_id) : null;
-          const state = task?.status.state === 'completed' ? 'delivered' : task && TERMINAL.has(task.status.state) ? 'failed' : 'reconciliation_required';
+          const state = task?.status.state === 'completed' ? 'delivered' : task?.status.state === 'canceled' ? 'canceled' : task && TERMINAL.has(task.status.state) ? 'failed' : 'reconciliation_required';
           await this.opts.db`UPDATE infra.deferred_jobs SET state=${state}, failure_code=${state === 'reconciliation_required' ? 'dispatch_outcome_unknown' : null}, updated_at=now()
             WHERE id=${job.id} AND state='dispatching' AND lease_until <= now()`;
           continue;
         }
-        if (job.state !== 'queued' || !this.opts.registry.getAgent(job.agent_id)) {
-          await this.opts.db`UPDATE infra.deferred_jobs SET updated_at=now() WHERE id=${job.id} AND state=${job.state}`;
-          continue;
-        }
+        if (job.state !== 'queued' || !this.opts.registry.getAgent(job.agent_id)) continue;
         // Do not start the continuation while its originating execution is
         // still active; caller runtime queues serialize other context turns.
         if (this.opts.registry.getBinding(job.source_task_id)) continue;
@@ -282,7 +286,7 @@ export class DeferredJobsService {
       await store.updateTask(task.id, { status: task.status, history: task.history, artifacts: task.artifacts });
     });
     const result = await store.getTask(task.id);
-    const state = result?.status.state === 'completed' ? 'delivered' : result?.status.state === 'input-required' || result?.status.state === 'auth-required' ? 'awaiting_input' : 'failed';
+    const state = result?.status.state === 'completed' ? 'delivered' : result?.status.state === 'input-required' || result?.status.state === 'auth-required' ? 'awaiting_input' : result?.status.state === 'canceled' ? 'canceled' : 'failed';
     await this.opts.db`UPDATE infra.deferred_jobs SET state=${state}, lease_until=NULL, updated_at=now() WHERE id=${job.id} AND state='dispatching'`;
   }
 }
@@ -294,15 +298,24 @@ export function mountDeferredJobs(app: Hono, opts: { db: Sql; registry: Registry
       const raw = c.req.header('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
       if (!raw?.startsWith(OWNER_SESSION_PREFIX)) throw new JobError(401, 'Owner bearer required');
       let principal: string;
-      try { principal = (await verifySessionToken(opts.db, raw, { expectedAudience: 'owner_session' })).principalId; }
+      try { principal = (await verifySessionToken(opts.db, raw, { expectedAudience: 'owner_session', bypassCache: true })).principalId; }
       catch { throw new JobError(401, 'Invalid owner bearer'); }
       return c.json({ job: await action(c, principal) });
     } catch (error) { return failure(c, error); }
   };
   const body = async (c: Context) => {
-    const raw = await c.req.text();
-    if (Buffer.byteLength(raw) > MAX_BYTES) throw new JobError(400, 'Body too large');
-    try { return JSON.parse(raw); } catch { throw new JobError(400, 'Invalid JSON'); }
+    const reader = c.req.raw.body?.getReader();
+    if (!reader) throw new JobError(400, 'JSON body required');
+    const chunks: Uint8Array[] = []; let size = 0;
+    try {
+      while (true) {
+        const chunk = await reader.read(); if (chunk.done) break;
+        size += chunk.value.byteLength;
+        if (size > MAX_BYTES) { await reader.cancel(); throw new JobError(400, 'Body too large'); }
+        chunks.push(chunk.value);
+      }
+    } finally { reader.releaseLock(); }
+    try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new JobError(400, 'Invalid JSON'); }
   };
   const base = '/admin-api/agents/:id/deferred-jobs';
   app.post(base, route(async (c, principal) => service.register(c.req.param('id')!, principal, await body(c))));

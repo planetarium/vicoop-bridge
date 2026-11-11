@@ -1263,4 +1263,20 @@ CREATE TABLE IF NOT EXISTS infra.deferred_jobs (
 );
 CREATE INDEX IF NOT EXISTS deferred_jobs_pending ON infra.deferred_jobs(state, updated_at)
   WHERE state IN ('waiting','queued','dispatching');
-REVOKE ALL ON infra.deferred_jobs FROM app_anonymous, app_authenticated, app_postgraphile;
+REVOKE ALL ON infra.deferred_jobs FROM PUBLIC, app_anonymous, app_authenticated, app_postgraphile;
+
+-- Removing/re-adding a grant cannot resurrect deferred work. Changes to the
+-- policy conservatively invalidate all work registered under its old revision.
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS caller_policy_revision BIGINT NOT NULL DEFAULT 0;
+CREATE OR REPLACE FUNCTION bump_caller_policy_revision() RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.allowed_callers IS DISTINCT FROM OLD.allowed_callers THEN
+    NEW.caller_policy_revision := OLD.caller_policy_revision + 1;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS agents_caller_policy_revision ON agents;
+CREATE TRIGGER agents_caller_policy_revision BEFORE UPDATE ON agents
+  FOR EACH ROW EXECUTE FUNCTION bump_caller_policy_revision();
+COMMENT ON COLUMN agents.caller_policy_revision IS E'@omit create,update';

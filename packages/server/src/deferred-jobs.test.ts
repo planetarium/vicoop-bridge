@@ -168,6 +168,78 @@ test('durable external jobs authorize, recover and continue in the original A2A 
     assert.equal(rows[0]!.state, 'canceled');
   });
 
+  await t.test('remove/re-add and owner transfer/return never resurrect registered jobs', async () => {
+    for (const kind of ['grant', 'owner'] as const) {
+      const { job } = await register();
+      if (kind === 'grant') {
+        await sql`UPDATE agents SET allowed_callers=${[stranger]} WHERE id=${agentId}`;
+        await sql`UPDATE agents SET allowed_callers=${[caller,stranger]} WHERE id=${agentId}`;
+      } else {
+        await sql`UPDATE agents SET owner_principal=${stranger} WHERE id=${agentId}`;
+        await sql`UPDATE agents SET owner_principal=${owner} WHERE id=${agentId}`;
+      }
+      await json(await call(`${path}/${job.jobId}/complete`, completion), 409);
+      const before = assigned.length; await service.tick(); assert.equal(assigned.length, before);
+      assert.equal((await service.inspect(agentId, job.jobId, owner)).state, 'canceled');
+    }
+  });
+
+  await t.test('fresh token checks reject cached owner and consumer tokens after revocation', async () => {
+    const { job } = await register();
+    const ephemeralOwner = await issueSessionToken(sql, { principalId: owner, provider: 'siwe', audience: 'owner_session' });
+    const ephemeralCaller = await issueSessionToken(sql, { principalId: caller, provider: 'siwe', audience: 'caller' });
+    await json(await call(`${path}/${job.jobId}`, undefined, ephemeralOwner.rawToken));
+    await json(await call(`/agents/${agentId}/deferred-jobs/${job.jobId}`, undefined, ephemeralCaller.rawToken));
+    await sql`UPDATE callers SET revoked=true WHERE id = ANY(${[ephemeralOwner.callerId, ephemeralCaller.callerId]})`;
+    await json(await call(`${path}/${job.jobId}/complete`, completion, ephemeralOwner.rawToken), 401);
+    await json(await call(`/agents/${agentId}/deferred-jobs/${job.jobId}`, undefined, ephemeralCaller.rawToken), 401);
+    await json(await call(`${path}/${job.jobId}/cancel`, {}));
+  });
+
+  await t.test('queued cancellation and active authority revocation suppress continuation effects', async () => {
+    const queued = await register();
+    await json(await call(`${path}/${queued.job.jobId}/complete`, completion));
+    await json(await call(`${path}/${queued.job.jobId}/cancel`, {}));
+    const before = assigned.length; await service.tick(); assert.equal(assigned.length, before);
+    const active = await register();
+    await json(await call(`${path}/${active.job.jobId}/complete`, completion));
+    await service.tick(); await waitFor(async () => assigned.length > before);
+    const taskId = assigned.at(-1)!.taskId;
+    await sql`UPDATE agents SET allowed_callers=${[stranger]} WHERE id=${agentId}`;
+    await service.tick();
+    await waitFor(async () => !registry.getBinding(taskId));
+    assert.equal((await service.inspect(agentId, active.job.jobId, owner)).state, 'canceled');
+    const row = await sql`SELECT state FROM infra.a2a_tasks WHERE task_id=${taskId}`;
+    assert.equal(row[0]!.state, 'canceled');
+    await sql`UPDATE agents SET allowed_callers=${[caller,stranger]} WHERE id=${agentId}`;
+  });
+
+  await t.test('worker keyset scan reaches queued work beyond 100 waiting records', async () => {
+    const { job } = await register();
+    // Copies represent independently registered jobs and exercise only the
+    // worker scan, without making this scheduling test a 100-request benchmark.
+    await sql`INSERT INTO infra.deferred_jobs
+      (id,agent_id,executor_principal,source_task_id,source_execution_id,operation_id,version,payload_digest,origin,expires_at)
+      SELECT '00000000-' || n::text, agent_id,executor_principal,source_task_id,source_execution_id,
+        gen_random_uuid()::text,version,payload_digest,origin,expires_at
+      FROM infra.deferred_jobs CROSS JOIN generate_series(1,110) n WHERE id=${job.jobId}`;
+    await json(await call(`${path}/${job.jobId}/complete`, completion));
+    const before = assigned.length;
+    const worker = new DeferredJobsService({ db: sql, registry });
+    await worker.tick(); await worker.tick();
+    await waitFor(async () => assigned.length > before);
+    finish(assigned.at(-1)!.taskId); await worker.drain();
+    await sql`DELETE FROM infra.deferred_jobs WHERE agent_id=${agentId} AND id LIKE '00000000-%'`;
+    assert.equal((await service.inspect(agentId, job.jobId, owner)).state, 'delivered');
+  });
+
+  await t.test('oversized callback is rejected before parsing or recording it', async () => {
+    const { job } = await register();
+    await json(await call(`${path}/${job.jobId}/complete`, { ...completion, parts: [{ kind: 'text', text: 'x'.repeat(1024 * 1024) }] }), 400);
+    assert.equal((await service.inspect(agentId, job.jobId, owner)).state, 'waiting');
+    await json(await call(`${path}/${job.jobId}/cancel`, {}));
+  });
+
   await t.test('ambiguous dispatch after restart is reconciled, never automatically redispatched', async () => {
     const { job } = await register();
     await json(await call(`${path}/${job.jobId}/complete`, completion));
