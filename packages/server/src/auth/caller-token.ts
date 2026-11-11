@@ -167,6 +167,8 @@ export async function issueCallerToken(
 }
 
 export interface VerifyOptions {
+  // Control-plane decisions must observe revocation immediately.
+  bypassCache?: boolean;
   // When set, throws if the verified token's audience does not match.
   // Call sites that handle a single audience kind (e.g. agent-auth.ts only
   // accepts 'caller') pass this so a stolen token cannot be repurposed
@@ -196,7 +198,7 @@ export async function verifySessionToken(
 
   const now = Date.now();
   const cached = verifyCache.get(rawToken);
-  if (cached && cached.expiresAt > now) {
+  if (!opts.bypassCache && cached && cached.expiresAt > now) {
     if (opts.expectedAudience && cached.audience !== opts.expectedAudience) {
       throw new Error(
         `Token audience mismatch: cached audience ${cached.audience} does not satisfy ${opts.expectedAudience}`,

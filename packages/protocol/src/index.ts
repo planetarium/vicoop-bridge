@@ -672,3 +672,5 @@ export function parseUpFrame(raw: string): UpFrame {
 export function parseDownFrame(raw: string): DownFrame {
   return DownFrame.parse(JSON.parse(raw));
 }
+
+export * from "./consumer-consent.js";

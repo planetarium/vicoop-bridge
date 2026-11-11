@@ -1,4 +1,4 @@
-import { APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
+import { APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY, CONSUMER_CONSENT_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import {
   A2A_TRANSPORTS,
   A2XServer,
@@ -127,7 +127,13 @@ export function buildAgentA2XServer(
         requesterApprovalUrlTemplate: `${opts.publicUrl ?? ''}/agents/${encodeURIComponent(conn.agentId)}/approvals/{requestId}` },
     });
   }
-  const wireExtensions = (wire.capabilities?.extensions ?? []).filter(e => e.uri !== APPROVAL_EXTENSION_URI);
+  if (opts.db) a2xServer.addExtension({ uri: CONSUMER_CONSENT_EXTENSION_URI, required: false,
+    description: 'Explicit consumer consent for immutable paid-operation proposals. The originating authenticated consumer decides through the advertised HTTPS endpoint; chat text never approves.',
+    params: { statusUrlTemplate: `${opts.publicUrl ?? ''}/agents/${encodeURIComponent(conn.agentId)}/consent-proposals/{operationId}`,
+      decisionUrlTemplate: `${opts.publicUrl ?? ''}/agents/${encodeURIComponent(conn.agentId)}/consent-proposals/{operationId}/decision` },
+  });
+  const wireExtensions = (wire.capabilities?.extensions ?? []).filter(e =>
+    e.uri !== APPROVAL_EXTENSION_URI && e.uri !== CONSUMER_CONSENT_EXTENSION_URI);
   const callerRuntime = conn.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) === true;
   const restricted = conn.allowedCallers.length > 0 || callerRuntime;
   const principals = conn.allowedCallers.map(parsePrincipal);

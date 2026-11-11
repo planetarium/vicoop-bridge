@@ -1,3 +1,4 @@
+import { mountConsumerConsent } from './consumer-consent-http.js';
 import { ApprovalDecision } from '@vicoop-bridge/protocol';
 import { transferAgent } from './agent-transfer.js';
 import { authorizeRequesterApproval, RequesterDecisionBody, requesterApprovalResponse } from './requester-approvals.js';
@@ -668,6 +669,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // signs a SIWE message once, then presents the returned vbc_caller_* token
   // on all subsequent requests.
   mountSiweExchange(app, { sql: opts.db, domain: siweDomain });
+  mountConsumerConsent(app, { db: opts.db, siweDomain });
 
   // RFC 7009 token revocation. Mounted unconditionally — revocation is
   // independent of how the token was issued (SIWE exchange or device flow),
