@@ -11,7 +11,19 @@ const fs = require('node:fs');
 const promptFiles = new Map();
 let promptDirectory, catalogPath, stagedBytes = 0;
 let child, server, next = 0, pending = '', started = false, closing = false;
+const serviceServers = [];
+let serviceDirectory;
 const sockets = new Map();
+const serviceSockets = new Set();
+const serviceUploads = new Map();
+function serviceUpload(id) {
+  const upload = serviceUploads.get(id),socket = sockets.get(id);
+  if (!upload || !socket) return;
+  if (upload.offset >= upload.data.length) {serviceUploads.delete(id);socket.resume();return;}
+  const chunk = upload.data.subarray(upload.offset,upload.offset + 48 * 1024);
+  upload.offset += chunk.length;
+  send({t:'data',id,data:chunk.toString('base64')});
+}
 const fileResponses = new Map();
 let fileServer, fileNext = 0;
 function send(frame) {
@@ -28,6 +40,8 @@ function shutdown(code) {
   for (const socket of sockets.values()) socket.destroy();
   if (server) server.close();
   if (fileServer) fileServer.close();
+  for (const s of serviceServers) s.close();
+  if (serviceDirectory) fs.rmSync(serviceDirectory,{recursive:true,force:true});
   for (const res of fileResponses.values()) res.destroy();
   if (promptDirectory) fs.rmSync(promptDirectory,{recursive:true,force:true});
   process.exit(code);
@@ -89,6 +103,39 @@ function receive(m) {
         if (${PROVIDER_ENV_PATTERN}.test(k) || /^(CODEX_|VICOOP_EXECUTION_TOKEN$)/.test(k)) delete env[k];
       }
       Object.assign(env, m.env);
+      delete env.VICOOP_CREDENTIAL_PROXY;
+      if (m.services && m.services.length) {
+        serviceDirectory = fs.mkdtempSync('/tmp/vicoop-services-');
+        const fetchModule = serviceDirectory + '/fetch.mjs';
+        fs.writeFileSync(fetchModule, m.serviceFetchModule, {mode:0o600});
+        const services = {};
+        for (const service of m.services) {
+          const accept = socket => {
+            if (sockets.size >= 16) {socket.destroy();return;}
+            const id = ++next;
+            sockets.set(id,socket);
+            serviceSockets.add(id);
+            send({t:'open',id,service:service.name});
+            socket.on('data',data=>{
+              socket.pause();serviceUploads.set(id,{data,offset:0});serviceUpload(id);
+            });
+            socket.on('error',()=>{});
+            socket.on('close',()=>{sockets.delete(id);serviceSockets.delete(id);serviceUploads.delete(id);send({t:'close',id});});
+          };
+          const tcp = net.createServer(accept), unix = net.createServer(accept);
+          serviceServers.push(tcp,unix);
+          tcp.on('error',()=>shutdown(1));unix.on('error',()=>shutdown(1));
+          const socketPath = serviceDirectory + '/' + service.name + '.sock';
+          await Promise.all([
+            new Promise(resolve=>tcp.listen(0,'127.0.0.1',resolve)),
+            new Promise(resolve=>unix.listen(socketPath,resolve)),
+          ]);
+          if (closing) return;
+          services[service.name] = {url:'http://127.0.0.1:'+tcp.address().port,
+            token:service.token,origins:service.origins,socketPath,fetchModule};
+        }
+        env.VICOOP_CREDENTIAL_PROXY = JSON.stringify(services);
+      }
       if(m.backend==='codex') {
         env.CODEX_HOME='/data/sessions/codex/config';
         fs.mkdirSync(env.CODEX_HOME,{recursive:true,mode:0o700});
@@ -157,8 +204,11 @@ function receive(m) {
     const socket = sockets.get(m.id);
     if (socket) {
       if (socket.writableLength > 1024 * 1024) socket.destroy();
-      else socket.write(Buffer.from(m.data, 'base64'));
+      else socket.write(Buffer.from(m.data, 'base64'),()=>{
+        if(serviceSockets.has(m.id))send({t:'service-drain',id:m.id});
+      });
     }
-  } else if (m.t === 'close') sockets.get(m.id)?.destroy();
+  } else if (m.t === 'service-resume') serviceUpload(m.id);
+  else if (m.t === 'close') sockets.get(m.id)?.destroy();
 }
 `;

@@ -614,14 +614,27 @@ test('aborted helper start cleans the disposable image without saving config', a
 
 test('concurrent agents on one daemon inherit one policy without deleting the shared pool', async t => {
   const a = await fixture(t), b = await fixture(t);
+  // Independent Docker builds need not have the same immutable image identity.
+  const withHelperImage = (helperImage: string): AsyncDockerRun => async (args, opts) => {
+    if (args[0] === 'image' && args.at(-1) === helperImage)
+      return success(JSON.stringify([{ Id: helperImage }]));
+    const result = await a.dockerRun(args, opts);
+    if (args[0] === 'build') await writeFile(args[args.indexOf('--iidfile') + 1], helperImage);
+    return result;
+  };
   // Both use one Docker fixture while keeping separate private config/state.
   await Promise.all([
-    runCallerContainerInit({ ...a.options, storageCapacityMiB: 4096, storageReserveMiB: 64 }),
-    runCallerContainerInit({ ...b.options, kind: 'codex', storageCapacityMiB: 4096, storageReserveMiB: 64, dockerRun: a.dockerRun }),
+    runCallerContainerInit({ ...a.options, image, storageCapacityMiB: 4096, storageReserveMiB: 64,
+      dockerRun: withHelperImage(`sha256:${'b'.repeat(64)}`) }),
+    runCallerContainerInit({ ...b.options, kind: 'codex', image, storageCapacityMiB: 4096, storageReserveMiB: 64,
+      dockerRun: withHelperImage(`sha256:${'c'.repeat(64)}`) }),
   ]);
   const first = (await a.read()).backends.claude.caller_runtime.fixedImageStorage;
   const second = (await b.read()).backends.codex.caller_runtime.fixedImageStorage;
-  assert.deepEqual(first, second);
+  const { image: firstHelper, ...firstPolicy } = first;
+  const { image: secondHelper, ...secondPolicy } = second;
+  assert.notEqual(firstHelper, secondHelper);
+  assert.deepEqual(firstPolicy, secondPolicy);
   assert.equal(first.capacityMiB, 4096);
   assert.equal(first.reserveMiB, 64);
   assert.equal(a.calls.some(args => args[0] === 'volume' && args[1] === 'rm'), false);

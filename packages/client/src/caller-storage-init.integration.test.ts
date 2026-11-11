@@ -56,8 +56,15 @@ USER node
     const other = JSON.parse(await readFile(paths[1], 'utf8'));
     const runtime = config.backends.claude.caller_runtime;
     assert.equal(config.preserved, true);
-    assert.deepEqual(runtime.fixedImageStorage, other.backends.codex.caller_runtime.fixedImageStorage);
-    assert.match(runtime.fixedImageStorage.image, /^sha256:[a-f0-9]{64}$/);
+    // Separate builds may have different image metadata/attestations. The shared
+    // pool contract is its policy; each config pins its own validated helper.
+    const { image: firstHelper, ...firstPolicy } = runtime.fixedImageStorage;
+    const { image: secondHelper, ...secondPolicy } = other.backends.codex.caller_runtime.fixedImageStorage;
+    assert.deepEqual(firstPolicy, secondPolicy);
+    for (const helper of [firstHelper, secondHelper]) {
+      assert.match(helper, /^sha256:[a-f0-9]{64}$/);
+      assert.equal(await command(['image', 'inspect', '--format', '{{.Id}}', helper]), helper);
+    }
     pool = new DockerCallerRuntimePool('claude', runtime, config.agent_id);
     await pool.initialize(false, true);
     const id = scopeDigest(config.agent_id, principal);

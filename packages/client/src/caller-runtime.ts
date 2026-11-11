@@ -87,6 +87,7 @@ export async function createCallerRuntime(args: {
               credential: claudeCredential!,
               authentication: selected.kind,
               ttlMs: config.taskTimeoutMs,
+              credentialProxy: config.credentialProxy,
               ...(config.fileDelivery ? {fileDelivery: {
                 description: `Deliver a file as an A2A attachment. Allowed roots: ${config.fileDelivery.allowedRoots.join(', ')}. Limit ${config.fileDelivery.maxBytes} bytes per file, ${config.fileDelivery.maxTotalBytes} total bytes and ${config.fileDelivery.maxFiles} files per task.`,
                 bind: () => {
@@ -99,6 +100,7 @@ export async function createCallerRuntime(args: {
           : createExecutionBrokerSpawn(containerId, {
               backend: 'codex',
               ttlMs: config.taskTimeoutMs,
+              credentialProxy: config.credentialProxy,
               codexCatalog,
               createBroker: () => {
                 const providerBroker = createCodexAuthBroker({
@@ -122,7 +124,8 @@ export async function createCallerRuntime(args: {
       const workspaceInstructions = container.context
         ? 'This conversation has its own persistent /workspace and backend session storage. Other conversations have separate writable workspaces. The caller’s previous shared workspace is available read-only at /caller-workspace; copy required files into /workspace before modifying them. Shared source assets under /shared are read-only. Write deliverables in /workspace/output.'
         : undefined;
-      const appendPrompt = [config.systemPrompt, workspaceInstructions].filter(Boolean).join('\n\n');
+      const proxyInstructions = config.credentialProxy ? 'Host-authenticated external services are available in VICOOP_CREDENTIAL_PROXY (JSON). Each service provides url, token, origins, socketPath and fetchModule. Import createProxyFetch from fetchModule to use an original JavaScript SDK with its custom fetch option. Do not persist execution tokens or endpoint paths: they expire when this execution ends. For gh use a temporary GH_CONFIG_DIR with http_unix_socket set to the GitHub service socketPath and GH_TOKEN set to its token. The proxy does not approve paid operations or retry requests.' : undefined;
+      const appendPrompt = [config.systemPrompt, workspaceInstructions, proxyInstructions].filter(Boolean).join('\n\n');
       const worker =
         args.kind === 'claude'
           ? createClaudeBackend({
@@ -143,7 +146,7 @@ export async function createCallerRuntime(args: {
             })
           : createCodexExecutionBackend({
               ...args.codex,
-              runtimeInstructions: workspaceInstructions,
+              runtimeInstructions: [workspaceInstructions, proxyInstructions].filter(Boolean).join('\n\n') || undefined,
               cwd: '/workspace',
               sandboxMode: 'danger-full-access',
               spawn: spawn as AppServerSpawnFn,

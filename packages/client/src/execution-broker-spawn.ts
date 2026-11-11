@@ -8,6 +8,9 @@ import type { createExecutionAuthBroker } from './execution-auth-broker.js';
 import { EXECUTION_BROKER_RELAY } from './execution-broker-relay.js';
 import { EXECUTION_BROKER_SUPERVISOR } from './execution-broker-supervisor.js';
 import type { ChildHandle, SpawnFn } from './spawn-adapter.js';
+import { createCredentialProxies, type ServiceProxy } from './credential-proxy.js';
+import type { CredentialProxyOptions } from './credential-proxy-config.js';
+import { CREDENTIAL_PROXY_FETCH } from './credential-proxy-fetch.js';
 
 // The Docker channel itself binds a grant to this execution and runtime.
 // A grant stolen by runtime B is useless on B's separate HTTP parser; there
@@ -20,6 +23,8 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
   codexCatalog?: string;
   spawnImpl?: typeof nodeSpawn;
   cleanupSpawnImpl?: typeof nodeSpawn;
+  credentialProxy?: CredentialProxyOptions;
+  createServiceProxies?: () => ServiceProxy[];
   fileDelivery?: { description: string; bind(): (input: unknown, signal: AbortSignal) => Promise<object> };
 }) {
   const running = new Set<() => void>();
@@ -57,6 +62,11 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
     const fileController = new AbortController();
     let fileRequests = 0;
     const broker = opts.createBroker();
+    let serviceProxies: ServiceProxy[];
+    try {
+      serviceProxies = opts.createServiceProxies?.() ?? (opts.credentialProxy
+        ? createCredentialProxies(opts.credentialProxy, opts.ttlMs ?? 60 * 60_000) : []);
+    } catch (error) { broker.revoke(); throw error; }
     // Absolute trusted binaries; disable runtime injection into the privileged
     // supervisor. The last argument is opaque relay source, run only as node.
     let relay: ReturnType<typeof nodeSpawn>;
@@ -67,6 +77,7 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
         EXECUTION_BROKER_SUPERVISOR, String(opts.ttlMs ?? 60 * 60_000), EXECUTION_BROKER_RELAY], { stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (error) {
       broker.revoke();
+      for (const proxy of serviceProxies) proxy.revoke();
       fileController.abort();
       throw error;
     }
@@ -74,6 +85,7 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
     const stdout = new PassThrough();
     const stderr = new PassThrough();
     const sockets = new Map<number, Duplex>();
+    const serviceFlows = new Map<number, { received(data: Buffer): void; drained(): void }>();
     let pending = '';
     let ready = false;
     let ended = false;
@@ -89,6 +101,7 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
     const stop = () => {
       fileController.abort();
       broker.revoke();
+      for (const proxy of serviceProxies) proxy.revoke();
       // Close the trusted supervisor input, discarding queued workload frames.
       // A stopped relay cannot process a kill frame or drain its input queue.
       relay.stdin?.destroy();
@@ -176,23 +189,61 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
             );
           } else if (m.t === 'open') {
             if (!Number.isSafeInteger(m.id) || m.id < 1 || sockets.has(m.id) || sockets.size >= 16) { fail(); return; }
+            const selected = m.service === undefined ? broker : serviceProxies.find(p => p.name === m.service);
+            if (!selected) { fail(); return; }
+            const isService = m.service !== undefined;
+            let resumeNeeded = false;
+            let writeNext: (() => void) | undefined;
+            let finishWrite: ((error?: Error | null) => void) | undefined;
+            const resume = () => {
+              if (!resumeNeeded) return;
+              resumeNeeded = false; send({t:'service-resume',id:m.id});
+            };
             const socket = new Duplex({
-              read() {},
+              read() { if (isService) resume(); },
               write(data, _encoding, callback) {
+                if (isService) {
+                  let offset = 0;
+                  finishWrite = callback;
+                  writeNext = () => {
+                    if (offset >= data.length) {
+                      writeNext = undefined; finishWrite = undefined; callback(); return;
+                    }
+                    const chunk = data.subarray(offset,offset + 48 * 1024); offset += chunk.length;
+                    send({t:'data',id:m.id,data:chunk.toString('base64')});
+                  };
+                  writeNext(); return;
+                }
                 for (let offset = 0; offset < data.length; offset += 48 * 1024) send({ t: 'data', id: m.id, data: data.subarray(offset, offset + 48 * 1024).toString('base64') });
                 callback();
               },
-              destroy(_err, callback) { send({ t: 'close', id: m.id }); sockets.delete(m.id); callback(); },
+              destroy(_err, callback) {
+                send({ t: 'close', id: m.id }); sockets.delete(m.id); serviceFlows.delete(m.id);
+                writeNext = undefined;
+                const pendingWrite = finishWrite; finishWrite = undefined;
+                pendingWrite?.(new Error('Service channel closed')); callback();
+              },
+            });
+            if (isService) serviceFlows.set(m.id, {
+              received(data) { resumeNeeded = true; if (socket.push(data)) resume(); },
+              drained() { writeNext?.(); },
             });
             socket.on('error', () => socket.destroy());
             sockets.set(m.id, socket);
-            broker.attach(socket);
+            selected.attach(socket);
           } else if (m.t === 'data') {
             const socket = sockets.get(m.id);
             if (socket) {
               if (socket.readableLength > 1024 * 1024) socket.destroy();
-              else socket.push(Buffer.from(m.data, 'base64'));
+              else {
+                const data = Buffer.from(m.data, 'base64');
+                const flow = serviceFlows.get(m.id);
+                if (flow) flow.received(data); else socket.push(data);
+              }
             }
+          } else if (m.t === 'service-drain') {
+            // A write acknowledgement can race the channel's close frame.
+            serviceFlows.get(m.id)?.drained();
           } else if (m.t === 'close') sockets.get(m.id)?.destroy();
           else { fail(); return; }
         } catch { fail(); return; }
@@ -211,6 +262,8 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
         }
       }
       send({ t: 'start', backend: opts.backend, command, args, cwd: options.cwd, env, token: broker.token,
+        services: serviceProxies.map(({name, token, origins}) => ({name, token, origins})),
+        ...(serviceProxies.length ? { serviceFetchModule: CREDENTIAL_PROXY_FETCH } : {}),
         authentication: opts.authentication ?? 'oauth',
         ...(deliverFile ? {fileDelivery:{token:fileToken,helper:CALLER_FILE_MCP,description:opts.fileDelivery!.description}} : {}), files:promptFiles.map((file,id)=>({id,argIndex:file.argIndex})) });
     })().catch(fail);

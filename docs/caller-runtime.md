@@ -13,6 +13,10 @@ this mode. Claude supports opt-in outgoing file delivery through the bridge-owne
 `container` (dedicated per caller); shared-container execution is no longer
 available through the daemon.
 
+Both backends can also opt into [host-held external-service credentials](credential-proxy.md)
+for native HTTP APIs, including fal JavaScript SDKs and GitHub clients. This
+keeps service keys outside the workload without replacing the service API.
+
 ## Initial setup
 
 Use Linux or macOS with a running Docker engine. Register the agent with
