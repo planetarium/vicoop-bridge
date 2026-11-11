@@ -152,7 +152,7 @@ function receive(m) {
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',
         });
       }
-      if (m.fileDelivery && m.backend === 'claude') {
+      if (m.fileDelivery) {
         fileServer = http.createServer({maxHeaderSize:4096}, async (req,res) => {
           if(req.method!=='POST'||req.url!=='/send-file'||req.headers.authorization!=='Bearer '+m.fileDelivery.token||fileResponses.size>=4){res.writeHead(403);res.end();return;}
           req.setEncoding('utf8');
@@ -171,11 +171,18 @@ function receive(m) {
         await new Promise(resolve=>fileServer.listen(0,'127.0.0.1',resolve));
         if(closing)return;
         const url='http://127.0.0.1:'+fileServer.address().port+'/send-file';
-        // Replace only the bridge-owned empty strict MCP configuration.
-        const index=m.args.indexOf('--mcp-config');
-        if(index<0||m.args[index+1]!==JSON.stringify({mcpServers:{}}))return shutdown(1);
-        m.args[index+1]=JSON.stringify({mcpServers:{'_vb-send-file':{command:'/usr/local/bin/node',args:['-e',m.fileDelivery.helper,url,m.fileDelivery.token,m.fileDelivery.description]}}});
-        m.args.push('--allowedTools','mcp___vb-send-file__send_file');
+        if (m.backend === 'codex') {
+          const helperArgs=['-e',m.fileDelivery.helper,url,m.fileDelivery.token,m.fileDelivery.description];
+          m.args.push('-c','mcp_servers.vb_send_file.command="/usr/local/bin/node"',
+            '-c','mcp_servers.vb_send_file.args='+JSON.stringify(helperArgs),
+            '-c','mcp_servers.vb_send_file.required=true');
+        } else {
+          // Replace only the bridge-owned empty strict MCP configuration.
+          const index=m.args.indexOf('--mcp-config');
+          if(index<0||m.args[index+1]!==JSON.stringify({mcpServers:{}}))return shutdown(1);
+          m.args[index+1]=JSON.stringify({mcpServers:{'_vb-send-file':{command:'/usr/local/bin/node',args:['-e',m.fileDelivery.helper,url,m.fileDelivery.token,m.fileDelivery.description]}}});
+          m.args.push('--allowedTools','mcp___vb-send-file__send_file');
+        }
       }
       child = spawn(m.command, m.args, {cwd:m.cwd, env, detached:true, stdio:['pipe','pipe','pipe']});
       child.stdout.on('data', data => send({t:'stdout', data:data.toString('base64')}));

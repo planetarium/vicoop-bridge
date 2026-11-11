@@ -37,7 +37,6 @@ export async function createCallerRuntime(args: {
   codex?: CodexBackendOptions;
 }): Promise<CallerScopedBackend> {
   const config = CallerRuntimeConfig.parse(args.config);
-  if (config.fileDelivery && args.kind !== 'claude') throw new Error('caller fileDelivery currently supports Claude only');
   assertCallerRuntimeBackend(args.kind, config);
   const claudeCredential =
     args.kind === 'claude' ? createClaudeCredentialReader() : undefined;
@@ -81,6 +80,14 @@ export async function createCallerRuntime(args: {
       signal.throwIfAborted();
       let taskFiles: ReturnType<typeof createCallerFileDelivery> | undefined;
       let filesHealthy = true;
+      const fileDeliveryOptions = config.fileDelivery ? {fileDelivery: {
+        description: `Deliver a file as an A2A attachment. Allowed roots: ${config.fileDelivery.allowedRoots.join(', ')}. Limit ${config.fileDelivery.maxBytes} bytes per file, ${config.fileDelivery.maxTotalBytes} total bytes and ${config.fileDelivery.maxFiles} files per task.`,
+        bind: () => {
+          const bound = taskFiles;
+          if (!bound) throw new Error('Missing file delivery execution');
+          return (input: unknown, signal: AbortSignal) => bound.send(input, signal);
+        },
+      }} : {};
       const broker =
         args.kind === 'claude'
           ? createClaudeBrokerSpawn(containerId, {
@@ -88,17 +95,11 @@ export async function createCallerRuntime(args: {
               authentication: selected.kind,
               ttlMs: config.taskTimeoutMs,
               credentialProxy: config.credentialProxy,
-              ...(config.fileDelivery ? {fileDelivery: {
-                description: `Deliver a file as an A2A attachment. Allowed roots: ${config.fileDelivery.allowedRoots.join(', ')}. Limit ${config.fileDelivery.maxBytes} bytes per file, ${config.fileDelivery.maxTotalBytes} total bytes and ${config.fileDelivery.maxFiles} files per task.`,
-                bind: () => {
-                  const bound = taskFiles;
-                  if (!bound) throw new Error('Missing file delivery execution');
-                  return (input: unknown, signal: AbortSignal) => bound.send(input, signal);
-                },
-              }} : {}),
+              ...fileDeliveryOptions,
             })
           : createExecutionBrokerSpawn(containerId, {
               backend: 'codex',
+              ...fileDeliveryOptions,
               ttlMs: config.taskTimeoutMs,
               credentialProxy: config.credentialProxy,
               codexCatalog,
@@ -106,6 +107,7 @@ export async function createCallerRuntime(args: {
                 const providerBroker = createCodexAuthBroker({
                   credential: codexCredential!,
                   authentication: selected.kind,
+                  ...('azureEndpoint' in selected && typeof selected.azureEndpoint === 'string' ? {azureEndpoint: selected.azureEndpoint} : {}),
                 });
                 brokerStats.push(providerBroker.stats);
                 return providerBroker;
@@ -146,7 +148,7 @@ export async function createCallerRuntime(args: {
             })
           : createCodexExecutionBackend({
               ...args.codex,
-              runtimeInstructions: [workspaceInstructions, proxyInstructions].filter(Boolean).join('\n\n') || undefined,
+              runtimeInstructions: appendPrompt || undefined,
               cwd: '/workspace',
               sandboxMode: 'danger-full-access',
               spawn: spawn as AppServerSpawnFn,

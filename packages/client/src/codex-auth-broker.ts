@@ -20,15 +20,40 @@ export type CodexCredential = {
   kind: 'api-key' | 'oauth';
   secret: string;
   accountId?: string;
+  azureEndpoint?: string;
 };
 export type CodexCredentialReader = () =>
   | CodexCredential
   | Promise<CodexCredential>;
 
+// Explicit host-only Azure adapter. Caller input cannot select an upstream.
+export function validateCodexAzureEndpoint(value: string): string {
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error('Invalid Codex Azure endpoint'); }
+  if (url.protocol !== 'https:' || url.port || url.username || url.password || url.search || url.hash ||
+      !/^[a-z0-9][a-z0-9-]*\.(?:openai\.azure\.com|services\.ai\.azure\.com)$/.test(url.hostname) ||
+      !['/openai/v1', '/openai/v1/'].includes(url.pathname))
+    throw new Error('Invalid Codex Azure endpoint; use https://RESOURCE.openai.azure.com/openai/v1');
+  return url.origin + '/openai/v1';
+}
+
 // Select once, reread only that source, and never copy/refresh a login in Docker.
 export function createCodexCredentialReader(
   env: NodeJS.ProcessEnv = process.env,
 ): CodexCredentialReader {
+  if (env.VICOOP_CODEX_AZURE_ENDPOINT || env.AZURE_OPENAI_API_KEY) {
+    if (!env.VICOOP_CODEX_AZURE_ENDPOINT || !env.AZURE_OPENAI_API_KEY || env.OPENAI_API_KEY || env.OPENAI_BASE_URL)
+      throw new Error('Azure Codex requires only VICOOP_CODEX_AZURE_ENDPOINT and AZURE_OPENAI_API_KEY');
+    const endpoint = validateCodexAzureEndpoint(env.VICOOP_CODEX_AZURE_ENDPOINT);
+    const initialEndpoint = env.VICOOP_CODEX_AZURE_ENDPOINT;
+    const initialKey = env.AZURE_OPENAI_API_KEY;
+    if (/\s/.test(initialKey)) throw new Error('Host Azure OpenAI API key is unavailable');
+    return () => {
+      if (env.VICOOP_CODEX_AZURE_ENDPOINT !== initialEndpoint || env.AZURE_OPENAI_API_KEY !== initialKey)
+        throw new Error('Host Azure Codex configuration changed; restart the bridge');
+      return {kind: 'api-key', secret: initialKey, azureEndpoint: endpoint};
+    };
+  }
   if (env.OPENAI_BASE_URL)
     throw new Error(
       'Codex container authentication requires the direct OpenAI service',
@@ -129,19 +154,22 @@ export function createCodexAuthBroker(opts: {
   credential: CodexCredentialReader;
   authentication: 'api-key' | 'oauth';
   upstream?: string;
+  azureEndpoint?: string;
   ttlMs?: number;
   timeoutMs?: number;
   maxRequests?: number;
   maxConcurrent?: number;
 }) {
   const oauth = opts.authentication === 'oauth';
+  const azure = opts.azureEndpoint ? new URL(validateCodexAzureEndpoint(opts.azureEndpoint)) : undefined;
+  if (azure && oauth) throw new Error('Azure Codex requires API-key authentication');
   return createExecutionAuthBroker({
     ...opts,
     upstream:
       opts.upstream ??
-      (oauth ? 'https://chatgpt.com' : 'https://api.openai.com'),
-    origins: [oauth ? 'https://chatgpt.com' : 'https://api.openai.com'],
-    pathPrefix: opts.upstream ? '' : oauth ? '/backend-api/codex' : '/v1',
+      (azure?.origin ?? (oauth ? 'https://chatgpt.com' : 'https://api.openai.com')),
+    origins: [azure?.origin ?? (oauth ? 'https://chatgpt.com' : 'https://api.openai.com')],
+    pathPrefix: azure ? azure.pathname : opts.upstream ? '' : oauth ? '/backend-api/codex' : '/v1',
     allow(req) {
       // Built-in OpenAI tries WebSockets first. 426 selects its HTTP fallback
       // immediately; 403 causes repeated handshakes before falling back.
@@ -176,13 +204,14 @@ export function createCodexAuthBroker(opts: {
       const credential = await opts.credential();
       if (
         credential.kind !== opts.authentication ||
+        credential.azureEndpoint !== azure?.href.replace(/\/$/, '') ||
         !credential.secret ||
         /\s/.test(credential.secret)
       )
         throw new BrokerRejection(503);
       const headers: Record<string, string> = {
         'content-type': 'application/json',
-        authorization: `Bearer ${credential.secret}`,
+        ...(azure ? {'api-key': credential.secret} : {authorization: `Bearer ${credential.secret}`}),
       };
       if (oauth) {
         if (!credential.accountId || /\s/.test(credential.accountId))

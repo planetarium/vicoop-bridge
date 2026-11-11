@@ -696,6 +696,5 @@ test('asset mounts and operator prompts require their supported effective runtim
   }
   const config = {backends:{codex:{runtime:'container' as const,caller_runtime:{...base,systemPrompt:'Unsupported'}}}};
   const result = mergeClientArgs({token:'t',agentId:'a',backend:'codex'},config);
-  assert.equal(result.ok,false);
-  if (!result.ok) assert.ok(result.errors.some(error=>error.includes('supported only for Claude')));
+  assert.equal(result.ok,true);
 });

@@ -1,3 +1,5 @@
+import {createExecutionBrokerSpawn} from './execution-broker-spawn.js';
+import {createCodexAuthBroker} from './codex-auth-broker.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, symlink, link, rm } from 'node:fs/promises';
@@ -67,10 +69,12 @@ const localSpawn: typeof spawn = ((_command: string,args: string[],options: obje
   spawn('/bin/sh',['-c','"$@"; exit 0','supervisor-stand-in',process.execPath,'-e',args[args.length-1]],
     {...options,env:{PATH:process.env.PATH}})) as typeof spawn;
 
-test('real relay injects stdio MCP, routes only to captured execution, and revokes on exit', async () => {
+for (const kind of ['claude', 'codex'] as const) test(`real ${kind} relay injects stdio MCP, routes only to captured execution, and revokes on exit`, async () => {
+  const testHome = await mkdtemp(join(tmpdir(), 'codex-mcp-relay-'));
+  const testSpawn: typeof spawn = ((command: string, args: string[], options: object) => localSpawn(command, args.map(arg=>arg.replaceAll('/data/sessions/codex/config',testHome)), options)) as typeof spawn;
   const calls: unknown[] = [], executionSignals: AbortSignal[] = [];
   let generation = 0;
-  const adapter = createClaudeBrokerSpawn('fixture',{spawnImpl:localSpawn,credential:()=>({kind:'oauth',secret:'fixture'}),fileDelivery:{description:'Send files',bind(){
+  const adapter = createExecutionBrokerSpawn('fixture',{backend:kind,spawnImpl:testSpawn,createBroker:()=>createCodexAuthBroker({authentication:'api-key',credential:()=>({kind:'api-key',secret:'fixture'})}),fileDelivery:{description:'Send files',bind(){
     const bound = ++generation;
     return async (input,signal)=>{calls.push({bound,input});executionSignals.push(signal);return {delivered:true};};
   }}});
@@ -78,8 +82,8 @@ test('real relay injects stdio MCP, routes only to captured execution, and revok
     for(let i=0;i<2;i++) {
       const script = `
       const {spawn}=require('node:child_process');
-      const args=process.argv.slice(1),config=JSON.parse(args[args.indexOf('--mcp-config')+1]);
-      const helper=config.mcpServers['_vb-send-file'];
+      const args=process.argv.slice(1);
+      const helper=${kind==='claude' ? "JSON.parse(args[args.indexOf('--mcp-config')+1]).mcpServers['_vb-send-file']" : "{args:JSON.parse(args.find(a=>a.startsWith('mcp_servers.vb_send_file.args=')).split('=').slice(1).join('='))}"};
       const p=spawn(process.execPath,helper.args,{stdio:['pipe','pipe','inherit']});
       let text='';p.stdout.on('data',chunk=>{text+=chunk;const lines=text.split('\\n');text=lines.pop();for(const l of lines){if(!l)continue;const r=JSON.parse(l);if(r.id===1)p.stdin.write(JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'send_file',arguments:{path:'/workspace/output/file.png'}}})+'\\n');if(r.id===2){console.log(JSON.stringify(r.result));p.kill();process.exit(r.result.isError?1:0);}}});
       p.stdin.write(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05'}})+'\\n');
@@ -93,7 +97,7 @@ test('real relay injects stdio MCP, routes only to captured execution, and revok
       assert.ok(executionSignals[i].aborted);
     }
     assert.deepEqual(calls,[1,2].map(bound=>({bound,input:{path:'/workspace/output/file.png'}})));
-  } finally { adapter.close(); }
+  } finally { adapter.close(); await rm(testHome,{recursive:true,force:true}); }
 });
 
 for (const split of [1,2]) test(`Docker stdout preserves send_file UTF-8 split after byte ${split}`, async () => {

@@ -622,7 +622,7 @@ test('config writers respect exclusive ownership and compare snapshots before co
 });
 
 
-test('operator prompt is preserved for Claude and rejected for Codex or invalid text', async t => {
+test('operator prompt is preserved for Claude and Codex and rejects invalid text', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'prompt-config-'));
   t.after(() => rmSync(dir,{recursive:true,force:true}));
   const path = join(dir,'config.json');
@@ -630,9 +630,7 @@ test('operator prompt is preserved for Claude and rejected for Codex or invalid 
   writeFileSync(path,JSON.stringify({backends:{claude:{runtime:'container',caller_runtime}}}));
   assert.equal(readConfig(path)?.backends?.claude?.caller_runtime?.systemPrompt,caller_runtime.systemPrompt);
   writeFileSync(path,JSON.stringify({backends:{codex:{runtime:'container',caller_runtime}}}));
-  assert.throws(()=>readConfig(path),/supported only for Claude/);
-  const {createCallerRuntime} = await import('./caller-runtime.js');
-  await assert.rejects(createCallerRuntime({kind:'codex',agentId:'test',config:caller_runtime}),/supported only for Claude/);
+  assert.equal(readConfig(path)?.backends?.codex?.caller_runtime?.systemPrompt,caller_runtime.systemPrompt);
   for (const systemPrompt of ['', '   ', 'bad\0text', 'a'.repeat(65537), '가'.repeat(22000)]) {
     writeFileSync(path,JSON.stringify({backends:{claude:{caller_runtime:{...caller_runtime,systemPrompt}}}}));
     assert.throws(()=>readConfig(path));

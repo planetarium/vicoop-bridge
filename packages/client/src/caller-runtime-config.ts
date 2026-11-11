@@ -77,6 +77,6 @@ export const CallerRuntimeConfig = z
 export type CallerRuntimeOptions = z.infer<typeof CallerRuntimeConfig>;
 
 export function assertCallerRuntimeBackend(kind: string, config: { systemPrompt?: unknown }): void {
-  if (kind !== 'claude' && config.systemPrompt !== undefined)
-    throw new Error('caller_runtime.systemPrompt is supported only for Claude');
+  if (!['claude', 'codex'].includes(kind) && config.systemPrompt !== undefined)
+    throw new Error('caller_runtime.systemPrompt is supported only for Claude or Codex');
 }

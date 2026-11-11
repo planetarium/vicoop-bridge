@@ -2,7 +2,6 @@ import { OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI, type AgentCard
 
 /** Match advertised input modes to the caller admission gate, without mutating host cards. */
 export function callerRuntimeCard(card: AgentCard, kind: string, custom = false, fileDelivery = false): AgentCard {
-  if (fileDelivery && kind !== 'claude') throw new Error('caller fileDelivery currently supports Claude only');
   const outputModes = fileDelivery ? ['text/plain', '*/*'] : ['text/plain'];
   const outputDescription = fileDelivery ? 'Files can be delivered as inline A2A FileParts through send_file, subject to operator path and size limits.' : 'Output is text only; outgoing files are unsupported.';
   const allowed = ['text/plain', 'image/png', 'image/jpeg', 'image/gif', 'image/webp',

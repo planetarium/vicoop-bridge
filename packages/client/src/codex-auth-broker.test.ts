@@ -159,3 +159,48 @@ test('catalog initialization forwards caller cancellation to the provider reques
   controller.abort();
   await assert.rejects(request, { name: 'AbortError' });
 });
+
+
+test('Azure selection is explicit, endpoint-restricted, and pinned without host login fallback', () => {
+  const endpoint = 'https://fixture.openai.azure.com/openai/v1';
+  const env = {VICOOP_CODEX_AZURE_ENDPOINT:endpoint, AZURE_OPENAI_API_KEY:'azure-fixture'};
+  const reader = createCodexCredentialReader(env);
+  assert.deepEqual(reader(), {kind:'api-key', secret:'azure-fixture', azureEndpoint:endpoint});
+  for (const invalid of ['http://fixture.openai.azure.com/openai/v1','https://127.0.0.1/openai/v1',
+    'https://fixture.openai.azure.com.evil.test/openai/v1','https://fixture.openai.azure.com/openai/v1?x=y',
+    'https://user@fixture.openai.azure.com/openai/v1','https://fixture.openai.azure.com:444/openai/v1',
+    'https://fixture.openai.azure.com/other']) {
+    assert.throws(() => createCodexCredentialReader({...env,VICOOP_CODEX_AZURE_ENDPOINT:invalid}), /Invalid/);
+  }
+  for(const extra of [{OPENAI_API_KEY:'conflict'},{OPENAI_BASE_URL:'https://api.openai.com'},
+      {AZURE_OPENAI_API_KEY:''},{VICOOP_CODEX_AZURE_ENDPOINT:''}])
+    assert.throws(() => createCodexCredentialReader({...env,...extra}), /requires only/);
+  env.AZURE_OPENAI_API_KEY=''; assert.throws(reader,/changed/);
+  env.AZURE_OPENAI_API_KEY='azure-fixture'; env.VICOOP_CODEX_AZURE_ENDPOINT='https://other.openai.azure.com/openai/v1';
+  assert.throws(reader,/changed/);
+});
+
+test('Azure broker sends API key only to pinned v1 routes and never retries/falls back', async () => {
+  const endpoint='https://fixture.openai.azure.com/openai/v1';
+  let status=200; const received:any[]=[];
+  const upstream=createServer(async(req,res)=>{for await(const _ of req){}received.push({url:req.url,headers:req.headers});res.writeHead(status);res.end(status===200?'{}':'azure-fixture');});
+  upstream.listen(0,'127.0.0.1'); await once(upstream,'listening');
+  let credential={kind:'api-key' as const,secret:'azure-fixture',azureEndpoint:endpoint};
+  const broker=createCodexAuthBroker({authentication:'api-key',azureEndpoint:endpoint,credential:()=>credential,upstream:`http://127.0.0.1:${(upstream.address() as any).port}`});
+  const tcp=tcpServer(socket=>broker.attach(socket));tcp.listen(0,'127.0.0.1');await once(tcp,'listening');
+  const request=(path='/responses')=>fetch(`http://127.0.0.1:${(tcp.address() as any).port}${path}`,{method:'POST',headers:{authorization:`Bearer ${broker.token}`,'api-key':'forged','chatgpt-account-id':'forged'},body:JSON.stringify({model:'gpt-5.4',input:[]})});
+  try {
+    assert.equal((await request()).status,200);
+    assert.equal(received[0].url,'/openai/v1/responses');
+    assert.equal(received[0].headers['api-key'],'azure-fixture');
+    assert.equal(received[0].headers.authorization,undefined);
+    assert.equal(received[0].headers['chatgpt-account-id'],undefined);
+    assert.equal((await request('/responses/compact')).status,200);
+    assert.equal(received[1].url,'/openai/v1/responses/compact');
+    assert.equal((await request('/responses?redirect=other')).status,403);
+    status=401;const failed=await request();assert.equal(failed.status,401);assert.ok(!(await failed.text()).includes('azure-fixture'));
+    assert.equal(received.length,3);
+    credential={...credential,azureEndpoint:'https://other.openai.azure.com/openai/v1'};
+    assert.equal((await request()).status,503);assert.equal(received.length,3);
+  } finally {broker.revoke();upstream.closeAllConnections();await Promise.all([new Promise<void>(r=>upstream.close(()=>r())),new Promise<void>(r=>tcp.close(()=>r()))]);}
+});

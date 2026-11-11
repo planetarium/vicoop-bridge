@@ -25,8 +25,9 @@ version is 0.153.4. `vicoop-client info` advertises this floor as
 `backends.codex.externalRuntimeSupportedRange`; `supportedRange` retains the
 existing host/bundled-direct range. Supported host sources, selected in order:
 
-1. Explicit `OPENAI_API_KEY` in the bridge environment.
-2. An API key or ChatGPT OAuth login in `$CODEX_HOME/auth.json` (default
+1. Explicit Azure adapter (`VICOOP_CODEX_AZURE_ENDPOINT` and `AZURE_OPENAI_API_KEY` together).
+2. Explicit `OPENAI_API_KEY` in the bridge environment.
+3. An API key or ChatGPT OAuth login in `$CODEX_HOME/auth.json` (default
    `~/.codex/auth.json`). OAuth requires `auth_mode="chatgpt"`; unsupported
    login modes and files containing both credential types are rejected.
 
@@ -60,6 +61,47 @@ The broker permits only POST `/responses` and
 Other routes, query parameters, background requests and unsupported model
 names are rejected. Credentials, account headers and upstream error bodies
 are never accepted from or echoed back to the workload.
+
+## Azure OpenAI (API key)
+
+Set these only in the host daemon's protected environment file:
+
+```sh
+VICOOP_CODEX_AZURE_ENDPOINT=https://RESOURCE.openai.azure.com/openai/v1
+AZURE_OPENAI_API_KEY=<host-only Azure key>
+```
+
+Set the root `model` in the dedicated host `$CODEX_HOME/config.toml` to the Azure
+model deployment name. The current broker accepts deployment names matching its
+existing `gpt-*` / `o1`, `o3`, `o4` model-name policy. A deployment named `gpt-5.4`
+is used by the Genesis2 integration check. Arbitrary aliases are not supported.
+
+The adapter supports public Azure `*.openai.azure.com` and
+`*.services.ai.azure.com` endpoints with `/openai/v1`; sovereign-cloud domains,
+Entra ID/managed identity, and custom origins are not implemented. Both Azure
+variables are required, and direct `OPENAI_API_KEY` / `OPENAI_BASE_URL` settings
+cannot be combined with them. No host login is read in explicit Azure mode.
+Endpoint and API key are pinned for the daemon lifetime; restart after changes.
+
+The container continues using its built-in OpenAI provider pointed at the
+execution relay. It receives only an execution grant. The host sends Azure's
+`api-key` header to the selected endpoint; upstream errors remain sanitized,
+redirects are rejected, and there is no credential fallback or broker retry.
+The existing route restrictions and request limits remain in force.
+
+Azure billing and sponsorship-credit eligibility belong to the selected Azure
+subscription. This adapter does not establish a billing cap or guarantee credits.
+
+## Operator instructions and file delivery
+
+Codex caller containers accept `caller_runtime.systemPrompt` as runtime
+instructions and the same `caller_runtime.fileDelivery` policy as Claude.
+The execution relay installs an ephemeral stdio MCP server named `vb_send_file`
+with a `send_file` tool. Files are read by the host's bounded container reader,
+validated against allowed paths and task budgets, and emitted as A2A FileParts.
+No provider credential is placed in MCP configuration. The execution-scoped
+file token expires with the relay; delivery is bound to the originating task.
+The daemon sizes replay retention for the selected backend's delivery policy.
 
 ## Current per-caller setup
 
