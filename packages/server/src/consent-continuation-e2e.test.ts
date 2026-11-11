@@ -105,7 +105,7 @@ async function createFixture(sql: postgres.Sql) {
     if (server) await closeServer(server);
     server = undefined;
   }
-  async function start() {
+  async function start(runWorker = false) {
     const registry = new Registry();
     deferredJobs = new DeferredJobsService({ db: sql, registry });
     const app = createHttpApp({ db: sql, registry, deferredJobs });
@@ -133,6 +133,7 @@ async function createFixture(sql: postgres.Sql) {
           error: { code: 'fixture_failure', message: String(error) } }));
       });
     });
+    if (runWorker) deferredJobs.start(20);
   }
   async function request(path: string, bearer: string, body?: unknown) {
     return fetch(`${baseUrl}${path}`, {
@@ -252,7 +253,7 @@ test('A2A proposal → consumer decision → one provider job → durable contin
     originatingContext = main.task.contextId;
     const binding = { version: main.proposal.version, payloadDigest: main.proposal.payloadDigest };
     const pending = await json(await consumerRequest(main.path));
-    assert.ok(JSON.stringify(pending).includes('pending') || JSON.stringify(pending).includes('awaiting_approval'));
+    assert.equal(pending.proposal.state, 'awaiting_approval');
     assert.equal(provider.requests.length, 0);
 
     await t.test('ordinary caller permission, prose, cross-context and changed digest do not authorize execution', async () => {
@@ -328,9 +329,8 @@ test('A2A proposal → consumer decision → one provider job → durable contin
     const priorAssignments = fixture.assignments.length;
     await fixture.stop();
     expectContinuation = true;
-    await fixture.start();
+    await fixture.start(true);
     assert.equal((await json(await ownerRequest(`${main.path}/claim`, { ...binding, claimId }))).execute, false);
-    await fixture.tick();
     const finished = await eventually(async () => {
       const view = await json(await ownerRequest(jobPath));
       return view.job ?? view;
@@ -342,6 +342,9 @@ test('A2A proposal → consumer decision → one provider job → durable contin
     const file = delivered.artifacts.flatMap((artifact: any) => artifact.parts).find((part: any) => part.kind === 'file');
     assert.ok(file?.file?.bytes, 'consumer obtains actual attachment bytes via task retrieval');
     assert.equal(digest(Buffer.from(file.file.bytes, 'base64')), digest(artifactBytes));
+    const inaccessible = await fixture.request(`/agents/${fixture.agentId}`, fixture.strangerToken,
+      { jsonrpc: '2.0', id: randomUUID(), method: 'tasks/get', params: { id: finished.continuationTaskId } });
+    assert.ok((await inaccessible.json() as { error?: unknown }).error, 'another authorized caller cannot retrieve the successor artifact');
     assert.equal(fixture.assignments.length, priorAssignments + 1);
     await json(await ownerRequest(`${jobPath}/complete`, completion));
     await fixture.tick();
