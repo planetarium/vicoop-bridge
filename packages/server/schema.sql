@@ -1225,19 +1225,23 @@ CREATE TABLE IF NOT EXISTS infra.consumer_consent_audit (
 -- These are server-owned control records, never a GraphQL mutation surface.
 REVOKE ALL ON infra.consumer_consent, infra.consumer_consent_audit FROM PUBLIC, app_authenticated, app_anonymous, app_postgraphile;
 -- A removed and re-added caller grant must not resurrect an old proposal.
-ALTER TABLE agents ADD COLUMN IF NOT EXISTS consent_policy_revision BIGINT NOT NULL DEFAULT 0;
-CREATE OR REPLACE FUNCTION bump_consent_policy_revision() RETURNS TRIGGER AS $$
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS caller_policy_revision BIGINT NOT NULL DEFAULT 0;
+CREATE OR REPLACE FUNCTION bump_caller_policy_revision() RETURNS TRIGGER AS $$
 BEGIN
   IF NEW.allowed_callers IS DISTINCT FROM OLD.allowed_callers THEN
-    NEW.consent_policy_revision := OLD.consent_policy_revision + 1;
+    NEW.caller_policy_revision := OLD.caller_policy_revision + 1;
   END IF;
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-DROP TRIGGER IF EXISTS agents_consent_policy_revision ON agents;
-CREATE TRIGGER agents_consent_policy_revision BEFORE UPDATE ON agents
-  FOR EACH ROW EXECUTE FUNCTION bump_consent_policy_revision();
-COMMENT ON COLUMN agents.consent_policy_revision IS E'@omit create,update';
+DROP TRIGGER IF EXISTS agents_caller_policy_revision ON agents;
+CREATE TRIGGER agents_caller_policy_revision BEFORE UPDATE ON agents
+  FOR EACH ROW EXECUTE FUNCTION bump_caller_policy_revision();
+COMMENT ON COLUMN agents.caller_policy_revision IS E'@omit create,update';
+CREATE INDEX IF NOT EXISTS consumer_consent_pending_credential
+  ON infra.consumer_consent ((document->'decisionCredential'->>'hash'))
+  WHERE document->>'state' = 'approved';
+
 -- Durable external completion and one continuation intent, independent of a
 -- backend process. No provider credentials or consumer bearer tokens persist.
 CREATE TABLE IF NOT EXISTS infra.deferred_jobs (
@@ -1265,18 +1269,3 @@ CREATE INDEX IF NOT EXISTS deferred_jobs_pending ON infra.deferred_jobs(state, u
   WHERE state IN ('waiting','queued','dispatching');
 REVOKE ALL ON infra.deferred_jobs FROM PUBLIC, app_anonymous, app_authenticated, app_postgraphile;
 
--- Removing/re-adding a grant cannot resurrect deferred work. Changes to the
--- policy conservatively invalidate all work registered under its old revision.
-ALTER TABLE agents ADD COLUMN IF NOT EXISTS caller_policy_revision BIGINT NOT NULL DEFAULT 0;
-CREATE OR REPLACE FUNCTION bump_caller_policy_revision() RETURNS TRIGGER AS $$
-BEGIN
-  IF NEW.allowed_callers IS DISTINCT FROM OLD.allowed_callers THEN
-    NEW.caller_policy_revision := OLD.caller_policy_revision + 1;
-  END IF;
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-DROP TRIGGER IF EXISTS agents_caller_policy_revision ON agents;
-CREATE TRIGGER agents_caller_policy_revision BEFORE UPDATE ON agents
-  FOR EACH ROW EXECUTE FUNCTION bump_caller_policy_revision();
-COMMENT ON COLUMN agents.caller_policy_revision IS E'@omit create,update';

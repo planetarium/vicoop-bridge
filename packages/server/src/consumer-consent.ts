@@ -44,7 +44,7 @@ interface StoredProposal extends ConsentProposal {
 interface AgentRow {
   owner_principal: string;
   owner_revision: string;
-  consent_policy_revision: string;
+  caller_policy_revision: string;
   allowed_callers: string[];
 }
 interface TaskRow {
@@ -76,9 +76,11 @@ export function consentPresentation(proposal: ConsentProposal) {
   const path = `/agents/${encodeURIComponent(proposal.agentId)}/consent-proposals/${proposal.operationId}`;
   const part = { kind: 'data' as const, data: { type: CONSUMER_CONSENT_EXTENSION_URI,
     proposal, statusUrl: path, decisionUrl: `${path}/decision` } };
-  return { proposal, part, status: { state: proposal.state === 'awaiting_approval' ? 'input-required' as const : 'completed' as const, timestamp: new Date().toISOString(),
-    message: { role: 'agent' as const, messageId: proposal.operationId,
-      parts: [part], extensions: [CONSUMER_CONSENT_EXTENSION_URI] } } };
+  return { proposal, part, ...(proposal.state === 'awaiting_approval' ? {
+    status: { state: 'input-required' as const, timestamp: new Date().toISOString(),
+      message: { role: 'agent' as const, messageId: proposal.operationId,
+        parts: [part], extensions: [CONSUMER_CONSENT_EXTENSION_URI] } },
+  } : {}) };
 }
 const pendingStates = new Set<ConsentProposal['state']>(['awaiting_approval', 'approved']);
 function originFromTask(task: TaskRow): Origin {
@@ -98,7 +100,7 @@ export class ConsumerConsentService {
 
   private async agent(sql: SqlExecutor, agentId: string): Promise<AgentRow> {
     const rows = await sql<AgentRow[]>`SELECT owner_principal, owner_revision::text,
-      consent_policy_revision::text, allowed_callers FROM agents WHERE id = ${agentId} FOR SHARE`;
+      caller_policy_revision::text, allowed_callers FROM agents WHERE id = ${agentId} FOR SHARE`;
     if (!rows[0]) throw new ConsentError(404, 'Not found');
     return rows[0];
   }
@@ -111,7 +113,9 @@ export class ConsumerConsentService {
   private async audit(sql: SqlExecutor, p: StoredProposal, event: string, principalId: string) {
     await sql`INSERT INTO infra.consumer_consent_audit (agent_id, operation_id, event)
       VALUES (${p.agentId}, ${p.operationId}, ${sql.json({ event, principalId, state: p.state,
-        version: p.version, payloadDigest: p.payloadDigest, at: new Date().toISOString() })})`;
+        version: p.version, payloadDigest: p.payloadDigest,
+        ...(p.decision ? { decisionId: p.decision.decisionId, actorId: p.decision.actorId ?? null } : {}),
+        ...(p.execution ? { claimId: p.execution.claimId } : {}), at: new Date().toISOString() })})`;
   }
   private async save(sql: SqlExecutor, p: StoredProposal, event: string, principalId: string) {
     await sql`UPDATE infra.consumer_consent SET document = ${sql.json(p as never)}, updated_at = now()
@@ -138,10 +142,20 @@ export class ConsumerConsentService {
       principalId: origin.principalId, ...(email ? { email, emailVerified: true } : {}),
     }));
   }
+  private async refresh(sql: SqlExecutor, p: StoredProposal, agent: AgentRow, principalId: string) {
+    const task = await this.source(sql, p.agentId, p.sourceTaskId);
+    const valid = task && !task.authorization_revoked_at && task.state !== 'canceled' &&
+      task.context_id === p.contextId && task.owner_principal && sameOrigin(p.origin, originFromTask(task)) &&
+      agent.owner_principal === p.ownerPrincipal && agent.owner_revision === p.ownerRevision &&
+      agent.caller_policy_revision === p.policyRevision && await this.sourceAllowed(sql, p.origin, agent) &&
+      await this.credentialActive(sql, p.decisionCredential, false);
+    if (pendingStates.has(p.state)) {
+      if (!valid) { p.state = 'invalidated'; await this.save(sql, p, 'invalidated', principalId); }
+      else if (Date.parse(p.expiresAt) <= Date.now()) { p.state = 'expired'; await this.save(sql, p, 'expired', principalId); }
+    }
+    return Boolean(valid);
+  }
   async register(agentId: string, identity: ConsentIdentity, input: ConsentRegistration) {
-    const expires = Date.parse(input.expiresAt);
-    if (expires <= Date.now() || expires > Date.now() + 7 * 86_400_000)
-      throw new ConsentError(400, 'Expiry must be in the next seven days');
     return this.db.begin(async sql => {
       await this.identityActive(sql, identity);
       const agent = await this.agent(sql, agentId);
@@ -154,8 +168,12 @@ export class ConsumerConsentService {
         const p = existing[0].document;
         if (p.payloadDigest !== consentDigest(input) || p.ownerRevision !== agent.owner_revision)
           throw new ConsentError(409, 'Operation ID already identifies a different request');
+        await this.refresh(sql, p, agent, identity.principalId);
         return consentPresentation(consentView(p));
       }
+      const expires = Date.parse(input.expiresAt);
+      if (expires <= Date.now() || expires > Date.now() + 7 * 86_400_000)
+        throw new ConsentError(400, 'Expiry must be in the next seven days');
       const task = await this.source(sql, agentId, input.sourceTaskId);
       if (!task || task.authorization_revoked_at || task.state === 'canceled' ||
           executionMarker(task.task_json.metadata) !== input.sourceExecutionId)
@@ -165,7 +183,7 @@ export class ConsumerConsentService {
       const p: StoredProposal = { ...structuredClone(input), agentId, version: 1,
         payloadDigest: consentDigest(input), contextId: task.context_id, origin,
         ownerPrincipal: identity.principalId, ownerRevision: agent.owner_revision,
-        policyRevision: agent.consent_policy_revision, state: 'awaiting_approval', createdAt: new Date().toISOString() };
+        policyRevision: agent.caller_policy_revision, state: 'awaiting_approval', createdAt: new Date().toISOString() };
       await sql`INSERT INTO infra.consumer_consent (agent_id, operation_id, document)
         VALUES (${agentId}, ${input.operationId}, ${sql.json(p as never)})`;
       await this.audit(sql, p, 'registered', identity.principalId);
@@ -190,16 +208,7 @@ export class ConsumerConsentService {
       } else if (!sameOrigin(p.origin, identity) || (identity.taskId && identity.taskId !== p.sourceTaskId)) {
         throw new ConsentError(404, 'Not found');
       }
-      const task = await this.source(sql, agentId, p.sourceTaskId);
-      const valid = task && !task.authorization_revoked_at && task.state !== 'canceled' &&
-        task.context_id === p.contextId && task.owner_principal && sameOrigin(p.origin, originFromTask(task)) &&
-        agent.owner_principal === p.ownerPrincipal && agent.owner_revision === p.ownerRevision &&
-        agent.consent_policy_revision === p.policyRevision && await this.sourceAllowed(sql, p.origin, agent) &&
-        await this.credentialActive(sql, p.decisionCredential, false);
-      if (pendingStates.has(p.state)) {
-        if (!valid) { p.state = 'invalidated'; await this.save(sql, p, 'invalidated', identity.principalId); }
-        else if (Date.parse(p.expiresAt) <= Date.now()) { p.state = 'expired'; await this.save(sql, p, 'expired', identity.principalId); }
-      }
+      const valid = await this.refresh(sql, p, agent, identity.principalId);
       if (mode === 'consumer' && !valid) return { error: new ConsentError(404, 'Not found') };
       try { return { result: await action(sql, p) }; }
       catch (error) { if (error instanceof ConsentError) return { error }; throw error; }

@@ -282,8 +282,17 @@ export async function sweepExpiredTokenExchangeState(sql: Sql): Promise<{
   replays: number;
 }> {
   const tokens = await sql`
-    DELETE FROM infra.oauth_token_exchange_access_tokens
-    WHERE expires_at <= now() OR revoked = true
+    DELETE FROM infra.oauth_token_exchange_access_tokens AS token
+    WHERE revoked = true OR (expires_at <= now() AND NOT EXISTS (
+      -- Consent may outlive this authentication session. Keep its revocation
+      -- record until the approved attempt is claimed or expires; deleting it
+      -- would otherwise make durable consent fail closed after five minutes.
+      SELECT 1 FROM infra.consumer_consent AS consent
+      WHERE consent.document->>'state' = 'approved'
+        AND consent.document->'decisionCredential'->>'kind' = 'federation'
+        AND consent.document->'decisionCredential'->>'hash' = token.token_hash
+        AND (consent.document->>'expiresAt')::timestamptz > now()
+    ))
   `;
   const replays = await sql`
     DELETE FROM infra.oauth_token_exchange_replays WHERE expires_at <= now()
