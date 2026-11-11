@@ -156,6 +156,7 @@ async function createFixture(sql: postgres.Sql) {
     setSupplier: (handler: SupplierHandler) => { supplier = handler; },
     async cleanup() {
       await stop();
+      await sql`DELETE FROM infra.deferred_jobs WHERE agent_id = ${agentId}`;
       await sql`DELETE FROM infra.a2a_tasks WHERE owner_agent = ${agentId}`;
       await sql`DELETE FROM agents WHERE id = ${agentId}`;
       await sql`DELETE FROM callers WHERE principal_id = ANY(${[owner, consumer, stranger]})`;
