@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.47.0
+
+### Minor Changes
+
+- 35f84f0: Add opt-in execution-scoped host credential proxies for native external-service HTTP APIs in caller-isolated Claude and Codex runtimes, including a JavaScript fetch adapter and GitHub CLI Unix socket support.
+
 ## 0.46.0
 
 ### Minor Changes
