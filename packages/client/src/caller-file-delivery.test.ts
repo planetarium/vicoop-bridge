@@ -83,6 +83,11 @@ for (const kind of ['claude', 'codex'] as const) test(`real ${kind} relay inject
       const script = `
       const {spawn}=require('node:child_process');
       const args=process.argv.slice(1);
+      if (${kind==='codex'}) {
+        require('node:assert/strict').ok(args.includes('mcp_servers.vb_send_file.tools.send_file.approval_mode="approve"'));
+        require('node:assert/strict').ok(args.includes('mcp_servers.vb_send_file.enabled_tools=["send_file"]'));
+        require('node:assert/strict').ok(!args.some(a=>a.startsWith('approval_policy=')));
+      }
       const helper=${kind==='claude' ? "JSON.parse(args[args.indexOf('--mcp-config')+1]).mcpServers['_vb-send-file']" : "{args:JSON.parse(args.find(a=>a.startsWith('mcp_servers.vb_send_file.args=')).split('=').slice(1).join('='))}"};
       const p=spawn(process.execPath,helper.args,{stdio:['pipe','pipe','inherit']});
       let text='';p.stdout.on('data',chunk=>{text+=chunk;const lines=text.split('\\n');text=lines.pop();for(const l of lines){if(!l)continue;const r=JSON.parse(l);if(r.id===1)p.stdin.write(JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'send_file',arguments:{path:'/workspace/output/file.png'}}})+'\\n');if(r.id===2){console.log(JSON.stringify(r.result));p.kill();process.exit(r.result.isError?1:0);}}});

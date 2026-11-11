@@ -175,7 +175,9 @@ function receive(m) {
           const helperArgs=['-e',m.fileDelivery.helper,url,m.fileDelivery.token,m.fileDelivery.description];
           m.args.push('-c','mcp_servers.vb_send_file.command="/usr/local/bin/node"',
             '-c','mcp_servers.vb_send_file.args='+JSON.stringify(helperArgs),
-            '-c','mcp_servers.vb_send_file.required=true');
+            '-c','mcp_servers.vb_send_file.required=true',
+            '-c','mcp_servers.vb_send_file.enabled_tools=["send_file"]',
+            '-c','mcp_servers.vb_send_file.tools.send_file.approval_mode="approve"');
         } else {
           // Replace only the bridge-owned empty strict MCP configuration.
           const index=m.args.indexOf('--mcp-config');

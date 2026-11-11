@@ -97,7 +97,9 @@ subscription. This adapter does not establish a billing cap or guarantee credits
 Codex caller containers accept `caller_runtime.systemPrompt` as runtime
 instructions and the same `caller_runtime.fileDelivery` policy as Claude.
 The execution relay installs an ephemeral stdio MCP server named `vb_send_file`
-with a `send_file` tool. Files are read by the host's bounded container reader,
+with a `send_file` tool. Enabling file delivery explicitly preapproves only this
+bridge-owned tool; other MCP tools and global approval policy are unchanged.
+Files are read by the host's bounded container reader,
 validated against allowed paths and task budgets, and emitted as A2A FileParts.
 No provider credential is placed in MCP configuration. The execution-scoped
 file token expires with the relay; delivery is bound to the originating task.
