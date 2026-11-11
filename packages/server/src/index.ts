@@ -1,3 +1,4 @@
+import { DeferredJobsService } from './deferred-jobs.js';
 import { watchAgentOwners } from './agent-transfer.js';
 import { serve } from '@hono/node-server';
 import { Registry } from './registry.js';
@@ -85,7 +86,9 @@ export interface ServerOptions {
 
 export async function startServer(opts: ServerOptions) {
   const registry = new Registry();
+  const deferredJobs = new DeferredJobsService({ db: opts.db, registry });
   const app = createHttpApp({
+    deferredJobs,
     registry,
     publicUrl: opts.publicUrl,
     db: opts.db,
@@ -103,6 +106,9 @@ export async function startServer(opts: ServerOptions) {
     db: opts.db,
     registry,
   });
+
+  deferredJobs.start();
+  server.once('close', () => deferredJobs.stop());
 
   // Cleanup expired transient rows (device_sessions, used_siwe_nonces) and
   // prune stale a2a_tasks contexts, on startup and periodically.
@@ -124,7 +130,7 @@ export async function startServer(opts: ServerOptions) {
   void watchAgentOwners(opts.db, registry);
 
   console.log(`[server] listening on :${opts.port}`);
-  return { registry, server };
+  return { registry, server, deferredJobs };
 }
 
 export { Registry } from './registry.js';

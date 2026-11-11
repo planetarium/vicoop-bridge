@@ -1,4 +1,5 @@
 import { mountConsumerConsent } from './consumer-consent-http.js';
+import { DeferredJobsService, mountDeferredJobs } from './deferred-jobs.js';
 import { ApprovalDecision } from '@vicoop-bridge/protocol';
 import { transferAgent } from './agent-transfer.js';
 import { authorizeRequesterApproval, RequesterDecisionBody, requesterApprovalResponse } from './requester-approvals.js';
@@ -106,6 +107,7 @@ import {
 } from './oauth/token-exchange/authorization.js';
 
 export interface ServerHttpOptions {
+  deferredJobs?: DeferredJobsService;
   registry: Registry;
   publicUrl?: string;
   db: Sql;
@@ -846,6 +848,8 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     logEvent('admin_api_error', { error: String(err) });
     return c.json({ error: 'Internal error' }, 500);
   }
+
+  mountDeferredJobs(app, { db: opts.db, registry: opts.registry, service: opts.deferredJobs });
 
   // Decisions use owner-session authority, never agent-call tokens or a
   // principal supplied in the body. Recheck DB ownership on every request.
