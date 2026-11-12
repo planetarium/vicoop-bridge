@@ -40,7 +40,7 @@ export function validateCodexAzureEndpoint(value: string): string {
 }
 
 function validateAzureModels(model: string | undefined, deployment: string | undefined): void {
-  if (!model || !/^(gpt-|o[134](?:-|$))[a-zA-Z0-9._-]+$/.test(model) || model.length > 128 ||
+  if (!model || !/^(?:gpt-[a-zA-Z0-9._-]+|o[134](?:-[a-zA-Z0-9._-]+)?)$/.test(model) || model.length > 128 ||
       !deployment || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(deployment))
     throw new Error('Azure Codex requires a supported logical model and a valid deployment name');
 }

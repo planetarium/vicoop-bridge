@@ -166,6 +166,9 @@ const azureEnv = () => ({
   AZURE_OPENAI_API_KEY: 'azure-fixture',
 });
 test('Azure selection validates complete provider configuration and pins all settings', () => {
+  for (const model of ['o1', 'o3', 'o4', 'o3-mini', 'gpt-5.4'])
+    assert.doesNotThrow(() => createCodexCredentialReader({...azureEnv(), VICOOP_CODEX_AZURE_MODEL:model}));
+  assert.throws(() => createCodexCredentialReader({...azureEnv(), VICOOP_CODEX_AZURE_MODEL:'gpt-'}));
   const env: NodeJS.ProcessEnv = azureEnv();
   const reader = createCodexCredentialReader(env);
   assert.deepEqual(reader(), {kind:'api-key',secret:'azure-fixture',azureEndpoint:env.VICOOP_CODEX_AZURE_ENDPOINT,azureModel:'gpt-5.4',azureDeployment:'production-codex'});
