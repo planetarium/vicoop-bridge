@@ -1,8 +1,9 @@
-import {createExecutionBrokerSpawn} from './execution-broker-spawn.js';
-import {createCodexAuthBroker} from './codex-auth-broker.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, symlink, link, rm } from 'node:fs/promises';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { createExecutionBrokerSpawn } from './execution-broker-spawn.js';
+import { createCodexAuthBroker } from './codex-auth-broker.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -65,32 +66,56 @@ test('revoked execution and canceled tasks cannot emit even when Docker read fin
   }
 });
 
-const localSpawn: typeof spawn = ((_command: string,args: string[],options: object)=>
-  spawn('/bin/sh',['-c','"$@"; exit 0','supervisor-stand-in',process.execPath,'-e',args[args.length-1]],
-    {...options,env:{PATH:process.env.PATH}})) as typeof spawn;
+const localSpawn: typeof spawn = ((_command: string,args: string[],options: object) => {
+  const directory = mkdtempSync(join(tmpdir(), 'file-relay-'));
+  const source = args[args.length-1].replace("env.CODEX_HOME='/data/sessions/codex/config'", 'env.CODEX_HOME='+JSON.stringify(directory));
+  const child = spawn('/bin/sh',['-c','"$@"; exit 0','supervisor-stand-in',process.execPath,'-e',source],
+    {...options,env:{PATH:process.env.PATH}});
+  child.on('close',()=>rmSync(directory,{recursive:true,force:true}));
+  return child;
+}) as typeof spawn;
 
-for (const kind of ['claude', 'codex'] as const) test(`real ${kind} relay injects stdio MCP, routes only to captured execution, and revokes on exit`, async () => {
-  const testHome = await mkdtemp(join(tmpdir(), 'codex-mcp-relay-'));
-  const testSpawn: typeof spawn = ((command: string, args: string[], options: object) => localSpawn(command, args.map(arg=>arg.replaceAll('/data/sessions/codex/config',testHome)), options)) as typeof spawn;
+function fileAdapter(kind: 'claude' | 'codex', fileDelivery: NonNullable<Parameters<typeof createExecutionBrokerSpawn>[1]['fileDelivery']>) {
+  return createExecutionBrokerSpawn('fixture', {backend:kind,spawnImpl:localSpawn,fileDelivery,
+    createBroker:()=>createCodexAuthBroker({authentication:'api-key',credential:()=>({kind:'api-key',secret:'fixture'})})});
+}
+
+const helperLookup = String.raw`
+const args=process.argv.slice(1);
+const override=args.find(a=>/^mcp_servers\._vb-send-file-[a-f0-9]{24}=/.test(a));
+const helper=override
+  ? {args:JSON.parse(override.match(/args=(\[.*\]),enabled=true}/s)[1])}
+  : JSON.parse(args[args.indexOf('--mcp-config')+1]).mcpServers['_vb-send-file'];
+`;
+
+for (const kind of ['claude','codex'] as const) test(`real ${kind} relay injects stdio MCP, captures executions, reports tool errors and revokes on exit`, async () => {
   const calls: unknown[] = [], executionSignals: AbortSignal[] = [];
   let generation = 0;
-  const adapter = createExecutionBrokerSpawn('fixture',{backend:kind,spawnImpl:testSpawn,createBroker:()=>createCodexAuthBroker({authentication:'api-key',credential:()=>({kind:'api-key',secret:'fixture'})}),fileDelivery:{description:'Send files',bind(){
+  const adapter = fileAdapter(kind,{description:'Send files \u007f',bind(){
     const bound = ++generation;
-    return async (input,signal)=>{calls.push({bound,input});executionSignals.push(signal);return {delivered:true};};
-  }}});
+    return async (input,signal)=>{
+      calls.push({bound,input});executionSignals.push(signal);
+      if ((input as any).path === '/denied') throw Error('private host diagnostic');
+      return {delivered:true};
+    };
+  }});
   try {
     for(let i=0;i<2;i++) {
       const script = `
-      const {spawn}=require('node:child_process');
-      const args=process.argv.slice(1);
-      if (${kind==='codex'}) {
-        require('node:assert/strict').ok(args.includes('mcp_servers.vb_send_file.tools.send_file.approval_mode="approve"'));
-        require('node:assert/strict').ok(args.includes('mcp_servers.vb_send_file.enabled_tools=["send_file"]'));
-        require('node:assert/strict').ok(!args.some(a=>a.startsWith('approval_policy=')));
+      const {spawn}=require('node:child_process');const assert=require('node:assert/strict');
+      ${helperLookup}
+      assert.ok(helper.args[4].endsWith(String.fromCharCode(127)));
+      if(override){
+        assert.ok(!override.includes(String.fromCharCode(127)));
+        const serverKey=override.split('=')[0];
+        assert.ok(args.includes(serverKey+'.tools.send_file.approval_mode="approve"'));
       }
-      const helper=${kind==='claude' ? "JSON.parse(args[args.indexOf('--mcp-config')+1]).mcpServers['_vb-send-file']" : "{args:JSON.parse(args.find(a=>a.startsWith('mcp_servers.vb_send_file.args=')).split('=').slice(1).join('='))}"};
       const p=spawn(process.execPath,helper.args,{stdio:['pipe','pipe','inherit']});
-      let text='';p.stdout.on('data',chunk=>{text+=chunk;const lines=text.split('\\n');text=lines.pop();for(const l of lines){if(!l)continue;const r=JSON.parse(l);if(r.id===1)p.stdin.write(JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'send_file',arguments:{path:'/workspace/output/file.png'}}})+'\\n');if(r.id===2){console.log(JSON.stringify(r.result));p.kill();process.exit(r.result.isError?1:0);}}});
+      let text='';p.stdout.on('data',chunk=>{text+=chunk;const lines=text.split('\\n');text=lines.pop();for(const l of lines){if(!l)continue;const r=JSON.parse(l);
+        if(r.id===1)p.stdin.write(JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'send_file',arguments:{path:'/denied'}}})+'\\n');
+        if(r.id===2){assert.equal(r.result.isError,true);assert.ok(!JSON.stringify(r).includes('private host diagnostic'));p.stdin.write(JSON.stringify({jsonrpc:'2.0',id:3,method:'tools/call',params:{name:'send_file',arguments:{path:'/workspace/output/file.png'}}})+'\\n');}
+        if(r.id===3){console.log(JSON.stringify(r.result));p.kill();process.exit(r.result.isError?1:0);}
+      }});
       p.stdin.write(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05'}})+'\\n');
       `;
       const child = adapter.spawn(process.execPath,['-e',script,'--','--mcp-config','{"mcpServers":{}}'],{});
@@ -99,10 +124,10 @@ for (const kind of ['claude', 'codex'] as const) test(`real ${kind} relay inject
       const code = await new Promise<number|null>(resolve=>child.on('close',resolve));
       assert.equal(code,0,Buffer.concat(output).toString());
       assert.match(Buffer.concat(output).toString(),/delivered/);
-      assert.ok(executionSignals[i].aborted);
+      assert.ok(executionSignals.at(-1)!.aborted);
     }
-    assert.deepEqual(calls,[1,2].map(bound=>({bound,input:{path:'/workspace/output/file.png'}})));
-  } finally { adapter.close(); await rm(testHome,{recursive:true,force:true}); }
+    assert.deepEqual(calls,[1,2].flatMap(bound=>['/denied','/workspace/output/file.png'].map(path=>({bound,input:{path}}))));
+  } finally { adapter.close(); }
 });
 
 for (const split of [1,2]) test(`Docker stdout preserves send_file UTF-8 split after byte ${split}`, async () => {
@@ -122,12 +147,12 @@ for (const split of [1,2]) test(`Docker stdout preserves send_file UTF-8 split a
   }finally{adapter.close();}
 });
 
-test('overlapping execution relays reject wrong-scope and stale tokens and close canceled endpoints', async () => {
+for (const kind of ['claude','codex'] as const) test(`overlapping ${kind} relays reject wrong-scope and stale tokens and close canceled endpoints`, async () => {
   const calls: string[]=[];
-  const make=(scope:string)=>createClaudeBrokerSpawn('fixture',{spawnImpl:localSpawn,credential:()=>({kind:'oauth',secret:'fixture'}),fileDelivery:{description:'files',bind:()=>async()=>{calls.push(scope);return {delivered:true};}}});
+  const make=(scope:string)=>fileAdapter(kind,{description:'files',bind:()=>async()=>{calls.push(scope);return {delivered:true};}});
   const a=make('a'),b=make('b'),children: Array<{child:ReturnType<typeof a.spawn>;closed:Promise<unknown>}> = [];
   async function start(adapter:typeof a){
-    const script=`const args=process.argv.slice(1),h=JSON.parse(args[args.indexOf('--mcp-config')+1]).mcpServers['_vb-send-file'];console.log(JSON.stringify({url:h.args[2],token:h.args[3]}));setInterval(()=>{},1000);`;
+    const script=`${helperLookup}console.log(JSON.stringify({url:helper.args[2],token:helper.args[3]}));setInterval(()=>{},1000);`;
     const child=adapter.spawn(process.execPath,['-e',script,'--','--mcp-config','{"mcpServers":{}}'],{});
     const closed=new Promise(resolve=>child.on('close',resolve));children.push({child,closed});
     let pending='';const endpoint=await new Promise<{url:string;token:string}>(resolve=>child.stdout!.on('data',chunk=>{pending+=chunk.toString();if(pending.includes('\n'))resolve(JSON.parse(pending.split('\n')[0]));}));
