@@ -252,7 +252,7 @@ test('Foundry relay exposes only an execution grant and keeps provider configura
   const upstream = createServer(async (req, res) => {
     forwarded++;
     assert.equal(req.url, '/anthropic/v1/messages');
-    assert.equal(req.headers['api-key'], 'host-foundry-secret');
+    assert.equal(req.headers['x-api-key'], 'host-foundry-secret');
     const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(chunk);
     assert.equal(JSON.parse(Buffer.concat(chunks).toString()).model, 'private-deployment');
     res.end('{"ok":true}');

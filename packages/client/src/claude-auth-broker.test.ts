@@ -258,14 +258,14 @@ test('invalid or conflicting Foundry configuration fails without echoing values'
   for (const overrides of cases) assert.throws(() => createClaudeCredentialReader({ ...foundryEnv(), ...overrides }), error => error instanceof Error && !error.message.includes('SECRET'));
 });
 
-test('Foundry routes only mapped models, substitutes api-key and strips caller routing/auth', async () => {
+test('Foundry routes only mapped models, substitutes x-api-key and strips caller routing/auth', async () => {
   const credential = createClaudeCredentialReader(foundryEnv());
   const f = await fixture({ credential, authentication: 'api-key' });
   try {
     assert.equal((await f.request()).status, 200);
     assert.equal(f.requests[0].url, '/anthropic/v1/messages');
-    assert.equal(f.requests[0].headers['api-key'], 'HOST_FOUNDRY_SECRET');
-    for (const name of ['x-api-key', 'authorization', 'cookie', 'x-forwarded-host']) assert.equal(f.requests[0].headers[name], undefined);
+    assert.equal(f.requests[0].headers['x-api-key'], 'HOST_FOUNDRY_SECRET');
+    for (const name of ['api-key', 'authorization', 'cookie', 'x-forwarded-host']) assert.equal(f.requests[0].headers[name], undefined);
     assert.equal((f.requests[0].body as { model: string }).model, 'production-sonnet');
     assert.equal((await f.request('/v1/messages/count_tokens?beta=true', { model: 'claude-sonnet-4-6', messages: [] })).status, 200);
     assert.equal(f.requests[1].url, '/anthropic/v1/messages/count_tokens?beta=true');
@@ -279,7 +279,7 @@ test('Foundry routes only mapped models, substitutes api-key and strips caller r
     const denied = await f.request();
     assert.equal(denied.status, 401); assert.doesNotMatch(await denied.text(), /SECRET/);
     assert.equal(f.requests.length, 3);
-    assert.ok(f.requests.every(req => req.headers['api-key'] === 'HOST_FOUNDRY_SECRET'));
+    assert.ok(f.requests.every(req => req.headers['x-api-key'] === 'HOST_FOUNDRY_SECRET'));
   } finally { await f.close(); }
 });
 

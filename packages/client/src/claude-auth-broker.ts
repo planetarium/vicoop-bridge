@@ -151,7 +151,7 @@ export function createClaudeAuthBroker(opts: BrokerOptions) {
       }
       if (!credential.secret || /\s/.test(credential.secret) || (foundry && credential.kind !== 'api-key') || (opts.authentication && credential.kind !== opts.authentication)) { throw new BrokerRejection(503); }
       const headers: Record<string, string> = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' };
-      headers[foundry ? 'api-key' : credential.kind === 'oauth' ? 'authorization' : 'x-api-key'] = credential.kind === 'oauth' ? `Bearer ${credential.secret}` : credential.secret;
+      headers[credential.kind === 'oauth' ? 'authorization' : 'x-api-key'] = credential.kind === 'oauth' ? `Bearer ${credential.secret}` : credential.secret;
       const beta = String(req.headers['anthropic-beta'] ?? '');
       if (!/^[a-zA-Z0-9,._-]*$/.test(beta)) { throw new BrokerRejection(400); }
       const betas = beta.split(',').filter(v => v && (credential.kind === 'oauth' || v !== 'oauth-2025-04-20'));

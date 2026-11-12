@@ -65,9 +65,12 @@ different account while tasks are active.
 The workload uses the existing local Anthropic-compatible broker transport. The
 bridge translates the allowlisted model to its configured deployment and sends
 POST `/anthropic/v1/messages` or `/anthropic/v1/messages/count_tokens`, with only
-the existing optional `?beta=true` query. Authentication is `api-key`, with
+the existing optional `?beta=true` query. Authentication is `x-api-key`, with
 `anthropic-version: 2023-06-01`; there is no Azure OpenAI `api-version` setting on
-this provider path. No provider key, endpoint, model map or Foundry environment is
+this provider path. The header follows the Microsoft REST example; a live
+header probe on 2026-11-12 returned HTTP 401 for `api-key` and HTTP 200 for
+`x-api-key` with the same resource key and deployment. This probe is not a
+completed caller-container integration check. No provider key, endpoint, model map or Foundry environment is
 forwarded to Docker. Claude Code receives the ephemeral grant in
 `ANTHROPIC_API_KEY` and a loopback `ANTHROPIC_BASE_URL`.
 
@@ -104,12 +107,13 @@ live-provider evidence.** On 2026-11-12, an authorized attempt to provision an
 Azure-hosted `claude-haiku-4-5` deployment (version 2, GlobalStandard capacity 10)
 on the existing Foundry resource failed at Azure Marketplace eligibility. Azure
 returned `AvailabilityNotInRegion`: the Claude Azure-hosted offer was unavailable
-for the subscription's KR/CSP purchasing context. No deployment was created, no
-caller-runtime inference request reached Foundry, and no live success is claimed.
+for the subscription's KR/CSP purchasing context. That attempt created no deployment and made no caller-runtime inference request.
+A later, separately authorized deployment in an eligible subscription succeeded;
+the header probe above reached that deployment, but caller-container acceptance
+is still pending.
 This is a provisioning/billing eligibility blocker, not evidence for or against
-the broker's runtime behavior. A separately authorized eligible deployment is
-required to complete this gate; keep the implementation PR in draft until that
-check succeeds.
+the broker's runtime behavior. Keep the implementation PR in draft until the full caller-container check
+succeeds.
 
 With the host configuration above, the existing runtime acceptance harness can
 exercise the pinned provider (set the image and a mapped model to your tested
