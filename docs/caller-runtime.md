@@ -673,6 +673,9 @@ File-enabled Claude and Codex cards advertise file output; disabled cards remain
 text-only. Codex registers the helper through an execution-only app-server MCP
 configuration override. Every resumed execution receives a fresh endpoint and
 token; no delivery grant is written to persistent Codex configuration.
+Operator opt-in also approves only this bridge-owned `send_file` tool in Codex,
+so it works with `approval_decision: "remote"`. Other tool approval policies
+remain in effect; every file still passes the host's path and budget checks.
 Traceability output and unsupported inputs remain rejected. To migrate from host
 `backends.claude.send_file`, move the export configuration to
 `caller_runtime.fileDelivery`, use container paths, and remove the host-only
@@ -699,7 +702,8 @@ DATABASE_URL=postgres://USER:PASSWORD@localhost:5432/DISPOSABLE_DATABASE \
   pnpm exec tsx packages/server/scripts/codex-file-delivery-smoke.ts
 ```
 
-The native smoke exercises real Codex tool registration/calls, path and size
+The native smoke exercises real Codex tool registration/calls, model-facing
+tool discovery and namespaced dispatch with synthetic Responses events, path and size
 errors, concurrent callers, disabled delivery, thread resume and process cleanup.
 The compiled-client concurrency and HTTP A2A smokes use a deterministic Codex
 protocol fixture; they do not establish model-selected tool usage. Native Codex

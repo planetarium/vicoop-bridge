@@ -105,7 +105,10 @@ for (const kind of ['claude','codex'] as const) test(`real ${kind} relay injects
       const {spawn}=require('node:child_process');const assert=require('node:assert/strict');
       ${helperLookup}
       assert.ok(helper.args[4].endsWith(String.fromCharCode(127)));
-      if(override)assert.ok(!override.includes(String.fromCharCode(127)));
+      if(override){
+        assert.ok(!override.includes(String.fromCharCode(127)));
+        assert.ok(args.includes('mcp_servers._vb-send-file.tools.send_file.approval_mode="approve"'));
+      }
       const p=spawn(process.execPath,helper.args,{stdio:['pipe','pipe','inherit']});
       let text='';p.stdout.on('data',chunk=>{text+=chunk;const lines=text.split('\\n');text=lines.pop();for(const l of lines){if(!l)continue;const r=JSON.parse(l);
         if(r.id===1)p.stdin.write(JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'send_file',arguments:{path:'/denied'}}})+'\\n');

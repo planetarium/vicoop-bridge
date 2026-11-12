@@ -177,6 +177,9 @@ function receive(m) {
           // resumed thread gets a new endpoint/token, never a persisted grant.
           // TOML forbids raw DEL, which JSON.stringify leaves unescaped.
           m.args.push('-c','mcp_servers._vb-send-file={command="/usr/local/bin/node",args=['+helperArgs.map(v=>JSON.stringify(v).replace(/\u007f/g,'\\u007f')).join(',')+'],enabled=true}');
+          // Operator opt-in authorizes this bounded export tool even when
+          // remote approvals put the rest of Codex in untrusted mode.
+          m.args.push('-c','mcp_servers._vb-send-file.tools.send_file.approval_mode="approve"');
         } else {
           // Replace only the bridge-owned empty strict MCP configuration.
           const index=m.args.indexOf('--mcp-config');

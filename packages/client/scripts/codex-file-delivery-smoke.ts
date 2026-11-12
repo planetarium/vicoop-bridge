@@ -33,21 +33,36 @@ const docker = async(args:string[]) => {
 const clients: AppServerRpcClient[] = [];
 const adapters: ReturnType<typeof createExecutionBrokerSpawn>[] = [];
 const grants: AbortSignal[] = [];
+const approvalRequests: string[] = [];
 let providerCalls = 0;
 const upstream = createServer(async(req,res)=>{
-  for await(const _ of req) {}
+  let body='';for await(const chunk of req)body+=chunk;
+  const request=JSON.parse(body);
   providerCalls++;
   assert.equal(req.headers.authorization,'Bearer fixture-host-only');
   const message={id:'msg_'+randomUUID(),type:'message',role:'assistant',status:'completed',
     content:[{type:'output_text',text:'fixture reply',annotations:[]}]};
+  // Drive the real model-facing deferred MCP surface, including discovery.
+  // Calling mcpServer/tool/call directly cannot prove that this surface works.
+  let output: object=message;
+  if(providerCalls===1) {
+    assert.ok(request.tools.some((t:any)=>t.type==='tool_search'));
+    output={type:'tool_search_call',id:'search_fixture',call_id:'search_fixture',
+      execution:'client',arguments:{query:'send_file',limit:1},status:'completed'};
+  } else if(providerCalls===2) {
+    const search=request.input.findLast((i:any)=>i.type==='tool_search_output');
+    const namespace=search.tools.find((t:any)=>t.tools?.some((tool:any)=>tool.name==='send_file'));
+    assert.ok(namespace,'model must discover send_file');
+    output={type:'function_call',id:'fc_fixture',call_id:'call_fixture',name:'send_file',
+      namespace:namespace.name,arguments:JSON.stringify({path:'/workspace/output/fixture.bin'}),status:'completed'};
+  }
   const response={id:'resp_'+randomUUID(),object:'response',model:'gpt-5.5',
-    status:'completed',output:[message],usage:{input_tokens:1,output_tokens:1,total_tokens:2}};
+    status:'completed',output:[output],usage:{input_tokens:1,output_tokens:1,total_tokens:2}};
   res.writeHead(200,{'content-type':'text/event-stream'});
   for(const event of [
     {type:'response.created',response:{...response,status:'in_progress',output:[]}},
-    {type:'response.output_item.added',output_index:0,item:{...message,status:'in_progress',content:[]}},
-    {type:'response.output_text.delta',item_id:message.id,output_index:0,content_index:0,delta:'fixture reply'},
-    {type:'response.output_item.done',output_index:0,item:message},
+    {type:'response.output_item.added',output_index:0,item:{...output,status:'in_progress'}},
+    {type:'response.output_item.done',output_index:0,item:output},
     {type:'response.completed',response},
   ]) res.write('data: '+JSON.stringify(event)+'\n\n');
   res.end();
@@ -80,11 +95,15 @@ try {
     });
     adapters.push(adapter);
     const rpc = new AppServerRpcClient({spawn:adapter.spawn as AppServerSpawnFn,cwd:'/workspace'});
-    clients.push(rpc);rpc.start();
+    clients.push(rpc);
+    rpc.setServerRequestHandler(async(_id,method)=>{
+      approvalRequests.push(method);return {decision:'decline'};
+    });
+    rpc.start();
     await rpc.request('initialize',{clientInfo:{name:'file-smoke',version:'1'},capabilities:{experimentalApi:true}});
     rpc.notify('initialized');
     await rpc.authenticateExecution();
-    const thread = await rpc.request<{thread:{id:string}}>(resume ? 'thread/resume' : 'thread/start',{...(resume ? {threadId:resume} : {}),cwd:'/workspace',sandbox:'danger-full-access',approvalPolicy:'never'});
+    const thread = await rpc.request<{thread:{id:string}}>(resume ? 'thread/resume' : 'thread/start',{...(resume ? {threadId:resume} : {}),cwd:'/workspace',sandbox:'danger-full-access',approvalPolicy:'untrusted',model:'gpt-5.5'});
     const inventory = await rpc.request<any>('mcpServerStatus/list',{threadId:thread.thread.id});
     const server = inventory.data.find((s:any)=>s.name==='_vb-send-file');
     assert.equal(Boolean(server),enabled,JSON.stringify(inventory));
@@ -108,9 +127,6 @@ try {
     if(part.kind==='file')assert.deepEqual(Buffer.from(part.file.bytes!,'base64'),
       Buffer.from([0,255,128,f.taskId==='alice-task'?0:1]));
   }
-  const again=await a.call('/workspace/output/fixture.bin');
-  assert.notEqual(again.isError,true,JSON.stringify(again));
-  assert.equal((await a.call('/workspace/output/fixture.bin')).isError,true);
   // A completed turn persists a real rollout so the next app-server can resume.
   let unsubscribe=()=>{};
   const completed=new Promise<any>(resolve=>{
@@ -132,6 +148,18 @@ try {
     ]);
     assert.equal(outcome.turn.status,'completed');
   } finally { clearTimeout(turnTimer);unsubscribe(); }
+  assert.deepEqual(approvalRequests,[],'operator-enabled send_file must work under remote approvals');
+  assert.equal(providerCalls,3,'search, discovered tool call, and final model response');
+  assert.equal(frames.length,3,'model-dispatched call must deliver an actual artifact');
+  const modelFile=frames.at(-1)!;
+  assert.equal(modelFile.type,'task.artifact');
+  if(modelFile.type==='task.artifact') {
+    assert.equal(modelFile.taskId,'alice-task');
+    const part=modelFile.artifact.parts[0];
+    assert.equal(part.kind,'file');
+    if(part.kind==='file')assert.deepEqual(Buffer.from(part.file.bytes!,'base64'),Buffer.from([0,255,128,0]));
+  }
+  assert.equal((await a.call('/workspace/output/fixture.bin')).isError,true,'model call consumes task file budget');
   a.rpc.kill();await a.rpc.waitForClose();await a.files.settle();
   assert.ok(grants.some(s=>s.aborted));
   b.rpc.kill();await b.rpc.waitForClose();await b.files.settle();
@@ -156,7 +184,7 @@ try {
     assert.equal(remaining,'[]','MCP helper or app-server survived cleanup');
   }
   console.log(JSON.stringify({result:'PASS',version,runtime:process.versions.bun?'Bun compiled':'Node',
-    checks:['native MCP registration','native tool invocation','actual file bytes','concurrent callers','path/symlink/size/count errors','disabled delivery','execution grant revocation','process cleanup','native thread resume','local mock inference only']}));
+    checks:['native MCP registration','native tool invocation','model tool search and namespaced dispatch under untrusted approvals','actual file bytes','concurrent callers','path/symlink/size/count errors','disabled delivery','execution grant revocation','process cleanup','native thread resume','local mock inference only']}));
 } finally {
   for(const rpc of clients)rpc.kill();
   await Promise.all(clients.map(c=>c.waitForClose()));
