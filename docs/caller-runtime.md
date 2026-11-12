@@ -818,9 +818,15 @@ with `--append-system-prompt-file`.
 
 For Codex, operator instructions are passed as `developerInstructions`, alongside
 identity/workspace/proxy rules on ordinary A2A tasks and caller-context rules.
-They are also retained on OpenAI-compatible model-endpoint requests, alongside
-the caller's system text (without the A2A identity/workspace rules). The bridge
-sends the composed instructions on `thread/start`. Codex persists them on
+They are also retained on OpenAI-compatible model-endpoint requests (without the
+A2A identity/workspace rules). When operator instructions are configured, caller
+`system`/`developer` messages and `tool_choice` preferences are delivered as a
+user message before the supplied conversation history. They cannot acquire the
+operator's developer role by choosing a role label in the remote request. This
+intentionally changes instruction precedence for these configured endpoints;
+without operator instructions, the existing model-endpoint system-text behavior
+is unchanged. This role separation is not an authorization or policy-enforcement
+boundary. The bridge sends the composed instructions on `thread/start`. Codex persists them on
 ordinary `thread/resume`. Thread reuse additionally requires the composed
 instructions hash to match; changed or removed instructions start a fresh thread
 rather than relying on an instruction override on resume (Codex 0.153.4 retained
