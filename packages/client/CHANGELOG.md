@@ -1,5 +1,12 @@
 # @vicoop-bridge/client
 
+## 0.48.0
+
+### Minor Changes
+
+- d77bcd1: Add explicit Microsoft Foundry API-key routing and model-to-deployment mapping for Claude caller containers while keeping provider credentials on the host.
+- e73bde9: Support explicit Azure OpenAI v1 deployments in Codex caller containers with host-held API keys, pinned model/deployment mapping and execution-scoped broker access.
+
 ## 0.47.1
 
 ### Patch Changes
