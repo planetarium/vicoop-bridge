@@ -43,6 +43,7 @@ export async function createCallerRuntime(args: {
   const codexCredential =
     args.kind === 'codex' ? createCodexCredentialReader() : undefined;
   const selected = await (claudeCredential ?? codexCredential)!();
+  const codexSelected = codexCredential ? await codexCredential() : undefined;
   const claudeSettings = args.kind === 'claude' ? selectClaudeCallerSettings(args.claude?.settings) : undefined;
   const catalog = codexCredential ? createCodexModelCatalogCache(codexCredential) : undefined;
   const pool = new DockerCallerRuntimePool(args.kind, config, args.agentId);
@@ -107,6 +108,9 @@ export async function createCallerRuntime(args: {
                 const providerBroker = createCodexAuthBroker({
                   credential: codexCredential!,
                   authentication: selected.kind,
+                  azureEndpoint: codexSelected?.azureEndpoint,
+                  azureModel: codexSelected?.azureModel,
+                  azureDeployment: codexSelected?.azureDeployment,
                 });
                 brokerStats.push(providerBroker.stats);
                 return providerBroker;
@@ -147,6 +151,10 @@ export async function createCallerRuntime(args: {
             })
           : createCodexExecutionBackend({
               ...args.codex,
+              ...(codexSelected?.azureModel ? {
+                appServerArgs: ['app-server', '-c', `model=${JSON.stringify(codexSelected.azureModel)}`],
+                readCodexConfigToml: async () => `model=${JSON.stringify(codexSelected.azureModel)}`,
+              } : {}),
               runtimeInstructions: [workspaceInstructions, proxyInstructions].filter(Boolean).join('\n\n') || undefined,
               cwd: '/workspace',
               sandboxMode: 'danger-full-access',

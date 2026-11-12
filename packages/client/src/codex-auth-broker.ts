@@ -20,15 +20,61 @@ export type CodexCredential = {
   kind: 'api-key' | 'oauth';
   secret: string;
   accountId?: string;
+  azureEndpoint?: string;
+  azureModel?: string;
+  azureDeployment?: string;
 };
 export type CodexCredentialReader = () =>
   | CodexCredential
   | Promise<CodexCredential>;
 
+// Explicit host-only Azure adapter. Caller input cannot select an upstream.
+export function validateCodexAzureEndpoint(value: string): string {
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error('Invalid Codex Azure endpoint'); }
+  if (url.protocol !== 'https:' || url.port || url.username || url.password || url.search || url.hash ||
+      !/^[a-z0-9][a-z0-9-]*\.(?:openai\.azure\.com|services\.ai\.azure\.com)$/.test(url.hostname) ||
+      !['/openai/v1', '/openai/v1/'].includes(url.pathname))
+    throw new Error('Invalid Codex Azure endpoint; use https://RESOURCE.openai.azure.com/openai/v1');
+  return url.origin + '/openai/v1';
+}
+
+function validateAzureModels(model: string | undefined, deployment: string | undefined): void {
+  if (!model || !/^(?:gpt-[a-zA-Z0-9._-]+|o[134](?:-[a-zA-Z0-9._-]+)?)$/.test(model) || model.length > 128 ||
+      !deployment || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(deployment))
+    throw new Error('Azure Codex requires a supported logical model and a valid deployment name');
+}
+
 // Select once, reread only that source, and never copy/refresh a login in Docker.
 export function createCodexCredentialReader(
   env: NodeJS.ProcessEnv = process.env,
 ): CodexCredentialReader {
+  const azureKeys = ['VICOOP_CODEX_AZURE_ENDPOINT', 'VICOOP_CODEX_AZURE_MODEL',
+    'VICOOP_CODEX_AZURE_DEPLOYMENT', 'VICOOP_CODEX_AZURE_API_VERSION', 'AZURE_OPENAI_API_KEY',
+    'AZURE_OPENAI_ENDPOINT', 'AZURE_OPENAI_AUTH_TOKEN', 'AZURE_OPENAI_AD_TOKEN', 'AZURE_OPENAI_API_VERSION'];
+  if (azureKeys.some(key => env[key] !== undefined)) {
+    if (!env.VICOOP_CODEX_AZURE_ENDPOINT || !env.AZURE_OPENAI_API_KEY ||
+        !env.VICOOP_CODEX_AZURE_MODEL || !env.VICOOP_CODEX_AZURE_DEPLOYMENT ||
+        env.OPENAI_API_KEY || env.OPENAI_BASE_URL || env.AZURE_OPENAI_ENDPOINT ||
+        env.AZURE_OPENAI_AUTH_TOKEN || env.AZURE_OPENAI_AD_TOKEN || env.OPENAI_API_VERSION ||
+        env.AZURE_OPENAI_API_VERSION ||
+        (env.VICOOP_CODEX_AZURE_API_VERSION !== undefined && env.VICOOP_CODEX_AZURE_API_VERSION !== 'v1'))
+      throw new Error('Azure Codex requires explicit bridge endpoint, model, deployment and API key; conflicting provider settings and non-v1 API versions are unsupported');
+    const endpoint = validateCodexAzureEndpoint(env.VICOOP_CODEX_AZURE_ENDPOINT);
+    const model = env.VICOOP_CODEX_AZURE_MODEL;
+    const deployment = env.VICOOP_CODEX_AZURE_DEPLOYMENT;
+    validateAzureModels(model, deployment);
+    const initialKey = env.AZURE_OPENAI_API_KEY;
+    if (/\s/.test(initialKey)) throw new Error('Host Azure OpenAI API key is unavailable');
+    const pinnedKeys = [...azureKeys, 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'AZURE_OPENAI_ENDPOINT',
+      'AZURE_OPENAI_AUTH_TOKEN', 'AZURE_OPENAI_AD_TOKEN', 'OPENAI_API_VERSION', 'AZURE_OPENAI_API_VERSION'];
+    const initial = pinnedKeys.map(key => env[key]);
+    return () => {
+      if (pinnedKeys.some((key, index) => env[key] !== initial[index]))
+        throw new Error('Host Azure Codex configuration changed; restart the bridge');
+      return {kind: 'api-key', secret: initialKey, azureEndpoint: endpoint, azureModel: model, azureDeployment: deployment};
+    };
+  }
   if (env.OPENAI_BASE_URL)
     throw new Error(
       'Codex container authentication requires the direct OpenAI service',
@@ -129,19 +175,27 @@ export function createCodexAuthBroker(opts: {
   credential: CodexCredentialReader;
   authentication: 'api-key' | 'oauth';
   upstream?: string;
+  azureEndpoint?: string;
+  azureModel?: string;
+  azureDeployment?: string;
   ttlMs?: number;
   timeoutMs?: number;
   maxRequests?: number;
   maxConcurrent?: number;
 }) {
   const oauth = opts.authentication === 'oauth';
+  const azure = opts.azureEndpoint ? new URL(validateCodexAzureEndpoint(opts.azureEndpoint)) : undefined;
+  if (azure && oauth) throw new Error('Azure Codex requires API-key authentication');
+  if (azure) validateAzureModels(opts.azureModel, opts.azureDeployment);
+  else if (opts.azureModel || opts.azureDeployment) throw new Error('Azure Codex requires an endpoint');
   return createExecutionAuthBroker({
     ...opts,
     upstream:
       opts.upstream ??
-      (oauth ? 'https://chatgpt.com' : 'https://api.openai.com'),
-    origins: [oauth ? 'https://chatgpt.com' : 'https://api.openai.com'],
-    pathPrefix: opts.upstream ? '' : oauth ? '/backend-api/codex' : '/v1',
+      (azure?.origin ?? (oauth ? 'https://chatgpt.com' : 'https://api.openai.com')),
+    origins: [azure?.origin ?? (oauth ? 'https://chatgpt.com' : 'https://api.openai.com')],
+    pathPrefix: azure ? azure.pathname : opts.upstream ? '' : oauth ? '/backend-api/codex' : '/v1',
+    transformBody: azure ? data => ({ ...data, model: opts.azureDeployment }) : undefined,
     allow(req) {
       // Built-in OpenAI tries WebSockets first. 426 selects its HTTP fallback
       // immediately; 403 causes repeated handshakes before falling back.
@@ -163,6 +217,7 @@ export function createCodexAuthBroker(opts: {
         typeof data !== 'object' ||
         typeof data.model !== 'string' ||
         !/^(gpt-|o[134](?:-|$))[a-zA-Z0-9._-]*$/.test(data.model) ||
+        (azure && data.model !== opts.azureModel) ||
         data.background === true
       )
         throw new BrokerRejection(403);
@@ -176,13 +231,16 @@ export function createCodexAuthBroker(opts: {
       const credential = await opts.credential();
       if (
         credential.kind !== opts.authentication ||
+        credential.azureEndpoint !== azure?.href.replace(/\/$/, '') ||
+        credential.azureModel !== opts.azureModel ||
+        credential.azureDeployment !== opts.azureDeployment ||
         !credential.secret ||
         /\s/.test(credential.secret)
       )
         throw new BrokerRejection(503);
       const headers: Record<string, string> = {
         'content-type': 'application/json',
-        authorization: `Bearer ${credential.secret}`,
+        ...(azure ? {'api-key': credential.secret} : {authorization: `Bearer ${credential.secret}`}),
       };
       if (oauth) {
         if (!credential.accountId || /\s/.test(credential.accountId))

@@ -25,8 +25,10 @@ version is 0.153.4. `vicoop-client info` advertises this floor as
 `backends.codex.externalRuntimeSupportedRange`; `supportedRange` retains the
 existing host/bundled-direct range. Supported host sources, selected in order:
 
-1. Explicit `OPENAI_API_KEY` in the bridge environment.
-2. An API key or ChatGPT OAuth login in `$CODEX_HOME/auth.json` (default
+1. Explicit Azure provider settings described below, if any are present (incomplete
+   or conflicting Azure settings fail closed).
+2. Explicit `OPENAI_API_KEY` in the bridge environment.
+3. An API key or ChatGPT OAuth login in `$CODEX_HOME/auth.json` (default
    `~/.codex/auth.json`). OAuth requires `auth_mode="chatgpt"`; unsupported
    login modes and files containing both credential types are rejected.
 
@@ -35,10 +37,11 @@ Credentials are reread for each request; an expired token, removed file, or
 changed account fails closed. OAuth must remain valid for at least 30 seconds.
 The bridge never refreshes OAuth or falls back to another account or API key.
 Renew the login on the host and retry; restart after changing accounts or
-environment credentials. Keyring-only logins, custom providers, host config
-profiles and `OPENAI_BASE_URL` overrides are unsupported in this profile.
+environment credentials. Keyring-only logins, arbitrary custom providers, host config profiles and
+`OPENAI_BASE_URL` overrides are unsupported in this profile. The explicit Azure
+provider below is supported independently of host Codex custom-provider config.
 
-Only the host config's root `model` setting is inherited. Other host settings,
+For direct OpenAI/ChatGPT, only the host config's root `model` setting is inherited. Other host settings,
 MCP servers and credential files are not copied. For OAuth, the host loads the
 authenticated model catalog and stages non-secret model metadata per execution.
 In per-caller container mode, loading is lazy: the first request for a backend
@@ -56,10 +59,159 @@ Responses-lite are disabled. The built-in provider's initial WebSocket handshake
 receives HTTP 426 from the authenticated broker, selecting HTTP fallback
 without repeated connection attempts; no WebSocket request reaches upstream.
 The broker permits only POST `/responses` and
-`/responses/compact`, routed to the fixed OpenAI API or ChatGPT Codex endpoint.
+`/responses/compact`, routed to the selected OpenAI API, ChatGPT Codex, or pinned Azure v1 endpoint.
 Other routes, query parameters, background requests and unsupported model
 names are rejected. Credentials, account headers and upstream error bodies
 are never accepted from or echoed back to the workload.
+
+## Azure OpenAI caller containers
+
+This path supports host-held **API keys only**. Microsoft Entra ID and managed
+identity are deferred; Azure identity tokens are rejected rather than treated as
+API keys. It uses the Azure OpenAI **v1** Responses API, including
+`/openai/v1/responses/compact`. Dated preview APIs and query-string API-version
+selection are not supported. The optional `VICOOP_CODEX_AZURE_API_VERSION` must
+be `v1`; omitting it also selects v1.
+
+Set these variables in the **host bridge process**, including its daemon/service
+environment. Do not add them to the caller image, runtime environment, mounts,
+prompts, or repository files:
+
+```sh
+export VICOOP_CODEX_AZURE_ENDPOINT=https://YOUR-RESOURCE.openai.azure.com/openai/v1
+export VICOOP_CODEX_AZURE_MODEL=gpt-5.4
+export VICOOP_CODEX_AZURE_DEPLOYMENT=YOUR-DEPLOYMENT-NAME
+# Supply AZURE_OPENAI_API_KEY through your host secret manager/environment.
+vicoop-client container init codex
+vicoop-client start --detach
+```
+
+All four settings (including the key) are required. The endpoint must be HTTPS
+on a single resource under `openai.azure.com` or `services.ai.azure.com`, with
+exactly `/openai/v1` (optional trailing slash), no credentials, query, fragment,
+or custom port. Private/custom-domain endpoints and sovereign-cloud suffixes
+are not supported by this initial adapter.
+
+`VICOOP_CODEX_AZURE_MODEL` is the underlying Codex-compatible model identifier,
+not necessarily the deployment name. It becomes the runtime's model, overriding
+the host's root model. `VICOOP_CODEX_AZURE_DEPLOYMENT` is the Azure deployment
+name. The broker accepts only the selected logical model and substitutes the
+pinned deployment in the upstream JSON body. For example, `gpt-5.4` can map to
+`production-codex`. A caller's request for another model fails closed. Configure
+a deployment whose underlying model matches the logical model and supports
+Responses/compaction; validation of names cannot establish regional availability
+or deployment capabilities.
+
+Only the host broker sees `AZURE_OPENAI_API_KEY`; it injects `api-key` on the
+pinned upstream request and never forwards the workload's authorization,
+`api-key`, cookies or ChatGPT account headers. The workload retains the same
+execution-scoped grant, private relay, native `send_file`, process cleanup and
+conversation-resume paths used by direct OpenAI. No host Azure configuration or
+credentials are staged in the container. API-key mode uses Codex's embedded
+model catalog and never fetches the ChatGPT catalog.
+
+The provider, key, endpoint, logical model, deployment and API version remain
+pinned for the reader lifetime. Changes require a bridge restart. Authentication
+errors and redirects are sanitized and never trigger fallback to OpenAI,
+ChatGPT or another Azure account. Remove `OPENAI_API_KEY`, `OPENAI_BASE_URL`,
+`AZURE_OPENAI_ENDPOINT`, Azure identity-token variables, and generic dated API
+version settings from this host process; mixed settings are rejected. An
+existing host `auth.json` is not consulted when explicit Azure settings exist.
+
+### Migration and rollback
+
+Stop the bridge before changing provider settings. Record the existing provider,
+model/deployment mapping, image version and caller-state paths. Upgrade the
+client and use a compatible caller image (the broker floor is stable Codex
+0.153.4; see live evidence below for the version actually exercised).
+
+Operators retiring custom Azure patches must transfer their resource endpoint,
+API key, **logical model and deployment name** into these settings first. Keep
+any host CLI configuration needed by standalone Codex; it is not copied to or
+used as the caller's Azure provider. Remove patched provider routing from the
+bridge and caller image, then initialize/validate the normal caller runtime and
+restart with the host settings above. Verify inference and native attachments
+before moving production traffic.
+
+For rollback, stop the daemon, remove all `VICOOP_CODEX_AZURE_*` and
+`AZURE_OPENAI_*` settings from its environment, restore the intended direct
+OpenAI API key or host ChatGPT login (or restore the previously recorded patched
+client/configuration), and restart. Keep caller storage; do not delete it as an
+authentication migration step. Model/provider changes can make old transcripts
+incompatible, so first test a fresh context, then an existing conversation.
+
+### Azure validation evidence
+
+Synthetic broker tests cover distinct logical/deployment names, endpoint and
+configuration rejection, credential/header isolation, account pinning, both
+Responses routes, sanitized authentication/rate-limit/server/redirect failures,
+revocation, and no fallback. Existing direct OpenAI/ChatGPT tests remain in the
+same suite. Shared execution tests cover concurrency, cancellation and resume.
+These are not live-provider evidence.
+
+A real validation must run the Azure caller runtime, complete inference, resume
+an existing conversation, run concurrent contexts, cancel an active execution
+and verify its grant is revoked. With `fileDelivery` enabled, have the model
+create synthetic attachment bytes and call native `send_file`; an A2A consumer
+must retrieve the bytes and verify the expected contents/hash both before and
+after resume. Check workload environments, mounts, session files and emitted
+artifacts/logs for credentials without printing the key. Record backend/client
+versions and successful gates, and distinguish skipped gates from passed ones.
+On 2026-11-12, this implementation passed real Azure inference on macOS/Colima
+with Codex **0.153.4**, logical model/deployment `gpt-5.4`, and the Azure v1
+endpoint. The caller-runtime harness verified:
+
+- Native `send_file` produced the exact nine synthetic bytes `00ff80415a5552450a`
+  before and after ordinary conversation resume (SHA-256
+  `199a7981082f950a2aaaa3278d95257a79ca6473272ad5b938dd18d2f44d3132`).
+- Two callers had live shell processes simultaneously, with separate workspaces.
+- Canceling an observed `sleep 90` stopped its container while the other caller
+  remained running. Explicit rejected-grant behavior is covered by broker tests;
+  the live check observes process/container revocation, not token replay.
+- Active workload environments, retained session files, container metadata and
+  A2A frames contained no host provider key.
+- After daemon recreation, workspace bytes remained deliverable. The runtime
+  explicitly reported `conversationReset`; this is **not** durable conversation
+  continuity across a daemon restart.
+
+Reproduce with the protected host provider settings above and a real pinned
+Codex caller image (a fixture that merely reports a version is insufficient):
+
+```sh
+VICOOP_SMOKE_IMAGE=sha256:YOUR_REAL_CALLER_IMAGE_ID \
+  pnpm exec tsx packages/client/scripts/codex-azure-live-smoke.ts
+```
+
+The script performs paid inference and removes only its disposable caller
+state. Its final PASS is emitted after cleanup. Native Linux and direct OpenAI
+API-key inference are not established by this Azure run.
+
+The HTTP A2A consumer harness also passed on 2026-11-12. It runs a local gateway,
+a real WebSocket client and Azure-backed caller runtime, then retrieves tasks
+through HTTP JSON-RPC. Both initial and resumed tasks returned the exact 31-byte
+synthetic attachment (SHA-256
+`4edf9b1b0a7eb33d3f18fd543d12869e099d07c37c44ce6d41d633378b8f7a20`). A random
+per-run nonce was recalled after resume, with no `conversationReset`. Provider
+keys were absent from responses and captured logs; success followed cleanup.
+
+```sh
+VICOOP_AZURE_SMOKE_IMAGE=sha256:YOUR_REAL_CALLER_IMAGE_ID \
+  pnpm exec tsx packages/server/scripts/azure-codex-a2a-smoke.ts
+```
+
+This harness creates and drops a randomly named PostgreSQL database and, by
+default, a disposable PostgreSQL Docker container. If Docker-published ports
+are not reachable from the host, supply a local PostgreSQL admin connection
+through `VICOOP_SMOKE_DATABASE_URL` and set `VICOOP_SMOKE_CREATE_DATABASE=1`.
+It creates a separate test database instead of migrating the supplied admin
+database. Use a disposable/local server, never production. All caller state and
+test database resources are removed before the final success report; a cleanup
+failure retains recovery state and fails the run.
+
+Provider references: [Azure Responses and compaction](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/responses),
+[Azure endpoint and deployment mapping](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/how-to/switching-endpoints).
+Billing eligibility (including promotional credits) is outside this transport
+implementation and must be checked for the selected Azure deployment.
 
 ## Current per-caller setup
 
@@ -141,7 +293,8 @@ It creates and removes a disposable Docker runtime, uses the selected host
 credential for real requests, and checks inference, model discovery, resume,
 tools, concurrency, cancellation cleanup and absent workload login files.
 The same script can be compiled with `bun build --compile`. Actual OAuth was
-tested on macOS with Docker Desktop. Actual API-key inference and native Linux
-host validation remain unverified; mock API-key tests do not replace them.
+tested on macOS with Docker Desktop. Direct OpenAI API-key inference and native Linux
+host validation remain unverified; see the separate Azure evidence above. Mock
+API-key tests do not replace live-provider checks.
 
 Workspace binds must use a separate project directory: paths overlapping the host Claude/Codex credential directories (including configured homes and symlink aliases) are rejected before startup. This check protects known credential locations; operators must still keep unrelated secrets out of shared project files. Runtime labels and volume names must match the requested runtime identity, and shared host/user/IPC namespaces and device requests are rejected.
