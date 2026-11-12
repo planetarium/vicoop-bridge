@@ -200,9 +200,10 @@ try {
   b.rpc.kill();await b.rpc.waitForClose();await b.files.settle();
   assert.ok(grants.every(s=>s.aborted),'all completed grants must be revoked');
   // Old configurations must not collide with the next execution's server.
-  // A legacy fixed name and the prior execution name both use HTTP transport;
+  // Both legacy fixed names (including the Azure deployment adapter) and the
+  // prior execution name use HTTP transport;
   // merging either with our stdio command would make Codex reject the config.
-  const staleConfig=['_vb-send-file',a.serverName].flatMap(name=>[
+  const staleConfig=['vb_send_file','_vb-send-file',a.serverName].flatMap(name=>[
     '[mcp_servers.'+name+']',
     'url = "http://127.0.0.1:1/old-mcp"',
     'enabled = false',
