@@ -50,8 +50,14 @@ export function createClaudeCredentialReader(env: NodeJS.ProcessEnv = process.en
   }
   const foundry = readFoundryConfig(env);
   if (foundry) {
+    const pinnedKeys = ['CLAUDE_CODE_USE_FOUNDRY', 'ANTHROPIC_FOUNDRY_RESOURCE', 'ANTHROPIC_FOUNDRY_BASE_URL',
+      'ANTHROPIC_FOUNDRY_API_KEY', 'VICOOP_CLAUDE_FOUNDRY_MODEL_MAP', 'ANTHROPIC_API_KEY',
+      'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX'];
+    const initial = pinnedKeys.map(key => env[key]);
+    const secret = env.ANTHROPIC_FOUNDRY_API_KEY;
     const reader: CredentialReader = () => {
-      const secret = env.ANTHROPIC_FOUNDRY_API_KEY;
+      if (pinnedKeys.some((key, index) => env[key] !== initial[index]))
+        throw new Error('Foundry host configuration changed; restart the daemon');
       if (!secret || /\s/.test(secret)) throw new Error('Foundry host API key is unavailable; restore it and restart the daemon');
       return { kind: 'api-key', secret };
     };

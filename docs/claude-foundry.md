@@ -55,7 +55,8 @@ Host `ANTHROPIC_DEFAULT_*_MODEL` settings are not forwarded into callers. Keep t
 public model ID in the agent configuration, and put the Azure deployment name only
 in the host map. The caller cannot select arbitrary deployments: unmapped models
 and request-level `fallbacks` are rejected before any credential-bearing request.
-The resource and map are immutable for the daemon lifetime. Restart the daemon to
+The resource, map and key are pinned for the daemon lifetime; any change to their
+selected host environment fails closed. Restart the daemon to
 change either or to replace an environment API key. Never rotate a key to a
 different account while tasks are active.
 
@@ -88,7 +89,7 @@ selected deployment. Keep an operator-tested image version pinned.
 
 Synthetic Node tests cover resource/URL validation, conflicting authentication,
 model translation, Messages/token-counting routes, host header substitution,
-credential rotation/loss, no fallback, sanitized failures and real relay environment
+credential/configuration change rejection, no fallback, sanitized failures and real relay environment
 isolation. Existing direct OAuth/API-key, cancellation and grant tests remain in
 place. Run them after building the protocol workspace:
 

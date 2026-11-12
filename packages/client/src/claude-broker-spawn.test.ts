@@ -258,8 +258,12 @@ test('Foundry relay exposes only an execution grant and keeps provider configura
     res.end('{"ok":true}');
   });
   upstream.listen(0, '127.0.0.1'); await once(upstream, 'listening');
+  const imageSpawn: typeof spawn = ((_cmd: string, args: string[], opts: object) =>
+    spawn('/bin/sh', ['-c', '"$@"; exit 0', 'supervisor-stand-in', process.execPath, '-e', args[args.length - 1]],
+      { ...opts, env: { PATH: process.env.PATH, VICOOP_CLAUDE_FOUNDRY_MODEL_MAP: 'private-deployment',
+        ANTHROPIC_FOUNDRY_API_KEY: 'host-foundry-secret', ANTHROPIC_FOUNDRY_RESOURCE: 'private-resource' } })) as typeof spawn;
   const adapter = createClaudeBrokerSpawn('fixture', { credential, authentication: 'api-key',
-    upstream: `http://127.0.0.1:${(upstream.address() as { port: number }).port}`, spawnImpl: localSpawn });
+    upstream: `http://127.0.0.1:${(upstream.address() as { port: number }).port}`, spawnImpl: imageSpawn });
   try {
     const child = adapter.spawn(process.execPath, ['-e', `
       (async () => {

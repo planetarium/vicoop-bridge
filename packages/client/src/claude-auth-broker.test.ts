@@ -227,15 +227,15 @@ test('Foundry configuration is explicit, constrained and pinned independently fr
   const reader = createClaudeCredentialReader(env);
   assert.equal(reader.foundry?.origin, 'https://test-resource.services.ai.azure.com');
   assert.deepEqual(reader(), { kind: 'api-key', secret: 'HOST_FOUNDRY_SECRET' });
-  env.ANTHROPIC_FOUNDRY_RESOURCE = 'other-account';
-  env.VICOOP_CLAUDE_FOUNDRY_MODEL_MAP = '{}';
-  env.ANTHROPIC_API_KEY = 'OTHER_SECRET';
-  env.ANTHROPIC_FOUNDRY_API_KEY = 'ROTATED';
+  for (const key of [...Object.keys(env), 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_USE_BEDROCK']) {
+    const original = env[key];
+    env[key] = 'other-account'; assert.throws(reader, /changed/);
+    if (original === undefined) delete env[key]; else env[key] = original;
+  }
   assert.equal(reader.foundry?.origin, 'https://test-resource.services.ai.azure.com');
   assert.equal(reader.foundry?.deployments['claude-sonnet-4-6'], 'production-sonnet');
-  assert.deepEqual(reader(), { kind: 'api-key', secret: 'ROTATED' });
   delete env.ANTHROPIC_FOUNDRY_API_KEY;
-  assert.throws(reader, /unavailable/);
+  assert.throws(reader, /changed/);
   assert.throws(() => Object.assign(reader.foundry!.deployments, { 'claude-sonnet-4-6': 'other' }));
   for (const url of ['https://example.services.ai.azure.com', 'https://example.services.ai.azure.com/anthropic/']) {
     const explicit = foundryEnv(); delete explicit.ANTHROPIC_FOUNDRY_RESOURCE;
