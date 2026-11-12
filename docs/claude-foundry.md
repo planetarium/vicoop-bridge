@@ -100,9 +100,20 @@ pnpm exec tsx --test packages/client/src/claude-auth-broker.test.ts packages/cli
 ```
 
 **Real Foundry caller-container inference is pending; synthetic success is not
-live-provider evidence.** With the host configuration above, the existing runtime
-acceptance harness can exercise the pinned provider (set the image and a mapped
-model to your tested versions):
+live-provider evidence.** On 2026-11-12, an authorized attempt to provision an
+Azure-hosted `claude-haiku-4-5` deployment (version 2, GlobalStandard capacity 10)
+on the existing Foundry resource failed at Azure Marketplace eligibility. Azure
+returned `AvailabilityNotInRegion`: the Claude Azure-hosted offer was unavailable
+for the subscription's KR/CSP purchasing context. No deployment was created, no
+caller-runtime inference request reached Foundry, and no live success is claimed.
+This is a provisioning/billing eligibility blocker, not evidence for or against
+the broker's runtime behavior. A separately authorized eligible deployment is
+required to complete this gate; keep the implementation PR in draft until that
+check succeeds.
+
+With the host configuration above, the existing runtime acceptance harness can
+exercise the pinned provider (set the image and a mapped model to your tested
+versions):
 
 ```sh
 VICOOP_SMOKE_KIND=claude \
