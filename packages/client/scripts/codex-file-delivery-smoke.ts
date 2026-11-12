@@ -22,7 +22,7 @@ assert.ok(image, 'Set VICOOP_FILE_TEST_IMAGE to a pinned Node-equipped Codex cal
 const directory = await mkdtemp(join(tmpdir(), 'codex-file-smoke-'));
 const agentId = 'files-' + randomUUID();
 const config = CallerRuntimeConfig.parse({image, stateDirectory:directory,
-  fileDelivery:{allowedRoots:['/workspace/output'],maxBytes:32,maxTotalBytes:48,maxFiles:2}});
+  fileDelivery:{allowedRoots:['/workspace/output','/workspace/out\u007fput'],maxBytes:32,maxTotalBytes:48,maxFiles:2}});
 const pool = new DockerCallerRuntimePool('codex', config, agentId);
 const frames: UpFrame[] = [];
 const docker = async(args:string[]) => {
@@ -74,7 +74,7 @@ try {
       backend:'codex',ttlMs:60000,
       createBroker:()=>createCodexAuthBroker({authentication:'api-key',upstream:upstreamUrl,
         credential:()=>({kind:'api-key',secret:'fixture-host-only'})}),
-      ...(enabled ? {fileDelivery:{description:'Deliver fixture files',bind:()=>async(input:unknown,execution:AbortSignal)=>{
+      ...(enabled ? {fileDelivery:{description:'Deliver fixture files from '+config.fileDelivery!.allowedRoots.join(', '),bind:()=>async(input:unknown,execution:AbortSignal)=>{
         grants.push(execution);return files.send(input,execution);
       }}} : {}),
     });
@@ -112,11 +112,26 @@ try {
   assert.notEqual(again.isError,true,JSON.stringify(again));
   assert.equal((await a.call('/workspace/output/fixture.bin')).isError,true);
   // A completed turn persists a real rollout so the next app-server can resume.
-  const completed=new Promise<any>(resolve=>a.rpc.onNotification((method,params)=>{
-    if(method==='turn/completed')resolve(params);
-  }));
-  await a.rpc.request('turn/start',{threadId:a.threadId,input:[{type:'text',text:'fixture'}]});
-  assert.equal((await completed).turn.status,'completed');
+  let unsubscribe=()=>{};
+  const completed=new Promise<any>(resolve=>{
+    unsubscribe=a.rpc.onNotification((method,params)=>{
+      if(method==='turn/completed')resolve(params);
+    });
+  });
+  let turnTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const outcome=await Promise.race([
+      (async()=>{
+        await a.rpc.request('turn/start',{threadId:a.threadId,input:[{type:'text',text:'fixture'}]});
+        return completed;
+      })(),
+      a.rpc.waitForClose().then(()=>{throw Error('Codex closed before turn completion');}),
+      new Promise<never>((_,reject)=>{
+        turnTimer=setTimeout(()=>reject(Error('Codex turn completion timed out')),30000);
+      }),
+    ]);
+    assert.equal(outcome.turn.status,'completed');
+  } finally { clearTimeout(turnTimer);unsubscribe(); }
   a.rpc.kill();await a.rpc.waitForClose();await a.files.settle();
   assert.ok(grants.some(s=>s.aborted));
   b.rpc.kill();await b.rpc.waitForClose();await b.files.settle();

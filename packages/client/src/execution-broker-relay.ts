@@ -175,7 +175,8 @@ function receive(m) {
         if(m.backend==='codex') {
           // CLI config overrides live only for this app-server execution. A
           // resumed thread gets a new endpoint/token, never a persisted grant.
-          m.args.push('-c','mcp_servers._vb-send-file={command="/usr/local/bin/node",args=['+helperArgs.map(v=>JSON.stringify(v)).join(',')+'],enabled=true}');
+          // TOML forbids raw DEL, which JSON.stringify leaves unescaped.
+          m.args.push('-c','mcp_servers._vb-send-file={command="/usr/local/bin/node",args=['+helperArgs.map(v=>JSON.stringify(v).replace(/\u007f/g,'\\u007f')).join(',')+'],enabled=true}');
         } else {
           // Replace only the bridge-owned empty strict MCP configuration.
           const index=m.args.indexOf('--mcp-config');

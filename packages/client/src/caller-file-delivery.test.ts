@@ -91,7 +91,7 @@ const helper=override
 for (const kind of ['claude','codex'] as const) test(`real ${kind} relay injects stdio MCP, captures executions, reports tool errors and revokes on exit`, async () => {
   const calls: unknown[] = [], executionSignals: AbortSignal[] = [];
   let generation = 0;
-  const adapter = fileAdapter(kind,{description:'Send files',bind(){
+  const adapter = fileAdapter(kind,{description:'Send files \u007f',bind(){
     const bound = ++generation;
     return async (input,signal)=>{
       calls.push({bound,input});executionSignals.push(signal);
@@ -104,6 +104,8 @@ for (const kind of ['claude','codex'] as const) test(`real ${kind} relay injects
       const script = `
       const {spawn}=require('node:child_process');const assert=require('node:assert/strict');
       ${helperLookup}
+      assert.ok(helper.args[4].endsWith(String.fromCharCode(127)));
+      if(override)assert.ok(!override.includes(String.fromCharCode(127)));
       const p=spawn(process.execPath,helper.args,{stdio:['pipe','pipe','inherit']});
       let text='';p.stdout.on('data',chunk=>{text+=chunk;const lines=text.split('\\n');text=lines.pop();for(const l of lines){if(!l)continue;const r=JSON.parse(l);
         if(r.id===1)p.stdin.write(JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'send_file',arguments:{path:'/denied'}}})+'\\n');
