@@ -186,6 +186,28 @@ The script performs paid inference and removes only its disposable caller
 state. Its final PASS is emitted after cleanup. Native Linux and direct OpenAI
 API-key inference are not established by this Azure run.
 
+The HTTP A2A consumer harness also passed on 2026-11-12. It runs a local gateway,
+a real WebSocket client and Azure-backed caller runtime, then retrieves tasks
+through HTTP JSON-RPC. Both initial and resumed tasks returned the exact 31-byte
+synthetic attachment (SHA-256
+`4edf9b1b0a7eb33d3f18fd543d12869e099d07c37c44ce6d41d633378b8f7a20`). A random
+per-run nonce was recalled after resume, with no `conversationReset`. Provider
+keys were absent from responses and captured logs; success followed cleanup.
+
+```sh
+VICOOP_AZURE_SMOKE_IMAGE=sha256:YOUR_REAL_CALLER_IMAGE_ID \
+  pnpm exec tsx packages/server/scripts/azure-codex-a2a-smoke.ts
+```
+
+This harness creates and drops a randomly named PostgreSQL database and, by
+default, a disposable PostgreSQL Docker container. If Docker-published ports
+are not reachable from the host, supply a local PostgreSQL admin connection
+through `VICOOP_SMOKE_DATABASE_URL` and set `VICOOP_SMOKE_CREATE_DATABASE=1`.
+It creates a separate test database instead of migrating the supplied admin
+database. Use a disposable/local server, never production. All caller state and
+test database resources are removed before the final success report; a cleanup
+failure retains recovery state and fails the run.
+
 Provider references: [Azure Responses and compaction](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/responses),
 [Azure endpoint and deployment mapping](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/how-to/switching-endpoints).
 Billing eligibility (including promotional credits) is outside this transport
