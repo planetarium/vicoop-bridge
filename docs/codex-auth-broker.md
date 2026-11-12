@@ -96,14 +96,25 @@ subscription. This adapter does not establish a billing cap or guarantee credits
 
 Codex caller containers accept `caller_runtime.systemPrompt` as runtime
 instructions and the same `caller_runtime.fileDelivery` policy as Claude.
-The execution relay installs an ephemeral stdio MCP server named `vb_send_file`
-with a `send_file` tool. Enabling file delivery explicitly preapproves only this
-bridge-owned tool; other MCP tools and global approval policy are unchanged.
+File delivery uses the upstream 0.47.1 execution relay and its `send_file` tool.
+Each execution, including resume, has a fresh MCP namespace; discover the current
+tool instead of hard-coding `vb_send_file` or persisting a namespace.
+Enabling file delivery explicitly preapproves only this bridge-owned tool; other MCP tools and global approval policy are unchanged.
 Files are read by the host's bounded container reader,
 validated against allowed paths and task budgets, and emitted as A2A FileParts.
 No provider credential is placed in MCP configuration. The execution-scoped
 file token expires with the relay; delivery is bound to the originating task.
 The daemon sizes replay retention for the selected backend's delivery policy.
+
+When upgrading the custom Azure deployment, update its operator-managed
+`caller_runtime.systemPrompt` and any mounted instructions before restarting:
+replace references such as `MCP vb_send_file.send_file` with instructions to
+discover the current bridge-owned `send_file` tool, including after resume.
+Keep the existing `fileDelivery` roots and budgets. Retain the Azure host
+configuration and custom provider build until its provider support is released;
+the stock 0.47.1 binary alone cannot replace this Azure-enabled build. Validate
+with the daemon stopped, then verify both a new task and a resumed context with
+actual consumer attachment retrieval before declaring the rollout complete.
 
 ## Current per-caller setup
 
@@ -185,7 +196,9 @@ It creates and removes a disposable Docker runtime, uses the selected host
 credential for real requests, and checks inference, model discovery, resume,
 tools, concurrency, cancellation cleanup and absent workload login files.
 The same script can be compiled with `bun build --compile`. Actual OAuth was
-tested on macOS with Docker Desktop. Azure API-key inference on native Linux was verified with Codex 0.153.4 and an
+tested on macOS with Docker Desktop. Before this integration, the custom
+Azure/file-delivery build was tested on native Linux. That historical check does not certify this merged build. Azure API-key
+inference was verified with Codex 0.153.4 and an
 Azure `gpt-5.4` deployment: an A2A task prepared and delivered a PNG and a
 three-second PCM WAV as separate ZIP attachments; the consumer decoded both,
 verified manifest/source hashes, and matched the WAV PCM to the source segment.

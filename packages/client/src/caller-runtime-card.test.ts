@@ -41,9 +41,12 @@ test('custom caller cards remove traceability without changing the original exte
 });
 
 test('file delivery is advertised only for explicitly enabled Claude and Codex callers', () => {
-  const card = AgentCard.parse(resolveBundledCard('claude'));
-  const enabled = callerRuntimeCard(card, 'claude', false, true);
-  assert.deepEqual(enabled.defaultOutputModes, ['text/plain', '*/*']);
-  assert.match(enabled.description!, /inline A2A FileParts/);
-  assert.deepEqual(callerRuntimeCard(card, 'codex', false, true).defaultOutputModes, ['text/plain', '*/*']);
+  for (const kind of ['claude', 'codex']) {
+    const card = AgentCard.parse(resolveBundledCard(kind));
+    const enabled = callerRuntimeCard(card, kind, false, true);
+    assert.deepEqual(enabled.defaultOutputModes, ['text/plain', '*/*']);
+    assert.match(enabled.description!, /inline A2A FileParts/);
+    assert.deepEqual(callerRuntimeCard(card, kind).defaultOutputModes, ['text/plain']);
+  }
+  assert.throws(() => callerRuntimeCard(AgentCard.parse(resolveBundledCard('claude')), 'openclaw', false, true), /Claude and Codex only/);
 });

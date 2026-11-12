@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.47.1
+
+### Patch Changes
+
+- 096d543: Support opt-in send_file attachments from Codex caller containers with execution-scoped delivery and backend-specific replay retention.
+
 ## 0.47.0
 
 ### Minor Changes

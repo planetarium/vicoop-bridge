@@ -171,18 +171,24 @@ function receive(m) {
         await new Promise(resolve=>fileServer.listen(0,'127.0.0.1',resolve));
         if(closing)return;
         const url='http://127.0.0.1:'+fileServer.address().port+'/send-file';
-        if (m.backend === 'codex') {
-          const helperArgs=['-e',m.fileDelivery.helper,url,m.fileDelivery.token,m.fileDelivery.description];
-          m.args.push('-c','mcp_servers.vb_send_file.command="/usr/local/bin/node"',
-            '-c','mcp_servers.vb_send_file.args='+JSON.stringify(helperArgs),
-            '-c','mcp_servers.vb_send_file.required=true',
-            '-c','mcp_servers.vb_send_file.enabled_tools=["send_file"]',
-            '-c','mcp_servers.vb_send_file.tools.send_file.approval_mode="approve"');
+        const helperArgs=['-e',m.fileDelivery.helper,url,m.fileDelivery.token,m.fileDelivery.description];
+        if(m.backend==='codex') {
+          // Codex merges CLI tables with persisted config, including transport
+          // fields that cannot be unset through TOML overrides. A fresh reserved
+          // server name avoids inheriting an old URL, tool filter or environment.
+          // Tool name stays send_file; discovery advertises the current namespace.
+          const serverName='_vb-send-file-'+require('node:crypto').randomBytes(12).toString('hex');
+          const serverKey='mcp_servers.'+serverName;
+          // TOML forbids raw DEL, which JSON.stringify leaves unescaped.
+          m.args.push('-c',serverKey+'={command="/usr/local/bin/node",args=['+helperArgs.map(v=>JSON.stringify(v).replace(/\u007f/g,'\\u007f')).join(',')+'],enabled=true}');
+          // Operator opt-in authorizes this bounded export tool even when
+          // remote approvals put the rest of Codex in untrusted mode.
+          m.args.push('-c',serverKey+'.tools.send_file.approval_mode="approve"');
         } else {
           // Replace only the bridge-owned empty strict MCP configuration.
           const index=m.args.indexOf('--mcp-config');
           if(index<0||m.args[index+1]!==JSON.stringify({mcpServers:{}}))return shutdown(1);
-          m.args[index+1]=JSON.stringify({mcpServers:{'_vb-send-file':{command:'/usr/local/bin/node',args:['-e',m.fileDelivery.helper,url,m.fileDelivery.token,m.fileDelivery.description]}}});
+          m.args[index+1]=JSON.stringify({mcpServers:{'_vb-send-file':{command:'/usr/local/bin/node',args:helperArgs}}});
           m.args.push('--allowedTools','mcp___vb-send-file__send_file');
         }
       }

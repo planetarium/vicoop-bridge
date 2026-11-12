@@ -589,7 +589,8 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     exit: (code) => process.exit(code),
   });
 
-  const deliveryRuntime = args.backends?.[args.backend as 'claude' | 'codex']?.caller_runtime;
+  const callerRuntime = args.runtime === 'container'
+    ? args.backends?.[args.backend as 'claude' | 'codex']?.caller_runtime : undefined;
   const client = new Client({
     serverUrl: args.server,
     token: args.token,
@@ -598,8 +599,8 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     backendKind: args.backend,
     backend,
     trustedIdentityIssuers: args.trustedIdentityIssuers,
-    maxPendingBytes: args.runtime === 'container' && deliveryRuntime?.fileDelivery
-      ? callerFilePendingBytes(deliveryRuntime.fileDelivery, (deliveryRuntime.concurrency ? (deliveryRuntime.concurrency.global ?? 8) : deliveryRuntime.maxScopes))
+    maxPendingBytes: callerRuntime?.fileDelivery
+      ? callerFilePendingBytes(callerRuntime.fileDelivery, (callerRuntime.concurrency ? (callerRuntime.concurrency.global ?? 8) : callerRuntime.maxScopes))
       : sendFilePendingBytes(args.claudeSendFile),
     logLevel: logger.level,
     // Daemon entrypoint: a fatal terminal close (currently 4014 "client

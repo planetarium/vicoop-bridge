@@ -9,7 +9,7 @@ principal uses the same container and workspace, with a separate conversation.
 This is opt-in. OpenClaw, unsupported delegation profiles, OpenAI compatibility, caller tools,
 general MCP integration and automatic idle reclamation are not supported in
 this mode. Claude supports opt-in outgoing file delivery through the bridge-owned
-`send_file` helper described below; Codex output remains text-only. The two execution modes are `host` (default) and
+`send_file` helper described below; Codex supports the same opt-in file delivery. The two execution modes are `host` (default) and
 `container` (dedicated per caller); shared-container execution is no longer
 available through the daemon.
 
@@ -525,7 +525,7 @@ bundled descriptions omit host JSON-data support. Custom card descriptions are
 preserved with the container input contract appended, and a custom card with no
 supported input mode is rejected before daemon startup.
 
-Caller cards advertise text-only output unless Claude file delivery is explicitly enabled. Traceability extensions are not advertised, and requests opting into traceability are rejected before allocation because trace artifacts may contain files or structured data. Offline removal/recreation also rejects volumes mounted by another container (including stopped containers) before deleting any resources; detach those consumers before retrying.
+Caller cards advertise text-only output unless file delivery is explicitly enabled for the selected backend. Traceability extensions are not advertised, and requests opting into traceability are rejected before allocation because trace artifacts may contain files or structured data. Offline removal/recreation also rejects volumes mounted by another container (including stopped containers) before deleting any resources; detach those consumers before retrying.
 
 Canceled queued requests return promptly, but their queue slots remain occupied until the preceding request settles. Repeated cancellation cannot bypass the queue bound; new requests may receive `runtime_capacity` while those barriers remain.
 
@@ -602,9 +602,10 @@ VICOOP_SHARED_TEST_IMAGE=sha256:YOUR_CALLER_IMAGE_ID \
 ```
 
 
-## Outgoing files from Claude caller containers
+## Outgoing files from Claude and Codex caller containers
 
-Enable `fileDelivery` under `backends.claude.caller_runtime`:
+Enable `fileDelivery` under `backends.claude.caller_runtime` or
+`backends.codex.caller_runtime` for the selected backend:
 
 ```json
 "fileDelivery": {
@@ -668,12 +669,49 @@ another execution uses the scope. Reconnection uses the existing execution repla
 protocol; a previous execution's helper cannot attach to a later task. Workspace
 files themselves persist and may be explicitly sent again in a later request.
 
-File-enabled Claude cards advertise file output; disabled Claude cards and Codex
-cards remain text-only. Setting `fileDelivery` on Codex fails startup explicitly.
+File-enabled Claude and Codex cards advertise file output; disabled cards remain
+text-only. Codex registers the helper through an execution-only app-server MCP
+configuration override. Every execution, including resume, receives a fresh MCP
+server namespace, endpoint and token so persisted server settings cannot merge
+into the bridge-owned helper. The tool remains named `send_file`; use current
+tool discovery rather than saving its execution-specific namespace. No delivery
+grant is written to persistent Codex configuration.
+Operator opt-in also approves only this bridge-owned `send_file` tool in Codex,
+so it works with `approval_decision: "remote"`. Other tool approval policies
+remain in effect; every file still passes the host's path and budget checks.
 Traceability output and unsupported inputs remain rejected. To migrate from host
 `backends.claude.send_file`, move the export configuration to
 `caller_runtime.fileDelivery`, use container paths, and remove the host-only
 setting. The host setting does not configure container delivery.
+
+Validation commands (run from the repository root after installing and building):
+
+```sh
+# Real installed Codex, native MCP calls and resume; only local mock inference.
+VICOOP_FILE_TEST_IMAGE=sha256:YOUR_CODEX_IMAGE_ID \
+  pnpm exec tsx packages/client/scripts/codex-file-delivery-smoke.ts
+bun build --compile packages/client/scripts/codex-file-delivery-smoke.ts --outfile /tmp/codex-file-smoke
+VICOOP_FILE_TEST_IMAGE=sha256:YOUR_CODEX_IMAGE_ID /tmp/codex-file-smoke
+
+# Compiled production CLI, actual Docker, deterministic backend fixture.
+docker build -f packages/client/scripts/fixtures/caller-backends/Dockerfile -t caller-file-fixture .
+bun build --compile packages/client/src/cli.ts --outfile /tmp/vicoop-client
+VICOOP_CLIENT_BIN=/tmp/vicoop-client VICOOP_SMOKE_IMAGE=sha256:YOUR_FIXTURE_IMAGE_ID \
+  VICOOP_SMOKE_KIND=codex node packages/client/scripts/caller-concurrency-smoke.mjs
+
+# Disposable Postgres, real HTTP A2A consumer and persisted attachment download.
+DATABASE_URL=postgres://USER:PASSWORD@localhost:5432/DISPOSABLE_DATABASE \
+  VICOOP_CLIENT_BIN=/tmp/vicoop-client VICOOP_SMOKE_IMAGE=sha256:YOUR_FIXTURE_IMAGE_ID \
+  pnpm exec tsx packages/server/scripts/codex-file-delivery-smoke.ts
+```
+
+The native smoke exercises real Codex tool registration/calls, model-facing
+tool discovery and namespaced dispatch with synthetic Responses events, path and size
+errors, concurrent callers, disabled delivery, thread resume and process cleanup.
+The compiled-client concurrency and HTTP A2A smokes use a deterministic Codex
+protocol fixture; they do not establish model-selected tool usage. Native Codex
+0.153.4, Docker 27.4.0 and Bun 1.3.14 were checked for this change. The same
+compiled-client concurrency smoke was also run with `VICOOP_SMOKE_KIND=claude`.
 
 For deployments of the unpublished local asset-container variant, replace
 `outgoingFiles` with `fileDelivery` and use the execution-bound `send_file` tool
@@ -909,10 +947,10 @@ old context containers; it never silently adopts a foreign resource. Offline
 `container list` includes retained context keys; `container recreate/remove`
 handles their owned containers/networks as well as the original caller resources.
 
-Claude keeps its existing optional `fileDelivery` support. Concurrent executions
+Claude and Codex support optional `fileDelivery`. Concurrent executions
 use separate bindings, budgets and output snapshots; cancellation cannot rebind
-one execution's helper to a sibling. Codex remains text-output-only; this feature
-does not add Codex outgoing FileParts. Replay retention is sized for `global`
+one execution's helper to a sibling. Both backends deliver inline A2A FileParts
+when file delivery is enabled. Replay retention is sized for `global`
 concurrent attachment batches instead of `maxScopes`. The 512 MiB ceiling still
 applies: the default 24 MiB/file-batch configuration fits 8 slots (about 268 MiB),
 but not 16. Lower `global` or file limits when startup rejects the byte budget.
