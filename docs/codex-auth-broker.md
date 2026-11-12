@@ -157,8 +157,34 @@ must retrieve the bytes and verify the expected contents/hash both before and
 after resume. Check workload environments, mounts, session files and emitted
 artifacts/logs for credentials without printing the key. Record backend/client
 versions and successful gates, and distinguish skipped gates from passed ones.
-Live results are recorded separately by the integration harness; an existing
-historical custom-provider run does not validate this implementation.
+On 2026-11-12, this implementation passed real Azure inference on macOS/Colima
+with Codex **0.153.4**, logical model/deployment `gpt-5.4`, and the Azure v1
+endpoint. The caller-runtime harness verified:
+
+- Native `send_file` produced the exact nine synthetic bytes `00ff80415a5552450a`
+  before and after ordinary conversation resume (SHA-256
+  `199a7981082f950a2aaaa3278d95257a79ca6473272ad5b938dd18d2f44d3132`).
+- Two callers had live shell processes simultaneously, with separate workspaces.
+- Canceling an observed `sleep 90` stopped its container while the other caller
+  remained running. Explicit rejected-grant behavior is covered by broker tests;
+  the live check observes process/container revocation, not token replay.
+- Active workload environments, retained session files, container metadata and
+  A2A frames contained no host provider key.
+- After daemon recreation, workspace bytes remained deliverable. The runtime
+  explicitly reported `conversationReset`; this is **not** durable conversation
+  continuity across a daemon restart.
+
+Reproduce with the protected host provider settings above and a real pinned
+Codex caller image (a fixture that merely reports a version is insufficient):
+
+```sh
+VICOOP_SMOKE_IMAGE=sha256:YOUR_REAL_CALLER_IMAGE_ID \
+  pnpm exec tsx packages/client/scripts/codex-azure-live-smoke.ts
+```
+
+The script performs paid inference and removes only its disposable caller
+state. Its final PASS is emitted after cleanup. Native Linux and direct OpenAI
+API-key inference are not established by this Azure run.
 
 Provider references: [Azure Responses and compaction](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/responses),
 [Azure endpoint and deployment mapping](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/how-to/switching-endpoints).
@@ -245,7 +271,8 @@ It creates and removes a disposable Docker runtime, uses the selected host
 credential for real requests, and checks inference, model discovery, resume,
 tools, concurrency, cancellation cleanup and absent workload login files.
 The same script can be compiled with `bun build --compile`. Actual OAuth was
-tested on macOS with Docker Desktop. Actual API-key inference and native Linux
-host validation remain unverified; mock API-key tests do not replace them.
+tested on macOS with Docker Desktop. Direct OpenAI API-key inference and native Linux
+host validation remain unverified; see the separate Azure evidence above. Mock
+API-key tests do not replace live-provider checks.
 
 Workspace binds must use a separate project directory: paths overlapping the host Claude/Codex credential directories (including configured homes and symlink aliases) are rejected before startup. This check protects known credential locations; operators must still keep unrelated secrets out of shared project files. Runtime labels and volume names must match the requested runtime identity, and shared host/user/IPC namespaces and device requests are rejected.
