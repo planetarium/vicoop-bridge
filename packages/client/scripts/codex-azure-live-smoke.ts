@@ -43,7 +43,7 @@ function text(frames: UpFrame[]) {
     .filter(p => p.kind === 'text').map(p => p.text).join('');
 }
 async function run(principal: string, prompt: string, context = contextId,
-  signal = AbortSignal.timeout(180000)) {
+  signal = AbortSignal.timeout(180000), expectedCancellation = false) {
   const task: TaskAssignFrame = { type: 'task.assign', taskId: randomUUID(), contextId: context,
     executionId: randomUUID(), executionScope: { policy: 'direct-principal-v1', agentId,
       principalId: principal, id: scopeDigest(agentId, principal) },
@@ -53,7 +53,8 @@ async function run(principal: string, prompt: string, context = contextId,
   await backend!.handle(task, f => { frames.push(f); }, signal);
   assert.ok(!JSON.stringify(frames).includes(selected.secret), 'provider credential leaked into A2A frames');
   const terminal = frames.at(-1);
-  if (signal.aborted) {
+  if (expectedCancellation) {
+    assert.ok(signal.aborted, 'expected cancellation was not requested');
     assert.equal(terminal?.type, 'task.fail', 'cancellation must be terminal');
   } else {
     assert.equal(terminal?.type, 'task.complete', 'task failed (provider diagnostics withheld)');
@@ -112,7 +113,7 @@ try {
   assert.match(text(replies[1]), /BOB_PARALLEL/);
   await docker(['exec', bob, 'test', '!', '-e', '/workspace/output/fixture.bin']);
   const controller = new AbortController();
-  const cancellation = run('alice', 'Execute exactly this shell command and wait until it finishes: echo $$ > /workspace/cancel.pid; exec sleep 90', randomUUID(), controller.signal);
+  const cancellation = run('alice', 'Execute exactly this shell command and wait until it finishes: echo $$ > /workspace/cancel.pid; exec sleep 90', randomUUID(), controller.signal, true);
   void cancellation.catch(() => {});
   let pid = '';
   try {
