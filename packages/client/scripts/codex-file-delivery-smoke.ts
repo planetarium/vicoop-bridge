@@ -35,7 +35,13 @@ const adapters: ReturnType<typeof createExecutionBrokerSpawn>[] = [];
 const grants: AbortSignal[] = [];
 const approvalRequests: string[] = [];
 let providerCalls = 0;
+let failProvider!: (error: unknown) => void;
+const providerFailed=new Promise<never>((_,reject)=>{failProvider=reject;});
+// Attach immediately so even an unexpected pre-turn request cannot produce an
+// unhandled rejection. The main turn race below propagates failures to cleanup.
+void providerFailed.catch(()=>{});
 const upstream = createServer(async(req,res)=>{
+  try {
   let body='';for await(const chunk of req)body+=chunk;
   const request=JSON.parse(body);
   providerCalls++;
@@ -66,6 +72,10 @@ const upstream = createServer(async(req,res)=>{
     {type:'response.completed',response},
   ]) res.write('data: '+JSON.stringify(event)+'\n\n');
   res.end();
+  } catch(error) {
+    failProvider(error);
+    res.destroy();
+  }
 });
 upstream.listen(0,'127.0.0.1');await once(upstream,'listening');
 const upstreamUrl='http://127.0.0.1:'+(upstream.address() as {port:number}).port;
@@ -137,6 +147,7 @@ try {
   let turnTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     const outcome=await Promise.race([
+      providerFailed,
       (async()=>{
         await a.rpc.request('turn/start',{threadId:a.threadId,input:[{type:'text',text:'fixture'}]});
         return completed;
