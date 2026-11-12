@@ -67,11 +67,9 @@ bridge translates the allowlisted model to its configured deployment and sends
 POST `/anthropic/v1/messages` or `/anthropic/v1/messages/count_tokens`, with only
 the existing optional `?beta=true` query. Authentication is `x-api-key`, with
 `anthropic-version: 2023-06-01`; there is no Azure OpenAI `api-version` setting on
-this provider path. The header follows the Microsoft REST example; a live
-header probe on 2026-11-12 returned HTTP 401 for `api-key` and HTTP 200 for
-`x-api-key` with the same resource key and deployment. This probe is not a
-completed caller-container integration check. No provider key, endpoint, model map or Foundry environment is
-forwarded to Docker. Claude Code receives the ephemeral grant in
+this provider path. Azure OpenAI uses a different authentication header; do not
+reuse its `api-key` header for Foundry Claude. No provider key, endpoint, model map
+or Foundry environment is forwarded to Docker. Claude Code receives the ephemeral grant in
 `ANTHROPIC_API_KEY` and a loopback `ANTHROPIC_BASE_URL`.
 
 The existing broker strips caller credentials and routing headers, removes the
@@ -102,44 +100,43 @@ pnpm -r typecheck
 pnpm exec tsx --test packages/client/src/claude-auth-broker.test.ts packages/client/src/claude-broker-spawn.test.ts
 ```
 
-**Real Foundry caller-container inference is pending; synthetic success is not
-live-provider evidence.** On 2026-11-12, an authorized attempt to provision an
-Azure-hosted `claude-haiku-4-5` deployment (version 2, GlobalStandard capacity 10)
-on the existing Foundry resource failed at Azure Marketplace eligibility. Azure
-returned `AvailabilityNotInRegion`: the Claude Azure-hosted offer was unavailable
-for the subscription's KR/CSP purchasing context. That attempt created no deployment and made no caller-runtime inference request.
-A later, separately authorized deployment in an eligible subscription succeeded;
-the header probe above reached that deployment, but caller-container acceptance
-is still pending.
-This is a provisioning/billing eligibility blocker, not evidence for or against
-the broker's runtime behavior. Keep the implementation PR in draft until the full caller-container check
-succeeds.
+Real caller-container validation passed on 2026-11-12 using Claude Code **2.1.267**
+and Azure-hosted **Claude Haiku 4.5, version 2**, GlobalStandard capacity 10. The
+selected resource was `A8` in `eastus`, with deployment `issue-581-haiku`;
+`claude-haiku-4-5` and `claude-haiku-4-5-20251001` both mapped to that deployment.
+The pinned image was
+`sha256:6d97bc48841ee31209d662d6aecfee8533f89049fd3bed9959aed40678b28d32`.
+The deployment remains available for operator use.
 
-With the host configuration above, the existing runtime acceptance harness can
-exercise the pinned provider (set the image and a mapped model to your tested
-versions):
+The live harness checks real inference and shell tools, A/B/A conversation resume,
+caller workspace isolation, cancellation of an observed running `sleep` process,
+and restart/recreate workspace persistence with an explicit conversation reset.
+It checks the host key is absent from A2A task frames, captured runtime logs,
+container configuration, active workload environments and session text files.
+Normal task timeouts fail the check; only the explicit cancellation probe may
+terminate with cancellation. The final PASS is emitted after disposable caller
+containers/state have been cleaned up. This harness drives `createCallerRuntime`
+through task frames; it does not claim external HTTP A2A consumer delivery.
+
+With the host configuration above and an image pinned by digest, reproduce it:
 
 ```sh
-VICOOP_SMOKE_KIND=claude \
-VICOOP_SMOKE_IMAGE=your-pinned-caller-image \
-VICOOP_SMOKE_MODEL=claude-sonnet-4-6 \
-pnpm exec tsx packages/client/scripts/caller-provider-smoke.ts
+VICOOP_SMOKE_IMAGE=your-image@sha256:your-image-digest \
+VICOOP_SMOKE_MODEL=claude-haiku-4-5 \
+pnpm exec tsx packages/client/scripts/claude-foundry-live-smoke.ts
 ```
 
-This harness drives caller runtime task frames directly; it does not by itself
-prove external A2A consumer delivery. Before production rollout, use an isolated
-test agent and existing Claude-enabled resource. Record the bridge revision, exact container
-image/Claude version, resource identifier and deployment/model mapping (never the
-key). With the host environment above, initialize the caller runtime, send an A2A
-task asking Claude to write a synthetic nonce to `/workspace/output/foundry.txt`
-and report it, and verify terminal `completed` plus the expected nonce. Resume the
-same conversation and have it read that file. Inspect caller environment and
-artifacts for provider credentials without printing secret values; retain only
-boolean pass/fail results. The workload should see a `vbc_exec_` grant and no
-Foundry key/resource configuration. Test a deliberately wrong key in a separate
-test daemon: it must fail with no direct-provider inference. Restore the real
-host key and restart after the negative test. Keep live result evidence separate
-from mock test counts.
+Use both exact Haiku IDs in the model map for the tested CLI. The API key stays
+only in the host environment; the harness reads it without printing it. The
+synthetic suite separately covers rejected credentials, unmapped models and no
+provider fallback. The live result does not imply support for every admitted CLI,
+Claude model, subscription type or authentication method.
+
+Azure Marketplace eligibility is separate from broker support. The tested A8
+pay-as-you-go subscription accepted this deployment; a KR/CSP subscription rejected
+the same model before deployment. Check the selected subscription's Claude
+purchasing eligibility, and do not infer Claude credit eligibility from Azure
+OpenAI billing.
 
 ## Migration and rollback
 
