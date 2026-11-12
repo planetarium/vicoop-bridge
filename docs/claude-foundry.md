@@ -100,8 +100,20 @@ pnpm exec tsx --test packages/client/src/claude-auth-broker.test.ts packages/cli
 ```
 
 **Real Foundry caller-container inference is pending; synthetic success is not
-live-provider evidence.** Before production rollout, use an isolated test agent
-and existing Claude-enabled resource. Record the bridge revision, exact container
+live-provider evidence.** With the host configuration above, the existing runtime
+acceptance harness can exercise the pinned provider (set the image and a mapped
+model to your tested versions):
+
+```sh
+VICOOP_SMOKE_KIND=claude \
+VICOOP_SMOKE_IMAGE=your-pinned-caller-image \
+VICOOP_SMOKE_MODEL=claude-sonnet-4-6 \
+pnpm exec tsx packages/client/scripts/caller-provider-smoke.ts
+```
+
+This harness drives caller runtime task frames directly; it does not by itself
+prove external A2A consumer delivery. Before production rollout, use an isolated
+test agent and existing Claude-enabled resource. Record the bridge revision, exact container
 image/Claude version, resource identifier and deployment/model mapping (never the
 key). With the host environment above, initialize the caller runtime, send an A2A
 task asking Claude to write a synthetic nonce to `/workspace/output/foundry.txt`
