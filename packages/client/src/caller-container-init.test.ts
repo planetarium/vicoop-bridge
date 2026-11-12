@@ -246,6 +246,7 @@ test('failed image checks preserve config and remove the probe container', async
 test('images with provider environment or anonymous volumes are rejected before execution', async (t) => {
   for (const Config of [
     { Env: ['ANTHROPIC_API_KEY=secret'] },
+    { Env: ['VICOOP_CLAUDE_FOUNDRY_MODEL_MAP=private-mapping'] },
     { Env: ['VICOOP_CODEX_AZURE_ENDPOINT=https://fixture.openai.azure.com/openai/v1'] },
     { Env: ['VICOOP_CODEX_AZURE_MODEL=gpt-5.4'] },
     { Env: ['VICOOP_CODEX_AZURE_DEPLOYMENT=production'] },
