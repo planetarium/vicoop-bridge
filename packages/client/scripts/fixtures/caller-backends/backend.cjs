@@ -24,13 +24,16 @@ let approvalDone;
 async function deliver(result,prompt,done) {
  if(!result)return;
  const configIndex=args.indexOf('--mcp-config');
- const helper=configIndex<0?undefined:JSON.parse(args[configIndex+1]).mcpServers?.['_vb-send-file'];
+ const override=args.find(arg=>/^mcp_servers\._vb-send-file-[a-f0-9]{24}=/.test(arg));
+ const helper=kind==='codex'
+   ? (override ? {args:JSON.parse(override.match(/args=(\[.*\]),enabled=true}/s)[1])} : undefined)
+   : (configIndex<0?undefined:JSON.parse(args[configIndex+1]).mcpServers?.['_vb-send-file']);
  if(helper) {
   fs.mkdirSync('/workspace/output',{recursive:true});
   fs.writeFileSync('/workspace/output/result.bin',result);
   const response=await fetch(helper.args[2],{method:'POST',headers:{authorization:'Bearer '+helper.args[3],'content-type':'application/json'},body:JSON.stringify({path:'/workspace/output/result.bin'})});
   const delivered=await response.json();
-  if(!response.ok || delivered.isError)throw Error('fixture file delivery failed');
+  if(!response.ok || delivered.error)throw Error('fixture file delivery failed');
  }
  if(prompt.includes('approval-task')) {
   await new Promise(resolve=>{
