@@ -746,11 +746,13 @@ or rebuilding the caller image. Add these fields to
 "sharedBinds": [
   { "name": "assets", "source": "/srv/ip-assets" }
 ],
-"systemPrompt": "Search the corpus under /shared/assets. Keep source files unchanged. Write deliverables under /workspace/output. When file delivery is configured, return actual attachments through send_file."
+"operatorInstructions": "Search the corpus under /shared/assets. Keep source files unchanged. Write deliverables under /workspace/output. When file delivery is configured, return actual attachments through send_file."
 ```
 
-`sharedBinds` works for Claude and Codex; `systemPrompt` is Claude-only and is
-rejected for Codex, including during `container init`. Both fields require the
+`sharedBinds` and `operatorInstructions` work for both Claude and Codex,
+including during `container init`. `systemPrompt` remains a compatibility alias
+for `operatorInstructions` on both backends. If both fields are supplied, their
+text must match exactly; conflicting values are rejected. These fields require the
 effective runtime to be `container`; host execution rejects them. The default is no binds
 and no operator prompt. Each bind has exactly `name` and `source`; arbitrary
 mount options, writable binds, custom destinations and remote caller-selected
@@ -804,19 +806,49 @@ To change names, source paths or the mount list:
    containers receive the new mounts on acquisition. Existing data is retained;
    the existing recreation/conversation-reset behavior still applies.
 
-Changing only `systemPrompt` requires a daemon restart, without image rebuild or
-container recreation. It is nonblank text, limited to 64 KiB of UTF-8 and cannot
-contain NUL. The bridge merges it into one staged append-prompt file alongside
-agent identity, caller-context rules and other bridge-generated instructions on
-**every execution**, including resumed sessions and retries. It does not mix
-`--append-system-prompt` with `--append-system-prompt-file`. Operator instructions
-are visible to callers through model behavior; do not put secrets in them.
+Changing only `operatorInstructions` (or its `systemPrompt` alias) requires a
+**daemon restart**, without image rebuild, container recreation, storage reset
+or caller-grant changes. Configuration is read at startup, not watched while the
+daemon runs. Instructions must be nonblank, at most 64 KiB of UTF-8, and NUL-free.
+
+For Claude, the bridge merges the text into one staged append-prompt file alongside
+identity, caller-context rules and other bridge-generated instructions on every
+execution, including resumes and retries. It does not mix `--append-system-prompt`
+with `--append-system-prompt-file`.
+
+For Codex, operator instructions are passed as `developerInstructions`, alongside
+identity/workspace/proxy rules on ordinary A2A tasks and caller-context rules.
+They are also retained on OpenAI-compatible model-endpoint requests, alongside
+the caller's system text (without the A2A identity/workspace rules). The bridge
+sends the composed instructions on `thread/start`. Codex persists them on
+ordinary `thread/resume`. Thread reuse additionally requires the composed
+instructions hash to match; changed or removed instructions start a fresh thread
+rather than relying on an instruction override on resume (Codex 0.153.4 retained
+the old instructions in that case). These instructions do not require `AGENTS.md`,
+host Codex configuration,
+or host credentials in caller storage. Native file-delivery tools remain configured
+by the broker and keep their existing limits.
+
+Ordinary executions within a running daemon resume the same eligible thread with
+the same startup configuration. Restarting the daemon drops its in-memory Codex
+context-to-thread mappings: the next request starts a **new Codex thread**, with
+the new instructions, but retains caller/context workspace files and session
+storage. Do not assume conversational history survives a daemon restart. Removing
+both instruction fields and restarting removes the operator instructions from
+new executions. Operator instructions are visible through model behavior; do not
+put secrets in them. They guide behavior and do not replace enforced authorization.
 
 ### Migrating the asset-agent patch
 
-Retain the local `sharedBinds`/`systemPrompt` fields, check them against the stricter
-validation above, and recreate old containers using the old client/configuration
-before starting the stock client. An older local container may lack the required
+Retain `sharedBinds`. Existing patched Codex `systemPrompt` configurations are
+accepted without changing their text; preferably rename the field to
+`operatorInstructions` (do not leave a conflicting alias). Keep the original
+`stateDirectory`, `fixedImageStorage`, caller grants, mounts and file-delivery
+configuration. Check them against the stricter validation above, and recreate old
+containers using the old client/configuration
+before starting the stock client **only if its mount declarations need migration**.
+A prompt-only migration does not require recreation. An older local container
+may lack the required
 non-recursion/propagation declarations. Preserve its state directory and private
 volumes rather than deleting caller data.
 

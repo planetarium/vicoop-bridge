@@ -1,6 +1,7 @@
 // Real Codex app-server + MCP + Docker reader, with a local synthetic model response (no paid inference).
 // Run with tsx, or bun build --compile this entrypoint. No real provider credentials are used.
 import assert from 'node:assert/strict';
+import { createCodexBackend } from '../src/backends/codex.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { createExecutionBrokerSpawn } from '../src/execution-broker-spawn.js';
 import { createCodexAuthBroker } from '../src/codex-auth-broker.js';
 import { AppServerRpcClient, type AppServerSpawnFn } from '../src/backends/codex-rpc.js';
-import { CallerRuntimeConfig } from '../src/caller-runtime-config.js';
+import { CallerRuntimeConfig, callerOperatorInstructions } from '../src/caller-runtime-config.js';
 import { DockerCallerRuntimePool } from '../src/caller-runtime-docker.js';
 import { scopeDigest } from '../src/caller-runtime-store.js';
 import { createCallerFileDelivery } from '../src/caller-file-delivery.js';
@@ -22,6 +23,7 @@ assert.ok(image, 'Set VICOOP_FILE_TEST_IMAGE to a pinned Node-equipped Codex cal
 const directory = await mkdtemp(join(tmpdir(), 'codex-file-smoke-'));
 const agentId = 'files-' + randomUUID();
 const config = CallerRuntimeConfig.parse({image, stateDirectory:directory,
+  operatorInstructions:'OPERATOR_POLICY_V1: use the supplier skill and reconcile each delivery.',
   fileDelivery:{allowedRoots:['/workspace/output','/workspace/out\u007fput'],maxBytes:32,maxTotalBytes:48,maxFiles:2}});
 const pool = new DockerCallerRuntimePool('codex', config, agentId);
 const frames: UpFrame[] = [];
@@ -46,6 +48,20 @@ const upstream = createServer(async(req,res)=>{
   let body='';for await(const chunk of req)body+=chunk;
   const request=JSON.parse(body);
   providerCalls++;
+  const developer = request.input.filter((item:any)=>item.role==='developer')
+    .map((item:any)=>JSON.stringify(item)).join('\n');
+  if (providerCalls >= 8) {
+    assert.match(developer,/BRIDGE_WORKSPACE_PROXY_CONTRACT/);
+    assert.match(developer,/@supplier@bridge.example/);
+  }
+  if (providerCalls <= 9) {
+    assert.ok(developer.includes(callerOperatorInstructions(config)!),'operator instructions reach fresh model request');
+  } else if (providerCalls === 10) {
+    assert.match(developer,/OPERATOR_POLICY_V2/,'changed instructions reach new model thread');
+    assert.doesNotMatch(developer,/OPERATOR_POLICY_V1/,'new thread excludes stale developer instructions');
+  } else {
+    assert.doesNotMatch(developer,/OPERATOR_POLICY_V[12]/,'new thread omits removed operator instructions');
+  }
   assert.equal(req.headers.authorization,'Bearer fixture-host-only');
   const message={id:'msg_'+randomUUID(),type:'message',role:'assistant',status:'completed',
     content:[{type:'output_text',text:'fixture reply',annotations:[]}]};
@@ -149,7 +165,7 @@ try {
     await rpc.request('initialize',{clientInfo:{name:'file-smoke',version:'1'},capabilities:{experimentalApi:true}});
     rpc.notify('initialized');
     await rpc.authenticateExecution();
-    const thread = await rpc.request<{thread:{id:string}}>(resume ? 'thread/resume' : 'thread/start',{...(resume ? {threadId:resume} : {}),cwd:'/workspace',sandbox:'danger-full-access',approvalPolicy:'untrusted',model:'gpt-5.5'});
+    const thread = await rpc.request<{thread:{id:string}}>(resume ? 'thread/resume' : 'thread/start',{...(resume ? {threadId:resume} : {}),cwd:'/workspace',sandbox:'danger-full-access',approvalPolicy:'untrusted',model:'gpt-5.5',...(!resume ? {developerInstructions:callerOperatorInstructions(config)} : {})});
     // Thread startup can return while MCP reports 'starting', even after
     // tools have been enumerated. Wait for the final state before asserting.
     const inventoryDeadline=Date.now()+10000;
@@ -239,6 +255,45 @@ try {
   const disabled=await start(0,'disabled',false,a.threadId);
   await assert.rejects(disabled.call('/workspace/output/fixture.bin'));
   disabled.rpc.kill();await disabled.rpc.waitForClose();
+  // Exercise the production backend's session reuse guard with a real app-server.
+  let operatorInstructions: string | undefined = callerOperatorInstructions(config);
+  const policyAdapter = createExecutionBrokerSpawn(containers[0].dockerId!, {
+    backend:'codex',ttlMs:60000,
+    createBroker:()=>createCodexAuthBroker({authentication:'api-key',upstream:upstreamUrl,
+      credential:()=>({kind:'api-key',secret:'fixture-host-only'})}),
+  });
+  adapters.push(policyAdapter);
+  const methods:string[]=[];
+  const policyBackend = createCodexBackend({
+    spawn:(command,args,options)=>{
+      const child=policyAdapter.spawn(command,args,options);
+      const write=child.stdin!.write.bind(child.stdin);
+      child.stdin!.write=((chunk:any,...rest:any[])=>{
+        for(const line of String(chunk).trim().split('\n')) {
+          try {const frame=JSON.parse(line);if(['thread/start','thread/resume'].includes(frame.method))methods.push(frame.method);} catch {}
+        }
+        return (write as any)(chunk,...rest);
+      }) as typeof child.stdin.write;
+      return child;
+    },
+    cwd:'/workspace',sandboxMode:'danger-full-access',turnTimeoutMs:30000,
+    appServerArgs:['app-server','-c','model="gpt-5.5"'],
+    get operatorInstructions(){return operatorInstructions;},
+    runtimeInstructions:'BRIDGE_WORKSPACE_PROXY_CONTRACT',
+    identity:{agentId:'supplier',host:'bridge.example',httpOrigin:'https://bridge.example'},
+  });
+  try {
+    for(const policy of [operatorInstructions,operatorInstructions,'OPERATOR_POLICY_V2: updated supplier skill.',undefined]) {
+      operatorInstructions=policy;
+      const output:UpFrame[]=[];
+      await Promise.race([providerFailed,policyBackend.handle({type:'task.assign',taskId:randomUUID(),contextId:'policy-context',
+        message:{role:'user',messageId:randomUUID(),parts:[{kind:'text',text:'fixture'}]}},f=>output.push(f),AbortSignal.timeout(30000))]);
+      assert.equal(output.at(-1)?.type,'task.complete',JSON.stringify(output));
+      await policyBackend.close();
+    }
+    assert.deepEqual(methods,['thread/start','thread/resume','thread/start','thread/start']);
+    assert.equal(providerCalls,11);
+  } finally {await policyBackend.close();}
   assert.ok(providerCalls>0);
   for(const c of containers) {
     const remaining=await docker(['exec',c.dockerId!,'node','-e',`
@@ -250,8 +305,8 @@ try {
     `]);
     assert.equal(remaining,'[]','MCP helper or app-server survived cleanup');
   }
-  console.log(JSON.stringify({result:'PASS',version,runtime:process.versions.bun?'Bun compiled':'Node',
-    checks:['native MCP registration','native tool invocation','model tool search and namespaced dispatch under untrusted approvals','actual file bytes','concurrent callers','path/symlink/size/count errors','disabled delivery','execution grant revocation','process cleanup','native thread resume with persisted conflicting MCP transports and filters','stale namespace rejected and resumed model rediscovers tool','local mock inference only']}));
+  console.log(JSON.stringify({result:'PASS',version,runtime:process.versions.bun?'Bun':'Node',
+    checks:['fresh operator instructions in developer role','ordinary resume preserves operator instructions','changed instructions start a fresh production backend thread','new thread omits removed operator instructions','native MCP registration','native tool invocation','model tool search and namespaced dispatch under untrusted approvals','actual file bytes','concurrent callers','path/symlink/size/count errors','disabled delivery','execution grant revocation','process cleanup','native thread resume with persisted conflicting MCP transports and filters','stale namespace rejected and resumed model rediscovers tool','local mock inference only']}));
 } finally {
   for(const rpc of clients)rpc.kill();
   await Promise.all(clients.map(c=>c.waitForClose()));

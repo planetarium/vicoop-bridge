@@ -622,19 +622,24 @@ test('config writers respect exclusive ownership and compare snapshots before co
 });
 
 
-test('operator prompt is preserved for Claude and rejected for Codex or invalid text', async t => {
+test('operator instructions and legacy alias are accepted for both caller backends', async t => {
+  const { CallerRuntimeConfig, callerOperatorInstructions } = await import('./caller-runtime-config.js');
   const dir = mkdtempSync(join(tmpdir(), 'prompt-config-'));
   t.after(() => rmSync(dir,{recursive:true,force:true}));
   const path = join(dir,'config.json');
-  const caller_runtime = {image:`sha256:${'a'.repeat(64)}`,stateDirectory:join(dir,'state'),systemPrompt:'Search /shared/assets.'};
-  writeFileSync(path,JSON.stringify({backends:{claude:{runtime:'container',caller_runtime}}}));
-  assert.equal(readConfig(path)?.backends?.claude?.caller_runtime?.systemPrompt,caller_runtime.systemPrompt);
-  writeFileSync(path,JSON.stringify({backends:{codex:{runtime:'container',caller_runtime}}}));
-  assert.throws(()=>readConfig(path),/supported only for Claude/);
-  const {createCallerRuntime} = await import('./caller-runtime.js');
-  await assert.rejects(createCallerRuntime({kind:'codex',agentId:'test',config:caller_runtime}),/supported only for Claude/);
-  for (const systemPrompt of ['', '   ', 'bad\0text', 'a'.repeat(65537), '가'.repeat(22000)]) {
-    writeFileSync(path,JSON.stringify({backends:{claude:{caller_runtime:{...caller_runtime,systemPrompt}}}}));
-    assert.throws(()=>readConfig(path));
+  const base = {image:`sha256:${'a'.repeat(64)}`,stateDirectory:join(dir,'state')};
+  for (const kind of ['claude','codex'] as const) {
+    for (const field of ['operatorInstructions','systemPrompt'] as const) {
+      const caller_runtime = {...base,[field]:'Search /shared/assets.'};
+      writeFileSync(path,JSON.stringify({backends:{[kind]:{runtime:'container',caller_runtime}}}));
+      assert.equal(callerOperatorInstructions(readConfig(path)!.backends![kind]!.caller_runtime!), 'Search /shared/assets.');
+      for (const text of ['', '   ', 'bad\0text', 'a'.repeat(65537), '가'.repeat(22000)]) {
+        writeFileSync(path,JSON.stringify({backends:{[kind]:{caller_runtime:{...base,[field]:text}}}}));
+        assert.throws(()=>readConfig(path));
+      }
+    }
   }
+  assert.equal(callerOperatorInstructions(CallerRuntimeConfig.parse({...base,
+    operatorInstructions:'same',systemPrompt:'same'})), 'same');
+  assert.throws(()=>CallerRuntimeConfig.parse({...base,operatorInstructions:'new',systemPrompt:'old'}), /must match/);
 });

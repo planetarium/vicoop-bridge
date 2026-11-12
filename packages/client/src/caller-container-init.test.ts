@@ -749,3 +749,20 @@ test('container init accepts and preserves agent-wide Claude deny settings', asy
   assert.equal(config.backends.claude.runtime, 'container');
   assert.equal(f.auth(), 1);
 });
+
+for (const field of ['operatorInstructions', 'systemPrompt']) {
+  test(`Codex initialization and reinitialization preserve ${field} and caller storage`, async t => {
+    const f = await fixture(t);
+    const initial = await f.read();
+    initial.backends = {codex:{caller_runtime:{[field]:'Use the supplier skill.'}}};
+    await writeFile(f.path, JSON.stringify(initial));
+    await runCallerContainerInit({...f.options,kind:'codex',image});
+    const before = (await f.read()).backends.codex.caller_runtime;
+    assert.equal(before[field], 'Use the supplier skill.');
+    await runCallerContainerInit({...f.options,kind:'codex'});
+    const after = (await f.read()).backends.codex.caller_runtime;
+    assert.equal(after[field], before[field]);
+    assert.equal(after.stateDirectory, before.stateDirectory);
+    assert.deepEqual(after.fixedImageStorage, before.fixedImageStorage);
+  });
+}

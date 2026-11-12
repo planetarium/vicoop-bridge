@@ -1,5 +1,5 @@
 import { currentApprovalRequester, type RequestApproval } from '../remote-approval.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -123,7 +123,9 @@ export interface CodexBackendOptions {
   // endpoint, not an A2A agent, there). Carries through `thread/resume`
   // because codex persists `developerInstructions` server-side per thread.
   identity?: AgentIdentity;
-  /** Bridge-owned runtime workspace contract, applied to plain A2A threads. */
+  /** Operator-owned instructions, also retained for model-endpoint requests. */
+  operatorInstructions?: string;
+  /** Bridge-owned workspace/proxy instructions, applied to plain A2A threads. */
   runtimeInstructions?: string;
 }
 
@@ -132,8 +134,9 @@ interface SessionEntry {
   lastUsedAt: number;
   writeId: number;
   // developerInstructions persist with a codex thread. Reuse is therefore
-  // safe only while the exact caller block is unchanged.
+  // safe only while both caller attribution and composed instructions match.
   callerKey: string;
+  instructionsKey: string;
 }
 
 const DEFAULT_HEARTBEAT_MS = HEARTBEAT_INTERVAL_MS;
@@ -1148,9 +1151,9 @@ export function createCodexBackend(
         // the directive because that's the actual a2a-agent surface the
         // mention can land on.
         const systemPrompt = appendCallerContextInstruction(
-          envelope
+          [opts.operatorInstructions, envelope
             ? composeNativeDevInstructions(envelopeSystem, envelopeToolChoice)
-            : identityDevInstructions,
+            : identityDevInstructions].filter(Boolean).join('\n\n'),
           task.caller,
         );
 
@@ -1265,8 +1268,9 @@ export function createCodexBackend(
           const tNow = now();
           if (sessionReuseEligible) evictExpired(tNow - sessionTtlMs);
           const callerKey = callerContextSessionKey(task.caller);
+          const instructionsKey = createHash('sha256').update(systemPrompt ?? '').digest('hex');
           const stored = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
-          const existing = stored?.callerKey === callerKey ? stored : undefined;
+          const existing = stored?.callerKey === callerKey && stored.instructionsKey === instructionsKey ? stored : undefined;
           let writeId = 0;
           if (sessionReuseEligible) {
             writeId = ++writeCounter;
@@ -1276,6 +1280,7 @@ export function createCodexBackend(
                 lastUsedAt: tNow,
                 writeId,
                 callerKey,
+                instructionsKey,
               });
             }
           }
@@ -1291,6 +1296,7 @@ export function createCodexBackend(
                 lastUsedAt: existing.lastUsedAt,
                 writeId: ++writeCounter,
                 callerKey,
+                instructionsKey,
               });
             }
           };
@@ -1308,9 +1314,11 @@ export function createCodexBackend(
             status: { state: 'working', timestamp: new Date().toISOString() },
           });
 
-          // For resumes we re-attach to the existing thread; sandbox and
-          // any developerInstructions set on initial `thread/start` carry
-          // over via the server-side session record. Feature-flag overrides
+          // Codex persists developerInstructions from thread/start. Resume
+          // does not reliably replace them (verified on 0.153.4), so reuse is
+          // gated on the full composed instructions hash above. Changes start
+          // a fresh thread without touching caller files or grants.
+          // Feature-flag overrides
           // (see `featuresOverride` below) are the exception — they do NOT
           // persist across resume and must be re-sent every turn that wants
           // them. `environments`, by contrast, IS sticky on `thread/start`
@@ -1456,6 +1464,7 @@ export function createCodexBackend(
                   lastUsedAt: now(),
                   writeId,
                   callerKey,
+                  instructionsKey,
                 });
               }
             }
@@ -1920,6 +1929,7 @@ export function createCodexBackend(
                 lastUsedAt: now(),
                 writeId,
                 callerKey,
+                instructionsKey,
               });
             }
           }
