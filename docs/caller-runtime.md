@@ -946,8 +946,8 @@ handles their owned containers/networks as well as the original caller resources
 
 Claude and Codex support optional `fileDelivery`. Concurrent executions
 use separate bindings, budgets and output snapshots; cancellation cannot rebind
-one execution's helper to a sibling. Codex remains text-output-only; this feature
-does not add Codex outgoing FileParts. Replay retention is sized for `global`
+one execution's helper to a sibling. Both backends deliver inline A2A FileParts
+when file delivery is enabled. Replay retention is sized for `global`
 concurrent attachment batches instead of `maxScopes`. The 512 MiB ceiling still
 applies: the default 24 MiB/file-batch configuration fits 8 slots (about 268 MiB),
 but not 16. Lower `global` or file limits when startup rejects the byte budget.
