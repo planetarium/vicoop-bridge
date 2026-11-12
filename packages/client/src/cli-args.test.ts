@@ -689,13 +689,14 @@ test('retired runtime-name CLI flag is rejected in host mode while stale config 
 
 test('asset mounts and operator prompts require their supported effective runtime', () => {
   const base = {image:`sha256:${'a'.repeat(64)}`,stateDirectory:'/private/caller-state'};
-  for (const extra of [{systemPrompt:'Search assets.'}, {sharedBinds:[{name:'assets',source:'/srv/assets'}]}]) {
+  for (const extra of [{operatorInstructions:'Search assets.'}, {systemPrompt:'Search assets.'}, {sharedBinds:[{name:'assets',source:'/srv/assets'}]}]) {
     const config = {backends:{claude:{caller_runtime:{...base,...extra}}}};
     assert.equal(mergeClientArgs({token:'t',agentId:'a',backend:'claude'},config).ok,false);
     assert.equal(mergeClientArgs({token:'t',agentId:'a',backend:'claude',runtime:'container'},config).ok,true);
   }
-  const config = {backends:{codex:{runtime:'container' as const,caller_runtime:{...base,systemPrompt:'Unsupported'}}}};
-  const result = mergeClientArgs({token:'t',agentId:'a',backend:'codex'},config);
-  assert.equal(result.ok,false);
-  if (!result.ok) assert.ok(result.errors.some(error=>error.includes('supported only for Claude')));
+  for (const field of ['operatorInstructions','systemPrompt']) {
+    const config = {backends:{codex:{runtime:'container' as const,caller_runtime:{...base,[field]:'Search assets.'}}}};
+    assert.equal(mergeClientArgs({token:'t',agentId:'a',backend:'codex'},config).ok,true);
+    assert.equal(mergeClientArgs({token:'t',agentId:'a',backend:'codex',runtime:'host'},config).ok,false);
+  }
 });

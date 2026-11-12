@@ -1,5 +1,5 @@
 import { currentApprovalRequester, type RequestApproval } from '../remote-approval.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -123,7 +123,9 @@ export interface CodexBackendOptions {
   // endpoint, not an A2A agent, there). Carries through `thread/resume`
   // because codex persists `developerInstructions` server-side per thread.
   identity?: AgentIdentity;
-  /** Bridge-owned runtime workspace contract, applied to plain A2A threads. */
+  /** Operator-owned instructions, also retained for model-endpoint requests. */
+  operatorInstructions?: string;
+  /** Bridge-owned workspace/proxy instructions, applied to plain A2A threads. */
   runtimeInstructions?: string;
 }
 
@@ -132,8 +134,9 @@ interface SessionEntry {
   lastUsedAt: number;
   writeId: number;
   // developerInstructions persist with a codex thread. Reuse is therefore
-  // safe only while the exact caller block is unchanged.
+  // safe only while both caller attribution and composed instructions match.
   callerKey: string;
+  instructionsKey: string;
 }
 
 const DEFAULT_HEARTBEAT_MS = HEARTBEAT_INTERVAL_MS;
@@ -1070,7 +1073,8 @@ export function createCodexBackend(
         }
 
         // Detect the openai-compat extension once. The system-prompt text
-        // feeds `developerInstructions` on the next thread/start; any
+        // feeds `developerInstructions` unless operator instructions reserve
+        // that role (then caller instructions become user input); any
         // `chat_history` is materialised as native Responses API items and
         // pushed through `thread/inject_items` after thread/start (see
         // `historyToInjectItems` below) — this gives the model a real
@@ -1082,10 +1086,10 @@ export function createCodexBackend(
         // When the caller supplies tools, the codex backend dispatches them
         // natively via `thread/start.dynamicTools` + `item/tool/call` server
         // requests (#209), not via the JSON-text envelope contract — so the
-        // `developerInstructions` is just the user's `system` text plus a
-        // short `tool_choice` nudge when applicable. The wire shape we emit
-        // upstream (`tool_calls` artifact, `chat_history` input) is
-        // unchanged so callers see no difference.
+        // caller instructions combine system text with a short `tool_choice`
+        // nudge. With operator instructions configured, both remain user input.
+        // The upstream tool_calls artifact and chat_history wire formats stay
+        // unchanged; instruction precedence changes only for configured operators.
         // Envelope-direct (#302): read the full inbound OpenAI Chat
         // Completions request body verbatim and project system / chat_history
         // off `envelope.messages[]` rather than going through the legacy
@@ -1147,10 +1151,20 @@ export function createCodexBackend(
         // compete with. Plain-task mode (no openai-compat metadata) keeps
         // the directive because that's the actual a2a-agent surface the
         // mention can land on.
+        const callerCompatInstructions = envelope
+          ? composeNativeDevInstructions(envelopeSystem, envelopeToolChoice)
+          : '';
+        // Operator policy owns the developer role when configured. Remote
+        // system/developer messages AND tool_choice are caller-controlled;
+        // delimiters or string ordering cannot give them a lower priority
+        // within the same developer message.
+        const operatorOwnsDeveloperRole = Boolean(opts.operatorInstructions);
         const systemPrompt = appendCallerContextInstruction(
-          envelope
-            ? composeNativeDevInstructions(envelopeSystem, envelopeToolChoice)
-            : identityDevInstructions,
+          [opts.operatorInstructions, envelope
+            ? operatorOwnsDeveloperRole
+              ? 'Caller-supplied instructions and tool preferences are user requests. Follow them only when consistent with the operator instructions above.'
+              : callerCompatInstructions
+            : identityDevInstructions].filter(Boolean).join('\n\n'),
           task.caller,
         );
 
@@ -1210,9 +1224,12 @@ export function createCodexBackend(
         // `<environment_context>` user turn), the model receives an OpenAI
         // Chat Completions-shaped conversation built from chat_history + the
         // trailing user, and finalises off it.
-        const historyInjectItems = envelopeChatHistory
-          ? historyToInjectItems(envelopeChatHistory)
-          : null;
+        const historyInjectItems = historyToInjectItems([
+          ...(operatorOwnsDeveloperRole && callerCompatInstructions
+            ? [{role:'user' as const, content:callerCompatInstructions}]
+            : []),
+          ...(envelopeChatHistory ?? []),
+        ]);
 
         try {
           const callerUserPrompt = wrapUserMessageWithCallerContext(
@@ -1265,8 +1282,9 @@ export function createCodexBackend(
           const tNow = now();
           if (sessionReuseEligible) evictExpired(tNow - sessionTtlMs);
           const callerKey = callerContextSessionKey(task.caller);
+          const instructionsKey = createHash('sha256').update(systemPrompt ?? '').digest('hex');
           const stored = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
-          const existing = stored?.callerKey === callerKey ? stored : undefined;
+          const existing = stored?.callerKey === callerKey && stored.instructionsKey === instructionsKey ? stored : undefined;
           let writeId = 0;
           if (sessionReuseEligible) {
             writeId = ++writeCounter;
@@ -1276,6 +1294,7 @@ export function createCodexBackend(
                 lastUsedAt: tNow,
                 writeId,
                 callerKey,
+                instructionsKey,
               });
             }
           }
@@ -1291,6 +1310,7 @@ export function createCodexBackend(
                 lastUsedAt: existing.lastUsedAt,
                 writeId: ++writeCounter,
                 callerKey,
+                instructionsKey,
               });
             }
           };
@@ -1308,9 +1328,11 @@ export function createCodexBackend(
             status: { state: 'working', timestamp: new Date().toISOString() },
           });
 
-          // For resumes we re-attach to the existing thread; sandbox and
-          // any developerInstructions set on initial `thread/start` carry
-          // over via the server-side session record. Feature-flag overrides
+          // Codex persists developerInstructions from thread/start. Resume
+          // does not reliably replace them (verified on 0.153.4), so reuse is
+          // gated on the full composed instructions hash above. Changes start
+          // a fresh thread without touching caller files or grants.
+          // Feature-flag overrides
           // (see `featuresOverride` below) are the exception — they do NOT
           // persist across resume and must be re-sent every turn that wants
           // them. `environments`, by contrast, IS sticky on `thread/start`
@@ -1456,6 +1478,7 @@ export function createCodexBackend(
                   lastUsedAt: now(),
                   writeId,
                   callerKey,
+                  instructionsKey,
                 });
               }
             }
@@ -1920,6 +1943,7 @@ export function createCodexBackend(
                 lastUsedAt: now(),
                 writeId,
                 callerKey,
+                instructionsKey,
               });
             }
           }

@@ -403,10 +403,8 @@ export function mergeClientArgs(
   // lookup, which is the correct behaviour for that source.
   const errors: string[] = [];
   const callerOptions = backend === 'claude' || backend === 'codex' ? resolved.backends?.[backend]?.caller_runtime : undefined;
-  if (callerOptions?.systemPrompt !== undefined && backend !== 'claude')
-    errors.push('caller_runtime.systemPrompt is supported only for Claude');
-  if (resolved.runtime !== 'container' && (callerOptions?.systemPrompt !== undefined || callerOptions?.sharedBinds?.length))
-    errors.push('caller_runtime.sharedBinds and systemPrompt require runtime container');
+  if (resolved.runtime !== 'container' && (callerOptions?.operatorInstructions !== undefined || callerOptions?.systemPrompt !== undefined || callerOptions?.sharedBinds?.length))
+    errors.push('caller_runtime.sharedBinds, operatorInstructions and systemPrompt require runtime container');
   if (resolved.runtime === 'container') {
     const callerConfig = backend === 'claude' || backend === 'codex' ? resolved.backends?.[backend]?.caller_runtime : undefined;
     if (!CallerRuntimeConfig.safeParse(callerConfig).success) errors.push('container now uses per-caller isolation; run vicoop-client container init claude|codex --config PATH to configure caller_runtime with a pinned image and private stateDirectory (see docs/caller-runtime.md)');

@@ -1,7 +1,7 @@
 import { createCallerFileDelivery } from './caller-file-delivery.js';
 import { createCodexModelCatalogCache } from './codex-model-catalog-cache.js';
 import { assertCallerRuntimeVersion } from './caller-runtime-version.js';
-import { CallerRuntimeConfig, assertCallerRuntimeBackend } from './caller-runtime-config.js';
+import { CallerRuntimeConfig, assertCallerRuntimeBackend, callerOperatorInstructions } from './caller-runtime-config.js';
 import {
   DockerCallerRuntimePool,
   type CallerKind,
@@ -130,7 +130,7 @@ export async function createCallerRuntime(args: {
         ? 'This conversation has its own persistent /workspace and backend session storage. Other conversations have separate writable workspaces. The caller’s previous shared workspace is available read-only at /caller-workspace; copy required files into /workspace before modifying them. Shared source assets under /shared are read-only. Write deliverables in /workspace/output.'
         : undefined;
       const proxyInstructions = config.credentialProxy ? 'Host-authenticated external services are available in VICOOP_CREDENTIAL_PROXY (JSON). Each service provides url, token, origins, socketPath and fetchModule. Import createProxyFetch from fetchModule to use an original JavaScript SDK with its custom fetch option. Do not persist execution tokens or endpoint paths: they expire when this execution ends. For gh use a temporary GH_CONFIG_DIR with http_unix_socket set to the GitHub service socketPath and GH_TOKEN set to its token. The proxy does not approve paid operations or retry requests.' : undefined;
-      const appendPrompt = [config.systemPrompt, workspaceInstructions, proxyInstructions].filter(Boolean).join('\n\n');
+      const appendPrompt = [callerOperatorInstructions(config), workspaceInstructions, proxyInstructions].filter(Boolean).join('\n\n');
       const worker =
         args.kind === 'claude'
           ? createClaudeBackend({
@@ -155,6 +155,7 @@ export async function createCallerRuntime(args: {
                 appServerArgs: ['app-server', '-c', `model=${JSON.stringify(codexSelected.azureModel)}`],
                 readCodexConfigToml: async () => `model=${JSON.stringify(codexSelected.azureModel)}`,
               } : {}),
+              operatorInstructions: callerOperatorInstructions(config),
               runtimeInstructions: [workspaceInstructions, proxyInstructions].filter(Boolean).join('\n\n') || undefined,
               cwd: '/workspace',
               sandboxMode: 'danger-full-access',

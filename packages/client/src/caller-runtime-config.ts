@@ -3,6 +3,17 @@ import { z } from 'zod';
 import { isAbsolute, posix } from 'node:path';
 import { CredentialProxyConfig } from './credential-proxy-config.js';
 
+const OperatorInstructions = z.string().refine(value => value.trim().length > 0 &&
+  !value.includes('\0') && Buffer.byteLength(value, 'utf8') <= 64 * 1024,
+  'operator instructions must be nonblank, NUL-free and at most 64 KiB');
+
+type OperatorInstructionOptions = { operatorInstructions?: string; systemPrompt?: string };
+
+/** systemPrompt is the compatibility spelling used by older deployments. */
+export function callerOperatorInstructions(config: OperatorInstructionOptions): string | undefined {
+  return config.operatorInstructions ?? config.systemPrompt;
+}
+
 export const CallerRuntimeConfig = z
   .object({
     image: z
@@ -22,9 +33,8 @@ export const CallerRuntimeConfig = z
     }).strict()).max(16).default([])
       .refine(entries => new Set(entries.map(entry => entry.name)).size === entries.length, 'shared bind names must be unique')
       .refine(entries => new Set(entries.map(entry => entry.source)).size === entries.length, 'shared bind sources must be unique'),
-    systemPrompt: z.string().refine(value => value.trim().length > 0 &&
-      !value.includes('\0') && Buffer.byteLength(value, 'utf8') <= 64 * 1024,
-    'systemPrompt must be nonblank, NUL-free and at most 64 KiB').optional(),
+    operatorInstructions: OperatorInstructions.optional(),
+    systemPrompt: OperatorInstructions.optional(),
     // Operator-owned plain Docker volumes, shared by all callers of this agent.
     sharedVolumes: z.array(z.object({
       name: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/),
@@ -63,6 +73,10 @@ export const CallerRuntimeConfig = z
   })
   .strict()
   .superRefine((config, context) => {
+    if (config.operatorInstructions !== undefined && config.systemPrompt !== undefined &&
+        config.operatorInstructions !== config.systemPrompt)
+      context.addIssue({ code: 'custom', path: ['operatorInstructions'],
+        message: 'operatorInstructions and systemPrompt must match when both are set' });
     if (config.concurrency && !config.fixedImageStorage)
       context.addIssue({ code: z.ZodIssueCode.custom, path: ['concurrency'],
         message: 'concurrency requires fixedImageStorage for a shared enforced caller storage budget' });
@@ -76,7 +90,7 @@ export const CallerRuntimeConfig = z
     config.sharedVolumes.length + config.sharedBinds.length, 'shared mount targets must be unique across volumes and binds');
 export type CallerRuntimeOptions = z.infer<typeof CallerRuntimeConfig>;
 
-export function assertCallerRuntimeBackend(kind: string, config: { systemPrompt?: unknown }): void {
-  if (kind !== 'claude' && config.systemPrompt !== undefined)
-    throw new Error('caller_runtime.systemPrompt is supported only for Claude');
+export function assertCallerRuntimeBackend(kind: string, config: OperatorInstructionOptions): void {
+  if (kind !== 'claude' && kind !== 'codex' && callerOperatorInstructions(config) !== undefined)
+    throw new Error('caller_runtime operator instructions are supported only for Claude and Codex');
 }
