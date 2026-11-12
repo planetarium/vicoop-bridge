@@ -24,7 +24,7 @@ let approvalDone;
 async function deliver(result,prompt,done) {
  if(!result)return;
  const configIndex=args.indexOf('--mcp-config');
- const override=args.find(arg=>arg.startsWith('mcp_servers._vb-send-file='));
+ const override=args.find(arg=>/^mcp_servers\._vb-send-file-[a-f0-9]{24}=/.test(arg));
  const helper=kind==='codex'
    ? (override ? {args:JSON.parse(override.match(/args=(\[.*\]),enabled=true}/s)[1])} : undefined)
    : (configIndex<0?undefined:JSON.parse(args[configIndex+1]).mcpServers?.['_vb-send-file']);

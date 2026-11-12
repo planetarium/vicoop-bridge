@@ -82,7 +82,7 @@ function fileAdapter(kind: 'claude' | 'codex', fileDelivery: NonNullable<Paramet
 
 const helperLookup = String.raw`
 const args=process.argv.slice(1);
-const override=args.find(a=>a.startsWith('mcp_servers._vb-send-file='));
+const override=args.find(a=>/^mcp_servers\._vb-send-file-[a-f0-9]{24}=/.test(a));
 const helper=override
   ? {args:JSON.parse(override.match(/args=(\[.*\]),enabled=true}/s)[1])}
   : JSON.parse(args[args.indexOf('--mcp-config')+1]).mcpServers['_vb-send-file'];
@@ -107,7 +107,8 @@ for (const kind of ['claude','codex'] as const) test(`real ${kind} relay injects
       assert.ok(helper.args[4].endsWith(String.fromCharCode(127)));
       if(override){
         assert.ok(!override.includes(String.fromCharCode(127)));
-        assert.ok(args.includes('mcp_servers._vb-send-file.tools.send_file.approval_mode="approve"'));
+        const serverKey=override.split('=')[0];
+        assert.ok(args.includes(serverKey+'.tools.send_file.approval_mode="approve"'));
       }
       const p=spawn(process.execPath,helper.args,{stdio:['pipe','pipe','inherit']});
       let text='';p.stdout.on('data',chunk=>{text+=chunk;const lines=text.split('\\n');text=lines.pop();for(const l of lines){if(!l)continue;const r=JSON.parse(l);

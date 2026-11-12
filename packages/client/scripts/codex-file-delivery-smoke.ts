@@ -35,6 +35,7 @@ const adapters: ReturnType<typeof createExecutionBrokerSpawn>[] = [];
 const grants: AbortSignal[] = [];
 const approvalRequests: string[] = [];
 let providerCalls = 0;
+let firstNamespace: string | undefined;
 let failProvider!: (error: unknown) => void;
 const providerFailed=new Promise<never>((_,reject)=>{failProvider=reject;});
 // Attach immediately so even an unexpected pre-turn request cannot produce an
@@ -51,15 +52,26 @@ const upstream = createServer(async(req,res)=>{
   // Drive the real model-facing deferred MCP surface, including discovery.
   // Calling mcpServer/tool/call directly cannot prove that this surface works.
   let output: object=message;
-  if(providerCalls===1) {
+  if(providerCalls===4) {
+    output={type:'function_call',id:'fc_stale',call_id:'call_stale',name:'send_file',namespace:firstNamespace,
+      arguments:JSON.stringify({path:'/workspace/output/fixture.bin'}),status:'completed'};
+  } else if(providerCalls===1 || providerCalls===5) {
+    if(providerCalls===5) {
+      assert.equal(frames.length,4,'stale namespace must not emit');
+      const result=request.input.findLast((i:any)=>i.type==='function_call_output' && i.call_id==='call_stale');
+      assert.ok(result, 'stale dispatch must produce a tool error');
+      assert.match(JSON.stringify(result.output),/unsupported call/);
+    }
     assert.ok(request.tools.some((t:any)=>t.type==='tool_search'));
-    output={type:'tool_search_call',id:'search_fixture',call_id:'search_fixture',
+    output={type:'tool_search_call',id:'search_fixture_'+providerCalls,call_id:'search_fixture_'+providerCalls,
       execution:'client',arguments:{query:'send_file',limit:1},status:'completed'};
-  } else if(providerCalls===2) {
+  } else if(providerCalls===2 || providerCalls===6) {
     const search=request.input.findLast((i:any)=>i.type==='tool_search_output');
     const namespace=search.tools.find((t:any)=>t.tools?.some((tool:any)=>tool.name==='send_file'));
     assert.ok(namespace,'model must discover send_file');
-    output={type:'function_call',id:'fc_fixture',call_id:'call_fixture',name:'send_file',
+    if(providerCalls===2) firstNamespace=namespace.name;
+    else assert.notEqual(namespace.name,firstNamespace,'rediscovery must find new namespace');
+    output={type:'function_call',id:'fc_fixture_'+providerCalls,call_id:'call_fixture_'+providerCalls,name:'send_file',
       namespace:namespace.name,arguments:JSON.stringify({path:'/workspace/output/fixture.bin'}),status:'completed'};
   }
   const response={id:'resp_'+randomUUID(),object:'response',model:'gpt-5.5',
@@ -79,6 +91,30 @@ const upstream = createServer(async(req,res)=>{
 });
 upstream.listen(0,'127.0.0.1');await once(upstream,'listening');
 const upstreamUrl='http://127.0.0.1:'+(upstream.address() as {port:number}).port;
+async function runModelTurn(rpc:AppServerRpcClient,threadId:string,text:string) {
+  let unsubscribe=()=>{};
+  const completed=new Promise<any>(resolve=>{
+    unsubscribe=rpc.onNotification((method,params)=>{
+      if(method==='turn/completed')resolve(params);
+    });
+  });
+  let timer:ReturnType<typeof setTimeout>|undefined;
+  try {
+    const outcome=await Promise.race([
+      providerFailed,
+      (async()=>{
+        await rpc.request('turn/start',{threadId,input:[{type:'text',text}]});
+        return completed;
+      })(),
+      rpc.waitForClose().then(()=>{throw Error('Codex closed before turn completion');}),
+      new Promise<never>((_,reject)=>{
+        timer=setTimeout(()=>reject(Error('Codex turn completion timed out')),30000);
+      }),
+    ]);
+    assert.equal(outcome.turn.status,'completed');
+  } finally {clearTimeout(timer);unsubscribe();}
+}
+
 try {
   await pool.initialize();
   const containers = await Promise.all(['alice','bob'].map(p=>pool.acquire(scopeDigest(agentId,p),undefined,p)));
@@ -114,14 +150,22 @@ try {
     rpc.notify('initialized');
     await rpc.authenticateExecution();
     const thread = await rpc.request<{thread:{id:string}}>(resume ? 'thread/resume' : 'thread/start',{...(resume ? {threadId:resume} : {}),cwd:'/workspace',sandbox:'danger-full-access',approvalPolicy:'untrusted',model:'gpt-5.5'});
-    const inventory = await rpc.request<any>('mcpServerStatus/list',{threadId:thread.thread.id});
-    const server = inventory.data.find((s:any)=>s.name==='_vb-send-file');
+    // Thread startup can return while MCP reports 'starting', even after
+    // tools have been enumerated. Wait for the final state before asserting.
+    const inventoryDeadline=Date.now()+10000;
+    let inventory:any,server:any;
+    do {
+      inventory=await rpc.request<any>('mcpServerStatus/list',{threadId:thread.thread.id});
+      server=inventory.data.find((s:any)=>/^_vb-send-file-[a-f0-9]{24}$/.test(s.name) && s.runtimeStatus==='connected');
+      if(!enabled || server || Date.now()>=inventoryDeadline)break;
+      await new Promise(resolve=>setTimeout(resolve,25));
+    } while(true);
     assert.equal(Boolean(server),enabled,JSON.stringify(inventory));
     if(enabled) assert.ok(Object.values(server.tools).some((t:any)=>t.name==='send_file'),JSON.stringify(server));
     const call = (path:string) => rpc.request<any>('mcpServer/tool/call',{
-      threadId:thread.thread.id,server:'_vb-send-file',tool:'send_file',arguments:{path},
+      threadId:thread.thread.id,server:server?.name ?? '_vb-send-file',tool:'send_file',arguments:{path},
     });
-    return {rpc,files,call,signal,threadId:thread.thread.id};
+    return {rpc,files,call,signal,threadId:thread.thread.id,serverName:server?.name};
   }
   const [a,b] = await Promise.all([start(0,'alice-task'),start(1,'bob-task')]);
   for (const path of ['/workspace/private','/workspace/output/link','/workspace/output/large']) {
@@ -138,27 +182,7 @@ try {
       Buffer.from([0,255,128,f.taskId==='alice-task'?0:1]));
   }
   // A completed turn persists a real rollout so the next app-server can resume.
-  let unsubscribe=()=>{};
-  const completed=new Promise<any>(resolve=>{
-    unsubscribe=a.rpc.onNotification((method,params)=>{
-      if(method==='turn/completed')resolve(params);
-    });
-  });
-  let turnTimer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const outcome=await Promise.race([
-      providerFailed,
-      (async()=>{
-        await a.rpc.request('turn/start',{threadId:a.threadId,input:[{type:'text',text:'fixture'}]});
-        return completed;
-      })(),
-      a.rpc.waitForClose().then(()=>{throw Error('Codex closed before turn completion');}),
-      new Promise<never>((_,reject)=>{
-        turnTimer=setTimeout(()=>reject(Error('Codex turn completion timed out')),30000);
-      }),
-    ]);
-    assert.equal(outcome.turn.status,'completed');
-  } finally { clearTimeout(turnTimer);unsubscribe(); }
+  await runModelTurn(a.rpc,a.threadId,'fixture');
   assert.deepEqual(approvalRequests,[],'operator-enabled send_file must work under remote approvals');
   assert.equal(providerCalls,3,'search, discovered tool call, and final model response');
   assert.equal(frames.length,3,'model-dispatched call must deliver an actual artifact');
@@ -175,12 +199,44 @@ try {
   assert.ok(grants.some(s=>s.aborted));
   b.rpc.kill();await b.rpc.waitForClose();await b.files.settle();
   assert.ok(grants.every(s=>s.aborted),'all completed grants must be revoked');
+  // Old configurations must not collide with the next execution's server.
+  // A legacy fixed name and the prior execution name both use HTTP transport;
+  // merging either with our stdio command would make Codex reject the config.
+  const staleConfig=['_vb-send-file',a.serverName].flatMap(name=>[
+    '[mcp_servers.'+name+']',
+    'url = "http://127.0.0.1:1/old-mcp"',
+    'enabled = false',
+    'enabled_tools = ["old_tool"]',
+    'disabled_tools = ["send_file"]',
+    '[mcp_servers.'+name+'.tools.send_file]',
+    'approval_mode = "prompt"',
+    '',
+  ]).join('\n');
+  await docker(['exec',containers[0].dockerId!,'node','-e',
+    "require('fs').writeFileSync('/data/sessions/codex/config/config.toml',process.argv[1])",staleConfig]);
   const resumed=await start(0,'alice-resumed',true,a.threadId);
+  assert.notEqual(resumed.serverName,a.serverName);
   assert.notEqual((await resumed.call('/workspace/output/fixture.bin')).isError,true);
   assert.equal(frames.at(-1)?.type,'task.artifact');
   assert.equal((frames.at(-1) as any).taskId,'alice-resumed');
+  await assert.rejects(resumed.rpc.request('mcpServer/tool/call',{
+    threadId:resumed.threadId,server:a.serverName,tool:'send_file',arguments:{path:'/workspace/output/fixture.bin'},
+  }));
+  await runModelTurn(resumed.rpc,resumed.threadId,'Send the fixture again');
+  assert.equal(providerCalls,7);
+  assert.equal(frames.length,5,'new namespace must deliver once');
+  const resumedFile=frames.at(-1)!;
+  assert.equal(resumedFile.type,'task.artifact');
+  if(resumedFile.type==='task.artifact') {
+    assert.equal(resumedFile.taskId,'alice-resumed');
+    const part=resumedFile.artifact.parts[0];
+    assert.equal(part.kind,'file');
+    if(part.kind==='file')assert.deepEqual(Buffer.from(part.file.bytes!,'base64'),Buffer.from([0,255,128,0]));
+  }
+  assert.deepEqual(approvalRequests,[]);
   resumed.rpc.kill();await resumed.rpc.waitForClose();
-  const disabled=await start(0,'disabled',false);
+  await docker(['exec',containers[0].dockerId!,'rm','/data/sessions/codex/config/config.toml']);
+  const disabled=await start(0,'disabled',false,a.threadId);
   await assert.rejects(disabled.call('/workspace/output/fixture.bin'));
   disabled.rpc.kill();await disabled.rpc.waitForClose();
   assert.ok(providerCalls>0);
@@ -195,7 +251,7 @@ try {
     assert.equal(remaining,'[]','MCP helper or app-server survived cleanup');
   }
   console.log(JSON.stringify({result:'PASS',version,runtime:process.versions.bun?'Bun compiled':'Node',
-    checks:['native MCP registration','native tool invocation','model tool search and namespaced dispatch under untrusted approvals','actual file bytes','concurrent callers','path/symlink/size/count errors','disabled delivery','execution grant revocation','process cleanup','native thread resume','local mock inference only']}));
+    checks:['native MCP registration','native tool invocation','model tool search and namespaced dispatch under untrusted approvals','actual file bytes','concurrent callers','path/symlink/size/count errors','disabled delivery','execution grant revocation','process cleanup','native thread resume with persisted conflicting MCP transports and filters','stale namespace rejected and resumed model rediscovers tool','local mock inference only']}));
 } finally {
   for(const rpc of clients)rpc.kill();
   await Promise.all(clients.map(c=>c.waitForClose()));

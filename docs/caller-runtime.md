@@ -671,8 +671,11 @@ files themselves persist and may be explicitly sent again in a later request.
 
 File-enabled Claude and Codex cards advertise file output; disabled cards remain
 text-only. Codex registers the helper through an execution-only app-server MCP
-configuration override. Every resumed execution receives a fresh endpoint and
-token; no delivery grant is written to persistent Codex configuration.
+configuration override. Every execution, including resume, receives a fresh MCP
+server namespace, endpoint and token so persisted server settings cannot merge
+into the bridge-owned helper. The tool remains named `send_file`; use current
+tool discovery rather than saving its execution-specific namespace. No delivery
+grant is written to persistent Codex configuration.
 Operator opt-in also approves only this bridge-owned `send_file` tool in Codex,
 so it works with `approval_decision: "remote"`. Other tool approval policies
 remain in effect; every file still passes the host's path and budget checks.
