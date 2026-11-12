@@ -21,6 +21,8 @@ export interface ExecutionBrokerOptions {
   /** True permits a route; false rejects with 403, or return a protocol status. */
   allow(req: IncomingMessage): boolean | number;
   prepare(req: IncomingMessage, body: any): Promise<Record<string,string>>;
+  /** Optional provider mapping after validation; direct requests retain their original bytes. */
+  transformBody?(body: any): unknown;
   ttlMs?: number;
   timeoutMs?: number;
   maxRequests?: number;
@@ -100,13 +102,14 @@ export function createExecutionAuthBroker(opts: ExecutionBrokerOptions) {
       let headers: Record<string,string>;
       try { headers = await opts.prepare(req, data); }
       catch (error) { deny(error instanceof BrokerRejection ? error.status : 503); return; }
+      const upstreamBody = opts.transformBody ? JSON.stringify(opts.transformBody(data)) : body;
       if (controller.signal.aborted || revoked) return;
       stats.forwarded++;
       const result = await new Promise<IncomingMessage>((resolve, reject) => {
         upstreamRequest = (origin.protocol === 'https:' ? httpsRequest : httpRequest)(
           `${origin.origin}${opts.pathPrefix ?? ""}${req.url}`, { method: 'POST', headers, agent: false }, resolve);
         upstreamRequest.on('error', reject);
-        upstreamRequest.end(body);
+        upstreamRequest.end(upstreamBody);
       });
       upstreamResponse = result;
       if (controller.signal.aborted) { result.destroy(); return; }

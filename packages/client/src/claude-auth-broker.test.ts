@@ -215,3 +215,81 @@ test('caller settings enforce the aggregate serialized UTF-8 boundary', async ()
   assert.equal(bytes(), 96 * 1024 + 1);
   assert.throws(() => selectClaudeCallerSettings(settings), /96 KiB/);
 });
+
+const foundryEnv = (): NodeJS.ProcessEnv => ({
+  CLAUDE_CODE_USE_FOUNDRY: '1', ANTHROPIC_FOUNDRY_RESOURCE: 'test-resource',
+  ANTHROPIC_FOUNDRY_API_KEY: 'HOST_FOUNDRY_SECRET',
+  VICOOP_CLAUDE_FOUNDRY_MODEL_MAP: JSON.stringify({ 'claude-sonnet-4-6': 'production-sonnet' }),
+});
+
+test('Foundry configuration is explicit, constrained and pinned independently from direct credentials', () => {
+  const env = foundryEnv();
+  const reader = createClaudeCredentialReader(env);
+  assert.equal(reader.foundry?.origin, 'https://test-resource.services.ai.azure.com');
+  assert.deepEqual(reader(), { kind: 'api-key', secret: 'HOST_FOUNDRY_SECRET' });
+  env.ANTHROPIC_FOUNDRY_RESOURCE = 'other-account';
+  env.VICOOP_CLAUDE_FOUNDRY_MODEL_MAP = '{}';
+  env.ANTHROPIC_API_KEY = 'OTHER_SECRET';
+  env.ANTHROPIC_FOUNDRY_API_KEY = 'ROTATED';
+  assert.equal(reader.foundry?.origin, 'https://test-resource.services.ai.azure.com');
+  assert.equal(reader.foundry?.deployments['claude-sonnet-4-6'], 'production-sonnet');
+  assert.deepEqual(reader(), { kind: 'api-key', secret: 'ROTATED' });
+  delete env.ANTHROPIC_FOUNDRY_API_KEY;
+  assert.throws(reader, /unavailable/);
+  assert.throws(() => Object.assign(reader.foundry!.deployments, { 'claude-sonnet-4-6': 'other' }));
+  for (const url of ['https://example.services.ai.azure.com', 'https://example.services.ai.azure.com/anthropic/']) {
+    const explicit = foundryEnv(); delete explicit.ANTHROPIC_FOUNDRY_RESOURCE;
+    explicit.ANTHROPIC_FOUNDRY_BASE_URL = url;
+    assert.equal(createClaudeCredentialReader(explicit).foundry?.origin, 'https://example.services.ai.azure.com');
+  }
+});
+
+test('invalid or conflicting Foundry configuration fails without echoing values', () => {
+  const cases: NodeJS.ProcessEnv[] = [
+    { CLAUDE_CODE_USE_FOUNDRY: 'yes' }, { CLAUDE_CODE_USE_FOUNDRY: '0' },
+    { ANTHROPIC_FOUNDRY_API_KEY: '' }, { ANTHROPIC_FOUNDRY_RESOURCE: '' },
+    { ANTHROPIC_FOUNDRY_RESOURCE: 'bad/SECRET' },
+    { ANTHROPIC_FOUNDRY_BASE_URL: 'https://other.services.ai.azure.com' },
+    ...['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_BASE_URL'].map(k => ({ [k]: 'SECRET' })),
+    ...['CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX'].map(k => ({ [k]: '1' })),
+    ...['{}', '[]', 'null', 'SECRET', '{"gpt-test":"d"}', '{"claude-sonnet-4-6":"../SECRET"}', '{"claude-sonnet-4-6":42}'].map(v => ({ VICOOP_CLAUDE_FOUNDRY_MODEL_MAP: v })),
+    ...['http://example.services.ai.azure.com', 'https://example.services.ai.azure.com.evil.invalid', 'https://SECRET@example.services.ai.azure.com', 'https://example.services.ai.azure.com:444', 'https://example.services.ai.azure.com/anthropic?SECRET', 'https://example.services.ai.azure.com/anthropic#SECRET', 'https://127.0.0.1/anthropic', 'https://example.services.ai.azure.com/api/projects/SECRET'].map(v => ({ ANTHROPIC_FOUNDRY_RESOURCE: undefined, ANTHROPIC_FOUNDRY_BASE_URL: v })),
+  ];
+  for (const overrides of cases) assert.throws(() => createClaudeCredentialReader({ ...foundryEnv(), ...overrides }), error => error instanceof Error && !error.message.includes('SECRET'));
+});
+
+test('Foundry routes only mapped models, substitutes api-key and strips caller routing/auth', async () => {
+  const credential = createClaudeCredentialReader(foundryEnv());
+  const f = await fixture({ credential, authentication: 'api-key' });
+  try {
+    assert.equal((await f.request()).status, 200);
+    assert.equal(f.requests[0].url, '/anthropic/v1/messages');
+    assert.equal(f.requests[0].headers['api-key'], 'HOST_FOUNDRY_SECRET');
+    for (const name of ['x-api-key', 'authorization', 'cookie', 'x-forwarded-host']) assert.equal(f.requests[0].headers[name], undefined);
+    assert.equal((f.requests[0].body as { model: string }).model, 'production-sonnet');
+    assert.equal((await f.request('/v1/messages/count_tokens?beta=true', { model: 'claude-sonnet-4-6', messages: [] })).status, 200);
+    assert.equal(f.requests[1].url, '/anthropic/v1/messages/count_tokens?beta=true');
+    assert.equal((f.requests[1].body as { model: string }).model, 'production-sonnet');
+    assert.equal((await f.request('/v1/messages', { model: 'claude-opus-4-6', max_tokens: 1 })).status, 403);
+    assert.equal((await f.request('/v1/messages', { model: 'claude-sonnet-4-6', max_tokens: 1, fallbacks: ['other'] })).status, 403);
+    assert.equal((await f.request('/anthropic/v1/messages')).status, 403);
+    assert.equal((await f.request('/v1/messages?api-version=2025-01-01')).status, 403);
+    assert.equal(f.requests.length, 2);
+    f.status(401);
+    const denied = await f.request();
+    assert.equal(denied.status, 401); assert.doesNotMatch(await denied.text(), /SECRET/);
+    assert.equal(f.requests.length, 3);
+    assert.ok(f.requests.every(req => req.headers['api-key'] === 'HOST_FOUNDRY_SECRET'));
+  } finally { await f.close(); }
+});
+
+test('Foundry missing host key fails closed without forwarding or selecting a direct credential', async () => {
+  const env = foundryEnv(); const credential = createClaudeCredentialReader(env);
+  const f = await fixture({ credential });
+  try {
+    env.ANTHROPIC_FOUNDRY_API_KEY = ''; env.ANTHROPIC_API_KEY = 'DIRECT_SECRET';
+    const response = await f.request();
+    assert.equal(response.status, 503); assert.doesNotMatch(await response.text(), /SECRET/);
+    assert.equal(f.requests.length, 0);
+  } finally { await f.close(); }
+});

@@ -17,6 +17,7 @@ one shared security domain; different callers using it are not isolated.
 | Claude subscription OAuth | Existing host Claude login (macOS Keychain or credentials file) | Temporary execution grant |
 | Explicit OAuth token | Host `CLAUDE_CODE_OAUTH_TOKEN` | Temporary execution grant |
 | Anthropic API key | Host `ANTHROPIC_API_KEY` | Temporary execution grant |
+| Microsoft Foundry API key | Host `ANTHROPIC_FOUNDRY_API_KEY` with explicit resource/model map | Temporary execution grant |
 
 Set at most one credential environment variable. If neither is set, the bridge
 selects the host login store. An explicit `CLAUDE_CONFIG_DIR` selects that
@@ -38,7 +39,11 @@ host-side instruction to renew the selected credential. Provider errors never
 trigger automatic broker retries, request replay or a credential fallback.
 Claude itself may retry a request; each attempt counts against the grant limit.
 
-Bedrock, Vertex, Foundry, custom Anthropic origins, `ANTHROPIC_AUTH_TOKEN`,
+For Foundry setup, model mapping, validation status and rollback, see
+[Claude Foundry](./claude-foundry.md). The direct-provider selection rules above
+apply when Foundry is disabled.
+
+Bedrock, Vertex, custom Anthropic origins, `ANTHROPIC_AUTH_TOKEN`,
 container-local login and `apiKeyHelper` authentication are not supported by this
 mode. Do not pass authentication settings or secrets through agent settings,
 workspace files, prompts or mounted state. Host mode and
@@ -179,9 +184,11 @@ terminates the child after at most one hour even if a caller disconnects.
 ## Protocol and resource limits
 
 Only POST `/v1/messages` and `/v1/messages/count_tokens`, optionally with exactly
-`?beta=true`, are forwarded to `https://api.anthropic.com`. Other paths, methods,
+`?beta=true`, are forwarded to `https://api.anthropic.com` in direct mode.
+Explicit Foundry mode uses the pinned Azure origin and `/anthropic` prefix. Other paths, methods,
 queries, destinations and redirects are rejected. Model IDs must be in the
-Claude Haiku/Sonnet/Opus families; the broker does not translate model names. The
+Claude Haiku/Sonnet/Opus families; direct mode does not translate model names.
+Foundry mode requires an explicit model-to-deployment mapping. The
 internal broker API can further restrict an execution to an explicit model list.
 
 Request authentication/cookie/routing headers are dropped. The broker sets the

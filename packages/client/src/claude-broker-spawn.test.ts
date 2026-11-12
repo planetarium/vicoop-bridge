@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+import { createClaudeCredentialReader } from './claude-auth-broker.js';
 import { createClaudeBrokerSpawn } from './claude-broker-spawn.js';
 
 // Exercise the real relay/HTTP parser through OS pipes, with no Docker needed.
@@ -238,4 +239,44 @@ test('broker preserves a large accepted Unicode deny list through the real relay
     assert.equal(await closed, 0);
     assert.equal(output, expected);
   } finally { adapter.close(); }
+});
+
+
+test('Foundry relay exposes only an execution grant and keeps provider configuration host-side', async () => {
+  const credential = createClaudeCredentialReader({
+    CLAUDE_CODE_USE_FOUNDRY: '1', ANTHROPIC_FOUNDRY_RESOURCE: 'private-resource',
+    ANTHROPIC_FOUNDRY_API_KEY: 'host-foundry-secret',
+    VICOOP_CLAUDE_FOUNDRY_MODEL_MAP: '{"claude-sonnet-4-6":"private-deployment"}',
+  });
+  let forwarded = 0;
+  const upstream = createServer(async (req, res) => {
+    forwarded++;
+    assert.equal(req.url, '/anthropic/v1/messages');
+    assert.equal(req.headers['api-key'], 'host-foundry-secret');
+    const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(chunk);
+    assert.equal(JSON.parse(Buffer.concat(chunks).toString()).model, 'private-deployment');
+    res.end('{"ok":true}');
+  });
+  upstream.listen(0, '127.0.0.1'); await once(upstream, 'listening');
+  const adapter = createClaudeBrokerSpawn('fixture', { credential, authentication: 'api-key',
+    upstream: `http://127.0.0.1:${(upstream.address() as { port: number }).port}`, spawnImpl: localSpawn });
+  try {
+    const child = adapter.spawn(process.execPath, ['-e', `
+      (async () => {
+        const assert = require('node:assert/strict');
+        assert.doesNotMatch(JSON.stringify(process.env), /host-foundry-secret|private-resource|private-deployment|FOUNDRY/);
+        assert.match(process.env.ANTHROPIC_API_KEY, /^vbc_exec_/);
+        assert.equal(process.env.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+        const response = await fetch(process.env.ANTHROPIC_BASE_URL + '/v1/messages', {
+          method: 'POST', headers: {'x-api-key':process.env.ANTHROPIC_API_KEY},
+          body: JSON.stringify({model:'claude-sonnet-4-6',max_tokens:32,messages:[]})});
+        assert.equal(response.status, 200);
+        process.stdout.write('verified');
+      })().catch(() => { process.exitCode = 1; });
+    `], {});
+    let output = ''; child.stdout!.on('data', c => output += c); child.stderr!.resume();
+    const done = new Promise<number | null>(resolve => child.on('close', resolve));
+    child.stdin!.end();
+    assert.equal(await done, 0); assert.equal(output, 'verified'); assert.equal(forwarded, 1);
+  } finally { adapter.close(); upstream.closeAllConnections(); await new Promise<void>(r => upstream.close(() => r())); }
 });
