@@ -243,7 +243,7 @@ try {
   const prepared = JSON.parse(await readFile(configPath,'utf8'));
   if(kind==='claude') prepared.backends[kind].remote_approvals=true;
   else prepared.backends[kind].approval_decision='remote';
-  if(kind==='claude') prepared.backends[kind].caller_runtime.fileDelivery={allowedRoots:['/workspace/output']};
+  prepared.backends[kind].caller_runtime.fileDelivery={allowedRoots:['/workspace/output']};
   prepared.backends[kind].caller_runtime.concurrency = {perCaller:2,global:2,queuePerCaller:4,queueTimeoutMs:120000};
   await writeFile(configPath,JSON.stringify(prepared),{mode:0o600});
   initialized = true;
@@ -272,7 +272,7 @@ try {
   assert.equal((await completed('other')).turn,1,'another caller progresses while B is running');
   await command(['exec',b,'touch','/workspace/release']);
   const b1 = await completed('B1');
-  if(kind==='claude') {
+  {
     const files = id => frames.filter(frame=>frame.taskId===id && frame.type==='task.artifact').flatMap(frame=>frame.artifact.parts).filter(part=>part.kind==='file');
     assert.equal(files('A1').length,1);
     assert.equal(files('B1').length,1);
