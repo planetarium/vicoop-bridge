@@ -892,70 +892,15 @@ process (shared with the Claude backend; scoped to whichever backend
 `--backend` selects). The v1 backend accepts text plus inline image
 `file.bytes` inputs and returns text output. `--codex-sandbox` is
 optional and accepts `read-only`, `workspace-write`, or
-`danger-full-access`; the client passes it to Codex as
-`-c sandbox_mode="<mode>"` so the same setting applies to fresh and
-resumed Codex sessions.
+`danger-full-access`; the client sends it to Codex as the `sandbox`
+setting of every thread it starts or resumes, so the same setting
+applies to fresh and resumed Codex sessions.
 
 > **Sandbox-on by default.** With neither `--codex-sandbox` nor
-> `backends.codex.sandbox_mode` set, the backend passes
-> `-c sandbox_mode="read-only"` explicitly — the same default Codex CLI
-> applies, but stamped into argv so the posture is visible in `ps` /
-> audit logs and survives any future change to Codex's own default.
-
-#### Sandbox mode and OpenAI-compatible requests
-
-A Codex agent card advertises the `…/openai-compat/v1` extension, so
-OpenAI-compatible clients (opencode and similar) can use the agent as a
-model endpoint. What the sandbox mode means for such a request depends
-on whether the request carries `tools`:
-
-| Request | Who executes the work | What the sandbox mode does |
-|---|---|---|
-| Carries `tools` (and `tool_choice` is not `"none"`) | The **caller**. Codex only decides which tool to call; the call is returned as `tool_calls` and the caller's client runs it on the caller's machine. | Nothing for the caller's tools — they never run on your host. Codex's own shell and patch tools cannot run in these requests whatever the mode. |
-| No `tools` (or `tool_choice: "none"`) | **Your host.** Codex uses its own shell and patch tools in `--cwd`. | Applies in full. Under `read-only` every write is rejected and the reply says so. Set `--codex-sandbox workspace-write` (or `backends.codex.sandbox_mode`) if callers should be able to create or edit files under `--cwd`. |
-| Plain A2A task (no openai-compat metadata) | **Your host**, as above. | Applies in full, as above. |
-
-Known problems with requests that carry caller tools, measured with
-Codex CLI 0.169.0 (8 runs per case, one machine, one model):
-
-- **Under the default `read-only` mode Codex often does not call the
-  caller's write-type tools** (#202). Codex still shows the model its
-  own shell and file tools next to the caller's. The model tries those
-  first, they fail, and it answers in text that no execution
-  environment is available instead of calling the caller's `write`
-  (0 of 8 runs returned a tool call). Read-type caller tools were not
-  affected when tested on Codex CLI 0.167.2.
-- **`--codex-sandbox workspace-write` is a workaround, not a fix.**
-  With it the caller's `write` was returned in most runs, but in every
-  one of those runs the model first attempted host execution, and in
-  most it also attempted an MCP tool from your Codex config. Nothing
-  was written on the host in these runs. Loosening the sandbox also
-  loosens it for requests without caller tools and for plain A2A
-  tasks, which do run on your host.
-- **The sandbox mode does not confine the rest of Codex's tooling.**
-  MCP servers listed in `~/.codex/config.toml`, your Codex skills, and
-  Codex built-ins such as web search, the clock and sub-agents stay
-  visible to the model during these requests. MCP calls were stopped
-  only by the approval answer, which is `decline` by default (see
-  **Approval prompts** below); the built-ins ran when a caller asked
-  for them. Review your Codex config before exposing a Codex agent,
-  be careful with any non-default `approval_decision`, and use
-  operator instructions to forbid host, MCP and built-in tools for
-  callers — keeping in mind that an instruction to a model is not an
-  enforcement mechanism.
-- **A caller tool that has the same name as a Codex built-in is never
-  called**, with no error: the built-in hides it. Observed for
-  `exec_command`, `write_stdin`, `apply_patch`, `view_image`,
-  `list_mcp_resources`, `list_mcp_resource_templates`,
-  `read_mcp_resource`, `web__run`, `clock__curr_time` (for these `-`
-  counts as `_`, so `apply-patch` is hidden too) and for the exact
-  names `exec`, `wait`, `request_user_input`,
-  `request_user_input_async`, `tool_search`. The list is specific to
-  that Codex version. Caller tools named `mcp__…` are rejected by
-  Codex outright and the task fails with `thread_start_failed`.
-
-Removing Codex's own tooling from requests that carry caller tools,
-which would address all four, is tracked in #601.
+> `backends.codex.sandbox_mode` set, the backend sends `read-only`
+> explicitly — the same default Codex CLI applies, but stated by the
+> client so the posture survives any future change to Codex's own
+> default.
 
 > **`cwd` need not be a git repository.** The Codex backend speaks
 > `codex app-server` over stdio JSON-RPC and does not require a
@@ -969,6 +914,74 @@ which would address all four, is tracked in #601.
 > `workspace-write`. Operators that want auto-accept set
 > `backends.codex.approval_decision` to `accept` or `acceptForSession`
 > in `config.json`.
+
+#### Sandbox mode and OpenAI-compatible requests
+
+A Codex agent card advertises the `…/openai-compat/v1` extension, so
+OpenAI-compatible clients (opencode and similar) can use the agent as a
+model endpoint. What the sandbox mode means for such a request depends
+on whether the request carries `tools`:
+
+| Request | Who executes the work | What the sandbox mode does |
+|---|---|---|
+| Carries `tools` (and `tool_choice` is not `"none"`) | The **caller** runs the caller's tools: Codex returns the call as `tool_calls` and the caller's client runs it on the caller's machine. Codex can still run some of its own tools on your host in these requests (see below). | Nothing for the caller's tools — they never run on your host. Codex's own shell and patch tools cannot run in these requests whatever the mode. |
+| No `tools` (or `tool_choice: "none"`) | **Your host.** Codex uses its own shell and patch tools in `--cwd`. | Applies in full. Under `read-only` every write is rejected and the reply says so. Set `--codex-sandbox workspace-write` (or `backends.codex.sandbox_mode`) if callers should be able to create or edit files under `--cwd`. |
+| Plain A2A task (no openai-compat metadata) | **Your host**, as above. | Applies in full, as above. |
+
+Known problems with requests that carry caller tools. Unless stated
+otherwise the figures are from Codex CLI 0.169.0, 8 runs per case, on
+one machine with one model and one Codex config:
+
+- **Under the default `read-only` mode Codex often does not call the
+  caller's write-type tools** (#202). Codex still shows the model its
+  own shell and file tools next to the caller's. The model tries those
+  first, they fail, and it answers in text that no execution
+  environment is available instead of calling the caller's `write`
+  (0 of 8 runs returned a tool call). A read task still returned the
+  caller's `read` (7 of 8), after the same failed host attempts.
+- **`--codex-sandbox workspace-write` is a workaround, not a fix.**
+  With it the caller's `write` was returned in most runs (6 and 7 of
+  8 in two sets), but in every run the model first attempted host
+  execution, and it also attempted an MCP tool from the test machine's
+  Codex config (how often depends on which MCP servers you have
+  configured). Nothing was written on the host in these runs.
+  Loosening the sandbox also loosens it for requests without caller
+  tools and for plain A2A tasks, which do run on your host.
+- **The sandbox mode does not confine the rest of Codex's tooling.**
+  MCP servers listed in `~/.codex/config.toml`, your Codex skills, and
+  Codex built-ins stay visible to the model during these requests.
+  What happened when a caller asked for them:
+  - Calls to MCP tools were cancelled by the approval answer, which
+    is `decline` by default (see **Approval prompts** above). Other
+    `approval_decision` values were not tested here; be careful with
+    them on an agent that serves OpenAI-compatible callers.
+  - Codex's MCP-resource tools ask for no approval:
+    `list_mcp_resources` ran. `list_mcp_resource_templates` and
+    `read_mcp_resource` were not observed either way.
+  - Web search, the clock and Codex's `exec` JavaScript runtime ran
+    on the host. Sub-agents were spawned.
+
+  Review your Codex config before exposing a Codex agent. Operator
+  instructions that forbid host, MCP and built-in tools for callers
+  stopped web search and the clock in these tests, but not sub-agents
+  and not every `exec` or MCP-resource request, and they also made
+  Codex stop returning some of the caller's own tools. An instruction
+  to a model is not an enforcement mechanism.
+- **Some caller tool names are hidden by a Codex built-in** of the
+  same name: such a tool is never called, with no error. Observed
+  (one probe run per name) for `exec_command`, `write_stdin`,
+  `apply_patch`, `view_image`, `list_mcp_resources`,
+  `list_mcp_resource_templates`, `read_mcp_resource`, `web__run`,
+  `clock__curr_time` (for these `-` counts as `_`, so `apply-patch`
+  is hidden too) and for the exact names `exec`, `wait`,
+  `request_user_input`, `request_user_input_async`, `tool_search`.
+  Other names that Codex also uses, such as `spawn_agent` or
+  `update_plan`, were not hidden. The list is specific to that Codex
+  version. Caller tools named `mcp__…` are rejected by Codex outright
+  and the task fails with `thread_start_failed`.
+
+Removing Codex's own tooling from requests that carry caller tools,
+which would address all four, is tracked in #601.
 
 ## Manage caller allowlists
 
