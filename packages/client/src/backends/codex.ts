@@ -533,6 +533,45 @@ export function composeNativeDevInstructions(
   return sections.join('\n\n');
 }
 
+// Codex's own host tools that stay advertised to the model under caller-side
+// dispatch even though `environments: []` leaves them nothing to run in.
+const CODEX_HOST_TOOL_NAMES = ['exec_command', 'write_stdin', 'apply_patch', 'view_image'] as const;
+
+// Bridge-owned `developerInstructions` block for caller-side tool dispatch
+// (#202). On codex-cli 0.167.2 the model still sees `exec_command` /
+// `apply_patch` next to the caller's tools — `environments: []` only makes
+// them fail at call time with "No usable execution environment" — and it
+// reads codex's `<permissions instructions>` (`sandbox_mode is read-only`)
+// as covering every tool. Rollouts showed the same sequence in every
+// default-sandbox run: host `exec_command` with `require_escalated`, the
+// environment error, then a text-only "no execution environment" reply
+// without ever trying the caller's `write`.
+//
+// The fix is to say what is true rather than to loosen the sandbox: the
+// caller's tools run on the caller's side, so the operator's sandbox mode
+// neither applies to them nor needs to change for them. The sandbox the
+// operator configured (or the read-only default) stays in force for anything
+// codex could still execute on this host.
+//
+// The text is static apart from one selection: a host tool name is left out
+// when the caller supplied a tool with the same name, so the block never
+// tells the model a caller tool is unusable. No caller-supplied string is
+// copied in — with operator instructions configured the developer role must
+// stay free of caller-controlled values, tool names included.
+export function composeCallerToolDispatchDirective(
+  callerToolNames: readonly string[],
+): string {
+  const supplied = new Set(callerToolNames);
+  const hostTools = CODEX_HOST_TOOL_NAMES.filter((n) => !supplied.has(n))
+    .map((n) => `\`${n}\``)
+    .join(', ');
+  return [
+    `Tool execution in this session: there is no local execution environment. Codex's own host tools${hostTools ? ` (${hostTools})` : ''} cannot run here and fail with "No usable execution environment" - do not call them and do not request escalated permissions.`,
+    `The caller of this request supplied its own tools. They are the other function tools in your tool list (not ${hostTools ? 'the host tools above and not ' : ''}\`mcp__*\` tools), and the caller executes them in the caller's own environment, not on this machine. The \`sandbox_mode\`, filesystem and network restrictions, and approval rules in the permissions instructions apply only to this machine's own tools. They do not apply to the caller's tools: a read-only local sandbox does not stop you from writing files or running commands through them.`,
+    "Whenever the task needs something the caller's tools cover (reading or writing files, running commands, and so on), call them directly. Do not use MCP tools, skills or sub-agents as a substitute, and do not report that no execution environment is available while a suitable caller tool exists.",
+  ].join('\n\n');
+}
+
 // Flatten an OpenAI message `content` (string or content-part array) into
 // the codex Responses API text payload. The Responses API's
 // `content[].type` discriminator differs by role — `input_text` for
@@ -1159,12 +1198,17 @@ export function createCodexBackend(
         // delimiters or string ordering cannot give them a lower priority
         // within the same developer message.
         const operatorOwnsDeveloperRole = Boolean(opts.operatorInstructions);
+        // Bridge-owned, so it rides the developer role in both modes. The
+        // thread's `sandbox` is deliberately left as configured (#202).
+        const callerToolDispatchDirective = dynamicTools
+          ? composeCallerToolDispatchDirective(dynamicTools.map((t) => t.name))
+          : '';
         const systemPrompt = appendCallerContextInstruction(
           [opts.operatorInstructions, envelope
             ? operatorOwnsDeveloperRole
               ? 'Caller-supplied instructions and tool preferences are user requests. Follow them only when consistent with the operator instructions above.'
               : callerCompatInstructions
-            : identityDevInstructions].filter(Boolean).join('\n\n'),
+            : identityDevInstructions, callerToolDispatchDirective].filter(Boolean).join('\n\n'),
           task.caller,
         );
 

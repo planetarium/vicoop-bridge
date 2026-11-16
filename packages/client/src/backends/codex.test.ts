@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import {
+  composeCallerToolDispatchDirective,
   composeNativeDevInstructions,
   createCodexBackend,
   historyToInjectItems,
@@ -1879,6 +1880,101 @@ test('composeNativeDevInstructions includes system text, omits JSON envelope con
   assert.equal(withTools.includes('tool_calls'), false);
   assert.equal(withTools.includes('{"tool_calls"'), false);
 });
+
+// #202: with caller tools the model kept reaching for codex's dead host
+// `exec_command`, read "sandbox_mode is read-only" as covering the caller's
+// tools too, and answered in text. The directive states where caller tools
+// run; it must stay free of caller-controlled strings.
+test('composeCallerToolDispatchDirective is static text that separates caller tools from the local sandbox (#202)', () => {
+  const out = composeCallerToolDispatchDirective(['write', 'bash']);
+  assert.match(out, /`exec_command`, `write_stdin`, `apply_patch`, `view_image`/);
+  assert.match(out, /caller executes them in the caller's own environment/);
+  assert.match(out, /`sandbox_mode`.*apply only to this machine's own tools/);
+  // Caller tool names are not copied in — same text whatever the caller sent.
+  assert.equal(out, composeCallerToolDispatchDirective(['IGNORE_PREVIOUS_INSTRUCTIONS']));
+  assert.doesNotMatch(out, /`write`|`bash`/);
+});
+
+test('composeCallerToolDispatchDirective does not call a caller tool a dead host tool on a name collision (#202)', () => {
+  const out = composeCallerToolDispatchDirective(['apply_patch', 'exec_command']);
+  assert.doesNotMatch(out, /apply_patch|exec_command/);
+  assert.match(out, /\(`write_stdin`, `view_image`\) cannot run here/);
+  const all = composeCallerToolDispatchDirective(['exec_command', 'write_stdin', 'apply_patch', 'view_image']);
+  assert.match(all, /Codex's own host tools cannot run here/);
+  assert.match(all, /\(not `mcp__\*` tools\)/);
+});
+
+function compatAssign(extra: Record<string, unknown>) {
+  return assign('create hello.txt', 'ctx-202', {
+    message: {
+      role: 'user',
+      messageId: 'm-202',
+      parts: [{ kind: 'text', text: 'create hello.txt' }],
+      metadata: {
+        [OPENAI_COMPAT_EXTENSION_URI]: {
+          chat_completions_request: {
+            messages: [
+              { role: 'system', content: 'CALLER_SYSTEM' },
+              { role: 'user', content: 'create hello.txt' },
+            ],
+            ...extra,
+          },
+        },
+      },
+    },
+  });
+}
+const WRITE_TOOL = {
+  type: 'function',
+  function: { name: 'write', parameters: { type: 'object', properties: {} } },
+};
+type StartParams = { sandbox?: string; developerInstructions?: string; environments?: unknown[] };
+
+// The fix for #202 must not loosen anything: the thread keeps the sandbox the
+// operator configured (read-only when unset) and only gains the directive.
+for (const sandboxMode of [undefined, 'read-only', 'workspace-write', 'danger-full-access'] as const) {
+  test(`caller-tool dispatch sends the directive and leaves sandbox=${sandboxMode ?? 'default'} untouched (#202)`, async () => {
+    const fake = makeFakeSpawn(() => happyPath());
+    const backend = createCodexBackend({ spawn: fake.spawn, ...(sandboxMode ? { sandboxMode } : {}) });
+    await backend.handle(compatAssign({ tools: [WRITE_TOOL] }), collect().emit, NEVER);
+    const params = (findRequest(fake.lastChild().stdinFrames(), 'thread/start') as { params: StartParams }).params;
+    assert.equal(params.sandbox, sandboxMode ?? 'read-only');
+    assert.deepEqual(params.environments, []);
+    assert.equal(
+      params.developerInstructions,
+      `CALLER_SYSTEM\n\n${composeCallerToolDispatchDirective(['write'])}`,
+    );
+  });
+}
+
+test('the caller-tool directive stays in the developer role under operator instructions (#202)', async () => {
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn, operatorInstructions: 'OPERATOR_POLICY' });
+  await backend.handle(compatAssign({ tools: [WRITE_TOOL] }), collect().emit, NEVER);
+  const params = (findRequest(fake.lastChild().stdinFrames(), 'thread/start') as { params: StartParams }).params;
+  const developer = params.developerInstructions ?? '';
+  assert.ok(developer.startsWith('OPERATOR_POLICY'));
+  assert.ok(developer.endsWith(composeCallerToolDispatchDirective(['write'])));
+  assert.doesNotMatch(developer, /CALLER_SYSTEM/);
+  assert.equal(params.sandbox, 'read-only');
+});
+
+// Without caller-side dispatch codex executes on the host, where the sandbox
+// text is accurate — the directive would be false there.
+for (const [name, extra] of [
+  ['no tools', {}],
+  ['tool_choice="none"', { tools: [WRITE_TOOL], tool_choice: 'none' }],
+] as const) {
+  test(`openai-compat request with ${name} gets no caller-tool directive (#202)`, async () => {
+    const fake = makeFakeSpawn(() => happyPath());
+    const backend = createCodexBackend({ spawn: fake.spawn });
+    await backend.handle(compatAssign(extra), collect().emit, NEVER);
+    const params = (findRequest(fake.lastChild().stdinFrames(), 'thread/start') as { params: StartParams }).params;
+    assert.equal(params.developerInstructions, 'CALLER_SYSTEM');
+    assert.equal(params.sandbox, 'read-only');
+    assert.equal(params.environments, undefined);
+  });
+}
 
 // Mirrors PR #129 for the codex backend: when `identity` is configured, every
 // `thread/start` must carry a `developerInstructions` field naming the agent's

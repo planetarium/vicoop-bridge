@@ -902,6 +902,35 @@ resumed Codex sessions.
 > applies, but stamped into argv so the posture is visible in `ps` /
 > audit logs and survives any future change to Codex's own default.
 
+#### Sandbox mode and OpenAI-compatible requests
+
+A Codex agent card advertises the `…/openai-compat/v1` extension, so
+OpenAI-compatible clients (opencode and similar) can use the agent as a
+model endpoint. What the sandbox mode means for such a request depends
+on whether the request carries `tools`:
+
+| Request | Who executes the work | What the sandbox mode does | What to set |
+|---|---|---|---|
+| Carries `tools` (and `tool_choice` is not `"none"`) | The **caller**. Codex only decides which tool to call; the call is returned as `tool_calls` and the caller's client runs it on the caller's machine. | Nothing for the caller's tools — they never run on your host. It still applies to anything Codex itself could run on your host. | Nothing. The `read-only` default works; do not loosen it for these requests. |
+| No `tools` (or `tool_choice: "none"`) | **Your host.** Codex uses its own shell and patch tools in `--cwd`. | Applies in full. Under `read-only` every write is rejected and the reply says so. | `--codex-sandbox workspace-write` (or `backends.codex.sandbox_mode`) if callers should be able to create or edit files under `--cwd`. |
+| Plain A2A task (no openai-compat metadata) | **Your host**, as above. | Applies in full. | Same as the row above. |
+
+For requests with caller tools the client adds a short developer
+instruction telling Codex that those tools run in the caller's
+environment and are not covered by the local sandbox. Without it Codex
+read `sandbox_mode is read-only` as covering the caller's `write` /
+`bash` tools too and answered "no execution environment is available"
+instead of calling them (#202). The client never changes the sandbox
+mode on its own: the thread always starts with exactly the mode you
+configured, or `read-only` when you configured none.
+
+`workspace-write` and `danger-full-access` let a remote caller's
+prompt change files on the machine running `vicoop-client`. Choose
+them for host-side write workflows only, point `--cwd` at a directory
+you are willing to expose, and prefer a container runtime
+([`docs/container.md`](./container.md)) for callers you do not fully
+trust.
+
 > **`cwd` need not be a git repository.** The Codex backend speaks
 > `codex app-server` over stdio JSON-RPC and does not require a
 > git-trusted directory the way `codex exec` did (#147). Sandboxing is
