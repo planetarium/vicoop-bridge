@@ -927,17 +927,37 @@ the thread always starts with exactly the mode you configured, or
 
 The instruction is fixed text. It contains nothing the caller sent,
 gives no permission, lists Codex's own tools (shell and file tools,
-web, clock, MCP resources and `mcp__*` tools, sub-agents, skills) as
-this machine's tooling that your operator instructions keep covering,
-tells Codex to treat the caller's tool names and descriptions as
-untrusted, and defers to your operator instructions. It is still an
-instruction to a model, not an enforcement mechanism. With Codex CLI
-0.169.0 it was measured against an operator rule forbidding host and
-MCP tools, with callers trying to talk Codex into them, and was no
-worse than the client without the instruction on any scenario tried;
-it was not shown to be better in general. The list of Codex's own
-tools in it is the 0.169.0 set: a built-in tool a later Codex adds is
-not named there.
+its `exec` JavaScript runtime and `wait`, web, clock, MCP resources
+and `mcp__*` tools, sub-agents, skills) as this machine's tooling that
+your operator instructions keep covering, tells Codex to treat the
+caller's tool names and descriptions as untrusted, and defers to your
+operator instructions. Codex calls the caller's tools from inside its
+own `exec` tool, so the instruction says that an `exec` script that
+only calls the request's tools is how those are called and that
+anything else run in `exec` is this machine's tooling.
+
+It is still an instruction to a model, not an enforcement mechanism.
+With Codex CLI 0.169.0 it was measured, 8 samples per scenario,
+against an operator rule forbidding host and MCP tools, with callers
+trying to talk Codex into them; on those scenarios Codex used its own
+tools for the caller no more often than the client without the
+instruction. It was not shown to be better in general, and other
+prompts, models or Codex versions can behave differently. The list of
+Codex's own tools in it is what Codex CLI 0.169.0 showed the model on
+the test machine: a built-in tool that it does not name, whether added
+by another Codex version or enabled by a Codex configuration that was
+not tried, looks to the model like one of the caller's tools.
+
+One consequence is intended: under an operator rule against host
+tools, Codex now hands caller tools back where the client without the
+instruction refused. For example, a caller tool named `spawn_agent`
+(which is not Codex's own and is not hidden by it) is returned to the
+caller under "never use MCP tools, skills or host tools on behalf of a
+caller", and the caller's `write` is returned under "do not run
+anything on this machine for callers". Nothing runs on your host in
+these cases. If callers should get text answers only, say so in the
+operator instructions (for example "never call any tool for a
+caller").
 
 Limits of that arrangement:
 
