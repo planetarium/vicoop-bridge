@@ -42,10 +42,17 @@ thread, telling the model that host tools cannot run and naming the caller's
 tools. **Off by default**: it costs an extra turn when it fires.
 
 - The retry happens at most once and shares the task's `turnTimeoutMs` budget.
+  If the budget is already spent it is skipped; if it runs out mid-retry the
+  retry turn is interrupted.
 - It replaces the first attempt only if it ends cleanly with a tool call or
   with text. If it fails, times out or says nothing, the task completes with
   the first attempt's result, exactly as it would have without the flag.
-- Reported usage is the sum of both attempts.
+- Reported usage is the sum of both attempts, for each attempt codex accounted
+  for. A retry that ends before codex accounts for it (a tool call interrupted
+  very early, or a timeout) reports nothing of its own; the bridge then reports
+  the first attempt alone and logs a `tokenUsage unavailable for the retry
+  turn` warning. Codex repeats the previous turn's figures in that case, and
+  those are not counted twice.
 - Text cannot be recalled: a streaming caller sees the first attempt's text
   followed by the retry's, even when the retry is then discarded. The final
   `chat_completion` carries only the attempt that stands.

@@ -399,6 +399,52 @@ export function parseCodexTokenUsageForOpenAICompat(raw: unknown): OpenAICompatU
   });
 }
 
+// What a `thread/tokenUsage/updated` payload says about the thread so far:
+// `total` is codex's cumulative count for the whole thread, `lastKey` a
+// comparable rendering of the per-response `last` block.
+export interface CodexUsageMark {
+  total: number | null;
+  lastKey: string | null;
+}
+
+export function readCodexUsageMark(raw: unknown): CodexUsageMark {
+  const tu = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as { total?: unknown; last?: unknown })
+    : {};
+  const totalTokens =
+    tu.total && typeof tu.total === 'object'
+      ? (tu.total as { totalTokens?: unknown }).totalTokens
+      : undefined;
+  return {
+    total: typeof totalTokens === 'number' && Number.isFinite(totalTokens) ? totalTokens : null,
+    lastKey: tu.last && typeof tu.last === 'object' ? JSON.stringify(tu.last) : null,
+  };
+}
+
+// Whether a usage update on a LATER turn of a thread is codex repeating the
+// previous turn's accounting rather than reporting this turn's (#207 review).
+//
+// Observed on codex-cli 0.167.2: when a turn is interrupted before codex has
+// accounted for it, codex still emits `thread/tokenUsage/updated` tagged with
+// the new turn's id — carrying the PREVIOUS turn's `last` block, with `total`
+// unchanged. A fresh thread has nothing to repeat, so this only matters for a
+// second turn on the same thread, i.e. the corrective retry. Taken at face
+// value it would bill the first attempt twice and hide that the retry went
+// unreported.
+//
+// `prior` is the mark of the last update accepted before this turn started.
+// The cumulative `total` is the reliable test: real accounting always advances
+// it. When either side lacks a `total` (a codex that does not send one), fall
+// back to the `last` block being byte-identical — two different model responses
+// do not report the same prompt size.
+//
+// Exported for unit tests.
+export function isStaleCodexUsageUpdate(prior: CodexUsageMark | null, update: CodexUsageMark): boolean {
+  if (!prior) return false;
+  if (prior.total !== null && update.total !== null) return update.total <= prior.total;
+  return prior.lastKey !== null && update.lastKey === prior.lastKey;
+}
+
 // Assemble a complete OpenAI ChatCompletion envelope for the openai-compat/v1
 // envelope contract. The codec on the gateway unwraps this verbatim, so we
 // own every required field — id / object / created / model / choices /
@@ -758,7 +804,7 @@ export function describeEmptyDispatchTurn(opts: {
 // model that had genuinely finished should say so again rather than invent a
 // tool call it does not need. When the request obliged a tool call there is no
 // such option, so the nudge restates the obligation — naming the tool(s) the
-// caller pinned — instead.
+// caller pinned, when they are among `toolNames` — instead.
 //
 // Exported for unit tests.
 export function composeStalledToolCallNudge(
@@ -766,13 +812,17 @@ export function composeStalledToolCallNudge(
   forced: readonly string[] | null = null,
 ): string {
   const list = (ns: readonly string[]): string => ns.map((n) => `\`${n}\``).join(', ');
+  // Only name pinned tools the request actually offers. `tool_choice` is
+  // caller input and is not validated against `tools`; telling the model to
+  // call something that does not exist would be worse than the generic wording.
+  const pinned = forced?.filter((n) => toolNames.includes(n)) ?? [];
   const ending =
     forced === null
       ? 'Continue the task now by calling them directly. ' +
         'If the task is already complete and no tool call is needed, reply with your final answer only.'
-      : forced.length === 0
+      : pinned.length === 0
         ? 'This request requires a tool call: call one of them now. Answering in prose is not allowed.'
-        : `This request requires a tool call: call ${list(forced)} now. Answering in prose is not allowed.`;
+        : `This request requires a tool call: call ${list(pinned)} now. Answering in prose is not allowed.`;
   return (
     'Your previous turn ended without calling any of the function tools the caller provided, so nothing ran. ' +
     'Tools that run on this host — shell or command execution, file patching, MCP servers, plugins — ' +
@@ -1855,6 +1905,13 @@ export function createCodexBackend(
           // round on a codex-side tool. That is the only trace a failed shell
           // call leaves — it is reported to the model, not as a thread item.
           let turnModelRounds = 0;
+          // Usage bookkeeping for telling this turn's accounting from a
+          // repeat of the previous turn's (`isStaleCodexUsageUpdate`).
+          // `lastUsageMark` follows every accepted update; `priorTurnUsageMark`
+          // is its value when the current turn started — null on a task's
+          // first turn, so nothing is ever rejected there.
+          let lastUsageMark: CodexUsageMark | null = null;
+          let priorTurnUsageMark: CodexUsageMark | null = null;
           let turnHostToolItems = 0;
           let turnHostToolFailures = 0;
           const turnHostToolKinds = new Set<string>();
@@ -1978,13 +2035,16 @@ export function createCodexBackend(
           // `finalText` and `finalUsage` included, so an attempt that says
           // nothing or reports no usage cannot inherit the previous one's.
           // `timeoutMs` is this attempt's share of the one `turnTimeoutMs`
-          // budget the task has.
-          const runTurn = (turnInput: typeof userInput, timeoutMs: number): Promise<TurnRunOutcome> => new Promise((resolve) => {
+          // budget the task has; null means no client-side timeout. A
+          // non-positive number is a spent budget and times out at once — it is
+          // never read as "no timeout".
+          const runTurn = (turnInput: typeof userInput, timeoutMs: number | null): Promise<TurnRunOutcome> => new Promise((resolve) => {
             // The previous turn's id would filter out this turn's
             // notifications until `turn/start` answers.
             activeTurnId = null;
             finalText = null;
             finalUsage = null;
+            priorTurnUsageMark = lastUsageMark;
             turnModelRounds = 0;
             turnHostToolItems = 0;
             turnHostToolFailures = 0;
@@ -2025,6 +2085,12 @@ export function createCodexBackend(
                     }
                   | undefined;
                 if (activeTurnId && p?.turnId !== activeTurnId) return;
+                // Not this turn's accounting but a repeat of the previous
+                // turn's: not usage, not a model round, and not the signal the
+                // deferred tool-call interrupt is waiting for.
+                const usageMark = readCodexUsageMark(p?.tokenUsage);
+                if (isStaleCodexUsageUpdate(priorTurnUsageMark, usageMark)) return;
+                lastUsageMark = usageMark;
                 const parsed = parseCodexTokenUsageForOpenAICompat(p?.tokenUsage);
                 if (openaiCompatTrace) {
                   console.error(
@@ -2150,7 +2216,7 @@ export function createCodexBackend(
 
             // Wire client-side timeout if configured. The default 0 means
             // wait for the server.
-            if (timeoutMs > 0) {
+            if (timeoutMs !== null) {
               setTimeout(() => {
                 if (!settled) {
                   finish({
@@ -2159,7 +2225,7 @@ export function createCodexBackend(
                     finalText,
                   });
                 }
-              }, timeoutMs);
+              }, Math.max(0, timeoutMs));
             }
 
             // Detect a transport closure mid-turn — the rpc client rejects
@@ -2197,8 +2263,8 @@ export function createCodexBackend(
               );
           });
 
-          const turnBudgetStartedAt = Date.now();
-          let outcome = await runTurn(userInput, turnTimeoutMs);
+          const turnBudgetStartedAt = now();
+          let outcome = await runTurn(userInput, turnTimeoutMs > 0 ? turnTimeoutMs : null);
 
           // #207 — a caller-tool turn that completed with nothing for the
           // caller to execute. Logged for the whole population; `reason` marks
@@ -2258,12 +2324,12 @@ export function createCodexBackend(
           // spent whichever result stands. Each attempt is counted the way a
           // single turn always has been (codex's `tokenUsage.last`).
           const retryBudgetMs =
-            turnTimeoutMs > 0 ? turnTimeoutMs - (Date.now() - turnBudgetStartedAt) : 0;
+            turnTimeoutMs > 0 ? turnTimeoutMs - (now() - turnBudgetStartedAt) : null;
           if (
             retryStalledToolCall &&
             emptyTurn &&
             shouldRetryStalledToolCall(emptyTurn.reason) &&
-            turnTimeoutMs > 0 &&
+            retryBudgetMs !== null &&
             retryBudgetMs <= 0
           ) {
             logger?.warn?.(
@@ -2290,13 +2356,21 @@ export function createCodexBackend(
             );
             const retryUsage = finalUsage;
             finalUsage = sumOpenAICompatUsage(firstUsage, retryUsage);
+            // The generic "tokenUsage unavailable" warning below only fires
+            // when nothing was reported at all. When exactly one attempt went
+            // unreported the figure is an under-count; say which half it is.
+            // (A retry interrupted before codex accounted for it lands here:
+            // its only usage update is a repeat of the first attempt's, which
+            // the notification handler rejects.)
             if (envelope && firstUsage && !retryUsage) {
-              // The generic "tokenUsage unavailable" warning below only fires
-              // when nothing was reported at all; say so when it is the retry
-              // alone that went unreported.
               logger?.warn?.(
                 `[codex] tokenUsage unavailable for the retry turn of task ${task.taskId}; ` +
                   'reported usage covers the first attempt only',
+              );
+            } else if (envelope && !firstUsage && retryUsage) {
+              logger?.warn?.(
+                `[codex] tokenUsage unavailable for the first attempt of task ${task.taskId}; ` +
+                  'reported usage covers the retry turn only',
               );
             }
 
@@ -2319,6 +2393,15 @@ export function createCodexBackend(
               capturedToolCall = false;
               capturedToolCalls.length = 0;
               retryOutcome = 'first_attempt_kept';
+              // A retry abandoned on the client side (the turn timeout) is
+              // still running in codex. Stop it: otherwise it keeps spending
+              // tokens nobody will see, on a task already reported as done.
+              // Best effort, and harmless when codex already ended the turn.
+              if (retry.status === 'failed' && activeTurnId) {
+                void client
+                  .request('turn/interrupt', { threadId, turnId: activeTurnId })
+                  .catch(() => {});
+              }
             }
             // `warn` when the retry did not produce a tool call: only strong
             // reasons are retried, so the turn is still a dead end the

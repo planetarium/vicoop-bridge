@@ -10,6 +10,8 @@ import {
   createCodexBackend,
   describeEmptyDispatchTurn,
   forcedToolChoice,
+  isStaleCodexUsageUpdate,
+  readCodexUsageMark,
   shouldRetryStalledToolCall,
   historyToInjectItems,
   openaiToolsToDynamicToolSpecs,
@@ -3469,6 +3471,40 @@ test('forcedToolChoice: which tool_choice shapes oblige a tool call, and which t
   );
 });
 
+test('isStaleCodexUsageUpdate: a later turn\'s update is real only if the thread total advanced (#207)', () => {
+  // Exactly as observed on codex-cli 0.167.2 (reviewer run Z1): the first
+  // attempt's final update, then the update codex sent on the retry turn.
+  const firstAttemptFinal = readCodexUsageMark({
+    total: { totalTokens: 36748, inputTokens: 36729, outputTokens: 19 },
+    last: { totalTokens: 18407, inputTokens: 18402, cachedInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 0 },
+  });
+  const replayOnRetryTurn = readCodexUsageMark({
+    total: { totalTokens: 36748, inputTokens: 36729, outputTokens: 19 },
+    last: { totalTokens: 18407, inputTokens: 18402, cachedInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 0 },
+  });
+  assert.equal(firstAttemptFinal.total, 36748);
+  assert.equal(isStaleCodexUsageUpdate(firstAttemptFinal, replayOnRetryTurn), true);
+  // Real accounting advances the total — even if `last` happened to match.
+  assert.equal(
+    isStaleCodexUsageUpdate(firstAttemptFinal, { ...replayOnRetryTurn, total: 55200 }),
+    false,
+  );
+  // A task's first turn has no prior mark: nothing is ever rejected there.
+  assert.equal(isStaleCodexUsageUpdate(null, replayOnRetryTurn), false);
+
+  // No `total` on the wire (either side): fall back to an identical `last`.
+  const noTotal = readCodexUsageMark({ last: { inputTokens: 18402, outputTokens: 5 } });
+  assert.equal(noTotal.total, null);
+  assert.equal(isStaleCodexUsageUpdate(noTotal, readCodexUsageMark({ last: { inputTokens: 18402, outputTokens: 5 } })), true);
+  assert.equal(isStaleCodexUsageUpdate(noTotal, readCodexUsageMark({ last: { inputTokens: 18999, outputTokens: 5 } })), false);
+  assert.equal(isStaleCodexUsageUpdate(firstAttemptFinal, noTotal), false);
+  // Malformed payloads carry no mark and are not called stale on that basis.
+  for (const junk of [undefined, null, 'x', [], {}, { total: 'n/a', last: 7 }]) {
+    assert.deepEqual(readCodexUsageMark(junk), { total: null, lastKey: null });
+    assert.equal(isStaleCodexUsageUpdate(noTotal, readCodexUsageMark(junk)), false);
+  }
+});
+
 test('shouldRetryStalledToolCall: only the strong reasons are retried; host_tool_round is log-only (#207)', () => {
   assert.equal(shouldRetryStalledToolCall('tool_choice_unmet'), true);
   assert.equal(shouldRetryStalledToolCall('host_tool_failed'), true);
@@ -3490,6 +3526,15 @@ test('composeStalledToolCallNudge names the caller tools; the final-answer escap
   const pinned = composeStalledToolCallNudge(['read', 'write'], ['write']);
   assert.match(pinned, /requires a tool call: call `write` now/);
   assert.doesNotMatch(pinned, /final answer/);
+
+  // `tool_choice` is not validated against `tools`: a pinned name the request
+  // does not offer is never put in front of the model.
+  const ghost = composeStalledToolCallNudge(['read', 'write'], ['delete_everything']);
+  assert.doesNotMatch(ghost, /delete_everything/);
+  assert.equal(ghost, required);
+  const mixed = composeStalledToolCallNudge(['read', 'write'], ['delete_everything', 'read']);
+  assert.match(mixed, /requires a tool call: call `read` now/);
+  assert.doesNotMatch(mixed, /delete_everything/);
 });
 
 // One scripted model turn for the #207 integration tests: how many model
@@ -3499,6 +3544,12 @@ interface ScriptedTurn {
   rounds?: number;
   /** Counts reported on each usage notification of this turn. Default 100 / 10. */
   usage?: { input: number; output: number };
+  /**
+   * Instead of this turn's own accounting, emit ONE update that repeats the
+   * previous turn's `last` block with the thread `total` unchanged — what
+   * codex-cli 0.167.2 sends for a turn that ended before it was accounted for.
+   */
+  staleUsageOnly?: boolean;
   hostItems?: Array<Record<string, unknown>>;
   /** Final agent message. Default 'OK'; `null` completes with no message at all. */
   text?: string | null;
@@ -3520,11 +3571,20 @@ interface ScriptedTurn {
 
 function scriptedTurnsScenario(turns: ScriptedTurn[]): ChildScenario {
   let turnCounter = 0;
+  // Thread-cumulative counters, as codex keeps them: `total` advances with
+  // every real usage report and `last` is the most recent response alone.
+  const total = { totalTokens: 0, inputTokens: 0, outputTokens: 0 };
+  let last = { totalTokens: 0, inputTokens: 0, outputTokens: 0 };
+  let staleSent = false;
   const usageOf = (script: ScriptedTurn) => {
+    if (script.staleUsageOnly) return { total: { ...total }, last: { ...last } };
     const input = script.usage?.input ?? 100;
     const output = script.usage?.output ?? 10;
-    const counts = { totalTokens: input + output, inputTokens: input, outputTokens: output };
-    return { total: counts, last: counts };
+    last = { totalTokens: input + output, inputTokens: input, outputTokens: output };
+    total.totalTokens += input + output;
+    total.inputTokens += input;
+    total.outputTokens += output;
+    return { total: { ...total }, last: { ...last } };
   };
   return {
     onLine(frame, child) {
@@ -3549,14 +3609,20 @@ function scriptedTurnsScenario(turns: ScriptedTurn[]): ChildScenario {
         const turnId = `turn-${turnNumber}`;
         if (!script) throw new Error(`unexpected turn/start #${turnNumber}`);
         script.beforeStartResponse?.(child);
+        staleSent = false;
         child.emitStdout({ id, result: { turn: { id: turnId, status: 'inProgress' } } });
         const play = (): void => {
           script.onStarted?.();
-          const emitUsage = (): void =>
+          const emitUsage = (): void => {
+            if (script.staleUsageOnly) {
+              if (staleSent) return;
+              staleSent = true;
+            }
             child.emitStdout({
               method: 'thread/tokenUsage/updated',
               params: { threadId: 'thr-1', turnId, tokenUsage: usageOf(script) },
             });
+          };
           for (const item of script.hostItems ?? []) {
             child.emitStdout({
               method: 'item/completed',
@@ -4024,11 +4090,56 @@ test('retry on: a retry that succeeds reports both attempts\' usage, and a non-r
   );
 });
 
-test('retry on: a retry that reports no usage does not pass the first attempt\'s off as the whole task\'s silently (#207)', async () => {
+test('retry on: a retry interrupted before codex accounted for it does not report the first attempt\'s usage twice (#207)', async () => {
+  // The retry calls a caller tool, the bridge answers, and the deferred
+  // interrupt fires before codex's accounting. codex-cli 0.167.2 then emits a
+  // usage update tagged with the retry's turn id that repeats the FIRST
+  // attempt's `last` block with the thread total unchanged.
   const fake = makeFakeSpawn(() =>
     scriptedTurnsScenario([
-      { rounds: 4, usage: { input: 1000, output: 40 }, hostItems: CANCELLED_MCP_ITEMS, text: GAVE_UP_TEXT },
-      { rounds: 0, text: 'Nothing more to do.' },
+      { rounds: 2, usage: { input: 18402, output: 5 }, text: 'Paris' },
+      { toolCall: { tool: 'write', arguments: { filePath: 'a.txt' } }, staleUsageOnly: true },
+    ]),
+  );
+  const logs = captureLogs();
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    logger: logs.logger,
+    retryStalledToolCall: true,
+    toolCallUsageWaitMs: 10,
+  });
+  const { emit, frames } = collect();
+  const task = callerToolsTask({ tool_choice: 'required' });
+  await backend.handle(task, emit, NEVER);
+
+  assert.equal(turnStarts(fake.lastChild()).length, 2);
+  const final = finalChoice(frames);
+  assert.equal(final.finish_reason, 'tool_calls');
+  // The first attempt's last round, once — not 36804 / 10.
+  assert.deepEqual(
+    { p: final.usage?.prompt_tokens, c: final.usage?.completion_tokens, t: final.usage?.total_tokens },
+    { p: 18402, c: 5, t: 18407 },
+  );
+  assert.deepEqual(
+    { p: final.frameUsage?.promptTokens, c: final.frameUsage?.completionTokens },
+    { p: 18402, c: 5 },
+  );
+  // …and the gap is announced rather than papered over.
+  assert.ok(
+    logs.lines.includes(
+      `warn [codex] tokenUsage unavailable for the retry turn of task ${task.taskId}; reported usage covers the first attempt only`,
+    ),
+    logs.lines.join('\n'),
+  );
+  await backend.close();
+});
+
+test('retry on: a stale usage replay on a retry that answers in prose is not added to the usage either (#207)', async () => {
+  // Retry answers in prose again, and its only usage update is the replay.
+  const fake = makeFakeSpawn(() =>
+    scriptedTurnsScenario([
+      { rounds: 1, usage: { input: 500, output: 5 }, text: 'Sure.' },
+      { rounds: 3, text: 'Sure, again.', staleUsageOnly: true },
     ]),
   );
   const logs = captureLogs();
@@ -4038,17 +4149,37 @@ test('retry on: a retry that reports no usage does not pass the first attempt\'s
     retryStalledToolCall: true,
   });
   const { emit, frames } = collect();
+  await backend.handle(callerToolsTask({ tool_choice: 'required' }), emit, NEVER);
+  const final = finalChoice(frames);
+  assert.equal(final.content, 'Sure, again.');
+  assert.equal(final.usage?.prompt_tokens, 500);
+  assert.ok(logs.lines.some((l) => l.includes('tokenUsage unavailable for the retry turn')));
+  await backend.close();
+});
+
+test('retry on: a first attempt that reported no usage is called out when only the retry\'s is reported (#207)', async () => {
+  const fake = makeFakeSpawn(() =>
+    scriptedTurnsScenario([
+      { rounds: 0, hostItems: CANCELLED_MCP_ITEMS, text: GAVE_UP_TEXT },
+      { rounds: 1, usage: { input: 2000, output: 7 }, toolCall: { tool: 'write', arguments: {} } },
+    ]),
+  );
+  const logs = captureLogs();
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    logger: logs.logger,
+    retryStalledToolCall: true,
+    toolCallUsageWaitMs: 10,
+  });
+  const { emit, frames } = collect();
   const task = callerToolsTask();
   await backend.handle(task, emit, NEVER);
   const final = finalChoice(frames);
-  assert.equal(final.content, 'Nothing more to do.');
-  assert.deepEqual(
-    { p: final.usage?.prompt_tokens, c: final.usage?.completion_tokens },
-    { p: 1000, c: 40 },
-  );
+  assert.equal(final.finish_reason, 'tool_calls');
+  assert.equal(final.usage?.prompt_tokens, 2000);
   assert.ok(
     logs.lines.includes(
-      `warn [codex] tokenUsage unavailable for the retry turn of task ${task.taskId}; reported usage covers the first attempt only`,
+      `warn [codex] tokenUsage unavailable for the first attempt of task ${task.taskId}; reported usage covers the retry turn only`,
     ),
     logs.lines.join('\n'),
   );
@@ -4072,11 +4203,14 @@ for (const [label, retryTurn, status] of [
   ],
   ['completes with no message and no tool call', { text: null }, 'completed'],
 ] as Array<[string, ScriptedTurn, string]>) {
-  test(`retry on: a retry that ${label} leaves the first attempt standing (#207)`, async () => {
+  // Run each end-state twice: with the retry accounted for by codex, and with
+  // codex only repeating the first attempt's usage on the retry turn.
+  for (const stale of [false, true]) {
+  test(`retry on: a retry that ${label} leaves the first attempt standing${stale ? ' (stale usage replay)' : ''} (#207)`, async () => {
     const fake = makeFakeSpawn(() =>
       scriptedTurnsScenario([
         { rounds: 4, usage: { input: 1000, output: 40 }, hostItems: CANCELLED_MCP_ITEMS, text: GAVE_UP_TEXT },
-        { usage: { input: 2000, output: 7 }, ...retryTurn },
+        { usage: { input: 2000, output: 7 }, ...retryTurn, staleUsageOnly: stale },
       ]),
     );
     const logs = captureLogs();
@@ -4107,8 +4241,21 @@ for (const [label, retryTurn, status] of [
       ),
       logs.lines.join('\n'),
     );
+    // Usage: the first attempt's, plus the retry's only where codex really
+    // accounted for it. A repeat of the first attempt's figures is never added.
+    // (The tool-call row fails before the bridge's answer triggers accounting,
+    // so it has no retry usage either way.)
+    const retryAccounted = !stale && !('toolCall' in retryTurn);
+    assert.equal(final.usage?.prompt_tokens, retryAccounted ? 3000 : 1000);
+    assert.equal(final.frameUsage?.promptTokens, retryAccounted ? 3000 : 1000);
+    assert.equal(
+      logs.lines.some((l) => l.includes('tokenUsage unavailable for the retry turn')),
+      !retryAccounted,
+      logs.lines.join('\n'),
+    );
     await backend.close();
   });
+  }
 }
 
 test('retry on: a caller abort during the retry turn cancels the task (#207)', async () => {
@@ -4173,6 +4320,47 @@ test('retry on: the retry runs inside the one turnTimeoutMs budget, not a fresh 
   assert.ok(
     logs.lines.some((l) =>
       l.includes('outcome=first_attempt_kept status=failed error=turn timed out after 400ms'),
+    ),
+    logs.lines.join('\n'),
+  );
+  // The abandoned retry turn is still running in codex; it must be stopped,
+  // not left spending tokens on a task already reported as complete.
+  const interrupts = fake
+    .lastChild()
+    .stdinFrames()
+    .filter((f) => (f as { method?: string }).method === 'turn/interrupt')
+    .map((f) => (f as { params?: { threadId?: string; turnId?: string } }).params);
+  assert.deepEqual(interrupts, [{ threadId: 'thr-1', turnId: 'turn-2' }]);
+  await backend.close();
+});
+
+test('retry on: with the turnTimeoutMs budget already spent, the retry is skipped — never run without a timeout (#207)', async () => {
+  const fake = makeFakeSpawn(() =>
+    scriptedTurnsScenario([{ rounds: 4, hostItems: CANCELLED_MCP_ITEMS, text: GAVE_UP_TEXT }]),
+  );
+  const logs = captureLogs();
+  // A clock that jumps a full second per reading: by the time the first turn
+  // has completed, the 500ms budget reads as spent.
+  let clock = 0;
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    logger: logs.logger,
+    retryStalledToolCall: true,
+    turnTimeoutMs: 500,
+    now: () => (clock += 1000),
+  });
+  const { emit, frames } = collect();
+  const task = callerToolsTask();
+  await backend.handle(task, emit, NEVER);
+
+  assert.equal(turnStarts(fake.lastChild()).length, 1, 'no corrective turn was started');
+  const final = finalChoice(frames);
+  assert.equal(final.state, 'completed');
+  assert.equal(final.content, GAVE_UP_TEXT);
+  assert.ok(
+    logs.lines.includes(
+      `warn [codex] stalled caller-tool turn not retried taskId=${task.taskId} ` +
+        'reason=host_tool_failed cause=turn_timeout_budget_spent',
     ),
     logs.lines.join('\n'),
   );
