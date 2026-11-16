@@ -1,6 +1,40 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildOpenAICompatUsage, toProtocolTaskUsage } from './openai-compat-usage.js';
+import {
+  buildOpenAICompatUsage,
+  sumOpenAICompatUsage,
+  toProtocolTaskUsage,
+} from './openai-compat-usage.js';
+
+test('sumOpenAICompatUsage adds two runs, and never turns "not reported" into zero', () => {
+  const a = buildOpenAICompatUsage({
+    prompt_tokens: 1000,
+    completion_tokens: 40,
+    cached_tokens: 900,
+    reasoning_tokens: 5,
+    model: 'first',
+  });
+  const b = buildOpenAICompatUsage({ prompt_tokens: 2000, completion_tokens: 7, model: 'second' });
+  assert.deepEqual(sumOpenAICompatUsage(a, b), {
+    prompt_tokens: 3000,
+    completion_tokens: 47,
+    total_tokens: 3047,
+    model: 'second',
+    // Present on one side only: carried, the missing side counts as 0.
+    prompt_tokens_details: { cached_tokens: 900 },
+    completion_tokens_details: { reasoning_tokens: 5 },
+  });
+  // Neither side has details → none are invented.
+  assert.deepEqual(sumOpenAICompatUsage(b, b), {
+    prompt_tokens: 4000,
+    completion_tokens: 14,
+    total_tokens: 4014,
+    model: 'second',
+  });
+  assert.equal(sumOpenAICompatUsage(a, null), a);
+  assert.equal(sumOpenAICompatUsage(null, b), b);
+  assert.equal(sumOpenAICompatUsage(null, null), null);
+});
 
 test('toProtocolTaskUsage carries the counts onto the protocol shape', () => {
   const usage = buildOpenAICompatUsage({

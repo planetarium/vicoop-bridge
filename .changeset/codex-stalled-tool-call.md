@@ -21,23 +21,33 @@ completed with `finish_reason: "stop"` and nothing in the logs
 [codex] caller-tool turn produced no tool calls taskId=… model=… textLen=… modelRounds=… toolHistory=… hostToolItems=… hostToolFailures=… hostToolKinds=mcpToolCall:<server> reason=…
 ```
 
-`reason` is `none` for an ordinary one-round answer (logged at `info`),
-`host_tool_round` when the model spent a round on something other than a
-caller tool (`info`), and `host_tool_failed` or `tool_choice_unmet` — a
-codex-side tool failed or was declined, or `tool_choice: "required"` was
-answered with prose — at `warn`. `hostToolKinds` names the MCP servers
-involved, which is usually what needs removing from the codex config. No model
-output is logged.
+`reason` is one of:
+
+- `none` (`info`) — an ordinary one-round answer.
+- `host_tool_round` (`info`) — the model spent a round on something other than
+  a caller tool. This covers the failed shell call, but also a harmless detour
+  followed by a correct answer; the two look identical, so it is only logged.
+- `host_tool_failed` (`warn`) — a codex-side tool failed or was declined.
+  `hostToolKinds` names the MCP servers involved, which is usually what needs
+  removing from the codex config.
+- `tool_choice_unmet` (`warn`) — `tool_choice` required a tool call and the
+  model answered with prose.
+
+No model output is logged.
 
 **Opt-in — retry.** With `--codex-retry-stalled-tool-call` (or
-`backends.codex.retry_stalled_tool_call: true`) a turn with any of those three
-reasons gets one corrective turn on the same thread, telling the model that
-host tools cannot run and naming the caller's tools. **Off by default**: it
-costs an extra turn when it fires, and `host_tool_round` is a heuristic that
-can misfire on a genuine answer. The retry happens at most once, and a retry
-that fails leaves the first attempt's result in place rather than failing the
-task.
+`backends.codex.retry_stalled_tool_call: true`) a turn flagged
+`host_tool_failed` or `tool_choice_unmet` gets one corrective turn on the same
+thread, telling the model that host tools cannot run and naming the caller's
+tools. **Off by default**: it costs an extra turn when it fires.
 
-The first attempt's text has already streamed and cannot be recalled, so a
-streaming caller sees it followed by the retry's output; the final
-`chat_completion` carries only the retry's result.
+- The retry happens at most once and shares the task's `turnTimeoutMs` budget.
+- It replaces the first attempt only if it ends cleanly with a tool call or
+  with text. If it fails, times out or says nothing, the task completes with
+  the first attempt's result, exactly as it would have without the flag.
+- Reported usage is the sum of both attempts.
+- Text cannot be recalled: a streaming caller sees the first attempt's text
+  followed by the retry's, even when the retry is then discarded. The final
+  `chat_completion` carries only the attempt that stands.
+- Host runtime only. The setting is rejected with `--runtime container`, which
+  does not serve caller tools.

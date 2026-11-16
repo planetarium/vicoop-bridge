@@ -171,13 +171,13 @@ export interface CodexBackendConfig {
   approval_decision?: 'accept' | 'acceptForSession' | 'decline' | 'remote';
   /**
    * When a caller-tool turn (openai-compat with `tools`) ends with no tool call
-   * and does not look like a final answer — the model reached for a host-side
-   * tool that cannot run there, or ignored a forced `tool_choice` — run one
-   * corrective turn on the same thread so the caller's tools actually get
-   * called (planetarium/vicoop-bridge#207). OFF by default: it costs an extra
-   * turn whenever it fires, and the weakest trigger (a model round spent on
-   * something other than a caller tool call) is a heuristic that can misfire
-   * on a genuine answer. Mirrors the `--codex-retry-stalled-tool-call` flag.
+   * after a host-side tool the model reached for failed or was declined, or
+   * after it ignored a forced `tool_choice`, run one corrective turn on the
+   * same thread so the caller's tools actually get called
+   * (planetarium/vicoop-bridge#207). OFF by default: it costs an extra turn
+   * whenever it fires, and a streaming caller sees both attempts. Host runtime
+   * only — rejected with `runtime: "container"`, which does not serve caller
+   * tools. Mirrors the `--codex-retry-stalled-tool-call` flag.
    */
   retry_stalled_tool_call?: boolean;
   runtime?: BackendRuntime;

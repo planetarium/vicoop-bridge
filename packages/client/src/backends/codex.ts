@@ -30,6 +30,7 @@ import {
   buildOpenAICompatResponseMetadata,
   toProtocolTaskUsage,
   buildOpenAICompatUsage,
+  sumOpenAICompatUsage,
   type OpenAICompatUsage,
 } from './openai-compat-usage.js';
 import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME, decodedBase64Size } from './fetch-uri-file.js';
@@ -124,9 +125,9 @@ export interface CodexBackendOptions {
   // because codex persists `developerInstructions` server-side per thread.
   identity?: AgentIdentity;
   // Opt into the corrective retry for a caller-tool turn that ended with no
-  // tool call for a reason that does not look like a final answer (#207). Off
-  // by default — it spends an extra turn when it fires, and the weakest of the
-  // triggers is a heuristic. See `classifyEmptyDispatchTurn`.
+  // tool call after a host-side tool failed, or despite a forced `tool_choice`
+  // (#207). Off by default — it spends an extra turn when it fires. See
+  // `shouldRetryStalledToolCall`.
   retryStalledToolCall?: boolean;
   /** Operator-owned instructions, also retained for model-endpoint requests. */
   operatorInstructions?: string;
@@ -575,9 +576,11 @@ export function composeNativeDevInstructions(
 //   - `host_tool_round`: the turn spent a model round on something that was not
 //     a caller tool call — a host tool item that did not fail, or more than one
 //     model round with no caller tool call to show for it. Covers the shell
-//     failure above, which codex reports to the model but not as an item. This
-//     is the weakest of the three: a harmless internal call (`update_plan`)
-//     followed by a genuine answer looks the same.
+//     failure above, which codex reports to the model but not as an item.
+//     LOGGED ONLY, never retried (see `shouldRetryStalledToolCall`): a turn
+//     that tries a tool codex does not have (`update_plan`), is told so, and
+//     then answers correctly produces exactly the same wire trace, and nothing
+//     short of reading the model's text tells the two apart.
 export type EmptyDispatchTurnReason =
   | 'tool_choice_unmet'
   | 'host_tool_failed'
@@ -621,12 +624,43 @@ export function classifyHostToolItem(
   };
 }
 
-function toolChoiceForcesCall(toolChoice: unknown): boolean {
-  if (toolChoice === 'required') return true;
+function functionName(entry: unknown): string | null {
+  if (typeof entry !== 'object' || entry === null) return null;
+  const e = entry as { type?: unknown; function?: unknown };
+  if (e.type !== 'function' || typeof e.function !== 'object' || e.function === null) return null;
+  const name = (e.function as { name?: unknown }).name;
+  return typeof name === 'string' && name.length > 0 ? name : null;
+}
+
+// Which caller tools an OpenAI `tool_choice` obliges the model to call, or null
+// when it leaves the model free to answer in prose (`"auto"`, `"none"`, absent,
+// or a shape this does not recognise — unknown is never read as "forced").
+//
+//   - `"required"`                                   → `[]` (any tool)
+//   - `{ type: "function", function: { name } }`     → `[name]`
+//   - `{ type: "allowed_tools", allowed_tools: { mode: "required", tools } }`
+//                                                    → the named subset
+//
+// Exported for unit tests.
+export function forcedToolChoice(toolChoice: unknown): string[] | null {
+  if (toolChoice === 'required') return [];
   if (typeof toolChoice !== 'object' || toolChoice === null || Array.isArray(toolChoice)) {
-    return false;
+    return null;
   }
-  return (toolChoice as { type?: unknown }).type === 'function';
+  const tc = toolChoice as { type?: unknown; allowed_tools?: unknown };
+  if (tc.type === 'function') {
+    const name = functionName(tc);
+    return name ? [name] : null;
+  }
+  if (tc.type === 'allowed_tools' && typeof tc.allowed_tools === 'object' && tc.allowed_tools !== null) {
+    const allowed = tc.allowed_tools as { mode?: unknown; tools?: unknown };
+    if (allowed.mode !== 'required') return null;
+    const names = Array.isArray(allowed.tools)
+      ? allowed.tools.map(functionName).filter((n): n is string => n !== null)
+      : [];
+    return names;
+  }
+  return null;
 }
 
 // Decide whether a completed caller-tool turn that emitted no tool call looks
@@ -643,10 +677,27 @@ export function classifyEmptyDispatchTurn(opts: {
   hostToolItems: number;
   hostToolFailures: number;
 }): EmptyDispatchTurnReason | null {
-  if (toolChoiceForcesCall(opts.toolChoice)) return 'tool_choice_unmet';
+  if (forcedToolChoice(opts.toolChoice) !== null) return 'tool_choice_unmet';
   if (opts.hostToolFailures > 0) return 'host_tool_failed';
   if (opts.hostToolItems > 0 || opts.modelRounds > 1) return 'host_tool_round';
   return null;
+}
+
+// Whether the opt-in corrective retry fires for a reason. Tuned for precision,
+// like the claude retry it mirrors: a false positive spends a turn AND makes a
+// streaming caller read a correct answer twice, which is worse than missing a
+// stall.
+//
+// `host_tool_round` is excluded on evidence. It would rescue real stalls — the
+// shell-failure shape was retried into a tool call 5 times out of 5 live — but
+// "Record a plan with update_plan, then tell me 17*23" was flagged 4 times out
+// of 4 on a turn that answered correctly, and the two are indistinguishable on
+// the wire. So it stays a log-only signal until its rate in real traffic is
+// known.
+//
+// Exported for unit tests.
+export function shouldRetryStalledToolCall(reason: EmptyDispatchTurnReason | null): boolean {
+  return reason === 'tool_choice_unmet' || reason === 'host_tool_failed';
 }
 
 // The log line for a caller-tool turn that completed with nothing for the
@@ -700,20 +751,34 @@ export function describeEmptyDispatchTurn(opts: {
 // The corrective turn sent on the same thread when `retryStalledToolCall` is on
 // and a caller-tool turn was classified as a dead end. It names what went wrong
 // (host tools cannot run here), names the tools that can, and leaves the task
-// itself alone — the thread still holds the whole conversation. The last
-// sentence is the escape hatch for a false positive: a model that had genuinely
-// finished should say so again rather than invent a tool call it does not need.
+// itself alone — the thread still holds the whole conversation.
+//
+// `forced` is `forcedToolChoice(tool_choice)`. When the request left the model
+// free (null), the last sentence is the escape hatch for a false positive: a
+// model that had genuinely finished should say so again rather than invent a
+// tool call it does not need. When the request obliged a tool call there is no
+// such option, so the nudge restates the obligation — naming the tool(s) the
+// caller pinned — instead.
 //
 // Exported for unit tests.
-export function composeStalledToolCallNudge(toolNames: readonly string[]): string {
-  const names = toolNames.map((n) => `\`${n}\``).join(', ');
+export function composeStalledToolCallNudge(
+  toolNames: readonly string[],
+  forced: readonly string[] | null = null,
+): string {
+  const list = (ns: readonly string[]): string => ns.map((n) => `\`${n}\``).join(', ');
+  const ending =
+    forced === null
+      ? 'Continue the task now by calling them directly. ' +
+        'If the task is already complete and no tool call is needed, reply with your final answer only.'
+      : forced.length === 0
+        ? 'This request requires a tool call: call one of them now. Answering in prose is not allowed.'
+        : `This request requires a tool call: call ${list(forced)} now. Answering in prose is not allowed.`;
   return (
     'Your previous turn ended without calling any of the function tools the caller provided, so nothing ran. ' +
     'Tools that run on this host — shell or command execution, file patching, MCP servers, plugins — ' +
     'are not available in this session: they fail or are cancelled, and you must not use them. ' +
-    `The only tools that can act are the caller-provided function tools: ${names}. ` +
-    'Continue the task now by calling them directly. ' +
-    'If the task is already complete and no tool call is needed, reply with your final answer only.'
+    `The only tools that can act are the caller-provided function tools: ${list(toolNames)}. ` +
+    ending
   );
 }
 
@@ -1908,10 +1973,18 @@ export function createCodexBackend(
           // A function rather than an inline promise so the corrective retry
           // (#207) can run a second turn on the same thread through the
           // identical notification, abort, heartbeat and timeout handling.
-          const runTurn = (turnInput: typeof userInput): Promise<TurnRunOutcome> => new Promise((resolve) => {
+          //
+          // Everything a turn reports is per-attempt and reset here —
+          // `finalText` and `finalUsage` included, so an attempt that says
+          // nothing or reports no usage cannot inherit the previous one's.
+          // `timeoutMs` is this attempt's share of the one `turnTimeoutMs`
+          // budget the task has.
+          const runTurn = (turnInput: typeof userInput, timeoutMs: number): Promise<TurnRunOutcome> => new Promise((resolve) => {
             // The previous turn's id would filter out this turn's
             // notifications until `turn/start` answers.
             activeTurnId = null;
+            finalText = null;
+            finalUsage = null;
             turnModelRounds = 0;
             turnHostToolItems = 0;
             turnHostToolFailures = 0;
@@ -1934,6 +2007,15 @@ export function createCodexBackend(
             };
 
             const cleanupNotifications = client.onNotification((method, params) => {
+              // Notifications are per app-server client, and tasks on other
+              // contexts share it. The `turnId` checks below only work once
+              // `turn/start` has answered; until then another thread's usage,
+              // items, text or even `turn/completed` would be taken for ours.
+              // Every turn-scoped notification carries `threadId`, so drop the
+              // foreign ones here. A notification without one falls through to
+              // the `turnId` checks as before.
+              const notifiedThreadId = (params as { threadId?: unknown } | undefined)?.threadId;
+              if (typeof notifiedThreadId === 'string' && notifiedThreadId !== threadId) return;
               if (method === 'thread/tokenUsage/updated') {
                 const p = params as
                   | {
@@ -2068,7 +2150,7 @@ export function createCodexBackend(
 
             // Wire client-side timeout if configured. The default 0 means
             // wait for the server.
-            if (turnTimeoutMs > 0) {
+            if (timeoutMs > 0) {
               setTimeout(() => {
                 if (!settled) {
                   finish({
@@ -2077,7 +2159,7 @@ export function createCodexBackend(
                     finalText,
                   });
                 }
-              }, turnTimeoutMs);
+              }, timeoutMs);
             }
 
             // Detect a transport closure mid-turn — the rpc client rejects
@@ -2115,7 +2197,8 @@ export function createCodexBackend(
               );
           });
 
-          let outcome = await runTurn(userInput);
+          const turnBudgetStartedAt = Date.now();
+          let outcome = await runTurn(userInput, turnTimeoutMs);
 
           // #207 — a caller-tool turn that completed with nothing for the
           // caller to execute. Logged for the whole population; `reason` marks
@@ -2150,41 +2233,104 @@ export function createCodexBackend(
           // argued out of it, and an unbounded loop would burn the caller's
           // budget invisibly.
           //
-          // The first attempt's text has already streamed and cannot be
-          // recalled, so a streaming caller sees it followed by the retry's
-          // output (in a separate artifact); the terminal chat_completion
-          // envelope carries only the retry's result.
-          if (retryStalledToolCall && emptyTurn?.reason) {
+          // Invariant: turning the retry on never makes a task that would have
+          // completed end any other way, except `canceled` when the caller
+          // itself aborts. The first attempt already completed; the retry
+          // replaces it only when it ends cleanly WITH something to deliver.
+          //
+          //   retry ended …                              task result
+          //   ─────────────────────────────────────────  ─────────────────────────
+          //   with a tool call, turn unwound cleanly      retry: `tool_calls`
+          //   completed with text, no tool call           retry: `stop`, its text
+          //   completed with no text and no tool call     first attempt
+          //   failed / timed out / transport closed,      first attempt (a tool
+          //     before OR after a tool call                 call it captured is dropped)
+          //   caller aborted                              `canceled`
+          //
+          // Text is the one thing that cannot be taken back: the first
+          // attempt's has already streamed, and the retry's streams as a
+          // second artifact as it arrives. So a streaming caller sees both
+          // attempts whatever the result, including a retry that then failed.
+          // The terminal chat_completion envelope carries exactly one of them,
+          // per the table.
+          //
+          // Usage is the sum of both attempts in every row — the tokens were
+          // spent whichever result stands. Each attempt is counted the way a
+          // single turn always has been (codex's `tokenUsage.last`).
+          const retryBudgetMs =
+            turnTimeoutMs > 0 ? turnTimeoutMs - (Date.now() - turnBudgetStartedAt) : 0;
+          if (
+            retryStalledToolCall &&
+            emptyTurn &&
+            shouldRetryStalledToolCall(emptyTurn.reason) &&
+            turnTimeoutMs > 0 &&
+            retryBudgetMs <= 0
+          ) {
+            logger?.warn?.(
+              `[codex] stalled caller-tool turn not retried taskId=${safeToken(task.taskId)} ` +
+                `reason=${emptyTurn.reason} cause=turn_timeout_budget_spent`,
+            );
+          } else if (
+            retryStalledToolCall &&
+            emptyTurn &&
+            shouldRetryStalledToolCall(emptyTurn.reason)
+          ) {
             logger?.info?.(
               `[codex] retrying stalled caller-tool turn taskId=${safeToken(task.taskId)} reason=${emptyTurn.reason}`,
             );
+            const firstUsage = finalUsage;
             responseArtifactId = null;
             streamedResponseText = '';
             const retry = await runTurn(
-              buildUserInput(composeStalledToolCallNudge(callerToolNames), []),
+              buildUserInput(
+                composeStalledToolCallNudge(callerToolNames, forcedToolChoice(envelopeToolChoice)),
+                [],
+              ),
+              retryBudgetMs,
             );
-            const callerAborted = retry.status === 'aborted' || signal.aborted;
-            if (retry.status === 'completed' || capturedToolCall || callerAborted) {
-              outcome = retry;
-              const stillEmpty = describeEmptyTurn(retry);
-              // `warn` when the retry did not help: the operator turned this
-              // on to get tool calls and the turn is still a dead end.
-              logger?.[stillEmpty ? 'warn' : 'info']?.(
-                `[codex] stalled caller-tool turn retry taskId=${safeToken(task.taskId)} ` +
-                  `reason=${emptyTurn.reason} outcome=${
-                    callerAborted ? 'aborted' : capturedToolCall ? 'tool_calls' : 'no_tool_call'
-                  }`,
-              );
-            } else {
-              // A failed retry must not fail the task: the first attempt
-              // already produced a completed (if useless) result, and turning
-              // a degraded turn into a hard failure would be a regression.
+            const retryUsage = finalUsage;
+            finalUsage = sumOpenAICompatUsage(firstUsage, retryUsage);
+            if (envelope && firstUsage && !retryUsage) {
+              // The generic "tokenUsage unavailable" warning below only fires
+              // when nothing was reported at all; say so when it is the retry
+              // alone that went unreported.
               logger?.warn?.(
-                `[codex] stalled caller-tool turn retry failed taskId=${safeToken(task.taskId)} ` +
-                  `reason=${emptyTurn.reason} status=${retry.status}` +
-                  (retry.error ? ` error=${safeToken(retry.error.message, 300)}` : ''),
+                `[codex] tokenUsage unavailable for the retry turn of task ${task.taskId}; ` +
+                  'reported usage covers the first attempt only',
               );
             }
+
+            const callerAborted = retry.status === 'aborted' || signal.aborted;
+            const endedCleanly = retry.status === 'completed' || retry.status === 'interrupted';
+            let retryOutcome: 'aborted' | 'tool_calls' | 'no_tool_call' | 'first_attempt_kept';
+            if (callerAborted) {
+              outcome = { status: 'aborted', finalText: retry.finalText };
+              retryOutcome = 'aborted';
+            } else if (endedCleanly && capturedToolCalls.length > 0) {
+              outcome = retry;
+              retryOutcome = 'tool_calls';
+            } else if (retry.status === 'completed' && retry.finalText) {
+              outcome = retry;
+              retryOutcome = 'no_tool_call';
+            } else {
+              // `outcome` is still the first attempt. Drop whatever the retry
+              // captured so the completion path below reports the first
+              // attempt as it was: text, `finish_reason: "stop"`.
+              capturedToolCall = false;
+              capturedToolCalls.length = 0;
+              retryOutcome = 'first_attempt_kept';
+            }
+            // `warn` when the retry did not produce a tool call: only strong
+            // reasons are retried, so the turn is still a dead end the
+            // operator turned this on to avoid.
+            logger?.[retryOutcome === 'tool_calls' || retryOutcome === 'aborted' ? 'info' : 'warn']?.(
+              `[codex] stalled caller-tool turn retry taskId=${safeToken(task.taskId)} ` +
+                `reason=${emptyTurn.reason} outcome=${retryOutcome}` +
+                (retryOutcome === 'first_attempt_kept'
+                  ? ` status=${retry.status}` +
+                    (retry.error ? ` error=${safeToken(retry.error.message, 300)}` : '')
+                  : ''),
+            );
           }
 
           // Map turn outcome to A2A lifecycle.

@@ -468,6 +468,54 @@ test('--codex-retry-stalled-tool-call resolves from flag, then config, and is co
   }
 });
 
+test('--codex-retry-stalled-tool-call is rejected under the container runtime, from flag or config (#207)', () => {
+  // Caller containers do not serve caller tools, so the retry could never
+  // fire there. Accepting it would leave the operator with a silently inert
+  // setting.
+  const callerRuntime = { image: `sha256:${'a'.repeat(64)}`, stateDirectory: '/private/caller-state' };
+  const containerConfig = { backends: { codex: { caller_runtime: callerRuntime } } };
+
+  // The container setup itself is valid without the retry…
+  assert.equal(
+    mergeClientArgs({ token: 't', agentId: 'a', backend: 'codex', runtime: 'container' }, containerConfig).ok,
+    true,
+  );
+  // …and rejected with it, whichever way it and the runtime were supplied.
+  const cases = [
+    mergeClientArgs(
+      { token: 't', agentId: 'a', backend: 'codex', runtime: 'container', codexRetryStalledToolCall: true },
+      containerConfig,
+    ),
+    mergeClientArgs(
+      { token: 't', agentId: 'a', backend: 'codex', runtime: 'container' },
+      { backends: { codex: { caller_runtime: callerRuntime, retry_stalled_tool_call: true } } },
+    ),
+    mergeClientArgs(
+      { token: 't', agentId: 'a', backend: 'codex', codexRetryStalledToolCall: true },
+      { backends: { codex: { runtime: 'container' as const, caller_runtime: callerRuntime } } },
+    ),
+  ];
+  for (const r of cases) {
+    assert.equal(r.ok, false);
+    if (!r.ok) {
+      assert.ok(
+        r.errors.some(
+          (e) => e.includes('--codex-retry-stalled-tool-call') && e.includes('requires the host runtime'),
+        ),
+        r.errors.join('\n'),
+      );
+    }
+  }
+  // An explicit `false` in config is not a request for the retry.
+  assert.equal(
+    mergeClientArgs(
+      { token: 't', agentId: 'a', backend: 'codex', runtime: 'container' },
+      { backends: { codex: { caller_runtime: callerRuntime, retry_stalled_tool_call: false } } },
+    ).ok,
+    true,
+  );
+});
+
 test('--no-vicoop-codex-reasoning with a non-vicoop-codex backend is a hard error', () => {
   const r = mergeClientArgs(
     { token: 't', agentId: 'a', backend: 'claude', noVicoopCodexReasoning: true },

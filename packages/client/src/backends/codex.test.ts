@@ -9,6 +9,8 @@ import {
   composeStalledToolCallNudge,
   createCodexBackend,
   describeEmptyDispatchTurn,
+  forcedToolChoice,
+  shouldRetryStalledToolCall,
   historyToInjectItems,
   openaiToolsToDynamicToolSpecs,
   parseCodexConfigTomlForModel,
@@ -3433,11 +3435,61 @@ test('describeEmptyDispatchTurn: covers the whole tool-less population, warns on
   assert.equal(forced?.reason, 'tool_choice_unmet');
 });
 
-test('composeStalledToolCallNudge names the caller tools and keeps a final-answer escape hatch (#207)', () => {
-  const nudge = composeStalledToolCallNudge(['read', 'write']);
-  assert.match(nudge, /`read`, `write`/);
-  assert.match(nudge, /not available in this session/);
-  assert.match(nudge, /reply with your final answer only/);
+test('forcedToolChoice: which tool_choice shapes oblige a tool call, and which tools (#207)', () => {
+  for (const free of [undefined, null, 'auto', 'none', 'banana', 42, [], {}, { type: 'custom' }]) {
+    assert.equal(forcedToolChoice(free), null, JSON.stringify(free));
+  }
+  assert.deepEqual(forcedToolChoice('required'), []);
+  assert.deepEqual(forcedToolChoice({ type: 'function', function: { name: 'write' } }), ['write']);
+  // A `function` choice with no usable name pins nothing — same rule as the
+  // developer-instruction nudge, which also needs the name.
+  assert.equal(forcedToolChoice({ type: 'function' }), null);
+  assert.equal(forcedToolChoice({ type: 'function', function: { name: '' } }), null);
+  const allowed = (mode: string) => ({
+    type: 'allowed_tools',
+    allowed_tools: {
+      mode,
+      tools: [
+        { type: 'function', function: { name: 'read' } },
+        { type: 'function', function: { name: 'write' } },
+        { type: 'bogus' },
+      ],
+    },
+  });
+  assert.deepEqual(forcedToolChoice(allowed('required')), ['read', 'write']);
+  assert.equal(forcedToolChoice(allowed('auto')), null);
+  assert.equal(
+    classifyEmptyDispatchTurn({
+      toolChoice: allowed('required'),
+      modelRounds: 1,
+      hostToolItems: 0,
+      hostToolFailures: 0,
+    }),
+    'tool_choice_unmet',
+  );
+});
+
+test('shouldRetryStalledToolCall: only the strong reasons are retried; host_tool_round is log-only (#207)', () => {
+  assert.equal(shouldRetryStalledToolCall('tool_choice_unmet'), true);
+  assert.equal(shouldRetryStalledToolCall('host_tool_failed'), true);
+  assert.equal(shouldRetryStalledToolCall('host_tool_round'), false);
+  assert.equal(shouldRetryStalledToolCall(null), false);
+});
+
+test('composeStalledToolCallNudge names the caller tools; the final-answer escape hatch exists only when no tool call is forced (#207)', () => {
+  const free = composeStalledToolCallNudge(['read', 'write']);
+  assert.match(free, /caller-provided function tools: `read`, `write`\./);
+  assert.match(free, /not available in this session/);
+  assert.match(free, /reply with your final answer only/);
+  assert.equal(composeStalledToolCallNudge(['read', 'write'], null), free);
+
+  const required = composeStalledToolCallNudge(['read', 'write'], []);
+  assert.match(required, /requires a tool call: call one of them now/);
+  assert.doesNotMatch(required, /final answer/);
+
+  const pinned = composeStalledToolCallNudge(['read', 'write'], ['write']);
+  assert.match(pinned, /requires a tool call: call `write` now/);
+  assert.doesNotMatch(pinned, /final answer/);
 });
 
 // One scripted model turn for the #207 integration tests: how many model
@@ -3445,19 +3497,34 @@ test('composeStalledToolCallNudge names the caller tools and keeps a final-answe
 // items completed along the way, and how it ended.
 interface ScriptedTurn {
   rounds?: number;
+  /** Counts reported on each usage notification of this turn. Default 100 / 10. */
+  usage?: { input: number; output: number };
   hostItems?: Array<Record<string, unknown>>;
-  text?: string;
+  /** Final agent message. Default 'OK'; `null` completes with no message at all. */
+  text?: string | null;
   /** End by invoking this caller tool instead of completing with text. */
   toolCall?: { tool: string; arguments: unknown };
-  /** End with `turn/completed` status `failed`. */
+  /** With `toolCall`: once the bridge answers the call, fail the turn instead of letting it be interrupted. */
+  failAfterToolCall?: string;
+  /** End with `turn/completed` status `failed` (after streaming `text`, if set). */
   fail?: string;
+  /** Never end on its own — only a `turn/interrupt` (or a client timeout) ends it. */
+  hang?: boolean;
+  /** Wait this long before the turn does anything. */
+  delayMs?: number;
+  /** Runs when the turn has started (after its `turn/start` response). */
+  onStarted?: () => void;
+  /** Runs BEFORE the `turn/start` response — the window where the turn id is not yet known. */
+  beforeStartResponse?: (child: FakeChild) => void;
 }
 
 function scriptedTurnsScenario(turns: ScriptedTurn[]): ChildScenario {
   let turnCounter = 0;
-  const usage = {
-    total: { totalTokens: 110, inputTokens: 100, outputTokens: 10 },
-    last: { totalTokens: 110, inputTokens: 100, outputTokens: 10 },
+  const usageOf = (script: ScriptedTurn) => {
+    const input = script.usage?.input ?? 100;
+    const output = script.usage?.output ?? 10;
+    const counts = { totalTokens: input + output, inputTokens: input, outputTokens: output };
+    return { total: counts, last: counts };
   };
   return {
     onLine(frame, child) {
@@ -3478,14 +3545,17 @@ function scriptedTurnsScenario(turns: ScriptedTurn[]): ChildScenario {
       if (method === 'turn/start' && id !== undefined) {
         const script = turns[turnCounter];
         turnCounter += 1;
-        const turnId = `turn-${turnCounter}`;
-        if (!script) throw new Error(`unexpected turn/start #${turnCounter}`);
+        const turnNumber = turnCounter;
+        const turnId = `turn-${turnNumber}`;
+        if (!script) throw new Error(`unexpected turn/start #${turnNumber}`);
+        script.beforeStartResponse?.(child);
         child.emitStdout({ id, result: { turn: { id: turnId, status: 'inProgress' } } });
-        queueMicrotask(() => {
+        const play = (): void => {
+          script.onStarted?.();
           const emitUsage = (): void =>
             child.emitStdout({
               method: 'thread/tokenUsage/updated',
-              params: { threadId: 'thr-1', turnId, tokenUsage: usage },
+              params: { threadId: 'thr-1', turnId, tokenUsage: usageOf(script) },
             });
           for (const item of script.hostItems ?? []) {
             child.emitStdout({
@@ -3498,12 +3568,12 @@ function scriptedTurnsScenario(turns: ScriptedTurn[]): ChildScenario {
             // bridge answers it (#351) — see the `srv-` branch below.
             for (let i = 1; i < (script.rounds ?? 1); i++) emitUsage();
             child.emitStdout({
-              id: `srv-${turnCounter}`,
+              id: `srv-${turnNumber}`,
               method: 'item/tool/call',
               params: {
                 threadId: 'thr-1',
                 turnId,
-                callId: `call_${turnCounter}`,
+                callId: `call_${turnNumber}`,
                 namespace: null,
                 tool: script.toolCall.tool,
                 arguments: script.toolCall.arguments,
@@ -3512,40 +3582,70 @@ function scriptedTurnsScenario(turns: ScriptedTurn[]): ChildScenario {
             return;
           }
           for (let i = 0; i < (script.rounds ?? 1); i++) emitUsage();
+          const text = script.text === undefined ? 'OK' : script.text;
+          if (text !== null && (script.fail === undefined || script.text !== undefined)) {
+            child.emitStdout({
+              method: 'item/agentMessage/delta',
+              params: { threadId: 'thr-1', itemId: `msg-${turnNumber}`, delta: text, turnId },
+            });
+          }
+          if (script.hang) return;
           if (script.fail) {
             child.emitStdout({
               method: 'turn/completed',
               params: {
+                threadId: 'thr-1',
                 turn: { id: turnId, status: 'failed', items: [], error: { message: script.fail } },
               },
             });
             return;
           }
-          const text = script.text ?? 'OK';
-          child.emitStdout({
-            method: 'item/agentMessage/delta',
-            params: { itemId: `msg-${turnCounter}`, delta: text, turnId },
-          });
-          child.emitStdout({
-            method: 'item/completed',
-            params: {
-              turnId,
-              threadId: 'thr-1',
-              item: { type: 'agentMessage', id: `msg-${turnCounter}`, text },
-            },
-          });
+          if (text !== null) {
+            child.emitStdout({
+              method: 'item/completed',
+              params: {
+                turnId,
+                threadId: 'thr-1',
+                item: { type: 'agentMessage', id: `msg-${turnNumber}`, text },
+              },
+            });
+          }
           child.emitStdout({
             method: 'turn/completed',
-            params: { turn: { id: turnId, status: 'completed', items: [], error: null } },
+            params: {
+              threadId: 'thr-1',
+              turn: { id: turnId, status: 'completed', items: [], error: null },
+            },
           });
-        });
+        };
+        if (script.delayMs) setTimeout(play, script.delayMs);
+        else queueMicrotask(play);
         return;
       }
       if (typeof id === 'string' && id.startsWith('srv-') && 'result' in (frame as object)) {
-        child.emitStdout({
-          method: 'thread/tokenUsage/updated',
-          params: { threadId: 'thr-1', turnId: `turn-${turnCounter}`, tokenUsage: usage },
-        });
+        const script = turns[turnCounter - 1];
+        const turnId = `turn-${turnCounter}`;
+        if (script?.failAfterToolCall) {
+          child.emitStdout({
+            method: 'turn/completed',
+            params: {
+              threadId: 'thr-1',
+              turn: {
+                id: turnId,
+                status: 'failed',
+                items: [],
+                error: { message: script.failAfterToolCall },
+              },
+            },
+          });
+          return;
+        }
+        if (script) {
+          child.emitStdout({
+            method: 'thread/tokenUsage/updated',
+            params: { threadId: 'thr-1', turnId, tokenUsage: usageOf(script) },
+          });
+        }
         return;
       }
       if (method === 'turn/interrupt' && id !== undefined) {
@@ -3554,7 +3654,10 @@ function scriptedTurnsScenario(turns: ScriptedTurn[]): ChildScenario {
         queueMicrotask(() => {
           child.emitStdout({
             method: 'turn/completed',
-            params: { turn: { id: turnId, status: 'interrupted', items: [], error: null } },
+            params: {
+              threadId: 'thr-1',
+              turn: { id: turnId, status: 'interrupted', items: [], error: null },
+            },
           });
         });
         return;
@@ -3651,14 +3754,20 @@ function finalChoice(frames: UpFrame[]): {
   finish_reason: unknown;
   content: unknown;
   tool_calls: Array<{ function?: { name?: string } }> | undefined;
+  /** `chat_completion.usage` — what the openai-compat consumer sees. */
+  usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined;
+  /** `task.complete.usage` — what the bridge bills on. */
+  frameUsage: { promptTokens?: number; completionTokens?: number } | undefined;
 } {
   const complete = frames.find((f) => f.type === 'task.complete');
   assert.ok(complete && complete.type === 'task.complete', 'task.complete emitted');
   const ext = (complete.status.message?.metadata as Record<string, Record<string, unknown>> | undefined)?.[
     OPENAI_COMPAT_EXTENSION_URI
   ];
-  const choice = (ext?.chat_completion as { choices?: Array<Record<string, unknown>> } | undefined)
-    ?.choices?.[0];
+  const completion = ext?.chat_completion as
+    | { choices?: Array<Record<string, unknown>>; usage?: Record<string, number> }
+    | undefined;
+  const choice = completion?.choices?.[0];
   const message = choice?.message as
     | { content?: unknown; tool_calls?: Array<{ function?: { name?: string } }> }
     | undefined;
@@ -3667,6 +3776,8 @@ function finalChoice(frames: UpFrame[]): {
     finish_reason: choice?.finish_reason,
     content: message?.content,
     tool_calls: message?.tool_calls,
+    usage: completion?.usage,
+    frameUsage: complete.usage,
   };
 }
 
@@ -3798,12 +3909,38 @@ test('retry on: a stalled caller-tool turn gets one corrective turn on the same 
   await backend.close();
 });
 
-test('retry on: a turn that spent hidden rounds on host tools is retried once, and a second stall is accepted, not looped (#207)', async () => {
+test('retry on: extra model rounds with no failed host item are logged but NOT retried (#207)', async () => {
+  // The shell-failure stall and "tried a tool codex does not have, then
+  // answered correctly" produce this same trace, so it is log-only.
+  const fake = makeFakeSpawn(() =>
+    scriptedTurnsScenario([{ rounds: 3, text: '`update_plan` isn’t available.\n\n17 × 23 = **391**.' }]),
+  );
+  const logs = captureLogs();
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    logger: logs.logger,
+    retryStalledToolCall: true,
+  });
+  const { emit, frames } = collect();
+  await backend.handle(callerToolsTask(), emit, NEVER);
+
+  assert.equal(turnStarts(fake.lastChild()).length, 1, 'no corrective turn');
+  const final = finalChoice(frames);
+  assert.equal(final.finish_reason, 'stop');
+  assert.equal(final.content, '`update_plan` isn’t available.\n\n17 × 23 = **391**.');
+  const line = logs.lines.find((l) => l.includes('caller-tool turn produced no tool calls'));
+  assert.ok(line?.startsWith('info '), line);
+  assert.match(line ?? '', /modelRounds=3 .* reason=host_tool_round$/);
+  assert.ok(!logs.lines.some((l) => l.includes('retry')), logs.lines.join('\n'));
+  assert.ok(!logs.lines.some((l) => l.startsWith('warn ')), logs.lines.join('\n'));
+  await backend.close();
+});
+
+test('retry on: a second stall is accepted, not looped — the retry\'s text stands and both attempts\' usage is reported (#207)', async () => {
   const fake = makeFakeSpawn(() =>
     scriptedTurnsScenario([
-      // The shell-failure shape: extra model rounds, no thread item to show for them.
-      { rounds: 3, text: 'I couldn’t create `hello.txt` because the execution environment is unavailable.' },
-      { rounds: 2, text: 'Still unable to proceed.' },
+      { rounds: 4, usage: { input: 1000, output: 40 }, hostItems: CANCELLED_MCP_ITEMS, text: GAVE_UP_TEXT },
+      { rounds: 2, usage: { input: 2000, output: 7 }, hostItems: CANCELLED_MCP_ITEMS, text: 'Still unable to proceed.' },
     ]),
   );
   const logs = captureLogs();
@@ -3823,31 +3960,75 @@ test('retry on: a turn that spent hidden rounds on host tools is retried once, a
   // The terminal envelope carries the retry's text, not the first attempt's.
   assert.equal(final.content, 'Still unable to proceed.');
   // The retry's text streams as its own artifact rather than appending to the
-  // first attempt's (already closed) one.
+  // first attempt's.
   const artifactIds = new Set(
     frames
       .filter((f): f is Extract<UpFrame, { type: 'task.artifact' }> => f.type === 'task.artifact')
       .map((f) => f.artifact.artifactId),
   );
   assert.equal(artifactIds.size, 2);
-
-  const first = logs.lines.find((l) => l.includes('caller-tool turn produced no tool calls'));
-  assert.ok(first?.startsWith('info '), first);
-  assert.match(first ?? '', /modelRounds=3 .* reason=host_tool_round$/);
+  // Usage: each attempt counted as a single turn always has been (its last
+  // usage report), and the two added — on the envelope AND on the frame field
+  // the bridge bills on.
+  assert.deepEqual(
+    { p: final.usage?.prompt_tokens, c: final.usage?.completion_tokens, t: final.usage?.total_tokens },
+    { p: 3000, c: 47, t: 3047 },
+  );
+  assert.deepEqual(
+    { p: final.frameUsage?.promptTokens, c: final.frameUsage?.completionTokens },
+    { p: 3000, c: 47 },
+  );
   assert.ok(
     logs.lines.includes(
-      `warn [codex] stalled caller-tool turn retry taskId=${task.taskId} reason=host_tool_round outcome=no_tool_call`,
+      `warn [codex] stalled caller-tool turn retry taskId=${task.taskId} reason=host_tool_failed outcome=no_tool_call`,
     ),
     logs.lines.join('\n'),
   );
   await backend.close();
 });
 
-test('retry on: a corrective turn that fails does not fail the task — the first attempt stands (#207)', async () => {
+test('retry on: a retry that succeeds reports both attempts\' usage, and a non-retried turn\'s usage is unchanged (#207)', async () => {
+  const run = async (retryStalledToolCall: boolean) => {
+    const fake = makeFakeSpawn(() =>
+      scriptedTurnsScenario([
+        { rounds: 4, usage: { input: 1000, output: 40 }, hostItems: CANCELLED_MCP_ITEMS, text: GAVE_UP_TEXT },
+        { rounds: 1, usage: { input: 2000, output: 7 }, toolCall: { tool: 'write', arguments: {} } },
+      ]),
+    );
+    const backend = createCodexBackend({
+      spawn: fake.spawn,
+      logger: captureLogs().logger,
+      retryStalledToolCall,
+      toolCallUsageWaitMs: 10,
+    });
+    const { emit, frames } = collect();
+    await backend.handle(callerToolsTask(), emit, NEVER);
+    await backend.close();
+    return finalChoice(frames);
+  };
+  const off = await run(false);
+  assert.equal(off.finish_reason, 'stop');
+  assert.deepEqual(
+    { p: off.usage?.prompt_tokens, c: off.usage?.completion_tokens, f: off.frameUsage?.promptTokens },
+    { p: 1000, c: 40, f: 1000 },
+  );
+  const on = await run(true);
+  assert.equal(on.finish_reason, 'tool_calls');
+  assert.deepEqual(
+    { p: on.usage?.prompt_tokens, c: on.usage?.completion_tokens, t: on.usage?.total_tokens },
+    { p: 3000, c: 47, t: 3047 },
+  );
+  assert.deepEqual(
+    { p: on.frameUsage?.promptTokens, c: on.frameUsage?.completionTokens },
+    { p: 3000, c: 47 },
+  );
+});
+
+test('retry on: a retry that reports no usage does not pass the first attempt\'s off as the whole task\'s silently (#207)', async () => {
   const fake = makeFakeSpawn(() =>
     scriptedTurnsScenario([
-      { rounds: 4, hostItems: CANCELLED_MCP_ITEMS, text: GAVE_UP_TEXT },
-      { fail: 'upstream overloaded' },
+      { rounds: 4, usage: { input: 1000, output: 40 }, hostItems: CANCELLED_MCP_ITEMS, text: GAVE_UP_TEXT },
+      { rounds: 0, text: 'Nothing more to do.' },
     ]),
   );
   const logs = captureLogs();
@@ -3859,18 +4040,209 @@ test('retry on: a corrective turn that fails does not fail the task — the firs
   const { emit, frames } = collect();
   const task = callerToolsTask();
   await backend.handle(task, emit, NEVER);
-
-  assert.equal(frames.filter((f) => f.type === 'task.fail').length, 0);
   const final = finalChoice(frames);
-  assert.equal(final.state, 'completed');
-  assert.equal(final.finish_reason, 'stop');
-  assert.equal(final.content, GAVE_UP_TEXT);
+  assert.equal(final.content, 'Nothing more to do.');
+  assert.deepEqual(
+    { p: final.usage?.prompt_tokens, c: final.usage?.completion_tokens },
+    { p: 1000, c: 40 },
+  );
   assert.ok(
     logs.lines.includes(
-      `warn [codex] stalled caller-tool turn retry failed taskId=${task.taskId} ` +
-        'reason=host_tool_failed status=failed error=upstream overloaded',
+      `warn [codex] tokenUsage unavailable for the retry turn of task ${task.taskId}; reported usage covers the first attempt only`,
     ),
     logs.lines.join('\n'),
+  );
+  await backend.close();
+});
+
+// Every way a retry can end without something to deliver. In each, the task
+// must end exactly as it would have with the retry off: completed / stop with
+// the first attempt's text — never `task.fail`, never the retry's tool call.
+for (const [label, retryTurn, status] of [
+  ['fails before any tool call', { fail: 'upstream overloaded' }, 'failed error=upstream overloaded'],
+  [
+    'streams partial text and then fails',
+    { text: 'Let me try aga', fail: 'upstream overloaded' },
+    'failed error=upstream overloaded',
+  ],
+  [
+    'captures a tool call and then fails',
+    { toolCall: { tool: 'write', arguments: { filePath: 'a.txt' } }, failAfterToolCall: 'stream disconnected' },
+    'failed error=stream disconnected',
+  ],
+  ['completes with no message and no tool call', { text: null }, 'completed'],
+] as Array<[string, ScriptedTurn, string]>) {
+  test(`retry on: a retry that ${label} leaves the first attempt standing (#207)`, async () => {
+    const fake = makeFakeSpawn(() =>
+      scriptedTurnsScenario([
+        { rounds: 4, usage: { input: 1000, output: 40 }, hostItems: CANCELLED_MCP_ITEMS, text: GAVE_UP_TEXT },
+        { usage: { input: 2000, output: 7 }, ...retryTurn },
+      ]),
+    );
+    const logs = captureLogs();
+    const backend = createCodexBackend({
+      spawn: fake.spawn,
+      logger: logs.logger,
+      retryStalledToolCall: true,
+      toolCallUsageWaitMs: 10,
+    });
+    const { emit, frames } = collect();
+    const task = callerToolsTask();
+    await backend.handle(task, emit, NEVER);
+
+    assert.equal(frames.filter((f) => f.type === 'task.fail').length, 0, 'never a task.fail');
+    const final = finalChoice(frames);
+    assert.equal(final.state, 'completed');
+    assert.equal(final.finish_reason, 'stop');
+    assert.equal(final.content, GAVE_UP_TEXT);
+    assert.equal(final.tool_calls, undefined, 'a tool call captured by a failed retry is not surfaced');
+    // The status message carries the first attempt's text too.
+    const complete = frames.find((f) => f.type === 'task.complete');
+    assert.ok(complete && complete.type === 'task.complete');
+    assert.deepEqual(complete.status.message?.parts, [{ kind: 'text', text: GAVE_UP_TEXT }]);
+    assert.ok(
+      logs.lines.includes(
+        `warn [codex] stalled caller-tool turn retry taskId=${task.taskId} ` +
+          `reason=host_tool_failed outcome=first_attempt_kept status=${status}`,
+      ),
+      logs.lines.join('\n'),
+    );
+    await backend.close();
+  });
+}
+
+test('retry on: a caller abort during the retry turn cancels the task (#207)', async () => {
+  const controller = new AbortController();
+  const fake = makeFakeSpawn(() =>
+    scriptedTurnsScenario([
+      { rounds: 4, hostItems: CANCELLED_MCP_ITEMS, text: GAVE_UP_TEXT },
+      // Delayed so the abort lands after the bridge knows the turn id and can
+      // send a real `turn/interrupt`.
+      { hang: true, delayMs: 5, onStarted: () => controller.abort() },
+    ]),
+  );
+  const logs = captureLogs();
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    logger: logs.logger,
+    retryStalledToolCall: true,
+  });
+  const { emit, frames } = collect();
+  const task = callerToolsTask();
+  await backend.handle(task, emit, controller.signal);
+
+  assert.equal(turnStarts(fake.lastChild()).length, 2);
+  assert.equal(frames.filter((f) => f.type === 'task.fail').length, 0);
+  const complete = frames.find((f) => f.type === 'task.complete');
+  assert.ok(complete && complete.type === 'task.complete');
+  assert.equal(complete.status.state, 'canceled');
+  assert.ok(
+    logs.lines.includes(
+      `info [codex] stalled caller-tool turn retry taskId=${task.taskId} reason=host_tool_failed outcome=aborted`,
+    ),
+    logs.lines.join('\n'),
+  );
+  await backend.close();
+});
+
+test('retry on: the retry runs inside the one turnTimeoutMs budget, not a fresh one (#207)', async () => {
+  const fake = makeFakeSpawn(() =>
+    scriptedTurnsScenario([
+      { delayMs: 300, rounds: 4, hostItems: CANCELLED_MCP_ITEMS, text: GAVE_UP_TEXT },
+      { hang: true },
+    ]),
+  );
+  const logs = captureLogs();
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    logger: logs.logger,
+    retryStalledToolCall: true,
+    turnTimeoutMs: 400,
+  });
+  const { emit, frames } = collect();
+  const startedAt = Date.now();
+  await backend.handle(callerToolsTask(), emit, NEVER);
+  const elapsed = Date.now() - startedAt;
+
+  // First attempt used ~300ms of the 400ms; the hanging retry gets the ~100ms
+  // left, not another 400ms (which would end at ~700ms).
+  assert.ok(elapsed < 600, `elapsed ${elapsed}ms — the retry was given a fresh budget`);
+  const final = finalChoice(frames);
+  assert.equal(final.state, 'completed');
+  assert.equal(final.content, GAVE_UP_TEXT);
+  assert.ok(
+    logs.lines.some((l) =>
+      l.includes('outcome=first_attempt_kept status=failed error=turn timed out after 400ms'),
+    ),
+    logs.lines.join('\n'),
+  );
+  await backend.close();
+});
+
+test('another thread\'s notifications arriving before the turn/start response are not counted against this turn (#207)', async () => {
+  // The notification stream is per app-server client and shared across
+  // contexts. Before `turn/start` answers, this turn has no id to filter on.
+  const foreign = (child: FakeChild): void => {
+    for (let i = 0; i < 3; i++) {
+      child.emitStdout({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId: 'thr-other',
+          turnId: 'turn-other',
+          tokenUsage: { last: { inputTokens: 999999, outputTokens: 999999 } },
+        },
+      });
+    }
+    child.emitStdout({
+      method: 'item/completed',
+      params: { threadId: 'thr-other', turnId: 'turn-other', item: CANCELLED_MCP_ITEMS[0] },
+    });
+    child.emitStdout({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thr-other', turnId: 'turn-other', itemId: 'x', delta: 'SOMEONE ELSE' },
+    });
+    child.emitStdout({
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-other',
+        turnId: 'turn-other',
+        item: { type: 'agentMessage', id: 'x', text: 'SOMEONE ELSE' },
+      },
+    });
+    child.emitStdout({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thr-other',
+        turn: { id: 'turn-other', status: 'completed', items: [], error: null },
+      },
+    });
+  };
+  const fake = makeFakeSpawn(() =>
+    scriptedTurnsScenario([
+      { rounds: 1, usage: { input: 100, output: 10 }, text: 'Paris', beforeStartResponse: foreign },
+    ]),
+  );
+  const logs = captureLogs();
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    logger: logs.logger,
+    retryStalledToolCall: true,
+  });
+  const { emit, frames } = collect();
+  await backend.handle(callerToolsTask(), emit, NEVER);
+
+  assert.equal(turnStarts(fake.lastChild()).length, 1, 'no spurious retry');
+  const final = finalChoice(frames);
+  assert.equal(final.content, 'Paris');
+  assert.equal(final.usage?.prompt_tokens, 100);
+  const line = logs.lines.find((l) => l.includes('caller-tool turn produced no tool calls'));
+  assert.match(
+    line ?? '',
+    /^info .* textLen=5 modelRounds=1 toolHistory=false hostToolItems=0 hostToolFailures=0 reason=none$/,
+  );
+  // And none of the other thread's text reached this task's artifacts.
+  assert.ok(
+    !frames.some((f) => f.type === 'task.artifact' && artifactText(f).includes('SOMEONE ELSE')),
   );
   await backend.close();
 });
@@ -3890,12 +4262,21 @@ test('tool_choice "required" answered with prose is flagged tool_choice_unmet an
     toolCallUsageWaitMs: 10,
   });
   const { emit, frames } = collect();
-  await backend.handle(callerToolsTask({ tool_choice: 'required' }), emit, NEVER);
+  await backend.handle(
+    callerToolsTask({ tool_choice: { type: 'function', function: { name: 'write' } } }),
+    emit,
+    NEVER,
+  );
 
   const line = logs.lines.find((l) => l.includes('caller-tool turn produced no tool calls'));
   assert.ok(line?.startsWith('warn '), line);
   assert.match(line ?? '', /reason=tool_choice_unmet$/);
-  assert.equal(turnStarts(fake.lastChild()).length, 2);
+  const starts = turnStarts(fake.lastChild());
+  assert.equal(starts.length, 2);
+  // The nudge names the tool the caller pinned, not just the whole list.
+  const nudge = (starts[1].params as { input: Array<{ text?: string }> }).input[0]?.text ?? '';
+  assert.equal(nudge, composeStalledToolCallNudge(['read', 'write'], ['write']));
+  assert.match(nudge, /call `write` now/);
   assert.equal(finalChoice(frames).finish_reason, 'tool_calls');
   await backend.close();
 });

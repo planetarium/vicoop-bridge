@@ -128,7 +128,7 @@ export const daemonFlagsFields = {
   })),
   codexRetryStalledToolCall: optional(
     flag('--codex-retry-stalled-tool-call', {
-      description: message`On a caller-tool turn that ends with no tool call after the model reached for a host-side tool instead (or ignored a forced \`tool_choice\`), run one corrective turn on the same thread (planetarium/vicoop-bridge#207). Off by default: it costs an extra turn when it fires and part of the detection is a heuristic. Only valid with \`--backend codex\`. Mirrors config \`backends.codex.retry_stalled_tool_call\`.`,
+      description: message`On a caller-tool turn that ends with no tool call after a host-side tool the model reached for failed or was declined (or after it ignored a forced \`tool_choice\`), run one corrective turn on the same thread (planetarium/vicoop-bridge#207). Off by default: it costs an extra turn when it fires. Only valid with \`--backend codex\` on the host runtime; \`--runtime container\` does not serve caller tools. Mirrors config \`backends.codex.retry_stalled_tool_call\`.`,
     }),
   ),
 
@@ -417,6 +417,14 @@ export function mergeClientArgs(
     const callerConfig = backend === 'claude' || backend === 'codex' ? resolved.backends?.[backend]?.caller_runtime : undefined;
     if (!CallerRuntimeConfig.safeParse(callerConfig).success) errors.push('container now uses per-caller isolation; run vicoop-client container init claude|codex --config PATH to configure caller_runtime with a pinned image and private stateDirectory (see docs/caller-runtime.md)');
     if (resolved.cwd || resolved.runtimeName) errors.push('container owns its workspace and runtime names');
+    // Caller containers do not advertise openai-compat, so no caller-tool turn
+    // ever reaches them and the retry could never fire. Reject rather than
+    // accept a setting that silently does nothing.
+    if (backend === 'codex' && resolved.codexRetryStalledToolCall) {
+      errors.push(
+        '--codex-retry-stalled-tool-call (backends.codex.retry_stalled_tool_call) requires the host runtime; caller containers do not serve caller tools, so the retry would never run',
+      );
+    }
   }
   if (flags.runtimeName !== undefined)
     errors.push('--runtime-name is retired; container mode assigns names per caller');
