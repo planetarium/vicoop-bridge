@@ -921,14 +921,25 @@ are handed back to the caller to run, and that the local sandbox mode
 describes this machine only. Without it Codex read `sandbox_mode is
 read-only` as describing the caller's `write` / `bash` tools too and
 answered "no execution environment is available" instead of calling
-them (#202). The instruction grants nothing: it lifts no restriction
-on Codex's own tools or on MCP tools, tells Codex to treat the
-caller's tool names and descriptions as untrusted, and defers to your
-operator instructions. The client never changes the sandbox
-mode on its own: the thread always starts with exactly the mode you
-configured, or `read-only` when you configured none.
+them (#202). The client never changes the sandbox mode on its own:
+the thread always starts with exactly the mode you configured, or
+`read-only` when you configured none.
 
-Two limits of that arrangement:
+The instruction is fixed text. It contains nothing the caller sent,
+gives no permission, lists Codex's own tools (shell and file tools,
+web, clock, MCP resources and `mcp__*` tools, sub-agents, skills) as
+this machine's tooling that your operator instructions keep covering,
+tells Codex to treat the caller's tool names and descriptions as
+untrusted, and defers to your operator instructions. It is still an
+instruction to a model, not an enforcement mechanism. With Codex CLI
+0.169.0 it was measured against an operator rule forbidding host and
+MCP tools, with callers trying to talk Codex into them, and was no
+worse than the client without the instruction on any scenario tried;
+it was not shown to be better in general. The list of Codex's own
+tools in it is the 0.169.0 set: a built-in tool a later Codex adds is
+not named there.
+
+Limits of that arrangement:
 
 - **MCP servers in your Codex config are not covered by the sandbox
   mode.** Servers listed in `~/.codex/config.toml` stay visible to
@@ -941,25 +952,26 @@ Two limits of that arrangement:
   be careful with any non-default `approval_decision`.
 - **Some caller tool names cannot be used, because Codex has a
   built-in tool of the same name that hides the caller's.** The client
-  knows the names Codex CLI 0.167.2 was observed to do this for, in
+  knows the names Codex CLI 0.169.0 was observed to do this for, in
   two groups:
   - `exec_command`, `write_stdin`, `apply_patch`, `view_image`,
     `list_mcp_resources`, `list_mcp_resource_templates`,
     `read_mcp_resource`, `web__run`, `clock__curr_time`. For these
     Codex treats `-` as `_`, so `apply-patch` is hidden just like
     `apply_patch`.
-  - `exec`, `wait`, `request_user_input`, `request_user_input_async`.
-    Only the exact spelling is hidden; `request-user-input` is an
-    ordinary caller tool and works.
+  - `exec`, `wait`, `request_user_input`, `request_user_input_async`,
+    `tool_search`. Only the exact spelling is hidden;
+    `request-user-input` is an ordinary caller tool and works.
 
   Case matters in both groups, so `Apply_Patch` is fine.
   - A caller tool with one of these names is **left out** of the
     request to Codex and the client logs one warning per task with the
     built-in name(s) and how many tools were dropped. The caller's
-    other tools keep working.
-  - The request **fails** with `thread_start_failed` only when no
-    usable tool is left (`dynamic tool name is reserved: …`) or when
-    `tool_choice` names one of these names. That is logged too.
+    other tools keep working. If none is left, the request is still
+    answered, in text, as it was before this check existed.
+  - The request **fails** with `thread_start_failed` only when
+    `tool_choice` cannot be honoured: it names one of these names, or
+    it is `"required"` and no usable tool is left. That is logged too.
   - The list is best-effort and tied to that Codex version. Not
     detected: a name another Codex version hides; two caller tools
     whose names differ only in `-` versus `_`; and a caller tool whose
