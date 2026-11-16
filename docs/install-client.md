@@ -972,7 +972,8 @@ one machine with one model and one Codex config:
     no operator instructions (8 of 8 each).
   - Codex's `exec` JavaScript runtime ran scripts on the host, and
     sub-agents were spawned, even under an operator rule against host
-    tools (7 or 8 of 8).
+    tools (`exec` in 7 and 8 of 8 runs in one set and 13 of 24 in
+    another; sub-agents in 8 of 8).
 
   Review your Codex config before exposing a Codex agent. Operator
   instructions that forbid host, MCP and built-in tools for callers
