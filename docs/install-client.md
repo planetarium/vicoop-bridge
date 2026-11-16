@@ -902,6 +902,61 @@ resumed Codex sessions.
 > applies, but stamped into argv so the posture is visible in `ps` /
 > audit logs and survives any future change to Codex's own default.
 
+#### Sandbox mode and OpenAI-compatible requests
+
+A Codex agent card advertises the `…/openai-compat/v1` extension, so
+OpenAI-compatible clients (opencode and similar) can use the agent as a
+model endpoint. What the sandbox mode means for such a request depends
+on whether the request carries `tools`:
+
+| Request | Who executes the work | What the sandbox mode does |
+|---|---|---|
+| Carries `tools` (and `tool_choice` is not `"none"`) | The **caller**. Codex only decides which tool to call; the call is returned as `tool_calls` and the caller's client runs it on the caller's machine. | Nothing for the caller's tools — they never run on your host. Codex's own shell and patch tools cannot run in these requests whatever the mode. |
+| No `tools` (or `tool_choice: "none"`) | **Your host.** Codex uses its own shell and patch tools in `--cwd`. | Applies in full. Under `read-only` every write is rejected and the reply says so. Set `--codex-sandbox workspace-write` (or `backends.codex.sandbox_mode`) if callers should be able to create or edit files under `--cwd`. |
+| Plain A2A task (no openai-compat metadata) | **Your host**, as above. | Applies in full, as above. |
+
+Known problems with requests that carry caller tools, measured with
+Codex CLI 0.169.0 (8 runs per case, one machine, one model):
+
+- **Under the default `read-only` mode Codex often does not call the
+  caller's write-type tools** (#202). Codex still shows the model its
+  own shell and file tools next to the caller's. The model tries those
+  first, they fail, and it answers in text that no execution
+  environment is available instead of calling the caller's `write`
+  (0 of 8 runs returned a tool call). Read-type caller tools were not
+  affected when tested on Codex CLI 0.167.2.
+- **`--codex-sandbox workspace-write` is a workaround, not a fix.**
+  With it the caller's `write` was returned in most runs, but in every
+  one of those runs the model first attempted host execution, and in
+  most it also attempted an MCP tool from your Codex config. Nothing
+  was written on the host in these runs. Loosening the sandbox also
+  loosens it for requests without caller tools and for plain A2A
+  tasks, which do run on your host.
+- **The sandbox mode does not confine the rest of Codex's tooling.**
+  MCP servers listed in `~/.codex/config.toml`, your Codex skills, and
+  Codex built-ins such as web search, the clock and sub-agents stay
+  visible to the model during these requests. MCP calls were stopped
+  only by the approval answer, which is `decline` by default (see
+  **Approval prompts** below); the built-ins ran when a caller asked
+  for them. Review your Codex config before exposing a Codex agent,
+  be careful with any non-default `approval_decision`, and use
+  operator instructions to forbid host, MCP and built-in tools for
+  callers — keeping in mind that an instruction to a model is not an
+  enforcement mechanism.
+- **A caller tool that has the same name as a Codex built-in is never
+  called**, with no error: the built-in hides it. Observed for
+  `exec_command`, `write_stdin`, `apply_patch`, `view_image`,
+  `list_mcp_resources`, `list_mcp_resource_templates`,
+  `read_mcp_resource`, `web__run`, `clock__curr_time` (for these `-`
+  counts as `_`, so `apply-patch` is hidden too) and for the exact
+  names `exec`, `wait`, `request_user_input`,
+  `request_user_input_async`, `tool_search`. The list is specific to
+  that Codex version. Caller tools named `mcp__…` are rejected by
+  Codex outright and the task fails with `thread_start_failed`.
+
+Removing Codex's own tooling from requests that carry caller tools,
+which would address all four, is tracked in #601.
+
 > **`cwd` need not be a git repository.** The Codex backend speaks
 > `codex app-server` over stdio JSON-RPC and does not require a
 > git-trusted directory the way `codex exec` did (#147). Sandboxing is
