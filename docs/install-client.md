@@ -937,7 +937,8 @@ client running on your host, where the mode defaults to `read-only`:
 
 Known problems with requests that carry caller tools. Unless stated
 otherwise the figures are from Codex CLI 0.169.0, 8 runs per case, on
-one machine with one model and one Codex config:
+one machine with one model and one Codex config, with the client's
+Codex backend driven directly (no bridge server in between):
 
 - **Under the default `read-only` mode Codex often does not call the
   caller's write-type tools** (#202). Codex still shows the model its
@@ -963,29 +964,25 @@ one machine with one model and one Codex config:
     `approval_decision` values were not tested here; be careful with
     them on an agent that serves OpenAI-compatible callers.
   - Codex's MCP-resource tools ask for no approval.
-    `list_mcp_resources` ran when a caller's tool description claimed
-    it as one of the caller's tools (3 and 5 of 8 under two operator
-    rules), and did not run on a plain request under an operator
-    rule. `list_mcp_resource_templates` and `read_mcp_resource` were
-    not observed either way.
-  - Web search and the clock ran on the host on a direct request with
-    no operator instructions (8 of 8 each).
-  - Codex's `exec` JavaScript runtime ran scripts on the host, and
-    sub-agents were spawned, even under an operator rule against host
-    tools (`exec` in 7 and 8 of 8 runs in one set and 13 of 24 in
-    another; sub-agents in 8 of 8).
+    `list_mcp_resources` ran in some runs when a caller's tool
+    description claimed it as one of the caller's tools.
+    `list_mcp_resource_templates` and `read_mcp_resource` were not
+    observed either way.
+  - Web search and the clock ran on the host on a direct request
+    (8 of 8 each). Codex's `exec` JavaScript runtime ran scripts on
+    the host, which is also how the model reached web search and the
+    clock, and sub-agents were spawned.
 
-  Review your Codex config before exposing a Codex agent. Operator
-  instructions that forbid host, MCP and built-in tools for callers
-  stopped direct requests for web search and the clock, but not every
-  request: the clock still ran in 3 to 4 of 8 runs when a caller
-  asked for the time without naming the tool, and under a differently
-  worded rule ("do not run anything on this machine for callers") web
-  search and the clock ran in 8 of 8. Sub-agents, `exec` and
-  MCP-resource requests still ran as described above. The same
-  instructions also made Codex stop returning some of the caller's
-  own tools. An instruction to a model is not an enforcement
-  mechanism.
+  A client running on your host has no setting to restrict this for
+  callers: `caller_runtime.operatorInstructions` requires
+  `--runtime container`. In these tests, restricting instructions
+  were passed to the Codex backend directly. They lowered how often
+  Codex used its own tools for a caller but did not stop it reliably:
+  the outcome changed with the wording of the instruction and between
+  sets of runs, and the same instructions also made Codex stop
+  returning some of the caller's own tools. An instruction to a model
+  is not an enforcement mechanism. Review your Codex config before
+  exposing a Codex agent.
 - **Some caller tool names are hidden by a Codex built-in** of the
   same name: such a tool is never called, with no error. Observed
   (one probe run per name, mostly in the dashed spelling) for `exec_command`, `write_stdin`,
