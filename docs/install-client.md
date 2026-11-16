@@ -911,7 +911,7 @@ on whether the request carries `tools`:
 
 | Request | Who executes the work | What the sandbox mode does | What to set |
 |---|---|---|---|
-| Carries `tools` (and `tool_choice` is not `"none"`) | The **caller**. Codex only decides which tool to call; the call is returned as `tool_calls` and the caller's client runs it on the caller's machine. | Nothing for the caller's tools — they never run on your host. It still applies to anything Codex itself could run on your host. | Nothing. The `read-only` default works; do not loosen it for these requests. |
+| Carries `tools` (and `tool_choice` is not `"none"`) | The **caller**. Codex only decides which tool to call; the call is returned as `tool_calls` and the caller's client runs it on the caller's machine. | Nothing for the caller's tools — they never run on your host. Codex's own shell and patch tools are switched off for these requests whatever the mode. | Nothing. The `read-only` default works; do not loosen it for these requests. |
 | No `tools` (or `tool_choice: "none"`) | **Your host.** Codex uses its own shell and patch tools in `--cwd`. | Applies in full. Under `read-only` every write is rejected and the reply says so. | `--codex-sandbox workspace-write` (or `backends.codex.sandbox_mode`) if callers should be able to create or edit files under `--cwd`. |
 | Plain A2A task (no openai-compat metadata) | **Your host**, as above. | Applies in full. | Same as the row above. |
 
@@ -923,6 +923,26 @@ read `sandbox_mode is read-only` as covering the caller's `write` /
 instead of calling them (#202). The client never changes the sandbox
 mode on its own: the thread always starts with exactly the mode you
 configured, or `read-only` when you configured none.
+
+Two limits of that arrangement:
+
+- **MCP servers in your Codex config are not covered by the sandbox
+  mode.** Servers listed in `~/.codex/config.toml` stay visible to
+  Codex during requests with caller tools, and `--codex-sandbox` does
+  not confine them. In testing, every MCP call Codex attempted in
+  such a request was stopped by the approval answer, which is
+  `decline` by default (see **Approval prompts** below). Codex decides
+  per tool whether to ask for approval at all, so do not rely on that
+  for every server: review the config before exposing the agent, and
+  be careful with any non-default `approval_decision`.
+- **Caller tool names that Codex reserves are refused.** A request
+  whose `tools` include `exec_command`, `write_stdin`, `apply_patch`
+  or `view_image` fails with `thread_start_failed: dynamic tool name
+  is reserved: <name>`, and the client logs a warning. Codex's
+  built-in tool of the same name would otherwise hide the caller's
+  tool, so it could never be called. Codex itself rejects names
+  starting with `mcp__` the same way. The caller has to rename the
+  tool.
 
 `workspace-write` and `danger-full-access` let a remote caller's
 prompt change files on the machine running `vicoop-client`. Choose
