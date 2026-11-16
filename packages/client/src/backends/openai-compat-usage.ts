@@ -47,6 +47,35 @@ export function buildOpenAICompatUsage(input: OpenAICompatUsageInput): OpenAICom
   return usage;
 }
 
+// Add two usage reports for one task that spent two separately-accounted
+// model runs (a first attempt plus a corrective retry — codex #207). Either
+// side may be null when that run reported nothing; null + null stays null, so
+// "the runtime did not report" is never turned into a fabricated zero. The
+// detail fields are summed when either side carries one. `model` prefers the
+// later run's.
+export function sumOpenAICompatUsage(
+  a: OpenAICompatUsage | null,
+  b: OpenAICompatUsage | null,
+): OpenAICompatUsage | null {
+  if (!a) return b;
+  if (!b) return a;
+  const cachedA = a.prompt_tokens_details?.cached_tokens;
+  const cachedB = b.prompt_tokens_details?.cached_tokens;
+  const reasoningA = a.completion_tokens_details?.reasoning_tokens;
+  const reasoningB = b.completion_tokens_details?.reasoning_tokens;
+  return buildOpenAICompatUsage({
+    prompt_tokens: a.prompt_tokens + b.prompt_tokens,
+    completion_tokens: a.completion_tokens + b.completion_tokens,
+    model: b.model ?? a.model,
+    cached_tokens:
+      cachedA === undefined && cachedB === undefined ? undefined : (cachedA ?? 0) + (cachedB ?? 0),
+    reasoning_tokens:
+      reasoningA === undefined && reasoningB === undefined
+        ? undefined
+        : (reasoningA ?? 0) + (reasoningB ?? 0),
+  });
+}
+
 // Build the `Message.metadata` payload to attach to the terminal A2A
 // message under the openai-compat extension URI.
 //

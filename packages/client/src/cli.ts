@@ -464,6 +464,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
         openaiCompatTrace: args.openaiCompatTrace,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
+        retryStalledToolCall: args.codexRetryStalledToolCall,
       });
       return { backend };
     }

@@ -126,6 +126,11 @@ export const daemonFlagsFields = {
   codexSandbox: optional(option('--codex-sandbox', choice([...SANDBOX_MODES]), {
     description: message`Codex sandbox mode.`,
   })),
+  codexRetryStalledToolCall: optional(
+    flag('--codex-retry-stalled-tool-call', {
+      description: message`On a caller-tool turn that ends with no tool call after a host-side tool the model reached for failed or was declined (or after it ignored a forced \`tool_choice\`), run one corrective turn on the same thread (planetarium/vicoop-bridge#207). Off by default: it costs an extra turn when it fires. Only valid with \`--backend codex\` on the host runtime; \`--runtime container\` does not serve caller tools. Mirrors config \`backends.codex.retry_stalled_tool_call\`.`,
+    }),
+  ),
 
   // Backend-specific (vicoop-codex)
   noVicoopCodexReasoning: optional(
@@ -196,6 +201,7 @@ export interface DaemonArgs {
   claudeThinkingBudget?: number;
   claudeRetryNarratedToolCall?: boolean;
   codexSandbox?: CodexSandboxMode;
+  codexRetryStalledToolCall?: boolean;
   // Resolved openai-compat/v1 reasoning channel toggle for the vicoop-codex
   // backend. Defaults ON; the `--no-vicoop-codex-reasoning` flag or
   // `backends['vicoop-codex'].reasoning: false` flips it off (#95 / #375).
@@ -358,6 +364,8 @@ export function mergeClientArgs(
       flags.claudeRetryNarratedToolCall ?? backends.claude?.retry_narrated_tool_call,
     codexSandbox:
       flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),
+    codexRetryStalledToolCall:
+      flags.codexRetryStalledToolCall ?? backends.codex?.retry_stalled_tool_call,
     // ON unless the config opts out (`reasoning: false`) or the CLI flag forces
     // it off; the flag wins over config, matching the other flag>config knobs.
     vicoopCodexReasoning:
@@ -409,6 +417,14 @@ export function mergeClientArgs(
     const callerConfig = backend === 'claude' || backend === 'codex' ? resolved.backends?.[backend]?.caller_runtime : undefined;
     if (!CallerRuntimeConfig.safeParse(callerConfig).success) errors.push('container now uses per-caller isolation; run vicoop-client container init claude|codex --config PATH to configure caller_runtime with a pinned image and private stateDirectory (see docs/caller-runtime.md)');
     if (resolved.cwd || resolved.runtimeName) errors.push('container owns its workspace and runtime names');
+    // Caller containers do not advertise openai-compat, so no caller-tool turn
+    // ever reaches them and the retry could never fire. Reject rather than
+    // accept a setting that silently does nothing.
+    if (backend === 'codex' && resolved.codexRetryStalledToolCall) {
+      errors.push(
+        '--codex-retry-stalled-tool-call (backends.codex.retry_stalled_tool_call) requires the host runtime; caller containers do not serve caller tools, so the retry would never run',
+      );
+    }
   }
   if (flags.runtimeName !== undefined)
     errors.push('--runtime-name is retired; container mode assigns names per caller');
@@ -450,6 +466,11 @@ export function mergeClientArgs(
   if (flags.claudeRetryNarratedToolCall && backend !== 'claude') {
     errors.push(
       `--claude-retry-narrated-tool-call is not supported by --backend ${backend}; only the claude backend runs caller-tool turns`,
+    );
+  }
+  if (flags.codexRetryStalledToolCall && backend !== 'codex') {
+    errors.push(
+      `--codex-retry-stalled-tool-call is not supported by --backend ${backend}; only the codex backend runs this retry`,
     );
   }
   if (flags.noVicoopCodexReasoning && backend !== 'vicoop-codex') {
