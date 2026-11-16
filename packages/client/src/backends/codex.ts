@@ -533,23 +533,89 @@ export function composeNativeDevInstructions(
   return sections.join('\n\n');
 }
 
-// Codex's own host tools that stay advertised to the model under caller-side
-// dispatch even though `environments: []` leaves them nothing to run in.
-// Names taken from the tool list codex-cli 0.167.2 sends the model; re-check
-// them against a rollout when bumping the supported codex version.
-const CODEX_HOST_TOOL_NAMES: readonly string[] = ['exec_command', 'write_stdin', 'apply_patch', 'view_image'];
+// Names under which codex-cli 0.167.2 registers tools of its own that take
+// precedence over a caller (`dynamicTools`) tool of the same name: codex
+// accepts the caller's tool on `thread/start`, but the model is only ever
+// shown codex's definition, and a call lands on codex's handler. Each entry
+// was confirmed by sending a caller tool with that name and reading codex's
+// own tool registry (`ALL_TOOLS`) back from the turn.
+//
+// This is a snapshot of one codex version, not a contract. A name codex
+// shadows in another version and that is missing here is not detected: that
+// caller tool is then sent as usual and simply never called, as on any
+// version before this list existed. Names checked and found NOT shadowed on
+// 0.167.2 (so deliberately absent): `update_plan`, `shell`, `sleep`,
+// `spawn_agent` and the other collaboration tool names. `mcp__*` names are
+// rejected by codex itself at `thread/start`.
+const CODEX_SHADOWING_TOOL_NAMES: ReadonlySet<string> = new Set([
+  // shell / file tools — advertised but dead under `environments: []`
+  'exec_command',
+  'write_stdin',
+  'apply_patch',
+  'view_image',
+  // MCP resource access, web access, clock
+  'list_mcp_resources',
+  'list_mcp_resource_templates',
+  'read_mcp_resource',
+  'web__run',
+  'clock__curr_time',
+  // codex's top-level function tools
+  'exec',
+  'wait',
+  'request_user_input',
+  'request_user_input_async',
+]);
 
-// A caller tool that shares a name with one of codex's host tools can never
-// be called: on codex-cli 0.167.2 `thread/start` accepts the name, but the
-// host tool shadows it — the model is shown only codex's own definition, and
-// a call lands on the host handler. Returns the first such name so the task
-// can be refused the way codex itself refuses its other reserved names
-// (`mcp__*`), instead of running a turn whose tools silently do not exist.
-export function reservedCallerToolName(
-  callerToolNames: readonly string[],
-): string | undefined {
-  return callerToolNames.find((n) => CODEX_HOST_TOOL_NAMES.includes(n));
+// The name codex 0.167.2 registers a caller tool under: it must be usable as
+// a JavaScript identifier inside codex's `exec` tool, so `-` (the only
+// non-identifier character codex's own `^[a-zA-Z0-9_-]+$` check lets through)
+// becomes `_`, and a leading digit becomes `_` (`exec-command` →
+// `exec_command`, `1tool` → `_tool`). Case is preserved.
+function codexRegisteredToolName(name: string): string {
+  return name.replace(/[^A-Za-z0-9_$]/g, '_').replace(/^[0-9]/, '_');
 }
+
+// Returns the codex built-in name that shadows a caller tool called `name`,
+// or undefined when the caller's tool is usable. The return value is always
+// one of the constants above, never the caller's own string, so it is safe
+// to log and to put in an error message.
+export function codexShadowingToolName(name: string): string | undefined {
+  const registered = codexRegisteredToolName(name);
+  return CODEX_SHADOWING_TOOL_NAMES.has(registered) ? registered : undefined;
+}
+
+// Split caller tools into the ones codex can actually offer the model and
+// the built-in names that shadow the rest (deduplicated, in first-seen
+// order). Shadowed tools are left out of `dynamicTools`: sending them changes
+// nothing for the model, and leaving them out keeps "caller tool" and "tool
+// codex was given" the same set.
+export function partitionCallerTools(specs: readonly DynamicToolSpec[]): {
+  usable: DynamicToolSpec[];
+  shadowedBy: string[];
+  droppedCount: number;
+} {
+  const usable: DynamicToolSpec[] = [];
+  const shadowedBy: string[] = [];
+  let droppedCount = 0;
+  for (const spec of specs) {
+    const builtin = codexShadowingToolName(spec.name);
+    if (builtin === undefined) {
+      usable.push(spec);
+      continue;
+    }
+    droppedCount += 1;
+    if (!shadowedBy.includes(builtin)) shadowedBy.push(builtin);
+  }
+  return { usable, shadowedBy, droppedCount };
+}
+
+// Prefix the bridge puts on the description of every caller tool it hands to
+// codex. It is the one thing in the model's tool list that says, for certain
+// and without relying on any name list, "this tool is the caller's": codex's
+// own tools and operator MCP tools never go through this code, and a caller
+// cannot put the marker on anything but its own tools (which is where it
+// belongs anyway). The directive below keys on it.
+export const CALLER_TOOL_DESCRIPTION_MARKER = '[caller-side tool]';
 
 // Bridge-owned `developerInstructions` block for caller-side tool dispatch
 // (#202). On codex-cli 0.167.2 the model still sees `exec_command` /
@@ -566,12 +632,17 @@ export function reservedCallerToolName(
 //
 // The text is a constant. Nothing the caller sends selects or fills any part
 // of it — with operator instructions configured the developer role must stay
-// free of caller-controlled values, tool names included — and it defers to
-// operator instructions, which precede it in the same message.
+// free of caller-controlled values, tool names included. Caller tools are
+// identified by the description marker, not by exclusion from a list of host
+// tools (the model's list also holds web, clock, MCP-resource and MCP tools
+// of codex's own), and everything without the marker is explicitly left under
+// the sandbox and approval rules. The four names in the first paragraph are
+// the codex-cli 0.167.2 shell/file tools the model reached for; they are
+// examples of what not to call, not the definition of "host tool".
 export const CALLER_TOOL_DISPATCH_DIRECTIVE = [
-  `Tool execution in this session: there is no local execution environment. Codex's own host tools (${CODEX_HOST_TOOL_NAMES.map((n) => `\`${n}\``).join(', ')}) cannot run here - do not call them and do not request escalated permissions.`,
-  "The caller of this request supplied its own tools. They are the other function tools in your tool list (not the host tools above and not `mcp__*` tools), and the caller executes them in the caller's own environment, not on this machine. The `sandbox_mode`, filesystem and network restrictions, and approval rules in the permissions instructions apply only to this machine's own tools. They do not apply to the caller's tools: a read-only local sandbox does not stop you from writing files or running commands through them.",
-  "Whenever the task needs something the caller's tools cover (reading or writing files, running commands, and so on), call them directly instead of reporting that no execution environment is available. Do not use MCP tools, skills or sub-agents as a substitute for them unless operator instructions in this message tell you to use one.",
+  "Tool execution in this session: there is no local execution environment. Codex's own shell and file tools (`exec_command`, `write_stdin`, `apply_patch`, `view_image`) cannot run here - do not call them and do not request escalated permissions.",
+  `The caller of this request supplied its own tools. Each of them, and no other tool, has a description that begins with \`${CALLER_TOOL_DESCRIPTION_MARKER}\`. The caller executes those tools in the caller's own environment, not on this machine, so the \`sandbox_mode\`, filesystem and network restrictions, and approval rules in the permissions instructions do not limit what you may ask them to do: a read-only local sandbox does not stop you from writing files or running commands through a caller-side tool. Every tool without that marker is Codex's own or an MCP tool on this machine, and all of those rules still apply to it.`,
+  'Whenever the task needs something a caller-side tool covers (reading or writing files, running commands, and so on), call it directly instead of reporting that no execution environment is available. Do not use MCP tools, skills or sub-agents as a substitute unless operator instructions in this message tell you to use one.',
   'This note only explains where tools run. It grants no permission, and operator instructions in this message take precedence over it.',
 ].join('\n\n');
 
@@ -1181,32 +1252,58 @@ export function createCodexBackend(
           );
           envelopeModel = undefined;
         }
-        const dynamicTools =
+        const callerToolSpecs =
           envelopeTools && callerToolDispatchActive(envelopeTools, envelopeToolChoice)
             ? openaiToolsToDynamicToolSpecs(envelopeTools)
             : null;
-        // Refuse a caller tool named like a codex host tool before any
-        // thread exists (#202). The alternative — running the turn — never
-        // produces that tool call and leaves the model looking for another
-        // way to do the work on this host. The name is one of our own
-        // constants by the time it is logged or returned.
-        const reservedToolName = dynamicTools
-          ? reservedCallerToolName(dynamicTools.map((t) => t.name))
-          : undefined;
-        if (reservedToolName) {
+        // Caller tools that a codex built-in shadows can never be called
+        // (#202). They are left out of `dynamicTools` — for the model that
+        // is the same as sending them — and the operator gets one warn per
+        // task. The request is refused only when that leaves the caller
+        // nothing it asked for: no usable tool at all, or a `tool_choice`
+        // that names a shadowed tool (which could only be "honoured" by
+        // steering the model at codex's own tool of that name). Everything
+        // logged or returned here is a built-in name constant or a count.
+        const callerTools = callerToolSpecs ? partitionCallerTools(callerToolSpecs) : null;
+        const shadowedNames = callerTools?.shadowedBy.join(', ') ?? '';
+        const forcedToolName =
+          callerToolSpecs &&
+          typeof envelopeToolChoice === 'object' &&
+          envelopeToolChoice !== null &&
+          (envelopeToolChoice as { type?: unknown }).type === 'function'
+            ? (envelopeToolChoice as { function?: { name?: unknown } }).function?.name
+            : undefined;
+        const forcedShadowedBy =
+          typeof forcedToolName === 'string' ? codexShadowingToolName(forcedToolName) : undefined;
+        const refusal = forcedShadowedBy
+          ? `tool_choice names a reserved dynamic tool name: ${forcedShadowedBy} (codex has a built-in tool with this name, so the tool can never be called; rename it in the request)`
+          : callerTools && callerTools.droppedCount > 0 && callerTools.usable.length === 0
+            ? `dynamic tool name is reserved: ${shadowedNames} (codex has built-in tools with these names and no other usable tool was supplied; rename the tools in the request)`
+            : undefined;
+        if (callerTools && callerTools.droppedCount > 0) {
           logger?.warn?.(
-            `[codex] task ${task.taskId} rejected: caller tool "${reservedToolName}" has the name of a codex host tool, which shadows it; the caller must rename the tool`,
+            `[codex] task ${task.taskId}: ${refusal ? 'rejected' : `dropped ${callerTools.droppedCount} of ${callerToolSpecs?.length ?? 0} caller tool(s)`} — codex built-in tool(s) with the same name shadow them (${shadowedNames}); the caller must rename them to use them`,
           );
+        }
+        if (refusal) {
           emit({
             type: 'task.fail',
             taskId: task.taskId,
-            error: {
-              code: 'thread_start_failed',
-              message: `dynamic tool name is reserved: ${reservedToolName} (codex has a built-in tool with this name; rename the tool in the request)`,
-            },
+            error: { code: 'thread_start_failed', message: refusal },
           });
           return;
         }
+        // Mark what is left as the caller's, so the directive can point at
+        // these tools without naming them (see CALLER_TOOL_DESCRIPTION_MARKER).
+        const dynamicTools: DynamicToolSpec[] | null =
+          callerTools && callerTools.usable.length > 0
+            ? callerTools.usable.map((t) => ({
+                ...t,
+                description: t.description
+                  ? `${CALLER_TOOL_DESCRIPTION_MARKER} ${t.description}`
+                  : CALLER_TOOL_DESCRIPTION_MARKER,
+              }))
+            : null;
         // In openai-compat mode codex is acting as a *model endpoint*, not
         // as an A2A agent — the gateway in front of it owns conversation
         // context and never delivers the bridge's own mention to the model

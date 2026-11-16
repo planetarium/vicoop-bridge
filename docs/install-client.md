@@ -935,14 +935,30 @@ Two limits of that arrangement:
   per tool whether to ask for approval at all, so do not rely on that
   for every server: review the config before exposing the agent, and
   be careful with any non-default `approval_decision`.
-- **Caller tool names that Codex reserves are refused.** A request
-  whose `tools` include `exec_command`, `write_stdin`, `apply_patch`
-  or `view_image` fails with `thread_start_failed: dynamic tool name
-  is reserved: <name>`, and the client logs a warning. Codex's
-  built-in tool of the same name would otherwise hide the caller's
-  tool, so it could never be called. Codex itself rejects names
-  starting with `mcp__` the same way. The caller has to rename the
-  tool.
+- **Some caller tool names cannot be used, because Codex has a
+  built-in tool of the same name that hides the caller's.** The client
+  knows the names Codex CLI 0.167.2 was observed to do this for:
+  `exec_command`, `write_stdin`, `apply_patch`, `view_image`,
+  `list_mcp_resources`, `list_mcp_resource_templates`,
+  `read_mcp_resource`, `web__run`, `clock__curr_time`, `exec`, `wait`,
+  `request_user_input` and `request_user_input_async`. Codex turns
+  `-` into `_` in tool names, so `apply-patch` counts as
+  `apply_patch`; case matters, so `Apply_Patch` is fine.
+  - A caller tool with one of these names is **left out** of the
+    request to Codex and the client logs one warning per task with the
+    built-in name(s) and how many tools were dropped. The caller's
+    other tools keep working.
+  - The request **fails** with `thread_start_failed` only when no
+    usable tool is left (`dynamic tool name is reserved: …`) or when
+    `tool_choice` names one of the dropped tools.
+  - The list is best-effort and tied to that Codex version. A name
+    another Codex version hides is not detected: that tool is sent as
+    usual and is simply never called.
+  - Codex itself rejects any tool name starting with `mcp__`
+    (`thread_start_failed: dynamic tool name is reserved`); the whole
+    request fails and the client cannot work around it.
+
+  In every case the caller has to rename the tool to use it.
 
 `workspace-write` and `danger-full-access` let a remote caller's
 prompt change files on the machine running `vicoop-client`. Choose

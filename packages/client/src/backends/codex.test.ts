@@ -3,13 +3,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import {
+  CALLER_TOOL_DESCRIPTION_MARKER,
   CALLER_TOOL_DISPATCH_DIRECTIVE,
+  codexShadowingToolName,
   composeNativeDevInstructions,
   createCodexBackend,
   historyToInjectItems,
   openaiToolsToDynamicToolSpecs,
   parseCodexConfigTomlForModel,
-  reservedCallerToolName,
+  partitionCallerTools,
 } from './codex.js';
 import type {
   AppServerChildHandle,
@@ -1887,27 +1889,32 @@ test('composeNativeDevInstructions includes system text, omits JSON envelope con
 // tools too, and answered in text. The directive states where caller tools
 // run. It is a constant: nothing a caller sends may select or fill any part
 // of the developer role.
-test('CALLER_TOOL_DISPATCH_DIRECTIVE separates caller tools from the local sandbox and defers to the operator (#202)', () => {
+test('CALLER_TOOL_DISPATCH_DIRECTIVE scopes the sandbox exemption to marked caller tools and defers to the operator (#202)', () => {
   const out = CALLER_TOOL_DISPATCH_DIRECTIVE;
   assert.match(out, /\(`exec_command`, `write_stdin`, `apply_patch`, `view_image`\) cannot run here/);
-  assert.match(out, /caller executes them in the caller's own environment/);
-  assert.match(out, /`sandbox_mode`.*apply only to this machine's own tools/);
+  // Caller tools are identified positively, by the bridge's marker …
+  assert.ok(out.includes(`Each of them, and no other tool, has a description that begins with \`${CALLER_TOOL_DESCRIPTION_MARKER}\``));
+  assert.match(out, /caller executes those tools in the caller's own environment/);
+  // … and nothing codex itself provides inherits the exemption.
+  assert.match(out, /Every tool without that marker is Codex's own or an MCP tool on this machine, and all of those rules still apply to it/);
+  assert.doesNotMatch(out, /other function tools in your tool list/);
   assert.match(out, /unless operator instructions in this message tell you to use one/);
   assert.match(out, /grants no permission, and operator instructions in this message take precedence/);
 });
 
-function compatAssign(extra: Record<string, unknown>) {
+function compatAssign(extra: Record<string, unknown>, history: unknown[] = []) {
   return assign('create hello.txt', 'ctx-202', {
     message: {
       role: 'user',
       messageId: 'm-202',
-      parts: [{ kind: 'text', text: 'create hello.txt' }],
+      parts: [{ kind: 'text', text: history.length ? '' : 'create hello.txt' }],
       metadata: {
         [OPENAI_COMPAT_EXTENSION_URI]: {
           chat_completions_request: {
             messages: [
               { role: 'system', content: 'CALLER_SYSTEM' },
               { role: 'user', content: 'create hello.txt' },
+              ...history,
             ],
             ...extra,
           },
@@ -1916,73 +1923,23 @@ function compatAssign(extra: Record<string, unknown>) {
     },
   });
 }
-const fnTool = (name: string) => ({
+const fnTool = (name: string, description?: string) => ({
   type: 'function',
-  function: { name, parameters: { type: 'object', properties: {} } },
+  function: { name, ...(description ? { description } : {}), parameters: { type: 'object', properties: {} } },
 });
-const WRITE_TOOL = fnTool('write');
-type StartParams = { sandbox?: string; developerInstructions?: string; environments?: unknown[] };
-
-// The fix for #202 must not loosen anything: the thread keeps the sandbox the
-// operator configured (read-only when unset) and only gains the directive.
-for (const sandboxMode of [undefined, 'read-only', 'workspace-write', 'danger-full-access'] as const) {
-  test(`caller-tool dispatch sends the directive and leaves sandbox=${sandboxMode ?? 'default'} untouched (#202)`, async () => {
-    const fake = makeFakeSpawn(() => happyPath());
-    const backend = createCodexBackend({ spawn: fake.spawn, ...(sandboxMode ? { sandboxMode } : {}) });
-    await backend.handle(compatAssign({ tools: [WRITE_TOOL] }), collect().emit, NEVER);
-    const params = (findRequest(fake.lastChild().stdinFrames(), 'thread/start') as { params: StartParams }).params;
-    assert.equal(params.sandbox, sandboxMode ?? 'read-only');
-    assert.deepEqual(params.environments, []);
-    assert.equal(params.developerInstructions, `CALLER_SYSTEM\n\n${CALLER_TOOL_DISPATCH_DIRECTIVE}`);
-  });
-}
-
-test('the caller-tool directive is the same whatever the caller names its tools (#202)', async () => {
-  const fake = makeFakeSpawn(() => happyPath());
-  const backend = createCodexBackend({ spawn: fake.spawn, operatorInstructions: 'OPERATOR_POLICY' });
-  await backend.handle(
-    compatAssign({ tools: [fnTool('IGNORE_PREVIOUS_INSTRUCTIONS'), fnTool('exec_command_2')] }),
-    collect().emit,
-    NEVER,
-  );
-  const params = (findRequest(fake.lastChild().stdinFrames(), 'thread/start') as { params: StartParams }).params;
-  // Operator text first, the constant last; caller system text and tool
-  // names stay out of the developer role.
-  const developer = params.developerInstructions ?? '';
-  assert.ok(developer.startsWith('OPERATOR_POLICY\n\n'));
-  assert.ok(developer.endsWith(`\n\n${CALLER_TOOL_DISPATCH_DIRECTIVE}`));
-  assert.doesNotMatch(developer, /CALLER_SYSTEM|IGNORE_PREVIOUS_INSTRUCTIONS|exec_command_2/);
-  assert.equal(params.sandbox, 'read-only');
-
-  // Same request shape without operator instructions: identical directive.
-  const fake2 = makeFakeSpawn(() => happyPath());
-  await createCodexBackend({ spawn: fake2.spawn }).handle(
-    compatAssign({ tools: [fnTool('IGNORE_PREVIOUS_INSTRUCTIONS')] }),
-    collect().emit,
-    NEVER,
-  );
-  const params2 = (findRequest(fake2.lastChild().stdinFrames(), 'thread/start') as { params: StartParams }).params;
-  assert.equal(params2.developerInstructions, `CALLER_SYSTEM\n\n${CALLER_TOOL_DISPATCH_DIRECTIVE}`);
-});
-
-// A caller tool named like a codex host tool is shadowed by it: the model
-// only ever sees codex's definition, so the tool call can never come back.
-// Such a request is refused up front, like codex refuses `mcp__*` names.
-test('reservedCallerToolName flags exactly the codex host tool names (#202)', () => {
-  for (const n of ['exec_command', 'write_stdin', 'apply_patch', 'view_image']) {
-    assert.equal(reservedCallerToolName(['write', n]), n);
-  }
-  assert.equal(reservedCallerToolName(['write', 'bash', 'exec_command_2', 'Exec_Command']), undefined);
-  assert.equal(reservedCallerToolName([]), undefined);
-});
-
-test('a caller tool named like a codex host tool fails the task before any thread starts (#202)', async () => {
-  const fake = makeFakeSpawn(() => happyPath());
+const WRITE_TOOL = fnTool('write', 'Write a file.');
+type StartParams = {
+  sandbox?: string;
+  developerInstructions?: string;
+  environments?: unknown[];
+  dynamicTools?: Array<{ name: string; description: string }>;
+};
+function warnCollector() {
   const warns: string[] = [];
-  const backend = createCodexBackend({
-    spawn: fake.spawn,
+  return {
+    warns,
     logger: {
-      level: 'warn',
+      level: 'warn' as const,
       info: () => {},
       warn: (...args: unknown[]) => {
         warns.push(args.map(String).join(' '));
@@ -1990,28 +1947,206 @@ test('a caller tool named like a codex host tool fails the task before any threa
       error: () => {},
       debug: () => {},
     },
-  });
+  };
+}
+async function startParamsFor(
+  extra: Record<string, unknown>,
+  opts: Parameters<typeof createCodexBackend>[0] = {},
+  history: unknown[] = [],
+) {
+  const fake = makeFakeSpawn(() => happyPath());
   const { emit, frames } = collect();
-  await backend.handle(compatAssign({ tools: [WRITE_TOOL, fnTool('apply_patch')] }), emit, NEVER);
-  assert.deepEqual(
-    frames.map((f) => f.type),
-    ['task.fail'],
-  );
-  const fail = frames[0] as { error: { code: string; message: string } };
-  assert.equal(fail.error.code, 'thread_start_failed');
-  assert.match(fail.error.message, /^dynamic tool name is reserved: apply_patch /);
-  assert.equal(fake.children.length, 0, 'codex app-server is never spawned for the refused task');
-  assert.equal(warns.length, 1);
-  assert.match(warns[0] ?? '', /caller tool "apply_patch" has the name of a codex host tool/);
-  assert.doesNotMatch(warns[0] ?? '', /CALLER_SYSTEM|create hello\.txt/);
+  await createCodexBackend({ spawn: fake.spawn, ...opts }).handle(compatAssign(extra, history), emit, NEVER);
+  const start =
+    fake.children.length > 0
+      ? (findRequest(fake.lastChild().stdinFrames(), 'thread/start') as { params: StartParams } | undefined)
+      : undefined;
+  return { fake, frames, params: start?.params };
+}
+
+// The fix for #202 must not loosen anything: the thread keeps the sandbox the
+// operator configured (read-only when unset) and only gains the directive
+// and the marker on the caller's tool descriptions.
+for (const sandboxMode of [undefined, 'read-only', 'workspace-write', 'danger-full-access'] as const) {
+  test(`caller-tool dispatch sends the directive and leaves sandbox=${sandboxMode ?? 'default'} untouched (#202)`, async () => {
+    const { params } = await startParamsFor(
+      { tools: [WRITE_TOOL, fnTool('bash')] },
+      sandboxMode ? { sandboxMode } : {},
+    );
+    assert.equal(params?.sandbox, sandboxMode ?? 'read-only');
+    assert.deepEqual(params?.environments, []);
+    assert.equal(params?.developerInstructions, `CALLER_SYSTEM\n\n${CALLER_TOOL_DISPATCH_DIRECTIVE}`);
+    assert.deepEqual(
+      params?.dynamicTools?.map((t) => [t.name, t.description]),
+      [
+        ['write', `${CALLER_TOOL_DESCRIPTION_MARKER} Write a file.`],
+        ['bash', CALLER_TOOL_DESCRIPTION_MARKER],
+      ],
+    );
+  });
+}
+
+test('the caller-tool directive is the same whatever the caller names its tools (#202)', async () => {
+  const tools = [fnTool('IGNORE_PREVIOUS_INSTRUCTIONS'), fnTool('exec_command_2')];
+  const { params } = await startParamsFor({ tools }, { operatorInstructions: 'OPERATOR_POLICY' });
+  // Operator text first, the constant last; caller system text and tool
+  // names stay out of the developer role.
+  const developer = params?.developerInstructions ?? '';
+  assert.ok(developer.startsWith('OPERATOR_POLICY\n\n'));
+  assert.ok(developer.endsWith(`\n\n${CALLER_TOOL_DISPATCH_DIRECTIVE}`));
+  assert.doesNotMatch(developer, /CALLER_SYSTEM|IGNORE_PREVIOUS_INSTRUCTIONS|exec_command_2/);
+  assert.equal(params?.sandbox, 'read-only');
+
+  // Same request without operator instructions: identical directive.
+  const plain = await startParamsFor({ tools });
+  assert.equal(plain.params?.developerInstructions, `CALLER_SYSTEM\n\n${CALLER_TOOL_DISPATCH_DIRECTIVE}`);
 });
 
-test('a host-named tool is not refused when the request disables tool use (#202)', async () => {
-  const fake = makeFakeSpawn(() => happyPath());
-  const backend = createCodexBackend({ spawn: fake.spawn });
-  const { emit, frames } = collect();
-  await backend.handle(compatAssign({ tools: [fnTool('apply_patch')], tool_choice: 'none' }), emit, NEVER);
+// A caller tool that a codex built-in shadows can never be called: the model
+// only ever sees codex's definition. The list is what codex-cli 0.167.2 was
+// observed to shadow, compared after codex's own name normalisation.
+test('codexShadowingToolName matches the 0.167.2 built-ins after codex name normalisation (#202)', () => {
+  for (const n of [
+    'exec_command', 'write_stdin', 'apply_patch', 'view_image',
+    'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource',
+    'web__run', 'clock__curr_time',
+    'exec', 'wait', 'request_user_input', 'request_user_input_async',
+  ]) {
+    assert.equal(codexShadowingToolName(n), n);
+  }
+  // `-` becomes `_` in codex's registry, so these collide too.
+  assert.equal(codexShadowingToolName('exec-command'), 'exec_command');
+  assert.equal(codexShadowingToolName('apply-patch'), 'apply_patch');
+  assert.equal(codexShadowingToolName('write-stdin'), 'write_stdin');
+  assert.equal(codexShadowingToolName('view-image'), 'view_image');
+  assert.equal(codexShadowingToolName('web--run'), 'web__run');
+  assert.equal(codexShadowingToolName('web_-run'), 'web__run');
+  // Not shadowed on 0.167.2: case differs, single underscore, or a codex
+  // name that was checked and found to leave the caller's tool visible.
+  for (const n of [
+    'Exec_Command', 'web_run', 'web-run', 'clock-curr-time', 'exec_command_2', 'my-tool',
+    'update_plan', 'shell', 'sleep', 'spawn_agent', 'send_message', 'write', 'bash', '1tool',
+  ]) {
+    assert.equal(codexShadowingToolName(n), undefined, n);
+  }
+});
+
+test('partitionCallerTools keeps usable tools in order and reports built-in names once (#202)', () => {
+  const spec = (name: string) => ({ name, description: '', inputSchema: {} });
+  const out = partitionCallerTools(
+    ['read', 'apply_patch', 'bash', 'apply-patch', 'exec-command'].map(spec),
+  );
+  assert.deepEqual(out.usable.map((t) => t.name), ['read', 'bash']);
+  assert.deepEqual(out.shadowedBy, ['apply_patch', 'exec_command']);
+  assert.equal(out.droppedCount, 3);
+});
+
+// Older-opencode-style toolset: one shadowed name among usable tools. The
+// request must keep working with the usable ones, as it did before #202.
+test('a shadowed caller tool is dropped with one warn and the rest are dispatched (#202)', async () => {
+  const { warns, logger } = warnCollector();
+  const { frames, params } = await startParamsFor(
+    { tools: ['read', 'bash', 'glob', 'grep', 'apply_patch'].map((n) => fnTool(n)) },
+    { logger },
+  );
   assert.equal(frames.at(-1)?.type, 'task.complete');
+  assert.deepEqual(params?.dynamicTools?.map((t) => t.name), ['read', 'bash', 'glob', 'grep']);
+  assert.deepEqual(params?.environments, []);
+  assert.ok(params?.developerInstructions?.endsWith(CALLER_TOOL_DISPATCH_DIRECTIVE));
+  const dropWarns = warns.filter((w) => w.includes('shadow'));
+  assert.equal(dropWarns.length, 1);
+  assert.match(dropWarns[0] ?? '', /dropped 1 of 5 caller tool\(s\)/);
+  assert.match(dropWarns[0] ?? '', /\(apply_patch\)/);
+});
+
+test('the drop warning carries built-in names and counts, never caller strings (#202)', async () => {
+  const { warns, logger } = warnCollector();
+  const { params } = await startParamsFor(
+    { tools: [WRITE_TOOL, fnTool('exec-command', 'CALLER_DESCRIPTION'), fnTool('web--run')] },
+    { logger },
+  );
+  assert.deepEqual(params?.dynamicTools?.map((t) => t.name), ['write']);
+  const w = warns.find((x) => x.includes('shadow')) ?? '';
+  assert.match(w, /dropped 2 of 3 caller tool\(s\)/);
+  assert.match(w, /\(exec_command, web__run\)/);
+  assert.doesNotMatch(w, /exec-command|web--run|CALLER_DESCRIPTION|CALLER_SYSTEM|create hello\.txt/);
+});
+
+test('a request whose caller tools are all shadowed fails before any thread starts (#202)', async () => {
+  const { warns, logger } = warnCollector();
+  const { fake, frames } = await startParamsFor(
+    { tools: [fnTool('apply_patch'), fnTool('exec-command')] },
+    { logger },
+  );
+  assert.deepEqual(frames.map((f) => f.type), ['task.fail']);
+  const fail = frames[0] as { error: { code: string; message: string } };
+  assert.equal(fail.error.code, 'thread_start_failed');
+  assert.match(fail.error.message, /^dynamic tool name is reserved: apply_patch, exec_command /);
+  assert.equal(fake.children.length, 0, 'codex app-server is never spawned for the refused task');
+  assert.equal(warns.length, 1);
+  assert.match(warns[0] ?? '', /rejected/);
+});
+
+// `tool_choice` naming a shadowed tool cannot be honoured, and the usual
+// "you MUST invoke <name>" nudge would point the model at codex's own tool.
+test('tool_choice naming a shadowed tool fails the task even when other tools are usable (#202)', async () => {
+  const { fake, frames } = await startParamsFor({
+    tools: [WRITE_TOOL, fnTool('apply-patch')],
+    tool_choice: { type: 'function', function: { name: 'apply-patch' } },
+  });
+  assert.deepEqual(frames.map((f) => f.type), ['task.fail']);
+  const fail = frames[0] as { error: { code: string; message: string } };
+  assert.equal(fail.error.code, 'thread_start_failed');
+  assert.match(fail.error.message, /^tool_choice names a reserved dynamic tool name: apply_patch /);
+  assert.equal(fake.children.length, 0);
+});
+
+test('tool_choice naming a usable tool, or "required", proceeds with the remaining tools (#202)', async () => {
+  const tools = [WRITE_TOOL, fnTool('apply_patch')];
+  const named = await startParamsFor({ tools, tool_choice: { type: 'function', function: { name: 'write' } } });
+  assert.equal(named.frames.at(-1)?.type, 'task.complete');
+  assert.deepEqual(named.params?.dynamicTools?.map((t) => t.name), ['write']);
+  assert.match(named.params?.developerInstructions ?? '', /MUST invoke the tool named "write"/);
+
+  const required = await startParamsFor({ tools, tool_choice: 'required' });
+  assert.equal(required.frames.at(-1)?.type, 'task.complete');
+  assert.deepEqual(required.params?.dynamicTools?.map((t) => t.name), ['write']);
+  assert.match(required.params?.developerInstructions ?? '', /tool_choice="required"/);
+});
+
+test('tool_choice="none" neither drops, warns about, nor refuses shadowed tool names (#202)', async () => {
+  const { warns, logger } = warnCollector();
+  const { frames, params } = await startParamsFor(
+    { tools: [fnTool('apply_patch')], tool_choice: 'none' },
+    { logger },
+  );
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+  assert.equal(params?.dynamicTools, undefined);
+  assert.equal(warns.filter((w) => w.includes('shadow')).length, 0);
+});
+
+// An earlier turn's history may mention a tool that is now dropped (the
+// caller keeps replaying it). History is injected as it always was.
+test('history that references a dropped tool name is still injected and the task proceeds (#202)', async () => {
+  const { fake, frames, params } = await startParamsFor(
+    { tools: [WRITE_TOOL, fnTool('apply_patch')] },
+    {},
+    [
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'apply_patch', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'call-1', content: 'PATCH_RESULT' },
+    ],
+  );
+  assert.equal(frames.at(-1)?.type, 'task.complete');
+  assert.deepEqual(params?.dynamicTools?.map((t) => t.name), ['write']);
+  const inject = findRequest(fake.lastChild().stdinFrames(), 'thread/inject_items') as {
+    params: { items: Array<{ type?: string; name?: string }> };
+  };
+  assert.ok(inject.params.items.some((i) => i.type === 'function_call' && i.name === 'apply_patch'));
+  assert.equal(inject.params.items.at(-1)?.type, 'function_call_output');
 });
 
 // Without a usable caller tool the directive would describe tools that do
@@ -2019,20 +2154,17 @@ test('a host-named tool is not refused when the request disables tool use (#202)
 // dispatch for `environments: []` (unchanged), but gets no directive.
 for (const [name, extra, environments] of [
   ['no tools', {}, undefined],
+  ['tools: []', { tools: [] }, undefined],
   ['tool_choice="none"', { tools: [WRITE_TOOL], tool_choice: 'none' }, undefined],
   ['only malformed tools', { tools: [{ type: 'retrieval' }, { type: 'function' }, null] }, []],
 ] as const) {
   test(`openai-compat request with ${name} gets no caller-tool directive (#202)`, async () => {
-    const fake = makeFakeSpawn(() => happyPath());
-    const backend = createCodexBackend({ spawn: fake.spawn });
-    await backend.handle(compatAssign(extra), collect().emit, NEVER);
-    const start = findRequest(fake.lastChild().stdinFrames(), 'thread/start') as {
-      params: StartParams & { dynamicTools?: unknown };
-    };
-    assert.equal(start.params.developerInstructions, 'CALLER_SYSTEM');
-    assert.equal(start.params.sandbox, 'read-only');
-    assert.deepEqual(start.params.environments, environments);
-    assert.equal(start.params.dynamicTools, undefined);
+    const { frames, params } = await startParamsFor(extra);
+    assert.equal(frames.at(-1)?.type, 'task.complete');
+    assert.equal(params?.developerInstructions, 'CALLER_SYSTEM');
+    assert.equal(params?.sandbox, 'read-only');
+    assert.deepEqual(params?.environments, environments);
+    assert.equal(params?.dynamicTools, undefined);
   });
 }
 
