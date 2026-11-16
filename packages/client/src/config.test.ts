@@ -356,6 +356,33 @@ test('normalizeConfig accepts backends.codex with sandbox_mode and approval_deci
   });
 });
 
+test('normalizeConfig keeps a boolean backends.codex.retry_stalled_tool_call and drops other types (#207)', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-codex-retry-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  writeFileSync(
+    path,
+    JSON.stringify({ backends: { codex: { retry_stalled_tool_call: true } } }),
+  );
+  assert.deepEqual(readConfig(path), {
+    backends: { codex: { retry_stalled_tool_call: true } },
+  });
+  // Explicit `false` survives too, so a `--config` overlay can turn it off.
+  writeFileSync(
+    path,
+    JSON.stringify({ backends: { codex: { retry_stalled_tool_call: false } } }),
+  );
+  assert.deepEqual(readConfig(path), {
+    backends: { codex: { retry_stalled_tool_call: false } },
+  });
+  // A non-boolean must not switch the retry on.
+  writeFileSync(
+    path,
+    JSON.stringify({ backends: { codex: { cwd: '/srv', retry_stalled_tool_call: 'yes' } } }),
+  );
+  assert.deepEqual(readConfig(path), { backends: { codex: { cwd: '/srv' } } });
+});
+
 test('normalizeConfig drops invalid codex approval_decision', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'vicoop-cfg-codex-approval-bad-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

@@ -437,6 +437,37 @@ test('--no-vicoop-codex-reasoning beats config reasoning:true', () => {
   assert.equal(r.args.vicoopCodexReasoning, false);
 });
 
+test('--codex-retry-stalled-tool-call resolves from flag, then config, and is codex-only (#207)', () => {
+  assert.equal(parseFlags(['--codex-retry-stalled-tool-call']).ok, true);
+
+  const off = mergeClientArgs({ token: 't', agentId: 'a', backend: 'codex' }, {});
+  assert.equal(off.ok, true);
+  if (off.ok) assert.equal(off.args.codexRetryStalledToolCall, undefined);
+
+  const fromFlag = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'codex', codexRetryStalledToolCall: true },
+    {},
+  );
+  assert.equal(fromFlag.ok, true);
+  if (fromFlag.ok) assert.equal(fromFlag.args.codexRetryStalledToolCall, true);
+
+  const fromConfig = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'codex' },
+    { backends: { codex: { retry_stalled_tool_call: true } } },
+  );
+  assert.equal(fromConfig.ok, true);
+  if (fromConfig.ok) assert.equal(fromConfig.args.codexRetryStalledToolCall, true);
+
+  const wrongBackend = mergeClientArgs(
+    { token: 't', agentId: 'a', backend: 'claude', codexRetryStalledToolCall: true },
+    {},
+  );
+  assert.equal(wrongBackend.ok, false);
+  if (!wrongBackend.ok) {
+    assert.ok(wrongBackend.errors.some((e) => e.includes('--codex-retry-stalled-tool-call')));
+  }
+});
+
 test('--no-vicoop-codex-reasoning with a non-vicoop-codex backend is a hard error', () => {
   const r = mergeClientArgs(
     { token: 't', agentId: 'a', backend: 'claude', noVicoopCodexReasoning: true },

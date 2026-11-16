@@ -126,6 +126,11 @@ export const daemonFlagsFields = {
   codexSandbox: optional(option('--codex-sandbox', choice([...SANDBOX_MODES]), {
     description: message`Codex sandbox mode.`,
   })),
+  codexRetryStalledToolCall: optional(
+    flag('--codex-retry-stalled-tool-call', {
+      description: message`On a caller-tool turn that ends with no tool call after the model reached for a host-side tool instead (or ignored a forced \`tool_choice\`), run one corrective turn on the same thread (planetarium/vicoop-bridge#207). Off by default: it costs an extra turn when it fires and part of the detection is a heuristic. Only valid with \`--backend codex\`. Mirrors config \`backends.codex.retry_stalled_tool_call\`.`,
+    }),
+  ),
 
   // Backend-specific (vicoop-codex)
   noVicoopCodexReasoning: optional(
@@ -196,6 +201,7 @@ export interface DaemonArgs {
   claudeThinkingBudget?: number;
   claudeRetryNarratedToolCall?: boolean;
   codexSandbox?: CodexSandboxMode;
+  codexRetryStalledToolCall?: boolean;
   // Resolved openai-compat/v1 reasoning channel toggle for the vicoop-codex
   // backend. Defaults ON; the `--no-vicoop-codex-reasoning` flag or
   // `backends['vicoop-codex'].reasoning: false` flips it off (#95 / #375).
@@ -358,6 +364,8 @@ export function mergeClientArgs(
       flags.claudeRetryNarratedToolCall ?? backends.claude?.retry_narrated_tool_call,
     codexSandbox:
       flags.codexSandbox ?? pickSandbox(backends.codex?.sandbox_mode),
+    codexRetryStalledToolCall:
+      flags.codexRetryStalledToolCall ?? backends.codex?.retry_stalled_tool_call,
     // ON unless the config opts out (`reasoning: false`) or the CLI flag forces
     // it off; the flag wins over config, matching the other flag>config knobs.
     vicoopCodexReasoning:
@@ -450,6 +458,11 @@ export function mergeClientArgs(
   if (flags.claudeRetryNarratedToolCall && backend !== 'claude') {
     errors.push(
       `--claude-retry-narrated-tool-call is not supported by --backend ${backend}; only the claude backend runs caller-tool turns`,
+    );
+  }
+  if (flags.codexRetryStalledToolCall && backend !== 'codex') {
+    errors.push(
+      `--codex-retry-stalled-tool-call is not supported by --backend ${backend}; only the codex backend runs this retry`,
     );
   }
   if (flags.noVicoopCodexReasoning && backend !== 'vicoop-codex') {

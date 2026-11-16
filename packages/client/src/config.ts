@@ -169,6 +169,17 @@ export interface CodexBackendConfig {
   sandbox_mode?: string;
   /** What to answer when codex requests user approval. Default `decline`. */
   approval_decision?: 'accept' | 'acceptForSession' | 'decline' | 'remote';
+  /**
+   * When a caller-tool turn (openai-compat with `tools`) ends with no tool call
+   * and does not look like a final answer — the model reached for a host-side
+   * tool that cannot run there, or ignored a forced `tool_choice` — run one
+   * corrective turn on the same thread so the caller's tools actually get
+   * called (planetarium/vicoop-bridge#207). OFF by default: it costs an extra
+   * turn whenever it fires, and the weakest trigger (a model round spent on
+   * something other than a caller tool call) is a heuristic that can misfire
+   * on a genuine answer. Mirrors the `--codex-retry-stalled-tool-call` flag.
+   */
+  retry_stalled_tool_call?: boolean;
   runtime?: BackendRuntime;
   /** Legacy shared-container selector, retained to report migration errors. */
   runtime_name?: string;
@@ -379,11 +390,13 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const callerRuntime = codexRaw.caller_runtime === undefined ? undefined : CallerRuntimeConfig.parse(codexRaw.caller_runtime);
       if (callerRuntime) assertCallerRuntimeBackend('codex', callerRuntime);
       const runtimeName = asString(codexRaw.runtime_name);
-      if (cwd || validSandbox || validApproval || runtime || runtimeName || callerRuntime) {
+      const retryStalled = asBoolean(codexRaw.retry_stalled_tool_call);
+      if (cwd || validSandbox || validApproval || runtime || runtimeName || callerRuntime || retryStalled !== undefined) {
         out.codex = {};
         if (cwd) out.codex.cwd = cwd;
         if (validSandbox) out.codex.sandbox_mode = validSandbox;
         if (validApproval) out.codex.approval_decision = validApproval;
+        if (retryStalled !== undefined) out.codex.retry_stalled_tool_call = retryStalled;
         if (runtime) out.codex.runtime = runtime;
         if (runtimeName) out.codex.runtime_name = runtimeName;
         if (callerRuntime) out.codex.caller_runtime = callerRuntime;

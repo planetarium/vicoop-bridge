@@ -18,7 +18,7 @@ import {
 import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
-import { createLogger, type Logger } from '../logger.js';
+import { createLogger, safeToken, type Logger } from '../logger.js';
 import {
   callerToolDispatchActive,
   chatHistoryFromMessages,
@@ -123,6 +123,11 @@ export interface CodexBackendOptions {
   // endpoint, not an A2A agent, there). Carries through `thread/resume`
   // because codex persists `developerInstructions` server-side per thread.
   identity?: AgentIdentity;
+  // Opt into the corrective retry for a caller-tool turn that ended with no
+  // tool call for a reason that does not look like a final answer (#207). Off
+  // by default — it spends an extra turn when it fires, and the weakest of the
+  // triggers is a heuristic. See `classifyEmptyDispatchTurn`.
+  retryStalledToolCall?: boolean;
   /** Operator-owned instructions, also retained for model-endpoint requests. */
   operatorInstructions?: string;
   /** Bridge-owned workspace/proxy instructions, applied to plain A2A threads. */
@@ -533,6 +538,185 @@ export function composeNativeDevInstructions(
   return sections.join('\n\n');
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Caller-tool turns that end with no tool call (#207)
+//
+// Under caller-tool dispatch the caller's `tools` are the only surface that can
+// act: `environments: []` and the feature overrides strip codex's own execution
+// tools, and the bridge declines every approval prompt. A turn that completes
+// having emitted no `item/tool/call` therefore hands the caller nothing to run.
+//
+// That is correct when the text was a final answer (typically the turn after
+// tool results came back) and a silent dead end when the model gave up. The
+// codex shape of the dead end, traced live on codex-cli 0.167.2: the model
+// reaches for a host-side tool first — a shell call that fails with "No usable
+// execution environment", or an MCP server from the operator's own
+// `~/.codex/config.toml` whose approval prompt the bridge declines — and then
+// reports "I couldn't create the app because the tool calls were cancelled"
+// instead of calling the caller's tools. The task used to complete with
+// `finish_reason: "stop"` and nothing in the logs.
+//
+// The claude backend has the same instrumentation and opt-in retry for its
+// version of this (#441 — `describeEmptyDispatchTurn` and
+// `shouldRetryNarratedToolCall` in claude.ts). The detection differs because
+// the failure does: claude narrates the call as prose, so its signal is the
+// text; codex goes off to tools that cannot work, so the signal here is
+// structural and no model output is inspected or logged.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Why a tool-less caller-tool turn is suspected of being a dead end rather than
+// a final answer. Ordered strongest first; `classifyEmptyDispatchTurn` returns
+// the first that applies.
+//
+//   - `tool_choice_unmet`: the caller sent `tool_choice: "required"` (or named
+//     a function) and got prose. Not a heuristic — the request was not met.
+//   - `host_tool_failed`: a codex-side tool item (MCP call, command execution,
+//     file change, …) completed `failed` / `declined` during the turn.
+//   - `host_tool_round`: the turn spent a model round on something that was not
+//     a caller tool call — a host tool item that did not fail, or more than one
+//     model round with no caller tool call to show for it. Covers the shell
+//     failure above, which codex reports to the model but not as an item. This
+//     is the weakest of the three: a harmless internal call (`update_plan`)
+//     followed by a genuine answer looks the same.
+export type EmptyDispatchTurnReason =
+  | 'tool_choice_unmet'
+  | 'host_tool_failed'
+  | 'host_tool_round';
+
+// Codex `ThreadItem` types that are tool activity run by codex itself rather
+// than by the caller. An allow-list on purpose: an item type this file does not
+// know about must not be counted as a failed tool. `dynamicToolCall` is absent
+// because that IS the caller's tool — and it always completes `failed`, since
+// the bridge answers `success: false` before interrupting the turn.
+const HOST_TOOL_ITEM_TYPES: ReadonlySet<string> = new Set([
+  'commandExecution',
+  'fileChange',
+  'mcpToolCall',
+  'collabAgentToolCall',
+  'webSearch',
+  'imageView',
+  'imageGeneration',
+]);
+
+// Classify a completed thread item as host-side tool activity. Returns null for
+// anything that is not (messages, reasoning, the caller's own dynamic tool
+// call, unknown types). `kind` is safe to log: the item type, plus the MCP
+// server name for `mcpToolCall` — operator configuration, which is what an
+// operator needs to find the server leaking into caller-dispatch turns.
+//
+// Exported for unit tests.
+export function classifyHostToolItem(
+  item: ThreadItem,
+): { kind: string; failed: boolean } | null {
+  if (!HOST_TOOL_ITEM_TYPES.has(item.type)) return null;
+  const rec = item as Record<string, unknown>;
+  const status = typeof rec.status === 'string' ? rec.status : '';
+  const server =
+    item.type === 'mcpToolCall' && typeof rec.server === 'string' && rec.server
+      ? `:${safeToken(rec.server, 40)}`
+      : '';
+  return {
+    kind: `${item.type}${server}`,
+    failed: status === 'failed' || status === 'declined',
+  };
+}
+
+function toolChoiceForcesCall(toolChoice: unknown): boolean {
+  if (toolChoice === 'required') return true;
+  if (typeof toolChoice !== 'object' || toolChoice === null || Array.isArray(toolChoice)) {
+    return false;
+  }
+  return (toolChoice as { type?: unknown }).type === 'function';
+}
+
+// Decide whether a completed caller-tool turn that emitted no tool call looks
+// like a dead end. Only meaningful for that population — the caller checks
+// dispatch / completion / zero tool calls first (see
+// `describeEmptyDispatchTurn`). Returns null for the unremarkable case: one
+// model round, no host tool activity, no forced `tool_choice`. That is what a
+// final answer looks like, and it is left alone.
+//
+// Exported for unit tests.
+export function classifyEmptyDispatchTurn(opts: {
+  toolChoice: unknown;
+  modelRounds: number;
+  hostToolItems: number;
+  hostToolFailures: number;
+}): EmptyDispatchTurnReason | null {
+  if (toolChoiceForcesCall(opts.toolChoice)) return 'tool_choice_unmet';
+  if (opts.hostToolFailures > 0) return 'host_tool_failed';
+  if (opts.hostToolItems > 0 || opts.modelRounds > 1) return 'host_tool_round';
+  return null;
+}
+
+// The log line for a caller-tool turn that completed with nothing for the
+// caller to execute, or null when the turn is not in that population.
+//
+// Like the claude line it mirrors, this covers the WHOLE population, including
+// legitimate final answers, so the rate stays measurable; `reason` is what
+// separates the suspect ones. `info` when unclassified or only weakly flagged
+// (`host_tool_round`), `warn` for the two strong reasons — those are anomalies
+// an operator can act on (an MCP server reachable from caller-dispatch turns, a
+// forced tool call the model ignored), and warn has to stay alertable.
+//
+// No model output reaches the log: `taskId` joins to the session transcript,
+// `textLen` / `modelRounds` are the cheap discriminators, `toolHistory` says
+// whether the request already carried tool results (a final answer usually
+// follows some; a first turn that calls nothing is the more suspect one).
+//
+// Exported for unit tests.
+export function describeEmptyDispatchTurn(opts: {
+  taskId: string;
+  dispatchActive: boolean;
+  toolCallCount: number;
+  completed: boolean;
+  textLength: number;
+  model: string | null;
+  toolChoice: unknown;
+  toolHistory: boolean;
+  modelRounds: number;
+  hostToolItems: number;
+  hostToolFailures: number;
+  hostToolKinds: readonly string[];
+}): { level: 'info' | 'warn'; line: string; reason: EmptyDispatchTurnReason | null } | null {
+  if (!opts.dispatchActive) return null;
+  if (opts.toolCallCount > 0) return null;
+  // A failed, interrupted or aborted turn already surfaces through its own
+  // path; the interesting case is a turn that reported success while producing
+  // nothing to execute.
+  if (!opts.completed) return null;
+  const reason = classifyEmptyDispatchTurn(opts);
+  const line =
+    `[codex] caller-tool turn produced no tool calls taskId=${safeToken(opts.taskId)} ` +
+    `model=${safeToken(opts.model ?? 'unknown', 60)} textLen=${opts.textLength} ` +
+    `modelRounds=${opts.modelRounds} toolHistory=${opts.toolHistory} ` +
+    `hostToolItems=${opts.hostToolItems} hostToolFailures=${opts.hostToolFailures}` +
+    (opts.hostToolKinds.length > 0 ? ` hostToolKinds=${opts.hostToolKinds.join(',')}` : '') +
+    ` reason=${reason ?? 'none'}`;
+  const level = reason === 'tool_choice_unmet' || reason === 'host_tool_failed' ? 'warn' : 'info';
+  return { level, line, reason };
+}
+
+// The corrective turn sent on the same thread when `retryStalledToolCall` is on
+// and a caller-tool turn was classified as a dead end. It names what went wrong
+// (host tools cannot run here), names the tools that can, and leaves the task
+// itself alone — the thread still holds the whole conversation. The last
+// sentence is the escape hatch for a false positive: a model that had genuinely
+// finished should say so again rather than invent a tool call it does not need.
+//
+// Exported for unit tests.
+export function composeStalledToolCallNudge(toolNames: readonly string[]): string {
+  const names = toolNames.map((n) => `\`${n}\``).join(', ');
+  return (
+    'Your previous turn ended without calling any of the function tools the caller provided, so nothing ran. ' +
+    'Tools that run on this host — shell or command execution, file patching, MCP servers, plugins — ' +
+    'are not available in this session: they fail or are cancelled, and you must not use them. ' +
+    `The only tools that can act are the caller-provided function tools: ${names}. ` +
+    'Continue the task now by calling them directly. ' +
+    'If the task is already complete and no tool call is needed, reply with your final answer only.'
+  );
+}
+
 // Flatten an OpenAI message `content` (string or content-part array) into
 // the codex Responses API text payload. The Responses API's
 // `content[].type` discriminator differs by role — `input_text` for
@@ -696,6 +880,8 @@ export function createCodexBackend(
   const initializeTimeoutMs = opts.initializeTimeoutMs ?? 10_000;
   const turnTimeoutMs = opts.turnTimeoutMs ?? 0;
   const toolCallUsageWaitMs = opts.toolCallUsageWaitMs ?? 1_000;
+  // #207 opt-in: corrective retry for a caller-tool turn that stalled.
+  const retryStalledToolCall = opts.retryStalledToolCall === true;
   // Precomputed once at construction (identity is per-daemon, not per-task).
   // Prepended to `developerInstructions` on every `thread/start` so the model
   // recognises its own mention / acct in user messages. See PR #129.
@@ -1440,9 +1626,13 @@ export function createCodexBackend(
           const sendEmptyEnvironments = callerToolDispatchActive(envelopeTools, envelopeToolChoice);
 
           let threadId: string;
+          // The model codex resolved for the thread, for the #207 log line.
+          // `envelope.model` is often absent or dropped by the gate above, and
+          // the operator's config.toml default is otherwise invisible here.
+          let threadModel: string | null = null;
           try {
             if (isResume) {
-              const resumeResult = await client.request<{ thread: { id: string } }>(
+              const resumeResult = await client.request<{ thread: { id: string }; model?: unknown }>(
                 'thread/resume',
                 {
                   threadId: existing.threadId,
@@ -1453,8 +1643,9 @@ export function createCodexBackend(
                 },
               );
               threadId = resumeResult.thread.id;
+              if (typeof resumeResult.model === 'string') threadModel = resumeResult.model;
             } else {
-              const startResult = await client.request<{ thread: { id: string } }>(
+              const startResult = await client.request<{ thread: { id: string }; model?: unknown }>(
                 'thread/start',
                 {
                   cwd,
@@ -1471,6 +1662,7 @@ export function createCodexBackend(
                 },
               );
               threadId = startResult.thread.id;
+              if (typeof startResult.model === 'string') threadModel = startResult.model;
               observedThreadId = threadId;
               if (sessionReuseEligible) {
                 sessions.set(task.contextId, {
@@ -1591,6 +1783,16 @@ export function createCodexBackend(
             function: { name: string; arguments: string };
           }> = [];
           const emitTraceArtifacts = traceabilityRequested(task);
+          // #207 — what the current turn did besides talking, reset by
+          // `runTurn`. `modelRounds` counts `thread/tokenUsage/updated`
+          // notifications: codex emits one per model response, so more than
+          // one on a turn with no caller tool call means the model spent a
+          // round on a codex-side tool. That is the only trace a failed shell
+          // call leaves — it is reported to the model, not as a thread item.
+          let turnModelRounds = 0;
+          let turnHostToolItems = 0;
+          let turnHostToolFailures = 0;
+          const turnHostToolKinds = new Set<string>();
 
           // Register the per-thread `item/tool/call` handler for the
           // duration of this turn. We always register when the openai-compat
@@ -1702,7 +1904,18 @@ export function createCodexBackend(
           // Drive the turn to completion. The notification subscription
           // captures the agent's final message text and command-execution
           // traces; the loop resolves on `turn/completed` or `turn/failed`.
-          const outcome: TurnRunOutcome = await new Promise((resolve) => {
+          //
+          // A function rather than an inline promise so the corrective retry
+          // (#207) can run a second turn on the same thread through the
+          // identical notification, abort, heartbeat and timeout handling.
+          const runTurn = (turnInput: typeof userInput): Promise<TurnRunOutcome> => new Promise((resolve) => {
+            // The previous turn's id would filter out this turn's
+            // notifications until `turn/start` answers.
+            activeTurnId = null;
+            turnModelRounds = 0;
+            turnHostToolItems = 0;
+            turnHostToolFailures = 0;
+            turnHostToolKinds.clear();
             let settled = false;
             const finish = (o: TurnRunOutcome): void => {
               if (settled) return;
@@ -1738,6 +1951,7 @@ export function createCodexBackend(
                   );
                 }
                 if (parsed) finalUsage = parsed;
+                turnModelRounds += 1;
                 // Usage is in — release any interrupt held back by the
                 // tool-call handler (#351).
                 if (parsed && interruptRequested) sendDeferredInterrupt();
@@ -1763,6 +1977,12 @@ export function createCodexBackend(
                 }
                 if (item.type === 'commandExecution') {
                   emitCommandTrace(item as Extract<ThreadItem, { type: 'commandExecution' }>);
+                }
+                const hostTool = classifyHostToolItem(item);
+                if (hostTool) {
+                  turnHostToolItems += 1;
+                  if (hostTool.failed) turnHostToolFailures += 1;
+                  turnHostToolKinds.add(hostTool.kind);
                 }
                 return;
               }
@@ -1878,7 +2098,7 @@ export function createCodexBackend(
             client
               .request<{ turn: { id: string } }>('turn/start', {
                 threadId,
-                input: userInput,
+                input: turnInput,
               })
               .then(
                 (res) => {
@@ -1894,6 +2114,78 @@ export function createCodexBackend(
                 },
               );
           });
+
+          let outcome = await runTurn(userInput);
+
+          // #207 — a caller-tool turn that completed with nothing for the
+          // caller to execute. Logged for the whole population; `reason` marks
+          // the ones that do not look like a final answer.
+          const callerToolNames = dynamicTools?.map((t) => t.name) ?? [];
+          const describeEmptyTurn = (o: TurnRunOutcome) =>
+            describeEmptyDispatchTurn({
+              taskId: task.taskId,
+              dispatchActive: callerToolNames.length > 0,
+              toolCallCount: capturedToolCalls.length,
+              completed: o.status === 'completed' && !signal.aborted,
+              textLength: (o.finalText || streamedResponseText).length,
+              model: threadModel ?? envelopeModel ?? null,
+              toolChoice: envelopeToolChoice,
+              toolHistory: envelopeChatHistory?.some((h) => h.role === 'tool') ?? false,
+              modelRounds: turnModelRounds,
+              hostToolItems: turnHostToolItems,
+              hostToolFailures: turnHostToolFailures,
+              hostToolKinds: [...turnHostToolKinds],
+            });
+          const emptyTurn = describeEmptyTurn(outcome);
+          if (emptyTurn) logger?.[emptyTurn.level]?.(emptyTurn.line);
+
+          // Opt-in (`--codex-retry-stalled-tool-call`): run ONE corrective
+          // turn on the same thread. The thread already holds the
+          // conversation, the dynamic tools, `environments: []` and the
+          // feature overrides, so only the nudge is new input. It never
+          // reaches the caller's history: openai-compat threads are not
+          // reused, and the caller replays its own messages next request.
+          //
+          // At most one extra attempt — a model that stalls twice will not be
+          // argued out of it, and an unbounded loop would burn the caller's
+          // budget invisibly.
+          //
+          // The first attempt's text has already streamed and cannot be
+          // recalled, so a streaming caller sees it followed by the retry's
+          // output (in a separate artifact); the terminal chat_completion
+          // envelope carries only the retry's result.
+          if (retryStalledToolCall && emptyTurn?.reason) {
+            logger?.info?.(
+              `[codex] retrying stalled caller-tool turn taskId=${safeToken(task.taskId)} reason=${emptyTurn.reason}`,
+            );
+            responseArtifactId = null;
+            streamedResponseText = '';
+            const retry = await runTurn(
+              buildUserInput(composeStalledToolCallNudge(callerToolNames), []),
+            );
+            const callerAborted = retry.status === 'aborted' || signal.aborted;
+            if (retry.status === 'completed' || capturedToolCall || callerAborted) {
+              outcome = retry;
+              const stillEmpty = describeEmptyTurn(retry);
+              // `warn` when the retry did not help: the operator turned this
+              // on to get tool calls and the turn is still a dead end.
+              logger?.[stillEmpty ? 'warn' : 'info']?.(
+                `[codex] stalled caller-tool turn retry taskId=${safeToken(task.taskId)} ` +
+                  `reason=${emptyTurn.reason} outcome=${
+                    callerAborted ? 'aborted' : capturedToolCall ? 'tool_calls' : 'no_tool_call'
+                  }`,
+              );
+            } else {
+              // A failed retry must not fail the task: the first attempt
+              // already produced a completed (if useless) result, and turning
+              // a degraded turn into a hard failure would be a regression.
+              logger?.warn?.(
+                `[codex] stalled caller-tool turn retry failed taskId=${safeToken(task.taskId)} ` +
+                  `reason=${emptyTurn.reason} status=${retry.status}` +
+                  (retry.error ? ` error=${safeToken(retry.error.message, 300)}` : ''),
+              );
+            }
+          }
 
           // Map turn outcome to A2A lifecycle.
           if (outcome.status === 'interrupted' || outcome.status === 'aborted') {
