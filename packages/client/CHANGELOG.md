@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.49.2
+
+### Patch Changes
+
+- 8c4295d: Diagnose Docker address-pool exhaustion without exposing workload output, document subnet sizing, and add explicit offline recovery of incomplete caller allocations using validated retained storage.
+
 ## 0.49.1
 
 ### Patch Changes
